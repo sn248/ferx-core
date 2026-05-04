@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-b0b7a707.js";
+            window.path_to_searchindex_js = "searchindex-667126dc.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-911e3088.js"></script>
@@ -1973,16 +1973,22 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 </ul>
 <p>Covariate names in the data file are matched case-insensitively to names used in <code>[individual_parameters]</code> expressions.</p>
 <h3 id="time-varying-covariate-scope"><a class="header" href="#time-varying-covariate-scope">Time-varying covariate scope</a></h3>
-<p>Time-varying covariates are supported for these structural models:</p>
+<p>Time-varying covariates are supported for <strong>all</strong> analytical structural models and ODE-defined models:</p>
 <ul>
 <li>1-compartment IV bolus (<code>one_cpt_iv_bolus</code>)</li>
 <li>1-compartment infusion (<code>one_cpt_infusion</code>)</li>
+<li>1-compartment oral (<code>one_cpt_oral</code>)</li>
 <li>2-compartment IV bolus (<code>two_cpt_iv_bolus</code>)</li>
 <li>2-compartment infusion (<code>two_cpt_infusion</code>)</li>
+<li>2-compartment oral (<code>two_cpt_oral</code>)</li>
+<li>3-compartment IV bolus (<code>three_cpt_iv_bolus</code>)</li>
+<li>3-compartment infusion (<code>three_cpt_infusion</code>)</li>
+<li>3-compartment oral (<code>three_cpt_oral</code>)</li>
 <li>All ODE-defined models (via <code>[odes]</code>)</li>
 </ul>
-<p>Oral models (<code>*_oral</code>) and 3-compartment models silently fall back to a single covariate snapshot taken from the first row of each subject — TV-cov support for those is tracked as a follow-up.</p>
-<p>When a subject has time-varying covariates and the structural model is in the supported list above, the autodiff (Enzyme) gradient fast path uses an <em>event-driven</em> AD kernel that consumes per-event covariate snapshots — gradients stay AD-accelerated. For unsupported models (oral, 3-cpt) the AD path is downgraded to finite-differences for the affected subjects and a warning is surfaced in the fit output. The H-matrix Jacobian (used once per inner-loop iteration) currently uses FD on TV-cov subjects regardless of model — forward-mode AD on the event-driven kernel is a follow-up.</p>
+<p>For oral models, the bolus dose into compartment 1 is interpreted as the depot (NONMEM ADVAN2/ADVAN4/ADVAN12 convention) and observation read-out reads the central compartment.</p>
+<p>The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients without falling back to finite-differences. The H-matrix Jacobian (used once per inner-loop iteration) currently uses FD on TV-cov subjects regardless of model — forward-mode AD on the event-driven kernel is a known follow-up tracked separately.</p>
+<p>Infusion support on the event-driven path is currently restricted to the central compartment (cmt=1 for IV models, cmt=2 for oral models). Infusion into peripheral compartments still falls back to the existing single-snapshot superposition path.</p>
 <h2 id="event-types-evid"><a class="header" href="#event-types-evid">Event Types (EVID)</a></h2>
 <div class="table-wrapper">
 <table>

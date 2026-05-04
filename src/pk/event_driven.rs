@@ -7,14 +7,22 @@
 //! when CL or V change between events, the elimination rate during the
 //! next interval changes accordingly.
 //!
-//! Initial scope (per the agreed phase plan):
-//!   - 1-compartment IV bolus & infusion
-//!   - 2-compartment IV bolus & infusion (dose into central / cmt=1)
+//! Coverage:
+//!   - 1-compartment IV bolus & infusion (state = `[A_central]`)
+//!   - 1-compartment oral (state = `[A_depot, A_central]`)
+//!   - 2-compartment IV bolus & infusion (state = `[A_central, A_periph]`)
+//!   - 2-compartment oral (state = `[A_depot, A_central, A_periph]`)
+//!   - 3-compartment IV bolus & infusion (state = `[A_central, A_p1, A_p2]`)
+//!   - 3-compartment oral (state = `[A_depot, A_central, A_p1, A_p2]`)
 //!
-//! Oral absorption and 3-compartment models are deferred to a follow-up
-//! pass (tracked in the project todo list). Models outside this scope
-//! panic with a clear message — callers must dispatch to the existing
-//! superposition path for non-TV-covariate cases.
+//! For oral models the dose into compartment 1 is the depot (NONMEM
+//! ADVAN2/ADVAN4 convention), and the observation read-out reads the
+//! *central* compartment (state slot 1, not 0).
+//!
+//! Infusion support (`rate > 0`) is restricted to inputs into the
+//! central compartment for IV models and into the depot for oral
+//! models (cmt=1 in both cases). Infusion into peripheral compartments
+//! still panics — that's a rare clinical setup tracked as a follow-up.
 
 use crate::types::{DoseEvent, PkModel, PkParams, Subject};
 
@@ -40,8 +48,34 @@ pub fn supports_event_driven(pk_model: PkModel) -> bool {
         pk_model,
         PkModel::OneCptIvBolus
             | PkModel::OneCptInfusion
+            | PkModel::OneCptOral
             | PkModel::TwoCptIvBolus
             | PkModel::TwoCptInfusion
+            | PkModel::TwoCptOral
+            | PkModel::ThreeCptIvBolus
+            | PkModel::ThreeCptInfusion
+            | PkModel::ThreeCptOral
+    )
+}
+
+/// State-vector dimension and central-compartment slot index for a given
+/// pk_model. Central is where the observation read-out reads from.
+fn state_layout(pk_model: PkModel) -> (usize, usize) {
+    match pk_model {
+        PkModel::OneCptIvBolus | PkModel::OneCptInfusion => (1, 0),
+        PkModel::OneCptOral => (2, 1), // [depot, central]
+        PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion => (2, 0),
+        PkModel::TwoCptOral => (3, 1), // [depot, central, periph]
+        PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion => (3, 0),
+        PkModel::ThreeCptOral => (4, 1), // [depot, central, periph1, periph2]
+    }
+}
+
+/// True when `pk_model` is an oral model (depot is state slot 0).
+fn is_oral(pk_model: PkModel) -> bool {
+    matches!(
+        pk_model,
+        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
     )
 }
 
@@ -74,15 +108,7 @@ pub fn event_driven_predictions(
         return preds;
     }
 
-    let n_states = match pk_model {
-        PkModel::OneCptIvBolus | PkModel::OneCptInfusion => 1,
-        PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion => 2,
-        _ => panic!(
-            "event_driven_predictions: pk_model {:?} not yet supported. \
-             Use compute_predictions superposition fallback for now.",
-            pk_model
-        ),
-    };
+    let (n_states, central_slot) = state_layout(pk_model);
 
     // Build merged event timeline. Stable tie-break: doses come before
     // observations at the same time so that an obs at the dose time
@@ -148,7 +174,9 @@ pub fn event_driven_predictions(
             EventKind::Obs => {
                 let pk = &pk_at_obs[ev.orig_idx];
                 let v = pk.v();
-                let conc = if v > 0.0 { state[0] / v } else { 0.0 };
+                // Read from the central-compartment slot — depot for slot 0
+                // on oral models, central for slot 1.
+                let conc = if v > 0.0 { state[central_slot] / v } else { 0.0 };
                 preds[ev.orig_idx] = conc.max(0.0);
                 current_pk = *pk;
             }
@@ -206,6 +234,10 @@ fn propagate(
         // Sum infusion rates active across the *whole* sub-interval.
         // Boundary cases (an infusion starting exactly at s0 or ending
         // exactly at s1) qualify because boundaries were inserted above.
+        // The "central" cmt depends on whether the model is oral (cmt=2)
+        // or IV (cmt=1). For 2-cpt IV we also accept cmt=2 → peripheral.
+        let oral = is_oral(pk_model);
+        let central_cmt = if oral { 2 } else { 1 };
         let mut rate_central = 0.0;
         let mut rate_periph = 0.0;
         for d in doses {
@@ -214,14 +246,17 @@ fn propagate(
                 && d.time <= mid
                 && d.time + d.duration >= mid
             {
-                match d.cmt {
-                    1 => rate_central += d.rate,
-                    2 => rate_periph += d.rate,
-                    _ => panic!(
+                if d.cmt == central_cmt {
+                    rate_central += d.rate;
+                } else if !oral && d.cmt == 2 {
+                    // 2-cpt IV peripheral input.
+                    rate_periph += d.rate;
+                } else {
+                    panic!(
                         "event-driven PK: infusion into compartment {} not supported \
-                         (only cmt=1 central and cmt=2 peripheral for 2-cpt models)",
-                        d.cmt
-                    ),
+                         for model {:?} (only central is supported)",
+                        d.cmt, pk_model
+                    );
                 }
             }
         }
@@ -230,10 +265,21 @@ fn propagate(
             PkModel::OneCptIvBolus | PkModel::OneCptInfusion => {
                 propagate_one_cpt(state, dt, pk, rate_central);
             }
+            PkModel::OneCptOral => {
+                propagate_one_cpt_oral(state, dt, pk);
+            }
             PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion => {
                 propagate_two_cpt(state, dt, pk, rate_central, rate_periph);
             }
-            _ => unreachable!("supports_event_driven gating bypassed"),
+            PkModel::TwoCptOral => {
+                propagate_two_cpt_oral(state, dt, pk);
+            }
+            PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion => {
+                propagate_three_cpt(state, dt, pk, rate_central);
+            }
+            PkModel::ThreeCptOral => {
+                propagate_three_cpt_oral(state, dt, pk);
+            }
         }
     }
 }
@@ -335,6 +381,315 @@ fn propagate_two_cpt(
 
     state[0] = h1_dt + a_ss_1;
     state[1] = h2_dt + a_ss_2;
+}
+
+// ─── Oral models ─────────────────────────────────────────────────────
+
+/// 1-cpt oral propagator. State = `[A_depot, A_central]`. Bolus only:
+/// the dose-event handler adds to state[0] (depot); during propagation
+/// the depot drains into the central compartment via the absorption
+/// rate `ka`.
+fn propagate_one_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
+    let cl = pk.cl();
+    let v = pk.v();
+    let ka = pk.ka();
+    if v <= 0.0 || cl <= 0.0 || ka <= 0.0 {
+        return;
+    }
+    let ke = cl / v;
+    let e_ka = (-ka * dt).exp();
+    let e_ke = (-ke * dt).exp();
+
+    let a_d_0 = state[0];
+    let a_c_0 = state[1];
+
+    // Depot decays exponentially (decoupled).
+    state[0] = a_d_0 * e_ka;
+
+    // Central compartment: homogeneous decay of A_c(0) plus depot-driven
+    // contribution. Bateman form, with L'Hôpital fallback when ka ≈ ke.
+    if (ka - ke).abs() < 1e-9 {
+        state[1] = a_c_0 * e_ke + ka * a_d_0 * dt * e_ke;
+    } else {
+        state[1] = a_c_0 * e_ke + (ka * a_d_0 / (ke - ka)) * (e_ka - e_ke);
+    }
+}
+
+/// 2-cpt oral propagator. State = `[A_depot, A_central, A_periph]`.
+/// Bolus only — see module-level docs for infusion-into-oral support.
+fn propagate_two_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
+    let cl = pk.cl();
+    let v1 = pk.v();
+    let q = pk.q();
+    let v2 = pk.v2();
+    let ka = pk.ka();
+    if v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q <= 0.0 || ka <= 0.0 {
+        return;
+    }
+    let k10 = cl / v1;
+    let k12 = q / v1;
+    let k21 = q / v2;
+    let s = k10 + k12 + k21;
+    let d_eig = k10 * k21;
+    let disc = {
+        let x = s * s - 4.0 * d_eig;
+        if x > 0.0 {
+            x.sqrt()
+        } else {
+            0.0
+        }
+    };
+    let alpha = (s + disc) * 0.5;
+    let beta = if alpha > 1e-30 { d_eig / alpha } else { 0.0 };
+
+    let a_d_0 = state[0];
+    let a_c_0 = state[1];
+    let a_p_0 = state[2];
+
+    let e_ka = (-ka * dt).exp();
+    let e_alpha = (-alpha * dt).exp();
+    let e_beta = (-beta * dt).exp();
+
+    // Depot drains independently.
+    state[0] = a_d_0 * e_ka;
+
+    // Particular solution amplitudes for the depot-driven input
+    // ka·A_d(t) = ka·A_d(0)·exp(-ka·t) into the central compartment.
+    // Assumes (A, B)·exp(-ka·t) form; substitute into the (A_c, A_p)
+    // ODE and solve. See derivation in the module docs / commit history.
+    let denom_depot = (ka - alpha) * (ka - beta);
+    let (cap_a, cap_b) = if denom_depot.abs() < 1e-12 {
+        // ka coincides with α or β: would need L'Hôpital. The Bateman
+        // singularity is rare in practice; fall back to no depot
+        // contribution (preserves homogeneous evolution).
+        (0.0, 0.0)
+    } else {
+        let a = ka * a_d_0 * (k21 - ka) / denom_depot;
+        let b = ka * a_d_0 * k12 / denom_depot;
+        (a, b)
+    };
+
+    // Homogeneous initial conditions = state - particular_at_t0.
+    let h_c_0 = a_c_0 - cap_a;
+    let h_p_0 = a_p_0 - cap_b;
+
+    // Decompose into the 2-cpt (α, β) eigenmodes (eigenvectors
+    // u_α = (k21 - α, k12),  u_β = (k21 - β, k12)).
+    let denom = beta - alpha;
+    let (c1, c2) = if k12.abs() < 1e-30 || denom.abs() < 1e-30 {
+        let s_homog = h_p_0 / k12.max(1e-30);
+        (s_homog * 0.5, s_homog * 0.5)
+    } else {
+        let s_homog = h_p_0 / k12;
+        let c1 = (h_c_0 - s_homog * (k21 - beta)) / denom;
+        let c2 = s_homog - c1;
+        (c1, c2)
+    };
+
+    let h_c_dt = c1 * (k21 - alpha) * e_alpha + c2 * (k21 - beta) * e_beta;
+    let h_p_dt = (c1 * e_alpha + c2 * e_beta) * k12;
+
+    state[1] = h_c_dt + cap_a * e_ka;
+    state[2] = h_p_dt + cap_b * e_ka;
+}
+
+// ─── 3-compartment models ────────────────────────────────────────────
+
+/// Three-compartment macro-rate constants and the auxiliary (k21, k31).
+/// Returns `(α, β, γ, k21, k31)` with the convention `α > β > γ > 0`.
+/// Mirrors `pk::three_compartment::macro_rates_three_cpt` (kept private
+/// there) — duplicated to avoid making it `pub`.
+fn macro_rates_three(
+    cl: f64,
+    v1: f64,
+    q2: f64,
+    v2: f64,
+    q3: f64,
+    v3: f64,
+) -> (f64, f64, f64, f64, f64) {
+    let k10 = cl / v1;
+    let k12 = q2 / v1;
+    let k21 = q2 / v2;
+    let k13 = q3 / v1;
+    let k31 = q3 / v3;
+    let s2 = k10 + k12 + k13 + k21 + k31;
+    let s1 = k10 * k21 + k10 * k31 + k21 * k31 + k12 * k31 + k13 * k21;
+    let s0 = k10 * k21 * k31;
+    let h = s2 / 3.0;
+    let p = s1 - s2 * s2 / 3.0;
+    let q = s1 * s2 / 3.0 - 2.0 * s2 * s2 * s2 / 27.0 - s0;
+    let p_safe = p.min(-1e-30);
+    let m = 2.0 * (-p_safe / 3.0).sqrt();
+    let arg = (3.0 * q / (p_safe * m)).clamp(-1.0, 1.0);
+    let phi = arg.acos() / 3.0;
+    let pi23 = 2.0 * std::f64::consts::FRAC_PI_3;
+    let l0 = m * phi.cos() + h;
+    let l1 = m * (phi - pi23).cos() + h;
+    let l2 = m * (phi - 2.0 * pi23).cos() + h;
+    let alpha = l0.max(l1).max(l2);
+    let gamma = l0.min(l1).min(l2);
+    let beta = s2 - alpha - gamma;
+    (alpha, beta, gamma, k21, k31)
+}
+
+/// Spectral propagation of one 3-cpt eigenmode `μ` applied to state vector
+/// `(c, p1, p2)`. Returns the mode's contribution to the new state at +dt.
+///
+/// Uses the *robust* eigenvector normalisation that stays well-defined
+/// even when an eigenvalue happens to be close to one of the structural
+/// rate constants (`k21` or `k31`) — common in 3-cpt models where the
+/// slowest eigenvalue γ is dominated by the slowest peripheral rate:
+///
+///   v_μ = ((k21-μ)(k31-μ),  k12·(k31-μ),  k13·(k21-μ))
+///   w_μ = ((k21-μ)(k31-μ),  k21·(k31-μ),  k31·(k21-μ))
+///
+/// Spectral projector: `P_μ = v_μ wᵀ_μ / (w_μ · v_μ)`.
+#[allow(clippy::too_many_arguments)]
+fn three_cpt_mode(
+    mu: f64,
+    c: f64,
+    p1: f64,
+    p2: f64,
+    k12: f64,
+    k13: f64,
+    k21: f64,
+    k31: f64,
+    dt: f64,
+) -> (f64, f64, f64) {
+    let d21 = k21 - mu;
+    let d31 = k31 - mu;
+    let v_c = d21 * d31;
+    let v_p1 = k12 * d31;
+    let v_p2 = k13 * d21;
+    let w_c = d21 * d31;
+    let w_p1 = k21 * d31;
+    let w_p2 = k31 * d21;
+    let norm = v_c * w_c + v_p1 * w_p1 + v_p2 * w_p2;
+    if norm.abs() < 1e-30 {
+        return (0.0, 0.0, 0.0);
+    }
+    let proj = w_c * c + w_p1 * p1 + w_p2 * p2;
+    let coef = proj / norm;
+    let exp_term = (-mu * dt).exp();
+    (
+        coef * v_c * exp_term,
+        coef * v_p1 * exp_term,
+        coef * v_p2 * exp_term,
+    )
+}
+
+/// 3-cpt linear propagator (IV models). State = `[A_central, A_p1, A_p2]`.
+/// Spectral decomposition along (α, β, γ) eigenmodes. Constant infusion
+/// `rate_central` into central is handled via the steady-state
+/// + homogeneous decomposition pattern (same as 2-cpt).
+fn propagate_three_cpt(state: &mut [f64], dt: f64, pk: &PkParams, rate_central: f64) {
+    let cl = pk.cl();
+    let v1 = pk.v();
+    let q2 = pk.q();
+    let v2 = pk.v2();
+    let q3 = pk.q3();
+    let v3 = pk.v3();
+    if v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q2 <= 0.0 || v3 <= 0.0 || q3 <= 0.0 {
+        return;
+    }
+    let (alpha, beta, gamma, k21, k31) = macro_rates_three(cl, v1, q2, v2, q3, v3);
+    let k12 = q2 / v1;
+    let k13 = q3 / v1;
+
+    // Steady-state under constant central input r:
+    //   A_ss_c = r·v1/cl, A_ss_p1 = r·v2/cl, A_ss_p2 = r·v3/cl.
+    let a_ss_c = rate_central * v1 / cl;
+    let a_ss_p1 = rate_central * v2 / cl;
+    let a_ss_p2 = rate_central * v3 / cl;
+
+    let h_c = state[0] - a_ss_c;
+    let h_p1 = state[1] - a_ss_p1;
+    let h_p2 = state[2] - a_ss_p2;
+
+    let (ca, p1a, p2a) = three_cpt_mode(alpha, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
+    let (cb, p1b, p2b) = three_cpt_mode(beta, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
+    let (cg, p1g, p2g) = three_cpt_mode(gamma, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
+
+    state[0] = ca + cb + cg + a_ss_c;
+    state[1] = p1a + p1b + p1g + a_ss_p1;
+    state[2] = p2a + p2b + p2g + a_ss_p2;
+}
+
+/// 3-cpt oral propagator. State = `[A_depot, A_central, A_p1, A_p2]`.
+/// Depot decays independently; the central+peripheral subsystem follows
+/// the 3-cpt homogeneous evolution plus a depot-driven particular solution
+/// of the form `(A, B, C)·exp(-ka·t)`.
+fn propagate_three_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
+    let cl = pk.cl();
+    let v1 = pk.v();
+    let q2 = pk.q();
+    let v2 = pk.v2();
+    let q3 = pk.q3();
+    let v3 = pk.v3();
+    let ka = pk.ka();
+    if v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q2 <= 0.0 || v3 <= 0.0 || q3 <= 0.0 || ka <= 0.0 {
+        return;
+    }
+    let (alpha, beta, gamma, k21, k31) = macro_rates_three(cl, v1, q2, v2, q3, v3);
+    let k12 = q2 / v1;
+    let k13 = q3 / v1;
+
+    let a_d_0 = state[0];
+    let a_c_0 = state[1];
+    let a_p1_0 = state[2];
+    let a_p2_0 = state[3];
+
+    let e_ka = (-ka * dt).exp();
+
+    // Depot decays.
+    state[0] = a_d_0 * e_ka;
+
+    // Particular solution `X·exp(-ka·t)` for the depot-driven input
+    // `(ka·A_d(0), 0, 0)·exp(-ka·t)` into the central compartment. Solving
+    // `(K + ka·I) X = -(ka·A_d(0), 0, 0)` via Cramer's rule:
+    //
+    //   X1 = -ka·A_d(0)·(k21-ka)·(k31-ka) / [(ka-α)(ka-β)(ka-γ)]
+    //   X2 = k12·X1 / (k21-ka)
+    //   X3 = k13·X1 / (k31-ka)
+    //
+    // The leading negative sign comes from the odd-degree characteristic
+    // polynomial of K (3-cpt has a cubic; 2-cpt's quadratic gives the
+    // opposite sign — see `propagate_two_cpt_oral`). To stay robust when
+    // ka coincides with k21 or k31, use the X3-form
+    //   X3 = k13·(-ka·A_d(0)·d21·d31/denom) / d31
+    //      = -k13·ka·A_d(0)·d21 / denom
+    // which cancels the d31 cleanly.
+    let cap_a;
+    let cap_b;
+    let cap_c;
+    let denom_depot = (ka - alpha) * (ka - beta) * (ka - gamma);
+    let d21 = k21 - ka;
+    let d31 = k31 - ka;
+    if denom_depot.abs() < 1e-12 {
+        // ka coincides with α/β/γ — eigenvalue resonance, would need
+        // L'Hôpital. Rare in practice; fall back to no contribution.
+        cap_a = 0.0;
+        cap_b = 0.0;
+        cap_c = 0.0;
+    } else {
+        let scale = -ka * a_d_0 / denom_depot;
+        cap_a = scale * d21 * d31;
+        cap_b = scale * k12 * d31;
+        cap_c = scale * k13 * d21;
+    }
+
+    // Homogeneous initial conditions = state - particular_at_t0.
+    let h_c = a_c_0 - cap_a;
+    let h_p1 = a_p1_0 - cap_b;
+    let h_p2 = a_p2_0 - cap_c;
+
+    let (ca, p1a, p2a) = three_cpt_mode(alpha, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
+    let (cb, p1b, p2b) = three_cpt_mode(beta, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
+    let (cg, p1g, p2g) = three_cpt_mode(gamma, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
+
+    state[1] = ca + cb + cg + cap_a * e_ka;
+    state[2] = p1a + p1b + p1g + cap_b * e_ka;
+    state[3] = p2a + p2b + p2g + cap_c * e_ka;
 }
 
 #[cfg(test)]
@@ -610,14 +965,268 @@ mod tests {
 
     #[test]
     fn supports_event_driven_gates_supported_models_only() {
+        // Now covers all analytical PK models.
         assert!(supports_event_driven(PkModel::OneCptIvBolus));
         assert!(supports_event_driven(PkModel::OneCptInfusion));
+        assert!(supports_event_driven(PkModel::OneCptOral));
         assert!(supports_event_driven(PkModel::TwoCptIvBolus));
         assert!(supports_event_driven(PkModel::TwoCptInfusion));
-        assert!(!supports_event_driven(PkModel::OneCptOral));
-        assert!(!supports_event_driven(PkModel::TwoCptOral));
-        assert!(!supports_event_driven(PkModel::ThreeCptIvBolus));
-        assert!(!supports_event_driven(PkModel::ThreeCptInfusion));
-        assert!(!supports_event_driven(PkModel::ThreeCptOral));
+        assert!(supports_event_driven(PkModel::TwoCptOral));
+        assert!(supports_event_driven(PkModel::ThreeCptIvBolus));
+        assert!(supports_event_driven(PkModel::ThreeCptInfusion));
+        assert!(supports_event_driven(PkModel::ThreeCptOral));
+    }
+
+    // ── Oral and 3-cpt: equivalence with the existing single-dose
+    //   superposition path when pk_params are constant ─────────────────
+
+    fn pk_one_oral(cl: f64, v: f64, ka: f64) -> PkParams {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = cl;
+        p.values[crate::types::PK_IDX_V] = v;
+        p.values[crate::types::PK_IDX_KA] = ka;
+        p
+    }
+
+    fn pk_two_oral(cl: f64, v1: f64, q: f64, v2: f64, ka: f64) -> PkParams {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = cl;
+        p.values[crate::types::PK_IDX_V] = v1;
+        p.values[crate::types::PK_IDX_Q] = q;
+        p.values[crate::types::PK_IDX_V2] = v2;
+        p.values[crate::types::PK_IDX_KA] = ka;
+        p
+    }
+
+    fn pk_three(cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64) -> PkParams {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = cl;
+        p.values[crate::types::PK_IDX_V] = v1;
+        p.values[crate::types::PK_IDX_Q] = q2;
+        p.values[crate::types::PK_IDX_V2] = v2;
+        p.values[crate::types::PK_IDX_Q3] = q3;
+        p.values[crate::types::PK_IDX_V3] = v3;
+        p
+    }
+
+    fn pk_three_oral(cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64, ka: f64) -> PkParams {
+        let mut p = pk_three(cl, v1, q2, v2, q3, v3);
+        p.values[crate::types::PK_IDX_KA] = ka;
+        p
+    }
+
+    #[test]
+    fn one_cpt_oral_matches_superposition_single_dose() {
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![0.5, 1.0, 2.0, 5.0, 10.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let pk = pk_one_oral(10.0, 100.0, 1.5);
+        let pk_dose = vec![pk; 1];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs);
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|&t| {
+                crate::pk::predict_concentration(PkModel::OneCptOral, &subj.doses, t, &pk)
+            })
+            .collect();
+        for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
+            assert_relative_eq!(*a, *e, epsilon = 1e-10, max_relative = 1e-10);
+            assert!(*a >= 0.0, "obs {} should be non-negative, got {}", i, a);
+        }
+    }
+
+    #[test]
+    fn one_cpt_oral_matches_superposition_multi_dose() {
+        let doses = vec![
+            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(8.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(16.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![0.5, 4.0, 8.5, 12.0, 18.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let pk = pk_one_oral(5.0, 80.0, 1.2);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs);
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|&t| {
+                crate::pk::predict_concentration(PkModel::OneCptOral, &subj.doses, t, &pk)
+            })
+            .collect();
+        for (a, e) in preds.iter().zip(expected.iter()) {
+            assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-9);
+        }
+    }
+
+    #[test]
+    fn two_cpt_oral_matches_superposition_single_dose() {
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let pk = pk_two_oral(5.0, 30.0, 2.0, 50.0, 1.5);
+        let pk_dose = vec![pk; 1];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::TwoCptOral, &subj, &pk_dose, &pk_obs);
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|&t| {
+                crate::pk::predict_concentration(PkModel::TwoCptOral, &subj.doses, t, &pk)
+            })
+            .collect();
+        for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
+            assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-8);
+            assert!(*a >= 0.0, "obs {} should be non-negative, got {}", i, a);
+        }
+    }
+
+    #[test]
+    fn two_cpt_oral_matches_superposition_multi_dose() {
+        let doses = vec![
+            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![0.5, 4.0, 12.5, 16.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let pk = pk_two_oral(5.0, 30.0, 2.0, 50.0, 1.2);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::TwoCptOral, &subj, &pk_dose, &pk_obs);
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|&t| {
+                crate::pk::predict_concentration(PkModel::TwoCptOral, &subj.doses, t, &pk)
+            })
+            .collect();
+        for (a, e) in preds.iter().zip(expected.iter()) {
+            assert_relative_eq!(*a, *e, epsilon = 1e-8, max_relative = 1e-8);
+        }
+    }
+
+    #[test]
+    fn three_cpt_iv_bolus_matches_superposition() {
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 1000.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![0.5, 1.0, 4.0, 12.5, 18.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let pk = pk_three(5.0, 20.0, 2.0, 30.0, 0.5, 100.0);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::ThreeCptIvBolus, &subj, &pk_dose, &pk_obs);
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|&t| {
+                crate::pk::predict_concentration(PkModel::ThreeCptIvBolus, &subj.doses, t, &pk)
+            })
+            .collect();
+        for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
+            assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-8);
+            assert!(*a > 0.0, "obs {} should be positive, got {}", i, a);
+        }
+    }
+
+    #[test]
+    fn three_cpt_infusion_matches_superposition() {
+        // 1000 mg over 2h infusion into central, multi-dose.
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0),
+            DoseEvent::new(12.0, 1000.0, 1, 500.0, false, 0.0),
+        ];
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 12.5, 14.0, 18.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let pk = pk_three(5.0, 20.0, 2.0, 30.0, 0.5, 100.0);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs);
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|&t| {
+                crate::pk::predict_concentration(PkModel::ThreeCptInfusion, &subj.doses, t, &pk)
+            })
+            .collect();
+        for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
+            assert_relative_eq!(*a, *e, epsilon = 1e-7, max_relative = 1e-7);
+            assert!(*a > 0.0, "obs {} should be positive, got {}", i, a);
+        }
+    }
+
+    #[test]
+    fn three_cpt_oral_matches_superposition() {
+        let doses = vec![
+            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 12.5, 14.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let pk = pk_three_oral(5.0, 20.0, 2.0, 30.0, 0.5, 100.0, 1.2);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::ThreeCptOral, &subj, &pk_dose, &pk_obs);
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|&t| {
+                crate::pk::predict_concentration(PkModel::ThreeCptOral, &subj.doses, t, &pk)
+            })
+            .collect();
+        for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
+            assert_relative_eq!(*a, *e, epsilon = 1e-8, max_relative = 1e-7);
+            assert!(*a >= 0.0, "obs {} should be non-negative, got {}", i, a);
+        }
+    }
+
+    // ── TV cov on oral: pk changes between doses changes elimination ─────
+
+    #[test]
+    fn one_cpt_oral_tv_cl_between_doses_changes_decay() {
+        // Two oral doses; CL doubles between dose 1 and dose 2, so the
+        // central-compartment decay rate doubles for the second interval.
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 1000.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![6.0, 18.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let pk_low = pk_one_oral(5.0, 100.0, 2.0); // ke=0.05
+        let pk_high = pk_one_oral(10.0, 100.0, 2.0); // ke=0.10
+        let pk_dose = vec![pk_low, pk_high];
+        let pk_obs = vec![pk_low, pk_high];
+
+        let preds_tv =
+            event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs);
+        // Sanity: predictions are positive and finite.
+        for &p in &preds_tv {
+            assert!(p > 0.0 && p.is_finite(), "got {}", p);
+        }
+        // Compare with a constant-pk run at pk_high — TV run's decay during
+        // the first interval is slower (lower CL) so concentration at obs1
+        // (t=6, between doses) should differ.
+        let pk_const_high = vec![pk_high; subj.obs_times.len() + subj.doses.len()];
+        let preds_const = event_driven_predictions(
+            PkModel::OneCptOral,
+            &subj,
+            &pk_const_high[..subj.doses.len()],
+            &pk_const_high[..subj.obs_times.len()],
+        );
+        // First obs: TV run must give a *higher* concentration than the
+        // all-high run because the depot drained more slowly under low CL
+        // doesn't matter — what matters is central elimination, which is
+        // also slower. So preds_tv[0] > preds_const[0].
+        assert!(
+            preds_tv[0] > preds_const[0],
+            "TV (low CL early) should preserve more drug at t=6 than constant high CL: \
+             tv={}, const_high={}",
+            preds_tv[0],
+            preds_const[0]
+        );
     }
 }

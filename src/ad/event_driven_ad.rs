@@ -205,12 +205,14 @@ pub fn individual_nll_event_driven_ad(
     }
 
     // ── State + walk events ─────────────────────────────────────────
-    // State held as scalars rather than `[f64; 2]` — avoids the array
-    // initialization (`llvm.memset` of 16 bytes) and the `&mut [f64;2]`
-    // through the propagator boundary. Both forms triggered Enzyme
-    // type-deduction failures in reverse mode on this function shape.
+    // State held as scalars (not `[f64; N]`) — array initialization emits
+    // `llvm.memset`, and the `&mut [f64;N]` through propagator boundary
+    // tripped Enzyme reverse-mode type deduction. Up to 4 slots cover all
+    // analytical PK models (3-cpt oral: depot, central, periph1, periph2).
     let mut state0 = 0.0_f64;
     let mut state1 = 0.0_f64;
+    let mut state2 = 0.0_f64;
+    let mut state3 = 0.0_f64;
 
     // Current PK params governing the current interval. Zero until we
     // reach the first event; harmless because the first propagation has
@@ -219,6 +221,9 @@ pub fn individual_nll_event_driven_ad(
     let mut current_v = 0.0_f64;
     let mut current_q = 0.0_f64;
     let mut current_v2 = 0.0_f64;
+    let mut current_ka = 0.0_f64;
+    let mut current_q3 = 0.0_f64;
+    let mut current_v3 = 0.0_f64;
 
     let mut cur_t = if n_events > 0 { event_times[0] } else { 0.0 };
 
@@ -230,16 +235,21 @@ pub fn individual_nll_event_driven_ad(
         // (exp(0) = 1, infusion contributions reduce to e^x - e^x = 0).
         // Branching on `dt > 0.0` here would create a phi-node on
         // `state` that Enzyme can't type-deduce in reverse mode.
-        let (s0_new, s1_new) = propagate_state_ad(
+        let (s0_new, s1_new, s2_new, s3_new) = propagate_state_ad(
             pk_model_id,
             state0,
             state1,
+            state2,
+            state3,
             cur_t,
             t_ev,
             current_cl,
             current_v,
             current_q,
             current_v2,
+            current_ka,
+            current_q3,
+            current_v3,
             dose_times,
             dose_rates,
             dose_durations,
@@ -247,15 +257,18 @@ pub fn individual_nll_event_driven_ad(
         );
         state0 = s0_new;
         state1 = s1_new;
+        state2 = s2_new;
+        state3 = s3_new;
 
         // Compute pk_params at this event from per-event tv row + eta.
-        // Inlined as scalars (no `[f64; MAX_PK_PARAMS]` array) so we
-        // avoid the array memset + per-iter aliasing that confuses
-        // Enzyme. The scalar form gives identical numerics.
+        // Inlined as scalars (no `[f64; MAX_PK_PARAMS]` array).
         let mut ev_cl = 0.0_f64;
         let mut ev_v = 0.0_f64;
         let mut ev_q = 0.0_f64;
         let mut ev_v2 = 0.0_f64;
+        let mut ev_ka = 0.0_f64;
+        let mut ev_q3 = 0.0_f64;
+        let mut ev_v3 = 0.0_f64;
         let row_off = ev_idx * n_tv;
         for i in 0..n_tv {
             let mut eta_contrib = 0.0;
@@ -264,9 +277,7 @@ pub fn individual_nll_event_driven_ad(
             }
             let val = tv_per_event[row_off + i] * eta_contrib.exp();
             let idx = pk_idx_f64[i] as usize;
-            // Const-branch fan-out: dispatch the value to the right
-            // scalar based on the (Const) pk index. Other slots
-            // (KA, F, Q3, V3) aren't used by 1-/2-cpt IV/infusion.
+            // Const-branch fan-out (pk_idx_f64 is Const).
             if idx == PK_IDX_CL {
                 ev_cl = val;
             } else if idx == PK_IDX_V {
@@ -275,33 +286,43 @@ pub fn individual_nll_event_driven_ad(
                 ev_q = val;
             } else if idx == PK_IDX_V2 {
                 ev_v2 = val;
+            } else if idx == PK_IDX_KA {
+                ev_ka = val;
+            } else if idx == PK_IDX_Q3 {
+                ev_q3 = val;
+            } else if idx == PK_IDX_V3 {
+                ev_v3 = val;
             }
         }
 
         let kind = event_kinds[ev_idx];
         let orig = event_orig_idx_f64[ev_idx] as usize;
-        // `orig` is the original index in *either* the doses or the obs
-        // arrays depending on `kind`. To keep both branches branch-free
-        // (we evaluate both and mask with `is_dose` / `is_obs`), clamp
-        // the index for the inactive branch so the load stays in-bounds
-        // — its result is multiplied by 0 anyway.
         let dose_idx = if kind < 0.5 { orig } else { 0 };
         let obs_idx = if kind < 0.5 { 0 } else { orig };
 
-        // ── Dose branch (kind < 0.5). All inputs here are Const so the
-        // gating is Const-Const with no adjoint flow.
+        // ── Dose branch. Const inputs throughout. Bolus goes into
+        // state0 — depot for oral models, central for IV models.
         let is_dose = if kind < 0.5 { 1.0 } else { 0.0 };
         let is_bolus = if dose_rates[dose_idx] == 0.0 { 1.0 } else { 0.0 };
         state0 += is_dose * is_bolus * dose_amts[dose_idx];
 
-        // ── Observation branch. Mask via is_obs so non-obs events
-        // contribute exactly zero to data_ll without an `if` phi.
+        // ── Observation branch. Mask via is_obs.
         let is_obs = if kind < 0.5 { 0.0 } else { 1.0 };
+
+        // Central-compartment slot:
+        //   IV models (1- 2- 3-cpt): central = state0
+        //   Oral models (1- 2- 3-cpt): central = state1 (state0 is depot)
+        // Const branch on pk_model_id constant-folds.
+        let central_amt = if pk_model_id == 1 || pk_model_id == 4 || pk_model_id == 7 {
+            state1
+        } else {
+            state0
+        };
 
         // Strictly positive divisor — handles transient ev_v ≤ 0 from
         // line-search trial steps.
         let v_safe = ev_v.abs() + 1e-30;
-        let conc_raw = state0 / v_safe;
+        let conc_raw = central_amt / v_safe;
         let conc = (conc_raw + conc_raw.abs()) * 0.5;
 
         let v_resid = residual_variance_ad(error_model_id, conc, sigma_values);
@@ -317,123 +338,23 @@ pub fn individual_nll_event_driven_ad(
         current_v = ev_v;
         current_q = ev_q;
         current_v2 = ev_v2;
+        current_ka = ev_ka;
+        current_q3 = ev_q3;
+        current_v3 = ev_v3;
         cur_t = t_ev;
     }
 
     0.5 * (eta_prior + log_det_omega + data_ll)
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Forward-mode AD path for the Jacobian d(predictions)/d(eta).
-//
-// **Disabled for now.** The function below is identical in shape to the
-// reverse-mode NLL above but Enzyme's forward-mode pointer tracker hits
+// Forward-mode AD path for the Jacobian d(predictions)/d(eta) is not
+// implemented. Enzyme's forward-mode pointer tracker hits
 // `Assertion failed: forwardModeInvertedPointerFallback` on the
-// per-event scalar-state propagation. The wrapper in
-// `inner_optimizer.rs` falls back to FD for the H matrix on TV-cov
-// subjects until this is resolved upstream — reverse-mode AD on the
-// BFGS gradient (the hot path) still wins back the bulk of the cost.
-// Tracked alongside the oral/3-cpt follow-up.
-// ─────────────────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-fn predict_all_event_driven_ad(
-    eta: &[f64],
-    tv_per_event: &[f64],
-    event_times: &[f64],
-    event_kinds: &[f64],
-    event_orig_idx_f64: &[f64],
-    dose_times: &[f64],
-    dose_amts: &[f64],
-    dose_rates: &[f64],
-    dose_durations: &[f64],
-    pk_idx_f64: &[f64],
-    sel_flat: &[f64],
-    pk_model_id_f64: f64,
-    out: &mut [f64],
-) {
-    let n_eta = eta.len();
-    let n_tv = pk_idx_f64.len();
-    let n_events = event_times.len();
-    let n_doses = dose_times.len();
-    let pk_model_id = pk_model_id_f64 as i32;
-
-    // Scalar state — see rationale in the reverse-mode NLL.
-    let mut state0 = 0.0_f64;
-    let mut state1 = 0.0_f64;
-    let mut current_cl = 0.0_f64;
-    let mut current_v = 0.0_f64;
-    let mut current_q = 0.0_f64;
-    let mut current_v2 = 0.0_f64;
-    let mut cur_t = if n_events > 0 { event_times[0] } else { 0.0 };
-
-    for ev_idx in 0..n_events {
-        let t_ev = event_times[ev_idx];
-        let (s0_new, s1_new) = propagate_state_ad(
-            pk_model_id,
-            state0,
-            state1,
-            cur_t,
-            t_ev,
-            current_cl,
-            current_v,
-            current_q,
-            current_v2,
-            dose_times,
-            dose_rates,
-            dose_durations,
-            n_doses,
-        );
-        state0 = s0_new;
-        state1 = s1_new;
-
-        let mut ev_cl = 0.0_f64;
-        let mut ev_v = 0.0_f64;
-        let mut ev_q = 0.0_f64;
-        let mut ev_v2 = 0.0_f64;
-        let row_off = ev_idx * n_tv;
-        for i in 0..n_tv {
-            let mut eta_contrib = 0.0;
-            for j in 0..n_eta {
-                eta_contrib += sel_flat[i * n_eta + j] * eta[j];
-            }
-            let val = tv_per_event[row_off + i] * eta_contrib.exp();
-            let idx = pk_idx_f64[i] as usize;
-            if idx == PK_IDX_CL {
-                ev_cl = val;
-            } else if idx == PK_IDX_V {
-                ev_v = val;
-            } else if idx == PK_IDX_Q {
-                ev_q = val;
-            } else if idx == PK_IDX_V2 {
-                ev_v2 = val;
-            }
-        }
-
-        let kind = event_kinds[ev_idx];
-        let orig = event_orig_idx_f64[ev_idx] as usize;
-
-        let is_dose = if kind < 0.5 { 1.0 } else { 0.0 };
-        let is_bolus = if dose_rates[orig] == 0.0 { 1.0 } else { 0.0 };
-        state0 += is_dose * is_bolus * dose_amts[orig];
-
-        // Write the central-compartment concentration unconditionally
-        // — every event slot in `out` gets one write per pass. The
-        // wrapper picks out the obs slots by event_kinds. Without the
-        // unconditional write Enzyme's forward-mode pointer tracking
-        // hits `Assertion failed: (found == gutils->invertedPointers...)`.
-        let v_safe = ev_v.abs() + 1e-30;
-        let conc_raw = state0 / v_safe;
-        let conc = (conc_raw + conc_raw.abs()) * 0.5;
-        out[ev_idx] = conc;
-
-        current_cl = ev_cl;
-        current_v = ev_v;
-        current_q = ev_q;
-        current_v2 = ev_v2;
-        cur_t = t_ev;
-    }
-}
+// per-event scalar-state form (the same kernel shape that reverse-mode
+// handles fine). The dispatcher in `inner_optimizer.rs` routes the
+// AdEventDriven Jacobian through `compute_jacobian_fd` instead;
+// reverse-mode AD on the BFGS gradient (the hot path) still wins back
+// the bulk of the cost. Tracked as a follow-up.
 
 // ─────────────────────────────────────────────────────────────────────
 // Inlined event-driven propagators (AD-safe).
@@ -451,63 +372,72 @@ fn predict_all_event_driven_ad(
 // contribute exactly zero (formula reduces to e^x - e^x = 0).
 // ─────────────────────────────────────────────────────────────────────
 
-/// Returns `(state0_new, state1_new)`. State is passed by value (no `&mut`)
-/// so the function returns scalars rather than mutating an array — Enzyme
-/// reverse-mode handles scalar return values cleanly but trips on the
-/// memset / mixed-active aliasing of `&mut [f64; 2]` here.
+/// Returns `(state0_new, state1_new, state2_new, state3_new)`. State is
+/// passed by value (no `&mut`) so the function returns scalars rather
+/// than mutating an array — Enzyme reverse-mode handles scalar return
+/// values cleanly but trips on the memset / mixed-active aliasing of
+/// `&mut [f64; N]` here. Slots beyond what the model uses are returned
+/// unchanged.
 #[allow(clippy::too_many_arguments)]
 fn propagate_state_ad(
     pk_model_id: i32,
     state0: f64,
     state1: f64,
+    state2: f64,
+    state3: f64,
     t_from: f64,
     t_to: f64,
     cl: f64,
     v: f64,
     q: f64,
     v2: f64,
+    ka: f64,
+    q3: f64,
+    v3: f64,
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
     n_doses: usize,
-) -> (f64, f64) {
-    // Const-only branch on pk_model_id — constant-folds under LLVM,
-    // same pattern as `single_dose_ad`. Only one of these branches
-    // contains real adjoint flow per build.
+) -> (f64, f64, f64, f64) {
+    // Const-only branch on pk_model_id — constant-folds under LLVM. Only
+    // the relevant arm contains real adjoint flow per build.
     if pk_model_id == 0 || pk_model_id == 2 {
+        // 1-cpt IV bolus / infusion: state = [central].
         let s0 = propagate_one_cpt_ad(
-            state0,
-            t_from,
-            t_to,
-            cl,
-            v,
-            dose_times,
-            dose_rates,
-            dose_durations,
+            state0, t_from, t_to, cl, v, dose_times, dose_rates, dose_durations, n_doses,
+        );
+        (s0, state1, state2, state3)
+    } else if pk_model_id == 1 {
+        // 1-cpt oral: state = [depot, central]. No infusion support.
+        let (s0, s1) = propagate_one_cpt_oral_ad(state0, state1, t_from, t_to, cl, v, ka);
+        (s0, s1, state2, state3)
+    } else if pk_model_id == 3 || pk_model_id == 5 {
+        // 2-cpt IV bolus / infusion: state = [central, periph].
+        let (s0, s1) = propagate_two_cpt_ad(
+            state0, state1, t_from, t_to, cl, v, q, v2, dose_times, dose_rates, dose_durations,
             n_doses,
         );
-        // 1-cpt has no peripheral compartment — `state1` carries through
-        // unchanged.
-        (s0, state1)
-    } else if pk_model_id == 3 || pk_model_id == 5 {
-        propagate_two_cpt_ad(
-            state0,
-            state1,
-            t_from,
-            t_to,
-            cl,
-            v,
-            q,
-            v2,
-            dose_times,
-            dose_rates,
-            dose_durations,
-            n_doses,
+        (s0, s1, state2, state3)
+    } else if pk_model_id == 4 {
+        // 2-cpt oral: state = [depot, central, periph].
+        let (s0, s1, s2) =
+            propagate_two_cpt_oral_ad(state0, state1, state2, t_from, t_to, cl, v, q, v2, ka);
+        (s0, s1, s2, state3)
+    } else if pk_model_id == 6 || pk_model_id == 8 {
+        // 3-cpt IV bolus / infusion: state = [central, periph1, periph2].
+        let (s0, s1, s2) = propagate_three_cpt_ad(
+            state0, state1, state2, t_from, t_to, cl, v, q, v2, q3, v3, dose_times, dose_rates,
+            dose_durations, n_doses,
+        );
+        (s0, s1, s2, state3)
+    } else if pk_model_id == 7 {
+        // 3-cpt oral: state = [depot, central, periph1, periph2].
+        propagate_three_cpt_oral_ad(
+            state0, state1, state2, state3, t_from, t_to, cl, v, q, v2, q3, v3, ka,
         )
     } else {
-        // Other pk_model_ids return state unchanged — dispatcher in
-        // inner_optimizer.rs forces FD for those.
-        (state0, state1)
+        // Unknown / unsupported — leave state unchanged.
+        (state0, state1, state2, state3)
     }
 }
 
@@ -631,6 +561,335 @@ fn propagate_two_cpt_ad(
     (s0, s1)
 }
 
+// ─── Oral models (AD) ──────────────────────────────────────────────
+
+/// 1-cpt oral propagator. State = `(depot, central)`. Bolus only —
+/// infusion-into-oral isn't supported (dispatcher skips this branch).
+/// The L'Hôpital limit at ka == ke is handled by a small offset added
+/// to `ke` so the formula stays smooth (and AD-friendly); the bias is
+/// O(eps) in the answer.
+#[allow(clippy::too_many_arguments)]
+fn propagate_one_cpt_oral_ad(
+    state0: f64,
+    state1: f64,
+    t_from: f64,
+    t_to: f64,
+    cl: f64,
+    v: f64,
+    ka: f64,
+) -> (f64, f64) {
+    let v_safe = v.abs() + 1e-30;
+    let cl_safe = cl.abs() + 1e-30;
+    let ka_safe = ka.abs() + 1e-30;
+    let ke = cl_safe / v_safe;
+    let dt = t_to - t_from;
+    let e_ka = (-ka_safe * dt).exp();
+    let e_ke = (-ke * dt).exp();
+
+    // Bateman: a_c(t) = a_c(0)·e^{-ke·t} + (ka·a_d(0)/(ke-ka))·(e^{-ka·t}-e^{-ke·t})
+    // To stay AD-safe we never branch on `(ka-ke).abs() < eps`. Instead
+    // add a small constant offset so the denominator is bounded away
+    // from zero. Worst-case bias is O(eps) — acceptable since the
+    // exact L'Hôpital limit is the analytic continuation of the same
+    // formula and any sane optimizer steers away from ka = ke anyway.
+    let denom = (ke - ka_safe) + if (ke - ka_safe).abs() < 1e-9 { 1e-9 } else { 0.0 };
+
+    let s0 = state0 * e_ka;
+    let s1 = state1 * e_ke + (ka_safe * state0 / denom) * (e_ka - e_ke);
+    (s0, s1)
+}
+
+/// 2-cpt oral propagator. State = `(depot, central, periph)`. Bolus only.
+#[allow(clippy::too_many_arguments)]
+fn propagate_two_cpt_oral_ad(
+    state0: f64,
+    state1: f64,
+    state2: f64,
+    t_from: f64,
+    t_to: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    ka: f64,
+) -> (f64, f64, f64) {
+    let v1_safe = v1.abs() + 1e-30;
+    let cl_safe = cl.abs() + 1e-30;
+    let q_safe = q.abs() + 1e-30;
+    let v2_safe = v2.abs() + 1e-30;
+    let ka_safe = ka.abs() + 1e-30;
+    let k10 = cl_safe / v1_safe;
+    let k12 = q_safe / v1_safe;
+    let k21 = q_safe / v2_safe;
+    let s = k10 + k12 + k21;
+    let d_eig = k10 * k21;
+    let arg = s * s - 4.0 * d_eig;
+    let arg_clamped = (arg + arg.abs()) * 0.5;
+    let disc = arg_clamped.sqrt();
+    let alpha = (s + disc) * 0.5;
+    let beta = d_eig / alpha;
+
+    let dt = t_to - t_from;
+    let e_ka = (-ka_safe * dt).exp();
+    let e_alpha = (-alpha * dt).exp();
+    let e_beta = (-beta * dt).exp();
+
+    // Particular solution amplitude (A, B) for input ka·A_d(0)·e^{-ka·t}:
+    //   A = ka·A_d(0)·(k21-ka) / [(ka-α)(ka-β)]
+    //   B = k12·A / (k21-ka)
+    let denom_depot = (ka_safe - alpha) * (ka_safe - beta);
+    let cap_a = ka_safe * state0 * (k21 - ka_safe) / denom_depot;
+    let cap_b = ka_safe * state0 * k12 / denom_depot;
+
+    // Homogeneous initial conditions = state - particular_at_t0.
+    let h_c_0 = state1 - cap_a;
+    let h_p_0 = state2 - cap_b;
+
+    let s_homog = h_p_0 / k12;
+    let denom = beta - alpha;
+    let c1 = (h_c_0 - s_homog * (k21 - beta)) / denom;
+    let c2 = s_homog - c1;
+
+    let h_c_dt = c1 * (k21 - alpha) * e_alpha + c2 * (k21 - beta) * e_beta;
+    let h_p_dt = (c1 * e_alpha + c2 * e_beta) * k12;
+
+    let new_s0 = state0 * e_ka;
+    let new_s1 = h_c_dt + cap_a * e_ka;
+    let new_s2 = h_p_dt + cap_b * e_ka;
+    (new_s0, new_s1, new_s2)
+}
+
+// ─── 3-cpt models (AD) ─────────────────────────────────────────────
+
+/// 3-cpt macro rates (α > β > γ), trigonometric (Vieta) method. AD-safe
+/// — same shape as `ad_gradients::macro_rates_three_cpt_ad`.
+fn macro_rates_three_ad(cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64) -> (f64, f64, f64, f64, f64) {
+    let v1_safe = v1.abs() + 1e-30;
+    let cl_safe = cl.abs() + 1e-30;
+    let q2_safe = q2.abs() + 1e-30;
+    let v2_safe = v2.abs() + 1e-30;
+    let q3_safe = q3.abs() + 1e-30;
+    let v3_safe = v3.abs() + 1e-30;
+    let k10 = cl_safe / v1_safe;
+    let k12 = q2_safe / v1_safe;
+    let k21 = q2_safe / v2_safe;
+    let k13 = q3_safe / v1_safe;
+    let k31 = q3_safe / v3_safe;
+    let s2 = k10 + k12 + k13 + k21 + k31;
+    let s1 = k10 * k21 + k10 * k31 + k21 * k31 + k12 * k31 + k13 * k21;
+    let s0 = k10 * k21 * k31;
+    let h = s2 / 3.0;
+    let p = s1 - s2 * s2 / 3.0;
+    let qq = s1 * s2 / 3.0 - 2.0 * s2 * s2 * s2 / 27.0 - s0;
+    // p must be ≤ -ε for the cubic to have three real roots — clamp via
+    // `min(p, -ε)` arithmetically: p_safe = (p + (-ε) - |p - (-ε)|) / 2 = min(p, -ε).
+    let eps = 1e-30;
+    let p_safe = (p + (-eps) - (p - (-eps)).abs()) * 0.5;
+    let m = 2.0 * (-p_safe / 3.0).sqrt();
+    let mut arg = 3.0 * qq / (p_safe * m);
+    if arg < -1.0 {
+        arg = -1.0;
+    }
+    if arg > 1.0 {
+        arg = 1.0;
+    }
+    let phi = arg.acos() / 3.0;
+    let pi23 = 2.0 * std::f64::consts::FRAC_PI_3;
+    let l0 = m * phi.cos() + h;
+    let l1 = m * (phi - pi23).cos() + h;
+    let l2 = m * (phi - 2.0 * pi23).cos() + h;
+    // Branch-free max/min via explicit comparisons (CLAUDE.md: no
+    // `f64::max` in AD-instrumented code).
+    let alpha = if l0 >= l1 && l0 >= l2 {
+        l0
+    } else if l1 >= l2 {
+        l1
+    } else {
+        l2
+    };
+    let gamma = if l0 <= l1 && l0 <= l2 {
+        l0
+    } else if l1 <= l2 {
+        l1
+    } else {
+        l2
+    };
+    let beta = s2 - alpha - gamma;
+    (alpha, beta, gamma, k21, k31)
+}
+
+/// One 3-cpt eigenmode contribution. Robust eigenvector form (no
+/// division by `(k21-μ)` or `(k31-μ)`): see `pk::event_driven`'s
+/// `three_cpt_mode` for the rationale.
+#[allow(clippy::too_many_arguments)]
+fn three_cpt_mode_ad(
+    mu: f64,
+    c: f64,
+    p1: f64,
+    p2: f64,
+    k12: f64,
+    k13: f64,
+    k21: f64,
+    k31: f64,
+    dt: f64,
+) -> (f64, f64, f64) {
+    let d21 = k21 - mu;
+    let d31 = k31 - mu;
+    let v_c = d21 * d31;
+    let v_p1 = k12 * d31;
+    let v_p2 = k13 * d21;
+    let w_c = d21 * d31;
+    let w_p1 = k21 * d31;
+    let w_p2 = k31 * d21;
+    let norm = v_c * w_c + v_p1 * w_p1 + v_p2 * w_p2;
+    // Strictly-positive guard so the divide is safe even at degenerate
+    // points (extremely rare for physical params).
+    let norm_safe = norm + if norm.abs() < 1e-30 { 1e-30 } else { 0.0 };
+    let proj = w_c * c + w_p1 * p1 + w_p2 * p2;
+    let coef = proj / norm_safe;
+    let exp_term = (-mu * dt).exp();
+    (
+        coef * v_c * exp_term,
+        coef * v_p1 * exp_term,
+        coef * v_p2 * exp_term,
+    )
+}
+
+/// 3-cpt linear propagator (IV bolus / infusion). Spectral decomposition
+/// over (α, β, γ) eigenmodes; constant central infusion handled via the
+/// steady-state + homogeneous decomposition (same pattern as 2-cpt).
+#[allow(clippy::too_many_arguments)]
+fn propagate_three_cpt_ad(
+    state0: f64,
+    state1: f64,
+    state2: f64,
+    t_from: f64,
+    t_to: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    q3: f64,
+    v3: f64,
+    dose_times: &[f64],
+    dose_rates: &[f64],
+    dose_durations: &[f64],
+    n_doses: usize,
+) -> (f64, f64, f64) {
+    let v1_safe = v1.abs() + 1e-30;
+    let cl_safe = cl.abs() + 1e-30;
+    let v2_safe = v2.abs() + 1e-30;
+    let v3_safe = v3.abs() + 1e-30;
+    let (alpha, beta, gamma, k21, k31) = macro_rates_three_ad(cl, v1, q, v2, q3, v3);
+    let q_safe = q.abs() + 1e-30;
+    let q3_safe = q3.abs() + 1e-30;
+    let k12 = q_safe / v1_safe;
+    let k13 = q3_safe / v1_safe;
+
+    let dt = t_to - t_from;
+
+    // Homogeneous evolution from initial state.
+    let (ca, p1a, p2a) = three_cpt_mode_ad(alpha, state0, state1, state2, k12, k13, k21, k31, dt);
+    let (cb, p1b, p2b) = three_cpt_mode_ad(beta, state0, state1, state2, k12, k13, k21, k31, dt);
+    let (cg, p1g, p2g) = three_cpt_mode_ad(gamma, state0, state1, state2, k12, k13, k21, k31, dt);
+
+    let mut s0 = ca + cb + cg;
+    let mut s1 = p1a + p1b + p1g;
+    let mut s2 = p2a + p2b + p2g;
+
+    // Infusion contributions (cmt=1 / central only). Per-active-window
+    // contribution under steady-state input r is given by
+    //   exp(K·τ_to)·A_ss − exp(K·τ_total)·A_ss
+    // where A_ss = (r·v1/cl, r·v2/cl, r·v3/cl).
+    for d in 0..n_doses {
+        let s_i = dose_times[d];
+        let e_i = s_i + dose_durations[d];
+        let p_start = (s_i + t_from + (s_i - t_from).abs()) * 0.5;
+        let p_end = (e_i + t_to - (e_i - t_to).abs()) * 0.5;
+        let tau_to_raw = t_to - p_end;
+        let tau_to = (tau_to_raw + tau_to_raw.abs()) * 0.5;
+        let tau_total_raw = t_to - p_start;
+        let diff = tau_total_raw - tau_to;
+        let tau_total = tau_to + (diff + diff.abs()) * 0.5;
+
+        let a_ss_c = dose_rates[d] * v1_safe / cl_safe;
+        let a_ss_p1 = dose_rates[d] * v2_safe / cl_safe;
+        let a_ss_p2 = dose_rates[d] * v3_safe / cl_safe;
+
+        // Mode contribution at τ_to (`_to`) and τ_total (`_tot`) — subtract.
+        let (ca_to, p1a_to, p2a_to) = three_cpt_mode_ad(alpha, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
+        let (cb_to, p1b_to, p2b_to) = three_cpt_mode_ad(beta, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
+        let (cg_to, p1g_to, p2g_to) = three_cpt_mode_ad(gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
+        let (ca_tot, p1a_tot, p2a_tot) = three_cpt_mode_ad(alpha, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total);
+        let (cb_tot, p1b_tot, p2b_tot) = three_cpt_mode_ad(beta, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total);
+        let (cg_tot, p1g_tot, p2g_tot) = three_cpt_mode_ad(gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total);
+
+        s0 += (ca_to - ca_tot) + (cb_to - cb_tot) + (cg_to - cg_tot);
+        s1 += (p1a_to - p1a_tot) + (p1b_to - p1b_tot) + (p1g_to - p1g_tot);
+        s2 += (p2a_to - p2a_tot) + (p2b_to - p2b_tot) + (p2g_to - p2g_tot);
+    }
+    (s0, s1, s2)
+}
+
+/// 3-cpt oral propagator. State = `(depot, central, periph1, periph2)`.
+/// Bolus into depot only. Depot decays independently; the (central,
+/// p1, p2) subsystem follows 3-cpt homogeneous evolution from
+/// `state - particular_at_t0` plus a depot-driven particular solution
+/// of the form `(A, B, C)·exp(-ka·t)`.
+#[allow(clippy::too_many_arguments)]
+fn propagate_three_cpt_oral_ad(
+    state0: f64,
+    state1: f64,
+    state2: f64,
+    state3: f64,
+    t_from: f64,
+    t_to: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    q3: f64,
+    v3: f64,
+    ka: f64,
+) -> (f64, f64, f64, f64) {
+    let v1_safe = v1.abs() + 1e-30;
+    let q_safe = q.abs() + 1e-30;
+    let q3_safe = q3.abs() + 1e-30;
+    let ka_safe = ka.abs() + 1e-30;
+    let (alpha, beta, gamma, k21, k31) = macro_rates_three_ad(cl, v1, q, v2, q3, v3);
+    let k12 = q_safe / v1_safe;
+    let k13 = q3_safe / v1_safe;
+
+    let dt = t_to - t_from;
+    let e_ka = (-ka_safe * dt).exp();
+
+    // Particular: X·e^{-ka·t} where (see `pk::event_driven`'s 3-cpt-oral
+    // derivation) the leading negative sign comes from the cubic
+    // characteristic polynomial of K.
+    let d21 = k21 - ka_safe;
+    let d31 = k31 - ka_safe;
+    let denom_depot = (ka_safe - alpha) * (ka_safe - beta) * (ka_safe - gamma);
+    let denom_safe = denom_depot + if denom_depot.abs() < 1e-30 { 1e-30 } else { 0.0 };
+    let scale = -ka_safe * state0 / denom_safe;
+    let cap_a = scale * d21 * d31;
+    let cap_b = scale * k12 * d31;
+    let cap_c = scale * k13 * d21;
+
+    let h_c = state1 - cap_a;
+    let h_p1 = state2 - cap_b;
+    let h_p2 = state3 - cap_c;
+
+    let (ca, p1a, p2a) = three_cpt_mode_ad(alpha, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
+    let (cb, p1b, p2b) = three_cpt_mode_ad(beta, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
+    let (cg, p1g, p2g) = three_cpt_mode_ad(gamma, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
+
+    let new_s0 = state0 * e_ka;
+    let new_s1 = ca + cb + cg + cap_a * e_ka;
+    let new_s2 = p1a + p1b + p1g + cap_b * e_ka;
+    let new_s3 = p2a + p2b + p2g + cap_c * e_ka;
+    (new_s0, new_s1, new_s2, new_s3)
+}
+
 // ─── AD-safe special functions (re-exports from ad_gradients) ───────
 
 /// Local copy of `erf_ad` so this module compiles independently of the
@@ -694,12 +953,19 @@ fn residual_variance_ad(error_model_id: i32, f_pred: f64, sigma: &[f64]) -> f64 
 /// this module. Caller-side dispatch in `inner_optimizer.rs` uses this
 /// to decide whether to take the AD fast path or fall back to FD.
 pub fn supports_event_driven_ad(pk_model: PkModel) -> bool {
+    // Now covers all analytical PK models — see the `propagate_state_ad`
+    // dispatch.
     matches!(
         pk_model,
         PkModel::OneCptIvBolus
             | PkModel::OneCptInfusion
+            | PkModel::OneCptOral
             | PkModel::TwoCptIvBolus
             | PkModel::TwoCptInfusion
+            | PkModel::TwoCptOral
+            | PkModel::ThreeCptIvBolus
+            | PkModel::ThreeCptInfusion
+            | PkModel::ThreeCptOral
     )
 }
 

@@ -58,17 +58,24 @@ Covariate names in the data file are matched case-insensitively to names used in
 
 ### Time-varying covariate scope
 
-Time-varying covariates are supported for these structural models:
+Time-varying covariates are supported for **all** analytical structural models and ODE-defined models:
 
 - 1-compartment IV bolus (`one_cpt_iv_bolus`)
 - 1-compartment infusion (`one_cpt_infusion`)
+- 1-compartment oral (`one_cpt_oral`)
 - 2-compartment IV bolus (`two_cpt_iv_bolus`)
 - 2-compartment infusion (`two_cpt_infusion`)
+- 2-compartment oral (`two_cpt_oral`)
+- 3-compartment IV bolus (`three_cpt_iv_bolus`)
+- 3-compartment infusion (`three_cpt_infusion`)
+- 3-compartment oral (`three_cpt_oral`)
 - All ODE-defined models (via `[odes]`)
 
-Oral models (`*_oral`) and 3-compartment models silently fall back to a single covariate snapshot taken from the first row of each subject — TV-cov support for those is tracked as a follow-up.
+For oral models, the bolus dose into compartment 1 is interpreted as the depot (NONMEM ADVAN2/ADVAN4/ADVAN12 convention) and observation read-out reads the central compartment.
 
-When a subject has time-varying covariates and the structural model is in the supported list above, the autodiff (Enzyme) gradient fast path uses an *event-driven* AD kernel that consumes per-event covariate snapshots — gradients stay AD-accelerated. For unsupported models (oral, 3-cpt) the AD path is downgraded to finite-differences for the affected subjects and a warning is surfaced in the fit output. The H-matrix Jacobian (used once per inner-loop iteration) currently uses FD on TV-cov subjects regardless of model — forward-mode AD on the event-driven kernel is a follow-up.
+The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients without falling back to finite-differences. The H-matrix Jacobian (used once per inner-loop iteration) currently uses FD on TV-cov subjects regardless of model — forward-mode AD on the event-driven kernel is a known follow-up tracked separately.
+
+Infusion support on the event-driven path is currently restricted to the central compartment (cmt=1 for IV models, cmt=2 for oral models). Infusion into peripheral compartments still falls back to the existing single-snapshot superposition path.
 
 ## Event Types (EVID)
 

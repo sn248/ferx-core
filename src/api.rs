@@ -387,13 +387,20 @@ fn fit_inner(
         model.gradient_method,
         GradientMethod::Ad | GradientMethod::Auto
     );
-    let event_driven_ad_supported = matches!(
-        model.pk_model,
-        PkModel::OneCptIvBolus
-            | PkModel::OneCptInfusion
-            | PkModel::TwoCptIvBolus
-            | PkModel::TwoCptInfusion
-    );
+    // All analytical PK models are now covered by event-driven AD.
+    let event_driven_ad_supported = !matches!(model.pk_model, _ if model.ode_spec.is_some())
+        && matches!(
+            model.pk_model,
+            PkModel::OneCptIvBolus
+                | PkModel::OneCptInfusion
+                | PkModel::OneCptOral
+                | PkModel::TwoCptIvBolus
+                | PkModel::TwoCptInfusion
+                | PkModel::TwoCptOral
+                | PkModel::ThreeCptIvBolus
+                | PkModel::ThreeCptInfusion
+                | PkModel::ThreeCptOral
+        );
     let tv_unsupported_subjects = if want_ad
         && model.tv_fn.is_some()
         && model.ode_spec.is_none()
@@ -408,11 +415,12 @@ fn fit_inner(
         0
     };
     if tv_unsupported_subjects > 0 {
+        // All analytical PkModel variants are currently in the supported
+        // list, so this path only fires if a future variant is added
+        // without AD coverage. Kept as a forward-looking guard.
         accumulated_warnings.push(format!(
             "AD gradients disabled for {}/{} subjects with time-varying covariates \
-             on this structural model — the event-driven AD path currently covers \
-             1- and 2-compartment IV bolus + infusion only. Falling back to FD; \
-             oral and 3-cpt support is tracked as a follow-up.",
+             on this structural model. Falling back to FD.",
             tv_unsupported_subjects,
             population.subjects.len()
         ));
@@ -1733,14 +1741,233 @@ mod tv_cov_integration {
         );
     }
 
-    /// Models the event-driven AD path doesn't yet support (oral, 3-cpt)
-    /// must surface the AD-downgrade warning when combined with TV covariates.
-    /// This locks in the gate so a future refactor can't silently let AD
-    /// run on stale snapshots for these models.
+    // ── Per-model TV-cov fit smoke tests. Each variant builds a tiny
+    //   model + population just rich enough to exercise the per-event
+    //   covariate path and the new analytical / AD propagator. We assert
+    //   the fit returns a finite OFV — that's enough to catch panics
+    //   in the propagator math and the dispatcher wiring. ────────────
+
+    fn build_tv_model(pk_model: PkModel) -> CompiledModel {
+        // CL = TVCL · CR · exp(ETA_CL); other PK params constants suitable
+        // for the model variant. tv_fn is None to keep the test
+        // path FD-only (avoids requiring nightly+enzyme to run unit tests).
+        let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
+        let (theta, theta_names): (Vec<f64>, Vec<String>) = match pk_model {
+            PkModel::OneCptIvBolus | PkModel::OneCptInfusion => {
+                (vec![5.0, 50.0], vec!["TVCL".into(), "TVV".into()])
+            }
+            PkModel::OneCptOral => (
+                vec![5.0, 50.0, 1.5],
+                vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
+            ),
+            PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion => (
+                vec![5.0, 30.0, 2.0, 50.0],
+                vec!["TVCL".into(), "TVV1".into(), "TVQ".into(), "TVV2".into()],
+            ),
+            PkModel::TwoCptOral => (
+                vec![5.0, 30.0, 2.0, 50.0, 1.5],
+                vec![
+                    "TVCL".into(),
+                    "TVV1".into(),
+                    "TVQ".into(),
+                    "TVV2".into(),
+                    "TVKA".into(),
+                ],
+            ),
+            PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion => (
+                vec![5.0, 20.0, 2.0, 30.0, 0.5, 100.0],
+                vec![
+                    "TVCL".into(),
+                    "TVV1".into(),
+                    "TVQ".into(),
+                    "TVV2".into(),
+                    "TVQ3".into(),
+                    "TVV3".into(),
+                ],
+            ),
+            PkModel::ThreeCptOral => (
+                vec![5.0, 20.0, 2.0, 30.0, 0.5, 100.0, 1.5],
+                vec![
+                    "TVCL".into(),
+                    "TVV1".into(),
+                    "TVQ".into(),
+                    "TVV2".into(),
+                    "TVQ3".into(),
+                    "TVV3".into(),
+                    "TVKA".into(),
+                ],
+            ),
+        };
+        let n_theta = theta.len();
+        let default_params = ModelParameters {
+            theta: theta.clone(),
+            theta_names: theta_names.clone(),
+            theta_lower: vec![0.01; n_theta],
+            theta_upper: vec![1000.0; n_theta],
+            theta_fixed: vec![false; n_theta],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector { values: vec![0.1], names: vec!["PROP_ERR".into()] },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+
+        CompiledModel {
+            name: format!("tv_cov_{:?}", pk_model),
+            pk_model,
+            error_model: ErrorModel::Proportional,
+            pk_param_fn: Box::new(move |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                let cr = cov.get("CR").copied().unwrap_or(1.0);
+                // Slot order in PkParams: 0=CL, 1=V, 2=Q, 3=V2, 4=KA, 5=F, 6=Q3, 7=V3.
+                p.values[0] = theta[0] * cr * eta[0].exp(); // CL
+                p.values[1] = theta[1]; // V
+                match pk_model {
+                    PkModel::OneCptOral => p.values[4] = theta[2],
+                    PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion => {
+                        p.values[2] = theta[2];
+                        p.values[3] = theta[3];
+                    }
+                    PkModel::TwoCptOral => {
+                        p.values[2] = theta[2];
+                        p.values[3] = theta[3];
+                        p.values[4] = theta[4];
+                    }
+                    PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion => {
+                        p.values[2] = theta[2];
+                        p.values[3] = theta[3];
+                        p.values[6] = theta[4];
+                        p.values[7] = theta[5];
+                    }
+                    PkModel::ThreeCptOral => {
+                        p.values[2] = theta[2];
+                        p.values[3] = theta[3];
+                        p.values[6] = theta[4];
+                        p.values[7] = theta[5];
+                        p.values[4] = theta[6];
+                    }
+                    _ => {}
+                }
+                p
+            }),
+            n_theta,
+            n_eta: 1,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: Vec::new(),
+            theta_names,
+            eta_names: vec!["ETA_CL".into()],
+            default_params,
+            mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: vec![0],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: vec!["CR".into()],
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+        }
+    }
+
+    fn build_tv_population(infusion: bool) -> Population {
+        let mk_cov = |cr: f64| {
+            let mut h = HashMap::new();
+            h.insert("CR".to_string(), cr);
+            h
+        };
+        let obs_times = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let dose = if infusion {
+            DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0) // 100mg over 2h
+        } else {
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)
+        };
+        let dose_covs = vec![mk_cov(1.0)];
+        let obs_covs = vec![mk_cov(1.0), mk_cov(1.0), mk_cov(1.0), mk_cov(2.0), mk_cov(2.0), mk_cov(2.0)];
+
+        let subject_data: &[(&str, Vec<f64>)] = &[
+            ("S1", vec![1.5, 2.0, 1.8, 1.5, 1.2, 1.0]),
+            ("S2", vec![1.7, 2.1, 1.9, 1.6, 1.3, 1.1]),
+            ("S3", vec![1.4, 1.9, 1.7, 1.4, 1.1, 0.9]),
+            ("S4", vec![1.8, 2.2, 2.0, 1.7, 1.4, 1.2]),
+        ];
+        let subjects: Vec<Subject> = subject_data
+            .iter()
+            .map(|(id, obs)| Subject {
+                id: id.to_string(),
+                doses: vec![dose.clone()],
+                obs_times: obs_times.clone(),
+                observations: obs.clone(),
+                obs_cmts: vec![1; 6],
+                covariates: mk_cov(1.0),
+                dose_covariates: dose_covs.clone(),
+                obs_covariates: obs_covs.clone(),
+                cens: vec![0; 6],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+            })
+            .collect();
+        Population {
+            subjects,
+            covariate_names: vec!["CR".into()],
+            dv_column: "DV".to_string(),
+        }
+    }
+
+    fn assert_tv_fit_finite(pk_model: PkModel, infusion: bool) {
+        let model = build_tv_model(pk_model);
+        let pop = build_tv_population(infusion);
+        let opts = fast_opts(EstimationMethod::Foce);
+        let result = fit(&model, &pop, &model.default_params, &opts)
+            .unwrap_or_else(|e| panic!("fit failed for {:?}: {}", pk_model, e));
+        assert!(
+            result.ofv.is_finite(),
+            "OFV should be finite for {:?}, got {}",
+            pk_model,
+            result.ofv
+        );
+        assert!(
+            pop.subjects.iter().all(|s| s.has_tv_covariates()),
+            "test population must carry TV covariates"
+        );
+    }
+
     #[test]
-    fn tv_cov_unsupported_model_with_ad_emits_downgrade_warning() {
+    fn tv_cov_one_cpt_oral_fits() {
+        assert_tv_fit_finite(PkModel::OneCptOral, false);
+    }
+
+    #[test]
+    fn tv_cov_two_cpt_oral_fits() {
+        assert_tv_fit_finite(PkModel::TwoCptOral, false);
+    }
+
+    #[test]
+    fn tv_cov_three_cpt_iv_bolus_fits() {
+        assert_tv_fit_finite(PkModel::ThreeCptIvBolus, false);
+    }
+
+    #[test]
+    fn tv_cov_three_cpt_infusion_fits() {
+        assert_tv_fit_finite(PkModel::ThreeCptInfusion, true);
+    }
+
+    #[test]
+    fn tv_cov_three_cpt_oral_fits() {
+        assert_tv_fit_finite(PkModel::ThreeCptOral, false);
+    }
+
+    /// All analytical PK models are now covered by the event-driven AD
+    /// path, so the downgrade warning shouldn't fire for any of them
+    /// even on TV-cov data. This locks in the new behavior so a future
+    /// refactor can't silently flip a PkModel variant to FD-fallback
+    /// without updating the AD coverage list.
+    #[test]
+    fn tv_cov_oral_with_ad_does_not_warn() {
         let mut model = make_tv_cov_model();
-        // Switch to oral — not yet covered by event-driven AD.
         model.pk_model = PkModel::OneCptOral;
         model.tv_fn = Some(Box::new(|theta: &[f64], _cov: &HashMap<String, f64>| {
             vec![theta[0], theta[1]]
@@ -1751,11 +1978,12 @@ mod tv_cov_integration {
         let opts = fast_opts(EstimationMethod::Foce);
         let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
         assert!(
-            result
+            !result
                 .warnings
                 .iter()
                 .any(|w| w.contains("AD gradients disabled")),
-            "oral + TV cov must emit downgrade warning; got: {:?}",
+            "1-cpt oral + TV cov is now supported by event-driven AD; \
+             should not warn. Warnings: {:?}",
             result.warnings
         );
     }

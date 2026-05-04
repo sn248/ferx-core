@@ -153,8 +153,18 @@ pub struct Subject {
     pub obs_times: Vec<f64>,
     pub observations: Vec<f64>,
     pub obs_cmts: Vec<usize>,
+    /// Subject-representative covariate values (first non-missing value per
+    /// covariate). Used by the AD fast path and as a fallback when neither
+    /// `dose_covariates` nor `obs_covariates` is populated.
     pub covariates: HashMap<String, f64>,
-    pub tvcov: HashMap<String, Vec<f64>>,
+    /// Per-dose covariate snapshot (LOCF), parallel to `doses`. When the
+    /// dataset has no time-varying covariates, this is empty and consumers
+    /// fall back to `covariates`. NONMEM-equivalent: the value of `$PK`
+    /// inputs at each dose record.
+    pub dose_covariates: Vec<HashMap<String, f64>>,
+    /// Per-observation covariate snapshot (LOCF), parallel to `obs_times`.
+    /// Same fallback semantics as `dose_covariates`.
+    pub obs_covariates: Vec<HashMap<String, f64>>,
     /// Censoring flag per observation (0 = quantified, 1 = below LLOQ).
     /// When `cens[j] == 1`, `observations[j]` holds the LLOQ value (NONMEM convention).
     pub cens: Vec<u8>,
@@ -169,6 +179,25 @@ pub struct Subject {
 impl Subject {
     pub fn has_bloq(&self) -> bool {
         self.cens.iter().any(|&c| c != 0)
+    }
+
+    /// True when the subject carries per-event covariate snapshots (i.e. at
+    /// least one covariate was time-varying in the source data). When false,
+    /// callers can use `covariates` directly and skip the per-event evaluation
+    /// loop.
+    pub fn has_tv_covariates(&self) -> bool {
+        !self.dose_covariates.is_empty() || !self.obs_covariates.is_empty()
+    }
+
+    /// Covariate snapshot at observation index `j`. Falls back to the
+    /// subject-static `covariates` map when per-event snapshots aren't present.
+    pub fn obs_cov(&self, j: usize) -> &HashMap<String, f64> {
+        self.obs_covariates.get(j).unwrap_or(&self.covariates)
+    }
+
+    /// Covariate snapshot at dose index `k`. Same fallback as `obs_cov`.
+    pub fn dose_cov(&self, k: usize) -> &HashMap<String, f64> {
+        self.dose_covariates.get(k).unwrap_or(&self.covariates)
     }
 }
 

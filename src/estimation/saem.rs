@@ -252,12 +252,7 @@ fn obs_nll_single(
     eta: &[f64],
 ) -> f64 {
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
-    let pk_params = (model.pk_param_fn)(theta, eta, &subject.covariates);
-    let preds = if let Some(ref ode_spec) = model.ode_spec {
-        crate::pk::compute_predictions_ode(ode_spec, subject, &pk_params.values)
-    } else {
-        crate::pk::compute_predictions(model.pk_model, subject, &pk_params)
-    };
+    let preds = crate::pk::compute_predictions_with_tv(model, subject, theta, eta);
     let mut nll = 0.0;
     for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let f = f.max(1e-12);
@@ -951,7 +946,8 @@ mod tests {
             observations: vec![1.0],
             obs_cmts: vec![1],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
             cens: vec![0],
             occasions: vec![],
             dose_occasions: vec![],

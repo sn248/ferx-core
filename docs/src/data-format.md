@@ -52,9 +52,23 @@ See [IOV documentation](estimation/iov.md) for full details.
 Any column not in the standard set above is automatically treated as a covariate. Covariate values are:
 
 - **Time-constant**: The first non-missing value for each subject is used
-- **Time-varying**: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied
+- **Time-varying**: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied per event (NONMEM-equivalent: `[individual_parameters]` is re-evaluated at each dose and observation row using that row's covariate values)
 
 Covariate names in the data file are matched case-insensitively to names used in `[individual_parameters]` expressions.
+
+### Time-varying covariate scope
+
+Time-varying covariates are supported for these structural models:
+
+- 1-compartment IV bolus (`one_cpt_iv_bolus`)
+- 1-compartment infusion (`one_cpt_infusion`)
+- 2-compartment IV bolus (`two_cpt_iv_bolus`)
+- 2-compartment infusion (`two_cpt_infusion`)
+- All ODE-defined models (via `[odes]`)
+
+Oral models (`*_oral`) and 3-compartment models silently fall back to a single covariate snapshot taken from the first row of each subject — TV-cov support for those is tracked as a follow-up.
+
+When a subject has time-varying covariates, the autodiff (Enzyme) gradient fast path is automatically downgraded to finite-differences for that subject — surfaced as a single warning in the fit output. Fits remain correct but run slower than they would on a no-TV-cov model. AD support for per-event covariate snapshots is planned.
 
 ## Event Types (EVID)
 

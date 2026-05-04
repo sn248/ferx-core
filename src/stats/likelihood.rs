@@ -5,14 +5,23 @@ use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
-/// Route predictions through analytical PK or ODE solver depending on model.
-fn model_predictions(model: &CompiledModel, subject: &Subject, pk_params: &PkParams) -> Vec<f64> {
-    if let Some(ref ode_spec) = model.ode_spec {
-        // For ODE models, pass PK params as flat array to the RHS
-        pk::compute_predictions_ode(ode_spec, subject, &pk_params.values)
-    } else {
-        pk::compute_predictions(model.pk_model, subject, pk_params)
-    }
+/// Route predictions through analytical PK or ODE solver depending on model,
+/// honouring per-event PK parameters when the subject has time-varying
+/// covariates. The TV-aware dispatcher in `pk::compute_predictions_with_tv`
+/// handles the analytical / ODE / event-driven branching.
+///
+/// This is the canonical predictions entry point for FOCE/FOCEI inner-loop
+/// objectives. Callers must pass the same `(theta, eta)` they use elsewhere
+/// in the NLL — `pk_param_fn` is invoked internally once per event (TV path)
+/// or once per subject (no-TV path).
+#[inline]
+fn model_predictions(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<f64> {
+    pk::compute_predictions_with_tv(model, subject, theta, eta)
 }
 
 /// True when observation `j` of `subject` is censored AND the model requests M3.
@@ -47,9 +56,9 @@ pub fn individual_nll(
     let eta_vec = DVector::from_column_slice(eta);
     let eta_prior = eta_vec.dot(&(&omega_inv * &eta_vec));
 
-    // Compute individual PK parameters and predictions
-    let pk_params = (model.pk_param_fn)(theta, eta, &subject.covariates);
-    let preds = model_predictions(model, subject, &pk_params);
+    // Compute individual predictions; per-event PK params handled internally
+    // when the subject has time-varying covariates.
+    let preds = model_predictions(model, subject, theta, eta);
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let v = residual_variance(model.error_model, f_pred, sigma_values);
@@ -103,9 +112,8 @@ pub fn foce_subject_nll(
     sigma_values: &[f64],
     interaction: bool,
 ) -> f64 {
-    // Individual predictions at eta_hat
-    let pk_params = (model.pk_param_fn)(theta, eta_hat.as_slice(), &subject.covariates);
-    let ipreds = model_predictions(model, subject, &pk_params);
+    // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
+    let ipreds = model_predictions(model, subject, theta, eta_hat.as_slice());
 
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
 
@@ -319,8 +327,7 @@ pub fn foce_subject_nll_iov(
     for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate() {
         let kap: &[f64] = if k < kappas.len() { kappas[k].as_slice() } else { &[] };
         let combined: Vec<f64> = eta_hat.iter().copied().chain(kap.iter().copied()).collect();
-        let pk_params = (model.pk_param_fn)(theta, &combined, &subject.covariates);
-        let all_preds = model_predictions(model, subject, &pk_params);
+        let all_preds = model_predictions(model, subject, theta, &combined);
         for &j in obs_indices {
             ipreds[j] = all_preds[j];
         }
@@ -580,8 +587,7 @@ pub fn individual_nll_iov(
         }
         // Build combined eta for this occasion
         let combined: Vec<f64> = eta.iter().chain(kappas[k].iter()).copied().collect();
-        let pk_params = (model.pk_param_fn)(theta, &combined, &subject.covariates);
-        let all_preds = model_predictions(model, subject, &pk_params);
+        let all_preds = model_predictions(model, subject, theta, &combined);
 
         for &j in obs_indices {
             let y = subject.observations[j];
@@ -614,7 +620,8 @@ mod tests {
             observations: vec![50.0, 40.0, 30.0, 45.0, 35.0, 25.0],
             obs_cmts: vec![1; 6],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),

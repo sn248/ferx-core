@@ -12,13 +12,17 @@ use nalgebra::{DMatrix, DVector};
 use std::path::Path;
 use std::time::Instant;
 
-/// Route predictions through analytical PK or ODE solver.
-fn model_preds(model: &CompiledModel, subject: &Subject, pk_params: &PkParams) -> Vec<f64> {
-    if let Some(ref ode_spec) = model.ode_spec {
-        pk::compute_predictions_ode(ode_spec, subject, &pk_params.values)
-    } else {
-        pk::compute_predictions(model.pk_model, subject, pk_params)
-    }
+/// Route predictions through the TV-aware dispatcher. Used by post-processing
+/// (sdtab generation) and the public `predict` API. Same semantics as
+/// `stats::likelihood::model_predictions` — passes `(theta, eta)` so the
+/// dispatcher can build per-event PK params when the subject has TV covariates.
+fn model_preds(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<f64> {
+    pk::compute_predictions_with_tv(model, subject, theta, eta)
 }
 
 /// Run a model file with a NONMEM-format CSV dataset.
@@ -84,7 +88,8 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             observations: vec![0.0; sim_spec.obs_times.len()],
             obs_cmts: vec![1; sim_spec.obs_times.len()],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
             cens: vec![0; sim_spec.obs_times.len()],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
@@ -372,6 +377,33 @@ fn fit_inner(
 
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
+
+    // TV-covariate AD downgrade notice. The AD path consumes a single
+    // `tv_adjusted` snapshot built from `subject.covariates` (the static
+    // map) so it cannot honour per-event covariate values. When any subject
+    // has TV covariates, the inner-loop AD gate trips per-subject and
+    // gradients fall back to FD — surface that here so the user knows the
+    // fit is slower than the AD-on-paper config implied. Only emitted if
+    // AD was even possible to begin with (analytical model + nightly build).
+    let tv_subjects = population
+        .subjects
+        .iter()
+        .filter(|s| s.has_tv_covariates())
+        .count();
+    let want_ad = matches!(
+        model.gradient_method,
+        GradientMethod::Ad | GradientMethod::Auto
+    );
+    if tv_subjects > 0 && model.tv_fn.is_some() && want_ad {
+        accumulated_warnings.push(format!(
+            "AD gradients disabled for {}/{} subjects with time-varying covariates \
+             (using FD instead). The AD fast path does not yet propagate per-event \
+             covariate snapshots; this is tracked as a follow-up. Fits remain correct \
+             but will run slower.",
+            tv_subjects,
+            population.subjects.len()
+        ));
+    }
     if options.run_covariance_step && n_params_pre > 30 {
         if let Some(n_evals) = covariance_n_evals_estimated {
             accumulated_warnings.push(format!(
@@ -735,24 +767,19 @@ fn compute_subject_results(
                         if k < kappas.len() { kappas[k].as_slice() } else { &[] };
                     let combined: Vec<f64> =
                         eta.iter().copied().chain(kap.iter().copied()).collect();
-                    let pk = (model.pk_param_fn)(&params.theta, &combined, &subject.covariates);
-                    let all_preds = model_preds(model, subject, &pk);
+                    let all_preds = model_preds(model, subject, &params.theta, &combined);
                     for &j in obs_indices {
                         ipreds[j] = all_preds[j];
                     }
                 }
                 ipreds
             } else {
-                let pk_params_ind =
-                    (model.pk_param_fn)(&params.theta, eta.as_slice(), &subject.covariates);
-                model_preds(model, subject, &pk_params_ind)
+                model_preds(model, subject, &params.theta, eta.as_slice())
             };
 
             // Population predictions: f(eta = 0, kappa = 0).
             let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
-            let pk_params_pop =
-                (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
-            let pred = model_preds(model, subject, &pk_params_pop);
+            let pred = model_preds(model, subject, &params.theta, &zero_eta);
 
             // IWRES (NaN on BLOQ rows — see compute_cwres for CWRES handling).
             let mut iwres = compute_iwres(
@@ -1121,11 +1148,8 @@ fn simulate_inner<R: rand::Rng>(
             let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
-            // Compute individual parameters
-            let pk_params = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
-
-            // Predict concentrations
-            let ipreds = model_preds(model, subject, &pk_params);
+            // Predict concentrations (TV-cov-aware dispatcher).
+            let ipreds = model_preds(model, subject, &params.theta, &eta_slice);
 
             // Add residual error
             for (j, &ipred) in ipreds.iter().enumerate() {
@@ -1171,8 +1195,7 @@ pub fn predict(
     let mut results = Vec::new();
 
     for subject in &population.subjects {
-        let pk_params = (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
-        let preds = model_preds(model, subject, &pk_params);
+        let preds = model_preds(model, subject, &params.theta, &zero_eta);
 
         for (j, &pred) in preds.iter().enumerate() {
             results.push(PredictionResult {
@@ -1286,7 +1309,8 @@ mod iov_integration {
                 observations: obs.clone(),
                 obs_cmts: vec![1; 6],
                 covariates: HashMap::new(),
-                tvcov: HashMap::new(),
+                dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
                 cens: vec![0; 6],
                 occasions: occasions.clone(),
                 dose_occasions: dose_occ.clone(),
@@ -1486,6 +1510,215 @@ mod iov_integration {
         assert!(
             msg.contains("trust_region") && msg.contains("IOV"),
             "error message should mention trust_region and IOV, got: {msg}"
+        );
+    }
+}
+
+/// End-to-end checks for time-varying covariate handling: the fit pipeline
+/// must accept per-event covariate snapshots, route through the event-driven
+/// PK path, surface the AD-downgrade warning, and return finite OFVs.
+#[cfg(test)]
+mod tv_cov_integration {
+    use super::fit;
+    use crate::types::*;
+
+    use std::collections::HashMap;
+
+    /// 1-cpt IV bolus model where CL = TVCL * (CR / 1.0) * exp(ETA_CL).
+    /// Covariate `CR` is what changes within a subject in the test population.
+    fn make_tv_cov_model() -> CompiledModel {
+        let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
+        let default_params = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.1, 5.0],
+            theta_upper: vec![50.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        CompiledModel {
+            name: "tv_cov_test".into(),
+            pk_model: PkModel::OneCptIvBolus,
+            error_model: ErrorModel::Proportional,
+            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                let cr = cov.get("CR").copied().unwrap_or(1.0);
+                p.values[0] = theta[0] * cr * eta[0].exp(); // CL = TVCL * CR * exp(ETA_CL)
+                p.values[1] = theta[1]; // V
+                p
+            }),
+            n_theta: 2,
+            n_eta: 1,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: Vec::new(),
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: vec!["ETA_CL".into()],
+            default_params,
+            mu_refs: HashMap::new(),
+            tv_fn: None, // forces FD; no AD path needed for the test
+            pk_indices: vec![0, 1],
+            eta_map: vec![0],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: vec!["CR".into()],
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+        }
+    }
+
+    /// Build a 4-subject population where CR doubles between obs 3 and obs 4.
+    /// This exercises the per-event LOCF snapshot path and the event-driven
+    /// analytical PK propagator.
+    fn make_tv_cov_population() -> Population {
+        let mk_cov = |cr: f64| {
+            let mut h = HashMap::new();
+            h.insert("CR".to_string(), cr);
+            h
+        };
+        let dose_covs = vec![mk_cov(1.0)];
+        let obs_covs = vec![mk_cov(1.0), mk_cov(1.0), mk_cov(1.0), mk_cov(2.0), mk_cov(2.0), mk_cov(2.0)];
+        let obs_times = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+
+        let subject_data: &[(&str, Vec<f64>)] = &[
+            ("S1", vec![18.0, 16.0, 14.0, 11.0, 9.0, 7.0]),
+            ("S2", vec![20.0, 18.0, 16.0, 12.5, 10.0, 8.0]),
+            ("S3", vec![17.0, 15.5, 13.5, 10.5, 8.5, 6.5]),
+            ("S4", vec![21.0, 19.0, 17.0, 13.0, 10.5, 8.5]),
+        ];
+
+        let subjects: Vec<Subject> = subject_data
+            .iter()
+            .map(|(id, obs)| Subject {
+                id: id.to_string(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: obs_times.clone(),
+                observations: obs.clone(),
+                obs_cmts: vec![1; 6],
+                covariates: mk_cov(1.0),
+                dose_covariates: dose_covs.clone(),
+                obs_covariates: obs_covs.clone(),
+                cens: vec![0; 6],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+            })
+            .collect();
+        Population {
+            subjects,
+            covariate_names: vec!["CR".into()],
+            dv_column: "DV".to_string(),
+        }
+    }
+
+    fn fast_opts(method: EstimationMethod) -> FitOptions {
+        FitOptions {
+            method,
+            methods: Vec::new(),
+            outer_maxiter: 30,
+            outer_gtol: 1e-3,
+            inner_maxiter: 50,
+            inner_tol: 1e-4,
+            run_covariance_step: false,
+            interaction: method == EstimationMethod::FoceI,
+            mu_referencing: false,
+            optimizer: Optimizer::Bobyqa,
+            verbose: false,
+            ..FitOptions::default()
+        }
+    }
+
+    #[test]
+    fn tv_cov_foce_runs_and_produces_finite_ofv() {
+        let model = make_tv_cov_model();
+        let pop = make_tv_cov_population();
+        // Sanity check the population was built with TV cov on every subject.
+        assert!(pop.subjects.iter().all(|s| s.has_tv_covariates()));
+
+        let opts = fast_opts(EstimationMethod::Foce);
+        let result = fit(&model, &pop, &model.default_params, &opts).expect("FOCE fit should succeed");
+        assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
+        assert!(result.theta[0] > 0.0, "TVCL should remain positive");
+    }
+
+    #[test]
+    fn tv_cov_focei_runs_and_produces_finite_ofv() {
+        let model = make_tv_cov_model();
+        let pop = make_tv_cov_population();
+        let opts = fast_opts(EstimationMethod::FoceI);
+        let result =
+            fit(&model, &pop, &model.default_params, &opts).expect("FOCEI fit should succeed");
+        assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
+    }
+
+    #[test]
+    fn tv_cov_saem_runs_and_produces_finite_ofv() {
+        let model = make_tv_cov_model();
+        let pop = make_tv_cov_population();
+        let mut opts = fast_opts(EstimationMethod::Saem);
+        opts.saem_n_exploration = 10;
+        opts.saem_n_convergence = 20;
+        let result =
+            fit(&model, &pop, &model.default_params, &opts).expect("SAEM fit should succeed");
+        assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
+    }
+
+    /// Sanity: when the population has zero TV-cov subjects the AD-downgrade
+    /// warning must NOT fire. This is the no-op branch and should keep the
+    /// existing behavior unchanged.
+    #[test]
+    fn no_tv_cov_population_does_not_emit_ad_downgrade_warning() {
+        let model = make_tv_cov_model();
+        // Strip per-event covariates to flip every subject back to "no TV".
+        let mut pop = make_tv_cov_population();
+        for s in &mut pop.subjects {
+            s.dose_covariates.clear();
+            s.obs_covariates.clear();
+        }
+        assert!(pop.subjects.iter().all(|s| !s.has_tv_covariates()));
+
+        let opts = fast_opts(EstimationMethod::Foce);
+        let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("AD gradients disabled")),
+            "no TV cov → no AD downgrade warning; got warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    /// Make sure the AD-downgrade warning *does* fire when subjects have TV
+    /// covariates and the model nominally supports AD (`tv_fn = Some(...)`,
+    /// `gradient_method = Auto`). This catches regressions where the gating
+    /// flag silently flips and AD is used on stale snapshots.
+    #[test]
+    fn tv_cov_population_with_ad_emits_downgrade_warning() {
+        let mut model = make_tv_cov_model();
+        model.tv_fn = Some(Box::new(|theta: &[f64], _cov: &HashMap<String, f64>| {
+            // Returned values are placeholder — never consumed because the
+            // inner loop falls back to FD for TV-cov subjects.
+            vec![theta[0], theta[1]]
+        }));
+        model.gradient_method = GradientMethod::Auto;
+        let pop = make_tv_cov_population();
+
+        let opts = fast_opts(EstimationMethod::Foce);
+        let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("AD gradients disabled")),
+            "TV cov + AD model must emit downgrade warning; got: {:?}",
+            result.warnings
         );
     }
 }

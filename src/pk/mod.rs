@@ -1,12 +1,64 @@
+pub mod event_driven;
 pub mod one_compartment;
 pub mod three_compartment;
 pub mod two_compartment;
 
-use crate::types::{DoseEvent, PkModel, PkParams, Subject};
+use crate::types::{CompiledModel, DoseEvent, PkModel, PkParams, Subject};
 
 pub use one_compartment::*;
 pub use three_compartment::*;
 pub use two_compartment::*;
+
+/// Per-event PK parameter snapshots for one subject.
+///
+/// When the subject has no time-varying covariates, all entries in `dose`
+/// and `obs` are equal (the single subject-static evaluation). The fast
+/// superposition path detects this case via `subject.has_tv_covariates()`
+/// and evaluates `pk_param_fn` only once instead of materialising the
+/// vectors — see [`compute_event_pk_params`] for details.
+#[derive(Debug, Clone)]
+pub struct EventPkParams {
+    /// PK params at each dose event time, parallel to `subject.doses`.
+    pub dose: Vec<PkParams>,
+    /// PK params at each observation event time, parallel to `subject.obs_times`.
+    pub obs: Vec<PkParams>,
+}
+
+/// Materialise per-event PK parameters by evaluating `model.pk_param_fn`
+/// at the LOCF covariate snapshot stored on each event.
+///
+/// When the subject has no time-varying covariates, this evaluates
+/// `pk_param_fn` exactly once and clones the result into every slot — the
+/// downstream PK solver still sees a uniform per-event interface, while
+/// the cost stays at O(1) covariate evaluation.
+pub fn compute_event_pk_params(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> EventPkParams {
+    if subject.has_tv_covariates() {
+        let dose = subject
+            .doses
+            .iter()
+            .enumerate()
+            .map(|(k, _)| (model.pk_param_fn)(theta, eta, subject.dose_cov(k)))
+            .collect();
+        let obs = subject
+            .obs_times
+            .iter()
+            .enumerate()
+            .map(|(j, _)| (model.pk_param_fn)(theta, eta, subject.obs_cov(j)))
+            .collect();
+        EventPkParams { dose, obs }
+    } else {
+        let p = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        EventPkParams {
+            dose: vec![p.clone(); subject.doses.len()],
+            obs: vec![p; subject.obs_times.len()],
+        }
+    }
+}
 
 /// Predict concentration at a given time for a subject, summing contributions
 /// from all prior doses (superposition principle).
@@ -80,6 +132,58 @@ pub fn compute_predictions_ode(
     crate::ode::ode_predictions(ode_spec, pk_params_flat, subject)
 }
 
+/// Top-level prediction dispatcher with time-varying-covariate awareness.
+///
+/// Picks the appropriate path:
+///   - **No TV covariates**: evaluates `pk_param_fn` once and uses the
+///     existing superposition (for analytical PK) or ODE (for ODE PK)
+///     fast paths — no per-event overhead.
+///   - **TV covariates + analytical PK supported by `event_driven`**:
+///     materialises per-event PK parameters and calls the event-driven
+///     propagator. This is the NONMEM-equivalent path.
+///   - **TV covariates + analytical PK *not* supported by event_driven**
+///     (oral / 3-cpt): falls back to single-snapshot superposition using
+///     the *first-event* PK params, matching the pre-TV behavior. The
+///     dispatcher emits no warning here — the parser should have already
+///     surfaced one. Tracked for follow-up.
+///   - **TV covariates + ODE PK**: per-event TV is wired through the ODE
+///     segment loop (Phase 4 — until then this falls back to single
+///     snapshot like the analytical-unsupported branch).
+pub fn compute_predictions_with_tv(
+    model: &crate::types::CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<f64> {
+    let has_tv = subject.has_tv_covariates();
+
+    // ODE path.
+    if let Some(ref ode) = model.ode_spec {
+        if has_tv {
+            let ev = compute_event_pk_params(model, subject, theta, eta);
+            return crate::ode::ode_predictions_event_driven(
+                ode, subject, &ev.dose, &ev.obs,
+            );
+        }
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        return crate::ode::ode_predictions(ode, &pk.values, subject);
+    }
+
+    if has_tv && event_driven::supports_event_driven(model.pk_model) {
+        let ev = compute_event_pk_params(model, subject, theta, eta);
+        return event_driven::event_driven_predictions(
+            model.pk_model,
+            subject,
+            &ev.dose,
+            &ev.obs,
+        );
+    }
+
+    // No-TV fast path (or TV with unsupported model — see docstring).
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    compute_predictions(model.pk_model, subject, &pk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +233,117 @@ mod tests {
         assert_relative_eq!(c_single, c_two, epsilon = 1e-12);
     }
 
+    fn make_subject_with_tv(
+        cov_const: HashMap<String, f64>,
+        dose_cov: Vec<HashMap<String, f64>>,
+        obs_cov: Vec<HashMap<String, f64>>,
+        n_doses: usize,
+        n_obs: usize,
+    ) -> Subject {
+        Subject {
+            id: "1".to_string(),
+            doses: (0..n_doses).map(|i| bolus_dose(i as f64, 100.0)).collect(),
+            obs_times: (0..n_obs).map(|i| 1.0 + i as f64).collect(),
+            observations: vec![0.0; n_obs],
+            obs_cmts: vec![1; n_obs],
+            covariates: cov_const,
+            dose_covariates: dose_cov,
+            obs_covariates: obs_cov,
+            cens: vec![0; n_obs],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+        }
+    }
+
+    /// Build a tiny analytical CompiledModel where CL = covariate `CR` *
+    /// theta[0] (so we can prove pk_param_fn was called with the right
+    /// covariate snapshot per event).
+    fn cl_from_cr_model() -> crate::types::CompiledModel {
+        use crate::types::{
+            BloqMethod, CompiledModel, ErrorModel, GradientMethod, ModelParameters, OmegaMatrix,
+            PkModel, SigmaVector,
+        };
+        CompiledModel {
+            name: "cl_from_cr".into(),
+            pk_model: PkModel::OneCptIvBolus,
+            error_model: ErrorModel::Additive,
+            pk_param_fn: Box::new(|theta, _eta, cov| {
+                let mut p = PkParams::default();
+                let cr = cov.get("CR").copied().unwrap_or(1.0);
+                p.values[crate::types::PK_IDX_CL] = theta[0] * cr;
+                p.values[crate::types::PK_IDX_V] = 50.0;
+                p
+            }),
+            n_theta: 1,
+            n_eta: 0,
+            n_epsilon: 1,
+            n_kappa: 0,
+            theta_names: vec!["TVCL".into()],
+            eta_names: Vec::new(),
+            kappa_names: Vec::new(),
+            default_params: ModelParameters {
+                theta: vec![1.0],
+                theta_names: vec!["TVCL".into()],
+                theta_lower: vec![0.0],
+                theta_upper: vec![f64::INFINITY],
+                theta_fixed: vec![false],
+                omega: OmegaMatrix::from_diagonal(&[], Vec::new()),
+                omega_fixed: Vec::new(),
+                sigma: SigmaVector { values: vec![0.1], names: vec!["EPS".into()] },
+                sigma_fixed: vec![false],
+                omega_iov: None,
+                kappa_fixed: Vec::new(),
+            },
+            mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![],
+            eta_map: vec![],
+            pk_idx_f64: vec![],
+            sel_flat: vec![],
+            ode_spec: None,
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: vec!["CR".into()],
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_event_pk_params_no_tv_evaluates_once() {
+        // No TV covariates → uses subject.covariates; result is identical
+        // for every event.
+        let mut covs = HashMap::new();
+        covs.insert("CR".to_string(), 2.0);
+        let subj = make_subject_with_tv(covs, Vec::new(), Vec::new(), 2, 3);
+        let model = cl_from_cr_model();
+        let ev = compute_event_pk_params(&model, &subj, &[10.0], &[]);
+        assert_eq!(ev.dose.len(), 2);
+        assert_eq!(ev.obs.len(), 3);
+        // CL = theta * CR = 10 * 2 = 20 everywhere.
+        for p in ev.dose.iter().chain(ev.obs.iter()) {
+            assert_relative_eq!(p.cl(), 20.0, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_event_pk_params_tv_uses_per_event_snapshot() {
+        // Per-event snapshots drive different CL at each event.
+        let mk = |cr: f64| {
+            let mut h = HashMap::new();
+            h.insert("CR".to_string(), cr);
+            h
+        };
+        let dose_cov = vec![mk(1.0), mk(1.5)];
+        let obs_cov = vec![mk(1.0), mk(2.0)];
+        let subj = make_subject_with_tv(mk(1.0), dose_cov, obs_cov, 2, 2);
+        let model = cl_from_cr_model();
+        let ev = compute_event_pk_params(&model, &subj, &[10.0], &[]);
+        assert_relative_eq!(ev.dose[0].cl(), 10.0, epsilon = 1e-12);
+        assert_relative_eq!(ev.dose[1].cl(), 15.0, epsilon = 1e-12);
+        assert_relative_eq!(ev.obs[0].cl(), 10.0, epsilon = 1e-12);
+        assert_relative_eq!(ev.obs[1].cl(), 20.0, epsilon = 1e-12);
+    }
+
     #[test]
     fn test_compute_predictions_length() {
         let subject = Subject {
@@ -138,7 +353,8 @@ mod tests {
             observations: vec![0.0; 4],
             obs_cmts: vec![1; 4],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),

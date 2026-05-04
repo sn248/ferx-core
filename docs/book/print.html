@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-e12ec2fe.js";
+            window.path_to_searchindex_js = "searchindex-1178ce2a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-911e3088.js"></script>
@@ -1969,9 +1969,20 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 <p>Any column not in the standard set above is automatically treated as a covariate. Covariate values are:</p>
 <ul>
 <li><strong>Time-constant</strong>: The first non-missing value for each subject is used</li>
-<li><strong>Time-varying</strong>: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied</li>
+<li><strong>Time-varying</strong>: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied per event (NONMEM-equivalent: <code>[individual_parameters]</code> is re-evaluated at each dose and observation row using that row’s covariate values)</li>
 </ul>
 <p>Covariate names in the data file are matched case-insensitively to names used in <code>[individual_parameters]</code> expressions.</p>
+<h3 id="time-varying-covariate-scope"><a class="header" href="#time-varying-covariate-scope">Time-varying covariate scope</a></h3>
+<p>Time-varying covariates are supported for these structural models:</p>
+<ul>
+<li>1-compartment IV bolus (<code>one_cpt_iv_bolus</code>)</li>
+<li>1-compartment infusion (<code>one_cpt_infusion</code>)</li>
+<li>2-compartment IV bolus (<code>two_cpt_iv_bolus</code>)</li>
+<li>2-compartment infusion (<code>two_cpt_infusion</code>)</li>
+<li>All ODE-defined models (via <code>[odes]</code>)</li>
+</ul>
+<p>Oral models (<code>*_oral</code>) and 3-compartment models silently fall back to a single covariate snapshot taken from the first row of each subject — TV-cov support for those is tracked as a follow-up.</p>
+<p>When a subject has time-varying covariates, the autodiff (Enzyme) gradient fast path is automatically downgraded to finite-differences for that subject — surfaced as a single warning in the fit output. Fits remain correct but run slower than they would on a no-TV-cov model. AD support for per-event covariate snapshots is planned.</p>
 <h2 id="event-types-evid"><a class="header" href="#event-types-evid">Event Types (EVID)</a></h2>
 <div class="table-wrapper">
 <table>
@@ -2873,10 +2884,18 @@ pub struct Subject {
     pub obs_times: Vec&lt;f64&gt;,
     pub observations: Vec&lt;f64&gt;,
     pub obs_cmts: Vec&lt;usize&gt;,
-    pub covariates: HashMap&lt;String, f64&gt;,      // Time-constant
-    pub tvcov: HashMap&lt;String, Vec&lt;f64&gt;&gt;,       // Time-varying (LOCF)
+    pub covariates: HashMap&lt;String, f64&gt;,                  // Subject-static fallback (first values)
+    pub dose_covariates: Vec&lt;HashMap&lt;String, f64&gt;&gt;,        // Per-dose LOCF snapshot (empty if no TV cov)
+    pub obs_covariates: Vec&lt;HashMap&lt;String, f64&gt;&gt;,         // Per-obs LOCF snapshot (empty if no TV cov)
+    pub cens: Vec&lt;u8&gt;,
+    pub occasions: Vec&lt;u32&gt;,
+    pub dose_occasions: Vec&lt;u32&gt;,
 }
 <span class="boring">}</span></code></pre>
+<p><code>dose_covariates</code> and <code>obs_covariates</code> are populated only when at least one
+covariate varies within the subject — the no-TV-cov fast paths use
+<code>covariates</code> directly. Helpers <code>subject.has_tv_covariates()</code>,
+<code>subject.dose_cov(k)</code>, and <code>subject.obs_cov(j)</code> abstract over this.</p>
 <h2 id="modelparameters"><a class="header" href="#modelparameters">ModelParameters</a></h2>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
@@ -3262,7 +3281,7 @@ println!("{} subjects, {} observations",
 <li>Rows with <code>EVID=1</code> are treated as dose events</li>
 <li>Rows with <code>EVID=0</code> and <code>MDV=0</code> are treated as observations</li>
 <li>Time-constant covariates use the first non-missing value per subject</li>
-<li>Time-varying covariates use Last Observation Carried Forward (LOCF)</li>
+<li>Time-varying covariates use Last Observation Carried Forward (LOCF) per event — <code>[individual_parameters]</code> is re-evaluated at each dose and observation row using that row’s covariate values (NONMEM-equivalent semantics). Currently supported on 1- and 2-compartment IV bolus / infusion models and all ODE-defined models; oral and 3-compartment models fall back to a single first-row snapshot</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="frequently-asked-questions"><a class="header" href="#frequently-asked-questions">Frequently Asked Questions</a></h1>

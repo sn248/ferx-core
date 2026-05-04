@@ -18,17 +18,29 @@ use crate::ad::ad_gradients::{self, FlatDoseData};
 /// perturbations, even at small `n_eta`.
 ///
 /// AD requires (a) the crate compiled with `feature = "autodiff"` and
-/// (b) the model to have `tv_fn` populated (analytical PK path only).
+/// (b) the model to have `tv_fn` populated (analytical PK path only) and
+/// (c) the **subject** to not carry per-event TV covariate snapshots —
+/// the AD path consumes a single `tv_adjusted` vector built from
+/// `subject.covariates` (the static snapshot), which would silently
+/// ignore the per-event values. The fit-level warning surfaced in
+/// `api::fit_inner` tells the user the entire fit is running on FD when
+/// any subject triggers this gate; a follow-up will teach the AD path
+/// per-event tv arrays so AD can stay on for TV-cov data.
+///
 /// ODE models have no AD path, so `Auto` resolves to FD there.
-fn resolve_gradient_method(model: &CompiledModel) -> bool {
+fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> bool {
     #[cfg(not(feature = "autodiff"))]
     {
         let _ = model;
+        let _ = subject;
         return false;
     }
     #[cfg(feature = "autodiff")]
     {
         if model.tv_fn.is_none() {
+            return false;
+        }
+        if subject.has_tv_covariates() {
             return false;
         }
         match model.gradient_method {
@@ -192,7 +204,7 @@ pub fn find_ebe(
     // Resolve Auto → concrete method based on model/eta characteristics.
     // Autodiff is only available when the crate was compiled with the feature
     // and the model provides tv_fn (the parser attaches it for analytical PK).
-    let use_ad = resolve_gradient_method(model);
+    let use_ad = resolve_gradient_method(model, subject);
 
     // Try BFGS — AD gradient if `use_ad`, FD otherwise. The AD gradient of
     // individual_nll w.r.t. psi equals the gradient w.r.t. eta_true (chain
@@ -478,22 +490,13 @@ fn compute_jacobian_fd_iov(
             let mut combined_plus: Vec<f64> = eta_pert.clone();
             combined_plus[col] = eta[col] + h_step;
             combined_plus.extend_from_slice(&kappas[k]);
-            let pk_plus = (model.pk_param_fn)(theta, &combined_plus, &subject.covariates);
-            let preds_plus = if let Some(ref ode_spec) = model.ode_spec {
-                pk::compute_predictions_ode(ode_spec, subject, &pk_plus.values)
-            } else {
-                pk::compute_predictions(model.pk_model, subject, &pk_plus)
-            };
+            let preds_plus = pk::compute_predictions_with_tv(model, subject, theta, &combined_plus);
 
             let mut combined_minus: Vec<f64> = eta_pert.clone();
             combined_minus[col] = eta[col] - h_step;
             combined_minus.extend_from_slice(&kappas[k]);
-            let pk_minus = (model.pk_param_fn)(theta, &combined_minus, &subject.covariates);
-            let preds_minus = if let Some(ref ode_spec) = model.ode_spec {
-                pk::compute_predictions_ode(ode_spec, subject, &pk_minus.values)
-            } else {
-                pk::compute_predictions(model.pk_model, subject, &pk_minus)
-            };
+            let preds_minus =
+                pk::compute_predictions_with_tv(model, subject, theta, &combined_minus);
 
             for &j in obs_indices {
                 h[(j, col)] = (preds_plus[j] - preds_minus[j]) / (2.0 * h_step);
@@ -831,20 +834,10 @@ fn compute_jacobian_fd(
         let h_step = eps * (1.0 + eta[j].abs());
 
         eta_pert[j] = eta[j] + h_step;
-        let pk_plus = (model.pk_param_fn)(theta, &eta_pert, &subject.covariates);
-        let preds_plus = if let Some(ref ode_spec) = model.ode_spec {
-            pk::compute_predictions_ode(ode_spec, subject, &pk_plus.values)
-        } else {
-            pk::compute_predictions(model.pk_model, subject, &pk_plus)
-        };
+        let preds_plus = pk::compute_predictions_with_tv(model, subject, theta, &eta_pert);
 
         eta_pert[j] = eta[j] - h_step;
-        let pk_minus = (model.pk_param_fn)(theta, &eta_pert, &subject.covariates);
-        let preds_minus = if let Some(ref ode_spec) = model.ode_spec {
-            pk::compute_predictions_ode(ode_spec, subject, &pk_minus.values)
-        } else {
-            pk::compute_predictions(model.pk_model, subject, &pk_minus)
-        };
+        let preds_minus = pk::compute_predictions_with_tv(model, subject, theta, &eta_pert);
 
         for i in 0..n_obs {
             h[(i, j)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);
@@ -1059,7 +1052,8 @@ mod iov_tests {
             observations: vec![40.0, 32.0, 25.0, 38.0, 30.0, 22.0],
             obs_cmts: vec![1; 6],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
@@ -1143,7 +1137,8 @@ mod iov_tests {
             observations: vec![40.0, 32.0, 20.0],
             obs_cmts: vec![1; 3],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),

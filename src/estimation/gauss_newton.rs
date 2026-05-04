@@ -606,12 +606,8 @@ fn subject_nll_at(
         }
     }
 
-    let pk_params = (model.pk_param_fn)(&params.theta, eta_hat.as_slice(), &subject.covariates);
-    let ipreds = if let Some(ref ode_spec) = model.ode_spec {
-        crate::pk::compute_predictions_ode(ode_spec, subject, &pk_params.values)
-    } else {
-        crate::pk::compute_predictions(model.pk_model, subject, &pk_params)
-    };
+    let ipreds =
+        crate::pk::compute_predictions_with_tv(model, subject, &params.theta, eta_hat.as_slice());
 
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
 

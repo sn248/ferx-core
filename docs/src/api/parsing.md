@@ -99,4 +99,4 @@ println!("{} subjects, {} observations",
 - Rows with `EVID=1` are treated as dose events
 - Rows with `EVID=0` and `MDV=0` are treated as observations
 - Time-constant covariates use the first non-missing value per subject
-- Time-varying covariates use Last Observation Carried Forward (LOCF)
+- Time-varying covariates use Last Observation Carried Forward (LOCF) per event — `[individual_parameters]` is re-evaluated at each dose and observation row using that row's covariate values (NONMEM-equivalent semantics). Currently supported on 1- and 2-compartment IV bolus / infusion models and all ODE-defined models; oral and 3-compartment models fall back to a single first-row snapshot

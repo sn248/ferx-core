@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-1178ce2a.js";
+            window.path_to_searchindex_js = "searchindex-b0b7a707.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-911e3088.js"></script>
@@ -1982,7 +1982,7 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 <li>All ODE-defined models (via <code>[odes]</code>)</li>
 </ul>
 <p>Oral models (<code>*_oral</code>) and 3-compartment models silently fall back to a single covariate snapshot taken from the first row of each subject — TV-cov support for those is tracked as a follow-up.</p>
-<p>When a subject has time-varying covariates, the autodiff (Enzyme) gradient fast path is automatically downgraded to finite-differences for that subject — surfaced as a single warning in the fit output. Fits remain correct but run slower than they would on a no-TV-cov model. AD support for per-event covariate snapshots is planned.</p>
+<p>When a subject has time-varying covariates and the structural model is in the supported list above, the autodiff (Enzyme) gradient fast path uses an <em>event-driven</em> AD kernel that consumes per-event covariate snapshots — gradients stay AD-accelerated. For unsupported models (oral, 3-cpt) the AD path is downgraded to finite-differences for the affected subjects and a warning is surfaced in the fit output. The H-matrix Jacobian (used once per inner-loop iteration) currently uses FD on TV-cov subjects regardless of model — forward-mode AD on the event-driven kernel is a follow-up.</p>
 <h2 id="event-types-evid"><a class="header" href="#event-types-evid">Event Types (EVID)</a></h2>
 <div class="table-wrapper">
 <table>

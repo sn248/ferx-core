@@ -68,7 +68,7 @@ Time-varying covariates are supported for these structural models:
 
 Oral models (`*_oral`) and 3-compartment models silently fall back to a single covariate snapshot taken from the first row of each subject — TV-cov support for those is tracked as a follow-up.
 
-When a subject has time-varying covariates, the autodiff (Enzyme) gradient fast path is automatically downgraded to finite-differences for that subject — surfaced as a single warning in the fit output. Fits remain correct but run slower than they would on a no-TV-cov model. AD support for per-event covariate snapshots is planned.
+When a subject has time-varying covariates and the structural model is in the supported list above, the autodiff (Enzyme) gradient fast path uses an *event-driven* AD kernel that consumes per-event covariate snapshots — gradients stay AD-accelerated. For unsupported models (oral, 3-cpt) the AD path is downgraded to finite-differences for the affected subjects and a warning is surfaced in the fit output. The H-matrix Jacobian (used once per inner-loop iteration) currently uses FD on TV-cov subjects regardless of model — forward-mode AD on the event-driven kernel is a follow-up.
 
 ## Event Types (EVID)
 

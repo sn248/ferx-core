@@ -378,29 +378,42 @@ fn fit_inner(
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
-    // TV-covariate AD downgrade notice. The AD path consumes a single
-    // `tv_adjusted` snapshot built from `subject.covariates` (the static
-    // map) so it cannot honour per-event covariate values. When any subject
-    // has TV covariates, the inner-loop AD gate trips per-subject and
-    // gradients fall back to FD — surface that here so the user knows the
-    // fit is slower than the AD-on-paper config implied. Only emitted if
-    // AD was even possible to begin with (analytical model + nightly build).
-    let tv_subjects = population
-        .subjects
-        .iter()
-        .filter(|s| s.has_tv_covariates())
-        .count();
+    // TV-covariate AD downgrade notice — only fires for the *unsupported*
+    // structural models (oral / 3-cpt). Supported analytical models
+    // (1- and 2-cpt IV bolus + infusion) now run the event-driven AD path
+    // for TV-cov subjects via `crate::ad::event_driven_ad`. ODE models
+    // never had an AD path to start with so the message would be noise.
     let want_ad = matches!(
         model.gradient_method,
         GradientMethod::Ad | GradientMethod::Auto
     );
-    if tv_subjects > 0 && model.tv_fn.is_some() && want_ad {
+    let event_driven_ad_supported = matches!(
+        model.pk_model,
+        PkModel::OneCptIvBolus
+            | PkModel::OneCptInfusion
+            | PkModel::TwoCptIvBolus
+            | PkModel::TwoCptInfusion
+    );
+    let tv_unsupported_subjects = if want_ad
+        && model.tv_fn.is_some()
+        && model.ode_spec.is_none()
+        && !event_driven_ad_supported
+    {
+        population
+            .subjects
+            .iter()
+            .filter(|s| s.has_tv_covariates())
+            .count()
+    } else {
+        0
+    };
+    if tv_unsupported_subjects > 0 {
         accumulated_warnings.push(format!(
             "AD gradients disabled for {}/{} subjects with time-varying covariates \
-             (using FD instead). The AD fast path does not yet propagate per-event \
-             covariate snapshots; this is tracked as a follow-up. Fits remain correct \
-             but will run slower.",
-            tv_subjects,
+             on this structural model — the event-driven AD path currently covers \
+             1- and 2-compartment IV bolus + infusion only. Falling back to FD; \
+             oral and 3-cpt support is tracked as a follow-up.",
+            tv_unsupported_subjects,
             population.subjects.len()
         ));
     }
@@ -1695,16 +1708,41 @@ mod tv_cov_integration {
         );
     }
 
-    /// Make sure the AD-downgrade warning *does* fire when subjects have TV
-    /// covariates and the model nominally supports AD (`tv_fn = Some(...)`,
-    /// `gradient_method = Auto`). This catches regressions where the gating
-    /// flag silently flips and AD is used on stale snapshots.
+    /// Supported analytical models with TV covariates take the event-driven
+    /// AD path — no downgrade warning. (Pre-AD-fast-path version of this
+    /// test asserted the opposite; updated when event-driven AD landed.)
     #[test]
-    fn tv_cov_population_with_ad_emits_downgrade_warning() {
+    fn tv_cov_supported_model_with_ad_does_not_warn() {
         let mut model = make_tv_cov_model();
         model.tv_fn = Some(Box::new(|theta: &[f64], _cov: &HashMap<String, f64>| {
-            // Returned values are placeholder — never consumed because the
-            // inner loop falls back to FD for TV-cov subjects.
+            vec![theta[0], theta[1]]
+        }));
+        model.gradient_method = GradientMethod::Auto;
+        let pop = make_tv_cov_population();
+
+        let opts = fast_opts(EstimationMethod::Foce);
+        let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("AD gradients disabled")),
+            "1-cpt IV bolus + TV cov is supported by event-driven AD; should not warn. \
+             Warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    /// Models the event-driven AD path doesn't yet support (oral, 3-cpt)
+    /// must surface the AD-downgrade warning when combined with TV covariates.
+    /// This locks in the gate so a future refactor can't silently let AD
+    /// run on stale snapshots for these models.
+    #[test]
+    fn tv_cov_unsupported_model_with_ad_emits_downgrade_warning() {
+        let mut model = make_tv_cov_model();
+        // Switch to oral — not yet covered by event-driven AD.
+        model.pk_model = PkModel::OneCptOral;
+        model.tv_fn = Some(Box::new(|theta: &[f64], _cov: &HashMap<String, f64>| {
             vec![theta[0], theta[1]]
         }));
         model.gradient_method = GradientMethod::Auto;
@@ -1717,7 +1755,7 @@ mod tv_cov_integration {
                 .warnings
                 .iter()
                 .any(|w| w.contains("AD gradients disabled")),
-            "TV cov + AD model must emit downgrade warning; got: {:?}",
+            "oral + TV cov must emit downgrade warning; got: {:?}",
             result.warnings
         );
     }

@@ -18,35 +18,58 @@ use crate::ad::ad_gradients::{self, FlatDoseData};
 /// perturbations, even at small `n_eta`.
 ///
 /// AD requires (a) the crate compiled with `feature = "autodiff"` and
-/// (b) the model to have `tv_fn` populated (analytical PK path only) and
-/// (c) the **subject** to not carry per-event TV covariate snapshots —
-/// the AD path consumes a single `tv_adjusted` vector built from
-/// `subject.covariates` (the static snapshot), which would silently
-/// ignore the per-event values. The fit-level warning surfaced in
-/// `api::fit_inner` tells the user the entire fit is running on FD when
-/// any subject triggers this gate; a follow-up will teach the AD path
-/// per-event tv arrays so AD can stay on for TV-cov data.
-///
+/// (b) the model to have `tv_fn` populated (analytical PK path only).
 /// ODE models have no AD path, so `Auto` resolves to FD there.
-fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> bool {
+///
+/// For subjects with time-varying covariates, the *event-driven* AD path
+/// is used when the structural model is in
+/// [`crate::ad::event_driven_ad::supports_event_driven_ad`] (currently
+/// 1- and 2-cpt IV bolus + infusion). Other models with TV covariates
+/// fall back to FD — the single-snapshot AD path can't honour per-event
+/// covariate values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InnerGradientMethod {
+    /// Finite differences. Used when AD is unavailable/disabled, when
+    /// the model has no `tv_fn`, or when the subject has TV covariates
+    /// on a model the event-driven AD path doesn't support yet.
+    Fd,
+    /// Reverse-mode AD with a single per-subject `tv_adjusted` vector
+    /// — the legacy fast path. Correct only when the subject has no
+    /// time-varying covariates.
+    AdSingleSnapshot,
+    /// Reverse-mode AD with per-event `tv` arrays — required for
+    /// time-varying covariates to be reflected in gradients.
+    AdEventDriven,
+}
+
+fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGradientMethod {
     #[cfg(not(feature = "autodiff"))]
     {
         let _ = model;
         let _ = subject;
-        return false;
+        return InnerGradientMethod::Fd;
     }
     #[cfg(feature = "autodiff")]
     {
         if model.tv_fn.is_none() {
-            return false;
+            return InnerGradientMethod::Fd;
         }
-        if subject.has_tv_covariates() {
-            return false;
-        }
-        match model.gradient_method {
+        let want_ad = match model.gradient_method {
             GradientMethod::Ad => true,
             GradientMethod::Fd => false,
             GradientMethod::Auto => true,
+        };
+        if !want_ad {
+            return InnerGradientMethod::Fd;
+        }
+        if subject.has_tv_covariates() {
+            if crate::ad::event_driven_ad::supports_event_driven_ad(model.pk_model) {
+                InnerGradientMethod::AdEventDriven
+            } else {
+                InnerGradientMethod::Fd
+            }
+        } else {
+            InnerGradientMethod::AdSingleSnapshot
         }
     }
 }
@@ -204,18 +227,14 @@ pub fn find_ebe(
     // Resolve Auto → concrete method based on model/eta characteristics.
     // Autodiff is only available when the crate was compiled with the feature
     // and the model provides tv_fn (the parser attaches it for analytical PK).
-    let use_ad = resolve_gradient_method(model, subject);
+    let grad_method = resolve_gradient_method(model, subject);
 
-    // Try BFGS — AD gradient if `use_ad`, FD otherwise. The AD gradient of
-    // individual_nll w.r.t. psi equals the gradient w.r.t. eta_true (chain
-    // rule: d/dpsi = d/d(eta_true), since psi = eta_true + mu).
+    // Try BFGS — AD gradient when `grad_method` is one of the AD variants,
+    // FD otherwise. The AD gradient of individual_nll w.r.t. psi equals the
+    // gradient w.r.t. eta_true (chain rule: d/dpsi = d/d(eta_true), since
+    // psi = eta_true + mu).
     #[cfg(feature = "autodiff")]
-    let result = if use_ad {
-        let tv_fn = model
-            .tv_fn
-            .as_ref()
-            .expect("resolve_gradient_method guarantees tv_fn");
-        let tv_adjusted = tv_fn(&params.theta, &subject.covariates);
+    let result = if grad_method != InnerGradientMethod::Fd {
         let dose_data = FlatDoseData::from_subject(subject);
         let omega_inv = params
             .omega
@@ -260,35 +279,81 @@ pub fn find_ebe(
             vec![0.0; subject.observations.len()]
         };
         let mu_ad = mu.clone();
-        let grad_fn = |p: &[f64]| -> Vec<f64> {
-            let eta_t: Vec<f64> = p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
-            let t0 = std::time::Instant::now();
-            let (_, g) = ad_gradients::compute_nll_gradient_ad(
-                &eta_t,
-                &tv_adjusted,
-                &omega_inv_flat,
-                log_det_omega,
-                &params.sigma.values,
-                &dose_data,
-                &subject.obs_times,
-                &subject.observations,
-                &cens_f64,
-                model.pk_model,
-                model.error_model,
-                &model.pk_idx_f64,
-                &model.sel_flat,
-            );
-            GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
-            g
-        };
-        bfgs_minimize_with_grad(&obj, &grad_fn, &mut psi, n_eta, max_iter, tol)
+
+        // Build the path-specific helpers up front so the closure doesn't
+        // re-allocate on every gradient call.
+        let tv_fn = model
+            .tv_fn
+            .as_ref()
+            .expect("resolve_gradient_method guarantees tv_fn for AD branches");
+
+        match grad_method {
+            InnerGradientMethod::AdSingleSnapshot => {
+                let tv_adjusted = tv_fn(&params.theta, &subject.covariates);
+                let grad_fn = |p: &[f64]| -> Vec<f64> {
+                    let eta_t: Vec<f64> =
+                        p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
+                    let t0 = std::time::Instant::now();
+                    let (_, g) = ad_gradients::compute_nll_gradient_ad(
+                        &eta_t,
+                        &tv_adjusted,
+                        &omega_inv_flat,
+                        log_det_omega,
+                        &params.sigma.values,
+                        &dose_data,
+                        &subject.obs_times,
+                        &subject.observations,
+                        &cens_f64,
+                        model.pk_model,
+                        model.error_model,
+                        &model.pk_idx_f64,
+                        &model.sel_flat,
+                    );
+                    GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
+                    g
+                };
+                bfgs_minimize_with_grad(&obj, &grad_fn, &mut psi, n_eta, max_iter, tol)
+            }
+            InnerGradientMethod::AdEventDriven => {
+                let event_data =
+                    crate::ad::event_driven_ad::FlatEventData::from_subject(subject);
+                let tv_per_event = crate::ad::event_driven_ad::FlatEventTv::from_subject(
+                    model,
+                    subject,
+                    &params.theta,
+                );
+                let grad_fn = |p: &[f64]| -> Vec<f64> {
+                    let eta_t: Vec<f64> =
+                        p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
+                    let t0 = std::time::Instant::now();
+                    let (_, g) = crate::ad::event_driven_ad::compute_nll_gradient_event_driven_ad(
+                        &eta_t,
+                        &tv_per_event,
+                        &omega_inv_flat,
+                        log_det_omega,
+                        &params.sigma.values,
+                        &event_data,
+                        &subject.observations,
+                        &cens_f64,
+                        model.pk_model,
+                        model.error_model,
+                        &model.pk_idx_f64,
+                        &model.sel_flat,
+                    );
+                    GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
+                    g
+                };
+                bfgs_minimize_with_grad(&obj, &grad_fn, &mut psi, n_eta, max_iter, tol)
+            }
+            InnerGradientMethod::Fd => unreachable!("guarded above"),
+        }
     } else {
         bfgs_minimize(&obj, &mut psi, n_eta, max_iter, tol)
     };
 
     #[cfg(not(feature = "autodiff"))]
     let result = {
-        let _ = use_ad; // silence unused warning on stable builds
+        let _ = grad_method; // silence unused warning on stable builds
         bfgs_minimize(&obj, &mut psi, n_eta, max_iter, tol)
     };
 
@@ -308,33 +373,49 @@ pub fn find_ebe(
     // Recover eta_true = psi - mu (mean-zero, NONMEM-compatible output)
     let eta_true: Vec<f64> = psi.iter().zip(mu.iter()).map(|(p, m)| p - m).collect();
 
-    // Compute Jacobian at eta_true — use AD when available and chosen.
+    // Compute Jacobian at eta_true — match the gradient path so the H matrix
+    // is consistent with the gradient that drove convergence.
     #[cfg(feature = "autodiff")]
-    let h_matrix = if use_ad {
-        let tv_fn = model
-            .tv_fn
-            .as_ref()
-            .expect("resolve_gradient_method guarantees tv_fn");
-        let tv_adjusted = tv_fn(&params.theta, &subject.covariates);
-        let dose_data = FlatDoseData::from_subject(subject);
-        let t0 = std::time::Instant::now();
-        let j = ad_gradients::compute_jacobian_ad(
-            &eta_true,
-            &tv_adjusted,
-            &dose_data,
-            &subject.obs_times,
-            subject.obs_times.len(),
-            model.pk_model,
-            &model.pk_idx_f64,
-            &model.sel_flat,
-        );
-        GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
-        j
-    } else {
-        let t0 = std::time::Instant::now();
-        let j = compute_jacobian_fd(model, subject, &params.theta, &eta_true);
-        GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
-        j
+    let h_matrix = match grad_method {
+        InnerGradientMethod::AdSingleSnapshot => {
+            let tv_fn = model
+                .tv_fn
+                .as_ref()
+                .expect("resolve_gradient_method guarantees tv_fn");
+            let tv_adjusted = tv_fn(&params.theta, &subject.covariates);
+            let dose_data = FlatDoseData::from_subject(subject);
+            let t0 = std::time::Instant::now();
+            let j = ad_gradients::compute_jacobian_ad(
+                &eta_true,
+                &tv_adjusted,
+                &dose_data,
+                &subject.obs_times,
+                subject.obs_times.len(),
+                model.pk_model,
+                &model.pk_idx_f64,
+                &model.sel_flat,
+            );
+            GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
+            j
+        }
+        InnerGradientMethod::AdEventDriven => {
+            // Forward-mode AD Jacobian for the event-driven path is not yet
+            // wired (Enzyme's `forwardModeInvertedPointerFallback` trips on
+            // the per-event scalar-state form). Reverse-mode AD covers the
+            // BFGS gradient which is the hot path; FD on the per-subject
+            // H matrix runs once per outer iteration and is already part of
+            // the inner loop's other consumers, so the cost is bounded.
+            let t0 = std::time::Instant::now();
+            let j = compute_jacobian_fd(model, subject, &params.theta, &eta_true);
+            GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
+            j
+        }
+        InnerGradientMethod::Fd => {
+            let t0 = std::time::Instant::now();
+            let j = compute_jacobian_fd(model, subject, &params.theta, &eta_true);
+            GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
+            j
+        }
     };
 
     #[cfg(not(feature = "autodiff"))]

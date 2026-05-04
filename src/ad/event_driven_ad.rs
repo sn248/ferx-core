@@ -50,6 +50,11 @@ pub struct FlatEventData {
     pub dose_amts: Vec<f64>,
     pub dose_rates: Vec<f64>,
     pub dose_durations: Vec<f64>,
+    /// Per-dose compartment number as f64 (1-based, matches NONMEM).
+    /// Used by the 2-/3-cpt AD propagators to route an infusion's
+    /// steady-state contribution to the correct channel (central vs
+    /// periph1 vs periph2). Const through the AD macros.
+    pub dose_cmts_f64: Vec<f64>,
 }
 
 impl FlatEventData {
@@ -91,6 +96,7 @@ impl FlatEventData {
             dose_amts: subject.doses.iter().map(|d| d.amt).collect(),
             dose_rates: subject.doses.iter().map(|d| d.rate).collect(),
             dose_durations: subject.doses.iter().map(|d| d.duration).collect(),
+            dose_cmts_f64: subject.doses.iter().map(|d| d.cmt as f64).collect(),
         }
     }
 }
@@ -163,6 +169,7 @@ impl FlatEventTv {
     Const,      // dose_amts
     Const,      // dose_rates
     Const,      // dose_durations
+    Const,      // dose_cmts_f64
     Const,      // observations
     Const,      // cens_f64
     Const,      // pk_idx_f64
@@ -183,6 +190,7 @@ pub fn individual_nll_event_driven_ad(
     dose_amts: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
+    dose_cmts_f64: &[f64],
     observations: &[f64],
     cens_f64: &[f64],
     pk_idx_f64: &[f64],
@@ -253,6 +261,7 @@ pub fn individual_nll_event_driven_ad(
             dose_times,
             dose_rates,
             dose_durations,
+            dose_cmts_f64,
             n_doses,
         );
         state0 = s0_new;
@@ -347,14 +356,13 @@ pub fn individual_nll_event_driven_ad(
     0.5 * (eta_prior + log_det_omega + data_ll)
 }
 
-// Forward-mode AD path for the Jacobian d(predictions)/d(eta) is not
-// implemented. Enzyme's forward-mode pointer tracker hits
-// `Assertion failed: forwardModeInvertedPointerFallback` on the
-// per-event scalar-state form (the same kernel shape that reverse-mode
-// handles fine). The dispatcher in `inner_optimizer.rs` routes the
-// AdEventDriven Jacobian through `compute_jacobian_fd` instead;
-// reverse-mode AD on the BFGS gradient (the hot path) still wins back
-// the bulk of the cost. Tracked as a follow-up.
+// Forward-mode AD path for the Jacobian d(predictions)/d(eta) lives in
+// the sibling module `event_driven_ad_jac` with its own private copies
+// of the propagators. Putting it in a separate module isolates the
+// Enzyme-instrumented call graph: when both AD passes share the same
+// helper functions, fat-LTO inlining causes phi-node IR to leak across
+// the forward and reverse pipelines and reverse-mode type deduction
+// breaks. Sibling-module isolation keeps the two pipelines independent.
 
 // ─────────────────────────────────────────────────────────────────────
 // Inlined event-driven propagators (AD-safe).
@@ -378,6 +386,7 @@ pub fn individual_nll_event_driven_ad(
 /// values cleanly but trips on the memset / mixed-active aliasing of
 /// `&mut [f64; N]` here. Slots beyond what the model uses are returned
 /// unchanged.
+///
 #[allow(clippy::too_many_arguments)]
 fn propagate_state_ad(
     pk_model_id: i32,
@@ -397,6 +406,7 @@ fn propagate_state_ad(
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
+    dose_cmts_f64: &[f64],
     n_doses: usize,
 ) -> (f64, f64, f64, f64) {
     // Const-only branch on pk_model_id — constant-folds under LLVM. Only
@@ -415,7 +425,7 @@ fn propagate_state_ad(
         // 2-cpt IV bolus / infusion: state = [central, periph].
         let (s0, s1) = propagate_two_cpt_ad(
             state0, state1, t_from, t_to, cl, v, q, v2, dose_times, dose_rates, dose_durations,
-            n_doses,
+            dose_cmts_f64, n_doses,
         );
         (s0, s1, state2, state3)
     } else if pk_model_id == 4 {
@@ -427,7 +437,7 @@ fn propagate_state_ad(
         // 3-cpt IV bolus / infusion: state = [central, periph1, periph2].
         let (s0, s1, s2) = propagate_three_cpt_ad(
             state0, state1, state2, t_from, t_to, cl, v, q, v2, q3, v3, dose_times, dose_rates,
-            dose_durations, n_doses,
+            dose_durations, dose_cmts_f64, n_doses,
         );
         (s0, s1, s2, state3)
     } else if pk_model_id == 7 {
@@ -484,6 +494,10 @@ fn propagate_one_cpt_ad(
 }
 
 /// 2-cpt linear propagator. Returns `(state0_new, state1_new)`.
+/// Per-channel A_ss for input b = (b1, b2):
+///   A_ss[0] = (b1 + b2) · v1 / cl
+///   A_ss[1] = b1 · v2 / cl + b2 · (cl + q) · v2 / (cl · q)
+/// `dose_cmts_f64` routes each dose's rate to channel 1 (cmt=1) or 2 (cmt=2).
 #[allow(clippy::too_many_arguments)]
 fn propagate_two_cpt_ad(
     state0: f64,
@@ -497,6 +511,7 @@ fn propagate_two_cpt_ad(
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
+    dose_cmts_f64: &[f64],
     n_doses: usize,
 ) -> (f64, f64) {
     let v1_safe = v1.abs() + 1e-30;
@@ -527,7 +542,8 @@ fn propagate_two_cpt_ad(
     let mut s0 = c1 * (k21 - alpha) * e_alpha + c2 * (k21 - beta) * e_beta;
     let mut s1 = (c1 * e_alpha + c2 * e_beta) * k12;
 
-    // Infusion contributions (cmt=1 / central only — follow-up TODO).
+    // Infusion contributions, per dose. dose_cmts_f64 routes each
+    // dose's rate to channel 1 (central) or channel 2 (peripheral).
     for d in 0..n_doses {
         let s_i = dose_times[d];
         let e_i = s_i + dose_durations[d];
@@ -539,8 +555,17 @@ fn propagate_two_cpt_ad(
         let diff = tau_total_raw - tau_to;
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
 
-        let a_ss_1 = dose_rates[d] * v1_safe / cl_safe;
-        let a_ss_2 = dose_rates[d] * v2_safe / cl_safe;
+        // Per-channel A_ss.
+        let cmt = dose_cmts_f64[d] as i32;
+        let r = dose_rates[d];
+        let (a_ss_1, a_ss_2) = if cmt == 2 {
+            (
+                r * v1_safe / cl_safe,
+                r * (cl_safe + q_safe) * v2_safe / (cl_safe * q_safe),
+            )
+        } else {
+            (r * v1_safe / cl_safe, r * v2_safe / cl_safe)
+        };
 
         let s_ss = a_ss_2 / k12;
         let c1_ss = (a_ss_1 - s_ss * (k21 - beta)) / denom;
@@ -756,8 +781,10 @@ fn three_cpt_mode_ad(
 }
 
 /// 3-cpt linear propagator (IV bolus / infusion). Spectral decomposition
-/// over (α, β, γ) eigenmodes; constant central infusion handled via the
-/// steady-state + homogeneous decomposition (same pattern as 2-cpt).
+/// over (α, β, γ) eigenmodes; constant infusion into central, periph1,
+/// or periph2 handled via the steady-state + homogeneous decomposition.
+/// Channel-specific A_ss formulas: see the analytical
+/// `propagate_three_cpt` in `pk::event_driven` for the derivation.
 #[allow(clippy::too_many_arguments)]
 fn propagate_three_cpt_ad(
     state0: f64,
@@ -774,15 +801,16 @@ fn propagate_three_cpt_ad(
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
+    dose_cmts_f64: &[f64],
     n_doses: usize,
 ) -> (f64, f64, f64) {
     let v1_safe = v1.abs() + 1e-30;
     let cl_safe = cl.abs() + 1e-30;
     let v2_safe = v2.abs() + 1e-30;
     let v3_safe = v3.abs() + 1e-30;
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_ad(cl, v1, q, v2, q3, v3);
     let q_safe = q.abs() + 1e-30;
     let q3_safe = q3.abs() + 1e-30;
+    let (alpha, beta, gamma, k21, k31) = macro_rates_three_ad(cl, v1, q, v2, q3, v3);
     let k12 = q_safe / v1_safe;
     let k13 = q3_safe / v1_safe;
 
@@ -797,10 +825,10 @@ fn propagate_three_cpt_ad(
     let mut s1 = p1a + p1b + p1g;
     let mut s2 = p2a + p2b + p2g;
 
-    // Infusion contributions (cmt=1 / central only). Per-active-window
-    // contribution under steady-state input r is given by
-    //   exp(K·τ_to)·A_ss − exp(K·τ_total)·A_ss
-    // where A_ss = (r·v1/cl, r·v2/cl, r·v3/cl).
+    // Infusion contributions, per dose. The dispatcher routes by
+    // dose_cmts_f64[d]: 1=central, 2=periph1, 3=periph2 (3-cpt IV).
+    // Other compartments yield zero contribution (handled via Const
+    // branches on dose_cmts_f64, all f64 and Const so phi-safe).
     for d in 0..n_doses {
         let s_i = dose_times[d];
         let e_i = s_i + dose_durations[d];
@@ -812,9 +840,28 @@ fn propagate_three_cpt_ad(
         let diff = tau_total_raw - tau_to;
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
 
-        let a_ss_c = dose_rates[d] * v1_safe / cl_safe;
-        let a_ss_p1 = dose_rates[d] * v2_safe / cl_safe;
-        let a_ss_p2 = dose_rates[d] * v3_safe / cl_safe;
+        // Per-channel A_ss. Const-branch on dose_cmts_f64 selects which
+        // channel formula applies.
+        let cmt = dose_cmts_f64[d] as i32;
+        let r = dose_rates[d];
+        let (a_ss_c, a_ss_p1, a_ss_p2) = if cmt == 2 {
+            // Channel 2 (periph1).
+            (
+                r * v1_safe / cl_safe,
+                r * (cl_safe + q_safe) * v2_safe / (cl_safe * q_safe),
+                r * v3_safe / cl_safe,
+            )
+        } else if cmt == 3 {
+            // Channel 3 (periph2).
+            (
+                r * v1_safe / cl_safe,
+                r * v2_safe / cl_safe,
+                r * (cl_safe + q3_safe) * v3_safe / (cl_safe * q3_safe),
+            )
+        } else {
+            // Default = channel 1 (central).
+            (r * v1_safe / cl_safe, r * v2_safe / cl_safe, r * v3_safe / cl_safe)
+        };
 
         // Mode contribution at τ_to (`_to`) and τ_total (`_tot`) — subtract.
         let (ca_to, p1a_to, p2a_to) = three_cpt_mode_ad(alpha, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
@@ -1023,6 +1070,11 @@ pub fn compute_nll_gradient_event_driven_ad(
     } else {
         &event_data.dose_durations
     };
+    let dose_cmts_padded: &[f64] = if event_data.dose_cmts_f64.is_empty() {
+        &[1.0]
+    } else {
+        &event_data.dose_cmts_f64
+    };
 
     let nll = individual_nll_event_driven_ad_grad(
         eta,
@@ -1038,6 +1090,7 @@ pub fn compute_nll_gradient_event_driven_ad(
         dose_amts_padded,
         dose_rates_padded,
         dose_durations_padded,
+        dose_cmts_padded,
         observations_padded,
         cens_padded,
         pk_idx_f64,
@@ -1049,7 +1102,5 @@ pub fn compute_nll_gradient_event_driven_ad(
     (nll, d_eta)
 }
 
-// (Jacobian wrapper deleted alongside the disabled forward-mode AD
-// function; the inner-loop dispatch routes the AdEventDriven branch
-// through `compute_jacobian_fd` instead. Reinstate when Enzyme's
-// `forwardModeInvertedPointerFallback` issue is resolved upstream.)
+// `compute_jacobian_event_driven_ad` lives in the sibling module
+// `event_driven_ad_jac` — see top-of-file note about AD-pass isolation.

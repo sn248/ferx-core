@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-667126dc.js";
+            window.path_to_searchindex_js = "searchindex-15f6b3a6.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-911e3088.js"></script>
@@ -250,8 +250,12 @@
 <li>All ODE-defined models (via <code>[odes]</code>)</li>
 </ul>
 <p>For oral models, the bolus dose into compartment 1 is interpreted as the depot (NONMEM ADVAN2/ADVAN4/ADVAN12 convention) and observation read-out reads the central compartment.</p>
-<p>The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients without falling back to finite-differences. The H-matrix Jacobian (used once per inner-loop iteration) currently uses FD on TV-cov subjects regardless of model — forward-mode AD on the event-driven kernel is a known follow-up tracked separately.</p>
-<p>Infusion support on the event-driven path is currently restricted to the central compartment (cmt=1 for IV models, cmt=2 for oral models). Infusion into peripheral compartments still falls back to the existing single-snapshot superposition path.</p>
+<p>The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients <em>and</em> an AD-accelerated H-matrix Jacobian (forward-mode), so neither the inner-loop gradient nor the per-iteration Jacobian falls back to finite-differences.</p>
+<p>Infusion routing on the event-driven path:</p>
+<ul>
+<li><strong>IV models</strong>: central infusion (cmt=1) for all 1/2/3-cpt; <strong>peripheral infusion</strong> for 2-cpt (cmt=2) and 3-cpt (cmt=2 → periph1, cmt=3 → periph2). Steady-state amounts per channel are computed by linear superposition over the channels.</li>
+<li><strong>Oral models</strong>: central infusion (cmt=2) is supported; peripheral infusion is rare clinically and still panics with a clear message (tracked as a follow-up).</li>
+</ul>
 <h2 id="event-types-evid"><a class="header" href="#event-types-evid">Event Types (EVID)</a></h2>
 <div class="table-wrapper">
 <table>

@@ -71,13 +71,8 @@ fn state_layout(pk_model: PkModel) -> (usize, usize) {
     }
 }
 
-/// True when `pk_model` is an oral model (depot is state slot 0).
-fn is_oral(pk_model: PkModel) -> bool {
-    matches!(
-        pk_model,
-        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
-    )
-}
+// `is_oral` was a helper for the previous infusion dispatcher; the
+// per-model `match (pk_model, d.cmt)` now subsumes it.
 
 /// Compute predictions by walking events in time order and propagating the
 /// compartment-amount state with per-event PK parameters.
@@ -231,32 +226,55 @@ fn propagate(
             continue;
         }
         let mid = 0.5 * (s0 + s1);
-        // Sum infusion rates active across the *whole* sub-interval.
-        // Boundary cases (an infusion starting exactly at s0 or ending
-        // exactly at s1) qualify because boundaries were inserted above.
-        // The "central" cmt depends on whether the model is oral (cmt=2)
-        // or IV (cmt=1). For 2-cpt IV we also accept cmt=2 → peripheral.
-        let oral = is_oral(pk_model);
-        let central_cmt = if oral { 2 } else { 1 };
+        // Sum infusion rates active across the *whole* sub-interval,
+        // routing each by the dose's compartment. The cmt → state-slot
+        // mapping is model-specific:
+        //   IV: cmt=1 central, cmt=2 periph1, cmt=3 periph2
+        //   Oral: cmt=1 depot, cmt=2 central, cmt=3 periph1, cmt=4 periph2
+        //
+        // Peripheral-compartment infusion is supported on the IV
+        // multi-compartment models (2-cpt: cmt=2; 3-cpt: cmt=2 and 3).
+        // Oral peripheral infusion is unusual clinically and stays
+        // unsupported for now (panics with a clear message); see the
+        // project todo list.
         let mut rate_central = 0.0;
-        let mut rate_periph = 0.0;
+        let mut rate_periph1 = 0.0;
+        let mut rate_periph2 = 0.0;
         for d in doses {
             if d.rate > 0.0
                 && d.duration > 0.0
                 && d.time <= mid
                 && d.time + d.duration >= mid
             {
-                if d.cmt == central_cmt {
-                    rate_central += d.rate;
-                } else if !oral && d.cmt == 2 {
-                    // 2-cpt IV peripheral input.
-                    rate_periph += d.rate;
-                } else {
-                    panic!(
+                match (pk_model, d.cmt) {
+                    (PkModel::OneCptIvBolus | PkModel::OneCptInfusion, 1) => {
+                        rate_central += d.rate
+                    }
+                    (PkModel::OneCptOral, 2) => rate_central += d.rate,
+                    (PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion, 1) => {
+                        rate_central += d.rate
+                    }
+                    (PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion, 2) => {
+                        rate_periph1 += d.rate
+                    }
+                    (PkModel::TwoCptOral, 2) => rate_central += d.rate,
+                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 1) => {
+                        rate_central += d.rate
+                    }
+                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 2) => {
+                        rate_periph1 += d.rate
+                    }
+                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 3) => {
+                        rate_periph2 += d.rate
+                    }
+                    (PkModel::ThreeCptOral, 2) => rate_central += d.rate,
+                    _ => panic!(
                         "event-driven PK: infusion into compartment {} not supported \
-                         for model {:?} (only central is supported)",
+                         for model {:?}. Supported: central for all models; periph1/2 \
+                         for 2- and 3-cpt IV models. Oral peripheral infusion is a \
+                         tracked follow-up.",
                         d.cmt, pk_model
-                    );
+                    ),
                 }
             }
         }
@@ -269,13 +287,13 @@ fn propagate(
                 propagate_one_cpt_oral(state, dt, pk);
             }
             PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion => {
-                propagate_two_cpt(state, dt, pk, rate_central, rate_periph);
+                propagate_two_cpt(state, dt, pk, rate_central, rate_periph1);
             }
             PkModel::TwoCptOral => {
                 propagate_two_cpt_oral(state, dt, pk);
             }
             PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion => {
-                propagate_three_cpt(state, dt, pk, rate_central);
+                propagate_three_cpt(state, dt, pk, rate_central, rate_periph1, rate_periph2);
             }
             PkModel::ThreeCptOral => {
                 propagate_three_cpt_oral(state, dt, pk);
@@ -580,9 +598,26 @@ fn three_cpt_mode(
 
 /// 3-cpt linear propagator (IV models). State = `[A_central, A_p1, A_p2]`.
 /// Spectral decomposition along (α, β, γ) eigenmodes. Constant infusion
-/// `rate_central` into central is handled via the steady-state
-/// + homogeneous decomposition pattern (same as 2-cpt).
-fn propagate_three_cpt(state: &mut [f64], dt: f64, pk: &PkParams, rate_central: f64) {
+/// `(rate_central, rate_periph1, rate_periph2)` into the three slots is
+/// handled via the steady-state + homogeneous decomposition pattern.
+///
+/// Steady-state per input channel (linear superposition):
+///   - Channel 1 (central):   `A_ss = (r·v1/cl, r·v2/cl, r·v3/cl)`
+///   - Channel 2 (periph 1):  `A_ss[0] = r·v1/cl,
+///                             A_ss[1] = r·(cl+q2)·v2/(cl·q2),
+///                             A_ss[2] = r·v3/cl`
+///   - Channel 3 (periph 2):  `A_ss[0] = r·v1/cl,
+///                             A_ss[1] = r·v2/cl,
+///                             A_ss[2] = r·(cl+q3)·v3/(cl·q3)`
+/// Combined `A_ss` is the sum across channels.
+fn propagate_three_cpt(
+    state: &mut [f64],
+    dt: f64,
+    pk: &PkParams,
+    rate_central: f64,
+    rate_periph1: f64,
+    rate_periph2: f64,
+) {
     let cl = pk.cl();
     let v1 = pk.v();
     let q2 = pk.q();
@@ -596,11 +631,16 @@ fn propagate_three_cpt(state: &mut [f64], dt: f64, pk: &PkParams, rate_central: 
     let k12 = q2 / v1;
     let k13 = q3 / v1;
 
-    // Steady-state under constant central input r:
-    //   A_ss_c = r·v1/cl, A_ss_p1 = r·v2/cl, A_ss_p2 = r·v3/cl.
-    let a_ss_c = rate_central * v1 / cl;
-    let a_ss_p1 = rate_central * v2 / cl;
-    let a_ss_p2 = rate_central * v3 / cl;
+    // Combined steady-state amounts under inputs (r_c, r_p1, r_p2).
+    // Central slot: total input divided by k10 = (r_c+r_p1+r_p2)·v1/cl.
+    // Peripheral slots get the central contribution + their own
+    // direct-input correction.
+    let r_total = rate_central + rate_periph1 + rate_periph2;
+    let a_ss_c = r_total * v1 / cl;
+    let a_ss_p1 = (rate_central + rate_periph2) * v2 / cl
+        + rate_periph1 * (cl + q2) * v2 / (cl * q2);
+    let a_ss_p2 = (rate_central + rate_periph1) * v3 / cl
+        + rate_periph2 * (cl + q3) * v3 / (cl * q3);
 
     let h_c = state[0] - a_ss_c;
     let h_p1 = state[1] - a_ss_p1;
@@ -1156,6 +1196,46 @@ mod tests {
         for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
             assert_relative_eq!(*a, *e, epsilon = 1e-7, max_relative = 1e-7);
             assert!(*a > 0.0, "obs {} should be positive, got {}", i, a);
+        }
+    }
+
+    #[test]
+    fn three_cpt_peripheral_infusion_propagates_correctly() {
+        // 3-cpt IV with infusion into periph1 (cmt=2) over a 2h window.
+        // The dispatcher must accept cmt=2 (instead of panicking), and
+        // the propagator must produce finite, non-negative central
+        // concentrations as drug transfers periph1 → central.
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 2, 500.0, false, 0.0)];
+        let obs_times = vec![0.5, 2.0, 4.0, 8.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let pk = pk_three(5.0, 20.0, 2.0, 30.0, 0.5, 100.0);
+        let pk_dose = vec![pk; 1];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs);
+
+        for (i, &p) in preds.iter().enumerate() {
+            assert!(p.is_finite(), "obs {} should be finite, got {}", i, p);
+            assert!(p > 0.0, "obs {} (t={}): expected positive central, got {}",
+                    i, obs_times[i], p);
+        }
+    }
+
+    #[test]
+    fn three_cpt_periph2_infusion_dispatches_without_panic() {
+        // cmt=3 (periph2) infusion path. Just confirm the dispatcher
+        // accepts it and produces finite output — exact dynamics depend
+        // on the slow-periph2 transfer rates which are model-specific.
+        let doses = vec![DoseEvent::new(0.0, 100.0, 3, 50.0, false, 0.0)];
+        let obs_times = vec![1.0, 4.0, 12.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let pk = pk_three(5.0, 20.0, 2.0, 30.0, 0.5, 100.0);
+        let pk_dose = vec![pk; 1];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs);
+        for &p in &preds {
+            assert!(p.is_finite() && p >= 0.0, "got {}", p);
         }
     }
 

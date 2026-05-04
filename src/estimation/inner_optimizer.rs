@@ -399,15 +399,27 @@ pub fn find_ebe(
             j
         }
         InnerGradientMethod::AdEventDriven => {
-            // Forward-mode AD Jacobian for the event-driven path is not yet
-            // wired (Enzyme's `forwardModeInvertedPointerFallback` trips on
-            // the per-event scalar-state form). Reverse-mode AD covers the
-            // BFGS gradient which is the hot path; FD on the per-subject
-            // H matrix runs once per outer iteration and is already part of
-            // the inner loop's other consumers, so the cost is bounded.
+            // Forward-mode AD Jacobian — kernel lives in
+            // `ad::event_driven_ad_jac` (sibling module so the AD pass
+            // stays isolated from the reverse-mode NLL pass; sharing
+            // helpers tripped Enzyme's reverse-mode type deduction).
+            let event_data = crate::ad::event_driven_ad::FlatEventData::from_subject(subject);
+            let tv_per_event = crate::ad::event_driven_ad::FlatEventTv::from_subject(
+                model,
+                subject,
+                &params.theta,
+            );
             let t0 = std::time::Instant::now();
-            let j = compute_jacobian_fd(model, subject, &params.theta, &eta_true);
-            GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
+            let j = crate::ad::event_driven_ad_jac::compute_jacobian_event_driven_ad(
+                &eta_true,
+                &tv_per_event,
+                &event_data,
+                subject.obs_times.len(),
+                model.pk_model,
+                &model.pk_idx_f64,
+                &model.sel_flat,
+            );
+            GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
             j
         }
         InnerGradientMethod::Fd => {

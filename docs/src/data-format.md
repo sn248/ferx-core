@@ -73,9 +73,12 @@ Time-varying covariates are supported for **all** analytical structural models a
 
 For oral models, the bolus dose into compartment 1 is interpreted as the depot (NONMEM ADVAN2/ADVAN4/ADVAN12 convention) and observation read-out reads the central compartment.
 
-The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients without falling back to finite-differences. The H-matrix Jacobian (used once per inner-loop iteration) currently uses FD on TV-cov subjects regardless of model — forward-mode AD on the event-driven kernel is a known follow-up tracked separately.
+The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients *and* an AD-accelerated H-matrix Jacobian (forward-mode), so neither the inner-loop gradient nor the per-iteration Jacobian falls back to finite-differences.
 
-Infusion support on the event-driven path is currently restricted to the central compartment (cmt=1 for IV models, cmt=2 for oral models). Infusion into peripheral compartments still falls back to the existing single-snapshot superposition path.
+Infusion routing on the event-driven path:
+
+- **IV models**: central infusion (cmt=1) for all 1/2/3-cpt; **peripheral infusion** for 2-cpt (cmt=2) and 3-cpt (cmt=2 → periph1, cmt=3 → periph2). Steady-state amounts per channel are computed by linear superposition over the channels.
+- **Oral models**: central infusion (cmt=2) is supported; peripheral infusion is rare clinically and still panics with a clear message (tracked as a follow-up).
 
 ## Event Types (EVID)
 

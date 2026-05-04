@@ -86,6 +86,7 @@ Infusion routing on the event-driven path:
 |------|---------|
 | 0 | Observation record. `DV` is used for estimation. |
 | 1 | Dosing record. `AMT` is administered to compartment `CMT`. |
+| 2 | Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row's covariate values — matching NONMEM's `$PK runs at every record` semantic. Only meaningful when at least one covariate is time-varying; for time-constant data EVID=2 rows are skipped (would be no-ops). |
 | 4 | Reset and dose. All compartment amounts are reset to zero before dosing. |
 
 ## Example Dataset

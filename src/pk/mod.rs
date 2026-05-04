@@ -22,6 +22,10 @@ pub struct EventPkParams {
     pub dose: Vec<PkParams>,
     /// PK params at each observation event time, parallel to `subject.obs_times`.
     pub obs: Vec<PkParams>,
+    /// PK params at each EVID=2 event time, parallel to
+    /// `subject.pk_only_times`. Empty when the subject has no
+    /// pk-only events (typical for non-TV-cov data).
+    pub pk_only: Vec<PkParams>,
 }
 
 /// Materialise per-event PK parameters by evaluating `model.pk_param_fn`
@@ -50,12 +54,19 @@ pub fn compute_event_pk_params(
             .enumerate()
             .map(|(j, _)| (model.pk_param_fn)(theta, eta, subject.obs_cov(j)))
             .collect();
-        EventPkParams { dose, obs }
+        let pk_only = subject
+            .pk_only_times
+            .iter()
+            .enumerate()
+            .map(|(m, _)| (model.pk_param_fn)(theta, eta, subject.pk_only_cov(m)))
+            .collect();
+        EventPkParams { dose, obs, pk_only }
     } else {
         let p = (model.pk_param_fn)(theta, eta, &subject.covariates);
         EventPkParams {
             dose: vec![p.clone(); subject.doses.len()],
             obs: vec![p; subject.obs_times.len()],
+            pk_only: Vec::new(),
         }
     }
 }
@@ -162,7 +173,7 @@ pub fn compute_predictions_with_tv(
         if has_tv {
             let ev = compute_event_pk_params(model, subject, theta, eta);
             return crate::ode::ode_predictions_event_driven(
-                ode, subject, &ev.dose, &ev.obs,
+                ode, subject, &ev.dose, &ev.obs, &ev.pk_only,
             );
         }
         let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
@@ -176,6 +187,7 @@ pub fn compute_predictions_with_tv(
             subject,
             &ev.dose,
             &ev.obs,
+            &ev.pk_only,
         );
     }
 
@@ -249,6 +261,8 @@ mod tests {
             covariates: cov_const,
             dose_covariates: dose_cov,
             obs_covariates: obs_cov,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
@@ -355,6 +369,8 @@ mod tests {
             covariates: HashMap::new(),
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),

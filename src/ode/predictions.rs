@@ -125,10 +125,10 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
 }
 
 /// ODE-based predictions with per-event PK parameters (time-varying-covariate
-/// aware). Walks the merged dose+obs timeline, integrating each segment with
-/// the PK params evaluated at the *segment-start* event — so a covariate that
-/// changes at an event row immediately changes the rate-matrix used over the
-/// next interval.
+/// aware). Walks the merged dose+obs+pk-only timeline, integrating each
+/// segment with the PK params evaluated at the *segment-start* event — so
+/// a covariate that changes at an event row (dose, obs, or EVID=2)
+/// immediately changes the rate matrix used over the next interval.
 ///
 /// The non-TV `ode_predictions` is preserved as a fast path; this function
 /// is only invoked from the dispatcher when `subject.has_tv_covariates()`.
@@ -141,9 +141,11 @@ pub fn ode_predictions_event_driven(
     subject: &Subject,
     pk_at_dose: &[PkParams],
     pk_at_obs: &[PkParams],
+    pk_at_pk_only: &[PkParams],
 ) -> Vec<f64> {
     assert_eq!(pk_at_dose.len(), subject.doses.len());
     assert_eq!(pk_at_obs.len(), subject.obs_times.len());
+    assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
 
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
@@ -156,29 +158,37 @@ pub fn ode_predictions_event_driven(
         return predictions;
     }
 
-    // Build merged event timeline (dose-before-obs at the same time, matching
-    // NONMEM convention and the analytical event-driven path).
+    // Build merged event timeline. Tie-break at the same time:
+    //   dose < pk-only < obs
+    // — matches the analytical event-driven path.
     #[derive(Clone, Copy)]
     enum Kind {
         Dose,
+        PkOnly,
         Obs,
     }
+    fn kind_order(k: Kind) -> u8 {
+        match k {
+            Kind::Dose => 0,
+            Kind::PkOnly => 1,
+            Kind::Obs => 2,
+        }
+    }
     let mut timeline: Vec<(f64, Kind, usize)> =
-        Vec::with_capacity(subject.doses.len() + n_obs);
+        Vec::with_capacity(subject.doses.len() + n_obs + subject.pk_only_times.len());
     for (k, d) in subject.doses.iter().enumerate() {
         timeline.push((d.time, Kind::Dose, k));
     }
     for (j, &t) in subject.obs_times.iter().enumerate() {
         timeline.push((t, Kind::Obs, j));
     }
+    for (m, &t) in subject.pk_only_times.iter().enumerate() {
+        timeline.push((t, Kind::PkOnly, m));
+    }
     timeline.sort_by(|a, b| {
         a.0.partial_cmp(&b.0)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| match (a.1, b.1) {
-                (Kind::Dose, Kind::Obs) => std::cmp::Ordering::Less,
-                (Kind::Obs, Kind::Dose) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            })
+            .then_with(|| kind_order(a.1).cmp(&kind_order(b.1)))
     });
 
     let mut cur_t = timeline[0].0;
@@ -186,6 +196,7 @@ pub fn ode_predictions_event_driven(
     let mut current_pk: PkParams = match timeline[0].1 {
         Kind::Dose => pk_at_dose[timeline[0].2],
         Kind::Obs => pk_at_obs[timeline[0].2],
+        Kind::PkOnly => pk_at_pk_only[timeline[0].2],
     };
 
     for &(t_event, kind, idx) in &timeline {
@@ -224,6 +235,12 @@ pub fn ode_predictions_event_driven(
                 let v = u[ode.obs_cmt_idx];
                 predictions[idx] = if v.is_nan() || v < 0.0 { 0.0 } else { v };
                 current_pk = pk_at_obs[idx];
+            }
+            Kind::PkOnly => {
+                // EVID=2: refresh current_pk so the next segment uses
+                // the values $PK would have computed at this row in
+                // NONMEM. Compartment state is unchanged.
+                current_pk = pk_at_pk_only[idx];
             }
         }
     }
@@ -270,6 +287,8 @@ mod tests {
             covariates: HashMap::new(),
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
@@ -293,7 +312,7 @@ mod tests {
         let ode = one_cpt_ode_spec();
 
         let baseline = ode_predictions(&ode, &pk.values, &subj);
-        let event_driven = ode_predictions_event_driven(&ode, &subj, &pk_dose, &pk_obs);
+        let event_driven = ode_predictions_event_driven(&ode, &subj, &pk_dose, &pk_obs, &[]);
         assert_eq!(baseline.len(), event_driven.len());
         for (b, e) in baseline.iter().zip(event_driven.iter()) {
             // ODE solver tolerance is ~1e-4 relative — a tighter equality
@@ -319,7 +338,7 @@ mod tests {
         let pk_obs = vec![pk_low, pk_high];
         let ode = one_cpt_ode_spec();
 
-        let preds = ode_predictions_event_driven(&ode, &subj, &pk_dose, &pk_obs);
+        let preds = ode_predictions_event_driven(&ode, &subj, &pk_dose, &pk_obs, &[]);
 
         // Expected at t=5 (low-CL interval, no V scaling needed at obs in
         // this ODE since it returns A directly): A = 1000 * exp(-0.05*5)

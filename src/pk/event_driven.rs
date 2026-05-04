@@ -30,13 +30,19 @@ use crate::types::{DoseEvent, PkModel, PkParams, Subject};
 enum EventKind {
     Dose,
     Obs,
+    /// EVID=2 "other event" — typically a covariate-change marker.
+    /// Doesn't mutate compartment amounts; just refreshes the
+    /// piecewise-constant rate matrix from the row's covariate values.
+    /// Matches NONMEM's `$PK runs at every record` semantic.
+    PkOnly,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Event {
     time: f64,
     kind: EventKind,
-    /// Index into `subject.doses` or `subject.obs_times`.
+    /// Index into `subject.doses`, `subject.obs_times`, or
+    /// `subject.pk_only_times` depending on `kind`.
     orig_idx: usize,
 }
 
@@ -78,23 +84,24 @@ fn state_layout(pk_model: PkModel) -> (usize, usize) {
 /// compartment-amount state with per-event PK parameters.
 ///
 /// `pk_at_dose[k]` are the PK parameters at `subject.doses[k].time`;
-/// `pk_at_obs[j]` are the PK parameters at `subject.obs_times[j]`. These
-/// are produced by [`crate::pk::compute_event_pk_params`].
+/// `pk_at_obs[j]` are the PK parameters at `subject.obs_times[j]`;
+/// `pk_at_pk_only[m]` are the PK parameters at `subject.pk_only_times[m]`
+/// (EVID=2 "other event" rows — typically covariate-change markers).
+/// All three slices are produced by [`crate::pk::compute_event_pk_params`].
 ///
 /// Concentration at observation `j` is read out as `state_central / V` where
 /// `V` is `pk_at_obs[j].v()` — i.e. the central-compartment volume at the
 /// *observation's* time. This matches NONMEM `S1 = V1` / `IPRED = A(1)/S1`.
-///
-/// Behavior on the unsupported-model branch is to panic, on the assumption
-/// that the dispatcher in `pk::compute_predictions` already filtered.
 pub fn event_driven_predictions(
     pk_model: PkModel,
     subject: &Subject,
     pk_at_dose: &[PkParams],
     pk_at_obs: &[PkParams],
+    pk_at_pk_only: &[PkParams],
 ) -> Vec<f64> {
     assert_eq!(pk_at_dose.len(), subject.doses.len());
     assert_eq!(pk_at_obs.len(), subject.obs_times.len());
+    assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
 
     let n_obs = subject.obs_times.len();
     let mut preds = vec![0.0_f64; n_obs];
@@ -105,25 +112,36 @@ pub fn event_driven_predictions(
 
     let (n_states, central_slot) = state_layout(pk_model);
 
-    // Build merged event timeline. Stable tie-break: doses come before
-    // observations at the same time so that an obs at the dose time
-    // observes the post-dose state (NONMEM convention).
-    let mut events: Vec<Event> = Vec::with_capacity(subject.doses.len() + n_obs);
+    // Build merged event timeline. Stable tie-break for events at the
+    // same time:
+    //   dose < pk-only < obs
+    // — covariate-change markers run *after* a dose at the same time
+    // (the dose's $PK already reflects the covariate values that
+    // would have been read at that time) but *before* an observation
+    // (so the obs sees post-pk-update state).
+    let mut events: Vec<Event> =
+        Vec::with_capacity(subject.doses.len() + n_obs + subject.pk_only_times.len());
     for (k, d) in subject.doses.iter().enumerate() {
         events.push(Event { time: d.time, kind: EventKind::Dose, orig_idx: k });
     }
     for (j, &t) in subject.obs_times.iter().enumerate() {
         events.push(Event { time: t, kind: EventKind::Obs, orig_idx: j });
     }
+    for (m, &t) in subject.pk_only_times.iter().enumerate() {
+        events.push(Event { time: t, kind: EventKind::PkOnly, orig_idx: m });
+    }
+    fn kind_order(k: EventKind) -> u8 {
+        match k {
+            EventKind::Dose => 0,
+            EventKind::PkOnly => 1,
+            EventKind::Obs => 2,
+        }
+    }
     events.sort_by(|a, b| {
         a.time
             .partial_cmp(&b.time)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| match (a.kind, b.kind) {
-                (EventKind::Dose, EventKind::Obs) => std::cmp::Ordering::Less,
-                (EventKind::Obs, EventKind::Dose) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            })
+            .then_with(|| kind_order(a.kind).cmp(&kind_order(b.kind)))
     });
 
     // State vector starts at zero (no residual drug before the first event).
@@ -131,7 +149,7 @@ pub fn event_driven_predictions(
     let mut cur_t = events[0].time;
     // PK params governing the *current* interval. Initialized from the first
     // event so the first (zero-length) propagation is well-defined.
-    let mut current_pk: PkParams = pk_for(events[0], pk_at_dose, pk_at_obs);
+    let mut current_pk: PkParams = pk_for(events[0], pk_at_dose, pk_at_obs, pk_at_pk_only);
 
     for ev in &events {
         if ev.time > cur_t {
@@ -175,6 +193,12 @@ pub fn event_driven_predictions(
                 preds[ev.orig_idx] = conc.max(0.0);
                 current_pk = *pk;
             }
+            EventKind::PkOnly => {
+                // EVID=2: refresh current_pk so the next interval uses
+                // the values $PK would have computed at this row in
+                // NONMEM. State is unchanged.
+                current_pk = pk_at_pk_only[ev.orig_idx];
+            }
         }
     }
 
@@ -182,10 +206,16 @@ pub fn event_driven_predictions(
 }
 
 #[inline]
-fn pk_for(ev: Event, pk_at_dose: &[PkParams], pk_at_obs: &[PkParams]) -> PkParams {
+fn pk_for(
+    ev: Event,
+    pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams],
+    pk_at_pk_only: &[PkParams],
+) -> PkParams {
     match ev.kind {
         EventKind::Dose => pk_at_dose[ev.orig_idx],
         EventKind::Obs => pk_at_obs[ev.orig_idx],
+        EventKind::PkOnly => pk_at_pk_only[ev.orig_idx],
     }
 }
 
@@ -766,6 +796,8 @@ mod tests {
             covariates: HashMap::new(),
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
@@ -783,7 +815,7 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -813,7 +845,7 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -842,7 +874,7 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::OneCptInfusion, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::OneCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -871,7 +903,7 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::TwoCptIvBolus, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::TwoCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -907,7 +939,7 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::TwoCptInfusion, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::TwoCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -945,7 +977,7 @@ mod tests {
         let pk_dose = vec![pk_low];
         let pk_obs = vec![pk_low, pk_high]; // pk changes at obs2
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
 
         // After dose: A1 = 1000.
         // Propagate to t=1 with ke=0.05 (current_pk = pk_low from dose):
@@ -982,7 +1014,7 @@ mod tests {
         let pk_dose = vec![pk_low, pk_high];
         let pk_obs = vec![pk_low, pk_high];
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
 
         // At t=5 (during low-CL interval after dose1):
         //   A1 = 1000 * exp(-0.05*5) = 778.80
@@ -1064,7 +1096,7 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -1090,7 +1122,7 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -1111,7 +1143,7 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::TwoCptOral, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::TwoCptOral, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -1136,7 +1168,7 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::TwoCptOral, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::TwoCptOral, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -1160,7 +1192,7 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::ThreeCptIvBolus, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::ThreeCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -1186,7 +1218,7 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -1212,7 +1244,7 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
 
         for (i, &p) in preds.iter().enumerate() {
             assert!(p.is_finite(), "obs {} should be finite, got {}", i, p);
@@ -1233,7 +1265,7 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
         for &p in &preds {
             assert!(p.is_finite() && p >= 0.0, "got {}", p);
         }
@@ -1251,7 +1283,7 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::ThreeCptOral, &subj, &pk_dose, &pk_obs);
+        let preds = event_driven_predictions(PkModel::ThreeCptOral, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
             .map(|&t| {
@@ -1265,6 +1297,48 @@ mod tests {
     }
 
     // ── TV cov on oral: pk changes between doses changes elimination ─────
+
+    #[test]
+    fn one_cpt_evid2_mid_interval_switches_decay_rate() {
+        // Single dose at t=0, single obs at t=10. A pk-only (EVID=2)
+        // event at t=5 with a different CL must split the decay:
+        //   [0, 5]:  uses CL_low
+        //   [5, 10]: uses CL_high
+        // This is what NONMEM/nlmixr2 do; if the EVID=2 event were
+        // ignored, decay would use CL_low for the whole interval.
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![10.0];
+        let mut subj = make_subject(doses, obs_times);
+        // Inject a pk-only event at t=5.
+        subj.pk_only_times = vec![5.0];
+
+        let pk_low = pk_one(5.0, 100.0); // ke = 0.05
+        let pk_high = pk_one(10.0, 100.0); // ke = 0.10
+        let pk_dose = vec![pk_low];
+        let pk_obs = vec![pk_high]; // obs at t=10 uses high (post-EVID2 covariate)
+        let pk_only = vec![pk_high]; // EVID=2 switches to high CL
+
+        let preds =
+            event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &pk_only);
+
+        // Expected: A(5) = 1000 * exp(-0.05*5) = 778.80
+        //           A(10) = A(5) * exp(-0.10*5) = 778.80 * 0.6065 = 472.37
+        //           C(10) = A(10) / 100 = 4.7237
+        let a_at_5 = 1000.0 * (-0.05f64 * 5.0).exp();
+        let a_at_10 = a_at_5 * (-0.10f64 * 5.0).exp();
+        let c10_expected = a_at_10 / 100.0;
+        assert_relative_eq!(preds[0], c10_expected, epsilon = 1e-12);
+
+        // Sanity: without the EVID=2 event the decay would be
+        // 1000 * exp(-0.05*10) / 100 = 6.0653 (much higher).
+        let no_evid2 = 1000.0 * (-0.05f64 * 10.0).exp() / 100.0;
+        assert!(
+            preds[0] < no_evid2,
+            "EVID=2 split should decay drug faster: with split={}, without={}",
+            preds[0],
+            no_evid2
+        );
+    }
 
     #[test]
     fn one_cpt_oral_tv_cl_between_doses_changes_decay() {
@@ -1282,7 +1356,7 @@ mod tests {
         let pk_obs = vec![pk_low, pk_high];
 
         let preds_tv =
-            event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs);
+            event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs, &[]);
         // Sanity: predictions are positive and finite.
         for &p in &preds_tv {
             assert!(p > 0.0 && p.is_finite(), "got {}", p);
@@ -1296,6 +1370,7 @@ mod tests {
             &subj,
             &pk_const_high[..subj.doses.len()],
             &pk_const_high[..subj.obs_times.len()],
+            &[],
         );
         // First obs: TV run must give a *higher* concentration than the
         // all-high run because the depot drained more slowly under low CL

@@ -165,6 +165,17 @@ pub struct Subject {
     /// Per-observation covariate snapshot (LOCF), parallel to `obs_times`.
     /// Same fallback semantics as `dose_covariates`.
     pub obs_covariates: Vec<HashMap<String, f64>>,
+    /// Times of EVID=2 "other event" rows (typically covariate-change
+    /// markers). Only populated when the subject has time-varying
+    /// covariates — for time-constant covariates these rows are no-ops
+    /// (NONMEM-equivalent: $PK runs but with the same values).
+    /// The event-driven propagators see them as a third event kind that
+    /// does not mutate compartment amounts but does refresh the
+    /// piecewise-constant rate matrix from the row's covariate values.
+    pub pk_only_times: Vec<f64>,
+    /// Per-EVID-2 covariate snapshot (LOCF), parallel to `pk_only_times`.
+    /// Empty when no TV covariates.
+    pub pk_only_covariates: Vec<HashMap<String, f64>>,
     /// Censoring flag per observation (0 = quantified, 1 = below LLOQ).
     /// When `cens[j] == 1`, `observations[j]` holds the LLOQ value (NONMEM convention).
     pub cens: Vec<u8>,
@@ -198,6 +209,15 @@ impl Subject {
     /// Covariate snapshot at dose index `k`. Same fallback as `obs_cov`.
     pub fn dose_cov(&self, k: usize) -> &HashMap<String, f64> {
         self.dose_covariates.get(k).unwrap_or(&self.covariates)
+    }
+
+    /// Covariate snapshot at EVID=2 row index `m`. Same fallback as
+    /// the others — for time-constant covariates this returns the
+    /// subject-static map.
+    pub fn pk_only_cov(&self, m: usize) -> &HashMap<String, f64> {
+        self.pk_only_covariates
+            .get(m)
+            .unwrap_or(&self.covariates)
     }
 }
 

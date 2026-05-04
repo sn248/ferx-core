@@ -141,6 +141,8 @@ pub fn predict_all_event_driven_ad(
         let orig = event_orig_idx_f64[ev_idx] as usize;
         let dose_idx = if kind < 0.5 { orig } else { 0 };
 
+        // is_dose=0 for obs (kind=1) and pk-only (kind=2), so their
+        // state0 is unchanged regardless of dose_*[dose_idx].
         let is_dose = if kind < 0.5 { 1.0 } else { 0.0 };
         let is_bolus = if dose_rates[dose_idx] == 0.0 { 1.0 } else { 0.0 };
         state0 += is_dose * is_bolus * dose_amts[dose_idx];
@@ -156,8 +158,9 @@ pub fn predict_all_event_driven_ad(
         let conc = (conc_raw + conc_raw.abs()) * 0.5;
 
         // Unconditional write: every Dual output slot must be written
-        // exactly once for forward-mode pointer tracking. The wrapper
-        // drops non-obs slots via `event_kinds`.
+        // exactly once for forward-mode pointer tracking. Non-obs slots
+        // (doses, pk-only) are scratch — the wrapper drops them via
+        // `event_kinds`.
         out[ev_idx] = conc;
 
         current_cl = ev_cl;
@@ -726,7 +729,10 @@ pub fn compute_jacobian_event_driven_ad(
         );
 
         for ev in 0..n_events {
-            if event_data.event_kinds[ev] > 0.5 {
+            // event_kinds: 0=dose, 1=obs, 2=pk-only. Only obs slots
+            // map to a Jacobian row.
+            let k = event_data.event_kinds[ev];
+            if k > 0.5 && k < 1.5 {
                 let obs_idx = event_data.event_orig_idx_f64[ev] as usize;
                 jac[(obs_idx, j)] = d_out[ev];
             }

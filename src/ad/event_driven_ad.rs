@@ -61,22 +61,40 @@ impl FlatEventData {
     pub fn from_subject(subject: &Subject) -> Self {
         let n_obs = subject.obs_times.len();
         let n_dose = subject.doses.len();
-        let n_events = n_obs + n_dose;
+        let n_pk_only = subject.pk_only_times.len();
+        let n_events = n_obs + n_dose + n_pk_only;
 
         let mut events: Vec<(f64, f64, f64)> = Vec::with_capacity(n_events);
-        // (time, kind, orig_idx). Doses first, then obs — kind tie-breaks to
-        // dose-before-obs at the same time so an obs at the dose time sees
-        // the post-dose state.
+        // (time, kind_order, orig_idx). Tie-break order at the same time:
+        //   dose (0) < pk-only (1) < obs (2)
+        // — see analytical `event_driven::event_driven_predictions` for
+        // the rationale. Stored kind is encoded as f64 for the AD macros:
+        //   0.0 = dose, 1.0 = obs, 2.0 = pk-only. The kind_order used for
+        // sorting is computed from these.
         for (k, d) in subject.doses.iter().enumerate() {
             events.push((d.time, 0.0, k as f64));
         }
         for (j, &t) in subject.obs_times.iter().enumerate() {
             events.push((t, 1.0, j as f64));
         }
+        for (m, &t) in subject.pk_only_times.iter().enumerate() {
+            events.push((t, 2.0, m as f64));
+        }
+        // Sort: by time, then by tie-break order (dose=0 < pk-only=2-mapped
+        // to 1 < obs=1-mapped to 2). Encode the tie-break ordinal directly.
+        let kind_order = |k: f64| -> u8 {
+            if k < 0.5 {
+                0 // dose
+            } else if k > 1.5 {
+                1 // pk-only
+            } else {
+                2 // obs
+            }
+        };
         events.sort_by(|a, b| {
             a.0.partial_cmp(&b.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| kind_order(a.1).cmp(&kind_order(b.1)))
         });
 
         let mut event_times = Vec::with_capacity(n_events);
@@ -118,29 +136,43 @@ impl FlatEventTv {
             .expect("FlatEventTv::from_subject: model.tv_fn required for AD path");
 
         // Re-derive the same event order used by FlatEventData::from_subject.
-        let mut events: Vec<(f64, f64, usize, bool)> =
-            Vec::with_capacity(subject.doses.len() + subject.obs_times.len());
+        // Triplet kind tags: 0 = dose, 1 = obs, 2 = pk-only (EVID=2).
+        let mut events: Vec<(f64, f64, usize, u8)> = Vec::with_capacity(
+            subject.doses.len() + subject.obs_times.len() + subject.pk_only_times.len(),
+        );
         for (k, d) in subject.doses.iter().enumerate() {
-            events.push((d.time, 0.0, k, false /* is_obs */));
+            events.push((d.time, 0.0, k, 0));
         }
         for (j, &t) in subject.obs_times.iter().enumerate() {
-            events.push((t, 1.0, j, true));
+            events.push((t, 1.0, j, 1));
         }
+        for (m, &t) in subject.pk_only_times.iter().enumerate() {
+            events.push((t, 2.0, m, 2));
+        }
+        let kind_order = |k: f64| -> u8 {
+            if k < 0.5 {
+                0
+            } else if k > 1.5 {
+                1
+            } else {
+                2
+            }
+        };
         events.sort_by(|a, b| {
             a.0.partial_cmp(&b.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| kind_order(a.1).cmp(&kind_order(b.1)))
         });
 
         let n_events = events.len();
         let n_tv = model.pk_idx_f64.len();
 
         let mut tv = Vec::with_capacity(n_events * n_tv);
-        for (_, _, orig, is_obs) in &events {
-            let cov = if *is_obs {
-                subject.obs_cov(*orig)
-            } else {
-                subject.dose_cov(*orig)
+        for (_, _, orig, kind_tag) in &events {
+            let cov = match kind_tag {
+                0 => subject.dose_cov(*orig),
+                1 => subject.obs_cov(*orig),
+                _ => subject.pk_only_cov(*orig),
             };
             let row = tv_fn(theta, cov);
             assert_eq!(row.len(), n_tv, "tv_fn returned wrong length");
@@ -306,17 +338,23 @@ pub fn individual_nll_event_driven_ad(
 
         let kind = event_kinds[ev_idx];
         let orig = event_orig_idx_f64[ev_idx] as usize;
+        // `orig` is an index into doses (kind=0), obs (kind=1), or
+        // pk_only events (kind=2). For each side-array access we
+        // clamp to a safe fallback index when the event isn't of
+        // that kind — multiplied by zero downstream so the value
+        // doesn't matter, only the address being valid.
         let dose_idx = if kind < 0.5 { orig } else { 0 };
-        let obs_idx = if kind < 0.5 { 0 } else { orig };
+        let obs_idx = if kind > 0.5 && kind < 1.5 { orig } else { 0 };
 
-        // ── Dose branch. Const inputs throughout. Bolus goes into
-        // state0 — depot for oral models, central for IV models.
+        // ── Dose branch. is_dose=0 for obs and pk-only events, so
+        // their state0 is unchanged regardless of dose_amts/dose_rates
+        // values. Const inputs throughout.
         let is_dose = if kind < 0.5 { 1.0 } else { 0.0 };
         let is_bolus = if dose_rates[dose_idx] == 0.0 { 1.0 } else { 0.0 };
         state0 += is_dose * is_bolus * dose_amts[dose_idx];
 
-        // ── Observation branch. Mask via is_obs.
-        let is_obs = if kind < 0.5 { 0.0 } else { 1.0 };
+        // ── Observation branch. is_obs=0 for dose and pk-only events.
+        let is_obs = if kind > 0.5 && kind < 1.5 { 1.0 } else { 0.0 };
 
         // Central-compartment slot:
         //   IV models (1- 2- 3-cpt): central = state0
@@ -341,6 +379,10 @@ pub fn individual_nll_event_driven_ad(
         let bloq_term = -2.0 * log_normal_cdf_ad(z);
         let gaussian_term = resid * resid / v_resid + v_resid.ln();
         let obs_term = cens_active * bloq_term + (1.0 - cens_active) * gaussian_term;
+        // For pk-only events is_obs = 0, so no contribution to data_ll.
+        // current_pk still updates from this event's row (handled by
+        // the unconditional ev_cl/v/q/v2/ka/q3/v3 captures above and
+        // the current_* assignments at the end of the loop body).
         data_ll += is_obs * obs_term;
 
         current_cl = ev_cl;

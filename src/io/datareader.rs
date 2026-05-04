@@ -244,6 +244,11 @@ fn parse_subject(
     // Per-event covariate snapshots (only populated when any_tv is true).
     let mut dose_covariates: Vec<HashMap<String, f64>> = Vec::new();
     let mut obs_covariates: Vec<HashMap<String, f64>> = Vec::new();
+    // EVID=2 ("other event") rows — typically covariate-change markers.
+    // Only worth tracking when there are TV covariates, since otherwise
+    // re-evaluating $PK with unchanged values is a no-op.
+    let mut pk_only_times: Vec<f64> = Vec::new();
+    let mut pk_only_covariates: Vec<HashMap<String, f64>> = Vec::new();
 
     for row in rows {
         // Update LOCF state from this row's TV-covariate values *before*
@@ -337,6 +342,21 @@ fn parse_subject(
             if any_tv {
                 obs_covariates.push(locf_state.clone());
             }
+        } else if evid == 2 && any_tv {
+            // EVID=2 "other event" — typically a covariate-change marker.
+            // NONMEM/nlmixr2 run $PK at this time with this row's
+            // covariate values, so the rate matrix switches at this
+            // time even though the row is neither a dose nor an obs.
+            // We capture it as a pk-only event; the analytical / AD /
+            // ODE event walkers will refresh `current_pk` from this
+            // row's covariates without mutating the compartment state.
+            //
+            // Skipped entirely when there are no TV covariates: with
+            // constant covariates re-evaluating $PK gives the same
+            // values, so the row is a true no-op and adding it to the
+            // event timeline would just be wasted work.
+            pk_only_times.push(time);
+            pk_only_covariates.push(locf_state.clone());
         }
     }
 
@@ -369,6 +389,8 @@ fn parse_subject(
             covariates,
             dose_covariates: sorted_dose_cov,
             obs_covariates,
+            pk_only_times,
+            pk_only_covariates,
             cens,
             occasions,
             dose_occasions: sorted_dose_occ,
@@ -537,6 +559,52 @@ mod tests {
         assert_eq!(subj.doses[1].time, 5.0);
         assert_eq!(subj.dose_covariates[0]["CR"], 1.0);
         assert_eq!(subj.dose_covariates[1]["CR"], 2.0);
+    }
+
+    #[test]
+    fn test_evid2_rows_captured_with_locf_covariates() {
+        // EVID=2 ("other event") rows with TV covariates should be
+        // captured into pk_only_times / pk_only_covariates so the
+        // event-driven propagator can refresh the rate matrix at the
+        // EVID=2 time. NONMEM/nlmixr2 equivalent: $PK runs at every
+        // record (including EVID=2), so a covariate change marker
+        // should switch CL/V immediately at its time.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CR\n\
+                   1,0,.,1,1,100,1.0\n\
+                   1,5,.,2,1,0,1.5\n\
+                   1,10,5.0,0,0,.,1.5\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        // 1 dose, 1 obs, 1 pk-only event.
+        assert_eq!(subj.doses.len(), 1);
+        assert_eq!(subj.obs_times.len(), 1);
+        assert_eq!(subj.pk_only_times.len(), 1);
+        assert_eq!(subj.pk_only_times[0], 5.0);
+        // EVID=2 row carries CR=1.5 — must end up in the snapshot.
+        assert_eq!(subj.pk_only_covariates[0]["CR"], 1.5);
+        // Subsequent obs sees the LOCF value.
+        assert_eq!(subj.obs_covariates[0]["CR"], 1.5);
+    }
+
+    #[test]
+    fn test_evid2_rows_skipped_when_no_tv_covariates() {
+        // With time-constant covariates, EVID=2 rows are no-ops in
+        // NONMEM ($PK gives the same values), so we don't bother
+        // building snapshots for them — saves allocation. This test
+        // locks in that optimization.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,WT\n\
+                   1,0,.,1,1,100,70\n\
+                   1,5,.,2,1,0,70\n\
+                   1,10,5.0,0,0,.,70\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        assert!(!subj.has_tv_covariates());
+        assert!(subj.pk_only_times.is_empty());
+        assert!(subj.pk_only_covariates.is_empty());
     }
 
     #[test]

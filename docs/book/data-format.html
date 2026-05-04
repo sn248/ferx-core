@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-15f6b3a6.js";
+            window.path_to_searchindex_js = "searchindex-66b5b5de.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-911e3088.js"></script>
@@ -265,6 +265,7 @@
 <tbody>
 <tr><td>0</td><td>Observation record. <code>DV</code> is used for estimation.</td></tr>
 <tr><td>1</td><td>Dosing record. <code>AMT</code> is administered to compartment <code>CMT</code>.</td></tr>
+<tr><td>2</td><td>Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row’s covariate values — matching NONMEM’s <code>$PK runs at every record</code> semantic. Only meaningful when at least one covariate is time-varying; for time-constant data EVID=2 rows are skipped (would be no-ops).</td></tr>
 <tr><td>4</td><td>Reset and dose. All compartment amounts are reset to zero before dosing.</td></tr>
 </tbody>
 </table>

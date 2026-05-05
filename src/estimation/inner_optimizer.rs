@@ -229,12 +229,24 @@ pub fn find_ebe(
     // and the model provides tv_fn (the parser attaches it for analytical PK).
     let grad_method = resolve_gradient_method(model, subject);
 
-    // Try BFGS — AD gradient when `grad_method` is one of the AD variants,
-    // FD otherwise. The AD gradient of individual_nll w.r.t. psi equals the
-    // gradient w.r.t. eta_true (chain rule: d/dpsi = d/d(eta_true), since
-    // psi = eta_true + mu).
+    // ── Per-subject AD helpers, built ONCE per find_ebe call ──
+    //
+    // theta is fixed for the whole inner-loop (BFGS gradient calls) AND
+    // for the post-convergence Jacobian, so all the per-event tv arrays
+    // and dose-flat arrays are stable across both. Hoist them out of
+    // the inner closures and out of the Jacobian site so each helper is
+    // only constructed once per outer iteration per subject — was twice
+    // before this refactor, with `pk_param_fn` re-evaluated per event.
     #[cfg(feature = "autodiff")]
-    let result = if grad_method != InnerGradientMethod::Fd {
+    let (
+        ad_dose_data,
+        ad_omega_inv_flat,
+        ad_log_det_omega,
+        ad_cens_f64,
+        ad_tv_adjusted,
+        ad_event_data,
+        ad_tv_per_event,
+    ) = if grad_method != InnerGradientMethod::Fd {
         let dose_data = FlatDoseData::from_subject(subject);
         let omega_inv = params
             .omega
@@ -249,6 +261,8 @@ pub fn find_ebe(
                 omega_inv_flat.push(omega_inv[(i, j)]);
             }
         }
+        // Same early-return on degenerate omega as before — must run
+        // before any heavy helper allocation.
         let log_det_omega = {
             let mut ld = 0.0;
             for i in 0..n_eta {
@@ -269,41 +283,78 @@ pub fn find_ebe(
             }
             2.0 * ld
         };
-
-        // Under M3, feed actual CENS flags so the AD path applies -log Φ to
-        // censored rows. Otherwise pass zeros — Enzyme will trace the Gaussian
-        // branch for every observation, identical to the pre-M3 behavior.
+        // Under M3, feed actual CENS flags so the AD path applies
+        // -log Φ to censored rows. Otherwise pass zeros — Enzyme
+        // traces the Gaussian branch for every observation.
         let cens_f64: Vec<f64> = if matches!(model.bloq_method, BloqMethod::M3) {
             subject.cens.iter().map(|&c| c as f64).collect()
         } else {
             vec![0.0; subject.observations.len()]
         };
-        let mu_ad = mu.clone();
-
-        // Build the path-specific helpers up front so the closure doesn't
-        // re-allocate on every gradient call.
+        // Per-method helpers — only one of the two is built.
         let tv_fn = model
             .tv_fn
             .as_ref()
             .expect("resolve_gradient_method guarantees tv_fn for AD branches");
+        let (tv_adjusted, event_data, tv_per_event) = match grad_method {
+            InnerGradientMethod::AdSingleSnapshot => (
+                Some(tv_fn(&params.theta, &subject.covariates)),
+                None,
+                None,
+            ),
+            InnerGradientMethod::AdEventDriven => (
+                None,
+                Some(crate::ad::event_driven_ad::FlatEventData::from_subject(subject)),
+                Some(crate::ad::event_driven_ad::FlatEventTv::from_subject(
+                    model,
+                    subject,
+                    &params.theta,
+                )),
+            ),
+            InnerGradientMethod::Fd => (None, None, None),
+        };
+        (
+            Some(dose_data),
+            Some(omega_inv_flat),
+            Some(log_det_omega),
+            Some(cens_f64),
+            tv_adjusted,
+            event_data,
+            tv_per_event,
+        )
+    } else {
+        (None, None, None, None, None, None, None)
+    };
+
+    // Try BFGS — AD gradient when `grad_method` is one of the AD variants,
+    // FD otherwise. The AD gradient of individual_nll w.r.t. psi equals the
+    // gradient w.r.t. eta_true (chain rule: d/dpsi = d/d(eta_true), since
+    // psi = eta_true + mu).
+    #[cfg(feature = "autodiff")]
+    let result = if grad_method != InnerGradientMethod::Fd {
+        let dose_data = ad_dose_data.as_ref().unwrap();
+        let omega_inv_flat = ad_omega_inv_flat.as_ref().unwrap();
+        let log_det_omega = ad_log_det_omega.unwrap();
+        let cens_f64 = ad_cens_f64.as_ref().unwrap();
+        let mu_ad = mu.clone();
 
         match grad_method {
             InnerGradientMethod::AdSingleSnapshot => {
-                let tv_adjusted = tv_fn(&params.theta, &subject.covariates);
+                let tv_adjusted = ad_tv_adjusted.as_ref().unwrap();
                 let grad_fn = |p: &[f64]| -> Vec<f64> {
                     let eta_t: Vec<f64> =
                         p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
                     let t0 = std::time::Instant::now();
                     let (_, g) = ad_gradients::compute_nll_gradient_ad(
                         &eta_t,
-                        &tv_adjusted,
-                        &omega_inv_flat,
+                        tv_adjusted,
+                        omega_inv_flat,
                         log_det_omega,
                         &params.sigma.values,
-                        &dose_data,
+                        dose_data,
                         &subject.obs_times,
                         &subject.observations,
-                        &cens_f64,
+                        cens_f64,
                         model.pk_model,
                         model.error_model,
                         &model.pk_idx_f64,
@@ -315,26 +366,21 @@ pub fn find_ebe(
                 bfgs_minimize_with_grad(&obj, &grad_fn, &mut psi, n_eta, max_iter, tol)
             }
             InnerGradientMethod::AdEventDriven => {
-                let event_data =
-                    crate::ad::event_driven_ad::FlatEventData::from_subject(subject);
-                let tv_per_event = crate::ad::event_driven_ad::FlatEventTv::from_subject(
-                    model,
-                    subject,
-                    &params.theta,
-                );
+                let event_data = ad_event_data.as_ref().unwrap();
+                let tv_per_event = ad_tv_per_event.as_ref().unwrap();
                 let grad_fn = |p: &[f64]| -> Vec<f64> {
                     let eta_t: Vec<f64> =
                         p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
                     let t0 = std::time::Instant::now();
                     let (_, g) = crate::ad::event_driven_ad::compute_nll_gradient_event_driven_ad(
                         &eta_t,
-                        &tv_per_event,
-                        &omega_inv_flat,
+                        tv_per_event,
+                        omega_inv_flat,
                         log_det_omega,
                         &params.sigma.values,
-                        &event_data,
+                        event_data,
                         &subject.observations,
-                        &cens_f64,
+                        cens_f64,
                         model.pk_model,
                         model.error_model,
                         &model.pk_idx_f64,
@@ -374,21 +420,19 @@ pub fn find_ebe(
     let eta_true: Vec<f64> = psi.iter().zip(mu.iter()).map(|(p, m)| p - m).collect();
 
     // Compute Jacobian at eta_true — match the gradient path so the H matrix
-    // is consistent with the gradient that drove convergence.
+    // is consistent with the gradient that drove convergence. Reuses the
+    // same per-subject helpers built once at the top of find_ebe; previously
+    // these were rebuilt here, doubling the per-subject helper cost.
     #[cfg(feature = "autodiff")]
     let h_matrix = match grad_method {
         InnerGradientMethod::AdSingleSnapshot => {
-            let tv_fn = model
-                .tv_fn
-                .as_ref()
-                .expect("resolve_gradient_method guarantees tv_fn");
-            let tv_adjusted = tv_fn(&params.theta, &subject.covariates);
-            let dose_data = FlatDoseData::from_subject(subject);
+            let tv_adjusted = ad_tv_adjusted.as_ref().unwrap();
+            let dose_data = ad_dose_data.as_ref().unwrap();
             let t0 = std::time::Instant::now();
             let j = ad_gradients::compute_jacobian_ad(
                 &eta_true,
-                &tv_adjusted,
-                &dose_data,
+                tv_adjusted,
+                dose_data,
                 &subject.obs_times,
                 subject.obs_times.len(),
                 model.pk_model,
@@ -403,17 +447,13 @@ pub fn find_ebe(
             // `ad::event_driven_ad_jac` (sibling module so the AD pass
             // stays isolated from the reverse-mode NLL pass; sharing
             // helpers tripped Enzyme's reverse-mode type deduction).
-            let event_data = crate::ad::event_driven_ad::FlatEventData::from_subject(subject);
-            let tv_per_event = crate::ad::event_driven_ad::FlatEventTv::from_subject(
-                model,
-                subject,
-                &params.theta,
-            );
+            let event_data = ad_event_data.as_ref().unwrap();
+            let tv_per_event = ad_tv_per_event.as_ref().unwrap();
             let t0 = std::time::Instant::now();
             let j = crate::ad::event_driven_ad_jac::compute_jacobian_event_driven_ad(
                 &eta_true,
-                &tv_per_event,
-                &event_data,
+                tv_per_event,
+                event_data,
                 subject.obs_times.len(),
                 model.pk_model,
                 &model.pk_idx_f64,

@@ -330,6 +330,48 @@ pub enum ErrorModel {
     Combined,
 }
 
+/// How a sigma parameter enters the residual error model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigmaType {
+    Proportional,
+    Additive,
+}
+
+/// Transformation applied to a theta on the natural scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThetaTransform {
+    /// Theta is on the natural scale (no transformation).
+    Identity,
+    /// Theta is on the log scale; back-transform = exp(theta).
+    Log,
+    /// Theta is on the logit scale; back-transform = inv_logit(theta).
+    Logit,
+}
+
+/// Distribution / parameterisation of an ETA random effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EtaParamType {
+    /// `TVCL * exp(ETA)` or `exp(THETA + ETA)` — log-normal.
+    LogNormal,
+    /// `TVCL + ETA` — normal (additive).
+    Additive,
+    /// `inv_logit(THETA + ETA)` — logit-normal.
+    Logit,
+    /// Pattern not automatically recognised.
+    Custom,
+}
+
+/// Per-ETA transformation metadata, carried in `FitResult`.
+#[derive(Debug, Clone)]
+pub struct EtaParamInfo {
+    pub eta_name: String,
+    pub param_type: EtaParamType,
+    /// Theta paired with this ETA (present for log-scale and logit patterns).
+    pub linked_theta: Option<String>,
+    /// Name of the individual parameter this ETA appears in (e.g. `"CL"`).
+    pub individual_param_name: String,
+}
+
 /// PK parameter function: maps (theta, eta, covariates) -> PkParams
 pub type PkParamFn = Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> PkParams + Send + Sync>;
 
@@ -443,6 +485,13 @@ pub struct CompiledModel {
     /// Warnings generated at parse time (e.g. mu-referencing disabled for
     /// conditional parameters).  Prepended to `FitResult.warnings` by `fit()`.
     pub parse_warnings: Vec<String>,
+    /// Per-ETA transformation metadata derived from the `[individual_parameters]`
+    /// expressions at parse time. Length ≤ n_eta (only ETAs whose expression was
+    /// classified are present). Forwarded into `FitResult`.
+    pub eta_param_info: Vec<EtaParamInfo>,
+    /// Per-theta transformation: `theta_transform[i]` describes whether theta i
+    /// is used on the natural (Identity), log, or logit scale. Length == n_theta.
+    pub theta_transform: Vec<ThetaTransform>,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -637,6 +686,14 @@ pub struct FitResult {
     pub model_name: String,
     /// ferx-nlme library version (from Cargo.toml at compile time).
     pub ferx_version: String,
+    /// Per-ETA transformation metadata (see `EtaParamInfo`). Used by the R
+    /// layer to pick the correct CI / CV% formula for each random effect.
+    pub eta_param_info: Vec<EtaParamInfo>,
+    /// Per-theta transformation (Identity / Log / Logit), parallel to `theta`.
+    /// Tells the R layer whether a theta must be back-transformed before display.
+    pub theta_transform: Vec<ThetaTransform>,
+    /// Per-sigma type (Proportional / Additive), parallel to `sigma`.
+    pub sigma_types: Vec<SigmaType>,
 }
 
 /// Options for fit()
@@ -1063,6 +1120,8 @@ pub(crate) mod test_helpers {
             referenced_covariates: vec![],
             gradient_method,
             parse_warnings: Vec::new(),
+        eta_param_info: Vec::new(),
+        theta_transform: Vec::new(),
         }
     }
 }

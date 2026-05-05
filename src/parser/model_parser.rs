@@ -249,6 +249,128 @@ fn detect_mu_refs(
     result
 }
 
+/// Detect `inv_logit(THETA_i + ETA_j)` pattern.
+/// Returns `Some((eta_idx, theta_idx))` or `None`.
+fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize)> {
+    if let Expression::UnaryFn(name, inner) = expr {
+        if name == "inv_logit" || name == "expit" {
+            if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
+                let try_theta_eta = |a: &Expression, b: &Expression| -> Option<(usize, usize)> {
+                    if let (Expression::Theta(ti), Expression::Eta(ei)) = (a, b) {
+                        return Some((*ei, *ti));
+                    }
+                    None
+                };
+                return try_theta_eta(lhs, rhs).or_else(|| try_theta_eta(rhs, lhs));
+            }
+        }
+    }
+    None
+}
+
+/// Classify each top-level [individual_parameters] assignment and return
+/// `(eta_param_infos, theta_transforms)`.
+///
+/// `theta_transforms` is indexed parallel to `theta_names`; `eta_param_infos`
+/// contains one entry per BSV ETA that could be classified.
+fn classify_indiv_params(
+    stmts: &[Statement],
+    theta_names: &[String],
+    eta_names: &[String],
+) -> (Vec<crate::types::EtaParamInfo>, Vec<crate::types::ThetaTransform>) {
+    use crate::types::{EtaParamInfo, EtaParamType, ThetaTransform};
+
+    let n_theta = theta_names.len();
+    let mut theta_transform = vec![ThetaTransform::Identity; n_theta];
+    let mut eta_infos: Vec<EtaParamInfo> = Vec::new();
+
+    for s in stmts {
+        if let Statement::Assign(param_name, expr) = s {
+            // Logit pattern: inv_logit(THETA + ETA)
+            if let Some((eta_idx, theta_idx)) = detect_logit_pattern(expr) {
+                if eta_idx < eta_names.len() && theta_idx < n_theta {
+                    theta_transform[theta_idx] = ThetaTransform::Logit;
+                    eta_infos.push(EtaParamInfo {
+                        eta_name: eta_names[eta_idx].clone(),
+                        param_type: EtaParamType::Logit,
+                        linked_theta: Some(theta_names[theta_idx].clone()),
+                        individual_param_name: param_name.clone(),
+                    });
+                    continue;
+                }
+            }
+
+            // Log-scale: exp(THETA + ETA)  [Pattern 2 in detect_pattern]
+            if let Expression::UnaryFn(name, inner) = expr {
+                if name == "exp" {
+                    if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
+                        let try_theta_eta =
+                            |a: &Expression, b: &Expression| -> Option<(usize, usize)> {
+                                if let (Expression::Theta(ti), Expression::Eta(ei)) = (a, b) {
+                                    return Some((*ei, *ti));
+                                }
+                                None
+                            };
+                        if let Some((ei, ti)) =
+                            try_theta_eta(lhs, rhs).or_else(|| try_theta_eta(rhs, lhs))
+                        {
+                            if ei < eta_names.len() && ti < n_theta {
+                                theta_transform[ti] = ThetaTransform::Log;
+                                eta_infos.push(EtaParamInfo {
+                                    eta_name: eta_names[ei].clone(),
+                                    param_type: EtaParamType::LogNormal,
+                                    linked_theta: Some(theta_names[ti].clone()),
+                                    individual_param_name: param_name.clone(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Use detect_pattern for the remaining mu-ref-compatible patterns
+            if let Some((eta_idx, theta_idx, log_transformed)) = detect_pattern(expr) {
+                if eta_idx < eta_names.len() && theta_idx < n_theta {
+                    if log_transformed {
+                        // TVCL * exp(ETA) or exp(log(THETA) + ETA)
+                        eta_infos.push(EtaParamInfo {
+                            eta_name: eta_names[eta_idx].clone(),
+                            param_type: EtaParamType::LogNormal,
+                            linked_theta: None,
+                            individual_param_name: param_name.clone(),
+                        });
+                    } else {
+                        // TVCL + ETA
+                        eta_infos.push(EtaParamInfo {
+                            eta_name: eta_names[eta_idx].clone(),
+                            param_type: EtaParamType::Additive,
+                            linked_theta: None,
+                            individual_param_name: param_name.clone(),
+                        });
+                    }
+                    continue;
+                }
+            }
+
+            // Any other expression that references an ETA → Custom
+            let eta_indices = extract_eta_indices(expr);
+            for ei in eta_indices {
+                if ei < eta_names.len() {
+                    eta_infos.push(EtaParamInfo {
+                        eta_name: eta_names[ei].clone(),
+                        param_type: EtaParamType::Custom,
+                        linked_theta: None,
+                        individual_param_name: param_name.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    (eta_infos, theta_transform)
+}
+
 /// Parse a model file (.ferx) and return a CompiledModel.
 pub fn parse_model_file(path: &Path) -> Result<CompiledModel, String> {
     let content =
@@ -513,6 +635,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
     }
 
+    // Classify [individual_parameters] expressions for the R metadata layer.
+    // Uses BSV-only eta names (no kappas).
+    let (eta_param_info, theta_transform) =
+        classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv);
+
     let model = CompiledModel {
         name,
         pk_model,
@@ -538,6 +665,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         referenced_covariates,
         gradient_method: GradientMethod::default(),
         parse_warnings: Vec::new(), // populated below
+        eta_param_info,
+        theta_transform,
     };
 
     // ── Optional blocks ──
@@ -1850,6 +1979,11 @@ fn eval_expression(
                 "log" | "ln" => v.max(1e-30).ln(),
                 "sqrt" => v.max(0.0).sqrt(),
                 "abs" => v.abs(),
+                "inv_logit" | "expit" => 1.0 / (1.0 + (-v).exp()),
+                "logit" => {
+                    let clamped = v.clamp(1e-15, 1.0 - 1e-15);
+                    (clamped / (1.0 - clamped)).ln()
+                }
                 _ => v,
             }
         }
@@ -4538,5 +4672,116 @@ if (1 > 0) {
             parsed.model.indiv_param_names.len(),
             parsed.model.pk_indices.len()
         );
+    }
+
+    fn minimal_model_with_indiv(indiv_block: &str) -> crate::types::CompiledModel {
+        let model_str = format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+{}
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+            indiv_block
+        );
+        super::parse_full_model(&model_str).unwrap().model
+    }
+
+    fn minimal_logit_model() -> crate::types::CompiledModel {
+        let model_str = r"
+[parameters]
+  theta THETA_F(0.0, -10.0, 10.0)
+  sigma EPS ~ 0.01
+  omega ETA_F  ~ 0.1
+
+[individual_parameters]
+  F = inv_logit(THETA_F + ETA_F)
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=1, v=1)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        super::parse_full_model(model_str).unwrap().model
+    }
+
+    #[test]
+    fn test_inv_logit_evaluates() {
+        let model = minimal_logit_model();
+        let tv = model.tv_fn.as_ref().unwrap()(&[0.0], &Default::default());
+        let expected = 0.5_f64; // inv_logit(0) = 0.5
+        assert!((tv[0] - expected).abs() < 1e-10, "inv_logit(0) should be 0.5, got {}", tv[0]);
+    }
+
+    #[test]
+    fn test_classify_lognormal_multiplicative() {
+        use crate::types::{EtaParamType, ThetaTransform};
+        // CL = TVCL * exp(ETA_CL)
+        let model = minimal_model_with_indiv("  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)");
+        assert_eq!(model.eta_param_info.len(), 2);
+        let cl_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
+        assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
+        // TVCL * exp(ETA) pattern: theta is not on log scale (theta IS TVCL)
+        assert!(cl_info.linked_theta.is_none());
+        // theta_transform for TVCL (theta index 0) stays Identity
+        assert_eq!(model.theta_transform[0], ThetaTransform::Identity);
+    }
+
+    #[test]
+    fn test_classify_lognormal_log_scale() {
+        use crate::types::{EtaParamType, ThetaTransform};
+        // CL = exp(TVCL + ETA_CL)  — theta is on log scale
+        let model = minimal_model_with_indiv("  CL = exp(TVCL + ETA_CL)\n  V = TVV * exp(ETA_V)");
+        let cl_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
+        assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
+        assert_eq!(cl_info.linked_theta, Some("TVCL".to_string()));
+        assert_eq!(model.theta_transform[0], ThetaTransform::Log);
+    }
+
+    #[test]
+    fn test_classify_additive() {
+        use crate::types::{EtaParamType, ThetaTransform};
+        // CL = TVCL + ETA_CL  — additive
+        let model = minimal_model_with_indiv("  CL = TVCL + ETA_CL\n  V = TVV * exp(ETA_V)");
+        let cl_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
+        assert_eq!(cl_info.param_type, EtaParamType::Additive);
+        assert_eq!(model.theta_transform[0], ThetaTransform::Identity);
+    }
+
+    #[test]
+    fn test_classify_logit() {
+        use crate::types::{EtaParamType, ThetaTransform};
+        let model = minimal_logit_model();
+        let f_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_F").unwrap();
+        assert_eq!(f_info.param_type, EtaParamType::Logit);
+        assert_eq!(f_info.linked_theta, Some("THETA_F".to_string()));
+        assert_eq!(model.theta_transform[0], ThetaTransform::Logit);
+    }
+
+    #[test]
+    fn test_sigma_types_proportional() {
+        use crate::types::{ErrorModel, SigmaType};
+        let model = minimal_logit_model();
+        assert_eq!(model.error_model, ErrorModel::Proportional);
+        // sigma_types is on FitResult, not CompiledModel — check error_model field here;
+        // the FitResult wiring is tested at integration level.
+        let sigma_types: Vec<SigmaType> = match model.error_model {
+            ErrorModel::Proportional => vec![SigmaType::Proportional],
+            ErrorModel::Additive => vec![SigmaType::Additive],
+            ErrorModel::Combined => vec![SigmaType::Proportional, SigmaType::Additive],
+        };
+        assert_eq!(sigma_types, vec![SigmaType::Proportional]);
     }
 }

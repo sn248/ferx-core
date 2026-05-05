@@ -1049,6 +1049,8 @@ mod iov_tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
             parse_warnings: Vec::new(),
+        eta_param_info: Vec::new(),
+        theta_transform: Vec::new(),
         }
     }
 
@@ -1137,6 +1139,8 @@ mod iov_tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
             parse_warnings: Vec::new(),
+        eta_param_info: Vec::new(),
+        theta_transform: Vec::new(),
         };
         let subject = Subject {
             id: "1".into(),

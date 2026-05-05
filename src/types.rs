@@ -637,6 +637,15 @@ pub struct FitResult {
     pub model_name: String,
     /// ferx-nlme library version (from Cargo.toml at compile time).
     pub ferx_version: String,
+    /// Eigenvalues of the correlation matrix of free (non-fixed) parameters,
+    /// sorted descending. `None` when the covariance step was not run, failed,
+    /// or fewer than two free parameters exist.
+    pub cov_eigenvalues: Option<Vec<f64>>,
+    /// Ratio of the largest to smallest eigenvalue of the correlation matrix of
+    /// free parameters. `f64::INFINITY` when the smallest eigenvalue is
+    /// non-positive (signals a near-singular parameter space). `None` when
+    /// `cov_eigenvalues` is `None`.
+    pub cov_condition_number: Option<f64>,
 }
 
 /// Options for fit()

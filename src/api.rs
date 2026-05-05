@@ -601,6 +601,9 @@ fn fit_inner(
 
     let wall_time_secs = fit_start.elapsed().as_secs_f64();
 
+    let (cov_eigenvalues, cov_condition_number) =
+        cov_diagnostics(result.covariance_matrix.as_ref());
+
     let fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
@@ -656,6 +659,8 @@ fn fit_inner(
         wall_time_secs,
         model_name: model.name.clone(),
         ferx_version: env!("CARGO_PKG_VERSION").to_string(),
+        cov_eigenvalues,
+        cov_condition_number,
     };
 
     if options.verbose {
@@ -701,6 +706,38 @@ fn fit_inner(
     }
 
     Ok(fit_result)
+}
+
+/// Eigenvalues and condition number of the correlation matrix of free
+/// (non-fixed) parameters.  Fixed parameters have zero diagonal in the
+/// covariance matrix and are excluded so that the correlation scaling does not
+/// divide by zero and the condition number reflects only the identifiable
+/// parameter space.
+///
+/// Returns `(None, None)` when `cov` is `None`, fewer than two free parameters
+/// exist, or any free-parameter diagonal entry is not strictly positive.
+fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
+    let cov = match cov {
+        Some(m) => m,
+        None => return (None, None),
+    };
+    let n = cov.nrows();
+    let free: Vec<usize> = (0..n).filter(|&i| cov[(i, i)] > 0.0).collect();
+    if free.len() < 2 {
+        return (None, None);
+    }
+    let sub = DMatrix::from_fn(free.len(), free.len(), |a, b| cov[(free[a], free[b])]);
+    let std_devs: Vec<f64> = (0..free.len()).map(|a| sub[(a, a)].sqrt()).collect();
+    let cor = DMatrix::from_fn(free.len(), free.len(), |a, b| {
+        sub[(a, b)] / (std_devs[a] * std_devs[b])
+    });
+    let eig = cor.symmetric_eigen();
+    let mut eigenvalues: Vec<f64> = eig.eigenvalues.iter().cloned().collect();
+    eigenvalues.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let min_ev = eigenvalues.last().copied().unwrap_or(0.0);
+    let max_ev = eigenvalues.first().copied().unwrap_or(0.0);
+    let condition_number = if min_ev > 0.0 { max_ev / min_ev } else { f64::INFINITY };
+    (Some(eigenvalues), Some(condition_number))
 }
 
 /// Compute per-subject diagnostics (IPRED, PRED, IWRES, CWRES)
@@ -1662,5 +1699,81 @@ mod extract_se_tests {
         let template = make_template(Some(iov), vec![false]);
         let (_, _, _, se_kappa) = extract_standard_errors(&None, &template);
         assert!(se_kappa.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests_cov_diagnostics {
+    use super::*;
+    use nalgebra::DMatrix;
+
+    #[test]
+    fn test_cov_diagnostics_none_input() {
+        let (ev, cn) = cov_diagnostics(None);
+        assert!(ev.is_none());
+        assert!(cn.is_none());
+    }
+
+    #[test]
+    fn test_cov_diagnostics_fewer_than_two_free_params() {
+        // 2×2 matrix where only one param is free (second has zero diagonal)
+        let mut m = DMatrix::<f64>::zeros(2, 2);
+        m[(0, 0)] = 4.0;
+        let (ev, cn) = cov_diagnostics(Some(&m));
+        assert!(ev.is_none());
+        assert!(cn.is_none());
+    }
+
+    #[test]
+    fn test_cov_diagnostics_excludes_fixed_params_zero_diagonal() {
+        // 3×3 covariance; middle param is fixed (zero row/col).
+        // Free subblock [[4, 0.5], [0.5, 2]] is non-singular, so condition
+        // number must be finite and eigenvalues length must be 2.
+        let mut m = DMatrix::<f64>::zeros(3, 3);
+        m[(0, 0)] = 4.0;
+        m[(0, 2)] = 0.5;
+        m[(2, 0)] = 0.5;
+        m[(2, 2)] = 2.0;
+        let (ev, cn) = cov_diagnostics(Some(&m));
+        let ev = ev.expect("eigenvalues must be Some");
+        let cn = cn.expect("condition_number must be Some");
+        assert_eq!(ev.len(), 2, "must have 2 eigenvalues (one per free param)");
+        assert!(cn.is_finite(), "condition_number must be finite for non-singular subblock");
+        assert!(cn > 0.0);
+        // Eigenvalues must be sorted descending
+        assert!(ev[0] >= ev[1]);
+    }
+
+    #[test]
+    fn test_cov_diagnostics_inf_condition_number_for_non_positive_eigenvalue() {
+        // Construct a 2×2 covariance matrix whose free-param correlation matrix
+        // is [[1, r], [r, 1]] with |r| > 1 — not PSD, so min eigenvalue < 0.
+        // (r = 1.5 → eigenvalues 2.5 and -0.5)
+        let mut m = DMatrix::<f64>::zeros(2, 2);
+        m[(0, 0)] = 1.0;
+        m[(0, 1)] = 1.5; // cor = 1.5/sqrt(1*1) = 1.5 > 1 → non-PSD
+        m[(1, 0)] = 1.5;
+        m[(1, 1)] = 1.0;
+        let (ev, cn) = cov_diagnostics(Some(&m));
+        let cn = cn.expect("condition_number must be Some");
+        assert!(
+            cn.is_infinite(),
+            "condition_number must be Inf when min eigenvalue ≤ 0, got {cn}"
+        );
+        let ev = ev.expect("eigenvalues must be Some");
+        assert!(ev.last().copied().unwrap_or(1.0) <= 0.0, "min eigenvalue must be ≤ 0");
+    }
+
+    #[test]
+    fn test_cov_diagnostics_identity_covariance() {
+        // Diagonal covariance → correlation matrix is identity → all eigenvalues 1.
+        let m = DMatrix::<f64>::from_diagonal(&nalgebra::DVector::from_vec(vec![4.0, 9.0]));
+        let (ev, cn) = cov_diagnostics(Some(&m));
+        let ev = ev.expect("eigenvalues must be Some");
+        let cn = cn.expect("condition_number must be Some");
+        for &e in &ev {
+            assert!((e - 1.0).abs() < 1e-12, "eigenvalue must be 1.0, got {e}");
+        }
+        assert!((cn - 1.0).abs() < 1e-12, "condition_number must be 1.0, got {cn}");
     }
 }

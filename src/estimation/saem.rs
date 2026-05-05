@@ -9,7 +9,8 @@
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{compute_covariance, pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::stats::likelihood::individual_nll;
+use crate::pk::EventPkParams;
+use crate::stats::likelihood::{individual_nll, individual_nll_into};
 use crate::stats::residual_error::residual_variance;
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
@@ -61,6 +62,7 @@ struct SaemState {
 /// That was incorrect: `individual_nll` interprets `eta` as the deviation
 /// `log(CL_i) − log(TVCL)`, while `mu_k = log(TVCL)`, so the model evaluated
 /// `CL = TVCL · exp(log TVCL) = TVCL²` for every accepted exploration step.
+#[allow(clippy::too_many_arguments)]
 fn mh_steps(
     eta: &mut [f64],
     nll_current: f64,
@@ -72,6 +74,7 @@ fn mh_steps(
     step_scale: f64,
     rng: &mut impl Rng,
     n_steps: usize,
+    pk_scratch: &mut EventPkParams,
 ) -> (usize, f64) {
     let n_eta = eta.len();
     let l = &omega.chol;
@@ -87,7 +90,20 @@ fn mh_steps(
             .map(|j| eta[j] + step_scale * perturbation[j])
             .collect();
 
-        let nll_prop = individual_nll(model, subject, theta, &eta_prop, omega, sigma_values);
+        // Reuses `pk_scratch` across all n_steps proposals (and across
+        // outer SAEM iterations when the caller hoists allocation
+        // further). On TV-cov subjects this eliminates the per-call
+        // allocate/discard of three `Vec<PkParams>` per evaluation —
+        // the dominant allocator pressure on the SAEM hot loop.
+        let nll_prop = individual_nll_into(
+            model,
+            subject,
+            theta,
+            &eta_prop,
+            omega,
+            sigma_values,
+            pk_scratch,
+        );
 
         // Symmetric proposal q(η_prop|η) = q(η|η_prop) cancels in the ratio,
         // so the prior+likelihood difference encoded in `individual_nll` is
@@ -244,15 +260,18 @@ fn theta_sigma_mstep_light(
 /// Observation NLL for a single subject with ETAs held fixed.
 ///
 /// Under M3, CENS=1 rows contribute `-log Φ((LLOQ - f)/√V)`.
-fn obs_nll_single(
+fn obs_nll_single_into(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
     eta: &[f64],
+    pk_scratch: &mut EventPkParams,
 ) -> f64 {
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
-    let preds = crate::pk::compute_predictions_with_tv(model, subject, theta, eta);
+    let preds = crate::pk::compute_predictions_with_tv_into(
+        model, subject, theta, eta, pk_scratch,
+    );
     let mut nll = 0.0;
     for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let f = f.max(1e-12);
@@ -273,6 +292,12 @@ fn obs_nll_single(
 /// Gaussian residual term. Without this branch, the SAEM M-step would optimize
 /// θ/σ as if censored observations were exact Gaussians at the LLOQ value,
 /// producing silently-biased population estimates.
+///
+/// Uses rayon's `map_init` so each worker thread allocates one
+/// `EventPkParams` scratch on first use and reuses it across every
+/// subject the worker handles. With NLopt's central-FD gradient
+/// hitting `obs_nll_sum` `1 + 2·n_dim` times per M-step, this cuts
+/// per-call `Vec<PkParams>` churn to near-zero on TV-cov data.
 fn obs_nll_sum(
     model: &CompiledModel,
     population: &Population,
@@ -285,7 +310,9 @@ fn obs_nll_sum(
         .subjects
         .par_iter()
         .enumerate()
-        .map(|(i, subject)| obs_nll_single(model, subject, theta, sigma_values, &etas[i]))
+        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            obs_nll_single_into(model, subject, theta, sigma_values, &etas[i], scratch)
+        })
         .sum()
 }
 
@@ -467,7 +494,13 @@ pub fn run_saem(
                 .zip(state.nll_cache.par_iter())
                 .zip(state.step_scales.par_iter())
                 .enumerate()
-                .map(|(i, ((eta, &nll), &scale))| {
+                // Per-rayon-worker `EventPkParams` scratch: allocated
+                // once per worker per outer iteration, reused across
+                // every subject the worker handles. Without `map_init`
+                // the scratch was allocated per subject per outer
+                // iter (5937 × N_iter on the cefepime SAEM bench);
+                // with it, n_workers × N_iter ≈ 10 × N_iter.
+                .map_init(EventPkParams::default, |pk_scratch, (i, ((eta, &nll), &scale))| {
                     let subject = &population.subjects[i];
                     let mut rng = StdRng::seed_from_u64(
                         master_seed
@@ -486,6 +519,7 @@ pub fn run_saem(
                         scale,
                         &mut rng,
                         n_mh_steps,
+                        pk_scratch,
                     );
                     (eta_work, nll_new, n_acc)
                 })
@@ -961,6 +995,7 @@ mod tests {
         let nll_start = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma.values);
         let mut rng = StdRng::seed_from_u64(42);
 
+        let mut pk_scratch = EventPkParams::with_capacity_for(&subj);
         mh_steps(
             &mut eta,
             nll_start,
@@ -972,6 +1007,7 @@ mod tests {
             0.0, // zero perturbation: random walk MUST stay put exactly
             &mut rng,
             100,
+            &mut pk_scratch,
         );
 
         // Random walk with step=0: every proposal == current eta, accepted as

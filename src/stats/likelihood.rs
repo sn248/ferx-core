@@ -14,6 +14,9 @@ use rayon::prelude::*;
 /// objectives. Callers must pass the same `(theta, eta)` they use elsewhere
 /// in the NLL — `pk_param_fn` is invoked internally once per event (TV path)
 /// or once per subject (no-TV path).
+///
+/// Allocates a fresh `EventPkParams` scratch on each call. Hot loops should
+/// use [`model_predictions_into`] with a reused scratch buffer instead.
 #[inline]
 fn model_predictions(
     model: &CompiledModel,
@@ -22,6 +25,19 @@ fn model_predictions(
     eta: &[f64],
 ) -> Vec<f64> {
     pk::compute_predictions_with_tv(model, subject, theta, eta)
+}
+
+/// Same as [`model_predictions`] but uses a caller-owned scratch buffer for
+/// per-event PK params (the dominant per-call allocation on TV-cov paths).
+#[inline]
+fn model_predictions_into(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    scratch: &mut pk::EventPkParams,
+) -> Vec<f64> {
+    pk::compute_predictions_with_tv_into(model, subject, theta, eta, scratch)
 }
 
 /// True when observation `j` of `subject` is censored AND the model requests M3.
@@ -45,6 +61,26 @@ pub fn individual_nll(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
 ) -> f64 {
+    // Allocate-on-each-call wrapper — see `individual_nll_into` for
+    // the scratch-aware version used by SAEM's MH loop.
+    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+    individual_nll_into(model, subject, theta, eta, omega, sigma_values, &mut scratch)
+}
+
+/// Same as [`individual_nll`] but uses a caller-owned scratch buffer.
+/// The hot-path entry point for SAEM's MH proposals: a single buffer
+/// allocated outside the per-subject MH loop is reused across all
+/// proposed `eta`s, eliminating the per-call `Vec<PkParams>` churn
+/// that previously dominated SAEM allocator pressure on TV-cov data.
+pub fn individual_nll_into(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    scratch: &mut pk::EventPkParams,
+) -> f64 {
     // Compute Omega inverse and log-determinant via Cholesky
     let omega_inv = match omega.matrix.clone().cholesky() {
         Some(chol) => chol.inverse(),
@@ -56,9 +92,10 @@ pub fn individual_nll(
     let eta_vec = DVector::from_column_slice(eta);
     let eta_prior = eta_vec.dot(&(&omega_inv * &eta_vec));
 
-    // Compute individual predictions; per-event PK params handled internally
-    // when the subject has time-varying covariates.
-    let preds = model_predictions(model, subject, theta, eta);
+    // Compute individual predictions using the caller's scratch buffer
+    // for per-event PK params (only consumed on the TV-cov path; ignored
+    // on the no-TV fast path).
+    let preds = model_predictions_into(model, subject, theta, eta, scratch);
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let v = residual_variance(model.error_model, f_pred, sigma_values);

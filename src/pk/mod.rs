@@ -16,7 +16,16 @@ pub use two_compartment::*;
 /// superposition path detects this case via `subject.has_tv_covariates()`
 /// and evaluates `pk_param_fn` only once instead of materialising the
 /// vectors — see [`compute_event_pk_params`] for details.
-#[derive(Debug, Clone)]
+///
+/// # Reusing across calls
+///
+/// Hot loops (SAEM Metropolis-Hastings, BFGS gradient/objective) call
+/// `compute_event_pk_params` once per evaluation. To avoid the
+/// allocate-and-discard cycle, allocate one buffer per subject (
+/// [`Self::with_capacity_for`]) and refill it with
+/// [`compute_event_pk_params_into`]. The Vecs are reused — no new
+/// allocations as long as `subject` doesn't change.
+#[derive(Debug, Clone, Default)]
 pub struct EventPkParams {
     /// PK params at each dose event time, parallel to `subject.doses`.
     pub dose: Vec<PkParams>,
@@ -28,6 +37,20 @@ pub struct EventPkParams {
     pub pk_only: Vec<PkParams>,
 }
 
+impl EventPkParams {
+    /// Allocate empty `Vec`s sized to fit `subject`'s event timeline.
+    /// The capacity is what matters for reuse — the subsequent
+    /// [`compute_event_pk_params_into`] call resizes the `Vec`s to
+    /// the exact lengths and overwrites the contents.
+    pub fn with_capacity_for(subject: &Subject) -> Self {
+        Self {
+            dose: Vec::with_capacity(subject.doses.len()),
+            obs: Vec::with_capacity(subject.obs_times.len()),
+            pk_only: Vec::with_capacity(subject.pk_only_times.len()),
+        }
+    }
+}
+
 /// Materialise per-event PK parameters by evaluating `model.pk_param_fn`
 /// at the LOCF covariate snapshot stored on each event.
 ///
@@ -35,38 +58,62 @@ pub struct EventPkParams {
 /// `pk_param_fn` exactly once and clones the result into every slot — the
 /// downstream PK solver still sees a uniform per-event interface, while
 /// the cost stays at O(1) covariate evaluation.
+///
+/// Allocates fresh `Vec`s each call. For hot loops use
+/// [`compute_event_pk_params_into`] with a reused [`EventPkParams`]
+/// buffer.
 pub fn compute_event_pk_params(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> EventPkParams {
+    let mut out = EventPkParams::with_capacity_for(subject);
+    compute_event_pk_params_into(model, subject, theta, eta, &mut out);
+    out
+}
+
+/// Same as [`compute_event_pk_params`] but writes into a caller-owned
+/// buffer. Used by SAEM's MH loop and the FOCE objective closure where
+/// the buffer is allocated once per subject and reused across many
+/// `eta` evaluations — cuts per-call allocator pressure to zero on the
+/// TV-cov path.
+///
+/// Resizes `out`'s `Vec`s to the exact lengths required by `subject`,
+/// then overwrites the contents. If the existing capacity already
+/// fits, no allocation happens.
+pub fn compute_event_pk_params_into(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    out: &mut EventPkParams,
+) {
+    out.dose.clear();
+    out.obs.clear();
+    out.pk_only.clear();
+
     if subject.has_tv_covariates() {
-        let dose = subject
-            .doses
-            .iter()
-            .enumerate()
-            .map(|(k, _)| (model.pk_param_fn)(theta, eta, subject.dose_cov(k)))
-            .collect();
-        let obs = subject
-            .obs_times
-            .iter()
-            .enumerate()
-            .map(|(j, _)| (model.pk_param_fn)(theta, eta, subject.obs_cov(j)))
-            .collect();
-        let pk_only = subject
-            .pk_only_times
-            .iter()
-            .enumerate()
-            .map(|(m, _)| (model.pk_param_fn)(theta, eta, subject.pk_only_cov(m)))
-            .collect();
-        EventPkParams { dose, obs, pk_only }
+        for k in 0..subject.doses.len() {
+            out.dose
+                .push((model.pk_param_fn)(theta, eta, subject.dose_cov(k)));
+        }
+        for j in 0..subject.obs_times.len() {
+            out.obs
+                .push((model.pk_param_fn)(theta, eta, subject.obs_cov(j)));
+        }
+        for m in 0..subject.pk_only_times.len() {
+            out.pk_only
+                .push((model.pk_param_fn)(theta, eta, subject.pk_only_cov(m)));
+        }
     } else {
         let p = (model.pk_param_fn)(theta, eta, &subject.covariates);
-        EventPkParams {
-            dose: vec![p.clone(); subject.doses.len()],
-            obs: vec![p; subject.obs_times.len()],
-            pk_only: Vec::new(),
+        // pk_only stays empty — see EventPkParams docstring.
+        for _ in 0..subject.doses.len() {
+            out.dose.push(p);
+        }
+        for _ in 0..subject.obs_times.len() {
+            out.obs.push(p);
         }
     }
 }
@@ -166,14 +213,41 @@ pub fn compute_predictions_with_tv(
     theta: &[f64],
     eta: &[f64],
 ) -> Vec<f64> {
+    // Allocate-on-each-call wrapper. Hot loops should use
+    // `compute_predictions_with_tv_into` instead.
+    let mut scratch = EventPkParams::with_capacity_for(subject);
+    compute_predictions_with_tv_into(model, subject, theta, eta, &mut scratch)
+}
+
+/// Same as [`compute_predictions_with_tv`] but writes per-event PK
+/// params into a caller-owned scratch buffer. Used by hot loops (SAEM
+/// MH proposals, FOCE objective evaluations) that re-evaluate the
+/// same subject many times with different `eta` — allocating fresh
+/// `Vec<PkParams>` on every call is the dominant allocator-pressure
+/// source on TV-cov datasets.
+///
+/// The scratch buffer is **only used on the TV-cov analytical/ODE
+/// path**; the no-TV fast path doesn't touch it. Callers can pass the
+/// same scratch unconditionally — the no-TV path just ignores it.
+pub fn compute_predictions_with_tv_into(
+    model: &crate::types::CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    scratch: &mut EventPkParams,
+) -> Vec<f64> {
     let has_tv = subject.has_tv_covariates();
 
     // ODE path.
     if let Some(ref ode) = model.ode_spec {
         if has_tv {
-            let ev = compute_event_pk_params(model, subject, theta, eta);
+            compute_event_pk_params_into(model, subject, theta, eta, scratch);
             return crate::ode::ode_predictions_event_driven(
-                ode, subject, &ev.dose, &ev.obs, &ev.pk_only,
+                ode,
+                subject,
+                &scratch.dose,
+                &scratch.obs,
+                &scratch.pk_only,
             );
         }
         let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
@@ -181,13 +255,13 @@ pub fn compute_predictions_with_tv(
     }
 
     if has_tv && event_driven::supports_event_driven(model.pk_model) {
-        let ev = compute_event_pk_params(model, subject, theta, eta);
+        compute_event_pk_params_into(model, subject, theta, eta, scratch);
         return event_driven::event_driven_predictions(
             model.pk_model,
             subject,
-            &ev.dose,
-            &ev.obs,
-            &ev.pk_only,
+            &scratch.dose,
+            &scratch.obs,
+            &scratch.pk_only,
         );
     }
 

@@ -1219,6 +1219,7 @@ mod iov_tests {
             kappa_names: vec!["KAPPA_CL".into()],
             theta_names: vec!["TVCL".into(), "TVV".into()],
             eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into(), "V".into()],
             default_params,
             mu_refs: HashMap::new(),
             tv_fn: None,
@@ -1231,6 +1232,8 @@ mod iov_tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
             parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
         }
     }
 
@@ -1309,6 +1312,7 @@ mod iov_tests {
             kappa_names: Vec::new(),
             theta_names: vec!["TVCL".into(), "TVV".into()],
             eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into(), "V".into()],
             default_params,
             mu_refs: HashMap::new(),
             tv_fn: None,
@@ -1321,6 +1325,8 @@ mod iov_tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
             parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
         };
         let subject = Subject {
             id: "1".into(),

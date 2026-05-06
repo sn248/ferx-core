@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-c5f4da84.js";
+            window.path_to_searchindex_js = "../searchindex-3fd4c433.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-911e3088.js"></script>
@@ -267,6 +267,26 @@ covariate term (e.g.
 [individual_parameters]
   CL = TVCL * (WT/70)^THETA_WT * (CRCL/100)^THETA_CRCL * exp(ETA_CL)
 </code></pre>
+<h3 id="logit-normal-bioavailability"><a class="header" href="#logit-normal-bioavailability">Logit-normal bioavailability</a></h3>
+<p>Use <code>inv_logit(logit(THETA_F) + ETA_F)</code> to constrain bioavailability to (0, 1).
+The starting value for <code>THETA_F</code> is set <strong>directly on the (0, 1) scale</strong> — whatever
+fraction you specify is what the optimiser uses as the typical F:</p>
+<pre><code>[parameters]
+  theta THETA_F(0.70, 0.001, 0.999)  # typical bioavailability = 70%
+  omega ETA_F ~ 0.10                 # BSV on the logit scale
+
+[individual_parameters]
+  F = inv_logit(logit(THETA_F) + ETA_F)
+</code></pre>
+<ul>
+<li>When <code>ETA_F = 0</code>, <code>F_i = THETA_F</code> exactly (the logit and inv_logit cancel).</li>
+<li><code>ETA_F</code> shifts each individual’s F on the logit scale, symmetrically around the typical value.</li>
+<li>The estimated <code>THETA_F</code> in the output is directly interpretable as the typical bioavailability.</li>
+<li><code>omega ETA_F</code> is variance on the <strong>logit scale</strong> — not the variance of F itself.</li>
+</ul>
+<p>The alternative form <code>inv_logit(THETA_F + ETA_F)</code> is also supported, where
+<code>THETA_F</code> is on the logit scale (e.g., <code>logit(0.70) ≈ 0.847</code>). This is
+less readable but may be useful when comparing with NONMEM models.</p>
 <h2 id="automatic-mu-referencing"><a class="header" href="#automatic-mu-referencing">Automatic MU-referencing</a></h2>
 <p>When a line matches one of the patterns</p>
 <pre><code>PARAM = THETA * exp(ETA)              # multiplicative / log-normal

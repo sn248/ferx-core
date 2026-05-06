@@ -760,8 +760,11 @@ mod tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
             parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
             n_kappa: 0,
             kappa_names: Vec::new(),
+            indiv_param_names: vec!["CL".into(), "V".into()],
         }
     }
 

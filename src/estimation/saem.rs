@@ -731,6 +731,12 @@ pub fn run_saem(
         }
     }
 
+    // If the user cancelled mid-run the loop broke early; skip the final
+    // EBE/OFV computation (which iterates over every subject) and abort.
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return Err("cancelled by user".to_string());
+    }
+
     if verbose {
         eprintln!("SAEM iterations complete. Computing final EBEs and OFV...");
     }
@@ -1071,5 +1077,55 @@ mod tests {
         // `!pairs.is_empty()`.  Both conditions are tested via the public API
         // in api::iov_integration::test_iov_foce_mu_referencing_on; this unit
         // test pins the precondition (pair detection still produces work).
+    }
+
+    /// A pre-cancelled `CancelFlag` makes the SAEM main loop break at the
+    /// first iteration and `run_saem` must return `Err("cancelled by user")`
+    /// without entering the post-loop "Computing final EBEs and OFV..." block
+    /// (which iterates over every subject and is what makes a cancelled run
+    /// feel like it isn't aborting).
+    #[test]
+    fn cancelled_run_returns_err_and_skips_final_ebe() {
+        use crate::cancel::CancelFlag;
+        use crate::types::{DoseEvent, FitOptions, Population};
+        use std::collections::HashMap;
+
+        let model = analytical_model(GradientMethod::Auto);
+        let subj = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0],
+            observations: vec![1.0, 0.5],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![],
+            dose_occasions: vec![],
+        };
+        let population = Population {
+            subjects: vec![subj],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+        };
+
+        let flag = CancelFlag::new();
+        flag.cancel(); // pre-cancel: loop breaks at iteration 1
+
+        let mut opts = FitOptions::default();
+        opts.verbose = false;
+        opts.run_covariance_step = false;
+        opts.cancel = Some(flag);
+
+        match run_saem(&model, &population, &model.default_params, &opts) {
+            Err(msg) => assert!(
+                msg.contains("cancelled by user"),
+                "unexpected error message: {msg}"
+            ),
+            Ok(_) => panic!("pre-cancelled SAEM must return Err, not Ok"),
+        }
     }
 }

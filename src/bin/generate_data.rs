@@ -209,8 +209,11 @@ fn build_warfarin_model() -> CompiledModel {
         referenced_covariates: Vec::new(),
         gradient_method: GradientMethod::default(),
         parse_warnings: Vec::new(),
+        eta_param_info: Vec::new(),
+        theta_transform: Vec::new(),
         n_kappa: 0,
         kappa_names: Vec::new(),
+        indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
     }
 }
 
@@ -308,8 +311,11 @@ fn generate_two_cpt_iv() {
         referenced_covariates: Vec::new(),
         gradient_method: GradientMethod::default(),
         parse_warnings: Vec::new(),
+        eta_param_info: Vec::new(),
+        theta_transform: Vec::new(),
         n_kappa: 0,
         kappa_names: Vec::new(),
+        indiv_param_names: vec!["CL".into(), "V".into(), "Q".into(), "V2".into()],
     };
     let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0];
     let subjects = simulate_subjects(&model, &params, 15, 100.0, 1, &obs_times, 123, None);
@@ -406,8 +412,11 @@ fn generate_two_cpt_oral_cov() {
         referenced_covariates: Vec::new(),
         gradient_method: GradientMethod::default(),
         parse_warnings: Vec::new(),
+        eta_param_info: Vec::new(),
+        theta_transform: Vec::new(),
         n_kappa: 0,
         kappa_names: Vec::new(),
+        indiv_param_names: vec!["CL".into(), "V".into(), "Q".into(), "V2".into(), "KA".into()],
     };
 
     // Generate random covariates (matching Julia seed 456)
@@ -549,8 +558,11 @@ fn generate_mm_oral() {
         referenced_covariates: Vec::new(),
         gradient_method: GradientMethod::default(),
         parse_warnings: Vec::new(),
+        eta_param_info: Vec::new(),
+        theta_transform: Vec::new(),
         n_kappa: 0,
         kappa_names: Vec::new(),
+        indiv_param_names: vec!["VMAX".into(), "KM".into(), "V".into(), "KA".into()],
     };
     let obs_times = vec![
         0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0,

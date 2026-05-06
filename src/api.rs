@@ -12,17 +12,13 @@ use nalgebra::{DMatrix, DVector};
 use std::path::Path;
 use std::time::Instant;
 
-/// Route predictions through the TV-aware dispatcher. Used by post-processing
-/// (sdtab generation) and the public `predict` API. Same semantics as
-/// `stats::likelihood::model_predictions` — passes `(theta, eta)` so the
-/// dispatcher can build per-event PK params when the subject has TV covariates.
-fn model_preds(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-) -> Vec<f64> {
-    pk::compute_predictions_with_tv(model, subject, theta, eta)
+/// Route predictions through analytical PK or ODE solver.
+fn model_preds(model: &CompiledModel, subject: &Subject, pk_params: &PkParams) -> Vec<f64> {
+    if let Some(ref ode_spec) = model.ode_spec {
+        pk::compute_predictions_ode(ode_spec, subject, &pk_params.values)
+    } else {
+        pk::compute_predictions(model.pk_model, subject, pk_params)
+    }
 }
 
 /// Run a model file with a NONMEM-format CSV dataset.
@@ -379,54 +375,6 @@ fn fit_inner(
 
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
-
-    // TV-covariate AD downgrade notice — only fires for the *unsupported*
-    // structural models (oral / 3-cpt). Supported analytical models
-    // (1- and 2-cpt IV bolus + infusion) now run the event-driven AD path
-    // for TV-cov subjects via `crate::ad::event_driven_ad`. ODE models
-    // never had an AD path to start with so the message would be noise.
-    let want_ad = matches!(
-        model.gradient_method,
-        GradientMethod::Ad | GradientMethod::Auto
-    );
-    // All analytical PK models are now covered by event-driven AD.
-    let event_driven_ad_supported = !matches!(model.pk_model, _ if model.ode_spec.is_some())
-        && matches!(
-            model.pk_model,
-            PkModel::OneCptIvBolus
-                | PkModel::OneCptInfusion
-                | PkModel::OneCptOral
-                | PkModel::TwoCptIvBolus
-                | PkModel::TwoCptInfusion
-                | PkModel::TwoCptOral
-                | PkModel::ThreeCptIvBolus
-                | PkModel::ThreeCptInfusion
-                | PkModel::ThreeCptOral
-        );
-    let tv_unsupported_subjects = if want_ad
-        && model.tv_fn.is_some()
-        && model.ode_spec.is_none()
-        && !event_driven_ad_supported
-    {
-        population
-            .subjects
-            .iter()
-            .filter(|s| s.has_tv_covariates())
-            .count()
-    } else {
-        0
-    };
-    if tv_unsupported_subjects > 0 {
-        // All analytical PkModel variants are currently in the supported
-        // list, so this path only fires if a future variant is added
-        // without AD coverage. Kept as a forward-looking guard.
-        accumulated_warnings.push(format!(
-            "AD gradients disabled for {}/{} subjects with time-varying covariates \
-             on this structural model. Falling back to FD.",
-            tv_unsupported_subjects,
-            population.subjects.len()
-        ));
-    }
     if options.run_covariance_step && n_params_pre > 30 {
         if let Some(n_evals) = covariance_n_evals_estimated {
             accumulated_warnings.push(format!(
@@ -597,16 +545,6 @@ fn fit_inner(
                 .to_string(),
         );
     }
-
-    // Diagnose degenerate / suspicious converged points. Common pathology
-    // when the optimiser lands in a local minimum where one eta has
-    // collapsed to zero variance, a theta has run to its bound, or an SE
-    // is so large the parameter is effectively unidentifiable. NONMEM
-    // emits similar diagnostics under different names. Each finding is
-    // a separate `degeneracy:` warning so callers can grep for them.
-    let degeneracy_warnings =
-        detect_degenerate_convergence(&result.params, se_theta.as_ref(), se_omega.as_ref());
-    warnings.extend(degeneracy_warnings);
     let sir_result = if options.sir && !crate::cancel::is_cancelled(&options.cancel) {
         if let Some(ref cov) = result.covariance_matrix {
             if options.verbose {
@@ -666,6 +604,9 @@ fn fit_inner(
 
     let wall_time_secs = fit_start.elapsed().as_secs_f64();
 
+    let (cov_eigenvalues, cov_condition_number) =
+        cov_diagnostics(result.covariance_matrix.as_ref());
+
     let fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
@@ -721,6 +662,11 @@ fn fit_inner(
         wall_time_secs,
         model_name: model.name.clone(),
         ferx_version: env!("CARGO_PKG_VERSION").to_string(),
+        eta_param_info: model.eta_param_info.clone(),
+        theta_transform: model.theta_transform.clone(),
+        sigma_types: model.error_model.sigma_types(),
+        cov_eigenvalues,
+        cov_condition_number,
     };
 
     if options.verbose {
@@ -768,6 +714,40 @@ fn fit_inner(
     Ok(fit_result)
 }
 
+/// Eigenvalues and condition number of the correlation matrix of free
+/// (non-fixed) parameters.  Fixed parameters have zero diagonal in the
+/// covariance matrix and are excluded so that the correlation scaling does not
+/// divide by zero and the condition number reflects only the identifiable
+/// parameter space.
+///
+/// Returns `(None, None)` when `cov` is `None` or fewer than two free
+/// parameters exist (after excluding parameters whose diagonal entry is
+/// `<= 0`).  Parameters with non-positive diagonals are treated as fixed and
+/// silently excluded; the remaining free subblock is used for the computation.
+fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
+    let cov = match cov {
+        Some(m) => m,
+        None => return (None, None),
+    };
+    let n = cov.nrows();
+    let free: Vec<usize> = (0..n).filter(|&i| cov[(i, i)] > 0.0).collect();
+    if free.len() < 2 {
+        return (None, None);
+    }
+    let sub = DMatrix::from_fn(free.len(), free.len(), |a, b| cov[(free[a], free[b])]);
+    let std_devs: Vec<f64> = (0..free.len()).map(|a| sub[(a, a)].sqrt()).collect();
+    let cor = DMatrix::from_fn(free.len(), free.len(), |a, b| {
+        sub[(a, b)] / (std_devs[a] * std_devs[b])
+    });
+    let eig = cor.symmetric_eigen();
+    let mut eigenvalues: Vec<f64> = eig.eigenvalues.iter().cloned().collect();
+    eigenvalues.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let min_ev = eigenvalues.last().copied().unwrap_or(0.0);
+    let max_ev = eigenvalues.first().copied().unwrap_or(0.0);
+    let condition_number = if min_ev > 1e-10 { max_ev / min_ev } else { f64::INFINITY };
+    (Some(eigenvalues), Some(condition_number))
+}
+
 /// Compute per-subject diagnostics (IPRED, PRED, IWRES, CWRES)
 fn compute_subject_results(
     model: &CompiledModel,
@@ -800,19 +780,24 @@ fn compute_subject_results(
                         if k < kappas.len() { kappas[k].as_slice() } else { &[] };
                     let combined: Vec<f64> =
                         eta.iter().copied().chain(kap.iter().copied()).collect();
-                    let all_preds = model_preds(model, subject, &params.theta, &combined);
+                    let pk = (model.pk_param_fn)(&params.theta, &combined, &subject.covariates);
+                    let all_preds = model_preds(model, subject, &pk);
                     for &j in obs_indices {
                         ipreds[j] = all_preds[j];
                     }
                 }
                 ipreds
             } else {
-                model_preds(model, subject, &params.theta, eta.as_slice())
+                let pk_params_ind =
+                    (model.pk_param_fn)(&params.theta, eta.as_slice(), &subject.covariates);
+                model_preds(model, subject, &pk_params_ind)
             };
 
             // Population predictions: f(eta = 0, kappa = 0).
             let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
-            let pred = model_preds(model, subject, &params.theta, &zero_eta);
+            let pk_params_pop =
+                (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
+            let pred = model_preds(model, subject, &pk_params_pop);
 
             // IWRES (NaN on BLOQ rows — see compute_cwres for CWRES handling).
             let mut iwres = compute_iwres(
@@ -1023,166 +1008,6 @@ mod tests {
     }
 }
 
-/// Inspect a converged set of population parameters for the kinds of
-/// pathological local minima the FOCEI inner loop can settle in when
-/// initial values are far from the truth or the model is structurally
-/// poorly identified for the data. Each finding becomes a one-line
-/// `degeneracy:` warning so callers can grep for them in batch runs.
-///
-/// Heuristics:
-///   - **Theta at bound**: a free theta sitting within 1% of its
-///     upper or lower bound (relative to the bound's distance to the
-///     other bound) — usually means the bound is binding and the
-///     parameter wants to leave the feasible region.
-///   - **Sigma collapsed**: a free sigma below 1e-3 SD — pushes the
-///     residual error model to zero, which never reflects real data
-///     and is almost always an optimiser artefact.
-///   - **Omega variance ≈ 0**: a free diagonal omega variance below
-///     1e-4 — the corresponding ETA has effectively no between-subject
-///     variability, which on real data is almost always a degenerate
-///     local minimum (the ETA collapses, model becomes 1-cpt-like,
-///     etc.).
-///   - **High RSE on theta or omega**: a free parameter whose
-///     standard error is more than 100% of its estimate — flag for
-///     non-identifiability. Only checked when the covariance step
-///     ran successfully (otherwise SE is unavailable).
-fn detect_degenerate_convergence(
-    params: &ModelParameters,
-    se_theta: Option<&Vec<f64>>,
-    se_omega: Option<&Vec<f64>>,
-) -> Vec<String> {
-    const THETA_BOUND_REL_TOL: f64 = 0.01;
-    const SIGMA_COLLAPSE: f64 = 1e-3;
-    const OMEGA_COLLAPSE: f64 = 1e-4;
-    const RSE_FLAG: f64 = 1.0; // 100%
-
-    let mut warnings = Vec::new();
-
-    // Theta at bound (free thetas only).
-    for (i, &est) in params.theta.iter().enumerate() {
-        if params.theta_fixed.get(i).copied().unwrap_or(false) {
-            continue;
-        }
-        let lb = params.theta_lower[i];
-        let ub = params.theta_upper[i];
-        let span = (ub - lb).abs().max(1e-30);
-        let lo_dist = (est - lb).abs() / span;
-        let hi_dist = (ub - est).abs() / span;
-        let name = params
-            .theta_names
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("THETA{}", i + 1));
-        if lo_dist < THETA_BOUND_REL_TOL {
-            warnings.push(format!(
-                "degeneracy: theta {} = {:.4} is at its lower bound ({:.4}) — \
-                 widen the bound or check initial value",
-                name, est, lb
-            ));
-        } else if hi_dist < THETA_BOUND_REL_TOL {
-            warnings.push(format!(
-                "degeneracy: theta {} = {:.4} is at its upper bound ({:.4}) — \
-                 widen the bound or check initial value",
-                name, est, ub
-            ));
-        }
-    }
-
-    // Sigma collapsed to ~zero (free sigmas only).
-    for (i, &est) in params.sigma.values.iter().enumerate() {
-        if params.sigma_fixed.get(i).copied().unwrap_or(false) {
-            continue;
-        }
-        if est.abs() < SIGMA_COLLAPSE {
-            let name = params
-                .sigma
-                .names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("SIGMA{}", i + 1));
-            warnings.push(format!(
-                "degeneracy: sigma {} = {:.2e} is essentially zero — residual \
-                 error has collapsed; likely a poor local optimum",
-                name, est
-            ));
-        }
-    }
-
-    // Omega variance collapsed (free diagonal entries only — block-omega
-    // off-diagonals and full block fix flags are inspected separately
-    // through the diagonal entries since both rows are flagged together).
-    for i in 0..params.omega.dim() {
-        if params.omega_fixed.get(i).copied().unwrap_or(false) {
-            continue;
-        }
-        let var = params.omega.matrix[(i, i)];
-        if var.abs() < OMEGA_COLLAPSE {
-            let name = params
-                .omega
-                .eta_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("ETA{}", i + 1));
-            warnings.push(format!(
-                "degeneracy: omega variance for {} = {:.2e} has collapsed \
-                 toward zero — the ETA carries no between-subject variability \
-                 at this optimum; likely a degenerate local minimum",
-                name, var
-            ));
-        }
-    }
-
-    // High RSE flags (only when covariance step ran successfully).
-    if let Some(se) = se_theta {
-        for (i, &est) in params.theta.iter().enumerate() {
-            if params.theta_fixed.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            let s = se.get(i).copied().unwrap_or(0.0);
-            if est.abs() > 1e-30 && s / est.abs() > RSE_FLAG {
-                let name = params
-                    .theta_names
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("THETA{}", i + 1));
-                warnings.push(format!(
-                    "degeneracy: theta {} = {:.4} has RSE {:.0}% — likely \
-                     non-identifiable at this point",
-                    name,
-                    est,
-                    100.0 * s / est.abs()
-                ));
-            }
-        }
-    }
-    if let Some(se) = se_omega {
-        for i in 0..params.omega.dim() {
-            if params.omega_fixed.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            let var = params.omega.matrix[(i, i)];
-            let s = se.get(i).copied().unwrap_or(0.0);
-            if var.abs() > 1e-30 && s / var.abs() > RSE_FLAG {
-                let name = params
-                    .omega
-                    .eta_names
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("ETA{}", i + 1));
-                warnings.push(format!(
-                    "degeneracy: omega variance for {} = {:.4e} has RSE \
-                     {:.0}% — likely non-identifiable at this point",
-                    name,
-                    var,
-                    100.0 * s / var.abs()
-                ));
-            }
-        }
-    }
-
-    warnings
-}
-
 /// Extract standard errors from covariance matrix on the packed parameter scale,
 /// then transform back to the original scale via delta method.
 fn extract_standard_errors(
@@ -1341,8 +1166,11 @@ fn simulate_inner<R: rand::Rng>(
             let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
-            // Predict concentrations (TV-cov-aware dispatcher).
-            let ipreds = model_preds(model, subject, &params.theta, &eta_slice);
+            // Compute individual parameters
+            let pk_params = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
+
+            // Predict concentrations
+            let ipreds = model_preds(model, subject, &pk_params);
 
             // Add residual error
             for (j, &ipred) in ipreds.iter().enumerate() {
@@ -1388,7 +1216,8 @@ pub fn predict(
     let mut results = Vec::new();
 
     for subject in &population.subjects {
-        let preds = model_preds(model, subject, &params.theta, &zero_eta);
+        let pk_params = (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
+        let preds = model_preds(model, subject, &pk_params);
 
         for (j, &pred) in preds.iter().enumerate() {
             results.push(PredictionResult {
@@ -1461,6 +1290,7 @@ mod iov_integration {
             kappa_names: vec!["KAPPA_CL".into()],
             theta_names: vec!["TVCL".into(), "TVV".into()],
             eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into(), "V".into()],
             default_params,
             mu_refs: HashMap::new(),
             tv_fn: None,
@@ -1473,6 +1303,8 @@ mod iov_integration {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
         }
     }
 
@@ -1709,464 +1541,6 @@ mod iov_integration {
     }
 }
 
-/// End-to-end checks for time-varying covariate handling: the fit pipeline
-/// must accept per-event covariate snapshots, route through the event-driven
-/// PK path, surface the AD-downgrade warning, and return finite OFVs.
-#[cfg(test)]
-mod tv_cov_integration {
-    use super::fit;
-    use crate::types::*;
-
-    use std::collections::HashMap;
-
-    /// 1-cpt IV bolus model where CL = TVCL * (CR / 1.0) * exp(ETA_CL).
-    /// Covariate `CR` is what changes within a subject in the test population.
-    fn make_tv_cov_model() -> CompiledModel {
-        let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
-        let default_params = ModelParameters {
-            theta: vec![5.0, 50.0],
-            theta_names: vec!["TVCL".into(), "TVV".into()],
-            theta_lower: vec![0.1, 5.0],
-            theta_upper: vec![50.0, 500.0],
-            theta_fixed: vec![false; 2],
-            omega,
-            omega_fixed: vec![false],
-            sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-        };
-        CompiledModel {
-            name: "tv_cov_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
-            error_model: ErrorModel::Proportional,
-            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>| {
-                let mut p = PkParams::default();
-                let cr = cov.get("CR").copied().unwrap_or(1.0);
-                p.values[0] = theta[0] * cr * eta[0].exp(); // CL = TVCL * CR * exp(ETA_CL)
-                p.values[1] = theta[1]; // V
-                p
-            }),
-            n_theta: 2,
-            n_eta: 1,
-            n_epsilon: 1,
-            n_kappa: 0,
-            kappa_names: Vec::new(),
-            theta_names: vec!["TVCL".into(), "TVV".into()],
-            eta_names: vec!["ETA_CL".into()],
-            default_params,
-            mu_refs: HashMap::new(),
-            tv_fn: None, // forces FD; no AD path needed for the test
-            pk_indices: vec![0, 1],
-            eta_map: vec![0],
-            pk_idx_f64: vec![0.0, 1.0],
-            sel_flat: vec![1.0, 0.0],
-            ode_spec: None,
-            bloq_method: BloqMethod::Drop,
-            referenced_covariates: vec!["CR".into()],
-            gradient_method: GradientMethod::Fd,
-            parse_warnings: Vec::new(),
-        }
-    }
-
-    /// Build a 4-subject population where CR doubles between obs 3 and obs 4.
-    /// This exercises the per-event LOCF snapshot path and the event-driven
-    /// analytical PK propagator.
-    fn make_tv_cov_population() -> Population {
-        let mk_cov = |cr: f64| {
-            let mut h = HashMap::new();
-            h.insert("CR".to_string(), cr);
-            h
-        };
-        let dose_covs = vec![mk_cov(1.0)];
-        let obs_covs = vec![mk_cov(1.0), mk_cov(1.0), mk_cov(1.0), mk_cov(2.0), mk_cov(2.0), mk_cov(2.0)];
-        let obs_times = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-
-        let subject_data: &[(&str, Vec<f64>)] = &[
-            ("S1", vec![18.0, 16.0, 14.0, 11.0, 9.0, 7.0]),
-            ("S2", vec![20.0, 18.0, 16.0, 12.5, 10.0, 8.0]),
-            ("S3", vec![17.0, 15.5, 13.5, 10.5, 8.5, 6.5]),
-            ("S4", vec![21.0, 19.0, 17.0, 13.0, 10.5, 8.5]),
-        ];
-
-        let subjects: Vec<Subject> = subject_data
-            .iter()
-            .map(|(id, obs)| Subject {
-                id: id.to_string(),
-                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                obs_times: obs_times.clone(),
-                observations: obs.clone(),
-                obs_cmts: vec![1; 6],
-                covariates: mk_cov(1.0),
-                dose_covariates: dose_covs.clone(),
-                obs_covariates: obs_covs.clone(),
-                pk_only_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                cens: vec![0; 6],
-                occasions: Vec::new(),
-                dose_occasions: Vec::new(),
-            })
-            .collect();
-        Population {
-            subjects,
-            covariate_names: vec!["CR".into()],
-            dv_column: "DV".to_string(),
-        }
-    }
-
-    fn fast_opts(method: EstimationMethod) -> FitOptions {
-        FitOptions {
-            method,
-            methods: Vec::new(),
-            outer_maxiter: 30,
-            outer_gtol: 1e-3,
-            inner_maxiter: 50,
-            inner_tol: 1e-4,
-            run_covariance_step: false,
-            interaction: method == EstimationMethod::FoceI,
-            mu_referencing: false,
-            optimizer: Optimizer::Bobyqa,
-            verbose: false,
-            ..FitOptions::default()
-        }
-    }
-
-    #[test]
-    fn tv_cov_foce_runs_and_produces_finite_ofv() {
-        let model = make_tv_cov_model();
-        let pop = make_tv_cov_population();
-        // Sanity check the population was built with TV cov on every subject.
-        assert!(pop.subjects.iter().all(|s| s.has_tv_covariates()));
-
-        let opts = fast_opts(EstimationMethod::Foce);
-        let result = fit(&model, &pop, &model.default_params, &opts).expect("FOCE fit should succeed");
-        assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
-        assert!(result.theta[0] > 0.0, "TVCL should remain positive");
-    }
-
-    #[test]
-    fn tv_cov_focei_runs_and_produces_finite_ofv() {
-        let model = make_tv_cov_model();
-        let pop = make_tv_cov_population();
-        let opts = fast_opts(EstimationMethod::FoceI);
-        let result =
-            fit(&model, &pop, &model.default_params, &opts).expect("FOCEI fit should succeed");
-        assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
-    }
-
-    #[test]
-    fn tv_cov_saem_runs_and_produces_finite_ofv() {
-        let model = make_tv_cov_model();
-        let pop = make_tv_cov_population();
-        let mut opts = fast_opts(EstimationMethod::Saem);
-        opts.saem_n_exploration = 10;
-        opts.saem_n_convergence = 20;
-        let result =
-            fit(&model, &pop, &model.default_params, &opts).expect("SAEM fit should succeed");
-        assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
-    }
-
-    /// Sanity: when the population has zero TV-cov subjects the AD-downgrade
-    /// warning must NOT fire. This is the no-op branch and should keep the
-    /// existing behavior unchanged.
-    #[test]
-    fn no_tv_cov_population_does_not_emit_ad_downgrade_warning() {
-        let model = make_tv_cov_model();
-        // Strip per-event covariates to flip every subject back to "no TV".
-        let mut pop = make_tv_cov_population();
-        for s in &mut pop.subjects {
-            s.dose_covariates.clear();
-            s.obs_covariates.clear();
-        }
-        assert!(pop.subjects.iter().all(|s| !s.has_tv_covariates()));
-
-        let opts = fast_opts(EstimationMethod::Foce);
-        let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
-        assert!(
-            !result
-                .warnings
-                .iter()
-                .any(|w| w.contains("AD gradients disabled")),
-            "no TV cov → no AD downgrade warning; got warnings: {:?}",
-            result.warnings
-        );
-    }
-
-    /// Supported analytical models with TV covariates take the event-driven
-    /// AD path — no downgrade warning. (Pre-AD-fast-path version of this
-    /// test asserted the opposite; updated when event-driven AD landed.)
-    #[test]
-    fn tv_cov_supported_model_with_ad_does_not_warn() {
-        let mut model = make_tv_cov_model();
-        model.tv_fn = Some(Box::new(|theta: &[f64], _cov: &HashMap<String, f64>| {
-            vec![theta[0], theta[1]]
-        }));
-        model.gradient_method = GradientMethod::Auto;
-        let pop = make_tv_cov_population();
-
-        let opts = fast_opts(EstimationMethod::Foce);
-        let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
-        assert!(
-            !result
-                .warnings
-                .iter()
-                .any(|w| w.contains("AD gradients disabled")),
-            "1-cpt IV bolus + TV cov is supported by event-driven AD; should not warn. \
-             Warnings: {:?}",
-            result.warnings
-        );
-    }
-
-    // ── Per-model TV-cov fit smoke tests. Each variant builds a tiny
-    //   model + population just rich enough to exercise the per-event
-    //   covariate path and the new analytical / AD propagator. We assert
-    //   the fit returns a finite OFV — that's enough to catch panics
-    //   in the propagator math and the dispatcher wiring. ────────────
-
-    fn build_tv_model(pk_model: PkModel) -> CompiledModel {
-        // CL = TVCL · CR · exp(ETA_CL); other PK params constants suitable
-        // for the model variant. tv_fn is None to keep the test
-        // path FD-only (avoids requiring nightly+enzyme to run unit tests).
-        let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
-        let (theta, theta_names): (Vec<f64>, Vec<String>) = match pk_model {
-            PkModel::OneCptIvBolus | PkModel::OneCptInfusion => {
-                (vec![5.0, 50.0], vec!["TVCL".into(), "TVV".into()])
-            }
-            PkModel::OneCptOral => (
-                vec![5.0, 50.0, 1.5],
-                vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
-            ),
-            PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion => (
-                vec![5.0, 30.0, 2.0, 50.0],
-                vec!["TVCL".into(), "TVV1".into(), "TVQ".into(), "TVV2".into()],
-            ),
-            PkModel::TwoCptOral => (
-                vec![5.0, 30.0, 2.0, 50.0, 1.5],
-                vec![
-                    "TVCL".into(),
-                    "TVV1".into(),
-                    "TVQ".into(),
-                    "TVV2".into(),
-                    "TVKA".into(),
-                ],
-            ),
-            PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion => (
-                vec![5.0, 20.0, 2.0, 30.0, 0.5, 100.0],
-                vec![
-                    "TVCL".into(),
-                    "TVV1".into(),
-                    "TVQ".into(),
-                    "TVV2".into(),
-                    "TVQ3".into(),
-                    "TVV3".into(),
-                ],
-            ),
-            PkModel::ThreeCptOral => (
-                vec![5.0, 20.0, 2.0, 30.0, 0.5, 100.0, 1.5],
-                vec![
-                    "TVCL".into(),
-                    "TVV1".into(),
-                    "TVQ".into(),
-                    "TVV2".into(),
-                    "TVQ3".into(),
-                    "TVV3".into(),
-                    "TVKA".into(),
-                ],
-            ),
-        };
-        let n_theta = theta.len();
-        let default_params = ModelParameters {
-            theta: theta.clone(),
-            theta_names: theta_names.clone(),
-            theta_lower: vec![0.01; n_theta],
-            theta_upper: vec![1000.0; n_theta],
-            theta_fixed: vec![false; n_theta],
-            omega,
-            omega_fixed: vec![false],
-            sigma: SigmaVector { values: vec![0.1], names: vec!["PROP_ERR".into()] },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-        };
-
-        CompiledModel {
-            name: format!("tv_cov_{:?}", pk_model),
-            pk_model,
-            error_model: ErrorModel::Proportional,
-            pk_param_fn: Box::new(move |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>| {
-                let mut p = PkParams::default();
-                let cr = cov.get("CR").copied().unwrap_or(1.0);
-                // Slot order in PkParams: 0=CL, 1=V, 2=Q, 3=V2, 4=KA, 5=F, 6=Q3, 7=V3.
-                p.values[0] = theta[0] * cr * eta[0].exp(); // CL
-                p.values[1] = theta[1]; // V
-                match pk_model {
-                    PkModel::OneCptOral => p.values[4] = theta[2],
-                    PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion => {
-                        p.values[2] = theta[2];
-                        p.values[3] = theta[3];
-                    }
-                    PkModel::TwoCptOral => {
-                        p.values[2] = theta[2];
-                        p.values[3] = theta[3];
-                        p.values[4] = theta[4];
-                    }
-                    PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion => {
-                        p.values[2] = theta[2];
-                        p.values[3] = theta[3];
-                        p.values[6] = theta[4];
-                        p.values[7] = theta[5];
-                    }
-                    PkModel::ThreeCptOral => {
-                        p.values[2] = theta[2];
-                        p.values[3] = theta[3];
-                        p.values[6] = theta[4];
-                        p.values[7] = theta[5];
-                        p.values[4] = theta[6];
-                    }
-                    _ => {}
-                }
-                p
-            }),
-            n_theta,
-            n_eta: 1,
-            n_epsilon: 1,
-            n_kappa: 0,
-            kappa_names: Vec::new(),
-            theta_names,
-            eta_names: vec!["ETA_CL".into()],
-            default_params,
-            mu_refs: HashMap::new(),
-            tv_fn: None,
-            pk_indices: vec![0, 1],
-            eta_map: vec![0],
-            pk_idx_f64: vec![0.0, 1.0],
-            sel_flat: vec![1.0, 0.0],
-            ode_spec: None,
-            bloq_method: BloqMethod::Drop,
-            referenced_covariates: vec!["CR".into()],
-            gradient_method: GradientMethod::Fd,
-            parse_warnings: Vec::new(),
-        }
-    }
-
-    fn build_tv_population(infusion: bool) -> Population {
-        let mk_cov = |cr: f64| {
-            let mut h = HashMap::new();
-            h.insert("CR".to_string(), cr);
-            h
-        };
-        let obs_times = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let dose = if infusion {
-            DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0) // 100mg over 2h
-        } else {
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)
-        };
-        let dose_covs = vec![mk_cov(1.0)];
-        let obs_covs = vec![mk_cov(1.0), mk_cov(1.0), mk_cov(1.0), mk_cov(2.0), mk_cov(2.0), mk_cov(2.0)];
-
-        let subject_data: &[(&str, Vec<f64>)] = &[
-            ("S1", vec![1.5, 2.0, 1.8, 1.5, 1.2, 1.0]),
-            ("S2", vec![1.7, 2.1, 1.9, 1.6, 1.3, 1.1]),
-            ("S3", vec![1.4, 1.9, 1.7, 1.4, 1.1, 0.9]),
-            ("S4", vec![1.8, 2.2, 2.0, 1.7, 1.4, 1.2]),
-        ];
-        let subjects: Vec<Subject> = subject_data
-            .iter()
-            .map(|(id, obs)| Subject {
-                id: id.to_string(),
-                doses: vec![dose.clone()],
-                obs_times: obs_times.clone(),
-                observations: obs.clone(),
-                obs_cmts: vec![1; 6],
-                covariates: mk_cov(1.0),
-                dose_covariates: dose_covs.clone(),
-                obs_covariates: obs_covs.clone(),
-                pk_only_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                cens: vec![0; 6],
-                occasions: Vec::new(),
-                dose_occasions: Vec::new(),
-            })
-            .collect();
-        Population {
-            subjects,
-            covariate_names: vec!["CR".into()],
-            dv_column: "DV".to_string(),
-        }
-    }
-
-    fn assert_tv_fit_finite(pk_model: PkModel, infusion: bool) {
-        let model = build_tv_model(pk_model);
-        let pop = build_tv_population(infusion);
-        let opts = fast_opts(EstimationMethod::Foce);
-        let result = fit(&model, &pop, &model.default_params, &opts)
-            .unwrap_or_else(|e| panic!("fit failed for {:?}: {}", pk_model, e));
-        assert!(
-            result.ofv.is_finite(),
-            "OFV should be finite for {:?}, got {}",
-            pk_model,
-            result.ofv
-        );
-        assert!(
-            pop.subjects.iter().all(|s| s.has_tv_covariates()),
-            "test population must carry TV covariates"
-        );
-    }
-
-    #[test]
-    fn tv_cov_one_cpt_oral_fits() {
-        assert_tv_fit_finite(PkModel::OneCptOral, false);
-    }
-
-    #[test]
-    fn tv_cov_two_cpt_oral_fits() {
-        assert_tv_fit_finite(PkModel::TwoCptOral, false);
-    }
-
-    #[test]
-    fn tv_cov_three_cpt_iv_bolus_fits() {
-        assert_tv_fit_finite(PkModel::ThreeCptIvBolus, false);
-    }
-
-    #[test]
-    fn tv_cov_three_cpt_infusion_fits() {
-        assert_tv_fit_finite(PkModel::ThreeCptInfusion, true);
-    }
-
-    #[test]
-    fn tv_cov_three_cpt_oral_fits() {
-        assert_tv_fit_finite(PkModel::ThreeCptOral, false);
-    }
-
-    /// All analytical PK models are now covered by the event-driven AD
-    /// path, so the downgrade warning shouldn't fire for any of them
-    /// even on TV-cov data. This locks in the new behavior so a future
-    /// refactor can't silently flip a PkModel variant to FD-fallback
-    /// without updating the AD coverage list.
-    #[test]
-    fn tv_cov_oral_with_ad_does_not_warn() {
-        let mut model = make_tv_cov_model();
-        model.pk_model = PkModel::OneCptOral;
-        model.tv_fn = Some(Box::new(|theta: &[f64], _cov: &HashMap<String, f64>| {
-            vec![theta[0], theta[1]]
-        }));
-        model.gradient_method = GradientMethod::Auto;
-        let pop = make_tv_cov_population();
-
-        let opts = fast_opts(EstimationMethod::Foce);
-        let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
-        assert!(
-            !result
-                .warnings
-                .iter()
-                .any(|w| w.contains("AD gradients disabled")),
-            "1-cpt oral + TV cov is now supported by event-driven AD; \
-             should not warn. Warnings: {:?}",
-            result.warnings
-        );
-    }
-}
-
 #[cfg(test)]
 mod extract_se_tests {
     use super::extract_standard_errors;
@@ -2342,142 +1716,95 @@ mod extract_se_tests {
 }
 
 #[cfg(test)]
-mod degeneracy_tests {
-    use super::detect_degenerate_convergence;
-    use crate::types::*;
+mod tests_cov_diagnostics {
+    use super::*;
+    use nalgebra::DMatrix;
 
-    fn make_params(theta: Vec<f64>, theta_lo: Vec<f64>, theta_hi: Vec<f64>,
-                   omega_diag: Vec<f64>, sigma_vals: Vec<f64>) -> ModelParameters {
-        let names: Vec<String> = (0..theta.len()).map(|i| format!("T{}", i + 1)).collect();
-        let eta_names: Vec<String> = (0..omega_diag.len()).map(|i| format!("ETA{}", i + 1)).collect();
-        let sigma_names: Vec<String> = (0..sigma_vals.len()).map(|i| format!("S{}", i + 1)).collect();
-        let omega = OmegaMatrix::from_diagonal(&omega_diag, eta_names);
-        let n_omega = omega_diag.len();
-        ModelParameters {
-            theta_fixed: vec![false; theta.len()],
-            theta_names: names,
-            theta_lower: theta_lo,
-            theta_upper: theta_hi,
-            theta,
-            omega,
-            omega_fixed: vec![false; n_omega],
-            sigma: SigmaVector { values: sigma_vals.clone(), names: sigma_names },
-            sigma_fixed: vec![false; sigma_vals.len()],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
+    #[test]
+    fn test_cov_diagnostics_none_input() {
+        let (ev, cn) = cov_diagnostics(None);
+        assert!(ev.is_none());
+        assert!(cn.is_none());
+    }
+
+    #[test]
+    fn test_cov_diagnostics_fewer_than_two_free_params() {
+        // 2×2 matrix where only one param is free (second has zero diagonal)
+        let mut m = DMatrix::<f64>::zeros(2, 2);
+        m[(0, 0)] = 4.0;
+        let (ev, cn) = cov_diagnostics(Some(&m));
+        assert!(ev.is_none());
+        assert!(cn.is_none());
+    }
+
+    #[test]
+    fn test_cov_diagnostics_excludes_fixed_params_zero_diagonal() {
+        // 3×3 covariance; middle param is fixed (zero row/col).
+        // Free subblock [[4, 0.5], [0.5, 2]] is non-singular, so condition
+        // number must be finite and eigenvalues length must be 2.
+        let mut m = DMatrix::<f64>::zeros(3, 3);
+        m[(0, 0)] = 4.0;
+        m[(0, 2)] = 0.5;
+        m[(2, 0)] = 0.5;
+        m[(2, 2)] = 2.0;
+        let (ev, cn) = cov_diagnostics(Some(&m));
+        let ev = ev.expect("eigenvalues must be Some");
+        let cn = cn.expect("condition_number must be Some");
+        assert_eq!(ev.len(), 2, "must have 2 eigenvalues (one per free param)");
+        assert!(cn.is_finite(), "condition_number must be finite for non-singular subblock");
+        assert!(cn > 0.0);
+        // Eigenvalues must be sorted descending
+        assert!(ev[0] >= ev[1]);
+    }
+
+    #[test]
+    fn test_cov_diagnostics_inf_condition_number_for_non_positive_eigenvalue() {
+        // Construct a 2×2 covariance matrix whose free-param correlation matrix
+        // is [[1, r], [r, 1]] with |r| > 1 — not PSD, so min eigenvalue < 0.
+        // (r = 1.5 → eigenvalues 2.5 and -0.5)
+        let mut m = DMatrix::<f64>::zeros(2, 2);
+        m[(0, 0)] = 1.0;
+        m[(0, 1)] = 1.5; // cor = 1.5/sqrt(1*1) = 1.5 > 1 → non-PSD
+        m[(1, 0)] = 1.5;
+        m[(1, 1)] = 1.0;
+        let (ev, cn) = cov_diagnostics(Some(&m));
+        let cn = cn.expect("condition_number must be Some");
+        assert!(
+            cn.is_infinite(),
+            "condition_number must be Inf when min eigenvalue ≤ 0, got {cn}"
+        );
+        let ev = ev.expect("eigenvalues must be Some");
+        assert!(ev.last().copied().unwrap_or(1.0) <= 0.0, "min eigenvalue must be ≤ 0");
+    }
+
+    #[test]
+    fn test_cov_diagnostics_inf_condition_number_for_near_zero_eigenvalue() {
+        // Simulate a floating-point near-zero negative eigenvalue (e.g. -1e-15)
+        // that a well-conditioned matrix could produce due to numerical noise.
+        // The tolerance guard (> 1e-10) must treat this as singular → INFINITY.
+        let mut m = DMatrix::<f64>::zeros(2, 2);
+        m[(0, 0)] = 1.0;
+        m[(0, 1)] = 1.0 - 1e-15; // cor ≈ 1 → min eigenvalue ≈ 0 (or tiny negative)
+        m[(1, 0)] = 1.0 - 1e-15;
+        m[(1, 1)] = 1.0;
+        let (_, cn) = cov_diagnostics(Some(&m));
+        let cn = cn.expect("condition_number must be Some");
+        assert!(
+            cn.is_infinite(),
+            "condition_number must be Inf for near-singular matrix (min_ev ≤ 1e-10), got {cn}"
+        );
+    }
+
+    #[test]
+    fn test_cov_diagnostics_identity_covariance() {
+        // Diagonal covariance → correlation matrix is identity → all eigenvalues 1.
+        let m = DMatrix::<f64>::from_diagonal(&nalgebra::DVector::from_vec(vec![4.0, 9.0]));
+        let (ev, cn) = cov_diagnostics(Some(&m));
+        let ev = ev.expect("eigenvalues must be Some");
+        let cn = cn.expect("condition_number must be Some");
+        for &e in &ev {
+            assert!((e - 1.0).abs() < 1e-12, "eigenvalue must be 1.0, got {e}");
         }
-    }
-
-    #[test]
-    fn detects_omega_collapsed_to_zero() {
-        // Mirrors the run1.ferx-from-bad-inits pathology: ETA_V2 variance
-        // collapsed to ~zero while the others are normal.
-        let p = make_params(
-            vec![5.0],
-            vec![0.1],
-            vec![50.0],
-            vec![0.09, 0.04, 1e-6], // 3rd eta collapsed
-            vec![0.1],
-        );
-        let w = detect_degenerate_convergence(&p, None, None);
-        assert!(w.iter().any(|s| s.contains("omega variance for ETA3") && s.contains("collapsed")),
-            "expected collapsed-omega warning, got: {:?}", w);
-    }
-
-    #[test]
-    fn detects_theta_at_lower_bound() {
-        // TVCL pinned to its lower bound — typical bound-active artefact.
-        let p = make_params(
-            vec![0.1001], // 0.01% above lb=0.1, within 1% relative span
-            vec![0.1],
-            vec![10.0],
-            vec![0.09],
-            vec![0.1],
-        );
-        let w = detect_degenerate_convergence(&p, None, None);
-        assert!(w.iter().any(|s| s.contains("at its lower bound")),
-            "expected lower-bound warning, got: {:?}", w);
-    }
-
-    #[test]
-    fn detects_theta_at_upper_bound() {
-        // Theta within 1% of upper bound (span=10, so within 0.1 of upper).
-        let p = make_params(
-            vec![9.95],
-            vec![0.0],
-            vec![10.0],
-            vec![0.09],
-            vec![0.1],
-        );
-        let w = detect_degenerate_convergence(&p, None, None);
-        assert!(w.iter().any(|s| s.contains("at its upper bound")),
-            "expected upper-bound warning, got: {:?}", w);
-    }
-
-    #[test]
-    fn detects_sigma_collapsed_to_zero() {
-        let p = make_params(
-            vec![5.0],
-            vec![0.1],
-            vec![50.0],
-            vec![0.09],
-            vec![1e-5], // collapsed
-        );
-        let w = detect_degenerate_convergence(&p, None, None);
-        assert!(w.iter().any(|s| s.contains("sigma S1") && s.contains("essentially zero")),
-            "expected sigma-collapse warning, got: {:?}", w);
-    }
-
-    #[test]
-    fn detects_high_rse_on_theta() {
-        // SE = 200% of estimate → flag.
-        let p = make_params(
-            vec![5.0],
-            vec![0.1],
-            vec![50.0],
-            vec![0.09],
-            vec![0.1],
-        );
-        let se_theta = vec![10.0]; // 200% RSE
-        let w = detect_degenerate_convergence(&p, Some(&se_theta), None);
-        assert!(w.iter().any(|s| s.contains("RSE")),
-            "expected RSE warning, got: {:?}", w);
-    }
-
-    #[test]
-    fn no_warnings_for_well_identified_fit() {
-        // Healthy fit: thetas mid-range, omegas O(0.1), sigma reasonable,
-        // SEs are small relative to estimates.
-        let p = make_params(
-            vec![5.0, 70.0],
-            vec![0.1, 1.0],
-            vec![50.0, 500.0],
-            vec![0.09, 0.05],
-            vec![0.2, 1.0],
-        );
-        let se_theta = vec![0.5, 5.0]; // 10% RSE each
-        let se_omega = vec![0.01, 0.005];
-        let w = detect_degenerate_convergence(&p, Some(&se_theta), Some(&se_omega));
-        assert!(w.is_empty(),
-            "expected no warnings for healthy fit, got: {:?}", w);
-    }
-
-    #[test]
-    fn skips_fixed_parameters() {
-        // A theta FIXed at its bound shouldn't be flagged — fixed params
-        // are intentionally constrained and the user knows they're there.
-        let mut p = make_params(
-            vec![0.1001],
-            vec![0.1],
-            vec![10.0],
-            vec![1e-6],
-            vec![1e-5],
-        );
-        p.theta_fixed[0] = true;
-        p.omega_fixed[0] = true;
-        p.sigma_fixed[0] = true;
-        let w = detect_degenerate_convergence(&p, None, None);
-        assert!(w.is_empty(), "fixed params should not be flagged, got: {:?}", w);
+        assert!((cn - 1.0).abs() < 1e-12, "condition_number must be 1.0, got {cn}");
     }
 }
-

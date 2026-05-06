@@ -425,6 +425,9 @@ mod tests {
             referenced_covariates: vec!["CR".into()],
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            indiv_param_names: Vec::new(),
+            theta_transform: Vec::new(),
         }
     }
 

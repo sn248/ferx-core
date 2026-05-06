@@ -236,6 +236,28 @@ pub fn compute_predictions_with_tv_into(
     eta: &[f64],
     scratch: &mut EventPkParams,
 ) -> Vec<f64> {
+    compute_predictions_with_tv_into_with_schedule(model, subject, theta, eta, scratch, None)
+}
+
+/// Hot-path variant that also accepts a pre-built
+/// [`event_driven::EventSchedule`]. When the subject takes the TV-cov
+/// event-driven analytical or ODE path, the schedule is reused on
+/// every call — eliminating the per-call merged-event sort and the
+/// per-interval infusion-bound construction (the dominant per-call
+/// CPU cost on TV-cov datasets).
+///
+/// `schedule` is ignored on the no-TV fast path and on the analytical
+/// fallback for models that don't support event-driven propagation.
+/// Callers that don't have a schedule cached can pass `None` to fall
+/// back to building one on demand.
+pub fn compute_predictions_with_tv_into_with_schedule(
+    model: &crate::types::CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    scratch: &mut EventPkParams,
+    schedule: Option<&event_driven::EventSchedule>,
+) -> Vec<f64> {
     let has_tv = subject.has_tv_covariates();
 
     // ODE path.
@@ -256,6 +278,16 @@ pub fn compute_predictions_with_tv_into(
 
     if has_tv && event_driven::supports_event_driven(model.pk_model) {
         compute_event_pk_params_into(model, subject, theta, eta, scratch);
+        if let Some(sched) = schedule {
+            return event_driven::event_driven_predictions_with_schedule(
+                model.pk_model,
+                subject,
+                sched,
+                &scratch.dose,
+                &scratch.obs,
+                &scratch.pk_only,
+            );
+        }
         return event_driven::event_driven_predictions(
             model.pk_model,
             subject,

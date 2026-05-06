@@ -1,7 +1,10 @@
 use crate::pk;
-use crate::stats::likelihood::{individual_nll, individual_nll_iov, split_obs_by_occasion};
+use crate::stats::likelihood::{
+    individual_nll_into_with_schedule, individual_nll_iov, split_obs_by_occasion,
+};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "autodiff")]
@@ -211,16 +214,43 @@ pub fn find_ebe(
         None => mu.clone(),
     };
 
-    // Objective in psi-space: model always receives eta_true = psi - mu
+    // Per-subject scratch buffers, built once and reused across every
+    // BFGS line-search obj call and every Jacobian perturbation. The
+    // EventSchedule pre-computes the merged event timeline + per-interval
+    // infusion-bound construction (subject-static, doesn't depend on
+    // theta/eta) so the event_driven_predictions hot path doesn't have
+    // to re-sort + re-allocate on every call. The EventPkParams scratch
+    // recycles the per-event Vec<PkParams> backing storage.
+    //
+    // Both are built only when this subject takes the TV-cov event-driven
+    // analytical path — for the no-TV fast path the schedule is None and
+    // event_driven_predictions is never called.
+    let pk_scratch_cell = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
+    let schedule = if subject.has_tv_covariates()
+        && model.ode_spec.is_none()
+        && pk::event_driven::supports_event_driven(model.pk_model)
+    {
+        Some(pk::event_driven::EventSchedule::for_subject(
+            subject,
+            model.pk_model,
+        ))
+    } else {
+        None
+    };
+
+    // Objective in psi-space: model always receives eta_true = psi - mu.
     let obj = |p: &[f64]| -> f64 {
+        let mut scratch = pk_scratch_cell.borrow_mut();
         let eta_t: Vec<f64> = p.iter().zip(mu.iter()).map(|(pi, mi)| pi - mi).collect();
-        individual_nll(
+        individual_nll_into_with_schedule(
             model,
             subject,
             &params.theta,
             &eta_t,
             &params.omega,
             &params.sigma.values,
+            &mut scratch,
+            schedule.as_ref(),
         )
     };
 
@@ -463,8 +493,16 @@ pub fn find_ebe(
             j
         }
         InnerGradientMethod::Fd => {
+            let mut scratch = pk_scratch_cell.borrow_mut();
             let t0 = std::time::Instant::now();
-            let j = compute_jacobian_fd(model, subject, &params.theta, &eta_true);
+            let j = compute_jacobian_fd(
+                model,
+                subject,
+                &params.theta,
+                &eta_true,
+                &mut scratch,
+                schedule.as_ref(),
+            );
             GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
             j
         }
@@ -472,8 +510,16 @@ pub fn find_ebe(
 
     #[cfg(not(feature = "autodiff"))]
     let h_matrix = {
+        let mut scratch = pk_scratch_cell.borrow_mut();
         let t0 = std::time::Instant::now();
-        let j = compute_jacobian_fd(model, subject, &params.theta, &eta_true);
+        let j = compute_jacobian_fd(
+            model,
+            subject,
+            &params.theta,
+            &eta_true,
+            &mut scratch,
+            schedule.as_ref(),
+        );
         GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
         j
     };
@@ -950,11 +996,18 @@ fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
 
 /// Compute Jacobian H = d(predictions)/d(eta) via finite differences.
 /// H is n_obs x n_eta.
+///
+/// Reuses a caller-owned `EventPkParams` scratch and an optional
+/// pre-built `EventSchedule` so each of the `2 * n_eta` perturbed
+/// prediction calls avoids the per-event-param Vec allocation and
+/// the per-call event-merge sort.
 fn compute_jacobian_fd(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
@@ -967,10 +1020,14 @@ fn compute_jacobian_fd(
         let h_step = eps * (1.0 + eta[j].abs());
 
         eta_pert[j] = eta[j] + h_step;
-        let preds_plus = pk::compute_predictions_with_tv(model, subject, theta, &eta_pert);
+        let preds_plus = pk::compute_predictions_with_tv_into_with_schedule(
+            model, subject, theta, &eta_pert, scratch, schedule,
+        );
 
         eta_pert[j] = eta[j] - h_step;
-        let preds_minus = pk::compute_predictions_with_tv(model, subject, theta, &eta_pert);
+        let preds_minus = pk::compute_predictions_with_tv_into_with_schedule(
+            model, subject, theta, &eta_pert, scratch, schedule,
+        );
 
         for i in 0..n_obs {
             h[(i, j)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);

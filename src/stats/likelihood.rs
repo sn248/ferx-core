@@ -27,17 +27,26 @@ fn model_predictions(
     pk::compute_predictions_with_tv(model, subject, theta, eta)
 }
 
-/// Same as [`model_predictions`] but uses a caller-owned scratch buffer for
-/// per-event PK params (the dominant per-call allocation on TV-cov paths).
+/// Caller-owned-scratch variant of [`model_predictions`] that also
+/// accepts an optional pre-built
+/// [`pk::event_driven::EventSchedule`]. Used by FOCE inner-loop callers
+/// (BFGS line search, post-convergence eval) that build the schedule
+/// once per `find_ebe` call and reuse it across many `(theta, eta)`
+/// evaluations of the same subject. SAEM and other callers pass `None`
+/// — the no-TV fast path doesn't consume the schedule, and the
+/// dispatcher falls back to building one on demand on the TV path.
 #[inline]
-fn model_predictions_into(
+fn model_predictions_into_with_schedule(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
     scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> Vec<f64> {
-    pk::compute_predictions_with_tv_into(model, subject, theta, eta, scratch)
+    pk::compute_predictions_with_tv_into_with_schedule(
+        model, subject, theta, eta, scratch, schedule,
+    )
 }
 
 /// True when observation `j` of `subject` is censored AND the model requests M3.
@@ -81,6 +90,25 @@ pub fn individual_nll_into(
     sigma_values: &[f64],
     scratch: &mut pk::EventPkParams,
 ) -> f64 {
+    individual_nll_into_with_schedule(
+        model, subject, theta, eta, omega, sigma_values, scratch, None,
+    )
+}
+
+/// Hot-path variant that additionally threads through a pre-built
+/// [`pk::event_driven::EventSchedule`]. The FOCE inner-loop obj closure
+/// and Jacobian build the schedule once per `find_ebe` call and reuse
+/// it across all BFGS iterations.
+pub fn individual_nll_into_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> f64 {
     // Compute Omega inverse and log-determinant via Cholesky
     let omega_inv = match omega.matrix.clone().cholesky() {
         Some(chol) => chol.inverse(),
@@ -95,7 +123,7 @@ pub fn individual_nll_into(
     // Compute individual predictions using the caller's scratch buffer
     // for per-event PK params (only consumed on the TV-cov path; ignored
     // on the no-TV fast path).
-    let preds = model_predictions_into(model, subject, theta, eta, scratch);
+    let preds = model_predictions_into_with_schedule(model, subject, theta, eta, scratch, schedule);
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let v = residual_variance(model.error_model, f_pred, sigma_values);

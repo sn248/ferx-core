@@ -597,6 +597,16 @@ fn fit_inner(
                 .to_string(),
         );
     }
+
+    // Diagnose degenerate / suspicious converged points. Common pathology
+    // when the optimiser lands in a local minimum where one eta has
+    // collapsed to zero variance, a theta has run to its bound, or an SE
+    // is so large the parameter is effectively unidentifiable. NONMEM
+    // emits similar diagnostics under different names. Each finding is
+    // a separate `degeneracy:` warning so callers can grep for them.
+    let degeneracy_warnings =
+        detect_degenerate_convergence(&result.params, se_theta.as_ref(), se_omega.as_ref());
+    warnings.extend(degeneracy_warnings);
     let sir_result = if options.sir && !crate::cancel::is_cancelled(&options.cancel) {
         if let Some(ref cov) = result.covariance_matrix {
             if options.verbose {
@@ -1011,6 +1021,166 @@ mod tests {
         let sh = compute_eps_shrinkage(&subjects);
         assert!((sh).abs() < 1e-10, "NaN IWRES not filtered, got {}", sh);
     }
+}
+
+/// Inspect a converged set of population parameters for the kinds of
+/// pathological local minima the FOCEI inner loop can settle in when
+/// initial values are far from the truth or the model is structurally
+/// poorly identified for the data. Each finding becomes a one-line
+/// `degeneracy:` warning so callers can grep for them in batch runs.
+///
+/// Heuristics:
+///   - **Theta at bound**: a free theta sitting within 1% of its
+///     upper or lower bound (relative to the bound's distance to the
+///     other bound) — usually means the bound is binding and the
+///     parameter wants to leave the feasible region.
+///   - **Sigma collapsed**: a free sigma below 1e-3 SD — pushes the
+///     residual error model to zero, which never reflects real data
+///     and is almost always an optimiser artefact.
+///   - **Omega variance ≈ 0**: a free diagonal omega variance below
+///     1e-4 — the corresponding ETA has effectively no between-subject
+///     variability, which on real data is almost always a degenerate
+///     local minimum (the ETA collapses, model becomes 1-cpt-like,
+///     etc.).
+///   - **High RSE on theta or omega**: a free parameter whose
+///     standard error is more than 100% of its estimate — flag for
+///     non-identifiability. Only checked when the covariance step
+///     ran successfully (otherwise SE is unavailable).
+fn detect_degenerate_convergence(
+    params: &ModelParameters,
+    se_theta: Option<&Vec<f64>>,
+    se_omega: Option<&Vec<f64>>,
+) -> Vec<String> {
+    const THETA_BOUND_REL_TOL: f64 = 0.01;
+    const SIGMA_COLLAPSE: f64 = 1e-3;
+    const OMEGA_COLLAPSE: f64 = 1e-4;
+    const RSE_FLAG: f64 = 1.0; // 100%
+
+    let mut warnings = Vec::new();
+
+    // Theta at bound (free thetas only).
+    for (i, &est) in params.theta.iter().enumerate() {
+        if params.theta_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let lb = params.theta_lower[i];
+        let ub = params.theta_upper[i];
+        let span = (ub - lb).abs().max(1e-30);
+        let lo_dist = (est - lb).abs() / span;
+        let hi_dist = (ub - est).abs() / span;
+        let name = params
+            .theta_names
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("THETA{}", i + 1));
+        if lo_dist < THETA_BOUND_REL_TOL {
+            warnings.push(format!(
+                "degeneracy: theta {} = {:.4} is at its lower bound ({:.4}) — \
+                 widen the bound or check initial value",
+                name, est, lb
+            ));
+        } else if hi_dist < THETA_BOUND_REL_TOL {
+            warnings.push(format!(
+                "degeneracy: theta {} = {:.4} is at its upper bound ({:.4}) — \
+                 widen the bound or check initial value",
+                name, est, ub
+            ));
+        }
+    }
+
+    // Sigma collapsed to ~zero (free sigmas only).
+    for (i, &est) in params.sigma.values.iter().enumerate() {
+        if params.sigma_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        if est.abs() < SIGMA_COLLAPSE {
+            let name = params
+                .sigma
+                .names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("SIGMA{}", i + 1));
+            warnings.push(format!(
+                "degeneracy: sigma {} = {:.2e} is essentially zero — residual \
+                 error has collapsed; likely a poor local optimum",
+                name, est
+            ));
+        }
+    }
+
+    // Omega variance collapsed (free diagonal entries only — block-omega
+    // off-diagonals and full block fix flags are inspected separately
+    // through the diagonal entries since both rows are flagged together).
+    for i in 0..params.omega.dim() {
+        if params.omega_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let var = params.omega.matrix[(i, i)];
+        if var.abs() < OMEGA_COLLAPSE {
+            let name = params
+                .omega
+                .eta_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("ETA{}", i + 1));
+            warnings.push(format!(
+                "degeneracy: omega variance for {} = {:.2e} has collapsed \
+                 toward zero — the ETA carries no between-subject variability \
+                 at this optimum; likely a degenerate local minimum",
+                name, var
+            ));
+        }
+    }
+
+    // High RSE flags (only when covariance step ran successfully).
+    if let Some(se) = se_theta {
+        for (i, &est) in params.theta.iter().enumerate() {
+            if params.theta_fixed.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let s = se.get(i).copied().unwrap_or(0.0);
+            if est.abs() > 1e-30 && s / est.abs() > RSE_FLAG {
+                let name = params
+                    .theta_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("THETA{}", i + 1));
+                warnings.push(format!(
+                    "degeneracy: theta {} = {:.4} has RSE {:.0}% — likely \
+                     non-identifiable at this point",
+                    name,
+                    est,
+                    100.0 * s / est.abs()
+                ));
+            }
+        }
+    }
+    if let Some(se) = se_omega {
+        for i in 0..params.omega.dim() {
+            if params.omega_fixed.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let var = params.omega.matrix[(i, i)];
+            let s = se.get(i).copied().unwrap_or(0.0);
+            if var.abs() > 1e-30 && s / var.abs() > RSE_FLAG {
+                let name = params
+                    .omega
+                    .eta_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("ETA{}", i + 1));
+                warnings.push(format!(
+                    "degeneracy: omega variance for {} = {:.4e} has RSE \
+                     {:.0}% — likely non-identifiable at this point",
+                    name,
+                    var,
+                    100.0 * s / var.abs()
+                ));
+            }
+        }
+    }
+
+    warnings
 }
 
 /// Extract standard errors from covariance matrix on the packed parameter scale,
@@ -2168,5 +2338,145 @@ mod extract_se_tests {
         let template = make_template(Some(iov), vec![false]);
         let (_, _, _, se_kappa) = extract_standard_errors(&None, &template);
         assert!(se_kappa.is_none());
+    }
+}
+
+#[cfg(test)]
+mod degeneracy_tests {
+    use super::detect_degenerate_convergence;
+    use crate::types::*;
+
+    fn make_params(theta: Vec<f64>, theta_lo: Vec<f64>, theta_hi: Vec<f64>,
+                   omega_diag: Vec<f64>, sigma_vals: Vec<f64>) -> ModelParameters {
+        let names: Vec<String> = (0..theta.len()).map(|i| format!("T{}", i + 1)).collect();
+        let eta_names: Vec<String> = (0..omega_diag.len()).map(|i| format!("ETA{}", i + 1)).collect();
+        let sigma_names: Vec<String> = (0..sigma_vals.len()).map(|i| format!("S{}", i + 1)).collect();
+        let omega = OmegaMatrix::from_diagonal(&omega_diag, eta_names);
+        let n_omega = omega_diag.len();
+        ModelParameters {
+            theta_fixed: vec![false; theta.len()],
+            theta_names: names,
+            theta_lower: theta_lo,
+            theta_upper: theta_hi,
+            theta,
+            omega,
+            omega_fixed: vec![false; n_omega],
+            sigma: SigmaVector { values: sigma_vals.clone(), names: sigma_names },
+            sigma_fixed: vec![false; sigma_vals.len()],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detects_omega_collapsed_to_zero() {
+        // Mirrors the run1.ferx-from-bad-inits pathology: ETA_V2 variance
+        // collapsed to ~zero while the others are normal.
+        let p = make_params(
+            vec![5.0],
+            vec![0.1],
+            vec![50.0],
+            vec![0.09, 0.04, 1e-6], // 3rd eta collapsed
+            vec![0.1],
+        );
+        let w = detect_degenerate_convergence(&p, None, None);
+        assert!(w.iter().any(|s| s.contains("omega variance for ETA3") && s.contains("collapsed")),
+            "expected collapsed-omega warning, got: {:?}", w);
+    }
+
+    #[test]
+    fn detects_theta_at_lower_bound() {
+        // TVCL pinned to its lower bound — typical bound-active artefact.
+        let p = make_params(
+            vec![0.1001], // 0.01% above lb=0.1, within 1% relative span
+            vec![0.1],
+            vec![10.0],
+            vec![0.09],
+            vec![0.1],
+        );
+        let w = detect_degenerate_convergence(&p, None, None);
+        assert!(w.iter().any(|s| s.contains("at its lower bound")),
+            "expected lower-bound warning, got: {:?}", w);
+    }
+
+    #[test]
+    fn detects_theta_at_upper_bound() {
+        // Theta within 1% of upper bound (span=10, so within 0.1 of upper).
+        let p = make_params(
+            vec![9.95],
+            vec![0.0],
+            vec![10.0],
+            vec![0.09],
+            vec![0.1],
+        );
+        let w = detect_degenerate_convergence(&p, None, None);
+        assert!(w.iter().any(|s| s.contains("at its upper bound")),
+            "expected upper-bound warning, got: {:?}", w);
+    }
+
+    #[test]
+    fn detects_sigma_collapsed_to_zero() {
+        let p = make_params(
+            vec![5.0],
+            vec![0.1],
+            vec![50.0],
+            vec![0.09],
+            vec![1e-5], // collapsed
+        );
+        let w = detect_degenerate_convergence(&p, None, None);
+        assert!(w.iter().any(|s| s.contains("sigma S1") && s.contains("essentially zero")),
+            "expected sigma-collapse warning, got: {:?}", w);
+    }
+
+    #[test]
+    fn detects_high_rse_on_theta() {
+        // SE = 200% of estimate → flag.
+        let p = make_params(
+            vec![5.0],
+            vec![0.1],
+            vec![50.0],
+            vec![0.09],
+            vec![0.1],
+        );
+        let se_theta = vec![10.0]; // 200% RSE
+        let w = detect_degenerate_convergence(&p, Some(&se_theta), None);
+        assert!(w.iter().any(|s| s.contains("RSE")),
+            "expected RSE warning, got: {:?}", w);
+    }
+
+    #[test]
+    fn no_warnings_for_well_identified_fit() {
+        // Healthy fit: thetas mid-range, omegas O(0.1), sigma reasonable,
+        // SEs are small relative to estimates.
+        let p = make_params(
+            vec![5.0, 70.0],
+            vec![0.1, 1.0],
+            vec![50.0, 500.0],
+            vec![0.09, 0.05],
+            vec![0.2, 1.0],
+        );
+        let se_theta = vec![0.5, 5.0]; // 10% RSE each
+        let se_omega = vec![0.01, 0.005];
+        let w = detect_degenerate_convergence(&p, Some(&se_theta), Some(&se_omega));
+        assert!(w.is_empty(),
+            "expected no warnings for healthy fit, got: {:?}", w);
+    }
+
+    #[test]
+    fn skips_fixed_parameters() {
+        // A theta FIXed at its bound shouldn't be flagged — fixed params
+        // are intentionally constrained and the user knows they're there.
+        let mut p = make_params(
+            vec![0.1001],
+            vec![0.1],
+            vec![10.0],
+            vec![1e-6],
+            vec![1e-5],
+        );
+        p.theta_fixed[0] = true;
+        p.omega_fixed[0] = true;
+        p.sigma_fixed[0] = true;
+        let w = detect_degenerate_convergence(&p, None, None);
+        assert!(w.is_empty(), "fixed params should not be flagged, got: {:?}", w);
     }
 }

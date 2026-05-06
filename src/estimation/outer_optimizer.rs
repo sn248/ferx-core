@@ -105,6 +105,233 @@ struct NloptState {
     prev_x: Vec<f64>,
 }
 
+/// Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a
+/// gradient-free global pre-search before the local optimizer. Returns
+/// the best point found in the same scaled coordinate system as the
+/// caller's `x0` / `lower_s` / `upper_s`. Falls back with `Err(...)`
+/// when the NLopt build doesn't ship CRS2-LM (a clear-message failure
+/// is more useful than the local optimizer silently using the original
+/// `x0`).
+///
+/// CRS2-LM is a population-based algorithm: it maintains a pool of
+/// `population_size` candidate points (NLopt's default is `10*(n+1)`),
+/// repeatedly drawing new candidates inside the simplex of the best-so-far
+/// points and mutating one at a time. It needs explicit bounds (which
+/// the FOCE outer-loop space provides) and is generally insensitive to
+/// the initial point — useful precisely when our initial point lies in
+/// a bad basin.
+fn run_global_presearch(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+    scale: &[f64],
+    lower_s: &[f64],
+    upper_s: &[f64],
+    x0: &[f64],
+) -> Result<Vec<f64>, String> {
+    let n = x0.len();
+    let n_subj = population.subjects.len();
+    let n_eta = model.n_eta;
+
+    // Probe CRS2-LM availability — some NLopt builds (notably the
+    // minimal one in the homebrew nlopt-rs crate) ship without it.
+    // Catch the panic so we surface a useful warning instead of
+    // crashing the fit.
+    let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fn dummy(_x: &[f64], _g: Option<&mut [f64]>, _d: &mut ()) -> f64 {
+            0.0
+        }
+        let _opt =
+            nlopt::Nlopt::new(nlopt::Algorithm::Crs2Lm, n, dummy, nlopt::Target::Minimize, ());
+    }));
+    if probe.is_err() {
+        return Err(
+            "NLopt CRS2-LM not available in this build — install a full \
+             NLopt (brew install nlopt / apt install libnlopt-dev) and rebuild"
+                .into(),
+        );
+    }
+
+    let n_evals = Arc::new(AtomicUsize::new(0));
+    let n_evals_cl = Arc::clone(&n_evals);
+    let verbose = options.verbose;
+
+    // Helper: evaluate the FOCE OFV at a single point in scaled space,
+    // independent of any NLopt state. Used to compute the user's initial
+    // OFV up-front (for the keep-best-of-(user, CRS2-LM) compare below).
+    let eval_at_scaled = |xs: &[f64]| -> f64 {
+        let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
+        let params = unpack_params(&x, init_params);
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+        let cached_zero = vec![DVector::zeros(n_eta); n_subj];
+        let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
+            model,
+            population,
+            &params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&cached_zero),
+            Some(&mu_k),
+            options.min_obs_for_convergence_check as usize,
+        );
+        let nll = pop_nll(model, population, &params, &ehs, &hms, &kappas, options.interaction);
+        let raw = 2.0 * nll;
+        let frac = ebe_stats.n_unconverged as f64 / (n_subj as f64).max(1.0);
+        let guarded = raw.is_finite()
+            && frac > options.max_unconverged_frac
+            && options.max_unconverged_frac >= 0.0;
+        if !raw.is_finite() || guarded { 1e20 } else { raw }
+    };
+
+    let initial_ofv = eval_at_scaled(x0);
+    if options.verbose {
+        eprintln!(
+            "Initial OFV at user-supplied parameters: {:.6} (used as fallback if global \
+             pre-search doesn't beat it)",
+            initial_ofv,
+        );
+    }
+
+    let pre_state = NloptState {
+        cached_etas: vec![DVector::zeros(n_eta); n_subj],
+        cached_h_mats: Vec::new(),
+        best_ofv: f64::INFINITY,
+        n_evals: 0,
+        prev_x: x0.to_vec(),
+    };
+
+    let pre_objective = |xs: &[f64], _grad: Option<&mut [f64]>, state: &mut NloptState| -> f64 {
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return 1e20;
+        }
+        let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
+        let params = unpack_params(&x, init_params);
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+
+        let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
+            model,
+            population,
+            &params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&state.cached_etas),
+            Some(&mu_k),
+            options.min_obs_for_convergence_check as usize,
+        );
+
+        let nll = pop_nll(model, population, &params, &ehs, &hms, &kappas, options.interaction);
+        let raw_ofv = 2.0 * nll;
+
+        let unconverged_frac = ebe_stats.n_unconverged as f64 / (n_subj as f64).max(1.0);
+        let ebe_guard = raw_ofv.is_finite()
+            && unconverged_frac > options.max_unconverged_frac
+            && options.max_unconverged_frac >= 0.0;
+        let ofv = if ebe_guard {
+            1e20
+        } else if raw_ofv.is_finite() {
+            raw_ofv
+        } else {
+            1e20
+        };
+
+        // CRS2-LM samples globally, so warm-starting EBEs with the
+        // best-so-far cached etas is mostly noise-amplifying — keep
+        // them at zeros for the next eval. The local optimizer that
+        // follows starts from a sensible point and warm-starts cleanly.
+        state.cached_etas = vec![DVector::zeros(n_eta); n_subj];
+        state.cached_h_mats = hms;
+        state.n_evals += 1;
+        n_evals_cl.fetch_add(1, Ordering::Relaxed);
+
+        if ofv < state.best_ofv {
+            state.best_ofv = ofv;
+            if verbose {
+                eprintln!("Global pre-search eval {:>4}: OFV = {:.6}", state.n_evals, ofv);
+            }
+        }
+
+        ofv
+    };
+
+    let mut opt = nlopt::Nlopt::new(
+        nlopt::Algorithm::Crs2Lm,
+        n,
+        pre_objective,
+        nlopt::Target::Minimize,
+        pre_state,
+    );
+    opt.set_lower_bounds(lower_s)
+        .map_err(|e| format!("CRS2-LM lower bounds: {:?}", e))?;
+    opt.set_upper_bounds(upper_s)
+        .map_err(|e| format!("CRS2-LM upper bounds: {:?}", e))?;
+
+    // Default budget: 30 * (n + 1) — modest budget that's enough to
+    // probe a few candidate basins without dominating the wall time of
+    // the subsequent local refine. Users with hard-to-find optima can
+    // bump `global_maxeval` to e.g. 200*(n+1) for a thorough sweep.
+    let max_eval = if options.global_maxeval > 0 {
+        options.global_maxeval as u32
+    } else {
+        30 * (n as u32 + 1)
+    };
+    opt.set_maxeval(max_eval)
+        .map_err(|e| format!("CRS2-LM maxeval: {:?}", e))?;
+
+    if options.verbose {
+        eprintln!(
+            "Starting NLopt CRS2-LM global pre-search ({} parameters, max {} evals)...",
+            n, max_eval
+        );
+    }
+
+    let mut x_pre = x0.to_vec();
+    let pre_ofv = match opt.optimize(&mut x_pre) {
+        Ok((status, ofv)) => {
+            if options.verbose {
+                eprintln!(
+                    "Global pre-search finished: {:?}, best OFV = {:.6} after {} evals",
+                    status,
+                    ofv,
+                    n_evals.load(Ordering::Relaxed),
+                );
+            }
+            ofv
+        }
+        Err((fail, ofv)) => {
+            if options.verbose {
+                eprintln!(
+                    "Global pre-search stopped: {:?}, best OFV = {:.6} after {} evals",
+                    fail,
+                    ofv,
+                    n_evals.load(Ordering::Relaxed),
+                );
+            }
+            ofv
+        }
+    };
+
+    // Keep whichever is better between the user-supplied initials and
+    // CRS2-LM's best point. CRS2-LM ignores the starting point and
+    // samples freely in [lower, upper], so for already-good inits its
+    // best point is often *worse* than where we started — handing that
+    // to the local optimizer would actively regress the fit. The
+    // initial-OFV evaluation above is one extra inner-loop pass, cheap
+    // insurance against that case.
+    if initial_ofv.is_finite() && initial_ofv <= pre_ofv {
+        if options.verbose {
+            eprintln!(
+                "Global pre-search did not beat user-supplied initials \
+                 ({:.4} vs {:.4}); keeping user initials for local optimisation.",
+                pre_ofv, initial_ofv,
+            );
+        }
+        Ok(x0.to_vec())
+    } else {
+        Ok(x_pre)
+    }
+}
+
 fn optimize_nlopt(
     model: &CompiledModel,
     population: &Population,
@@ -131,6 +358,31 @@ fn optimize_nlopt(
     // Scale x0 into optimizer space: xs[i] = x[i] / scale[i].
     for i in 0..n {
         x0[i] /= scale[i];
+    }
+
+    // Optional gradient-free global pre-search (NLopt CRS2-LM). Samples
+    // within the parameter bounds and lets the local optimizer pick up
+    // from the best point found — useful for poorly-identified models
+    // where the local optimizer can land in a degenerate basin from a
+    // far-from-truth start. The pre-search runs the same FOCE objective
+    // as the main optimizer (no shortcuts), so each global eval is a
+    // full inner-loop pass; budget is `global_maxeval` (default
+    // `200 * (n_params + 1)` when 0).
+    if options.global_search {
+        let pre_x = run_global_presearch(
+            model,
+            population,
+            init_params,
+            options,
+            &scale,
+            &lower_s,
+            &upper_s,
+            &x0,
+        );
+        match pre_x {
+            Ok(best_x) => x0 = best_x,
+            Err(e) => warnings.push(format!("global_search disabled: {}", e)),
+        }
     }
 
     let state = NloptState {

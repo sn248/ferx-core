@@ -762,19 +762,6 @@ pub struct FitOptions {
     /// excluded from the convergence fraction but still run normally.
     /// Default: `2`.
     pub min_obs_for_convergence_check: u32,
-    /// Number of independent fits to run from different starting points,
-    /// returning the one with the lowest OFV. The first run uses the
-    /// user-provided initial values verbatim; runs 2..N use log-uniform
-    /// random perturbations of those initial values, sampled within the
-    /// declared bounds. Useful for poorly-identified models where the
-    /// optimiser can land in different local minima depending on the
-    /// starting point. Default: `1` (no multi-start).
-    pub multi_start: usize,
-    /// RNG seed for the perturbations applied to the multi-start initial
-    /// values. `None` (default) uses entropy from the OS — different
-    /// runs explore different regions of parameter space. Set to a
-    /// fixed value for reproducible runs.
-    pub multi_start_seed: Option<u64>,
 }
 
 impl Default for FitOptions {
@@ -824,8 +811,6 @@ impl Default for FitOptions {
             scale_params: true,
             max_unconverged_frac: 0.1,
             min_obs_for_convergence_check: 2,
-            multi_start: 1,
-            multi_start_seed: None,
         }
     }
 }
@@ -987,8 +972,6 @@ pub fn framework_keys() -> &'static [&'static str] {
         "scale_params",
         "max_unconverged_frac",
         "min_obs_for_convergence_check",
-        "multi_start",
-        "multi_start_seed",
     ]
 }
 

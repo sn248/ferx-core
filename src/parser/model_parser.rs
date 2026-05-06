@@ -907,14 +907,6 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.min_obs_for_convergence_check =
                 parse_usize("min_obs_for_convergence_check")? as u32
         }
-        "multi_start" => opts.multi_start = parse_usize("multi_start")?.max(1),
-        "multi_start_seed" => {
-            opts.multi_start_seed = if value.is_empty() {
-                None
-            } else {
-                Some(parse_usize("multi_start_seed")? as u64)
-            };
-        }
         _ => return Ok(false),
     }
     opts.user_set_keys.push(key.to_string());

@@ -249,18 +249,35 @@ fn detect_mu_refs(
     result
 }
 
-/// Detect `inv_logit(THETA_i + ETA_j)` pattern.
-/// Returns `Some((eta_idx, theta_idx))` or `None`.
-fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize)> {
+/// Detect logit-normal parameterisation patterns.
+/// Returns `Some((eta_idx, theta_idx, prob_scale))` where `prob_scale` is
+/// `true` for `inv_logit(logit(THETA) + ETA)` and `false` for `inv_logit(THETA + ETA)`.
+///
+/// Recognised forms:
+///   - `inv_logit(THETA + ETA)`          — THETA on the logit scale
+///   - `inv_logit(logit(THETA) + ETA)`   — THETA on the probability scale (0,1)
+fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
     if let Expression::UnaryFn(name, inner) = expr {
         if name == "inv_logit" || name == "expit" {
             if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
-                let try_theta_eta = |a: &Expression, b: &Expression| -> Option<(usize, usize)> {
-                    if let (Expression::Theta(ti), Expression::Eta(ei)) = (a, b) {
-                        return Some((*ei, *ti));
-                    }
-                    None
-                };
+                let try_theta_eta =
+                    |a: &Expression, b: &Expression| -> Option<(usize, usize, bool)> {
+                        // Form 1: THETA + ETA  (THETA on logit scale)
+                        if let (Expression::Theta(ti), Expression::Eta(ei)) = (a, b) {
+                            return Some((*ei, *ti, false));
+                        }
+                        // Form 2: logit(THETA) + ETA  (THETA on probability scale)
+                        if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) =
+                            (a, b)
+                        {
+                            if fn_name == "logit" {
+                                if let Expression::Theta(ti) = inner_arg.as_ref() {
+                                    return Some((*ei, *ti, true));
+                                }
+                            }
+                        }
+                        None
+                    };
                 return try_theta_eta(lhs, rhs).or_else(|| try_theta_eta(rhs, lhs));
             }
         }
@@ -286,13 +303,18 @@ fn classify_indiv_params(
 
     for s in stmts {
         if let Statement::Assign(param_name, expr) = s {
-            // Logit pattern: inv_logit(THETA + ETA)
-            if let Some((eta_idx, theta_idx)) = detect_logit_pattern(expr) {
+            // Logit patterns: inv_logit(THETA + ETA) or inv_logit(logit(THETA) + ETA)
+            if let Some((eta_idx, theta_idx, prob_scale)) = detect_logit_pattern(expr) {
                 if eta_idx < eta_names.len() && theta_idx < n_theta {
-                    theta_transform[theta_idx] = ThetaTransform::Logit;
+                    let (tt, pt) = if prob_scale {
+                        (ThetaTransform::LogitProbability, EtaParamType::LogitProbability)
+                    } else {
+                        (ThetaTransform::Logit, EtaParamType::Logit)
+                    };
+                    theta_transform[theta_idx] = tt;
                     eta_infos.push(EtaParamInfo {
                         eta_name: eta_names[eta_idx].clone(),
-                        param_type: EtaParamType::Logit,
+                        param_type: pt,
                         linked_theta: Some(theta_names[theta_idx].clone()),
                         individual_param_name: param_name.clone(),
                     });
@@ -4761,13 +4783,67 @@ if (1 > 0) {
     }
 
     #[test]
-    fn test_classify_logit() {
+    fn test_classify_logit_scale() {
+        // inv_logit(THETA_F + ETA_F) — THETA_F on logit scale
         use crate::types::{EtaParamType, ThetaTransform};
         let model = minimal_logit_model();
         let f_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_F").unwrap();
         assert_eq!(f_info.param_type, EtaParamType::Logit);
         assert_eq!(f_info.linked_theta, Some("THETA_F".to_string()));
         assert_eq!(model.theta_transform[0], ThetaTransform::Logit);
+    }
+
+    #[test]
+    fn test_classify_logit_probability_scale() {
+        // inv_logit(logit(THETA_F) + ETA_F) — THETA_F on probability scale (0,1)
+        use crate::types::{EtaParamType, ThetaTransform};
+        let model_str = r"
+[parameters]
+  theta THETA_F(0.70, 0.001, 0.999)
+  sigma EPS ~ 0.01
+  omega ETA_F  ~ 0.1
+
+[individual_parameters]
+  F = inv_logit(logit(THETA_F) + ETA_F)
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=1, v=1)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = super::parse_full_model(model_str).unwrap().model;
+        let f_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_F").unwrap();
+        assert_eq!(f_info.param_type, EtaParamType::LogitProbability);
+        assert_eq!(f_info.linked_theta, Some("THETA_F".to_string()));
+        assert_eq!(model.theta_transform[0], ThetaTransform::LogitProbability);
+    }
+
+    #[test]
+    fn test_inv_logit_logit_theta_evaluates() {
+        // inv_logit(logit(0.70) + 0) should equal 0.70
+        let model_str = r"
+[parameters]
+  theta THETA_F(0.70, 0.001, 0.999)
+  sigma EPS ~ 0.01
+  omega ETA_F  ~ 0.1
+
+[individual_parameters]
+  F = inv_logit(logit(THETA_F) + ETA_F)
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=1, v=1)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = super::parse_full_model(model_str).unwrap().model;
+        let tv = model.tv_fn.as_ref().unwrap()(&[0.70], &Default::default());
+        assert!(
+            (tv[0] - 0.70).abs() < 1e-10,
+            "inv_logit(logit(0.70)) should be 0.70, got {}",
+            tv[0]
+        );
     }
 
     #[test]

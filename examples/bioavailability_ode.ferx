@@ -25,7 +25,7 @@
   theta TVCL(5.0,   0.1,  50.0)    # typical clearance (L/h)
   theta TVV(50.0,   5.0, 500.0)    # typical volume (L)
   theta TVKA(1.5,  0.05,  20.0)    # typical absorption rate constant (/h)
-  theta THETA_F(0.85, -5.0, 5.0)   # logit(F_typical) — logit(0.70) ≈ 0.847
+  theta THETA_F(0.70, 0.001, 0.999) # typical bioavailability, directly on (0,1) scale
 
   omega ETA_CL ~ 0.09              # BSV on CL (log-normal)
   omega ETA_F  ~ 0.10              # BSV on F  (logit-normal)
@@ -36,7 +36,7 @@
   CL = TVCL * exp(ETA_CL)
   V  = TVV
   KA = TVKA
-  F  = inv_logit(THETA_F + ETA_F)  # individual bioavailability ∈ (0, 1)
+  F  = inv_logit(logit(THETA_F) + ETA_F)  # individual bioavailability ∈ (0, 1)
 
 [structural_model]
   ode(obs_cmt=central, states=[depot, central])

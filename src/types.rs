@@ -344,8 +344,12 @@ pub enum ThetaTransform {
     Identity,
     /// Theta is on the log scale; back-transform = exp(theta).
     Log,
-    /// Theta is on the logit scale; back-transform = inv_logit(theta).
+    /// Theta is on the logit scale: `inv_logit(THETA + ETA)`. User sets THETA
+    /// on the logit scale (e.g. logit(0.7) ≈ 0.847).
     Logit,
+    /// Theta is on the probability scale: `inv_logit(logit(THETA) + ETA)`.
+    /// User sets THETA directly in (0,1) (e.g. 0.70 for 70% bioavailability).
+    LogitProbability,
 }
 
 /// Distribution / parameterisation of an ETA random effect.
@@ -355,8 +359,10 @@ pub enum EtaParamType {
     LogNormal,
     /// `TVCL + ETA` — normal (additive).
     Additive,
-    /// `inv_logit(THETA + ETA)` — logit-normal.
+    /// `inv_logit(THETA + ETA)` — logit-normal; THETA on the logit scale.
     Logit,
+    /// `inv_logit(logit(THETA) + ETA)` — logit-normal; THETA on the (0,1) scale.
+    LogitProbability,
     /// Pattern not automatically recognised.
     Custom,
 }

@@ -192,22 +192,25 @@ pub fn ode_predictions_event_driven(
     });
 
     let mut cur_t = timeline[0].0;
-    // Initial pk params for the first (zero-length) segment.
-    let mut current_pk: PkParams = match timeline[0].1 {
-        Kind::Dose => pk_at_dose[timeline[0].2],
-        Kind::Obs => pk_at_obs[timeline[0].2],
-        Kind::PkOnly => pk_at_pk_only[timeline[0].2],
-    };
 
     for &(t_event, kind, idx) in &timeline {
+        // PK params for the segment [cur_t, t_event] are evaluated AT
+        // t_event (NONMEM end-of-interval / current-record convention —
+        // `$PK runs at every record, then ADVAN propagates to it`).
+        let pk_now: PkParams = match kind {
+            Kind::Dose => pk_at_dose[idx],
+            Kind::Obs => pk_at_obs[idx],
+            Kind::PkOnly => pk_at_pk_only[idx],
+        };
+
         if t_event > cur_t {
-            // Integrate segment [cur_t, t_event] with current_pk.
+            // Integrate segment [cur_t, t_event] with this event's pk.
             let saveat = vec![t_event];
             let sol = solve_ode(
                 &*ode.rhs,
                 &u,
                 (cur_t, t_event),
-                &current_pk.values,
+                &pk_now.values,
                 &saveat,
                 &opts,
             );
@@ -229,18 +232,15 @@ pub fn ode_predictions_event_driven(
                 if cmt_idx < n {
                     u[cmt_idx] += d.amt;
                 }
-                current_pk = pk_at_dose[idx];
             }
             Kind::Obs => {
                 let v = u[ode.obs_cmt_idx];
                 predictions[idx] = if v.is_nan() || v < 0.0 { 0.0 } else { v };
-                current_pk = pk_at_obs[idx];
             }
             Kind::PkOnly => {
-                // EVID=2: refresh current_pk so the next segment uses
-                // the values $PK would have computed at this row in
-                // NONMEM. Compartment state is unchanged.
-                current_pk = pk_at_pk_only[idx];
+                // EVID=2: $PK ran at this record but compartment state is
+                // unchanged. The new pk is consumed by the next segment's
+                // integration via the loop-top `pk_now` lookup.
             }
         }
     }
@@ -324,8 +324,11 @@ mod tests {
     #[test]
     fn ode_event_driven_picks_up_changing_cl() {
         // Same shape as the analytical TV test: CL doubles between two doses.
-        // The decay over [t_dose1, t_dose2] uses pk_dose1; after dose2 uses
-        // pk_dose2. Compares against analytical exp(-ke·dt) closed form.
+        // End-of-interval / NONMEM convention — each segment uses the PK
+        // params at the record being arrived at:
+        //   [0, t_obs1=5]: uses pk at obs1 = pk_low → ke = 0.05
+        //   [5, t_dose2=10]: uses pk at dose2 = pk_high → ke = 0.10
+        //   [10, t_obs2=12]: uses pk at obs2 = pk_high → ke = 0.10
         let doses = vec![
             DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
             DoseEvent::new(10.0, 1000.0, 1, 0.0, false, 0.0),
@@ -340,15 +343,15 @@ mod tests {
 
         let preds = ode_predictions_event_driven(&ode, &subj, &pk_dose, &pk_obs, &[]);
 
-        // Expected at t=5 (low-CL interval, no V scaling needed at obs in
-        // this ODE since it returns A directly): A = 1000 * exp(-0.05*5)
+        // [0, 5] uses pk_low (pk at obs1): A(5) = 1000 * exp(-0.05*5) ≈ 778.80
         let a5 = 1000.0 * (-0.05f64 * 5.0).exp();
         assert_relative_eq!(preds[0], a5, epsilon = 1e-3, max_relative = 1e-4);
 
-        // At t=10⁻: A = 1000 * exp(-0.5) ≈ 606.53
-        // After dose2: A = 1606.53. Then 2h with ke=0.10 (pk_dose2=high):
-        //   A(12) = 1606.53 * exp(-0.20) ≈ 1316.18
-        let a10_minus = 1000.0 * (-0.5f64).exp();
+        // [5, 10] uses pk_high (pk at dose2): ke=0.10 for 5h.
+        //   A(10⁻) = A(5) * exp(-0.10*5) = 778.80 * 0.6065 ≈ 472.37
+        // After dose2: A(10⁺) = 472.37 + 1000 = 1472.37.
+        // [10, 12] uses pk_high (pk at obs2): A(12) = 1472.37 * exp(-0.20) ≈ 1205.49
+        let a10_minus = a5 * (-0.10f64 * 5.0).exp();
         let a10_plus = a10_minus + 1000.0;
         let a12 = a10_plus * (-0.20f64).exp();
         assert_relative_eq!(preds[1], a12, epsilon = 1e-2, max_relative = 1e-4);

@@ -242,12 +242,15 @@ pub fn event_driven_predictions_with_schedule(
     // State vector starts at zero (no residual drug before the first event).
     let mut state = vec![0.0_f64; n_states];
     let mut cur_t = schedule.events[0].time;
-    // PK params governing the *current* interval. Initialized from the first
-    // event so the first (zero-length) propagation is well-defined.
-    let mut current_pk: PkParams =
-        pk_for(schedule.events[0], pk_at_dose, pk_at_obs, pk_at_pk_only);
 
     for (i, ev) in schedule.events.iter().enumerate() {
+        // PK params for the propagation [events[i-1], events[i]] are the
+        // params evaluated AT events[i] — matches NONMEM's `$PK runs at
+        // every record then ADVAN propagates to that record` semantic
+        // (end-of-interval / current-record convention). For the first
+        // event the propagation has dt = 0 and `pk_now` is unused.
+        let pk_now = pk_for(*ev, pk_at_dose, pk_at_obs, pk_at_pk_only);
+
         if ev.time > cur_t {
             // The interval (events[i-1], events[i]) — its bounds were
             // pre-computed at schedule.bounds_per_interval[i-1].
@@ -255,7 +258,7 @@ pub fn event_driven_predictions_with_schedule(
             propagate_with_bounds(
                 &mut state,
                 bounds,
-                &current_pk,
+                &pk_now,
                 pk_model,
                 &subject.doses,
             );
@@ -280,22 +283,17 @@ pub fn event_driven_predictions_with_schedule(
                 }
                 // Infusion: handled inside `propagate` via the active-input
                 // lookup — no instantaneous state jump here.
-                current_pk = pk_at_dose[ev.orig_idx];
             }
             EventKind::Obs => {
-                let pk = &pk_at_obs[ev.orig_idx];
-                let v = pk.v();
+                let v = pk_now.v();
                 // Read from the central-compartment slot — depot for slot 0
                 // on oral models, central for slot 1.
                 let conc = if v > 0.0 { state[central_slot] / v } else { 0.0 };
                 preds[ev.orig_idx] = conc.max(0.0);
-                current_pk = *pk;
             }
             EventKind::PkOnly => {
-                // EVID=2: refresh current_pk so the next interval uses
-                // the values $PK would have computed at this row in
-                // NONMEM. State is unchanged.
-                current_pk = pk_at_pk_only[ev.orig_idx];
+                // EVID=2: $PK ran at this row but state is unchanged;
+                // pk_now is consumed by the next interval's propagation.
             }
         }
     }
@@ -1048,8 +1046,14 @@ mod tests {
     #[test]
     fn one_cpt_tv_cl_changes_decay_rate() {
         // Single dose at t=0, two observations: CL doubles between the two
-        // observations. The state at obs2 must equal:
-        //   exp(-ke1 * (t1-0)) * dose then exp(-ke2 * (t2-t1)) * (above)
+        // observations.
+        //
+        // NONMEM convention (end-of-interval / current-record): each
+        // propagation [t_{i-1}, t_i] uses the PK params evaluated AT t_i
+        // (`$PK runs at every record, ADVAN propagates to that record`).
+        // So:
+        //   [0, t1=1]: uses pk at obs1 = pk_low  → ke = 0.05
+        //   [t1, t2]:  uses pk at obs2 = pk_high → ke = 0.10
         let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
         let obs_times = vec![1.0, 2.0];
         let subj = make_subject(doses, obs_times.clone());
@@ -1060,30 +1064,30 @@ mod tests {
 
         let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
 
-        // After dose: A1 = 1000.
-        // Propagate to t=1 with ke=0.05 (current_pk = pk_low from dose):
+        // [0, 1] uses pk_low (= pk at obs1):
         //   A1(1) = 1000 * exp(-0.05) ≈ 951.23
-        //   C(obs1) = A1(1) / 100 = 9.5123
+        //   C(1)  = 9.5123
         let a1_at_t1 = 1000.0 * (-0.05f64).exp();
         let c1_expected = a1_at_t1 / 100.0;
         assert_relative_eq!(preds[0], c1_expected, epsilon = 1e-12);
 
-        // After obs1 (which uses pk_low's V to read out, then sets
-        // current_pk = pk_low). But on the obs event, current_pk *updates*
-        // to pk_obs[0] = pk_low, so propagation 1→2 still uses pk_low.
-        // (Verified: matches NONMEM where covariates only change with the
-        // event row's values.)
-        // For this test the pk at obs1 is still pk_low — so pk_low governs
-        // (1, 2) and pk_high only changes the V used at obs2.
-        let a1_at_t2 = a1_at_t1 * (-0.05f64).exp();
+        // [1, 2] uses pk_high (= pk at obs2). End-of-interval — the new CL
+        // applies to the interval BEFORE its record:
+        //   A1(2) = A1(1) * exp(-0.10) ≈ 951.23 * 0.9048 ≈ 860.71
+        //   C(2)  = 8.6071
+        let a1_at_t2 = a1_at_t1 * (-0.10f64).exp();
         let c2_expected = a1_at_t2 / 100.0; // V from pk_high == 100 anyway.
         assert_relative_eq!(preds[1], c2_expected, epsilon = 1e-12);
     }
 
     #[test]
     fn one_cpt_tv_cl_between_doses_changes_decay() {
-        // Two doses, with CL doubling between them. Decay during
-        // [t_dose1, t_dose2] uses pk_dose1; after dose2, decay uses pk_dose2.
+        // Two doses, with CL doubling between them.
+        //
+        // End-of-interval (NONMEM) propagation:
+        //   [0, t_obs1=5]:  uses pk at obs1  = pk_low
+        //   [5, t_dose2=10]: uses pk at dose2 = pk_high
+        //   [10, t_obs2=12]: uses pk at obs2  = pk_high
         let doses = vec![
             DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
             DoseEvent::new(10.0, 1000.0, 1, 0.0, false, 0.0),
@@ -1097,21 +1101,20 @@ mod tests {
 
         let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
 
-        // At t=5 (during low-CL interval after dose1):
-        //   A1 = 1000 * exp(-0.05*5) = 778.80
-        //   C = 7.7880
-        let c5_expected = 1000.0 * (-0.05f64 * 5.0).exp() / 100.0;
+        // [0, 5] uses pk_low (pk at obs1):
+        //   A1(5) = 1000 * exp(-0.05*5) = 778.80, C = 7.788
+        let a1_at_5 = 1000.0 * (-0.05f64 * 5.0).exp();
+        let c5_expected = a1_at_5 / 100.0;
         assert_relative_eq!(preds[0], c5_expected, epsilon = 1e-12);
 
-        // At t=10: dose2 is added. Just before dose2:
-        //   A1(10⁻) = 1000 * exp(-0.05*10) = 606.53
-        // After dose2: A1(10⁺) = 606.53 + 1000 = 1606.53
-        // From t=10 to t=12, current_pk is pk_dose2 = pk_high, so ke=0.10:
-        //   A1(12) = 1606.53 * exp(-0.10*2) = 1316.18
-        //   C(12) = 13.1618
-        let a1_at_10_minus = 1000.0 * (-0.5f64).exp();
+        // [5, 10] uses pk_high (pk at dose2): ke=0.10 for 5h.
+        //   A1(10⁻) = 778.80 * exp(-0.10*5) = 472.37
+        // After dose2: A1(10⁺) = 472.37 + 1000 = 1472.37
+        // [10, 12] uses pk_high (pk at obs2): ke=0.10 for 2h.
+        //   A1(12) = 1472.37 * exp(-0.10*2) = 1205.49, C = 12.0549
+        let a1_at_10_minus = a1_at_5 * (-0.10f64 * 5.0).exp();
         let a1_at_10_plus = a1_at_10_minus + 1000.0;
-        let a1_at_12 = a1_at_10_plus * (-0.20f64).exp();
+        let a1_at_12 = a1_at_10_plus * (-0.10f64 * 2.0).exp();
         let c12_expected = a1_at_12 / 100.0;
         assert_relative_eq!(preds[1], c12_expected, epsilon = 1e-12);
     }
@@ -1381,41 +1384,45 @@ mod tests {
 
     #[test]
     fn one_cpt_evid2_mid_interval_switches_decay_rate() {
-        // Single dose at t=0, single obs at t=10. A pk-only (EVID=2)
-        // event at t=5 with a different CL must split the decay:
-        //   [0, 5]:  uses CL_low
-        //   [5, 10]: uses CL_high
-        // This is what NONMEM/nlmixr2 do; if the EVID=2 event were
-        // ignored, decay would use CL_low for the whole interval.
+        // Single dose at t=0 (CL_low), pk-only (EVID=2) at t=5 with CL_high,
+        // single obs at t=10 (CL_high).
+        //
+        // End-of-interval (NONMEM) propagation:
+        //   [0, 5]:  uses pk at EVID=2 = pk_high → ke = 0.10
+        //   [5, 10]: uses pk at obs    = pk_high → ke = 0.10
+        // The EVID=2 record's PK params govern the interval LEADING UP to it
+        // (NONMEM "$PK runs at every record then ADVAN propagates to it"
+        // semantic). Both intervals end up using pk_high here, so the
+        // dose's pk_low is effectively unused for propagation.
         let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
         let obs_times = vec![10.0];
         let mut subj = make_subject(doses, obs_times);
-        // Inject a pk-only event at t=5.
         subj.pk_only_times = vec![5.0];
 
         let pk_low = pk_one(5.0, 100.0); // ke = 0.05
         let pk_high = pk_one(10.0, 100.0); // ke = 0.10
         let pk_dose = vec![pk_low];
-        let pk_obs = vec![pk_high]; // obs at t=10 uses high (post-EVID2 covariate)
-        let pk_only = vec![pk_high]; // EVID=2 switches to high CL
+        let pk_obs = vec![pk_high];
+        let pk_only = vec![pk_high];
 
         let preds =
             event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &pk_only);
 
-        // Expected: A(5) = 1000 * exp(-0.05*5) = 778.80
-        //           A(10) = A(5) * exp(-0.10*5) = 778.80 * 0.6065 = 472.37
-        //           C(10) = A(10) / 100 = 4.7237
-        let a_at_5 = 1000.0 * (-0.05f64 * 5.0).exp();
+        //   A(5⁻) = 1000 * exp(-0.10*5) = 606.53   (uses pk_high — end-of-interval)
+        //   A(10) = A(5⁻) * exp(-0.10*5) = 367.88
+        //   C(10) = 3.6788
+        let a_at_5 = 1000.0 * (-0.10f64 * 5.0).exp();
         let a_at_10 = a_at_5 * (-0.10f64 * 5.0).exp();
         let c10_expected = a_at_10 / 100.0;
         assert_relative_eq!(preds[0], c10_expected, epsilon = 1e-12);
 
-        // Sanity: without the EVID=2 event the decay would be
-        // 1000 * exp(-0.05*10) / 100 = 6.0653 (much higher).
+        // Sanity: without any pk-update event the decay would be
+        // 1000 * exp(-0.05*10) / 100 = 6.065 — much higher than our 3.68.
         let no_evid2 = 1000.0 * (-0.05f64 * 10.0).exp() / 100.0;
         assert!(
             preds[0] < no_evid2,
-            "EVID=2 split should decay drug faster: with split={}, without={}",
+            "EVID=2 high-CL update should decay faster than baseline pk_low: \
+             with={}, without={}",
             preds[0],
             no_evid2
         );

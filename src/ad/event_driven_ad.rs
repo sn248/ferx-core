@@ -254,55 +254,19 @@ pub fn individual_nll_event_driven_ad(
     let mut state2 = 0.0_f64;
     let mut state3 = 0.0_f64;
 
-    // Current PK params governing the current interval. Zero until we
-    // reach the first event; harmless because the first propagation has
-    // dt = 0 (cur_t starts at events[0].time).
-    let mut current_cl = 0.0_f64;
-    let mut current_v = 0.0_f64;
-    let mut current_q = 0.0_f64;
-    let mut current_v2 = 0.0_f64;
-    let mut current_ka = 0.0_f64;
-    let mut current_q3 = 0.0_f64;
-    let mut current_v3 = 0.0_f64;
-
     let mut cur_t = if n_events > 0 { event_times[0] } else { 0.0 };
 
     let mut data_ll = 0.0_f64;
 
     for ev_idx in 0..n_events {
         let t_ev = event_times[ev_idx];
-        // Always call the propagator — when dt = 0 the math is a no-op
-        // (exp(0) = 1, infusion contributions reduce to e^x - e^x = 0).
-        // Branching on `dt > 0.0` here would create a phi-node on
-        // `state` that Enzyme can't type-deduce in reverse mode.
-        let (s0_new, s1_new, s2_new, s3_new) = propagate_state_ad(
-            pk_model_id,
-            state0,
-            state1,
-            state2,
-            state3,
-            cur_t,
-            t_ev,
-            current_cl,
-            current_v,
-            current_q,
-            current_v2,
-            current_ka,
-            current_q3,
-            current_v3,
-            dose_times,
-            dose_rates,
-            dose_durations,
-            dose_cmts_f64,
-            n_doses,
-        );
-        state0 = s0_new;
-        state1 = s1_new;
-        state2 = s2_new;
-        state3 = s3_new;
 
-        // Compute pk_params at this event from per-event tv row + eta.
-        // Inlined as scalars (no `[f64; MAX_PK_PARAMS]` array).
+        // Compute PK params at THIS event from per-event tv row + eta.
+        // NONMEM convention (end-of-interval / current-record): the
+        // params at event[i] govern the propagation [event[i-1], event[i]].
+        // For the first event the propagation has dt = 0, so the values
+        // are unused and the loop is well-defined regardless of where
+        // the params are evaluated.
         let mut ev_cl = 0.0_f64;
         let mut ev_v = 0.0_f64;
         let mut ev_q = 0.0_f64;
@@ -335,6 +299,37 @@ pub fn individual_nll_event_driven_ad(
                 ev_v3 = val;
             }
         }
+
+        // Always call the propagator with the current event's pk —
+        // when dt = 0 the math is a no-op (exp(0) = 1, infusion
+        // contributions reduce to e^x - e^x = 0). Branching on
+        // `dt > 0.0` here would create a phi-node on `state` that
+        // Enzyme can't type-deduce in reverse mode.
+        let (s0_new, s1_new, s2_new, s3_new) = propagate_state_ad(
+            pk_model_id,
+            state0,
+            state1,
+            state2,
+            state3,
+            cur_t,
+            t_ev,
+            ev_cl,
+            ev_v,
+            ev_q,
+            ev_v2,
+            ev_ka,
+            ev_q3,
+            ev_v3,
+            dose_times,
+            dose_rates,
+            dose_durations,
+            dose_cmts_f64,
+            n_doses,
+        );
+        state0 = s0_new;
+        state1 = s1_new;
+        state2 = s2_new;
+        state3 = s3_new;
 
         let kind = event_kinds[ev_idx];
         let orig = event_orig_idx_f64[ev_idx] as usize;
@@ -380,18 +375,10 @@ pub fn individual_nll_event_driven_ad(
         let gaussian_term = resid * resid / v_resid + v_resid.ln();
         let obs_term = cens_active * bloq_term + (1.0 - cens_active) * gaussian_term;
         // For pk-only events is_obs = 0, so no contribution to data_ll.
-        // current_pk still updates from this event's row (handled by
-        // the unconditional ev_cl/v/q/v2/ka/q3/v3 captures above and
-        // the current_* assignments at the end of the loop body).
+        // PK params for the next interval are recomputed at the top of
+        // the next iteration from `tv_per_event` — no carry-over state.
         data_ll += is_obs * obs_term;
 
-        current_cl = ev_cl;
-        current_v = ev_v;
-        current_q = ev_q;
-        current_v2 = ev_v2;
-        current_ka = ev_ka;
-        current_q3 = ev_q3;
-        current_v3 = ev_v3;
         cur_t = t_ev;
     }
 

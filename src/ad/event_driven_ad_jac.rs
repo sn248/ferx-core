@@ -67,44 +67,14 @@ pub fn predict_all_event_driven_ad(
     let mut state2 = 0.0_f64;
     let mut state3 = 0.0_f64;
 
-    let mut current_cl = 0.0_f64;
-    let mut current_v = 0.0_f64;
-    let mut current_q = 0.0_f64;
-    let mut current_v2 = 0.0_f64;
-    let mut current_ka = 0.0_f64;
-    let mut current_q3 = 0.0_f64;
-    let mut current_v3 = 0.0_f64;
-
     let mut cur_t = if n_events > 0 { event_times[0] } else { 0.0 };
 
     for ev_idx in 0..n_events {
         let t_ev = event_times[ev_idx];
-        let (s0_new, s1_new, s2_new, s3_new) = propagate_state_jac(
-            pk_model_id,
-            state0,
-            state1,
-            state2,
-            state3,
-            cur_t,
-            t_ev,
-            current_cl,
-            current_v,
-            current_q,
-            current_v2,
-            current_ka,
-            current_q3,
-            current_v3,
-            dose_times,
-            dose_rates,
-            dose_durations,
-            dose_cmts_f64,
-            n_doses,
-        );
-        state0 = s0_new;
-        state1 = s1_new;
-        state2 = s2_new;
-        state3 = s3_new;
 
+        // PK params at THIS event — used both for the propagation
+        // [event[i-1], event[i]] (NONMEM end-of-interval / current-record
+        // semantic) and for the obs read-out V if this event is an obs.
         let mut ev_cl = 0.0_f64;
         let mut ev_v = 0.0_f64;
         let mut ev_q = 0.0_f64;
@@ -137,6 +107,32 @@ pub fn predict_all_event_driven_ad(
             }
         }
 
+        let (s0_new, s1_new, s2_new, s3_new) = propagate_state_jac(
+            pk_model_id,
+            state0,
+            state1,
+            state2,
+            state3,
+            cur_t,
+            t_ev,
+            ev_cl,
+            ev_v,
+            ev_q,
+            ev_v2,
+            ev_ka,
+            ev_q3,
+            ev_v3,
+            dose_times,
+            dose_rates,
+            dose_durations,
+            dose_cmts_f64,
+            n_doses,
+        );
+        state0 = s0_new;
+        state1 = s1_new;
+        state2 = s2_new;
+        state3 = s3_new;
+
         let kind = event_kinds[ev_idx];
         let orig = event_orig_idx_f64[ev_idx] as usize;
         let dose_idx = if kind < 0.5 { orig } else { 0 };
@@ -163,13 +159,6 @@ pub fn predict_all_event_driven_ad(
         // `event_kinds`.
         out[ev_idx] = conc;
 
-        current_cl = ev_cl;
-        current_v = ev_v;
-        current_q = ev_q;
-        current_v2 = ev_v2;
-        current_ka = ev_ka;
-        current_q3 = ev_q3;
-        current_v3 = ev_v3;
         cur_t = t_ev;
     }
 }

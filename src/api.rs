@@ -659,6 +659,9 @@ fn fit_inner(
         wall_time_secs,
         model_name: model.name.clone(),
         ferx_version: env!("CARGO_PKG_VERSION").to_string(),
+        eta_param_info: model.eta_param_info.clone(),
+        theta_transform: model.theta_transform.clone(),
+        sigma_types: model.error_model.sigma_types(),
         cov_eigenvalues,
         cov_condition_number,
     };
@@ -1297,6 +1300,8 @@ mod iov_integration {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
         }
     }
 

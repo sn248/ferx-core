@@ -111,6 +111,30 @@ Use additional theta parameters for covariate coefficients:
   CL = TVCL * (WT/70)^THETA_WT * (CRCL/100)^THETA_CRCL * exp(ETA_CL)
 ```
 
+### Logit-normal bioavailability
+
+Use `inv_logit(logit(THETA_F) + ETA_F)` to constrain bioavailability to (0, 1).
+The starting value for `THETA_F` is set **directly on the (0, 1) scale** — whatever
+fraction you specify is what the optimiser uses as the typical F:
+
+```
+[parameters]
+  theta THETA_F(0.70, 0.001, 0.999)  # typical bioavailability = 70%
+  omega ETA_F ~ 0.10                 # BSV on the logit scale
+
+[individual_parameters]
+  F = inv_logit(logit(THETA_F) + ETA_F)
+```
+
+- When `ETA_F = 0`, `F_i = THETA_F` exactly (the logit and inv_logit cancel).
+- `ETA_F` shifts each individual's F on the logit scale, symmetrically around the typical value.
+- The estimated `THETA_F` in the output is directly interpretable as the typical bioavailability.
+- `omega ETA_F` is variance on the **logit scale** — not the variance of F itself.
+
+The alternative form `inv_logit(THETA_F + ETA_F)` is also supported, where
+`THETA_F` is on the logit scale (e.g., `logit(0.70) ≈ 0.847`). This is
+less readable but may be useful when comparing with NONMEM models.
+
 ## Automatic MU-referencing
 
 When a line matches one of the patterns

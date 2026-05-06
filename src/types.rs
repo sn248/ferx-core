@@ -330,6 +330,67 @@ pub enum ErrorModel {
     Combined,
 }
 
+/// How a sigma parameter enters the residual error model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigmaType {
+    Proportional,
+    Additive,
+}
+
+impl ErrorModel {
+    /// Return the `SigmaType` for each sigma, in the order they appear in `FitResult.sigma`.
+    pub fn sigma_types(self) -> Vec<SigmaType> {
+        match self {
+            ErrorModel::Proportional => vec![SigmaType::Proportional],
+            ErrorModel::Additive => vec![SigmaType::Additive],
+            ErrorModel::Combined => vec![SigmaType::Proportional, SigmaType::Additive],
+        }
+    }
+}
+
+/// Transformation applied to a theta on the natural scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThetaTransform {
+    /// Theta is on the natural scale (no transformation).
+    Identity,
+    /// Theta is on the log scale; back-transform = exp(theta).
+    Log,
+    /// Theta is on the logit scale: `inv_logit(THETA + ETA)`. User sets THETA
+    /// on the logit scale (e.g. logit(0.7) ≈ 0.847).
+    Logit,
+    /// Theta is on the probability scale: `inv_logit(logit(THETA) + ETA)`.
+    /// User sets THETA directly in (0,1) (e.g. 0.70 for 70% bioavailability).
+    LogitProbability,
+}
+
+/// Distribution / parameterisation of an ETA random effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EtaParamType {
+    /// `TVCL * exp(ETA)` or `exp(THETA + ETA)` — log-normal.
+    LogNormal,
+    /// `TVCL + ETA` — normal (additive).
+    Additive,
+    /// `inv_logit(THETA + ETA)` — logit-normal; THETA on the logit scale.
+    Logit,
+    /// `inv_logit(logit(THETA) + ETA)` — logit-normal; THETA on the (0,1) scale.
+    LogitProbability,
+    /// Pattern not automatically recognised.
+    Custom,
+}
+
+/// Per-ETA transformation metadata, carried in `FitResult`.
+#[derive(Debug, Clone)]
+pub struct EtaParamInfo {
+    pub eta_name: String,
+    pub param_type: EtaParamType,
+    /// Theta paired with this ETA. Set only when the ETA is added directly to a single THETA in
+    /// the same expression (e.g. `THETA * exp(ETA)` or `inv_logit(THETA + ETA)`).
+    /// Not set for mu-ref patterns like `TVCL * exp(ETA)` where the THETA is a scale factor.
+    pub linked_theta: Option<String>,
+    /// Name of the individual parameter this ETA appears in (e.g. `"CL"`).
+    pub individual_param_name: String,
+}
+
 /// PK parameter function: maps (theta, eta, covariates) -> PkParams
 pub type PkParamFn = Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> PkParams + Send + Sync>;
 
@@ -443,6 +504,13 @@ pub struct CompiledModel {
     /// Warnings generated at parse time (e.g. mu-referencing disabled for
     /// conditional parameters).  Prepended to `FitResult.warnings` by `fit()`.
     pub parse_warnings: Vec<String>,
+    /// Per-ETA transformation metadata derived from the `[individual_parameters]`
+    /// expressions at parse time. Length ≤ n_eta (only ETAs whose expression was
+    /// classified are present). Forwarded into `FitResult`.
+    pub eta_param_info: Vec<EtaParamInfo>,
+    /// Per-theta transformation: `theta_transform[i]` describes whether theta i
+    /// is used on the natural (Identity), log, or logit scale. Length == n_theta.
+    pub theta_transform: Vec<ThetaTransform>,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -637,6 +705,14 @@ pub struct FitResult {
     pub model_name: String,
     /// ferx-nlme library version (from Cargo.toml at compile time).
     pub ferx_version: String,
+    /// Per-ETA transformation metadata (see `EtaParamInfo`). Used by the R
+    /// layer to pick the correct CI / CV% formula for each random effect.
+    pub eta_param_info: Vec<EtaParamInfo>,
+    /// Per-theta transformation (Identity / Log / Logit), parallel to `theta`.
+    /// Tells the R layer whether a theta must be back-transformed before display.
+    pub theta_transform: Vec<ThetaTransform>,
+    /// Per-sigma type (Proportional / Additive), parallel to `sigma`.
+    pub sigma_types: Vec<SigmaType>,
     /// Eigenvalues of the correlation matrix of free (non-fixed) parameters,
     /// sorted descending. `None` when the covariance step was not run, failed,
     /// or fewer than two free parameters exist.
@@ -1042,7 +1118,10 @@ pub(crate) mod test_helpers {
                 theta_fixed: vec![false],
                 omega: OmegaMatrix::from_diagonal(&[0.1], vec!["ETA_CL".into()]),
                 omega_fixed: vec![false],
-                sigma: SigmaVector { values: vec![0.1], names: vec!["EPS".into()] },
+                sigma: SigmaVector {
+                    values: vec![0.1],
+                    names: vec!["EPS".into()],
+                },
                 sigma_fixed: vec![false],
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
@@ -1072,6 +1151,8 @@ pub(crate) mod test_helpers {
             referenced_covariates: vec![],
             gradient_method,
             parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
         }
     }
 }

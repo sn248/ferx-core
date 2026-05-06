@@ -295,6 +295,16 @@ fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
 ///
 /// `theta_transforms` is indexed parallel to `theta_names`; `eta_param_infos`
 /// contains one entry per BSV ETA that could be classified.
+///
+/// Known limitations / follow-up TODOs:
+/// - `if/else` assignments that contain an ETA are classified as `Custom` even when all
+///   branches share the same parameterisation pattern (issue #3 in review).
+/// - `detect_logit_pattern` and the `exp(THETA+ETA)` arm both define a local
+///   `try_theta_eta` closure; extract a shared free function to remove duplication (issue #6).
+/// - `sigma_types` is derived inline in `api::fit_inner`; add a method on `ErrorModel` so
+///   the mapping isn't duplicated (issue #2).
+/// - New metadata types (`EtaParamInfo`, `ThetaTransform`, `SigmaType`) are not yet
+///   written to the fit YAML — update `io/output.rs` alongside ferx#53 (issue #5).
 fn classify_indiv_params(
     stmts: &[Statement],
     theta_names: &[String],
@@ -670,6 +680,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Uses BSV-only eta names (no kappas).
     let (eta_param_info, theta_transform) =
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv);
+    debug_assert_eq!(
+        theta_transform.len(),
+        theta_names.len(),
+        "classify_indiv_params must return one ThetaTransform per theta"
+    );
 
     let model = CompiledModel {
         name,

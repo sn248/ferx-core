@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-3fd4c433.js";
+            window.path_to_searchindex_js = "../searchindex-7a77815b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-911e3088.js"></script>
@@ -217,6 +217,35 @@ omega ETA_KA ~ 0.40
 <p>For a 3x3 block:</p>
 <pre><code>block_omega (ETA_CL, ETA_V, ETA_KA) = [var_CL, cov_CL_V, var_V, cov_CL_KA, cov_V_KA, var_KA]
 </code></pre>
+<h4 id="visualising-the-lower-triangle"><a class="header" href="#visualising-the-lower-triangle">Visualising the lower triangle</a></h4>
+<p>For an N×N block you supply <code>N·(N+1)/2</code> values, walked row by row through the lower triangle (row 1 has 1 value, row 2 has 2, …, row N has N). Drawing it out as a matrix makes the layout obvious:</p>
+<pre><code>          ETA_1   ETA_2   ETA_3   ETA_4
+        ┌                                ┐
+ETA_1   │  v[0]                          │
+ETA_2   │  v[1]   v[2]                   │
+ETA_3   │  v[3]   v[4]    v[5]           │
+ETA_4   │  v[6]   v[7]    v[8]    v[9]   │
+        └                                ┘
+</code></pre>
+<p>The diagonal entries are the variances; the off-diagonals are the covariances (which the optimiser estimates — set them to <code>0.0</code> as initial values and the fit will recover correlations from the data).</p>
+<h4 id="converting-diagonal-omegas-to-a-block"><a class="header" href="#converting-diagonal-omegas-to-a-block">Converting diagonal omegas to a block</a></h4>
+<p>A common pattern: you have all-diagonal omegas and want to replace them with a single fully-correlated block. Each <code>omega</code> variance becomes a diagonal entry; off-diagonals start at <code>0.0</code>. For example:</p>
+<pre><code>omega ETA_CL ~ 0.1
+omega ETA_V1 ~ 0.1
+omega ETA_Q  ~ 0.1
+omega ETA_V2 ~ 0.1
+</code></pre>
+<p>becomes a 4×4 block (10 values: <code>1+2+3+4</code>):</p>
+<pre><code>block_omega (ETA_CL, ETA_V1, ETA_Q, ETA_V2) = [
+  0.1,
+  0.0, 0.1,
+  0.0, 0.0, 0.1,
+  0.0, 0.0, 0.0, 0.1
+]
+</code></pre>
+<p>(Multi-line and single-line layouts are equivalent — line breaks inside <code>[ ... ]</code> are ignored.) Reading the rows: row 1 is <code>var(CL)</code>, row 2 is <code>cov(CL,V1) var(V1)</code>, row 3 is <code>cov(CL,Q) cov(V1,Q) var(Q)</code>, row 4 is <code>cov(CL,V2) cov(V1,V2) cov(Q,V2) var(V2)</code>.</p>
+<p>Block omega regularises poorly-identified parameters by letting them share variability — see the <a href="../faq.html">optimisation FAQ</a> for a worked example where switching from diagonal to <code>block_omega(3)</code> rescues a fit that diagonal-omega couldn’t converge.</p>
+<h4 id="mixing-diagonal-and-block"><a class="header" href="#mixing-diagonal-and-block">Mixing diagonal and block</a></h4>
 <p>You can mix diagonal and block omega specifications. Diagonal omegas specify uncorrelated random effects, while block omegas estimate the full covariance sub-matrix:</p>
 <pre><code>block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
 omega ETA_KA ~ 0.40

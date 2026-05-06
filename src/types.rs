@@ -372,7 +372,9 @@ pub enum EtaParamType {
 pub struct EtaParamInfo {
     pub eta_name: String,
     pub param_type: EtaParamType,
-    /// Theta paired with this ETA (present for log-scale and logit patterns).
+    /// Theta paired with this ETA. Set only when the ETA is added directly to a single THETA in
+    /// the same expression (e.g. `THETA * exp(ETA)` or `inv_logit(THETA + ETA)`).
+    /// Not set for mu-ref patterns like `TVCL * exp(ETA)` where the THETA is a scale factor.
     pub linked_theta: Option<String>,
     /// Name of the individual parameter this ETA appears in (e.g. `"CL"`).
     pub individual_param_name: String,
@@ -1096,7 +1098,10 @@ pub(crate) mod test_helpers {
                 theta_fixed: vec![false],
                 omega: OmegaMatrix::from_diagonal(&[0.1], vec!["ETA_CL".into()]),
                 omega_fixed: vec![false],
-                sigma: SigmaVector { values: vec![0.1], names: vec!["EPS".into()] },
+                sigma: SigmaVector {
+                    values: vec![0.1],
+                    names: vec!["EPS".into()],
+                },
                 sigma_fixed: vec![false],
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
@@ -1126,8 +1131,8 @@ pub(crate) mod test_helpers {
             referenced_covariates: vec![],
             gradient_method,
             parse_warnings: Vec::new(),
-        eta_param_info: Vec::new(),
-        theta_transform: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
         }
     }
 }

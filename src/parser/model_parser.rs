@@ -104,7 +104,10 @@ fn assigned_vars_in_order(stmts: &[Statement]) -> Vec<String> {
                     }
                 }
                 Statement::DiffEq(_, _) => {}
-                Statement::If { branches, else_body } => {
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
                     for (_, body) in branches {
                         walk(body, out);
                     }
@@ -156,7 +159,10 @@ fn extract_eta_indices_for_var(stmts: &[Statement], var_name: &str) -> Vec<usize
                         }
                     }
                 }
-                Statement::If { branches, else_body } => {
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
                     for (_, body) in branches {
                         walk(body, target, out);
                     }
@@ -260,24 +266,23 @@ fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
     if let Expression::UnaryFn(name, inner) = expr {
         if name == "inv_logit" || name == "expit" {
             if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
-                let try_theta_eta =
-                    |a: &Expression, b: &Expression| -> Option<(usize, usize, bool)> {
-                        // Form 1: THETA + ETA  (THETA on logit scale)
-                        if let (Expression::Theta(ti), Expression::Eta(ei)) = (a, b) {
-                            return Some((*ei, *ti, false));
-                        }
-                        // Form 2: logit(THETA) + ETA  (THETA on probability scale)
-                        if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) =
-                            (a, b)
-                        {
-                            if fn_name == "logit" {
-                                if let Expression::Theta(ti) = inner_arg.as_ref() {
-                                    return Some((*ei, *ti, true));
-                                }
+                let try_theta_eta = |a: &Expression,
+                                     b: &Expression|
+                 -> Option<(usize, usize, bool)> {
+                    // Form 1: THETA + ETA  (THETA on logit scale)
+                    if let (Expression::Theta(ti), Expression::Eta(ei)) = (a, b) {
+                        return Some((*ei, *ti, false));
+                    }
+                    // Form 2: logit(THETA) + ETA  (THETA on probability scale)
+                    if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) = (a, b) {
+                        if fn_name == "logit" {
+                            if let Expression::Theta(ti) = inner_arg.as_ref() {
+                                return Some((*ei, *ti, true));
                             }
                         }
-                        None
-                    };
+                    }
+                    None
+                };
                 return try_theta_eta(lhs, rhs).or_else(|| try_theta_eta(rhs, lhs));
             }
         }
@@ -294,7 +299,10 @@ fn classify_indiv_params(
     stmts: &[Statement],
     theta_names: &[String],
     eta_names: &[String],
-) -> (Vec<crate::types::EtaParamInfo>, Vec<crate::types::ThetaTransform>) {
+) -> (
+    Vec<crate::types::EtaParamInfo>,
+    Vec<crate::types::ThetaTransform>,
+) {
     use crate::types::{EtaParamInfo, EtaParamType, ThetaTransform};
 
     let n_theta = theta_names.len();
@@ -307,7 +315,10 @@ fn classify_indiv_params(
             if let Some((eta_idx, theta_idx, prob_scale)) = detect_logit_pattern(expr) {
                 if eta_idx < eta_names.len() && theta_idx < n_theta {
                     let (tt, pt) = if prob_scale {
-                        (ThetaTransform::LogitProbability, EtaParamType::LogitProbability)
+                        (
+                            ThetaTransform::LogitProbability,
+                            EtaParamType::LogitProbability,
+                        )
                     } else {
                         (ThetaTransform::Logit, EtaParamType::Logit)
                     };
@@ -489,12 +500,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         let ode_lines = blocks
             .get("odes")
             .ok_or("ODE model requires [odes] block")?;
-        let ode_spec = build_ode_spec(
-            ode_lines,
-            &state_names,
-            &obs_cmt_name,
-            &indiv_var_names,
-        )?;
+        let ode_spec = build_ode_spec(ode_lines, &state_names, &obs_cmt_name, &indiv_var_names)?;
         // PK model not used for ODE, but we need a placeholder + empty param map
         (PkModel::OneCptOral, HashMap::new(), Some(ode_spec))
     } else {
@@ -532,7 +538,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         let diag_as_omega: Vec<OmegaSpec> = kappa_info
             .diagonal
             .iter()
-            .map(|k| OmegaSpec { name: k.name.clone(), variance: k.variance, fixed: k.fixed })
+            .map(|k| OmegaSpec {
+                name: k.name.clone(),
+                variance: k.variance,
+                fixed: k.fixed,
+            })
             .collect();
         let block_as_omega: Vec<BlockOmegaSpec> = kappa_info
             .block
@@ -544,8 +554,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             })
             .collect();
         let omega_iov = build_omega_matrix(&diag_as_omega, &block_as_omega, &kappa_names)?;
-        let kappa_fixed =
-            build_omega_fixed(&diag_as_omega, &block_as_omega, &kappa_names)?;
+        let kappa_fixed = build_omega_fixed(&diag_as_omega, &block_as_omega, &kappa_names)?;
         (Some(omega_iov), kappa_fixed)
     };
 
@@ -720,20 +729,18 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // Also collect top-level vars that are assigned ONLY inside if-blocks
         // (i.e. they appear in an If branch but have no top-level Assign).
         // Union: any var in an if-branch that references an eta → warn.
-        fn any_if_branch_assigns_eta(
-            stmts: &[Statement],
-            var: &str,
-            n_eta: usize,
-        ) -> bool {
+        fn any_if_branch_assigns_eta(stmts: &[Statement], var: &str, n_eta: usize) -> bool {
             for s in stmts {
-                if let Statement::If { branches, else_body } = s {
+                if let Statement::If {
+                    branches,
+                    else_body,
+                } = s
+                {
                     for (_, body) in branches {
                         for bs in body {
                             if let Statement::Assign(name, expr) = bs {
                                 if name == var
-                                    && extract_eta_indices(expr)
-                                        .iter()
-                                        .any(|&i| i < n_eta)
+                                    && extract_eta_indices(expr).iter().any(|&i| i < n_eta)
                                 {
                                     return true;
                                 }
@@ -744,9 +751,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                         for bs in eb {
                             if let Statement::Assign(name, expr) = bs {
                                 if name == var
-                                    && extract_eta_indices(expr)
-                                        .iter()
-                                        .any(|&i| i < n_eta)
+                                    && extract_eta_indices(expr).iter().any(|&i| i < n_eta)
                                 {
                                     return true;
                                 }
@@ -1138,16 +1143,16 @@ fn build_ode_spec(
     // since the second write would silently win at runtime. Assignments to the
     // same state in *different* branches of an if/else are allowed.
     let mut diffeq_states: std::collections::HashSet<String> = std::collections::HashSet::new();
-    fn collect_diffeqs(
-        stmts: &[Statement],
-        out: &mut std::collections::HashSet<String>,
-    ) {
+    fn collect_diffeqs(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
         for s in stmts {
             match s {
                 Statement::DiffEq(name, _) => {
                     out.insert(name.clone());
                 }
-                Statement::If { branches, else_body } => {
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
                     for (_, body) in branches {
                         collect_diffeqs(body, out);
                     }
@@ -1171,7 +1176,10 @@ fn build_ode_spec(
                         ));
                     }
                 }
-                Statement::If { branches, else_body } => {
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
                     for (_, body) in branches {
                         check_duplicate_diffeqs(body)?;
                     }
@@ -1188,10 +1196,7 @@ fn build_ode_spec(
     check_duplicate_diffeqs(&stmts)?;
     for s in state_names {
         if !diffeq_states.contains(s) {
-            return Err(format!(
-                "[odes]: missing d/dt({}) for declared state",
-                s
-            ));
+            return Err(format!("[odes]: missing d/dt({}) for declared state", s));
         }
     }
 
@@ -1528,7 +1533,11 @@ fn parse_parameters(
                 .map_err(|_| format!("Bad kappa: {}", line))?;
             let fixed = caps.get(3).is_some();
             kappa_names_ordered.push(name.clone());
-            kappas.push(KappaSpec { name, variance, fixed });
+            kappas.push(KappaSpec {
+                name,
+                variance,
+                fixed,
+            });
         }
     }
 
@@ -1926,10 +1935,7 @@ fn collect_covariates(expr: &Expression, out: &mut std::collections::HashSet<Str
     }
 }
 
-fn collect_covariates_in_condition(
-    cond: &Condition,
-    out: &mut std::collections::HashSet<String>,
-) {
+fn collect_covariates_in_condition(cond: &Condition, out: &mut std::collections::HashSet<String>) {
     match cond {
         Condition::Compare(l, _, r) => {
             collect_covariates(l, out);
@@ -1945,14 +1951,14 @@ fn collect_covariates_in_condition(
 
 /// Walk a list of statements (assignments and if-blocks) and accumulate every
 /// covariate name they reference.
-fn collect_covariates_in_stmts(
-    stmts: &[Statement],
-    out: &mut std::collections::HashSet<String>,
-) {
+fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
     for s in stmts {
         match s {
             Statement::Assign(_, e) | Statement::DiffEq(_, e) => collect_covariates(e, out),
-            Statement::If { branches, else_body } => {
+            Statement::If {
+                branches,
+                else_body,
+            } => {
                 for (cond, body) in branches {
                     collect_covariates_in_condition(cond, out);
                     collect_covariates_in_stmts(body, out);
@@ -2001,7 +2007,15 @@ fn eval_expression(
                 "log" | "ln" => v.max(1e-30).ln(),
                 "sqrt" => v.max(0.0).sqrt(),
                 "abs" => v.abs(),
-                "inv_logit" | "expit" => 1.0 / (1.0 + (-v).exp()),
+                "inv_logit" | "expit" => {
+                    // Numerically stable: avoid exp overflow for very negative v
+                    if v >= 0.0 {
+                        1.0 / (1.0 + (-v).exp())
+                    } else {
+                        let e = v.exp();
+                        e / (1.0 + e)
+                    }
+                }
                 "logit" => {
                     let clamped = v.clamp(1e-15, 1.0 - 1e-15);
                     (clamped / (1.0 - clamped)).ln()
@@ -2087,7 +2101,10 @@ fn eval_statements(
                     buf[idx] = v;
                 }
             }
-            Statement::If { branches, else_body } => {
+            Statement::If {
+                branches,
+                else_body,
+            } => {
                 let mut taken = false;
                 for (cond, body) in branches {
                     if eval_condition(cond, theta, eta, covariates, vars) {
@@ -2745,10 +2762,7 @@ fn parse_one_statement(
             let state_name = match &tokens[pos + 4] {
                 Token::Ident(n) => n.clone(),
                 other => {
-                    return Err(format!(
-                        "d/dt(...) expected an identifier, got {:?}",
-                        other
-                    ));
+                    return Err(format!("d/dt(...) expected an identifier, got {:?}", other));
                 }
             };
             if tokens[pos + 5] != Token::RParen {
@@ -2840,7 +2854,13 @@ fn parse_if_statement(
             _ => break,
         }
     }
-    Ok((Statement::If { branches, else_body }, p))
+    Ok((
+        Statement::If {
+            branches,
+            else_body,
+        },
+        p,
+    ))
 }
 
 #[cfg(test)]
@@ -4015,7 +4035,7 @@ mod tests {
 "#;
         let parsed = parse_full_model(content).unwrap();
         let m = &parsed.model;
-        assert_eq!(m.n_eta, 2);   // BSV only
+        assert_eq!(m.n_eta, 2); // BSV only
         assert_eq!(m.n_kappa, 1);
         assert_eq!(m.kappa_names, vec!["KAPPA_CL"]);
         assert!(m.default_params.omega_iov.is_some());
@@ -4050,8 +4070,7 @@ mod tests {
 
     #[test]
     fn test_parse_block_kappa_syntax() {
-        let lines =
-            vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002, 0.005]".to_string()];
+        let lines = vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002, 0.005]".to_string()];
         let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
         assert_eq!(ki.diagonal.len(), 0);
         assert_eq!(ki.block.len(), 1);
@@ -4063,8 +4082,7 @@ mod tests {
 
     #[test]
     fn test_parse_block_kappa_fix() {
-        let lines =
-            vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002, 0.005] FIX".to_string()];
+        let lines = vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002, 0.005] FIX".to_string()];
         let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
         assert!(ki.block[0].fixed);
     }
@@ -4072,8 +4090,7 @@ mod tests {
     #[test]
     fn test_parse_block_kappa_wrong_count_errors() {
         // 2 names → need 3 values, only 2 given
-        let lines =
-            vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002]".to_string()];
+        let lines = vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002]".to_string()];
         assert!(parse_parameters(&lines).is_err());
     }
 
@@ -4114,7 +4131,10 @@ mod tests {
         assert_eq!(m.kappa_names, vec!["KAPPA_CL", "KAPPA_V"]);
         let iov = m.default_params.omega_iov.as_ref().unwrap();
         assert_eq!(iov.dim(), 2);
-        assert!(!iov.diagonal, "block_kappa should produce non-diagonal omega_iov");
+        assert!(
+            !iov.diagonal,
+            "block_kappa should produce non-diagonal omega_iov"
+        );
         assert!((iov.matrix[(0, 0)] - 0.01).abs() < 1e-12);
         assert!((iov.matrix[(0, 1)] - 0.002).abs() < 1e-12);
         assert!((iov.matrix[(1, 0)] - 0.002).abs() < 1e-12);
@@ -4160,8 +4180,7 @@ mod tests {
 
     #[test]
     fn test_strip_newlines_keeps_brace_separators() {
-        let toks =
-            tokenize("if (a >\n  1) {\n  y = 2\n}").unwrap();
+        let toks = tokenize("if (a >\n  1) {\n  y = 2\n}").unwrap();
         let stripped = strip_newlines_in_groups(toks);
         // Newline inside the parens is gone; newlines inside the braces stay
         // (statement separators). Two newlines are typed inside the brace body
@@ -4175,9 +4194,12 @@ mod tests {
         let tn = vec!["TVCL".to_string()];
         let en: Vec<String> = vec![];
         let ctx = ParseCtx::new(&tn, &en, &[]);
-        let stmts =
-            parse_block_statements("CL = if (WT > 70) TVCL * 1.2 else TVCL", ctx, StatementMode::Plain)
-                .unwrap();
+        let stmts = parse_block_statements(
+            "CL = if (WT > 70) TVCL * 1.2 else TVCL",
+            ctx,
+            StatementMode::Plain,
+        )
+        .unwrap();
         assert_eq!(stmts.len(), 1);
 
         let mut vars = HashMap::new();
@@ -4185,12 +4207,18 @@ mod tests {
         let mut covs = HashMap::new();
         covs.insert("WT".to_string(), 80.0);
         eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None);
-        assert!((vars["CL"] - 6.0).abs() < 1e-12, "CL should pick the then-branch");
+        assert!(
+            (vars["CL"] - 6.0).abs() < 1e-12,
+            "CL should pick the then-branch"
+        );
 
         covs.insert("WT".to_string(), 60.0);
         let mut vars2 = HashMap::new();
         eval_statements(&stmts, &theta, &[], &covs, &mut vars2, None, None);
-        assert!((vars2["CL"] - 5.0).abs() < 1e-12, "CL should pick the else-branch");
+        assert!(
+            (vars2["CL"] - 5.0).abs() < 1e-12,
+            "CL should pick the else-branch"
+        );
     }
 
     #[test]
@@ -4213,7 +4241,12 @@ if (WT > 70) {
             covs.insert("WT".to_string(), wt);
             let mut vars = HashMap::new();
             eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None);
-            assert!((vars["CL"] - expected).abs() < 1e-12, "WT={} → expected CL={}", wt, expected);
+            assert!(
+                (vars["CL"] - expected).abs() < 1e-12,
+                "WT={} → expected CL={}",
+                wt,
+                expected
+            );
         }
     }
 
@@ -4250,8 +4283,7 @@ if (X < 10) {
     #[test]
     fn test_logical_operators_in_condition() {
         let tn = vec!["TVCL".to_string()];
-        let block =
-            "CL = if ((SEX == 1 && WT > 70) || AGE >= 65) TVCL * 1.5 else TVCL";
+        let block = "CL = if ((SEX == 1 && WT > 70) || AGE >= 65) TVCL * 1.5 else TVCL";
         let ctx = ParseCtx::new(&tn, &[], &[]);
         let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
         let theta = vec![10.0];
@@ -4441,7 +4473,11 @@ if (X < 10) {
         let u_zero = vec![0.0, 0.0];
         let mut du_zero = vec![999.0, 999.0];
         (ode.rhs)(&u_zero, &params, 0.0, &mut du_zero);
-        assert!(du_zero[1].abs() < 1e-12, "else-branch should emit 0, got {}", du_zero[1]);
+        assert!(
+            du_zero[1].abs() < 1e-12,
+            "else-branch should emit 0, got {}",
+            du_zero[1]
+        );
     }
 
     #[test]
@@ -4494,11 +4530,7 @@ if (X < 10) {
     #[test]
     fn test_missing_brace_in_if_block_errors() {
         let ctx = empty_ctx();
-        let res = parse_block_statements(
-            "if (1 > 0) CL = 5",
-            ctx,
-            StatementMode::Plain,
-        );
+        let res = parse_block_statements("if (1 > 0) CL = 5", ctx, StatementMode::Plain);
         assert!(res.is_err(), "block-form if without `{{` must error");
     }
 
@@ -4590,9 +4622,16 @@ if (1 > 0) {
                                 return Err(format!("duplicate d/dt({})", name));
                             }
                         }
-                        Statement::If { branches, else_body } => {
-                            for (_, b) in branches { check(b)?; }
-                            if let Some(eb) = else_body { check(eb)?; }
+                        Statement::If {
+                            branches,
+                            else_body,
+                        } => {
+                            for (_, b) in branches {
+                                check(b)?;
+                            }
+                            if let Some(eb) = else_body {
+                                check(eb)?;
+                            }
                         }
                         Statement::Assign(_, _) => {}
                     }
@@ -4617,7 +4656,10 @@ if (1 > 0) {
         ];
         let state_names = vec!["central".to_string()];
         let result = build_ode_spec(&ode_lines, &state_names, "central", &[]);
-        assert!(result.is_ok(), "same state in different branches must be allowed");
+        assert!(
+            result.is_ok(),
+            "same state in different branches must be allowed"
+        );
     }
 
     #[test]
@@ -4651,7 +4693,10 @@ if (1 > 0) {
         );
         let w = &parsed.model.parse_warnings[0];
         assert!(w.contains("CL"), "warning should mention CL");
-        assert!(w.contains("Mu-referencing disabled"), "warning should mention mu-referencing");
+        assert!(
+            w.contains("Mu-referencing disabled"),
+            "warning should mention mu-referencing"
+        );
     }
 
     #[test]
@@ -4744,7 +4789,11 @@ if (1 > 0) {
         let model = minimal_logit_model();
         let tv = model.tv_fn.as_ref().unwrap()(&[0.0], &Default::default());
         let expected = 0.5_f64; // inv_logit(0) = 0.5
-        assert!((tv[0] - expected).abs() < 1e-10, "inv_logit(0) should be 0.5, got {}", tv[0]);
+        assert!(
+            (tv[0] - expected).abs() < 1e-10,
+            "inv_logit(0) should be 0.5, got {}",
+            tv[0]
+        );
     }
 
     #[test]
@@ -4753,7 +4802,11 @@ if (1 > 0) {
         // CL = TVCL * exp(ETA_CL)
         let model = minimal_model_with_indiv("  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)");
         assert_eq!(model.eta_param_info.len(), 2);
-        let cl_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
+        let cl_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .unwrap();
         assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
         // TVCL * exp(ETA) pattern: theta is not on log scale (theta IS TVCL)
         assert!(cl_info.linked_theta.is_none());
@@ -4766,7 +4819,11 @@ if (1 > 0) {
         use crate::types::{EtaParamType, ThetaTransform};
         // CL = exp(TVCL + ETA_CL)  — theta is on log scale
         let model = minimal_model_with_indiv("  CL = exp(TVCL + ETA_CL)\n  V = TVV * exp(ETA_V)");
-        let cl_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
+        let cl_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .unwrap();
         assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
         assert_eq!(cl_info.linked_theta, Some("TVCL".to_string()));
         assert_eq!(model.theta_transform[0], ThetaTransform::Log);
@@ -4777,7 +4834,11 @@ if (1 > 0) {
         use crate::types::{EtaParamType, ThetaTransform};
         // CL = TVCL + ETA_CL  — additive
         let model = minimal_model_with_indiv("  CL = TVCL + ETA_CL\n  V = TVV * exp(ETA_V)");
-        let cl_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
+        let cl_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .unwrap();
         assert_eq!(cl_info.param_type, EtaParamType::Additive);
         assert_eq!(model.theta_transform[0], ThetaTransform::Identity);
     }
@@ -4787,7 +4848,11 @@ if (1 > 0) {
         // inv_logit(THETA_F + ETA_F) — THETA_F on logit scale
         use crate::types::{EtaParamType, ThetaTransform};
         let model = minimal_logit_model();
-        let f_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_F").unwrap();
+        let f_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_F")
+            .unwrap();
         assert_eq!(f_info.param_type, EtaParamType::Logit);
         assert_eq!(f_info.linked_theta, Some("THETA_F".to_string()));
         assert_eq!(model.theta_transform[0], ThetaTransform::Logit);
@@ -4813,7 +4878,11 @@ if (1 > 0) {
   DV ~ proportional(EPS)
 ";
         let model = super::parse_full_model(model_str).unwrap().model;
-        let f_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_F").unwrap();
+        let f_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_F")
+            .unwrap();
         assert_eq!(f_info.param_type, EtaParamType::LogitProbability);
         assert_eq!(f_info.linked_theta, Some("THETA_F".to_string()));
         assert_eq!(model.theta_transform[0], ThetaTransform::LogitProbability);

@@ -3726,12 +3726,12 @@ mod tests {
     #[test]
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
-        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-8,
+        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-4,
         //   steihaug_max_iters = 50.
         let opts = FitOptions::default();
         assert_eq!(opts.optimizer, Optimizer::Bobyqa);
         assert_eq!(opts.inner_maxiter, 200);
-        assert!((opts.inner_tol - 1e-8).abs() < 1e-20);
+        assert!((opts.inner_tol - 1e-4).abs() < 1e-20);
         assert_eq!(opts.steihaug_max_iters, 50);
     }
 

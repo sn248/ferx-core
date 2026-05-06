@@ -18,7 +18,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 | `covariance` | `true`, `false` | `true` | Compute covariance matrix and standard errors |
 | `optimizer` | `slsqp`, `lbfgs`, `nlopt_lbfgs`, `mma`, `bfgs`, `bobyqa`, `trust_region` | `slsqp` | Optimization algorithm |
 | `inner_maxiter` | integer | `200` | Max iterations for the inner (per-subject EBE) optimizer |
-| `inner_tol` | float | `1e-8` | Gradient-norm convergence tolerance for the inner optimizer |
+| `inner_tol` | float | `1e-4` | Gradient-norm convergence tolerance for the inner (per-subject EBE) optimizer. The default of `1e-4` matches the precision of typical NLME engines (NONMEM's default inner-loop SIGDIGITS is ~3, equivalent to ~`1e-3`). Tighter values (e.g. `1e-6`, `1e-8`) over-converge the EBE relative to the Sheiner–Beal linearisation error and can slow FOCEI fits by 10–15× without measurable change in the final OFV. Use a tighter value only if you're comparing post-hoc EBE values across runs at high precision. |
 | `steihaug_max_iters` | integer | `50` | Max CG iterations for the Steihaug subproblem (only used when `optimizer = trust_region`) |
 | `global_search` | `true`, `false` | `false` | Run gradient-free pre-search before local optimization |
 | `global_maxeval` | integer | auto | Max evaluations for global search |

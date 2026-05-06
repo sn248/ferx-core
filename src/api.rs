@@ -714,8 +714,10 @@ fn fit_inner(
 /// divide by zero and the condition number reflects only the identifiable
 /// parameter space.
 ///
-/// Returns `(None, None)` when `cov` is `None`, fewer than two free parameters
-/// exist, or any free-parameter diagonal entry is not strictly positive.
+/// Returns `(None, None)` when `cov` is `None` or fewer than two free
+/// parameters exist (after excluding parameters whose diagonal entry is
+/// `<= 0`).  Parameters with non-positive diagonals are treated as fixed and
+/// silently excluded; the remaining free subblock is used for the computation.
 fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
     let cov = match cov {
         Some(m) => m,

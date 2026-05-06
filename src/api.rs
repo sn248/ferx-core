@@ -658,14 +658,7 @@ fn fit_inner(
         ferx_version: env!("CARGO_PKG_VERSION").to_string(),
         eta_param_info: model.eta_param_info.clone(),
         theta_transform: model.theta_transform.clone(),
-        sigma_types: {
-            use crate::types::{ErrorModel, SigmaType};
-            match model.error_model {
-                ErrorModel::Proportional => vec![SigmaType::Proportional],
-                ErrorModel::Additive => vec![SigmaType::Additive],
-                ErrorModel::Combined => vec![SigmaType::Proportional, SigmaType::Additive],
-            }
-        },
+        sigma_types: model.error_model.sigma_types(),
     };
 
     if options.verbose {

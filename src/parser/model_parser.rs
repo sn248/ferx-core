@@ -255,6 +255,139 @@ fn detect_mu_refs(
     result
 }
 
+/// Intermediate result from classifying a single expression.
+#[derive(Debug, Clone, PartialEq)]
+struct ExprClass {
+    eta_idx: usize,
+    theta_idx: Option<usize>,
+    param_type: crate::types::EtaParamType,
+    /// Whether `theta_transform` should be updated for `theta_idx`.
+    theta_transform: Option<crate::types::ThetaTransform>,
+}
+
+/// Classify a single expression into an `ExprClass`, or return `None` if no ETA
+/// is present / no pattern recognised (caller handles `Custom` fallback).
+fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
+    use crate::types::{EtaParamType, ThetaTransform};
+
+    // inv_logit(THETA + ETA) or inv_logit(logit(THETA) + ETA)
+    if let Some((ei, ti, prob_scale)) = detect_logit_pattern(expr) {
+        if ti < n_theta {
+            let (tt, pt) = if prob_scale {
+                (ThetaTransform::LogitProbability, EtaParamType::LogitProbability)
+            } else {
+                (ThetaTransform::Logit, EtaParamType::Logit)
+            };
+            return Some(ExprClass {
+                eta_idx: ei,
+                theta_idx: Some(ti),
+                param_type: pt,
+                theta_transform: Some(tt),
+            });
+        }
+    }
+
+    // exp(THETA + ETA)
+    if let Expression::UnaryFn(name, inner) = expr {
+        if name == "exp" {
+            if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
+                if let Some((ei, ti)) =
+                    plain_theta_eta(lhs, rhs).or_else(|| plain_theta_eta(rhs, lhs))
+                {
+                    if ti < n_theta {
+                        return Some(ExprClass {
+                            eta_idx: ei,
+                            theta_idx: Some(ti),
+                            param_type: EtaParamType::LogNormal,
+                            theta_transform: Some(ThetaTransform::Log),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // TVCL * exp(ETA), exp(log(THETA) + ETA), TVCL + ETA
+    if let Some((ei, ti, log_transformed)) = detect_pattern(expr) {
+        if ti < n_theta {
+            let pt = if log_transformed {
+                EtaParamType::LogNormal
+            } else {
+                EtaParamType::Additive
+            };
+            return Some(ExprClass {
+                eta_idx: ei,
+                theta_idx: None,
+                param_type: pt,
+                theta_transform: None,
+            });
+        }
+    }
+
+    None
+}
+
+/// Collect all expressions assigned to `param_name` across every branch of a
+/// `Statement::If` (branches + else_body). Only looks one level deep (nested ifs
+/// are not walked). Returns `None` if any branch body has no assignment for
+/// `param_name` (meaning the parameter is only conditionally defined).
+fn if_branch_exprs<'a>(
+    stmt: &'a Statement,
+    param_name: &str,
+) -> Option<Vec<&'a Expression>> {
+    if let Statement::If { branches, else_body } = stmt {
+        let mut exprs: Vec<&'a Expression> = Vec::new();
+        for (_, body) in branches {
+            let found: Vec<_> = body
+                .iter()
+                .filter_map(|s| {
+                    if let Statement::Assign(n, e) = s {
+                        if n == param_name { Some(e) } else { None }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if found.is_empty() {
+                return None; // branch doesn't assign this param — incomplete
+            }
+            exprs.extend(found);
+        }
+        if let Some(eb) = else_body {
+            let found: Vec<_> = eb
+                .iter()
+                .filter_map(|s| {
+                    if let Statement::Assign(n, e) = s {
+                        if n == param_name { Some(e) } else { None }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if found.is_empty() {
+                return None;
+            }
+            exprs.extend(found);
+        } else {
+            // No else branch: parameter may be undefined for some subjects → incomplete.
+            return None;
+        }
+        Some(exprs)
+    } else {
+        None
+    }
+}
+
+/// Match `THETA + ETA` or `ETA + THETA` and return `(eta_idx, theta_idx)`.
+/// Used by both `detect_logit_pattern` and the `exp(THETA+ETA)` arm of
+/// `classify_indiv_params`.
+fn plain_theta_eta(a: &Expression, b: &Expression) -> Option<(usize, usize)> {
+    if let (Expression::Theta(ti), Expression::Eta(ei)) = (a, b) {
+        return Some((*ei, *ti));
+    }
+    None
+}
+
 /// Detect logit-normal parameterisation patterns.
 /// Returns `Some((eta_idx, theta_idx, prob_scale))` where `prob_scale` is
 /// `true` for `inv_logit(logit(THETA) + ETA)` and `false` for `inv_logit(THETA + ETA)`.
@@ -266,24 +399,26 @@ fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
     if let Expression::UnaryFn(name, inner) = expr {
         if name == "inv_logit" || name == "expit" {
             if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
-                let try_theta_eta = |a: &Expression,
-                                     b: &Expression|
-                 -> Option<(usize, usize, bool)> {
-                    // Form 1: THETA + ETA  (THETA on logit scale)
-                    if let (Expression::Theta(ti), Expression::Eta(ei)) = (a, b) {
-                        return Some((*ei, *ti, false));
-                    }
-                    // Form 2: logit(THETA) + ETA  (THETA on probability scale)
-                    if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) = (a, b) {
-                        if fn_name == "logit" {
-                            if let Expression::Theta(ti) = inner_arg.as_ref() {
-                                return Some((*ei, *ti, true));
+                let try_logit_theta_eta =
+                    |a: &Expression, b: &Expression| -> Option<(usize, usize, bool)> {
+                        // Form 1: THETA + ETA  (THETA on logit scale)
+                        if let Some((ei, ti)) = plain_theta_eta(a, b) {
+                            return Some((ei, ti, false));
+                        }
+                        // Form 2: logit(THETA) + ETA  (THETA on probability scale)
+                        if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) =
+                            (a, b)
+                        {
+                            if fn_name == "logit" {
+                                if let Expression::Theta(ti) = inner_arg.as_ref() {
+                                    return Some((*ei, *ti, true));
+                                }
                             }
                         }
-                    }
-                    None
-                };
-                return try_theta_eta(lhs, rhs).or_else(|| try_theta_eta(rhs, lhs));
+                        None
+                    };
+                return try_logit_theta_eta(lhs, rhs)
+                    .or_else(|| try_logit_theta_eta(rhs, lhs));
             }
         }
     }
@@ -296,15 +431,8 @@ fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
 /// `theta_transforms` is indexed parallel to `theta_names`; `eta_param_infos`
 /// contains one entry per BSV ETA that could be classified.
 ///
-/// Known limitations / follow-up TODOs:
-/// - `if/else` assignments that contain an ETA are classified as `Custom` even when all
-///   branches share the same parameterisation pattern (issue #3 in review).
-/// - `detect_logit_pattern` and the `exp(THETA+ETA)` arm both define a local
-///   `try_theta_eta` closure; extract a shared free function to remove duplication (issue #6).
-/// - `sigma_types` is derived inline in `api::fit_inner`; add a method on `ErrorModel` so
-///   the mapping isn't duplicated (issue #2).
-/// - New metadata types (`EtaParamInfo`, `ThetaTransform`, `SigmaType`) are not yet
-///   written to the fit YAML — update `io/output.rs` alongside ferx#53 (issue #5).
+/// Note: new metadata types (`EtaParamInfo`, `ThetaTransform`, `SigmaType`) are not yet
+/// written to the fit YAML — `io/output.rs` will be updated alongside ferx#53.
 fn classify_indiv_params(
     stmts: &[Statement],
     theta_names: &[String],
@@ -320,98 +448,131 @@ fn classify_indiv_params(
     let mut eta_infos: Vec<EtaParamInfo> = Vec::new();
 
     for s in stmts {
-        if let Statement::Assign(param_name, expr) = s {
-            // Logit patterns: inv_logit(THETA + ETA) or inv_logit(logit(THETA) + ETA)
-            if let Some((eta_idx, theta_idx, prob_scale)) = detect_logit_pattern(expr) {
-                if eta_idx < eta_names.len() && theta_idx < n_theta {
-                    let (tt, pt) = if prob_scale {
-                        (
-                            ThetaTransform::LogitProbability,
-                            EtaParamType::LogitProbability,
-                        )
-                    } else {
-                        (ThetaTransform::Logit, EtaParamType::Logit)
-                    };
-                    theta_transform[theta_idx] = tt;
-                    eta_infos.push(EtaParamInfo {
-                        eta_name: eta_names[eta_idx].clone(),
-                        param_type: pt,
-                        linked_theta: Some(theta_names[theta_idx].clone()),
-                        individual_param_name: param_name.clone(),
-                    });
-                    continue;
-                }
-            }
-
-            // Log-scale: exp(THETA + ETA)  [Pattern 2 in detect_pattern]
-            if let Expression::UnaryFn(name, inner) = expr {
-                if name == "exp" {
-                    if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
-                        let try_theta_eta =
-                            |a: &Expression, b: &Expression| -> Option<(usize, usize)> {
-                                if let (Expression::Theta(ti), Expression::Eta(ei)) = (a, b) {
-                                    return Some((*ei, *ti));
-                                }
-                                None
-                            };
-                        if let Some((ei, ti)) =
-                            try_theta_eta(lhs, rhs).or_else(|| try_theta_eta(rhs, lhs))
-                        {
-                            if ei < eta_names.len() && ti < n_theta {
-                                theta_transform[ti] = ThetaTransform::Log;
-                                eta_infos.push(EtaParamInfo {
-                                    eta_name: eta_names[ei].clone(),
-                                    param_type: EtaParamType::LogNormal,
-                                    linked_theta: Some(theta_names[ti].clone()),
-                                    individual_param_name: param_name.clone(),
-                                });
-                                continue;
-                            }
+        match s {
+            Statement::Assign(param_name, expr) => {
+                if let Some(c) = classify_expr(expr, n_theta) {
+                    apply_class(
+                        c,
+                        param_name,
+                        eta_names,
+                        theta_names,
+                        &mut theta_transform,
+                        &mut eta_infos,
+                    );
+                } else {
+                    // Unrecognised pattern → Custom for every ETA referenced.
+                    // Note: multiple ETAs in one expression each get their own entry.
+                    for ei in extract_eta_indices(expr) {
+                        if ei < eta_names.len() {
+                            eta_infos.push(EtaParamInfo {
+                                eta_name: eta_names[ei].clone(),
+                                param_type: EtaParamType::Custom,
+                                linked_theta: None,
+                                individual_param_name: param_name.clone(),
+                            });
                         }
                     }
                 }
             }
-
-            // Use detect_pattern for the remaining mu-ref-compatible patterns
-            if let Some((eta_idx, theta_idx, log_transformed)) = detect_pattern(expr) {
-                if eta_idx < eta_names.len() && theta_idx < n_theta {
-                    if log_transformed {
-                        // TVCL * exp(ETA) or exp(log(THETA) + ETA)
-                        eta_infos.push(EtaParamInfo {
-                            eta_name: eta_names[eta_idx].clone(),
-                            param_type: EtaParamType::LogNormal,
-                            linked_theta: None,
-                            individual_param_name: param_name.clone(),
-                        });
-                    } else {
-                        // TVCL + ETA
-                        eta_infos.push(EtaParamInfo {
-                            eta_name: eta_names[eta_idx].clone(),
-                            param_type: EtaParamType::Additive,
-                            linked_theta: None,
-                            individual_param_name: param_name.clone(),
-                        });
+            Statement::If { .. } => {
+                // For each individual parameter assigned inside this if/else block,
+                // check whether every branch uses the same pattern. If so, emit that
+                // classification; otherwise fall back to Custom.
+                let candidate_names = collect_assigned_names_in_if(s);
+                for param_name in &candidate_names {
+                    if let Some(exprs) = if_branch_exprs(s, param_name) {
+                        let classes: Vec<Option<ExprClass>> =
+                            exprs.iter().map(|e| classify_expr(e, n_theta)).collect();
+                        if classes.iter().all(|c| c.is_some()) {
+                            let first = classes[0].as_ref().unwrap();
+                            let unanimous = classes.iter().all(|c| {
+                                let c = c.as_ref().unwrap();
+                                c.param_type == first.param_type
+                                    && c.eta_idx == first.eta_idx
+                            });
+                            if unanimous {
+                                apply_class(
+                                    first.clone(),
+                                    param_name,
+                                    eta_names,
+                                    theta_names,
+                                    &mut theta_transform,
+                                    &mut eta_infos,
+                                );
+                                continue;
+                            }
+                        }
+                        // Branches disagree or contain unrecognised patterns → Custom.
+                        let all_etas: std::collections::HashSet<usize> = exprs
+                            .iter()
+                            .flat_map(|e| extract_eta_indices(e))
+                            .filter(|&i| i < eta_names.len())
+                            .collect();
+                        for ei in all_etas {
+                            eta_infos.push(EtaParamInfo {
+                                eta_name: eta_names[ei].clone(),
+                                param_type: EtaParamType::Custom,
+                                linked_theta: None,
+                                individual_param_name: param_name.clone(),
+                            });
+                        }
                     }
-                    continue;
+                    // if_branch_exprs returns None when a branch omits the param
+                    // (no else arm, or incomplete coverage) — skip classification.
                 }
             }
-
-            // Any other expression that references an ETA → Custom
-            let eta_indices = extract_eta_indices(expr);
-            for ei in eta_indices {
-                if ei < eta_names.len() {
-                    eta_infos.push(EtaParamInfo {
-                        eta_name: eta_names[ei].clone(),
-                        param_type: EtaParamType::Custom,
-                        linked_theta: None,
-                        individual_param_name: param_name.clone(),
-                    });
-                }
-            }
+            _ => {}
         }
     }
 
     (eta_infos, theta_transform)
+}
+
+/// Apply a recognised `ExprClass` to the output vectors.
+fn apply_class(
+    c: ExprClass,
+    param_name: &str,
+    eta_names: &[String],
+    theta_names: &[String],
+    theta_transform: &mut Vec<crate::types::ThetaTransform>,
+    eta_infos: &mut Vec<crate::types::EtaParamInfo>,
+) {
+    if c.eta_idx >= eta_names.len() {
+        return;
+    }
+    if let (Some(ti), Some(tt)) = (c.theta_idx, c.theta_transform) {
+        theta_transform[ti] = tt;
+    }
+    let linked = c.theta_idx.map(|ti| theta_names[ti].clone());
+    eta_infos.push(crate::types::EtaParamInfo {
+        eta_name: eta_names[c.eta_idx].clone(),
+        param_type: c.param_type,
+        linked_theta: linked,
+        individual_param_name: param_name.to_owned(),
+    });
+}
+
+/// Return the set of variable names assigned anywhere inside a `Statement::If`
+/// (one level deep only — nested ifs are not walked).
+fn collect_assigned_names_in_if(stmt: &Statement) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    if let Statement::If { branches, else_body } = stmt {
+        for (_, body) in branches {
+            for s in body {
+                if let Statement::Assign(n, _) = s {
+                    names.insert(n.clone());
+                }
+            }
+        }
+        if let Some(eb) = else_body {
+            for s in eb {
+                if let Statement::Assign(n, _) = s {
+                    names.insert(n.clone());
+                }
+            }
+        }
+    }
+    names
 }
 
 /// Parse a model file (.ferx) and return a CompiledModel.
@@ -4932,16 +5093,66 @@ if (1 > 0) {
 
     #[test]
     fn test_sigma_types_proportional() {
-        use crate::types::{ErrorModel, SigmaType};
+        use crate::types::SigmaType;
         let model = minimal_logit_model();
-        assert_eq!(model.error_model, ErrorModel::Proportional);
-        // sigma_types is on FitResult, not CompiledModel — check error_model field here;
-        // the FitResult wiring is tested at integration level.
-        let sigma_types: Vec<SigmaType> = match model.error_model {
-            ErrorModel::Proportional => vec![SigmaType::Proportional],
-            ErrorModel::Additive => vec![SigmaType::Additive],
-            ErrorModel::Combined => vec![SigmaType::Proportional, SigmaType::Additive],
-        };
-        assert_eq!(sigma_types, vec![SigmaType::Proportional]);
+        // sigma_types is on FitResult, not CompiledModel — verify via ErrorModel::sigma_types().
+        assert_eq!(model.error_model.sigma_types(), vec![SigmaType::Proportional]);
+    }
+
+    // ── Issue 3: if/else classification ─────────────────────────────────────
+
+    #[test]
+    fn test_classify_if_else_unanimous_lognormal() {
+        // Both branches use TVCL * exp(ETA_CL) — should classify as LogNormal.
+        use crate::types::EtaParamType;
+        let model = minimal_model_with_indiv(
+            "  if (TVCL > 1) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    CL = TVCL * exp(ETA_CL)\n  }\n  V = TVV * exp(ETA_V)",
+        );
+        let cl_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .unwrap();
+        assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
+        assert_eq!(cl_info.individual_param_name, "CL");
+    }
+
+    #[test]
+    fn test_classify_if_else_disagreement_custom() {
+        // Branches use different patterns — should fall back to Custom.
+        use crate::types::EtaParamType;
+        let model = minimal_model_with_indiv(
+            "  if (TVCL > 1) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    CL = TVCL + ETA_CL\n  }\n  V = TVV * exp(ETA_V)",
+        );
+        let cl_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .unwrap();
+        assert_eq!(cl_info.param_type, EtaParamType::Custom);
+    }
+
+    #[test]
+    fn test_classify_if_no_else_skipped() {
+        // No else arm → partially defined → classification skipped entirely for V.
+        let model = minimal_model_with_indiv(
+            "  CL = TVCL * exp(ETA_CL)\n  if (TVV > 1) {\n    V = TVV * exp(ETA_V)\n  }",
+        );
+        // CL should be classified; V (if-only, no else) should be absent.
+        assert!(model.eta_param_info.iter().any(|i| i.eta_name == "ETA_CL"));
+        assert!(!model.eta_param_info.iter().any(|i| i.eta_name == "ETA_V"));
+    }
+
+    #[test]
+    fn test_classify_multi_eta_custom() {
+        // Expression with two ETAs (unusual) — both get their own Custom entry.
+        use crate::types::EtaParamType;
+        let model = minimal_model_with_indiv("  CL = TVCL + ETA_CL + ETA_V\n  V = 10.0");
+        let customs: Vec<_> = model
+            .eta_param_info
+            .iter()
+            .filter(|i| i.param_type == EtaParamType::Custom)
+            .collect();
+        assert_eq!(customs.len(), 2, "both ETAs in the expression should be Custom");
     }
 }

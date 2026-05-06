@@ -337,6 +337,17 @@ pub enum SigmaType {
     Additive,
 }
 
+impl ErrorModel {
+    /// Return the `SigmaType` for each sigma, in the order they appear in `FitResult.sigma`.
+    pub fn sigma_types(self) -> Vec<SigmaType> {
+        match self {
+            ErrorModel::Proportional => vec![SigmaType::Proportional],
+            ErrorModel::Additive => vec![SigmaType::Additive],
+            ErrorModel::Combined => vec![SigmaType::Proportional, SigmaType::Additive],
+        }
+    }
+}
+
 /// Transformation applied to a theta on the natural scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThetaTransform {

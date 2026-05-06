@@ -216,6 +216,20 @@ pub fn fit(
     options: &FitOptions,
 ) -> Result<FitResult, String> {
     validate_covariates(model, population)?;
+    if options.multi_start > 1 {
+        fit_multi_start(model, population, init_params, options)
+    } else {
+        fit_with_threads(model, population, init_params, options)
+    }
+}
+
+/// Apply the optional thread-pool scope, then run a single fit.
+fn fit_with_threads(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Result<FitResult, String> {
     match options.threads {
         Some(n) if n > 0 => {
             let pool = rayon::ThreadPoolBuilder::new()
@@ -226,6 +240,161 @@ pub fn fit(
         }
         _ => fit_inner(model, population, init_params, options),
     }
+}
+
+/// Run `options.multi_start` independent fits — the first from the user's
+/// initial values, subsequent ones from log-uniform random perturbations
+/// within the declared parameter bounds — and return the one with the
+/// lowest OFV. The returned `FitResult.warnings` carries a `multi-start:`
+/// summary of the OFV spread across starts; a wide spread is a strong
+/// signal that the model has multiple local optima.
+fn fit_multi_start(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Result<FitResult, String> {
+    use rand::{rngs::StdRng, SeedableRng};
+    let n_starts = options.multi_start;
+    let mut rng = match options.multi_start_seed {
+        Some(s) => StdRng::seed_from_u64(s),
+        None => StdRng::from_entropy(),
+    };
+
+    let mut best: Option<FitResult> = None;
+    let mut all_ofvs: Vec<f64> = Vec::with_capacity(n_starts);
+
+    for i in 0..n_starts {
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return Err("cancelled by user".into());
+        }
+
+        let params_for_run = if i == 0 {
+            init_params.clone()
+        } else {
+            perturb_initial_values(init_params, &mut rng)
+        };
+
+        if options.verbose {
+            eprintln!(
+                "\n=== Multi-start: run {}/{} ({}) ===",
+                i + 1,
+                n_starts,
+                if i == 0 { "user-provided initials" } else { "perturbed initials" },
+            );
+        }
+
+        let res = match fit_with_threads(model, population, &params_for_run, options) {
+            Ok(r) => r,
+            Err(e) => {
+                // A failed multi-start run shouldn't kill the whole sweep —
+                // record an unrealistic OFV so it doesn't win and keep going.
+                if options.verbose {
+                    eprintln!("Multi-start run {} failed: {}", i + 1, e);
+                }
+                all_ofvs.push(f64::INFINITY);
+                continue;
+            }
+        };
+        all_ofvs.push(res.ofv);
+
+        let take = match best.as_ref() {
+            None => true,
+            Some(b) => res.ofv.is_finite() && res.ofv < b.ofv,
+        };
+        if take {
+            best = Some(res);
+        }
+    }
+
+    let mut best = best.ok_or_else(|| "all multi-start runs failed".to_string())?;
+
+    // Summarise OFV spread so the user knows whether the starts agreed.
+    let finite: Vec<f64> = all_ofvs.iter().copied().filter(|x| x.is_finite()).collect();
+    if finite.len() >= 2 {
+        let min = finite.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = finite.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let spread = max - min;
+        let summary = format!(
+            "multi-start: {}/{} starts converged (best OFV = {:.4}, spread = {:.4} \
+             between best and worst). Wide spreads (≫1 OFV unit) indicate the model \
+             has multiple local optima — examine the result and consider tighter \
+             bounds, better inits, or `block_omega` regularisation.",
+            finite.len(),
+            n_starts,
+            min,
+            spread,
+        );
+        best.warnings.push(summary);
+    }
+    Ok(best)
+}
+
+/// Perturb `init_params` for a multi-start run. Free parameters are
+/// log-uniformly resampled within their declared bounds (slightly
+/// shrunk to avoid bound corners). Fixed parameters keep their value.
+/// Block-omega off-diagonal correlations are preserved; only the
+/// diagonal variances are perturbed.
+fn perturb_initial_values<R: rand::Rng>(
+    template: &ModelParameters,
+    rng: &mut R,
+) -> ModelParameters {
+    use rand::distributions::{Distribution, Uniform};
+    let mut p = template.clone();
+
+    // Theta: log-uniform within bounds, shrunk by 5% on each side so
+    // we don't hand the optimiser an at-bound start.
+    for i in 0..p.theta.len() {
+        if p.theta_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let lb = p.theta_lower[i].max(1e-12);
+        let ub = p.theta_upper[i].max(lb * 1.0001);
+        let lo = lb.ln();
+        let hi = ub.ln();
+        let span = hi - lo;
+        let lo_safe = lo + 0.05 * span;
+        let hi_safe = hi - 0.05 * span;
+        let dist = Uniform::new(lo_safe, hi_safe);
+        p.theta[i] = dist.sample(rng).exp();
+    }
+
+    // Omega: perturb the diagonal in log-space around the initial value
+    // by ±1 decade. Keep off-diagonals (block-omega correlations stay
+    // intact). If the result isn't PD, OmegaMatrix's regulariser in
+    // `from_matrix_with_mask` lifts it. Done in place via reconstruction.
+    let n_eta = p.omega.matrix.nrows();
+    let mut new_matrix = p.omega.matrix.clone();
+    for i in 0..n_eta {
+        if p.omega_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let init = p.omega.matrix[(i, i)].max(1e-6);
+        let log_lo = (init / 10.0).ln();
+        let log_hi = (init * 10.0).ln();
+        let dist = Uniform::new(log_lo, log_hi);
+        new_matrix[(i, i)] = dist.sample(rng).exp();
+    }
+    let names = p.omega.eta_names.clone();
+    let free_mask = p.omega.free_mask.clone();
+    let diagonal = p.omega.diagonal;
+    p.omega = OmegaMatrix::from_matrix_with_mask(new_matrix, names, diagonal, free_mask);
+
+    // Sigma: log-uniform around the initial value by ±0.5 decade
+    // (residual error is usually well-determined by the data; over-wide
+    // sigma perturbations send the optimiser to absurd starting points).
+    for i in 0..p.sigma.values.len() {
+        if p.sigma_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let init = p.sigma.values[i].max(1e-6);
+        let log_lo = (init / 3.0).ln();
+        let log_hi = (init * 3.0).ln();
+        let dist = Uniform::new(log_lo, log_hi);
+        p.sigma.values[i] = dist.sample(rng).exp();
+    }
+
+    p
 }
 
 /// Probe whether NLopt CRS2-LM (used for global_search) is available.
@@ -2478,5 +2647,111 @@ mod degeneracy_tests {
         p.sigma_fixed[0] = true;
         let w = detect_degenerate_convergence(&p, None, None);
         assert!(w.is_empty(), "fixed params should not be flagged, got: {:?}", w);
+    }
+}
+
+#[cfg(test)]
+mod multi_start_tests {
+    use super::perturb_initial_values;
+    use crate::types::*;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    fn make_params() -> ModelParameters {
+        let omega = OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["ETA_CL".into(), "ETA_V".into()]);
+        ModelParameters {
+            theta: vec![5.0, 50.0, 1.0],
+            theta_names: vec!["TVCL".into(), "TVV".into(), "TVQ".into()],
+            theta_lower: vec![0.1, 1.0, 0.01],
+            theta_upper: vec![100.0, 500.0, 10.0],
+            theta_fixed: vec![false, false, false],
+            omega,
+            omega_fixed: vec![false, false],
+            sigma: SigmaVector { values: vec![0.2, 1.0], names: vec!["PROP".into(), "ADD".into()] },
+            sigma_fixed: vec![false, false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn perturbed_theta_stays_within_bounds() {
+        let template = make_params();
+        let mut rng = StdRng::seed_from_u64(42);
+        // 50 perturbations should all stay inside the (slightly shrunk)
+        // declared bounds.
+        for _ in 0..50 {
+            let p = perturb_initial_values(&template, &mut rng);
+            for i in 0..p.theta.len() {
+                assert!(
+                    p.theta[i] >= template.theta_lower[i] && p.theta[i] <= template.theta_upper[i],
+                    "theta {} = {} out of bounds [{}, {}]",
+                    template.theta_names[i],
+                    p.theta[i],
+                    template.theta_lower[i],
+                    template.theta_upper[i],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perturbed_theta_actually_moves() {
+        // Perturbation must produce values that differ from the initial
+        // — at least with high probability across many draws.
+        let template = make_params();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut moved = 0;
+        for _ in 0..20 {
+            let p = perturb_initial_values(&template, &mut rng);
+            if (p.theta[0] - template.theta[0]).abs() > 0.01 * template.theta[0] {
+                moved += 1;
+            }
+        }
+        assert!(moved >= 18, "perturbation should move theta in most draws, only {} of 20 moved", moved);
+    }
+
+    #[test]
+    fn fixed_theta_preserved_under_perturbation() {
+        let mut template = make_params();
+        template.theta_fixed[1] = true; // Fix TVV
+        let mut rng = StdRng::seed_from_u64(123);
+        for _ in 0..10 {
+            let p = perturb_initial_values(&template, &mut rng);
+            assert_eq!(
+                p.theta[1], template.theta[1],
+                "fixed theta TVV must be preserved under perturbation",
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_omega_preserved_under_perturbation() {
+        let mut template = make_params();
+        template.omega_fixed[0] = true; // Fix ETA_CL variance
+        let mut rng = StdRng::seed_from_u64(999);
+        for _ in 0..10 {
+            let p = perturb_initial_values(&template, &mut rng);
+            assert_eq!(
+                p.omega.matrix[(0, 0)],
+                template.omega.matrix[(0, 0)],
+                "fixed omega variance must be preserved under perturbation",
+            );
+        }
+    }
+
+    #[test]
+    fn perturbation_is_deterministic_with_seed() {
+        // Same seed → same perturbation (used for reproducible runs).
+        let template = make_params();
+        let mut rng_a = StdRng::seed_from_u64(7);
+        let mut rng_b = StdRng::seed_from_u64(7);
+        let pa = perturb_initial_values(&template, &mut rng_a);
+        let pb = perturb_initial_values(&template, &mut rng_b);
+        assert_eq!(pa.theta, pb.theta);
+        for i in 0..pa.omega.matrix.nrows() {
+            assert_eq!(pa.omega.matrix[(i, i)], pb.omega.matrix[(i, i)]);
+        }
+        assert_eq!(pa.sigma.values, pb.sigma.values);
     }
 }

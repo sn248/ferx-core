@@ -738,7 +738,7 @@ fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>
     eigenvalues.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let min_ev = eigenvalues.last().copied().unwrap_or(0.0);
     let max_ev = eigenvalues.first().copied().unwrap_or(0.0);
-    let condition_number = if min_ev > 0.0 { max_ev / min_ev } else { f64::INFINITY };
+    let condition_number = if min_ev > 1e-10 { max_ev / min_ev } else { f64::INFINITY };
     (Some(eigenvalues), Some(condition_number))
 }
 
@@ -1764,6 +1764,24 @@ mod tests_cov_diagnostics {
         );
         let ev = ev.expect("eigenvalues must be Some");
         assert!(ev.last().copied().unwrap_or(1.0) <= 0.0, "min eigenvalue must be ≤ 0");
+    }
+
+    #[test]
+    fn test_cov_diagnostics_inf_condition_number_for_near_zero_eigenvalue() {
+        // Simulate a floating-point near-zero negative eigenvalue (e.g. -1e-15)
+        // that a well-conditioned matrix could produce due to numerical noise.
+        // The tolerance guard (> 1e-10) must treat this as singular → INFINITY.
+        let mut m = DMatrix::<f64>::zeros(2, 2);
+        m[(0, 0)] = 1.0;
+        m[(0, 1)] = 1.0 - 1e-15; // cor ≈ 1 → min eigenvalue ≈ 0 (or tiny negative)
+        m[(1, 0)] = 1.0 - 1e-15;
+        m[(1, 1)] = 1.0;
+        let (_, cn) = cov_diagnostics(Some(&m));
+        let cn = cn.expect("condition_number must be Some");
+        assert!(
+            cn.is_infinite(),
+            "condition_number must be Inf for near-singular matrix (min_ev ≤ 1e-10), got {cn}"
+        );
     }
 
     #[test]

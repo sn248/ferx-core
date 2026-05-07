@@ -323,11 +323,9 @@ fn fit_inner(
     // Guard: SAEM does not support IOV (kappas are not sampled in the SAEM
     // stochastic approximation loop).  Fail early with a clear message.
     if model.n_kappa > 0 && chain.iter().any(|&m| m == EstimationMethod::Saem) {
-        return Err(
-            "method = saem does not support IOV (n_kappa > 0). \
+        return Err("method = saem does not support IOV (n_kappa > 0). \
              Use method = foce or method = focei for models with kappa declarations."
-                .to_string(),
-        );
+            .to_string());
     }
 
     // Guard: the trust-region outer optimizer does not yet thread kappas through
@@ -744,7 +742,11 @@ fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>
     eigenvalues.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let min_ev = eigenvalues.last().copied().unwrap_or(0.0);
     let max_ev = eigenvalues.first().copied().unwrap_or(0.0);
-    let condition_number = if min_ev > 1e-10 { max_ev / min_ev } else { f64::INFINITY };
+    let condition_number = if min_ev > 1e-10 {
+        max_ev / min_ev
+    } else {
+        f64::INFINITY
+    };
     (Some(eigenvalues), Some(condition_number))
 }
 
@@ -776,8 +778,11 @@ fn compute_subject_results(
                 let occ_groups = split_obs_by_occasion(subject);
                 let mut ipreds = vec![0.0; subject.obs_times.len()];
                 for (k, (_, obs_indices)) in occ_groups.iter().enumerate() {
-                    let kap: &[f64] =
-                        if k < kappas.len() { kappas[k].as_slice() } else { &[] };
+                    let kap: &[f64] = if k < kappas.len() {
+                        kappas[k].as_slice()
+                    } else {
+                        &[]
+                    };
                     let combined: Vec<f64> =
                         eta.iter().copied().chain(kap.iter().copied()).collect();
                     let pk = (model.pk_param_fn)(&params.theta, &combined, &subject.covariates);
@@ -795,8 +800,7 @@ fn compute_subject_results(
 
             // Population predictions: f(eta = 0, kappa = 0).
             let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
-            let pk_params_pop =
-                (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
+            let pk_params_pop = (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
             let pred = model_preds(model, subject, &pk_params_pop);
 
             // IWRES (NaN on BLOQ rows — see compute_cwres for CWRES handling).
@@ -885,8 +889,7 @@ pub(crate) fn compute_eta_shrinkage(subjects: &[SubjectResult], omega: &DMatrix<
             let omega_sd = omega_var.sqrt();
             let vals: Vec<f64> = subjects.iter().map(|s| s.eta[k]).collect();
             let mean = vals.iter().sum::<f64>() / n_subj as f64;
-            let var =
-                vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n_subj - 1) as f64;
+            let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n_subj - 1) as f64;
             1.0 - var.sqrt() / omega_sd
         })
         .collect()
@@ -942,7 +945,11 @@ mod tests {
         assert_eq!(sh.len(), 1);
         // SD([1.0, -1.0]) = sqrt(((1-0)^2 + (-1-0)^2) / 1) = sqrt(2) ≈ 1.414
         // shrinkage = 1 - sqrt(2) / sqrt(2) = 0.0
-        assert!((sh[0]).abs() < 1e-10, "expected ~0 shrinkage, got {}", sh[0]);
+        assert!(
+            (sh[0]).abs() < 1e-10,
+            "expected ~0 shrinkage, got {}",
+            sh[0]
+        );
     }
 
     #[test]
@@ -1266,7 +1273,10 @@ mod iov_integration {
             theta_fixed: vec![false; 2],
             omega,
             omega_fixed: vec![false],
-            sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
@@ -1280,7 +1290,7 @@ mod iov_integration {
                 let mut p = PkParams::default();
                 let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
                 p.values[0] = theta[0] * (eta[0] + kappa).exp(); // CL = TVCL * exp(ETA_CL + KAPPA_CL)
-                p.values[1] = theta[1];                           // V
+                p.values[1] = theta[1]; // V
                 p
             }),
             n_theta: 2,
@@ -1335,9 +1345,9 @@ mod iov_integration {
                 obs_cmts: vec![1; 6],
                 covariates: HashMap::new(),
                 dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
                 cens: vec![0; 6],
                 occasions: occasions.clone(),
                 dose_occasions: dose_occ.clone(),
@@ -1350,7 +1360,11 @@ mod iov_integration {
         }
     }
 
-    fn fast_opts(method: EstimationMethod, optimizer: Optimizer, mu_referencing: bool) -> FitOptions {
+    fn fast_opts(
+        method: EstimationMethod,
+        optimizer: Optimizer,
+        mu_referencing: bool,
+    ) -> FitOptions {
         FitOptions {
             method,
             methods: Vec::new(),
@@ -1373,7 +1387,10 @@ mod iov_integration {
         assert!(result.ofv.is_finite(), "OFV must be finite");
         assert!(result.omega_iov.is_some(), "omega_iov must be populated");
         let iov_diag = result.omega_iov.as_ref().unwrap()[(0, 0)];
-        assert!(iov_diag > 0.0, "omega_iov diagonal must be positive, got {iov_diag}");
+        assert!(
+            iov_diag > 0.0,
+            "omega_iov diagonal must be positive, got {iov_diag}"
+        );
         assert_eq!(result.kappa_names, vec!["KAPPA_CL"], "kappa name mismatch");
         assert_eq!(result.ebe_kappas.len(), 4, "expected kappas for 4 subjects");
         for (i, subj_kappas) in result.ebe_kappas.iter().enumerate() {
@@ -1455,7 +1472,8 @@ mod iov_integration {
         let model = make_iov_model();
         let pop = make_iov_population();
         let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, true);
-        let result = fit(&model, &pop, &model.default_params, &opts).expect("fit with mu_referencing should succeed");
+        let result = fit(&model, &pop, &model.default_params, &opts)
+            .expect("fit with mu_referencing should succeed");
         assert_iov_fit_ok(&result);
     }
 
@@ -1464,7 +1482,8 @@ mod iov_integration {
         let model = make_iov_model();
         let pop = make_iov_population();
         let opts = fast_opts(EstimationMethod::FoceI, Optimizer::Bobyqa, true);
-        let result = fit(&model, &pop, &model.default_params, &opts).expect("fit with mu_referencing should succeed");
+        let result = fit(&model, &pop, &model.default_params, &opts)
+            .expect("fit with mu_referencing should succeed");
         assert_iov_fit_ok(&result);
     }
 
@@ -1475,7 +1494,8 @@ mod iov_integration {
         let model = make_iov_model();
         let pop = make_iov_population();
         let opts = fast_opts(EstimationMethod::FoceGn, Optimizer::Bobyqa, false);
-        let result = fit(&model, &pop, &model.default_params, &opts).expect("GN fit should succeed");
+        let result =
+            fit(&model, &pop, &model.default_params, &opts).expect("GN fit should succeed");
         assert_iov_fit_ok(&result);
     }
 
@@ -1484,7 +1504,8 @@ mod iov_integration {
         let model = make_iov_model();
         let pop = make_iov_population();
         let opts = fast_opts(EstimationMethod::FoceGnHybrid, Optimizer::Bobyqa, false);
-        let result = fit(&model, &pop, &model.default_params, &opts).expect("GN hybrid fit should succeed");
+        let result =
+            fit(&model, &pop, &model.default_params, &opts).expect("GN hybrid fit should succeed");
         assert_iov_fit_ok(&result);
     }
 
@@ -1514,7 +1535,10 @@ mod iov_integration {
         let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
         opts.methods = vec![EstimationMethod::Saem, EstimationMethod::Foce];
         let result = fit(&model, &pop, &model.default_params, &opts);
-        assert!(result.is_err(), "SAEM in methods chain with IOV must return an error");
+        assert!(
+            result.is_err(),
+            "SAEM in methods chain with IOV must return an error"
+        );
         let msg = result.unwrap_err();
         assert!(
             msg.contains("saem") && msg.contains("IOV"),
@@ -1532,7 +1556,10 @@ mod iov_integration {
         let pop = make_iov_population();
         let opts = fast_opts(EstimationMethod::Foce, Optimizer::TrustRegion, false);
         let result = fit(&model, &pop, &model.default_params, &opts);
-        assert!(result.is_err(), "trust_region with IOV must return an error");
+        assert!(
+            result.is_err(),
+            "trust_region with IOV must return an error"
+        );
         let msg = result.unwrap_err();
         assert!(
             msg.contains("trust_region") && msg.contains("IOV"),
@@ -1560,7 +1587,10 @@ mod extract_se_tests {
             theta_fixed: vec![false],
             omega,
             omega_fixed: vec![false],
-            sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
             sigma_fixed: vec![false],
             omega_iov,
             kappa_fixed,
@@ -1582,7 +1612,8 @@ mod extract_se_tests {
         mat[(1, 1)] = 0.09;
         mat[(2, 2)] = 0.16;
         let _chol = mat.clone().cholesky().unwrap().l();
-        let omega = OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into(), "E3".into()], false);
+        let omega =
+            OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into(), "E3".into()], false);
         let template = ModelParameters {
             theta: vec![5.0],
             theta_names: vec!["TVCL".into()],
@@ -1591,7 +1622,10 @@ mod extract_se_tests {
             theta_fixed: vec![false],
             omega,
             omega_fixed: vec![false; 3],
-            sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: vec![],
@@ -1619,10 +1653,7 @@ mod extract_se_tests {
     /// Diagonal omega path is unaffected by the fix; this guards the simple case.
     #[test]
     fn test_se_omega_diagonal_unchanged() {
-        let omega = OmegaMatrix::from_diagonal(
-            &[0.04, 0.09],
-            vec!["E1".into(), "E2".into()],
-        );
+        let omega = OmegaMatrix::from_diagonal(&[0.04, 0.09], vec!["E1".into(), "E2".into()]);
         let template = ModelParameters {
             theta: vec![5.0],
             theta_names: vec!["TVCL".into()],
@@ -1631,7 +1662,10 @@ mod extract_se_tests {
             theta_fixed: vec![false],
             omega,
             omega_fixed: vec![false; 2],
-            sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: vec![],
@@ -1651,10 +1685,8 @@ mod extract_se_tests {
     /// returned se_kappa[i] equals 2 * variance_i for diagonal IOV.
     #[test]
     fn test_se_kappa_diagonal_uses_correct_index() {
-        let iov = OmegaMatrix::from_diagonal(
-            &[0.04, 0.09],
-            vec!["KAPPA_CL".into(), "KAPPA_V".into()],
-        );
+        let iov =
+            OmegaMatrix::from_diagonal(&[0.04, 0.09], vec!["KAPPA_CL".into(), "KAPPA_V".into()]);
         let template = make_template(Some(iov), vec![false, false]);
         // Packed layout: [theta, omega(1), sigma, kappa_1, kappa_2] → 5 entries.
         // Identity cov means se_packed = [1, 1, 1, 1, 1].
@@ -1751,7 +1783,10 @@ mod tests_cov_diagnostics {
         let ev = ev.expect("eigenvalues must be Some");
         let cn = cn.expect("condition_number must be Some");
         assert_eq!(ev.len(), 2, "must have 2 eigenvalues (one per free param)");
-        assert!(cn.is_finite(), "condition_number must be finite for non-singular subblock");
+        assert!(
+            cn.is_finite(),
+            "condition_number must be finite for non-singular subblock"
+        );
         assert!(cn > 0.0);
         // Eigenvalues must be sorted descending
         assert!(ev[0] >= ev[1]);
@@ -1774,7 +1809,10 @@ mod tests_cov_diagnostics {
             "condition_number must be Inf when min eigenvalue ≤ 0, got {cn}"
         );
         let ev = ev.expect("eigenvalues must be Some");
-        assert!(ev.last().copied().unwrap_or(1.0) <= 0.0, "min eigenvalue must be ≤ 0");
+        assert!(
+            ev.last().copied().unwrap_or(1.0) <= 0.0,
+            "min eigenvalue must be ≤ 0"
+        );
     }
 
     #[test]
@@ -1805,6 +1843,9 @@ mod tests_cov_diagnostics {
         for &e in &ev {
             assert!((e - 1.0).abs() < 1e-12, "eigenvalue must be 1.0, got {e}");
         }
-        assert!((cn - 1.0).abs() < 1e-12, "condition_number must be 1.0, got {cn}");
+        assert!(
+            (cn - 1.0).abs() < 1e-12,
+            "condition_number must be 1.0, got {cn}"
+        );
     }
 }

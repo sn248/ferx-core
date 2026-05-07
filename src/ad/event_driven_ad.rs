@@ -211,12 +211,12 @@ impl FlatEventTv {
 )]
 pub fn individual_nll_event_driven_ad(
     eta: &[f64],
-    tv_per_event: &[f64],         // n_events * n_tv (row-major)
+    tv_per_event: &[f64], // n_events * n_tv (row-major)
     omega_inv_flat: &[f64],
     log_det_omega: f64,
     sigma_values: &[f64],
     event_times: &[f64],
-    event_kinds: &[f64],          // 0=dose, 1=obs
+    event_kinds: &[f64], // 0=dose, 1=obs
     event_orig_idx_f64: &[f64],
     dose_times: &[f64],
     dose_amts: &[f64],
@@ -345,7 +345,11 @@ pub fn individual_nll_event_driven_ad(
         // their state0 is unchanged regardless of dose_amts/dose_rates
         // values. Const inputs throughout.
         let is_dose = if kind < 0.5 { 1.0 } else { 0.0 };
-        let is_bolus = if dose_rates[dose_idx] == 0.0 { 1.0 } else { 0.0 };
+        let is_bolus = if dose_rates[dose_idx] == 0.0 {
+            1.0
+        } else {
+            0.0
+        };
         state0 += is_dose * is_bolus * dose_amts[dose_idx];
 
         // ── Observation branch. is_obs=0 for dose and pk-only events.
@@ -443,7 +447,15 @@ fn propagate_state_ad(
     if pk_model_id == 0 || pk_model_id == 2 {
         // 1-cpt IV bolus / infusion: state = [central].
         let s0 = propagate_one_cpt_ad(
-            state0, t_from, t_to, cl, v, dose_times, dose_rates, dose_durations, n_doses,
+            state0,
+            t_from,
+            t_to,
+            cl,
+            v,
+            dose_times,
+            dose_rates,
+            dose_durations,
+            n_doses,
         );
         (s0, state1, state2, state3)
     } else if pk_model_id == 1 {
@@ -453,8 +465,19 @@ fn propagate_state_ad(
     } else if pk_model_id == 3 || pk_model_id == 5 {
         // 2-cpt IV bolus / infusion: state = [central, periph].
         let (s0, s1) = propagate_two_cpt_ad(
-            state0, state1, t_from, t_to, cl, v, q, v2, dose_times, dose_rates, dose_durations,
-            dose_cmts_f64, n_doses,
+            state0,
+            state1,
+            t_from,
+            t_to,
+            cl,
+            v,
+            q,
+            v2,
+            dose_times,
+            dose_rates,
+            dose_durations,
+            dose_cmts_f64,
+            n_doses,
         );
         (s0, s1, state2, state3)
     } else if pk_model_id == 4 {
@@ -465,8 +488,22 @@ fn propagate_state_ad(
     } else if pk_model_id == 6 || pk_model_id == 8 {
         // 3-cpt IV bolus / infusion: state = [central, periph1, periph2].
         let (s0, s1, s2) = propagate_three_cpt_ad(
-            state0, state1, state2, t_from, t_to, cl, v, q, v2, q3, v3, dose_times, dose_rates,
-            dose_durations, dose_cmts_f64, n_doses,
+            state0,
+            state1,
+            state2,
+            t_from,
+            t_to,
+            cl,
+            v,
+            q,
+            v2,
+            q3,
+            v3,
+            dose_times,
+            dose_rates,
+            dose_durations,
+            dose_cmts_f64,
+            n_doses,
         );
         (s0, s1, s2, state3)
     } else if pk_model_id == 7 {
@@ -515,8 +552,7 @@ fn propagate_one_cpt_ad(
         let tau_total_raw = t_to - p_start;
         let diff = tau_total_raw - tau_to;
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
-        let contribution =
-            (dose_rates[d] / ke) * ((-ke * tau_to).exp() - (-ke * tau_total).exp());
+        let contribution = (dose_rates[d] / ke) * ((-ke * tau_to).exp() - (-ke * tau_total).exp());
         s0 += contribution;
     }
     s0
@@ -605,8 +641,8 @@ fn propagate_two_cpt_ad(
         let e_b_to = (-beta * tau_to).exp();
         let e_b_tot = (-beta * tau_total).exp();
 
-        let a1_contrib = c1_ss * (k21 - alpha) * (e_a_to - e_a_tot)
-            + c2_ss * (k21 - beta) * (e_b_to - e_b_tot);
+        let a1_contrib =
+            c1_ss * (k21 - alpha) * (e_a_to - e_a_tot) + c2_ss * (k21 - beta) * (e_b_to - e_b_tot);
         let a2_contrib = k12 * (c1_ss * (e_a_to - e_a_tot) + c2_ss * (e_b_to - e_b_tot));
 
         s0 += a1_contrib;
@@ -646,7 +682,12 @@ fn propagate_one_cpt_oral_ad(
     // from zero. Worst-case bias is O(eps) — acceptable since the
     // exact L'Hôpital limit is the analytic continuation of the same
     // formula and any sane optimizer steers away from ka = ke anyway.
-    let denom = (ke - ka_safe) + if (ke - ka_safe).abs() < 1e-9 { 1e-9 } else { 0.0 };
+    let denom = (ke - ka_safe)
+        + if (ke - ka_safe).abs() < 1e-9 {
+            1e-9
+        } else {
+            0.0
+        };
 
     let s0 = state0 * e_ka;
     let s1 = state1 * e_ke + (ka_safe * state0 / denom) * (e_ka - e_ke);
@@ -717,7 +758,14 @@ fn propagate_two_cpt_oral_ad(
 
 /// 3-cpt macro rates (α > β > γ), trigonometric (Vieta) method. AD-safe
 /// — same shape as `ad_gradients::macro_rates_three_cpt_ad`.
-fn macro_rates_three_ad(cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64) -> (f64, f64, f64, f64, f64) {
+fn macro_rates_three_ad(
+    cl: f64,
+    v1: f64,
+    q2: f64,
+    v2: f64,
+    q3: f64,
+    v3: f64,
+) -> (f64, f64, f64, f64, f64) {
     let v1_safe = v1.abs() + 1e-30;
     let cl_safe = cl.abs() + 1e-30;
     let q2_safe = q2.abs() + 1e-30;
@@ -889,16 +937,29 @@ fn propagate_three_cpt_ad(
             )
         } else {
             // Default = channel 1 (central).
-            (r * v1_safe / cl_safe, r * v2_safe / cl_safe, r * v3_safe / cl_safe)
+            (
+                r * v1_safe / cl_safe,
+                r * v2_safe / cl_safe,
+                r * v3_safe / cl_safe,
+            )
         };
 
         // Mode contribution at τ_to (`_to`) and τ_total (`_tot`) — subtract.
-        let (ca_to, p1a_to, p2a_to) = three_cpt_mode_ad(alpha, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
-        let (cb_to, p1b_to, p2b_to) = three_cpt_mode_ad(beta, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
-        let (cg_to, p1g_to, p2g_to) = three_cpt_mode_ad(gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
-        let (ca_tot, p1a_tot, p2a_tot) = three_cpt_mode_ad(alpha, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total);
-        let (cb_tot, p1b_tot, p2b_tot) = three_cpt_mode_ad(beta, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total);
-        let (cg_tot, p1g_tot, p2g_tot) = three_cpt_mode_ad(gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total);
+        let (ca_to, p1a_to, p2a_to) =
+            three_cpt_mode_ad(alpha, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
+        let (cb_to, p1b_to, p2b_to) =
+            three_cpt_mode_ad(beta, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
+        let (cg_to, p1g_to, p2g_to) =
+            three_cpt_mode_ad(gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
+        let (ca_tot, p1a_tot, p2a_tot) = three_cpt_mode_ad(
+            alpha, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total,
+        );
+        let (cb_tot, p1b_tot, p2b_tot) = three_cpt_mode_ad(
+            beta, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total,
+        );
+        let (cg_tot, p1g_tot, p2g_tot) = three_cpt_mode_ad(
+            gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total,
+        );
 
         s0 += (ca_to - ca_tot) + (cb_to - cb_tot) + (cg_to - cg_tot);
         s1 += (p1a_to - p1a_tot) + (p1b_to - p1b_tot) + (p1g_to - p1g_tot);
@@ -945,7 +1006,12 @@ fn propagate_three_cpt_oral_ad(
     let d21 = k21 - ka_safe;
     let d31 = k31 - ka_safe;
     let denom_depot = (ka_safe - alpha) * (ka_safe - beta) * (ka_safe - gamma);
-    let denom_safe = denom_depot + if denom_depot.abs() < 1e-30 { 1e-30 } else { 0.0 };
+    let denom_safe = denom_depot
+        + if denom_depot.abs() < 1e-30 {
+            1e-30
+        } else {
+            0.0
+        };
     let scale = -ka_safe * state0 / denom_safe;
     let cap_a = scale * d21 * d31;
     let cap_b = scale * k12 * d31;
@@ -1077,8 +1143,16 @@ pub fn compute_nll_gradient_event_driven_ad(
     // Pad zero-length arrays so the AD kernel's masked-but-still-evaluated
     // index loads stay in-bounds. The mask multiplies the read by 0 so
     // the value doesn't matter, only the address being valid.
-    let observations_padded: &[f64] = if observations.is_empty() { &[0.0] } else { observations };
-    let cens_padded: &[f64] = if cens_f64.is_empty() { &[0.0] } else { cens_f64 };
+    let observations_padded: &[f64] = if observations.is_empty() {
+        &[0.0]
+    } else {
+        observations
+    };
+    let cens_padded: &[f64] = if cens_f64.is_empty() {
+        &[0.0]
+    } else {
+        cens_f64
+    };
     let dose_times_padded: &[f64] = if event_data.dose_times.is_empty() {
         &[0.0]
     } else {

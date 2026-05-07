@@ -73,7 +73,15 @@ pub fn individual_nll(
     // Allocate-on-each-call wrapper — see `individual_nll_into` for
     // the scratch-aware version used by SAEM's MH loop.
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-    individual_nll_into(model, subject, theta, eta, omega, sigma_values, &mut scratch)
+    individual_nll_into(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        &mut scratch,
+    )
 }
 
 /// Same as [`individual_nll`] but uses a caller-owned scratch buffer.
@@ -91,7 +99,14 @@ pub fn individual_nll_into(
     scratch: &mut pk::EventPkParams,
 ) -> f64 {
     individual_nll_into_with_schedule(
-        model, subject, theta, eta, omega, sigma_values, scratch, None,
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        scratch,
+        None,
     )
 }
 
@@ -399,7 +414,14 @@ pub fn foce_subject_nll_iov(
 ) -> f64 {
     if kappas.is_empty() {
         return foce_subject_nll(
-            model, subject, theta, eta_hat, h_matrix, omega_bsv, sigma_values, interaction,
+            model,
+            subject,
+            theta,
+            eta_hat,
+            h_matrix,
+            omega_bsv,
+            sigma_values,
+            interaction,
         );
     }
 
@@ -408,7 +430,11 @@ pub fn foce_subject_nll_iov(
     let n_obs = subject.obs_times.len();
     let mut ipreds = vec![0.0_f64; n_obs];
     for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate() {
-        let kap: &[f64] = if k < kappas.len() { kappas[k].as_slice() } else { &[] };
+        let kap: &[f64] = if k < kappas.len() {
+            kappas[k].as_slice()
+        } else {
+            &[]
+        };
         let combined: Vec<f64> = eta_hat.iter().copied().chain(kap.iter().copied()).collect();
         let all_preds = model_predictions(model, subject, theta, &combined);
         for &j in obs_indices {
@@ -419,13 +445,25 @@ pub fn foce_subject_nll_iov(
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
     let foce_term = if interaction || m3_active {
         foce_subject_nll_interaction(
-            subject, &ipreds, eta_hat, h_matrix, omega_bsv, sigma_values,
-            model.error_model, model.bloq_method,
+            subject,
+            &ipreds,
+            eta_hat,
+            h_matrix,
+            omega_bsv,
+            sigma_values,
+            model.error_model,
+            model.bloq_method,
         )
     } else {
         foce_subject_nll_standard(
-            subject, &ipreds, eta_hat, h_matrix, omega_bsv, sigma_values,
-            model.error_model, model.bloq_method,
+            subject,
+            &ipreds,
+            eta_hat,
+            h_matrix,
+            omega_bsv,
+            sigma_values,
+            model.error_model,
+            model.bloq_method,
         )
     };
 
@@ -470,8 +508,16 @@ pub fn foce_population_nll_iov(
                 &[]
             };
             foce_subject_nll_iov(
-                model, subject, theta, &eta_hats[i], &h_matrices[i],
-                omega_bsv, sigma_values, interaction, kappas, omega_iov,
+                model,
+                subject,
+                theta,
+                &eta_hats[i],
+                &h_matrices[i],
+                omega_bsv,
+                sigma_values,
+                interaction,
+                kappas,
+                omega_iov,
             )
         })
         .sum::<f64>()
@@ -551,8 +597,7 @@ pub fn compute_cwres(
 /// Returns `Vec<(occ_id, Vec<obs_index>)>` sorted by first appearance of the occasion.
 pub fn split_obs_by_occasion(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
     let mut occ_order: Vec<u32> = Vec::new();
-    let mut occ_map: std::collections::HashMap<u32, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut occ_map: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
     for (j, &occ) in subject.occasions.iter().enumerate() {
         if !occ_map.contains_key(&occ) {
             occ_order.push(occ);
@@ -819,10 +864,22 @@ mod tests {
         // Non-zero kappas add a kappa prior ≥ 0, so IOV NLL ≥ base NLL.
         let kappas = vec![vec![0.1], vec![-0.1]];
         let iov = individual_nll_iov(
-            &model, &subj, &theta, &eta, &kappas, &omega, Some(&omega_iov), &sigma,
+            &model,
+            &subj,
+            &theta,
+            &eta,
+            &kappas,
+            &omega,
+            Some(&omega_iov),
+            &sigma,
         );
         // Kappa prior is positive → IOV NLL should differ from base
-        assert!((iov - base).abs() > 1e-6, "IOV NLL={}, base NLL={}", iov, base);
+        assert!(
+            (iov - base).abs() > 1e-6,
+            "IOV NLL={}, base NLL={}",
+            iov,
+            base
+        );
     }
 
     #[test]
@@ -837,7 +894,7 @@ mod tests {
         assert_eq!(combined[(1, 1)], 0.04);
         assert_eq!(combined[(2, 2)], 0.01); // occ 1 kappa
         assert_eq!(combined[(3, 3)], 0.01); // occ 2 kappa
-        assert_eq!(combined[(0, 2)], 0.0);  // off-block must be zero
+        assert_eq!(combined[(0, 2)], 0.0); // off-block must be zero
     }
 
     /// Regression: FOCEI must produce the same Sheiner–Beal linearised

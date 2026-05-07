@@ -409,7 +409,10 @@ mod tests {
                 theta_fixed: vec![false],
                 omega: OmegaMatrix::from_diagonal(&[], Vec::new()),
                 omega_fixed: Vec::new(),
-                sigma: SigmaVector { values: vec![0.1], names: vec!["EPS".into()] },
+                sigma: SigmaVector {
+                    values: vec![0.1],
+                    names: vec!["EPS".into()],
+                },
                 sigma_fixed: vec![false],
                 omega_iov: None,
                 kappa_fixed: Vec::new(),

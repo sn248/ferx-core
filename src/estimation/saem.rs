@@ -239,7 +239,13 @@ fn theta_sigma_mstep_light(
         }
     };
 
-    let mut opt = nlopt::Nlopt::new(nlopt::Algorithm::Slsqp, n, obj_s, nlopt::Target::Minimize, ());
+    let mut opt = nlopt::Nlopt::new(
+        nlopt::Algorithm::Slsqp,
+        n,
+        obj_s,
+        nlopt::Target::Minimize,
+        (),
+    );
     opt.set_lower_bounds(&lower_s).unwrap();
     opt.set_upper_bounds(&upper_s).unwrap();
     opt.set_maxeval(maxiter * (n as u32 + 1)).unwrap();
@@ -269,9 +275,7 @@ fn obs_nll_single_into(
     pk_scratch: &mut EventPkParams,
 ) -> f64 {
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
-    let preds = crate::pk::compute_predictions_with_tv_into(
-        model, subject, theta, eta, pk_scratch,
-    );
+    let preds = crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
     let mut nll = 0.0;
     for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let f = f.max(1e-12);
@@ -500,29 +504,32 @@ pub fn run_saem(
                 // the scratch was allocated per subject per outer
                 // iter (5937 × N_iter on the cefepime SAEM bench);
                 // with it, n_workers × N_iter ≈ 10 × N_iter.
-                .map_init(EventPkParams::default, |pk_scratch, (i, ((eta, &nll), &scale))| {
-                    let subject = &population.subjects[i];
-                    let mut rng = StdRng::seed_from_u64(
-                        master_seed
-                            .wrapping_add(k as u64 * 100_000)
-                            .wrapping_add(i as u64),
-                    );
-                    let mut eta_work = eta.clone();
-                    let (n_acc, nll_new) = mh_steps(
-                        &mut eta_work,
-                        nll,
-                        subject,
-                        model,
-                        theta_ref,
-                        omega_ref,
-                        sigma_ref,
-                        scale,
-                        &mut rng,
-                        n_mh_steps,
-                        pk_scratch,
-                    );
-                    (eta_work, nll_new, n_acc)
-                })
+                .map_init(
+                    EventPkParams::default,
+                    |pk_scratch, (i, ((eta, &nll), &scale))| {
+                        let subject = &population.subjects[i];
+                        let mut rng = StdRng::seed_from_u64(
+                            master_seed
+                                .wrapping_add(k as u64 * 100_000)
+                                .wrapping_add(i as u64),
+                        );
+                        let mut eta_work = eta.clone();
+                        let (n_acc, nll_new) = mh_steps(
+                            &mut eta_work,
+                            nll,
+                            subject,
+                            model,
+                            theta_ref,
+                            omega_ref,
+                            sigma_ref,
+                            scale,
+                            &mut rng,
+                            n_mh_steps,
+                            pk_scratch,
+                        );
+                        (eta_work, nll_new, n_acc)
+                    },
+                )
                 .collect();
 
             for (i, (eta_new, nll_new, n_acc)) in results.into_iter().enumerate() {
@@ -600,11 +607,15 @@ pub fn run_saem(
                 let mut temp_theta_upper = log_theta_upper.clone();
                 let mut n_pinned: u64 = 0;
                 for &(theta_idx, eta_idx) in &mu_ref_pairs {
-                    if init_params.theta_fixed.get(theta_idx).copied().unwrap_or(false) {
+                    if init_params
+                        .theta_fixed
+                        .get(theta_idx)
+                        .copied()
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
-                    let mean_eta: f64 =
-                        state.etas.iter().map(|e| e[eta_idx]).sum::<f64>() / n_subj;
+                    let mean_eta: f64 = state.etas.iter().map(|e| e[eta_idx]).sum::<f64>() / n_subj;
                     let log_theta_before = log_theta[theta_idx];
                     log_theta[theta_idx] = (log_theta_before + gamma * mean_eta)
                         .clamp(log_theta_lower[theta_idx], log_theta_upper[theta_idx]);
@@ -783,7 +794,16 @@ pub fn run_saem(
     );
 
     // ---- Final OFV via FOCE approximation (for AIC/BIC comparability) ----
-    let ofv = 2.0 * pop_nll(model, population, &final_params, &eta_hats, &h_matrices, &final_kappas, options.interaction);
+    let ofv = 2.0
+        * pop_nll(
+            model,
+            population,
+            &final_params,
+            &eta_hats,
+            &h_matrices,
+            &final_kappas,
+            options.interaction,
+        );
 
     // ---- Covariance step ----
     let mut warnings = Vec::new();
@@ -903,11 +923,7 @@ mod tests {
     #[test]
     fn get_mu_ref_pairs_skips_orphaned_theta() {
         // mu_ref points at a theta name that doesn't exist — silently skipped.
-        let m = model_with_mu_refs(
-            &["CL"],
-            &["ETA_CL"],
-            &[("ETA_CL", "MISSING", true)],
-        );
+        let m = model_with_mu_refs(&["CL"], &["ETA_CL"], &[("ETA_CL", "MISSING", true)]);
         assert!(get_mu_ref_pairs(&m).is_empty());
     }
 
@@ -974,8 +990,8 @@ mod tests {
     fn mh_steps_random_walk_uses_current_eta_not_mu_k() {
         use crate::stats::likelihood::individual_nll;
         use crate::types::{DoseEvent, SigmaVector};
-        use rand::SeedableRng;
         use rand::rngs::StdRng;
+        use rand::SeedableRng;
         use std::collections::HashMap;
 
         let model = analytical_model(GradientMethod::Auto);
@@ -995,7 +1011,10 @@ mod tests {
             dose_occasions: vec![],
         };
         let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]);
-        let sigma = SigmaVector { values: vec![1.0], names: vec!["PROP".into()] };
+        let sigma = SigmaVector {
+            values: vec![1.0],
+            names: vec!["PROP".into()],
+        };
         let theta = vec![1.0]; // mu_k = log(1) = 0
         let mut eta = vec![5.0_f64]; // far from mu_k
         let nll_start = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma.values);
@@ -1033,13 +1052,7 @@ mod tests {
     fn closed_form_mu_ref_mstep_is_bounded_and_signed_correctly() {
         // Simulate post-MH state: 5 subjects, eta_mean = +0.4 (population CL
         // is higher than current TVCL), gamma = 1.0 (exploration step).
-        let etas: Vec<Vec<f64>> = vec![
-            vec![0.5],
-            vec![0.3],
-            vec![0.4],
-            vec![0.6],
-            vec![0.2],
-        ];
+        let etas: Vec<Vec<f64>> = vec![vec![0.5], vec![0.3], vec![0.4], vec![0.6], vec![0.2]];
         let n = etas.len() as f64;
         let mean_eta: f64 = etas.iter().map(|e| e[0]).sum::<f64>() / n;
         assert!((mean_eta - 0.4).abs() < 1e-12);

@@ -228,8 +228,15 @@ pub fn write_foce(
         let phase = s.phase_override.unwrap_or("");
         if let Some(ref mut w) = s.writer {
             w.write_foce_row(
-                iter, method, phase, ofv, grad_norm, step_norm, optimizer,
-                n_ebe_unconverged, n_ebe_fallback,
+                iter,
+                method,
+                phase,
+                ofv,
+                grad_norm,
+                step_norm,
+                optimizer,
+                n_ebe_unconverged,
+                n_ebe_fallback,
             );
         }
     });
@@ -260,8 +267,15 @@ pub fn write_gn(
         // reserved for the FOCEI polish phase and doesn't apply here.
         if let Some(ref mut w) = s.writer {
             w.write_gn_row(
-                iter, method, phase, ofv, lm_lambda, ofv_delta, step_accepted,
-                n_ebe_unconverged, n_ebe_fallback,
+                iter,
+                method,
+                phase,
+                ofv,
+                lm_lambda,
+                ofv_delta,
+                step_accepted,
+                n_ebe_unconverged,
+                n_ebe_fallback,
             );
         }
     });
@@ -305,7 +319,17 @@ mod tests {
     fn test_foce_row_format() {
         let path = format!("/tmp/ferx_trace_foce_{}.csv", std::process::id());
         let mut w = TraceWriter::new(path.clone()).unwrap();
-        w.write_foce_row(1, "foce", "", 100.5, Some(0.25), Some(0.01), "slsqp", None, None);
+        w.write_foce_row(
+            1,
+            "foce",
+            "",
+            100.5,
+            Some(0.25),
+            Some(0.01),
+            "slsqp",
+            None,
+            None,
+        );
         w.flush();
         let contents = read_file(&path);
         let lines: Vec<&str> = contents.lines().collect();
@@ -492,7 +516,17 @@ mod tests {
         // NaN/Inf gradients should be serialised as "NA", not "NaN"/"inf".
         let path = unique_path("nonfinite");
         let mut w = TraceWriter::new(path.clone()).unwrap();
-        w.write_foce_row(1, "foce", "", 1.0, Some(f64::NAN), Some(f64::INFINITY), "bfgs", None, None);
+        w.write_foce_row(
+            1,
+            "foce",
+            "",
+            1.0,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            "bfgs",
+            None,
+            None,
+        );
         w.flush();
         let row = read_file(&path).lines().nth(1).unwrap().to_string();
         let cols: Vec<&str> = row.split(',').collect();

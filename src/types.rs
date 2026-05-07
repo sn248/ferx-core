@@ -215,9 +215,7 @@ impl Subject {
     /// the others — for time-constant covariates this returns the
     /// subject-static map.
     pub fn pk_only_cov(&self, m: usize) -> &HashMap<String, f64> {
-        self.pk_only_covariates
-            .get(m)
-            .unwrap_or(&self.covariates)
+        self.pk_only_covariates.get(m).unwrap_or(&self.covariates)
     }
 }
 

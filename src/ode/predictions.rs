@@ -126,9 +126,11 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
 
 /// ODE-based predictions with per-event PK parameters (time-varying-covariate
 /// aware). Walks the merged dose+obs+pk-only timeline, integrating each
-/// segment with the PK params evaluated at the *segment-start* event — so
-/// a covariate that changes at an event row (dose, obs, or EVID=2)
-/// immediately changes the rate matrix used over the next interval.
+/// segment `[cur_t, t_event]` with the PK params evaluated at `t_event` —
+/// the NONMEM end-of-interval / current-record convention (`$PK` runs at
+/// every record, then ADVAN propagates to it). A covariate that changes
+/// at an event row (dose, obs, or EVID=2) is therefore consumed by the
+/// segment terminating at that record.
 ///
 /// The non-TV `ode_predictions` is preserved as a fast path; this function
 /// is only invoked from the dispatcher when `subject.has_tv_covariates()`.

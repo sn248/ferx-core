@@ -84,14 +84,28 @@ pub(crate) fn pop_nll(
     if model.n_kappa > 0 {
         if let Some(ref iov) = params.omega_iov {
             return foce_population_nll_iov(
-                model, population, &params.theta, eta_hats, h_matrices,
-                kappas, &params.omega, iov, &params.sigma.values, interaction,
+                model,
+                population,
+                &params.theta,
+                eta_hats,
+                h_matrices,
+                kappas,
+                &params.omega,
+                iov,
+                &params.sigma.values,
+                interaction,
             );
         }
     }
     foce_population_nll(
-        model, population, &params.theta, eta_hats, h_matrices,
-        &params.omega, &params.sigma.values, interaction,
+        model,
+        population,
+        &params.theta,
+        eta_hats,
+        h_matrices,
+        &params.omega,
+        &params.sigma.values,
+        interaction,
     )
 }
 
@@ -142,8 +156,13 @@ fn run_global_presearch(
         fn dummy(_x: &[f64], _g: Option<&mut [f64]>, _d: &mut ()) -> f64 {
             0.0
         }
-        let _opt =
-            nlopt::Nlopt::new(nlopt::Algorithm::Crs2Lm, n, dummy, nlopt::Target::Minimize, ());
+        let _opt = nlopt::Nlopt::new(
+            nlopt::Algorithm::Crs2Lm,
+            n,
+            dummy,
+            nlopt::Target::Minimize,
+            (),
+        );
     }));
     if probe.is_err() {
         return Err(
@@ -175,13 +194,25 @@ fn run_global_presearch(
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
         );
-        let nll = pop_nll(model, population, &params, &ehs, &hms, &kappas, options.interaction);
+        let nll = pop_nll(
+            model,
+            population,
+            &params,
+            &ehs,
+            &hms,
+            &kappas,
+            options.interaction,
+        );
         let raw = 2.0 * nll;
         let frac = ebe_stats.n_unconverged as f64 / (n_subj as f64).max(1.0);
         let guarded = raw.is_finite()
             && frac > options.max_unconverged_frac
             && options.max_unconverged_frac >= 0.0;
-        if !raw.is_finite() || guarded { 1e20 } else { raw }
+        if !raw.is_finite() || guarded {
+            1e20
+        } else {
+            raw
+        }
     };
 
     let initial_ofv = eval_at_scaled(x0);
@@ -220,7 +251,15 @@ fn run_global_presearch(
             options.min_obs_for_convergence_check as usize,
         );
 
-        let nll = pop_nll(model, population, &params, &ehs, &hms, &kappas, options.interaction);
+        let nll = pop_nll(
+            model,
+            population,
+            &params,
+            &ehs,
+            &hms,
+            &kappas,
+            options.interaction,
+        );
         let raw_ofv = 2.0 * nll;
 
         let unconverged_frac = ebe_stats.n_unconverged as f64 / (n_subj as f64).max(1.0);
@@ -247,7 +286,10 @@ fn run_global_presearch(
         if ofv < state.best_ofv {
             state.best_ofv = ofv;
             if verbose {
-                eprintln!("Global pre-search eval {:>4}: OFV = {:.6}", state.n_evals, ofv);
+                eprintln!(
+                    "Global pre-search eval {:>4}: OFV = {:.6}",
+                    state.n_evals, ofv
+                );
             }
         }
 
@@ -451,7 +493,15 @@ fn optimize_nlopt(
         );
 
         // Compute OFV with fixed EBEs
-        let nll = pop_nll(model, population, &params, &ehs, &hms, &kappas, options.interaction);
+        let nll = pop_nll(
+            model,
+            population,
+            &params,
+            &ehs,
+            &hms,
+            &kappas,
+            options.interaction,
+        );
         let raw_ofv = 2.0 * nll;
 
         // EBE convergence guard: reject step when too many subjects unconverged.
@@ -495,13 +545,25 @@ fn optimize_nlopt(
             let kappas_ref = &kappas;
             let ofv_fn = |xp: &[f64], eh: &[DVector<f64>], hm: &[DMatrix<f64>]| -> f64 {
                 let p = unpack_params(xp, init_params);
-                2.0 * pop_nll(model, population, &p, eh, hm, kappas_ref, options.interaction)
+                2.0 * pop_nll(
+                    model,
+                    population,
+                    &p,
+                    eh,
+                    hm,
+                    kappas_ref,
+                    options.interaction,
+                )
             };
             // FD gradient in unscaled space; multiply by scale for scaled gradient.
             let grad_vec = gradient_cd(&x, &bounds, &ehs, &hms, &ofv_fn);
             let mut sq = 0.0_f64;
             for i in 0..g.len() {
-                let gi = if grad_vec[i].is_finite() { grad_vec[i] * scale[i] } else { 0.0 };
+                let gi = if grad_vec[i].is_finite() {
+                    grad_vec[i] * scale[i]
+                } else {
+                    0.0
+                };
                 g[i] = gi;
                 sq += gi * gi;
             }
@@ -523,9 +585,17 @@ fn optimize_nlopt(
         // Optimizer trace (step_norm in scaled space)
         if crate::estimation::trace::is_active() {
             let step_norm = {
-                let sq: f64 = xs.iter().zip(&state.prev_x).map(|(a, b)| (a - b).powi(2)).sum();
+                let sq: f64 = xs
+                    .iter()
+                    .zip(&state.prev_x)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum();
                 let n = sq.sqrt();
-                if n > 0.0 { Some(n) } else { None }
+                if n > 0.0 {
+                    Some(n)
+                } else {
+                    None
+                }
             };
             let method_str = match options.method {
                 EstimationMethod::FoceI => "focei",
@@ -533,9 +603,9 @@ fn optimize_nlopt(
             };
             let optimizer_str = match algo {
                 nlopt::Algorithm::Bobyqa => "bobyqa",
-                nlopt::Algorithm::Mma    => "mma",
-                nlopt::Algorithm::Lbfgs  => "nlopt_lbfgs",
-                _                        => "slsqp",
+                nlopt::Algorithm::Mma => "mma",
+                nlopt::Algorithm::Lbfgs => "nlopt_lbfgs",
+                _ => "slsqp",
             };
             crate::estimation::trace::write_foce(
                 state.n_evals,
@@ -642,7 +712,15 @@ fn optimize_nlopt(
                 Some(&mu_k),
                 options.min_obs_for_convergence_check as usize,
             );
-            let nll = pop_nll(model, population, &params, &ehs, &hms, &kappas, options.interaction);
+            let nll = pop_nll(
+                model,
+                population,
+                &params,
+                &ehs,
+                &hms,
+                &kappas,
+                options.interaction,
+            );
             let raw_ofv = 2.0 * nll;
 
             let unconverged_frac2 = ebe_stats2.n_unconverged as f64 / (n_subj as f64).max(1.0);
@@ -681,12 +759,24 @@ fn optimize_nlopt(
                 let kappas_ref = &kappas;
                 let ofv_fn = |xp: &[f64], eh: &[DVector<f64>], hm: &[DMatrix<f64>]| -> f64 {
                     let p = unpack_params(xp, init_params);
-                    2.0 * pop_nll(model, population, &p, eh, hm, kappas_ref, options.interaction)
+                    2.0 * pop_nll(
+                        model,
+                        population,
+                        &p,
+                        eh,
+                        hm,
+                        kappas_ref,
+                        options.interaction,
+                    )
                 };
                 let grad_vec = gradient_cd(&x, &bounds, &ehs, &hms, &ofv_fn);
                 let mut sq = 0.0_f64;
                 for i in 0..g.len() {
-                    let gi = if grad_vec[i].is_finite() { grad_vec[i] * scale[i] } else { 0.0 };
+                    let gi = if grad_vec[i].is_finite() {
+                        grad_vec[i] * scale[i]
+                    } else {
+                        0.0
+                    };
                     g[i] = gi;
                     sq += gi * gi;
                 }
@@ -707,9 +797,17 @@ fn optimize_nlopt(
             // Optimizer trace (SLSQP fallback, step_norm in scaled space)
             if crate::estimation::trace::is_active() {
                 let step_norm = {
-                    let sq: f64 = xs.iter().zip(&state.prev_x).map(|(a, b)| (a - b).powi(2)).sum();
+                    let sq: f64 = xs
+                        .iter()
+                        .zip(&state.prev_x)
+                        .map(|(a, b)| (a - b).powi(2))
+                        .sum();
                     let n = sq.sqrt();
-                    if n > 0.0 { Some(n) } else { None }
+                    if n > 0.0 {
+                        Some(n)
+                    } else {
+                        None
+                    }
                 };
                 let method_str = match options.method {
                     EstimationMethod::FoceI => "focei",
@@ -790,7 +888,12 @@ fn optimize_nlopt(
     );
 
     let final_nll = pop_nll(
-        model, population, &final_params, &final_ehs, &final_hms, &final_kappas,
+        model,
+        population,
+        &final_params,
+        &final_ehs,
+        &final_hms,
+        &final_kappas,
         options.interaction,
     );
     let final_ofv = 2.0 * final_nll;
@@ -877,7 +980,15 @@ fn optimize_bfgs(
                         kappas: &[Vec<DVector<f64>>]|
      -> f64 {
         let params = unpack_params(x, init_params);
-        2.0 * pop_nll(model, population, &params, eta_hats, h_matrices, kappas, options.interaction)
+        2.0 * pop_nll(
+            model,
+            population,
+            &params,
+            eta_hats,
+            h_matrices,
+            kappas,
+            options.interaction,
+        )
     };
 
     let f_only = |x: &[f64], prev_etas: &[DVector<f64>]| -> f64 {
@@ -893,8 +1004,21 @@ fn optimize_bfgs(
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
         );
-        let ofv = 2.0 * pop_nll(model, population, &params, &ehs, &hms, &kappas, options.interaction);
-        if ofv.is_finite() { ofv } else { 1e20 }
+        let ofv = 2.0
+            * pop_nll(
+                model,
+                population,
+                &params,
+                &ehs,
+                &hms,
+                &kappas,
+                options.interaction,
+            );
+        if ofv.is_finite() {
+            ofv
+        } else {
+            1e20
+        }
     };
 
     let fdfg = |x: &[f64],
@@ -913,10 +1037,9 @@ fn optimize_bfgs(
             options.min_obs_for_convergence_check as usize,
         );
         let kappas_ref = &kappas;
-        let ofv_fn_fixed =
-            |xp: &[f64], eh: &[DVector<f64>], hm: &[DMatrix<f64>]| -> f64 {
-                ofv_at_fixed(xp, eh, hm, kappas_ref)
-            };
+        let ofv_fn_fixed = |xp: &[f64], eh: &[DVector<f64>], hm: &[DMatrix<f64>]| -> f64 {
+            ofv_at_fixed(xp, eh, hm, kappas_ref)
+        };
         let ofv = ofv_at_fixed(x, &ehs, &hms, &kappas);
         let g = gradient_cd(x, &bounds, &ehs, &hms, &ofv_fn_fixed);
         let f = if ofv.is_finite() { ofv } else { 1e20 };
@@ -931,7 +1054,10 @@ fn optimize_bfgs(
     };
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
-    let bounds_s = PackedBounds { lower: lower_s, upper: upper_s };
+    let bounds_s = PackedBounds {
+        lower: lower_s,
+        upper: upper_s,
+    };
 
     // Wrappers that operate in scaled space; unscale before calling base closures.
     let fdfg_s = |xs: &[f64],
@@ -1272,7 +1398,15 @@ pub(crate) fn compute_covariance(
     // This matches Julia's foce_population_nll_diff.
     let ofv_fixed = |x: &[f64]| -> f64 {
         let params = unpack_params(x, template);
-        let foce_nll = pop_nll(model, population, &params, eta_hats, h_matrices, kappas, options.interaction);
+        let foce_nll = pop_nll(
+            model,
+            population,
+            &params,
+            eta_hats,
+            h_matrices,
+            kappas,
+            options.interaction,
+        );
 
         // Add explicit Omega prior terms for each subject
         let n_subj = eta_hats.len();

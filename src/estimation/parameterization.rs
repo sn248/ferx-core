@@ -135,7 +135,10 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
                 idx += 1;
                 variances.push(chol_diag * chol_diag);
             }
-            Some(OmegaMatrix::from_diagonal(&variances, iov_tmpl.eta_names.clone()))
+            Some(OmegaMatrix::from_diagonal(
+                &variances,
+                iov_tmpl.eta_names.clone(),
+            ))
         } else {
             let mut l = DMatrix::zeros(n_iov, n_iov);
             for j in 0..n_iov {
@@ -247,7 +250,11 @@ pub fn packed_len(template: &ModelParameters) -> usize {
     let n_sigma = template.sigma.values.len();
     let n_iov = template.omega_iov.as_ref().map_or(0, |m| {
         let d = m.dim();
-        if m.diagonal { d } else { d * (d + 1) / 2 }
+        if m.diagonal {
+            d
+        } else {
+            d * (d + 1) / 2
+        }
     });
     n_theta + n_omega + n_sigma + n_iov
 }
@@ -878,7 +885,7 @@ mod tests {
         assert_relative_eq!(xs[0].abs(), 1.0, epsilon = 1e-12); // 6.9/6.9
         assert_relative_eq!(xs[1].abs(), 1.0, epsilon = 1e-12); // -2.3/2.3
         assert_relative_eq!(xs[2].abs(), 1.0, epsilon = 1e-12); // 1.5/1.5
-        assert_relative_eq!(xs[3], -0.05, epsilon = 1e-12);     // |v|≤0.1 → scale=1
+        assert_relative_eq!(xs[3], -0.05, epsilon = 1e-12); // |v|≤0.1 → scale=1
     }
 
     #[test]
@@ -890,8 +897,7 @@ mod tests {
     }
 
     fn make_iov_template() -> ModelParameters {
-        let omega =
-            OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+        let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
         let omega_iov = OmegaMatrix::from_diagonal(&[0.01], vec!["KAPPA_CL".into()]);
         let sigma = SigmaVector {
             values: vec![0.02],
@@ -992,7 +998,8 @@ mod tests {
         mat[(1, 0)] = 0.002;
         mat[(1, 1)] = 0.005;
         let _chol = mat.clone().cholesky().unwrap().l();
-        let omega_iov = OmegaMatrix::from_matrix(mat, vec!["KAPPA_CL".into(), "KAPPA_V".into()], false);
+        let omega_iov =
+            OmegaMatrix::from_matrix(mat, vec!["KAPPA_CL".into(), "KAPPA_V".into()], false);
         let sigma = SigmaVector {
             values: vec![0.02],
             names: vec!["PROP_ERR".into()],
@@ -1032,7 +1039,11 @@ mod tests {
         assert!(!iov_rec.diagonal);
         for i in 0..2 {
             for j in 0..2 {
-                assert_relative_eq!(iov_orig.matrix[(i, j)], iov_rec.matrix[(i, j)], epsilon = 1e-8);
+                assert_relative_eq!(
+                    iov_orig.matrix[(i, j)],
+                    iov_rec.matrix[(i, j)],
+                    epsilon = 1e-8
+                );
             }
         }
     }
@@ -1046,7 +1057,7 @@ mod tests {
         assert_eq!(mask.len(), packed_len(&template));
         // IOV chol layout (after theta+omega+sigma): L11, L21, L22
         let iov_start = 1 + 1 + 1; // theta + bsv diag + sigma
-        assert!(mask[iov_start]);     // L11 — kappa_fixed[0]=true
+        assert!(mask[iov_start]); // L11 — kappa_fixed[0]=true
         assert!(mask[iov_start + 1]); // L21 — kappa_fixed[0]||kappa_fixed[1]=true
         assert!(!mask[iov_start + 2]); // L22 — kappa_fixed[1]=false
     }
@@ -1058,8 +1069,9 @@ mod tests {
         assert_eq!(bounds.lower.len(), packed_len(&template));
         // IOV chol layout after theta+omega+sigma: L11, L21, L22
         let iov_start = 1 + 1 + 1;
-        assert_relative_eq!(bounds.lower[iov_start], -6.0, epsilon = 1e-12);     // L11 diag
+        assert_relative_eq!(bounds.lower[iov_start], -6.0, epsilon = 1e-12); // L11 diag
         assert_relative_eq!(bounds.lower[iov_start + 1], -10.0, epsilon = 1e-12); // L21 off-diag
-        assert_relative_eq!(bounds.lower[iov_start + 2], -6.0, epsilon = 1e-12); // L22 diag
+        assert_relative_eq!(bounds.lower[iov_start + 2], -6.0, epsilon = 1e-12);
+        // L22 diag
     }
 }

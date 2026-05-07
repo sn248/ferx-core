@@ -140,7 +140,11 @@ pub fn predict_all_event_driven_ad(
         // is_dose=0 for obs (kind=1) and pk-only (kind=2), so their
         // state0 is unchanged regardless of dose_*[dose_idx].
         let is_dose = if kind < 0.5 { 1.0 } else { 0.0 };
-        let is_bolus = if dose_rates[dose_idx] == 0.0 { 1.0 } else { 0.0 };
+        let is_bolus = if dose_rates[dose_idx] == 0.0 {
+            1.0
+        } else {
+            0.0
+        };
         state0 += is_dose * is_bolus * dose_amts[dose_idx];
 
         let central_amt = if pk_model_id == 1 || pk_model_id == 4 || pk_model_id == 7 {
@@ -195,7 +199,15 @@ fn propagate_state_jac(
 ) -> (f64, f64, f64, f64) {
     if pk_model_id == 0 || pk_model_id == 2 {
         let s0 = propagate_one_cpt_jac(
-            state0, t_from, t_to, cl, v, dose_times, dose_rates, dose_durations, n_doses,
+            state0,
+            t_from,
+            t_to,
+            cl,
+            v,
+            dose_times,
+            dose_rates,
+            dose_durations,
+            n_doses,
         );
         (s0, state1, state2, state3)
     } else if pk_model_id == 1 {
@@ -203,8 +215,19 @@ fn propagate_state_jac(
         (s0, s1, state2, state3)
     } else if pk_model_id == 3 || pk_model_id == 5 {
         let (s0, s1) = propagate_two_cpt_jac(
-            state0, state1, t_from, t_to, cl, v, q, v2, dose_times, dose_rates, dose_durations,
-            dose_cmts_f64, n_doses,
+            state0,
+            state1,
+            t_from,
+            t_to,
+            cl,
+            v,
+            q,
+            v2,
+            dose_times,
+            dose_rates,
+            dose_durations,
+            dose_cmts_f64,
+            n_doses,
         );
         (s0, s1, state2, state3)
     } else if pk_model_id == 4 {
@@ -213,8 +236,22 @@ fn propagate_state_jac(
         (s0, s1, s2, state3)
     } else if pk_model_id == 6 || pk_model_id == 8 {
         let (s0, s1, s2) = propagate_three_cpt_jac(
-            state0, state1, state2, t_from, t_to, cl, v, q, v2, q3, v3, dose_times, dose_rates,
-            dose_durations, dose_cmts_f64, n_doses,
+            state0,
+            state1,
+            state2,
+            t_from,
+            t_to,
+            cl,
+            v,
+            q,
+            v2,
+            q3,
+            v3,
+            dose_times,
+            dose_rates,
+            dose_durations,
+            dose_cmts_f64,
+            n_doses,
         );
         (s0, s1, s2, state3)
     } else if pk_model_id == 7 {
@@ -256,8 +293,7 @@ fn propagate_one_cpt_jac(
         let tau_total_raw = t_to - p_start;
         let diff = tau_total_raw - tau_to;
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
-        let contribution =
-            (dose_rates[d] / ke) * ((-ke * tau_to).exp() - (-ke * tau_total).exp());
+        let contribution = (dose_rates[d] / ke) * ((-ke * tau_to).exp() - (-ke * tau_total).exp());
         s0 += contribution;
     }
     s0
@@ -336,8 +372,8 @@ fn propagate_two_cpt_jac(
         let e_b_to = (-beta * tau_to).exp();
         let e_b_tot = (-beta * tau_total).exp();
 
-        let a1_contrib = c1_ss * (k21 - alpha) * (e_a_to - e_a_tot)
-            + c2_ss * (k21 - beta) * (e_b_to - e_b_tot);
+        let a1_contrib =
+            c1_ss * (k21 - alpha) * (e_a_to - e_a_tot) + c2_ss * (k21 - beta) * (e_b_to - e_b_tot);
         let a2_contrib = k12 * (c1_ss * (e_a_to - e_a_tot) + c2_ss * (e_b_to - e_b_tot));
 
         s0 += a1_contrib;
@@ -364,7 +400,12 @@ fn propagate_one_cpt_oral_jac(
     let e_ka = (-ka_safe * dt).exp();
     let e_ke = (-ke * dt).exp();
 
-    let denom = (ke - ka_safe) + if (ke - ka_safe).abs() < 1e-9 { 1e-9 } else { 0.0 };
+    let denom = (ke - ka_safe)
+        + if (ke - ka_safe).abs() < 1e-9 {
+            1e-9
+        } else {
+            0.0
+        };
 
     let s0 = state0 * e_ka;
     let s1 = state1 * e_ke + (ka_safe * state0 / denom) * (e_ka - e_ke);
@@ -426,7 +467,14 @@ fn propagate_two_cpt_oral_jac(
     (new_s0, new_s1, new_s2)
 }
 
-fn macro_rates_three_jac(cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64) -> (f64, f64, f64, f64, f64) {
+fn macro_rates_three_jac(
+    cl: f64,
+    v1: f64,
+    q2: f64,
+    v2: f64,
+    q3: f64,
+    v3: f64,
+) -> (f64, f64, f64, f64, f64) {
     let v1_safe = v1.abs() + 1e-30;
     let cl_safe = cl.abs() + 1e-30;
     let q2_safe = q2.abs() + 1e-30;
@@ -574,15 +622,28 @@ fn propagate_three_cpt_jac(
                 r * (cl_safe + q3_safe) * v3_safe / (cl_safe * q3_safe),
             )
         } else {
-            (r * v1_safe / cl_safe, r * v2_safe / cl_safe, r * v3_safe / cl_safe)
+            (
+                r * v1_safe / cl_safe,
+                r * v2_safe / cl_safe,
+                r * v3_safe / cl_safe,
+            )
         };
 
-        let (ca_to, p1a_to, p2a_to) = three_cpt_mode_jac(alpha, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
-        let (cb_to, p1b_to, p2b_to) = three_cpt_mode_jac(beta, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
-        let (cg_to, p1g_to, p2g_to) = three_cpt_mode_jac(gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
-        let (ca_tot, p1a_tot, p2a_tot) = three_cpt_mode_jac(alpha, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total);
-        let (cb_tot, p1b_tot, p2b_tot) = three_cpt_mode_jac(beta, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total);
-        let (cg_tot, p1g_tot, p2g_tot) = three_cpt_mode_jac(gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total);
+        let (ca_to, p1a_to, p2a_to) =
+            three_cpt_mode_jac(alpha, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
+        let (cb_to, p1b_to, p2b_to) =
+            three_cpt_mode_jac(beta, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
+        let (cg_to, p1g_to, p2g_to) =
+            three_cpt_mode_jac(gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_to);
+        let (ca_tot, p1a_tot, p2a_tot) = three_cpt_mode_jac(
+            alpha, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total,
+        );
+        let (cb_tot, p1b_tot, p2b_tot) = three_cpt_mode_jac(
+            beta, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total,
+        );
+        let (cg_tot, p1g_tot, p2g_tot) = three_cpt_mode_jac(
+            gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total,
+        );
 
         s0 += (ca_to - ca_tot) + (cb_to - cb_tot) + (cg_to - cg_tot);
         s1 += (p1a_to - p1a_tot) + (p1b_to - p1b_tot) + (p1g_to - p1g_tot);
@@ -621,7 +682,12 @@ fn propagate_three_cpt_oral_jac(
     let d21 = k21 - ka_safe;
     let d31 = k31 - ka_safe;
     let denom_depot = (ka_safe - alpha) * (ka_safe - beta) * (ka_safe - gamma);
-    let denom_safe = denom_depot + if denom_depot.abs() < 1e-30 { 1e-30 } else { 0.0 };
+    let denom_safe = denom_depot
+        + if denom_depot.abs() < 1e-30 {
+            1e-30
+        } else {
+            0.0
+        };
     let scale = -ka_safe * state0 / denom_safe;
     let cap_a = scale * d21 * d31;
     let cap_b = scale * k12 * d31;

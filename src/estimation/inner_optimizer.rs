@@ -327,14 +327,14 @@ pub fn find_ebe(
             .as_ref()
             .expect("resolve_gradient_method guarantees tv_fn for AD branches");
         let (tv_adjusted, event_data, tv_per_event) = match grad_method {
-            InnerGradientMethod::AdSingleSnapshot => (
-                Some(tv_fn(&params.theta, &subject.covariates)),
-                None,
-                None,
-            ),
+            InnerGradientMethod::AdSingleSnapshot => {
+                (Some(tv_fn(&params.theta, &subject.covariates)), None, None)
+            }
             InnerGradientMethod::AdEventDriven => (
                 None,
-                Some(crate::ad::event_driven_ad::FlatEventData::from_subject(subject)),
+                Some(crate::ad::event_driven_ad::FlatEventData::from_subject(
+                    subject,
+                )),
                 Some(crate::ad::event_driven_ad::FlatEventTv::from_subject(
                     model,
                     subject,
@@ -616,14 +616,19 @@ fn find_ebe_iov(
         .map(|(p, m)| p - m)
         .collect();
     let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
-        .map(|k| {
-            DVector::from_column_slice(&x[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa])
-        })
+        .map(|k| DVector::from_column_slice(&x[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa]))
         .collect();
 
     // H-matrix: BSV columns only, perturbing eta with kappas fixed at EBE values
     let kappas_slices: Vec<Vec<f64>> = kappas_vec.iter().map(|k| k.as_slice().to_vec()).collect();
-    let h_matrix = compute_jacobian_fd_iov(model, subject, &params.theta, &bsv_eta, &kappas_slices, &occ_groups);
+    let h_matrix = compute_jacobian_fd_iov(
+        model,
+        subject,
+        &params.theta,
+        &bsv_eta,
+        &kappas_slices,
+        &occ_groups,
+    );
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
@@ -1181,8 +1186,10 @@ mod tests {
 #[cfg(test)]
 mod iov_tests {
     use super::*;
-    use crate::types::{BloqMethod, DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkModel,
-                       PkParams, SigmaVector};
+    use crate::types::{
+        BloqMethod, DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkModel, PkParams,
+        SigmaVector,
+    };
     use std::collections::HashMap;
 
     fn make_iov_model() -> CompiledModel {
@@ -1196,7 +1203,10 @@ mod iov_tests {
             theta_fixed: vec![false; 2],
             omega,
             omega_fixed: vec![false],
-            sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
@@ -1290,7 +1300,10 @@ mod iov_tests {
             theta_fixed: vec![false; 2],
             omega,
             omega_fixed: vec![false],
-            sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),

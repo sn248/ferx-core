@@ -14,12 +14,10 @@
 /// This approach mirrors NONMEM's modified Gauss-Newton algorithm and typically
 /// converges in 10-30 iterations vs 100+ for first-order methods.
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::{compute_covariance, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::estimation::outer_optimizer::pop_nll;
-use crate::stats::likelihood::{
-    foce_subject_nll_interaction, foce_subject_nll_standard,
-};
+use crate::stats::likelihood::{foce_subject_nll_interaction, foce_subject_nll_standard};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 
@@ -88,7 +86,16 @@ pub fn run_foce_gn(
         options.min_obs_for_convergence_check as usize,
     );
 
-    let mut ofv = 2.0 * pop_nll(model, population, &params, &eta_hats, &h_matrices, &kappas, options.interaction);
+    let mut ofv = 2.0
+        * pop_nll(
+            model,
+            population,
+            &params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            options.interaction,
+        );
 
     if verbose {
         eprintln!("  GN iter {:>3}: OFV = {:.6}", 0, ofv);
@@ -139,10 +146,8 @@ pub fn run_foce_gn(
         // g_s[i] = g[i] * scale[i],  H_s[i,j] = H[i,j] * scale[i] * scale[j]
         // Solve H_s_lm * delta_s = -g_s, then delta[i] = delta_s[i] * scale[i].
         // With identity scale (scale_params=false) this is a no-op.
-        let grad_s: DVector<f64> = DVector::from_iterator(
-            n_packed,
-            (0..n_packed).map(|i| grad[i] * gn_scale[i]),
-        );
+        let grad_s: DVector<f64> =
+            DVector::from_iterator(n_packed, (0..n_packed).map(|i| grad[i] * gn_scale[i]));
         let mut h_s = DMatrix::zeros(n_packed, n_packed);
         for i in 0..n_packed {
             for j in 0..n_packed {
@@ -171,10 +176,8 @@ pub fn run_foce_gn(
             }
         };
         // Convert step back to real (unscaled) space
-        let delta = DVector::from_iterator(
-            n_packed,
-            (0..n_packed).map(|i| delta_s[i] * gn_scale[i]),
-        );
+        let delta =
+            DVector::from_iterator(n_packed, (0..n_packed).map(|i| delta_s[i] * gn_scale[i]));
 
         // ---- Line search with backtracking ----
         let mut alpha = 1.0;
@@ -204,7 +207,16 @@ pub fn run_foce_gn(
                 options.min_obs_for_convergence_check as usize,
             );
 
-            let ofv_try = 2.0 * pop_nll(model, population, &params_try, &eh, &hm, &kap_new, options.interaction);
+            let ofv_try = 2.0
+                * pop_nll(
+                    model,
+                    population,
+                    &params_try,
+                    &eh,
+                    &hm,
+                    &kap_new,
+                    options.interaction,
+                );
 
             if ofv_try.is_finite() && ofv_try < ofv {
                 ofv_new = ofv_try;
@@ -488,8 +500,21 @@ fn build_gn_system(
         .iter()
         .enumerate()
         .map(|(i, _)| {
-            let kap_i = if i < kappas.len() { kappas[i].as_slice() } else { &[] };
-            subject_nll_at(model, population, i, &params, &eta_hats[i], &h_matrices[i], kap_i, options)
+            let kap_i = if i < kappas.len() {
+                kappas[i].as_slice()
+            } else {
+                &[]
+            };
+            subject_nll_at(
+                model,
+                population,
+                i,
+                &params,
+                &eta_hats[i],
+                &h_matrices[i],
+                kap_i,
+                options,
+            )
         })
         .collect();
 
@@ -522,8 +547,21 @@ fn build_gn_system(
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                let kap_i = if i < kappas.len() { kappas[i].as_slice() } else { &[] };
-                subject_nll_at(model, population, i, &params_plus, &eta_hats[i], &h_matrices[i], kap_i, options)
+                let kap_i = if i < kappas.len() {
+                    kappas[i].as_slice()
+                } else {
+                    &[]
+                };
+                subject_nll_at(
+                    model,
+                    population,
+                    i,
+                    &params_plus,
+                    &eta_hats[i],
+                    &h_matrices[i],
+                    kap_i,
+                    options,
+                )
             })
             .collect();
 
@@ -534,8 +572,21 @@ fn build_gn_system(
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                let kap_i = if i < kappas.len() { kappas[i].as_slice() } else { &[] };
-                subject_nll_at(model, population, i, &params_minus, &eta_hats[i], &h_matrices[i], kap_i, options)
+                let kap_i = if i < kappas.len() {
+                    kappas[i].as_slice()
+                } else {
+                    &[]
+                };
+                subject_nll_at(
+                    model,
+                    population,
+                    i,
+                    &params_minus,
+                    &eta_hats[i],
+                    &h_matrices[i],
+                    kap_i,
+                    options,
+                )
             })
             .collect();
 
@@ -600,8 +651,16 @@ fn subject_nll_at(
     if !kappas.is_empty() {
         if let Some(ref iov) = params.omega_iov {
             return foce_subject_nll_iov(
-                model, subject, &params.theta, eta_hat, h_matrix,
-                &params.omega, &params.sigma.values, options.interaction, kappas, iov,
+                model,
+                subject,
+                &params.theta,
+                eta_hat,
+                h_matrix,
+                &params.omega,
+                &params.sigma.values,
+                options.interaction,
+                kappas,
+                iov,
             );
         }
     }
@@ -613,13 +672,25 @@ fn subject_nll_at(
 
     if options.interaction || m3_active {
         foce_subject_nll_interaction(
-            subject, &ipreds, eta_hat, h_matrix,
-            &params.omega, &params.sigma.values, model.error_model, model.bloq_method,
+            subject,
+            &ipreds,
+            eta_hat,
+            h_matrix,
+            &params.omega,
+            &params.sigma.values,
+            model.error_model,
+            model.bloq_method,
         )
     } else {
         foce_subject_nll_standard(
-            subject, &ipreds, eta_hat, h_matrix,
-            &params.omega, &params.sigma.values, model.error_model, model.bloq_method,
+            subject,
+            &ipreds,
+            eta_hat,
+            h_matrix,
+            &params.omega,
+            &params.sigma.values,
+            model.error_model,
+            model.bloq_method,
         )
     }
 }

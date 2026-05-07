@@ -50,7 +50,7 @@ impl FoceiProblem<'_> {
             &params,
             etas,
             h_mats,
-            &[],  // trust_region doesn't support IOV yet; kappas empty
+            &[], // trust_region doesn't support IOV yet; kappas empty
             self.options.interaction,
         );
         let raw = 2.0 * nll;
@@ -232,7 +232,16 @@ pub fn optimize_trust_region(
         options.min_obs_for_convergence_check as usize,
     );
 
-    let final_ofv = 2.0 * pop_nll(model, population, &final_params, &final_ehs, &final_hms, &final_kappas, options.interaction);
+    let final_ofv = 2.0
+        * pop_nll(
+            model,
+            population,
+            &final_params,
+            &final_ehs,
+            &final_hms,
+            &final_kappas,
+            options.interaction,
+        );
 
     if options.verbose {
         eprintln!("Final OFV = {:.6}", final_ofv);

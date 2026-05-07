@@ -274,7 +274,10 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
     if let Some((ei, ti, prob_scale)) = detect_logit_pattern(expr) {
         if ti < n_theta {
             let (tt, pt) = if prob_scale {
-                (ThetaTransform::LogitProbability, EtaParamType::LogitProbability)
+                (
+                    ThetaTransform::LogitProbability,
+                    EtaParamType::LogitProbability,
+                )
             } else {
                 (ThetaTransform::Logit, EtaParamType::Logit)
             };
@@ -331,18 +334,23 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
 /// `Statement::If` (branches + else_body). Only looks one level deep (nested ifs
 /// are not walked). Returns `None` if any branch body has no assignment for
 /// `param_name` (meaning the parameter is only conditionally defined).
-fn if_branch_exprs<'a>(
-    stmt: &'a Statement,
-    param_name: &str,
-) -> Option<Vec<&'a Expression>> {
-    if let Statement::If { branches, else_body } = stmt {
+fn if_branch_exprs<'a>(stmt: &'a Statement, param_name: &str) -> Option<Vec<&'a Expression>> {
+    if let Statement::If {
+        branches,
+        else_body,
+    } = stmt
+    {
         let mut exprs: Vec<&'a Expression> = Vec::new();
         for (_, body) in branches {
             let found: Vec<_> = body
                 .iter()
                 .filter_map(|s| {
                     if let Statement::Assign(n, e) = s {
-                        if n == param_name { Some(e) } else { None }
+                        if n == param_name {
+                            Some(e)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -358,7 +366,11 @@ fn if_branch_exprs<'a>(
                 .iter()
                 .filter_map(|s| {
                     if let Statement::Assign(n, e) = s {
-                        if n == param_name { Some(e) } else { None }
+                        if n == param_name {
+                            Some(e)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -399,26 +411,24 @@ fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
     if let Expression::UnaryFn(name, inner) = expr {
         if name == "inv_logit" || name == "expit" {
             if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
-                let try_logit_theta_eta =
-                    |a: &Expression, b: &Expression| -> Option<(usize, usize, bool)> {
-                        // Form 1: THETA + ETA  (THETA on logit scale)
-                        if let Some((ei, ti)) = plain_theta_eta(a, b) {
-                            return Some((ei, ti, false));
-                        }
-                        // Form 2: logit(THETA) + ETA  (THETA on probability scale)
-                        if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) =
-                            (a, b)
-                        {
-                            if fn_name == "logit" {
-                                if let Expression::Theta(ti) = inner_arg.as_ref() {
-                                    return Some((*ei, *ti, true));
-                                }
+                let try_logit_theta_eta = |a: &Expression,
+                                           b: &Expression|
+                 -> Option<(usize, usize, bool)> {
+                    // Form 1: THETA + ETA  (THETA on logit scale)
+                    if let Some((ei, ti)) = plain_theta_eta(a, b) {
+                        return Some((ei, ti, false));
+                    }
+                    // Form 2: logit(THETA) + ETA  (THETA on probability scale)
+                    if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) = (a, b) {
+                        if fn_name == "logit" {
+                            if let Expression::Theta(ti) = inner_arg.as_ref() {
+                                return Some((*ei, *ti, true));
                             }
                         }
-                        None
-                    };
-                return try_logit_theta_eta(lhs, rhs)
-                    .or_else(|| try_logit_theta_eta(rhs, lhs));
+                    }
+                    None
+                };
+                return try_logit_theta_eta(lhs, rhs).or_else(|| try_logit_theta_eta(rhs, lhs));
             }
         }
     }
@@ -487,8 +497,7 @@ fn classify_indiv_params(
                             let first = classes[0].as_ref().unwrap();
                             let unanimous = classes.iter().all(|c| {
                                 let c = c.as_ref().unwrap();
-                                c.param_type == first.param_type
-                                    && c.eta_idx == first.eta_idx
+                                c.param_type == first.param_type && c.eta_idx == first.eta_idx
                             });
                             if unanimous {
                                 apply_class(
@@ -556,7 +565,11 @@ fn apply_class(
 /// (one level deep only — nested ifs are not walked).
 fn collect_assigned_names_in_if(stmt: &Statement) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
-    if let Statement::If { branches, else_body } = stmt {
+    if let Statement::If {
+        branches,
+        else_body,
+    } = stmt
+    {
         for (_, body) in branches {
             for s in body {
                 if let Statement::Assign(n, _) = s {
@@ -4079,12 +4092,12 @@ mod tests {
     #[test]
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
-        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-8,
+        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-4,
         //   steihaug_max_iters = 50.
         let opts = FitOptions::default();
         assert_eq!(opts.optimizer, Optimizer::Bobyqa);
         assert_eq!(opts.inner_maxiter, 200);
-        assert!((opts.inner_tol - 1e-8).abs() < 1e-20);
+        assert!((opts.inner_tol - 1e-4).abs() < 1e-20);
         assert_eq!(opts.steihaug_max_iters, 50);
     }
 
@@ -5096,7 +5109,10 @@ if (1 > 0) {
         use crate::types::SigmaType;
         let model = minimal_logit_model();
         // sigma_types is on FitResult, not CompiledModel — verify via ErrorModel::sigma_types().
-        assert_eq!(model.error_model.sigma_types(), vec![SigmaType::Proportional]);
+        assert_eq!(
+            model.error_model.sigma_types(),
+            vec![SigmaType::Proportional]
+        );
     }
 
     // ── Issue 3: if/else classification ─────────────────────────────────────
@@ -5153,6 +5169,10 @@ if (1 > 0) {
             .iter()
             .filter(|i| i.param_type == EtaParamType::Custom)
             .collect();
-        assert_eq!(customs.len(), 2, "both ETAs in the expression should be Custom");
+        assert_eq!(
+            customs.len(),
+            2,
+            "both ETAs in the expression should be Custom"
+        );
     }
 }

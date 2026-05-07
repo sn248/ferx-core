@@ -52,9 +52,33 @@ See [IOV documentation](estimation/iov.md) for full details.
 Any column not in the standard set above is automatically treated as a covariate. Covariate values are:
 
 - **Time-constant**: The first non-missing value for each subject is used
-- **Time-varying**: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied
+- **Time-varying**: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied per event (NONMEM-equivalent: `[individual_parameters]` is re-evaluated at each dose and observation row using that row's covariate values)
 
 Covariate names in the data file are matched case-insensitively to names used in `[individual_parameters]` expressions.
+
+### Time-varying covariate scope
+
+Time-varying covariates are supported for **all** analytical structural models and ODE-defined models:
+
+- 1-compartment IV bolus (`one_cpt_iv_bolus`)
+- 1-compartment infusion (`one_cpt_infusion`)
+- 1-compartment oral (`one_cpt_oral`)
+- 2-compartment IV bolus (`two_cpt_iv_bolus`)
+- 2-compartment infusion (`two_cpt_infusion`)
+- 2-compartment oral (`two_cpt_oral`)
+- 3-compartment IV bolus (`three_cpt_iv_bolus`)
+- 3-compartment infusion (`three_cpt_infusion`)
+- 3-compartment oral (`three_cpt_oral`)
+- All ODE-defined models (via `[odes]`)
+
+For oral models, the bolus dose into compartment 1 is interpreted as the depot (NONMEM ADVAN2/ADVAN4/ADVAN12 convention) and observation read-out reads the central compartment.
+
+The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients *and* an AD-accelerated H-matrix Jacobian (forward-mode), so neither the inner-loop gradient nor the per-iteration Jacobian falls back to finite-differences.
+
+Infusion routing on the event-driven path:
+
+- **IV models**: central infusion (cmt=1) for all 1/2/3-cpt; **peripheral infusion** for 2-cpt (cmt=2) and 3-cpt (cmt=2 → periph1, cmt=3 → periph2). Steady-state amounts per channel are computed by linear superposition over the channels.
+- **Oral models**: central infusion (cmt=2) is supported; peripheral infusion is rare clinically and still panics with a clear message (tracked as a follow-up).
 
 ## Event Types (EVID)
 
@@ -62,6 +86,7 @@ Covariate names in the data file are matched case-insensitively to names used in
 |------|---------|
 | 0 | Observation record. `DV` is used for estimation. |
 | 1 | Dosing record. `AMT` is administered to compartment `CMT`. |
+| 2 | Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row's covariate values — matching NONMEM's `$PK runs at every record` semantic. Only meaningful when at least one covariate is time-varying; for time-constant data EVID=2 rows are skipped (would be no-ops). |
 | 4 | Reset and dose. All compartment amounts are reset to zero before dosing. |
 
 ## Example Dataset

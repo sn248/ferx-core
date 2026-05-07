@@ -5,14 +5,48 @@ use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
-/// Route predictions through analytical PK or ODE solver depending on model.
-fn model_predictions(model: &CompiledModel, subject: &Subject, pk_params: &PkParams) -> Vec<f64> {
-    if let Some(ref ode_spec) = model.ode_spec {
-        // For ODE models, pass PK params as flat array to the RHS
-        pk::compute_predictions_ode(ode_spec, subject, &pk_params.values)
-    } else {
-        pk::compute_predictions(model.pk_model, subject, pk_params)
-    }
+/// Route predictions through analytical PK or ODE solver depending on model,
+/// honouring per-event PK parameters when the subject has time-varying
+/// covariates. The TV-aware dispatcher in `pk::compute_predictions_with_tv`
+/// handles the analytical / ODE / event-driven branching.
+///
+/// This is the canonical predictions entry point for FOCE/FOCEI inner-loop
+/// objectives. Callers must pass the same `(theta, eta)` they use elsewhere
+/// in the NLL — `pk_param_fn` is invoked internally once per event (TV path)
+/// or once per subject (no-TV path).
+///
+/// Allocates a fresh `EventPkParams` scratch on each call. Hot loops should
+/// use [`model_predictions_into`] with a reused scratch buffer instead.
+#[inline]
+fn model_predictions(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<f64> {
+    pk::compute_predictions_with_tv(model, subject, theta, eta)
+}
+
+/// Caller-owned-scratch variant of [`model_predictions`] that also
+/// accepts an optional pre-built
+/// [`pk::event_driven::EventSchedule`]. Used by FOCE inner-loop callers
+/// (BFGS line search, post-convergence eval) that build the schedule
+/// once per `find_ebe` call and reuse it across many `(theta, eta)`
+/// evaluations of the same subject. SAEM and other callers pass `None`
+/// — the no-TV fast path doesn't consume the schedule, and the
+/// dispatcher falls back to building one on demand on the TV path.
+#[inline]
+fn model_predictions_into_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> Vec<f64> {
+    pk::compute_predictions_with_tv_into_with_schedule(
+        model, subject, theta, eta, scratch, schedule,
+    )
 }
 
 /// True when observation `j` of `subject` is censored AND the model requests M3.
@@ -36,6 +70,60 @@ pub fn individual_nll(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
 ) -> f64 {
+    // Allocate-on-each-call wrapper — see `individual_nll_into` for
+    // the scratch-aware version used by SAEM's MH loop.
+    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+    individual_nll_into(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        &mut scratch,
+    )
+}
+
+/// Same as [`individual_nll`] but uses a caller-owned scratch buffer.
+/// The hot-path entry point for SAEM's MH proposals: a single buffer
+/// allocated outside the per-subject MH loop is reused across all
+/// proposed `eta`s, eliminating the per-call `Vec<PkParams>` churn
+/// that previously dominated SAEM allocator pressure on TV-cov data.
+pub fn individual_nll_into(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    scratch: &mut pk::EventPkParams,
+) -> f64 {
+    individual_nll_into_with_schedule(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        scratch,
+        None,
+    )
+}
+
+/// Hot-path variant that additionally threads through a pre-built
+/// [`pk::event_driven::EventSchedule`]. The FOCE inner-loop obj closure
+/// and Jacobian build the schedule once per `find_ebe` call and reuse
+/// it across all BFGS iterations.
+pub fn individual_nll_into_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> f64 {
     // Compute Omega inverse and log-determinant via Cholesky
     let omega_inv = match omega.matrix.clone().cholesky() {
         Some(chol) => chol.inverse(),
@@ -47,9 +135,10 @@ pub fn individual_nll(
     let eta_vec = DVector::from_column_slice(eta);
     let eta_prior = eta_vec.dot(&(&omega_inv * &eta_vec));
 
-    // Compute individual PK parameters and predictions
-    let pk_params = (model.pk_param_fn)(theta, eta, &subject.covariates);
-    let preds = model_predictions(model, subject, &pk_params);
+    // Compute individual predictions using the caller's scratch buffer
+    // for per-event PK params (only consumed on the TV-cov path; ignored
+    // on the no-TV fast path).
+    let preds = model_predictions_into_with_schedule(model, subject, theta, eta, scratch, schedule);
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let v = residual_variance(model.error_model, f_pred, sigma_values);
@@ -103,9 +192,8 @@ pub fn foce_subject_nll(
     sigma_values: &[f64],
     interaction: bool,
 ) -> f64 {
-    // Individual predictions at eta_hat
-    let pk_params = (model.pk_param_fn)(theta, eta_hat.as_slice(), &subject.covariates);
-    let ipreds = model_predictions(model, subject, &pk_params);
+    // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
+    let ipreds = model_predictions(model, subject, theta, eta_hat.as_slice());
 
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
 
@@ -190,10 +278,25 @@ pub fn foce_subject_nll_standard(
     0.5 * (quad_form + log_det_r)
 }
 
-/// FOCEI per-subject NLL. With `bloq_method == M3`, BLOQ observations are
-/// dropped from the Gaussian residual sum and the R_tilde Cholesky, and instead
-/// contribute `-2·log Φ((LLOQ - f)/√V)` evaluated at η̂ (scalar, independent
-/// of the other observations given η̂).
+/// FOCEI per-subject NLL.
+///
+/// Same Sheiner–Beal linearised marginal form as the standard FOCE path
+/// (`(y - f₀)' R̃⁻¹ (y - f₀) + log|R̃|`), but with R evaluated at η̂
+/// (the "interaction" piece) — this is what NONMEM's `METHOD=1 INTER`
+/// reports.
+///
+/// The previous implementation decomposed via the Laplace identity
+/// (`(y - f)' diag(R)⁻¹ (y - f) + η̂' Ω⁻¹ η̂ + log|R̃|`). For *linear*
+/// models that decomposition is exactly equal to the Sheiner–Beal form
+/// at the EBE, but for nonlinear models the linearised residual `y - f₀`
+/// pulled through `R̃⁻¹` is not the same as the per-row `(y - f)/R(η̂)`
+/// quadratic, and the OFV drifts away from NONMEM by a few units per
+/// subject. The standard form below stays in lockstep with NONMEM at
+/// matched parameter values for both linear and nonlinear PK.
+///
+/// With `bloq_method == M3`, BLOQ observations are dropped from the
+/// Gaussian residual sum and the R̃ Cholesky, and instead contribute
+/// `-2·log Φ((LLOQ - f)/√V)` evaluated at η̂.
 pub fn foce_subject_nll_interaction(
     subject: &Subject,
     ipreds: &[f64],
@@ -206,57 +309,60 @@ pub fn foce_subject_nll_interaction(
 ) -> f64 {
     let n_obs = subject.observations.len();
 
-    // Partition observation indices into quantified vs BLOQ.
+    // Linearisation point: f₀ = ipred - H · η̂. (Same construction as
+    // the no-interaction path; the only FOCEI difference is that R is
+    // evaluated at η̂/ipred instead of at f₀.)
+    let h_eta = h_matrix * eta_hat;
+    let f0: Vec<f64> = ipreds
+        .iter()
+        .enumerate()
+        .map(|(j, &ip)| ip - h_eta[j])
+        .collect();
+
+    // Partition observation indices into quantified vs BLOQ (M3 only).
     let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
         !(matches!(bloq_method, BloqMethod::M3) && subject.cens.get(j).copied().unwrap_or(0) != 0)
     });
 
     let n_quant = quant_idx.len();
-
-    // Build sub-H over quantified rows.
     let n_eta = eta_hat.len();
     let h_quant = DMatrix::from_fn(n_quant, n_eta, |r, c| h_matrix[(quant_idx[r], c)]);
     let ipreds_quant: Vec<f64> = quant_idx.iter().map(|&j| ipreds[j]).collect();
 
+    // R diagonal at η̂/ipred (interaction).
     let r_diag_quant = compute_r_diag(error_model, &ipreds_quant, sigma_values);
 
-    // R_tilde over quantified rows: H_q · Ω · H_qᵀ + diag(R_q)
+    // R̃ over quantified rows: H_q · Ω · H_qᵀ + diag(R_q(η̂))
     let r_tilde = compute_r_tilde(&h_quant, &omega.matrix, &r_diag_quant);
 
-    let log_det = if n_quant > 0 {
+    let (quad_form, log_det) = if n_quant > 0 {
         let chol = match r_tilde.clone().cholesky() {
             Some(c) => c,
             None => return 1e20,
         };
-        chol_log_det(&chol.l())
+        let resid_quant: DVector<f64> = DVector::from_iterator(
+            n_quant,
+            quant_idx.iter().map(|&j| subject.observations[j] - f0[j]),
+        );
+        let solved = chol.solve(&resid_quant);
+        let quad = resid_quant.dot(&solved);
+        let ld = chol_log_det(&chol.l());
+        (quad, ld)
     } else {
-        0.0
+        (0.0, 0.0)
     };
 
-    // Gaussian residual sum over quantified rows, using diagonal R(ipred).
-    let mut data_term = 0.0;
-    for (k, &j) in quant_idx.iter().enumerate() {
-        let resid = subject.observations[j] - ipreds[j];
-        data_term += resid * resid / r_diag_quant[k];
-    }
-
     // BLOQ contributions: -2·log Φ((lloq - f)/√V) at η̂ (ipred-based variance).
+    let mut bloq_term = 0.0;
     for &j in &bloq_idx {
         let lloq = subject.observations[j];
         let f = ipreds[j];
         let v = residual_variance(error_model, f, sigma_values);
         let z = (lloq - f) / v.sqrt();
-        data_term += -2.0 * log_normal_cdf(z);
+        bloq_term += -2.0 * log_normal_cdf(z);
     }
 
-    // Prior term: eta_hat' * Omega_inv * eta_hat
-    let omega_inv = match omega.matrix.clone().cholesky() {
-        Some(c) => c.inverse(),
-        None => return 1e20,
-    };
-    let eta_prior = eta_hat.dot(&(&omega_inv * eta_hat));
-
-    0.5 * (data_term + eta_prior + log_det)
+    0.5 * (quad_form + log_det + bloq_term)
 }
 
 /// R_tilde = H * Omega * H' + diag(r_diag)
@@ -308,7 +414,14 @@ pub fn foce_subject_nll_iov(
 ) -> f64 {
     if kappas.is_empty() {
         return foce_subject_nll(
-            model, subject, theta, eta_hat, h_matrix, omega_bsv, sigma_values, interaction,
+            model,
+            subject,
+            theta,
+            eta_hat,
+            h_matrix,
+            omega_bsv,
+            sigma_values,
+            interaction,
         );
     }
 
@@ -317,10 +430,13 @@ pub fn foce_subject_nll_iov(
     let n_obs = subject.obs_times.len();
     let mut ipreds = vec![0.0_f64; n_obs];
     for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate() {
-        let kap: &[f64] = if k < kappas.len() { kappas[k].as_slice() } else { &[] };
+        let kap: &[f64] = if k < kappas.len() {
+            kappas[k].as_slice()
+        } else {
+            &[]
+        };
         let combined: Vec<f64> = eta_hat.iter().copied().chain(kap.iter().copied()).collect();
-        let pk_params = (model.pk_param_fn)(theta, &combined, &subject.covariates);
-        let all_preds = model_predictions(model, subject, &pk_params);
+        let all_preds = model_predictions(model, subject, theta, &combined);
         for &j in obs_indices {
             ipreds[j] = all_preds[j];
         }
@@ -329,13 +445,25 @@ pub fn foce_subject_nll_iov(
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
     let foce_term = if interaction || m3_active {
         foce_subject_nll_interaction(
-            subject, &ipreds, eta_hat, h_matrix, omega_bsv, sigma_values,
-            model.error_model, model.bloq_method,
+            subject,
+            &ipreds,
+            eta_hat,
+            h_matrix,
+            omega_bsv,
+            sigma_values,
+            model.error_model,
+            model.bloq_method,
         )
     } else {
         foce_subject_nll_standard(
-            subject, &ipreds, eta_hat, h_matrix, omega_bsv, sigma_values,
-            model.error_model, model.bloq_method,
+            subject,
+            &ipreds,
+            eta_hat,
+            h_matrix,
+            omega_bsv,
+            sigma_values,
+            model.error_model,
+            model.bloq_method,
         )
     };
 
@@ -380,8 +508,16 @@ pub fn foce_population_nll_iov(
                 &[]
             };
             foce_subject_nll_iov(
-                model, subject, theta, &eta_hats[i], &h_matrices[i],
-                omega_bsv, sigma_values, interaction, kappas, omega_iov,
+                model,
+                subject,
+                theta,
+                &eta_hats[i],
+                &h_matrices[i],
+                omega_bsv,
+                sigma_values,
+                interaction,
+                kappas,
+                omega_iov,
             )
         })
         .sum::<f64>()
@@ -461,8 +597,7 @@ pub fn compute_cwres(
 /// Returns `Vec<(occ_id, Vec<obs_index>)>` sorted by first appearance of the occasion.
 pub fn split_obs_by_occasion(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
     let mut occ_order: Vec<u32> = Vec::new();
-    let mut occ_map: std::collections::HashMap<u32, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut occ_map: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
     for (j, &occ) in subject.occasions.iter().enumerate() {
         if !occ_map.contains_key(&occ) {
             occ_order.push(occ);
@@ -580,8 +715,7 @@ pub fn individual_nll_iov(
         }
         // Build combined eta for this occasion
         let combined: Vec<f64> = eta.iter().chain(kappas[k].iter()).copied().collect();
-        let pk_params = (model.pk_param_fn)(theta, &combined, &subject.covariates);
-        let all_preds = model_predictions(model, subject, &pk_params);
+        let all_preds = model_predictions(model, subject, theta, &combined);
 
         for &j in obs_indices {
             let y = subject.observations[j];
@@ -614,7 +748,10 @@ mod tests {
             observations: vec![50.0, 40.0, 30.0, 45.0, 35.0, 25.0],
             obs_cmts: vec![1; 6],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
@@ -727,10 +864,22 @@ mod tests {
         // Non-zero kappas add a kappa prior ≥ 0, so IOV NLL ≥ base NLL.
         let kappas = vec![vec![0.1], vec![-0.1]];
         let iov = individual_nll_iov(
-            &model, &subj, &theta, &eta, &kappas, &omega, Some(&omega_iov), &sigma,
+            &model,
+            &subj,
+            &theta,
+            &eta,
+            &kappas,
+            &omega,
+            Some(&omega_iov),
+            &sigma,
         );
         // Kappa prior is positive → IOV NLL should differ from base
-        assert!((iov - base).abs() > 1e-6, "IOV NLL={}, base NLL={}", iov, base);
+        assert!(
+            (iov - base).abs() > 1e-6,
+            "IOV NLL={}, base NLL={}",
+            iov,
+            base
+        );
     }
 
     #[test]
@@ -745,6 +894,74 @@ mod tests {
         assert_eq!(combined[(1, 1)], 0.04);
         assert_eq!(combined[(2, 2)], 0.01); // occ 1 kappa
         assert_eq!(combined[(3, 3)], 0.01); // occ 2 kappa
-        assert_eq!(combined[(0, 2)], 0.0);  // off-block must be zero
+        assert_eq!(combined[(0, 2)], 0.0); // off-block must be zero
+    }
+
+    /// Regression: FOCEI must produce the same Sheiner–Beal linearised
+    /// marginal as FOCE, only differing in *where R is evaluated*.
+    /// Specifically, with an additive-only error model R doesn't depend
+    /// on f, so R(f0) == R(η̂) and FOCEI must equal FOCE exactly. This
+    /// catches the bug where FOCEI used a Laplace decomposition that
+    /// drifted from FOCE by a few OFV units per nonlinear subject.
+    #[test]
+    fn test_focei_matches_foce_when_r_is_eta_independent() {
+        let subj = make_simple_subject();
+        let mut model = make_model();
+        // Switch to additive error so R is constant w.r.t. eta.
+        model.error_model = ErrorModel::Additive;
+
+        let theta = vec![5.0, 50.0];
+        let eta_hat = nalgebra::DVector::from_vec(vec![0.05]);
+        let omega = make_omega(0.09);
+        let sigma = vec![1.0];
+
+        // ipreds at eta_hat
+        let ipreds = pk::compute_predictions_with_tv(&model, &subj, &theta, eta_hat.as_slice());
+
+        // Build a finite-difference H matrix d(ipred)/d(eta) at eta_hat
+        // — same approach used inside find_ebe.
+        let n_obs = subj.obs_times.len();
+        let eps = 1e-6;
+        let mut h = DMatrix::zeros(n_obs, 1);
+        let h_step = eps * (1.0 + eta_hat[0].abs());
+        let eta_plus = vec![eta_hat[0] + h_step];
+        let eta_minus = vec![eta_hat[0] - h_step];
+        let preds_plus = pk::compute_predictions_with_tv(&model, &subj, &theta, &eta_plus);
+        let preds_minus = pk::compute_predictions_with_tv(&model, &subj, &theta, &eta_minus);
+        for i in 0..n_obs {
+            h[(i, 0)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);
+        }
+
+        let foce = foce_subject_nll_standard(
+            &subj,
+            &ipreds,
+            &eta_hat,
+            &h,
+            &omega,
+            &sigma,
+            ErrorModel::Additive,
+            BloqMethod::Drop,
+        );
+        let focei = foce_subject_nll_interaction(
+            &subj,
+            &ipreds,
+            &eta_hat,
+            &h,
+            &omega,
+            &sigma,
+            ErrorModel::Additive,
+            BloqMethod::Drop,
+        );
+
+        // For an η-independent residual variance, FOCEI is mathematically
+        // identical to FOCE. Pre-fix this test would fail by several OFV
+        // units because the Laplace-style decomposition added an extra
+        // η̂'Ω⁻¹η̂ term and used (y - ipred) instead of (y - f₀).
+        assert!(
+            (focei - foce).abs() < 1e-9,
+            "FOCEI ({}) and FOCE ({}) must agree when R is eta-independent (additive error)",
+            focei,
+            foce,
+        );
     }
 }

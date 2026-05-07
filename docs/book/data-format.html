@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-14f643b3.js";
+            window.path_to_searchindex_js = "searchindex-7a77815b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-911e3088.js"></script>
@@ -232,9 +232,30 @@
 <p>Any column not in the standard set above is automatically treated as a covariate. Covariate values are:</p>
 <ul>
 <li><strong>Time-constant</strong>: The first non-missing value for each subject is used</li>
-<li><strong>Time-varying</strong>: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied</li>
+<li><strong>Time-varying</strong>: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied per event (NONMEM-equivalent: <code>[individual_parameters]</code> is re-evaluated at each dose and observation row using that row’s covariate values)</li>
 </ul>
 <p>Covariate names in the data file are matched case-insensitively to names used in <code>[individual_parameters]</code> expressions.</p>
+<h3 id="time-varying-covariate-scope"><a class="header" href="#time-varying-covariate-scope">Time-varying covariate scope</a></h3>
+<p>Time-varying covariates are supported for <strong>all</strong> analytical structural models and ODE-defined models:</p>
+<ul>
+<li>1-compartment IV bolus (<code>one_cpt_iv_bolus</code>)</li>
+<li>1-compartment infusion (<code>one_cpt_infusion</code>)</li>
+<li>1-compartment oral (<code>one_cpt_oral</code>)</li>
+<li>2-compartment IV bolus (<code>two_cpt_iv_bolus</code>)</li>
+<li>2-compartment infusion (<code>two_cpt_infusion</code>)</li>
+<li>2-compartment oral (<code>two_cpt_oral</code>)</li>
+<li>3-compartment IV bolus (<code>three_cpt_iv_bolus</code>)</li>
+<li>3-compartment infusion (<code>three_cpt_infusion</code>)</li>
+<li>3-compartment oral (<code>three_cpt_oral</code>)</li>
+<li>All ODE-defined models (via <code>[odes]</code>)</li>
+</ul>
+<p>For oral models, the bolus dose into compartment 1 is interpreted as the depot (NONMEM ADVAN2/ADVAN4/ADVAN12 convention) and observation read-out reads the central compartment.</p>
+<p>The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients <em>and</em> an AD-accelerated H-matrix Jacobian (forward-mode), so neither the inner-loop gradient nor the per-iteration Jacobian falls back to finite-differences.</p>
+<p>Infusion routing on the event-driven path:</p>
+<ul>
+<li><strong>IV models</strong>: central infusion (cmt=1) for all 1/2/3-cpt; <strong>peripheral infusion</strong> for 2-cpt (cmt=2) and 3-cpt (cmt=2 → periph1, cmt=3 → periph2). Steady-state amounts per channel are computed by linear superposition over the channels.</li>
+<li><strong>Oral models</strong>: central infusion (cmt=2) is supported; peripheral infusion is rare clinically and still panics with a clear message (tracked as a follow-up).</li>
+</ul>
 <h2 id="event-types-evid"><a class="header" href="#event-types-evid">Event Types (EVID)</a></h2>
 <div class="table-wrapper">
 <table>
@@ -244,6 +265,7 @@
 <tbody>
 <tr><td>0</td><td>Observation record. <code>DV</code> is used for estimation.</td></tr>
 <tr><td>1</td><td>Dosing record. <code>AMT</code> is administered to compartment <code>CMT</code>.</td></tr>
+<tr><td>2</td><td>Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row’s covariate values — matching NONMEM’s <code>$PK runs at every record</code> semantic. Only meaningful when at least one covariate is time-varying; for time-constant data EVID=2 rows are skipped (would be no-ops).</td></tr>
 <tr><td>4</td><td>Reset and dose. All compartment amounts are reset to zero before dosing.</td></tr>
 </tbody>
 </table>

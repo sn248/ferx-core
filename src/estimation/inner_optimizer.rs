@@ -1,7 +1,10 @@
 use crate::pk;
-use crate::stats::likelihood::{individual_nll, individual_nll_iov, split_obs_by_occasion};
+use crate::stats::likelihood::{
+    individual_nll_into_with_schedule, individual_nll_iov, split_obs_by_occasion,
+};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "autodiff")]
@@ -20,21 +23,56 @@ use crate::ad::ad_gradients::{self, FlatDoseData};
 /// AD requires (a) the crate compiled with `feature = "autodiff"` and
 /// (b) the model to have `tv_fn` populated (analytical PK path only).
 /// ODE models have no AD path, so `Auto` resolves to FD there.
-fn resolve_gradient_method(model: &CompiledModel) -> bool {
+///
+/// For subjects with time-varying covariates, the *event-driven* AD path
+/// is used when the structural model is in
+/// [`crate::ad::event_driven_ad::supports_event_driven_ad`] (currently
+/// 1- and 2-cpt IV bolus + infusion). Other models with TV covariates
+/// fall back to FD — the single-snapshot AD path can't honour per-event
+/// covariate values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InnerGradientMethod {
+    /// Finite differences. Used when AD is unavailable/disabled, when
+    /// the model has no `tv_fn`, or when the subject has TV covariates
+    /// on a model the event-driven AD path doesn't support yet.
+    Fd,
+    /// Reverse-mode AD with a single per-subject `tv_adjusted` vector
+    /// — the legacy fast path. Correct only when the subject has no
+    /// time-varying covariates.
+    AdSingleSnapshot,
+    /// Reverse-mode AD with per-event `tv` arrays — required for
+    /// time-varying covariates to be reflected in gradients.
+    AdEventDriven,
+}
+
+fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGradientMethod {
     #[cfg(not(feature = "autodiff"))]
     {
         let _ = model;
-        return false;
+        let _ = subject;
+        return InnerGradientMethod::Fd;
     }
     #[cfg(feature = "autodiff")]
     {
         if model.tv_fn.is_none() {
-            return false;
+            return InnerGradientMethod::Fd;
         }
-        match model.gradient_method {
+        let want_ad = match model.gradient_method {
             GradientMethod::Ad => true,
             GradientMethod::Fd => false,
             GradientMethod::Auto => true,
+        };
+        if !want_ad {
+            return InnerGradientMethod::Fd;
+        }
+        if subject.has_tv_covariates() {
+            if crate::ad::event_driven_ad::supports_event_driven_ad(model.pk_model) {
+                InnerGradientMethod::AdEventDriven
+            } else {
+                InnerGradientMethod::Fd
+            }
+        } else {
+            InnerGradientMethod::AdSingleSnapshot
         }
     }
 }
@@ -176,34 +214,69 @@ pub fn find_ebe(
         None => mu.clone(),
     };
 
-    // Objective in psi-space: model always receives eta_true = psi - mu
+    // Per-subject scratch buffers, built once and reused across every
+    // BFGS line-search obj call and every Jacobian perturbation. The
+    // EventSchedule pre-computes the merged event timeline + per-interval
+    // infusion-bound construction (subject-static, doesn't depend on
+    // theta/eta) so the event_driven_predictions hot path doesn't have
+    // to re-sort + re-allocate on every call. The EventPkParams scratch
+    // recycles the per-event Vec<PkParams> backing storage.
+    //
+    // Both are built only when this subject takes the TV-cov event-driven
+    // analytical path — for the no-TV fast path the schedule is None and
+    // event_driven_predictions is never called.
+    let pk_scratch_cell = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
+    let schedule = if subject.has_tv_covariates()
+        && model.ode_spec.is_none()
+        && pk::event_driven::supports_event_driven(model.pk_model)
+    {
+        Some(pk::event_driven::EventSchedule::for_subject(
+            subject,
+            model.pk_model,
+        ))
+    } else {
+        None
+    };
+
+    // Objective in psi-space: model always receives eta_true = psi - mu.
     let obj = |p: &[f64]| -> f64 {
+        let mut scratch = pk_scratch_cell.borrow_mut();
         let eta_t: Vec<f64> = p.iter().zip(mu.iter()).map(|(pi, mi)| pi - mi).collect();
-        individual_nll(
+        individual_nll_into_with_schedule(
             model,
             subject,
             &params.theta,
             &eta_t,
             &params.omega,
             &params.sigma.values,
+            &mut scratch,
+            schedule.as_ref(),
         )
     };
 
     // Resolve Auto → concrete method based on model/eta characteristics.
     // Autodiff is only available when the crate was compiled with the feature
     // and the model provides tv_fn (the parser attaches it for analytical PK).
-    let use_ad = resolve_gradient_method(model);
+    let grad_method = resolve_gradient_method(model, subject);
 
-    // Try BFGS — AD gradient if `use_ad`, FD otherwise. The AD gradient of
-    // individual_nll w.r.t. psi equals the gradient w.r.t. eta_true (chain
-    // rule: d/dpsi = d/d(eta_true), since psi = eta_true + mu).
+    // ── Per-subject AD helpers, built ONCE per find_ebe call ──
+    //
+    // theta is fixed for the whole inner-loop (BFGS gradient calls) AND
+    // for the post-convergence Jacobian, so all the per-event tv arrays
+    // and dose-flat arrays are stable across both. Hoist them out of
+    // the inner closures and out of the Jacobian site so each helper is
+    // only constructed once per outer iteration per subject — was twice
+    // before this refactor, with `pk_param_fn` re-evaluated per event.
     #[cfg(feature = "autodiff")]
-    let result = if use_ad {
-        let tv_fn = model
-            .tv_fn
-            .as_ref()
-            .expect("resolve_gradient_method guarantees tv_fn");
-        let tv_adjusted = tv_fn(&params.theta, &subject.covariates);
+    let (
+        ad_dose_data,
+        ad_omega_inv_flat,
+        ad_log_det_omega,
+        ad_cens_f64,
+        ad_tv_adjusted,
+        ad_event_data,
+        ad_tv_per_event,
+    ) = if grad_method != InnerGradientMethod::Fd {
         let dose_data = FlatDoseData::from_subject(subject);
         let omega_inv = params
             .omega
@@ -218,6 +291,8 @@ pub fn find_ebe(
                 omega_inv_flat.push(omega_inv[(i, j)]);
             }
         }
+        // Same early-return on degenerate omega as before — must run
+        // before any heavy helper allocation.
         let log_det_omega = {
             let mut ld = 0.0;
             for i in 0..n_eta {
@@ -238,45 +313,123 @@ pub fn find_ebe(
             }
             2.0 * ld
         };
-
-        // Under M3, feed actual CENS flags so the AD path applies -log Φ to
-        // censored rows. Otherwise pass zeros — Enzyme will trace the Gaussian
-        // branch for every observation, identical to the pre-M3 behavior.
+        // Under M3, feed actual CENS flags so the AD path applies
+        // -log Φ to censored rows. Otherwise pass zeros — Enzyme
+        // traces the Gaussian branch for every observation.
         let cens_f64: Vec<f64> = if matches!(model.bloq_method, BloqMethod::M3) {
             subject.cens.iter().map(|&c| c as f64).collect()
         } else {
             vec![0.0; subject.observations.len()]
         };
-        let mu_ad = mu.clone();
-        let grad_fn = |p: &[f64]| -> Vec<f64> {
-            let eta_t: Vec<f64> = p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
-            let t0 = std::time::Instant::now();
-            let (_, g) = ad_gradients::compute_nll_gradient_ad(
-                &eta_t,
-                &tv_adjusted,
-                &omega_inv_flat,
-                log_det_omega,
-                &params.sigma.values,
-                &dose_data,
-                &subject.obs_times,
-                &subject.observations,
-                &cens_f64,
-                model.pk_model,
-                model.error_model,
-                &model.pk_idx_f64,
-                &model.sel_flat,
-            );
-            GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
-            g
+        // Per-method helpers — only one of the two is built.
+        let tv_fn = model
+            .tv_fn
+            .as_ref()
+            .expect("resolve_gradient_method guarantees tv_fn for AD branches");
+        let (tv_adjusted, event_data, tv_per_event) = match grad_method {
+            InnerGradientMethod::AdSingleSnapshot => {
+                (Some(tv_fn(&params.theta, &subject.covariates)), None, None)
+            }
+            InnerGradientMethod::AdEventDriven => (
+                None,
+                Some(crate::ad::event_driven_ad::FlatEventData::from_subject(
+                    subject,
+                )),
+                Some(crate::ad::event_driven_ad::FlatEventTv::from_subject(
+                    model,
+                    subject,
+                    &params.theta,
+                )),
+            ),
+            InnerGradientMethod::Fd => (None, None, None),
         };
-        bfgs_minimize_with_grad(&obj, &grad_fn, &mut psi, n_eta, max_iter, tol)
+        (
+            Some(dose_data),
+            Some(omega_inv_flat),
+            Some(log_det_omega),
+            Some(cens_f64),
+            tv_adjusted,
+            event_data,
+            tv_per_event,
+        )
+    } else {
+        (None, None, None, None, None, None, None)
+    };
+
+    // Try BFGS — AD gradient when `grad_method` is one of the AD variants,
+    // FD otherwise. The AD gradient of individual_nll w.r.t. psi equals the
+    // gradient w.r.t. eta_true (chain rule: d/dpsi = d/d(eta_true), since
+    // psi = eta_true + mu).
+    #[cfg(feature = "autodiff")]
+    let result = if grad_method != InnerGradientMethod::Fd {
+        let dose_data = ad_dose_data.as_ref().unwrap();
+        let omega_inv_flat = ad_omega_inv_flat.as_ref().unwrap();
+        let log_det_omega = ad_log_det_omega.unwrap();
+        let cens_f64 = ad_cens_f64.as_ref().unwrap();
+        let mu_ad = mu.clone();
+
+        match grad_method {
+            InnerGradientMethod::AdSingleSnapshot => {
+                let tv_adjusted = ad_tv_adjusted.as_ref().unwrap();
+                let grad_fn = |p: &[f64]| -> Vec<f64> {
+                    let eta_t: Vec<f64> =
+                        p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
+                    let t0 = std::time::Instant::now();
+                    let (_, g) = ad_gradients::compute_nll_gradient_ad(
+                        &eta_t,
+                        tv_adjusted,
+                        omega_inv_flat,
+                        log_det_omega,
+                        &params.sigma.values,
+                        dose_data,
+                        &subject.obs_times,
+                        &subject.observations,
+                        cens_f64,
+                        model.pk_model,
+                        model.error_model,
+                        &model.pk_idx_f64,
+                        &model.sel_flat,
+                    );
+                    GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
+                    g
+                };
+                bfgs_minimize_with_grad(&obj, &grad_fn, &mut psi, n_eta, max_iter, tol)
+            }
+            InnerGradientMethod::AdEventDriven => {
+                let event_data = ad_event_data.as_ref().unwrap();
+                let tv_per_event = ad_tv_per_event.as_ref().unwrap();
+                let grad_fn = |p: &[f64]| -> Vec<f64> {
+                    let eta_t: Vec<f64> =
+                        p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
+                    let t0 = std::time::Instant::now();
+                    let (_, g) = crate::ad::event_driven_ad::compute_nll_gradient_event_driven_ad(
+                        &eta_t,
+                        tv_per_event,
+                        omega_inv_flat,
+                        log_det_omega,
+                        &params.sigma.values,
+                        event_data,
+                        &subject.observations,
+                        cens_f64,
+                        model.pk_model,
+                        model.error_model,
+                        &model.pk_idx_f64,
+                        &model.sel_flat,
+                    );
+                    GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
+                    g
+                };
+                bfgs_minimize_with_grad(&obj, &grad_fn, &mut psi, n_eta, max_iter, tol)
+            }
+            InnerGradientMethod::Fd => unreachable!("guarded above"),
+        }
     } else {
         bfgs_minimize(&obj, &mut psi, n_eta, max_iter, tol)
     };
 
     #[cfg(not(feature = "autodiff"))]
     let result = {
-        let _ = use_ad; // silence unused warning on stable builds
+        let _ = grad_method; // silence unused warning on stable builds
         bfgs_minimize(&obj, &mut psi, n_eta, max_iter, tol)
     };
 
@@ -296,39 +449,77 @@ pub fn find_ebe(
     // Recover eta_true = psi - mu (mean-zero, NONMEM-compatible output)
     let eta_true: Vec<f64> = psi.iter().zip(mu.iter()).map(|(p, m)| p - m).collect();
 
-    // Compute Jacobian at eta_true — use AD when available and chosen.
+    // Compute Jacobian at eta_true — match the gradient path so the H matrix
+    // is consistent with the gradient that drove convergence. Reuses the
+    // same per-subject helpers built once at the top of find_ebe; previously
+    // these were rebuilt here, doubling the per-subject helper cost.
     #[cfg(feature = "autodiff")]
-    let h_matrix = if use_ad {
-        let tv_fn = model
-            .tv_fn
-            .as_ref()
-            .expect("resolve_gradient_method guarantees tv_fn");
-        let tv_adjusted = tv_fn(&params.theta, &subject.covariates);
-        let dose_data = FlatDoseData::from_subject(subject);
-        let t0 = std::time::Instant::now();
-        let j = ad_gradients::compute_jacobian_ad(
-            &eta_true,
-            &tv_adjusted,
-            &dose_data,
-            &subject.obs_times,
-            subject.obs_times.len(),
-            model.pk_model,
-            &model.pk_idx_f64,
-            &model.sel_flat,
-        );
-        GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
-        j
-    } else {
-        let t0 = std::time::Instant::now();
-        let j = compute_jacobian_fd(model, subject, &params.theta, &eta_true);
-        GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
-        j
+    let h_matrix = match grad_method {
+        InnerGradientMethod::AdSingleSnapshot => {
+            let tv_adjusted = ad_tv_adjusted.as_ref().unwrap();
+            let dose_data = ad_dose_data.as_ref().unwrap();
+            let t0 = std::time::Instant::now();
+            let j = ad_gradients::compute_jacobian_ad(
+                &eta_true,
+                tv_adjusted,
+                dose_data,
+                &subject.obs_times,
+                subject.obs_times.len(),
+                model.pk_model,
+                &model.pk_idx_f64,
+                &model.sel_flat,
+            );
+            GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
+            j
+        }
+        InnerGradientMethod::AdEventDriven => {
+            // Forward-mode AD Jacobian — kernel lives in
+            // `ad::event_driven_ad_jac` (sibling module so the AD pass
+            // stays isolated from the reverse-mode NLL pass; sharing
+            // helpers tripped Enzyme's reverse-mode type deduction).
+            let event_data = ad_event_data.as_ref().unwrap();
+            let tv_per_event = ad_tv_per_event.as_ref().unwrap();
+            let t0 = std::time::Instant::now();
+            let j = crate::ad::event_driven_ad_jac::compute_jacobian_event_driven_ad(
+                &eta_true,
+                tv_per_event,
+                event_data,
+                subject.obs_times.len(),
+                model.pk_model,
+                &model.pk_idx_f64,
+                &model.sel_flat,
+            );
+            GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
+            j
+        }
+        InnerGradientMethod::Fd => {
+            let mut scratch = pk_scratch_cell.borrow_mut();
+            let t0 = std::time::Instant::now();
+            let j = compute_jacobian_fd(
+                model,
+                subject,
+                &params.theta,
+                &eta_true,
+                &mut scratch,
+                schedule.as_ref(),
+            );
+            GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
+            j
+        }
     };
 
     #[cfg(not(feature = "autodiff"))]
     let h_matrix = {
+        let mut scratch = pk_scratch_cell.borrow_mut();
         let t0 = std::time::Instant::now();
-        let j = compute_jacobian_fd(model, subject, &params.theta, &eta_true);
+        let j = compute_jacobian_fd(
+            model,
+            subject,
+            &params.theta,
+            &eta_true,
+            &mut scratch,
+            schedule.as_ref(),
+        );
         GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
         j
     };
@@ -425,14 +616,19 @@ fn find_ebe_iov(
         .map(|(p, m)| p - m)
         .collect();
     let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
-        .map(|k| {
-            DVector::from_column_slice(&x[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa])
-        })
+        .map(|k| DVector::from_column_slice(&x[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa]))
         .collect();
 
     // H-matrix: BSV columns only, perturbing eta with kappas fixed at EBE values
     let kappas_slices: Vec<Vec<f64>> = kappas_vec.iter().map(|k| k.as_slice().to_vec()).collect();
-    let h_matrix = compute_jacobian_fd_iov(model, subject, &params.theta, &bsv_eta, &kappas_slices, &occ_groups);
+    let h_matrix = compute_jacobian_fd_iov(
+        model,
+        subject,
+        &params.theta,
+        &bsv_eta,
+        &kappas_slices,
+        &occ_groups,
+    );
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
@@ -478,22 +674,13 @@ fn compute_jacobian_fd_iov(
             let mut combined_plus: Vec<f64> = eta_pert.clone();
             combined_plus[col] = eta[col] + h_step;
             combined_plus.extend_from_slice(&kappas[k]);
-            let pk_plus = (model.pk_param_fn)(theta, &combined_plus, &subject.covariates);
-            let preds_plus = if let Some(ref ode_spec) = model.ode_spec {
-                pk::compute_predictions_ode(ode_spec, subject, &pk_plus.values)
-            } else {
-                pk::compute_predictions(model.pk_model, subject, &pk_plus)
-            };
+            let preds_plus = pk::compute_predictions_with_tv(model, subject, theta, &combined_plus);
 
             let mut combined_minus: Vec<f64> = eta_pert.clone();
             combined_minus[col] = eta[col] - h_step;
             combined_minus.extend_from_slice(&kappas[k]);
-            let pk_minus = (model.pk_param_fn)(theta, &combined_minus, &subject.covariates);
-            let preds_minus = if let Some(ref ode_spec) = model.ode_spec {
-                pk::compute_predictions_ode(ode_spec, subject, &pk_minus.values)
-            } else {
-                pk::compute_predictions(model.pk_model, subject, &pk_minus)
-            };
+            let preds_minus =
+                pk::compute_predictions_with_tv(model, subject, theta, &combined_minus);
 
             for &j in obs_indices {
                 h[(j, col)] = (preds_plus[j] - preds_minus[j]) / (2.0 * h_step);
@@ -814,11 +1001,18 @@ fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
 
 /// Compute Jacobian H = d(predictions)/d(eta) via finite differences.
 /// H is n_obs x n_eta.
+///
+/// Reuses a caller-owned `EventPkParams` scratch and an optional
+/// pre-built `EventSchedule` so each of the `2 * n_eta` perturbed
+/// prediction calls avoids the per-event-param Vec allocation and
+/// the per-call event-merge sort.
 fn compute_jacobian_fd(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
@@ -831,20 +1025,14 @@ fn compute_jacobian_fd(
         let h_step = eps * (1.0 + eta[j].abs());
 
         eta_pert[j] = eta[j] + h_step;
-        let pk_plus = (model.pk_param_fn)(theta, &eta_pert, &subject.covariates);
-        let preds_plus = if let Some(ref ode_spec) = model.ode_spec {
-            pk::compute_predictions_ode(ode_spec, subject, &pk_plus.values)
-        } else {
-            pk::compute_predictions(model.pk_model, subject, &pk_plus)
-        };
+        let preds_plus = pk::compute_predictions_with_tv_into_with_schedule(
+            model, subject, theta, &eta_pert, scratch, schedule,
+        );
 
         eta_pert[j] = eta[j] - h_step;
-        let pk_minus = (model.pk_param_fn)(theta, &eta_pert, &subject.covariates);
-        let preds_minus = if let Some(ref ode_spec) = model.ode_spec {
-            pk::compute_predictions_ode(ode_spec, subject, &pk_minus.values)
-        } else {
-            pk::compute_predictions(model.pk_model, subject, &pk_minus)
-        };
+        let preds_minus = pk::compute_predictions_with_tv_into_with_schedule(
+            model, subject, theta, &eta_pert, scratch, schedule,
+        );
 
         for i in 0..n_obs {
             h[(i, j)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);
@@ -998,8 +1186,10 @@ mod tests {
 #[cfg(test)]
 mod iov_tests {
     use super::*;
-    use crate::types::{BloqMethod, DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkModel,
-                       PkParams, SigmaVector};
+    use crate::types::{
+        BloqMethod, DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkModel, PkParams,
+        SigmaVector,
+    };
     use std::collections::HashMap;
 
     fn make_iov_model() -> CompiledModel {
@@ -1013,7 +1203,10 @@ mod iov_tests {
             theta_fixed: vec![false; 2],
             omega,
             omega_fixed: vec![false],
-            sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
@@ -1062,7 +1255,10 @@ mod iov_tests {
             observations: vec![40.0, 32.0, 25.0, 38.0, 30.0, 22.0],
             obs_cmts: vec![1; 6],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
@@ -1104,7 +1300,10 @@ mod iov_tests {
             theta_fixed: vec![false; 2],
             omega,
             omega_fixed: vec![false],
-            sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
@@ -1149,7 +1348,10 @@ mod iov_tests {
             observations: vec![40.0, 32.0, 20.0],
             obs_cmts: vec![1; 3],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),

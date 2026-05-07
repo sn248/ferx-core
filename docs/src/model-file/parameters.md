@@ -60,6 +60,50 @@ For a 3x3 block:
 block_omega (ETA_CL, ETA_V, ETA_KA) = [var_CL, cov_CL_V, var_V, cov_CL_KA, cov_V_KA, var_KA]
 ```
 
+#### Visualising the lower triangle
+
+For an N×N block you supply `N·(N+1)/2` values, walked row by row through the lower triangle (row 1 has 1 value, row 2 has 2, …, row N has N). Drawing it out as a matrix makes the layout obvious:
+
+```
+          ETA_1   ETA_2   ETA_3   ETA_4
+        ┌                                ┐
+ETA_1   │  v[0]                          │
+ETA_2   │  v[1]   v[2]                   │
+ETA_3   │  v[3]   v[4]    v[5]           │
+ETA_4   │  v[6]   v[7]    v[8]    v[9]   │
+        └                                ┘
+```
+
+The diagonal entries are the variances; the off-diagonals are the covariances (which the optimiser estimates — set them to `0.0` as initial values and the fit will recover correlations from the data).
+
+#### Converting diagonal omegas to a block
+
+A common pattern: you have all-diagonal omegas and want to replace them with a single fully-correlated block. Each `omega` variance becomes a diagonal entry; off-diagonals start at `0.0`. For example:
+
+```
+omega ETA_CL ~ 0.1
+omega ETA_V1 ~ 0.1
+omega ETA_Q  ~ 0.1
+omega ETA_V2 ~ 0.1
+```
+
+becomes a 4×4 block (10 values: `1+2+3+4`):
+
+```
+block_omega (ETA_CL, ETA_V1, ETA_Q, ETA_V2) = [
+  0.1,
+  0.0, 0.1,
+  0.0, 0.0, 0.1,
+  0.0, 0.0, 0.0, 0.1
+]
+```
+
+(Multi-line and single-line layouts are equivalent — line breaks inside `[ ... ]` are ignored.) Reading the rows: row 1 is `var(CL)`, row 2 is `cov(CL,V1) var(V1)`, row 3 is `cov(CL,Q) cov(V1,Q) var(Q)`, row 4 is `cov(CL,V2) cov(V1,V2) cov(Q,V2) var(V2)`.
+
+Block omega regularises poorly-identified parameters by letting them share variability — see the [optimisation FAQ](../faq.md) for a worked example where switching from diagonal to `block_omega(3)` rescues a fit that diagonal-omega couldn't converge.
+
+#### Mixing diagonal and block
+
 You can mix diagonal and block omega specifications. Diagonal omegas specify uncorrelated random effects, while block omegas estimate the full covariance sub-matrix:
 
 ```

@@ -188,7 +188,9 @@ fn parse_subject(
     let mut dose_occasions: Vec<u32> = Vec::new();
     let mut occ_parse_failures: usize = 0;
 
-    // Time-constant covariates: first non-missing value
+    // Time-constant covariates: first non-missing value across all rows.
+    // Used as the subject-static fallback (and for the AD fast path, which
+    // does not yet read per-event snapshots).
     let mut covariates: HashMap<String, f64> = HashMap::new();
     for (name, idx) in cov_indices {
         for row in rows {
@@ -203,39 +205,67 @@ fn parse_subject(
         }
     }
 
-    // Time-varying covariates (LOCF) — detect if values change across rows
-    let mut tvcov: HashMap<String, Vec<f64>> = HashMap::new();
+    // Detect which covariates are time-varying within this subject. Per-event
+    // snapshots are only built when at least one is — keeps memory flat for
+    // models with no TV covariates.
+    let mut tv_names: Vec<&str> = Vec::new();
+    let mut tv_indices: Vec<usize> = Vec::new();
     for (name, idx) in cov_indices {
-        let vals: Vec<f64> = rows
-            .iter()
-            .map(|row| {
-                row.get(*idx)
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(f64::NAN)
-            })
-            .collect();
-
-        // Check if values change
-        let first_val = vals.iter().find(|v| v.is_finite()).copied();
-        let is_tv = first_val.map_or(false, |fv| {
-            vals.iter()
-                .any(|v| v.is_finite() && (*v - fv).abs() > 1e-12)
-        });
-        if is_tv {
-            // LOCF fill
-            let mut filled = Vec::with_capacity(vals.len());
-            let mut last = first_val.unwrap_or(0.0);
-            for v in &vals {
-                if v.is_finite() {
-                    last = *v;
+        let mut first_val: Option<f64> = None;
+        let mut is_tv = false;
+        for row in rows {
+            let v_opt = row
+                .get(*idx)
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| v.is_finite());
+            if let Some(v) = v_opt {
+                match first_val {
+                    None => first_val = Some(v),
+                    Some(fv) if (v - fv).abs() > 1e-12 => {
+                        is_tv = true;
+                        break;
+                    }
+                    _ => {}
                 }
-                filled.push(last);
             }
-            tvcov.insert(name.clone(), filled);
+        }
+        if is_tv {
+            tv_names.push(name.as_str());
+            tv_indices.push(*idx);
         }
     }
+    let any_tv = !tv_names.is_empty();
+
+    // LOCF state for the per-event snapshot path. Initialized from the
+    // subject-static `covariates` map so the first event sees something
+    // sensible even if the row's own value is missing.
+    let mut locf_state: HashMap<String, f64> = covariates.clone();
+
+    // Per-event covariate snapshots (only populated when any_tv is true).
+    let mut dose_covariates: Vec<HashMap<String, f64>> = Vec::new();
+    let mut obs_covariates: Vec<HashMap<String, f64>> = Vec::new();
+    // EVID=2 ("other event") rows — typically covariate-change markers.
+    // Only worth tracking when there are TV covariates, since otherwise
+    // re-evaluating $PK with unchanged values is a no-op.
+    let mut pk_only_times: Vec<f64> = Vec::new();
+    let mut pk_only_covariates: Vec<HashMap<String, f64>> = Vec::new();
 
     for row in rows {
+        // Update LOCF state from this row's TV-covariate values *before*
+        // classifying the event, matching NONMEM's "$PK runs at the record
+        // with this record's covariate values" semantics.
+        if any_tv {
+            for (name, idx) in tv_names.iter().zip(tv_indices.iter()) {
+                if let Some(s) = row.get(*idx) {
+                    if let Ok(v) = s.parse::<f64>() {
+                        if v.is_finite() {
+                            locf_state.insert((*name).to_string(), v);
+                        }
+                    }
+                }
+            }
+        }
+
         let time = parse_f64(row.get(time_col).map(|s| s.as_str()).unwrap_or("0"));
         let evid = evid_col
             .and_then(|c| row.get(c))
@@ -288,6 +318,9 @@ fn parse_subject(
             if occ_col.is_some() {
                 dose_occasions.push(occ);
             }
+            if any_tv {
+                dose_covariates.push(locf_state.clone());
+            }
         } else if evid == 0 && mdv == 0 {
             // Observation record
             let dv = parse_f64(row.get(dv_col).map(|s| s.as_str()).unwrap_or("0"));
@@ -306,18 +339,45 @@ fn parse_subject(
             if occ_col.is_some() {
                 occasions.push(occ);
             }
+            if any_tv {
+                obs_covariates.push(locf_state.clone());
+            }
+        } else if evid == 2 && any_tv {
+            // EVID=2 "other event" — typically a covariate-change marker.
+            // NONMEM/nlmixr2 run $PK at this time with this row's
+            // covariate values, so the rate matrix switches at this
+            // time even though the row is neither a dose nor an obs.
+            // We capture it as a pk-only event; the analytical / AD /
+            // ODE event walkers will refresh `current_pk` from this
+            // row's covariates without mutating the compartment state.
+            //
+            // Skipped entirely when there are no TV covariates: with
+            // constant covariates re-evaluating $PK gives the same
+            // values, so the row is a true no-op and adding it to the
+            // event timeline would just be wasted work.
+            pk_only_times.push(time);
+            pk_only_covariates.push(locf_state.clone());
         }
     }
 
-    // Sort doses by time (keeping dose_occasions in sync)
-    let mut dose_pairs: Vec<(DoseEvent, u32)> = if dose_occasions.is_empty() {
-        doses.iter().cloned().map(|d| (d, 0)).collect()
+    // Sort doses by time (keeping dose_occasions and dose_covariates in sync).
+    // Stable sort would be safer when two events share a time, but PartialOrd
+    // sort_by gives us a stable answer for f64 ordered times, and matches
+    // pre-existing behavior.
+    let n_doses = doses.len();
+    let mut perm: Vec<usize> = (0..n_doses).collect();
+    perm.sort_by(|&a, &b| doses[a].time.partial_cmp(&doses[b].time).unwrap());
+    let sorted_doses: Vec<DoseEvent> = perm.iter().map(|&i| doses[i].clone()).collect();
+    let sorted_dose_occ: Vec<u32> = if occ_col.is_some() {
+        perm.iter().map(|&i| dose_occasions[i]).collect()
     } else {
-        doses.into_iter().zip(dose_occasions.into_iter()).collect()
+        Vec::new()
     };
-    dose_pairs.sort_by(|a, b| a.0.time.partial_cmp(&b.0.time).unwrap());
-    let (sorted_doses, sorted_dose_occ): (Vec<_>, Vec<_>) = dose_pairs.into_iter().unzip();
-    let dose_occasions_out = if occ_col.is_some() { sorted_dose_occ } else { Vec::new() };
+    let sorted_dose_cov: Vec<HashMap<String, f64>> = if any_tv {
+        perm.iter().map(|&i| dose_covariates[i].clone()).collect()
+    } else {
+        Vec::new()
+    };
 
     Ok((
         Subject {
@@ -327,10 +387,13 @@ fn parse_subject(
             observations,
             obs_cmts,
             covariates,
-            tvcov,
+            dose_covariates: sorted_dose_cov,
+            obs_covariates,
+            pk_only_times,
+            pk_only_covariates,
             cens,
             occasions,
-            dose_occasions: dose_occasions_out,
+            dose_occasions: sorted_dose_occ,
         },
         occ_parse_failures,
     ))
@@ -424,5 +487,142 @@ mod tests {
         let subj = &pop.subjects[0];
         // Two obs: first has OCC=1, second had "." → 0
         assert_eq!(subj.occasions, vec![1, 0]);
+    }
+
+    #[test]
+    fn test_no_tv_covariates_leaves_per_event_snapshots_empty() {
+        // WT is constant — no per-event snapshots should be allocated.
+        let csv = "ID,TIME,DV,EVID,AMT,WT\n\
+                   1,0,.,1,100,70\n\
+                   1,1,5.0,0,.,70\n\
+                   1,2,3.0,0,.,70\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert!(!subj.has_tv_covariates());
+        assert!(subj.dose_covariates.is_empty());
+        assert!(subj.obs_covariates.is_empty());
+        // Static covariate map still populated.
+        assert_eq!(subj.covariates["WT"], 70.0);
+        // Fallback helpers return the static map.
+        assert_eq!(subj.dose_cov(0)["WT"], 70.0);
+        assert_eq!(subj.obs_cov(0)["WT"], 70.0);
+    }
+
+    #[test]
+    fn test_tv_covariate_locf_per_event_snapshot() {
+        // CR changes mid-subject. Each event must see the LOCF value at its
+        // own row's time (NONMEM $PK semantics).
+        let csv = "ID,TIME,DV,EVID,AMT,WT,CR\n\
+                   1,0,.,1,100,70,1.0\n\
+                   1,1,5.0,0,.,70,1.0\n\
+                   1,2,3.0,0,.,70,1.5\n\
+                   1,3,.,1,100,70,1.5\n\
+                   1,4,2.5,0,.,70,2.0\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert!(subj.has_tv_covariates());
+        // 2 doses, 3 obs.
+        assert_eq!(subj.dose_covariates.len(), 2);
+        assert_eq!(subj.obs_covariates.len(), 3);
+        // Static covariate map is the *first* CR value (1.0), kept for
+        // the AD fast-path / fallback.
+        assert_eq!(subj.covariates["CR"], 1.0);
+        // Dose 1 (t=0): CR=1.0; Dose 2 (t=3): CR=1.5
+        assert_eq!(subj.dose_covariates[0]["CR"], 1.0);
+        assert_eq!(subj.dose_covariates[1]["CR"], 1.5);
+        // Obs at t=1: CR=1.0; t=2: CR=1.5; t=4: CR=2.0
+        assert_eq!(subj.obs_covariates[0]["CR"], 1.0);
+        assert_eq!(subj.obs_covariates[1]["CR"], 1.5);
+        assert_eq!(subj.obs_covariates[2]["CR"], 2.0);
+        // WT is constant — but appears in every snapshot at its constant value.
+        assert_eq!(subj.dose_covariates[0]["WT"], 70.0);
+        assert_eq!(subj.obs_covariates[2]["WT"], 70.0);
+    }
+
+    #[test]
+    fn test_tv_covariate_snapshot_keeps_dose_sort_alignment() {
+        // Doses arrive in non-time order in the CSV. After sorting doses by
+        // time, dose_covariates must follow the same permutation so each
+        // dose still pairs with its own snapshot.
+        let csv = "ID,TIME,DV,EVID,AMT,CR\n\
+                   1,5,.,1,100,2.0\n\
+                   1,0,.,1,100,1.0\n\
+                   1,6,5.0,0,.,2.0\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert!(subj.has_tv_covariates());
+        // After sorting: dose 0 = t=0 (CR=1.0), dose 1 = t=5 (CR=2.0).
+        assert_eq!(subj.doses[0].time, 0.0);
+        assert_eq!(subj.doses[1].time, 5.0);
+        assert_eq!(subj.dose_covariates[0]["CR"], 1.0);
+        assert_eq!(subj.dose_covariates[1]["CR"], 2.0);
+    }
+
+    #[test]
+    fn test_evid2_rows_captured_with_locf_covariates() {
+        // EVID=2 ("other event") rows with TV covariates should be
+        // captured into pk_only_times / pk_only_covariates so the
+        // event-driven propagator can refresh the rate matrix at the
+        // EVID=2 time. NONMEM/nlmixr2 equivalent: $PK runs at every
+        // record (including EVID=2), so a covariate change marker
+        // should switch CL/V immediately at its time.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CR\n\
+                   1,0,.,1,1,100,1.0\n\
+                   1,5,.,2,1,0,1.5\n\
+                   1,10,5.0,0,0,.,1.5\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        // 1 dose, 1 obs, 1 pk-only event.
+        assert_eq!(subj.doses.len(), 1);
+        assert_eq!(subj.obs_times.len(), 1);
+        assert_eq!(subj.pk_only_times.len(), 1);
+        assert_eq!(subj.pk_only_times[0], 5.0);
+        // EVID=2 row carries CR=1.5 — must end up in the snapshot.
+        assert_eq!(subj.pk_only_covariates[0]["CR"], 1.5);
+        // Subsequent obs sees the LOCF value.
+        assert_eq!(subj.obs_covariates[0]["CR"], 1.5);
+    }
+
+    #[test]
+    fn test_evid2_rows_skipped_when_no_tv_covariates() {
+        // With time-constant covariates, EVID=2 rows are no-ops in
+        // NONMEM ($PK gives the same values), so we don't bother
+        // building snapshots for them — saves allocation. This test
+        // locks in that optimization.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,WT\n\
+                   1,0,.,1,1,100,70\n\
+                   1,5,.,2,1,0,70\n\
+                   1,10,5.0,0,0,.,70\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        assert!(!subj.has_tv_covariates());
+        assert!(subj.pk_only_times.is_empty());
+        assert!(subj.pk_only_covariates.is_empty());
+    }
+
+    #[test]
+    fn test_tv_covariate_locf_handles_missing_intermediate() {
+        // Missing CR values are filled forward (LOCF), matching NONMEM.
+        let csv = "ID,TIME,DV,EVID,AMT,CR\n\
+                   1,0,.,1,100,1.0\n\
+                   1,1,5.0,0,.,.\n\
+                   1,2,3.0,0,.,2.0\n\
+                   1,3,2.0,0,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        // Obs 0 (t=1, CR missing) → LOCF → 1.0.
+        assert_eq!(subj.obs_covariates[0]["CR"], 1.0);
+        // Obs 1 (t=2, CR=2.0) → 2.0.
+        assert_eq!(subj.obs_covariates[1]["CR"], 2.0);
+        // Obs 2 (t=3, CR missing) → LOCF → 2.0.
+        assert_eq!(subj.obs_covariates[2]["CR"], 2.0);
     }
 }

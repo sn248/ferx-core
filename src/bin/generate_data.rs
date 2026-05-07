@@ -97,7 +97,10 @@ fn simulate_subjects(
                 observations: vec![0.0; obs_times.len()],
                 obs_cmts: vec![1; obs_times.len()],
                 covariates: cov,
-                tvcov: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
                 cens: vec![0; obs_times.len()],
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
@@ -413,7 +416,13 @@ fn generate_two_cpt_oral_cov() {
         theta_transform: Vec::new(),
         n_kappa: 0,
         kappa_names: Vec::new(),
-        indiv_param_names: vec!["CL".into(), "V".into(), "Q".into(), "V2".into(), "KA".into()],
+        indiv_param_names: vec![
+            "CL".into(),
+            "V".into(),
+            "Q".into(),
+            "V2".into(),
+            "KA".into(),
+        ],
     };
 
     // Generate random covariates (matching Julia seed 456)
@@ -442,7 +451,10 @@ fn generate_two_cpt_oral_cov() {
             observations: vec![0.0; obs_times.len()],
             obs_cmts: vec![1; obs_times.len()],
             covariates: covs[i].clone(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
             cens: vec![0; obs_times.len()],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),

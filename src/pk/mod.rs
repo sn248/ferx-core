@@ -1,12 +1,122 @@
+pub mod event_driven;
 pub mod one_compartment;
 pub mod three_compartment;
 pub mod two_compartment;
 
-use crate::types::{DoseEvent, PkModel, PkParams, Subject};
+use crate::types::{CompiledModel, DoseEvent, PkModel, PkParams, Subject};
 
 pub use one_compartment::*;
 pub use three_compartment::*;
 pub use two_compartment::*;
+
+/// Per-event PK parameter snapshots for one subject.
+///
+/// When the subject has no time-varying covariates, all entries in `dose`
+/// and `obs` are equal (the single subject-static evaluation). The fast
+/// superposition path detects this case via `subject.has_tv_covariates()`
+/// and evaluates `pk_param_fn` only once instead of materialising the
+/// vectors — see [`compute_event_pk_params`] for details.
+///
+/// # Reusing across calls
+///
+/// Hot loops (SAEM Metropolis-Hastings, BFGS gradient/objective) call
+/// `compute_event_pk_params` once per evaluation. To avoid the
+/// allocate-and-discard cycle, allocate one buffer per subject (
+/// [`Self::with_capacity_for`]) and refill it with
+/// [`compute_event_pk_params_into`]. The Vecs are reused — no new
+/// allocations as long as `subject` doesn't change.
+#[derive(Debug, Clone, Default)]
+pub struct EventPkParams {
+    /// PK params at each dose event time, parallel to `subject.doses`.
+    pub dose: Vec<PkParams>,
+    /// PK params at each observation event time, parallel to `subject.obs_times`.
+    pub obs: Vec<PkParams>,
+    /// PK params at each EVID=2 event time, parallel to
+    /// `subject.pk_only_times`. Empty when the subject has no
+    /// pk-only events (typical for non-TV-cov data).
+    pub pk_only: Vec<PkParams>,
+}
+
+impl EventPkParams {
+    /// Allocate empty `Vec`s sized to fit `subject`'s event timeline.
+    /// The capacity is what matters for reuse — the subsequent
+    /// [`compute_event_pk_params_into`] call resizes the `Vec`s to
+    /// the exact lengths and overwrites the contents.
+    pub fn with_capacity_for(subject: &Subject) -> Self {
+        Self {
+            dose: Vec::with_capacity(subject.doses.len()),
+            obs: Vec::with_capacity(subject.obs_times.len()),
+            pk_only: Vec::with_capacity(subject.pk_only_times.len()),
+        }
+    }
+}
+
+/// Materialise per-event PK parameters by evaluating `model.pk_param_fn`
+/// at the LOCF covariate snapshot stored on each event.
+///
+/// When the subject has no time-varying covariates, this evaluates
+/// `pk_param_fn` exactly once and clones the result into every slot — the
+/// downstream PK solver still sees a uniform per-event interface, while
+/// the cost stays at O(1) covariate evaluation.
+///
+/// Allocates fresh `Vec`s each call. For hot loops use
+/// [`compute_event_pk_params_into`] with a reused [`EventPkParams`]
+/// buffer.
+pub fn compute_event_pk_params(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> EventPkParams {
+    let mut out = EventPkParams::with_capacity_for(subject);
+    compute_event_pk_params_into(model, subject, theta, eta, &mut out);
+    out
+}
+
+/// Same as [`compute_event_pk_params`] but writes into a caller-owned
+/// buffer. Used by SAEM's MH loop and the FOCE objective closure where
+/// the buffer is allocated once per subject and reused across many
+/// `eta` evaluations — cuts per-call allocator pressure to zero on the
+/// TV-cov path.
+///
+/// Resizes `out`'s `Vec`s to the exact lengths required by `subject`,
+/// then overwrites the contents. If the existing capacity already
+/// fits, no allocation happens.
+pub fn compute_event_pk_params_into(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    out: &mut EventPkParams,
+) {
+    out.dose.clear();
+    out.obs.clear();
+    out.pk_only.clear();
+
+    if subject.has_tv_covariates() {
+        for k in 0..subject.doses.len() {
+            out.dose
+                .push((model.pk_param_fn)(theta, eta, subject.dose_cov(k)));
+        }
+        for j in 0..subject.obs_times.len() {
+            out.obs
+                .push((model.pk_param_fn)(theta, eta, subject.obs_cov(j)));
+        }
+        for m in 0..subject.pk_only_times.len() {
+            out.pk_only
+                .push((model.pk_param_fn)(theta, eta, subject.pk_only_cov(m)));
+        }
+    } else {
+        let p = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        // pk_only stays empty — see EventPkParams docstring.
+        for _ in 0..subject.doses.len() {
+            out.dose.push(p);
+        }
+        for _ in 0..subject.obs_times.len() {
+            out.obs.push(p);
+        }
+    }
+}
 
 /// Predict concentration at a given time for a subject, summing contributions
 /// from all prior doses (superposition principle).
@@ -80,6 +190,118 @@ pub fn compute_predictions_ode(
     crate::ode::ode_predictions(ode_spec, pk_params_flat, subject)
 }
 
+/// Top-level prediction dispatcher with time-varying-covariate awareness.
+///
+/// Picks the appropriate path:
+///   - **No TV covariates**: evaluates `pk_param_fn` once and uses the
+///     existing superposition (for analytical PK) or ODE (for ODE PK)
+///     fast paths — no per-event overhead.
+///   - **TV covariates + analytical PK supported by `event_driven`**:
+///     materialises per-event PK parameters and calls the event-driven
+///     propagator. This is the NONMEM-equivalent path.
+///   - **TV covariates + analytical PK *not* supported by event_driven**
+///     (oral / 3-cpt): falls back to single-snapshot superposition using
+///     the *first-event* PK params, matching the pre-TV behavior. The
+///     dispatcher emits no warning here — the parser should have already
+///     surfaced one. Tracked for follow-up.
+///   - **TV covariates + ODE PK**: per-event TV is wired through the ODE
+///     segment loop (Phase 4 — until then this falls back to single
+///     snapshot like the analytical-unsupported branch).
+pub fn compute_predictions_with_tv(
+    model: &crate::types::CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<f64> {
+    // Allocate-on-each-call wrapper. Hot loops should use
+    // `compute_predictions_with_tv_into` instead.
+    let mut scratch = EventPkParams::with_capacity_for(subject);
+    compute_predictions_with_tv_into(model, subject, theta, eta, &mut scratch)
+}
+
+/// Same as [`compute_predictions_with_tv`] but writes per-event PK
+/// params into a caller-owned scratch buffer. Used by hot loops (SAEM
+/// MH proposals, FOCE objective evaluations) that re-evaluate the
+/// same subject many times with different `eta` — allocating fresh
+/// `Vec<PkParams>` on every call is the dominant allocator-pressure
+/// source on TV-cov datasets.
+///
+/// The scratch buffer is **only used on the TV-cov analytical/ODE
+/// path**; the no-TV fast path doesn't touch it. Callers can pass the
+/// same scratch unconditionally — the no-TV path just ignores it.
+pub fn compute_predictions_with_tv_into(
+    model: &crate::types::CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    scratch: &mut EventPkParams,
+) -> Vec<f64> {
+    compute_predictions_with_tv_into_with_schedule(model, subject, theta, eta, scratch, None)
+}
+
+/// Hot-path variant that also accepts a pre-built
+/// [`event_driven::EventSchedule`]. When the subject takes the TV-cov
+/// event-driven analytical or ODE path, the schedule is reused on
+/// every call — eliminating the per-call merged-event sort and the
+/// per-interval infusion-bound construction (the dominant per-call
+/// CPU cost on TV-cov datasets).
+///
+/// `schedule` is ignored on the no-TV fast path and on the analytical
+/// fallback for models that don't support event-driven propagation.
+/// Callers that don't have a schedule cached can pass `None` to fall
+/// back to building one on demand.
+pub fn compute_predictions_with_tv_into_with_schedule(
+    model: &crate::types::CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    scratch: &mut EventPkParams,
+    schedule: Option<&event_driven::EventSchedule>,
+) -> Vec<f64> {
+    let has_tv = subject.has_tv_covariates();
+
+    // ODE path.
+    if let Some(ref ode) = model.ode_spec {
+        if has_tv {
+            compute_event_pk_params_into(model, subject, theta, eta, scratch);
+            return crate::ode::ode_predictions_event_driven(
+                ode,
+                subject,
+                &scratch.dose,
+                &scratch.obs,
+                &scratch.pk_only,
+            );
+        }
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        return crate::ode::ode_predictions(ode, &pk.values, subject);
+    }
+
+    if has_tv && event_driven::supports_event_driven(model.pk_model) {
+        compute_event_pk_params_into(model, subject, theta, eta, scratch);
+        if let Some(sched) = schedule {
+            return event_driven::event_driven_predictions_with_schedule(
+                model.pk_model,
+                subject,
+                sched,
+                &scratch.dose,
+                &scratch.obs,
+                &scratch.pk_only,
+            );
+        }
+        return event_driven::event_driven_predictions(
+            model.pk_model,
+            subject,
+            &scratch.dose,
+            &scratch.obs,
+            &scratch.pk_only,
+        );
+    }
+
+    // No-TV fast path (or TV with unsupported model — see docstring).
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    compute_predictions(model.pk_model, subject, &pk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +351,125 @@ mod tests {
         assert_relative_eq!(c_single, c_two, epsilon = 1e-12);
     }
 
+    fn make_subject_with_tv(
+        cov_const: HashMap<String, f64>,
+        dose_cov: Vec<HashMap<String, f64>>,
+        obs_cov: Vec<HashMap<String, f64>>,
+        n_doses: usize,
+        n_obs: usize,
+    ) -> Subject {
+        Subject {
+            id: "1".to_string(),
+            doses: (0..n_doses).map(|i| bolus_dose(i as f64, 100.0)).collect(),
+            obs_times: (0..n_obs).map(|i| 1.0 + i as f64).collect(),
+            observations: vec![0.0; n_obs],
+            obs_cmts: vec![1; n_obs],
+            covariates: cov_const,
+            dose_covariates: dose_cov,
+            obs_covariates: obs_cov,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            cens: vec![0; n_obs],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+        }
+    }
+
+    /// Build a tiny analytical CompiledModel where CL = covariate `CR` *
+    /// theta[0] (so we can prove pk_param_fn was called with the right
+    /// covariate snapshot per event).
+    fn cl_from_cr_model() -> crate::types::CompiledModel {
+        use crate::types::{
+            BloqMethod, CompiledModel, ErrorModel, GradientMethod, ModelParameters, OmegaMatrix,
+            PkModel, SigmaVector,
+        };
+        CompiledModel {
+            name: "cl_from_cr".into(),
+            pk_model: PkModel::OneCptIvBolus,
+            error_model: ErrorModel::Additive,
+            pk_param_fn: Box::new(|theta, _eta, cov| {
+                let mut p = PkParams::default();
+                let cr = cov.get("CR").copied().unwrap_or(1.0);
+                p.values[crate::types::PK_IDX_CL] = theta[0] * cr;
+                p.values[crate::types::PK_IDX_V] = 50.0;
+                p
+            }),
+            n_theta: 1,
+            n_eta: 0,
+            n_epsilon: 1,
+            n_kappa: 0,
+            theta_names: vec!["TVCL".into()],
+            eta_names: Vec::new(),
+            kappa_names: Vec::new(),
+            default_params: ModelParameters {
+                theta: vec![1.0],
+                theta_names: vec!["TVCL".into()],
+                theta_lower: vec![0.0],
+                theta_upper: vec![f64::INFINITY],
+                theta_fixed: vec![false],
+                omega: OmegaMatrix::from_diagonal(&[], Vec::new()),
+                omega_fixed: Vec::new(),
+                sigma: SigmaVector {
+                    values: vec![0.1],
+                    names: vec!["EPS".into()],
+                },
+                sigma_fixed: vec![false],
+                omega_iov: None,
+                kappa_fixed: Vec::new(),
+            },
+            mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![],
+            eta_map: vec![],
+            pk_idx_f64: vec![],
+            sel_flat: vec![],
+            ode_spec: None,
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: vec!["CR".into()],
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            indiv_param_names: Vec::new(),
+            theta_transform: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_event_pk_params_no_tv_evaluates_once() {
+        // No TV covariates → uses subject.covariates; result is identical
+        // for every event.
+        let mut covs = HashMap::new();
+        covs.insert("CR".to_string(), 2.0);
+        let subj = make_subject_with_tv(covs, Vec::new(), Vec::new(), 2, 3);
+        let model = cl_from_cr_model();
+        let ev = compute_event_pk_params(&model, &subj, &[10.0], &[]);
+        assert_eq!(ev.dose.len(), 2);
+        assert_eq!(ev.obs.len(), 3);
+        // CL = theta * CR = 10 * 2 = 20 everywhere.
+        for p in ev.dose.iter().chain(ev.obs.iter()) {
+            assert_relative_eq!(p.cl(), 20.0, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_event_pk_params_tv_uses_per_event_snapshot() {
+        // Per-event snapshots drive different CL at each event.
+        let mk = |cr: f64| {
+            let mut h = HashMap::new();
+            h.insert("CR".to_string(), cr);
+            h
+        };
+        let dose_cov = vec![mk(1.0), mk(1.5)];
+        let obs_cov = vec![mk(1.0), mk(2.0)];
+        let subj = make_subject_with_tv(mk(1.0), dose_cov, obs_cov, 2, 2);
+        let model = cl_from_cr_model();
+        let ev = compute_event_pk_params(&model, &subj, &[10.0], &[]);
+        assert_relative_eq!(ev.dose[0].cl(), 10.0, epsilon = 1e-12);
+        assert_relative_eq!(ev.dose[1].cl(), 15.0, epsilon = 1e-12);
+        assert_relative_eq!(ev.obs[0].cl(), 10.0, epsilon = 1e-12);
+        assert_relative_eq!(ev.obs[1].cl(), 20.0, epsilon = 1e-12);
+    }
+
     #[test]
     fn test_compute_predictions_length() {
         let subject = Subject {
@@ -138,7 +479,10 @@ mod tests {
             observations: vec![0.0; 4],
             obs_cmts: vec![1; 4],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),

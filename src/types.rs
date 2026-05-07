@@ -153,8 +153,29 @@ pub struct Subject {
     pub obs_times: Vec<f64>,
     pub observations: Vec<f64>,
     pub obs_cmts: Vec<usize>,
+    /// Subject-representative covariate values (first non-missing value per
+    /// covariate). Used by the AD fast path and as a fallback when neither
+    /// `dose_covariates` nor `obs_covariates` is populated.
     pub covariates: HashMap<String, f64>,
-    pub tvcov: HashMap<String, Vec<f64>>,
+    /// Per-dose covariate snapshot (LOCF), parallel to `doses`. When the
+    /// dataset has no time-varying covariates, this is empty and consumers
+    /// fall back to `covariates`. NONMEM-equivalent: the value of `$PK`
+    /// inputs at each dose record.
+    pub dose_covariates: Vec<HashMap<String, f64>>,
+    /// Per-observation covariate snapshot (LOCF), parallel to `obs_times`.
+    /// Same fallback semantics as `dose_covariates`.
+    pub obs_covariates: Vec<HashMap<String, f64>>,
+    /// Times of EVID=2 "other event" rows (typically covariate-change
+    /// markers). Only populated when the subject has time-varying
+    /// covariates — for time-constant covariates these rows are no-ops
+    /// (NONMEM-equivalent: $PK runs but with the same values).
+    /// The event-driven propagators see them as a third event kind that
+    /// does not mutate compartment amounts but does refresh the
+    /// piecewise-constant rate matrix from the row's covariate values.
+    pub pk_only_times: Vec<f64>,
+    /// Per-EVID-2 covariate snapshot (LOCF), parallel to `pk_only_times`.
+    /// Empty when no TV covariates.
+    pub pk_only_covariates: Vec<HashMap<String, f64>>,
     /// Censoring flag per observation (0 = quantified, 1 = below LLOQ).
     /// When `cens[j] == 1`, `observations[j]` holds the LLOQ value (NONMEM convention).
     pub cens: Vec<u8>,
@@ -169,6 +190,32 @@ pub struct Subject {
 impl Subject {
     pub fn has_bloq(&self) -> bool {
         self.cens.iter().any(|&c| c != 0)
+    }
+
+    /// True when the subject carries per-event covariate snapshots (i.e. at
+    /// least one covariate was time-varying in the source data). When false,
+    /// callers can use `covariates` directly and skip the per-event evaluation
+    /// loop.
+    pub fn has_tv_covariates(&self) -> bool {
+        !self.dose_covariates.is_empty() || !self.obs_covariates.is_empty()
+    }
+
+    /// Covariate snapshot at observation index `j`. Falls back to the
+    /// subject-static `covariates` map when per-event snapshots aren't present.
+    pub fn obs_cov(&self, j: usize) -> &HashMap<String, f64> {
+        self.obs_covariates.get(j).unwrap_or(&self.covariates)
+    }
+
+    /// Covariate snapshot at dose index `k`. Same fallback as `obs_cov`.
+    pub fn dose_cov(&self, k: usize) -> &HashMap<String, f64> {
+        self.dose_covariates.get(k).unwrap_or(&self.covariates)
+    }
+
+    /// Covariate snapshot at EVID=2 row index `m`. Same fallback as
+    /// the others — for time-constant covariates this returns the
+    /// subject-static map.
+    pub fn pk_only_cov(&self, m: usize) -> &HashMap<String, f64> {
+        self.pk_only_covariates.get(m).unwrap_or(&self.covariates)
     }
 }
 
@@ -826,7 +873,16 @@ impl Default for FitOptions {
             outer_maxiter: 500,
             outer_gtol: 1e-6,
             inner_maxiter: 200,
-            inner_tol: 1e-8,
+            // 1e-4 matches typical NLME engines (NONMEM's default inner-loop
+            // SIGDIGITS is ~3, equivalent to ~1e-3). Tighter tolerances
+            // (1e-6 or 1e-8) over-converge the EBE relative to the
+            // Sheiner–Beal linearisation error and force BFGS to do many
+            // extra iterations per find_ebe — measured ~15x slowdown on
+            // a 100-subject 2-cpt FOCEI fit when set to 1e-8 vs 1e-4,
+            // with no measurable change in the final OFV. Override via
+            // `inner_tol = ...` in `[fit_options]` for studies that need
+            // tighter EBEs (e.g. very-small-data simulation work).
+            inner_tol: 1e-4,
             run_covariance_step: true,
             interaction: false,
             verbose: true,

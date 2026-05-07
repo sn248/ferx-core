@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-14f643b3.js";
+            window.path_to_searchindex_js = "searchindex-7a77815b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-911e3088.js"></script>
@@ -685,6 +685,35 @@ omega ETA_KA ~ 0.40
 <p>For a 3x3 block:</p>
 <pre><code>block_omega (ETA_CL, ETA_V, ETA_KA) = [var_CL, cov_CL_V, var_V, cov_CL_KA, cov_V_KA, var_KA]
 </code></pre>
+<h4 id="visualising-the-lower-triangle"><a class="header" href="#visualising-the-lower-triangle">Visualising the lower triangle</a></h4>
+<p>For an N×N block you supply <code>N·(N+1)/2</code> values, walked row by row through the lower triangle (row 1 has 1 value, row 2 has 2, …, row N has N). Drawing it out as a matrix makes the layout obvious:</p>
+<pre><code>          ETA_1   ETA_2   ETA_3   ETA_4
+        ┌                                ┐
+ETA_1   │  v[0]                          │
+ETA_2   │  v[1]   v[2]                   │
+ETA_3   │  v[3]   v[4]    v[5]           │
+ETA_4   │  v[6]   v[7]    v[8]    v[9]   │
+        └                                ┘
+</code></pre>
+<p>The diagonal entries are the variances; the off-diagonals are the covariances (which the optimiser estimates — set them to <code>0.0</code> as initial values and the fit will recover correlations from the data).</p>
+<h4 id="converting-diagonal-omegas-to-a-block"><a class="header" href="#converting-diagonal-omegas-to-a-block">Converting diagonal omegas to a block</a></h4>
+<p>A common pattern: you have all-diagonal omegas and want to replace them with a single fully-correlated block. Each <code>omega</code> variance becomes a diagonal entry; off-diagonals start at <code>0.0</code>. For example:</p>
+<pre><code>omega ETA_CL ~ 0.1
+omega ETA_V1 ~ 0.1
+omega ETA_Q  ~ 0.1
+omega ETA_V2 ~ 0.1
+</code></pre>
+<p>becomes a 4×4 block (10 values: <code>1+2+3+4</code>):</p>
+<pre><code>block_omega (ETA_CL, ETA_V1, ETA_Q, ETA_V2) = [
+  0.1,
+  0.0, 0.1,
+  0.0, 0.0, 0.1,
+  0.0, 0.0, 0.0, 0.1
+]
+</code></pre>
+<p>(Multi-line and single-line layouts are equivalent — line breaks inside <code>[ ... ]</code> are ignored.) Reading the rows: row 1 is <code>var(CL)</code>, row 2 is <code>cov(CL,V1) var(V1)</code>, row 3 is <code>cov(CL,Q) cov(V1,Q) var(Q)</code>, row 4 is <code>cov(CL,V2) cov(V1,V2) cov(Q,V2) var(V2)</code>.</p>
+<p>Block omega regularises poorly-identified parameters by letting them share variability — see the <a href="#frequently-asked-questions">optimisation FAQ</a> for a worked example where switching from diagonal to <code>block_omega(3)</code> rescues a fit that diagonal-omega couldn’t converge.</p>
+<h4 id="mixing-diagonal-and-block"><a class="header" href="#mixing-diagonal-and-block">Mixing diagonal and block</a></h4>
 <p>You can mix diagonal and block omega specifications. Diagonal omegas specify uncorrelated random effects, while block omegas estimate the full covariance sub-matrix:</p>
 <pre><code>block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
 omega ETA_KA ~ 0.40
@@ -1167,10 +1196,10 @@ of <code>0</code>.</p>
 <tr><td><code>covariance</code></td><td><code>true</code>, <code>false</code></td><td><code>true</code></td><td>Compute covariance matrix and standard errors</td></tr>
 <tr><td><code>optimizer</code></td><td><code>slsqp</code>, <code>lbfgs</code>, <code>nlopt_lbfgs</code>, <code>mma</code>, <code>bfgs</code>, <code>bobyqa</code>, <code>trust_region</code></td><td><code>slsqp</code></td><td>Optimization algorithm</td></tr>
 <tr><td><code>inner_maxiter</code></td><td>integer</td><td><code>200</code></td><td>Max iterations for the inner (per-subject EBE) optimizer</td></tr>
-<tr><td><code>inner_tol</code></td><td>float</td><td><code>1e-8</code></td><td>Gradient-norm convergence tolerance for the inner optimizer</td></tr>
+<tr><td><code>inner_tol</code></td><td>float</td><td><code>1e-4</code></td><td>Gradient-norm convergence tolerance for the inner (per-subject EBE) optimizer. The default of <code>1e-4</code> matches the precision of typical NLME engines (NONMEM’s default inner-loop SIGDIGITS is ~3, equivalent to ~<code>1e-3</code>). Tighter values (e.g. <code>1e-6</code>, <code>1e-8</code>) over-converge the EBE relative to the Sheiner–Beal linearisation error and can slow FOCEI fits by 10–15× without measurable change in the final OFV. Use a tighter value only if you’re comparing post-hoc EBE values across runs at high precision.</td></tr>
 <tr><td><code>steihaug_max_iters</code></td><td>integer</td><td><code>50</code></td><td>Max CG iterations for the Steihaug subproblem (only used when <code>optimizer = trust_region</code>)</td></tr>
-<tr><td><code>global_search</code></td><td><code>true</code>, <code>false</code></td><td><code>false</code></td><td>Run gradient-free pre-search before local optimization</td></tr>
-<tr><td><code>global_maxeval</code></td><td>integer</td><td>auto</td><td>Max evaluations for global search</td></tr>
+<tr><td><code>global_search</code></td><td><code>true</code>, <code>false</code></td><td><code>false</code></td><td>Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a gradient-free global pre-search before the local optimizer. CRS2-LM samples within the parameter bounds; the local optimizer (e.g. <code>bobyqa</code>, <code>slsqp</code>) starts from the best point found. Useful for poorly-identified models — when the local optimizer can land in a degenerate basin (collapsed ETA, V/Q swap, parameters at bounds) from a far-from-truth start, the global pre-search usually escapes it. Adds the pre-search budget on top of the local optimisation, but typically more efficient than running multiple full fits from scratch. Requires a full NLopt build (e.g. <code>brew install nlopt</code> or <code>apt install libnlopt-dev</code>); a clear warning is emitted if CRS2-LM is unavailable.</td></tr>
+<tr><td><code>global_maxeval</code></td><td>integer</td><td><code>200 * (n_params + 1)</code></td><td>Maximum evaluations of the FOCE objective during the global pre-search. Each eval is a full inner-loop pass over all subjects, so this is the dominant cost of <code>global_search = true</code>. The default (<code>0</code> → auto) is empirically enough to escape bad basins on 10–20 parameter PK models without dominating the wall time of the subsequent local refine.</td></tr>
 <tr><td><code>bloq_method</code></td><td><code>drop</code>, <code>m3</code></td><td><code>drop</code></td><td>How to handle rows with <code>CENS=1</code>. <code>m3</code> enables Beal’s M3 likelihood (see <a href="#bloq-m3-method">BLOQ example</a>).</td></tr>
 <tr><td><code>mu_referencing</code></td><td><code>true</code>, <code>false</code></td><td><code>true</code></td><td>Re-centre inner-loop ETA estimates on the current population mean (auto-detected from <code>[individual_parameters]</code>). See the <a href="#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem--nlmixr2">FAQ entry</a> for details. Set <code>false</code> to reproduce pre-automatic-mu behaviour.</td></tr>
 <tr><td><code>iov_column</code></td><td>string</td><td>—</td><td>Name of the occasion column in the dataset (e.g. <code>OCC</code>). Required when the model uses <code>kappa</code> or <code>block_kappa</code> declarations. The column must contain integer occasion indices. Case-insensitive. Only supported with <code>foce</code> / <code>focei</code> — not <code>saem</code>. See <a href="#inter-occasion-variability-iov">IOV documentation</a>.</td></tr>
@@ -1989,9 +2018,30 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 <p>Any column not in the standard set above is automatically treated as a covariate. Covariate values are:</p>
 <ul>
 <li><strong>Time-constant</strong>: The first non-missing value for each subject is used</li>
-<li><strong>Time-varying</strong>: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied</li>
+<li><strong>Time-varying</strong>: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied per event (NONMEM-equivalent: <code>[individual_parameters]</code> is re-evaluated at each dose and observation row using that row’s covariate values)</li>
 </ul>
 <p>Covariate names in the data file are matched case-insensitively to names used in <code>[individual_parameters]</code> expressions.</p>
+<h3 id="time-varying-covariate-scope"><a class="header" href="#time-varying-covariate-scope">Time-varying covariate scope</a></h3>
+<p>Time-varying covariates are supported for <strong>all</strong> analytical structural models and ODE-defined models:</p>
+<ul>
+<li>1-compartment IV bolus (<code>one_cpt_iv_bolus</code>)</li>
+<li>1-compartment infusion (<code>one_cpt_infusion</code>)</li>
+<li>1-compartment oral (<code>one_cpt_oral</code>)</li>
+<li>2-compartment IV bolus (<code>two_cpt_iv_bolus</code>)</li>
+<li>2-compartment infusion (<code>two_cpt_infusion</code>)</li>
+<li>2-compartment oral (<code>two_cpt_oral</code>)</li>
+<li>3-compartment IV bolus (<code>three_cpt_iv_bolus</code>)</li>
+<li>3-compartment infusion (<code>three_cpt_infusion</code>)</li>
+<li>3-compartment oral (<code>three_cpt_oral</code>)</li>
+<li>All ODE-defined models (via <code>[odes]</code>)</li>
+</ul>
+<p>For oral models, the bolus dose into compartment 1 is interpreted as the depot (NONMEM ADVAN2/ADVAN4/ADVAN12 convention) and observation read-out reads the central compartment.</p>
+<p>The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients <em>and</em> an AD-accelerated H-matrix Jacobian (forward-mode), so neither the inner-loop gradient nor the per-iteration Jacobian falls back to finite-differences.</p>
+<p>Infusion routing on the event-driven path:</p>
+<ul>
+<li><strong>IV models</strong>: central infusion (cmt=1) for all 1/2/3-cpt; <strong>peripheral infusion</strong> for 2-cpt (cmt=2) and 3-cpt (cmt=2 → periph1, cmt=3 → periph2). Steady-state amounts per channel are computed by linear superposition over the channels.</li>
+<li><strong>Oral models</strong>: central infusion (cmt=2) is supported; peripheral infusion is rare clinically and still panics with a clear message (tracked as a follow-up).</li>
+</ul>
 <h2 id="event-types-evid"><a class="header" href="#event-types-evid">Event Types (EVID)</a></h2>
 <div class="table-wrapper">
 <table>
@@ -2001,6 +2051,7 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 <tbody>
 <tr><td>0</td><td>Observation record. <code>DV</code> is used for estimation.</td></tr>
 <tr><td>1</td><td>Dosing record. <code>AMT</code> is administered to compartment <code>CMT</code>.</td></tr>
+<tr><td>2</td><td>Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row’s covariate values — matching NONMEM’s <code>$PK runs at every record</code> semantic. Only meaningful when at least one covariate is time-varying; for time-constant data EVID=2 rows are skipped (would be no-ops).</td></tr>
 <tr><td>4</td><td>Reset and dose. All compartment amounts are reset to zero before dosing.</td></tr>
 </tbody>
 </table>
@@ -2893,10 +2944,18 @@ pub struct Subject {
     pub obs_times: Vec&lt;f64&gt;,
     pub observations: Vec&lt;f64&gt;,
     pub obs_cmts: Vec&lt;usize&gt;,
-    pub covariates: HashMap&lt;String, f64&gt;,      // Time-constant
-    pub tvcov: HashMap&lt;String, Vec&lt;f64&gt;&gt;,       // Time-varying (LOCF)
+    pub covariates: HashMap&lt;String, f64&gt;,                  // Subject-static fallback (first values)
+    pub dose_covariates: Vec&lt;HashMap&lt;String, f64&gt;&gt;,        // Per-dose LOCF snapshot (empty if no TV cov)
+    pub obs_covariates: Vec&lt;HashMap&lt;String, f64&gt;&gt;,         // Per-obs LOCF snapshot (empty if no TV cov)
+    pub cens: Vec&lt;u8&gt;,
+    pub occasions: Vec&lt;u32&gt;,
+    pub dose_occasions: Vec&lt;u32&gt;,
 }
 <span class="boring">}</span></code></pre>
+<p><code>dose_covariates</code> and <code>obs_covariates</code> are populated only when at least one
+covariate varies within the subject — the no-TV-cov fast paths use
+<code>covariates</code> directly. Helpers <code>subject.has_tv_covariates()</code>,
+<code>subject.dose_cov(k)</code>, and <code>subject.obs_cov(j)</code> abstract over this.</p>
 <h2 id="modelparameters"><a class="header" href="#modelparameters">ModelParameters</a></h2>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
@@ -3282,7 +3341,7 @@ println!("{} subjects, {} observations",
 <li>Rows with <code>EVID=1</code> are treated as dose events</li>
 <li>Rows with <code>EVID=0</code> and <code>MDV=0</code> are treated as observations</li>
 <li>Time-constant covariates use the first non-missing value per subject</li>
-<li>Time-varying covariates use Last Observation Carried Forward (LOCF)</li>
+<li>Time-varying covariates use Last Observation Carried Forward (LOCF) per event — <code>[individual_parameters]</code> is re-evaluated at each dose and observation row using that row’s covariate values (NONMEM-equivalent semantics). Currently supported on 1- and 2-compartment IV bolus / infusion models and all ODE-defined models; oral and 3-compartment models fall back to a single first-row snapshot</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="frequently-asked-questions"><a class="header" href="#frequently-asked-questions">Frequently Asked Questions</a></h1>

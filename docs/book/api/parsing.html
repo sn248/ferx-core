@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-14f643b3.js";
+            window.path_to_searchindex_js = "../searchindex-7a77815b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-911e3088.js"></script>
@@ -267,7 +267,7 @@ println!("{} subjects, {} observations",
 <li>Rows with <code>EVID=1</code> are treated as dose events</li>
 <li>Rows with <code>EVID=0</code> and <code>MDV=0</code> are treated as observations</li>
 <li>Time-constant covariates use the first non-missing value per subject</li>
-<li>Time-varying covariates use Last Observation Carried Forward (LOCF)</li>
+<li>Time-varying covariates use Last Observation Carried Forward (LOCF) per event — <code>[individual_parameters]</code> is re-evaluated at each dose and observation row using that row’s covariate values (NONMEM-equivalent semantics). Currently supported on 1- and 2-compartment IV bolus / infusion models and all ODE-defined models; oral and 3-compartment models fall back to a single first-row snapshot</li>
 </ul>
 
                     </main>

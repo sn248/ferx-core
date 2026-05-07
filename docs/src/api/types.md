@@ -44,10 +44,19 @@ pub struct Subject {
     pub obs_times: Vec<f64>,
     pub observations: Vec<f64>,
     pub obs_cmts: Vec<usize>,
-    pub covariates: HashMap<String, f64>,      // Time-constant
-    pub tvcov: HashMap<String, Vec<f64>>,       // Time-varying (LOCF)
+    pub covariates: HashMap<String, f64>,                  // Subject-static fallback (first values)
+    pub dose_covariates: Vec<HashMap<String, f64>>,        // Per-dose LOCF snapshot (empty if no TV cov)
+    pub obs_covariates: Vec<HashMap<String, f64>>,         // Per-obs LOCF snapshot (empty if no TV cov)
+    pub cens: Vec<u8>,
+    pub occasions: Vec<u32>,
+    pub dose_occasions: Vec<u32>,
 }
 ```
+
+`dose_covariates` and `obs_covariates` are populated only when at least one
+covariate varies within the subject — the no-TV-cov fast paths use
+`covariates` directly. Helpers `subject.has_tv_covariates()`,
+`subject.dose_cov(k)`, and `subject.obs_cov(j)` abstract over this.
 
 ## ModelParameters
 

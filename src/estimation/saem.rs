@@ -9,7 +9,8 @@
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{compute_covariance, pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::stats::likelihood::individual_nll;
+use crate::pk::EventPkParams;
+use crate::stats::likelihood::{individual_nll, individual_nll_into};
 use crate::stats::residual_error::residual_variance;
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
@@ -61,6 +62,7 @@ struct SaemState {
 /// That was incorrect: `individual_nll` interprets `eta` as the deviation
 /// `log(CL_i) − log(TVCL)`, while `mu_k = log(TVCL)`, so the model evaluated
 /// `CL = TVCL · exp(log TVCL) = TVCL²` for every accepted exploration step.
+#[allow(clippy::too_many_arguments)]
 fn mh_steps(
     eta: &mut [f64],
     nll_current: f64,
@@ -72,6 +74,7 @@ fn mh_steps(
     step_scale: f64,
     rng: &mut impl Rng,
     n_steps: usize,
+    pk_scratch: &mut EventPkParams,
 ) -> (usize, f64) {
     let n_eta = eta.len();
     let l = &omega.chol;
@@ -87,7 +90,20 @@ fn mh_steps(
             .map(|j| eta[j] + step_scale * perturbation[j])
             .collect();
 
-        let nll_prop = individual_nll(model, subject, theta, &eta_prop, omega, sigma_values);
+        // Reuses `pk_scratch` across all n_steps proposals (and across
+        // outer SAEM iterations when the caller hoists allocation
+        // further). On TV-cov subjects this eliminates the per-call
+        // allocate/discard of three `Vec<PkParams>` per evaluation —
+        // the dominant allocator pressure on the SAEM hot loop.
+        let nll_prop = individual_nll_into(
+            model,
+            subject,
+            theta,
+            &eta_prop,
+            omega,
+            sigma_values,
+            pk_scratch,
+        );
 
         // Symmetric proposal q(η_prop|η) = q(η|η_prop) cancels in the ratio,
         // so the prior+likelihood difference encoded in `individual_nll` is
@@ -223,7 +239,13 @@ fn theta_sigma_mstep_light(
         }
     };
 
-    let mut opt = nlopt::Nlopt::new(nlopt::Algorithm::Slsqp, n, obj_s, nlopt::Target::Minimize, ());
+    let mut opt = nlopt::Nlopt::new(
+        nlopt::Algorithm::Slsqp,
+        n,
+        obj_s,
+        nlopt::Target::Minimize,
+        (),
+    );
     opt.set_lower_bounds(&lower_s).unwrap();
     opt.set_upper_bounds(&upper_s).unwrap();
     opt.set_maxeval(maxiter * (n as u32 + 1)).unwrap();
@@ -244,20 +266,16 @@ fn theta_sigma_mstep_light(
 /// Observation NLL for a single subject with ETAs held fixed.
 ///
 /// Under M3, CENS=1 rows contribute `-log Φ((LLOQ - f)/√V)`.
-fn obs_nll_single(
+fn obs_nll_single_into(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
     eta: &[f64],
+    pk_scratch: &mut EventPkParams,
 ) -> f64 {
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
-    let pk_params = (model.pk_param_fn)(theta, eta, &subject.covariates);
-    let preds = if let Some(ref ode_spec) = model.ode_spec {
-        crate::pk::compute_predictions_ode(ode_spec, subject, &pk_params.values)
-    } else {
-        crate::pk::compute_predictions(model.pk_model, subject, &pk_params)
-    };
+    let preds = crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
     let mut nll = 0.0;
     for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let f = f.max(1e-12);
@@ -278,6 +296,12 @@ fn obs_nll_single(
 /// Gaussian residual term. Without this branch, the SAEM M-step would optimize
 /// θ/σ as if censored observations were exact Gaussians at the LLOQ value,
 /// producing silently-biased population estimates.
+///
+/// Uses rayon's `map_init` so each worker thread allocates one
+/// `EventPkParams` scratch on first use and reuses it across every
+/// subject the worker handles. With NLopt's central-FD gradient
+/// hitting `obs_nll_sum` `1 + 2·n_dim` times per M-step, this cuts
+/// per-call `Vec<PkParams>` churn to near-zero on TV-cov data.
 fn obs_nll_sum(
     model: &CompiledModel,
     population: &Population,
@@ -290,7 +314,9 @@ fn obs_nll_sum(
         .subjects
         .par_iter()
         .enumerate()
-        .map(|(i, subject)| obs_nll_single(model, subject, theta, sigma_values, &etas[i]))
+        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            obs_nll_single_into(model, subject, theta, sigma_values, &etas[i], scratch)
+        })
         .sum()
 }
 
@@ -472,28 +498,38 @@ pub fn run_saem(
                 .zip(state.nll_cache.par_iter())
                 .zip(state.step_scales.par_iter())
                 .enumerate()
-                .map(|(i, ((eta, &nll), &scale))| {
-                    let subject = &population.subjects[i];
-                    let mut rng = StdRng::seed_from_u64(
-                        master_seed
-                            .wrapping_add(k as u64 * 100_000)
-                            .wrapping_add(i as u64),
-                    );
-                    let mut eta_work = eta.clone();
-                    let (n_acc, nll_new) = mh_steps(
-                        &mut eta_work,
-                        nll,
-                        subject,
-                        model,
-                        theta_ref,
-                        omega_ref,
-                        sigma_ref,
-                        scale,
-                        &mut rng,
-                        n_mh_steps,
-                    );
-                    (eta_work, nll_new, n_acc)
-                })
+                // Per-rayon-worker `EventPkParams` scratch: allocated
+                // once per worker per outer iteration, reused across
+                // every subject the worker handles. Without `map_init`
+                // the scratch was allocated per subject per outer
+                // iter (5937 × N_iter on the cefepime SAEM bench);
+                // with it, n_workers × N_iter ≈ 10 × N_iter.
+                .map_init(
+                    EventPkParams::default,
+                    |pk_scratch, (i, ((eta, &nll), &scale))| {
+                        let subject = &population.subjects[i];
+                        let mut rng = StdRng::seed_from_u64(
+                            master_seed
+                                .wrapping_add(k as u64 * 100_000)
+                                .wrapping_add(i as u64),
+                        );
+                        let mut eta_work = eta.clone();
+                        let (n_acc, nll_new) = mh_steps(
+                            &mut eta_work,
+                            nll,
+                            subject,
+                            model,
+                            theta_ref,
+                            omega_ref,
+                            sigma_ref,
+                            scale,
+                            &mut rng,
+                            n_mh_steps,
+                            pk_scratch,
+                        );
+                        (eta_work, nll_new, n_acc)
+                    },
+                )
                 .collect();
 
             for (i, (eta_new, nll_new, n_acc)) in results.into_iter().enumerate() {
@@ -571,11 +607,15 @@ pub fn run_saem(
                 let mut temp_theta_upper = log_theta_upper.clone();
                 let mut n_pinned: u64 = 0;
                 for &(theta_idx, eta_idx) in &mu_ref_pairs {
-                    if init_params.theta_fixed.get(theta_idx).copied().unwrap_or(false) {
+                    if init_params
+                        .theta_fixed
+                        .get(theta_idx)
+                        .copied()
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
-                    let mean_eta: f64 =
-                        state.etas.iter().map(|e| e[eta_idx]).sum::<f64>() / n_subj;
+                    let mean_eta: f64 = state.etas.iter().map(|e| e[eta_idx]).sum::<f64>() / n_subj;
                     let log_theta_before = log_theta[theta_idx];
                     log_theta[theta_idx] = (log_theta_before + gamma * mean_eta)
                         .clamp(log_theta_lower[theta_idx], log_theta_upper[theta_idx]);
@@ -754,7 +794,16 @@ pub fn run_saem(
     );
 
     // ---- Final OFV via FOCE approximation (for AIC/BIC comparability) ----
-    let ofv = 2.0 * pop_nll(model, population, &final_params, &eta_hats, &h_matrices, &final_kappas, options.interaction);
+    let ofv = 2.0
+        * pop_nll(
+            model,
+            population,
+            &final_params,
+            &eta_hats,
+            &h_matrices,
+            &final_kappas,
+            options.interaction,
+        );
 
     // ---- Covariance step ----
     let mut warnings = Vec::new();
@@ -874,11 +923,7 @@ mod tests {
     #[test]
     fn get_mu_ref_pairs_skips_orphaned_theta() {
         // mu_ref points at a theta name that doesn't exist — silently skipped.
-        let m = model_with_mu_refs(
-            &["CL"],
-            &["ETA_CL"],
-            &[("ETA_CL", "MISSING", true)],
-        );
+        let m = model_with_mu_refs(&["CL"], &["ETA_CL"], &[("ETA_CL", "MISSING", true)]);
         assert!(get_mu_ref_pairs(&m).is_empty());
     }
 
@@ -945,8 +990,8 @@ mod tests {
     fn mh_steps_random_walk_uses_current_eta_not_mu_k() {
         use crate::stats::likelihood::individual_nll;
         use crate::types::{DoseEvent, SigmaVector};
-        use rand::SeedableRng;
         use rand::rngs::StdRng;
+        use rand::SeedableRng;
         use std::collections::HashMap;
 
         let model = analytical_model(GradientMethod::Auto);
@@ -957,18 +1002,25 @@ mod tests {
             observations: vec![1.0],
             obs_cmts: vec![1],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
             cens: vec![0],
             occasions: vec![],
             dose_occasions: vec![],
         };
         let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]);
-        let sigma = SigmaVector { values: vec![1.0], names: vec!["PROP".into()] };
+        let sigma = SigmaVector {
+            values: vec![1.0],
+            names: vec!["PROP".into()],
+        };
         let theta = vec![1.0]; // mu_k = log(1) = 0
         let mut eta = vec![5.0_f64]; // far from mu_k
         let nll_start = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma.values);
         let mut rng = StdRng::seed_from_u64(42);
 
+        let mut pk_scratch = EventPkParams::with_capacity_for(&subj);
         mh_steps(
             &mut eta,
             nll_start,
@@ -980,6 +1032,7 @@ mod tests {
             0.0, // zero perturbation: random walk MUST stay put exactly
             &mut rng,
             100,
+            &mut pk_scratch,
         );
 
         // Random walk with step=0: every proposal == current eta, accepted as
@@ -999,13 +1052,7 @@ mod tests {
     fn closed_form_mu_ref_mstep_is_bounded_and_signed_correctly() {
         // Simulate post-MH state: 5 subjects, eta_mean = +0.4 (population CL
         // is higher than current TVCL), gamma = 1.0 (exploration step).
-        let etas: Vec<Vec<f64>> = vec![
-            vec![0.5],
-            vec![0.3],
-            vec![0.4],
-            vec![0.6],
-            vec![0.2],
-        ];
+        let etas: Vec<Vec<f64>> = vec![vec![0.5], vec![0.3], vec![0.4], vec![0.6], vec![0.2]];
         let n = etas.len() as f64;
         let mean_eta: f64 = etas.iter().map(|e| e[0]).sum::<f64>() / n;
         assert!((mean_eta - 0.4).abs() < 1e-12);
@@ -1064,7 +1111,10 @@ mod tests {
             observations: vec![1.0, 0.5],
             obs_cmts: vec![1, 1],
             covariates: HashMap::new(),
-            tvcov: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![],
             dose_occasions: vec![],

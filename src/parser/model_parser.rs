@@ -789,8 +789,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         };
 
     // Detect mu-referencing relationships from [individual_parameters].
-    // Use BSV-only eta names — kappas don't participate in mu-referencing.
-    let mu_refs = detect_mu_refs(&indiv_stmts, &theta_names, &eta_names_bsv);
+    // Run detection over all eta names (BSV + kappa) so we can derive the
+    // lognormal/additive flag for IOV kappas alongside the BSV etas.
+    let all_eta_names: Vec<String> = eta_names_bsv
+        .iter()
+        .chain(kappa_names.iter())
+        .cloned()
+        .collect();
+    let all_mu_refs = detect_mu_refs(&indiv_stmts, &theta_names, &all_eta_names);
+    let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
+    let mu_refs: HashMap<String, MuRef> = all_mu_refs
+        .iter()
+        .filter(|(k, _)| !kappa_set.contains(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let kappa_mu_refs: HashMap<String, MuRef> = all_mu_refs
+        .into_iter()
+        .filter(|(k, _)| kappa_set.contains(k))
+        .collect();
 
     // Build pk_indices: maps each individual parameter (by declaration order)
     // to its PK parameter index. Needed for AD to place values in correct slots.
@@ -882,6 +898,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         ode_spec,
         bloq_method: BloqMethod::Drop,
         mu_refs,
+        kappa_mu_refs,
         referenced_covariates,
         gradient_method: GradientMethod::default(),
         parse_warnings: Vec::new(), // populated below

@@ -195,6 +195,19 @@ A name may not appear in both `kappa` and `block_kappa` — this is a parse erro
 
 Kappa declaration order determines the IOV omega matrix layout and the kappa column order in output. Kappas follow all BSV etas in the internal indexing: if a model has 3 BSV etas and 2 kappas, the kappas sit at indices 4 and 5.
 
+## Parameter-level correlation in output
+
+When a `block_omega` (or `block_kappa`) is estimated, ferx reports a **parameter-level correlation** for each off-diagonal pair in the console and YAML output. This differs from the eta-level (normal-scale) correlation `ω_ij / √(ω_ii · ω_jj)`:
+
+| Both etas lognormal (`THETA * exp(ETA)`) | `(exp(ω_ij) − 1) / √((exp(ω_ii) − 1)(exp(ω_jj) − 1))` |
+|---|---|
+| Both etas additive (`THETA + ETA`) | `ω_ij / √(ω_ii · ω_jj)` (same as eta-level) |
+| Mixed or complex expressions | Falls back to eta-level; a warning is added to `FitResult.warnings` |
+
+The formula for lognormal pairs is the standard bivariate lognormal identity and reflects the correlation between the actual PK/PD parameters (e.g. CL and V) rather than their underlying normal variates.
+
+The result is exposed as `FitResult.omega_param_corr` (BSV) and `FitResult.omega_iov_param_corr` (IOV), and is used wherever ferx prints a `corr` or `correlation` value for a block omega pair.
+
 ## Sigma (Residual Error)
 
 ```

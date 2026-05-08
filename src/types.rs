@@ -489,6 +489,8 @@ pub struct CompiledModel {
     /// Detected mu-referencing relationships: eta_name → (theta_name, log_transformed).
     /// Populated by the parser; empty map means no mu-referencing detected.
     pub mu_refs: HashMap<String, MuRef>,
+    /// Same as `mu_refs` but for IOV kappa parameters (kappa_name → MuRef).
+    pub kappa_mu_refs: HashMap<String, MuRef>,
     /// Computes covariate-adjusted typical values per subject for AD.
     /// Returns one value per `[individual_parameters]` assignment (in
     /// declaration order), evaluated with eta = 0. Covariates and theta are
@@ -769,6 +771,17 @@ pub struct FitResult {
     /// non-positive (signals a near-singular parameter space). `None` when
     /// `cov_eigenvalues` is `None`.
     pub cov_condition_number: Option<f64>,
+    /// Whether each BSV eta is lognormally parameterised (`true`) or
+    /// additive/unknown (`false`). Parallel to `eta_names` / omega diagonal.
+    pub eta_log_transformed: Vec<bool>,
+    /// Parameter-level correlation matrix for BSV omega.  Entry `[i,j]` uses
+    /// the lognormal formula `(exp(ω_ij)−1)/√((exp(ω_ii)−1)(exp(ω_jj)−1))`
+    /// when both etas are lognormal, otherwise falls back to
+    /// `ω_ij/√(ω_ii·ω_jj)`.  `None` when omega is diagonal (no off-diagonals).
+    pub omega_param_corr: Option<DMatrix<f64>>,
+    /// Parameter-level correlation matrix for IOV block kappa, analogous to
+    /// `omega_param_corr`.  `None` when `omega_iov` is absent or diagonal.
+    pub omega_iov_param_corr: Option<DMatrix<f64>>,
 }
 
 /// Options for fit()
@@ -1183,6 +1196,7 @@ pub(crate) mod test_helpers {
                 kappa_fixed: Vec::new(),
             },
             mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
             // Analytical models populate tv_fn; ODE models leave it None.
             tv_fn: if with_ode {
                 None

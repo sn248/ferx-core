@@ -107,18 +107,24 @@ pub fn print_results(result: &FitResult) {
                 if cov.abs() <= 1e-15 {
                     continue;
                 }
-                let var_i = result.omega[(i, i)];
-                let var_j = result.omega[(j, j)];
-                let corr = if var_i > 0.0 && var_j > 0.0 {
-                    cov / (var_i.sqrt() * var_j.sqrt())
-                } else {
-                    0.0
-                };
                 let name_i = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
                 let name_j = result.eta_names.get(j).map(|s| s.as_str()).unwrap_or("ETA");
+                let param_corr = result
+                    .omega_param_corr
+                    .as_ref()
+                    .map(|m| m[(i, j)])
+                    .unwrap_or_else(|| {
+                        let var_i = result.omega[(i, i)];
+                        let var_j = result.omega[(j, j)];
+                        if var_i > 0.0 && var_j > 0.0 {
+                            cov / (var_i.sqrt() * var_j.sqrt())
+                        } else {
+                            0.0
+                        }
+                    });
                 eprintln!(
-                    "  {} × {} = {:.6}  (corr = {:.4})",
-                    name_i, name_j, cov, corr,
+                    "  {} × {} = {:.6}  (param corr = {:.4})",
+                    name_i, name_j, cov, param_corr,
                 );
             }
         }
@@ -199,13 +205,6 @@ pub fn print_results(result: &FitResult) {
                     if cov.abs() <= 1e-15 {
                         continue;
                     }
-                    let var_i = iov[(i, i)];
-                    let var_j = iov[(j, j)];
-                    let corr = if var_i > 0.0 && var_j > 0.0 {
-                        cov / (var_i.sqrt() * var_j.sqrt())
-                    } else {
-                        0.0
-                    };
                     let name_i = result
                         .kappa_names
                         .get(i)
@@ -216,9 +215,22 @@ pub fn print_results(result: &FitResult) {
                         .get(j)
                         .map(|s| s.as_str())
                         .unwrap_or("KAPPA");
+                    let param_corr = result
+                        .omega_iov_param_corr
+                        .as_ref()
+                        .map(|m| m[(i, j)])
+                        .unwrap_or_else(|| {
+                            let var_i = iov[(i, i)];
+                            let var_j = iov[(j, j)];
+                            if var_i > 0.0 && var_j > 0.0 {
+                                cov / (var_i.sqrt() * var_j.sqrt())
+                            } else {
+                                0.0
+                            }
+                        });
                     eprintln!(
-                        "  {} × {} = {:.6}  (corr = {:.4})",
-                        name_i, name_j, cov, corr,
+                        "  {} × {} = {:.6}  (param corr = {:.4})",
+                        name_i, name_j, cov, param_corr,
                     );
                 }
             }
@@ -481,13 +493,6 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         for j in 0..i {
             let cov = result.omega[(i, j)];
             if cov.abs() > 1e-15 {
-                let var_i = result.omega[(i, i)];
-                let var_j = result.omega[(j, j)];
-                let corr = if var_i > 0.0 && var_j > 0.0 {
-                    cov / (var_i.sqrt() * var_j.sqrt())
-                } else {
-                    0.0
-                };
                 let name_i = result
                     .eta_names
                     .get(i)
@@ -498,9 +503,22 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(j)
                     .cloned()
                     .unwrap_or_else(|| format!("eta_{}", j + 1));
+                let param_corr = result
+                    .omega_param_corr
+                    .as_ref()
+                    .map(|m| m[(i, j)])
+                    .unwrap_or_else(|| {
+                        let var_i = result.omega[(i, i)];
+                        let var_j = result.omega[(j, j)];
+                        if var_i > 0.0 && var_j > 0.0 {
+                            cov / (var_i.sqrt() * var_j.sqrt())
+                        } else {
+                            0.0
+                        }
+                    });
                 writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
                 writeln!(f, "    covariance: {:.6}", cov).map_err(|e| e.to_string())?;
-                writeln!(f, "    correlation: {:.6}", corr).map_err(|e| e.to_string())?;
+                writeln!(f, "    correlation: {:.6}", param_corr).map_err(|e| e.to_string())?;
             }
         }
     }
@@ -568,13 +586,6 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 if cov.abs() <= 1e-15 {
                     continue;
                 }
-                let var_i = iov[(i, i)];
-                let var_j = iov[(j, j)];
-                let corr = if var_i > 0.0 && var_j > 0.0 {
-                    cov / (var_i.sqrt() * var_j.sqrt())
-                } else {
-                    0.0
-                };
                 let name_i = result
                     .kappa_names
                     .get(i)
@@ -585,9 +596,22 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(j)
                     .cloned()
                     .unwrap_or_else(|| format!("kappa_{}", j + 1));
+                let param_corr = result
+                    .omega_iov_param_corr
+                    .as_ref()
+                    .map(|m| m[(i, j)])
+                    .unwrap_or_else(|| {
+                        let var_i = iov[(i, i)];
+                        let var_j = iov[(j, j)];
+                        if var_i > 0.0 && var_j > 0.0 {
+                            cov / (var_i.sqrt() * var_j.sqrt())
+                        } else {
+                            0.0
+                        }
+                    });
                 writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
                 writeln!(f, "    covariance: {:.6}", cov).map_err(|e| e.to_string())?;
-                writeln!(f, "    correlation: {:.6}", corr).map_err(|e| e.to_string())?;
+                writeln!(f, "    correlation: {:.6}", param_corr).map_err(|e| e.to_string())?;
             }
         }
     }

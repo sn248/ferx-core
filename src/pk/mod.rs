@@ -418,6 +418,7 @@ mod tests {
                 kappa_fixed: Vec::new(),
             },
             mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
             tv_fn: None,
             pk_indices: vec![],
             eta_map: vec![],

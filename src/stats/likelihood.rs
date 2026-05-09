@@ -809,6 +809,7 @@ mod tests {
             theta_transform: Vec::new(),
             n_kappa: 0,
             kappa_names: Vec::new(),
+            kappa_mu_refs: HashMap::new(),
             indiv_param_names: vec!["CL".into(), "V".into()],
         }
     }

@@ -663,6 +663,7 @@ mod tests {
             indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
             default_params,
             mu_refs: refs,
+            kappa_mu_refs: HashMap::new(),
             tv_fn: None,
             pk_indices: vec![0, 1, 4],
 

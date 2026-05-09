@@ -605,6 +605,52 @@ fn fit_inner(
     let (cov_eigenvalues, cov_condition_number) =
         cov_diagnostics(result.covariance_matrix.as_ref());
 
+    // Derive per-eta lognormal flags from mu_refs, keyed by eta name.
+    // Etas absent from mu_refs (conditional / complex / logit) are treated as
+    // additive (false) and a warning is added when they participate in a block.
+    let eta_log_transformed: Vec<bool> = result
+        .params
+        .omega
+        .eta_names
+        .iter()
+        .map(|name| {
+            model
+                .mu_refs
+                .get(name)
+                .map(|r| r.log_transformed)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    let omega_param_corr = compute_param_corr(
+        &result.params.omega.matrix,
+        &eta_log_transformed,
+        &result.params.omega.eta_names,
+        "omega_param_corr",
+        &mut warnings,
+    );
+
+    let omega_iov_param_corr = result.params.omega_iov.as_ref().and_then(|iov| {
+        let kappa_log: Vec<bool> = model
+            .kappa_names
+            .iter()
+            .map(|name| {
+                model
+                    .kappa_mu_refs
+                    .get(name)
+                    .map(|r| r.log_transformed)
+                    .unwrap_or(false)
+            })
+            .collect();
+        compute_param_corr(
+            &iov.matrix,
+            &kappa_log,
+            &model.kappa_names,
+            "omega_iov_param_corr",
+            &mut warnings,
+        )
+    });
+
     let fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
@@ -665,6 +711,9 @@ fn fit_inner(
         sigma_types: model.error_model.sigma_types(),
         cov_eigenvalues,
         cov_condition_number,
+        eta_log_transformed,
+        omega_param_corr,
+        omega_iov_param_corr,
     };
 
     if options.verbose {
@@ -722,6 +771,80 @@ fn fit_inner(
 /// parameters exist (after excluding parameters whose diagonal entry is
 /// `<= 0`).  Parameters with non-positive diagonals are treated as fixed and
 /// silently excluded; the remaining free subblock is used for the computation.
+/// Threshold below which an off-diagonal omega/kappa entry is treated as
+/// structurally zero for correlation reporting.  Matches the threshold used
+/// in `io/output.rs` when emitting the `correlation:` field.
+const OFFDIAG_EPS: f64 = 1e-15;
+
+/// Compute a parameter-level correlation matrix from an omega/kappa matrix.
+///
+/// For lognormal pairs uses `(exp(ω_ij)−1)/√((exp(ω_ii)−1)(exp(ω_jj)−1))`.
+/// For additive pairs uses `ω_ij/√(ω_ii·ω_jj)` (eta-level).
+/// Mixed pairs fall back to eta-level and append a warning.
+/// Returns `None` when the matrix is diagonal (no off-diagonals above
+/// `OFFDIAG_EPS`).
+fn compute_param_corr(
+    omega: &DMatrix<f64>,
+    log_transformed: &[bool],
+    names: &[String],
+    warn_prefix: &str,
+    warnings: &mut Vec<String>,
+) -> Option<DMatrix<f64>> {
+    let n = omega.nrows();
+    debug_assert_eq!(
+        log_transformed.len(),
+        n,
+        "log_transformed must be parallel to omega diagonal (got {} for n={})",
+        log_transformed.len(),
+        n,
+    );
+    debug_assert_eq!(
+        names.len(),
+        n,
+        "names must be parallel to omega diagonal (got {} for n={})",
+        names.len(),
+        n,
+    );
+    let has_offdiag = (0..n).any(|i| (0..i).any(|j| omega[(i, j)].abs() > OFFDIAG_EPS));
+    if !has_offdiag {
+        return None;
+    }
+    let mut corr = DMatrix::identity(n, n);
+    for i in 0..n {
+        for j in 0..i {
+            let cov = omega[(i, j)];
+            if cov.abs() <= OFFDIAG_EPS {
+                continue;
+            }
+            let w_ii = omega[(i, i)];
+            let w_jj = omega[(j, j)];
+            let lt_i = *log_transformed.get(i).unwrap_or(&false);
+            let lt_j = *log_transformed.get(j).unwrap_or(&false);
+            let c = if lt_i && lt_j {
+                let num = cov.exp() - 1.0;
+                let den = ((w_ii.exp() - 1.0) * (w_jj.exp() - 1.0)).sqrt();
+                if den > 0.0 { num / den } else { 0.0 }
+            } else if !lt_i && !lt_j {
+                let den = (w_ii * w_jj).sqrt();
+                if den > 0.0 { cov / den } else { 0.0 }
+            } else {
+                let name_i = names.get(i).map(|s| s.as_str()).unwrap_or("?");
+                let name_j = names.get(j).map(|s| s.as_str()).unwrap_or("?");
+                warnings.push(format!(
+                    "{}: {} × {} have mixed lognormal/additive parameterizations; \
+                     falling back to eta-level correlation",
+                    warn_prefix, name_i, name_j
+                ));
+                let den = (w_ii * w_jj).sqrt();
+                if den > 0.0 { cov / den } else { 0.0 }
+            };
+            corr[(i, j)] = c;
+            corr[(j, i)] = c;
+        }
+    }
+    Some(corr)
+}
+
 fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
     let cov = match cov {
         Some(m) => m,
@@ -1303,6 +1426,7 @@ mod iov_integration {
             indiv_param_names: vec!["CL".into(), "V".into()],
             default_params,
             mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
             tv_fn: None,
             pk_indices: vec![0, 1],
             eta_map: vec![0],
@@ -1847,5 +1971,118 @@ mod tests_cov_diagnostics {
             (cn - 1.0).abs() < 1e-12,
             "condition_number must be 1.0, got {cn}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_param_corr {
+    use super::compute_param_corr;
+    use nalgebra::DMatrix;
+
+    fn names(ns: &[&str]) -> Vec<String> {
+        ns.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Lognormal pair: uses the bivariate lognormal formula.
+    #[test]
+    fn lognormal_pair() {
+        // ω = [[0.09, 0.045], [0.045, 0.09]]
+        let w11 = 0.09_f64;
+        let w12 = 0.045_f64;
+        let mut omega = DMatrix::zeros(2, 2);
+        omega[(0, 0)] = w11;
+        omega[(1, 1)] = w11;
+        omega[(0, 1)] = w12;
+        omega[(1, 0)] = w12;
+
+        let mut warnings = Vec::new();
+        let corr = compute_param_corr(
+            &omega,
+            &[true, true],
+            &names(&["ETA_CL", "ETA_V"]),
+            "test",
+            &mut warnings,
+        )
+        .expect("should return Some for block omega");
+
+        assert!(warnings.is_empty());
+        // diagonal must be 1
+        assert!((corr[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((corr[(1, 1)] - 1.0).abs() < 1e-12);
+        // lognormal formula: (exp(w12) - 1) / sqrt((exp(w11)-1)*(exp(w11)-1))
+        let expected = (w12.exp() - 1.0) / (w11.exp() - 1.0);
+        assert!(
+            (corr[(0, 1)] - expected).abs() < 1e-10,
+            "lognormal corr {:.6} != expected {:.6}",
+            corr[(0, 1)],
+            expected
+        );
+    }
+
+    /// Additive pair: falls back to eta-level formula (cov/sqrt(var_i*var_j)).
+    #[test]
+    fn additive_pair() {
+        let w11 = 4.0_f64;
+        let w12 = 1.0_f64;
+        let mut omega = DMatrix::zeros(2, 2);
+        omega[(0, 0)] = w11;
+        omega[(1, 1)] = w11;
+        omega[(0, 1)] = w12;
+        omega[(1, 0)] = w12;
+
+        let mut warnings = Vec::new();
+        let corr = compute_param_corr(
+            &omega,
+            &[false, false],
+            &names(&["ETA_CL", "ETA_V"]),
+            "test",
+            &mut warnings,
+        )
+        .expect("should return Some");
+
+        assert!(warnings.is_empty());
+        let expected = w12 / w11;
+        assert!((corr[(0, 1)] - expected).abs() < 1e-12);
+    }
+
+    /// Mixed pair (one lognormal, one additive) falls back to eta-level and emits a warning.
+    #[test]
+    fn mixed_pair_warns_and_falls_back() {
+        let w11 = 0.09_f64;
+        let w12 = 0.03_f64;
+        let mut omega = DMatrix::zeros(2, 2);
+        omega[(0, 0)] = w11;
+        omega[(1, 1)] = w11;
+        omega[(0, 1)] = w12;
+        omega[(1, 0)] = w12;
+
+        let mut warnings = Vec::new();
+        let corr = compute_param_corr(
+            &omega,
+            &[true, false],
+            &names(&["ETA_CL", "ETA_V"]),
+            "test",
+            &mut warnings,
+        )
+        .expect("should return Some");
+
+        assert_eq!(warnings.len(), 1, "expected one warning");
+        assert!(warnings[0].contains("mixed"));
+        // eta-level fallback
+        let expected = w12 / w11;
+        assert!((corr[(0, 1)] - expected).abs() < 1e-12);
+    }
+
+    /// Diagonal omega returns None (no off-diagonals to report).
+    #[test]
+    fn diagonal_returns_none() {
+        let mut omega = DMatrix::zeros(2, 2);
+        omega[(0, 0)] = 0.09;
+        omega[(1, 1)] = 0.04;
+        let mut warnings = Vec::new();
+        let result =
+            compute_param_corr(&omega, &[true, true], &names(&["A", "B"]), "test", &mut warnings);
+        assert!(result.is_none());
+        assert!(warnings.is_empty());
     }
 }

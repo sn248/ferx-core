@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-48357c0b.js";
+            window.path_to_searchindex_js = "../searchindex-d1274b28.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-911e3088.js"></script>
@@ -298,6 +298,21 @@ kappa KAPPA_KA ~ 0.10
 <p>A name may not appear in both <code>kappa</code> and <code>block_kappa</code> — this is a parse error.</p>
 <h3 id="declaration-order-1"><a class="header" href="#declaration-order-1">Declaration order</a></h3>
 <p>Kappa declaration order determines the IOV omega matrix layout and the kappa column order in output. Kappas follow all BSV etas in the internal indexing: if a model has 3 BSV etas and 2 kappas, the kappas sit at indices 4 and 5.</p>
+<h2 id="parameter-level-correlation-in-output"><a class="header" href="#parameter-level-correlation-in-output">Parameter-level correlation in output</a></h2>
+<p>When a <code>block_omega</code> (or <code>block_kappa</code>) is estimated, ferx reports a <strong>parameter-level correlation</strong> for each off-diagonal pair in the console and YAML output. This differs from the eta-level (normal-scale) correlation <code>ω_ij / √(ω_ii · ω_jj)</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Both etas lognormal (<code>THETA * exp(ETA)</code>)</th><th><code>(exp(ω_ij) − 1) / √((exp(ω_ii) − 1)(exp(ω_jj) − 1))</code></th></tr>
+</thead>
+<tbody>
+<tr><td>Both etas additive (<code>THETA + ETA</code>)</td><td><code>ω_ij / √(ω_ii · ω_jj)</code> (same as eta-level)</td></tr>
+<tr><td>Mixed or complex expressions</td><td>Falls back to eta-level; a warning is added to <code>FitResult.warnings</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The formula for lognormal pairs is the standard bivariate lognormal identity and reflects the correlation between the actual PK/PD parameters (e.g. CL and V) rather than their underlying normal variates.</p>
+<p>The result is exposed as <code>FitResult.omega_param_corr</code> (BSV) and <code>FitResult.omega_iov_param_corr</code> (IOV), and is used wherever ferx prints a <code>corr</code> or <code>correlation</code> value for a block omega pair.</p>
 <h2 id="sigma-residual-error"><a class="header" href="#sigma-residual-error">Sigma (Residual Error)</a></h2>
 <pre><code>sigma NAME ~ value
 </code></pre>

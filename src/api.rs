@@ -771,12 +771,18 @@ fn fit_inner(
 /// parameters exist (after excluding parameters whose diagonal entry is
 /// `<= 0`).  Parameters with non-positive diagonals are treated as fixed and
 /// silently excluded; the remaining free subblock is used for the computation.
+/// Threshold below which an off-diagonal omega/kappa entry is treated as
+/// structurally zero for correlation reporting.  Matches the threshold used
+/// in `io/output.rs` when emitting the `correlation:` field.
+const OFFDIAG_EPS: f64 = 1e-15;
+
 /// Compute a parameter-level correlation matrix from an omega/kappa matrix.
 ///
 /// For lognormal pairs uses `(exp(ω_ij)−1)/√((exp(ω_ii)−1)(exp(ω_jj)−1))`.
 /// For additive pairs uses `ω_ij/√(ω_ii·ω_jj)` (eta-level).
 /// Mixed pairs fall back to eta-level and append a warning.
-/// Returns `None` when the matrix is diagonal (no off-diagonals above 1e-15).
+/// Returns `None` when the matrix is diagonal (no off-diagonals above
+/// `OFFDIAG_EPS`).
 fn compute_param_corr(
     omega: &DMatrix<f64>,
     log_transformed: &[bool],
@@ -785,7 +791,21 @@ fn compute_param_corr(
     warnings: &mut Vec<String>,
 ) -> Option<DMatrix<f64>> {
     let n = omega.nrows();
-    let has_offdiag = (0..n).any(|i| (0..i).any(|j| omega[(i, j)].abs() > 1e-15));
+    debug_assert_eq!(
+        log_transformed.len(),
+        n,
+        "log_transformed must be parallel to omega diagonal (got {} for n={})",
+        log_transformed.len(),
+        n,
+    );
+    debug_assert_eq!(
+        names.len(),
+        n,
+        "names must be parallel to omega diagonal (got {} for n={})",
+        names.len(),
+        n,
+    );
+    let has_offdiag = (0..n).any(|i| (0..i).any(|j| omega[(i, j)].abs() > OFFDIAG_EPS));
     if !has_offdiag {
         return None;
     }
@@ -793,7 +813,7 @@ fn compute_param_corr(
     for i in 0..n {
         for j in 0..i {
             let cov = omega[(i, j)];
-            if cov.abs() <= 1e-15 {
+            if cov.abs() <= OFFDIAG_EPS {
                 continue;
             }
             let w_ii = omega[(i, i)];

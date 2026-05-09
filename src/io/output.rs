@@ -137,6 +137,11 @@ pub fn print_results(result: &FitResult) {
         ErrorModel::Combined => "combined",
     };
     eprintln!("\n--- SIGMA Estimates ({}) ---", err_type);
+    // Sigma is stored on the SD scale for both proportional and additive
+    // components (see src/stats/residual_error.rs). For the proportional
+    // component CV% = sigma * 100 directly; for the additive component the
+    // value is in observation units and no CV% applies. `result.sigma_types`
+    // is already parallel to `result.sigma`.
     for (i, &s) in result.sigma.iter().enumerate() {
         let sig_name = result
             .sigma_names
@@ -157,7 +162,16 @@ pub fn print_results(result: &FitResult) {
                 _ => "N/A".to_string(),
             }
         };
-        eprintln!("  {:<20} = {:.6}  SE = {}", label, s, se_str);
+        match result.sigma_types.get(i).copied() {
+            Some(SigmaType::Proportional) => eprintln!(
+                "  {:<20} = {:.6}  (CV% = {:.1})  SE = {}",
+                label,
+                s,
+                s * 100.0,
+                se_str,
+            ),
+            _ => eprintln!("  {:<20} = {:.6}  SE = {}", label, s, se_str),
+        }
     }
 
     // IOV (KAPPA) estimates
@@ -529,6 +543,12 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         ErrorModel::Combined => "combined",
     };
     writeln!(f, "\nsigma:  # error model: {}", err_type_str).map_err(|e| e.to_string())?;
+    // Sigma is stored on the SD scale (see src/stats/residual_error.rs).
+    // `variance` is therefore `estimate^2` for both component types. `cv_pct`
+    // is only emitted for proportional components, where `sigma * 100` is
+    // the coefficient of variation directly; an additive sigma's value lives
+    // in observation units and has no scale-free CV interpretation.
+    // `result.sigma_types` is parallel to `result.sigma`.
     for (i, &s) in result.sigma.iter().enumerate() {
         let is_fixed = result.sigma_fixed.get(i).copied().unwrap_or(false);
         let se = result.se_sigma.as_ref().and_then(|v| v.get(i).copied());
@@ -537,8 +557,19 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             .get(i)
             .cloned()
             .unwrap_or_else(|| format!("sigma_{}", i + 1));
+        let sigma_type = result.sigma_types.get(i).copied();
+        let kind_str = match sigma_type {
+            Some(SigmaType::Proportional) => "proportional",
+            Some(SigmaType::Additive) => "additive",
+            None => "unknown",
+        };
         writeln!(f, "  {}:", key).map_err(|e| e.to_string())?;
         writeln!(f, "    estimate: {:.6}", s).map_err(|e| e.to_string())?;
+        writeln!(f, "    variance: {:.6}", s * s).map_err(|e| e.to_string())?;
+        writeln!(f, "    type: {}", kind_str).map_err(|e| e.to_string())?;
+        if matches!(sigma_type, Some(SigmaType::Proportional)) {
+            writeln!(f, "    cv_pct: {:.2}", s * 100.0).map_err(|e| e.to_string())?;
+        }
         if is_fixed {
             writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
             writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
@@ -718,4 +749,135 @@ pub fn parameter_table(result: &FitResult) -> String {
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::DMatrix;
+
+    /// Build a near-empty `FitResult` with just enough data for the YAML
+    /// emitter to produce a sigma block. All fields the sigma block does not
+    /// read are zeroed / empty.
+    fn make_sigma_only_result(error_model: ErrorModel, sigma: Vec<f64>) -> FitResult {
+        let sigma_types = error_model.sigma_types();
+        let n = sigma.len();
+        FitResult {
+            method: EstimationMethod::Foce,
+            method_chain: vec![EstimationMethod::Foce],
+            converged: true,
+            ofv: 0.0,
+            aic: 0.0,
+            bic: 0.0,
+            theta: Vec::new(),
+            theta_names: Vec::new(),
+            eta_names: Vec::new(),
+            omega: DMatrix::zeros(0, 0),
+            sigma,
+            sigma_names: (0..n).map(|i| format!("EPS_{}", i + 1)).collect(),
+            error_model,
+            covariance_matrix: None,
+            se_theta: None,
+            se_omega: None,
+            se_sigma: None,
+            theta_fixed: Vec::new(),
+            omega_fixed: Vec::new(),
+            sigma_fixed: vec![false; n],
+            subjects: Vec::new(),
+            n_obs: 0,
+            n_subjects: 0,
+            n_parameters: 0,
+            n_iterations: 0,
+            interaction: false,
+            warnings: Vec::new(),
+            sir_ci_theta: None,
+            sir_ci_omega: None,
+            sir_ci_sigma: None,
+            sir_ess: None,
+            omega_iov: None,
+            kappa_names: Vec::new(),
+            kappa_fixed: Vec::new(),
+            se_kappa: None,
+            shrinkage_kappa: Vec::new(),
+            ebe_kappas: Vec::new(),
+            saem_mu_ref_m_step_evals_saved: None,
+            gradient_method_inner: String::new(),
+            gradient_method_outer: String::new(),
+            uses_ode_solver: false,
+            n_threads_used: 1,
+            nlopt_missing_algorithms: Vec::new(),
+            covariance_n_evals_estimated: None,
+            trace_path: None,
+            ebe_convergence_warnings: 0,
+            max_unconverged_subjects: 0,
+            total_ebe_fallbacks: 0,
+            covariance_status: CovarianceStatus::NotRequested,
+            shrinkage_eta: Vec::new(),
+            shrinkage_eps: f64::NAN,
+            wall_time_secs: 0.0,
+            model_name: "test".to_string(),
+            ferx_version: env!("CARGO_PKG_VERSION").to_string(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            sigma_types,
+            cov_eigenvalues: None,
+            cov_condition_number: None,
+            eta_log_transformed: Vec::new(),
+            omega_param_corr: None,
+            omega_iov_param_corr: None,
+        }
+    }
+
+    fn yaml_for(error_model: ErrorModel, sigma: Vec<f64>) -> String {
+        let result = make_sigma_only_result(error_model, sigma);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&result, path.to_str().unwrap()).expect("yaml write");
+        std::fs::read_to_string(&path).expect("yaml read")
+    }
+
+    #[test]
+    fn sigma_yaml_proportional_emits_variance_and_cv_pct() {
+        let yaml = yaml_for(ErrorModel::Proportional, vec![0.1]);
+        // sigma is on the SD scale: variance = 0.1² = 0.01, cv_pct = 10.
+        assert!(yaml.contains("estimate: 0.100000"), "yaml=\n{}", yaml);
+        assert!(yaml.contains("variance: 0.010000"), "yaml=\n{}", yaml);
+        assert!(yaml.contains("cv_pct: 10.00"), "yaml=\n{}", yaml);
+        assert!(yaml.contains("type: proportional"), "yaml=\n{}", yaml);
+    }
+
+    #[test]
+    fn sigma_yaml_additive_emits_variance_but_no_cv_pct() {
+        let yaml = yaml_for(ErrorModel::Additive, vec![0.5]);
+        assert!(yaml.contains("estimate: 0.500000"), "yaml=\n{}", yaml);
+        assert!(yaml.contains("variance: 0.250000"), "yaml=\n{}", yaml);
+        assert!(yaml.contains("type: additive"), "yaml=\n{}", yaml);
+        // Additive sigma is in observation units — no scale-free CV applies.
+        assert!(
+            !yaml.lines().any(|l| l.trim_start().starts_with("cv_pct:")),
+            "yaml unexpectedly contains cv_pct:\n{}",
+            yaml
+        );
+    }
+
+    #[test]
+    fn sigma_yaml_combined_distinguishes_components() {
+        let yaml = yaml_for(ErrorModel::Combined, vec![0.2, 0.5]);
+        // First sigma is proportional (CV%), second is additive (no CV).
+        assert!(yaml.contains("type: proportional"), "yaml=\n{}", yaml);
+        assert!(yaml.contains("type: additive"), "yaml=\n{}", yaml);
+        assert!(yaml.contains("cv_pct: 20.00"), "yaml=\n{}", yaml);
+        // Variances: 0.2² = 0.04 and 0.5² = 0.25.
+        assert!(yaml.contains("variance: 0.040000"), "yaml=\n{}", yaml);
+        assert!(yaml.contains("variance: 0.250000"), "yaml=\n{}", yaml);
+        // Exactly one cv_pct line for the prop component.
+        assert_eq!(
+            yaml.lines()
+                .filter(|l| l.trim_start().starts_with("cv_pct:"))
+                .count(),
+            1,
+            "yaml=\n{}",
+            yaml
+        );
+    }
 }

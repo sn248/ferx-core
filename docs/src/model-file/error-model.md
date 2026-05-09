@@ -46,6 +46,22 @@ Combines proportional and additive components:
 
 Use when both proportional and additive error sources are present. Requires two sigma parameters defined in `[parameters]`.
 
+## Sigma scale
+
+**All sigma parameters are estimated and reported on the standard-deviation scale**, not the variance scale. This is true for both proportional and additive components, and for both elements of a combined error model.
+
+In particular:
+
+| Error model       | Initial value `sigma = X` means …                                       |
+|-------------------|--------------------------------------------------------------------------|
+| `proportional`    | The residual SD scales as `X · f`, i.e. **CV% = `X · 100`**             |
+| `additive`        | The residual SD is `X` in the units of `DV` (no CV interpretation)     |
+| `combined`        | First sigma is proportional (CV-style), second is additive (units of `DV`) |
+
+So `sigma PROP_ERR ~ 0.1` for a proportional model is a **10% CV** initial value, not 1%. Likewise, the SE on a proportional sigma is on the SD scale — multiply by 100 for an SE in CV-percentage points.
+
+The fitted YAML emits both the SD (`estimate`) and the variance (`variance: estimate²`); for proportional components it also emits `cv_pct = estimate · 100` so downstream tooling does not have to re-derive it.
+
 ## Examples
 
 Proportional error (most common):

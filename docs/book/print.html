@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-675e09fa.js";
+            window.path_to_searchindex_js = "searchindex-d1274b28.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-911e3088.js"></script>
@@ -1057,6 +1057,23 @@ PARAM = THETA + ETA                   # additive
 <p>Combines proportional and additive components:</p>
 <p>\[ \text{Var}(DV) = (\sigma_1 \cdot f)^2 + \sigma_2^2 \]</p>
 <p>Use when both proportional and additive error sources are present. Requires two sigma parameters defined in <code>[parameters]</code>.</p>
+<h2 id="sigma-scale"><a class="header" href="#sigma-scale">Sigma scale</a></h2>
+<p><strong>All sigma parameters are estimated and reported on the standard-deviation scale</strong>, not the variance scale. This is true for both proportional and additive components, and for both elements of a combined error model.</p>
+<p>In particular:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Error model</th><th>Initial value <code>sigma = X</code> means …</th></tr>
+</thead>
+<tbody>
+<tr><td><code>proportional</code></td><td>The residual SD scales as <code>X · f</code>, i.e. <strong>CV% = <code>X · 100</code></strong></td></tr>
+<tr><td><code>additive</code></td><td>The residual SD is <code>X</code> in the units of <code>DV</code> (no CV interpretation)</td></tr>
+<tr><td><code>combined</code></td><td>First sigma is proportional (CV-style), second is additive (units of <code>DV</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<p>So <code>sigma PROP_ERR ~ 0.1</code> for a proportional model is a <strong>10% CV</strong> initial value, not 1%. Likewise, the SE on a proportional sigma is on the SD scale — multiply by 100 for an SE in CV-percentage points.</p>
+<p>The fitted YAML emits both the SD (<code>estimate</code>) and the variance (<code>variance: estimate²</code>); for proportional components it also emits <code>cv_pct = estimate · 100</code> so downstream tooling does not have to re-derive it.</p>
 <h2 id="examples-1"><a class="header" href="#examples-1">Examples</a></h2>
 <p>Proportional error (most common):</p>
 <pre><code>[parameters]

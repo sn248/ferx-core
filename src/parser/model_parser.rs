@@ -1606,11 +1606,15 @@ fn parse_parameters(
     // theta NAME(init)  |  theta NAME(init, FIX)
     // theta NAME(init, lower, upper)  |  theta NAME(init, lower, upper, FIX)
     //
+    // Whitespace between NAME and `(` is allowed (`theta TVCL (5, ...)`) — without
+    // it the line silently falls through and TVCL is later misclassified as a
+    // covariate.
+    //
     // The `FIX` keyword is case-insensitive and must be the exact token —
     // the trailing `\b` rejects prefix matches like `FIXED`, which would
     // otherwise silently mark the parameter as fixed.
     let theta_re = Regex::new(
-        r"(?i)theta\s+(\w+)\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)\s*,\s*([0-9eE.+-]+))?\s*(?:,\s*(FIX)\b)?\s*\)",
+        r"(?i)theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)\s*,\s*([0-9eE.+-]+))?\s*(?:,\s*(FIX)\b)?\s*\)",
     )
     .unwrap();
 
@@ -3831,6 +3835,29 @@ mod tests {
         let lines = vec!["theta TVCL(0.1, 0.01, 1.0)".to_string()];
         let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(!thetas[0].fixed);
+    }
+
+    #[test]
+    fn test_parse_theta_allows_space_before_paren() {
+        // Regression: `theta TVCL (5, ...)` (with whitespace before the paren)
+        // used to silently fail to match, causing TVCL to be misclassified as
+        // a covariate downstream.
+        let lines = vec![
+            "theta TVCL (5, 0.001, 100.0)".to_string(),
+            "theta TVV  ( 10 )".to_string(),
+            "theta TVKA\t(0.5, FIX)".to_string(),
+        ];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 3);
+        assert_eq!(thetas[0].name, "TVCL");
+        assert!((thetas[0].init - 5.0).abs() < 1e-12);
+        assert!((thetas[0].lower - 0.001).abs() < 1e-12);
+        assert!((thetas[0].upper - 100.0).abs() < 1e-12);
+        assert!(!thetas[0].fixed);
+        assert_eq!(thetas[1].name, "TVV");
+        assert!((thetas[1].init - 10.0).abs() < 1e-12);
+        assert_eq!(thetas[2].name, "TVKA");
+        assert!(thetas[2].fixed);
     }
 
     #[test]

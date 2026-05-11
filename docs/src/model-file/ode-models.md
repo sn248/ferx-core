@@ -96,11 +96,11 @@ The solver automatically adapts step sizes based on local error estimates.
 ## Dose Handling
 
 - **Bolus doses**: Applied as instantaneous state changes at dose times. The dose amount is added to the target compartment: `state[cmt] += amt`
+- **Infusion doses** (`RATE > 0`): Treated as a continuous zero-order input. The integrator's timeline is broken at the infusion's end (`time + amt/rate`), and `+rate` is added to the target compartment's derivative for every segment fully spanned by the infusion. Overlapping infusions on the same compartment sum their rates
 - **Compartment indexing**: Compartments are 1-indexed in the data file (`CMT=1` corresponds to the first state in the `states` list)
-- **Multiple doses**: The ODE is integrated in segments between dose events, with state discontinuities at each dose
+- **Multiple doses**: The ODE is integrated in segments between dose events, with state discontinuities at each bolus
 
 ## Limitations
 
-- Infusion doses (`RATE > 0`) are not currently supported for ODE models. Use bolus approximations or analytical models for infusions
 - The observable compartment contains the amount (not concentration). Divide by volume in the ODE equations if needed
 - Steady-state (`SS=1`) is not directly supported for ODE models

@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-d1274b28.js";
+            window.path_to_searchindex_js = "searchindex-7134ffcf.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-911e3088.js"></script>
@@ -1200,12 +1200,12 @@ of <code>0</code>.</p>
 <h2 id="dose-handling-1"><a class="header" href="#dose-handling-1">Dose Handling</a></h2>
 <ul>
 <li><strong>Bolus doses</strong>: Applied as instantaneous state changes at dose times. The dose amount is added to the target compartment: <code>state[cmt] += amt</code></li>
+<li><strong>Infusion doses</strong> (<code>RATE &gt; 0</code>): Treated as a continuous zero-order input. The integrator’s timeline is broken at the infusion’s end (<code>time + amt/rate</code>), and <code>+rate</code> is added to the target compartment’s derivative for every segment fully spanned by the infusion. Overlapping infusions on the same compartment sum their rates</li>
 <li><strong>Compartment indexing</strong>: Compartments are 1-indexed in the data file (<code>CMT=1</code> corresponds to the first state in the <code>states</code> list)</li>
-<li><strong>Multiple doses</strong>: The ODE is integrated in segments between dose events, with state discontinuities at each dose</li>
+<li><strong>Multiple doses</strong>: The ODE is integrated in segments between dose events, with state discontinuities at each bolus</li>
 </ul>
 <h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
 <ul>
-<li>Infusion doses (<code>RATE &gt; 0</code>) are not currently supported for ODE models. Use bolus approximations or analytical models for infusions</li>
 <li>The observable compartment contains the amount (not concentration). Divide by volume in the ODE equations if needed</li>
 <li>Steady-state (<code>SS=1</code>) is not directly supported for ODE models</li>
 </ul>

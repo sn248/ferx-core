@@ -17,6 +17,16 @@ use std::collections::HashMap;
 /// infusion window — this tolerance only guards float-equality on the bound.
 const INFUSION_EPS: f64 = 1e-12;
 
+/// `is_infusion()` only checks `rate > 0`, but a degenerate row with
+/// `rate > 0 && amt <= 0` (or NaN) yields `duration = amt/rate <= 0`
+/// (or NaN). Treating those as infusions would push an infusion-end
+/// break that sorts before the dose itself, and NaN would panic the
+/// break-time sort. Such rows fall back to the bolus branch instead
+/// (a zero/negative bolus update — visible, not silently dropped).
+fn is_real_infusion(d: &DoseEvent) -> bool {
+    d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
+}
+
 /// Returns `(cmt_idx_0based, rate)` for every infusion that is active
 /// throughout the closed segment `[t_start, t_end]`. By construction of the
 /// break-time list (every infusion start and end is a break time), each
@@ -25,7 +35,7 @@ fn active_infusions(doses: &[DoseEvent], t_start: f64, t_end: f64) -> Vec<(usize
     doses
         .iter()
         .filter(|d| {
-            d.is_infusion()
+            is_real_infusion(d)
                 && d.time <= t_start + INFUSION_EPS
                 && d.time + d.duration >= t_end - INFUSION_EPS
         })
@@ -72,7 +82,7 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
     let mut break_times: Vec<f64> = vec![0.0];
     for dose in &subject.doses {
         break_times.push(dose.time);
-        if dose.is_infusion() {
+        if is_real_infusion(dose) {
             break_times.push(dose.time + dose.duration);
         }
     }
@@ -88,7 +98,7 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
         // instantaneously — they're injected as a derivative term inside
         // the integrator (see `active_infusions` + wrapped RHS below).
         for dose in &subject.doses {
-            if (dose.time - t_start).abs() < 1e-12 && !dose.is_infusion() {
+            if (dose.time - t_start).abs() < 1e-12 && !is_real_infusion(dose) {
                 // dose.cmt is 1-based; state indices are 0-based
                 let cmt_idx = dose.cmt - 1;
                 if cmt_idx < n {
@@ -215,13 +225,13 @@ pub fn ode_predictions_event_driven(
             Kind::InfusionEnd => 3,
         }
     }
-    let n_infusion_ends = subject.doses.iter().filter(|d| d.is_infusion()).count();
+    let n_infusion_ends = subject.doses.iter().filter(|d| is_real_infusion(d)).count();
     let mut timeline: Vec<(f64, Kind, usize)> = Vec::with_capacity(
         subject.doses.len() + n_obs + subject.pk_only_times.len() + n_infusion_ends,
     );
     for (k, d) in subject.doses.iter().enumerate() {
         timeline.push((d.time, Kind::Dose, k));
-        if d.is_infusion() {
+        if is_real_infusion(d) {
             timeline.push((d.time + d.duration, Kind::InfusionEnd, k));
         }
     }
@@ -287,7 +297,7 @@ pub fn ode_predictions_event_driven(
                 // Boluses: add amt to state. Infusions: no instantaneous
                 // change — handled via the wrapped RHS for segments inside
                 // [d.time, d.time + d.duration].
-                if !d.is_infusion() {
+                if !is_real_infusion(d) {
                     let cmt_idx = d.cmt.saturating_sub(1);
                     if cmt_idx < n {
                         u[cmt_idx] += d.amt;
@@ -587,5 +597,66 @@ mod tests {
         assert_relative_eq!(preds[0], depot_2, epsilon = 1e-2, max_relative = 1e-4);
         assert_relative_eq!(preds[1], depot_4, epsilon = 1e-2, max_relative = 1e-4);
         assert_relative_eq!(preds[2], depot_8, epsilon = 1e-2, max_relative = 1e-4);
+    }
+
+    // Degenerate input guards: `rate > 0` alone is insufficient to mark a
+    // dose as an infusion — `duration = amt/rate` must also be > 0 and
+    // finite. Otherwise:
+    //   - `amt < 0` would push an infusion-end break time *before* the
+    //     dose, scrambling the segmented integration order.
+    //   - `amt = NaN` would make `partial_cmp` return None and panic
+    //     the break-time sort.
+    //   - In both cases, the bolus branch is skipped (because
+    //     `is_infusion()` is true on rate alone), so the dose silently
+    //     disappears from the prediction.
+    // `is_real_infusion` falls back to the bolus path for these rows.
+
+    #[test]
+    fn ode_degenerate_zero_amt_with_positive_rate_falls_back_to_bolus() {
+        // amt=0, rate>0 → duration=0. Treated as a (no-op) bolus.
+        // Result must match "no dose at all".
+        let doses = vec![DoseEvent::new(0.0, 0.0, 1, 100.0, false, 0.0)];
+        let obs_times = vec![1.0, 5.0, 10.0];
+        let subj = make_subject(doses, obs_times);
+        let pk = pk_one(5.0, 80.0);
+        let ode = one_cpt_ode_spec();
+
+        let preds = ode_predictions(&ode, &pk.values, &subj);
+
+        assert_eq!(preds, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn ode_degenerate_negative_amt_with_positive_rate_does_not_break_ordering() {
+        // amt<0, rate>0 → duration<0. Pre-fix, the infusion-end break time
+        // would sort *before* the dose, producing nonsense segments and
+        // (silently) zero output because the bolus branch was skipped.
+        // Post-fix this is treated as a bolus with negative amt — at least
+        // visible to the caller.
+        let doses = vec![DoseEvent::new(0.0, -10.0, 1, 100.0, false, 0.0)];
+        let obs_times = vec![0.0, 1.0];
+        let subj = make_subject(doses, obs_times);
+        let pk = pk_one(5.0, 80.0);
+        let ode = one_cpt_ode_spec();
+
+        // Must not panic; the negative bolus update is clamped to 0 by
+        // the negative-prediction guard in `ode_predictions`.
+        let preds = ode_predictions(&ode, &pk.values, &subj);
+        assert_eq!(preds.len(), 2);
+    }
+
+    #[test]
+    fn ode_degenerate_nan_amt_with_positive_rate_does_not_panic() {
+        // amt=NaN, rate>0 → duration=NaN. Pre-fix, sort_by(partial_cmp).unwrap()
+        // would panic on the break-time vec. Post-fix the row falls through
+        // to the bolus branch and the panic is avoided.
+        let doses = vec![DoseEvent::new(0.0, f64::NAN, 1, 100.0, false, 0.0)];
+        let obs_times = vec![1.0];
+        let subj = make_subject(doses, obs_times);
+        let pk = pk_one(5.0, 80.0);
+        let ode = one_cpt_ode_spec();
+
+        let preds = ode_predictions(&ode, &pk.values, &subj);
+        assert_eq!(preds.len(), 1);
     }
 }

@@ -17,7 +17,7 @@ ferx <model.ferx> --simulate
 ferx model.ferx --data data.csv
 ```
 
-Parses the model file, reads the data, and runs the estimation method specified in `[fit_options]` (defaults to FOCE).
+Parses the model file, reads the data, and runs the estimation method specified in `[fit_options]` (defaults to FOCEI).
 
 ### Simulate and Fit
 

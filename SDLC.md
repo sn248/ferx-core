@@ -1,15 +1,15 @@
-# Software Development Life Cycle — ferx-nlme
+# Software Development Life Cycle — ferx-core
 
 ## 1. Project Overview
 
-**ferx-nlme** is a Rust-based Nonlinear Mixed Effects (NLME) modeling engine for population pharmacokinetics. It implements FOCE/FOCEI estimation methods with analytical PK solutions and an optional ODE solver.
+**ferx-core** is a Rust-based Nonlinear Mixed Effects (NLME) modeling engine for population pharmacokinetics. It implements FOCE/FOCEI estimation methods with analytical PK solutions and an optional ODE solver.
 
 | Attribute | Value |
 |-----------|-------|
 | Language | Rust |
 | Current version | 0.1.0 (active development) |
 | Binary name | `ferx` |
-| Repository | GitHub (InsightRX/ferx-nlme) |
+| Repository | GitHub (FeRx-NLME/ferx-core) |
 | Toolchain | Enzyme (custom Rust toolchain for automatic differentiation) |
 
 ## 2. Development Environment Setup

@@ -53,4 +53,4 @@ src/
 
 ## License
 
-FeRx-NLME is released under the [MIT License](https://github.com/InsightRX/ferx-nlme/blob/main/LICENSE). Copyright © 2026 InsightRX, Inc.
+FeRx-NLME is released under the [MIT License](https://github.com/FeRx-NLME/ferx-core/blob/main/LICENSE).

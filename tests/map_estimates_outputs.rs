@@ -9,14 +9,14 @@
 //!    EBEs live in `fit$ebe_etas` on the R side; sdtab is now strictly
 //!    per-observation diagnostic data.
 
-use ferx_nlme::io::output::sdtab;
-use ferx_nlme::parser::model_parser::parse_model_file;
-use ferx_nlme::{fit, read_nonmem_csv, FitOptions, Optimizer};
+use ferx_core::io::output::sdtab;
+use ferx_core::parser::model_parser::parse_model_file;
+use ferx_core::{fit, read_nonmem_csv, FitOptions, Optimizer};
 use std::path::Path;
 
 fn warfarin_setup() -> (
-    ferx_nlme::types::CompiledModel,
-    ferx_nlme::types::Population,
+    ferx_core::types::CompiledModel,
+    ferx_core::types::Population,
 ) {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin example must parse");

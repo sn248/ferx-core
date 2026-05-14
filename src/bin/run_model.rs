@@ -42,9 +42,9 @@ fn main() {
 
     let t_start = Instant::now();
     let result = if let Some(csv_path) = data_path {
-        ferx_nlme::run_model_with_data(model_path, csv_path)
+        ferx_core::run_model_with_data(model_path, csv_path)
     } else if simulate {
-        ferx_nlme::run_model_simulate(model_path)
+        ferx_core::run_model_simulate(model_path)
     } else {
         eprintln!("Error: specify --data <file.csv> or --simulate");
         std::process::exit(1);
@@ -60,13 +60,13 @@ fn main() {
                 .unwrap_or("model");
 
             let sdtab_path = format!("{}-sdtab.csv", model_name);
-            match ferx_nlme::io::output::write_sdtab_csv(&fit_result, &population, &sdtab_path) {
+            match ferx_core::io::output::write_sdtab_csv(&fit_result, &population, &sdtab_path) {
                 Ok(()) => eprintln!("Residuals written to {}", sdtab_path),
                 Err(e) => eprintln!("Warning: failed to write sdtab: {}", e),
             }
 
             let yaml_path = format!("{}-fit.yaml", model_name);
-            match ferx_nlme::io::output::write_estimates_yaml(&fit_result, &yaml_path) {
+            match ferx_core::io::output::write_estimates_yaml(&fit_result, &yaml_path) {
                 Ok(()) => eprintln!("Estimates written to {}", yaml_path),
                 Err(e) => eprintln!("Warning: failed to write estimates: {}", e),
             }

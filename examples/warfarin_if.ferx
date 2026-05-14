@@ -2,7 +2,7 @@
 # subjects (WT > 70) get an allometric clearance bump, lighter subjects use
 # the typical clearance directly.
 #
-# Demonstrates ferx-nlme's `if (cond) { ... } else { ... }` syntax in the
+# Demonstrates ferx-core's `if (cond) { ... } else { ... }` syntax in the
 # [individual_parameters] block. The covariate-aware branching reproduces
 # the kind of conditional model construction users write in NONMEM
 # (`IF (WT.GT.70) THEN ... ENDIF`) or nlmixr2 (`if (WT > 70) { ... }`).

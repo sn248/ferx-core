@@ -1,8 +1,8 @@
 //! Generate NONMEM-format CSV datasets for all examples.
 //! Usage: cargo run --bin generate_data
 
-use ferx_nlme::api::SimulationResult;
-use ferx_nlme::*;
+use ferx_core::api::SimulationResult;
+use ferx_core::*;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -530,7 +530,7 @@ fn generate_mm_oral() {
             du[0] = -ka * depot;
             du[1] = ka * depot / v - vmax * central / (km + central);
         });
-    let ode_spec = ferx_nlme::ode::OdeSpec {
+    let ode_spec = ferx_core::ode::OdeSpec {
         rhs: ode_rhs,
         n_states: 2,
         state_names: vec!["depot".into(), "central".into()],

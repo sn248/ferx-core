@@ -226,7 +226,7 @@ rustc +enzyme -Z autodiff=Enable - </dev/null 2>&1 | head
 ### Workarounds for Windows users
 
 - **WSL2 (recommended)**: Install Ubuntu under WSL2 and follow the [Linux instructions](#linux). Performance is near-native for CPU-bound workloads like model fitting.
-- **Docker**: Use the forthcoming ferx-nlme Docker image (coming soon) which ships with the toolchain pre-installed.
+- **Docker**: Use the forthcoming ferx-core Docker image (coming soon) which ships with the toolchain pre-installed.
 - **Remote dev**: SSH into a Linux server or cloud VM.
 
 ### Future Windows support
@@ -237,13 +237,13 @@ If you're a Windows developer who would like to help, a CI run against `x86_64-p
 
 ---
 
-## Building ferx-nlme from source
+## Building ferx-core from source
 
 Once your Enzyme toolchain is set up:
 
 ```bash
-git clone https://github.com/InsightRX/ferx-nlme
-cd ferx-nlme
+git clone https://github.com/FeRx-NLME/ferx-core
+cd ferx-core
 
 cargo build --release --features autodiff
 # Binary at target/release/ferx
@@ -282,12 +282,12 @@ Should print a successful model fit with parameter estimates.
 Ensure the Enzyme toolchain is set up (above). Then:
 
 ```r
-devtools::install_github("InsightRX/ferx")
+devtools::install_github("FeRx-NLME/ferx-r")
 ```
 
 The R package's build is driven by its `Makevars`, which invokes `cargo` and resolves the `enzyme` toolchain via rustup. Both must be set up correctly in your shell/Renviron before calling `install_github`.
 
-See the [ferx R package README](https://github.com/InsightRX/ferx) for API usage.
+See the [ferx R package README](https://github.com/FeRx-NLME/ferx-r) for API usage.
 
 ### Cancelling a running fit (Ctrl-C)
 
@@ -353,10 +353,10 @@ rustc +enzyme -Z autodiff=Enable - </dev/null 2>&1 | head
 If `Enable` is rejected, try `LooseTypes`, `Inline`, or `PrintTA`.
 
 ### `"Enzyme: cannot handle (forward) unknown intrinsic llvm.maximumnum"`
-Recent rustc lowers `f64::max()`/`f64::min()` to intrinsics Enzyme can't yet differentiate. This is a ferx-nlme code-level issue — AD-instrumented functions must use manual `if` expressions. Should not happen on released ferx-nlme versions; if it does, please file an issue.
+Recent rustc lowers `f64::max()`/`f64::min()` to intrinsics Enzyme can't yet differentiate. This is a ferx-core code-level issue — AD-instrumented functions must use manual `if` expressions. Should not happen on released ferx-core versions; if it does, please file an issue.
 
 ### `"cargo is unavailable for the active toolchain"` (info, not error)
 Cargo wasn't copied into your linked toolchain. Either copy it (`cp ~/.cargo/bin/cargo /opt/rust-nightly/bin/`) or ignore — rustup falls back to nightly's cargo, which works.
 
 ### Refreshing when upstream nightly rolls forward
-If a new ferx-nlme release references stdlib items your cached toolchain doesn't have (e.g. `autodiff_forward` not found), rebuild `/opt/rust-nightly` against the current nightly, and rebuild Enzyme if the LLVM major version changed.
+If a new ferx-core release references stdlib items your cached toolchain doesn't have (e.g. `autodiff_forward` not found), rebuild `/opt/rust-nightly` against the current nightly, and rebuild Enzyme if the LLVM major version changed.

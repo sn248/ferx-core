@@ -1,6 +1,6 @@
 //! Cooperative cancellation token for long-running fits.
 //!
-//! Motivation: when ferx-nlme is called from R (via extendr) or any other
+//! Motivation: when ferx-core is called from R (via extendr) or any other
 //! FFI host, the host cannot interrupt our Rust hot loops. `CancelFlag` is a
 //! cheap shared atomic that callers clone into [`FitOptions`](crate::types::FitOptions);
 //! the estimation loops poll it at safe points and return a partial/empty

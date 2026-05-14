@@ -7,13 +7,13 @@
 //! points. The asserts are loose enough to catch "regression to garbage"
 //! while tolerating normal optimizer jitter.
 
-use ferx_nlme::parser::model_parser::parse_model_file;
-use ferx_nlme::{fit, read_nonmem_csv, FitOptions, Optimizer};
+use ferx_core::parser::model_parser::parse_model_file;
+use ferx_core::{fit, read_nonmem_csv, FitOptions, Optimizer};
 use std::path::Path;
 
 fn data_and_model() -> (
-    ferx_nlme::types::CompiledModel,
-    ferx_nlme::types::Population,
+    ferx_core::types::CompiledModel,
+    ferx_core::types::Population,
 ) {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin example must parse");

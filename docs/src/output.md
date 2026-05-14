@@ -123,7 +123,7 @@ Values of `NaN` indicate a zero-variance omega component (ETA) or fewer than two
 | Field | Description |
 |-------|-------------|
 | `model_name` | Name from the `.ferx` file (or `"Unnamed"`) |
-| `ferx_version` | Version of ferx-nlme that produced the result |
+| `ferx_version` | Version of ferx-core that produced the result |
 | `wall_time_secs` | Wall-clock time for the complete fit (seconds) |
 | `gradient_method_inner` | Gradient method used in the inner (EBE) loop, e.g. `FiniteDifference` |
 | `gradient_method_outer` | Gradient method used in the outer loop, e.g. `FiniteDifference` or `AutoDiff` |

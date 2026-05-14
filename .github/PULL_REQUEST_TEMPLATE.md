@@ -20,7 +20,7 @@
 ## Cross-repo dependency
 | Repo | PR | Status | Must merge |
 |------|----|--------|------------|
-| ferx (R) | InsightRX/ferx#___ | open / merged / not needed | before / after / together / — |
+| ferx (R) | FeRx-NLME/ferx-r#___ | open / merged / not needed | before / after / together / — |
 
 <!-- If a ferx PR is required but not yet open, mark this PR as Draft. -->
 

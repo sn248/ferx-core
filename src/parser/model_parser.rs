@@ -3116,7 +3116,7 @@ mod tests {
     #[test]
     fn test_method_chain_helper_default() {
         let opts = FitOptions::default();
-        assert_eq!(opts.method_chain(), vec![EstimationMethod::Foce]);
+        assert_eq!(opts.method_chain(), vec![EstimationMethod::FoceI]);
     }
 
     #[test]

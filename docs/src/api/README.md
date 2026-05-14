@@ -6,13 +6,13 @@ FeRx-NLME can be used as a Rust library for embedding population PK estimation i
 
 ```toml
 [dependencies]
-ferx-nlme = { path = "../ferx-nlme", features = ["autodiff"] }
+ferx-core = { path = "../ferx-core", features = ["autodiff"] }
 ```
 
 ## Quick Example
 
 ```rust
-use ferx_nlme::*;
+use ferx_core::*;
 use std::path::Path;
 
 fn main() -> Result<(), String> {

@@ -1,6 +1,6 @@
 # Core Types
 
-The main types exported by `ferx_nlme`. All types are available via `use ferx_nlme::*`.
+The main types exported by `ferx_core`. All types are available via `use ferx_core::*`.
 
 ## CompiledModel
 

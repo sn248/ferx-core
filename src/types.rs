@@ -752,7 +752,7 @@ pub struct FitResult {
     pub wall_time_secs: f64,
     /// Model name (from the `.ferx` file or "Unnamed").
     pub model_name: String,
-    /// ferx-nlme library version (from Cargo.toml at compile time).
+    /// ferx-core library version (from Cargo.toml at compile time).
     pub ferx_version: String,
     /// Per-ETA transformation metadata (see `EtaParamInfo`). Used by the R
     /// layer to pick the correct CI / CV% formula for each random effect.

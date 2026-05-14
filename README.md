@@ -1,4 +1,4 @@
-# ferx-nlme
+# ferx-core
 
 A high-performance Nonlinear Mixed Effects (NLME) modeling engine for population pharmacokinetics, written in Rust. Implements FOCE/FOCEI estimation with analytical PK solutions and an optional ODE solver, similar to NONMEM.
 

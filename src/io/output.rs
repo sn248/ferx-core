@@ -794,6 +794,7 @@ mod tests {
             sir_ci_omega: None,
             sir_ci_sigma: None,
             sir_ess: None,
+            sir_resamples_packed: None,
             omega_iov: None,
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),

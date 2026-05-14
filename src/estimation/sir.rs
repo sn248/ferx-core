@@ -30,6 +30,10 @@ pub struct SirResult {
     pub ci_sigma: Vec<(f64, f64)>,
     /// Effective sample size (ESS = 1 / sum(w_k^2))
     pub effective_sample_size: f64,
+    /// Resampled packed parameter vectors, retained when
+    /// `FitOptions.sir_keep_samples = true`. `None` otherwise.
+    /// Length equals `FitOptions.sir_resamples` when populated.
+    pub resamples_packed: Option<Vec<Vec<f64>>>,
 }
 
 /// Run the SIR procedure after maximum likelihood estimation.
@@ -274,11 +278,23 @@ pub fn run_sir(
     let ci_omega: Vec<(f64, f64)> = omega_samples.iter().map(|s| percentile_ci(s)).collect();
     let ci_sigma: Vec<(f64, f64)> = sigma_samples.iter().map(|s| percentile_ci(s)).collect();
 
+    let resamples_packed = if options.sir_keep_samples {
+        Some(
+            resampled_indices
+                .iter()
+                .map(|&idx| samples[idx].clone())
+                .collect(),
+        )
+    } else {
+        None
+    };
+
     Ok(SirResult {
         ci_theta,
         ci_omega,
         ci_sigma,
         effective_sample_size: ess,
+        resamples_packed,
     })
 }
 

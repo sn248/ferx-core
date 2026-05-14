@@ -704,6 +704,11 @@ pub struct FitResult {
     pub sir_ci_omega: Option<Vec<(f64, f64)>>,
     pub sir_ci_sigma: Option<Vec<(f64, f64)>>,
     pub sir_ess: Option<f64>,
+    /// Resampled packed parameter vectors retained from the SIR step, available
+    /// when `FitOptions.sir_keep_samples = true`. Each `Vec<f64>` is a draw in
+    /// the packed (log-theta, Cholesky-omega, log-sigma) parameter space.
+    /// Consumed by `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`.
+    pub sir_resamples_packed: Option<Vec<Vec<f64>>>,
     // IOV results (present when kappa declarations exist in the model)
     pub omega_iov: Option<DMatrix<f64>>,
     pub kappa_names: Vec<String>,
@@ -822,6 +827,11 @@ pub struct FitOptions {
     pub sir_samples: usize,
     pub sir_resamples: usize,
     pub sir_seed: Option<u64>,
+    /// When `true` and SIR is enabled, the resampled packed parameter vectors
+    /// are retained on `FitResult.sir_resamples_packed` for downstream use by
+    /// `simulate_with_uncertainty()`. Adds `n_resamples * n_packed * 8` bytes
+    /// to the result; default `false`.
+    pub sir_keep_samples: bool,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -913,6 +923,7 @@ impl Default for FitOptions {
             sir_samples: 1000,
             sir_resamples: 250,
             sir_seed: None,
+            sir_keep_samples: false,
             bloq_method: BloqMethod::Drop,
             steihaug_max_iters: 50,
             mu_referencing: true,
@@ -1075,6 +1086,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "sir_samples",
         "sir_resamples",
         "sir_seed",
+        "sir_keep_samples",
         "bloq_method",
         "bloq",
         "mu_referencing",

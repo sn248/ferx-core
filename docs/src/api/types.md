@@ -113,7 +113,7 @@ pub struct FitOptions {
 }
 ```
 
-Use `FitOptions::default()` for standard FOCE settings.
+Use `FitOptions::default()` for standard FOCEI settings.
 
 ## FitResult
 

@@ -68,8 +68,8 @@ Set via `method` in `[fit_options]`:
 
 | Method | Description |
 |--------|-------------|
-| `foce` | First-Order Conditional Estimation (default) |
-| `focei` | FOCE with Interaction |
+| `foce` | First-Order Conditional Estimation |
+| `focei` | FOCE with Interaction (default) |
 | `gn` | Gauss-Newton (BHHH) with Levenberg-Marquardt damping |
 | `gn_hybrid` | Gauss-Newton followed by FOCEI polish |
 | `saem` | Stochastic Approximation EM |

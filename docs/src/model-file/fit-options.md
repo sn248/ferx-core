@@ -13,7 +13,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `method` | `foce`, `focei`, `saem` | `foce` | Estimation method |
+| `method` | `foce`, `focei`, `saem` | `focei` | Estimation method |
 | `maxiter` | integer | `500` | Maximum outer loop iterations |
 | `covariance` | `true`, `false` | `true` | Compute covariance matrix and standard errors |
 | `optimizer` | `slsqp`, `lbfgs`, `nlopt_lbfgs`, `mma`, `bfgs`, `bobyqa`, `trust_region` | `slsqp` | Optimization algorithm |
@@ -29,17 +29,17 @@ The optional `[fit_options]` block configures the estimation method and optimize
 
 ## Estimation Methods
 
-### FOCE (default)
-```
-method = foce
-```
-First-Order Conditional Estimation. Linearizes the model around the empirical Bayes estimates. Fast and reliable for most models.
-
-### FOCEI
+### FOCEI (default)
 ```
 method = focei
 ```
 FOCE with Interaction. Includes the dependence of the residual error on random effects. More accurate than FOCE when the error model depends on individual predictions, but slightly slower.
+
+### FOCE
+```
+method = foce
+```
+First-Order Conditional Estimation. Linearizes the model around the empirical Bayes estimates. Fast and reliable for most models.
 
 ### SAEM
 ```
@@ -119,10 +119,10 @@ The number of global evaluations is auto-scaled based on the number of parameter
 
 ## Examples
 
-Standard FOCE with defaults:
+Standard FOCEI with defaults:
 ```
 [fit_options]
-  method     = foce
+  method     = focei
   maxiter    = 300
   covariance = true
 ```

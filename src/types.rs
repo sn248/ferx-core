@@ -881,7 +881,7 @@ pub struct FitOptions {
 impl Default for FitOptions {
     fn default() -> Self {
         Self {
-            method: EstimationMethod::Foce,
+            method: EstimationMethod::FoceI,
             methods: Vec::new(),
             outer_maxiter: 500,
             outer_gtol: 1e-6,
@@ -897,7 +897,7 @@ impl Default for FitOptions {
             // tighter EBEs (e.g. very-small-data simulation work).
             inner_tol: 1e-4,
             run_covariance_step: true,
-            interaction: false,
+            interaction: true,
             verbose: true,
             optimizer: Optimizer::Bobyqa,
             lbfgs_memory: 5,

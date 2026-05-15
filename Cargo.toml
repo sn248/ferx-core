@@ -21,6 +21,8 @@ ci = []  # Allows building without autodiff for CI (nightly, no Enzyme)
 nalgebra = "0.33"
 csv = "1.3"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 rayon = "1.10"
 rand = "0.8"
 rand_distr = "0.4"
@@ -29,10 +31,10 @@ thiserror = "2"
 nlopt = "0.8"
 argmin = { version = "0.11", features = ["serde1"] }
 argmin-math = { version = "0.5", features = ["nalgebra_latest"] }
+tempfile = "3"
 
 [dev-dependencies]
 approx = "0.5"
-tempfile = "3"
 
 [profile.release]
 lto = "fat"

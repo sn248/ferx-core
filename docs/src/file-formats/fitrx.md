@@ -1,0 +1,260 @@
+# The `.fitrx` Fit Bundle
+
+A `.fitrx` file is a single, portable, self-describing container for a fit
+result. It is designed to be readable from any language with stdlib-level
+support for zip, JSON, and CSV — Rust, R, Python, Julia.
+
+A `.fitrx` is just a zip archive. You can inspect it without any tooling:
+
+```bash
+unzip -l run1.fitrx
+unzip -p run1.fitrx manifest.json
+unzip -p run1.fitrx fit.json | jq .theta
+```
+
+## When to use it
+
+Use `--output run1.fitrx` (CLI) or `save_fit()` (Rust API) when you want a
+single artifact that can be shipped between machines and languages — for
+example, fitting in Rust and post-processing in R/Python. The legacy
+`*-sdtab.csv` and `*-fit.yaml` files are still written; `--output` is
+additive.
+
+## Producing a bundle
+
+From the CLI:
+
+```bash
+ferx model.ferx --data data.csv --output run1.fitrx
+ferx model.ferx --data data.csv --output run1.fitrx --include-data
+```
+
+`--include-data` embeds the input NONMEM CSV verbatim inside the bundle. Off
+by default — without it, downstream tools must re-supply the data when they
+want to call `predict()` or recompute diagnostics.
+
+From the Rust API:
+
+```rust
+use ferx_core::io::fitrx::{save_fit, SaveFitOptions};
+use std::path::{Path, PathBuf};
+
+save_fit(
+    &fit_result,
+    &population,
+    &std::fs::read_to_string("model.ferx").unwrap(),
+    Path::new("run1.fitrx"),
+    SaveFitOptions { include_data: Some(PathBuf::from("data.csv")) },
+)?;
+```
+
+## Loading a bundle
+
+```rust
+use ferx_core::io::fitrx::load_fit;
+
+let loaded = load_fit(Path::new("run1.fitrx"))?;
+println!("OFV: {}", loaded.fit.ofv);
+```
+
+`loaded.population` is `Some(...)` only when `data.csv` was bundled. The model
+source is always available as `loaded.model_source` and can be re-parsed via
+`parse_model_string` to reconstruct a `CompiledModel` (e.g. to run
+`predict()`).
+
+## Archive layout
+
+| Entry | Format | Required | Contents |
+|-------|--------|----------|----------|
+| `manifest.json` | JSON | yes | Format version, ferx version, timestamp, entry index |
+| `fit.json` | JSON | yes | All scalars, vectors, and matrices on `FitResult` |
+| `ebes.csv` | CSV | yes | One row per subject: `ID, <eta names...>, ofv_contribution, n_obs` |
+| `ebes_kappa.csv` | CSV | only when `n_kappa > 0` | One row per (subject, occasion): `ID, OCC, <kappa names...>` |
+| `predictions.csv` | CSV | yes | One row per observation: `ID, TIME, DV, PRED, IPRED, CWRES, IWRES, EBE_OFV, N_OBS` plus optional `CENS`, `OCC` |
+| `model.ferx` | UTF-8 text | yes | Verbatim model source |
+| `warnings.txt` | UTF-8 text | yes | One warning per line (mirrors `fit.json`) |
+| `data.csv` | CSV | only with `--include-data` | Copy of the input NONMEM data |
+
+Entries are deflate-compressed inside the zip archive.
+
+## `manifest.json`
+
+```json
+{
+  "format_version": "1",
+  "ferx_version": "0.1.0",
+  "model_name": "warfarin",
+  "created_at": "2026-05-15T18:06:56Z",
+  "entries": ["manifest.json", "fit.json", "ebes.csv", "..."]
+}
+```
+
+- `format_version` — currently `"1"`. Loaders should refuse unknown values
+  rather than try to parse them. New keys may be added within a version;
+  removals or semantic changes bump the version.
+- `created_at` — ISO-8601 UTC timestamp (seconds resolution).
+
+## `fit.json`
+
+Top-level keys mirror `FitResult` fields. Enums are encoded as snake_case
+strings:
+
+| Enum | Values |
+|------|--------|
+| `method` / `method_chain` | `"foce"`, `"focei"`, `"foce_gn"`, `"foce_gn_hybrid"`, `"saem"` |
+| `covariance_status` | `"not_requested"`, `"computed"`, `"failed"` |
+| `error_model` | `"additive"`, `"proportional"`, `"combined"` |
+| `theta.transform[i]` | `"linear"`, `"identity"`, `"log"`, `"logit"`, `"logit_probability"` |
+| `sigma.types[i]` | `"proportional"`, `"additive"` |
+| `eta_param_info[i].param_type` | `"log_normal"`, `"additive"`, `"logit"`, `"logit_probability"`, `"custom"` |
+
+Matrices use a row-major dense representation:
+
+```json
+{ "rows": 2, "cols": 2, "data": [0.1, 0.0, 0.0, 0.2] }
+```
+
+`Option<T>` fields use JSON `null` when absent (e.g. `covariance_matrix` is
+`null` when the covariance step did not run).
+
+### Layout
+
+```json
+{
+  "method": "focei",
+  "method_chain": ["focei"],
+  "converged": true,
+  "ofv": -280.18,
+  "aic": -266.18,
+  "bic": -247.28,
+  "n_obs": 110,
+  "n_subjects": 10,
+  "n_parameters": 7,
+  "n_iterations": 42,
+  "interaction": true,
+  "wall_time_secs": 1.234,
+  "n_threads_used": 4,
+  "uses_ode_solver": false,
+  "gradient_method_inner": "autodiff",
+  "gradient_method_outer": "autodiff",
+  "nlopt_missing_algorithms": [],
+  "covariance_status": "computed",
+  "covariance_n_evals_estimated": null,
+  "trace_path": null,
+  "ebe_convergence_warnings": 0,
+  "max_unconverged_subjects": 0,
+  "total_ebe_fallbacks": 0,
+  "warnings": [],
+  "saem_mu_ref_m_step_evals_saved": null,
+
+  "theta": {
+    "names": ["TVCL", "TVV", "TVKA"],
+    "estimates": [0.13, 7.7, 0.76],
+    "se": [0.014, 0.29, 0.035],
+    "fixed": [false, false, false],
+    "transform": ["log", "log", "log"]
+  },
+  "omega": {
+    "names": ["eta_CL", "eta_V", "eta_KA"],
+    "matrix": { "rows": 3, "cols": 3, "data": [/* row-major */] },
+    "se": [/* SEs of the free entries, or null */],
+    "fixed": [false, false, false],
+    "log_transformed": [true, true, true],
+    "param_corr": null,
+    "shrinkage": [0.05, 0.10, 0.15]
+  },
+  "sigma": {
+    "names": ["prop"],
+    "estimates": [0.05],
+    "se": [0.001],
+    "fixed": [false],
+    "types": ["proportional"]
+  },
+  "error_model": "proportional",
+  "shrinkage_eps": 0.05,
+  "covariance_matrix": { "rows": 7, "cols": 7, "data": [/* ... */] },
+  "cov_eigenvalues": [1.0, 0.5, 0.2],
+  "cov_condition_number": 5.0,
+
+  "sir": null,
+  "iov": null,
+
+  "eta_param_info": [
+    {
+      "eta_name": "eta_CL",
+      "param_type": "log_normal",
+      "linked_theta": "TVCL",
+      "individual_param_name": "CL"
+    }
+  ],
+  "model_name": "warfarin",
+  "ferx_version": "0.1.0"
+}
+```
+
+`sir` is non-null only when `[fit_options].sir = true`; `iov` is non-null only
+when the model uses kappa (block IOV).
+
+## `ebes.csv`
+
+```
+ID,ETA_CL,ETA_V,ETA_KA,ofv_contribution,n_obs
+1,0.029777,0.070511,0.438001,-25.745580,11
+2,0.017193,-0.058745,-0.344668,-33.692046,11
+```
+
+- `ID` — subject identifier as a string (matches `Population.subjects[i].id`).
+- ETA columns — named after `omega.names` from `fit.json`.
+- `ofv_contribution` — the subject's contribution to the total OFV.
+
+Subject rows appear in fit order.
+
+## `ebes_kappa.csv`
+
+Present only when the model uses IOV (block kappa).
+
+```
+ID,OCC,kappa_CL,kappa_V
+1,1,0.012,-0.004
+1,2,0.020,0.008
+```
+
+`OCC` is 1-based occasion index per subject.
+
+## `predictions.csv`
+
+```
+ID,TIME,DV,PRED,IPRED,CWRES,IWRES,EBE_OFV,N_OBS[,CENS[,OCC]]
+1,0.500000,5.365300,4.078143,5.351798,0.579358,0.237126,-25.745580,11
+```
+
+- `ID` — subject string identifier.
+- One row per observation (MDV=0). Subject rows are contiguous and in the
+  same observation order as the underlying data.
+- `CENS` and `OCC` columns are present only when at least one subject in the
+  population has censoring or occasions, respectively.
+- NaN values (e.g. CWRES/IWRES for censored observations) are written as
+  empty fields, not as `"NaN"`.
+
+## `warnings.txt`
+
+Plain text, one warning per line. Same content as `fit.json:warnings` —
+duplicated for grep-friendliness.
+
+## `data.csv`
+
+A verbatim copy of the input NONMEM CSV. Only present when the writer was
+asked to embed data (`--include-data` on the CLI, or `SaveFitOptions::include_data
+= Some(path)` via the Rust API).
+
+## Versioning
+
+The `format_version` string in `manifest.json` is the source of truth. A
+loader must:
+
+1. Reject any value it does not recognise.
+2. Tolerate unknown JSON keys within `fit.json` (forward-compatible additions
+   within the same version).
+
+When the on-disk format changes in a way that breaks readers, `format_version`
+is incremented.

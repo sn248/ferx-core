@@ -14,7 +14,9 @@
 //! Each draw is unpacked via [`unpack_params`] so theta, Omega, and Sigma are
 //! perturbed coherently (they share one packed vector).
 
-use crate::estimation::parameterization::{compute_bounds, unpack_params};
+use crate::estimation::parameterization::{
+    compute_bounds, packed_fixed_mask, unpack_params, PackedBounds,
+};
 use crate::types::{FitResult, ModelParameters, OmegaMatrix, SigmaVector};
 use nalgebra::{DMatrix, DVector};
 use rand::Rng;
@@ -112,10 +114,29 @@ pub(crate) fn regularised_cholesky(cov: &DMatrix<f64>) -> Result<DMatrix<f64>, S
         .ok_or_else(|| "Covariance could not be made positive definite".to_string())
 }
 
+/// Clamp packed indices flagged as FIX to their pinned packed value (taken
+/// from `x_hat`). `compute_bounds()` already pins fixed indices via
+/// `lower == upper`, so a continuous MVN draw would otherwise fail the bounds
+/// check for any model with a FIX'd theta / omega / sigma / kappa. This is
+/// equivalent to sampling only the free subspace: fixed parameters carry no
+/// uncertainty and must equal their pinned value.
+fn clamp_fixed_indices(x: &mut [f64], fixed_mask: &[bool], x_hat: &[f64]) {
+    for (i, &is_fixed) in fixed_mask.iter().enumerate() {
+        if is_fixed {
+            x[i] = x_hat[i];
+        }
+    }
+}
+
 /// Check that a candidate packed parameter vector unpacks to a parameter set
 /// that is in-bounds and has positive theta / sigma / omega-diagonal values.
-fn candidate_is_valid(x: &[f64], template: &ModelParameters) -> bool {
-    let bounds = compute_bounds(template);
+/// `bounds` is taken by reference to avoid recomputing it for each candidate
+/// (it doesn't change across draws within a single sampler call).
+fn candidate_is_valid(
+    x: &[f64],
+    template: &ModelParameters,
+    bounds: &PackedBounds,
+) -> bool {
     for (i, &xi) in x.iter().enumerate() {
         if xi < bounds.lower[i] || xi > bounds.upper[i] {
             return false;
@@ -190,6 +211,8 @@ fn draw_asymptotic(
         ));
     }
     let chol = regularised_cholesky(cov)?;
+    let bounds = compute_bounds(template);
+    let fixed_mask = packed_fixed_mask(template);
 
     let max_tries = 10 * n_draws;
     let mut draws = Vec::with_capacity(n_draws);
@@ -208,12 +231,17 @@ fn draw_asymptotic(
         let z: Vec<f64> = (0..n_packed).map(|_| rng.sample(StandardNormal)).collect();
         let z_vec = DVector::from_column_slice(&z);
         let delta = &chol * z_vec;
-        let x_k: Vec<f64> = x_hat
+        let mut x_k: Vec<f64> = x_hat
             .iter()
             .zip(delta.iter())
             .map(|(a, b)| a + b)
             .collect();
-        if !candidate_is_valid(&x_k, template) {
+        // Fixed parameters carry no uncertainty — pin them to x_hat before
+        // bounds-checking. Without this, `compute_bounds` (which sets
+        // lower == upper for fixed indices) would reject every draw for any
+        // model with a FIX'd theta / omega / sigma / kappa.
+        clamp_fixed_indices(&mut x_k, &fixed_mask, &x_hat);
+        if !candidate_is_valid(&x_k, template, &bounds) {
             continue;
         }
         draws.push(unpack_params(&x_k, template));
@@ -247,7 +275,10 @@ fn draw_sir(
 
     // Bounds-rejection sampling. SIR already filtered for finite weights, but
     // we still validate to be defensive against extreme proposal samples that
-    // slipped through.
+    // slipped through. Precompute bounds + fixed mask once per call.
+    let bounds = compute_bounds(template);
+    let fixed_mask = packed_fixed_mask(template);
+    let x_hat = crate::estimation::parameterization::pack_params(template);
     let max_tries = 10 * n_draws;
     let mut draws = Vec::with_capacity(n_draws);
     let mut tries = 0usize;
@@ -262,11 +293,15 @@ fn draw_sir(
         }
         tries += 1;
         let idx = rng.gen_range(0..pool.len());
-        let x_k = &pool[idx];
-        if !candidate_is_valid(x_k, template) {
+        let mut x_k = pool[idx].clone();
+        // Re-pin fixed indices defensively: SIR samples should already
+        // respect the pin (SIR's own bounds use `compute_bounds`), but
+        // clamping is cheap insurance against drift / off-by-epsilon issues.
+        clamp_fixed_indices(&mut x_k, &fixed_mask, &x_hat);
+        if !candidate_is_valid(&x_k, template, &bounds) {
             continue;
         }
-        draws.push(unpack_params(x_k, template));
+        draws.push(unpack_params(&x_k, template));
     }
     Ok(draws)
 }
@@ -534,5 +569,54 @@ mod tests {
                 assert!(prod[(i, j)].is_finite());
             }
         }
+    }
+
+    /// Regression test for the Copilot review on PR #7: when a parameter is
+    /// FIX'd, `compute_bounds` sets `lower == upper` for its packed index, so
+    /// a continuous MVN draw used to be rejected almost surely. We now
+    /// re-pin fixed indices to `x_hat` before bounds-checking, so the
+    /// sampler should succeed and the returned theta/sigma/omega should
+    /// equal the template's value for any FIX'd parameter.
+    #[test]
+    fn asymptotic_fixed_parameters_pinned_to_template() {
+        let mut template = tiny_template();
+        template.theta_fixed = vec![true, false]; // Pin TVCL
+        template.sigma_fixed = vec![true]; // Pin sigma too
+        let n_packed = crate::estimation::parameterization::packed_len(&template);
+        // Use a covariance with non-zero entries at the fixed indices to
+        // prove the clamp does the work (real fits set those rows/cols to
+        // zero, but the sampler shouldn't depend on that).
+        let cov = DMatrix::identity(n_packed, n_packed) * 0.01;
+        let fit = fit_with_cov(&template, cov);
+        let mut rng = StdRng::seed_from_u64(7);
+        let draws = draw_parameter_samples(
+            &fit,
+            &template,
+            50,
+            UncertaintyMethod::Asymptotic,
+            &mut rng,
+        )
+        .expect("FIX'd parameters should not exhaust max_tries");
+        assert_eq!(draws.len(), 50);
+        // Fixed indices are pinned on the *packed* scale (log-space) so the
+        // natural-scale round-trip through `unpack_params` is ULP-accurate
+        // rather than bit-exact.
+        for d in &draws {
+            assert!(
+                (d.theta[0] - 1.0).abs() < 1e-12,
+                "fixed TVCL drifted: {}",
+                d.theta[0]
+            );
+            assert!(
+                (d.sigma.values[0] - 0.1).abs() < 1e-12,
+                "fixed sigma drifted: {}",
+                d.sigma.values[0]
+            );
+        }
+        let any_v_varies = draws.iter().any(|d| (d.theta[1] - 5.0).abs() > 1e-6);
+        assert!(
+            any_v_varies,
+            "free parameter V was inadvertently pinned by the clamp"
+        );
     }
 }

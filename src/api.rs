@@ -1389,7 +1389,15 @@ pub fn simulate_with_uncertainty(
         &mut rng,
     )?;
 
-    let mut results = Vec::new();
+    // Final size is deterministic, so we can size the buffer once and avoid
+    // repeated reallocations for large simulations.
+    let total_obs: usize = population
+        .subjects
+        .iter()
+        .map(|s| s.obs_times.len())
+        .sum();
+    let mut results =
+        Vec::with_capacity(opts.n_uncertainty_draws * opts.n_sim_per_draw * total_obs);
     for (k, params) in draws.iter().enumerate() {
         let mut rows = simulate_inner_with_draw(
             model,

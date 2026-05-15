@@ -706,7 +706,9 @@ pub struct FitResult {
     pub sir_ess: Option<f64>,
     /// Resampled packed parameter vectors retained from the SIR step, available
     /// when `FitOptions.sir_keep_samples = true`. Each `Vec<f64>` is a draw in
-    /// the packed (log-theta, Cholesky-omega, log-sigma) parameter space.
+    /// the packed parameter space — same layout as `pack_params`:
+    /// `[log-theta, Cholesky-omega, log-sigma]`, with the IOV Cholesky block
+    /// appended when the model has kappa declarations.
     /// Consumed by `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`.
     pub sir_resamples_packed: Option<Vec<Vec<f64>>>,
     // IOV results (present when kappa declarations exist in the model)

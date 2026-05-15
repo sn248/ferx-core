@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Simulation - FeRx-NLME Documentation</title>
+        <title>File Formats - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,205 +177,250 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="simulation"><a class="header" href="#simulation">Simulation</a></h1>
-<h2 id="simulate"><a class="header" href="#simulate"><code>simulate()</code></a></h2>
-<p>Generate simulated observations from a model with random effects and residual error.</p>
+                        <h1 id="the-fitrx-fit-bundle"><a class="header" href="#the-fitrx-fit-bundle">The <code>.fitrx</code> Fit Bundle</a></h1>
+<p>A <code>.fitrx</code> file is a single, portable, self-describing container for a fit
+result. It is designed to be readable from any language with stdlib-level
+support for zip, JSON, and CSV — Rust, R, Python, Julia.</p>
+<p>A <code>.fitrx</code> is just a zip archive. You can inspect it without any tooling:</p>
+<pre><code class="language-bash">unzip -l run1.fitrx
+unzip -p run1.fitrx manifest.json
+unzip -p run1.fitrx fit.json | jq .theta
+</code></pre>
+<h2 id="when-to-use-it"><a class="header" href="#when-to-use-it">When to use it</a></h2>
+<p>Use <code>--output run1.fitrx</code> (CLI) or <code>save_fit()</code> (Rust API) when you want a
+single artifact that can be shipped between machines and languages — for
+example, fitting in Rust and post-processing in R/Python. The legacy
+<code>*-sdtab.csv</code> and <code>*-fit.yaml</code> files are still written; <code>--output</code> is
+additive.</p>
+<h2 id="producing-a-bundle"><a class="header" href="#producing-a-bundle">Producing a bundle</a></h2>
+<p>From the CLI:</p>
+<pre><code class="language-bash">ferx model.ferx --data data.csv --output run1.fitrx
+ferx model.ferx --data data.csv --output run1.fitrx --include-data
+</code></pre>
+<p><code>--include-data</code> embeds the input NONMEM CSV verbatim inside the bundle. Off
+by default — without it, downstream tools must re-supply the data when they
+want to call <code>predict()</code> or recompute diagnostics.</p>
+<p>From the Rust API:</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>pub fn simulate(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    params: &amp;ModelParameters,
-    n_sim: usize,
-) -&gt; Vec&lt;SimulationResult&gt;
-<span class="boring">}</span></code></pre>
-<p><strong>Parameters:</strong></p>
-<ul>
-<li><code>model</code>: Compiled model</li>
-<li><code>population</code>: Template population (dose events and observation times are used; DV values are ignored)</li>
-<li><code>params</code>: True parameter values for simulation</li>
-<li><code>n_sim</code>: Number of simulation replicates</li>
-</ul>
-<p><strong>Returns:</strong> Vector of <code>SimulationResult</code>, one per observation per subject per replicate.</p>
-<p><strong>Example:</strong></p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>let model = parse_model_file(Path::new("model.ferx"))?;
-let population = read_nonmem_csv(Path::new("data.csv"), None)?;
+</span>use ferx_core::io::fitrx::{save_fit, SaveFitOptions};
+use std::path::{Path, PathBuf};
 
-// Simulate 1000 replicates
-let sims = simulate(&amp;model, &amp;population, &amp;model.default_params, 1000);
-
-for sim in &amp;sims[..5] {
-    println!("Sim {}, ID {}, TIME {}, IPRED {:.3}, DV {:.3}",
-             sim.sim, sim.id, sim.time, sim.ipred, sim.dv_sim);
-}
-<span class="boring">}</span></code></pre>
-<h2 id="simulate_with_seed"><a class="header" href="#simulate_with_seed"><code>simulate_with_seed()</code></a></h2>
-<p>Same as <code>simulate()</code> but with a fixed random seed for reproducibility.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn simulate_with_seed(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    params: &amp;ModelParameters,
-    n_sim: usize,
-    seed: u64,
-) -&gt; Vec&lt;SimulationResult&gt;
-<span class="boring">}</span></code></pre>
-<h2 id="predict"><a class="header" href="#predict"><code>predict()</code></a></h2>
-<p>Population predictions without random effects (eta = 0). No simulation noise is added.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn predict(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    params: &amp;ModelParameters,
-) -&gt; Vec&lt;PredictionResult&gt;
-<span class="boring">}</span></code></pre>
-<p><strong>Returns:</strong> Vector of <code>PredictionResult</code> with population-level predictions.</p>
-<p><strong>Example:</strong></p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>let preds = predict(&amp;model, &amp;population, &amp;model.default_params);
-for p in &amp;preds {
-    println!("ID {}, TIME {}, PRED {:.3}", p.id, p.time, p.pred);
-}
-<span class="boring">}</span></code></pre>
-<h2 id="simulate_with_uncertainty"><a class="header" href="#simulate_with_uncertainty"><code>simulate_with_uncertainty()</code></a></h2>
-<p>Simulate observations while propagating <strong>population parameter uncertainty</strong>.
-For each parameter draw from the uncertainty distribution, etas (from the
-drawn Omega) and epsilons (from the drawn Sigma) are sampled — giving
-simulation bands that include both individual variability <em>and</em> uncertainty
-in the population estimates.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn simulate_with_uncertainty(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    fit_result: &amp;FitResult,
-    opts: &amp;SimulateUncertaintyOptions,
-) -&gt; Result&lt;Vec&lt;SimulationResult&gt;, String&gt;
-<span class="boring">}</span></code></pre>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub struct SimulateUncertaintyOptions {
-    pub n_uncertainty_draws: usize,      // parameter sets drawn
-    pub n_sim_per_draw: usize,           // eta/eps replicates per draw
-    pub method: UncertaintyMethod,       // Asymptotic | Sir
-    pub seed: Option&lt;u64&gt;,
-}
-
-pub enum UncertaintyMethod {
-    Asymptotic,   // MVN around ML estimate using FitResult.covariance_matrix
-    Sir,          // resamples from FitResult.sir_resamples_packed
-}
-<span class="boring">}</span></code></pre>
-<p><strong>Parameters:</strong></p>
-<ul>
-<li><code>fit_result</code>: Result of a previous <code>fit()</code> call. Must include
-<code>covariance_matrix</code> (Asymptotic) or <code>sir_resamples_packed</code> (SIR).</li>
-<li><code>opts.n_uncertainty_draws</code>: number of parameter sets drawn.</li>
-<li><code>opts.n_sim_per_draw</code>: number of subject-level replicates per draw.</li>
-<li><code>opts.method</code>: how to draw the parameter sets.</li>
-</ul>
-<p><strong>Returns:</strong> <code>Vec&lt;SimulationResult&gt;</code> of length <code>n_uncertainty_draws * n_sim_per_draw * n_subjects * n_obs</code>. Each row carries a <code>draw</code> index
-(1..=n_uncertainty_draws) and a <code>sim</code> index (1..=n_sim_per_draw).</p>
-<p><strong>Prerequisites:</strong></p>
-<ul>
-<li>For <code>UncertaintyMethod::Asymptotic</code>: run <code>fit()</code> with
-<code>run_covariance_step = true</code> (or <code>covariance = true</code> in <code>[fit_options]</code>).</li>
-<li>For <code>UncertaintyMethod::Sir</code>: run with <code>sir = true</code> <em>and</em>
-<code>sir_keep_samples = true</code> so the resampled vectors are kept on the
-<code>FitResult</code>.</li>
-</ul>
-<p><strong>Example:</strong></p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>let fit_opts = FitOptions {
-    run_covariance_step: true,
-    ..FitOptions::default()
-};
-let fit = fit(&amp;model, &amp;population, &amp;model.default_params, &amp;fit_opts)?;
-
-let sims = simulate_with_uncertainty(
-    &amp;model,
+save_fit(
+    &amp;fit_result,
     &amp;population,
-    &amp;fit,
-    &amp;SimulateUncertaintyOptions {
-        n_uncertainty_draws: 200,
-        n_sim_per_draw: 10,
-        method: UncertaintyMethod::Asymptotic,
-        seed: Some(42),
-    },
+    &amp;std::fs::read_to_string("model.ferx").unwrap(),
+    Path::new("run1.fitrx"),
+    SaveFitOptions { include_data: Some(PathBuf::from("data.csv")) },
 )?;
 <span class="boring">}</span></code></pre>
-<h2 id="result-types"><a class="header" href="#result-types">Result Types</a></h2>
+<h2 id="loading-a-bundle"><a class="header" href="#loading-a-bundle">Loading a bundle</a></h2>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>pub struct SimulationResult {
-    pub draw: usize,    // Uncertainty draw index (1-indexed; always 1 for simulate())
-    pub sim: usize,     // Replicate number within a draw (1-indexed)
-    pub id: String,     // Subject ID
-    pub time: f64,      // Observation time
-    pub ipred: f64,     // Individual prediction (no residual error)
-    pub dv_sim: f64,    // Simulated observation (with residual error)
-}
+</span>use ferx_core::io::fitrx::load_fit;
 
-pub struct PredictionResult {
-    pub id: String,
-    pub time: f64,
-    pub pred: f64,      // Population prediction (eta = 0)
-}
+let loaded = load_fit(Path::new("run1.fitrx"))?;
+println!("OFV: {}", loaded.fit.ofv);
 <span class="boring">}</span></code></pre>
-<h2 id="simulation-process"><a class="header" href="#simulation-process">Simulation Process</a></h2>
-<p>For each replicate and each subject:</p>
-<ol>
-<li>Sample random effects: \( \eta_i \sim N(0, \Omega) \) using the Cholesky factor \( L \): \( \eta = L \cdot z \), where \( z \sim N(0, I) \)</li>
-<li>Compute individual PK parameters via <code>pk_param_fn(theta, eta, covariates)</code></li>
-<li>Generate predictions using the structural model</li>
-<li>Add residual error: \( DV = IPRED + \sqrt{V} \cdot \epsilon \), where \( \epsilon \sim N(0, 1) \) and \( V \) is the residual variance from the error model</li>
-</ol>
-<h2 id="simulation-with-uncertainty-process"><a class="header" href="#simulation-with-uncertainty-process">Simulation with Uncertainty Process</a></h2>
-<p><code>simulate_with_uncertainty()</code> wraps the steps above in an outer loop over
-parameter draws:</p>
-<ol>
-<li>
-<p><strong>Outer loop</strong> — for each of <code>n_uncertainty_draws</code>, draw a population
-parameter set \( (\theta_k, \Omega_k, \Sigma_k) \) from the uncertainty
-distribution.</p>
+<p><code>loaded.population</code> is <code>Some(...)</code> only when <code>data.csv</code> was bundled. The model
+source is always available as <code>loaded.model_source</code> and can be re-parsed via
+<code>parse_model_string</code> to reconstruct a <code>CompiledModel</code> (e.g. to run
+<code>predict()</code>).</p>
+<h2 id="archive-layout"><a class="header" href="#archive-layout">Archive layout</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Entry</th><th>Format</th><th>Required</th><th>Contents</th></tr>
+</thead>
+<tbody>
+<tr><td><code>manifest.json</code></td><td>JSON</td><td>yes</td><td>Format version, ferx version, timestamp, entry index</td></tr>
+<tr><td><code>fit.json</code></td><td>JSON</td><td>yes</td><td>All scalars, vectors, and matrices on <code>FitResult</code></td></tr>
+<tr><td><code>ebes.csv</code></td><td>CSV</td><td>yes</td><td>One row per subject: <code>ID, &lt;eta names...&gt;, ofv_contribution, n_obs</code></td></tr>
+<tr><td><code>ebes_kappa.csv</code></td><td>CSV</td><td>only when <code>n_kappa &gt; 0</code></td><td>One row per (subject, occasion): <code>ID, OCC, &lt;kappa names...&gt;</code></td></tr>
+<tr><td><code>predictions.csv</code></td><td>CSV</td><td>yes</td><td>One row per observation: <code>ID, TIME, DV, PRED, IPRED, CWRES, IWRES, EBE_OFV, N_OBS</code> plus optional <code>CENS</code>, <code>OCC</code></td></tr>
+<tr><td><code>model.ferx</code></td><td>UTF-8 text</td><td>yes</td><td>Verbatim model source</td></tr>
+<tr><td><code>warnings.txt</code></td><td>UTF-8 text</td><td>no</td><td>One warning per line. Mirrors <code>fit.json:warnings</code> for grep-friendliness; loaders read warnings from <code>fit.json</code> and ignore this entry. Writers should still produce it.</td></tr>
+<tr><td><code>data.csv</code></td><td>CSV</td><td>only with <code>--include-data</code></td><td>Copy of the input NONMEM data</td></tr>
+</tbody>
+</table>
+</div>
+<p>Entries are deflate-compressed inside the zip archive.</p>
+<h2 id="manifestjson"><a class="header" href="#manifestjson"><code>manifest.json</code></a></h2>
+<pre><code class="language-json">{
+  "format_version": "1",
+  "ferx_version": "0.1.0",
+  "model_name": "warfarin",
+  "created_at": "2026-05-15T18:06:56Z",
+  "entries": ["manifest.json", "fit.json", "ebes.csv", "..."]
+}
+</code></pre>
 <ul>
-<li><strong>Asymptotic</strong>: \( x_k = \hat{x} + L_\text{cov} z \) in packed log-space
-(theta, Cholesky-omega, sigma share one packed vector), then unpack —
-theta, Omega, and Sigma are perturbed coherently from a single MVN draw.</li>
-<li><strong>SIR</strong>: pick a parameter vector at random from
-<code>FitResult.sir_resamples_packed</code> (the resampled pool retained from the
-SIR step).
-Draws that fall outside the parameter bounds or yield non-positive
-theta/omega/sigma are rejected and resampled (up to <code>10 × n_uncertainty_draws</code> attempts).</li>
+<li><code>format_version</code> — currently <code>"1"</code>. Loaders should refuse unknown values
+rather than try to parse them. New keys may be added within a version;
+removals or semantic changes bump the version.</li>
+<li><code>created_at</code> — ISO-8601 UTC timestamp (seconds resolution).</li>
 </ul>
-</li>
-<li>
-<p><strong>Inner loop</strong> — for the drawn \( (\theta_k, \Omega_k, \Sigma_k) \), run
-<code>n_sim_per_draw</code> replicates of the standard simulation process above.
-Etas are drawn from \( N(0, \Omega_k) \) and epsilons from the drawn
-\( \Sigma_k \).</p>
-</li>
+<h2 id="fitjson"><a class="header" href="#fitjson"><code>fit.json</code></a></h2>
+<p>Top-level keys mirror <code>FitResult</code> fields. Enums are encoded as snake_case
+strings:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Enum</th><th>Values</th></tr>
+</thead>
+<tbody>
+<tr><td><code>method</code> / <code>method_chain</code></td><td><code>"foce"</code>, <code>"focei"</code>, <code>"foce_gn"</code>, <code>"foce_gn_hybrid"</code>, <code>"saem"</code></td></tr>
+<tr><td><code>covariance_status</code></td><td><code>"not_requested"</code>, <code>"computed"</code>, <code>"failed"</code></td></tr>
+<tr><td><code>error_model</code></td><td><code>"additive"</code>, <code>"proportional"</code>, <code>"combined"</code></td></tr>
+<tr><td><code>theta.transform[i]</code></td><td><code>"identity"</code>, <code>"log"</code>, <code>"logit"</code>, <code>"logit_probability"</code></td></tr>
+<tr><td><code>sigma.types[i]</code></td><td><code>"proportional"</code>, <code>"additive"</code></td></tr>
+<tr><td><code>eta_param_info[i].param_type</code></td><td><code>"log_normal"</code>, <code>"additive"</code>, <code>"logit"</code>, <code>"logit_probability"</code>, <code>"custom"</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Matrices use a row-major dense representation:</p>
+<pre><code class="language-json">{ "rows": 2, "cols": 2, "data": [0.1, 0.0, 0.0, 0.2] }
+</code></pre>
+<p><code>Option&lt;T&gt;</code> fields use JSON <code>null</code> when absent (e.g. <code>covariance_matrix</code> is
+<code>null</code> when the covariance step did not run).</p>
+<p><strong>Non-finite floats.</strong> JSON has no representation for <code>NaN</code> or <code>±Inf</code>. The
+format encodes any non-finite <code>f64</code> as JSON <code>null</code>, both for scalars (e.g.
+<code>shrinkage_eps</code>, <code>cov_condition_number</code>) and for elements of numeric arrays
+including matrix <code>data</code> vectors. Loaders convert <code>null</code> back to <code>NaN</code>. This
+keeps the format robust for legitimate fits — <code>shrinkage_eps</code> is <code>NaN</code> when
+the model has fewer than two valid residuals, and <code>cov_condition_number</code> is
+<code>+Inf</code> when the smallest eigenvalue is non-positive.</p>
+<h3 id="layout"><a class="header" href="#layout">Layout</a></h3>
+<pre><code class="language-json">{
+  "method": "focei",
+  "method_chain": ["focei"],
+  "converged": true,
+  "ofv": -280.18,
+  "aic": -266.18,
+  "bic": -247.28,
+  "n_obs": 110,
+  "n_subjects": 10,
+  "n_parameters": 7,
+  "n_iterations": 42,
+  "interaction": true,
+  "wall_time_secs": 1.234,
+  "n_threads_used": 4,
+  "uses_ode_solver": false,
+  "gradient_method_inner": "autodiff",
+  "gradient_method_outer": "autodiff",
+  "nlopt_missing_algorithms": [],
+  "covariance_status": "computed",
+  "covariance_n_evals_estimated": null,
+  "trace_path": null,
+  "ebe_convergence_warnings": 0,
+  "max_unconverged_subjects": 0,
+  "total_ebe_fallbacks": 0,
+  "warnings": [],
+  "saem_mu_ref_m_step_evals_saved": null,
+
+  "theta": {
+    "names": ["TVCL", "TVV", "TVKA"],
+    "estimates": [0.13, 7.7, 0.76],
+    "se": [0.014, 0.29, 0.035],
+    "fixed": [false, false, false],
+    "transform": ["log", "log", "log"]
+  },
+  "omega": {
+    "names": ["eta_CL", "eta_V", "eta_KA"],
+    "matrix": { "rows": 3, "cols": 3, "data": [/* row-major */] },
+    "se": [/* SEs of the free entries, or null */],
+    "fixed": [false, false, false],
+    "log_transformed": [true, true, true],
+    "param_corr": null,
+    "shrinkage": [0.05, 0.10, 0.15]
+  },
+  "sigma": {
+    "names": ["prop"],
+    "estimates": [0.05],
+    "se": [0.001],
+    "fixed": [false],
+    "types": ["proportional"]
+  },
+  "error_model": "proportional",
+  "shrinkage_eps": 0.05,
+  "covariance_matrix": { "rows": 7, "cols": 7, "data": [/* ... */] },
+  "cov_eigenvalues": [1.0, 0.5, 0.2],
+  "cov_condition_number": 5.0,
+
+  "sir": null,
+  "iov": null,
+
+  "eta_param_info": [
+    {
+      "eta_name": "eta_CL",
+      "param_type": "log_normal",
+      "linked_theta": "TVCL",
+      "individual_param_name": "CL"
+    }
+  ],
+  "model_name": "warfarin",
+  "ferx_version": "0.1.0"
+}
+</code></pre>
+<p><code>sir</code> is non-null only when <code>[fit_options].sir = true</code>; <code>iov</code> is non-null only
+when the model uses kappa (block IOV).</p>
+<h2 id="ebescsv"><a class="header" href="#ebescsv"><code>ebes.csv</code></a></h2>
+<pre><code>ID,ETA_CL,ETA_V,ETA_KA,ofv_contribution,n_obs
+1,0.029777,0.070511,0.438001,-25.745580,11
+2,0.017193,-0.058745,-0.344668,-33.692046,11
+</code></pre>
+<ul>
+<li><code>ID</code> — subject identifier as a string (matches <code>Population.subjects[i].id</code>).</li>
+<li>ETA columns — named after <code>omega.names</code> from <code>fit.json</code>.</li>
+<li><code>ofv_contribution</code> — the subject’s contribution to the total OFV.</li>
+</ul>
+<p>Subject rows appear in fit order.</p>
+<h2 id="ebes_kappacsv"><a class="header" href="#ebes_kappacsv"><code>ebes_kappa.csv</code></a></h2>
+<p>Present only when the model uses IOV (block kappa).</p>
+<pre><code>ID,OCC,kappa_CL,kappa_V
+1,1,0.012,-0.004
+1,2,0.020,0.008
+</code></pre>
+<p><code>OCC</code> is 1-based occasion index per subject.</p>
+<h2 id="predictionscsv"><a class="header" href="#predictionscsv"><code>predictions.csv</code></a></h2>
+<pre><code>ID,TIME,DV,PRED,IPRED,CWRES,IWRES,EBE_OFV,N_OBS[,CENS[,OCC]]
+1,0.500000,5.365300,4.078143,5.351798,0.579358,0.237126,-25.745580,11
+</code></pre>
+<ul>
+<li><code>ID</code> — subject string identifier.</li>
+<li>One row per observation (MDV=0). Subject rows are contiguous and in the
+same observation order as the underlying data.</li>
+<li><code>CENS</code> and <code>OCC</code> columns are present only when at least one subject in the
+population has censoring or occasions, respectively.</li>
+<li>NaN values (e.g. CWRES/IWRES for censored observations) are written as
+empty fields, not as <code>"NaN"</code>.</li>
+</ul>
+<h2 id="warningstxt"><a class="header" href="#warningstxt"><code>warnings.txt</code></a></h2>
+<p>Plain text, one warning per line. Same content as <code>fit.json:warnings</code> —
+duplicated for grep-friendliness.</p>
+<h2 id="datacsv"><a class="header" href="#datacsv"><code>data.csv</code></a></h2>
+<p>A verbatim copy of the input NONMEM CSV. Only present when the writer was
+asked to embed data (<code>--include-data</code> on the CLI, or <code>SaveFitOptions::include_data = Some(path)</code> via the Rust API).</p>
+<h2 id="versioning"><a class="header" href="#versioning">Versioning</a></h2>
+<p>The <code>format_version</code> string in <code>manifest.json</code> is the source of truth. A
+loader must:</p>
+<ol>
+<li>Reject any value it does not recognise.</li>
+<li>Tolerate unknown JSON keys within <code>fit.json</code> (forward-compatible additions
+within the same version).</li>
 </ol>
-<p>The resulting <code>SimulationResult</code> rows are tagged with both <code>draw</code> and <code>sim</code>
-so downstream code can compute either marginal bands (over all draws and
-sims) or hierarchical bands (e.g. median across sims within each draw, then
-percentiles across draws).</p>
+<p>When the on-disk format changes in a way that breaks readers, <code>format_version</code>
+is incremented.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../api/fitting.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../output.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../api/parsing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../examples/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -385,11 +430,11 @@ percentiles across draws).</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../api/fitting.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../output.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../api/parsing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../examples/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

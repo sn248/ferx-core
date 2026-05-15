@@ -5,8 +5,8 @@ The `ferx` command-line tool runs population PK estimation from model files and 
 ## Usage
 
 ```bash
-ferx <model.ferx> --data <data.csv>
-ferx <model.ferx> --simulate
+ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data]
+ferx <model.ferx> --simulate          [--output <run.fitrx>]
 ```
 
 ## Commands
@@ -29,7 +29,7 @@ Parses the model file, generates simulated data from the `[simulation]` block, a
 
 ## Output Files
 
-Three files are generated, named after the model file:
+Three files are always generated, named after the model file:
 
 | File | Contents |
 |------|----------|
@@ -38,6 +38,20 @@ Three files are generated, named after the model file:
 | `{model}-timing.txt` | Wall-clock estimation time |
 
 See [Output Files](output.md) for detailed format descriptions.
+
+## Portable Fit Bundle (`--output`)
+
+Pass `--output run.fitrx` to additionally write a portable `.fitrx` bundle —
+a zip of JSON and CSV designed to be read from Rust, R, Python, or Julia. Use
+`--include-data` to embed the input NONMEM CSV inside the bundle (off by
+default).
+
+```bash
+ferx model.ferx --data data.csv --output run1.fitrx --include-data
+```
+
+See [the `.fitrx` format reference](file-formats/fitrx.md) for the full
+schema.
 
 ## Console Output
 

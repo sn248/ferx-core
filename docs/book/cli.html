@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-df342e73.js";
+            window.path_to_searchindex_js = "searchindex-ca1b0cde.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-911e3088.js"></script>
+        <script src="toc-bb1e2caf.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -180,8 +180,8 @@
                         <h1 id="cli-reference"><a class="header" href="#cli-reference">CLI Reference</a></h1>
 <p>The <code>ferx</code> command-line tool runs population PK estimation from model files and data.</p>
 <h2 id="usage"><a class="header" href="#usage">Usage</a></h2>
-<pre><code class="language-bash">ferx &lt;model.ferx&gt; --data &lt;data.csv&gt;
-ferx &lt;model.ferx&gt; --simulate
+<pre><code class="language-bash">ferx &lt;model.ferx&gt; --data &lt;data.csv&gt; [--output &lt;run.fitrx&gt;] [--include-data]
+ferx &lt;model.ferx&gt; --simulate          [--output &lt;run.fitrx&gt;]
 </code></pre>
 <h2 id="commands"><a class="header" href="#commands">Commands</a></h2>
 <h3 id="fit-with-data"><a class="header" href="#fit-with-data">Fit with Data</a></h3>
@@ -193,7 +193,7 @@ ferx &lt;model.ferx&gt; --simulate
 </code></pre>
 <p>Parses the model file, generates simulated data from the <code>[simulation]</code> block, and fits the model to the simulated data. Requires a <code>[simulation]</code> block in the model file.</p>
 <h2 id="output-files"><a class="header" href="#output-files">Output Files</a></h2>
-<p>Three files are generated, named after the model file:</p>
+<p>Three files are always generated, named after the model file:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -207,6 +207,15 @@ ferx &lt;model.ferx&gt; --simulate
 </table>
 </div>
 <p>See <a href="output.html">Output Files</a> for detailed format descriptions.</p>
+<h2 id="portable-fit-bundle---output"><a class="header" href="#portable-fit-bundle---output">Portable Fit Bundle (<code>--output</code>)</a></h2>
+<p>Pass <code>--output run.fitrx</code> to additionally write a portable <code>.fitrx</code> bundle —
+a zip of JSON and CSV designed to be read from Rust, R, Python, or Julia. Use
+<code>--include-data</code> to embed the input NONMEM CSV inside the bundle (off by
+default).</p>
+<pre><code class="language-bash">ferx model.ferx --data data.csv --output run1.fitrx --include-data
+</code></pre>
+<p>See <a href="file-formats/fitrx.html">the <code>.fitrx</code> format reference</a> for the full
+schema.</p>
 <h2 id="console-output"><a class="header" href="#console-output">Console Output</a></h2>
 <h3 id="progress"><a class="header" href="#progress">Progress</a></h3>
 <p>The estimation progress is printed to stderr, including:</p>

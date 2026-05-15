@@ -22,7 +22,23 @@ use std::path::Path;
 /// Run SIR against an existing fit. Returns a new `FitResult` that is a clone
 /// of `fit` with the `sir_*` fields populated. The returned fit's
 /// `warnings` vector is unchanged — SIR-specific diagnostics live on
-/// `sir_ess` (low ESS signals a poorly-matched proposal).
+/// `sir_ess` (low ESS signals a poorly-matched proposal); the SIR kernel
+/// does not emit structured warnings, so there is nothing to propagate.
+///
+/// # Notes on integrity
+///
+/// Hash verification (when stored on the fit) hits the filesystem once for
+/// the hash and again during parse / CSV read. On a fast local filesystem
+/// the window between those two reads is too small to be a practical TOCTOU
+/// concern; on a shared filesystem or network mount, a file modified
+/// in that window would pass the check and then be parsed in its modified
+/// form. The intended threat model is accidental edits, not adversarial
+/// substitution.
+///
+/// Paths recorded on the fit are stored verbatim (no canonicalisation), so
+/// relative paths resolve against whatever the cwd is at `run_sir` time,
+/// not at fit time. Pass absolute paths to `fit_from_files` if your
+/// downstream code may run from a different working directory.
 ///
 /// # Arguments
 /// - `fit`: the maximum-likelihood fit to SIR-refine. Must carry a
@@ -155,7 +171,8 @@ pub fn run_sir(
     // --- Now require a covariance matrix to seed the proposal -------------
     let cov = fit.covariance_matrix.as_ref().ok_or_else(|| {
         "run_sir requires fit.covariance_matrix; re-run the original fit \
-             with covariance = true."
+         with the covariance step enabled (FitOptions.run_covariance_step = \
+         true, or `covariance = true` in the model file's [fit_options])."
             .to_string()
     })?;
 
@@ -292,6 +309,38 @@ mod tests {
         assert!(
             err.contains("model hash mismatch"),
             "expected hash-mismatch message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn run_sir_errors_when_no_model_path_recorded_and_no_caller_model() {
+        // Cover the "no model path recorded and caller didn't supply one"
+        // branch — the in-memory `fit()` path leaves `model_path = None`,
+        // and a downstream caller that also passes `None` should get a
+        // clear error rather than a panic or generic NPE-style failure.
+        //
+        // Cheapest way to get a valid FitResult with empty paths is to run
+        // `fit_from_files` and then null out the path/hash fields.
+        let dir = tempfile::tempdir().unwrap();
+        let (model_path, data_path) = copy_example_to_tempdir(dir.path());
+
+        let mut fit = fit_from_files(
+            model_path.to_str().unwrap(),
+            data_path.to_str().unwrap(),
+            None,
+            Some(quick_opts()),
+        )
+        .expect("fit must converge");
+        fit.model_path = None;
+        fit.data_path = None;
+        fit.model_hash = None;
+        fit.data_hash = None;
+
+        let err = run_sir(&fit, None, None, &quick_opts()).unwrap_err();
+        assert!(
+            err.contains("no model supplied"),
+            "expected 'no model supplied' error, got: {}",
             err
         );
     }

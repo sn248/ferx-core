@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-ca1b0cde.js";
+            window.path_to_searchindex_js = "searchindex-00676987.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-bb1e2caf.js"></script>
@@ -264,10 +264,11 @@ sigma:
 <h3 id="shrinkage"><a class="header" href="#shrinkage">Shrinkage</a></h3>
 <p>Two shrinkage metrics are reported after every fit:</p>
 <p><strong>ETA shrinkage</strong> (per random effect — <code>shrinkage_eta: Vec&lt;f64&gt;</code>):
-\[ \text{shrinkage}_k = 1 - \frac{\text{SD}(\hat{\eta}<em>k)}{\sqrt{\omega</em>{kk}}} \]</p>
+\[ \text{shrinkage}<em>k = 1 - \frac{\sqrt{\frac{1}{n}\sum_i \hat{\eta}</em>{k,i}^2}}{\sqrt{\omega_{kk}}} \]</p>
 <p>A value near 1 means individual EBEs are all pulled toward zero — the data are not informative about that random effect. A value near 0 means the ETAs are spread consistent with the prior omega.</p>
 <p><strong>EPS shrinkage</strong> (scalar — <code>shrinkage_eps: f64</code>):
-\[ \text{shrinkage}_\varepsilon = 1 - \text{SD}(\text{IWRES}) \]</p>
+\[ \text{shrinkage}_\varepsilon = 1 - \sqrt{\frac{1}{n}\sum_j \text{IWRES}_j^2} \]</p>
+<p>Both formulas use the <strong>uncentered second moment with <code>n</code> divisor</strong>, matching the NONMEM / PsN / Monolix convention — the population model assumes <code>E[η]=0</code> and <code>E[IWRES²]=1</code>, so the natural estimator is <code>√(Σx²/n)</code> rather than the unbiased sample SD (which centers on the sample mean and divides by <code>n-1</code>). The unbiased form would inflate SD by <code>√(n/(n-1))</code> and routinely produce spurious negative shrinkage on small samples.</p>
 <p>Values of <code>NaN</code> indicate a zero-variance omega component (ETA) or fewer than two valid residuals (EPS).</p>
 <h3 id="covariance-status"><a class="header" href="#covariance-status">Covariance Status</a></h3>
 <p><code>covariance_status: CovarianceStatus</code> takes one of three values:</p>

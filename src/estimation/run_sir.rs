@@ -20,8 +20,9 @@ use nalgebra::DVector;
 use std::path::Path;
 
 /// Run SIR against an existing fit. Returns a new `FitResult` that is a clone
-/// of `fit` with the `sir_*` fields populated (and an extra warning when the
-/// underlying `run_sir` reported one).
+/// of `fit` with the `sir_*` fields populated. The returned fit's
+/// `warnings` vector is unchanged — SIR-specific diagnostics live on
+/// `sir_ess` (low ESS signals a poorly-matched proposal).
 ///
 /// # Arguments
 /// - `fit`: the maximum-likelihood fit to SIR-refine. Must carry a
@@ -44,7 +45,15 @@ pub fn run_sir(
     // is downstream and only matters once the inputs are confirmed.
 
     // --- Resolve model -----------------------------------------------------
+    //
+    // When re-reading from disk we use `parse_full_model_file` (not the
+    // CompiledModel-only `parse_model_file`) because IOV models need the
+    // `iov_column` name from `[fit_options]` to parse occasions out of the
+    // data; that info doesn't survive on `CompiledModel`. The parsed
+    // fit_options are stashed in `iov_column_from_parse` for the
+    // population re-read below.
     let model_owned: Option<CompiledModel>;
+    let mut iov_column_from_parse: Option<String> = None;
     let model_ref: &CompiledModel = match model {
         Some(m) => m,
         None => {
@@ -65,8 +74,10 @@ pub fn run_sir(
                     ));
                 }
             }
-            let parsed = crate::parser::model_parser::parse_model_file(Path::new(path))?;
-            model_owned = Some(parsed);
+            let parsed =
+                crate::parser::model_parser::parse_full_model_file(Path::new(path))?;
+            iov_column_from_parse = parsed.fit_options.iov_column.clone();
+            model_owned = Some(parsed.model);
             model_owned.as_ref().unwrap()
         }
     };
@@ -76,6 +87,21 @@ pub fn run_sir(
     let pop_ref: &Population = match population {
         Some(p) => p,
         None => {
+            // For IOV models the population MUST be parsed with the correct
+            // `iov_column` so per-occasion kappas line up with the data. We
+            // can only obtain that name from the model file's `[fit_options]`
+            // block (parse_full_model_file path above). When the caller
+            // supplied a `Some(model)` but no population, we have no
+            // iov_column source for n_kappa > 0 models — refuse rather than
+            // silently produce wrong likelihoods.
+            if model.is_some() && model_ref.n_kappa > 0 {
+                return Err(
+                    "run_sir: caller-supplied `model` for an IOV (n_kappa > 0) model \
+                     requires `population` to also be supplied — `iov_column` from \
+                     `[fit_options]` is needed to parse per-occasion kappas correctly."
+                        .to_string(),
+                );
+            }
             let path = fit.data_path.as_deref().ok_or_else(|| {
                 "run_sir: no population supplied and fit.data_path is None. \
                  Either pass `population = Some(&pop)` or re-fit via fit_from_files \
@@ -93,7 +119,11 @@ pub fn run_sir(
                     ));
                 }
             }
-            let p = crate::io::datareader::read_nonmem_csv(Path::new(path), None, None)?;
+            let p = crate::io::datareader::read_nonmem_csv(
+                Path::new(path),
+                None,
+                iov_column_from_parse.as_deref(),
+            )?;
             pop_owned = Some(p);
             pop_owned.as_ref().unwrap()
         }
@@ -102,9 +132,8 @@ pub fn run_sir(
     // --- Sanity-check dimensions ------------------------------------------
     if model_ref.n_eta != fit.omega.nrows() {
         return Err(format!(
-            "run_sir: model has n_eta = {} but fit.omega is {}×{}. \
-             Model file may have been edited in a way that doesn't change its hash \
-             coverage — verify you supplied the same model used for the fit.",
+            "run_sir: supplied model has n_eta = {} but fit.omega is {}×{}. \
+             Verify you supplied the same model used for the fit.",
             model_ref.n_eta,
             fit.omega.nrows(),
             fit.omega.ncols()

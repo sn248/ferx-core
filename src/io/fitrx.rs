@@ -184,7 +184,7 @@ struct FitWire {
     model_name: String,
     ferx_version: String,
     // Source-file provenance. All four are optional and default to absent on
-    // older bundles so loading a pre-v1.1 .fitrx keeps working.
+    // older bundles (produced before these fields existed) so they keep loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

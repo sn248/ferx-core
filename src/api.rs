@@ -44,18 +44,20 @@ pub fn run_model_with_data(
     );
 
     let init_params = build_init_params(&parsed);
-    let model_hash = crate::io::hash::sha256_file(Path::new(model_path))?;
-    let data_hash = crate::io::hash::sha256_file(Path::new(data_path))?;
     let mut result = fit(
         &parsed.model,
         &population,
         &init_params,
         &parsed.fit_options,
     )?;
+    // Hash both inputs *after* the fit so we don't double up disk reads
+    // (the model and CSV are already in the page cache from parse + read
+    // upstream). Errors here are non-fatal: the fit already succeeded, and
+    // a missing hash just disables the integrity check in run_sir.
     result.model_path = Some(model_path.to_string());
     result.data_path = Some(data_path.to_string());
-    result.model_hash = Some(model_hash);
-    result.data_hash = Some(data_hash);
+    result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
+    result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
     Ok((result, population))
 }
 
@@ -135,17 +137,17 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     );
 
     let init_params = build_init_params(&parsed);
-    // No data file to hash — data is simulated in-process. Only the model
-    // path/hash is meaningful here.
-    let model_hash = crate::io::hash::sha256_file(Path::new(model_path))?;
     let mut result = fit(
         &parsed.model,
         &population,
         &init_params,
         &parsed.fit_options,
     )?;
+    // No data file to hash — data is simulated in-process. Hash the model
+    // post-fit (same pattern as `run_model_with_data`); failures are
+    // non-fatal and just disable the integrity check in `run_sir`.
     result.model_path = Some(model_path.to_string());
-    result.model_hash = Some(model_hash);
+    result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     Ok((result, population))
 }
 
@@ -207,17 +209,16 @@ pub fn fit_from_files(
     let opts = options.unwrap_or_default();
     model.bloq_method = opts.bloq_method;
     model.gradient_method = opts.gradient_method;
-    // Hash both inputs before `fit()` runs. We compute these up-front (rather
-    // than after the fit) so a missing/unreadable file fails immediately
-    // instead of after a multi-minute estimation. Errors here are fatal —
-    // the caller asked us to read these files, so we can't proceed.
-    let model_hash = crate::io::hash::sha256_file(Path::new(model_path))?;
-    let data_hash = crate::io::hash::sha256_file(Path::new(data_path))?;
     let mut result = fit(&model, &population, &model.default_params, &opts)?;
+    // Hash inputs post-fit (same pattern as `run_model_with_data`). The
+    // model and CSV were already read by `parse_model_file` and
+    // `read_nonmem_csv` upstream, so the OS page cache typically serves
+    // these reads; failures are non-fatal and just disable the integrity
+    // check in `run_sir`.
     result.model_path = Some(model_path.to_string());
     result.data_path = Some(data_path.to_string());
-    result.model_hash = Some(model_hash);
-    result.data_hash = Some(data_hash);
+    result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
+    result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
     Ok(result)
 }
 

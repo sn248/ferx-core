@@ -1009,7 +1009,13 @@ fn compute_subject_results(
         .collect()
 }
 
-/// ETA shrinkage: `1 - SD(eta_hat_k) / sqrt(omega_kk)` for each random effect k.
+/// ETA shrinkage: `1 - sqrt(mean(eta_hat_k^2)) / sqrt(omega_kk)` for each random effect k.
+///
+/// Uses the uncentered second moment with `n` divisor (NONMEM / PsN / Monolix
+/// convention), reflecting the population assumption that `E[eta_k] = 0`. This
+/// differs from the centered, unbiased sample variance (n-1 divisor) — for small
+/// `n` the unbiased form inflates SD by sqrt(n/(n-1)) and routinely produces
+/// spurious negative shrinkage even on well-fit models.
 pub(crate) fn compute_eta_shrinkage(subjects: &[SubjectResult], omega: &DMatrix<f64>) -> Vec<f64> {
     let n_eta = omega.nrows();
     let n_subj = subjects.len();
@@ -1023,15 +1029,16 @@ pub(crate) fn compute_eta_shrinkage(subjects: &[SubjectResult], omega: &DMatrix<
                 return f64::NAN;
             }
             let omega_sd = omega_var.sqrt();
-            let vals: Vec<f64> = subjects.iter().map(|s| s.eta[k]).collect();
-            let mean = vals.iter().sum::<f64>() / n_subj as f64;
-            let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n_subj - 1) as f64;
-            1.0 - var.sqrt() / omega_sd
+            let ms = subjects.iter().map(|s| s.eta[k].powi(2)).sum::<f64>() / n_subj as f64;
+            1.0 - ms.sqrt() / omega_sd
         })
         .collect()
 }
 
-/// EPS shrinkage: `1 - SD(IWRES)` across all valid (non-NaN) residuals.
+/// EPS shrinkage: `1 - sqrt(mean(IWRES^2))` across all valid (non-NaN) residuals.
+///
+/// IWRES has model-imposed mean 0 and variance 1, so the uncentered second
+/// moment with `n` divisor is the natural estimator (matches NONMEM).
 pub(crate) fn compute_eps_shrinkage(subjects: &[SubjectResult]) -> f64 {
     let vals: Vec<f64> = subjects
         .iter()
@@ -1042,9 +1049,8 @@ pub(crate) fn compute_eps_shrinkage(subjects: &[SubjectResult]) -> f64 {
     if n < 2 {
         return f64::NAN;
     }
-    let mean = vals.iter().sum::<f64>() / n as f64;
-    let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
-    1.0 - var.sqrt()
+    let ms = vals.iter().map(|v| v.powi(2)).sum::<f64>() / n as f64;
+    1.0 - ms.sqrt()
 }
 
 #[cfg(test)]
@@ -1068,19 +1074,16 @@ mod tests {
     }
 
     #[test]
-    fn test_eta_shrinkage_zero_when_eta_matches_omega_sd() {
-        // If SD(eta_hat) == sqrt(omega), shrinkage = 0.
-        // With n=2 subjects: eta = [+s, -s] => SD = s * sqrt(2/(n-1)) for n=2 => SD = s*sqrt(2)
-        // For shrinkage=0: SD(eta_hat) = sqrt(omega). So pick omega = 2.0, eta = [+1, -1].
-        let omega = DMatrix::from_diagonal_element(1, 1, 2.0);
+    fn test_eta_shrinkage_zero_when_eta_rms_matches_omega_sd() {
+        // NONMEM convention: shrinkage = 1 - sqrt(mean(eta^2)) / sqrt(omega).
+        // omega = 1.0, eta = [+1, -1] => mean(eta^2) = 1 => shrinkage = 0.
+        let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
         let subjects = vec![
             make_subject(vec![1.0], vec![0.0]),
             make_subject(vec![-1.0], vec![0.0]),
         ];
         let sh = compute_eta_shrinkage(&subjects, &omega);
         assert_eq!(sh.len(), 1);
-        // SD([1.0, -1.0]) = sqrt(((1-0)^2 + (-1-0)^2) / 1) = sqrt(2) ≈ 1.414
-        // shrinkage = 1 - sqrt(2) / sqrt(2) = 0.0
         assert!(
             (sh[0]).abs() < 1e-10,
             "expected ~0 shrinkage, got {}",
@@ -1097,6 +1100,28 @@ mod tests {
             .collect();
         let sh = compute_eta_shrinkage(&subjects, &omega);
         assert!(sh[0] > 0.5, "expected high shrinkage, got {}", sh[0]);
+    }
+
+    #[test]
+    fn test_eta_shrinkage_uses_n_not_n_minus_1_divisor() {
+        // Regression: with the old (centered, n-1) estimator, eta = [+a, -a] gave
+        // SD = a*sqrt(2), so omega = 2.0 was needed to land at shrinkage 0.
+        // With the NONMEM (uncentered, n) estimator, mean(eta^2) = a^2, so the
+        // same eta values + omega = 2.0 must now give a clearly positive value:
+        // shrinkage = 1 - 1/sqrt(2) ≈ 0.293.
+        let omega = DMatrix::from_diagonal_element(1, 1, 2.0);
+        let subjects = vec![
+            make_subject(vec![1.0], vec![0.0]),
+            make_subject(vec![-1.0], vec![0.0]),
+        ];
+        let sh = compute_eta_shrinkage(&subjects, &omega);
+        let expected = 1.0 - 1.0 / 2.0_f64.sqrt();
+        assert!(
+            (sh[0] - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            sh[0]
+        );
     }
 
     #[test]
@@ -1120,12 +1145,11 @@ mod tests {
 
     #[test]
     fn test_eps_shrinkage_near_zero_for_unit_normal_iwres() {
-        // IWRES with sample SD = 1 => shrinkage = 0.
-        // For n=2: SD([a, -a]) = a*sqrt(2); set a = 1/sqrt(2) so SD = 1.
-        let a = 1.0_f64 / 2.0_f64.sqrt();
+        // NONMEM convention: shrinkage = 1 - sqrt(mean(IWRES^2)).
+        // IWRES = [+1, -1] => mean(IWRES^2) = 1 => shrinkage = 0.
         let subjects = vec![
-            make_subject(vec![0.0], vec![a]),
-            make_subject(vec![0.0], vec![-a]),
+            make_subject(vec![0.0], vec![1.0]),
+            make_subject(vec![0.0], vec![-1.0]),
         ];
         let sh = compute_eps_shrinkage(&subjects);
         assert!((sh).abs() < 1e-10, "expected ~0 eps shrinkage, got {}", sh);
@@ -1140,11 +1164,10 @@ mod tests {
     #[test]
     fn test_eps_shrinkage_ignores_nan_iwres() {
         // BLOQ rows have NaN IWRES — they must be filtered out.
-        // After filtering, two valid values with SD=1 remain => shrinkage = 0.
-        let a = 1.0_f64 / 2.0_f64.sqrt();
+        // After filtering, two values with mean(IWRES^2)=1 remain => shrinkage = 0.
         let subjects = vec![
-            make_subject(vec![0.0], vec![a, f64::NAN]),
-            make_subject(vec![0.0], vec![-a, f64::NAN]),
+            make_subject(vec![0.0], vec![1.0, f64::NAN]),
+            make_subject(vec![0.0], vec![-1.0, f64::NAN]),
         ];
         let sh = compute_eps_shrinkage(&subjects);
         assert!((sh).abs() < 1e-10, "NaN IWRES not filtered, got {}", sh);

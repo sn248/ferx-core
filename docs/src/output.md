@@ -99,12 +99,14 @@ The following fields are populated on the `FitResult` struct returned by `fit()`
 Two shrinkage metrics are reported after every fit:
 
 **ETA shrinkage** (per random effect — `shrinkage_eta: Vec<f64>`):
-\\[ \text{shrinkage}_k = 1 - \frac{\text{SD}(\hat{\eta}_k)}{\sqrt{\omega_{kk}}} \\]
+\\[ \text{shrinkage}_k = 1 - \frac{\sqrt{\frac{1}{n}\sum_i \hat{\eta}_{k,i}^2}}{\sqrt{\omega_{kk}}} \\]
 
 A value near 1 means individual EBEs are all pulled toward zero — the data are not informative about that random effect. A value near 0 means the ETAs are spread consistent with the prior omega.
 
 **EPS shrinkage** (scalar — `shrinkage_eps: f64`):
-\\[ \text{shrinkage}_\varepsilon = 1 - \text{SD}(\text{IWRES}) \\]
+\\[ \text{shrinkage}_\varepsilon = 1 - \sqrt{\frac{1}{n}\sum_j \text{IWRES}_j^2} \\]
+
+Both formulas use the **uncentered second moment with `n` divisor**, matching the NONMEM / PsN / Monolix convention — the population model assumes `E[η]=0` and `E[IWRES²]=1`, so the natural estimator is `√(Σx²/n)` rather than the unbiased sample SD (which centers on the sample mean and divides by `n-1`). The unbiased form would inflate SD by `√(n/(n-1))` and routinely produce spurious negative shrinkage on small samples.
 
 Values of `NaN` indicate a zero-variance omega component (ETA) or fewer than two valid residuals (EPS).
 

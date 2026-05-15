@@ -132,11 +132,7 @@ fn clamp_fixed_indices(x: &mut [f64], fixed_mask: &[bool], x_hat: &[f64]) {
 /// that is in-bounds and has positive theta / sigma / omega-diagonal values.
 /// `bounds` is taken by reference to avoid recomputing it for each candidate
 /// (it doesn't change across draws within a single sampler call).
-fn candidate_is_valid(
-    x: &[f64],
-    template: &ModelParameters,
-    bounds: &PackedBounds,
-) -> bool {
+fn candidate_is_valid(x: &[f64], template: &ModelParameters, bounds: &PackedBounds) -> bool {
     for (i, &xi) in x.iter().enumerate() {
         if xi < bounds.lower[i] || xi > bounds.upper[i] {
             return false;
@@ -146,11 +142,7 @@ fn candidate_is_valid(
     if p.theta.iter().any(|&t| !t.is_finite() || t <= 0.0) {
         return false;
     }
-    if p.sigma
-        .values
-        .iter()
-        .any(|&s| !s.is_finite() || s <= 0.0)
-    {
+    if p.sigma.values.iter().any(|&s| !s.is_finite() || s <= 0.0) {
         return false;
     }
     let n_eta = p.omega.dim();
@@ -182,9 +174,7 @@ pub fn draw_parameter_samples(
         return Ok(Vec::new());
     }
     match method {
-        UncertaintyMethod::Asymptotic => {
-            draw_asymptotic(fit_result, template, n_draws, rng)
-        }
+        UncertaintyMethod::Asymptotic => draw_asymptotic(fit_result, template, n_draws, rng),
         UncertaintyMethod::Sir => draw_sir(fit_result, template, n_draws, rng),
     }
 }
@@ -231,11 +221,7 @@ fn draw_asymptotic(
         let z: Vec<f64> = (0..n_packed).map(|_| rng.sample(StandardNormal)).collect();
         let z_vec = DVector::from_column_slice(&z);
         let delta = &chol * z_vec;
-        let mut x_k: Vec<f64> = x_hat
-            .iter()
-            .zip(delta.iter())
-            .map(|(a, b)| a + b)
-            .collect();
+        let mut x_k: Vec<f64> = x_hat.iter().zip(delta.iter()).map(|(a, b)| a + b).collect();
         // Fixed parameters carry no uncertainty — pin them to x_hat before
         // bounds-checking. Without this, `compute_bounds` (which sets
         // lower == upper for fixed indices) would reject every draw for any
@@ -311,18 +297,14 @@ mod tests {
     use super::*;
     use crate::types::{ErrorModel, OmegaMatrix, SigmaVector};
     use nalgebra::DMatrix;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     /// Build a minimal `ModelParameters` template for unit testing the
     /// sampler. Two thetas, one diagonal Omega (1 eta), one sigma. No IOV.
     fn tiny_template() -> ModelParameters {
         let omega_matrix = DMatrix::from_diagonal(&DVector::from_vec(vec![0.04]));
-        let omega = OmegaMatrix::from_matrix(
-            omega_matrix,
-            vec!["eta_CL".to_string()],
-            true,
-        );
+        let omega = OmegaMatrix::from_matrix(omega_matrix, vec!["eta_CL".to_string()], true);
         ModelParameters {
             theta: vec![1.0, 5.0],
             theta_names: vec!["CL".to_string(), "V".to_string()],
@@ -433,20 +415,10 @@ mod tests {
         assert_eq!(draws.len(), 2000);
 
         // Empirical theta means should be close to template theta.
-        let mean_th1: f64 =
-            draws.iter().map(|p| p.theta[0]).sum::<f64>() / draws.len() as f64;
-        let mean_th2: f64 =
-            draws.iter().map(|p| p.theta[1]).sum::<f64>() / draws.len() as f64;
-        assert!(
-            (mean_th1 - 1.0).abs() < 0.05,
-            "mean_th1 = {}",
-            mean_th1
-        );
-        assert!(
-            (mean_th2 - 5.0).abs() < 0.25,
-            "mean_th2 = {}",
-            mean_th2
-        );
+        let mean_th1: f64 = draws.iter().map(|p| p.theta[0]).sum::<f64>() / draws.len() as f64;
+        let mean_th2: f64 = draws.iter().map(|p| p.theta[1]).sum::<f64>() / draws.len() as f64;
+        assert!((mean_th1 - 1.0).abs() < 0.05, "mean_th1 = {}", mean_th1);
+        assert!((mean_th2 - 5.0).abs() < 0.25, "mean_th2 = {}", mean_th2);
     }
 
     #[test]
@@ -461,14 +433,9 @@ mod tests {
         );
         fit.covariance_matrix = None;
         let mut rng = StdRng::seed_from_u64(0);
-        let err = draw_parameter_samples(
-            &fit,
-            &template,
-            10,
-            UncertaintyMethod::Asymptotic,
-            &mut rng,
-        )
-        .unwrap_err();
+        let err =
+            draw_parameter_samples(&fit, &template, 10, UncertaintyMethod::Asymptotic, &mut rng)
+                .unwrap_err();
         assert!(err.contains("covariance"));
     }
 
@@ -483,14 +450,8 @@ mod tests {
             ) * 0.01,
         );
         let mut rng = StdRng::seed_from_u64(0);
-        let err = draw_parameter_samples(
-            &fit,
-            &template,
-            10,
-            UncertaintyMethod::Sir,
-            &mut rng,
-        )
-        .unwrap_err();
+        let err = draw_parameter_samples(&fit, &template, 10, UncertaintyMethod::Sir, &mut rng)
+            .unwrap_err();
         assert!(err.contains("sir_keep_samples"));
     }
 
@@ -498,10 +459,7 @@ mod tests {
     fn sir_draws_from_pool() {
         let template = tiny_template();
         let n_packed = crate::estimation::parameterization::packed_len(&template);
-        let mut fit = fit_with_cov(
-            &template,
-            DMatrix::identity(n_packed, n_packed) * 0.01,
-        );
+        let mut fit = fit_with_cov(&template, DMatrix::identity(n_packed, n_packed) * 0.01);
         // Build a pool of 5 deterministic resamples around the ML estimate.
         let x_hat = crate::estimation::parameterization::pack_params(&template);
         let pool: Vec<Vec<f64>> = (0..5)
@@ -514,14 +472,8 @@ mod tests {
         fit.sir_resamples_packed = Some(pool);
 
         let mut rng = StdRng::seed_from_u64(123);
-        let draws = draw_parameter_samples(
-            &fit,
-            &template,
-            50,
-            UncertaintyMethod::Sir,
-            &mut rng,
-        )
-        .unwrap();
+        let draws =
+            draw_parameter_samples(&fit, &template, 50, UncertaintyMethod::Sir, &mut rng).unwrap();
         assert_eq!(draws.len(), 50);
         // All thetas must come from the small perturbed pool.
         for d in &draws {
@@ -540,14 +492,9 @@ mod tests {
         let cov = DMatrix::identity(n_packed, n_packed) * 0.001;
         let fit = fit_with_cov(&template, cov);
         let mut rng = StdRng::seed_from_u64(99);
-        let draws = draw_parameter_samples(
-            &fit,
-            &template,
-            50,
-            UncertaintyMethod::Asymptotic,
-            &mut rng,
-        )
-        .unwrap();
+        let draws =
+            draw_parameter_samples(&fit, &template, 50, UncertaintyMethod::Asymptotic, &mut rng)
+                .unwrap();
         for d in &draws {
             assert!(
                 d.theta[0] <= 1.05 + 1e-12,
@@ -589,14 +536,9 @@ mod tests {
         let cov = DMatrix::identity(n_packed, n_packed) * 0.01;
         let fit = fit_with_cov(&template, cov);
         let mut rng = StdRng::seed_from_u64(7);
-        let draws = draw_parameter_samples(
-            &fit,
-            &template,
-            50,
-            UncertaintyMethod::Asymptotic,
-            &mut rng,
-        )
-        .expect("FIX'd parameters should not exhaust max_tries");
+        let draws =
+            draw_parameter_samples(&fit, &template, 50, UncertaintyMethod::Asymptotic, &mut rng)
+                .expect("FIX'd parameters should not exhaust max_tries");
         assert_eq!(draws.len(), 50);
         // Fixed indices are pinned on the *packed* scale (log-space) so the
         // natural-scale round-trip through `unpack_params` is ULP-accurate

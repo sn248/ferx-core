@@ -683,9 +683,7 @@ fn fit_inner(
         sir_ci_omega: sir_result.as_ref().map(|s| s.ci_omega.clone()),
         sir_ci_sigma: sir_result.as_ref().map(|s| s.ci_sigma.clone()),
         sir_ess: sir_result.as_ref().map(|s| s.effective_sample_size),
-        sir_resamples_packed: sir_result
-            .as_ref()
-            .and_then(|s| s.resamples_packed.clone()),
+        sir_resamples_packed: sir_result.as_ref().and_then(|s| s.resamples_packed.clone()),
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
@@ -826,10 +824,18 @@ fn compute_param_corr(
             let c = if lt_i && lt_j {
                 let num = cov.exp() - 1.0;
                 let den = ((w_ii.exp() - 1.0) * (w_jj.exp() - 1.0)).sqrt();
-                if den > 0.0 { num / den } else { 0.0 }
+                if den > 0.0 {
+                    num / den
+                } else {
+                    0.0
+                }
             } else if !lt_i && !lt_j {
                 let den = (w_ii * w_jj).sqrt();
-                if den > 0.0 { cov / den } else { 0.0 }
+                if den > 0.0 {
+                    cov / den
+                } else {
+                    0.0
+                }
             } else {
                 let name_i = names.get(i).map(|s| s.as_str()).unwrap_or("?");
                 let name_j = names.get(j).map(|s| s.as_str()).unwrap_or("?");
@@ -839,7 +845,11 @@ fn compute_param_corr(
                     warn_prefix, name_i, name_j
                 ));
                 let den = (w_ii * w_jj).sqrt();
-                if den > 0.0 { cov / den } else { 0.0 }
+                if den > 0.0 {
+                    cov / den
+                } else {
+                    0.0
+                }
             };
             corr[(i, j)] = c;
             corr[(j, i)] = c;
@@ -1391,11 +1401,7 @@ pub fn simulate_with_uncertainty(
 
     // Final size is deterministic, so we can size the buffer once and avoid
     // repeated reallocations for large simulations.
-    let total_obs: usize = population
-        .subjects
-        .iter()
-        .map(|s| s.obs_times.len())
-        .sum();
+    let total_obs: usize = population.subjects.iter().map(|s| s.obs_times.len()).sum();
     let mut results =
         Vec::with_capacity(opts.n_uncertainty_draws * opts.n_sim_per_draw * total_obs);
     for (k, params) in draws.iter().enumerate() {
@@ -2172,8 +2178,13 @@ mod tests_param_corr {
         omega[(0, 0)] = 0.09;
         omega[(1, 1)] = 0.04;
         let mut warnings = Vec::new();
-        let result =
-            compute_param_corr(&omega, &[true, true], &names(&["A", "B"]), "test", &mut warnings);
+        let result = compute_param_corr(
+            &omega,
+            &[true, true],
+            &names(&["A", "B"]),
+            "test",
+            &mut warnings,
+        );
         assert!(result.is_none());
         assert!(warnings.is_empty());
     }

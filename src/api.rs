@@ -683,6 +683,7 @@ fn fit_inner(
         sir_ci_omega: sir_result.as_ref().map(|s| s.ci_omega.clone()),
         sir_ci_sigma: sir_result.as_ref().map(|s| s.ci_sigma.clone()),
         sir_ess: sir_result.as_ref().map(|s| s.effective_sample_size),
+        sir_resamples_packed: sir_result.as_ref().and_then(|s| s.resamples_packed.clone()),
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
@@ -823,10 +824,18 @@ fn compute_param_corr(
             let c = if lt_i && lt_j {
                 let num = cov.exp() - 1.0;
                 let den = ((w_ii.exp() - 1.0) * (w_jj.exp() - 1.0)).sqrt();
-                if den > 0.0 { num / den } else { 0.0 }
+                if den > 0.0 {
+                    num / den
+                } else {
+                    0.0
+                }
             } else if !lt_i && !lt_j {
                 let den = (w_ii * w_jj).sqrt();
-                if den > 0.0 { cov / den } else { 0.0 }
+                if den > 0.0 {
+                    cov / den
+                } else {
+                    0.0
+                }
             } else {
                 let name_i = names.get(i).map(|s| s.as_str()).unwrap_or("?");
                 let name_j = names.get(j).map(|s| s.as_str()).unwrap_or("?");
@@ -836,7 +845,11 @@ fn compute_param_corr(
                     warn_prefix, name_i, name_j
                 ));
                 let den = (w_ii * w_jj).sqrt();
-                if den > 0.0 { cov / den } else { 0.0 }
+                if den > 0.0 {
+                    cov / den
+                } else {
+                    0.0
+                }
             };
             corr[(i, j)] = c;
             corr[(j, i)] = c;
@@ -1280,6 +1293,17 @@ fn simulate_inner<R: rand::Rng>(
     n_sim: usize,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
+    simulate_inner_with_draw(model, population, params, n_sim, 1, rng)
+}
+
+fn simulate_inner_with_draw<R: rand::Rng>(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    draw: usize,
+    rng: &mut R,
+) -> Vec<SimulationResult> {
     use rand_distr::Normal;
 
     let normal = Normal::new(0.0, 1.0).unwrap();
@@ -1313,6 +1337,7 @@ fn simulate_inner<R: rand::Rng>(
                 let dv_sim = ipred + var.sqrt() * eps;
 
                 results.push(SimulationResult {
+                    draw,
                     sim: sim_idx + 1,
                     id: subject.id.clone(),
                     time: subject.obs_times[j],
@@ -1326,9 +1351,82 @@ fn simulate_inner<R: rand::Rng>(
     results
 }
 
-/// A single simulated observation
+/// Options controlling `simulate_with_uncertainty()`.
+#[derive(Debug, Clone)]
+pub struct SimulateUncertaintyOptions {
+    /// Number of parameter sets to draw from the uncertainty distribution.
+    pub n_uncertainty_draws: usize,
+    /// Number of eta/eps replicates simulated *per* parameter draw.
+    pub n_sim_per_draw: usize,
+    /// How to draw the parameter sets — asymptotic MVN or SIR resamples.
+    pub method: crate::estimation::uncertainty_samples::UncertaintyMethod,
+    /// Optional seed for reproducibility. `None` uses `thread_rng`.
+    pub seed: Option<u64>,
+}
+
+/// Simulate observations while propagating parameter uncertainty.
+///
+/// For each of `opts.n_uncertainty_draws` parameter sets drawn from the
+/// uncertainty distribution (asymptotic MVN around the ML estimate or stored
+/// SIR resamples), simulate `opts.n_sim_per_draw` replicates of every subject
+/// — sampling etas from the drawn Omega and epsilons from the drawn Sigma.
+///
+/// Total rows returned: `n_uncertainty_draws * n_sim_per_draw * n_subjects *
+/// n_obs`. Each `SimulationResult` carries the originating `draw` and `sim`
+/// indices so downstream code can compute per-time uncertainty bands.
+pub fn simulate_with_uncertainty(
+    model: &CompiledModel,
+    population: &Population,
+    fit_result: &FitResult,
+    opts: &SimulateUncertaintyOptions,
+) -> Result<Vec<SimulationResult>, String> {
+    use rand::SeedableRng;
+
+    let mut rng: rand::rngs::StdRng = match opts.seed {
+        Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
+        // Re-seed StdRng from entropy so simulate-without-seed is still
+        // independent across calls but uses a uniform RNG type internally.
+        None => rand::rngs::StdRng::from_entropy(),
+    };
+
+    let template =
+        crate::estimation::uncertainty_samples::fitted_params_from_result(fit_result, model);
+    let draws = crate::estimation::uncertainty_samples::draw_parameter_samples(
+        fit_result,
+        &template,
+        opts.n_uncertainty_draws,
+        opts.method,
+        &mut rng,
+    )?;
+
+    // Final size is deterministic, so we can size the buffer once and avoid
+    // repeated reallocations for large simulations.
+    let total_obs: usize = population.subjects.iter().map(|s| s.obs_times.len()).sum();
+    let mut results =
+        Vec::with_capacity(opts.n_uncertainty_draws * opts.n_sim_per_draw * total_obs);
+    for (k, params) in draws.iter().enumerate() {
+        let mut rows = simulate_inner_with_draw(
+            model,
+            population,
+            params,
+            opts.n_sim_per_draw,
+            k + 1,
+            &mut rng,
+        );
+        results.append(&mut rows);
+    }
+    Ok(results)
+}
+
+/// A single simulated observation.
+///
+/// `draw` is the uncertainty draw index (1-based). For `simulate()` /
+/// `simulate_with_seed()`, which use point-estimate parameters, `draw` is
+/// always `1`. For `simulate_with_uncertainty()` it spans
+/// `1..=n_uncertainty_draws`. `sim` is the replicate index *within* a draw.
 #[derive(Debug, Clone)]
 pub struct SimulationResult {
+    pub draw: usize,
     pub sim: usize,
     pub id: String,
     pub time: f64,
@@ -2080,9 +2178,263 @@ mod tests_param_corr {
         omega[(0, 0)] = 0.09;
         omega[(1, 1)] = 0.04;
         let mut warnings = Vec::new();
-        let result =
-            compute_param_corr(&omega, &[true, true], &names(&["A", "B"]), "test", &mut warnings);
+        let result = compute_param_corr(
+            &omega,
+            &[true, true],
+            &names(&["A", "B"]),
+            "test",
+            &mut warnings,
+        );
         assert!(result.is_none());
         assert!(warnings.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod simulate_with_uncertainty_tests {
+    //! End-to-end smoke tests for `simulate_with_uncertainty`. The parameter
+    //! sampler itself is exercised in `estimation::uncertainty_samples::tests`;
+    //! these tests verify the wiring: row count, draw index range, and SIR
+    //! pool reuse.
+
+    use super::*;
+    use crate::estimation::uncertainty_samples::UncertaintyMethod;
+    use nalgebra::DMatrix;
+    use std::collections::HashMap;
+
+    fn tiny_model() -> CompiledModel {
+        let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
+        let default_params = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.1, 5.0],
+            theta_upper: vec![50.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.1],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        CompiledModel {
+            name: "uncertainty_smoke".into(),
+            pk_model: PkModel::OneCptIvBolus,
+            error_model: ErrorModel::Proportional,
+            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp();
+                p.values[1] = theta[1];
+                p
+            }),
+            n_theta: 2,
+            n_eta: 1,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: Vec::new(),
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into(), "V".into()],
+            default_params,
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: vec![0],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+        }
+    }
+
+    fn tiny_population() -> Population {
+        let obs_times = vec![1.0, 2.0, 3.0];
+        let subjects: Vec<Subject> = (0..2)
+            .map(|i| Subject {
+                id: format!("S{}", i + 1),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: obs_times.clone(),
+                observations: vec![30.0, 22.0, 16.0],
+                obs_cmts: vec![1, 1, 1],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                cens: vec![0, 0, 0],
+                occasions: vec![1, 1, 1],
+                dose_occasions: vec![1],
+            })
+            .collect();
+        Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+        }
+    }
+
+    /// Build a synthetic `FitResult` carrying the fitted theta/Omega/Sigma
+    /// from `template` plus a small identity covariance in packed log-space.
+    /// Avoids invoking `fit()` (slow) while still exercising the full
+    /// `simulate_with_uncertainty` wiring.
+    fn synthetic_fit(template: &ModelParameters) -> FitResult {
+        let n_packed = crate::estimation::parameterization::packed_len(template);
+        let cov = DMatrix::identity(n_packed, n_packed) * 0.01;
+        FitResult {
+            method: EstimationMethod::FoceI,
+            method_chain: vec![EstimationMethod::FoceI],
+            converged: true,
+            ofv: 0.0,
+            aic: 0.0,
+            bic: 0.0,
+            theta: template.theta.clone(),
+            theta_names: template.theta_names.clone(),
+            eta_names: template.omega.eta_names.clone(),
+            omega: template.omega.matrix.clone(),
+            sigma: template.sigma.values.clone(),
+            sigma_names: template.sigma.names.clone(),
+            error_model: ErrorModel::Proportional,
+            covariance_matrix: Some(cov),
+            se_theta: None,
+            se_omega: None,
+            se_sigma: None,
+            theta_fixed: template.theta_fixed.clone(),
+            omega_fixed: template.omega_fixed.clone(),
+            sigma_fixed: template.sigma_fixed.clone(),
+            subjects: vec![],
+            n_obs: 6,
+            n_subjects: 2,
+            n_parameters: n_packed,
+            n_iterations: 0,
+            interaction: true,
+            warnings: vec![],
+            sir_ci_theta: None,
+            sir_ci_omega: None,
+            sir_ci_sigma: None,
+            sir_ess: None,
+            sir_resamples_packed: None,
+            omega_iov: None,
+            kappa_names: vec![],
+            kappa_fixed: vec![],
+            se_kappa: None,
+            shrinkage_kappa: vec![],
+            ebe_kappas: vec![],
+            saem_mu_ref_m_step_evals_saved: None,
+            gradient_method_inner: String::new(),
+            gradient_method_outer: String::new(),
+            uses_ode_solver: false,
+            n_threads_used: 1,
+            nlopt_missing_algorithms: vec![],
+            covariance_n_evals_estimated: None,
+            trace_path: None,
+            ebe_convergence_warnings: 0,
+            max_unconverged_subjects: 0,
+            total_ebe_fallbacks: 0,
+            covariance_status: CovarianceStatus::Computed,
+            shrinkage_eta: vec![],
+            shrinkage_eps: f64::NAN,
+            wall_time_secs: 0.0,
+            model_name: String::new(),
+            ferx_version: String::new(),
+            eta_param_info: vec![],
+            theta_transform: vec![],
+            sigma_types: vec![],
+            cov_eigenvalues: None,
+            cov_condition_number: None,
+            eta_log_transformed: vec![],
+            omega_param_corr: None,
+            omega_iov_param_corr: None,
+        }
+    }
+
+    #[test]
+    fn asymptotic_row_count_and_draw_range() {
+        let model = tiny_model();
+        let pop = tiny_population();
+        let fit = synthetic_fit(&model.default_params);
+
+        let opts = SimulateUncertaintyOptions {
+            n_uncertainty_draws: 3,
+            n_sim_per_draw: 2,
+            method: UncertaintyMethod::Asymptotic,
+            seed: Some(7),
+        };
+        let rows = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap();
+        // 3 draws * 2 sims * 2 subjects * 3 obs = 36 rows
+        assert_eq!(rows.len(), 36);
+
+        let mut draws: Vec<usize> = rows.iter().map(|r| r.draw).collect();
+        draws.sort();
+        draws.dedup();
+        assert_eq!(draws, vec![1, 2, 3]);
+
+        let mut sims: Vec<usize> = rows.iter().map(|r| r.sim).collect();
+        sims.sort();
+        sims.dedup();
+        assert_eq!(sims, vec![1, 2]);
+    }
+
+    #[test]
+    fn legacy_simulate_emits_draw_one() {
+        // The original simulate() path should tag every row with draw = 1,
+        // preserving a sensible default for callers that don't propagate
+        // parameter uncertainty.
+        let model = tiny_model();
+        let pop = tiny_population();
+        let rows = simulate_with_seed(&model, &pop, &model.default_params, 2, 42);
+        assert!(rows.iter().all(|r| r.draw == 1));
+    }
+
+    #[test]
+    fn sir_path_reuses_pool() {
+        let model = tiny_model();
+        let pop = tiny_population();
+        let mut fit = synthetic_fit(&model.default_params);
+        // Build a 4-element resample pool: small perturbations of x_hat in
+        // packed log-space. Tests will sample with replacement from this pool.
+        let x_hat = crate::estimation::parameterization::pack_params(&model.default_params);
+        let pool: Vec<Vec<f64>> = (0..4)
+            .map(|k| {
+                let mut xk = x_hat.clone();
+                xk[0] += 0.005 * (k as f64);
+                xk
+            })
+            .collect();
+        fit.sir_resamples_packed = Some(pool);
+
+        let opts = SimulateUncertaintyOptions {
+            n_uncertainty_draws: 5,
+            n_sim_per_draw: 1,
+            method: UncertaintyMethod::Sir,
+            seed: Some(11),
+        };
+        let rows = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap();
+        // 5 draws * 1 sim * 2 subjects * 3 obs = 30 rows
+        assert_eq!(rows.len(), 30);
+    }
+
+    #[test]
+    fn asymptotic_errors_without_covariance_step() {
+        let model = tiny_model();
+        let pop = tiny_population();
+        let mut fit = synthetic_fit(&model.default_params);
+        fit.covariance_matrix = None;
+        let opts = SimulateUncertaintyOptions {
+            n_uncertainty_draws: 2,
+            n_sim_per_draw: 1,
+            method: UncertaintyMethod::Asymptotic,
+            seed: Some(0),
+        };
+        let err = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap_err();
+        assert!(err.contains("covariance"));
     }
 }

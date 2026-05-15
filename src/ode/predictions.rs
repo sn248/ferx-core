@@ -141,7 +141,14 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
                 }
             }
         };
-        let sol = solve_ode(&wrapped_rhs, &u, (t_start, t_end), pk_params_flat, &saveat, &opts);
+        let sol = solve_ode(
+            &wrapped_rhs,
+            &u,
+            (t_start, t_end),
+            pk_params_flat,
+            &saveat,
+            &opts,
+        );
 
         // Extract predictions and update state
         for pt in &sol {

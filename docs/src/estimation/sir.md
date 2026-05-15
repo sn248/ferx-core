@@ -35,6 +35,7 @@ Add `sir = true` to the `[fit_options]` block. The covariance step must also be 
 | `sir_samples` | `1000` | Number of proposal samples (M). Higher values give more reliable weights but take longer |
 | `sir_resamples` | `250` | Number of resampled vectors (m). Must be less than `sir_samples` |
 | `sir_seed` | `12345` | RNG seed for reproducibility |
+| `sir_keep_samples` | `false` | Retain the resampled parameter vectors on `FitResult.sir_resamples_packed`. Required for `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`. Adds `n_resamples × n_packed × 8` bytes to the result |
 
 ## Output
 

@@ -1214,6 +1214,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "sir_samples" => opts.sir_samples = parse_usize("sir_samples")?,
         "sir_resamples" => opts.sir_resamples = parse_usize("sir_resamples")?,
         "sir_seed" => opts.sir_seed = parse_u64_opt("sir_seed")?,
+        "sir_keep_samples" => opts.sir_keep_samples = parse_bool("sir_keep_samples")?,
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
             opts.bloq_method = match value.to_lowercase().as_str() {
@@ -3391,6 +3392,7 @@ mod tests {
             "sir_samples",
             "sir_resamples",
             "sir_seed",
+            "sir_keep_samples",
             "bloq_method",
             "bloq",
             "threads",

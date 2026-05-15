@@ -183,6 +183,16 @@ struct FitWire {
     eta_param_info: Vec<EtaParamInfoWire>,
     model_name: String,
     ferx_version: String,
+    // Source-file provenance. All four are optional and default to absent on
+    // older bundles so loading a pre-v1.1 .fitrx keeps working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data_hash: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -345,7 +355,12 @@ fn covariance_status_from_str(s: &str) -> Result<CovarianceStatus, FitrxError> {
         "not_requested" => CovarianceStatus::NotRequested,
         "computed" => CovarianceStatus::Computed,
         "failed" => CovarianceStatus::Failed,
-        _ => return Err(FitrxError::Corrupt(format!("unknown covariance_status {:?}", s))),
+        _ => {
+            return Err(FitrxError::Corrupt(format!(
+                "unknown covariance_status {:?}",
+                s
+            )))
+        }
     })
 }
 
@@ -364,7 +379,12 @@ fn theta_transform_from_str(s: &str) -> Result<ThetaTransform, FitrxError> {
         "log" => ThetaTransform::Log,
         "logit" => ThetaTransform::Logit,
         "logit_probability" => ThetaTransform::LogitProbability,
-        _ => return Err(FitrxError::Corrupt(format!("unknown theta_transform {:?}", s))),
+        _ => {
+            return Err(FitrxError::Corrupt(format!(
+                "unknown theta_transform {:?}",
+                s
+            )))
+        }
     })
 }
 
@@ -400,7 +420,12 @@ fn eta_param_type_from_str(s: &str) -> Result<EtaParamType, FitrxError> {
         "logit" => EtaParamType::Logit,
         "logit_probability" => EtaParamType::LogitProbability,
         "custom" => EtaParamType::Custom,
-        _ => return Err(FitrxError::Corrupt(format!("unknown eta_param_type {:?}", s))),
+        _ => {
+            return Err(FitrxError::Corrupt(format!(
+                "unknown eta_param_type {:?}",
+                s
+            )))
+        }
     })
 }
 
@@ -497,7 +522,11 @@ pub fn save_fit(
 fn build_fit_wire(r: &FitResult) -> FitWire {
     FitWire {
         method: method_to_str(r.method).into(),
-        method_chain: r.method_chain.iter().map(|m| method_to_str(*m).into()).collect(),
+        method_chain: r
+            .method_chain
+            .iter()
+            .map(|m| method_to_str(*m).into())
+            .collect(),
         converged: r.converged,
         ofv: r.ofv,
         aic: r.aic,
@@ -526,7 +555,11 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             estimates: r.theta.clone(),
             se: r.se_theta.clone(),
             fixed: r.theta_fixed.clone(),
-            transform: r.theta_transform.iter().map(|t| theta_transform_to_str(*t).into()).collect(),
+            transform: r
+                .theta_transform
+                .iter()
+                .map(|t| theta_transform_to_str(*t).into())
+                .collect(),
         },
         omega: OmegaWire {
             names: r.eta_names.clone(),
@@ -542,16 +575,18 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             estimates: r.sigma.clone(),
             se: r.se_sigma.clone(),
             fixed: r.sigma_fixed.clone(),
-            types: r.sigma_types.iter().map(|t| sigma_type_to_str(*t).into()).collect(),
+            types: r
+                .sigma_types
+                .iter()
+                .map(|t| sigma_type_to_str(*t).into())
+                .collect(),
         },
         error_model: error_model_to_str(r.error_model).into(),
         shrinkage_eps: r.shrinkage_eps,
         covariance_matrix: r.covariance_matrix.as_ref().map(MatrixWire::from),
         cov_eigenvalues: r.cov_eigenvalues.clone(),
         cov_condition_number: r.cov_condition_number,
-        sir: if r.sir_ci_theta.is_some()
-            || r.sir_ess.is_some()
-            || r.sir_resamples_packed.is_some()
+        sir: if r.sir_ci_theta.is_some() || r.sir_ess.is_some() || r.sir_resamples_packed.is_some()
         {
             Some(SirWire {
                 ci_theta: r.sir_ci_theta.clone(),
@@ -583,6 +618,10 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             .collect(),
         model_name: r.model_name.clone(),
         ferx_version: r.ferx_version.clone(),
+        model_path: r.model_path.clone(),
+        data_path: r.data_path.clone(),
+        model_hash: r.model_hash.clone(),
+        data_hash: r.data_hash.clone(),
     }
 }
 
@@ -779,7 +818,10 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
     let n_eta = wire.omega.matrix.rows;
     let subjects = parse_subjects(&ebes_csv, &preds_csv, ebes_kappa_csv.as_deref(), n_eta)?;
     let ebe_kappas = if let Some(csv) = ebes_kappa_csv.as_deref() {
-        parse_ebe_kappas(csv, &subjects.iter().map(|s| s.id.clone()).collect::<Vec<_>>())?
+        parse_ebe_kappas(
+            csv,
+            &subjects.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+        )?
     } else {
         Vec::new()
     };
@@ -929,7 +971,13 @@ fn parse_subjects(
         let idx = *by_id
             .get(&id)
             .ok_or_else(|| FitrxError::Corrupt(format!("predictions.csv: unknown ID {:?}", id)))?;
-        let parse_opt = |s: &str| -> f64 { if s.is_empty() { f64::NAN } else { s.parse().unwrap_or(f64::NAN) } };
+        let parse_opt = |s: &str| -> f64 {
+            if s.is_empty() {
+                f64::NAN
+            } else {
+                s.parse().unwrap_or(f64::NAN)
+            }
+        };
         subjects[idx].pred.push(parse_opt(&fields[pred_i]));
         subjects[idx].ipred.push(parse_opt(&fields[ipred_i]));
         subjects[idx].cwres.push(parse_opt(&fields[cwres_i]));
@@ -1194,10 +1242,7 @@ fn wire_to_fit_result(
 
     let omega = w.omega.matrix.into_dmatrix()?;
     let omega_param_corr = w.omega.param_corr.map(|m| m.into_dmatrix()).transpose()?;
-    let covariance_matrix = w
-        .covariance_matrix
-        .map(|m| m.into_dmatrix())
-        .transpose()?;
+    let covariance_matrix = w.covariance_matrix.map(|m| m.into_dmatrix()).transpose()?;
 
     let (omega_iov, kappa_names, kappa_fixed, se_kappa, shrinkage_kappa, omega_iov_param_corr) =
         match w.iov {
@@ -1207,13 +1252,21 @@ fn wire_to_fit_result(
                 iov.kappa_fixed,
                 iov.se_kappa,
                 iov.shrinkage_kappa,
-                iov.omega_iov_param_corr.map(|m| m.into_dmatrix()).transpose()?,
+                iov.omega_iov_param_corr
+                    .map(|m| m.into_dmatrix())
+                    .transpose()?,
             ),
             None => (None, Vec::new(), Vec::new(), None, Vec::new(), None),
         };
 
     let (sir_ci_theta, sir_ci_omega, sir_ci_sigma, sir_ess, sir_resamples_packed) = match w.sir {
-        Some(s) => (s.ci_theta, s.ci_omega, s.ci_sigma, s.ess, s.resamples_packed),
+        Some(s) => (
+            s.ci_theta,
+            s.ci_omega,
+            s.ci_sigma,
+            s.ess,
+            s.resamples_packed,
+        ),
         None => (None, None, None, None, None),
     };
 
@@ -1281,6 +1334,10 @@ fn wire_to_fit_result(
         eta_log_transformed: w.omega.log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
+        model_path: w.model_path,
+        data_path: w.data_path,
+        model_hash: w.model_hash,
+        data_hash: w.data_hash,
     })
 }
 
@@ -1434,13 +1491,21 @@ mod tests {
                     individual_param_name: "V".into(),
                 },
             ],
-            theta_transform: vec![ThetaTransform::Log, ThetaTransform::Log, ThetaTransform::Log],
+            theta_transform: vec![
+                ThetaTransform::Log,
+                ThetaTransform::Log,
+                ThetaTransform::Log,
+            ],
             sigma_types: vec![SigmaType::Proportional],
             cov_eigenvalues: Some(vec![1.0, 0.5, 0.2]),
             cov_condition_number: Some(5.0),
             eta_log_transformed: vec![true, true],
             omega_param_corr: None,
             omega_iov_param_corr: None,
+            model_path: None,
+            data_path: None,
+            model_hash: None,
+            data_hash: None,
         }
     }
 
@@ -1634,8 +1699,7 @@ mod tests {
         save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
 
         // Rewrite predictions.csv with one row removed for S1.
-        let mut archive =
-            zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
@@ -1679,8 +1743,7 @@ mod tests {
         let p = dummy_population(&["S1", "S2"], 3);
         save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
 
-        let mut archive =
-            zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();

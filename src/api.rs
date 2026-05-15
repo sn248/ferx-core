@@ -44,12 +44,18 @@ pub fn run_model_with_data(
     );
 
     let init_params = build_init_params(&parsed);
-    let result = fit(
+    let model_hash = crate::io::hash::sha256_file(Path::new(model_path))?;
+    let data_hash = crate::io::hash::sha256_file(Path::new(data_path))?;
+    let mut result = fit(
         &parsed.model,
         &population,
         &init_params,
         &parsed.fit_options,
     )?;
+    result.model_path = Some(model_path.to_string());
+    result.data_path = Some(data_path.to_string());
+    result.model_hash = Some(model_hash);
+    result.data_hash = Some(data_hash);
     Ok((result, population))
 }
 
@@ -129,12 +135,17 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     );
 
     let init_params = build_init_params(&parsed);
-    let result = fit(
+    // No data file to hash — data is simulated in-process. Only the model
+    // path/hash is meaningful here.
+    let model_hash = crate::io::hash::sha256_file(Path::new(model_path))?;
+    let mut result = fit(
         &parsed.model,
         &population,
         &init_params,
         &parsed.fit_options,
     )?;
+    result.model_path = Some(model_path.to_string());
+    result.model_hash = Some(model_hash);
     Ok((result, population))
 }
 
@@ -196,7 +207,18 @@ pub fn fit_from_files(
     let opts = options.unwrap_or_default();
     model.bloq_method = opts.bloq_method;
     model.gradient_method = opts.gradient_method;
-    fit(&model, &population, &model.default_params, &opts)
+    // Hash both inputs before `fit()` runs. We compute these up-front (rather
+    // than after the fit) so a missing/unreadable file fails immediately
+    // instead of after a multi-minute estimation. Errors here are fatal —
+    // the caller asked us to read these files, so we can't proceed.
+    let model_hash = crate::io::hash::sha256_file(Path::new(model_path))?;
+    let data_hash = crate::io::hash::sha256_file(Path::new(data_path))?;
+    let mut result = fit(&model, &population, &model.default_params, &opts)?;
+    result.model_path = Some(model_path.to_string());
+    result.data_path = Some(data_path.to_string());
+    result.model_hash = Some(model_hash);
+    result.data_hash = Some(data_hash);
+    Ok(result)
 }
 
 /// Main fit entry point: CompiledModel + Population → FitResult.
@@ -548,7 +570,7 @@ fn fit_inner(
             if options.verbose {
                 eprintln!("\nRunning SIR...");
             }
-            match crate::estimation::sir::run_sir(
+            match crate::estimation::sir::run_sir_core(
                 model,
                 population,
                 &result.params,
@@ -715,6 +737,13 @@ fn fit_inner(
         eta_log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
+        // Path/hash fields stay None at this layer; `fit_from_files` and the
+        // CLI populate them after a successful fit. In-memory `fit()` callers
+        // don't have meaningful paths.
+        model_path: None,
+        data_path: None,
+        model_hash: None,
+        data_hash: None,
     };
 
     if options.verbose {
@@ -2376,6 +2405,10 @@ mod simulate_with_uncertainty_tests {
             eta_log_transformed: vec![],
             omega_param_corr: None,
             omega_iov_param_corr: None,
+            model_path: None,
+            data_path: None,
+            model_hash: None,
+            data_hash: None,
         }
     }
 

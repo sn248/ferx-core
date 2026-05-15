@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-dd5424c7.js";
+            window.path_to_searchindex_js = "searchindex-ca1b0cde.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-bb1e2caf.js"></script>
@@ -2440,7 +2440,7 @@ source is always available as <code>loaded.model_source</code> and can be re-par
 <tr><td><code>ebes_kappa.csv</code></td><td>CSV</td><td>only when <code>n_kappa &gt; 0</code></td><td>One row per (subject, occasion): <code>ID, OCC, &lt;kappa names...&gt;</code></td></tr>
 <tr><td><code>predictions.csv</code></td><td>CSV</td><td>yes</td><td>One row per observation: <code>ID, TIME, DV, PRED, IPRED, CWRES, IWRES, EBE_OFV, N_OBS</code> plus optional <code>CENS</code>, <code>OCC</code></td></tr>
 <tr><td><code>model.ferx</code></td><td>UTF-8 text</td><td>yes</td><td>Verbatim model source</td></tr>
-<tr><td><code>warnings.txt</code></td><td>UTF-8 text</td><td>yes</td><td>One warning per line (mirrors <code>fit.json</code>)</td></tr>
+<tr><td><code>warnings.txt</code></td><td>UTF-8 text</td><td>no</td><td>One warning per line. Mirrors <code>fit.json:warnings</code> for grep-friendliness; loaders read warnings from <code>fit.json</code> and ignore this entry. Writers should still produce it.</td></tr>
 <tr><td><code>data.csv</code></td><td>CSV</td><td>only with <code>--include-data</code></td><td>Copy of the input NONMEM data</td></tr>
 </tbody>
 </table>
@@ -2473,7 +2473,7 @@ strings:</p>
 <tr><td><code>method</code> / <code>method_chain</code></td><td><code>"foce"</code>, <code>"focei"</code>, <code>"foce_gn"</code>, <code>"foce_gn_hybrid"</code>, <code>"saem"</code></td></tr>
 <tr><td><code>covariance_status</code></td><td><code>"not_requested"</code>, <code>"computed"</code>, <code>"failed"</code></td></tr>
 <tr><td><code>error_model</code></td><td><code>"additive"</code>, <code>"proportional"</code>, <code>"combined"</code></td></tr>
-<tr><td><code>theta.transform[i]</code></td><td><code>"linear"</code>, <code>"identity"</code>, <code>"log"</code>, <code>"logit"</code>, <code>"logit_probability"</code></td></tr>
+<tr><td><code>theta.transform[i]</code></td><td><code>"identity"</code>, <code>"log"</code>, <code>"logit"</code>, <code>"logit_probability"</code></td></tr>
 <tr><td><code>sigma.types[i]</code></td><td><code>"proportional"</code>, <code>"additive"</code></td></tr>
 <tr><td><code>eta_param_info[i].param_type</code></td><td><code>"log_normal"</code>, <code>"additive"</code>, <code>"logit"</code>, <code>"logit_probability"</code>, <code>"custom"</code></td></tr>
 </tbody>
@@ -2484,6 +2484,13 @@ strings:</p>
 </code></pre>
 <p><code>Option&lt;T&gt;</code> fields use JSON <code>null</code> when absent (e.g. <code>covariance_matrix</code> is
 <code>null</code> when the covariance step did not run).</p>
+<p><strong>Non-finite floats.</strong> JSON has no representation for <code>NaN</code> or <code>±Inf</code>. The
+format encodes any non-finite <code>f64</code> as JSON <code>null</code>, both for scalars (e.g.
+<code>shrinkage_eps</code>, <code>cov_condition_number</code>) and for elements of numeric arrays
+including matrix <code>data</code> vectors. Loaders convert <code>null</code> back to <code>NaN</code>. This
+keeps the format robust for legitimate fits — <code>shrinkage_eps</code> is <code>NaN</code> when
+the model has fewer than two valid residuals, and <code>cov_condition_number</code> is
+<code>+Inf</code> when the smallest eigenvalue is non-positive.</p>
 <h3 id="layout"><a class="header" href="#layout">Layout</a></h3>
 <pre><code class="language-json">{
   "method": "focei",

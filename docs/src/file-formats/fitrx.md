@@ -72,7 +72,7 @@ source is always available as `loaded.model_source` and can be re-parsed via
 | `ebes_kappa.csv` | CSV | only when `n_kappa > 0` | One row per (subject, occasion): `ID, OCC, <kappa names...>` |
 | `predictions.csv` | CSV | yes | One row per observation: `ID, TIME, DV, PRED, IPRED, CWRES, IWRES, EBE_OFV, N_OBS` plus optional `CENS`, `OCC` |
 | `model.ferx` | UTF-8 text | yes | Verbatim model source |
-| `warnings.txt` | UTF-8 text | yes | One warning per line (mirrors `fit.json`) |
+| `warnings.txt` | UTF-8 text | no | One warning per line. Mirrors `fit.json:warnings` for grep-friendliness; loaders read warnings from `fit.json` and ignore this entry. Writers should still produce it. |
 | `data.csv` | CSV | only with `--include-data` | Copy of the input NONMEM data |
 
 Entries are deflate-compressed inside the zip archive.
@@ -104,7 +104,7 @@ strings:
 | `method` / `method_chain` | `"foce"`, `"focei"`, `"foce_gn"`, `"foce_gn_hybrid"`, `"saem"` |
 | `covariance_status` | `"not_requested"`, `"computed"`, `"failed"` |
 | `error_model` | `"additive"`, `"proportional"`, `"combined"` |
-| `theta.transform[i]` | `"linear"`, `"identity"`, `"log"`, `"logit"`, `"logit_probability"` |
+| `theta.transform[i]` | `"identity"`, `"log"`, `"logit"`, `"logit_probability"` |
 | `sigma.types[i]` | `"proportional"`, `"additive"` |
 | `eta_param_info[i].param_type` | `"log_normal"`, `"additive"`, `"logit"`, `"logit_probability"`, `"custom"` |
 
@@ -116,6 +116,14 @@ Matrices use a row-major dense representation:
 
 `Option<T>` fields use JSON `null` when absent (e.g. `covariance_matrix` is
 `null` when the covariance step did not run).
+
+**Non-finite floats.** JSON has no representation for `NaN` or `±Inf`. The
+format encodes any non-finite `f64` as JSON `null`, both for scalars (e.g.
+`shrinkage_eps`, `cov_condition_number`) and for elements of numeric arrays
+including matrix `data` vectors. Loaders convert `null` back to `NaN`. This
+keeps the format robust for legitimate fits — `shrinkage_eps` is `NaN` when
+the model has fewer than two valid residuals, and `cov_condition_number` is
+`+Inf` when the smallest eigenvalue is non-positive.
 
 ### Layout
 

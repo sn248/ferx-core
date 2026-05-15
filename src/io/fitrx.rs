@@ -26,6 +26,71 @@ use zip::{ZipArchive, ZipWriter};
 
 pub const FORMAT_VERSION: &str = "1";
 
+// ---------------------------------------------------------------------------
+// Serde helpers for non-finite floats
+// ---------------------------------------------------------------------------
+//
+// JSON has no representation for NaN/±Inf. `serde_json` writes them as
+// `null` on serialize, which is correct per the spec but means the default
+// `Deserialize` for `f64` then fails when reading the value back. These
+// helpers make the round-trip lossless: non-finite serializes to `null`,
+// and `null` deserializes back to `NaN`. Use via `#[serde(with = "...")]`
+// on fields that may legitimately carry NaN (shrinkage, cov_condition_number
+// when the Hessian is singular, etc.).
+
+mod f64_nan_as_null {
+    use serde::{de::Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &f64, ser: S) -> Result<S::Ok, S::Error> {
+        if value.is_finite() {
+            ser.serialize_f64(*value)
+        } else {
+            ser.serialize_none()
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<f64, D::Error> {
+        let opt: Option<f64> = Option::deserialize(de)?;
+        Ok(opt.unwrap_or(f64::NAN))
+    }
+}
+
+mod vec_f64_nan_as_null {
+    use serde::{de::Deserialize, ser::SerializeSeq, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Vec<f64>, ser: S) -> Result<S::Ok, S::Error> {
+        let mut seq = ser.serialize_seq(Some(value.len()))?;
+        for v in value {
+            if v.is_finite() {
+                seq.serialize_element(v)?;
+            } else {
+                seq.serialize_element(&Option::<f64>::None)?;
+            }
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<f64>, D::Error> {
+        let opts: Vec<Option<f64>> = Vec::deserialize(de)?;
+        Ok(opts.into_iter().map(|o| o.unwrap_or(f64::NAN)).collect())
+    }
+}
+
+mod opt_f64_nan_as_null {
+    use serde::{de::Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<f64>, ser: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) if v.is_finite() => ser.serialize_some(v),
+            _ => ser.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<f64>, D::Error> {
+        Option::<f64>::deserialize(de)
+    }
+}
+
 /// Errors from `.fitrx` save/load.
 #[derive(Debug, thiserror::Error)]
 pub enum FitrxError {
@@ -105,9 +170,11 @@ struct FitWire {
     omega: OmegaWire,
     sigma: SigmaWire,
     error_model: String,
+    #[serde(with = "f64_nan_as_null")]
     shrinkage_eps: f64,
     covariance_matrix: Option<MatrixWire>,
     cov_eigenvalues: Option<Vec<f64>>,
+    #[serde(with = "opt_f64_nan_as_null")]
     cov_condition_number: Option<f64>,
 
     sir: Option<SirWire>,
@@ -135,6 +202,7 @@ struct OmegaWire {
     fixed: Vec<bool>,
     log_transformed: Vec<bool>,
     param_corr: Option<MatrixWire>,
+    #[serde(with = "vec_f64_nan_as_null")]
     shrinkage: Vec<f64>,
 }
 
@@ -163,6 +231,7 @@ struct IovWire {
     kappa_names: Vec<String>,
     kappa_fixed: Vec<bool>,
     se_kappa: Option<Vec<f64>>,
+    #[serde(with = "vec_f64_nan_as_null")]
     shrinkage_kappa: Vec<f64>,
     omega_iov: MatrixWire,
     omega_iov_param_corr: Option<MatrixWire>,
@@ -177,10 +246,14 @@ struct EtaParamInfoWire {
 }
 
 /// Row-major dense matrix serialization. `data.len() == rows * cols`.
+/// Non-finite entries (NaN, ±Inf) are written as JSON `null` and read back
+/// as `NaN`, so matrices from failed fits survive a round-trip without
+/// hitting serde_json's "non-finite f64 has no JSON representation" wall.
 #[derive(Serialize, Deserialize)]
 struct MatrixWire {
     rows: usize,
     cols: usize,
+    #[serde(with = "vec_f64_nan_as_null")]
     data: Vec<f64>,
 }
 
@@ -871,6 +944,21 @@ fn parse_subjects(
         subjects[idx].cens.push(c);
     }
 
+    // Cross-validate every subject's per-observation vector length against
+    // the `n_obs` we read from ebes.csv. A mismatch means the bundle was
+    // hand-edited or produced by a buggy writer; better to fail clearly
+    // here than to let downstream code panic on a length mismatch.
+    for s in &subjects {
+        if s.ipred.len() != s.n_obs {
+            return Err(FitrxError::Corrupt(format!(
+                "subject {:?}: predictions.csv has {} rows but ebes.csv reports n_obs = {}",
+                s.id,
+                s.ipred.len(),
+                s.n_obs
+            )));
+        }
+    }
+
     Ok(subjects)
 }
 
@@ -894,7 +982,12 @@ fn parse_ebe_kappas(
     for (idx, id) in subject_ids.iter().enumerate() {
         by_id.insert(id.clone(), idx);
     }
-    let mut out: Vec<Vec<DVector<f64>>> = vec![Vec::new(); subject_ids.len()];
+    // We collect (occ, kappa) pairs per subject and place them by OCC at the
+    // end, so file order doesn't determine occasion-index. The writer always
+    // writes in order, but a hand-edited or third-party-written bundle could
+    // shuffle rows and would otherwise silently associate kappas with the
+    // wrong occasion.
+    let mut staged: Vec<Vec<(u32, DVector<f64>)>> = vec![Vec::new(); subject_ids.len()];
 
     for (i, line) in lines.enumerate() {
         if line.trim().is_empty() {
@@ -912,15 +1005,152 @@ fn parse_ebe_kappas(
         let idx = *by_id.get(&fields[0]).ok_or_else(|| {
             FitrxError::Corrupt(format!("ebes_kappa.csv: unknown ID {:?}", fields[0]))
         })?;
+        let occ = fields[1].parse::<u32>().map_err(|_| {
+            FitrxError::Corrupt(format!(
+                "ebes_kappa.csv row {}: bad OCC value {:?} (expected positive integer)",
+                i + 1,
+                fields[1]
+            ))
+        })?;
+        if occ == 0 {
+            return Err(FitrxError::Corrupt(format!(
+                "ebes_kappa.csv row {}: OCC must be 1-based, got 0",
+                i + 1
+            )));
+        }
         let mut v = DVector::<f64>::zeros(n_kappa);
         for k in 0..n_kappa {
             v[k] = fields[2 + k].parse::<f64>().map_err(|_| {
                 FitrxError::Corrupt(format!("ebes_kappa.csv: bad kappa in row {}", i + 1))
             })?;
         }
-        out[idx].push(v);
+        staged[idx].push((occ, v));
+    }
+
+    // Resolve per-subject occasion slots. Each subject's `staged` vector is
+    // sorted by OCC; we validate that OCCs are contiguous 1..n and that no
+    // index is duplicated.
+    let mut out: Vec<Vec<DVector<f64>>> = Vec::with_capacity(subject_ids.len());
+    for (idx, mut rows) in staged.into_iter().enumerate() {
+        if rows.is_empty() {
+            out.push(Vec::new());
+            continue;
+        }
+        rows.sort_by_key(|(occ, _)| *occ);
+        let n = rows.len();
+        for (i, (occ, _)) in rows.iter().enumerate() {
+            let expected = (i + 1) as u32;
+            if *occ != expected {
+                return Err(FitrxError::Corrupt(format!(
+                    "ebes_kappa.csv: subject {:?} has OCC {} but expected {} (rows must form a 1..{} sequence)",
+                    subject_ids[idx], occ, expected, n
+                )));
+            }
+        }
+        out.push(rows.into_iter().map(|(_, v)| v).collect());
     }
     Ok(out)
+}
+
+// Validate every "parallel array" invariant in the wire layout so that
+// downstream consumers that index by position (theta_names[i] matched with
+// theta_estimates[i], etc.) can't panic on a malformed file. The Rust
+// writer always produces consistent lengths; this check exists to keep
+// loaders robust against hand-edited or third-party-written bundles.
+fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
+    let bail = |msg: String| -> Result<(), FitrxError> { Err(FitrxError::Corrupt(msg)) };
+
+    let n_theta = w.theta.estimates.len();
+    if w.theta.names.len() != n_theta {
+        return bail(format!(
+            "theta.names ({}) and theta.estimates ({}) length mismatch",
+            w.theta.names.len(),
+            n_theta
+        ));
+    }
+    if w.theta.fixed.len() != n_theta {
+        return bail(format!(
+            "theta.fixed ({}) does not match theta.estimates ({})",
+            w.theta.fixed.len(),
+            n_theta
+        ));
+    }
+    if w.theta.transform.len() != n_theta {
+        return bail(format!(
+            "theta.transform ({}) does not match theta.estimates ({})",
+            w.theta.transform.len(),
+            n_theta
+        ));
+    }
+    if let Some(se) = &w.theta.se {
+        if se.len() != n_theta {
+            return bail(format!(
+                "theta.se ({}) does not match theta.estimates ({})",
+                se.len(),
+                n_theta
+            ));
+        }
+    }
+
+    let n_eta = w.omega.matrix.rows;
+    if w.omega.matrix.cols != n_eta {
+        return bail(format!(
+            "omega.matrix is {}×{}; expected square",
+            n_eta, w.omega.matrix.cols
+        ));
+    }
+    if w.omega.names.len() != n_eta {
+        return bail(format!(
+            "omega.names ({}) does not match omega.matrix dim ({})",
+            w.omega.names.len(),
+            n_eta
+        ));
+    }
+    if w.omega.fixed.len() != n_eta {
+        return bail(format!(
+            "omega.fixed ({}) does not match omega.matrix dim ({})",
+            w.omega.fixed.len(),
+            n_eta
+        ));
+    }
+    if w.omega.log_transformed.len() != n_eta {
+        return bail(format!(
+            "omega.log_transformed ({}) does not match omega.matrix dim ({})",
+            w.omega.log_transformed.len(),
+            n_eta
+        ));
+    }
+    if !w.omega.shrinkage.is_empty() && w.omega.shrinkage.len() != n_eta {
+        return bail(format!(
+            "omega.shrinkage ({}) does not match omega.matrix dim ({})",
+            w.omega.shrinkage.len(),
+            n_eta
+        ));
+    }
+
+    let n_sigma = w.sigma.estimates.len();
+    if w.sigma.names.len() != n_sigma {
+        return bail(format!(
+            "sigma.names ({}) and sigma.estimates ({}) length mismatch",
+            w.sigma.names.len(),
+            n_sigma
+        ));
+    }
+    if w.sigma.fixed.len() != n_sigma {
+        return bail(format!(
+            "sigma.fixed ({}) does not match sigma.estimates ({})",
+            w.sigma.fixed.len(),
+            n_sigma
+        ));
+    }
+    if w.sigma.types.len() != n_sigma {
+        return bail(format!(
+            "sigma.types ({}) does not match sigma.estimates ({})",
+            w.sigma.types.len(),
+            n_sigma
+        ));
+    }
+    Ok(())
 }
 
 fn wire_to_fit_result(
@@ -928,6 +1158,7 @@ fn wire_to_fit_result(
     subjects: Vec<SubjectResult>,
     ebe_kappas: Vec<Vec<DVector<f64>>>,
 ) -> Result<FitResult, FitrxError> {
+    validate_parallel_lengths(&w)?;
     let method = method_from_str(&w.method)?;
     let method_chain: Vec<EstimationMethod> = w
         .method_chain
@@ -1357,5 +1588,160 @@ mod tests {
         assert_eq!(epoch_to_utc(1_704_067_200), (2024, 1, 1, 0, 0, 0));
         // 2026-05-15T00:00:00Z = 1_778_803_200
         assert_eq!(epoch_to_utc(1_778_803_200), (2026, 5, 15, 0, 0, 0));
+    }
+
+    #[test]
+    fn roundtrip_preserves_nan_and_inf() {
+        // Fits with sparse data produce NaN shrinkage_eps; singular Hessians
+        // produce f64::INFINITY cov_condition_number. Both must survive the
+        // JSON round-trip (encoded as `null` on disk, NaN on load).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nan.fitrx");
+        let mut r = minimal_fit_result();
+        r.shrinkage_eps = f64::NAN;
+        r.shrinkage_eta = vec![f64::NAN, 0.15];
+        r.cov_condition_number = Some(f64::INFINITY);
+        // Plant a NaN inside the covariance matrix data too.
+        if let Some(cov) = r.covariance_matrix.as_mut() {
+            cov[(0, 0)] = f64::NAN;
+        }
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert!(loaded.fit.shrinkage_eps.is_nan());
+        assert!(loaded.fit.shrinkage_eta[0].is_nan());
+        assert_eq!(loaded.fit.shrinkage_eta[1], 0.15);
+        // cov_condition_number was +Inf; round-trips as None (null) under the
+        // current opt_f64_nan_as_null adapter. Either NaN or None is fine —
+        // both mean "could not be computed reliably" downstream.
+        assert!(loaded
+            .fit
+            .cov_condition_number
+            .map(|v| !v.is_finite())
+            .unwrap_or(true));
+        let cov = loaded.fit.covariance_matrix.as_ref().expect("cov matrix");
+        assert!(cov[(0, 0)].is_nan());
+    }
+
+    #[test]
+    fn load_rejects_predictions_row_count_mismatch() {
+        // Hand-build a .fitrx with a one-row-short predictions.csv vs the
+        // n_obs reported in ebes.csv. parse_subjects should detect it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-rows.fitrx");
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        // Rewrite predictions.csv with one row removed for S1.
+        let mut archive =
+            zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            if name == "predictions.csv" {
+                let csv = String::from_utf8(buf).unwrap();
+                let mut lines: Vec<&str> = csv.lines().collect();
+                // Drop the second data row (first S1 observation) to simulate
+                // a writer that miscounted.
+                lines.remove(2);
+                buf = lines.join("\n").into_bytes();
+                buf.push(b'\n');
+            }
+            entries.push((name, buf));
+        }
+        let bad = dir.path().join("bad-rows-rewritten.fitrx");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&bad).unwrap());
+        for (name, body) in entries {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap();
+
+        let err = load_fit(&bad).unwrap_err();
+        match err {
+            FitrxError::Corrupt(msg) => assert!(msg.contains("n_obs"), "msg = {}", msg),
+            other => panic!("expected Corrupt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_rejects_parallel_array_mismatch() {
+        // Hand-edit fit.json to drop a theta_fixed entry; the loader should
+        // reject the bundle before downstream code can panic on an index.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-parallel.fitrx");
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        let mut archive =
+            zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            if name == "fit.json" {
+                let mut v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+                let fixed = v["theta"]["fixed"].as_array_mut().unwrap();
+                fixed.pop(); // induce length mismatch
+                buf = serde_json::to_vec_pretty(&v).unwrap();
+            }
+            entries.push((name, buf));
+        }
+        let bad = dir.path().join("bad-parallel-rewritten.fitrx");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&bad).unwrap());
+        for (name, body) in entries {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap();
+
+        let err = load_fit(&bad).unwrap_err();
+        match err {
+            FitrxError::Corrupt(msg) => {
+                assert!(msg.contains("theta.fixed"), "msg = {}", msg)
+            }
+            other => panic!("expected Corrupt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_ebe_kappas_uses_occ_column() {
+        // OCC=2 row appears first; the loader must still slot kappas at
+        // [occ-1], not at file-order positions.
+        let csv = "ID,OCC,kappa_CL\nS1,2,0.020000\nS1,1,0.010000\n";
+        let result = parse_ebe_kappas(csv, &["S1".into()]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 2);
+        assert!((result[0][0][0] - 0.01).abs() < 1e-9);
+        assert!((result[0][1][0] - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_ebe_kappas_rejects_duplicate_occ() {
+        let csv = "ID,OCC,kappa_CL\nS1,1,0.010000\nS1,1,0.020000\n";
+        let err = parse_ebe_kappas(csv, &["S1".into()]).unwrap_err();
+        match err {
+            FitrxError::Corrupt(msg) => assert!(msg.contains("OCC"), "msg = {}", msg),
+            other => panic!("expected Corrupt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_ebe_kappas_rejects_zero_occ() {
+        let csv = "ID,OCC,kappa_CL\nS1,0,0.010000\n";
+        let err = parse_ebe_kappas(csv, &["S1".into()]).unwrap_err();
+        match err {
+            FitrxError::Corrupt(msg) => assert!(msg.contains("1-based"), "msg = {}", msg),
+            other => panic!("expected Corrupt, got {:?}", other),
+        }
     }
 }

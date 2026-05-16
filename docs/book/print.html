@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-c392cb71.js";
+            window.path_to_searchindex_js = "searchindex-96fd3bbf.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-61c3128c.js"></script>
@@ -1927,6 +1927,44 @@ SAEM iterations complete. Computing final EBEs and OFV...
   sir_resamples = 250
   sir_seed      = 42
 </code></pre>
+<h2 id="running-sir-after-a-fit-run_sir"><a class="header" href="#running-sir-after-a-fit-run_sir">Running SIR after a fit (<code>run_sir</code>)</a></h2>
+<p>SIR can also be run as a standalone step against a <code>FitResult</code> that was produced earlier — useful when the original fit was expensive and you want to add SIR without re-estimating, or when working with a fit loaded from a <code>.fitrx</code> bundle.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use ferx_core::{fit_from_files, run_sir, FitOptions};
+
+let mut opts = FitOptions::default();
+opts.run_covariance_step = true;          // SIR needs the cov matrix
+let fit = fit_from_files("model.ferx", "data.csv", None, Some(opts.clone()))?;
+
+opts.sir_samples   = 2000;
+opts.sir_resamples = 500;
+let fit_with_sir = run_sir(&amp;fit, None, None, &amp;opts)?;
+<span class="boring">}</span></code></pre>
+<p><code>run_sir</code> re-uses the fit’s covariance matrix as the SIR proposal and the per-subject EBEs from <code>fit.subjects</code> to warm-start the inner loop. The returned <code>FitResult</code> is a clone of <code>fit</code> with <code>sir_ci_theta</code>, <code>sir_ci_omega</code>, <code>sir_ci_sigma</code>, <code>sir_ess</code>, and (when <code>sir_keep_samples = true</code>) <code>sir_resamples_packed</code> populated.</p>
+<h3 id="caller-supplied-vs-re-read-inputs"><a class="header" href="#caller-supplied-vs-re-read-inputs">Caller-supplied vs. re-read inputs</a></h3>
+<p>The second and third arguments to <code>run_sir</code> are <code>Option&lt;&amp;CompiledModel&gt;</code> and <code>Option&lt;&amp;Population&gt;</code>:</p>
+<ul>
+<li><strong>Supplied (<code>Some(...)</code>)</strong>: used as-is. No hash check happens — caller owns verification.</li>
+<li><strong><code>None</code></strong>: <code>run_sir</code> re-reads from <code>fit.model_path</code> / <code>fit.data_path</code> (set automatically by <code>fit_from_files</code>). If <code>fit.model_hash</code> / <code>fit.data_hash</code> is set, the file is hashed and compared against the stored digest. <strong>A mismatch is a hard error</strong> — the whole point of <code>run_sir</code> is to refuse SIR against stale source.</li>
+</ul>
+<p>This means <code>run_sir(&amp;fit, None, None, &amp;opts)</code> “just works” after <code>fit_from_files</code>, with built-in integrity checking. For in-memory workflows where <code>fit()</code> was called directly (no paths recorded), pass the model and population explicitly.</p>
+<h3 id="hash-storage-on-fitresult"><a class="header" href="#hash-storage-on-fitresult">Hash storage on <code>FitResult</code></a></h3>
+<p>When you go through <code>fit_from_files</code> or <code>run_model_with_data</code>, the resulting <code>FitResult</code> carries:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>model_path: Option&lt;String&gt;</code></td><td>The <code>.ferx</code> path as supplied (no canonicalisation)</td></tr>
+<tr><td><code>data_path:  Option&lt;String&gt;</code></td><td>The data CSV path as supplied</td></tr>
+<tr><td><code>model_hash: Option&lt;String&gt;</code></td><td>SHA-256 hex digest of the model file at fit time</td></tr>
+<tr><td><code>data_hash:  Option&lt;String&gt;</code></td><td>SHA-256 hex digest of the data file at fit time</td></tr>
+</tbody>
+</table>
+</div>
+<p>These fields round-trip through <code>.fitrx</code> save/load, so a loaded fit can still be SIR’d against the original files (provided they’re still on disk and unchanged).</p>
 <h2 id="reference"><a class="header" href="#reference">Reference</a></h2>
 <p>Dosne A-G, Bergstrand M, Karlsson MO. “Improving the estimation of parameter uncertainty distributions in nonlinear mixed effects models using sampling importance resampling.” <em>J Pharmacokinet Pharmacodyn</em>. 2017;44(6):539-562. doi:10.1007/s10928-017-9542-0</p>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -2634,11 +2672,22 @@ the model has fewer than two valid residuals, and <code>cov_condition_number</co
     }
   ],
   "model_name": "warfarin",
-  "ferx_version": "0.1.0"
+  "ferx_version": "0.1.0",
+
+  "model_path": "examples/warfarin.ferx",
+  "data_path":  "data/warfarin.csv",
+  "model_hash": "e3b0c4...",
+  "data_hash":  "ba7816..."
 }
 </code></pre>
 <p><code>sir</code> is non-null only when <code>[fit_options].sir = true</code>; <code>iov</code> is non-null only
 when the model uses kappa (block IOV).</p>
+<p><code>model_path</code> / <code>data_path</code> / <code>model_hash</code> / <code>data_hash</code> are populated when the
+fit was produced via <code>fit_from_files</code> (or <code>run_model_with_data</code>); they are
+absent (the keys are omitted) for in-memory <code>fit()</code> calls. Paths are stored
+verbatim as the caller supplied them (no canonicalisation), and the hashes are
+SHA-256 hex digests of the raw file bytes. They round-trip on save/load and
+are used by <code>run_sir</code> to refuse running against modified source files.</p>
 <h2 id="ebescsv"><a class="header" href="#ebescsv"><code>ebes.csv</code></a></h2>
 <pre><code>ID,ETA_CL,ETA_V,ETA_KA,ofv_contribution,n_obs
 1,0.029777,0.070511,0.438001,-25.745580,11

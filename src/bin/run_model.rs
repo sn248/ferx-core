@@ -89,7 +89,9 @@ fn main() {
                 } else {
                     None
                 };
-                let opts = ferx_core::io::fitrx::SaveFitOptions { include_data: include };
+                let opts = ferx_core::io::fitrx::SaveFitOptions {
+                    include_data: include,
+                };
                 match ferx_core::io::fitrx::save_fit(
                     &fit_result,
                     &population,

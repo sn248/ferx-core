@@ -196,12 +196,24 @@ the model has fewer than two valid residuals, and `cov_condition_number` is
     }
   ],
   "model_name": "warfarin",
-  "ferx_version": "0.1.0"
+  "ferx_version": "0.1.0",
+
+  "model_path": "examples/warfarin.ferx",
+  "data_path":  "data/warfarin.csv",
+  "model_hash": "e3b0c4...",
+  "data_hash":  "ba7816..."
 }
 ```
 
 `sir` is non-null only when `[fit_options].sir = true`; `iov` is non-null only
 when the model uses kappa (block IOV).
+
+`model_path` / `data_path` / `model_hash` / `data_hash` are populated when the
+fit was produced via `fit_from_files` (or `run_model_with_data`); they are
+absent (the keys are omitted) for in-memory `fit()` calls. Paths are stored
+verbatim as the caller supplied them (no canonicalisation), and the hashes are
+SHA-256 hex digests of the raw file bytes. They round-trip on save/load and
+are used by `run_sir` to refuse running against modified source files.
 
 ## `ebes.csv`
 

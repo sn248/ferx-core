@@ -718,4 +718,46 @@ mod tests {
         let expected_6 = 1000.0_f64 * (-ke * 4.0).exp();
         assert_relative_eq!(preds[2], expected_6, epsilon = 1e-4, max_relative = 1e-4);
     }
+
+    #[test]
+    fn ode_infusion_with_lagtime_shifts_break_times_and_active_window() {
+        // Direct test of the ODE infusion + lagtime path that the analytical
+        // superposition test alone doesn't cover. Amt=100, rate=100 ⇒
+        // duration=1.0; with lagtime=0.5, the active-infusion window runs
+        // [2.5, 3.5] rather than [2.0, 3.0]. Compare against an equivalent
+        // unlagged dose starting at 2.5 — predictions at matched observation
+        // offsets should agree to ODE tolerance.
+        let dose_lag = DoseEvent::new(2.0, 100.0, 1, 100.0, false, 0.0);
+        assert!(dose_lag.is_infusion() && dose_lag.duration > 0.0);
+        let subj_lag = make_subject(vec![dose_lag], vec![2.0, 3.0, 4.0]);
+        let mut pk_lag = pk_one(5.0, 80.0);
+        pk_lag.values[PK_IDX_LAGTIME] = 0.5;
+
+        // Reference: dose shifted at the data level, no lagtime applied.
+        let dose_ref = DoseEvent::new(2.5, 100.0, 1, 100.0, false, 0.0);
+        let subj_ref = make_subject(vec![dose_ref], vec![2.0, 3.0, 4.0]);
+        let pk_ref = pk_one(5.0, 80.0);
+
+        let ode = one_cpt_ode_spec();
+        let preds_lag = ode_predictions(&ode, &pk_lag.values, &subj_lag);
+        let preds_ref = ode_predictions(&ode, &pk_ref.values, &subj_ref);
+
+        // Observation before lagged infusion start: zero.
+        assert_relative_eq!(preds_lag[0], 0.0, epsilon = 1e-10);
+
+        // Observations during and after the lagged infusion: must match the
+        // reference where the dose was shifted at the dataset level.
+        assert_relative_eq!(
+            preds_lag[1],
+            preds_ref[1],
+            epsilon = 1e-4,
+            max_relative = 1e-4
+        );
+        assert_relative_eq!(
+            preds_lag[2],
+            preds_ref[2],
+            epsilon = 1e-4,
+            max_relative = 1e-4
+        );
+    }
 }

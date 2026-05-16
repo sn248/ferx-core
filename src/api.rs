@@ -396,6 +396,51 @@ fn fit_inner(
 
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
+
+    // Lagtime validation warnings. Two concerns surfaced here once per fit:
+    //   1. Steady-state (SS=1) doses + lagtime: not currently shifted within
+    //      the SS pulse train — silently produces wrong predictions for those
+    //      subjects. Tracked as a follow-up; warn until the SS path is fixed.
+    //   2. Negative lagtime at the initial typical-value point. The fit might
+    //      drift back to positive territory, but starting negative usually
+    //      signals a misparameterization (e.g. an additive `LAGTIME = TVLAG
+    //      + ETA_LAG` instead of a multiplicative `TVLAG * exp(ETA_LAG)`).
+    if model.has_lagtime() {
+        let n_ss_subjects = population
+            .subjects
+            .iter()
+            .filter(|s| s.doses.iter().any(|d| d.ss))
+            .count();
+        if n_ss_subjects > 0 {
+            accumulated_warnings.push(format!(
+                "Lagtime is declared but {} subject(s) have steady-state (SS=1) \
+                 doses. SS pulse trains are not currently shifted by lagtime — \
+                 only the post-SS continuation is delayed. Predictions for \
+                 these subjects may be biased; this is a tracked follow-up.",
+                n_ss_subjects
+            ));
+        }
+
+        // Probe lagtime at the initial typical-value point (eta = 0, mean
+        // covariates). Cheap — one pk_param_fn call per population.
+        if let Some(first_subj) = population.subjects.first() {
+            let zero_eta = vec![0.0_f64; model.n_eta];
+            let pk = (model.pk_param_fn)(
+                &init_params.theta,
+                &zero_eta,
+                &first_subj.covariates,
+            );
+            if pk.lagtime() < 0.0 {
+                accumulated_warnings.push(format!(
+                    "Lagtime evaluates to {:.4} (< 0) at the initial typical-value \
+                     point (eta = 0). Negative lagtimes are physically nonsensical \
+                     and are not clamped — consider an exp() or other positive-link \
+                     parameterisation.",
+                    pk.lagtime()
+                ));
+            }
+        }
+    }
     if options.run_covariance_step && n_params_pre > 30 {
         if let Some(n_evals) = covariance_n_evals_estimated {
             accumulated_warnings.push(format!(

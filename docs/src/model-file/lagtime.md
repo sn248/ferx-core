@@ -68,6 +68,11 @@ NONMEM's per-compartment `ALAG1`, `ALAG2`, ... are mapped to a single
 For typical PK models (one absorption compartment, doses into the depot)
 this is equivalent to setting `ALAG1` on the depot compartment.
 
+If both `lagtime=` and `alag=` are supplied on the same `[structural_model]`
+line (or if both keys appear in a programmatically constructed PK
+parameter map), `lagtime` wins. This is intentional but unlikely to be
+intended; prefer using only one of the two names per model.
+
 ## Notes and caveats
 
 - `lagtime` may carry a random effect like any other PK parameter
@@ -76,9 +81,12 @@ this is equivalent to setting `ALAG1` on the depot compartment.
 - Negative `lagtime` is not clamped — if a user writes an expression that
   yields a negative value, predictions will treat the dose as effective
   before its record time. Prefer a log-link (`exp(...)`) or any other
-  parameterisation that keeps `lagtime ≥ 0`.
+  parameterisation that keeps `lagtime ≥ 0`. ferx emits a warning in
+  `FitResult.warnings` when the initial typical-value lagtime is negative.
 - Steady-state doses (`SS=1`) combined with non-zero `lagtime` are not
   currently supported; the SS train is treated as unshifted, with only
-  the post-SS continuation lagged. Tracked as a follow-up.
+  the post-SS continuation lagged. ferx emits a warning in
+  `FitResult.warnings` when any subject has both an `SS=1` dose record
+  and a model with declared `LAGTIME`. Tracked as a follow-up.
 
 See `examples/oral_with_lagtime.ferx` for a runnable model.

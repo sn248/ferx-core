@@ -553,9 +553,16 @@ mod tests {
 
     #[test]
     fn test_infusion_with_lagtime_shifts_window() {
-        // 1-cpt infusion, rate=100, duration=1, starting at t_dose=2.
-        // With lagtime=0.5, the infusion effectively runs 2.5..3.5.
+        // 1-cpt infusion, amt=100, rate=100 → duration = amt/rate = 1.0
+        // (the `DoseEvent::new` signature is `(time, amt, cmt, rate, ss, ii)`
+        // — duration is auto-computed from amt/rate; the trailing 0.0 is `ii`).
+        // Starting at t_dose=2, with lagtime=0.5, the infusion effectively
+        // runs 2.5..3.5.
         let dose = DoseEvent::new(2.0, 100.0, 1, 100.0, false, 0.0);
+        debug_assert!(
+            dose.is_infusion() && dose.duration > 0.0,
+            "test must exercise the infusion branch"
+        );
         let doses = vec![dose.clone()];
         let mut pk = make_pk_params(10.0, 100.0);
         pk.values[crate::types::PK_IDX_LAGTIME] = 0.5;

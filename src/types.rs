@@ -631,6 +631,16 @@ impl CompiledModel {
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()
     }
+
+    /// Returns true when `[individual_parameters]` declares `LAGTIME` (or its
+    /// `ALAG` alias). Used by the prediction dispatcher and inner optimizer
+    /// to choose between cached-schedule / AD fast paths and the lagtime-
+    /// aware slow paths. Cheap O(pk_indices.len()) scan — kept here rather
+    /// than as a cached bool so it stays correct if `pk_indices` is mutated
+    /// post-construction.
+    pub fn has_lagtime(&self) -> bool {
+        self.pk_indices.iter().any(|&i| i == PK_IDX_LAGTIME)
+    }
 }
 
 impl std::fmt::Debug for CompiledModel {

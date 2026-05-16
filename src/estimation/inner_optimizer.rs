@@ -71,13 +71,9 @@ fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGra
         // already handles lagtime (see `ad_gradients.rs::predict_all_ad`).
         // Until the event-driven AD path is updated, fall back to FD when
         // a TV-cov subject is paired with a lagtime-bearing model.
-        let uses_lagtime = model
-            .pk_indices
-            .iter()
-            .any(|&i| i == crate::types::PK_IDX_LAGTIME);
         if subject.has_tv_covariates() {
             if crate::ad::event_driven_ad::supports_event_driven_ad(model.pk_model)
-                && !uses_lagtime
+                && !model.has_lagtime()
             {
                 InnerGradientMethod::AdEventDriven
             } else {
@@ -243,14 +239,10 @@ pub fn find_ebe(
     // cached schedule would go stale as the inner BFGS varies eta. The
     // non-cached path (`event_driven_predictions`) rebuilds the schedule
     // per call using the current per-dose PkParams (which carry lagtime).
-    let uses_lagtime = model
-        .pk_indices
-        .iter()
-        .any(|&i| i == crate::types::PK_IDX_LAGTIME);
     let schedule = if subject.has_tv_covariates()
         && model.ode_spec.is_none()
         && pk::event_driven::supports_event_driven(model.pk_model)
-        && !uses_lagtime
+        && !model.has_lagtime()
     {
         Some(pk::event_driven::EventSchedule::for_subject(
             subject,

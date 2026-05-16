@@ -45,6 +45,10 @@ Two-compartment oral:
 
 For oral models, bioavailability (F) defaults to 1.0. To estimate it, define an `F` parameter in `[individual_parameters]` -- it will be automatically used by the oral PK functions.
 
+### Lagtime
+
+All `pk` models accept an optional `lagtime=` parameter (or its NONMEM-style alias `alag=`) that delays the effective start of every dose record by the parameter's value. Defaults to `0.0` when omitted, so existing models behave identically. See [Lagtime](lagtime.md) for semantics, examples, and limitations.
+
 ### Dose Handling
 
 Analytical models support:

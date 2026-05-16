@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-96fd3bbf.js";
+            window.path_to_searchindex_js = "../searchindex-f08615c6.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-61c3128c.js"></script>
@@ -234,6 +234,10 @@ performance cost.</p>
 <code>lagtime</code> slot in ferx-core, applied to all dose records of the model.
 For typical PK models (one absorption compartment, doses into the depot)
 this is equivalent to setting <code>ALAG1</code> on the depot compartment.</p>
+<p>If both <code>lagtime=</code> and <code>alag=</code> are supplied on the same <code>[structural_model]</code>
+line (or if both keys appear in a programmatically constructed PK
+parameter map), <code>lagtime</code> wins. This is intentional but unlikely to be
+intended; prefer using only one of the two names per model.</p>
 <h2 id="notes-and-caveats"><a class="header" href="#notes-and-caveats">Notes and caveats</a></h2>
 <ul>
 <li><code>lagtime</code> may carry a random effect like any other PK parameter
@@ -242,10 +246,13 @@ derivatives through the same machinery used for <code>CL</code>, <code>V</code>,
 <li>Negative <code>lagtime</code> is not clamped — if a user writes an expression that
 yields a negative value, predictions will treat the dose as effective
 before its record time. Prefer a log-link (<code>exp(...)</code>) or any other
-parameterisation that keeps <code>lagtime ≥ 0</code>.</li>
+parameterisation that keeps <code>lagtime ≥ 0</code>. ferx emits a warning in
+<code>FitResult.warnings</code> when the initial typical-value lagtime is negative.</li>
 <li>Steady-state doses (<code>SS=1</code>) combined with non-zero <code>lagtime</code> are not
 currently supported; the SS train is treated as unshifted, with only
-the post-SS continuation lagged. Tracked as a follow-up.</li>
+the post-SS continuation lagged. ferx emits a warning in
+<code>FitResult.warnings</code> when any subject has both an <code>SS=1</code> dose record
+and a model with declared <code>LAGTIME</code>. Tracked as a follow-up.</li>
 </ul>
 <p>See <code>examples/oral_with_lagtime.ferx</code> for a runnable model.</p>
 

@@ -635,11 +635,22 @@ impl CompiledModel {
     /// Returns true when `[individual_parameters]` declares `LAGTIME` (or its
     /// `ALAG` alias). Used by the prediction dispatcher and inner optimizer
     /// to choose between cached-schedule / AD fast paths and the lagtime-
-    /// aware slow paths. Cheap O(pk_indices.len()) scan — kept here rather
-    /// than as a cached bool so it stays correct if `pk_indices` is mutated
-    /// post-construction.
+    /// aware slow paths.
+    ///
+    /// Checks both routes by which lagtime can be wired in:
+    ///   1. Analytical PK: `pk_indices` contains `PK_IDX_LAGTIME` when the
+    ///      `[structural_model]` line includes `lagtime=` / `alag=`.
+    ///   2. ODE: the LAGTIME/ALAG slot is populated by name in
+    ///      `build_pk_param_fn`'s ODE branch (sequential pk_indices do not
+    ///      reflect this), so we fall back to scanning `indiv_param_names`.
     pub fn has_lagtime(&self) -> bool {
-        self.pk_indices.iter().any(|&i| i == PK_IDX_LAGTIME)
+        if self.pk_indices.iter().any(|&i| i == PK_IDX_LAGTIME) {
+            return true;
+        }
+        self.indiv_param_names.iter().any(|n| {
+            let u = n.to_uppercase();
+            u == "LAGTIME" || u == "ALAG"
+        })
     }
 }
 

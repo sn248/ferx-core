@@ -2009,6 +2009,21 @@ fn build_pk_param_fn(
                         }
                     }
                 }
+                // Lagtime is consumed by `ode_predictions` outside the user's
+                // RHS, so a LAGTIME/ALAG-named individual parameter must land
+                // at the canonical PK_IDX_LAGTIME slot regardless of its
+                // declaration position. Side-write here AFTER the sequential
+                // loop so this takes precedence over a positional value that
+                // happens to land on slot 8 (only relevant when the user has
+                // ≥9 individual parameters).
+                for var_name in vars_in_order.iter() {
+                    let upper = var_name.to_uppercase();
+                    if upper == "LAGTIME" || upper == "ALAG" {
+                        if let Some(&val) = vars.get(var_name) {
+                            p.values[PK_IDX_LAGTIME] = val;
+                        }
+                    }
+                }
             } else {
                 // Analytical model: map pk_param_name → value via pk_param_map
                 let mut named = HashMap::new();
@@ -5302,5 +5317,55 @@ if (1 > 0) {
         let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
         let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
         assert_eq!(pk.lagtime(), 0.75);
+    }
+
+    #[test]
+    fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
+        // Regression for the ODE-with-lagtime path. For ODE models there is
+        // no [structural_model] pk= line, so pk_param_map is empty and
+        // pk_param_fn's ODE branch writes individual parameters by
+        // declaration order. LAGTIME (and ALAG) must also land at the
+        // canonical PK_IDX_LAGTIME slot so `ode_predictions` (which reads
+        // `pk_params_flat[PK_IDX_LAGTIME]`) sees it. `has_lagtime()` must
+        // likewise return true via the indiv_param_names fallback so the
+        // SS/negative-lagtime warning gating fires for ODE users.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVLAGTIME(0.5)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  LAGTIME = TVLAGTIME
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str).unwrap();
+        // ODE models must report has_lagtime() via the indiv_param_names
+        // fallback even when pk_indices doesn't contain PK_IDX_LAGTIME.
+        assert!(
+            parsed.model.has_lagtime(),
+            "has_lagtime() must return true for an ODE model declaring LAGTIME"
+        );
+
+        let theta: Vec<f64> = parsed.model.default_params.theta.clone();
+        let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        assert_eq!(
+            pk.lagtime(),
+            0.5,
+            "LAGTIME must be routed to PK_IDX_LAGTIME for ODE models"
+        );
     }
 }

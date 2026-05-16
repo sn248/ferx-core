@@ -79,14 +79,20 @@ pub fn individual_nll_ad(
         pk[idx] = tv[i] * eta_contrib.exp();
     }
 
+    // Lagtime shifts the effective start of every dose. Default 0.0 (no
+    // shift) so models that don't declare LAGTIME behave identically to
+    // the pre-feature path. AD-safe: only adds + and <= on scalars.
+    let lagtime = pk[PK_IDX_LAGTIME];
+
     // Predictions + data likelihood
     let mut data_ll = 0.0;
     for obs_idx in 0..n_obs {
         let t = obs_times[obs_idx];
         let mut conc = 0.0;
         for d in 0..n_doses {
-            if dose_times[d] <= t {
-                let tau = t - dose_times[d];
+            let t_eff = dose_times[d] + lagtime;
+            if t_eff <= t {
+                let tau = t - t_eff;
                 conc += single_dose_ad(
                     pk_model_id,
                     tau,
@@ -207,12 +213,17 @@ pub fn predict_all_ad(
         pk[idx] = tv[i] * eta_contrib.exp();
     }
 
+    // Lagtime shifts the effective start of every dose. See
+    // `individual_nll_ad` for the matching path on the NLL side.
+    let lagtime = pk[PK_IDX_LAGTIME];
+
     for obs_idx in 0..n_obs {
         let t = obs_times[obs_idx];
         let mut conc = 0.0;
         for d in 0..n_doses {
-            if dose_times[d] <= t {
-                let tau = t - dose_times[d];
+            let t_eff = dose_times[d] + lagtime;
+            if t_eff <= t {
+                let tau = t - t_eff;
                 conc += single_dose_ad(
                     pk_id,
                     tau,

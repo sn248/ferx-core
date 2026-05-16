@@ -5221,4 +5221,86 @@ if (1 > 0) {
             "both ETAs in the expression should be Custom"
         );
     }
+
+    #[test]
+    fn test_lagtime_in_structural_model_block() {
+        // The DSL key `lagtime=LAGTIME` on the structural_model line must
+        // route LAGTIME's value into PK_IDX_LAGTIME (8). Verifies the
+        // parser → name_to_index → PkParams pipeline end-to-end.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(2.0)
+  theta TVLAGTIME(0.5)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV  * exp(ETA_V)
+  KA      = TVKA
+  LAGTIME = TVLAGTIME
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str).unwrap();
+        let pk_indices = &parsed.model.pk_indices;
+        // LAGTIME should map to slot 8.
+        assert!(
+            pk_indices.contains(&crate::types::PK_IDX_LAGTIME),
+            "pk_indices missing PK_IDX_LAGTIME: {:?}",
+            pk_indices
+        );
+
+        // Evaluate pk_param_fn with default theta to confirm the value
+        // flows through to the slot.
+        let theta: Vec<f64> = parsed.model.default_params.theta.clone();
+        let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        assert_eq!(pk.lagtime(), 0.5);
+    }
+
+    #[test]
+    fn test_alag_alias_in_structural_model_block() {
+        // For NONMEM-user familiarity, `alag=` is accepted as an alias
+        // for `lagtime=`. Same target slot (PK_IDX_LAGTIME).
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(2.0)
+  theta TVALAG(0.75)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  KA   = TVKA
+  ALAG = TVALAG
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=ALAG)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str).unwrap();
+        assert!(parsed
+            .model
+            .pk_indices
+            .contains(&crate::types::PK_IDX_LAGTIME));
+
+        let theta: Vec<f64> = parsed.model.default_params.theta.clone();
+        let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        assert_eq!(pk.lagtime(), 0.75);
+    }
 }

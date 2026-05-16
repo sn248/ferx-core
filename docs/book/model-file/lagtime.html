@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>BLOQ (M3 method) - FeRx-NLME Documentation</title>
+        <title>Lagtime - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,111 +177,87 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="bloq-m3-method"><a class="header" href="#bloq-m3-method">BLOQ (M3 method)</a></h1>
-<p>This example shows how to fit a model to data that contains observations below
-the assay lower limit of quantification (BLOQ) using Beal’s <strong>M3 method</strong>.
-Instead of dropping BLOQ rows — which biases terminal-phase parameter estimates
-— each censored observation contributes
-<code>P(y &lt; LLOQ | θ, η) = Φ((LLOQ − f)/√V)</code> to the likelihood.</p>
-<h2 id="dataset-datawarfarin-bloqcsv"><a class="header" href="#dataset-datawarfarin-bloqcsv">Dataset (<code>data/warfarin-bloq.csv</code>)</a></h2>
-<p>This is the warfarin dataset with an added <code>CENS</code> column. Ten late-time
-observations that originally fell below an assay LLOQ of 2.0 µg/mL have been
-marked <code>CENS=1</code> and their <code>DV</code> cell set to the LLOQ value:</p>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,CENS
-1,0,.,1,100,1,0,1,0
-1,0.5,5.3653,0,.,1,0,0,0
-...
-1,96,2.5019,0,.,1,0,0,0
-1,120,2,0,.,1,0,0,1
-</code></pre>
-<p><strong>NONMEM <code>CENS</code> convention</strong>: when <code>CENS=1</code>, the row is censored and <code>DV</code>
-carries the LLOQ value — not the true (unobserved) concentration. Rows with no
-<code>CENS</code> column, or <code>CENS=0</code>, are treated as ordinary quantified observations.</p>
-<h2 id="model-file-exampleswarfarin-bloqferx"><a class="header" href="#model-file-exampleswarfarin-bloqferx">Model File (<code>examples/warfarin-bloq.ferx</code>)</a></h2>
-<pre><code># One-compartment oral PK model (warfarin) with M3 BLOQ likelihood.
+                        <h1 id="lagtime"><a class="header" href="#lagtime">Lagtime</a></h1>
+<p>A <code>lagtime</code> PK parameter shifts the effective start of every dose record by
+a fixed amount. This is the standard way to model delayed-onset oral
+absorption: even after the dose is administered at clock time <code>t_dose</code>,
+no drug enters the system until <code>t_dose + lagtime</code>.</p>
+<p><code>lagtime</code> is the ferx-core name for what NONMEM calls <code>ALAG</code>. The DSL
+accepts both <code>lagtime=</code> (preferred) and <code>alag=</code> (alias) on the
+<code>[structural_model]</code> line; both route to the same internal slot.</p>
+<h2 id="dsl-example"><a class="header" href="#dsl-example">DSL example</a></h2>
+<pre><code>[parameters]
+  theta TVCL(5.0,  0.1,  50.0)
+  theta TVV(50.0,  5.0, 500.0)
+  theta TVKA(1.5, 0.05,  20.0)
+  theta TVLAGTIME(0.5, 0.001, 5.0)
 
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL      ~ 0.09
+  omega ETA_LAGTIME ~ 0.10
 
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-
-  sigma PROP_ERR ~ 0.02
+  sigma PROP_ERR ~ 0.10
 
 [individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  KA      = TVKA
+  LAGTIME = TVLAGTIME * exp(ETA_LAGTIME)
 
 [structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
-
-[fit_options]
-  method       = focei
-  maxiter      = 300
-  covariance   = true
-  bloq_method  = m3
 </code></pre>
-<p>The only two lines that differ from a plain fit are <code>bloq_method = m3</code> in
-<code>[fit_options]</code> and the added <code>CENS</code> column in the CSV. Nothing else in the
-model changes.</p>
-<h2 id="running"><a class="header" href="#running">Running</a></h2>
-<pre><code class="language-bash">ferx examples/warfarin-bloq.ferx --data data/warfarin-bloq.csv
-</code></pre>
-<h2 id="expected-results"><a class="header" href="#expected-results">Expected Results</a></h2>
-<pre><code>--- Objective Function ---
-OFV:  -213.9104
-
---- THETA Estimates ---
-TVCL                 0.126263
-TVV                  7.629401
-TVKA                 1.083302
-
---- OMEGA Estimates ---
-  OMEGA(1,1) = 0.031381  (CV% = 17.7)
-  OMEGA(2,2) = 0.009723  (CV% = 9.9)
-  OMEGA(3,3) = 0.419327  (CV% = 64.8)
-
---- SIGMA Estimates ---
-  SIGMA(1) = 0.010766
-</code></pre>
-<p>The diagnostic table (<code>warfarin-bloq-sdtab.csv</code>) gains a <code>CENS</code> column, and the
-<code>IWRES</code> / <code>CWRES</code> cells for censored rows are written as empty (a weighted
-Gaussian residual is undefined when the observed value is censored).</p>
-<h2 id="method-notes"><a class="header" href="#method-notes">Method Notes</a></h2>
+<p>This is exactly analogous to declaring <code>F</code> (bioavailability): a typical
+value (optionally with a random effect) flows through
+<code>[individual_parameters]</code> and lands in a dedicated PK slot.</p>
+<h2 id="semantics"><a class="header" href="#semantics">Semantics</a></h2>
+<p>For every dose record (bolus, infusion, or oral depot), the effective
+arrival time is <code>dose.time + lagtime</code>. For infusions the duration is
+unchanged — only the start (and therefore the end) shifts. An observation
+before the lagged arrival reads <code>0</code>.</p>
+<p>If <code>lagtime</code> is not declared, the slot defaults to <code>0.0</code> — existing models
+behave identically to the pre-feature path.</p>
+<p><code>lagtime</code> is supported on:</p>
 <ul>
-<li><strong>Activation requires both pieces</strong>: the <code>CENS</code> column in the data file <em>and</em>
-<code>bloq_method = m3</code> in <code>[fit_options]</code>. Without the option, <code>CENS=1</code> rows are
-treated as ordinary observations at the LLOQ value, which biases the fit.</li>
-<li><strong>FOCE is auto-promoted to FOCEI on affected subjects.</strong> Mixing linearized
-Gaussian residuals with non-linearized <code>log Φ</code> terms produces inconsistent
-OFVs near the LLOQ boundary, so when <code>method = foce</code> and a subject has any
-<code>CENS=1</code> row, that subject is evaluated with η-interaction. A notice is
-written to <code>FitResult.warnings</code>; set <code>method = focei</code> explicitly to silence
-it.</li>
-<li><strong>Gauss-Newton caveat.</strong> With <code>method = gn</code> or <code>gn_hybrid</code>, the BHHH
-information-matrix approximation degrades as the BLOQ fraction grows (each
-censored row carries less Fisher information than its Gaussian counterpart).
-A warning is emitted; for &gt;20% censoring prefer <code>focei</code>.</li>
-<li><strong>SAEM</strong> optimizes θ/σ with M3 in the M-step directly, so no special handling
-is required beyond setting <code>bloq_method = m3</code>.</li>
+<li>the analytical superposition path,</li>
+<li>the autodiff (single-snapshot) path used during <code>fit()</code>,</li>
+<li>the ODE path.</li>
 </ul>
+<p>In the niche case of a time-varying-covariate subject combined with a
+lagtime-bearing model, ferx-core silently falls back from the event-driven
+autodiff path to finite differences — correctness is preserved at a small
+performance cost.</p>
+<h2 id="nonmem-equivalence"><a class="header" href="#nonmem-equivalence">NONMEM equivalence</a></h2>
+<p>NONMEM’s per-compartment <code>ALAG1</code>, <code>ALAG2</code>, … are mapped to a single
+<code>lagtime</code> slot in ferx-core, applied to all dose records of the model.
+For typical PK models (one absorption compartment, doses into the depot)
+this is equivalent to setting <code>ALAG1</code> on the depot compartment.</p>
+<h2 id="notes-and-caveats"><a class="header" href="#notes-and-caveats">Notes and caveats</a></h2>
+<ul>
+<li><code>lagtime</code> may carry a random effect like any other PK parameter
+(<code>LAGTIME = TVLAGTIME * exp(ETA_LAGTIME)</code>). The optimiser handles
+derivatives through the same machinery used for <code>CL</code>, <code>V</code>, <code>KA</code>, etc.</li>
+<li>Negative <code>lagtime</code> is not clamped — if a user writes an expression that
+yields a negative value, predictions will treat the dose as effective
+before its record time. Prefer a log-link (<code>exp(...)</code>) or any other
+parameterisation that keeps <code>lagtime ≥ 0</code>.</li>
+<li>Steady-state doses (<code>SS=1</code>) combined with non-zero <code>lagtime</code> are not
+currently supported; the SS train is treated as unshifted, with only
+the post-SS continuation lagged. Tracked as a follow-up.</li>
+</ul>
+<p>See <code>examples/oral_with_lagtime.ferx</code> for a runnable model.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../examples/ode-model.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../model-file/structural-model.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../examples/iov.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../model-file/error-model.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -291,11 +267,11 @@ is required beyond setting <code>bloq_method = m3</code>.</li>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../examples/ode-model.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../model-file/structural-model.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../examples/iov.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../model-file/error-model.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

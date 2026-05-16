@@ -35,15 +35,16 @@ impl DoseEvent {
 /// Fixed-layout PK parameters — replaces HashMap<String, f64> for AD compatibility.
 ///
 /// Index convention:
-///   0: CL   (clearance)
-///   1: V    (volume, or V1 for 2-cmt)
-///   2: Q/Q2 (intercompartmental clearance, central ↔ peripheral 1; 2-cmt and 3-cmt)
-///   3: V2   (peripheral volume 1; 2-cmt and 3-cmt)
-///   4: KA   (absorption rate constant, oral only)
-///   5: F    (bioavailability, default 1.0)
-///   6: Q3   (intercompartmental clearance, 3-cmt: central ↔ peripheral 2)
-///   7: V3   (peripheral volume 2, 3-cmt only)
-pub const MAX_PK_PARAMS: usize = 8;
+///   0: CL      (clearance)
+///   1: V       (volume, or V1 for 2-cmt)
+///   2: Q/Q2    (intercompartmental clearance, central ↔ peripheral 1; 2-cmt and 3-cmt)
+///   3: V2      (peripheral volume 1; 2-cmt and 3-cmt)
+///   4: KA      (absorption rate constant, oral only)
+///   5: F       (bioavailability, default 1.0)
+///   6: Q3      (intercompartmental clearance, 3-cmt: central ↔ peripheral 2)
+///   7: V3      (peripheral volume 2, 3-cmt only)
+///   8: LAGTIME (dose/absorption lagtime, default 0.0; equivalent to NONMEM ALAG)
+pub const MAX_PK_PARAMS: usize = 9;
 
 pub const PK_IDX_CL: usize = 0;
 pub const PK_IDX_V: usize = 1;
@@ -53,6 +54,7 @@ pub const PK_IDX_KA: usize = 4;
 pub const PK_IDX_F: usize = 5;
 pub const PK_IDX_Q3: usize = 6;
 pub const PK_IDX_V3: usize = 7;
+pub const PK_IDX_LAGTIME: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PkParams {
@@ -92,8 +94,13 @@ impl PkParams {
     pub fn v3(&self) -> f64 {
         self.values[PK_IDX_V3]
     }
+    pub fn lagtime(&self) -> f64 {
+        self.values[PK_IDX_LAGTIME]
+    }
 
     /// Map a PK parameter name to its index in the fixed-size array.
+    ///
+    /// `"alag"` is accepted as an alias for `"lagtime"` for NONMEM familiarity.
     pub fn name_to_index(name: &str) -> Option<usize> {
         match name {
             "cl" => Some(PK_IDX_CL),
@@ -104,6 +111,7 @@ impl PkParams {
             "f" => Some(PK_IDX_F),
             "q3" => Some(PK_IDX_Q3),
             "v3" => Some(PK_IDX_V3),
+            "lagtime" | "alag" => Some(PK_IDX_LAGTIME),
             _ => None,
         }
     }
@@ -140,6 +148,9 @@ impl PkParams {
         }
         if let Some(&v) = map.get("v3") {
             p.values[PK_IDX_V3] = v;
+        }
+        if let Some(&v) = map.get("lagtime").or_else(|| map.get("alag")) {
+            p.values[PK_IDX_LAGTIME] = v;
         }
         p
     }
@@ -1255,5 +1266,32 @@ mod tests {
     fn is_ode_based_true_for_ode() {
         let m = test_helpers::ode_model(GradientMethod::Auto);
         assert!(m.is_ode_based());
+    }
+
+    #[test]
+    fn test_lagtime_name_to_index_and_default() {
+        assert_eq!(PkParams::name_to_index("lagtime"), Some(PK_IDX_LAGTIME));
+        // NONMEM-style alias maps to the same slot.
+        assert_eq!(PkParams::name_to_index("alag"), Some(PK_IDX_LAGTIME));
+        assert_eq!(PK_IDX_LAGTIME, 8);
+        assert_eq!(MAX_PK_PARAMS, 9);
+
+        let default = PkParams::default();
+        assert_eq!(default.lagtime(), 0.0);
+        // F still defaults to 1.0 (unchanged).
+        assert_eq!(default.f_bio(), 1.0);
+    }
+
+    #[test]
+    fn test_lagtime_from_hashmap_primary_and_alias() {
+        let mut m = HashMap::new();
+        m.insert("lagtime".to_string(), 1.5);
+        let p = PkParams::from_hashmap(&m);
+        assert_eq!(p.lagtime(), 1.5);
+
+        let mut m_alias = HashMap::new();
+        m_alias.insert("alag".to_string(), 2.0);
+        let p_alias = PkParams::from_hashmap(&m_alias);
+        assert_eq!(p_alias.lagtime(), 2.0);
     }
 }

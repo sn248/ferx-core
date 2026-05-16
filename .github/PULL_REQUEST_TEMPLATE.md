@@ -104,11 +104,11 @@
 - [ ] New estimator, DSL feature, or fit option → relevant book chapter updated or PR opened
 
 ### Example execution (run locally before marking ready for review)
-- [ ] Rebuilt ferx-core: `cd /Users/teun/ferx-core && cargo build --release`
+- [ ] Rebuilt ferx-core: `cargo build --release`
 - [ ] Rebuilt ferx-r against updated ferx-core: `cd ../ferx-r && FERX_NO_AUTODIFF=1 R CMD INSTALL .`
 - [ ] All affected `examples/*.ferx` run cleanly via CLI: `cargo run --release -- examples/<model>.ferx --data data/<data>.csv`
-- [ ] All affected ferx-site example `.qmd` pages render cleanly: `cd /Users/teun/ferx-site && quarto render examples/<page>.qmd`
-- [ ] All affected ferx-book chapters render cleanly: `cd /Users/teun/ferx-book && quarto render chapters/<chapter>.qmd`
+- [ ] All affected ferx-site example `.qmd` pages render cleanly: `quarto render examples/<page>.qmd`
+- [ ] All affected ferx-book chapters render cleanly: `quarto render chapters/<chapter>.qmd`
 - [ ] No example execution step needed (internal refactor / docs-only / no user-visible change)
 
 ## Reviewer hints

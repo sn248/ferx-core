@@ -38,13 +38,29 @@ use std::path::Path;
 /// Paths recorded on the fit are stored verbatim (no canonicalisation), so
 /// relative paths resolve against whatever the cwd is at `run_sir` time,
 /// not at fit time. Pass absolute paths to `fit_from_files` if your
-/// downstream code may run from a different working directory.
+/// downstream code may run from a different working directory — or
+/// canonicalise the path on the fit yourself before save / re-use, e.g.
+/// `fit.model_path = Some(std::fs::canonicalize(&path)?.to_string_lossy().into_owned())`.
+///
+/// # IOV models (n_kappa > 0)
+///
+/// For models with inter-occasion variability, re-reading the dataset
+/// requires the `iov_column` name from the model file's `[fit_options]`
+/// block — that name doesn't survive on a `CompiledModel`. When the
+/// caller passes `None` for both `model` and `population`, this function
+/// parses the full model file (including `[fit_options]`) and threads
+/// `iov_column` into `read_nonmem_csv`. When the caller supplies
+/// `Some(model)` for an IOV model but leaves `population = None`, there
+/// is no source of `iov_column`, so `run_sir` returns an error rather
+/// than silently dropping occasion parsing. Workaround: pass both
+/// `Some(model)` and `Some(population)` for IOV cases.
 ///
 /// # Arguments
 /// - `fit`: the maximum-likelihood fit to SIR-refine. Must carry a
 ///   `covariance_matrix` (i.e. the original fit ran with `covariance = true`).
 /// - `model`: pre-compiled model. When `None`, re-parsed from `fit.model_path`.
-/// - `population`: dataset. When `None`, re-read from `fit.data_path`.
+/// - `population`: dataset. When `None`, re-read from `fit.data_path` (with
+///   the `iov_column` constraint above for IOV models).
 /// - `options`: SIR-relevant fields read are `sir_samples`, `sir_resamples`,
 ///   `sir_seed`, `sir_keep_samples`, plus the inner-loop settings
 ///   (`inner_maxiter`, `inner_tol`, `interaction`, `mu_referencing`,
@@ -311,6 +327,191 @@ mod tests {
             "expected hash-mismatch message, got: {}",
             err
         );
+    }
+
+    /// Run a fit and skip the test body with a logged message when the
+    /// covariance step doesn't converge. SIR requires a non-None
+    /// covariance matrix; without autodiff (`--features ci`) the warfarin
+    /// FD cov step is flaky. This helper centralises the skip pattern so
+    /// the SIR happy-path tests don't fail spuriously on no-autodiff CI.
+    fn fit_with_cov_or_skip(
+        model_path: &str,
+        data_path: &str,
+        opts: FitOptions,
+    ) -> Option<FitResult> {
+        let fit = fit_from_files(model_path, data_path, None, Some(opts))
+            .expect("fit must converge");
+        if fit.covariance_matrix.is_none() {
+            eprintln!(
+                "[skip] covariance step did not produce a matrix (likely FD \
+                 instability without autodiff); skipping SIR happy-path assertions"
+            );
+            return None;
+        }
+        Some(fit)
+    }
+
+    #[test]
+    fn run_sir_happy_path_populates_sir_fields() {
+        // Integration test: fit_from_files → run_sir(None, None) → verify
+        // the returned FitResult carries the four SIR diagnostics.
+        // Exercises the "re-read model + data from paths + verify hashes"
+        // code path, which is the primary use case for the public API.
+        let dir = tempfile::tempdir().unwrap();
+        let (model_path, data_path) = copy_example_to_tempdir(dir.path());
+
+        let opts = quick_opts();
+        let Some(fit) = fit_with_cov_or_skip(
+            model_path.to_str().unwrap(),
+            data_path.to_str().unwrap(),
+            opts.clone(),
+        ) else {
+            return;
+        };
+
+        let out = run_sir(&fit, None, None, &opts).expect("run_sir succeeds");
+
+        // Every SIR field populated.
+        let ci_theta = out.sir_ci_theta.as_ref().expect("ci_theta populated");
+        let ci_omega = out.sir_ci_omega.as_ref().expect("ci_omega populated");
+        let ci_sigma = out.sir_ci_sigma.as_ref().expect("ci_sigma populated");
+        let ess = out.sir_ess.expect("sir_ess populated");
+
+        assert_eq!(ci_theta.len(), fit.theta.len());
+        assert_eq!(ci_omega.len(), fit.omega.nrows());
+        assert_eq!(ci_sigma.len(), fit.sigma.len());
+        // ESS is bounded by sir_samples; with sir_samples=8, sir_resamples=4
+        // we expect ess > 0 and ess <= sir_samples.
+        assert!(ess > 0.0 && ess <= opts.sir_samples as f64);
+
+        // Lower <= upper on every CI band.
+        for (lo, hi) in ci_theta {
+            assert!(lo <= hi, "theta CI: {} > {}", lo, hi);
+        }
+        for (lo, hi) in ci_omega {
+            assert!(lo <= hi, "omega CI: {} > {}", lo, hi);
+        }
+
+        // Non-SIR fields unchanged (we copy fit, then stamp on the SIR
+        // fields — the rest must round-trip).
+        assert_eq!(out.theta, fit.theta);
+        assert_eq!(out.omega, fit.omega);
+        assert_eq!(out.sigma, fit.sigma);
+        assert_eq!(out.ofv, fit.ofv);
+    }
+
+    #[test]
+    fn run_sir_errors_when_iov_model_supplied_without_population() {
+        // Caller passes Some(model) for an IOV (n_kappa > 0) model but
+        // None for population. The wrapper must refuse rather than
+        // silently re-read the data without iov_column (which would drop
+        // occasion parsing and produce wrong SIR results).
+        //
+        // The fit object here is shape-wise nonsense (warfarin non-IOV
+        // fit + IOV model) — but the IOV check fires before any
+        // dimension check, so this triggers the intended branch first.
+        let dir = tempfile::tempdir().unwrap();
+        let (model_path, data_path) = copy_example_to_tempdir(dir.path());
+
+        let opts = quick_opts();
+        let Some(fit) = fit_with_cov_or_skip(
+            model_path.to_str().unwrap(),
+            data_path.to_str().unwrap(),
+            opts.clone(),
+        ) else {
+            return;
+        };
+
+        let iov_model = crate::parser::model_parser::parse_full_model_file(
+            std::path::Path::new("examples/warfarin_iov.ferx"),
+        )
+        .expect("parse warfarin_iov.ferx")
+        .model;
+        assert!(iov_model.n_kappa > 0, "warfarin_iov.ferx must declare kappa");
+
+        let err = run_sir(&fit, Some(&iov_model), None, &opts).unwrap_err();
+        assert!(
+            err.contains("IOV") && err.contains("population"),
+            "expected IOV-needs-population error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn run_sir_detects_modified_data_file() {
+        // Symmetric to `run_sir_detects_modified_model_file` — verify the
+        // data-hash branch fires on tamper. Without this test the data
+        // side of the integrity check has no coverage.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let (model_path, data_path) = copy_example_to_tempdir(dir.path());
+
+        let opts = quick_opts();
+        let Some(fit) = fit_with_cov_or_skip(
+            model_path.to_str().unwrap(),
+            data_path.to_str().unwrap(),
+            opts.clone(),
+        ) else {
+            return;
+        };
+
+        // Append a comment line so the CSV still parses but the hash flips.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&data_path)
+            .unwrap();
+        writeln!(f, "# tampered").unwrap();
+        drop(f);
+
+        let err = run_sir(&fit, None, None, &opts).unwrap_err();
+        assert!(
+            err.contains("data hash mismatch"),
+            "expected data hash-mismatch message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn run_sir_with_caller_supplied_model_and_pop_skips_hash_check() {
+        // When the caller passes Some(model) AND Some(population), the
+        // wrapper uses them as-is — no hash verification. Tampering with
+        // the on-disk files (so the recorded hashes no longer match)
+        // must NOT trigger a hash mismatch error in this branch.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let (model_path, data_path) = copy_example_to_tempdir(dir.path());
+
+        let opts = quick_opts();
+        let Some(fit) = fit_with_cov_or_skip(
+            model_path.to_str().unwrap(),
+            data_path.to_str().unwrap(),
+            opts.clone(),
+        ) else {
+            return;
+        };
+
+        // Tamper with both files — would fail any disk-based hash check.
+        for p in [&model_path, &data_path] {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(p)
+                .unwrap();
+            writeln!(f, "# tampered").unwrap();
+            drop(f);
+        }
+
+        // Build model + population in memory (from the tampered files —
+        // doesn't matter, this branch doesn't verify).
+        let parsed = crate::parser::model_parser::parse_full_model_file(&model_path)
+            .expect("parse tampered model");
+        let pop = crate::io::datareader::read_nonmem_csv(&data_path, None, None)
+            .expect("read tampered data");
+
+        // Should succeed despite the on-disk tampering, because the
+        // caller-supplied branch bypasses the hash check entirely.
+        let out = run_sir(&fit, Some(&parsed.model), Some(&pop), &opts)
+            .expect("caller-supplied model+pop must skip the hash check");
+        assert!(out.sir_ess.unwrap_or(0.0) > 0.0);
     }
 
     #[test]

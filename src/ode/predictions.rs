@@ -63,6 +63,12 @@ pub struct OdeSpec {
     pub state_names: Vec<String>,
     /// Index of the observable compartment (0-based) for DV
     pub obs_cmt_idx: usize,
+    /// Per-state diagonal process-noise variances (σ²_w,i) for SDE / EKF.
+    /// Length must equal `n_states` when non-empty; empty means standard ODE
+    /// (no diffusion). Declared via `[diffusion]` block as `state ~ variance`,
+    /// analogous to sigma/omega notation. Updated each outer iteration as
+    /// diffusion thetas are re-estimated.
+    pub diffusion_var: Vec<f64>,
 }
 
 /// Compute ODE-based predictions for a single subject.
@@ -79,10 +85,7 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
 
     // Lagtime shifts the effective start (and end) of every dose record.
     // Default 0.0 when not declared, so existing models behave identically.
-    let lagtime = pk_params_flat
-        .get(PK_IDX_LAGTIME)
-        .copied()
-        .unwrap_or(0.0);
+    let lagtime = pk_params_flat.get(PK_IDX_LAGTIME).copied().unwrap_or(0.0);
     // Per-dose lagtimes for `active_infusions` — uniform for the no-TV
     // path (lagtime is constant across doses).
     let dose_lagtimes: Vec<f64> = vec![lagtime; subject.doses.len()];
@@ -357,6 +360,101 @@ pub fn ode_predictions_event_driven(
     predictions
 }
 
+/// EKF-based predictions with an explicit diffusion_var slice (bypasses
+/// `ode_spec.diffusion_var`). Used by the likelihood path to supply the
+/// current theta-derived diffusion variances without mutating the model.
+pub fn ode_predictions_ekf_with_diffusion(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    subject: &Subject,
+    diffusion_var: &[f64],
+    r_obs_fn: impl Fn(f64) -> f64,
+) -> (Vec<f64>, Vec<f64>) {
+    use crate::ode::ekf::solve_ekf;
+
+    let ipred_plain = ode_predictions(ode, pk_params_flat, subject);
+    let r_obs_vec: Vec<f64> = ipred_plain
+        .iter()
+        .map(|&f| {
+            let v = r_obs_fn(f);
+            if v.is_finite() && v > 0.0 {
+                v
+            } else {
+                1.0
+            }
+        })
+        .collect();
+
+    let pts = solve_ekf(
+        ode.rhs.as_ref(),
+        ode.n_states,
+        ode.obs_cmt_idx,
+        diffusion_var,
+        pk_params_flat,
+        &subject.doses,
+        &subject.obs_times,
+        &r_obs_vec,
+    );
+
+    let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();
+    let p_obs: Vec<f64> = pts.iter().map(|p| p.p_obs).collect();
+    (ipreds, p_obs)
+}
+
+/// EKF-based predictions for a subject with an SDE model.
+///
+/// Wraps `solve_ekf`, handling the residual variance `r_obs` needed for the
+/// Kalman update step. Returns `(ipred, p_obs)` where `p_obs[j]` is the
+/// EKF state covariance at the observable compartment just before assimilating
+/// observation `j`. Callers add `p_obs[j]` to the residual variance to form
+/// `V_total = p_obs[j] + V_residual`.
+///
+/// `r_obs_fn` computes the scalar residual variance for each observation given
+/// the predicted value — this feeds the Kalman update, keeping the covariance
+/// estimate numerically stable. It does NOT affect the returned `p_obs` values
+/// (those are pre-update, i.e. the purely process-noise contribution).
+// Not currently called from outside this module — superseded by
+// `ode_predictions_ekf_with_diffusion` which accepts an explicit diffusion_var.
+#[allow(dead_code)]
+pub fn ode_predictions_ekf(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    subject: &Subject,
+    r_obs_fn: impl Fn(f64) -> f64,
+) -> (Vec<f64>, Vec<f64>) {
+    use crate::ode::ekf::solve_ekf;
+
+    // Compute per-observation R for the Kalman update from a standard ODE pass.
+    // Using per-observation R is correct for proportional and combined error models.
+    let ipred_plain = ode_predictions(ode, pk_params_flat, subject);
+    let r_obs_vec: Vec<f64> = ipred_plain
+        .iter()
+        .map(|&f| {
+            let v = r_obs_fn(f);
+            if v.is_finite() && v > 0.0 {
+                v
+            } else {
+                1.0
+            }
+        })
+        .collect();
+
+    let pts = solve_ekf(
+        ode.rhs.as_ref(),
+        ode.n_states,
+        ode.obs_cmt_idx,
+        &ode.diffusion_var,
+        pk_params_flat,
+        &subject.doses,
+        &subject.obs_times,
+        &r_obs_vec,
+    );
+
+    let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();
+    let p_obs: Vec<f64> = pts.iter().map(|p| p.p_obs).collect();
+    (ipreds, p_obs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +473,7 @@ mod tests {
             n_states: 1,
             state_names: vec!["central".into()],
             obs_cmt_idx: 0,
+            diffusion_var: Vec::new(),
         }
     }
 
@@ -481,6 +580,7 @@ mod tests {
             n_states: 2,
             state_names: vec!["depot".into(), "central".into()],
             obs_cmt_idx: 1,
+            diffusion_var: Vec::new(),
         }
     }
 

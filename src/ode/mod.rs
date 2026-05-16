@@ -1,3 +1,4 @@
+pub(crate) mod ekf;
 pub mod predictions;
 pub mod solver;
 

@@ -8,7 +8,7 @@
 //! derivative for the duration of the infusion via an RHS wrapper.
 
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
-use crate::types::{DoseEvent, PkParams, Subject};
+use crate::types::{DoseEvent, PkParams, Subject, PK_IDX_LAGTIME};
 use std::collections::HashMap;
 
 /// Epsilon used to decide whether an infusion fully spans a segment.
@@ -31,15 +31,25 @@ fn is_real_infusion(d: &DoseEvent) -> bool {
 /// throughout the closed segment `[t_start, t_end]`. By construction of the
 /// break-time list (every infusion start and end is a break time), each
 /// infusion is either fully active or fully inactive across a segment.
-fn active_infusions(doses: &[DoseEvent], t_start: f64, t_end: f64) -> Vec<(usize, f64)> {
+///
+/// `dose_lagtimes[k]` shifts dose `k`'s active window. Parallel to `doses`.
+/// An empty slice means "no lagtime" (all zeros).
+fn active_infusions(
+    doses: &[DoseEvent],
+    t_start: f64,
+    t_end: f64,
+    dose_lagtimes: &[f64],
+) -> Vec<(usize, f64)> {
     doses
         .iter()
-        .filter(|d| {
+        .enumerate()
+        .filter(|(k, d)| {
+            let lag = dose_lagtimes.get(*k).copied().unwrap_or(0.0);
             is_real_infusion(d)
-                && d.time <= t_start + INFUSION_EPS
-                && d.time + d.duration >= t_end - INFUSION_EPS
+                && d.time + lag <= t_start + INFUSION_EPS
+                && d.time + lag + d.duration >= t_end - INFUSION_EPS
         })
-        .map(|d| (d.cmt.saturating_sub(1), d.rate))
+        .map(|(_, d)| (d.cmt.saturating_sub(1), d.rate))
         .collect()
 }
 
@@ -67,6 +77,16 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
     let mut u = vec![0.0; n];
     let mut predictions = vec![f64::NAN; n_obs];
 
+    // Lagtime shifts the effective start (and end) of every dose record.
+    // Default 0.0 when not declared, so existing models behave identically.
+    let lagtime = pk_params_flat
+        .get(PK_IDX_LAGTIME)
+        .copied()
+        .unwrap_or(0.0);
+    // Per-dose lagtimes for `active_infusions` — uniform for the no-TV
+    // path (lagtime is constant across doses).
+    let dose_lagtimes: Vec<f64> = vec![lagtime; subject.doses.len()];
+
     // Build obs_time → index map
     let obs_map: HashMap<u64, usize> = subject
         .obs_times
@@ -75,15 +95,15 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
         .map(|(i, &t)| (t.to_bits(), i))
         .collect();
 
-    // Break timeline at dose times — and, for infusions, at infusion-end
-    // times too, so each segment is either fully inside or fully outside
-    // every infusion window.
+    // Break timeline at lagtime-shifted dose times — and, for infusions,
+    // at lagtime-shifted infusion-end times too, so each segment is
+    // either fully inside or fully outside every infusion window.
     let t_last = subject.obs_times.iter().cloned().fold(0.0f64, f64::max);
     let mut break_times: Vec<f64> = vec![0.0];
     for dose in &subject.doses {
-        break_times.push(dose.time);
+        break_times.push(dose.time + lagtime);
         if is_real_infusion(dose) {
-            break_times.push(dose.time + dose.duration);
+            break_times.push(dose.time + lagtime + dose.duration);
         }
     }
     break_times.push(t_last);
@@ -98,7 +118,7 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
         // instantaneously — they're injected as a derivative term inside
         // the integrator (see `active_infusions` + wrapped RHS below).
         for dose in &subject.doses {
-            if (dose.time - t_start).abs() < 1e-12 && !is_real_infusion(dose) {
+            if (dose.time + lagtime - t_start).abs() < 1e-12 && !is_real_infusion(dose) {
                 // dose.cmt is 1-based; state indices are 0-based
                 let cmt_idx = dose.cmt - 1;
                 if cmt_idx < n {
@@ -132,7 +152,7 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
 
         // Integrate. If any infusions are active in this segment, wrap
         // the user RHS so it adds `+rate` to each infusion's compartment.
-        let active = active_infusions(&subject.doses, t_start, t_end);
+        let active = active_infusions(&subject.doses, t_start, t_end, &dose_lagtimes);
         let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
             (ode.rhs)(y, p, t, dy);
             for &(cmt_idx, rate) in &active {
@@ -236,10 +256,13 @@ pub fn ode_predictions_event_driven(
     let mut timeline: Vec<(f64, Kind, usize)> = Vec::with_capacity(
         subject.doses.len() + n_obs + subject.pk_only_times.len() + n_infusion_ends,
     );
+    // Per-dose lagtimes from the per-event PK snapshot for the dose.
+    let dose_lagtimes: Vec<f64> = pk_at_dose.iter().map(|p| p.lagtime()).collect();
     for (k, d) in subject.doses.iter().enumerate() {
-        timeline.push((d.time, Kind::Dose, k));
+        let lag = dose_lagtimes[k];
+        timeline.push((d.time + lag, Kind::Dose, k));
         if is_real_infusion(d) {
-            timeline.push((d.time + d.duration, Kind::InfusionEnd, k));
+            timeline.push((d.time + lag + d.duration, Kind::InfusionEnd, k));
         }
     }
     for (j, &t) in subject.obs_times.iter().enumerate() {
@@ -274,7 +297,7 @@ pub fn ode_predictions_event_driven(
         if t_event > cur_t {
             // Wrap the user RHS so any infusion fully spanning
             // [cur_t, t_event] contributes `+rate` to its compartment.
-            let active = active_infusions(&subject.doses, cur_t, t_event);
+            let active = active_infusions(&subject.doses, cur_t, t_event, &dose_lagtimes);
             let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
                 (ode.rhs)(y, p, t, dy);
                 for &(cmt_idx, rate) in &active {
@@ -665,5 +688,76 @@ mod tests {
 
         let preds = ode_predictions(&ode, &pk.values, &subj);
         assert_eq!(preds.len(), 1);
+    }
+
+    #[test]
+    fn ode_iv_bolus_with_lagtime_shifts_curve() {
+        // 1-cpt IV bolus integrated via ODE: with lagtime=2.0 and dose at
+        // t_dose=0, the central-amount state should be 0 until t=2 (the
+        // lagged dose arrival), then decay as if dose-time were 2.
+        // (`one_cpt_ode_spec` observes the amount A(t), not A/V.)
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![1.0, 3.0, 6.0];
+        let subj = make_subject(doses, obs_times);
+        let mut pk = pk_one(5.0, 80.0);
+        pk.values[PK_IDX_LAGTIME] = 2.0;
+        let ode = one_cpt_ode_spec();
+
+        let preds = ode_predictions(&ode, &pk.values, &subj);
+
+        // At t=1, dose has not yet arrived (lagtime=2). State stays 0.
+        assert_relative_eq!(preds[0], 0.0, epsilon = 1e-10);
+
+        // At t=3, effective elapsed time since dose is 1.0.
+        // A(1) = Amt * exp(-ke * 1)
+        let ke = 5.0_f64 / 80.0;
+        let expected_3 = 1000.0_f64 * (-ke * 1.0).exp();
+        assert_relative_eq!(preds[1], expected_3, epsilon = 1e-4, max_relative = 1e-4);
+
+        // At t=6, effective elapsed time is 4.0.
+        let expected_6 = 1000.0_f64 * (-ke * 4.0).exp();
+        assert_relative_eq!(preds[2], expected_6, epsilon = 1e-4, max_relative = 1e-4);
+    }
+
+    #[test]
+    fn ode_infusion_with_lagtime_shifts_break_times_and_active_window() {
+        // Direct test of the ODE infusion + lagtime path that the analytical
+        // superposition test alone doesn't cover. Amt=100, rate=100 ⇒
+        // duration=1.0; with lagtime=0.5, the active-infusion window runs
+        // [2.5, 3.5] rather than [2.0, 3.0]. Compare against an equivalent
+        // unlagged dose starting at 2.5 — predictions at matched observation
+        // offsets should agree to ODE tolerance.
+        let dose_lag = DoseEvent::new(2.0, 100.0, 1, 100.0, false, 0.0);
+        assert!(dose_lag.is_infusion() && dose_lag.duration > 0.0);
+        let subj_lag = make_subject(vec![dose_lag], vec![2.0, 3.0, 4.0]);
+        let mut pk_lag = pk_one(5.0, 80.0);
+        pk_lag.values[PK_IDX_LAGTIME] = 0.5;
+
+        // Reference: dose shifted at the data level, no lagtime applied.
+        let dose_ref = DoseEvent::new(2.5, 100.0, 1, 100.0, false, 0.0);
+        let subj_ref = make_subject(vec![dose_ref], vec![2.0, 3.0, 4.0]);
+        let pk_ref = pk_one(5.0, 80.0);
+
+        let ode = one_cpt_ode_spec();
+        let preds_lag = ode_predictions(&ode, &pk_lag.values, &subj_lag);
+        let preds_ref = ode_predictions(&ode, &pk_ref.values, &subj_ref);
+
+        // Observation before lagged infusion start: zero.
+        assert_relative_eq!(preds_lag[0], 0.0, epsilon = 1e-10);
+
+        // Observations during and after the lagged infusion: must match the
+        // reference where the dose was shifted at the dataset level.
+        assert_relative_eq!(
+            preds_lag[1],
+            preds_ref[1],
+            epsilon = 1e-4,
+            max_relative = 1e-4
+        );
+        assert_relative_eq!(
+            preds_lag[2],
+            preds_ref[2],
+            epsilon = 1e-4,
+            max_relative = 1e-4
+        );
     }
 }

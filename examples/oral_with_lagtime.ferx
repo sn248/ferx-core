@@ -1,0 +1,39 @@
+# Oral absorption with lagtime
+#
+# One-compartment oral model with an absorption lagtime parameter — the
+# effective start of every dose is delayed by `LAGTIME`. Equivalent to
+# NONMEM's `ALAG1`.
+#
+# The DSL accepts either `lagtime=...` (preferred) or `alag=...` (alias)
+# on the structural_model line. Both route to the same PK slot.
+#
+# Defaults: when no `LAGTIME` is declared the lagtime is 0.0 — existing
+# models behave identically to the pre-feature path.
+
+[parameters]
+  theta TVCL(5.0,  0.1,  50.0)       # typical clearance (L/h)
+  theta TVV(50.0,  5.0, 500.0)       # typical volume (L)
+  theta TVKA(1.5, 0.05,  20.0)       # typical absorption rate constant (/h)
+  theta TVLAGTIME(0.5, 0.001, 5.0)   # typical lagtime (h)
+
+  omega ETA_CL      ~ 0.09           # BSV on CL (log-normal)
+  omega ETA_LAGTIME ~ 0.10           # BSV on lagtime (log-normal)
+
+  sigma PROP_ERR ~ 0.10
+
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  KA      = TVKA
+  LAGTIME = TVLAGTIME * exp(ETA_LAGTIME)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true

@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-c5f64ed3.js";
+            window.path_to_searchindex_js = "searchindex-f08615c6.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-bb1e2caf.js"></script>
+        <script src="toc-61c3128c.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -970,6 +970,7 @@ PARAM = THETA + ETA                   # additive
 <tr><td><code>V2</code></td><td>Peripheral volume</td></tr>
 <tr><td><code>KA</code></td><td>Absorption rate constant</td></tr>
 <tr><td><code>F</code></td><td>Bioavailability (default 1.0 if omitted)</td></tr>
+<tr><td><code>LAGTIME</code> (alias: <code>ALAG</code>)</td><td>Dose/absorption lagtime (default 0.0 if omitted) — see <a href="#lagtime-1">Lagtime</a></td></tr>
 </tbody>
 </table>
 </div>
@@ -1012,6 +1013,8 @@ PARAM = THETA + ETA                   # additive
 </code></pre>
 <h3 id="bioavailability"><a class="header" href="#bioavailability">Bioavailability</a></h3>
 <p>For oral models, bioavailability (F) defaults to 1.0. To estimate it, define an <code>F</code> parameter in <code>[individual_parameters]</code> – it will be automatically used by the oral PK functions.</p>
+<h3 id="lagtime"><a class="header" href="#lagtime">Lagtime</a></h3>
+<p>All <code>pk</code> models accept an optional <code>lagtime=</code> parameter (or its NONMEM-style alias <code>alag=</code>) that delays the effective start of every dose record by the parameter’s value. Defaults to <code>0.0</code> when omitted, so existing models behave identically. See <a href="#lagtime-1">Lagtime</a> for semantics, examples, and limitations.</p>
 <h3 id="dose-handling"><a class="header" href="#dose-handling">Dose Handling</a></h3>
 <p>Analytical models support:</p>
 <ul>
@@ -1032,6 +1035,85 @@ PARAM = THETA + ETA                   # additive
   ode(obs_cmt=COMPARTMENT_NAME, states=[state1, state2, ...])
 </code></pre>
 <p>See <a href="#ode-models-1">ODE Models</a> for full ODE syntax.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="lagtime-1"><a class="header" href="#lagtime-1">Lagtime</a></h1>
+<p>A <code>lagtime</code> PK parameter shifts the effective start of every dose record by
+a fixed amount. This is the standard way to model delayed-onset oral
+absorption: even after the dose is administered at clock time <code>t_dose</code>,
+no drug enters the system until <code>t_dose + lagtime</code>.</p>
+<p><code>lagtime</code> is the ferx-core name for what NONMEM calls <code>ALAG</code>. The DSL
+accepts both <code>lagtime=</code> (preferred) and <code>alag=</code> (alias) on the
+<code>[structural_model]</code> line; both route to the same internal slot.</p>
+<h2 id="dsl-example"><a class="header" href="#dsl-example">DSL example</a></h2>
+<pre><code>[parameters]
+  theta TVCL(5.0,  0.1,  50.0)
+  theta TVV(50.0,  5.0, 500.0)
+  theta TVKA(1.5, 0.05,  20.0)
+  theta TVLAGTIME(0.5, 0.001, 5.0)
+
+  omega ETA_CL      ~ 0.09
+  omega ETA_LAGTIME ~ 0.10
+
+  sigma PROP_ERR ~ 0.10
+
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  KA      = TVKA
+  LAGTIME = TVLAGTIME * exp(ETA_LAGTIME)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+</code></pre>
+<p>This is exactly analogous to declaring <code>F</code> (bioavailability): a typical
+value (optionally with a random effect) flows through
+<code>[individual_parameters]</code> and lands in a dedicated PK slot.</p>
+<h2 id="semantics"><a class="header" href="#semantics">Semantics</a></h2>
+<p>For every dose record (bolus, infusion, or oral depot), the effective
+arrival time is <code>dose.time + lagtime</code>. For infusions the duration is
+unchanged — only the start (and therefore the end) shifts. An observation
+before the lagged arrival reads <code>0</code>.</p>
+<p>If <code>lagtime</code> is not declared, the slot defaults to <code>0.0</code> — existing models
+behave identically to the pre-feature path.</p>
+<p><code>lagtime</code> is supported on:</p>
+<ul>
+<li>the analytical superposition path,</li>
+<li>the autodiff (single-snapshot) path used during <code>fit()</code>,</li>
+<li>the ODE path.</li>
+</ul>
+<p>In the niche case of a time-varying-covariate subject combined with a
+lagtime-bearing model, ferx-core silently falls back from the event-driven
+autodiff path to finite differences — correctness is preserved at a small
+performance cost.</p>
+<h2 id="nonmem-equivalence"><a class="header" href="#nonmem-equivalence">NONMEM equivalence</a></h2>
+<p>NONMEM’s per-compartment <code>ALAG1</code>, <code>ALAG2</code>, … are mapped to a single
+<code>lagtime</code> slot in ferx-core, applied to all dose records of the model.
+For typical PK models (one absorption compartment, doses into the depot)
+this is equivalent to setting <code>ALAG1</code> on the depot compartment.</p>
+<p>If both <code>lagtime=</code> and <code>alag=</code> are supplied on the same <code>[structural_model]</code>
+line (or if both keys appear in a programmatically constructed PK
+parameter map), <code>lagtime</code> wins. This is intentional but unlikely to be
+intended; prefer using only one of the two names per model.</p>
+<h2 id="notes-and-caveats"><a class="header" href="#notes-and-caveats">Notes and caveats</a></h2>
+<ul>
+<li><code>lagtime</code> may carry a random effect like any other PK parameter
+(<code>LAGTIME = TVLAGTIME * exp(ETA_LAGTIME)</code>). The optimiser handles
+derivatives through the same machinery used for <code>CL</code>, <code>V</code>, <code>KA</code>, etc.</li>
+<li>Negative <code>lagtime</code> is not clamped — if a user writes an expression that
+yields a negative value, predictions will treat the dose as effective
+before its record time. Prefer a log-link (<code>exp(...)</code>) or any other
+parameterisation that keeps <code>lagtime ≥ 0</code>. ferx emits a warning in
+<code>FitResult.warnings</code> when the initial typical-value lagtime is negative.</li>
+<li>Steady-state doses (<code>SS=1</code>) combined with non-zero <code>lagtime</code> are not
+currently supported; the SS train is treated as unshifted, with only
+the post-SS continuation lagged. ferx emits a warning in
+<code>FitResult.warnings</code> when any subject has both an <code>SS=1</code> dose record
+and a model with declared <code>LAGTIME</code>. Tracked as a follow-up.</li>
+</ul>
+<p>See <code>examples/oral_with_lagtime.ferx</code> for a runnable model.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="error-model"><a class="header" href="#error-model">Error Model</a></h1>
 <p>The <code>[error_model]</code> block defines the residual error structure, specifying how observed data (DV) relates to model predictions.</p>

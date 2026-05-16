@@ -8,6 +8,7 @@
   - [Parameters](model-file/parameters.md)
   - [Individual Parameters](model-file/individual-parameters.md)
   - [Structural Model](model-file/structural-model.md)
+  - [Lagtime](model-file/lagtime.md)
   - [Error Model](model-file/error-model.md)
   - [ODE Models](model-file/ode-models.md)
   - [Fit Options](model-file/fit-options.md)

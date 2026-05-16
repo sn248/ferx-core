@@ -169,5 +169,6 @@ The parameter names on the left side of each assignment must map to recognized P
 | `V2` | Peripheral volume |
 | `KA` | Absorption rate constant |
 | `F` | Bioavailability (default 1.0 if omitted) |
+| `LAGTIME` (alias: `ALAG`) | Dose/absorption lagtime (default 0.0 if omitted) — see [Lagtime](lagtime.md) |
 
 For ODE models, the parameter names are user-defined and passed as a flat vector to the ODE right-hand side function.

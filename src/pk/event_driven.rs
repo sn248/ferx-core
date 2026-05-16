@@ -65,6 +65,9 @@ pub struct EventSchedule {
     /// Merged + sorted event list. Tie-break order is `Dose < PkOnly < Obs`
     /// so covariate-change markers run after a dose at the same time but
     /// before an observation (matches NONMEM `$PK` semantics).
+    ///
+    /// Dose event times are `subject.doses[k].time + dose_lagtimes[k]`
+    /// so the schedule already reflects per-dose lagtime.
     pub events: Vec<Event>,
     /// For each interval `i` between `events[i]` and `events[i+1]`, the
     /// sub-interval boundary points (sorted, deduped, including the two
@@ -73,22 +76,49 @@ pub struct EventSchedule {
     /// For an interval with no infusion start/stop crossing, this is
     /// just `[t_from, t_to]`.
     pub bounds_per_interval: Vec<Vec<f64>>,
+    /// Per-dose lagtimes that were used to build this schedule. Parallel
+    /// to `subject.doses`. Stored so callers (and the propagator's
+    /// active-infusion check) use the same shifted times the schedule
+    /// was built with.
+    pub dose_lagtimes: Vec<f64>,
 }
 
 impl EventSchedule {
     /// Pre-compute the event timeline and per-interval infusion bounds
     /// for `subject` under `pk_model`. The result is reusable across
-    /// arbitrary `(theta, eta)` evaluations of the same subject — only
-    /// the *event times* (subject-static) matter, not the per-event PK
-    /// values (which are passed separately into the `_with_schedule`
-    /// propagator).
-    pub fn for_subject(subject: &Subject, _pk_model: PkModel) -> Self {
+    /// arbitrary `(theta, eta)` evaluations of the same subject *as long
+    /// as the per-dose lagtimes are unchanged* — only the event times
+    /// (subject-static, plus lagtime offsets) matter, not the per-event
+    /// PK rate values.
+    ///
+    /// `dose_lagtimes` must be length `subject.doses.len()` (or empty,
+    /// which is treated as all zeros for backward compatibility with the
+    /// no-lagtime fast path).
+    pub fn for_subject(
+        subject: &Subject,
+        _pk_model: PkModel,
+        dose_lagtimes: &[f64],
+    ) -> Self {
+        assert!(
+            dose_lagtimes.is_empty() || dose_lagtimes.len() == subject.doses.len(),
+            "dose_lagtimes length {} does not match subject.doses.len() {}",
+            dose_lagtimes.len(),
+            subject.doses.len()
+        );
+        let get_lag = |k: usize| -> f64 {
+            if dose_lagtimes.is_empty() {
+                0.0
+            } else {
+                dose_lagtimes[k]
+            }
+        };
+
         let mut events: Vec<Event> = Vec::with_capacity(
             subject.doses.len() + subject.obs_times.len() + subject.pk_only_times.len(),
         );
         for (k, d) in subject.doses.iter().enumerate() {
             events.push(Event {
-                time: d.time,
+                time: d.time + get_lag(k),
                 kind: EventKind::Dose,
                 orig_idx: k,
             });
@@ -114,18 +144,27 @@ impl EventSchedule {
                 .then_with(|| kind_order(a.kind).cmp(&kind_order(b.kind)))
         });
 
+        // Materialize lagtimes for later use (active-infusion check).
+        let stored_lagtimes: Vec<f64> = if dose_lagtimes.is_empty() {
+            vec![0.0; subject.doses.len()]
+        } else {
+            dose_lagtimes.to_vec()
+        };
+
         let mut bounds_per_interval = Vec::with_capacity(events.len().saturating_sub(1));
         for w in events.windows(2) {
             bounds_per_interval.push(compute_propagation_bounds(
                 w[0].time,
                 w[1].time,
                 &subject.doses,
+                &stored_lagtimes,
             ));
         }
 
         Self {
             events,
             bounds_per_interval,
+            dose_lagtimes: stored_lagtimes,
         }
     }
 }
@@ -144,12 +183,21 @@ fn kind_order(k: EventKind) -> u8 {
 /// `Vec` is sorted, deduped, and always includes the two interval
 /// endpoints, so `windows(2)` enumerates every sub-interval over which
 /// the rate matrix is constant.
-fn compute_propagation_bounds(t_from: f64, t_to: f64, doses: &[DoseEvent]) -> Vec<f64> {
+///
+/// `dose_lagtimes[k]` shifts dose `k`'s effective start (and therefore
+/// end) by that amount. Must be parallel to `doses`.
+fn compute_propagation_bounds(
+    t_from: f64,
+    t_to: f64,
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+) -> Vec<f64> {
     let mut bounds: Vec<f64> = vec![t_from, t_to];
-    for d in doses {
+    for (k, d) in doses.iter().enumerate() {
         if d.rate > 0.0 && d.duration > 0.0 {
-            let start = d.time;
-            let end = d.time + d.duration;
+            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+            let start = d.time + lag;
+            let end = d.time + lag + d.duration;
             if start > t_from + 1e-15 && start < t_to - 1e-15 {
                 bounds.push(start);
             }
@@ -216,7 +264,8 @@ pub fn event_driven_predictions(
     pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
 ) -> Vec<f64> {
-    let schedule = EventSchedule::for_subject(subject, pk_model);
+    let dose_lagtimes: Vec<f64> = pk_at_dose.iter().map(|p| p.lagtime()).collect();
+    let schedule = EventSchedule::for_subject(subject, pk_model, &dose_lagtimes);
     event_driven_predictions_with_schedule(
         pk_model,
         subject,
@@ -270,7 +319,14 @@ pub fn event_driven_predictions_with_schedule(
             // The interval (events[i-1], events[i]) — its bounds were
             // pre-computed at schedule.bounds_per_interval[i-1].
             let bounds = &schedule.bounds_per_interval[i - 1];
-            propagate_with_bounds(&mut state, bounds, &pk_now, pk_model, &subject.doses);
+            propagate_with_bounds(
+                &mut state,
+                bounds,
+                &pk_now,
+                pk_model,
+                &subject.doses,
+                &schedule.dose_lagtimes,
+            );
             cur_t = ev.time;
         }
 
@@ -333,12 +389,16 @@ fn pk_for(
 /// containing event interval — see [`compute_propagation_bounds`] /
 /// [`EventSchedule`]). The input rate matrix is constant within each
 /// `bounds.windows(2)` sub-interval.
+///
+/// `dose_lagtimes[k]` shifts dose `k`'s active-infusion window by that
+/// amount; must be parallel to `doses`.
 fn propagate_with_bounds(
     state: &mut [f64],
     bounds: &[f64],
     pk: &PkParams,
     pk_model: PkModel,
     doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
 ) {
     for w in bounds.windows(2) {
         let s0 = w[0];
@@ -362,8 +422,11 @@ fn propagate_with_bounds(
         let mut rate_central = 0.0;
         let mut rate_periph1 = 0.0;
         let mut rate_periph2 = 0.0;
-        for d in doses {
-            if d.rate > 0.0 && d.duration > 0.0 && d.time <= mid && d.time + d.duration >= mid {
+        for (k, d) in doses.iter().enumerate() {
+            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+            let t_start = d.time + lag;
+            let t_end = t_start + d.duration;
+            if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
                 match (pk_model, d.cmt) {
                     (PkModel::OneCptIvBolus | PkModel::OneCptInfusion, 1) => rate_central += d.rate,
                     (PkModel::OneCptOral, 2) => rate_central += d.rate,
@@ -1444,7 +1507,7 @@ mod tests {
         let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
         let obs_times = vec![0.0, 1.0]; // first obs at t=0, same as dose
         let subj = make_subject(doses, obs_times);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIvBolus);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIvBolus, &[]);
 
         assert_eq!(schedule.events.len(), 3);
         assert!(matches!(schedule.events[0].kind, EventKind::Dose));
@@ -1461,7 +1524,7 @@ mod tests {
         let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 2.0)];
         let obs_times = vec![10.0];
         let subj = make_subject(doses, obs_times);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptInfusion);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptInfusion, &[]);
 
         // Two events (dose at 0, obs at 10) → one interval (0, 10).
         assert_eq!(schedule.bounds_per_interval.len(), 1);
@@ -1501,7 +1564,7 @@ mod tests {
 
         let direct =
             event_driven_predictions(PkModel::TwoCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::TwoCptInfusion);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::TwoCptInfusion, &[]);
         let with_sched = event_driven_predictions_with_schedule(
             PkModel::TwoCptInfusion,
             &subj,

@@ -120,16 +120,22 @@ pub fn compute_event_pk_params_into(
 
 /// Predict concentration at a given time for a subject, summing contributions
 /// from all prior doses (superposition principle).
+///
+/// `pk_params.lagtime()` shifts the effective start of every dose (bolus,
+/// infusion, and oral) by that amount. For infusions the duration is
+/// preserved — only the start (and therefore end) of the window shifts.
 pub fn predict_concentration(
     pk_model: PkModel,
     doses: &[DoseEvent],
     t: f64,
     pk_params: &PkParams,
 ) -> f64 {
+    let lagtime = pk_params.lagtime();
     let mut conc = 0.0;
     for dose in doses {
-        if dose.time <= t {
-            let tau = t - dose.time;
+        let t_eff = dose.time + lagtime;
+        if t_eff <= t {
+            let tau = t - t_eff;
             conc += single_dose_concentration(pk_model, dose, tau, pk_params);
         }
     }
@@ -495,5 +501,97 @@ mod tests {
         for i in 1..preds.len() {
             assert!(preds[i] < preds[i - 1]);
         }
+    }
+
+    fn oral_pk_params(cl: f64, v: f64, ka: f64) -> PkParams {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = cl;
+        p.values[crate::types::PK_IDX_V] = v;
+        p.values[crate::types::PK_IDX_KA] = ka;
+        p
+    }
+
+    #[test]
+    fn test_predict_concentration_lagtime_zero_matches_baseline() {
+        // With lagtime = 0, predict_concentration must agree with the
+        // pre-feature behavior at any observation time.
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let pk = oral_pk_params(2.0, 20.0, 1.5); // CL/V = 0.1, KA = 1.5
+        let c0 = predict_concentration(PkModel::OneCptOral, &doses, 2.0, &pk);
+        // Bateman: C(t) = (F*Dose*KA) / (V*(KA-k)) * [exp(-k*t) - exp(-KA*t)]
+        let k = 2.0_f64 / 20.0;
+        let expected =
+            (1.0 * 100.0 * 1.5) / (20.0 * (1.5 - k)) * ((-k * 2.0).exp() - (-1.5 * 2.0_f64).exp());
+        assert_relative_eq!(c0, expected, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_predict_concentration_lagtime_shifts_curve() {
+        // Concentration at t with lagtime=L should equal the unlagged
+        // concentration evaluated at (t - L).
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let mut pk_lag = oral_pk_params(2.0, 20.0, 1.5);
+        pk_lag.values[crate::types::PK_IDX_LAGTIME] = 1.5;
+        let pk_nolag = oral_pk_params(2.0, 20.0, 1.5);
+
+        // At t = 3.5 with lag=1.5, effective elapsed time is 2.0.
+        let c_lag = predict_concentration(PkModel::OneCptOral, &doses, 3.5, &pk_lag);
+        let c_no = predict_concentration(PkModel::OneCptOral, &doses, 2.0, &pk_nolag);
+        assert_relative_eq!(c_lag, c_no, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_predict_concentration_lagtime_before_first_obs_returns_zero() {
+        // Lagtime longer than the observation window: nothing has reached
+        // the system yet, so concentration is exactly 0.
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let mut pk = oral_pk_params(2.0, 20.0, 1.5);
+        pk.values[crate::types::PK_IDX_LAGTIME] = 5.0;
+        let c = predict_concentration(PkModel::OneCptOral, &doses, 1.0, &pk);
+        assert_eq!(c, 0.0);
+    }
+
+    #[test]
+    fn test_infusion_with_lagtime_shifts_window() {
+        // 1-cpt infusion, amt=100, rate=100 → duration = amt/rate = 1.0
+        // (the `DoseEvent::new` signature is `(time, amt, cmt, rate, ss, ii)`
+        // — duration is auto-computed from amt/rate; the trailing 0.0 is `ii`).
+        // Starting at t_dose=2, with lagtime=0.5, the infusion effectively
+        // runs 2.5..3.5.
+        let dose = DoseEvent::new(2.0, 100.0, 1, 100.0, false, 0.0);
+        debug_assert!(
+            dose.is_infusion() && dose.duration > 0.0,
+            "test must exercise the infusion branch"
+        );
+        let doses = vec![dose.clone()];
+        let mut pk = make_pk_params(10.0, 100.0);
+        pk.values[crate::types::PK_IDX_LAGTIME] = 0.5;
+
+        // (a) Before lagged start: still zero.
+        let c_pre = predict_concentration(PkModel::OneCptInfusion, &doses, 0.6, &pk);
+        assert_eq!(c_pre, 0.0);
+
+        // (b) Mid-infusion (lagged): pre-lag conc at tau = t - (dose.time + lag) = t - 2.5.
+        // Compare against unlagged infusion at tau via the same formula.
+        let pk_nolag = make_pk_params(10.0, 100.0);
+        let c_lag = predict_concentration(PkModel::OneCptInfusion, &doses, 2.6, &pk);
+        let c_no = predict_concentration(
+            PkModel::OneCptInfusion,
+            &[DoseEvent::new(0.1, 100.0, 1, 100.0, false, 0.0)],
+            0.2,
+            &pk_nolag,
+        );
+        // Both probe an elapsed time of 0.1 into a 1h infusion of rate=100.
+        assert_relative_eq!(c_lag, c_no, epsilon = 1e-10);
+
+        // (c) Post-infusion (lagged window ends at 3.5).
+        let c_post = predict_concentration(PkModel::OneCptInfusion, &doses, 3.6, &pk);
+        let c_post_nolag = predict_concentration(
+            PkModel::OneCptInfusion,
+            &[DoseEvent::new(0.0, 100.0, 1, 100.0, false, 0.0)],
+            1.1,
+            &pk_nolag,
+        );
+        assert_relative_eq!(c_post, c_post_nolag, epsilon = 1e-10);
     }
 }

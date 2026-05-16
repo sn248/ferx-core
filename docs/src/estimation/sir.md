@@ -70,6 +70,46 @@ The resampling step itself is negligible.
   sir_seed      = 42
 ```
 
+## Running SIR after a fit (`run_sir`)
+
+SIR can also be run as a standalone step against a `FitResult` that was produced earlier — useful when the original fit was expensive and you want to add SIR without re-estimating, or when working with a fit loaded from a `.fitrx` bundle.
+
+```rust
+use ferx_core::{fit_from_files, run_sir, FitOptions};
+
+let mut opts = FitOptions::default();
+opts.run_covariance_step = true;          // SIR needs the cov matrix
+let fit = fit_from_files("model.ferx", "data.csv", None, Some(opts.clone()))?;
+
+opts.sir_samples   = 2000;
+opts.sir_resamples = 500;
+let fit_with_sir = run_sir(&fit, None, None, &opts)?;
+```
+
+`run_sir` re-uses the fit's covariance matrix as the SIR proposal and the per-subject EBEs from `fit.subjects` to warm-start the inner loop. The returned `FitResult` is a clone of `fit` with `sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ess`, and (when `sir_keep_samples = true`) `sir_resamples_packed` populated.
+
+### Caller-supplied vs. re-read inputs
+
+The second and third arguments to `run_sir` are `Option<&CompiledModel>` and `Option<&Population>`:
+
+- **Supplied (`Some(...)`)**: used as-is. No hash check happens — caller owns verification.
+- **`None`**: `run_sir` re-reads from `fit.model_path` / `fit.data_path` (set automatically by `fit_from_files`). If `fit.model_hash` / `fit.data_hash` is set, the file is hashed and compared against the stored digest. **A mismatch is a hard error** — the whole point of `run_sir` is to refuse SIR against stale source.
+
+This means `run_sir(&fit, None, None, &opts)` "just works" after `fit_from_files`, with built-in integrity checking. For in-memory workflows where `fit()` was called directly (no paths recorded), pass the model and population explicitly.
+
+### Hash storage on `FitResult`
+
+When you go through `fit_from_files` or `run_model_with_data`, the resulting `FitResult` carries:
+
+| Field | Description |
+|-------|-------------|
+| `model_path: Option<String>` | The `.ferx` path as supplied (no canonicalisation) |
+| `data_path:  Option<String>` | The data CSV path as supplied |
+| `model_hash: Option<String>` | SHA-256 hex digest of the model file at fit time |
+| `data_hash:  Option<String>` | SHA-256 hex digest of the data file at fit time |
+
+These fields round-trip through `.fitrx` save/load, so a loaded fit can still be SIR'd against the original files (provided they're still on disk and unchanged).
+
 ## Reference
 
 Dosne A-G, Bergstrand M, Karlsson MO. "Improving the estimation of parameter uncertainty distributions in nonlinear mixed effects models using sampling importance resampling." *J Pharmacokinet Pharmacodyn*. 2017;44(6):539-562. doi:10.1007/s10928-017-9542-0

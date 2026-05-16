@@ -36,7 +36,11 @@ pub struct SirResult {
     pub resamples_packed: Option<Vec<Vec<f64>>>,
 }
 
-/// Run the SIR procedure after maximum likelihood estimation.
+/// Math kernel for the SIR procedure. Operates on pre-built parameter and
+/// EBE arrays; users should typically call the higher-level
+/// [`run_sir`](crate::run_sir) wrapper in `estimation::run_sir`, which takes
+/// a `FitResult` and handles `ModelParameters` reconstruction, EBE
+/// extraction, and source-file integrity checks.
 ///
 /// # Arguments
 /// * `model` - The compiled model
@@ -46,7 +50,7 @@ pub struct SirResult {
 /// * `proposal_cov` - Covariance matrix in packed (log-transformed) parameter space
 /// * `ofv_hat` - OFV at ML estimates
 /// * `options` - Fit options containing SIR settings
-pub fn run_sir(
+pub fn run_sir_core(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,

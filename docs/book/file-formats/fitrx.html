@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-00676987.js";
+            window.path_to_searchindex_js = "../searchindex-c5f64ed3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-bb1e2caf.js"></script>
@@ -359,11 +359,22 @@ the model has fewer than two valid residuals, and <code>cov_condition_number</co
     }
   ],
   "model_name": "warfarin",
-  "ferx_version": "0.1.0"
+  "ferx_version": "0.1.0",
+
+  "model_path": "examples/warfarin.ferx",
+  "data_path":  "data/warfarin.csv",
+  "model_hash": "e3b0c4...",
+  "data_hash":  "ba7816..."
 }
 </code></pre>
 <p><code>sir</code> is non-null only when <code>[fit_options].sir = true</code>; <code>iov</code> is non-null only
 when the model uses kappa (block IOV).</p>
+<p><code>model_path</code> / <code>data_path</code> / <code>model_hash</code> / <code>data_hash</code> are populated when the
+fit was produced via <code>fit_from_files</code> (or <code>run_model_with_data</code>); they are
+absent (the keys are omitted) for in-memory <code>fit()</code> calls. Paths are stored
+verbatim as the caller supplied them (no canonicalisation), and the hashes are
+SHA-256 hex digests of the raw file bytes. They round-trip on save/load and
+are used by <code>run_sir</code> to refuse running against modified source files.</p>
 <h2 id="ebescsv"><a class="header" href="#ebescsv"><code>ebes.csv</code></a></h2>
 <pre><code>ID,ETA_CL,ETA_V,ETA_KA,ofv_contribution,n_obs
 1,0.029777,0.070511,0.438001,-25.745580,11

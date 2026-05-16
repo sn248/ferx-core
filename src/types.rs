@@ -789,6 +789,23 @@ pub struct FitResult {
     /// Parameter-level correlation matrix for IOV block kappa, analogous to
     /// `omega_param_corr`.  `None` when `omega_iov` is absent or diagonal.
     pub omega_iov_param_corr: Option<DMatrix<f64>>,
+    /// Path to the `.ferx` model file used for this fit, as supplied by the
+    /// caller. `Some` when the fit was launched via `fit_from_files` or
+    /// `run_model_with_data`; `None` when `fit()` was called with an in-memory
+    /// `CompiledModel`. Stored verbatim (no canonicalisation) so paths don't
+    /// leak the runner's home directory into shared `.fitrx` bundles.
+    pub model_path: Option<String>,
+    /// Path to the NONMEM-format CSV data file used for this fit, as supplied
+    /// by the caller. `Some` / `None` follows the same rules as `model_path`.
+    pub data_path: Option<String>,
+    /// SHA-256 hex digest (64 chars, lowercase) of the model file bytes at
+    /// fit time. Used by `run_sir` to refuse stale data when the caller
+    /// re-supplies a model or asks the function to re-read from `model_path`.
+    /// Computed only when the fit was launched from a file path.
+    pub model_hash: Option<String>,
+    /// SHA-256 hex digest of the data file bytes at fit time. Same semantics
+    /// as `model_hash`.
+    pub data_hash: Option<String>,
 }
 
 /// Options for fit()

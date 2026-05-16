@@ -26,6 +26,7 @@ pub use api::{
     simulate_with_seed, simulate_with_uncertainty, SimulateUncertaintyOptions,
 };
 pub use cancel::CancelFlag;
+pub use estimation::run_sir::run_sir;
 pub use estimation::uncertainty_samples::UncertaintyMethod;
 pub use io::datareader::read_nonmem_csv;
 pub use parser::model_parser::{parse_full_model_file, parse_model_file, parse_model_string};

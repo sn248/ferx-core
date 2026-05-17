@@ -452,7 +452,24 @@ fn optimize_nlopt(
     let mut warnings = Vec::new();
 
     // Per-element scale factors: present O(1) coordinates to NLopt.
-    let scale: Vec<f64> = if options.scale_params {
+    //
+    // `compute_scale` normalises by |packed value|, which gives O(1)
+    // scaled coords for log-packed thetas (CL, V, KA — log-magnitude
+    // is typically > 0.1) and a 1.0 fallback for everything near zero.
+    // For identity-packed thetas (those with `theta_lower < 0`,
+    // typically small covariate effects like THETA_AGE_CL = -0.01)
+    // this places the scaled value near zero, and SLSQP's BFGS-flavored
+    // Hessian estimate handles wildly different scaled magnitudes
+    // poorly — observed regression: SAD_SCEN1 FOCEI took 510+ evals
+    // (40+ min) vs ~90 evals (~5 min) with scaling off. Auto-disable
+    // scaling whenever any identity-packed theta is present, so the
+    // optimizer runs in the natural (mixed) packed space where
+    // BFGS's own scale-adaptation works correctly.
+    let has_identity_theta = init_params
+        .theta_lower
+        .iter()
+        .any(|&lo| lo < 0.0);
+    let scale: Vec<f64> = if options.scale_params && !has_identity_theta {
         compute_scale(&x0)
     } else {
         vec![1.0; n]

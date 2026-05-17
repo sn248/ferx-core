@@ -242,6 +242,58 @@ impl Population {
     pub fn n_obs(&self) -> usize {
         self.subjects.iter().map(|s| s.observations.len()).sum()
     }
+
+    /// Drop per-event covariate snapshots that don't carry any
+    /// variation in covariates the model actually references.
+    ///
+    /// The data reader populates `dose_covariates` / `obs_covariates` /
+    /// `pk_only_covariates` whenever *any* non-standard CSV column
+    /// varies within a subject — including pure time-tracker columns
+    /// like `DAY` or `STIME` that no model expression touches. The
+    /// downstream prediction path then takes the heavy event-driven
+    /// route (one `pk_param_fn` call per event, plus state propagation
+    /// across each interval) instead of the analytical superposition
+    /// fast path that runs `pk_param_fn` once per subject. This pre-fit
+    /// pass clears the snapshots for any subject whose model-referenced
+    /// covariates are all time-constant, so the existing
+    /// `has_tv_covariates()`-based dispatcher routes those subjects
+    /// through the fast path automatically.
+    ///
+    /// Returns the number of subjects whose snapshots were cleared
+    /// (for diagnostic / warning purposes).
+    pub fn prune_irrelevant_tv_covariates(&mut self, referenced: &[String]) -> usize {
+        let mut pruned = 0;
+        for subj in &mut self.subjects {
+            if subj.dose_covariates.is_empty()
+                && subj.obs_covariates.is_empty()
+                && subj.pk_only_covariates.is_empty()
+            {
+                continue; // already on the fast path
+            }
+            let mut any_relevant_tv = false;
+            'covs: for cov in referenced {
+                let base = subj.covariates.get(cov).copied();
+                for snap in subj
+                    .dose_covariates
+                    .iter()
+                    .chain(subj.obs_covariates.iter())
+                    .chain(subj.pk_only_covariates.iter())
+                {
+                    if snap.get(cov).copied() != base {
+                        any_relevant_tv = true;
+                        break 'covs;
+                    }
+                }
+            }
+            if !any_relevant_tv {
+                subj.dose_covariates.clear();
+                subj.obs_covariates.clear();
+                subj.pk_only_covariates.clear();
+                pruned += 1;
+            }
+        }
+        pruned
+    }
 }
 
 /// Between-subject variability matrix (Omega)

@@ -241,15 +241,37 @@ pub fn fit(
     options: &FitOptions,
 ) -> Result<FitResult, String> {
     validate_covariates(model, population)?;
+    // If any subject has per-event covariate snapshots that don't carry
+    // a variation in covariates the model actually references (e.g.
+    // DAY / STIME columns in NONMEM-format datasets), clear those
+    // snapshots so the downstream prediction path routes through the
+    // cheap analytical/no-TV fast path instead of the event-driven
+    // path. Bigger wins on SAD-style datasets where every subject has
+    // a varying DAY column but no model expression touches DAY.
+    let pop_pruned: std::borrow::Cow<Population> = {
+        let needs = population.subjects.iter().any(|s| {
+            !s.dose_covariates.is_empty()
+                || !s.obs_covariates.is_empty()
+                || !s.pk_only_covariates.is_empty()
+        });
+        if needs {
+            let mut p = population.clone();
+            p.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+            std::borrow::Cow::Owned(p)
+        } else {
+            std::borrow::Cow::Borrowed(population)
+        }
+    };
+    let pop_ref: &Population = &*pop_pruned;
     match options.threads {
         Some(n) if n > 0 => {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
                 .build()
                 .map_err(|e| format!("failed to build rayon pool with {} threads: {}", n, e))?;
-            pool.install(|| fit_inner(model, population, init_params, options))
+            pool.install(|| fit_inner(model, pop_ref, init_params, options))
         }
-        _ => fit_inner(model, population, init_params, options),
+        _ => fit_inner(model, pop_ref, init_params, options),
     }
 }
 

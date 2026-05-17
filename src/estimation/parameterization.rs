@@ -7,17 +7,48 @@ pub struct PackedBounds {
     pub upper: Vec<f64>,
 }
 
+/// Whether to pack `theta[i]` on the log scale.
+///
+/// Log packing is used when the user-specified lower bound is strictly
+/// positive (the parameter is sign-constrained, e.g. CL, V, KA, sigma).
+/// When `theta_lower[i] < 0`, the user has explicitly allowed negative
+/// values — typical for covariate exponents (`(DOSE/100)^γ` with γ ∈
+/// [-3, 3]), additive covariate effects (`THETA_AGE_CL ∈ [-1, 1]`), or
+/// logit-scale parameters. Log-packing those silently clamps to 1e-10
+/// and the optimizer can never reach the true sign-bearing value
+/// (regression: SAD_SCEN4's γ = -0.8 collapsed to 1e-10 ≈ 0, and
+/// SAD_SCEN1's THETA_AGE_CL = -0.01 collapsed to the same).
+///
+/// We default to log on theta_lower >= 0 to preserve the optimizer
+/// conditioning that established users rely on for sign-constrained
+/// parameters (CL, V, sigma can span many orders of magnitude). Use
+/// theta_lower = 0 if you want identity packing for an already-positive
+/// parameter.
+#[inline]
+fn theta_packs_log(theta_lower: f64) -> bool {
+    theta_lower >= 0.0
+}
+
 /// Pack ModelParameters into a flat unconstrained vector for optimization.
 ///
-/// Layout: [log(theta_1), ..., log(theta_n),
+/// Layout: [pack(theta_1), ..., pack(theta_n),
 ///          log(L_11), L_21, log(L_22), ...,   (Cholesky lower triangle)
 ///          log(sigma_1), ..., log(sigma_m)]
+///
+/// Theta packing depends on whether the user's `theta_lower[i]` allows
+/// negatives — see [`theta_packs_log`].
 pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
     let mut v = Vec::new();
 
-    // Theta: log-transformed
-    for &th in &params.theta {
-        v.push(th.max(1e-10).ln());
+    // Theta: log-transformed when lower bound is non-negative; identity
+    // otherwise (so negative-valued parameters like covariate exponents
+    // can be expressed at all).
+    for (i, &th) in params.theta.iter().enumerate() {
+        if theta_packs_log(params.theta_lower[i]) {
+            v.push(th.max(1e-10).ln());
+        } else {
+            v.push(th);
+        }
     }
 
     // Omega Cholesky factor: diagonal as log, off-diagonal as-is
@@ -75,10 +106,14 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
     let n_sigma = template.sigma.values.len();
     let mut idx = 0;
 
-    // Theta
+    // Theta — back-transform mirrors `pack_params`.
     let theta: Vec<f64> = (0..n_theta)
-        .map(|_| {
-            let val = v[idx].exp();
+        .map(|i| {
+            let val = if theta_packs_log(template.theta_lower[i]) {
+                v[idx].exp()
+            } else {
+                v[idx]
+            };
             idx += 1;
             val
         })
@@ -272,10 +307,16 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
     let mut lower = Vec::new();
     let mut upper = Vec::new();
 
-    // Theta bounds (log-transformed)
+    // Theta bounds — packed in whichever space `pack_params` uses
+    // (log when sign-constrained, identity otherwise).
     for i in 0..n_theta {
-        lower.push(template.theta_lower[i].max(1e-10).ln());
-        upper.push(template.theta_upper[i].min(1e9).ln());
+        if theta_packs_log(template.theta_lower[i]) {
+            lower.push(template.theta_lower[i].max(1e-10).ln());
+            upper.push(template.theta_upper[i].min(1e9).ln());
+        } else {
+            lower.push(template.theta_lower[i]);
+            upper.push(template.theta_upper[i]);
+        }
     }
 
     // Omega Cholesky bounds
@@ -491,6 +532,63 @@ mod tests {
         // First packed value should be log(theta[0]) = log(10)
         assert_relative_eq!(packed[0], 10.0_f64.ln(), epsilon = 1e-10);
         assert_relative_eq!(packed[1], 100.0_f64.ln(), epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_pack_negative_lower_bound_uses_identity_packing() {
+        // Regression: SAD_SCEN3/SAD_SCEN4 in the astra-testdata-simulator
+        // benchmark have thetas like `THETA_CL_GAMMA(-0.8, -3.0, 3.0)` and
+        // `THETA_AGE_CL(-0.01, -1.0, 1.0)`. The original `pack_params` ran
+        // `th.max(1e-10).ln()` on every theta, silently clamping negative
+        // values to 1e-10 and back-transforming through `exp()` so the
+        // optimizer could never reach a sign-bearing optimum. SCEN4 was the
+        // most visible: γ = -0.8 (truth) collapsed to ≈ 0 and the rest of
+        // the fit drifted by 30-50% to compensate.
+        //
+        // Identity packing kicks in whenever the user-supplied `theta_lower`
+        // allows negatives (i.e. < 0). Positive-only parameters keep their
+        // log-scale conditioning.
+        let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["eta_cl".into()]);
+        let sigma = SigmaVector {
+            values: vec![0.3],
+            names: vec!["sigma_prop".into()],
+        };
+        let template = ModelParameters {
+            theta: vec![5.0, -0.8, -0.01],
+            theta_names: vec!["tvcl".into(), "gamma".into(), "age_eff".into()],
+            theta_lower: vec![0.1, -3.0, -1.0],
+            theta_upper: vec![100.0, 3.0, 1.0],
+            theta_fixed: vec![false; 3],
+            omega,
+            omega_fixed: vec![false; 1],
+            sigma,
+            sigma_fixed: vec![false; 1],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        let packed = pack_params(&template);
+        // theta[0] is sign-constrained (lower=0.1) → log-packed.
+        assert_relative_eq!(packed[0], 5.0_f64.ln(), epsilon = 1e-12);
+        // theta[1] (lower=-3.0) and theta[2] (lower=-1.0) → identity-packed,
+        // so the *negative* initial values survive the round-trip.
+        assert_relative_eq!(packed[1], -0.8, epsilon = 1e-12);
+        assert_relative_eq!(packed[2], -0.01, epsilon = 1e-12);
+
+        let recovered = unpack_params(&packed, &template);
+        assert_relative_eq!(recovered.theta[0], 5.0, epsilon = 1e-10);
+        assert_relative_eq!(recovered.theta[1], -0.8, epsilon = 1e-12);
+        assert_relative_eq!(recovered.theta[2], -0.01, epsilon = 1e-12);
+
+        // Bounds packed in matching space: log for theta[0], identity for
+        // the others. compute_bounds must agree with pack_params or
+        // clamp_to_bounds will silently reject legal points.
+        let bounds = compute_bounds(&template);
+        assert_relative_eq!(bounds.lower[0], 0.1_f64.ln(), epsilon = 1e-12);
+        assert_relative_eq!(bounds.upper[0], 100.0_f64.ln(), epsilon = 1e-12);
+        assert_relative_eq!(bounds.lower[1], -3.0, epsilon = 1e-12);
+        assert_relative_eq!(bounds.upper[1], 3.0, epsilon = 1e-12);
+        assert_relative_eq!(bounds.lower[2], -1.0, epsilon = 1e-12);
+        assert_relative_eq!(bounds.upper[2], 1.0, epsilon = 1e-12);
     }
 
     #[test]

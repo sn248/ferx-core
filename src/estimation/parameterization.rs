@@ -25,7 +25,7 @@ pub struct PackedBounds {
 /// theta_lower = 0 if you want identity packing for an already-positive
 /// parameter.
 #[inline]
-fn theta_packs_log(theta_lower: f64) -> bool {
+pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
     theta_lower >= 0.0
 }
 

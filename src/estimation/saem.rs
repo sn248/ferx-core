@@ -123,8 +123,14 @@ fn mh_steps(
 // Gradient of conditional observation NLL w.r.t. log(theta) and log(sigma)
 // ---------------------------------------------------------------------------
 
-/// Lightweight M-step: run NLopt SLSQP for a few iterations in log-space,
-/// warm-started from the current log-theta/log-sigma.
+/// Lightweight M-step: run NLopt SLSQP for a few iterations in packed
+/// space, warm-started from the current packed theta / log-sigma.
+///
+/// `theta_packs_log_mask[i]` selects per-theta packing: log when true,
+/// identity when false. Sigma is always log-packed (sigma > 0 by
+/// construction). See the run_saem comment on `theta_packs_log_mask` for
+/// motivation — without per-theta packing, any theta with `theta_lower < 0`
+/// got pinned at 1e-10 and could never be estimated.
 fn theta_sigma_mstep_light(
     model: &CompiledModel,
     population: &Population,
@@ -139,6 +145,7 @@ fn theta_sigma_mstep_light(
     n_sigma: usize,
     maxiter: u32,
     scale_params: bool,
+    theta_packs_log_mask: &[bool],
 ) -> (Vec<f64>, Vec<f64>) {
     let n = n_theta + n_sigma;
 
@@ -157,7 +164,21 @@ fn theta_sigma_mstep_light(
         x[i] = x[i].clamp(lower[i], upper[i]);
     }
 
-    // Objective operating on unscaled log-space parameters.
+    // Unpack a slice of packed theta values into natural-scale theta.
+    // Closure (not local fn) so it captures `theta_packs_log_mask`.
+    let unpack_thetas = |packed: &[f64]| -> Vec<f64> {
+        (0..n_theta)
+            .map(|i| {
+                if theta_packs_log_mask[i] {
+                    packed[i].exp()
+                } else {
+                    packed[i]
+                }
+            })
+            .collect()
+    };
+
+    // Objective operating on the unscaled packed parameters.
     //
     // Forward-difference gradient: `g[i] = (f(x + h·e_i) - f(x)) / h`.
     // We keep the base `f(x)` from the value pass above so each gradient
@@ -168,7 +189,7 @@ fn theta_sigma_mstep_light(
     // dimension; rayon's nested par_iter with the obs_nll_sum's
     // subject-level par_iter avoids oversubscription via work stealing.
     let obj = |xv: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
-        let th: Vec<f64> = xv[..n_theta].iter().map(|&v| v.exp()).collect();
+        let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
         let val = obs_nll_sum(model, population, &th, &sg, etas);
 
@@ -188,7 +209,7 @@ fn theta_sigma_mstep_light(
                     }
                     let mut xp = xv.to_vec();
                     xp[i] = xv[i] + h;
-                    let th_p: Vec<f64> = xp[..n_theta].iter().map(|&v| v.exp()).collect();
+                    let th_p: Vec<f64> = unpack_thetas(&xp[..n_theta]);
                     let sg_p: Vec<f64> = xp[n_theta..].iter().map(|&v| v.exp()).collect();
                     let fp = obs_nll_sum(model, population, &th_p, &sg_p, etas);
                     let gi = (fp - f0) / h;
@@ -406,25 +427,61 @@ pub fn run_saem(
         })
         .collect();
 
-    // Pack initial log-theta and log-sigma for SA updates
-    let mut log_theta: Vec<f64> = theta_cur.iter().map(|&t| t.max(1e-10).ln()).collect();
-    let mut log_sigma: Vec<f64> = sigma_cur.iter().map(|&s| s.max(1e-10).ln()).collect();
-
-    // Bounds in log-space
-    let mut log_theta_lower: Vec<f64> = init_params
+    // Per-theta packing flag: log for `theta_lower >= 0` (CL/V/KA…),
+    // identity when `theta_lower < 0` (covariate exponents like
+    // THETA_AGE_CL = -0.01 or THETA_CL_GAMMA = -0.8). Same convention
+    // as `parameterization.rs::pack_params`. Without this, every theta
+    // with a negative lower bound got clamped to 1e-10 by the old
+    // `t.max(1e-10).ln()` packing and could never be estimated —
+    // visible regression: SAD_SCEN4 SAEM left γ_CL stuck at 0 (truth
+    // -0.8), letting the rest of the fit drift to compensate.
+    let theta_packs_log_mask: Vec<bool> = init_params
         .theta_lower
         .iter()
-        .map(|&b| b.max(1e-10).ln())
+        .map(|&lo| crate::estimation::parameterization::theta_packs_log(lo))
         .collect();
-    let mut log_theta_upper: Vec<f64> = init_params
-        .theta_upper
-        .iter()
-        .map(|&b| b.min(1e9).ln())
+    let pack_theta = |i: usize, t: f64| -> f64 {
+        if theta_packs_log_mask[i] {
+            t.max(1e-10).ln()
+        } else {
+            t
+        }
+    };
+    let unpack_theta = |i: usize, packed: f64| -> f64 {
+        if theta_packs_log_mask[i] {
+            packed.exp()
+        } else {
+            packed
+        }
+    };
+
+    // Pack initial theta (per-mask) and sigma (always log).
+    let mut log_theta: Vec<f64> = (0..n_theta).map(|i| pack_theta(i, theta_cur[i])).collect();
+    let mut log_sigma: Vec<f64> = sigma_cur.iter().map(|&s| s.max(1e-10).ln()).collect();
+
+    // Bounds in packed space — log when log-packed, identity otherwise.
+    let mut log_theta_lower: Vec<f64> = (0..n_theta)
+        .map(|i| {
+            if theta_packs_log_mask[i] {
+                init_params.theta_lower[i].max(1e-10).ln()
+            } else {
+                init_params.theta_lower[i]
+            }
+        })
+        .collect();
+    let mut log_theta_upper: Vec<f64> = (0..n_theta)
+        .map(|i| {
+            if theta_packs_log_mask[i] {
+                init_params.theta_upper[i].min(1e9).ln()
+            } else {
+                init_params.theta_upper[i]
+            }
+        })
         .collect();
     let mut log_sigma_lower = vec![-8.0f64; n_sigma];
     let mut log_sigma_upper = vec![5.0f64; n_sigma];
 
-    // Pin FIX parameters: set lower == upper == log(current) so the inner
+    // Pin FIX parameters: set lower == upper == packed_value so the inner
     // NLopt M-step treats them as constants. Matches the FOCE/FOCEI treatment.
     for i in 0..n_theta {
         if init_params.theta_fixed.get(i).copied().unwrap_or(false) {
@@ -652,6 +709,7 @@ pub fn run_saem(
                     n_sigma,
                     mstep_maxiter,
                     options.scale_params,
+                    &theta_packs_log_mask,
                 );
                 log_theta = theta_new;
                 log_sigma = sigma_new;
@@ -671,12 +729,13 @@ pub fn run_saem(
                     n_sigma,
                     mstep_maxiter,
                     options.scale_params,
+                    &theta_packs_log_mask,
                 );
                 log_theta = theta_new;
                 log_sigma = sigma_new;
             }
 
-            state.theta = log_theta.iter().map(|&v| v.exp()).collect();
+            state.theta = (0..n_theta).map(|i| unpack_theta(i, log_theta[i])).collect();
             state.sigma_vals = log_sigma.iter().map(|&v| v.exp()).collect();
         }
 

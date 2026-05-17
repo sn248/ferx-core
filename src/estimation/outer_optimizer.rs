@@ -627,12 +627,46 @@ fn optimize_nlopt(
     let mut opt = nlopt::Nlopt::new(algo, n, objective, nlopt::Target::Minimize, state);
     opt.set_lower_bounds(&lower_s).unwrap();
     opt.set_upper_bounds(&upper_s).unwrap();
-    opt.set_maxeval(options.outer_maxiter as u32 * (n as u32 + 1))
-        .unwrap();
-    // Use very loose tolerances — FOCE objective is noisy from EBE re-estimation.
-    // Let maxeval be the primary stopping criterion.
-    opt.set_xtol_rel(1e-12).unwrap();
-    opt.set_ftol_rel(1e-12).unwrap();
+    if matches!(algo, nlopt::Algorithm::Bobyqa) {
+        // BOBYQA is derivative-free: each eval is one objective call, not
+        // n+1 (gradient methods FD the gradient inside one outer iter).
+        // Give it enough headroom to triangulate a quadratic in n-D and
+        // still make real trust-region progress: 40 evals/param baseline
+        // plus the outer_maxiter budget. The setup phase alone costs
+        // 2n+1 evals before any movement.
+        let bobyqa_maxeval = (options.outer_maxiter as u32).saturating_mul(n as u32 + 1)
+            + 40 * (n as u32 + 1);
+        opt.set_maxeval(bobyqa_maxeval).unwrap();
+        // BOBYQA's xtol_rel controls rho_end / rho_start — i.e. how much
+        // it must shrink the trust radius to declare success. 1e-12 is
+        // unreachable in any realistic budget and forces MaxevalReached
+        // at an arbitrary interim point; 1e-4 in scaled log-space is a
+        // ~0.01% move in the natural-scale parameter, which is plenty
+        // tight for NLME work.
+        opt.set_xtol_rel(1e-4).unwrap();
+        opt.set_ftol_rel(1e-6).unwrap();
+        // NLopt's default rhobeg is 25% of the bound-width — huge in our
+        // log-space packing (theta bounds can span 40+ log units), so the
+        // initial 2n+1 interpolation probes land in regions where the EBE
+        // inner loop fails and the OFV gets clamped to 1e20, poisoning the
+        // quadratic model. 0.5 in scaled space is a ~1.6× move on the
+        // natural parameter scale — small enough to stay feasible at
+        // start, large enough to see real OFV signal.
+        let init_step: Vec<f64> = (0..n)
+            .map(|i| {
+                let half_width = (upper_s[i] - lower_s[i]).abs() * 0.5;
+                0.5_f64.min(half_width.max(1e-6))
+            })
+            .collect();
+        opt.set_initial_step(&init_step).unwrap();
+    } else {
+        opt.set_maxeval(options.outer_maxiter as u32 * (n as u32 + 1))
+            .unwrap();
+        // Use very loose tolerances — FOCE objective is noisy from EBE re-estimation.
+        // Let maxeval be the primary stopping criterion.
+        opt.set_xtol_rel(1e-12).unwrap();
+        opt.set_ftol_rel(1e-12).unwrap();
+    }
 
     if options.verbose {
         eprintln!(

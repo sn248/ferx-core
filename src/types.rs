@@ -977,7 +977,7 @@ impl Default for FitOptions {
             run_covariance_step: true,
             interaction: true,
             verbose: true,
-            optimizer: Optimizer::Bobyqa,
+            optimizer: Optimizer::Slsqp,
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,
@@ -1027,17 +1027,19 @@ pub enum BloqMethod {
 pub enum Optimizer {
     Bfgs,
     Lbfgs,
-    /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based;
-    /// faster on smooth, well-behaved problems but more sensitive to the
-    /// noisy FOCE surface than BOBYQA.
+    /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based,
+    /// default outer optimizer. Robust on the FOCE/FOCEI objective surface in
+    /// practice: FD-gradient noise from EBE re-estimation is small relative
+    /// to the OFV moves the optimizer cares about.
     Slsqp,
     /// NLopt LD_LBFGS
     NloptLbfgs,
     /// NLopt LD_MMA — Method of Moving Asymptotes
     Mma,
-    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation. Default:
-    /// robust on the FOCE objective surface, which is near-noisy because of
-    /// the inner EBE optimization.
+    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation. Useful when
+    /// FD gradients are unreliable (e.g. small datasets where EBE-loop noise
+    /// dominates per-eval signal). Needs more outer evaluations than SLSQP
+    /// because it must triangulate a quadratic from scratch.
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
     TrustRegion,

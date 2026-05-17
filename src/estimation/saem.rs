@@ -159,12 +159,14 @@ fn theta_sigma_mstep_light(
 
     // Objective operating on unscaled log-space parameters.
     //
-    // The central-FD gradient parallelises over both the parameter dimension
-    // (outer) and subjects (inner via `obs_nll_sum`). Rayon's work-stealing
-    // schedules the nested par_iter without oversubscription; in practice
-    // nested wins because n_dims (~5–10) alone rarely saturates n_cores (10),
-    // while subject-level parallelism alone leaves the FD dims serialised
-    // across many small per-sweep sync barriers.
+    // Forward-difference gradient: `g[i] = (f(x + h·e_i) - f(x)) / h`.
+    // We keep the base `f(x)` from the value pass above so each gradient
+    // request costs `n_dim` extra `obs_nll_sum` calls, not `2·n_dim` for
+    // central FD. SAEM's stochastic-approximation framework absorbs the
+    // O(h) bias just like it absorbs MH noise; the central-FD precision
+    // was wasted work on this hot loop. Parallelises over the parameter
+    // dimension; rayon's nested par_iter with the obs_nll_sum's
+    // subject-level par_iter avoids oversubscription via work stealing.
     let obj = |xv: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
         let th: Vec<f64> = xv[..n_theta].iter().map(|&v| v.exp()).collect();
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
@@ -173,14 +175,14 @@ fn theta_sigma_mstep_light(
         if let Some(g) = grad {
             use rayon::prelude::*;
             let h = 1e-5;
+            let f0 = val;
             let g_vec: Vec<f64> = (0..n)
                 .into_par_iter()
                 .map(|i| {
                     // Pinned dims (lower == upper) cannot move; skip their FD
-                    // evaluations entirely.  This is what makes the SAEM mu-ref
+                    // evaluations entirely. This is what makes the SAEM mu-ref
                     // gradient step actually save NLopt OFV evaluations —
-                    // without it, NLopt's central FD would still hit each
-                    // pinned dim.
+                    // without it, NLopt's FD would still hit each pinned dim.
                     if lower[i] == upper[i] {
                         return 0.0;
                     }
@@ -189,11 +191,7 @@ fn theta_sigma_mstep_light(
                     let th_p: Vec<f64> = xp[..n_theta].iter().map(|&v| v.exp()).collect();
                     let sg_p: Vec<f64> = xp[n_theta..].iter().map(|&v| v.exp()).collect();
                     let fp = obs_nll_sum(model, population, &th_p, &sg_p, etas);
-                    xp[i] = xv[i] - h;
-                    let th_m: Vec<f64> = xp[..n_theta].iter().map(|&v| v.exp()).collect();
-                    let sg_m: Vec<f64> = xp[n_theta..].iter().map(|&v| v.exp()).collect();
-                    let fm = obs_nll_sum(model, population, &th_m, &sg_m, etas);
-                    let gi = (fp - fm) / (2.0 * h);
+                    let gi = (fp - f0) / h;
                     if gi.is_finite() {
                         gi
                     } else {
@@ -690,18 +688,24 @@ pub fn run_saem(
         );
         {
             use rayon::prelude::*;
+            // map_init lets each rayon worker keep one `EventPkParams`
+            // scratch alive across every subject it handles, the same
+            // pattern as the MH step above. Without it, the per-iter
+            // refresh was allocating n_subj scratch buffers per outer
+            // iter on TV-cov data.
             let new_nlls: Vec<f64> = state
                 .etas
                 .par_iter()
                 .enumerate()
-                .map(|(i, eta)| {
-                    individual_nll(
+                .map_init(EventPkParams::default, |scratch, (i, eta)| {
+                    individual_nll_into(
                         model,
                         &population.subjects[i],
                         &state.theta,
                         eta,
                         &omega_upd,
                         &state.sigma_vals,
+                        scratch,
                     )
                 })
                 .collect();

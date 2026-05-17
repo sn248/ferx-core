@@ -138,14 +138,12 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
             }
         }
     }
-    let omega_matrix = &l * l.transpose();
-    let omega = OmegaMatrix {
-        matrix: omega_matrix,
-        chol: l,
-        eta_names: template.omega.eta_names.clone(),
-        diagonal: template.omega.diagonal,
-        free_mask: template.omega.free_mask.clone(),
-    };
+    let omega = OmegaMatrix::from_chol_factor(
+        l,
+        template.omega.eta_names.clone(),
+        template.omega.diagonal,
+        template.omega.free_mask.clone(),
+    );
 
     // Sigma
     let sigma_values: Vec<f64> = (0..n_sigma)
@@ -186,14 +184,12 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
                     idx += 1;
                 }
             }
-            let matrix = &l * l.transpose();
-            Some(OmegaMatrix {
-                matrix,
-                chol: l,
-                eta_names: iov_tmpl.eta_names.clone(),
-                diagonal: false,
-                free_mask: iov_tmpl.free_mask.clone(),
-            })
+            Some(OmegaMatrix::from_chol_factor(
+                l,
+                iov_tmpl.eta_names.clone(),
+                false,
+                iov_tmpl.free_mask.clone(),
+            ))
         }
     } else {
         None

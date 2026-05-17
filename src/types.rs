@@ -258,6 +258,12 @@ pub struct OmegaMatrix {
     /// Used by the SAEM M-step to zero sampling correlations that bleed into
     /// structurally-absent entries via `(1/N) Σ ηη^T`.
     pub free_mask: DMatrix<bool>,
+    /// Pre-computed Ω⁻¹. Cached at construction so per-call code paths
+    /// (`individual_nll_into`, SAEM MH proposals) don't have to clone the
+    /// matrix, run Cholesky, and invert on every evaluation.
+    pub inv: DMatrix<f64>,
+    /// Pre-computed `log|Ω| = 2·Σᵢ log(L_ii)`. Same motivation as `inv`.
+    pub log_det: f64,
 }
 
 impl OmegaMatrix {
@@ -268,22 +274,39 @@ impl OmegaMatrix {
         free_mask: DMatrix<bool>,
     ) -> Self {
         let n = m.nrows();
-        let chol = match m.clone().cholesky() {
-            Some(c) => c.l(),
+        let (chol, inv) = match m.clone().cholesky() {
+            Some(c) => (c.l(), c.inverse()),
             None => {
                 let eig = m.clone().symmetric_eigen();
                 let min_eig = eig.eigenvalues.min();
                 let reg = if min_eig < 0.0 { -min_eig + 1e-8 } else { 1e-8 };
                 let m_reg = &m + DMatrix::identity(n, n) * reg;
-                m_reg.cholesky().expect("Regularized matrix must be PD").l()
+                let c = m_reg.cholesky().expect("Regularized matrix must be PD");
+                (c.l(), c.inverse())
             }
         };
+        // log|Ω| = 2·Σᵢ log(L_ii). Negative or zero diagonals shouldn't
+        // happen post-regularisation but we fall back to f64::INFINITY so
+        // downstream NLL code can short-circuit cleanly instead of NaNing.
+        let mut log_det = 0.0;
+        for i in 0..n {
+            let lii = chol[(i, i)];
+            if lii > 0.0 {
+                log_det += lii.ln();
+            } else {
+                log_det = f64::INFINITY;
+                break;
+            }
+        }
+        log_det *= 2.0;
         Self {
             matrix: m,
             chol,
             eta_names: names,
             diagonal,
             free_mask,
+            inv,
+            log_det,
         }
     }
 
@@ -315,6 +338,46 @@ impl OmegaMatrix {
             m[(i, i)] = variances[i];
         }
         Self::from_matrix(m, names, true)
+    }
+
+    /// Construct from a known lower-Cholesky factor `L` such that Ω = L Lᵀ.
+    /// Saves one Cholesky vs `from_matrix*`, which the SAEM/FOCEI hot paths
+    /// hit on every NLopt M-step and every outer iteration via `unpack_params`.
+    pub fn from_chol_factor(
+        l: DMatrix<f64>,
+        names: Vec<String>,
+        diagonal: bool,
+        free_mask: DMatrix<bool>,
+    ) -> Self {
+        let n = l.nrows();
+        let matrix = &l * l.transpose();
+        // Solve L X = I  then  X^T (X^T)^T  =  Ω⁻¹. nalgebra's
+        // `LU::solve(I)` does this in one shot.
+        let inv = matrix
+            .clone()
+            .cholesky()
+            .expect("L Lᵀ should be PD by construction")
+            .inverse();
+        let mut log_det = 0.0;
+        for i in 0..n {
+            let lii = l[(i, i)];
+            if lii > 0.0 {
+                log_det += lii.ln();
+            } else {
+                log_det = f64::INFINITY;
+                break;
+            }
+        }
+        log_det *= 2.0;
+        Self {
+            matrix,
+            chol: l,
+            eta_names: names,
+            diagonal,
+            free_mask,
+            inv,
+            log_det,
+        }
     }
 
     pub fn dim(&self) -> usize {

@@ -125,6 +125,41 @@ fn bobyqa_ofv_no_worse_than_slsqp_on_warfarin() {
 }
 
 #[test]
+fn slsqp_stops_via_stagnation_well_before_a_generous_maxeval() {
+    // Regression: on γ-bearing FOCEI scenarios (SAD_SCEN3/SAD_SCEN4 in the
+    // astra-testdata-simulator REPORT.md), SLSQP used to grind through
+    // hundreds of evals at a plateaued OFV without terminating — see the
+    // `detect_stagnation` doc comment for the underlying cause. The
+    // stagnation guard inside the NLopt closure latches once the recent
+    // window shows no meaningful OFV improvement and short-circuits
+    // subsequent evals, which lets NLopt's xtol/ftol fire promptly.
+    //
+    // On warfarin we don't have a γ, but the same mechanism kicks in
+    // once SLSQP has effectively converged. Asserting that the iteration
+    // count stays well below an absurdly generous maxeval budget
+    // exercises the guard without needing a 10-minute SAD_SCEN3 dataset
+    // in the test corpus.
+    let (model, population) = data_and_model();
+    let mut opts = base_options();
+    opts.optimizer = Optimizer::Slsqp;
+    opts.outer_maxiter = 1000; // far more than warfarin needs
+
+    let result =
+        fit(&model, &population, &model.default_params, &opts).expect("slsqp fit must succeed");
+    assert!(result.ofv.is_finite());
+    // n_iterations on the NLopt path counts evals (see comment in
+    // outer_optimizer.rs about NLopt not exposing iteration counts).
+    // 8000 = 1000 * (n+1 ≈ 8) is the unbounded budget; the guard should
+    // stop us at a small fraction of that.
+    assert!(
+        result.n_iterations < 2000,
+        "SLSQP burned {} evals on warfarin with maxiter=1000 — \
+         stagnation guard should have stopped us well below 2000",
+        result.n_iterations,
+    );
+}
+
+#[test]
 fn steihaug_max_iters_is_respected_by_trust_region() {
     // A very small steihaug_max_iters degrades step quality but should still
     // return a valid FitResult without crashing. Catches regressions in the

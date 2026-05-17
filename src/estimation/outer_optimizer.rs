@@ -117,6 +117,74 @@ struct NloptState {
     n_evals: usize,
     /// Previous parameter vector — used to compute step_norm for the trace.
     prev_x: Vec<f64>,
+    /// Eval index at which `best_ofv` last dropped by more than the
+    /// stagnation threshold. Used to detect "stuck on plateau" — see
+    /// `should_short_circuit_for_stagnation`.
+    last_improvement_eval: usize,
+    /// Best OFV observed at `last_improvement_eval`. Compared against
+    /// current `best_ofv` to test whether the optimizer has made
+    /// meaningful progress in the recent window.
+    best_at_last_improvement: f64,
+    /// Sticky flag: once set, the closure returns `best_ofv` with zero
+    /// gradient on every subsequent eval, which lets SLSQP / L-BFGS
+    /// reach their xtol/ftol stop criterion in microseconds instead of
+    /// grinding through the remaining `maxeval` budget at full inner-loop
+    /// cost.
+    stagnation_stopped: bool,
+}
+
+/// Decide whether the optimizer has stalled — and if so, latch the
+/// `stagnation_stopped` flag in `state` so subsequent evals return
+/// `best_ofv` cheaply.
+///
+/// Used inside the NLopt objective closure. The trigger is conservative:
+/// allow `STAGNATION_WINDOW` (auto-sized to ~3 outer iterations of an
+/// `n`-dimensional FD-gradient method) evals without an OFV improvement
+/// of at least `STAGNATION_THRESHOLD` before short-circuiting.
+///
+/// Without this guard, SLSQP on a γ-bearing (poorly identified) FOCEI
+/// problem can spend 30+ minutes shrinking line-search steps at a
+/// numerically-flat OFV before its `xtol_rel`/`ftol_rel` criteria fire —
+/// see comment near the per-algorithm tolerance block.
+fn detect_stagnation(state: &mut NloptState, n: usize) -> bool {
+    if state.stagnation_stopped {
+        return true;
+    }
+    // Tied to the FD-gradient cost: 3*(n+1) evals = 3 attempted descent
+    // steps with their gradient probes. Minimum of 50 evals so very-small
+    // problems still get a real chance before we declare stagnation.
+    let stagnation_window: usize = (3 * (n + 1)).max(50);
+    // Absolute OFV improvement below this is treated as noise. Matches
+    // typical FOCE EBE-loop precision (~1e-3 OFV units) — see
+    // `inner_tol` default and Sheiner–Beal linearisation comment in
+    // [types.rs:959].
+    const STAGNATION_THRESHOLD: f64 = 1e-3;
+
+    let improved =
+        (state.best_at_last_improvement - state.best_ofv) > STAGNATION_THRESHOLD;
+    if improved {
+        state.last_improvement_eval = state.n_evals;
+        state.best_at_last_improvement = state.best_ofv;
+        false
+    } else if state.n_evals.saturating_sub(state.last_improvement_eval) >= stagnation_window {
+        state.stagnation_stopped = true;
+        true
+    } else {
+        false
+    }
+}
+
+fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
+    NloptState {
+        cached_etas: vec![DVector::zeros(n_eta); n_subj],
+        cached_h_mats: Vec::new(),
+        best_ofv: f64::INFINITY,
+        n_evals: 0,
+        prev_x: x0.to_vec(),
+        last_improvement_eval: 0,
+        best_at_last_improvement: f64::INFINITY,
+        stagnation_stopped: false,
+    }
 }
 
 /// Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a
@@ -224,13 +292,7 @@ fn run_global_presearch(
         );
     }
 
-    let pre_state = NloptState {
-        cached_etas: vec![DVector::zeros(n_eta); n_subj],
-        cached_h_mats: Vec::new(),
-        best_ofv: f64::INFINITY,
-        n_evals: 0,
-        prev_x: x0.to_vec(),
-    };
+    let pre_state = new_nlopt_state(n_subj, n_eta, x0);
 
     let pre_objective = |xs: &[f64], _grad: Option<&mut [f64]>, state: &mut NloptState| -> f64 {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -427,13 +489,7 @@ fn optimize_nlopt(
         }
     }
 
-    let state = NloptState {
-        cached_etas: vec![DVector::zeros(n_eta); n_subj],
-        cached_h_mats: Vec::new(),
-        best_ofv: f64::INFINITY,
-        n_evals: 0,
-        prev_x: x0.clone(),
-    };
+    let state = new_nlopt_state(n_subj, n_eta, &x0);
 
     // External counter mirrors state.n_evals — nlopt doesn't hand `state`
     // back after `opt.optimize()`, so we need an Arc to read the final
@@ -474,6 +530,22 @@ fn optimize_nlopt(
                 }
             }
             return 1e20;
+        }
+        // Stagnation guard: once latched, every subsequent eval returns
+        // `best_ofv` with zero gradient. SLSQP / L-BFGS see a stationary
+        // point and terminate via xtol_rel within a couple of evals,
+        // instead of grinding through the remaining maxeval budget at
+        // full inner-loop cost. See `detect_stagnation` doc comment for
+        // the trigger criterion.
+        if state.stagnation_stopped {
+            if let Some(g) = grad {
+                for gi in g.iter_mut() {
+                    *gi = 0.0;
+                }
+            }
+            state.n_evals += 1;
+            n_evals_cl.fetch_add(1, Ordering::Relaxed);
+            return state.best_ofv;
         }
         // Unscale from optimizer space to real (log/Cholesky) space.
         let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
@@ -580,6 +652,16 @@ fn optimize_nlopt(
             if verbose {
                 eprintln!("Eval {:>4}: OFV = {:.6}", state.n_evals, ofv);
             }
+        }
+        // After updating best_ofv, check whether we've stalled. If yes,
+        // `stagnation_stopped` is latched and the early-return at the
+        // top of the closure trips on the next eval.
+        if detect_stagnation(state, n) && verbose {
+            eprintln!(
+                "Eval {:>4}: stagnation guard triggered (no improvement \
+                 below 1e-3 in last window); next eval will short-circuit",
+                state.n_evals,
+            );
         }
 
         // Optimizer trace (step_norm in scaled space)
@@ -713,13 +795,7 @@ fn optimize_nlopt(
             eprintln!("Retrying with NLopt SLSQP from current point...");
         }
 
-        let state2 = NloptState {
-            cached_etas: vec![DVector::zeros(n_eta); n_subj],
-            cached_h_mats: Vec::new(),
-            best_ofv: f64::INFINITY,
-            n_evals: 0,
-            prev_x: x0.clone(),
-        };
+        let state2 = new_nlopt_state(n_subj, n_eta, &x0);
 
         let n_evals_cl2 = Arc::clone(&n_evals_outer);
         let ebe_accum_cl2 = Arc::clone(&ebe_accum);
@@ -732,6 +808,17 @@ fn optimize_nlopt(
                     }
                 }
                 return 1e20;
+            }
+            // Stagnation guard — see primary closure for rationale.
+            if state.stagnation_stopped {
+                if let Some(g) = grad {
+                    for gi in g.iter_mut() {
+                        *gi = 0.0;
+                    }
+                }
+                state.n_evals += 1;
+                n_evals_cl2.fetch_add(1, Ordering::Relaxed);
+                return state.best_ofv;
             }
             let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
             let params = unpack_params(&x, init_params);
@@ -826,6 +913,12 @@ fn optimize_nlopt(
                 if verbose {
                     eprintln!("Eval {:>4}: OFV = {:.6} (SLSQP)", state.n_evals, ofv);
                 }
+            }
+            if detect_stagnation(state, n) && verbose {
+                eprintln!(
+                    "Eval {:>4}: stagnation guard triggered in SLSQP fallback",
+                    state.n_evals,
+                );
             }
 
             // Optimizer trace (SLSQP fallback, step_norm in scaled space)

@@ -719,11 +719,28 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // The ParseCtx still receives the full set (via assigned_vars_in_order) so
     // branch-local names parse as Variable rather than Covariate.
     let indiv_text = indiv_lines.join("\n");
-    let bare_ctx = ParseCtx::new(&theta_names, &eta_names, &[]);
+    // NN-output lookup table for `TYPICAL_PK.CL`-style dot-access in
+    // [individual_parameters]. Always present (empty when no [covariate_nn]
+    // block is in the model) so the same code path works with or without
+    // --features nn.
+    #[cfg(feature = "nn")]
+    let nn_specs_for_ctx: Vec<(String, Vec<String>)> = nn_specs
+        .iter()
+        .map(|s| {
+            use crate::nn::CovariateMapper;
+            (s.name.clone(), s.mapper.output_names().to_vec())
+        })
+        .collect();
+    #[cfg(not(feature = "nn"))]
+    let nn_specs_for_ctx: Vec<(String, Vec<String>)> = Vec::new();
+
+    let bare_ctx =
+        ParseCtx::new(&theta_names, &eta_names, &[]).with_nn_specs(&nn_specs_for_ctx);
     let pre_stmts = parse_block_statements(&indiv_text, bare_ctx, StatementMode::Plain)?;
     let all_assigned = assigned_vars_in_order(&pre_stmts);
     let indiv_var_names = top_level_assigned_vars(&pre_stmts);
-    let indiv_ctx = ParseCtx::new(&theta_names, &eta_names, &all_assigned);
+    let indiv_ctx = ParseCtx::new(&theta_names, &eta_names, &all_assigned)
+        .with_nn_specs(&nn_specs_for_ctx);
     let indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
 
     // Detect ODE vs analytical model
@@ -808,9 +825,33 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         )
     };
 
+    // Build the CovariateNn handles up front (before build_pk_param_fn, which
+    // captures them in the pk_param_fn closure). The same vector is also
+    // appended to CompiledModel.covariate_nns further down — see the diffusion
+    // appendage block, which uses these to drive theta-value extension.
+    #[cfg(feature = "nn")]
+    let covariate_nns_for_closure: Vec<crate::nn::CovariateNn> = {
+        let mut acc = Vec::with_capacity(nn_specs.len());
+        let mut offset = thetas.len();
+        for spec in &nn_specs {
+            acc.push(crate::nn::CovariateNn {
+                name: spec.name.clone(),
+                mapper: spec.mapper.clone(),
+                weights_offset: offset,
+            });
+            offset += spec.theta_inits.len();
+        }
+        acc
+    };
+
     // Build pk_param_fn with the extended eta context (BSV + kappa names).
-    let (pk_param_fn, referenced_covariates) =
-        build_pk_param_fn(indiv_stmts.clone(), &pk_param_map, &indiv_var_names)?;
+    let (pk_param_fn, referenced_covariates) = build_pk_param_fn(
+        indiv_stmts.clone(),
+        &pk_param_map,
+        &indiv_var_names,
+        #[cfg(feature = "nn")]
+        &covariate_nns_for_closure,
+    )?;
 
     // Append NN-weight thetas (Phase A M1), then diffusion variances. Both
     // sit at the tail of the theta vector so existing user-declared theta
@@ -827,25 +868,21 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let mut theta_upper: Vec<f64> = thetas.iter().map(|t| t.upper).collect();
     let mut theta_fixed: Vec<bool> = thetas.iter().map(|t| t.fixed).collect();
 
+    // NN-weight thetas: same offsets as `covariate_nns_for_closure` built
+    // above (both use `thetas.len()` as the first offset). We append values
+    // / bounds / fixed flags here; the handles themselves live in
+    // `covariate_nns_for_closure` and are reused below for `CompiledModel`.
     #[cfg(feature = "nn")]
-    let covariate_nns: Vec<crate::nn::CovariateNn> = {
-        let mut out = Vec::with_capacity(nn_specs.len());
-        for spec in &nn_specs {
-            let offset = theta_values.len();
-            for &init in &spec.theta_inits {
-                theta_values.push(init);
-                theta_lower.push(f64::NEG_INFINITY);
-                theta_upper.push(f64::INFINITY);
-                theta_fixed.push(false);
-            }
-            out.push(crate::nn::CovariateNn {
-                name: spec.name.clone(),
-                mapper: spec.mapper.clone(),
-                weights_offset: offset,
-            });
+    let covariate_nns: Vec<crate::nn::CovariateNn> = covariate_nns_for_closure.clone();
+    #[cfg(feature = "nn")]
+    for spec in &nn_specs {
+        for &init in &spec.theta_inits {
+            theta_values.push(init);
+            theta_lower.push(f64::NEG_INFINITY);
+            theta_upper.push(f64::INFINITY);
+            theta_fixed.push(false);
         }
-        out
-    };
+    }
 
     let diff_theta_start = theta_values.len(); // index of first diffusion theta
     for (i, &init) in diffusion_theta_inits.iter().enumerate() {
@@ -2462,10 +2499,17 @@ fn parse_error_model(lines: &[String]) -> Result<(ErrorModel, Vec<String>), Stri
 /// `var_names` is the deduplicated list of all variables ever assigned in the
 /// block (in first-occurrence order). For analytical PK models the assignment
 /// order doubles as the slot ordering for `PkParams.values`.
+/// Build the `pk_param_fn` closure used by every fit / simulate / predict
+/// call site. When the `nn` feature is on and the model has any
+/// `[covariate_nn]` blocks, `covariate_nns` carries each mapper plus the
+/// offset of its weight block inside the optimizer's `theta` vector. The
+/// closure pre-computes each NN's forward output once per call and exposes
+/// them to the indexed evaluator via the `nn_outputs` slice.
 fn build_pk_param_fn(
     stmts: Vec<Statement>,
     pk_param_map: &HashMap<String, String>,
     var_names: &[String],
+    #[cfg(feature = "nn")] covariate_nns: &[crate::nn::CovariateNn],
 ) -> Result<(PkParamFn, Vec<String>), String> {
     // Covariates referenced anywhere in the block (including inside if-bodies
     // and condition expressions). Sorted for deterministic error messages.
@@ -2542,6 +2586,13 @@ fn build_pk_param_fn(
 
     let cov_names_for_lookup = referenced_covariates.clone();
 
+    // Snapshot the NN handles into the closure. Empty when no
+    // `[covariate_nn]` blocks are present, in which case the per-call
+    // forward-pass loop below is a no-op (just an empty `Vec<Vec<f64>>`
+    // alloc — cheap enough to skip the branch).
+    #[cfg(feature = "nn")]
+    let covariate_nns_owned: Vec<crate::nn::CovariateNn> = covariate_nns.to_vec();
+
     let pk_param_fn: PkParamFn = Box::new(
         move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
             // Materialise covariates into a Vec<f64> aligned with
@@ -2554,7 +2605,27 @@ fn build_pk_param_fn(
                 cov_vec[i] = covariates.get(name).copied().unwrap_or(0.0);
             }
             let mut vars = vec![0.0_f64; n_vars];
-            eval_statements_indexed(&stmts_owned, theta, eta, &cov_vec, &mut vars);
+
+            // Pre-compute each NN's forward output once per call. The
+            // indexed evaluator reads `nn_outputs[nn_idx][output_idx]` for
+            // every `Expression::NnOutput` it visits, so multiple `.CL`,
+            // `.V1`, … references on the same NN share this single forward.
+            #[cfg(feature = "nn")]
+            let nn_outputs: Vec<Vec<f64>> = covariate_nns_owned
+                .iter()
+                .map(|nn| {
+                    use crate::nn::CovariateMapper;
+                    let n_w = nn.mapper.n_weights();
+                    let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
+                    nn.mapper
+                        .forward_raw(weights, covariates)
+                        .unwrap_or_else(|_| vec![0.0; nn.mapper.n_outputs()])
+                })
+                .collect();
+            #[cfg(not(feature = "nn"))]
+            let nn_outputs: Vec<Vec<f64>> = Vec::new();
+
+            eval_statements_indexed(&stmts_owned, theta, eta, &cov_vec, &mut vars, &nn_outputs);
 
             let mut p = PkParams::default();
             if is_analytical_pk {
@@ -2602,6 +2673,14 @@ enum Expression {
     Power(Box<Expression>, Box<Expression>),
     /// `if (cond) then_expr else else_expr` — value-producing inline conditional.
     Conditional(Box<Condition>, Box<Expression>, Box<Expression>),
+    /// Dot-access on a `[covariate_nn NAME]` block's output, e.g.
+    /// `TYPICAL_PK.CL`. `nn_idx` indexes into `CompiledModel.covariate_nns`
+    /// (deterministic alphabetical order set at parse time); `output_idx`
+    /// indexes into the block's declared `outputs` list. Eval-time dispatch
+    /// reads the pre-computed forward output from a per-call cache in
+    /// `build_pk_param_fn` so multiple references to outputs of the same
+    /// NN share a single forward pass.
+    NnOutput { nn_idx: usize, output_idx: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -2662,26 +2741,40 @@ struct ParseCtx<'a> {
     /// Set to `false` for the ODE RHS parser, where state names and individual
     /// parameters are injected into the `vars` map at eval time instead.
     fallback_covariate: bool,
+    /// Per-NN-block (name, output_names) pairs in alphabetical order.
+    /// `nn_idx` in `Expression::NnOutput` indexes into this slice. Empty
+    /// when no `[covariate_nn]` block is present in the model (the
+    /// dot-access parser then errors on `FOO.BAR`).
+    nn_specs: &'a [(String, Vec<String>)],
 }
 
 impl<'a> ParseCtx<'a> {
     fn new(theta_names: &'a [String], eta_names: &'a [String], defined_vars: &'a [String]) -> Self {
+        const EMPTY_NN: &[(String, Vec<String>)] = &[];
         Self {
             theta_names,
             eta_names,
             defined_vars,
             fallback_covariate: true,
+            nn_specs: EMPTY_NN,
         }
     }
 
     fn ode(defined_vars: &'a [String]) -> Self {
         const EMPTY: &[String] = &[];
+        const EMPTY_NN: &[(String, Vec<String>)] = &[];
         Self {
             theta_names: EMPTY,
             eta_names: EMPTY,
             defined_vars,
             fallback_covariate: false,
+            nn_specs: EMPTY_NN,
         }
+    }
+
+    fn with_nn_specs(mut self, nn_specs: &'a [(String, Vec<String>)]) -> Self {
+        self.nn_specs = nn_specs;
+        self
     }
 }
 
@@ -2818,6 +2911,19 @@ fn eval_expression(
                 eval_expression(e, theta, eta, covariates, vars)
             }
         }
+        Expression::NnOutput { .. } => {
+            // The HashMap-keyed (unindexed) evaluator is used only by callers
+            // that pre-date the `[covariate_nn]` feature (tv_fn, the simulation
+            // expression evaluator). NN dispatch happens exclusively in the
+            // indexed path. Reaching this branch from a NN-bearing model is a
+            // bug to fix in a subsequent PR (Phase A M2: tv_fn parity).
+            debug_assert!(
+                false,
+                "Expression::NnOutput reached unindexed eval_expression; tv_fn / simulation \
+                 paths do not yet support [covariate_nn] (Phase A M2 work)"
+            );
+            0.0
+        }
     }
 }
 
@@ -2866,6 +2972,7 @@ fn eval_expression_indexed(
     eta: &[f64],
     covariates: &[f64],
     vars: &[f64],
+    nn_outputs: &[Vec<f64>],
 ) -> f64 {
     match expr {
         Expression::Literal(v) => *v,
@@ -2878,8 +2985,8 @@ fn eval_expression_indexed(
             0.0
         }
         Expression::BinOp(lhs, op, rhs) => {
-            let l = eval_expression_indexed(lhs, theta, eta, covariates, vars);
-            let r = eval_expression_indexed(rhs, theta, eta, covariates, vars);
+            let l = eval_expression_indexed(lhs, theta, eta, covariates, vars, nn_outputs);
+            let r = eval_expression_indexed(rhs, theta, eta, covariates, vars, nn_outputs);
             match op {
                 BinOp::Add => l + r,
                 BinOp::Sub => l - r,
@@ -2894,7 +3001,7 @@ fn eval_expression_indexed(
             }
         }
         Expression::UnaryFn(name, arg) => {
-            let v = eval_expression_indexed(arg, theta, eta, covariates, vars);
+            let v = eval_expression_indexed(arg, theta, eta, covariates, vars, nn_outputs);
             match name.as_str() {
                 "exp" => v.exp(),
                 "log" | "ln" => v.max(1e-30).ln(),
@@ -2916,16 +3023,33 @@ fn eval_expression_indexed(
             }
         }
         Expression::Power(base, exp) => {
-            let b = eval_expression_indexed(base, theta, eta, covariates, vars);
-            let e = eval_expression_indexed(exp, theta, eta, covariates, vars);
+            let b = eval_expression_indexed(base, theta, eta, covariates, vars, nn_outputs);
+            let e = eval_expression_indexed(exp, theta, eta, covariates, vars, nn_outputs);
             b.powf(e)
         }
         Expression::Conditional(cond, t, e) => {
-            if eval_condition_indexed(cond, theta, eta, covariates, vars) {
-                eval_expression_indexed(t, theta, eta, covariates, vars)
+            if eval_condition_indexed(cond, theta, eta, covariates, vars, nn_outputs) {
+                eval_expression_indexed(t, theta, eta, covariates, vars, nn_outputs)
             } else {
-                eval_expression_indexed(e, theta, eta, covariates, vars)
+                eval_expression_indexed(e, theta, eta, covariates, vars, nn_outputs)
             }
+        }
+        Expression::NnOutput { nn_idx, output_idx } => {
+            // Reads from the per-call cache that `build_pk_param_fn`
+            // populates once per forward via `NamedMlpMapper::forward_raw`.
+            // Multiple references to outputs of the same NN therefore share
+            // a single forward pass.
+            nn_outputs
+                .get(*nn_idx)
+                .and_then(|v| v.get(*output_idx))
+                .copied()
+                .unwrap_or_else(|| {
+                    debug_assert!(
+                        false,
+                        "NnOutput nn_idx={nn_idx} output_idx={output_idx} out of bounds"
+                    );
+                    0.0
+                })
         }
     }
 }
@@ -2936,11 +3060,12 @@ fn eval_condition_indexed(
     eta: &[f64],
     covariates: &[f64],
     vars: &[f64],
+    nn_outputs: &[Vec<f64>],
 ) -> bool {
     match cond {
         Condition::Compare(l, op, r) => {
-            let lv = eval_expression_indexed(l, theta, eta, covariates, vars);
-            let rv = eval_expression_indexed(r, theta, eta, covariates, vars);
+            let lv = eval_expression_indexed(l, theta, eta, covariates, vars, nn_outputs);
+            let rv = eval_expression_indexed(r, theta, eta, covariates, vars, nn_outputs);
             match op {
                 CmpOp::Lt => lv < rv,
                 CmpOp::Le => lv <= rv,
@@ -2951,14 +3076,14 @@ fn eval_condition_indexed(
             }
         }
         Condition::And(l, r) => {
-            eval_condition_indexed(l, theta, eta, covariates, vars)
-                && eval_condition_indexed(r, theta, eta, covariates, vars)
+            eval_condition_indexed(l, theta, eta, covariates, vars, nn_outputs)
+                && eval_condition_indexed(r, theta, eta, covariates, vars, nn_outputs)
         }
         Condition::Or(l, r) => {
-            eval_condition_indexed(l, theta, eta, covariates, vars)
-                || eval_condition_indexed(r, theta, eta, covariates, vars)
+            eval_condition_indexed(l, theta, eta, covariates, vars, nn_outputs)
+                || eval_condition_indexed(r, theta, eta, covariates, vars, nn_outputs)
         }
-        Condition::Not(c) => !eval_condition_indexed(c, theta, eta, covariates, vars),
+        Condition::Not(c) => !eval_condition_indexed(c, theta, eta, covariates, vars, nn_outputs),
     }
 }
 
@@ -2973,11 +3098,12 @@ fn eval_statements_indexed(
     eta: &[f64],
     covariates: &[f64],
     vars: &mut [f64],
+    nn_outputs: &[Vec<f64>],
 ) {
     for s in stmts {
         match s {
             Statement::AssignIdx(idx, expr) => {
-                let v = eval_expression_indexed(expr, theta, eta, covariates, vars);
+                let v = eval_expression_indexed(expr, theta, eta, covariates, vars, nn_outputs);
                 if let Some(slot) = vars.get_mut(*idx) {
                     *slot = v;
                 }
@@ -2988,15 +3114,15 @@ fn eval_statements_indexed(
             } => {
                 let mut taken = false;
                 for (cond, body) in branches {
-                    if eval_condition_indexed(cond, theta, eta, covariates, vars) {
-                        eval_statements_indexed(body, theta, eta, covariates, vars);
+                    if eval_condition_indexed(cond, theta, eta, covariates, vars, nn_outputs) {
+                        eval_statements_indexed(body, theta, eta, covariates, vars, nn_outputs);
                         taken = true;
                         break;
                     }
                 }
                 if !taken {
                     if let Some(eb) = else_body {
-                        eval_statements_indexed(eb, theta, eta, covariates, vars);
+                        eval_statements_indexed(eb, theta, eta, covariates, vars, nn_outputs);
                     }
                 }
             }
@@ -3082,7 +3208,8 @@ fn resolve_expr_indices(
         | Expression::Theta(_)
         | Expression::Eta(_)
         | Expression::VariableIdx(_)
-        | Expression::CovariateIdx(_) => {}
+        | Expression::CovariateIdx(_)
+        | Expression::NnOutput { .. } => {}
     }
 }
 
@@ -3209,6 +3336,11 @@ enum Token {
     OrOr,
     Bang,
     Comma,
+    /// `.` — member-access operator, used today only by `[covariate_nn]`
+    /// dot-access syntax (`TYPICAL_PK.CL`). Decimal-point dots inside number
+    /// literals (e.g. `4.5`, `.5`) are absorbed by the number tokenizer
+    /// before this token is produced.
+    Dot,
     /// Logical line separator. Consumed only by the statement parser, where
     /// it acts as an "end of statement" marker. Newlines inside `(...)` and
     /// `[...]` are stripped by `strip_newlines_in_groups` so users can break
@@ -3380,7 +3512,30 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::Caret);
                 i += 1;
             }
-            c if c.is_ascii_digit() || c == '.' => {
+            // A `.` followed by a digit starts a decimal-only literal like `.5`.
+            // Standalone `.` (e.g. `TYPICAL_PK.CL`) is the member-access operator
+            // and is handled by a separate arm below.
+            '.' if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() => {
+                let start = i;
+                while i < chars.len()
+                    && (chars[i].is_ascii_digit()
+                        || chars[i] == '.'
+                        || chars[i] == 'e'
+                        || chars[i] == 'E')
+                {
+                    i += 1;
+                }
+                let num_str: String = chars[start..i].iter().collect();
+                let num: f64 = num_str
+                    .parse()
+                    .map_err(|_| format!("Bad number: {}", num_str))?;
+                tokens.push(Token::Number(num));
+            }
+            '.' => {
+                tokens.push(Token::Dot);
+                i += 1;
+            }
+            c if c.is_ascii_digit() => {
                 let start = i;
                 while i < chars.len()
                     && (chars[i].is_ascii_digit()
@@ -3554,6 +3709,42 @@ fn parse_atom(
                     return Err(format!("Missing closing parenthesis for function {}", name));
                 }
                 return Ok((Expression::UnaryFn(func_name, Box::new(arg)), p + 1));
+            }
+
+            // Check if it's an `[covariate_nn NAME]` output access: `NAME.OUTPUT`.
+            // Resolved at parse time into `Expression::NnOutput { nn_idx, output_idx }`
+            // so the evaluator can read the pre-computed forward output by index.
+            if pos + 1 < tokens.len() && tokens[pos + 1] == Token::Dot {
+                if let Some(nn_idx) = ctx.nn_specs.iter().position(|(n, _)| n == name) {
+                    let output_tok = tokens.get(pos + 2).ok_or_else(|| {
+                        format!("`{}.` is missing an output name after the dot", name)
+                    })?;
+                    let output_name = match output_tok {
+                        Token::Ident(s) => s,
+                        other => {
+                            return Err(format!(
+                                "`{}.` must be followed by an output name (identifier), got {:?}",
+                                name, other
+                            ));
+                        }
+                    };
+                    let outputs = &ctx.nn_specs[nn_idx].1;
+                    let output_idx = outputs
+                        .iter()
+                        .position(|o| o == output_name)
+                        .ok_or_else(|| {
+                            format!(
+                                "`{name}.{output_name}` is not declared as an output of \
+                                 [covariate_nn {name}]. Known outputs: {}",
+                                outputs.join(", ")
+                            )
+                        })?;
+                    return Ok((Expression::NnOutput { nn_idx, output_idx }, pos + 3));
+                }
+                // `NAME.X` where NAME is not a known NN — fall through to the
+                // identifier-classification chain. The `Dot` token will then
+                // be the next unexpected token; the caller will surface that
+                // as an expression-parse error.
             }
 
             // Check if it's a theta
@@ -6468,5 +6659,175 @@ if (1 > 0) {
         let lines = by_inst.get("FOO").expect("instance FOO present");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "key = value");
+    }
+
+    // ─── [covariate_nn] dot-access + pk_param_fn dispatch (Phase A M1 step 3) ────
+
+    #[cfg(feature = "nn")]
+    fn covariate_nn_dotted_model_src() -> String {
+        // Two-output NN feeding both CL and V. Etas on the final PK params,
+        // matching the Phase A M2 mu-ref form. The fit-objective surface
+        // (method = nn_mse) isn't wired yet, so we only exercise the
+        // pk_param_fn closure here — that's the simulate path.
+        r#"
+[parameters]
+  theta TVKA(1.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma ADD ~ 0.1
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT, CRCL]
+  outputs = [CL, V]
+  layers = [4]
+  activation = tanh
+  output = softplus
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V  = TYPICAL_PK.V  * exp(ETA_V)
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ additive(ADD)
+"#
+        .to_string()
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_dot_access_parses_into_nn_output_node() {
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("dot-access must parse");
+        // 1 base theta (TVKA) + NN weights for a 2->4->2 net:
+        //   W_1: 4*2 = 8, b_1: 4, W_2: 2*4 = 8, b_2: 2 → 22 weights.
+        assert_eq!(model.n_theta, 1 + 22);
+        assert_eq!(model.covariate_nns.len(), 1);
+        assert_eq!(model.covariate_nns[0].name, "TYPICAL_PK");
+        // Weights start right after the user-declared base thetas.
+        assert_eq!(model.covariate_nns[0].weights_offset, 1);
+    }
+
+    /// Round-trip: call the closure with known theta values (including known
+    /// NN weights) and confirm the PK params it produces match what
+    /// `NamedMlpMapper::forward_raw` returns directly.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_pk_param_fn_dispatches_through_nn() {
+        use crate::nn::CovariateMapper;
+        use crate::types::{PK_IDX_CL, PK_IDX_V};
+
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("model parses");
+        let theta: Vec<f64> = model.default_params.theta.clone();
+        let eta = vec![0.0_f64, 0.0_f64]; // zero etas → PK params == NN typical values.
+        let mut cov = HashMap::new();
+        cov.insert("WT".to_string(), 70.0);
+        cov.insert("CRCL".to_string(), 95.0);
+
+        let pk = (model.pk_param_fn)(&theta, &eta, &cov);
+
+        // What the NN itself would emit, sliced from the same theta vector.
+        let nn = &model.covariate_nns[0];
+        let weights = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+        let nn_outputs = nn.mapper.forward_raw(weights, &cov).unwrap();
+
+        // pk_param_fn writes to PkParams by name: output[0] = CL, output[1] = V.
+        assert!((pk.values[PK_IDX_CL] - nn_outputs[0]).abs() < 1e-12);
+        assert!((pk.values[PK_IDX_V] - nn_outputs[1]).abs() < 1e-12);
+        // KA is a plain theta-only path.
+        assert!((pk.values[crate::types::PK_IDX_KA] - theta[0]).abs() < 1e-12);
+    }
+
+    /// Non-zero etas: the mu-ref composition `TYPICAL_PK.CL * exp(ETA_CL)`
+    /// must apply log-normal IIV on top of the NN typical value.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_pk_param_fn_composes_eta_on_top_of_nn_output() {
+        use crate::nn::CovariateMapper;
+        use crate::types::PK_IDX_CL;
+
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("model parses");
+        let theta = model.default_params.theta.clone();
+        let mut cov = HashMap::new();
+        cov.insert("WT".to_string(), 70.0);
+        cov.insert("CRCL".to_string(), 95.0);
+
+        let nn = &model.covariate_nns[0];
+        let weights = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+        let nn_outputs = nn.mapper.forward_raw(weights, &cov).unwrap();
+        let tv_cl = nn_outputs[0];
+
+        // eta = +0.3 → CL should be tv_cl * exp(0.3).
+        let pk = (model.pk_param_fn)(&theta, &[0.3_f64, 0.0_f64], &cov);
+        let expected = tv_cl * 0.3_f64.exp();
+        assert!(
+            (pk.values[PK_IDX_CL] - expected).abs() < 1e-10,
+            "expected {expected}, got {}",
+            pk.values[PK_IDX_CL]
+        );
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_dot_access_rejects_unknown_output() {
+        // GARBAGE is not in `outputs = [CL, V]`.
+        let src = r#"
+[parameters]
+  theta TVKA(1.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.1
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT]
+  outputs = [CL, V]
+  layers = [3]
+  activation = tanh
+
+[individual_parameters]
+  CL = TYPICAL_PK.GARBAGE * exp(ETA_CL)
+  V  = 50
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ additive(ADD)
+"#;
+        let err = parse_model_string(src).expect_err("unknown output must error");
+        assert!(
+            err.contains("GARBAGE"),
+            "error should name the bad output, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_dot_access_on_unknown_nn_name_falls_back_to_parse_error() {
+        // FOO is not a declared [covariate_nn] block. `FOO.CL` must error
+        // (the parser stops at the `.` it can't classify).
+        let src = r#"
+[parameters]
+  theta TVKA(1.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.1
+
+[individual_parameters]
+  CL = FOO.CL
+  V  = 50
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ additive(ADD)
+"#;
+        assert!(parse_model_string(src).is_err());
     }
 }

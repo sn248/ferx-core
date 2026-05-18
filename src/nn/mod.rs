@@ -486,6 +486,30 @@ impl NamedMlpMapper {
         &self.mlp
     }
 
+    /// Names of the inputs in `inputs` order — i.e. the covariate keys this
+    /// mapper reads from a `&HashMap<String, f64>` on every forward pass.
+    pub fn input_names(&self) -> &[String] {
+        &self.input_names
+    }
+
+    /// Forward pass returning the raw output vector in *declaration order*
+    /// (the order of `output_names`), without routing through `PkParams`.
+    ///
+    /// `forward` writes results into PK slots via `name_to_index`, which is
+    /// what the fit / predict / simulate paths ultimately want. The parser,
+    /// however, needs to look up outputs by their position in the
+    /// `[covariate_nn]` block's `outputs` list (so the AST can carry a tiny
+    /// `output_idx` rather than a string slot name). This method is the
+    /// parser-facing variant.
+    pub fn forward_raw(
+        &self,
+        weights: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Result<Vec<f64>, NnError> {
+        let x = self.build_input_vec(covariates)?;
+        self.mlp.forward(&x, weights)
+    }
+
     fn build_input_vec(&self, covariates: &HashMap<String, f64>) -> Result<Vec<f64>, NnError> {
         self.input_names
             .iter()

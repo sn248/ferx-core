@@ -1,25 +1,25 @@
 # ────────────────────────────────────────────────────────────────────────────
 # DRAFT — design intent for Deep Compartment Models (DCM)
 #
-# What's wired now (Phase A M1, behind `--features nn`):
+# What's wired now (Phase A M1 steps 2 + 3, behind `--features nn`):
 #   ✓ `[covariate_nn NAME]` block syntax parses end-to-end.
-#   ✓ NN weight thetas (`W_TYPICAL_PK_…`, `B_TYPICAL_PK_…`) are auto-generated
+#   ✓ NN weight thetas (`W_TYPICAL_PK_…`, `B_TYPICAL_PK_…`) auto-generated
 #     and appended to the model's theta vector with Glorot-style inits.
-#   ✓ `model.covariate_nns` exposes the mapper handle on `CompiledModel`.
+#   ✓ Mu-ref composition `TYPICAL_PK.CL * exp(ETA_CL)` parses and dispatches.
+#   ✓ `pk_param_fn` runs the NN forward pass once per call and routes its
+#     outputs into PK slots. The model is simulate-able end-to-end.
 #
-# What's NOT wired yet (planned for the next PR):
-#   ✗ `method = nn_mse` fit objective.
-#   ✗ Mu-ref composition `TYPICAL_PK.CL * exp(ETA_CL)` in `[individual_parameters]`.
-#   ✗ `pk_param_fn` dispatch onto the NN.
+# What's NOT wired yet (planned for the next PR — Phase A M1 step 4):
+#   ✗ `method = nn_mse` fixed-effects fit objective.
+#   ✗ Option E NN-aware output rendering in `{model}-fit.yaml` / `.fitrx`.
+#   ✗ Promotion to `examples/warfarin_dcm.ferx` (out of `drafts/`).
 #
-# Running `cargo run --features nn -- examples/drafts/warfarin_dcm.ferx` today
-# will FAIL on the `[individual_parameters]` reference to `TYPICAL_PK.CL`
-# (unknown identifier) and on `method = nn_mse` (unknown method). Expected.
-#
-# The file lives in `examples/drafts/` so the parser smoke test
-# (`test_parse_all_example_ferx_files`) skips it. When parser-side support
-# for the mu-ref composition + nn_mse lands, the file will be promoted to
-# `examples/warfarin_dcm.ferx` and this header removed.
+# Today, swapping `method = nn_mse` below for a real method (`method = focei`)
+# and running `cargo run --release --features nn -- examples/drafts/warfarin_dcm.ferx
+# --simulate` should produce reasonable concentration curves driven by the
+# untrained NN. Fitting is not yet useful — the optimizer would treat NN
+# weights as ordinary thetas which is technically correct but not what the
+# paper does.
 # ────────────────────────────────────────────────────────────────────────────
 #
 # Model: two-compartment oral PK, NN-based typical values (DCM), additive

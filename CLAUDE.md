@@ -45,6 +45,16 @@ Inline `#[cfg(test)] mod tests` blocks at the bottom of each module (e.g. `src/p
 
 Prefer unit tests of the smallest helper that isolates the new behaviour (e.g. test `detect_mu_refs` directly, not just through a full `fit()` call) — end-to-end fits are too slow and flaky for the default test suite.
 
+**Any test that calls `fit()` and runs to convergence must be gated** so it is skipped in the default PR test job. Use the `slow-tests` cargo feature:
+
+```rust
+#[test]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+fn test_my_new_estimator() { ... }
+```
+
+These tests still run in CI via the nightly `slow-tests.yml` workflow and can be triggered manually. Fast-failing tests (those that call `fit()` but expect an immediate `Err` without running the optimiser) do not need gating.
+
 ## Documentation
 
 Docs live in `docs/` as an [mdBook](https://rust-lang.github.io/mdBook/):

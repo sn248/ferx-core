@@ -418,24 +418,11 @@ fn propagate_with_bounds(
             continue;
         }
         let mid = 0.5 * (s0 + s1);
-        // Sum infusion rates active across the *whole* sub-interval,
-        // routing each by the dose's compartment. The cmt → state-slot
-        // mapping is model-specific:
-        //   IV: cmt=1 central, cmt=2 periph1, cmt=3 periph2
-        //   Oral: cmt=1 depot, cmt=2 central, cmt=3 periph1, cmt=4 periph2
-        //
-        // Peripheral-compartment infusion is supported on the IV
-        // multi-compartment models (2-cpt: cmt=2; 3-cpt: cmt=2 and 3).
-        // Oral peripheral infusion is unusual clinically and stays
-        // unsupported for now (panics with a clear message); see the
-        // project todo list.
         let mut rate_central = 0.0;
         let mut rate_periph1 = 0.0;
         let mut rate_periph2 = 0.0;
-        // F multiplies infusion rate (rate-scaled convention). Equivalent to
-        // delivering F·AMT over the user-specified duration. Mirrors the bolus
-        // fix in the EventKind::Dose arm above so an infusion approaching dur→0
-        // limits cleanly to a bolus of amount F·AMT.
+        // F multiplies infusion rate so a dur→0 infusion limits to a bolus
+        // of amount F·AMT — same convention as the EventKind::Dose arm above.
         let f_bio = pk.f_bio();
         for (k, d) in doses.iter().enumerate() {
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
@@ -1316,6 +1303,56 @@ mod tests {
             event_driven_predictions(PkModel::TwoCptOral, &subj, &pk_dose_unit, &pk_obs_unit, &[]);
         for (a_f, a_1) in preds.iter().zip(preds_unit.iter()) {
             assert_relative_eq!(*a_f, 2.5 * *a_1, epsilon = 1e-9, max_relative = 1e-9);
+        }
+    }
+
+    #[test]
+    fn event_driven_applies_f_bio_to_infusion() {
+        // Companion to the bolus test above. `propagate_with_bounds`
+        // multiplies `f_bio` into the infusion rate (rate-scaled
+        // convention), so a dur→0 infusion limits to a bolus of amount
+        // F·AMT.
+        //
+        // Note: the analytical IV/Infusion paths in `pk/mod.rs` do *not*
+        // apply F (only the `_f` oral variants do), so we don't compare
+        // event-driven to the analytical reference here. We assert two
+        // weaker invariants that the fix should satisfy:
+        //   1. At F=1 the event-driven prediction matches the analytical
+        //      (regression for the unrelated infusion path).
+        //   2. Predictions scale linearly with F (the bolus fix's
+        //      contract extended to infusions).
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0)];
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
+        let subj = make_subject(doses, obs_times.clone());
+
+        let mut pk = pk_one(10.0, 100.0);
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+        let pk_dose_unit = vec![pk; 1];
+        let pk_obs_unit = vec![pk; obs_times.len()];
+        let preds_unit = event_driven_predictions(
+            PkModel::OneCptInfusion,
+            &subj,
+            &pk_dose_unit,
+            &pk_obs_unit,
+            &[],
+        );
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|&t| crate::pk::predict_concentration(PkModel::OneCptInfusion, &subj.doses, t, &pk))
+            .collect();
+        for (i, (a, e)) in preds_unit.iter().zip(expected.iter()).enumerate() {
+            assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-8);
+            assert!(*a > 0.0, "obs {} should be positive, got {}", i, a);
+        }
+
+        let mut pk_f = pk;
+        pk_f.values[crate::types::PK_IDX_F] = 0.4;
+        let pk_dose_f = vec![pk_f; 1];
+        let pk_obs_f = vec![pk_f; obs_times.len()];
+        let preds_f =
+            event_driven_predictions(PkModel::OneCptInfusion, &subj, &pk_dose_f, &pk_obs_f, &[]);
+        for (a_f, a_1) in preds_f.iter().zip(preds_unit.iter()) {
+            assert_relative_eq!(*a_f, 0.4 * *a_1, epsilon = 1e-9, max_relative = 1e-9);
         }
     }
 

@@ -117,35 +117,19 @@ struct NloptState {
     n_evals: usize,
     /// Previous parameter vector — used to compute step_norm for the trace.
     prev_x: Vec<f64>,
-    /// Eval index at which `best_ofv` last dropped by more than the
-    /// stagnation threshold. Used to detect "stuck on plateau" — see
-    /// `should_short_circuit_for_stagnation`.
     last_improvement_eval: usize,
-    /// Best OFV observed at `last_improvement_eval`. Compared against
-    /// current `best_ofv` to test whether the optimizer has made
-    /// meaningful progress in the recent window.
     best_at_last_improvement: f64,
-    /// Sticky flag: once set, the closure returns `best_ofv` with zero
-    /// gradient on every subsequent eval, which lets SLSQP / L-BFGS
-    /// reach their xtol/ftol stop criterion in microseconds instead of
-    /// grinding through the remaining `maxeval` budget at full inner-loop
-    /// cost.
+    /// Sticky once latched — subsequent evals return `best_ofv` with zero
+    /// gradient so SLSQP/L-BFGS xtol/ftol fires in microseconds instead
+    /// of grinding through `maxeval` at full inner-loop cost.
     stagnation_stopped: bool,
 }
 
-/// Decide whether the optimizer has stalled — and if so, latch the
-/// `stagnation_stopped` flag in `state` so subsequent evals return
-/// `best_ofv` cheaply.
+/// Latches `stagnation_stopped` once recent evals show no OFV progress.
 ///
-/// Used inside the NLopt objective closure. The trigger is conservative:
-/// allow `STAGNATION_WINDOW` (auto-sized to ~3 outer iterations of an
-/// `n`-dimensional FD-gradient method) evals without an OFV improvement
-/// of at least `STAGNATION_THRESHOLD` before short-circuiting.
-///
-/// Without this guard, SLSQP on a γ-bearing (poorly identified) FOCEI
-/// problem can spend 30+ minutes shrinking line-search steps at a
-/// numerically-flat OFV before its `xtol_rel`/`ftol_rel` criteria fire —
-/// see comment near the per-algorithm tolerance block.
+/// Without this, SLSQP on poorly-identified (e.g. γ-bearing) FOCEI
+/// problems can spend 30+ min at a numerically-flat OFV before its
+/// xtol/ftol criteria fire.
 fn detect_stagnation(state: &mut NloptState, n: usize) -> bool {
     if state.stagnation_stopped {
         return true;

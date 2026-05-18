@@ -2154,19 +2154,9 @@ fn build_pk_param_fn(
     let mut referenced_covariates: Vec<String> = cov_set.into_iter().collect();
     referenced_covariates.sort();
 
-    // Build indexed forms: every Variable(name) → VariableIdx(slot) and
-    // Covariate(name) → CovariateIdx(slot). The eval closure below then
-    // runs on `Vec<f64>` instead of `HashMap<String, f64>` for both.
-    // Per-call this removes ~5-10 HashMap probes and one HashMap
-    // allocation; on a SAEM M-step with `obs_nll_sum` × 120 subj × 9
-    // events that's where most of the 100s+ wall time used to go after
-    // the earlier omega_inv + scratch-reuse fixes.
-    //
-    // Slot layout: top-level `var_names` come first (positions 0..N_top),
-    // then any branch-local helpers assigned only inside `if` bodies
-    // (positions N_top..). Keeping top-level slots stable preserves the
-    // ODE-positional mapping below; the extra slots cover nested
-    // assignments like `CL = TVCL * 2` inside `if (WT>70) { ... }`.
+    // Variable/covariate references switch from HashMap lookup to slot
+    // index. Top-level vars come first so the ODE positional mapping
+    // below stays valid; nested if-body vars get appended slots.
     let mut all_var_names: Vec<String> = var_names.to_vec();
     let nested_vars = assigned_vars_in_order(&stmts);
     for n in &nested_vars {
@@ -2192,11 +2182,8 @@ fn build_pk_param_fn(
     let stmts_owned = stmts_resolved;
     let vars_in_order = var_names.to_vec();
 
-    // Pre-resolve pk_map → indexed slots for the analytical-PK branch.
-    // Each (pk_idx, var_idx) entry maps a PK slot (CL=0, V=1, ...) to
-    // the variable slot whose value should populate it. Built once at
-    // parse end so the hot path is a tight `for (pk, vi) in mapping`
-    // loop with two array indexes.
+    // Pre-resolve pk_map → indexed (pk_slot, var_slot) pairs so the hot
+    // loop is two array reads instead of two HashMap probes.
     let pk_assignment_mapping: Vec<(usize, usize)> = pk_param_map
         .iter()
         .filter_map(|(pk_name, var_name)| {
@@ -2211,10 +2198,9 @@ fn build_pk_param_fn(
         .collect();
     let is_analytical_pk = !pk_param_map.is_empty();
 
-    // For the ODE branch we also pre-resolve "var slot for slot i in
-    // declaration order" so the per-call loop is two indexed reads. The
-    // lagtime side-write is handled separately because lagtime can sit
-    // outside the first MAX_PK_PARAMS positions.
+    // ODE branch counterpart of the same pre-resolution. Lagtime is
+    // handled separately because it can live outside the first
+    // MAX_PK_PARAMS positions.
     let ode_positional_slots: Vec<usize> = vars_in_order
         .iter()
         .enumerate()
@@ -2456,13 +2442,10 @@ fn eval_expression(
         Expression::Eta(i) => eta[*i],
         Expression::Covariate(name) => covariates.get(name).copied().unwrap_or(0.0),
         Expression::Variable(name) => vars.get(name).copied().unwrap_or(0.0),
-        // The indexed variants exist for the `pk_param_fn` fast path
-        // (which uses `eval_expression_indexed`). Hitting them here means
-        // someone forgot to route through the indexed evaluator; rather
-        // than panic, fall back to 0.0 to mirror the existing
-        // unknown-name behaviour for `Variable`/`Covariate`.
-        Expression::VariableIdx(_) => 0.0,
-        Expression::CovariateIdx(_) => 0.0,
+        Expression::VariableIdx(_) | Expression::CovariateIdx(_) => {
+            debug_assert!(false, "indexed expression reached unindexed eval_expression");
+            0.0
+        }
         Expression::BinOp(lhs, op, rhs) => {
             let l = eval_expression(lhs, theta, eta, covariates, vars);
             let r = eval_expression(rhs, theta, eta, covariates, vars);
@@ -2569,8 +2552,10 @@ fn eval_expression_indexed(
         Expression::Eta(i) => eta[*i],
         Expression::VariableIdx(i) => vars.get(*i).copied().unwrap_or(0.0),
         Expression::CovariateIdx(i) => covariates.get(*i).copied().unwrap_or(0.0),
-        // Unindexed forms — should not appear in a fully-resolved AST.
-        Expression::Covariate(_) | Expression::Variable(_) => 0.0,
+        Expression::Covariate(_) | Expression::Variable(_) => {
+            debug_assert!(false, "unresolved name reached eval_expression_indexed");
+            0.0
+        }
         Expression::BinOp(lhs, op, rhs) => {
             let l = eval_expression_indexed(lhs, theta, eta, covariates, vars);
             let r = eval_expression_indexed(rhs, theta, eta, covariates, vars);

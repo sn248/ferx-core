@@ -1204,4 +1204,46 @@ mod tests {
             Ok(_) => panic!("pre-cancelled SAEM must return Err, not Ok"),
         }
     }
+
+    /// Per-theta packing must round-trip values identically for both log-packed
+    /// (`theta_lower >= 0`) and identity-packed (`theta_lower < 0`) thetas. SAEM
+    /// uses its own pack/unpack closures inside the M-step, so this exercises
+    /// the same math the closures rely on (`theta_packs_log` from
+    /// parameterization plus the `if mask[i] { ln/exp } else { identity }`
+    /// branches in `theta_sigma_mstep_light`).
+    #[test]
+    fn saem_pack_unpack_handles_negative_lower_bound() {
+        use crate::estimation::parameterization::theta_packs_log;
+
+        // Mix: CL (lower=0), V (lower=0.001), THETA_AGE_CL (lower=-1).
+        let lowers: [f64; 3] = [0.0, 0.001, -1.0];
+        let values: [f64; 3] = [5.0, 20.0, -0.01];
+        let mask: Vec<bool> = lowers.iter().map(|&lo| theta_packs_log(lo)).collect();
+        assert_eq!(mask, vec![true, true, false]);
+
+        // Forward: simulate the SAEM init-pack construction (lines ~444–451 of
+        // run_saem: log when log-packed, identity when identity-packed).
+        let packed: Vec<f64> = values
+            .iter()
+            .zip(mask.iter())
+            .map(|(&v, &log_pack)| if log_pack { v.max(1e-10).ln() } else { v })
+            .collect();
+
+        // Reverse: the M-step `unpack_thetas` closure.
+        let unpacked: Vec<f64> = packed
+            .iter()
+            .zip(mask.iter())
+            .map(|(&p, &log_pack)| if log_pack { p.exp() } else { p })
+            .collect();
+
+        for (orig, round) in values.iter().zip(unpacked.iter()) {
+            assert!(
+                (orig - round).abs() < 1e-12,
+                "saem pack/unpack should round-trip: {orig} != {round}"
+            );
+        }
+        // The identity-packed theta carries a negative value through —
+        // pre-fix, this was clamped to 1e-10 by the log path.
+        assert!(unpacked[2] < 0.0);
+    }
 }

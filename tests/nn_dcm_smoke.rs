@@ -17,7 +17,8 @@ use ferx_core::nn::{Activation, CovariateMapper, MlpMapper, NamedMlpMapper};
 use ferx_core::types::PkParams;
 
 /// Build a tiny DCM-style mapper: 2 covariates -> 4 hidden (tanh) -> 5 PK
-/// params (softplus head). Matches the shape sketched in `examples/warfarin_dcm.ferx`.
+/// params (softplus head). Matches the shape sketched in
+/// `examples/drafts/warfarin_dcm.ferx`.
 fn build_mapper() -> NamedMlpMapper {
     let mlp = MlpMapper::new(vec![2, 4, 5], Activation::Tanh, Activation::Softplus)
         .expect("layer shape valid");

@@ -311,9 +311,13 @@ impl MlpMapper {
         Ok(jac)
     }
 
-    /// View weights of layer `l` (1-indexed, `1..=L`) as an
-    /// `(n_l × n_{l-1})` matrix without copying. The bias block is the
-    /// `n_l` entries immediately after.
+    /// Build an `(n_l × n_{l-1})` `DMatrix` from the layer-`l` weight block
+    /// (1-indexed, `1..=L`). The flat weight vector is row-major while
+    /// nalgebra's `DMatrix` is column-major, so this is a copy, not a
+    /// zero-cost view. For the paper-scale networks this module targets
+    /// (≤300 weights for DCM, ≤62 for low-dim NODE) the per-call alloc is
+    /// negligible; a zero-copy variant via column-major storage is tracked
+    /// against Phase A M3 in `plans/dcm-and-low-dim-node.md`.
     fn weight_matrix(&self, weights: &[f64], l: usize) -> DMatrix<f64> {
         let n_l = self.layers[l];
         let n_lm1 = self.layers[l - 1];

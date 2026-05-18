@@ -6,7 +6,7 @@
 # PR that introduces this file (https://github.com/FeRx-NLME/ferx-core/pull/24
 # and successors), but the parser integration that turns this file into a
 # runnable `CompiledModel` is intentionally **not yet wired**. Running
-# `cargo run -- examples/warfarin_dcm.ferx` today will fail with an
+# `cargo run -- examples/drafts/warfarin_dcm.ferx` today will fail with an
 # unrecognised-block error — this is expected.
 #
 # The file lives here so reviewers can comment on the proposed DSL on the PR.

@@ -436,15 +436,9 @@ fn propagate_with_bounds(
                     (PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion, 1) => rate_central += r,
                     (PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion, 2) => rate_periph1 += r,
                     (PkModel::TwoCptOral, 2) => rate_central += r,
-                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 1) => {
-                        rate_central += r
-                    }
-                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 2) => {
-                        rate_periph1 += r
-                    }
-                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 3) => {
-                        rate_periph2 += r
-                    }
+                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 1) => rate_central += r,
+                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 2) => rate_periph1 += r,
+                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 3) => rate_periph2 += r,
                     (PkModel::ThreeCptOral, 2) => rate_central += r,
                     _ => panic!(
                         "event-driven PK: infusion into compartment {} not supported \
@@ -1338,7 +1332,9 @@ mod tests {
         );
         let expected: Vec<f64> = obs_times
             .iter()
-            .map(|&t| crate::pk::predict_concentration(PkModel::OneCptInfusion, &subj.doses, t, &pk))
+            .map(|&t| {
+                crate::pk::predict_concentration(PkModel::OneCptInfusion, &subj.doses, t, &pk)
+            })
             .collect();
         for (i, (a, e)) in preds_unit.iter().zip(expected.iter()).enumerate() {
             assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-8);

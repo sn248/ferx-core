@@ -2289,8 +2289,8 @@ enum Expression {
     VariableIdx(usize),
     /// Same as `Covariate(name)` but pre-resolved to an index into a Vec
     /// aligned with `CompiledModel.referenced_covariates`. Built by
-    /// `resolve_variable_indices`; the matching Vec is constructed once
-    /// per subject in `Population::index_covariates`.
+    /// `resolve_variable_indices`; the matching Vec is materialized
+    /// inside the `pk_param_fn` closure for each subject.
     CovariateIdx(usize),
     BinOp(Box<Expression>, BinOp, Box<Expression>),
     UnaryFn(String, Box<Expression>),

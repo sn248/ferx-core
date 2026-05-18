@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTUP_TOOLCHAIN: nightly
+  # ferx_core's hot paths (`obs_nll_sum`, `foce_population_nll`, EKF/SDE)
+  # use rayon::par_iter over subjects. cargo test already parallelises tests
+  # across cores, so unconstrained rayon causes N×N thread oversubscription
+  # on a 2-core ubuntu-latest runner. Pinning rayon to 1 thread lets cargo
+  # own the parallelism. (Local machines stay fast because cores ≫ tests.)
+  RAYON_NUM_THREADS: 1
 
 jobs:
   check:
@@ -20,6 +26,8 @@ jobs:
         run: rustup toolchain install nightly --profile minimal
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
       - name: cargo check
         run: cargo check --no-default-features --features ci
 
@@ -32,8 +40,14 @@ jobs:
         run: rustup toolchain install nightly --profile minimal
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+      # `--release` pays an extra ~3-5 min compile vs default once, then runs
+      # the population-fit tests (SDE, IOV, FOCEI, GN-hybrid) 5-10× faster.
+      # Net: replaces the >80 min debug test wall with a single-digit-minute
+      # release wall on average.
       - name: cargo test
-        run: cargo test --lib --no-default-features --features ci
+        run: cargo test --lib --no-default-features --features ci --release
 
   clippy:
     name: Clippy
@@ -44,6 +58,8 @@ jobs:
         run: rustup toolchain install nightly --profile minimal -c clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
       - name: cargo clippy
         run: cargo clippy --no-default-features --features ci
 
@@ -57,3 +73,31 @@ jobs:
 
       - name: cargo fmt
         run: cargo fmt -- --check
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal -c llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-slow
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Generate coverage report
+        # `slow-tests` un-ignores the gated tests, so `--include-ignored`
+        # isn't needed; left off so a stray plain `#[ignore]` test elsewhere
+        # in the suite doesn't silently inflate coverage measurements here.
+        run: cargo llvm-cov --lib --no-default-features --features ci,slow-tests --release --lcov --output-path lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}

@@ -221,7 +221,10 @@ impl MlpMapper {
 
     /// Number of output features.
     pub fn n_outputs(&self) -> usize {
-        *self.layers.last().expect("layers non-empty by construction")
+        *self
+            .layers
+            .last()
+            .expect("layers non-empty by construction")
     }
 
     /// Forward pass.
@@ -650,8 +653,8 @@ mod tests {
 
     #[test]
     fn forward_rejects_mismatched_shapes() {
-        let mlp = MlpMapper::new(vec![2, 3, 1], Activation::Identity, Activation::Identity)
-            .unwrap();
+        let mlp =
+            MlpMapper::new(vec![2, 3, 1], Activation::Identity, Activation::Identity).unwrap();
         assert!(matches!(
             mlp.forward(&[1.0], &[0.0; 13]),
             Err(NnError::InputCountMismatch { .. })
@@ -687,8 +690,8 @@ mod tests {
         }
         // ReLU separately — skip the kink at 0.
         for &x in &[-3.0, -1.0, -0.001, 0.001, 1.0, 3.0] {
-            let fd = (Activation::Relu.apply(x + eps) - Activation::Relu.apply(x - eps))
-                / (2.0 * eps);
+            let fd =
+                (Activation::Relu.apply(x + eps) - Activation::Relu.apply(x - eps)) / (2.0 * eps);
             assert_relative_eq!(Activation::Relu.derivative(x), fd, epsilon = 1e-9);
         }
     }
@@ -702,7 +705,13 @@ mod tests {
         NamedMlpMapper::new(
             mlp,
             vec!["WT".into(), "CRCL".into()],
-            vec!["CL".into(), "V1".into(), "Q".into(), "V2".into(), "KA".into()],
+            vec![
+                "CL".into(),
+                "V1".into(),
+                "Q".into(),
+                "V2".into(),
+                "KA".into(),
+            ],
         )
         .unwrap()
     }
@@ -751,24 +760,16 @@ mod tests {
     #[test]
     fn named_mapper_rejects_unknown_pk_output() {
         let mlp = MlpMapper::new(vec![1, 2, 1], Activation::Tanh, Activation::Identity).unwrap();
-        let err = NamedMlpMapper::new(
-            mlp,
-            vec!["WT".into()],
-            vec!["NOT_A_PK_PARAM".into()],
-        )
-        .unwrap_err();
+        let err =
+            NamedMlpMapper::new(mlp, vec!["WT".into()], vec!["NOT_A_PK_PARAM".into()]).unwrap_err();
         assert!(matches!(err, NnError::UnknownPkOutput(ref n) if n == "NOT_A_PK_PARAM"));
     }
 
     #[test]
     fn named_mapper_rejects_duplicate_outputs() {
         let mlp = MlpMapper::new(vec![1, 2, 2], Activation::Tanh, Activation::Identity).unwrap();
-        let err = NamedMlpMapper::new(
-            mlp,
-            vec!["WT".into()],
-            vec!["CL".into(), "CL".into()],
-        )
-        .unwrap_err();
+        let err = NamedMlpMapper::new(mlp, vec!["WT".into()], vec!["CL".into(), "CL".into()])
+            .unwrap_err();
         assert!(matches!(err, NnError::DuplicateOutput(_)));
     }
 

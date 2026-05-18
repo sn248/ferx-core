@@ -1,0 +1,42 @@
+name: Slow tests
+
+# Heavy fit-based regression tests (each runs a real FOCEI / GN-hybrid / EKF
+# population fit) that take 5–60 min on a 2-core ubuntu-latest runner. The
+# main CI workflow `#[ignore]`s them via `#[cfg_attr(not(feature = "slow-tests"), ignore)]`.
+# This workflow runs them on a schedule + on-demand so they can't block
+# pull-request merges but still get exercised regularly against `main`.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # daily at 06:00 UTC
+  workflow_dispatch:       # manual trigger
+  push:
+    branches: [main]
+    paths:
+      # Re-run when something touches the code that the heavy fits exercise.
+      - 'src/api.rs'
+      - 'src/estimation/**'
+      - 'src/ode/ekf.rs'
+      - 'src/ode/predictions.rs'
+      - 'src/stats/likelihood.rs'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: nightly
+  RAYON_NUM_THREADS: 1
+
+jobs:
+  slow-tests:
+    name: Slow regression tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-slow
+      - name: cargo test (release + slow-tests)
+        run: cargo test --lib --no-default-features --features ci,slow-tests --release -- --include-ignored

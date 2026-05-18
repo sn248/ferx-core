@@ -16,6 +16,9 @@ path = "src/bin/run_model.rs"
 default = ["autodiff"]
 autodiff = []
 ci = []  # Allows building without autodiff for CI (nightly, no Enzyme)
+# Heavy fit-based tests (5–60 min wall each on a 2-core CI runner).
+# Default `cargo test` `#[ignore]`s them; a nightly/manual job opts in.
+slow-tests = []
 
 [dependencies]
 nalgebra = "0.33"

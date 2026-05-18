@@ -9,6 +9,26 @@ static DIFFUSION_LINE_RE: LazyLock<Regex> =
 
 // ── Mu-referencing pattern detection ────────────────────────────────────────
 
+/// Anchor of a mu-referencing relationship — either a plain user-declared
+/// theta (the classical case) or a `[covariate_nn]` output (Phase A M1+
+/// "deep compartment model" extension; the per-individual typical value
+/// comes out of an NN forward pass). Both shapes compose with eta the same
+/// way: `param = anchor * exp(eta)` (lognormal) or `param = anchor + eta`
+/// (additive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MuRefAnchor {
+    /// User-declared theta at this index in `theta_names`.
+    Theta(usize),
+    /// Output of a `[covariate_nn NAME]` block. `nn_idx` indexes the
+    /// alphabetically-sorted NN list (same as `ParseCtx::nn_specs`);
+    /// `output_idx` indexes the block's declared `outputs` list.
+    #[allow(dead_code)]
+    NnOutput {
+        nn_idx: usize,
+        output_idx: usize,
+    },
+}
+
 /// Walk a Mul-chain and collect direct Theta indices (not inside any function).
 fn collect_mul_thetas(expr: &Expression, out: &mut Vec<usize>) {
     match expr {
@@ -16,6 +36,26 @@ fn collect_mul_thetas(expr: &Expression, out: &mut Vec<usize>) {
         Expression::BinOp(l, BinOp::Mul, r) => {
             collect_mul_thetas(l, out);
             collect_mul_thetas(r, out);
+        }
+        _ => {}
+    }
+}
+
+/// Walk a Mul-chain and collect direct anchor candidates — `Theta(i)` or
+/// `NnOutput { nn_idx, output_idx }` — that sit at the top of the
+/// multiplication tree (not inside any function call). Used by the
+/// extended Pattern 1/4 detector to recognise both
+/// `TVCL * exp(ETA)` (classical) and `TYPICAL_PK.CL * exp(ETA)` (DCM).
+fn collect_mul_anchors(expr: &Expression, out: &mut Vec<MuRefAnchor>) {
+    match expr {
+        Expression::Theta(i) => out.push(MuRefAnchor::Theta(*i)),
+        Expression::NnOutput { nn_idx, output_idx } => out.push(MuRefAnchor::NnOutput {
+            nn_idx: *nn_idx,
+            output_idx: *output_idx,
+        }),
+        Expression::BinOp(l, BinOp::Mul, r) => {
+            collect_mul_anchors(l, out);
+            collect_mul_anchors(r, out);
         }
         _ => {}
     }
@@ -192,12 +232,24 @@ fn extract_eta_indices_for_var(stmts: &[Statement], var_name: &str) -> Vec<usize
 }
 
 /// Detect mu-referencing patterns in one assignment expression.
-/// Returns `Some((eta_idx, theta_idx, log_transformed))` or `None`.
-fn detect_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
+///
+/// Returns `Some((eta_idx, anchor, log_transformed))` or `None`. The anchor
+/// is either a plain `Theta(usize)` (classical mu-ref) or a `NnOutput`
+/// reference (Phase A M1: the typical value is produced by a
+/// `[covariate_nn]` forward pass).
+///
+/// Patterns recognised:
+/// - Pattern 1: `THETA * exp(ETA)`              → lognormal
+/// - Pattern 1-NN: `NN.OUTPUT * exp(ETA)`       → lognormal (DCM)
+/// - Pattern 2: `exp(log(THETA) + ETA)`         → lognormal
+/// - Pattern 3: `THETA + ETA` or `ETA + THETA`  → additive
+/// - Pattern 4: `THETA * exp(ETA) * <const>`    → lognormal (multiplied
+///   by a constant factor; the constant doesn't affect mu-ref detection
+///   since `collect_mul_*` walks the whole product chain).
+fn detect_pattern(expr: &Expression) -> Option<(usize, MuRefAnchor, bool)> {
     match expr {
         // Pattern 2: exp(log(THETA) + ETA)
         Expression::UnaryFn(name, inner) if name == "exp" => {
-            // inner must be Add with log(Theta) and Eta in either order
             if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
                 let try_log_theta_eta =
                     |a: &Expression, b: &Expression| -> Option<(usize, usize)> {
@@ -215,24 +267,29 @@ fn detect_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
                 if let Some((ei, ti)) =
                     try_log_theta_eta(lhs, rhs).or_else(|| try_log_theta_eta(rhs, lhs))
                 {
-                    return Some((ei, ti, true));
+                    return Some((ei, MuRefAnchor::Theta(ti), true));
                 }
             }
             None
         }
         // Pattern 3: THETA + ETA or ETA + THETA
         Expression::BinOp(lhs, BinOp::Add, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
-            (Expression::Theta(ti), Expression::Eta(ei)) => Some((*ei, *ti, false)),
-            (Expression::Eta(ei), Expression::Theta(ti)) => Some((*ei, *ti, false)),
+            (Expression::Theta(ti), Expression::Eta(ei)) => {
+                Some((*ei, MuRefAnchor::Theta(*ti), false))
+            }
+            (Expression::Eta(ei), Expression::Theta(ti)) => {
+                Some((*ei, MuRefAnchor::Theta(*ti), false))
+            }
             _ => None,
         },
-        // Pattern 1 / 4: product containing Theta and exp(Eta)
+        // Pattern 1 / 1-NN / 4: product containing exactly one anchor
+        // (Theta OR NnOutput) and `exp(Eta)` somewhere in the chain.
         _ => {
-            let mut thetas = Vec::new();
-            collect_mul_thetas(expr, &mut thetas);
-            if thetas.len() == 1 {
+            let mut anchors = Vec::new();
+            collect_mul_anchors(expr, &mut anchors);
+            if anchors.len() == 1 {
                 if let Some(ei) = find_exp_eta_in_mul(expr) {
-                    return Some((ei, thetas[0], true));
+                    return Some((ei, anchors[0], true));
                 }
             }
             None
@@ -245,24 +302,54 @@ fn detect_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
 /// participate — a variable defined inside `if (...) { CL = ... }` cannot
 /// participate in mu-referencing because the inner-loop re-centering only
 /// holds when the relationship is unconditional.
+///
+/// `nn_specs` is the same `(name, output_names)` list passed to `ParseCtx`.
+/// For NN-anchored mu-refs the produced `MuRef::theta_name` is the
+/// structured `"<NN_NAME>.<OUTPUT_NAME>"` form. Downstream consumers that
+/// only know about plain thetas (e.g. `compute_mu_k`) silently skip these
+/// entries because the structured name doesn't appear in `theta_names`;
+/// the full DCM-aware AD inner-loop fast path is planned for Phase A M2.
 fn detect_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
     eta_names: &[String],
+    nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
     let mut result = HashMap::new();
     for s in stmts {
         if let Statement::Assign(_, expr) = s {
-            if let Some((eta_idx, theta_idx, log_transformed)) = detect_pattern(expr) {
-                if eta_idx < eta_names.len() && theta_idx < theta_names.len() {
-                    result.insert(
-                        eta_names[eta_idx].clone(),
-                        MuRef {
-                            theta_name: theta_names[theta_idx].clone(),
-                            log_transformed,
-                        },
-                    );
+            if let Some((eta_idx, anchor, log_transformed)) = detect_pattern(expr) {
+                if eta_idx >= eta_names.len() {
+                    continue;
                 }
+                let name = match anchor {
+                    MuRefAnchor::Theta(ti) => {
+                        if ti >= theta_names.len() {
+                            continue;
+                        }
+                        theta_names[ti].clone()
+                    }
+                    MuRefAnchor::NnOutput { nn_idx, output_idx } => {
+                        // Defensive: indices should be valid by construction
+                        // (parse_atom built them against the same nn_specs),
+                        // but skip silently rather than panic if anything's
+                        // out of sync.
+                        let Some((nn_name, outputs)) = nn_specs.get(nn_idx) else {
+                            continue;
+                        };
+                        let Some(out_name) = outputs.get(output_idx) else {
+                            continue;
+                        };
+                        format!("{nn_name}.{out_name}")
+                    }
+                };
+                result.insert(
+                    eta_names[eta_idx].clone(),
+                    MuRef {
+                        theta_name: name,
+                        log_transformed,
+                    },
+                );
             }
         }
     }
@@ -324,9 +411,15 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
         }
     }
 
-    // TVCL * exp(ETA), exp(log(THETA) + ETA), TVCL + ETA
-    if let Some((ei, ti, log_transformed)) = detect_pattern(expr) {
-        if ti < n_theta {
+    // TVCL * exp(ETA), exp(log(THETA) + ETA), TVCL + ETA, TYPICAL_PK.CL * exp(ETA).
+    // NN-anchored variants are still classified as Lognormal/Additive — the
+    // eta's *statistical* shape is the same; only the anchor differs.
+    if let Some((ei, anchor, log_transformed)) = detect_pattern(expr) {
+        let valid = match anchor {
+            MuRefAnchor::Theta(ti) => ti < n_theta,
+            MuRefAnchor::NnOutput { .. } => true,
+        };
+        if valid {
             let pt = if log_transformed {
                 EtaParamType::LogNormal
             } else {
@@ -961,10 +1054,29 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         if !is_ode {
             let stmts_for_tv = indiv_stmts.clone();
             let var_names_for_tv = indiv_var_names.clone();
+            #[cfg(feature = "nn")]
+            let tv_covariate_nns: Vec<crate::nn::CovariateNn> = covariate_nns_for_closure.clone();
             Some(Box::new(
                 move |theta: &[f64], covariates: &HashMap<String, f64>| {
                     let zero_eta = vec![0.0; tv_eta_names.len()];
                     let mut vars: HashMap<String, f64> = HashMap::new();
+                    // Pre-compute each NN's forward output once per call so
+                    // `TYPICAL_PK.CL`-style references inside the eta=0
+                    // expression evaluate consistently and share the work.
+                    #[cfg(feature = "nn")]
+                    let nn_outputs: Vec<Vec<f64>> = tv_covariate_nns
+                        .iter()
+                        .map(|nn| {
+                            use crate::nn::CovariateMapper;
+                            let n_w = nn.mapper.n_weights();
+                            let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
+                            nn.mapper
+                                .forward_raw(weights, covariates)
+                                .unwrap_or_else(|_| vec![0.0; nn.mapper.n_outputs()])
+                        })
+                        .collect();
+                    #[cfg(not(feature = "nn"))]
+                    let nn_outputs: Vec<Vec<f64>> = Vec::new();
                     eval_statements(
                         &stmts_for_tv,
                         theta,
@@ -973,6 +1085,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                         &mut vars,
                         None,
                         None,
+                        &nn_outputs,
                     );
                     var_names_for_tv
                         .iter()
@@ -992,7 +1105,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .chain(kappa_names.iter())
         .cloned()
         .collect();
-    let all_mu_refs = detect_mu_refs(&indiv_stmts, &theta_names, &all_eta_names);
+    let all_mu_refs =
+        detect_mu_refs(&indiv_stmts, &theta_names, &all_eta_names, &nn_specs_for_ctx);
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
     let mu_refs: HashMap<String, MuRef> = all_mu_refs
         .iter()
@@ -1926,6 +2040,11 @@ fn build_ode_spec(
             let empty_theta: [f64; 0] = [];
             let empty_eta: [f64; 0] = [];
             let empty_cov: HashMap<String, f64> = HashMap::new();
+            // ODE RHS evaluation runs with empty theta/eta/covariates here —
+            // values are injected later via the `vars` map (state names, indiv
+            // params). NN outputs aren't relevant: `[covariate_nn]` outputs are
+            // routed via `pk_param_fn`, not the ODE RHS.
+            let empty_nn_outputs: Vec<Vec<f64>> = Vec::new();
             eval_statements(
                 &stmts_owned,
                 &empty_theta,
@@ -1934,6 +2053,7 @@ fn build_ode_spec(
                 &mut vars,
                 Some(du),
                 Some(&state_index),
+                &empty_nn_outputs,
             );
         });
 
@@ -2846,6 +2966,7 @@ fn eval_expression(
     eta: &[f64],
     covariates: &HashMap<String, f64>,
     vars: &HashMap<String, f64>,
+    nn_outputs: &[Vec<f64>],
 ) -> f64 {
     match expr {
         Expression::Literal(v) => *v,
@@ -2861,8 +2982,8 @@ fn eval_expression(
             0.0
         }
         Expression::BinOp(lhs, op, rhs) => {
-            let l = eval_expression(lhs, theta, eta, covariates, vars);
-            let r = eval_expression(rhs, theta, eta, covariates, vars);
+            let l = eval_expression(lhs, theta, eta, covariates, vars, nn_outputs);
+            let r = eval_expression(rhs, theta, eta, covariates, vars, nn_outputs);
             match op {
                 BinOp::Add => l + r,
                 BinOp::Sub => l - r,
@@ -2877,7 +2998,7 @@ fn eval_expression(
             }
         }
         Expression::UnaryFn(name, arg) => {
-            let v = eval_expression(arg, theta, eta, covariates, vars);
+            let v = eval_expression(arg, theta, eta, covariates, vars, nn_outputs);
             match name.as_str() {
                 "exp" => v.exp(),
                 "log" | "ln" => v.max(1e-30).ln(),
@@ -2900,29 +3021,34 @@ fn eval_expression(
             }
         }
         Expression::Power(base, exp) => {
-            let b = eval_expression(base, theta, eta, covariates, vars);
-            let e = eval_expression(exp, theta, eta, covariates, vars);
+            let b = eval_expression(base, theta, eta, covariates, vars, nn_outputs);
+            let e = eval_expression(exp, theta, eta, covariates, vars, nn_outputs);
             b.powf(e)
         }
         Expression::Conditional(cond, t, e) => {
-            if eval_condition(cond, theta, eta, covariates, vars) {
-                eval_expression(t, theta, eta, covariates, vars)
+            if eval_condition(cond, theta, eta, covariates, vars, nn_outputs) {
+                eval_expression(t, theta, eta, covariates, vars, nn_outputs)
             } else {
-                eval_expression(e, theta, eta, covariates, vars)
+                eval_expression(e, theta, eta, covariates, vars, nn_outputs)
             }
         }
-        Expression::NnOutput { .. } => {
-            // The HashMap-keyed (unindexed) evaluator is used only by callers
-            // that pre-date the `[covariate_nn]` feature (tv_fn, the simulation
-            // expression evaluator). NN dispatch happens exclusively in the
-            // indexed path. Reaching this branch from a NN-bearing model is a
-            // bug to fix in a subsequent PR (Phase A M2: tv_fn parity).
-            debug_assert!(
-                false,
-                "Expression::NnOutput reached unindexed eval_expression; tv_fn / simulation \
-                 paths do not yet support [covariate_nn] (Phase A M2 work)"
-            );
-            0.0
+        Expression::NnOutput { nn_idx, output_idx } => {
+            // Same per-call cache as the indexed evaluator. Callers
+            // populate `nn_outputs` from `NamedMlpMapper::forward_raw`
+            // (see the `tv_fn` closure for the eta=0 path). Out-of-bounds
+            // indices return 0.0 with a debug-assert so a logic bug
+            // surfaces in tests but doesn't crash release builds.
+            nn_outputs
+                .get(*nn_idx)
+                .and_then(|v| v.get(*output_idx))
+                .copied()
+                .unwrap_or_else(|| {
+                    debug_assert!(
+                        false,
+                        "NnOutput nn_idx={nn_idx} output_idx={output_idx} out of bounds in unindexed eval"
+                    );
+                    0.0
+                })
         }
     }
 }
@@ -2933,11 +3059,12 @@ fn eval_condition(
     eta: &[f64],
     covariates: &HashMap<String, f64>,
     vars: &HashMap<String, f64>,
+    nn_outputs: &[Vec<f64>],
 ) -> bool {
     match cond {
         Condition::Compare(l, op, r) => {
-            let lv = eval_expression(l, theta, eta, covariates, vars);
-            let rv = eval_expression(r, theta, eta, covariates, vars);
+            let lv = eval_expression(l, theta, eta, covariates, vars, nn_outputs);
+            let rv = eval_expression(r, theta, eta, covariates, vars, nn_outputs);
             match op {
                 CmpOp::Lt => lv < rv,
                 CmpOp::Le => lv <= rv,
@@ -2948,14 +3075,14 @@ fn eval_condition(
             }
         }
         Condition::And(l, r) => {
-            eval_condition(l, theta, eta, covariates, vars)
-                && eval_condition(r, theta, eta, covariates, vars)
+            eval_condition(l, theta, eta, covariates, vars, nn_outputs)
+                && eval_condition(r, theta, eta, covariates, vars, nn_outputs)
         }
         Condition::Or(l, r) => {
-            eval_condition(l, theta, eta, covariates, vars)
-                || eval_condition(r, theta, eta, covariates, vars)
+            eval_condition(l, theta, eta, covariates, vars, nn_outputs)
+                || eval_condition(r, theta, eta, covariates, vars, nn_outputs)
         }
-        Condition::Not(c) => !eval_condition(c, theta, eta, covariates, vars),
+        Condition::Not(c) => !eval_condition(c, theta, eta, covariates, vars, nn_outputs),
     }
 }
 
@@ -3243,6 +3370,7 @@ fn eval_statements(
     vars: &mut HashMap<String, f64>,
     du: Option<&mut [f64]>,
     state_index: Option<&HashMap<String, usize>>,
+    nn_outputs: &[Vec<f64>],
 ) {
     // The `du` borrow has to be re-passed into each recursive sub-block, so
     // shuttle it through an Option that we re-grab on each iteration.
@@ -3250,7 +3378,7 @@ fn eval_statements(
     for s in stmts {
         match s {
             Statement::Assign(name, expr) => {
-                let v = eval_expression(expr, theta, eta, covariates, vars);
+                let v = eval_expression(expr, theta, eta, covariates, vars, nn_outputs);
                 vars.insert(name.clone(), v);
             }
             Statement::AssignIdx(_, _) => {
@@ -3261,7 +3389,7 @@ fn eval_statements(
                 // silently skip if they do (defensive).
             }
             Statement::DiffEq(name, expr) => {
-                let v = eval_expression(expr, theta, eta, covariates, vars);
+                let v = eval_expression(expr, theta, eta, covariates, vars, nn_outputs);
                 let idx = state_index
                     .and_then(|m| m.get(name).copied())
                     .expect("DiffEq encountered without state_index — internal error");
@@ -3275,7 +3403,7 @@ fn eval_statements(
             } => {
                 let mut taken = false;
                 for (cond, body) in branches {
-                    if eval_condition(cond, theta, eta, covariates, vars) {
+                    if eval_condition(cond, theta, eta, covariates, vars, nn_outputs) {
                         eval_statements(
                             body,
                             theta,
@@ -3284,6 +3412,7 @@ fn eval_statements(
                             vars,
                             du_opt.as_deref_mut(),
                             state_index,
+                            nn_outputs,
                         );
                         taken = true;
                         break;
@@ -3299,6 +3428,7 @@ fn eval_statements(
                             vars,
                             du_opt.as_deref_mut(),
                             state_index,
+                            nn_outputs,
                         );
                     }
                 }
@@ -4553,7 +4683,7 @@ mod tests {
         let en: Vec<String> = eta_names.iter().map(|s| s.to_string()).collect();
         let ctx = ParseCtx::new(&tn, &en, &[]);
         let stmts = parse_block_statements(line, ctx, StatementMode::Plain).ok()?;
-        let refs = detect_mu_refs(&stmts, &tn, &en);
+        let refs = detect_mu_refs(&stmts, &tn, &en, &[]);
         // Return the one detected mu-ref (if any). Tests assume a single line.
         refs.into_iter().next().map(|(_, v)| v)
     }
@@ -4668,7 +4798,7 @@ mod tests {
         ];
         let ctx = ParseCtx::new(&tn, &en, &[]);
         let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
-        let refs = detect_mu_refs(&stmts, &tn, &en);
+        let refs = detect_mu_refs(&stmts, &tn, &en, &[]);
         assert_eq!(refs.len(), 3);
         assert_eq!(refs["ETA_CL"].theta_name, "TVCL");
         assert_eq!(refs["ETA_V"].theta_name, "TVV");
@@ -5462,7 +5592,7 @@ mod tests {
         let theta = vec![5.0];
         let mut covs = HashMap::new();
         covs.insert("WT".to_string(), 80.0);
-        eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None);
+        eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None, &[]);
         assert!(
             (vars["CL"] - 6.0).abs() < 1e-12,
             "CL should pick the then-branch"
@@ -5470,7 +5600,7 @@ mod tests {
 
         covs.insert("WT".to_string(), 60.0);
         let mut vars2 = HashMap::new();
-        eval_statements(&stmts, &theta, &[], &covs, &mut vars2, None, None);
+        eval_statements(&stmts, &theta, &[], &covs, &mut vars2, None, None, &[]);
         assert!(
             (vars2["CL"] - 5.0).abs() < 1e-12,
             "CL should pick the else-branch"
@@ -5496,7 +5626,7 @@ if (WT > 70) {
             let mut covs = HashMap::new();
             covs.insert("WT".to_string(), wt);
             let mut vars = HashMap::new();
-            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None);
+            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None, &[]);
             assert!(
                 (vars["CL"] - expected).abs() < 1e-12,
                 "WT={} → expected CL={}",
@@ -5527,7 +5657,7 @@ if (X < 10) {
             let mut covs = HashMap::new();
             covs.insert("X".to_string(), x);
             let mut vars = HashMap::new();
-            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None);
+            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None, &[]);
             assert!(
                 (vars["CL"] - expected).abs() < 1e-12,
                 "X={x} should pick branch giving CL={expected}, got {}",
@@ -5556,7 +5686,7 @@ if (X < 10) {
             covs.insert("WT".to_string(), wt);
             covs.insert("AGE".to_string(), age);
             let mut vars = HashMap::new();
-            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None);
+            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None, &[]);
             assert!(
                 (vars["CL"] - expected).abs() < 1e-12,
                 "sex={sex} wt={wt} age={age} expected CL={expected}, got {}",
@@ -6829,5 +6959,96 @@ if (1 > 0) {
   DV ~ additive(ADD)
 "#;
         assert!(parse_model_string(src).is_err());
+    }
+
+    // ─── Fix 1 + fix 2: NN-anchored mu-ref detection + tv_fn parity ─────
+
+    /// Fix 1: `TYPICAL_PK.CL * exp(ETA_CL)` should be recognised as a
+    /// lognormal mu-ref, with `MuRef.theta_name = "TYPICAL_PK.CL"` (the
+    /// structured form). Downstream consumers that only know about plain
+    /// thetas silently fall back to FD; the M2 AD-aware consumer is a
+    /// follow-up.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_detect_mu_refs_recognises_nn_anchored_lognormal() {
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("model parses");
+        let cl_ref = model
+            .mu_refs
+            .get("ETA_CL")
+            .expect("ETA_CL must be detected as mu-referenced");
+        assert_eq!(cl_ref.theta_name, "TYPICAL_PK.CL");
+        assert!(
+            cl_ref.log_transformed,
+            "TYPICAL_PK.CL * exp(ETA_CL) is lognormal"
+        );
+        let v_ref = model.mu_refs.get("ETA_V").expect("ETA_V mu-referenced");
+        assert_eq!(v_ref.theta_name, "TYPICAL_PK.V");
+        assert!(v_ref.log_transformed);
+    }
+
+    /// Fix 1 follow-on: `eta_param_info` still classifies NN-anchored
+    /// patterns as `LogNormal` — the eta's statistical shape is unchanged;
+    /// only the anchor differs.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_eta_param_info_classifies_nn_anchored_lognormal() {
+        use crate::types::EtaParamType;
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("model parses");
+        let cl = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .expect("ETA_CL classification present");
+        assert_eq!(cl.param_type, EtaParamType::LogNormal);
+        let v = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_V")
+            .expect("ETA_V classification present");
+        assert_eq!(v.param_type, EtaParamType::LogNormal);
+    }
+
+    /// Fix 2: `tv_fn` (the eta=0 typical-value closure) must produce the
+    /// same values as the NN forward pass. Previously the unindexed
+    /// evaluator returned 0.0 for `NnOutput`, so `tv_fn` would have
+    /// silently produced zero TVs for NN-bearing models — a footgun for
+    /// the AD fast path the M2 PR will lean on.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_tv_fn_dispatches_through_nn() {
+        use crate::nn::CovariateMapper;
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("model parses");
+        let theta = model.default_params.theta.clone();
+        let mut cov = HashMap::new();
+        cov.insert("WT".to_string(), 70.0);
+        cov.insert("CRCL".to_string(), 95.0);
+
+        let tv_fn = model.tv_fn.as_ref().expect("analytical model -> Some(tv_fn)");
+        let tvs = tv_fn(&theta, &cov);
+
+        // tv_fn returns values in `indiv_param_names` declaration order:
+        // CL, V, KA. At eta=0 the lognormal mu-ref `tv * exp(0)` collapses
+        // to tv, which equals the NN's raw output for CL and V.
+        let nn = &model.covariate_nns[0];
+        let weights = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+        let nn_outputs = nn.mapper.forward_raw(weights, &cov).unwrap();
+
+        assert!(
+            (tvs[0] - nn_outputs[0]).abs() < 1e-12,
+            "TV[CL] from tv_fn = {} vs NN output = {}",
+            tvs[0],
+            nn_outputs[0]
+        );
+        assert!(
+            (tvs[1] - nn_outputs[1]).abs() < 1e-12,
+            "TV[V] from tv_fn = {} vs NN output = {}",
+            tvs[1],
+            nn_outputs[1]
+        );
+        // KA = TVKA (plain theta path, unchanged).
+        assert!((tvs[2] - theta[0]).abs() < 1e-12);
     }
 }

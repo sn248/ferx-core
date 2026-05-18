@@ -107,6 +107,11 @@ fn assigned_vars_in_order(stmts: &[Statement]) -> Vec<String> {
                         out.push(name.clone());
                     }
                 }
+                Statement::AssignIdx(_, _) => {
+                    // Should never appear in the AST walked by this
+                    // helper — `resolve_variable_indices` is run only
+                    // after all name-collecting helpers have finished.
+                }
                 Statement::DiffEq(_, _) => {}
                 Statement::If {
                     branches,
@@ -162,6 +167,11 @@ fn extract_eta_indices_for_var(stmts: &[Statement], var_name: &str) -> Vec<usize
                             }
                         }
                     }
+                }
+                Statement::AssignIdx(_, _) => {
+                    // Indexed-form statements only appear in the
+                    // post-resolve AST owned by `pk_param_fn`; this
+                    // helper is called on the pre-resolve AST.
                 }
                 Statement::If {
                     branches,
@@ -1521,7 +1531,7 @@ fn build_ode_spec(
                         collect_diffeqs(eb, out);
                     }
                 }
-                Statement::Assign(_, _) => {}
+                Statement::Assign(_, _) | Statement::AssignIdx(_, _) => {}
             }
         }
     }
@@ -1548,7 +1558,7 @@ fn build_ode_spec(
                         check_duplicate_diffeqs(eb)?;
                     }
                 }
-                Statement::Assign(_, _) => {}
+                Statement::Assign(_, _) | Statement::AssignIdx(_, _) => {}
             }
         }
         Ok(())
@@ -2144,54 +2154,105 @@ fn build_pk_param_fn(
     let mut referenced_covariates: Vec<String> = cov_set.into_iter().collect();
     referenced_covariates.sort();
 
-    let pk_map: HashMap<String, String> = pk_param_map.clone();
-    let stmts_owned = stmts;
+    // Variable/covariate references switch from HashMap lookup to slot
+    // index. Top-level vars come first so the ODE positional mapping
+    // below stays valid; nested if-body vars get appended slots.
+    let mut all_var_names: Vec<String> = var_names.to_vec();
+    let nested_vars = assigned_vars_in_order(&stmts);
+    for n in &nested_vars {
+        if !all_var_names.iter().any(|m| m == n) {
+            all_var_names.push(n.clone());
+        }
+    }
+    let var_idx: HashMap<String, usize> = all_var_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    let cov_idx: HashMap<String, usize> = referenced_covariates
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    let n_vars = all_var_names.len();
+    let n_cov = referenced_covariates.len();
+    let mut stmts_resolved = stmts;
+    resolve_variable_indices(&mut stmts_resolved, &var_idx, &cov_idx);
+
+    let stmts_owned = stmts_resolved;
     let vars_in_order = var_names.to_vec();
+
+    // Pre-resolve pk_map → indexed (pk_slot, var_slot) pairs so the hot
+    // loop is two array reads instead of two HashMap probes.
+    let pk_assignment_mapping: Vec<(usize, usize)> = pk_param_map
+        .iter()
+        .filter_map(|(pk_name, var_name)| {
+            let pk_slot = PkParams::name_to_index(pk_name)?;
+            let var_slot = var_idx.get(var_name).copied().or_else(|| {
+                // Fall back to lowercase lookup — matches the previous
+                // `vars.get(var_name.to_lowercase())` compat behaviour.
+                var_idx.get(&var_name.to_lowercase()).copied()
+            })?;
+            Some((pk_slot, var_slot))
+        })
+        .collect();
+    let is_analytical_pk = !pk_param_map.is_empty();
+
+    // ODE branch counterpart of the same pre-resolution. Lagtime is
+    // handled separately because it can live outside the first
+    // MAX_PK_PARAMS positions.
+    let ode_positional_slots: Vec<usize> = vars_in_order
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, var_name)| {
+            if pos >= MAX_PK_PARAMS {
+                return None;
+            }
+            var_idx.get(var_name).copied().map(|s| s)
+        })
+        .collect();
+    let ode_lagtime_slot: Option<usize> = vars_in_order
+        .iter()
+        .find_map(|var_name| {
+            let upper = var_name.to_uppercase();
+            if upper == "LAGTIME" || upper == "ALAG" {
+                var_idx.get(var_name).copied()
+            } else {
+                None
+            }
+        });
+
+    let cov_names_for_lookup = referenced_covariates.clone();
 
     let pk_param_fn: PkParamFn = Box::new(
         move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-            let mut vars: HashMap<String, f64> = HashMap::new();
-            eval_statements(&stmts_owned, theta, eta, covariates, &mut vars, None, None);
+            // Materialise covariates into a Vec<f64> aligned with
+            // `referenced_covariates`. For the typical 3-5 covariates
+            // this is ~3-5 HashMap probes + one short alloc; cheaper
+            // than the 10-20 probes the previous unresolved AST was
+            // paying for both variables AND covariates.
+            let mut cov_vec = vec![0.0_f64; n_cov];
+            for (i, name) in cov_names_for_lookup.iter().enumerate() {
+                cov_vec[i] = covariates.get(name).copied().unwrap_or(0.0);
+            }
+            let mut vars = vec![0.0_f64; n_vars];
+            eval_statements_indexed(&stmts_owned, theta, eta, &cov_vec, &mut vars);
 
             let mut p = PkParams::default();
-
-            if pk_map.is_empty() {
-                // ODE model or no pk_param_map: store individual params by declaration order
-                for (i, var_name) in vars_in_order.iter().enumerate() {
-                    if i < MAX_PK_PARAMS {
-                        if let Some(&val) = vars.get(var_name) {
-                            p.values[i] = val;
-                        }
-                    }
-                }
-                // Lagtime is consumed by `ode_predictions` outside the user's
-                // RHS, so a LAGTIME/ALAG-named individual parameter must land
-                // at the canonical PK_IDX_LAGTIME slot regardless of its
-                // declaration position. Side-write here AFTER the sequential
-                // loop so this takes precedence over a positional value that
-                // happens to land on slot 8 (only relevant when the user has
-                // ≥9 individual parameters).
-                for var_name in vars_in_order.iter() {
-                    let upper = var_name.to_uppercase();
-                    if upper == "LAGTIME" || upper == "ALAG" {
-                        if let Some(&val) = vars.get(var_name) {
-                            p.values[PK_IDX_LAGTIME] = val;
-                        }
-                    }
+            if is_analytical_pk {
+                for &(pk_slot, var_slot) in &pk_assignment_mapping {
+                    p.values[pk_slot] = vars[var_slot];
                 }
             } else {
-                // Analytical model: map pk_param_name → value via pk_param_map
-                let mut named = HashMap::new();
-                for (pk_name, var_name) in &pk_map {
-                    if let Some(&val) = vars.get(var_name) {
-                        named.insert(pk_name.clone(), val);
-                    } else if let Some(&val) = vars.get(&var_name.to_lowercase()) {
-                        named.insert(pk_name.clone(), val);
-                    }
+                // ODE model: store individual params by declaration order.
+                for (pos, &var_slot) in ode_positional_slots.iter().enumerate() {
+                    p.values[pos] = vars[var_slot];
                 }
-                p = PkParams::from_hashmap(&named);
+                // Lagtime side-write (see original commentary).
+                if let Some(lag_slot) = ode_lagtime_slot {
+                    p.values[PK_IDX_LAGTIME] = vars[lag_slot];
+                }
             }
-
             p
         },
     );
@@ -2207,6 +2268,17 @@ enum Expression {
     Eta(usize),
     Covariate(String),
     Variable(String),
+    /// Same as `Variable(name)` but pre-resolved to a slot index. Produced
+    /// by `resolve_variable_indices` for the `pk_param_fn` AST so the hot
+    /// path doesn't pay HashMap-lookup overhead on every eval. `usize::MAX`
+    /// is reserved for "unresolved" (defensive — eval treats it as 0.0).
+    VariableIdx(usize),
+    /// Same as `Covariate(name)` but pre-resolved to an index into a Vec
+    /// aligned with `CompiledModel.referenced_covariates`. Built by
+    /// `resolve_variable_indices`; the matching Vec is materialised once
+    /// per call inside the `pk_param_fn` closure (`build_pk_param_fn`),
+    /// reading from the caller-supplied covariate HashMap.
+    CovariateIdx(usize),
     BinOp(Box<Expression>, BinOp, Box<Expression>),
     UnaryFn(String, Box<Expression>),
     Power(Box<Expression>, Box<Expression>),
@@ -2245,6 +2317,9 @@ enum Condition {
 #[derive(Debug, Clone)]
 enum Statement {
     Assign(String, Expression),
+    /// Same as `Assign(name, expr)` but pre-resolved to a slot index for
+    /// the `pk_param_fn` hot path. See `Expression::VariableIdx`.
+    AssignIdx(usize, Expression),
     /// `d/dt(NAME) = expr` — only legal in `[odes]` blocks.
     DiffEq(String, Expression),
     /// One or more `if (cond) { ... }` arms followed by an optional `else { ... }`.
@@ -2335,7 +2410,9 @@ fn collect_covariates_in_condition(cond: &Condition, out: &mut std::collections:
 fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
     for s in stmts {
         match s {
-            Statement::Assign(_, e) | Statement::DiffEq(_, e) => collect_covariates(e, out),
+            Statement::Assign(_, e)
+            | Statement::AssignIdx(_, e)
+            | Statement::DiffEq(_, e) => collect_covariates(e, out),
             Statement::If {
                 branches,
                 else_body,
@@ -2365,6 +2442,10 @@ fn eval_expression(
         Expression::Eta(i) => eta[*i],
         Expression::Covariate(name) => covariates.get(name).copied().unwrap_or(0.0),
         Expression::Variable(name) => vars.get(name).copied().unwrap_or(0.0),
+        Expression::VariableIdx(_) | Expression::CovariateIdx(_) => {
+            debug_assert!(false, "indexed expression reached unindexed eval_expression");
+            0.0
+        }
         Expression::BinOp(lhs, op, rhs) => {
             let l = eval_expression(lhs, theta, eta, covariates, vars);
             let r = eval_expression(rhs, theta, eta, covariates, vars);
@@ -2451,6 +2532,257 @@ fn eval_condition(
     }
 }
 
+/// Indexed-form evaluator: `vars` is a `Vec<f64>` indexed by parse-time
+/// variable slot; `covariates` is a `Vec<f64>` aligned to
+/// `CompiledModel.referenced_covariates`. Hot-path replacement for the
+/// HashMap-keyed `eval_expression` — eliminates the per-call string hash
+/// + probe in the `pk_param_fn` closure. Falls back to 0.0 for the
+/// HashMap-keyed variants (Variable/Covariate) since callers running
+/// the indexed path have already resolved every name.
+fn eval_expression_indexed(
+    expr: &Expression,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &[f64],
+    vars: &[f64],
+) -> f64 {
+    match expr {
+        Expression::Literal(v) => *v,
+        Expression::Theta(i) => theta[*i],
+        Expression::Eta(i) => eta[*i],
+        Expression::VariableIdx(i) => vars.get(*i).copied().unwrap_or(0.0),
+        Expression::CovariateIdx(i) => covariates.get(*i).copied().unwrap_or(0.0),
+        Expression::Covariate(_) | Expression::Variable(_) => {
+            debug_assert!(false, "unresolved name reached eval_expression_indexed");
+            0.0
+        }
+        Expression::BinOp(lhs, op, rhs) => {
+            let l = eval_expression_indexed(lhs, theta, eta, covariates, vars);
+            let r = eval_expression_indexed(rhs, theta, eta, covariates, vars);
+            match op {
+                BinOp::Add => l + r,
+                BinOp::Sub => l - r,
+                BinOp::Mul => l * r,
+                BinOp::Div => {
+                    if r.abs() < 1e-30 {
+                        0.0
+                    } else {
+                        l / r
+                    }
+                }
+            }
+        }
+        Expression::UnaryFn(name, arg) => {
+            let v = eval_expression_indexed(arg, theta, eta, covariates, vars);
+            match name.as_str() {
+                "exp" => v.exp(),
+                "log" | "ln" => v.max(1e-30).ln(),
+                "sqrt" => v.max(0.0).sqrt(),
+                "abs" => v.abs(),
+                "inv_logit" | "expit" => {
+                    if v >= 0.0 {
+                        1.0 / (1.0 + (-v).exp())
+                    } else {
+                        let e = v.exp();
+                        e / (1.0 + e)
+                    }
+                }
+                "logit" => {
+                    let clamped = v.clamp(1e-15, 1.0 - 1e-15);
+                    (clamped / (1.0 - clamped)).ln()
+                }
+                _ => v,
+            }
+        }
+        Expression::Power(base, exp) => {
+            let b = eval_expression_indexed(base, theta, eta, covariates, vars);
+            let e = eval_expression_indexed(exp, theta, eta, covariates, vars);
+            b.powf(e)
+        }
+        Expression::Conditional(cond, t, e) => {
+            if eval_condition_indexed(cond, theta, eta, covariates, vars) {
+                eval_expression_indexed(t, theta, eta, covariates, vars)
+            } else {
+                eval_expression_indexed(e, theta, eta, covariates, vars)
+            }
+        }
+    }
+}
+
+fn eval_condition_indexed(
+    cond: &Condition,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &[f64],
+    vars: &[f64],
+) -> bool {
+    match cond {
+        Condition::Compare(l, op, r) => {
+            let lv = eval_expression_indexed(l, theta, eta, covariates, vars);
+            let rv = eval_expression_indexed(r, theta, eta, covariates, vars);
+            match op {
+                CmpOp::Lt => lv < rv,
+                CmpOp::Le => lv <= rv,
+                CmpOp::Gt => lv > rv,
+                CmpOp::Ge => lv >= rv,
+                CmpOp::Eq => lv == rv,
+                CmpOp::Ne => lv != rv,
+            }
+        }
+        Condition::And(l, r) => {
+            eval_condition_indexed(l, theta, eta, covariates, vars)
+                && eval_condition_indexed(r, theta, eta, covariates, vars)
+        }
+        Condition::Or(l, r) => {
+            eval_condition_indexed(l, theta, eta, covariates, vars)
+                || eval_condition_indexed(r, theta, eta, covariates, vars)
+        }
+        Condition::Not(c) => !eval_condition_indexed(c, theta, eta, covariates, vars),
+    }
+}
+
+/// Indexed-form statement executor; mirror of `eval_statements`. Only
+/// handles `AssignIdx` + `If`; if any non-indexed variant slips through,
+/// it falls back to a no-op (defensive — caller should ensure the AST
+/// was resolved). `DiffEq` is not supported here because the indexed
+/// path is only used by `pk_param_fn` (no derivatives).
+fn eval_statements_indexed(
+    stmts: &[Statement],
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &[f64],
+    vars: &mut [f64],
+) {
+    for s in stmts {
+        match s {
+            Statement::AssignIdx(idx, expr) => {
+                let v = eval_expression_indexed(expr, theta, eta, covariates, vars);
+                if let Some(slot) = vars.get_mut(*idx) {
+                    *slot = v;
+                }
+            }
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                let mut taken = false;
+                for (cond, body) in branches {
+                    if eval_condition_indexed(cond, theta, eta, covariates, vars) {
+                        eval_statements_indexed(body, theta, eta, covariates, vars);
+                        taken = true;
+                        break;
+                    }
+                }
+                if !taken {
+                    if let Some(eb) = else_body {
+                        eval_statements_indexed(eb, theta, eta, covariates, vars);
+                    }
+                }
+            }
+            // Non-indexed Assign/DiffEq shouldn't appear in a resolved AST
+            // for `pk_param_fn`. Silently skip.
+            Statement::Assign(_, _) | Statement::DiffEq(_, _) => {}
+        }
+    }
+}
+
+/// Walk the AST in `stmts` and replace every `Statement::Assign(name, e)`
+/// with `Statement::AssignIdx(idx, e)`, every `Expression::Variable(name)`
+/// with `Expression::VariableIdx(idx)`, and every `Expression::Covariate(name)`
+/// with `Expression::CovariateIdx(idx)`. Indices come from `var_idx` and
+/// `cov_idx`. Variables not in `var_idx` get `usize::MAX` (eval returns 0.0).
+///
+/// Used by `build_pk_param_fn` so the hot-loop closure can run on
+/// `Vec<f64>` slots instead of paying per-call HashMap-lookup overhead.
+fn resolve_variable_indices(
+    stmts: &mut [Statement],
+    var_idx: &HashMap<String, usize>,
+    cov_idx: &HashMap<String, usize>,
+) {
+    for s in stmts.iter_mut() {
+        match s {
+            Statement::Assign(name, expr) => {
+                resolve_expr_indices(expr, var_idx, cov_idx);
+                let i = var_idx.get(name).copied().unwrap_or(usize::MAX);
+                let taken_expr = std::mem::replace(expr, Expression::Literal(0.0));
+                *s = Statement::AssignIdx(i, taken_expr);
+            }
+            Statement::AssignIdx(_, expr) => {
+                resolve_expr_indices(expr, var_idx, cov_idx);
+            }
+            Statement::DiffEq(_, expr) => {
+                resolve_expr_indices(expr, var_idx, cov_idx);
+            }
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (cond, body) in branches.iter_mut() {
+                    resolve_condition_indices(cond, var_idx, cov_idx);
+                    resolve_variable_indices(body, var_idx, cov_idx);
+                }
+                if let Some(eb) = else_body {
+                    resolve_variable_indices(eb, var_idx, cov_idx);
+                }
+            }
+        }
+    }
+}
+
+fn resolve_expr_indices(
+    expr: &mut Expression,
+    var_idx: &HashMap<String, usize>,
+    cov_idx: &HashMap<String, usize>,
+) {
+    match expr {
+        Expression::Variable(name) => {
+            let i = var_idx.get(name).copied().unwrap_or(usize::MAX);
+            *expr = Expression::VariableIdx(i);
+        }
+        Expression::Covariate(name) => {
+            let i = cov_idx.get(name).copied().unwrap_or(usize::MAX);
+            *expr = Expression::CovariateIdx(i);
+        }
+        Expression::BinOp(l, _, r) => {
+            resolve_expr_indices(l, var_idx, cov_idx);
+            resolve_expr_indices(r, var_idx, cov_idx);
+        }
+        Expression::UnaryFn(_, a) => resolve_expr_indices(a, var_idx, cov_idx),
+        Expression::Power(b, e) => {
+            resolve_expr_indices(b, var_idx, cov_idx);
+            resolve_expr_indices(e, var_idx, cov_idx);
+        }
+        Expression::Conditional(cond, t, e) => {
+            resolve_condition_indices(cond, var_idx, cov_idx);
+            resolve_expr_indices(t, var_idx, cov_idx);
+            resolve_expr_indices(e, var_idx, cov_idx);
+        }
+        Expression::Literal(_)
+        | Expression::Theta(_)
+        | Expression::Eta(_)
+        | Expression::VariableIdx(_)
+        | Expression::CovariateIdx(_) => {}
+    }
+}
+
+fn resolve_condition_indices(
+    cond: &mut Condition,
+    var_idx: &HashMap<String, usize>,
+    cov_idx: &HashMap<String, usize>,
+) {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            resolve_expr_indices(l, var_idx, cov_idx);
+            resolve_expr_indices(r, var_idx, cov_idx);
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            resolve_condition_indices(l, var_idx, cov_idx);
+            resolve_condition_indices(r, var_idx, cov_idx);
+        }
+        Condition::Not(c) => resolve_condition_indices(c, var_idx, cov_idx),
+    }
+}
+
 /// Execute a list of statements, mutating `vars` with each assignment. ODE
 /// `DiffEq` statements write into the optional `du` slice using the
 /// `state_index` lookup. For `[individual_parameters]` callers, pass `None`
@@ -2472,6 +2804,13 @@ fn eval_statements(
             Statement::Assign(name, expr) => {
                 let v = eval_expression(expr, theta, eta, covariates, vars);
                 vars.insert(name.clone(), v);
+            }
+            Statement::AssignIdx(_, _) => {
+                // Indexed-form statements are only produced by
+                // `resolve_variable_indices` for the `pk_param_fn`
+                // closure, which uses `eval_statements_indexed`
+                // exclusively. They should never reach this evaluator;
+                // silently skip if they do (defensive).
             }
             Statement::DiffEq(name, expr) => {
                 let v = eval_expression(expr, theta, eta, covariates, vars);
@@ -4273,11 +4612,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_optimizer_defaults_to_bobyqa() {
+    fn test_parse_optimizer_defaults_to_slsqp() {
         // No [fit_options] block → default optimizer.
         let content = minimal_model_with_fit_options("  maxiter = 100");
         let parsed = parse_full_model(&content).unwrap();
-        assert_eq!(parsed.fit_options.optimizer, Optimizer::Bobyqa);
+        assert_eq!(parsed.fit_options.optimizer, Optimizer::Slsqp);
     }
 
     #[test]
@@ -4308,10 +4647,10 @@ mod tests {
     #[test]
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
-        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-4,
+        //   optimizer = slsqp, inner_maxiter = 200, inner_tol = 1e-4,
         //   steihaug_max_iters = 50.
         let opts = FitOptions::default();
-        assert_eq!(opts.optimizer, Optimizer::Bobyqa);
+        assert_eq!(opts.optimizer, Optimizer::Slsqp);
         assert_eq!(opts.inner_maxiter, 200);
         assert!((opts.inner_tol - 1e-4).abs() < 1e-20);
         assert_eq!(opts.steihaug_max_iters, 50);
@@ -5038,7 +5377,7 @@ if (1 > 0) {
                                 check(eb)?;
                             }
                         }
-                        Statement::Assign(_, _) => {}
+                        Statement::Assign(_, _) | Statement::AssignIdx(_, _) => {}
                     }
                 }
                 Ok(())

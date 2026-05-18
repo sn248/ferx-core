@@ -242,6 +242,58 @@ impl Population {
     pub fn n_obs(&self) -> usize {
         self.subjects.iter().map(|s| s.observations.len()).sum()
     }
+
+    /// Drop per-event covariate snapshots that don't carry any
+    /// variation in covariates the model actually references.
+    ///
+    /// The data reader populates `dose_covariates` / `obs_covariates` /
+    /// `pk_only_covariates` whenever *any* non-standard CSV column
+    /// varies within a subject — including pure time-tracker columns
+    /// like `DAY` or `STIME` that no model expression touches. The
+    /// downstream prediction path then takes the heavy event-driven
+    /// route (one `pk_param_fn` call per event, plus state propagation
+    /// across each interval) instead of the analytical superposition
+    /// fast path that runs `pk_param_fn` once per subject. This pre-fit
+    /// pass clears the snapshots for any subject whose model-referenced
+    /// covariates are all time-constant, so the existing
+    /// `has_tv_covariates()`-based dispatcher routes those subjects
+    /// through the fast path automatically.
+    ///
+    /// Returns the number of subjects whose snapshots were cleared
+    /// (for diagnostic / warning purposes).
+    pub fn prune_irrelevant_tv_covariates(&mut self, referenced: &[String]) -> usize {
+        let mut pruned = 0;
+        for subj in &mut self.subjects {
+            if subj.dose_covariates.is_empty()
+                && subj.obs_covariates.is_empty()
+                && subj.pk_only_covariates.is_empty()
+            {
+                continue; // already on the fast path
+            }
+            let mut any_relevant_tv = false;
+            'covs: for cov in referenced {
+                let base = subj.covariates.get(cov).copied();
+                for snap in subj
+                    .dose_covariates
+                    .iter()
+                    .chain(subj.obs_covariates.iter())
+                    .chain(subj.pk_only_covariates.iter())
+                {
+                    if snap.get(cov).copied() != base {
+                        any_relevant_tv = true;
+                        break 'covs;
+                    }
+                }
+            }
+            if !any_relevant_tv {
+                subj.dose_covariates.clear();
+                subj.obs_covariates.clear();
+                subj.pk_only_covariates.clear();
+                pruned += 1;
+            }
+        }
+        pruned
+    }
 }
 
 /// Between-subject variability matrix (Omega)
@@ -258,6 +310,12 @@ pub struct OmegaMatrix {
     /// Used by the SAEM M-step to zero sampling correlations that bleed into
     /// structurally-absent entries via `(1/N) Σ ηη^T`.
     pub free_mask: DMatrix<bool>,
+    /// Pre-computed Ω⁻¹. Cached at construction so per-call code paths
+    /// (`individual_nll_into`, SAEM MH proposals) don't have to clone the
+    /// matrix, run Cholesky, and invert on every evaluation.
+    pub inv: DMatrix<f64>,
+    /// Pre-computed `log|Ω| = 2·Σᵢ log(L_ii)`. Same motivation as `inv`.
+    pub log_det: f64,
 }
 
 impl OmegaMatrix {
@@ -268,22 +326,48 @@ impl OmegaMatrix {
         free_mask: DMatrix<bool>,
     ) -> Self {
         let n = m.nrows();
-        let chol = match m.clone().cholesky() {
-            Some(c) => c.l(),
+        // If the input matrix is PD we use it as-is. If Cholesky fails we
+        // regularise (eigenvalue floor) and switch to the regularised
+        // matrix from here on, so `matrix`, `chol`, `inv`, and `log_det`
+        // all describe the *same* matrix downstream — otherwise the
+        // FOCE inner loop's eta_prior (read from `matrix`) would be
+        // inconsistent with the cached `inv` (computed from `m_reg`).
+        let (matrix, chol, inv) = match m.clone().cholesky() {
+            Some(c) => (m, c.l(), c.inverse()),
             None => {
                 let eig = m.clone().symmetric_eigen();
                 let min_eig = eig.eigenvalues.min();
                 let reg = if min_eig < 0.0 { -min_eig + 1e-8 } else { 1e-8 };
                 let m_reg = &m + DMatrix::identity(n, n) * reg;
-                m_reg.cholesky().expect("Regularized matrix must be PD").l()
+                let c = m_reg
+                    .clone()
+                    .cholesky()
+                    .expect("Regularized matrix must be PD");
+                (m_reg, c.l(), c.inverse())
             }
         };
+        // log|Ω| = 2·Σᵢ log(L_ii). Negative or zero diagonals shouldn't
+        // happen post-regularisation but we fall back to f64::INFINITY so
+        // downstream NLL code can short-circuit cleanly instead of NaNing.
+        let mut log_det = 0.0;
+        for i in 0..n {
+            let lii = chol[(i, i)];
+            if lii > 0.0 {
+                log_det += lii.ln();
+            } else {
+                log_det = f64::INFINITY;
+                break;
+            }
+        }
+        log_det *= 2.0;
         Self {
-            matrix: m,
+            matrix,
             chol,
             eta_names: names,
             diagonal,
             free_mask,
+            inv,
+            log_det,
         }
     }
 
@@ -315,6 +399,57 @@ impl OmegaMatrix {
             m[(i, i)] = variances[i];
         }
         Self::from_matrix(m, names, true)
+    }
+
+    /// Construct from a known lower-Cholesky factor `L` such that Ω = L Lᵀ.
+    /// Avoids the Cholesky factorisation that `from_matrix*` runs, which the
+    /// SAEM/FOCEI hot paths hit on every NLopt M-step and every outer
+    /// iteration via `unpack_params`. Ω⁻¹ is computed from `L` directly:
+    /// Ω⁻¹ = L⁻ᵀ L⁻¹, where L⁻¹ comes from one lower-triangular solve
+    /// against the identity.
+    pub fn from_chol_factor(
+        l: DMatrix<f64>,
+        names: Vec<String>,
+        diagonal: bool,
+        free_mask: DMatrix<bool>,
+    ) -> Self {
+        let n = l.nrows();
+        let matrix = &l * l.transpose();
+        // L⁻¹ via lower-triangular solve: L · X = I ⇒ X = L⁻¹.
+        // `solve_lower_triangular(&I)` returns Some(_) iff L is non-singular;
+        // L Lᵀ is PD by construction so a positive-diagonal L is guaranteed
+        // unless the caller hands us a degenerate factor — fall back to a
+        // full Cholesky on the materialised matrix in that degenerate case
+        // so the cache is at least populated rather than panicking.
+        let identity = DMatrix::<f64>::identity(n, n);
+        let inv = match l.solve_lower_triangular(&identity) {
+            Some(l_inv) => &l_inv.transpose() * &l_inv,
+            None => matrix
+                .clone()
+                .cholesky()
+                .expect("L Lᵀ should be PD by construction")
+                .inverse(),
+        };
+        let mut log_det = 0.0;
+        for i in 0..n {
+            let lii = l[(i, i)];
+            if lii > 0.0 {
+                log_det += lii.ln();
+            } else {
+                log_det = f64::INFINITY;
+                break;
+            }
+        }
+        log_det *= 2.0;
+        Self {
+            matrix,
+            chol: l,
+            eta_names: names,
+            diagonal,
+            free_mask,
+            inv,
+            log_det,
+        }
     }
 
     pub fn dim(&self) -> usize {
@@ -977,7 +1112,7 @@ impl Default for FitOptions {
             run_covariance_step: true,
             interaction: true,
             verbose: true,
-            optimizer: Optimizer::Bobyqa,
+            optimizer: Optimizer::Slsqp,
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,
@@ -1027,17 +1162,19 @@ pub enum BloqMethod {
 pub enum Optimizer {
     Bfgs,
     Lbfgs,
-    /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based;
-    /// faster on smooth, well-behaved problems but more sensitive to the
-    /// noisy FOCE surface than BOBYQA.
+    /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based,
+    /// default outer optimizer. Robust on the FOCE/FOCEI objective surface in
+    /// practice: FD-gradient noise from EBE re-estimation is small relative
+    /// to the OFV moves the optimizer cares about.
     Slsqp,
     /// NLopt LD_LBFGS
     NloptLbfgs,
     /// NLopt LD_MMA — Method of Moving Asymptotes
     Mma,
-    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation. Default:
-    /// robust on the FOCE objective surface, which is near-noisy because of
-    /// the inner EBE optimization.
+    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation. Useful when
+    /// FD gradients are unreliable (e.g. small datasets where EBE-loop noise
+    /// dominates per-eval signal). Needs more outer evaluations than SLSQP
+    /// because it must triangulate a quadratic from scratch.
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
     TrustRegion,

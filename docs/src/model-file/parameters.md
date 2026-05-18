@@ -10,7 +10,15 @@ theta NAME(initial_value, lower_bound, upper_bound)
 
 - **NAME**: Parameter name (used in `[individual_parameters]` expressions)
 - **initial_value**: Starting value for estimation
-- **lower_bound**: Lower bound constraint (must be > 0; parameters are log-transformed internally)
+- **lower_bound**: Lower bound constraint. Thetas with `lower_bound >= 0`
+  are log-transformed internally (so the optimiser sees `log(theta)`);
+  thetas with `lower_bound < 0` are estimated on the natural scale.
+  This lets covariate exponents like `theta THETA_AGE_CL(-0.01, -1, 1)`
+  pass through unchanged while still allowing CL/V/KA to be positivity-
+  constrained via the log transform. **Edge case:** `lower_bound = 0.0`
+  still picks the log transform with an internal `1e-10` floor, so a
+  parameter that genuinely needs to reach 0 should declare a small
+  negative `lower_bound` (e.g. `-1e-6`) to switch to identity packing.
 - **upper_bound**: Upper bound constraint
 
 Example:

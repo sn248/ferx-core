@@ -331,9 +331,19 @@ pub fn event_driven_predictions_with_schedule(
                 let d = &subject.doses[ev.orig_idx];
                 if d.rate <= 0.0 {
                     // Bolus: instantaneous amount jump in dose's compartment.
+                    // Apply bioavailability F1 — mirrors the analytical
+                    // *_oral_f path (`d = f_bio * dose.amt * ka / v1`). Without
+                    // this, models that compute F as a function of DOSE (e.g.
+                    // dose-dependent F = (DOSE/100)^γ) would silently drop the
+                    // F multiplier whenever the subject had any time-varying
+                    // covariate, since `compute_predictions_with_tv_into_*`
+                    // routes to the event-driven path on `has_tv`. SCEN3 in the
+                    // astra-testdata-simulator benchmark hits this: DAY/STIME
+                    // make every subject look "TV", and predictions for
+                    // high-dose subjects came out F× too small.
                     let cmt_idx = d.cmt.saturating_sub(1);
                     if cmt_idx < n_states {
-                        state[cmt_idx] += d.amt;
+                        state[cmt_idx] += pk_now.f_bio() * d.amt;
                     } else {
                         panic!(
                             "event-driven PK: dose into compartment {} but model has \
@@ -343,7 +353,11 @@ pub fn event_driven_predictions_with_schedule(
                     }
                 }
                 // Infusion: handled inside `propagate` via the active-input
-                // lookup — no instantaneous state jump here.
+                // lookup — F is applied to the rate there (see
+                // propagate_with_bounds), preserving the user-specified
+                // duration. This matches NONMEM's `rate = AMT/DUR` convention
+                // when both are supplied, and keeps F-modulated infusions
+                // bit-for-bit equal to the bolus path on the limit dur→0.
             }
             EventKind::Obs => {
                 let v = pk_now.v();
@@ -404,41 +418,34 @@ fn propagate_with_bounds(
             continue;
         }
         let mid = 0.5 * (s0 + s1);
-        // Sum infusion rates active across the *whole* sub-interval,
-        // routing each by the dose's compartment. The cmt → state-slot
-        // mapping is model-specific:
-        //   IV: cmt=1 central, cmt=2 periph1, cmt=3 periph2
-        //   Oral: cmt=1 depot, cmt=2 central, cmt=3 periph1, cmt=4 periph2
-        //
-        // Peripheral-compartment infusion is supported on the IV
-        // multi-compartment models (2-cpt: cmt=2; 3-cpt: cmt=2 and 3).
-        // Oral peripheral infusion is unusual clinically and stays
-        // unsupported for now (panics with a clear message); see the
-        // project todo list.
         let mut rate_central = 0.0;
         let mut rate_periph1 = 0.0;
         let mut rate_periph2 = 0.0;
+        // F multiplies infusion rate so a dur→0 infusion limits to a bolus
+        // of amount F·AMT — same convention as the EventKind::Dose arm above.
+        let f_bio = pk.f_bio();
         for (k, d) in doses.iter().enumerate() {
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
             let t_start = d.time + lag;
             let t_end = t_start + d.duration;
             if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
+                let r = f_bio * d.rate;
                 match (pk_model, d.cmt) {
-                    (PkModel::OneCptIvBolus | PkModel::OneCptInfusion, 1) => rate_central += d.rate,
-                    (PkModel::OneCptOral, 2) => rate_central += d.rate,
-                    (PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion, 1) => rate_central += d.rate,
-                    (PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion, 2) => rate_periph1 += d.rate,
-                    (PkModel::TwoCptOral, 2) => rate_central += d.rate,
+                    (PkModel::OneCptIvBolus | PkModel::OneCptInfusion, 1) => rate_central += r,
+                    (PkModel::OneCptOral, 2) => rate_central += r,
+                    (PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion, 1) => rate_central += r,
+                    (PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion, 2) => rate_periph1 += r,
+                    (PkModel::TwoCptOral, 2) => rate_central += r,
                     (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 1) => {
-                        rate_central += d.rate
+                        rate_central += r
                     }
                     (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 2) => {
-                        rate_periph1 += d.rate
+                        rate_periph1 += r
                     }
                     (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 3) => {
-                        rate_periph2 += d.rate
+                        rate_periph2 += r
                     }
-                    (PkModel::ThreeCptOral, 2) => rate_central += d.rate,
+                    (PkModel::ThreeCptOral, 2) => rate_central += r,
                     _ => panic!(
                         "event-driven PK: infusion into compartment {} not supported \
                          for model {:?}. Supported: central for all models; periph1/2 \
@@ -1254,6 +1261,98 @@ mod tests {
         for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
             assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-8);
             assert!(*a >= 0.0, "obs {} should be non-negative, got {}", i, a);
+        }
+    }
+
+    #[test]
+    fn event_driven_applies_f_bio_to_bolus_dose() {
+        // Regression for the SCEN3 F-bioavailability bug: the event-driven
+        // path was adding `dose.amt` to the depot without multiplying by F,
+        // while the analytical superposition path multiplies F into the
+        // amplitude (`d = f_bio * amt * ka / v1`). Models that compute F
+        // as a function of dose (`F = (DOSE/100)^γ`) silently lost the F
+        // factor whenever the subject had any time-varying covariate (which
+        // includes "fake" TV columns like DAY/STIME), so high-dose subjects
+        // came out F× too small. Verify event-driven and analytical agree
+        // bit-for-bit when F ≠ 1.
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
+        let subj = make_subject(doses, obs_times.clone());
+
+        let mut pk = pk_two_oral(5.0, 30.0, 2.0, 50.0, 1.5);
+        pk.values[crate::types::PK_IDX_F] = 2.5; // non-trivial bioavailability
+
+        let pk_dose = vec![pk; 1];
+        let pk_obs = vec![pk; obs_times.len()];
+        let preds = event_driven_predictions(PkModel::TwoCptOral, &subj, &pk_dose, &pk_obs, &[]);
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|&t| crate::pk::predict_concentration(PkModel::TwoCptOral, &subj.doses, t, &pk))
+            .collect();
+        for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
+            assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-8);
+            assert!(*a > 0.0, "obs {} should be positive, got {}", i, a);
+        }
+
+        // Cross-check: predictions must scale linearly with F.
+        let mut pk_unit = pk;
+        pk_unit.values[crate::types::PK_IDX_F] = 1.0;
+        let pk_dose_unit = vec![pk_unit; 1];
+        let pk_obs_unit = vec![pk_unit; obs_times.len()];
+        let preds_unit =
+            event_driven_predictions(PkModel::TwoCptOral, &subj, &pk_dose_unit, &pk_obs_unit, &[]);
+        for (a_f, a_1) in preds.iter().zip(preds_unit.iter()) {
+            assert_relative_eq!(*a_f, 2.5 * *a_1, epsilon = 1e-9, max_relative = 1e-9);
+        }
+    }
+
+    #[test]
+    fn event_driven_applies_f_bio_to_infusion() {
+        // Companion to the bolus test above. `propagate_with_bounds`
+        // multiplies `f_bio` into the infusion rate (rate-scaled
+        // convention), so a dur→0 infusion limits to a bolus of amount
+        // F·AMT.
+        //
+        // Note: the analytical IV/Infusion paths in `pk/mod.rs` do *not*
+        // apply F (only the `_f` oral variants do), so we don't compare
+        // event-driven to the analytical reference here. We assert two
+        // weaker invariants that the fix should satisfy:
+        //   1. At F=1 the event-driven prediction matches the analytical
+        //      (regression for the unrelated infusion path).
+        //   2. Predictions scale linearly with F (the bolus fix's
+        //      contract extended to infusions).
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0)];
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
+        let subj = make_subject(doses, obs_times.clone());
+
+        let mut pk = pk_one(10.0, 100.0);
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+        let pk_dose_unit = vec![pk; 1];
+        let pk_obs_unit = vec![pk; obs_times.len()];
+        let preds_unit = event_driven_predictions(
+            PkModel::OneCptInfusion,
+            &subj,
+            &pk_dose_unit,
+            &pk_obs_unit,
+            &[],
+        );
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|&t| crate::pk::predict_concentration(PkModel::OneCptInfusion, &subj.doses, t, &pk))
+            .collect();
+        for (i, (a, e)) in preds_unit.iter().zip(expected.iter()).enumerate() {
+            assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-8);
+            assert!(*a > 0.0, "obs {} should be positive, got {}", i, a);
+        }
+
+        let mut pk_f = pk;
+        pk_f.values[crate::types::PK_IDX_F] = 0.4;
+        let pk_dose_f = vec![pk_f; 1];
+        let pk_obs_f = vec![pk_f; obs_times.len()];
+        let preds_f =
+            event_driven_predictions(PkModel::OneCptInfusion, &subj, &pk_dose_f, &pk_obs_f, &[]);
+        for (a_f, a_1) in preds_f.iter().zip(preds_unit.iter()) {
+            assert_relative_eq!(*a_f, 0.4 * *a_1, epsilon = 1e-9, max_relative = 1e-9);
         }
     }
 

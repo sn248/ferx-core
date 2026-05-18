@@ -90,10 +90,15 @@ fn trust_region_fit_converges_to_finite_ofv() {
 }
 
 #[test]
-fn bobyqa_and_slsqp_agree_within_10_percent_on_theta() {
-    // Cross-check: two different outer optimizers, same problem, should land
-    // near each other. Loose 10% tolerance covers optimizer jitter on a
-    // noisy FOCE surface without silently accepting divergent solutions.
+fn bobyqa_ofv_no_worse_than_slsqp_on_warfarin() {
+    // Sanity check: BOBYQA must find a fit that is at least as good as SLSQP
+    // by OFV (allowing a small slack for the derivative-free optimizer's
+    // coarser termination). The earlier theta-agreement test was misleading
+    // — it passed only because the original BOBYQA configuration barely
+    // moved from the initial values, which made it spuriously "agree" with
+    // SLSQP's local minimum. Once BOBYQA can actually explore (rhobeg set,
+    // xtol loosened) it routinely finds a better OFV on warfarin than SLSQP
+    // does, so the right invariant is OFV-not-worse, not theta-agreement.
     let (model, population) = data_and_model();
 
     let mut opts_slsqp = base_options();
@@ -107,17 +112,48 @@ fn bobyqa_and_slsqp_agree_within_10_percent_on_theta() {
     let r_bobyqa = fit(&model, &population, &model.default_params, &opts_bobyqa)
         .expect("bobyqa fit must succeed");
 
-    for i in 0..r_slsqp.theta.len() {
-        let rel = (r_bobyqa.theta[i] - r_slsqp.theta[i]).abs() / r_slsqp.theta[i].abs().max(1e-6);
-        assert!(
-            rel < 0.10,
-            "theta[{}] mismatch: slsqp={}, bobyqa={}, rel diff={:.3}",
-            i,
-            r_slsqp.theta[i],
-            r_bobyqa.theta[i],
-            rel
-        );
-    }
+    // BOBYQA's OFV should be ≤ SLSQP's + 5 units of slack. The bug we
+    // care about catching is "BOBYQA is stuck near the initial point",
+    // which on warfarin produces an OFV gap of ~150 vs converged SLSQP
+    // (worst-case observed pre-fix). A 5-unit slack sits well inside
+    // that gap while staying loose enough to absorb the derivative-free
+    // optimizer's coarser termination.
+    assert!(
+        r_bobyqa.ofv <= r_slsqp.ofv + 5.0,
+        "BOBYQA OFV {} should be no worse than SLSQP OFV {} + 5",
+        r_bobyqa.ofv,
+        r_slsqp.ofv,
+    );
+}
+
+#[test]
+fn slsqp_stops_via_stagnation_well_before_a_generous_maxeval() {
+    // Regression: on γ-bearing FOCEI scenarios SLSQP used to grind through
+    // hundreds of post-convergence evals without terminating. The
+    // stagnation guard short-circuits once recent evals show no OFV
+    // improvement so NLopt's xtol/ftol can fire.
+    let (model, population) = data_and_model();
+    let mut opts = base_options();
+    opts.optimizer = Optimizer::Slsqp;
+    opts.outer_maxiter = 1000;
+
+    let result =
+        fit(&model, &population, &model.default_params, &opts).expect("slsqp fit must succeed");
+    assert!(result.ofv.is_finite());
+    // FD-mode unbounded budget is outer_maxiter * (n+1). Asserting a small
+    // fraction of that keeps the assertion meaningful as n grows.
+    let n_params = model.default_params.theta.len()
+        + model.default_params.omega.matrix.nrows()
+        + model.default_params.sigma.values.len();
+    let budget = opts.outer_maxiter * (n_params + 1);
+    let ceiling = budget / 4;
+    assert!(
+        result.n_iterations < ceiling,
+        "SLSQP burned {} evals (ceiling {}, n={}) — stagnation guard should fire earlier",
+        result.n_iterations,
+        ceiling,
+        n_params,
+    );
 }
 
 #[test]

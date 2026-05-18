@@ -71,13 +71,16 @@ and returns the raw state value as `ipred` — there is no implicit
 `amount → concentration` normalisation.  You are responsible for making the
 ODE's state match the `DV` column.
 
-Two common forms for a 1-cpt oral model:
+Two common forms for a 1-cpt oral model (both equations shown so the
+expressions are self-contained):
 
 ```
 # State = amount (mg).  DV must be in mg.
+d/dt(depot)   = -KA * depot
 d/dt(central) =  KA * depot - (CL / V) * central
 
 # State = concentration (mg/L).  DV must be in mg/L.
+d/dt(depot)   = -KA * depot
 d/dt(central) =  KA * depot / V - (CL / V) * central
 ```
 

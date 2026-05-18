@@ -241,15 +241,37 @@ pub fn fit(
     options: &FitOptions,
 ) -> Result<FitResult, String> {
     validate_covariates(model, population)?;
+    // If any subject has per-event covariate snapshots that don't carry
+    // a variation in covariates the model actually references (e.g.
+    // DAY / STIME columns in NONMEM-format datasets), clear those
+    // snapshots so the downstream prediction path routes through the
+    // cheap analytical/no-TV fast path instead of the event-driven
+    // path. Bigger wins on SAD-style datasets where every subject has
+    // a varying DAY column but no model expression touches DAY.
+    let pop_pruned: std::borrow::Cow<Population> = {
+        let needs = population.subjects.iter().any(|s| {
+            !s.dose_covariates.is_empty()
+                || !s.obs_covariates.is_empty()
+                || !s.pk_only_covariates.is_empty()
+        });
+        if needs {
+            let mut p = population.clone();
+            p.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+            std::borrow::Cow::Owned(p)
+        } else {
+            std::borrow::Cow::Borrowed(population)
+        }
+    };
+    let pop_ref: &Population = &*pop_pruned;
     match options.threads {
         Some(n) if n > 0 => {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
                 .build()
                 .map_err(|e| format!("failed to build rayon pool with {} threads: {}", n, e))?;
-            pool.install(|| fit_inner(model, population, init_params, options))
+            pool.install(|| fit_inner(model, pop_ref, init_params, options))
         }
-        _ => fit_inner(model, population, init_params, options),
+        _ => fit_inner(model, pop_ref, init_params, options),
     }
 }
 
@@ -1820,6 +1842,10 @@ mod iov_integration {
     // ── Tests: FOCEI ─────────────────────────────────────────────────────────
 
     #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn test_iov_focei_bobyqa() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1841,6 +1867,10 @@ mod iov_integration {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn test_iov_focei_mu_referencing_on() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1863,6 +1893,10 @@ mod iov_integration {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn test_iov_gn_hybrid() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -2662,13 +2696,22 @@ mod sde_integration {
         // state, so for an IV bolus the state IS the dose in amount units.
         // Observations must therefore also be in amount (mg), not concentration.
         // True amounts from a 1-cpt model with CL=5, V=50 (k = 0.1/h):
-        //   t=1: 90.5,  t=4: 67.0,  t=8: 44.9   (plus modest noise per subject)
+        //   t=1: A(t) = 100·exp(-0.1) = 90.48
+        //   t=4: A(t) = 100·exp(-0.4) = 67.03
+        //   t=8: A(t) = 100·exp(-0.8) = 44.93
+        // Values below are symmetric ±5% perturbations of the true amounts
+        // (two subjects below, two above) so the population sample remains
+        // centered on the analytical trajectory.
         let obs_times = vec![1.0, 4.0, 8.0];
         let dvs: &[(&str, Vec<f64>)] = &[
-            ("S1", vec![81.0, 46.0, 24.0]),
-            ("S2", vec![85.0, 48.5, 26.0]),
-            ("S3", vec![77.5, 44.0, 22.5]),
-            ("S4", vec![82.5, 47.0, 25.0]),
+            // -5% across all times
+            ("S1", vec![85.96, 63.68, 42.68]),
+            // +5% across all times
+            ("S2", vec![95.00, 70.38, 47.18]),
+            // -3% across all times
+            ("S3", vec![87.77, 65.02, 43.58]),
+            // +3% across all times
+            ("S4", vec![93.19, 69.04, 46.28]),
         ];
         let subjects = dvs
             .iter()
@@ -2714,22 +2757,21 @@ mod sde_integration {
     }
 
     #[test]
-    fn test_sde_fit_uses_sde_flag() {
+    fn test_sde_fit_smoke() {
+        // Combined smoke test: one SDE fit, three assertions. Each EKF FOCE
+        // fit takes ~30–50 min on the 2-core CI runner, so the previous
+        // 3-tests-1-assertion split tripled CI wall for no extra coverage.
         let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
         let pop = make_sde_population();
         let opts = fast_foce_opts();
         let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
             .expect("SDE fit should succeed");
         assert!(result.uses_sde, "uses_sde must be true");
-    }
-
-    #[test]
-    fn test_sde_fit_diff_central_positive() {
-        let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
-        let pop = make_sde_population();
-        let opts = fast_foce_opts();
-        let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
-            .expect("SDE fit should succeed");
+        assert!(
+            result.ofv.is_finite(),
+            "OFV must be finite, got {}",
+            result.ofv
+        );
         let diff_idx = result
             .theta_names
             .iter()
@@ -2743,21 +2785,21 @@ mod sde_integration {
     }
 
     #[test]
-    fn test_sde_fit_ofv_finite() {
-        let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
-        let pop = make_sde_population();
-        let opts = fast_foce_opts();
-        let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
-            .expect("SDE fit should succeed");
-        assert!(
-            result.ofv.is_finite(),
-            "OFV must be finite, got {}",
-            result.ofv
-        );
-    }
-
-    #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn test_sde_ofv_le_base_ofv() {
+        // Reference: the OFV from the identical model fit without the
+        // [diffusion] block (BASE_MODEL_SRC). Since [diffusion] adds an extra
+        // free parameter (DIFF_CENTRAL ≥ 0) and the EKF observation variance
+        // collapses to the residual-only variance when DIFF_CENTRAL → 0, the
+        // SDE OFV must be ≤ the base OFV at the optimum.
+        // The +1 unit of slack absorbs numerical noise from finite-difference
+        // gradients, NLopt's stopping tolerance (`outer_gtol = 1e-3`), and the
+        // truncated `outer_maxiter = 80` cap in `fast_foce_opts`; without the
+        // slack we'd flake on iterations where the SDE fit stopped a hair
+        // short of the base fit's OFV.
         let pop = make_sde_population();
         let opts = fast_foce_opts();
 

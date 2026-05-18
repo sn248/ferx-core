@@ -15,6 +15,8 @@ pub mod build_info;
 pub mod cancel;
 pub mod estimation;
 pub mod io;
+#[cfg(feature = "nn")]
+pub mod nn;
 pub mod ode;
 pub mod parser;
 pub mod pk;

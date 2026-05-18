@@ -12,6 +12,7 @@
   - [Error Model](model-file/error-model.md)
   - [ODE Models](model-file/ode-models.md)
   - [Stochastic Differential Equations](model-file/diffusion.md)
+  - [Neural Networks (DCM / NODE)](model-file/neural-networks.md)
   - [Fit Options](model-file/fit-options.md)
   - [Simulation](model-file/simulation.md)
 - [Estimation Methods](estimation/README.md)

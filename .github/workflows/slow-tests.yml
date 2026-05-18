@@ -14,10 +14,14 @@ on:
     branches: [main]
     paths:
       # Re-run when something touches the code that the heavy fits exercise.
+      # `src/ode/solver.rs` is in the list because the EKF in `src/ode/ekf.rs`
+      # uses `solve_ode` from it — a change to the integrator otherwise
+      # wouldn't trigger this workflow until the next scheduled run.
       - 'src/api.rs'
       - 'src/estimation/**'
       - 'src/ode/ekf.rs'
       - 'src/ode/predictions.rs'
+      - 'src/ode/solver.rs'
       - 'src/stats/likelihood.rs'
 
 env:
@@ -39,4 +43,6 @@ jobs:
         with:
           shared-key: ci-slow
       - name: cargo test (release + slow-tests)
-        run: cargo test --lib --no-default-features --features ci,slow-tests --release -- --include-ignored
+        # With `slow-tests` on, the gated tests are no longer `#[ignore]`d
+        # so `--include-ignored` is a no-op here. Kept off for clarity.
+        run: cargo test --lib --no-default-features --features ci,slow-tests --release

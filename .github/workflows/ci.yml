@@ -90,7 +90,10 @@ jobs:
         run: cargo install cargo-llvm-cov --locked
 
       - name: Generate coverage report
-        run: cargo llvm-cov --lib --no-default-features --features ci,slow-tests --release --include-ignored --lcov --output-path lcov.info
+        # `slow-tests` un-ignores the gated tests, so `--include-ignored`
+        # isn't needed; left off so a stray plain `#[ignore]` test elsewhere
+        # in the suite doesn't silently inflate coverage measurements here.
+        run: cargo llvm-cov --lib --no-default-features --features ci,slow-tests --release --lcov --output-path lcov.info
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5

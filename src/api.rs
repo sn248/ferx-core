@@ -1820,7 +1820,7 @@ mod iov_integration {
     // ── Tests: FOCEI ─────────────────────────────────────────────────────────
 
     #[test]
-    #[cfg_attr(not(feature = "slow-tests"), ignore)]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn test_iov_focei_bobyqa() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1842,7 +1842,7 @@ mod iov_integration {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "slow-tests"), ignore)]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn test_iov_focei_mu_referencing_on() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1865,7 +1865,7 @@ mod iov_integration {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "slow-tests"), ignore)]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn test_iov_gn_hybrid() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -2740,7 +2740,7 @@ mod sde_integration {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "slow-tests"), ignore)]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn test_sde_ofv_le_base_ofv() {
         let pop = make_sde_population();
         let opts = fast_foce_opts();

@@ -29,18 +29,6 @@ enum MuRefAnchor {
     },
 }
 
-/// Walk a Mul-chain and collect direct Theta indices (not inside any function).
-fn collect_mul_thetas(expr: &Expression, out: &mut Vec<usize>) {
-    match expr {
-        Expression::Theta(i) => out.push(*i),
-        Expression::BinOp(l, BinOp::Mul, r) => {
-            collect_mul_thetas(l, out);
-            collect_mul_thetas(r, out);
-        }
-        _ => {}
-    }
-}
-
 /// Walk a Mul-chain and collect direct anchor candidates — `Theta(i)` or
 /// `NnOutput { nn_idx, output_idx }` — that sit at the top of the
 /// multiplication tree (not inside any function call). Used by the

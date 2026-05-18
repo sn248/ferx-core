@@ -721,6 +721,10 @@ fn fit_inner(
     let shrinkage_eta = compute_eta_shrinkage(&subjects, &result.params.omega.matrix);
     let shrinkage_eps = compute_eps_shrinkage(&subjects);
 
+    if let Some(w) = eps_shrinkage_warning(shrinkage_eps) {
+        warnings.push(w);
+    }
+
     // Covariance status
     let covariance_status = if !options.run_covariance_step {
         CovarianceStatus::NotRequested
@@ -1191,6 +1195,32 @@ pub(crate) fn compute_eps_shrinkage(subjects: &[SubjectResult]) -> f64 {
     1.0 - ms.sqrt()
 }
 
+/// Threshold below which negative `shrinkage_eps` triggers a warning.
+///
+/// Small negative values are normal sampling noise around 0 on well-fit models
+/// (the NONMEM uncentered estimator has a small downward bias when the sample
+/// mean of IWRES is non-zero). Past this threshold the residual error model
+/// genuinely fails to absorb the residuals at the EBE etas and the user should
+/// see it.
+const EPS_SHRINKAGE_WARN_THRESHOLD: f64 = -0.05;
+
+/// Build the user-facing warning for notably-negative EPS shrinkage, or
+/// `None` if the value is finite and above the threshold (or NaN).
+pub(crate) fn eps_shrinkage_warning(shrinkage_eps: f64) -> Option<String> {
+    if !shrinkage_eps.is_finite() || shrinkage_eps >= EPS_SHRINKAGE_WARN_THRESHOLD {
+        return None;
+    }
+    Some(format!(
+        "EPS shrinkage is notably negative ({:.1}%): mean(IWRES^2) > 1, \
+         which means the residual error model does not absorb the residuals \
+         at the final EBE etas. Common causes: SAEM converged to a local \
+         optimum with under-fit sigma (try `method = saem_foce` or different \
+         starts); model misspecification on a subset of subjects; sigma at \
+         a bound. Inspect the IWRES distribution in the sdtab.",
+        100.0 * shrinkage_eps
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,6 +1327,39 @@ mod tests {
     fn test_eps_shrinkage_nan_for_fewer_than_2_residuals() {
         let subjects = vec![make_subject(vec![0.0], vec![0.5])];
         assert!(compute_eps_shrinkage(&subjects).is_nan());
+    }
+
+    #[test]
+    fn test_eps_shrinkage_negative_when_iwres_inflated() {
+        // IWRES with mean(IWRES^2) > 1 must produce a negative value, not be
+        // clamped. Matches the SAEM repro on `nmdata_20230216_1.csv` where
+        // mean(IWRES^2) ~ 2.45 -> shrinkage ~ -0.566.
+        let subjects = vec![
+            make_subject(vec![0.0], vec![2.0]),
+            make_subject(vec![0.0], vec![-2.0]),
+        ];
+        let sh = compute_eps_shrinkage(&subjects);
+        assert!(sh < 0.0, "expected negative shrinkage, got {}", sh);
+        assert!((sh - (1.0 - 2.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_eps_shrinkage_warning_emits_below_threshold() {
+        let w = eps_shrinkage_warning(-0.10).expect("expected warning");
+        assert!(w.contains("mean(IWRES^2) > 1"));
+        assert!(w.contains("-10.0%"));
+    }
+
+    #[test]
+    fn test_eps_shrinkage_warning_silent_above_threshold() {
+        // Tiny negatives are noise — no warning.
+        assert!(eps_shrinkage_warning(-0.01).is_none());
+        // Positive shrinkage — no warning.
+        assert!(eps_shrinkage_warning(0.20).is_none());
+        // Right at the boundary — no warning (uses `<`).
+        assert!(eps_shrinkage_warning(-0.05).is_none());
+        // NaN — no warning.
+        assert!(eps_shrinkage_warning(f64::NAN).is_none());
     }
 
     #[test]

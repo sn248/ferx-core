@@ -108,6 +108,8 @@ A value near 1 means individual EBEs are all pulled toward zero — the data are
 
 Both formulas use the **uncentered second moment with `n` divisor**, matching the NONMEM / PsN / Monolix convention — the population model assumes `E[η]=0` and `E[IWRES²]=1`, so the natural estimator is `√(Σx²/n)` rather than the unbiased sample SD (which centers on the sample mean and divides by `n-1`). The unbiased form would inflate SD by `√(n/(n-1))` and routinely produce spurious negative shrinkage on small samples.
 
+**Negative `shrinkage_eps`** is mathematically possible and meaningful: it indicates `mean(IWRES²) > 1`, i.e. the residual error model does not absorb the residuals seen at the final EBE etas. Common causes include SAEM converging to a local optimum with under-fit sigma (often resolved by polishing with `method = [saem, focei]` or trying a different start), model misspecification for a subset of subjects (check the IWRES distribution in the sdtab for outliers), or sigma at a bound. When `shrinkage_eps < -5%`, ferx emits a warning to `FitResult.warnings`; the raw value is retained for parity with NONMEM/PsN.
+
 Values of `NaN` indicate a zero-variance omega component (ETA) or fewer than two valid residuals (EPS).
 
 ### Covariance Status

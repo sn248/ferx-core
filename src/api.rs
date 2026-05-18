@@ -1820,6 +1820,7 @@ mod iov_integration {
     // ── Tests: FOCEI ─────────────────────────────────────────────────────────
 
     #[test]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn test_iov_focei_bobyqa() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1841,6 +1842,7 @@ mod iov_integration {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn test_iov_focei_mu_referencing_on() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1863,6 +1865,7 @@ mod iov_integration {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn test_iov_gn_hybrid() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -2709,22 +2712,21 @@ mod sde_integration {
     }
 
     #[test]
-    fn test_sde_fit_uses_sde_flag() {
+    fn test_sde_fit_smoke() {
+        // Combined smoke test: one SDE fit, three assertions. Each EKF FOCE
+        // fit takes ~30–50 min on the 2-core CI runner, so the previous
+        // 3-tests-1-assertion split tripled CI wall for no extra coverage.
         let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
         let pop = make_sde_population();
         let opts = fast_foce_opts();
         let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
             .expect("SDE fit should succeed");
         assert!(result.uses_sde, "uses_sde must be true");
-    }
-
-    #[test]
-    fn test_sde_fit_diff_central_positive() {
-        let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
-        let pop = make_sde_population();
-        let opts = fast_foce_opts();
-        let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
-            .expect("SDE fit should succeed");
+        assert!(
+            result.ofv.is_finite(),
+            "OFV must be finite, got {}",
+            result.ofv
+        );
         let diff_idx = result
             .theta_names
             .iter()
@@ -2738,20 +2740,7 @@ mod sde_integration {
     }
 
     #[test]
-    fn test_sde_fit_ofv_finite() {
-        let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
-        let pop = make_sde_population();
-        let opts = fast_foce_opts();
-        let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
-            .expect("SDE fit should succeed");
-        assert!(
-            result.ofv.is_finite(),
-            "OFV must be finite, got {}",
-            result.ofv
-        );
-    }
-
-    #[test]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn test_sde_ofv_le_base_ofv() {
         let pop = make_sde_population();
         let opts = fast_foce_opts();

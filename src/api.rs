@@ -1214,9 +1214,10 @@ pub(crate) fn eps_shrinkage_warning(shrinkage_eps: f64) -> Option<String> {
         "EPS shrinkage is notably negative ({:.1}%): mean(IWRES^2) > 1, \
          which means the residual error model does not absorb the residuals \
          at the final EBE etas. Common causes: SAEM converged to a local \
-         optimum with under-fit sigma (try `method = saem_foce` or different \
-         starts); model misspecification on a subset of subjects; sigma at \
-         a bound. Inspect the IWRES distribution in the sdtab.",
+         optimum with under-fit sigma (try `method = [saem, focei]` to polish \
+         with FOCEI, or different starts); model misspecification on a subset \
+         of subjects; sigma at a bound. Inspect the IWRES distribution in the \
+         sdtab.",
         100.0 * shrinkage_eps
     ))
 }

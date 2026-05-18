@@ -2657,13 +2657,18 @@ mod sde_integration {
 
     fn make_sde_population() -> Population {
         // 4 subjects, single IV bolus dose=100 at t=0, observations at 3 times.
-        // Concentrations from a 1-cpt model with CL=5, V=50 plus modest noise.
+        // The ODE `d/dt(central) = -(CL/V) * central` describes the amount in
+        // the central compartment (mg) — ferx adds `dose.amt` directly to the
+        // state, so for an IV bolus the state IS the dose in amount units.
+        // Observations must therefore also be in amount (mg), not concentration.
+        // True amounts from a 1-cpt model with CL=5, V=50 (k = 0.1/h):
+        //   t=1: 90.5,  t=4: 67.0,  t=8: 44.9   (plus modest noise per subject)
         let obs_times = vec![1.0, 4.0, 8.0];
         let dvs: &[(&str, Vec<f64>)] = &[
-            ("S1", vec![1.62, 0.92, 0.48]),
-            ("S2", vec![1.70, 0.97, 0.52]),
-            ("S3", vec![1.55, 0.88, 0.45]),
-            ("S4", vec![1.65, 0.94, 0.50]),
+            ("S1", vec![81.0, 46.0, 24.0]),
+            ("S2", vec![85.0, 48.5, 26.0]),
+            ("S3", vec![77.5, 44.0, 22.5]),
+            ("S4", vec![82.5, 47.0, 25.0]),
         ];
         let subjects = dvs
             .iter()

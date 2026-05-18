@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-33a6e33e.js";
+            window.path_to_searchindex_js = "../searchindex-c8c948a2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-e860d047.js"></script>
@@ -231,6 +231,25 @@ loop, or a covariate effect).</p>
 <p>The primary signal is residual autocorrelation.  If the IWRES Durbin-Watson
 statistic is low (&lt; 1.5) in a fitted ODE model, adding a diffusion term on the
 slow-varying compartment often absorbs the systematic drift.</p>
+<h2 id="unit-convention-important"><a class="header" href="#unit-convention-important">Unit convention (important)</a></h2>
+<p>The EKF propagates the variance of the <strong>ODE state in whatever units the user
+defines it</strong>.  ferx adds <code>dose.amt</code> directly to the state (<code>u[cmt-1] += amt</code>)
+and returns the raw state value as <code>ipred</code> — there is no implicit
+<code>amount → concentration</code> normalisation.  You are responsible for making the
+ODE’s state match the <code>DV</code> column.</p>
+<p>Two common forms for a 1-cpt oral model:</p>
+<pre><code># State = amount (mg).  DV must be in mg.
+d/dt(central) =  KA * depot - (CL / V) * central
+
+# State = concentration (mg/L).  DV must be in mg/L.
+d/dt(central) =  KA * depot / V - (CL / V) * central
+</code></pre>
+<p>If the units don’t match (e.g. amount-form ODE with concentration <code>DV</code>),
+predictions and observations will differ by a factor of <code>V</code> and the fit will
+not converge.  <code>DIFF_&lt;STATE&gt;</code> is then the variance of process noise <em>in the
+same units as the state</em> — e.g. <code>(mg/L)²</code> for the concentration form,
+<code>(mg)²</code> for the amount form.  See <code>examples/bioavailability_ode.ferx</code> for a
+worked concentration-form ODE.</p>
 <h2 id="worked-example-1-cpt-iv-with-central-diffusion"><a class="header" href="#worked-example-1-cpt-iv-with-central-diffusion">Worked example: 1-cpt IV with central diffusion</a></h2>
 <pre><code>[parameters]
   theta TVCL(5.0, 0.1, 50.0)

@@ -63,6 +63,31 @@ The primary signal is residual autocorrelation.  If the IWRES Durbin-Watson
 statistic is low (< 1.5) in a fitted ODE model, adding a diffusion term on the
 slow-varying compartment often absorbs the systematic drift.
 
+## Unit convention (important)
+
+The EKF propagates the variance of the **ODE state in whatever units the user
+defines it**.  ferx adds `dose.amt` directly to the state (`u[cmt-1] += amt`)
+and returns the raw state value as `ipred` — there is no implicit
+`amount → concentration` normalisation.  You are responsible for making the
+ODE's state match the `DV` column.
+
+Two common forms for a 1-cpt oral model:
+
+```
+# State = amount (mg).  DV must be in mg.
+d/dt(central) =  KA * depot - (CL / V) * central
+
+# State = concentration (mg/L).  DV must be in mg/L.
+d/dt(central) =  KA * depot / V - (CL / V) * central
+```
+
+If the units don't match (e.g. amount-form ODE with concentration `DV`),
+predictions and observations will differ by a factor of `V` and the fit will
+not converge.  `DIFF_<STATE>` is then the variance of process noise *in the
+same units as the state* — e.g. `(mg/L)²` for the concentration form,
+`(mg)²` for the amount form.  See `examples/bioavailability_ode.ferx` for a
+worked concentration-form ODE.
+
 ## Worked example: 1-cpt IV with central diffusion
 
 ```

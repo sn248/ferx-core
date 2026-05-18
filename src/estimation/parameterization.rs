@@ -9,21 +9,22 @@ pub struct PackedBounds {
 
 /// Whether to pack `theta[i]` on the log scale.
 ///
-/// Log packing is used when the user-specified lower bound is strictly
-/// positive (the parameter is sign-constrained, e.g. CL, V, KA, sigma).
-/// When `theta_lower[i] < 0`, the user has explicitly allowed negative
-/// values — typical for covariate exponents (`(DOSE/100)^γ` with γ ∈
-/// [-3, 3]), additive covariate effects (`THETA_AGE_CL ∈ [-1, 1]`), or
-/// logit-scale parameters. Log-packing those silently clamps to 1e-10
-/// and the optimizer can never reach the true sign-bearing value
-/// (regression: SAD_SCEN4's γ = -0.8 collapsed to 1e-10 ≈ 0, and
-/// SAD_SCEN1's THETA_AGE_CL = -0.01 collapsed to the same).
+/// Log packing applies when `theta_lower >= 0` — i.e. the user has
+/// declared the parameter as non-negative (the typical case for CL, V,
+/// KA, sigma; `theta_lower = 0` is also included). When
+/// `theta_lower < 0`, the user has explicitly allowed negative values —
+/// typical for covariate exponents (`(DOSE/100)^γ` with γ ∈ [-3, 3]),
+/// additive covariate effects (`THETA_AGE_CL ∈ [-1, 1]`), or logit-scale
+/// parameters. Log-packing those silently clamps to 1e-10 and the
+/// optimizer can never reach the true sign-bearing value (regression:
+/// SAD_SCEN4's γ = -0.8 collapsed to 1e-10 ≈ 0, and SAD_SCEN1's
+/// THETA_AGE_CL = -0.01 collapsed to the same).
 ///
-/// We default to log on theta_lower >= 0 to preserve the optimizer
-/// conditioning that established users rely on for sign-constrained
-/// parameters (CL, V, sigma can span many orders of magnitude). Use
-/// theta_lower = 0 if you want identity packing for an already-positive
-/// parameter.
+/// Identity packing is opted into only by a *negative* lower bound. A
+/// `theta_lower = 0` parameter still uses log packing (with the
+/// `max(1e-10)` floor handling the boundary). This preserves the
+/// optimizer conditioning that established users rely on for
+/// sign-constrained parameters that can span many orders of magnitude.
 #[inline]
 pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
     theta_lower >= 0.0

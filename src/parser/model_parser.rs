@@ -2289,8 +2289,9 @@ enum Expression {
     VariableIdx(usize),
     /// Same as `Covariate(name)` but pre-resolved to an index into a Vec
     /// aligned with `CompiledModel.referenced_covariates`. Built by
-    /// `resolve_variable_indices`; the matching Vec is materialized
-    /// inside the `pk_param_fn` closure for each subject.
+    /// `resolve_variable_indices`; the matching Vec is materialised once
+    /// per call inside the `pk_param_fn` closure (`build_pk_param_fn`),
+    /// reading from the caller-supplied covariate HashMap.
     CovariateIdx(usize),
     BinOp(Box<Expression>, BinOp, Box<Expression>),
     UnaryFn(String, Box<Expression>),

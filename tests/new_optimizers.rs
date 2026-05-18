@@ -112,10 +112,12 @@ fn bobyqa_ofv_no_worse_than_slsqp_on_warfarin() {
     let r_bobyqa = fit(&model, &population, &model.default_params, &opts_bobyqa)
         .expect("bobyqa fit must succeed");
 
-    // BOBYQA's OFV should be ≤ SLSQP's + 5 units of slack. This is a
-    // pragmatic tolerance for derivative-free termination/coarseness, and it
-    // catches "BOBYQA is stuck near the initial point" without rejecting
-    // normal optimizer jitter on this example.
+    // BOBYQA's OFV should be ≤ SLSQP's + 5 units of slack. The bug we
+    // care about catching is "BOBYQA is stuck near the initial point",
+    // which on warfarin produces an OFV gap of ~150 vs converged SLSQP
+    // (worst-case observed pre-fix). A 5-unit slack sits well inside
+    // that gap while staying loose enough to absorb the derivative-free
+    // optimizer's coarser termination.
     assert!(
         r_bobyqa.ofv <= r_slsqp.ofv + 5.0,
         "BOBYQA OFV {} should be no worse than SLSQP OFV {} + 5",

@@ -326,15 +326,24 @@ impl OmegaMatrix {
         free_mask: DMatrix<bool>,
     ) -> Self {
         let n = m.nrows();
-        let (chol, inv) = match m.clone().cholesky() {
-            Some(c) => (c.l(), c.inverse()),
+        // If the input matrix is PD we use it as-is. If Cholesky fails we
+        // regularise (eigenvalue floor) and switch to the regularised
+        // matrix from here on, so `matrix`, `chol`, `inv`, and `log_det`
+        // all describe the *same* matrix downstream — otherwise the
+        // FOCE inner loop's eta_prior (read from `matrix`) would be
+        // inconsistent with the cached `inv` (computed from `m_reg`).
+        let (matrix, chol, inv) = match m.clone().cholesky() {
+            Some(c) => (m, c.l(), c.inverse()),
             None => {
                 let eig = m.clone().symmetric_eigen();
                 let min_eig = eig.eigenvalues.min();
                 let reg = if min_eig < 0.0 { -min_eig + 1e-8 } else { 1e-8 };
                 let m_reg = &m + DMatrix::identity(n, n) * reg;
-                let c = m_reg.cholesky().expect("Regularized matrix must be PD");
-                (c.l(), c.inverse())
+                let c = m_reg
+                    .clone()
+                    .cholesky()
+                    .expect("Regularized matrix must be PD");
+                (m_reg, c.l(), c.inverse())
             }
         };
         // log|Ω| = 2·Σᵢ log(L_ii). Negative or zero diagonals shouldn't
@@ -352,7 +361,7 @@ impl OmegaMatrix {
         }
         log_det *= 2.0;
         Self {
-            matrix: m,
+            matrix,
             chol,
             eta_names: names,
             diagonal,
@@ -393,8 +402,11 @@ impl OmegaMatrix {
     }
 
     /// Construct from a known lower-Cholesky factor `L` such that Ω = L Lᵀ.
-    /// Saves one Cholesky vs `from_matrix*`, which the SAEM/FOCEI hot paths
-    /// hit on every NLopt M-step and every outer iteration via `unpack_params`.
+    /// Avoids the Cholesky factorisation that `from_matrix*` runs, which the
+    /// SAEM/FOCEI hot paths hit on every NLopt M-step and every outer
+    /// iteration via `unpack_params`. Ω⁻¹ is computed from `L` directly:
+    /// Ω⁻¹ = L⁻ᵀ L⁻¹, where L⁻¹ comes from one lower-triangular solve
+    /// against the identity.
     pub fn from_chol_factor(
         l: DMatrix<f64>,
         names: Vec<String>,
@@ -403,13 +415,21 @@ impl OmegaMatrix {
     ) -> Self {
         let n = l.nrows();
         let matrix = &l * l.transpose();
-        // Solve L X = I  then  X^T (X^T)^T  =  Ω⁻¹. nalgebra's
-        // `LU::solve(I)` does this in one shot.
-        let inv = matrix
-            .clone()
-            .cholesky()
-            .expect("L Lᵀ should be PD by construction")
-            .inverse();
+        // L⁻¹ via lower-triangular solve: L · X = I ⇒ X = L⁻¹.
+        // `solve_lower_triangular(&I)` returns Some(_) iff L is non-singular;
+        // L Lᵀ is PD by construction so a positive-diagonal L is guaranteed
+        // unless the caller hands us a degenerate factor — fall back to a
+        // full Cholesky on the materialised matrix in that degenerate case
+        // so the cache is at least populated rather than panicking.
+        let identity = DMatrix::<f64>::identity(n, n);
+        let inv = match l.solve_lower_triangular(&identity) {
+            Some(l_inv) => &l_inv.transpose() * &l_inv,
+            None => matrix
+                .clone()
+                .cholesky()
+                .expect("L Lᵀ should be PD by construction")
+                .inverse(),
+        };
         let mut log_det = 0.0;
         for i in 0..n {
             let lii = l[(i, i)];

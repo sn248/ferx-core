@@ -66,7 +66,7 @@ Goal: NN provides typical values; FOCEI fits NN weights + omega + sigma + etas j
    CL = TYPICAL_PK.CL * exp(ETA_CL)
    V1 = TYPICAL_PK.V1 * exp(ETA_V1)
    ```
-   In code, the new `pk_param_fn` closure runs NN forward, then multiplies in `exp(eta[i])` per output. Mu-ref detection in [src/parser/model_parser.rs](src/parser/model_parser.rs) should recognize this pattern so the existing inner-loop AD path (which already differentiates `tv * exp(eta)` w.r.t. eta — see `src/ad/ad_gradients.rs:79`) keeps working **without modification**. This is the single most important property of the design: the NN is "upstream" of the eta application, so the inner FOCEI loop is genuinely unchanged.
+   In code, the new `pk_param_fn` closure runs NN forward, then multiplies in `exp(eta[i])` per output. Implementation note: [`detect_pattern`](src/parser/model_parser.rs#L186) currently matches Pattern 1 (`THETA * exp(ETA)`) by walking the multiplicative chain for `Expression::Theta` nodes. NN-output access (`TYPICAL_PK.CL`) is a new AST node, so `detect_pattern` needs a small extension to treat that node as a theta-equivalent anchor — ~10 LOC, plus a unit test under `model_parser.rs::tests`. Once recognized, the existing inner-loop AD path (which differentiates `tv * exp(eta)` w.r.t. eta — see `src/ad/ad_gradients.rs:79`) handles the rest. The single most important property still holds: the inner FOCEI loop itself is unchanged because the NN is "upstream" of the eta application.
 2. **`tv_fn` parity**: the parser auto-generates a `tv_fn` (typical-value function with eta=0) around [src/parser/model_parser.rs:844–849](src/parser/model_parser.rs:844). Add the NN-aware equivalent: call `MlpMapper::forward` and skip the eta multiplication.
 3. **Outer gradient strategy** (the hard call):
    - **Default**: central FD on the full parameter vector, including NN weights. Cost is 2·(n_theta + n_weights) NLL evals per gradient. With the paper's ~320 weights and ferx-core's fast analytical PK, this is workable for proof-of-concept (≈ low-seconds per gradient step on warfarin-sized data).
@@ -285,9 +285,9 @@ The parser cross-checks usage: a `[covariate_nn]` referenced inside `[odes]` is 
 
 `[dynamics_nn]` blocks accept `iiv = additive` to auto-emit additive etas on every weight and bias. This eliminates the dozen-or-more hand-written `omega ETA_W_..._...` lines a Bräm-style model otherwise requires. `[covariate_nn]` blocks intentionally do not expose `iiv` — etas in DCM live on the downstream PK params (CL, V, …), not on weights.
 
-### Output fit YAML reports active NN features
+### Fit output reports active NN features (both formats)
 
-[src/io/output.rs](src/io/output.rs) (or wherever the fit YAML is written) emits a top-level section listing every NN block active in the fit:
+ferx-core produces two parallel fit outputs: the CLI's human-readable `{model}-fit.yaml` (written from [src/io/output.rs](src/io/output.rs)) and the round-trippable `.fitrx` zip bundle (with `fit.json` inside, schema in [src/io/fitrx.rs](src/io/fitrx.rs)). Both should emit a top-level section listing every NN block active in the fit:
 
 ```
 neural_networks:
@@ -304,7 +304,7 @@ neural_networks:
       n_weights: 11
 ```
 
-Anyone debugging from a fit YAML alone can immediately tell what kind of NN model was fit. This is also useful for `ferx`-internal tooling like covariance auto-disable to find what's active.
+Anyone debugging from a fit artifact alone can immediately tell what kind of NN model was fit. The `.fitrx` mirror lives in `fit.json` under the same key so `ferx-r`'s loader can round-trip it. This is also useful for `ferx`-internal tooling like the covariance auto-disable to find what's active.
 
 ### Runtime warning when `[dynamics_nn]` is present
 

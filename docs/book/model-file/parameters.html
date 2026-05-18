@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-3d0c83c9.js";
+            window.path_to_searchindex_js = "../searchindex-f9f5aead.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-6f2d6898.js"></script>
@@ -185,7 +185,15 @@
 <ul>
 <li><strong>NAME</strong>: Parameter name (used in <code>[individual_parameters]</code> expressions)</li>
 <li><strong>initial_value</strong>: Starting value for estimation</li>
-<li><strong>lower_bound</strong>: Lower bound constraint (must be &gt; 0; parameters are log-transformed internally)</li>
+<li><strong>lower_bound</strong>: Lower bound constraint. Thetas with <code>lower_bound &gt;= 0</code>
+are log-transformed internally (so the optimiser sees <code>log(theta)</code>);
+thetas with <code>lower_bound &lt; 0</code> are estimated on the natural scale.
+This lets covariate exponents like <code>theta THETA_AGE_CL(-0.01, -1, 1)</code>
+pass through unchanged while still allowing CL/V/KA to be positivity-
+constrained via the log transform. <strong>Edge case:</strong> <code>lower_bound = 0.0</code>
+still picks the log transform with an internal <code>1e-10</code> floor, so a
+parameter that genuinely needs to reach 0 should declare a small
+negative <code>lower_bound</code> (e.g. <code>-1e-6</code>) to switch to identity packing.</li>
 <li><strong>upper_bound</strong>: Upper bound constraint</li>
 </ul>
 <p>Example:</p>

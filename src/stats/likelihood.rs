@@ -124,16 +124,19 @@ pub fn individual_nll_into_with_schedule(
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
-    // Compute Omega inverse and log-determinant via Cholesky
-    let omega_inv = match omega.matrix.clone().cholesky() {
-        Some(chol) => chol.inverse(),
-        None => return 1e20,
-    };
-    let log_det_omega = omega_log_det(omega);
+    // Ω⁻¹ and log|Ω| are pre-computed in `OmegaMatrix::from_matrix_*`.
+    // Hot-path users (FOCE inner BFGS, SAEM MH) call this 100s–1000s of
+    // times per subject per outer iter — recomputing Cholesky+inverse
+    // here used to dominate small-omega problems.
+    if !omega.log_det.is_finite() {
+        return 1e20;
+    }
+    let omega_inv = &omega.inv;
+    let log_det_omega = omega.log_det;
 
     // Eta prior: eta' * Omega_inv * eta
     let eta_vec = DVector::from_column_slice(eta);
-    let eta_prior = eta_vec.dot(&(&omega_inv * &eta_vec));
+    let eta_prior = eta_vec.dot(&(omega_inv * &eta_vec));
 
     // Compute individual predictions using the caller's scratch buffer
     // for per-event PK params (only consumed on the TV-cov path; ignored

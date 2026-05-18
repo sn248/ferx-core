@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-0dc041c3.js";
+            window.path_to_searchindex_js = "searchindex-3cd74007.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e860d047.js"></script>
+        <script src="toc-6f2d6898.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1432,6 +1432,122 @@ of the <code>.ferx</code> model file and requires no special R-side argument.  T
 estimated diffusion variances appear in the returned fit object alongside other
 theta parameters.  See the ferx-r documentation (<code>?ferx_fit</code>) for details on
 accessing <code>theta_names</code> and interpreting <code>uses_sde</code> in the fit object.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="neural-networks"><a class="header" href="#neural-networks">Neural Networks</a></h1>
+<p>ferx-core is gaining two complementary neural-network extensions. Both are
+gated behind the <code>nn</code> cargo feature (off by default) and are being built
+incrementally — see <a href="https://github.com/FeRx-NLME/ferx-core/blob/main/plans/dcm-and-low-dim-node.md"><code>plans/dcm-and-low-dim-node.md</code></a> in the source
+tree for the milestone roadmap.</p>
+<p>This page is the landing point: it explains which extension fits which
+modeling problem. Detailed reference pages for each block sit beneath it.</p>
+<h2 id="tldr--which-one-do-i-need"><a class="header" href="#tldr--which-one-do-i-need">TL;DR — which one do I need?</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Known PK / PD structure?</th><th>Known covariate model?</th><th>Use</th></tr>
+</thead>
+<tbody>
+<tr><td>Yes (e.g. 2-cpt oral)</td><td>Yes</td><td>Classical analytical — no NN needed</td></tr>
+<tr><td>Yes</td><td>No / partial</td><td><a href="model-file/covariate-nn.html"><code>[covariate_nn]</code></a> (DCM, Phase A)</td></tr>
+<tr><td>No / partial</td><td>Yes</td><td><a href="model-file/dynamics-nn.html"><code>[dynamics_nn]</code></a> (low-dim NODE, Phase B)</td></tr>
+<tr><td>No</td><td>No</td><td>Both — they coexist in the same model</td></tr>
+</tbody>
+</table>
+</div>
+<p>If you also need <em>structural uncertainty</em> — system noise that accumulates
+between observations regardless of covariates or dynamics — see
+<a href="#stochastic-differential-equations-sde--diffusion"><code>[diffusion]</code></a> (SDE / Extended Kalman Filter). It is
+orthogonal to either neural-network mechanism.</p>
+<h2 id="two-extension-points-two-papers"><a class="header" href="#two-extension-points-two-papers">Two extension points, two papers</a></h2>
+<p>ferx-core integrates neural networks at two different layers of the model
+pipeline, motivated by two distinct papers in the pharmacometrics
+literature:</p>
+<h3 id="covariate_nn--deep-compartment-models-dcm"><a class="header" href="#covariate_nn--deep-compartment-models-dcm"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</a></h3>
+<p>A neural network replaces the <strong>typical-value covariate model</strong>: instead of
+writing</p>
+<pre><code>CL = TVCL * (WT / 70)^THETA_WT * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)
+</code></pre>
+<p>you write a network whose inputs are subject covariates and whose outputs
+are PK typical values, then combine with etas as usual:</p>
+<pre><code>[covariate_nn TYPICAL_PK]
+  inputs  = [WT, CRCL]
+  outputs = [CL, V1, Q, V2, KA]
+  layers  = [16]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V1 = TYPICAL_PK.V1 * exp(ETA_V1)
+  …
+</code></pre>
+<p>The compartmental ODE / analytical solution downstream is unchanged.
+Etas attach to the <em>final</em> PK parameters (not the NN weights), so the
+inner FOCEI loop runs exactly as it does for an analytical model.</p>
+<p>Reference: <strong>Janssen et al. 2022</strong> — <em>Deep compartment models: a deep
+learning approach for the reliable prediction of time-series data in
+pharmacokinetic modeling.</em> CPT Pharmacometrics Syst Pharmacol 11:934–945.
+DOI <a href="https://doi.org/10.1002/psp4.12808">10.1002/psp4.12808</a>.</p>
+<h3 id="dynamics_nn--low-dimensional-neural-odes"><a class="header" href="#dynamics_nn--low-dimensional-neural-odes"><code>[dynamics_nn]</code> — Low-dimensional Neural ODEs</a></h3>
+<p>A small neural network appears on the <strong>right-hand side of an ODE</strong>,
+replacing mechanistic terms like Michaelis–Menten or linear elimination
+when the dynamics are unknown:</p>
+<pre><code>[dynamics_nn ka_nn]
+  inputs     = [depot]
+  hidden     = 5
+  activation = relu
+  iiv        = additive
+
+[odes]
+  d/dt(depot)   = -ka_nn(depot)
+  d/dt(central) =  ka_nn(depot) - cl_nn(central) * central
+</code></pre>
+<p>The compartmental <em>topology</em> (number of states, dose routing, observation
+mapping) is still specified by the modeler. Random effects can attach
+directly to the NN weights via <code>iiv = additive</code> — Bräm et al.’s key
+contribution.</p>
+<p>Reference: <strong>Bräm et al. 2025</strong> — <em>Low-dimensional neural ordinary
+differential equations accounting for inter-individual variability
+implemented in Monolix and NONMEM.</em> CPT Pharmacometrics Syst Pharmacol
+14:5–16. DOI <a href="https://doi.org/10.1002/psp4.13265">10.1002/psp4.13265</a>.</p>
+<h2 id="guardrails"><a class="header" href="#guardrails">Guardrails</a></h2>
+<p>Because both blocks declare neural networks, the parser and runtime
+enforce a few rules to keep the difference visible:</p>
+<ul>
+<li><strong>Block-name cross-check</strong>: a <code>[covariate_nn]</code> referenced inside <code>[odes]</code>
+is a hard error pointing to <code>[dynamics_nn]</code> (and vice versa).</li>
+<li><strong>Fit-output reporting</strong>: both <code>{model}-fit.yaml</code> (CLI) and <code>.fitrx</code>
+(programmatic round-trip) emit a <code>neural_networks:</code> section listing every
+active block, its shape, and its weight count.</li>
+<li><strong>Runtime warning on <code>[dynamics_nn]</code></strong>: a <code>FitResult.warnings</code> entry
+notes the expected 10–100× slowdown vs classical PK and the lack of
+reliable standard errors for NN weights.</li>
+<li><strong>Scoped covariance auto-disable</strong>: when <code>[dynamics_nn]</code> is present and
+<code>covariance = true</code>, ferx-core overrides to <code>covariance = false</code> and
+warns. <code>[covariate_nn]</code> weights are reasonably identifiable and
+covariance estimation stays enabled there.</li>
+</ul>
+<h2 id="status"><a class="header" href="#status">Status</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Component</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nn</code> cargo feature, <code>MlpMapper</code>, <code>NamedMlpMapper</code> (forward + Jacobian)</td><td>Implemented in <code>src/nn/mod.rs</code>; behind <code>--features nn</code></td></tr>
+<tr><td><code>[covariate_nn]</code> parser block + auto-generated thetas</td><td>Pending (Phase A M1)</td></tr>
+<tr><td><code>pk_param_fn</code> dispatch on <code>[covariate_nn]</code></td><td>Pending (Phase A M1)</td></tr>
+<tr><td><code>method = nn_mse</code> fixed-effects objective</td><td>Pending (Phase A M1)</td></tr>
+<tr><td>Mu-ref composition <code>TYPICAL_PK.X * exp(ETA_X)</code></td><td>Pending (Phase A M2)</td></tr>
+<tr><td><code>[dynamics_nn]</code> block + NN-in-ODE-expression syntax</td><td>Pending (Phase B)</td></tr>
+<tr><td>Activation-aware Bräm-style initializer</td><td>Pending (Phase B)</td></tr>
+<tr><td>Outer-loop AD through NN weights (production speed)</td><td>Deferred (Phase A M3)</td></tr>
+</tbody>
+</table>
+</div>
+<p>The Rust-level API (the <code>CovariateMapper</code> trait and <code>MlpMapper</code>) is
+already callable today — see <code>tests/nn_dcm_smoke.rs</code> for an end-to-end
+example.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="fit-options"><a class="header" href="#fit-options">Fit Options</a></h1>
 <p>The optional <code>[fit_options]</code> block configures the estimation method and optimizer settings.</p>

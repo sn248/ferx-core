@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Data Format - FeRx-NLME Documentation</title>
+        <title>Neural Networks (DCM / NODE) - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -12,33 +12,33 @@
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
-        <link rel="icon" href="favicon-de23e50b.svg">
-        <link rel="shortcut icon" href="favicon-8114d1fc.png">
-        <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-2459343d.css">
-        <link rel="stylesheet" href="css/chrome-ae938929.css">
-        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
-        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
 
         <!-- Highlight.js Stylesheets -->
-        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
-        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
-        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
-            const path_to_root = "";
+            const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-3cd74007.js";
+            window.path_to_searchindex_js = "../searchindex-3cd74007.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-6f2d6898.js"></script>
+        <script src="../toc-6f2d6898.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -105,7 +105,7 @@
             <!-- populated by js -->
             <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
             <noscript>
-                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
             </noscript>
             <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -140,7 +140,7 @@
                     <h1 class="menu-title">FeRx-NLME Documentation</h1>
 
                     <div class="right-buttons">
-                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
                             <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
                         </a>
                         <a href="https://github.com/FeRx-NLME/ferx-core" title="Git repository" aria-label="Git repository">
@@ -177,153 +177,131 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="data-format"><a class="header" href="#data-format">Data Format</a></h1>
-<p>FeRx reads data in NONMEM-compatible CSV format. This is the standard format used across population PK tools.</p>
-<h2 id="required-columns"><a class="header" href="#required-columns">Required Columns</a></h2>
+                        <h1 id="neural-networks"><a class="header" href="#neural-networks">Neural Networks</a></h1>
+<p>ferx-core is gaining two complementary neural-network extensions. Both are
+gated behind the <code>nn</code> cargo feature (off by default) and are being built
+incrementally — see <a href="https://github.com/FeRx-NLME/ferx-core/blob/main/plans/dcm-and-low-dim-node.md"><code>plans/dcm-and-low-dim-node.md</code></a> in the source
+tree for the milestone roadmap.</p>
+<p>This page is the landing point: it explains which extension fits which
+modeling problem. Detailed reference pages for each block sit beneath it.</p>
+<h2 id="tldr--which-one-do-i-need"><a class="header" href="#tldr--which-one-do-i-need">TL;DR — which one do I need?</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Column</th><th>Type</th><th>Description</th></tr>
+<tr><th>Known PK / PD structure?</th><th>Known covariate model?</th><th>Use</th></tr>
 </thead>
 <tbody>
-<tr><td><code>ID</code></td><td>string/numeric</td><td>Subject identifier</td></tr>
-<tr><td><code>TIME</code></td><td>numeric</td><td>Time relative to first dose</td></tr>
-<tr><td><code>DV</code></td><td>numeric</td><td>Dependent variable (observed concentration)</td></tr>
+<tr><td>Yes (e.g. 2-cpt oral)</td><td>Yes</td><td>Classical analytical — no NN needed</td></tr>
+<tr><td>Yes</td><td>No / partial</td><td><a href="covariate-nn.html"><code>[covariate_nn]</code></a> (DCM, Phase A)</td></tr>
+<tr><td>No / partial</td><td>Yes</td><td><a href="dynamics-nn.html"><code>[dynamics_nn]</code></a> (low-dim NODE, Phase B)</td></tr>
+<tr><td>No</td><td>No</td><td>Both — they coexist in the same model</td></tr>
 </tbody>
 </table>
 </div>
-<h2 id="optional-standard-columns"><a class="header" href="#optional-standard-columns">Optional Standard Columns</a></h2>
+<p>If you also need <em>structural uncertainty</em> — system noise that accumulates
+between observations regardless of covariates or dynamics — see
+<a href="diffusion.html"><code>[diffusion]</code></a> (SDE / Extended Kalman Filter). It is
+orthogonal to either neural-network mechanism.</p>
+<h2 id="two-extension-points-two-papers"><a class="header" href="#two-extension-points-two-papers">Two extension points, two papers</a></h2>
+<p>ferx-core integrates neural networks at two different layers of the model
+pipeline, motivated by two distinct papers in the pharmacometrics
+literature:</p>
+<h3 id="covariate_nn--deep-compartment-models-dcm"><a class="header" href="#covariate_nn--deep-compartment-models-dcm"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</a></h3>
+<p>A neural network replaces the <strong>typical-value covariate model</strong>: instead of
+writing</p>
+<pre><code>CL = TVCL * (WT / 70)^THETA_WT * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)
+</code></pre>
+<p>you write a network whose inputs are subject covariates and whose outputs
+are PK typical values, then combine with etas as usual:</p>
+<pre><code>[covariate_nn TYPICAL_PK]
+  inputs  = [WT, CRCL]
+  outputs = [CL, V1, Q, V2, KA]
+  layers  = [16]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V1 = TYPICAL_PK.V1 * exp(ETA_V1)
+  …
+</code></pre>
+<p>The compartmental ODE / analytical solution downstream is unchanged.
+Etas attach to the <em>final</em> PK parameters (not the NN weights), so the
+inner FOCEI loop runs exactly as it does for an analytical model.</p>
+<p>Reference: <strong>Janssen et al. 2022</strong> — <em>Deep compartment models: a deep
+learning approach for the reliable prediction of time-series data in
+pharmacokinetic modeling.</em> CPT Pharmacometrics Syst Pharmacol 11:934–945.
+DOI <a href="https://doi.org/10.1002/psp4.12808">10.1002/psp4.12808</a>.</p>
+<h3 id="dynamics_nn--low-dimensional-neural-odes"><a class="header" href="#dynamics_nn--low-dimensional-neural-odes"><code>[dynamics_nn]</code> — Low-dimensional Neural ODEs</a></h3>
+<p>A small neural network appears on the <strong>right-hand side of an ODE</strong>,
+replacing mechanistic terms like Michaelis–Menten or linear elimination
+when the dynamics are unknown:</p>
+<pre><code>[dynamics_nn ka_nn]
+  inputs     = [depot]
+  hidden     = 5
+  activation = relu
+  iiv        = additive
+
+[odes]
+  d/dt(depot)   = -ka_nn(depot)
+  d/dt(central) =  ka_nn(depot) - cl_nn(central) * central
+</code></pre>
+<p>The compartmental <em>topology</em> (number of states, dose routing, observation
+mapping) is still specified by the modeler. Random effects can attach
+directly to the NN weights via <code>iiv = additive</code> — Bräm et al.’s key
+contribution.</p>
+<p>Reference: <strong>Bräm et al. 2025</strong> — <em>Low-dimensional neural ordinary
+differential equations accounting for inter-individual variability
+implemented in Monolix and NONMEM.</em> CPT Pharmacometrics Syst Pharmacol
+14:5–16. DOI <a href="https://doi.org/10.1002/psp4.13265">10.1002/psp4.13265</a>.</p>
+<h2 id="guardrails"><a class="header" href="#guardrails">Guardrails</a></h2>
+<p>Because both blocks declare neural networks, the parser and runtime
+enforce a few rules to keep the difference visible:</p>
+<ul>
+<li><strong>Block-name cross-check</strong>: a <code>[covariate_nn]</code> referenced inside <code>[odes]</code>
+is a hard error pointing to <code>[dynamics_nn]</code> (and vice versa).</li>
+<li><strong>Fit-output reporting</strong>: both <code>{model}-fit.yaml</code> (CLI) and <code>.fitrx</code>
+(programmatic round-trip) emit a <code>neural_networks:</code> section listing every
+active block, its shape, and its weight count.</li>
+<li><strong>Runtime warning on <code>[dynamics_nn]</code></strong>: a <code>FitResult.warnings</code> entry
+notes the expected 10–100× slowdown vs classical PK and the lack of
+reliable standard errors for NN weights.</li>
+<li><strong>Scoped covariance auto-disable</strong>: when <code>[dynamics_nn]</code> is present and
+<code>covariance = true</code>, ferx-core overrides to <code>covariance = false</code> and
+warns. <code>[covariate_nn]</code> weights are reasonably identifiable and
+covariance estimation stays enabled there.</li>
+</ul>
+<h2 id="status"><a class="header" href="#status">Status</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Column</th><th>Type</th><th>Default</th><th>Description</th></tr>
+<tr><th>Component</th><th>Status</th></tr>
 </thead>
 <tbody>
-<tr><td><code>EVID</code></td><td>integer</td><td>0</td><td>Event ID: 0 = observation, 1 = dose, 4 = reset + dose</td></tr>
-<tr><td><code>AMT</code></td><td>numeric</td><td>0</td><td>Dose amount (only for <code>EVID=1</code> or <code>EVID=4</code>)</td></tr>
-<tr><td><code>CMT</code></td><td>integer</td><td>1</td><td>Compartment number (1-indexed)</td></tr>
-<tr><td><code>RATE</code></td><td>numeric</td><td>0</td><td>Infusion rate. 0 = bolus dose</td></tr>
-<tr><td><code>MDV</code></td><td>integer</td><td>0</td><td>Missing DV flag. 1 = DV should be ignored</td></tr>
-<tr><td><code>II</code></td><td>numeric</td><td>0</td><td>Interdose interval for repeated dosing</td></tr>
-<tr><td><code>SS</code></td><td>integer</td><td>0</td><td>Steady-state flag. 1 = assume steady state</td></tr>
-<tr><td><code>CENS</code></td><td>integer</td><td>0</td><td>Censoring flag. 1 = observation is below LLOQ; <code>DV</code> carries the LLOQ value. Paired with <code>bloq_method = m3</code> in <code>[fit_options]</code> to enable likelihood-based handling — see <a href="examples/bloq.html">BLOQ example</a>.</td></tr>
+<tr><td><code>nn</code> cargo feature, <code>MlpMapper</code>, <code>NamedMlpMapper</code> (forward + Jacobian)</td><td>Implemented in <code>src/nn/mod.rs</code>; behind <code>--features nn</code></td></tr>
+<tr><td><code>[covariate_nn]</code> parser block + auto-generated thetas</td><td>Pending (Phase A M1)</td></tr>
+<tr><td><code>pk_param_fn</code> dispatch on <code>[covariate_nn]</code></td><td>Pending (Phase A M1)</td></tr>
+<tr><td><code>method = nn_mse</code> fixed-effects objective</td><td>Pending (Phase A M1)</td></tr>
+<tr><td>Mu-ref composition <code>TYPICAL_PK.X * exp(ETA_X)</code></td><td>Pending (Phase A M2)</td></tr>
+<tr><td><code>[dynamics_nn]</code> block + NN-in-ODE-expression syntax</td><td>Pending (Phase B)</td></tr>
+<tr><td>Activation-aware Bräm-style initializer</td><td>Pending (Phase B)</td></tr>
+<tr><td>Outer-loop AD through NN weights (production speed)</td><td>Deferred (Phase A M3)</td></tr>
 </tbody>
 </table>
 </div>
-<h2 id="occasion-column-iov"><a class="header" href="#occasion-column-iov">Occasion Column (IOV)</a></h2>
-<p>When using Inter-Occasion Variability (IOV), add an occasion-index column to the dataset and specify its name with <code>iov_column</code> in <code>[fit_options]</code>. The column:</p>
-<ul>
-<li>Contains <strong>integer occasion indices</strong> (e.g. 1, 2, 3…) — one per row</li>
-<li>Applies to both dose rows and observation rows</li>
-<li>Is <strong>excluded from covariate auto-detection</strong></li>
-</ul>
-<p>Example dataset with <code>OCC</code> column:</p>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,MDV,OCC
-1,0,.,1,100,1,1,1
-1,1,9.5,0,.,.,0,1
-1,2,7.3,0,.,.,0,1
-1,24,.,1,100,1,1,2
-1,25,10.1,0,.,.,0,2
-1,26,8.2,0,.,.,0,2
-</code></pre>
-<p>The occasion index can be any positive integer; they do not need to start at 1 or be consecutive, but a different number means a different occasion with its own kappa EBE.</p>
-<p>See <a href="estimation/iov.html">IOV documentation</a> for full details.</p>
-<h2 id="covariate-columns"><a class="header" href="#covariate-columns">Covariate Columns</a></h2>
-<p>Any column not in the standard set above is automatically treated as a covariate. Covariate values are:</p>
-<ul>
-<li><strong>Time-constant</strong>: The first non-missing value for each subject is used</li>
-<li><strong>Time-varying</strong>: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied per event (NONMEM-equivalent: <code>[individual_parameters]</code> is re-evaluated at each dose and observation row using that row’s covariate values)</li>
-</ul>
-<p>Covariate names in the data file are matched case-insensitively to names used in <code>[individual_parameters]</code> expressions.</p>
-<h3 id="time-varying-covariate-scope"><a class="header" href="#time-varying-covariate-scope">Time-varying covariate scope</a></h3>
-<p>Time-varying covariates are supported for <strong>all</strong> analytical structural models and ODE-defined models:</p>
-<ul>
-<li>1-compartment IV bolus (<code>one_cpt_iv_bolus</code>)</li>
-<li>1-compartment infusion (<code>one_cpt_infusion</code>)</li>
-<li>1-compartment oral (<code>one_cpt_oral</code>)</li>
-<li>2-compartment IV bolus (<code>two_cpt_iv_bolus</code>)</li>
-<li>2-compartment infusion (<code>two_cpt_infusion</code>)</li>
-<li>2-compartment oral (<code>two_cpt_oral</code>)</li>
-<li>3-compartment IV bolus (<code>three_cpt_iv_bolus</code>)</li>
-<li>3-compartment infusion (<code>three_cpt_infusion</code>)</li>
-<li>3-compartment oral (<code>three_cpt_oral</code>)</li>
-<li>All ODE-defined models (via <code>[odes]</code>)</li>
-</ul>
-<p>For oral models, the bolus dose into compartment 1 is interpreted as the depot (NONMEM ADVAN2/ADVAN4/ADVAN12 convention) and observation read-out reads the central compartment.</p>
-<p>The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients <em>and</em> an AD-accelerated H-matrix Jacobian (forward-mode), so neither the inner-loop gradient nor the per-iteration Jacobian falls back to finite-differences.</p>
-<p>Infusion routing on the event-driven path:</p>
-<ul>
-<li><strong>IV models</strong>: central infusion (cmt=1) for all 1/2/3-cpt; <strong>peripheral infusion</strong> for 2-cpt (cmt=2) and 3-cpt (cmt=2 → periph1, cmt=3 → periph2). Steady-state amounts per channel are computed by linear superposition over the channels.</li>
-<li><strong>Oral models</strong>: central infusion (cmt=2) is supported; peripheral infusion is rare clinically and still panics with a clear message (tracked as a follow-up).</li>
-</ul>
-<h2 id="event-types-evid"><a class="header" href="#event-types-evid">Event Types (EVID)</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>EVID</th><th>Meaning</th></tr>
-</thead>
-<tbody>
-<tr><td>0</td><td>Observation record. <code>DV</code> is used for estimation.</td></tr>
-<tr><td>1</td><td>Dosing record. <code>AMT</code> is administered to compartment <code>CMT</code>.</td></tr>
-<tr><td>2</td><td>Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row’s covariate values — matching NONMEM’s <code>$PK runs at every record</code> semantic. Only meaningful when at least one covariate is time-varying; for time-constant data EVID=2 rows are skipped (would be no-ops).</td></tr>
-<tr><td>4</td><td>Reset and dose. All compartment amounts are reset to zero before dosing.</td></tr>
-</tbody>
-</table>
-</div>
-<h2 id="example-dataset"><a class="header" href="#example-dataset">Example Dataset</a></h2>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT,CRCL
-1,0,.,1,100,1,0,1,70,95
-1,0.5,9.49,0,.,.,.,0,70,95
-1,1,14.42,0,.,.,.,0,70,95
-1,2,17.56,0,.,.,.,0,70,95
-1,4,15.23,0,.,.,.,0,70,95
-1,8,10.15,0,.,.,.,0,70,95
-2,0,.,1,150,1,0,1,85,110
-2,0.5,14.2,0,.,.,.,0,85,110
-2,1,21.3,0,.,.,.,0,85,110
-</code></pre>
-<p>Key points:</p>
-<ul>
-<li>Dose records (<code>EVID=1</code>) have <code>MDV=1</code> and <code>DV=.</code> (missing)</li>
-<li>Observation records (<code>EVID=0</code>) have <code>MDV=0</code> and a valid <code>DV</code></li>
-<li>Covariates (<code>WT</code>, <code>CRCL</code>) are included as extra columns</li>
-<li>Missing values can be represented as <code>.</code> or left empty</li>
-</ul>
-<h2 id="infusion-doses"><a class="header" href="#infusion-doses">Infusion Doses</a></h2>
-<p>For IV infusions, set <code>RATE</code> to the infusion rate (amount per time unit):</p>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
-1,0,.,1,500,1,50,1
-</code></pre>
-<p>This administers 500 units at a rate of 50 units/hour (duration = 10 hours).</p>
-<h2 id="steady-state-dosing"><a class="header" href="#steady-state-dosing">Steady-State Dosing</a></h2>
-<p>For steady-state simulations, set <code>SS=1</code> and <code>II</code> to the dosing interval:</p>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,SS,II,MDV
-1,0,.,1,100,1,1,12,1
-1,0.5,25.3,0,.,.,.,.,0
-</code></pre>
-<p>This assumes the subject has reached steady state with 100 units every 12 hours before the observation at TIME=0.5.</p>
-<h2 id="multiple-doses"><a class="header" href="#multiple-doses">Multiple Doses</a></h2>
-<p>Multiple doses are supported as separate rows:</p>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,MDV
-1,0,.,1,100,1,1
-1,0.5,9.49,0,.,.,0
-1,12,.,1,100,1,1
-1,12.5,15.2,0,.,.,0
-1,24,.,1,100,1,1
-1,24.5,18.1,0,.,.,0
-</code></pre>
-<h2 id="column-name-case"><a class="header" href="#column-name-case">Column Name Case</a></h2>
-<p>Column names are case-insensitive. <code>ID</code>, <code>Id</code>, and <code>id</code> are all recognized. Covariate columns preserve their case as declared in the CSV header.</p>
+<p>The Rust-level API (the <code>CovariateMapper</code> trait and <code>MlpMapper</code>) is
+already callable today — see <code>tests/nn_dcm_smoke.rs</code> for an end-to-end
+example.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="estimation/iov.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../model-file/diffusion.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="cli.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../model-file/fit-options.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -333,11 +311,11 @@
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="estimation/iov.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../model-file/diffusion.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="cli.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../model-file/fit-options.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
@@ -357,16 +335,16 @@
         </script>
 
 
-        <script src="elasticlunr-ef4e11c1.min.js"></script>
-        <script src="mark-09e88c2c.min.js"></script>
-        <script src="searcher-c2a407aa.js"></script>
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
 
-        <script src="clipboard-1626706a.min.js"></script>
-        <script src="highlight-abc7f01d.js"></script>
-        <script src="book-a0b12cfe.js"></script>
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
 
         <!-- Custom JS scripts -->
-        <script src="mathjax-config-cc82dc7f.js"></script>
+        <script src="../mathjax-config-cc82dc7f.js"></script>
 
 
 

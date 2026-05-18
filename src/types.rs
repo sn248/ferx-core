@@ -716,6 +716,15 @@ pub struct CompiledModel {
     /// Per-theta transformation: `theta_transform[i]` describes whether theta i
     /// is used on the natural (Identity), log, or logit scale. Length == n_theta.
     pub theta_transform: Vec<ThetaTransform>,
+    /// Parsed `[covariate_nn NAME]` blocks (one entry per block in the model
+    /// file). Empty when the `nn` feature is off or no block is present.
+    /// The fit / predict / simulate paths do not yet consume this field —
+    /// the next PR wires `pk_param_fn` dispatch onto these mappers. For now
+    /// the parser registers each mapper's weights as plain thetas in
+    /// `default_params.theta`, so optimizer-vector layout is already
+    /// representative.
+    #[cfg(feature = "nn")]
+    pub covariate_nns: Vec<crate::nn::CovariateNn>,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -1443,6 +1452,8 @@ pub(crate) mod test_helpers {
             parse_warnings: Vec::new(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
         }
     }
 }

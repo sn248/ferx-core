@@ -537,6 +537,38 @@ impl CovariateMapper for NamedMlpMapper {
 }
 
 // ---------------------------------------------------------------------------
+// CovariateNn — a parsed `[covariate_nn NAME]` block, ready to be
+// consumed by the fitting pipeline.
+// ---------------------------------------------------------------------------
+
+/// One instance of a `[covariate_nn NAME]` block, stored on `CompiledModel`.
+///
+/// The parser builds this and:
+///
+/// 1. registers the mapper's `n_weights()` weights as plain thetas in the
+///    optimizer parameter vector, with names of the form
+///    `W_<NAME>_<l>_<i>_<j>` / `B_<NAME>_<l>_<i>` (uppercased), starting
+///    at index [`weights_offset`](Self::weights_offset);
+/// 2. stores the resulting handle here so the fit / predict / simulate
+///    paths can slice out the relevant weights at runtime via
+///    `&theta[weights_offset..weights_offset + n_weights]`.
+///
+/// Multiple `[covariate_nn]` blocks per model are syntactically allowed by
+/// the parser (the `named` block map keys them by `NAME`), though Phase A M1
+/// only exercises the single-block case end-to-end.
+#[derive(Debug, Clone)]
+pub struct CovariateNn {
+    /// User-visible identifier from the block header (e.g. `TYPICAL_PK`).
+    /// Used in `[individual_parameters]` dot-access (`TYPICAL_PK.CL`).
+    pub name: String,
+    /// The mapper that translates `(covariates, weights) → PkParams`.
+    pub mapper: NamedMlpMapper,
+    /// Index into `ModelParameters::theta` where this NN's weight block
+    /// starts. The block has `mapper.n_weights()` contiguous entries.
+    pub weights_offset: usize,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

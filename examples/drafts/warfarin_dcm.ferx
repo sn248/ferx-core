@@ -1,18 +1,25 @@
 # ────────────────────────────────────────────────────────────────────────────
 # DRAFT — design intent for Deep Compartment Models (DCM)
 #
-# This file shows the *proposed* `.ferx` syntax for a mixed-effects DCM model.
-# The neural-network engine (`src/nn/mod.rs`) is implemented and tested in the
-# PR that introduces this file (https://github.com/FeRx-NLME/ferx-core/pull/24
-# and successors), but the parser integration that turns this file into a
-# runnable `CompiledModel` is intentionally **not yet wired**. Running
-# `cargo run -- examples/drafts/warfarin_dcm.ferx` today will fail with an
-# unrecognised-block error — this is expected.
+# What's wired now (Phase A M1, behind `--features nn`):
+#   ✓ `[covariate_nn NAME]` block syntax parses end-to-end.
+#   ✓ NN weight thetas (`W_TYPICAL_PK_…`, `B_TYPICAL_PK_…`) are auto-generated
+#     and appended to the model's theta vector with Glorot-style inits.
+#   ✓ `model.covariate_nns` exposes the mapper handle on `CompiledModel`.
 #
-# The file lives here so reviewers can comment on the proposed DSL on the PR.
-# When the parser support lands (Phase A M1.5 / M2 — see
-# `plans/dcm-and-low-dim-node.md`) this header comment will be removed and
-# the file will become a real, runnable example.
+# What's NOT wired yet (planned for the next PR):
+#   ✗ `method = nn_mse` fit objective.
+#   ✗ Mu-ref composition `TYPICAL_PK.CL * exp(ETA_CL)` in `[individual_parameters]`.
+#   ✗ `pk_param_fn` dispatch onto the NN.
+#
+# Running `cargo run --features nn -- examples/drafts/warfarin_dcm.ferx` today
+# will FAIL on the `[individual_parameters]` reference to `TYPICAL_PK.CL`
+# (unknown identifier) and on `method = nn_mse` (unknown method). Expected.
+#
+# The file lives in `examples/drafts/` so the parser smoke test
+# (`test_parse_all_example_ferx_files`) skips it. When parser-side support
+# for the mu-ref composition + nn_mse lands, the file will be promoted to
+# `examples/warfarin_dcm.ferx` and this header removed.
 # ────────────────────────────────────────────────────────────────────────────
 #
 # Model: two-compartment oral PK, NN-based typical values (DCM), additive

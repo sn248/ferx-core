@@ -1262,6 +1262,8 @@ mod iov_tests {
             parse_warnings: Vec::new(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
         }
     }
 
@@ -1361,6 +1363,8 @@ mod iov_tests {
             parse_warnings: Vec::new(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
         };
         let subject = Subject {
             id: "1".into(),

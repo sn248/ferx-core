@@ -1842,7 +1842,10 @@ mod iov_integration {
     // ── Tests: FOCEI ─────────────────────────────────────────────────────────
 
     #[test]
-    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn test_iov_focei_bobyqa() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1864,7 +1867,10 @@ mod iov_integration {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn test_iov_focei_mu_referencing_on() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1887,7 +1893,10 @@ mod iov_integration {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn test_iov_gn_hybrid() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -2682,13 +2691,27 @@ mod sde_integration {
 
     fn make_sde_population() -> Population {
         // 4 subjects, single IV bolus dose=100 at t=0, observations at 3 times.
-        // Concentrations from a 1-cpt model with CL=5, V=50 plus modest noise.
+        // The ODE `d/dt(central) = -(CL/V) * central` describes the amount in
+        // the central compartment (mg) — ferx adds `dose.amt` directly to the
+        // state, so for an IV bolus the state IS the dose in amount units.
+        // Observations must therefore also be in amount (mg), not concentration.
+        // True amounts from a 1-cpt model with CL=5, V=50 (k = 0.1/h):
+        //   t=1: A(t) = 100·exp(-0.1) = 90.48
+        //   t=4: A(t) = 100·exp(-0.4) = 67.03
+        //   t=8: A(t) = 100·exp(-0.8) = 44.93
+        // Values below are symmetric ±5% perturbations of the true amounts
+        // (two subjects below, two above) so the population sample remains
+        // centered on the analytical trajectory.
         let obs_times = vec![1.0, 4.0, 8.0];
         let dvs: &[(&str, Vec<f64>)] = &[
-            ("S1", vec![1.62, 0.92, 0.48]),
-            ("S2", vec![1.70, 0.97, 0.52]),
-            ("S3", vec![1.55, 0.88, 0.45]),
-            ("S4", vec![1.65, 0.94, 0.50]),
+            // -5% across all times
+            ("S1", vec![85.96, 63.68, 42.68]),
+            // +5% across all times
+            ("S2", vec![95.00, 70.38, 47.18]),
+            // -3% across all times
+            ("S3", vec![87.77, 65.02, 43.58]),
+            // +3% across all times
+            ("S4", vec![93.19, 69.04, 46.28]),
         ];
         let subjects = dvs
             .iter()
@@ -2762,8 +2785,21 @@ mod sde_integration {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn test_sde_ofv_le_base_ofv() {
+        // Reference: the OFV from the identical model fit without the
+        // [diffusion] block (BASE_MODEL_SRC). Since [diffusion] adds an extra
+        // free parameter (DIFF_CENTRAL ≥ 0) and the EKF observation variance
+        // collapses to the residual-only variance when DIFF_CENTRAL → 0, the
+        // SDE OFV must be ≤ the base OFV at the optimum.
+        // The +1 unit of slack absorbs numerical noise from finite-difference
+        // gradients, NLopt's stopping tolerance (`outer_gtol = 1e-3`), and the
+        // truncated `outer_maxiter = 80` cap in `fast_foce_opts`; without the
+        // slack we'd flake on iterations where the SDE fit stopped a hair
+        // short of the base fit's OFV.
         let pop = make_sde_population();
         let opts = fast_foce_opts();
 

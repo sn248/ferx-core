@@ -795,7 +795,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         theta_fixed.push(is_fixed);
     }
     n_theta = theta_names.len(); // set here after diffusion thetas are appended above
-    // BSV omega is built from the BSV-only eta names (no kappas)
+                                 // BSV omega is built from the BSV-only eta names (no kappas)
     let omega = build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?;
     let omega_fixed = build_omega_fixed(&omegas, &block_omegas, &eta_names_bsv)?;
     let sigma_values: Vec<f64> = sigmas.iter().map(|s| s.value).collect();
@@ -2211,16 +2211,14 @@ fn build_pk_param_fn(
             var_idx.get(var_name).copied().map(|s| s)
         })
         .collect();
-    let ode_lagtime_slot: Option<usize> = vars_in_order
-        .iter()
-        .find_map(|var_name| {
-            let upper = var_name.to_uppercase();
-            if upper == "LAGTIME" || upper == "ALAG" {
-                var_idx.get(var_name).copied()
-            } else {
-                None
-            }
-        });
+    let ode_lagtime_slot: Option<usize> = vars_in_order.iter().find_map(|var_name| {
+        let upper = var_name.to_uppercase();
+        if upper == "LAGTIME" || upper == "ALAG" {
+            var_idx.get(var_name).copied()
+        } else {
+            None
+        }
+    });
 
     let cov_names_for_lookup = referenced_covariates.clone();
 
@@ -2410,9 +2408,9 @@ fn collect_covariates_in_condition(cond: &Condition, out: &mut std::collections:
 fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
     for s in stmts {
         match s {
-            Statement::Assign(_, e)
-            | Statement::AssignIdx(_, e)
-            | Statement::DiffEq(_, e) => collect_covariates(e, out),
+            Statement::Assign(_, e) | Statement::AssignIdx(_, e) | Statement::DiffEq(_, e) => {
+                collect_covariates(e, out)
+            }
             Statement::If {
                 branches,
                 else_body,
@@ -2443,7 +2441,10 @@ fn eval_expression(
         Expression::Covariate(name) => covariates.get(name).copied().unwrap_or(0.0),
         Expression::Variable(name) => vars.get(name).copied().unwrap_or(0.0),
         Expression::VariableIdx(_) | Expression::CovariateIdx(_) => {
-            debug_assert!(false, "indexed expression reached unindexed eval_expression");
+            debug_assert!(
+                false,
+                "indexed expression reached unindexed eval_expression"
+            );
             0.0
         }
         Expression::BinOp(lhs, op, rhs) => {

@@ -144,8 +144,7 @@ fn detect_stagnation(state: &mut NloptState, n: usize) -> bool {
     // [types.rs:959].
     const STAGNATION_THRESHOLD: f64 = 1e-3;
 
-    let improved =
-        (state.best_at_last_improvement - state.best_ofv) > STAGNATION_THRESHOLD;
+    let improved = (state.best_at_last_improvement - state.best_ofv) > STAGNATION_THRESHOLD;
     if improved {
         state.last_improvement_eval = state.n_evals;
         state.best_at_last_improvement = state.best_ofv;
@@ -449,10 +448,7 @@ fn optimize_nlopt(
     // scaling whenever any identity-packed theta is present, so the
     // optimizer runs in the natural (mixed) packed space where
     // BFGS's own scale-adaptation works correctly.
-    let has_identity_theta = init_params
-        .theta_lower
-        .iter()
-        .any(|&lo| lo < 0.0);
+    let has_identity_theta = init_params.theta_lower.iter().any(|&lo| lo < 0.0);
     let scale: Vec<f64> = if options.scale_params && !has_identity_theta {
         compute_scale(&x0)
     } else {
@@ -717,8 +713,8 @@ fn optimize_nlopt(
         // still make real trust-region progress: 40 evals/param baseline
         // plus the outer_maxiter budget. The setup phase alone costs
         // 2n+1 evals before any movement.
-        let bobyqa_maxeval = (options.outer_maxiter as u32).saturating_mul(n as u32 + 1)
-            + 40 * (n as u32 + 1);
+        let bobyqa_maxeval =
+            (options.outer_maxiter as u32).saturating_mul(n as u32 + 1) + 40 * (n as u32 + 1);
         opt.set_maxeval(bobyqa_maxeval).unwrap();
         // BOBYQA's xtol_rel controls rho_end / rho_start — i.e. how much
         // it must shrink the trust radius to declare success. 1e-12 is

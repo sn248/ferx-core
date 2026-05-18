@@ -735,7 +735,9 @@ pub fn run_saem(
                 log_sigma = sigma_new;
             }
 
-            state.theta = (0..n_theta).map(|i| unpack_theta(i, log_theta[i])).collect();
+            state.theta = (0..n_theta)
+                .map(|i| unpack_theta(i, log_theta[i]))
+                .collect();
             state.sigma_vals = log_sigma.iter().map(|&v| v.exp()).collect();
         }
 

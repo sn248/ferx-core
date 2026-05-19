@@ -29,7 +29,7 @@ jobs:
         with:
           shared-key: ci
       - name: cargo check
-        run: cargo check --no-default-features --features ci
+        run: cargo check --tests --no-default-features --features ci
 
   test:
     name: Test

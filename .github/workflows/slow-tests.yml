@@ -43,6 +43,7 @@ jobs:
         with:
           shared-key: ci-slow
       - name: cargo test (release + slow-tests)
-        # With `slow-tests` on, the gated tests are no longer `#[ignore]`d
-        # so `--include-ignored` is a no-op here. Kept off for clarity.
-        run: cargo test --lib --no-default-features --features ci,slow-tests --release
+        # `--lib` is intentionally omitted so integration tests in `tests/`
+        # are compiled and run here. Gated slow tests (the `slow-tests` feature
+        # removes their `#[ignore]`) and ungated integration tests both execute.
+        run: cargo test --no-default-features --features ci,slow-tests --release

@@ -225,6 +225,11 @@ struct OmegaWire {
     param_corr: Option<MatrixWire>,
     #[serde(with = "vec_f64_nan_as_null")]
     shrinkage: Vec<f64>,
+    /// Per-eta SD-init flag (see `FitResult.omega_init_as_sd`). Optional /
+    /// defaulted so .fitrx files written before issue #5 still load — older
+    /// bundles deserialize with an all-`false` vector.
+    #[serde(default)]
+    init_as_sd: Vec<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -234,6 +239,10 @@ struct SigmaWire {
     se: Option<Vec<f64>>,
     fixed: Vec<bool>,
     types: Vec<String>,
+    /// Per-sigma SD-init flag (see `FitResult.sigma_init_as_sd`). Defaulted
+    /// for backward compatibility with .fitrx files from before issue #5.
+    #[serde(default)]
+    init_as_sd: Vec<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -256,6 +265,10 @@ struct IovWire {
     shrinkage_kappa: Vec<f64>,
     omega_iov: MatrixWire,
     omega_iov_param_corr: Option<MatrixWire>,
+    /// Per-kappa SD-init flag. Defaulted for backward compatibility with
+    /// .fitrx files from before issue #5.
+    #[serde(default)]
+    kappa_init_as_sd: Vec<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -585,6 +598,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             log_transformed: r.eta_log_transformed.clone(),
             param_corr: r.omega_param_corr.as_ref().map(MatrixWire::from),
             shrinkage: r.shrinkage_eta.clone(),
+            init_as_sd: r.omega_init_as_sd.clone(),
         },
         sigma: SigmaWire {
             names: r.sigma_names.clone(),
@@ -596,6 +610,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
                 .iter()
                 .map(|t| sigma_type_to_str(*t).into())
                 .collect(),
+            init_as_sd: r.sigma_init_as_sd.clone(),
         },
         error_model: error_model_to_str(r.error_model).into(),
         shrinkage_eps: r.shrinkage_eps,
@@ -623,6 +638,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             shrinkage_kappa: r.shrinkage_kappa.clone(),
             omega_iov: MatrixWire::from(m),
             omega_iov_param_corr: r.omega_iov_param_corr.as_ref().map(MatrixWire::from),
+            kappa_init_as_sd: r.kappa_init_as_sd.clone(),
         }),
         eta_param_info: r
             .eta_param_info
@@ -1226,7 +1242,7 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
 }
 
 fn wire_to_fit_result(
-    w: FitWire,
+    mut w: FitWire,
     subjects: Vec<SubjectResult>,
     ebe_kappas: Vec<Vec<DVector<f64>>>,
 ) -> Result<FitResult, FitrxError> {
@@ -1268,20 +1284,39 @@ fn wire_to_fit_result(
     let omega_param_corr = w.omega.param_corr.map(|m| m.into_dmatrix()).transpose()?;
     let covariance_matrix = w.covariance_matrix.map(|m| m.into_dmatrix()).transpose()?;
 
-    let (omega_iov, kappa_names, kappa_fixed, se_kappa, shrinkage_kappa, omega_iov_param_corr) =
-        match w.iov {
-            Some(iov) => (
+    let (
+        omega_iov,
+        kappa_names,
+        kappa_fixed,
+        kappa_init_as_sd,
+        se_kappa,
+        shrinkage_kappa,
+        omega_iov_param_corr,
+    ) = match w.iov {
+        Some(iov) => {
+            // Older .fitrx bundles (pre-issue #5) wrote no init_as_sd flag —
+            // serde_default leaves an empty vec there; pad to match the
+            // kappa diagonal so downstream code can index it uniformly.
+            let n_k = iov.kappa_names.len();
+            let init_as_sd = if iov.kappa_init_as_sd.len() == n_k {
+                iov.kappa_init_as_sd
+            } else {
+                vec![false; n_k]
+            };
+            (
                 Some(iov.omega_iov.into_dmatrix()?),
                 iov.kappa_names,
                 iov.kappa_fixed,
+                init_as_sd,
                 iov.se_kappa,
                 iov.shrinkage_kappa,
                 iov.omega_iov_param_corr
                     .map(|m| m.into_dmatrix())
                     .transpose()?,
-            ),
-            None => (None, Vec::new(), Vec::new(), None, Vec::new(), None),
-        };
+            )
+        }
+        None => (None, Vec::new(), Vec::new(), Vec::new(), None, Vec::new(), None),
+    };
 
     let (sir_ci_theta, sir_ci_omega, sir_ci_sigma, sir_ess, sir_resamples_packed) = match w.sir {
         Some(s) => (
@@ -1292,6 +1327,23 @@ fn wire_to_fit_result(
             s.resamples_packed,
         ),
         None => (None, None, None, None, None),
+    };
+
+    // Pre-issue-#5 .fitrx files have no `init_as_sd` field; serde_default
+    // leaves an empty vec there, which we promote to all-false to match the
+    // eta/sigma cardinality. Computed up-front because the FitResult literal
+    // below moves `w.omega.names` and `w.sigma.names` into other fields.
+    let n_eta_w = w.omega.names.len();
+    let n_sigma_w = w.sigma.names.len();
+    let omega_init_as_sd_resolved = if w.omega.init_as_sd.len() == n_eta_w {
+        std::mem::take(&mut w.omega.init_as_sd)
+    } else {
+        vec![false; n_eta_w]
+    };
+    let sigma_init_as_sd_resolved = if w.sigma.init_as_sd.len() == n_sigma_w {
+        std::mem::take(&mut w.sigma.init_as_sd)
+    } else {
+        vec![false; n_sigma_w]
     };
 
     Ok(FitResult {
@@ -1315,6 +1367,8 @@ fn wire_to_fit_result(
         theta_fixed: w.theta.fixed,
         omega_fixed: w.omega.fixed,
         sigma_fixed: w.sigma.fixed,
+        omega_init_as_sd: omega_init_as_sd_resolved,
+        sigma_init_as_sd: sigma_init_as_sd_resolved,
         subjects,
         n_obs: w.n_obs,
         n_subjects: w.n_subjects,
@@ -1330,6 +1384,7 @@ fn wire_to_fit_result(
         omega_iov,
         kappa_names,
         kappa_fixed,
+        kappa_init_as_sd,
         se_kappa,
         shrinkage_kappa,
         ebe_kappas,
@@ -1470,6 +1525,8 @@ mod tests {
             theta_fixed: vec![false, false, false],
             omega_fixed: vec![false, false],
             sigma_fixed: vec![false],
+            omega_init_as_sd: vec![false, false],
+            sigma_init_as_sd: vec![false],
             subjects: vec![dummy_subject("S1", n_eta, 3), dummy_subject("S2", n_eta, 2)],
             n_obs: 5,
             n_subjects: 2,
@@ -1485,6 +1542,7 @@ mod tests {
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],
+            kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],
             ebe_kappas: vec![],

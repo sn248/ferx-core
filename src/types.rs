@@ -632,6 +632,20 @@ pub struct CompiledModel {
     /// approaches this limit.
     pub indiv_param_names: Vec<String>,
     pub default_params: ModelParameters,
+    /// Per-eta flag (parallel to `eta_names` / omega diagonal): `true` when
+    /// the user wrote `omega NAME ~ X (sd)` and the parser squared the value.
+    /// Pure display metadata — the stored `default_params.omega` is always on
+    /// the variance scale. Always `false` for etas declared inside a
+    /// `block_omega`, which is variance-only.
+    pub omega_init_as_sd: Vec<bool>,
+    /// Per-sigma flag (parallel to `default_params.sigma.values`): `true` when
+    /// the user wrote `sigma NAME ~ X (sd)`. Since #56 the .ferx default for
+    /// sigma is variance — the parser `sqrt`s the variance-scale input into
+    /// the internal SD representation. With `(sd)` the value is stored as-is.
+    pub sigma_init_as_sd: Vec<bool>,
+    /// Per-kappa flag (parallel to `kappa_names`): `true` when the user wrote
+    /// `kappa NAME ~ X (sd)`. Empty when no kappa declarations are present.
+    pub kappa_init_as_sd: Vec<bool>,
     /// Detected mu-referencing relationships: eta_name → (theta_name, log_transformed).
     /// Populated by the parser; empty map means no mu-referencing detected.
     pub mu_refs: HashMap<String, MuRef>,
@@ -883,6 +897,15 @@ pub struct FitResult {
     pub theta_fixed: Vec<bool>,
     pub omega_fixed: Vec<bool>,
     pub sigma_fixed: Vec<bool>,
+    /// Per-eta SD-init flag (parallel to the omega diagonal): `true` when the
+    /// initial value was written as `omega NAME ~ X (sd)`. Lets downstream
+    /// printers annotate the estimate with `[initial specified as SD]`.
+    /// Always `false` for block-omega entries.
+    pub omega_init_as_sd: Vec<bool>,
+    /// Per-sigma SD-init flag (parallel to `sigma`): `true` when the initial
+    /// value was written as `sigma NAME ~ X (sd)`, `false` for the variance
+    /// default.
+    pub sigma_init_as_sd: Vec<bool>,
     pub subjects: Vec<SubjectResult>,
     pub n_obs: usize,
     pub n_subjects: usize,
@@ -906,6 +929,10 @@ pub struct FitResult {
     pub omega_iov: Option<DMatrix<f64>>,
     pub kappa_names: Vec<String>,
     pub kappa_fixed: Vec<bool>,
+    /// Per-kappa SD-init flag (parallel to the `omega_iov` diagonal). Same
+    /// semantics as `omega_init_as_sd` — `true` when the user wrote
+    /// `kappa NAME ~ X (sd)`. Always `false` for block_kappa entries.
+    pub kappa_init_as_sd: Vec<bool>,
     pub se_kappa: Option<Vec<f64>>,
     pub shrinkage_kappa: Vec<f64>,
     /// Per-subject, per-occasion kappa EBEs.
@@ -1496,6 +1523,9 @@ pub(crate) mod test_helpers {
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
             },
+            omega_init_as_sd: vec![false],
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: Vec::new(),
             mu_refs: HashMap::new(),
             kappa_mu_refs: HashMap::new(),
             // Analytical models populate tv_fn; ODE models leave it None.

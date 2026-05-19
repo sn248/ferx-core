@@ -15,7 +15,7 @@
   omega ETA_V  ~ 0.04
   omega ETA_KA ~ 0.30 FIX
 
-  sigma PROP_ERR ~ 0.02 FIX
+  sigma PROP_ERR ~ 0.02 (sd) FIX
 
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)

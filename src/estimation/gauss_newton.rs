@@ -554,10 +554,18 @@ fn dr_diag_d_log_sigma(
         .zip(pred_point.iter())
         .map(|(&r_j, &f_j)| match error_model {
             ErrorModel::Additive => {
-                if sigma_k == 0 { 2.0 * sigma_values[0] * sigma_values[0] } else { 0.0 }
+                if sigma_k == 0 {
+                    2.0 * sigma_values[0] * sigma_values[0]
+                } else {
+                    0.0
+                }
             }
             ErrorModel::Proportional => {
-                if sigma_k == 0 { 2.0 * r_j } else { 0.0 }
+                if sigma_k == 0 {
+                    2.0 * r_j
+                } else {
+                    0.0
+                }
             }
             ErrorModel::Combined => {
                 if sigma_k == 0 {
@@ -608,7 +616,11 @@ fn subject_nll_pop_grad_analytical(
     let ipreds = pk::compute_predictions_with_tv(model, subject, &params.theta, eta_hat.as_slice());
 
     let h_eta = h_matrix * eta_hat;
-    let f0: Vec<f64> = ipreds.iter().enumerate().map(|(j, &ip)| ip - h_eta[j]).collect();
+    let f0: Vec<f64> = ipreds
+        .iter()
+        .enumerate()
+        .map(|(j, &ip)| ip - h_eta[j])
+        .collect();
 
     // r_diag: at f0 (standard) or at ipreds (interaction)
     let r_pred_point: &[f64] = if options.interaction { &ipreds } else { &f0 };
@@ -620,7 +632,11 @@ fn subject_nll_pop_grad_analytical(
 
     let v: DVector<f64> = DVector::from_iterator(
         n_obs,
-        subject.observations.iter().zip(f0.iter()).map(|(&y, &f)| y - f),
+        subject
+            .observations
+            .iter()
+            .zip(f0.iter())
+            .map(|(&y, &f)| y - f),
     );
     let solved_a = chol.solve(&v);
     let nll = 0.5 * (v.dot(&solved_a) + chol_log_det(&chol_l));
@@ -673,7 +689,11 @@ fn subject_nll_pop_grad_analytical(
                 ErrorModel::Additive => 0.0,
                 ErrorModel::Proportional => {
                     // r_j = sigma^2 * pred^2 => dr/d(pred) = 2*sigma^2*pred = 2*r_j/pred
-                    if pred_j.abs() > 1e-15 { 2.0 * r_j / pred_j * dp_j } else { 0.0 }
+                    if pred_j.abs() > 1e-15 {
+                        2.0 * r_j / pred_j * dp_j
+                    } else {
+                        0.0
+                    }
                 }
                 ErrorModel::Combined => {
                     let sp2 = params.sigma.values[0] * params.sigma.values[0];
@@ -720,7 +740,12 @@ fn subject_nll_pop_grad_analytical(
             // Diagonal: x[k] = log L_omega[i,i], d(omega_ii)/d(x[k]) = 2 * omega_ii
             let omega_ii = params.omega.matrix[(row, row)];
             let w = &h_cols_solved[row]; // C^{-1} h_i
-            let h_i_dot_a: f64 = h_matrix.column(row).iter().zip(solved_a.iter()).map(|(h, a)| h * a).sum();
+            let h_i_dot_a: f64 = h_matrix
+                .column(row)
+                .iter()
+                .zip(solved_a.iter())
+                .map(|(h, a)| h * a)
+                .sum();
             let w_sq: f64 = w.iter().map(|&x| x * x).sum();
             grad[k] = omega_ii * (w_sq - h_i_dot_a * h_i_dot_a);
         } else {
@@ -731,13 +756,20 @@ fn subject_nll_pop_grad_analytical(
             let l_col: Vec<f64> = (0..n_eta).map(|r| l_omega[(r, col)]).collect();
             let u: Vec<f64> = (0..n_obs)
                 .map(|obs_j| {
-                    (0..n_eta).map(|eta_i| h_matrix[(obs_j, eta_i)] * l_col[eta_i]).sum::<f64>()
+                    (0..n_eta)
+                        .map(|eta_i| h_matrix[(obs_j, eta_i)] * l_col[eta_i])
+                        .sum::<f64>()
                 })
                 .collect();
             let c_inv_u = fwd_solve(&chol_l, &u);
             let c_inv_w = &h_cols_solved[row];
             let u_dot_a: f64 = u.iter().zip(solved_a.iter()).map(|(ui, ai)| ui * ai).sum();
-            let w_dot_a: f64 = h_matrix.column(row).iter().zip(solved_a.iter()).map(|(h, a)| h * a).sum();
+            let w_dot_a: f64 = h_matrix
+                .column(row)
+                .iter()
+                .zip(solved_a.iter())
+                .map(|(h, a)| h * a)
+                .sum();
             let trace_term: f64 = c_inv_w.iter().zip(c_inv_u.iter()).map(|(w, u)| w * u).sum();
             grad[k] = trace_term - w_dot_a * u_dot_a;
         }
@@ -751,7 +783,11 @@ fn subject_nll_pop_grad_analytical(
             continue;
         }
         let dr_k = dr_diag_d_log_sigma(
-            model.error_model, &r_diag, r_pred_point, &params.sigma.values, ks,
+            model.error_model,
+            &r_diag,
+            r_pred_point,
+            &params.sigma.values,
+            ks,
         );
         let g: f64 = dr_k
             .iter()
@@ -803,7 +839,14 @@ pub(crate) fn subject_nll_pop_grad(
 
     let params_base = unpack_params(x, template);
     let nll_base = subject_nll_at(
-        model, population, subj_idx, &params_base, eta_hat, h_matrix, kappas, options,
+        model,
+        population,
+        subj_idx,
+        &params_base,
+        eta_hat,
+        h_matrix,
+        kappas,
+        options,
     );
 
     let mut grad = vec![0.0f64; n];
@@ -824,13 +867,27 @@ pub(crate) fn subject_nll_pop_grad(
         x_work[j] = xj_plus;
         let params_plus = unpack_params(&x_work, template);
         let nll_plus = subject_nll_at(
-            model, population, subj_idx, &params_plus, eta_hat, h_matrix, kappas, options,
+            model,
+            population,
+            subj_idx,
+            &params_plus,
+            eta_hat,
+            h_matrix,
+            kappas,
+            options,
         );
 
         x_work[j] = xj_minus;
         let params_minus = unpack_params(&x_work, template);
         let nll_minus = subject_nll_at(
-            model, population, subj_idx, &params_minus, eta_hat, h_matrix, kappas, options,
+            model,
+            population,
+            subj_idx,
+            &params_minus,
+            eta_hat,
+            h_matrix,
+            kappas,
+            options,
         );
 
         x_work[j] = x[j];
@@ -866,10 +923,22 @@ fn build_gn_system(
     let per_subj: Vec<(f64, Vec<f64>)> = (0..n_subj)
         .into_par_iter()
         .map(|i| {
-            let kap_i = if i < kappas.len() { kappas[i].as_slice() } else { &[] };
+            let kap_i = if i < kappas.len() {
+                kappas[i].as_slice()
+            } else {
+                &[]
+            };
             subject_nll_pop_grad(
-                x, template, model, population, i,
-                &eta_hats[i], &h_matrices[i], kap_i, bounds, options,
+                x,
+                template,
+                model,
+                population,
+                i,
+                &eta_hats[i],
+                &h_matrices[i],
+                kap_i,
+                bounds,
+                options,
             )
         })
         .collect();
@@ -1178,14 +1247,34 @@ mod tests {
 
         // Analytical path (called directly)
         let (nll_an, grad_an) = subject_nll_pop_grad_analytical(
-            &x, template, &model, &population, 0,
-            &eta_hat, &h_matrix, &bounds, &options,
-        ).expect("analytical path should succeed for non-IOV non-ODE model");
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &options,
+        )
+        .expect("analytical path should succeed for non-IOV non-ODE model");
 
         // Central-FD reference
         let params_base = unpack_params(&x, template);
-        let nll_ref = subject_nll_at(&model, &population, 0, &params_base, &eta_hat, &h_matrix, &[], &options);
-        assert!((nll_an - nll_ref).abs() < 1e-10, "nll mismatch: {nll_an} vs {nll_ref}");
+        let nll_ref = subject_nll_at(
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
+        );
+        assert!(
+            (nll_an - nll_ref).abs() < 1e-10,
+            "nll mismatch: {nll_an} vs {nll_ref}"
+        );
 
         let eps = 1e-5;
         for j in 0..n {
@@ -1196,8 +1285,26 @@ mod tests {
             let actual_2h = xp[j] - xm[j];
             let pp = unpack_params(&xp, template);
             let pm = unpack_params(&xm, template);
-            let np = subject_nll_at(&model, &population, 0, &pp, &eta_hat, &h_matrix, &[], &options);
-            let nm = subject_nll_at(&model, &population, 0, &pm, &eta_hat, &h_matrix, &[], &options);
+            let np = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pp,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nm = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pm,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
             let ref_j = (np - nm) / actual_2h;
 
             // Omega and sigma components should be machine-accurate; theta can
@@ -1206,7 +1313,9 @@ mod tests {
             assert!(
                 (grad_an[j] - ref_j).abs() < tol,
                 "analytical grad[{j}]: {:.6e}, fd ref: {:.6e}, diff: {:.2e}",
-                grad_an[j], ref_j, (grad_an[j] - ref_j).abs()
+                grad_an[j],
+                ref_j,
+                (grad_an[j] - ref_j).abs()
             );
         }
     }
@@ -1232,16 +1341,34 @@ mod tests {
         let options = FitOptions::default();
 
         let (nll_an, grad_an) = subject_nll_pop_grad_analytical(
-            &x, template, &model, &population, 0,
-            &eta_hat, &h_matrix, &bounds, &options,
-        ).expect("analytical path should succeed");
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &options,
+        )
+        .expect("analytical path should succeed");
 
         // NLL must match direct call
         let params_base = unpack_params(&x, template);
         let nll_ref = subject_nll_at(
-            &model, &population, 0, &params_base, &eta_hat, &h_matrix, &[], &options,
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
         );
-        assert!((nll_an - nll_ref).abs() < 1e-10, "nll mismatch: {nll_an} vs {nll_ref}");
+        assert!(
+            (nll_an - nll_ref).abs() < 1e-10,
+            "nll mismatch: {nll_an} vs {nll_ref}"
+        );
 
         // Gradient must agree with central-FD reference
         let eps = 1e-5;
@@ -1253,15 +1380,35 @@ mod tests {
             let actual_2h = xp[j] - xm[j];
             let pp = unpack_params(&xp, template);
             let pm = unpack_params(&xm, template);
-            let np = subject_nll_at(&model, &population, 0, &pp, &eta_hat, &h_matrix, &[], &options);
-            let nm = subject_nll_at(&model, &population, 0, &pm, &eta_hat, &h_matrix, &[], &options);
+            let np = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pp,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nm = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pm,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
             let ref_j = (np - nm) / actual_2h;
 
             let tol = 0.01 * (1.0 + ref_j.abs()).max(1e-8);
             assert!(
                 (grad_an[j] - ref_j).abs() < tol,
                 "nonzero-H: analytical grad[{j}]={:.6e}, fd ref={:.6e}, diff={:.2e}",
-                grad_an[j], ref_j, (grad_an[j] - ref_j).abs()
+                grad_an[j],
+                ref_j,
+                (grad_an[j] - ref_j).abs()
             );
         }
     }
@@ -1287,15 +1434,33 @@ mod tests {
         options.interaction = true;
 
         let (nll_an, grad_an) = subject_nll_pop_grad_analytical(
-            &x, template, &model, &population, 0,
-            &eta_hat, &h_matrix, &bounds, &options,
-        ).expect("analytical path should succeed with interaction=true");
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &options,
+        )
+        .expect("analytical path should succeed with interaction=true");
 
         let params_base = unpack_params(&x, template);
         let nll_ref = subject_nll_at(
-            &model, &population, 0, &params_base, &eta_hat, &h_matrix, &[], &options,
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
         );
-        assert!((nll_an - nll_ref).abs() < 1e-10, "interaction nll mismatch: {nll_an} vs {nll_ref}");
+        assert!(
+            (nll_an - nll_ref).abs() < 1e-10,
+            "interaction nll mismatch: {nll_an} vs {nll_ref}"
+        );
 
         let eps = 1e-5;
         for j in 0..n {
@@ -1306,15 +1471,35 @@ mod tests {
             let actual_2h = xp[j] - xm[j];
             let pp = unpack_params(&xp, template);
             let pm = unpack_params(&xm, template);
-            let np = subject_nll_at(&model, &population, 0, &pp, &eta_hat, &h_matrix, &[], &options);
-            let nm = subject_nll_at(&model, &population, 0, &pm, &eta_hat, &h_matrix, &[], &options);
+            let np = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pp,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nm = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pm,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
             let ref_j = (np - nm) / actual_2h;
 
             let tol = 0.01 * (1.0 + ref_j.abs()).max(1e-8);
             assert!(
                 (grad_an[j] - ref_j).abs() < tol,
                 "interaction: analytical grad[{j}]={:.6e}, fd ref={:.6e}, diff={:.2e}",
-                grad_an[j], ref_j, (grad_an[j] - ref_j).abs()
+                grad_an[j],
+                ref_j,
+                (grad_an[j] - ref_j).abs()
             );
         }
     }
@@ -1339,14 +1524,34 @@ mod tests {
         let options = FitOptions::default();
 
         let (nll, grad) = subject_nll_pop_grad(
-            &x, template, &model, &population, 0,
-            &eta_hat, &h_matrix, &[], &bounds, &options,
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &bounds,
+            &options,
         );
 
         // NLL must match a direct subject_nll_at call
         let params_base = unpack_params(&x, template);
-        let nll_ref = subject_nll_at(&model, &population, 0, &params_base, &eta_hat, &h_matrix, &[], &options);
-        assert!((nll - nll_ref).abs() < 1e-12, "nll mismatch: {nll} vs {nll_ref}");
+        let nll_ref = subject_nll_at(
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
+        );
+        assert!(
+            (nll - nll_ref).abs() < 1e-12,
+            "nll mismatch: {nll} vs {nll_ref}"
+        );
 
         // Gradient must be finite
         for (j, g) in grad.iter().enumerate() {
@@ -1364,15 +1569,34 @@ mod tests {
 
             let params_p = unpack_params(&xp, template);
             let params_m = unpack_params(&xm, template);
-            let nll_p = subject_nll_at(&model, &population, 0, &params_p, &eta_hat, &h_matrix, &[], &options);
-            let nll_m = subject_nll_at(&model, &population, 0, &params_m, &eta_hat, &h_matrix, &[], &options);
+            let nll_p = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_p,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nll_m = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_m,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
             let ref_j = (nll_p - nll_m) / actual_2h;
 
             let tol = 1e-4 * (1.0 + ref_j.abs());
             assert!(
                 (grad[j] - ref_j).abs() < tol,
                 "grad[{j}]: subject_nll_pop_grad={:.6e}, ref={:.6e}",
-                grad[j], ref_j,
+                grad[j],
+                ref_j,
             );
         }
     }

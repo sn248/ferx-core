@@ -1752,6 +1752,8 @@ mod tests {
             parse_warnings: Vec::new(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
         }
     }
 
@@ -1921,6 +1923,8 @@ mod tests {
             parse_warnings: Vec::new(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
         };
         check_gradient(&model, &make_population(3), 2);
     }

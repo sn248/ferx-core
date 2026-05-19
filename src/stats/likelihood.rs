@@ -442,7 +442,11 @@ pub fn foce_subject_nll_interaction(
 }
 
 /// R_tilde = H * Omega * H' + diag(r_diag)
-pub(crate) fn compute_r_tilde(h: &DMatrix<f64>, omega: &DMatrix<f64>, r_diag: &[f64]) -> DMatrix<f64> {
+pub(crate) fn compute_r_tilde(
+    h: &DMatrix<f64>,
+    omega: &DMatrix<f64>,
+    r_diag: &[f64],
+) -> DMatrix<f64> {
     let n_obs = h.nrows();
     let h_omega = h * omega;
     let mut r_tilde = &h_omega * h.transpose();

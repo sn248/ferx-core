@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-aeadd51d.js";
+            window.path_to_searchindex_js = "searchindex-639eccf2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-7ca32c60.js"></script>
+        <script src="toc-e4fdb3a6.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1448,7 +1448,7 @@ modeling problem. Detailed reference pages for each block sit beneath it.</p>
 </thead>
 <tbody>
 <tr><td>Yes (e.g. 2-cpt oral)</td><td>Yes</td><td>Classical analytical — no NN needed</td></tr>
-<tr><td>Yes</td><td>No / partial</td><td><a href="model-file/covariate-nn.html"><code>[covariate_nn]</code></a> (DCM, Phase A)</td></tr>
+<tr><td>Yes</td><td>No / partial</td><td><a href="#covariate_nn--deep-compartment-models-dcm-1"><code>[covariate_nn]</code></a> (DCM, Phase A)</td></tr>
 <tr><td>No / partial</td><td>Yes</td><td><a href="model-file/dynamics-nn.html"><code>[dynamics_nn]</code></a> (low-dim NODE, Phase B)</td></tr>
 <tr><td>No</td><td>No</td><td>Both — they coexist in the same model</td></tr>
 </tbody>
@@ -1548,6 +1548,162 @@ covariance estimation stays enabled there.</li>
 <p>The Rust-level API (the <code>CovariateMapper</code> trait and <code>MlpMapper</code>) is
 already callable today — see <code>tests/nn_dcm_smoke.rs</code> for an end-to-end
 example.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="covariate_nn--deep-compartment-models-dcm-1"><a class="header" href="#covariate_nn--deep-compartment-models-dcm-1"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</a></h1>
+<p>A <code>[covariate_nn]</code> block replaces the <strong>typical-value covariate model</strong> with
+a small feed-forward neural network. Instead of writing</p>
+<pre><code class="language-ferx">CL = TVCL * (WT / 70)^THETA_WT * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)
+</code></pre>
+<p>you write a network whose inputs are subject covariates and whose outputs
+are PK typical values, then compose with etas the standard way:</p>
+<pre><code class="language-ferx">[covariate_nn TYPICAL_PK]
+  inputs     = [WT, CRCL]
+  outputs    = [CL, V1, Q, V2, KA]
+  layers     = [8, 8]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V1 = TYPICAL_PK.V1 * exp(ETA_V1)
+  Q  = TYPICAL_PK.Q  * exp(ETA_Q)
+  V2 = TYPICAL_PK.V2 * exp(ETA_V2)
+  KA = TYPICAL_PK.KA * exp(ETA_KA)
+</code></pre>
+<p>The compartmental ODE / analytical solution downstream is unchanged; etas
+attach to the <em>final</em> PK parameters (not the NN weights), so the inner
+FOCEI loop runs exactly as it does for an analytical model. This is the
+“mixed-effects DCM” variant.</p>
+<blockquote>
+<p><strong>Reference</strong>: Janssen A. et al. (2022). <em>Deep compartment models: A deep
+learning approach for the reliable prediction of time-series data in
+pharmacokinetic modeling.</em> CPT Pharmacometrics Syst Pharmacol 11:934–945.
+DOI <a href="https://doi.org/10.1002/psp4.12808">10.1002/psp4.12808</a>.</p>
+</blockquote>
+<h2 id="status-1"><a class="header" href="#status-1">Status</a></h2>
+<p>Behind the <code>nn</code> cargo feature (off by default). Build with:</p>
+<pre><code class="language-sh">RUSTFLAGS="-Z autodiff=Enable" cargo build --release --features nn
+</code></pre>
+<p>A full runnable example lives at <a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_dcm.ferx"><code>examples/warfarin_dcm.ferx</code></a> —
+compare with <a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_oral_cov.ferx"><code>examples/two_cpt_oral_cov.ferx</code></a>, which uses
+the same data and eta structure but an analytical covariate model.</p>
+<h2 id="block-syntax"><a class="header" href="#block-syntax">Block syntax</a></h2>
+<pre><code class="language-ferx">[covariate_nn NAME]
+  inputs     = [COV_1, COV_2, ...]
+  outputs    = [PK_PARAM_1, PK_PARAM_2, ...]
+  layers     = [hidden_1, hidden_2, ...]
+  activation = tanh | relu | sigmoid | softplus | exp | identity
+  output     = tanh | relu | sigmoid | softplus | exp | identity   # optional, default `identity`
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Required</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>inputs</code></td><td>yes</td><td>Covariate column names from the NONMEM CSV</td></tr>
+<tr><td><code>outputs</code></td><td>yes</td><td>PK parameter names (<code>cl</code>, <code>v</code> / <code>v1</code>, <code>q</code> / <code>q2</code>, <code>v2</code>, <code>ka</code>, <code>f</code>, <code>q3</code>, <code>v3</code>, <code>lagtime</code> / <code>alag</code>)</td></tr>
+<tr><td><code>layers</code></td><td>yes</td><td>Hidden layer widths, in order. At least one entry required</td></tr>
+<tr><td><code>activation</code></td><td>yes</td><td>Hidden-layer element-wise activation</td></tr>
+<tr><td><code>output</code></td><td>no</td><td>Output-layer activation. Use <code>softplus</code> or <code>exp</code> for positive PK params</td></tr>
+</tbody>
+</table>
+</div>
+<p>The header form <code>[covariate_nn NAME]</code> requires the <strong>NAME</strong> (e.g.
+<code>TYPICAL_PK</code>). NAME is the dot-access prefix in <code>[individual_parameters]</code>
+expressions (<code>NAME.CL</code>, <code>NAME.V1</code>, …).</p>
+<p>Multiple <code>[covariate_nn]</code> blocks per model are permitted; they’re keyed
+by NAME and ordered alphabetically when generating theta names.</p>
+<h2 id="auto-generated-parameters"><a class="header" href="#auto-generated-parameters">Auto-generated parameters</a></h2>
+<p>For each block, the parser generates one theta per weight and per bias.
+Names follow the convention:</p>
+<ul>
+<li><code>W_&lt;NAME&gt;_&lt;l&gt;_&lt;i&gt;_&lt;j&gt;</code> — weight from input unit <code>j</code> (in layer <code>l−1</code>) to
+output unit <code>i</code> (in layer <code>l</code>)</li>
+<li><code>B_&lt;NAME&gt;_&lt;l&gt;_&lt;i&gt;</code> — bias of output unit <code>i</code> in layer <code>l</code></li>
+</ul>
+<p>Layers are 1-indexed (input layer is layer 0, doesn’t have weights).
+For a 2 → 8 → 8 → 5 network: 2·8 + 8 + 8·8 + 8 + 8·5 + 5 = <strong>141 thetas</strong>.</p>
+<p>Initial values use a Glorot-style deterministic scheme seeded by the
+block NAME, so builds are reproducible without pulling <code>rand</code> into the
+parser. Weights are unbounded (identity-packed): the optimizer sees them
+on the natural scale, no log transform. Biases initialise to 0.</p>
+<h2 id="activation-reference"><a class="header" href="#activation-reference">Activation reference</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>activation</code> value</th><th>Behavior</th><th>Typical use</th></tr>
+</thead>
+<tbody>
+<tr><td><code>identity</code></td><td><code>f(x) = x</code></td><td>Output layer when you’ll wrap your own positivity head</td></tr>
+<tr><td><code>relu</code></td><td><code>f(x) = max(0, x)</code></td><td>Cheap hidden activation, but creates kinks; reduces smoothness for FOCEI</td></tr>
+<tr><td><code>tanh</code></td><td><code>f(x) = tanh(x)</code></td><td><strong>Recommended hidden default</strong> — smooth, bounded <code>(-1, 1)</code></td></tr>
+<tr><td><code>sigmoid</code></td><td><code>f(x) = 1 / (1 + exp(-x))</code></td><td>Bounded <code>(0, 1)</code>; useful for <code>F</code> bioavailability outputs</td></tr>
+<tr><td><code>softplus</code></td><td><code>f(x) = ln(1 + exp(x))</code></td><td><strong>Recommended output for PK params</strong> — guarantees positivity, no exp blow-up</td></tr>
+<tr><td><code>exp</code></td><td><code>f(x) = exp(x)</code></td><td>Strictly positive, but unbounded; prefer <code>softplus</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>All activations use <code>if</code>/<code>else</code> instead of <code>f64::max</code>/<code>f64::min</code> for AD
+safety (see <a href="https://github.com/FeRx-NLME/ferx-core/blob/main/CLAUDE.md">CLAUDE.md</a> → “Autodiff-Safe Code in <code>ad/</code> Module”).</p>
+<h2 id="mu-ref-composition-with-etas"><a class="header" href="#mu-ref-composition-with-etas">Mu-ref composition with etas</a></h2>
+<p>The pattern <code>TYPICAL_PK.CL * exp(ETA_CL)</code> is recognised by the parser as
+a <strong>lognormal mu-ref</strong> with <code>TYPICAL_PK.CL</code> as the structured anchor
+name. It shows up in <code>FitResult.mu_refs</code> as:</p>
+<pre><code>{ "ETA_CL": MuRef { theta_name: "TYPICAL_PK.CL", log_transformed: true } }
+</code></pre>
+<p>and in <code>eta_param_info[ETA_CL].param_type</code> as <code>LogNormal</code>. The
+AD-aware re-centering fast path (<code>compute_mu_k</code>) currently silently
+skips structured-name mu-refs and FOCEI falls back to its standard
+inner-loop path — correct, just slower than a true mu-ref-aware AD
+inner loop. That perf improvement lives on the Phase A M2 roadmap in
+<a href="https://github.com/FeRx-NLME/ferx-core/blob/main/plans/dcm-and-low-dim-node.md"><code>plans/dcm-and-low-dim-node.md</code></a>.</p>
+<h2 id="fit-output"><a class="header" href="#fit-output">Fit output</a></h2>
+<p>Fit YAML (<code>{model}-fit.yaml</code>) and <code>.fitrx</code> bundles emit a compact
+<code>neural_networks:</code> section in addition to the regular <code>theta:</code> block.
+The NN weights are summarised by shape, activations, weight count, and
+basic statistics over the trained values rather than dumped one row
+per weight — for a 141-weight network, the YAML stays scannable:</p>
+<pre><code class="language-yaml">neural_networks:
+  TYPICAL_PK:
+    shape: [2, 8, 8, 5]
+    hidden_activation: tanh
+    output_activation: softplus
+    inputs: [WT, CRCL]
+    outputs: [CL, V1, Q, V2, KA]
+    n_weights: 141
+    weights_summary:
+      min:  -1.034521
+      max:   0.987643
+      mean:  0.014277
+      std:   0.342118
+</code></pre>
+<p>Full per-weight values remain in <code>result.theta</code> at indices
+<code>weights_offset..weights_offset + n_weights</code> (the <code>weights_offset</code> is
+also exposed on each <code>FitResult.neural_networks[k]</code> entry). <code>ferx-r</code>
+loaders round-trip them losslessly via <code>fit.json</code> inside the <code>.fitrx</code>
+archive.</p>
+<h2 id="whats-not-yet-wired"><a class="header" href="#whats-not-yet-wired">What’s not yet wired</a></h2>
+<p>These items are tracked against Phase A M2 / future PRs in the
+<a href="https://github.com/FeRx-NLME/ferx-core/blob/main/plans/dcm-and-low-dim-node.md">plan</a>:</p>
+<ul>
+<li><code>method = nn_mse</code> — Janssen 2022’s original fixed-effects MSE objective
+(FOCEI works as the default today).</li>
+<li>AD-aware mu-ref re-centering for NN-anchored etas — fits work today
+but the inner-loop AD fast path skips NN-anchored etas; performance
+improvement, not correctness.</li>
+<li>Phase B <code>[dynamics_nn]</code> block for neural-ODE-style RHS terms (Bräm
+et al. 2025).</li>
+</ul>
+<h2 id="see-also"><a class="header" href="#see-also">See also</a></h2>
+<ul>
+<li><a href="#neural-networks"><code>docs/src/model-file/neural-networks.md</code></a> — landing
+page with the “which block do I need?” decision table.</li>
+<li><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_dcm.ferx"><code>examples/warfarin_dcm.ferx</code></a> — runnable example.</li>
+<li><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_oral_cov.ferx"><code>examples/two_cpt_oral_cov.ferx</code></a> — analytical equivalent
+for comparison.</li>
+<li><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/plans/dcm-and-low-dim-node.md"><code>plans/dcm-and-low-dim-node.md</code></a> — full milestone roadmap.</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="fit-options"><a class="header" href="#fit-options">Fit Options</a></h1>
 <p>The optional <code>[fit_options]</code> block configures the estimation method and optimizer settings.</p>

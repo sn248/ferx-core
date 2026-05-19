@@ -4,6 +4,33 @@ fn fixed_label(name: &str) -> String {
     format!("{} [FIX]", name)
 }
 
+/// Summary statistics over an NN's flat weight vector for the compact
+/// `neural_networks:` section in the fit YAML / CLI output. Empty input
+/// yields all zeros (defensive — shouldn't happen in practice because
+/// the parser refuses zero-weight NNs).
+#[cfg(feature = "nn")]
+fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
+    if w.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let n = w.len() as f64;
+    let mut mn = f64::INFINITY;
+    let mut mx = f64::NEG_INFINITY;
+    let mut sum = 0.0;
+    for &v in w {
+        if v < mn {
+            mn = v;
+        }
+        if v > mx {
+            mx = v;
+        }
+        sum += v;
+    }
+    let mean = sum / n;
+    let var = w.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>() / n;
+    (mn, mx, mean, var.sqrt())
+}
+
 /// Print NONMEM-style results to stderr
 pub fn print_results(result: &FitResult) {
     eprintln!("\n{}", "=".repeat(60));
@@ -32,6 +59,17 @@ pub fn print_results(result: &FitResult) {
         result.n_subjects, result.n_obs, result.n_parameters
     );
 
+    // NN weight thetas — listed as a compact summary block below instead
+    // of one row per weight (Option E; see plans/dcm-and-low-dim-node.md).
+    #[cfg(feature = "nn")]
+    let nn_theta_indices: std::collections::HashSet<usize> = result
+        .neural_networks
+        .iter()
+        .flat_map(|nn| nn.weights_offset..nn.weights_offset + nn.n_weights)
+        .collect();
+    #[cfg(not(feature = "nn"))]
+    let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
     // Theta estimates
     eprintln!("\n--- THETA Estimates ---");
     eprintln!(
@@ -40,6 +78,9 @@ pub fn print_results(result: &FitResult) {
     );
     eprintln!("{}", "-".repeat(52));
     for (i, name) in result.theta_names.iter().enumerate() {
+        if nn_theta_indices.contains(&i) {
+            continue;
+        }
         let est = result.theta[i];
         let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
         let label = if is_fixed {
@@ -64,6 +105,35 @@ pub fn print_results(result: &FitResult) {
             }
         };
         eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
+    }
+
+    // Compact NN-weight summary block (Option E). Skipped when no
+    // `[covariate_nn]` blocks were declared.
+    #[cfg(feature = "nn")]
+    if !result.neural_networks.is_empty() {
+        eprintln!("\n--- NEURAL NETWORKS ---");
+        for nn in &result.neural_networks {
+            let w = &result.theta[nn.weights_offset..nn.weights_offset + nn.n_weights];
+            let (mn, mx, mean, sd) = weight_summary(w);
+            let shape: Vec<String> = nn.shape.iter().map(|s| s.to_string()).collect();
+            eprintln!(
+                "{}  shape=[{}]  activation={}/{}  n_weights={}",
+                nn.name,
+                shape.join(", "),
+                nn.hidden_activation,
+                nn.output_activation,
+                nn.n_weights,
+            );
+            eprintln!(
+                "  inputs:  [{}]   outputs: [{}]",
+                nn.input_names.join(", "),
+                nn.output_names.join(", "),
+            );
+            eprintln!(
+                "  weights: min {:.4}  max {:.4}  mean {:.4}  std {:.4}",
+                mn, mx, mean, sd
+            );
+        }
     }
 
     // Omega estimates
@@ -447,8 +517,24 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     writeln!(f, "  n_observations: {}", result.n_obs).map_err(|e| e.to_string())?;
     writeln!(f, "  n_parameters: {}", result.n_parameters).map_err(|e| e.to_string())?;
 
+    // Identify indices that belong to a `[covariate_nn]` weight block so we
+    // can skip them in the per-theta listing below and emit them in a
+    // compact `neural_networks:` block instead. Empty set when no NN blocks
+    // are present (Option E: see plans/dcm-and-low-dim-node.md).
+    #[cfg(feature = "nn")]
+    let nn_theta_indices: std::collections::HashSet<usize> = result
+        .neural_networks
+        .iter()
+        .flat_map(|nn| nn.weights_offset..nn.weights_offset + nn.n_weights)
+        .collect();
+    #[cfg(not(feature = "nn"))]
+    let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
     writeln!(f, "\ntheta:").map_err(|e| e.to_string())?;
     for (i, name) in result.theta_names.iter().enumerate() {
+        if nn_theta_indices.contains(&i) {
+            continue;
+        }
         let est = result.theta[i];
         let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
         let se = result.se_theta.as_ref().map(|v| v[i]);
@@ -476,6 +562,55 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
                 }
             }
+        }
+    }
+
+    // Compact NN-weights summary (Option E). Lists shape, activations,
+    // weight count, and basic statistics over the trained weight values
+    // — none of which need to be one-line-per-weight to be useful for
+    // sanity-checking a fit. Full per-weight values are still recoverable
+    // from `result.theta` slices keyed by `weights_offset` + `n_weights`.
+    #[cfg(feature = "nn")]
+    if !result.neural_networks.is_empty() {
+        writeln!(f, "\nneural_networks:").map_err(|e| e.to_string())?;
+        for nn in &result.neural_networks {
+            writeln!(f, "  {}:", nn.name).map_err(|e| e.to_string())?;
+            writeln!(
+                f,
+                "    shape: [{}]",
+                nn.shape
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .map_err(|e| e.to_string())?;
+            writeln!(f, "    hidden_activation: {}", nn.hidden_activation)
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "    output_activation: {}", nn.output_activation)
+                .map_err(|e| e.to_string())?;
+            writeln!(
+                f,
+                "    inputs: [{}]",
+                nn.input_names.join(", ")
+            )
+            .map_err(|e| e.to_string())?;
+            writeln!(
+                f,
+                "    outputs: [{}]",
+                nn.output_names.join(", ")
+            )
+            .map_err(|e| e.to_string())?;
+            writeln!(f, "    n_weights: {}", nn.n_weights).map_err(|e| e.to_string())?;
+            // Summary statistics over the trained weight values.
+            let w_slice =
+                &result.theta[nn.weights_offset..nn.weights_offset + nn.n_weights];
+            let (mn, mx, mean, sd) = weight_summary(w_slice);
+            writeln!(f, "    weights_summary:").map_err(|e| e.to_string())?;
+            writeln!(f, "      min:  {:.6}", mn).map_err(|e| e.to_string())?;
+            writeln!(f, "      max:  {:.6}", mx).map_err(|e| e.to_string())?;
+            writeln!(f, "      mean: {:.6}", mean).map_err(|e| e.to_string())?;
+            writeln!(f, "      std:  {:.6}", sd).map_err(|e| e.to_string())?;
         }
     }
 
@@ -835,6 +970,8 @@ mod tests {
             data_path: None,
             model_hash: None,
             data_hash: None,
+            #[cfg(feature = "nn")]
+            neural_networks: Vec::new(),
         }
     }
 
@@ -844,6 +981,107 @@ mod tests {
         let path = dir.path().join("fit.yaml");
         write_estimates_yaml(&result, path.to_str().unwrap()).expect("yaml write");
         std::fs::read_to_string(&path).expect("yaml read")
+    }
+
+    // ─── Option E: NN-aware fit YAML rendering ───────────────────────────
+
+    /// Build a minimal FitResult with one `[covariate_nn]` block worth of
+    /// theta entries so we can exercise the YAML writer's compact rendering.
+    #[cfg(feature = "nn")]
+    fn make_nn_result() -> FitResult {
+        // 1 user theta (TVKA) + a 2->3->2 NN: W_1 6, b_1 3, W_2 6, b_2 2 → 17 weights.
+        let mut theta = vec![1.5_f64];
+        let mut theta_names = vec!["TVKA".to_string()];
+        // NN weight names — pattern: W_<NAME>_<l>_<i>_<j>, B_<NAME>_<l>_<i>.
+        for l in 1..3 {
+            let (n_l, n_lm1) = if l == 1 { (3, 2) } else { (2, 3) };
+            for i in 1..=n_l {
+                for j in 1..=n_lm1 {
+                    theta.push(0.1 * (i + j) as f64);
+                    theta_names.push(format!("W_TYPICAL_PK_{}_{}_{}", l, i, j));
+                }
+            }
+            for i in 1..=n_l {
+                theta.push(0.01 * i as f64);
+                theta_names.push(format!("B_TYPICAL_PK_{}_{}", l, i));
+            }
+        }
+        let n = theta.len();
+        let theta_fixed = vec![false; n];
+
+        let mut base = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        base.theta = theta;
+        base.theta_names = theta_names;
+        base.theta_fixed = theta_fixed;
+        base.neural_networks = vec![NeuralNetworkInfo {
+            name: "TYPICAL_PK".to_string(),
+            shape: vec![2, 3, 2],
+            hidden_activation: "tanh".to_string(),
+            output_activation: "softplus".to_string(),
+            n_weights: 17,
+            weights_offset: 1,
+            input_names: vec!["WT".to_string(), "CRCL".to_string()],
+            output_names: vec!["CL".to_string(), "V".to_string()],
+        }];
+        base
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn yaml_collapses_nn_weight_thetas_into_summary_section() {
+        let result = make_nn_result();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&result, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        // The user-declared theta (TVKA) is still in the per-theta listing.
+        assert!(yaml.contains("  TVKA:"), "TVKA must appear in theta section:\n{yaml}");
+
+        // None of the 17 NN-weight thetas appear in the per-theta listing.
+        for layer in 1..3 {
+            let n_l = if layer == 1 { 3 } else { 2 };
+            let n_lm1 = if layer == 1 { 2 } else { 3 };
+            for i in 1..=n_l {
+                for j in 1..=n_lm1 {
+                    let name = format!("W_TYPICAL_PK_{}_{}_{}:", layer, i, j);
+                    assert!(
+                        !yaml.contains(&name),
+                        "NN weight `{}` should NOT appear in per-theta section:\n{yaml}",
+                        name
+                    );
+                }
+            }
+        }
+
+        // The compact `neural_networks:` section IS present.
+        assert!(yaml.contains("\nneural_networks:"), "neural_networks section missing:\n{yaml}");
+        assert!(yaml.contains("  TYPICAL_PK:"), "NN block name missing:\n{yaml}");
+        assert!(yaml.contains("    shape: [2, 3, 2]"), "shape missing:\n{yaml}");
+        assert!(yaml.contains("hidden_activation: tanh"), "hidden activation missing:\n{yaml}");
+        assert!(yaml.contains("output_activation: softplus"), "output activation missing:\n{yaml}");
+        assert!(yaml.contains("inputs: [WT, CRCL]"), "inputs missing:\n{yaml}");
+        assert!(yaml.contains("outputs: [CL, V]"), "outputs missing:\n{yaml}");
+        assert!(yaml.contains("n_weights: 17"), "n_weights missing:\n{yaml}");
+        assert!(yaml.contains("weights_summary:"), "weights_summary missing:\n{yaml}");
+        assert!(yaml.contains("      min:"), "min stat missing:\n{yaml}");
+        assert!(yaml.contains("      max:"), "max stat missing:\n{yaml}");
+    }
+
+    /// Sanity: when no `[covariate_nn]` blocks are declared, the YAML
+    /// should NOT have a `neural_networks:` section at all.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn yaml_no_neural_networks_section_when_block_absent() {
+        let result = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&result, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        assert!(
+            !yaml.contains("neural_networks:"),
+            "neural_networks section should be absent when no NN blocks:\n{yaml}"
+        );
     }
 
     #[test]

@@ -79,6 +79,19 @@ pub enum Activation {
 }
 
 impl Activation {
+    /// Lowercase identifier as used in the `.ferx` DSL
+    /// (`activation = tanh`). Symmetric round-trip with the parser.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Activation::Identity => "identity",
+            Activation::Relu => "relu",
+            Activation::Softplus => "softplus",
+            Activation::Tanh => "tanh",
+            Activation::Sigmoid => "sigmoid",
+            Activation::Exp => "exp",
+        }
+    }
+
     /// Apply elementwise. Uses `if`/`else` for AD safety.
     #[inline]
     pub fn apply(self, x: f64) -> f64 {
@@ -212,6 +225,22 @@ impl MlpMapper {
     /// Total number of weights + biases.
     pub fn n_weights(&self) -> usize {
         self.n_params
+    }
+
+    /// Full layer shape: `[n_input, n_hidden_1, ..., n_output]`.
+    pub fn layer_sizes(&self) -> &[usize] {
+        &self.layers
+    }
+
+    /// Hidden-layer activation (applied between every adjacent layer
+    /// except the output).
+    pub fn hidden_activation(&self) -> Activation {
+        self.hidden_activation
+    }
+
+    /// Output-layer activation (applied at the output).
+    pub fn output_activation(&self) -> Activation {
+        self.output_activation
     }
 
     /// Number of input features.

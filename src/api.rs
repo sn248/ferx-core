@@ -10,6 +10,28 @@ use crate::stats::likelihood::{
 use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
+
+/// Build the `FitResult.neural_networks` summary from the compiled model's
+/// `[covariate_nn]` blocks. Empty when no NN blocks are present, so output
+/// writers can always iterate `result.neural_networks` without branching.
+#[cfg(feature = "nn")]
+fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
+    use crate::nn::CovariateMapper;
+    model
+        .covariate_nns
+        .iter()
+        .map(|nn| NeuralNetworkInfo {
+            name: nn.name.clone(),
+            shape: nn.mapper.mlp().layer_sizes().to_vec(),
+            hidden_activation: nn.mapper.mlp().hidden_activation().as_str().to_string(),
+            output_activation: nn.mapper.mlp().output_activation().as_str().to_string(),
+            n_weights: nn.mapper.n_weights(),
+            weights_offset: nn.weights_offset,
+            input_names: nn.mapper.input_names().to_vec(),
+            output_names: nn.mapper.output_names().to_vec(),
+        })
+        .collect()
+}
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
@@ -1018,6 +1040,8 @@ fn fit_inner(
         data_path: None,
         model_hash: None,
         data_hash: None,
+        #[cfg(feature = "nn")]
+        neural_networks: build_neural_network_infos(model),
     };
 
     if options.verbose {
@@ -2766,6 +2790,8 @@ mod simulate_with_uncertainty_tests {
             data_path: None,
             model_hash: None,
             data_hash: None,
+            #[cfg(feature = "nn")]
+            neural_networks: Vec::new(),
         }
     }
 

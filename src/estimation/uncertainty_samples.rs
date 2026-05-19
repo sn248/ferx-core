@@ -398,6 +398,8 @@ mod tests {
             data_path: None,
             model_hash: None,
             data_hash: None,
+            #[cfg(feature = "nn")]
+            neural_networks: Vec::new(),
         }
     }
 

@@ -4665,12 +4665,23 @@ mod tests {
         // Smoke test: every checked-in example must parse under the strict
         // [fit_options] rules. Guards against accidentally tightening a key
         // in apply_fit_option in a way that breaks a shipped example.
+        //
+        // When `--features nn` is off, files that declare a `[covariate_nn]`
+        // or `[dynamics_nn]` block are skipped — they're only valid under
+        // the feature gate. A cheap pre-scan of file contents handles this
+        // without splitting the example directory.
         let examples_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
         let mut seen = 0;
         for entry in std::fs::read_dir(&examples_dir).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().and_then(|s| s.to_str()) != Some("ferx") {
                 continue;
+            }
+            if !cfg!(feature = "nn") {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                if src.contains("[covariate_nn") || src.contains("[dynamics_nn") {
+                    continue;
+                }
             }
             seen += 1;
             if let Err(e) = parse_full_model_file(&path) {

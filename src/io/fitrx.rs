@@ -198,6 +198,12 @@ struct FitWire {
     model_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     data_hash: Option<String>,
+    /// `[covariate_nn]` block metadata. Absent (None) on bundles produced
+    /// before this field existed or when ferx-core was built without
+    /// `--features nn`. Loaders gracefully default to an empty Vec.
+    #[cfg(feature = "nn")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    neural_networks: Option<Vec<crate::types::NeuralNetworkInfo>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -634,6 +640,12 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         data_path: r.data_path.clone(),
         model_hash: r.model_hash.clone(),
         data_hash: r.data_hash.clone(),
+        #[cfg(feature = "nn")]
+        neural_networks: if r.neural_networks.is_empty() {
+            None
+        } else {
+            Some(r.neural_networks.clone())
+        },
     }
 }
 
@@ -1353,6 +1365,8 @@ fn wire_to_fit_result(
         data_path: w.data_path,
         model_hash: w.model_hash,
         data_hash: w.data_hash,
+        #[cfg(feature = "nn")]
+        neural_networks: w.neural_networks.unwrap_or_default(),
     })
 }
 
@@ -1523,6 +1537,8 @@ mod tests {
             data_path: None,
             model_hash: None,
             data_hash: None,
+            #[cfg(feature = "nn")]
+            neural_networks: Vec::new(),
         }
     }
 

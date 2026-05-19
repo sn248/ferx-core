@@ -17,7 +17,10 @@ use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::{compute_covariance, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::stats::likelihood::{foce_subject_nll_interaction, foce_subject_nll_standard};
+use crate::stats::likelihood::{
+    chol_log_det, compute_r_tilde, foce_subject_nll_interaction, foce_subject_nll_standard,
+};
+use crate::stats::residual_error::compute_r_diag;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
@@ -470,16 +473,439 @@ fn gn_trace_method_phase(method: EstimationMethod) -> (&'static str, &'static st
     }
 }
 
-/// Build the Gauss-Newton linear system using the gradient and approximate Hessian
+// ── Analytical gradient helpers ──────────────────────────────────────────────
+//
+// For each packed parameter x[k] the gradient of the FOCE NLL uses:
+//
+//   dL = A^T dv  +  0.5 * (tr(R^{-1} dR) - A^T dR A)
+//
+// where  v = y - f0,  A = R_tilde^{-1} v,  and C = chol(R_tilde).
+//
+// Omega diagonal x[k] = log L_omega[i,i]:
+//   dR = 2*omega_ii * h_i h_i^T,  dv = 0
+//   dL = omega_ii * (||C^{-1} h_i||^2 - (h_i^T A)^2)
+//
+// Omega off-diagonal x[k] = L_omega[j,i] (j>i, identity-packed):
+//   dOmega = e_j (L[:,i])^T + L[:,i] e_j^T
+//   u = H L_omega[:,i],  w = H[:,j] = h_j
+//   dR = w u^T + u w^T,  dv = 0
+//   dL = (C^{-1} w)^T (C^{-1} u) - (w^T A)(u^T A)
+//
+// Sigma x[k] = log sigma_k:
+//   dR = diag(d r_j / d log sigma_k),  dv = 0
+//   dL = 0.5 * sum_j (d r_j) * ((R^{-1})_jj - A_j^2)
+//
+// Theta x[k] (log-packed or identity):
+//   d(ipreds) from forward FD of compute_predictions_with_tv
+//   d(f0) = d(ipreds),  d(r) via chain rule through residual variance
+//   dv = -d(f0)
+//   dL = -A^T d(f0)  +  0.5 * (sum_j d(r_j) * ((R^{-1})_jj - A_j^2))
+//      (the diagonal-R^{-1} term is shared with sigma and reused)
+
+/// Diagonal of R^{-1} via Cholesky: (R^{-1})_jj = ||C^{-1} e_j||^2
+/// where C = chol(R) (lower triangular). Computed by forward-substituting each unit vector.
+fn r_inv_diag(chol_l: &DMatrix<f64>) -> Vec<f64> {
+    let n = chol_l.nrows();
+    (0..n)
+        .map(|j| {
+            // Solve C w = e_j by forward substitution
+            let mut w = vec![0.0f64; n];
+            for i in 0..n {
+                if i == j {
+                    w[i] = 1.0 / chol_l[(i, i)];
+                } else if i > j {
+                    let mut s = 0.0;
+                    for k in j..i {
+                        s += chol_l[(i, k)] * w[k];
+                    }
+                    w[i] = -s / chol_l[(i, i)];
+                }
+            }
+            w.iter().map(|&x| x * x).sum()
+        })
+        .collect()
+}
+
+/// Solve C w = rhs by forward substitution (C lower triangular).
+fn fwd_solve(chol_l: &DMatrix<f64>, rhs: &[f64]) -> Vec<f64> {
+    let n = chol_l.nrows();
+    let mut w = vec![0.0f64; n];
+    for i in 0..n {
+        let mut s = rhs[i];
+        for k in 0..i {
+            s -= chol_l[(i, k)] * w[k];
+        }
+        w[i] = s / chol_l[(i, i)];
+    }
+    w
+}
+
+/// d(r_j)/d(log sigma_k) for each observation, at the prediction point used
+/// to evaluate r_diag (f0 for standard, ipreds for interaction).
+fn dr_diag_d_log_sigma(
+    error_model: ErrorModel,
+    r_diag: &[f64],
+    pred_point: &[f64], // f0 or ipreds depending on path
+    sigma_values: &[f64],
+    sigma_k: usize,
+) -> Vec<f64> {
+    r_diag
+        .iter()
+        .zip(pred_point.iter())
+        .map(|(&r_j, &f_j)| match error_model {
+            ErrorModel::Additive => {
+                if sigma_k == 0 {
+                    2.0 * sigma_values[0] * sigma_values[0]
+                } else {
+                    0.0
+                }
+            }
+            ErrorModel::Proportional => {
+                if sigma_k == 0 {
+                    2.0 * r_j
+                } else {
+                    0.0
+                }
+            }
+            ErrorModel::Combined => {
+                if sigma_k == 0 {
+                    // d(sigma_prop^2 * f^2)/d(log sigma_prop) = 2 * sigma_prop^2 * f^2
+                    let sp2 = sigma_values[0] * sigma_values[0];
+                    2.0 * sp2 * f_j * f_j
+                } else {
+                    // sigma_k == 1: d(sigma_add^2)/d(log sigma_add) = 2 * sigma_add^2
+                    2.0 * sigma_values[1] * sigma_values[1]
+                }
+            }
+        })
+        .collect()
+}
+
+/// Analytical per-subject FOCE NLL gradient for non-IOV, non-ODE, non-M3 models.
+///
+/// Returns `None` if the Cholesky of R_tilde fails (degenerate parameters) so
+/// the caller can fall back to central FD.
+///
+/// The gradient is exact for omega and sigma packed parameters. For theta packed
+/// parameters, uses forward FD of `compute_predictions_with_tv` only (cheap —
+/// no matrix work per perturbation).
+#[allow(clippy::too_many_arguments)]
+fn subject_nll_pop_grad_analytical(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Option<(f64, Vec<f64>)> {
+    use crate::pk;
+
+    let n = x.len();
+    let n_eta = model.n_eta;
+    let n_theta = template.theta.len();
+    let n_sigma = template.sigma.values.len();
+    let n_obs = population.subjects[subj_idx].observations.len();
+    let subject = &population.subjects[subj_idx];
+    let params = unpack_params(x, template);
+    let fixed_mask = packed_fixed_mask(template);
+
+    // Base predictions and FOCE state
+    let ipreds = pk::compute_predictions_with_tv(model, subject, &params.theta, eta_hat.as_slice());
+
+    let h_eta = h_matrix * eta_hat;
+    let f0: Vec<f64> = ipreds
+        .iter()
+        .enumerate()
+        .map(|(j, &ip)| ip - h_eta[j])
+        .collect();
+
+    // r_diag: at f0 (standard) or at ipreds (interaction)
+    let r_pred_point: &[f64] = if options.interaction { &ipreds } else { &f0 };
+    let r_diag = compute_r_diag(model.error_model, r_pred_point, &params.sigma.values);
+
+    let r_tilde = compute_r_tilde(h_matrix, &params.omega.matrix, &r_diag);
+    let chol = r_tilde.cholesky()?;
+    let chol_l = chol.l();
+
+    let v: DVector<f64> = DVector::from_iterator(
+        n_obs,
+        subject
+            .observations
+            .iter()
+            .zip(f0.iter())
+            .map(|(&y, &f)| y - f),
+    );
+    let solved_a = chol.solve(&v);
+    let nll = 0.5 * (v.dot(&solved_a) + chol_log_det(&chol_l));
+
+    // Diagonal of R_tilde^{-1} — shared across all sigma and theta gradient terms
+    let rinv_diag = r_inv_diag(&chol_l);
+
+    // Pre-compute C^{-1} H columns for omega gradient: each w_i = C^{-1} h_i
+    let h_cols_solved: Vec<Vec<f64>> = (0..n_eta)
+        .map(|i| fwd_solve(&chol_l, h_matrix.column(i).as_slice()))
+        .collect();
+
+    // For block omega: get the Cholesky factor of omega (L_omega)
+    let l_omega = &params.omega.chol; // nalgebra DMatrix, lower triangular
+
+    let mut grad = vec![0.0f64; n];
+
+    // ── Theta parameters (indices 0..n_theta) ──────────────────────────────
+    let eps = 1e-5;
+    for k in 0..n_theta {
+        if fixed_mask[k] {
+            continue;
+        }
+        let h = eps * (1.0 + x[k].abs());
+        let xk_plus = (x[k] + h).min(bounds.upper[k]);
+        let actual_h = xk_plus - x[k];
+        if actual_h.abs() < 1e-16 {
+            continue;
+        }
+
+        let mut x_pert = x.to_vec();
+        x_pert[k] = xk_plus;
+        let params_pert = unpack_params(&x_pert, template);
+        let ipreds_pert =
+            pk::compute_predictions_with_tv(model, subject, &params_pert.theta, eta_hat.as_slice());
+
+        // d(ipreds)/dx[k] via forward FD
+        let d_ipreds: Vec<f64> = ipreds_pert
+            .iter()
+            .zip(ipreds.iter())
+            .map(|(&p, &b)| (p - b) / actual_h)
+            .collect();
+
+        // d(f0) = d(ipreds); d(v) = -d(f0)
+        // For sigma-dependent r: d(r_j)/d(x[k]) via chain rule through r(f0 or ipreds)
+        let dr: Vec<f64> = r_diag
+            .iter()
+            .zip(r_pred_point.iter().zip(d_ipreds.iter()))
+            .map(|(&r_j, (&pred_j, &dp_j))| match model.error_model {
+                ErrorModel::Additive => 0.0,
+                ErrorModel::Proportional => {
+                    // r_j = sigma^2 * pred^2 => dr/d(pred) = 2*sigma^2*pred = 2*r_j/pred
+                    if pred_j.abs() > 1e-15 {
+                        2.0 * r_j / pred_j * dp_j
+                    } else {
+                        0.0
+                    }
+                }
+                ErrorModel::Combined => {
+                    let sp2 = params.sigma.values[0] * params.sigma.values[0];
+                    2.0 * sp2 * pred_j * dp_j
+                }
+            })
+            .collect();
+
+        // dL = -A^T d(f0) + 0.5 * sum_j dr_j * ((R^{-1})_jj - A_j^2)
+        let data_term: f64 = solved_a
+            .iter()
+            .zip(d_ipreds.iter())
+            .map(|(&a_j, &df_j)| -a_j * df_j)
+            .sum();
+        let r_term: f64 = dr
+            .iter()
+            .zip(rinv_diag.iter().zip(solved_a.iter()))
+            .map(|(&drj, (&rinv_jj, &a_j))| 0.5 * drj * (rinv_jj - a_j * a_j))
+            .sum();
+
+        grad[k] = data_term + r_term;
+    }
+
+    // ── Omega packed parameters ────────────────────────────────────────────
+    let omega_start = n_theta;
+    let omega_entries: Vec<(usize, usize)> = if template.omega.diagonal {
+        (0..n_eta).map(|i| (i, i)).collect()
+    } else {
+        let mut v = Vec::new();
+        for j in 0..n_eta {
+            for i in j..n_eta {
+                v.push((i, j));
+            }
+        }
+        v
+    };
+
+    for (ko, &(row, col)) in omega_entries.iter().enumerate() {
+        let k = omega_start + ko;
+        if fixed_mask[k] {
+            continue;
+        }
+        if row == col {
+            // Diagonal: x[k] = log L_omega[i,i], d(omega_ii)/d(x[k]) = 2 * omega_ii
+            let omega_ii = params.omega.matrix[(row, row)];
+            let w = &h_cols_solved[row]; // C^{-1} h_i
+            let h_i_dot_a: f64 = h_matrix
+                .column(row)
+                .iter()
+                .zip(solved_a.iter())
+                .map(|(h, a)| h * a)
+                .sum();
+            let w_sq: f64 = w.iter().map(|&x| x * x).sum();
+            grad[k] = omega_ii * (w_sq - h_i_dot_a * h_i_dot_a);
+        } else {
+            // Off-diagonal: x[k] = L_omega[row, col] (identity-packed)
+            // u = H * L_omega[:,col], w_vec = h_row = H[:,row]
+            // dR = w u^T + u w^T (symmetric rank-2)
+            // dL = (C^{-1} w)^T (C^{-1} u) - (w^T A)(u^T A)
+            let l_col: Vec<f64> = (0..n_eta).map(|r| l_omega[(r, col)]).collect();
+            let u: Vec<f64> = (0..n_obs)
+                .map(|obs_j| {
+                    (0..n_eta)
+                        .map(|eta_i| h_matrix[(obs_j, eta_i)] * l_col[eta_i])
+                        .sum::<f64>()
+                })
+                .collect();
+            let c_inv_u = fwd_solve(&chol_l, &u);
+            let c_inv_w = &h_cols_solved[row];
+            let u_dot_a: f64 = u.iter().zip(solved_a.iter()).map(|(ui, ai)| ui * ai).sum();
+            let w_dot_a: f64 = h_matrix
+                .column(row)
+                .iter()
+                .zip(solved_a.iter())
+                .map(|(h, a)| h * a)
+                .sum();
+            let trace_term: f64 = c_inv_w.iter().zip(c_inv_u.iter()).map(|(w, u)| w * u).sum();
+            grad[k] = trace_term - w_dot_a * u_dot_a;
+        }
+    }
+
+    // ── Sigma packed parameters ────────────────────────────────────────────
+    let sigma_start = omega_start + omega_entries.len();
+    for ks in 0..n_sigma {
+        let k = sigma_start + ks;
+        if fixed_mask[k] {
+            continue;
+        }
+        let dr_k = dr_diag_d_log_sigma(
+            model.error_model,
+            &r_diag,
+            r_pred_point,
+            &params.sigma.values,
+            ks,
+        );
+        let g: f64 = dr_k
+            .iter()
+            .zip(rinv_diag.iter().zip(solved_a.iter()))
+            .map(|(&drj, (&rinv_jj, &a_j))| 0.5 * drj * (rinv_jj - a_j * a_j))
+            .sum();
+        grad[k] = g;
+    }
+
+    Some((nll, grad))
+}
+
+/// Compute the FOCE NLL and its gradient w.r.t. the packed population parameter
+/// vector for a single subject, with ETAs fixed at their current EBE values.
+///
+/// For non-IOV analytical PK models without M3 BLOQ, uses an analytical gradient:
+/// exact for omega/sigma parameters; forward-FD of predictions only for theta.
+/// Falls back to central FD for ODE models, IOV, or M3 BLOQ.
+///
+/// Returns `(nll_i, gradient_i)` where `gradient_i[j] = d(nll_i)/d(x[j])`.
+pub(crate) fn subject_nll_pop_grad(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    kappas: &[DVector<f64>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> (f64, Vec<f64>) {
+    let can_use_analytical = model.ode_spec.is_none()
+        && kappas.is_empty()
+        && !matches!(model.bloq_method, BloqMethod::M3);
+
+    if can_use_analytical {
+        if let Some(result) = subject_nll_pop_grad_analytical(
+            x, template, model, population, subj_idx, eta_hat, h_matrix, bounds, options,
+        ) {
+            return result;
+        }
+    }
+
+    // Fallback: central FD over full per-subject NLL
+    let n = x.len();
+    let fixed_mask = packed_fixed_mask(template);
+    let eps = 1e-4;
+
+    let params_base = unpack_params(x, template);
+    let nll_base = subject_nll_at(
+        model,
+        population,
+        subj_idx,
+        &params_base,
+        eta_hat,
+        h_matrix,
+        kappas,
+        options,
+    );
+
+    let mut grad = vec![0.0f64; n];
+    let mut x_work = x.to_vec();
+
+    for j in 0..n {
+        if fixed_mask[j] {
+            continue;
+        }
+        let h = eps * (1.0 + x[j].abs());
+        let xj_plus = (x[j] + h).min(bounds.upper[j]);
+        let xj_minus = (x[j] - h).max(bounds.lower[j]);
+        let actual_2h = xj_plus - xj_minus;
+        if actual_2h.abs() < 1e-16 {
+            continue;
+        }
+
+        x_work[j] = xj_plus;
+        let params_plus = unpack_params(&x_work, template);
+        let nll_plus = subject_nll_at(
+            model,
+            population,
+            subj_idx,
+            &params_plus,
+            eta_hat,
+            h_matrix,
+            kappas,
+            options,
+        );
+
+        x_work[j] = xj_minus;
+        let params_minus = unpack_params(&x_work, template);
+        let nll_minus = subject_nll_at(
+            model,
+            population,
+            subj_idx,
+            &params_minus,
+            eta_hat,
+            h_matrix,
+            kappas,
+            options,
+        );
+
+        x_work[j] = x[j];
+
+        let deriv = (nll_plus - nll_minus) / actual_2h;
+        grad[j] = if deriv.is_finite() { deriv } else { 0.0 };
+    }
+
+    (nll_base, grad)
+}
+
+/// Build the Gauss-Newton linear system: gradient and BHHH approximate Hessian
 /// of the FOCE population objective.
 ///
-/// The gradient is computed via central FD of the total OFV w.r.t. packed params.
-/// The approximate Hessian uses the outer product of per-subject gradients (BHHH):
-///   H_bhhh = sum_i g_i g_i^T
-/// where g_i = d(2*nll_i)/d(x) is the per-subject OFV gradient.
-///
-/// This is the Berndt-Hall-Hall-Hausman (BHHH) approximation, which is equivalent
-/// to Gauss-Newton for the FOCE log-likelihood and is what NONMEM uses internally.
+/// Calls `subject_nll_pop_grad` in parallel over subjects (rayon `par_iter`).
+/// Each subject contributes its per-subject NLL gradient g_i; the totals are:
+///   grad(OFV) = 2 * Σ_i g_i
+///   H_bhhh(OFV) ≈ 4 * Σ_i g_i g_i^T   (BHHH approximation)
 fn build_gn_system(
     x: &[f64],
     template: &ModelParameters,
@@ -494,109 +920,38 @@ fn build_gn_system(
     let n = x.len();
     let n_subj = population.subjects.len();
 
-    // Compute per-subject gradient via central FD
-    // g_i[j] = d(nll_i)/d(x_j) for each subject i, parameter j
-    let eps = 1e-4;
-    let mut per_subj_grad: Vec<Vec<f64>> = vec![vec![0.0; n]; n_subj];
-    let mut x_work = x.to_vec();
-    let fixed_mask = packed_fixed_mask(template);
+    let per_subj: Vec<(f64, Vec<f64>)> = (0..n_subj)
+        .into_par_iter()
+        .map(|i| {
+            let kap_i = if i < kappas.len() {
+                kappas[i].as_slice()
+            } else {
+                &[]
+            };
+            subject_nll_pop_grad(
+                x,
+                template,
+                model,
+                population,
+                i,
+                &eta_hats[i],
+                &h_matrices[i],
+                kap_i,
+                bounds,
+                options,
+            )
+        })
+        .collect();
 
-    for j in 0..n {
-        // Skip FD evaluation for FIX parameters — the gradient is identically
-        // zero there and the `unpack_params + per-subject NLL` passes are
-        // expensive.
-        if fixed_mask[j] {
-            continue;
-        }
-        let h = eps * (1.0 + x[j].abs());
-        let xj_plus = (x[j] + h).min(bounds.upper[j]);
-        let xj_minus = (x[j] - h).max(bounds.lower[j]);
-        let actual_2h = xj_plus - xj_minus;
-        if actual_2h.abs() < 1e-16 {
-            continue;
-        }
-
-        x_work[j] = xj_plus;
-        let params_plus = unpack_params(&x_work, template);
-        let nll_plus: Vec<f64> = (0..n_subj)
-            .into_par_iter()
-            .map(|i| {
-                let kap_i = if i < kappas.len() {
-                    kappas[i].as_slice()
-                } else {
-                    &[]
-                };
-                subject_nll_at(
-                    model,
-                    population,
-                    i,
-                    &params_plus,
-                    &eta_hats[i],
-                    &h_matrices[i],
-                    kap_i,
-                    options,
-                )
-            })
-            .collect();
-
-        x_work[j] = xj_minus;
-        let params_minus = unpack_params(&x_work, template);
-        let nll_minus: Vec<f64> = (0..n_subj)
-            .into_par_iter()
-            .map(|i| {
-                let kap_i = if i < kappas.len() {
-                    kappas[i].as_slice()
-                } else {
-                    &[]
-                };
-                subject_nll_at(
-                    model,
-                    population,
-                    i,
-                    &params_minus,
-                    &eta_hats[i],
-                    &h_matrices[i],
-                    kap_i,
-                    options,
-                )
-            })
-            .collect();
-
-        x_work[j] = x[j];
-
-        for i in 0..n_subj {
-            let deriv = (nll_plus[i] - nll_minus[i]) / actual_2h;
-            per_subj_grad[i][j] = if deriv.is_finite() { deriv } else { 0.0 };
-        }
-    }
-
-    // Total gradient: g = sum_i g_i (scaled by 2 for OFV = 2*NLL)
+    // For OFV = 2 * Σ nll_i:
+    //   grad(OFV)    = 2 * Σ g_i
+    //   H_bhhh(OFV) ≈ 4 * Σ g_i g_i^T
     let mut grad = DVector::zeros(n);
-    for i in 0..n_subj {
-        for j in 0..n {
-            grad[j] += 2.0 * per_subj_grad[i][j];
-        }
-    }
-
-    // BHHH approximate Hessian: H = sum_i (2*g_i)(2*g_i)^T = 4 * sum_i g_i g_i^T
-    // But for the Newton step H*delta = -grad, we can factor out the 4:
-    // Use H_bhhh = sum_i g_i g_i^T, and solve (H_bhhh * delta) = -(grad/4)...
-    // Actually, let's just use the properly scaled version.
-    //
-    // For OFV = 2 * sum_i nll_i:
-    //   grad(OFV) = 2 * sum_i grad_i
-    //   H_bhhh(OFV) ≈ 4 * sum_i grad_i grad_i^T
-    //
-    // Newton step: delta = -H^{-1} grad = -(4 sum g_i g_i^T)^{-1} (2 sum g_i)
-    //            = -0.5 * (sum g_i g_i^T)^{-1} (sum g_i)
-    //
-    // We return (grad_total, H_total) where grad_total = 2*sum(g_i) and
-    // H_total = 4*sum(g_i g_i^T) so the caller solves H*delta = -grad directly.
-
     let mut h_bhhh = DMatrix::zeros(n, n);
-    for i in 0..n_subj {
-        let gi = DVector::from_column_slice(&per_subj_grad[i]);
-        h_bhhh += 4.0 * &gi * gi.transpose();
+    for (_, gi) in &per_subj {
+        let gi_vec = DVector::from_column_slice(gi);
+        grad += 2.0 * &gi_vec;
+        h_bhhh += 4.0 * &gi_vec * gi_vec.transpose();
     }
 
     (grad, h_bhhh)
@@ -867,6 +1222,381 @@ mod tests {
                 grad[j],
                 ref_grad_j,
                 (grad[j] - ref_grad_j).abs()
+            );
+        }
+    }
+
+    /// Verify that the analytical gradient path agrees with central FD to tight
+    /// tolerance — tests exact omega/sigma gradients and forward-FD theta
+    /// gradients against the reference.
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_matches_fd() {
+        let model = make_model();
+        let population = make_population();
+        let template = &model.default_params;
+
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+
+        let n_obs = 3;
+        let n_eta = 1;
+        let eta_hat = DVector::zeros(n_eta);
+        let h_matrix = nalgebra::DMatrix::zeros(n_obs, n_eta);
+        let options = FitOptions::default();
+
+        // Analytical path (called directly)
+        let (nll_an, grad_an) = subject_nll_pop_grad_analytical(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &options,
+        )
+        .expect("analytical path should succeed for non-IOV non-ODE model");
+
+        // Central-FD reference
+        let params_base = unpack_params(&x, template);
+        let nll_ref = subject_nll_at(
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
+        );
+        assert!(
+            (nll_an - nll_ref).abs() < 1e-10,
+            "nll mismatch: {nll_an} vs {nll_ref}"
+        );
+
+        let eps = 1e-5;
+        for j in 0..n {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let actual_2h = xp[j] - xm[j];
+            let pp = unpack_params(&xp, template);
+            let pm = unpack_params(&xm, template);
+            let np = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pp,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nm = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pm,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let ref_j = (np - nm) / actual_2h;
+
+            // Omega and sigma components should be machine-accurate; theta can
+            // differ due to forward vs central FD — allow 1% relative tolerance.
+            let tol = 0.01 * (1.0 + ref_j.abs()).max(1e-8);
+            assert!(
+                (grad_an[j] - ref_j).abs() < tol,
+                "analytical grad[{j}]: {:.6e}, fd ref: {:.6e}, diff: {:.2e}",
+                grad_an[j],
+                ref_j,
+                (grad_an[j] - ref_j).abs()
+            );
+        }
+    }
+
+    /// Verify that the analytical gradient is correct when H is non-zero —
+    /// exercises the `h_cols_solved` path and the omega diagonal formula with
+    /// non-trivial eta-to-obs mapping.
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_nonzero_h() {
+        let model = make_model();
+        let population = make_population();
+        let template = &model.default_params;
+
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+
+        let n_obs = 3;
+        let n_eta = 1;
+        // Non-zero H: partial derivatives of predictions w.r.t. eta at baseline
+        let eta_hat = DVector::from_vec(vec![0.1]);
+        let h_matrix = nalgebra::DMatrix::from_vec(n_obs, n_eta, vec![2.0, 1.5, 0.8]);
+        let options = FitOptions::default();
+
+        let (nll_an, grad_an) = subject_nll_pop_grad_analytical(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &options,
+        )
+        .expect("analytical path should succeed");
+
+        // NLL must match direct call
+        let params_base = unpack_params(&x, template);
+        let nll_ref = subject_nll_at(
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
+        );
+        assert!(
+            (nll_an - nll_ref).abs() < 1e-10,
+            "nll mismatch: {nll_an} vs {nll_ref}"
+        );
+
+        // Gradient must agree with central-FD reference
+        let eps = 1e-5;
+        for j in 0..n {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let actual_2h = xp[j] - xm[j];
+            let pp = unpack_params(&xp, template);
+            let pm = unpack_params(&xm, template);
+            let np = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pp,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nm = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pm,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let ref_j = (np - nm) / actual_2h;
+
+            let tol = 0.01 * (1.0 + ref_j.abs()).max(1e-8);
+            assert!(
+                (grad_an[j] - ref_j).abs() < tol,
+                "nonzero-H: analytical grad[{j}]={:.6e}, fd ref={:.6e}, diff={:.2e}",
+                grad_an[j],
+                ref_j,
+                (grad_an[j] - ref_j).abs()
+            );
+        }
+    }
+
+    /// Verify that the analytical gradient is correct under the FOCEI interaction
+    /// path (`options.interaction = true`), where r_diag is evaluated at ipreds
+    /// rather than f0, and dr/d(theta) passes through the r(ipred) chain.
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_interaction() {
+        let model = make_model();
+        let population = make_population();
+        let template = &model.default_params;
+
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+
+        let n_obs = 3;
+        let n_eta = 1;
+        let eta_hat = DVector::from_vec(vec![0.05]);
+        let h_matrix = nalgebra::DMatrix::from_vec(n_obs, n_eta, vec![3.0, 2.0, 1.0]);
+        let mut options = FitOptions::default();
+        options.interaction = true;
+
+        let (nll_an, grad_an) = subject_nll_pop_grad_analytical(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &options,
+        )
+        .expect("analytical path should succeed with interaction=true");
+
+        let params_base = unpack_params(&x, template);
+        let nll_ref = subject_nll_at(
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
+        );
+        assert!(
+            (nll_an - nll_ref).abs() < 1e-10,
+            "interaction nll mismatch: {nll_an} vs {nll_ref}"
+        );
+
+        let eps = 1e-5;
+        for j in 0..n {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let actual_2h = xp[j] - xm[j];
+            let pp = unpack_params(&xp, template);
+            let pm = unpack_params(&xm, template);
+            let np = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pp,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nm = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &pm,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let ref_j = (np - nm) / actual_2h;
+
+            let tol = 0.01 * (1.0 + ref_j.abs()).max(1e-8);
+            assert!(
+                (grad_an[j] - ref_j).abs() < tol,
+                "interaction: analytical grad[{j}]={:.6e}, fd ref={:.6e}, diff={:.2e}",
+                grad_an[j],
+                ref_j,
+                (grad_an[j] - ref_j).abs()
+            );
+        }
+    }
+
+    /// Verify that `subject_nll_pop_grad` returns (nll, gradient) where the
+    /// gradient agrees with a sequential central-FD reference for subject 0,
+    /// and the returned nll matches a direct call to `subject_nll_at`.
+    #[test]
+    fn test_subject_nll_pop_grad_matches_fd_reference() {
+        let model = make_model();
+        let population = make_population();
+        let template = &model.default_params;
+
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+
+        let n_obs = 3;
+        let n_eta = 1;
+        let eta_hat = DVector::zeros(n_eta);
+        let h_matrix = nalgebra::DMatrix::zeros(n_obs, n_eta);
+        let options = FitOptions::default();
+
+        let (nll, grad) = subject_nll_pop_grad(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &bounds,
+            &options,
+        );
+
+        // NLL must match a direct subject_nll_at call
+        let params_base = unpack_params(&x, template);
+        let nll_ref = subject_nll_at(
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
+        );
+        assert!(
+            (nll - nll_ref).abs() < 1e-12,
+            "nll mismatch: {nll} vs {nll_ref}"
+        );
+
+        // Gradient must be finite
+        for (j, g) in grad.iter().enumerate() {
+            assert!(g.is_finite(), "grad[{j}] not finite");
+        }
+
+        // Each gradient component must agree with sequential central-FD reference
+        let eps = 1e-4;
+        for j in 0..n {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let actual_2h = xp[j] - xm[j];
+
+            let params_p = unpack_params(&xp, template);
+            let params_m = unpack_params(&xm, template);
+            let nll_p = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_p,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nll_m = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_m,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let ref_j = (nll_p - nll_m) / actual_2h;
+
+            let tol = 1e-4 * (1.0 + ref_j.abs());
+            assert!(
+                (grad[j] - ref_j).abs() < tol,
+                "grad[{j}]: subject_nll_pop_grad={:.6e}, ref={:.6e}",
+                grad[j],
+                ref_j,
             );
         }
     }

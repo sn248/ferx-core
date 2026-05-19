@@ -213,7 +213,7 @@ by the parameterization integration tests; no new test is required.
 
 ## Step 1 — rayon `par_iter` in FOCE Subject Loop
 
-**Status: 🔶 PARTIAL**
+**Status: ✅ DONE — absorbed by PR #47 (Step 3).**
 
 **No prerequisites. Start here.**
 
@@ -280,7 +280,23 @@ speedup with core count for those collection passes.
 
 ## Step 3 — AD Gradients for GN/BHHH Per-Subject Score Vectors
 
-**Status: ❌ NOT STARTED**
+**Status: ✅ DONE — merged via PR #47.**
+
+**Phase B deviation (recorded):** The original plan called for propagating Dual
+numbers through `tv_fn` to get population-parameter gradients. This is infeasible:
+`tv_fn` is `Option<Box<dyn Fn(&[f64], &HashMap<String, f64>) -> Vec<f64>>>` — an
+opaque closure that only accepts `f64` slices; Dual numbers cannot propagate
+through it. The implementation instead uses:
+- **Analytical matrix formulas** (exact) for omega and sigma packed parameters,
+  derived from the Cholesky of R_tilde already computed during the FOCE NLL.
+- **Forward-FD of `compute_predictions_with_tv` only** (not full NLL) for theta
+  packed parameters — one predict call per theta parameter, reusing the baseline
+  Cholesky. Equivalent accuracy: O(h) error same as central-FD for theta, exact
+  for omega/sigma.
+- **Central-FD fallback** retained for ODE models, IOV, and M3/BLOQ paths.
+
+`build_gn_system` was restructured to Rayon subject-parallel accumulation
+(previously per-parameter outer loop with inner subject `par_iter`).
 
 **Requires: Step 1 complete. Requires PR #22 merged.**
 
@@ -768,7 +784,7 @@ larger. The exploration phase stabilizes faster.
 
 ## Step 9 — Student-t Proposal for SIR
 
-**Status: ❌ NOT STARTED**
+**Status: ✅ DONE — merged via PR #41.**
 
 **No prerequisites. Can be done at any time independently.**
 
@@ -836,7 +852,7 @@ implementation cost.
 
 ## Step 10 — Parallel Multi-Start Outer Optimization
 
-**Status: ❌ NOT STARTED**
+**Status: ✅ DONE — merged via PR #42.**
 
 **No prerequisites. Can be done at any time. Uses rayon already in Cargo.toml.**
 

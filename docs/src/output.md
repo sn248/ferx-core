@@ -108,7 +108,28 @@ A value near 1 means individual EBEs are all pulled toward zero — the data are
 
 Both formulas use the **uncentered second moment with `n` divisor**, matching the NONMEM / PsN / Monolix convention — the population model assumes `E[η]=0` and `E[IWRES²]=1`, so the natural estimator is `√(Σx²/n)` rather than the unbiased sample SD (which centers on the sample mean and divides by `n-1`). The unbiased form would inflate SD by `√(n/(n-1))` and routinely produce spurious negative shrinkage on small samples.
 
+**Negative `shrinkage_eps`** is mathematically possible and meaningful: it indicates `mean(IWRES²) > 1`, i.e. the residual error model does not absorb the residuals seen at the final EBE etas. Common causes include SAEM converging to a local optimum with under-fit sigma (often resolved by polishing with `method = [saem, focei]` or trying a different start), model misspecification for a subset of subjects (check the IWRES distribution in the sdtab for outliers), or sigma at a bound. When `shrinkage_eps < -5%`, ferx emits a warning to `FitResult.warnings`; the raw value is retained for parity with NONMEM/PsN.
+
 Values of `NaN` indicate a zero-variance omega component (ETA) or fewer than two valid residuals (EPS).
+
+### IWRES Autocorrelation
+
+Two pooled autocorrelation diagnostics are reported after every fit:
+
+**`iwres_lag1_r`** — pooled lag-1 Pearson correlation of IWRES across subjects. Values near 0 indicate no serial dependence; values approaching ±1 indicate strong autocorrelation.
+
+**`dw_statistic`** — pooled Durbin-Watson statistic:
+\\[ \text{DW} = \frac{\sum_i \sum_t (e_{i,t} - e_{i,t-1})^2}{\sum_i \sum_t e_{i,t}^2} \\]
+
+| DW range | Interpretation |
+|----------|---------------|
+| ≈ 2.0 | No autocorrelation |
+| < 1.5 | Positive autocorrelation — structural model likely missing dynamics |
+| > 2.5 | Negative autocorrelation — possible over-parameterization or misspecified error model |
+
+Subjects with fewer than 2 finite IWRES values are excluded from both statistics. Both fields are `NaN` when no subject qualifies.
+
+When `dw_statistic < 1.5`, ferx emits a warning suggesting a transit absorption model, additional compartment, or IOV on ka/F (plus SDE process noise for ODE models). When `dw_statistic > 2.5`, the warning suggests over-parameterization or a misspecified error model.
 
 ### Covariance Status
 

@@ -948,6 +948,13 @@ pub struct FitResult {
     pub shrinkage_eta: Vec<f64>,
     /// EPS shrinkage: `1 - SD(IWRES)`.  `NaN` when fewer than 2 valid residuals.
     pub shrinkage_eps: f64,
+    /// Pooled lag-1 Pearson correlation of IWRES across subjects.
+    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    pub iwres_lag1_r: f64,
+    /// Pooled Durbin-Watson statistic for IWRES within subjects.
+    /// 2.0 = no autocorrelation; < 1.5 = positive; > 2.5 = negative.
+    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    pub dw_statistic: f64,
     /// Wall-clock time for the complete fit in seconds.
     pub wall_time_secs: f64,
     /// Model name (from the `.ferx` file or "Unnamed").
@@ -1044,13 +1051,20 @@ pub struct FitOptions {
     /// `simulate_with_uncertainty()`. Adds `n_resamples * n_packed * 8` bytes
     /// to the result; default `false`.
     pub sir_keep_samples: bool,
+    /// Degrees of freedom for the Student-t SIR proposal distribution.
+    /// Heavier tails than the normal improve ESS for parameters near boundaries
+    /// (omega variances, constrained thetas). Default 5.0 follows Dosne (2017).
+    /// Set to a large value (e.g. 100.0) to recover near-normal behaviour.
+    pub sir_df: f64,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
     pub bloq_method: BloqMethod,
     /// Maximum CG iterations for the Steihaug subproblem solver (trust-region only).
-    /// Should be at least n_params; default 50 covers most population PK models.
-    pub steihaug_max_iters: usize,
+    /// `None` (default) uses a size-adaptive budget of `ceil(sqrt(n_params)).clamp(5, n_params)`,
+    /// which is 5 for typical NLME problems (n_params ≈ 7–15) and grows with model size.
+    /// `Some(n)` pins the budget to `n` — set to `50` to recover the previous fixed behaviour.
+    pub steihaug_max_iters: Option<usize>,
     /// If true (default), use automatically detected mu-referencing to centre
     /// ETA starting points on the current population mean at each outer step.
     /// Set to false to disable for comparison purposes.
@@ -1062,6 +1076,25 @@ pub struct FitOptions {
     /// pool of `n` threads — so the setting is per-call, not process-wide,
     /// and different fits can use different thread counts.
     pub threads: Option<usize>,
+    /// Number of independent optimizations to run from perturbed starting values.
+    /// `1` (default) is a single run — no behaviour change. When `> 1`, runs are
+    /// launched in parallel via rayon; the result with the lowest OFV among
+    /// converged runs is returned. Start 0 always uses the exact user initials;
+    /// starts 1..n are log-space or additive perturbations of size `start_sigma`.
+    /// Useful for models with local minima (nonlinear elimination, full-block omega,
+    /// many covariates). Nested rayon parallelism (multi-start × per-subject) is
+    /// safe — rayon's work-stealing pool handles it without oversubscription.
+    pub n_starts: usize,
+    /// Log-space standard deviation of the perturbation applied to initial theta
+    /// values for starts 1..n_starts. Log-packed thetas are multiplied by
+    /// `exp(N(0, start_sigma))`; identity-packed thetas (negative lower bound)
+    /// are shifted by `start_sigma * N(0,1)`. Default `0.3` (≈ 30% CV).
+    pub start_sigma: f64,
+    /// RNG seed for the multi-start theta perturbations. Independent of
+    /// `saem_seed` so that changing the SAEM seed for SAEM convergence does
+    /// not silently alter which perturbed starts are tried for FOCE multi-start
+    /// runs. Default `None` falls back to `42`.
+    pub multi_start_seed: Option<u64>,
     /// Name of the column in the dataset that identifies the occasion for each row.
     /// When `Some`, `read_nonmem_csv` populates `Subject::occasions` / `dose_occasions`
     /// and the inner loop estimates per-occasion kappas alongside the BSV etas.
@@ -1136,10 +1169,14 @@ impl Default for FitOptions {
             sir_resamples: 250,
             sir_seed: None,
             sir_keep_samples: false,
+            sir_df: 5.0,
             bloq_method: BloqMethod::Drop,
-            steihaug_max_iters: 50,
+            steihaug_max_iters: None,
             mu_referencing: true,
             threads: None,
+            n_starts: 1,
+            start_sigma: 0.3,
+            multi_start_seed: None,
             iov_column: None,
             cancel: None,
             user_set_keys: Vec::new(),
@@ -1301,10 +1338,14 @@ pub fn framework_keys() -> &'static [&'static str] {
         "sir_resamples",
         "sir_seed",
         "sir_keep_samples",
+        "sir_df",
         "bloq_method",
         "bloq",
         "mu_referencing",
         "threads",
+        "n_starts",
+        "start_sigma",
+        "multi_start_seed",
         "gradient",
         "gradient_method",
         "iov_column",

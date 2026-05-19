@@ -1,4 +1,4 @@
-# ferx-core Optimization Task Plan (Updated 2026-05-18)
+# ferx-core Optimization Task Plan (Updated 2026-05-19)
 
 This file is for use with Claude Code in the `ferx-core` repository.
 Read `CLAUDE.md` first before starting any step.
@@ -8,6 +8,25 @@ below is a starting hypothesis, not a fixed recipe**. The actual repository stat
 may differ from what is described. Every step begins with deep evaluation of the
 existing code, plan reconciliation, and explicit confirmation before any code is
 written.
+
+---
+
+## Progress Summary (as of 2026-05-19)
+
+All steps completed in a single day (2026-05-19). Steps 5b, 7, and 8 remain.
+
+| Step | PR | What | Why | What it adds |
+|------|----|------|-----|--------------|
+| **1** — rayon `par_iter` in GN | absorbed by #47 | Parallelize per-subject NLL evaluations in the GN finite-difference gradient loop | GN was computing subject NLL sequentially inside a per-parameter outer loop | Near-linear speedup with core count for the FD path of GN |
+| **2** — Log-Cholesky for Ω | pre-existing | Store Cholesky diagonal in log space during packing | Keeps optimizer unconstrained (no positivity constraints on diagonal) | Was already done; no PR needed |
+| **3** — AD gradients for GN/BHHH | [#47](https://github.com/FeRx-NLME/ferx-core/pull/47) | Replace central-FD score vectors with analytical Ω/σ gradients + forward-FD of predictions only for θ; restructure to rayon subject-parallel | Central-FD cost P·subjects per BHHH iteration; exact gradients are cheaper and improve Hessian quality | ~13k fewer model evaluations per fit on warfarin; exact BHHH matrix for GN; enables Step 5 |
+| **4** — AD gradient for SAEM M-step | [#49](https://github.com/FeRx-NLME/ferx-core/pull/49) | Replace forward-FD of `obs_nll_sum` in the M-step NLopt closure with a single rayon subject-parallel pass using analytical σ gradients + FD-of-predictions for θ | Forward-FD launched n_dim sequential rayon jobs; analytical σ path eliminates extra predict calls entirely | Fewer NLopt OFV evaluations per M-step; better cache locality; single rayon launch vs n sequential ones |
+| **5** — AD gradient in outer optimizer | [#48](https://github.com/FeRx-NLME/ferx-core/pull/48) | Replace central-FD `gradient_cd` in the NLopt SLSQP/LBFGS outer loop with `subject_nll_pop_grad` summed over subjects in parallel | Each outer FD gradient query cost P full inner-loop re-solves (re-running EBE for each parameter); AD provides the same gradient with fixed EBEs in one pass | Largest single wall-clock improvement for FOCE/FOCEI; eliminates the dominant cost of each outer iteration on ODE models |
+| **6** — BHHH Hessian + AD gradient in trust-region | [#50](https://github.com/FeRx-NLME/ferx-core/pull/50) | Replace FD gradient and FD-of-gradient Hessian in `trust_region.rs` with `subject_nll_pop_grad` (gradient) and `4 Σ gᵢgᵢᵀ` (BHHH Hessian); cache per-subject gradients between the two calls; adaptive Steihaug CG budget | FD Hessian cost O(n²) OFV evaluations per outer iteration (98 for n=7); BHHH reuses gradients already computed, costs zero extra evaluations; BHHH is always PSD so CG is well-conditioned near constraints | Zero-cost Hessian per TR iteration; PSD guarantee eliminates CG conditioning failures; CG budget reduced from fixed 50 to adaptive ~5 for typical NLME models |
+| **9** — Student-t SIR proposal | [#41](https://github.com/FeRx-NLME/ferx-core/pull/41) | Replace MVN proposal in SIR with multivariate Student-t (ν=5) | Normal proposal has thin tails; ESS collapses for parameters near boundaries (Ω variances, constrained θ) | Higher ESS without increasing `sir_samples`; more reliable 95% CIs for boundary-adjacent parameters |
+| **10** — Parallel multi-start | [#42](https://github.com/FeRx-NLME/ferx-core/pull/42) | Run N independent full optimizations from perturbed initials in parallel via rayon; return lowest OFV | Local minima are the most common practical failure mode for nonlinear elimination, full-block Ω, and covariate models | On an 8-core machine, `n_starts = 8` gives ~8× lower probability of a local minimum at the same wall-clock cost |
+
+**Remaining:** Step 5b (IOV analytical gradient, requires Step 5 ✅), Step 7 (GN → trust-region subproblem replacing LM damping, requires Step 6 ✅), Step 8 (HMC proposals in SAEM E-step, requires Steps 3 ✅ and 4 ✅).
 
 ---
 
@@ -213,7 +232,7 @@ by the parameterization integration tests; no new test is required.
 
 ## Step 1 — rayon `par_iter` in FOCE Subject Loop
 
-**Status: 🔶 PARTIAL**
+**Status: ✅ DONE — absorbed by PR #47 (Step 3).**
 
 **No prerequisites. Start here.**
 
@@ -280,7 +299,23 @@ speedup with core count for those collection passes.
 
 ## Step 3 — AD Gradients for GN/BHHH Per-Subject Score Vectors
 
-**Status: ❌ NOT STARTED**
+**Status: ✅ DONE — merged via PR #47.**
+
+**Phase B deviation (recorded):** The original plan called for propagating Dual
+numbers through `tv_fn` to get population-parameter gradients. This is infeasible:
+`tv_fn` is `Option<Box<dyn Fn(&[f64], &HashMap<String, f64>) -> Vec<f64>>>` — an
+opaque closure that only accepts `f64` slices; Dual numbers cannot propagate
+through it. The implementation instead uses:
+- **Analytical matrix formulas** (exact) for omega and sigma packed parameters,
+  derived from the Cholesky of R_tilde already computed during the FOCE NLL.
+- **Forward-FD of `compute_predictions_with_tv` only** (not full NLL) for theta
+  packed parameters — one predict call per theta parameter, reusing the baseline
+  Cholesky. Equivalent accuracy: O(h) error same as central-FD for theta, exact
+  for omega/sigma.
+- **Central-FD fallback** retained for ODE models, IOV, and M3/BLOQ paths.
+
+`build_gn_system` was restructured to Rayon subject-parallel accumulation
+(previously per-parameter outer loop with inner subject `par_iter`).
 
 **Requires: Step 1 complete. Requires PR #22 merged.**
 
@@ -539,9 +574,89 @@ wall-clock improvement for FOCE/FOCEI on ODE models.
 
 ---
 
+## Step 5b — Analytical Gradient for IOV Models in the Outer Optimizer
+
+**Status: 🔴 NOT STARTED**
+
+**Requires: Step 5 complete.**
+
+### Background
+
+Step 5 replaced population-level central FD with `subject_nll_pop_grad` summed
+in parallel over subjects. For non-IOV analytical PK models, `subject_nll_pop_grad`
+takes the analytical path (`subject_nll_pop_grad_analytical`): exact for ω/σ
+Cholesky elements, forward-FD of predictions only for θ. For IOV models,
+`can_use_analytical = false` because `!kappas.is_empty()`, so it falls back to
+per-subject central FD (cost = 2P subject NLL evals per outer gradient query).
+
+The analytical gradient *can* be extended to IOV — the FOCE NLL structure is
+identical, just with an expanded random-effects vector and a block-diagonal
+variance matrix.
+
+### What remains
+
+#### Math
+
+For a subject with occasions `1…K`, the IOV random effects are `[η; κ₁; …; κ_K]`
+and the combined variance block is:
+
+```
+Ω_combined = diag(Ω_bsv, Ω_iov, …, Ω_iov)   (K+1 blocks)
+```
+
+The FOCE linearisation gives:
+
+```
+r_tilde = R + H_combined · Ω_combined · H_combined^T
+```
+
+where `H_combined = [H_η | H_κ₁ | … | H_κ_K]` concatenates the Jacobians
+`∂ipred/∂η` and `∂ipred/∂κ_occ` for each occasion (most columns are zero
+outside their occasion's observations).
+
+The gradients follow the same formula as the non-IOV case:
+
+```
+∂NLL/∂L_bsv[i,j]  = ...  (same as non-IOV ∂NLL/∂L[i,j] for the bsv block)
+∂NLL/∂L_iov[i,j]  = Σ_occ [same formula applied to the κ_occ block]
+∂NLL/∂σ_k         = ...  (unchanged)
+∂NLL/∂θ           = forward-FD of ipred (unchanged)
+```
+
+#### Implementation
+
+1. Add `subject_nll_pop_grad_analytical_iov` in `src/estimation/gauss_newton.rs`
+   (or extend `subject_nll_pop_grad_analytical` with an IOV branch).
+2. In `subject_nll_pop_grad`, lift the `kappas.is_empty()` gate from
+   `can_use_analytical` for non-ODE, non-M3 models.
+3. The kappa H-matrices (`∂ipred/∂κ_occ`) must be available at the call site —
+   verify they are returned by `run_inner_loop_warm` or add their computation.
+
+### Files to touch
+- `src/estimation/gauss_newton.rs` (new IOV analytical gradient variant)
+- `src/estimation/outer_optimizer.rs` (lift `kappas.is_empty()` gate if needed)
+
+### Test
+
+Add a gradient test analogous to `test_outer_ad_gradient_block_omega` but with
+`omega_iov` set and multiple occasions per subject. Verify that the IOV
+analytical gradient matches population-level central FD to within `1e-4`.
+
+Also verify that `test_outer_ad_gradient_fd_fallback_path` is superseded (or
+update it to confirm the analytical path is now taken for non-ODE IOV).
+
+### Expected gain
+
+Same ratio as Step 5 for non-IOV: instead of 2P subject NLL evals per gradient
+query, the cost drops to 1 forward-FD pass of predictions per θ component.
+For IOV models with many occasions, the per-subject FD cost scales with P,
+so the gain is proportional to P (number of packed population parameters).
+
+---
+
 ## Step 6 — Trust Region: AD Gradient + BHHH Hessian + Adaptive Steihaug-CG
 
-**Status: 🔶 PARTIAL**
+**Status: ✅ DONE — merged via PR #50.**
 
 **Requires: Steps 3 and 5 complete.**
 
@@ -768,7 +883,7 @@ larger. The exploration phase stabilizes faster.
 
 ## Step 9 — Student-t Proposal for SIR
 
-**Status: ❌ NOT STARTED**
+**Status: ✅ DONE — merged via PR #41.**
 
 **No prerequisites. Can be done at any time independently.**
 
@@ -836,7 +951,7 @@ implementation cost.
 
 ## Step 10 — Parallel Multi-Start Outer Optimization
 
-**Status: ❌ NOT STARTED**
+**Status: ✅ DONE — merged via PR #42.**
 
 **No prerequisites. Can be done at any time. Uses rayon already in Cargo.toml.**
 

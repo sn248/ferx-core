@@ -1,8 +1,10 @@
+use crate::estimation::gauss_newton::subject_nll_pop_grad;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -611,29 +613,27 @@ fn optimize_nlopt(
                 n_evals_cl.fetch_add(1, Ordering::Relaxed);
                 return ofv;
             }
-            let kappas_ref = &kappas;
-            let ofv_fn = |xp: &[f64], eh: &[DVector<f64>], hm: &[DMatrix<f64>]| -> f64 {
-                let p = unpack_params(xp, init_params);
-                2.0 * pop_nll(
-                    model,
-                    population,
-                    &p,
-                    eh,
-                    hm,
-                    kappas_ref,
-                    options.interaction,
-                )
-            };
-            // FD gradient in unscaled space; multiply by scale for scaled gradient.
-            let grad_vec = gradient_cd(&x, &bounds, &ehs, &hms, &ofv_fn);
+            // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
+            let grad_raw = ad_population_gradient(
+                &x,
+                n_subj,
+                init_params,
+                model,
+                population,
+                &ehs,
+                &hms,
+                &kappas,
+                &bounds,
+                options,
+            );
             let mut sq = 0.0_f64;
-            for i in 0..g.len() {
-                let gi = if grad_vec[i].is_finite() {
-                    grad_vec[i] * scale[i]
+            for k in 0..g.len() {
+                let gi = if grad_raw[k].is_finite() {
+                    grad_raw[k] * scale[k]
                 } else {
                     0.0
                 };
-                g[i] = gi;
+                g[k] = gi;
                 sq += gi * gi;
             }
             grad_norm_for_trace = Some(sq.sqrt());
@@ -874,28 +874,27 @@ fn optimize_nlopt(
                     n_evals_cl2.fetch_add(1, Ordering::Relaxed);
                     return ofv;
                 }
-                let kappas_ref = &kappas;
-                let ofv_fn = |xp: &[f64], eh: &[DVector<f64>], hm: &[DMatrix<f64>]| -> f64 {
-                    let p = unpack_params(xp, init_params);
-                    2.0 * pop_nll(
-                        model,
-                        population,
-                        &p,
-                        eh,
-                        hm,
-                        kappas_ref,
-                        options.interaction,
-                    )
-                };
-                let grad_vec = gradient_cd(&x, &bounds, &ehs, &hms, &ofv_fn);
+                // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
+                let grad_raw = ad_population_gradient(
+                    &x,
+                    n_subj,
+                    init_params,
+                    model,
+                    population,
+                    &ehs,
+                    &hms,
+                    &kappas,
+                    &bounds,
+                    options,
+                );
                 let mut sq = 0.0_f64;
-                for i in 0..g.len() {
-                    let gi = if grad_vec[i].is_finite() {
-                        grad_vec[i] * scale[i]
+                for k in 0..g.len() {
+                    let gi = if grad_raw[k].is_finite() {
+                        grad_raw[k] * scale[k]
                     } else {
                         0.0
                     };
-                    g[i] = gi;
+                    g[k] = gi;
                     sq += gi * gi;
                 }
                 grad_norm_for_trace = Some(sq.sqrt());
@@ -1160,12 +1159,20 @@ fn optimize_bfgs(
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
         );
-        let kappas_ref = &kappas;
-        let ofv_fn_fixed = |xp: &[f64], eh: &[DVector<f64>], hm: &[DMatrix<f64>]| -> f64 {
-            ofv_at_fixed(xp, eh, hm, kappas_ref)
-        };
         let ofv = ofv_at_fixed(x, &ehs, &hms, &kappas);
-        let g = gradient_cd(x, &bounds, &ehs, &hms, &ofv_fn_fixed);
+        // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x)
+        let g = ad_population_gradient(
+            x,
+            n_subj,
+            init_params,
+            model,
+            population,
+            &ehs,
+            &hms,
+            &kappas,
+            &bounds,
+            options,
+        );
         let f = if ofv.is_finite() { ofv } else { 1e20 };
         (f, g, ehs, hms)
     };
@@ -1383,6 +1390,50 @@ fn optimize_bfgs(
 //  Shared utilities
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Compute `d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x)` by summing per-subject
+/// gradients in parallel.  ETAs are fixed at their current EBE values.
+///
+/// `kappas` must have length `n_subj`; each `kappas[i]` is the IOV kappa
+/// vector for subject `i` (empty for non-IOV models).
+fn ad_population_gradient(
+    x: &[f64],
+    n_subj: usize,
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    ehs: &[DVector<f64>],
+    hms: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    debug_assert_eq!(ehs.len(), n_subj);
+    debug_assert_eq!(hms.len(), n_subj);
+    debug_assert_eq!(kappas.len(), n_subj);
+    let np = x.len();
+    let per_subj: Vec<Vec<f64>> = (0..n_subj)
+        .into_par_iter()
+        .map(|i| {
+            subject_nll_pop_grad(
+                x,
+                init_params,
+                model,
+                population,
+                i,
+                &ehs[i],
+                &hms[i],
+                kappas[i].as_slice(),
+                bounds,
+                options,
+            )
+            .1
+        })
+        .collect();
+    (0..np)
+        .map(|k| per_subj.iter().map(|gi| gi[k]).sum::<f64>() * 2.0)
+        .collect()
+}
+
 fn bfgs_update(
     h_inv: &mut DMatrix<f64>,
     x_new: &[f64],
@@ -1406,67 +1457,6 @@ fn bfgs_update(
     } else {
         *h_inv = DMatrix::identity(n, n);
     }
-}
-
-/// Central finite-difference gradient of FOCE OFV with EBEs held fixed.
-///
-/// Parameters with `bounds.lower[i] == bounds.upper[i]` (e.g. FIX parameters)
-/// are skipped: the perturbed point would be clamped back to `x[i]` so
-/// `actual_2h` is zero anyway, but skipping avoids two full OFV evaluations
-/// per fixed coordinate.
-fn gradient_cd(
-    x: &[f64],
-    bounds: &PackedBounds,
-    eta_hats: &[DVector<f64>],
-    h_matrices: &[DMatrix<f64>],
-    ofv: &dyn Fn(&[f64], &[DVector<f64>], &[DMatrix<f64>]) -> f64,
-) -> Vec<f64> {
-    let n = x.len();
-    let eps = 1e-5;
-    let mut g = vec![0.0; n];
-    let mut x_work = x.to_vec();
-
-    for i in 0..n {
-        if (bounds.upper[i] - bounds.lower[i]).abs() < 1e-16 {
-            continue; // FIX parameter
-        }
-        let h = eps * (1.0 + x[i].abs());
-        let xi_plus = (x[i] + h).min(bounds.upper[i]);
-        let xi_minus = (x[i] - h).max(bounds.lower[i]);
-        let actual_2h = xi_plus - xi_minus;
-        if actual_2h.abs() < 1e-16 {
-            continue;
-        }
-
-        x_work[i] = xi_plus;
-        let f_plus = ofv(&x_work, eta_hats, h_matrices);
-        x_work[i] = xi_minus;
-        let f_minus = ofv(&x_work, eta_hats, h_matrices);
-        x_work[i] = x[i];
-
-        // If either evaluation is non-finite, use one-sided FD from the base point
-        if f_plus.is_finite() && f_minus.is_finite() {
-            let gi = (f_plus - f_minus) / actual_2h;
-            if gi.is_finite() {
-                g[i] = gi;
-            }
-        } else {
-            // Fallback: one-sided from base
-            let f0 = ofv(&x, eta_hats, h_matrices);
-            if f_plus.is_finite() && f0.is_finite() {
-                let gi = (f_plus - f0) / (xi_plus - x[i]);
-                if gi.is_finite() {
-                    g[i] = gi;
-                }
-            } else if f_minus.is_finite() && f0.is_finite() {
-                let gi = (f0 - f_minus) / (x[i] - xi_minus);
-                if gi.is_finite() {
-                    g[i] = gi;
-                }
-            }
-        }
-    }
-    g
 }
 
 fn backtracking_line_search_warm(
@@ -1694,6 +1684,325 @@ pub(crate) fn compute_covariance(
                 eprintln!("  Covariance failed: Hessian not invertible");
             }
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::estimation::parameterization::{compute_bounds, pack_params};
+    use crate::types::{
+        BloqMethod, CompiledModel, DoseEvent, ErrorModel, FitOptions, GradientMethod,
+        ModelParameters, OmegaMatrix, PkModel, PkParams, Population, SigmaVector, Subject,
+    };
+    use nalgebra::DVector;
+    use std::collections::HashMap;
+
+    fn make_model() -> CompiledModel {
+        let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
+        let default_params = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.1, 5.0],
+            theta_upper: vec![50.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.1],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        CompiledModel {
+            name: "outer_test".into(),
+            pk_model: PkModel::OneCptIvBolus,
+            error_model: ErrorModel::Proportional,
+            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp();
+                p.values[1] = theta[1];
+                p
+            }),
+            n_theta: 2,
+            n_eta: 1,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: Vec::new(),
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into(), "V".into()],
+            default_params,
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: vec![0],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+        }
+    }
+
+    fn make_population(n_subj: usize) -> Population {
+        let subjects = (0..n_subj)
+            .map(|_| Subject {
+                id: "S1".into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 4.0, 8.0],
+                observations: vec![25.0, 15.0, 9.0],
+                obs_cmts: vec![1, 1, 1],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                cens: vec![0, 0, 0],
+                occasions: vec![1, 1, 1],
+                dose_occasions: vec![1],
+            })
+            .collect();
+        Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+        }
+    }
+
+    fn check_gradient(model: &CompiledModel, population: &Population, n_eta: usize) {
+        let template = &model.default_params;
+        let n_subj = population.subjects.len();
+        let n_obs = population.subjects[0].observations.len();
+
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+        let options = FitOptions::default();
+
+        let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
+        // Use a non-zero H-matrix so r_tilde = R + H·Ω·Hᵀ depends on Ω and
+        // the omega/off-diagonal Cholesky gradients are non-trivially exercised.
+        let h_matrices: Vec<nalgebra::DMatrix<f64>> = (0..n_subj)
+            .map(|_| nalgebra::DMatrix::from_element(n_obs, n_eta, 0.1))
+            .collect();
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
+
+        let ad_grad = ad_population_gradient(
+            &x,
+            n_subj,
+            template,
+            model,
+            population,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &bounds,
+            &options,
+        );
+
+        let ofv_at = |xp: &[f64]| -> f64 {
+            let p = unpack_params(xp, template);
+            2.0 * pop_nll(
+                model,
+                population,
+                &p,
+                &eta_hats,
+                &h_matrices,
+                &kappas,
+                options.interaction,
+            )
+        };
+        let eps = 1e-4;
+        let fd_grad: Vec<f64> = (0..n)
+            .map(|j| {
+                let h = eps * (1.0 + x[j].abs());
+                let mut xp = x.clone();
+                let mut xm = x.clone();
+                xp[j] += h;
+                xm[j] -= h;
+                (ofv_at(&xp) - ofv_at(&xm)) / (2.0 * h)
+            })
+            .collect();
+
+        for j in 0..n {
+            let tol = 1e-4 * (1.0 + fd_grad[j].abs());
+            assert!(
+                (ad_grad[j] - fd_grad[j]).abs() < tol,
+                "grad[{j}]: AD={:.6e}, FD={:.6e}",
+                ad_grad[j],
+                fd_grad[j],
+            );
+        }
+    }
+
+    /// IIV (diagonal omega, 1 ETA): analytical path.
+    #[test]
+    fn test_outer_ad_gradient_iiv() {
+        check_gradient(&make_model(), &make_population(3), 1);
+    }
+
+    /// Block omega (2×2 with off-diagonal): tests Cholesky-param gradient.
+    #[test]
+    fn test_outer_ad_gradient_block_omega() {
+        use crate::types::{OmegaMatrix, PkParams};
+        // 2-ETA model: CL and V both random with correlation.
+        // Build 2×2 omega with variance 0.04 on diagonal and covariance 0.01.
+        let mut mat = nalgebra::DMatrix::zeros(2, 2);
+        mat[(0, 0)] = 0.04;
+        mat[(1, 1)] = 0.04;
+        mat[(0, 1)] = 0.01;
+        mat[(1, 0)] = 0.01;
+        let free_mask = nalgebra::DMatrix::from_element(2, 2, true);
+        let omega = OmegaMatrix::from_matrix_with_mask(
+            mat,
+            vec!["ETA_CL".into(), "ETA_V".into()],
+            false,
+            free_mask,
+        );
+        let default_params = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.1, 5.0],
+            theta_upper: vec![50.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega,
+            omega_fixed: vec![false, false, false],
+            sigma: SigmaVector {
+                values: vec![0.1],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        let model = CompiledModel {
+            name: "block_test".into(),
+            pk_model: PkModel::OneCptIvBolus,
+            error_model: ErrorModel::Proportional,
+            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp();
+                p.values[1] = theta[1] * eta[1].exp();
+                p
+            }),
+            n_theta: 2,
+            n_eta: 2,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: Vec::new(),
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: vec!["ETA_CL".into(), "ETA_V".into()],
+            indiv_param_names: vec!["CL".into(), "V".into()],
+            default_params,
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: vec![0, 1],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+        };
+        check_gradient(&model, &make_population(3), 2);
+    }
+
+    /// Non-empty kappas force the central-FD fallback in subject_nll_pop_grad
+    /// (can_use_analytical = false); the population-sum must still match the
+    /// population-level FD reference.
+    ///
+    /// Note: with omega_iov=None the IOV NLL formula is not exercised here —
+    /// this test covers the FD *code path*, not IOV NLL correctness.
+    #[test]
+    fn test_outer_ad_gradient_fd_fallback_path() {
+        // `subject_nll_at` only enters the IOV NLL branch when kappas is
+        // non-empty AND omega_iov is Some. With omega_iov=None and non-empty
+        // kappas the function falls through to standard FOCE, but
+        // subject_nll_pop_grad still takes the per-subject central-FD path
+        // because kappas.is_empty() is false — the path we want to exercise.
+        let model = make_model();
+
+        let template = &model.default_params;
+        let n_subj = 3;
+        let n_eta = 1;
+        let n_obs = 3;
+        let population = make_population(n_subj);
+
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+        let options = FitOptions::default();
+
+        let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
+        let h_matrices: Vec<nalgebra::DMatrix<f64>> = (0..n_subj)
+            .map(|_| nalgebra::DMatrix::zeros(n_obs, n_eta))
+            .collect();
+        // Non-empty kappas trigger the FD fallback path.
+        let kappas: Vec<Vec<DVector<f64>>> = (0..n_subj).map(|_| vec![DVector::zeros(1)]).collect();
+
+        let ad_grad = ad_population_gradient(
+            &x,
+            n_subj,
+            template,
+            &model,
+            &population,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &bounds,
+            &options,
+        );
+
+        let ofv_at = |xp: &[f64]| -> f64 {
+            let p = unpack_params(xp, template);
+            2.0 * pop_nll(
+                &model,
+                &population,
+                &p,
+                &eta_hats,
+                &h_matrices,
+                &kappas,
+                options.interaction,
+            )
+        };
+        let eps = 1e-4;
+        let fd_grad: Vec<f64> = (0..n)
+            .map(|j| {
+                let h = eps * (1.0 + x[j].abs());
+                let mut xp = x.clone();
+                let mut xm = x.clone();
+                xp[j] += h;
+                xm[j] -= h;
+                (ofv_at(&xp) - ofv_at(&xm)) / (2.0 * h)
+            })
+            .collect();
+
+        for j in 0..n {
+            let tol = 1e-3 * (1.0 + fd_grad[j].abs());
+            assert!(
+                (ad_grad[j] - fd_grad[j]).abs() < tol,
+                "IOV grad[{j}]: AD={:.6e}, FD={:.6e}",
+                ad_grad[j],
+                fd_grad[j],
+            );
         }
     }
 }

@@ -1,4 +1,5 @@
 use crate::estimation::outer_optimizer::optimize_population;
+use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::io::datareader::read_nonmem_csv;
 use crate::io::output;
@@ -6,9 +7,12 @@ use crate::pk;
 use crate::stats::likelihood::{
     compute_cwres, foce_subject_nll, foce_subject_nll_iov, split_obs_by_occasion,
 };
-use crate::stats::residual_error::compute_iwres;
+use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
+use rand::SeedableRng;
+use rand_distr::{Distribution, Normal};
+use rayon::prelude::*;
 use std::path::Path;
 use std::time::Instant;
 
@@ -228,6 +232,39 @@ pub fn fit_from_files(
     Ok(result)
 }
 
+/// Perturb initial parameters for multi-start optimisation.
+///
+/// Start 0 always returns the unmodified params. Starts 1..n multiply each
+/// log-packed theta by `exp(N(0, sigma))` and shift identity-packed thetas
+/// (negative lower bound) by `sigma * N(0,1)`. Omega and sigma are left
+/// unchanged — their starting values are typically less important than theta.
+fn perturb_init(
+    params: &ModelParameters,
+    start_idx: usize,
+    sigma: f64,
+    base_seed: u64,
+) -> ModelParameters {
+    if start_idx == 0 {
+        return params.clone();
+    }
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(base_seed.wrapping_add(start_idx as u64));
+    let normal = Normal::new(0.0_f64, 1.0_f64).expect("normal dist");
+    let mut p = params.clone();
+    for (i, t) in p.theta.iter_mut().enumerate() {
+        let lower = p.theta_lower.get(i).copied().unwrap_or(0.0);
+        if theta_packs_log(lower) {
+            *t *= (sigma * normal.sample(&mut rng)).exp();
+        } else {
+            *t += sigma * normal.sample(&mut rng);
+        }
+        // Clamp to bounds to avoid starting outside the feasible region
+        let lo = p.theta_lower.get(i).copied().unwrap_or(f64::NEG_INFINITY);
+        let hi = p.theta_upper.get(i).copied().unwrap_or(f64::INFINITY);
+        *t = t.clamp(lo, hi);
+    }
+    p
+}
+
 /// Main fit entry point: CompiledModel + Population → FitResult.
 ///
 /// When `options.threads` is `Some(n)`, the fit runs inside a scoped rayon
@@ -263,15 +300,113 @@ pub fn fit(
         }
     };
     let pop_ref: &Population = &*pop_pruned;
-    match options.threads {
-        Some(n) if n > 0 => {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(n)
-                .build()
-                .map_err(|e| format!("failed to build rayon pool with {} threads: {}", n, e))?;
-            pool.install(|| fit_inner(model, pop_ref, init_params, options))
+
+    // Single-start fast path (default)
+    if options.n_starts <= 1 {
+        return match options.threads {
+            Some(n) if n > 0 => {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build()
+                    .map_err(|e| format!("failed to build rayon pool with {} threads: {}", n, e))?;
+                pool.install(|| fit_inner(model, pop_ref, init_params, options))
+            }
+            _ => fit_inner(model, pop_ref, init_params, options),
+        };
+    }
+
+    // Multi-start: run n_starts fits in parallel, return the lowest-OFV converged result.
+    // `threads` controls per-subject parallelism inside each start; in multi-start mode
+    // we let the global rayon pool handle both levels (outer start × inner per-subject).
+    // Creating a new ThreadPool per start inside an outer into_par_iter() spawns n_starts
+    // independent pools that all compete on the same CPUs, causing oversubscription —
+    // so we only honour `threads` when the global pool hasn't been entered yet (single-start
+    // path above). Here we always use the global pool for the outer par_iter.
+    let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
+    let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
+    let n = options.n_starts;
+    let sigma = options.start_sigma;
+
+    // Warn once (before the parallel section) that global_search only runs on start 0.
+    let mut pre_warnings: Vec<String> = Vec::new();
+    if options.global_search && n > 1 {
+        pre_warnings.push(format!(
+            "global_search = true with n_starts = {n}: CRS2-LM only runs on start 0 \
+             (it ignores the starting point and would override the theta perturbation \
+             on starts 1..{n})"
+        ));
+    }
+
+    let results: Vec<(usize, Result<FitResult, String>)> = (0..n)
+        .into_par_iter()
+        .map(|k| {
+            let init_k = perturb_init(init_params, k, sigma, base_seed);
+            // Per-start option overrides for k > 0:
+            // - saem_seed: derive from base so each start gets a different MH trajectory.
+            //   Start 0 keeps the user's seed for reproducibility of the unperturbed run.
+            // - global_search: CRS2-LM ignores the starting point and samples freely in
+            //   [lower, upper], so running it on starts 1..n overrides the perturbation
+            //   and makes multi-start a no-op for those starts. Only run it on start 0.
+            let opts_k_storage;
+            let opts_ref: &FitOptions = if k == 0 {
+                options
+            } else {
+                opts_k_storage = FitOptions {
+                    saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
+                    global_search: false,
+                    ..options.clone()
+                };
+                &opts_k_storage
+            };
+            (k, fit_inner(model, pop_ref, &init_k, opts_ref))
+        })
+        .collect();
+
+    // Pick best converged result; fall back to best unconverged if none converged.
+    let mut best: Option<(usize, FitResult)> = None;
+    let mut failed_starts: Vec<String> = Vec::new();
+    for (k, res) in results {
+        match res {
+            Ok(r) => {
+                let better = match &best {
+                    None => true,
+                    Some((_, b)) => {
+                        // Prefer converged over unconverged; then lower OFV
+                        (!b.converged && r.converged)
+                            || (b.converged == r.converged && r.ofv < b.ofv)
+                    }
+                };
+                if better {
+                    best = Some((k, r));
+                }
+            }
+            Err(e) => failed_starts.push(format!("start {k}: {e}")),
         }
-        _ => fit_inner(model, pop_ref, init_params, options),
+    }
+
+    match best {
+        None => Err("All multi-start fits failed".to_string()),
+        Some((k, mut result)) => {
+            result.warnings.splice(0..0, pre_warnings);
+            if !failed_starts.is_empty() {
+                result.warnings.push(format!(
+                    "Multi-start: {} of {n} starts failed: {}",
+                    failed_starts.len(),
+                    failed_starts.join("; ")
+                ));
+            }
+            if !result.converged {
+                result.warnings.push(format!(
+                    "No multi-start run converged ({n} starts); returning best OFV from start {k}"
+                ));
+            } else if k > 0 {
+                result.warnings.push(format!(
+                    "Multi-start: best result from start {k}/{n} (OFV = {:.4})",
+                    result.ofv
+                ));
+            }
+            Ok(result)
+        }
     }
 }
 
@@ -721,6 +856,12 @@ fn fit_inner(
     let shrinkage_eta = compute_eta_shrinkage(&subjects, &result.params.omega.matrix);
     let shrinkage_eps = compute_eps_shrinkage(&subjects);
 
+    if let Some(w) = eps_shrinkage_warning(shrinkage_eps) {
+        warnings.push(w);
+    }
+
+    let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
+
     // Covariance status
     let covariance_status = if !options.run_covariance_step {
         CovarianceStatus::NotRequested
@@ -781,6 +922,28 @@ fn fit_inner(
         )
     });
 
+    // DW autocorrelation warnings
+    if dw_statistic.is_finite() {
+        if dw_statistic < 1.5 {
+            let mut msg = format!(
+                "Positive IWRES autocorrelation detected (Durbin-Watson = {:.2}). \
+                Structural model may be missing dynamics. Consider a transit \
+                absorption model, additional compartment, or IOV on ka/F.",
+                dw_statistic
+            );
+            if model.ode_spec.is_some() {
+                msg.push_str(" For ODE models, SDE process noise may also help.");
+            }
+            warnings.push(msg);
+        } else if dw_statistic > 2.5 {
+            warnings.push(format!(
+                "Negative IWRES autocorrelation detected (Durbin-Watson = {:.2}). \
+                Possible over-parameterization or misspecified error model.",
+                dw_statistic
+            ));
+        }
+    }
+
     let fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
@@ -835,6 +998,8 @@ fn fit_inner(
         covariance_status,
         shrinkage_eta,
         shrinkage_eps,
+        iwres_lag1_r,
+        dw_statistic,
         wall_time_secs,
         model_name: model.name.clone(),
         ferx_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1191,6 +1356,33 @@ pub(crate) fn compute_eps_shrinkage(subjects: &[SubjectResult]) -> f64 {
     1.0 - ms.sqrt()
 }
 
+/// Threshold below which negative `shrinkage_eps` triggers a warning.
+///
+/// Small negative values are normal sampling noise around 0 on well-fit models
+/// (the NONMEM uncentered estimator has a small downward bias when the sample
+/// mean of IWRES is non-zero). Past this threshold the residual error model
+/// genuinely fails to absorb the residuals at the EBE etas and the user should
+/// see it.
+const EPS_SHRINKAGE_WARN_THRESHOLD: f64 = -0.05;
+
+/// Build the user-facing warning for notably-negative EPS shrinkage, or
+/// `None` if the value is finite and above the threshold (or NaN).
+pub(crate) fn eps_shrinkage_warning(shrinkage_eps: f64) -> Option<String> {
+    if !shrinkage_eps.is_finite() || shrinkage_eps >= EPS_SHRINKAGE_WARN_THRESHOLD {
+        return None;
+    }
+    Some(format!(
+        "EPS shrinkage is notably negative ({:.1}%): mean(IWRES^2) > 1, \
+         which means the residual error model does not absorb the residuals \
+         at the final EBE etas. Common causes: SAEM converged to a local \
+         optimum with under-fit sigma (try `method = [saem, focei]` to polish \
+         with FOCEI, or different starts); model misspecification on a subset \
+         of subjects; sigma at a bound. Inspect the IWRES distribution in the \
+         sdtab.",
+        100.0 * shrinkage_eps
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,6 +1489,39 @@ mod tests {
     fn test_eps_shrinkage_nan_for_fewer_than_2_residuals() {
         let subjects = vec![make_subject(vec![0.0], vec![0.5])];
         assert!(compute_eps_shrinkage(&subjects).is_nan());
+    }
+
+    #[test]
+    fn test_eps_shrinkage_negative_when_iwres_inflated() {
+        // IWRES with mean(IWRES^2) > 1 must produce a negative value, not be
+        // clamped. Matches the SAEM repro on `nmdata_20230216_1.csv` where
+        // mean(IWRES^2) ~ 2.45 -> shrinkage ~ -0.566.
+        let subjects = vec![
+            make_subject(vec![0.0], vec![2.0]),
+            make_subject(vec![0.0], vec![-2.0]),
+        ];
+        let sh = compute_eps_shrinkage(&subjects);
+        assert!(sh < 0.0, "expected negative shrinkage, got {}", sh);
+        assert!((sh - (1.0 - 2.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_eps_shrinkage_warning_emits_below_threshold() {
+        let w = eps_shrinkage_warning(-0.10).expect("expected warning");
+        assert!(w.contains("mean(IWRES^2) > 1"));
+        assert!(w.contains("-10.0%"));
+    }
+
+    #[test]
+    fn test_eps_shrinkage_warning_silent_above_threshold() {
+        // Tiny negatives are noise — no warning.
+        assert!(eps_shrinkage_warning(-0.01).is_none());
+        // Positive shrinkage — no warning.
+        assert!(eps_shrinkage_warning(0.20).is_none());
+        // Right at the boundary — no warning (uses `<`).
+        assert!(eps_shrinkage_warning(-0.05).is_none());
+        // NaN — no warning.
+        assert!(eps_shrinkage_warning(f64::NAN).is_none());
     }
 
     #[test]
@@ -2524,6 +2749,8 @@ mod simulate_with_uncertainty_tests {
             covariance_status: CovarianceStatus::Computed,
             shrinkage_eta: vec![],
             shrinkage_eps: f64::NAN,
+            iwres_lag1_r: f64::NAN,
+            dw_statistic: f64::NAN,
             wall_time_secs: 0.0,
             model_name: String::new(),
             ferx_version: String::new(),
@@ -2877,5 +3104,120 @@ mod sde_integration {
                 "error message should mention gn: {msg}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod multi_start_tests {
+    use super::perturb_init;
+    use crate::estimation::parameterization::theta_packs_log;
+    use crate::types::{FitOptions, ModelParameters, OmegaMatrix, SigmaVector};
+
+    fn make_params(
+        theta: Vec<f64>,
+        theta_lower: Vec<f64>,
+        theta_upper: Vec<f64>,
+    ) -> ModelParameters {
+        let n = theta.len();
+        ModelParameters {
+            theta,
+            theta_names: (0..n).map(|i| format!("T{i}")).collect(),
+            theta_lower,
+            theta_upper,
+            theta_fixed: vec![false; n],
+            omega: OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]),
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.1],
+                names: vec!["ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_perturb_start0_is_identity() {
+        let p = make_params(vec![5.0, 50.0], vec![0.1, 1.0], vec![100.0, 500.0]);
+        let perturbed = perturb_init(&p, 0, 0.5, 42);
+        assert_eq!(perturbed.theta, p.theta);
+    }
+
+    #[test]
+    fn test_perturb_changes_theta() {
+        let p = make_params(vec![5.0, 50.0], vec![0.1, 1.0], vec![100.0, 500.0]);
+        let perturbed = perturb_init(&p, 1, 0.3, 42);
+        // With sigma=0.3 and seed=43 (42+1), at least one theta should differ
+        let changed = perturbed
+            .theta
+            .iter()
+            .zip(p.theta.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-10);
+        assert!(changed, "start 1 should perturb theta");
+    }
+
+    #[test]
+    fn test_perturb_stays_in_bounds() {
+        let p = make_params(vec![5.0, 50.0], vec![0.1, 1.0], vec![100.0, 500.0]);
+        for k in 1..=10 {
+            let perturbed = perturb_init(&p, k, 2.0, 42); // large sigma to stress-test bounds
+            for (i, &t) in perturbed.theta.iter().enumerate() {
+                assert!(
+                    t >= p.theta_lower[i],
+                    "start {k}: theta[{i}]={t} < lower={}",
+                    p.theta_lower[i]
+                );
+                assert!(
+                    t <= p.theta_upper[i],
+                    "start {k}: theta[{i}]={t} > upper={}",
+                    p.theta_upper[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_perturb_identity_packed_theta() {
+        // theta_lower < 0 → identity packing → additive perturbation
+        let p = make_params(vec![0.5], vec![-5.0], vec![5.0]);
+        assert!(!theta_packs_log(p.theta_lower[0]));
+        let perturbed = perturb_init(&p, 1, 0.3, 99);
+        assert!(perturbed.theta[0] >= -5.0 && perturbed.theta[0] <= 5.0);
+    }
+
+    #[test]
+    fn test_n_starts_option_parsed() {
+        let mut opts = FitOptions::default();
+        assert_eq!(opts.n_starts, 1);
+        opts.n_starts = 4;
+        assert_eq!(opts.n_starts, 4);
+    }
+
+    #[test]
+    fn test_n_starts_and_seed_via_parser() {
+        use crate::parser::model_parser::apply_fit_option;
+        let mut opts = FitOptions::default();
+        apply_fit_option(&mut opts, "n_starts", "4").expect("n_starts parses");
+        assert_eq!(opts.n_starts, 4);
+        apply_fit_option(&mut opts, "multi_start_seed", "123").expect("multi_start_seed parses");
+        assert_eq!(opts.multi_start_seed, Some(123));
+        apply_fit_option(&mut opts, "start_sigma", "0.5").expect("start_sigma parses");
+        assert!((opts.start_sigma - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_per_start_saem_seed_derivation() {
+        let base: u64 = 12345;
+        // Each start k > 0 gets base + k; start 0 keeps the base unchanged.
+        assert_eq!(base.wrapping_add(0), 12345);
+        assert_eq!(base.wrapping_add(1), 12346);
+        assert_eq!(base.wrapping_add(7), 12352);
+        // All derived seeds are distinct.
+        let seeds: Vec<u64> = (0..8).map(|k| base.wrapping_add(k)).collect();
+        let unique: std::collections::HashSet<u64> = seeds.iter().copied().collect();
+        assert_eq!(unique.len(), 8);
+        // wrapping_add is defined at u64::MAX.
+        assert_eq!(u64::MAX.wrapping_add(1), 0);
     }
 }

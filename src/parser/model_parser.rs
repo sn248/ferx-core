@@ -976,8 +976,9 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         theta_upper.push(f64::INFINITY);
         theta_fixed.push(is_fixed);
     }
-    n_theta = theta_names.len(); // set here after diffusion thetas are appended above
-                                 // BSV omega is built from the BSV-only eta names (no kappas)
+    // set here after diffusion thetas are appended above
+    n_theta = theta_names.len();
+    // BSV omega is built from the BSV-only eta names (no kappas)
     let omega = build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?;
     let omega_fixed = build_omega_fixed(&omegas, &block_omegas, &eta_names_bsv)?;
     let sigma_values: Vec<f64> = sigmas.iter().map(|s| s.value).collect();
@@ -1507,7 +1508,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             };
         }
-        "steihaug_max_iters" => opts.steihaug_max_iters = parse_usize("steihaug_max_iters")?,
+        "steihaug_max_iters" => opts.steihaug_max_iters = Some(parse_usize("steihaug_max_iters")?),
         "global_search" => opts.global_search = parse_bool("global_search")?,
         "global_maxeval" => opts.global_maxeval = parse_usize("global_maxeval")?,
         "n_exploration" => opts.saem_n_exploration = parse_usize("n_exploration")?,
@@ -1521,6 +1522,13 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "sir_resamples" => opts.sir_resamples = parse_usize("sir_resamples")?,
         "sir_seed" => opts.sir_seed = parse_u64_opt("sir_seed")?,
         "sir_keep_samples" => opts.sir_keep_samples = parse_bool("sir_keep_samples")?,
+        "sir_df" => {
+            let v = parse_f64("sir_df")?;
+            if v < 1.0 {
+                return Err(format!("sir_df must be >= 1.0, got {v}"));
+            }
+            opts.sir_df = v;
+        }
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
             opts.bloq_method = match value.to_lowercase().as_str() {
@@ -1559,6 +1567,23 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             }
         }
+        "n_starts" => match value.parse::<usize>() {
+            Ok(n) if n >= 1 => opts.n_starts = n,
+            _ => {
+                return Err(format!(
+                    "fit option `n_starts`: expected a positive integer, got `{value}`"
+                ));
+            }
+        },
+        "start_sigma" => opts.start_sigma = parse_f64("start_sigma")?,
+        "multi_start_seed" => match value.parse::<u64>() {
+            Ok(s) => opts.multi_start_seed = Some(s),
+            _ => {
+                return Err(format!(
+                    "fit option `multi_start_seed`: expected a non-negative integer, got `{value}`"
+                ));
+            }
+        },
         "iov_column" => {
             opts.iov_column = if value.is_empty()
                 || value.eq_ignore_ascii_case("null")
@@ -4380,8 +4405,20 @@ mod tests {
         assert!(apply_fit_option(&mut opts, "optimizer", "does_not_exist").is_err());
         assert!(apply_fit_option(&mut opts, "bloq_method", "nope").is_err());
         assert!(apply_fit_option(&mut opts, "threads", "-1").is_err());
+        assert!(apply_fit_option(&mut opts, "sir_df", "0.0").is_err());
+        assert!(apply_fit_option(&mut opts, "sir_df", "0.5").is_err());
         // Failed apply must not mutate — default preserved.
         assert_eq!(opts.saem_n_exploration, 150);
+    }
+
+    #[test]
+    fn test_sir_df_valid_and_invalid() {
+        let mut opts = FitOptions::default();
+        assert!(apply_fit_option(&mut opts, "sir_df", "5.0").is_ok());
+        assert_eq!(opts.sir_df, 5.0);
+        assert!(apply_fit_option(&mut opts, "sir_df", "1.0").is_ok());
+        assert!(apply_fit_option(&mut opts, "sir_df", "0.9").is_err());
+        assert!(apply_fit_option(&mut opts, "sir_df", "0.0").is_err());
     }
 
     #[test]
@@ -5255,15 +5292,15 @@ mod tests {
             minimal_model_with_fit_options("  optimizer = trust_region\n  steihaug_max_iters = 30");
         let parsed = parse_full_model(&content).unwrap();
         assert_eq!(parsed.fit_options.optimizer, Optimizer::TrustRegion);
-        assert_eq!(parsed.fit_options.steihaug_max_iters, 30);
+        assert_eq!(parsed.fit_options.steihaug_max_iters, Some(30));
     }
 
     #[test]
     fn test_steihaug_max_iters_default() {
-        // Default must match the documented value (50).
+        // Default is None (size-adaptive budget).
         let content = minimal_model_with_fit_options("  optimizer = trust_region");
         let parsed = parse_full_model(&content).unwrap();
-        assert_eq!(parsed.fit_options.steihaug_max_iters, 50);
+        assert_eq!(parsed.fit_options.steihaug_max_iters, None);
     }
 
     #[test]
@@ -5278,12 +5315,12 @@ mod tests {
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
         //   optimizer = slsqp, inner_maxiter = 200, inner_tol = 1e-4,
-        //   steihaug_max_iters = 50.
+        //   steihaug_max_iters = None (adaptive).
         let opts = FitOptions::default();
         assert_eq!(opts.optimizer, Optimizer::Slsqp);
         assert_eq!(opts.inner_maxiter, 200);
         assert!((opts.inner_tol - 1e-4).abs() < 1e-20);
-        assert_eq!(opts.steihaug_max_iters, 50);
+        assert_eq!(opts.steihaug_max_iters, None);
     }
 
     #[test]
@@ -5303,7 +5340,7 @@ mod tests {
         let content = include_str!("../../examples/warfarin_trust_region.ferx");
         let parsed = parse_full_model(content).unwrap();
         assert_eq!(parsed.fit_options.optimizer, Optimizer::TrustRegion);
-        assert_eq!(parsed.fit_options.steihaug_max_iters, 30);
+        assert_eq!(parsed.fit_options.steihaug_max_iters, Some(30));
     }
 
     // ── apply_fit_option: coverage of the newly-added optimizer keys.
@@ -5335,7 +5372,7 @@ mod tests {
             apply_fit_option(&mut opts, "steihaug_max_iters", "30"),
             Ok(true)
         );
-        assert_eq!(opts.steihaug_max_iters, 30);
+        assert_eq!(opts.steihaug_max_iters, Some(30));
         // Reject malformed (e.g. negative) value.
         assert!(apply_fit_option(&mut opts, "steihaug_max_iters", "-1").is_err());
     }

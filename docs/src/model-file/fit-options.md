@@ -19,7 +19,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 | `optimizer` | `slsqp`, `lbfgs`, `nlopt_lbfgs`, `mma`, `bfgs`, `bobyqa`, `trust_region` | `slsqp` | Optimization algorithm |
 | `inner_maxiter` | integer | `200` | Max iterations for the inner (per-subject EBE) optimizer |
 | `inner_tol` | float | `1e-4` | Gradient-norm convergence tolerance for the inner (per-subject EBE) optimizer. The default of `1e-4` matches the precision of typical NLME engines (NONMEM's default inner-loop SIGDIGITS is ~3, equivalent to ~`1e-3`). Tighter values (e.g. `1e-6`, `1e-8`) over-converge the EBE relative to the Sheiner–Beal linearisation error and can slow FOCEI fits by 10–15× without measurable change in the final OFV. Use a tighter value only if you're comparing post-hoc EBE values across runs at high precision. |
-| `steihaug_max_iters` | integer | `50` | Max CG iterations for the Steihaug subproblem (only used when `optimizer = trust_region`) |
+| `steihaug_max_iters` | integer | adaptive | Max CG iterations for the Steihaug subproblem (only used when `optimizer = trust_region`). Default (unset) uses `ceil(sqrt(n_params)).clamp(5, n_params)` — typically 5 for standard NLME models. Set explicitly (e.g. `steihaug_max_iters = 50`) to pin the budget. |
 | `global_search` | `true`, `false` | `false` | Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a gradient-free global pre-search before the local optimizer. CRS2-LM samples within the parameter bounds; the local optimizer (e.g. `bobyqa`, `slsqp`) starts from the best point found. Useful for poorly-identified models — when the local optimizer can land in a degenerate basin (collapsed ETA, V/Q swap, parameters at bounds) from a far-from-truth start, the global pre-search usually escapes it. Adds the pre-search budget on top of the local optimisation, but typically more efficient than running multiple full fits from scratch. Requires a full NLopt build (e.g. `brew install nlopt` or `apt install libnlopt-dev`); a clear warning is emitted if CRS2-LM is unavailable. |
 | `global_maxeval` | integer | `200 * (n_params + 1)` | Maximum evaluations of the FOCE objective during the global pre-search. Each eval is a full inner-loop pass over all subjects, so this is the dominant cost of `global_search = true`. The default (`0` → auto) is empirically enough to escape bad basins on 10–20 parameter PK models without dominating the wall time of the subsequent local refine. |
 | `bloq_method` | `drop`, `m3` | `drop` | How to handle rows with `CENS=1`. `m3` enables Beal's M3 likelihood (see [BLOQ example](../examples/bloq.md)). |
@@ -68,6 +68,7 @@ SIR provides non-parametric parameter uncertainty estimates as an optional post-
 | `sir_resamples` | `250` | Number of resampled vectors (m) |
 | `sir_seed` | `12345` | RNG seed for reproducibility |
 | `sir_keep_samples` | `false` | Retain resampled parameter vectors for `simulate_with_uncertainty()` |
+| `sir_df` | `5.0` | Degrees of freedom for the Student-t proposal; higher values approach a normal proposal |
 
 See [SIR documentation](../estimation/sir.md) for details.
 
@@ -81,16 +82,18 @@ See [SIR documentation](../estimation/sir.md) for details.
 | `nlopt_lbfgs` | NLopt L-BFGS | Alternative L-BFGS |
 | `mma` | Method of Moving Asymptotes (NLopt) | Constrained problems |
 | `bobyqa` | NLopt BOBYQA — derivative-free quadratic interpolation | Noisy or non-smooth objectives where FD gradients are unreliable |
-| `trust_region` | Newton trust-region with Steihaug CG subproblem (argmin) | Well-conditioned problems where second-order curvature helps convergence; tune `steihaug_max_iters` |
+| `trust_region` | Newton trust-region with Steihaug CG subproblem (argmin) | Well-conditioned problems where second-order curvature helps convergence |
 
 Notes:
 - `bobyqa` does not use gradients, so it is robust to small discontinuities in
   the FOCE surface caused by EBE re-estimation, but it converges more slowly
   than gradient-based methods on smooth problems.
-- `trust_region` uses a finite-difference Hessian of the OFV-at-fixed-EBEs.
-  Each Hessian costs O(n²) OFV evaluations, so it is fastest when the number
-  of packed parameters is small. Increase `steihaug_max_iters` when the
-  parameter count exceeds the default of 50.
+- `trust_region` uses an AD-based gradient (same `subject_nll_pop_grad` as the
+  outer FOCE optimizer) and a BHHH approximate Hessian (`H ≈ 4 Σ gᵢgᵢᵀ`).
+  The BHHH matrix is always positive semi-definite, so the Steihaug subproblem
+  is well-conditioned even near constraints. The Steihaug CG budget defaults to
+  `ceil(sqrt(n_params))` — typically 5 for standard NLME models, which is far
+  cheaper than the previous FD-Hessian path (O(n²) OFV evaluations per Hessian).
 
 ## Parameter Scaling and EBE Convergence
 
@@ -111,6 +114,16 @@ ignored — the fit still proceeds.
 For a chained fit (`method = [saem, focei]`), an option is kept if it applies
 to *any* stage in the chain, so SAEM and FOCEI keys can be mixed without
 warnings.
+
+## Multi-Start Optimization
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `n_starts` | `1` | Number of independent optimization runs. `1` disables multi-start (no behaviour change). When `> 1`, all starts run in parallel via rayon; the converged run with the lowest OFV is returned. Start 0 always uses the exact initial values from the model file. |
+| `start_sigma` | `0.3` | Log-space perturbation applied to initial theta values for starts 1..n. Log-packed thetas are multiplied by `exp(N(0, start_sigma))`; thetas with negative lower bounds are shifted additively. |
+| `multi_start_seed` | `42` | RNG seed for the multi-start theta perturbations. Independent of `seed` (SAEM) so that changing the SAEM seed does not silently alter which perturbed starting points are used in FOCE multi-start runs. |
+
+Multi-start is most useful for models prone to local minima: nonlinear elimination (Michaelis-Menten), full-block omega, or many covariate parameters. On an 8-core machine `n_starts = 8` costs the same wall-clock time as a single run but has ~8× lower probability of a local minimum.
 
 ## Global Search
 

@@ -1,4 +1,4 @@
-# ferx-core Optimization Task Plan (Updated 2026-05-18)
+# ferx-core Optimization Task Plan (Updated 2026-05-19)
 
 This file is for use with Claude Code in the `ferx-core` repository.
 Read `CLAUDE.md` first before starting any step.
@@ -8,6 +8,25 @@ below is a starting hypothesis, not a fixed recipe**. The actual repository stat
 may differ from what is described. Every step begins with deep evaluation of the
 existing code, plan reconciliation, and explicit confirmation before any code is
 written.
+
+---
+
+## Progress Summary (as of 2026-05-19)
+
+All steps completed in a single day (2026-05-19). Steps 5b, 7, and 8 remain.
+
+| Step | PR | What | Why | What it adds |
+|------|----|------|-----|--------------|
+| **1** — rayon `par_iter` in GN | absorbed by #47 | Parallelize per-subject NLL evaluations in the GN finite-difference gradient loop | GN was computing subject NLL sequentially inside a per-parameter outer loop | Near-linear speedup with core count for the FD path of GN |
+| **2** — Log-Cholesky for Ω | pre-existing | Store Cholesky diagonal in log space during packing | Keeps optimizer unconstrained (no positivity constraints on diagonal) | Was already done; no PR needed |
+| **3** — AD gradients for GN/BHHH | [#47](https://github.com/FeRx-NLME/ferx-core/pull/47) | Replace central-FD score vectors with analytical Ω/σ gradients + forward-FD of predictions only for θ; restructure to rayon subject-parallel | Central-FD cost P·subjects per BHHH iteration; exact gradients are cheaper and improve Hessian quality | ~13k fewer model evaluations per fit on warfarin; exact BHHH matrix for GN; enables Step 5 |
+| **4** — AD gradient for SAEM M-step | [#49](https://github.com/FeRx-NLME/ferx-core/pull/49) | Replace forward-FD of `obs_nll_sum` in the M-step NLopt closure with a single rayon subject-parallel pass using analytical σ gradients + FD-of-predictions for θ | Forward-FD launched n_dim sequential rayon jobs; analytical σ path eliminates extra predict calls entirely | Fewer NLopt OFV evaluations per M-step; better cache locality; single rayon launch vs n sequential ones |
+| **5** — AD gradient in outer optimizer | [#48](https://github.com/FeRx-NLME/ferx-core/pull/48) | Replace central-FD `gradient_cd` in the NLopt SLSQP/LBFGS outer loop with `subject_nll_pop_grad` summed over subjects in parallel | Each outer FD gradient query cost P full inner-loop re-solves (re-running EBE for each parameter); AD provides the same gradient with fixed EBEs in one pass | Largest single wall-clock improvement for FOCE/FOCEI; eliminates the dominant cost of each outer iteration on ODE models |
+| **6** — BHHH Hessian + AD gradient in trust-region | [#50](https://github.com/FeRx-NLME/ferx-core/pull/50) | Replace FD gradient and FD-of-gradient Hessian in `trust_region.rs` with `subject_nll_pop_grad` (gradient) and `4 Σ gᵢgᵢᵀ` (BHHH Hessian); cache per-subject gradients between the two calls; adaptive Steihaug CG budget | FD Hessian cost O(n²) OFV evaluations per outer iteration (98 for n=7); BHHH reuses gradients already computed, costs zero extra evaluations; BHHH is always PSD so CG is well-conditioned near constraints | Zero-cost Hessian per TR iteration; PSD guarantee eliminates CG conditioning failures; CG budget reduced from fixed 50 to adaptive ~5 for typical NLME models |
+| **9** — Student-t SIR proposal | [#41](https://github.com/FeRx-NLME/ferx-core/pull/41) | Replace MVN proposal in SIR with multivariate Student-t (ν=5) | Normal proposal has thin tails; ESS collapses for parameters near boundaries (Ω variances, constrained θ) | Higher ESS without increasing `sir_samples`; more reliable 95% CIs for boundary-adjacent parameters |
+| **10** — Parallel multi-start | [#42](https://github.com/FeRx-NLME/ferx-core/pull/42) | Run N independent full optimizations from perturbed initials in parallel via rayon; return lowest OFV | Local minima are the most common practical failure mode for nonlinear elimination, full-block Ω, and covariate models | On an 8-core machine, `n_starts = 8` gives ~8× lower probability of a local minimum at the same wall-clock cost |
+
+**Remaining:** Step 5b (IOV analytical gradient, requires Step 5 ✅), Step 7 (GN → trust-region subproblem replacing LM damping, requires Step 6 ✅), Step 8 (HMC proposals in SAEM E-step, requires Steps 3 ✅ and 4 ✅).
 
 ---
 

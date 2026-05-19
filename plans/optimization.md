@@ -213,7 +213,7 @@ by the parameterization integration tests; no new test is required.
 
 ## Step 1 — rayon `par_iter` in FOCE Subject Loop
 
-**Status: 🔶 PARTIAL**
+**Status: ✅ DONE — absorbed by PR #47 (Step 3).**
 
 **No prerequisites. Start here.**
 

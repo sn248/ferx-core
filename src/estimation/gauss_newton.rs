@@ -1211,6 +1211,114 @@ mod tests {
         }
     }
 
+    /// Verify that the analytical gradient is correct when H is non-zero —
+    /// exercises the `h_cols_solved` path and the omega diagonal formula with
+    /// non-trivial eta-to-obs mapping.
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_nonzero_h() {
+        let model = make_model();
+        let population = make_population();
+        let template = &model.default_params;
+
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+
+        let n_obs = 3;
+        let n_eta = 1;
+        // Non-zero H: partial derivatives of predictions w.r.t. eta at baseline
+        let eta_hat = DVector::from_vec(vec![0.1]);
+        let h_matrix = nalgebra::DMatrix::from_vec(n_obs, n_eta, vec![2.0, 1.5, 0.8]);
+        let options = FitOptions::default();
+
+        let (nll_an, grad_an) = subject_nll_pop_grad_analytical(
+            &x, template, &model, &population, 0,
+            &eta_hat, &h_matrix, &bounds, &options,
+        ).expect("analytical path should succeed");
+
+        // NLL must match direct call
+        let params_base = unpack_params(&x, template);
+        let nll_ref = subject_nll_at(
+            &model, &population, 0, &params_base, &eta_hat, &h_matrix, &[], &options,
+        );
+        assert!((nll_an - nll_ref).abs() < 1e-10, "nll mismatch: {nll_an} vs {nll_ref}");
+
+        // Gradient must agree with central-FD reference
+        let eps = 1e-5;
+        for j in 0..n {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let actual_2h = xp[j] - xm[j];
+            let pp = unpack_params(&xp, template);
+            let pm = unpack_params(&xm, template);
+            let np = subject_nll_at(&model, &population, 0, &pp, &eta_hat, &h_matrix, &[], &options);
+            let nm = subject_nll_at(&model, &population, 0, &pm, &eta_hat, &h_matrix, &[], &options);
+            let ref_j = (np - nm) / actual_2h;
+
+            let tol = 0.01 * (1.0 + ref_j.abs()).max(1e-8);
+            assert!(
+                (grad_an[j] - ref_j).abs() < tol,
+                "nonzero-H: analytical grad[{j}]={:.6e}, fd ref={:.6e}, diff={:.2e}",
+                grad_an[j], ref_j, (grad_an[j] - ref_j).abs()
+            );
+        }
+    }
+
+    /// Verify that the analytical gradient is correct under the FOCEI interaction
+    /// path (`options.interaction = true`), where r_diag is evaluated at ipreds
+    /// rather than f0, and dr/d(theta) passes through the r(ipred) chain.
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_interaction() {
+        let model = make_model();
+        let population = make_population();
+        let template = &model.default_params;
+
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+
+        let n_obs = 3;
+        let n_eta = 1;
+        let eta_hat = DVector::from_vec(vec![0.05]);
+        let h_matrix = nalgebra::DMatrix::from_vec(n_obs, n_eta, vec![3.0, 2.0, 1.0]);
+        let mut options = FitOptions::default();
+        options.interaction = true;
+
+        let (nll_an, grad_an) = subject_nll_pop_grad_analytical(
+            &x, template, &model, &population, 0,
+            &eta_hat, &h_matrix, &bounds, &options,
+        ).expect("analytical path should succeed with interaction=true");
+
+        let params_base = unpack_params(&x, template);
+        let nll_ref = subject_nll_at(
+            &model, &population, 0, &params_base, &eta_hat, &h_matrix, &[], &options,
+        );
+        assert!((nll_an - nll_ref).abs() < 1e-10, "interaction nll mismatch: {nll_an} vs {nll_ref}");
+
+        let eps = 1e-5;
+        for j in 0..n {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let actual_2h = xp[j] - xm[j];
+            let pp = unpack_params(&xp, template);
+            let pm = unpack_params(&xm, template);
+            let np = subject_nll_at(&model, &population, 0, &pp, &eta_hat, &h_matrix, &[], &options);
+            let nm = subject_nll_at(&model, &population, 0, &pm, &eta_hat, &h_matrix, &[], &options);
+            let ref_j = (np - nm) / actual_2h;
+
+            let tol = 0.01 * (1.0 + ref_j.abs()).max(1e-8);
+            assert!(
+                (grad_an[j] - ref_j).abs() < tol,
+                "interaction: analytical grad[{j}]={:.6e}, fd ref={:.6e}, diff={:.2e}",
+                grad_an[j], ref_j, (grad_an[j] - ref_j).abs()
+            );
+        }
+    }
+
     /// Verify that `subject_nll_pop_grad` returns (nll, gradient) where the
     /// gradient agrees with a sequential central-FD reference for subject 0,
     /// and the returned nll matches a direct call to `subject_nll_at`.

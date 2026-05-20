@@ -4726,6 +4726,42 @@ mod tests {
         assert!(opts.unsupported_keys_warnings().is_empty());
     }
 
+    #[test]
+    fn test_stagnation_guard_recognized_by_nlopt_methods() {
+        // `stagnation_guard` lives in the NLopt outer-loop code, so the
+        // unused-key guard must accept it under FOCE/FOCEI and the FoceGn
+        // hybrid (which has a FOCEI polish phase) — and must flag it under
+        // pure GN and SAEM, which don't touch the NLopt path.
+        for method in ["foce", "focei", "gn_hybrid"] {
+            let opts = parse_fit_options(&[
+                format!("method = {}", method),
+                "stagnation_guard = false".to_string(),
+            ])
+            .unwrap();
+            let warnings = opts.unsupported_keys_warnings();
+            assert!(
+                warnings.is_empty(),
+                "method={method} should not warn for stagnation_guard: {:?}",
+                warnings
+            );
+        }
+        for method in ["gn", "saem"] {
+            let opts = parse_fit_options(&[
+                format!("method = {}", method),
+                "stagnation_guard = false".to_string(),
+            ])
+            .unwrap();
+            let warnings = opts.unsupported_keys_warnings();
+            assert_eq!(
+                warnings.len(),
+                1,
+                "method={method}: expected exactly one warning, got: {:?}",
+                warnings
+            );
+            assert!(warnings[0].contains("stagnation_guard"));
+        }
+    }
+
     // ── parse_fit_options: strict parsing at the .ferx layer. Unknown
     //    keys and malformed values both raise an error — a typo like
     //    `covariance = maybe` or `bloq_method = nope` now fails loudly

@@ -1443,6 +1443,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "steihaug_max_iters",
             "global_search",
             "global_maxeval",
+            "stagnation_guard",
         ],
         EstimationMethod::FoceGn => &["maxiter", "inner_maxiter", "inner_tol", "gn_lambda"],
         EstimationMethod::FoceGnHybrid => &[
@@ -1453,6 +1454,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "steihaug_max_iters",
             "global_search",
             "global_maxeval",
+            "stagnation_guard",
             "gn_lambda",
         ],
         EstimationMethod::Saem => &[

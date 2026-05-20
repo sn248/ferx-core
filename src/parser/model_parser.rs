@@ -1989,6 +1989,16 @@ fn parse_parameters(
                 .get(3)
                 .map(|m| m.as_str().eq_ignore_ascii_case("sd"))
                 .unwrap_or(false);
+            // Negative values are nonsensical on either scale: variance ≥ 0
+            // by definition, and SD ≥ 0 since SD = sqrt(variance). The
+            // optimizer's Cholesky pack uses `l.max(1e-10).ln()` and would
+            // silently clamp them — fail loudly here instead.
+            if raw < 0.0 {
+                let scale = if init_as_sd { "SD" } else { "variance" };
+                return Err(format!(
+                    "omega '{name}' has a negative initial {scale} ({raw}); both variance and SD must be non-negative"
+                ));
+            }
             let variance = if init_as_sd { raw * raw } else { raw };
             let fixed = caps.get(4).is_some();
             eta_names_ordered.push(name.clone());
@@ -2007,14 +2017,15 @@ fn parse_parameters(
                 .get(3)
                 .map(|m| m.as_str().eq_ignore_ascii_case("sd"))
                 .unwrap_or(false);
-            // Default (variance scale): take sqrt to land on the internal SD
-            // representation. With `(sd)`: the value is already SD.
-            // Negative variance inputs are rejected up-front so we don't end up
-            // with a NaN flowing into the likelihood.
-            if !init_as_sd && raw < 0.0 {
+            // Reject negatives on both scales. On the default (variance)
+            // path a negative would slip through `sqrt` as NaN; on the
+            // (sd) path the optimizer's `s.max(1e-10).ln()` packing would
+            // silently clamp it to 1e-10. Either is a hard-to-debug silent
+            // failure — surface the bad input at parse time.
+            if raw < 0.0 {
+                let scale = if init_as_sd { "SD" } else { "variance" };
                 return Err(format!(
-                    "sigma '{}' has a negative initial variance ({raw}); use a non-negative value or annotate `(sd)` to specify a standard deviation",
-                    name
+                    "sigma '{name}' has a negative initial {scale} ({raw}); both variance and SD must be non-negative"
                 ));
             }
             let value = if init_as_sd { raw } else { raw.sqrt() };
@@ -2034,6 +2045,12 @@ fn parse_parameters(
                 .get(3)
                 .map(|m| m.as_str().eq_ignore_ascii_case("sd"))
                 .unwrap_or(false);
+            if raw < 0.0 {
+                let scale = if init_as_sd { "SD" } else { "variance" };
+                return Err(format!(
+                    "kappa '{name}' has a negative initial {scale} ({raw}); both variance and SD must be non-negative"
+                ));
+            }
             let variance = if init_as_sd { raw * raw } else { raw };
             let fixed = caps.get(4).is_some();
             kappa_names_ordered.push(name.clone());
@@ -4642,13 +4659,31 @@ mod tests {
     }
 
     #[test]
-    fn test_sigma_negative_sd_is_allowed() {
-        // With `(sd)` a negative value parses (the user explicitly asked for
-        // the SD scale and we don't double-check). The optimizer's log
-        // transform will reject it later if it's still in play.
+    fn test_sigma_negative_sd_rejected() {
+        // Negative SD is just as nonsensical as negative variance, and the
+        // optimizer's `s.max(1e-10).ln()` packing would silently clamp the
+        // bad input rather than surface it. Reject at parse time, symmetric
+        // with the negative-variance case.
         let lines = vec!["sigma PROP ~ -0.5 (sd)".to_string()];
         let res = parse_parameters(&lines);
-        assert!(res.is_ok());
+        match res {
+            Err(msg) => assert!(msg.contains("negative initial SD"), "got: {msg}"),
+            Ok(_) => panic!("expected error for negative sigma SD"),
+        }
+    }
+
+    #[test]
+    fn test_omega_negative_value_rejected() {
+        // Same rule applies to omega — variance must be ≥ 0, and SD ≥ 0.
+        for line in [
+            "omega ETA_CL ~ -0.04",
+            "omega ETA_CL ~ -0.2 (sd)",
+            "kappa KAPPA_CL ~ -0.03",
+            "kappa KAPPA_CL ~ -0.1 (sd)",
+        ] {
+            let res = parse_parameters(&[line.to_string()]);
+            assert!(res.is_err(), "expected negative `{line}` to be rejected");
+        }
     }
 
     #[test]

@@ -41,7 +41,7 @@ The binary is called `ferx` and outputs `{model}-fit.yaml` (estimates) and `{mod
 
 There are three tiers of tests. Put a new test in the lowest tier whose constraints it fits.
 
-**Tier 1 — Fast unit tests** (`src/**/tests` inline modules)
+**Tier 1 — Fast unit tests** (inline `#[cfg(test)] mod tests { ... }` blocks in `src/**/*.rs`)
 Test the smallest helper that isolates the behaviour; avoid calling `fit()`. Run with `cargo test --lib`. These run on every PR and must stay fast (seconds total).
 
 **Tier 2 — Integration tests** (`tests/*.rs`)

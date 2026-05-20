@@ -546,6 +546,15 @@ fn optimize_nlopt(
     let n_evals_outer = Arc::new(AtomicUsize::new(0));
     let n_evals_cl = Arc::clone(&n_evals_outer);
 
+    // Best-seen accumulator (issue #59). NLopt returns the last evaluated
+    // point, not the best one — when the stagnation guard short-circuits
+    // by returning `best_ofv` with zero gradient, the optimizer can drift
+    // a step or two off the true minimum before its xtol/ftol fires. We
+    // track the best (xs, ofv) externally and restore x0 to it after
+    // optimize() returns, before the final inner loop and covariance step.
+    let best_seen: Arc<Mutex<Option<(Vec<f64>, f64)>>> = Arc::new(Mutex::new(None));
+    let best_seen_cl = Arc::clone(&best_seen);
+
     // EBE stats accumulator: tracks worst unconverged count and total fallbacks.
     #[derive(Default)]
     struct EbeAccum {
@@ -699,6 +708,7 @@ fn optimize_nlopt(
         n_evals_cl.fetch_add(1, Ordering::Relaxed);
         if ofv < state.best_ofv {
             state.best_ofv = ofv;
+            *best_seen_cl.lock().unwrap() = Some((xs.to_vec(), ofv));
             if verbose {
                 eprintln!("Eval {:>4}: OFV = {:.6}", state.n_evals, ofv);
             }
@@ -708,8 +718,10 @@ fn optimize_nlopt(
         // top of the closure trips on the next eval.
         if detect_stagnation(state, n) && verbose {
             eprintln!(
-                "Eval {:>4}: stagnation guard triggered (no improvement \
-                 below 1e-3 in last window); next eval will short-circuit",
+                "Eval {:>4}: stopping early — OFV has converged (no improvement \
+                 above 1e-3 in last window). This is normal convergence behaviour, \
+                 not an error: further evaluations are unlikely to find a better \
+                 solution.",
                 state.n_evals,
             );
         }
@@ -849,6 +861,7 @@ fn optimize_nlopt(
 
         let n_evals_cl2 = Arc::clone(&n_evals_outer);
         let ebe_accum_cl2 = Arc::clone(&ebe_accum);
+        let best_seen_cl2 = Arc::clone(&best_seen);
         // SLSQP fallback also operates in scaled xs space (same scale as primary opt).
         let objective2 = |xs: &[f64], grad: Option<&mut [f64]>, state: &mut NloptState| -> f64 {
             if crate::cancel::is_cancelled(&options.cancel) {
@@ -962,13 +975,17 @@ fn optimize_nlopt(
             n_evals_cl2.fetch_add(1, Ordering::Relaxed);
             if ofv < state.best_ofv {
                 state.best_ofv = ofv;
+                *best_seen_cl2.lock().unwrap() = Some((xs.to_vec(), ofv));
                 if verbose {
                     eprintln!("Eval {:>4}: OFV = {:.6} (SLSQP)", state.n_evals, ofv);
                 }
             }
             if detect_stagnation(state, n) && verbose {
                 eprintln!(
-                    "Eval {:>4}: stagnation guard triggered in SLSQP fallback",
+                    "Eval {:>4}: SLSQP fallback stopping early — OFV has converged \
+                     (no improvement above 1e-3 in last window). This is normal \
+                     convergence behaviour, not an error: further evaluations are \
+                     unlikely to find a better solution.",
                     state.n_evals,
                 );
             }
@@ -1044,6 +1061,25 @@ fn optimize_nlopt(
             }
         };
         drop(opt2);
+    }
+
+    // Restore the best-seen point (issue #59). NLopt returns the last
+    // evaluated `x0`, not the best-seen one — when the stagnation guard
+    // short-circuits, the last few evals return `best_ofv` with zero
+    // gradient and the optimizer can drift off the true minimum before
+    // termination. Replacing `x0` with the best-seen xs guarantees the
+    // final inner loop and covariance step run at the actual minimum.
+    if let Some((best_xs, best_ofv)) = best_seen.lock().unwrap().clone() {
+        if best_xs.len() == n {
+            x0.copy_from_slice(&best_xs);
+            if options.verbose {
+                eprintln!(
+                    "Restored best-seen point (OFV = {:.6}) for final inner loop \
+                     and covariance step.",
+                    best_ofv,
+                );
+            }
+        }
     }
 
     // Unscale x0 back from optimizer space to real (log/Cholesky) space.

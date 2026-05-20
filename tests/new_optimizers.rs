@@ -157,6 +157,61 @@ fn slsqp_stops_via_stagnation_well_before_a_generous_maxeval() {
 }
 
 #[test]
+fn final_ofv_no_worse_than_best_seen_during_trace() {
+    // Regression for issue #59: when the stagnation guard short-circuits
+    // by returning `best_ofv` with zero gradient, NLopt would still return
+    // its *last evaluated* x rather than the best-seen one. The final OFV
+    // could then be measurably worse than an intermediate value (and the
+    // covariance step would silently fail because the Hessian was being
+    // computed off-minimum). The fix tracks the best (xs, OFV) externally
+    // and restores x0 to it before the final inner loop runs.
+    let (model, population) = data_and_model();
+    let mut opts = base_options();
+    opts.optimizer = Optimizer::Slsqp;
+    opts.outer_maxiter = 1000;
+    opts.optimizer_trace = true;
+    opts.run_covariance_step = false;
+
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("slsqp fit must succeed");
+    assert!(result.ofv.is_finite());
+
+    let trace_path = result
+        .trace_path
+        .clone()
+        .expect("optimizer_trace=true must produce a trace path");
+    let csv = std::fs::read_to_string(&trace_path).expect("trace file must be readable");
+    let mut lines = csv.lines();
+    lines.next().expect("trace must have a header"); // skip header
+    let min_trace_ofv = lines
+        .filter_map(|line| {
+            // Columns: iter,method,phase,ofv,...
+            let ofv = line.split(',').nth(3)?;
+            ofv.parse::<f64>().ok()
+        })
+        .filter(|x| x.is_finite())
+        .fold(f64::INFINITY, f64::min);
+
+    assert!(
+        min_trace_ofv.is_finite(),
+        "trace must record at least one finite OFV"
+    );
+    // Tolerance absorbs the slight OFV change from the final fresh-start
+    // inner loop (vs the warm-started ones during the trace). Without the
+    // best-seen restoration, the gap can blow up arbitrarily as the
+    // optimizer drifts off-minimum during the short-circuit phase.
+    assert!(
+        result.ofv <= min_trace_ofv + 0.5,
+        "final OFV {} is worse than best-seen OFV {} (Δ = {})",
+        result.ofv,
+        min_trace_ofv,
+        result.ofv - min_trace_ofv,
+    );
+
+    let _ = std::fs::remove_file(&trace_path);
+}
+
+#[test]
 fn steihaug_max_iters_is_respected_by_trust_region() {
     // A very small steihaug_max_iters degrades step quality but should still
     // return a valid FitResult without crashing. Catches regressions in the

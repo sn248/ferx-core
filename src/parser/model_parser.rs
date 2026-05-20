@@ -1090,9 +1090,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                             use crate::nn::CovariateMapper;
                             let n_w = nn.mapper.n_weights();
                             let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
-                            nn.mapper
-                                .forward_raw(weights, covariates)
-                                .unwrap_or_else(|_| vec![0.0; nn.mapper.n_outputs()])
+                            nn.mapper.forward_raw(weights, covariates).expect(
+                                "NN forward_raw failed in tv_fn: this indicates a \
+                                 weight-offset/length wiring bug (missing covariates \
+                                 are substituted with 0.0, not errored on)",
+                            )
                         })
                         .collect();
                     #[cfg(not(feature = "nn"))]
@@ -2854,9 +2856,11 @@ fn build_pk_param_fn(
                     use crate::nn::CovariateMapper;
                     let n_w = nn.mapper.n_weights();
                     let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
-                    nn.mapper
-                        .forward_raw(weights, covariates)
-                        .unwrap_or_else(|_| vec![0.0; nn.mapper.n_outputs()])
+                    nn.mapper.forward_raw(weights, covariates).expect(
+                        "NN forward_raw failed in pk_param_fn: this indicates a \
+                         weight-offset/length wiring bug (missing covariates \
+                         are substituted with 0.0, not errored on)",
+                    )
                 })
                 .collect();
             #[cfg(not(feature = "nn"))]

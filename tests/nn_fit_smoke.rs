@@ -25,7 +25,6 @@
 //!   --features nn,slow-tests --test nn_fit_smoke`.
 
 #![cfg(feature = "nn")]
-#![cfg(feature = "slow-tests")]
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, read_nonmem_csv};
@@ -67,6 +66,7 @@ const NN_DCM_MODEL: &str = r#"
 "#;
 
 #[test]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn fit_runs_without_panicking_on_nn_bearing_model() {
     let parsed = parse_full_model(NN_DCM_MODEL).expect("model parses with --features nn");
     let model = parsed.model;

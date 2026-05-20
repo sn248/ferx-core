@@ -732,11 +732,12 @@ pub struct CompiledModel {
     pub theta_transform: Vec<ThetaTransform>,
     /// Parsed `[covariate_nn NAME]` blocks (one entry per block in the model
     /// file). Empty when the `nn` feature is off or no block is present.
-    /// The fit / predict / simulate paths do not yet consume this field —
-    /// the next PR wires `pk_param_fn` dispatch onto these mappers. For now
-    /// the parser registers each mapper's weights as plain thetas in
-    /// `default_params.theta`, so optimizer-vector layout is already
-    /// representative.
+    ///
+    /// Consumed by `build_pk_param_fn` and `tv_fn`: each NN's forward output is
+    /// pre-computed once per call and looked up by `Expression::NnOutput` via
+    /// the `NAME.OUTPUT` dot-access syntax. Weights live in `theta` starting at
+    /// `weights_offset` for `mapper.n_weights()` slots, so they participate in
+    /// the optimizer vector like any other theta.
     #[cfg(feature = "nn")]
     pub covariate_nns: Vec<crate::nn::CovariateNn>,
 }

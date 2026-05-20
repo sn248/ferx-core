@@ -530,15 +530,23 @@ impl NamedMlpMapper {
     /// `[covariate_nn]` block's `outputs` list (so the AST can carry a tiny
     /// `output_idx` rather than a string slot name). This method is the
     /// parser-facing variant.
+    ///
+    /// Missing covariates are substituted with `0.0` to match the rest of the
+    /// parser's expression evaluator (which uses `unwrap_or(0.0)` for missing
+    /// covariate lookups). The remaining error variants — `WeightCountMismatch`
+    /// / `InputCountMismatch` — only fire on genuine wiring bugs, so callers
+    /// can typically `.expect(...)` the result.
     pub fn forward_raw(
         &self,
         weights: &[f64],
         covariates: &HashMap<String, f64>,
     ) -> Result<Vec<f64>, NnError> {
-        let x = self.build_input_vec(covariates)?;
+        let x = self.build_input_vec_zero_fill(covariates);
         self.mlp.forward(&x, weights)
     }
 
+    /// Strict variant used by [`CovariateMapper::forward`] / `jacobian`: errors
+    /// out with `MissingCovariate` if any input name is absent.
     fn build_input_vec(&self, covariates: &HashMap<String, f64>) -> Result<Vec<f64>, NnError> {
         self.input_names
             .iter()
@@ -548,6 +556,15 @@ impl NamedMlpMapper {
                     .copied()
                     .ok_or_else(|| NnError::MissingCovariate(n.clone()))
             })
+            .collect()
+    }
+
+    /// Zero-fill variant used by [`Self::forward_raw`]: substitutes `0.0` for
+    /// any missing covariate, matching the parser's expression evaluator.
+    fn build_input_vec_zero_fill(&self, covariates: &HashMap<String, f64>) -> Vec<f64> {
+        self.input_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
             .collect()
     }
 }
@@ -840,6 +857,45 @@ mod tests {
         let mut out = PkParams::default();
         let err = mapper.forward(&weights, &covariates, &mut out).unwrap_err();
         assert!(matches!(err, NnError::MissingCovariate(ref n) if n == "CRCL"));
+    }
+
+    #[test]
+    fn forward_raw_substitutes_zero_for_missing_covariates() {
+        // `forward_raw` is the parser-facing entrypoint and must match the
+        // expression evaluator's `unwrap_or(0.0)` semantics — missing
+        // covariates become 0.0 inputs, not errors. Reference: this commit's
+        // fix to silent error-swallowing at NN dispatch sites.
+        let mapper = five_param_mapper();
+        let weights = vec![0.1; mapper.n_weights()];
+
+        let mut both = HashMap::new();
+        both.insert("WT".to_string(), 70.0);
+        both.insert("CRCL".to_string(), 0.0); // explicit zero for CRCL
+        let y_explicit = mapper.forward_raw(&weights, &both).unwrap();
+
+        let mut wt_only = HashMap::new();
+        wt_only.insert("WT".to_string(), 70.0);
+        let y_implicit = mapper.forward_raw(&weights, &wt_only).unwrap();
+
+        // Missing CRCL must produce identical outputs to CRCL = 0.0.
+        assert_eq!(y_explicit.len(), y_implicit.len());
+        for (a, b) in y_explicit.iter().zip(y_implicit.iter()) {
+            assert_relative_eq!(a, b, epsilon = 1e-15);
+        }
+    }
+
+    #[test]
+    fn forward_raw_surfaces_weight_count_mismatch() {
+        // `MissingCovariate` is no longer reachable via `forward_raw`, but
+        // genuine wiring bugs (wrong weight slice length) must still surface
+        // as errors so callers can `.expect(...)` them loudly.
+        let mapper = five_param_mapper();
+        let bad_weights = vec![0.0; mapper.n_weights() - 1];
+        let mut covariates = HashMap::new();
+        covariates.insert("WT".to_string(), 70.0);
+        covariates.insert("CRCL".to_string(), 100.0);
+        let err = mapper.forward_raw(&bad_weights, &covariates).unwrap_err();
+        assert!(matches!(err, NnError::WeightCountMismatch { .. }));
     }
 
     #[test]

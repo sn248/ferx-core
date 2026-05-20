@@ -24,7 +24,6 @@
 //!     --features nn,slow-tests --test nn_fit_convergence
 
 #![cfg(feature = "nn")]
-#![cfg(feature = "slow-tests")]
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::types::FitOptions;
@@ -70,6 +69,7 @@ const MODEL: &str = r#"
 "#;
 
 #[test]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn focei_makes_substantial_progress_on_nn_model() {
     let parsed = parse_full_model(MODEL).expect("model parses with --features nn");
     let model = parsed.model;

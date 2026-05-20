@@ -182,7 +182,14 @@ struct NloptState {
 /// Without this, SLSQP on poorly-identified (e.g. γ-bearing) FOCEI
 /// problems can spend 30+ min at a numerically-flat OFV before its
 /// xtol/ftol criteria fire.
-fn detect_stagnation(state: &mut NloptState, n: usize) -> bool {
+///
+/// `enabled = false` disables the guard entirely: never latches and never
+/// reports stagnation, so the optimizer runs to its own termination
+/// criterion (or to `outer_maxiter`).
+fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
+    if !enabled {
+        return false;
+    }
     if state.stagnation_stopped {
         return true;
     }
@@ -726,7 +733,7 @@ fn optimize_nlopt(
         // After updating best_ofv, check whether we've stalled. If yes,
         // `stagnation_stopped` is latched and the early-return at the
         // top of the closure trips on the next eval.
-        if detect_stagnation(state, n) && verbose {
+        if detect_stagnation(state, n, options.stagnation_guard) && verbose {
             eprintln!(
                 "Eval {:>4}: stopping early — OFV has converged (no improvement \
                  above 1e-3 in last window). This is normal convergence behaviour, \
@@ -997,7 +1004,7 @@ fn optimize_nlopt(
                     *bs = Some((xs.to_vec(), ofv));
                 }
             }
-            if detect_stagnation(state, n) && verbose {
+            if detect_stagnation(state, n, options.stagnation_guard) && verbose {
                 eprintln!(
                     "Eval {:>4}: SLSQP fallback stopping early — OFV has converged \
                      (no improvement above 1e-3 in last window). This is normal \

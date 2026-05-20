@@ -157,6 +157,51 @@ fn slsqp_stops_via_stagnation_well_before_a_generous_maxeval() {
 }
 
 #[test]
+fn stagnation_guard_toggle_runs_to_natural_termination() {
+    // With `stagnation_guard = false` the SLSQP run should NOT cut off
+    // early via the guard. The pair complements
+    // `slsqp_stops_via_stagnation_well_before_a_generous_maxeval`: with
+    // the guard on, NLopt terminates well below a `outer_maxiter * (n+1)`
+    // ceiling; with it off, eval counts climb noticeably higher (or hit
+    // maxeval) because only NLopt's own xtol/ftol can stop it.
+    let (model, population) = data_and_model();
+
+    let mut opts_on = base_options();
+    opts_on.optimizer = Optimizer::Slsqp;
+    opts_on.outer_maxiter = 1000;
+    opts_on.stagnation_guard = true;
+    let r_on = fit(&model, &population, &model.default_params, &opts_on)
+        .expect("slsqp fit with guard on must succeed");
+
+    let mut opts_off = base_options();
+    opts_off.optimizer = Optimizer::Slsqp;
+    opts_off.outer_maxiter = 1000;
+    opts_off.stagnation_guard = false;
+    let r_off = fit(&model, &population, &model.default_params, &opts_off)
+        .expect("slsqp fit with guard off must succeed");
+
+    assert!(r_on.ofv.is_finite() && r_off.ofv.is_finite());
+    // Both fits should land on roughly the same OFV — the guard only
+    // affects *when* SLSQP stops, not the converged value.
+    assert!(
+        (r_on.ofv - r_off.ofv).abs() < 1.0,
+        "guard on OFV {} vs off OFV {} should agree within 1 unit",
+        r_on.ofv,
+        r_off.ofv,
+    );
+    // The guard exists precisely because SLSQP can grind past the
+    // numerically-flat OFV plateau. With it off, expect a meaningfully
+    // higher eval count. Assert strictly more — anything else suggests
+    // the toggle didn't take effect.
+    assert!(
+        r_off.n_iterations > r_on.n_iterations,
+        "guard off should run more evals than guard on (off = {}, on = {})",
+        r_off.n_iterations,
+        r_on.n_iterations,
+    );
+}
+
+#[test]
 fn final_ofv_no_worse_than_best_seen_during_trace() {
     // Regression for issue #59: when the stagnation guard short-circuits
     // by returning `best_ofv` with zero gradient, NLopt would still return

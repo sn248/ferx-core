@@ -102,6 +102,7 @@ Notes:
 | `scale_params` | `true` | Scale packed parameters to O(1) before passing to the optimizer. Improves conditioning when log-transformed parameters span several orders of magnitude. Set to `false` to disable (reproduces pre-PR2 behaviour). |
 | `max_unconverged_frac` | `0.1` | Fraction of subjects (with at least `min_obs_for_convergence_check` observations) allowed to have unconverged EBEs before the outer optimizer rejects the step (returns OFV = ∞). Set to `1.0` to disable the guard. |
 | `min_obs_for_convergence_check` | `2` | Subjects with fewer than this many observations are excluded from the `max_unconverged_frac` check (they still run normally). |
+| `stagnation_guard` | `true` | Short-circuit the NLopt-based outer optimizers once recent evals show no OFV improvement above 1e-3 over a window of `3*(n+1).max(50)` evals. This lets SLSQP / L-BFGS terminate quickly via their own xtol/ftol on numerically-flat plateaus (e.g. γ-bearing FOCEI problems) instead of grinding through the remaining `outer_maxiter` budget at full inner-loop cost. Set to `false` to let the optimizer run to its natural termination criterion — useful when debugging or for problems with very slow but real OFV improvements below the threshold. |
 
 ## Options That Don't Apply to the Selected Method
 

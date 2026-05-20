@@ -74,7 +74,7 @@ fn trust_region_fit_converges_to_finite_ofv() {
     let (model, population) = data_and_model();
     let mut opts = base_options();
     opts.optimizer = Optimizer::TrustRegion;
-    opts.steihaug_max_iters = 30;
+    opts.steihaug_max_iters = Some(30);
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("trust_region fit must succeed");
     assert!(
@@ -164,7 +164,7 @@ fn steihaug_max_iters_is_respected_by_trust_region() {
     let (model, population) = data_and_model();
     let mut opts = base_options();
     opts.optimizer = Optimizer::TrustRegion;
-    opts.steihaug_max_iters = 2; // intentionally aggressive
+    opts.steihaug_max_iters = Some(2); // intentionally aggressive
     opts.outer_maxiter = 30;
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("trust_region with tight CG budget must still return");

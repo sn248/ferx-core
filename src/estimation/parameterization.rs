@@ -787,6 +787,8 @@ mod tests {
             theta_transform: Vec::new(),
             n_kappa: 0,
             kappa_names: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
         }
     }
 

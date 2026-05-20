@@ -903,6 +903,8 @@ mod tests {
             kappa_names: Vec::new(),
             kappa_mu_refs: HashMap::new(),
             indiv_param_names: vec!["CL".into(), "V".into()],
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
         }
     }
 

@@ -9,13 +9,41 @@ static DIFFUSION_LINE_RE: LazyLock<Regex> =
 
 // ── Mu-referencing pattern detection ────────────────────────────────────────
 
-/// Walk a Mul-chain and collect direct Theta indices (not inside any function).
-fn collect_mul_thetas(expr: &Expression, out: &mut Vec<usize>) {
+/// Anchor of a mu-referencing relationship — either a plain user-declared
+/// theta (the classical case) or a `[covariate_nn]` output (Phase A M1+
+/// "deep compartment model" extension; the per-individual typical value
+/// comes out of an NN forward pass). Both shapes compose with eta the same
+/// way: `param = anchor * exp(eta)` (lognormal) or `param = anchor + eta`
+/// (additive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MuRefAnchor {
+    /// User-declared theta at this index in `theta_names`.
+    Theta(usize),
+    /// Output of a `[covariate_nn NAME]` block. `nn_idx` indexes the
+    /// alphabetically-sorted NN list (same as `ParseCtx::nn_specs`);
+    /// `output_idx` indexes the block's declared `outputs` list.
+    #[allow(dead_code)]
+    NnOutput {
+        nn_idx: usize,
+        output_idx: usize,
+    },
+}
+
+/// Walk a Mul-chain and collect direct anchor candidates — `Theta(i)` or
+/// `NnOutput { nn_idx, output_idx }` — that sit at the top of the
+/// multiplication tree (not inside any function call). Used by the
+/// extended Pattern 1/4 detector to recognise both
+/// `TVCL * exp(ETA)` (classical) and `TYPICAL_PK.CL * exp(ETA)` (DCM).
+fn collect_mul_anchors(expr: &Expression, out: &mut Vec<MuRefAnchor>) {
     match expr {
-        Expression::Theta(i) => out.push(*i),
+        Expression::Theta(i) => out.push(MuRefAnchor::Theta(*i)),
+        Expression::NnOutput { nn_idx, output_idx } => out.push(MuRefAnchor::NnOutput {
+            nn_idx: *nn_idx,
+            output_idx: *output_idx,
+        }),
         Expression::BinOp(l, BinOp::Mul, r) => {
-            collect_mul_thetas(l, out);
-            collect_mul_thetas(r, out);
+            collect_mul_anchors(l, out);
+            collect_mul_anchors(r, out);
         }
         _ => {}
     }
@@ -192,12 +220,24 @@ fn extract_eta_indices_for_var(stmts: &[Statement], var_name: &str) -> Vec<usize
 }
 
 /// Detect mu-referencing patterns in one assignment expression.
-/// Returns `Some((eta_idx, theta_idx, log_transformed))` or `None`.
-fn detect_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
+///
+/// Returns `Some((eta_idx, anchor, log_transformed))` or `None`. The anchor
+/// is either a plain `Theta(usize)` (classical mu-ref) or a `NnOutput`
+/// reference (Phase A M1: the typical value is produced by a
+/// `[covariate_nn]` forward pass).
+///
+/// Patterns recognised:
+/// - Pattern 1: `THETA * exp(ETA)`              → lognormal
+/// - Pattern 1-NN: `NN.OUTPUT * exp(ETA)`       → lognormal (DCM)
+/// - Pattern 2: `exp(log(THETA) + ETA)`         → lognormal
+/// - Pattern 3: `THETA + ETA` or `ETA + THETA`  → additive
+/// - Pattern 4: `THETA * exp(ETA) * <const>`    → lognormal (multiplied
+///   by a constant factor; the constant doesn't affect mu-ref detection
+///   since `collect_mul_*` walks the whole product chain).
+fn detect_pattern(expr: &Expression) -> Option<(usize, MuRefAnchor, bool)> {
     match expr {
         // Pattern 2: exp(log(THETA) + ETA)
         Expression::UnaryFn(name, inner) if name == "exp" => {
-            // inner must be Add with log(Theta) and Eta in either order
             if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
                 let try_log_theta_eta =
                     |a: &Expression, b: &Expression| -> Option<(usize, usize)> {
@@ -215,24 +255,29 @@ fn detect_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
                 if let Some((ei, ti)) =
                     try_log_theta_eta(lhs, rhs).or_else(|| try_log_theta_eta(rhs, lhs))
                 {
-                    return Some((ei, ti, true));
+                    return Some((ei, MuRefAnchor::Theta(ti), true));
                 }
             }
             None
         }
         // Pattern 3: THETA + ETA or ETA + THETA
         Expression::BinOp(lhs, BinOp::Add, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
-            (Expression::Theta(ti), Expression::Eta(ei)) => Some((*ei, *ti, false)),
-            (Expression::Eta(ei), Expression::Theta(ti)) => Some((*ei, *ti, false)),
+            (Expression::Theta(ti), Expression::Eta(ei)) => {
+                Some((*ei, MuRefAnchor::Theta(*ti), false))
+            }
+            (Expression::Eta(ei), Expression::Theta(ti)) => {
+                Some((*ei, MuRefAnchor::Theta(*ti), false))
+            }
             _ => None,
         },
-        // Pattern 1 / 4: product containing Theta and exp(Eta)
+        // Pattern 1 / 1-NN / 4: product containing exactly one anchor
+        // (Theta OR NnOutput) and `exp(Eta)` somewhere in the chain.
         _ => {
-            let mut thetas = Vec::new();
-            collect_mul_thetas(expr, &mut thetas);
-            if thetas.len() == 1 {
+            let mut anchors = Vec::new();
+            collect_mul_anchors(expr, &mut anchors);
+            if anchors.len() == 1 {
                 if let Some(ei) = find_exp_eta_in_mul(expr) {
-                    return Some((ei, thetas[0], true));
+                    return Some((ei, anchors[0], true));
                 }
             }
             None
@@ -245,24 +290,54 @@ fn detect_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
 /// participate — a variable defined inside `if (...) { CL = ... }` cannot
 /// participate in mu-referencing because the inner-loop re-centering only
 /// holds when the relationship is unconditional.
+///
+/// `nn_specs` is the same `(name, output_names)` list passed to `ParseCtx`.
+/// For NN-anchored mu-refs the produced `MuRef::theta_name` is the
+/// structured `"<NN_NAME>.<OUTPUT_NAME>"` form. Downstream consumers that
+/// only know about plain thetas (e.g. `compute_mu_k`) silently skip these
+/// entries because the structured name doesn't appear in `theta_names`;
+/// the full DCM-aware AD inner-loop fast path is planned for Phase A M2.
 fn detect_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
     eta_names: &[String],
+    nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
     let mut result = HashMap::new();
     for s in stmts {
         if let Statement::Assign(_, expr) = s {
-            if let Some((eta_idx, theta_idx, log_transformed)) = detect_pattern(expr) {
-                if eta_idx < eta_names.len() && theta_idx < theta_names.len() {
-                    result.insert(
-                        eta_names[eta_idx].clone(),
-                        MuRef {
-                            theta_name: theta_names[theta_idx].clone(),
-                            log_transformed,
-                        },
-                    );
+            if let Some((eta_idx, anchor, log_transformed)) = detect_pattern(expr) {
+                if eta_idx >= eta_names.len() {
+                    continue;
                 }
+                let name = match anchor {
+                    MuRefAnchor::Theta(ti) => {
+                        if ti >= theta_names.len() {
+                            continue;
+                        }
+                        theta_names[ti].clone()
+                    }
+                    MuRefAnchor::NnOutput { nn_idx, output_idx } => {
+                        // Defensive: indices should be valid by construction
+                        // (parse_atom built them against the same nn_specs),
+                        // but skip silently rather than panic if anything's
+                        // out of sync.
+                        let Some((nn_name, outputs)) = nn_specs.get(nn_idx) else {
+                            continue;
+                        };
+                        let Some(out_name) = outputs.get(output_idx) else {
+                            continue;
+                        };
+                        format!("{nn_name}.{out_name}")
+                    }
+                };
+                result.insert(
+                    eta_names[eta_idx].clone(),
+                    MuRef {
+                        theta_name: name,
+                        log_transformed,
+                    },
+                );
             }
         }
     }
@@ -324,9 +399,15 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
         }
     }
 
-    // TVCL * exp(ETA), exp(log(THETA) + ETA), TVCL + ETA
-    if let Some((ei, ti, log_transformed)) = detect_pattern(expr) {
-        if ti < n_theta {
+    // TVCL * exp(ETA), exp(log(THETA) + ETA), TVCL + ETA, TYPICAL_PK.CL * exp(ETA).
+    // NN-anchored variants are still classified as Lognormal/Additive — the
+    // eta's *statistical* shape is the same; only the anchor differs.
+    if let Some((ei, anchor, log_transformed)) = detect_pattern(expr) {
+        let valid = match anchor {
+            MuRefAnchor::Theta(ti) => ti < n_theta,
+            MuRefAnchor::NnOutput { .. } => true,
+        };
+        if valid {
             let pt = if log_transformed {
                 EtaParamType::LogNormal
             } else {
@@ -624,7 +705,11 @@ pub fn parse_model_string(content: &str) -> Result<CompiledModel, String> {
 
 /// Parse a full model string including all optional blocks.
 pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
-    let blocks = extract_blocks(content)?;
+    let extracted = extract_blocks(content)?;
+    // Keep the historical `blocks` binding for unnamed blocks so the rest of
+    // this (large) function reads unchanged. Named blocks are pulled from
+    // `extracted.named` directly where they're consumed below.
+    let blocks = &extracted.unnamed;
     let name = extract_model_name(content);
 
     // ── Required blocks ──
@@ -633,6 +718,35 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .ok_or("Missing [parameters] block")?;
     let (thetas, omegas, block_omegas, sigmas, eta_names_bsv, kappa_info) =
         parse_parameters(param_lines)?;
+
+    // ── Optional [covariate_nn NAME] blocks (Phase A M1, behind `--features nn`)
+    //
+    // Parsed early so the auto-generated weight thetas land in `theta_names`
+    // before [individual_parameters] is parsed — that way future PRs can
+    // recognise `TYPICAL_PK.CL` as an NN-output reference during expression
+    // parsing without re-walking the AST.
+    #[cfg(feature = "nn")]
+    let nn_specs: Vec<CovariateNnSpec> = {
+        let mut specs = Vec::new();
+        if let Some(map) = extracted.named.get("covariate_nn") {
+            // Sort by name so theta-ordering is deterministic across runs
+            // (HashMap iteration order is otherwise unstable).
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (instance, lines) in entries {
+                specs.push(parse_covariate_nn_block(instance, lines)?);
+            }
+        }
+        specs
+    };
+    #[cfg(not(feature = "nn"))]
+    if extracted.named.contains_key("covariate_nn") {
+        return Err(
+            "[covariate_nn] blocks require building ferx-core with `--features nn`. \
+             See plans/dcm-and-low-dim-node.md for the design and roadmap."
+                .to_string(),
+        );
+    }
 
     let struct_lines = blocks
         .get("structural_model")
@@ -647,8 +761,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .get("individual_parameters")
         .ok_or("Missing [individual_parameters] block")?;
 
-    // theta_names is extended below after diffusion thetas are appended
+    // theta_names is extended below after NN-weight and diffusion thetas are appended
     let mut theta_names: Vec<String> = thetas.iter().map(|t| t.name.clone()).collect();
+    #[cfg(feature = "nn")]
+    for spec in &nn_specs {
+        theta_names.extend(spec.theta_names.iter().cloned());
+    }
     let sigma_names: Vec<String> = sigmas.iter().map(|s| s.name.clone()).collect();
     let n_theta;
     let n_eta = eta_names_bsv.len(); // BSV-only count
@@ -682,11 +800,28 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // The ParseCtx still receives the full set (via assigned_vars_in_order) so
     // branch-local names parse as Variable rather than Covariate.
     let indiv_text = indiv_lines.join("\n");
-    let bare_ctx = ParseCtx::new(&theta_names, &eta_names, &[]);
+    // NN-output lookup table for `TYPICAL_PK.CL`-style dot-access in
+    // [individual_parameters]. Always present (empty when no [covariate_nn]
+    // block is in the model) so the same code path works with or without
+    // --features nn.
+    #[cfg(feature = "nn")]
+    let nn_specs_for_ctx: Vec<(String, Vec<String>)> = nn_specs
+        .iter()
+        .map(|s| {
+            use crate::nn::CovariateMapper;
+            (s.name.clone(), s.mapper.output_names().to_vec())
+        })
+        .collect();
+    #[cfg(not(feature = "nn"))]
+    let nn_specs_for_ctx: Vec<(String, Vec<String>)> = Vec::new();
+
+    let bare_ctx =
+        ParseCtx::new(&theta_names, &eta_names, &[]).with_nn_specs(&nn_specs_for_ctx);
     let pre_stmts = parse_block_statements(&indiv_text, bare_ctx, StatementMode::Plain)?;
     let all_assigned = assigned_vars_in_order(&pre_stmts);
     let indiv_var_names = top_level_assigned_vars(&pre_stmts);
-    let indiv_ctx = ParseCtx::new(&theta_names, &eta_names, &all_assigned);
+    let indiv_ctx = ParseCtx::new(&theta_names, &eta_names, &all_assigned)
+        .with_nn_specs(&nn_specs_for_ctx);
     let indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
 
     // Detect ODE vs analytical model
@@ -771,19 +906,66 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         )
     };
 
-    // Build pk_param_fn with the extended eta context (BSV + kappa names).
-    let (pk_param_fn, referenced_covariates) =
-        build_pk_param_fn(indiv_stmts.clone(), &pk_param_map, &indiv_var_names)?;
+    // Build the CovariateNn handles up front (before build_pk_param_fn, which
+    // captures them in the pk_param_fn closure). The same vector is also
+    // appended to CompiledModel.covariate_nns further down — see the diffusion
+    // appendage block, which uses these to drive theta-value extension.
+    #[cfg(feature = "nn")]
+    let covariate_nns_for_closure: Vec<crate::nn::CovariateNn> = {
+        let mut acc = Vec::with_capacity(nn_specs.len());
+        let mut offset = thetas.len();
+        for spec in &nn_specs {
+            acc.push(crate::nn::CovariateNn {
+                name: spec.name.clone(),
+                mapper: spec.mapper.clone(),
+                weights_offset: offset,
+            });
+            offset += spec.theta_inits.len();
+        }
+        acc
+    };
 
-    // Append diffusion parameters to the theta list. They are treated as
-    // positive variance parameters: log-transformed during optimisation,
-    // lower-bounded at 0, no upper bound. They appear last in the theta vector
-    // so existing theta indices are unaffected.
-    let diff_theta_start = thetas.len(); // index of first diffusion theta
+    // Build pk_param_fn with the extended eta context (BSV + kappa names).
+    let (pk_param_fn, referenced_covariates) = build_pk_param_fn(
+        indiv_stmts.clone(),
+        &pk_param_map,
+        &indiv_var_names,
+        #[cfg(feature = "nn")]
+        &covariate_nns_for_closure,
+    )?;
+
+    // Append NN-weight thetas (Phase A M1), then diffusion variances. Both
+    // sit at the tail of the theta vector so existing user-declared theta
+    // indices are unaffected.
+    //
+    // Layout:
+    //   [base thetas | NN-weight thetas | diffusion thetas]
+    //
+    // NN weights are identity-packed (lower = -∞, upper = +∞): they can be
+    // any real number, the optimizer sees them unscaled. Initial values are
+    // Glorot-style deterministic samples produced by `parse_covariate_nn_block`.
     let mut theta_values: Vec<f64> = thetas.iter().map(|t| t.init).collect();
     let mut theta_lower: Vec<f64> = thetas.iter().map(|t| t.lower).collect();
     let mut theta_upper: Vec<f64> = thetas.iter().map(|t| t.upper).collect();
     let mut theta_fixed: Vec<bool> = thetas.iter().map(|t| t.fixed).collect();
+
+    // NN-weight thetas: same offsets as `covariate_nns_for_closure` built
+    // above (both use `thetas.len()` as the first offset). We append values
+    // / bounds / fixed flags here; the handles themselves live in
+    // `covariate_nns_for_closure` and are reused below for `CompiledModel`.
+    #[cfg(feature = "nn")]
+    let covariate_nns: Vec<crate::nn::CovariateNn> = covariate_nns_for_closure.clone();
+    #[cfg(feature = "nn")]
+    for spec in &nn_specs {
+        for &init in &spec.theta_inits {
+            theta_values.push(init);
+            theta_lower.push(f64::NEG_INFINITY);
+            theta_upper.push(f64::INFINITY);
+            theta_fixed.push(false);
+        }
+    }
+
+    let diff_theta_start = theta_values.len(); // index of first diffusion theta
     for (i, &init) in diffusion_theta_inits.iter().enumerate() {
         let is_fixed = diffusion_theta_fixed[i];
         // Only clamp estimated params — a fixed 0.0 diffusion should stay 0.0
@@ -892,10 +1074,31 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         if !is_ode {
             let stmts_for_tv = indiv_stmts.clone();
             let var_names_for_tv = indiv_var_names.clone();
+            #[cfg(feature = "nn")]
+            let tv_covariate_nns: Vec<crate::nn::CovariateNn> = covariate_nns_for_closure.clone();
             Some(Box::new(
                 move |theta: &[f64], covariates: &HashMap<String, f64>| {
                     let zero_eta = vec![0.0; tv_eta_names.len()];
                     let mut vars: HashMap<String, f64> = HashMap::new();
+                    // Pre-compute each NN's forward output once per call so
+                    // `TYPICAL_PK.CL`-style references inside the eta=0
+                    // expression evaluate consistently and share the work.
+                    #[cfg(feature = "nn")]
+                    let nn_outputs: Vec<Vec<f64>> = tv_covariate_nns
+                        .iter()
+                        .map(|nn| {
+                            use crate::nn::CovariateMapper;
+                            let n_w = nn.mapper.n_weights();
+                            let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
+                            nn.mapper.forward_raw(weights, covariates).expect(
+                                "NN forward_raw failed in tv_fn: this indicates a \
+                                 weight-offset/length wiring bug (missing covariates \
+                                 are substituted with 0.0, not errored on)",
+                            )
+                        })
+                        .collect();
+                    #[cfg(not(feature = "nn"))]
+                    let nn_outputs: Vec<Vec<f64>> = Vec::new();
                     eval_statements(
                         &stmts_for_tv,
                         theta,
@@ -904,6 +1107,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                         &mut vars,
                         None,
                         None,
+                        &nn_outputs,
                     );
                     var_names_for_tv
                         .iter()
@@ -923,7 +1127,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .chain(kappa_names.iter())
         .cloned()
         .collect();
-    let all_mu_refs = detect_mu_refs(&indiv_stmts, &theta_names, &all_eta_names);
+    let all_mu_refs =
+        detect_mu_refs(&indiv_stmts, &theta_names, &all_eta_names, &nn_specs_for_ctx);
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
     let mu_refs: HashMap<String, MuRef> = all_mu_refs
         .iter()
@@ -1021,6 +1226,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         sigma_init_as_sd,
         kappa_init_as_sd,
         tv_fn,
+        #[cfg(feature = "nn")]
+        covariate_nns,
         pk_indices,
         eta_map,
         pk_idx_f64,
@@ -1521,6 +1728,218 @@ fn parse_diffusion_block(
     Ok((variances, names, fixed))
 }
 
+// ── [covariate_nn NAME] block ────────────────────────────────────────────────
+//
+// Parses block bodies of the form:
+//
+//   [covariate_nn TYPICAL_PK]
+//     inputs     = [WT, CRCL]
+//     outputs    = [CL, V1, Q, V2, KA]
+//     layers     = [16, 16]
+//     activation = tanh           # hidden-layer activation
+//     output     = softplus       # output-layer activation (optional, default identity)
+//
+// Produces a `NamedMlpMapper` plus a list of auto-generated weight-theta
+// names. The names follow the convention `W_<NAME>_<l>_<i>_<j>` and
+// `B_<NAME>_<l>_<i>` (1-indexed layers/units, all uppercase), matching the
+// existing `TVCL` / `THETA_WT` theta-name style.
+//
+// Feature-gated behind `nn`. Without the feature the parser surfaces a
+// clear error so users get told to rebuild with `--features nn`.
+
+#[cfg(feature = "nn")]
+#[derive(Debug, Clone)]
+pub(crate) struct CovariateNnSpec {
+    pub name: String,
+    pub mapper: crate::nn::NamedMlpMapper,
+    pub theta_names: Vec<String>,
+    pub theta_inits: Vec<f64>,
+}
+
+#[cfg(feature = "nn")]
+fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnSpec, String> {
+    use crate::nn::{Activation, CovariateMapper, MlpMapper, NamedMlpMapper};
+
+    // Collect simple `key = value` pairs. Each value is either a list
+    // `[a, b, c]` or a bare identifier / integer.
+    let mut fields: HashMap<String, String> = HashMap::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!(
+                "[covariate_nn {}] expected `key = value`, got: `{}`",
+                name, line
+            ));
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if fields.insert(key.clone(), value).is_some() {
+            return Err(format!(
+                "[covariate_nn {}] duplicate key `{}`",
+                name, key
+            ));
+        }
+    }
+
+    let take_list = |field: &str| -> Result<Vec<String>, String> {
+        let raw = fields.get(field).ok_or_else(|| {
+            format!("[covariate_nn {}] missing required `{}`", name, field)
+        })?;
+        let inner = raw
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .ok_or_else(|| {
+                format!(
+                    "[covariate_nn {}] `{}` must be a list like `[a, b, c]`, got `{}`",
+                    name, field, raw
+                )
+            })?;
+        Ok(inner
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    };
+
+    let inputs = take_list("inputs")?;
+    let outputs = take_list("outputs")?;
+    let layer_strs = take_list("layers")?;
+    if inputs.is_empty() {
+        return Err(format!("[covariate_nn {}] `inputs` is empty", name));
+    }
+    if outputs.is_empty() {
+        return Err(format!("[covariate_nn {}] `outputs` is empty", name));
+    }
+
+    let hidden: Vec<usize> = layer_strs
+        .iter()
+        .map(|s| {
+            s.parse::<usize>().map_err(|_| {
+                format!(
+                    "[covariate_nn {}] `layers` entries must be positive integers, got `{}`",
+                    name, s
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    if hidden.is_empty() {
+        return Err(format!(
+            "[covariate_nn {}] `layers` must list at least one hidden width",
+            name
+        ));
+    }
+    if hidden.iter().any(|&h| h == 0) {
+        return Err(format!(
+            "[covariate_nn {}] hidden-layer width must be > 0",
+            name
+        ));
+    }
+
+    let parse_activation = |raw: &str, ctx: &str| -> Result<Activation, String> {
+        match raw.to_ascii_lowercase().as_str() {
+            "identity" | "linear" => Ok(Activation::Identity),
+            "relu" => Ok(Activation::Relu),
+            "softplus" => Ok(Activation::Softplus),
+            "tanh" => Ok(Activation::Tanh),
+            "sigmoid" => Ok(Activation::Sigmoid),
+            "exp" => Ok(Activation::Exp),
+            other => Err(format!(
+                "[covariate_nn {}] unknown {} activation `{}` (expected one of: \
+                 identity, relu, softplus, tanh, sigmoid, exp)",
+                name, ctx, other
+            )),
+        }
+    };
+
+    let hidden_act_raw = fields
+        .get("activation")
+        .ok_or_else(|| format!("[covariate_nn {}] missing required `activation`", name))?;
+    let hidden_activation = parse_activation(hidden_act_raw, "hidden")?;
+
+    let output_activation = match fields.get("output") {
+        Some(s) => parse_activation(s, "output")?,
+        None => Activation::Identity,
+    };
+
+    // Reject any unknown keys so typos don't silently pass.
+    const KNOWN: &[&str] = &["inputs", "outputs", "layers", "activation", "output"];
+    for k in fields.keys() {
+        if !KNOWN.contains(&k.as_str()) {
+            return Err(format!(
+                "[covariate_nn {}] unknown key `{}` (known: {})",
+                name,
+                k,
+                KNOWN.join(", ")
+            ));
+        }
+    }
+
+    let mut layer_sizes = Vec::with_capacity(hidden.len() + 2);
+    layer_sizes.push(inputs.len());
+    layer_sizes.extend(hidden.iter().copied());
+    layer_sizes.push(outputs.len());
+
+    let mlp = MlpMapper::new(layer_sizes.clone(), hidden_activation, output_activation)
+        .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
+    let mapper = NamedMlpMapper::new(mlp, inputs, outputs)
+        .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
+
+    // Auto-generate weight-theta names + Glorot-style deterministic inits.
+    // Names are uppercase to match the codebase convention (TVCL, THETA_WT,
+    // DIFF_CENTRAL, …). Inits use a fixed PRNG (xorshift seeded by name) so
+    // builds are reproducible without pulling `rand` into the parser.
+    let upper = name.to_ascii_uppercase();
+    let mut theta_names = Vec::new();
+    let mut theta_inits = Vec::new();
+    let mut state: u64 = {
+        // Tiny string hash → seed. Deterministic across runs.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in upper.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h | 1
+    };
+    let mut next_unit = || -> f64 {
+        // xorshift64 → uniform(-0.5, 0.5)
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state as f64 / u64::MAX as f64) - 0.5
+    };
+    for l in 1..layer_sizes.len() {
+        let n_l = layer_sizes[l];
+        let n_lm1 = layer_sizes[l - 1];
+        // Glorot/Xavier scale: weights ~ U(-r, r), r = sqrt(6 / (fan_in + fan_out)).
+        let r = (6.0 / (n_lm1 + n_l) as f64).sqrt();
+        for i in 1..=n_l {
+            for j in 1..=n_lm1 {
+                theta_names.push(format!("W_{}_{}_{}_{}", upper, l, i, j));
+                theta_inits.push(2.0 * r * next_unit());
+            }
+        }
+        for i in 1..=n_l {
+            theta_names.push(format!("B_{}_{}_{}", upper, l, i));
+            // Biases initialised to 0 — standard for tanh/sigmoid; for ReLU
+            // you'd want a small positive bias, but this module's intended
+            // hidden activation for [covariate_nn] is `tanh` (softplus on the
+            // output head), so 0 is fine.
+            theta_inits.push(0.0);
+        }
+    }
+    debug_assert_eq!(theta_names.len(), mapper.n_weights());
+
+    Ok(CovariateNnSpec {
+        name: name.to_string(),
+        mapper,
+        theta_names,
+        theta_inits,
+    })
+}
+
 fn build_ode_spec(
     lines: &[String],
     state_names: &[String],
@@ -1670,6 +2089,11 @@ fn build_ode_spec(
             let empty_theta: [f64; 0] = [];
             let empty_eta: [f64; 0] = [];
             let empty_cov: HashMap<String, f64> = HashMap::new();
+            // ODE RHS evaluation runs with empty theta/eta/covariates here —
+            // values are injected later via the `vars` map (state names, indiv
+            // params). NN outputs aren't relevant: `[covariate_nn]` outputs are
+            // routed via `pk_param_fn`, not the ODE RHS.
+            let empty_nn_outputs: Vec<Vec<f64>> = Vec::new();
             eval_statements(
                 &stmts_owned,
                 &empty_theta,
@@ -1678,6 +2102,7 @@ fn build_ode_spec(
                 &mut vars,
                 Some(du),
                 Some(&state_index),
+                &empty_nn_outputs,
             );
         });
 
@@ -1781,13 +2206,37 @@ fn extract_model_name(content: &str) -> String {
         .unwrap_or_else(|| "Unnamed".to_string())
 }
 
-fn extract_blocks(content: &str) -> Result<HashMap<String, Vec<String>>, String> {
-    let mut blocks: HashMap<String, Vec<String>> = HashMap::new();
+/// Extracted-block state: the original (unnamed) block map plus a second
+/// map for blocks with an instance name in the header — `[block_type NAME]`.
+///
+/// Unnamed blocks (e.g. `[parameters]`, `[odes]`) live in `unnamed` with the
+/// block type as key. Each block type may appear at most once and is
+/// represented as a flat `Vec<String>` of body lines.
+///
+/// Named blocks (currently `[covariate_nn NAME]`; later `[dynamics_nn NAME]`
+/// in Phase B) live in `named[type][name]`. Multiple instances per type are
+/// supported.
+#[derive(Default, Debug)]
+struct ExtractedBlocks {
+    unnamed: HashMap<String, Vec<String>>,
+    named: HashMap<String, HashMap<String, Vec<String>>>,
+}
+
+fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
+    let mut out = ExtractedBlocks::default();
+    // Two header forms:
+    //   `[block_type]`            — unnamed (existing)
+    //   `[block_type INSTANCE]`   — named (e.g. `[covariate_nn TYPICAL_PK]`)
     // Anchor on the whole line so things like `states=[central]` inside an
     // ODE structural definition aren't misread as a block-tag opener.
-    let block_re = Regex::new(r"^\[(\w+)\]$").unwrap();
+    let block_re = Regex::new(r"^\[(\w+)(?:\s+(\w+))?\]$").unwrap();
 
-    let mut current_block: Option<String> = None;
+    // current_target: either an unnamed block name, or a (block_type, instance) pair.
+    enum BlockTarget {
+        Unnamed(String),
+        Named { ty: String, name: String },
+    }
+    let mut current: Option<BlockTarget> = None;
 
     for line in content.lines() {
         let without_comment = match line.find('#').into_iter().chain(line.find("//")).min() {
@@ -1800,7 +2249,14 @@ fn extract_blocks(content: &str) -> Result<HashMap<String, Vec<String>>, String>
         }
 
         if let Some(caps) = block_re.captures(trimmed) {
-            current_block = Some(caps[1].to_lowercase());
+            let ty = caps[1].to_lowercase();
+            current = match caps.get(2) {
+                Some(m) => Some(BlockTarget::Named {
+                    ty,
+                    name: m.as_str().to_string(),
+                }),
+                None => Some(BlockTarget::Unnamed(ty)),
+            };
             continue;
         }
 
@@ -1808,15 +2264,26 @@ fn extract_blocks(content: &str) -> Result<HashMap<String, Vec<String>>, String>
             continue;
         }
 
-        if let Some(ref block) = current_block {
-            blocks
-                .entry(block.clone())
-                .or_default()
-                .push(trimmed.to_string());
+        match current.as_ref() {
+            Some(BlockTarget::Unnamed(block)) => {
+                out.unnamed
+                    .entry(block.clone())
+                    .or_default()
+                    .push(trimmed.to_string());
+            }
+            Some(BlockTarget::Named { ty, name }) => {
+                out.named
+                    .entry(ty.clone())
+                    .or_default()
+                    .entry(name.clone())
+                    .or_default()
+                    .push(trimmed.to_string());
+            }
+            None => { /* lines before any block header are ignored */ }
         }
     }
 
-    Ok(blocks)
+    Ok(out)
 }
 
 // --- Parameter parsing ---
@@ -2288,10 +2755,17 @@ fn parse_error_model(lines: &[String]) -> Result<(ErrorModel, Vec<String>), Stri
 /// `var_names` is the deduplicated list of all variables ever assigned in the
 /// block (in first-occurrence order). For analytical PK models the assignment
 /// order doubles as the slot ordering for `PkParams.values`.
+/// Build the `pk_param_fn` closure used by every fit / simulate / predict
+/// call site. When the `nn` feature is on and the model has any
+/// `[covariate_nn]` blocks, `covariate_nns` carries each mapper plus the
+/// offset of its weight block inside the optimizer's `theta` vector. The
+/// closure pre-computes each NN's forward output once per call and exposes
+/// them to the indexed evaluator via the `nn_outputs` slice.
 fn build_pk_param_fn(
     stmts: Vec<Statement>,
     pk_param_map: &HashMap<String, String>,
     var_names: &[String],
+    #[cfg(feature = "nn")] covariate_nns: &[crate::nn::CovariateNn],
 ) -> Result<(PkParamFn, Vec<String>), String> {
     // Covariates referenced anywhere in the block (including inside if-bodies
     // and condition expressions). Sorted for deterministic error messages.
@@ -2368,6 +2842,13 @@ fn build_pk_param_fn(
 
     let cov_names_for_lookup = referenced_covariates.clone();
 
+    // Snapshot the NN handles into the closure. Empty when no
+    // `[covariate_nn]` blocks are present, in which case the per-call
+    // forward-pass loop below is a no-op (just an empty `Vec<Vec<f64>>`
+    // alloc — cheap enough to skip the branch).
+    #[cfg(feature = "nn")]
+    let covariate_nns_owned: Vec<crate::nn::CovariateNn> = covariate_nns.to_vec();
+
     let pk_param_fn: PkParamFn = Box::new(
         move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
             // Materialise covariates into a Vec<f64> aligned with
@@ -2380,7 +2861,29 @@ fn build_pk_param_fn(
                 cov_vec[i] = covariates.get(name).copied().unwrap_or(0.0);
             }
             let mut vars = vec![0.0_f64; n_vars];
-            eval_statements_indexed(&stmts_owned, theta, eta, &cov_vec, &mut vars);
+
+            // Pre-compute each NN's forward output once per call. The
+            // indexed evaluator reads `nn_outputs[nn_idx][output_idx]` for
+            // every `Expression::NnOutput` it visits, so multiple `.CL`,
+            // `.V1`, … references on the same NN share this single forward.
+            #[cfg(feature = "nn")]
+            let nn_outputs: Vec<Vec<f64>> = covariate_nns_owned
+                .iter()
+                .map(|nn| {
+                    use crate::nn::CovariateMapper;
+                    let n_w = nn.mapper.n_weights();
+                    let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
+                    nn.mapper.forward_raw(weights, covariates).expect(
+                        "NN forward_raw failed in pk_param_fn: this indicates a \
+                         weight-offset/length wiring bug (missing covariates \
+                         are substituted with 0.0, not errored on)",
+                    )
+                })
+                .collect();
+            #[cfg(not(feature = "nn"))]
+            let nn_outputs: Vec<Vec<f64>> = Vec::new();
+
+            eval_statements_indexed(&stmts_owned, theta, eta, &cov_vec, &mut vars, &nn_outputs);
 
             let mut p = PkParams::default();
             if is_analytical_pk {
@@ -2428,6 +2931,14 @@ enum Expression {
     Power(Box<Expression>, Box<Expression>),
     /// `if (cond) then_expr else else_expr` — value-producing inline conditional.
     Conditional(Box<Condition>, Box<Expression>, Box<Expression>),
+    /// Dot-access on a `[covariate_nn NAME]` block's output, e.g.
+    /// `TYPICAL_PK.CL`. `nn_idx` indexes into `CompiledModel.covariate_nns`
+    /// (deterministic alphabetical order set at parse time); `output_idx`
+    /// indexes into the block's declared `outputs` list. Eval-time dispatch
+    /// reads the pre-computed forward output from a per-call cache in
+    /// `build_pk_param_fn` so multiple references to outputs of the same
+    /// NN share a single forward pass.
+    NnOutput { nn_idx: usize, output_idx: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -2488,26 +2999,40 @@ struct ParseCtx<'a> {
     /// Set to `false` for the ODE RHS parser, where state names and individual
     /// parameters are injected into the `vars` map at eval time instead.
     fallback_covariate: bool,
+    /// Per-NN-block (name, output_names) pairs in alphabetical order.
+    /// `nn_idx` in `Expression::NnOutput` indexes into this slice. Empty
+    /// when no `[covariate_nn]` block is present in the model (the
+    /// dot-access parser then errors on `FOO.BAR`).
+    nn_specs: &'a [(String, Vec<String>)],
 }
 
 impl<'a> ParseCtx<'a> {
     fn new(theta_names: &'a [String], eta_names: &'a [String], defined_vars: &'a [String]) -> Self {
+        const EMPTY_NN: &[(String, Vec<String>)] = &[];
         Self {
             theta_names,
             eta_names,
             defined_vars,
             fallback_covariate: true,
+            nn_specs: EMPTY_NN,
         }
     }
 
     fn ode(defined_vars: &'a [String]) -> Self {
         const EMPTY: &[String] = &[];
+        const EMPTY_NN: &[(String, Vec<String>)] = &[];
         Self {
             theta_names: EMPTY,
             eta_names: EMPTY,
             defined_vars,
             fallback_covariate: false,
+            nn_specs: EMPTY_NN,
         }
+    }
+
+    fn with_nn_specs(mut self, nn_specs: &'a [(String, Vec<String>)]) -> Self {
+        self.nn_specs = nn_specs;
+        self
     }
 }
 
@@ -2579,6 +3104,7 @@ fn eval_expression(
     eta: &[f64],
     covariates: &HashMap<String, f64>,
     vars: &HashMap<String, f64>,
+    nn_outputs: &[Vec<f64>],
 ) -> f64 {
     match expr {
         Expression::Literal(v) => *v,
@@ -2594,8 +3120,8 @@ fn eval_expression(
             0.0
         }
         Expression::BinOp(lhs, op, rhs) => {
-            let l = eval_expression(lhs, theta, eta, covariates, vars);
-            let r = eval_expression(rhs, theta, eta, covariates, vars);
+            let l = eval_expression(lhs, theta, eta, covariates, vars, nn_outputs);
+            let r = eval_expression(rhs, theta, eta, covariates, vars, nn_outputs);
             match op {
                 BinOp::Add => l + r,
                 BinOp::Sub => l - r,
@@ -2610,7 +3136,7 @@ fn eval_expression(
             }
         }
         Expression::UnaryFn(name, arg) => {
-            let v = eval_expression(arg, theta, eta, covariates, vars);
+            let v = eval_expression(arg, theta, eta, covariates, vars, nn_outputs);
             match name.as_str() {
                 "exp" => v.exp(),
                 "log" | "ln" => v.max(1e-30).ln(),
@@ -2633,16 +3159,34 @@ fn eval_expression(
             }
         }
         Expression::Power(base, exp) => {
-            let b = eval_expression(base, theta, eta, covariates, vars);
-            let e = eval_expression(exp, theta, eta, covariates, vars);
+            let b = eval_expression(base, theta, eta, covariates, vars, nn_outputs);
+            let e = eval_expression(exp, theta, eta, covariates, vars, nn_outputs);
             b.powf(e)
         }
         Expression::Conditional(cond, t, e) => {
-            if eval_condition(cond, theta, eta, covariates, vars) {
-                eval_expression(t, theta, eta, covariates, vars)
+            if eval_condition(cond, theta, eta, covariates, vars, nn_outputs) {
+                eval_expression(t, theta, eta, covariates, vars, nn_outputs)
             } else {
-                eval_expression(e, theta, eta, covariates, vars)
+                eval_expression(e, theta, eta, covariates, vars, nn_outputs)
             }
+        }
+        Expression::NnOutput { nn_idx, output_idx } => {
+            // Same per-call cache as the indexed evaluator. Callers
+            // populate `nn_outputs` from `NamedMlpMapper::forward_raw`
+            // (see the `tv_fn` closure for the eta=0 path). Out-of-bounds
+            // indices return 0.0 with a debug-assert so a logic bug
+            // surfaces in tests but doesn't crash release builds.
+            nn_outputs
+                .get(*nn_idx)
+                .and_then(|v| v.get(*output_idx))
+                .copied()
+                .unwrap_or_else(|| {
+                    debug_assert!(
+                        false,
+                        "NnOutput nn_idx={nn_idx} output_idx={output_idx} out of bounds in unindexed eval"
+                    );
+                    0.0
+                })
         }
     }
 }
@@ -2653,11 +3197,12 @@ fn eval_condition(
     eta: &[f64],
     covariates: &HashMap<String, f64>,
     vars: &HashMap<String, f64>,
+    nn_outputs: &[Vec<f64>],
 ) -> bool {
     match cond {
         Condition::Compare(l, op, r) => {
-            let lv = eval_expression(l, theta, eta, covariates, vars);
-            let rv = eval_expression(r, theta, eta, covariates, vars);
+            let lv = eval_expression(l, theta, eta, covariates, vars, nn_outputs);
+            let rv = eval_expression(r, theta, eta, covariates, vars, nn_outputs);
             match op {
                 CmpOp::Lt => lv < rv,
                 CmpOp::Le => lv <= rv,
@@ -2668,14 +3213,14 @@ fn eval_condition(
             }
         }
         Condition::And(l, r) => {
-            eval_condition(l, theta, eta, covariates, vars)
-                && eval_condition(r, theta, eta, covariates, vars)
+            eval_condition(l, theta, eta, covariates, vars, nn_outputs)
+                && eval_condition(r, theta, eta, covariates, vars, nn_outputs)
         }
         Condition::Or(l, r) => {
-            eval_condition(l, theta, eta, covariates, vars)
-                || eval_condition(r, theta, eta, covariates, vars)
+            eval_condition(l, theta, eta, covariates, vars, nn_outputs)
+                || eval_condition(r, theta, eta, covariates, vars, nn_outputs)
         }
-        Condition::Not(c) => !eval_condition(c, theta, eta, covariates, vars),
+        Condition::Not(c) => !eval_condition(c, theta, eta, covariates, vars, nn_outputs),
     }
 }
 
@@ -2692,6 +3237,7 @@ fn eval_expression_indexed(
     eta: &[f64],
     covariates: &[f64],
     vars: &[f64],
+    nn_outputs: &[Vec<f64>],
 ) -> f64 {
     match expr {
         Expression::Literal(v) => *v,
@@ -2704,8 +3250,8 @@ fn eval_expression_indexed(
             0.0
         }
         Expression::BinOp(lhs, op, rhs) => {
-            let l = eval_expression_indexed(lhs, theta, eta, covariates, vars);
-            let r = eval_expression_indexed(rhs, theta, eta, covariates, vars);
+            let l = eval_expression_indexed(lhs, theta, eta, covariates, vars, nn_outputs);
+            let r = eval_expression_indexed(rhs, theta, eta, covariates, vars, nn_outputs);
             match op {
                 BinOp::Add => l + r,
                 BinOp::Sub => l - r,
@@ -2720,7 +3266,7 @@ fn eval_expression_indexed(
             }
         }
         Expression::UnaryFn(name, arg) => {
-            let v = eval_expression_indexed(arg, theta, eta, covariates, vars);
+            let v = eval_expression_indexed(arg, theta, eta, covariates, vars, nn_outputs);
             match name.as_str() {
                 "exp" => v.exp(),
                 "log" | "ln" => v.max(1e-30).ln(),
@@ -2742,16 +3288,33 @@ fn eval_expression_indexed(
             }
         }
         Expression::Power(base, exp) => {
-            let b = eval_expression_indexed(base, theta, eta, covariates, vars);
-            let e = eval_expression_indexed(exp, theta, eta, covariates, vars);
+            let b = eval_expression_indexed(base, theta, eta, covariates, vars, nn_outputs);
+            let e = eval_expression_indexed(exp, theta, eta, covariates, vars, nn_outputs);
             b.powf(e)
         }
         Expression::Conditional(cond, t, e) => {
-            if eval_condition_indexed(cond, theta, eta, covariates, vars) {
-                eval_expression_indexed(t, theta, eta, covariates, vars)
+            if eval_condition_indexed(cond, theta, eta, covariates, vars, nn_outputs) {
+                eval_expression_indexed(t, theta, eta, covariates, vars, nn_outputs)
             } else {
-                eval_expression_indexed(e, theta, eta, covariates, vars)
+                eval_expression_indexed(e, theta, eta, covariates, vars, nn_outputs)
             }
+        }
+        Expression::NnOutput { nn_idx, output_idx } => {
+            // Reads from the per-call cache that `build_pk_param_fn`
+            // populates once per forward via `NamedMlpMapper::forward_raw`.
+            // Multiple references to outputs of the same NN therefore share
+            // a single forward pass.
+            nn_outputs
+                .get(*nn_idx)
+                .and_then(|v| v.get(*output_idx))
+                .copied()
+                .unwrap_or_else(|| {
+                    debug_assert!(
+                        false,
+                        "NnOutput nn_idx={nn_idx} output_idx={output_idx} out of bounds"
+                    );
+                    0.0
+                })
         }
     }
 }
@@ -2762,11 +3325,12 @@ fn eval_condition_indexed(
     eta: &[f64],
     covariates: &[f64],
     vars: &[f64],
+    nn_outputs: &[Vec<f64>],
 ) -> bool {
     match cond {
         Condition::Compare(l, op, r) => {
-            let lv = eval_expression_indexed(l, theta, eta, covariates, vars);
-            let rv = eval_expression_indexed(r, theta, eta, covariates, vars);
+            let lv = eval_expression_indexed(l, theta, eta, covariates, vars, nn_outputs);
+            let rv = eval_expression_indexed(r, theta, eta, covariates, vars, nn_outputs);
             match op {
                 CmpOp::Lt => lv < rv,
                 CmpOp::Le => lv <= rv,
@@ -2777,14 +3341,14 @@ fn eval_condition_indexed(
             }
         }
         Condition::And(l, r) => {
-            eval_condition_indexed(l, theta, eta, covariates, vars)
-                && eval_condition_indexed(r, theta, eta, covariates, vars)
+            eval_condition_indexed(l, theta, eta, covariates, vars, nn_outputs)
+                && eval_condition_indexed(r, theta, eta, covariates, vars, nn_outputs)
         }
         Condition::Or(l, r) => {
-            eval_condition_indexed(l, theta, eta, covariates, vars)
-                || eval_condition_indexed(r, theta, eta, covariates, vars)
+            eval_condition_indexed(l, theta, eta, covariates, vars, nn_outputs)
+                || eval_condition_indexed(r, theta, eta, covariates, vars, nn_outputs)
         }
-        Condition::Not(c) => !eval_condition_indexed(c, theta, eta, covariates, vars),
+        Condition::Not(c) => !eval_condition_indexed(c, theta, eta, covariates, vars, nn_outputs),
     }
 }
 
@@ -2799,11 +3363,12 @@ fn eval_statements_indexed(
     eta: &[f64],
     covariates: &[f64],
     vars: &mut [f64],
+    nn_outputs: &[Vec<f64>],
 ) {
     for s in stmts {
         match s {
             Statement::AssignIdx(idx, expr) => {
-                let v = eval_expression_indexed(expr, theta, eta, covariates, vars);
+                let v = eval_expression_indexed(expr, theta, eta, covariates, vars, nn_outputs);
                 if let Some(slot) = vars.get_mut(*idx) {
                     *slot = v;
                 }
@@ -2814,15 +3379,15 @@ fn eval_statements_indexed(
             } => {
                 let mut taken = false;
                 for (cond, body) in branches {
-                    if eval_condition_indexed(cond, theta, eta, covariates, vars) {
-                        eval_statements_indexed(body, theta, eta, covariates, vars);
+                    if eval_condition_indexed(cond, theta, eta, covariates, vars, nn_outputs) {
+                        eval_statements_indexed(body, theta, eta, covariates, vars, nn_outputs);
                         taken = true;
                         break;
                     }
                 }
                 if !taken {
                     if let Some(eb) = else_body {
-                        eval_statements_indexed(eb, theta, eta, covariates, vars);
+                        eval_statements_indexed(eb, theta, eta, covariates, vars, nn_outputs);
                     }
                 }
             }
@@ -2908,7 +3473,8 @@ fn resolve_expr_indices(
         | Expression::Theta(_)
         | Expression::Eta(_)
         | Expression::VariableIdx(_)
-        | Expression::CovariateIdx(_) => {}
+        | Expression::CovariateIdx(_)
+        | Expression::NnOutput { .. } => {}
     }
 }
 
@@ -2942,6 +3508,7 @@ fn eval_statements(
     vars: &mut HashMap<String, f64>,
     du: Option<&mut [f64]>,
     state_index: Option<&HashMap<String, usize>>,
+    nn_outputs: &[Vec<f64>],
 ) {
     // The `du` borrow has to be re-passed into each recursive sub-block, so
     // shuttle it through an Option that we re-grab on each iteration.
@@ -2949,7 +3516,7 @@ fn eval_statements(
     for s in stmts {
         match s {
             Statement::Assign(name, expr) => {
-                let v = eval_expression(expr, theta, eta, covariates, vars);
+                let v = eval_expression(expr, theta, eta, covariates, vars, nn_outputs);
                 vars.insert(name.clone(), v);
             }
             Statement::AssignIdx(_, _) => {
@@ -2960,7 +3527,7 @@ fn eval_statements(
                 // silently skip if they do (defensive).
             }
             Statement::DiffEq(name, expr) => {
-                let v = eval_expression(expr, theta, eta, covariates, vars);
+                let v = eval_expression(expr, theta, eta, covariates, vars, nn_outputs);
                 let idx = state_index
                     .and_then(|m| m.get(name).copied())
                     .expect("DiffEq encountered without state_index — internal error");
@@ -2974,7 +3541,7 @@ fn eval_statements(
             } => {
                 let mut taken = false;
                 for (cond, body) in branches {
-                    if eval_condition(cond, theta, eta, covariates, vars) {
+                    if eval_condition(cond, theta, eta, covariates, vars, nn_outputs) {
                         eval_statements(
                             body,
                             theta,
@@ -2983,6 +3550,7 @@ fn eval_statements(
                             vars,
                             du_opt.as_deref_mut(),
                             state_index,
+                            nn_outputs,
                         );
                         taken = true;
                         break;
@@ -2998,6 +3566,7 @@ fn eval_statements(
                             vars,
                             du_opt.as_deref_mut(),
                             state_index,
+                            nn_outputs,
                         );
                     }
                 }
@@ -3035,6 +3604,11 @@ enum Token {
     OrOr,
     Bang,
     Comma,
+    /// `.` — member-access operator, used today only by `[covariate_nn]`
+    /// dot-access syntax (`TYPICAL_PK.CL`). Decimal-point dots inside number
+    /// literals (e.g. `4.5`, `.5`) are absorbed by the number tokenizer
+    /// before this token is produced.
+    Dot,
     /// Logical line separator. Consumed only by the statement parser, where
     /// it acts as an "end of statement" marker. Newlines inside `(...)` and
     /// `[...]` are stripped by `strip_newlines_in_groups` so users can break
@@ -3206,7 +3780,30 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::Caret);
                 i += 1;
             }
-            c if c.is_ascii_digit() || c == '.' => {
+            // A `.` followed by a digit starts a decimal-only literal like `.5`.
+            // Standalone `.` (e.g. `TYPICAL_PK.CL`) is the member-access operator
+            // and is handled by a separate arm below.
+            '.' if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() => {
+                let start = i;
+                while i < chars.len()
+                    && (chars[i].is_ascii_digit()
+                        || chars[i] == '.'
+                        || chars[i] == 'e'
+                        || chars[i] == 'E')
+                {
+                    i += 1;
+                }
+                let num_str: String = chars[start..i].iter().collect();
+                let num: f64 = num_str
+                    .parse()
+                    .map_err(|_| format!("Bad number: {}", num_str))?;
+                tokens.push(Token::Number(num));
+            }
+            '.' => {
+                tokens.push(Token::Dot);
+                i += 1;
+            }
+            c if c.is_ascii_digit() => {
                 let start = i;
                 while i < chars.len()
                     && (chars[i].is_ascii_digit()
@@ -3380,6 +3977,42 @@ fn parse_atom(
                     return Err(format!("Missing closing parenthesis for function {}", name));
                 }
                 return Ok((Expression::UnaryFn(func_name, Box::new(arg)), p + 1));
+            }
+
+            // Check if it's an `[covariate_nn NAME]` output access: `NAME.OUTPUT`.
+            // Resolved at parse time into `Expression::NnOutput { nn_idx, output_idx }`
+            // so the evaluator can read the pre-computed forward output by index.
+            if pos + 1 < tokens.len() && tokens[pos + 1] == Token::Dot {
+                if let Some(nn_idx) = ctx.nn_specs.iter().position(|(n, _)| n == name) {
+                    let output_tok = tokens.get(pos + 2).ok_or_else(|| {
+                        format!("`{}.` is missing an output name after the dot", name)
+                    })?;
+                    let output_name = match output_tok {
+                        Token::Ident(s) => s,
+                        other => {
+                            return Err(format!(
+                                "`{}.` must be followed by an output name (identifier), got {:?}",
+                                name, other
+                            ));
+                        }
+                    };
+                    let outputs = &ctx.nn_specs[nn_idx].1;
+                    let output_idx = outputs
+                        .iter()
+                        .position(|o| o == output_name)
+                        .ok_or_else(|| {
+                            format!(
+                                "`{name}.{output_name}` is not declared as an output of \
+                                 [covariate_nn {name}]. Known outputs: {}",
+                                outputs.join(", ")
+                            )
+                        })?;
+                    return Ok((Expression::NnOutput { nn_idx, output_idx }, pos + 3));
+                }
+                // `NAME.X` where NAME is not a known NN — fall through to the
+                // identifier-classification chain. The `Dot` token will then
+                // be the next unexpected token; the caller will surface that
+                // as an expression-parse error.
             }
 
             // Check if it's a theta
@@ -4157,12 +4790,23 @@ mod tests {
         // Smoke test: every checked-in example must parse under the strict
         // [fit_options] rules. Guards against accidentally tightening a key
         // in apply_fit_option in a way that breaks a shipped example.
+        //
+        // When `--features nn` is off, files that declare a `[covariate_nn]`
+        // or `[dynamics_nn]` block are skipped — they're only valid under
+        // the feature gate. A cheap pre-scan of file contents handles this
+        // without splitting the example directory.
         let examples_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
         let mut seen = 0;
         for entry in std::fs::read_dir(&examples_dir).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().and_then(|s| s.to_str()) != Some("ferx") {
                 continue;
+            }
+            if !cfg!(feature = "nn") {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                if src.contains("[covariate_nn") || src.contains("[dynamics_nn") {
+                    continue;
+                }
             }
             seen += 1;
             if let Err(e) = parse_full_model_file(&path) {
@@ -4200,7 +4844,7 @@ mod tests {
         let en: Vec<String> = eta_names.iter().map(|s| s.to_string()).collect();
         let ctx = ParseCtx::new(&tn, &en, &[]);
         let stmts = parse_block_statements(line, ctx, StatementMode::Plain).ok()?;
-        let refs = detect_mu_refs(&stmts, &tn, &en);
+        let refs = detect_mu_refs(&stmts, &tn, &en, &[]);
         // Return the one detected mu-ref (if any). Tests assume a single line.
         refs.into_iter().next().map(|(_, v)| v)
     }
@@ -4315,7 +4959,7 @@ mod tests {
         ];
         let ctx = ParseCtx::new(&tn, &en, &[]);
         let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
-        let refs = detect_mu_refs(&stmts, &tn, &en);
+        let refs = detect_mu_refs(&stmts, &tn, &en, &[]);
         assert_eq!(refs.len(), 3);
         assert_eq!(refs["ETA_CL"].theta_name, "TVCL");
         assert_eq!(refs["ETA_V"].theta_name, "TVV");
@@ -5312,7 +5956,7 @@ mod tests {
         let theta = vec![5.0];
         let mut covs = HashMap::new();
         covs.insert("WT".to_string(), 80.0);
-        eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None);
+        eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None, &[]);
         assert!(
             (vars["CL"] - 6.0).abs() < 1e-12,
             "CL should pick the then-branch"
@@ -5320,7 +5964,7 @@ mod tests {
 
         covs.insert("WT".to_string(), 60.0);
         let mut vars2 = HashMap::new();
-        eval_statements(&stmts, &theta, &[], &covs, &mut vars2, None, None);
+        eval_statements(&stmts, &theta, &[], &covs, &mut vars2, None, None, &[]);
         assert!(
             (vars2["CL"] - 5.0).abs() < 1e-12,
             "CL should pick the else-branch"
@@ -5346,7 +5990,7 @@ if (WT > 70) {
             let mut covs = HashMap::new();
             covs.insert("WT".to_string(), wt);
             let mut vars = HashMap::new();
-            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None);
+            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None, &[]);
             assert!(
                 (vars["CL"] - expected).abs() < 1e-12,
                 "WT={} → expected CL={}",
@@ -5377,7 +6021,7 @@ if (X < 10) {
             let mut covs = HashMap::new();
             covs.insert("X".to_string(), x);
             let mut vars = HashMap::new();
-            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None);
+            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None, &[]);
             assert!(
                 (vars["CL"] - expected).abs() < 1e-12,
                 "X={x} should pick branch giving CL={expected}, got {}",
@@ -5406,7 +6050,7 @@ if (X < 10) {
             covs.insert("WT".to_string(), wt);
             covs.insert("AGE".to_string(), age);
             let mut vars = HashMap::new();
-            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None);
+            eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None, &[]);
             assert!(
                 (vars["CL"] - expected).abs() < 1e-12,
                 "sex={sex} wt={wt} age={age} expected CL={expected}, got {}",
@@ -6341,5 +6985,434 @@ if (1 > 0) {
             parse_full_model(src).is_err(),
             "[diffusion] on an analytical model must be an error"
         );
+    }
+
+    // ─── [covariate_nn NAME] block parsing ──────────────────────────────
+
+    /// Minimal full model with a `[covariate_nn]` block. Re-used across tests.
+    /// The base [parameters]/[individual_parameters] still use the analytical
+    /// form — this PR only registers the NN-weight thetas and stores the
+    /// mapper handle; it does not yet route PK params through the NN.
+    fn covariate_nn_model_src(nn_block: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.1
+
+{nn_block}
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(ADD)
+"#
+        )
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_covariate_nn_block_parses_and_appends_thetas() {
+        let src = covariate_nn_model_src(
+            "[covariate_nn TYPICAL_PK]\n  inputs = [WT, CRCL]\n  outputs = [CL, V]\n  layers = [4]\n  activation = tanh\n  output = softplus\n",
+        );
+        let model = parse_model_string(&src).expect("model must parse with --features nn");
+
+        // Mapper present and named correctly.
+        assert_eq!(model.covariate_nns.len(), 1);
+        let nn = &model.covariate_nns[0];
+        assert_eq!(nn.name, "TYPICAL_PK");
+        // 2 inputs -> 4 hidden -> 2 outputs:
+        // W_1: 4*2 = 8, b_1: 4, W_2: 2*4 = 8, b_2: 2 → total 22 weights.
+        let n_weights = 4 * 2 + 4 + 2 * 4 + 2;
+        use crate::nn::CovariateMapper;
+        assert_eq!(nn.mapper.n_weights(), n_weights);
+
+        // Auto-generated thetas land at the tail of the theta vector.
+        // Base thetas: TVCL, TVV. So weights_offset == 2.
+        assert_eq!(nn.weights_offset, 2);
+        assert_eq!(model.n_theta, 2 + n_weights);
+
+        // Theta-name convention is W_<NAME>_<l>_<i>_<j> / B_<NAME>_<l>_<i>.
+        let names: &[String] = &model.theta_names;
+        assert_eq!(names[0], "TVCL");
+        assert_eq!(names[1], "TVV");
+        assert_eq!(names[2], "W_TYPICAL_PK_1_1_1");
+        // Last name is the last bias of layer 2 (output layer, 2 outputs).
+        assert_eq!(names[names.len() - 1], "B_TYPICAL_PK_2_2");
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_covariate_nn_block_rejects_unknown_pk_output() {
+        let src = covariate_nn_model_src(
+            "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [NOT_A_PK_PARAM]\n  layers = [3]\n  activation = relu\n",
+        );
+        let err = parse_model_string(&src).expect_err("unknown PK output must error");
+        assert!(
+            err.contains("NOT_A_PK_PARAM"),
+            "error should name the bad output, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_covariate_nn_block_rejects_unknown_activation() {
+        let src = covariate_nn_model_src(
+            "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [CL]\n  layers = [3]\n  activation = quack\n",
+        );
+        let err = parse_model_string(&src).expect_err("bad activation must error");
+        assert!(err.contains("quack"), "error should name the bad activation, got: {err}");
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_covariate_nn_block_rejects_unknown_key() {
+        let src = covariate_nn_model_src(
+            "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [CL]\n  layers = [3]\n  activation = relu\n  not_a_real_key = 42\n",
+        );
+        let err = parse_model_string(&src).expect_err("unknown key must error");
+        assert!(
+            err.contains("not_a_real_key"),
+            "error should name the bad key, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_covariate_nn_block_missing_required_field() {
+        // Missing `layers`.
+        let src = covariate_nn_model_src(
+            "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [CL]\n  activation = relu\n",
+        );
+        let err = parse_model_string(&src).expect_err("missing layers must error");
+        assert!(err.contains("layers"), "error should mention `layers`, got: {err}");
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_multiple_covariate_nn_blocks_appear_in_sorted_order() {
+        // Two blocks; the second-declared one should still come first by
+        // alphabetical sort to keep theta-ordering reproducible.
+        let src = covariate_nn_model_src(
+            "[covariate_nn ZETA]\n  inputs = [WT]\n  outputs = [CL]\n  layers = [2]\n  activation = tanh\n\n\
+             [covariate_nn ALPHA]\n  inputs = [WT]\n  outputs = [V]\n  layers = [2]\n  activation = tanh\n",
+        );
+        let model = parse_model_string(&src).expect("two NN blocks must parse");
+        assert_eq!(model.covariate_nns.len(), 2);
+        assert_eq!(model.covariate_nns[0].name, "ALPHA");
+        assert_eq!(model.covariate_nns[1].name, "ZETA");
+        // ALPHA's weights are first; ZETA's start where ALPHA's end.
+        use crate::nn::CovariateMapper;
+        let alpha_weights = model.covariate_nns[0].mapper.n_weights();
+        assert_eq!(model.covariate_nns[1].weights_offset, 2 + alpha_weights);
+    }
+
+    /// When ferx-core is built without `--features nn`, a `[covariate_nn]`
+    /// block must produce a clear feature-gate error rather than being
+    /// silently ignored.
+    #[cfg(not(feature = "nn"))]
+    #[test]
+    fn test_covariate_nn_block_without_nn_feature_errors() {
+        let src = covariate_nn_model_src(
+            "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [CL]\n  layers = [2]\n  activation = tanh\n",
+        );
+        let err = parse_model_string(&src).expect_err("must error without --features nn");
+        assert!(
+            err.contains("nn"),
+            "error should mention the nn feature, got: {err}"
+        );
+    }
+
+    /// Sanity for the named-block parser extension itself (independent of the
+    /// NN feature). `[block_type NAME]` should be recognised and parsed.
+    #[test]
+    fn test_extract_blocks_recognizes_named_block_form() {
+        let src = "
+[parameters]
+  theta T1(1.0, 0.001, 10.0)
+
+[some_named_block FOO]
+  key = value
+";
+        let extracted = extract_blocks(src).unwrap();
+        // Unnamed block intact.
+        assert!(extracted.unnamed.contains_key("parameters"));
+        // Named block captured by type + instance.
+        let by_inst = extracted
+            .named
+            .get("some_named_block")
+            .expect("named block extracted");
+        let lines = by_inst.get("FOO").expect("instance FOO present");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "key = value");
+    }
+
+    // ─── [covariate_nn] dot-access + pk_param_fn dispatch (Phase A M1 step 3) ────
+
+    #[cfg(feature = "nn")]
+    fn covariate_nn_dotted_model_src() -> String {
+        // Two-output NN feeding both CL and V. Etas on the final PK params,
+        // matching the Phase A M2 mu-ref form. The fit-objective surface
+        // (method = nn_mse) isn't wired yet, so we only exercise the
+        // pk_param_fn closure here — that's the simulate path.
+        r#"
+[parameters]
+  theta TVKA(1.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma ADD ~ 0.1
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT, CRCL]
+  outputs = [CL, V]
+  layers = [4]
+  activation = tanh
+  output = softplus
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V  = TYPICAL_PK.V  * exp(ETA_V)
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ additive(ADD)
+"#
+        .to_string()
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_dot_access_parses_into_nn_output_node() {
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("dot-access must parse");
+        // 1 base theta (TVKA) + NN weights for a 2->4->2 net:
+        //   W_1: 4*2 = 8, b_1: 4, W_2: 2*4 = 8, b_2: 2 → 22 weights.
+        assert_eq!(model.n_theta, 1 + 22);
+        assert_eq!(model.covariate_nns.len(), 1);
+        assert_eq!(model.covariate_nns[0].name, "TYPICAL_PK");
+        // Weights start right after the user-declared base thetas.
+        assert_eq!(model.covariate_nns[0].weights_offset, 1);
+    }
+
+    /// Round-trip: call the closure with known theta values (including known
+    /// NN weights) and confirm the PK params it produces match what
+    /// `NamedMlpMapper::forward_raw` returns directly.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_pk_param_fn_dispatches_through_nn() {
+        use crate::nn::CovariateMapper;
+        use crate::types::{PK_IDX_CL, PK_IDX_V};
+
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("model parses");
+        let theta: Vec<f64> = model.default_params.theta.clone();
+        let eta = vec![0.0_f64, 0.0_f64]; // zero etas → PK params == NN typical values.
+        let mut cov = HashMap::new();
+        cov.insert("WT".to_string(), 70.0);
+        cov.insert("CRCL".to_string(), 95.0);
+
+        let pk = (model.pk_param_fn)(&theta, &eta, &cov);
+
+        // What the NN itself would emit, sliced from the same theta vector.
+        let nn = &model.covariate_nns[0];
+        let weights = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+        let nn_outputs = nn.mapper.forward_raw(weights, &cov).unwrap();
+
+        // pk_param_fn writes to PkParams by name: output[0] = CL, output[1] = V.
+        assert!((pk.values[PK_IDX_CL] - nn_outputs[0]).abs() < 1e-12);
+        assert!((pk.values[PK_IDX_V] - nn_outputs[1]).abs() < 1e-12);
+        // KA is a plain theta-only path.
+        assert!((pk.values[crate::types::PK_IDX_KA] - theta[0]).abs() < 1e-12);
+    }
+
+    /// Non-zero etas: the mu-ref composition `TYPICAL_PK.CL * exp(ETA_CL)`
+    /// must apply log-normal IIV on top of the NN typical value.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_pk_param_fn_composes_eta_on_top_of_nn_output() {
+        use crate::nn::CovariateMapper;
+        use crate::types::PK_IDX_CL;
+
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("model parses");
+        let theta = model.default_params.theta.clone();
+        let mut cov = HashMap::new();
+        cov.insert("WT".to_string(), 70.0);
+        cov.insert("CRCL".to_string(), 95.0);
+
+        let nn = &model.covariate_nns[0];
+        let weights = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+        let nn_outputs = nn.mapper.forward_raw(weights, &cov).unwrap();
+        let tv_cl = nn_outputs[0];
+
+        // eta = +0.3 → CL should be tv_cl * exp(0.3).
+        let pk = (model.pk_param_fn)(&theta, &[0.3_f64, 0.0_f64], &cov);
+        let expected = tv_cl * 0.3_f64.exp();
+        assert!(
+            (pk.values[PK_IDX_CL] - expected).abs() < 1e-10,
+            "expected {expected}, got {}",
+            pk.values[PK_IDX_CL]
+        );
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_dot_access_rejects_unknown_output() {
+        // GARBAGE is not in `outputs = [CL, V]`.
+        let src = r#"
+[parameters]
+  theta TVKA(1.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.1
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT]
+  outputs = [CL, V]
+  layers = [3]
+  activation = tanh
+
+[individual_parameters]
+  CL = TYPICAL_PK.GARBAGE * exp(ETA_CL)
+  V  = 50
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ additive(ADD)
+"#;
+        let err = parse_model_string(src).expect_err("unknown output must error");
+        assert!(
+            err.contains("GARBAGE"),
+            "error should name the bad output, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_dot_access_on_unknown_nn_name_falls_back_to_parse_error() {
+        // FOO is not a declared [covariate_nn] block. `FOO.CL` must error
+        // (the parser stops at the `.` it can't classify).
+        let src = r#"
+[parameters]
+  theta TVKA(1.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.1
+
+[individual_parameters]
+  CL = FOO.CL
+  V  = 50
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ additive(ADD)
+"#;
+        assert!(parse_model_string(src).is_err());
+    }
+
+    // ─── Fix 1 + fix 2: NN-anchored mu-ref detection + tv_fn parity ─────
+
+    /// Fix 1: `TYPICAL_PK.CL * exp(ETA_CL)` should be recognised as a
+    /// lognormal mu-ref, with `MuRef.theta_name = "TYPICAL_PK.CL"` (the
+    /// structured form). Downstream consumers that only know about plain
+    /// thetas silently fall back to FD; the M2 AD-aware consumer is a
+    /// follow-up.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_detect_mu_refs_recognises_nn_anchored_lognormal() {
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("model parses");
+        let cl_ref = model
+            .mu_refs
+            .get("ETA_CL")
+            .expect("ETA_CL must be detected as mu-referenced");
+        assert_eq!(cl_ref.theta_name, "TYPICAL_PK.CL");
+        assert!(
+            cl_ref.log_transformed,
+            "TYPICAL_PK.CL * exp(ETA_CL) is lognormal"
+        );
+        let v_ref = model.mu_refs.get("ETA_V").expect("ETA_V mu-referenced");
+        assert_eq!(v_ref.theta_name, "TYPICAL_PK.V");
+        assert!(v_ref.log_transformed);
+    }
+
+    /// Fix 1 follow-on: `eta_param_info` still classifies NN-anchored
+    /// patterns as `LogNormal` — the eta's statistical shape is unchanged;
+    /// only the anchor differs.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_eta_param_info_classifies_nn_anchored_lognormal() {
+        use crate::types::EtaParamType;
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("model parses");
+        let cl = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .expect("ETA_CL classification present");
+        assert_eq!(cl.param_type, EtaParamType::LogNormal);
+        let v = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_V")
+            .expect("ETA_V classification present");
+        assert_eq!(v.param_type, EtaParamType::LogNormal);
+    }
+
+    /// Fix 2: `tv_fn` (the eta=0 typical-value closure) must produce the
+    /// same values as the NN forward pass. Previously the unindexed
+    /// evaluator returned 0.0 for `NnOutput`, so `tv_fn` would have
+    /// silently produced zero TVs for NN-bearing models — a footgun for
+    /// the AD fast path the M2 PR will lean on.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn test_tv_fn_dispatches_through_nn() {
+        use crate::nn::CovariateMapper;
+        let src = covariate_nn_dotted_model_src();
+        let model = parse_model_string(&src).expect("model parses");
+        let theta = model.default_params.theta.clone();
+        let mut cov = HashMap::new();
+        cov.insert("WT".to_string(), 70.0);
+        cov.insert("CRCL".to_string(), 95.0);
+
+        let tv_fn = model.tv_fn.as_ref().expect("analytical model -> Some(tv_fn)");
+        let tvs = tv_fn(&theta, &cov);
+
+        // tv_fn returns values in `indiv_param_names` declaration order:
+        // CL, V, KA. At eta=0 the lognormal mu-ref `tv * exp(0)` collapses
+        // to tv, which equals the NN's raw output for CL and V.
+        let nn = &model.covariate_nns[0];
+        let weights = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+        let nn_outputs = nn.mapper.forward_raw(weights, &cov).unwrap();
+
+        assert!(
+            (tvs[0] - nn_outputs[0]).abs() < 1e-12,
+            "TV[CL] from tv_fn = {} vs NN output = {}",
+            tvs[0],
+            nn_outputs[0]
+        );
+        assert!(
+            (tvs[1] - nn_outputs[1]).abs() < 1e-12,
+            "TV[V] from tv_fn = {} vs NN output = {}",
+            tvs[1],
+            nn_outputs[1]
+        );
+        // KA = TVKA (plain theta path, unchanged).
+        assert!((tvs[2] - theta[0]).abs() < 1e-12);
     }
 }

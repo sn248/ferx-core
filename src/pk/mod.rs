@@ -443,6 +443,8 @@ mod tests {
             eta_param_info: Vec::new(),
             indiv_param_names: Vec::new(),
             theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
         }
     }
 

@@ -79,6 +79,19 @@ pub enum Activation {
 }
 
 impl Activation {
+    /// Lowercase identifier as used in the `.ferx` DSL
+    /// (`activation = tanh`). Symmetric round-trip with the parser.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Activation::Identity => "identity",
+            Activation::Relu => "relu",
+            Activation::Softplus => "softplus",
+            Activation::Tanh => "tanh",
+            Activation::Sigmoid => "sigmoid",
+            Activation::Exp => "exp",
+        }
+    }
+
     /// Apply elementwise. Uses `if`/`else` for AD safety.
     #[inline]
     pub fn apply(self, x: f64) -> f64 {
@@ -212,6 +225,22 @@ impl MlpMapper {
     /// Total number of weights + biases.
     pub fn n_weights(&self) -> usize {
         self.n_params
+    }
+
+    /// Full layer shape: `[n_input, n_hidden_1, ..., n_output]`.
+    pub fn layer_sizes(&self) -> &[usize] {
+        &self.layers
+    }
+
+    /// Hidden-layer activation (applied between every adjacent layer
+    /// except the output).
+    pub fn hidden_activation(&self) -> Activation {
+        self.hidden_activation
+    }
+
+    /// Output-layer activation (applied at the output).
+    pub fn output_activation(&self) -> Activation {
+        self.output_activation
     }
 
     /// Number of input features.
@@ -486,6 +515,38 @@ impl NamedMlpMapper {
         &self.mlp
     }
 
+    /// Names of the inputs in `inputs` order — i.e. the covariate keys this
+    /// mapper reads from a `&HashMap<String, f64>` on every forward pass.
+    pub fn input_names(&self) -> &[String] {
+        &self.input_names
+    }
+
+    /// Forward pass returning the raw output vector in *declaration order*
+    /// (the order of `output_names`), without routing through `PkParams`.
+    ///
+    /// `forward` writes results into PK slots via `name_to_index`, which is
+    /// what the fit / predict / simulate paths ultimately want. The parser,
+    /// however, needs to look up outputs by their position in the
+    /// `[covariate_nn]` block's `outputs` list (so the AST can carry a tiny
+    /// `output_idx` rather than a string slot name). This method is the
+    /// parser-facing variant.
+    ///
+    /// Missing covariates are substituted with `0.0` to match the rest of the
+    /// parser's expression evaluator (which uses `unwrap_or(0.0)` for missing
+    /// covariate lookups). The remaining error variants — `WeightCountMismatch`
+    /// / `InputCountMismatch` — only fire on genuine wiring bugs, so callers
+    /// can typically `.expect(...)` the result.
+    pub fn forward_raw(
+        &self,
+        weights: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Result<Vec<f64>, NnError> {
+        let x = self.build_input_vec_zero_fill(covariates);
+        self.mlp.forward(&x, weights)
+    }
+
+    /// Strict variant used by [`CovariateMapper::forward`] / `jacobian`: errors
+    /// out with `MissingCovariate` if any input name is absent.
     fn build_input_vec(&self, covariates: &HashMap<String, f64>) -> Result<Vec<f64>, NnError> {
         self.input_names
             .iter()
@@ -495,6 +556,15 @@ impl NamedMlpMapper {
                     .copied()
                     .ok_or_else(|| NnError::MissingCovariate(n.clone()))
             })
+            .collect()
+    }
+
+    /// Zero-fill variant used by [`Self::forward_raw`]: substitutes `0.0` for
+    /// any missing covariate, matching the parser's expression evaluator.
+    fn build_input_vec_zero_fill(&self, covariates: &HashMap<String, f64>) -> Vec<f64> {
+        self.input_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
             .collect()
     }
 }
@@ -534,6 +604,38 @@ impl CovariateMapper for NamedMlpMapper {
     fn output_names(&self) -> &[String] {
         &self.output_names
     }
+}
+
+// ---------------------------------------------------------------------------
+// CovariateNn — a parsed `[covariate_nn NAME]` block, ready to be
+// consumed by the fitting pipeline.
+// ---------------------------------------------------------------------------
+
+/// One instance of a `[covariate_nn NAME]` block, stored on `CompiledModel`.
+///
+/// The parser builds this and:
+///
+/// 1. registers the mapper's `n_weights()` weights as plain thetas in the
+///    optimizer parameter vector, with names of the form
+///    `W_<NAME>_<l>_<i>_<j>` / `B_<NAME>_<l>_<i>` (uppercased), starting
+///    at index [`weights_offset`](Self::weights_offset);
+/// 2. stores the resulting handle here so the fit / predict / simulate
+///    paths can slice out the relevant weights at runtime via
+///    `&theta[weights_offset..weights_offset + n_weights]`.
+///
+/// Multiple `[covariate_nn]` blocks per model are syntactically allowed by
+/// the parser (the `named` block map keys them by `NAME`), though Phase A M1
+/// only exercises the single-block case end-to-end.
+#[derive(Debug, Clone)]
+pub struct CovariateNn {
+    /// User-visible identifier from the block header (e.g. `TYPICAL_PK`).
+    /// Used in `[individual_parameters]` dot-access (`TYPICAL_PK.CL`).
+    pub name: String,
+    /// The mapper that translates `(covariates, weights) → PkParams`.
+    pub mapper: NamedMlpMapper,
+    /// Index into `ModelParameters::theta` where this NN's weight block
+    /// starts. The block has `mapper.n_weights()` contiguous entries.
+    pub weights_offset: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -755,6 +857,45 @@ mod tests {
         let mut out = PkParams::default();
         let err = mapper.forward(&weights, &covariates, &mut out).unwrap_err();
         assert!(matches!(err, NnError::MissingCovariate(ref n) if n == "CRCL"));
+    }
+
+    #[test]
+    fn forward_raw_substitutes_zero_for_missing_covariates() {
+        // `forward_raw` is the parser-facing entrypoint and must match the
+        // expression evaluator's `unwrap_or(0.0)` semantics — missing
+        // covariates become 0.0 inputs, not errors. Reference: this commit's
+        // fix to silent error-swallowing at NN dispatch sites.
+        let mapper = five_param_mapper();
+        let weights = vec![0.1; mapper.n_weights()];
+
+        let mut both = HashMap::new();
+        both.insert("WT".to_string(), 70.0);
+        both.insert("CRCL".to_string(), 0.0); // explicit zero for CRCL
+        let y_explicit = mapper.forward_raw(&weights, &both).unwrap();
+
+        let mut wt_only = HashMap::new();
+        wt_only.insert("WT".to_string(), 70.0);
+        let y_implicit = mapper.forward_raw(&weights, &wt_only).unwrap();
+
+        // Missing CRCL must produce identical outputs to CRCL = 0.0.
+        assert_eq!(y_explicit.len(), y_implicit.len());
+        for (a, b) in y_explicit.iter().zip(y_implicit.iter()) {
+            assert_relative_eq!(a, b, epsilon = 1e-15);
+        }
+    }
+
+    #[test]
+    fn forward_raw_surfaces_weight_count_mismatch() {
+        // `MissingCovariate` is no longer reachable via `forward_raw`, but
+        // genuine wiring bugs (wrong weight slice length) must still surface
+        // as errors so callers can `.expect(...)` them loudly.
+        let mapper = five_param_mapper();
+        let bad_weights = vec![0.0; mapper.n_weights() - 1];
+        let mut covariates = HashMap::new();
+        covariates.insert("WT".to_string(), 70.0);
+        covariates.insert("CRCL".to_string(), 100.0);
+        let err = mapper.forward_raw(&bad_weights, &covariates).unwrap_err();
+        assert!(matches!(err, NnError::WeightCountMismatch { .. }));
     }
 
     #[test]

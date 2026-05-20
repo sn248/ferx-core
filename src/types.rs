@@ -730,6 +730,16 @@ pub struct CompiledModel {
     /// Per-theta transformation: `theta_transform[i]` describes whether theta i
     /// is used on the natural (Identity), log, or logit scale. Length == n_theta.
     pub theta_transform: Vec<ThetaTransform>,
+    /// Parsed `[covariate_nn NAME]` blocks (one entry per block in the model
+    /// file). Empty when the `nn` feature is off or no block is present.
+    ///
+    /// Consumed by `build_pk_param_fn` and `tv_fn`: each NN's forward output is
+    /// pre-computed once per call and looked up by `Expression::NnOutput` via
+    /// the `NAME.OUTPUT` dot-access syntax. Weights live in `theta` starting at
+    /// `weights_offset` for `mapper.n_weights()` slots, so they participate in
+    /// the optimizer vector like any other theta.
+    #[cfg(feature = "nn")]
+    pub covariate_nns: Vec<crate::nn::CovariateNn>,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -1024,6 +1034,40 @@ pub struct FitResult {
     /// SHA-256 hex digest of the data file bytes at fit time. Same semantics
     /// as `model_hash`.
     pub data_hash: Option<String>,
+    /// One entry per `[covariate_nn NAME]` block in the model, populated by
+    /// `fit()` from `CompiledModel.covariate_nns`. Empty when the `nn`
+    /// feature is off or no block is declared. Output writers
+    /// (`write_estimates_yaml`, `print_results`, `.fitrx`) use this to
+    /// collapse the wall of per-weight thetas (`W_NN_l_i_j`, `B_NN_l_i`)
+    /// into a single readable `neural_networks:` summary section — see
+    /// `plans/dcm-and-low-dim-node.md` "Option E".
+    #[cfg(feature = "nn")]
+    pub neural_networks: Vec<NeuralNetworkInfo>,
+}
+
+/// Minimal per-NN metadata carried on `FitResult` so output writers can
+/// summarise NN weights without re-walking `theta_names` to detect them.
+#[cfg(feature = "nn")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NeuralNetworkInfo {
+    /// Block name from the model file (e.g. `TYPICAL_PK`).
+    pub name: String,
+    /// Layer shape including input and output dimensions
+    /// (e.g. `[2, 16, 5]` for 2 inputs → 16 hidden → 5 outputs).
+    pub shape: Vec<usize>,
+    /// Hidden-layer activation name (e.g. `"tanh"`, `"relu"`).
+    pub hidden_activation: String,
+    /// Output-layer activation name.
+    pub output_activation: String,
+    /// Total weight + bias count for this NN.
+    pub n_weights: usize,
+    /// Index into `FitResult.theta` (and `FitResult.theta_names`) where
+    /// this NN's contiguous weight block starts.
+    pub weights_offset: usize,
+    /// Input covariate names in declaration order.
+    pub input_names: Vec<String>,
+    /// PK output names in declaration order.
+    pub output_names: Vec<String>,
 }
 
 /// Options for fit()
@@ -1514,6 +1558,8 @@ pub(crate) mod test_helpers {
             parse_warnings: Vec::new(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
         }
     }
 }

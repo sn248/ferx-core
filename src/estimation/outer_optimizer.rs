@@ -708,9 +708,19 @@ fn optimize_nlopt(
         n_evals_cl.fetch_add(1, Ordering::Relaxed);
         if ofv < state.best_ofv {
             state.best_ofv = ofv;
-            *best_seen_cl.lock().unwrap() = Some((xs.to_vec(), ofv));
             if verbose {
                 eprintln!("Eval {:>4}: OFV = {:.6}", state.n_evals, ofv);
+            }
+        }
+        // `best_seen` is global across the primary run and any SLSQP fallback.
+        // Gate on the externally-tracked best (not `state.best_ofv`, which
+        // resets to INFINITY when the fallback starts fresh) so the first
+        // fallback eval at the drifted post-primary x0 can't clobber a
+        // better point found earlier.
+        {
+            let mut bs = best_seen_cl.lock().unwrap();
+            if bs.as_ref().is_none_or(|(_, prev)| ofv < *prev) {
+                *bs = Some((xs.to_vec(), ofv));
             }
         }
         // After updating best_ofv, check whether we've stalled. If yes,
@@ -975,9 +985,16 @@ fn optimize_nlopt(
             n_evals_cl2.fetch_add(1, Ordering::Relaxed);
             if ofv < state.best_ofv {
                 state.best_ofv = ofv;
-                *best_seen_cl2.lock().unwrap() = Some((xs.to_vec(), ofv));
                 if verbose {
                     eprintln!("Eval {:>4}: OFV = {:.6} (SLSQP)", state.n_evals, ofv);
+                }
+            }
+            // See `best_seen` comment in the primary closure — gate on the
+            // global accumulator, not `state.best_ofv` which is fresh here.
+            {
+                let mut bs = best_seen_cl2.lock().unwrap();
+                if bs.as_ref().is_none_or(|(_, prev)| ofv < *prev) {
+                    *bs = Some((xs.to_vec(), ofv));
                 }
             }
             if detect_stagnation(state, n) && verbose {

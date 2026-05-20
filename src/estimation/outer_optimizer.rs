@@ -72,6 +72,56 @@ pub fn optimize_population_warm(
 //  NLopt-based outer optimizer (matches Julia's NLopt path exactly)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// SLSQP overshoot guard for the scaled gradient.
+///
+/// NLopt LD_SLSQP starts each fit with its quasi-Newton Hessian set to
+/// identity, so the QP that produces its first step has an unconstrained
+/// solution d = -∇f, projected onto the box bounds. When |∇f|∞ is several
+/// times larger than the bound width — which is what the AD/analytical
+/// FOCE gradient added in PR #48 looks like on standard PK models (≈ 10²–10³
+/// in scaled log/Cholesky space) — the projected step pins every component
+/// to a corner of the box. The OFV at the corner explodes and SLSQP cannot
+/// recover; theta stays byte-identical to init for the rest of the budget.
+/// See issue #55.
+///
+/// This helper rescales `g` in place by a single scalar so that no component
+/// of the identity-Hessian Newton step exceeds its per-dimension step budget,
+/// where the budget is `clamp(half_width, 0.1, 1.0)` in scaled space. The
+/// [0.1, 1.0] clamp keeps the cap effective on very narrow bounds (where
+/// half-width alone would paralyse it — notably fixed parameters with
+/// half-width 0) and on very wide log/Cholesky bounds (40+ units on some
+/// omega/sigma dims, where an uncapped budget would let the gradient
+/// magnitude through unchanged). For non-fixed parameters with `half_width <
+/// 0.1` the post-cap step can exceed half-width by a small constant, which
+/// is benign because the dimension itself is narrow.
+///
+/// The rescale is uniform across components, so the descent direction is
+/// unchanged.
+///
+/// Returns true if the cap fired (gradient was rescaled), false otherwise.
+/// LBFGS/MMA have line-search-style safeguards and BOBYQA is derivative-free,
+/// so this is only applied on the SLSQP path.
+pub(crate) fn cap_slsqp_gradient(g: &mut [f64], lower_s: &[f64], upper_s: &[f64]) -> bool {
+    debug_assert_eq!(g.len(), lower_s.len());
+    debug_assert_eq!(g.len(), upper_s.len());
+    let mut worst_ratio = 0.0_f64;
+    for i in 0..g.len() {
+        let budget = ((upper_s[i] - lower_s[i]).abs() * 0.5).clamp(0.1, 1.0);
+        let ratio = g[i].abs() / budget;
+        if ratio > worst_ratio {
+            worst_ratio = ratio;
+        }
+    }
+    if worst_ratio > 1.0 {
+        for gi in g.iter_mut() {
+            *gi /= worst_ratio;
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Dispatch to the IOV-aware or standard population NLL based on model.n_kappa.
 /// `kappas` is ignored (may be empty) when `model.n_kappa == 0`.
 pub(crate) fn pop_nll(
@@ -637,6 +687,9 @@ fn optimize_nlopt(
                 sq += gi * gi;
             }
             grad_norm_for_trace = Some(sq.sqrt());
+            if matches!(algo, nlopt::Algorithm::Slsqp) {
+                cap_slsqp_gradient(g, &lower_s, &upper_s);
+            }
         }
 
         // Update state
@@ -898,6 +951,9 @@ fn optimize_nlopt(
                     sq += gi * gi;
                 }
                 grad_norm_for_trace = Some(sq.sqrt());
+                // SLSQP overshoot guard (issue #55) — this fallback
+                // closure is unconditionally SLSQP.
+                cap_slsqp_gradient(g, &lower_s, &upper_s);
             }
 
             state.cached_etas = ehs;
@@ -2014,5 +2070,147 @@ mod tests {
                 fd_grad[j],
             );
         }
+    }
+
+    // ── SLSQP overshoot guard tests (issue #55) ────────────────────────────
+    //
+    // NLopt LD_SLSQP starts every fit with its quasi-Newton Hessian set to
+    // identity; the QP's unconstrained first step is therefore d = -∇f. The
+    // AD/analytical FOCE gradient introduced in PR #48 has inf-norm ≈ 10²–10³
+    // on standard PK models, while the scaled bound width is ≈ 3–9, so the
+    // projected step lands at a corner of the box and the OFV explodes. The
+    // `cap_slsqp_gradient` helper rescales `g` by a single scalar so the
+    // would-be Newton step fits inside the box on every dimension.
+
+    /// Cap fires when the gradient inf-norm exceeds the per-dimension
+    /// step budget, and the cap is a uniform rescale (preserves direction
+    /// and relative magnitudes between components).
+    #[test]
+    fn test_cap_slsqp_gradient_uniformly_rescales_when_huge() {
+        // Bounds chosen so each dimension's budget = clamp(half-width, 0.1, 1.0).
+        //   i=0: width=2.0 → budget = clamp(1.0, …) = 1.0
+        //   i=1: width=4.0 → budget = clamp(2.0, …) = 1.0 (clamped to 1.0)
+        //   i=2: width=0.2 → budget = clamp(0.1, …) = 0.1 (clamped to 0.1)
+        let lower = vec![-1.0, -2.0, -0.1];
+        let upper = vec![1.0, 2.0, 0.1];
+
+        // Gradient with inf-norm 200 at the third component → worst_ratio = 200/0.1 = 2000.
+        let mut g = vec![10.0, 100.0, 200.0];
+        let g_before = g.clone();
+        let fired = cap_slsqp_gradient(&mut g, &lower, &upper);
+        assert!(fired, "cap should have fired for huge gradient");
+
+        // Direction preserved: g[i] / g_before[i] is the same scalar across i.
+        let scalar0 = g[0] / g_before[0];
+        let scalar1 = g[1] / g_before[1];
+        let scalar2 = g[2] / g_before[2];
+        assert!(
+            (scalar0 - scalar1).abs() < 1e-12 && (scalar1 - scalar2).abs() < 1e-12,
+            "cap should be a uniform rescale: scalars {scalar0}, {scalar1}, {scalar2}",
+        );
+
+        // Inf-norm relative to per-dim budget should be exactly 1.0 after capping
+        // (the dimension that drove the rescale is now at its budget).
+        let after_inf_ratio = (g[0].abs() / 1.0)
+            .max(g[1].abs() / 1.0)
+            .max(g[2].abs() / 0.1);
+        assert!(
+            (after_inf_ratio - 1.0).abs() < 1e-12,
+            "post-cap inf-norm ratio should equal 1.0, got {after_inf_ratio}",
+        );
+    }
+
+    /// Cap is a no-op when the gradient is already within budget — preserves
+    /// SLSQP convergence behaviour once it's in the basin of the optimum.
+    #[test]
+    fn test_cap_slsqp_gradient_noop_when_within_budget() {
+        let lower = vec![-1.0, -2.0];
+        let upper = vec![1.0, 2.0];
+        // Per-dim budgets are both clamped to 1.0; gradient inf-norm = 0.5 < 1.0.
+        let mut g = vec![0.5, -0.3];
+        let g_before = g.clone();
+        let fired = cap_slsqp_gradient(&mut g, &lower, &upper);
+        assert!(!fired, "cap should not fire for in-budget gradient");
+        assert_eq!(g, g_before, "in-budget gradient must be untouched");
+    }
+
+    /// Even when one dimension has very wide bounds (a typical pattern in
+    /// log-Cholesky omega/sigma packing, where bounds span 10+ units), the
+    /// budget is clamped to 1.0 so the cap still fires.
+    #[test]
+    fn test_cap_slsqp_gradient_clamps_wide_bounds_to_unit_budget() {
+        // Wide bounds: half-width = 5 → budget clamped to 1.0.
+        let lower = vec![-10.0, -10.0];
+        let upper = vec![10.0, 10.0];
+        let mut g = vec![5.0, 0.0];
+        let fired = cap_slsqp_gradient(&mut g, &lower, &upper);
+        assert!(fired, "cap should fire: budget clamped to 1.0, |g_max| = 5");
+        // Worst ratio = 5/1 = 5 → divide all by 5 → g[0] becomes 1.0.
+        assert!(
+            (g[0] - 1.0).abs() < 1e-12,
+            "g[0] post-cap should be 1.0, got {}",
+            g[0]
+        );
+        assert_eq!(g[1], 0.0);
+    }
+
+    /// Regression test for the original issue #55 symptom: SLSQP optimizing
+    /// a multi-theta mu-referenced FOCEI fit terminated with theta byte-
+    /// identical to init. The cap doesn't restore SLSQP to LBFGS's optimum
+    /// (the QP is still less aggressive than a line-search method on this
+    /// objective), but it does guarantee meaningful movement and a real OFV
+    /// improvement — the failure mode of "looks converged, didn't run".
+    ///
+    /// Gated under `slow-tests` because it calls fit() to convergence.
+    #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
+    fn test_slsqp_moves_on_mu_referenced_two_cpt_oral_cov() {
+        use crate::api::fit_from_files;
+        use crate::types::{EstimationMethod, FitOptions, Optimizer};
+
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            optimizer: Optimizer::Slsqp,
+            outer_maxiter: 200,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let model_path = "examples/two_cpt_oral_cov.ferx";
+        let data_path = "data/two_cpt_oral_cov.csv";
+        let result = fit_from_files(model_path, data_path, None, Some(opts))
+            .expect("fit should succeed");
+
+        // Initial theta from the .ferx file: [4.0, 40.0, 8.0, 80.0, 1.0, 0.6, 0.3].
+        let init = [4.0, 40.0, 8.0, 80.0, 1.0, 0.6, 0.3];
+        let max_rel_delta = result
+            .theta
+            .iter()
+            .zip(init.iter())
+            .map(|(t, i)| ((t - i) / i).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_rel_delta > 0.01,
+            "SLSQP didn't move (max relative theta change = {:.4e}); \
+             this is the issue #55 byte-identical-theta regression.\n\
+             theta = {:?}\ninit  = {:?}",
+            max_rel_delta,
+            result.theta,
+            init,
+        );
+
+        // OFV at init on this model + data is around -1040; LBFGS finds
+        // ≈ -1198. SLSQP-with-cap reaches ≈ -1182. Assert at least a
+        // 100-unit OFV improvement so we catch silent regressions where
+        // SLSQP only moves by a hair.
+        assert!(
+            result.ofv < -1140.0,
+            "SLSQP OFV = {:.2} is too close to init (-1040); cap may be \
+             overly aggressive and throttling convergence.",
+            result.ofv,
+        );
     }
 }

@@ -1215,6 +1215,15 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
             n_eta
         ));
     }
+    // `init_as_sd` (issue #5): backward-compat empty vec is fine, but any
+    // other non-matching length is a corrupt bundle — don't silently pad it.
+    if !w.omega.init_as_sd.is_empty() && w.omega.init_as_sd.len() != n_eta {
+        return bail(format!(
+            "omega.init_as_sd ({}) does not match omega.matrix dim ({})",
+            w.omega.init_as_sd.len(),
+            n_eta
+        ));
+    }
 
     let n_sigma = w.sigma.estimates.len();
     if w.sigma.names.len() != n_sigma {
@@ -1237,6 +1246,26 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
             w.sigma.types.len(),
             n_sigma
         ));
+    }
+    if !w.sigma.init_as_sd.is_empty() && w.sigma.init_as_sd.len() != n_sigma {
+        return bail(format!(
+            "sigma.init_as_sd ({}) does not match sigma.estimates ({})",
+            w.sigma.init_as_sd.len(),
+            n_sigma
+        ));
+    }
+    // IOV init_as_sd: same backward-compat rule as omega/sigma. Only validate
+    // when an `iov` section is present (otherwise there's no n_kappa to match
+    // against).
+    if let Some(iov) = &w.iov {
+        let n_kappa = iov.kappa_names.len();
+        if !iov.kappa_init_as_sd.is_empty() && iov.kappa_init_as_sd.len() != n_kappa {
+            return bail(format!(
+                "iov.kappa_init_as_sd ({}) does not match iov.kappa_names ({})",
+                iov.kappa_init_as_sd.len(),
+                n_kappa
+            ));
+        }
     }
     Ok(())
 }
@@ -1294,14 +1323,15 @@ fn wire_to_fit_result(
         omega_iov_param_corr,
     ) = match w.iov {
         Some(iov) => {
-            // Older .fitrx bundles (pre-issue #5) wrote no init_as_sd flag —
-            // serde_default leaves an empty vec there; pad to match the
-            // kappa diagonal so downstream code can index it uniformly.
+            // `validate_parallel_lengths` has already ensured that
+            // `kappa_init_as_sd` is either empty (pre-issue-#5 bundle) or
+            // exactly `n_kappa` long. Promote the empty case to all-false so
+            // downstream code can index it uniformly with `kappa_names`.
             let n_k = iov.kappa_names.len();
-            let init_as_sd = if iov.kappa_init_as_sd.len() == n_k {
-                iov.kappa_init_as_sd
-            } else {
+            let init_as_sd = if iov.kappa_init_as_sd.is_empty() {
                 vec![false; n_k]
+            } else {
+                iov.kappa_init_as_sd
             };
             (
                 Some(iov.omega_iov.into_dmatrix()?),
@@ -1329,21 +1359,22 @@ fn wire_to_fit_result(
         None => (None, None, None, None, None),
     };
 
-    // Pre-issue-#5 .fitrx files have no `init_as_sd` field; serde_default
-    // leaves an empty vec there, which we promote to all-false to match the
-    // eta/sigma cardinality. Computed up-front because the FitResult literal
-    // below moves `w.omega.names` and `w.sigma.names` into other fields.
+    // `validate_parallel_lengths` has already ensured that omega/sigma
+    // `init_as_sd` are either empty (pre-issue-#5 bundle) or exactly the
+    // expected length. Promote the empty case to all-false here. Computed
+    // up-front because the FitResult literal below moves `w.omega.names`
+    // and `w.sigma.names` into other fields.
     let n_eta_w = w.omega.names.len();
     let n_sigma_w = w.sigma.names.len();
-    let omega_init_as_sd_resolved = if w.omega.init_as_sd.len() == n_eta_w {
-        std::mem::take(&mut w.omega.init_as_sd)
-    } else {
+    let omega_init_as_sd_resolved = if w.omega.init_as_sd.is_empty() {
         vec![false; n_eta_w]
-    };
-    let sigma_init_as_sd_resolved = if w.sigma.init_as_sd.len() == n_sigma_w {
-        std::mem::take(&mut w.sigma.init_as_sd)
     } else {
+        std::mem::take(&mut w.omega.init_as_sd)
+    };
+    let sigma_init_as_sd_resolved = if w.sigma.init_as_sd.is_empty() {
         vec![false; n_sigma_w]
+    } else {
+        std::mem::take(&mut w.sigma.init_as_sd)
     };
 
     Ok(FitResult {

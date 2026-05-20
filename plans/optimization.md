@@ -1,4 +1,4 @@
-# ferx-core Optimization Task Plan (Updated 2026-05-19)
+# ferx-core Optimization Task Plan (Updated 2026-05-20)
 
 This file is for use with Claude Code in the `ferx-core` repository.
 Read `CLAUDE.md` first before starting any step.
@@ -11,9 +11,10 @@ written.
 
 ---
 
-## Progress Summary (as of 2026-05-19)
+## Progress Summary (as of 2026-05-20)
 
-All steps completed in a single day (2026-05-19). Steps 5b, 7, and 8 remain.
+All optimization steps completed on 2026-05-19. Steps 5b, 6b, 7, and 8 remain.
+Since 2026-05-19, four non-optimization PRs landed: #53 (NN-DCM feature), #58 (SLSQP overshoot fix), #57 (variance scale / `(sd)` annotation), #54 (PR-finding fix). None affect the remaining steps.
 
 | Step | PR | What | Why | What it adds |
 |------|----|------|-----|--------------|
@@ -26,7 +27,7 @@ All steps completed in a single day (2026-05-19). Steps 5b, 7, and 8 remain.
 | **9** — Student-t SIR proposal | [#41](https://github.com/FeRx-NLME/ferx-core/pull/41) | Replace MVN proposal in SIR with multivariate Student-t (ν=5) | Normal proposal has thin tails; ESS collapses for parameters near boundaries (Ω variances, constrained θ) | Higher ESS without increasing `sir_samples`; more reliable 95% CIs for boundary-adjacent parameters |
 | **10** — Parallel multi-start | [#42](https://github.com/FeRx-NLME/ferx-core/pull/42) | Run N independent full optimizations from perturbed initials in parallel via rayon; return lowest OFV | Local minima are the most common practical failure mode for nonlinear elimination, full-block Ω, and covariate models | On an 8-core machine, `n_starts = 8` gives ~8× lower probability of a local minimum at the same wall-clock cost |
 
-**Remaining:** Step 5b (IOV analytical gradient, requires Step 5 ✅), Step 7 (GN → trust-region subproblem replacing LM damping, requires Step 6 ✅), Step 8 (HMC proposals in SAEM E-step, requires Steps 3 ✅ and 4 ✅).
+**Remaining:** Step 5b (IOV analytical gradient, requires Step 5 ✅), Step 6b (eliminate double inner-solve in trust-region `cost()`, requires Step 6 ✅), Step 7 (GN → trust-region subproblem replacing LM damping, requires Steps 6 ✅ + 6b ✅), Step 8 (HMC proposals in SAEM E-step, requires Steps 3 ✅ and 4 ✅).
 
 ---
 
@@ -168,11 +169,32 @@ Only now write code. Implement the updated plan from Phase B.
 
 1. Make changes file by file.
 2. Run `cargo check` after each file to catch type errors early.
-3. Add tests as you go, not at the end. Every new function gets a unit test
-   in the same file's `tests` module before the function is considered done.
+3. Add tests as you go, not at the end. Follow the three-tier structure from
+   `CLAUDE.md`:
+   - **Tier 1 (unit, `src/`)** — Every new helper function (gradient correctness
+     check, budget logic, cache hit/miss, leapfrog step) gets an inline
+     `#[cfg(test)] mod tests` block in the same `.rs` file. These must not call
+     `fit()`. Run with `cargo test --lib`.
+   - **Tier 2 (integration, `tests/*.rs`)** — When the step introduces a new
+     public-API behaviour (new `FitOptions` field, new optimizer variant, new
+     estimation path), add an integration test that calls `fit()` with a low
+     `outer_maxiter` (≤ 30) and asserts sane shape/non-panic/non-NaN — **not**
+     convergence. These are compile-checked on every PR. See `tests/new_optimizers.rs`
+     for the established pattern (`data_and_model()`, `base_options()`, low
+     `outer_maxiter`).
+   - **Tier 3 (slow convergence, `tests/*.rs`)** — Full population fits to
+     convergence (OFV comparison, SE accuracy, iteration count comparison) must
+     be gated:
+     ```rust
+     #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+     ```
+     These run nightly and on pushes to `main` that touch estimation code.
+     Per-step "Test" sections below that say "OFV must match baseline" or
+     "run N times" describe Tier 3 tests.
 4. Run `cargo clippy` — fix any warnings before moving on.
-5. Run `cargo test --lib` — all tests must pass before considering the step
-   complete.
+5. Run `cargo test --lib` — all Tier 1 tests must pass before considering the
+   step complete. Tier 2 tests are checked via `cargo check --tests` (they must
+   compile; they run nightly).
 
 ### Phase E — Verification Against Goals
 
@@ -441,7 +463,7 @@ exact.
 
 ## Step 4 — AD Gradient for SAEM M-Step (Theta and Sigma)
 
-**Status: ❌ NOT STARTED**
+**Status: ✅ DONE — merged via PR #49.**
 
 **Requires: Step 3 complete. Requires PR #22 merged.**
 
@@ -511,7 +533,7 @@ model evaluations.
 
 ## Step 5 — AD Gradient for FOCE/FOCEI Outer Optimizer
 
-**Status: 🔶 PARTIAL**
+**Status: ✅ DONE — merged via PR #48.**
 
 **Requires: Step 3 complete. Requires PR #22 merged.**
 
@@ -638,12 +660,21 @@ The gradients follow the same formula as the non-IOV case:
 
 ### Test
 
-Add a gradient test analogous to `test_outer_ad_gradient_block_omega` but with
-`omega_iov` set and multiple occasions per subject. Verify that the IOV
-analytical gradient matches population-level central FD to within `1e-4`.
+**Tier 1 (unit, `src/estimation/gauss_newton.rs`):** Add a unit test analogous
+to `test_outer_ad_gradient_block_omega` but with `omega_iov` set and multiple
+occasions per subject. Verify that the IOV analytical gradient matches
+population-level central FD to within `1e-4`. Also update or supersede
+`test_outer_ad_gradient_fd_fallback_path` to confirm the analytical path is
+now taken for non-ODE IOV models.
 
-Also verify that `test_outer_ad_gradient_fd_fallback_path` is superseded (or
-update it to confirm the analytical path is now taken for non-ODE IOV).
+**Tier 2 (integration, `tests/new_optimizers.rs` or a new `tests/iov.rs`):**
+Add a test that calls `fit()` on an IOV model with `outer_maxiter = 5`, asserts
+no panic and non-NaN OFV — confirms the IOV analytical gradient path is wired
+into the outer optimizer without running to convergence.
+
+**Tier 3 (slow, same file):** Gate a full IOV convergence run with
+`#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]`.
+Assert OFV matches the central-FD baseline to within 0.01.
 
 ### Expected gain
 
@@ -748,11 +779,101 @@ average: 7× reduction in total CG cost per outer iteration.
 
 ---
 
+## Step 6b — Eliminate Double Inner-Solve in Trust-Region `cost()`
+
+**Status: ❌ NOT STARTED**
+
+**Requires: Step 6 complete.**
+
+### Background
+
+Flagged in the PR #50 review as a known follow-up. Within each argmin TR
+iteration, argmin calls `cost()` and then `gradient()` on the same parameter
+vector. `CostFunction::cost()` calls `run_inner()` independently — it never
+writes into `grad_cache`. So `compute_ad_grads()` gets a cache miss when
+`gradient()` fires next, and the inner loop (EBE solve) runs a second time for
+the same `x`. This doubles inner-solve cost per outer iteration.
+
+### What to do
+
+In `src/estimation/trust_region.rs`, modify `CostFunction::cost()` to populate
+`grad_cache` with the `(etas, h_mats)` from its `run_inner()` call — without
+yet computing `per_subj_grads` (which is the expensive AD part). Store a
+sentinel that marks the EBEs as warm but gradients as not yet computed:
+
+```rust
+impl CostFunction for FoceiProblem<'_> {
+    fn cost(&self, p: &Vec<f64>) -> Result<f64, Error> {
+        let (etas, h_mats) = self.run_inner(p);
+        // Pre-warm the cache so gradient() on the same x skips run_inner().
+        *self.grad_cache.lock().unwrap() = Some(GradCache {
+            x: p.clone(),
+            etas: etas.clone(),
+            h_mats: h_mats.clone(),
+            per_subj_grads: vec![],  // empty signals "EBEs ready, AD not yet done"
+        });
+        Ok(self.ofv_fixed(p, &etas, &h_mats))
+    }
+}
+```
+
+Then in `compute_ad_grads()`, when a cache hit has `per_subj_grads.is_empty()`,
+skip `run_inner()` but still compute the AD gradient pass using the cached
+`etas` and `h_mats`:
+
+```rust
+fn compute_ad_grads(&self, x: &[f64]) -> (...) {
+    let cached = {
+        let cache = self.grad_cache.lock().unwrap();
+        cache.as_ref().filter(|c| c.x == x).map(|c| (c.etas.clone(), c.h_mats.clone(), c.per_subj_grads.clone()))
+    };
+    let (etas, h_mats, existing_grads) = cached.unzip_or_else(|| {
+        let (e, h) = self.run_inner(x);
+        (e, h, vec![])
+    });
+    if !existing_grads.is_empty() {
+        return (etas, h_mats, existing_grads);
+    }
+    // compute per_subj_grads via subject_nll_pop_grad ...
+    // write full cache entry and return
+}
+```
+
+The exact implementation may differ from the sketch above — read `compute_ad_grads`
+carefully and adjust to match the actual control flow.
+
+### Files to touch
+- `src/estimation/trust_region.rs` only
+
+### Test
+
+**Tier 1 (unit, `src/estimation/trust_region.rs`):** Add a unit test that
+constructs a `FoceiProblem` directly and asserts that calling `cost()` followed
+by `gradient()` on the same `x` leaves `grad_cache` in a state where
+`per_subj_grads` is populated after `gradient()` and that `run_inner` was not
+called a second time. A simple approach: check that `compute_ad_grads` returns
+the cache-warmed path by asserting `grad_cache.x == x` before `gradient()` is
+called (i.e. `cost()` pre-warmed it). The OFV from `cost()` and the OFV
+recomputed from the cached EBEs must agree to f64 precision.
+
+**Tier 3 (slow, `tests/new_optimizers.rs`):** Gate a full warfarin
+`optimizer = trust_region` convergence run with the `slow-tests` feature.
+Assert OFV matches the SLSQP baseline to within 0.01. This is a correctness
+check — the cache change must not alter results.
+
+### Expected gain
+
+Halves the inner-solve count per TR outer iteration. For ODE models where each
+inner solve is expensive (RK45 per subject), this is a meaningful wall-clock
+improvement. For analytical PK models the gain is smaller but still measurable.
+
+---
+
 ## Step 7 — Natural Gradient: BHHH Hessian Inside the GN Trust-Region Step
 
 **Status: ❌ NOT STARTED**
 
-**Requires: Steps 3 and 6 complete.**
+**Requires: Steps 3, 6, and 6b complete.**
 
 ### What to do
 
@@ -787,11 +908,25 @@ the same subproblem solver is reused.
 - `src/estimation/trust_region.rs` (expose subproblem solver as a reusable `pub fn`)
 
 ### Test
-Run warfarin with `method = gn`. Compare outer iteration count against the LM version.
-OFV must match LM baseline to within 0.01.
 
-Run `two_cpt_oral_cov.ferx` with weight and creatinine clearance covariates.
-Compare iteration counts against `method = focei` and the old `method = gn`.
+**Tier 1 (unit, `src/estimation/gauss_newton.rs`):** Add a unit test for the
+new `solve_trust_region_subproblem` pub fn exposed from `trust_region.rs`.
+Given a simple 2×2 BHHH matrix and gradient, verify the returned step has
+norm ≤ trust radius and improves the quadratic model. Also test the ρ ratio
+update: assert radius expands for ρ > 0.75 and shrinks for ρ ≤ 0.25.
+
+**Tier 2 (integration, `tests/new_optimizers.rs`):** Add a non-convergence test
+that calls `fit()` with `method = gn` and `outer_maxiter = 5`, asserts no panic
+and non-NaN OFV — confirms the TR subproblem wiring compiles and runs without
+diverging on warfarin.
+
+**Tier 3 (slow, `tests/new_optimizers.rs` or new `tests/gn_convergence.rs`):**
+Gate two convergence tests with `#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]`:
+1. Warfarin `method = gn`: OFV must match LM-damping baseline to within 0.01;
+   compare outer iteration count.
+2. `two_cpt_oral_cov.ferx` `method = gn` vs `method = focei`: compare iteration
+   counts to confirm the TR step reduces wasted steps on weakly-identified
+   covariate directions.
 
 ### Expected gain
 The LM damping factor is a scalar approximation to the trust radius — it treats
@@ -868,11 +1003,25 @@ in the Enzyme path), fall back to MH and emit a warning in `FitResult.warnings`.
 - `docs/src/model-file/fit-options.md`
 
 ### Test
-Run warfarin SAEM 5 times with different seeds. Compare:
-- Mean acceptance rate: should be ~65%, not ~40%
-- Final parameter estimates: must agree with MH version to within 2%
 
-Run `mm_oral.ferx` with full-block OMEGA (most correlated ETA posterior).
+**Tier 1 (unit, `src/estimation/saem.rs` or new `src/estimation/hmc.rs`):**
+Add a unit test for `leapfrog` that verifies energy conservation on a simple
+1D harmonic oscillator (known analytical solution). Also test that the
+acceptance step correctly computes `H(q, p) = NLL(q) + ½ pᵀ Ω p` and that
+`saem_n_leapfrog = 1` degenerates to single-step leapfrog without panic.
+
+**Tier 2 (integration, `tests/` — new `tests/saem_smoke.rs` or alongside
+existing tests):** Call `fit()` with `method = saem` and `outer_maxiter = 5`.
+Assert no panic, non-NaN OFV, and that `FitResult.warnings` is empty (i.e. the
+HMC path was taken, not the MH fallback). A low iteration count is sufficient —
+no convergence needed.
+
+**Tier 3 (slow, same file):** Gate full convergence runs with
+`#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]`:
+1. Run warfarin SAEM 5 times with different seeds. Assert mean acceptance rate
+   ≥ 55% (HMC) vs the MH baseline (~40%). Final theta/omega must agree with MH
+   to within 2%.
+2. Run `mm_oral.ferx` with full-block OMEGA. Confirm convergence and sane OFV.
 
 ### Expected gain
 At 40% acceptance, 60% of proposals are wasted ODE evaluations. HMC at
@@ -1041,17 +1190,22 @@ After all steps, verify the project goals are met.
 
 ### Correctness (Accurate)
 
-Run the full example suite:
 ```bash
-cargo run --release -- examples/warfarin.ferx --data data/warfarin.csv
-cargo run --release -- examples/two_cpt_iv.ferx --data data/warfarin.csv
-cargo run --release -- examples/two_cpt_oral_cov.ferx --data data/warfarin.csv
-cargo run --release -- examples/mm_oral.ferx --data data/warfarin.csv
+# Tier 1 unit tests — must pass on every PR
+cargo test --lib
+
+# Tier 2 integration compile check — must pass on every PR
+cargo check --tests
+
+# Tier 3 slow convergence tests — run nightly / manually
+cargo test --features slow-tests
+
+# Clippy — no new warnings
+cargo clippy
 ```
-All OFVs must agree with pre-improvement baseline to within 0.01 OFV units.
+
+All Tier 3 OFVs must agree with pre-improvement baselines to within 0.01 OFV units.
 All standard errors must agree within 1% relative.
-Run `cargo test --lib` — all tests must pass.
-Run `cargo clippy` — no new warnings.
 
 ### Performance (Fast)
 

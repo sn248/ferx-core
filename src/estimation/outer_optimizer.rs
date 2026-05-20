@@ -85,11 +85,18 @@ pub fn optimize_population_warm(
 /// See issue #55.
 ///
 /// This helper rescales `g` in place by a single scalar so that no component
-/// would push the identity-Hessian Newton step outside half the bound width.
-/// Each dimension's budget is clamped to [0.1, 1.0] (in scaled space) so very
-/// narrow bounds don't paralyse the cap and very wide bounds (40+ log units
-/// on some omega/sigma dims) don't disable it. The rescale is uniform, so the
-/// descent direction is unchanged.
+/// of the identity-Hessian Newton step exceeds its per-dimension step budget,
+/// where the budget is `clamp(half_width, 0.1, 1.0)` in scaled space. The
+/// [0.1, 1.0] clamp keeps the cap effective on very narrow bounds (where
+/// half-width alone would paralyse it — notably fixed parameters with
+/// half-width 0) and on very wide log/Cholesky bounds (40+ units on some
+/// omega/sigma dims, where an uncapped budget would let the gradient
+/// magnitude through unchanged). For non-fixed parameters with `half_width <
+/// 0.1` the post-cap step can exceed half-width by a small constant, which
+/// is benign because the dimension itself is narrow.
+///
+/// The rescale is uniform across components, so the descent direction is
+/// unchanged.
 ///
 /// Returns true if the cap fired (gradient was rescaled), false otherwise.
 /// LBFGS/MMA have line-search-style safeguards and BOBYQA is derivative-free,

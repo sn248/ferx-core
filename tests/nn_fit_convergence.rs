@@ -40,7 +40,7 @@ const MODEL: &str = r#"
   omega ETA_Q  ~ 0.08
   omega ETA_V2 ~ 0.08
   omega ETA_KA ~ 0.20
-  sigma PROP_ERR ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
 
 [covariate_nn TYPICAL_PK]
   inputs     = [WT, CRCL]

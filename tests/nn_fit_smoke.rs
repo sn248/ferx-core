@@ -37,7 +37,7 @@ const NN_DCM_MODEL: &str = r#"
   omega ETA_Q  ~ 0.09
   omega ETA_V2 ~ 0.09
   omega ETA_KA ~ 0.09
-  sigma PROP_ERR ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
 
 [covariate_nn TYPICAL_PK]
   inputs = [WT, CRCL]

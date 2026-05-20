@@ -39,13 +39,16 @@ The binary is called `ferx` and outputs `{model}-fit.yaml` (estimates) and `{mod
 
 ## Tests
 
-Inline `#[cfg(test)] mod tests` blocks at the bottom of each module (e.g. `src/parser/model_parser.rs`, `src/estimation/parameterization.rs`). Run with `cargo test --lib`.
+There are three tiers of tests. Put a new test in the lowest tier whose constraints it fits.
 
-**Every new feature requires a test.** When adding a new parser pattern, fit option, estimator, or any public behaviour, add a corresponding unit test in the same file's `tests` module before considering the change done. Bug fixes should add a regression test that fails without the fix.
+**Tier 1 — Fast unit tests** (inline `#[cfg(test)] mod tests { ... }` blocks in `src/**/*.rs`)
+Test the smallest helper that isolates the behaviour; avoid calling `fit()`. Run with `cargo test --lib`. These run on every PR and must stay fast (seconds total).
 
-Prefer unit tests of the smallest helper that isolates the new behaviour (e.g. test `detect_mu_refs` directly, not just through a full `fit()` call) — end-to-end fits are too slow and flaky for the default test suite.
+**Tier 2 — Integration tests** (`tests/*.rs`)
+Call the public API (`fit()`, `predict()`, etc.) but must return immediately — either with an `Ok` after a handful of outer iterations or with an `Err`. No convergence loops. These files are compile-checked on every PR (`cargo check --tests`) and run nightly in `slow-tests.yml`. Put tests here when you need to exercise a public-API boundary that can't be reached from a `src/` unit test.
 
-**Any test that calls `fit()` and runs to convergence must be gated** so it is skipped in the default PR test job. Use the `slow-tests` cargo feature:
+**Tier 3 — Slow convergence tests** (`tests/*.rs` or `src/` with `slow-tests` gate)
+Full population fits that run to convergence. Gate them so they are skipped in the default PR job:
 
 ```rust
 #[test]
@@ -53,7 +56,9 @@ Prefer unit tests of the smallest helper that isolates the new behaviour (e.g. t
 fn test_my_new_estimator() { ... }
 ```
 
-These tests still run in CI via the nightly `slow-tests.yml` workflow and can be triggered manually. Fast-failing tests (those that call `fit()` but expect an immediate `Err` without running the optimiser) do not need gating.
+These run nightly via `slow-tests.yml` and on any push to `main` that touches estimation code. Fast-failing tests (those that call `fit()` but expect an immediate `Err`) do not need gating.
+
+**Every new feature requires a test** at the appropriate tier. When adding a new parser pattern, fit option, estimator, or any public behaviour, add a corresponding test before considering the change done. Bug fixes should add a regression test that fails without the fix.
 
 ## Documentation
 

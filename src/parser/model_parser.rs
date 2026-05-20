@@ -1638,6 +1638,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.min_obs_for_convergence_check =
                 parse_usize("min_obs_for_convergence_check")? as u32
         }
+        "stagnation_guard" => opts.stagnation_guard = parse_bool("stagnation_guard")?,
         _ => return Ok(false),
     }
     opts.user_set_keys.push(key.to_string());

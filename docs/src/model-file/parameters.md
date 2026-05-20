@@ -33,20 +33,33 @@ theta TVKA(1.0, 0.01, 50.0)
 ### Diagonal omega
 
 ```
-omega NAME ~ variance
+omega NAME ~ value          # value interpreted as variance (default)
+omega NAME ~ value (sd)     # value interpreted as standard deviation
+omega NAME ~ value (variance)   # explicit no-op equivalent to no annotation
 ```
 
 - **NAME**: Random effect name (used in `[individual_parameters]` as `ETA_XXX`)
-- **variance**: Initial variance estimate (diagonal element of the omega matrix)
+- **value**: Initial value. Default scale is **variance** (the diagonal element of the omega matrix). Append `(sd)` to specify a standard deviation instead — the parser squares it before storing. The optimizer always works on the variance scale internally.
 
-Example:
+Example (variance scale, default):
 ```
 omega ETA_CL ~ 0.07
 omega ETA_V  ~ 0.02
 omega ETA_KA ~ 0.40
 ```
 
+Equivalent declaration using SD coding (`(sd)` annotation):
+```
+omega ETA_CL ~ 0.265 (sd)    # ≡ ~ 0.0702
+omega ETA_V  ~ 0.141 (sd)    # ≡ ~ 0.0200
+omega ETA_KA ~ 0.632 (sd)    # ≡ ~ 0.400
+```
+
 Each variance represents the between-subject variability for that parameter. The coefficient of variation (CV%) is approximately `sqrt(variance) * 100` for log-normally distributed parameters. For example, `omega ETA_CL ~ 0.09` corresponds to ~30% CV.
+
+The `(sd)` form is convenient when you're setting initial values from expected CV%, e.g. "I expect ~25% CV on CL" → `omega ETA_CL ~ 0.25 (sd)`. The fit result records which form you used so that downstream printers can annotate the estimate with `[initial specified as SD]`.
+
+Block omega (`block_omega (...) = [...]`) is variance-only — `(sd)` is not accepted there because the lower-triangle list mixes variances and covariances and a single tag would be ambiguous.
 
 ### Block omega (correlated random effects)
 
@@ -146,11 +159,12 @@ Inter-Occasion Variability (IOV) is declared with `kappa` (independent per-param
 ### Diagonal kappa — Option A
 
 ```
-kappa NAME ~ variance
-kappa NAME ~ variance FIX
+kappa NAME ~ value              # value interpreted as variance (default)
+kappa NAME ~ value (sd)         # value interpreted as standard deviation
+kappa NAME ~ value FIX
 ```
 
-Each `kappa` line adds one diagonal element to the IOV omega matrix. Occasions are independent.
+Each `kappa` line adds one diagonal element to the IOV omega matrix. Occasions are independent. The `(sd)` annotation is accepted with the same semantics as for `omega`. `block_kappa` is variance-only.
 
 Example:
 ```
@@ -219,25 +233,35 @@ The result is exposed as `FitResult.omega_param_corr` (BSV) and `FitResult.omega
 ## Sigma (Residual Error)
 
 ```
-sigma NAME ~ value
+sigma NAME ~ value              # value interpreted as variance (default)
+sigma NAME ~ value (sd)         # value interpreted as standard deviation
+sigma NAME ~ value (variance)   # explicit no-op equivalent to no annotation
 ```
 
 - **NAME**: Residual error parameter name (referenced in `[error_model]`)
-- **value**: Initial value
+- **value**: Initial value. Default scale is **variance**, matching omega. Append `(sd)` to specify a standard deviation; the parser converts it to the internal representation. This unifies the user-facing scale across omega and sigma — see [issue #56](https://github.com/FeRx-NLME/ferx-core/issues/56).
 
-Example:
+Example (variance scale, default):
 ```
-sigma PROP_ERR ~ 0.01
-sigma ADD_ERR  ~ 1.0
+sigma PROP_ERR ~ 0.0004     # variance 0.0004  →  SD = 0.02  →  2% CV
+sigma ADD_ERR  ~ 1.0        # variance 1.0     →  SD = 1.0
 ```
 
-The interpretation of sigma depends on the error model:
+Equivalent declarations using SD coding:
+```
+sigma PROP_ERR ~ 0.02 (sd)
+sigma ADD_ERR  ~ 1.0  (sd)
+```
 
-| Error Model | Sigma Meaning |
+The interpretation of sigma's role in the residual-error model depends on the error model:
+
+| Error Model | Sigma component |
 |-------------|---------------|
-| Additive | Standard deviation of additive error |
-| Proportional | Coefficient of proportional error |
-| Combined | First sigma = proportional coefficient, second = additive SD |
+| Additive | Variance (or SD with `(sd)`) of additive error |
+| Proportional | Variance (or SD with `(sd)`) of the proportional coefficient |
+| Combined | First sigma = proportional coefficient, second = additive component |
+
+> **Migration note** (pre-issue-#56 models): `sigma NAME ~ value` was previously interpreted as a standard deviation. The new default is **variance**, so a pre-#56 value `v` becomes either `v² (variance)` or `v (sd)`. The `examples/` directory uses the `(sd)` form to preserve the prior initial values verbatim.
 
 ## Complete Examples
 

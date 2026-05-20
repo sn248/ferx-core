@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-aeadd51d.js";
+            window.path_to_searchindex_js = "searchindex-23ca2966.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-7ca32c60.js"></script>
@@ -671,18 +671,27 @@ theta TVKA(1.0, 0.01, 50.0)
 </code></pre>
 <h2 id="omega-between-subject-variability"><a class="header" href="#omega-between-subject-variability">Omega (Between-Subject Variability)</a></h2>
 <h3 id="diagonal-omega"><a class="header" href="#diagonal-omega">Diagonal omega</a></h3>
-<pre><code>omega NAME ~ variance
+<pre><code>omega NAME ~ value          # value interpreted as variance (default)
+omega NAME ~ value (sd)     # value interpreted as standard deviation
+omega NAME ~ value (variance)   # explicit no-op equivalent to no annotation
 </code></pre>
 <ul>
 <li><strong>NAME</strong>: Random effect name (used in <code>[individual_parameters]</code> as <code>ETA_XXX</code>)</li>
-<li><strong>variance</strong>: Initial variance estimate (diagonal element of the omega matrix)</li>
+<li><strong>value</strong>: Initial value. Default scale is <strong>variance</strong> (the diagonal element of the omega matrix). Append <code>(sd)</code> to specify a standard deviation instead — the parser squares it before storing. The optimizer always works on the variance scale internally.</li>
 </ul>
-<p>Example:</p>
+<p>Example (variance scale, default):</p>
 <pre><code>omega ETA_CL ~ 0.07
 omega ETA_V  ~ 0.02
 omega ETA_KA ~ 0.40
 </code></pre>
+<p>Equivalent declaration using SD coding (<code>(sd)</code> annotation):</p>
+<pre><code>omega ETA_CL ~ 0.265 (sd)    # ≡ ~ 0.0702
+omega ETA_V  ~ 0.141 (sd)    # ≡ ~ 0.0200
+omega ETA_KA ~ 0.632 (sd)    # ≡ ~ 0.400
+</code></pre>
 <p>Each variance represents the between-subject variability for that parameter. The coefficient of variation (CV%) is approximately <code>sqrt(variance) * 100</code> for log-normally distributed parameters. For example, <code>omega ETA_CL ~ 0.09</code> corresponds to ~30% CV.</p>
+<p>The <code>(sd)</code> form is convenient when you’re setting initial values from expected CV%, e.g. “I expect ~25% CV on CL” → <code>omega ETA_CL ~ 0.25 (sd)</code>. The fit result records which form you used so that downstream printers can annotate the estimate with <code>[initial specified as SD]</code>.</p>
+<p>Block omega (<code>block_omega (...) = [...]</code>) is variance-only — <code>(sd)</code> is not accepted there because the lower-triangle list mixes variances and covariances and a single tag would be ambiguous.</p>
 <h3 id="block-omega-correlated-random-effects"><a class="header" href="#block-omega-correlated-random-effects">Block omega (correlated random effects)</a></h3>
 <p>To estimate correlations between random effects, use <code>block_omega</code>:</p>
 <pre><code>block_omega (NAME1, NAME2, ...) = [lower_triangle_values]
@@ -740,10 +749,11 @@ block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
 <h2 id="kappa-inter-occasion-variability"><a class="header" href="#kappa-inter-occasion-variability">Kappa (Inter-Occasion Variability)</a></h2>
 <p>Inter-Occasion Variability (IOV) is declared with <code>kappa</code> (independent per-parameter) or <code>block_kappa</code> (correlated across parameters). Kappa parameters must be paired with <code>iov_column</code> in <code>[fit_options]</code> and an occasion column in the dataset.</p>
 <h3 id="diagonal-kappa--option-a"><a class="header" href="#diagonal-kappa--option-a">Diagonal kappa — Option A</a></h3>
-<pre><code>kappa NAME ~ variance
-kappa NAME ~ variance FIX
+<pre><code>kappa NAME ~ value              # value interpreted as variance (default)
+kappa NAME ~ value (sd)         # value interpreted as standard deviation
+kappa NAME ~ value FIX
 </code></pre>
-<p>Each <code>kappa</code> line adds one diagonal element to the IOV omega matrix. Occasions are independent.</p>
+<p>Each <code>kappa</code> line adds one diagonal element to the IOV omega matrix. Occasions are independent. The <code>(sd)</code> annotation is accepted with the same semantics as for <code>omega</code>. <code>block_kappa</code> is variance-only.</p>
 <p>Example:</p>
 <pre><code>kappa KAPPA_CL ~ 0.05
 kappa KAPPA_V  ~ 0.03
@@ -790,29 +800,38 @@ kappa KAPPA_KA ~ 0.10
 <p>The formula for lognormal pairs is the standard bivariate lognormal identity and reflects the correlation between the actual PK/PD parameters (e.g. CL and V) rather than their underlying normal variates.</p>
 <p>The result is exposed as <code>FitResult.omega_param_corr</code> (BSV) and <code>FitResult.omega_iov_param_corr</code> (IOV), and is used wherever ferx prints a <code>corr</code> or <code>correlation</code> value for a block omega pair.</p>
 <h2 id="sigma-residual-error"><a class="header" href="#sigma-residual-error">Sigma (Residual Error)</a></h2>
-<pre><code>sigma NAME ~ value
+<pre><code>sigma NAME ~ value              # value interpreted as variance (default)
+sigma NAME ~ value (sd)         # value interpreted as standard deviation
+sigma NAME ~ value (variance)   # explicit no-op equivalent to no annotation
 </code></pre>
 <ul>
 <li><strong>NAME</strong>: Residual error parameter name (referenced in <code>[error_model]</code>)</li>
-<li><strong>value</strong>: Initial value</li>
+<li><strong>value</strong>: Initial value. Default scale is <strong>variance</strong>, matching omega. Append <code>(sd)</code> to specify a standard deviation; the parser converts it to the internal representation. This unifies the user-facing scale across omega and sigma — see <a href="https://github.com/FeRx-NLME/ferx-core/issues/56">issue #56</a>.</li>
 </ul>
-<p>Example:</p>
-<pre><code>sigma PROP_ERR ~ 0.01
-sigma ADD_ERR  ~ 1.0
+<p>Example (variance scale, default):</p>
+<pre><code>sigma PROP_ERR ~ 0.0004     # variance 0.0004  →  SD = 0.02  →  2% CV
+sigma ADD_ERR  ~ 1.0        # variance 1.0     →  SD = 1.0
 </code></pre>
-<p>The interpretation of sigma depends on the error model:</p>
+<p>Equivalent declarations using SD coding:</p>
+<pre><code>sigma PROP_ERR ~ 0.02 (sd)
+sigma ADD_ERR  ~ 1.0  (sd)
+</code></pre>
+<p>The interpretation of sigma’s role in the residual-error model depends on the error model:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Error Model</th><th>Sigma Meaning</th></tr>
+<tr><th>Error Model</th><th>Sigma component</th></tr>
 </thead>
 <tbody>
-<tr><td>Additive</td><td>Standard deviation of additive error</td></tr>
-<tr><td>Proportional</td><td>Coefficient of proportional error</td></tr>
-<tr><td>Combined</td><td>First sigma = proportional coefficient, second = additive SD</td></tr>
+<tr><td>Additive</td><td>Variance (or SD with <code>(sd)</code>) of additive error</td></tr>
+<tr><td>Proportional</td><td>Variance (or SD with <code>(sd)</code>) of the proportional coefficient</td></tr>
+<tr><td>Combined</td><td>First sigma = proportional coefficient, second = additive component</td></tr>
 </tbody>
 </table>
 </div>
+<blockquote>
+<p><strong>Migration note</strong> (pre-issue-#56 models): <code>sigma NAME ~ value</code> was previously interpreted as a standard deviation. The new default is <strong>variance</strong>, so a pre-#56 value <code>v</code> becomes either <code>v² (variance)</code> or <code>v (sd)</code>. The <code>examples/</code> directory uses the <code>(sd)</code> form to preserve the prior initial values verbatim.</p>
+</blockquote>
 <h2 id="complete-examples"><a class="header" href="#complete-examples">Complete Examples</a></h2>
 <p>Diagonal omega (no correlations):</p>
 <pre><code>[parameters]
@@ -3602,7 +3621,7 @@ println!("Omega IOV: {:?}", result.omega_iov);
   omega ETA_VMAX ~ 0.25
   omega ETA_V    ~ 0.20
 
-  sigma PROP_ERR ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
 
 [individual_parameters]
   VMAX = TVVMAX * exp(ETA_VMAX)

@@ -799,11 +799,41 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // BSV omega is built from the BSV-only eta names (no kappas)
     let omega = build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?;
     let omega_fixed = build_omega_fixed(&omegas, &block_omegas, &eta_names_bsv)?;
+    // Per-eta SD-init flags, parallel to `eta_names_bsv`. Diagonal omega
+    // declarations carry their `(sd)` flag from the parser; block-omega etas
+    // are always `false` because block_omega is variance-only.
+    let omega_init_as_sd: Vec<bool> = {
+        let diag_lookup: std::collections::HashMap<&str, bool> = omegas
+            .iter()
+            .map(|o| (o.name.as_str(), o.init_as_sd))
+            .collect();
+        eta_names_bsv
+            .iter()
+            .map(|n| *diag_lookup.get(n.as_str()).unwrap_or(&false))
+            .collect()
+    };
     let sigma_values: Vec<f64> = sigmas.iter().map(|s| s.value).collect();
     let sigma_fixed: Vec<bool> = sigmas.iter().map(|s| s.fixed).collect();
+    let sigma_init_as_sd: Vec<bool> = sigmas.iter().map(|s| s.init_as_sd).collect();
     let sigma = SigmaVector {
         values: sigma_values,
         names: sigma_names,
+    };
+
+    // Per-kappa SD-init flags, parallel to `kappa_info.names_ordered`. Same
+    // logic as omega: diagonal kappa declarations carry the `(sd)` flag;
+    // block_kappa entries are variance-only and contribute `false`.
+    let kappa_init_as_sd: Vec<bool> = {
+        let diag_lookup: std::collections::HashMap<&str, bool> = kappa_info
+            .diagonal
+            .iter()
+            .map(|k| (k.name.as_str(), k.init_as_sd))
+            .collect();
+        kappa_info
+            .names_ordered
+            .iter()
+            .map(|n| *diag_lookup.get(n.as_str()).unwrap_or(&false))
+            .collect()
     };
 
     // IOV omega: built from kappa (diagonal) and/or block_kappa specs.
@@ -822,6 +852,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 name: k.name.clone(),
                 variance: k.variance,
                 fixed: k.fixed,
+                init_as_sd: k.init_as_sd,
             })
             .collect();
         let block_as_omega: Vec<BlockOmegaSpec> = kappa_info
@@ -986,6 +1017,9 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         kappa_names,
         indiv_param_names: indiv_var_names.clone(),
         default_params,
+        omega_init_as_sd,
+        sigma_init_as_sd,
+        kappa_init_as_sd,
         tv_fn,
         pk_indices,
         eta_map,
@@ -1683,6 +1717,11 @@ struct OmegaSpec {
     name: String,
     variance: f64,
     fixed: bool,
+    /// `true` when the user wrote `omega NAME ~ X (sd)` — i.e. they specified
+    /// the initial value on the standard-deviation scale and the parser squared
+    /// it. Purely display metadata; the stored `variance` is always on the
+    /// variance scale.
+    init_as_sd: bool,
 }
 
 /// Specifies a block (correlated) group of omegas.
@@ -1696,8 +1735,15 @@ struct BlockOmegaSpec {
 
 struct SigmaSpec {
     name: String,
+    /// Internal sigma value on the standard-deviation scale (the form the
+    /// likelihood code consumes). The parser converts variance-scale input
+    /// (the default since issue #56) to SD via `sqrt`.
     value: f64,
     fixed: bool,
+    /// `true` when the user wrote `sigma NAME ~ X (sd)` — i.e. specified the
+    /// initial value directly as a standard deviation. `false` for the default
+    /// (variance) case. Purely display metadata.
+    init_as_sd: bool,
 }
 
 /// Diagonal inter-occasion variability (kappa) specification.
@@ -1705,6 +1751,9 @@ struct KappaSpec {
     name: String,
     variance: f64,
     fixed: bool,
+    /// Same semantics as `OmegaSpec::init_as_sd` — `true` when the user wrote
+    /// `kappa NAME ~ X (sd)` and the parser squared the value.
+    init_as_sd: bool,
 }
 
 /// Block (correlated) IOV kappa specification — mirrors `BlockOmegaSpec`.
@@ -1809,18 +1858,41 @@ fn parse_parameters(
     )
     .unwrap();
 
-    // omega NAME ~ value  |  omega NAME ~ value FIX
-    let omega_re = Regex::new(r"(?i)omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?").unwrap();
+    // omega NAME ~ value [(sd|variance|var)] [FIX]
+    //
+    // Initial value defaults to the variance scale (matching how the optimizer
+    // stores omega internally). Append `(sd)` to declare the value on the
+    // standard-deviation scale — the parser squares it before storing. The
+    // `(variance)` / `(var)` annotation is accepted as an explicit no-op for
+    // symmetry with sigma.
+    let omega_re = Regex::new(
+        r"(?i)omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?",
+    )
+    .unwrap();
 
     // block_omega (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
+    //
+    // Block omegas are variance-scale only — the lower triangle mixes
+    // variances and covariances, so a single `(sd)` flag would be ambiguous.
     let block_omega_re =
         Regex::new(r"(?i)block_omega\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?").unwrap();
 
-    // sigma NAME ~ value  |  sigma NAME ~ value FIX
-    let sigma_re = Regex::new(r"(?i)sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?").unwrap();
+    // sigma NAME ~ value [(sd|variance|var)] [FIX]
+    //
+    // As of issue #56, sigma defaults to the variance scale (matching omega).
+    // `(sd)` opts back into specifying a standard deviation directly. The
+    // parser converts variance → internal SD via `sqrt` so the residual-error
+    // and likelihood code (which work in SD) need no changes.
+    let sigma_re = Regex::new(
+        r"(?i)sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?",
+    )
+    .unwrap();
 
-    // kappa NAME ~ value  |  kappa NAME ~ value FIX  (IOV diagonal variance)
-    let kappa_re = Regex::new(r"(?i)kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?").unwrap();
+    // kappa NAME ~ value [(sd|variance|var)] [FIX]  (IOV diagonal variance)
+    let kappa_re = Regex::new(
+        r"(?i)kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?",
+    )
+    .unwrap();
 
     // block_kappa (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
     let block_kappa_re =
@@ -1910,34 +1982,66 @@ fn parse_parameters(
             });
         } else if let Some(caps) = omega_re.captures(line) {
             let name = caps[1].to_string();
-            let variance: f64 = caps[2]
+            let raw: f64 = caps[2]
                 .parse()
                 .map_err(|_| format!("Bad omega: {}", line))?;
-            let fixed = caps.get(3).is_some();
+            let init_as_sd = caps
+                .get(3)
+                .map(|m| m.as_str().eq_ignore_ascii_case("sd"))
+                .unwrap_or(false);
+            let variance = if init_as_sd { raw * raw } else { raw };
+            let fixed = caps.get(4).is_some();
             eta_names_ordered.push(name.clone());
             omegas.push(OmegaSpec {
                 name,
                 variance,
                 fixed,
+                init_as_sd,
             });
         } else if let Some(caps) = sigma_re.captures(line) {
             let name = caps[1].to_string();
-            let value: f64 = caps[2]
+            let raw: f64 = caps[2]
                 .parse()
                 .map_err(|_| format!("Bad sigma: {}", line))?;
-            let fixed = caps.get(3).is_some();
-            sigmas.push(SigmaSpec { name, value, fixed });
+            let init_as_sd = caps
+                .get(3)
+                .map(|m| m.as_str().eq_ignore_ascii_case("sd"))
+                .unwrap_or(false);
+            // Default (variance scale): take sqrt to land on the internal SD
+            // representation. With `(sd)`: the value is already SD.
+            // Negative variance inputs are rejected up-front so we don't end up
+            // with a NaN flowing into the likelihood.
+            if !init_as_sd && raw < 0.0 {
+                return Err(format!(
+                    "sigma '{}' has a negative initial variance ({raw}); use a non-negative value or annotate `(sd)` to specify a standard deviation",
+                    name
+                ));
+            }
+            let value = if init_as_sd { raw } else { raw.sqrt() };
+            let fixed = caps.get(4).is_some();
+            sigmas.push(SigmaSpec {
+                name,
+                value,
+                fixed,
+                init_as_sd,
+            });
         } else if let Some(caps) = kappa_re.captures(line) {
             let name = caps[1].to_string();
-            let variance: f64 = caps[2]
+            let raw: f64 = caps[2]
                 .parse()
                 .map_err(|_| format!("Bad kappa: {}", line))?;
-            let fixed = caps.get(3).is_some();
+            let init_as_sd = caps
+                .get(3)
+                .map(|m| m.as_str().eq_ignore_ascii_case("sd"))
+                .unwrap_or(false);
+            let variance = if init_as_sd { raw * raw } else { raw };
+            let fixed = caps.get(4).is_some();
             kappa_names_ordered.push(name.clone());
             kappas.push(KappaSpec {
                 name,
                 variance,
                 fixed,
+                init_as_sd,
             });
         }
     }
@@ -4306,11 +4410,13 @@ mod tests {
                 name: "ETA_CL".into(),
                 variance: 0.09,
                 fixed: false,
+                init_as_sd: false,
             },
             OmegaSpec {
                 name: "ETA_V".into(),
                 variance: 0.04,
                 fixed: false,
+                init_as_sd: false,
             },
         ];
         let names = vec!["ETA_CL".into(), "ETA_V".into()];
@@ -4343,6 +4449,7 @@ mod tests {
             name: "ETA_KA".into(),
             variance: 0.16,
             fixed: false,
+            init_as_sd: false,
         }];
         let block = vec![BlockOmegaSpec {
             names: vec!["ETA_CL".into(), "ETA_V".into()],
@@ -4443,6 +4550,185 @@ mod tests {
         assert!(sigmas[0].fixed);
     }
 
+    // ── SD-init annotation (issue #5 + #56) ─────────────────────────────
+
+    #[test]
+    fn test_omega_default_is_variance() {
+        // No annotation: value is stored verbatim as variance.
+        let lines = vec!["omega ETA_CL ~ 0.07".to_string()];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert!((omegas[0].variance - 0.07).abs() < 1e-12);
+        assert!(!omegas[0].init_as_sd);
+    }
+
+    #[test]
+    fn test_omega_sd_annotation_squares_value() {
+        // `(sd)` → variance is the square of the raw value.
+        let lines = vec!["omega ETA_CL ~ 0.265 (sd)".to_string()];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let expected = 0.265 * 0.265;
+        assert!((omegas[0].variance - expected).abs() < 1e-12);
+        assert!(omegas[0].init_as_sd);
+    }
+
+    #[test]
+    fn test_omega_variance_annotation_is_noop() {
+        // `(variance)` and `(var)` are explicit no-ops.
+        let lines = vec![
+            "omega ETA_CL ~ 0.07 (variance)".to_string(),
+            "omega ETA_V  ~ 0.04 (var)".to_string(),
+        ];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert!((omegas[0].variance - 0.07).abs() < 1e-12);
+        assert!(!omegas[0].init_as_sd);
+        assert!((omegas[1].variance - 0.04).abs() < 1e-12);
+        assert!(!omegas[1].init_as_sd);
+    }
+
+    #[test]
+    fn test_omega_sd_annotation_with_fix() {
+        // `(sd) FIX` — both annotations must be honored together.
+        let lines = vec!["omega ETA_CL ~ 0.30 (sd) FIX".to_string()];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let expected = 0.30 * 0.30;
+        assert!((omegas[0].variance - expected).abs() < 1e-12);
+        assert!(omegas[0].fixed);
+        assert!(omegas[0].init_as_sd);
+    }
+
+    #[test]
+    fn test_sigma_default_is_variance() {
+        // Since #56, the default sigma input is variance — the parser sqrt's
+        // it into the internal SD representation that the likelihood uses.
+        let lines = vec!["sigma PROP ~ 0.04".to_string()];
+        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        // Stored value is SD = sqrt(variance) = sqrt(0.04) = 0.2.
+        assert!((sigmas[0].value - 0.2).abs() < 1e-12);
+        assert!(!sigmas[0].init_as_sd);
+    }
+
+    #[test]
+    fn test_sigma_sd_annotation_stores_value_as_is() {
+        // `(sd)` → the value is already on the SD scale, no transform.
+        let lines = vec!["sigma PROP ~ 0.2 (sd)".to_string()];
+        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        assert!((sigmas[0].value - 0.2).abs() < 1e-12);
+        assert!(sigmas[0].init_as_sd);
+    }
+
+    #[test]
+    fn test_sigma_default_and_sd_equivalent_initial_value() {
+        // `sigma X ~ v²` (default variance) must produce the same internal
+        // SD as `sigma X ~ v (sd)` (SD).
+        let lines = vec![
+            "sigma A ~ 0.0004".to_string(),    // variance 0.0004
+            "sigma B ~ 0.02 (sd)".to_string(), // SD 0.02
+        ];
+        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        assert!((sigmas[0].value - sigmas[1].value).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_sigma_negative_variance_rejected() {
+        // A negative value on the (default) variance scale is meaningless —
+        // sqrt would yield NaN and silently corrupt the fit. Reject up-front
+        // with a clear error.
+        let lines = vec!["sigma PROP ~ -0.1".to_string()];
+        let res = parse_parameters(&lines);
+        match res {
+            Err(msg) => assert!(msg.contains("negative initial variance"), "got: {msg}"),
+            Ok(_) => panic!("expected error for negative sigma variance"),
+        }
+    }
+
+    #[test]
+    fn test_sigma_negative_sd_is_allowed() {
+        // With `(sd)` a negative value parses (the user explicitly asked for
+        // the SD scale and we don't double-check). The optimizer's log
+        // transform will reject it later if it's still in play.
+        let lines = vec!["sigma PROP ~ -0.5 (sd)".to_string()];
+        let res = parse_parameters(&lines);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_kappa_sd_annotation_squares_value() {
+        let lines = vec!["kappa KAPPA_CL ~ 0.25 (sd)".to_string()];
+        let (_, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
+        let k = &kappas.diagonal[0];
+        let expected = 0.25 * 0.25;
+        assert!((k.variance - expected).abs() < 1e-12);
+        assert!(k.init_as_sd);
+    }
+
+    #[test]
+    fn test_sd_annotation_case_insensitive() {
+        // `(SD)`, `(Sd)`, `(sd)` must all be accepted.
+        let lines = vec![
+            "omega ETA_A ~ 0.1 (SD)".to_string(),
+            "omega ETA_B ~ 0.2 (Sd)".to_string(),
+            "omega ETA_C ~ 0.3 (sd)".to_string(),
+        ];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert!(omegas.iter().all(|o| o.init_as_sd));
+    }
+
+    #[test]
+    fn test_unknown_scale_tag_is_ignored_as_trailing_garbage() {
+        // The omega regex is intentionally unanchored — it matches the
+        // leading `omega NAME ~ value` and lets trailing tokens fall through.
+        // An unrecognized tag like `(foo)` therefore doesn't fail the parse;
+        // the value is taken as variance and `init_as_sd` stays `false`, just
+        // as if the tag weren't there. (This matches how the `FIX` keyword's
+        // prefix-match check works — only the exact, recognized tag changes
+        // behavior; anything else is silently ignored, consistent with the
+        // parser's existing FIXED-vs-FIX handling.)
+        let lines = vec!["omega ETA_CL ~ 0.07 (foo)".to_string()];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(omegas.len(), 1);
+        assert!((omegas[0].variance - 0.07).abs() < 1e-12);
+        assert!(!omegas[0].init_as_sd);
+    }
+
+    #[test]
+    fn test_parse_full_model_threads_init_as_sd_to_compiled_model() {
+        // End-to-end: a `(sd)` annotation in the .ferx text must surface as
+        // `true` in the matching CompiledModel.{omega,sigma}_init_as_sd slot.
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta TVKA(1.5)
+  omega ETA_CL ~ 0.30 (sd)
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.50 (sd)
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let parsed = parse_full_model(content).unwrap();
+        assert_eq!(
+            parsed.model.omega_init_as_sd,
+            vec![true, false, true],
+            "omega_init_as_sd flags must thread through to CompiledModel"
+        );
+        assert_eq!(parsed.model.sigma_init_as_sd, vec![true]);
+        // Verify the SD-coded omega was squared: 0.30² = 0.09.
+        let omega = &parsed.model.default_params.omega.matrix;
+        assert!((omega[(0, 0)] - 0.09).abs() < 1e-12);
+        // And the variance-coded omega is stored verbatim.
+        assert!((omega[(1, 1)] - 0.04).abs() < 1e-12);
+        // Sigma stored as SD (input was already SD, no transform).
+        let sigma = &parsed.model.default_params.sigma.values;
+        assert!((sigma[0] - 0.02).abs() < 1e-12);
+    }
+
     #[test]
     fn test_fix_keyword_rejects_prefix_match() {
         // `FIXED` must not be silently accepted as `FIX`. Any non-exact token
@@ -4468,11 +4754,13 @@ mod tests {
                 name: "ETA_CL".into(),
                 variance: 0.09,
                 fixed: true,
+                init_as_sd: false,
             },
             OmegaSpec {
                 name: "ETA_V".into(),
                 variance: 0.04,
                 fixed: false,
+                init_as_sd: false,
             },
         ];
         let names = vec!["ETA_CL".into(), "ETA_V".into()];
@@ -4500,6 +4788,7 @@ mod tests {
             name: "ETA_CL".into(),
             variance: 0.09,
             fixed: true,
+            init_as_sd: false,
         }];
         let block = vec![BlockOmegaSpec {
             names: vec!["ETA_CL".into(), "ETA_V".into()],

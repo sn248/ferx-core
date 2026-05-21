@@ -2,7 +2,6 @@ use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::io::datareader::read_nonmem_csv;
-use crate::io::output;
 use crate::pk;
 use crate::stats::likelihood::{
     compute_cwres, foce_subject_nll, foce_subject_nll_iov, split_obs_by_occasion,
@@ -1046,10 +1045,6 @@ fn fit_inner(
         #[cfg(feature = "nn")]
         neural_networks: build_neural_network_infos(model),
     };
-
-    if options.verbose {
-        output::print_results(&fit_result);
-    }
 
     if time_gradients {
         let (ad_c, ad_n, fd_c, fd_n, jac_ad_c, jac_ad_n, jac_fd_c, jac_fd_n) =

@@ -64,6 +64,11 @@ fn main() {
 
     match result {
         Ok((fit_result, population)) => {
+            // CLI prints the human-readable summary. The library `fit()` no longer
+            // prints it — language bindings (e.g. ferx-r's print.ferx_fit) are the
+            // single source of truth for formatted summaries (see issue #60).
+            ferx_core::io::output::print_results(&fit_result);
+
             // Derive model name from model file path
             let model_name = std::path::Path::new(model_path)
                 .file_stem()

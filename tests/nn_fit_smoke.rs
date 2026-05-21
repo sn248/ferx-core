@@ -66,7 +66,10 @@ const NN_DCM_MODEL: &str = r#"
 "#;
 
 #[test]
-#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
 fn fit_runs_without_panicking_on_nn_bearing_model() {
     let parsed = parse_full_model(NN_DCM_MODEL).expect("model parses with --features nn");
     let model = parsed.model;
@@ -91,13 +94,7 @@ fn fit_runs_without_panicking_on_nn_bearing_model() {
 
     // Run the fit. The point is to verify nothing panics and that fit
     // produces a finite OFV.
-    let result = fit(
-        &model,
-        &population,
-        &model.default_params,
-        &options,
-    )
-    .expect("fit returns Ok");
+    let result = fit(&model, &population, &model.default_params, &options).expect("fit returns Ok");
 
     // OFV must be finite.
     assert!(

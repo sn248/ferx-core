@@ -69,7 +69,10 @@ const MODEL: &str = r#"
 "#;
 
 #[test]
-#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
 fn focei_makes_substantial_progress_on_nn_model() {
     let parsed = parse_full_model(MODEL).expect("model parses with --features nn");
     let model = parsed.model;
@@ -90,17 +93,16 @@ fn focei_makes_substantial_progress_on_nn_model() {
     // with refactors.
     let mut baseline_opts: FitOptions = options.clone();
     baseline_opts.outer_maxiter = 1;
-    let baseline =
-        fit(&model, &population, &model.default_params, &baseline_opts)
-            .expect("baseline fit (maxiter=1) runs");
+    let baseline = fit(&model, &population, &model.default_params, &baseline_opts)
+        .expect("baseline fit (maxiter=1) runs");
     let baseline_ofv = baseline.ofv;
     assert!(
         baseline_ofv.is_finite(),
         "baseline OFV at Glorot init must be finite (got {baseline_ofv})"
     );
 
-    let result = fit(&model, &population, &model.default_params, &options)
-        .expect("fit runs to completion");
+    let result =
+        fit(&model, &population, &model.default_params, &options).expect("fit runs to completion");
 
     // ── Assertion 1: OFV decreased substantially.
     //
@@ -164,7 +166,9 @@ fn focei_makes_substantial_progress_on_nn_model() {
                 .find(|s| s.id == sr.id)
                 .and_then(|s| s.observations.get(j))
                 .copied();
-            let Some(obs) = obs else { continue; };
+            let Some(obs) = obs else {
+                continue;
+            };
             if obs <= 0.0 {
                 continue;
             }
@@ -192,6 +196,12 @@ fn focei_makes_substantial_progress_on_nn_model() {
     eprintln!(
         "\nNN fit summary: baseline OFV {:.2} -> {:.2} ({:.1}% better) | \
          RMS weight step {:.4} | pred-vs-obs in [0.2x, 5x]: {:.0}% ({}/{})",
-        baseline_ofv, result.ofv, improvement_pct, rms_move, frac * 100.0, n_within, n_total,
+        baseline_ofv,
+        result.ofv,
+        improvement_pct,
+        rms_move,
+        frac * 100.0,
+        n_within,
+        n_total,
     );
 }

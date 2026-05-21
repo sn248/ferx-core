@@ -1345,7 +1345,15 @@ fn wire_to_fit_result(
                     .transpose()?,
             )
         }
-        None => (None, Vec::new(), Vec::new(), Vec::new(), None, Vec::new(), None),
+        None => (
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+        ),
     };
 
     let (sir_ci_theta, sir_ci_omega, sir_ci_sigma, sir_ess, sir_resamples_packed) = match w.sir {

@@ -10,7 +10,7 @@
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::parameterization::{
-    compute_bounds, compute_mu_k, pack_params, unpack_params,
+    compute_bounds, compute_mu_k, pack_params, packed_fixed_mask, unpack_params,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -79,25 +79,50 @@ pub fn run_sir_core(
         ));
     }
 
-    // Symmetrize and Cholesky-decompose the proposal covariance.
-    // The FD covariance may not be perfectly symmetric or positive definite;
-    // regularize with an eigenvalue floor if needed (same pattern as OmegaMatrix::from_matrix).
-    let sym_cov = (proposal_cov + proposal_cov.transpose()) * 0.5;
-    let proposal_chol = match sym_cov.clone().cholesky() {
+    // Restrict the proposal to the free subspace. `compute_covariance` zeroes
+    // the rows/cols of FIX-ed parameters, and `compute_bounds` pins their
+    // bounds to `lower == upper == x_hat[i]`. Sampling on the full space would
+    // (after regularising the singular covariance) perturb fixed indices by
+    // ~sqrt(reg) ≈ 1e-4, which then fails the strict bounds check on every
+    // sample — yielding "All SIR samples had invalid weights" for any model
+    // with at least one FIX-ed parameter. Sampling on the free block instead
+    // keeps fixed indices exactly at `x_hat`, and uses `d = n_free` as the
+    // Student-t dimensionality so the importance weights are consistent.
+    let fixed_mask = packed_fixed_mask(params);
+    let free_idx: Vec<usize> = (0..n_packed).filter(|&i| !fixed_mask[i]).collect();
+    let n_free = free_idx.len();
+    if n_free == 0 {
+        return Err(
+            "run_sir_core: every packed parameter is FIX — nothing to sample.".to_string(),
+        );
+    }
+
+    // Symmetrize first, then extract the free block (rows/cols of non-FIX
+    // indices) before Cholesky.
+    let sym_cov_full = (proposal_cov + proposal_cov.transpose()) * 0.5;
+    let mut sub_cov = DMatrix::zeros(n_free, n_free);
+    for (a, &i) in free_idx.iter().enumerate() {
+        for (b, &j) in free_idx.iter().enumerate() {
+            sub_cov[(a, b)] = sym_cov_full[(i, j)];
+        }
+    }
+
+    // Cholesky-decompose the free block; regularise with an eigenvalue floor
+    // if the free block is not strictly positive definite.
+    let proposal_chol = match sub_cov.clone().cholesky() {
         Some(c) => c.l(),
         None => {
-            // Regularize: shift eigenvalues to be at least 1e-8
-            let eig = sym_cov.clone().symmetric_eigen();
+            let eig = sub_cov.clone().symmetric_eigen();
             let min_eig = eig.eigenvalues.min();
             let reg = if min_eig < 1e-8 {
                 -min_eig + 1e-8
             } else {
                 1e-8
             };
-            let reg_cov = &sym_cov + DMatrix::identity(n_packed, n_packed) * reg;
+            let reg_cov = &sub_cov + DMatrix::identity(n_free, n_free) * reg;
             if options.verbose {
                 eprintln!(
-                    "  SIR: proposal covariance not PD (min eigenvalue = {:.2e}), regularizing",
+                    "  SIR: free-block proposal covariance not PD (min eigenvalue = {:.2e}), regularizing",
                     min_eig
                 );
             }
@@ -108,9 +133,10 @@ pub fn run_sir_core(
         }
     };
 
-    // Log-determinant of proposal covariance (for density computation)
+    // Log-determinant of the free-block proposal covariance (for density
+    // computation). Uses n_free, matching the dimensionality of the Student-t.
     let log_det_proposal = 2.0
-        * (0..n_packed)
+        * (0..n_free)
             .map(|i| proposal_chol[(i, i)].ln())
             .sum::<f64>();
 
@@ -133,7 +159,7 @@ pub fn run_sir_core(
     let nu = options.sir_df;
     let chi2_dist = ChiSquared::new(nu).map_err(|e| format!("sir_df invalid: {e}"))?;
 
-    let d = n_packed as f64;
+    let d = n_free as f64;
     // Cache lgamma terms that are constant across all samples.
     let log_norm =
         lgamma((nu + d) / 2.0) - lgamma(nu / 2.0) - (d / 2.0) * (nu * std::f64::consts::PI).ln();
@@ -143,15 +169,22 @@ pub fn run_sir_core(
     let mut z_vectors: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
     let mut samples: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
     for _ in 0..n_samples {
-        let z: Vec<f64> = (0..n_packed).map(|_| rng.sample(StandardNormal)).collect();
+        let z_free: Vec<f64> = (0..n_free).map(|_| rng.sample(StandardNormal)).collect();
         let chi2: f64 = chi2_dist.sample(&mut rng);
         let scale = (nu / chi2).sqrt();
-        let z_vec = DVector::from_column_slice(&z);
-        let delta = &proposal_chol * &z_vec * scale;
-        let x_k: Vec<f64> = x_hat.iter().zip(delta.iter()).map(|(a, b)| a + b).collect();
+        let z_vec_free = DVector::from_column_slice(&z_free);
+        let delta_free = &proposal_chol * &z_vec_free * scale;
+        // Build the full packed sample: free indices get x_hat + delta_free,
+        // fixed indices stay pinned at x_hat (so the strict bounds check
+        // `lower == upper == x_hat[i]` passes).
+        let mut x_k = x_hat.clone();
+        for (a, &i) in free_idx.iter().enumerate() {
+            x_k[i] += delta_free[a];
+        }
         samples.push(x_k);
-        // store L⁻¹(x_k − x_hat) = z * scale for the quadratic form in log_q_k
-        z_vectors.push(z.into_iter().map(|zi| zi * scale).collect());
+        // store L_free⁻¹(delta_free) = z_free * scale for the quadratic form
+        // in log_q_k. Length = n_free.
+        z_vectors.push(z_free.into_iter().map(|zi| zi * scale).collect());
     }
 
     // Step 2: Evaluate importance weights in parallel (warm-started inner loop)

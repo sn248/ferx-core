@@ -274,6 +274,12 @@ pub fn individual_nll_event_driven_ad(
         let mut ev_ka = 0.0_f64;
         let mut ev_q3 = 0.0_f64;
         let mut ev_v3 = 0.0_f64;
+        // F (bioavailability) defaults to 1.0 — matches PkParams::default()
+        // and the analytical event-driven path. If the model doesn't
+        // declare F as an individual parameter, the loop below never
+        // overwrites this and the bolus / infusion scaling reduces to a
+        // no-op multiplication by 1.
+        let mut ev_f = 1.0_f64;
         let row_off = ev_idx * n_tv;
         for i in 0..n_tv {
             let mut eta_contrib = 0.0;
@@ -293,6 +299,8 @@ pub fn individual_nll_event_driven_ad(
                 ev_v2 = val;
             } else if idx == PK_IDX_KA {
                 ev_ka = val;
+            } else if idx == PK_IDX_F {
+                ev_f = val;
             } else if idx == PK_IDX_Q3 {
                 ev_q3 = val;
             } else if idx == PK_IDX_V3 {
@@ -320,6 +328,7 @@ pub fn individual_nll_event_driven_ad(
             ev_ka,
             ev_q3,
             ev_v3,
+            ev_f,
             dose_times,
             dose_rates,
             dose_durations,
@@ -343,14 +352,18 @@ pub fn individual_nll_event_driven_ad(
 
         // ── Dose branch. is_dose=0 for obs and pk-only events, so
         // their state0 is unchanged regardless of dose_amts/dose_rates
-        // values. Const inputs throughout.
+        // values. Const inputs throughout. `ev_f` applies bioavailability
+        // F1 at bolus injection — mirrors the analytical event-driven
+        // path (`pk::event_driven`) and the single-snapshot AD path
+        // (`ad::ad_gradients`). Without it, oral / extravascular subjects
+        // with F ≠ 1 silently got wrong AD gradients on TV-covariate fits.
         let is_dose = if kind < 0.5 { 1.0 } else { 0.0 };
         let is_bolus = if dose_rates[dose_idx] == 0.0 {
             1.0
         } else {
             0.0
         };
-        state0 += is_dose * is_bolus * dose_amts[dose_idx];
+        state0 += is_dose * is_bolus * dose_amts[dose_idx] * ev_f;
 
         // ── Observation branch. is_obs=0 for dose and pk-only events.
         let is_obs = if kind > 0.5 && kind < 1.5 { 1.0 } else { 0.0 };
@@ -436,6 +449,7 @@ fn propagate_state_ad(
     ka: f64,
     q3: f64,
     v3: f64,
+    f_bio: f64,
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
@@ -443,7 +457,11 @@ fn propagate_state_ad(
     n_doses: usize,
 ) -> (f64, f64, f64, f64) {
     // Const-only branch on pk_model_id — constant-folds under LLVM. Only
-    // the relevant arm contains real adjoint flow per build.
+    // the relevant arm contains real adjoint flow per build. `f_bio`
+    // scales every active infusion's rate inside the IV propagators
+    // (mirrors `pk::event_driven::propagate_with_bounds`). Oral
+    // propagators take no doses internally — bolus into depot is
+    // handled in the main event loop with `f_bio` applied there.
     if pk_model_id == 0 || pk_model_id == 2 {
         // 1-cpt IV bolus / infusion: state = [central].
         let s0 = propagate_one_cpt_ad(
@@ -452,6 +470,7 @@ fn propagate_state_ad(
             t_to,
             cl,
             v,
+            f_bio,
             dose_times,
             dose_rates,
             dose_durations,
@@ -473,6 +492,7 @@ fn propagate_state_ad(
             v,
             q,
             v2,
+            f_bio,
             dose_times,
             dose_rates,
             dose_durations,
@@ -499,6 +519,7 @@ fn propagate_state_ad(
             v2,
             q3,
             v3,
+            f_bio,
             dose_times,
             dose_rates,
             dose_durations,
@@ -529,6 +550,7 @@ fn propagate_one_cpt_ad(
     t_to: f64,
     cl: f64,
     v: f64,
+    f_bio: f64,
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
@@ -552,7 +574,8 @@ fn propagate_one_cpt_ad(
         let tau_total_raw = t_to - p_start;
         let diff = tau_total_raw - tau_to;
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
-        let contribution = (dose_rates[d] / ke) * ((-ke * tau_to).exp() - (-ke * tau_total).exp());
+        let r = f_bio * dose_rates[d];
+        let contribution = (r / ke) * ((-ke * tau_to).exp() - (-ke * tau_total).exp());
         s0 += contribution;
     }
     s0
@@ -573,6 +596,7 @@ fn propagate_two_cpt_ad(
     v1: f64,
     q: f64,
     v2: f64,
+    f_bio: f64,
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
@@ -620,9 +644,11 @@ fn propagate_two_cpt_ad(
         let diff = tau_total_raw - tau_to;
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
 
-        // Per-channel A_ss.
+        // Per-channel A_ss. `f_bio` scales the active infusion rate so a
+        // dur→0 infusion limits to a bolus of amount F·AMT — same
+        // convention as the bolus injection step in the event loop.
         let cmt = dose_cmts_f64[d] as i32;
-        let r = dose_rates[d];
+        let r = f_bio * dose_rates[d];
         let (a_ss_1, a_ss_2) = if cmt == 2 {
             (
                 r * v1_safe / cl_safe,
@@ -875,6 +901,7 @@ fn propagate_three_cpt_ad(
     v2: f64,
     q3: f64,
     v3: f64,
+    f_bio: f64,
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
@@ -918,9 +945,10 @@ fn propagate_three_cpt_ad(
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
 
         // Per-channel A_ss. Const-branch on dose_cmts_f64 selects which
-        // channel formula applies.
+        // channel formula applies. `f_bio` scales the active infusion
+        // rate so dur→0 limits to a bolus of amount F·AMT.
         let cmt = dose_cmts_f64[d] as i32;
-        let r = dose_rates[d];
+        let r = f_bio * dose_rates[d];
         let (a_ss_c, a_ss_p1, a_ss_p2) = if cmt == 2 {
             // Channel 2 (periph1).
             (

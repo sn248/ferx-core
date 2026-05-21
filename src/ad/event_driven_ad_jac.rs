@@ -82,6 +82,8 @@ pub fn predict_all_event_driven_ad(
         let mut ev_ka = 0.0_f64;
         let mut ev_q3 = 0.0_f64;
         let mut ev_v3 = 0.0_f64;
+        // F defaults to 1.0 — see sibling `event_driven_ad.rs`.
+        let mut ev_f = 1.0_f64;
         let row_off = ev_idx * n_tv;
         for i in 0..n_tv {
             let mut eta_contrib = 0.0;
@@ -100,6 +102,8 @@ pub fn predict_all_event_driven_ad(
                 ev_v2 = val;
             } else if idx == PK_IDX_KA {
                 ev_ka = val;
+            } else if idx == PK_IDX_F {
+                ev_f = val;
             } else if idx == PK_IDX_Q3 {
                 ev_q3 = val;
             } else if idx == PK_IDX_V3 {
@@ -122,6 +126,7 @@ pub fn predict_all_event_driven_ad(
             ev_ka,
             ev_q3,
             ev_v3,
+            ev_f,
             dose_times,
             dose_rates,
             dose_durations,
@@ -138,14 +143,15 @@ pub fn predict_all_event_driven_ad(
         let dose_idx = if kind < 0.5 { orig } else { 0 };
 
         // is_dose=0 for obs (kind=1) and pk-only (kind=2), so their
-        // state0 is unchanged regardless of dose_*[dose_idx].
+        // state0 is unchanged regardless of dose_*[dose_idx]. `ev_f`
+        // applies F1 at bolus injection — see sibling `event_driven_ad.rs`.
         let is_dose = if kind < 0.5 { 1.0 } else { 0.0 };
         let is_bolus = if dose_rates[dose_idx] == 0.0 {
             1.0
         } else {
             0.0
         };
-        state0 += is_dose * is_bolus * dose_amts[dose_idx];
+        state0 += is_dose * is_bolus * dose_amts[dose_idx] * ev_f;
 
         let central_amt = if pk_model_id == 1 || pk_model_id == 4 || pk_model_id == 7 {
             state1
@@ -191,6 +197,7 @@ fn propagate_state_jac(
     ka: f64,
     q3: f64,
     v3: f64,
+    f_bio: f64,
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
@@ -204,6 +211,7 @@ fn propagate_state_jac(
             t_to,
             cl,
             v,
+            f_bio,
             dose_times,
             dose_rates,
             dose_durations,
@@ -223,6 +231,7 @@ fn propagate_state_jac(
             v,
             q,
             v2,
+            f_bio,
             dose_times,
             dose_rates,
             dose_durations,
@@ -247,6 +256,7 @@ fn propagate_state_jac(
             v2,
             q3,
             v3,
+            f_bio,
             dose_times,
             dose_rates,
             dose_durations,
@@ -270,6 +280,7 @@ fn propagate_one_cpt_jac(
     t_to: f64,
     cl: f64,
     v: f64,
+    f_bio: f64,
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
@@ -293,7 +304,8 @@ fn propagate_one_cpt_jac(
         let tau_total_raw = t_to - p_start;
         let diff = tau_total_raw - tau_to;
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
-        let contribution = (dose_rates[d] / ke) * ((-ke * tau_to).exp() - (-ke * tau_total).exp());
+        let r = f_bio * dose_rates[d];
+        let contribution = (r / ke) * ((-ke * tau_to).exp() - (-ke * tau_total).exp());
         s0 += contribution;
     }
     s0
@@ -309,6 +321,7 @@ fn propagate_two_cpt_jac(
     v1: f64,
     q: f64,
     v2: f64,
+    f_bio: f64,
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
@@ -354,7 +367,7 @@ fn propagate_two_cpt_jac(
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
 
         let cmt = dose_cmts_f64[d] as i32;
-        let r = dose_rates[d];
+        let r = f_bio * dose_rates[d];
         let (a_ss_1, a_ss_2) = if cmt == 2 {
             (
                 r * v1_safe / cl_safe,
@@ -570,6 +583,7 @@ fn propagate_three_cpt_jac(
     v2: f64,
     q3: f64,
     v3: f64,
+    f_bio: f64,
     dose_times: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
@@ -608,7 +622,7 @@ fn propagate_three_cpt_jac(
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
 
         let cmt = dose_cmts_f64[d] as i32;
-        let r = dose_rates[d];
+        let r = f_bio * dose_rates[d];
         let (a_ss_c, a_ss_p1, a_ss_p2) = if cmt == 2 {
             (
                 r * v1_safe / cl_safe,
@@ -795,4 +809,166 @@ pub fn compute_jacobian_event_driven_ad(
     }
 
     jac
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ad::ad_gradients::pk_model_to_id;
+    use approx::assert_relative_eq;
+
+    // Helper: build the minimum tv_per_event row layout the kernel needs.
+    // `pk_idx_f64` declares which PK indices the row covers (and in what
+    // order); each row carries one value per declared index.
+    fn build_tv_constant(pk_idx: &[usize], values: &[f64], n_events: usize) -> Vec<f64> {
+        assert_eq!(pk_idx.len(), values.len());
+        let mut out = Vec::with_capacity(n_events * pk_idx.len());
+        for _ in 0..n_events {
+            out.extend_from_slice(values);
+        }
+        out
+    }
+
+    /// F scales bolus and infusion dose amounts linearly in the event-
+    /// driven AD path. Regression for issue #16: the AD path was
+    /// silently dropping `f_bio` at the dose-injection step (bolus) and
+    /// in the propagator infusion contributions, so subjects with
+    /// TV-covariates + F ≠ 1 got wrong AD gradients / predictions.
+    /// We assert the linear-scaling invariant
+    /// `pred(F=F0) == F0 * pred(F=1)` separately for an oral bolus and
+    /// an IV infusion, since that catches both fix sites without
+    /// requiring a hand-computed reference.
+    #[test]
+    fn ad_event_driven_applies_f_bio_to_oral_bolus() {
+        // 1-cpt oral, single bolus at t=0, observations spread over the
+        // absorption + elimination phase.
+        let pk_model_id = pk_model_to_id(PkModel::OneCptOral) as f64;
+        let event_times = vec![0.0_f64, 0.5, 1.0, 2.0, 4.0, 8.0];
+        let event_kinds = vec![0.0_f64, 1.0, 1.0, 1.0, 1.0, 1.0]; // dose then 5 obs
+        let event_orig = vec![0.0_f64, 0.0, 1.0, 2.0, 3.0, 4.0];
+        let dose_times = vec![0.0_f64];
+        let dose_amts = vec![1000.0_f64];
+        let dose_rates = vec![0.0_f64]; // bolus
+        let dose_durations = vec![0.0_f64];
+        let dose_cmts = vec![1.0_f64];
+
+        // No eta — single fake row to satisfy n_eta >= 1.
+        let eta = vec![0.0_f64];
+        // Include F in pk_idx so the per-event row carries it.
+        let pk_idx = vec![PK_IDX_CL, PK_IDX_V, PK_IDX_KA, PK_IDX_F];
+        let pk_idx_f64: Vec<f64> = pk_idx.iter().map(|&i| i as f64).collect();
+        let n_tv = pk_idx.len();
+        let n_eta = eta.len();
+        let sel_flat = vec![0.0_f64; n_tv * n_eta]; // all-zero: no eta on any tv
+
+        let cl = 5.0;
+        let v = 50.0;
+        let ka = 1.2;
+
+        let run = |f: f64| -> Vec<f64> {
+            let tv = build_tv_constant(&pk_idx, &[cl, v, ka, f], event_times.len());
+            let mut out = vec![0.0_f64; event_times.len()];
+            predict_all_event_driven_ad(
+                &eta,
+                &tv,
+                &event_times,
+                &event_kinds,
+                &event_orig,
+                &dose_times,
+                &dose_amts,
+                &dose_rates,
+                &dose_durations,
+                &dose_cmts,
+                &pk_idx_f64,
+                &sel_flat,
+                pk_model_id,
+                &mut out,
+            );
+            // Drop the dose slot (kind=0) — only obs slots carry preds.
+            event_kinds
+                .iter()
+                .zip(out.iter())
+                .filter(|(k, _)| **k > 0.5)
+                .map(|(_, p)| *p)
+                .collect()
+        };
+
+        let preds_unit = run(1.0);
+        let preds_half = run(0.5);
+        let preds_tall = run(2.5);
+
+        // Sanity: at F=1 some obs has non-trivial concentration.
+        assert!(preds_unit.iter().any(|p| *p > 1e-3));
+        for (a, b) in preds_unit.iter().zip(preds_half.iter()) {
+            assert_relative_eq!(*b, 0.5 * *a, epsilon = 1e-12, max_relative = 1e-12);
+        }
+        for (a, b) in preds_unit.iter().zip(preds_tall.iter()) {
+            assert_relative_eq!(*b, 2.5 * *a, epsilon = 1e-12, max_relative = 1e-12);
+        }
+    }
+
+    #[test]
+    fn ad_event_driven_applies_f_bio_to_iv_infusion() {
+        // 1-cpt IV infusion: dose split across a finite duration so the
+        // propagator's per-dose `f_bio * dose_rates[d]` path runs (not the
+        // main loop's bolus step).
+        let pk_model_id = pk_model_to_id(PkModel::OneCptInfusion) as f64;
+        let event_times = vec![0.0_f64, 0.5, 1.0, 2.0, 4.0, 8.0];
+        let event_kinds = vec![0.0_f64, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let event_orig = vec![0.0_f64, 0.0, 1.0, 2.0, 3.0, 4.0];
+        let dose_times = vec![0.0_f64];
+        let dose_amts = vec![1000.0_f64];
+        let dose_rates = vec![500.0_f64]; // 2-hour infusion
+        let dose_durations = vec![2.0_f64];
+        let dose_cmts = vec![1.0_f64];
+
+        let eta = vec![0.0_f64];
+        let pk_idx = vec![PK_IDX_CL, PK_IDX_V, PK_IDX_F];
+        let pk_idx_f64: Vec<f64> = pk_idx.iter().map(|&i| i as f64).collect();
+        let n_tv = pk_idx.len();
+        let n_eta = eta.len();
+        let sel_flat = vec![0.0_f64; n_tv * n_eta];
+
+        let cl = 10.0;
+        let v = 100.0;
+
+        let run = |f: f64| -> Vec<f64> {
+            let tv = build_tv_constant(&pk_idx, &[cl, v, f], event_times.len());
+            let mut out = vec![0.0_f64; event_times.len()];
+            predict_all_event_driven_ad(
+                &eta,
+                &tv,
+                &event_times,
+                &event_kinds,
+                &event_orig,
+                &dose_times,
+                &dose_amts,
+                &dose_rates,
+                &dose_durations,
+                &dose_cmts,
+                &pk_idx_f64,
+                &sel_flat,
+                pk_model_id,
+                &mut out,
+            );
+            event_kinds
+                .iter()
+                .zip(out.iter())
+                .filter(|(k, _)| **k > 0.5)
+                .map(|(_, p)| *p)
+                .collect()
+        };
+
+        let preds_unit = run(1.0);
+        let preds_half = run(0.5);
+        let preds_tall = run(2.5);
+
+        assert!(preds_unit.iter().any(|p| *p > 1e-3));
+        for (a, b) in preds_unit.iter().zip(preds_half.iter()) {
+            assert_relative_eq!(*b, 0.5 * *a, epsilon = 1e-12, max_relative = 1e-12);
+        }
+        for (a, b) in preds_unit.iter().zip(preds_tall.iter()) {
+            assert_relative_eq!(*b, 2.5 * *a, epsilon = 1e-12, max_relative = 1e-12);
+        }
+    }
 }

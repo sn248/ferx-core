@@ -589,22 +589,13 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 .map_err(|e| e.to_string())?;
             writeln!(f, "    output_activation: {}", nn.output_activation)
                 .map_err(|e| e.to_string())?;
-            writeln!(
-                f,
-                "    inputs: [{}]",
-                nn.input_names.join(", ")
-            )
-            .map_err(|e| e.to_string())?;
-            writeln!(
-                f,
-                "    outputs: [{}]",
-                nn.output_names.join(", ")
-            )
-            .map_err(|e| e.to_string())?;
+            writeln!(f, "    inputs: [{}]", nn.input_names.join(", "))
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "    outputs: [{}]", nn.output_names.join(", "))
+                .map_err(|e| e.to_string())?;
             writeln!(f, "    n_weights: {}", nn.n_weights).map_err(|e| e.to_string())?;
             // Summary statistics over the trained weight values.
-            let w_slice =
-                &result.theta[nn.weights_offset..nn.weights_offset + nn.n_weights];
+            let w_slice = &result.theta[nn.weights_offset..nn.weights_offset + nn.n_weights];
             let (mn, mx, mean, sd) = weight_summary(w_slice);
             writeln!(f, "    weights_summary:").map_err(|e| e.to_string())?;
             writeln!(f, "      min:  {:.6}", mn).map_err(|e| e.to_string())?;
@@ -1039,7 +1030,10 @@ mod tests {
         let yaml = std::fs::read_to_string(&path).expect("yaml read");
 
         // The user-declared theta (TVKA) is still in the per-theta listing.
-        assert!(yaml.contains("  TVKA:"), "TVKA must appear in theta section:\n{yaml}");
+        assert!(
+            yaml.contains("  TVKA:"),
+            "TVKA must appear in theta section:\n{yaml}"
+        );
 
         // None of the 17 NN-weight thetas appear in the per-theta listing.
         for layer in 1..3 {
@@ -1058,15 +1052,39 @@ mod tests {
         }
 
         // The compact `neural_networks:` section IS present.
-        assert!(yaml.contains("\nneural_networks:"), "neural_networks section missing:\n{yaml}");
-        assert!(yaml.contains("  TYPICAL_PK:"), "NN block name missing:\n{yaml}");
-        assert!(yaml.contains("    shape: [2, 3, 2]"), "shape missing:\n{yaml}");
-        assert!(yaml.contains("hidden_activation: tanh"), "hidden activation missing:\n{yaml}");
-        assert!(yaml.contains("output_activation: softplus"), "output activation missing:\n{yaml}");
-        assert!(yaml.contains("inputs: [WT, CRCL]"), "inputs missing:\n{yaml}");
-        assert!(yaml.contains("outputs: [CL, V]"), "outputs missing:\n{yaml}");
+        assert!(
+            yaml.contains("\nneural_networks:"),
+            "neural_networks section missing:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("  TYPICAL_PK:"),
+            "NN block name missing:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("    shape: [2, 3, 2]"),
+            "shape missing:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("hidden_activation: tanh"),
+            "hidden activation missing:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("output_activation: softplus"),
+            "output activation missing:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("inputs: [WT, CRCL]"),
+            "inputs missing:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("outputs: [CL, V]"),
+            "outputs missing:\n{yaml}"
+        );
         assert!(yaml.contains("n_weights: 17"), "n_weights missing:\n{yaml}");
-        assert!(yaml.contains("weights_summary:"), "weights_summary missing:\n{yaml}");
+        assert!(
+            yaml.contains("weights_summary:"),
+            "weights_summary missing:\n{yaml}"
+        );
         assert!(yaml.contains("      min:"), "min stat missing:\n{yaml}");
         assert!(yaml.contains("      max:"), "max stat missing:\n{yaml}");
     }

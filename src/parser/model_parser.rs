@@ -23,10 +23,7 @@ enum MuRefAnchor {
     /// alphabetically-sorted NN list (same as `ParseCtx::nn_specs`);
     /// `output_idx` indexes the block's declared `outputs` list.
     #[allow(dead_code)]
-    NnOutput {
-        nn_idx: usize,
-        output_idx: usize,
-    },
+    NnOutput { nn_idx: usize, output_idx: usize },
 }
 
 /// Walk a Mul-chain and collect direct anchor candidates — `Theta(i)` or
@@ -815,13 +812,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     #[cfg(not(feature = "nn"))]
     let nn_specs_for_ctx: Vec<(String, Vec<String>)> = Vec::new();
 
-    let bare_ctx =
-        ParseCtx::new(&theta_names, &eta_names, &[]).with_nn_specs(&nn_specs_for_ctx);
+    let bare_ctx = ParseCtx::new(&theta_names, &eta_names, &[]).with_nn_specs(&nn_specs_for_ctx);
     let pre_stmts = parse_block_statements(&indiv_text, bare_ctx, StatementMode::Plain)?;
     let all_assigned = assigned_vars_in_order(&pre_stmts);
     let indiv_var_names = top_level_assigned_vars(&pre_stmts);
-    let indiv_ctx = ParseCtx::new(&theta_names, &eta_names, &all_assigned)
-        .with_nn_specs(&nn_specs_for_ctx);
+    let indiv_ctx =
+        ParseCtx::new(&theta_names, &eta_names, &all_assigned).with_nn_specs(&nn_specs_for_ctx);
     let indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
 
     // Detect ODE vs analytical model
@@ -1127,8 +1123,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .chain(kappa_names.iter())
         .cloned()
         .collect();
-    let all_mu_refs =
-        detect_mu_refs(&indiv_stmts, &theta_names, &all_eta_names, &nn_specs_for_ctx);
+    let all_mu_refs = detect_mu_refs(
+        &indiv_stmts,
+        &theta_names,
+        &all_eta_names,
+        &nn_specs_for_ctx,
+    );
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
     let mu_refs: HashMap<String, MuRef> = all_mu_refs
         .iter()
@@ -1778,17 +1778,14 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         let key = key.trim().to_ascii_lowercase();
         let value = value.trim().to_string();
         if fields.insert(key.clone(), value).is_some() {
-            return Err(format!(
-                "[covariate_nn {}] duplicate key `{}`",
-                name, key
-            ));
+            return Err(format!("[covariate_nn {}] duplicate key `{}`", name, key));
         }
     }
 
     let take_list = |field: &str| -> Result<Vec<String>, String> {
-        let raw = fields.get(field).ok_or_else(|| {
-            format!("[covariate_nn {}] missing required `{}`", name, field)
-        })?;
+        let raw = fields
+            .get(field)
+            .ok_or_else(|| format!("[covariate_nn {}] missing required `{}`", name, field))?;
         let inner = raw
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
@@ -2939,7 +2936,10 @@ enum Expression {
     /// reads the pre-computed forward output from a per-call cache in
     /// `build_pk_param_fn` so multiple references to outputs of the same
     /// NN share a single forward pass.
-    NnOutput { nn_idx: usize, output_idx: usize },
+    NnOutput {
+        nn_idx: usize,
+        output_idx: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -3998,16 +3998,17 @@ fn parse_atom(
                         }
                     };
                     let outputs = &ctx.nn_specs[nn_idx].1;
-                    let output_idx = outputs
-                        .iter()
-                        .position(|o| o == output_name)
-                        .ok_or_else(|| {
-                            format!(
-                                "`{name}.{output_name}` is not declared as an output of \
+                    let output_idx =
+                        outputs
+                            .iter()
+                            .position(|o| o == output_name)
+                            .ok_or_else(|| {
+                                format!(
+                                    "`{name}.{output_name}` is not declared as an output of \
                                  [covariate_nn {name}]. Known outputs: {}",
-                                outputs.join(", ")
-                            )
-                        })?;
+                                    outputs.join(", ")
+                                )
+                            })?;
                     return Ok((Expression::NnOutput { nn_idx, output_idx }, pos + 3));
                 }
                 // `NAME.X` where NAME is not a known NN — fall through to the
@@ -7106,7 +7107,10 @@ if (1 > 0) {
             "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [CL]\n  layers = [3]\n  activation = quack\n",
         );
         let err = parse_model_string(&src).expect_err("bad activation must error");
-        assert!(err.contains("quack"), "error should name the bad activation, got: {err}");
+        assert!(
+            err.contains("quack"),
+            "error should name the bad activation, got: {err}"
+        );
     }
 
     #[cfg(feature = "nn")]
@@ -7130,7 +7134,10 @@ if (1 > 0) {
             "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [CL]\n  activation = relu\n",
         );
         let err = parse_model_string(&src).expect_err("missing layers must error");
-        assert!(err.contains("layers"), "error should mention `layers`, got: {err}");
+        assert!(
+            err.contains("layers"),
+            "error should mention `layers`, got: {err}"
+        );
     }
 
     #[cfg(feature = "nn")]
@@ -7427,7 +7434,10 @@ if (1 > 0) {
         cov.insert("WT".to_string(), 70.0);
         cov.insert("CRCL".to_string(), 95.0);
 
-        let tv_fn = model.tv_fn.as_ref().expect("analytical model -> Some(tv_fn)");
+        let tv_fn = model
+            .tv_fn
+            .as_ref()
+            .expect("analytical model -> Some(tv_fn)");
         let tvs = tv_fn(&theta, &cov);
 
         // tv_fn returns values in `indiv_param_names` declaration order:

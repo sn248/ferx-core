@@ -217,8 +217,8 @@ fn final_ofv_no_worse_than_best_seen_during_trace() {
     opts.optimizer_trace = true;
     opts.run_covariance_step = false;
 
-    let result = fit(&model, &population, &model.default_params, &opts)
-        .expect("slsqp fit must succeed");
+    let result =
+        fit(&model, &population, &model.default_params, &opts).expect("slsqp fit must succeed");
     assert!(result.ofv.is_finite());
 
     let trace_path = result

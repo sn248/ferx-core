@@ -522,6 +522,54 @@ mod tests {
     }
 
     #[test]
+    fn run_sir_succeeds_with_fixed_parameters() {
+        // Regression: before run_sir_core was restricted to the free
+        // subspace, every SIR sample for a model with at least one FIX-ed
+        // parameter failed the bounds check. `compute_covariance` zeroes the
+        // rows/cols of FIX-ed indices, the proposal-cov regularisation
+        // (eigenvalue floor of 1e-8) then perturbs them by ~1e-4, and
+        // `compute_bounds` pins them with `lower == upper == x_hat[i]` — so
+        // the strict bounds check rejected every sample and SIR returned
+        // "All SIR samples had invalid weights".
+        //
+        // `examples/warfarin_fix.ferx` exercises FIX on a theta, an omega,
+        // and a sigma in one go.
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model_fix.ferx");
+        let data_path = dir.path().join("data.csv");
+        std::fs::copy("examples/warfarin_fix.ferx", &model_path).unwrap();
+        std::fs::copy(DATA_PATH, &data_path).unwrap();
+
+        let opts = quick_opts();
+        let Some(fit) = fit_with_cov_or_skip(
+            model_path.to_str().unwrap(),
+            data_path.to_str().unwrap(),
+            opts.clone(),
+        ) else {
+            return;
+        };
+
+        // Sanity-check the fit actually carries FIX-ed parameters — without
+        // this the test would silently degenerate into a non-FIX path.
+        assert!(
+            fit.theta_fixed.iter().any(|&b| b)
+                || fit.omega_fixed.iter().any(|&b| b)
+                || fit.sigma_fixed.iter().any(|&b| b),
+            "expected at least one FIX-ed parameter in warfarin_fix.ferx"
+        );
+
+        let out = run_sir(&fit, None, None, &opts)
+            .expect("SIR must succeed on a model with FIX-ed parameters");
+        let ess = out.sir_ess.expect("sir_ess populated");
+        assert!(
+            ess > 0.0 && ess <= opts.sir_samples as f64,
+            "ess = {} out of (0, {}]",
+            ess,
+            opts.sir_samples
+        );
+    }
+
+    #[test]
     fn run_sir_errors_when_no_model_path_recorded_and_no_caller_model() {
         // Cover the "no model path recorded and caller didn't supply one"
         // branch — the in-memory `fit()` path leaves `model_path = None`,

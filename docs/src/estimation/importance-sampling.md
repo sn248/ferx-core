@@ -87,13 +87,32 @@ For each subject *i* with EBE η̂ᵢ and inner-loop Jacobian Jᵢ = ∂f/∂η 
    \\;=\\; \\operatorname{lse}_k \\log w_{ik} - \\log K.
    \\]
 
-5. **Population −2 log L** = sum across subjects, doubled and negated.
+5. **Per-subject effective sample size:**
+   \\(\\mathrm{ESS}_i = 1 / \\sum_k \\tilde w_{ik}^2\\) (normalised weights).
+   The result reports the across-subject min and median of ESS/K, plus
+   any subjects below `is_low_ess_threshold` (default 10%).
 
-The per-subject **effective sample size** is
-\\(\\mathrm{ESS}_i = 1 / \\sum_k \\tilde w_{ik}^2\\)
-(normalised weights). The result reports the across-subject min and median
-of ESS/K, plus any subjects below `is_low_ess_threshold` (default 10%).
-The Monte-Carlo standard error on `−2 log L` is reported alongside.
+6. **Monte-Carlo standard error.** For a self-normalised IS estimator the
+   asymptotic per-subject variance (Geweke 1989) is
+   \\[
+   \\operatorname{Var}\\bigl(\\log \\hat p(y_i \\mid \\theta)\\bigr)
+   \\;\\approx\\; \\frac{1}{K}\\left(\\frac{1}{\\mathrm{ESS}_i / K} - 1\\right).
+   \\]
+   Aggregating across subjects (LL is a sum of independent per-subject
+   log-marginals) and converting to the `−2 log L` scale,
+   \\[
+   \\operatorname{SE}(-2 \\log L_{IS})
+   \\;=\\; 2 \\sqrt{\\sum_i \\operatorname{Var}\\bigl(\\log \\hat p(y_i \\mid \\theta)\\bigr)}.
+   \\]
+   Subjects with degenerate ESS (\\(\\mathrm{ESS}_i / K = 0\\) — complete
+   proposal collapse) fall back to a per-subject variance of `1.0`, which
+   produces a *finite* but inflated SE rather than a NaN. A separate
+   warning is emitted on `FitResult.warnings` listing the collapsed
+   subjects; the IS-LL itself remains usable as a point estimate.
+
+7. **Population −2 log L** = `−2 · Σᵢ log p̂(yᵢ | θ)`, reported on
+   `FitResult.importance_sampling.minus2_log_likelihood` together with
+   `mc_standard_error`.
 
 ## Tuning
 
@@ -110,6 +129,11 @@ The Monte-Carlo standard error on `−2 log L` is reported alongside.
   Hessian was near-singular. The IS estimate is still unbiased, just
   noisier. Investigate by re-running with a tighter `inner_tol` or
   inspecting the `FitResult.subjects[i]` diagnostics.
+- **Reproducibility.** `is_seed` defaults to `42` when unset (so two
+  fits with the same `is_samples` and `is_proposal_df` produce identical
+  `−2 log L`). Set it explicitly to vary the RNG stream. The full set of
+  `is_*` defaults is listed in the
+  [`[fit_options]` reference](../model-file/fit-options.md#importance-sampling-imp).
 
 ## SDE / [diffusion] models (not supported)
 

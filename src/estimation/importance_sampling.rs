@@ -578,6 +578,15 @@ fn logsumexp_with_normalised(xs: &[f64]) -> (f64, Vec<f64>) {
 /// IOV-aware obs NLL with κ fixed at its EBE. Mirrors the per-occasion split
 /// in `foce_subject_nll_iov` but returns only the obs term — no Laplace/FOCE
 /// linearisation.
+//
+// TODO(imp-iov-v2): the per-occasion loop below calls `compute_predictions_
+// with_tv_into` once per occasion across the *entire* subject timeline and
+// then discards everything outside `obs_indices`. For a subject with n_occ
+// occasions and K = is_samples draws, that is O(K · n_occ) full-subject PK
+// evaluations where O(K) would suffice if `compute_predictions_with_tv_into`
+// accepted a per-occasion kappa schedule. Acceptable in v1 (IOV with IMP is
+// already an explicit partial-marginal use case); revisit alongside joint
+// (η, κ) sampling.
 fn obs_nll_iov_fixed_kappa(
     model: &CompiledModel,
     subject: &Subject,

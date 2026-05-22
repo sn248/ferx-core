@@ -179,6 +179,53 @@ fn imp_after_focei_handles_fixed_theta_omega_sigma() {
 }
 
 #[test]
+fn imp_after_saem_populates_field() {
+    // SAEM → IMP is the *other* advertised chain (alongside FOCEI → IMP). SAEM
+    // routes `h_matrices` through `run_inner_loop_warm` after the stochastic
+    // approximation loop, so the per-subject Jacobian shape is structurally the
+    // same as FOCEI's — but a future refactor of SAEM's terminal stage could
+    // diverge that shape, which IMP's defensive shape check would catch as a
+    // hard `Err`. This test locks in the wiring against that regression.
+    //
+    // Iterations are floored to the minimum SAEM accepts; convergence quality
+    // is not being tested.
+    let (model, population, mut opts) = warfarin_setup();
+    opts.saem_n_exploration = 5;
+    opts.saem_n_convergence = 5;
+    opts.saem_n_mh_steps = 2;
+    opts.methods = vec![EstimationMethod::Saem, EstimationMethod::Imp];
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("saem → imp chain must produce a fit");
+    let imp = result
+        .importance_sampling
+        .as_ref()
+        .expect("importance_sampling must be populated after a successful saem → imp run");
+    assert!(
+        imp.minus2_log_likelihood.is_finite(),
+        "-2 LL must be finite after saem → imp, got {}",
+        imp.minus2_log_likelihood
+    );
+    assert!(
+        imp.mc_standard_error >= 0.0 && imp.mc_standard_error.is_finite(),
+        "MC SE must be finite & non-negative, got {}",
+        imp.mc_standard_error
+    );
+    assert_eq!(imp.n_samples, 200);
+    assert!(
+        (0.0..=1.0).contains(&imp.ess_min),
+        "ess_min out of range: {}",
+        imp.ess_min
+    );
+    // `method_chain` keeps the IMP terminal stage; `method` drops it so the
+    // canonical reported method is the last estimating stage (SAEM here).
+    assert_eq!(
+        result.method_chain,
+        vec![EstimationMethod::Saem, EstimationMethod::Imp]
+    );
+    assert_eq!(result.method, EstimationMethod::Saem);
+}
+
+#[test]
 fn imp_minus2_ll_is_in_loose_neighbourhood_of_focei_ofv() {
     // Warfarin is well-sampled (≈8 obs/subject) — the Laplace approximation is
     // good here, so the IS and FOCEI likelihoods should be within tens of OFV

@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-8db824f0.js";
+            window.path_to_searchindex_js = "searchindex-5ecdcefc.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-eae77ecf.js"></script>
@@ -2544,14 +2544,36 @@ proposal — gives a valid but noisy LL estimate).</li>
 \]</p>
 </li>
 <li>
-<p><strong>Population −2 log L</strong> = sum across subjects, doubled and negated.</p>
+<p><strong>Per-subject effective sample size:</strong>
+\(\mathrm{ESS}<em>i = 1 / \sum_k \tilde w</em>{ik}^2\) (normalised weights).
+The result reports the across-subject min and median of ESS/K, plus
+any subjects below <code>is_low_ess_threshold</code> (default 10%).</p>
+</li>
+<li>
+<p><strong>Monte-Carlo standard error.</strong> For a self-normalised IS estimator the
+asymptotic per-subject variance (Geweke 1989) is
+\[
+\operatorname{Var}\bigl(\log \hat p(y_i \mid \theta)\bigr)
+\;\approx\; \frac{1}{K}\left(\frac{1}{\mathrm{ESS}<em>i / K} - 1\right).
+\]
+Aggregating across subjects (LL is a sum of independent per-subject
+log-marginals) and converting to the <code>−2 log L</code> scale,
+\[
+\operatorname{SE}(-2 \log L</em>{IS})
+\;=\; 2 \sqrt{\sum_i \operatorname{Var}\bigl(\log \hat p(y_i \mid \theta)\bigr)}.
+\]
+Subjects with degenerate ESS (\(\mathrm{ESS}_i / K = 0\) — complete
+proposal collapse) fall back to a per-subject variance of <code>1.0</code>, which
+produces a <em>finite</em> but inflated SE rather than a NaN. A separate
+warning is emitted on <code>FitResult.warnings</code> listing the collapsed
+subjects; the IS-LL itself remains usable as a point estimate.</p>
+</li>
+<li>
+<p><strong>Population −2 log L</strong> = <code>−2 · Σᵢ log p̂(yᵢ | θ)</code>, reported on
+<code>FitResult.importance_sampling.minus2_log_likelihood</code> together with
+<code>mc_standard_error</code>.</p>
 </li>
 </ol>
-<p>The per-subject <strong>effective sample size</strong> is
-\(\mathrm{ESS}<em>i = 1 / \sum_k \tilde w</em>{ik}^2\)
-(normalised weights). The result reports the across-subject min and median
-of ESS/K, plus any subjects below <code>is_low_ess_threshold</code> (default 10%).
-The Monte-Carlo standard error on <code>−2 log L</code> is reported alongside.</p>
 <h2 id="tuning"><a class="header" href="#tuning">Tuning</a></h2>
 <ul>
 <li><strong>K = <code>is_samples</code></strong> controls accuracy. The MC SE scales as
@@ -2567,6 +2589,11 @@ posterior well — usually a sign the EBE didn’t converge or the
 Hessian was near-singular. The IS estimate is still unbiased, just
 noisier. Investigate by re-running with a tighter <code>inner_tol</code> or
 inspecting the <code>FitResult.subjects[i]</code> diagnostics.</li>
+<li><strong>Reproducibility.</strong> <code>is_seed</code> defaults to <code>42</code> when unset (so two
+fits with the same <code>is_samples</code> and <code>is_proposal_df</code> produce identical
+<code>−2 log L</code>). Set it explicitly to vary the RNG stream. The full set of
+<code>is_*</code> defaults is listed in the
+<a href="#importance-sampling-imp"><code>[fit_options]</code> reference</a>.</li>
 </ul>
 <h2 id="sde--diffusion-models-not-supported"><a class="header" href="#sde--diffusion-models-not-supported">SDE / [diffusion] models (not supported)</a></h2>
 <p>IMP refuses to run on models with a <code>[diffusion]</code> block. The EKF

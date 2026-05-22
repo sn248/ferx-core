@@ -761,6 +761,40 @@ fn fit_inner(
                 &stage_opts,
             ) {
                 Ok(r) => {
+                    // Surface a *separate* warning for any subject whose
+                    // ESS-fraction collapsed to zero. These are already in
+                    // `low_ess_subjects` (assuming threshold > 0), but
+                    // complete proposal collapse is qualitatively distinct
+                    // from merely-low ESS — each collapsed subject inflates
+                    // the reported MC SE by ~1 unit (see Geweke variance
+                    // fallback in `importance_sampling.rs`).
+                    let collapsed: Vec<&str> = r
+                        .low_ess_subjects
+                        .iter()
+                        .filter(|(_, f)| *f <= 0.0)
+                        .map(|(id, _)| id.as_str())
+                        .collect();
+                    if !collapsed.is_empty() {
+                        let preview = if collapsed.len() <= 5 {
+                            collapsed.join(", ")
+                        } else {
+                            let head = collapsed[..5].join(", ");
+                            format!("{} (+{} more)", head, collapsed.len() - 5)
+                        };
+                        let msg = format!(
+                            "IMP: {} subject(s) had ESS = 0 (proposal collapse): {}. \
+                             The reported MC SE is inflated by ~1 per collapsed subject; \
+                             consider raising `is_samples` or `is_proposal_df`, \
+                             or check the EBE/Hessian quality of these subjects.",
+                            collapsed.len(),
+                            preview
+                        );
+                        accumulated_warnings.push(if n_stages > 1 {
+                            format!("[IMP] {}", msg)
+                        } else {
+                            msg
+                        });
+                    }
                     is_result = Some(r);
                 }
                 Err(e) => {

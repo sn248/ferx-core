@@ -868,6 +868,10 @@ pub struct SubjectResult {
 pub enum KappaTreatment {
     NotApplicable,
     FixedAtMode,
+    // Reserved for joint (eta, kappa) sampling; see TODO(imp-iov-v2) in
+    // `estimation/importance_sampling.rs`. Never constructed by v1 IMP so
+    // `dead_code` would otherwise fire on a strict clippy run.
+    #[allow(dead_code)]
     Marginalized,
 }
 

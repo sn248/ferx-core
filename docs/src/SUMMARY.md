@@ -21,6 +21,7 @@
   - [Gauss-Newton (BHHH)](estimation/gauss-newton.md)
   - [SAEM](estimation/saem.md)
   - [SIR](estimation/sir.md)
+  - [Importance Sampling (IMP)](estimation/importance-sampling.md)
   - [Inter-Occasion Variability (IOV)](estimation/iov.md)
 - [Data Format](data-format.md)
 - [CLI Reference](cli.md)

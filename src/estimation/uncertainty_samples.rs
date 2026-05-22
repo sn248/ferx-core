@@ -362,6 +362,7 @@ mod tests {
             sir_ci_sigma: None,
             sir_ess: None,
             sir_resamples_packed: None,
+            importance_sampling: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],

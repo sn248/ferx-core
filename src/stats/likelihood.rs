@@ -166,6 +166,38 @@ pub fn individual_nll_into_with_schedule(
     0.5 * (eta_prior + log_det_omega + data_ll)
 }
 
+/// Observation-only NLL for a single subject with ETAs held fixed.
+///
+/// Returns the data term `−log p(y_i | η, θ, σ)` (no prior, no |Ω| term) — the
+/// piece that participates in the SAEM M-step gradient and the IS-LL numerator.
+///
+/// Under M3, CENS=1 rows contribute `−log Φ((LLOQ − f)/√V)` instead of the
+/// Gaussian residual term.
+pub(crate) fn obs_nll_subject_into(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+    pk_scratch: &mut pk::EventPkParams,
+) -> f64 {
+    let m3 = matches!(model.bloq_method, BloqMethod::M3);
+    let preds = pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+    let mut nll = 0.0;
+    for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
+        let f = f.max(1e-12);
+        let v = crate::stats::residual_error::residual_variance(model.error_model, f, sigma_values)
+            .max(1e-12);
+        if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
+            let z = (y - f) / v.sqrt();
+            nll += -crate::stats::special::log_normal_cdf(z);
+        } else {
+            nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
+        }
+    }
+    nll
+}
+
 /// Compute per-observation EKF process-noise variance (p_obs) for an SDE model.
 ///
 /// Returns an empty vec when `model.is_sde()` is false — callers should check

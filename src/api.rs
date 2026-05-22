@@ -573,6 +573,38 @@ fn fit_inner(
             .to_string());
     }
 
+    // Guard: IMP is a likelihood evaluation, not an estimator. It must follow
+    // a parameter-estimating stage (it consumes that stage's EBEs + Hessians),
+    // may appear at most once, and must be the terminal stage. A non-terminal
+    // IMP would leave `FitResult.importance_sampling` populated with an IS-LL
+    // computed at parameters that the following stage then overwrites.
+    if chain.iter().any(|&m| m == EstimationMethod::Imp) {
+        if chain.first().copied() == Some(EstimationMethod::Imp) {
+            return Err(
+                "method `imp` cannot be the first stage in a chain — it consumes \
+                 EBEs and Hessians from a preceding estimator. Try `methods = [focei, imp]` \
+                 or `methods = [saem, imp]`."
+                    .to_string(),
+            );
+        }
+        let n_imp = chain
+            .iter()
+            .filter(|&&m| m == EstimationMethod::Imp)
+            .count();
+        if n_imp > 1 {
+            return Err("method `imp` may appear at most once in a chain.".to_string());
+        }
+        if chain.last().copied() != Some(EstimationMethod::Imp) {
+            return Err(
+                "method `imp` must be the final stage of the chain — placing it mid-chain \
+                 would leave `FitResult.importance_sampling` populated with a log-likelihood \
+                 computed at parameters that the following stage then overwrites. Move `imp` \
+                 to the end."
+                    .to_string(),
+            );
+        }
+    }
+
     // Guard: the trust-region outer optimizer does not yet thread kappas through
     // its OFV evaluation (see trust_region.rs::FoceiProblem::ofv_fixed which
     // passes &[] for kappas). Running it on an IOV model would silently produce
@@ -679,6 +711,7 @@ fn fit_inner(
     }
 
     let mut total_iterations: usize = 0;
+    let mut is_result: Option<ImportanceSamplingResult> = None;
 
     for (stage_idx, &method) in chain.iter().enumerate() {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -709,6 +742,72 @@ fn fit_inner(
             );
         }
 
+        // IMP stage: not an estimator. Consumes the previous stage's params /
+        // EBEs / Hessians, writes its result to `is_result`, and skips the
+        // params/result update at the bottom of the loop so the preceding
+        // stage's `OuterResult` continues to be the canonical one.
+        if method == EstimationMethod::Imp {
+            let prev = result.as_ref().expect(
+                "IMP guard above should have rejected an IMP-first chain — \
+                 prior stage's OuterResult must exist here",
+            );
+            match crate::estimation::importance_sampling::run_importance_sampling(
+                model,
+                population,
+                &prev.params,
+                &prev.eta_hats,
+                &prev.h_matrices,
+                &prev.kappas,
+                &stage_opts,
+            ) {
+                Ok(r) => {
+                    // Surface a *separate* warning for any subject whose
+                    // ESS-fraction collapsed to zero. These are already in
+                    // `low_ess_subjects` (assuming threshold > 0), but
+                    // complete proposal collapse is qualitatively distinct
+                    // from merely-low ESS — each collapsed subject inflates
+                    // the reported MC SE by ~1 unit (see Geweke variance
+                    // fallback in `importance_sampling.rs`).
+                    let collapsed: Vec<&str> = r
+                        .low_ess_subjects
+                        .iter()
+                        .filter(|(_, f)| *f <= 0.0)
+                        .map(|(id, _)| id.as_str())
+                        .collect();
+                    if !collapsed.is_empty() {
+                        let preview = if collapsed.len() <= 5 {
+                            collapsed.join(", ")
+                        } else {
+                            let head = collapsed[..5].join(", ");
+                            format!("{} (+{} more)", head, collapsed.len() - 5)
+                        };
+                        let msg = format!(
+                            "IMP: {} subject(s) had ESS = 0 (proposal collapse): {}. \
+                             The reported MC SE is inflated by ~1 per collapsed subject; \
+                             consider raising `is_samples` or `is_proposal_df`, \
+                             or check the EBE/Hessian quality of these subjects.",
+                            collapsed.len(),
+                            preview
+                        );
+                        accumulated_warnings.push(if n_stages > 1 {
+                            format!("[IMP] {}", msg)
+                        } else {
+                            msg
+                        });
+                    }
+                    is_result = Some(r);
+                }
+                Err(e) => {
+                    accumulated_warnings.push(if n_stages > 1 {
+                        format!("[IMP] {}", e)
+                    } else {
+                        format!("IMP: {}", e)
+                    });
+                }
+            }
+            continue;
+        }
+
         let stage_result = match method {
             EstimationMethod::Saem => {
                 saem::run_saem(model, population, &stage_params, &stage_opts)?
@@ -721,6 +820,7 @@ fn fit_inner(
                     &stage_opts,
                 )
             }
+            EstimationMethod::Imp => unreachable!("handled by the IMP branch above"),
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
 
@@ -861,7 +961,16 @@ fn fit_inner(
         None
     };
 
-    let final_method = *chain.last().expect("chain non-empty");
+    // `final_method` reports the last *estimating* stage — IMP is a likelihood
+    // evaluation and doesn't produce parameters, so a chain like `[saem, imp]`
+    // surfaces as `method = SAEM`. The full chain (including IMP) is preserved
+    // in `method_chain`.
+    let final_method = chain
+        .iter()
+        .rev()
+        .copied()
+        .find(|&m| m != EstimationMethod::Imp)
+        .unwrap_or(*chain.last().expect("chain non-empty"));
     let grad_inner =
         crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, model);
     let grad_outer = crate::build_info::gradient_method_outer(
@@ -1000,6 +1109,7 @@ fn fit_inner(
         sir_ci_sigma: sir_result.as_ref().map(|s| s.ci_sigma.clone()),
         sir_ess: sir_result.as_ref().map(|s| s.effective_sample_size),
         sir_resamples_packed: sir_result.as_ref().and_then(|s| s.resamples_packed.clone()),
+        importance_sampling: is_result,
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
@@ -2758,6 +2868,7 @@ mod simulate_with_uncertainty_tests {
             sir_ci_sigma: None,
             sir_ess: None,
             sir_resamples_packed: None,
+            importance_sampling: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],

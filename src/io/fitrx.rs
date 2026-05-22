@@ -339,6 +339,7 @@ fn method_to_str(m: EstimationMethod) -> &'static str {
         EstimationMethod::FoceGn => "foce_gn",
         EstimationMethod::FoceGnHybrid => "foce_gn_hybrid",
         EstimationMethod::Saem => "saem",
+        EstimationMethod::Imp => "imp",
     }
 }
 
@@ -349,6 +350,7 @@ fn method_from_str(s: &str) -> Result<EstimationMethod, FitrxError> {
         "foce_gn" => EstimationMethod::FoceGn,
         "foce_gn_hybrid" => EstimationMethod::FoceGnHybrid,
         "saem" => EstimationMethod::Saem,
+        "imp" => EstimationMethod::Imp,
         _ => return Err(FitrxError::Corrupt(format!("unknown method {:?}", s))),
     })
 }
@@ -1420,6 +1422,9 @@ fn wire_to_fit_result(
         sir_ci_sigma,
         sir_ess,
         sir_resamples_packed,
+        // .fitrx v1: importance_sampling is not serialised — re-run via
+        // `methods = [..., imp]` if the consumer needs the IS LL.
+        importance_sampling: None,
         omega_iov,
         kappa_names,
         kappa_fixed,
@@ -1578,6 +1583,7 @@ mod tests {
             sir_ci_sigma: None,
             sir_ess: None,
             sir_resamples_packed: None,
+            importance_sampling: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],

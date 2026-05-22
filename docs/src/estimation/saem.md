@@ -90,6 +90,16 @@ After the SAEM iterations complete:
 3. **Covariance Step**: Optionally compute standard errors via finite-difference Hessian (same method as FOCE)
 4. **Diagnostics**: Compute PRED, IPRED, CWRES, IWRES for each subject
 
+For sparsely-sampled data where the Laplace OFV is biased, you can
+append an importance-sampling stage that estimates `−2 log L` by Monte
+Carlo:
+
+```
+method = [saem, imp]
+```
+
+See [Importance Sampling (IMP)](importance-sampling.md).
+
 ## Configuration
 
 ```

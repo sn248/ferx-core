@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-22edb9ee.js";
+            window.path_to_searchindex_js = "searchindex-5ecdcefc.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-e4fdb3a6.js"></script>
+        <script src="toc-eae77ecf.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1737,7 +1737,7 @@ for comparison.</li>
 <tr><th>Key</th><th>Values</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>method</code></td><td><code>foce</code>, <code>focei</code>, <code>saem</code></td><td><code>focei</code></td><td>Estimation method</td></tr>
+<tr><td><code>method</code></td><td><code>foce</code>, <code>focei</code>, <code>saem</code>, <code>imp</code> (only as final chain stage)</td><td><code>focei</code></td><td>Estimation method (or single-stage method in a chain). See <a href="#chained-fits">chained fits</a>.</td></tr>
 <tr><td><code>maxiter</code></td><td>integer</td><td><code>500</code></td><td>Maximum outer loop iterations</td></tr>
 <tr><td><code>covariance</code></td><td><code>true</code>, <code>false</code></td><td><code>true</code></td><td>Compute covariance matrix and standard errors</td></tr>
 <tr><td><code>optimizer</code></td><td><code>slsqp</code>, <code>lbfgs</code>, <code>nlopt_lbfgs</code>, <code>mma</code>, <code>bfgs</code>, <code>bobyqa</code>, <code>trust_region</code></td><td><code>slsqp</code></td><td>Optimization algorithm</td></tr>
@@ -1799,6 +1799,32 @@ for comparison.</li>
 </table>
 </div>
 <p>See <a href="#sampling-importance-resampling-sir">SIR documentation</a> for details.</p>
+<h2 id="importance-sampling-imp"><a class="header" href="#importance-sampling-imp">Importance Sampling (IMP)</a></h2>
+<p>The <code>imp</code> stage estimates the marginal log-likelihood by Monte-Carlo
+importance sampling, giving a lower-bias <code>−2 log L</code> than the FOCE/Laplace
+OFV when subject posteriors of η are non-Gaussian (e.g. sparsely-sampled
+PK). Use it as a final chain stage:</p>
+<pre><code>[fit_options]
+  method        = [focei, imp]
+  is_samples    = 1000
+  is_proposal_df = 5
+  is_seed       = 12345
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>is_samples</code></td><td><code>1000</code></td><td>Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE.</td></tr>
+<tr><td><code>is_proposal_df</code></td><td><code>5.0</code></td><td>Student-t proposal degrees of freedom (≥ 1). Lower = heavier tails.</td></tr>
+<tr><td><code>is_seed</code></td><td><code>42</code></td><td>RNG seed. Same seed → identical <code>−2 log L</code>.</td></tr>
+<tr><td><code>is_low_ess_threshold</code></td><td><code>0.1</code></td><td>Subjects with normalized ESS below this fraction get flagged in the result. Set <code>0</code> to silence.</td></tr>
+</tbody>
+</table>
+</div>
+<p>See <a href="#importance-sampling-imp-1">Importance Sampling documentation</a>
+for the algorithm, IOV caveats, and tuning guidance.</p>
 <h2 id="optimizer-choices"><a class="header" href="#optimizer-choices">Optimizer Choices</a></h2>
 <div class="table-wrapper">
 <table>
@@ -2285,6 +2311,12 @@ warnings.</p>
 <li><strong>Covariance Step</strong>: Optionally compute standard errors via finite-difference Hessian (same method as FOCE)</li>
 <li><strong>Diagnostics</strong>: Compute PRED, IPRED, CWRES, IWRES for each subject</li>
 </ol>
+<p>For sparsely-sampled data where the Laplace OFV is biased, you can
+append an importance-sampling stage that estimates <code>−2 log L</code> by Monte
+Carlo:</p>
+<pre><code>method = [saem, imp]
+</code></pre>
+<p>See <a href="#importance-sampling-imp-1">Importance Sampling (IMP)</a>.</p>
 <h2 id="configuration-1"><a class="header" href="#configuration-1">Configuration</a></h2>
 <pre><code>[fit_options]
   method        = saem
@@ -2428,6 +2460,197 @@ let fit_with_sir = run_sir(&amp;fit, None, None, &amp;opts)?;
 <h2 id="reference"><a class="header" href="#reference">Reference</a></h2>
 <p>Dosne A-G, Bergstrand M, Karlsson MO. “Improving the estimation of parameter uncertainty distributions in nonlinear mixed effects models using sampling importance resampling.” <em>J Pharmacokinet Pharmacodyn</em>. 2017;44(6):539-562. doi:10.1007/s10928-017-9542-0</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="importance-sampling-imp-1"><a class="header" href="#importance-sampling-imp-1">Importance Sampling (IMP)</a></h1>
+<p>The <code>imp</code> stage estimates the marginal log-likelihood</p>
+<p>\[
+-2 \log L(\theta) \;=\; -2 \sum_i \log p(y_i \mid \theta)
+\;=\; -2 \sum_i \log \int p(y_i \mid \eta, \theta)\, p(\eta \mid \theta)\, d\eta
+\]</p>
+<p>by Monte-Carlo importance sampling. The IS Monte-Carlo estimator of
+<code>p(yᵢ|θ)</code> is unbiased; the reported <code>−2 log L</code> carries a small Jensen
+bias from the <code>log(·)</code> transform that vanishes as <code>K → ∞</code> and is
+typically dominated by the much larger Laplace-approximation bias of
+<code>ofv</code> in the sparse-data / strongly-nonlinear regime IMP targets.
+Analogous to NONMEM’s <code>$EST METHOD=IMP EONLY=1</code> and Monolix’s
+“Importance Sampling” likelihood method.</p>
+<h2 id="when-to-use-it"><a class="header" href="#when-to-use-it">When to use it</a></h2>
+<p>The Laplace approximation that produces the FOCE/FOCEI OFV assumes each
+subject’s posterior of η is Gaussian-shaped. That assumption is fine for
+<strong>well-sampled</strong> PK (≥ 5–6 obs per subject across the elimination phase)
+but breaks down for:</p>
+<ul>
+<li><strong>Sparse data</strong> — e.g. routine TDM with 1–3 troughs per patient.</li>
+<li><strong>Strong nonlinearity</strong> — Michaelis–Menten elimination,
+target-mediated drug disposition, transit-compartment absorption.</li>
+<li><strong>PD with categorical / binary endpoints</strong> (likelihood
+surface non-quadratic in η).</li>
+</ul>
+<p>In those regimes the FOCE OFV is biased — typically <em>under</em>-stated, so
+naïve AIC/BIC comparisons favour over-parameterised models. IMP gives a
+much-lower-bias estimate at extra MC cost.</p>
+<h2 id="how-it-runs"><a class="header" href="#how-it-runs">How it runs</a></h2>
+<p><code>imp</code> is a chain stage, not a standalone method:</p>
+<pre><code>[fit_options]
+  method        = [focei, imp]
+  is_samples    = 2000     # K, samples per subject
+  is_proposal_df = 5       # ν, Student-t tail weight
+  is_seed       = 12345
+</code></pre>
+<p>Rules:</p>
+<ul>
+<li><strong>Must follow another stage.</strong> <code>methods = [imp]</code> and
+<code>methods = [imp, focei]</code> are rejected — IMP needs the previous stage’s
+EBEs and per-subject Jacobian as the proposal centre/scale.</li>
+<li><strong>Must appear at most once.</strong></li>
+<li><strong>Should be terminal.</strong> A non-terminal <code>imp</code> produces a warning — the
+next stage updates parameters and the IS result becomes meaningless.</li>
+</ul>
+<p>When IMP runs, <code>FitResult.method</code> still reports the previous estimating
+stage (e.g. <code>FOCEI</code>), and <code>FitResult.method_chain</code> preserves the full
+chain (<code>[FoceI, Imp]</code>). The IS-LL itself lands on
+<code>FitResult.importance_sampling</code>.</p>
+<h2 id="algorithm"><a class="header" href="#algorithm">Algorithm</a></h2>
+<p>For each subject <em>i</em> with EBE η̂ᵢ and inner-loop Jacobian Jᵢ = ∂f/∂η at η̂ᵢ:</p>
+<ol>
+<li>
+<p><strong>Build proposal scale Σᵢ:</strong></p>
+<ul>
+<li>Compute Sheiner–Beal posterior Hessian
+\(H_i = J_i^\top R_i^{-1} J_i + \Omega^{-1}\) at η̂ᵢ
+(\(R_i\) = diagonal residual variance at the EBE).</li>
+<li>Add a small ridge \(\lambda I\) for numerical safety
+(λ = max(10⁻⁶ · trace(H)/d, 10⁻¹⁰)).</li>
+<li>Cholesky-factor; on failure fall back to Σᵢ = Ω (broad prior-scale
+proposal — gives a valid but noisy LL estimate).</li>
+</ul>
+</li>
+<li>
+<p><strong>Draw K samples</strong> \(\eta_{ik} \sim t_\nu(\hat\eta_i, \Sigma_i)\)
+(multivariate Student-t).</p>
+</li>
+<li>
+<p><strong>Compute log importance weights:</strong>
+\[
+\log w_{ik} = \log p(y_i \mid \eta_{ik}, \theta)
++ \log p(\eta_{ik} \mid \theta)
+- \log q(\eta_{ik}).
+\]</p>
+</li>
+<li>
+<p><strong>Subject marginal LL</strong> via log-sum-exp:
+\[
+\log \hat p(y_i \mid \theta)
+\;=\; \operatorname{lse}<em>k \log w</em>{ik} - \log K.
+\]</p>
+</li>
+<li>
+<p><strong>Per-subject effective sample size:</strong>
+\(\mathrm{ESS}<em>i = 1 / \sum_k \tilde w</em>{ik}^2\) (normalised weights).
+The result reports the across-subject min and median of ESS/K, plus
+any subjects below <code>is_low_ess_threshold</code> (default 10%).</p>
+</li>
+<li>
+<p><strong>Monte-Carlo standard error.</strong> For a self-normalised IS estimator the
+asymptotic per-subject variance (Geweke 1989) is
+\[
+\operatorname{Var}\bigl(\log \hat p(y_i \mid \theta)\bigr)
+\;\approx\; \frac{1}{K}\left(\frac{1}{\mathrm{ESS}<em>i / K} - 1\right).
+\]
+Aggregating across subjects (LL is a sum of independent per-subject
+log-marginals) and converting to the <code>−2 log L</code> scale,
+\[
+\operatorname{SE}(-2 \log L</em>{IS})
+\;=\; 2 \sqrt{\sum_i \operatorname{Var}\bigl(\log \hat p(y_i \mid \theta)\bigr)}.
+\]
+Subjects with degenerate ESS (\(\mathrm{ESS}_i / K = 0\) — complete
+proposal collapse) fall back to a per-subject variance of <code>1.0</code>, which
+produces a <em>finite</em> but inflated SE rather than a NaN. A separate
+warning is emitted on <code>FitResult.warnings</code> listing the collapsed
+subjects; the IS-LL itself remains usable as a point estimate.</p>
+</li>
+<li>
+<p><strong>Population −2 log L</strong> = <code>−2 · Σᵢ log p̂(yᵢ | θ)</code>, reported on
+<code>FitResult.importance_sampling.minus2_log_likelihood</code> together with
+<code>mc_standard_error</code>.</p>
+</li>
+</ol>
+<h2 id="tuning"><a class="header" href="#tuning">Tuning</a></h2>
+<ul>
+<li><strong>K = <code>is_samples</code></strong> controls accuracy. The MC SE scales as
+\(1/\sqrt{K}\); halve it by quadrupling K.
+Default 1000 is fine for a smoke test; bump to 2000–5000 for any
+reported LL.</li>
+<li><strong>ν = <code>is_proposal_df</code></strong> controls the proposal tails. The default of 5
+is robust to mild proposal misspecification (Geweke 1989); raise
+toward 30+ to recover a near-Gaussian proposal when the posterior is
+known to be light-tailed.</li>
+<li><strong>Low-ESS subjects</strong> signal a proposal that doesn’t match the
+posterior well — usually a sign the EBE didn’t converge or the
+Hessian was near-singular. The IS estimate is still unbiased, just
+noisier. Investigate by re-running with a tighter <code>inner_tol</code> or
+inspecting the <code>FitResult.subjects[i]</code> diagnostics.</li>
+<li><strong>Reproducibility.</strong> <code>is_seed</code> defaults to <code>42</code> when unset (so two
+fits with the same <code>is_samples</code> and <code>is_proposal_df</code> produce identical
+<code>−2 log L</code>). Set it explicitly to vary the RNG stream. The full set of
+<code>is_*</code> defaults is listed in the
+<a href="#importance-sampling-imp"><code>[fit_options]</code> reference</a>.</li>
+</ul>
+<h2 id="sde--diffusion-models-not-supported"><a class="header" href="#sde--diffusion-models-not-supported">SDE / [diffusion] models (not supported)</a></h2>
+<p>IMP refuses to run on models with a <code>[diffusion]</code> block. The EKF
+process-noise variance that inflates the residual variance for SDE
+models is not yet threaded through the IS observation-likelihood path,
+so the marginal would be silently biased. Use FOCE / FOCEI for the
+Laplace OFV on SDE models; IMP for SDE is tracked as a follow-up.</p>
+<h2 id="iov-current-limitation"><a class="header" href="#iov-current-limitation">IOV (current limitation)</a></h2>
+<p>For models with <code>kappa</code> declarations, IMP samples η only — per-occasion
+κ is held fixed at its EBE κ̂. The reported <code>−2 log L</code> is therefore a
+<strong>partial marginal</strong> that does not integrate over κ uncertainty. It
+underestimates the true marginal variance and is <em>not</em> directly
+comparable to NONMEM <code>$EST METHOD=IMP LAPLACIAN=1</code> on κ.</p>
+<p>The result struct flags this via <code>kappa_treatment = "fixed_at_mode"</code>
+(YAML) and the CLI prints a notice. Joint (η, κ) sampling is planned;
+see the <code>TODO(imp-iov-v2)</code> marker in
+<code>src/estimation/importance_sampling.rs</code>.</p>
+<h2 id="cost"><a class="header" href="#cost">Cost</a></h2>
+<p>K × n_subjects predict calls per IMP run. For warfarin (32 subjects)
+with K=2000 this is ≈ 64k predicts — seconds to a minute on a typical
+laptop. The cost is linear in K and trivially parallel over subjects
+(uses the same Rayon worker pool as the inner loop).</p>
+<h2 id="output-2"><a class="header" href="#output-2">Output</a></h2>
+<p>In the CLI:</p>
+<pre><code>--- Importance Sampling (marginal log-likelihood) ---
+  -2 log L (IS): 1284.52  (MC SE = 0.41, K = 2000, ν = 5)
+  ESS / K: min = 0.18, median = 0.62
+  Low-ESS subjects (3): 12=0.18, 27=0.21, 34=0.22
+</code></pre>
+<p>In the fit YAML:</p>
+<pre><code class="language-yaml">importance_sampling:
+  minus2_log_likelihood: 1284.524300
+  mc_standard_error: 0.412700
+  n_samples: 2000
+  proposal_df: 5.0000
+  ess_min: 0.1800
+  ess_median: 0.6200
+  kappa_treatment: not_applicable
+  low_ess_subjects:
+    - id: "12"
+      ess_fraction: 0.1800
+    - id: "27"
+      ess_fraction: 0.2100
+    - id: "34"
+      ess_fraction: 0.2200
+</code></pre>
+<p>The Rust <code>FitResult.importance_sampling</code> field carries the same data
+typed as <code>Option&lt;ImportanceSamplingResult&gt;</code>.</p>
+<h2 id="see-also-1"><a class="header" href="#see-also-1">See also</a></h2>
+<ul>
+<li><a href="#saem-1">SAEM</a> — common upstream stage for <code>methods = [saem, imp]</code>.</li>
+<li><a href="#sampling-importance-resampling-sir">SIR</a> — a different importance-sampling-flavoured procedure
+that targets <em>parameter uncertainty</em> (CIs on θ/Ω/σ), not the marginal
+likelihood. The name overlap is unfortunate; the two methods are
+unrelated in goal and implementation.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="inter-occasion-variability-iov"><a class="header" href="#inter-occasion-variability-iov">Inter-Occasion Variability (IOV)</a></h1>
 <p>Inter-Occasion Variability (IOV) models the fact that a subject’s PK parameters may shift between occasions (treatment periods, study visits, dosing intervals). Unlike between-subject variability (BSV), which is fixed for a subject across the whole study, IOV is a random effect that is re-drawn for each occasion.</p>
 <h2 id="concepts"><a class="header" href="#concepts">Concepts</a></h2>
@@ -2525,7 +2748,7 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 <p>The H-matrix (Jacobian ∂f/∂η) covers BSV etas only — kappa columns are not included in the FOCE linearization.</p>
 <h3 id="covariance-step-1"><a class="header" href="#covariance-step-1">Covariance step</a></h3>
 <p>When <code>covariance = true</code>, standard errors for the IOV omega diagonal (or its Cholesky elements) are computed via the finite-difference Hessian at convergence, using the same procedure as for BSV omega.</p>
-<h2 id="output-2"><a class="header" href="#output-2">Output</a></h2>
+<h2 id="output-3"><a class="header" href="#output-3">Output</a></h2>
 <p>The following IOV-related fields are populated on <code>FitResult</code> and printed by <code>print_results()</code>. The fit YAML gains an <code>omega_iov:</code> section listing the kappa variances and (for Option B) the off-diagonal covariances/correlations.</p>
 <div class="table-wrapper">
 <table>
@@ -2979,7 +3202,7 @@ support for zip, JSON, and CSV — Rust, R, Python, Julia.</p>
 unzip -p run1.fitrx manifest.json
 unzip -p run1.fitrx fit.json | jq .theta
 </code></pre>
-<h2 id="when-to-use-it"><a class="header" href="#when-to-use-it">When to use it</a></h2>
+<h2 id="when-to-use-it-1"><a class="header" href="#when-to-use-it-1">When to use it</a></h2>
 <p>Use <code>--output run1.fitrx</code> (CLI) or <code>save_fit()</code> (Rust API) when you want a
 single artifact that can be shipped between machines and languages — for
 example, fitting in Rust and post-processing in R/Python. The legacy

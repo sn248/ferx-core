@@ -13,7 +13,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `method` | `foce`, `focei`, `saem` | `focei` | Estimation method |
+| `method` | `foce`, `focei`, `saem`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](#chained-fits). |
 | `maxiter` | integer | `500` | Maximum outer loop iterations |
 | `covariance` | `true`, `false` | `true` | Compute covariance matrix and standard errors |
 | `optimizer` | `slsqp`, `lbfgs`, `nlopt_lbfgs`, `mma`, `bfgs`, `bobyqa`, `trust_region` | `slsqp` | Optimization algorithm |
@@ -71,6 +71,31 @@ SIR provides non-parametric parameter uncertainty estimates as an optional post-
 | `sir_df` | `5.0` | Degrees of freedom for the Student-t proposal; higher values approach a normal proposal |
 
 See [SIR documentation](../estimation/sir.md) for details.
+
+## Importance Sampling (IMP)
+
+The `imp` stage estimates the marginal log-likelihood by Monte-Carlo
+importance sampling, giving a lower-bias `−2 log L` than the FOCE/Laplace
+OFV when subject posteriors of η are non-Gaussian (e.g. sparsely-sampled
+PK). Use it as a final chain stage:
+
+```
+[fit_options]
+  method        = [focei, imp]
+  is_samples    = 1000
+  is_proposal_df = 5
+  is_seed       = 12345
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `is_samples` | `1000` | Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE. |
+| `is_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1). Lower = heavier tails. |
+| `is_seed` | `42` | RNG seed. Same seed → identical `−2 log L`. |
+| `is_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction get flagged in the result. Set `0` to silence. |
+
+See [Importance Sampling documentation](../estimation/importance-sampling.md)
+for the algorithm, IOV caveats, and tuning guidance.
 
 ## Optimizer Choices
 

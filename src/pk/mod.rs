@@ -157,9 +157,35 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
             PkModel::OneCptIvBolus => return one_cpt_iv_bolus_ss(dose, tau, cl, v),
             PkModel::OneCptInfusion => return one_cpt_infusion_ss(dose, tau, cl, v),
             PkModel::OneCptOral => return one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio()),
-            // 2-cpt / 3-cpt SS not yet implemented — fall through to the
-            // single-dose formula. `api.rs` emits a warning for these.
-            _ => {}
+            PkModel::TwoCptIvBolus => {
+                return two_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2());
+            }
+            PkModel::TwoCptInfusion => {
+                return two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2());
+            }
+            PkModel::TwoCptOral => {
+                return two_cpt_oral_f_ss(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
+            }
+            PkModel::ThreeCptIvBolus => {
+                return three_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+            }
+            PkModel::ThreeCptInfusion => {
+                return three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+            }
+            PkModel::ThreeCptOral => {
+                return three_cpt_oral_f_ss(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.q3(),
+                    p.v3(),
+                    p.ka(),
+                    p.f_bio(),
+                );
+            }
         }
     }
 

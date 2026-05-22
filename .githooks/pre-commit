@@ -1,0 +1,4 @@
+#!/bin/sh
+# Reject commits that fail rustfmt. Run once after cloning:
+#   git config core.hooksPath .githooks
+cargo fmt --check

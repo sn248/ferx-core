@@ -10,6 +10,14 @@ ferx-core is a Rust-based Nonlinear Mixed Effects (NLME) modeling engine for pop
 
 The R wrapper package lives at `../ferx-r` (sibling directory). The R package's Rust glue depends on `ferx-core` via git, but its `src/rust/.cargo/config.toml` carries a `[patch]` that auto-swaps in `../../../ferx-core` (this repo) when the sibling checkout exists. So changes here are picked up by an R-package build automatically — no Cargo.toml edits needed on either side. When a change to a `pub` API in `ferx-core` lands, expect to follow up with a matching PR in `ferx-r`.
 
+## First-time setup
+
+After cloning, activate the shared pre-commit hook (blocks commits that fail `rustfmt`):
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Build & Run Commands
 
 ```bash

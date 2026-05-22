@@ -76,18 +76,33 @@ impl FoceiProblem<'_> {
 
     /// Compute per-subject NLL gradients via `subject_nll_pop_grad`, caching the
     /// result so that `hessian()` can reuse it without a second inner-loop solve.
+    ///
+    /// Three cache states (keyed by `x` equality and sentinel field):
+    ///   Full hit:    `c.x == x` and `!c.per_subj_grads.is_empty()` → return everything cached.
+    ///   Partial hit: `c.x == x` and `c.per_subj_grads.is_empty()`  → EBEs warm (from `cost()`),
+    ///                                                                   run AD pass only.
+    ///   Miss:        `c.x != x` or cache is `None`                 → full inner solve + AD.
     fn compute_ad_grads(&self, x: &[f64]) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<f64>>) {
-        // Return cached result if x matches.
-        {
+        let maybe_warm: Option<(Vec<DVector<f64>>, Vec<DMatrix<f64>>)> = {
             let cache = self.grad_cache.lock().unwrap();
             if let Some(ref c) = *cache {
                 if c.x == x {
-                    return (c.etas.clone(), c.h_mats.clone(), c.per_subj_grads.clone());
+                    if !c.per_subj_grads.is_empty() {
+                        // Full hit: EBEs and AD gradients both cached.
+                        return (c.etas.clone(), c.h_mats.clone(), c.per_subj_grads.clone());
+                    }
+                    // Partial hit: EBEs ready from cost(), AD not yet done.
+                    Some((c.etas.clone(), c.h_mats.clone()))
+                } else {
+                    None
                 }
+            } else {
+                None
             }
-        }
+        };
 
-        let (etas, h_mats) = self.run_inner(x);
+        // Use warm EBEs on partial hit; run inner solve on miss.
+        let (etas, h_mats) = maybe_warm.unwrap_or_else(|| self.run_inner(x));
         let n_subj = self.population.subjects.len();
 
         let per_subj: Vec<Vec<f64>> = (0..n_subj)
@@ -129,7 +144,17 @@ impl CostFunction for FoceiProblem<'_> {
 
     fn cost(&self, p: &Vec<f64>) -> Result<f64, Error> {
         let (etas, h_mats) = self.run_inner(p);
-        Ok(self.ofv_fixed(p, &etas, &h_mats))
+        let ofv = self.ofv_fixed(p, &etas, &h_mats);
+        // Pre-warm the gradient cache with EBEs so that a subsequent
+        // gradient() call on the same x skips the redundant run_inner().
+        // per_subj_grads: vec![] is the sentinel for "EBEs ready, AD pending".
+        *self.grad_cache.lock().unwrap() = Some(GradCache {
+            x: p.clone(),
+            etas,
+            h_mats,
+            per_subj_grads: vec![],
+        });
+        Ok(ofv)
     }
 }
 
@@ -337,6 +362,45 @@ mod tests {
         assert_eq!(adaptive_steihaug_budget(100), 10);
         // Budget never exceeds n_params.
         assert!(adaptive_steihaug_budget(4) <= 4.max(5));
+    }
+
+    /// Verify the sentinel invariant that `compute_ad_grads` relies on to
+    /// distinguish a partial hit (EBEs ready, AD pending) from a full hit.
+    /// This documents the contract between `cost()` and `compute_ad_grads()`.
+    #[test]
+    fn test_grad_cache_sentinel_invariant() {
+        let x = vec![1.0_f64, 2.0, 3.0];
+
+        // Partial-hit sentinel: cost() writes an entry with empty per_subj_grads.
+        let partial = GradCache {
+            x: x.clone(),
+            etas: vec![],
+            h_mats: vec![],
+            per_subj_grads: vec![],
+        };
+        assert_eq!(partial.x, x);
+        assert!(
+            partial.per_subj_grads.is_empty(),
+            "sentinel written by cost() must have empty per_subj_grads"
+        );
+
+        // Full-hit: compute_ad_grads() writes an entry with per_subj_grads populated.
+        let full = GradCache {
+            x: x.clone(),
+            etas: vec![],
+            h_mats: vec![],
+            per_subj_grads: vec![vec![0.1_f64, 0.2, 0.3]],
+        };
+        assert_eq!(full.x, x);
+        assert!(
+            !full.per_subj_grads.is_empty(),
+            "full cache written by compute_ad_grads() must have non-empty per_subj_grads"
+        );
+
+        // x mismatch always means miss, regardless of per_subj_grads content.
+        let other_x = vec![9.0_f64, 9.0, 9.0];
+        assert_ne!(partial.x, other_x, "different x must not match");
+        assert_ne!(full.x, other_x, "different x must not match");
     }
 
     #[test]

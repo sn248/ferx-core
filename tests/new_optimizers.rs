@@ -256,6 +256,30 @@ fn final_ofv_no_worse_than_best_seen_during_trace() {
     let _ = std::fs::remove_file(&trace_path);
 }
 
+/// Verify that the pre-warm cache change in `cost()` is transparent end-to-end:
+/// after the refactor, `gradient()` is called on the same x that `cost()` just
+/// evaluated (partial hit path), and the result must still be a finite, non-NaN OFV.
+/// Uses a very low `outer_maxiter` so this runs fast on every PR.
+#[test]
+fn trust_region_cost_prewarm_cache_is_transparent() {
+    let (model, population) = data_and_model();
+    let mut opts = base_options();
+    opts.optimizer = Optimizer::TrustRegion;
+    opts.steihaug_max_iters = Some(5);
+    opts.outer_maxiter = 5;
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("trust_region must not panic with cost() pre-warm cache");
+    assert!(
+        result.ofv.is_finite(),
+        "OFV must be finite after cost() pre-warm, got {}",
+        result.ofv
+    );
+    assert!(
+        !result.theta.iter().any(|x| x.is_nan()),
+        "theta must not contain NaN after cost() pre-warm"
+    );
+}
+
 #[test]
 fn steihaug_max_iters_is_respected_by_trust_region() {
     // A very small steihaug_max_iters degrades step quality but should still

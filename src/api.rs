@@ -651,32 +651,56 @@ fn fit_inner(
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
-    // Lagtime validation warnings. Two concerns surfaced here once per fit:
-    //   1. Steady-state (SS=1) doses + lagtime: not currently shifted within
-    //      the SS pulse train — silently produces wrong predictions for those
-    //      subjects. Tracked as a follow-up; warn until the SS path is fixed.
-    //   2. Negative lagtime at the initial typical-value point. The fit might
-    //      drift back to positive territory, but starting negative usually
-    //      signals a misparameterization (e.g. an additive `LAGTIME = TVLAG
-    //      + ETA_LAG` instead of a multiplicative `TVLAG * exp(ETA_LAG)`).
-    if model.has_lagtime() {
-        let n_ss_subjects = population
+    // Steady-state (SS=1) coverage warning. SS is supported via closed-form
+    // for 1-cpt analytical models without time-varying covariates; other
+    // paths (2-/3-cpt analytical, ODE-based, and any subject with TV
+    // covariates routed through the event-driven path) silently treat SS
+    // doses as single doses. Warn so users know predictions are biased on
+    // those paths.
+    let n_ss_subjects = population
+        .subjects
+        .iter()
+        .filter(|s| s.has_ss_doses())
+        .count();
+    if n_ss_subjects > 0 {
+        let one_cpt_analytical = !model.is_ode_based()
+            && matches!(
+                model.pk_model,
+                crate::types::PkModel::OneCptIvBolus
+                    | crate::types::PkModel::OneCptOral
+                    | crate::types::PkModel::OneCptInfusion
+            );
+        let n_ss_with_tv = population
             .subjects
             .iter()
-            .filter(|s| s.doses.iter().any(|d| d.ss))
+            .filter(|s| s.has_ss_doses() && s.has_tv_covariates())
             .count();
-        if n_ss_subjects > 0 {
+        if !one_cpt_analytical {
             accumulated_warnings.push(format!(
-                "Lagtime is declared but {} subject(s) have steady-state (SS=1) \
-                 doses. SS pulse trains are not currently shifted by lagtime — \
-                 only the post-SS continuation is delayed. Predictions for \
-                 these subjects may be biased; this is a tracked follow-up.",
+                "{} subject(s) have steady-state (SS=1) doses but the model uses \
+                 a path that does not yet implement SS (2-/3-cpt analytical, \
+                 ODE, or event-driven). SS doses are treated as single doses on \
+                 these paths — predictions for these subjects are biased. \
+                 Tracked in issue #74.",
                 n_ss_subjects
             ));
+        } else if n_ss_with_tv > 0 {
+            accumulated_warnings.push(format!(
+                "{} subject(s) have steady-state (SS=1) doses combined with \
+                 time-varying covariates. The event-driven path used for TV \
+                 covariates does not yet implement SS — these subjects are \
+                 biased. Tracked in issue #74.",
+                n_ss_with_tv
+            ));
         }
+    }
 
-        // Probe lagtime at the initial typical-value point (eta = 0, mean
-        // covariates). Cheap — one pk_param_fn call per population.
+    // Lagtime: probe at the initial typical-value point (eta = 0, mean
+    // covariates). Cheap — one pk_param_fn call per population. Starting
+    // with a negative typical-value lagtime usually signals a
+    // misparameterisation (e.g. an additive `LAGTIME = TVLAG + ETA_LAG`
+    // instead of a multiplicative `TVLAG * exp(ETA_LAG)`).
+    if model.has_lagtime() {
         if let Some(first_subj) = population.subjects.first() {
             let zero_eta = vec![0.0_f64; model.n_eta];
             let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates);

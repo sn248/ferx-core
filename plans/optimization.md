@@ -34,8 +34,8 @@ Since 2026-05-19, the following non-optimization PRs landed:
 | Step | Requires | Status |
 |------|----------|--------|
 | **5b** — IOV analytical gradient in outer optimizer | Step 5 ✅ | ❌ NOT STARTED |
-| **6b** — Eliminate double inner-solve in trust-region `cost()` | Step 6 ✅ | ❌ NOT STARTED |
-| **7** — GN → trust-region subproblem (replace LM damping + line search) | Steps 6 ✅ + 6b | ❌ NOT STARTED |
+| **6b** — Eliminate double inner-solve in trust-region `cost()` | Step 6 ✅ | 🔶 IN PR [#67](https://github.com/FeRx-NLME/ferx-core/pull/67) |
+| **7** — GN → trust-region subproblem (replace LM damping + line search) | Steps 6 ✅ + 6b ✅ | ❌ NOT STARTED |
 | **8** — HMC proposals in SAEM E-step | Steps 3 ✅ + 4 ✅ + PR #66 merged | ❌ NOT STARTED |
 
 **Recommended implementation order: 6b → 7 → 5b → 8.**

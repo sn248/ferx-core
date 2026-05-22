@@ -76,18 +76,33 @@ impl FoceiProblem<'_> {
 
     /// Compute per-subject NLL gradients via `subject_nll_pop_grad`, caching the
     /// result so that `hessian()` can reuse it without a second inner-loop solve.
+    ///
+    /// Three cache states (keyed by `x` equality and sentinel field):
+    ///   Full hit:    `c.x == x` and `!c.per_subj_grads.is_empty()` → return everything cached.
+    ///   Partial hit: `c.x == x` and `c.per_subj_grads.is_empty()`  → EBEs warm (from `cost()`),
+    ///                                                                   run AD pass only.
+    ///   Miss:        `c.x != x` or cache is `None`                 → full inner solve + AD.
     fn compute_ad_grads(&self, x: &[f64]) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<f64>>) {
-        // Return cached result if x matches.
-        {
+        let maybe_warm: Option<(Vec<DVector<f64>>, Vec<DMatrix<f64>>)> = {
             let cache = self.grad_cache.lock().unwrap();
             if let Some(ref c) = *cache {
                 if c.x == x {
-                    return (c.etas.clone(), c.h_mats.clone(), c.per_subj_grads.clone());
+                    if !c.per_subj_grads.is_empty() {
+                        // Full hit: EBEs and AD gradients both cached.
+                        return (c.etas.clone(), c.h_mats.clone(), c.per_subj_grads.clone());
+                    }
+                    // Partial hit: EBEs ready from cost(), AD not yet done.
+                    Some((c.etas.clone(), c.h_mats.clone()))
+                } else {
+                    None
                 }
+            } else {
+                None
             }
-        }
+        };
 
-        let (etas, h_mats) = self.run_inner(x);
+        // Use warm EBEs on partial hit; run inner solve on miss.
+        let (etas, h_mats) = maybe_warm.unwrap_or_else(|| self.run_inner(x));
         let n_subj = self.population.subjects.len();
 
         let per_subj: Vec<Vec<f64>> = (0..n_subj)
@@ -129,7 +144,17 @@ impl CostFunction for FoceiProblem<'_> {
 
     fn cost(&self, p: &Vec<f64>) -> Result<f64, Error> {
         let (etas, h_mats) = self.run_inner(p);
-        Ok(self.ofv_fixed(p, &etas, &h_mats))
+        let ofv = self.ofv_fixed(p, &etas, &h_mats);
+        // Pre-warm the gradient cache with EBEs so that a subsequent
+        // gradient() call on the same x skips the redundant run_inner().
+        // per_subj_grads: vec![] is the sentinel for "EBEs ready, AD pending".
+        *self.grad_cache.lock().unwrap() = Some(GradCache {
+            x: p.clone(),
+            etas,
+            h_mats,
+            per_subj_grads: vec![],
+        });
+        Ok(ofv)
     }
 }
 
@@ -337,6 +362,96 @@ mod tests {
         assert_eq!(adaptive_steihaug_budget(100), 10);
         // Budget never exceeds n_params.
         assert!(adaptive_steihaug_budget(4) <= 4.max(5));
+    }
+
+    /// Verify the dynamic cache-state contract between `cost()` and `compute_ad_grads()`:
+    ///
+    /// 1. `cost(x)` writes a partial sentinel (`per_subj_grads.is_empty()`).
+    /// 2. `compute_ad_grads(x)` on the same x upgrades to a full entry
+    ///    (`!per_subj_grads.is_empty()`).
+    /// 3. `compute_ad_grads(x)` on a *different* x (miss path) also produces a
+    ///    full entry — the fallback still works without a preceding `cost()`.
+    #[test]
+    fn test_grad_cache_sentinel_invariant() {
+        use crate::estimation::parameterization::{clamp_to_bounds, compute_bounds, pack_params};
+        use crate::io::datareader::read_nonmem_csv;
+        use crate::parser::model_parser::parse_model_file;
+        use argmin::core::CostFunction;
+        use std::path::Path;
+
+        let model = parse_model_file(Path::new("examples/warfarin.ferx"))
+            .expect("warfarin model must parse");
+        let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data must load");
+        let options = FitOptions::default();
+        let bounds = compute_bounds(&model.default_params);
+        let mut x0 = pack_params(&model.default_params);
+        clamp_to_bounds(&mut x0, &bounds);
+        let n_subj = population.subjects.len();
+        let n_eta = model.n_eta;
+
+        let problem = FoceiProblem {
+            model: &model,
+            population: &population,
+            options: &options,
+            init_params: &model.default_params,
+            bounds,
+            cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(n_eta); n_subj]),
+            grad_cache: std::sync::Mutex::new(None),
+        };
+
+        // 1. Before cost(): cache is None.
+        assert!(
+            problem.grad_cache.lock().unwrap().is_none(),
+            "cache must be empty before any call"
+        );
+
+        // 2. After cost(x0): partial sentinel written — x matches, per_subj_grads empty.
+        let _ = problem.cost(&x0).expect("cost() must not fail");
+        {
+            let cache = problem.grad_cache.lock().unwrap();
+            let c = cache.as_ref().expect("cost() must populate grad_cache");
+            assert_eq!(c.x, x0, "cost() must write the current x into grad_cache");
+            assert!(
+                c.per_subj_grads.is_empty(),
+                "cost() must write the partial sentinel (empty per_subj_grads)"
+            );
+        }
+
+        // 3. After compute_ad_grads(x0): full entry — same x, per_subj_grads populated.
+        let _ = problem.compute_ad_grads(&x0);
+        {
+            let cache = problem.grad_cache.lock().unwrap();
+            let c = cache
+                .as_ref()
+                .expect("compute_ad_grads() must populate grad_cache");
+            assert_eq!(
+                c.x, x0,
+                "grad_cache x must still match x0 after full AD pass"
+            );
+            assert!(
+                !c.per_subj_grads.is_empty(),
+                "compute_ad_grads() must upgrade sentinel to a full entry"
+            );
+            assert_eq!(
+                c.per_subj_grads.len(),
+                n_subj,
+                "per_subj_grads must have one entry per subject"
+            );
+        }
+
+        // 4. compute_ad_grads on a different x (miss path) must still produce a full entry.
+        let x_other: Vec<f64> = x0.iter().map(|v| v + 0.01).collect();
+        let _ = problem.compute_ad_grads(&x_other);
+        {
+            let cache = problem.grad_cache.lock().unwrap();
+            let c = cache.as_ref().expect("miss path must populate grad_cache");
+            assert_eq!(c.x, x_other, "miss path must write x_other into grad_cache");
+            assert!(
+                !c.per_subj_grads.is_empty(),
+                "miss path must produce a full entry without a preceding cost() call"
+            );
+        }
     }
 
     #[test]

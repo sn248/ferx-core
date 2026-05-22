@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Simulation - FeRx-NLME Documentation</title>
+        <title>Importance Sampling (IMP) - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,205 +177,170 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="simulation"><a class="header" href="#simulation">Simulation</a></h1>
-<h2 id="simulate"><a class="header" href="#simulate"><code>simulate()</code></a></h2>
-<p>Generate simulated observations from a model with random effects and residual error.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn simulate(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    params: &amp;ModelParameters,
-    n_sim: usize,
-) -&gt; Vec&lt;SimulationResult&gt;
-<span class="boring">}</span></code></pre>
-<p><strong>Parameters:</strong></p>
+                        <h1 id="importance-sampling-imp"><a class="header" href="#importance-sampling-imp">Importance Sampling (IMP)</a></h1>
+<p>The <code>imp</code> stage estimates the marginal log-likelihood</p>
+<p>\[
+-2 \log L(\theta) \;=\; -2 \sum_i \log p(y_i \mid \theta)
+\;=\; -2 \sum_i \log \int p(y_i \mid \eta, \theta)\, p(\eta \mid \theta)\, d\eta
+\]</p>
+<p>by Monte-Carlo importance sampling, replacing the FOCE / Laplace
+approximation used by <code>ofv</code> with a (less-biased) unbiased estimator.
+Analogous to NONMEM’s <code>$EST METHOD=IMP EONLY=1</code> and Monolix’s
+“Importance Sampling” likelihood method.</p>
+<h2 id="when-to-use-it"><a class="header" href="#when-to-use-it">When to use it</a></h2>
+<p>The Laplace approximation that produces the FOCE/FOCEI OFV assumes each
+subject’s posterior of η is Gaussian-shaped. That assumption is fine for
+<strong>well-sampled</strong> PK (≥ 5–6 obs per subject across the elimination phase)
+but breaks down for:</p>
 <ul>
-<li><code>model</code>: Compiled model</li>
-<li><code>population</code>: Template population (dose events and observation times are used; DV values are ignored)</li>
-<li><code>params</code>: True parameter values for simulation</li>
-<li><code>n_sim</code>: Number of simulation replicates</li>
+<li><strong>Sparse data</strong> — e.g. routine TDM with 1–3 troughs per patient.</li>
+<li><strong>Strong nonlinearity</strong> — Michaelis–Menten elimination,
+target-mediated drug disposition, transit-compartment absorption.</li>
+<li><strong>PD with categorical / binary endpoints</strong> (likelihood
+surface non-quadratic in η).</li>
 </ul>
-<p><strong>Returns:</strong> Vector of <code>SimulationResult</code>, one per observation per subject per replicate.</p>
-<p><strong>Example:</strong></p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>let model = parse_model_file(Path::new("model.ferx"))?;
-let population = read_nonmem_csv(Path::new("data.csv"), None)?;
-
-// Simulate 1000 replicates
-let sims = simulate(&amp;model, &amp;population, &amp;model.default_params, 1000);
-
-for sim in &amp;sims[..5] {
-    println!("Sim {}, ID {}, TIME {}, IPRED {:.3}, DV {:.3}",
-             sim.sim, sim.id, sim.time, sim.ipred, sim.dv_sim);
-}
-<span class="boring">}</span></code></pre>
-<h2 id="simulate_with_seed"><a class="header" href="#simulate_with_seed"><code>simulate_with_seed()</code></a></h2>
-<p>Same as <code>simulate()</code> but with a fixed random seed for reproducibility.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn simulate_with_seed(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    params: &amp;ModelParameters,
-    n_sim: usize,
-    seed: u64,
-) -&gt; Vec&lt;SimulationResult&gt;
-<span class="boring">}</span></code></pre>
-<h2 id="predict"><a class="header" href="#predict"><code>predict()</code></a></h2>
-<p>Population predictions without random effects (eta = 0). No simulation noise is added.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn predict(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    params: &amp;ModelParameters,
-) -&gt; Vec&lt;PredictionResult&gt;
-<span class="boring">}</span></code></pre>
-<p><strong>Returns:</strong> Vector of <code>PredictionResult</code> with population-level predictions.</p>
-<p><strong>Example:</strong></p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>let preds = predict(&amp;model, &amp;population, &amp;model.default_params);
-for p in &amp;preds {
-    println!("ID {}, TIME {}, PRED {:.3}", p.id, p.time, p.pred);
-}
-<span class="boring">}</span></code></pre>
-<h2 id="simulate_with_uncertainty"><a class="header" href="#simulate_with_uncertainty"><code>simulate_with_uncertainty()</code></a></h2>
-<p>Simulate observations while propagating <strong>population parameter uncertainty</strong>.
-For each parameter draw from the uncertainty distribution, etas (from the
-drawn Omega) and epsilons (from the drawn Sigma) are sampled — giving
-simulation bands that include both individual variability <em>and</em> uncertainty
-in the population estimates.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn simulate_with_uncertainty(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    fit_result: &amp;FitResult,
-    opts: &amp;SimulateUncertaintyOptions,
-) -&gt; Result&lt;Vec&lt;SimulationResult&gt;, String&gt;
-<span class="boring">}</span></code></pre>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub struct SimulateUncertaintyOptions {
-    pub n_uncertainty_draws: usize,      // parameter sets drawn
-    pub n_sim_per_draw: usize,           // eta/eps replicates per draw
-    pub method: UncertaintyMethod,       // Asymptotic | Sir
-    pub seed: Option&lt;u64&gt;,
-}
-
-pub enum UncertaintyMethod {
-    Asymptotic,   // MVN around ML estimate using FitResult.covariance_matrix
-    Sir,          // resamples from FitResult.sir_resamples_packed
-}
-<span class="boring">}</span></code></pre>
-<p><strong>Parameters:</strong></p>
+<p>In those regimes the FOCE OFV is biased — typically <em>under</em>-stated, so
+naïve AIC/BIC comparisons favour over-parameterised models. IMP gives an
+unbiased estimate at extra MC cost.</p>
+<h2 id="how-it-runs"><a class="header" href="#how-it-runs">How it runs</a></h2>
+<p><code>imp</code> is a chain stage, not a standalone method:</p>
+<pre><code>[fit_options]
+  method        = [focei, imp]
+  is_samples    = 2000     # K, samples per subject
+  is_proposal_df = 5       # ν, Student-t tail weight
+  is_seed       = 12345
+</code></pre>
+<p>Rules:</p>
 <ul>
-<li><code>fit_result</code>: Result of a previous <code>fit()</code> call. Must include
-<code>covariance_matrix</code> (Asymptotic) or <code>sir_resamples_packed</code> (SIR).</li>
-<li><code>opts.n_uncertainty_draws</code>: number of parameter sets drawn.</li>
-<li><code>opts.n_sim_per_draw</code>: number of subject-level replicates per draw.</li>
-<li><code>opts.method</code>: how to draw the parameter sets.</li>
+<li><strong>Must follow another stage.</strong> <code>methods = [imp]</code> and
+<code>methods = [imp, focei]</code> are rejected — IMP needs the previous stage’s
+EBEs and per-subject Jacobian as the proposal centre/scale.</li>
+<li><strong>Must appear at most once.</strong></li>
+<li><strong>Should be terminal.</strong> A non-terminal <code>imp</code> produces a warning — the
+next stage updates parameters and the IS result becomes meaningless.</li>
 </ul>
-<p><strong>Returns:</strong> <code>Vec&lt;SimulationResult&gt;</code> of length <code>n_uncertainty_draws * n_sim_per_draw * n_subjects * n_obs</code>. Each row carries a <code>draw</code> index
-(1..=n_uncertainty_draws) and a <code>sim</code> index (1..=n_sim_per_draw).</p>
-<p><strong>Prerequisites:</strong></p>
-<ul>
-<li>For <code>UncertaintyMethod::Asymptotic</code>: run <code>fit()</code> with
-<code>run_covariance_step = true</code> (or <code>covariance = true</code> in <code>[fit_options]</code>).</li>
-<li>For <code>UncertaintyMethod::Sir</code>: run with <code>sir = true</code> <em>and</em>
-<code>sir_keep_samples = true</code> so the resampled vectors are kept on the
-<code>FitResult</code>.</li>
-</ul>
-<p><strong>Example:</strong></p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>let fit_opts = FitOptions {
-    run_covariance_step: true,
-    ..FitOptions::default()
-};
-let fit = fit(&amp;model, &amp;population, &amp;model.default_params, &amp;fit_opts)?;
-
-let sims = simulate_with_uncertainty(
-    &amp;model,
-    &amp;population,
-    &amp;fit,
-    &amp;SimulateUncertaintyOptions {
-        n_uncertainty_draws: 200,
-        n_sim_per_draw: 10,
-        method: UncertaintyMethod::Asymptotic,
-        seed: Some(42),
-    },
-)?;
-<span class="boring">}</span></code></pre>
-<h2 id="result-types"><a class="header" href="#result-types">Result Types</a></h2>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub struct SimulationResult {
-    pub draw: usize,    // Uncertainty draw index (1-indexed; always 1 for simulate())
-    pub sim: usize,     // Replicate number within a draw (1-indexed)
-    pub id: String,     // Subject ID
-    pub time: f64,      // Observation time
-    pub ipred: f64,     // Individual prediction (no residual error)
-    pub dv_sim: f64,    // Simulated observation (with residual error)
-}
-
-pub struct PredictionResult {
-    pub id: String,
-    pub time: f64,
-    pub pred: f64,      // Population prediction (eta = 0)
-}
-<span class="boring">}</span></code></pre>
-<h2 id="simulation-process"><a class="header" href="#simulation-process">Simulation Process</a></h2>
-<p>For each replicate and each subject:</p>
-<ol>
-<li>Sample random effects: \( \eta_i \sim N(0, \Omega) \) using the Cholesky factor \( L \): \( \eta = L \cdot z \), where \( z \sim N(0, I) \)</li>
-<li>Compute individual PK parameters via <code>pk_param_fn(theta, eta, covariates)</code></li>
-<li>Generate predictions using the structural model</li>
-<li>Add residual error: \( DV = IPRED + \sqrt{V} \cdot \epsilon \), where \( \epsilon \sim N(0, 1) \) and \( V \) is the residual variance from the error model</li>
-</ol>
-<h2 id="simulation-with-uncertainty-process"><a class="header" href="#simulation-with-uncertainty-process">Simulation with Uncertainty Process</a></h2>
-<p><code>simulate_with_uncertainty()</code> wraps the steps above in an outer loop over
-parameter draws:</p>
+<p>When IMP runs, <code>FitResult.method</code> still reports the previous estimating
+stage (e.g. <code>FOCEI</code>), and <code>FitResult.method_chain</code> preserves the full
+chain (<code>[FoceI, Imp]</code>). The IS-LL itself lands on
+<code>FitResult.importance_sampling</code>.</p>
+<h2 id="algorithm"><a class="header" href="#algorithm">Algorithm</a></h2>
+<p>For each subject <em>i</em> with EBE η̂ᵢ and inner-loop Jacobian Jᵢ = ∂f/∂η at η̂ᵢ:</p>
 <ol>
 <li>
-<p><strong>Outer loop</strong> — for each of <code>n_uncertainty_draws</code>, draw a population
-parameter set \( (\theta_k, \Omega_k, \Sigma_k) \) from the uncertainty
-distribution.</p>
+<p><strong>Build proposal scale Σᵢ:</strong></p>
 <ul>
-<li><strong>Asymptotic</strong>: \( x_k = \hat{x} + L_\text{cov} z \) in packed log-space
-(theta, Cholesky-omega, sigma share one packed vector), then unpack —
-theta, Omega, and Sigma are perturbed coherently from a single MVN draw.</li>
-<li><strong>SIR</strong>: pick a parameter vector at random from
-<code>FitResult.sir_resamples_packed</code> (the resampled pool retained from the
-SIR step).
-Draws that fall outside the parameter bounds or yield non-positive
-theta/omega/sigma are rejected and resampled (up to <code>10 × n_uncertainty_draws</code> attempts).</li>
+<li>Compute Sheiner–Beal posterior Hessian
+\(H_i = J_i^\top R_i^{-1} J_i + \Omega^{-1}\) at η̂ᵢ
+(\(R_i\) = diagonal residual variance at the EBE).</li>
+<li>Add a small ridge \(\lambda I\) for numerical safety
+(λ = max(10⁻⁶ · trace(H)/d, 10⁻¹⁰)).</li>
+<li>Cholesky-factor; on failure fall back to Σᵢ = Ω (broad prior-scale
+proposal — gives a valid but noisy LL estimate).</li>
 </ul>
 </li>
 <li>
-<p><strong>Inner loop</strong> — for the drawn \( (\theta_k, \Omega_k, \Sigma_k) \), run
-<code>n_sim_per_draw</code> replicates of the standard simulation process above.
-Etas are drawn from \( N(0, \Omega_k) \) and epsilons from the drawn
-\( \Sigma_k \).</p>
+<p><strong>Draw K samples</strong> \(\eta_{ik} \sim t_\nu(\hat\eta_i, \Sigma_i)\)
+(multivariate Student-t).</p>
+</li>
+<li>
+<p><strong>Compute log importance weights:</strong>
+\[
+\log w_{ik} = \log p(y_i \mid \eta_{ik}, \theta)
++ \log p(\eta_{ik} \mid \theta)
+- \log q(\eta_{ik}).
+\]</p>
+</li>
+<li>
+<p><strong>Subject marginal LL</strong> via log-sum-exp:
+\[
+\log \hat p(y_i \mid \theta)
+\;=\; \operatorname{lse}<em>k \log w</em>{ik} - \log K.
+\]</p>
+</li>
+<li>
+<p><strong>Population −2 log L</strong> = sum across subjects, doubled and negated.</p>
 </li>
 </ol>
-<p>The resulting <code>SimulationResult</code> rows are tagged with both <code>draw</code> and <code>sim</code>
-so downstream code can compute either marginal bands (over all draws and
-sims) or hierarchical bands (e.g. median across sims within each draw, then
-percentiles across draws).</p>
+<p>The per-subject <strong>effective sample size</strong> is
+\(\mathrm{ESS}<em>i = 1 / \sum_k \tilde w</em>{ik}^2\)
+(normalised weights). The result reports the across-subject min and median
+of ESS/K, plus any subjects below <code>is_low_ess_threshold</code> (default 10%).
+The Monte-Carlo standard error on <code>−2 log L</code> is reported alongside.</p>
+<h2 id="tuning"><a class="header" href="#tuning">Tuning</a></h2>
+<ul>
+<li><strong>K = <code>is_samples</code></strong> controls accuracy. The MC SE scales as
+\(1/\sqrt{K}\); halve it by quadrupling K.
+Default 1000 is fine for a smoke test; bump to 2000–5000 for any
+reported LL.</li>
+<li><strong>ν = <code>is_proposal_df</code></strong> controls the proposal tails. The default of 5
+is robust to mild proposal misspecification (Geweke 1989); raise
+toward 30+ to recover a near-Gaussian proposal when the posterior is
+known to be light-tailed.</li>
+<li><strong>Low-ESS subjects</strong> signal a proposal that doesn’t match the
+posterior well — usually a sign the EBE didn’t converge or the
+Hessian was near-singular. The IS estimate is still unbiased, just
+noisier. Investigate by re-running with a tighter <code>inner_tol</code> or
+inspecting the <code>FitResult.subjects[i]</code> diagnostics.</li>
+</ul>
+<h2 id="iov-current-limitation"><a class="header" href="#iov-current-limitation">IOV (current limitation)</a></h2>
+<p>For models with <code>kappa</code> declarations, IMP samples η only — per-occasion
+κ is held fixed at its EBE κ̂. The reported <code>−2 log L</code> is therefore a
+<strong>partial marginal</strong> that does not integrate over κ uncertainty. It
+underestimates the true marginal variance and is <em>not</em> directly
+comparable to NONMEM <code>$EST METHOD=IMP LAPLACIAN=1</code> on κ.</p>
+<p>The result struct flags this via <code>kappa_treatment = "fixed_at_mode"</code>
+(YAML) and the CLI prints a notice. Joint (η, κ) sampling is planned;
+see the <code>TODO(imp-iov-v2)</code> marker in
+<code>src/estimation/importance_sampling.rs</code>.</p>
+<h2 id="cost"><a class="header" href="#cost">Cost</a></h2>
+<p>K × n_subjects predict calls per IMP run. For warfarin (32 subjects)
+with K=2000 this is ≈ 64k predicts — seconds to a minute on a typical
+laptop. The cost is linear in K and trivially parallel over subjects
+(uses the same Rayon worker pool as the inner loop).</p>
+<h2 id="output"><a class="header" href="#output">Output</a></h2>
+<p>In the CLI:</p>
+<pre><code>--- Importance Sampling (marginal log-likelihood) ---
+  -2 log L (IS): 1284.52  (MC SE = 0.41, K = 2000, ν = 5)
+  ESS / K: min = 0.18, median = 0.62
+  Low-ESS subjects (3): 12=0.18, 27=0.21, 34=0.22
+</code></pre>
+<p>In the fit YAML:</p>
+<pre><code class="language-yaml">importance_sampling:
+  minus2_log_likelihood: 1284.524300
+  mc_standard_error: 0.412700
+  n_samples: 2000
+  proposal_df: 5.0000
+  ess_min: 0.1800
+  ess_median: 0.6200
+  kappa_treatment: not_applicable
+  low_ess_subjects:
+    - id: "12"
+      ess_fraction: 0.1800
+    - id: "27"
+      ess_fraction: 0.2100
+    - id: "34"
+      ess_fraction: 0.2200
+</code></pre>
+<p>The Rust <code>FitResult.importance_sampling</code> field carries the same data
+typed as <code>Option&lt;ImportanceSamplingResult&gt;</code>.</p>
+<h2 id="see-also"><a class="header" href="#see-also">See also</a></h2>
+<ul>
+<li><a href="saem.html">SAEM</a> — common upstream stage for <code>methods = [saem, imp]</code>.</li>
+<li><a href="sir.html">SIR</a> — a different importance-sampling-flavoured procedure
+that targets <em>parameter uncertainty</em> (CIs on θ/Ω/σ), not the marginal
+likelihood. The name overlap is unfortunate; the two methods are
+unrelated in goal and implementation.</li>
+</ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../api/fitting.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../estimation/sir.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../api/parsing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../estimation/iov.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -385,11 +350,11 @@ percentiles across draws).</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../api/fitting.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../estimation/sir.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../api/parsing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../estimation/iov.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

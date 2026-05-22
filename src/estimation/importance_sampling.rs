@@ -1,0 +1,731 @@
+//! Importance-sampling marginal log-likelihood (Monolix / NONMEM `$EST METHOD=IMP`).
+//!
+//! For each subject i, given the EBE η̂ᵢ and Hessian Hᵢ from the inner loop,
+//! draw K samples η_ik from a Student-t proposal centred at η̂ᵢ with scale
+//! Σᵢ = (Hᵢ + λI)⁻¹ and DoF ν, then estimate
+//!
+//!   log p(yᵢ | θ) ≈ logsumexp_k [log p(yᵢ | η_ik, θ) + log p(η_ik | θ) − log q(η_ik)] − log K
+//!
+//! Summed across subjects this gives `−2 log L_IS = −2 Σᵢ log p(yᵢ | θ)`,
+//! a lower-bias estimate of the marginal likelihood than the FOCE/Laplace
+//! approximation when individual posteriors of η are non-Gaussian
+//! (sparse-data PK, strong nonlinearity).
+//!
+//! The kernel is rayon-parallel over subjects; per-subject RNGs are seeded
+//! from `options.is_seed.wrapping_add(i as u64)` so the result is
+//! deterministic for a given seed.
+//!
+//! ## IOV (v1)
+//!
+//! For models with inter-occasion variability, κ is held fixed at its
+//! EBE κ̂ — only η is sampled. This makes the reported `-2LL` a *partial*
+//! marginal likelihood that ignores κ uncertainty; it underestimates the
+//! true marginal variance and is not directly comparable to NONMEM's
+//! `$EST METHOD=IMP LAPLACIAN=1` on κ.  Joint (η, κ) sampling is planned —
+//! see `TODO(imp-iov-v2)` below.
+
+use crate::pk::{compute_predictions_with_tv_into, EventPkParams};
+use crate::stats::likelihood::{obs_nll_subject_into, split_obs_by_occasion};
+use crate::stats::residual_error::{compute_r_diag, residual_variance};
+use crate::stats::special::log_normal_cdf;
+use crate::types::*;
+use nalgebra::{DMatrix, DVector};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use rand_distr::{ChiSquared, Distribution, StandardNormal};
+use rayon::prelude::*;
+
+/// `2π` as `f64`.  Used in the Gaussian-prior log-density.
+const TWO_PI: f64 = std::f64::consts::TAU;
+
+/// Estimate `−2 log L` by importance sampling. See module docstring for the
+/// algorithm and IOV caveats.
+pub fn run_importance_sampling(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> Result<ImportanceSamplingResult, String> {
+    let n_subjects = population.subjects.len();
+    if eta_hats.len() != n_subjects || h_matrices.len() != n_subjects {
+        return Err(format!(
+            "IS: eta_hats ({}) / h_matrices ({}) length must match n_subjects ({})",
+            eta_hats.len(),
+            h_matrices.len(),
+            n_subjects
+        ));
+    }
+
+    let n_eta = model.n_eta;
+    let k_samples = options.is_samples;
+    let nu = options.is_proposal_df;
+    let seed = options.is_seed.unwrap_or(42);
+    let threshold = options.is_low_ess_threshold;
+    let cancel = &options.cancel;
+
+    if k_samples < 2 {
+        return Err(format!("IS: is_samples must be >= 2, got {}", k_samples));
+    }
+    if nu < 1.0 {
+        return Err(format!("IS: is_proposal_df must be >= 1.0, got {}", nu));
+    }
+
+    let kappa_treatment = if model.n_kappa > 0 {
+        KappaTreatment::FixedAtMode
+    } else {
+        KappaTreatment::NotApplicable
+    };
+
+    // Pre-compute Ω⁻¹ and log|Ω| once (shared across all subjects + samples).
+    let omega = &params.omega;
+    if !omega.log_det.is_finite() {
+        return Err("IS: Ω log-determinant is not finite — cannot evaluate η prior".into());
+    }
+    let omega_inv = omega.inv.clone();
+    let log_det_omega = omega.log_det;
+
+    if options.verbose {
+        eprintln!(
+            "Importance sampling: {} subjects, K={} per subject, t_{} proposal, seed={}",
+            n_subjects, k_samples, nu, seed
+        );
+    }
+
+    let per_subject: Vec<SubjectIsOutput> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            if crate::cancel::is_cancelled(cancel) {
+                return SubjectIsOutput::cancelled(subject.id.clone());
+            }
+            let eta_hat = &eta_hats[i];
+            // `h_matrices` from the inner loop is the Jacobian df/dη at η̂
+            // (shape n_obs × n_eta) — not the posterior Hessian. Build the
+            // Sheiner–Beal Hessian H_post ≈ J' R⁻¹ J + Ω⁻¹ here, then pass
+            // *that* into the proposal builder. Skipping this step would
+            // panic on the (n_obs, n_eta) ≠ (n_eta, n_eta) shape check and
+            // — even after that — would have given a numerically wrong
+            // proposal scale.
+            let jacobian = &h_matrices[i];
+            let h_post = compute_posterior_hessian(
+                model,
+                subject,
+                &params.theta,
+                eta_hat,
+                &params.sigma.values,
+                jacobian,
+                &omega_inv,
+                n_eta,
+                scratch,
+            );
+            let kap = kappas.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+            let subj_seed = seed.wrapping_add(i as u64);
+            subject_is_estimate(
+                model,
+                subject,
+                &params.theta,
+                &params.sigma.values,
+                eta_hat,
+                &h_post,
+                kap,
+                &omega_inv,
+                log_det_omega,
+                n_eta,
+                k_samples,
+                nu,
+                subj_seed,
+                scratch,
+            )
+        })
+        .collect();
+
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return Err("cancelled by user".to_string());
+    }
+
+    // Reduce across subjects.
+    let mut ll = 0.0_f64;
+    let mut var_ll = 0.0_f64;
+    let mut ess_fracs: Vec<f64> = Vec::with_capacity(n_subjects);
+    let mut low_ess: Vec<(String, f64)> = Vec::new();
+    for (i, out) in per_subject.iter().enumerate() {
+        ll += out.log_marginal;
+        var_ll += out.var_log_marginal;
+        ess_fracs.push(out.ess_fraction);
+        if out.ess_fraction < threshold {
+            low_ess.push((population.subjects[i].id.clone(), out.ess_fraction));
+        }
+    }
+    let minus2_ll = -2.0 * ll;
+    // Var(−2 LL) = 4 · Var(LL) = 4 · Σᵢ Var(log p̂(yᵢ)).
+    let mc_se = 2.0 * var_ll.max(0.0).sqrt();
+
+    ess_fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ess_min = *ess_fracs.first().unwrap_or(&0.0);
+    let ess_median = if ess_fracs.is_empty() {
+        0.0
+    } else {
+        let mid = ess_fracs.len() / 2;
+        if ess_fracs.len().is_multiple_of(2) {
+            0.5 * (ess_fracs[mid - 1] + ess_fracs[mid])
+        } else {
+            ess_fracs[mid]
+        }
+    };
+
+    if options.verbose {
+        eprintln!(
+            "IS done. −2 log L = {:.4} ± {:.4} (ess_min/K = {:.3}, ess_med/K = {:.3}, low_ess = {})",
+            minus2_ll,
+            mc_se,
+            ess_min,
+            ess_median,
+            low_ess.len()
+        );
+    }
+
+    Ok(ImportanceSamplingResult {
+        minus2_log_likelihood: minus2_ll,
+        mc_standard_error: mc_se,
+        low_ess_subjects: low_ess,
+        n_samples: k_samples,
+        proposal_df: nu,
+        ess_min,
+        ess_median,
+        kappa_treatment,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Per-subject estimate
+// ---------------------------------------------------------------------------
+
+struct SubjectIsOutput {
+    /// log p̂(yᵢ | θ) — the IS-estimated marginal log-likelihood for subject i.
+    log_marginal: f64,
+    /// Per-subject contribution to `Var(LL_IS) = Σᵢ Var(log p̂(yᵢ))`.
+    /// Used to build the population-level MC SE.
+    var_log_marginal: f64,
+    /// Normalised effective sample size, ESS/K. 1.0 = ideal; near 0 = degenerate.
+    ess_fraction: f64,
+}
+
+impl SubjectIsOutput {
+    fn cancelled(_id: String) -> Self {
+        Self {
+            log_marginal: 0.0,
+            var_log_marginal: 0.0,
+            ess_fraction: 0.0,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn subject_is_estimate(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>,
+    kappas_of_subject: &[DVector<f64>],
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    k_samples: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+) -> SubjectIsOutput {
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // Build proposal: t_ν(η̂, Σ) with Σ = (H + λI)⁻¹.
+    let proposal = match build_proposal(h, omega_inv, d) {
+        Some(p) => p,
+        None => {
+            // Even the omega-scale fallback failed (n_eta = 0?). Treat as a
+            // degenerate proposal with all weight at the prior mode.
+            return SubjectIsOutput {
+                log_marginal: 0.0,
+                var_log_marginal: 0.0,
+                ess_fraction: 0.0,
+            };
+        }
+    };
+
+    let normal = StandardNormal;
+    let chi_sq = ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller");
+
+    // Constant pieces of log q (Student-t) and log p_η (Gaussian) pulled out
+    // of the per-sample loop.
+    let half_d = 0.5 * d as f64;
+    let log_t_const = ln_gamma(0.5 * (nu + d as f64))
+        - ln_gamma(0.5 * nu)
+        - half_d * (nu * std::f64::consts::PI).ln()
+        + 0.5 * proposal.log_det_inv_scale; // −0.5 log|Σ| = +0.5 log|H_reg|
+    let log_p_eta_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega;
+
+    let mut log_w: Vec<f64> = Vec::with_capacity(k_samples);
+    let mut z = vec![0.0_f64; d];
+    let mut eta_sample = vec![0.0_f64; d];
+
+    for _ in 0..k_samples {
+        // Draw z ~ N(0, I_d) and c ~ χ²_ν; build η = η̂ + sqrt(ν/c) · L_Σ z.
+        for zi in z.iter_mut() {
+            *zi = normal.sample(&mut rng);
+        }
+        let c: f64 = chi_sq.sample(&mut rng).max(1e-300);
+        let scale = (nu / c).sqrt();
+        // L_Σ z via the precomputed factor.
+        proposal.apply_l_sigma(&z, &mut eta_sample, scale);
+        for (j, e) in eta_sample.iter_mut().enumerate() {
+            *e += eta_hat[j];
+        }
+
+        // log p(y | η, θ, κ̂):  IOV path branches on whether the subject has occasions.
+        let obs_nll = if kappas_of_subject.is_empty() {
+            obs_nll_subject_into(model, subject, theta, sigma, &eta_sample, scratch)
+        } else {
+            // TODO(imp-iov-v2): replace this κ-fixed evaluation with joint
+            // sampling of (η, κ_1, …, κ_O) from a block-structured proposal
+            // that uses the full (n_eta + n_kappa·n_occasions) Hessian and
+            // includes Ω_iov in the prior. See docs/src/estimation/importance-sampling.md.
+            obs_nll_iov_fixed_kappa(
+                model,
+                subject,
+                theta,
+                sigma,
+                &eta_sample,
+                kappas_of_subject,
+                scratch,
+            )
+        };
+        let log_p_y = -obs_nll;
+
+        // log p(η | θ): multivariate normal density at η_sample.
+        let eta_vec = DVector::from_column_slice(&eta_sample);
+        let quad_form = eta_vec.dot(&(omega_inv * &eta_vec));
+        let log_p_eta = log_p_eta_const - 0.5 * quad_form;
+
+        // log q(η): multivariate t at (η̂, Σ, ν).
+        let diff: Vec<f64> = eta_sample
+            .iter()
+            .zip(eta_hat.iter())
+            .map(|(a, b)| a - b)
+            .collect();
+        // (η-η̂)' H_reg (η-η̂) via the precomputed Cholesky of H_reg = L L'.
+        // Σ⁻¹ = H_reg, so the Mahalanobis term is ‖L'·diff‖².
+        let mahal = proposal.mahalanobis(&diff);
+        let log_q = log_t_const - 0.5 * (nu + d as f64) * (1.0 + mahal / nu).ln();
+
+        log_w.push(log_p_y + log_p_eta - log_q);
+    }
+
+    // logsumexp + ESS.
+    let (lse, weights_norm) = logsumexp_with_normalised(&log_w);
+    let log_marginal = lse - (k_samples as f64).ln();
+    let ess = if weights_norm.is_empty() {
+        0.0
+    } else {
+        let sum_sq: f64 = weights_norm.iter().map(|w| w * w).sum();
+        if sum_sq > 0.0 {
+            1.0 / sum_sq
+        } else {
+            0.0
+        }
+    };
+    let ess_fraction = ess / (k_samples as f64);
+
+    // Asymptotic variance of log p̂(yᵢ) for a self-normalised IS estimator:
+    //   Var(log p̂) ≈ (K · Σ wₖ² − 1) / K = (1/ESS_fraction − 1) / K
+    // (Geweke 1989; equivalent to the standard "1/ESS − 1/K" relation.)
+    let var_log_marginal = if ess_fraction > 0.0 {
+        (1.0 / ess_fraction - 1.0) / (k_samples as f64)
+    } else {
+        // Degenerate — treat the per-subject estimate as having undefined SE.
+        // Inflate by a finite-but-large number so the overall MC SE flags it
+        // without producing a NaN that contaminates the sum.
+        1.0
+    };
+
+    SubjectIsOutput {
+        log_marginal,
+        var_log_marginal,
+        ess_fraction,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proposal construction (regularised Hessian, Cholesky factors)
+// ---------------------------------------------------------------------------
+
+struct Proposal {
+    /// Lower-triangular L such that L L' = H_reg = Σ⁻¹.
+    /// Used both to apply Σ^{1/2} when sampling (L'⁻¹ z) and to evaluate the
+    /// Mahalanobis term (‖L'·diff‖²) when scoring q(η).
+    chol_h: DMatrix<f64>,
+    /// log|H_reg| = 2 · Σ log L_ii — used for the log|Σ| = −log|H_reg| piece
+    /// of the Student-t log-density.
+    log_det_inv_scale: f64,
+    d: usize,
+}
+
+impl Proposal {
+    /// Apply `scale · L_Σ z` into `out`, where `L_Σ` is the Cholesky factor of
+    /// Σ = H⁻¹. Implementation: `L_Σ = L^{-T}` for the L from `H = L L^T`, so
+    /// `L_Σ z = L^{-T} z` — one back-substitution.
+    fn apply_l_sigma(&self, z: &[f64], out: &mut [f64], scale: f64) {
+        // Back-solve L^T x = z for x (i.e. `out`).
+        // L is lower-triangular; L^T is upper-triangular.
+        let l = &self.chol_h;
+        for i in (0..self.d).rev() {
+            let mut s = z[i];
+            for j in (i + 1)..self.d {
+                s -= l[(j, i)] * out[j];
+            }
+            out[i] = s / l[(i, i)];
+        }
+        if scale != 1.0 {
+            for x in out.iter_mut() {
+                *x *= scale;
+            }
+        }
+    }
+
+    /// Compute `diff' H_reg diff` via `‖L' diff‖²`.
+    fn mahalanobis(&self, diff: &[f64]) -> f64 {
+        let l = &self.chol_h;
+        let mut sum = 0.0;
+        for i in 0..self.d {
+            let mut s = 0.0;
+            for j in i..self.d {
+                s += l[(j, i)] * diff[j];
+            }
+            sum += s * s;
+        }
+        sum
+    }
+}
+
+/// Build the IS proposal scale matrix from a per-subject inner-loop Hessian.
+///
+/// Strategy: Cholesky(H + λI), with λ = max(1e−6 · trace(H)/d, 1e−10). If H
+/// is so degenerate that even the jittered matrix isn't positive-definite,
+/// fall back to Σ = Ω (the prior covariance) — a broad proposal that won't
+/// give a sharp likelihood estimate but stays well-defined.
+///
+/// Returns `None` only when `d == 0`.
+fn build_proposal(h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize) -> Option<Proposal> {
+    if d == 0 {
+        return None;
+    }
+    debug_assert_eq!(h.nrows(), d);
+    debug_assert_eq!(h.ncols(), d);
+
+    let trace = (0..d).map(|i| h[(i, i)]).sum::<f64>();
+    let lambda = (1e-6 * trace / d as f64).max(1e-10);
+    let mut h_reg = h.clone();
+    for i in 0..d {
+        h_reg[(i, i)] += lambda;
+    }
+    if let Some(chol) = h_reg.clone().cholesky() {
+        let l = chol.l();
+        let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
+        return Some(Proposal {
+            chol_h: l,
+            log_det_inv_scale: log_det,
+            d,
+        });
+    }
+
+    // Fallback: Σ = Ω (proposal scale = prior covariance). To keep the same
+    // (L L' = Σ⁻¹) interface we Cholesky-factor Ω⁻¹ instead.
+    let omega_inv_chol = omega_inv.clone().cholesky()?;
+    let l = omega_inv_chol.l();
+    let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
+    Some(Proposal {
+        chol_h: l,
+        log_det_inv_scale: log_det,
+        d,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Numerical helpers
+// ---------------------------------------------------------------------------
+
+/// log Γ(x) via the Lanczos approximation. Standard library doesn't expose
+/// `f64::ln_gamma` on stable, so we inline the textbook coefficients.
+fn ln_gamma(x: f64) -> f64 {
+    // Cody's coefficients for Lanczos g=7, n=9. Accuracy ~1e-15 for x > 0.
+    const G: f64 = 7.0;
+    const C: [f64; 9] = [
+        0.999_999_999_999_81,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_2,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_1,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if x < 0.5 {
+        // Reflection.
+        return std::f64::consts::PI.ln()
+            - (std::f64::consts::PI * x).sin().ln()
+            - ln_gamma(1.0 - x);
+    }
+    let x = x - 1.0;
+    let mut a = C[0];
+    for (i, &c) in C.iter().enumerate().skip(1) {
+        a += c / (x + i as f64);
+    }
+    let t = x + G + 0.5;
+    0.5 * (TWO_PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
+}
+
+/// Numerically stable `log Σ exp(xᵢ)` plus the normalised weights `wᵢ`.
+fn logsumexp_with_normalised(xs: &[f64]) -> (f64, Vec<f64>) {
+    if xs.is_empty() {
+        return (f64::NEG_INFINITY, Vec::new());
+    }
+    let m = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !m.is_finite() {
+        return (m, vec![0.0; xs.len()]);
+    }
+    let mut sum = 0.0;
+    let mut shifted: Vec<f64> = Vec::with_capacity(xs.len());
+    for &x in xs {
+        let s = (x - m).exp();
+        shifted.push(s);
+        sum += s;
+    }
+    let lse = m + sum.ln();
+    let weights: Vec<f64> = if sum > 0.0 {
+        shifted.iter().map(|&s| s / sum).collect()
+    } else {
+        vec![0.0; xs.len()]
+    };
+    (lse, weights)
+}
+
+/// IOV-aware obs NLL with κ fixed at its EBE. Mirrors the per-occasion split
+/// in `foce_subject_nll_iov` but returns only the obs term — no Laplace/FOCE
+/// linearisation.
+fn obs_nll_iov_fixed_kappa(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta_bsv: &[f64],
+    kappas_of_subject: &[DVector<f64>],
+    scratch: &mut EventPkParams,
+) -> f64 {
+    let occ_groups = split_obs_by_occasion(subject);
+    let n_obs = subject.obs_times.len();
+    let mut ipreds = vec![0.0_f64; n_obs];
+    for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate() {
+        let kap: &[f64] = if k < kappas_of_subject.len() {
+            kappas_of_subject[k].as_slice()
+        } else {
+            &[]
+        };
+        let combined: Vec<f64> = eta_bsv.iter().copied().chain(kap.iter().copied()).collect();
+        let all_preds = compute_predictions_with_tv_into(model, subject, theta, &combined, scratch);
+        for &j in obs_indices {
+            ipreds[j] = all_preds[j];
+        }
+    }
+    let m3 = matches!(model.bloq_method, BloqMethod::M3);
+    let mut nll = 0.0;
+    for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
+        let f = f.max(1e-12);
+        let v = residual_variance(model.error_model, f, sigma).max(1e-12);
+        if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
+            let z = (y - f) / v.sqrt();
+            nll += -log_normal_cdf(z);
+        } else {
+            nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
+        }
+    }
+    nll
+}
+
+/// Sheiner–Beal posterior-Hessian approximation at η̂.
+///
+/// `H_post ≈ J' R⁻¹ J + Ω⁻¹` where J is the Jacobian `df/dη` (the misleadingly-
+/// named `h_matrix` stored on `OuterResult`) and R is the diagonal residual
+/// variance evaluated at η̂. This is the matrix the IS proposal scales against
+/// — it's the Laplace covariance's inverse.
+#[allow(clippy::too_many_arguments)]
+fn compute_posterior_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    sigma: &[f64],
+    jacobian: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    n_eta: usize,
+    scratch: &mut EventPkParams,
+) -> DMatrix<f64> {
+    let n_obs = subject.observations.len();
+    if n_obs == 0 {
+        // Subject has no observations — posterior == prior; Hessian = Ω⁻¹.
+        return omega_inv.clone();
+    }
+    let ipreds =
+        compute_predictions_with_tv_into(model, subject, theta, eta_hat.as_slice(), scratch);
+    let r_diag = compute_r_diag(model.error_model, &ipreds, sigma);
+    let mut h_post = omega_inv.clone();
+    for j in 0..n_obs {
+        let rj = r_diag[j].max(1e-12);
+        for a in 0..n_eta {
+            let ja = jacobian[(j, a)];
+            for b in 0..n_eta {
+                h_post[(a, b)] += ja * jacobian[(j, b)] / rj;
+            }
+        }
+    }
+    h_post
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1 unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logsumexp_handles_extreme_spread() {
+        // log[exp(1000) + exp(1001)] = 1001 + log(1 + exp(-1)) ≈ 1001.3133
+        let (lse, w) = logsumexp_with_normalised(&[1000.0, 1001.0]);
+        assert!((lse - (1001.0 + (1.0 + (-1.0_f64).exp()).ln())).abs() < 1e-10);
+        // Normalised weights should sum to 1 and reflect the relative
+        // log-weight: w[1] / w[0] = exp(1) ≈ 2.718.
+        let sum: f64 = w.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-12);
+        let ratio = w[1] / w[0];
+        assert!((ratio - 1.0_f64.exp()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn logsumexp_returns_neginf_on_empty_input() {
+        let (lse, w) = logsumexp_with_normalised(&[]);
+        assert_eq!(lse, f64::NEG_INFINITY);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn logsumexp_handles_all_neginf() {
+        let (lse, w) = logsumexp_with_normalised(&[f64::NEG_INFINITY; 3]);
+        assert_eq!(lse, f64::NEG_INFINITY);
+        assert_eq!(w, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn ln_gamma_matches_known_values() {
+        // ln Γ(0.5) = ln √π
+        assert!((ln_gamma(0.5) - 0.5 * std::f64::consts::PI.ln()).abs() < 1e-10);
+        // ln Γ(1) = 0
+        assert!(ln_gamma(1.0).abs() < 1e-10);
+        // ln Γ(5) = ln 24
+        assert!((ln_gamma(5.0) - 24.0_f64.ln()).abs() < 1e-10);
+        // ln Γ(10) = ln 9!
+        let factorial_9: f64 = (1..=9).map(|n| n as f64).product();
+        assert!((ln_gamma(10.0) - factorial_9.ln()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_proposal_handles_well_conditioned_h() {
+        // H = diag(2, 4) — well conditioned.
+        let h = DMatrix::from_row_slice(2, 2, &[2.0, 0.0, 0.0, 4.0]);
+        let omega_inv = DMatrix::identity(2, 2);
+        let p = build_proposal(&h, &omega_inv, 2).unwrap();
+        // Σ = H⁻¹ = diag(0.5, 0.25), so log|Σ⁻¹| ≈ log 8.
+        // (λ jitter is ~1e-6·trace/d = 3e-6 — negligible at this precision.)
+        assert!((p.log_det_inv_scale - 8.0_f64.ln()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn build_proposal_falls_back_when_h_is_singular() {
+        // H = zero matrix — not positive-definite even with default jitter.
+        // Fallback uses Ω⁻¹'s Cholesky.
+        let h = DMatrix::zeros(2, 2);
+        let omega_inv = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 1.0]);
+        let p = build_proposal(&h, &omega_inv, 2);
+        assert!(p.is_some(), "fallback to Ω-scale proposal should succeed");
+    }
+
+    #[test]
+    fn proposal_mahalanobis_matches_direct_quadratic_form() {
+        // H = [[4, 1], [1, 3]], diff = [0.5, -0.2].
+        // diff' H diff = 4·0.25 + 2·1·0.5·(-0.2) + 3·0.04 = 1.0 − 0.2 + 0.12 = 0.92.
+        let h = DMatrix::from_row_slice(2, 2, &[4.0, 1.0, 1.0, 3.0]);
+        let omega_inv = DMatrix::identity(2, 2);
+        let p = build_proposal(&h, &omega_inv, 2).unwrap();
+        let diff = vec![0.5, -0.2];
+        let m = p.mahalanobis(&diff);
+        // Allow a touch of slack for the jitter.
+        assert!((m - 0.92).abs() < 1e-3, "mahalanobis = {} vs 0.92", m);
+    }
+
+    #[test]
+    fn proposal_apply_l_sigma_round_trips_with_mahalanobis() {
+        // For x = L_Σ z, x' H x should equal z' L^{-1} H L^{-T} z = z' z = ||z||².
+        // Set scale = 1 so the t expansion factor doesn't enter.
+        let h = DMatrix::from_row_slice(2, 2, &[4.0, 1.0, 1.0, 3.0]);
+        let omega_inv = DMatrix::identity(2, 2);
+        let p = build_proposal(&h, &omega_inv, 2).unwrap();
+        let z = vec![0.7, -0.4];
+        let mut x = vec![0.0, 0.0];
+        p.apply_l_sigma(&z, &mut x, 1.0);
+        let m = p.mahalanobis(&x);
+        let z_sq: f64 = z.iter().map(|v| v * v).sum();
+        // Jitter tilts this slightly; loose tolerance is fine here.
+        assert!((m - z_sq).abs() < 1e-3, "m={} vs ||z||²={}", m, z_sq);
+    }
+
+    #[test]
+    fn weights_invariant_under_log_constant_shift() {
+        // Shifting every log-weight by the same constant must not change the
+        // normalised weights (and hence ESS).
+        let xs = vec![0.1, -0.5, 2.3, -1.2, 0.8];
+        let (_, w1) = logsumexp_with_normalised(&xs);
+        let shifted: Vec<f64> = xs.iter().map(|x| x + 17.4).collect();
+        let (_, w2) = logsumexp_with_normalised(&shifted);
+        for (a, b) in w1.iter().zip(w2.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    /// Linear-Gaussian sanity check: when the model is exactly Gaussian and
+    /// the proposal is correctly scaled, the IS estimate of log Σ wₖ should
+    /// concentrate around the analytic marginal. We don't drive a full PK
+    /// model here — instead we exercise the IS-weight bookkeeping on a
+    /// known integrand by injecting hand-built log-weights through
+    /// logsumexp + ESS, and verify the per-subject SE formula matches the
+    /// known closed form for equal weights.
+    #[test]
+    fn equal_weights_imply_full_ess_and_zero_variance() {
+        // K equal log-weights → wₖ = 1/K, ESS = K, variance estimate = 0.
+        let k = 100;
+        let log_w = vec![0.0_f64; k];
+        let (lse, w) = logsumexp_with_normalised(&log_w);
+        let log_marginal = lse - (k as f64).ln();
+        // Σ exp(0) = K, so log Σ = log K, log_marginal = 0.
+        assert!(log_marginal.abs() < 1e-12);
+        let ess: f64 = 1.0 / w.iter().map(|v| v * v).sum::<f64>();
+        assert!((ess - k as f64).abs() < 1e-10);
+        let ess_fraction = ess / (k as f64);
+        let var = (1.0 / ess_fraction - 1.0) / (k as f64);
+        assert!(var.abs() < 1e-12);
+    }
+}

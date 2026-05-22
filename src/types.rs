@@ -857,6 +857,51 @@ pub struct SubjectResult {
 }
 
 /// Outcome of the post-estimation covariance step.
+/// How per-occasion kappa random effects are treated in the IS marginal likelihood.
+///
+/// `Marginalized` — kappa is jointly sampled with eta (planned v2; not yet implemented).
+/// `FixedAtMode` — kappa is held at its EBE (κ̂) and only eta is sampled. This is a
+/// *partial* marginal likelihood that ignores κ uncertainty, so the reported `-2LL`
+/// is biased downward relative to the true marginal and is not directly comparable
+/// to NONMEM's `$EST METHOD=IMP LAPLACIAN=1` on κ.
+/// `NotApplicable` — model has no kappa declarations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KappaTreatment {
+    NotApplicable,
+    FixedAtMode,
+    Marginalized,
+}
+
+/// Result of the importance-sampling marginal log-likelihood step.
+///
+/// Produced by the `Imp` stage in a method chain (`methods = [..., imp]`).
+/// Surfaced on `FitResult.importance_sampling`.
+#[derive(Debug, Clone)]
+pub struct ImportanceSamplingResult {
+    /// `−2 · Σᵢ log p(yᵢ | θ)` estimated by importance sampling. Lower-bias
+    /// alternative to the FOCE/Laplace OFV when subject posteriors are
+    /// non-Gaussian (sparse data, strong nonlinearity).
+    pub minus2_log_likelihood: f64,
+    /// Monte-Carlo standard error on `minus2_log_likelihood`. Scales with
+    /// `1/sqrt(n_samples)`; halve by quadrupling `is_samples`.
+    pub mc_standard_error: f64,
+    /// `(subject_id, ESS/K)` for every subject whose normalized effective sample
+    /// size fraction fell below `FitOptions::is_low_ess_threshold`. Empty list
+    /// means every subject's proposal matched its posterior well.
+    pub low_ess_subjects: Vec<(String, f64)>,
+    /// Number of importance samples drawn per subject (`FitOptions::is_samples`).
+    pub n_samples: usize,
+    /// Student-t proposal degrees of freedom (`FitOptions::is_proposal_df`).
+    pub proposal_df: f64,
+    /// Minimum across-subject normalized ESS fraction (ESS / K). 1.0 = ideal,
+    /// near 0 = degenerate proposal for at least one subject.
+    pub ess_min: f64,
+    /// Median across-subject normalized ESS fraction.
+    pub ess_median: f64,
+    /// Treatment of per-occasion kappa random effects.  See [`KappaTreatment`].
+    pub kappa_treatment: KappaTreatment,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CovarianceStatus {
     /// User set `covariance = false`; step was not attempted.
@@ -926,6 +971,12 @@ pub struct FitResult {
     /// appended when the model has kappa declarations.
     /// Consumed by `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`.
     pub sir_resamples_packed: Option<Vec<Vec<f64>>>,
+    /// Importance-sampling marginal log-likelihood result. `Some` when an
+    /// `Imp` stage ran in the method chain (`methods = [..., imp]`). The
+    /// `−2 log L_IS` value is lower-bias than the FOCE/Laplace `ofv` for
+    /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
+    /// model comparison in those settings. See [`ImportanceSamplingResult`].
+    pub importance_sampling: Option<ImportanceSamplingResult>,
     // IOV results (present when kappa declarations exist in the model)
     pub omega_iov: Option<DMatrix<f64>>,
     pub kappa_names: Vec<String>,
@@ -1118,6 +1169,23 @@ pub struct FitOptions {
     /// (omega variances, constrained thetas). Default 5.0 follows Dosne (2017).
     /// Set to a large value (e.g. 100.0) to recover near-normal behaviour.
     pub sir_df: f64,
+    // Importance-sampling marginal log-likelihood options (consumed by the
+    // `Imp` chain stage; ignored otherwise). The Imp stage estimates
+    // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` by Monte Carlo with a
+    // Student-t proposal centred on each subject's EBE.
+    /// Number of importance samples per subject. Default 1000. Recommended
+    /// 2000–5000 for publication-quality MC SE (cost scales linearly).
+    pub is_samples: usize,
+    /// Degrees of freedom for the Student-t proposal. Default 5.0 (heavy-tailed
+    /// — robust to mild proposal misspecification). Must be ≥ 1.
+    pub is_proposal_df: f64,
+    /// RNG seed for the IS sampling. `None` falls back to a fixed default so
+    /// runs are reproducible across invocations.
+    pub is_seed: Option<u64>,
+    /// Subjects with normalized effective sample size below this fraction
+    /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
+    /// the flag entirely.
+    pub is_low_ess_threshold: f64,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -1242,6 +1310,10 @@ impl Default for FitOptions {
             sir_seed: None,
             sir_keep_samples: false,
             sir_df: 5.0,
+            is_samples: 1000,
+            is_proposal_df: 5.0,
+            is_seed: None,
+            is_low_ess_threshold: 0.1,
             bloq_method: BloqMethod::Drop,
             steihaug_max_iters: None,
             mu_referencing: true,
@@ -1307,6 +1379,12 @@ pub enum EstimationMethod {
     FoceGn,
     FoceGnHybrid,
     Saem,
+    /// Importance-sampling marginal log-likelihood. Not an estimator — does not
+    /// update parameters. Must follow another stage in `methods` (consumes that
+    /// stage's params + EBEs + per-subject Hessians as the proposal centre /
+    /// scale) and is typically terminal. Reports `−2 log L_IS` on
+    /// `FitResult.importance_sampling`, distinct from the Laplace OFV on `ofv`.
+    Imp,
 }
 
 impl EstimationMethod {
@@ -1317,6 +1395,7 @@ impl EstimationMethod {
             EstimationMethod::FoceGn => "FOCE-GN",
             EstimationMethod::FoceGnHybrid => "FOCE-GN-Hybrid",
             EstimationMethod::Saem => "SAEM",
+            EstimationMethod::Imp => "IMP",
         }
     }
 }
@@ -1466,6 +1545,12 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "adapt_interval",
             "seed",
             "saem_seed",
+        ],
+        EstimationMethod::Imp => &[
+            "is_samples",
+            "is_proposal_df",
+            "is_seed",
+            "is_low_ess_threshold",
         ],
     }
 }

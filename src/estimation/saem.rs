@@ -10,9 +10,8 @@ use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{compute_covariance, pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::{individual_nll, individual_nll_into};
+use crate::stats::likelihood::{individual_nll, individual_nll_into, obs_nll_subject_into};
 use crate::stats::residual_error::residual_variance;
-use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::prelude::*;
@@ -306,7 +305,7 @@ fn theta_sigma_mstep_light(
 ///   NLL call).
 ///
 /// For M3 models (complex Mills-ratio sigma gradient): forward-FD of
-/// `obs_nll_single_into` for all parameters.
+/// `obs_nll_subject_into` for all parameters.
 ///
 /// `lower`/`upper` are the packed-space bounds used to detect pinned dimensions
 /// (`lower[i] == upper[i]`); pinned dimensions contribute 0 to the gradient and
@@ -329,8 +328,8 @@ fn obs_nll_subject_grad(
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
 
     if m3 {
-        // M3 path: forward-FD of obs_nll_single_into for all parameters.
-        let nll_base = obs_nll_single_into(model, subject, theta, sigma_values, eta, pk_scratch);
+        // M3 path: forward-FD of obs_nll_subject_into for all parameters.
+        let nll_base = obs_nll_subject_into(model, subject, theta, sigma_values, eta, pk_scratch);
         let mut grad = vec![0.0f64; n];
         let h = 1e-5;
         for i in 0..n {
@@ -342,7 +341,7 @@ fn obs_nll_subject_grad(
                 let delta = h * (1.0 + theta[i].abs());
                 theta_p[i] += delta;
                 let nll_p =
-                    obs_nll_single_into(model, subject, &theta_p, sigma_values, eta, pk_scratch);
+                    obs_nll_subject_into(model, subject, &theta_p, sigma_values, eta, pk_scratch);
                 let raw = (nll_p - nll_base) / delta;
                 grad[i] = if theta_packs_log_mask[i] {
                     theta[i] * raw
@@ -354,7 +353,7 @@ fn obs_nll_subject_grad(
                 let mut sigma_p = sigma_values.to_vec();
                 let delta = h * (1.0 + sigma_values[k].abs());
                 sigma_p[k] += delta;
-                let nll_p = obs_nll_single_into(model, subject, theta, &sigma_p, eta, pk_scratch);
+                let nll_p = obs_nll_subject_into(model, subject, theta, &sigma_p, eta, pk_scratch);
                 // log-packing for sigma: d/d(log_sigma_k) = sigma_k * d/d(sigma_k)
                 grad[i] = sigma_values[k] * (nll_p - nll_base) / delta;
             }
@@ -454,33 +453,6 @@ fn obs_nll_subject_grad(
     (nll_base, grad)
 }
 
-/// Observation NLL for a single subject with ETAs held fixed.
-///
-/// Under M3, CENS=1 rows contribute `-log Φ((LLOQ - f)/√V)`.
-fn obs_nll_single_into(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    pk_scratch: &mut EventPkParams,
-) -> f64 {
-    let m3 = matches!(model.bloq_method, BloqMethod::M3);
-    let preds = crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
-    let mut nll = 0.0;
-    for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-        let f = f.max(1e-12);
-        let v = residual_variance(model.error_model, f, sigma_values).max(1e-12);
-        if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
-            let z = (y - f) / v.sqrt();
-            nll += -log_normal_cdf(z);
-        } else {
-            nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
-        }
-    }
-    nll
-}
-
 /// Sum of observation log-likelihoods with ETAs held fixed.
 ///
 /// Under M3, CENS=1 rows contribute `-log Φ((LLOQ - f)/√V)` instead of the
@@ -506,7 +478,7 @@ fn obs_nll_sum(
         .par_iter()
         .enumerate()
         .map_init(EventPkParams::default, |scratch, (i, subject)| {
-            obs_nll_single_into(model, subject, theta, sigma_values, &etas[i], scratch)
+            obs_nll_subject_into(model, subject, theta, sigma_values, &etas[i], scratch)
         })
         .sum()
 }

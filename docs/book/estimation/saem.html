@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-22edb9ee.js";
+            window.path_to_searchindex_js = "../searchindex-7390df12.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-e4fdb3a6.js"></script>
+        <script src="../toc-eae77ecf.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -232,6 +232,12 @@
 <li><strong>Covariance Step</strong>: Optionally compute standard errors via finite-difference Hessian (same method as FOCE)</li>
 <li><strong>Diagnostics</strong>: Compute PRED, IPRED, CWRES, IWRES for each subject</li>
 </ol>
+<p>For sparsely-sampled data where the Laplace OFV is biased, you can
+append an importance-sampling stage that estimates <code>−2 log L</code> by Monte
+Carlo:</p>
+<pre><code>method = [saem, imp]
+</code></pre>
+<p>See <a href="importance-sampling.html">Importance Sampling (IMP)</a>.</p>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
 <pre><code>[fit_options]
   method        = saem

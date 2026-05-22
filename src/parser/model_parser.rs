@@ -1403,6 +1403,8 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         .to_lowercase();
     if val == "saem" {
         Ok(EstimationMethod::Saem)
+    } else if val == "imp" || val == "importance_sampling" || val == "importance-sampling" {
+        Ok(EstimationMethod::Imp)
     } else if val.contains("hybrid") || val == "gn_hybrid" || val == "gn-hybrid" {
         Ok(EstimationMethod::FoceGnHybrid)
     } else if val == "gn" || val.contains("gauss") {
@@ -1564,6 +1566,30 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 return Err(format!("sir_df must be >= 1.0, got {v}"));
             }
             opts.sir_df = v;
+        }
+        "is_samples" => {
+            let v = parse_usize("is_samples")?;
+            if v < 2 {
+                return Err(format!("is_samples must be >= 2, got {v}"));
+            }
+            opts.is_samples = v;
+        }
+        "is_proposal_df" => {
+            let v = parse_f64("is_proposal_df")?;
+            if v < 1.0 {
+                return Err(format!("is_proposal_df must be >= 1.0, got {v}"));
+            }
+            opts.is_proposal_df = v;
+        }
+        "is_seed" => opts.is_seed = parse_u64_opt("is_seed")?,
+        "is_low_ess_threshold" => {
+            let v = parse_f64("is_low_ess_threshold")?;
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!(
+                    "is_low_ess_threshold must be in [0.0, 1.0], got {v}"
+                ));
+            }
+            opts.is_low_ess_threshold = v;
         }
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
@@ -4536,6 +4562,44 @@ mod tests {
         assert!(apply_fit_option(&mut opts, "sir_df", "0.5").is_err());
         // Failed apply must not mutate — default preserved.
         assert_eq!(opts.saem_n_exploration, 150);
+    }
+
+    #[test]
+    fn test_imp_method_and_is_options_parse() {
+        // `methods = [focei, imp]` plus the four `is_*` keys must apply
+        // cleanly and produce no `unsupported_keys_warnings`.
+        let opts = parse_fit_options(&[
+            "method = [focei, imp]".to_string(),
+            "is_samples = 500".to_string(),
+            "is_proposal_df = 4.0".to_string(),
+            "is_seed = 99".to_string(),
+            "is_low_ess_threshold = 0.2".to_string(),
+            "covariance = false".to_string(),
+            "verbose = false".to_string(),
+        ])
+        .expect("parse must succeed");
+        assert_eq!(
+            opts.methods,
+            vec![EstimationMethod::FoceI, EstimationMethod::Imp]
+        );
+        assert_eq!(opts.is_samples, 500);
+        assert_eq!(opts.is_proposal_df, 4.0);
+        assert_eq!(opts.is_seed, Some(99));
+        assert_eq!(opts.is_low_ess_threshold, 0.2);
+        // No "ignored option" warnings — keys are method-specific to Imp,
+        // and Imp is in the chain.
+        assert!(opts.unsupported_keys_warnings().is_empty());
+    }
+
+    #[test]
+    fn test_is_options_validate_ranges() {
+        let mut opts = FitOptions::default();
+        assert!(apply_fit_option(&mut opts, "is_samples", "1").is_err()); // < 2
+        assert!(apply_fit_option(&mut opts, "is_proposal_df", "0.5").is_err()); // < 1
+        assert!(apply_fit_option(&mut opts, "is_low_ess_threshold", "1.5").is_err()); // > 1
+        assert!(apply_fit_option(&mut opts, "is_low_ess_threshold", "-0.1").is_err()); // < 0
+                                                                                       // Defaults preserved after a failed apply.
+        assert_eq!(opts.is_samples, 1000);
     }
 
     #[test]

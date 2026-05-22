@@ -321,6 +321,42 @@ pub fn print_results(result: &FitResult) {
         }
     }
 
+    // Importance sampling marginal log-likelihood
+    if let Some(ref imp) = result.importance_sampling {
+        eprintln!("\n--- Importance Sampling (marginal log-likelihood) ---");
+        eprintln!(
+            "  -2 log L (IS): {:.4}  (MC SE = {:.4}, K = {}, ν = {})",
+            imp.minus2_log_likelihood, imp.mc_standard_error, imp.n_samples, imp.proposal_df,
+        );
+        eprintln!(
+            "  ESS / K: min = {:.3}, median = {:.3}",
+            imp.ess_min, imp.ess_median
+        );
+        match imp.kappa_treatment {
+            KappaTreatment::FixedAtMode => {
+                eprintln!(
+                    "  Note: κ fixed at EBE (partial marginal — not fully comparable to NONMEM IMP)"
+                );
+            }
+            KappaTreatment::Marginalized => {
+                eprintln!("  κ marginalised over IS proposal");
+            }
+            KappaTreatment::NotApplicable => {}
+        }
+        if !imp.low_ess_subjects.is_empty() {
+            eprintln!(
+                "  Low-ESS subjects ({}): {}",
+                imp.low_ess_subjects.len(),
+                imp.low_ess_subjects
+                    .iter()
+                    .take(5)
+                    .map(|(id, frac)| format!("{}={:.2}", id, frac))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
     // SIR results
     if let Some(ess) = result.sir_ess {
         eprintln!("\n--- SIR Uncertainty (95% CI) ---");
@@ -775,6 +811,38 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    // Importance-sampling marginal log-likelihood section
+    if let Some(ref imp) = result.importance_sampling {
+        writeln!(f, "\nimportance_sampling:").map_err(|e| e.to_string())?;
+        writeln!(
+            f,
+            "  minus2_log_likelihood: {:.6}",
+            imp.minus2_log_likelihood
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(f, "  mc_standard_error: {:.6}", imp.mc_standard_error)
+            .map_err(|e| e.to_string())?;
+        writeln!(f, "  n_samples: {}", imp.n_samples).map_err(|e| e.to_string())?;
+        writeln!(f, "  proposal_df: {:.4}", imp.proposal_df).map_err(|e| e.to_string())?;
+        writeln!(f, "  ess_min: {:.4}", imp.ess_min).map_err(|e| e.to_string())?;
+        writeln!(f, "  ess_median: {:.4}", imp.ess_median).map_err(|e| e.to_string())?;
+        let kt = match imp.kappa_treatment {
+            KappaTreatment::NotApplicable => "not_applicable",
+            KappaTreatment::FixedAtMode => "fixed_at_mode",
+            KappaTreatment::Marginalized => "marginalized",
+        };
+        writeln!(f, "  kappa_treatment: {}", kt).map_err(|e| e.to_string())?;
+        if imp.low_ess_subjects.is_empty() {
+            writeln!(f, "  low_ess_subjects: []").map_err(|e| e.to_string())?;
+        } else {
+            writeln!(f, "  low_ess_subjects:").map_err(|e| e.to_string())?;
+            for (id, frac) in &imp.low_ess_subjects {
+                writeln!(f, "    - id: \"{}\"", id).map_err(|e| e.to_string())?;
+                writeln!(f, "      ess_fraction: {:.4}", frac).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
     // SIR section
     if let Some(ess) = result.sir_ess {
         writeln!(f, "\nsir:").map_err(|e| e.to_string())?;
@@ -925,6 +993,7 @@ mod tests {
             sir_ci_sigma: None,
             sir_ess: None,
             sir_resamples_packed: None,
+            importance_sampling: None,
             omega_iov: None,
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),

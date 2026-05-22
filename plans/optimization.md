@@ -1196,6 +1196,35 @@ PR #66 (Importance Sampling) hoists `obs_nll_single_into` from `saem.rs` into
 Step 8 must be started **after PR #66 merges**. After the merge, re-read `saem.rs`
 around line 744 to confirm the E-step loop structure before writing any code.
 
+**Note on PR #66 vs Step 8 overlap:** `hmc_step` uses `compute_nll_gradient_ad`,
+not `obs_nll_single_into` — the HMC E-step code does not directly touch the
+function that #66 moves. The #66 interaction is in the M-step, not the E-step.
+Starting Step 8 before #66 merges is therefore low-risk; the only exposure is a
+minor merge conflict if #66 lands mid-PR and touches nearby lines in `saem.rs`.
+
+### autodiff feature and local vs CI testing
+
+Step 8 is split across two compilation tiers:
+
+**Builds and `cargo check`-es without `autodiff` (Enzyme toolchain not required):**
+- `src/estimation/hmc.rs` — `leapfrog` takes a `&dyn Fn(&[f64]) -> Vec<f64>` closure; no Enzyme dependency
+- Tier 1 unit tests for `leapfrog` — use hand-written closures as the grad function (no Enzyme)
+- `saem_n_leapfrog: usize` in `FitOptions` and the parser change
+- Module declaration in `mod.rs`
+- The dispatch skeleton in `saem.rs` — the `#[cfg(not(feature = "autodiff"))]` MH fallback branch compiles without Enzyme
+- Adaptation target logic (a constant comparison)
+
+**Requires `autodiff` (Enzyme toolchain — CI only, not available locally):**
+- `hmc_step` body — constructs the grad closure via `compute_nll_gradient_ad` from `src/ad/ad_gradients.rs`
+- Tier 2/3 tests gated on `#[cfg(feature = "autodiff")]`
+
+`hmc_step` is gated behind `#[cfg(feature = "autodiff")]`. The non-`autodiff` fallback
+(keep using `mh_steps`, emit a one-time warning) compiles and runs normally.
+Local validation: `cargo check --no-default-features --features ci` covers everything
+except the `autodiff` blocks. The Enzyme-specific code is validated by the nightly
+CI job that has the full toolchain — same pattern as all other `autodiff` code in
+the repo. Push to CI to validate the HMC path.
+
 ### Actual code state (current `main`, may differ post-PR #66 — verify)
 
 `src/estimation/saem.rs` uses `mh_steps` (line 66) — a Metropolis-Hastings

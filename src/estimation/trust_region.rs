@@ -411,10 +411,7 @@ mod tests {
         {
             let cache = problem.grad_cache.lock().unwrap();
             let c = cache.as_ref().expect("cost() must populate grad_cache");
-            assert_eq!(
-                c.x, x0,
-                "cost() must write the current x into grad_cache"
-            );
+            assert_eq!(c.x, x0, "cost() must write the current x into grad_cache");
             assert!(
                 c.per_subj_grads.is_empty(),
                 "cost() must write the partial sentinel (empty per_subj_grads)"
@@ -425,8 +422,13 @@ mod tests {
         let _ = problem.compute_ad_grads(&x0);
         {
             let cache = problem.grad_cache.lock().unwrap();
-            let c = cache.as_ref().expect("compute_ad_grads() must populate grad_cache");
-            assert_eq!(c.x, x0, "grad_cache x must still match x0 after full AD pass");
+            let c = cache
+                .as_ref()
+                .expect("compute_ad_grads() must populate grad_cache");
+            assert_eq!(
+                c.x, x0,
+                "grad_cache x must still match x0 after full AD pass"
+            );
             assert!(
                 !c.per_subj_grads.is_empty(),
                 "compute_ad_grads() must upgrade sentinel to a full entry"

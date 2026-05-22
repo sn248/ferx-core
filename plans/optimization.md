@@ -1,4 +1,4 @@
-# ferx-core Optimization Task Plan (Updated 2026-05-20)
+# ferx-core Optimization Task Plan (Updated 2026-05-22)
 
 This file is for use with Claude Code in the `ferx-core` repository.
 Read `CLAUDE.md` first before starting any step.
@@ -11,10 +11,12 @@ written.
 
 ---
 
-## Progress Summary (as of 2026-05-20)
+## Progress Summary (as of 2026-05-22)
 
 All optimization steps completed on 2026-05-19. Steps 5b, 6b, 7, and 8 remain.
-Since 2026-05-19, four non-optimization PRs landed: #53 (NN-DCM feature), #58 (SLSQP overshoot fix), #57 (variance scale / `(sd)` annotation), #54 (PR-finding fix). None affect the remaining steps.
+Since 2026-05-19, the following non-optimization PRs landed:
+- #53 (NN-DCM feature), #58 (SLSQP overshoot fix), #57 (variance scale / `(sd)` annotation), #54 (PR-finding fix) — none affect the remaining optimization steps.
+- #66 (Importance Sampling / IMP terminal chain stage — about to merge) — orthogonal to remaining optimization steps, **with one exception**: PR #66 hoists `obs_nll_single_into` from `saem.rs` to `stats/likelihood.rs` as `obs_nll_subject_into`. Step 8 must be started after PR #66 merges and must use `obs_nll_subject_into` from its new location.
 
 | Step | PR | What | Why | What it adds |
 |------|----|------|-----|--------------|
@@ -27,7 +29,20 @@ Since 2026-05-19, four non-optimization PRs landed: #53 (NN-DCM feature), #58 (S
 | **9** — Student-t SIR proposal | [#41](https://github.com/FeRx-NLME/ferx-core/pull/41) | Replace MVN proposal in SIR with multivariate Student-t (ν=5) | Normal proposal has thin tails; ESS collapses for parameters near boundaries (Ω variances, constrained θ) | Higher ESS without increasing `sir_samples`; more reliable 95% CIs for boundary-adjacent parameters |
 | **10** — Parallel multi-start | [#42](https://github.com/FeRx-NLME/ferx-core/pull/42) | Run N independent full optimizations from perturbed initials in parallel via rayon; return lowest OFV | Local minima are the most common practical failure mode for nonlinear elimination, full-block Ω, and covariate models | On an 8-core machine, `n_starts = 8` gives ~8× lower probability of a local minimum at the same wall-clock cost |
 
-**Remaining:** Step 5b (IOV analytical gradient, requires Step 5 ✅), Step 6b (eliminate double inner-solve in trust-region `cost()`, requires Step 6 ✅), Step 7 (GN → trust-region subproblem replacing LM damping, requires Steps 6 ✅ + 6b ✅), Step 8 (HMC proposals in SAEM E-step, requires Steps 3 ✅ and 4 ✅).
+**Remaining (4 steps):**
+
+| Step | Requires | Status |
+|------|----------|--------|
+| **5b** — IOV analytical gradient in outer optimizer | Step 5 ✅ | ❌ NOT STARTED |
+| **6b** — Eliminate double inner-solve in trust-region `cost()` | Step 6 ✅ | ❌ NOT STARTED |
+| **7** — GN → trust-region subproblem (replace LM damping + line search) | Steps 6 ✅ + 6b | ❌ NOT STARTED |
+| **8** — HMC proposals in SAEM E-step | Steps 3 ✅ + 4 ✅ + PR #66 merged | ❌ NOT STARTED |
+
+**Recommended implementation order: 6b → 7 → 5b → 8.**
+- 6b first: smallest scope, pure `trust_region.rs` change, immediately halves inner-solve cost per TR iteration, unblocks Step 7.
+- 7 second: requires 6b; reuses the TR subproblem machinery being introduced in 6b.
+- 5b third: independent of 6b/7; larger scope (requires inner optimizer to expose kappa H-matrices).
+- 8 last: largest scope, requires PR #66 merged; `autodiff` feature dependency means CI validation needs extra care.
 
 ---
 
@@ -35,34 +50,7 @@ Since 2026-05-19, four non-optimization PRs landed: #53 (NN-DCM feature), #58 (S
 
 - ✅ **DONE** — fully implemented on `main`.
 - 🔶 **PARTIAL** — partially done; see the per-step note.
-- 🔁 **IN PR** — addressed by open PR #22 (`perf/cross-engine-bench-fixes`); not yet on `main`.
 - ❌ **NOT STARTED** — nothing relevant in `main` or open PRs.
-
----
-
-## Important: Open PR #22 — Read Before Starting Steps 3–6
-
-PR #22 (`perf/cross-engine-bench-fixes`) is open and **must be merged before
-implementing Steps 3–6**. It touches `outer_optimizer.rs`, `parameterization.rs`,
-`saem.rs`, and `types.rs` — the same files as Steps 3–6. Starting those steps on
-the current `main` will produce merge conflicts and duplicate work.
-
-PR #22 changes relevant to this plan:
-
-- **`types.rs`**: default outer optimizer flipped from `Bobyqa` to `Slsqp`.
-  Step 5 notes below are written for this post-PR22 default.
-- **`parameterization.rs`**: adds identity packing for negative-lower-bound
-  thetas (covariate exponents such as γ). Step 3 must handle the mixed-packing
-  case — some thetas are log-packed, some are identity-packed — when assembling
-  the population gradient vector. The function `theta_packs_log(theta_lower: f64)`
-  exported from `parameterization.rs` is the gate.
-- **`saem.rs`**: switches M-step gradient from central-FD to forward-FD and
-  caches Ω⁻¹ — 2.4× single-thread speedup. Step 4 (AD M-step gradient) supersedes
-  this change; verify the SAEM M-step call site after PR #22 merges before
-  touching `saem.rs`.
-- **`outer_optimizer.rs`**: adds a stagnation guard that short-circuits the
-  NLopt loop when OFV improvement stalls. Step 5 must preserve this guard when
-  wiring in the AD gradient.
 
 ---
 
@@ -598,9 +586,9 @@ wall-clock improvement for FOCE/FOCEI on ODE models.
 
 ## Step 5b — Analytical Gradient for IOV Models in the Outer Optimizer
 
-**Status: 🔴 NOT STARTED**
+**Status: ❌ NOT STARTED**
 
-**Requires: Step 5 complete.**
+**Requires: Step 5 ✅**
 
 ### Background
 
@@ -608,19 +596,76 @@ Step 5 replaced population-level central FD with `subject_nll_pop_grad` summed
 in parallel over subjects. For non-IOV analytical PK models, `subject_nll_pop_grad`
 takes the analytical path (`subject_nll_pop_grad_analytical`): exact for ω/σ
 Cholesky elements, forward-FD of predictions only for θ. For IOV models,
-`can_use_analytical = false` because `!kappas.is_empty()`, so it falls back to
-per-subject central FD (cost = 2P subject NLL evals per outer gradient query).
+`can_use_analytical = false` because `!kappas.is_empty()` (confirmed at
+`src/estimation/gauss_newton.rs:847`), so it falls back to per-subject central FD
+(cost = 2P subject NLL evals per outer gradient query).
 
 The analytical gradient *can* be extended to IOV — the FOCE NLL structure is
 identical, just with an expanded random-effects vector and a block-diagonal
 variance matrix.
 
-### What remains
+### Actual code state
 
-#### Math
+`subject_nll_pop_grad` (`gauss_newton.rs:835`) has this gate:
 
-For a subject with occasions `1…K`, the IOV random effects are `[η; κ₁; …; κ_K]`
-and the combined variance block is:
+```rust
+let can_use_analytical = model.ode_spec.is_none()
+    && kappas.is_empty()                     // ← IOV falls back here
+    && !matches!(model.bloq_method, BloqMethod::M3);
+```
+
+`subject_nll_pop_grad_analytical` (`gauss_newton.rs:593`) accepts only
+`eta_hat: &DVector<f64>` and `h_matrix: &DMatrix<f64>` — there is no
+kappa/IOV parameter. IOV models always fall through to the central-FD path.
+
+The existing FOCE IOV NLL path (`foce_subject_nll_iov` called at line 1014)
+assembles a combined H-matrix and combined omega block internally — the
+kappa H-matrices are computed there but not currently returned by
+`run_inner_loop_warm`.
+
+### Sub-task 5b-a — Prerequisite: expose kappa H-matrices from the inner loop
+
+Read `src/estimation/inner_optimizer.rs` in full to find where kappa
+H-matrices (`∂ipred/∂κ_occ`) are computed. They are used inside
+`foce_subject_nll_iov` but not returned up the call stack.
+
+Modify `run_inner_loop_warm` to return a `kappa_h_mats: Vec<Vec<DMatrix<f64>>>`
+alongside the existing return tuple `(etas, h_mats, _, kappas)`. The outer type
+is `Vec` over subjects; inner `Vec` over occasions. If the inner optimizer
+already discards them after use, add the necessary storage.
+
+This is a prerequisite — all subsequent sub-tasks depend on having kappa
+H-matrices available at the outer optimizer call sites.
+
+**Files:** `src/estimation/inner_optimizer.rs`, and all callers of
+`run_inner_loop_warm` (search with `grep -rn "run_inner_loop_warm"` — expected
+in `outer_optimizer.rs`, `trust_region.rs`, `gauss_newton.rs`). Each call site
+must be updated to receive the new return value; unused sites may discard with `_`.
+
+### Sub-task 5b-b — Add `subject_nll_pop_grad_analytical_iov`
+
+In `src/estimation/gauss_newton.rs`, add a new function alongside
+`subject_nll_pop_grad_analytical`:
+
+```rust
+fn subject_nll_pop_grad_analytical_iov(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    kappas: &[DVector<f64>],           // per-occasion κ EBEs
+    kappa_h_mats: &[DMatrix<f64>],     // per-occasion ∂ipred/∂κ_occ Jacobians
+    omega_iov: &OmegaMatrix,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Option<(f64, Vec<f64>)>
+```
+
+**Math:** For a subject with occasions `1…K`, the IOV random effects are
+`[η; κ₁; …; κ_K]` and the combined variance block is:
 
 ```
 Ω_combined = diag(Ω_bsv, Ω_iov, …, Ω_iov)   (K+1 blocks)
@@ -632,56 +677,93 @@ The FOCE linearisation gives:
 r_tilde = R + H_combined · Ω_combined · H_combined^T
 ```
 
-where `H_combined = [H_η | H_κ₁ | … | H_κ_K]` concatenates the Jacobians
-`∂ipred/∂η` and `∂ipred/∂κ_occ` for each occasion (most columns are zero
-outside their occasion's observations).
+where `H_combined = [H_η | H_κ₁ | … | H_κ_K]` concatenates the Jacobians.
 
-The gradients follow the same formula as the non-IOV case:
+The gradient formulas follow the same pattern as `subject_nll_pop_grad_analytical`:
+- `∂NLL/∂L_bsv[i,j]` — same formula applied to the η-block rows/columns of `C⁻¹ H`.
+- `∂NLL/∂L_iov[i,j]` — **sum over occasions**: `Σ_occ [same formula applied to the κ_occ block]`.
+- `∂NLL/∂σ_k` — unchanged.
+- `∂NLL/∂θ` — forward-FD of ipred (unchanged).
 
+### Sub-task 5b-c — Lift the `kappas.is_empty()` gate
+
+In `subject_nll_pop_grad` (`gauss_newton.rs:847`), change `can_use_analytical` to:
+
+```rust
+let can_use_analytical = model.ode_spec.is_none()
+    && !matches!(model.bloq_method, BloqMethod::M3);
 ```
-∂NLL/∂L_bsv[i,j]  = ...  (same as non-IOV ∂NLL/∂L[i,j] for the bsv block)
-∂NLL/∂L_iov[i,j]  = Σ_occ [same formula applied to the κ_occ block]
-∂NLL/∂σ_k         = ...  (unchanged)
-∂NLL/∂θ           = forward-FD of ipred (unchanged)
+
+Then dispatch on whether kappas are present:
+
+```rust
+if can_use_analytical {
+    if kappas.is_empty() {
+        if let Some(result) = subject_nll_pop_grad_analytical(...) {
+            return result;
+        }
+    } else if let Some(ref omega_iov) = params.omega_iov {
+        if let Some(result) = subject_nll_pop_grad_analytical_iov(
+            ..., kappas, kappa_h_mats, omega_iov, ...
+        ) {
+            return result;
+        }
+    }
+}
+// Central-FD fallback (ODE / M3 / degenerate cases)
 ```
 
-#### Implementation
+### Sub-task 5b-d — Thread `kappa_h_mats` through all outer call sites
 
-1. Add `subject_nll_pop_grad_analytical_iov` in `src/estimation/gauss_newton.rs`
-   (or extend `subject_nll_pop_grad_analytical` with an IOV branch).
-2. In `subject_nll_pop_grad`, lift the `kappas.is_empty()` gate from
-   `can_use_analytical` for non-ODE, non-M3 models.
-3. The kappa H-matrices (`∂ipred/∂κ_occ`) must be available at the call site —
-   verify they are returned by `run_inner_loop_warm` or add their computation.
+Update `subject_nll_pop_grad`'s signature to accept
+`kappa_h_mats: &[DMatrix<f64>]`. Update all call sites in:
+- `src/estimation/outer_optimizer.rs` — pass per-subject kappa H-matrices from
+  the `run_inner_loop_warm` return.
+- `src/estimation/trust_region.rs` — same (currently passes `&[]` as a
+  placeholder; replace with actual kappa H-matrices).
+- `src/estimation/gauss_newton.rs` (the `build_gn_system` caller) — same.
 
 ### Files to touch
-- `src/estimation/gauss_newton.rs` (new IOV analytical gradient variant)
-- `src/estimation/outer_optimizer.rs` (lift `kappas.is_empty()` gate if needed)
+- `src/estimation/inner_optimizer.rs` — return kappa H-matrices
+- `src/estimation/gauss_newton.rs` — add IOV analytical gradient function; update gate and dispatch; update `build_gn_system`
+- `src/estimation/outer_optimizer.rs` — thread kappa H-matrices to gradient call
+- `src/estimation/trust_region.rs` — thread kappa H-matrices to `compute_ad_grads`
+- `src/types.rs` — add `kappa_h_mats` to `OuterResult` if needed for downstream consumers
 
-### Test
+### Tests
 
-**Tier 1 (unit, `src/estimation/gauss_newton.rs`):** Add a unit test analogous
-to `test_outer_ad_gradient_block_omega` but with `omega_iov` set and multiple
-occasions per subject. Verify that the IOV analytical gradient matches
-population-level central FD to within `1e-4`. Also update or supersede
-`test_outer_ad_gradient_fd_fallback_path` to confirm the analytical path is
-now taken for non-ODE IOV models.
+**Tier 1 (unit, `src/estimation/gauss_newton.rs`):**
 
-**Tier 2 (integration, `tests/new_optimizers.rs` or a new `tests/iov.rs`):**
-Add a test that calls `fit()` on an IOV model with `outer_maxiter = 5`, asserts
-no panic and non-NaN OFV — confirms the IOV analytical gradient path is wired
-into the outer optimizer without running to convergence.
+Add a unit test analogous to `test_subject_nll_pop_grad_analytical_matches_fd`
+but with a subject that has 2 occasions and non-empty `kappas`/`kappa_h_mats`.
+Assert that `subject_nll_pop_grad_analytical_iov` output matches population-level
+central FD to within `1e-4` for every packed parameter, including Ω_iov Cholesky
+elements. Also update `test_outer_ad_gradient_fd_fallback_path` (or add a new
+test) to confirm the analytical path is taken for non-ODE IOV models after
+the gate change.
 
-**Tier 3 (slow, same file):** Gate a full IOV convergence run with
-`#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]`.
-Assert OFV matches the central-FD baseline to within 0.01.
+**Tier 2 (integration, `tests/iov_api.rs` or alongside existing IOV tests):**
+
+Add a test that calls `fit()` on `examples/warfarin_iov.ferx` (or the IOV
+fixture used in existing tests) with `outer_maxiter = 5`, asserts no panic and
+non-NaN OFV — confirms the IOV analytical gradient path is wired through
+to the outer optimizer without running to convergence.
+
+**Tier 3 (slow, same file):**
+
+Gate a full IOV convergence run:
+```rust
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+```
+Assert OFV matches the central-FD baseline to within 0.01. Assert iteration count
+is equal or lower (analytical gradient should not regress convergence speed).
 
 ### Expected gain
 
-Same ratio as Step 5 for non-IOV: instead of 2P subject NLL evals per gradient
-query, the cost drops to 1 forward-FD pass of predictions per θ component.
-For IOV models with many occasions, the per-subject FD cost scales with P,
-so the gain is proportional to P (number of packed population parameters).
+Same ratio as Step 5 for non-IOV: instead of 2P full subject-NLL evals per
+outer gradient query, cost drops to 1 forward-FD pass of predictions per θ
+component. For IOV models with many occasions, the per-subject FD cost scales
+with P, so the gain is proportional to P (number of packed population parameters).
 
 ---
 
@@ -783,156 +865,319 @@ average: 7× reduction in total CG cost per outer iteration.
 
 **Status: ❌ NOT STARTED**
 
-**Requires: Step 6 complete.**
+**Requires: Step 6 ✅**
 
 ### Background
 
-Flagged in the PR #50 review as a known follow-up. Within each argmin TR
-iteration, argmin calls `cost()` and then `gradient()` on the same parameter
-vector. `CostFunction::cost()` calls `run_inner()` independently — it never
-writes into `grad_cache`. So `compute_ad_grads()` gets a cache miss when
-`gradient()` fires next, and the inner loop (EBE solve) runs a second time for
-the same `x`. This doubles inner-solve cost per outer iteration.
+Flagged explicitly in the PR #50 review (confirmed by code inspection):
+
+> "`cost()` calls `run_inner()` independently — it doesn't populate `grad_cache`.
+> So within one TR iteration, the inner loop runs twice: once for `cost()` and
+> once for `gradient()`. Not a regression, but a follow-up opportunity."
+
+### Actual code state (confirmed in `trust_region.rs:126–133`)
+
+```rust
+impl CostFunction for FoceiProblem<'_> {
+    fn cost(&self, p: &Vec<f64>) -> Result<f64, Error> {
+        let (etas, h_mats) = self.run_inner(p);   // inner solve #1
+        Ok(self.ofv_fixed(p, &etas, &h_mats))
+        // grad_cache is NOT written here
+    }
+}
+```
+
+The argmin `TrustRegion` call order within each outer iteration (confirmed
+from `trustregion_method.rs` in argmin 0.11.0):
+
+1. Run Steihaug subproblem on current `(grad, hessian)` → step `pk` (no model calls).
+2. `problem.cost(new_param)` → `run_inner(new_param)` (inner solve #1); nothing written to `grad_cache`.
+3. If step accepted: `problem.gradient(new_param)` → `compute_ad_grads(new_param)` → cache miss → `run_inner(new_param)` again (inner solve #2) + AD pass.
+4. `problem.hessian(new_param)` → `compute_ad_grads(new_param)` → full cache hit → free.
+
+Inner solve #1 and #2 are redundant — they process the exact same `new_param`.
 
 ### What to do
 
-In `src/estimation/trust_region.rs`, modify `CostFunction::cost()` to populate
-`grad_cache` with the `(etas, h_mats)` from its `run_inner()` call — without
-yet computing `per_subj_grads` (which is the expensive AD part). Store a
-sentinel that marks the EBEs as warm but gradients as not yet computed:
+Modify `cost()` to pre-warm `grad_cache` with the EBEs, using
+`per_subj_grads: vec![]` as the sentinel meaning "EBEs ready, AD not yet done":
 
 ```rust
 impl CostFunction for FoceiProblem<'_> {
     fn cost(&self, p: &Vec<f64>) -> Result<f64, Error> {
         let (etas, h_mats) = self.run_inner(p);
-        // Pre-warm the cache so gradient() on the same x skips run_inner().
+        let ofv = self.ofv_fixed(p, &etas, &h_mats);
+        // Pre-warm cache so gradient() on the same x skips run_inner().
         *self.grad_cache.lock().unwrap() = Some(GradCache {
             x: p.clone(),
             etas: etas.clone(),
             h_mats: h_mats.clone(),
-            per_subj_grads: vec![],  // empty signals "EBEs ready, AD not yet done"
+            per_subj_grads: vec![],  // empty = EBEs ready, AD not yet done
         });
-        Ok(self.ofv_fixed(p, &etas, &h_mats))
+        Ok(ofv)
     }
 }
 ```
 
-Then in `compute_ad_grads()`, when a cache hit has `per_subj_grads.is_empty()`,
-skip `run_inner()` but still compute the AD gradient pass using the cached
-`etas` and `h_mats`:
+Modify `compute_ad_grads()` (`trust_region.rs:79–120`) to distinguish three cache states:
+
+1. **Full hit** (`c.x == x` and `!c.per_subj_grads.is_empty()`): return cached EBEs + gradients directly.
+2. **Partial hit** (`c.x == x` and `c.per_subj_grads.is_empty()`): EBEs are warm from `cost()` — skip `run_inner`, run the AD pass only, write full cache entry.
+3. **Miss** (`c.x != x` or `cache.is_none()`): run `run_inner`, then AD pass, write full cache entry.
+
+Concrete change in `compute_ad_grads` (starting at line 80):
 
 ```rust
-fn compute_ad_grads(&self, x: &[f64]) -> (...) {
-    let cached = {
+fn compute_ad_grads(&self, x: &[f64]) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<f64>>) {
+    // Check for full hit or partial hit.
+    let maybe_warm = {
         let cache = self.grad_cache.lock().unwrap();
-        cache.as_ref().filter(|c| c.x == x).map(|c| (c.etas.clone(), c.h_mats.clone(), c.per_subj_grads.clone()))
+        if let Some(ref c) = *cache {
+            if c.x == x {
+                if !c.per_subj_grads.is_empty() {
+                    // Full hit: return everything from cache.
+                    return (c.etas.clone(), c.h_mats.clone(), c.per_subj_grads.clone());
+                } else {
+                    // Partial hit: EBEs ready, AD still needed.
+                    Some((c.etas.clone(), c.h_mats.clone()))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     };
-    let (etas, h_mats, existing_grads) = cached.unzip_or_else(|| {
-        let (e, h) = self.run_inner(x);
-        (e, h, vec![])
+
+    // Either use warm EBEs (partial hit) or run inner solve (miss).
+    let (etas, h_mats) = maybe_warm.unwrap_or_else(|| self.run_inner(x));
+
+    // AD pass: compute per-subject gradients.
+    let n_subj = self.population.subjects.len();
+    let per_subj: Vec<Vec<f64>> = (0..n_subj)
+        .into_par_iter()
+        .map(|i| {
+            subject_nll_pop_grad(
+                x, self.init_params, self.model, self.population, i,
+                &etas[i], &h_mats[i], &[], &self.bounds, self.options,
+            ).1
+        })
+        .collect();
+
+    // Write full cache entry.
+    *self.grad_cache.lock().unwrap() = Some(GradCache {
+        x: x.to_vec(),
+        etas: etas.clone(),
+        h_mats: h_mats.clone(),
+        per_subj_grads: per_subj.clone(),
     });
-    if !existing_grads.is_empty() {
-        return (etas, h_mats, existing_grads);
-    }
-    // compute per_subj_grads via subject_nll_pop_grad ...
-    // write full cache entry and return
+
+    (etas, h_mats, per_subj)
 }
 ```
-
-The exact implementation may differ from the sketch above — read `compute_ad_grads`
-carefully and adjust to match the actual control flow.
 
 ### Files to touch
 - `src/estimation/trust_region.rs` only
 
-### Test
+### Tests
 
-**Tier 1 (unit, `src/estimation/trust_region.rs`):** Add a unit test that
-constructs a `FoceiProblem` directly and asserts that calling `cost()` followed
-by `gradient()` on the same `x` leaves `grad_cache` in a state where
-`per_subj_grads` is populated after `gradient()` and that `run_inner` was not
-called a second time. A simple approach: check that `compute_ad_grads` returns
-the cache-warmed path by asserting `grad_cache.x == x` before `gradient()` is
-called (i.e. `cost()` pre-warmed it). The OFV from `cost()` and the OFV
-recomputed from the cached EBEs must agree to f64 precision.
+**Tier 1 (unit, `src/estimation/trust_region.rs`):**
 
-**Tier 3 (slow, `tests/new_optimizers.rs`):** Gate a full warfarin
-`optimizer = trust_region` convergence run with the `slow-tests` feature.
-Assert OFV matches the SLSQP baseline to within 0.01. This is a correctness
-check — the cache change must not alter results.
+Add a test that verifies the pre-warm behaviour without needing a full model:
+1. After calling `cost(x)`, assert `grad_cache` contains an entry with `x == x`
+   and `per_subj_grads.is_empty() == true`.
+2. After calling `gradient(x)` on the same `x`, assert `grad_cache` now has
+   `!per_subj_grads.is_empty()`.
+3. Assert that the OFV returned by `cost(x)` equals `ofv_fixed(x, &cached_etas, &cached_h_mats)`
+   to `f64` precision — confirms the pre-warmed EBEs are consistent with the cost.
+4. Calling `gradient(x)` without a preceding `cost(x)` must not panic — the
+   miss path must still call `run_inner` as a fallback.
+
+**Tier 3 (slow, `tests/new_optimizers.rs`):**
+
+Gate a full warfarin `optimizer = trust_region` convergence run with
+`#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]`.
+Assert OFV matches the SLSQP baseline to within 0.01. This is a pure correctness
+check — the cache change must be transparent to the result.
 
 ### Expected gain
 
-Halves the inner-solve count per TR outer iteration. For ODE models where each
-inner solve is expensive (RK45 per subject), this is a meaningful wall-clock
-improvement. For analytical PK models the gain is smaller but still measurable.
+Halves `run_inner_loop_warm` calls per accepted TR outer iteration. For ODE
+models where the inner loop dominates (RK45 per subject), this is a direct
+~2× reduction in the most expensive part of each outer step. For analytical
+PK models the gain is smaller but still measurable (EBE BFGS solve per subject
+is not free on large populations).
 
 ---
 
-## Step 7 — Natural Gradient: BHHH Hessian Inside the GN Trust-Region Step
+## Step 7 — GN: Replace LM Damping + Line Search with Trust-Region Subproblem
 
 **Status: ❌ NOT STARTED**
 
-**Requires: Steps 3, 6, and 6b complete.**
+**Requires: Steps 3 ✅, 6 ✅, and 6b**
 
-### What to do
+### Background
 
-Currently `method = gn` uses BHHH + LM damping + backtracking line search
-(in `gauss_newton.rs`). `trust_region.rs` will now have an Steihaug-CG
-trust-region subproblem solver with BHHH Hessian and AD gradient (from Steps 3
-and 6).
+Currently `method = gn` uses BHHH + LM (Levenberg-Marquardt) damping:
+`δ = (H_bhhh + λI)⁻¹ (−g)` followed by a backtracking line search
+(in `gauss_newton.rs`). This is a scalar approximation: λ scales all
+directions equally. The trust-region subproblem introduced in Step 6 adapts
+step length per eigendirection of `H_BHHH` — better suited to NLME parameter
+spaces where Ω variances (well-identified) and covariate exponents
+(weakly identified) live on very different curvature scales.
 
-Upgrade the GN method to use the trust-region subproblem solver instead of
-LM damping and line search:
+### Actual code state
 
-1. In `estimation/gauss_newton.rs`, after computing `H_BHHH` and `∇OFV`, call
-   into the trust-region subproblem solver (expose it as a `pub fn` from
-   `trust_region.rs`) to compute the step `δ`.
+`trust_region.rs` does NOT currently expose a standalone subproblem solver.
+The argmin `Steihaug` CG implementation is embedded in the `optimize_trust_region`
+function via the `Executor` framework and cannot be called for a single step in
+isolation. A self-contained Steihaug-CG function must be added.
 
-2. Replace the LM damping adaptation with the standard trust-region ratio update:
-   ```
-   ρ = (OFV_current - OFV_proposed) / (predicted_reduction_from_quadratic_model)
-   ```
-   - ρ > 0.75: expand trust radius (×2, up to Δ_max)
-   - 0.25 < ρ ≤ 0.75: keep radius unchanged
-   - ρ ≤ 0.25: shrink radius (÷4), reject step, retry
+`gauss_newton.rs` — the LM + line search loop is in `run_gn_optimization`
+(search for the `lambda` variable and the backtracking loop). These are the
+code paths to replace.
 
-3. Remove the backtracking line search. The trust-region step is accepted or the
-   radius shrinks — no line search is needed or appropriate.
+### Sub-task 7a — Implement standalone `pub fn solve_trust_region_subproblem`
 
-The adaptive Steihaug-CG budget from Step 6c applies automatically here because
-the same subproblem solver is reused.
+Add to `src/estimation/trust_region.rs`:
+
+```rust
+/// Steihaug truncated-CG trust-region subproblem.
+/// Returns the step δ satisfying ‖δ‖ ≤ trust_radius that approximately
+/// minimises the quadratic model ½ δᵀ H δ + gᵀ δ.
+pub fn solve_trust_region_subproblem(
+    g: &DVector<f64>,
+    h: &DMatrix<f64>,
+    trust_radius: f64,
+    max_iters: usize,
+) -> DVector<f64>
+```
+
+Implement standard Steihaug-CG (≈50 lines — Nocedal & Wright, Algorithm 7.2):
+
+```
+p = 0,  r = g,  d = −g
+for j = 0..max_iters:
+    if dᵀ H d ≤ 0:    // zero or negative curvature — go to boundary
+        τ = solve ‖p + τd‖ = Δ  (take positive root)
+        return p + τd
+    α = rᵀr / dᵀHd
+    p_new = p + α d
+    if ‖p_new‖ ≥ Δ:   // step exits trust region
+        τ = solve ‖p + τd‖ = Δ  (take positive root)
+        return p + τd
+    r_new = r + α H d
+    if ‖r_new‖ < ε ‖r_0‖:  // converged
+        return p_new
+    β = r_newᵀ r_new / rᵀr
+    d = −r_new + β d
+    p = p_new,  r = r_new
+return p
+```
+
+`ε = 1e-10`, initial `max_iters` via the `max_iters` parameter (use
+`adaptive_steihaug_budget(g.len())` at the call site in GN — reuse the
+existing helper from Step 6c). The "positive root" for the boundary step is:
+
+```
+τ = (−pᵀd + sqrt((pᵀd)² − ‖d‖²(‖p‖² − Δ²))) / ‖d‖²
+```
+
+This function must have no dependency on argmin — it is pure nalgebra.
+
+### Sub-task 7b — Replace LM damping + line search in `gauss_newton.rs`
+
+In `run_gn_optimization` (or wherever the LM step is computed), replace the
+LM solve and backtracking loop with:
+
+```rust
+// Compute step via TR subproblem
+let step = solve_trust_region_subproblem(&grad, &h_bhhh, trust_radius, cg_budget);
+
+// Compute proposed OFV at x + step
+let x_new = /* clamp to bounds */;
+let (eta_hats_new, h_mats_new) = run_inner_loop_warm(..., x_new);
+let ofv_new = 2.0 * pop_nll(..., x_new, ...);
+
+// TR ratio update
+let pred_reduction = -grad.dot(&step) - 0.5 * step.dot(&(h_bhhh * &step));
+let rho = (ofv_current - ofv_new) / pred_reduction;
+
+if rho > 0.75 {
+    trust_radius = (trust_radius * 2.0).min(delta_max);  // expand
+} else if rho < 0.25 {
+    trust_radius /= 4.0;  // shrink, reject step
+    continue;
+}
+// Accept step (rho > 0.25)
+x = x_new;
+ofv_current = ofv_new;
+eta_hats = eta_hats_new;
+h_mats = h_mats_new;
+```
+
+Initialise `trust_radius = 1.0`, `delta_max = 10.0` (same defaults as
+`optimize_trust_region`). Remove `lambda` and the backtracking loop entirely.
+
+### Sub-task 7c — Apply adaptive Steihaug budget
+
+At the `solve_trust_region_subproblem` call site in GN, set:
+```rust
+let cg_budget = adaptive_steihaug_budget(x.len());
+```
+Reuse the `adaptive_steihaug_budget` helper already defined in `trust_region.rs`.
+Make it `pub(crate)` if not already.
 
 ### Files to touch
-- `src/estimation/gauss_newton.rs` (replace LM + line search with TR subproblem call)
-- `src/estimation/trust_region.rs` (expose subproblem solver as a reusable `pub fn`)
+- `src/estimation/trust_region.rs` — add `pub fn solve_trust_region_subproblem` and make `adaptive_steihaug_budget` accessible
+- `src/estimation/gauss_newton.rs` — replace LM + backtracking with TR subproblem + ratio update
 
-### Test
+### Tests
 
-**Tier 1 (unit, `src/estimation/gauss_newton.rs`):** Add a unit test for the
-new `solve_trust_region_subproblem` pub fn exposed from `trust_region.rs`.
-Given a simple 2×2 BHHH matrix and gradient, verify the returned step has
-norm ≤ trust radius and improves the quadratic model. Also test the ρ ratio
-update: assert radius expands for ρ > 0.75 and shrinks for ρ ≤ 0.25.
+**Tier 1 (unit, `src/estimation/trust_region.rs`):**
 
-**Tier 2 (integration, `tests/new_optimizers.rs`):** Add a non-convergence test
-that calls `fit()` with `method = gn` and `outer_maxiter = 5`, asserts no panic
-and non-NaN OFV — confirms the TR subproblem wiring compiles and runs without
-diverging on warfarin.
+1. `test_solve_trust_region_subproblem_respects_radius`: given a 2×2 PSD
+   Hessian and gradient, assert `‖result‖ ≤ trust_radius` for trust radii
+   [0.1, 0.5, 1.0, 5.0].
+2. `test_solve_trust_region_subproblem_improves_quadratic_model`: assert
+   `½ δᵀ H δ + gᵀ δ < 0` (the quadratic model decreases).
+3. `test_solve_trust_region_subproblem_negative_curvature`: pass a Hessian with
+   a negative eigenvalue. Assert the returned step reaches the trust boundary
+   (`‖result‖ ≈ trust_radius`) rather than panicking.
 
-**Tier 3 (slow, `tests/new_optimizers.rs` or new `tests/gn_convergence.rs`):**
-Gate two convergence tests with `#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]`:
-1. Warfarin `method = gn`: OFV must match LM-damping baseline to within 0.01;
-   compare outer iteration count.
-2. `two_cpt_oral_cov.ferx` `method = gn` vs `method = focei`: compare iteration
-   counts to confirm the TR step reduces wasted steps on weakly-identified
-   covariate directions.
+**Tier 1 (unit, `src/estimation/gauss_newton.rs`):**
+
+4. `test_gn_tr_ratio_expands_radius`: mock `ofv_current`, `ofv_new`, `pred_reduction`
+   such that `ρ = 0.9`. Assert `trust_radius` doubles after the update.
+5. `test_gn_tr_ratio_rejects_step`: set values so `ρ = 0.1`. Assert step is
+   rejected and `trust_radius` quarters.
+
+**Tier 2 (integration, `tests/new_optimizers.rs`):**
+
+Add a non-convergence test: `fit()` with `method = gn` and `outer_maxiter = 5`
+on warfarin. Assert no panic and non-NaN OFV — confirms TR subproblem wiring
+compiles and runs.
+
+**Tier 3 (slow, `tests/gn_convergence.rs` — new file):**
+
+Gate two convergence tests:
+```rust
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+```
+1. Warfarin `method = gn`: OFV must match the LM-damping baseline to within 0.01.
+   Record outer iteration count — TR step should not regress.
+2. `two_cpt_oral_cov.ferx` `method = gn`: compare outer iteration count vs
+   LM-damping baseline. The TR step should use ≤ iterations on the covariate
+   model (weakly identified covariate directions benefit from per-direction
+   step scaling).
 
 ### Expected gain
-The LM damping factor is a scalar approximation to the trust radius — it treats
-all parameter directions equally. The trust-region step adapts differently per
-eigendirection of `H_BHHH`. For covariate models with weakly identified covariate
-coefficients, this gives fewer wasted steps in the weakly-identified directions.
+
+The LM scalar `λ` treats all parameter directions equally. The TR subproblem
+adapts step length per eigendirection of `H_BHHH`. For NLME covariate models
+where Ω variances are well-identified and covariate exponents are weakly
+identified, this avoids the pattern of shrinking the step globally when only
+one direction is problematic — typically 10–30% fewer outer iterations.
 
 ---
 
@@ -940,26 +1185,42 @@ coefficients, this gives fewer wasted steps in the weakly-identified directions.
 
 **Status: ❌ NOT STARTED**
 
-**Requires: Steps 3 and 4 complete.**
+**Requires: Steps 3 ✅, 4 ✅, and PR #66 merged**
 
-### Current state
+### PR #66 interaction — read before starting
 
-`src/estimation/saem.rs` uses a Metropolis-Hastings (MH) random-walk E-step
-(`mh_steps`, line 66). The per-subject adaptive step size (`step_scales`) is
-already tracked and adapted per subject. No HMC code exists.
+PR #66 (Importance Sampling) hoists `obs_nll_single_into` from `saem.rs` into
+`stats/likelihood.rs` as `obs_nll_subject_into`, and updates all SAEM call sites.
+Step 8 must be started **after PR #66 merges**. After the merge, re-read `saem.rs`
+around line 744 to confirm the E-step loop structure before writing any code.
 
-The ETA gradient needed for HMC leapfrog is `∇_η NLLᵢ(η | θ, Ω, σ)` —
-provided by `compute_nll_gradient_ad` from `src/ad/ad_gradients.rs`. Confirm
-this function works with the current subject data layout before proceeding
-(check `FlatDoseData::from_subject` compatibility with the saem.rs subject
-representation).
+### Actual code state (current `main`, may differ post-PR #66 — verify)
 
-### What to do
+`src/estimation/saem.rs` uses `mh_steps` (line 66) — a Metropolis-Hastings
+random-walk sampler. Per-subject step sizes are tracked in `state.step_scales`
+and adapted every `adapt_interval` steps. The adaptation targets acceptance
+rates around 40% (line 951–955). No HMC code exists anywhere in the codebase.
 
-Add a `leapfrog` function in `saem.rs` (or `src/estimation/hmc.rs`):
+`compute_nll_gradient_ad` in `src/ad/ad_gradients.rs` provides
+`∇_η NLLᵢ(η | θ, Ω, σ)` — the ETA gradient needed for HMC leapfrog.
+Before using it, confirm that `FlatDoseData::from_subject` is compatible with
+how SAEM subjects are stored (read the relevant struct definitions to verify).
+
+The `autodiff` feature flag gates Enzyme-generated gradient functions. The HMC
+path is only available when `autodiff` is enabled. When it is not, the code
+must fall back to the existing MH sampler with a warning.
+
+### Sub-task 8a — New file `src/estimation/hmc.rs`
+
+Create `src/estimation/hmc.rs` with two public functions.
+
+#### `pub fn leapfrog`
+
+Standard velocity-Störmer-Verlet integrator (half-step p, n full steps q + p,
+half-step p):
 
 ```rust
-fn leapfrog(
+pub fn leapfrog(
     eta: &[f64],
     momentum: &[f64],
     nll_grad_eta: &dyn Fn(&[f64]) -> Vec<f64>,
@@ -981,52 +1242,159 @@ fn leapfrog(
 }
 ```
 
-Replace the MH random-walk proposal with HMC per subject:
-1. Sample fresh momentum `p ~ N(0, Ω⁻¹)` — mass matrix = inverse OMEGA.
-2. Run `leapfrog` for `saem_n_leapfrog` steps using `compute_nll_gradient_ad`.
-3. Accept/reject: `H(q, p) = NLLᵢ(q) + ½ pᵀ Ω p`; accept with probability
-   `min(1, exp(H_current - H_proposed))`.
+No AD restrictions apply to `leapfrog` itself — it operates on plain `f64`
+vectors returned from the Enzyme-generated gradient. No `f64::max`/`f64::min`
+concern here.
 
-The per-subject step size (`step_scales[i]`) becomes the HMC leapfrog step
-size. Keep the adaptation logic but target 65% acceptance instead of ~40%.
+#### `pub fn hmc_step`
 
-Add `saem_n_leapfrog: usize` to `FitOptions` (default: 3). Document it.
+```rust
+pub fn hmc_step(
+    subject: &Subject,
+    eta: &DVector<f64>,
+    params: &ModelParameters,
+    model: &CompiledModel,
+    step_size: f64,
+    n_leapfrog: usize,
+    rng: &mut impl Rng,
+) -> (DVector<f64>, bool)   // (new_eta, accepted)
+```
 
-Keep the existing MH sampler available as a fallback: if the AD ETA gradient
-is unavailable for the current model configuration (e.g. unsupported PK model
-in the Enzyme path), fall back to MH and emit a warning in `FitResult.warnings`.
+Algorithm:
+1. Sample momentum `p ~ N(0, Ω⁻¹)`. Mass matrix M⁻¹ = Ω means `p ~ N(0, Ω⁻¹)`;
+   kinetic energy `K(p) = ½ pᵀ Ω p`. Rationale: ETAs are distributed as
+   `N(0, Ω)`, so M = Ω⁻¹ pre-conditions the proposal to the prior curvature.
+   Sample by drawing `z ~ N(0, I)` then computing `p = L_omega_inv * z` where
+   `L_omega_inv` is the inverse of the Cholesky factor of Ω.
+2. Compute current Hamiltonian: `H_curr = NLLᵢ(η) + ½ pᵀ Ω p`.
+3. Call `leapfrog(eta, p, grad_fn, step_size, n_leapfrog)` → `(eta_prop, p_prop)`.
+4. Compute proposed Hamiltonian: `H_prop = NLLᵢ(η_prop) + ½ p_propᵀ Ω p_prop`.
+5. Accept with probability `min(1, exp(H_curr − H_prop))`.
+6. Return `(eta_prop, true)` if accepted, `(eta.clone(), false)` if rejected.
+
+The gradient closure for leapfrog wraps `compute_nll_gradient_ad`:
+```rust
+let grad_fn = |q: &[f64]| -> Vec<f64> {
+    compute_nll_gradient_ad(q, tv_adjusted, omega_inv_flat, ...).1
+};
+```
+Verify the exact `compute_nll_gradient_ad` signature at call time and match
+the subject data layout to what `FlatDoseData::from_subject` produces.
+
+### Sub-task 8b — Add `saem_n_leapfrog: usize` to `FitOptions`
+
+In `src/types.rs`, add to `FitOptions`:
+```rust
+pub saem_n_leapfrog: usize,   // default: 3
+```
+
+Update `Default::default()` for `FitOptions`. Add parsing in
+`src/parser/model_parser.rs` (follow the pattern of `saem_n_mh_steps`).
+
+### Sub-task 8c — Replace `mh_steps` with `hmc_step` in the SAEM E-step loop
+
+In `src/estimation/saem.rs`, inside the E-step loop (around line 744 — verify
+post-PR #66 location), replace:
+
+```rust
+let (n_acc, nll_new) = mh_steps(..., n_mh_steps, ...);
+```
+
+With a feature-gated dispatch:
+
+```rust
+#[cfg(feature = "autodiff")]
+let (new_eta, accepted) = hmc_step(subject, &eta, &params, model,
+                                    state.step_scales[i], options.saem_n_leapfrog, &mut rng);
+#[cfg(not(feature = "autodiff"))]
+let (new_eta, accepted) = {
+    // MH fallback — emit warning once per fit, not once per step
+    (mh_result_eta, mh_accepted)
+};
+```
+
+The MH fallback warning must be emitted into `FitResult.warnings` (not stderr).
+Use a flag to emit it at most once per fit (not per E-step iteration or subject).
+
+### Sub-task 8d — Update step-size adaptation target
+
+The adaptation loop at lines 951–955 (verify post-PR #66) targets acceptance
+rate implicitly around 40% (MH). For HMC, target 65%. Change the threshold
+constant:
+
+```rust
+// Before (MH):
+if rate > 0.4 { ... scale up ... } else { ... scale down ... }
+
+// After (HMC):
+let target_rate = if options.saem_n_leapfrog > 0 { 0.65 } else { 0.4 };
+if rate > target_rate { ... scale up ... } else { ... scale down ... }
+```
+
+### Sub-task 8e — Register `hmc` module
+
+In `src/estimation/mod.rs`, add:
+```rust
+pub(crate) mod hmc;
+```
 
 ### Files to touch
-- `src/estimation/saem.rs`
+- `src/estimation/hmc.rs` (new file)
+- `src/estimation/mod.rs` (declare `hmc` module)
+- `src/estimation/saem.rs` (replace `mh_steps` dispatch; update adaptation target)
 - `src/types.rs` (add `saem_n_leapfrog: usize`)
-- `docs/src/estimation/saem.md`
-- `docs/src/model-file/fit-options.md`
+- `src/parser/model_parser.rs` (parse `saem_n_leapfrog`)
+- `docs/src/estimation/saem.md` (document HMC path, `saem_n_leapfrog`, fallback behaviour)
+- `docs/src/model-file/fit-options.md` (add `saem_n_leapfrog` entry)
 
-### Test
+### Tests
 
-**Tier 1 (unit, `src/estimation/saem.rs` or new `src/estimation/hmc.rs`):**
-Add a unit test for `leapfrog` that verifies energy conservation on a simple
-1D harmonic oscillator (known analytical solution). Also test that the
-acceptance step correctly computes `H(q, p) = NLL(q) + ½ pᵀ Ω p` and that
-`saem_n_leapfrog = 1` degenerates to single-step leapfrog without panic.
+**Tier 1 (unit, `src/estimation/hmc.rs`):**
 
-**Tier 2 (integration, `tests/` — new `tests/saem_smoke.rs` or alongside
-existing tests):** Call `fit()` with `method = saem` and `outer_maxiter = 5`.
-Assert no panic, non-NaN OFV, and that `FitResult.warnings` is empty (i.e. the
-HMC path was taken, not the MH fallback). A low iteration count is sufficient —
-no convergence needed.
+1. `test_leapfrog_energy_conservation`: 1D harmonic oscillator where
+   `NLL(q) = ½ q²` (Gaussian prior, no observations). Hamiltonian
+   `H = ½ q² + ½ p²` is analytically conserved. Run leapfrog with
+   `step_size = 0.1`, `n_steps = 10`. Assert `|H_before − H_after| < 0.01`
+   (Verlet discretization error is O(ε²L)). This verifies the half-step
+   implementation is correct.
+2. `test_leapfrog_single_step_n0`: `n_steps = 0` degenerates to two half-steps
+   only. The proposed q must equal the original eta (no full position step).
+   Assert no panic.
+3. `test_hmc_step_zero_step_size_always_accepts`: with `step_size = 0.0` and
+   `n_leapfrog = 1`, the proposed position equals the current position, ΔH = 0,
+   and the step must always be accepted. Assert `accepted == true` across 10
+   random momentum draws.
+4. `test_hmc_step_hamiltonian_computation`: hand-compute `H = NLL(η) + ½ pᵀ Ω p`
+   for a known simple NLL and known Ω. Assert the internal computation in
+   `hmc_step` matches to 1e-10.
 
-**Tier 3 (slow, same file):** Gate full convergence runs with
-`#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]`:
-1. Run warfarin SAEM 5 times with different seeds. Assert mean acceptance rate
-   ≥ 55% (HMC) vs the MH baseline (~40%). Final theta/omega must agree with MH
-   to within 2%.
-2. Run `mm_oral.ferx` with full-block OMEGA. Confirm convergence and sane OFV.
+**Tier 2 (integration, `tests/saem_hmc_api.rs` — new file):**
+
+Gate on `#[cfg(feature = "autodiff")]` — the HMC path is not available without
+the Enzyme toolchain. Call `fit()` with `method = saem` and `outer_maxiter = 5`
+on warfarin. Assert no panic, non-NaN OFV, and `FitResult.warnings.is_empty()`
+(confirms the HMC path was taken, not the MH fallback).
+
+**Tier 3 (slow, same file):**
+
+Gate two convergence tests:
+```rust
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+```
+1. Warfarin SAEM 5× with different seeds. Assert mean acceptance rate ≥ 55%
+   (HMC). Final theta/omega must agree with the MH baseline to within 2%.
+   Record acceptance rate vs seed for variance check.
+2. `mm_oral.ferx` with full-block Ω. Confirm convergence and sane OFV — this
+   model has nonlinear elimination that stresses the E-step; HMC should not
+   regress convergence reliability.
 
 ### Expected gain
-At 40% acceptance, 60% of proposals are wasted ODE evaluations. HMC at
-65–90% acceptance wastes far less. Effective sample size per E-step is 3–5×
-larger. The exploration phase stabilizes faster.
+
+At MH acceptance ~40%, 60% of E-step ODE evaluations are wasted. HMC with
+3 leapfrog steps targets 65–85% acceptance — each accepted proposal moves
+further from the current point because the gradient guides the trajectory.
+Effective sample size per E-step increases by 3–5×. The exploration phase
+stabilizes faster, reducing total SAEM iterations needed.
 
 ---
 

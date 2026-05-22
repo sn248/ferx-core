@@ -7,8 +7,11 @@ The `imp` stage estimates the marginal log-likelihood
 \\;=\\; -2 \\sum_i \\log \\int p(y_i \\mid \\eta, \\theta)\\, p(\\eta \\mid \\theta)\\, d\\eta
 \\]
 
-by Monte-Carlo importance sampling, replacing the FOCE / Laplace
-approximation used by `ofv` with a (less-biased) unbiased estimator.
+by Monte-Carlo importance sampling. The IS Monte-Carlo estimator of
+`p(yᵢ|θ)` is unbiased; the reported `−2 log L` carries a small Jensen
+bias from the `log(·)` transform that vanishes as `K → ∞` and is
+typically dominated by the much larger Laplace-approximation bias of
+`ofv` in the sparse-data / strongly-nonlinear regime IMP targets.
 Analogous to NONMEM's `$EST METHOD=IMP EONLY=1` and Monolix's
 "Importance Sampling" likelihood method.
 
@@ -26,8 +29,8 @@ but breaks down for:
   surface non-quadratic in η).
 
 In those regimes the FOCE OFV is biased — typically *under*-stated, so
-naïve AIC/BIC comparisons favour over-parameterised models. IMP gives an
-unbiased estimate at extra MC cost.
+naïve AIC/BIC comparisons favour over-parameterised models. IMP gives a
+much-lower-bias estimate at extra MC cost.
 
 ## How it runs
 

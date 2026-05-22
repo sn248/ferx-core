@@ -56,6 +56,23 @@ fn imp_first_in_chain_is_rejected() {
 }
 
 #[test]
+fn imp_non_terminal_in_chain_is_rejected() {
+    let (model, population, mut opts) = warfarin_setup();
+    opts.methods = vec![
+        EstimationMethod::FoceI,
+        EstimationMethod::Imp,
+        EstimationMethod::FoceI,
+    ];
+    let err = fit(&model, &population, &model.default_params, &opts)
+        .err()
+        .expect("non-terminal `imp` must be rejected");
+    assert!(
+        err.contains("final stage"),
+        "expected `final stage` in error, got: {err}"
+    );
+}
+
+#[test]
 fn imp_duplicated_in_chain_is_rejected() {
     let (model, population, mut opts) = warfarin_setup();
     opts.methods = vec![

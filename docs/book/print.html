@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-254280c3.js";
+            window.path_to_searchindex_js = "searchindex-8db824f0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-eae77ecf.js"></script>
@@ -2466,8 +2466,11 @@ let fit_with_sir = run_sir(&amp;fit, None, None, &amp;opts)?;
 -2 \log L(\theta) \;=\; -2 \sum_i \log p(y_i \mid \theta)
 \;=\; -2 \sum_i \log \int p(y_i \mid \eta, \theta)\, p(\eta \mid \theta)\, d\eta
 \]</p>
-<p>by Monte-Carlo importance sampling, replacing the FOCE / Laplace
-approximation used by <code>ofv</code> with a (less-biased) unbiased estimator.
+<p>by Monte-Carlo importance sampling. The IS Monte-Carlo estimator of
+<code>p(yᵢ|θ)</code> is unbiased; the reported <code>−2 log L</code> carries a small Jensen
+bias from the <code>log(·)</code> transform that vanishes as <code>K → ∞</code> and is
+typically dominated by the much larger Laplace-approximation bias of
+<code>ofv</code> in the sparse-data / strongly-nonlinear regime IMP targets.
 Analogous to NONMEM’s <code>$EST METHOD=IMP EONLY=1</code> and Monolix’s
 “Importance Sampling” likelihood method.</p>
 <h2 id="when-to-use-it"><a class="header" href="#when-to-use-it">When to use it</a></h2>
@@ -2483,8 +2486,8 @@ target-mediated drug disposition, transit-compartment absorption.</li>
 surface non-quadratic in η).</li>
 </ul>
 <p>In those regimes the FOCE OFV is biased — typically <em>under</em>-stated, so
-naïve AIC/BIC comparisons favour over-parameterised models. IMP gives an
-unbiased estimate at extra MC cost.</p>
+naïve AIC/BIC comparisons favour over-parameterised models. IMP gives a
+much-lower-bias estimate at extra MC cost.</p>
 <h2 id="how-it-runs"><a class="header" href="#how-it-runs">How it runs</a></h2>
 <p><code>imp</code> is a chain stage, not a standalone method:</p>
 <pre><code>[fit_options]

@@ -856,7 +856,6 @@ pub struct SubjectResult {
     pub n_obs: usize,
 }
 
-/// Outcome of the post-estimation covariance step.
 /// How per-occasion kappa random effects are treated in the IS marginal likelihood.
 ///
 /// `Marginalized` — kappa is jointly sampled with eta (planned v2; not yet implemented).
@@ -902,6 +901,7 @@ pub struct ImportanceSamplingResult {
     pub kappa_treatment: KappaTreatment,
 }
 
+/// Outcome of the post-estimation covariance step.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CovarianceStatus {
     /// User set `covariance = false`; step was not attempted.

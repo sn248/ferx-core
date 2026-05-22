@@ -574,10 +574,10 @@ fn fit_inner(
     }
 
     // Guard: IMP is a likelihood evaluation, not an estimator. It must follow
-    // a parameter-estimating stage (it consumes that stage's EBEs + Hessians)
-    // and may appear at most once. The non-terminal warning (where the IMP
-    // result would be clobbered by a following stage) is emitted later,
-    // after `accumulated_warnings` is initialised.
+    // a parameter-estimating stage (it consumes that stage's EBEs + Hessians),
+    // may appear at most once, and must be the terminal stage. A non-terminal
+    // IMP would leave `FitResult.importance_sampling` populated with an IS-LL
+    // computed at parameters that the following stage then overwrites.
     if chain.iter().any(|&m| m == EstimationMethod::Imp) {
         if chain.first().copied() == Some(EstimationMethod::Imp) {
             return Err(
@@ -593,6 +593,15 @@ fn fit_inner(
             .count();
         if n_imp > 1 {
             return Err("method `imp` may appear at most once in a chain.".to_string());
+        }
+        if chain.last().copied() != Some(EstimationMethod::Imp) {
+            return Err(
+                "method `imp` must be the final stage of the chain — placing it mid-chain \
+                 would leave `FitResult.importance_sampling` populated with a log-likelihood \
+                 computed at parameters that the following stage then overwrites. Move `imp` \
+                 to the end."
+                    .to_string(),
+            );
         }
     }
 
@@ -698,19 +707,6 @@ fn fit_inner(
                  expect this to be very slow.",
                 n_params_pre
             ));
-        }
-    }
-
-    // Non-terminal IMP warning: emitted here so it's interleaved with the
-    // other pre-flight warnings. Hard errors (Imp first / Imp duplicated)
-    // are raised in the validation block above.
-    if let Some(imp_idx) = chain.iter().position(|&m| m == EstimationMethod::Imp) {
-        if imp_idx + 1 != n_stages {
-            accumulated_warnings.push(
-                "method `imp` is not the final stage — its log-likelihood result will be \
-                 overwritten by the following stage. Move `imp` to the end of the chain."
-                    .to_string(),
-            );
         }
     }
 

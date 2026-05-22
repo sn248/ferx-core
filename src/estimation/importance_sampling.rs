@@ -59,6 +59,16 @@ pub fn run_importance_sampling(
         ));
     }
 
+    // n_eta == 0: model has no random effects, so p(y|θ) = ∏ p(yⱼ|θ) directly
+    // (no integration needed). IS is meaningless here — the marginal collapses
+    // to the obs likelihood. Refuse rather than silently returning 0.
+    if model.n_eta == 0 {
+        return Err("Importance sampling requires at least one random effect. \
+             With n_eta = 0 the marginal likelihood is just the observation likelihood — \
+             read `FitResult.ofv` directly (no IS needed)."
+            .to_string());
+    }
+
     // SDE / EKF likelihood inflates the residual variance with per-observation
     // process-noise (see `individual_nll_into_with_schedule`). Our IS obs-NLL
     // path (`obs_nll_subject_into`) does not thread that through yet, so an
@@ -306,9 +316,14 @@ fn subject_is_estimate(
         + 0.5 * proposal.log_det_inv_scale; // −0.5 log|Σ| = +0.5 log|H_reg|
     let log_p_eta_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega;
 
+    // Preallocate every per-sample buffer once. With K typically in the
+    // thousands per subject and n_subjects in the hundreds, repeated
+    // allocation of `z`, `eta_sample`, `diff` and the implicit `DVector`
+    // for the prior quadratic form would dominate the inner loop.
     let mut log_w: Vec<f64> = Vec::with_capacity(k_samples);
     let mut z = vec![0.0_f64; d];
     let mut eta_sample = vec![0.0_f64; d];
+    let mut diff = vec![0.0_f64; d];
 
     for _ in 0..k_samples {
         // Draw z ~ N(0, I_d) and c ~ χ²_ν; build η = η̂ + sqrt(ν/c) · L_Σ z.
@@ -343,17 +358,26 @@ fn subject_is_estimate(
         };
         let log_p_y = -obs_nll;
 
-        // log p(η | θ): multivariate normal density at η_sample.
-        let eta_vec = DVector::from_column_slice(&eta_sample);
-        let quad_form = eta_vec.dot(&(omega_inv * &eta_vec));
+        // log p(η | θ): multivariate-normal quadratic form `η' Ω⁻¹ η`,
+        // computed allocation-free on slices. For d ≈ 2–10 the O(d²) double
+        // loop is far cheaper than building a `DVector` and a fresh
+        // `omega_inv * eta` allocation per sample.
+        let mut quad_form = 0.0_f64;
+        for i in 0..d {
+            let mut row = 0.0_f64;
+            for j in 0..d {
+                row += omega_inv[(i, j)] * eta_sample[j];
+            }
+            quad_form += row * eta_sample[i];
+        }
         let log_p_eta = log_p_eta_const - 0.5 * quad_form;
 
         // log q(η): multivariate t at (η̂, Σ, ν).
-        let diff: Vec<f64> = eta_sample
-            .iter()
-            .zip(eta_hat.iter())
-            .map(|(a, b)| a - b)
-            .collect();
+        // Fill the preallocated `diff` buffer in place — avoids a per-sample
+        // `Vec` allocation from the previous `.collect()` form.
+        for (k, d_slot) in diff.iter_mut().enumerate() {
+            *d_slot = eta_sample[k] - eta_hat[k];
+        }
         // (η-η̂)' H_reg (η-η̂) via the precomputed Cholesky of H_reg = L L'.
         // Σ⁻¹ = H_reg, so the Mahalanobis term is ‖L'·diff‖².
         let mahal = proposal.mahalanobis(&diff);

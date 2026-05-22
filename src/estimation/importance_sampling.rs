@@ -59,6 +59,43 @@ pub fn run_importance_sampling(
         ));
     }
 
+    // SDE / EKF likelihood inflates the residual variance with per-observation
+    // process-noise (see `individual_nll_into_with_schedule`). Our IS obs-NLL
+    // path (`obs_nll_subject_into`) does not thread that through yet, so an
+    // SDE model would silently report a wrong −2 log L. Refuse upfront — the
+    // user can still get the Laplace OFV via FOCE / FOCEI.
+    if model.is_sde() {
+        return Err(
+            "Importance sampling is not yet supported for SDE / [diffusion] models. \
+             The EKF process-noise variance is not included in the IS observation likelihood, \
+             so the marginal would be biased. Use FOCE / FOCEI for the Laplace OFV instead."
+                .to_string(),
+        );
+    }
+
+    // Defensive: every Jacobian must have shape (n_obs_i × n_eta). The only
+    // path in the current inner loop that violates this (degenerate-Ω
+    // early-out, `inner_optimizer.rs`) is already caught globally by the
+    // omega.log_det check below, but a future inner-loop path that fails
+    // per-subject would otherwise panic deep inside `compute_posterior_hessian`.
+    // Cheap to verify here; refuse with a clear message if violated.
+    for (i, j) in h_matrices.iter().enumerate() {
+        let expected_rows = population.subjects[i].observations.len();
+        if j.ncols() != model.n_eta || j.nrows() != expected_rows {
+            return Err(format!(
+                "IS: subject {} has Jacobian shape ({}×{}); expected ({}×{}). \
+                 The preceding estimator likely failed to compute EBEs for this subject \
+                 — fix the upstream convergence issue (tighter `inner_tol`, more `outer_maxiter`) \
+                 before running IMP.",
+                population.subjects[i].id,
+                j.nrows(),
+                j.ncols(),
+                expected_rows,
+                model.n_eta,
+            ));
+        }
+    }
+
     let n_eta = model.n_eta;
     let k_samples = options.is_samples;
     let nu = options.is_proposal_df;

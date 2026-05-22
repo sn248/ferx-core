@@ -108,6 +108,14 @@ The Monte-Carlo standard error on `−2 log L` is reported alongside.
   noisier. Investigate by re-running with a tighter `inner_tol` or
   inspecting the `FitResult.subjects[i]` diagnostics.
 
+## SDE / [diffusion] models (not supported)
+
+IMP refuses to run on models with a `[diffusion]` block. The EKF
+process-noise variance that inflates the residual variance for SDE
+models is not yet threaded through the IS observation-likelihood path,
+so the marginal would be silently biased. Use FOCE / FOCEI for the
+Laplace OFV on SDE models; IMP for SDE is tracked as a follow-up.
+
 ## IOV (current limitation)
 
 For models with `kappa` declarations, IMP samples η only — per-occasion

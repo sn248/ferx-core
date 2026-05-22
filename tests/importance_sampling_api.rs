@@ -116,6 +116,52 @@ fn imp_after_focei_populates_field() {
 }
 
 #[test]
+fn imp_after_focei_handles_fixed_theta_omega_sigma() {
+    // `warfarin_fix.ferx` FIXes TVKA (theta), ETA_KA variance (omega), and
+    // PROP_ERR (sigma). Exercises that FIX values flow correctly through the
+    // IS proposal — Ω⁻¹ uses the FIXED variance, σ used in the obs NLL, θ
+    // unchanged across IS samples — without panicking or producing NaN LL.
+    let model = parse_model_file(Path::new("examples/warfarin_fix.ferx"))
+        .expect("warfarin_fix model must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data must load");
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    opts.run_covariance_step = false;
+    opts.outer_maxiter = 40;
+    opts.is_samples = 200;
+    opts.is_seed = Some(11);
+    opts.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
+
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("FIX-model focei → imp must produce a fit");
+    let imp = result
+        .importance_sampling
+        .as_ref()
+        .expect("importance_sampling field should be populated");
+    assert!(
+        imp.minus2_log_likelihood.is_finite(),
+        "−2 log L on a FIX model must be finite, got {}",
+        imp.minus2_log_likelihood
+    );
+    // FIXED theta/omega/sigma slots must be preserved in the reported fit —
+    // IS doesn't update them, but a wiring bug could surface here.
+    assert!(
+        model.default_params.theta_fixed.iter().any(|&f| f),
+        "test fixture should have at least one FIXED theta"
+    );
+    for (i, &fixed) in model.default_params.theta_fixed.iter().enumerate() {
+        if fixed {
+            assert_eq!(
+                result.theta[i], model.default_params.theta[i],
+                "FIXED theta[{}] must not move",
+                i
+            );
+        }
+    }
+}
+
+#[test]
 fn imp_minus2_ll_is_in_loose_neighbourhood_of_focei_ofv() {
     // Warfarin is well-sampled (≈8 obs/subject) — the Laplace approximation is
     // good here, so the IS and FOCEI likelihoods should be within tens of OFV

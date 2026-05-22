@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-7390df12.js";
+            window.path_to_searchindex_js = "searchindex-254280c3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-eae77ecf.js"></script>
@@ -2565,6 +2565,12 @@ Hessian was near-singular. The IS estimate is still unbiased, just
 noisier. Investigate by re-running with a tighter <code>inner_tol</code> or
 inspecting the <code>FitResult.subjects[i]</code> diagnostics.</li>
 </ul>
+<h2 id="sde--diffusion-models-not-supported"><a class="header" href="#sde--diffusion-models-not-supported">SDE / [diffusion] models (not supported)</a></h2>
+<p>IMP refuses to run on models with a <code>[diffusion]</code> block. The EKF
+process-noise variance that inflates the residual variance for SDE
+models is not yet threaded through the IS observation-likelihood path,
+so the marginal would be silently biased. Use FOCE / FOCEI for the
+Laplace OFV on SDE models; IMP for SDE is tracked as a follow-up.</p>
 <h2 id="iov-current-limitation"><a class="header" href="#iov-current-limitation">IOV (current limitation)</a></h2>
 <p>For models with <code>kappa</code> declarations, IMP samples η only — per-occasion
 κ is held fixed at its EBE κ̂. The reported <code>−2 log L</code> is therefore a

@@ -92,9 +92,7 @@ pub fn run_sir_core(
     let free_idx: Vec<usize> = (0..n_packed).filter(|&i| !fixed_mask[i]).collect();
     let n_free = free_idx.len();
     if n_free == 0 {
-        return Err(
-            "run_sir_core: every packed parameter is FIX — nothing to sample.".to_string(),
-        );
+        return Err("run_sir_core: every packed parameter is FIX — nothing to sample.".to_string());
     }
 
     // Symmetrize first, then extract the free block (rows/cols of non-FIX
@@ -135,10 +133,7 @@ pub fn run_sir_core(
 
     // Log-determinant of the free-block proposal covariance (for density
     // computation). Uses n_free, matching the dimensionality of the Student-t.
-    let log_det_proposal = 2.0
-        * (0..n_free)
-            .map(|i| proposal_chol[(i, i)].ln())
-            .sum::<f64>();
+    let log_det_proposal = 2.0 * (0..n_free).map(|i| proposal_chol[(i, i)].ln()).sum::<f64>();
 
     let mut rng = match options.sir_seed {
         Some(seed) => StdRng::seed_from_u64(seed),

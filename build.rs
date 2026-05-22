@@ -26,6 +26,14 @@ fn main() {
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
     println!("cargo:rustc-env=FERX_BUILD_PROFILE={}", profile);
 
+    // Activate the shared pre-commit hook for local checkouts. Skipped silently
+    // when .git is absent (CI) or git is not on PATH.
+    if std::path::Path::new(".git").exists() {
+        let _ = std::process::Command::new("git")
+            .args(["config", "core.hooksPath", ".githooks"])
+            .status();
+    }
+
     println!("cargo:rerun-if-changed=Cargo.toml");
     // Re-run when any input we read above changes, so the embedded metadata
     // does not go stale across feature/profile/toolchain switches.

@@ -33,16 +33,16 @@ Since 2026-05-19, the following non-optimization PRs landed:
 
 | Step | Requires | Status |
 |------|----------|--------|
-| **5b** — IOV analytical gradient in outer optimizer | Step 5 ✅ | 🔶 IN REVIEW — PR [#71](https://github.com/FeRx-NLME/ferx-core/pull/71) (PR #70 merged then reverted; #71 is the re-open with bug fix needed — see review) |
+| **5b** — IOV analytical gradient in outer optimizer | Step 5 ✅ | ✅ DONE — PR [#71](https://github.com/FeRx-NLME/ferx-core/pull/71) merged |
 | **6b** — Eliminate double inner-solve in trust-region `cost()` | Step 6 ✅ | ✅ DONE — PR [#67](https://github.com/FeRx-NLME/ferx-core/pull/67) merged |
 | **7** — GN → trust-region subproblem (replace LM damping + line search) | Steps 6 ✅ + 6b ✅ | ✅ DONE — PRs [#68](https://github.com/FeRx-NLME/ferx-core/pull/68) + [#69](https://github.com/FeRx-NLME/ferx-core/pull/69) merged |
 | **8** — HMC proposals in SAEM E-step | Steps 3 ✅ + 4 ✅ + PR #66 merged | ❌ NOT STARTED |
 | **11** — IOV support for SAEM | Steps 4 ✅ + 5b, Step 8 recommended | ❌ NOT STARTED |
 
-**Recommended implementation order: 5b → 7 ✅ → 8 → 11 (IOV+SAEM, optional).**
+**Recommended implementation order: 5b ✅ → 7 ✅ → 8 → 11 (IOV+SAEM, optional).**
 - 6b: ✅ done (PR #67 merged).
 - 7: ✅ done (PR #68 merged; missing `two_cpt_oral_cov` Tier 3 test added via PR #69).
-- 5b: 🔶 in review (PR #71). Key Phase B deviation: kappa H-matrices are not needed — the IOV NLL uses BSV-only FOCE linearisation + a direct kappa prior; `∂P_κ/∂L_iov` derived via forward/backward solve through `L_iov` only. No changes to `run_inner_loop_warm` or call sites. **Outstanding bug**: T1 tests use `FitOptions::default()` (`interaction = true`) for the analytical call but hardcode `false` in the FD reference closures — must fix before merge.
+- 5b: ✅ done (PR #71 merged). Key Phase B deviation: kappa H-matrices are not needed — the IOV NLL uses BSV-only FOCE linearisation + a direct kappa prior; `∂P_κ/∂L_iov` derived via forward/backward solve through `L_iov` only. No changes to `run_inner_loop_warm` or call sites.
 - 8 last: largest scope, requires PR #66 merged; `autodiff` feature dependency means CI validation needs extra care.
 - 11 (IOV+SAEM): optional, post-Step 8; see new step below.
 

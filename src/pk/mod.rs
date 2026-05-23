@@ -3,11 +3,72 @@ pub mod one_compartment;
 pub mod three_compartment;
 pub mod two_compartment;
 
-use crate::types::{CompiledModel, DoseEvent, PkModel, PkParams, Subject};
+use crate::types::{CompiledModel, DoseEvent, PkModel, PkParams, ScalingSpec, Subject};
 
 pub use one_compartment::*;
 pub use three_compartment::*;
 pub use two_compartment::*;
+
+/// Divide each prediction in-place by the scale derived from
+/// `model.scaling`. The convention is **divisive** so that
+/// `[scaling] obs_scale = 1000` maps mg/L → mg/mL (i.e. the user's number
+/// reads as "raw / scale").
+///
+/// `ScalingSpec::None` is a no-op so every existing call path keeps its
+/// historical behaviour. For `ExpressionScale`, a subject-static
+/// `pk_param_fn` evaluation is performed so the scale expression can
+/// reference individual parameters (Phase 1 limitation: subject-static
+/// only — TV-cov-aware expression scales are a Phase 1.5 follow-up).
+///
+/// Form C (ODE `y = <expr>`) does *not* go through here — it replaces the
+/// per-observation state readout inside the ODE timeline loop via
+/// `OdeSpec::output_fn`, so the prediction returned to this function is
+/// already in observation units.
+#[inline]
+pub fn apply_scaling(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    preds: &mut [f64],
+) {
+    match &model.scaling {
+        ScalingSpec::None => {}
+        ScalingSpec::ScalarScale(k) => {
+            // Parser enforces `k > 0 && finite`; defensive guard for
+            // hand-constructed CompiledModels (no parser pass) — fall
+            // through to the NaN branch on bad values.
+            if *k > 0.0 && k.is_finite() {
+                let inv = 1.0 / k;
+                preds.iter_mut().for_each(|p| *p *= inv);
+            } else {
+                preds.iter_mut().for_each(|p| *p = f64::NAN);
+            }
+        }
+        ScalingSpec::ExpressionScale { scale_fn } => {
+            // Compute subject-static pk so the scale expression can
+            // reference individual parameters by name. Cheap relative to
+            // the FOCE inner loop — `gradient = ad` is rejected for
+            // ExpressionScale at parse time, so this branch only runs
+            // under FD anyway.
+            let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+            let s = scale_fn(theta, eta, &subject.covariates, &pk);
+            if s > 0.0 && s.is_finite() {
+                let inv = 1.0 / s;
+                preds.iter_mut().for_each(|p| *p *= inv);
+            } else {
+                // Expression scales can evaluate to 0 / NaN / inf at
+                // runtime (e.g. `WT / 70` with WT missing → 0, or
+                // `1 / (TVV - x)` near a singularity). Propagate NaN
+                // through `preds` so the outer optimizer's NLL goes NaN
+                // and the step is rejected — matches standard NLM
+                // convention and surfaces the bad scale in per-subject
+                // diagnostics rather than silently mis-fitting.
+                preds.iter_mut().for_each(|p| *p = f64::NAN);
+            }
+        }
+    }
+}
 
 /// Per-event PK parameter snapshots for one subject.
 ///
@@ -232,12 +293,17 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
 
 /// Compute predictions using ODE integration.
 /// `pk_params_flat` is the flat parameter vector passed to the ODE RHS function.
+/// `theta` and `eta` are forwarded to `OdeSpec::output_fn` for Form C
+/// (`[scaling] y = <expr>`) — pass empty slices for ODE specs without
+/// `output_fn` set.
 pub fn compute_predictions_ode(
     ode_spec: &crate::ode::OdeSpec,
     subject: &Subject,
     pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
 ) -> Vec<f64> {
-    crate::ode::ode_predictions(ode_spec, pk_params_flat, subject)
+    crate::ode::ode_predictions(ode_spec, pk_params_flat, theta, eta, subject)
 }
 
 /// Top-level prediction dispatcher with time-varying-covariate awareness.
@@ -310,46 +376,55 @@ pub fn compute_predictions_with_tv_into_with_schedule(
 ) -> Vec<f64> {
     let has_tv = subject.has_tv_covariates();
 
-    // ODE path.
-    if let Some(ref ode) = model.ode_spec {
+    let mut preds = if let Some(ref ode) = model.ode_spec {
+        // ODE path.
         if has_tv {
             compute_event_pk_params_into(model, subject, theta, eta, scratch);
-            return crate::ode::ode_predictions_event_driven(
+            crate::ode::ode_predictions_event_driven(
                 ode,
                 subject,
+                theta,
+                eta,
                 &scratch.dose,
                 &scratch.obs,
                 &scratch.pk_only,
-            );
+            )
+        } else {
+            let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+            crate::ode::ode_predictions(ode, &pk.values, theta, eta, subject)
         }
-        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-        return crate::ode::ode_predictions(ode, &pk.values, subject);
-    }
-
-    if has_tv && event_driven::supports_event_driven(model.pk_model) {
+    } else if has_tv && event_driven::supports_event_driven(model.pk_model) {
         compute_event_pk_params_into(model, subject, theta, eta, scratch);
         if let Some(sched) = schedule {
-            return event_driven::event_driven_predictions_with_schedule(
+            event_driven::event_driven_predictions_with_schedule(
                 model.pk_model,
                 subject,
                 sched,
                 &scratch.dose,
                 &scratch.obs,
                 &scratch.pk_only,
-            );
+            )
+        } else {
+            event_driven::event_driven_predictions(
+                model.pk_model,
+                subject,
+                &scratch.dose,
+                &scratch.obs,
+                &scratch.pk_only,
+            )
         }
-        return event_driven::event_driven_predictions(
-            model.pk_model,
-            subject,
-            &scratch.dose,
-            &scratch.obs,
-            &scratch.pk_only,
-        );
-    }
+    } else {
+        // No-TV fast path (or TV with unsupported model — see docstring).
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        compute_predictions(model.pk_model, subject, &pk)
+    };
 
-    // No-TV fast path (or TV with unsupported model — see docstring).
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-    compute_predictions(model.pk_model, subject, &pk)
+    // `[scaling]` post-multiply. Single insertion point covers FOCE/FOCEI,
+    // GN, trust-region, SAEM, and IOV — they all route through here.
+    // Form C (ODE `y = <expr>`) is already applied inside `ode_predictions*`
+    // via `OdeSpec::output_fn`, so `model.scaling` is `None` for those.
+    apply_scaling(model, subject, theta, eta, &mut preds);
+    preds
 }
 
 #[cfg(test)]
@@ -431,7 +506,7 @@ mod tests {
     fn cl_from_cr_model() -> crate::types::CompiledModel {
         use crate::types::{
             BloqMethod, CompiledModel, ErrorModel, GradientMethod, ModelParameters, OmegaMatrix,
-            PkModel, SigmaVector,
+            PkModel, ScalingSpec, SigmaVector,
         };
         CompiledModel {
             name: "cl_from_cr".into(),
@@ -489,6 +564,7 @@ mod tests {
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
         }
     }
 
@@ -711,5 +787,122 @@ mod tests {
         // With II = 24 and k = 0.1, KA = 1.5: exp(-k·II) ≈ 0.091, so the SS
         // tail adds ~10% to the slow term. Sanity: under 50%.
         assert!((c_ss / c_single) < 1.5);
+    }
+
+    // ── apply_scaling ───────────────────────────────────────────────────────
+
+    /// Build the same `cl_from_cr_model` test fixture but with the
+    /// requested `ScalingSpec` swapped in. Used by all apply_scaling tests
+    /// so they exercise the production signature
+    /// (`apply_scaling(&model, &subject, ...)`).
+    fn model_with_scaling(scaling: crate::types::ScalingSpec) -> crate::types::CompiledModel {
+        let mut m = cl_from_cr_model();
+        m.scaling = scaling;
+        m
+    }
+
+    fn one_subject_for_scaling() -> Subject {
+        let mut cov = HashMap::new();
+        cov.insert("CR".to_string(), 1.0);
+        make_subject_with_tv(cov, Vec::new(), Vec::new(), 1, 3)
+    }
+
+    #[test]
+    fn test_apply_scaling_none_is_noop() {
+        let model = model_with_scaling(ScalingSpec::None);
+        let subj = one_subject_for_scaling();
+        let mut preds = vec![10.0, 20.0, 30.0];
+        apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
+        assert_eq!(preds, vec![10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn test_apply_scaling_scalar_divides_in_place() {
+        let model = model_with_scaling(ScalingSpec::ScalarScale(1000.0));
+        let subj = one_subject_for_scaling();
+        let mut preds = vec![1000.0, 2000.0, 3000.0];
+        apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
+        for (got, exp) in preds.iter().zip([1.0, 2.0, 3.0].iter()) {
+            assert_relative_eq!(got, exp, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_apply_scaling_marks_bad_scale_as_nan() {
+        // When a ScaleFn returns 0 / NaN / inf at runtime, apply_scaling
+        // replaces every prediction with NaN so the outer NLL goes NaN
+        // and the optimizer rejects the step. Loud failure mode (vs the
+        // earlier "skip silently" policy, which hid mis-scaled fits).
+        let bad_returns = [0.0_f64, -1.0_f64, f64::NAN, f64::INFINITY];
+        for &val in &bad_returns {
+            let scale_fn: crate::types::ScaleFn = Box::new(move |_, _, _, _| val);
+            let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn });
+            let subj = one_subject_for_scaling();
+            let mut preds = vec![1.0, 2.0, 3.0];
+            apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
+            for p in &preds {
+                assert!(
+                    p.is_nan(),
+                    "bad scale ({}) must produce NaN preds, got {}",
+                    val,
+                    p
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_scaling_scalar_bad_value_marks_nan() {
+        // Defensive guard on the ScalarScale branch (hand-constructed
+        // models bypass the parser's > 0 check).
+        for &k in &[0.0_f64, -1.0_f64, f64::NAN, f64::INFINITY] {
+            let model = model_with_scaling(ScalingSpec::ScalarScale(k));
+            let subj = one_subject_for_scaling();
+            let mut preds = vec![1.0, 2.0, 3.0];
+            apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
+            for p in &preds {
+                assert!(
+                    p.is_nan(),
+                    "bad scalar scale ({}) must produce NaN preds, got {}",
+                    k,
+                    p
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_scaling_expression_uses_covariate() {
+        // scale_fn = WT / 70 — divisive convention so preds / (WT/70).
+        let scale_fn: crate::types::ScaleFn =
+            Box::new(|_theta, _eta, cov: &HashMap<String, f64>, _pk: &PkParams| {
+                cov.get("WT").copied().unwrap_or(70.0) / 70.0
+            });
+        let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn });
+        let mut subj = one_subject_for_scaling();
+        subj.covariates.insert("WT".to_string(), 84.0); // scale = 84/70 = 1.2
+        let mut preds = vec![12.0, 24.0];
+        apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
+        assert_relative_eq!(preds[0], 10.0, epsilon = 1e-12); // 12 / 1.2
+        assert_relative_eq!(preds[1], 20.0, epsilon = 1e-12); // 24 / 1.2
+    }
+
+    #[test]
+    fn test_apply_scaling_expression_uses_pk_param() {
+        // Regression for Phase 1.5 lift: scale_fn can now read individual
+        // parameters from `pk`. Here `scale = V / 10` — V is at PK slot 1
+        // (PK_IDX_V) for the cl_from_cr model fixture (CL=slot 0, V=slot 1).
+        // The model sets V = 50 so scale = 5 and preds get divided by 5.
+        let scale_fn: crate::types::ScaleFn =
+            Box::new(|_theta, _eta, _cov: &HashMap<String, f64>, pk: &PkParams| {
+                pk.values[crate::types::PK_IDX_V] / 10.0
+            });
+        let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn });
+        let subj = one_subject_for_scaling();
+        let mut preds = vec![100.0, 50.0];
+        apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
+        // cl_from_cr_model sets V = 50, so scale = 5.
+        assert_relative_eq!(preds[0], 20.0, epsilon = 1e-12);
+        assert_relative_eq!(preds[1], 10.0, epsilon = 1e-12);
     }
 }

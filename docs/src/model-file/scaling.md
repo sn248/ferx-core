@@ -1,0 +1,130 @@
+# Scaling
+
+The optional `[scaling]` block declares how the structural model's raw
+output maps to the observed `DV`. It exists so the user does not have to
+fold unit conversion or amount-to-concentration arithmetic into the
+structural model itself — keeping `[odes]` and `[structural_model]`
+readable, and making mixed-unit data (e.g. data in ng/mL when the model
+thinks in mg/L) straightforward.
+
+The convention is **divisive**: `pred_scaled = pred_raw / scale`. This
+matches the natural reading of `obs_scale = V/1000` as *"divide amount by
+V/1000 to get concentration in the user's units."*
+
+Three forms are supported. Each is optional; omitting `[scaling]` keeps
+the historical "raw prediction equals DV" behaviour.
+
+## Form A — scalar divisor
+
+Use for fixed unit conversion (e.g. mg/L → mg/mL is a constant 1000).
+
+```ferx
+[scaling]
+  obs_scale = 1000
+```
+
+Applies to analytical PK models and ODE models alike: every prediction
+is divided by the constant before reaching the residual error model.
+
+## Form B — expression divisor
+
+Use when the scale depends on theta, eta, or a covariate.
+
+```ferx
+[scaling]
+  obs_scale = WT / 70
+```
+
+Expressions may reference:
+
+- thetas (e.g. `TVV`),
+- etas (e.g. `ETA_CL`),
+- covariates (e.g. `WT`, `CR`),
+- individual parameters declared in `[individual_parameters]` (e.g.
+  `V`, `CL`) — these are resolved from a subject-static evaluation of
+  `pk_param_fn` at scale-evaluation time, so `obs_scale = 1000 / V`
+  uses the per-subject V (typical value times the EBE eta).
+
+The scale is evaluated **once per subject** with subject-level
+covariates (matching the no-TV path). Time-varying covariate support for
+expression scales is a Phase 1.5 follow-up.
+
+## Form C — explicit output expression (ODE only)
+
+Use when the ODE state is held as an amount and the observation is a
+concentration. Form C replaces the default `obs_cmt` readout entirely.
+
+```ferx
+[structural_model]
+  ode(states=[depot, central])     # no obs_cmt — Form C provides it
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central   # central holds amount
+
+[scaling]
+  y = central / V
+```
+
+The right-hand side may reference state names (`depot`, `central`),
+individual parameters (`CL`, `V`, `KA`), thetas (`TVCL`), etas
+(`ETA_CL`), and covariates (`WT`). All five name classes are looked up
+at evaluation time — states from the ODE solver, individual parameters
+from the subject-static `pk_param_fn`, and thetas/etas/covariates from
+the values supplied by the caller.
+
+Form C is only valid for ODE models. The parser rejects `y = ...` on
+analytical models with a clear error.
+
+## Runtime behaviour on bad scales
+
+If an expression scale (Form B or C) evaluates to a non-positive or
+non-finite value at runtime — for example `WT / 70` when `WT` is missing
+(reads 0) or `1 / (TVV - x)` near a singularity — every prediction for
+that subject is set to `NaN`. The outer NLL then evaluates to `NaN` and
+the optimizer rejects the step. This matches established NLM convention
+(NONMEM's `OBJFN = NaN` → step rejection) and surfaces bad scales in
+the per-subject diagnostics rather than silently producing a mis-scaled
+fit.
+
+## Comparison with NONMEM and nlmixr2
+
+| Need | NONMEM | nlmixr2 | ferx |
+|---|---|---|---|
+| Scalar unit conversion | `S1 = 1000` | (multiplier in `cmt`/`f`) | `[scaling] obs_scale = 1000` |
+| Amount-state ODE with concentration DV | `S2 = V/1000` plus `Y = A(2)/S2` | `cmt(central); f = central/V/1000` | `[scaling] y = central / (V/1000)` |
+
+The ferx form is divisive by convention, so an `obs_scale = V/1000`
+reads as "divide raw by V/1000" — matching NONMEM's `S2`.
+
+## Interaction with gradients (AD vs FD)
+
+- Scalar `obs_scale = K` works with both `gradient = ad` and
+  `gradient = fd`. The constant is threaded through the AD entry points
+  as a `Const` argument.
+- Expression `obs_scale = <expr>` is supported only with
+  `gradient = fd` in Phase 1. The parser rejects the combination of
+  expression scaling with AD gradients and prints the required flag.
+
+## Interaction with SDE / `[diffusion]`
+
+In Phase 1, `[scaling]` is **not supported** on SDE models. The EKF /
+Kalman update computes both the predicted mean and the prediction
+covariance `p_obs` in the observation space, and the per-observation
+`r_obs` callback evaluates the residual variance from that predicted
+mean. Forms A/B post-multiply only the mean, so the EKF variance would
+remain in the unscaled space — producing mis-scaled OFVs.
+
+A correct SDE+scaling integration needs the scale factor threaded into
+both the EKF `p_obs` propagation (scales by `1/K²`) and the residual
+variance callback. That's a wider change deferred to Phase 1.5. Until
+then, the parser rejects any `[scaling]` block on a model with a
+`[diffusion]` block (Forms A, B, and C alike).
+
+## Multi-analyte (forward compatibility)
+
+`[scaling]` is per-model in Phase 1. When ferx adds CMT-keyed scaling
+(NONMEM's `if (CMT==2) Y = A2/V2`-style routing), the same block will
+grow `y[CMT=1] = <expr>` / `y[CMT=2] = <expr>` and
+`obs_scale[CMT=...]` variants. Existing single-form usage will continue
+to work unchanged.

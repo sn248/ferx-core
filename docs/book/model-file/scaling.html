@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Parsing - FeRx-NLME Documentation</title>
+        <title>Scaling - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,108 +177,124 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="parsing"><a class="header" href="#parsing">Parsing</a></h1>
-<h2 id="model-parsing"><a class="header" href="#model-parsing">Model Parsing</a></h2>
-<h3 id="parse_model_file"><a class="header" href="#parse_model_file"><code>parse_model_file()</code></a></h3>
-<p>Parse a <code>.ferx</code> file into a <code>CompiledModel</code>. Only the core model blocks are processed (<code>[parameters]</code>, <code>[individual_parameters]</code>, <code>[structural_model]</code>, <code>[error_model]</code>).</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn parse_model_file(path: &amp;Path) -&gt; Result&lt;CompiledModel, String&gt;
-<span class="boring">}</span></code></pre>
-<h3 id="parse_model_string"><a class="header" href="#parse_model_string"><code>parse_model_string()</code></a></h3>
-<p>Parse a model from a string instead of a file.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn parse_model_string(content: &amp;str) -&gt; Result&lt;CompiledModel, String&gt;
-<span class="boring">}</span></code></pre>
-<p><strong>Example:</strong></p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>let model_str = r#"
-[parameters]
-  theta TVCL(0.1, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma ADD_ERR ~ 1.0
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
-
-[error_model]
-  DV ~ additive(ADD_ERR)
-"#;
-
-let model = parse_model_string(model_str)?;
-<span class="boring">}</span></code></pre>
-<h3 id="parse_full_model_file"><a class="header" href="#parse_full_model_file"><code>parse_full_model_file()</code></a></h3>
-<p>Parse a complete model file including <code>[fit_options]</code> and <code>[simulation]</code> blocks.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn parse_full_model_file(path: &amp;Path) -&gt; Result&lt;ParsedModel, String&gt;
-<span class="boring">}</span></code></pre>
-<p>Returns a <code>ParsedModel</code> which contains:</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub struct ParsedModel {
-    pub model: CompiledModel,
-    pub simulation: Option&lt;SimulationSpec&gt;,
-    pub fit_options: FitOptions,
-}
-<span class="boring">}</span></code></pre>
-<h2 id="data-parsing"><a class="header" href="#data-parsing">Data Parsing</a></h2>
-<h3 id="read_nonmem_csv"><a class="header" href="#read_nonmem_csv"><code>read_nonmem_csv()</code></a></h3>
-<p>Read a NONMEM-format CSV file into a <code>Population</code>.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn read_nonmem_csv(
-    path: &amp;Path,
-    covariate_columns: Option&lt;&amp;[&amp;str]&gt;,
-) -&gt; Result&lt;Population, String&gt;
-<span class="boring">}</span></code></pre>
-<p><strong>Parameters:</strong></p>
+                        <h1 id="scaling"><a class="header" href="#scaling">Scaling</a></h1>
+<p>The optional <code>[scaling]</code> block declares how the structural model’s raw
+output maps to the observed <code>DV</code>. It exists so the user does not have to
+fold unit conversion or amount-to-concentration arithmetic into the
+structural model itself — keeping <code>[odes]</code> and <code>[structural_model]</code>
+readable, and making mixed-unit data (e.g. data in ng/mL when the model
+thinks in mg/L) straightforward.</p>
+<p>The convention is <strong>divisive</strong>: <code>pred_scaled = pred_raw / scale</code>. This
+matches the natural reading of <code>obs_scale = V/1000</code> as <em>“divide amount by
+V/1000 to get concentration in the user’s units.”</em></p>
+<p>Three forms are supported. Each is optional; omitting <code>[scaling]</code> keeps
+the historical “raw prediction equals DV” behaviour.</p>
+<h2 id="form-a--scalar-divisor"><a class="header" href="#form-a--scalar-divisor">Form A — scalar divisor</a></h2>
+<p>Use for fixed unit conversion (e.g. mg/L → mg/mL is a constant 1000).</p>
+<pre><code class="language-ferx">[scaling]
+  obs_scale = 1000
+</code></pre>
+<p>Applies to analytical PK models and ODE models alike: every prediction
+is divided by the constant before reaching the residual error model.</p>
+<h2 id="form-b--expression-divisor"><a class="header" href="#form-b--expression-divisor">Form B — expression divisor</a></h2>
+<p>Use when the scale depends on theta, eta, or a covariate.</p>
+<pre><code class="language-ferx">[scaling]
+  obs_scale = WT / 70
+</code></pre>
+<p>Expressions may reference:</p>
 <ul>
-<li><code>path</code>: Path to the CSV file</li>
-<li><code>covariate_columns</code>: Optional list of covariate column names. If <code>None</code>, all non-standard columns are auto-detected as covariates.</li>
+<li>thetas (e.g. <code>TVV</code>),</li>
+<li>etas (e.g. <code>ETA_CL</code>),</li>
+<li>covariates (e.g. <code>WT</code>, <code>CR</code>),</li>
+<li>individual parameters declared in <code>[individual_parameters]</code> (e.g.
+<code>V</code>, <code>CL</code>) — these are resolved from a subject-static evaluation of
+<code>pk_param_fn</code> at scale-evaluation time, so <code>obs_scale = 1000 / V</code>
+uses the per-subject V (typical value times the EBE eta).</li>
 </ul>
-<p><strong>Example:</strong></p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>// Auto-detect covariates
-let pop = read_nonmem_csv(Path::new("data.csv"), None)?;
+<p>The scale is evaluated <strong>once per subject</strong> with subject-level
+covariates (matching the no-TV path). Time-varying covariate support for
+expression scales is a Phase 1.5 follow-up.</p>
+<h2 id="form-c--explicit-output-expression-ode-only"><a class="header" href="#form-c--explicit-output-expression-ode-only">Form C — explicit output expression (ODE only)</a></h2>
+<p>Use when the ODE state is held as an amount and the observation is a
+concentration. Form C replaces the default <code>obs_cmt</code> readout entirely.</p>
+<pre><code class="language-ferx">[structural_model]
+  ode(states=[depot, central])     # no obs_cmt — Form C provides it
 
-// Explicit covariate list
-let pop = read_nonmem_csv(
-    Path::new("data.csv"),
-    Some(&amp;["WT", "CRCL", "AGE"]),
-)?;
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central   # central holds amount
 
-println!("{} subjects, {} observations",
-         pop.subjects.len(), pop.n_obs());
-<span class="boring">}</span></code></pre>
-<h3 id="data-processing-details"><a class="header" href="#data-processing-details">Data Processing Details</a></h3>
+[scaling]
+  y = central / V
+</code></pre>
+<p>The right-hand side may reference state names (<code>depot</code>, <code>central</code>),
+individual parameters (<code>CL</code>, <code>V</code>, <code>KA</code>), thetas (<code>TVCL</code>), etas
+(<code>ETA_CL</code>), and covariates (<code>WT</code>). All five name classes are looked up
+at evaluation time — states from the ODE solver, individual parameters
+from the subject-static <code>pk_param_fn</code>, and thetas/etas/covariates from
+the values supplied by the caller.</p>
+<p>Form C is only valid for ODE models. The parser rejects <code>y = ...</code> on
+analytical models with a clear error.</p>
+<h2 id="runtime-behaviour-on-bad-scales"><a class="header" href="#runtime-behaviour-on-bad-scales">Runtime behaviour on bad scales</a></h2>
+<p>If an expression scale (Form B or C) evaluates to a non-positive or
+non-finite value at runtime — for example <code>WT / 70</code> when <code>WT</code> is missing
+(reads 0) or <code>1 / (TVV - x)</code> near a singularity — every prediction for
+that subject is set to <code>NaN</code>. The outer NLL then evaluates to <code>NaN</code> and
+the optimizer rejects the step. This matches established NLM convention
+(NONMEM’s <code>OBJFN = NaN</code> → step rejection) and surfaces bad scales in
+the per-subject diagnostics rather than silently producing a mis-scaled
+fit.</p>
+<h2 id="comparison-with-nonmem-and-nlmixr2"><a class="header" href="#comparison-with-nonmem-and-nlmixr2">Comparison with NONMEM and nlmixr2</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Need</th><th>NONMEM</th><th>nlmixr2</th><th>ferx</th></tr>
+</thead>
+<tbody>
+<tr><td>Scalar unit conversion</td><td><code>S1 = 1000</code></td><td>(multiplier in <code>cmt</code>/<code>f</code>)</td><td><code>[scaling] obs_scale = 1000</code></td></tr>
+<tr><td>Amount-state ODE with concentration DV</td><td><code>S2 = V/1000</code> plus <code>Y = A(2)/S2</code></td><td><code>cmt(central); f = central/V/1000</code></td><td><code>[scaling] y = central / (V/1000)</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The ferx form is divisive by convention, so an <code>obs_scale = V/1000</code>
+reads as “divide raw by V/1000” — matching NONMEM’s <code>S2</code>.</p>
+<h2 id="interaction-with-gradients-ad-vs-fd"><a class="header" href="#interaction-with-gradients-ad-vs-fd">Interaction with gradients (AD vs FD)</a></h2>
 <ul>
-<li>Column names are matched case-insensitively</li>
-<li>Standard NONMEM columns (<code>ID</code>, <code>TIME</code>, <code>DV</code>, <code>EVID</code>, <code>AMT</code>, <code>CMT</code>, <code>RATE</code>, <code>MDV</code>, <code>II</code>, <code>SS</code>) are recognized automatically</li>
-<li>Missing values (<code>.</code>, empty string) are handled appropriately</li>
-<li>Rows with <code>EVID=1</code> are treated as dose events</li>
-<li>Rows with <code>EVID=0</code> and <code>MDV=0</code> are treated as observations</li>
-<li>Time-constant covariates use the first non-missing value per subject</li>
-<li>Time-varying covariates use Last Observation Carried Forward (LOCF) per event — <code>[individual_parameters]</code> is re-evaluated at each dose and observation row using that row’s covariate values (NONMEM-equivalent semantics). Currently supported on 1- and 2-compartment IV bolus / infusion models and all ODE-defined models; oral and 3-compartment models fall back to a single first-row snapshot</li>
+<li>Scalar <code>obs_scale = K</code> works with both <code>gradient = ad</code> and
+<code>gradient = fd</code>. The constant is threaded through the AD entry points
+as a <code>Const</code> argument.</li>
+<li>Expression <code>obs_scale = &lt;expr&gt;</code> is supported only with
+<code>gradient = fd</code> in Phase 1. The parser rejects the combination of
+expression scaling with AD gradients and prints the required flag.</li>
 </ul>
+<h2 id="interaction-with-sde--diffusion"><a class="header" href="#interaction-with-sde--diffusion">Interaction with SDE / <code>[diffusion]</code></a></h2>
+<p>In Phase 1, <code>[scaling]</code> is <strong>not supported</strong> on SDE models. The EKF /
+Kalman update computes both the predicted mean and the prediction
+covariance <code>p_obs</code> in the observation space, and the per-observation
+<code>r_obs</code> callback evaluates the residual variance from that predicted
+mean. Forms A/B post-multiply only the mean, so the EKF variance would
+remain in the unscaled space — producing mis-scaled OFVs.</p>
+<p>A correct SDE+scaling integration needs the scale factor threaded into
+both the EKF <code>p_obs</code> propagation (scales by <code>1/K²</code>) and the residual
+variance callback. That’s a wider change deferred to Phase 1.5. Until
+then, the parser rejects any <code>[scaling]</code> block on a model with a
+<code>[diffusion]</code> block (Forms A, B, and C alike).</p>
+<h2 id="multi-analyte-forward-compatibility"><a class="header" href="#multi-analyte-forward-compatibility">Multi-analyte (forward compatibility)</a></h2>
+<p><code>[scaling]</code> is per-model in Phase 1. When ferx adds CMT-keyed scaling
+(NONMEM’s <code>if (CMT==2) Y = A2/V2</code>-style routing), the same block will
+grow <code>y[CMT=1] = &lt;expr&gt;</code> / <code>y[CMT=2] = &lt;expr&gt;</code> and
+<code>obs_scale[CMT=...]</code> variants. Existing single-form usage will continue
+to work unchanged.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../api/simulation.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../model-file/ode-models.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../faq.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../model-file/diffusion.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -288,11 +304,11 @@ println!("{} subjects, {} observations",
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../api/simulation.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../model-file/ode-models.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../faq.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../model-file/diffusion.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

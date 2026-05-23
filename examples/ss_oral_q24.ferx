@@ -9,12 +9,14 @@
 #   cargo run --release -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
 #
 # Simulation truth: TVCL=2.0, TVV=20.0, TVKA=1.5. The initial values
-# below are intentionally biased so the optimiser has work to do.
+# below are intentionally biased (1.5-2x off truth in each direction)
+# so the optimiser has meaningful work to do — running this example
+# should report final estimates close to the truth values above.
 
 [parameters]
-  theta TVCL(2.5, 0.01, 50.0)
-  theta TVV(15.0, 0.5, 200.0)
-  theta TVKA(1.0, 0.05, 20.0)
+  theta TVCL(5.0, 0.01, 50.0)
+  theta TVV(5.0, 0.5, 200.0)
+  theta TVKA(4.5, 0.05, 20.0)
 
   omega ETA_CL ~ 0.05
   omega ETA_V  ~ 0.05

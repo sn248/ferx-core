@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-76e577ea.js";
+            window.path_to_searchindex_js = "searchindex-01128107.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-3a934816.js"></script>
@@ -1022,9 +1022,13 @@ PARAM = THETA + ETA                   # additive
 <tr><td><code>two_cpt_iv_bolus</code></td><td>2</td><td>IV bolus</td><td><code>cl</code>, <code>v1</code>, <code>q</code>, <code>v2</code></td></tr>
 <tr><td><code>two_cpt_oral</code></td><td>2</td><td>Oral</td><td><code>cl</code>, <code>v1</code>, <code>q</code>, <code>v2</code>, <code>ka</code></td></tr>
 <tr><td><code>two_cpt_infusion</code></td><td>2</td><td>IV infusion</td><td><code>cl</code>, <code>v1</code>, <code>q</code>, <code>v2</code></td></tr>
+<tr><td><code>three_cpt_iv_bolus</code></td><td>3</td><td>IV bolus</td><td><code>cl</code>, <code>v1</code>, <code>q2</code>, <code>v2</code>, <code>q3</code>, <code>v3</code></td></tr>
+<tr><td><code>three_cpt_oral</code></td><td>3</td><td>Oral</td><td><code>cl</code>, <code>v1</code>, <code>q2</code>, <code>v2</code>, <code>q3</code>, <code>v3</code>, <code>ka</code></td></tr>
+<tr><td><code>three_cpt_infusion</code></td><td>3</td><td>IV infusion</td><td><code>cl</code>, <code>v1</code>, <code>q2</code>, <code>v2</code>, <code>q3</code>, <code>v3</code></td></tr>
 </tbody>
 </table>
 </div>
+<p>Each model has a <code>three_compartment_*</code> long-form alias (e.g. <code>three_compartment_iv_bolus</code>); the short and long names are interchangeable.</p>
 <h3 id="examples"><a class="header" href="#examples">Examples</a></h3>
 <p>One-compartment oral:</p>
 <pre><code>[structural_model]
@@ -1037,6 +1041,10 @@ PARAM = THETA + ETA                   # additive
 <p>Two-compartment oral:</p>
 <pre><code>[structural_model]
   pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+</code></pre>
+<p>Three-compartment IV bolus (note that <code>q2</code>/<code>q3</code> and <code>v2</code>/<code>v3</code> distinguish the two peripheral compartments):</p>
+<pre><code>[structural_model]
+  pk three_cpt_iv_bolus(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
 </code></pre>
 <h3 id="bioavailability"><a class="header" href="#bioavailability">Bioavailability</a></h3>
 <p>For oral models, bioavailability (F) defaults to 1.0. To estimate it, define an <code>F</code> parameter in <code>[individual_parameters]</code> – it will be automatically used by the oral PK functions.</p>
@@ -2478,7 +2486,7 @@ warnings.</p>
 <tr><th>Algorithm</th><th>Key</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td>Trust region</td><td><code>trust_region</code></td><td>Newton trust-region with Steihaug conjugate-gradient subproblem. Uses a finite-difference Hessian of the OFV-at-fixed-EBEs. Tune the CG budget with <code>steihaug_max_iters</code> (default 50).</td></tr>
+<tr><td>Trust region</td><td><code>trust_region</code></td><td>Newton trust-region with Steihaug conjugate-gradient subproblem. Uses the AD-based outer gradient (<code>subject_nll_pop_grad</code>) and a BHHH approximate Hessian <code>H ≈ 4 Σ gᵢgᵢᵀ</code> — always positive semi-definite, so the Steihaug subproblem stays well-conditioned. The CG budget defaults to <code>ceil(sqrt(n_params)).clamp(5, n_params)</code> (typically 5 for standard NLME models); pin it explicitly with <code>steihaug_max_iters</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -2504,7 +2512,7 @@ warnings.</p>
 <li>The maximum number of iterations (<code>maxiter</code>) is reached</li>
 <li>The optimizer reports convergence (NLopt <code>XtolReached</code> or <code>FtolReached</code>)</li>
 </ul>
-<p>The inner loop terminates when the gradient norm falls below <code>inner_tol</code> (default 1e-8) or <code>inner_maxiter</code> (default 200) iterations are reached.</p>
+<p>The inner loop terminates when the gradient norm falls below <code>inner_tol</code> (default <code>1e-4</code>, matching NONMEM’s ~3 SIGDIGITS inner-loop precision — see <a href="#general-options"><code>fit-options.md</code></a> for tuning guidance) or <code>inner_maxiter</code> (default 200) iterations are reached.</p>
 <h2 id="warm-starting"><a class="header" href="#warm-starting">Warm Starting</a></h2>
 <p>The inner loop warm-starts EBE estimation from the previous outer iteration’s EBEs. This significantly reduces computation time, especially in later iterations when parameters change slowly.</p>
 <h2 id="configuration-example"><a class="header" href="#configuration-example">Configuration Example</a></h2>
@@ -5070,10 +5078,12 @@ scale that ferx uses internally.</p>
 <li><strong><code>bobyqa</code></strong> — derivative-free, good when FOCE’s FD gradients are noisy and
 SLSQP stalls or oscillates. Slower per iteration on smooth problems, but
 often converges when gradient-based methods give up.</li>
-<li><strong><code>trust_region</code></strong> — second-order Newton trust-region. Can be faster near
-convergence because it uses curvature information; tune the CG budget with
-<code>steihaug_max_iters</code> (default 50) if you have more than ~50 packed
-parameters.</li>
+<li><strong><code>trust_region</code></strong> — second-order Newton trust-region with an AD-based
+gradient and BHHH approximate Hessian. Can be faster near convergence
+because it uses curvature information; the CG budget defaults to
+<code>ceil(sqrt(n_params))</code> (~5 for standard NLME models), but you can pin
+it with <code>steihaug_max_iters</code> if you have many packed parameters and
+want more aggressive sub-problem solves.</li>
 <li><strong><code>lbfgs</code> / <code>bfgs</code></strong> — fall back to these only when NLopt is unavailable.</li>
 </ul>
 <p>See <a href="#optimizer-choices">Fit Options</a> for the full

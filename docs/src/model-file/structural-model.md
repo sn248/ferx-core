@@ -20,6 +20,11 @@ pk MODEL_NAME(param=VALUE, param=VALUE, ...)
 | `two_cpt_iv_bolus` | 2 | IV bolus | `cl`, `v1`, `q`, `v2` |
 | `two_cpt_oral` | 2 | Oral | `cl`, `v1`, `q`, `v2`, `ka` |
 | `two_cpt_infusion` | 2 | IV infusion | `cl`, `v1`, `q`, `v2` |
+| `three_cpt_iv_bolus` | 3 | IV bolus | `cl`, `v1`, `q2`, `v2`, `q3`, `v3` |
+| `three_cpt_oral` | 3 | Oral | `cl`, `v1`, `q2`, `v2`, `q3`, `v3`, `ka` |
+| `three_cpt_infusion` | 3 | IV infusion | `cl`, `v1`, `q2`, `v2`, `q3`, `v3` |
+
+Each model has a `three_compartment_*` long-form alias (e.g. `three_compartment_iv_bolus`); the short and long names are interchangeable.
 
 ### Examples
 
@@ -39,6 +44,12 @@ Two-compartment oral:
 ```
 [structural_model]
   pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+```
+
+Three-compartment IV bolus (note that `q2`/`q3` and `v2`/`v3` distinguish the two peripheral compartments):
+```
+[structural_model]
+  pk three_cpt_iv_bolus(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
 ```
 
 ### Bioavailability

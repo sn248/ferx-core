@@ -67,7 +67,7 @@ FOCEI is more accurate when the residual variance depends on the predicted value
 
 | Algorithm | Key | Description |
 |-----------|-----|-------------|
-| Trust region | `trust_region` | Newton trust-region with Steihaug conjugate-gradient subproblem. Uses a finite-difference Hessian of the OFV-at-fixed-EBEs. Tune the CG budget with `steihaug_max_iters` (default 50). |
+| Trust region | `trust_region` | Newton trust-region with Steihaug conjugate-gradient subproblem. Uses the AD-based outer gradient (`subject_nll_pop_grad`) and a BHHH approximate Hessian `H ≈ 4 Σ gᵢgᵢᵀ` — always positive semi-definite, so the Steihaug subproblem stays well-conditioned. The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)` (typically 5 for standard NLME models); pin it explicitly with `steihaug_max_iters`. |
 
 ## Global Search
 
@@ -97,7 +97,7 @@ The outer loop terminates when any of:
 - The maximum number of iterations (`maxiter`) is reached
 - The optimizer reports convergence (NLopt `XtolReached` or `FtolReached`)
 
-The inner loop terminates when the gradient norm falls below `inner_tol` (default 1e-8) or `inner_maxiter` (default 200) iterations are reached.
+The inner loop terminates when the gradient norm falls below `inner_tol` (default `1e-4`, matching NONMEM's ~3 SIGDIGITS inner-loop precision — see [`fit-options.md`](../model-file/fit-options.md#general-options) for tuning guidance) or `inner_maxiter` (default 200) iterations are reached.
 
 ## Warm Starting
 

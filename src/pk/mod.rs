@@ -142,10 +142,26 @@ pub fn predict_concentration(
     conc.max(0.0)
 }
 
-/// Concentration contribution from a single dose at elapsed time tau
+/// Concentration contribution from a single dose at elapsed time tau.
+///
+/// When `dose.ss` is true and a steady-state closed form is available
+/// (currently 1-cpt only), the SS variant is used. For models without an
+/// SS closed form, SS doses fall back to the single-dose response — see
+/// the warning emitted from `api.rs` when this happens.
 fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParams) -> f64 {
     let cl = p.cl();
     let v = p.v();
+
+    if dose.ss && dose.ii > 0.0 {
+        match pk_model {
+            PkModel::OneCptIvBolus => return one_cpt_iv_bolus_ss(dose, tau, cl, v),
+            PkModel::OneCptInfusion => return one_cpt_infusion_ss(dose, tau, cl, v),
+            PkModel::OneCptOral => return one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio()),
+            // 2-cpt / 3-cpt SS not yet implemented — fall through to the
+            // single-dose formula. `api.rs` emits a warning for these.
+            _ => {}
+        }
+    }
 
     match pk_model {
         PkModel::OneCptIvBolus => one_cpt_iv_bolus(dose, tau, cl, v),
@@ -600,5 +616,72 @@ mod tests {
             &pk_nolag,
         );
         assert_relative_eq!(c_post, c_post_nolag, epsilon = 1e-10);
+    }
+
+    // --- Steady-state (SS=1) integration with predict_concentration ---
+
+    #[test]
+    fn test_ss_iv_bolus_via_predict_matches_closed_form() {
+        // Sanity check: predict_concentration with an SS=1 dose dispatches to
+        // the closed-form SS formula (not the single-dose response).
+        let ii = 12.0_f64;
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, true, ii)];
+        let pk = make_pk_params(10.0, 100.0);
+        let k = 10.0_f64 / 100.0;
+        for &t in &[0.0, 3.0, 11.9, 24.0] {
+            let c = predict_concentration(PkModel::OneCptIvBolus, &doses, t, &pk);
+            let expected = (1000.0 / 100.0) * (-k * t).exp() / (1.0 - (-k * ii).exp());
+            assert_relative_eq!(c, expected, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_ss_with_lagtime_identity_c_t_l_equals_c_t_minus_l() {
+        // Acceptance criterion from issue #15: with SS+lagtime, the curve at
+        // time t with lagtime L equals the unlagged SS curve at t - L. This
+        // is the geometric-series identity under linear superposition.
+        let ii = 12.0;
+        let lagtime = 1.5;
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, true, ii)];
+
+        let mut pk_lag = make_pk_params(10.0, 100.0);
+        pk_lag.values[crate::types::PK_IDX_LAGTIME] = lagtime;
+        let pk_nolag = make_pk_params(10.0, 100.0);
+
+        // Sample several t > lagtime so both curves are defined.
+        for &t in &[2.0, 5.0, 11.0, 13.5] {
+            let c_lag = predict_concentration(PkModel::OneCptIvBolus, &doses, t, &pk_lag);
+            let c_no =
+                predict_concentration(PkModel::OneCptIvBolus, &doses, t - lagtime, &pk_nolag);
+            assert_relative_eq!(c_lag, c_no, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_ss_oral_via_predict_dispatches_to_ss_formula() {
+        // With SS=1 and II large enough that exp(-k·II) is small, the SS
+        // value should be close to but strictly above the single-dose value
+        // at the same τ (the "+1" geometric-tail extra contribution).
+        let ii = 24.0_f64;
+        let cl = 2.0;
+        let v = 20.0;
+        let ka = 1.5;
+
+        let doses_ss = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, ii)];
+        let doses_single = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let pk = oral_pk_params(cl, v, ka);
+
+        let t = 4.0;
+        let c_ss = predict_concentration(PkModel::OneCptOral, &doses_ss, t, &pk);
+        let c_single = predict_concentration(PkModel::OneCptOral, &doses_single, t, &pk);
+        assert!(
+            c_ss > c_single,
+            "SS conc {} should be greater than single-dose conc {}",
+            c_ss,
+            c_single
+        );
+        // With II = 24 and k = 0.1, KA = 1.5: exp(-k·II) ≈ 0.091, so the SS
+        // tail adds ~10% to the slow term. Sanity: under 50%.
+        assert!((c_ss / c_single) < 1.5);
     }
 }

@@ -211,6 +211,14 @@ impl Subject {
         !self.dose_covariates.is_empty() || !self.obs_covariates.is_empty()
     }
 
+    /// True when any dose record on this subject is flagged steady-state
+    /// (SS=1). Used to gate paths that don't yet honour SS (event-driven,
+    /// AD propagators, ODE) — see `estimation/inner_optimizer.rs` and the
+    /// SS warning in `api.rs`.
+    pub fn has_ss_doses(&self) -> bool {
+        self.doses.iter().any(|d| d.ss)
+    }
+
     /// Covariate snapshot at observation index `j`. Falls back to the
     /// subject-static `covariates` map when per-event snapshots aren't present.
     pub fn obs_cov(&self, j: usize) -> &HashMap<String, f64> {

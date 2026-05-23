@@ -65,6 +65,15 @@ fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGra
         if !want_ad {
             return InnerGradientMethod::Fd;
         }
+        // SS=1 doses in the AD paths would require threading `dose.ss` and
+        // `dose.ii` through the AD-instrumented propagators and adding
+        // closed-form SS branches inside them. Until that lands, fall back
+        // to FD whenever the subject has any SS dose — otherwise AD
+        // gradients (computed against the single-dose response) would not
+        // match the SS-aware predictions from `predict_concentration`.
+        if subject.has_ss_doses() {
+            return InnerGradientMethod::Fd;
+        }
         // Lagtime in the event-driven AD path would require threading
         // per-dose `lagtime` through the AD-instrumented propagators and
         // their infusion-window checks. The single-snapshot AD path

@@ -652,36 +652,27 @@ fn fit_inner(
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
     // Steady-state (SS=1) coverage warning. SS is supported via closed-form
-    // for 1-cpt analytical models without time-varying covariates; other
-    // paths (2-/3-cpt analytical, ODE-based, and any subject with TV
-    // covariates routed through the event-driven path) silently treat SS
-    // doses as single doses. Warn so users know predictions are biased on
-    // those paths.
+    // for 1-cpt, 2-cpt, and 3-cpt analytical models without time-varying
+    // covariates. ODE-based models and any subject with TV covariates
+    // (routed through the event-driven path) silently treat SS doses as
+    // single doses. Warn so users know predictions are biased on those
+    // paths.
     let n_ss_subjects = population
         .subjects
         .iter()
         .filter(|s| s.has_ss_doses())
         .count();
     if n_ss_subjects > 0 {
-        let one_cpt_analytical = !model.is_ode_based()
-            && matches!(
-                model.pk_model,
-                crate::types::PkModel::OneCptIvBolus
-                    | crate::types::PkModel::OneCptOral
-                    | crate::types::PkModel::OneCptInfusion
-            );
         let n_ss_with_tv = population
             .subjects
             .iter()
             .filter(|s| s.has_ss_doses() && s.has_tv_covariates())
             .count();
-        if !one_cpt_analytical {
+        if model.is_ode_based() {
             accumulated_warnings.push(format!(
-                "{} subject(s) have steady-state (SS=1) doses but the model uses \
-                 a path that does not yet implement SS (2-/3-cpt analytical, \
-                 ODE, or event-driven). SS doses are treated as single doses on \
-                 these paths — predictions for these subjects are biased. \
-                 Tracked in issue #74.",
+                "{} subject(s) have steady-state (SS=1) doses but the model is \
+                 ODE-based. The ODE prediction path does not yet implement SS — \
+                 predictions for these subjects are biased. Tracked in issue #74.",
                 n_ss_subjects
             ));
         } else if n_ss_with_tv > 0 {

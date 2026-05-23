@@ -1123,6 +1123,9 @@ pub struct FitResult {
     /// Estimated OFV evaluations saved by the SAEM mu-ref gradient step M-step.
     /// Non-None only when method=saem and mu_referencing=true.
     pub saem_mu_ref_m_step_evals_saved: Option<u64>,
+    /// Number of subjects that used HMC at least once during the SAEM E-step.
+    /// `None` when `n_leapfrog = 0` (MH-only) or for non-SAEM methods.
+    pub saem_n_subjects_hmc: Option<usize>,
     /// Gradient method used in the inner (per-subject EBE) BFGS loop.
     pub gradient_method_inner: String,
     /// Gradient method used in the outer (population parameter) optimizer.
@@ -1281,6 +1284,11 @@ pub struct FitOptions {
     pub saem_n_mh_steps: usize,
     pub saem_adapt_interval: usize,
     pub saem_seed: Option<u64>,
+    /// Number of leapfrog steps per HMC proposal in the SAEM E-step.
+    /// `0` (default) uses the Metropolis-Hastings random-walk sampler.
+    /// A positive value (e.g. `3`) enables HMC; requires the `autodiff`
+    /// feature and an analytical PK model — falls back to MH otherwise.
+    pub saem_n_leapfrog: usize,
     /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
     pub gn_lambda: f64,
     // SIR options
@@ -1432,6 +1440,7 @@ impl Default for FitOptions {
             saem_n_mh_steps: 3,
             saem_adapt_interval: 50,
             saem_seed: None,
+            saem_n_leapfrog: 0,
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,
@@ -1671,6 +1680,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "n_exploration",
             "n_convergence",
             "n_mh_steps",
+            "n_leapfrog",
+            "saem_n_leapfrog",
             "adapt_interval",
             "seed",
             "saem_seed",

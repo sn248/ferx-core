@@ -29,19 +29,43 @@ Default: 250 iterations.
 
 Each SAEM iteration consists of:
 
-### 1. E-Step: Metropolis-Hastings Sampling
+### 1. E-Step: Sampling
 
-For each subject, run `n_mh_steps` Metropolis-Hastings iterations to sample from the conditional distribution of random effects:
+For each subject, sample from the conditional distribution of random effects:
 
 \\[ p(\eta_i | y_i, \theta, \Omega, \sigma) \\]
 
-**Proposal**: symmetric random walk in deviation space, \\( \eta_{\text{prop}} = \eta_{\text{current}} + \delta_i \cdot L \cdot z \\), with \\( z \sim N(0, I) \\) and \\( L = \text{chol}(\Omega) \\). The schedule is identical across both phases — only the SA step size \\( \gamma_k \\) changes between exploration and convergence.
+Two samplers are available:
+
+#### Metropolis-Hastings (default, `n_leapfrog = 0`)
+
+Run `n_mh_steps` symmetric random-walk MH iterations per subject per SAEM iteration.
+
+**Proposal**: \\( \eta_{\text{prop}} = \eta_{\text{current}} + \delta_i \cdot L \cdot z \\), with \\( z \sim N(0, I) \\) and \\( L = \text{chol}(\Omega) \\). The schedule is identical across both phases — only the SA step size \\( \gamma_k \\) changes between exploration and convergence.
 
 The MH kernel is symmetric in \\( \eta \\), so the proposal density cancels and the acceptance log-ratio is the difference of `individual_nll` values, which encodes the prior \\( N(0, \Omega) \\) plus the observation likelihood.
 
-**Acceptance**: Accept with probability \\( \min(1, \exp(\text{NLL}_{\text{current}} - \text{NLL}_{\text{prop}})) \\).
+**Acceptance**: \\( \min(1, \exp(\text{NLL}_{\text{current}} - \text{NLL}_{\text{prop}})) \\). Target acceptance rate: 40%.
 
-The MH sampling is parallelized across subjects using Rayon.
+#### HMC (Hamiltonian Monte Carlo, `n_leapfrog > 0`)
+
+When `n_leapfrog` is set to a positive integer (e.g. `3`), one HMC proposal replaces the `n_mh_steps` MH proposals per subject per iteration. HMC uses the gradient of the individual NLL to make longer, more directed moves through the posterior:
+
+\\[ H(\eta, p) = \text{NLL}(\eta) + \tfrac{1}{2} \|p\|^2 \\]
+
+with momentum \\( p \sim N(0, I) \\) and a standard velocity Störmer-Verlet (leapfrog) integrator. Acceptance is on \\( \Delta H \\), targeting ~65% acceptance.
+
+**Requirements**: `autodiff` feature enabled (default) and an analytical PK model (no ODE). A warning is emitted if `n_leapfrog > 0` but the `autodiff` feature is absent.
+
+**Per-subject fallback to MH**: `hmc_step` silently falls back to MH for a subject when any of the following conditions hold:
+- The model uses an ODE (`[odes]` block present)
+- The model has no analytical PK path (no `tv_fn` — pure ODE-only models)
+- The Ω matrix has a non-finite log-determinant (degenerate variance)
+- The subject has time-varying covariates and either the PK model does not support the event-driven AD path or the model has a lag time
+
+In a single run with `n_leapfrog > 0`, different subjects can therefore use different samplers. The acceptance rate reported in verbose output and the optimizer trace is an aggregate across all subjects; in mixed HMC/MH runs the target (65% for HMC, 40% for MH) may not be meaningful for the aggregate. The `n_mh_steps` option governs the number of proposals for MH-fallback subjects even when `n_leapfrog > 0`.
+
+The E-step sampling is parallelized across subjects using Rayon.
 
 ### 2. Stochastic Approximation Update
 
@@ -73,13 +97,15 @@ When `mu_referencing = false`, the full NLopt M-step runs for all thetas as befo
 
 The number of NLopt evaluations saved is stored in `FitResult::saem_mu_ref_m_step_evals_saved`, accumulated across SAEM iterations as `2 × mstep_maxiter × n_mu_ref_pairs` per outer step (one finite-difference probe pair per pinned mu-ref dimension, capped at `mstep_maxiter` NLopt gradient requests). The field is `None` when mu-referencing is off or method ≠ SAEM.
 
-### 5. Adaptive MH Step Sizes
+When `n_leapfrog > 0`, `FitResult::saem_n_subjects_hmc` records how many subjects used HMC at least once during the E-step (the remainder used MH fallback). The field is `None` for MH-only runs. The fit YAML also emits `saem_n_subjects_hmc` and `saem_n_subjects_mh` when the field is `Some`.
 
-Every `adapt_interval` iterations, the per-subject step sizes \\( \delta_i \\) are adjusted:
-- If acceptance rate > 40%: increase \\( \delta_i \\) by 10% (up to 5.0)
-- If acceptance rate < 40%: decrease \\( \delta_i \\) by 10% (down to 0.01)
+### 5. Adaptive Step Sizes
 
-This targets an acceptance rate around 40%, balancing exploration and mixing.
+Every `adapt_interval` iterations, the per-subject step sizes \\( \delta_i \\) (MH) or leapfrog step sizes (HMC) are adjusted based on acceptance rate:
+- If acceptance rate exceeds the target: increase \\( \delta_i \\) by 10% (up to 5.0)
+- If acceptance rate falls below the target: decrease \\( \delta_i \\) by 10% (down to 0.01)
+
+Target acceptance rates: 40% for MH, 65% for HMC.
 
 ## Post-SAEM Finalization
 
@@ -107,7 +133,8 @@ See [Importance Sampling (IMP)](importance-sampling.md).
   method        = saem
   n_exploration = 150      # Phase 1 iterations
   n_convergence = 250      # Phase 2 iterations
-  n_mh_steps    = 3        # MH steps per subject per iteration
+  n_mh_steps    = 3        # MH steps per subject per iteration (ignored when n_leapfrog > 0)
+  n_leapfrog    = 0        # Set > 0 (e.g. 3) to use HMC instead of MH
   adapt_interval = 50      # Step-size adaptation frequency
   seed          = 12345    # RNG seed for reproducibility
   covariance    = true     # Compute standard errors

@@ -1073,7 +1073,7 @@ mod tests {
         let pk = pk_one(cl, v);
         let ode = one_cpt_ode_spec();
 
-        let preds = ode_predictions(&ode, &pk.values, &subj);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
         assert_eq!(preds.len(), obs_times.len());
 
         for (j, &t) in obs_times.iter().enumerate() {
@@ -1100,7 +1100,7 @@ mod tests {
         let pk = pk_one(cl, v);
         let ode = one_cpt_ode_spec();
 
-        let preds = ode_predictions(&ode, &pk.values, &subj);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
         for (j, &t) in obs_times.iter().enumerate() {
             let expected = one_cpt_infusion_ss(&dose, t, cl, v);
             assert_relative_eq!(preds[j] / v, expected, epsilon = 1e-6, max_relative = 1e-4);
@@ -1129,7 +1129,7 @@ mod tests {
         let pk = pk_one(cl, v);
         let ode = one_cpt_ode_spec();
 
-        let preds = ode_predictions(&ode, &pk.values, &subj);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
         for (j, &t) in obs_times.iter().enumerate() {
             let expected = one_cpt_iv_bolus_ss(&doses[1], t - 10.0, cl, v);
             assert_relative_eq!(preds[j] / v, expected, epsilon = 1e-6, max_relative = 1e-4);

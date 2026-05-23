@@ -437,11 +437,7 @@ window.search = window.search || {};
         if (yes) {
             loadSearchScript(
                 window.path_to_searchindex_js ||
-<<<<<<< HEAD
-                path_to_root + 'searchindex-660261eb.js',
-=======
-                path_to_root + 'searchindex-38383e4d.js',
->>>>>>> 632a578 (feat(parser): add [scaling] block for unit conversion and amount-based ODEs (Phase 1, closes #2))
+                path_to_root + 'searchindex-76e577ea.js',
                 'mdbook-search-index');
             search_wrap.classList.remove('hidden');
             searchicon.setAttribute('aria-expanded', 'true');

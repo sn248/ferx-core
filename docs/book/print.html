@@ -36,17 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-<<<<<<< HEAD
-            window.path_to_searchindex_js = "searchindex-660261eb.js";
+            window.path_to_searchindex_js = "searchindex-76e577ea.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-808a48a8.js"></script>
-=======
-            window.path_to_searchindex_js = "searchindex-38383e4d.js";
-        </script>
-        <!-- Start loading toc.js asap -->
-        <script src="toc-f187808c.js"></script>
->>>>>>> 632a578 (feat(parser): add [scaling] block for unit conversion and amount-based ODEs (Phase 1, closes #2))
+        <script src="toc-3a934816.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1581,16 +1574,16 @@ is divided by the constant before reaching the residual error model.</p>
 <pre><code class="language-ferx">[scaling]
   obs_scale = WT / 70
 </code></pre>
-<p>In Phase 1, expressions may reference:</p>
+<p>Expressions may reference:</p>
 <ul>
 <li>thetas (e.g. <code>TVV</code>),</li>
 <li>etas (e.g. <code>ETA_CL</code>),</li>
-<li>covariates (e.g. <code>WT</code>, <code>CR</code>).</li>
+<li>covariates (e.g. <code>WT</code>, <code>CR</code>),</li>
+<li>individual parameters declared in <code>[individual_parameters]</code> (e.g.
+<code>V</code>, <code>CL</code>) — these are resolved from a subject-static evaluation of
+<code>pk_param_fn</code> at scale-evaluation time, so <code>obs_scale = 1000 / V</code>
+uses the per-subject V (typical value times the EBE eta).</li>
 </ul>
-<p>Phase 1 <strong>does not</strong> support references to individual parameters (e.g.
-<code>obs_scale = 1000 / V</code>) — the parser will reject these with a clear
-error. Use the underlying theta (<code>TVV</code>) for now, or switch to Form C if
-you need an individual-parameter-driven scale on an ODE model.</p>
 <p>The scale is evaluated <strong>once per subject</strong> with subject-level
 covariates (matching the no-TV path). Time-varying covariate support for
 expression scales is a Phase 1.5 follow-up.</p>
@@ -1608,11 +1601,22 @@ concentration. Form C replaces the default <code>obs_cmt</code> readout entirely
   y = central / V
 </code></pre>
 <p>The right-hand side may reference state names (<code>depot</code>, <code>central</code>),
-individual parameters (<code>CL</code>, <code>V</code>, <code>KA</code>), and covariates. Thetas and
-etas are <strong>not</strong> directly in scope — they are folded into individual
-parameters by <code>[individual_parameters]</code> before <code>y</code> is evaluated.</p>
+individual parameters (<code>CL</code>, <code>V</code>, <code>KA</code>), thetas (<code>TVCL</code>), etas
+(<code>ETA_CL</code>), and covariates (<code>WT</code>). All five name classes are looked up
+at evaluation time — states from the ODE solver, individual parameters
+from the subject-static <code>pk_param_fn</code>, and thetas/etas/covariates from
+the values supplied by the caller.</p>
 <p>Form C is only valid for ODE models. The parser rejects <code>y = ...</code> on
 analytical models with a clear error.</p>
+<h2 id="runtime-behaviour-on-bad-scales"><a class="header" href="#runtime-behaviour-on-bad-scales">Runtime behaviour on bad scales</a></h2>
+<p>If an expression scale (Form B or C) evaluates to a non-positive or
+non-finite value at runtime — for example <code>WT / 70</code> when <code>WT</code> is missing
+(reads 0) or <code>1 / (TVV - x)</code> near a singularity — every prediction for
+that subject is set to <code>NaN</code>. The outer NLL then evaluates to <code>NaN</code> and
+the optimizer rejects the step. This matches established NLM convention
+(NONMEM’s <code>OBJFN = NaN</code> → step rejection) and surfaces bad scales in
+the per-subject diagnostics rather than silently producing a mis-scaled
+fit.</p>
 <h2 id="comparison-with-nonmem-and-nlmixr2"><a class="header" href="#comparison-with-nonmem-and-nlmixr2">Comparison with NONMEM and nlmixr2</a></h2>
 <div class="table-wrapper">
 <table>
@@ -1637,10 +1641,17 @@ as a <code>Const</code> argument.</li>
 expression scaling with AD gradients and prints the required flag.</li>
 </ul>
 <h2 id="interaction-with-sde--diffusion"><a class="header" href="#interaction-with-sde--diffusion">Interaction with SDE / <code>[diffusion]</code></a></h2>
-<p>The EKF / SDE path requires a single observable compartment index for
-the Kalman update. SDE models can use Forms A and B (post-multiplied at
-the end of the prediction path) but cannot use Form C — the parser
-rejects SDE models that omit <code>obs_cmt</code> from <code>[structural_model]</code>.</p>
+<p>In Phase 1, <code>[scaling]</code> is <strong>not supported</strong> on SDE models. The EKF /
+Kalman update computes both the predicted mean and the prediction
+covariance <code>p_obs</code> in the observation space, and the per-observation
+<code>r_obs</code> callback evaluates the residual variance from that predicted
+mean. Forms A/B post-multiply only the mean, so the EKF variance would
+remain in the unscaled space — producing mis-scaled OFVs.</p>
+<p>A correct SDE+scaling integration needs the scale factor threaded into
+both the EKF <code>p_obs</code> propagation (scales by <code>1/K²</code>) and the residual
+variance callback. That’s a wider change deferred to Phase 1.5. Until
+then, the parser rejects any <code>[scaling]</code> block on a model with a
+<code>[diffusion]</code> block (Forms A, B, and C alike).</p>
 <h2 id="multi-analyte-forward-compatibility"><a class="header" href="#multi-analyte-forward-compatibility">Multi-analyte (forward compatibility)</a></h2>
 <p><code>[scaling]</code> is per-model in Phase 1. When ferx adds CMT-keyed scaling
 (NONMEM’s <code>if (CMT==2) Y = A2/V2</code>-style routing), the same block will

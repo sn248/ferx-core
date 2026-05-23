@@ -67,12 +67,25 @@ concentration. Form C replaces the default `obs_cmt` readout entirely.
 ```
 
 The right-hand side may reference state names (`depot`, `central`),
-individual parameters (`CL`, `V`, `KA`), and covariates. Thetas and
-etas are **not** directly in scope — they are folded into individual
-parameters by `[individual_parameters]` before `y` is evaluated.
+individual parameters (`CL`, `V`, `KA`), thetas (`TVCL`), etas
+(`ETA_CL`), and covariates (`WT`). All five name classes are looked up
+at evaluation time — states from the ODE solver, individual parameters
+from the subject-static `pk_param_fn`, and thetas/etas/covariates from
+the values supplied by the caller.
 
 Form C is only valid for ODE models. The parser rejects `y = ...` on
 analytical models with a clear error.
+
+## Runtime behaviour on bad scales
+
+If an expression scale (Form B or C) evaluates to a non-positive or
+non-finite value at runtime — for example `WT / 70` when `WT` is missing
+(reads 0) or `1 / (TVV - x)` near a singularity — every prediction for
+that subject is set to `NaN`. The outer NLL then evaluates to `NaN` and
+the optimizer rejects the step. This matches established NLM convention
+(NONMEM's `OBJFN = NaN` → step rejection) and surfaces bad scales in
+the per-subject diagnostics rather than silently producing a mis-scaled
+fit.
 
 ## Comparison with NONMEM and nlmixr2
 

@@ -35,11 +35,14 @@ pub fn apply_scaling(
     match &model.scaling {
         ScalingSpec::None => {}
         ScalingSpec::ScalarScale(k) => {
-            // Parser enforces `k > 0 && finite`; defensive guard kept so
-            // hand-constructed CompiledModels can't introduce inf/NaN.
+            // Parser enforces `k > 0 && finite`; defensive guard for
+            // hand-constructed CompiledModels (no parser pass) — fall
+            // through to the NaN branch on bad values.
             if *k > 0.0 && k.is_finite() {
                 let inv = 1.0 / k;
                 preds.iter_mut().for_each(|p| *p *= inv);
+            } else {
+                preds.iter_mut().for_each(|p| *p = f64::NAN);
             }
         }
         ScalingSpec::ExpressionScale { scale_fn } => {
@@ -50,17 +53,18 @@ pub fn apply_scaling(
             // under FD anyway.
             let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
             let s = scale_fn(theta, eta, &subject.covariates, &pk);
-            // Expression scales can evaluate to 0 / NaN / inf at runtime
-            // (e.g. covariate-driven `WT / 70` when WT = 0 due to missing
-            // data, or `1 / (TVV - x)` near a singularity). Dividing
-            // would produce inf/NaN predictions that then contaminate
-            // residual variance and likelihood. Skip the divide and
-            // leave preds untouched when the scale is not a positive
-            // finite value — the resulting OFV will reflect the
-            // mis-scaled fit rather than blowing up.
             if s > 0.0 && s.is_finite() {
                 let inv = 1.0 / s;
                 preds.iter_mut().for_each(|p| *p *= inv);
+            } else {
+                // Expression scales can evaluate to 0 / NaN / inf at
+                // runtime (e.g. `WT / 70` with WT missing → 0, or
+                // `1 / (TVV - x)` near a singularity). Propagate NaN
+                // through `preds` so the outer optimizer's NLL goes NaN
+                // and the step is rejected — matches standard NLM
+                // convention and surfaces the bad scale in per-subject
+                // diagnostics rather than silently mis-fitting.
+                preds.iter_mut().for_each(|p| *p = f64::NAN);
             }
         }
     }
@@ -289,12 +293,17 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
 
 /// Compute predictions using ODE integration.
 /// `pk_params_flat` is the flat parameter vector passed to the ODE RHS function.
+/// `theta` and `eta` are forwarded to `OdeSpec::output_fn` for Form C
+/// (`[scaling] y = <expr>`) — pass empty slices for ODE specs without
+/// `output_fn` set.
 pub fn compute_predictions_ode(
     ode_spec: &crate::ode::OdeSpec,
     subject: &Subject,
     pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
 ) -> Vec<f64> {
-    crate::ode::ode_predictions(ode_spec, pk_params_flat, subject)
+    crate::ode::ode_predictions(ode_spec, pk_params_flat, theta, eta, subject)
 }
 
 /// Top-level prediction dispatcher with time-varying-covariate awareness.
@@ -374,13 +383,15 @@ pub fn compute_predictions_with_tv_into_with_schedule(
             crate::ode::ode_predictions_event_driven(
                 ode,
                 subject,
+                theta,
+                eta,
                 &scratch.dose,
                 &scratch.obs,
                 &scratch.pk_only,
             )
         } else {
             let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-            crate::ode::ode_predictions(ode, &pk.values, subject)
+            crate::ode::ode_predictions(ode, &pk.values, theta, eta, subject)
         }
     } else if has_tv && event_driven::supports_event_driven(model.pk_model) {
         compute_event_pk_params_into(model, subject, theta, eta, scratch);
@@ -817,11 +828,12 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_scaling_skips_invalid_scale() {
-        // Regression for Copilot review: an ExpressionScale whose closure
-        // returns 0 / NaN / inf must not produce inf/NaN predictions.
-        // Phase 1 policy: leave preds unchanged.
-        let bad_returns = [0.0_f64, f64::NAN, f64::INFINITY];
+    fn test_apply_scaling_marks_bad_scale_as_nan() {
+        // When a ScaleFn returns 0 / NaN / inf at runtime, apply_scaling
+        // replaces every prediction with NaN so the outer NLL goes NaN
+        // and the optimizer rejects the step. Loud failure mode (vs the
+        // earlier "skip silently" policy, which hid mis-scaled fits).
+        let bad_returns = [0.0_f64, -1.0_f64, f64::NAN, f64::INFINITY];
         for &val in &bad_returns {
             let scale_fn: crate::types::ScaleFn = Box::new(move |_, _, _, _| val);
             let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn });
@@ -830,11 +842,32 @@ mod tests {
             apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
             for p in &preds {
                 assert!(
-                    p.is_finite(),
-                    "invalid scale must not contaminate predictions"
+                    p.is_nan(),
+                    "bad scale ({}) must produce NaN preds, got {}",
+                    val,
+                    p
                 );
             }
-            assert_eq!(preds, vec![1.0, 2.0, 3.0]);
+        }
+    }
+
+    #[test]
+    fn test_apply_scaling_scalar_bad_value_marks_nan() {
+        // Defensive guard on the ScalarScale branch (hand-constructed
+        // models bypass the parser's > 0 check).
+        for &k in &[0.0_f64, -1.0_f64, f64::NAN, f64::INFINITY] {
+            let model = model_with_scaling(ScalingSpec::ScalarScale(k));
+            let subj = one_subject_for_scaling();
+            let mut preds = vec![1.0, 2.0, 3.0];
+            apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
+            for p in &preds {
+                assert!(
+                    p.is_nan(),
+                    "bad scalar scale ({}) must produce NaN preds, got {}",
+                    k,
+                    p
+                );
+            }
         }
     }
 

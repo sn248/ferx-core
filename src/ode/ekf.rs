@@ -391,7 +391,7 @@ mod tests {
             output_fn: None,
             diffusion_var: Vec::new(),
         };
-        let ode_preds = ode_predictions(&ode_spec, &pk, &subj);
+        let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 
         for (ekf, &ode) in ekf_pts.iter().zip(ode_preds.iter()) {
             assert_relative_eq!(ekf.ipred, ode, epsilon = 1e-4, max_relative = 1e-4);

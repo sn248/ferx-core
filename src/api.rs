@@ -52,7 +52,7 @@ fn model_preds(
     eta: &[f64],
 ) -> Vec<f64> {
     let mut preds = if let Some(ref ode_spec) = model.ode_spec {
-        pk::compute_predictions_ode(ode_spec, subject, &pk_params.values)
+        pk::compute_predictions_ode(ode_spec, subject, &pk_params.values, theta, eta)
     } else {
         pk::compute_predictions(model.pk_model, subject, pk_params)
     };

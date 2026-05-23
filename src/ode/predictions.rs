@@ -152,11 +152,14 @@ fn active_infusions(
         .collect()
 }
 
-/// Function that computes the observable from `(state, pk_params_flat, covariates)`.
-/// Used by `[scaling] y = <expr>` (Form C) to replace the default `u[obs_cmt_idx]`
-/// readout with an arbitrary expression over states + individual parameters +
-/// covariates.
-pub type OdeOutputFn = Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
+/// Function that computes the observable from
+/// `(state, pk_params_flat, theta, eta, covariates)`. Used by `[scaling]
+/// y = <expr>` (Form C) to replace the default `u[obs_cmt_idx]` readout
+/// with an arbitrary expression over states + individual parameters +
+/// thetas + etas + covariates. Callers that don't have theta/eta in scope
+/// (e.g. the EKF path, which never sets `output_fn`) may pass empty slices.
+pub type OdeOutputFn =
+    Box<dyn Fn(&[f64], &[f64], &[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
 
 /// Read the observable value from the ODE state.
 ///
@@ -170,10 +173,12 @@ fn read_observable(
     ode: &OdeSpec,
     u: &[f64],
     pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
     covariates: &HashMap<String, f64>,
 ) -> f64 {
     if let Some(ref out_fn) = ode.output_fn {
-        out_fn(u, pk_params_flat, covariates)
+        out_fn(u, pk_params_flat, theta, eta, covariates)
     } else {
         let idx = ode
             .obs_cmt_idx
@@ -195,8 +200,9 @@ pub struct OdeSpec {
     /// that case `output_fn` is used instead.
     pub obs_cmt_idx: Option<usize>,
     /// Optional explicit output expression (Form C). When `Some`, the
-    /// per-observation readout is `output_fn(state, pk_params_flat, covariates)`
-    /// rather than `u[obs_cmt_idx]`. Parser guarantees exactly one of
+    /// per-observation readout is
+    /// `output_fn(state, pk_params_flat, theta, eta, covariates)` rather
+    /// than `u[obs_cmt_idx]`. Parser guarantees exactly one of
     /// `obs_cmt_idx` and `output_fn` is set for any compiled ODE model.
     pub output_fn: Option<OdeOutputFn>,
     /// Per-state diagonal process-noise variances (σ²_w,i) for SDE / EKF.
@@ -210,8 +216,16 @@ pub struct OdeSpec {
 /// Compute ODE-based predictions for a single subject.
 ///
 /// `pk_params_flat` is a flat array of PK parameters passed to the RHS function.
+/// `theta` and `eta` are forwarded to `OdeSpec::output_fn` for Form C
+/// (`[scaling] y = <expr>`); pass empty slices when no Form C is configured.
 /// Dose events are handled as state discontinuities between integration segments.
-pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject) -> Vec<f64> {
+pub fn ode_predictions(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+) -> Vec<f64> {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
     let opts = OdeSolverOptions::default();
@@ -281,7 +295,8 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
 
         // Record observations exactly at t_start (after dose)
         if let Some(&obs_idx) = obs_map.get(&t_start.to_bits()) {
-            predictions[obs_idx] = read_observable(ode, &u, pk_params_flat, &subject.covariates);
+            predictions[obs_idx] =
+                read_observable(ode, &u, pk_params_flat, theta, eta, &subject.covariates);
         }
 
         // Observation times in this segment (t_start < t <= t_end)
@@ -326,7 +341,7 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
         for pt in &sol {
             if let Some(&obs_idx) = obs_map.get(&pt.t.to_bits()) {
                 predictions[obs_idx] =
-                    read_observable(ode, &pt.u, pk_params_flat, &subject.covariates);
+                    read_observable(ode, &pt.u, pk_params_flat, theta, eta, &subject.covariates);
             }
         }
 
@@ -364,6 +379,8 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
 pub fn ode_predictions_event_driven(
     ode: &OdeSpec,
     subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
     pk_at_dose: &[PkParams],
     pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
@@ -496,7 +513,7 @@ pub fn ode_predictions_event_driven(
                 last_pk = pk_now;
             }
             Kind::Obs => {
-                let v = read_observable(ode, &u, &pk_now.values, &subject.covariates);
+                let v = read_observable(ode, &u, &pk_now.values, theta, eta, &subject.covariates);
                 predictions[idx] = if v.is_nan() || v < 0.0 { 0.0 } else { v };
                 last_pk = pk_now;
             }
@@ -529,7 +546,9 @@ pub fn ode_predictions_ekf_with_diffusion(
 ) -> (Vec<f64>, Vec<f64>) {
     use crate::ode::ekf::solve_ekf;
 
-    let ipred_plain = ode_predictions(ode, pk_params_flat, subject);
+    // EKF path: parser rejects SDE + Form C, so output_fn is always None
+    // here and theta/eta would never be consulted. Pass empty slices.
+    let ipred_plain = ode_predictions(ode, pk_params_flat, &[], &[], subject);
     let r_obs_vec: Vec<f64> = ipred_plain
         .iter()
         .map(|&f| {
@@ -587,7 +606,9 @@ pub fn ode_predictions_ekf(
 
     // Compute per-observation R for the Kalman update from a standard ODE pass.
     // Using per-observation R is correct for proportional and combined error models.
-    let ipred_plain = ode_predictions(ode, pk_params_flat, subject);
+    // EKF path: parser rejects SDE + Form C, so output_fn is always None
+    // here and theta/eta would never be consulted. Pass empty slices.
+    let ipred_plain = ode_predictions(ode, pk_params_flat, &[], &[], subject);
     let r_obs_vec: Vec<f64> = ipred_plain
         .iter()
         .map(|&f| {
@@ -682,8 +703,9 @@ mod tests {
         let pk_obs = vec![pk; obs_times.len()];
         let ode = one_cpt_ode_spec();
 
-        let baseline = ode_predictions(&ode, &pk.values, &subj);
-        let event_driven = ode_predictions_event_driven(&ode, &subj, &pk_dose, &pk_obs, &[]);
+        let baseline = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+        let event_driven =
+            ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
         assert_eq!(baseline.len(), event_driven.len());
         for (b, e) in baseline.iter().zip(event_driven.iter()) {
             // ODE solver tolerance is ~1e-4 relative — a tighter equality
@@ -712,7 +734,7 @@ mod tests {
         let pk_obs = vec![pk_low, pk_high];
         let ode = one_cpt_ode_spec();
 
-        let preds = ode_predictions_event_driven(&ode, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
 
         // [0, 5] uses pk_low (pk at obs1): A(5) = 1000 * exp(-0.05*5) ≈ 778.80
         let a5 = 1000.0 * (-0.05f64 * 5.0).exp();
@@ -764,7 +786,7 @@ mod tests {
         let ke = 5.0_f64 / 80.0;
         let ode = one_cpt_ode_spec();
 
-        let preds = ode_predictions(&ode, &pk.values, &subj);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
 
         // During infusion [0, 10]
         let a5 = (rate / ke) * (1.0 - (-ke * 5.0).exp());
@@ -792,8 +814,9 @@ mod tests {
         let pk_obs = vec![pk; obs_times.len()];
         let ode = one_cpt_ode_spec();
 
-        let baseline = ode_predictions(&ode, &pk.values, &subj);
-        let event_driven = ode_predictions_event_driven(&ode, &subj, &pk_dose, &pk_obs, &[]);
+        let baseline = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+        let event_driven =
+            ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
         assert_eq!(baseline.len(), event_driven.len());
         for (b, e) in baseline.iter().zip(event_driven.iter()) {
             assert_relative_eq!(*b, *e, epsilon = 1e-3, max_relative = 1e-4);
@@ -816,7 +839,7 @@ mod tests {
         let ke = 5.0_f64 / 80.0;
         let ode = one_cpt_ode_spec();
 
-        let preds = ode_predictions(&ode, &pk.values, &subj);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
 
         // [0, 2]: rate=100, A(0)=0 → A(t) = (100/ke)·(1 - exp(-ke·t))
         let a2 = (100.0_f64 / ke) * (1.0 - (-ke * 2.0).exp());
@@ -849,7 +872,7 @@ mod tests {
         let ke = 5.0_f64 / 80.0;
         let ode = one_cpt_ode_spec();
 
-        let preds = ode_predictions(&ode, &pk.values, &subj);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
 
         let a10 = (100.0_f64 / ke) * (1.0 - (-ke * 10.0).exp());
         let a15_pre = a10 * (-ke * 5.0).exp();
@@ -882,7 +905,7 @@ mod tests {
         pk.values[crate::types::PK_IDX_KA] = 1.0;
         let ka = 1.0_f64;
 
-        let preds = ode_predictions(&ode, &pk.values, &subj);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
 
         let depot_2 = (rate / ka) * (1.0 - (-ka * 2.0).exp());
         let depot_4 = (rate / ka) * (1.0 - (-ka * 4.0).exp());
@@ -915,7 +938,7 @@ mod tests {
         let pk = pk_one(5.0, 80.0);
         let ode = one_cpt_ode_spec();
 
-        let preds = ode_predictions(&ode, &pk.values, &subj);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
 
         assert_eq!(preds, vec![0.0, 0.0, 0.0]);
     }
@@ -935,7 +958,7 @@ mod tests {
 
         // Must not panic; the negative bolus update is clamped to 0 by
         // the negative-prediction guard in `ode_predictions`.
-        let preds = ode_predictions(&ode, &pk.values, &subj);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
         assert_eq!(preds.len(), 2);
     }
 
@@ -950,7 +973,7 @@ mod tests {
         let pk = pk_one(5.0, 80.0);
         let ode = one_cpt_ode_spec();
 
-        let preds = ode_predictions(&ode, &pk.values, &subj);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
         assert_eq!(preds.len(), 1);
     }
 
@@ -967,7 +990,7 @@ mod tests {
         pk.values[PK_IDX_LAGTIME] = 2.0;
         let ode = one_cpt_ode_spec();
 
-        let preds = ode_predictions(&ode, &pk.values, &subj);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
 
         // At t=1, dose has not yet arrived (lagtime=2). State stays 0.
         assert_relative_eq!(preds[0], 0.0, epsilon = 1e-10);
@@ -1003,8 +1026,8 @@ mod tests {
         let pk_ref = pk_one(5.0, 80.0);
 
         let ode = one_cpt_ode_spec();
-        let preds_lag = ode_predictions(&ode, &pk_lag.values, &subj_lag);
-        let preds_ref = ode_predictions(&ode, &pk_ref.values, &subj_ref);
+        let preds_lag = ode_predictions(&ode, &pk_lag.values, &[], &[], &subj_lag);
+        let preds_ref = ode_predictions(&ode, &pk_ref.values, &[], &[], &subj_ref);
 
         // Observation before lagged infusion start: zero.
         assert_relative_eq!(preds_lag[0], 0.0, epsilon = 1e-10);
@@ -1131,14 +1154,16 @@ mod tests {
             n_states: 1,
             state_names: vec!["central".into()],
             obs_cmt_idx: None,
-            output_fn: Some(Box::new(|state: &[f64], pk: &[f64], _cov| {
-                let v = pk[crate::types::PK_IDX_V];
-                if v > 0.0 {
-                    state[0] / v
-                } else {
-                    0.0
-                }
-            })),
+            output_fn: Some(Box::new(
+                |state: &[f64], pk: &[f64], _theta: &[f64], _eta: &[f64], _cov| {
+                    let v = pk[crate::types::PK_IDX_V];
+                    if v > 0.0 {
+                        state[0] / v
+                    } else {
+                        0.0
+                    }
+                },
+            )),
             diffusion_var: Vec::new(),
         }
     }
@@ -1163,8 +1188,8 @@ mod tests {
         let ode_ref = one_cpt_ode_spec();
         let ode_form_c = one_cpt_ode_spec_amount_form();
 
-        let preds_ref = ode_predictions(&ode_ref, &pk.values, &subj);
-        let preds_c = ode_predictions(&ode_form_c, &pk.values, &subj);
+        let preds_ref = ode_predictions(&ode_ref, &pk.values, &[], &[], &subj);
+        let preds_c = ode_predictions(&ode_form_c, &pk.values, &[], &[], &subj);
 
         // V = 1 makes amount/V numerically equal to amount, so both must agree.
         for (a, b) in preds_ref.iter().zip(preds_c.iter()) {
@@ -1175,12 +1200,12 @@ mod tests {
         // when V differs from 1, demonstrating the readout actually divides
         // by V rather than ignoring it.
         let pk_v_5 = pk_one(5.0, 5.0); // CL=5, V=5 → ke = 1
-        let preds_c_v5 = ode_predictions(&ode_form_c, &pk_v_5.values, &subj);
+        let preds_c_v5 = ode_predictions(&ode_form_c, &pk_v_5.values, &[], &[], &subj);
         // At t=0 just after the bolus, state = 10, V = 5 → conc = 2.
         assert_relative_eq!(preds_c_v5[0], 2.0, epsilon = 1e-9);
         // Reference (concentration-baked) with same params: state = 10
         // ⇒ conc = 10. Different from Form C, confirming output_fn ran.
-        let preds_ref_v5 = ode_predictions(&ode_ref, &pk_v_5.values, &subj);
+        let preds_ref_v5 = ode_predictions(&ode_ref, &pk_v_5.values, &[], &[], &subj);
         assert!(
             (preds_ref_v5[0] - preds_c_v5[0]).abs() > 1.0,
             "output_fn must change the readout (ref={} c={})",

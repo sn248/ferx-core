@@ -1900,23 +1900,21 @@ fn parse_scaling_block(
                 if output_fn.is_some() {
                     return Err("[scaling]: duplicate `y` key".into());
                 }
-                // Form C: expression references state names + individual parameter
-                // names. Thetas/etas are NOT in scope (they're folded into pk via
-                // pk_param_fn before output_fn is called).
+                // Form C: expression may reference state names, individual
+                // parameters, thetas, etas, and covariates. Use `ParseCtx::new`
+                // (fallback_covariate = true) so unknown identifiers resolve
+                // as `Covariate(NAME)` and read from the covariate map at
+                // eval time. `theta_names` / `eta_names` are in scope so
+                // identifiers like `TVCL` / `ETA_CL` parse correctly as
+                // `Theta(i)` / `Eta(i)`, and `state_names` + `indiv_var_names`
+                // make up the `defined_vars` set so they parse as `Variable`.
                 let mut defined: Vec<String> = state_names.to_vec();
                 for n in indiv_var_names {
                     if !defined.iter().any(|d| d == n) {
                         defined.push(n.clone());
                     }
                 }
-                // Use `ParseCtx::new` (fallback_covariate = true) rather than
-                // `ParseCtx::ode` so unknown identifiers like `WT` resolve as
-                // `Covariate(WT)` and are looked up in the covariate map at
-                // eval time. With `ParseCtx::ode` they would silently parse
-                // as `Variable(WT)` and read 0.0 from `vars` since the output_fn
-                // vars map only carries states + indiv params.
-                const EMPTY: &[String] = &[];
-                let ctx = ParseCtx::new(EMPTY, EMPTY, &defined);
+                let ctx = ParseCtx::new(theta_names, eta_names, &defined);
                 let expr = parse_scalar_expression(value, ctx)
                     .map_err(|e| format!("[scaling] y: {}", e))?;
                 // Pre-resolve state names → state indices and individual-param
@@ -1935,6 +1933,8 @@ fn parse_scaling_block(
                 let out_fn: crate::ode::OdeOutputFn = Box::new(
                     move |state: &[f64],
                           pk_params_flat: &[f64],
+                          theta: &[f64],
+                          eta: &[f64],
                           covariates: &HashMap<String, f64>|
                           -> f64 {
                         let mut vars: HashMap<String, f64> =
@@ -1950,16 +1950,7 @@ fn parse_scaling_block(
                             }
                         }
                         let empty_nn: Vec<Vec<f64>> = Vec::new();
-                        let empty_theta: [f64; 0] = [];
-                        let empty_eta: [f64; 0] = [];
-                        eval_expression(
-                            &expr,
-                            &empty_theta,
-                            &empty_eta,
-                            covariates,
-                            &vars,
-                            &empty_nn,
-                        )
+                        eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
                     },
                 );
                 output_fn = Some(out_fn);
@@ -8063,7 +8054,7 @@ if (1 > 0) {
         pk[1] = 50.0; // V
         pk[2] = 1.0; // KA
         let cov = HashMap::new();
-        let y = out_fn(&state, &pk, &cov);
+        let y = out_fn(&state, &pk, &[], &[], &cov);
         assert!((y - 2.0).abs() < 1e-12, "expected 100/50 = 2, got {}", y);
     }
 
@@ -8115,12 +8106,46 @@ if (1 > 0) {
         pk[2] = 1.0; // KA
         let mut cov = HashMap::new();
         cov.insert("WT".to_string(), 70.0);
-        let y = out_fn(&state, &pk, &cov);
+        let y = out_fn(&state, &pk, &[], &[], &cov);
         // central/V * WT = 50/50 * 70 = 70. With the bug, WT was treated as
         // a Variable and read 0 from the empty vars map → y = 0.
         assert!(
             (y - 70.0).abs() < 1e-12,
             "expected 70.0 (covariate WT must resolve), got {}",
+            y
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_y_form_c_resolves_theta() {
+        // Follow-up after Copilot's Fix #1: switching Form C's ParseCtx to
+        // ParseCtx::ode silently zeroed covariate refs; Copilot suggested
+        // ParseCtx::new(EMPTY, EMPTY, ...) which fixed covariates but
+        // introduced the symmetric bug for theta refs (TVCL became
+        // Covariate("TVCL") → 0.0). Phase 1.5 fix: pass theta_names/eta_names
+        // into ParseCtx so identifiers resolve as Theta(i) / Eta(i) and
+        // thread theta/eta through OdeOutputFn at runtime.
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some("  y = central / V * TVCL\n"),
+        );
+        let model = parse_model_string(&src).expect("Form C with theta ref parses");
+        let ode = model.ode_spec.as_ref().unwrap();
+        let out_fn = ode.output_fn.as_ref().unwrap();
+
+        let state = vec![0.0, 50.0];
+        let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
+        pk[0] = 1.0;
+        pk[1] = 50.0;
+        pk[2] = 1.0;
+        let theta = vec![3.0, 50.0, 1.0]; // [TVCL=3, TVV=50, TVKA=1]
+        let eta = vec![0.0];
+        let cov = HashMap::new();
+        let y = out_fn(&state, &pk, &theta, &eta, &cov);
+        // central/V * TVCL = 50/50 * 3 = 3.
+        assert!(
+            (y - 3.0).abs() < 1e-12,
+            "expected 3.0 (TVCL must resolve to theta[0]=3), got {}",
             y
         );
     }

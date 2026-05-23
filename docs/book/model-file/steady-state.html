@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Multi-Start (Michaelis-Menten) - FeRx-NLME Documentation</title>
+        <title>Steady-State Doses - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,112 +177,140 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="multi-start-michaelis-menten-elimination"><a class="header" href="#multi-start-michaelis-menten-elimination">Multi-Start: Michaelis-Menten Elimination</a></h1>
-<p>Michaelis-Menten (saturable) elimination is the canonical example of a local-minimum problem in NLME modelling. The Vmax/Km pair is only weakly identifiable from sparse PK data: many (Vmax, Km) combinations produce similar predicted concentrations, so the OFV surface contains a narrow ridge. A single-start FOCEI run is sensitive to the initial values — starting far from the true optimum, the optimizer often settles on an inflated Vmax/Km pair with a higher OFV than the true optimum.</p>
-<h2 id="the-problem"><a class="header" href="#the-problem">The problem</a></h2>
-<p>For the model below with true parameters Vmax ≈ 3.5 mg/h and Km ≈ 5.5 mg/L, starting with Vmax = 12 and Km = 20 (both roughly 3× too high) a single FOCEI run may converge to a local minimum rather than the global one. The two solutions predict similar concentration-time profiles on the observed time grid but differ in OFV by several units.</p>
-<h2 id="the-model-file"><a class="header" href="#the-model-file">The model file</a></h2>
-<pre><code class="language-ferx"># Michaelis-Menten elimination — multi-start demonstration
-#
-# The Vmax/Km parameter pair is only weakly identifiable from sparse PK data:
-# many (Vmax, Km) combinations produce similar predicted concentrations, and the
-# OFV surface contains a narrow ridge that makes single-start FOCEI sensitive to
-# the choice of initial values.  Starting from the values below, a single run
-# will often land on a local minimum with Vmax and Km both inflated relative to
-# the true values (Vmax ≈ 3.5 mg/h, Km ≈ 5.5 mg/L).
-#
-# n_starts = 8 runs 8 parallel fits from perturbed starting points (the same
-# wall-clock time as one run on an 8-core machine) and returns the converged
-# result with the lowest OFV.  Set multi_start_seed to reproduce a specific
-# set of perturbations.
-#
-# Data: data/mm_sparse.csv  (simulate with --simulate, or use the [simulation]
-# block below)
+                        <h1 id="steady-state-doses-ss1"><a class="header" href="#steady-state-doses-ss1">Steady-State Doses (SS=1)</a></h1>
+<p>A dose record with <code>SS=1</code> and <code>II &gt; 0</code> tells ferx-core that, at the time
+of the record, the compartmental state is at steady state under repeated
+dosing of that amount/rate every <code>II</code> time units. The record itself is
+treated as one of the pulses in the train.</p>
+<p>This matches the NONMEM <code>SS=1</code> semantic: the compartments are initialised
+to the value that would arise from an infinite-past pulse train at
+interval <code>II</code>. Subsequent observations decay from that loaded state under
+the model’s normal dynamics; the SS train is <strong>not</strong> implicitly continued
+past the SS dose record. To continue dosing forward in time, add explicit
+dose records (the typical clinical pattern is one <code>SS=1</code> “loading” row
+followed by any number of probe observations).</p>
+<h2 id="dataset-columns"><a class="header" href="#dataset-columns">Dataset columns</a></h2>
+<p>A steady-state row uses two NONMEM-format columns: <code>SS</code> and <code>II</code>.</p>
+<pre><code>ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS
+1,0,.,1,100,1,0,1,24,1     # SS=1: at SS under q24h dosing of AMT=100
+1,1,4.18,0,.,1,0,0,.,.
+1,4,3.86,0,.,1,0,0,.,.
+1,12,1.78,0,.,1,0,0,.,.
+1,23,0.59,0,.,1,0,0,.,.
+</code></pre>
+<p><code>II</code> is the dosing interval. For a bolus row (<code>RATE=0</code>) and an
+infusion row (<code>RATE&gt;0</code>), <code>SS=1</code> works the same way — the steady-state
+state is computed from the corresponding single-dose response repeated
+every <code>II</code>.</p>
+<h2 id="supported-prediction-paths"><a class="header" href="#supported-prediction-paths">Supported prediction paths</a></h2>
+<p>Every prediction path in ferx-core honours <code>SS=1</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Path</th><th>Where</th><th>How</th></tr>
+</thead>
+<tbody>
+<tr><td>Analytical (1-/2-/3-cpt, no TV covariates)</td><td><code>predict_concentration</code> in <code>src/pk/mod.rs</code></td><td>Closed-form geometric-series</td></tr>
+<tr><td>Analytical (1-/2-/3-cpt, time-varying covariates)</td><td><code>event_driven_predictions_with_schedule</code> in <code>src/pk/event_driven.rs</code></td><td>Numerical pre-equilibration via the propagator</td></tr>
+<tr><td>ODE (<code>[odes]</code>-block models)</td><td><code>ode_predictions</code> / <code>ode_predictions_event_driven</code> in <code>src/ode/predictions.rs</code></td><td>Numerical pre-equilibration via the RK45 solver</td></tr>
+</tbody>
+</table>
+</div>
+<p>The closed-form path uses the identity</p>
+<pre><code>C_ss(τ) = Σ_{n=0}^∞ C_single(τ + n·II)
+</code></pre>
+<p>evaluated in closed form per disposition eigenvalue: for every
+exponential <code>A·exp(-λ·t)</code> in the single-dose response, the steady-state
+amplitude becomes <code>A·exp(-λ·τ) / (1 - exp(-λ·II))</code>. For oral models with
+<code>KA ≈ λ</code> a separate L’Hopital limit applies; ferx handles it
+automatically.</p>
+<p>The numerical paths (ODE and event-driven analytical) run the same
+identity but expand the sum as <code>N = 50</code> cycles of <code>(apply dose; propagate II)</code>. Fifty cycles puts the truncation tail below <code>1e-9</code> of
+the steady-state value for any realistic PK, so users won’t see the
+distinction in fit output.</p>
+<h2 id="dsl-example"><a class="header" href="#dsl-example">DSL example</a></h2>
+<p>No new DSL syntax is required — the model file is identical to a
+single-dose model. SS is a property of the <strong>dataset</strong>:</p>
+<pre><code>[parameters]
+  theta TVCL(2.5, 0.01, 50.0)
+  theta TVV(15.0, 0.5, 200.0)
+  theta TVKA(1.0, 0.05, 20.0)
 
-[parameters]
-  # Initial values are intentionally high — a single run often stays here.
-  # Multi-start explores the neighbourhood and finds the true optimum.
-  theta TVVMAX(12.0, 0.1, 50.0)    # maximum elimination rate (mg/h); true ≈ 3.5
-  theta TVKM(20.0,  0.1, 100.0)    # Michaelis constant (mg/L);       true ≈ 5.5
-  theta TVV(11.0,   1.0, 200.0)    # volume of distribution (L);       true ≈ 11
-  theta TVKA(1.3,   0.05, 20.0)    # absorption rate constant (1/h);   true ≈ 1.3
+  omega ETA_CL ~ 0.05
+  omega ETA_V  ~ 0.05
+  omega ETA_KA ~ 0.1
 
-  omega ETA_VMAX ~ 0.25
-  omega ETA_V    ~ 0.20
-
-  sigma PROP_ERR ~ 0.04 (sd)
+  sigma PROP_ERR ~ 0.02 (sd)
 
 [individual_parameters]
-  VMAX = TVVMAX * exp(ETA_VMAX)
-  KM   = TVKM
-  V    = TVV * exp(ETA_V)
-  KA   = TVKA
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
 
 [structural_model]
-  ode(obs_cmt=central, states=[depot, central])
-
-[odes]
-  d/dt(depot)   = -KA * depot
-  d/dt(central) = KA * depot / V - VMAX * central / (KM + central)
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
 
 [fit_options]
-  method           = focei
-  maxiter          = 500
-  covariance       = true
-  n_starts         = 8
-  start_sigma      = 0.5    # wider perturbation for a ridge-shaped surface
-  multi_start_seed = 42
-
-[simulation]
-  n_subjects = 40
-  dose_amt   = 100.0
-  dose_cmt   = 1
-  times      = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]
-  seed       = 1
+  method  = foce
+  maxiter = 100
 </code></pre>
-<h2 id="what-multi-start-does"><a class="header" href="#what-multi-start-does">What multi-start does</a></h2>
-<p>With <code>n_starts = 8</code> and <code>start_sigma = 0.5</code>:</p>
+<p>Combine with the SS=1 dataset above and run:</p>
+<pre><code>cargo run --release -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
+</code></pre>
+<p>A runnable example pair ships in the repository at
+<code>examples/ss_oral_q24.ferx</code> + <code>data/ss_oral_q24.csv</code>.</p>
+<h2 id="combining-with-lagtime"><a class="header" href="#combining-with-lagtime">Combining with <code>LAGTIME</code></a></h2>
+<p><code>LAGTIME</code> shifts each pulse in the SS train, including the SS pulse
+itself. Under linear superposition this satisfies the identity</p>
+<pre><code>C_ss(τ, L) = C_ss(τ - L, 0)   for τ &gt; L
+</code></pre>
+<p>i.e. the lagged SS curve is just the un-lagged SS curve shifted in time.
+ferx-core enforces this exactly — declaring <code>LAGTIME</code> on a steady-state
+model is fully supported across all paths.</p>
+<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
+<p>The SS code paths return <code>0</code> and emit a warning in
+<code>FitResult.warnings</code> for the following malformed cases:</p>
 <ul>
-<li><strong>Start 0</strong> uses the exact initial values from <code>[parameters]</code> (Vmax=12, Km=20).</li>
-<li><strong>Starts 1–7</strong> multiply each log-packed theta by <code>exp(N(0, 0.5))</code>, giving a spread of roughly ×0.6–×1.6 around the initial values. With <code>start_sigma = 0.5</code> this is wider than the default 0.3 — appropriate for a ridge-shaped surface.</li>
-<li>All 8 runs execute in parallel. On an 8-core machine wall-clock time equals a single run.</li>
-<li>The converged run with the lowest OFV is returned. If start 0 was already at the global optimum, nothing changes. If one of the perturbed starts found a better solution, a warning on <code>FitResult.warnings</code> reports which start won and its OFV.</li>
+<li><strong><code>SS=1</code> with <code>II ≤ 0</code></strong> — interval is required for SS predictions;
+set <code>II</code> in the dataset or remove the <code>SS=1</code> flag.</li>
+<li><strong><code>SS=1</code> infusion with <code>T_inf &gt; II</code></strong> (overlapping pulses) — no
+closed-form solution covers this; use a shorter infusion or remove
+<code>SS=1</code>. The user can equivalently model overlapping infusions with
+an <code>[odes]</code> block and explicit periodic dose records (no SS).</li>
 </ul>
-<h2 id="running-it"><a class="header" href="#running-it">Running it</a></h2>
-<pre><code class="language-bash"># Simulate data first
-cargo run --release -- examples/mm_multistart.ferx --simulate
-
-# Fit with multi-start
-cargo run --release -- examples/mm_multistart.ferx --data mm_multistart-sim.csv
-</code></pre>
-<h2 id="when-to-use-multi-start"><a class="header" href="#when-to-use-multi-start">When to use multi-start</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Model feature</th><th>Risk of local minima</th><th>Recommended n_starts</th></tr>
-</thead>
-<tbody>
-<tr><td>Linear 1-cpt / 2-cpt</td><td>Very low</td><td>1 (default)</td></tr>
-<tr><td>Michaelis-Menten elimination</td><td>High</td><td>4–8</td></tr>
-<tr><td>Full-block omega (≥ 3 etas)</td><td>Moderate</td><td>4</td></tr>
-<tr><td>Many correlated covariates</td><td>Moderate</td><td>4–8</td></tr>
-</tbody>
-</table>
-</div>
-<p><code>start_sigma = 0.3</code> (the default, ≈ 30% CV) is appropriate for most models. For ridge-shaped surfaces like Vmax/Km, <code>start_sigma = 0.4–0.5</code> explores a wider neighbourhood.</p>
+<p>The <code>SS=2</code> flag (NONMEM “add to the existing train without
+re-equilibrating”) is <strong>not</strong> supported. Datasets that use <code>SS=2</code> should
+be converted to explicit dose records.</p>
+<h2 id="nonmem-equivalence"><a class="header" href="#nonmem-equivalence">NONMEM equivalence</a></h2>
+<ul>
+<li><code>SS=1</code>, <code>II=24</code>, <code>AMT=100</code>, <code>RATE=0</code> → matches NONMEM SS=1 bolus.</li>
+<li><code>SS=1</code>, <code>II=24</code>, <code>AMT=100</code>, <code>RATE=25</code> → matches NONMEM SS=1 infusion
+of duration <code>4</code> (= <code>AMT/RATE</code>), repeated every 24 time units.</li>
+<li>The SS state is computed assuming the same <code>CL</code>, <code>V</code>, etc. as the
+current PK record — i.e. ferx uses the <strong>current</strong> subject’s
+parameters, not a separate “SS parameters” set. This matches
+NONMEM’s <code>$PK</code> evaluation convention.</li>
+</ul>
+<h2 id="validation"><a class="header" href="#validation">Validation</a></h2>
+<p>Closed-form SS expressions are unit-tested against 200- to 400-term
+numerical pulse sums at 1e-9 relative tolerance (see
+<code>src/pk/one_compartment.rs::tests::test_ss_*</code>, similarly for 2-cpt and
+3-cpt). The ODE and event-driven paths are cross-checked against the
+analytical closed forms in their own test modules. The end-to-end fit
+path is covered by <code>tests/ss_fit_smoke.rs</code>.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../examples/iov.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../model-file/lagtime.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../api/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../model-file/error-model.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -292,11 +320,11 @@ cargo run --release -- examples/mm_multistart.ferx --data mm_multistart-sim.csv
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../examples/iov.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../model-file/lagtime.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../api/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../model-file/error-model.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

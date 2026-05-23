@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-5ecdcefc.js";
+            window.path_to_searchindex_js = "searchindex-144528bf.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-eae77ecf.js"></script>
+        <script src="toc-808a48a8.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1134,13 +1134,138 @@ yields a negative value, predictions will treat the dose as effective
 before its record time. Prefer a log-link (<code>exp(...)</code>) or any other
 parameterisation that keeps <code>lagtime ≥ 0</code>. ferx emits a warning in
 <code>FitResult.warnings</code> when the initial typical-value lagtime is negative.</li>
-<li>Steady-state doses (<code>SS=1</code>) combined with non-zero <code>lagtime</code> are not
-currently supported; the SS train is treated as unshifted, with only
-the post-SS continuation lagged. ferx emits a warning in
-<code>FitResult.warnings</code> when any subject has both an <code>SS=1</code> dose record
-and a model with declared <code>LAGTIME</code>. Tracked as a follow-up.</li>
+<li>Steady-state doses (<code>SS=1</code>) combined with non-zero <code>lagtime</code> are
+fully supported. Under linear superposition the lagged SS curve at
+time <code>t</code> equals the un-lagged SS curve evaluated at <code>t - lagtime</code>,
+i.e. <code>C_ss(t, L) = C_ss(t - L, 0)</code>. See
+<a href="#steady-state-doses-ss1">Steady-State Doses</a> for the full SS=1 reference.</li>
 </ul>
 <p>See <code>examples/oral_with_lagtime.ferx</code> for a runnable model.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="steady-state-doses-ss1"><a class="header" href="#steady-state-doses-ss1">Steady-State Doses (SS=1)</a></h1>
+<p>A dose record with <code>SS=1</code> and <code>II &gt; 0</code> tells ferx-core that, at the time
+of the record, the compartmental state is at steady state under repeated
+dosing of that amount/rate every <code>II</code> time units. The record itself is
+treated as one of the pulses in the train.</p>
+<p>This matches the NONMEM <code>SS=1</code> semantic: the compartments are initialised
+to the value that would arise from an infinite-past pulse train at
+interval <code>II</code>. Subsequent observations decay from that loaded state under
+the model’s normal dynamics; the SS train is <strong>not</strong> implicitly continued
+past the SS dose record. To continue dosing forward in time, add explicit
+dose records (the typical clinical pattern is one <code>SS=1</code> “loading” row
+followed by any number of probe observations).</p>
+<h2 id="dataset-columns"><a class="header" href="#dataset-columns">Dataset columns</a></h2>
+<p>A steady-state row uses two NONMEM-format columns: <code>SS</code> and <code>II</code>.</p>
+<pre><code>ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS
+1,0,.,1,100,1,0,1,24,1     # SS=1: at SS under q24h dosing of AMT=100
+1,1,4.18,0,.,1,0,0,.,.
+1,4,3.86,0,.,1,0,0,.,.
+1,12,1.78,0,.,1,0,0,.,.
+1,23,0.59,0,.,1,0,0,.,.
+</code></pre>
+<p><code>II</code> is the dosing interval. For a bolus row (<code>RATE=0</code>) and an
+infusion row (<code>RATE&gt;0</code>), <code>SS=1</code> works the same way — the steady-state
+state is computed from the corresponding single-dose response repeated
+every <code>II</code>.</p>
+<h2 id="supported-prediction-paths"><a class="header" href="#supported-prediction-paths">Supported prediction paths</a></h2>
+<p>Every prediction path in ferx-core honours <code>SS=1</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Path</th><th>Where</th><th>How</th></tr>
+</thead>
+<tbody>
+<tr><td>Analytical (1-/2-/3-cpt, no TV covariates)</td><td><code>predict_concentration</code> in <code>src/pk/mod.rs</code></td><td>Closed-form geometric-series</td></tr>
+<tr><td>Analytical (1-/2-/3-cpt, time-varying covariates)</td><td><code>event_driven_predictions_with_schedule</code> in <code>src/pk/event_driven.rs</code></td><td>Numerical pre-equilibration via the propagator</td></tr>
+<tr><td>ODE (<code>[odes]</code>-block models)</td><td><code>ode_predictions</code> / <code>ode_predictions_event_driven</code> in <code>src/ode/predictions.rs</code></td><td>Numerical pre-equilibration via the RK45 solver</td></tr>
+</tbody>
+</table>
+</div>
+<p>The closed-form path uses the identity</p>
+<pre><code>C_ss(τ) = Σ_{n=0}^∞ C_single(τ + n·II)
+</code></pre>
+<p>evaluated in closed form per disposition eigenvalue: for every
+exponential <code>A·exp(-λ·t)</code> in the single-dose response, the steady-state
+amplitude becomes <code>A·exp(-λ·τ) / (1 - exp(-λ·II))</code>. For oral models with
+<code>KA ≈ λ</code> a separate L’Hopital limit applies; ferx handles it
+automatically.</p>
+<p>The numerical paths (ODE and event-driven analytical) run the same
+identity but expand the sum as <code>N = 50</code> cycles of <code>(apply dose; propagate II)</code>. Fifty cycles puts the truncation tail below <code>1e-9</code> of
+the steady-state value for any realistic PK, so users won’t see the
+distinction in fit output.</p>
+<h2 id="dsl-example-1"><a class="header" href="#dsl-example-1">DSL example</a></h2>
+<p>No new DSL syntax is required — the model file is identical to a
+single-dose model. SS is a property of the <strong>dataset</strong>:</p>
+<pre><code>[parameters]
+  theta TVCL(2.5, 0.01, 50.0)
+  theta TVV(15.0, 0.5, 200.0)
+  theta TVKA(1.0, 0.05, 20.0)
+
+  omega ETA_CL ~ 0.05
+  omega ETA_V  ~ 0.05
+  omega ETA_KA ~ 0.1
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = foce
+  maxiter = 100
+</code></pre>
+<p>Combine with the SS=1 dataset above and run:</p>
+<pre><code>cargo run --release -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
+</code></pre>
+<p>A runnable example pair ships in the repository at
+<code>examples/ss_oral_q24.ferx</code> + <code>data/ss_oral_q24.csv</code>.</p>
+<h2 id="combining-with-lagtime"><a class="header" href="#combining-with-lagtime">Combining with <code>LAGTIME</code></a></h2>
+<p><code>LAGTIME</code> shifts each pulse in the SS train, including the SS pulse
+itself. Under linear superposition this satisfies the identity</p>
+<pre><code>C_ss(τ, L) = C_ss(τ - L, 0)   for τ &gt; L
+</code></pre>
+<p>i.e. the lagged SS curve is just the un-lagged SS curve shifted in time.
+ferx-core enforces this exactly — declaring <code>LAGTIME</code> on a steady-state
+model is fully supported across all paths.</p>
+<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
+<p>The SS code paths return <code>0</code> and emit a warning in
+<code>FitResult.warnings</code> for the following malformed cases:</p>
+<ul>
+<li><strong><code>SS=1</code> with <code>II ≤ 0</code></strong> — interval is required for SS predictions;
+set <code>II</code> in the dataset or remove the <code>SS=1</code> flag.</li>
+<li><strong><code>SS=1</code> infusion with <code>T_inf &gt; II</code></strong> (overlapping pulses) — no
+closed-form solution covers this; use a shorter infusion or remove
+<code>SS=1</code>. The user can equivalently model overlapping infusions with
+an <code>[odes]</code> block and explicit periodic dose records (no SS).</li>
+</ul>
+<p>The <code>SS=2</code> flag (NONMEM “add to the existing train without
+re-equilibrating”) is <strong>not</strong> supported. Datasets that use <code>SS=2</code> should
+be converted to explicit dose records.</p>
+<h2 id="nonmem-equivalence-1"><a class="header" href="#nonmem-equivalence-1">NONMEM equivalence</a></h2>
+<ul>
+<li><code>SS=1</code>, <code>II=24</code>, <code>AMT=100</code>, <code>RATE=0</code> → matches NONMEM SS=1 bolus.</li>
+<li><code>SS=1</code>, <code>II=24</code>, <code>AMT=100</code>, <code>RATE=25</code> → matches NONMEM SS=1 infusion
+of duration <code>4</code> (= <code>AMT/RATE</code>), repeated every 24 time units.</li>
+<li>The SS state is computed assuming the same <code>CL</code>, <code>V</code>, etc. as the
+current PK record — i.e. ferx uses the <strong>current</strong> subject’s
+parameters, not a separate “SS parameters” set. This matches
+NONMEM’s <code>$PK</code> evaluation convention.</li>
+</ul>
+<h2 id="validation"><a class="header" href="#validation">Validation</a></h2>
+<p>Closed-form SS expressions are unit-tested against 200- to 400-term
+numerical pulse sums at 1e-9 relative tolerance (see
+<code>src/pk/one_compartment.rs::tests::test_ss_*</code>, similarly for 2-cpt and
+3-cpt). The ODE and event-driven paths are cross-checked against the
+analytical closed forms in their own test modules. The end-to-end fit
+path is covered by <code>tests/ss_fit_smoke.rs</code>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="error-model"><a class="header" href="#error-model">Error Model</a></h1>
 <p>The <code>[error_model]</code> block defines the residual error structure, specifying how observed data (DV) relates to model predictions.</p>
@@ -1318,7 +1443,7 @@ of <code>0</code>.</p>
 a <code>[diffusion]</code> block to your ODE model.  See <a href="#stochastic-differential-equations-sde--diffusion">Stochastic Differential
 Equations</a> for a full description, worked example, and comparison
 with sigma and omega.</p>
-<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
+<h2 id="limitations-1"><a class="header" href="#limitations-1">Limitations</a></h2>
 <ul>
 <li>The observable compartment contains the amount (not concentration). Divide by volume in the ODE equations if needed</li>
 <li>Steady-state (<code>SS=1</code>) is not directly supported for ODE models</li>
@@ -2768,7 +2893,7 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 <blockquote>
 <p><strong>Note</strong>: <code>shrinkage_kappa</code> exists as a placeholder field on <code>FitResult</code> but is not yet computed — it is always returned as an empty <code>Vec</code>. Use <code>ebe_kappas</code> directly if you need a manual shrinkage diagnostic.</p>
 </blockquote>
-<h2 id="limitations-1"><a class="header" href="#limitations-1">Limitations</a></h2>
+<h2 id="limitations-2"><a class="header" href="#limitations-2">Limitations</a></h2>
 <ul>
 <li><strong>SAEM is not supported</strong> with IOV models — an error is returned directing you to use <code>foce</code> or <code>focei</code>.</li>
 <li><strong>Automatic differentiation (AD) is not used</strong> for IOV inner-loop gradients; finite differences are used instead. For large models this is slower than the AD path used for BSV-only models.</li>
@@ -2916,6 +3041,12 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 1,0.5,25.3,0,.,.,.,.,0
 </code></pre>
 <p>This assumes the subject has reached steady state with 100 units every 12 hours before the observation at TIME=0.5.</p>
+<p>SS=1 is supported on every prediction path: analytical (1-/2-/3-cpt with
+or without time-varying covariates) and ODE. SS=1 also composes with
+<code>LAGTIME</code> — the lagged SS curve at time <code>t</code> equals the un-lagged curve
+at <code>t - lagtime</code>. See <a href="#steady-state-doses-ss1">Steady-State Doses</a>
+for the full reference, including the data-validation warnings emitted
+for malformed rows (missing <code>II</code>, overlapping infusions).</p>
 <h2 id="multiple-doses"><a class="header" href="#multiple-doses">Multiple Doses</a></h2>
 <p>Multiple doses are supported as separate rows:</p>
 <pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,MDV

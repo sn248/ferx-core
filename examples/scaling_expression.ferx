@@ -1,0 +1,39 @@
+# Form B: expression `obs_scale` — references an individual parameter.
+#
+# Mirrors the example in issue #2: the structural model produces an
+# amount-style prediction and `obs_scale = V` converts it to a
+# concentration. The scale is evaluated per subject from a single
+# `pk_param_fn` snapshot, so V here uses the typical value times the
+# EBE η (subject-static).
+#
+# Form B can also reference thetas, etas, and covariates (e.g.
+# `obs_scale = WT / 70`). `[scaling] obs_scale = <expr>` + `gradient = ad`
+# is rejected at parse time; use `gradient = fd` (set here explicitly).
+
+[parameters]
+  theta TVCL(5.0,  0.1,  50.0)
+  theta TVV(50.0,  5.0, 500.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+
+[scaling]
+  obs_scale = V                 # per-subject volume-normalised DV scale
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 300
+  covariance = true
+  gradient   = fd               # required for expression-form obs_scale

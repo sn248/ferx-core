@@ -387,10 +387,11 @@ mod tests {
             rhs: Box::new(one_cpt_rhs),
             n_states: 1,
             state_names: vec!["central".into()],
-            obs_cmt_idx: 0,
+            obs_cmt_idx: Some(0),
+            output_fn: None,
             diffusion_var: Vec::new(),
         };
-        let ode_preds = ode_predictions(&ode_spec, &pk, &subj);
+        let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 
         for (ekf, &ode) in ekf_pts.iter().zip(ode_preds.iter()) {
             assert_relative_eq!(ekf.ipred, ode, epsilon = 1e-4, max_relative = 1e-4);

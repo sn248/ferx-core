@@ -121,10 +121,12 @@ Reach for a different optimizer when SLSQP misbehaves:
 - **`bobyqa`** — derivative-free, good when FOCE's FD gradients are noisy and
   SLSQP stalls or oscillates. Slower per iteration on smooth problems, but
   often converges when gradient-based methods give up.
-- **`trust_region`** — second-order Newton trust-region. Can be faster near
-  convergence because it uses curvature information; tune the CG budget with
-  `steihaug_max_iters` (default 50) if you have more than ~50 packed
-  parameters.
+- **`trust_region`** — second-order Newton trust-region with an AD-based
+  gradient and BHHH approximate Hessian. Can be faster near convergence
+  because it uses curvature information; the CG budget defaults to
+  `ceil(sqrt(n_params))` (~5 for standard NLME models), but you can pin
+  it with `steihaug_max_iters` if you have many packed parameters and
+  want more aggressive sub-problem solves.
 - **`lbfgs` / `bfgs`** — fall back to these only when NLopt is unavailable.
 
 See [Fit Options](model-file/fit-options.md#optimizer-choices) for the full

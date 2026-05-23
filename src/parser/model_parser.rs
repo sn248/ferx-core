@@ -1296,44 +1296,40 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             is_ode_model,
         )?;
 
-        // AD compatibility check: the analytical AD path threads a single
-        // f64 scale into `individual_nll_ad` as a `Const`, which can't
-        // evaluate user closures over theta/eta/states or vary per
-        // observation. ExpressionScale, ScalingSpec::PerCmt, and either
-        // Form C variant (OdeReadout::Single / PerCmt) all force
-        // `gradient = fd`. (gradient_method resolution happens at fit time
-        // when `Auto` defaults to AD if `tv_fn.is_some()`, so we
-        // conservatively reject both `Ad` and `Auto` here.)
+        // AD compatibility check (Phase 2.5):
         //
-        // The ODE readout check uses `output_fn` (the just-parsed
-        // Option<OdeReadout>) rather than `model.ode_spec.readout` because
-        // the latter is still the build_ode_spec placeholder at this
-        // point — Form C wiring happens just below. (Found by Copilot
-        // review on PR #84: the original check only looked at `scaling`,
-        // so a Form C model with `ScalingSpec::None` could request
-        // `gradient = ad` without a clear error and silently fall back to
-        // FD via `model.tv_fn.is_none()` at runtime.)
+        // ScalingSpec — None / ScalarScale / ExpressionScale / PerCmt —
+        // all support AD now via the per-observation `obs_scale: &[f64]`
+        // slice threaded into the four AD entry points and built by
+        // `inner_optimizer::build_scale_array_for_ad`. The slice is
+        // materialised once per gradient call from a subject-static pk
+        // evaluation, so AD treats the scale as constant w.r.t. eta.
+        // That's exact for the common eta-independent scale (`WT/70`,
+        // `TVV/1000`, `V` reading the EBE value) and a documented
+        // approximation for the rare eta-dependent case — users who
+        // explicitly need eta-sensitive gradients should set
+        // `gradient = fd`.
+        //
+        // Form C readouts (`OdeReadout::Single` / `PerCmt`) STILL force
+        // FD: they only exist on ODE models, and the AD path requires
+        // `tv_fn.is_some()` which is only set for analytical models. The
+        // runtime check would silently demote `gradient = ad` to FD; the
+        // parse-time guard here surfaces it as a loud error so the user
+        // knows AD isn't actually doing anything for their Form C model.
         let ad_explicit = fit_options.gradient_method == GradientMethod::Ad;
         let ad_auto_likely = fit_options.gradient_method == GradientMethod::Auto
             && model.tv_fn.is_some()
             && cfg!(feature = "autodiff");
         let readout_needs_fd = output_fn.as_ref().map(|r| r.requires_fd()).unwrap_or(false);
-        if (scaling.requires_fd() || readout_needs_fd) && (ad_explicit || ad_auto_likely) {
-            let kind = if matches!(scaling, ScalingSpec::ExpressionScale { .. }) {
-                "expression-form `obs_scale = <expr>`"
-            } else if matches!(scaling, ScalingSpec::PerCmt(_)) {
-                "per-CMT `obs_scale[CMT=N]`"
-            } else {
-                match output_fn.as_ref() {
-                    Some(crate::ode::OdeReadout::PerCmt(_)) => "per-CMT `y[CMT=N]` (Form C)",
-                    Some(crate::ode::OdeReadout::Single(_)) => "`y = <expr>` (Form C)",
-                    _ => {
-                        unreachable!("readout_needs_fd implies output_fn is Some(Single | PerCmt)")
-                    }
-                }
+        if readout_needs_fd && (ad_explicit || ad_auto_likely) {
+            let kind = match output_fn.as_ref() {
+                Some(crate::ode::OdeReadout::PerCmt(_)) => "per-CMT `y[CMT=N]` (Form C)",
+                Some(crate::ode::OdeReadout::Single(_)) => "`y = <expr>` (Form C)",
+                _ => unreachable!("readout_needs_fd implies output_fn is Some(Single | PerCmt)"),
             };
             return Err(format!(
-                "[scaling]: {} is not yet supported with AD gradients. \
+                "[scaling]: {} is not supported with AD gradients (Form C readouts only \
+                 exist on ODE models, and AD requires the analytical PK path). \
                  Add `gradient = fd` to [fit_options].",
                 kind
             ));
@@ -8401,18 +8397,16 @@ if (1 > 0) {
     }
 
     #[test]
-    fn test_parse_scaling_expression_rejects_ad_gradient() {
-        // Form B + gradient = ad must error with clear message.
+    fn test_parse_scaling_expression_accepts_ad_gradient() {
+        // Phase 2.5: Form B (`obs_scale = <expr>`) + `gradient = ad` is
+        // now allowed. The AD path receives a per-observation scale
+        // array materialised from a subject-static `pk_param_fn`
+        // evaluation; the gradient treats the scale as constant w.r.t.
+        // eta, which is exact for eta-independent scales (the common
+        // case) and a documented approximation otherwise.
         let base = analytical_model_with_scaling(Some("  obs_scale = TVV / 10\n"));
-        // Replace `gradient = fd` with `gradient = ad`.
         let src = base.replace("gradient = fd", "gradient = ad");
-        let err =
-            parse_model_string(&src).expect_err("ExpressionScale + gradient = ad must be rejected");
-        assert!(
-            err.to_lowercase().contains("expression") && err.contains("gradient = fd"),
-            "expected gradient=fd hint, got: {}",
-            err
-        );
+        parse_model_string(&src).expect("ExpressionScale + gradient = ad now parses");
     }
 
     // ── Phase 2: multi-analyte / per-CMT scaling ────────────────────────────
@@ -8543,18 +8537,16 @@ if (1 > 0) {
     }
 
     #[test]
-    fn test_parse_scaling_per_cmt_rejects_ad() {
-        // PerCmt scaling forces FD (same as ExpressionScale + AD).
+    fn test_parse_scaling_per_cmt_accepts_ad() {
+        // Phase 2.5: per-CMT `obs_scale[CMT=N]` + `gradient = ad` is now
+        // allowed. The AD path builds a per-observation scale array
+        // dispatching the right per-CMT inner spec to each observation
+        // via `inner_optimizer::build_scale_array_for_ad`.
         let base = analytical_model_with_scaling(Some(
             "  obs_scale[CMT=1] = 1000\n  obs_scale[CMT=2] = 1\n",
         ));
         let src = base.replace("gradient = fd", "gradient = ad");
-        let err = parse_model_string(&src).expect_err("per-CMT + gradient = ad must be rejected");
-        assert!(
-            err.to_lowercase().contains("per-cmt") && err.contains("gradient = fd"),
-            "expected per-CMT + AD rejection, got: {}",
-            err
-        );
+        parse_model_string(&src).expect("per-CMT obs_scale + gradient = ad now parses");
     }
 
     #[test]

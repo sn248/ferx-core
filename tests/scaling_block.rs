@@ -331,3 +331,73 @@ fn per_cmt_scaling_missing_cmt_errors_at_fit() {
         msg
     );
 }
+
+#[test]
+fn per_cmt_scaling_works_with_ad_gradient() {
+    // Phase 2.5: PerCmt + gradient = ad now goes through the per-observation
+    // scale array in `inner_optimizer::build_scale_array_for_ad`. The fit
+    // must complete (no parse error, no runtime panic), produce a finite
+    // OFV, AND actually use AD (not silently fall back to FD).
+    //
+    // `fit()` does NOT propagate `opts.gradient_method` to
+    // `model.gradient_method` — the inner loop reads `model.gradient_method`
+    // which is set by the parser from the `[fit_options]` block. So the
+    // model source must hardcode `gradient = ad`. (Caught by Copilot
+    // review on PR #85.)
+    use ferx_core::{fit, FitOptions};
+
+    let mut src = String::from(ANALYTICAL_BASE).replace("gradient = fd", "gradient = ad");
+    src.push_str("\n[scaling]\n  obs_scale[CMT=1] = 1000\n  obs_scale[CMT=2] = 2\n");
+    let model = parse_model_string(&src).expect("PerCmt + AD model parses");
+
+    let pop = two_cmt_pop();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let res = fit(&model, &pop, &model.default_params, &opts)
+        .expect("PerCmt + AD fit must complete without errors");
+    assert!(
+        res.ofv.is_finite(),
+        "PerCmt + AD OFV must be finite, got {}",
+        res.ofv
+    );
+    // The inner-loop gradient should report Enzyme AD when the autodiff
+    // feature is on. Under `--features ci` (no autodiff) it falls back to
+    // FD and the check below is skipped; we want the explicit assertion
+    // when CI runs the autodiff feature in a separate job.
+    #[cfg(feature = "autodiff")]
+    assert_eq!(
+        res.gradient_method_inner, "Enzyme AD",
+        "expected inner-loop AD, got {}",
+        res.gradient_method_inner
+    );
+}
+
+#[test]
+fn form_b_expression_scaling_works_with_ad_gradient() {
+    // Phase 2.5: ExpressionScale + gradient = ad also lifts (same
+    // machinery — subject-static per-obs scale array). Verifies the
+    // wiring on the Form B path. See `per_cmt_scaling_works_with_ad_gradient`
+    // for why the model string must hardcode `gradient = ad`.
+    use ferx_core::{fit, FitOptions};
+
+    let mut src = String::from(ANALYTICAL_BASE).replace("gradient = fd", "gradient = ad");
+    src.push_str("\n[scaling]\n  obs_scale = TVV / 10\n");
+    let model = parse_model_string(&src).expect("ExpressionScale + AD model parses");
+
+    let pop = one_subject_pop();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let res = fit(&model, &pop, &model.default_params, &opts)
+        .expect("ExpressionScale + AD fit must complete without errors");
+    assert!(
+        res.ofv.is_finite(),
+        "ExpressionScale + AD OFV must be finite, got {}",
+        res.ofv
+    );
+    #[cfg(feature = "autodiff")]
+    assert_eq!(
+        res.gradient_method_inner, "Enzyme AD",
+        "expected inner-loop AD, got {}",
+        res.gradient_method_inner
+    );
+}

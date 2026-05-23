@@ -7,8 +7,10 @@
 # EBE η (subject-static).
 #
 # Form B can also reference thetas, etas, and covariates (e.g.
-# `obs_scale = WT / 70`). `[scaling] obs_scale = <expr>` + `gradient = ad`
-# is rejected at parse time; use `gradient = fd` (set here explicitly).
+# `obs_scale = WT / 70`). Works with both `gradient = ad` and
+# `gradient = fd`: AD uses a subject-static per-observation scale array
+# (exact for eta-independent scales like this one). See
+# `docs/src/model-file/scaling.md` for the subject-static caveat.
 
 [parameters]
   theta TVCL(5.0,  0.1,  50.0)
@@ -35,5 +37,4 @@
 [fit_options]
   method     = focei
   maxiter    = 300
-  covariance = true
-  gradient   = fd               # required for expression-form obs_scale
+  covariance = true             # AD is fine here; FD also works.

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-b02da9c0.js";
+            window.path_to_searchindex_js = "../searchindex-07ef4905.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-3a934816.js"></script>
@@ -259,14 +259,32 @@ fit.</p>
 <p>The ferx form is divisive by convention, so an <code>obs_scale = V/1000</code>
 reads as “divide raw by V/1000” — matching NONMEM’s <code>S2</code>.</p>
 <h2 id="interaction-with-gradients-ad-vs-fd"><a class="header" href="#interaction-with-gradients-ad-vs-fd">Interaction with gradients (AD vs FD)</a></h2>
-<ul>
-<li>Scalar <code>obs_scale = K</code> works with both <code>gradient = ad</code> and
-<code>gradient = fd</code>. The constant is threaded through the AD entry points
-as a <code>Const</code> argument.</li>
-<li>Expression <code>obs_scale = &lt;expr&gt;</code> is supported only with
-<code>gradient = fd</code> in Phase 1. The parser rejects the combination of
-expression scaling with AD gradients and prints the required flag.</li>
-</ul>
+<p>All <code>[scaling]</code> variants on the <strong>analytical PK path</strong> support both
+<code>gradient = ad</code> and <code>gradient = fd</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Form</th><th>AD</th><th>FD</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>Scalar <code>obs_scale = K</code></td><td>✓ exact</td><td>✓ exact</td><td>The constant threads as a <code>Const</code> slice (one entry per obs).</td></tr>
+<tr><td>Expression <code>obs_scale = &lt;expr&gt;</code></td><td>✓ subject-static</td><td>✓ exact</td><td>See subject-static caveat below.</td></tr>
+<tr><td>Per-CMT <code>obs_scale[CMT=N]</code></td><td>✓ subject-static</td><td>✓ exact</td><td>One per-obs scale entry per observation, dispatched by <code>subject.obs_cmts[i]</code>.</td></tr>
+<tr><td>Form C <code>y[…] = &lt;expr&gt;</code> (ODE only)</td><td>✗ — forces <code>gradient = fd</code></td><td>✓</td><td>Form C only exists on ODE models, where the AD path is not available regardless of scaling.</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Subject-static caveat (Expression / per-CMT under AD).</strong> The
+per-observation scale array passed to the AD entry points is
+materialised from a single subject-static <code>pk_param_fn</code> evaluation —
+the same simplification documented for the FD path’s <code>apply_scaling</code>.
+This means AD treats the scale as constant w.r.t. eta. For the common
+eta-independent scale (<code>WT/70</code>, <code>TVV/1000</code>, or <code>V</code> reading the EBE
+value) the AD and FD gradients are identical. For the rare case of a
+scale expression that explicitly references eta (e.g.
+<code>obs_scale = exp(ETA_V)</code>), the AD gradient ignores that dependence
+while FD captures it numerically — set <code>gradient = fd</code> if you need the
+eta sensitivity in the gradient.</p>
 <h2 id="interaction-with-sde--diffusion"><a class="header" href="#interaction-with-sde--diffusion">Interaction with SDE / <code>[diffusion]</code></a></h2>
 <p>In Phase 1, <code>[scaling]</code> is <strong>not supported</strong> on SDE models. The EKF /
 Kalman update computes both the predicted mean and the prediction
@@ -308,11 +326,18 @@ Every observed CMT must have an `obs_scale[CMT=N]` (or `y[CMT=N]` for ODE) entry
 form (<code>obs_scale[CMT=N] = K</code>) are mutually exclusive within the same
 group. The parser rejects mixing them so the user is explicit about
 intent. The same rule applies to <code>y</code> and <code>y[CMT=N]</code>.</p>
-<p><strong>Gradients</strong> — per-CMT scaling forces <code>gradient = fd</code>. The AD path
-takes a single <code>Const</code> scale factor per subject; supporting per-CMT
-scales under AD requires threading per-observation scale arrays through
-the AD entry points and is deferred to a future PR. Parser rejects
-<code>PerCmt + gradient = ad</code> with a <code>gradient = fd</code> hint.</p>
+<p><strong>Gradients</strong> — per-CMT <code>obs_scale[CMT=N]</code> works with both
+<code>gradient = ad</code> and <code>gradient = fd</code>. The AD path materialises a
+per-observation scale array (one entry per obs in the subject) from a
+subject-static <code>pk_param_fn</code> evaluation and passes it to the AD entry
+points as a <code>Const</code> slice. See <a href="#interaction-with-gradients-ad-vs-fd">AD interaction</a>
+below for the subject-static caveat that applies to all expression-form
+scales.</p>
+<p>Form C per-CMT (<code>y[CMT=N] = &lt;expr&gt;</code>) still requires <code>gradient = fd</code> —
+not because of the per-CMT dispatch but because Form C only exists on
+ODE models, and the AD path requires the analytical PK path
+(<code>tv_fn.is_some()</code>). The parser rejects <code>Form C + gradient = ad</code> with a
+clear hint.</p>
 
                     </main>
 

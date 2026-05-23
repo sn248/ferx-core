@@ -161,6 +161,15 @@ pub fn hmc_step(
         let obs = subject.observations.clone();
 
         let grad_fn = |q: &[f64]| -> Vec<f64> {
+            // Per-event scale array — q is the eta proposal, matches the
+            // pattern in `inner_optimizer::find_ebe`.
+            let event_scale = crate::estimation::inner_optimizer::build_event_scale_array_for_ad(
+                model,
+                subject,
+                &event_data,
+                theta,
+                q,
+            );
             let (nll, g) = event_driven_ad::compute_nll_gradient_event_driven_ad(
                 q,
                 &tv_per_event,
@@ -174,7 +183,7 @@ pub fn hmc_step(
                 model.error_model,
                 &model.pk_idx_f64,
                 &model.sel_flat,
-                model.scaling.scalar_for_ad(),
+                &event_scale,
             );
             last_nll.set(nll);
             g
@@ -193,6 +202,10 @@ pub fn hmc_step(
         let obs_times = subject.obs_times.clone();
 
         let grad_fn = |q: &[f64]| -> Vec<f64> {
+            // Per-observation scale array (single-snapshot AD path).
+            let obs_scale = crate::estimation::inner_optimizer::build_scale_array_for_ad(
+                model, subject, theta, q,
+            );
             let (nll, g) = compute_nll_gradient_ad(
                 q,
                 &tv_adjusted,
@@ -207,7 +220,7 @@ pub fn hmc_step(
                 model.error_model,
                 &model.pk_idx_f64,
                 &model.sel_flat,
-                model.scaling.scalar_for_ad(),
+                &obs_scale,
             );
             last_nll.set(nll);
             g

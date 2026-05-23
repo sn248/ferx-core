@@ -10,6 +10,75 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "autodiff")]
 use crate::ad::ad_gradients::{self, FlatDoseData};
 
+/// Materialise the per-observation `obs_scale` array for one subject,
+/// suitable for passing to the analytical AD entry points
+/// (`individual_nll_ad`, `predict_all_ad`) as a `Const` slice.
+///
+/// Computes pk once per call only when `model.scaling.needs_pk_eval()`
+/// — i.e. there's at least one `ExpressionScale` closure (top level or
+/// nested in `PerCmt`) that consults pk. Scalar-only scaling skips the
+/// pk_param_fn call (which can be expensive on models with parsed
+/// expressions or NN forward passes). (Caught by Copilot review on PR
+/// #85.)
+#[cfg(feature = "autodiff")]
+pub(crate) fn build_scale_array_for_ad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<f64> {
+    let pk_owned;
+    let pk_ref: &PkParams = if model.scaling.needs_pk_eval() {
+        pk_owned = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        &pk_owned
+    } else {
+        // Safe placeholder: no ExpressionScale closure will fire when
+        // needs_pk_eval() is false, so pk values are never read.
+        static DEFAULT_PK: PkParams = PkParams {
+            values: [0.0; crate::types::MAX_PK_PARAMS],
+        };
+        &DEFAULT_PK
+    };
+    model
+        .scaling
+        .build_obs_scale_array(theta, eta, &subject.covariates, pk_ref, &subject.obs_cmts)
+}
+
+/// Build a per-event scale array for the event-driven AD entry points
+/// (`individual_nll_event_driven_ad`, `predict_all_event_driven_ad`).
+///
+/// Length = `event_data.event_times.len()`. Obs events (`event_kinds[i]`
+/// in (0.5, 1.5)) get the corresponding per-observation scale; non-obs
+/// events (dose, pk-only) get `1.0`. Padding non-obs entries to `1.0` is
+/// essential — the AD body divides `conc / obs_scale[ev_idx]` for every
+/// event before the `is_obs` mask drops the non-obs contributions, and
+/// NaN/0 in a non-obs slot would propagate through the masked add as NaN
+/// (per IEEE 754 `0 * NaN = NaN`).
+#[cfg(feature = "autodiff")]
+pub(crate) fn build_event_scale_array_for_ad(
+    model: &CompiledModel,
+    subject: &Subject,
+    event_data: &crate::ad::event_driven_ad::FlatEventData,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<f64> {
+    let obs_scales = build_scale_array_for_ad(model, subject, theta, eta);
+    let n_events = event_data.event_times.len();
+    let mut event_scales = vec![1.0; n_events];
+    for ev_idx in 0..n_events {
+        // event_kinds: 0 = dose, 1 = obs, 2 = pk-only. Only obs entries
+        // route to the per-observation scale; everything else stays 1.0.
+        let kind = event_data.event_kinds[ev_idx];
+        if kind > 0.5 && kind < 1.5 {
+            let obs_idx = event_data.event_orig_idx_f64[ev_idx] as usize;
+            if let Some(&s) = obs_scales.get(obs_idx) {
+                event_scales[ev_idx] = s;
+            }
+        }
+    }
+    event_scales
+}
+
 /// Resolve [`GradientMethod::Auto`] to a concrete AD/FD choice for this model.
 /// Returns `true` for AD, `false` for FD.
 ///
@@ -399,6 +468,7 @@ pub fn find_ebe(
                     let eta_t: Vec<f64> =
                         p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
                     let t0 = std::time::Instant::now();
+                    let obs_scale = build_scale_array_for_ad(model, subject, &params.theta, &eta_t);
                     let (_, g) = ad_gradients::compute_nll_gradient_ad(
                         &eta_t,
                         tv_adjusted,
@@ -413,7 +483,7 @@ pub fn find_ebe(
                         model.error_model,
                         &model.pk_idx_f64,
                         &model.sel_flat,
-                        model.scaling.scalar_for_ad(),
+                        &obs_scale,
                     );
                     GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
                     g
@@ -427,6 +497,13 @@ pub fn find_ebe(
                     let eta_t: Vec<f64> =
                         p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
                     let t0 = std::time::Instant::now();
+                    let event_scale = build_event_scale_array_for_ad(
+                        model,
+                        subject,
+                        event_data,
+                        &params.theta,
+                        &eta_t,
+                    );
                     let (_, g) = crate::ad::event_driven_ad::compute_nll_gradient_event_driven_ad(
                         &eta_t,
                         tv_per_event,
@@ -440,7 +517,7 @@ pub fn find_ebe(
                         model.error_model,
                         &model.pk_idx_f64,
                         &model.sel_flat,
-                        model.scaling.scalar_for_ad(),
+                        &event_scale,
                     );
                     GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
                     g
@@ -485,6 +562,7 @@ pub fn find_ebe(
             let tv_adjusted = ad_tv_adjusted.as_ref().unwrap();
             let dose_data = ad_dose_data.as_ref().unwrap();
             let t0 = std::time::Instant::now();
+            let obs_scale = build_scale_array_for_ad(model, subject, &params.theta, &eta_true);
             let j = ad_gradients::compute_jacobian_ad(
                 &eta_true,
                 tv_adjusted,
@@ -494,7 +572,7 @@ pub fn find_ebe(
                 model.pk_model,
                 &model.pk_idx_f64,
                 &model.sel_flat,
-                model.scaling.scalar_for_ad(),
+                &obs_scale,
             );
             GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
             j
@@ -507,6 +585,13 @@ pub fn find_ebe(
             let event_data = ad_event_data.as_ref().unwrap();
             let tv_per_event = ad_tv_per_event.as_ref().unwrap();
             let t0 = std::time::Instant::now();
+            let event_scale = build_event_scale_array_for_ad(
+                model,
+                subject,
+                event_data,
+                &params.theta,
+                &eta_true,
+            );
             let j = crate::ad::event_driven_ad_jac::compute_jacobian_event_driven_ad(
                 &eta_true,
                 tv_per_event,
@@ -515,7 +600,7 @@ pub fn find_ebe(
                 model.pk_model,
                 &model.pk_idx_f64,
                 &model.sel_flat,
-                model.scaling.scalar_for_ad(),
+                &event_scale,
             );
             GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
             j

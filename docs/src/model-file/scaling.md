@@ -99,12 +99,27 @@ reads as "divide raw by V/1000" — matching NONMEM's `S2`.
 
 ## Interaction with gradients (AD vs FD)
 
-- Scalar `obs_scale = K` works with both `gradient = ad` and
-  `gradient = fd`. The constant is threaded through the AD entry points
-  as a `Const` argument.
-- Expression `obs_scale = <expr>` is supported only with
-  `gradient = fd` in Phase 1. The parser rejects the combination of
-  expression scaling with AD gradients and prints the required flag.
+All `[scaling]` variants on the **analytical PK path** support both
+`gradient = ad` and `gradient = fd`:
+
+| Form | AD | FD | Notes |
+|---|---|---|---|
+| Scalar `obs_scale = K` | ✓ exact | ✓ exact | The constant threads as a `Const` slice (one entry per obs). |
+| Expression `obs_scale = <expr>` | ✓ subject-static | ✓ exact | See subject-static caveat below. |
+| Per-CMT `obs_scale[CMT=N]` | ✓ subject-static | ✓ exact | One per-obs scale entry per observation, dispatched by `subject.obs_cmts[i]`. |
+| Form C `y[…] = <expr>` (ODE only) | ✗ — forces `gradient = fd` | ✓ | Form C only exists on ODE models, where the AD path is not available regardless of scaling. |
+
+**Subject-static caveat (Expression / per-CMT under AD).** The
+per-observation scale array passed to the AD entry points is
+materialised from a single subject-static `pk_param_fn` evaluation —
+the same simplification documented for the FD path's `apply_scaling`.
+This means AD treats the scale as constant w.r.t. eta. For the common
+eta-independent scale (`WT/70`, `TVV/1000`, or `V` reading the EBE
+value) the AD and FD gradients are identical. For the rare case of a
+scale expression that explicitly references eta (e.g.
+`obs_scale = exp(ETA_V)`), the AD gradient ignores that dependence
+while FD captures it numerically — set `gradient = fd` if you need the
+eta sensitivity in the gradient.
 
 ## Interaction with SDE / `[diffusion]`
 
@@ -161,8 +176,16 @@ form (`obs_scale[CMT=N] = K`) are mutually exclusive within the same
 group. The parser rejects mixing them so the user is explicit about
 intent. The same rule applies to `y` and `y[CMT=N]`.
 
-**Gradients** — per-CMT scaling forces `gradient = fd`. The AD path
-takes a single `Const` scale factor per subject; supporting per-CMT
-scales under AD requires threading per-observation scale arrays through
-the AD entry points and is deferred to a future PR. Parser rejects
-`PerCmt + gradient = ad` with a `gradient = fd` hint.
+**Gradients** — per-CMT `obs_scale[CMT=N]` works with both
+`gradient = ad` and `gradient = fd`. The AD path materialises a
+per-observation scale array (one entry per obs in the subject) from a
+subject-static `pk_param_fn` evaluation and passes it to the AD entry
+points as a `Const` slice. See [AD interaction](#interaction-with-gradients-ad-vs-fd)
+below for the subject-static caveat that applies to all expression-form
+scales.
+
+Form C per-CMT (`y[CMT=N] = <expr>`) still requires `gradient = fd` —
+not because of the per-CMT dispatch but because Form C only exists on
+ODE models, and the AD path requires the analytical PK path
+(`tv_fn.is_some()`). The parser rejects `Form C + gradient = ad` with a
+clear hint.

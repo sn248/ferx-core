@@ -8,8 +8,11 @@
 # but fit() validates coverage at startup and errors with a clear
 # message naming any missing CMTs.
 #
-# Per-CMT scaling forces `gradient = fd`. AD support for per-observation
-# scale arrays is a separate follow-up.
+# `gradient = fd` is required because this example uses Form C (the
+# `y[CMT=N] = ...` readout — ODE-only, no AD path). Per-CMT
+# `obs_scale[CMT=N] = K` (Forms A/B post-multiply) DOES support AD via
+# the per-observation scale array — see `scaling_expression.ferx` and
+# `docs/src/model-file/scaling.md` for the gradient-method matrix.
 
 [parameters]
   theta TVCL(5.0,  0.1,  50.0)

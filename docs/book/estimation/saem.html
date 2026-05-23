@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-229bf832.js";
+            window.path_to_searchindex_js = "../searchindex-07ef4905.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-e4fdb3a6.js"></script>
+        <script src="../toc-3a934816.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -178,7 +178,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="saem"><a class="header" href="#saem">SAEM</a></h1>
-<p>Stochastic Approximation Expectation-Maximization (SAEM) is an alternative estimation method that uses MCMC sampling for random effects instead of MAP optimization. It is more robust to local minima and can handle complex random effect structures.</p>
+<p>Stochastic Approximation Expectation-Maximization (SAEM) is an alternative estimation method that uses MCMC sampling for random effects instead of MAP optimization. It is more robust to local minima and can handle complex random effect structures, including models with <strong>inter-occasion variability (IOV)</strong>.</p>
 <h2 id="algorithm-overview"><a class="header" href="#algorithm-overview">Algorithm Overview</a></h2>
 <p>SAEM replaces the deterministic inner loop of FOCE with stochastic sampling, following the Monolix convention with a two-phase step-size schedule.</p>
 <h3 id="references"><a class="header" href="#references">References</a></h3>
@@ -249,6 +249,20 @@
 <li><strong>Covariance Step</strong>: Optionally compute standard errors via finite-difference Hessian (same method as FOCE)</li>
 <li><strong>Diagnostics</strong>: Compute PRED, IPRED, CWRES, IWRES for each subject</li>
 </ol>
+<p>For sparsely-sampled data where the Laplace OFV is biased, you can
+append an importance-sampling stage that estimates <code>−2 log L</code> by Monte
+Carlo:</p>
+<pre><code>method = [saem, imp]
+</code></pre>
+<p>See <a href="importance-sampling.html">Importance Sampling (IMP)</a>.</p>
+<h2 id="inter-occasion-variability-iov"><a class="header" href="#inter-occasion-variability-iov">Inter-Occasion Variability (IOV)</a></h2>
+<p><code>method = saem</code> supports models with <code>kappa</code> declarations (<code>n_kappa &gt; 0</code>). IOV is handled with a per-occasion Gibbs Metropolis-Hastings step interleaved with the standard eta MH:</p>
+<ul>
+<li><strong>E-step</strong>: After sampling \( \eta \), one MH proposal is made for each occasion’s \( \kappa_k \). Both the eta and kappa samplers target the correct conditional distributions: \( p(\eta | \kappa, \theta, \text{data}) \) and \( p(\kappa_k | \eta, \theta, \text{data}) \) respectively.</li>
+<li><strong>SA update</strong>: \( S_2^{\text{iov}} \leftarrow (1 - \gamma_k) S_2^{\text{iov}} + \gamma_k \cdot \frac{1}{N_{\text{occ}}} \sum_i \sum_k \kappa_{ik} \kappa_{ik}^T \)</li>
+<li><strong>M-step</strong>: \( \Omega_{\text{iov}} = S_2^{\text{iov}} \) (analytic update, same structure as the BSV omega M-step).</li>
+</ul>
+<p>No additional configuration is required; <code>method = saem</code> works for both BSV-only and IOV models.</p>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
 <pre><code>[fit_options]
   method        = saem

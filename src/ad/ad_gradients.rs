@@ -46,7 +46,7 @@ pub fn individual_nll_ad(
     pk_idx_f64: &[f64],    // PK parameter indices as f64 (cast to usize inside)
     sel_flat: &[f64],      // n_tv × n_eta row-major one-hot eta selector
     pk_and_err_model: f64, // pk_model_id * 10 + error_model_id
-    obs_scale: f64,        // `[scaling] obs_scale = K` → conc /= K (1.0 = no-op)
+    obs_scale: &[f64],     // per-observation divisor (len = n_obs). All-ones = no-op.
 ) -> f64 {
     let n_eta = eta.len();
     let n_tv = tv.len();
@@ -115,7 +115,7 @@ pub fn individual_nll_ad(
         if conc < 0.0 {
             conc = 0.0;
         }
-        conc /= obs_scale;
+        conc /= obs_scale[obs_idx];
 
         let v = residual_variance_ad(error_model_id, conc, sigma_values);
         if cens_f64[obs_idx] > 0.5 {
@@ -198,7 +198,7 @@ pub fn predict_all_ad(
     pk_idx_f64: &[f64], // PK parameter indices as f64 (cast to usize inside)
     sel_flat: &[f64],   // n_tv × n_eta row-major one-hot eta selector
     pk_model_id: f64,
-    obs_scale: f64, // `[scaling] obs_scale = K` → pred /= K (1.0 = no-op)
+    obs_scale: &[f64], // per-observation divisor (len = n_obs). All-ones = no-op.
     out: &mut [f64],
 ) {
     let n_eta = eta.len();
@@ -247,7 +247,7 @@ pub fn predict_all_ad(
             }
         }
         let positive = if conc > 0.0 { conc } else { 0.0 };
-        out[obs_idx] = positive / obs_scale;
+        out[obs_idx] = positive / obs_scale[obs_idx];
     }
 }
 
@@ -622,7 +622,7 @@ pub fn compute_nll_gradient_ad(
     error_model: ErrorModel,
     pk_idx_f64: &[f64],
     sel_flat: &[f64],
-    obs_scale: f64,
+    obs_scale: &[f64],
 ) -> (f64, Vec<f64>) {
     let n_eta = eta.len();
     let mut d_eta = vec![0.0f64; n_eta];
@@ -664,7 +664,7 @@ pub fn compute_jacobian_ad(
     pk_model: PkModel,
     pk_idx_f64: &[f64],
     sel_flat: &[f64],
-    obs_scale: f64,
+    obs_scale: &[f64],
 ) -> nalgebra::DMatrix<f64> {
     let n_eta = eta.len();
     let pk_id = pk_model_to_id(pk_model) as f64;

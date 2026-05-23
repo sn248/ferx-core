@@ -164,9 +164,13 @@ pub fn one_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v: f64) -> f64 {
     let r_over_cl = rate / cl;
     let one_minus_e_kt_inf = 1.0 - (-k * t_inf).exp();
     // Contribution from past pulses (n ≥ 1) is always "after-infusion"
-    // because τ + n·II ≥ II ≥ T_inf.
-    let past_pulses =
-        r_over_cl * one_minus_e_kt_inf * (-k * (t - t_inf)).exp() * (-k * ii).exp() / denom;
+    // because τ + n·II ≥ II ≥ T_inf. The combined exponent
+    // `exp(-k·(t + II - t_inf))` is ≤ 1 for the in-range domain
+    // (t ≥ 0, t_inf ≤ II), so collapse the two `.exp()` calls into one
+    // to avoid an `inf * 0 = NaN` intermediate when k·(t_inf - t) is
+    // large and k·II is also large (would only arise outside realistic
+    // PK ranges, but cheaper to write defensively than to debug later).
+    let past_pulses = r_over_cl * one_minus_e_kt_inf * (-k * (t + ii - t_inf)).exp() / denom;
     if t <= t_inf {
         // n=0 is during the current infusion.
         r_over_cl * (1.0 - (-k * t).exp()) + past_pulses

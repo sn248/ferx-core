@@ -656,11 +656,14 @@ fn fit_inner(
     // ODE-based (numerical pre-equilibration via per-cycle pulse expansion
     // in `equilibrate_ss_state`), and event-driven (TV-cov; analytical
     // pulse expansion in `equilibrate_ss_state_event_driven`). The
-    // remaining warnings catch malformed SS rows that the SS code paths
-    // can't handle and silently zero out:
-    //   - SS=1 with II ≤ 0 (missing or invalid interval)
+    // remaining warnings catch malformed SS rows where the prediction
+    // code can't honour the SS semantic and instead falls back to
+    // treating the dose as if SS=0:
+    //   - SS=1 with II ≤ 0 (missing/invalid interval — SS branch is gated
+    //     on `dose.ii > 0`, so the dose is treated as a single dose)
     //   - SS=1 infusion with T_inf > II (overlapping pulses — no closed
-    //     form, no equilibration scheme)
+    //     form or equilibration scheme; the equilibration call returns
+    //     zero preload, then the dose is applied as a single infusion)
     let n_ss_bad_ii = population
         .subjects
         .iter()
@@ -669,8 +672,9 @@ fn fit_inner(
     if n_ss_bad_ii > 0 {
         accumulated_warnings.push(format!(
             "{} subject(s) have SS=1 doses with missing or non-positive II. \
-             SS predictions require II > 0 — affected dose contributions are \
-             silently zero. Set II in the dataset or remove the SS flag.",
+             SS predictions require II > 0 — these doses are treated as \
+             non-SS (no steady-state pre-equilibration). Set II in the \
+             dataset or remove the SS flag.",
             n_ss_bad_ii
         ));
     }
@@ -686,8 +690,11 @@ fn fit_inner(
     if n_ss_overlapping_inf > 0 {
         accumulated_warnings.push(format!(
             "{} subject(s) have SS=1 infusions with T_inf > II (overlapping \
-             pulses). No closed-form SS covers this case; predictions are 0 \
-             for those contributions. Use a shorter infusion or remove SS.",
+             pulses). No closed form or pulse-expansion scheme covers this \
+             case — the SS pre-equilibration is skipped and the dose is \
+             applied as a single (non-SS) infusion, so the system is not at \
+             steady state at the dose time. Use a shorter infusion (T_inf \
+             ≤ II) or remove the SS flag.",
             n_ss_overlapping_inf
         ));
     }

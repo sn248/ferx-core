@@ -216,23 +216,24 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
         let t_start = break_times[k];
         let t_end = break_times[k + 1];
 
-        // Steady-state (SS=1) dose handling: at the moment of an SS dose,
-        // reset state and load it with the SS amount from the infinite-
-        // past pulse train. The SS dose's own pulse is then applied below
-        // through the normal bolus/active-infusion flow. See
-        // `equilibrate_ss_state` for the per-cycle scheme and the
-        // governing semantic.
+        // Apply dose effects at t_start in a single pass over the dose
+        // list. Ordering inside the pass matters:
+        //   1. SS=1 + II > 0: pre-equilibrate by overwriting state with
+        //      the SS amount from the infinite-past pulse train (see
+        //      `equilibrate_ss_state`).
+        //   2. Bolus (non-infusion): instantaneous amount jump in the
+        //      dose's compartment, applied on top of any SS preload.
+        // Infusions don't add to state at t_start — they're injected as
+        // a derivative term inside the integrator (see `active_infusions`
+        // + wrapped RHS below).
         for dose in &subject.doses {
-            if dose.ss && dose.ii > 0.0 && (dose.time + lagtime - t_start).abs() < 1e-12 {
+            if (dose.time + lagtime - t_start).abs() >= 1e-12 {
+                continue;
+            }
+            if dose.ss && dose.ii > 0.0 {
                 u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
             }
-        }
-
-        // Apply bolus doses at t_start. Infusions don't add to state
-        // instantaneously — they're injected as a derivative term inside
-        // the integrator (see `active_infusions` + wrapped RHS below).
-        for dose in &subject.doses {
-            if (dose.time + lagtime - t_start).abs() < 1e-12 && !is_real_infusion(dose) {
+            if !is_real_infusion(dose) {
                 // dose.cmt is 1-based; state indices are 0-based
                 let cmt_idx = dose.cmt - 1;
                 if cmt_idx < n {

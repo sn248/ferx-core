@@ -244,6 +244,25 @@ impl OdeSpec {
     }
 }
 
+impl OdeReadout {
+    /// Returns true when this readout cannot be paired with `gradient = ad`.
+    ///
+    /// Both Form C variants (`Single` and `PerCmt`) call arbitrary
+    /// user-defined closures at each observation. The analytical AD entry
+    /// points take only a single `Const f64` scale and cannot evaluate
+    /// closures over theta/eta — there's no AD path for Form C. At runtime
+    /// `model.tv_fn` is `None` for any ODE model anyway, so AD silently
+    /// falls back to FD. The parse-time guard surfaces that fallback as a
+    /// clear error rather than silently demoting the user's `gradient = ad`
+    /// choice.
+    pub fn requires_fd(&self) -> bool {
+        match self {
+            OdeReadout::ObsCmt(_) => false,
+            OdeReadout::Single(_) | OdeReadout::PerCmt(_) => true,
+        }
+    }
+}
+
 /// Compute ODE-based predictions for a single subject.
 ///
 /// `pk_params_flat` is a flat array of PK parameters passed to the RHS function.
@@ -398,9 +417,15 @@ pub fn ode_predictions(
         }
     }
 
-    // Clamp negatives
+    // Clamp negative predictions to zero (ODE solver overshoot guard).
+    // NaN intentionally NOT clamped — it propagates to a NaN OFV so the
+    // outer optimizer rejects the step, matching the analytical path's
+    // `conc.max(0.0)` semantic (NaN survives `.max(0.0)` per IEEE 754).
+    // This is also what surfaces a missing `OdeReadout::PerCmt` entry as
+    // a loud failure rather than a silent zero. (Pre-Phase-2 the clamp
+    // included NaN; Copilot's review of #84 caught the inconsistency.)
     for p in &mut predictions {
-        if *p < 0.0 || p.is_nan() {
+        if *p < 0.0 {
             *p = 0.0;
         }
     }
@@ -570,7 +595,12 @@ pub fn ode_predictions_event_driven(
                     &subject.covariates,
                     cmt,
                 );
-                predictions[idx] = if v.is_nan() || v < 0.0 { 0.0 } else { v };
+                // Clamp negative readouts (ODE solver overshoot guard);
+                // let NaN through so a missing `OdeReadout::PerCmt` entry
+                // (or any other genuine NaN) surfaces as a NaN OFV
+                // rather than a silent zero. See the corresponding note
+                // in `ode_predictions`.
+                predictions[idx] = if v < 0.0 { 0.0 } else { v };
                 last_pk = pk_now;
             }
             Kind::PkOnly => {
@@ -1264,6 +1294,72 @@ mod tests {
             "output_fn must change the readout (ref={} c={})",
             preds_ref_v5[0],
             preds_c_v5[0]
+        );
+    }
+
+    /// Regression for Copilot review on PR #84: pre-Phase-2 the ODE paths
+    /// clamped NaN predictions to 0 at the end of `ode_predictions` (and
+    /// at the Obs branch of `ode_predictions_event_driven`). That defeated
+    /// the "loud failure" semantic for `OdeReadout::PerCmt` missing
+    /// entries (and for any other genuine NaN). The clamp now only
+    /// touches negatives; NaN propagates.
+    #[test]
+    fn test_ode_predictions_propagates_nan_from_readout() {
+        // Build an OdeReadout::PerCmt that DELIBERATELY returns NaN for
+        // CMT=1 — emulating a missing-CMT lookup that bypassed pre-fit
+        // validation. The resulting prediction must be NaN, not 0.
+        let mut map: HashMap<usize, OdeOutputFn> = HashMap::new();
+        map.insert(
+            1,
+            Box::new(|_state: &[f64], _pk: &[f64], _theta, _eta, _cov| f64::NAN),
+        );
+        let mut ode = one_cpt_ode_spec();
+        ode.readout = OdeReadout::PerCmt(map);
+
+        let pk = pk_one(5.0, 80.0);
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![1.0, 4.0];
+        let subj = make_subject(doses, obs_times);
+
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+        for (j, p) in preds.iter().enumerate() {
+            assert!(
+                p.is_nan(),
+                "obs {} from a NaN-returning readout must be NaN, got {}",
+                j,
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn test_ode_predictions_still_clamps_negatives() {
+        // Sanity: dropping the NaN clamp must not change the negative
+        // clamp behavior (ODE solver overshoot guard).
+        let ode = OdeSpec {
+            // dA/dt = -1 → state goes negative quickly with starting amount 1
+            rhs: Box::new(|_y, _p, _t, dy| {
+                dy[0] = -1.0;
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+        };
+        let pk = pk_one(1.0, 1.0);
+        let doses = vec![DoseEvent::new(0.0, 1.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![10.0]; // dose=1, after 10s of -1/s → state = -9
+        let subj = make_subject(doses, obs_times);
+
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+        assert!(
+            !preds[0].is_nan(),
+            "negative readout must be clamped to 0, not NaN"
+        );
+        assert!(
+            preds[0] >= 0.0,
+            "negative readout must be clamped to 0, got {}",
+            preds[0]
         );
     }
 }

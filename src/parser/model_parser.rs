@@ -1298,32 +1298,44 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
         // AD compatibility check: the analytical AD path threads a single
         // f64 scale into `individual_nll_ad` as a `Const`, which can't
-        // evaluate an expression that touches theta/eta (ExpressionScale)
-        // or vary per observation (PerCmt). Both force `gradient = fd`.
-        // (gradient_method resolution happens at fit time when `Auto`
-        // defaults to AD if `tv_fn.is_some()`, so we conservatively reject
-        // both `Ad` and `Auto` here.)
+        // evaluate user closures over theta/eta/states or vary per
+        // observation. ExpressionScale, ScalingSpec::PerCmt, and either
+        // Form C variant (OdeReadout::Single / PerCmt) all force
+        // `gradient = fd`. (gradient_method resolution happens at fit time
+        // when `Auto` defaults to AD if `tv_fn.is_some()`, so we
+        // conservatively reject both `Ad` and `Auto` here.)
+        //
+        // The ODE readout check uses `output_fn` (the just-parsed
+        // Option<OdeReadout>) rather than `model.ode_spec.readout` because
+        // the latter is still the build_ode_spec placeholder at this
+        // point — Form C wiring happens just below. (Found by Copilot
+        // review on PR #84: the original check only looked at `scaling`,
+        // so a Form C model with `ScalingSpec::None` could request
+        // `gradient = ad` without a clear error and silently fall back to
+        // FD via `model.tv_fn.is_none()` at runtime.)
         let ad_explicit = fit_options.gradient_method == GradientMethod::Ad;
         let ad_auto_likely = fit_options.gradient_method == GradientMethod::Auto
             && model.tv_fn.is_some()
             && cfg!(feature = "autodiff");
-        if scaling.requires_fd() && (ad_explicit || ad_auto_likely) {
-            let (kind, hint) = match &scaling {
-                ScalingSpec::ExpressionScale { .. } => (
-                    "expression-form `obs_scale = <expr>`",
-                    "rewrite as a scalar `obs_scale = <number>`",
-                ),
-                ScalingSpec::PerCmt(_) => (
-                    "per-CMT `obs_scale[CMT=N]` / `y[CMT=N]`",
-                    "use a single uniform `obs_scale = <number>` if all observed CMTs share a scale",
-                ),
-                // requires_fd is false for None / ScalarScale.
-                _ => unreachable!("requires_fd only true for ExpressionScale and PerCmt"),
+        let readout_needs_fd = output_fn.as_ref().map(|r| r.requires_fd()).unwrap_or(false);
+        if (scaling.requires_fd() || readout_needs_fd) && (ad_explicit || ad_auto_likely) {
+            let kind = if matches!(scaling, ScalingSpec::ExpressionScale { .. }) {
+                "expression-form `obs_scale = <expr>`"
+            } else if matches!(scaling, ScalingSpec::PerCmt(_)) {
+                "per-CMT `obs_scale[CMT=N]`"
+            } else {
+                match output_fn.as_ref() {
+                    Some(crate::ode::OdeReadout::PerCmt(_)) => "per-CMT `y[CMT=N]` (Form C)",
+                    Some(crate::ode::OdeReadout::Single(_)) => "`y = <expr>` (Form C)",
+                    _ => {
+                        unreachable!("readout_needs_fd implies output_fn is Some(Single | PerCmt)")
+                    }
+                }
             };
             return Err(format!(
                 "[scaling]: {} is not yet supported with AD gradients. \
-                 Add `gradient = fd` to [fit_options], or {}.",
-                kind, hint
+                 Add `gradient = fd` to [fit_options].",
+                kind
             ));
         }
 
@@ -1805,22 +1817,6 @@ fn parse_scalar_expression(value: &str, ctx: ParseCtx<'_>) -> Result<Expression,
     Ok(expr)
 }
 
-/// Parsed contents of a `[scaling]` block.
-///
-/// Returns `(ScalingSpec, Option<OdeOutputFn>)`:
-/// - `ScalingSpec` populates `CompiledModel.scaling` (Forms A/B post-multiply).
-/// - `OdeOutputFn` populates `OdeSpec.output_fn` for Form C (`y = <expr>`),
-///   replacing the default state-index readout inside the ODE timeline loop.
-///
-/// `is_ode = true` enables Form C and lets expressions reference state names.
-/// `pk_indices` is parallel to `indiv_var_names`: `pk_indices[i]` is the
-/// `PkParams.values` slot for the i-th individual parameter. Used by Form B
-/// to look up indiv-param values (e.g. `V`) from a subject-static
-/// `pk_param_fn` evaluation supplied to `scale_fn` at call time.
-///
-/// Validation:
-/// - Unknown keys are rejected.
-/// - `y = ...` on an analytical model is rejected.
 /// Parse a `[scaling]` block key into `(base, optional_cmt)`.
 ///
 /// Accepts:
@@ -1979,6 +1975,31 @@ fn build_y_output_fn(
     Ok(out_fn)
 }
 
+/// Parsed contents of a `[scaling]` block.
+///
+/// Returns `(ScalingSpec, Option<OdeReadout>)`:
+/// - `ScalingSpec` populates `CompiledModel.scaling` and drives the
+///   prediction-pipeline post-multiply. Variants: `None` /
+///   `ScalarScale(K)` (Form A) / `ExpressionScale { scale_fn }` (Form B)
+///   / `PerCmt(HashMap<usize, ScalingSpec>)` (Phase 2 multi-analyte
+///   Forms A/B per CMT).
+/// - `OdeReadout` populates `OdeSpec.readout` for Form C — the per-CMT
+///   `y[CMT=N] = <expr>` and uniform `y = <expr>` syntaxes both go here
+///   (`OdeReadout::PerCmt` vs `OdeReadout::Single` respectively), and
+///   replace the default `OdeReadout::ObsCmt(idx)` state-index readout.
+///
+/// `is_ode = true` enables Form C and lets expressions reference state names.
+/// `pk_indices` is parallel to `indiv_var_names`: `pk_indices[i]` is the
+/// `PkParams.values` slot for the i-th individual parameter. Used by Form B
+/// to look up indiv-param values (e.g. `V`) from a subject-static
+/// `pk_param_fn` evaluation supplied to `scale_fn` at call time.
+///
+/// Validation:
+/// - Unknown keys (anything other than `obs_scale[…]` / `y[…]`) → error.
+/// - `y[…]` on an analytical model → error.
+/// - Mixing uniform (`obs_scale = K`) with per-CMT (`obs_scale[CMT=N] = K`)
+///   within the same group → error.
+/// - Duplicate `[CMT=N]` keys → error.
 #[allow(clippy::too_many_arguments)]
 fn parse_scaling_block(
     lines: &[String],
@@ -8553,5 +8574,38 @@ if (1 > 0) {
             }
             _ => panic!("expected OdeReadout::PerCmt"),
         }
+    }
+
+    #[test]
+    fn test_parse_scaling_y_form_c_rejects_ad() {
+        // Regression for Copilot review on PR #84: the original guard only
+        // checked `ScalingSpec::requires_fd()`, missing Form C readouts
+        // (which live on `OdeSpec.readout`, not `model.scaling`). A Form C
+        // model with `gradient = ad` silently fell back to FD via
+        // `model.tv_fn.is_none()` at runtime; now the parser errors loudly.
+        let src_per_cmt = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some("  y[CMT=1] = central / V\n  y[CMT=2] = central / V * 1000\n"),
+        )
+        .replace("gradient = fd", "gradient = ad");
+        let err = parse_model_string(&src_per_cmt)
+            .expect_err("per-CMT y + gradient = ad must be rejected");
+        assert!(
+            err.contains("per-CMT `y[CMT=N]`") && err.contains("gradient = fd"),
+            "expected per-CMT Form C + AD rejection, got: {}",
+            err
+        );
+
+        // Single Form C (uniform `y = <expr>`) gets the same treatment.
+        let src_single =
+            ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V\n"))
+                .replace("gradient = fd", "gradient = ad");
+        let err = parse_model_string(&src_single)
+            .expect_err("single Form C + gradient = ad must be rejected");
+        assert!(
+            err.contains("`y = <expr>` (Form C)") && err.contains("gradient = fd"),
+            "expected single Form C + AD rejection, got: {}",
+            err
+        );
     }
 }

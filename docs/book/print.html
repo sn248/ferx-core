@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-01128107.js";
+            window.path_to_searchindex_js = "searchindex-b02da9c0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-3a934816.js"></script>
@@ -1660,12 +1660,40 @@ both the EKF <code>p_obs</code> propagation (scales by <code>1/K²</code>) and t
 variance callback. That’s a wider change deferred to Phase 1.5. Until
 then, the parser rejects any <code>[scaling]</code> block on a model with a
 <code>[diffusion]</code> block (Forms A, B, and C alike).</p>
-<h2 id="multi-analyte-forward-compatibility"><a class="header" href="#multi-analyte-forward-compatibility">Multi-analyte (forward compatibility)</a></h2>
-<p><code>[scaling]</code> is per-model in Phase 1. When ferx adds CMT-keyed scaling
-(NONMEM’s <code>if (CMT==2) Y = A2/V2</code>-style routing), the same block will
-grow <code>y[CMT=1] = &lt;expr&gt;</code> / <code>y[CMT=2] = &lt;expr&gt;</code> and
-<code>obs_scale[CMT=...]</code> variants. Existing single-form usage will continue
-to work unchanged.</p>
+<h2 id="multi-analyte--per-cmt-scaling"><a class="header" href="#multi-analyte--per-cmt-scaling">Multi-analyte / per-CMT scaling</a></h2>
+<p>For models that observe multiple compartments (parent + metabolite,
+sum-of-moieties, free vs. total, …), specify a separate scale per
+observed CMT using the <code>obs_scale[CMT=N]</code> (Forms A/B) or <code>y[CMT=N]</code>
+(Form C) syntax. <code>N</code> is the 1-based CMT index from the data file’s
+<code>CMT</code> column.</p>
+<pre><code class="language-ferx">[scaling]
+  obs_scale[CMT=1] = 1000    # parent in mg/L → mg/mL
+  obs_scale[CMT=2] = 1       # metabolite already in target units
+</code></pre>
+<p>Form C (ODE) per-CMT:</p>
+<pre><code class="language-ferx">[structural_model]
+  ode(states=[depot, parent, metab])
+
+[scaling]
+  y[CMT=1] = parent / V_parent
+  y[CMT=2] = metab  / V_metab
+</code></pre>
+<p><strong>Coverage rule</strong> — every CMT that has at least one observation in the
+data must have a matching <code>[CMT=N]</code> entry. The parser only checks
+syntax; the fit-time validation (run automatically at the top of
+<code>fit()</code>) errors with a list of the missing CMTs:</p>
+<pre><code>[scaling]: per-CMT scaling is missing entries for observed CMTs [2, 3].
+Every observed CMT must have an `obs_scale[CMT=N]` (or `y[CMT=N]` for ODE) entry.
+</code></pre>
+<p><strong>Mixing rule</strong> — the uniform form (<code>obs_scale = K</code>) and the per-CMT
+form (<code>obs_scale[CMT=N] = K</code>) are mutually exclusive within the same
+group. The parser rejects mixing them so the user is explicit about
+intent. The same rule applies to <code>y</code> and <code>y[CMT=N]</code>.</p>
+<p><strong>Gradients</strong> — per-CMT scaling forces <code>gradient = fd</code>. The AD path
+takes a single <code>Const</code> scale factor per subject; supporting per-CMT
+scales under AD requires threading per-observation scale arrays through
+the AD entry points and is deferred to a future PR. Parser rejects
+<code>PerCmt + gradient = ad</code> with a <code>gradient = fd</code> hint.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="stochastic-differential-equations-sde--diffusion"><a class="header" href="#stochastic-differential-equations-sde--diffusion">Stochastic Differential Equations (SDE / Diffusion)</a></h1>
 <p>The <code>[diffusion]</code> block adds continuous stochastic noise to ODE state variables.
@@ -5103,6 +5131,16 @@ and an ODE-only Form C that replaces the state readout entirely:</p>
 [scaling]
   y = central / V           # central holds amount; observe as concentration
 </code></pre>
+<p>For models with multiple observed compartments (parent + metabolite,
+sum-of-moieties, free vs. total), specify a scale per CMT:</p>
+<pre><code>[scaling]
+  obs_scale[CMT=1] = 1000
+  obs_scale[CMT=2] = 1
+  y[CMT=1] = parent / V
+  y[CMT=2] = metab  / VM
+</code></pre>
+<p>Every observed CMT must have a matching <code>[CMT=N]</code> entry — <code>fit()</code>
+errors at startup with the list of missing CMTs.</p>
 <p>See <a href="#scaling">Scaling</a> for the full reference, including
 how this compares to NONMEM’s <code>S1</code>/<code>S2</code> and nlmixr2’s <code>cmt(central); f = ...</code>.</p>
 

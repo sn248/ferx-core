@@ -331,3 +331,55 @@ fn per_cmt_scaling_missing_cmt_errors_at_fit() {
         msg
     );
 }
+
+#[test]
+fn per_cmt_scaling_works_with_ad_gradient() {
+    // Phase 2.5: PerCmt + gradient = ad now goes through the per-observation
+    // scale array in `inner_optimizer::build_scale_array_for_ad`. The fit
+    // must complete (no parse error, no runtime panic) and produce a
+    // finite OFV. Tighter "AD-matches-FD-OFV" comparison would also be
+    // nice but adds tier-3-style runtime cost; the smoke test here verifies
+    // the wiring without committing to convergence semantics on a
+    // synthetic dataset.
+    use ferx_core::{fit, FitOptions, GradientMethod};
+
+    let mut src = String::from(ANALYTICAL_BASE);
+    src.push_str("\n[scaling]\n  obs_scale[CMT=1] = 1000\n  obs_scale[CMT=2] = 2\n");
+    let model = parse_model_string(&src).expect("PerCmt + AD model parses");
+
+    let pop = two_cmt_pop();
+    let mut opts = FitOptions::default();
+    opts.gradient_method = GradientMethod::Ad;
+    opts.verbose = false;
+    let res = fit(&model, &pop, &model.default_params, &opts)
+        .expect("PerCmt + AD fit must complete without errors");
+    assert!(
+        res.ofv.is_finite(),
+        "PerCmt + AD OFV must be finite, got {}",
+        res.ofv
+    );
+}
+
+#[test]
+fn form_b_expression_scaling_works_with_ad_gradient() {
+    // Phase 2.5: ExpressionScale + gradient = ad also lifts (same
+    // machinery — subject-static per-obs scale array). Verifies the
+    // wiring on the Form B path.
+    use ferx_core::{fit, FitOptions, GradientMethod};
+
+    let mut src = String::from(ANALYTICAL_BASE);
+    src.push_str("\n[scaling]\n  obs_scale = TVV / 10\n");
+    let model = parse_model_string(&src).expect("ExpressionScale + AD model parses");
+
+    let pop = one_subject_pop();
+    let mut opts = FitOptions::default();
+    opts.gradient_method = GradientMethod::Ad;
+    opts.verbose = false;
+    let res = fit(&model, &pop, &model.default_params, &opts)
+        .expect("ExpressionScale + AD fit must complete without errors");
+    assert!(
+        res.ofv.is_finite(),
+        "ExpressionScale + AD OFV must be finite, got {}",
+        res.ofv
+    );
+}

@@ -32,91 +32,36 @@ pub fn apply_scaling(
     eta: &[f64],
     preds: &mut [f64],
 ) {
-    match &model.scaling {
-        ScalingSpec::None => {}
-        ScalingSpec::ScalarScale(k) => {
-            // Parser enforces `k > 0 && finite`; defensive guard for
-            // hand-constructed CompiledModels (no parser pass) — fall
-            // through to the NaN branch on bad values.
-            if *k > 0.0 && k.is_finite() {
-                let inv = 1.0 / k;
-                preds.iter_mut().for_each(|p| *p *= inv);
-            } else {
-                preds.iter_mut().for_each(|p| *p = f64::NAN);
-            }
-        }
-        ScalingSpec::ExpressionScale { scale_fn } => {
-            // Compute subject-static pk so the scale expression can
-            // reference individual parameters by name. Cheap relative to
-            // the FOCE inner loop — `gradient = ad` is rejected for
-            // ExpressionScale at parse time, so this branch only runs
-            // under FD anyway.
-            let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-            let s = scale_fn(theta, eta, &subject.covariates, &pk);
-            if s > 0.0 && s.is_finite() {
-                let inv = 1.0 / s;
-                preds.iter_mut().for_each(|p| *p *= inv);
-            } else {
-                // Expression scales can evaluate to 0 / NaN / inf at
-                // runtime (e.g. `WT / 70` with WT missing → 0, or
-                // `1 / (TVV - x)` near a singularity). Propagate NaN
-                // through `preds` so the outer optimizer's NLL goes NaN
-                // and the step is rejected — matches standard NLM
-                // convention and surfaces the bad scale in per-subject
-                // diagnostics rather than silently mis-fitting.
-                preds.iter_mut().for_each(|p| *p = f64::NAN);
-            }
-        }
-        ScalingSpec::PerCmt(map) => {
-            // Per-CMT dispatch. Pre-fit validation (`validate_per_cmt_scaling`
-            // called from `fit()`) ensures every observed CMT has an entry,
-            // so the missing-CMT branch below is a defensive fallback for
-            // hand-constructed CompiledModels.
-            //
-            // Compute pk once per subject if any inner spec is
-            // ExpressionScale (matches the analytical-form B path's
-            // subject-static evaluation).
-            let needs_pk = map
-                .values()
-                .any(|s| matches!(s, ScalingSpec::ExpressionScale { .. }));
-            let pk = if needs_pk {
-                Some((model.pk_param_fn)(theta, eta, &subject.covariates))
-            } else {
-                None
-            };
-            for (i, pred) in preds.iter_mut().enumerate() {
-                let cmt = subject.obs_cmts.get(i).copied().unwrap_or(0);
-                let inner = match map.get(&cmt) {
-                    Some(s) => s,
-                    None => {
-                        // Validation should have caught this; emit NaN.
-                        *pred = f64::NAN;
-                        continue;
-                    }
-                };
-                let s = match inner {
-                    ScalingSpec::None => 1.0,
-                    ScalingSpec::ScalarScale(k) => *k,
-                    ScalingSpec::ExpressionScale { scale_fn } => scale_fn(
-                        theta,
-                        eta,
-                        &subject.covariates,
-                        pk.as_ref().expect("needs_pk implies pk is Some"),
-                    ),
-                    ScalingSpec::PerCmt(_) => {
-                        debug_assert!(
-                            false,
-                            "nested ScalingSpec::PerCmt should be rejected at parse time"
-                        );
-                        1.0
-                    }
-                };
-                if s > 0.0 && s.is_finite() {
-                    *pred /= s;
-                } else {
-                    *pred = f64::NAN;
-                }
-            }
+    // Fast path: no scaling skips both the pk evaluation and the per-obs
+    // array allocation. Keeps the hot loop allocation-free for the
+    // overwhelming majority of models.
+    if matches!(model.scaling, ScalingSpec::None) {
+        return;
+    }
+    // Materialise per-observation scales via the shared
+    // `ScalingSpec::build_obs_scale_array` helper so the FD path here
+    // and the AD path in `inner_optimizer.rs` see identical semantics.
+    // Any scaling change is felt by both paths automatically.
+    //
+    // Compute pk once per subject (subject-static, matching the
+    // documented Phase 1 simplification). ExpressionScale closures
+    // consult it; the other variants ignore it.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let scales = model.scaling.build_obs_scale_array(
+        theta,
+        eta,
+        &subject.covariates,
+        &pk,
+        &subject.obs_cmts,
+    );
+    for (i, pred) in preds.iter_mut().enumerate() {
+        // build_obs_scale_array already encodes invalid scales as NaN,
+        // so this is purely a divide (no extra positivity check needed).
+        let s = scales.get(i).copied().unwrap_or(f64::NAN);
+        if s.is_finite() && s > 0.0 {
+            *pred /= s;
+        } else {
+            *pred = f64::NAN;
         }
     }
 }
@@ -1100,5 +1045,78 @@ mod tests {
         let subj = one_subject_for_scaling();
         validate_per_cmt_scaling(&model, std::slice::from_ref(&subj))
             .expect("non-PerCmt scaling never errors");
+    }
+
+    // ── build_obs_scale_array (Phase 2.5: shared FD/AD materialiser) ───────
+
+    #[test]
+    fn test_build_obs_scale_array_none() {
+        let spec = ScalingSpec::None;
+        let pk = PkParams::default();
+        let cov = HashMap::new();
+        let obs_cmts = vec![1, 1, 2];
+        let arr = spec.build_obs_scale_array(&[], &[], &cov, &pk, &obs_cmts);
+        assert_eq!(arr, vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_build_obs_scale_array_scalar() {
+        let spec = ScalingSpec::ScalarScale(1000.0);
+        let pk = PkParams::default();
+        let cov = HashMap::new();
+        let obs_cmts = vec![1; 4];
+        let arr = spec.build_obs_scale_array(&[], &[], &cov, &pk, &obs_cmts);
+        assert_eq!(arr, vec![1000.0; 4]);
+    }
+
+    #[test]
+    fn test_build_obs_scale_array_scalar_bad_value_yields_nan() {
+        // Defensive: hand-constructed ScalarScale with invalid k materialises
+        // NaN — feeds the FD path's loud-failure semantic and the AD path
+        // gets a Const NaN that propagates to NaN gradient too.
+        for &k in &[0.0_f64, -1.0, f64::NAN, f64::INFINITY] {
+            let spec = ScalingSpec::ScalarScale(k);
+            let pk = PkParams::default();
+            let arr = spec.build_obs_scale_array(&[], &[], &HashMap::new(), &pk, &[1; 3]);
+            assert!(arr.iter().all(|s| s.is_nan()), "bad k={} → all NaN", k);
+        }
+    }
+
+    #[test]
+    fn test_build_obs_scale_array_expression() {
+        // Closure returns 5.0; array should be 5.0 for every obs.
+        let scale_fn: crate::types::ScaleFn = Box::new(|_, _, _, _| 5.0);
+        let spec = ScalingSpec::ExpressionScale { scale_fn };
+        let pk = PkParams::default();
+        let arr = spec.build_obs_scale_array(&[], &[], &HashMap::new(), &pk, &[1; 3]);
+        assert_eq!(arr, vec![5.0; 3]);
+    }
+
+    #[test]
+    fn test_build_obs_scale_array_per_cmt_dispatches() {
+        let mut map: HashMap<usize, ScalingSpec> = HashMap::new();
+        map.insert(1, ScalingSpec::ScalarScale(1000.0));
+        map.insert(2, ScalingSpec::ScalarScale(2.0));
+        let spec = ScalingSpec::PerCmt(map);
+        let pk = PkParams::default();
+        let obs_cmts = vec![1, 2, 1, 2];
+        let arr = spec.build_obs_scale_array(&[], &[], &HashMap::new(), &pk, &obs_cmts);
+        assert_eq!(arr, vec![1000.0, 2.0, 1000.0, 2.0]);
+    }
+
+    #[test]
+    fn test_build_obs_scale_array_per_cmt_missing_cmt_is_nan() {
+        // CMT=3 is observed but not in the map. The runtime fit-time
+        // validation should catch this earlier; if it doesn't (hand-built
+        // CompiledModel), the array materialises NaN at the missing slot.
+        let mut map: HashMap<usize, ScalingSpec> = HashMap::new();
+        map.insert(1, ScalingSpec::ScalarScale(1000.0));
+        let spec = ScalingSpec::PerCmt(map);
+        let pk = PkParams::default();
+        let obs_cmts = vec![1, 3, 1];
+        let arr = spec.build_obs_scale_array(&[], &[], &HashMap::new(), &pk, &obs_cmts);
+        assert_eq!(arr[0], 1000.0);
+        assert!(arr[1].is_nan());
+        assert_eq!(arr[2], 1000.0);
     }
 }

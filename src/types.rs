@@ -645,46 +645,102 @@ impl Default for ScalingSpec {
 }
 
 impl ScalingSpec {
-    /// Returns the per-subject scalar divisor for the AD path.
-    /// `None` → 1.0 (no-op). `ScalarScale(k)` → `k`. The remaining
-    /// variants are rejected at parse time when the model resolves
-    /// `gradient_method == Ad` (ExpressionScale because the closure
-    /// needs theta/eta; PerCmt because per-observation scale arrays
-    /// aren't yet threaded through the AD entry points) — they return
-    /// `1.0` with a debug assertion rather than producing incorrect
-    /// gradients.
-    #[inline]
-    pub fn scalar_for_ad(&self) -> f64 {
+    /// Materialise the per-observation scale factors for one subject.
+    ///
+    /// Returns a `Vec<f64>` of length `obs_cmts.len()`. The vector is the
+    /// canonical source of truth used by both the FD path
+    /// (`pk::apply_scaling`) and the AD path (threaded as a `Const` slice
+    /// into the four AD entry points). Keeping a single materialiser
+    /// avoids drift between the two — every change to the scaling
+    /// semantics is felt by both paths automatically.
+    ///
+    /// All variants are subject-static: the closure (`ExpressionScale`)
+    /// is evaluated at most once per subject. AD therefore treats the
+    /// scale as a constant w.r.t. eta, which matches the documented
+    /// Phase 1 simplification — for the common case where the scale
+    /// expression doesn't reference eta (e.g. `WT/70`, `TVV/1000`,
+    /// `V` which only sees the EBE value), AD and FD give identical
+    /// gradients. For the rare case of a scale that explicitly references
+    /// eta, the AD gradient ignores that dependence; FD captures it. See
+    /// `docs/src/model-file/scaling.md` for the user-facing note.
+    ///
+    /// Invalid scale values (0, negative, NaN, inf — e.g. from a covariate
+    /// that's missing, or from a `1/(TVV-x)` near a singularity) propagate
+    /// as `NaN` so the downstream divide produces a NaN prediction and
+    /// the outer NLL goes NaN, matching the established loud-failure
+    /// semantic used everywhere else in the scaling path.
+    pub fn build_obs_scale_array(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        pk: &PkParams,
+        obs_cmts: &[usize],
+    ) -> Vec<f64> {
+        let n = obs_cmts.len();
         match self {
-            Self::None => 1.0,
-            Self::ScalarScale(k) => *k,
-            Self::ExpressionScale { .. } => {
-                debug_assert!(
-                    false,
-                    "ExpressionScale with AD must be rejected at parse time"
-                );
-                1.0
+            Self::None => vec![1.0; n],
+            Self::ScalarScale(k) => {
+                let v = if *k > 0.0 && k.is_finite() {
+                    *k
+                } else {
+                    f64::NAN
+                };
+                vec![v; n]
             }
-            Self::PerCmt(_) => {
-                debug_assert!(
-                    false,
-                    "PerCmt scaling with AD must be rejected at parse time"
-                );
-                1.0
+            Self::ExpressionScale { scale_fn } => {
+                let s = scale_fn(theta, eta, covariates, pk);
+                let v = if s > 0.0 && s.is_finite() {
+                    s
+                } else {
+                    f64::NAN
+                };
+                vec![v; n]
             }
+            Self::PerCmt(map) => obs_cmts
+                .iter()
+                .map(|cmt| match map.get(cmt) {
+                    Some(inner) => {
+                        let s = match inner {
+                            Self::None => 1.0,
+                            Self::ScalarScale(k) => *k,
+                            Self::ExpressionScale { scale_fn } => {
+                                scale_fn(theta, eta, covariates, pk)
+                            }
+                            Self::PerCmt(_) => {
+                                debug_assert!(false, "nested PerCmt rejected at parse time");
+                                1.0
+                            }
+                        };
+                        if s > 0.0 && s.is_finite() {
+                            s
+                        } else {
+                            f64::NAN
+                        }
+                    }
+                    // Validation in `fit()` catches this; defensive NaN.
+                    None => f64::NAN,
+                })
+                .collect(),
         }
     }
 
-    /// Returns true if this spec is `PerCmt` or contains an
-    /// `ExpressionScale` (directly or in any PerCmt entry). Used by the
-    /// parser to decide whether the gradient method must be FD.
+    /// Returns true if this spec is a Form C readout shape that the AD
+    /// path can't represent (currently only Form C lives outside
+    /// `ScalingSpec` — see `OdeReadout::requires_fd`).
+    ///
+    /// `ScalingSpec` variants — including `ExpressionScale` and
+    /// `PerCmt` — are all AD-compatible now via the per-observation scale
+    /// array produced by `build_obs_scale_array`. Always returns `false`.
+    /// Kept for symmetry with `OdeReadout::requires_fd` and forward
+    /// compatibility (e.g. a future variant that genuinely can't fold
+    /// into a Const slice).
+    #[inline]
     pub fn requires_fd(&self) -> bool {
         match self {
-            Self::None | Self::ScalarScale(_) => false,
-            Self::ExpressionScale { .. } => true,
-            // PerCmt always forces FD (Phase 2 limitation), independent
-            // of whether the inner variants need it.
-            Self::PerCmt(_) => true,
+            Self::None | Self::ScalarScale(_) | Self::ExpressionScale { .. } | Self::PerCmt(_) => {
+                false
+            }
         }
     }
 }

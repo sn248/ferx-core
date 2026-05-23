@@ -55,7 +55,10 @@ pub fn predict_all_event_driven_ad(
     pk_idx_f64: &[f64],
     sel_flat: &[f64],
     pk_model_id_f64: f64,
-    obs_scale: f64,
+    // Per-event divisor (length = event_times.len()). Non-obs slots must
+    // be 1.0 — the wrapper discards them via `event_kinds`, but the AD
+    // pass still writes scaled `conc` into every slot.
+    obs_scale: &[f64],
     out: &mut [f64],
 ) {
     let n_eta = eta.len();
@@ -164,7 +167,7 @@ pub fn predict_all_event_driven_ad(
         let v_safe = ev_v.abs() + 1e-30;
         let conc_raw = central_amt / v_safe;
         let conc_clamped = (conc_raw + conc_raw.abs()) * 0.5;
-        let conc = conc_clamped / obs_scale;
+        let conc = conc_clamped / obs_scale[ev_idx];
 
         // Unconditional write: every Dual output slot must be written
         // exactly once for forward-mode pointer tracking. Non-obs slots
@@ -741,7 +744,10 @@ pub fn compute_jacobian_event_driven_ad(
     pk_model: PkModel,
     pk_idx_f64: &[f64],
     sel_flat: &[f64],
-    obs_scale: f64,
+    // Per-event divisor (length = event_data.event_times.len()). The
+    // caller pads non-obs entries to 1.0 since the AD pass writes scaled
+    // conc into every event slot before the wrapper drops non-obs.
+    obs_scale: &[f64],
 ) -> nalgebra::DMatrix<f64> {
     let n_eta = eta.len();
     let pk_id = crate::ad::ad_gradients::pk_model_to_id(pk_model) as f64;

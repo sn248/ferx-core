@@ -621,9 +621,21 @@ pub enum ScalingSpec {
     None,
     /// Constant divisor applied to every prediction.
     ScalarScale(f64),
-    /// Per-subject divisor evaluated from `(theta, eta, covariates)`.
+    /// Per-subject divisor evaluated from `(theta, eta, covariates, pk)`.
     /// Used for expressions like `obs_scale = 1000 / V`.
     ExpressionScale { scale_fn: ScaleFn },
+    /// Per-CMT dispatch for multi-analyte models (parent+metabolite,
+    /// sum-of-moieties, free vs total, ...). Key is the 1-based CMT
+    /// index from the data file's CMT column (matches
+    /// `subject.obs_cmts[i]`, which is `usize`). Each entry is one of
+    /// `None` / `ScalarScale` / `ExpressionScale` (no nested `PerCmt`
+    /// — parser enforces).
+    ///
+    /// Fit-time validation requires every observed CMT in the population
+    /// to have an entry; missing entries fall through to NaN predictions
+    /// at runtime as a defensive guard against hand-constructed
+    /// CompiledModels.
+    PerCmt(HashMap<usize, ScalingSpec>),
 }
 
 impl Default for ScalingSpec {
@@ -634,11 +646,13 @@ impl Default for ScalingSpec {
 
 impl ScalingSpec {
     /// Returns the per-subject scalar divisor for the AD path.
-    /// `None` → 1.0 (no-op). `ScalarScale(k)` → `k`. `ExpressionScale` is
-    /// rejected at parse time when the model resolves `gradient_method == Ad`,
-    /// so the AD path never sees it — returns `1.0` with a debug assertion
-    /// rather than evaluating the closure (which would need theta/eta and
-    /// defeat the AD entry-point signature anyway).
+    /// `None` → 1.0 (no-op). `ScalarScale(k)` → `k`. The remaining
+    /// variants are rejected at parse time when the model resolves
+    /// `gradient_method == Ad` (ExpressionScale because the closure
+    /// needs theta/eta; PerCmt because per-observation scale arrays
+    /// aren't yet threaded through the AD entry points) — they return
+    /// `1.0` with a debug assertion rather than producing incorrect
+    /// gradients.
     #[inline]
     pub fn scalar_for_ad(&self) -> f64 {
         match self {
@@ -651,6 +665,26 @@ impl ScalingSpec {
                 );
                 1.0
             }
+            Self::PerCmt(_) => {
+                debug_assert!(
+                    false,
+                    "PerCmt scaling with AD must be rejected at parse time"
+                );
+                1.0
+            }
+        }
+    }
+
+    /// Returns true if this spec is `PerCmt` or contains an
+    /// `ExpressionScale` (directly or in any PerCmt entry). Used by the
+    /// parser to decide whether the gradient method must be FD.
+    pub fn requires_fd(&self) -> bool {
+        match self {
+            Self::None | Self::ScalarScale(_) => false,
+            Self::ExpressionScale { .. } => true,
+            // PerCmt always forces FD (Phase 2 limitation), independent
+            // of whether the inner variants need it.
+            Self::PerCmt(_) => true,
         }
     }
 }
@@ -661,6 +695,14 @@ impl std::fmt::Debug for ScalingSpec {
             Self::None => write!(f, "ScalingSpec::None"),
             Self::ScalarScale(k) => write!(f, "ScalingSpec::ScalarScale({})", k),
             Self::ExpressionScale { .. } => write!(f, "ScalingSpec::ExpressionScale {{ .. }}"),
+            Self::PerCmt(map) => {
+                let cmts: Vec<usize> = {
+                    let mut v: Vec<usize> = map.keys().copied().collect();
+                    v.sort();
+                    v
+                };
+                write!(f, "ScalingSpec::PerCmt({:?})", cmts)
+            }
         }
     }
 }
@@ -1731,8 +1773,7 @@ pub(crate) mod test_helpers {
                     rhs: Box::new(|_y, _p, _t, _dy| {}),
                     n_states: 2,
                     state_names: vec!["depot".into(), "central".into()],
-                    obs_cmt_idx: Some(0),
-                    output_fn: None,
+                    readout: crate::ode::OdeReadout::ObsCmt(0),
                     diffusion_var: Vec::new(),
                 })
             } else {

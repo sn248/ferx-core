@@ -121,10 +121,48 @@ variance callback. That's a wider change deferred to Phase 1.5. Until
 then, the parser rejects any `[scaling]` block on a model with a
 `[diffusion]` block (Forms A, B, and C alike).
 
-## Multi-analyte (forward compatibility)
+## Multi-analyte / per-CMT scaling
 
-`[scaling]` is per-model in Phase 1. When ferx adds CMT-keyed scaling
-(NONMEM's `if (CMT==2) Y = A2/V2`-style routing), the same block will
-grow `y[CMT=1] = <expr>` / `y[CMT=2] = <expr>` and
-`obs_scale[CMT=...]` variants. Existing single-form usage will continue
-to work unchanged.
+For models that observe multiple compartments (parent + metabolite,
+sum-of-moieties, free vs. total, ...), specify a separate scale per
+observed CMT using the `obs_scale[CMT=N]` (Forms A/B) or `y[CMT=N]`
+(Form C) syntax. `N` is the 1-based CMT index from the data file's
+`CMT` column.
+
+```ferx
+[scaling]
+  obs_scale[CMT=1] = 1000    # parent in mg/L → mg/mL
+  obs_scale[CMT=2] = 1       # metabolite already in target units
+```
+
+Form C (ODE) per-CMT:
+
+```ferx
+[structural_model]
+  ode(states=[depot, parent, metab])
+
+[scaling]
+  y[CMT=1] = parent / V_parent
+  y[CMT=2] = metab  / V_metab
+```
+
+**Coverage rule** — every CMT that has at least one observation in the
+data must have a matching `[CMT=N]` entry. The parser only checks
+syntax; the fit-time validation (run automatically at the top of
+`fit()`) errors with a list of the missing CMTs:
+
+```
+[scaling]: per-CMT scaling is missing entries for observed CMTs [2, 3].
+Every observed CMT must have an `obs_scale[CMT=N]` (or `y[CMT=N]` for ODE) entry.
+```
+
+**Mixing rule** — the uniform form (`obs_scale = K`) and the per-CMT
+form (`obs_scale[CMT=N] = K`) are mutually exclusive within the same
+group. The parser rejects mixing them so the user is explicit about
+intent. The same rule applies to `y` and `y[CMT=N]`.
+
+**Gradients** — per-CMT scaling forces `gradient = fd`. The AD path
+takes a single `Const` scale factor per subject; supporting per-CMT
+scales under AD requires threading per-observation scale arrays through
+the AD entry points and is deferred to a future PR. Parser rejects
+`PerCmt + gradient = ad` with a `gradient = fd` hint.

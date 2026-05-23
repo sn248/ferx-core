@@ -195,14 +195,18 @@ fn form_c_amount_ode_matches_concentration_ode() {
     let conc = parse_model_string(ODE_CONCENTRATION_FORM).expect("concentration form parses");
     let amt = parse_model_string(ODE_AMOUNT_FORM_C).expect("Form C parses");
 
-    // ODE spec sanity: concentration form keeps obs_cmt_idx, Form C clears it
-    // and sets output_fn instead.
+    // ODE spec sanity: concentration form keeps ObsCmt readout; Form C
+    // swaps to a Single output_fn readout.
     let ode_conc = conc.ode_spec.as_ref().expect("conc ODE present");
     let ode_amt = amt.ode_spec.as_ref().expect("amt ODE present");
-    assert!(ode_conc.obs_cmt_idx.is_some());
-    assert!(ode_conc.output_fn.is_none());
-    assert!(ode_amt.obs_cmt_idx.is_none());
-    assert!(ode_amt.output_fn.is_some());
+    assert!(matches!(
+        ode_conc.readout,
+        ferx_core::ode::OdeReadout::ObsCmt(_)
+    ));
+    assert!(matches!(
+        ode_amt.readout,
+        ferx_core::ode::OdeReadout::Single(_)
+    ));
 
     let pop = one_subject_pop();
     let conc_preds = predict(&conc, &pop, &conc.default_params);
@@ -226,4 +230,104 @@ fn form_c_amount_ode_matches_concentration_ode() {
             rel
         );
     }
+}
+
+/// Two-subject population with observations split across two CMTs — used
+/// to exercise the multi-analyte (PerCmt) dispatch end-to-end through
+/// `predict()`. Each subject has 3 obs on CMT=1 and 2 obs on CMT=2.
+fn two_cmt_pop() -> Population {
+    let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
+    let obs_cmts = vec![1, 1, 1, 2, 2];
+    let n_obs = obs_times.len();
+    let mk_subject = |id: &str| Subject {
+        id: id.into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: obs_times.clone(),
+        observations: vec![0.0; n_obs],
+        obs_cmts: obs_cmts.clone(),
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        cens: vec![0; n_obs],
+        occasions: Vec::new(),
+        dose_occasions: Vec::new(),
+    };
+    Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        subjects: vec![mk_subject("1"), mk_subject("2")],
+    }
+}
+
+#[test]
+fn per_cmt_scaling_dispatches_per_observation_through_predict() {
+    // Same baseline model, two scaling configurations:
+    //   (a) no scaling — predictions match the analytical 1-cpt IV bolus
+    //       formula at every obs.
+    //   (b) per-CMT: CMT=1 /1000, CMT=2 /2.
+    // Verify the scaled predictions differ from the baseline by exactly
+    // the right factor for each CMT.
+    let baseline = parse_model_string(ANALYTICAL_BASE).expect("baseline parses");
+
+    let mut scaled_src = String::from(ANALYTICAL_BASE);
+    scaled_src.push_str("\n[scaling]\n  obs_scale[CMT=1] = 1000\n  obs_scale[CMT=2] = 2\n");
+    let scaled = parse_model_string(&scaled_src).expect("per-CMT scaling parses");
+
+    let pop = two_cmt_pop();
+    let base_preds = predict(&baseline, &pop, &baseline.default_params);
+    let scaled_preds = predict(&scaled, &pop, &scaled.default_params);
+
+    assert_eq!(base_preds.len(), scaled_preds.len());
+
+    for (subj_i, subj) in pop.subjects.iter().enumerate() {
+        let n = subj.obs_times.len();
+        let base_off = subj_i * n;
+        for j in 0..n {
+            let cmt = subj.obs_cmts[j];
+            let expected_scale = match cmt {
+                1 => 1000.0,
+                2 => 2.0,
+                other => panic!("unexpected CMT {}", other),
+            };
+            let base = base_preds[base_off + j].pred;
+            let scaled = scaled_preds[base_off + j].pred;
+            assert!(base > 0.0);
+            let ratio = base / scaled;
+            assert!(
+                (ratio - expected_scale).abs() < 1e-9,
+                "subj {} obs {} CMT={}: expected scale {}, got ratio {}",
+                subj.id,
+                j,
+                cmt,
+                expected_scale,
+                ratio
+            );
+        }
+    }
+}
+
+#[test]
+fn per_cmt_scaling_missing_cmt_errors_at_fit() {
+    // PerCmt map covers CMT=1 only, but the population has obs on CMT=2.
+    // fit() must reject this with a clear error naming the missing CMT.
+    use ferx_core::{fit, FitOptions};
+
+    let mut src = String::from(ANALYTICAL_BASE);
+    src.push_str("\n[scaling]\n  obs_scale[CMT=1] = 1000\n");
+    let model = parse_model_string(&src).expect("PerCmt-with-only-CMT-1 parses");
+
+    let pop = two_cmt_pop(); // observes both CMT=1 and CMT=2
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let err = fit(&model, &pop, &model.default_params, &opts)
+        .expect_err("missing per-CMT entry must error at fit() entry");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("[2]") || (msg.contains("missing") && msg.contains("CMT")),
+        "expected missing-CMT error, got: {}",
+        msg
+    );
 }

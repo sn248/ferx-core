@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-046ad31f.js";
+            window.path_to_searchindex_js = "searchindex-660261eb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-808a48a8.js"></script>
@@ -1311,19 +1311,33 @@ itself. Under linear superposition this satisfies the identity</p>
 ferx-core enforces this exactly — declaring <code>LAGTIME</code> on a steady-state
 model is fully supported across all paths.</p>
 <h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
-<p>The SS code paths return <code>0</code> and emit a warning in
-<code>FitResult.warnings</code> for the following malformed cases:</p>
+<p>For the following malformed configurations, ferx-core skips the SS
+pre-equilibration (treating the dose as a single, non-SS bolus or
+infusion) and emits a warning in <code>FitResult.warnings</code>. The predictions
+in these cases are <em>not</em> zero — the dose is still applied through the
+normal flow — but the system isn’t actually at steady state at the
+dose time, so don’t interpret the fit as a steady-state fit.</p>
 <ul>
-<li><strong><code>SS=1</code> with <code>II ≤ 0</code></strong> — interval is required for SS predictions;
-set <code>II</code> in the dataset or remove the <code>SS=1</code> flag.</li>
+<li><strong><code>SS=1</code> with <code>II ≤ 0</code></strong> — interval is required for SS predictions.
+The SS branch is gated on <code>dose.ii &gt; 0</code>, so the dose falls through
+to the single-dose path. Set <code>II</code> in the dataset or remove the
+<code>SS=1</code> flag.</li>
 <li><strong><code>SS=1</code> infusion with <code>T_inf &gt; II</code></strong> (overlapping pulses) — no
-closed-form solution covers this; use a shorter infusion or remove
-<code>SS=1</code>. The user can equivalently model overlapping infusions with
-an <code>[odes]</code> block and explicit periodic dose records (no SS).</li>
+closed-form solution or pulse-expansion scheme covers this. The SS
+pre-equilibration returns a zero preload and the dose is then
+applied as a single infusion. Use a shorter infusion (<code>T_inf ≤ II</code>)
+or model overlapping infusions with an <code>[odes]</code> block and explicit
+periodic dose records (without <code>SS=1</code>).</li>
 </ul>
-<p>The <code>SS=2</code> flag (NONMEM “add to the existing train without
-re-equilibrating”) is <strong>not</strong> supported. Datasets that use <code>SS=2</code> should
-be converted to explicit dose records.</p>
+<h3 id="ss2"><a class="header" href="#ss2"><code>SS=2</code></a></h3>
+<p>NONMEM’s <code>SS=2</code> semantic (“add to the existing train without
+re-equilibrating”) is <strong>not implemented</strong>. The CSV reader accepts any
+positive integer in the <code>SS</code> column and treats it as a boolean: an
+<code>SS=2</code> row is parsed identically to <code>SS=1</code> and goes through the
+re-equilibration path described above. This is not bit-for-bit
+NONMEM-compatible for datasets that distinguish <code>SS=1</code> and <code>SS=2</code>
+records — convert <code>SS=2</code> rows to explicit dose records if the
+no-re-equilibration semantic is required.</p>
 <h2 id="nonmem-equivalence-1"><a class="header" href="#nonmem-equivalence-1">NONMEM equivalence</a></h2>
 <ul>
 <li><code>SS=1</code>, <code>II=24</code>, <code>AMT=100</code>, <code>RATE=0</code> → matches NONMEM SS=1 bolus.</li>
@@ -1521,9 +1535,11 @@ with sigma and omega.</p>
 <h2 id="limitations-1"><a class="header" href="#limitations-1">Limitations</a></h2>
 <ul>
 <li>The observable compartment contains the amount (not concentration). Divide by volume in the ODE equations if needed</li>
-<li>Steady-state (<code>SS=1</code>) is not directly supported for ODE models</li>
 <li>SDE (<code>[diffusion]</code>) is not compatible with SAEM or the autodiff gradient path</li>
 </ul>
+<p>Steady-state (<code>SS=1</code>) is supported for ODE models via numerical
+pulse-expansion equilibration — see <a href="#steady-state-doses-ss1">Steady-State Doses</a>
+for the mechanism and how it differs from the analytical closed forms.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="stochastic-differential-equations-sde--diffusion"><a class="header" href="#stochastic-differential-equations-sde--diffusion">Stochastic Differential Equations (SDE / Diffusion)</a></h1>
 <p>The <code>[diffusion]</code> block adds continuous stochastic noise to ODE state variables.

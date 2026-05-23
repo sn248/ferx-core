@@ -188,19 +188,34 @@ model is fully supported across all paths.
 
 ## Limitations
 
-The SS code paths return `0` and emit a warning in
-`FitResult.warnings` for the following malformed cases:
+For the following malformed configurations, ferx-core skips the SS
+pre-equilibration (treating the dose as a single, non-SS bolus or
+infusion) and emits a warning in `FitResult.warnings`. The predictions
+in these cases are *not* zero — the dose is still applied through the
+normal flow — but the system isn't actually at steady state at the
+dose time, so don't interpret the fit as a steady-state fit.
 
-- **`SS=1` with `II ≤ 0`** — interval is required for SS predictions;
-  set `II` in the dataset or remove the `SS=1` flag.
+- **`SS=1` with `II ≤ 0`** — interval is required for SS predictions.
+  The SS branch is gated on `dose.ii > 0`, so the dose falls through
+  to the single-dose path. Set `II` in the dataset or remove the
+  `SS=1` flag.
 - **`SS=1` infusion with `T_inf > II`** (overlapping pulses) — no
-  closed-form solution covers this; use a shorter infusion or remove
-  `SS=1`. The user can equivalently model overlapping infusions with
-  an `[odes]` block and explicit periodic dose records (no SS).
+  closed-form solution or pulse-expansion scheme covers this. The SS
+  pre-equilibration returns a zero preload and the dose is then
+  applied as a single infusion. Use a shorter infusion (`T_inf ≤ II`)
+  or model overlapping infusions with an `[odes]` block and explicit
+  periodic dose records (without `SS=1`).
 
-The `SS=2` flag (NONMEM "add to the existing train without
-re-equilibrating") is **not** supported. Datasets that use `SS=2` should
-be converted to explicit dose records.
+### `SS=2`
+
+NONMEM's `SS=2` semantic ("add to the existing train without
+re-equilibrating") is **not implemented**. The CSV reader accepts any
+positive integer in the `SS` column and treats it as a boolean: an
+`SS=2` row is parsed identically to `SS=1` and goes through the
+re-equilibration path described above. This is not bit-for-bit
+NONMEM-compatible for datasets that distinguish `SS=1` and `SS=2`
+records — convert `SS=2` rows to explicit dose records if the
+no-re-equilibration semantic is required.
 
 ## NONMEM equivalence
 

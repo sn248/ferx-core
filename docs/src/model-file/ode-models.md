@@ -110,5 +110,8 @@ with sigma and omega.
 ## Limitations
 
 - The observable compartment contains the amount (not concentration). Divide by volume in the ODE equations if needed
-- Steady-state (`SS=1`) is not directly supported for ODE models
 - SDE (`[diffusion]`) is not compatible with SAEM or the autodiff gradient path
+
+Steady-state (`SS=1`) is supported for ODE models via numerical
+pulse-expansion equilibration — see [Steady-State Doses](steady-state.md)
+for the mechanism and how it differs from the analytical closed forms.

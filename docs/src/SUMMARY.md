@@ -9,6 +9,7 @@
   - [Individual Parameters](model-file/individual-parameters.md)
   - [Structural Model](model-file/structural-model.md)
   - [Lagtime](model-file/lagtime.md)
+  - [Steady-State Doses](model-file/steady-state.md)
   - [Error Model](model-file/error-model.md)
   - [ODE Models](model-file/ode-models.md)
   - [Stochastic Differential Equations](model-file/diffusion.md)

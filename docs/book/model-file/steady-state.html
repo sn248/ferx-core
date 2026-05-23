@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Data Format - FeRx-NLME Documentation</title>
+        <title>Steady-State Doses - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -12,33 +12,33 @@
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
-        <link rel="icon" href="favicon-de23e50b.svg">
-        <link rel="shortcut icon" href="favicon-8114d1fc.png">
-        <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-2459343d.css">
-        <link rel="stylesheet" href="css/chrome-ae938929.css">
-        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
-        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
 
         <!-- Highlight.js Stylesheets -->
-        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
-        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
-        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
-            const path_to_root = "";
+            const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-660261eb.js";
+            window.path_to_searchindex_js = "../searchindex-660261eb.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-808a48a8.js"></script>
+        <script src="../toc-808a48a8.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -105,7 +105,7 @@
             <!-- populated by js -->
             <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
             <noscript>
-                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
             </noscript>
             <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -140,7 +140,7 @@
                     <h1 class="menu-title">FeRx-NLME Documentation</h1>
 
                     <div class="right-buttons">
-                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
                             <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
                         </a>
                         <a href="https://github.com/FeRx-NLME/ferx-core" title="Git repository" aria-label="Git repository">
@@ -177,159 +177,229 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="data-format"><a class="header" href="#data-format">Data Format</a></h1>
-<p>FeRx reads data in NONMEM-compatible CSV format. This is the standard format used across population PK tools.</p>
-<h2 id="required-columns"><a class="header" href="#required-columns">Required Columns</a></h2>
+                        <h1 id="steady-state-doses-ss1"><a class="header" href="#steady-state-doses-ss1">Steady-State Doses (SS=1)</a></h1>
+<p>A dose record with <code>SS=1</code> and <code>II &gt; 0</code> tells ferx-core that, at the time
+of the record, the compartmental state is at steady state under repeated
+dosing of that amount/rate every <code>II</code> time units. The record itself is
+treated as one of the pulses in the train.</p>
+<p>This matches the NONMEM <code>SS=1</code> semantic: the compartments are initialised
+to the value that would arise from an infinite-past pulse train at
+interval <code>II</code>. Subsequent observations decay from that loaded state under
+the model’s normal dynamics; the SS train is <strong>not</strong> implicitly continued
+past the SS dose record. To continue dosing forward in time, add explicit
+dose records (the typical clinical pattern is one <code>SS=1</code> “loading” row
+followed by any number of probe observations).</p>
+<h2 id="dataset-columns"><a class="header" href="#dataset-columns">Dataset columns</a></h2>
+<p>A steady-state row uses two NONMEM-format columns: <code>SS</code> and <code>II</code>.</p>
+<pre><code>ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS
+1,0,.,1,100,1,0,1,24,1     # SS=1: at SS under q24h dosing of AMT=100
+1,1,4.18,0,.,1,0,0,.,.
+1,4,3.86,0,.,1,0,0,.,.
+1,12,1.78,0,.,1,0,0,.,.
+1,23,0.59,0,.,1,0,0,.,.
+</code></pre>
+<p><code>II</code> is the dosing interval. For a bolus row (<code>RATE=0</code>) and an
+infusion row (<code>RATE&gt;0</code>), <code>SS=1</code> works the same way — the steady-state
+state is computed from the corresponding single-dose response repeated
+every <code>II</code>.</p>
+<h2 id="supported-prediction-paths"><a class="header" href="#supported-prediction-paths">Supported prediction paths</a></h2>
+<p>Every prediction path in ferx-core honours <code>SS=1</code>:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Column</th><th>Type</th><th>Description</th></tr>
+<tr><th>Path</th><th>Where</th><th>How</th></tr>
 </thead>
 <tbody>
-<tr><td><code>ID</code></td><td>string/numeric</td><td>Subject identifier</td></tr>
-<tr><td><code>TIME</code></td><td>numeric</td><td>Time relative to first dose</td></tr>
-<tr><td><code>DV</code></td><td>numeric</td><td>Dependent variable (observed concentration)</td></tr>
+<tr><td>Analytical (1-/2-/3-cpt, no TV covariates)</td><td><code>predict_concentration</code> in <code>src/pk/mod.rs</code></td><td>Closed-form geometric-series</td></tr>
+<tr><td>Analytical (1-/2-/3-cpt, time-varying covariates)</td><td><code>event_driven_predictions_with_schedule</code> in <code>src/pk/event_driven.rs</code></td><td>Numerical pulse expansion via the propagator</td></tr>
+<tr><td>ODE (<code>[odes]</code>-block models)</td><td><code>ode_predictions</code> / <code>ode_predictions_event_driven</code> in <code>src/ode/predictions.rs</code></td><td>Numerical pulse expansion via the RK45 solver</td></tr>
 </tbody>
 </table>
 </div>
-<h2 id="optional-standard-columns"><a class="header" href="#optional-standard-columns">Optional Standard Columns</a></h2>
+<p>Both kinds of paths start from the same underlying identity — the
+choice between them is a question of whether the geometric series has
+a closed form for the model in question.</p>
+<h3 id="analytical-path-closed-form-geometric-series"><a class="header" href="#analytical-path-closed-form-geometric-series">Analytical path: closed-form geometric series</a></h3>
+<p>For linear analytical PK (1-/2-/3-cpt), the single-dose response is a
+sum of exponentials with known eigenvalues. The steady-state series</p>
+<pre><code>C_ss(τ) = Σ_{n=0}^∞ C_single(τ + n·II)
+</code></pre>
+<p>collapses per eigenvalue: every exponential <code>A·exp(-λ·t)</code> in the
+single-dose response contributes a steady-state amplitude
+<code>A·exp(-λ·τ) / (1 - exp(-λ·II))</code>. ferx evaluates this exactly — no
+iteration, single-pass cost equivalent to evaluating the single-dose
+formula plus one extra division per eigenvalue. For oral models when
+<code>KA ≈ λ</code> the closed form needs the L’Hopital limit; ferx handles that
+case automatically.</p>
+<h3 id="ode-path-brute-force-pulse-expansion"><a class="header" href="#ode-path-brute-force-pulse-expansion">ODE path: brute-force pulse expansion</a></h3>
+<p>An <code>[odes]</code>-block model is an arbitrary user-defined RHS. There is no
+general eigenstructure to exploit — <code>dy/dt = f(y, p, t)</code> can be
+non-linear (Michaelis-Menten elimination), time-varying, or both, so
+no closed form exists for the steady-state state in general.</p>
+<p>Instead, ferx evaluates the geometric series <em>numerically</em> before the
+SS dose is applied. The algorithm in <code>equilibrate_ss_state</code> is exactly
+what its name says — brute-force pulse expansion:</p>
+<ol>
+<li><strong>Reset</strong> the compartment state to zero. NONMEM <code>SS=1</code> semantics
+say prior dynamics are discarded at the SS dose, so anything that
+happened earlier in the timeline is overwritten here.</li>
+<li><strong>Loop <code>N = 50</code> cycles</strong>:
+<ul>
+<li><strong>Apply the dose</strong> for one cycle:
+<ul>
+<li>For a bolus, add <code>AMT</code> (with bioavailability <code>F1</code> applied) to
+the dose’s compartment.</li>
+<li>For an infusion, integrate for <code>T_inf = AMT/RATE</code> with a
+wrapped RHS that adds <code>+RATE</code> to the dose’s compartment.</li>
+</ul>
+</li>
+<li><strong>Propagate</strong> the ODE forward by the remainder of the cycle (<code>II</code>
+for boluses, <code>II - T_inf</code> for infusions). Same RK45 solver as the
+normal timeline, same tolerances, same wrapped-infusion mechanics.</li>
+</ul>
+</li>
+<li>After the loop, the compartment state equals the “just-before-the-
+next-pulse” steady-state amount.</li>
+<li>Normal-timeline handling resumes — the SS dose’s own pulse is
+applied through the standard bolus/infusion code path, taking the
+state from pre-pulse to at-pulse SS.</li>
+</ol>
+<p>The result is mathematically equivalent to the analytical closed form
+in the linear case (and is unit-tested against it — see
+<code>ode_ss_iv_bolus_matches_analytical_ss</code> in <code>src/ode/predictions.rs</code>
+for the 1-cpt cross-check). For non-linear PK, the same scheme still
+produces a self-consistent steady-state state under the model’s own
+dynamics; just be aware that for systems that <em>don’t</em> have a true
+periodic steady state (e.g. zero-order elimination at saturation),
+the iteration may not converge to anything meaningful and SS=1 isn’t
+really applicable.</p>
+<h3 id="why-n--50"><a class="header" href="#why-n--50">Why <code>N = 50</code>?</a></h3>
+<p>The truncation tail after <code>N</code> cycles is bounded by <code>exp(-N·λ·II)</code> for
+each disposition rate <code>λ</code>. For typical PK
+(<code>λ·II ≈ 2</code>, i.e. ~3 half-lives per dosing interval),
+<code>exp(-100) ≈ 4e-44</code> — well below any meaningful precision. For very
+slow PK (<code>λ·II = 0.1</code>, ~14 half-lives total over the 50 cycles),
+<code>exp(-5) ≈ 7e-3</code> — the slowest realistic case. ferx uses fixed
+<code>N = 50</code> rather than adaptive convergence checking because (a) the
+bound is conservative and (b) skipping the convergence check keeps
+the hot path branch-free for AD compatibility.</p>
+<p>If you need tighter accuracy for an unusually slow PK, the constant
+lives at <code>SS_EQUILIBRATION_CYCLES</code> in <code>src/ode/predictions.rs</code> and
+<code>EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES</code> in <code>src/pk/event_driven.rs</code>.</p>
+<h3 id="cost-comparison"><a class="header" href="#cost-comparison">Cost comparison</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Column</th><th>Type</th><th>Default</th><th>Description</th></tr>
+<tr><th>Path</th><th>Per SS-dose cost</th><th>Notes</th></tr>
 </thead>
 <tbody>
-<tr><td><code>EVID</code></td><td>integer</td><td>0</td><td>Event ID: 0 = observation, 1 = dose, 4 = reset + dose</td></tr>
-<tr><td><code>AMT</code></td><td>numeric</td><td>0</td><td>Dose amount (only for <code>EVID=1</code> or <code>EVID=4</code>)</td></tr>
-<tr><td><code>CMT</code></td><td>integer</td><td>1</td><td>Compartment number (1-indexed)</td></tr>
-<tr><td><code>RATE</code></td><td>numeric</td><td>0</td><td>Infusion rate. 0 = bolus dose</td></tr>
-<tr><td><code>MDV</code></td><td>integer</td><td>0</td><td>Missing DV flag. 1 = DV should be ignored</td></tr>
-<tr><td><code>II</code></td><td>numeric</td><td>0</td><td>Interdose interval for repeated dosing</td></tr>
-<tr><td><code>SS</code></td><td>integer</td><td>0</td><td>Steady-state flag. 1 = assume steady state</td></tr>
-<tr><td><code>CENS</code></td><td>integer</td><td>0</td><td>Censoring flag. 1 = observation is below LLOQ; <code>DV</code> carries the LLOQ value. Paired with <code>bloq_method = m3</code> in <code>[fit_options]</code> to enable likelihood-based handling — see <a href="examples/bloq.html">BLOQ example</a>.</td></tr>
+<tr><td>Analytical closed</td><td>~1 single-dose evaluation</td><td>Effectively free</td></tr>
+<tr><td>Event-driven pulse</td><td>~50× analytical propagator calls</td><td>Still cheap; analytical propagator is fast</td></tr>
+<tr><td>ODE pulse</td><td>~50× RK45 segment integrations</td><td>Real cost — RK45 is the dominant per-prediction cost for ODE models, so SS doses cost ~50× more than non-SS doses</td></tr>
 </tbody>
 </table>
 </div>
-<h2 id="occasion-column-iov"><a class="header" href="#occasion-column-iov">Occasion Column (IOV)</a></h2>
-<p>When using Inter-Occasion Variability (IOV), add an occasion-index column to the dataset and specify its name with <code>iov_column</code> in <code>[fit_options]</code>. The column:</p>
-<ul>
-<li>Contains <strong>integer occasion indices</strong> (e.g. 1, 2, 3…) — one per row</li>
-<li>Applies to both dose rows and observation rows</li>
-<li>Is <strong>excluded from covariate auto-detection</strong></li>
-</ul>
-<p>Example dataset with <code>OCC</code> column:</p>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,MDV,OCC
-1,0,.,1,100,1,1,1
-1,1,9.5,0,.,.,0,1
-1,2,7.3,0,.,.,0,1
-1,24,.,1,100,1,1,2
-1,25,10.1,0,.,.,0,2
-1,26,8.2,0,.,.,0,2
+<p>SS doses are typically rare (one per subject at the start of a
+maintenance regimen), so the absolute overhead per fit iteration is
+modest even for ODE models. If a benchmark shows SS equilibration as
+a hot spot, an adaptive <code>N</code> (loop until <code>||state - prev|| / ||state|| &lt; tol</code>) is the obvious follow-up — it would early-exit on fast PK.</p>
+<h2 id="dsl-example"><a class="header" href="#dsl-example">DSL example</a></h2>
+<p>No new DSL syntax is required — the model file is identical to a
+single-dose model. SS is a property of the <strong>dataset</strong>:</p>
+<pre><code>[parameters]
+  theta TVCL(2.5, 0.01, 50.0)
+  theta TVV(15.0, 0.5, 200.0)
+  theta TVKA(1.0, 0.05, 20.0)
+
+  omega ETA_CL ~ 0.05
+  omega ETA_V  ~ 0.05
+  omega ETA_KA ~ 0.1
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = foce
+  maxiter = 100
 </code></pre>
-<p>The occasion index can be any positive integer; they do not need to start at 1 or be consecutive, but a different number means a different occasion with its own kappa EBE.</p>
-<p>See <a href="estimation/iov.html">IOV documentation</a> for full details.</p>
-<h2 id="covariate-columns"><a class="header" href="#covariate-columns">Covariate Columns</a></h2>
-<p>Any column not in the standard set above is automatically treated as a covariate. Covariate values are:</p>
-<ul>
-<li><strong>Time-constant</strong>: The first non-missing value for each subject is used</li>
-<li><strong>Time-varying</strong>: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied per event (NONMEM-equivalent: <code>[individual_parameters]</code> is re-evaluated at each dose and observation row using that row’s covariate values)</li>
-</ul>
-<p>Covariate names in the data file are matched case-insensitively to names used in <code>[individual_parameters]</code> expressions.</p>
-<h3 id="time-varying-covariate-scope"><a class="header" href="#time-varying-covariate-scope">Time-varying covariate scope</a></h3>
-<p>Time-varying covariates are supported for <strong>all</strong> analytical structural models and ODE-defined models:</p>
-<ul>
-<li>1-compartment IV bolus (<code>one_cpt_iv_bolus</code>)</li>
-<li>1-compartment infusion (<code>one_cpt_infusion</code>)</li>
-<li>1-compartment oral (<code>one_cpt_oral</code>)</li>
-<li>2-compartment IV bolus (<code>two_cpt_iv_bolus</code>)</li>
-<li>2-compartment infusion (<code>two_cpt_infusion</code>)</li>
-<li>2-compartment oral (<code>two_cpt_oral</code>)</li>
-<li>3-compartment IV bolus (<code>three_cpt_iv_bolus</code>)</li>
-<li>3-compartment infusion (<code>three_cpt_infusion</code>)</li>
-<li>3-compartment oral (<code>three_cpt_oral</code>)</li>
-<li>All ODE-defined models (via <code>[odes]</code>)</li>
-</ul>
-<p>For oral models, the bolus dose into compartment 1 is interpreted as the depot (NONMEM ADVAN2/ADVAN4/ADVAN12 convention) and observation read-out reads the central compartment.</p>
-<p>The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients <em>and</em> an AD-accelerated H-matrix Jacobian (forward-mode), so neither the inner-loop gradient nor the per-iteration Jacobian falls back to finite-differences.</p>
-<p>Infusion routing on the event-driven path:</p>
-<ul>
-<li><strong>IV models</strong>: central infusion (cmt=1) for all 1/2/3-cpt; <strong>peripheral infusion</strong> for 2-cpt (cmt=2) and 3-cpt (cmt=2 → periph1, cmt=3 → periph2). Steady-state amounts per channel are computed by linear superposition over the channels.</li>
-<li><strong>Oral models</strong>: central infusion (cmt=2) is supported; peripheral infusion is rare clinically and still panics with a clear message (tracked as a follow-up).</li>
-</ul>
-<h2 id="event-types-evid"><a class="header" href="#event-types-evid">Event Types (EVID)</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>EVID</th><th>Meaning</th></tr>
-</thead>
-<tbody>
-<tr><td>0</td><td>Observation record. <code>DV</code> is used for estimation.</td></tr>
-<tr><td>1</td><td>Dosing record. <code>AMT</code> is administered to compartment <code>CMT</code>.</td></tr>
-<tr><td>2</td><td>Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row’s covariate values — matching NONMEM’s <code>$PK runs at every record</code> semantic. Only meaningful when at least one covariate is time-varying; for time-constant data EVID=2 rows are skipped (would be no-ops).</td></tr>
-<tr><td>4</td><td>Reset and dose. All compartment amounts are reset to zero before dosing.</td></tr>
-</tbody>
-</table>
-</div>
-<h2 id="example-dataset"><a class="header" href="#example-dataset">Example Dataset</a></h2>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT,CRCL
-1,0,.,1,100,1,0,1,70,95
-1,0.5,9.49,0,.,.,.,0,70,95
-1,1,14.42,0,.,.,.,0,70,95
-1,2,17.56,0,.,.,.,0,70,95
-1,4,15.23,0,.,.,.,0,70,95
-1,8,10.15,0,.,.,.,0,70,95
-2,0,.,1,150,1,0,1,85,110
-2,0.5,14.2,0,.,.,.,0,85,110
-2,1,21.3,0,.,.,.,0,85,110
+<p>Combine with the SS=1 dataset above and run:</p>
+<pre><code>cargo run --release -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
 </code></pre>
-<p>Key points:</p>
+<p>A runnable example pair ships in the repository at
+<code>examples/ss_oral_q24.ferx</code> + <code>data/ss_oral_q24.csv</code>.</p>
+<h2 id="combining-with-lagtime"><a class="header" href="#combining-with-lagtime">Combining with <code>LAGTIME</code></a></h2>
+<p><code>LAGTIME</code> shifts each pulse in the SS train, including the SS pulse
+itself. Under linear superposition this satisfies the identity</p>
+<pre><code>C_ss(τ, L) = C_ss(τ - L, 0)   for τ &gt; L
+</code></pre>
+<p>i.e. the lagged SS curve is just the un-lagged SS curve shifted in time.
+ferx-core enforces this exactly — declaring <code>LAGTIME</code> on a steady-state
+model is fully supported across all paths.</p>
+<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
+<p>For the following malformed configurations, ferx-core skips the SS
+pre-equilibration (treating the dose as a single, non-SS bolus or
+infusion) and emits a warning in <code>FitResult.warnings</code>. The predictions
+in these cases are <em>not</em> zero — the dose is still applied through the
+normal flow — but the system isn’t actually at steady state at the
+dose time, so don’t interpret the fit as a steady-state fit.</p>
 <ul>
-<li>Dose records (<code>EVID=1</code>) have <code>MDV=1</code> and <code>DV=.</code> (missing)</li>
-<li>Observation records (<code>EVID=0</code>) have <code>MDV=0</code> and a valid <code>DV</code></li>
-<li>Covariates (<code>WT</code>, <code>CRCL</code>) are included as extra columns</li>
-<li>Missing values can be represented as <code>.</code> or left empty</li>
+<li><strong><code>SS=1</code> with <code>II ≤ 0</code></strong> — interval is required for SS predictions.
+The SS branch is gated on <code>dose.ii &gt; 0</code>, so the dose falls through
+to the single-dose path. Set <code>II</code> in the dataset or remove the
+<code>SS=1</code> flag.</li>
+<li><strong><code>SS=1</code> infusion with <code>T_inf &gt; II</code></strong> (overlapping pulses) — no
+closed-form solution or pulse-expansion scheme covers this. The SS
+pre-equilibration returns a zero preload and the dose is then
+applied as a single infusion. Use a shorter infusion (<code>T_inf ≤ II</code>)
+or model overlapping infusions with an <code>[odes]</code> block and explicit
+periodic dose records (without <code>SS=1</code>).</li>
 </ul>
-<h2 id="infusion-doses"><a class="header" href="#infusion-doses">Infusion Doses</a></h2>
-<p>For IV infusions, set <code>RATE</code> to the infusion rate (amount per time unit):</p>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
-1,0,.,1,500,1,50,1
-</code></pre>
-<p>This administers 500 units at a rate of 50 units/hour (duration = 10 hours).</p>
-<h2 id="steady-state-dosing"><a class="header" href="#steady-state-dosing">Steady-State Dosing</a></h2>
-<p>For steady-state simulations, set <code>SS=1</code> and <code>II</code> to the dosing interval:</p>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,SS,II,MDV
-1,0,.,1,100,1,1,12,1
-1,0.5,25.3,0,.,.,.,.,0
-</code></pre>
-<p>This assumes the subject has reached steady state with 100 units every 12 hours before the observation at TIME=0.5.</p>
-<p>SS=1 is supported on every prediction path: analytical (1-/2-/3-cpt with
-or without time-varying covariates) and ODE. SS=1 also composes with
-<code>LAGTIME</code> — the lagged SS curve at time <code>t</code> equals the un-lagged curve
-at <code>t - lagtime</code>. See <a href="model-file/steady-state.html">Steady-State Doses</a>
-for the full reference, including the data-validation warnings emitted
-for malformed rows (missing <code>II</code>, overlapping infusions).</p>
-<h2 id="multiple-doses"><a class="header" href="#multiple-doses">Multiple Doses</a></h2>
-<p>Multiple doses are supported as separate rows:</p>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,MDV
-1,0,.,1,100,1,1
-1,0.5,9.49,0,.,.,0
-1,12,.,1,100,1,1
-1,12.5,15.2,0,.,.,0
-1,24,.,1,100,1,1
-1,24.5,18.1,0,.,.,0
-</code></pre>
-<h2 id="column-name-case"><a class="header" href="#column-name-case">Column Name Case</a></h2>
-<p>Column names are case-insensitive. <code>ID</code>, <code>Id</code>, and <code>id</code> are all recognized. Covariate columns preserve their case as declared in the CSV header.</p>
+<h3 id="ss2"><a class="header" href="#ss2"><code>SS=2</code></a></h3>
+<p>NONMEM’s <code>SS=2</code> semantic (“add to the existing train without
+re-equilibrating”) is <strong>not implemented</strong>. The CSV reader accepts any
+positive integer in the <code>SS</code> column and treats it as a boolean: an
+<code>SS=2</code> row is parsed identically to <code>SS=1</code> and goes through the
+re-equilibration path described above. This is not bit-for-bit
+NONMEM-compatible for datasets that distinguish <code>SS=1</code> and <code>SS=2</code>
+records — convert <code>SS=2</code> rows to explicit dose records if the
+no-re-equilibration semantic is required.</p>
+<h2 id="nonmem-equivalence"><a class="header" href="#nonmem-equivalence">NONMEM equivalence</a></h2>
+<ul>
+<li><code>SS=1</code>, <code>II=24</code>, <code>AMT=100</code>, <code>RATE=0</code> → matches NONMEM SS=1 bolus.</li>
+<li><code>SS=1</code>, <code>II=24</code>, <code>AMT=100</code>, <code>RATE=25</code> → matches NONMEM SS=1 infusion
+of duration <code>4</code> (= <code>AMT/RATE</code>), repeated every 24 time units.</li>
+<li>The SS state is computed assuming the same <code>CL</code>, <code>V</code>, etc. as the
+current PK record — i.e. ferx uses the <strong>current</strong> subject’s
+parameters, not a separate “SS parameters” set. This matches
+NONMEM’s <code>$PK</code> evaluation convention.</li>
+</ul>
+<h2 id="validation"><a class="header" href="#validation">Validation</a></h2>
+<p>Closed-form SS expressions are unit-tested against 200- to 400-term
+numerical pulse sums at 1e-9 relative tolerance (see
+<code>src/pk/one_compartment.rs::tests::test_ss_*</code>, similarly for 2-cpt and
+3-cpt). The ODE and event-driven paths are cross-checked against the
+analytical closed forms in their own test modules. The end-to-end fit
+path is covered by <code>tests/ss_fit_smoke.rs</code>.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="estimation/iov.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../model-file/lagtime.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="cli.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../model-file/error-model.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -339,11 +409,11 @@ for malformed rows (missing <code>II</code>, overlapping infusions).</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="estimation/iov.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../model-file/lagtime.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="cli.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../model-file/error-model.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
@@ -363,16 +433,16 @@ for malformed rows (missing <code>II</code>, overlapping infusions).</p>
         </script>
 
 
-        <script src="elasticlunr-ef4e11c1.min.js"></script>
-        <script src="mark-09e88c2c.min.js"></script>
-        <script src="searcher-c2a407aa.js"></script>
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
 
-        <script src="clipboard-1626706a.min.js"></script>
-        <script src="highlight-abc7f01d.js"></script>
-        <script src="book-a0b12cfe.js"></script>
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
 
         <!-- Custom JS scripts -->
-        <script src="mathjax-config-cc82dc7f.js"></script>
+        <script src="../mathjax-config-cc82dc7f.js"></script>
 
 
 

@@ -83,10 +83,10 @@ intended; prefer using only one of the two names per model.
   before its record time. Prefer a log-link (`exp(...)`) or any other
   parameterisation that keeps `lagtime ≥ 0`. ferx emits a warning in
   `FitResult.warnings` when the initial typical-value lagtime is negative.
-- Steady-state doses (`SS=1`) combined with non-zero `lagtime` are not
-  currently supported; the SS train is treated as unshifted, with only
-  the post-SS continuation lagged. ferx emits a warning in
-  `FitResult.warnings` when any subject has both an `SS=1` dose record
-  and a model with declared `LAGTIME`. Tracked as a follow-up.
+- Steady-state doses (`SS=1`) combined with non-zero `lagtime` are
+  fully supported. Under linear superposition the lagged SS curve at
+  time `t` equals the un-lagged SS curve evaluated at `t - lagtime`,
+  i.e. `C_ss(t, L) = C_ss(t - L, 0)`. See
+  [Steady-State Doses](steady-state.md) for the full SS=1 reference.
 
 See `examples/oral_with_lagtime.ferx` for a runnable model.

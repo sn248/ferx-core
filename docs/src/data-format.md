@@ -133,6 +133,13 @@ ID,TIME,DV,EVID,AMT,CMT,SS,II,MDV
 
 This assumes the subject has reached steady state with 100 units every 12 hours before the observation at TIME=0.5.
 
+SS=1 is supported on every prediction path: analytical (1-/2-/3-cpt with
+or without time-varying covariates) and ODE. SS=1 also composes with
+`LAGTIME` — the lagged SS curve at time `t` equals the un-lagged curve
+at `t - lagtime`. See [Steady-State Doses](model-file/steady-state.md)
+for the full reference, including the data-validation warnings emitted
+for malformed rows (missing `II`, overlapping infusions).
+
 ## Multiple Doses
 
 Multiple doses are supported as separate rows:

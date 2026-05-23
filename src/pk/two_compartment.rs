@@ -167,7 +167,7 @@ fn ss_coeff(lambda: f64, ii: f64) -> f64 {
 
 /// Two-compartment IV bolus at steady state.
 pub fn two_cpt_iv_bolus_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || dose.ii <= 0.0 {
+    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q < 0.0 || dose.ii <= 0.0 {
         return 0.0;
     }
     let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
@@ -186,7 +186,7 @@ pub fn two_cpt_iv_bolus_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v
 /// Closed form requires `T_inf ≤ II` (non-overlapping infusions); returns 0.0
 /// otherwise. The `api.rs` warning catches this case for users.
 pub fn two_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || dose.ii <= 0.0 {
+    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q < 0.0 || dose.ii <= 0.0 {
         return 0.0;
     }
     let dur = dose.duration;
@@ -242,7 +242,7 @@ pub fn two_cpt_oral_f_ss(
     ka: f64,
     f_bio: f64,
 ) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || ka <= 0.0 || dose.ii <= 0.0 {
+    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || ka <= 0.0 || v2 <= 0.0 || q < 0.0 || dose.ii <= 0.0 {
         return 0.0;
     }
     let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);

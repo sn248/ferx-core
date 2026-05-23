@@ -727,6 +727,45 @@ mod tests {
     }
 
     #[test]
+    fn test_ss_oral_lhopital_ka_near_beta_matches_numerical_sum() {
+        // The L'Hopital branch in `bateman_ss` activates per-eigenvalue —
+        // verify the β branch independently of α (Copilot review on #77).
+        let (_, beta, _, _, _) = macro_rates_three_cpt(CL, V1, Q2, V2, Q3, V3);
+        let ka = beta;
+        let ii: f64 = 24.0;
+        let dose = ss_bolus_dose(100.0, ii);
+        let single = bolus_dose(100.0);
+        for &t in &[0.5, 2.0, 12.0, 23.0] {
+            let cf = three_cpt_oral_ss(&dose, t, CL, V1, Q2, V2, Q3, V3, ka);
+            let num = ss_numerical_sum(t, ii, |tt| {
+                three_cpt_oral(&single, tt, CL, V1, Q2, V2, Q3, V3, ka)
+            });
+            assert_relative_eq!(cf, num, epsilon = 1e-5, max_relative = 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_ss_oral_lhopital_ka_near_gamma_matches_numerical_sum() {
+        // γ-branch coverage (Copilot review on #77). γ is the slowest
+        // disposition rate; with ka = γ the SS series tail is widest, so
+        // the numerical-sum oracle uses more terms via the default N=400.
+        let (_, _, gamma, _, _) = macro_rates_three_cpt(CL, V1, Q2, V2, Q3, V3);
+        let ka = gamma;
+        let ii: f64 = 24.0;
+        let dose = ss_bolus_dose(100.0, ii);
+        let single = bolus_dose(100.0);
+        for &t in &[0.5, 2.0, 12.0, 23.0] {
+            let cf = three_cpt_oral_ss(&dose, t, CL, V1, Q2, V2, Q3, V3, ka);
+            let num = ss_numerical_sum(t, ii, |tt| {
+                three_cpt_oral(&single, tt, CL, V1, Q2, V2, Q3, V3, ka)
+            });
+            // γ-branch: looser tolerance because the slow-tail truncation
+            // in the 400-term numerical sum is the dominant residual.
+            assert_relative_eq!(cf, num, epsilon = 1e-4, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
     fn test_ss_infusion_during_matches_numerical_sum() {
         let ii: f64 = 24.0;
         let rate = 50.0; // amt=100, duration=2

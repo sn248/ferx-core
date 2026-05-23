@@ -144,10 +144,12 @@ pub fn predict_concentration(
 
 /// Concentration contribution from a single dose at elapsed time tau.
 ///
-/// When `dose.ss` is true and a steady-state closed form is available
-/// (currently 1-cpt only), the SS variant is used. For models without an
-/// SS closed form, SS doses fall back to the single-dose response — see
-/// the warning emitted from `api.rs` when this happens.
+/// When `dose.ss` is true and `dose.ii > 0`, the SS closed-form variant
+/// is dispatched for every analytical PK model (1-/2-/3-cpt IV bolus,
+/// oral, and infusion). The malformed SS configurations that the
+/// closed forms don't handle — `ii <= 0` and `T_inf > ii` for infusion —
+/// fall through to the single-dose formula and are flagged by the
+/// data-validation warning in `api.rs`.
 fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParams) -> f64 {
     let cl = p.cl();
     let v = p.v();

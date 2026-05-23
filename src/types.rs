@@ -708,8 +708,16 @@ impl ScalingSpec {
                                 scale_fn(theta, eta, covariates, pk)
                             }
                             Self::PerCmt(_) => {
+                                // Nested PerCmt is rejected at parse time;
+                                // a hand-constructed CompiledModel that
+                                // bypasses validation lands here. Return
+                                // NaN (loud failure → NaN OFV) rather than
+                                // 1.0, which would silently produce a
+                                // mis-scaled fit in release builds where
+                                // the debug_assert is stripped. (Caught by
+                                // Copilot review on PR #85.)
                                 debug_assert!(false, "nested PerCmt rejected at parse time");
-                                1.0
+                                f64::NAN
                             }
                         };
                         if s > 0.0 && s.is_finite() {
@@ -741,6 +749,21 @@ impl ScalingSpec {
             Self::None | Self::ScalarScale(_) | Self::ExpressionScale { .. } | Self::PerCmt(_) => {
                 false
             }
+        }
+    }
+
+    /// Returns true when materialising this spec needs a `pk_param_fn`
+    /// evaluation. Only `ExpressionScale` consults `pk` (either directly
+    /// or as an inner entry inside `PerCmt`). Lets callers skip the
+    /// pk eval — which may be expensive on models with parsed expressions
+    /// or NN forward passes — for the common `None` / `ScalarScale`
+    /// cases. (Caught by Copilot review on PR #85.)
+    #[inline]
+    pub fn needs_pk_eval(&self) -> bool {
+        match self {
+            Self::None | Self::ScalarScale(_) => false,
+            Self::ExpressionScale { .. } => true,
+            Self::PerCmt(map) => map.values().any(Self::needs_pk_eval),
         }
     }
 }

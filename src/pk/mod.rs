@@ -43,15 +43,26 @@ pub fn apply_scaling(
     // and the AD path in `inner_optimizer.rs` see identical semantics.
     // Any scaling change is felt by both paths automatically.
     //
-    // Compute pk once per subject (subject-static, matching the
-    // documented Phase 1 simplification). ExpressionScale closures
-    // consult it; the other variants ignore it.
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // Only evaluate pk when at least one ExpressionScale closure (top
+    // level or nested inside PerCmt) actually needs it. ScalarScale and
+    // PerCmt-with-scalar-entries skip the pk_param_fn call, which can
+    // be expensive on models with parsed-expression indiv params or NN
+    // forward passes. (Caught by Copilot review on PR #85.)
+    let pk_owned;
+    let pk_ref: &PkParams = if model.scaling.needs_pk_eval() {
+        pk_owned = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        &pk_owned
+    } else {
+        static DEFAULT_PK: PkParams = PkParams {
+            values: [0.0; crate::types::MAX_PK_PARAMS],
+        };
+        &DEFAULT_PK
+    };
     let scales = model.scaling.build_obs_scale_array(
         theta,
         eta,
         &subject.covariates,
-        &pk,
+        pk_ref,
         &subject.obs_cmts,
     );
     for (i, pred) in preds.iter_mut().enumerate() {

@@ -14,23 +14,34 @@ use crate::ad::ad_gradients::{self, FlatDoseData};
 /// suitable for passing to the analytical AD entry points
 /// (`individual_nll_ad`, `predict_all_ad`) as a `Const` slice.
 ///
-/// Computes pk once per call so `ScalingSpec::ExpressionScale` closures
-/// can reference individual parameters by name (subject-static — matches
-/// the FD path in `pk::apply_scaling`). For `ScalingSpec::None` /
-/// `ScalarScale` the pk computation is technically wasted, but at one
-/// `pk_param_fn` call per gradient evaluation the cost is negligible
-/// compared to the AD pass itself.
+/// Computes pk once per call only when `model.scaling.needs_pk_eval()`
+/// — i.e. there's at least one `ExpressionScale` closure (top level or
+/// nested in `PerCmt`) that consults pk. Scalar-only scaling skips the
+/// pk_param_fn call (which can be expensive on models with parsed
+/// expressions or NN forward passes). (Caught by Copilot review on PR
+/// #85.)
 #[cfg(feature = "autodiff")]
-fn build_scale_array_for_ad(
+pub(crate) fn build_scale_array_for_ad(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> Vec<f64> {
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let pk_owned;
+    let pk_ref: &PkParams = if model.scaling.needs_pk_eval() {
+        pk_owned = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        &pk_owned
+    } else {
+        // Safe placeholder: no ExpressionScale closure will fire when
+        // needs_pk_eval() is false, so pk values are never read.
+        static DEFAULT_PK: PkParams = PkParams {
+            values: [0.0; crate::types::MAX_PK_PARAMS],
+        };
+        &DEFAULT_PK
+    };
     model
         .scaling
-        .build_obs_scale_array(theta, eta, &subject.covariates, &pk, &subject.obs_cmts)
+        .build_obs_scale_array(theta, eta, &subject.covariates, pk_ref, &subject.obs_cmts)
 }
 
 /// Build a per-event scale array for the event-driven AD entry points
@@ -44,7 +55,7 @@ fn build_scale_array_for_ad(
 /// NaN/0 in a non-obs slot would propagate through the masked add as NaN
 /// (per IEEE 754 `0 * NaN = NaN`).
 #[cfg(feature = "autodiff")]
-fn build_event_scale_array_for_ad(
+pub(crate) fn build_event_scale_array_for_ad(
     model: &CompiledModel,
     subject: &Subject,
     event_data: &crate::ad::event_driven_ad::FlatEventData,

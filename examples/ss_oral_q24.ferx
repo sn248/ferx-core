@@ -1,0 +1,41 @@
+# Steady-state (SS=1) example — 1-cpt oral PK on q24h maintenance dosing.
+#
+# Each subject in `data/ss_oral_q24.csv` carries an SS=1 record at t=0
+# with II=24h. The system is initialised to its steady-state value from
+# the infinite-past pulse train at the time of the recorded dose, then
+# observations are taken within the dosing interval (t = 1, 4, 12, 23h).
+#
+# Run:
+#   cargo run --release -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
+#
+# Simulation truth: TVCL=2.0, TVV=20.0, TVKA=1.5. The initial values
+# below are intentionally biased (1.5-2x off truth in each direction)
+# so the optimiser has meaningful work to do — running this example
+# should report final estimates close to the truth values above.
+
+[parameters]
+  theta TVCL(5.0, 0.01, 50.0)
+  theta TVV(5.0, 0.5, 200.0)
+  theta TVKA(4.5, 0.05, 20.0)
+
+  omega ETA_CL ~ 0.05
+  omega ETA_V  ~ 0.05
+  omega ETA_KA ~ 0.1
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 100
+  covariance = true

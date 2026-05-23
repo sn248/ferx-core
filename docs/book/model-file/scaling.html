@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Simulation - FeRx-NLME Documentation</title>
+        <title>Scaling - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -35,17 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-<<<<<<< HEAD
-            window.path_to_searchindex_js = "../searchindex-660261eb.js";
-        </script>
-        <!-- Start loading toc.js asap -->
-        <script src="../toc-808a48a8.js"></script>
-=======
             window.path_to_searchindex_js = "../searchindex-38383e4d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-f187808c.js"></script>
->>>>>>> 632a578 (feat(parser): add [scaling] block for unit conversion and amount-based ODEs (Phase 1, closes #2))
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -184,205 +177,106 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="simulation"><a class="header" href="#simulation">Simulation</a></h1>
-<h2 id="simulate"><a class="header" href="#simulate"><code>simulate()</code></a></h2>
-<p>Generate simulated observations from a model with random effects and residual error.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn simulate(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    params: &amp;ModelParameters,
-    n_sim: usize,
-) -&gt; Vec&lt;SimulationResult&gt;
-<span class="boring">}</span></code></pre>
-<p><strong>Parameters:</strong></p>
+                        <h1 id="scaling"><a class="header" href="#scaling">Scaling</a></h1>
+<p>The optional <code>[scaling]</code> block declares how the structural model’s raw
+output maps to the observed <code>DV</code>. It exists so the user does not have to
+fold unit conversion or amount-to-concentration arithmetic into the
+structural model itself — keeping <code>[odes]</code> and <code>[structural_model]</code>
+readable, and making mixed-unit data (e.g. data in ng/mL when the model
+thinks in mg/L) straightforward.</p>
+<p>The convention is <strong>divisive</strong>: <code>pred_scaled = pred_raw / scale</code>. This
+matches the natural reading of <code>obs_scale = V/1000</code> as <em>“divide amount by
+V/1000 to get concentration in the user’s units.”</em></p>
+<p>Three forms are supported. Each is optional; omitting <code>[scaling]</code> keeps
+the historical “raw prediction equals DV” behaviour.</p>
+<h2 id="form-a--scalar-divisor"><a class="header" href="#form-a--scalar-divisor">Form A — scalar divisor</a></h2>
+<p>Use for fixed unit conversion (e.g. mg/L → mg/mL is a constant 1000).</p>
+<pre><code class="language-ferx">[scaling]
+  obs_scale = 1000
+</code></pre>
+<p>Applies to analytical PK models and ODE models alike: every prediction
+is divided by the constant before reaching the residual error model.</p>
+<h2 id="form-b--expression-divisor"><a class="header" href="#form-b--expression-divisor">Form B — expression divisor</a></h2>
+<p>Use when the scale depends on theta, eta, or a covariate.</p>
+<pre><code class="language-ferx">[scaling]
+  obs_scale = WT / 70
+</code></pre>
+<p>In Phase 1, expressions may reference:</p>
 <ul>
-<li><code>model</code>: Compiled model</li>
-<li><code>population</code>: Template population (dose events and observation times are used; DV values are ignored)</li>
-<li><code>params</code>: True parameter values for simulation</li>
-<li><code>n_sim</code>: Number of simulation replicates</li>
+<li>thetas (e.g. <code>TVV</code>),</li>
+<li>etas (e.g. <code>ETA_CL</code>),</li>
+<li>covariates (e.g. <code>WT</code>, <code>CR</code>).</li>
 </ul>
-<p><strong>Returns:</strong> Vector of <code>SimulationResult</code>, one per observation per subject per replicate.</p>
-<p><strong>Example:</strong></p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>let model = parse_model_file(Path::new("model.ferx"))?;
-let population = read_nonmem_csv(Path::new("data.csv"), None)?;
+<p>Phase 1 <strong>does not</strong> support references to individual parameters (e.g.
+<code>obs_scale = 1000 / V</code>) — the parser will reject these with a clear
+error. Use the underlying theta (<code>TVV</code>) for now, or switch to Form C if
+you need an individual-parameter-driven scale on an ODE model.</p>
+<p>The scale is evaluated <strong>once per subject</strong> with subject-level
+covariates (matching the no-TV path). Time-varying covariate support for
+expression scales is a Phase 1.5 follow-up.</p>
+<h2 id="form-c--explicit-output-expression-ode-only"><a class="header" href="#form-c--explicit-output-expression-ode-only">Form C — explicit output expression (ODE only)</a></h2>
+<p>Use when the ODE state is held as an amount and the observation is a
+concentration. Form C replaces the default <code>obs_cmt</code> readout entirely.</p>
+<pre><code class="language-ferx">[structural_model]
+  ode(states=[depot, central])     # no obs_cmt — Form C provides it
 
-// Simulate 1000 replicates
-let sims = simulate(&amp;model, &amp;population, &amp;model.default_params, 1000);
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central   # central holds amount
 
-for sim in &amp;sims[..5] {
-    println!("Sim {}, ID {}, TIME {}, IPRED {:.3}, DV {:.3}",
-             sim.sim, sim.id, sim.time, sim.ipred, sim.dv_sim);
-}
-<span class="boring">}</span></code></pre>
-<h2 id="simulate_with_seed"><a class="header" href="#simulate_with_seed"><code>simulate_with_seed()</code></a></h2>
-<p>Same as <code>simulate()</code> but with a fixed random seed for reproducibility.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn simulate_with_seed(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    params: &amp;ModelParameters,
-    n_sim: usize,
-    seed: u64,
-) -&gt; Vec&lt;SimulationResult&gt;
-<span class="boring">}</span></code></pre>
-<h2 id="predict"><a class="header" href="#predict"><code>predict()</code></a></h2>
-<p>Population predictions without random effects (eta = 0). No simulation noise is added.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn predict(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    params: &amp;ModelParameters,
-) -&gt; Vec&lt;PredictionResult&gt;
-<span class="boring">}</span></code></pre>
-<p><strong>Returns:</strong> Vector of <code>PredictionResult</code> with population-level predictions.</p>
-<p><strong>Example:</strong></p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>let preds = predict(&amp;model, &amp;population, &amp;model.default_params);
-for p in &amp;preds {
-    println!("ID {}, TIME {}, PRED {:.3}", p.id, p.time, p.pred);
-}
-<span class="boring">}</span></code></pre>
-<h2 id="simulate_with_uncertainty"><a class="header" href="#simulate_with_uncertainty"><code>simulate_with_uncertainty()</code></a></h2>
-<p>Simulate observations while propagating <strong>population parameter uncertainty</strong>.
-For each parameter draw from the uncertainty distribution, etas (from the
-drawn Omega) and epsilons (from the drawn Sigma) are sampled — giving
-simulation bands that include both individual variability <em>and</em> uncertainty
-in the population estimates.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub fn simulate_with_uncertainty(
-    model: &amp;CompiledModel,
-    population: &amp;Population,
-    fit_result: &amp;FitResult,
-    opts: &amp;SimulateUncertaintyOptions,
-) -&gt; Result&lt;Vec&lt;SimulationResult&gt;, String&gt;
-<span class="boring">}</span></code></pre>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub struct SimulateUncertaintyOptions {
-    pub n_uncertainty_draws: usize,      // parameter sets drawn
-    pub n_sim_per_draw: usize,           // eta/eps replicates per draw
-    pub method: UncertaintyMethod,       // Asymptotic | Sir
-    pub seed: Option&lt;u64&gt;,
-}
-
-pub enum UncertaintyMethod {
-    Asymptotic,   // MVN around ML estimate using FitResult.covariance_matrix
-    Sir,          // resamples from FitResult.sir_resamples_packed
-}
-<span class="boring">}</span></code></pre>
-<p><strong>Parameters:</strong></p>
+[scaling]
+  y = central / V
+</code></pre>
+<p>The right-hand side may reference state names (<code>depot</code>, <code>central</code>),
+individual parameters (<code>CL</code>, <code>V</code>, <code>KA</code>), and covariates. Thetas and
+etas are <strong>not</strong> directly in scope — they are folded into individual
+parameters by <code>[individual_parameters]</code> before <code>y</code> is evaluated.</p>
+<p>Form C is only valid for ODE models. The parser rejects <code>y = ...</code> on
+analytical models with a clear error.</p>
+<h2 id="comparison-with-nonmem-and-nlmixr2"><a class="header" href="#comparison-with-nonmem-and-nlmixr2">Comparison with NONMEM and nlmixr2</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Need</th><th>NONMEM</th><th>nlmixr2</th><th>ferx</th></tr>
+</thead>
+<tbody>
+<tr><td>Scalar unit conversion</td><td><code>S1 = 1000</code></td><td>(multiplier in <code>cmt</code>/<code>f</code>)</td><td><code>[scaling] obs_scale = 1000</code></td></tr>
+<tr><td>Amount-state ODE with concentration DV</td><td><code>S2 = V/1000</code> plus <code>Y = A(2)/S2</code></td><td><code>cmt(central); f = central/V/1000</code></td><td><code>[scaling] y = central / (V/1000)</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The ferx form is divisive by convention, so an <code>obs_scale = V/1000</code>
+reads as “divide raw by V/1000” — matching NONMEM’s <code>S2</code>.</p>
+<h2 id="interaction-with-gradients-ad-vs-fd"><a class="header" href="#interaction-with-gradients-ad-vs-fd">Interaction with gradients (AD vs FD)</a></h2>
 <ul>
-<li><code>fit_result</code>: Result of a previous <code>fit()</code> call. Must include
-<code>covariance_matrix</code> (Asymptotic) or <code>sir_resamples_packed</code> (SIR).</li>
-<li><code>opts.n_uncertainty_draws</code>: number of parameter sets drawn.</li>
-<li><code>opts.n_sim_per_draw</code>: number of subject-level replicates per draw.</li>
-<li><code>opts.method</code>: how to draw the parameter sets.</li>
+<li>Scalar <code>obs_scale = K</code> works with both <code>gradient = ad</code> and
+<code>gradient = fd</code>. The constant is threaded through the AD entry points
+as a <code>Const</code> argument.</li>
+<li>Expression <code>obs_scale = &lt;expr&gt;</code> is supported only with
+<code>gradient = fd</code> in Phase 1. The parser rejects the combination of
+expression scaling with AD gradients and prints the required flag.</li>
 </ul>
-<p><strong>Returns:</strong> <code>Vec&lt;SimulationResult&gt;</code> of length <code>n_uncertainty_draws * n_sim_per_draw * n_subjects * n_obs</code>. Each row carries a <code>draw</code> index
-(1..=n_uncertainty_draws) and a <code>sim</code> index (1..=n_sim_per_draw).</p>
-<p><strong>Prerequisites:</strong></p>
-<ul>
-<li>For <code>UncertaintyMethod::Asymptotic</code>: run <code>fit()</code> with
-<code>run_covariance_step = true</code> (or <code>covariance = true</code> in <code>[fit_options]</code>).</li>
-<li>For <code>UncertaintyMethod::Sir</code>: run with <code>sir = true</code> <em>and</em>
-<code>sir_keep_samples = true</code> so the resampled vectors are kept on the
-<code>FitResult</code>.</li>
-</ul>
-<p><strong>Example:</strong></p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>let fit_opts = FitOptions {
-    run_covariance_step: true,
-    ..FitOptions::default()
-};
-let fit = fit(&amp;model, &amp;population, &amp;model.default_params, &amp;fit_opts)?;
-
-let sims = simulate_with_uncertainty(
-    &amp;model,
-    &amp;population,
-    &amp;fit,
-    &amp;SimulateUncertaintyOptions {
-        n_uncertainty_draws: 200,
-        n_sim_per_draw: 10,
-        method: UncertaintyMethod::Asymptotic,
-        seed: Some(42),
-    },
-)?;
-<span class="boring">}</span></code></pre>
-<h2 id="result-types"><a class="header" href="#result-types">Result Types</a></h2>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub struct SimulationResult {
-    pub draw: usize,    // Uncertainty draw index (1-indexed; always 1 for simulate())
-    pub sim: usize,     // Replicate number within a draw (1-indexed)
-    pub id: String,     // Subject ID
-    pub time: f64,      // Observation time
-    pub ipred: f64,     // Individual prediction (no residual error)
-    pub dv_sim: f64,    // Simulated observation (with residual error)
-}
-
-pub struct PredictionResult {
-    pub id: String,
-    pub time: f64,
-    pub pred: f64,      // Population prediction (eta = 0)
-}
-<span class="boring">}</span></code></pre>
-<h2 id="simulation-process"><a class="header" href="#simulation-process">Simulation Process</a></h2>
-<p>For each replicate and each subject:</p>
-<ol>
-<li>Sample random effects: \( \eta_i \sim N(0, \Omega) \) using the Cholesky factor \( L \): \( \eta = L \cdot z \), where \( z \sim N(0, I) \)</li>
-<li>Compute individual PK parameters via <code>pk_param_fn(theta, eta, covariates)</code></li>
-<li>Generate predictions using the structural model</li>
-<li>Add residual error: \( DV = IPRED + \sqrt{V} \cdot \epsilon \), where \( \epsilon \sim N(0, 1) \) and \( V \) is the residual variance from the error model</li>
-</ol>
-<h2 id="simulation-with-uncertainty-process"><a class="header" href="#simulation-with-uncertainty-process">Simulation with Uncertainty Process</a></h2>
-<p><code>simulate_with_uncertainty()</code> wraps the steps above in an outer loop over
-parameter draws:</p>
-<ol>
-<li>
-<p><strong>Outer loop</strong> — for each of <code>n_uncertainty_draws</code>, draw a population
-parameter set \( (\theta_k, \Omega_k, \Sigma_k) \) from the uncertainty
-distribution.</p>
-<ul>
-<li><strong>Asymptotic</strong>: \( x_k = \hat{x} + L_\text{cov} z \) in packed log-space
-(theta, Cholesky-omega, sigma share one packed vector), then unpack —
-theta, Omega, and Sigma are perturbed coherently from a single MVN draw.</li>
-<li><strong>SIR</strong>: pick a parameter vector at random from
-<code>FitResult.sir_resamples_packed</code> (the resampled pool retained from the
-SIR step).
-Draws that fall outside the parameter bounds or yield non-positive
-theta/omega/sigma are rejected and resampled (up to <code>10 × n_uncertainty_draws</code> attempts).</li>
-</ul>
-</li>
-<li>
-<p><strong>Inner loop</strong> — for the drawn \( (\theta_k, \Omega_k, \Sigma_k) \), run
-<code>n_sim_per_draw</code> replicates of the standard simulation process above.
-Etas are drawn from \( N(0, \Omega_k) \) and epsilons from the drawn
-\( \Sigma_k \).</p>
-</li>
-</ol>
-<p>The resulting <code>SimulationResult</code> rows are tagged with both <code>draw</code> and <code>sim</code>
-so downstream code can compute either marginal bands (over all draws and
-sims) or hierarchical bands (e.g. median across sims within each draw, then
-percentiles across draws).</p>
+<h2 id="interaction-with-sde--diffusion"><a class="header" href="#interaction-with-sde--diffusion">Interaction with SDE / <code>[diffusion]</code></a></h2>
+<p>The EKF / SDE path requires a single observable compartment index for
+the Kalman update. SDE models can use Forms A and B (post-multiplied at
+the end of the prediction path) but cannot use Form C — the parser
+rejects SDE models that omit <code>obs_cmt</code> from <code>[structural_model]</code>.</p>
+<h2 id="multi-analyte-forward-compatibility"><a class="header" href="#multi-analyte-forward-compatibility">Multi-analyte (forward compatibility)</a></h2>
+<p><code>[scaling]</code> is per-model in Phase 1. When ferx adds CMT-keyed scaling
+(NONMEM’s <code>if (CMT==2) Y = A2/V2</code>-style routing), the same block will
+grow <code>y[CMT=1] = &lt;expr&gt;</code> / <code>y[CMT=2] = &lt;expr&gt;</code> and
+<code>obs_scale[CMT=...]</code> variants. Existing single-form usage will continue
+to work unchanged.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../api/fitting.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../model-file/ode-models.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../api/parsing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../model-file/diffusion.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -392,11 +286,11 @@ percentiles across draws).</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../api/fitting.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../model-file/ode-models.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../api/parsing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../model-file/diffusion.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

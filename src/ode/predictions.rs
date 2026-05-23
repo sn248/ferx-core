@@ -27,6 +27,105 @@ fn is_real_infusion(d: &DoseEvent) -> bool {
     d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
 }
 
+/// Number of dosing cycles to simulate when pre-equilibrating an SS=1
+/// dose. With a typical t₁/₂/II ratio under 2 (the common clinical range)
+/// this is comfortably past saturation — each additional cycle adds
+/// `exp(-k·II)` of the prior decay, so by N=50 the truncation tail is
+/// well below 1e-6 for any reasonable PK.
+const SS_EQUILIBRATION_CYCLES: usize = 50;
+
+/// Pre-equilibrate the ODE state to its steady-state value for an SS=1
+/// dose with interval `dose.ii`. NONMEM SS=1 semantics: at the time of
+/// the SS dose, the compartments are loaded with the steady-state
+/// amounts from an infinite-past pulse train. No closed form is
+/// available for arbitrary ODE systems, so we numerically expand the
+/// train: starting from a zero state, simulate
+/// [`SS_EQUILIBRATION_CYCLES`] cycles of `(apply dose; integrate for II)`.
+/// The state after the loop equals the "just-before-next-pulse" SS state;
+/// the caller then applies the SS dose itself through the normal flow,
+/// recovering the at-pulse SS amount.
+///
+/// `dose.ii > 0` and `dose.cmt` valid are required (callers guard this).
+/// For SS infusions (`is_real_infusion(dose)`), each cycle integrates a
+/// `dose.duration`-long active-infusion window followed by a
+/// `(II - duration)`-long quiet window. The SS form requires
+/// `dose.duration <= dose.ii` (non-overlapping); overlapping pulses
+/// would need a different equilibration scheme and are out of scope —
+/// the existing api.rs warning fires for those.
+fn equilibrate_ss_state(
+    ode: &crate::ode::OdeSpec,
+    pk_params_flat: &[f64],
+    dose: &DoseEvent,
+    opts: &OdeSolverOptions,
+) -> Vec<f64> {
+    let n = ode.n_states;
+    let mut u = vec![0.0; n];
+
+    if dose.ii <= 0.0 || dose.cmt == 0 {
+        return u;
+    }
+    let cmt_idx = dose.cmt - 1;
+    if cmt_idx >= n {
+        return u;
+    }
+
+    let is_inf = is_real_infusion(dose);
+    let t_inf = dose.duration;
+    if is_inf && t_inf > dose.ii {
+        // Overlapping infusions; no closed-form / simple equilibration.
+        return u;
+    }
+
+    for _ in 0..SS_EQUILIBRATION_CYCLES {
+        if is_inf {
+            // Active-infusion window: wrapped RHS injects rate into the
+            // dosing compartment.
+            let rate = dose.rate;
+            let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+                (ode.rhs)(y, p, t, dy);
+                if cmt_idx < dy.len() {
+                    dy[cmt_idx] += rate;
+                }
+            };
+            let sol = solve_ode(
+                &wrapped_rhs,
+                &u,
+                (0.0, t_inf),
+                pk_params_flat,
+                &[t_inf],
+                opts,
+            );
+            if let Some(last) = sol.last() {
+                u.copy_from_slice(&last.u);
+            }
+            // Quiet window from end-of-infusion to end-of-cycle.
+            let quiet = dose.ii - t_inf;
+            if quiet > 0.0 {
+                let sol = solve_ode(&ode.rhs, &u, (0.0, quiet), pk_params_flat, &[quiet], opts);
+                if let Some(last) = sol.last() {
+                    u.copy_from_slice(&last.u);
+                }
+            }
+        } else {
+            // Bolus pulse + decay for one cycle.
+            u[cmt_idx] += dose.amt;
+            let sol = solve_ode(
+                &ode.rhs,
+                &u,
+                (0.0, dose.ii),
+                pk_params_flat,
+                &[dose.ii],
+                opts,
+            );
+            if let Some(last) = sol.last() {
+                u.copy_from_slice(&last.u);
+            }
+        }
+    }
+
+    u
+}
+
 /// Returns `(cmt_idx_0based, rate)` for every infusion that is active
 /// throughout the closed segment `[t_start, t_end]`. By construction of the
 /// break-time list (every infusion start and end is a break time), each
@@ -117,11 +216,24 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
         let t_start = break_times[k];
         let t_end = break_times[k + 1];
 
-        // Apply bolus doses at t_start. Infusions don't add to state
-        // instantaneously — they're injected as a derivative term inside
-        // the integrator (see `active_infusions` + wrapped RHS below).
+        // Apply dose effects at t_start in a single pass over the dose
+        // list. Ordering inside the pass matters:
+        //   1. SS=1 + II > 0: pre-equilibrate by overwriting state with
+        //      the SS amount from the infinite-past pulse train (see
+        //      `equilibrate_ss_state`).
+        //   2. Bolus (non-infusion): instantaneous amount jump in the
+        //      dose's compartment, applied on top of any SS preload.
+        // Infusions don't add to state at t_start — they're injected as
+        // a derivative term inside the integrator (see `active_infusions`
+        // + wrapped RHS below).
         for dose in &subject.doses {
-            if (dose.time + lagtime - t_start).abs() < 1e-12 && !is_real_infusion(dose) {
+            if (dose.time + lagtime - t_start).abs() >= 1e-12 {
+                continue;
+            }
+            if dose.ss && dose.ii > 0.0 {
+                u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
+            }
+            if !is_real_infusion(dose) {
                 // dose.cmt is 1-based; state indices are 0-based
                 let cmt_idx = dose.cmt - 1;
                 if cmt_idx < n {
@@ -327,6 +439,13 @@ pub fn ode_predictions_event_driven(
         match kind {
             Kind::Dose => {
                 let d = &subject.doses[idx];
+                // Steady-state (SS=1) dose: reset state and load with the
+                // SS amount from the infinite-past pulse train before the
+                // SS dose's own pulse is applied below. See
+                // `equilibrate_ss_state` for the per-cycle scheme.
+                if d.ss && d.ii > 0.0 {
+                    u = equilibrate_ss_state(ode, &pk_now.values, d, &opts);
+                }
                 // Boluses: add amt to state. Infusions: no instantaneous
                 // change — handled via the wrapped RHS for segments inside
                 // [d.time, d.time + d.duration].
@@ -859,5 +978,93 @@ mod tests {
             epsilon = 1e-4,
             max_relative = 1e-4
         );
+    }
+
+    // --- Steady-state (SS=1) tests ---
+    //
+    // The ODE SS path is verified against the corresponding analytical
+    // 1-cpt SS closed forms (PR #75): a 1-cpt IV-bolus ODE with SS dose
+    // must match `one_cpt_iv_bolus_ss` to RK45 tolerance, and similarly
+    // for infusion. This cross-checks the per-cycle pulse-expansion
+    // equilibration loop in `equilibrate_ss_state`.
+
+    #[test]
+    fn ode_ss_iv_bolus_matches_analytical_ss() {
+        // The test ODE stores compartment AMOUNT (dA/dt = -ke·A), while the
+        // analytical formula returns CONCENTRATION = amount/V. Divide
+        // before comparing.
+        use crate::pk::one_cpt_iv_bolus_ss;
+        let cl = 5.0_f64;
+        let v = 80.0_f64;
+        let amt = 1000.0_f64;
+        let ii = 12.0_f64;
+        // Sample times within and beyond one dosing interval.
+        let obs_times = vec![1.0, 4.0, 8.0, 11.0, 14.0, 24.0];
+        let dose = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
+        let subj = make_subject(vec![dose.clone()], obs_times.clone());
+        let pk = pk_one(cl, v);
+        let ode = one_cpt_ode_spec();
+
+        let preds = ode_predictions(&ode, &pk.values, &subj);
+        assert_eq!(preds.len(), obs_times.len());
+
+        for (j, &t) in obs_times.iter().enumerate() {
+            let expected = one_cpt_iv_bolus_ss(&dose, t, cl, v);
+            // RK45 default tolerance is ~1e-6 relative; SS equilibration
+            // truncation at N=50 leaves a ~1e-9 tail. 1e-4 is the safe
+            // headroom across the population.
+            assert_relative_eq!(preds[j] / v, expected, epsilon = 1e-6, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn ode_ss_infusion_matches_analytical_ss() {
+        use crate::pk::one_cpt_infusion_ss;
+        let cl = 5.0_f64;
+        let v = 80.0_f64;
+        let amt = 1000.0_f64;
+        let rate = 250.0_f64; // T_inf = 4 h
+        let ii = 24.0_f64;
+        // Cover during-infusion, post-infusion, and beyond one interval.
+        let obs_times = vec![1.0, 3.5, 4.0, 8.0, 12.0, 23.0, 48.0];
+        let dose = DoseEvent::new(0.0, amt, 1, rate, true, ii);
+        let subj = make_subject(vec![dose.clone()], obs_times.clone());
+        let pk = pk_one(cl, v);
+        let ode = one_cpt_ode_spec();
+
+        let preds = ode_predictions(&ode, &pk.values, &subj);
+        for (j, &t) in obs_times.iter().enumerate() {
+            let expected = one_cpt_infusion_ss(&dose, t, cl, v);
+            assert_relative_eq!(preds[j] / v, expected, epsilon = 1e-6, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn ode_ss_resets_prior_state() {
+        // SS=1 semantics: at the SS dose time, prior compartment state is
+        // discarded and reset to the SS-train value. Build a subject with
+        // a non-SS dose at t=0 (which would normally contribute decay
+        // through to t=10) and an SS=1 dose at t=10. The post-SS-dose
+        // observation must match the SS analytical formula evaluated at
+        // tau = obs_time - 10, independent of the t=0 dose.
+        use crate::pk::one_cpt_iv_bolus_ss;
+        let cl = 5.0;
+        let v = 80.0;
+        let amt = 1000.0;
+        let ii = 12.0;
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(10.0, amt, 1, 0.0, true, ii),
+        ];
+        let obs_times = vec![11.0, 14.0, 20.0];
+        let subj = make_subject(doses.clone(), obs_times.clone());
+        let pk = pk_one(cl, v);
+        let ode = one_cpt_ode_spec();
+
+        let preds = ode_predictions(&ode, &pk.values, &subj);
+        for (j, &t) in obs_times.iter().enumerate() {
+            let expected = one_cpt_iv_bolus_ss(&doses[1], t - 10.0, cl, v);
+            assert_relative_eq!(preds[j] / v, expected, epsilon = 1e-6, max_relative = 1e-4);
+        }
     }
 }

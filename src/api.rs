@@ -313,6 +313,10 @@ pub fn fit(
     options: &FitOptions,
 ) -> Result<FitResult, String> {
     validate_covariates(model, population)?;
+    // Per-CMT scaling needs every observed CMT to have an entry in the
+    // `ScalingSpec::PerCmt` / `OdeReadout::PerCmt` map. The parser can't
+    // check this — it doesn't see the data — so fire here at fit time.
+    pk::validate_per_cmt_scaling(model, &population.subjects)?;
     // If any subject has per-event covariate snapshots that don't carry
     // a variation in covariates the model actually references (e.g.
     // DAY / STIME columns in NONMEM-format datasets), clear those

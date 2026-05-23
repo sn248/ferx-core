@@ -67,7 +67,114 @@ pub fn apply_scaling(
                 preds.iter_mut().for_each(|p| *p = f64::NAN);
             }
         }
+        ScalingSpec::PerCmt(map) => {
+            // Per-CMT dispatch. Pre-fit validation (`validate_per_cmt_scaling`
+            // called from `fit()`) ensures every observed CMT has an entry,
+            // so the missing-CMT branch below is a defensive fallback for
+            // hand-constructed CompiledModels.
+            //
+            // Compute pk once per subject if any inner spec is
+            // ExpressionScale (matches the analytical-form B path's
+            // subject-static evaluation).
+            let needs_pk = map
+                .values()
+                .any(|s| matches!(s, ScalingSpec::ExpressionScale { .. }));
+            let pk = if needs_pk {
+                Some((model.pk_param_fn)(theta, eta, &subject.covariates))
+            } else {
+                None
+            };
+            for (i, pred) in preds.iter_mut().enumerate() {
+                let cmt = subject.obs_cmts.get(i).copied().unwrap_or(0);
+                let inner = match map.get(&cmt) {
+                    Some(s) => s,
+                    None => {
+                        // Validation should have caught this; emit NaN.
+                        *pred = f64::NAN;
+                        continue;
+                    }
+                };
+                let s = match inner {
+                    ScalingSpec::None => 1.0,
+                    ScalingSpec::ScalarScale(k) => *k,
+                    ScalingSpec::ExpressionScale { scale_fn } => scale_fn(
+                        theta,
+                        eta,
+                        &subject.covariates,
+                        pk.as_ref().expect("needs_pk implies pk is Some"),
+                    ),
+                    ScalingSpec::PerCmt(_) => {
+                        debug_assert!(
+                            false,
+                            "nested ScalingSpec::PerCmt should be rejected at parse time"
+                        );
+                        1.0
+                    }
+                };
+                if s > 0.0 && s.is_finite() {
+                    *pred /= s;
+                } else {
+                    *pred = f64::NAN;
+                }
+            }
+        }
     }
+}
+
+/// Validate that every observed CMT in the population has an entry in
+/// the model's `ScalingSpec::PerCmt` map (or any nested `OdeReadout::PerCmt`
+/// readout for ODE models). Called once at the top of `fit()` so missing
+/// entries surface as a clear parse-time-style error rather than silent
+/// NaN predictions at runtime.
+///
+/// Returns `Ok(())` for non-PerCmt scaling. The error message names
+/// every missing CMT explicitly.
+pub fn validate_per_cmt_scaling(model: &CompiledModel, subjects: &[Subject]) -> Result<(), String> {
+    use std::collections::BTreeSet;
+
+    // Collect every CMT that has at least one observation in the population.
+    let mut observed_cmts: BTreeSet<usize> = BTreeSet::new();
+    for subj in subjects {
+        for &cmt in &subj.obs_cmts {
+            observed_cmts.insert(cmt);
+        }
+    }
+
+    // Check ScalingSpec::PerCmt coverage (Forms A/B).
+    if let ScalingSpec::PerCmt(map) = &model.scaling {
+        let missing: Vec<usize> = observed_cmts
+            .iter()
+            .copied()
+            .filter(|c| !map.contains_key(c))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "[scaling]: per-CMT scaling is missing entries for observed CMTs {:?}. \
+                 Every observed CMT must have an `obs_scale[CMT=N]` (or `y[CMT=N]` for ODE) entry.",
+                missing
+            ));
+        }
+    }
+
+    // Check OdeReadout::PerCmt coverage (Form C per-CMT).
+    if let Some(ref ode) = model.ode_spec {
+        if let crate::ode::OdeReadout::PerCmt(map) = &ode.readout {
+            let missing: Vec<usize> = observed_cmts
+                .iter()
+                .copied()
+                .filter(|c| !map.contains_key(c))
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "[scaling]: per-CMT `y[CMT=N]` Form C is missing entries for observed CMTs {:?}. \
+                     Every observed CMT must have a `y[CMT=N]` entry.",
+                    missing
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Per-event PK parameter snapshots for one subject.
@@ -904,5 +1011,94 @@ mod tests {
         // cl_from_cr_model sets V = 50, so scale = 5.
         assert_relative_eq!(preds[0], 20.0, epsilon = 1e-12);
         assert_relative_eq!(preds[1], 10.0, epsilon = 1e-12);
+    }
+
+    // ── PerCmt dispatch ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_apply_scaling_per_cmt_dispatches_per_observation() {
+        // Two observations on different CMTs get scaled by different
+        // factors. CMT=1 → /1000, CMT=2 → /1.
+        let mut map: HashMap<usize, ScalingSpec> = HashMap::new();
+        map.insert(1, ScalingSpec::ScalarScale(1000.0));
+        map.insert(2, ScalingSpec::ScalarScale(1.0));
+        let model = model_with_scaling(ScalingSpec::PerCmt(map));
+
+        let mut subj = one_subject_for_scaling();
+        // The helper produces 3 obs all on CMT=1; override one to CMT=2.
+        assert!(subj.obs_cmts.len() >= 2);
+        subj.obs_cmts[0] = 1;
+        subj.obs_cmts[1] = 2;
+        subj.obs_cmts[2] = 1;
+
+        let mut preds = vec![1000.0, 50.0, 2000.0];
+        apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
+        assert_relative_eq!(preds[0], 1.0, epsilon = 1e-12); // 1000 / 1000
+        assert_relative_eq!(preds[1], 50.0, epsilon = 1e-12); // 50 / 1
+        assert_relative_eq!(preds[2], 2.0, epsilon = 1e-12); // 2000 / 1000
+    }
+
+    #[test]
+    fn test_apply_scaling_per_cmt_missing_cmt_yields_nan() {
+        // PerCmt map covers CMT=1 only, but obs[1] is on CMT=2.
+        // Pre-fit validation catches this at fit() entry, but apply_scaling
+        // is the defensive last line — must produce NaN, not silent zero.
+        let mut map: HashMap<usize, ScalingSpec> = HashMap::new();
+        map.insert(1, ScalingSpec::ScalarScale(1000.0));
+        let model = model_with_scaling(ScalingSpec::PerCmt(map));
+
+        let mut subj = one_subject_for_scaling();
+        subj.obs_cmts[0] = 1;
+        subj.obs_cmts[1] = 2; // not in map → NaN
+        subj.obs_cmts[2] = 1;
+
+        let mut preds = vec![1000.0, 50.0, 2000.0];
+        apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
+        assert_relative_eq!(preds[0], 1.0, epsilon = 1e-12);
+        assert!(preds[1].is_nan(), "missing CMT must produce NaN");
+        assert_relative_eq!(preds[2], 2.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_validate_per_cmt_scaling_errors_on_missing_entry() {
+        // The pre-fit validation should produce a clear error naming the
+        // missing CMTs rather than relying on the runtime NaN fallback.
+        let mut map: HashMap<usize, ScalingSpec> = HashMap::new();
+        map.insert(1, ScalingSpec::ScalarScale(1000.0));
+        let model = model_with_scaling(ScalingSpec::PerCmt(map));
+
+        let mut subj = one_subject_for_scaling();
+        subj.obs_cmts = vec![1, 2, 3]; // 2 and 3 missing from map
+
+        let err = validate_per_cmt_scaling(&model, std::slice::from_ref(&subj))
+            .expect_err("missing CMTs must error");
+        assert!(
+            err.contains("[2, 3]"),
+            "error should list missing CMTs explicitly, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_per_cmt_scaling_passes_when_complete() {
+        let mut map: HashMap<usize, ScalingSpec> = HashMap::new();
+        map.insert(1, ScalingSpec::ScalarScale(1000.0));
+        map.insert(2, ScalingSpec::ScalarScale(1.0));
+        let model = model_with_scaling(ScalingSpec::PerCmt(map));
+
+        let mut subj = one_subject_for_scaling();
+        subj.obs_cmts = vec![1, 2, 1];
+
+        validate_per_cmt_scaling(&model, std::slice::from_ref(&subj))
+            .expect("complete PerCmt coverage must pass validation");
+    }
+
+    #[test]
+    fn test_validate_per_cmt_scaling_noop_for_non_per_cmt() {
+        // Non-PerCmt scaling never errors regardless of observed CMTs.
+        let model = model_with_scaling(ScalingSpec::ScalarScale(1000.0));
+        let subj = one_subject_for_scaling();
+        validate_per_cmt_scaling(&model, std::slice::from_ref(&subj))
+            .expect("non-PerCmt scaling never errors");
     }
 }

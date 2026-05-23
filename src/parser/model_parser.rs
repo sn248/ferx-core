@@ -1296,45 +1296,70 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             is_ode_model,
         )?;
 
-        // Form B + AD is rejected: the analytical AD path threads a single
+        // AD compatibility check: the analytical AD path threads a single
         // f64 scale into `individual_nll_ad` as a `Const`, which can't
-        // evaluate an expression that touches theta/eta. (gradient_method
-        // resolution happens at fit time when `Auto` defaults to AD if
-        // `tv_fn.is_some()`, so we conservatively reject both `Ad` and
-        // `Auto` here when ExpressionScale is in play.)
+        // evaluate user closures over theta/eta/states or vary per
+        // observation. ExpressionScale, ScalingSpec::PerCmt, and either
+        // Form C variant (OdeReadout::Single / PerCmt) all force
+        // `gradient = fd`. (gradient_method resolution happens at fit time
+        // when `Auto` defaults to AD if `tv_fn.is_some()`, so we
+        // conservatively reject both `Ad` and `Auto` here.)
+        //
+        // The ODE readout check uses `output_fn` (the just-parsed
+        // Option<OdeReadout>) rather than `model.ode_spec.readout` because
+        // the latter is still the build_ode_spec placeholder at this
+        // point — Form C wiring happens just below. (Found by Copilot
+        // review on PR #84: the original check only looked at `scaling`,
+        // so a Form C model with `ScalingSpec::None` could request
+        // `gradient = ad` without a clear error and silently fall back to
+        // FD via `model.tv_fn.is_none()` at runtime.)
         let ad_explicit = fit_options.gradient_method == GradientMethod::Ad;
         let ad_auto_likely = fit_options.gradient_method == GradientMethod::Auto
             && model.tv_fn.is_some()
             && cfg!(feature = "autodiff");
-        if matches!(scaling, ScalingSpec::ExpressionScale { .. }) && (ad_explicit || ad_auto_likely)
-        {
-            return Err(
-                "[scaling]: expression-form `obs_scale = <expr>` is not yet supported with AD \
-                 gradients. Add `gradient = fd` to [fit_options], or rewrite as a scalar \
-                 `obs_scale = <number>`."
-                    .into(),
-            );
+        let readout_needs_fd = output_fn.as_ref().map(|r| r.requires_fd()).unwrap_or(false);
+        if (scaling.requires_fd() || readout_needs_fd) && (ad_explicit || ad_auto_likely) {
+            let kind = if matches!(scaling, ScalingSpec::ExpressionScale { .. }) {
+                "expression-form `obs_scale = <expr>`"
+            } else if matches!(scaling, ScalingSpec::PerCmt(_)) {
+                "per-CMT `obs_scale[CMT=N]`"
+            } else {
+                match output_fn.as_ref() {
+                    Some(crate::ode::OdeReadout::PerCmt(_)) => "per-CMT `y[CMT=N]` (Form C)",
+                    Some(crate::ode::OdeReadout::Single(_)) => "`y = <expr>` (Form C)",
+                    _ => {
+                        unreachable!("readout_needs_fd implies output_fn is Some(Single | PerCmt)")
+                    }
+                }
+            };
+            return Err(format!(
+                "[scaling]: {} is not yet supported with AD gradients. \
+                 Add `gradient = fd` to [fit_options].",
+                kind
+            ));
         }
 
-        // Form C wiring: store the output_fn on the ODE spec and clear
-        // `obs_cmt_idx` so the readout dispatches through `output_fn`.
-        if let Some(of) = output_fn {
-            // `is_ode_model` guarantees `model.ode_spec.is_some()` here,
-            // and parse_scaling_block already rejects Form C for analytical models.
+        // Form C wiring: replace the ODE readout (which was set to the
+        // `NEEDS_FORM_C = usize::MAX` sentinel by `build_ode_spec` if the
+        // user omitted `obs_cmt=`) with the parsed Single/PerCmt readout.
+        if let Some(new_readout) = output_fn {
             let ode_spec = model.ode_spec.as_mut().expect("guarded by is_ode_model");
-            ode_spec.output_fn = Some(of);
-            ode_spec.obs_cmt_idx = None;
+            ode_spec.readout = new_readout;
         }
 
         model.scaling = scaling;
     }
 
-    // ODE validation: exactly one of obs_cmt / output_fn must be set on
-    // any compiled ODE model. `parse_ode_structural` accepts both forms;
-    // the only invalid path is omitting obs_cmt without supplying
-    // [scaling] y = <expr>.
+    // ODE validation: the `NEEDS_FORM_C = usize::MAX` sentinel from
+    // build_ode_spec must be replaced by parsed Form C readout. If it
+    // survives, the user omitted `obs_cmt=` in `ode(states=[...])`
+    // without providing `[scaling] y = ...`.
+    const NEEDS_FORM_C: usize = usize::MAX;
     if let Some(ref ode_spec) = model.ode_spec {
-        if ode_spec.obs_cmt_idx.is_none() && ode_spec.output_fn.is_none() {
+        if matches!(
+            ode_spec.readout,
+            crate::ode::OdeReadout::ObsCmt(NEEDS_FORM_C)
+        ) {
             return Err(
                 "ODE model omitted `obs_cmt=...` in [structural_model] but no \
                  [scaling] y = <expr> was provided. Either add `obs_cmt=NAME` or supply Form C."
@@ -1351,7 +1376,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         //     That's a wider change than Phase 1 covers — flag and defer.
         let sde_active = model.diffusion_theta_start.is_some();
         if sde_active {
-            if ode_spec.obs_cmt_idx.is_none() {
+            if !matches!(ode_spec.readout, crate::ode::OdeReadout::ObsCmt(_)) {
                 return Err(
                     "[scaling] y = <expr> (Form C) is not supported on SDE models — the \
                      [diffusion] / EKF path requires a single observable compartment index."
@@ -1792,12 +1817,176 @@ fn parse_scalar_expression(value: &str, ctx: ParseCtx<'_>) -> Result<Expression,
     Ok(expr)
 }
 
+/// Parse a `[scaling]` block key into `(base, optional_cmt)`.
+///
+/// Accepts:
+///   - `obs_scale`           → ("obs_scale", None)
+///   - `obs_scale[CMT=N]`    → ("obs_scale", Some(N))
+///   - `y`                   → ("y", None)
+///   - `y[CMT=N]`            → ("y", Some(N))
+///
+/// CMT must be a positive integer (1-based, matching the data file).
+fn parse_scaling_key(key: &str) -> Result<(&str, Option<usize>), String> {
+    match key.find('[') {
+        None => Ok((key, None)),
+        Some(open) => {
+            let close = key
+                .find(']')
+                .ok_or_else(|| format!("[scaling]: malformed key `{}` (missing `]`)", key))?;
+            if close < open {
+                return Err(format!("[scaling]: malformed key `{}`", key));
+            }
+            let base = &key[..open];
+            let inner = key[open + 1..close].trim();
+            let trailing = key[close + 1..].trim();
+            if !trailing.is_empty() {
+                return Err(format!(
+                    "[scaling]: unexpected text after `]` in key `{}`",
+                    key
+                ));
+            }
+            let cmt_parts: Vec<&str> = inner.splitn(2, '=').map(|s| s.trim()).collect();
+            if cmt_parts.len() != 2 || cmt_parts[0] != "CMT" {
+                return Err(format!(
+                    "[scaling]: malformed key `{}` — expected `BASE[CMT=N]`",
+                    key
+                ));
+            }
+            let cmt: usize = cmt_parts[1].parse().map_err(|_| {
+                format!(
+                    "[scaling]: invalid CMT `{}` in key `{}` (expected positive integer)",
+                    cmt_parts[1], key
+                )
+            })?;
+            if cmt == 0 {
+                return Err(format!(
+                    "[scaling]: CMT must be ≥ 1 (1-based) in key `{}`",
+                    key
+                ));
+            }
+            Ok((base, Some(cmt)))
+        }
+    }
+}
+
+/// Build a `ScalingSpec` (None / ScalarScale / ExpressionScale) from one
+/// `obs_scale[…] = value` line. Shared between the uniform and per-CMT paths.
+fn build_obs_scale_spec(
+    value: &str,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    pk_indices: &[usize],
+) -> Result<ScalingSpec, String> {
+    // Try scalar first (Form A). Otherwise parse as expression (Form B).
+    if let Ok(k) = value.parse::<f64>() {
+        // Divisor — strictly positive. A negative scale would flip every
+        // prediction sign and bypass the upstream non-negativity clamps.
+        if !(k > 0.0 && k.is_finite()) {
+            return Err(format!(
+                "[scaling]: obs_scale must be a strictly positive finite value, got `{}`",
+                value
+            ));
+        }
+        return Ok(ScalingSpec::ScalarScale(k));
+    }
+    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
+    let expr =
+        parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] obs_scale: {}", e))?;
+    // Pre-resolve indiv param name → PK slot so the closure can look up
+    // `pk.values[slot]` for each `Expression::Variable(name)`. Mirrors
+    // the analytical Form B path from Phase 1.5.
+    let indiv_to_pk_slot: HashMap<String, usize> = indiv_var_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.clone(), pk_indices.get(i).copied().unwrap_or(i)))
+        .collect();
+    let scale_fn: ScaleFn = Box::new(
+        move |theta: &[f64],
+              eta: &[f64],
+              covariates: &HashMap<String, f64>,
+              pk: &PkParams|
+              -> f64 {
+            let mut vars: HashMap<String, f64> = HashMap::with_capacity(indiv_to_pk_slot.len());
+            for (name, &slot) in &indiv_to_pk_slot {
+                if slot < pk.values.len() {
+                    vars.insert(name.clone(), pk.values[slot]);
+                }
+            }
+            let empty_nn: Vec<Vec<f64>> = Vec::new();
+            eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
+        },
+    );
+    Ok(ScalingSpec::ExpressionScale { scale_fn })
+}
+
+/// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
+/// the uniform and per-CMT paths.
+fn build_y_output_fn(
+    value: &str,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    state_names: &[String],
+) -> Result<crate::ode::OdeOutputFn, String> {
+    // Form C: expression may reference state names, individual params,
+    // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
+    let mut defined: Vec<String> = state_names.to_vec();
+    for n in indiv_var_names {
+        if !defined.iter().any(|d| d == n) {
+            defined.push(n.clone());
+        }
+    }
+    let ctx = ParseCtx::new(theta_names, eta_names, &defined);
+    let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {}", e))?;
+    let state_idx: HashMap<String, usize> = state_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    let indiv_idx: HashMap<String, usize> = indiv_var_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    let out_fn: crate::ode::OdeOutputFn = Box::new(
+        move |state: &[f64],
+              pk_params_flat: &[f64],
+              theta: &[f64],
+              eta: &[f64],
+              covariates: &HashMap<String, f64>|
+              -> f64 {
+            let mut vars: HashMap<String, f64> =
+                HashMap::with_capacity(state_idx.len() + indiv_idx.len());
+            for (name, &i) in &state_idx {
+                if i < state.len() {
+                    vars.insert(name.clone(), state[i]);
+                }
+            }
+            for (name, &i) in &indiv_idx {
+                if i < pk_params_flat.len() {
+                    vars.insert(name.clone(), pk_params_flat[i]);
+                }
+            }
+            let empty_nn: Vec<Vec<f64>> = Vec::new();
+            eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
+        },
+    );
+    Ok(out_fn)
+}
+
 /// Parsed contents of a `[scaling]` block.
 ///
-/// Returns `(ScalingSpec, Option<OdeOutputFn>)`:
-/// - `ScalingSpec` populates `CompiledModel.scaling` (Forms A/B post-multiply).
-/// - `OdeOutputFn` populates `OdeSpec.output_fn` for Form C (`y = <expr>`),
-///   replacing the default state-index readout inside the ODE timeline loop.
+/// Returns `(ScalingSpec, Option<OdeReadout>)`:
+/// - `ScalingSpec` populates `CompiledModel.scaling` and drives the
+///   prediction-pipeline post-multiply. Variants: `None` /
+///   `ScalarScale(K)` (Form A) / `ExpressionScale { scale_fn }` (Form B)
+///   / `PerCmt(HashMap<usize, ScalingSpec>)` (Phase 2 multi-analyte
+///   Forms A/B per CMT).
+/// - `OdeReadout` populates `OdeSpec.readout` for Form C — the per-CMT
+///   `y[CMT=N] = <expr>` and uniform `y = <expr>` syntaxes both go here
+///   (`OdeReadout::PerCmt` vs `OdeReadout::Single` respectively), and
+///   replace the default `OdeReadout::ObsCmt(idx)` state-index readout.
 ///
 /// `is_ode = true` enables Form C and lets expressions reference state names.
 /// `pk_indices` is parallel to `indiv_var_names`: `pk_indices[i]` is the
@@ -1806,8 +1995,11 @@ fn parse_scalar_expression(value: &str, ctx: ParseCtx<'_>) -> Result<Expression,
 /// `pk_param_fn` evaluation supplied to `scale_fn` at call time.
 ///
 /// Validation:
-/// - Unknown keys are rejected.
-/// - `y = ...` on an analytical model is rejected.
+/// - Unknown keys (anything other than `obs_scale[…]` / `y[…]`) → error.
+/// - `y[…]` on an analytical model → error.
+/// - Mixing uniform (`obs_scale = K`) with per-CMT (`obs_scale[CMT=N] = K`)
+///   within the same group → error.
+/// - Duplicate `[CMT=N]` keys → error.
 #[allow(clippy::too_many_arguments)]
 fn parse_scaling_block(
     lines: &[String],
@@ -1817,78 +2009,86 @@ fn parse_scaling_block(
     pk_indices: &[usize],
     state_names: &[String],
     is_ode: bool,
-) -> Result<(ScalingSpec, Option<crate::ode::OdeOutputFn>), String> {
-    let mut scaling = ScalingSpec::None;
-    let mut output_fn: Option<crate::ode::OdeOutputFn> = None;
+) -> Result<(ScalingSpec, Option<crate::ode::OdeReadout>), String> {
+    // Accumulate uniform and per-CMT entries separately, then assemble at
+    // the end. Mixing the two forms within the same group (obs_scale or y)
+    // is rejected — keeps the semantic clean and matches NONMEM's
+    // explicit-S1/S2 discipline.
+    let mut obs_scale_uniform: Option<ScalingSpec> = None;
+    let mut obs_scale_per_cmt: HashMap<usize, ScalingSpec> = HashMap::new();
+    let mut y_uniform: Option<crate::ode::OdeOutputFn> = None;
+    let mut y_per_cmt: HashMap<usize, crate::ode::OdeOutputFn> = HashMap::new();
 
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = trimmed.splitn(2, '=').map(|s| s.trim()).collect();
-        if parts.len() != 2 {
-            return Err(format!(
-                "[scaling]: expected `key = value`, got: `{}`",
-                trimmed
-            ));
-        }
-        let (key, value) = (parts[0], parts[1]);
-
-        match key {
-            "obs_scale" => {
-                if !matches!(scaling, ScalingSpec::None) {
-                    return Err("[scaling]: duplicate `obs_scale` key".into());
+        // Split on the first `=` OUTSIDE any `[...]` bracket. A naive
+        // `splitn(2, '=')` would split inside `obs_scale[CMT=1]` and treat
+        // `obs_scale[CMT` as the key. Walk the string tracking bracket
+        // depth and split at the first depth-0 `=`.
+        let mut depth: i32 = 0;
+        let mut split_at: Option<usize> = None;
+        for (i, ch) in trimmed.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                '=' if depth == 0 => {
+                    split_at = Some(i);
+                    break;
                 }
-                // Try scalar first (Form A). Otherwise parse as expression (Form B).
-                if let Ok(k) = value.parse::<f64>() {
-                    // Divisor — strictly positive. A negative scale would flip
-                    // every prediction sign and bypass the upstream
-                    // non-negativity clamps in the analytical / ODE paths.
-                    if !(k > 0.0 && k.is_finite()) {
-                        return Err(format!(
-                            "[scaling]: obs_scale must be a strictly positive finite value, got `{}`",
-                            value
-                        ));
+                _ => {}
+            }
+        }
+        let split_at = match split_at {
+            Some(p) => p,
+            None => {
+                return Err(format!(
+                    "[scaling]: expected `key = value`, got: `{}`",
+                    trimmed
+                ));
+            }
+        };
+        let key = trimmed[..split_at].trim();
+        let value = trimmed[split_at + 1..].trim();
+        let (base, cmt_opt) = parse_scaling_key(key)?;
+
+        match base {
+            "obs_scale" => {
+                let spec = build_obs_scale_spec(
+                    value,
+                    theta_names,
+                    eta_names,
+                    indiv_var_names,
+                    pk_indices,
+                )?;
+                match cmt_opt {
+                    None => {
+                        if obs_scale_uniform.is_some() {
+                            return Err("[scaling]: duplicate `obs_scale` key".into());
+                        }
+                        if !obs_scale_per_cmt.is_empty() {
+                            return Err("[scaling]: cannot mix uniform `obs_scale = ...` with \
+                                 per-CMT `obs_scale[CMT=N] = ...` — choose one form."
+                                .into());
+                        }
+                        obs_scale_uniform = Some(spec);
                     }
-                    scaling = ScalingSpec::ScalarScale(k);
-                } else {
-                    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
-                    let expr = parse_scalar_expression(value, ctx)
-                        .map_err(|e| format!("[scaling] obs_scale: {}", e))?;
-                    // Build name → PK-slot lookup so the closure can read
-                    // `pk.values[slot]` for each `Expression::Variable(name)`.
-                    // For analytical models, `pk_indices[i]` is the canonical
-                    // PK slot for the i-th indiv param. For ODE models the
-                    // parser fills `pk_indices = (0..n_eta)` which is only
-                    // valid when `n_eta == indiv_var_names.len()`; fall back
-                    // to positional `i` when the arrays don't align so an
-                    // ODE indiv param like `V` (with no eta) still resolves.
-                    let indiv_to_pk_slot: HashMap<String, usize> = indiv_var_names
-                        .iter()
-                        .enumerate()
-                        .map(|(i, name)| (name.clone(), pk_indices.get(i).copied().unwrap_or(i)))
-                        .collect();
-                    let scale_fn: ScaleFn = Box::new(
-                        move |theta: &[f64],
-                              eta: &[f64],
-                              covariates: &HashMap<String, f64>,
-                              pk: &PkParams|
-                              -> f64 {
-                            // Populate vars with indiv-param values from pk so
-                            // `Expression::Variable("V")` resolves to pk.values[V_slot].
-                            let mut vars: HashMap<String, f64> =
-                                HashMap::with_capacity(indiv_to_pk_slot.len());
-                            for (name, &slot) in &indiv_to_pk_slot {
-                                if slot < pk.values.len() {
-                                    vars.insert(name.clone(), pk.values[slot]);
-                                }
-                            }
-                            let empty_nn: Vec<Vec<f64>> = Vec::new();
-                            eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
-                        },
-                    );
-                    scaling = ScalingSpec::ExpressionScale { scale_fn };
+                    Some(cmt) => {
+                        if obs_scale_uniform.is_some() {
+                            return Err("[scaling]: cannot mix uniform `obs_scale = ...` with \
+                                 per-CMT `obs_scale[CMT=N] = ...` — choose one form."
+                                .into());
+                        }
+                        if obs_scale_per_cmt.contains_key(&cmt) {
+                            return Err(format!(
+                                "[scaling]: duplicate `obs_scale[CMT={}]` key",
+                                cmt
+                            ));
+                        }
+                        obs_scale_per_cmt.insert(cmt, spec);
+                    }
                 }
             }
             "y" => {
@@ -1897,71 +2097,54 @@ fn parse_scaling_block(
                          use `obs_scale = <expr>` for analytical PK"
                         .into());
                 }
-                if output_fn.is_some() {
-                    return Err("[scaling]: duplicate `y` key".into());
-                }
-                // Form C: expression may reference state names, individual
-                // parameters, thetas, etas, and covariates. Use `ParseCtx::new`
-                // (fallback_covariate = true) so unknown identifiers resolve
-                // as `Covariate(NAME)` and read from the covariate map at
-                // eval time. `theta_names` / `eta_names` are in scope so
-                // identifiers like `TVCL` / `ETA_CL` parse correctly as
-                // `Theta(i)` / `Eta(i)`, and `state_names` + `indiv_var_names`
-                // make up the `defined_vars` set so they parse as `Variable`.
-                let mut defined: Vec<String> = state_names.to_vec();
-                for n in indiv_var_names {
-                    if !defined.iter().any(|d| d == n) {
-                        defined.push(n.clone());
+                let out_fn =
+                    build_y_output_fn(value, theta_names, eta_names, indiv_var_names, state_names)?;
+                match cmt_opt {
+                    None => {
+                        if y_uniform.is_some() {
+                            return Err("[scaling]: duplicate `y` key".into());
+                        }
+                        if !y_per_cmt.is_empty() {
+                            return Err("[scaling]: cannot mix uniform `y = ...` with per-CMT \
+                                 `y[CMT=N] = ...` — choose one form."
+                                .into());
+                        }
+                        y_uniform = Some(out_fn);
+                    }
+                    Some(cmt) => {
+                        if y_uniform.is_some() {
+                            return Err("[scaling]: cannot mix uniform `y = ...` with per-CMT \
+                                 `y[CMT=N] = ...` — choose one form."
+                                .into());
+                        }
+                        if y_per_cmt.contains_key(&cmt) {
+                            return Err(format!("[scaling]: duplicate `y[CMT={}]` key", cmt));
+                        }
+                        y_per_cmt.insert(cmt, out_fn);
                     }
                 }
-                let ctx = ParseCtx::new(theta_names, eta_names, &defined);
-                let expr = parse_scalar_expression(value, ctx)
-                    .map_err(|e| format!("[scaling] y: {}", e))?;
-                // Pre-resolve state names → state indices and individual-param
-                // names → positional pk_params_flat slots (ODE writes indiv
-                // params sequentially starting at slot 0; see build_pk_param_fn).
-                let state_idx: HashMap<String, usize> = state_names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, n)| (n.clone(), i))
-                    .collect();
-                let indiv_idx: HashMap<String, usize> = indiv_var_names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, n)| (n.clone(), i))
-                    .collect();
-                let out_fn: crate::ode::OdeOutputFn = Box::new(
-                    move |state: &[f64],
-                          pk_params_flat: &[f64],
-                          theta: &[f64],
-                          eta: &[f64],
-                          covariates: &HashMap<String, f64>|
-                          -> f64 {
-                        let mut vars: HashMap<String, f64> =
-                            HashMap::with_capacity(state_idx.len() + indiv_idx.len());
-                        for (name, &i) in &state_idx {
-                            if i < state.len() {
-                                vars.insert(name.clone(), state[i]);
-                            }
-                        }
-                        for (name, &i) in &indiv_idx {
-                            if i < pk_params_flat.len() {
-                                vars.insert(name.clone(), pk_params_flat[i]);
-                            }
-                        }
-                        let empty_nn: Vec<Vec<f64>> = Vec::new();
-                        eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
-                    },
-                );
-                output_fn = Some(out_fn);
             }
             _ => {
-                return Err(format!("[scaling]: unknown key `{}`", key));
+                return Err(format!("[scaling]: unknown key `{}`", base));
             }
         }
     }
 
-    Ok((scaling, output_fn))
+    let scaling = if let Some(s) = obs_scale_uniform {
+        s
+    } else if !obs_scale_per_cmt.is_empty() {
+        ScalingSpec::PerCmt(obs_scale_per_cmt)
+    } else {
+        ScalingSpec::None
+    };
+    let readout = if let Some(f) = y_uniform {
+        Some(crate::ode::OdeReadout::Single(f))
+    } else if !y_per_cmt.is_empty() {
+        Some(crate::ode::OdeReadout::PerCmt(y_per_cmt))
+    } else {
+        None
+    };
+    Ok((scaling, readout))
 }
 
 // ── [structural_model] ODE variant parser ───────────────────────────────────
@@ -2271,17 +2454,22 @@ fn build_ode_spec(
     indiv_param_names: &[String],
 ) -> Result<crate::ode::OdeSpec, String> {
     let n_states = state_names.len();
-    // `obs_cmt_idx = None` when the user omitted `obs_cmt` in the ODE form
-    // and supplied a `[scaling] y = <expr>` (Form C) instead — wired in
-    // `parse_full_model` after the scaling block parses.
+    // When the user omitted `obs_cmt=` in `ode(states=[...])` they must
+    // supply a `[scaling] y = <expr>` (Form C). At this point the
+    // scaling block hasn't been parsed yet, so we encode "no obs_cmt
+    // decided yet" as the sentinel `usize::MAX` on the ObsCmt readout.
+    // `parse_full_model` then either replaces the readout with Form C
+    // (Single/PerCmt) or errors when both the sentinel survives and no
+    // override arrives.
+    const NEEDS_FORM_C: usize = usize::MAX;
     let obs_cmt_idx = match obs_cmt_name {
-        Some(name) => Some(state_names.iter().position(|s| s == name).ok_or_else(|| {
+        Some(name) => state_names.iter().position(|s| s == name).ok_or_else(|| {
             format!(
                 "Observable compartment '{}' not in states {:?}",
                 name, state_names
             )
-        })?),
-        None => None,
+        })?,
+        None => NEEDS_FORM_C,
     };
 
     // For ODE RHS expressions, states + individual params get injected into the
@@ -2437,8 +2625,7 @@ fn build_ode_spec(
         rhs,
         n_states,
         state_names: state_names.to_vec(),
-        obs_cmt_idx,
-        output_fn: None,
+        readout: crate::ode::OdeReadout::ObsCmt(obs_cmt_idx),
         diffusion_var: Vec::new(),
     })
 }
@@ -8042,8 +8229,17 @@ if (1 > 0) {
             ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V\n"));
         let model = parse_model_string(&src).expect("Form C parses");
         let ode = model.ode_spec.as_ref().expect("ODE spec present");
-        assert!(ode.obs_cmt_idx.is_none(), "Form C clears obs_cmt_idx");
-        let out_fn = ode.output_fn.as_ref().expect("Form C sets output_fn");
+        let out_fn = match &ode.readout {
+            crate::ode::OdeReadout::Single(f) => f,
+            other => panic!(
+                "Form C must set OdeReadout::Single, got {:?}",
+                match other {
+                    crate::ode::OdeReadout::ObsCmt(i) => format!("ObsCmt({})", i),
+                    crate::ode::OdeReadout::Single(_) => "Single(..)".into(),
+                    crate::ode::OdeReadout::PerCmt(_) => "PerCmt(..)".into(),
+                }
+            ),
+        };
 
         // ODE writes indiv params sequentially into pk_params_flat[0..n] in
         // declaration order: [CL, V, KA] -> pk[0..3]. State order: [depot,
@@ -8080,8 +8276,7 @@ if (1 > 0) {
         );
         let model = parse_model_string(&src).expect("Form A on ODE parses");
         let ode = model.ode_spec.as_ref().expect("ODE spec present");
-        assert_eq!(ode.obs_cmt_idx, Some(1));
-        assert!(ode.output_fn.is_none());
+        assert!(matches!(ode.readout, crate::ode::OdeReadout::ObsCmt(1)));
         assert!(matches!(model.scaling, ScalingSpec::ScalarScale(k) if (k - 1000.0).abs() < 1e-12));
     }
 
@@ -8097,7 +8292,10 @@ if (1 > 0) {
         );
         let model = parse_model_string(&src).expect("Form C with covariate parses");
         let ode = model.ode_spec.as_ref().unwrap();
-        let out_fn = ode.output_fn.as_ref().unwrap();
+        let out_fn = match &ode.readout {
+            crate::ode::OdeReadout::Single(f) => f,
+            _ => panic!("Form C must set OdeReadout::Single"),
+        };
 
         let state = vec![0.0, 50.0]; // depot=0, central=50
         let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
@@ -8131,7 +8329,10 @@ if (1 > 0) {
         );
         let model = parse_model_string(&src).expect("Form C with theta ref parses");
         let ode = model.ode_spec.as_ref().unwrap();
-        let out_fn = ode.output_fn.as_ref().unwrap();
+        let out_fn = match &ode.readout {
+            crate::ode::OdeReadout::Single(f) => f,
+            _ => panic!("Form C must set OdeReadout::Single"),
+        };
 
         let state = vec![0.0, 50.0];
         let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
@@ -8209,6 +8410,201 @@ if (1 > 0) {
         assert!(
             err.to_lowercase().contains("expression") && err.contains("gradient = fd"),
             "expected gradient=fd hint, got: {}",
+            err
+        );
+    }
+
+    // ── Phase 2: multi-analyte / per-CMT scaling ────────────────────────────
+
+    #[test]
+    fn test_parse_scaling_key_uniform() {
+        let (base, cmt) = parse_scaling_key("obs_scale").unwrap();
+        assert_eq!(base, "obs_scale");
+        assert_eq!(cmt, None);
+    }
+
+    #[test]
+    fn test_parse_scaling_key_per_cmt() {
+        let (base, cmt) = parse_scaling_key("obs_scale[CMT=2]").unwrap();
+        assert_eq!(base, "obs_scale");
+        assert_eq!(cmt, Some(2));
+
+        let (base, cmt) = parse_scaling_key("y[CMT=1]").unwrap();
+        assert_eq!(base, "y");
+        assert_eq!(cmt, Some(1));
+    }
+
+    #[test]
+    fn test_parse_scaling_key_rejects_malformed() {
+        assert!(parse_scaling_key("obs_scale[").is_err());
+        assert!(parse_scaling_key("obs_scale[CMT=]").is_err());
+        assert!(parse_scaling_key("obs_scale[CMT=abc]").is_err());
+        assert!(parse_scaling_key("obs_scale[FOO=1]").is_err());
+        assert!(parse_scaling_key("obs_scale[CMT=0]").is_err()); // 1-based
+        assert!(parse_scaling_key("obs_scale[CMT=1]extra").is_err());
+    }
+
+    #[test]
+    fn test_parse_scaling_per_cmt_scalar() {
+        // Use the analytical template but layer a per-CMT scaling block on
+        // top. Even though one_cpt_iv_bolus only emits CMT=1 observations,
+        // the parser doesn't validate coverage (that happens at fit time),
+        // so this exercises the parse path cleanly.
+        let mut src = String::from(
+            "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 5
+  gradient = fd
+
+[scaling]
+  obs_scale[CMT=1] = 1000
+  obs_scale[CMT=2] = 1
+",
+        );
+        let _ = &mut src; // silence unused-mut on platforms without mods
+        let model = parse_model_string(&src).expect("per-CMT obs_scale parses");
+        match &model.scaling {
+            ScalingSpec::PerCmt(map) => {
+                assert_eq!(map.len(), 2);
+                assert!(
+                    matches!(map.get(&1), Some(ScalingSpec::ScalarScale(k)) if (*k - 1000.0).abs() < 1e-12)
+                );
+                assert!(
+                    matches!(map.get(&2), Some(ScalingSpec::ScalarScale(k)) if (*k - 1.0).abs() < 1e-12)
+                );
+            }
+            other => panic!("expected PerCmt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_scaling_per_cmt_mixed_forms() {
+        // CMT=1 uses scalar, CMT=2 uses expression. Both are valid within
+        // the same PerCmt map.
+        let src = analytical_model_with_scaling(Some(
+            "  obs_scale[CMT=1] = 1000\n  obs_scale[CMT=2] = TVV / 10\n",
+        ));
+        let model = parse_model_string(&src).expect("mixed PerCmt parses");
+        match &model.scaling {
+            ScalingSpec::PerCmt(map) => {
+                assert_eq!(map.len(), 2);
+                assert!(matches!(map.get(&1), Some(ScalingSpec::ScalarScale(_))));
+                assert!(matches!(
+                    map.get(&2),
+                    Some(ScalingSpec::ExpressionScale { .. })
+                ));
+            }
+            other => panic!("expected PerCmt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_scaling_rejects_mixing_uniform_and_per_cmt() {
+        let src =
+            analytical_model_with_scaling(Some("  obs_scale = 1000\n  obs_scale[CMT=2] = 1\n"));
+        let err = parse_model_string(&src)
+            .expect_err("mixing uniform + per-CMT obs_scale must be rejected");
+        assert!(
+            err.to_lowercase().contains("cannot mix"),
+            "expected cannot-mix error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_rejects_duplicate_cmt() {
+        let src = analytical_model_with_scaling(Some(
+            "  obs_scale[CMT=1] = 1000\n  obs_scale[CMT=1] = 2000\n",
+        ));
+        let err = parse_model_string(&src).expect_err("duplicate CMT key must be rejected");
+        assert!(
+            err.contains("duplicate") && err.contains("CMT=1"),
+            "expected duplicate-CMT-key error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_per_cmt_rejects_ad() {
+        // PerCmt scaling forces FD (same as ExpressionScale + AD).
+        let base = analytical_model_with_scaling(Some(
+            "  obs_scale[CMT=1] = 1000\n  obs_scale[CMT=2] = 1\n",
+        ));
+        let src = base.replace("gradient = fd", "gradient = ad");
+        let err = parse_model_string(&src).expect_err("per-CMT + gradient = ad must be rejected");
+        assert!(
+            err.to_lowercase().contains("per-cmt") && err.contains("gradient = fd"),
+            "expected per-CMT + AD rejection, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_y_per_cmt_form_c() {
+        // Per-CMT Form C on an ODE model. Build_y_output_fn picks up each
+        // entry; the parser assembles them into OdeReadout::PerCmt.
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some("  y[CMT=1] = central / V\n  y[CMT=2] = central / V * 1000\n"),
+        );
+        let model = parse_model_string(&src).expect("per-CMT y Form C parses");
+        let ode = model.ode_spec.as_ref().expect("ODE spec present");
+        match &ode.readout {
+            crate::ode::OdeReadout::PerCmt(map) => {
+                assert_eq!(map.len(), 2);
+                assert!(map.contains_key(&1));
+                assert!(map.contains_key(&2));
+            }
+            _ => panic!("expected OdeReadout::PerCmt"),
+        }
+    }
+
+    #[test]
+    fn test_parse_scaling_y_form_c_rejects_ad() {
+        // Regression for Copilot review on PR #84: the original guard only
+        // checked `ScalingSpec::requires_fd()`, missing Form C readouts
+        // (which live on `OdeSpec.readout`, not `model.scaling`). A Form C
+        // model with `gradient = ad` silently fell back to FD via
+        // `model.tv_fn.is_none()` at runtime; now the parser errors loudly.
+        let src_per_cmt = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some("  y[CMT=1] = central / V\n  y[CMT=2] = central / V * 1000\n"),
+        )
+        .replace("gradient = fd", "gradient = ad");
+        let err = parse_model_string(&src_per_cmt)
+            .expect_err("per-CMT y + gradient = ad must be rejected");
+        assert!(
+            err.contains("per-CMT `y[CMT=N]`") && err.contains("gradient = fd"),
+            "expected per-CMT Form C + AD rejection, got: {}",
+            err
+        );
+
+        // Single Form C (uniform `y = <expr>`) gets the same treatment.
+        let src_single =
+            ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V\n"))
+                .replace("gradient = fd", "gradient = ad");
+        let err = parse_model_string(&src_single)
+            .expect_err("single Form C + gradient = ad must be rejected");
+        assert!(
+            err.contains("`y = <expr>` (Form C)") && err.contains("gradient = fd"),
+            "expected single Form C + AD rejection, got: {}",
             err
         );
     }

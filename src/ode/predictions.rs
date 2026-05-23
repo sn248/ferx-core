@@ -157,17 +157,36 @@ fn active_infusions(
 /// y = <expr>` (Form C) to replace the default `u[obs_cmt_idx]` readout
 /// with an arbitrary expression over states + individual parameters +
 /// thetas + etas + covariates. Callers that don't have theta/eta in scope
-/// (e.g. the EKF path, which never sets `output_fn`) may pass empty slices.
+/// (e.g. the EKF path, which never sets a Single/PerCmt readout) may pass
+/// empty slices.
 pub type OdeOutputFn =
     Box<dyn Fn(&[f64], &[f64], &[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
 
-/// Read the observable value from the ODE state.
+/// How an ODE model's observable is read at each observation event.
 ///
-/// When `ode.output_fn` is set (Form C `[scaling] y = <expr>`) it replaces
-/// the default state-index readout entirely. Otherwise the value at
-/// `obs_cmt_idx` is returned. Parser-side validation guarantees exactly one
-/// of `output_fn` / `obs_cmt_idx` is set, so the `expect` here is unreachable
-/// for any compiled model.
+/// Replaces the earlier mutually-exclusive `(obs_cmt_idx, output_fn)` pair
+/// with a single enum that scales naturally to per-CMT (multi-analyte)
+/// dispatch.
+pub enum OdeReadout {
+    /// Default: read `state[obs_cmt_idx]` (0-based into the state vector)
+    /// for every observation regardless of its CMT. The canonical
+    /// single-output ODE shape.
+    ObsCmt(usize),
+    /// Form C uniform: `[scaling] y = <expr>` — a single output_fn
+    /// replaces the state-index readout for every observation.
+    Single(OdeOutputFn),
+    /// Form C per-CMT: `[scaling] y[CMT=N] = <expr>` for each observed
+    /// CMT. Key is the 1-based CMT index from the data file (matches
+    /// `subject.obs_cmts[i]`, which is `usize`). Fit-time validation
+    /// enforces that every observed CMT has an entry; missing entries
+    /// fall through to NaN at runtime as a defensive guard.
+    PerCmt(HashMap<usize, OdeOutputFn>),
+}
+
+/// Read the observable value at observation `obs_idx`.
+///
+/// `subject.obs_cmts[obs_idx]` selects the per-CMT readout when
+/// `OdeReadout::PerCmt` is in use; the simpler variants ignore it.
 #[inline]
 fn read_observable(
     ode: &OdeSpec,
@@ -176,14 +195,20 @@ fn read_observable(
     theta: &[f64],
     eta: &[f64],
     covariates: &HashMap<String, f64>,
+    obs_cmt: usize,
 ) -> f64 {
-    if let Some(ref out_fn) = ode.output_fn {
-        out_fn(u, pk_params_flat, theta, eta, covariates)
-    } else {
-        let idx = ode
-            .obs_cmt_idx
-            .expect("OdeSpec must have either obs_cmt_idx or output_fn set");
-        u[idx]
+    match &ode.readout {
+        OdeReadout::ObsCmt(idx) => u[*idx],
+        OdeReadout::Single(out_fn) => out_fn(u, pk_params_flat, theta, eta, covariates),
+        OdeReadout::PerCmt(map) => match map.get(&obs_cmt) {
+            Some(out_fn) => out_fn(u, pk_params_flat, theta, eta, covariates),
+            // Parser + fit-time validation guarantee every observed CMT
+            // has an entry. NaN here is a defensive guard against
+            // hand-constructed CompiledModels that bypassed validation —
+            // it propagates to NaN OFV so the bad config is loud, not
+            // silent.
+            None => f64::NAN,
+        },
     }
 }
 
@@ -195,22 +220,47 @@ pub struct OdeSpec {
     pub n_states: usize,
     /// Names of state variables (e.g., ["depot", "central"])
     pub state_names: Vec<String>,
-    /// Index of the observable compartment (0-based) for DV. `None` when
-    /// the user supplied an explicit `[scaling] y = <expr>` (Form C) — in
-    /// that case `output_fn` is used instead.
-    pub obs_cmt_idx: Option<usize>,
-    /// Optional explicit output expression (Form C). When `Some`, the
-    /// per-observation readout is
-    /// `output_fn(state, pk_params_flat, theta, eta, covariates)` rather
-    /// than `u[obs_cmt_idx]`. Parser guarantees exactly one of
-    /// `obs_cmt_idx` and `output_fn` is set for any compiled ODE model.
-    pub output_fn: Option<OdeOutputFn>,
+    /// How the per-observation observable is computed. Replaces the
+    /// earlier `(obs_cmt_idx, output_fn)` pair — see [`OdeReadout`].
+    pub readout: OdeReadout,
     /// Per-state diagonal process-noise variances (σ²_w,i) for SDE / EKF.
     /// Length must equal `n_states` when non-empty; empty means standard ODE
     /// (no diffusion). Declared via `[diffusion]` block as `state ~ variance`,
     /// analogous to sigma/omega notation. Updated each outer iteration as
     /// diffusion thetas are re-estimated.
     pub diffusion_var: Vec<f64>,
+}
+
+impl OdeSpec {
+    /// Convenience accessor: returns the canonical `obs_cmt_idx` when the
+    /// readout is the default `ObsCmt` variant. Used by EKF (which requires
+    /// a single observable compartment) and by callers that need to know
+    /// whether the readout is "Phase 1 simple" vs "Form C custom".
+    pub fn obs_cmt_idx(&self) -> Option<usize> {
+        match &self.readout {
+            OdeReadout::ObsCmt(idx) => Some(*idx),
+            OdeReadout::Single(_) | OdeReadout::PerCmt(_) => None,
+        }
+    }
+}
+
+impl OdeReadout {
+    /// Returns true when this readout cannot be paired with `gradient = ad`.
+    ///
+    /// Both Form C variants (`Single` and `PerCmt`) call arbitrary
+    /// user-defined closures at each observation. The analytical AD entry
+    /// points take only a single `Const f64` scale and cannot evaluate
+    /// closures over theta/eta — there's no AD path for Form C. At runtime
+    /// `model.tv_fn` is `None` for any ODE model anyway, so AD silently
+    /// falls back to FD. The parse-time guard surfaces that fallback as a
+    /// clear error rather than silently demoting the user's `gradient = ad`
+    /// choice.
+    pub fn requires_fd(&self) -> bool {
+        match self {
+            OdeReadout::ObsCmt(_) => false,
+            OdeReadout::Single(_) | OdeReadout::PerCmt(_) => true,
+        }
+    }
 }
 
 /// Compute ODE-based predictions for a single subject.
@@ -295,8 +345,16 @@ pub fn ode_predictions(
 
         // Record observations exactly at t_start (after dose)
         if let Some(&obs_idx) = obs_map.get(&t_start.to_bits()) {
-            predictions[obs_idx] =
-                read_observable(ode, &u, pk_params_flat, theta, eta, &subject.covariates);
+            let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+            predictions[obs_idx] = read_observable(
+                ode,
+                &u,
+                pk_params_flat,
+                theta,
+                eta,
+                &subject.covariates,
+                cmt,
+            );
         }
 
         // Observation times in this segment (t_start < t <= t_end)
@@ -340,8 +398,16 @@ pub fn ode_predictions(
         // Extract predictions and update state
         for pt in &sol {
             if let Some(&obs_idx) = obs_map.get(&pt.t.to_bits()) {
-                predictions[obs_idx] =
-                    read_observable(ode, &pt.u, pk_params_flat, theta, eta, &subject.covariates);
+                let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+                predictions[obs_idx] = read_observable(
+                    ode,
+                    &pt.u,
+                    pk_params_flat,
+                    theta,
+                    eta,
+                    &subject.covariates,
+                    cmt,
+                );
             }
         }
 
@@ -351,9 +417,15 @@ pub fn ode_predictions(
         }
     }
 
-    // Clamp negatives
+    // Clamp negative predictions to zero (ODE solver overshoot guard).
+    // NaN intentionally NOT clamped — it propagates to a NaN OFV so the
+    // outer optimizer rejects the step, matching the analytical path's
+    // `conc.max(0.0)` semantic (NaN survives `.max(0.0)` per IEEE 754).
+    // This is also what surfaces a missing `OdeReadout::PerCmt` entry as
+    // a loud failure rather than a silent zero. (Pre-Phase-2 the clamp
+    // included NaN; Copilot's review of #84 caught the inconsistency.)
     for p in &mut predictions {
-        if *p < 0.0 || p.is_nan() {
+        if *p < 0.0 {
             *p = 0.0;
         }
     }
@@ -513,8 +585,22 @@ pub fn ode_predictions_event_driven(
                 last_pk = pk_now;
             }
             Kind::Obs => {
-                let v = read_observable(ode, &u, &pk_now.values, theta, eta, &subject.covariates);
-                predictions[idx] = if v.is_nan() || v < 0.0 { 0.0 } else { v };
+                let cmt = subject.obs_cmts.get(idx).copied().unwrap_or(0);
+                let v = read_observable(
+                    ode,
+                    &u,
+                    &pk_now.values,
+                    theta,
+                    eta,
+                    &subject.covariates,
+                    cmt,
+                );
+                // Clamp negative readouts (ODE solver overshoot guard);
+                // let NaN through so a missing `OdeReadout::PerCmt` entry
+                // (or any other genuine NaN) surfaces as a NaN OFV
+                // rather than a silent zero. See the corresponding note
+                // in `ode_predictions`.
+                predictions[idx] = if v < 0.0 { 0.0 } else { v };
                 last_pk = pk_now;
             }
             Kind::PkOnly => {
@@ -567,7 +653,7 @@ pub fn ode_predictions_ekf_with_diffusion(
         // EKF/SDE path requires a single observable compartment index for
         // the Kalman update. Parser-side validation rejects SDE models that
         // use Form C `y = <expr>`; so `obs_cmt_idx` is always `Some` here.
-        ode.obs_cmt_idx
+        ode.obs_cmt_idx()
             .expect("EKF requires obs_cmt_idx; SDE + [scaling] y = ... is not supported"),
         diffusion_var,
         pk_params_flat,
@@ -624,7 +710,7 @@ pub fn ode_predictions_ekf(
     let pts = solve_ekf(
         ode.rhs.as_ref(),
         ode.n_states,
-        ode.obs_cmt_idx
+        ode.obs_cmt_idx()
             .expect("EKF requires obs_cmt_idx; SDE + [scaling] y = ... is not supported"),
         &ode.diffusion_var,
         pk_params_flat,
@@ -655,8 +741,7 @@ mod tests {
             }),
             n_states: 1,
             state_names: vec!["central".into()],
-            obs_cmt_idx: Some(0),
-            output_fn: None,
+            readout: OdeReadout::ObsCmt(0),
             diffusion_var: Vec::new(),
         }
     }
@@ -764,8 +849,7 @@ mod tests {
             }),
             n_states: 2,
             state_names: vec!["depot".into(), "central".into()],
-            obs_cmt_idx: Some(1),
-            output_fn: None,
+            readout: OdeReadout::ObsCmt(1),
             diffusion_var: Vec::new(),
         }
     }
@@ -894,7 +978,7 @@ mod tests {
         //   A1(t) after end T     = A1(T) · exp(-ka·(t-T))
         // Re-use the oral ODE spec but observe the depot.
         let mut ode = one_cpt_oral_ode_spec();
-        ode.obs_cmt_idx = Some(0);
+        ode.readout = OdeReadout::ObsCmt(0);
 
         let rate = 50.0;
         let amt = 200.0; // duration = 4 h
@@ -1153,8 +1237,7 @@ mod tests {
             }),
             n_states: 1,
             state_names: vec!["central".into()],
-            obs_cmt_idx: None,
-            output_fn: Some(Box::new(
+            readout: OdeReadout::Single(Box::new(
                 |state: &[f64], pk: &[f64], _theta: &[f64], _eta: &[f64], _cov| {
                     let v = pk[crate::types::PK_IDX_V];
                     if v > 0.0 {
@@ -1211,6 +1294,72 @@ mod tests {
             "output_fn must change the readout (ref={} c={})",
             preds_ref_v5[0],
             preds_c_v5[0]
+        );
+    }
+
+    /// Regression for Copilot review on PR #84: pre-Phase-2 the ODE paths
+    /// clamped NaN predictions to 0 at the end of `ode_predictions` (and
+    /// at the Obs branch of `ode_predictions_event_driven`). That defeated
+    /// the "loud failure" semantic for `OdeReadout::PerCmt` missing
+    /// entries (and for any other genuine NaN). The clamp now only
+    /// touches negatives; NaN propagates.
+    #[test]
+    fn test_ode_predictions_propagates_nan_from_readout() {
+        // Build an OdeReadout::PerCmt that DELIBERATELY returns NaN for
+        // CMT=1 — emulating a missing-CMT lookup that bypassed pre-fit
+        // validation. The resulting prediction must be NaN, not 0.
+        let mut map: HashMap<usize, OdeOutputFn> = HashMap::new();
+        map.insert(
+            1,
+            Box::new(|_state: &[f64], _pk: &[f64], _theta, _eta, _cov| f64::NAN),
+        );
+        let mut ode = one_cpt_ode_spec();
+        ode.readout = OdeReadout::PerCmt(map);
+
+        let pk = pk_one(5.0, 80.0);
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![1.0, 4.0];
+        let subj = make_subject(doses, obs_times);
+
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+        for (j, p) in preds.iter().enumerate() {
+            assert!(
+                p.is_nan(),
+                "obs {} from a NaN-returning readout must be NaN, got {}",
+                j,
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn test_ode_predictions_still_clamps_negatives() {
+        // Sanity: dropping the NaN clamp must not change the negative
+        // clamp behavior (ODE solver overshoot guard).
+        let ode = OdeSpec {
+            // dA/dt = -1 → state goes negative quickly with starting amount 1
+            rhs: Box::new(|_y, _p, _t, dy| {
+                dy[0] = -1.0;
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+        };
+        let pk = pk_one(1.0, 1.0);
+        let doses = vec![DoseEvent::new(0.0, 1.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![10.0]; // dose=1, after 10s of -1/s → state = -9
+        let subj = make_subject(doses, obs_times);
+
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+        assert!(
+            !preds[0].is_nan(),
+            "negative readout must be clamped to 0, not NaN"
+        );
+        assert!(
+            preds[0] >= 0.0,
+            "negative readout must be clamped to 0, got {}",
+            preds[0]
         );
     }
 }

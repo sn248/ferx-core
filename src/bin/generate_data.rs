@@ -558,8 +558,7 @@ fn generate_mm_oral() {
         rhs: ode_rhs,
         n_states: 2,
         state_names: vec!["depot".into(), "central".into()],
-        obs_cmt_idx: Some(1),
-        output_fn: None,
+        readout: ferx_core::ode::OdeReadout::ObsCmt(1),
         diffusion_var: Vec::new(),
     };
     let model = CompiledModel {

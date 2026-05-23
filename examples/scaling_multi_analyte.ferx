@@ -1,0 +1,51 @@
+# Multi-analyte (per-CMT) scaling: parent + metabolite both observed.
+#
+# Demonstrates `y[CMT=N]` (Form C per-CMT). The ODE keeps each
+# compartment as an AMOUNT; per-CMT `y` readouts convert each amount to
+# the observed concentration via the appropriate volume.
+#
+# Both observed CMTs MUST have an entry; the parser only checks syntax,
+# but fit() validates coverage at startup and errors with a clear
+# message naming any missing CMTs.
+#
+# Per-CMT scaling forces `gradient = fd`. AD support for per-observation
+# scale arrays is a separate follow-up.
+
+[parameters]
+  theta TVCL(5.0,  0.1,  50.0)
+  theta TVV(50.0,  5.0, 500.0)
+  theta TVCLM(2.0, 0.05, 20.0)        # metabolite clearance
+  theta TVVM(30.0, 5.0, 300.0)        # metabolite volume
+
+  omega ETA_CL  ~ 0.09
+  omega ETA_CLM ~ 0.09
+
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL  = TVCL  * exp(ETA_CL)
+  V   = TVV
+  CLM = TVCLM * exp(ETA_CLM)
+  VM  = TVVM
+
+[structural_model]
+  ode(states=[parent, metab])         # no obs_cmt — Form C per-CMT below
+
+[odes]
+  # Amounts in each compartment (mg). The conversion to mg/L lives in
+  # the [scaling] readouts per CMT.
+  d/dt(parent) = -CL/V * parent
+  d/dt(metab)  =  CL/V * parent - CLM/VM * metab
+
+[scaling]
+  y[CMT=1] = parent / V               # parent concentration (mg/L)
+  y[CMT=2] = metab  / VM              # metabolite concentration (mg/L)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+  gradient   = fd                     # required for per-CMT scaling

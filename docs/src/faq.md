@@ -154,5 +154,19 @@ and an ODE-only Form C that replaces the state readout entirely:
   y = central / V           # central holds amount; observe as concentration
 ```
 
+For models with multiple observed compartments (parent + metabolite,
+sum-of-moieties, free vs. total), specify a scale per CMT:
+
+```
+[scaling]
+  obs_scale[CMT=1] = 1000
+  obs_scale[CMT=2] = 1
+  y[CMT=1] = parent / V
+  y[CMT=2] = metab  / VM
+```
+
+Every observed CMT must have a matching `[CMT=N]` entry — `fit()`
+errors at startup with the list of missing CMTs.
+
 See [Scaling](model-file/scaling.md) for the full reference, including
 how this compares to NONMEM's `S1`/`S2` and nlmixr2's `cmt(central); f = ...`.

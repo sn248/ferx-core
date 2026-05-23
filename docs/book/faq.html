@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-01128107.js";
+            window.path_to_searchindex_js = "searchindex-b02da9c0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-3a934816.js"></script>
@@ -288,6 +288,16 @@ and an ODE-only Form C that replaces the state readout entirely:</p>
 [scaling]
   y = central / V           # central holds amount; observe as concentration
 </code></pre>
+<p>For models with multiple observed compartments (parent + metabolite,
+sum-of-moieties, free vs. total), specify a scale per CMT:</p>
+<pre><code>[scaling]
+  obs_scale[CMT=1] = 1000
+  obs_scale[CMT=2] = 1
+  y[CMT=1] = parent / V
+  y[CMT=2] = metab  / VM
+</code></pre>
+<p>Every observed CMT must have a matching <code>[CMT=N]</code> entry — <code>fit()</code>
+errors at startup with the list of missing CMTs.</p>
 <p>See <a href="model-file/scaling.html">Scaling</a> for the full reference, including
 how this compares to NONMEM’s <code>S1</code>/<code>S2</code> and nlmixr2’s <code>cmt(central); f = ...</code>.</p>
 

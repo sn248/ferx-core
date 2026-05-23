@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-144528bf.js";
+            window.path_to_searchindex_js = "../searchindex-046ad31f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-808a48a8.js"></script>
@@ -211,23 +211,98 @@ every <code>II</code>.</p>
 </thead>
 <tbody>
 <tr><td>Analytical (1-/2-/3-cpt, no TV covariates)</td><td><code>predict_concentration</code> in <code>src/pk/mod.rs</code></td><td>Closed-form geometric-series</td></tr>
-<tr><td>Analytical (1-/2-/3-cpt, time-varying covariates)</td><td><code>event_driven_predictions_with_schedule</code> in <code>src/pk/event_driven.rs</code></td><td>Numerical pre-equilibration via the propagator</td></tr>
-<tr><td>ODE (<code>[odes]</code>-block models)</td><td><code>ode_predictions</code> / <code>ode_predictions_event_driven</code> in <code>src/ode/predictions.rs</code></td><td>Numerical pre-equilibration via the RK45 solver</td></tr>
+<tr><td>Analytical (1-/2-/3-cpt, time-varying covariates)</td><td><code>event_driven_predictions_with_schedule</code> in <code>src/pk/event_driven.rs</code></td><td>Numerical pulse expansion via the propagator</td></tr>
+<tr><td>ODE (<code>[odes]</code>-block models)</td><td><code>ode_predictions</code> / <code>ode_predictions_event_driven</code> in <code>src/ode/predictions.rs</code></td><td>Numerical pulse expansion via the RK45 solver</td></tr>
 </tbody>
 </table>
 </div>
-<p>The closed-form path uses the identity</p>
+<p>Both kinds of paths start from the same underlying identity — the
+choice between them is a question of whether the geometric series has
+a closed form for the model in question.</p>
+<h3 id="analytical-path-closed-form-geometric-series"><a class="header" href="#analytical-path-closed-form-geometric-series">Analytical path: closed-form geometric series</a></h3>
+<p>For linear analytical PK (1-/2-/3-cpt), the single-dose response is a
+sum of exponentials with known eigenvalues. The steady-state series</p>
 <pre><code>C_ss(τ) = Σ_{n=0}^∞ C_single(τ + n·II)
 </code></pre>
-<p>evaluated in closed form per disposition eigenvalue: for every
-exponential <code>A·exp(-λ·t)</code> in the single-dose response, the steady-state
-amplitude becomes <code>A·exp(-λ·τ) / (1 - exp(-λ·II))</code>. For oral models with
-<code>KA ≈ λ</code> a separate L’Hopital limit applies; ferx handles it
-automatically.</p>
-<p>The numerical paths (ODE and event-driven analytical) run the same
-identity but expand the sum as <code>N = 50</code> cycles of <code>(apply dose; propagate II)</code>. Fifty cycles puts the truncation tail below <code>1e-9</code> of
-the steady-state value for any realistic PK, so users won’t see the
-distinction in fit output.</p>
+<p>collapses per eigenvalue: every exponential <code>A·exp(-λ·t)</code> in the
+single-dose response contributes a steady-state amplitude
+<code>A·exp(-λ·τ) / (1 - exp(-λ·II))</code>. ferx evaluates this exactly — no
+iteration, single-pass cost equivalent to evaluating the single-dose
+formula plus one extra division per eigenvalue. For oral models when
+<code>KA ≈ λ</code> the closed form needs the L’Hopital limit; ferx handles that
+case automatically.</p>
+<h3 id="ode-path-brute-force-pulse-expansion"><a class="header" href="#ode-path-brute-force-pulse-expansion">ODE path: brute-force pulse expansion</a></h3>
+<p>An <code>[odes]</code>-block model is an arbitrary user-defined RHS. There is no
+general eigenstructure to exploit — <code>dy/dt = f(y, p, t)</code> can be
+non-linear (Michaelis-Menten elimination), time-varying, or both, so
+no closed form exists for the steady-state state in general.</p>
+<p>Instead, ferx evaluates the geometric series <em>numerically</em> before the
+SS dose is applied. The algorithm in <code>equilibrate_ss_state</code> is exactly
+what its name says — brute-force pulse expansion:</p>
+<ol>
+<li><strong>Reset</strong> the compartment state to zero. NONMEM <code>SS=1</code> semantics
+say prior dynamics are discarded at the SS dose, so anything that
+happened earlier in the timeline is overwritten here.</li>
+<li><strong>Loop <code>N = 50</code> cycles</strong>:
+<ul>
+<li><strong>Apply the dose</strong> for one cycle:
+<ul>
+<li>For a bolus, add <code>AMT</code> (with bioavailability <code>F1</code> applied) to
+the dose’s compartment.</li>
+<li>For an infusion, integrate for <code>T_inf = AMT/RATE</code> with a
+wrapped RHS that adds <code>+RATE</code> to the dose’s compartment.</li>
+</ul>
+</li>
+<li><strong>Propagate</strong> the ODE forward by the remainder of the cycle (<code>II</code>
+for boluses, <code>II - T_inf</code> for infusions). Same RK45 solver as the
+normal timeline, same tolerances, same wrapped-infusion mechanics.</li>
+</ul>
+</li>
+<li>After the loop, the compartment state equals the “just-before-the-
+next-pulse” steady-state amount.</li>
+<li>Normal-timeline handling resumes — the SS dose’s own pulse is
+applied through the standard bolus/infusion code path, taking the
+state from pre-pulse to at-pulse SS.</li>
+</ol>
+<p>The result is mathematically equivalent to the analytical closed form
+in the linear case (and is unit-tested against it — see
+<code>ode_ss_iv_bolus_matches_analytical_ss</code> in <code>src/ode/predictions.rs</code>
+for the 1-cpt cross-check). For non-linear PK, the same scheme still
+produces a self-consistent steady-state state under the model’s own
+dynamics; just be aware that for systems that <em>don’t</em> have a true
+periodic steady state (e.g. zero-order elimination at saturation),
+the iteration may not converge to anything meaningful and SS=1 isn’t
+really applicable.</p>
+<h3 id="why-n--50"><a class="header" href="#why-n--50">Why <code>N = 50</code>?</a></h3>
+<p>The truncation tail after <code>N</code> cycles is bounded by <code>exp(-N·λ·II)</code> for
+each disposition rate <code>λ</code>. For typical PK
+(<code>λ·II ≈ 2</code>, i.e. ~3 half-lives per dosing interval),
+<code>exp(-100) ≈ 4e-44</code> — well below any meaningful precision. For very
+slow PK (<code>λ·II = 0.1</code>, ~14 half-lives total over the 50 cycles),
+<code>exp(-5) ≈ 7e-3</code> — the slowest realistic case. ferx uses fixed
+<code>N = 50</code> rather than adaptive convergence checking because (a) the
+bound is conservative and (b) skipping the convergence check keeps
+the hot path branch-free for AD compatibility.</p>
+<p>If you need tighter accuracy for an unusually slow PK, the constant
+lives at <code>SS_EQUILIBRATION_CYCLES</code> in <code>src/ode/predictions.rs</code> and
+<code>EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES</code> in <code>src/pk/event_driven.rs</code>.</p>
+<h3 id="cost-comparison"><a class="header" href="#cost-comparison">Cost comparison</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Path</th><th>Per SS-dose cost</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>Analytical closed</td><td>~1 single-dose evaluation</td><td>Effectively free</td></tr>
+<tr><td>Event-driven pulse</td><td>~50× analytical propagator calls</td><td>Still cheap; analytical propagator is fast</td></tr>
+<tr><td>ODE pulse</td><td>~50× RK45 segment integrations</td><td>Real cost — RK45 is the dominant per-prediction cost for ODE models, so SS doses cost ~50× more than non-SS doses</td></tr>
+</tbody>
+</table>
+</div>
+<p>SS doses are typically rare (one per subject at the start of a
+maintenance regimen), so the absolute overhead per fit iteration is
+modest even for ODE models. If a benchmark shows SS equilibration as
+a hot spot, an adaptive <code>N</code> (loop until <code>||state - prev|| / ||state|| &lt; tol</code>) is the obvious follow-up — it would early-exit on fast PK.</p>
 <h2 id="dsl-example"><a class="header" href="#dsl-example">DSL example</a></h2>
 <p>No new DSL syntax is required — the model file is identical to a
 single-dose model. SS is a property of the <strong>dataset</strong>:</p>

@@ -38,26 +38,98 @@ Every prediction path in ferx-core honours `SS=1`:
 | Path                                              | Where                                                                     | How                                                |
 | ------------------------------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------- |
 | Analytical (1-/2-/3-cpt, no TV covariates)        | `predict_concentration` in `src/pk/mod.rs`                                | Closed-form geometric-series                       |
-| Analytical (1-/2-/3-cpt, time-varying covariates) | `event_driven_predictions_with_schedule` in `src/pk/event_driven.rs`      | Numerical pre-equilibration via the propagator     |
-| ODE (`[odes]`-block models)                       | `ode_predictions` / `ode_predictions_event_driven` in `src/ode/predictions.rs` | Numerical pre-equilibration via the RK45 solver |
+| Analytical (1-/2-/3-cpt, time-varying covariates) | `event_driven_predictions_with_schedule` in `src/pk/event_driven.rs`      | Numerical pulse expansion via the propagator       |
+| ODE (`[odes]`-block models)                       | `ode_predictions` / `ode_predictions_event_driven` in `src/ode/predictions.rs` | Numerical pulse expansion via the RK45 solver |
 
-The closed-form path uses the identity
+Both kinds of paths start from the same underlying identity — the
+choice between them is a question of whether the geometric series has
+a closed form for the model in question.
+
+### Analytical path: closed-form geometric series
+
+For linear analytical PK (1-/2-/3-cpt), the single-dose response is a
+sum of exponentials with known eigenvalues. The steady-state series
 
 ```
 C_ss(τ) = Σ_{n=0}^∞ C_single(τ + n·II)
 ```
 
-evaluated in closed form per disposition eigenvalue: for every
-exponential `A·exp(-λ·t)` in the single-dose response, the steady-state
-amplitude becomes `A·exp(-λ·τ) / (1 - exp(-λ·II))`. For oral models with
-`KA ≈ λ` a separate L'Hopital limit applies; ferx handles it
-automatically.
+collapses per eigenvalue: every exponential `A·exp(-λ·t)` in the
+single-dose response contributes a steady-state amplitude
+`A·exp(-λ·τ) / (1 - exp(-λ·II))`. ferx evaluates this exactly — no
+iteration, single-pass cost equivalent to evaluating the single-dose
+formula plus one extra division per eigenvalue. For oral models when
+`KA ≈ λ` the closed form needs the L'Hopital limit; ferx handles that
+case automatically.
 
-The numerical paths (ODE and event-driven analytical) run the same
-identity but expand the sum as `N = 50` cycles of `(apply dose;
-propagate II)`. Fifty cycles puts the truncation tail below `1e-9` of
-the steady-state value for any realistic PK, so users won't see the
-distinction in fit output.
+### ODE path: brute-force pulse expansion
+
+An `[odes]`-block model is an arbitrary user-defined RHS. There is no
+general eigenstructure to exploit — `dy/dt = f(y, p, t)` can be
+non-linear (Michaelis-Menten elimination), time-varying, or both, so
+no closed form exists for the steady-state state in general.
+
+Instead, ferx evaluates the geometric series *numerically* before the
+SS dose is applied. The algorithm in `equilibrate_ss_state` is exactly
+what its name says — brute-force pulse expansion:
+
+1. **Reset** the compartment state to zero. NONMEM `SS=1` semantics
+   say prior dynamics are discarded at the SS dose, so anything that
+   happened earlier in the timeline is overwritten here.
+2. **Loop `N = 50` cycles**:
+   - **Apply the dose** for one cycle:
+     - For a bolus, add `AMT` (with bioavailability `F1` applied) to
+       the dose's compartment.
+     - For an infusion, integrate for `T_inf = AMT/RATE` with a
+       wrapped RHS that adds `+RATE` to the dose's compartment.
+   - **Propagate** the ODE forward by the remainder of the cycle (`II`
+     for boluses, `II - T_inf` for infusions). Same RK45 solver as the
+     normal timeline, same tolerances, same wrapped-infusion mechanics.
+3. After the loop, the compartment state equals the "just-before-the-
+   next-pulse" steady-state amount.
+4. Normal-timeline handling resumes — the SS dose's own pulse is
+   applied through the standard bolus/infusion code path, taking the
+   state from pre-pulse to at-pulse SS.
+
+The result is mathematically equivalent to the analytical closed form
+in the linear case (and is unit-tested against it — see
+`ode_ss_iv_bolus_matches_analytical_ss` in `src/ode/predictions.rs`
+for the 1-cpt cross-check). For non-linear PK, the same scheme still
+produces a self-consistent steady-state state under the model's own
+dynamics; just be aware that for systems that *don't* have a true
+periodic steady state (e.g. zero-order elimination at saturation),
+the iteration may not converge to anything meaningful and SS=1 isn't
+really applicable.
+
+### Why `N = 50`?
+
+The truncation tail after `N` cycles is bounded by `exp(-N·λ·II)` for
+each disposition rate `λ`. For typical PK
+(`λ·II ≈ 2`, i.e. ~3 half-lives per dosing interval),
+`exp(-100) ≈ 4e-44` — well below any meaningful precision. For very
+slow PK (`λ·II = 0.1`, ~14 half-lives total over the 50 cycles),
+`exp(-5) ≈ 7e-3` — the slowest realistic case. ferx uses fixed
+`N = 50` rather than adaptive convergence checking because (a) the
+bound is conservative and (b) skipping the convergence check keeps
+the hot path branch-free for AD compatibility.
+
+If you need tighter accuracy for an unusually slow PK, the constant
+lives at `SS_EQUILIBRATION_CYCLES` in `src/ode/predictions.rs` and
+`EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES` in `src/pk/event_driven.rs`.
+
+### Cost comparison
+
+| Path                | Per SS-dose cost                          | Notes |
+| ------------------- | ----------------------------------------- | ----- |
+| Analytical closed   | ~1 single-dose evaluation                 | Effectively free |
+| Event-driven pulse  | ~50× analytical propagator calls          | Still cheap; analytical propagator is fast |
+| ODE pulse           | ~50× RK45 segment integrations            | Real cost — RK45 is the dominant per-prediction cost for ODE models, so SS doses cost ~50× more than non-SS doses |
+
+SS doses are typically rare (one per subject at the start of a
+maintenance regimen), so the absolute overhead per fit iteration is
+modest even for ODE models. If a benchmark shows SS equilibration as
+a hot spot, an adaptive `N` (loop until `||state - prev|| / ||state||
+< tol`) is the obvious follow-up — it would early-exit on fast PK.
 
 ## DSL example
 

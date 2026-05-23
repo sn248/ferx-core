@@ -238,6 +238,77 @@ fn state_layout(pk_model: PkModel) -> (usize, usize) {
     }
 }
 
+/// Number of cycles to expand for SS equilibration in the event-driven
+/// analytical path. Matches the ODE-side default in `ode/predictions.rs`
+/// for consistency. 50 cycles puts `exp(-50·k·II)` well below 1e-9 of
+/// the SS amount for any realistic PK.
+const EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES: usize = 50;
+
+/// Pre-equilibrate the event-driven analytical state to its SS value for
+/// an SS=1 dose. Same scheme as `ode/predictions.rs::equilibrate_ss_state`:
+/// reset state, then loop N cycles of (apply dose; propagate one II).
+/// The state after the loop is the "just-before-next-pulse" SS state;
+/// the caller applies the SS dose's own pulse through the normal flow.
+///
+/// `dose.ii > 0` and `dose.duration <= dose.ii` are required (callers
+/// already guard the first; overlapping infusions are rejected).
+fn equilibrate_ss_state_event_driven(
+    pk_model: PkModel,
+    pk: &PkParams,
+    dose: &DoseEvent,
+) -> Vec<f64> {
+    let (n_states, _) = state_layout(pk_model);
+    let mut state = vec![0.0_f64; n_states];
+
+    if dose.ii <= 0.0 || dose.cmt == 0 {
+        return state;
+    }
+    let cmt_idx = dose.cmt.saturating_sub(1);
+    if cmt_idx >= n_states {
+        return state;
+    }
+    let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
+    if is_inf && dose.duration > dose.ii {
+        // Overlapping infusions: no closed-form pulse expansion. Caller's
+        // api.rs warning fires for this case.
+        return state;
+    }
+
+    // Synthetic single-dose at t=0 inside each cycle; propagate over
+    // [0, T_inf, II] for infusions (so the bounds split at the infusion
+    // end) or [0, II] for boluses.
+    let synthetic_dose = if is_inf {
+        vec![DoseEvent::new(
+            0.0, dose.amt, dose.cmt, dose.rate, false, 0.0,
+        )]
+    } else {
+        Vec::new()
+    };
+    let synthetic_lagtimes: Vec<f64> = if is_inf { vec![0.0] } else { Vec::new() };
+    let bounds: Vec<f64> = if is_inf {
+        vec![0.0, dose.duration, dose.ii]
+    } else {
+        vec![0.0, dose.ii]
+    };
+
+    for _ in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
+        if !is_inf {
+            // Bolus pulse: instantaneous amount jump (with F).
+            state[cmt_idx] += pk.f_bio() * dose.amt;
+        }
+        propagate_with_bounds(
+            &mut state,
+            &bounds,
+            pk,
+            pk_model,
+            &synthetic_dose,
+            &synthetic_lagtimes,
+        );
+    }
+
+    state
+}
+
 // `is_oral` was a helper for the previous infusion dispatcher; the
 // per-model `match (pk_model, d.cmt)` now subsumes it.
 
@@ -329,6 +400,14 @@ pub fn event_driven_predictions_with_schedule(
         match ev.kind {
             EventKind::Dose => {
                 let d = &subject.doses[ev.orig_idx];
+                // Steady-state (SS=1): reset state and load with the SS
+                // amount from the infinite-past pulse train before the SS
+                // dose's own pulse is applied through the normal flow.
+                // See `equilibrate_ss_state_event_driven` for the per-cycle
+                // scheme. Mirrors `ode/predictions.rs::ode_predictions_*`.
+                if d.ss && d.ii > 0.0 {
+                    state = equilibrate_ss_state_event_driven(pk_model, &pk_now, d);
+                }
                 if d.rate <= 0.0 {
                     // Bolus: instantaneous amount jump in dose's compartment.
                     // Apply bioavailability F1 — mirrors the analytical
@@ -1667,6 +1746,80 @@ mod tests {
         assert_eq!(direct.len(), with_sched.len());
         for (a, b) in direct.iter().zip(with_sched.iter()) {
             assert_relative_eq!(*a, *b, epsilon = 1e-12);
+        }
+    }
+
+    // --- Steady-state (SS=1) tests for the event-driven path ---
+    //
+    // Cross-checked against the analytical SS closed forms in
+    // `src/pk/one_compartment.rs::*_ss`. The event-driven path is what TV-
+    // covariate subjects route through; when the per-event PK params are
+    // constant the predictions must equal the no-TV closed-form result.
+
+    #[test]
+    fn event_driven_ss_iv_bolus_matches_analytical_ss() {
+        use crate::pk::one_cpt_iv_bolus_ss;
+        let cl = 5.0;
+        let v = 80.0;
+        let amt = 1000.0;
+        let ii = 12.0;
+        let obs_times = vec![1.0, 4.0, 8.0, 11.0, 14.0, 24.0];
+        let dose = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
+        let subj = make_subject(vec![dose.clone()], obs_times.clone());
+        let pk = pk_one(cl, v);
+        let pk_dose = vec![pk; 1];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        for (j, &t) in obs_times.iter().enumerate() {
+            let expected = one_cpt_iv_bolus_ss(&dose, t, cl, v);
+            assert_relative_eq!(preds[j], expected, epsilon = 1e-9, max_relative = 1e-7);
+        }
+    }
+
+    #[test]
+    fn event_driven_ss_infusion_matches_analytical_ss() {
+        use crate::pk::one_cpt_infusion_ss;
+        let cl = 5.0;
+        let v = 80.0;
+        let amt = 1000.0;
+        let rate = 250.0; // T_inf = 4 h
+        let ii = 24.0;
+        let obs_times = vec![1.0, 3.5, 4.0, 8.0, 12.0, 23.0, 48.0];
+        let dose = DoseEvent::new(0.0, amt, 1, rate, true, ii);
+        let subj = make_subject(vec![dose.clone()], obs_times.clone());
+        let pk = pk_one(cl, v);
+        let pk_dose = vec![pk; 1];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds =
+            event_driven_predictions(PkModel::OneCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
+        for (j, &t) in obs_times.iter().enumerate() {
+            let expected = one_cpt_infusion_ss(&dose, t, cl, v);
+            assert_relative_eq!(preds[j], expected, epsilon = 1e-9, max_relative = 1e-7);
+        }
+    }
+
+    #[test]
+    fn event_driven_ss_oral_matches_analytical_ss() {
+        use crate::pk::one_cpt_oral_ss;
+        let cl = 2.0;
+        let v = 20.0;
+        let ka = 1.5;
+        let amt = 100.0;
+        let ii = 24.0;
+        let obs_times = vec![0.5, 1.0, 4.0, 12.0, 23.0, 48.0];
+        // Oral SS: dose into the depot (cmt = 1 for the depot slot).
+        let dose = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
+        let subj = make_subject(vec![dose.clone()], obs_times.clone());
+        let pk = pk_one_oral(cl, v, ka);
+        let pk_dose = vec![pk; 1];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs, &[]);
+        for (j, &t) in obs_times.iter().enumerate() {
+            let expected = one_cpt_oral_ss(&dose, t, cl, v, ka);
+            assert_relative_eq!(preds[j], expected, epsilon = 1e-9, max_relative = 1e-7);
         }
     }
 }

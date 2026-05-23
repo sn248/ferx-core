@@ -651,39 +651,45 @@ fn fit_inner(
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
-    // Steady-state (SS=1) coverage warning. SS is supported via closed-form
-    // for 1-cpt, 2-cpt, and 3-cpt analytical models without time-varying
-    // covariates. ODE-based models and any subject with TV covariates
-    // (routed through the event-driven path) silently treat SS doses as
-    // single doses. Warn so users know predictions are biased on those
-    // paths.
-    let n_ss_subjects = population
+    // Steady-state (SS=1) data validation. SS is now supported on every
+    // prediction path: analytical (PR #75 for 1-cpt, #77 for 2-/3-cpt),
+    // ODE-based (numerical pre-equilibration via per-cycle pulse expansion
+    // in `equilibrate_ss_state`), and event-driven (TV-cov; analytical
+    // pulse expansion in `equilibrate_ss_state_event_driven`). The
+    // remaining warnings catch malformed SS rows that the SS code paths
+    // can't handle and silently zero out:
+    //   - SS=1 with II ≤ 0 (missing or invalid interval)
+    //   - SS=1 infusion with T_inf > II (overlapping pulses — no closed
+    //     form, no equilibration scheme)
+    let n_ss_bad_ii = population
         .subjects
         .iter()
-        .filter(|s| s.has_ss_doses())
+        .filter(|s| s.doses.iter().any(|d| d.ss && d.ii <= 0.0))
         .count();
-    if n_ss_subjects > 0 {
-        let n_ss_with_tv = population
-            .subjects
-            .iter()
-            .filter(|s| s.has_ss_doses() && s.has_tv_covariates())
-            .count();
-        if model.is_ode_based() {
-            accumulated_warnings.push(format!(
-                "{} subject(s) have steady-state (SS=1) doses but the model is \
-                 ODE-based. The ODE prediction path does not yet implement SS — \
-                 predictions for these subjects are biased. Tracked in issue #74.",
-                n_ss_subjects
-            ));
-        } else if n_ss_with_tv > 0 {
-            accumulated_warnings.push(format!(
-                "{} subject(s) have steady-state (SS=1) doses combined with \
-                 time-varying covariates. The event-driven path used for TV \
-                 covariates does not yet implement SS — these subjects are \
-                 biased. Tracked in issue #74.",
-                n_ss_with_tv
-            ));
-        }
+    if n_ss_bad_ii > 0 {
+        accumulated_warnings.push(format!(
+            "{} subject(s) have SS=1 doses with missing or non-positive II. \
+             SS predictions require II > 0 — affected dose contributions are \
+             silently zero. Set II in the dataset or remove the SS flag.",
+            n_ss_bad_ii
+        ));
+    }
+    let n_ss_overlapping_inf = population
+        .subjects
+        .iter()
+        .filter(|s| {
+            s.doses
+                .iter()
+                .any(|d| d.ss && d.ii > 0.0 && d.rate > 0.0 && d.duration > d.ii)
+        })
+        .count();
+    if n_ss_overlapping_inf > 0 {
+        accumulated_warnings.push(format!(
+            "{} subject(s) have SS=1 infusions with T_inf > II (overlapping \
+             pulses). No closed-form SS covers this case; predictions are 0 \
+             for those contributions. Use a shorter infusion or remove SS.",
+            n_ss_overlapping_inf
+        ));
     }
 
     // Lagtime: probe at the initial typical-value point (eta = 0, mean

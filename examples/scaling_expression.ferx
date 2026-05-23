@@ -1,12 +1,14 @@
-# Form B: expression `obs_scale` — covariate-driven scale.
+# Form B: expression `obs_scale` — references an individual parameter.
 #
-# Demonstrates a weight-normalised scale factor `WT / 70`. The scale is
-# evaluated once per subject from subject-level covariates (Phase 1).
+# Mirrors the example in issue #2: the structural model produces an
+# amount-style prediction and `obs_scale = V` converts it to a
+# concentration. The scale is evaluated per subject from a single
+# `pk_param_fn` snapshot, so V here uses the typical value times the
+# EBE η (subject-static).
 #
-# Note: Form B can reference thetas, etas, and covariates — but NOT
-# individual parameters (see docs/src/model-file/scaling.md). The combination
-# `[scaling] obs_scale = <expr>` + `gradient = ad` is rejected at parse time;
-# use `gradient = fd` (set here explicitly) for expression-form scales.
+# Form B can also reference thetas, etas, and covariates (e.g.
+# `obs_scale = WT / 70`). `[scaling] obs_scale = <expr>` + `gradient = ad`
+# is rejected at parse time; use `gradient = fd` (set here explicitly).
 
 [parameters]
   theta TVCL(5.0,  0.1,  50.0)
@@ -25,7 +27,7 @@
   pk one_cpt_iv_bolus(cl=CL, v=V)
 
 [scaling]
-  obs_scale = WT / 70           # subject-level allometric DV scale
+  obs_scale = V                 # per-subject volume-normalised DV scale
 
 [error_model]
   DV ~ proportional(PROP_ERR)

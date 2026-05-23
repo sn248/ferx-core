@@ -56,7 +56,7 @@ fn model_preds(
     } else {
         pk::compute_predictions(model.pk_model, subject, pk_params)
     };
-    pk::apply_scaling(&model.scaling, theta, eta, &subject.covariates, &mut preds);
+    pk::apply_scaling(model, subject, theta, eta, &mut preds);
     preds
 }
 

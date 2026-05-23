@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-10b3e3bf.js";
+            window.path_to_searchindex_js = "../searchindex-1e86eb14.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-f187808c.js"></script>
@@ -201,16 +201,16 @@ is divided by the constant before reaching the residual error model.</p>
 <pre><code class="language-ferx">[scaling]
   obs_scale = WT / 70
 </code></pre>
-<p>In Phase 1, expressions may reference:</p>
+<p>Expressions may reference:</p>
 <ul>
 <li>thetas (e.g. <code>TVV</code>),</li>
 <li>etas (e.g. <code>ETA_CL</code>),</li>
-<li>covariates (e.g. <code>WT</code>, <code>CR</code>).</li>
+<li>covariates (e.g. <code>WT</code>, <code>CR</code>),</li>
+<li>individual parameters declared in <code>[individual_parameters]</code> (e.g.
+<code>V</code>, <code>CL</code>) — these are resolved from a subject-static evaluation of
+<code>pk_param_fn</code> at scale-evaluation time, so <code>obs_scale = 1000 / V</code>
+uses the per-subject V (typical value times the EBE eta).</li>
 </ul>
-<p>Phase 1 <strong>does not</strong> support references to individual parameters (e.g.
-<code>obs_scale = 1000 / V</code>) — the parser will reject these with a clear
-error. Use the underlying theta (<code>TVV</code>) for now, or switch to Form C if
-you need an individual-parameter-driven scale on an ODE model.</p>
 <p>The scale is evaluated <strong>once per subject</strong> with subject-level
 covariates (matching the no-TV path). Time-varying covariate support for
 expression scales is a Phase 1.5 follow-up.</p>

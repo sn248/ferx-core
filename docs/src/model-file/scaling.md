@@ -35,16 +35,15 @@ Use when the scale depends on theta, eta, or a covariate.
   obs_scale = WT / 70
 ```
 
-In Phase 1, expressions may reference:
+Expressions may reference:
 
 - thetas (e.g. `TVV`),
 - etas (e.g. `ETA_CL`),
-- covariates (e.g. `WT`, `CR`).
-
-Phase 1 **does not** support references to individual parameters (e.g.
-`obs_scale = 1000 / V`) — the parser will reject these with a clear
-error. Use the underlying theta (`TVV`) for now, or switch to Form C if
-you need an individual-parameter-driven scale on an ODE model.
+- covariates (e.g. `WT`, `CR`),
+- individual parameters declared in `[individual_parameters]` (e.g.
+  `V`, `CL`) — these are resolved from a subject-static evaluation of
+  `pk_param_fn` at scale-evaluation time, so `obs_scale = 1000 / V`
+  uses the per-subject V (typical value times the EBE eta).
 
 The scale is evaluated **once per subject** with subject-level
 covariates (matching the no-TV path). Time-varying covariate support for

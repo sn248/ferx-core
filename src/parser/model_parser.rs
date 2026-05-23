@@ -1278,6 +1278,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         let theta_names_for_scaling = model.theta_names.clone();
         let eta_names_for_scaling = model.eta_names.clone();
         let indiv_var_names_for_scaling = model.indiv_param_names.clone();
+        let pk_indices_for_scaling = model.pk_indices.clone();
         let state_names_for_scaling = model
             .ode_spec
             .as_ref()
@@ -1290,6 +1291,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &theta_names_for_scaling,
             &eta_names_for_scaling,
             &indiv_var_names_for_scaling,
+            &pk_indices_for_scaling,
             &state_names_for_scaling,
             is_ode_model,
         )?;
@@ -1790,35 +1792,6 @@ fn parse_scalar_expression(value: &str, ctx: ParseCtx<'_>) -> Result<Expression,
     Ok(expr)
 }
 
-/// Walk an expression tree and reject any `Variable` reference. Used to
-/// enforce the Phase-1 restriction that `obs_scale = <expr>` (Form B) cannot
-/// reference individual parameters — only theta/eta/covariates.
-fn reject_variable_refs(expr: &Expression, where_msg: &str) -> Result<(), String> {
-    match expr {
-        Expression::Variable(name) => Err(format!(
-            "[scaling]: `{}` references individual parameter `{}`. \
-             Form B (obs_scale = <expr>) supports thetas, etas, and covariates only \
-             in Phase 1; refer to the underlying theta (e.g. `TVV`) or use Form C \
-             (`y = <expr>` on an ODE model) for individual-parameter access.",
-            where_msg, name
-        )),
-        Expression::BinOp(l, _, r) => {
-            reject_variable_refs(l, where_msg)?;
-            reject_variable_refs(r, where_msg)
-        }
-        Expression::UnaryFn(_, a) => reject_variable_refs(a, where_msg),
-        Expression::Power(b, e) => {
-            reject_variable_refs(b, where_msg)?;
-            reject_variable_refs(e, where_msg)
-        }
-        Expression::Conditional(_, t, e) => {
-            reject_variable_refs(t, where_msg)?;
-            reject_variable_refs(e, where_msg)
-        }
-        _ => Ok(()),
-    }
-}
-
 /// Parsed contents of a `[scaling]` block.
 ///
 /// Returns `(ScalingSpec, Option<OdeOutputFn>)`:
@@ -1827,17 +1800,21 @@ fn reject_variable_refs(expr: &Expression, where_msg: &str) -> Result<(), String
 ///   replacing the default state-index readout inside the ODE timeline loop.
 ///
 /// `is_ode = true` enables Form C and lets expressions reference state names.
+/// `pk_indices` is parallel to `indiv_var_names`: `pk_indices[i]` is the
+/// `PkParams.values` slot for the i-th individual parameter. Used by Form B
+/// to look up indiv-param values (e.g. `V`) from a subject-static
+/// `pk_param_fn` evaluation supplied to `scale_fn` at call time.
+///
 /// Validation:
 /// - Unknown keys are rejected.
 /// - `y = ...` on an analytical model is rejected.
-/// - Form B (expression `obs_scale`) cannot reference individual parameters
-///   in Phase 1 — see `reject_variable_refs`.
 #[allow(clippy::too_many_arguments)]
 fn parse_scaling_block(
     lines: &[String],
     theta_names: &[String],
     eta_names: &[String],
     indiv_var_names: &[String],
+    pk_indices: &[usize],
     state_names: &[String],
     is_ode: bool,
 ) -> Result<(ScalingSpec, Option<crate::ode::OdeOutputFn>), String> {
@@ -1879,18 +1856,36 @@ fn parse_scaling_block(
                     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
                     let expr = parse_scalar_expression(value, ctx)
                         .map_err(|e| format!("[scaling] obs_scale: {}", e))?;
-                    // Phase 1 restriction: no individual-parameter refs in
-                    // Form B — the closure has no path to evaluate them
-                    // without re-running the pk_param_fn (deferred to phase 2).
-                    reject_variable_refs(&expr, "obs_scale")?;
+                    // Build name → PK-slot lookup so the closure can read
+                    // `pk.values[slot]` for each `Expression::Variable(name)`.
+                    // For analytical models, `pk_indices[i]` is the canonical
+                    // PK slot for the i-th indiv param. For ODE models the
+                    // parser fills `pk_indices = (0..n_eta)` which is only
+                    // valid when `n_eta == indiv_var_names.len()`; fall back
+                    // to positional `i` when the arrays don't align so an
+                    // ODE indiv param like `V` (with no eta) still resolves.
+                    let indiv_to_pk_slot: HashMap<String, usize> = indiv_var_names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| (name.clone(), pk_indices.get(i).copied().unwrap_or(i)))
+                        .collect();
                     let scale_fn: ScaleFn = Box::new(
                         move |theta: &[f64],
                               eta: &[f64],
-                              covariates: &HashMap<String, f64>|
+                              covariates: &HashMap<String, f64>,
+                              pk: &PkParams|
                               -> f64 {
-                            let empty_vars: HashMap<String, f64> = HashMap::new();
+                            // Populate vars with indiv-param values from pk so
+                            // `Expression::Variable("V")` resolves to pk.values[V_slot].
+                            let mut vars: HashMap<String, f64> =
+                                HashMap::with_capacity(indiv_to_pk_slot.len());
+                            for (name, &slot) in &indiv_to_pk_slot {
+                                if slot < pk.values.len() {
+                                    vars.insert(name.clone(), pk.values[slot]);
+                                }
+                            }
                             let empty_nn: Vec<Vec<f64>> = Vec::new();
-                            eval_expression(&expr, theta, eta, covariates, &empty_vars, &empty_nn)
+                            eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
                         },
                     );
                     scaling = ScalingSpec::ExpressionScale { scale_fn };
@@ -7971,7 +7966,8 @@ if (1 > 0) {
                 let theta = vec![1.0, 50.0]; // [TVCL, TVV]
                 let eta = vec![0.0];
                 let cov = HashMap::new();
-                let s = scale_fn(&theta, &eta, &cov);
+                let pk = PkParams::default();
+                let s = scale_fn(&theta, &eta, &cov, &pk);
                 assert!((s - 5.0).abs() < 1e-12, "expected 5.0, got {}", s);
             }
             other => panic!("expected ExpressionScale, got {:?}", other),
@@ -7988,7 +7984,8 @@ if (1 > 0) {
                 let eta = vec![0.0];
                 let mut cov = HashMap::new();
                 cov.insert("WT".to_string(), 84.0);
-                let s = scale_fn(&theta, &eta, &cov);
+                let pk = PkParams::default();
+                let s = scale_fn(&theta, &eta, &cov, &pk);
                 assert!((s - 1.2).abs() < 1e-12, "expected 1.2, got {}", s);
             }
             other => panic!("expected ExpressionScale, got {:?}", other),
@@ -7996,18 +7993,31 @@ if (1 > 0) {
     }
 
     #[test]
-    fn test_parse_scaling_expression_rejects_indiv_param_ref() {
-        // Phase 1 restriction: `V` is an individual parameter — must be rejected
-        // in Form B because the closure has no path to materialize it without
-        // re-running pk_param_fn.
+    fn test_parse_scaling_expression_uses_indiv_param() {
+        // Phase 1.5: `V` is an individual parameter — must resolve via the
+        // PK slot in the pk_params snapshot passed to scale_fn. The
+        // `analytical_model_with_scaling` template defines `V = TVV` (an
+        // unattenuated theta passthrough), so V's runtime value equals
+        // theta[1] = 50, and `obs_scale = 1000 / V` evaluates to 20.
         let src = analytical_model_with_scaling(Some("  obs_scale = 1000 / V\n"));
-        let err =
-            parse_model_string(&src).expect_err("indiv param ref in obs_scale must be rejected");
-        assert!(
-            err.contains("individual parameter") && err.contains('V'),
-            "expected indiv-param rejection error, got: {}",
-            err
-        );
+        let model = parse_model_string(&src).expect("indiv-param ref in obs_scale parses");
+        match model.scaling {
+            ScalingSpec::ExpressionScale { ref scale_fn } => {
+                let theta = vec![1.0, 50.0]; // [TVCL, TVV]
+                let eta = vec![0.0];
+                let cov = HashMap::new();
+                // Mimic what apply_scaling does at runtime: evaluate pk_param_fn
+                // with the subject's theta/eta/covariates to materialize V.
+                let pk = (model.pk_param_fn)(&theta, &eta, &cov);
+                let s = scale_fn(&theta, &eta, &cov, &pk);
+                assert!(
+                    (s - 20.0).abs() < 1e-12,
+                    "expected 20.0 (= 1000/50), got {}",
+                    s
+                );
+            }
+            other => panic!("expected ExpressionScale, got {:?}", other),
+        }
     }
 
     #[test]

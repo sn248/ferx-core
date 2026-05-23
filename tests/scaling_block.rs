@@ -155,6 +155,42 @@ const ODE_AMOUNT_FORM_C: &str = "\
 ";
 
 #[test]
+fn form_b_expression_uses_individual_parameter() {
+    // Phase 1.5: Form B can reference individual parameters. We construct
+    // two equivalent analytical models on the same data:
+    //   (a) baseline with no scaling
+    //   (b) `obs_scale = V` — divides every prediction by V
+    // and check (a).pred / V = (b).pred. With V = TVV = 50 and the test
+    // population having a single subject (η = 0), V is deterministic.
+    let baseline = parse_model_string(ANALYTICAL_BASE).expect("baseline parses");
+    let mut scaled_src = String::from(ANALYTICAL_BASE);
+    scaled_src.push_str("\n[scaling]\n  obs_scale = V\n");
+    let scaled = parse_model_string(&scaled_src).expect("Form B with indiv-param parses");
+
+    let pop = one_subject_pop();
+    let base_preds = predict(&baseline, &pop, &baseline.default_params);
+    let scaled_preds = predict(&scaled, &pop, &scaled.default_params);
+
+    assert_eq!(base_preds.len(), scaled_preds.len());
+    assert!(!base_preds.is_empty());
+
+    // V = TVV = 50 (no eta on V in the template).
+    let v = 50.0;
+    for (b, s) in base_preds.iter().zip(scaled_preds.iter()) {
+        assert!(b.pred > 0.0);
+        let expected = b.pred / v;
+        let rel = (s.pred - expected).abs() / expected.abs().max(1e-12);
+        assert!(
+            rel < 1e-9,
+            "Form B with indiv-param V: baseline={} scaled={} expected={}",
+            b.pred,
+            s.pred,
+            expected
+        );
+    }
+}
+
+#[test]
 fn form_c_amount_ode_matches_concentration_ode() {
     let conc = parse_model_string(ODE_CONCENTRATION_FORM).expect("concentration form parses");
     let amt = parse_model_string(ODE_AMOUNT_FORM_C).expect("Form C parses");

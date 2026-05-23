@@ -596,10 +596,13 @@ pub struct EtaParamInfo {
 pub type PkParamFn = Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> PkParams + Send + Sync>;
 
 /// Closure signature for `[scaling] obs_scale = <expr>` (Form B). Receives
-/// `(theta, eta, covariates)` and returns the per-subject scale factor used
-/// to divide the raw prediction. Mirrors the surface of `PkParamFn` so the
-/// parser can build it with the same machinery.
-pub type ScaleFn = Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
+/// `(theta, eta, covariates, pk_params)` and returns the per-subject scale
+/// factor used to divide the raw prediction. `pk_params` is the subject-
+/// static evaluation of `model.pk_param_fn`, so the scale expression can
+/// reference individual parameters (e.g. `obs_scale = 1000 / V`) — the
+/// closure looks up V via its PK slot in `pk_params.values`.
+pub type ScaleFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>, &PkParams) -> f64 + Send + Sync>;
 
 /// How the structural model's raw output is mapped to the observed `DV`.
 ///

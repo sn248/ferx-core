@@ -15,7 +15,10 @@ pub use two_compartment::*;
 /// reads as "raw / scale").
 ///
 /// `ScalingSpec::None` is a no-op so every existing call path keeps its
-/// historical behaviour.
+/// historical behaviour. For `ExpressionScale`, a subject-static
+/// `pk_param_fn` evaluation is performed so the scale expression can
+/// reference individual parameters (Phase 1 limitation: subject-static
+/// only — TV-cov-aware expression scales are a Phase 1.5 follow-up).
 ///
 /// Form C (ODE `y = <expr>`) does *not* go through here — it replaces the
 /// per-observation state readout inside the ODE timeline loop via
@@ -23,13 +26,13 @@ pub use two_compartment::*;
 /// already in observation units.
 #[inline]
 pub fn apply_scaling(
-    scaling: &ScalingSpec,
+    model: &CompiledModel,
+    subject: &Subject,
     theta: &[f64],
     eta: &[f64],
-    covariates: &std::collections::HashMap<String, f64>,
     preds: &mut [f64],
 ) {
-    match scaling {
+    match &model.scaling {
         ScalingSpec::None => {}
         ScalingSpec::ScalarScale(k) => {
             // Parser enforces `k > 0 && finite`; defensive guard kept so
@@ -40,7 +43,13 @@ pub fn apply_scaling(
             }
         }
         ScalingSpec::ExpressionScale { scale_fn } => {
-            let s = scale_fn(theta, eta, covariates);
+            // Compute subject-static pk so the scale expression can
+            // reference individual parameters by name. Cheap relative to
+            // the FOCE inner loop — `gradient = ad` is rejected for
+            // ExpressionScale at parse time, so this branch only runs
+            // under FD anyway.
+            let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+            let s = scale_fn(theta, eta, &subject.covariates, &pk);
             // Expression scales can evaluate to 0 / NaN / inf at runtime
             // (e.g. covariate-driven `WT / 70` when WT = 0 due to missing
             // data, or `1 / (TVV - x)` near a singularity). Dividing
@@ -403,7 +412,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     // GN, trust-region, SAEM, and IOV — they all route through here.
     // Form C (ODE `y = <expr>`) is already applied inside `ode_predictions*`
     // via `OdeSpec::output_fn`, so `model.scaling` is `None` for those.
-    apply_scaling(&model.scaling, theta, eta, &subject.covariates, &mut preds);
+    apply_scaling(model, subject, theta, eta, &mut preds);
     preds
 }
 
@@ -771,29 +780,37 @@ mod tests {
 
     // ── apply_scaling ───────────────────────────────────────────────────────
 
+    /// Build the same `cl_from_cr_model` test fixture but with the
+    /// requested `ScalingSpec` swapped in. Used by all apply_scaling tests
+    /// so they exercise the production signature
+    /// (`apply_scaling(&model, &subject, ...)`).
+    fn model_with_scaling(scaling: crate::types::ScalingSpec) -> crate::types::CompiledModel {
+        let mut m = cl_from_cr_model();
+        m.scaling = scaling;
+        m
+    }
+
+    fn one_subject_for_scaling() -> Subject {
+        let mut cov = HashMap::new();
+        cov.insert("CR".to_string(), 1.0);
+        make_subject_with_tv(cov, Vec::new(), Vec::new(), 1, 3)
+    }
+
     #[test]
     fn test_apply_scaling_none_is_noop() {
+        let model = model_with_scaling(ScalingSpec::None);
+        let subj = one_subject_for_scaling();
         let mut preds = vec![10.0, 20.0, 30.0];
-        let theta = vec![];
-        let eta = vec![];
-        let cov = HashMap::new();
-        apply_scaling(&ScalingSpec::None, &theta, &eta, &cov, &mut preds);
+        apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
         assert_eq!(preds, vec![10.0, 20.0, 30.0]);
     }
 
     #[test]
     fn test_apply_scaling_scalar_divides_in_place() {
+        let model = model_with_scaling(ScalingSpec::ScalarScale(1000.0));
+        let subj = one_subject_for_scaling();
         let mut preds = vec![1000.0, 2000.0, 3000.0];
-        let theta = vec![];
-        let eta = vec![];
-        let cov = HashMap::new();
-        apply_scaling(
-            &ScalingSpec::ScalarScale(1000.0),
-            &theta,
-            &eta,
-            &cov,
-            &mut preds,
-        );
+        apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
         for (got, exp) in preds.iter().zip([1.0, 2.0, 3.0].iter()) {
             assert_relative_eq!(got, exp, epsilon = 1e-12);
         }
@@ -804,23 +821,13 @@ mod tests {
         // Regression for Copilot review: an ExpressionScale whose closure
         // returns 0 / NaN / inf must not produce inf/NaN predictions.
         // Phase 1 policy: leave preds unchanged.
-        let cases: [Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>; 3] = [
-            Box::new(|_, _, _| 0.0),
-            Box::new(|_, _, _| f64::NAN),
-            Box::new(|_, _, _| f64::INFINITY),
-        ];
-        let theta = vec![];
-        let eta = vec![];
-        let cov = HashMap::new();
-        for scale_fn in cases {
+        let bad_returns = [0.0_f64, f64::NAN, f64::INFINITY];
+        for &val in &bad_returns {
+            let scale_fn: crate::types::ScaleFn = Box::new(move |_, _, _, _| val);
+            let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn });
+            let subj = one_subject_for_scaling();
             let mut preds = vec![1.0, 2.0, 3.0];
-            apply_scaling(
-                &ScalingSpec::ExpressionScale { scale_fn },
-                &theta,
-                &eta,
-                &cov,
-                &mut preds,
-            );
+            apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
             for p in &preds {
                 assert!(
                     p.is_finite(),
@@ -835,22 +842,34 @@ mod tests {
     fn test_apply_scaling_expression_uses_covariate() {
         // scale_fn = WT / 70 — divisive convention so preds / (WT/70).
         let scale_fn: crate::types::ScaleFn =
-            Box::new(|_theta, _eta, cov: &HashMap<String, f64>| {
+            Box::new(|_theta, _eta, cov: &HashMap<String, f64>, _pk: &PkParams| {
                 cov.get("WT").copied().unwrap_or(70.0) / 70.0
             });
+        let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn });
+        let mut subj = one_subject_for_scaling();
+        subj.covariates.insert("WT".to_string(), 84.0); // scale = 84/70 = 1.2
         let mut preds = vec![12.0, 24.0];
-        let theta = vec![];
-        let eta = vec![];
-        let mut cov = HashMap::new();
-        cov.insert("WT".to_string(), 84.0); // scale = 84/70 = 1.2
-        apply_scaling(
-            &ScalingSpec::ExpressionScale { scale_fn },
-            &theta,
-            &eta,
-            &cov,
-            &mut preds,
-        );
+        apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
         assert_relative_eq!(preds[0], 10.0, epsilon = 1e-12); // 12 / 1.2
         assert_relative_eq!(preds[1], 20.0, epsilon = 1e-12); // 24 / 1.2
+    }
+
+    #[test]
+    fn test_apply_scaling_expression_uses_pk_param() {
+        // Regression for Phase 1.5 lift: scale_fn can now read individual
+        // parameters from `pk`. Here `scale = V / 10` — V is at PK slot 1
+        // (PK_IDX_V) for the cl_from_cr model fixture (CL=slot 0, V=slot 1).
+        // The model sets V = 50 so scale = 5 and preds get divided by 5.
+        let scale_fn: crate::types::ScaleFn =
+            Box::new(|_theta, _eta, _cov: &HashMap<String, f64>, pk: &PkParams| {
+                pk.values[crate::types::PK_IDX_V] / 10.0
+            });
+        let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn });
+        let subj = one_subject_for_scaling();
+        let mut preds = vec![100.0, 50.0];
+        apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
+        // cl_from_cr_model sets V = 50, so scale = 5.
+        assert_relative_eq!(preds[0], 20.0, epsilon = 1e-12);
+        assert_relative_eq!(preds[1], 10.0, epsilon = 1e-12);
     }
 }

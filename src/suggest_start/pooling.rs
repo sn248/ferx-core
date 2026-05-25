@@ -13,6 +13,8 @@ pub struct PopNca {
     pub tmax_median: f64,
     /// Inter-subject CV² of CL/F, for omega initialisation.
     pub cl_cv2: Option<f64>,
+    /// Apparent lag time (oral models only); median across subjects with detectable lag.
+    pub tlag: Option<f64>,
     /// Q from biexponential peeling (2/3-cpt); None until try_biexp_peel runs.
     pub q_peel: Option<f64>,
     /// V2 from biexponential peeling (2/3-cpt); None until try_biexp_peel runs.
@@ -66,6 +68,23 @@ pub fn pool_nca(subjects: &[SubjectNca]) -> PopNca {
     tmaxes.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let tmax_median = median_f64(&tmaxes);
 
+    // Median lag time — use median rather than geomean because tlag is often a
+    // discrete sampling-time value and a few subjects with no detectable lag
+    // should not pull the estimate to zero.
+    let tlag = {
+        let mut tlags: Vec<f64> = subjects
+            .iter()
+            .filter_map(|s| s.tlag)
+            .filter(|&t| t > 0.0 && t.is_finite())
+            .collect();
+        tlags.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if tlags.is_empty() {
+            None
+        } else {
+            Some(median_f64(&tlags))
+        }
+    };
+
     // Inter-subject CV² of CL/F: var(log(CL_i / CL_pop))
     let cl_cv2 = cl_f.and_then(|cl_pop| {
         let log_devs: Vec<f64> = subjects
@@ -97,6 +116,7 @@ pub fn pool_nca(subjects: &[SubjectNca]) -> PopNca {
         c0,
         tmax_median,
         cl_cv2,
+        tlag,
         q_peel: None,
         v2_peel: None,
     }
@@ -146,6 +166,7 @@ mod tests {
             lambda_z: Some(cl_f / v_f),
             ka: Some(ka),
             c0: None,
+            tlag: None,
             tmax: 1.0,
             cmax: 10.0,
             auc_inf: Some(v_f / cl_f),

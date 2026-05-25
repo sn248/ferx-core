@@ -15,7 +15,7 @@ use rayon::prelude::*;
 
 use crate::types::{
     CompiledModel, ModelParameters, OmegaMatrix, PkModel, Population, PK_IDX_CL, PK_IDX_KA,
-    PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
+    PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
 };
 use nca::{
     biexponential_peel, first_dose_amt, first_dose_obs, nca_one_cpt_iv, nca_one_cpt_oral,
@@ -271,6 +271,8 @@ pub fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usiz
         "Q3"
     } else if pk_slot == PK_IDX_V3 {
         "V3"
+    } else if pk_slot == PK_IDX_LAGTIME {
+        "LAGTIME"
     } else {
         return None;
     };
@@ -340,6 +342,7 @@ fn build_params(
     let ka_idx = find_theta_for_slot(model, PK_IDX_KA);
     let q_idx = find_theta_for_slot(model, PK_IDX_Q);
     let v2_idx = find_theta_for_slot(model, PK_IDX_V2);
+    let lagtime_idx = find_theta_for_slot(model, PK_IDX_LAGTIME);
     let cl_eta_omega_idx = find_omega_idx_for_slot(model, PK_IDX_CL);
 
     // Helper: write one theta with bounds-clamping.
@@ -425,6 +428,20 @@ fn build_params(
         _ => {}
     }
 
+    // Write lag time (oral models only)
+    match model.pk_model {
+        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral => {
+            if let Some(tlag) = pop.tlag {
+                if let Some(idx) = lagtime_idx {
+                    write_theta(&mut params, idx, tlag, "LAGTIME", warnings);
+                }
+                // No warning if idx is None: model may not have a lagtime theta at all.
+            }
+            // No warning if tlag is None: no detectable lag in the data is fine.
+        }
+        _ => {}
+    }
+
     // Write Q and V2 from biexponential peeling
     if let Some(q) = pop.q_peel {
         if let Some(idx) = q_idx {
@@ -463,6 +480,7 @@ fn empty_pop_nca() -> PopNca {
         c0: None,
         tmax_median: 0.0,
         cl_cv2: None,
+        tlag: None,
         q_peel: None,
         v2_peel: None,
     }

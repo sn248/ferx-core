@@ -12,8 +12,9 @@ pub struct SubjectNca {
     pub v_f: Option<f64>,  // Vd or Vd/F = CL_f / lambda_z
     pub vss: Option<f64>,  // Vss = CL_f × MRT (multi-cpt)
     pub lambda_z: Option<f64>,
-    pub ka: Option<f64>, // absorption rate (oral models only)
-    pub c0: Option<f64>, // back-extrapolated initial conc (IV models only)
+    pub ka: Option<f64>,   // absorption rate (oral models only)
+    pub c0: Option<f64>,   // back-extrapolated initial conc (IV models only)
+    pub tlag: Option<f64>, // apparent lag time (oral models only)
     pub tmax: f64,
     pub cmax: f64,
     pub auc_inf: Option<f64>,
@@ -382,6 +383,11 @@ pub fn nca_one_cpt_oral(subject: &Subject) -> SubjectNca {
         None
     };
 
+    // Lag time: last observation time before Cmax whose concentration is below
+    // 5% of Cmax.  Indicates a delay in absorption onset.  None if the first
+    // observation already exceeds 5% of Cmax (no detectable lag).
+    let tlag = estimate_tlag(&times, &concs_norm, cmax);
+
     SubjectNca {
         cl_f,
         v_f,
@@ -389,6 +395,7 @@ pub fn nca_one_cpt_oral(subject: &Subject) -> SubjectNca {
         lambda_z: lz.map(|(l, _)| l),
         ka,
         c0: None,
+        tlag,
         tmax,
         cmax,
         auc_inf,
@@ -439,6 +446,7 @@ pub fn nca_one_cpt_iv(subject: &Subject) -> SubjectNca {
         lambda_z: lz.map(|(l, _)| l),
         ka: None,
         c0,
+        tlag: None,
         tmax,
         cmax,
         auc_inf,
@@ -487,11 +495,41 @@ fn empty_nca() -> SubjectNca {
         lambda_z: None,
         ka: None,
         c0: None,
+        tlag: None,
         tmax: 0.0,
         cmax: 0.0,
         auc_inf: None,
         mrt: None,
     }
+}
+
+/// Estimate apparent lag time as the last observation time before Tmax where
+/// concentration is below `threshold` × Cmax.  Returns None when the first
+/// observation already exceeds the threshold (no detectable lag).
+fn estimate_tlag(times: &[f64], concs: &[f64], cmax: f64) -> Option<f64> {
+    if cmax <= 0.0 || times.is_empty() {
+        return None;
+    }
+    let threshold = 0.05 * cmax;
+    // Walk forward; stop at Cmax to avoid the elimination phase.
+    let tmax = times
+        .iter()
+        .zip(concs.iter())
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(&t, _)| t)
+        .unwrap_or(f64::INFINITY);
+
+    let last_below: Option<f64> = times
+        .iter()
+        .zip(concs.iter())
+        .take_while(|(&t, _)| t <= tmax)
+        .filter(|(_, &c)| c < threshold)
+        .map(|(&t, _)| t)
+        .last();
+
+    // Only report a lag if it's after time zero (a zero-time pre-dose sample
+    // at c≈0 is not a lag).
+    last_below.filter(|&t| t > 0.0)
 }
 
 #[cfg(test)]

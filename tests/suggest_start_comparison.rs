@@ -112,6 +112,17 @@ fn suggest_start_comparison_all_models() {
                 ("TVV3", 30.0),
             ],
         },
+        Case {
+            label: "1-cpt oral with lag time (analytical)",
+            model_path: "examples/oral_with_lagtime.ferx",
+            data_path: "data/one_cpt_oral_lagtime.csv",
+            truth: vec![
+                ("TVCL", 5.0),
+                ("TVV", 50.0),
+                ("TVKA", 1.5),
+                ("TVLAGTIME", 0.75),
+            ],
+        },
         // ── ODE models ───────────────────────────────────────────────────────
         Case {
             label: "1-cpt IV bolus (ODE)",

@@ -105,8 +105,21 @@ pub fn terminal_slope(
     min_pts: usize,
     r2_threshold: f64,
 ) -> Option<(f64, f64)> {
-    // Collect terminal candidate points: C > cmax/10, C > 0, finite.
-    let threshold = cmax / 10.0;
+    terminal_slope_frac(times, concs, cmax, min_pts, r2_threshold, 0.1)
+}
+
+/// Like [`terminal_slope`] but with a configurable `cmax_fraction` threshold.
+/// Use a lower fraction (e.g. 0.01) when estimating the true terminal phase
+/// of multi-compartment data, where the terminal phase sits well below 10% of Cmax.
+pub fn terminal_slope_frac(
+    times: &[f64],
+    concs: &[f64],
+    cmax: f64,
+    min_pts: usize,
+    r2_threshold: f64,
+    cmax_fraction: f64,
+) -> Option<(f64, f64)> {
+    let threshold = cmax * cmax_fraction;
     let pts: Vec<(f64, f64)> = times
         .iter()
         .zip(concs.iter())
@@ -283,26 +296,47 @@ pub fn cmax_tmax(times: &[f64], concs: &[f64]) -> (f64, f64) {
 pub fn biexponential_peel(
     times: &[f64],
     concs: &[f64],
-    cmax: f64,
     min_pts: usize,
     min_separation: f64, // α/β threshold, typically 3.0
 ) -> Option<(f64, f64, f64, f64)> {
-    // Step 1: terminal phase → β, B
-    let (lambda_z, intercept_ln) = terminal_slope(times, concs, cmax, min_pts, 0.8)?;
-    let beta = lambda_z;
-    let b_cap = intercept_ln.exp(); // B = exp(intercept)
-
-    // Step 2: compute residuals on early points (before peak / early distribution phase)
-    // Use points where the terminal component is < 90% of the observed value
-    // (i.e. still meaningfully in the distribution phase).
-    let residuals: Vec<(f64, f64)> = times
+    // Step 1: terminal phase → β, B.
+    // Classic method of residuals: use only the LAST min_pts+1 points by time for
+    // the terminal regression.  This avoids including early distribution-dominated
+    // points that would bias the slope estimate toward α.
+    let valid_pts: Vec<(f64, f64)> = times
         .iter()
         .zip(concs.iter())
         .filter(|(_, &c)| c.is_finite() && c > 0.0)
-        .filter_map(|(&t, &c)| {
+        .map(|(&t, &c)| (t, c))
+        .collect();
+
+    if valid_pts.len() < min_pts * 2 {
+        return None;
+    }
+
+    // Use the last (min_pts + 1) points for terminal regression (max 5).
+    let n_terminal = (min_pts + 1).min(5).min(valid_pts.len() / 2);
+    let terminal_pts: Vec<(f64, f64)> = valid_pts[valid_pts.len() - n_terminal..]
+        .iter()
+        .map(|&(t, c)| (t, c.ln()))
+        .collect();
+
+    let (slope_term, intercept_term, r2_term) = ols_slope(&terminal_pts)?;
+    if slope_term >= 0.0 || r2_term < 0.8 {
+        return None;
+    }
+    let beta = -slope_term;
+    let b_cap = intercept_term.exp();
+
+    // Step 2: compute residuals on the EARLY points (all except terminal).
+    // These are the points dominated by the distribution phase.
+    let early_pts: &[(f64, f64)] = &valid_pts[..valid_pts.len() - n_terminal];
+    let residuals: Vec<(f64, f64)> = early_pts
+        .iter()
+        .filter_map(|&(t, c)| {
             let terminal_contrib = b_cap * (-beta * t).exp();
             let resid = c - terminal_contrib;
-            if resid > 0.01 * c {
+            if resid > 0.0 {
                 Some((t, resid.ln()))
             } else {
                 None
@@ -347,46 +381,72 @@ pub fn nca_one_cpt_oral(subject: &Subject) -> SubjectNca {
 
     let (cmax, tmax) = cmax_tmax(&times, &concs_norm);
 
-    let Some((auc_obs, c_last, t_last)) = auc_trapezoid(&times, &concs_norm) else {
+    // Detect lag before NCA so we can shift times for AUC/lambda_z.
+    // Without shifting, near-zero pre-lag observations inflate AUC and cause
+    // CL = Dose/AUC to collapse to near-zero.
+    let tlag = estimate_tlag(&times, &concs_norm, cmax);
+    let lag_shift = tlag.unwrap_or(0.0);
+
+    // Drop observations that fall entirely within the lag period and shift the
+    // remaining times so absorption appears to start at t=0.
+    let (times_shifted, concs_shifted): (Vec<f64>, Vec<f64>) = times
+        .iter()
+        .zip(concs_norm.iter())
+        .filter(|(&t, _)| t >= lag_shift)
+        .map(|(&t, &c)| (t - lag_shift, c))
+        .unzip();
+
+    if times_shifted.len() < 2 {
         return SubjectNca {
             cmax,
             tmax,
+            tlag,
+            ..empty_nca()
+        };
+    }
+
+    let Some((auc_obs, c_last, t_last)) = auc_trapezoid(&times_shifted, &concs_shifted) else {
+        return SubjectNca {
+            cmax,
+            tmax,
+            tlag,
             ..empty_nca()
         };
     };
 
-    let lz = terminal_slope(&times, &concs_norm, cmax, 3, 0.8);
+    let lz = terminal_slope(&times_shifted, &concs_shifted, cmax, 3, 0.8);
     let auc_inf = lz.map(|(lz, _)| auc_obs + c_last / lz);
     let cl_f = auc_inf.map(|a| if a > 0.0 { 1.0 / a } else { f64::NAN });
     let v_f = lz.and_then(|(lz, _)| cl_f.map(|cl| cl / lz));
 
     // AUMC for MRT
-    let (aumc_obs, _, _) = aumc_trapezoid(&times, &concs_norm).unwrap_or((0.0, t_last, c_last));
+    let (aumc_obs, _, _) =
+        aumc_trapezoid(&times_shifted, &concs_shifted).unwrap_or((0.0, t_last, c_last));
     let aumc_inf =
         lz.and_then(|(lz, _)| Some(aumc_obs + c_last / lz.powi(2) + t_last * c_last / lz));
     let mrt =
         aumc_inf.and_then(|aumc| auc_inf.map(|auc| if auc > 0.0 { aumc / auc } else { f64::NAN }));
     let vss = mrt.and_then(|m| cl_f.map(|cl| cl * m));
 
-    // Ka via Wagner-Nelson; fallback = heuristic from Tmax
+    // Ka via Wagner-Nelson on lag-shifted times; fallback = heuristic from Tmax
+    let tmax_shifted = if tmax >= lag_shift {
+        tmax - lag_shift
+    } else {
+        tmax
+    };
     let ka = if let (Some(cl), Some(v)) = (cl_f, v_f) {
-        wagner_nelson_ka(&times, &concs_norm, cl, v).or_else(|| {
-            if tmax > 0.0 {
-                Some((2.0_f64).ln() / (0.5 * tmax))
+        wagner_nelson_ka(&times_shifted, &concs_shifted, cl, v).or_else(|| {
+            if tmax_shifted > 0.0 {
+                Some((2.0_f64).ln() / (0.5 * tmax_shifted))
             } else {
                 None
             }
         })
-    } else if tmax > 0.0 {
-        Some((2.0_f64).ln() / (0.5 * tmax))
+    } else if tmax_shifted > 0.0 {
+        Some((2.0_f64).ln() / (0.5 * tmax_shifted))
     } else {
         None
     };
-
-    // Lag time: last observation time before Cmax whose concentration is below
-    // 5% of Cmax.  Indicates a delay in absorption onset.  None if the first
-    // observation already exceeds 5% of Cmax (no detectable lag).
-    let tlag = estimate_tlag(&times, &concs_norm, cmax);
 
     SubjectNca {
         cl_f,
@@ -665,9 +725,7 @@ mod tests {
             .iter()
             .map(|&t| (a_cap * (-alpha * t).exp() + b_cap * (-beta * t).exp()) / dose)
             .collect();
-        let cmax = concs.iter().cloned().fold(0.0_f64, f64::max);
-
-        let (a, al, b, be) = biexponential_peel(&times, &concs, cmax, 3, 2.0).unwrap();
+        let (a, al, b, be) = biexponential_peel(&times, &concs, 3, 2.0).unwrap();
         // Check A/B and alpha/beta within 15%
         assert!(
             (a - a_cap / dose).abs() / (a_cap / dose) < 0.15,
@@ -690,8 +748,7 @@ mod tests {
             .iter()
             .map(|&t| 0.6 * (-0.3 * t).exp() + 0.4 * (-0.15 * t).exp())
             .collect();
-        let cmax = concs.iter().cloned().fold(0.0_f64, f64::max);
-        let result = biexponential_peel(&times, &concs, cmax, 3, 3.0);
+        let result = biexponential_peel(&times, &concs, 3, 3.0);
         assert!(
             result.is_none(),
             "should return None for poorly separated phases"

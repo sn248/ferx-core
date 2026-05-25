@@ -22,7 +22,7 @@ use nca::{
     SubjectNca,
 };
 use pooling::{pool_nca, PopNca};
-use sweep::sweep_unwritten_thetas;
+use sweep::{sweep_slots, sweep_unwritten_thetas};
 
 /// Output of `suggest_start` / `suggest_start_thorough`.
 #[derive(Debug, Clone)]
@@ -67,18 +67,49 @@ pub fn suggest_start_thorough(model: &CompiledModel, population: &Population) ->
     let mut base = suggest_start(model, population);
 
     // Collect non-fixed thetas that Option A left unchanged (still at model default).
-    let sweep_targets: Vec<usize> = (0..model.default_params.theta.len())
+    let mut remaining: Vec<usize> = (0..model.default_params.theta.len())
         .filter(|&i| {
             !base.params.theta_fixed[i]
                 && (base.params.theta[i] - model.default_params.theta[i]).abs() < 1e-12
         })
         .collect();
 
-    if !sweep_targets.is_empty() {
-        let (swept, sweep_warnings) =
-            sweep_unwritten_thetas(model, population, &base.params, &sweep_targets, 9, 10.0);
+    if remaining.is_empty() {
+        return base;
+    }
+
+    // Joint 2D sweeps for highly correlated pairs before independent 1D sweeps.
+    // CL and V (or CL/F, V/F) lie on a ridge in the rRMSE landscape — sweeping
+    // them independently always moves along the ridge rather than across it.
+    // Same applies to (Q, V2).
+    for (slot_a, slot_b, label) in &[(PK_IDX_CL, PK_IDX_V, "CL/V"), (PK_IDX_Q, PK_IDX_V2, "Q/V2")] {
+        let idx_a = find_theta_for_slot(model, *slot_a);
+        let idx_b = find_theta_for_slot(model, *slot_b);
+        if let (Some(ia), Some(ib)) = (idx_a, idx_b) {
+            if remaining.contains(&ia) && remaining.contains(&ib) {
+                let (swept, w) = sweep_slots(
+                    model,
+                    population,
+                    &base.params,
+                    *slot_a,
+                    *slot_b,
+                    9,
+                    10.0,
+                    label,
+                );
+                base.params = swept;
+                base.warnings.extend(w);
+                remaining.retain(|&i| i != ia && i != ib);
+            }
+        }
+    }
+
+    // Independent 1D sweeps for any remaining unwritten thetas.
+    if !remaining.is_empty() {
+        let (swept, w) =
+            sweep_unwritten_thetas(model, population, &base.params, &remaining, 9, 10.0);
         base.params = swept;
-        base.warnings.extend(sweep_warnings);
+        base.warnings.extend(w);
     }
 
     base
@@ -205,9 +236,8 @@ fn try_biexp_peel(
 
     let times: Vec<f64> = pooled.iter().map(|p| p.0).collect();
     let concs: Vec<f64> = pooled.iter().map(|p| p.1).collect();
-    let cmax = concs.iter().cloned().fold(0.0_f64, f64::max);
 
-    match biexponential_peel(&times, &concs, cmax, 3, 3.0) {
+    match biexponential_peel(&times, &concs, 3, 3.0) {
         Some((a_cap, alpha, b_cap, beta)) => {
             // Convert macro constants to micro PK parameters.
             // C(0) = A + B, V1 = 1/(A+B) (dose-normalised).

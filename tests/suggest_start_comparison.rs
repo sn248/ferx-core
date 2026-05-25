@@ -123,6 +123,12 @@ fn suggest_start_comparison_all_models() {
                 ("TVLAGTIME", 0.75),
             ],
         },
+        Case {
+            label: "1-cpt IV infusion (analytical)",
+            model_path: "examples/one_cpt_infusion.ferx",
+            data_path: "data/one_cpt_infusion.csv",
+            truth: vec![("TVCL", 5.0), ("TVV", 50.0)],
+        },
         // ── ODE models ───────────────────────────────────────────────────────
         Case {
             label: "1-cpt IV bolus (ODE)",

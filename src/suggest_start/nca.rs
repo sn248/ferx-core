@@ -463,7 +463,11 @@ pub fn nca_one_cpt_oral(subject: &Subject) -> SubjectNca {
     }
 }
 
-/// Run per-subject NCA for an IV bolus 1-cpt model.
+/// Run per-subject NCA for an IV bolus or IV infusion 1-cpt model.
+///
+/// For infusion doses (`rate > 0`): terminal-slope regression uses only
+/// post-infusion observations (t > t_end_infusion) to avoid including the
+/// rising absorption phase, and C0 back-extrapolation is skipped.
 pub fn nca_one_cpt_iv(subject: &Subject) -> SubjectNca {
     let dose = first_dose_amt(subject);
     if dose <= 0.0 {
@@ -478,6 +482,15 @@ pub fn nca_one_cpt_iv(subject: &Subject) -> SubjectNca {
     let concs_norm: Vec<f64> = concs.iter().map(|&c| c / dose).collect();
     let (cmax, tmax) = cmax_tmax(&times, &concs_norm);
 
+    // Infusion end time: for rate > 0, terminal phase starts after the infusion ends.
+    let t_infusion_end = subject
+        .doses
+        .first()
+        .filter(|d| d.rate > 0.0)
+        .map(|d| d.time + d.duration)
+        .unwrap_or(0.0);
+    let is_infusion = t_infusion_end > 0.0;
+
     let Some((auc_obs, c_last, t_last)) = auc_trapezoid(&times, &concs_norm) else {
         return SubjectNca {
             cmax,
@@ -486,7 +499,24 @@ pub fn nca_one_cpt_iv(subject: &Subject) -> SubjectNca {
         };
     };
 
-    let lz = terminal_slope(&times, &concs_norm, cmax, 3, 0.8);
+    // Terminal slope: use only post-infusion points for infusion to avoid
+    // mixing the rising phase with the declining phase.
+    let lz = if is_infusion {
+        let (t_post, c_post): (Vec<f64>, Vec<f64>) = times
+            .iter()
+            .zip(concs_norm.iter())
+            .filter(|(&t, _)| t > t_infusion_end)
+            .map(|(&t, &c)| (t, c))
+            .unzip();
+        if t_post.len() >= 3 {
+            terminal_slope(&t_post, &c_post, cmax, 3, 0.8)
+        } else {
+            None
+        }
+    } else {
+        terminal_slope(&times, &concs_norm, cmax, 3, 0.8)
+    };
+
     let auc_inf = lz.map(|(lz, _)| auc_obs + c_last / lz);
     let cl_f = auc_inf.map(|a| if a > 0.0 { 1.0 / a } else { f64::NAN });
     let v_f = lz.and_then(|(lz, _)| cl_f.map(|cl| cl / lz));
@@ -497,7 +527,12 @@ pub fn nca_one_cpt_iv(subject: &Subject) -> SubjectNca {
     let mrt =
         aumc_inf.and_then(|aumc| auc_inf.map(|auc| if auc > 0.0 { aumc / auc } else { f64::NAN }));
     let vss = mrt.and_then(|m| cl_f.map(|cl| cl * m));
-    let c0 = backextrapolate_c0(&times, &concs_norm);
+    // C0 back-extrapolation is only meaningful for bolus dosing.
+    let c0 = if is_infusion {
+        None
+    } else {
+        backextrapolate_c0(&times, &concs_norm)
+    };
 
     SubjectNca {
         cl_f,

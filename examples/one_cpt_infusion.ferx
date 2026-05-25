@@ -1,0 +1,27 @@
+# One-compartment IV infusion PK model (analytical).
+#
+# Drug is administered as a constant-rate infusion (RATE column in data).
+# CL/F → CL for IV; F is fixed at 1.
+
+[parameters]
+  theta TVCL(5.0,  0.1, 100.0)
+  theta TVV(50.0,  1.0, 500.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  one_cpt_infusion
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 300

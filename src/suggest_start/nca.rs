@@ -565,6 +565,7 @@ mod tests {
             obs_covariates: vec![],
             pk_only_times: vec![],
             pk_only_covariates: vec![],
+            reset_times: vec![],
         };
 
         let (t, c) = first_dose_obs(&subject);

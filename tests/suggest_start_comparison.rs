@@ -124,6 +124,20 @@ fn suggest_start_comparison_all_models() {
             ],
         },
         Case {
+            label: "1-cpt oral with bioavailability F (warfarin_logit_f)",
+            model_path: "examples/warfarin_logit_f.ferx",
+            data_path: "data/warfarin_logit_f.csv",
+            // THETA_F default 0.80; NCA CL/V are apparent (CL/F, V/F) and are
+            // corrected by F_default so TVCL/TVV start in the true-parameter space.
+            // F itself stays at default for Option A; Option B sweeps it.
+            truth: vec![
+                ("TVCL", 0.134),
+                ("TVV", 8.1),
+                ("TVKA", 1.0),
+                ("THETA_F", 0.80),
+            ],
+        },
+        Case {
             label: "1-cpt IV infusion (analytical)",
             model_path: "examples/one_cpt_infusion.ferx",
             data_path: "data/one_cpt_infusion.csv",

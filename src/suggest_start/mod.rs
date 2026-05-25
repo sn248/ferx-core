@@ -14,8 +14,8 @@ mod sweep;
 use rayon::prelude::*;
 
 use crate::types::{
-    CompiledModel, ModelParameters, OmegaMatrix, PkModel, Population, PK_IDX_CL, PK_IDX_KA,
-    PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
+    CompiledModel, ModelParameters, OmegaMatrix, PkModel, Population, PK_IDX_CL, PK_IDX_F,
+    PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
 };
 use nca::{
     biexponential_peel, first_dose_amt, first_dose_obs, nca_one_cpt_iv, nca_one_cpt_oral,
@@ -303,6 +303,8 @@ pub fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usiz
         "V3"
     } else if pk_slot == PK_IDX_LAGTIME {
         "LAGTIME"
+    } else if pk_slot == PK_IDX_F {
+        "F"
     } else {
         return None;
     };
@@ -373,7 +375,30 @@ fn build_params(
     let q_idx = find_theta_for_slot(model, PK_IDX_Q);
     let v2_idx = find_theta_for_slot(model, PK_IDX_V2);
     let lagtime_idx = find_theta_for_slot(model, PK_IDX_LAGTIME);
+    let f_idx = find_theta_for_slot(model, PK_IDX_F);
     let cl_eta_omega_idx = find_omega_idx_for_slot(model, PK_IDX_CL);
+
+    // Bioavailability correction: NCA estimates are apparent (CL/F, V/F). When the
+    // model carries an explicit free F theta, multiply back by F_default so that the
+    // written TVCL/TVV are in the model's true-CL/true-V space.  F itself cannot be
+    // estimated from oral-only NCA, so it stays at its model default; Option B sweeps
+    // it via 1D rRMSE search.
+    let f_scale = match f_idx {
+        Some(fi) if !params.theta_fixed[fi] => {
+            let fval = params.theta[fi]; // model default F
+            if fval > 0.0 && fval < 1.0 {
+                warnings.push(format!(
+                    "suggest_start: bioavailability F theta found (default={fval:.3}); \
+                     NCA CL/V scaled by F_default. F cannot be estimated from oral NCA alone \
+                     — Option B will sweep it via rRMSE."
+                ));
+                fval
+            } else {
+                1.0
+            }
+        }
+        _ => 1.0,
+    };
 
     // Helper: write one theta with bounds-clamping.
     let write_theta = |params: &mut ModelParameters,
@@ -416,10 +441,17 @@ fn build_params(
         _ => 1.0,
     };
 
-    // Write CL / CL_F
+    // Write CL / CL_F.  When an explicit F theta is present, NCA gives apparent
+    // CL/F; multiply by f_scale (= F_default) to recover the true CL.
     if let Some(cl) = pop.cl_f {
         if let Some(idx) = cl_idx {
-            write_theta(&mut params, idx, cl / scale_factor, "CL", warnings);
+            write_theta(
+                &mut params,
+                idx,
+                cl * f_scale / scale_factor,
+                "CL",
+                warnings,
+            );
         } else {
             warnings.push("suggest_start: could not map CL to a theta (no mu-referencing for CL eta); using model default".into());
         }
@@ -427,10 +459,16 @@ fn build_params(
         warnings.push("suggest_start: CL not estimable from NCA; using model default".into());
     }
 
-    // Write V / V1 (PK_IDX_V is the same slot for 1-cpt V and 2-cpt V1)
+    // Write V / V1.  Same f_scale correction as CL.
     if let Some(v) = pop.v_f {
         if let Some(idx) = v_idx {
-            write_theta(&mut params, idx, v / scale_factor, "V/V1", warnings);
+            write_theta(
+                &mut params,
+                idx,
+                v * f_scale / scale_factor,
+                "V/V1",
+                warnings,
+            );
         } else {
             warnings
                 .push("suggest_start: could not map V/V1 to a theta; using model default".into());

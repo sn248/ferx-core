@@ -44,7 +44,7 @@ use std::time::Instant;
 /// `theta` and `eta` are required so that `ScalingSpec::ExpressionScale`
 /// can evaluate its `scale_fn(theta, eta, covariates)`. Callers that don't
 /// have a separate eta vector (population predictions) pass an all-zero eta.
-fn model_preds(
+pub(crate) fn model_preds(
     model: &CompiledModel,
     subject: &Subject,
     pk_params: &PkParams,

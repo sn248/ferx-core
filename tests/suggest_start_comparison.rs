@@ -1,12 +1,13 @@
-//! Comparison test: suggest_start (Option A) vs suggest_start_thorough (Option B)
+//! Comparison test: suggest_start (A), suggest_start_thorough (B), suggest_start_ebe (C)
 //! across analytical and ODE model types.
 //!
 //! Run with:
 //!   cargo test --no-default-features --features ci suggest_start_comparison -- --nocapture
 
 use ferx_core::parser::model_parser::parse_model_file;
-use ferx_core::{read_nonmem_csv, suggest_start, suggest_start_thorough};
+use ferx_core::{read_nonmem_csv, suggest_start, suggest_start_ebe, suggest_start_thorough};
 use std::path::Path;
+use std::time::Instant;
 
 struct Case {
     label: &'static str,
@@ -22,17 +23,33 @@ fn run_case(case: &Case) {
     let population = read_nonmem_csv(Path::new(case.data_path), None, None)
         .unwrap_or_else(|e| panic!("data {}: {e}", case.data_path));
 
+    let t0 = Instant::now();
     let a = suggest_start(&model, &population);
+    let t_a = t0.elapsed();
+
+    let t1 = Instant::now();
     let b = suggest_start_thorough(&model, &population);
+    let t_b = t1.elapsed();
+
+    let t2 = Instant::now();
+    let c = suggest_start_ebe(&model, &population);
+    let t_c = t2.elapsed();
 
     println!("\n══ {} ══", case.label);
-    println!("  Theta              Default    OptA       OptB       Truth");
-    println!("  {:-<60}", "");
+    println!(
+        "  Timing: A={:.0}ms  B={:.0}ms  C={:.0}ms",
+        t_a.as_secs_f64() * 1000.0,
+        t_b.as_secs_f64() * 1000.0,
+        t_c.as_secs_f64() * 1000.0,
+    );
+    println!("  Theta              Default    OptA       OptB       OptC       Truth");
+    println!("  {:-<72}", "");
 
     for (i, name) in a.params.theta_names.iter().enumerate() {
         let default = model.default_params.theta[i];
         let opt_a = a.params.theta[i];
         let opt_b = b.params.theta[i];
+        let opt_c = c.params.theta[i];
         let truth_str = case
             .truth
             .iter()
@@ -41,14 +58,16 @@ fn run_case(case: &Case) {
             .unwrap_or_else(|| "          ".to_string());
         let changed_a = (opt_a - default).abs() > 1e-10;
         let changed_b = (opt_b - opt_a).abs() > 1e-10;
+        let changed_c = (opt_c - opt_b).abs() > 1e-10;
         let tag_a = if changed_a { "*" } else { " " };
         let tag_b = if changed_b { "†" } else { " " };
+        let tag_c = if changed_c { "‡" } else { " " };
         println!(
-            "  {name:<18} {default:>10.3} {opt_a:>10.3}{tag_a} {opt_b:>10.3}{tag_b}{truth_str}"
+            "  {name:<18} {default:>10.3} {opt_a:>10.3}{tag_a} {opt_b:>10.3}{tag_b} {opt_c:>10.3}{tag_c}{truth_str}"
         );
     }
 
-    println!("  (* = Option A changed from default; † = Option B changed from Option A)");
+    println!("  (* = A changed default; † = B changed A; ‡ = C changed B)");
 
     if !a.warnings.is_empty() {
         println!("  Option A warnings:");
@@ -56,17 +75,26 @@ fn run_case(case: &Case) {
             println!("    [A] {w}");
         }
     }
-    if !b.warnings.is_empty() {
-        let b_only: Vec<_> = b
-            .warnings
-            .iter()
-            .filter(|w| !a.warnings.contains(w))
-            .collect();
-        if !b_only.is_empty() {
-            println!("  Option B additional warnings:");
-            for w in b_only {
-                println!("    [B] {w}");
-            }
+    let b_only: Vec<_> = b
+        .warnings
+        .iter()
+        .filter(|w| !a.warnings.contains(w))
+        .collect();
+    if !b_only.is_empty() {
+        println!("  Option B additional warnings:");
+        for w in b_only {
+            println!("    [B] {w}");
+        }
+    }
+    let c_only: Vec<_> = c
+        .warnings
+        .iter()
+        .filter(|w| !a.warnings.contains(w) && !b.warnings.contains(w))
+        .collect();
+    if !c_only.is_empty() {
+        println!("  Option C additional warnings:");
+        for w in c_only {
+            println!("    [C] {w}");
         }
     }
 }
@@ -198,5 +226,5 @@ fn suggest_start_comparison_all_models() {
         run_case(case);
     }
 
-    println!("\nLegend: * = Option A wrote value; † = Option B refined over Option A");
+    println!("\nLegend: * = A wrote value; † = B refined over A; ‡ = C (EBE) refined over B");
 }

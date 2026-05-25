@@ -33,5 +33,5 @@ pub use estimation::run_sir::run_sir;
 pub use estimation::uncertainty_samples::UncertaintyMethod;
 pub use io::datareader::read_nonmem_csv;
 pub use parser::model_parser::{parse_full_model_file, parse_model_file, parse_model_string};
-pub use suggest_start::{suggest_start, suggest_start_thorough, SuggestedStart};
+pub use suggest_start::{suggest_start, suggest_start_ebe, suggest_start_thorough, SuggestedStart};
 pub use types::*;

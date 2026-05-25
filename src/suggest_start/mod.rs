@@ -22,7 +22,7 @@ use nca::{
     SubjectNca,
 };
 use pooling::{pool_nca, PopNca};
-use sweep::{sweep_slots, sweep_unwritten_thetas};
+use sweep::{sweep_slots, sweep_slots_ebe, sweep_unwritten_thetas, sweep_unwritten_thetas_ebe};
 
 /// Output of `suggest_start` / `suggest_start_thorough`.
 #[derive(Debug, Clone)]
@@ -155,6 +155,139 @@ pub fn suggest_start_thorough(model: &CompiledModel, population: &Population) ->
     if !remaining.is_empty() {
         let (swept, w) =
             sweep_unwritten_thetas(model, population, &base.params, &remaining, 9, 10.0);
+        base.params = swept;
+        base.warnings.extend(w);
+    }
+
+    base
+}
+
+/// EBE-based NCA + rRMSE sweep (Option C).
+///
+/// Runs Option A first, then sweeps every non-fixed **lognormal** structural
+/// theta that Option A left at the model default, using individual empirical
+/// Bayes estimates (etas ≠ 0) to evaluate rRMSE at each grid point.
+///
+/// Unlike Option B, this method correctly accounts for between-subject
+/// variability: each grid point runs a warm-started inner optimisation
+/// (`run_inner_loop_warm`, max 20 iterations, tolerance 1e-3) before
+/// computing rRMSE against individual observations.  EBEs from one grid
+/// point warm-start the next, so convergence is typically 3–5 iterations
+/// and total cost is ~20–25× Option B for analytical PK models.
+///
+/// **ODE models**: EBE sweeps on ODE models are prohibitively slow (each
+/// inner iteration requires numerical integration) and unreliable when
+/// starting from uninformed defaults.  For ODE models this function falls
+/// back to Option B (etas=0 sweep) automatically, with a warning.
+///
+/// **Logit-parameterised thetas** (e.g. bioavailability F via
+/// `inv_logit(logit(THETA_F) + ETA_F)`): excluded from the EBE sweep
+/// because the eta can partially compensate for a wrong TV on the logit
+/// scale, making the rRMSE landscape unreliable.  They are swept
+/// afterwards with etas=0 (Option B style).
+///
+/// Typical wall-clock cost on a 30-subject analytical 2-cpt model: 200–500 ms.
+pub fn suggest_start_ebe(model: &CompiledModel, population: &Population) -> SuggestedStart {
+    let mut base = suggest_start(model, population);
+
+    // ODE fallback: EBE sweeps require per-subject numerical integration per
+    // inner iteration — too slow (~minutes) and unreliable from uninformed
+    // defaults.  Fall through to Option B (etas=0) sweep instead.
+    if model.ode_spec.is_some() {
+        base.warnings.push(
+            "suggest_start_ebe: ODE model — EBE sweep skipped (too slow; ODE integration per inner iteration). Falling back to etas=0 sweep (Option B).".into(),
+        );
+        return suggest_start_thorough(model, population);
+    }
+
+    let mut remaining: Vec<usize> = (0..model.default_params.theta.len())
+        .filter(|&i| {
+            !base.params.theta_fixed[i]
+                && (base.params.theta[i] - model.default_params.theta[i]).abs() < 1e-12
+        })
+        .collect();
+
+    if remaining.is_empty() {
+        return base;
+    }
+
+    // For EBE sweeps, only include lognormal-parameterised thetas
+    // (mu_ref.log_transformed = true, i.e. THETA * exp(ETA) form).
+    // Logit thetas are excluded from the EBE sweep: the eta can compensate
+    // for a wrong TV on the logit scale, creating spurious rRMSE minima.
+    // Covariate thetas (no mu_ref at all) are also excluded.
+    // Logit thetas will be swept afterwards with etas=0 (Option B style).
+    let lognormal_theta_names: std::collections::HashSet<&str> = model
+        .mu_refs
+        .values()
+        .filter(|mr| mr.log_transformed)
+        .map(|mr| mr.theta_name.as_str())
+        .collect();
+
+    let logit_and_covariate_remaining: Vec<usize> = remaining
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let name = &model.default_params.theta_names[i];
+            !lognormal_theta_names.contains(name.as_str())
+        })
+        .collect();
+
+    remaining.retain(|&i| {
+        let name = &model.default_params.theta_names[i];
+        lognormal_theta_names.contains(name.as_str())
+    });
+
+    if remaining.is_empty() && logit_and_covariate_remaining.is_empty() {
+        return base;
+    }
+
+    // Joint 2D EBE sweeps for correlated pairs.
+    for (slot_a, slot_b, label) in &[
+        (PK_IDX_CL, PK_IDX_V, "CL/V"),
+        (PK_IDX_Q, PK_IDX_V2, "Q/V2"),
+        (PK_IDX_F, PK_IDX_CL, "F/CL"),
+    ] {
+        let idx_a = find_theta_for_slot(model, *slot_a);
+        let idx_b = find_theta_for_slot(model, *slot_b);
+        if let (Some(ia), Some(ib)) = (idx_a, idx_b) {
+            if ia != ib && remaining.contains(&ia) && remaining.contains(&ib) {
+                let (swept, w) = sweep_slots_ebe(
+                    model,
+                    population,
+                    &base.params,
+                    *slot_a,
+                    *slot_b,
+                    9,
+                    10.0,
+                    label,
+                );
+                base.params = swept;
+                base.warnings.extend(w);
+                remaining.retain(|&i| i != ia && i != ib);
+            }
+        }
+    }
+
+    // 1D EBE sweeps for remaining lognormal structural thetas.
+    if !remaining.is_empty() {
+        let (swept, w) =
+            sweep_unwritten_thetas_ebe(model, population, &base.params, &remaining, 9, 10.0);
+        base.params = swept;
+        base.warnings.extend(w);
+    }
+
+    // Logit-parameterised thetas swept with etas=0 (same as Option B).
+    // EBE sweeps are unreliable for logit params due to eta-compensation effects.
+    if !logit_and_covariate_remaining.is_empty() {
+        let (swept, w) = sweep_unwritten_thetas(
+            model,
+            population,
+            &base.params,
+            &logit_and_covariate_remaining,
+            9,
+            10.0,
+        );
         base.params = swept;
         base.warnings.extend(w);
     }

@@ -1,12 +1,13 @@
-/// Option B: rRMSE grid sweep for distribution parameters.
+/// Option B: rRMSE grid sweep using population predictions (etas=0).
+/// Option C: rRMSE grid sweep using individual EBEs (etas≠0, warm-started).
 ///
-/// Uses `predict()` with etas=0 (population prediction) to evaluate each
-/// candidate parameter combination. The grid is parallelised with rayon.
 /// Theta indices are resolved via [`crate::suggest_start::find_theta_for_slot`]
 /// so user-chosen parameter names and ODE models are handled uniformly.
+use nalgebra::DVector;
 use rayon::prelude::*;
 
-use crate::api::predict;
+use crate::api::{model_preds, predict};
+use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::suggest_start::find_theta_for_slot;
 use crate::types::{CompiledModel, ModelParameters, Population};
 
@@ -55,7 +56,6 @@ fn log_grid(centre: f64, factor: f64, n_pts: usize) -> Vec<f64> {
         .collect()
 }
 
-#[allow(dead_code)]
 /// Sweep a pair of theta indices jointly over an `n_pts × n_pts` log-space grid.
 ///
 /// For each (a, b) grid point, evaluates rRMSE via `predict()` (etas=0) and
@@ -166,6 +166,163 @@ pub fn sweep_unwritten_thetas(
             .unwrap_or(0);
 
         current.theta[idx] = grid[best].clamp(current.theta_lower[idx], current.theta_upper[idx]);
+    }
+
+    (current, warnings)
+}
+
+// ---------------------------------------------------------------------------
+// Option C: EBE-based rRMSE (warm-started inner loop)
+// ---------------------------------------------------------------------------
+
+/// Compute rRMSE using per-subject empirical Bayes estimates.
+///
+/// `prev_etas` are warm-start EBEs from the previous grid point in eta_true
+/// space (same ordering as `population.subjects`).  Returns (rRMSE, new_etas)
+/// so the caller can thread warm-starts through sequential grid traversal.
+fn rrmse_ebe<'a>(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    prev_etas: Option<&'a [DVector<f64>]>,
+) -> (f64, Vec<DVector<f64>>) {
+    // Run inner loop with warm-start. 20 iterations and 1e-3 tolerance are
+    // enough for a grid sweep — full inner-loop precision is not needed here,
+    // and warm-starting means convergence is typically 3–5 iterations.
+    let (eta_hats, _h, _stats, _kappas) =
+        run_inner_loop_warm(model, population, params, 20, 1e-3, prev_etas, None, 0);
+
+    // Compute predictions using the per-subject EBEs.
+    let mut sum_sq = 0.0_f64;
+    let mut n = 0usize;
+
+    for (subj, eta) in population.subjects.iter().zip(eta_hats.iter()) {
+        let eta_slice = eta.as_slice();
+        let pk_params = (model.pk_param_fn)(&params.theta, eta_slice, &subj.covariates);
+        let preds = model_preds(model, subj, &pk_params, &params.theta, eta_slice);
+
+        for (j, (&obs, &cens)) in subj.observations.iter().zip(subj.cens.iter()).enumerate() {
+            if cens == 0 && obs > 0.0 && obs.is_finite() {
+                let pred_val = preds.get(j).copied().unwrap_or(f64::NAN);
+                if pred_val.is_finite() {
+                    let rel_err = (pred_val - obs) / obs;
+                    sum_sq += rel_err * rel_err;
+                    n += 1;
+                }
+            }
+        }
+    }
+
+    let rrmse_val = if n == 0 {
+        f64::INFINITY
+    } else {
+        (sum_sq / n as f64).sqrt()
+    };
+
+    (rrmse_val, eta_hats)
+}
+
+/// EBE-based joint 2D sweep over two theta slots.
+///
+/// Grid traversal is sequential (row-major) so EBEs from each point warm-start
+/// the next; the rayon parallelism is inside `run_inner_loop_warm` (subjects).
+pub fn sweep_slots_ebe(
+    model: &CompiledModel,
+    population: &Population,
+    base: &ModelParameters,
+    slot_a: usize,
+    slot_b: usize,
+    n_pts: usize,
+    factor: f64,
+    label: &str,
+) -> (ModelParameters, Vec<String>) {
+    let mut warnings = Vec::new();
+
+    let idx_a = find_theta_for_slot(model, slot_a);
+    let idx_b = find_theta_for_slot(model, slot_b);
+
+    let (Some(ia), Some(ib)) = (idx_a, idx_b) else {
+        warnings.push(format!(
+            "suggest_start_ebe: could not locate theta indices for {label} sweep; keeping current estimates"
+        ));
+        return (base.clone(), warnings);
+    };
+
+    let grid_a = log_grid(base.theta[ia], factor, n_pts);
+    let grid_b = log_grid(base.theta[ib], factor, n_pts);
+
+    let mut best_rrmse = f64::INFINITY;
+    let mut best_a = base.theta[ia];
+    let mut best_b = base.theta[ib];
+    let mut prev_etas: Option<Vec<DVector<f64>>> = None;
+
+    for &a in &grid_a {
+        for &b in &grid_b {
+            let mut trial = base.clone();
+            trial.theta[ia] = a.clamp(base.theta_lower[ia], base.theta_upper[ia]);
+            trial.theta[ib] = b.clamp(base.theta_lower[ib], base.theta_upper[ib]);
+            let (r, new_etas) = rrmse_ebe(model, population, &trial, prev_etas.as_deref());
+            if r < best_rrmse {
+                best_rrmse = r;
+                best_a = a;
+                best_b = b;
+            }
+            prev_etas = Some(new_etas);
+        }
+    }
+
+    let mut result = base.clone();
+    result.theta[ia] = best_a.clamp(base.theta_lower[ia], base.theta_upper[ia]);
+    result.theta[ib] = best_b.clamp(base.theta_lower[ib], base.theta_upper[ib]);
+    (result, warnings)
+}
+
+/// EBE-based sequential 1D sweeps for each theta in `targets`.
+///
+/// Warm-starts EBEs from the final grid point of each sweep as the initial
+/// estimate for the next sweep.
+pub fn sweep_unwritten_thetas_ebe(
+    model: &CompiledModel,
+    population: &Population,
+    base: &ModelParameters,
+    targets: &[usize],
+    n_pts: usize,
+    factor: f64,
+) -> (ModelParameters, Vec<String>) {
+    if targets.is_empty() {
+        return (base.clone(), Vec::new());
+    }
+
+    let mut current = base.clone();
+    let mut warnings = Vec::new();
+    let mut prev_etas: Option<Vec<DVector<f64>>> = None;
+
+    for &idx in targets {
+        let centre = current.theta[idx];
+        if centre <= 0.0 {
+            warnings.push(format!(
+                "suggest_start_ebe: theta[{idx}] ({name}) has non-positive value {centre}; skipping",
+                name = current.theta_names[idx]
+            ));
+            continue;
+        }
+
+        let grid = log_grid(centre, factor, n_pts);
+        let mut best_rrmse = f64::INFINITY;
+        let mut best_val = centre;
+
+        for &val in &grid {
+            let mut trial = current.clone();
+            trial.theta[idx] = val.clamp(current.theta_lower[idx], current.theta_upper[idx]);
+            let (r, new_etas) = rrmse_ebe(model, population, &trial, prev_etas.as_deref());
+            if r < best_rrmse {
+                best_rrmse = r;
+                best_val = val;
+            }
+            prev_etas = Some(new_etas);
+        }
+
+        current.theta[idx] = best_val.clamp(current.theta_lower[idx], current.theta_upper[idx]);
     }
 
     (current, warnings)

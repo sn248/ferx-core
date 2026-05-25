@@ -91,6 +91,14 @@ expression to initialized compartments (returning them to baseline) and zeros
 all other compartments — so a reset behaves like the start of a fresh episode.
 See [Data Format](../data-format.md) for reset rows.
 
+Note one deliberate asymmetry with the start-of-record seeding described above:
+the re-applied baseline at a reset is evaluated with the covariate values in
+effect **at the reset time**, not the first record's. With time-varying
+covariates this means the post-reset baseline reflects the most recent
+covariate values — appropriate for a "fresh episode" that starts under current
+conditions — whereas the very first baseline uses the first record's
+covariates. For time-constant covariates the two are identical.
+
 ## Example: Michaelis-Menten Elimination
 
 A one-compartment oral model with saturable (Michaelis-Menten) elimination:

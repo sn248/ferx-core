@@ -505,13 +505,31 @@ pub fn ode_predictions_event_driven(
 
     // Seed compartments from `init(state) = expr` (zeros when none declared).
     // The init expression folds covariates/eta in via the individual-parameter
-    // layer, so evaluate it with a representative per-event parameter set — the
-    // first event's. For the common no-TV case every event shares one set.
-    let init_pk = pk_at_dose
-        .first()
-        .or_else(|| pk_at_obs.first())
-        .or_else(|| pk_at_pk_only.first());
-    let mut u = match init_pk {
+    // layer, so evaluate it with the snapshot from the subject's *first record*
+    // — the smallest record time across dose / obs / pk-only. Selecting by
+    // event kind would wrongly prefer a later dose over an earlier observation
+    // when covariates are time-varying (e.g. a pre-dose baseline obs at t=0).
+    // Raw record times are used (not lagtime-shifted) since `$PK` order follows
+    // the record, not the absorption delay.
+    let init_pk: Option<PkParams> = {
+        let mut best: Option<(f64, PkParams)> = None;
+        let mut consider = |t: f64, p: &PkParams| {
+            if best.map_or(true, |(bt, _)| t < bt) {
+                best = Some((t, *p));
+            }
+        };
+        for (k, d) in subject.doses.iter().enumerate() {
+            consider(d.time, &pk_at_dose[k]);
+        }
+        for (j, &t) in subject.obs_times.iter().enumerate() {
+            consider(t, &pk_at_obs[j]);
+        }
+        for (m, &t) in subject.pk_only_times.iter().enumerate() {
+            consider(t, &pk_at_pk_only[m]);
+        }
+        best.map(|(_, p)| p)
+    };
+    let mut u = match &init_pk {
         Some(p) => ode.initial_state(&p.values),
         None => vec![0.0_f64; n],
     };
@@ -582,7 +600,11 @@ pub fn ode_predictions_event_driven(
     let mut cur_t = timeline[0].0;
     // Most-recent NONMEM record's PK params, used to integrate segments
     // ending at an infusion-end (which is not a record and carries no PK).
-    let mut last_pk: PkParams = PkParams::default();
+    // Seed last_pk with the first record's snapshot (not zeroed defaults) so a
+    // reset that is itself the first event — e.g. an EVID=4 reset+dose at t=0 —
+    // re-applies init from real parameters rather than zeros. Updated as
+    // dose/obs/pk-only records are processed.
+    let mut last_pk: PkParams = init_pk.unwrap_or_default();
     // Most-recent system-reset time (EVID=3/4); `NEG_INFINITY` until the
     // first reset. Infusions started before it are no longer active.
     let mut reset_floor = f64::NEG_INFINITY;
@@ -913,6 +935,46 @@ mod tests {
         assert_relative_eq!(preds[0], 25.0, epsilon = 1e-6);
         // t=5: reset re-applies init → 5 (a zeroing reset would give 0).
         assert_relative_eq!(preds[1], 5.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn ode_init_uses_chronologically_first_record_not_first_dose() {
+        // Regression (Copilot review #1): with time-varying covariates the init
+        // snapshot must come from the earliest record by TIME, not the first
+        // dose. Here a pre-dose observation at t=0 carries KIN=10 (baseline 5)
+        // while a later dose at t=5 carries KIN=100 (baseline 50). Seeding must
+        // use the t=0 obs → prediction at t=0 is 5, not 50.
+        let ode = turnover_ode_spec_with_init();
+        let doses = vec![DoseEvent::new(5.0, 0.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![0.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let pk_dose = vec![pk_kin_kout(100.0, 2.0)]; // baseline 50 (must NOT be used)
+        let pk_obs = vec![pk_kin_kout(10.0, 2.0)]; // baseline 5 (first record)
+
+        let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+        assert_relative_eq!(preds[0], 5.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn ode_init_reapplied_when_reset_is_first_event() {
+        // Regression (Copilot review #2): an EVID=4 reset+dose at t=0 re-applies
+        // init *before* the same-time dose. last_pk must be seeded from the
+        // first record's params (not zeroed defaults), or the re-applied
+        // baseline would evaluate KIN/KOUT with zero params and collapse to 0.
+        // Expected: init(5) re-applied at reset, then bolus 20 → 25.
+        let ode = turnover_ode_spec_with_init();
+        let doses = vec![DoseEvent::new(0.0, 20.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![0.0];
+        let mut subj = make_subject(doses, obs_times.clone());
+        subj.reset_times = vec![0.0];
+        let pk = pk_kin_kout(10.0, 2.0); // baseline 5
+        let pk_dose = vec![pk];
+        let pk_obs = vec![pk];
+
+        let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+        // Re-applied baseline (5) + bolus (20) = 25. A zero-param re-seed would
+        // give 0 + 20 = 20.
+        assert_relative_eq!(preds[0], 25.0, epsilon = 1e-6);
     }
 
     #[test]

@@ -329,6 +329,68 @@ fn equilibrate_ss_state_event_driven(
     state
 }
 
+/// Event-driven steady-state state at `phase` ∈ [0, II) within the dosing
+/// cycle, forward from the pulse at phase 0. [`equilibrate_ss_state_event_driven`]
+/// returns the pre-pulse trough (phase 0⁻ ≡ II); this advances from that
+/// trough through the dose pulse and `phase` units of the cycle.
+///
+/// Used to recover the *previous interval's* steady-state tail for an SS
+/// dose with a lagtime: observations between the dose record time and the
+/// lagged arrival sit at phase `II − lagtime` … `II` (issue #15). For SS
+/// infusions this assumes `phase ≥ dose.duration` (`lagtime ≤ II − T_inf`),
+/// the realistic regime; overlapping infusions are rejected upstream.
+fn ss_state_at_phase_event_driven(
+    pk_model: PkModel,
+    pk: &PkParams,
+    dose: &DoseEvent,
+    phase: f64,
+) -> Vec<f64> {
+    let mut state = equilibrate_ss_state_event_driven(pk_model, pk, dose);
+    if phase <= 0.0 {
+        return state;
+    }
+    let (n_states, _) = state_layout(pk_model);
+    let cmt_idx = dose.cmt.saturating_sub(1);
+    if cmt_idx >= n_states {
+        return state;
+    }
+
+    let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
+    if is_inf {
+        let t_inf = dose.duration;
+        let synthetic_dose = vec![DoseEvent::new(
+            0.0, dose.amt, dose.cmt, dose.rate, false, 0.0,
+        )];
+        let synthetic_lagtimes = vec![0.0];
+        let bounds: Vec<f64> = if phase > t_inf {
+            vec![0.0, t_inf, phase]
+        } else {
+            vec![0.0, phase]
+        };
+        propagate_with_bounds(
+            &mut state,
+            &bounds,
+            pk,
+            pk_model,
+            &synthetic_dose,
+            &synthetic_lagtimes,
+            f64::NEG_INFINITY,
+        );
+    } else {
+        state[cmt_idx] += pk.f_bio() * dose.amt;
+        propagate_with_bounds(
+            &mut state,
+            &[0.0, phase],
+            pk,
+            pk_model,
+            &[],
+            &[],
+            f64::NEG_INFINITY,
+        );
+    }
+    state
+}
+
 // `is_oral` was a helper for the previous infusion dispatcher; the
 // per-model `match (pk_model, d.cmt)` now subsumes it.
 
@@ -491,6 +553,35 @@ pub fn event_driven_predictions_with_schedule(
                 // pk_now is consumed by the next interval's propagation.
             }
             EventKind::Reset => unreachable!("Reset handled before pk_for above"),
+        }
+    }
+
+    // SS + lagtime: previous-interval steady-state tail (issue #15). The
+    // walk above seeds the SS state only at the lagged dose event, so
+    // observations between the dose record time and the lagged arrival are
+    // left at the empty initial state (≈0). At steady state they carry the
+    // tail of the prior pulse; recompute them from the SS phase. Matches the
+    // analytical (`predict_concentration`) and ODE (`ss_state_at_phase`)
+    // paths, verified against NONMEM ALAG1 + SS=1.
+    for (k, d) in subject.doses.iter().enumerate() {
+        let lag = schedule.dose_lagtimes.get(k).copied().unwrap_or(0.0);
+        if !(d.ss && d.ii > 0.0 && lag > 0.0) {
+            continue;
+        }
+        let t_eff = d.time + lag;
+        let pk_dose = pk_at_dose[k];
+        for (j, &t_obs) in subject.obs_times.iter().enumerate() {
+            if t_obs >= d.time - 1e-12 && t_obs < t_eff - 1e-12 {
+                // Phase of the previous pulse (at t_eff − II) at t_obs.
+                let phase = t_obs - t_eff + d.ii;
+                let st = ss_state_at_phase_event_driven(pk_model, &pk_dose, d, phase);
+                let v = pk_at_obs[j].v();
+                preds[j] = if v > 0.0 {
+                    (st[central_slot] / v).max(0.0)
+                } else {
+                    0.0
+                };
+            }
         }
     }
 
@@ -1990,6 +2081,46 @@ mod tests {
         for (j, &t) in obs_times.iter().enumerate() {
             let expected = one_cpt_oral_ss(&dose, t, cl, v, ka);
             assert_relative_eq!(preds[j], expected, epsilon = 1e-9, max_relative = 1e-7);
+        }
+    }
+
+    #[test]
+    fn event_driven_ss_iv_bolus_with_lagtime_matches_nonmem() {
+        // Event-driven-path coverage of SS + ALAG1 (issue #15). Same NONMEM
+        // 7.5.1 reference as the ODE test (ADVAN1 TRANS2, MAXEVAL=0): CL=5,
+        // V=80, ALAG1=2.0, single SS=1 II=12 AMT=1000 IV bolus. Control file
+        // + dataset in tests/ss_lagtime_nonmem.rs.
+        //
+        // t=0.5,1.0,1.5 (< ALAG1=2.0) exercise the previous-interval tail
+        // recomputed by `ss_state_at_phase_event_driven`; the plain walk
+        // leaves them at ≈0.
+        let cl = 5.0;
+        let v = 80.0;
+        let amt = 1000.0;
+        let ii = 12.0;
+        let lagtime = 2.0;
+        let nonmem: &[(f64, f64)] = &[
+            (0.5, 12.291),
+            (1.0, 11.912),
+            (1.5, 11.546),
+            (2.0, 23.691),
+            (3.0, 22.255),
+            (6.0, 18.450),
+            (11.0, 13.499),
+            (13.0, 11.912),
+            (18.0, 8.7153),
+        ];
+        let obs_times: Vec<f64> = nonmem.iter().map(|&(t, _)| t).collect();
+        let dose = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
+        let subj = make_subject(vec![dose], obs_times.clone());
+        let mut pk = pk_one(cl, v);
+        pk.values[crate::types::PK_IDX_LAGTIME] = lagtime;
+        let pk_dose = vec![pk; 1];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        for (j, &(_t, pred)) in nonmem.iter().enumerate() {
+            assert_relative_eq!(preds[j], pred, max_relative = 1e-4);
         }
     }
 }

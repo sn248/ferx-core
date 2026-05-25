@@ -175,16 +175,28 @@ A runnable example pair ships in the repository at
 
 ## Combining with `LAGTIME`
 
-`LAGTIME` shifts each pulse in the SS train, including the SS pulse
-itself. Under linear superposition this satisfies the identity
+`LAGTIME` (NONMEM `ALAG1`) shifts every pulse in the SS train, including
+the SS pulse itself. Writing `τ = t − dose.time` for the time since the
+dose *record* and `L` for the lagtime, the steady-state concentration is
 
 ```
-C_ss(τ, L) = C_ss(τ - L, 0)   for τ > L
+C_ss(τ, L) = C_ss(τ − L,      0)    for τ ≥ L          (current interval)
+C_ss(τ, L) = C_ss(τ − L + II, 0)    for 0 ≤ τ < L      (previous interval)
 ```
 
-i.e. the lagged SS curve is just the un-lagged SS curve shifted in time.
-ferx-core enforces this exactly — declaring `LAGTIME` on a steady-state
-model is fully supported across all paths.
+The second line matters: a sample taken **earlier than the lagtime**
+(between the dose record time and the lagged arrival) is still at steady
+state, so it shows the decaying tail of the *previous* dosing interval —
+not zero. ferx-core implements both branches on all three prediction
+paths (analytical superposition, the event-driven analytical walker, and
+the ODE solver), and the result is validated against NONMEM `ALAG1` +
+`SS=1` to 5 significant figures (see *Validation* below). Declaring
+`LAGTIME` on a steady-state model is fully supported.
+
+> Edge case for SS **infusions**: the previous-interval tail assumes the
+> prior infusion has finished by the record time, i.e. `L ≤ II − T_inf`.
+> This holds for any realistic lagtime; overlapping infusions
+> (`T_inf > II`) are rejected as described under *Limitations*.
 
 ## Limitations
 
@@ -235,3 +247,11 @@ numerical pulse sums at 1e-9 relative tolerance (see
 3-cpt). The ODE and event-driven paths are cross-checked against the
 analytical closed forms in their own test modules. The end-to-end fit
 path is covered by `tests/ss_fit_smoke.rs`.
+
+SS + `LAGTIME` is additionally cross-checked against **NONMEM 7.5.1**
+(`ADVAN1`/`ADVAN2`, `$ESTIMATION MAXEVAL=0`) to 1e-4 relative — including
+the previous-interval tail for samples earlier than the lagtime. The
+reference values and the NONMEM control files are documented in
+`tests/ss_lagtime_nonmem.rs`, with per-path coverage in
+`src/pk/mod.rs`, `src/pk/event_driven.rs`, and `src/ode/predictions.rs`
+(`*_ss_*_with_lagtime_matches_nonmem`).

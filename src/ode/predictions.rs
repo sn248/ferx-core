@@ -126,6 +126,75 @@ fn equilibrate_ss_state(
     u
 }
 
+/// Steady-state ODE state at `phase` ∈ [0, II) within the dosing cycle,
+/// measured forward from the pulse at phase 0. [`equilibrate_ss_state`]
+/// returns the pre-pulse trough (phase 0⁻ ≡ II); this advances from that
+/// trough through the dose pulse and `phase` units of the cycle.
+///
+/// Used to seed the *previous interval's* steady-state tail when an SS dose
+/// has a lagtime: observations between the dose record time and the lagged
+/// arrival sit at phase `II − lagtime` … `II`, decaying from the prior
+/// pulse. Without this seed those samples would read the (empty) initial
+/// state. See [`ode_predictions`] for placement and issue #15.
+///
+/// For SS infusions this assumes `phase ≥ dose.duration` (the prior
+/// infusion has finished by `phase`), i.e. `lagtime ≤ II − dose.duration`
+/// — the realistic regime; overlapping infusions (`T_inf > II`) are already
+/// rejected upstream.
+fn ss_state_at_phase(
+    ode: &crate::ode::OdeSpec,
+    pk_params_flat: &[f64],
+    dose: &DoseEvent,
+    phase: f64,
+    opts: &OdeSolverOptions,
+) -> Vec<f64> {
+    let mut u = equilibrate_ss_state(ode, pk_params_flat, dose, opts);
+    if phase <= 0.0 {
+        return u;
+    }
+    let cmt_idx = dose.cmt.saturating_sub(1);
+    if cmt_idx >= u.len() {
+        return u;
+    }
+
+    if is_real_infusion(dose) {
+        let rate = dose.rate;
+        let t_inf = dose.duration;
+        let active = phase.min(t_inf);
+        let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+            (ode.rhs)(y, p, t, dy);
+            if cmt_idx < dy.len() {
+                dy[cmt_idx] += rate;
+            }
+        };
+        let sol = solve_ode(
+            &wrapped_rhs,
+            &u,
+            (0.0, active),
+            pk_params_flat,
+            &[active],
+            opts,
+        );
+        if let Some(last) = sol.last() {
+            u.copy_from_slice(&last.u);
+        }
+        if phase > t_inf {
+            let quiet = phase - t_inf;
+            let sol = solve_ode(&ode.rhs, &u, (0.0, quiet), pk_params_flat, &[quiet], opts);
+            if let Some(last) = sol.last() {
+                u.copy_from_slice(&last.u);
+            }
+        }
+    } else {
+        u[cmt_idx] += dose.amt;
+        let sol = solve_ode(&ode.rhs, &u, (0.0, phase), pk_params_flat, &[phase], opts);
+        if let Some(last) = sol.last() {
+            u.copy_from_slice(&last.u);
+        }
+    }
+    u
+}
+
 /// Returns `(cmt_idx_0based, rate)` for every infusion that is active
 /// throughout the closed segment `[t_start, t_end]`. By construction of the
 /// break-time list (every infusion start and end is a break time), each
@@ -337,6 +406,12 @@ pub fn ode_predictions(
         if is_real_infusion(dose) {
             break_times.push(dose.time + lagtime + dose.duration);
         }
+        // SS + lagtime: break at the dose *record* time too, so we can seed
+        // the previous-interval steady-state tail there before the lagged
+        // pulse arrives (issue #15).
+        if lagtime > 0.0 && dose.ss && dose.ii > 0.0 {
+            break_times.push(dose.time);
+        }
     }
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -356,6 +431,18 @@ pub fn ode_predictions(
         // Infusions don't add to state at t_start — they're injected as
         // a derivative term inside the integrator (see `active_infusions`
         // + wrapped RHS below).
+        // SS + lagtime: at the dose record time (strictly before the lagged
+        // arrival) seed the previous interval's steady-state tail so pre-lag
+        // observations don't read the empty initial state. Phase II−lagtime
+        // is where the prior pulse has decayed to by the record time.
+        if lagtime > 0.0 {
+            for dose in &subject.doses {
+                if dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
+                    u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lagtime, &opts);
+                }
+            }
+        }
+
         for dose in &subject.doses {
             if (dose.time + lagtime - t_start).abs() >= 1e-12 {
                 continue;
@@ -1480,6 +1567,46 @@ mod tests {
         for (j, &t) in obs_times.iter().enumerate() {
             let expected = one_cpt_iv_bolus_ss(&doses[1], t - 10.0, cl, v);
             assert_relative_eq!(preds[j] / v, expected, epsilon = 1e-6, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn ode_ss_iv_bolus_with_lagtime_matches_nonmem() {
+        // ODE-path coverage of SS + ALAG1 (issue #15). Reference PRED from
+        // NONMEM 7.5.1 (ADVAN1 TRANS2, MAXEVAL=0): CL=5, V=80, ALAG1=2.0,
+        // single SS=1 II=12 AMT=1000 IV bolus into the central compartment
+        // (S1=V). Control file + dataset in tests/ss_lagtime_nonmem.rs.
+        //
+        // The first three samples (t=0.5,1.0,1.5 < ALAG1=2.0) exercise the
+        // previous-interval steady-state tail seeded by `ss_state_at_phase`;
+        // without the seed the ODE state would still be empty there (≈0).
+        let cl = 5.0;
+        let v = 80.0;
+        let amt = 1000.0;
+        let ii = 12.0;
+        let lagtime = 2.0;
+        let nonmem: &[(f64, f64)] = &[
+            (0.5, 12.291),
+            (1.0, 11.912),
+            (1.5, 11.546),
+            (2.0, 23.691),
+            (3.0, 22.255),
+            (6.0, 18.450),
+            (11.0, 13.499),
+            (13.0, 11.912),
+            (18.0, 8.7153),
+        ];
+        let obs_times: Vec<f64> = nonmem.iter().map(|&(t, _)| t).collect();
+        let dose = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
+        let subj = make_subject(vec![dose], obs_times);
+        let mut pk = pk_one(cl, v);
+        pk.values[crate::types::PK_IDX_LAGTIME] = lagtime;
+        let ode = one_cpt_ode_spec();
+
+        // one_cpt_ode_spec stores amount; divide by V for concentration.
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+        for (j, &(_t, pred)) in nonmem.iter().enumerate() {
+            assert_relative_eq!(preds[j] / v, pred, max_relative = 1e-4);
         }
     }
 

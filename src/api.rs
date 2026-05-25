@@ -318,6 +318,31 @@ pub fn fit(
     // `ScalingSpec::PerCmt` / `OdeReadout::PerCmt` map. The parser can't
     // check this — it doesn't see the data — so fire here at fit time.
     pk::validate_per_cmt_scaling(model, &population.subjects)?;
+    // Same idea for per-CMT (multi-endpoint) error models: every observed CMT
+    // must have a matching `CMT=N:` entry in `[error_model]`.
+    if let crate::types::ErrorSpec::PerCmt(map) = &model.error_spec {
+        use std::collections::BTreeSet;
+        let mut missing = BTreeSet::new();
+        for subj in &population.subjects {
+            for &cmt in &subj.obs_cmts {
+                if !map.contains_key(&cmt) {
+                    missing.insert(cmt);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let list = missing
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "[error_model] has no entry for observed compartment(s) {}; \
+                 add a `CMT=N: DV ~ ...` line for each observed CMT.",
+                list
+            ));
+        }
+    }
     // If any subject has per-event covariate snapshots that don't carry
     // a variation in covariates the model actually references (e.g.
     // DAY / STIME columns in NONMEM-format datasets), clear those
@@ -550,6 +575,12 @@ fn fit_inner(
     // autodiff gradient path. Fail/warn early so users get a clear message
     // rather than a silent wrong result.
     if model.is_sde() {
+        // Note: a per-CMT (multi-endpoint) error model cannot reach the EKF
+        // path. Observing multiple compartments requires a Form C `y[CMT=N]`
+        // readout, which the parser already rejects on SDE models, so an SDE
+        // model is always single-endpoint here. The EKF residual-variance
+        // assumption (`ErrorSpec::Single`) is therefore safe — see the comment
+        // at the EKF call site in stats/likelihood.rs.
         if chain.iter().any(|&m| m == EstimationMethod::Saem) {
             return Err(
                 "method = saem is not compatible with a [diffusion] block. \
@@ -1200,7 +1231,9 @@ fn fit_inner(
         ferx_version: env!("CARGO_PKG_VERSION").to_string(),
         eta_param_info: model.eta_param_info.clone(),
         theta_transform: model.theta_transform.clone(),
-        sigma_types: model.error_model.sigma_types(),
+        sigma_types: model
+            .error_spec
+            .sigma_types(result.params.sigma.values.len()),
         cov_eigenvalues,
         cov_condition_number,
         eta_log_transformed,
@@ -1445,7 +1478,8 @@ fn compute_subject_results(
             let mut iwres = compute_iwres(
                 &subject.observations,
                 &ipred,
-                model.error_model,
+                &subject.obs_cmts,
+                &model.error_spec,
                 &params.sigma.values,
             );
             for (j, c) in subject.cens.iter().enumerate() {
@@ -1462,7 +1496,7 @@ fn compute_subject_results(
                 h,
                 &params.omega,
                 &params.sigma.values,
-                model.error_model,
+                &model.error_spec,
             );
 
             // OFV contribution
@@ -1913,11 +1947,8 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
             // Add residual error
             for (j, &ipred) in ipreds.iter().enumerate() {
-                let var = crate::stats::residual_error::residual_variance(
-                    model.error_model,
-                    ipred,
-                    &params.sigma.values,
-                );
+                let var =
+                    model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
                 let eps: f64 = rng.sample(normal);
                 let dv_sim = ipred + var.sqrt() * eps;
 
@@ -2091,6 +2122,7 @@ mod iov_integration {
             name: "iov_test".into(),
             pk_model: PkModel::OneCptIvBolus,
             error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             // pk_param_fn: eta[0]=BSV for CL, eta[1]=KAPPA_CL (appended by IOV path)
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
@@ -2842,6 +2874,7 @@ mod simulate_with_uncertainty_tests {
             name: "uncertainty_smoke".into(),
             pk_model: PkModel::OneCptIvBolus,
             error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp();

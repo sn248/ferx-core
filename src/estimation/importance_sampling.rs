@@ -26,7 +26,7 @@
 
 use crate::pk::{compute_predictions_with_tv_into, EventPkParams};
 use crate::stats::likelihood::{obs_nll_subject_into, split_obs_by_occasion};
-use crate::stats::residual_error::{compute_r_diag, residual_variance};
+use crate::stats::residual_error::compute_r_diag;
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -615,7 +615,9 @@ fn obs_nll_iov_fixed_kappa(
     let mut nll = 0.0;
     for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
         let f = f.max(1e-12);
-        let v = residual_variance(model.error_model, f, sigma).max(1e-12);
+        let v = model
+            .residual_variance_at(subject.obs_cmts[j], f, sigma)
+            .max(1e-12);
         if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
             let z = (y - f) / v.sqrt();
             nll += -log_normal_cdf(z);
@@ -651,7 +653,7 @@ fn compute_posterior_hessian(
     }
     let ipreds =
         compute_predictions_with_tv_into(model, subject, theta, eta_hat.as_slice(), scratch);
-    let r_diag = compute_r_diag(model.error_model, &ipreds, sigma);
+    let r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
     let mut h_post = omega_inv.clone();
     for j in 0..n_obs {
         let rj = r_diag[j].max(1e-12);

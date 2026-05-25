@@ -46,6 +46,54 @@ Combines proportional and additive components:
 
 Use when both proportional and additive error sources are present. Requires two sigma parameters defined in `[parameters]`.
 
+## Multiple endpoints (per-CMT error models)
+
+For simultaneous PK/PD (and other multi-analyte) models, a single observed
+compartment is not enough: plasma concentrations and a PD effect typically
+need *different* residual error models in the *same* joint likelihood. Prefix
+each error line with `CMT=N:` to assign a distinct error model to each observed
+compartment, dispatched by the dataset's `CMT` column:
+
+```
+[error_model]
+  CMT=2: DV ~ proportional(PROP_ERR_PK)   # plasma concentration (central)
+  CMT=3: DV ~ additive(ADD_ERR_PD)        # PD effect (effect compartment)
+```
+
+Every observation row is matched to the endpoint whose `CMT=N` equals its
+`CMT` value, and its residual variance is computed from that endpoint's error
+model and sigma(s). All endpoints contribute to one FOCEI objective, so PK and
+PD parameters — and their uncertainty — are estimated jointly. This is the
+gold-standard alternative to the sequential workaround (fit PK, freeze IPRED,
+then fit PD), which underestimates uncertainty.
+
+Each endpoint's sigma parameters are declared once in `[parameters]`, as usual:
+
+```
+[parameters]
+  sigma PROP_ERR_PK ~ 0.10 (sd)
+  sigma ADD_ERR_PD  ~ 1.00 (sd)
+```
+
+Rules and restrictions:
+
+- **ODE models only.** Per-CMT dispatch lives in the finite-difference
+  likelihood path used by ODE models. An analytical PK model with `CMT=N:`
+  lines is rejected at parse time.
+- **No mixing styles.** An `[error_model]` block is either a single plain
+  `DV ~ ...` line *or* all `CMT=N:` lines — not both.
+- **Coverage is checked at fit time.** Every observed `CMT` in the dataset must
+  have a matching `CMT=N:` entry, or `fit()` errors and names the missing
+  compartments. Duplicate `CMT=N` entries are rejected at parse time.
+- **Estimation method.** Supported with FOCE/FOCEI, the Gauss-Newton
+  optimizers, and SAEM (optionally followed by `imp`).
+
+A complete worked model lives in [`examples/emax_pkpd.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/emax_pkpd.ferx)
+— an oral 1-compartment PK model with an effect-compartment Emax PD readout,
+proportional error on the plasma endpoint and additive error on the PD
+endpoint. The per-CMT *readout* (which compartment/expression each `CMT` maps
+to) is configured in the [`[scaling]`](scaling.md) block.
+
 ## Sigma scale
 
 **All sigma parameters are estimated and reported on the standard-deviation scale**, not the variance scale. This is true for both proportional and additive components, and for both elements of a combined error model.

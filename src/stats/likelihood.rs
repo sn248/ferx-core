@@ -1,5 +1,5 @@
 use crate::pk;
-use crate::stats::residual_error::{compute_r_diag, residual_variance};
+use crate::stats::residual_error::compute_r_diag;
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -151,7 +151,7 @@ pub fn individual_nll_into_with_schedule(
     };
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-        let v_resid = residual_variance(model.error_model, f_pred, sigma_values);
+        let v_resid = model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values);
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if is_m3_bloq(model, subject, j) {
             // y carries LLOQ on CENS=1 rows.
@@ -186,7 +186,8 @@ pub(crate) fn obs_nll_subject_into(
     let mut nll = 0.0;
     for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let f = f.max(1e-12);
-        let v = crate::stats::residual_error::residual_variance(model.error_model, f, sigma_values)
+        let v = model
+            .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
             .max(1e-12);
         if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
             let z = (y - f) / v.sqrt();
@@ -229,6 +230,15 @@ fn ekf_p_obs(
     }
 
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // EKF process-noise variance uses a single error model. This is sound: a
+    // per-CMT (multi-endpoint) error model needs a Form C `y[CMT=N]` readout to
+    // observe multiple compartments, and the parser rejects Form C on SDE
+    // models — so an SDE model is always `ErrorSpec::Single` and the
+    // representative `model.error_model` is exact here.
+    debug_assert!(
+        matches!(model.error_spec, ErrorSpec::Single(_)),
+        "EKF path reached with a non-Single error spec (per-CMT + SDE should be unreachable)"
+    );
     let error_model = model.error_model;
 
     // Temporarily shadow ode_spec with updated diffusion_var for this call.
@@ -303,7 +313,7 @@ pub fn foce_subject_nll(
             h_matrix,
             omega,
             sigma_values,
-            model.error_model,
+            &model.error_spec,
             model.bloq_method,
             &p_obs,
         )
@@ -315,7 +325,7 @@ pub fn foce_subject_nll(
             h_matrix,
             omega,
             sigma_values,
-            model.error_model,
+            &model.error_spec,
             model.bloq_method,
             &p_obs,
         )
@@ -333,7 +343,7 @@ pub fn foce_subject_nll_standard(
     h_matrix: &DMatrix<f64>,
     omega: &OmegaMatrix,
     sigma_values: &[f64],
-    error_model: ErrorModel,
+    error_spec: &ErrorSpec,
     _bloq_method: BloqMethod,
     p_obs: &[f64],
 ) -> f64 {
@@ -348,7 +358,7 @@ pub fn foce_subject_nll_standard(
         .collect();
 
     // R diagonal at f0; inflate with EKF process-noise variance for SDE models.
-    let mut r_diag = compute_r_diag(error_model, &f0, sigma_values);
+    let mut r_diag = compute_r_diag(error_spec, &f0, &subject.obs_cmts, sigma_values);
     for (j, r) in r_diag.iter_mut().enumerate() {
         *r += p_obs.get(j).copied().unwrap_or(0.0);
     }
@@ -408,7 +418,7 @@ pub fn foce_subject_nll_interaction(
     h_matrix: &DMatrix<f64>,
     omega: &OmegaMatrix,
     sigma_values: &[f64],
-    error_model: ErrorModel,
+    error_spec: &ErrorSpec,
     bloq_method: BloqMethod,
     p_obs: &[f64],
 ) -> f64 {
@@ -433,9 +443,10 @@ pub fn foce_subject_nll_interaction(
     let n_eta = eta_hat.len();
     let h_quant = DMatrix::from_fn(n_quant, n_eta, |r, c| h_matrix[(quant_idx[r], c)]);
     let ipreds_quant: Vec<f64> = quant_idx.iter().map(|&j| ipreds[j]).collect();
+    let obs_cmts_quant: Vec<usize> = quant_idx.iter().map(|&j| subject.obs_cmts[j]).collect();
 
     // R diagonal at η̂/ipred (interaction); inflate with EKF variance for SDE.
-    let mut r_diag_quant = compute_r_diag(error_model, &ipreds_quant, sigma_values);
+    let mut r_diag_quant = compute_r_diag(error_spec, &ipreds_quant, &obs_cmts_quant, sigma_values);
     for (qi, &orig_j) in quant_idx.iter().enumerate() {
         r_diag_quant[qi] += p_obs.get(orig_j).copied().unwrap_or(0.0);
     }
@@ -465,7 +476,7 @@ pub fn foce_subject_nll_interaction(
     for &j in &bloq_idx {
         let lloq = subject.observations[j];
         let f = ipreds[j];
-        let v = residual_variance(error_model, f, sigma_values);
+        let v = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
         let z = (lloq - f) / v.sqrt();
         bloq_term += -2.0 * log_normal_cdf(z);
     }
@@ -568,7 +579,7 @@ pub fn foce_subject_nll_iov(
             h_matrix,
             omega_bsv,
             sigma_values,
-            model.error_model,
+            &model.error_spec,
             model.bloq_method,
             &p_obs_iov,
         )
@@ -580,7 +591,7 @@ pub fn foce_subject_nll_iov(
             h_matrix,
             omega_bsv,
             sigma_values,
-            model.error_model,
+            &model.error_spec,
             model.bloq_method,
             &p_obs_iov,
         )
@@ -682,7 +693,7 @@ pub fn compute_cwres(
     h_matrix: &DMatrix<f64>,
     omega: &OmegaMatrix,
     sigma_values: &[f64],
-    error_model: ErrorModel,
+    error_spec: &ErrorSpec,
 ) -> Vec<f64> {
     let n_obs = subject.observations.len();
 
@@ -695,7 +706,7 @@ pub fn compute_cwres(
         .collect();
 
     // R_tilde
-    let r_diag = compute_r_diag(error_model, &f0, sigma_values);
+    let r_diag = compute_r_diag(error_spec, &f0, &subject.obs_cmts, sigma_values);
     let r_tilde = compute_r_tilde(h_matrix, &omega.matrix, &r_diag);
 
     // CWRES_j = (y_j - f0_j) / sqrt(R_tilde_jj), or NaN if censored.
@@ -839,7 +850,7 @@ pub fn individual_nll_iov(
         for &j in obs_indices {
             let y = subject.observations[j];
             let f_pred = all_preds[j];
-            let v = residual_variance(model.error_model, f_pred, sigma_values);
+            let v = model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values);
             if is_m3_bloq(model, subject, j) {
                 let z = (y - f_pred) / v.sqrt();
                 data_ll += -2.0 * log_normal_cdf(z);
@@ -856,7 +867,9 @@ pub fn individual_nll_iov(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{BloqMethod, DoseEvent, ErrorModel, GradientMethod, PkModel, PkParams};
+    use crate::types::{
+        BloqMethod, DoseEvent, ErrorModel, ErrorSpec, GradientMethod, PkModel, PkParams,
+    };
     use std::collections::HashMap;
 
     fn make_simple_subject() -> Subject {
@@ -887,6 +900,7 @@ mod tests {
             name: "test".into(),
             pk_model: PkModel::OneCptIvBolus,
             error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp(); // CL uses combined eta[0]
@@ -1061,6 +1075,7 @@ mod tests {
             h[(i, 0)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);
         }
 
+        let espec = ErrorSpec::Single(ErrorModel::Additive);
         let foce = foce_subject_nll_standard(
             &subj,
             &ipreds,
@@ -1068,7 +1083,7 @@ mod tests {
             &h,
             &omega,
             &sigma,
-            ErrorModel::Additive,
+            &espec,
             BloqMethod::Drop,
             &[],
         );
@@ -1079,7 +1094,7 @@ mod tests {
             &h,
             &omega,
             &sigma,
-            ErrorModel::Additive,
+            &espec,
             BloqMethod::Drop,
             &[],
         );

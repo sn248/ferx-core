@@ -674,6 +674,7 @@ mod tests {
             name: "cl_from_cr".into(),
             pk_model: PkModel::OneCptIvBolus,
             error_model: ErrorModel::Additive,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Additive),
             pk_param_fn: Box::new(|theta, _eta, cov| {
                 let mut p = PkParams::default();
                 let cr = cov.get("CR").copied().unwrap_or(1.0);

@@ -752,7 +752,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let error_lines = blocks
         .get("error_model")
         .ok_or("Missing [error_model] block")?;
-    let (error_model, _) = parse_error_model(error_lines)?;
+    let parsed_error_model = parse_error_model(error_lines)?;
 
     let indiv_lines = blocks
         .get("individual_parameters")
@@ -997,6 +997,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let sigma_values: Vec<f64> = sigmas.iter().map(|s| s.value).collect();
     let sigma_fixed: Vec<bool> = sigmas.iter().map(|s| s.fixed).collect();
     let sigma_init_as_sd: Vec<bool> = sigmas.iter().map(|s| s.init_as_sd).collect();
+    // Resolve the error model now that the sigma vector ordering is known.
+    // For per-CMT (multi-endpoint) models this maps each endpoint's sigma
+    // names to indices into this flat vector and enforces the ODE-only
+    // restriction.
+    let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
     let sigma = SigmaVector {
         values: sigma_values,
         names: sigma_names,
@@ -1216,6 +1221,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         name,
         pk_model,
         error_model,
+        error_spec,
         pk_param_fn,
         n_theta,
         n_eta,
@@ -1924,6 +1930,7 @@ fn build_y_output_fn(
     theta_names: &[String],
     eta_names: &[String],
     indiv_var_names: &[String],
+    pk_indices: &[usize],
     state_names: &[String],
 ) -> Result<crate::ode::OdeOutputFn, String> {
     // Form C: expression may reference state names, individual params,
@@ -1941,10 +1948,15 @@ fn build_y_output_fn(
         .enumerate()
         .map(|(i, n)| (n.clone(), i))
         .collect();
+    // Map each individual-parameter name to its PK slot (`pk_params_flat` is
+    // indexed by PK slot via `pk_indices`, NOT by declaration order). Mirrors
+    // the Form B path; without this a readout like `central/V` reads the wrong
+    // (often uninitialised → NaN) slot whenever a param's declaration index
+    // differs from its PK slot.
     let indiv_idx: HashMap<String, usize> = indiv_var_names
         .iter()
         .enumerate()
-        .map(|(i, n)| (n.clone(), i))
+        .map(|(i, n)| (n.clone(), pk_indices.get(i).copied().unwrap_or(i)))
         .collect();
     let out_fn: crate::ode::OdeOutputFn = Box::new(
         move |state: &[f64],
@@ -2094,8 +2106,14 @@ fn parse_scaling_block(
                          use `obs_scale = <expr>` for analytical PK"
                         .into());
                 }
-                let out_fn =
-                    build_y_output_fn(value, theta_names, eta_names, indiv_var_names, state_names)?;
+                let out_fn = build_y_output_fn(
+                    value,
+                    theta_names,
+                    eta_names,
+                    indiv_var_names,
+                    pk_indices,
+                    state_names,
+                )?;
                 match cmt_opt {
                     None => {
                         if y_uniform.is_some() {
@@ -3327,30 +3345,169 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
 
 // --- Error model parsing ---
 
-fn parse_error_model(lines: &[String]) -> Result<(ErrorModel, Vec<String>), String> {
-    // DV ~ proportional(SIGMA_NAME)
-    // DV ~ additive(SIGMA_NAME)
-    // DV ~ combined(SIGMA1, SIGMA2)
+/// Parsed-but-unresolved `[error_model]` block. Sigma references are still
+/// names here; `build_error_spec` resolves them to indices into the flat
+/// global sigma vector once the `[parameters]` block has been parsed.
+enum ParsedErrorModel {
+    /// Single error model applied to all observations (no `CMT=` prefix).
+    /// Carries the referenced sigma name(s) so `build_error_spec` can check
+    /// they were declared in `[parameters]` (sigmas are then consumed
+    /// positionally from the global sigma vector).
+    Single(ErrorModel, Vec<String>),
+    /// Per-CMT error models (every line prefixed `CMT=N:`). One entry per line,
+    /// in source order; duplicates are rejected here.
+    PerCmt(Vec<(usize, ErrorModel, Vec<String>)>),
+}
+
+fn parse_error_model(lines: &[String]) -> Result<ParsedErrorModel, String> {
+    // Single-endpoint:
+    //   DV ~ proportional(SIGMA_NAME)
+    //   DV ~ additive(SIGMA_NAME)
+    //   DV ~ combined(SIGMA1, SIGMA2)
+    // Multi-endpoint (per-CMT dispatch, ODE models only):
+    //   CMT=2: DV ~ proportional(PROP_ERR_PK)
+    //   CMT=3: DV ~ additive(ADD_ERR_PD)
     let re = Regex::new(r"(\w+)\s*~\s*(\w+)\(([^)]+)\)").unwrap();
+    let cmt_re = Regex::new(r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$").unwrap();
+
+    let mut singles: Vec<(ErrorModel, Vec<String>)> = Vec::new();
+    let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
 
     for line in lines {
-        if let Some(caps) = re.captures(line) {
-            let error_type = &caps[2];
-            let sigma_names: Vec<String> =
-                caps[3].split(',').map(|s| s.trim().to_string()).collect();
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
 
-            let error_model = match error_type.to_lowercase().as_str() {
-                "additive" => ErrorModel::Additive,
-                "proportional" => ErrorModel::Proportional,
-                "combined" => ErrorModel::Combined,
-                other => return Err(format!("Unknown error model: {}", other)),
-            };
+        // Peel off an optional `CMT=N:` prefix.
+        let (cmt_opt, body) = if let Some(c) = cmt_re.captures(trimmed) {
+            let cmt: usize = c[1]
+                .parse()
+                .map_err(|_| format!("Invalid CMT index in [error_model] line: {}", trimmed))?;
+            (Some(cmt), c[2].trim().to_string())
+        } else {
+            (None, trimmed.to_string())
+        };
 
-            return Ok((error_model, sigma_names));
+        let caps = match re.captures(&body) {
+            Some(c) => c,
+            None => continue, // not an error-model statement
+        };
+        let error_type = &caps[2];
+        let sigma_names: Vec<String> = caps[3].split(',').map(|s| s.trim().to_string()).collect();
+        let error_model = match error_type.to_lowercase().as_str() {
+            "additive" => ErrorModel::Additive,
+            "proportional" => ErrorModel::Proportional,
+            "combined" => ErrorModel::Combined,
+            other => return Err(format!("Unknown error model: {}", other)),
+        };
+        if sigma_names.len() != error_model.n_sigma() {
+            return Err(format!(
+                "[error_model] {} model expects {} sigma(s) but {} given: {}",
+                error_type,
+                error_model.n_sigma(),
+                sigma_names.len(),
+                trimmed
+            ));
+        }
+
+        match cmt_opt {
+            Some(cmt) => per_cmt.push((cmt, error_model, sigma_names)),
+            None => singles.push((error_model, sigma_names)),
         }
     }
 
-    Err("No error model found in [error_model] block".to_string())
+    if !singles.is_empty() && !per_cmt.is_empty() {
+        return Err("[error_model] mixes a plain `DV ~ ...` line with `CMT=N:` \
+                    per-compartment lines; use one style or the other"
+            .to_string());
+    }
+
+    if !per_cmt.is_empty() {
+        let mut seen = std::collections::HashSet::new();
+        for (cmt, _, _) in &per_cmt {
+            if !seen.insert(*cmt) {
+                return Err(format!(
+                    "[error_model] has more than one entry for CMT={}",
+                    cmt
+                ));
+            }
+        }
+        return Ok(ParsedErrorModel::PerCmt(per_cmt));
+    }
+
+    match singles.into_iter().next() {
+        Some((model, names)) => Ok(ParsedErrorModel::Single(model, names)),
+        None => Err("No error model found in [error_model] block".to_string()),
+    }
+}
+
+/// Resolve a `ParsedErrorModel` into the `(representative ErrorModel, ErrorSpec)`
+/// stored on `CompiledModel`. For `PerCmt`, sigma names are resolved to indices
+/// into the flat global sigma vector (`sigma_names`, in `[parameters]` order)
+/// and the feature is restricted to ODE models (Phase 1).
+fn build_error_spec(
+    parsed: ParsedErrorModel,
+    sigma_names: &[String],
+    is_ode: bool,
+) -> Result<(ErrorModel, ErrorSpec), String> {
+    match parsed {
+        ParsedErrorModel::Single(model, names) => {
+            // Single-endpoint sigmas are consumed positionally from the global
+            // sigma vector, but a referenced name that was never declared in
+            // [parameters] is a typo we should catch rather than silently bind
+            // to sigma[0]. (Mirrors the strict resolution on the PerCmt path.)
+            for nm in &names {
+                if !sigma_names.iter().any(|s| s == nm) {
+                    return Err(format!(
+                        "[error_model] references unknown sigma '{}' \
+                         (declare it in [parameters])",
+                        nm
+                    ));
+                }
+            }
+            Ok((model, ErrorSpec::Single(model)))
+        }
+        ParsedErrorModel::PerCmt(entries) => {
+            if !is_ode {
+                return Err(
+                    "Per-CMT error models (`CMT=N: DV ~ ...`) require an ODE-based \
+                     [structural_model]; analytical PK models support a single error \
+                     model only."
+                        .to_string(),
+                );
+            }
+            let mut map = HashMap::new();
+            let mut representative = None;
+            for (cmt, em, names) in entries {
+                let mut sigma_idx = Vec::with_capacity(names.len());
+                for nm in &names {
+                    let idx = sigma_names.iter().position(|s| s == nm).ok_or_else(|| {
+                        format!(
+                            "[error_model] CMT={}: references unknown sigma '{}' \
+                             (declare it in [parameters])",
+                            cmt, nm
+                        )
+                    })?;
+                    sigma_idx.push(idx);
+                }
+                if representative.is_none() {
+                    representative = Some(em);
+                }
+                map.insert(
+                    cmt,
+                    EndpointError {
+                        error_model: em,
+                        sigma_idx,
+                    },
+                );
+            }
+            Ok((
+                representative.unwrap_or(ErrorModel::Additive),
+                ErrorSpec::PerCmt(map),
+            ))
+        }
+    }
 }
 
 // --- Individual parameter function builder ---
@@ -7359,6 +7516,230 @@ if (1 > 0) {
             model.error_model.sigma_types(),
             vec![SigmaType::Proportional]
         );
+    }
+
+    // ── Per-CMT (multi-endpoint) error models (issue #14) ───────────────────
+
+    /// Minimal 2-endpoint ODE PK/PD model: PK readout at CMT=1 (proportional),
+    /// PD readout at CMT=2 (additive). `error_block` overrides the
+    /// `[error_model]` body so negative tests can vary just that block.
+    /// Parse, expecting failure; returns the error string (ParsedModel isn't Debug).
+    fn expect_parse_err(model_str: &str) -> String {
+        match parse_full_model(model_str) {
+            Ok(_) => panic!("expected parse error, got Ok"),
+            Err(e) => e,
+        }
+    }
+
+    fn pkpd_model_str(error_block: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR_PK ~ 0.10 (sd)
+  sigma ADD_ERR_PD  ~ 1.00 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central, effect])
+
+[odes]
+  d/dt(central) = -CL/V * central
+  d/dt(effect)  =  central/V - effect
+
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = effect
+
+[error_model]
+{}
+",
+            error_block
+        )
+    }
+
+    #[test]
+    fn test_per_cmt_error_model_parses() {
+        let model = parse_full_model(&pkpd_model_str(
+            "  CMT=1: DV ~ proportional(PROP_ERR_PK)\n  CMT=2: DV ~ additive(ADD_ERR_PD)",
+        ))
+        .unwrap()
+        .model;
+
+        match &model.error_spec {
+            ErrorSpec::PerCmt(map) => {
+                assert_eq!(map.len(), 2);
+                // CMT=1 → proportional on the first declared sigma (idx 0).
+                let pk = map.get(&1).expect("CMT=1 endpoint present");
+                assert_eq!(pk.error_model, ErrorModel::Proportional);
+                assert_eq!(pk.sigma_idx, vec![0]);
+                // CMT=2 → additive on the second declared sigma (idx 1).
+                let pd = map.get(&2).expect("CMT=2 endpoint present");
+                assert_eq!(pd.error_model, ErrorModel::Additive);
+                assert_eq!(pd.sigma_idx, vec![1]);
+            }
+            other => panic!("expected PerCmt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_single_error_model_stays_single() {
+        // A plain (unprefixed) line must still yield ErrorSpec::Single.
+        let model = parse_full_model(&pkpd_model_str("  DV ~ proportional(PROP_ERR_PK)"))
+            .unwrap()
+            .model;
+        assert!(matches!(
+            model.error_spec,
+            ErrorSpec::Single(ErrorModel::Proportional)
+        ));
+    }
+
+    #[test]
+    fn test_per_cmt_error_unknown_sigma_rejected() {
+        let err = expect_parse_err(&pkpd_model_str(
+            "  CMT=1: DV ~ proportional(NOPE)\n  CMT=2: DV ~ additive(ADD_ERR_PD)",
+        ));
+        assert!(err.contains("unknown sigma"), "got: {err}");
+    }
+
+    #[test]
+    fn test_per_cmt_error_duplicate_cmt_rejected() {
+        let err = expect_parse_err(&pkpd_model_str(
+            "  CMT=1: DV ~ proportional(PROP_ERR_PK)\n  CMT=1: DV ~ additive(ADD_ERR_PD)",
+        ));
+        assert!(err.contains("CMT=1"), "got: {err}");
+    }
+
+    #[test]
+    fn test_per_cmt_error_mixed_styles_rejected() {
+        let err = expect_parse_err(&pkpd_model_str(
+            "  DV ~ proportional(PROP_ERR_PK)\n  CMT=2: DV ~ additive(ADD_ERR_PD)",
+        ));
+        assert!(err.contains("mixes"), "got: {err}");
+    }
+
+    /// A `combined` (two-sigma) endpoint resolves both sigma indices, and they
+    /// can interleave with other endpoints' sigmas in [parameters] order.
+    fn pkpd_3sigma_model_str(error_block: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma S_PROP ~ 0.10 (sd)
+  sigma S_ADD  ~ 1.00 (sd)
+  sigma S_PD   ~ 0.50 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central, effect])
+
+[odes]
+  d/dt(central) = -CL/V * central
+  d/dt(effect)  =  central/V - effect
+
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = effect
+
+[error_model]
+{}
+",
+            error_block
+        )
+    }
+
+    #[test]
+    fn test_per_cmt_combined_endpoint_resolves_two_sigma_indices() {
+        let model = parse_full_model(&pkpd_3sigma_model_str(
+            "  CMT=1: DV ~ combined(S_PROP, S_ADD)\n  CMT=2: DV ~ additive(S_PD)",
+        ))
+        .unwrap()
+        .model;
+
+        match &model.error_spec {
+            ErrorSpec::PerCmt(map) => {
+                let c1 = map.get(&1).expect("CMT=1 present");
+                assert_eq!(c1.error_model, ErrorModel::Combined);
+                assert_eq!(c1.sigma_idx, vec![0, 1]); // S_PROP, S_ADD
+                let c2 = map.get(&2).expect("CMT=2 present");
+                assert_eq!(c2.error_model, ErrorModel::Additive);
+                assert_eq!(c2.sigma_idx, vec![2]); // S_PD
+            }
+            other => panic!("expected PerCmt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_per_cmt_endpoint_sigma_count_mismatch_rejected() {
+        // `combined` needs two sigmas; giving one must error at parse, not
+        // silently propagate NaN into the likelihood.
+        let err = expect_parse_err(&pkpd_3sigma_model_str(
+            "  CMT=1: DV ~ combined(S_PROP)\n  CMT=2: DV ~ additive(S_PD)",
+        ));
+        assert!(
+            err.contains("expects 2 sigma") || err.contains("2 sigma(s)"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_single_error_unknown_sigma_rejected() {
+        // A single (unprefixed) error line that references a sigma not declared
+        // in [parameters] is a typo, not a silent bind to sigma[0].
+        let model_str = r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(NO_SUCH_SIGMA)
+";
+        let err = expect_parse_err(model_str);
+        assert!(err.contains("unknown sigma"), "got: {err}");
+    }
+
+    #[test]
+    fn test_per_cmt_error_on_analytical_model_rejected() {
+        let model_str = r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR_PK ~ 0.10 (sd)
+  sigma ADD_ERR_PD  ~ 1.00 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_PK)
+  CMT=2: DV ~ additive(ADD_ERR_PD)
+";
+        let err = expect_parse_err(model_str);
+        assert!(err.contains("ODE"), "got: {err}");
     }
 
     // ── Issue 3: if/else classification ─────────────────────────────────────

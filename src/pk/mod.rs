@@ -274,11 +274,15 @@ pub fn predict_concentration(
         if t_eff <= t {
             let tau = t - t_eff;
             conc += single_dose_concentration(pk_model, dose, tau, pk_params);
-        } else if dose.ss && dose.ii > 0.0 {
-            // Pre-arrival steady-state tail (see the doc comment). Wrap the
-            // negative elapsed time `t - t_eff` up into `[0, II)` by adding
-            // whole intervals — one suffices for a physical lagtime < II,
-            // but the ceil keeps it correct for any value.
+        } else if dose.ss && dose.ii > 0.0 && t >= dose.time {
+            // Pre-arrival steady-state tail (see the doc comment). Only for
+            // observations at/after the dose *record* time: SS=1 establishes
+            // steady state *at* the record, so a record cannot contribute to
+            // times before itself (an SS dose later in the timeline must not
+            // leak into earlier observations). Wrap the negative elapsed time
+            // `t - t_eff` up into `[0, II)` by adding whole intervals — one
+            // suffices for a physical lagtime < II, but the ceil keeps it
+            // correct for any value.
             let raw = t - t_eff;
             let n = (-raw / dose.ii).ceil();
             let tau = raw + n * dose.ii;
@@ -956,6 +960,32 @@ mod tests {
             let c = predict_concentration(PkModel::OneCptOral, &doses, t, &pk);
             assert_relative_eq!(c, pred, max_relative = 1e-4);
         }
+    }
+
+    #[test]
+    fn test_ss_dose_does_not_contribute_before_its_record_time() {
+        // SS=1 establishes steady state *at* the dose record time, so an SS
+        // dose must not contribute to observations earlier than its own
+        // record (the pre-arrival wrap only applies in [dose.time, t_eff)).
+        // Regression guard: before the `t >= dose.time` gate, a future SS
+        // record leaked a non-zero steady-state tail into earlier times.
+        let (cl, v, ka, lagtime, ii, amt) = (2.0, 20.0, 1.5, 1.5, 24.0, 100.0);
+        // SS dose recorded at t = 10 (not at the origin).
+        let doses = vec![DoseEvent::new(10.0, amt, 1, 0.0, true, ii)];
+        let mut pk = oral_pk_params(cl, v, ka);
+        pk.values[crate::types::PK_IDX_LAGTIME] = lagtime;
+
+        // Strictly before the record time → no contribution.
+        for &t in &[0.0, 5.0, 9.9] {
+            let c = predict_concentration(PkModel::OneCptOral, &doses, t, &pk);
+            assert_eq!(c, 0.0, "future SS dose leaked into t={t}");
+        }
+        // In the record-to-arrival window [10, 11.5) → previous-interval tail.
+        let c_pre = predict_concentration(PkModel::OneCptOral, &doses, 10.5, &pk);
+        let dose0 = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
+        // phase = (10.5 - 11.5) + II = 23.0
+        let expected = one_cpt_oral_ss(&dose0, 23.0, cl, v, ka);
+        assert_relative_eq!(c_pre, expected, max_relative = 1e-9);
     }
 
     #[test]

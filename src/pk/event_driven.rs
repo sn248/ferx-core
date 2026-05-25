@@ -569,6 +569,18 @@ pub fn event_driven_predictions_with_schedule(
             continue;
         }
         let t_eff = d.time + lag;
+        // Reconstruct the steady-state amount with the *dose-record* PK
+        // snapshot and read out concentration with the *observation* V —
+        // the same split the main walk uses (it equilibrates the SS dose
+        // with `pk_now = pk_at_dose[k]` and divides by `pk_at_obs[j].v()`
+        // at the obs event). Keeping the dose-time snapshot here is what
+        // makes the pre-arrival branch continuous with the main walk at
+        // t_eff: the steady-state profile is defined by the SS-record
+        // params, and a full-interval propagation from that equilibrium
+        // returns exactly to the trough. Equilibrating with obs-time params
+        // instead would break that continuity under time-varying covariates.
+        // (For pre-lag samples — within `lag` of the record — the two
+        // snapshots are effectively equal anyway.)
         let pk_dose = pk_at_dose[k];
         for (j, &t_obs) in subject.obs_times.iter().enumerate() {
             if t_obs >= d.time - 1e-12 && t_obs < t_eff - 1e-12 {

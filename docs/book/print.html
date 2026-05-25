@@ -16,8 +16,8 @@
         <link rel="icon" href="favicon-de23e50b.svg">
         <link rel="shortcut icon" href="favicon-8114d1fc.png">
         <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-2459343d.css">
-        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/general-0392ca55.css">
+        <link rel="stylesheet" href="css/chrome-fc474251.css">
         <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-07ef4905.js";
+            window.path_to_searchindex_js = "searchindex-31e4b60b.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-3a934816.js"></script>
+        <script src="toc-39f227ad.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1490,6 +1490,51 @@ that aren’t assigned in the firing branch this step receive a derivative
 of <code>0</code>.</p>
 </li>
 </ul>
+<h2 id="initial-compartment-amounts"><a class="header" href="#initial-compartment-amounts">Initial Compartment Amounts</a></h2>
+<p>By default every compartment starts at zero, and drug enters only through dose
+records. To start a compartment at a non-zero amount — e.g. a pre-dose baseline
+for an indirect-response / turnover model — declare an initial condition in the
+<code>[odes]</code> block:</p>
+<pre><code>[odes]
+  init(state_name) = expression
+  d/dt(state_name) = expression
+</code></pre>
+<ul>
+<li>The right-hand side is evaluated <strong>once per subject</strong> at the start of the
+record and may reference individual parameters (and therefore folds in
+<code>theta</code>, <code>eta</code>, and covariates through the <code>[individual_parameters]</code> layer).
+State names referenced in an <code>init</code> expression are treated as <code>0</code> (no drug
+is present yet).</li>
+<li>Compartments without an <code>init(...)</code> line start at zero, as before.</li>
+<li>This is the analogue of NONMEM’s <code>A_0(n)</code>.</li>
+</ul>
+<p><strong>Time-varying covariates.</strong> Because the initial condition is a pre-record
+baseline, it is evaluated a single time using the covariate values from the
+subject’s <strong>first record</strong>. If a covariate that feeds the <code>init</code> expression
+changes later in the record, the initial amount is <em>not</em> re-evaluated — the
+later covariate values affect <code>d/dt(...)</code> going forward (the system evolves
+from the baseline), but the t=0 starting point is fixed by the first record’s
+covariates. For most models this is exactly what you want, since the baseline
+represents the pre-dose steady state. If you need the starting amount to track
+a covariate value observed mid-record, model it as a state driven by <code>d/dt</code>
+rather than as an <code>init</code>.</p>
+<p>A turnover model whose response variable sits at its baseline <code>KIN/KOUT</code>
+before any perturbation:</p>
+<pre><code>[odes]
+  init(response) = KIN / KOUT
+  d/dt(response) = KIN - KOUT * response
+</code></pre>
+<p><strong>Interaction with system resets (EVID=3/4):</strong> a reset re-applies the <code>init</code>
+expression to initialized compartments (returning them to baseline) and zeros
+all other compartments — so a reset behaves like the start of a fresh episode.
+See <a href="#data-format">Data Format</a> for reset rows.</p>
+<p>Note one deliberate asymmetry with the start-of-record seeding described above:
+the re-applied baseline at a reset is evaluated with the covariate values in
+effect <strong>at the reset time</strong>, not the first record’s. With time-varying
+covariates this means the post-reset baseline reflects the most recent
+covariate values — appropriate for a “fresh episode” that starts under current
+conditions — whereas the very first baseline uses the first record’s
+covariates. For time-constant covariates the two are identical.</p>
 <h2 id="example-michaelis-menten-elimination"><a class="header" href="#example-michaelis-menten-elimination">Example: Michaelis-Menten Elimination</a></h2>
 <p>A one-compartment oral model with saturable (Michaelis-Menten) elimination:</p>
 <pre><code>[parameters]
@@ -3235,7 +3280,7 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 <tr><th>Column</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>EVID</code></td><td>integer</td><td>0</td><td>Event ID: 0 = observation, 1 = dose, 4 = reset + dose</td></tr>
+<tr><td><code>EVID</code></td><td>integer</td><td>0</td><td>Event ID: 0 = observation, 1 = dose, 2 = other event, 3 = system reset, 4 = reset + dose</td></tr>
 <tr><td><code>AMT</code></td><td>numeric</td><td>0</td><td>Dose amount (only for <code>EVID=1</code> or <code>EVID=4</code>)</td></tr>
 <tr><td><code>CMT</code></td><td>integer</td><td>1</td><td>Compartment number (1-indexed)</td></tr>
 <tr><td><code>RATE</code></td><td>numeric</td><td>0</td><td>Infusion rate. 0 = bolus dose</td></tr>
@@ -3302,10 +3347,27 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 <tr><td>0</td><td>Observation record. <code>DV</code> is used for estimation.</td></tr>
 <tr><td>1</td><td>Dosing record. <code>AMT</code> is administered to compartment <code>CMT</code>.</td></tr>
 <tr><td>2</td><td>Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row’s covariate values — matching NONMEM’s <code>$PK runs at every record</code> semantic. Only meaningful when at least one covariate is time-varying; for time-constant data EVID=2 rows are skipped (would be no-ops).</td></tr>
-<tr><td>4</td><td>Reset and dose. All compartment amounts are reset to zero before dosing.</td></tr>
+<tr><td>3</td><td>System reset. All compartment amounts are set to zero at this time, and any ongoing infusion is turned off. No dose is given and <code>DV</code> is ignored.</td></tr>
+<tr><td>4</td><td>Reset and dose. Like EVID=3 (zero every compartment, stop ongoing infusions) followed immediately by a dose of <code>AMT</code> into compartment <code>CMT</code>.</td></tr>
 </tbody>
 </table>
 </div>
+<h2 id="system-resets-evid3--evid4"><a class="header" href="#system-resets-evid3--evid4">System Resets (EVID=3 / EVID=4)</a></h2>
+<p>A reset record empties every compartment at its <code>TIME</code>, as if the subject’s drug history started over from that point. <code>EVID=3</code> is a pure reset; <code>EVID=4</code> resets and then administers the row’s dose into the freshly emptied system. This matches NONMEM’s reset-event semantics and is useful for, e.g., modelling washout between treatment cycles or re-using one subject record for independent dosing episodes.</p>
+<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+1,1,9.5,0,.,.,0
+1,4,6.1,0,.,.,0
+1,24,.,3,.,.,1
+1,24,.,1,100,1,1
+1,25,9.4,0,.,.,0
+</code></pre>
+<p>Notes:</p>
+<ul>
+<li>Resets force the <a href="../estimation/foce.html">event-driven analytical / ODE prediction path</a> — dose superposition cannot express a mid-record reset — so any analytical or ODE model supports them with no configuration.</li>
+<li>Under <code>gradient_method = ad</code>, reset-bearing subjects fall back to finite-difference gradients (the autodiff propagators do not yet carry a reset event); results are unaffected, only the gradient method.</li>
+<li>Resets are <strong>not</strong> supported on the EKF/SDE path (<code>[diffusion]</code> models). A reset row on an SDE model emits a warning and is ignored.</li>
+</ul>
 <h2 id="example-dataset"><a class="header" href="#example-dataset">Example Dataset</a></h2>
 <pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT,CRCL
 1,0,.,1,100,1,0,1,70,95
@@ -5228,11 +5290,11 @@ how this compares to NONMEM’s <code>S1</code>/<code>S2</code> and nlmixr2’s 
 
         <script src="elasticlunr-ef4e11c1.min.js"></script>
         <script src="mark-09e88c2c.min.js"></script>
-        <script src="searcher-c2a407aa.js"></script>
+        <script src="searcher-09f2665d.js"></script>
 
         <script src="clipboard-1626706a.min.js"></script>
         <script src="highlight-abc7f01d.js"></script>
-        <script src="book-a0b12cfe.js"></script>
+        <script src="book-c22b7243.js"></script>
 
         <!-- Custom JS scripts -->
         <script src="mathjax-config-cc82dc7f.js"></script>

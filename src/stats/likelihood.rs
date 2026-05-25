@@ -871,6 +871,7 @@ mod tests {
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),

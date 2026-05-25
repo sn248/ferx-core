@@ -14,7 +14,7 @@ FeRx reads data in NONMEM-compatible CSV format. This is the standard format use
 
 | Column | Type | Default | Description |
 |--------|------|---------|-------------|
-| `EVID` | integer | 0 | Event ID: 0 = observation, 1 = dose, 4 = reset + dose |
+| `EVID` | integer | 0 | Event ID: 0 = observation, 1 = dose, 2 = other event, 3 = system reset, 4 = reset + dose |
 | `AMT` | numeric | 0 | Dose amount (only for `EVID=1` or `EVID=4`) |
 | `CMT` | integer | 1 | Compartment number (1-indexed) |
 | `RATE` | numeric | 0 | Infusion rate. 0 = bolus dose |
@@ -87,7 +87,28 @@ Infusion routing on the event-driven path:
 | 0 | Observation record. `DV` is used for estimation. |
 | 1 | Dosing record. `AMT` is administered to compartment `CMT`. |
 | 2 | Other event (typically a covariate-change marker). The compartment state is unchanged but the rate matrix is refreshed from this row's covariate values — matching NONMEM's `$PK runs at every record` semantic. Only meaningful when at least one covariate is time-varying; for time-constant data EVID=2 rows are skipped (would be no-ops). |
-| 4 | Reset and dose. All compartment amounts are reset to zero before dosing. |
+| 3 | System reset. All compartment amounts are set to zero at this time, and any ongoing infusion is turned off. No dose is given and `DV` is ignored. |
+| 4 | Reset and dose. Like EVID=3 (zero every compartment, stop ongoing infusions) followed immediately by a dose of `AMT` into compartment `CMT`. |
+
+## System Resets (EVID=3 / EVID=4)
+
+A reset record empties every compartment at its `TIME`, as if the subject's drug history started over from that point. `EVID=3` is a pure reset; `EVID=4` resets and then administers the row's dose into the freshly emptied system. This matches NONMEM's reset-event semantics and is useful for, e.g., modelling washout between treatment cycles or re-using one subject record for independent dosing episodes.
+
+```csv
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+1,1,9.5,0,.,.,0
+1,4,6.1,0,.,.,0
+1,24,.,3,.,.,1
+1,24,.,1,100,1,1
+1,25,9.4,0,.,.,0
+```
+
+Notes:
+
+- Resets force the [event-driven analytical / ODE prediction path](../estimation/foce.md) — dose superposition cannot express a mid-record reset — so any analytical or ODE model supports them with no configuration.
+- Under `gradient_method = ad`, reset-bearing subjects fall back to finite-difference gradients (the autodiff propagators do not yet carry a reset event); results are unaffected, only the gradient method.
+- Resets are **not** supported on the EKF/SDE path (`[diffusion]` models). A reset row on an SDE model emits a warning and is ignored.
 
 ## Example Dataset
 

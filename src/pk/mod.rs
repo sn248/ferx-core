@@ -347,6 +347,24 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
 /// Uses analytical equations for standard PK models, or delegates to ODE solver
 /// when an OdeSpec is provided.
 pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkParams) -> Vec<f64> {
+    // Dose superposition cannot express a system reset (EVID=3/4): a reset
+    // zeros the compartments mid-record, which is not a sum of independent
+    // dose responses. Route reset-bearing subjects through the
+    // state-propagating event-driven analytical path instead, replicating
+    // the (constant) `pk_params` across every event slot — the same uniform
+    // fill the no-TV dispatcher branch uses.
+    if subject.has_resets() && event_driven::supports_event_driven(pk_model) {
+        let pk_dose = vec![*pk_params; subject.doses.len()];
+        let pk_obs = vec![*pk_params; subject.obs_times.len()];
+        let pk_pk_only = vec![*pk_params; subject.pk_only_times.len()];
+        return event_driven::event_driven_predictions(
+            pk_model,
+            subject,
+            &pk_dose,
+            &pk_obs,
+            &pk_pk_only,
+        );
+    }
     subject
         .obs_times
         .iter()
@@ -366,6 +384,27 @@ pub fn compute_predictions_ode(
     theta: &[f64],
     eta: &[f64],
 ) -> Vec<f64> {
+    // System resets (EVID=3/4) need the state-propagating event-driven ODE
+    // walker — the plain `ode_predictions` segment loop has no reset event.
+    // Replicate the (constant) params across every event slot, mirroring the
+    // no-TV uniform fill used by `compute_event_pk_params`.
+    if subject.has_resets() {
+        let mut pk = PkParams::default();
+        let n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
+        pk.values[..n].copy_from_slice(&pk_params_flat[..n]);
+        let pk_dose = vec![pk; subject.doses.len()];
+        let pk_obs = vec![pk; subject.obs_times.len()];
+        let pk_pk_only = vec![pk; subject.pk_only_times.len()];
+        return crate::ode::ode_predictions_event_driven(
+            ode_spec,
+            subject,
+            theta,
+            eta,
+            &pk_dose,
+            &pk_obs,
+            &pk_pk_only,
+        );
+    }
     crate::ode::ode_predictions(ode_spec, pk_params_flat, theta, eta, subject)
 }
 
@@ -440,8 +479,10 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     let has_tv = subject.has_tv_covariates();
 
     let mut preds = if let Some(ref ode) = model.ode_spec {
-        // ODE path.
-        if has_tv {
+        // ODE path. Resets (EVID=3/4) need the state-propagating event-driven
+        // walker too, even without time-varying covariates — the plain
+        // `ode_predictions` loop has no reset event.
+        if has_tv || subject.has_resets() {
             compute_event_pk_params_into(model, subject, theta, eta, scratch);
             crate::ode::ode_predictions_event_driven(
                 ode,
@@ -456,7 +497,9 @@ pub fn compute_predictions_with_tv_into_with_schedule(
             let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
             crate::ode::ode_predictions(ode, &pk.values, theta, eta, subject)
         }
-    } else if has_tv && event_driven::supports_event_driven(model.pk_model) {
+    } else if (has_tv || subject.has_resets())
+        && event_driven::supports_event_driven(model.pk_model)
+    {
         compute_event_pk_params_into(model, subject, theta, eta, scratch);
         if let Some(sched) = schedule {
             event_driven::event_driven_predictions_with_schedule(
@@ -539,6 +582,33 @@ mod tests {
         assert_relative_eq!(c_single, c_two, epsilon = 1e-12);
     }
 
+    #[test]
+    fn compute_predictions_routes_reset_subject_to_event_driven() {
+        // A subject with a reset (EVID=3) must NOT use superposition:
+        // `compute_predictions` should zero the state at the reset. Dose at
+        // t=0, reset at t=5, obs at t=1 (positive) and t=6 (zero).
+        let subj = Subject {
+            id: "1".to_string(),
+            doses: vec![bolus_dose(0.0, 1000.0)],
+            obs_times: vec![1.0, 6.0],
+            observations: vec![0.0; 2],
+            obs_cmts: vec![1; 2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: vec![5.0],
+            cens: vec![0; 2],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+        };
+        let pk = make_pk_params(10.0, 100.0);
+        let preds = compute_predictions(PkModel::OneCptIvBolus, &subj, &pk);
+        assert!(preds[0] > 0.0);
+        assert_relative_eq!(preds[1], 0.0, epsilon = 1e-12);
+    }
+
     fn make_subject_with_tv(
         cov_const: HashMap<String, f64>,
         dose_cov: Vec<HashMap<String, f64>>,
@@ -557,6 +627,7 @@ mod tests {
             obs_covariates: obs_cov,
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
@@ -680,6 +751,7 @@ mod tests {
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),

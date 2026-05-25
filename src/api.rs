@@ -135,6 +135,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
             cens: vec![0; sim_spec.obs_times.len()],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
@@ -707,6 +708,27 @@ fn fit_inner(
              ≤ II) or remove the SS flag.",
             n_ss_overlapping_inf
         ));
+    }
+
+    // System resets (EVID=3/4) are honoured on the analytical and ODE
+    // prediction paths, but not yet on the EKF/SDE path (`ode_predictions_ekf`
+    // builds its own timeline without a reset event). Warn rather than
+    // silently ignore the resets for SDE models.
+    if model.is_sde() {
+        let n_reset_sde = population
+            .subjects
+            .iter()
+            .filter(|s| s.has_resets())
+            .count();
+        if n_reset_sde > 0 {
+            accumulated_warnings.push(format!(
+                "{} subject(s) have EVID=3/4 reset rows with a [diffusion] (SDE) \
+                 model. System resets are not yet honoured on the EKF/SDE path — \
+                 the resets are ignored and compartment amounts carry through. \
+                 Use an ODE or analytical model if resets are required.",
+                n_reset_sde
+            ));
+        }
     }
 
     // Lagtime: probe at the initial typical-value point (eta = 0, mean
@@ -2141,6 +2163,7 @@ mod iov_integration {
                 obs_covariates: Vec::new(),
                 pk_only_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
                 cens: vec![0; 6],
                 occasions: occasions.clone(),
                 dose_occasions: dose_occ.clone(),
@@ -2873,6 +2896,7 @@ mod simulate_with_uncertainty_tests {
                 obs_covariates: Vec::new(),
                 pk_only_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
@@ -3161,6 +3185,7 @@ mod sde_integration {
                 obs_covariates: Vec::new(),
                 pk_only_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
                 cens: vec![0; 3],
                 occasions: vec![1u32; 3],
                 dose_occasions: vec![1u32],
@@ -3284,6 +3309,7 @@ mod sde_integration {
                 obs_covariates: Vec::new(),
                 pk_only_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
                 cens: vec![0],
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),

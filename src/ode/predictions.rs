@@ -138,13 +138,17 @@ fn active_infusions(
     t_start: f64,
     t_end: f64,
     dose_lagtimes: &[f64],
+    reset_floor: f64,
 ) -> Vec<(usize, f64)> {
     doses
         .iter()
         .enumerate()
         .filter(|(k, d)| {
             let lag = dose_lagtimes.get(*k).copied().unwrap_or(0.0);
+            // Infusions started before the most recent system reset (EVID=3/4)
+            // are turned off, the same way the reset zeros the compartments.
             is_real_infusion(d)
+                && d.time + lag >= reset_floor
                 && d.time + lag <= t_start + INFUSION_EPS
                 && d.time + lag + d.duration >= t_end - INFUSION_EPS
         })
@@ -377,7 +381,16 @@ pub fn ode_predictions(
 
         // Integrate. If any infusions are active in this segment, wrap
         // the user RHS so it adds `+rate` to each infusion's compartment.
-        let active = active_infusions(&subject.doses, t_start, t_end, &dose_lagtimes);
+        // The plain (non-event-driven) ODE path never sees reset subjects —
+        // the dispatcher routes those to `ode_predictions_event_driven` — so
+        // no reset floor applies here.
+        let active = active_infusions(
+            &subject.doses,
+            t_start,
+            t_end,
+            &dose_lagtimes,
+            f64::NEG_INFINITY,
+        );
         let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
             (ode.rhs)(y, p, t, dy);
             for &(cmt_idx, rate) in &active {
@@ -481,6 +494,7 @@ pub fn ode_predictions_event_driven(
     // include the rate in their active set on the next iteration).
     #[derive(Clone, Copy)]
     enum Kind {
+        Reset,
         Dose,
         PkOnly,
         Obs,
@@ -488,16 +502,26 @@ pub fn ode_predictions_event_driven(
     }
     fn kind_order(k: Kind) -> u8 {
         match k {
-            Kind::Dose => 0,
-            Kind::PkOnly => 1,
-            Kind::Obs => 2,
-            Kind::InfusionEnd => 3,
+            // Reset sorts first so EVID=4 (reset + dose) zeros the state
+            // before its own dose lands at the same time.
+            Kind::Reset => 0,
+            Kind::Dose => 1,
+            Kind::PkOnly => 2,
+            Kind::Obs => 3,
+            Kind::InfusionEnd => 4,
         }
     }
     let n_infusion_ends = subject.doses.iter().filter(|d| is_real_infusion(d)).count();
     let mut timeline: Vec<(f64, Kind, usize)> = Vec::with_capacity(
-        subject.doses.len() + n_obs + subject.pk_only_times.len() + n_infusion_ends,
+        subject.doses.len()
+            + n_obs
+            + subject.pk_only_times.len()
+            + subject.reset_times.len()
+            + n_infusion_ends,
     );
+    for (r, &t) in subject.reset_times.iter().enumerate() {
+        timeline.push((t, Kind::Reset, r));
+    }
     // Per-dose lagtimes from the per-event PK snapshot for the dose.
     let dose_lagtimes: Vec<f64> = pk_at_dose.iter().map(|p| p.lagtime()).collect();
     for (k, d) in subject.doses.iter().enumerate() {
@@ -523,23 +547,28 @@ pub fn ode_predictions_event_driven(
     // Most-recent NONMEM record's PK params, used to integrate segments
     // ending at an infusion-end (which is not a record and carries no PK).
     let mut last_pk: PkParams = PkParams::default();
+    // Most-recent system-reset time (EVID=3/4); `NEG_INFINITY` until the
+    // first reset. Infusions started before it are no longer active.
+    let mut reset_floor = f64::NEG_INFINITY;
 
     for &(t_event, kind, idx) in &timeline {
         // PK params for the segment [cur_t, t_event] are evaluated AT
         // t_event (NONMEM end-of-interval / current-record convention —
         // `$PK runs at every record, then ADVAN propagates to it`).
         // Infusion-end is not a record: reuse the previous segment's PK.
+        // Reset is not a record either: it just zeros the state below.
         let pk_now: PkParams = match kind {
             Kind::Dose => pk_at_dose[idx],
             Kind::Obs => pk_at_obs[idx],
             Kind::PkOnly => pk_at_pk_only[idx],
-            Kind::InfusionEnd => last_pk,
+            Kind::InfusionEnd | Kind::Reset => last_pk,
         };
 
         if t_event > cur_t {
             // Wrap the user RHS so any infusion fully spanning
             // [cur_t, t_event] contributes `+rate` to its compartment.
-            let active = active_infusions(&subject.doses, cur_t, t_event, &dose_lagtimes);
+            let active =
+                active_infusions(&subject.doses, cur_t, t_event, &dose_lagtimes, reset_floor);
             let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
                 (ode.rhs)(y, p, t, dy);
                 for &(cmt_idx, rate) in &active {
@@ -613,6 +642,14 @@ pub fn ode_predictions_event_driven(
                 // Not a NONMEM record: no state update, no PK update —
                 // only purpose is to break the timeline so the next
                 // segment's `active_infusions` excludes this infusion.
+            }
+            Kind::Reset => {
+                // EVID=3 / EVID=4: zero every compartment. For EVID=4 the
+                // dose at this same time follows (Reset sorts before Dose),
+                // so it lands in a freshly emptied system. Record the reset
+                // time so infusions started earlier stop contributing.
+                u.iter_mut().for_each(|x| *x = 0.0);
+                reset_floor = t_event;
             }
         }
     }
@@ -766,9 +803,67 @@ mod tests {
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ode_event_driven_reset_evid3_zeros_state() {
+        // EVID=3 reset at t=5 must zero the ODE state: obs after the reset
+        // read ~0 when no later dose exists.
+        let ode = one_cpt_ode_spec();
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![1.0, 6.0, 10.0];
+        let mut subj = make_subject(doses, obs_times.clone());
+        subj.reset_times = vec![5.0];
+        let pk = pk_one(10.0, 100.0);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+        assert!(preds[0] > 0.0, "pre-reset obs should be positive");
+        assert_relative_eq!(preds[1], 0.0, epsilon = 1e-6);
+        assert_relative_eq!(preds[2], 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn ode_event_driven_reset_evid4_matches_fresh_dose() {
+        // EVID=4 (reset + dose) at t=10 must match a single fresh dose at t=10.
+        let ode = one_cpt_ode_spec();
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(10.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![10.0, 12.0, 15.0];
+        let mut subj = make_subject(doses, obs_times.clone());
+        subj.reset_times = vec![10.0];
+        let pk = pk_one(8.0, 50.0);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+
+        // Reference: lone 500 mg dose at t=10 through the same ODE path.
+        let fresh = make_subject(
+            vec![DoseEvent::new(10.0, 500.0, 1, 0.0, false, 0.0)],
+            obs_times.clone(),
+        );
+        let fresh_pk_dose = vec![pk; fresh.doses.len()];
+        let fresh_pk_obs = vec![pk; obs_times.len()];
+        let expected = ode_predictions_event_driven(
+            &ode,
+            &fresh,
+            &[],
+            &[],
+            &fresh_pk_dose,
+            &fresh_pk_obs,
+            &[],
+        );
+        for (a, e) in preds.iter().zip(expected.iter()) {
+            assert_relative_eq!(*a, *e, epsilon = 1e-6, max_relative = 1e-6);
         }
     }
 

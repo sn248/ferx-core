@@ -1538,6 +1538,7 @@ mod tests {
                 obs_covariates: vec![],
                 pk_only_times: vec![],
                 pk_only_covariates: vec![],
+                reset_times: vec![],
                 cens: vec![0; n_obs_each],
                 occasions: vec![],
                 dose_occasions: vec![],

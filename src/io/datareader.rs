@@ -7,7 +7,8 @@ use std::path::Path;
 /// Expected columns (case-insensitive):
 ///   ID, TIME, DV, EVID, AMT, CMT, RATE, MDV, II, SS, CENS, [covariates...]
 ///
-/// EVID: 0=observation, 1=dose, 4=reset+dose
+/// EVID: 0=observation, 1=dose, 2=other event (covariate change),
+///       3=system reset (zero all compartments), 4=reset + dose
 /// MDV: 1=missing dependent variable
 /// CENS: 1=observation is below LLOQ (DV carries the LLOQ value); 0 otherwise
 ///
@@ -249,6 +250,10 @@ fn parse_subject(
     // re-evaluating $PK with unchanged values is a no-op.
     let mut pk_only_times: Vec<f64> = Vec::new();
     let mut pk_only_covariates: Vec<HashMap<String, f64>> = Vec::new();
+    // EVID=3 (reset) and EVID=4 (reset + dose) rows. Both zero every
+    // compartment amount at `time`; EVID=4 additionally records a dose
+    // (handled in the `evid == 1 || evid == 4` arm below).
+    let mut reset_times: Vec<f64> = Vec::new();
 
     for row in rows {
         // Update LOCF state from this row's TV-covariate values *before*
@@ -291,7 +296,16 @@ fn parse_subject(
             0
         };
 
-        if evid == 1 || evid == 4 {
+        // EVID=3 (reset) and EVID=4 (reset + dose) both zero the compartment
+        // state at this time. Record the reset before the dose arm runs so
+        // EVID=4 captures both the reset and its dose.
+        if evid == 3 || evid == 4 {
+            reset_times.push(time);
+        }
+
+        if evid == 3 {
+            // Pure system reset: no dose, no observation. Nothing else to do.
+        } else if evid == 1 || evid == 4 {
             // Dose record
             let amt = amt_col
                 .and_then(|c| row.get(c))
@@ -379,6 +393,10 @@ fn parse_subject(
         Vec::new()
     };
 
+    // Reset events are recorded in row order, which is usually time order;
+    // sort defensively so the event-driven propagators see them in order.
+    reset_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
     Ok((
         Subject {
             id: id.to_string(),
@@ -391,6 +409,7 @@ fn parse_subject(
             obs_covariates,
             pk_only_times,
             pk_only_covariates,
+            reset_times,
             cens,
             occasions,
             dose_occasions: sorted_dose_occ,
@@ -418,6 +437,52 @@ mod tests {
         let pop = read_nonmem_csv(f.path(), None, None).unwrap();
         assert!(pop.subjects[0].occasions.is_empty());
         assert!(pop.subjects[0].dose_occasions.is_empty());
+    }
+
+    #[test]
+    fn test_evid3_reset_recorded_not_dose_or_obs() {
+        // EVID=3 is a pure system reset: it must land in `reset_times` and
+        // must NOT be parsed as a dose or an observation.
+        let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,1,5.0,0,.\n\
+                   1,5,.,3,.\n\
+                   1,6,2.0,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(subj.reset_times, vec![5.0]);
+        assert!(subj.has_resets());
+        // One dose (t=0), two observations (t=1, t=6) — the reset row is neither.
+        assert_eq!(subj.doses.len(), 1);
+        assert_eq!(subj.obs_times, vec![1.0, 6.0]);
+    }
+
+    #[test]
+    fn test_evid4_reset_plus_dose_recorded_as_both() {
+        // EVID=4 is reset + dose: it records both a reset time and a dose.
+        let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,1,5.0,0,.\n\
+                   1,10,.,4,200\n\
+                   1,11,3.0,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(subj.reset_times, vec![10.0]);
+        // Two doses: the t=0 dose and the EVID=4 dose at t=10.
+        assert_eq!(subj.doses.len(), 2);
+        assert!(subj.doses.iter().any(|d| d.time == 10.0 && d.amt == 200.0));
+        assert_eq!(subj.obs_times, vec![1.0, 11.0]);
+    }
+
+    #[test]
+    fn test_no_resets_leaves_reset_times_empty() {
+        let csv = "ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(pop.subjects[0].reset_times.is_empty());
+        assert!(!pop.subjects[0].has_resets());
     }
 
     #[test]

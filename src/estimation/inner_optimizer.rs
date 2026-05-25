@@ -143,6 +143,15 @@ fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGra
         if subject.has_ss_doses() {
             return InnerGradientMethod::Fd;
         }
+        // System resets (EVID=3/4) zero the compartment state mid-record.
+        // The AD-instrumented propagators have no reset event, so their
+        // gradients wouldn't match the reset-aware predictions from the
+        // event-driven path. Fall back to FD until the AD path learns
+        // resets — the FD path routes through the reset-aware analytical
+        // propagator (see `pk::compute_predictions`).
+        if subject.has_resets() {
+            return InnerGradientMethod::Fd;
+        }
         // Lagtime in the event-driven AD path would require threading
         // per-dose `lagtime` through the AD-instrumented propagators and
         // their infusion-window checks. The single-snapshot AD path
@@ -317,7 +326,10 @@ pub fn find_ebe(
     // cached schedule would go stale as the inner BFGS varies eta. The
     // non-cached path (`event_driven_predictions`) rebuilds the schedule
     // per call using the current per-dose PkParams (which carry lagtime).
-    let schedule = if subject.has_tv_covariates()
+    // Reset-bearing subjects (EVID=3/4) also take the event-driven analytical
+    // path, so they benefit from a cached schedule too — the schedule now
+    // includes reset events.
+    let schedule = if (subject.has_tv_covariates() || subject.has_resets())
         && model.ode_spec.is_none()
         && pk::event_driven::supports_event_driven(model.pk_model)
         && !model.has_lagtime()
@@ -1381,6 +1393,7 @@ mod iov_tests {
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
@@ -1483,6 +1496,7 @@ mod iov_tests {
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),

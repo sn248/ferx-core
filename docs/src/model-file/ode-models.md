@@ -66,6 +66,17 @@ for an indirect-response / turnover model — declare an initial condition in th
 - Compartments without an `init(...)` line start at zero, as before.
 - This is the analogue of NONMEM's `A_0(n)`.
 
+**Time-varying covariates.** Because the initial condition is a pre-record
+baseline, it is evaluated a single time using the covariate values from the
+subject's **first record**. If a covariate that feeds the `init` expression
+changes later in the record, the initial amount is *not* re-evaluated — the
+later covariate values affect `d/dt(...)` going forward (the system evolves
+from the baseline), but the t=0 starting point is fixed by the first record's
+covariates. For most models this is exactly what you want, since the baseline
+represents the pre-dose steady state. If you need the starting amount to track
+a covariate value observed mid-record, model it as a state driven by `d/dt`
+rather than as an `init`.
+
 A turnover model whose response variable sits at its baseline `KIN/KOUT`
 before any perturbation:
 

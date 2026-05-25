@@ -7611,6 +7611,75 @@ if (1 > 0) {
         assert!(err.contains("mixes"), "got: {err}");
     }
 
+    /// A `combined` (two-sigma) endpoint resolves both sigma indices, and they
+    /// can interleave with other endpoints' sigmas in [parameters] order.
+    fn pkpd_3sigma_model_str(error_block: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma S_PROP ~ 0.10 (sd)
+  sigma S_ADD  ~ 1.00 (sd)
+  sigma S_PD   ~ 0.50 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central, effect])
+
+[odes]
+  d/dt(central) = -CL/V * central
+  d/dt(effect)  =  central/V - effect
+
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = effect
+
+[error_model]
+{}
+",
+            error_block
+        )
+    }
+
+    #[test]
+    fn test_per_cmt_combined_endpoint_resolves_two_sigma_indices() {
+        let model = parse_full_model(&pkpd_3sigma_model_str(
+            "  CMT=1: DV ~ combined(S_PROP, S_ADD)\n  CMT=2: DV ~ additive(S_PD)",
+        ))
+        .unwrap()
+        .model;
+
+        match &model.error_spec {
+            ErrorSpec::PerCmt(map) => {
+                let c1 = map.get(&1).expect("CMT=1 present");
+                assert_eq!(c1.error_model, ErrorModel::Combined);
+                assert_eq!(c1.sigma_idx, vec![0, 1]); // S_PROP, S_ADD
+                let c2 = map.get(&2).expect("CMT=2 present");
+                assert_eq!(c2.error_model, ErrorModel::Additive);
+                assert_eq!(c2.sigma_idx, vec![2]); // S_PD
+            }
+            other => panic!("expected PerCmt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_per_cmt_endpoint_sigma_count_mismatch_rejected() {
+        // `combined` needs two sigmas; giving one must error at parse, not
+        // silently propagate NaN into the likelihood.
+        let err = expect_parse_err(&pkpd_3sigma_model_str(
+            "  CMT=1: DV ~ combined(S_PROP)\n  CMT=2: DV ~ additive(S_PD)",
+        ));
+        assert!(
+            err.contains("expects 2 sigma") || err.contains("2 sigma(s)"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn test_single_error_unknown_sigma_rejected() {
         // A single (unprefixed) error line that references a sigma not declared

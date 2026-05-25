@@ -590,6 +590,12 @@ fn fit_inner(
     // autodiff gradient path. Fail/warn early so users get a clear message
     // rather than a silent wrong result.
     if model.is_sde() {
+        // Note: a per-CMT (multi-endpoint) error model cannot reach the EKF
+        // path. Observing multiple compartments requires a Form C `y[CMT=N]`
+        // readout, which the parser already rejects on SDE models, so an SDE
+        // model is always single-endpoint here. The EKF residual-variance
+        // assumption (`ErrorSpec::Single`) is therefore safe — see the comment
+        // at the EKF call site in stats/likelihood.rs.
         if chain.iter().any(|&m| m == EstimationMethod::Saem) {
             return Err(
                 "method = saem is not compatible with a [diffusion] block. \

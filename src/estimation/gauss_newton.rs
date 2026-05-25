@@ -659,6 +659,18 @@ fn subject_nll_pop_grad_analytical(
 ) -> Option<(f64, Vec<f64>)> {
     use crate::pk;
 
+    // This analytical-gradient path dispatches the dr/dsigma terms on the
+    // single `model.error_model`. It is only ever entered for analytical PK
+    // models (`subject_nll_pop_grad` gates on `ode_spec.is_none()`), and
+    // per-CMT error models are ODE-only — so the error spec is always Single
+    // here and the representative error model is exact. The assert locks that
+    // invariant against future drift; ODE / per-CMT models take the FD path,
+    // which dispatches through `error_spec`.
+    debug_assert!(
+        matches!(model.error_spec, ErrorSpec::Single(_)),
+        "analytical GN gradient reached with a non-Single error spec"
+    );
+
     let n = x.len();
     let n_eta = model.n_eta;
     let n_theta = template.theta.len();
@@ -919,6 +931,18 @@ fn subject_nll_pop_grad_analytical_iov(
     options: &FitOptions,
 ) -> Option<(f64, Vec<f64>)> {
     use crate::pk;
+
+    // This analytical-gradient path dispatches the dr/dsigma terms on the
+    // single `model.error_model`. It is only ever entered for analytical PK
+    // models (`subject_nll_pop_grad` gates on `ode_spec.is_none()`), and
+    // per-CMT error models are ODE-only — so the error spec is always Single
+    // here and the representative error model is exact. The assert locks that
+    // invariant against future drift; ODE / per-CMT models take the FD path,
+    // which dispatches through `error_spec`.
+    debug_assert!(
+        matches!(model.error_spec, ErrorSpec::Single(_)),
+        "analytical GN gradient reached with a non-Single error spec"
+    );
 
     let n = x.len();
     let n_eta = model.n_eta;

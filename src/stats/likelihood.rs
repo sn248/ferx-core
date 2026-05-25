@@ -230,6 +230,15 @@ fn ekf_p_obs(
     }
 
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // EKF process-noise variance uses a single error model. This is sound: a
+    // per-CMT (multi-endpoint) error model needs a Form C `y[CMT=N]` readout to
+    // observe multiple compartments, and the parser rejects Form C on SDE
+    // models — so an SDE model is always `ErrorSpec::Single` and the
+    // representative `model.error_model` is exact here.
+    debug_assert!(
+        matches!(model.error_spec, ErrorSpec::Single(_)),
+        "EKF path reached with a non-Single error spec (per-CMT + SDE should be unreachable)"
+    );
     let error_model = model.error_model;
 
     // Temporarily shadow ode_spec with updated diffusion_var for this call.

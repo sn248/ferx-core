@@ -1278,6 +1278,12 @@ pub struct FitResult {
     /// Names of the sigma parameters, parallel to `sigma`.
     pub sigma_names: Vec<String>,
     /// Residual error model (additive, proportional, combined).
+    ///
+    /// For multi-endpoint (per-CMT) models this is only the *representative*
+    /// endpoint's error model; it does not describe the other endpoints.
+    /// `sigma_types` (parallel to `sigma`/`sigma_names`) carries the correct
+    /// per-sigma classification and should be preferred by consumers that need
+    /// to distinguish endpoints.
     pub error_model: ErrorModel,
     pub covariance_matrix: Option<DMatrix<f64>>,
     pub se_theta: Option<Vec<f64>>,

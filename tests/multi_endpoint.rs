@@ -132,6 +132,52 @@ fn per_cmt_error_missing_endpoint_is_rejected_at_fit() {
     assert!(err.contains('3'), "error should name missing CMT 3: {err}");
 }
 
+/// Per-CMT error models cannot be combined with a `[diffusion]` (SDE/EKF)
+/// block: observing multiple compartments needs a Form C `y[CMT=N]` readout,
+/// which the parser rejects on SDE models. So the multi-endpoint + SDE
+/// combination is unreachable at parse time (and the EKF path can soundly
+/// assume a single error model).
+#[test]
+fn per_cmt_readout_with_sde_is_rejected_at_parse() {
+    let sde_pkpd = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR_PK ~ 0.10 (sd)
+  sigma ADD_ERR_PD  ~ 0.50 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central, effect])
+
+[odes]
+  d/dt(central) = -CL/V * central
+  d/dt(effect)  =  central/V - effect
+
+[diffusion]
+  central ~ 0.5
+
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = effect
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_PK)
+  CMT=2: DV ~ additive(ADD_ERR_PD)
+";
+    let err = parse_model_string(sde_pkpd)
+        .err()
+        .expect("multi-CMT (Form C) readout on an SDE model must be rejected");
+    assert!(
+        err.contains("SDE") || err.to_lowercase().contains("diffusion"),
+        "error should cite the SDE restriction: {err}"
+    );
+}
+
 /// The shipped Emax PK/PD showcase parses into a two-endpoint per-CMT error
 /// spec (proportional PK on CMT=2 + additive PD on CMT=3).
 #[test]

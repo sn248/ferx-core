@@ -1693,6 +1693,40 @@ mod tests {
         );
     }
 
+    /// Regression for the co-temporal multi-CMT recorder bug: two observations
+    /// at the SAME time but different CMTs (simultaneous PK/PD sampling) must
+    /// BOTH be recorded. Before the fix, `obs_map` keyed by time alone kept
+    /// only one index per time and left the other observation at its initial
+    /// NaN.
+    #[test]
+    fn test_ode_predictions_records_cotemporal_multi_cmt() {
+        // CMT=1 reads the compartment amount; CMT=2 reads twice that — two
+        // distinct, finite readouts of the same single-state system, so we can
+        // confirm each observation got its own value (not one overwriting the
+        // other).
+        let mut map: HashMap<usize, OdeOutputFn> = HashMap::new();
+        map.insert(1, Box::new(|s: &[f64], _pk: &[f64], _t, _e, _c| s[0]));
+        map.insert(2, Box::new(|s: &[f64], _pk: &[f64], _t, _e, _c| 2.0 * s[0]));
+        let mut ode = one_cpt_ode_spec();
+        ode.readout = OdeReadout::PerCmt(map);
+
+        let pk = pk_one(5.0, 80.0);
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+        // Two obs at t=1 (CMT 1 and 2) and two at t=4 (CMT 1 and 2).
+        let mut subj = make_subject(doses, vec![1.0, 1.0, 4.0, 4.0]);
+        subj.obs_cmts = vec![1, 2, 1, 2];
+
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+
+        assert!(
+            preds.iter().all(|p| p.is_finite()),
+            "all co-temporal obs must be recorded (finite), got {preds:?}"
+        );
+        // CMT=2 readout is exactly twice CMT=1 at the same time.
+        assert!((preds[1] - 2.0 * preds[0]).abs() < 1e-9);
+        assert!((preds[3] - 2.0 * preds[2]).abs() < 1e-9);
+    }
+
     /// Regression for Copilot review on PR #84: pre-Phase-2 the ODE paths
     /// clamped NaN predictions to 0 at the end of `ode_predictions` (and
     /// at the Obs branch of `ode_predictions_event_driven`). That defeated

@@ -86,7 +86,7 @@ pub fn suggest_start_thorough(model: &CompiledModel, population: &Population) ->
         let idx_a = find_theta_for_slot(model, *slot_a);
         let idx_b = find_theta_for_slot(model, *slot_b);
         if let (Some(ia), Some(ib)) = (idx_a, idx_b) {
-            if remaining.contains(&ia) && remaining.contains(&ib) {
+            if ia != ib && remaining.contains(&ia) && remaining.contains(&ib) {
                 let (swept, w) = sweep_slots(
                     model,
                     population,

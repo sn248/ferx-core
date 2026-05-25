@@ -1,0 +1,28 @@
+# 1-cpt IV bolus model with non-standard theta names.
+#
+# Tests that suggest_start is independent of how the user names their TV
+# thetas: the slot lookup proceeds through mu_refs (ETA_CL → CLEARANCE,
+# ETA_V → DISTRIB) rather than relying on the theta names containing "CL" or "V".
+
+[parameters]
+  theta CLEARANCE(5.0, 0.1, 100.0)
+  theta DISTRIB(50.0, 1.0, 500.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = CLEARANCE * exp(ETA_CL)
+  V  = DISTRIB   * exp(ETA_V)
+
+[structural_model]
+  one_cpt_iv_bolus
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 300

@@ -154,6 +154,24 @@ fn suggest_start_comparison_all_models() {
             data_path: "data/three_cpt_iv.csv",
             truth: vec![("TVCL", 5.0), ("TVV1", 10.0)],
         },
+        // ── Name-independence & non-standard model types ─────────────────────
+        Case {
+            label: "1-cpt IV bolus (renamed: CLEARANCE/DISTRIB)",
+            model_path: "examples/one_cpt_iv_renamed.ferx",
+            data_path: "data/one_cpt_iv.csv",
+            // Thetas are named CLEARANCE and DISTRIB — find_theta_for_slot must
+            // resolve them through mu_refs rather than canonical name search.
+            truth: vec![("CLEARANCE", 5.0), ("DISTRIB", 50.0)],
+        },
+        Case {
+            label: "MM IV bolus (Michaelis-Menten, ODE)",
+            model_path: "examples/mm_iv.ferx",
+            data_path: "data/mm_iv.csv",
+            // VMAX and KM do not match any canonical PK slot name —
+            // Option A returns model defaults; Option B sweeps all thetas via
+            // 1D coordinate sweeps.  No CL/V ridge, so 1D sweeps are appropriate.
+            truth: vec![("TVVMAX", 5.0), ("TVKM", 2.0), ("TVV", 10.0)],
+        },
     ];
 
     for case in &cases {

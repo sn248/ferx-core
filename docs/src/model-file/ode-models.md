@@ -45,6 +45,60 @@ Expressions can reference:
   that aren't assigned in the firing branch this step receive a derivative
   of `0`.
 
+## Initial Compartment Amounts
+
+By default every compartment starts at zero, and drug enters only through dose
+records. To start a compartment at a non-zero amount — e.g. a pre-dose baseline
+for an indirect-response / turnover model — declare an initial condition in the
+`[odes]` block:
+
+```
+[odes]
+  init(state_name) = expression
+  d/dt(state_name) = expression
+```
+
+- The right-hand side is evaluated **once per subject** at the start of the
+  record and may reference individual parameters (and therefore folds in
+  `theta`, `eta`, and covariates through the `[individual_parameters]` layer).
+  State names referenced in an `init` expression are treated as `0` (no drug
+  is present yet).
+- Compartments without an `init(...)` line start at zero, as before.
+- This is the analogue of NONMEM's `A_0(n)`.
+
+**Time-varying covariates.** Because the initial condition is a pre-record
+baseline, it is evaluated a single time using the covariate values from the
+subject's **first record**. If a covariate that feeds the `init` expression
+changes later in the record, the initial amount is *not* re-evaluated — the
+later covariate values affect `d/dt(...)` going forward (the system evolves
+from the baseline), but the t=0 starting point is fixed by the first record's
+covariates. For most models this is exactly what you want, since the baseline
+represents the pre-dose steady state. If you need the starting amount to track
+a covariate value observed mid-record, model it as a state driven by `d/dt`
+rather than as an `init`.
+
+A turnover model whose response variable sits at its baseline `KIN/KOUT`
+before any perturbation:
+
+```
+[odes]
+  init(response) = KIN / KOUT
+  d/dt(response) = KIN - KOUT * response
+```
+
+**Interaction with system resets (EVID=3/4):** a reset re-applies the `init`
+expression to initialized compartments (returning them to baseline) and zeros
+all other compartments — so a reset behaves like the start of a fresh episode.
+See [Data Format](../data-format.md) for reset rows.
+
+Note one deliberate asymmetry with the start-of-record seeding described above:
+the re-applied baseline at a reset is evaluated with the covariate values in
+effect **at the reset time**, not the first record's. With time-varying
+covariates this means the post-reset baseline reflects the most recent
+covariate values — appropriate for a "fresh episode" that starts under current
+conditions — whereas the very first baseline uses the first record's
+covariates. For time-constant covariates the two are identical.
+
 ## Example: Michaelis-Menten Elimination
 
 A one-compartment oral model with saturable (Michaelis-Menten) elimination:

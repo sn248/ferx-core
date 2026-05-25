@@ -143,12 +143,14 @@ pub struct EkfObsPoint {
 /// Dose events are handled identically to `ode_predictions`: boluses add to
 /// state; infusions inject a rate term into the wrapped RHS. Covariance is
 /// reset to zero at initial time and propagated forward from there.
+#[allow(clippy::too_many_arguments)]
 pub fn solve_ekf(
     rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
     n_states: usize,
     obs_cmt_idx: usize,
     diffusion_var: &[f64],
     pk_params_flat: &[f64],
+    initial_state: &[f64],
     doses: &[DoseEvent],
     obs_times: &[f64],
     r_obs_vec: &[f64],
@@ -159,7 +161,14 @@ pub fn solve_ekf(
     let n_obs = obs_times.len();
     let opts = OdeSolverOptions::default();
 
-    let mut u = vec![0.0f64; n];
+    // Seed the EKF mean from the model's initial compartment amounts
+    // (`init(state) = expr`); zeros for models without an init block. The
+    // covariance still starts at zero — init sets the deterministic mean only.
+    let mut u = if initial_state.len() == n {
+        initial_state.to_vec()
+    } else {
+        vec![0.0f64; n]
+    };
     let mut p_mat = DMatrix::zeros(n, n);
     let mut results = vec![
         EkfObsPoint {
@@ -363,6 +372,7 @@ mod tests {
             0,
             &diffusion_var,
             &pk,
+            &[], // no init block in test: empty seeds zero state
             &doses,
             &obs_times,
             &r_obs_vec,
@@ -390,6 +400,7 @@ mod tests {
             state_names: vec!["central".into()],
             readout: crate::ode::OdeReadout::ObsCmt(0),
             diffusion_var: Vec::new(),
+            init_fn: None,
         };
         let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 
@@ -430,6 +441,7 @@ mod tests {
             0,
             &[sigma2_w],
             &pk,
+            &[], // no init block in test: empty seeds zero state
             &doses,
             &obs_times,
             &r_obs_vec,
@@ -456,6 +468,7 @@ mod tests {
             0,
             &[0.1],
             &pk,
+            &[], // no init block in test: empty seeds zero state
             &doses,
             &obs_times,
             &r_obs_vec,

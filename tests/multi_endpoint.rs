@@ -1,0 +1,147 @@
+//! Integration tests for multi-endpoint (per-CMT) residual error models —
+//! issue #14, simultaneous PK/PD fitting.
+//!
+//! These exercise the public parse/`fit()` boundary. Per-CMT *correctness*
+//! reduces to `ErrorSpec::variance_at` dispatching the right error model and
+//! sigma slice per observation (the FOCE likelihood accumulation around it is
+//! unchanged); that dispatch, plus `compute_r_diag`/`compute_iwres` and the
+//! parser, is covered by fast unit tests in `src/`. We deliberately do not run
+//! a full ODE PK/PD fit to convergence here: ODE fits are impractically heavy
+//! in the unoptimized test profile (the repo's other "slow" fit tests all use
+//! analytical models), so an end-to-end fit would add cost without exercising
+//! anything the unit tests don't already cover. The canonical nonlinear Emax
+//! showcase lives in `examples/emax_pkpd.ferx`.
+
+use ferx_core::parser::model_parser::{parse_model_file, parse_model_string};
+use ferx_core::types::{DoseEvent, ErrorSpec, Population, SigmaType, Subject};
+use ferx_core::{fit, EstimationMethod, FitOptions};
+use std::collections::HashMap;
+use std::path::Path;
+
+/// Small linear-ODE PK/PD model: central compartment (PK, CMT=1, proportional
+/// error) plus a biophase effect compartment (PD, CMT=2, additive error).
+const LINEAR_PKPD: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TVKE0(0.5, 0.05, 5.0)
+
+  omega ETA_CL ~ 0.04
+
+  sigma PROP_ERR_PK ~ 0.10 (sd)
+  sigma ADD_ERR_PD  ~ 0.50 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KE0 = TVKE0
+
+[structural_model]
+  ode(states=[central, effect])
+
+[odes]
+  d/dt(central) = -CL/V * central
+  d/dt(effect)  =  KE0 * (central/V - effect)
+
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = effect
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_PK)
+  CMT=2: DV ~ additive(ADD_ERR_PD)
+
+[fit_options]
+  method   = focei
+  gradient = fd
+";
+
+/// One subject observed on CMT=1 (PK) and CMT=2 (PD) at three times each.
+fn pkpd_pop() -> Population {
+    let times = vec![1.0, 1.0, 2.0, 2.0, 4.0, 4.0];
+    let cmts = vec![1, 2, 1, 2, 1, 2];
+    let n = times.len();
+    Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        subjects: vec![Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: times,
+            observations: vec![8.0, 1.0, 6.0, 2.0, 4.0, 3.0],
+            obs_cmts: cmts,
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+        }],
+    }
+}
+
+#[test]
+fn linear_pkpd_parses_to_per_cmt_error_spec() {
+    let model = parse_model_string(LINEAR_PKPD).expect("linear PK/PD model must parse");
+    match &model.error_spec {
+        ErrorSpec::PerCmt(map) => {
+            assert_eq!(map.len(), 2);
+            assert!(map.contains_key(&1) && map.contains_key(&2));
+        }
+        other => panic!("expected PerCmt error spec, got {other:?}"),
+    }
+    // sigma_types maps each global sigma slot to its endpoint's type.
+    let types = model.error_spec.sigma_types(2);
+    assert!(types.contains(&SigmaType::Proportional));
+    assert!(types.contains(&SigmaType::Additive));
+}
+
+/// SAEM is rejected up front for per-CMT error models (Phase 1 restriction):
+/// its analytical M-step gradient assumes a single error model. This exercises
+/// the `fit()` boundary and returns immediately with an `Err`.
+#[test]
+fn per_cmt_error_with_saem_is_rejected() {
+    let model = parse_model_string(LINEAR_PKPD).expect("model parses");
+    let pop = pkpd_pop();
+
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::Saem;
+    opts.verbose = false;
+
+    let err = fit(&model, &pop, &model.default_params, &opts)
+        .expect_err("SAEM + per-CMT error model must be rejected");
+    assert!(err.contains("saem"), "error should mention saem: {err}");
+}
+
+/// A model observing a CMT with no matching `CMT=N:` error entry is rejected
+/// at `fit()` entry (coverage validation), naming the missing compartment.
+#[test]
+fn per_cmt_error_missing_endpoint_is_rejected_at_fit() {
+    let model = parse_model_string(LINEAR_PKPD).expect("model parses");
+    // Population observes CMT=3, which has no endpoint (model covers 1 and 2).
+    let mut pop = pkpd_pop();
+    pop.subjects[0].obs_cmts = vec![1, 2, 1, 2, 1, 3];
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let err = fit(&model, &pop, &model.default_params, &opts)
+        .expect_err("observed CMT with no error endpoint must be rejected");
+    assert!(err.contains('3'), "error should name missing CMT 3: {err}");
+}
+
+/// The shipped Emax PK/PD showcase parses into a two-endpoint per-CMT error
+/// spec (proportional PK on CMT=2 + additive PD on CMT=3).
+#[test]
+fn emax_example_parses_to_per_cmt_error_spec() {
+    let model = parse_model_file(Path::new("examples/emax_pkpd.ferx"))
+        .expect("emax_pkpd example must parse");
+    match &model.error_spec {
+        ErrorSpec::PerCmt(map) => {
+            assert!(map.contains_key(&2) && map.contains_key(&3));
+        }
+        other => panic!("expected PerCmt error spec, got {other:?}"),
+    }
+}

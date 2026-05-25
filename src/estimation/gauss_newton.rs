@@ -680,7 +680,12 @@ fn subject_nll_pop_grad_analytical(
 
     // r_diag: at f0 (standard) or at ipreds (interaction)
     let r_pred_point: &[f64] = if options.interaction { &ipreds } else { &f0 };
-    let r_diag = compute_r_diag(model.error_model, r_pred_point, &params.sigma.values);
+    let r_diag = compute_r_diag(
+        &model.error_spec,
+        r_pred_point,
+        &subject.obs_cmts,
+        &params.sigma.values,
+    );
 
     let r_tilde = compute_r_tilde(h_matrix, &params.omega.matrix, &r_diag);
     let chol = r_tilde.cholesky()?;
@@ -949,7 +954,12 @@ fn subject_nll_pop_grad_analytical_iov(
         .collect();
 
     let r_pred_point: &[f64] = if options.interaction { &ipreds } else { &f0 };
-    let r_diag = compute_r_diag(model.error_model, r_pred_point, &params.sigma.values);
+    let r_diag = compute_r_diag(
+        &model.error_spec,
+        r_pred_point,
+        &subject.obs_cmts,
+        &params.sigma.values,
+    );
     let r_tilde = compute_r_tilde(h_matrix, &params.omega.matrix, &r_diag);
     let chol = r_tilde.cholesky()?;
     let chol_l = chol.l();
@@ -1411,7 +1421,7 @@ fn subject_nll_at(
             h_matrix,
             &params.omega,
             &params.sigma.values,
-            model.error_model,
+            &model.error_spec,
             model.bloq_method,
             &[],
         )
@@ -1423,7 +1433,7 @@ fn subject_nll_at(
             h_matrix,
             &params.omega,
             &params.sigma.values,
-            model.error_model,
+            &model.error_spec,
             model.bloq_method,
             &[],
         )
@@ -1463,6 +1473,7 @@ mod tests {
             name: "gn_test".into(),
             pk_model: PkModel::OneCptIvBolus,
             error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp(); // CL
@@ -2107,6 +2118,7 @@ mod tests {
             name: "iov_gn_test".into(),
             pk_model: PkModel::OneCptIvBolus,
             error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 // eta[0] = bsv_eta, eta[1] = kappa (combined vector from inner optimizer)

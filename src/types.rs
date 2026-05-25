@@ -565,6 +565,100 @@ impl ErrorModel {
             ErrorModel::Combined => vec![SigmaType::Proportional, SigmaType::Additive],
         }
     }
+
+    /// Number of sigma parameters this error model consumes.
+    pub fn n_sigma(self) -> usize {
+        match self {
+            ErrorModel::Additive | ErrorModel::Proportional => 1,
+            ErrorModel::Combined => 2,
+        }
+    }
+}
+
+/// Residual error specification for a model.
+///
+/// `Single` applies one error model to every observation (the default and the
+/// only form analytical-PK models support). `PerCmt` dispatches a distinct
+/// error model per observed compartment — the multi-endpoint / simultaneous
+/// PK-PD case (issue #14). The map key is the 1-based CMT index from the data
+/// file's CMT column, matching `subject.obs_cmts[i]`.
+#[derive(Debug, Clone)]
+pub enum ErrorSpec {
+    /// One error model for all observations.
+    Single(ErrorModel),
+    /// Per-CMT error models. Each endpoint carries its own `ErrorModel` and the
+    /// indices into the flat global `sigma.values` vector that supply its
+    /// sigmas (declaration order in the `[parameters]` block).
+    PerCmt(HashMap<usize, EndpointError>),
+}
+
+impl Default for ErrorSpec {
+    fn default() -> Self {
+        ErrorSpec::Single(ErrorModel::Additive)
+    }
+}
+
+impl ErrorSpec {
+    /// Residual variance for one observation, dispatching on its compartment.
+    ///
+    /// For `Single` the `cmt` is ignored and the full `sigma` slice is used
+    /// (the back-compat path). For `PerCmt` the endpoint registered for `cmt`
+    /// selects the error model and slices `sigma` by its `sigma_idx`. A CMT
+    /// with no registered endpoint yields a NaN variance — a defensive guard
+    /// mirroring the scaling path; fit-time validation rejects that case up
+    /// front, so it is only reachable via a hand-constructed `CompiledModel`.
+    /// `SigmaType` for each entry of the flat global sigma vector (length
+    /// `n_sigma`), so `FitResult` can label/scale each sigma correctly.
+    ///
+    /// For `Single` this is just the model's own sigma types. For `PerCmt`
+    /// each endpoint stamps the type of every sigma index it owns; any sigma
+    /// declared but not referenced by an endpoint defaults to `Additive`.
+    pub fn sigma_types(&self, n_sigma: usize) -> Vec<SigmaType> {
+        match self {
+            ErrorSpec::Single(em) => em.sigma_types(),
+            ErrorSpec::PerCmt(map) => {
+                let mut out = vec![SigmaType::Additive; n_sigma];
+                for ep in map.values() {
+                    let types = ep.error_model.sigma_types();
+                    for (k, &idx) in ep.sigma_idx.iter().enumerate() {
+                        if idx < out.len() {
+                            out[idx] = types[k];
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
+        use crate::stats::residual_error::residual_variance;
+        match self {
+            ErrorSpec::Single(em) => residual_variance(*em, f_pred, sigma),
+            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
+                Some(ep) => {
+                    // At most two sigmas (Combined); avoid a heap allocation in
+                    // this per-observation hot path.
+                    let mut buf = [0.0f64; 2];
+                    let n = ep.sigma_idx.len().min(2);
+                    for (k, &i) in ep.sigma_idx.iter().take(2).enumerate() {
+                        buf[k] = sigma[i];
+                    }
+                    residual_variance(ep.error_model, f_pred, &buf[..n])
+                }
+                None => f64::NAN,
+            },
+        }
+    }
+}
+
+/// One endpoint of a multi-endpoint (`ErrorSpec::PerCmt`) residual error model.
+#[derive(Debug, Clone)]
+pub struct EndpointError {
+    pub error_model: ErrorModel,
+    /// Positions into the flat global `sigma.values` supplying this endpoint's
+    /// sigmas. Length equals `error_model.n_sigma()`.
+    pub sigma_idx: Vec<usize>,
 }
 
 /// Transformation applied to a theta on the natural scale.
@@ -817,6 +911,10 @@ pub struct CompiledModel {
     pub name: String,
     pub pk_model: PkModel,
     pub error_model: ErrorModel,
+    /// Residual error specification. For single-endpoint models this is
+    /// `ErrorSpec::Single(error_model)`; for multi-endpoint models it carries
+    /// the per-CMT dispatch and `error_model` holds a representative endpoint.
+    pub error_spec: ErrorSpec,
     pub pk_param_fn: PkParamFn,
     pub n_theta: usize,
     /// Number of between-subject variability (BSV) ETAs.
@@ -1048,6 +1146,13 @@ impl CompiledModel {
             u == "LAGTIME" || u == "ALAG"
         })
     }
+
+    /// Residual variance for one observation, dispatching on its compartment.
+    /// Thin convenience wrapper over [`ErrorSpec::variance_at`] for call sites
+    /// that already hold the `&CompiledModel`.
+    pub fn residual_variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
+        self.error_spec.variance_at(cmt, f_pred, sigma)
+    }
 }
 
 impl std::fmt::Debug for CompiledModel {
@@ -1056,6 +1161,7 @@ impl std::fmt::Debug for CompiledModel {
             .field("name", &self.name)
             .field("pk_model", &self.pk_model)
             .field("error_model", &self.error_model)
+            .field("error_spec", &self.error_spec)
             .field("n_theta", &self.n_theta)
             .field("n_eta", &self.n_eta)
             .field("n_kappa", &self.n_kappa)
@@ -1834,6 +1940,7 @@ pub(crate) mod test_helpers {
             name: "test".into(),
             pk_model: PkModel::OneCptOral,
             error_model: ErrorModel::Additive,
+            error_spec: ErrorSpec::Single(ErrorModel::Additive),
             pk_param_fn: Box::new(|_, _, _| PkParams::default()),
             n_theta: 1,
             n_eta: 1,
@@ -1915,6 +2022,70 @@ mod tests {
     fn is_ode_based_true_for_ode() {
         let m = test_helpers::ode_model(GradientMethod::Auto);
         assert!(m.is_ode_based());
+    }
+
+    #[test]
+    fn error_spec_single_ignores_cmt() {
+        let spec = ErrorSpec::Single(ErrorModel::Proportional);
+        // Proportional: V = (f * sigma)^2 = (10 * 0.1)^2 = 1.0, regardless of CMT.
+        assert!((spec.variance_at(1, 10.0, &[0.1]) - 1.0).abs() < 1e-12);
+        assert!((spec.variance_at(7, 10.0, &[0.1]) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn error_spec_per_cmt_dispatches_model_and_sigma_slice() {
+        // Flat sigma vector [prop_pk, add_pd]; CMT=2 uses idx 0 (proportional),
+        // CMT=3 uses idx 1 (additive).
+        let mut map = HashMap::new();
+        map.insert(
+            2,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![0],
+            },
+        );
+        map.insert(
+            3,
+            EndpointError {
+                error_model: ErrorModel::Additive,
+                sigma_idx: vec![1],
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        let sigma = [0.1, 2.0];
+
+        // CMT=2 proportional: (10 * 0.1)^2 = 1.0 (independent of additive sigma).
+        assert!((spec.variance_at(2, 10.0, &sigma) - 1.0).abs() < 1e-12);
+        // CMT=3 additive: 2.0^2 = 4.0 (independent of prediction).
+        assert!((spec.variance_at(3, 10.0, &sigma) - 4.0).abs() < 1e-12);
+        assert!((spec.variance_at(3, 999.0, &sigma) - 4.0).abs() < 1e-12);
+
+        // Unregistered CMT → NaN guard.
+        assert!(spec.variance_at(1, 10.0, &sigma).is_nan());
+    }
+
+    #[test]
+    fn error_spec_per_cmt_sigma_types_maps_each_slot() {
+        let mut map = HashMap::new();
+        map.insert(
+            2,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![0],
+            },
+        );
+        map.insert(
+            3,
+            EndpointError {
+                error_model: ErrorModel::Additive,
+                sigma_idx: vec![1],
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        assert_eq!(
+            spec.sigma_types(2),
+            vec![SigmaType::Proportional, SigmaType::Additive]
+        );
     }
 
     #[test]

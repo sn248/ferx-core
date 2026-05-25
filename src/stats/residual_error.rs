@@ -1,4 +1,4 @@
-use crate::types::{ErrorModel, SubjectResult};
+use crate::types::{ErrorModel, ErrorSpec, SubjectResult};
 
 const MIN_VARIANCE: f64 = 1e-12;
 
@@ -24,11 +24,20 @@ pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f
     v.max(MIN_VARIANCE)
 }
 
-/// Compute the R diagonal (vector of residual variances for all observations)
-pub fn compute_r_diag(error_model: ErrorModel, ipreds: &[f64], sigma_values: &[f64]) -> Vec<f64> {
+/// Compute the R diagonal (vector of residual variances for all observations),
+/// dispatching the error model per observation by compartment. `obs_cmts` is
+/// parallel to `ipreds` (`subject.obs_cmts`); for single-endpoint models the
+/// CMT is ignored.
+pub fn compute_r_diag(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    sigma_values: &[f64],
+) -> Vec<f64> {
     ipreds
         .iter()
-        .map(|&f| residual_variance(error_model, f, sigma_values))
+        .zip(obs_cmts.iter())
+        .map(|(&f, &cmt)| error_spec.variance_at(cmt, f, sigma_values))
         .collect()
 }
 
@@ -38,17 +47,23 @@ pub fn iwres(obs: f64, ipred: f64, error_model: ErrorModel, sigma_values: &[f64]
     (obs - ipred) / v.sqrt()
 }
 
-/// Compute IWRES for all observations
+/// Compute IWRES for all observations, dispatching the error model per
+/// observation by compartment (`obs_cmts` parallel to `observations`/`ipreds`).
 pub fn compute_iwres(
     observations: &[f64],
     ipreds: &[f64],
-    error_model: ErrorModel,
+    obs_cmts: &[usize],
+    error_spec: &ErrorSpec,
     sigma_values: &[f64],
 ) -> Vec<f64> {
     observations
         .iter()
         .zip(ipreds.iter())
-        .map(|(&y, &f)| iwres(y, f, error_model, sigma_values))
+        .zip(obs_cmts.iter())
+        .map(|((&y, &f), &cmt)| {
+            let v = error_spec.variance_at(cmt, f, sigma_values);
+            (y - f) / v.sqrt()
+        })
         .collect()
 }
 
@@ -126,6 +141,7 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::GradientMethod;
     use approx::assert_relative_eq;
 
     #[test]
@@ -184,16 +200,25 @@ mod tests {
 
     #[test]
     fn test_compute_r_diag_length() {
+        // Single-endpoint model (Additive): CMT is ignored.
+        let model = crate::types::test_helpers::analytical_model(GradientMethod::Auto);
         let ipreds = vec![1.0, 2.0, 3.0];
-        let r = compute_r_diag(ErrorModel::Additive, &ipreds, &[0.5]);
+        let obs_cmts = vec![1, 1, 1];
+        let r = compute_r_diag(&model.error_spec, &ipreds, &obs_cmts, &[0.5]);
         assert_eq!(r.len(), 3);
+        // Additive variance is sigma^2 regardless of prediction/CMT.
+        for v in &r {
+            assert_relative_eq!(*v, 0.25, epsilon = 1e-12);
+        }
     }
 
     #[test]
     fn test_compute_iwres_vectorized() {
+        let model = crate::types::test_helpers::analytical_model(GradientMethod::Auto);
         let obs = vec![12.0, 22.0];
         let ipreds = vec![10.0, 20.0];
-        let result = compute_iwres(&obs, &ipreds, ErrorModel::Additive, &[1.0]);
+        let obs_cmts = vec![1, 1];
+        let result = compute_iwres(&obs, &ipreds, &obs_cmts, &model.error_spec, &[1.0]);
         assert_eq!(result.len(), 2);
         assert_relative_eq!(result[0], 2.0, epsilon = 1e-12);
         assert_relative_eq!(result[1], 2.0, epsilon = 1e-12);

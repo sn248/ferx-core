@@ -1,10 +1,7 @@
 # Three-compartment IV bolus PK model (ODE)
 #
-# ODE equivalent of three_cpt_iv.ferx — same data, same true parameters.
-# States:
-#   CMT=1  central     — concentration (mg/L)
-#   CMT=2  peripheral1 — concentration (mg/L)
-#   CMT=3  peripheral2 — concentration (mg/L)
+# ODE equivalent of three_cpt_iv.ferx. States held as amounts (mg); dose adds
+# directly to central. [scaling] converts central to concentration.
 
 [parameters]
   theta TVCL(5.0,  0.1, 100.0)
@@ -28,12 +25,15 @@
   V3 = TVV3
 
 [structural_model]
-  ode(obs_cmt=central, states=[central, peripheral1, peripheral2])
+  ode(states=[central, peripheral1, peripheral2])
 
 [odes]
   d/dt(central)     = -(CL/V1)*central - (Q2/V1)*central + (Q2/V2)*peripheral1 - (Q3/V1)*central + (Q3/V3)*peripheral2
   d/dt(peripheral1) =  (Q2/V1)*central - (Q2/V2)*peripheral1
   d/dt(peripheral2) =  (Q3/V1)*central - (Q3/V3)*peripheral2
+
+[scaling]
+  y = central / V1
 
 [error_model]
   DV ~ proportional(PROP_ERR)

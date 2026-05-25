@@ -1,8 +1,7 @@
 # One-compartment IV bolus PK model (ODE)
 #
-# ODE equivalent of one_cpt_iv.ferx — same data, same true parameters.
-# Demonstrates that suggest_start skips NCA for ODE models and falls back
-# to suggest_start_thorough for rRMSE-based sweep.
+# ODE equivalent of one_cpt_iv.ferx. State held as amount (mg); dose adds
+# directly. [scaling] converts to concentration for the observation.
 
 [parameters]
   theta TVCL(4.0,  0.1, 100.0)
@@ -18,10 +17,13 @@
   V  = TVV  * exp(ETA_V)
 
 [structural_model]
-  ode(obs_cmt=central, states=[central])
+  ode(states=[central])
 
 [odes]
   d/dt(central) = -(CL/V) * central
+
+[scaling]
+  y = central / V
 
 [error_model]
   DV ~ proportional(PROP_ERR)

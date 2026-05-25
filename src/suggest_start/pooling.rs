@@ -21,37 +21,24 @@ pub struct PopNca {
     pub v2_peel: Option<f64>,
 }
 
+/// Minimum number of subjects needed for a pooled parameter estimate to be trusted.
+const MIN_SUBJECTS: usize = 3;
+
+fn geomean_min_n(iter: impl Iterator<Item = f64>) -> Option<f64> {
+    let vals: Vec<f64> = iter.filter(|&v| v > 0.0 && v.is_finite()).collect();
+    if vals.len() < MIN_SUBJECTS {
+        None
+    } else {
+        geomean(vals.into_iter())
+    }
+}
+
 pub fn pool_nca(subjects: &[SubjectNca]) -> PopNca {
-    let cl_f = geomean(
-        subjects
-            .iter()
-            .filter_map(|s| s.cl_f)
-            .filter(|&v| v > 0.0 && v.is_finite()),
-    );
-    let v_f = geomean(
-        subjects
-            .iter()
-            .filter_map(|s| s.v_f)
-            .filter(|&v| v > 0.0 && v.is_finite()),
-    );
-    let vss = geomean(
-        subjects
-            .iter()
-            .filter_map(|s| s.vss)
-            .filter(|&v| v > 0.0 && v.is_finite()),
-    );
-    let lambda_z = geomean(
-        subjects
-            .iter()
-            .filter_map(|s| s.lambda_z)
-            .filter(|&v| v > 0.0 && v.is_finite()),
-    );
-    let ka = geomean(
-        subjects
-            .iter()
-            .filter_map(|s| s.ka)
-            .filter(|&v| v > 0.0 && v.is_finite()),
-    );
+    let cl_f = geomean_min_n(subjects.iter().filter_map(|s| s.cl_f));
+    let v_f = geomean_min_n(subjects.iter().filter_map(|s| s.v_f));
+    let vss = geomean_min_n(subjects.iter().filter_map(|s| s.vss));
+    let lambda_z = geomean_min_n(subjects.iter().filter_map(|s| s.lambda_z));
+    let ka = geomean_min_n(subjects.iter().filter_map(|s| s.ka));
     let c0 = geomean(
         subjects
             .iter()

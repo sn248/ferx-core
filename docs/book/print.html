@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-40ceb56f.js";
+            window.path_to_searchindex_js = "searchindex-e22b85ff.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-39f227ad.js"></script>
@@ -1448,9 +1448,8 @@ lines is rejected at parse time.</li>
 <li><strong>Coverage is checked at fit time.</strong> Every observed <code>CMT</code> in the dataset must
 have a matching <code>CMT=N:</code> entry, or <code>fit()</code> errors and names the missing
 compartments. Duplicate <code>CMT=N</code> entries are rejected at parse time.</li>
-<li><strong>Estimation method.</strong> Supported with FOCE/FOCEI and the Gauss-Newton
-optimizers (optionally followed by <code>imp</code>). <code>method = saem</code> is <strong>not</strong> supported
-with per-CMT error models in this release.</li>
+<li><strong>Estimation method.</strong> Supported with FOCE/FOCEI, the Gauss-Newton
+optimizers, and SAEM (optionally followed by <code>imp</code>).</li>
 </ul>
 <p>A complete worked model lives in <a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/emax_pkpd.ferx"><code>examples/emax_pkpd.ferx</code></a>
 — an oral 1-compartment PK model with an effect-compartment Emax PD readout,

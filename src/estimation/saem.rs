@@ -14,7 +14,6 @@ use crate::stats::likelihood::{
     individual_nll, individual_nll_into, individual_nll_iov, obs_nll_subject_into,
     split_obs_by_occasion,
 };
-use crate::stats::residual_error::residual_variance;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::prelude::*;
@@ -260,9 +259,9 @@ fn obs_nll_subject_into_iov(
             // (the E-step evaluator) does not floor — see obs_nll_subject_grad_iov
             // for why the asymmetry is intentional.
             let f = preds[j].max(1e-12);
-            let v =
-                crate::stats::residual_error::residual_variance(model.error_model, f, sigma_values)
-                    .max(1e-12);
+            let v = model
+                .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
+                .max(1e-12);
             if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
                 let z = (subject.observations[j] - f) / v.sqrt();
                 total_nll += -log_normal_cdf(z);
@@ -357,21 +356,15 @@ fn obs_nll_subject_grad_iov(
             model, subject, theta, &combined, pk_scratch,
         );
         for &j in obs_indices {
+            let cmt = subject.obs_cmts[j];
             let f = preds[j].max(1e-12);
-            let v =
-                crate::stats::residual_error::residual_variance(model.error_model, f, sigma_values)
-                    .max(1e-12);
+            let v = model.residual_variance_at(cmt, f, sigma_values).max(1e-12);
             let resid = subject.observations[j] - f;
             nll_base += 0.5 * (v.ln() + resid * resid / v);
             all_preds_base[j] = f;
             residuals[j] = resid;
             variances[j] = v;
-            let dv_df = match model.error_model {
-                ErrorModel::Additive => 0.0,
-                ErrorModel::Proportional | ErrorModel::Combined => {
-                    2.0 * f * sigma_values[0] * sigma_values[0]
-                }
-            };
+            let dv_df = model.error_spec.dvar_df(cmt, f, sigma_values);
             d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
         }
     }
@@ -423,23 +416,18 @@ fn obs_nll_subject_grad_iov(
         if lower[i] == upper[i] {
             continue;
         }
-        let s = sigma_values[k];
         let g: f64 = (0..n_obs)
             .map(|j| {
                 let f = all_preds_base[j];
                 let v = variances[j];
                 let resid = residuals[j];
-                let ratio = match model.error_model {
-                    ErrorModel::Additive => 2.0 * s * s,
-                    ErrorModel::Proportional => 2.0 * s * s * f * f,
-                    ErrorModel::Combined => {
-                        if k == 0 {
-                            2.0 * s * s * f * f
-                        } else {
-                            2.0 * s * s
-                        }
-                    }
-                };
+                // d(v_j)/d(log sigma_k); zero unless sigma_k enters obs j's
+                // endpoint, so per-CMT each sigma picks up only its own
+                // endpoint's observations.
+                let ratio =
+                    model
+                        .error_spec
+                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values);
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
@@ -743,19 +731,15 @@ fn obs_nll_subject_grad(
     let mut d_nll_d_f = vec![0.0f64; n_obs];
 
     for j in 0..n_obs {
+        let cmt = subject.obs_cmts[j];
         let f = preds_base[j].max(1e-12);
-        let v = residual_variance(model.error_model, f, sigma_values).max(1e-12);
+        let v = model.residual_variance_at(cmt, f, sigma_values).max(1e-12);
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
         residuals[j] = resid;
         variances[j] = v;
         // d(obs_nll_j)/d(f_j) = -resid/V + 0.5 * (dV/df) * (1/V - resid²/V²)
-        let dv_df = match model.error_model {
-            ErrorModel::Additive => 0.0,
-            ErrorModel::Proportional | ErrorModel::Combined => {
-                2.0 * f * sigma_values[0] * sigma_values[0]
-            }
-        };
+        let dv_df = model.error_spec.dvar_df(cmt, f, sigma_values);
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
 
@@ -795,24 +779,18 @@ fn obs_nll_subject_grad(
         if lower[i] == upper[i] {
             continue;
         }
-        let s = sigma_values[k];
         let g: f64 = (0..n_obs)
             .map(|j| {
                 let f = preds_base[j].max(1e-12);
                 let v = variances[j];
                 let resid = residuals[j];
-                // ratio = sigma_k * dV/d(sigma_k)
-                let ratio = match model.error_model {
-                    ErrorModel::Additive => 2.0 * s * s,             // = 2V
-                    ErrorModel::Proportional => 2.0 * s * s * f * f, // = 2V
-                    ErrorModel::Combined => {
-                        if k == 0 {
-                            2.0 * s * s * f * f
-                        } else {
-                            2.0 * s * s
-                        }
-                    }
-                };
+                // ratio = d(V_j)/d(log sigma_k); zero unless sigma_k enters
+                // obs j's endpoint (so per-CMT each sigma sums only over its
+                // own endpoint's observations).
+                let ratio =
+                    model
+                        .error_spec
+                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values);
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
@@ -2210,6 +2188,151 @@ mod tests {
             assert!(
                 rel < 1e-4,
                 "grad[{j}]: obs_nll_subject_grad={:.6e}, ref={:.6e}, rel={:.2e}",
+                total_grad[j],
+                ref_grad[j],
+                rel
+            );
+        }
+    }
+
+    /// Per-CMT (multi-endpoint) M-step gradient must match the forward-FD of
+    /// `obs_nll_sum` — the correctness gate for the per-CMT `dvar_df` /
+    /// `dvar_dlogsigma` score terms. Two endpoints with *different* error
+    /// models (proportional PK on CMT=1, additive PD on CMT=2) so a single
+    /// error model would give the wrong Jacobian for one endpoint.
+    #[test]
+    fn obs_nll_subject_grad_per_cmt_matches_fd() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{DoseEvent, Population};
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TVKE0(0.5, 0.05, 5.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR_PK ~ 0.10 (sd)
+  sigma ADD_ERR_PD  ~ 0.50 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KE0 = TVKE0
+
+[structural_model]
+  ode(states=[central, effect])
+
+[odes]
+  d/dt(central) = -CL/V * central
+  d/dt(effect)  =  KE0 * (central/V - effect)
+
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = effect
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_PK)
+  CMT=2: DV ~ additive(ADD_ERR_PD)
+",
+        )
+        .expect("per-CMT ODE model parses");
+
+        // obs at CMT=1 (PK) and CMT=2 (PD), interleaved.
+        let make_subj = |id: &str, scale: f64| Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 1.0, 2.0, 2.0, 4.0, 4.0],
+            observations: vec![
+                8.0 * scale,
+                2.0 * scale,
+                6.0 * scale,
+                3.0 * scale,
+                4.0 * scale,
+                3.5 * scale,
+            ],
+            obs_cmts: vec![1, 2, 1, 2, 1, 2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 6],
+            occasions: vec![],
+            dose_occasions: vec![],
+        };
+        let population = Population {
+            subjects: vec![make_subj("1", 1.0), make_subj("2", 1.1)],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+        };
+
+        let theta = vec![1.0f64, 10.0, 0.5];
+        let sigma_values = vec![0.10f64, 0.50];
+        let etas: Vec<Vec<f64>> = vec![vec![0.0], vec![0.05]];
+        let n_theta = 3;
+        let n_sigma = 2;
+        let n = n_theta + n_sigma;
+
+        // Reference gradient: forward-FD of obs_nll_sum, in log-packed space.
+        let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas);
+        let h = 1e-6;
+        let mut ref_grad = vec![0.0f64; n];
+        for i in 0..n_theta {
+            let mut tp = theta.clone();
+            tp[i] += h;
+            let fp = obs_nll_sum(&model, &population, &tp, &sigma_values, &etas);
+            ref_grad[i] = theta[i] * (fp - f0) / h;
+        }
+        for k in 0..n_sigma {
+            let mut sp = sigma_values.clone();
+            sp[k] += h;
+            let fp = obs_nll_sum(&model, &population, &theta, &sp, &etas);
+            ref_grad[n_theta + k] = sigma_values[k] * (fp - f0) / h;
+        }
+
+        // Analytical gradient: sum of per-subject obs_nll_subject_grad.
+        let mask = vec![true; n_theta];
+        let lo = vec![-1e30f64; n];
+        let hi = vec![1e30f64; n];
+        let mut total_nll = 0.0f64;
+        let mut total_grad = vec![0.0f64; n];
+        let mut scratch = EventPkParams::default();
+        for (i, subject) in population.subjects.iter().enumerate() {
+            let (nll_i, grad_i) = obs_nll_subject_grad(
+                &model,
+                subject,
+                &theta,
+                &sigma_values,
+                &etas[i],
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
+                &mut scratch,
+            );
+            total_nll += nll_i;
+            for (g, gi) in total_grad.iter_mut().zip(grad_i.iter()) {
+                *g += gi;
+            }
+        }
+
+        assert!(
+            (total_nll - f0).abs() < 1e-8,
+            "nll mismatch: {total_nll} vs {f0}"
+        );
+        for j in 0..n {
+            let rel = if ref_grad[j].abs() > 1e-8 {
+                (total_grad[j] - ref_grad[j]).abs() / ref_grad[j].abs()
+            } else {
+                (total_grad[j] - ref_grad[j]).abs()
+            };
+            assert!(
+                rel < 1e-3,
+                "per-CMT grad[{j}]: analytical={:.6e}, fd={:.6e}, rel={:.2e}",
                 total_grad[j],
                 ref_grad[j],
                 rel

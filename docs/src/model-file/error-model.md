@@ -85,9 +85,8 @@ Rules and restrictions:
 - **Coverage is checked at fit time.** Every observed `CMT` in the dataset must
   have a matching `CMT=N:` entry, or `fit()` errors and names the missing
   compartments. Duplicate `CMT=N` entries are rejected at parse time.
-- **Estimation method.** Supported with FOCE/FOCEI and the Gauss-Newton
-  optimizers (optionally followed by `imp`). `method = saem` is **not** supported
-  with per-CMT error models in this release.
+- **Estimation method.** Supported with FOCE/FOCEI, the Gauss-Newton
+  optimizers, and SAEM (optionally followed by `imp`).
 
 A complete worked model lives in [`examples/emax_pkpd.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/emax_pkpd.ferx)
 — an oral 1-compartment PK model with an effect-compartment Emax PD readout,

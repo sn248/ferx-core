@@ -631,6 +631,66 @@ impl ErrorSpec {
         out
     }
 
+    /// `d(residual variance)/d(prediction f)` for one observation at `cmt`.
+    ///
+    /// The score term the SAEM M-step needs alongside the variance. Additive
+    /// endpoints contribute 0; proportional/combined endpoints contribute
+    /// `2·f·σ_prop²` (σ_prop is the endpoint's proportional sigma, which is the
+    /// first sigma for both `Proportional` and `Combined`). `Single` ignores
+    /// `cmt`; `PerCmt` dispatches on the endpoint registered for `cmt`.
+    pub fn dvar_df(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
+        let (em, prop_sigma) = match self {
+            ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
+            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
+                Some(ep) => (
+                    ep.error_model,
+                    ep.sigma_idx
+                        .first()
+                        .and_then(|&i| sigma.get(i))
+                        .copied()
+                        .unwrap_or(0.0),
+                ),
+                None => return 0.0,
+            },
+        };
+        match em {
+            ErrorModel::Additive => 0.0,
+            ErrorModel::Proportional | ErrorModel::Combined => 2.0 * f * prop_sigma * prop_sigma,
+        }
+    }
+
+    /// `d(residual variance)/d(log σ_k)` for one observation at `cmt`, where
+    /// `k` indexes the flat global sigma vector. Zero when `σ_k` does not enter
+    /// this observation's endpoint, so the SAEM sigma-gradient can sum this over
+    /// every observation and have each sigma pick up only its own endpoint's
+    /// contributions. (`Proportional` slot → `2·σ_k²·f²`, `Additive` slot →
+    /// `2·σ_k²`.)
+    pub fn dvar_dlogsigma(&self, cmt: usize, k: usize, f: f64, sigma: &[f64]) -> f64 {
+        let sk = match sigma.get(k) {
+            Some(&s) => s,
+            None => return 0.0,
+        };
+        let sk2 = sk * sk;
+        // Resolve which `SigmaType` (if any) global index `k` plays for this
+        // observation's endpoint.
+        let stype = match self {
+            ErrorSpec::Single(em) => em.sigma_types().get(k).copied(),
+            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
+                Some(ep) => ep
+                    .sigma_idx
+                    .iter()
+                    .position(|&i| i == k)
+                    .and_then(|p| ep.error_model.sigma_types().get(p).copied()),
+                None => None,
+            },
+        };
+        match stype {
+            Some(SigmaType::Proportional) => 2.0 * sk2 * f * f,
+            Some(SigmaType::Additive) => 2.0 * sk2,
+            None => 0.0,
+        }
+    }
+
     /// Residual variance for one observation, dispatching on its compartment.
     ///
     /// For `Single` the `cmt` is ignored and the full `sigma` slice is used
@@ -2119,6 +2179,62 @@ mod tests {
         );
         let spec = ErrorSpec::PerCmt(map);
         assert!(spec.variance_at(2, 10.0, &[0.1]).is_nan());
+    }
+
+    #[test]
+    fn error_spec_dvar_df_matches_legacy_single_formulas() {
+        let f = 7.0;
+        // Additive: 0. Proportional/Combined: 2*f*sigma_prop^2.
+        assert_eq!(
+            ErrorSpec::Single(ErrorModel::Additive).dvar_df(1, f, &[0.5]),
+            0.0
+        );
+        assert!(
+            (ErrorSpec::Single(ErrorModel::Proportional).dvar_df(1, f, &[0.3]) - 2.0 * f * 0.09)
+                .abs()
+                < 1e-12
+        );
+        // Combined uses the first (proportional) sigma.
+        assert!(
+            (ErrorSpec::Single(ErrorModel::Combined).dvar_df(1, f, &[0.3, 2.0]) - 2.0 * f * 0.09)
+                .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn error_spec_per_cmt_dvar_df_and_dlogsigma_dispatch_by_endpoint() {
+        // CMT=2 proportional on sigma idx 0; CMT=3 additive on sigma idx 1.
+        let mut map = HashMap::new();
+        map.insert(
+            2,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![0],
+            },
+        );
+        map.insert(
+            3,
+            EndpointError {
+                error_model: ErrorModel::Additive,
+                sigma_idx: vec![1],
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        let sigma = [0.3, 2.0];
+        let f = 7.0;
+
+        // dvar_df: proportional endpoint -> 2*f*0.3^2; additive -> 0.
+        assert!((spec.dvar_df(2, f, &sigma) - 2.0 * f * 0.09).abs() < 1e-12);
+        assert_eq!(spec.dvar_df(3, f, &sigma), 0.0);
+
+        // dvar_dlogsigma: each sigma only contributes through its own endpoint.
+        // sigma 0 (proportional, CMT=2): 2*0.3^2*f^2 at CMT=2, 0 at CMT=3.
+        assert!((spec.dvar_dlogsigma(2, 0, f, &sigma) - 2.0 * 0.09 * f * f).abs() < 1e-12);
+        assert_eq!(spec.dvar_dlogsigma(3, 0, f, &sigma), 0.0);
+        // sigma 1 (additive, CMT=3): 2*2.0^2 at CMT=3, 0 at CMT=2.
+        assert!((spec.dvar_dlogsigma(3, 1, f, &sigma) - 2.0 * 4.0).abs() < 1e-12);
+        assert_eq!(spec.dvar_dlogsigma(2, 1, f, &sigma), 0.0);
     }
 
     #[test]

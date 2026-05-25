@@ -1930,6 +1930,7 @@ fn build_y_output_fn(
     theta_names: &[String],
     eta_names: &[String],
     indiv_var_names: &[String],
+    pk_indices: &[usize],
     state_names: &[String],
 ) -> Result<crate::ode::OdeOutputFn, String> {
     // Form C: expression may reference state names, individual params,
@@ -1947,10 +1948,15 @@ fn build_y_output_fn(
         .enumerate()
         .map(|(i, n)| (n.clone(), i))
         .collect();
+    // Map each individual-parameter name to its PK slot (`pk_params_flat` is
+    // indexed by PK slot via `pk_indices`, NOT by declaration order). Mirrors
+    // the Form B path; without this a readout like `central/V` reads the wrong
+    // (often uninitialised → NaN) slot whenever a param's declaration index
+    // differs from its PK slot.
     let indiv_idx: HashMap<String, usize> = indiv_var_names
         .iter()
         .enumerate()
-        .map(|(i, n)| (n.clone(), i))
+        .map(|(i, n)| (n.clone(), pk_indices.get(i).copied().unwrap_or(i)))
         .collect();
     let out_fn: crate::ode::OdeOutputFn = Box::new(
         move |state: &[f64],
@@ -2100,8 +2106,14 @@ fn parse_scaling_block(
                          use `obs_scale = <expr>` for analytical PK"
                         .into());
                 }
-                let out_fn =
-                    build_y_output_fn(value, theta_names, eta_names, indiv_var_names, state_names)?;
+                let out_fn = build_y_output_fn(
+                    value,
+                    theta_names,
+                    eta_names,
+                    indiv_var_names,
+                    pk_indices,
+                    state_names,
+                )?;
                 match cmt_opt {
                     None => {
                         if y_uniform.is_some() {

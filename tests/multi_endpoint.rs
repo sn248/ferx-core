@@ -1,20 +1,18 @@
 //! Integration tests for multi-endpoint (per-CMT) residual error models —
 //! issue #14, simultaneous PK/PD fitting.
 //!
-//! These exercise the public parse/`fit()` boundary. Per-CMT *correctness*
-//! reduces to `ErrorSpec::variance_at` dispatching the right error model and
-//! sigma slice per observation (the FOCE likelihood accumulation around it is
-//! unchanged); that dispatch, plus `compute_r_diag`/`compute_iwres` and the
-//! parser, is covered by fast unit tests in `src/`. We deliberately do not run
-//! a full ODE PK/PD fit to convergence here: ODE fits are impractically heavy
-//! in the unoptimized test profile (the repo's other "slow" fit tests all use
-//! analytical models), so an end-to-end fit would add cost without exercising
-//! anything the unit tests don't already cover. The canonical nonlinear Emax
-//! showcase lives in `examples/emax_pkpd.ferx`.
+//! These exercise the public parse / `predict()` / `fit()` boundary. The
+//! per-CMT residual dispatch and the SAEM M-step score derivatives are covered
+//! by fast unit tests in `src/` (`ErrorSpec::{variance_at, dvar_df,
+//! dvar_dlogsigma}`, `compute_r_diag`/`compute_iwres`, and the parser). Here we
+//! add a fast prediction regression test (co-temporal multi-CMT obs must all be
+//! finite) and gate the full ODE fits as slow (heavy in the unoptimized test
+//! profile). The canonical nonlinear Emax showcase lives in
+//! `examples/emax_pkpd.ferx`.
 
 use ferx_core::parser::model_parser::{parse_model_file, parse_model_string};
 use ferx_core::types::{DoseEvent, ErrorSpec, Population, SigmaType, Subject};
-use ferx_core::{fit, EstimationMethod, FitOptions};
+use ferx_core::{fit, predict, EstimationMethod, FitOptions};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -99,21 +97,58 @@ fn linear_pkpd_parses_to_per_cmt_error_spec() {
     assert!(types.contains(&SigmaType::Additive));
 }
 
-/// SAEM is rejected up front for per-CMT error models (Phase 1 restriction):
-/// its analytical M-step gradient assumes a single error model. This exercises
-/// the `fit()` boundary and returns immediately with an `Err`.
+/// Regression test for the co-temporal multi-CMT recorder bug: PK and PD
+/// observations sampled at the *same* timepoints must both receive finite
+/// predictions. Before the fix, the ODE recorder keyed observations by time
+/// alone, so all but one observation per timepoint stayed at the initial NaN.
 #[test]
-fn per_cmt_error_with_saem_is_rejected() {
+fn per_cmt_predictions_finite_for_cotemporal_obs() {
+    let model = parse_model_string(LINEAR_PKPD).expect("model parses");
+    let pop = pkpd_pop(); // obs on CMT 1 and 2 share each timepoint
+    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .iter()
+        .map(|p| p.pred)
+        .collect();
+    assert!(
+        preds.iter().all(|v| v.is_finite()),
+        "co-temporal multi-CMT predictions must all be finite, got {preds:?}"
+    );
+}
+
+/// SAEM now supports per-CMT error models (the M-step score dispatches the
+/// residual-variance derivatives per endpoint). Gated as slow: a full ODE
+/// SAEM fit is too heavy for the per-PR job. The per-CMT M-step gradient is
+/// unit-tested against finite differences in `estimation::saem`.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn per_cmt_saem_fit_runs() {
     let model = parse_model_string(LINEAR_PKPD).expect("model parses");
     let pop = pkpd_pop();
 
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::Saem;
+    opts.saem_n_exploration = 5;
+    opts.saem_n_convergence = 5;
+    opts.run_covariance_step = false;
     opts.verbose = false;
 
-    let err = fit(&model, &pop, &model.default_params, &opts)
-        .expect_err("SAEM + per-CMT error model must be rejected");
-    assert!(err.contains("saem"), "error should mention saem: {err}");
+    let result =
+        fit(&model, &pop, &model.default_params, &opts).expect("per-CMT SAEM fit must run");
+    assert!(
+        result.ofv.is_finite(),
+        "OFV must be finite, got {}",
+        result.ofv
+    );
+    assert_eq!(result.sigma.len(), 2);
+    for (name, s) in result.sigma_names.iter().zip(result.sigma.iter()) {
+        assert!(
+            s.is_finite() && *s > 0.0,
+            "endpoint sigma {name} must be positive/finite, got {s}"
+        );
+    }
 }
 
 /// A model observing a CMT with no matching `CMT=N:` error entry is rejected

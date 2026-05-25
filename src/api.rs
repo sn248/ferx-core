@@ -571,21 +571,6 @@ fn fit_inner(
         );
     }
 
-    // Guard: per-CMT (multi-endpoint) error models route their residual
-    // variance through the FD-differenced FOCE/GN/IS likelihood. SAEM's
-    // analytical M-step gradient assumes a single error model, so reject the
-    // combination up front (Phase 1).
-    if matches!(model.error_spec, crate::types::ErrorSpec::PerCmt(_))
-        && chain.iter().any(|&m| m == EstimationMethod::Saem)
-    {
-        return Err(
-            "Per-CMT error models (multi-endpoint, `CMT=N: DV ~ ...`) are not supported \
-             with method = saem in this release. Use FOCE/FOCEI or GN (optionally \
-             followed by `imp`)."
-                .to_string(),
-        );
-    }
-
     // Guard: SDE ([diffusion] block) is incompatible with SAEM and with the
     // autodiff gradient path. Fail/warn early so users get a clear message
     // rather than a silent wrong result.

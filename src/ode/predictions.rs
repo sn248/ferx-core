@@ -388,13 +388,14 @@ pub fn ode_predictions(
     // path (lagtime is constant across doses).
     let dose_lagtimes: Vec<f64> = vec![lagtime; subject.doses.len()];
 
-    // Build obs_time → index map
-    let obs_map: HashMap<u64, usize> = subject
-        .obs_times
-        .iter()
-        .enumerate()
-        .map(|(i, &t)| (t.to_bits(), i))
-        .collect();
+    // Build obs_time → indices map. Multiple observations can share a time
+    // (e.g. simultaneous PK/PD samples on different CMTs), so each time maps to
+    // *all* its observation indices — recording only one would leave the others
+    // at their initial NaN.
+    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, &t) in subject.obs_times.iter().enumerate() {
+        obs_map.entry(t.to_bits()).or_default().push(i);
+    }
 
     // Break timeline at lagtime-shifted dose times — and, for infusions,
     // at lagtime-shifted infusion-end times too, so each segment is
@@ -460,17 +461,19 @@ pub fn ode_predictions(
         }
 
         // Record observations exactly at t_start (after dose)
-        if let Some(&obs_idx) = obs_map.get(&t_start.to_bits()) {
-            let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-            predictions[obs_idx] = read_observable(
-                ode,
-                &u,
-                pk_params_flat,
-                theta,
-                eta,
-                &subject.covariates,
-                cmt,
-            );
+        if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
+            for &obs_idx in obs_idxs {
+                let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+                predictions[obs_idx] = read_observable(
+                    ode,
+                    &u,
+                    pk_params_flat,
+                    theta,
+                    eta,
+                    &subject.covariates,
+                    cmt,
+                );
+            }
         }
 
         // Observation times in this segment (t_start < t <= t_end)
@@ -522,17 +525,19 @@ pub fn ode_predictions(
 
         // Extract predictions and update state
         for pt in &sol {
-            if let Some(&obs_idx) = obs_map.get(&pt.t.to_bits()) {
-                let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-                predictions[obs_idx] = read_observable(
-                    ode,
-                    &pt.u,
-                    pk_params_flat,
-                    theta,
-                    eta,
-                    &subject.covariates,
-                    cmt,
-                );
+            if let Some(obs_idxs) = obs_map.get(&pt.t.to_bits()) {
+                for &obs_idx in obs_idxs {
+                    let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+                    predictions[obs_idx] = read_observable(
+                        ode,
+                        &pt.u,
+                        pk_params_flat,
+                        theta,
+                        eta,
+                        &subject.covariates,
+                        cmt,
+                    );
+                }
             }
         }
 

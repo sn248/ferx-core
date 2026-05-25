@@ -187,6 +187,15 @@ pub struct Subject {
     /// Per-EVID-2 covariate snapshot (LOCF), parallel to `pk_only_times`.
     /// Empty when no TV covariates.
     pub pk_only_covariates: Vec<HashMap<String, f64>>,
+    /// Times of system-reset events (NONMEM EVID=3 "reset" and EVID=4
+    /// "reset + dose"). At each of these times every compartment amount is
+    /// set back to zero. For EVID=4 the row's dose is *also* recorded in
+    /// `doses`; the reset is applied first (state-propagating paths use a
+    /// `Reset < Dose` tie-break at a shared time). Empty for the common case
+    /// of no reset rows — superposition stays valid and consumers skip the
+    /// state-propagating path. Resets break dose superposition, so a subject
+    /// with any reset is forced onto the event-driven analytical / ODE path.
+    pub reset_times: Vec<f64>,
     /// Censoring flag per observation (0 = quantified, 1 = below LLOQ).
     /// When `cens[j] == 1`, `observations[j]` holds the LLOQ value (NONMEM convention).
     pub cens: Vec<u8>,
@@ -209,6 +218,15 @@ impl Subject {
     /// loop.
     pub fn has_tv_covariates(&self) -> bool {
         !self.dose_covariates.is_empty() || !self.obs_covariates.is_empty()
+    }
+
+    /// True when this subject carries any system-reset event (EVID=3 or
+    /// EVID=4). Resets zero all compartment amounts, which dose superposition
+    /// cannot express, so the prediction dispatcher routes these subjects onto
+    /// the state-propagating event-driven analytical / ODE path regardless of
+    /// whether they have time-varying covariates.
+    pub fn has_resets(&self) -> bool {
+        !self.reset_times.is_empty()
     }
 
     /// True when any dose record on this subject is flagged steady-state

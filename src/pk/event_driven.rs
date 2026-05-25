@@ -35,14 +35,21 @@ pub enum EventKind {
     /// piecewise-constant rate matrix from the row's covariate values.
     /// Matches NONMEM's `$PK runs at every record` semantic.
     PkOnly,
+    /// EVID=3 / EVID=4 system reset — zeros every compartment amount.
+    /// For EVID=4 a `Dose` event is scheduled at the same time; the
+    /// `Reset < Dose` tie-break (see [`kind_order`]) makes the reset run
+    /// first so the dose lands in a freshly emptied system.
+    Reset,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Event {
     pub time: f64,
     pub kind: EventKind,
-    /// Index into `subject.doses`, `subject.obs_times`, or
-    /// `subject.pk_only_times` depending on `kind`.
+    /// Index into `subject.doses`, `subject.obs_times`,
+    /// `subject.pk_only_times`, or `subject.reset_times` depending on `kind`.
+    /// For `Reset` events the index is unused (a reset carries no per-event
+    /// data — it just zeros the state).
     pub orig_idx: usize,
 }
 
@@ -62,9 +69,11 @@ pub struct Event {
 /// `*_with_schedule` variants below.
 #[derive(Debug, Clone)]
 pub struct EventSchedule {
-    /// Merged + sorted event list. Tie-break order is `Dose < PkOnly < Obs`
-    /// so covariate-change markers run after a dose at the same time but
-    /// before an observation (matches NONMEM `$PK` semantics).
+    /// Merged + sorted event list. Tie-break order is
+    /// `Reset < Dose < PkOnly < Obs` so a system reset zeros the state
+    /// before a same-time dose lands (EVID=4), and covariate-change markers
+    /// run after a dose at the same time but before an observation (matches
+    /// NONMEM `$PK` semantics).
     ///
     /// Dose event times are `subject.doses[k].time + dose_lagtimes[k]`
     /// so the schedule already reflects per-dose lagtime.
@@ -133,6 +142,13 @@ impl EventSchedule {
                 orig_idx: m,
             });
         }
+        for (r, &t) in subject.reset_times.iter().enumerate() {
+            events.push(Event {
+                time: t,
+                kind: EventKind::Reset,
+                orig_idx: r,
+            });
+        }
         events.sort_by(|a, b| {
             a.time
                 .partial_cmp(&b.time)
@@ -168,9 +184,12 @@ impl EventSchedule {
 #[inline]
 fn kind_order(k: EventKind) -> u8 {
     match k {
-        EventKind::Dose => 0,
-        EventKind::PkOnly => 1,
-        EventKind::Obs => 2,
+        // Reset sorts first so an EVID=4 (reset + dose) zeros the state
+        // before its own dose lands at the same time.
+        EventKind::Reset => 0,
+        EventKind::Dose => 1,
+        EventKind::PkOnly => 2,
+        EventKind::Obs => 3,
     }
 }
 
@@ -303,6 +322,7 @@ fn equilibrate_ss_state_event_driven(
             pk_model,
             &synthetic_dose,
             &synthetic_lagtimes,
+            f64::NEG_INFINITY,
         );
     }
 
@@ -373,8 +393,24 @@ pub fn event_driven_predictions_with_schedule(
     // State vector starts at zero (no residual drug before the first event).
     let mut state = vec![0.0_f64; n_states];
     let mut cur_t = schedule.events[0].time;
+    // Most-recent system-reset time. Infusions whose window started before
+    // this are no longer active (a reset turns off ongoing infusions, the
+    // same way it zeros the compartments). `NEG_INFINITY` until the first
+    // reset means every infusion is eligible.
+    let mut reset_floor = f64::NEG_INFINITY;
 
     for (i, ev) in schedule.events.iter().enumerate() {
+        // EVID=3 / EVID=4 reset: zero every compartment. Any drug carried
+        // by the interval ending here would just be discarded, so skip the
+        // propagation entirely and only advance the clock. A reset carries
+        // no PK params, so this also avoids the `pk_for` lookup below.
+        if ev.kind == EventKind::Reset {
+            state.iter_mut().for_each(|s| *s = 0.0);
+            cur_t = ev.time;
+            reset_floor = ev.time;
+            continue;
+        }
+
         // PK params for the propagation [events[i-1], events[i]] are the
         // params evaluated AT events[i] — matches NONMEM's `$PK runs at
         // every record then ADVAN propagates to that record` semantic
@@ -393,6 +429,7 @@ pub fn event_driven_predictions_with_schedule(
                 pk_model,
                 &subject.doses,
                 &schedule.dose_lagtimes,
+                reset_floor,
             );
             cur_t = ev.time;
         }
@@ -453,6 +490,7 @@ pub fn event_driven_predictions_with_schedule(
                 // EVID=2: $PK ran at this row but state is unchanged;
                 // pk_now is consumed by the next interval's propagation.
             }
+            EventKind::Reset => unreachable!("Reset handled before pk_for above"),
         }
     }
 
@@ -470,6 +508,9 @@ fn pk_for(
         EventKind::Dose => pk_at_dose[ev.orig_idx],
         EventKind::Obs => pk_at_obs[ev.orig_idx],
         EventKind::PkOnly => pk_at_pk_only[ev.orig_idx],
+        // Resets are handled by the caller before `pk_for`; they carry no
+        // per-event PK snapshot.
+        EventKind::Reset => unreachable!("Reset carries no PK params"),
     }
 }
 
@@ -481,6 +522,11 @@ fn pk_for(
 ///
 /// `dose_lagtimes[k]` shifts dose `k`'s active-infusion window by that
 /// amount; must be parallel to `doses`.
+///
+/// `reset_floor` is the time of the most recent system reset (EVID=3/4), or
+/// `f64::NEG_INFINITY` when none has happened. Infusions whose (lagged) start
+/// is strictly before `reset_floor` are treated as turned off — a reset stops
+/// ongoing infusions, just as it zeros the compartments.
 fn propagate_with_bounds(
     state: &mut [f64],
     bounds: &[f64],
@@ -488,6 +534,7 @@ fn propagate_with_bounds(
     pk_model: PkModel,
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
+    reset_floor: f64,
 ) {
     for w in bounds.windows(2) {
         let s0 = w[0];
@@ -507,6 +554,10 @@ fn propagate_with_bounds(
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
             let t_start = d.time + lag;
             let t_end = t_start + d.duration;
+            // Infusions that started before the last reset are turned off.
+            if t_start < reset_floor {
+                continue;
+            }
             if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
                 let r = f_bio * d.rate;
                 match (pk_model, d.cmt) {
@@ -1019,10 +1070,78 @@ mod tests {
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
         }
+    }
+
+    // ── System resets (EVID=3 / EVID=4) ───────────────────────────────────
+
+    #[test]
+    fn reset_evid3_zeros_compartments() {
+        // 1-cpt IV bolus at t=0, system reset (EVID=3) at t=5. Observations
+        // after the reset must read ~0: the reset emptied every compartment
+        // and there is no later dose.
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![1.0, 6.0, 10.0];
+        let mut subj = make_subject(doses, obs_times.clone());
+        subj.reset_times = vec![5.0];
+        let pk = pk_one(10.0, 100.0);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        assert!(preds[0] > 0.0, "pre-reset obs should be positive");
+        assert_relative_eq!(preds[1], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(preds[2], 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn reset_evid4_dose_into_emptied_system_matches_fresh_dose() {
+        // Dose at t=0, then reset + dose (EVID=4) at t=10. Predictions at and
+        // after t=10 must equal a single fresh 500 mg dose given at t=10 — the
+        // prior drug is zeroed before the new dose lands.
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(10.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![10.0, 12.0, 15.0];
+        let mut subj = make_subject(doses, obs_times.clone());
+        subj.reset_times = vec![10.0];
+        let pk = pk_one(8.0, 50.0);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+
+        let fresh = vec![DoseEvent::new(10.0, 500.0, 1, 0.0, false, 0.0)];
+        for (i, &t) in obs_times.iter().enumerate() {
+            let expected = crate::pk::predict_concentration(PkModel::OneCptIvBolus, &fresh, t, &pk);
+            assert_relative_eq!(preds[i], expected, epsilon = 1e-10, max_relative = 1e-10);
+        }
+    }
+
+    #[test]
+    fn reset_turns_off_ongoing_infusion() {
+        // Infusion 0–8 h started at t=0; a reset at t=4 (mid-infusion) zeros
+        // the state AND turns the infusion off, so an obs at t=6 reads ~0.
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 125.0, false, 0.0)];
+        let obs_times = vec![3.0, 6.0];
+        let mut subj = make_subject(doses, obs_times.clone());
+        subj.reset_times = vec![4.0];
+        let pk = pk_one(10.0, 100.0);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds =
+            event_driven_predictions(PkModel::OneCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
+        assert!(
+            preds[0] > 0.0,
+            "mid-infusion pre-reset obs should be positive"
+        );
+        assert_relative_eq!(preds[1], 0.0, epsilon = 1e-12);
     }
 
     // ── Equivalence with superposition (constant pk_params) ───────────────────

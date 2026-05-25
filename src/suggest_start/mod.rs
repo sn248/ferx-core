@@ -217,28 +217,47 @@ pub fn suggest_start_ebe(model: &CompiledModel, population: &Population) -> Sugg
     // for a wrong TV on the logit scale, creating spurious rRMSE minima.
     // Covariate thetas (no mu_ref at all) are also excluded.
     // Logit thetas will be swept afterwards with etas=0 (Option B style).
+    // Partition remaining into three groups:
+    //   lognormal  — THETA * exp(ETA): EBE sweep is reliable
+    //   logit      — inv_logit(logit(THETA) + ETA): etas=0 sweep (eta compensates on logit scale)
+    //   covariate  — no mu_ref at all: excluded entirely (same as Option B)
     let lognormal_theta_names: std::collections::HashSet<&str> = model
         .mu_refs
         .values()
         .filter(|mr| mr.log_transformed)
         .map(|mr| mr.theta_name.as_str())
         .collect();
-
-    let logit_and_covariate_remaining: Vec<usize> = remaining
-        .iter()
-        .copied()
-        .filter(|&i| {
-            let name = &model.default_params.theta_names[i];
-            !lognormal_theta_names.contains(name.as_str())
-        })
+    let logit_theta_names: std::collections::HashSet<&str> = model
+        .mu_refs
+        .values()
+        .filter(|mr| !mr.log_transformed)
+        .map(|mr| mr.theta_name.as_str())
         .collect();
 
+    let mut logit_remaining: Vec<usize> = Vec::new();
+    let mut n_covariate_excluded = 0usize;
+
+    // Split remaining: lognormal → EBE sweep, logit → etas=0 sweep, else drop.
     remaining.retain(|&i| {
         let name = &model.default_params.theta_names[i];
-        lognormal_theta_names.contains(name.as_str())
+        if lognormal_theta_names.contains(name.as_str()) {
+            true // keep for EBE sweep
+        } else if logit_theta_names.contains(name.as_str()) {
+            logit_remaining.push(i);
+            false
+        } else {
+            n_covariate_excluded += 1;
+            false
+        }
     });
 
-    if remaining.is_empty() && logit_and_covariate_remaining.is_empty() {
+    if n_covariate_excluded > 0 {
+        base.warnings.push(format!(
+            "suggest_start_ebe: excluded {n_covariate_excluded} covariate theta(s) from rRMSE sweep"
+        ));
+    }
+
+    if remaining.is_empty() && logit_remaining.is_empty() {
         return base;
     }
 
@@ -279,15 +298,9 @@ pub fn suggest_start_ebe(model: &CompiledModel, population: &Population) -> Sugg
 
     // Logit-parameterised thetas swept with etas=0 (same as Option B).
     // EBE sweeps are unreliable for logit params due to eta-compensation effects.
-    if !logit_and_covariate_remaining.is_empty() {
-        let (swept, w) = sweep_unwritten_thetas(
-            model,
-            population,
-            &base.params,
-            &logit_and_covariate_remaining,
-            9,
-            10.0,
-        );
+    if !logit_remaining.is_empty() {
+        let (swept, w) =
+            sweep_unwritten_thetas(model, population, &base.params, &logit_remaining, 9, 10.0);
         base.params = swept;
         base.warnings.extend(w);
     }

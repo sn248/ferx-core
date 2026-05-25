@@ -248,6 +248,19 @@ pub fn compute_event_pk_params_into(
 /// `pk_params.lagtime()` shifts the effective start of every dose (bolus,
 /// infusion, and oral) by that amount. For infusions the duration is
 /// preserved — only the start (and therefore end) of the window shifts.
+///
+/// # Steady state under lagtime
+///
+/// For a steady-state dose (`dose.ss`, `dose.ii > 0`) the periodic pulse
+/// train extends infinitely into the past, so an observation between the
+/// dose *record* time and the lagged dose arrival
+/// (`dose.time ≤ t < dose.time + lagtime`) still sees the tail of the
+/// *previous* interval — the most recent pulse landed at `t_eff − II`. We
+/// recover it by wrapping the (negative) elapsed time into `[0, II)` and
+/// evaluating the SS closed form there. This matches NONMEM `ALAG1` +
+/// `SS=1` (verified against NONMEM 7.5 to 5 significant figures). Without
+/// the wrap these early samples would read 0, which is wrong at steady
+/// state.
 pub fn predict_concentration(
     pk_model: PkModel,
     doses: &[DoseEvent],
@@ -261,6 +274,21 @@ pub fn predict_concentration(
         if t_eff <= t {
             let tau = t - t_eff;
             conc += single_dose_concentration(pk_model, dose, tau, pk_params);
+        } else if dose.ss && dose.ii > 0.0 && t >= dose.time {
+            // Pre-arrival steady-state tail (see the doc comment). Only for
+            // observations at/after the dose *record* time: SS=1 establishes
+            // steady state *at* the record, so a record cannot contribute to
+            // times before itself (an SS dose later in the timeline must not
+            // leak into earlier observations). Wrap the negative elapsed time
+            // `t - t_eff` up into `[0, II)` by adding whole intervals — one
+            // suffices for a physical lagtime < II, but the ceil keeps it
+            // correct for any value.
+            let raw = t - t_eff;
+            let n = (-raw / dose.ii).ceil();
+            let tau = raw + n * dose.ii;
+            if tau >= 0.0 {
+                conc += single_dose_concentration(pk_model, dose, tau, pk_params);
+            }
         }
     }
     conc.max(0.0)
@@ -894,6 +922,70 @@ mod tests {
                 predict_concentration(PkModel::OneCptIvBolus, &doses, t - lagtime, &pk_nolag);
             assert_relative_eq!(c_lag, c_no, epsilon = 1e-12);
         }
+    }
+
+    /// NONMEM cross-check for SS + ALAG1 (issue #15). Reference PRED values
+    /// were generated with NONMEM 7.5.1 (`ADVAN2 TRANS2`, `$ESTIMATION
+    /// MAXEVAL=0`) for a 1-cpt oral model: CL=2, V=20, KA=1.5, ALAG1=1.5,
+    /// a single `SS=1, II=24, AMT=100` dose into the depot, observed in the
+    /// central compartment (`S2=V`). Control file + dataset documented in
+    /// `tests/ss_lagtime_nonmem.rs`.
+    ///
+    /// The two earliest samples (t=0.5, 1.0 < ALAG1) exercise the
+    /// previous-interval steady-state tail: NONMEM reports ~0.59 / ~0.56
+    /// there, not 0. This is the analytical-path coverage of the wrap added
+    /// to `predict_concentration`.
+    #[test]
+    fn test_ss_oral_with_lagtime_matches_nonmem() {
+        let (cl, v, ka, lagtime, ii, amt) = (2.0, 20.0, 1.5, 1.5, 24.0, 100.0);
+        let doses = vec![DoseEvent::new(0.0, amt, 1, 0.0, true, ii)];
+        let mut pk = oral_pk_params(cl, v, ka);
+        pk.values[crate::types::PK_IDX_LAGTIME] = lagtime;
+
+        // (observation time, NONMEM PRED). t < 1.5 is the previous-interval
+        // tail; t >= 1.5 is the current interval; t > II decays (naked SS).
+        let nonmem: &[(f64, f64)] = &[
+            (0.5, 0.59069),
+            (1.0, 0.56188),
+            (2.0, 3.07370),
+            (4.0, 4.46240),
+            (8.0, 3.07540),
+            (12.0, 2.06170),
+            (18.0, 1.13150),
+            (23.0, 0.68628),
+            (25.0, 0.56188),
+            (30.0, 0.34080),
+        ];
+        for &(t, pred) in nonmem {
+            let c = predict_concentration(PkModel::OneCptOral, &doses, t, &pk);
+            assert_relative_eq!(c, pred, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_ss_dose_does_not_contribute_before_its_record_time() {
+        // SS=1 establishes steady state *at* the dose record time, so an SS
+        // dose must not contribute to observations earlier than its own
+        // record (the pre-arrival wrap only applies in [dose.time, t_eff)).
+        // Regression guard: before the `t >= dose.time` gate, a future SS
+        // record leaked a non-zero steady-state tail into earlier times.
+        let (cl, v, ka, lagtime, ii, amt) = (2.0, 20.0, 1.5, 1.5, 24.0, 100.0);
+        // SS dose recorded at t = 10 (not at the origin).
+        let doses = vec![DoseEvent::new(10.0, amt, 1, 0.0, true, ii)];
+        let mut pk = oral_pk_params(cl, v, ka);
+        pk.values[crate::types::PK_IDX_LAGTIME] = lagtime;
+
+        // Strictly before the record time → no contribution.
+        for &t in &[0.0, 5.0, 9.9] {
+            let c = predict_concentration(PkModel::OneCptOral, &doses, t, &pk);
+            assert_eq!(c, 0.0, "future SS dose leaked into t={t}");
+        }
+        // In the record-to-arrival window [10, 11.5) → previous-interval tail.
+        let c_pre = predict_concentration(PkModel::OneCptOral, &doses, 10.5, &pk);
+        let dose0 = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
+        // phase = (10.5 - 11.5) + II = 23.0
+        let expected = one_cpt_oral_ss(&dose0, 23.0, cl, v, ka);
+        assert_relative_eq!(c_pre, expected, max_relative = 1e-9);
     }
 
     #[test]

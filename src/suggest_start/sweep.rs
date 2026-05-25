@@ -180,11 +180,11 @@ pub fn sweep_unwritten_thetas(
 /// `prev_etas` are warm-start EBEs from the previous grid point in eta_true
 /// space (same ordering as `population.subjects`).  Returns (rRMSE, new_etas)
 /// so the caller can thread warm-starts through sequential grid traversal.
-fn rrmse_ebe<'a>(
+fn rrmse_ebe(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-    prev_etas: Option<&'a [DVector<f64>]>,
+    prev_etas: Option<&[DVector<f64>]>,
 ) -> (f64, Vec<DVector<f64>>) {
     // Run inner loop with warm-start. 20 iterations and 1e-3 tolerance are
     // enough for a grid sweep — full inner-loop precision is not needed here,

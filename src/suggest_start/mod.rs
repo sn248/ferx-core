@@ -188,17 +188,20 @@ pub fn suggest_start_thorough(model: &CompiledModel, population: &Population) ->
 ///
 /// Typical wall-clock cost on a 30-subject analytical 2-cpt model: 200–500 ms.
 pub fn suggest_start_ebe(model: &CompiledModel, population: &Population) -> SuggestedStart {
-    let mut base = suggest_start(model, population);
-
     // ODE fallback: EBE sweeps require per-subject numerical integration per
     // inner iteration — too slow (~minutes) and unreliable from uninformed
-    // defaults.  Fall through to Option B (etas=0) sweep instead.
+    // defaults.  Delegate to Option B directly (which runs NCA + etas=0 sweep)
+    // rather than calling suggest_start() first and then suggest_start_thorough()
+    // (which would run NCA twice).
     if model.ode_spec.is_some() {
-        base.warnings.push(
+        let mut result = suggest_start_thorough(model, population);
+        result.warnings.insert(0,
             "suggest_start_ebe: ODE model — EBE sweep skipped (too slow; ODE integration per inner iteration). Falling back to etas=0 sweep (Option B).".into(),
         );
-        return suggest_start_thorough(model, population);
+        return result;
     }
+
+    let mut base = suggest_start(model, population);
 
     let mut remaining: Vec<usize> = (0..model.default_params.theta.len())
         .filter(|&i| {
@@ -478,7 +481,7 @@ fn try_biexp_peel(
 ///    `indiv_param_names[pos]` string (handles CLEARANCE → CLEARANCE, TVCL → CL, etc.).
 /// 3. Canonical-name fallback: search `theta_names` for the standard slot name
 ///    ("CL", "V", "Q", etc.).
-pub fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usize> {
+pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usize> {
     // Canonical names for each slot (used only as last-resort fallback).
     let canonical = if pk_slot == PK_IDX_CL {
         "CL"
@@ -508,10 +511,15 @@ pub fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usiz
     if let Some(indiv_pos) = model.pk_indices.iter().position(|&s| s == pk_slot) {
         let indiv_name = &model.indiv_param_names[indiv_pos];
         // Search mu_refs for an eta whose theta_name is in theta_names and whose
-        // eta name contains the indiv_param_name (case-insensitive).
+        // eta name matches the indiv_param_name as a whole word (case-insensitive).
+        // We require the eta name to end with `_<INDIV>` or equal `<INDIV>` exactly
+        // (after uppercasing both) to avoid "ETA_VMAX" matching indiv_name "V".
         let indiv_upper = indiv_name.to_ascii_uppercase();
         for (eta_name, mu_ref) in &model.mu_refs {
-            if eta_name.to_ascii_uppercase().contains(&indiv_upper) {
+            let eta_upper = eta_name.to_ascii_uppercase();
+            let matches =
+                eta_upper == indiv_upper || eta_upper.ends_with(&format!("_{indiv_upper}"));
+            if matches {
                 if let Some(idx) = params
                     .theta_names
                     .iter()
@@ -716,15 +724,17 @@ fn build_params(
     }
 
     // Update omega for CL eta if we have inter-subject CV².
+    // Update the single diagonal element in-place so that block_omega off-diagonal
+    // entries (correlated etas) are not discarded.
     if let Some(cv2) = pop.cl_cv2 {
         if let Some(cl_eta_idx) = cl_eta_omega_idx {
             let omega_var = cv2.clamp(0.01, 2.0);
-            let mut new_diag: Vec<f64> = (0..model.n_eta)
-                .map(|i| params.omega.matrix[(i, i)])
-                .collect();
-            new_diag[cl_eta_idx] = omega_var;
-            let eta_names = params.omega.eta_names.clone();
-            params.omega = OmegaMatrix::from_diagonal(&new_diag, eta_names);
+            let mut m = params.omega.matrix.clone();
+            m[(cl_eta_idx, cl_eta_idx)] = omega_var;
+            let names = params.omega.eta_names.clone();
+            let diagonal = params.omega.diagonal;
+            let mask = params.omega.free_mask.clone();
+            params.omega = OmegaMatrix::from_matrix_with_mask(m, names, diagonal, mask);
         }
     }
 

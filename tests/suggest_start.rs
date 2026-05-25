@@ -1,7 +1,7 @@
 //! Integration tests for `suggest_start` and `suggest_start_thorough`.
 
 use ferx_core::parser::model_parser::parse_model_file;
-use ferx_core::{read_nonmem_csv, suggest_start, suggest_start_thorough};
+use ferx_core::{read_nonmem_csv, suggest_start, suggest_start_ebe, suggest_start_thorough};
 use std::path::Path;
 
 fn warfarin() -> (
@@ -164,6 +164,87 @@ fn test_suggest_start_thorough_moves_unwritten_thetas() {
     assert!(
         any_changed,
         "suggest_start_thorough should change at least one theta vs Option A"
+    );
+}
+
+/// When a model uses block_omega (correlated etas), updating the CL omega from
+/// NCA CV² must not discard the off-diagonal entries.
+#[test]
+fn test_suggest_start_block_omega_preserved() {
+    use ferx_core::types::OmegaMatrix;
+    use nalgebra::DMatrix;
+
+    // Parse a fresh model so we can mutate default_params.omega.
+    let mut model =
+        parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data must load");
+
+    let n = model.n_eta;
+    if n >= 2 {
+        // Replace with a 2×2 block omega (ETA_CL correlated with ETA_V) with off-diagonal = 0.02.
+        let mut m = DMatrix::<f64>::identity(n, n) * 0.09;
+        m[(0, 1)] = 0.02;
+        m[(1, 0)] = 0.02;
+        let names = model.default_params.omega.eta_names.clone();
+        let mut free_mask = DMatrix::from_element(n, n, false);
+        for i in 0..n {
+            for j in 0..n {
+                free_mask[(i, j)] = i == j || (i < 2 && j < 2);
+            }
+        }
+        model.default_params.omega = OmegaMatrix::from_matrix_with_mask(m, names, false, free_mask);
+
+        let result = suggest_start(&model, &population);
+
+        // Off-diagonal (0,1) must survive the omega update.
+        let off_diag = result.params.omega.matrix[(0, 1)];
+        assert!(
+            (off_diag - 0.02).abs() < 1e-10,
+            "block omega off-diagonal should be preserved after suggest_start, got {off_diag}"
+        );
+    }
+}
+
+/// auto_start = true must produce different theta than the model default when
+/// NCA or the rRMSE sweep finds a better starting point.
+#[test]
+fn test_auto_start_changes_params() {
+    // We test the plumbing by calling suggest_start_thorough directly (same
+    // function that auto_start invokes) and confirming it changes at least one theta.
+    let (model, population) = warfarin();
+    let result = suggest_start_thorough(&model, &population);
+    let any_changed = result
+        .params
+        .theta
+        .iter()
+        .zip(model.default_params.theta.iter())
+        .any(|(suggested, &default)| (suggested - default).abs() > 1e-10);
+    assert!(
+        any_changed,
+        "suggest_start_thorough (used by auto_start) must change at least one theta from model default"
+    );
+}
+
+/// suggest_start_ebe on an ODE model must fall back to Option B and emit a warning.
+#[test]
+fn test_suggest_start_ebe_ode_fallback_warning() {
+    // mm_iv.ferx uses an ODE-based Michaelis-Menten model.
+    let model = parse_model_file(Path::new("examples/mm_iv.ferx")).expect("mm_iv model must parse");
+    let population =
+        read_nonmem_csv(Path::new("data/mm_iv.csv"), None, None).expect("mm_iv data must load");
+
+    assert!(model.ode_spec.is_some(), "mm_iv model must be an ODE model");
+
+    let result = suggest_start_ebe(&model, &population);
+    let has_ode_warning = result
+        .warnings
+        .iter()
+        .any(|w| w.contains("ODE") && w.contains("Falling back"));
+    assert!(
+        has_ode_warning,
+        "suggest_start_ebe on an ODE model must emit the ODE-fallback warning; got: {:?}",
+        result.warnings
     );
 }
 

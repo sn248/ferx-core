@@ -22,7 +22,7 @@ pub struct PopNca {
 }
 
 /// Minimum number of subjects needed for a pooled parameter estimate to be trusted.
-const MIN_SUBJECTS: usize = 3;
+const MIN_SUBJECTS: usize = 2;
 
 fn geomean_min_n(iter: impl Iterator<Item = f64>) -> Option<f64> {
     let vals: Vec<f64> = iter.filter(|&v| v > 0.0 && v.is_finite()).collect();

@@ -770,9 +770,12 @@ fn fit_inner(
         }
     }
 
-    // Auto-start: derive NCA-based starting values before the optimizer loop.
+    // Auto-start: derive NCA + rRMSE-sweep starting values (Option B) before
+    // the optimizer loop.  Option B is used rather than Option A so that ODE
+    // models and distribution parameters (Q, V2, …) that NCA cannot estimate
+    // are covered by the rRMSE grid sweep.
     if options.auto_start {
-        let suggested = crate::suggest_start::suggest_start(model, population);
+        let suggested = crate::suggest_start::suggest_start_thorough(model, population);
         stage_params = suggested.params;
         accumulated_warnings.extend(suggested.warnings);
     }

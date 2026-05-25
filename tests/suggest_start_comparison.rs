@@ -100,6 +100,10 @@ fn run_case(case: &Case) {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
 fn suggest_start_comparison_all_models() {
     let cases = vec![
         // ── Analytical models ────────────────────────────────────────────────

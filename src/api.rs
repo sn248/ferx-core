@@ -770,6 +770,13 @@ fn fit_inner(
         }
     }
 
+    // Auto-start: derive NCA-based starting values before the optimizer loop.
+    if options.auto_start {
+        let suggested = crate::suggest_start::suggest_start(model, population);
+        stage_params = suggested.params;
+        accumulated_warnings.extend(suggested.warnings);
+    }
+
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
 

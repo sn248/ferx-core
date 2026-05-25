@@ -45,6 +45,41 @@ Expressions can reference:
   that aren't assigned in the firing branch this step receive a derivative
   of `0`.
 
+## Initial Compartment Amounts
+
+By default every compartment starts at zero, and drug enters only through dose
+records. To start a compartment at a non-zero amount — e.g. a pre-dose baseline
+for an indirect-response / turnover model — declare an initial condition in the
+`[odes]` block:
+
+```
+[odes]
+  init(state_name) = expression
+  d/dt(state_name) = expression
+```
+
+- The right-hand side is evaluated **once per subject** at the start of the
+  record and may reference individual parameters (and therefore folds in
+  `theta`, `eta`, and covariates through the `[individual_parameters]` layer).
+  State names referenced in an `init` expression are treated as `0` (no drug
+  is present yet).
+- Compartments without an `init(...)` line start at zero, as before.
+- This is the analogue of NONMEM's `A_0(n)`.
+
+A turnover model whose response variable sits at its baseline `KIN/KOUT`
+before any perturbation:
+
+```
+[odes]
+  init(response) = KIN / KOUT
+  d/dt(response) = KIN - KOUT * response
+```
+
+**Interaction with system resets (EVID=3/4):** a reset re-applies the `init`
+expression to initialized compartments (returning them to baseline) and zeros
+all other compartments — so a reset behaves like the start of a fresh episode.
+See [Data Format](../data-format.md) for reset rows.
+
 ## Example: Michaelis-Menten Elimination
 
 A one-compartment oral model with saturable (Michaelis-Menten) elimination:

@@ -2469,13 +2469,50 @@ fn build_ode_spec(
         None => NEEDS_FORM_C,
     };
 
+    // Pull `init(state) = <expr>` directives out of the block first. The
+    // statement parser only understands d/dt / assignment / if, so init lines
+    // must be separated before parsing the RHS. Each init expression may
+    // reference individual parameters and (defensively) state names — states
+    // are bound to 0.0 at init time. Build the init_fn closure that seeds the
+    // integrator from these expressions.
+    let init_ctx_defined: Vec<String> = state_names
+        .iter()
+        .cloned()
+        .chain(indiv_param_names.iter().cloned())
+        .collect();
+    let mut init_specs: Vec<(usize, Expression)> = Vec::new();
+    let mut seen_init: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rhs_lines: Vec<String> = Vec::with_capacity(lines.len());
+    for raw in lines {
+        if let Some((name, expr_str)) = parse_init_line(raw) {
+            let idx = state_names.iter().position(|s| s == &name).ok_or_else(|| {
+                format!(
+                    "[odes]: init({}) references unknown state. Declared states: {:?}",
+                    name, state_names
+                )
+            })?;
+            if !seen_init.insert(name.clone()) {
+                return Err(format!(
+                    "[odes]: duplicate init({}) — initial condition defined more than once",
+                    name
+                ));
+            }
+            let ctx = ParseCtx::ode(&init_ctx_defined);
+            let expr = parse_scalar_expression(&expr_str, ctx)
+                .map_err(|e| format!("[odes] init({}): {}", name, e))?;
+            init_specs.push((idx, expr));
+        } else {
+            rhs_lines.push(raw.clone());
+        }
+    }
+
     // For ODE RHS expressions, states + individual params get injected into the
     // `vars` map at eval time, so every bare identifier should resolve to a
     // Variable (not a Covariate). ParseCtx::ode() flips the fallback accordingly.
     // Local intermediate vars assigned within the [odes] block (e.g. inside an
     // if-body) are also collected from a pre-pass below so they parse as
     // Variable too.
-    let block_text = lines.join("\n");
+    let block_text = rhs_lines.join("\n");
     let pre_defined: Vec<String> = state_names
         .iter()
         .cloned()
@@ -2618,13 +2655,71 @@ fn build_ode_spec(
             );
         });
 
+    // Build the init_fn closure from the extracted `init(state) = expr`
+    // directives. It mirrors the RHS variable binding: individual parameters
+    // by declaration order (PkParams.values slots), plus state names bound to
+    // 0.0 (no drug present at init time). Returns the full n_states vector so
+    // the caller can both seed the integrator and re-seed after a reset.
+    let init_fn: Option<Box<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync>> = if init_specs.is_empty() {
+        None
+    } else {
+        let n = n_states;
+        let indiv = indiv_param_names.to_vec();
+        let states = state_names.to_vec();
+        let specs = init_specs;
+        Some(Box::new(move |params: &[f64]| -> Vec<f64> {
+            let mut vars: HashMap<String, f64> = HashMap::new();
+            for name in &states {
+                vars.insert(name.clone(), 0.0);
+                vars.insert(name.to_lowercase(), 0.0);
+            }
+            for (i, name) in indiv.iter().enumerate() {
+                if i < params.len() {
+                    vars.insert(name.clone(), params[i]);
+                    vars.insert(name.to_uppercase(), params[i]);
+                    vars.insert(name.to_lowercase(), params[i]);
+                }
+            }
+            let empty_theta: [f64; 0] = [];
+            let empty_eta: [f64; 0] = [];
+            let empty_cov: HashMap<String, f64> = HashMap::new();
+            let empty_nn: Vec<Vec<f64>> = Vec::new();
+            let mut u0 = vec![0.0; n];
+            for (idx, expr) in &specs {
+                u0[*idx] =
+                    eval_expression(expr, &empty_theta, &empty_eta, &empty_cov, &vars, &empty_nn);
+            }
+            u0
+        }))
+    };
+
     Ok(crate::ode::OdeSpec {
         rhs,
         n_states,
         state_names: state_names.to_vec(),
         readout: crate::ode::OdeReadout::ObsCmt(obs_cmt_idx),
         diffusion_var: Vec::new(),
+        init_fn,
     })
+}
+
+/// Parse an `init(state) = <expr>` directive line. Returns `(state_name,
+/// expr_str)` when `line` is such a directive, else `None` (so the caller
+/// routes it to the d/dt statement parser). Tolerates whitespace variants
+/// (`init (R)=...`, `init( R ) = ...`).
+fn parse_init_line(line: &str) -> Option<(String, String)> {
+    let rest = line.trim().strip_prefix("init")?.trim_start();
+    let inner = rest.strip_prefix('(')?;
+    let close = inner.find(')')?;
+    let name = inner[..close].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let expr = inner[close + 1..].trim_start().strip_prefix('=')?.trim();
+    if expr.is_empty() {
+        return None;
+    }
+    Some((name, expr.to_string()))
 }
 
 // ── Helper: parse "[1.0, 2.0, 3.0]" → Vec<f64> ────────────────────────────
@@ -7491,6 +7586,108 @@ if (1 > 0) {
 "#,
             diffusion_lines = diffusion_lines
         )
+    }
+
+    // ── [odes] init(state) = expr ─────────────────────────────────────────
+
+    /// Turnover model `d/dt(response) = KIN - KOUT*response` with a baseline
+    /// initial condition. `init_lines` is spliced into the `[odes]` block.
+    fn turnover_ode_model(init_lines: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVKIN(10.0, 0.001, 100.0)
+  theta TVKOUT(2.0, 0.001, 100.0)
+  omega ETA_KIN ~ 0.09
+  sigma ADD ~ 0.1
+
+[individual_parameters]
+  KIN  = TVKIN * exp(ETA_KIN)
+  KOUT = TVKOUT
+
+[structural_model]
+  ode(obs_cmt=response, states=[response])
+
+[odes]
+{init_lines}
+  d/dt(response) = KIN - KOUT * response
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method = foce
+"#,
+            init_lines = init_lines
+        )
+    }
+
+    #[test]
+    fn test_init_directive_builds_init_fn() {
+        let src = turnover_ode_model("  init(response) = KIN / KOUT");
+        let parsed = parse_full_model(&src).unwrap();
+        let ode = parsed.model.ode_spec.as_ref().expect("ODE spec");
+        assert!(ode.init_fn.is_some(), "init_fn should be populated");
+
+        // Evaluate at typical values (eta = 0): KIN = 10, KOUT = 2 → 5.0.
+        // For an ODE model, individual params occupy PkParams slots in
+        // declaration order: KIN @ 0, KOUT @ 1.
+        let mut params = [0.0; crate::types::MAX_PK_PARAMS];
+        params[0] = 10.0;
+        params[1] = 2.0;
+        let u0 = ode.initial_state(&params);
+        assert_eq!(u0.len(), 1);
+        assert!(
+            (u0[0] - 5.0).abs() < 1e-9,
+            "init(response) = KIN/KOUT = 5, got {}",
+            u0[0]
+        );
+    }
+
+    #[test]
+    fn test_no_init_directive_seeds_zero() {
+        let src = turnover_ode_model("");
+        let parsed = parse_full_model(&src).unwrap();
+        let ode = parsed.model.ode_spec.as_ref().unwrap();
+        assert!(ode.init_fn.is_none());
+        // initial_state falls back to zeros.
+        assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![0.0]);
+    }
+
+    #[test]
+    fn test_init_unknown_state_errors() {
+        let src = turnover_ode_model("  init(nonexistent) = 1.0");
+        let err = match parse_full_model(&src) {
+            Err(e) => e,
+            Ok(_) => panic!("expected unknown-state error"),
+        };
+        assert!(
+            err.contains("init(nonexistent)") && err.contains("unknown state"),
+            "expected unknown-state error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_duplicate_init_errors() {
+        let src = turnover_ode_model("  init(response) = KIN / KOUT\n  init(response) = 0.0");
+        let err = match parse_full_model(&src) {
+            Err(e) => e,
+            Ok(_) => panic!("expected duplicate-init error"),
+        };
+        assert!(
+            err.contains("duplicate init(response)"),
+            "expected duplicate-init error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_init_literal_value() {
+        let src = turnover_ode_model("  init(response) = 7.5");
+        let parsed = parse_full_model(&src).unwrap();
+        let ode = parsed.model.ode_spec.as_ref().unwrap();
+        assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![7.5]);
     }
 
     #[test]

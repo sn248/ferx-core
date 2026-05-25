@@ -1883,6 +1883,7 @@ pub(crate) mod test_helpers {
                     state_names: vec!["depot".into(), "central".into()],
                     readout: crate::ode::OdeReadout::ObsCmt(0),
                     diffusion_var: Vec::new(),
+                    init_fn: None,
                 })
             } else {
                 None

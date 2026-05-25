@@ -233,9 +233,33 @@ pub struct OdeSpec {
     /// analogous to sigma/omega notation. Updated each outer iteration as
     /// diffusion thetas are re-estimated.
     pub diffusion_var: Vec<f64>,
+    /// Optional per-subject initial compartment amounts. Declared in the
+    /// `[odes]` block as `init(state) = <expr>`; the expression may reference
+    /// individual parameters (so it folds in theta/eta/covariates via the
+    /// individual-parameter layer, exactly like the RHS). Given the flat
+    /// individual-parameter vector (`PkParams.values`), returns the full
+    /// `n_states`-length initial-amount vector — the init value for declared
+    /// states and `0.0` for the rest. `None` when no `init(...)` is declared,
+    /// in which case every compartment starts at zero (the historical default).
+    /// A system reset (EVID=3/4) re-applies this on the ODE event-driven path.
+    #[allow(clippy::type_complexity)]
+    pub init_fn: Option<Box<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync>>,
 }
 
 impl OdeSpec {
+    /// Initial compartment-amount vector for a subject, given the flat
+    /// individual-parameter vector `params` (`PkParams.values`). Returns the
+    /// `init(...)` expression values where declared and `0.0` elsewhere; when
+    /// no `init(...)` is declared this is all zeros — the historical default.
+    /// Used to seed the integrator at the start of a record and to re-seed it
+    /// after an EVID=3/4 reset.
+    pub fn initial_state(&self, params: &[f64]) -> Vec<f64> {
+        match &self.init_fn {
+            Some(f) => f(params),
+            None => vec![0.0; self.n_states],
+        }
+    }
+
     /// Convenience accessor: returns the canonical `obs_cmt_idx` when the
     /// readout is the default `ObsCmt` variant. Used by EKF (which requires
     /// a single observable compartment) and by callers that need to know
@@ -284,7 +308,8 @@ pub fn ode_predictions(
     let n_obs = subject.obs_times.len();
     let opts = OdeSolverOptions::default();
 
-    let mut u = vec![0.0; n];
+    // Seed compartments from `init(state) = expr` (zeros when none declared).
+    let mut u = ode.initial_state(pk_params_flat);
     let mut predictions = vec![f64::NAN; n_obs];
 
     // Lagtime shifts the effective start (and end) of every dose record.
@@ -478,7 +503,18 @@ pub fn ode_predictions_event_driven(
     let n_obs = subject.obs_times.len();
     let opts = OdeSolverOptions::default();
 
-    let mut u = vec![0.0_f64; n];
+    // Seed compartments from `init(state) = expr` (zeros when none declared).
+    // The init expression folds covariates/eta in via the individual-parameter
+    // layer, so evaluate it with a representative per-event parameter set — the
+    // first event's. For the common no-TV case every event shares one set.
+    let init_pk = pk_at_dose
+        .first()
+        .or_else(|| pk_at_obs.first())
+        .or_else(|| pk_at_pk_only.first());
+    let mut u = match init_pk {
+        Some(p) => ode.initial_state(&p.values),
+        None => vec![0.0_f64; n],
+    };
     let mut predictions = vec![f64::NAN; n_obs];
 
     if n_obs == 0 {
@@ -644,11 +680,16 @@ pub fn ode_predictions_event_driven(
                 // segment's `active_infusions` excludes this infusion.
             }
             Kind::Reset => {
-                // EVID=3 / EVID=4: zero every compartment. For EVID=4 the
-                // dose at this same time follows (Reset sorts before Dose),
-                // so it lands in a freshly emptied system. Record the reset
-                // time so infusions started earlier stop contributing.
-                u.iter_mut().for_each(|x| *x = 0.0);
+                // EVID=3 / EVID=4: reset the system. Compartments with an
+                // `init(state) = expr` return to their initial value; all
+                // others go to zero (a reset starts a fresh episode from
+                // baseline). With no init declared this zeros everything.
+                // Evaluate init with the params in effect at the reset
+                // (`last_pk`). For EVID=4 the dose at this same time follows
+                // (Reset sorts before Dose), so it lands on the re-seeded
+                // state. Record the reset time so infusions started earlier
+                // stop contributing.
+                u = ode.initial_state(&last_pk.values);
                 reset_floor = t_event;
             }
         }
@@ -694,6 +735,7 @@ pub fn ode_predictions_ekf_with_diffusion(
             .expect("EKF requires obs_cmt_idx; SDE + [scaling] y = ... is not supported"),
         diffusion_var,
         pk_params_flat,
+        &ode.initial_state(pk_params_flat),
         &subject.doses,
         &subject.obs_times,
         &r_obs_vec,
@@ -751,6 +793,7 @@ pub fn ode_predictions_ekf(
             .expect("EKF requires obs_cmt_idx; SDE + [scaling] y = ... is not supported"),
         &ode.diffusion_var,
         pk_params_flat,
+        &ode.initial_state(pk_params_flat),
         &subject.doses,
         &subject.obs_times,
         &r_obs_vec,
@@ -780,6 +823,7 @@ mod tests {
             state_names: vec!["central".into()],
             readout: OdeReadout::ObsCmt(0),
             diffusion_var: Vec::new(),
+            init_fn: None,
         }
     }
 
@@ -808,6 +852,67 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
         }
+    }
+
+    /// Turnover model with a baseline initial condition:
+    ///   d/dt(R) = kin - kout*R,  init(R) = kin/kout
+    /// params: kin @ slot 0, kout @ slot 1. Observable reads R (state 0).
+    fn turnover_ode_spec_with_init() -> OdeSpec {
+        OdeSpec {
+            rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = p[0] - p[1] * y[0];
+            }),
+            n_states: 1,
+            state_names: vec!["R".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            init_fn: Some(Box::new(|p: &[f64]| {
+                let (kin, kout) = (p[0], p[1]);
+                vec![if kout > 0.0 { kin / kout } else { 0.0 }]
+            })),
+        }
+    }
+
+    fn pk_kin_kout(kin: f64, kout: f64) -> PkParams {
+        let mut p = PkParams::default();
+        p.values[0] = kin;
+        p.values[1] = kout;
+        p
+    }
+
+    #[test]
+    fn ode_init_state_seeds_plain_path() {
+        // No doses; the system starts at baseline kin/kout = 5 and stays there
+        // (dR/dt = 0). Without init it would start at 0 and climb.
+        let ode = turnover_ode_spec_with_init();
+        let pk = pk_kin_kout(10.0, 2.0);
+        let subj = make_subject(Vec::new(), vec![0.0, 1.0, 5.0, 20.0]);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+        for (i, &p) in preds.iter().enumerate() {
+            assert_relative_eq!(p, 5.0, epsilon = 1e-5);
+            let _ = i;
+        }
+    }
+
+    #[test]
+    fn ode_init_state_then_dose_and_reset_reapplies_init() {
+        // Exercises all three: (1) init seeds the start at baseline=5, (2) a
+        // bolus at t=0 lands on top of the seeded state (5 + 20 = 25), and
+        // (3) an EVID=3 reset at t=5 re-applies init (back to 5, NOT zero).
+        let ode = turnover_ode_spec_with_init();
+        let pk = pk_kin_kout(10.0, 2.0); // baseline 5
+        let doses = vec![DoseEvent::new(0.0, 20.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![0.0, 5.0];
+        let mut subj = make_subject(doses, obs_times.clone());
+        subj.reset_times = vec![5.0];
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+        // t=0: init(5) + bolus(20) = 25.
+        assert_relative_eq!(preds[0], 25.0, epsilon = 1e-6);
+        // t=5: reset re-applies init → 5 (a zeroing reset would give 0).
+        assert_relative_eq!(preds[1], 5.0, epsilon = 1e-6);
     }
 
     #[test]
@@ -946,6 +1051,7 @@ mod tests {
             state_names: vec!["depot".into(), "central".into()],
             readout: OdeReadout::ObsCmt(1),
             diffusion_var: Vec::new(),
+            init_fn: None,
         }
     }
 
@@ -1343,6 +1449,7 @@ mod tests {
                 },
             )),
             diffusion_var: Vec::new(),
+            init_fn: None,
         }
     }
 
@@ -1440,6 +1547,7 @@ mod tests {
             state_names: vec!["central".into()],
             readout: OdeReadout::ObsCmt(0),
             diffusion_var: Vec::new(),
+            init_fn: None,
         };
         let pk = pk_one(1.0, 1.0);
         let doses = vec![DoseEvent::new(0.0, 1.0, 1, 0.0, false, 0.0)];

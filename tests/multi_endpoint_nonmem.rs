@@ -19,7 +19,7 @@
 //! Known limitation (NOT asserted tightly here): ferx's outer optimizer
 //! under-converges OMEGA on this dataset — it halts ~2.5 OFV units short of its
 //! own objective minimum (the one check #1 confirms NONMEM reaches), leaving
-//! ETA_CL variance near its initial value. Tracked separately; this is an
+//! ETA_CL variance near its initial value. Tracked in issue #99; this is an
 //! outer-optimizer conditioning issue, not a per-CMT error-model problem (the
 //! objective in check #1 agrees with NONMEM).
 //!

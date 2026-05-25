@@ -78,11 +78,58 @@ pub fn suggest_start_thorough(model: &CompiledModel, population: &Population) ->
         return base;
     }
 
+    // Exclude covariate-effect thetas (e.g. THETA_WT, THETA_CRCL) from the sweep.
+    // These have no mu-referencing link and no standard PK slot mapping, so rRMSE
+    // sweeps on them produce meaningless estimates. A structural theta satisfies at
+    // least one of: (a) it is a TV parameter referenced via mu_refs, or (b) it maps
+    // to a known PK slot (CL, V, Q, V2, Ka, F, Q3, V3, LAGTIME).
+    {
+        let mu_ref_theta_names: std::collections::HashSet<&str> = model
+            .mu_refs
+            .values()
+            .map(|mr| mr.theta_name.as_str())
+            .collect();
+        let pk_slot_indices: std::collections::HashSet<usize> = [
+            PK_IDX_CL,
+            PK_IDX_V,
+            PK_IDX_Q,
+            PK_IDX_V2,
+            PK_IDX_KA,
+            PK_IDX_F,
+            PK_IDX_Q3,
+            PK_IDX_V3,
+            PK_IDX_LAGTIME,
+        ]
+        .iter()
+        .filter_map(|&slot| find_theta_for_slot(model, slot))
+        .collect();
+
+        let n_before = remaining.len();
+        remaining.retain(|&i| {
+            let name = &model.default_params.theta_names[i];
+            mu_ref_theta_names.contains(name.as_str()) || pk_slot_indices.contains(&i)
+        });
+        let n_excluded = n_before - remaining.len();
+        if n_excluded > 0 {
+            base.warnings.push(format!(
+                "suggest_start_thorough: excluded {n_excluded} covariate theta(s) from rRMSE sweep (no mu-ref link and no standard PK slot)"
+            ));
+        }
+    }
+
+    if remaining.is_empty() {
+        return base;
+    }
+
     // Joint 2D sweeps for highly correlated pairs before independent 1D sweeps.
     // CL and V (or CL/F, V/F) lie on a ridge in the rRMSE landscape — sweeping
     // them independently always moves along the ridge rather than across it.
-    // Same applies to (Q, V2).
-    for (slot_a, slot_b, label) in &[(PK_IDX_CL, PK_IDX_V, "CL/V"), (PK_IDX_Q, PK_IDX_V2, "Q/V2")] {
+    // Same applies to (Q, V2) and (F, CL) when both are unwritten.
+    for (slot_a, slot_b, label) in &[
+        (PK_IDX_CL, PK_IDX_V, "CL/V"),
+        (PK_IDX_Q, PK_IDX_V2, "Q/V2"),
+        (PK_IDX_F, PK_IDX_CL, "F/CL"),
+    ] {
         let idx_a = find_theta_for_slot(model, *slot_a);
         let idx_b = find_theta_for_slot(model, *slot_b);
         if let (Some(ia), Some(ib)) = (idx_a, idx_b) {

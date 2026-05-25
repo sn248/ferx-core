@@ -18,7 +18,7 @@
   V  = DISTRIB   * exp(ETA_V)
 
 [structural_model]
-  one_cpt_iv_bolus
+  pk one_cpt_iv_bolus(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)

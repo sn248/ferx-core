@@ -17,7 +17,7 @@
   V  = TVV  * exp(ETA_V)
 
 [structural_model]
-  one_cpt_infusion
+  pk one_cpt_infusion(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)

@@ -599,25 +599,25 @@ impl Default for ErrorSpec {
 }
 
 impl ErrorSpec {
-    /// Residual variance for one observation, dispatching on its compartment.
+    /// `SigmaType` for each entry of the flat global sigma vector, as a `Vec`
+    /// of length `n_sigma`, so `FitResult` can label/scale every sigma.
     ///
-    /// For `Single` the `cmt` is ignored and the full `sigma` slice is used
-    /// (the back-compat path). For `PerCmt` the endpoint registered for `cmt`
-    /// selects the error model and slices `sigma` by its `sigma_idx`. A CMT
-    /// with no registered endpoint yields a NaN variance — a defensive guard
-    /// mirroring the scaling path; fit-time validation rejects that case up
-    /// front, so it is only reachable via a hand-constructed `CompiledModel`.
-    /// `SigmaType` for each entry of the flat global sigma vector (length
-    /// `n_sigma`), so `FitResult` can label/scale each sigma correctly.
-    ///
-    /// For `Single` this is just the model's own sigma types. For `PerCmt`
-    /// each endpoint stamps the type of every sigma index it owns; any sigma
-    /// declared but not referenced by an endpoint defaults to `Additive`.
+    /// `Single` stamps the error model's own sigma types into the leading
+    /// slots and leaves any further declared sigmas as `Additive`. `PerCmt`
+    /// stamps the type of every sigma index each endpoint owns; sigmas not
+    /// referenced by any endpoint default to `Additive`. Either way the
+    /// returned length always equals `n_sigma`.
     pub fn sigma_types(&self, n_sigma: usize) -> Vec<SigmaType> {
+        let mut out = vec![SigmaType::Additive; n_sigma];
         match self {
-            ErrorSpec::Single(em) => em.sigma_types(),
+            ErrorSpec::Single(em) => {
+                for (i, t) in em.sigma_types().into_iter().enumerate() {
+                    if i < out.len() {
+                        out[i] = t;
+                    }
+                }
+            }
             ErrorSpec::PerCmt(map) => {
-                let mut out = vec![SigmaType::Additive; n_sigma];
                 for ep in map.values() {
                     let types = ep.error_model.sigma_types();
                     for (k, &idx) in ep.sigma_idx.iter().enumerate() {
@@ -626,25 +626,39 @@ impl ErrorSpec {
                         }
                     }
                 }
-                out
             }
         }
+        out
     }
 
+    /// Residual variance for one observation, dispatching on its compartment.
+    ///
+    /// For `Single` the `cmt` is ignored and the full `sigma` slice is used
+    /// (the back-compat path). For `PerCmt` the endpoint registered for `cmt`
+    /// selects the error model and slices `sigma` by its `sigma_idx`. Returns
+    /// `NaN` when `cmt` has no registered endpoint, or when an endpoint's
+    /// `sigma_idx` points outside `sigma` — defensive guards mirroring the
+    /// scaling path. Fit-time validation rejects an uncovered CMT up front,
+    /// and `build_error_spec` resolves indices against the real sigma vector,
+    /// so a `NaN` here is only reachable via a hand-constructed model.
     pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
         use crate::stats::residual_error::residual_variance;
         match self {
             ErrorSpec::Single(em) => residual_variance(*em, f_pred, sigma),
             ErrorSpec::PerCmt(map) => match map.get(&cmt) {
                 Some(ep) => {
-                    // At most two sigmas (Combined); avoid a heap allocation in
-                    // this per-observation hot path.
+                    // Slice length is tied to the endpoint's error model
+                    // (1 for additive/proportional, 2 for combined); the max
+                    // is 2, so a stack buffer avoids a per-observation alloc.
+                    let n = ep.error_model.n_sigma();
                     let mut buf = [0.0f64; 2];
-                    let n = ep.sigma_idx.len().min(2);
-                    for (k, &i) in ep.sigma_idx.iter().take(2).enumerate() {
-                        buf[k] = sigma[i];
+                    for k in 0..n.min(2) {
+                        match ep.sigma_idx.get(k).and_then(|&i| sigma.get(i)) {
+                            Some(&v) => buf[k] = v,
+                            None => return f64::NAN, // malformed spec / sigma length
+                        }
                     }
-                    residual_variance(ep.error_model, f_pred, &buf[..n])
+                    residual_variance(ep.error_model, f_pred, &buf[..n.min(2)])
                 }
                 None => f64::NAN,
             },
@@ -2062,6 +2076,43 @@ mod tests {
 
         // Unregistered CMT → NaN guard.
         assert!(spec.variance_at(1, 10.0, &sigma).is_nan());
+    }
+
+    #[test]
+    fn error_spec_single_sigma_types_padded_to_n_sigma() {
+        // Single proportional with extra declared sigmas: leading slot is
+        // proportional, the rest default to additive, length == n_sigma.
+        let spec = ErrorSpec::Single(ErrorModel::Proportional);
+        assert_eq!(
+            spec.sigma_types(3),
+            vec![
+                SigmaType::Proportional,
+                SigmaType::Additive,
+                SigmaType::Additive
+            ]
+        );
+        // Combined stamps both leading slots.
+        let combined = ErrorSpec::Single(ErrorModel::Combined);
+        assert_eq!(
+            combined.sigma_types(2),
+            vec![SigmaType::Proportional, SigmaType::Additive]
+        );
+    }
+
+    #[test]
+    fn error_spec_per_cmt_variance_at_out_of_range_idx_is_nan() {
+        // Hand-constructed endpoint whose sigma_idx points past the sigma slice
+        // must yield NaN, not panic.
+        let mut map = HashMap::new();
+        map.insert(
+            2,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![5], // out of range for a length-1 sigma vector
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        assert!(spec.variance_at(2, 10.0, &[0.1]).is_nan());
     }
 
     #[test]

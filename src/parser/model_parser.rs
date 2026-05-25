@@ -3337,10 +3337,11 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
 /// names here; `build_error_spec` resolves them to indices into the flat
 /// global sigma vector once the `[parameters]` block has been parsed.
 enum ParsedErrorModel {
-    /// Single error model applied to all observations (no `CMT=` prefix). Its
-    /// sigmas come from the full global sigma vector, so the names need not be
-    /// retained here.
-    Single(ErrorModel),
+    /// Single error model applied to all observations (no `CMT=` prefix).
+    /// Carries the referenced sigma name(s) so `build_error_spec` can check
+    /// they were declared in `[parameters]` (sigmas are then consumed
+    /// positionally from the global sigma vector).
+    Single(ErrorModel, Vec<String>),
     /// Per-CMT error models (every line prefixed `CMT=N:`). One entry per line,
     /// in source order; duplicates are rejected here.
     PerCmt(Vec<(usize, ErrorModel, Vec<String>)>),
@@ -3357,7 +3358,7 @@ fn parse_error_model(lines: &[String]) -> Result<ParsedErrorModel, String> {
     let re = Regex::new(r"(\w+)\s*~\s*(\w+)\(([^)]+)\)").unwrap();
     let cmt_re = Regex::new(r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$").unwrap();
 
-    let mut singles: Vec<ErrorModel> = Vec::new();
+    let mut singles: Vec<(ErrorModel, Vec<String>)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
 
     for line in lines {
@@ -3400,7 +3401,7 @@ fn parse_error_model(lines: &[String]) -> Result<ParsedErrorModel, String> {
 
         match cmt_opt {
             Some(cmt) => per_cmt.push((cmt, error_model, sigma_names)),
-            None => singles.push(error_model),
+            None => singles.push((error_model, sigma_names)),
         }
     }
 
@@ -3424,7 +3425,7 @@ fn parse_error_model(lines: &[String]) -> Result<ParsedErrorModel, String> {
     }
 
     match singles.into_iter().next() {
-        Some(model) => Ok(ParsedErrorModel::Single(model)),
+        Some((model, names)) => Ok(ParsedErrorModel::Single(model, names)),
         None => Err("No error model found in [error_model] block".to_string()),
     }
 }
@@ -3439,7 +3440,22 @@ fn build_error_spec(
     is_ode: bool,
 ) -> Result<(ErrorModel, ErrorSpec), String> {
     match parsed {
-        ParsedErrorModel::Single(model) => Ok((model, ErrorSpec::Single(model))),
+        ParsedErrorModel::Single(model, names) => {
+            // Single-endpoint sigmas are consumed positionally from the global
+            // sigma vector, but a referenced name that was never declared in
+            // [parameters] is a typo we should catch rather than silently bind
+            // to sigma[0]. (Mirrors the strict resolution on the PerCmt path.)
+            for nm in &names {
+                if !sigma_names.iter().any(|s| s == nm) {
+                    return Err(format!(
+                        "[error_model] references unknown sigma '{}' \
+                         (declare it in [parameters])",
+                        nm
+                    ));
+                }
+            }
+            Ok((model, ErrorSpec::Single(model)))
+        }
         ParsedErrorModel::PerCmt(entries) => {
             if !is_ode {
                 return Err(
@@ -7593,6 +7609,31 @@ if (1 > 0) {
             "  DV ~ proportional(PROP_ERR_PK)\n  CMT=2: DV ~ additive(ADD_ERR_PD)",
         ));
         assert!(err.contains("mixes"), "got: {err}");
+    }
+
+    #[test]
+    fn test_single_error_unknown_sigma_rejected() {
+        // A single (unprefixed) error line that references a sigma not declared
+        // in [parameters] is a typo, not a silent bind to sigma[0].
+        let model_str = r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(NO_SUCH_SIGMA)
+";
+        let err = expect_parse_err(model_str);
+        assert!(err.contains("unknown sigma"), "got: {err}");
     }
 
     #[test]

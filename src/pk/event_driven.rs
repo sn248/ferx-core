@@ -1144,6 +1144,57 @@ mod tests {
         assert_relative_eq!(preds[1], 0.0, epsilon = 1e-12);
     }
 
+    #[test]
+    fn reset_zeros_depot_for_oral_model() {
+        // Oral model: the dose lands in the depot (state[0]) and observations
+        // read central (state[1]). A reset must zero BOTH compartments, so an
+        // EVID=4 redose reproduces the fresh-dose curve even though drug was
+        // still in the depot/central at reset time.
+        let mut pk = pk_one(8.0, 50.0);
+        pk.values[crate::types::PK_IDX_KA] = 1.2;
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(10.0, 1000.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![10.5, 12.0, 16.0];
+        let mut subj = make_subject(doses, obs_times.clone());
+        subj.reset_times = vec![10.0]; // EVID=4 at t=10
+
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+        let preds = event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs, &[]);
+
+        let fresh = vec![DoseEvent::new(10.0, 1000.0, 1, 0.0, false, 0.0)];
+        for (i, &t) in obs_times.iter().enumerate() {
+            let expected = crate::pk::predict_concentration(PkModel::OneCptOral, &fresh, t, &pk);
+            assert_relative_eq!(preds[i], expected, epsilon = 1e-10, max_relative = 1e-10);
+        }
+    }
+
+    #[test]
+    fn reset_zeros_peripheral_for_two_cpt() {
+        // 2-cpt: a reset must empty the peripheral compartment too, not just
+        // central. After a long first interval drug has distributed into the
+        // periphery; a reset+redose must still match a lone fresh dose.
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(20.0, 1000.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![20.5, 24.0, 32.0];
+        let mut subj = make_subject(doses, obs_times.clone());
+        subj.reset_times = vec![20.0];
+        let pk = pk_two(5.0, 30.0, 2.0, 50.0);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let preds = event_driven_predictions(PkModel::TwoCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let fresh = vec![DoseEvent::new(20.0, 1000.0, 1, 0.0, false, 0.0)];
+        for (i, &t) in obs_times.iter().enumerate() {
+            let expected = crate::pk::predict_concentration(PkModel::TwoCptIvBolus, &fresh, t, &pk);
+            assert_relative_eq!(preds[i], expected, epsilon = 1e-9, max_relative = 1e-9);
+        }
+    }
+
     // ── Equivalence with superposition (constant pk_params) ───────────────────
 
     #[test]

@@ -1667,10 +1667,27 @@ pub struct FitOptions {
     /// and store its path in `FitResult::trace_path`. Default: `false`.
     pub optimizer_trace: bool,
     /// Apply an additional scaling layer on top of the existing log/Cholesky
-    /// parameterization so that all transformed parameters are O(1) when
-    /// passed to the outer optimizer.  Scaling is mathematically transparent
-    /// (identical OFV and estimates by design); it only changes the internal
-    /// coordinate system seen by NLopt / BFGS / GN.  Default: `true`.
+    /// parameterization, dividing each transformed coordinate by its initial
+    /// magnitude so they are O(1) when passed to the outer optimizer.
+    ///
+    /// **Default: `false`** (changed in issue #99). The scaling layer is *not*
+    /// trajectory-transparent: although the OFV value is unchanged at any
+    /// fixed point, the layer rescales the gradient the optimizer sees, and
+    /// that gradient feeds the SLSQP overshoot cap (`cap_slsqp_gradient`), the
+    /// quasi-Newton Hessian estimate, and the xtol/ftol termination — all of
+    /// which act in the scaled coordinate system, so the *trajectory* and stop
+    /// point differ. Because the scaling-enabled path only ever runs on
+    /// log/Cholesky-packed coordinates (it auto-disables when any
+    /// identity-packed theta is present), dividing by `|log value|` is
+    /// counterproductive: a coordinate like `ln(V) = ln(20) ≈ 3` gets scale 3,
+    /// so the optimizer's unit step becomes a 3-unit move in log space — an
+    /// e³ ≈ 20× multiplicative jump in V. That large step both overshoots and,
+    /// through the uniform gradient cap, starves the step in every other
+    /// dimension (notably OMEGA), which then halts on xtol ~2.5 OFV units
+    /// short of the minimum (issue #99; the earlier SAD_SCEN1 slowdown noted
+    /// in `optimize_nlopt` is the same effect). The `false` default reproduces
+    /// the well-tested pre-scaling-layer behaviour; `true` is left as an
+    /// opt-in for experimentation.
     pub scale_params: bool,
     /// Fraction of subjects allowed to have unconverged EBEs before the outer
     /// optimizer rejects the current parameter step (returns OFV = ∞).  Set to
@@ -1747,7 +1764,7 @@ impl Default for FitOptions {
             user_set_keys: Vec::new(),
             gradient_method: GradientMethod::default(),
             optimizer_trace: false,
-            scale_params: true,
+            scale_params: false,
             max_unconverged_frac: 0.1,
             min_obs_for_convergence_check: 2,
             stagnation_guard: true,

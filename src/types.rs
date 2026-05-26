@@ -1708,6 +1708,11 @@ pub struct FitOptions {
     /// (or to `outer_maxiter`), e.g. for debugging or for problems with
     /// very slow-but-real OFV improvements below the stagnation threshold.
     pub stagnation_guard: bool,
+    /// When `Some(_)`, call [`crate::suggest_start::inits_from_nca`] with the
+    /// selected strategy before the optimizer loop to derive NCA-based starting
+    /// values from the data. Useful when the model file's defaults are far from
+    /// the truth. `None` (the default) disables it.
+    pub inits_from_nca: Option<crate::suggest_start::NcaInit>,
 }
 
 impl Default for FitOptions {
@@ -1768,6 +1773,7 @@ impl Default for FitOptions {
             max_unconverged_frac: 0.1,
             min_obs_for_convergence_check: 2,
             stagnation_guard: true,
+            inits_from_nca: None,
         }
     }
 }
@@ -1943,6 +1949,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "scale_params",
         "max_unconverged_frac",
         "min_obs_for_convergence_check",
+        "inits_from_nca",
     ]
 }
 

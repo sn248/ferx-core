@@ -1833,6 +1833,21 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 parse_usize("min_obs_for_convergence_check")? as u32
         }
         "stagnation_guard" => opts.stagnation_guard = parse_bool("stagnation_guard")?,
+        "inits_from_nca" => {
+            use crate::suggest_start::NcaInit;
+            opts.inits_from_nca = match value.to_lowercase().as_str() {
+                "false" | "off" | "none" | "no" | "0" => None,
+                "true" | "yes" | "1" | "nca_sweep" | "sweep" => Some(NcaInit::Sweep),
+                "nca" => Some(NcaInit::Nca),
+                "nca_ebe" | "ebe" => Some(NcaInit::Ebe),
+                other => {
+                    return Err(format!(
+                        "fit option `inits_from_nca`: unknown value `{other}` — expected \
+                         true/false or one of 'nca', 'nca_sweep', 'nca_ebe'"
+                    ));
+                }
+            };
+        }
         _ => return Ok(false),
     }
     opts.user_set_keys.push(key.to_string());
@@ -5205,6 +5220,28 @@ mod tests {
         assert_eq!(opts.method, EstimationMethod::FoceI);
         assert!(opts.methods.is_empty());
         assert!(opts.interaction);
+    }
+
+    #[test]
+    fn test_parse_inits_from_nca() {
+        use crate::suggest_start::NcaInit;
+        // Default is off.
+        assert_eq!(FitOptions::default().inits_from_nca, None);
+        // Boolean true maps to the sweep strategy.
+        let opts = parse_fit_options(&["inits_from_nca = true".to_string()]).unwrap();
+        assert_eq!(opts.inits_from_nca, Some(NcaInit::Sweep));
+        // Boolean false disables.
+        let opts = parse_fit_options(&["inits_from_nca = false".to_string()]).unwrap();
+        assert_eq!(opts.inits_from_nca, None);
+        // Explicit strategy names.
+        let opts = parse_fit_options(&["inits_from_nca = nca".to_string()]).unwrap();
+        assert_eq!(opts.inits_from_nca, Some(NcaInit::Nca));
+        let opts = parse_fit_options(&["inits_from_nca = nca_sweep".to_string()]).unwrap();
+        assert_eq!(opts.inits_from_nca, Some(NcaInit::Sweep));
+        let opts = parse_fit_options(&["inits_from_nca = nca_ebe".to_string()]).unwrap();
+        assert_eq!(opts.inits_from_nca, Some(NcaInit::Ebe));
+        // Unknown value is rejected.
+        assert!(parse_fit_options(&["inits_from_nca = bogus".to_string()]).is_err());
     }
 
     #[test]

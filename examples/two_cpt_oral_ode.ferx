@@ -1,0 +1,46 @@
+# Two-compartment oral PK model (ODE, no covariates)
+#
+# Simplified ODE version for suggest_start testing.
+# Uses two_cpt_oral_cov.csv but ignores covariate effects.
+# True parameters approximately: CL=4, V1=40, Q=8, V2=80, KA=1.
+# States:
+#   CMT=1  depot      — oral dose (mg)
+#   CMT=2  central    — concentration (mg/L)
+#   CMT=3  peripheral — concentration (mg/L)
+
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0,   0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0,  0.01, 10.0)
+
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  omega ETA_Q  ~ 0.08
+  omega ETA_V2 ~ 0.08
+  omega ETA_KA ~ 0.20
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ  * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central, peripheral])
+
+[odes]
+  d/dt(depot)      = -KA * depot
+  d/dt(central)    =  KA * depot / V1 - (CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central - (Q/V2) * peripheral
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 500

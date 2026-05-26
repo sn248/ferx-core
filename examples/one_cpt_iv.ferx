@@ -1,0 +1,26 @@
+# One-compartment IV bolus PK model (analytical)
+#
+# True parameters: CL=5 L/h, V=50 L
+
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV(40.0,  1.0, 500.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 300

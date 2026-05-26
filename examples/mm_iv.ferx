@@ -1,0 +1,40 @@
+# 1-cpt IV bolus with Michaelis-Menten elimination.
+#
+# State is in amount (mg); dose adds directly to central.
+# Observation is concentration: y = central / V.
+#
+# Parameters:
+#   VMAX  maximal elimination rate (mg/h)
+#   KM    Michaelis constant (mg/L = concentration)
+#   V     volume of distribution (L)
+
+[parameters]
+  theta TVVMAX(5.0,  0.1, 100.0)
+  theta TVKM(2.0,   0.01, 50.0)
+  theta TVV(10.0,   0.5, 200.0)
+
+  omega ETA_VMAX ~ 0.09
+  omega ETA_V    ~ 0.09
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  VMAX = TVVMAX * exp(ETA_VMAX)
+  KM   = TVKM
+  V    = TVV * exp(ETA_V)
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -(VMAX * (central / V)) / (KM + (central / V))
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 300

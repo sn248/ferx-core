@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-e6c23135.js";
+            window.path_to_searchindex_js = "searchindex-3459c454.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-39f227ad.js"></script>
@@ -1417,6 +1417,45 @@ reference values and the NONMEM control files are documented in
 <p>Combines proportional and additive components:</p>
 <p>\[ \text{Var}(DV) = (\sigma_1 \cdot f)^2 + \sigma_2^2 \]</p>
 <p>Use when both proportional and additive error sources are present. Requires two sigma parameters defined in <code>[parameters]</code>.</p>
+<h2 id="multiple-endpoints-per-cmt-error-models"><a class="header" href="#multiple-endpoints-per-cmt-error-models">Multiple endpoints (per-CMT error models)</a></h2>
+<p>For simultaneous PK/PD (and other multi-analyte) models, a single observed
+compartment is not enough: plasma concentrations and a PD effect typically
+need <em>different</em> residual error models in the <em>same</em> joint likelihood. Prefix
+each error line with <code>CMT=N:</code> to assign a distinct error model to each observed
+compartment, dispatched by the dataset’s <code>CMT</code> column:</p>
+<pre><code>[error_model]
+  CMT=2: DV ~ proportional(PROP_ERR_PK)   # plasma concentration (central)
+  CMT=3: DV ~ additive(ADD_ERR_PD)        # PD effect (effect compartment)
+</code></pre>
+<p>Every observation row is matched to the endpoint whose <code>CMT=N</code> equals its
+<code>CMT</code> value, and its residual variance is computed from that endpoint’s error
+model and sigma(s). All endpoints contribute to one FOCEI objective, so PK and
+PD parameters — and their uncertainty — are estimated jointly. This is the
+gold-standard alternative to the sequential workaround (fit PK, freeze IPRED,
+then fit PD), which underestimates uncertainty.</p>
+<p>Each endpoint’s sigma parameters are declared once in <code>[parameters]</code>, as usual:</p>
+<pre><code>[parameters]
+  sigma PROP_ERR_PK ~ 0.10 (sd)
+  sigma ADD_ERR_PD  ~ 1.00 (sd)
+</code></pre>
+<p>Rules and restrictions:</p>
+<ul>
+<li><strong>ODE models only.</strong> Per-CMT dispatch lives in the finite-difference
+likelihood path used by ODE models. An analytical PK model with <code>CMT=N:</code>
+lines is rejected at parse time.</li>
+<li><strong>No mixing styles.</strong> An <code>[error_model]</code> block is either a single plain
+<code>DV ~ ...</code> line <em>or</em> all <code>CMT=N:</code> lines — not both.</li>
+<li><strong>Coverage is checked at fit time.</strong> Every observed <code>CMT</code> in the dataset must
+have a matching <code>CMT=N:</code> entry, or <code>fit()</code> errors and names the missing
+compartments. Duplicate <code>CMT=N</code> entries are rejected at parse time.</li>
+<li><strong>Estimation method.</strong> Supported with FOCE/FOCEI, the Gauss-Newton
+optimizers, and SAEM (optionally followed by <code>imp</code>).</li>
+</ul>
+<p>A complete worked model lives in <a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/emax_pkpd.ferx"><code>examples/emax_pkpd.ferx</code></a>
+— an oral 1-compartment PK model with an effect-compartment Emax PD readout,
+proportional error on the plasma endpoint and additive error on the PD
+endpoint. The per-CMT <em>readout</em> (which compartment/expression each <code>CMT</code> maps
+to) is configured in the <a href="#scaling"><code>[scaling]</code></a> block.</p>
 <h2 id="sigma-scale"><a class="header" href="#sigma-scale">Sigma scale</a></h2>
 <p><strong>All sigma parameters are estimated and reported on the standard-deviation scale</strong>, not the variance scale. This is true for both proportional and additive components, and for both elements of a combined error model.</p>
 <p>In particular:</p>
@@ -2344,7 +2383,7 @@ cheaper than the previous FD-Hessian path (O(n²) OFV evaluations per Hessian).<
 <tr><th>Key</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>scale_params</code></td><td><code>true</code></td><td>Scale packed parameters to O(1) before passing to the optimizer. Improves conditioning when log-transformed parameters span several orders of magnitude. Set to <code>false</code> to disable (reproduces pre-PR2 behaviour).</td></tr>
+<tr><td><code>scale_params</code></td><td><code>false</code></td><td>Divide each packed (log/Cholesky) coordinate by its initial magnitude before passing it to the optimizer. <strong>Off by default since issue #99:</strong> the scaling-enabled path only ever runs on log/Cholesky coordinates, where dividing by <code>|log value|</code> is counterproductive — e.g. <code>ln(V)=ln(20)≈3</code> gets scale 3, turning the optimizer’s unit step into a ≈20× multiplicative jump in V, which overshoots and (via the uniform SLSQP gradient cap) starves the step in other dimensions such as OMEGA, halting short of the minimum. The OFV value is unchanged at any fixed point, but the optimizer <em>trajectory</em> and stop point are not. Set to <code>true</code> only for experimentation.</td></tr>
 <tr><td><code>max_unconverged_frac</code></td><td><code>0.1</code></td><td>Fraction of subjects (with at least <code>min_obs_for_convergence_check</code> observations) allowed to have unconverged EBEs before the outer optimizer rejects the step (returns OFV = ∞). Set to <code>1.0</code> to disable the guard.</td></tr>
 <tr><td><code>min_obs_for_convergence_check</code></td><td><code>2</code></td><td>Subjects with fewer than this many observations are excluded from the <code>max_unconverged_frac</code> check (they still run normally).</td></tr>
 <tr><td><code>stagnation_guard</code></td><td><code>true</code></td><td>Short-circuit the NLopt-based outer optimizers once recent evals show no OFV improvement above 1e-3 over a window of <code>3*(n+1).max(50)</code> evals. This lets SLSQP / L-BFGS terminate quickly via their own xtol/ftol on numerically-flat plateaus (e.g. γ-bearing FOCEI problems) instead of grinding through the remaining <code>outer_maxiter</code> budget at full inner-loop cost. Set to <code>false</code> to let the optimizer run to its natural termination criterion — useful when debugging or for problems with very slow but real OFV improvements below the threshold.</td></tr>
@@ -2582,6 +2621,7 @@ warnings.</p>
 <p>For each subject, the inner loop finds the empirical Bayes estimate (EBE) of the random effects \( \hat{\eta}_i \) by minimizing the individual negative log-likelihood:</p>
 <p>\[ -\log p(\eta_i | y_i, \theta, \Omega, \sigma) = \frac{1}{2} \left[ \eta_i^T \Omega^{-1} \eta_i + \log|\Omega| + \sum_j \left( \frac{(y_{ij} - f_{ij})^2}{V_{ij}} + \log V_{ij} \right) \right] \]</p>
 <p>The inner loop uses BFGS with automatic differentiation gradients, falling back to Nelder-Mead simplex if BFGS fails.</p>
+<p>If the EBE search wanders into a region where the individual NLL evaluates to a non-finite value (for example, an ODE model whose integration blows up at extreme \( \eta \)), that point is treated as the worst possible objective rather than aborting the fit. The subject is reported as non-converged and estimation continues for the remaining subjects.</p>
 <h2 id="foce-vs-focei"><a class="header" href="#foce-vs-focei">FOCE vs FOCEI</a></h2>
 <h3 id="standard-foce"><a class="header" href="#standard-foce">Standard FOCE</a></h3>
 <p>Uses linearized predictions around the EBEs:</p>
@@ -3250,11 +3290,24 @@ kappa KAPPA_KA ~ 0.10
 <p>\[
 x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Omega_\text{IOV})]
 \]</p>
-<p>The per-subject FOCE objective uses a block-diagonal omega that stacks the BSV block with <em>K</em> copies of Ω_IOV:</p>
+<p>The per-subject FOCE objective is a <em>proper augmented marginal</em>: the per-occasion kappas are integrated out through the linearised marginal exactly like the BSV etas. The random-effect vector is \( b = [\eta,\ \kappa_1, \ldots, \kappa_K] \) with block-diagonal prior covariance</p>
 <p>\[
-\Omega_\text{full} = \text{blockdiag}(\Omega_\text{BSV},\ \Omega_\text{IOV},\ \ldots,\ \Omega_\text{IOV})
+\Sigma_b = \text{blockdiag}(\Omega_\text{BSV},\ \Omega_\text{IOV},\ \ldots,\ \Omega_\text{IOV})
 \]</p>
-<p>The H-matrix (Jacobian ∂f/∂η) covers BSV etas only — kappa columns are not included in the FOCE linearization.</p>
+<p>(<em>K</em> copies of Ω_IOV), and the H-matrix is <strong>augmented</strong> with kappa columns,
+\( H_\text{full} = [,\partial f/\partial\eta \mid \partial f/\partial\kappa_1 \mid \cdots \mid \partial f/\partial\kappa_K,] \). Because \( \kappa_k \) enters only occasion-<em>k</em>’s predictions, its columns are non-zero only on that occasion’s rows. The objective is then the ordinary Sheiner–Beal form</p>
+<p>\[
+\text{NLL}<em>i = \tfrac{1}{2}\left[(y - f_0)^T \tilde{R}^{-1} (y - f_0) + \log|\tilde{R}|\right],\qquad
+\tilde{R} = H</em>\text{full},\Sigma_b,H_\text{full}^T + R
+\]</p>
+<p>with no separate kappa prior added (it is already folded into \( \tilde{R} \)). This reduces exactly to the BSV-only FOCE objective when there are no kappas.</p>
+<blockquote>
+<p><strong>Why this matters (issue #101).</strong> An earlier implementation linearised only the BSV etas and added an explicit kappa MAP penalty \( \tfrac{1}{2}\sum_k(\kappa_k^T\Omega_\text{IOV}^{-1}\kappa_k + \log|\Omega_\text{IOV}|) \). That penalty omits the kappa Laplace determinant, so Ω_IOV was unidentified and the FOCE OFV disagreed with SAEM and NONMEM. The augmented marginal above fixes this; all estimation paths now share one consistent objective.</p>
+</blockquote>
+<h3 id="outer-loop-gradient-ebe-re-convergence-for-iov"><a class="header" href="#outer-loop-gradient-ebe-re-convergence-for-iov">Outer-loop gradient (EBE re-convergence for IOV)</a></h3>
+<p>For non-IOV models the outer optimizer uses a cheap analytical gradient with the EBEs held fixed, which converges OMEGA correctly. IOV is different: the variance components — especially Ω_IOV — are <em>weakly identified</em>, and their gradient is dominated by the <strong>EBE response</strong>. Raising Ω_IOV un-shrinks the per-occasion kappas and improves the data fit, an effect a fixed-EBE gradient cannot see, so gradient optimizers leave Ω_IOV pinned at its initial value (while derivative-free methods, which re-solve the EBEs at each trial point, move it freely).</p>
+<p>For IOV models (<code>n_kappa &gt; 0</code>) the outer gradient is therefore computed by <strong>central finite differences that re-converge the inner loop at each perturbed point</strong> (<code>reconverged_fd_gradient</code>). This restores the correct descent direction for the variance components at a cost of <code>2·n_free</code> inner-loop solves per gradient; it is gated to IOV so the non-IOV path is unaffected.</p>
+<p>In addition, on the <strong>SLSQP</strong> path IOV models auto-enable per-coordinate scaling. SLSQP applies a uniform gradient cap that rescales the whole gradient by its largest (theta) component; with the disparate-magnitude IOV parameters (block-diagonal omega + kappa) that cap otherwise starves the omega/Ω_IOV step and leaves the variances pinned at their initial values. Presenting O(1) scaled coordinates removes the starvation, so a <em>pure</em> FOCEI/SLSQP fit reaches the marginal minimum from a cold start. (This scaling is scoped to IOV + SLSQP: it is unnecessary for BFGS, which optimizes in unscaled space, and counter-productive for MMA — and the global <code>scale_params</code> default stays off to preserve the issue-#99 non-IOV behaviour.)</p>
 <h3 id="covariance-step-1"><a class="header" href="#covariance-step-1">Covariance step</a></h3>
 <p>When <code>covariance = true</code>, standard errors for the IOV omega diagonal (or its Cholesky elements) are computed via the finite-difference Hessian at convergence, using the same procedure as for BSV omega.</p>
 <h2 id="output-3"><a class="header" href="#output-3">Output</a></h2>
@@ -3279,7 +3332,9 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 </blockquote>
 <h2 id="limitations-2"><a class="header" href="#limitations-2">Limitations</a></h2>
 <ul>
-<li><strong>SAEM is not supported</strong> with IOV models — an error is returned directing you to use <code>foce</code> or <code>focei</code>.</li>
+<li><strong>Cross-occasion dose carryover.</strong> Predictions are computed by <code>pk::predict_iov</code>, which builds per-event PK parameters carrying each event’s occasion kappa and propagates the compartment amounts <em>continuously</em> across occasion boundaries (via the event-driven solver). A dose from an earlier occasion is therefore eliminated through a later occasion with the later occasion’s clearance — matching NONMEM’s integration model (this replaced the earlier “Option A” superposition, which used a single clearance for the whole dose history and biased no-washout designs; issue #104). On the warfarin IOV reference, ferx’s population prediction now matches NONMEM’s to 5 significant figures on every row. A ~17 OFV-unit gap versus NONMEM remains at matched parameters, but it is <em>not</em> a prediction difference — it is a cross-engine FOCEI marginal/EBE difference for this weakly-identified multi-random-effect model (and NONMEM’s reference itself did not converge cleanly here). See <code>tests/warfarin_iov_nonmem.rs</code>.</li>
+<li><strong>Local-optimizer convergence from a far-off cold start.</strong> Pure FOCEI (SLSQP via the auto-scaling above, or BFGS) reaches the minimum from a <em>sensible</em> start, but the IOV variance surface is ill-conditioned and weakly identified, so a <em>far-off</em> start (e.g. a residual-error init off by more than ~2×) can still stall. Set a realistic <code>sigma</code> init (a too-small one drives early omega inflation). The most robust workflow remains <strong>SAEM</strong>, or a <code>methods = [saem, focei]</code> chain (SAEM finds the basin, FOCEI polishes to a strictly better marginal optimum). See <code>tests/iov_convergence.rs</code>.</li>
+<li><strong>ODE Form C output (<code>[scaling] y = &lt;expr&gt;</code>) cannot reference <code>KAPPA_*</code> directly</strong> under IOV — the readout is evaluated once per observation with a single eta, so a direct kappa reference would see <code>kappa = 0</code>. The parser rejects it with a clear error (issue #107); put the occasion dependence in the structural parameters (e.g. <code>CL</code>) and reference those in the readout instead. The PK dynamics themselves are always occasion-correct.</li>
 <li><strong>Automatic differentiation (AD) is not used</strong> for IOV inner-loop gradients; finite differences are used instead. For large models this is slower than the AD path used for BSV-only models.</li>
 <li>The occasion column must contain non-negative integers. Non-integer or negative values are silently treated as missing (<code>OCC = 0</code>) and a single summary warning is emitted.</li>
 <li>Per-kappa shrinkage is not yet computed (see Output note above).</li>

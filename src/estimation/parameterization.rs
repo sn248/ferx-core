@@ -750,6 +750,7 @@ mod tests {
             name: "test".into(),
             pk_model: PkModel::OneCptIvBolus,
             error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|_, _, _| PkParams::default()),
             n_theta: 3,
             n_eta: 3,

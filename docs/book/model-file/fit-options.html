@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-e6c23135.js";
+            window.path_to_searchindex_js = "../searchindex-3459c454.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-39f227ad.js"></script>
@@ -337,7 +337,7 @@ cheaper than the previous FD-Hessian path (O(n²) OFV evaluations per Hessian).<
 <tr><th>Key</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>scale_params</code></td><td><code>true</code></td><td>Scale packed parameters to O(1) before passing to the optimizer. Improves conditioning when log-transformed parameters span several orders of magnitude. Set to <code>false</code> to disable (reproduces pre-PR2 behaviour).</td></tr>
+<tr><td><code>scale_params</code></td><td><code>false</code></td><td>Divide each packed (log/Cholesky) coordinate by its initial magnitude before passing it to the optimizer. <strong>Off by default since issue #99:</strong> the scaling-enabled path only ever runs on log/Cholesky coordinates, where dividing by <code>|log value|</code> is counterproductive — e.g. <code>ln(V)=ln(20)≈3</code> gets scale 3, turning the optimizer’s unit step into a ≈20× multiplicative jump in V, which overshoots and (via the uniform SLSQP gradient cap) starves the step in other dimensions such as OMEGA, halting short of the minimum. The OFV value is unchanged at any fixed point, but the optimizer <em>trajectory</em> and stop point are not. Set to <code>true</code> only for experimentation.</td></tr>
 <tr><td><code>max_unconverged_frac</code></td><td><code>0.1</code></td><td>Fraction of subjects (with at least <code>min_obs_for_convergence_check</code> observations) allowed to have unconverged EBEs before the outer optimizer rejects the step (returns OFV = ∞). Set to <code>1.0</code> to disable the guard.</td></tr>
 <tr><td><code>min_obs_for_convergence_check</code></td><td><code>2</code></td><td>Subjects with fewer than this many observations are excluded from the <code>max_unconverged_frac</code> check (they still run normally).</td></tr>
 <tr><td><code>stagnation_guard</code></td><td><code>true</code></td><td>Short-circuit the NLopt-based outer optimizers once recent evals show no OFV improvement above 1e-3 over a window of <code>3*(n+1).max(50)</code> evals. This lets SLSQP / L-BFGS terminate quickly via their own xtol/ftol on numerically-flat plateaus (e.g. γ-bearing FOCEI problems) instead of grinding through the remaining <code>outer_maxiter</code> budget at full inner-loop cost. Set to <code>false</code> to let the optimizer run to its natural termination criterion — useful when debugging or for problems with very slow but real OFV improvements below the threshold.</td></tr>

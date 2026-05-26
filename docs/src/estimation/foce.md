@@ -23,6 +23,8 @@ For each subject, the inner loop finds the empirical Bayes estimate (EBE) of the
 
 The inner loop uses BFGS with automatic differentiation gradients, falling back to Nelder-Mead simplex if BFGS fails.
 
+If the EBE search wanders into a region where the individual NLL evaluates to a non-finite value (for example, an ODE model whose integration blows up at extreme \\( \eta \\)), that point is treated as the worst possible objective rather than aborting the fit. The subject is reported as non-converged and estimation continues for the remaining subjects.
+
 ## FOCE vs FOCEI
 
 ### Standard FOCE

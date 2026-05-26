@@ -3,9 +3,7 @@ use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::io::datareader::read_nonmem_csv;
 use crate::pk;
-use crate::stats::likelihood::{
-    compute_cwres, foce_subject_nll, foce_subject_nll_iov, split_obs_by_occasion,
-};
+use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
 use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -333,6 +331,31 @@ pub fn fit(
     // `ScalingSpec::PerCmt` / `OdeReadout::PerCmt` map. The parser can't
     // check this — it doesn't see the data — so fire here at fit time.
     pk::validate_per_cmt_scaling(model, &population.subjects)?;
+    // Same idea for per-CMT (multi-endpoint) error models: every observed CMT
+    // must have a matching `CMT=N:` entry in `[error_model]`.
+    if let crate::types::ErrorSpec::PerCmt(map) = &model.error_spec {
+        use std::collections::BTreeSet;
+        let mut missing = BTreeSet::new();
+        for subj in &population.subjects {
+            for &cmt in &subj.obs_cmts {
+                if !map.contains_key(&cmt) {
+                    missing.insert(cmt);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let list = missing
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "[error_model] has no entry for observed compartment(s) {}; \
+                 add a `CMT=N: DV ~ ...` line for each observed CMT.",
+                list
+            ));
+        }
+    }
     // If any subject has per-event covariate snapshots that don't carry
     // a variation in covariates the model actually references (e.g.
     // DAY / STIME columns in NONMEM-format datasets), clear those
@@ -565,6 +588,12 @@ fn fit_inner(
     // autodiff gradient path. Fail/warn early so users get a clear message
     // rather than a silent wrong result.
     if model.is_sde() {
+        // Note: a per-CMT (multi-endpoint) error model cannot reach the EKF
+        // path. Observing multiple compartments requires a Form C `y[CMT=N]`
+        // readout, which the parser already rejects on SDE models, so an SDE
+        // model is always single-endpoint here. The EKF residual-variance
+        // assumption (`ErrorSpec::Single`) is therefore safe — see the comment
+        // at the EKF call site in stats/likelihood.rs.
         if chain.iter().any(|&m| m == EstimationMethod::Saem) {
             return Err(
                 "method = saem is not compatible with a [diffusion] block. \
@@ -1223,7 +1252,9 @@ fn fit_inner(
         ferx_version: env!("CARGO_PKG_VERSION").to_string(),
         eta_param_info: model.eta_param_info.clone(),
         theta_transform: model.theta_transform.clone(),
-        sigma_types: model.error_model.sigma_types(),
+        sigma_types: model
+            .error_spec
+            .sigma_types(result.params.sigma.values.len()),
         cov_eigenvalues,
         cov_condition_number,
         eta_log_transformed,
@@ -1429,24 +1460,12 @@ fn compute_subject_results(
             };
 
             // Individual predictions: f(eta_hat), with occasion-specific kappas for IOV.
+            // Uses the continuous per-occasion-aware prediction (issue #104) so the
+            // sdtab ipreds match the fitted objective.
             let ipred = if !kappas.is_empty() {
-                let occ_groups = split_obs_by_occasion(subject);
-                let mut ipreds = vec![0.0; subject.obs_times.len()];
-                for (k, (_, obs_indices)) in occ_groups.iter().enumerate() {
-                    let kap: &[f64] = if k < kappas.len() {
-                        kappas[k].as_slice()
-                    } else {
-                        &[]
-                    };
-                    let combined: Vec<f64> =
-                        eta.iter().copied().chain(kap.iter().copied()).collect();
-                    let pk = (model.pk_param_fn)(&params.theta, &combined, &subject.covariates);
-                    let all_preds = model_preds(model, subject, &pk, &params.theta, &combined);
-                    for &j in obs_indices {
-                        ipreds[j] = all_preds[j];
-                    }
-                }
-                ipreds
+                let kappa_slices: Vec<Vec<f64>> =
+                    kappas.iter().map(|k| k.as_slice().to_vec()).collect();
+                crate::pk::predict_iov(model, subject, &params.theta, eta.as_slice(), &kappa_slices)
             } else {
                 let pk_params_ind =
                     (model.pk_param_fn)(&params.theta, eta.as_slice(), &subject.covariates);
@@ -1468,7 +1487,8 @@ fn compute_subject_results(
             let mut iwres = compute_iwres(
                 &subject.observations,
                 &ipred,
-                model.error_model,
+                &subject.obs_cmts,
+                &model.error_spec,
                 &params.sigma.values,
             );
             for (j, c) in subject.cens.iter().enumerate() {
@@ -1485,7 +1505,7 @@ fn compute_subject_results(
                 h,
                 &params.omega,
                 &params.sigma.values,
-                model.error_model,
+                &model.error_spec,
             );
 
             // OFV contribution
@@ -1936,11 +1956,8 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
             // Add residual error
             for (j, &ipred) in ipreds.iter().enumerate() {
-                let var = crate::stats::residual_error::residual_variance(
-                    model.error_model,
-                    ipred,
-                    &params.sigma.values,
-                );
+                let var =
+                    model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
                 let eps: f64 = rng.sample(normal);
                 let dv_sim = ipred + var.sqrt() * eps;
 
@@ -2114,6 +2131,7 @@ mod iov_integration {
             name: "iov_test".into(),
             pk_model: PkModel::OneCptIvBolus,
             error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             // pk_param_fn: eta[0]=BSV for CL, eta[1]=KAPPA_CL (appended by IOV path)
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
@@ -2865,6 +2883,7 @@ mod simulate_with_uncertainty_tests {
             name: "uncertainty_smoke".into(),
             pk_model: PkModel::OneCptIvBolus,
             error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp();

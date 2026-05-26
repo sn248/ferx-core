@@ -1,45 +1,91 @@
-//! Slow convergence tests for the IOV fitting path.
+//! Convergence / objective-consistency tests for the IOV fitting path.
 //!
-//! These run SLSQP and BFGS to convergence on a real IOV model and verify
-//! both optimizers find the same minimum — confirming that the IOV objective
-//! (kappa EBEs + IOV prior) is computed consistently.  Gate them so they
-//! are skipped in the default PR job (only run nightly / on demand):
+//! Gate the slow ones so they are skipped in the default PR job (run nightly /
+//! on demand):
 //!
 //!   cargo test --features slow-tests --test iov_convergence
+//!
+//! ## What these check (issue #101)
+//!
+//! 1. `foce_subject_nll_iov` is a *proper* augmented FOCE marginal — the
+//!    per-occasion κ are integrated out through R̃ like the BSV η (kappa-augmented
+//!    H + block-diagonal Σ), not via an additive κ MAP penalty. All estimation
+//!    paths share one consistent objective.
+//!
+//! 2. For IOV models the outer optimizer computes its gradient by **re-converging
+//!    the EBEs at each FD point** (`reconverged_fd_gradient`). The IOV variance
+//!    components — especially Ω_iov — are weakly identified and their gradient is
+//!    dominated by the EBE response (raising Ω_iov un-shrinks the kappas); the
+//!    old fixed-EBE gradient missed this and left Ω_iov pinned at its initial
+//!    value. With the fix, gradient FOCEI moves the variance components and a
+//!    `saem → focei` chain polishes SAEM's result down to a *better* optimum
+//!    (OFV ≈ 288.8 vs SAEM's ≈ 303) — see issue #101 rec #2.
+//!
+//! The FOCEI optimum (CL≈0.17, V≈8.5, KA≈1.15, Ω_iov≈0.047) matches the NONMEM
+//! 7.5.1 reference basin (tests/nonmem/warfarin_iov.ctl), and the per-occasion
+//! prediction is exact (ferx PRED == NONMEM PRED to 5 s.f. — issue #104). The
+//! OFV sits ≈17 units below NONMEM's 308.83; that residual is a FOCE-marginal
+//! cross-engine difference, not prediction — see `tests/warfarin_iov_nonmem.rs`.
+//!
+//! 3. Pure FOCEI/SLSQP now reaches the minimum from the model's cold default
+//!    start: for IOV models the SLSQP path auto-enables per-coordinate scaling
+//!    so its uniform gradient cap no longer starves the omega/omega_iov step
+//!    (issue #101 rec #2). Very far-off starts (e.g. a residual-error init off
+//!    by >2×) can still stall; SAEM / `saem → focei` remain the most robust.
 //!
 //! The trust-region outer optimizer does not support IOV models (n_kappa > 0).
 //! Use slsqp, bfgs, bobyqa, lbfgs, or mma for IOV fits.
 
 use ferx_core::parser::model_parser::parse_model_file;
-use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
+use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, FitResult, Optimizer};
 use std::path::Path;
 
-/// SLSQP FOCEI on warfarin_iov converges to a finite OFV.
-///
-/// The OCC column must be passed as iov_column so that subject.occasions is
-/// populated; without it every subject falls through to the non-IOV EBE path
-/// and panics when KAPPA_CL (eta index 3) is evaluated against a 3-element
-/// BSV eta slice.
+/// OFV the FOCEI marginal minimum reaches on warfarin_iov with the continuous
+/// per-occasion-aware prediction (issue #104). Pure SLSQP, pure BFGS, and the
+/// `saem → focei` chain all agree here; the parameters match the NONMEM
+/// reference basin (CL≈0.17, V≈8.5, Ω_iov≈0.047).
+const IOV_FOCEI_OFV: f64 = 288.8;
+
+fn load() -> (ferx_core::CompiledModel, ferx_core::Population) {
+    let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))
+        .expect("warfarin_iov model must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
+        .expect("warfarin_iov data must load");
+    (model, population)
+}
+
+/// Run a single method with the given optimizer.
+fn run_single(method: EstimationMethod, optimizer: Optimizer) -> FitResult {
+    let (model, population) = load();
+    let mut opts = FitOptions::default();
+    opts.method = method;
+    opts.optimizer = optimizer;
+    opts.outer_maxiter = 800;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+    fit(&model, &population, &model.default_params, &opts).expect("IOV fit must succeed")
+}
+
+/// Run a `saem → focei` method chain with the given polishing optimizer.
+fn run_chain(optimizer: Optimizer) -> FitResult {
+    let (model, population) = load();
+    let mut opts = FitOptions::default();
+    opts.methods = vec![EstimationMethod::Saem, EstimationMethod::FoceI];
+    opts.optimizer = optimizer;
+    opts.outer_maxiter = 800;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+    fit(&model, &population, &model.default_params, &opts).expect("IOV chain fit must succeed")
+}
+
+/// SLSQP FOCEI on warfarin_iov returns a finite OFV (smoke).
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests"
 )]
 fn iov_slsqp_converges() {
-    let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))
-        .expect("warfarin_iov model must parse");
-    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
-        .expect("warfarin_iov data must load");
-
-    let mut opts = FitOptions::default();
-    opts.method = EstimationMethod::FoceI;
-    opts.optimizer = Optimizer::Slsqp;
-    opts.outer_maxiter = 500;
-    opts.run_covariance_step = false;
-    opts.verbose = false;
-    let result =
-        fit(&model, &population, &model.default_params, &opts).expect("SLSQP IOV fit must succeed");
-
+    let result = run_single(EstimationMethod::FoceI, Optimizer::Slsqp);
     assert!(
         result.ofv.is_finite(),
         "SLSQP IOV OFV must be finite, got {}",
@@ -47,74 +93,78 @@ fn iov_slsqp_converges() {
     );
 }
 
-/// BFGS FOCEI on warfarin_iov must reach the same OFV as SLSQP.
-///
-/// Both optimizers drive the same FOCE objective with the same IOV kappa
-/// EBEs — they should find the same local minimum within 1.0 OFV unit.
-/// BFGS is the natural cross-check for SLSQP on IOV models (trust-region
-/// does not support IOV).
+/// The `saem → focei` chain reaches the FOCEI marginal minimum and, crucially,
+/// improves on SAEM alone — the regression guard for the reconverged-EBE
+/// gradient (issue #101 rec #2). Before that fix the fixed-EBE gradient left
+/// FOCEI pinned at SAEM's point; now it descends to a strictly better OFV.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests"
 )]
-fn iov_bfgs_matches_slsqp() {
-    let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))
-        .expect("warfarin_iov model must parse");
-    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
-        .expect("warfarin_iov data must load");
-
-    let mut opts_ref = FitOptions::default();
-    opts_ref.method = EstimationMethod::FoceI;
-    opts_ref.optimizer = Optimizer::Slsqp;
-    opts_ref.outer_maxiter = 500;
-    opts_ref.run_covariance_step = false;
-    opts_ref.verbose = false;
-    let ref_result = fit(&model, &population, &model.default_params, &opts_ref)
-        .expect("SLSQP IOV reference fit must succeed");
+fn iov_chain_improves_on_saem_and_reaches_reference() {
+    let saem = run_single(EstimationMethod::Saem, Optimizer::Slsqp);
     assert!(
-        ref_result.ofv.is_finite(),
-        "SLSQP IOV OFV must be finite, got {}",
-        ref_result.ofv
+        saem.ofv.is_finite() && saem.omega_iov.is_some(),
+        "SAEM must return a finite OFV and omega_iov, got {}",
+        saem.ofv
     );
 
-    let mut opts_bfgs = FitOptions::default();
-    opts_bfgs.method = EstimationMethod::FoceI;
-    opts_bfgs.optimizer = Optimizer::Bfgs;
-    opts_bfgs.outer_maxiter = 500;
-    opts_bfgs.run_covariance_step = false;
-    opts_bfgs.verbose = false;
-    let bfgs_result = fit(&model, &population, &model.default_params, &opts_bfgs)
-        .expect("BFGS IOV fit must succeed");
-
+    let chain = run_chain(Optimizer::Slsqp);
     assert!(
-        bfgs_result.ofv.is_finite(),
-        "BFGS IOV OFV must be finite, got {}",
-        bfgs_result.ofv
+        chain.ofv.is_finite(),
+        "chain OFV must be finite, got {}",
+        chain.ofv
     );
-    // One-sided: BFGS may find a better minimum than SLSQP, but must not
-    // regress more than 1.0 unit above the SLSQP baseline.
+    // FOCEI polish reaches the reference minimum...
     assert!(
-        bfgs_result.ofv <= ref_result.ofv + 1.0,
-        "BFGS IOV OFV {:.4} is more than 1.0 above SLSQP OFV {:.4}",
-        bfgs_result.ofv,
-        ref_result.ofv,
+        (chain.ofv - IOV_FOCEI_OFV).abs() < 2.0,
+        "saem→focei chain OFV {:.4} should reach the FOCEI reference {:.2}",
+        chain.ofv,
+        IOV_FOCEI_OFV
+    );
+    // ...and meaningfully improves on SAEM alone (would NOT, with a fixed-EBE
+    // gradient that can't move the variance components).
+    assert!(
+        chain.ofv < saem.ofv - 3.0,
+        "FOCEI polish must improve on SAEM by >3 OFV units: chain {:.4} vs SAEM {:.4}",
+        chain.ofv,
+        saem.ofv
     );
 }
 
-/// SAEM + IOV (Step 11): smoke test — fit() must return Ok with a finite OFV
-/// after a handful of SAEM iterations.  Does NOT assert convergence; just
-/// confirms the SAEM IOV path (kappa MH + omega_iov analytic update) compiles
-/// and runs without panicking.
-///
-/// This is a Tier-2 test: it calls the public API but exits after 5 iterations.
+/// The two outer optimizers (SLSQP, BFGS) driving the augmented marginal in a
+/// `saem → focei` chain reach the same minimum — the objective and the
+/// reconverged gradient are optimizer-independent. BFGS may report
+/// `converged = false` while sitting on the minimum, so this asserts on OFV.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn iov_chain_slsqp_and_bfgs_agree() {
+    let slsqp = run_chain(Optimizer::Slsqp);
+    let bfgs = run_chain(Optimizer::Bfgs);
+    assert!(slsqp.ofv.is_finite() && bfgs.ofv.is_finite());
+    assert!(
+        (slsqp.ofv - bfgs.ofv).abs() < 1.0,
+        "saem→focei OFV must match across optimizers: SLSQP {:.4} vs BFGS {:.4}",
+        slsqp.ofv,
+        bfgs.ofv
+    );
+    assert!(
+        (slsqp.ofv - IOV_FOCEI_OFV).abs() < 2.0,
+        "saem→focei/SLSQP OFV {:.4} should reach the FOCEI reference {:.2}",
+        slsqp.ofv,
+        IOV_FOCEI_OFV
+    );
+}
+
+/// SAEM + IOV (smoke): fit() must return Ok with a finite OFV after a handful of
+/// SAEM iterations. Tier-2 — calls the public API but exits after 5 iterations.
 #[test]
 fn iov_saem_smoke_returns_finite_ofv() {
-    let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))
-        .expect("warfarin_iov model must parse");
-    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
-        .expect("warfarin_iov data must load");
-
+    let (model, population) = load();
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::Saem;
     opts.outer_maxiter = 5; // just enough to exercise the full E+M loop
@@ -135,61 +185,31 @@ fn iov_saem_smoke_returns_finite_ofv() {
     );
 }
 
-/// SAEM + IOV convergence: run to convergence and compare OFV to the SLSQP
-/// FOCEI baseline.  SAEM and FOCE are different approximations so OFVs can
-/// differ; we allow up to 2.0 OFV units of slack.
-///
-/// This is a Tier-3 slow test — gated on the `slow-tests` feature.
+/// Pure FOCEI/SLSQP from the model's cold default start reaches the FOCEI
+/// minimum on warfarin_iov — no SAEM seeding needed. This is the payoff of the
+/// IOV+SLSQP auto-scaling fix (issue #101 rec #2): before it, SLSQP's uniform
+/// gradient cap starved the omega step and the fit stalled at OFV ≈ 292 with the
+/// variance components pinned near their initial values.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests"
 )]
-fn iov_saem_converges_within_tolerance_of_focei() {
-    let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))
-        .expect("warfarin_iov model must parse");
-    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
-        .expect("warfarin_iov data must load");
-
-    // FOCEI reference (SLSQP)
-    let mut opts_ref = FitOptions::default();
-    opts_ref.method = EstimationMethod::FoceI;
-    opts_ref.optimizer = Optimizer::Slsqp;
-    opts_ref.outer_maxiter = 500;
-    opts_ref.run_covariance_step = false;
-    opts_ref.verbose = false;
-    let focei_result = fit(&model, &population, &model.default_params, &opts_ref)
-        .expect("FOCEI IOV reference fit must succeed");
+fn iov_pure_slsqp_from_cold_start_reaches_minimum() {
+    let focei = run_single(EstimationMethod::FoceI, Optimizer::Slsqp);
     assert!(
-        focei_result.ofv.is_finite(),
-        "FOCEI IOV OFV must be finite, got {}",
-        focei_result.ofv
+        (focei.ofv - IOV_FOCEI_OFV).abs() < 2.0,
+        "pure FOCEI/SLSQP from the cold default start must reach the FOCEI \
+         minimum {:.2}, got {:.4}",
+        IOV_FOCEI_OFV,
+        focei.ofv
     );
-
-    // SAEM
-    let mut opts_saem = FitOptions::default();
-    opts_saem.method = EstimationMethod::Saem;
-    opts_saem.outer_maxiter = 800; // saem_n_exploration + saem_n_convergence default
-    opts_saem.run_covariance_step = false;
-    opts_saem.verbose = false;
-    let saem_result = fit(&model, &population, &model.default_params, &opts_saem)
-        .expect("SAEM IOV fit must succeed");
-
+    // The fix is specifically about moving the IOV variance off its init: Ω_iov
+    // starts at 0.01 and must climb toward ≈0.036.
+    let iov = focei.omega_iov.expect("omega_iov present")[(0, 0)];
     assert!(
-        saem_result.ofv.is_finite(),
-        "SAEM IOV OFV must be finite, got {}",
-        saem_result.ofv
-    );
-    assert!(
-        saem_result.omega_iov.is_some(),
-        "omega_iov must be present in SAEM IOV result"
-    );
-    // SAEM and FOCEI are different approximations; allow 2.0 OFV units of slack.
-    // TODO: tighten after nightly baseline is established.
-    assert!(
-        (saem_result.ofv - focei_result.ofv).abs() < 2.0,
-        "SAEM IOV OFV {:.4} differs from FOCEI OFV {:.4} by more than 2.0 units",
-        saem_result.ofv,
-        focei_result.ofv
+        iov > 0.02,
+        "omega_iov must move off its 0.01 init toward ≈0.036, got {:.4}",
+        iov
     );
 }

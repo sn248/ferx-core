@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-e6c23135.js";
+            window.path_to_searchindex_js = "../searchindex-3459c454.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-39f227ad.js"></script>
@@ -201,6 +201,45 @@
 <p>Combines proportional and additive components:</p>
 <p>\[ \text{Var}(DV) = (\sigma_1 \cdot f)^2 + \sigma_2^2 \]</p>
 <p>Use when both proportional and additive error sources are present. Requires two sigma parameters defined in <code>[parameters]</code>.</p>
+<h2 id="multiple-endpoints-per-cmt-error-models"><a class="header" href="#multiple-endpoints-per-cmt-error-models">Multiple endpoints (per-CMT error models)</a></h2>
+<p>For simultaneous PK/PD (and other multi-analyte) models, a single observed
+compartment is not enough: plasma concentrations and a PD effect typically
+need <em>different</em> residual error models in the <em>same</em> joint likelihood. Prefix
+each error line with <code>CMT=N:</code> to assign a distinct error model to each observed
+compartment, dispatched by the dataset’s <code>CMT</code> column:</p>
+<pre><code>[error_model]
+  CMT=2: DV ~ proportional(PROP_ERR_PK)   # plasma concentration (central)
+  CMT=3: DV ~ additive(ADD_ERR_PD)        # PD effect (effect compartment)
+</code></pre>
+<p>Every observation row is matched to the endpoint whose <code>CMT=N</code> equals its
+<code>CMT</code> value, and its residual variance is computed from that endpoint’s error
+model and sigma(s). All endpoints contribute to one FOCEI objective, so PK and
+PD parameters — and their uncertainty — are estimated jointly. This is the
+gold-standard alternative to the sequential workaround (fit PK, freeze IPRED,
+then fit PD), which underestimates uncertainty.</p>
+<p>Each endpoint’s sigma parameters are declared once in <code>[parameters]</code>, as usual:</p>
+<pre><code>[parameters]
+  sigma PROP_ERR_PK ~ 0.10 (sd)
+  sigma ADD_ERR_PD  ~ 1.00 (sd)
+</code></pre>
+<p>Rules and restrictions:</p>
+<ul>
+<li><strong>ODE models only.</strong> Per-CMT dispatch lives in the finite-difference
+likelihood path used by ODE models. An analytical PK model with <code>CMT=N:</code>
+lines is rejected at parse time.</li>
+<li><strong>No mixing styles.</strong> An <code>[error_model]</code> block is either a single plain
+<code>DV ~ ...</code> line <em>or</em> all <code>CMT=N:</code> lines — not both.</li>
+<li><strong>Coverage is checked at fit time.</strong> Every observed <code>CMT</code> in the dataset must
+have a matching <code>CMT=N:</code> entry, or <code>fit()</code> errors and names the missing
+compartments. Duplicate <code>CMT=N</code> entries are rejected at parse time.</li>
+<li><strong>Estimation method.</strong> Supported with FOCE/FOCEI, the Gauss-Newton
+optimizers, and SAEM (optionally followed by <code>imp</code>).</li>
+</ul>
+<p>A complete worked model lives in <a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/emax_pkpd.ferx"><code>examples/emax_pkpd.ferx</code></a>
+— an oral 1-compartment PK model with an effect-compartment Emax PD readout,
+proportional error on the plasma endpoint and additive error on the PD
+endpoint. The per-CMT <em>readout</em> (which compartment/expression each <code>CMT</code> maps
+to) is configured in the <a href="scaling.html"><code>[scaling]</code></a> block.</p>
 <h2 id="sigma-scale"><a class="header" href="#sigma-scale">Sigma scale</a></h2>
 <p><strong>All sigma parameters are estimated and reported on the standard-deviation scale</strong>, not the variance scale. This is true for both proportional and additive components, and for both elements of a combined error model.</p>
 <p>In particular:</p>

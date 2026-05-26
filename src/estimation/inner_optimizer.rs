@@ -746,14 +746,7 @@ fn find_ebe_iov(
 
     // H-matrix: BSV columns only, perturbing eta with kappas fixed at EBE values
     let kappas_slices: Vec<Vec<f64>> = kappas_vec.iter().map(|k| k.as_slice().to_vec()).collect();
-    let h_matrix = compute_jacobian_fd_iov(
-        model,
-        subject,
-        &params.theta,
-        &bsv_eta,
-        &kappas_slices,
-        &occ_groups,
-    );
+    let h_matrix = compute_jacobian_fd_iov(model, subject, &params.theta, &bsv_eta, &kappas_slices);
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
@@ -766,23 +759,21 @@ fn find_ebe_iov(
     }
 }
 
-/// Jacobian d(pred)/d(bsv_eta) with kappas fixed, per-occasion predictions.
-/// Returns an n_obs × n_eta matrix.
+/// Jacobian d(pred)/d(bsv_eta) with kappas fixed. Returns an n_obs × n_eta
+/// matrix.
 ///
-/// Shares the cross-occasion dose-carryover convention of `individual_nll_iov`:
-/// occasion-`k`'s predictions are computed using that occasion's combined eta
-/// against the full subject dose history, then only the occasion's obs rows
-/// are written into the Jacobian. This keeps the FD gradient consistent
-/// with the NLL value (both treat each dose's effect as governed by the
-/// observation's occasion, not the dose's). See the docstring on
-/// `individual_nll_iov` for the implications.
+/// Uses the continuous, per-occasion-aware prediction (`pk::predict_iov`), so a
+/// BSV-eta perturbation flows through the whole timeline (it shifts every
+/// occasion's clearance) and the column is dense across rows — consistent with
+/// the NLL value in `individual_nll_iov`, which uses the same prediction. The
+/// occasion list is recovered inside `predict_iov`, so `occ_groups` is no longer
+/// needed here. See issue #104.
 fn compute_jacobian_fd_iov(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
     kappas: &[Vec<f64>],
-    occ_groups: &[(u32, Vec<usize>)],
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
@@ -792,26 +783,16 @@ fn compute_jacobian_fd_iov(
 
     for col in 0..n_eta {
         let h_step = eps * (1.0 + eta[col].abs());
-        for (k, (_, obs_indices)) in occ_groups.iter().enumerate() {
-            if k >= kappas.len() {
-                break;
-            }
-            let mut combined_plus: Vec<f64> = eta_pert.clone();
-            combined_plus[col] = eta[col] + h_step;
-            combined_plus.extend_from_slice(&kappas[k]);
-            let preds_plus = pk::compute_predictions_with_tv(model, subject, theta, &combined_plus);
-
-            let mut combined_minus: Vec<f64> = eta_pert.clone();
-            combined_minus[col] = eta[col] - h_step;
-            combined_minus.extend_from_slice(&kappas[k]);
-            let preds_minus =
-                pk::compute_predictions_with_tv(model, subject, theta, &combined_minus);
-
-            for &j in obs_indices {
-                h[(j, col)] = (preds_plus[j] - preds_minus[j]) / (2.0 * h_step);
-            }
-        }
+        eta_pert[col] = eta[col] + h_step;
+        let preds_plus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
+        eta_pert[col] = eta[col] - h_step;
+        let preds_minus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
         eta_pert[col] = eta[col];
+
+        let inv = 1.0 / (2.0 * h_step);
+        for j in 0..n_obs {
+            h[(j, col)] = (preds_plus[j] - preds_minus[j]) * inv;
+        }
     }
 
     h
@@ -998,7 +979,14 @@ fn nelder_mead_minimize(
 
     for _iter in 0..max_iter {
         let mut indices: Vec<usize> = (0..=n).collect();
-        indices.sort_by(|&a, &b| fvals[a].partial_cmp(&fvals[b]).unwrap());
+        // NaN-safe: a non-finite objective (e.g. an ODE prediction that blew
+        // up at a simplex vertex) sorts as worst rather than panicking on the
+        // `None` that `partial_cmp` returns for NaN. See issue #97.
+        indices.sort_by(|&a, &b| {
+            fvals[a]
+                .partial_cmp(&fvals[b])
+                .unwrap_or(std::cmp::Ordering::Greater)
+        });
 
         let best = indices[0];
         let worst = indices[n];
@@ -1068,10 +1056,11 @@ fn nelder_mead_minimize(
         }
     }
 
+    // NaN-safe min: a non-finite vertex objective must not panic here either.
     let best = fvals
         .iter()
         .enumerate()
-        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater))
         .map(|(i, _)| i)
         .unwrap();
     x.copy_from_slice(&simplex[best]);
@@ -1306,6 +1295,33 @@ mod tests {
         // Both fallback counts regardless of min_obs.
         assert_eq!(n_fallback, 1);
     }
+
+    #[test]
+    fn test_nelder_mead_nan_objective_does_not_panic() {
+        // Regression for issue #97: when a simplex vertex evaluates to a NaN
+        // objective (e.g. an ODE prediction blowing up during the EBE search),
+        // the `partial_cmp().unwrap()` sort used to panic — and, unwinding
+        // through the non-unwinding optimizer callback, abort the whole fit.
+        // NaN must now sort as worst and get reflected away instead.
+        let obj = |x: &[f64]| -> f64 {
+            if x[0] < 0.0 {
+                // The "blow-up" region: objective is non-finite here.
+                f64::NAN
+            } else {
+                (x[0] - 1.0).powi(2) + (x[1] - 1.0).powi(2)
+            }
+        };
+        // Seed the simplex entirely inside the NaN region so the very first
+        // sort encounters only NaN vertices.
+        let mut x = vec![-1.0, -1.0];
+        // The contract under test is "does not panic"; the return flag and
+        // final point are secondary. Coordinates must stay finite.
+        let _converged = nelder_mead_minimize(&obj, &mut x, 2, 200, 1e-8);
+        assert!(
+            x.iter().all(|v| v.is_finite()),
+            "Nelder-Mead must leave the point finite, got {x:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1340,6 +1356,7 @@ mod iov_tests {
             name: "iov_test".into(),
             pk_model: PkModel::OneCptIvBolus,
             error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 // eta[0] = bsv, eta[1] = kappa (combined)
@@ -1447,6 +1464,7 @@ mod iov_tests {
             name: "no_iov".into(),
             pk_model: PkModel::OneCptIvBolus,
             error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp();

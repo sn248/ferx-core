@@ -1,0 +1,41 @@
+# Simultaneous PK/PD with per-CMT residual error — the model used to
+# cross-check ferx-core against a NONMEM 7.5.1 FOCEI reference fit
+# (see tests/multi_endpoint_nonmem.rs). IV bolus into the central
+# compartment (CMT=1); plasma concentration observed on CMT=1 with
+# proportional error, effect-compartment level on CMT=2 with additive
+# error. PK and PD are sampled at the same timepoints.
+
+[parameters]
+  theta TVCL(2.0,  0.01, 100.0)
+  theta TVV(20.0,  0.1, 1000.0)
+  theta TVKE0(0.5, 0.001, 10.0)
+
+  omega ETA_CL ~ 0.09
+
+  sigma PROP_ERR_PK ~ 0.10 (sd)   # plasma concentration (CMT=1)
+  sigma ADD_ERR_PD  ~ 0.50 (sd)   # effect-compartment level (CMT=2)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KE0 = TVKE0
+
+[structural_model]
+  ode(states=[central, effect])
+
+[odes]
+  d/dt(central) = -CL/V * central
+  d/dt(effect)  =  KE0 * (central/V - effect)
+
+[scaling]
+  y[CMT=1] = central / V          # plasma concentration
+  y[CMT=2] = effect               # effect-compartment level
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_PK)
+  CMT=2: DV ~ additive(ADD_ERR_PD)
+
+[fit_options]
+  method     = focei
+  gradient   = fd
+  covariance = false

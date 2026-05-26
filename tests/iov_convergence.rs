@@ -22,10 +22,10 @@
 //!    (OFV ≈ 288.8 vs SAEM's ≈ 303) — see issue #101 rec #2.
 //!
 //! The FOCEI optimum (CL≈0.17, V≈8.5, KA≈1.15, Ω_iov≈0.047) matches the NONMEM
-//! 7.5.1 reference basin (tests/nonmem/warfarin_iov.ctl). With the continuous
-//! per-occasion-aware prediction (issue #104) its OFV is within ≈17 units of
-//! NONMEM's 308.83 (down from ≈40); the residual is the simultaneous
-//! cross-occasion dose/obs event ordering — see `tests/warfarin_iov_nonmem.rs`.
+//! 7.5.1 reference basin (tests/nonmem/warfarin_iov.ctl), and the per-occasion
+//! prediction is exact (ferx PRED == NONMEM PRED to 5 s.f. — issue #104). The
+//! OFV sits ≈17 units below NONMEM's 308.83; that residual is a FOCE-marginal
+//! cross-engine difference, not prediction — see `tests/warfarin_iov_nonmem.rs`.
 //!
 //! 3. Pure FOCEI/SLSQP now reaches the minimum from the model's cold default
 //!    start: for IOV models the SLSQP path auto-enables per-coordinate scaling

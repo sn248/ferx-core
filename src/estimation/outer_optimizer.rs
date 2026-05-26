@@ -511,7 +511,18 @@ fn optimize_nlopt(
     // optimizer runs in the natural (mixed) packed space where
     // BFGS's own scale-adaptation works correctly.
     let has_identity_theta = init_params.theta_lower.iter().any(|&lo| lo < 0.0);
-    let scale: Vec<f64> = if options.scale_params && !has_identity_theta {
+    // IOV + SLSQP: auto-enable per-coordinate scaling (issue #101 rec #2). IOV
+    // models pack disparate-magnitude parameters (block-diagonal omega plus the
+    // kappa block), and SLSQP's uniform gradient cap (`cap_slsqp_gradient`,
+    // applied only on the SLSQP path) otherwise rescales the whole gradient by
+    // the worst (theta) component, starving the omega/omega_iov step so the
+    // variance components stay pinned at their initial values. Scaling presents
+    // O(1) coordinates so the cap no longer starves them. The #99 regression
+    // that made scaling default-off was on non-IOV models and other algorithms
+    // (notably MMA, which scaling hurts here), so scope the auto-enable to the
+    // IOV + SLSQP combination that actually needs it.
+    let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
+    let scale: Vec<f64> = if (options.scale_params || auto_scale_iov) && !has_identity_theta {
         compute_scale(&x0)
     } else {
         vec![1.0; n]
@@ -683,18 +694,24 @@ fn optimize_nlopt(
                 return ofv;
             }
             // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
-            let grad_raw = ad_population_gradient(
-                &x,
-                n_subj,
-                init_params,
-                model,
-                population,
-                &ehs,
-                &hms,
-                &kappas,
-                &bounds,
-                options,
-            );
+            // IOV models need EBE-reconverging FD to move the variance components
+            // (issue #101 rec #2); non-IOV uses the cheap fixed-EBE analytical path.
+            let grad_raw = if model.n_kappa > 0 {
+                reconverged_fd_gradient(&x, init_params, model, population, &ehs, &bounds, options)
+            } else {
+                ad_population_gradient(
+                    &x,
+                    n_subj,
+                    init_params,
+                    model,
+                    population,
+                    &ehs,
+                    &hms,
+                    &kappas,
+                    &bounds,
+                    options,
+                )
+            };
             let mut sq = 0.0_f64;
             for k in 0..g.len() {
                 let gi = if grad_raw[k].is_finite() {
@@ -961,18 +978,30 @@ fn optimize_nlopt(
                     return ofv;
                 }
                 // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
-                let grad_raw = ad_population_gradient(
-                    &x,
-                    n_subj,
-                    init_params,
-                    model,
-                    population,
-                    &ehs,
-                    &hms,
-                    &kappas,
-                    &bounds,
-                    options,
-                );
+                let grad_raw = if model.n_kappa > 0 {
+                    reconverged_fd_gradient(
+                        &x,
+                        init_params,
+                        model,
+                        population,
+                        &ehs,
+                        &bounds,
+                        options,
+                    )
+                } else {
+                    ad_population_gradient(
+                        &x,
+                        n_subj,
+                        init_params,
+                        model,
+                        population,
+                        &ehs,
+                        &hms,
+                        &kappas,
+                        &bounds,
+                        options,
+                    )
+                };
                 let mut sq = 0.0_f64;
                 for k in 0..g.len() {
                     let gi = if grad_raw[k].is_finite() {
@@ -1280,19 +1309,24 @@ fn optimize_bfgs(
             options.min_obs_for_convergence_check as usize,
         );
         let ofv = ofv_at_fixed(x, &ehs, &hms, &kappas);
-        // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x)
-        let g = ad_population_gradient(
-            x,
-            n_subj,
-            init_params,
-            model,
-            population,
-            &ehs,
-            &hms,
-            &kappas,
-            &bounds,
-            options,
-        );
+        // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x). IOV reconverges EBEs in the FD
+        // stencil so the variance components move (issue #101 rec #2).
+        let g = if model.n_kappa > 0 {
+            reconverged_fd_gradient(x, init_params, model, population, &ehs, &bounds, options)
+        } else {
+            ad_population_gradient(
+                x,
+                n_subj,
+                init_params,
+                model,
+                population,
+                &ehs,
+                &hms,
+                &kappas,
+                &bounds,
+                options,
+            )
+        };
         let f = if ofv.is_finite() { ofv } else { 1e20 };
         (f, g, ehs, hms)
     };
@@ -1510,6 +1544,98 @@ fn optimize_bfgs(
 // ═══════════════════════════════════════════════════════════════════════════
 //  Shared utilities
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// Central-FD `d(OFV)/d(x)` that **re-converges the EBEs at every perturbed
+/// point** (warm-started from `warm_etas`), rather than holding them fixed.
+///
+/// For IOV models the variance components — especially `omega_iov` — are
+/// weakly identified, and the EBE response dominates their gradient: raising
+/// `omega_iov` un-shrinks the per-occasion kappas and improves the fit, an
+/// effect the fixed-EBE gradient ([`ad_population_gradient`]) misses entirely.
+/// The result is that gradient optimizers leave `omega_iov` pinned at its
+/// initial value while derivative-free methods (which re-solve the EBEs at
+/// each trial point) move it freely. Re-converging the inner loop inside the
+/// FD stencil restores the correct descent direction. See issue #101 rec #2.
+///
+/// This costs `2·n_free` inner-loop solves per gradient, so it is gated to IOV
+/// models (`model.n_kappa > 0`); the non-IOV path keeps the cheap analytical
+/// fixed-EBE gradient, which already converges OMEGA correctly (issue #99).
+#[allow(clippy::too_many_arguments)]
+fn reconverged_fd_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    warm_etas: &[DVector<f64>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let n = x.len();
+    let n_subj = population.subjects.len();
+    let fixed = packed_fixed_mask(init_params);
+    let eps = 1e-4;
+
+    // OFV at a packed point, re-solving the inner loop (warm-started). Matches
+    // the objective closure's definition: 2·pop_nll, guarded to 1e20 on
+    // non-finite or excess EBE non-convergence.
+    let eval = |xv: &[f64]| -> f64 {
+        let params = unpack_params(xv, init_params);
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+        let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
+            model,
+            population,
+            &params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(warm_etas),
+            Some(&mu_k),
+            options.min_obs_for_convergence_check as usize,
+        );
+        let raw = 2.0
+            * pop_nll(
+                model,
+                population,
+                &params,
+                &ehs,
+                &hms,
+                &kappas,
+                options.interaction,
+            );
+        let frac = ebe_stats.n_unconverged as f64 / (n_subj as f64).max(1.0);
+        if !raw.is_finite()
+            || (options.max_unconverged_frac >= 0.0 && frac > options.max_unconverged_frac)
+        {
+            1e20
+        } else {
+            raw
+        }
+    };
+
+    let mut grad = vec![0.0_f64; n];
+    let mut xw = x.to_vec();
+    for k in 0..n {
+        if fixed[k] {
+            continue;
+        }
+        let h = eps * (1.0 + x[k].abs());
+        let xp = (x[k] + h).min(bounds.upper[k]);
+        let xm = (x[k] - h).max(bounds.lower[k]);
+        let denom = xp - xm;
+        if denom.abs() < 1e-16 {
+            continue;
+        }
+        xw[k] = xp;
+        let fp = eval(&xw);
+        xw[k] = xm;
+        let fm = eval(&xw);
+        xw[k] = x[k];
+        let d = (fp - fm) / denom;
+        if d.is_finite() {
+            grad[k] = d;
+        }
+    }
+    grad
+}
 
 /// Compute `d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x)` by summing per-subject
 /// gradients in parallel.  ETAs are fixed at their current EBE values.

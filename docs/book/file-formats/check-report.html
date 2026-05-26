@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-8fee082a.js";
+            window.path_to_searchindex_js = "../searchindex-f012af5f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-6b798105.js"></script>
@@ -245,6 +245,9 @@ stable machine-readable <code>code</code> rather than only prose.</p>
 <tr><td><code>E_PER_CMT_SCALING</code></td><td>error</td><td>An observed compartment lacks a per-CMT scaling entry.</td></tr>
 <tr><td><code>E_PER_CMT_ERROR_MODEL</code></td><td>error</td><td>An observed compartment lacks a per-CMT <code>[error_model]</code> entry.</td></tr>
 <tr><td><code>E_DATA</code></td><td>error</td><td>The <code>--data</code> file could not be read or parsed.</td></tr>
+<tr><td><code>E_SDE_INCOMPATIBLE</code></td><td>error</td><td>An SDE (<code>[diffusion]</code>) model used with an incompatible method (<code>saem</code>, <code>gn</code>, <code>gn_hybrid</code>) or <code>gradient_method = ad</code>.</td></tr>
+<tr><td><code>E_IMP_CHAIN</code></td><td>error</td><td><code>imp</code> is mis-placed in a method chain — first stage, repeated, or not the terminal stage.</td></tr>
+<tr><td><code>E_OPTIMIZER_IOV</code></td><td>error</td><td><code>optimizer = trust_region</code> used with an IOV model (<code>n_kappa &gt; 0</code>).</td></tr>
 <tr><td><code>W_STEADY_STATE_II</code></td><td>warning</td><td>SS=1 doses with missing / non-positive <code>II</code> (treated as non-SS).</td></tr>
 <tr><td><code>W_STEADY_STATE_INFUSION</code></td><td>warning</td><td>SS=1 infusion with <code>T_inf &gt; II</code> (overlapping pulses; SS skipped).</td></tr>
 <tr><td><code>W_SDE_RESET</code></td><td>warning</td><td>EVID=3/4 resets under an SDE <code>[diffusion]</code> model are not honoured.</td></tr>

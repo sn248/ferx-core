@@ -41,7 +41,9 @@ a fit — *without* fitting — then reports the findings. This is a fast
 `author → diagnose → fix` loop, especially useful for tooling and coding agents
 that author model files programmatically.
 
-- Without `--data`, only parse / structural checks run (no data is read).
+- Without `--data`, parse / structural and model–option compatibility checks
+  run (no data is read) — e.g. an SDE model paired with SAEM, or
+  `optimizer = trust_region` on an IOV model.
 - With `--data`, the dataset is read and the data-dependent checks run too:
   referenced covariates present, per-CMT scaling / error-model coverage,
   steady-state dosing well-formed, and non-negative typical-value lag time.

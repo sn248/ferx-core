@@ -301,6 +301,114 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
     diags
 }
 
+/// Model + estimation-option *compatibility* checks that don't depend on data:
+/// estimation method vs an SDE (`[diffusion]`) model, IMP chain placement, and
+/// optimizer vs IOV. These mirror the guards at the top of `fit_inner`, so a
+/// clean `ferx check` and a `fit()` agree on which method/model combinations are
+/// rejected (rather than reporting `valid: true` and then failing at fit time).
+/// `fit_inner` consumes these via [`first_error`]; message text is identical to
+/// the historical inline guards. Check order matches `fit_inner` so the first
+/// error is unchanged.
+pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<Diagnostic> {
+    let chain = options.method_chain();
+    let mut diags = Vec::new();
+
+    // SDE ([diffusion]) is incompatible with SAEM, with the Gauss-Newton
+    // methods, and with the autodiff gradient path (EKF estimation requires
+    // FD-FOCE/FOCEI).
+    if model.is_sde() {
+        if chain.iter().any(|&m| m == EstimationMethod::Saem) {
+            diags.push(
+                Diagnostic::error(
+                    "E_SDE_INCOMPATIBLE",
+                    "method = saem is not compatible with a [diffusion] block. \
+                     SDE / EKF estimation requires FOCE or FOCEI. Use method = foce or method = focei.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid))
+        {
+            diags.push(
+                Diagnostic::error(
+                    "E_SDE_INCOMPATIBLE",
+                    "SDE ([diffusion]) is not supported with method = gn or gn_hybrid. \
+                     Use method = foce or method = focei.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if options.gradient_method == crate::types::GradientMethod::Ad {
+            diags.push(
+                Diagnostic::error(
+                    "E_SDE_INCOMPATIBLE",
+                    "gradient_method = ad is not compatible with a [diffusion] block. \
+                     Set gradient_method = fd (or leave it unset — fd is selected automatically).",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
+    // IMP is a likelihood evaluation, not an estimator: it must follow a
+    // parameter-estimating stage, appear at most once, and be the terminal stage.
+    if chain.iter().any(|&m| m == EstimationMethod::Imp) {
+        if chain.first().copied() == Some(EstimationMethod::Imp) {
+            diags.push(
+                Diagnostic::error(
+                    "E_IMP_CHAIN",
+                    "method `imp` cannot be the first stage in a chain — it consumes \
+                     EBEs and Hessians from a preceding estimator. Try `methods = [focei, imp]` \
+                     or `methods = [saem, imp]`.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        let n_imp = chain
+            .iter()
+            .filter(|&&m| m == EstimationMethod::Imp)
+            .count();
+        if n_imp > 1 {
+            diags.push(
+                Diagnostic::error(
+                    "E_IMP_CHAIN",
+                    "method `imp` may appear at most once in a chain.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if chain.last().copied() != Some(EstimationMethod::Imp) {
+            diags.push(
+                Diagnostic::error(
+                    "E_IMP_CHAIN",
+                    "method `imp` must be the final stage of the chain — placing it mid-chain \
+                     would leave `FitResult.importance_sampling` populated with a log-likelihood \
+                     computed at parameters that the following stage then overwrites. Move `imp` \
+                     to the end.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
+    // The trust-region outer optimizer does not thread kappas through its OFV.
+    if model.n_kappa > 0 && options.optimizer == Optimizer::TrustRegion {
+        diags.push(
+            Diagnostic::error(
+                "E_OPTIMIZER_IOV",
+                "optimizer = trust_region does not support IOV (n_kappa > 0). \
+                 Use optimizer = bobyqa, slsqp, lbfgs, nlopt_lbfgs, mma, or bfgs \
+                 for models with kappa declarations.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
+    diags
+}
+
 /// Data-dependent *warning*-level checks: malformed steady-state rows, EVID=3/4
 /// resets under an SDE model, and a negative typical-value lag time. These are
 /// non-fatal — `fit()` pushes their messages into `FitResult.warnings` and
@@ -428,9 +536,10 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
 /// first, as `fit()` does). This is the engine behind the `ferx check` CLI
 /// command and is the fast `author → diagnose → fix` loop for tools and agents.
 ///
-/// When `data_path` is `None`, only parse/structural validation runs (no data
-/// is read). When it is `Some`, the CSV is read and the covariate / per-CMT /
-/// steady-state / lag-time checks run as well.
+/// When `data_path` is `None`, only parse/structural and model/option
+/// compatibility validation runs (no data is read). When it is `Some`, the CSV
+/// is read and the covariate / per-CMT / steady-state / lag-time checks run as
+/// well.
 pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport {
     use crate::parser::model_parser::parse_full_model_file;
 
@@ -452,7 +561,13 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
 
     let mut diags: Vec<Diagnostic> = Vec::new();
 
-    // 2. Data-dependent checks (only when a dataset is supplied).
+    // 2. Model / estimation-option compatibility (data-independent): catches
+    //    method/model combinations that `fit()` rejects before fitting, so a
+    //    clean check and a fit agree. Uses the parsed `[fit_options]`, mirroring
+    //    what the CLI fit path (`run_model_with_data`) passes to `fit()`.
+    diags.extend(check_model_options(&parsed.model, &parsed.fit_options));
+
+    // 3. Data-dependent checks (only when a dataset is supplied).
     if let Some(path) = data_path {
         let iov_col = parsed.fit_options.iov_column.as_deref();
         match read_nonmem_csv(Path::new(path), None, iov_col) {
@@ -474,7 +589,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
         }
     }
 
-    // 3. Attach block-level line numbers to any diagnostic that named a block.
+    // 4. Attach block-level line numbers to any diagnostic that named a block.
     for d in &mut diags {
         if d.line.is_none() {
             if let Some(block) = &d.block {
@@ -798,94 +913,15 @@ fn fit_inner(
         );
     }
 
-    // Guard: SDE ([diffusion] block) is incompatible with SAEM and with the
-    // autodiff gradient path. Fail/warn early so users get a clear message
-    // rather than a silent wrong result.
-    if model.is_sde() {
-        // Note: a per-CMT (multi-endpoint) error model cannot reach the EKF
-        // path. Observing multiple compartments requires a Form C `y[CMT=N]`
-        // readout, which the parser already rejects on SDE models, so an SDE
-        // model is always single-endpoint here. The EKF residual-variance
-        // assumption (`ErrorSpec::Single`) is therefore safe — see the comment
-        // at the EKF call site in stats/likelihood.rs.
-        if chain.iter().any(|&m| m == EstimationMethod::Saem) {
-            return Err(
-                "method = saem is not compatible with a [diffusion] block. \
-                 SDE / EKF estimation requires FOCE or FOCEI. Use method = foce or method = focei."
-                    .to_string(),
-            );
-        }
-        if chain
-            .iter()
-            .any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid))
-        {
-            return Err(
-                "SDE ([diffusion]) is not supported with method = gn or gn_hybrid. \
-                 Use method = foce or method = focei."
-                    .to_string(),
-            );
-        }
-        if options.gradient_method == crate::types::GradientMethod::Ad {
-            return Err(
-                "gradient_method = ad is not compatible with a [diffusion] block. \
-                 Set gradient_method = fd (or leave it unset — fd is selected automatically)."
-                    .to_string(),
-            );
-        }
-        // Auto-mode: force FD silently (the inner loop detects this via
-        // model.gradient_method which the parser will have set to Fd; if
-        // somehow Auto slipped through, enforce it here).
-        if options.gradient_method == crate::types::GradientMethod::Auto {
-            // Nothing to do — the parser enforces Fd when diffusion is present.
-            // This comment is a reminder that Auto on SDE models is safe only
-            // because the ODE path already falls back to Fd in the inner loop.
-        }
-    }
-
-    // Guard: IMP is a likelihood evaluation, not an estimator. It must follow
-    // a parameter-estimating stage (it consumes that stage's EBEs + Hessians),
-    // may appear at most once, and must be the terminal stage. A non-terminal
-    // IMP would leave `FitResult.importance_sampling` populated with an IS-LL
-    // computed at parameters that the following stage then overwrites.
-    if chain.iter().any(|&m| m == EstimationMethod::Imp) {
-        if chain.first().copied() == Some(EstimationMethod::Imp) {
-            return Err(
-                "method `imp` cannot be the first stage in a chain — it consumes \
-                 EBEs and Hessians from a preceding estimator. Try `methods = [focei, imp]` \
-                 or `methods = [saem, imp]`."
-                    .to_string(),
-            );
-        }
-        let n_imp = chain
-            .iter()
-            .filter(|&&m| m == EstimationMethod::Imp)
-            .count();
-        if n_imp > 1 {
-            return Err("method `imp` may appear at most once in a chain.".to_string());
-        }
-        if chain.last().copied() != Some(EstimationMethod::Imp) {
-            return Err(
-                "method `imp` must be the final stage of the chain — placing it mid-chain \
-                 would leave `FitResult.importance_sampling` populated with a log-likelihood \
-                 computed at parameters that the following stage then overwrites. Move `imp` \
-                 to the end."
-                    .to_string(),
-            );
-        }
-    }
-
-    // Guard: the trust-region outer optimizer does not yet thread kappas through
-    // its OFV evaluation (see trust_region.rs::FoceiProblem::ofv_fixed which
-    // passes &[] for kappas). Running it on an IOV model would silently produce
-    // a wrong OFV. Fail early until the trust-region path supports IOV.
-    if model.n_kappa > 0 && options.optimizer == Optimizer::TrustRegion {
-        return Err(
-            "optimizer = trust_region does not support IOV (n_kappa > 0). \
-             Use optimizer = bobyqa, slsqp, lbfgs, nlopt_lbfgs, mma, or bfgs \
-             for models with kappa declarations."
-                .to_string(),
-        );
-    }
+    // Model / estimation-option compatibility guards: SDE vs SAEM / GN / AD,
+    // IMP chain placement, and trust-region vs IOV. Extracted into
+    // `check_model_options` so `ferx check` reports the same incompatibilities;
+    // here we stop at the first error to preserve fail-fast behavior and exact
+    // error strings. (Per-CMT error models cannot reach the EKF path — the
+    // parser rejects Form C `y[CMT=N]` readouts on SDE models — so an SDE model
+    // is always single-endpoint here, which the EKF residual-variance
+    // assumption in stats/likelihood.rs relies on.)
+    first_error(&check_model_options(model, options))?;
 
     // Pre-compute n_params (uses init_params, available before chain runs).
     let fixed_mask = crate::estimation::parameterization::packed_fixed_mask(init_params);
@@ -2571,6 +2607,26 @@ mod iov_integration {
             msg.contains("trust_region") && msg.contains("IOV"),
             "error message should mention trust_region and IOV, got: {msg}"
         );
+    }
+
+    // `ferx check` must surface the same trust_region+IOV incompatibility that
+    // `fit()` rejects — without it, a model could report `valid: true` and then
+    // fail at fit time. `check_model_options` is the shared source of truth.
+    #[test]
+    fn test_check_model_options_flags_trust_region_iov() {
+        let model = make_iov_model();
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::TrustRegion, false);
+        let diags = super::check_model_options(&model, &opts);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_OPTIMIZER_IOV")
+            .expect("expected E_OPTIMIZER_IOV diagnostic");
+        // Same wording fit() produces (regression against the extracted guard).
+        assert!(d.message.contains("trust_region") && d.message.contains("IOV"));
+
+        // A compatible optimizer produces no compatibility diagnostics.
+        let ok_opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        assert!(super::check_model_options(&model, &ok_opts).is_empty());
     }
 }
 

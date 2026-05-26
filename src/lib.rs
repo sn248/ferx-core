@@ -25,8 +25,8 @@ pub mod stats;
 pub mod types;
 
 pub use api::{
-    check_model_data, check_model_data_warnings, fit, fit_from_files, predict, run_from_file,
-    run_model_simulate, run_model_with_data, simulate, simulate_with_seed,
+    check_model_data, check_model_data_warnings, check_model_options, fit, fit_from_files, predict,
+    run_from_file, run_model_simulate, run_model_with_data, simulate, simulate_with_seed,
     simulate_with_uncertainty, validate_model_file, SimulateUncertaintyOptions,
 };
 pub use cancel::CancelFlag;

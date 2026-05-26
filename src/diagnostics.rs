@@ -26,6 +26,9 @@
 //! | `E_PER_CMT_SCALING`       | an observed compartment lacks a per-CMT scaling entry |
 //! | `E_PER_CMT_ERROR_MODEL`   | an observed compartment lacks a per-CMT `[error_model]` entry |
 //! | `E_DATA`                  | the `--data` file could not be read or parsed |
+//! | `E_SDE_INCOMPATIBLE`      | an SDE (`[diffusion]`) model used with SAEM / GN / AD |
+//! | `E_IMP_CHAIN`             | `imp` mis-placed in a method chain (first / repeated / non-terminal) |
+//! | `E_OPTIMIZER_IOV`         | `optimizer = trust_region` used with an IOV model |
 //! | `W_STEADY_STATE_II`       | SS=1 dose with missing / non-positive II |
 //! | `W_STEADY_STATE_INFUSION` | SS=1 infusion with `T_inf > II` (overlapping pulses) |
 //! | `W_SDE_RESET`             | EVID=3/4 resets under an SDE model are not honoured |

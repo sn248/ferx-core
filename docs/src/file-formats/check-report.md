@@ -59,6 +59,9 @@ Optional fields are omitted entirely when absent (not emitted as `null`).
 | `E_PER_CMT_SCALING` | error | An observed compartment lacks a per-CMT scaling entry. |
 | `E_PER_CMT_ERROR_MODEL` | error | An observed compartment lacks a per-CMT `[error_model]` entry. |
 | `E_DATA` | error | The `--data` file could not be read or parsed. |
+| `E_SDE_INCOMPATIBLE` | error | An SDE (`[diffusion]`) model used with an incompatible method (`saem`, `gn`, `gn_hybrid`) or `gradient_method = ad`. |
+| `E_IMP_CHAIN` | error | `imp` is mis-placed in a method chain — first stage, repeated, or not the terminal stage. |
+| `E_OPTIMIZER_IOV` | error | `optimizer = trust_region` used with an IOV model (`n_kappa > 0`). |
 | `W_STEADY_STATE_II` | warning | SS=1 doses with missing / non-positive `II` (treated as non-SS). |
 | `W_STEADY_STATE_INFUSION` | warning | SS=1 infusion with `T_inf > II` (overlapping pulses; SS skipped). |
 | `W_SDE_RESET` | warning | EVID=3/4 resets under an SDE `[diffusion]` model are not honoured. |

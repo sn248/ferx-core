@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-8fee082a.js";
+            window.path_to_searchindex_js = "searchindex-f012af5f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-6b798105.js"></script>
@@ -203,7 +203,9 @@ a fit — <em>without</em> fitting — then reports the findings. This is a fast
 <code>author → diagnose → fix</code> loop, especially useful for tooling and coding agents
 that author model files programmatically.</p>
 <ul>
-<li>Without <code>--data</code>, only parse / structural checks run (no data is read).</li>
+<li>Without <code>--data</code>, parse / structural and model–option compatibility checks
+run (no data is read) — e.g. an SDE model paired with SAEM, or
+<code>optimizer = trust_region</code> on an IOV model.</li>
 <li>With <code>--data</code>, the dataset is read and the data-dependent checks run too:
 referenced covariates present, per-CMT scaling / error-model coverage,
 steady-state dosing well-formed, and non-negative typical-value lag time.</li>

@@ -144,39 +144,62 @@ fn main() {
 }
 
 /// Parsed `ferx check` arguments.
+#[derive(Debug, PartialEq, Eq)]
 struct CheckArgs<'a> {
     model: &'a str,
     data: Option<&'a str>,
     json: bool,
 }
 
-/// Parse `ferx check <model> [--data <csv>] [--json]`. Returns `None` when the
-/// model path is missing (or looks like a flag), so the caller can print usage.
-fn parse_check_args(args: &[String]) -> Option<CheckArgs<'_>> {
+/// Why `parse_check_args` rejected the arguments.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckArgsError {
+    /// Model path missing or flag-looking — print full usage.
+    Usage,
+    /// `--data` present but missing its value or followed by another flag.
+    MissingDataValue,
+}
+
+/// Parse `ferx check <model> [--data <csv>] [--json]`.
+///
+/// `--data` is parsed like the existing `--output` / `--threads` helpers: when
+/// the flag is present it must be followed by a non-flag value, otherwise we
+/// reject the args rather than silently running without data (or trying to open
+/// a file literally named `--json`).
+fn parse_check_args(args: &[String]) -> Result<CheckArgs<'_>, CheckArgsError> {
     let model = match args.get(2) {
         Some(p) if !p.starts_with("--") => p.as_str(),
-        _ => return None,
+        _ => return Err(CheckArgsError::Usage),
     };
-    let data = args
-        .iter()
-        .position(|a| a == "--data")
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str);
+    let data = match args.iter().position(|a| a == "--data") {
+        None => None,
+        Some(i) => match args.get(i + 1) {
+            Some(v) if !v.starts_with("--") => Some(v.as_str()),
+            _ => return Err(CheckArgsError::MissingDataValue),
+        },
+    };
     let json = args.iter().any(|a| a == "--json");
-    Some(CheckArgs { model, data, json })
+    Ok(CheckArgs { model, data, json })
 }
 
 /// Run the `check` subcommand. Returns the process exit code:
 /// `0` = valid (no errors), `1` = errors found, `2` = usage / serialization error.
 fn run_check(args: &[String]) -> i32 {
-    let Some(parsed) = parse_check_args(args) else {
-        eprintln!("Usage: ferx check <model.ferx> [--data <data.csv>] [--json]");
-        eprintln!();
-        eprintln!("Validates a model file without fitting and reports structured");
-        eprintln!("diagnostics. With --data, also runs data-dependent checks");
-        eprintln!("(covariates present, per-CMT coverage, steady-state, lag time).");
-        eprintln!("--json   emit the report as JSON to stdout");
-        return 2;
+    let parsed = match parse_check_args(args) {
+        Ok(p) => p,
+        Err(CheckArgsError::MissingDataValue) => {
+            eprintln!("Error: --data requires a path (e.g. --data data.csv)");
+            return 2;
+        }
+        Err(CheckArgsError::Usage) => {
+            eprintln!("Usage: ferx check <model.ferx> [--data <data.csv>] [--json]");
+            eprintln!();
+            eprintln!("Validates a model file without fitting and reports structured");
+            eprintln!("diagnostics. With --data, also runs data-dependent checks");
+            eprintln!("(covariates present, per-CMT coverage, steady-state, lag time).");
+            eprintln!("--json   emit the report as JSON to stdout");
+            return 2;
+        }
     };
 
     let report = ferx_core::validate_model_file(parsed.model, parsed.data);
@@ -276,7 +299,7 @@ fn parse_threads_flag(args: &[String]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_check_args, parse_output_flag, parse_threads_flag};
+    use super::{parse_check_args, parse_output_flag, parse_threads_flag, CheckArgsError};
 
     fn args(extra: &[&str]) -> Vec<String> {
         std::iter::once("ferx")
@@ -338,8 +361,32 @@ mod tests {
     }
 
     #[test]
-    fn check_args_missing_model_is_none() {
-        assert!(parse_check_args(&args(&["check"])).is_none());
-        assert!(parse_check_args(&args(&["check", "--json"])).is_none());
+    fn check_args_missing_model_is_usage_error() {
+        assert_eq!(
+            parse_check_args(&args(&["check"])),
+            Err(CheckArgsError::Usage)
+        );
+        assert_eq!(
+            parse_check_args(&args(&["check", "--json"])),
+            Err(CheckArgsError::Usage)
+        );
+    }
+
+    #[test]
+    fn check_args_data_without_value_is_error() {
+        // `--data` as the final token: previously ran silently without data.
+        assert_eq!(
+            parse_check_args(&args(&["check", "model.ferx", "--data"])),
+            Err(CheckArgsError::MissingDataValue)
+        );
+    }
+
+    #[test]
+    fn check_args_data_followed_by_flag_is_error() {
+        // `--data --json`: previously tried to open a file named "--json".
+        assert_eq!(
+            parse_check_args(&args(&["check", "model.ferx", "--data", "--json"])),
+            Err(CheckArgsError::MissingDataValue)
+        );
     }
 }

@@ -19,12 +19,13 @@
 //!    old fixed-EBE gradient missed this and left Ω_iov pinned at its initial
 //!    value. With the fix, gradient FOCEI moves the variance components and a
 //!    `saem → focei` chain polishes SAEM's result down to a *better* optimum
-//!    (OFV ≈ 266.2 vs SAEM's ≈ 279) — see issue #101 rec #2.
+//!    (OFV ≈ 288.8 vs SAEM's ≈ 303) — see issue #101 rec #2.
 //!
-//! The FOCEI optimum (CL≈0.17, V≈8.5, KA≈1.15, Ω_iov≈0.036) matches the NONMEM
-//! 7.5.1 reference basin (tests/nonmem/warfarin_iov.ctl). Its OFV sits ≈40 units
-//! below NONMEM's 308.83 because of ferx's Option-A cross-occasion dose-carryover
-//! approximation — see `tests/warfarin_iov_nonmem.rs`.
+//! The FOCEI optimum (CL≈0.17, V≈8.5, KA≈1.15, Ω_iov≈0.047) matches the NONMEM
+//! 7.5.1 reference basin (tests/nonmem/warfarin_iov.ctl). With the continuous
+//! per-occasion-aware prediction (issue #104) its OFV is within ≈17 units of
+//! NONMEM's 308.83 (down from ≈40); the residual is the simultaneous
+//! cross-occasion dose/obs event ordering — see `tests/warfarin_iov_nonmem.rs`.
 //!
 //! 3. Pure FOCEI/SLSQP now reaches the minimum from the model's cold default
 //!    start: for IOV models the SLSQP path auto-enables per-coordinate scaling
@@ -39,10 +40,11 @@ use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, FitResult, Optimizer};
 use std::path::Path;
 
-/// OFV the `saem → focei` chain reaches on warfarin_iov (the FOCEI marginal
-/// minimum; SLSQP and BFGS polish agree here, and the parameters match the
-/// NONMEM reference basin).
-const IOV_FOCEI_OFV: f64 = 266.2;
+/// OFV the FOCEI marginal minimum reaches on warfarin_iov with the continuous
+/// per-occasion-aware prediction (issue #104). Pure SLSQP, pure BFGS, and the
+/// `saem → focei` chain all agree here; the parameters match the NONMEM
+/// reference basin (CL≈0.17, V≈8.5, Ω_iov≈0.047).
+const IOV_FOCEI_OFV: f64 = 288.8;
 
 fn load() -> (ferx_core::CompiledModel, ferx_core::Population) {
     let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))

@@ -3,9 +3,7 @@ use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::io::datareader::read_nonmem_csv;
 use crate::pk;
-use crate::stats::likelihood::{
-    compute_cwres, foce_subject_nll, foce_subject_nll_iov, split_obs_by_occasion,
-};
+use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
 use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -1439,24 +1437,12 @@ fn compute_subject_results(
             };
 
             // Individual predictions: f(eta_hat), with occasion-specific kappas for IOV.
+            // Uses the continuous per-occasion-aware prediction (issue #104) so the
+            // sdtab ipreds match the fitted objective.
             let ipred = if !kappas.is_empty() {
-                let occ_groups = split_obs_by_occasion(subject);
-                let mut ipreds = vec![0.0; subject.obs_times.len()];
-                for (k, (_, obs_indices)) in occ_groups.iter().enumerate() {
-                    let kap: &[f64] = if k < kappas.len() {
-                        kappas[k].as_slice()
-                    } else {
-                        &[]
-                    };
-                    let combined: Vec<f64> =
-                        eta.iter().copied().chain(kap.iter().copied()).collect();
-                    let pk = (model.pk_param_fn)(&params.theta, &combined, &subject.covariates);
-                    let all_preds = model_preds(model, subject, &pk, &params.theta, &combined);
-                    for &j in obs_indices {
-                        ipreds[j] = all_preds[j];
-                    }
-                }
-                ipreds
+                let kappa_slices: Vec<Vec<f64>> =
+                    kappas.iter().map(|k| k.as_slice().to_vec()).collect();
+                crate::pk::predict_iov(model, subject, &params.theta, eta.as_slice(), &kappa_slices)
             } else {
                 let pk_params_ind =
                     (model.pk_param_fn)(&params.theta, eta.as_slice(), &subject.covariates);

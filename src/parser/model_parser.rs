@@ -110,6 +110,40 @@ fn extract_eta_indices(expr: &Expression) -> Vec<usize> {
     out
 }
 
+/// First kappa name referenced anywhere in `expr` (as a `Variable` or
+/// `Covariate` identifier), if any. Used to reject `KAPPA_*` references in a
+/// Form C ODE output expression under IOV (issue #107): in the `[scaling]`
+/// parse context the eta scope is BSV-only, so a kappa name there parses as an
+/// unresolved identifier rather than `Eta(i)`. Walks the whole value-producing
+/// tree, including conditional branches *and* the condition itself, so any
+/// appearance of a kappa name (e.g. `if (KAPPA_CL > 0) ...`) is caught.
+fn expr_references_kappa(expr: &Expression, kappa_names: &[String]) -> Option<String> {
+    fn walk(e: &Expression, kappa: &[String]) -> Option<String> {
+        match e {
+            Expression::Variable(n) | Expression::Covariate(n) => {
+                kappa.iter().find(|k| *k == n).cloned()
+            }
+            Expression::BinOp(l, _, r) => walk(l, kappa).or_else(|| walk(r, kappa)),
+            Expression::UnaryFn(_, a) => walk(a, kappa),
+            Expression::Power(b, e) => walk(b, kappa).or_else(|| walk(e, kappa)),
+            Expression::Conditional(cond, t, els) => walk_cond(cond, kappa)
+                .or_else(|| walk(t, kappa))
+                .or_else(|| walk(els, kappa)),
+            _ => None,
+        }
+    }
+    fn walk_cond(c: &Condition, kappa: &[String]) -> Option<String> {
+        match c {
+            Condition::Compare(l, _, r) => walk(l, kappa).or_else(|| walk(r, kappa)),
+            Condition::And(l, r) | Condition::Or(l, r) => {
+                walk_cond(l, kappa).or_else(|| walk_cond(r, kappa))
+            }
+            Condition::Not(c) => walk_cond(c, kappa),
+        }
+    }
+    walk(expr, kappa_names)
+}
+
 /// All variable names assigned anywhere in the statement tree, in
 /// first-occurrence order, deduplicated. Used by `[individual_parameters]`
 /// to enumerate "tv" parameters for the AD path and to populate the per-var
@@ -1300,6 +1334,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &pk_indices_for_scaling,
             &state_names_for_scaling,
             is_ode_model,
+            &model.kappa_names,
         )?;
 
         // AD compatibility check (Phase 2.5):
@@ -1932,6 +1967,7 @@ fn build_y_output_fn(
     indiv_var_names: &[String],
     pk_indices: &[usize],
     state_names: &[String],
+    kappa_names: &[String],
 ) -> Result<crate::ode::OdeOutputFn, String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
@@ -1943,6 +1979,23 @@ fn build_y_output_fn(
     }
     let ctx = ParseCtx::new(theta_names, eta_names, &defined);
     let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {}", e))?;
+
+    // Reject KAPPA_* (IOV) references in a Form C ODE output expression: the
+    // readout is evaluated once per observation with a single eta, so under IOV
+    // it would silently see kappa = 0 (the per-occasion PK *dynamics* are still
+    // correct — they flow through the per-event parameters — but a direct kappa
+    // reference in the readout is not occasion-aware). The `[scaling]` eta scope
+    // is BSV-only, so a kappa name parses as an unresolved identifier here; match
+    // it by name. Fail fast rather than mislead. See issue #107; reference the
+    // occasion-dependent structural parameter (e.g. CL) instead.
+    if let Some(name) = expr_references_kappa(&expr, kappa_names) {
+        return Err(format!(
+            "[scaling] y: Form C output expressions cannot reference the IOV \
+             parameter `{name}` — the ODE readout is evaluated per observation and \
+             would see kappa = 0. Reference the occasion-dependent structural \
+             parameter (e.g. CL) instead. See issue #107."
+        ));
+    }
     let state_idx: HashMap<String, usize> = state_names
         .iter()
         .enumerate()
@@ -2018,6 +2071,7 @@ fn parse_scaling_block(
     pk_indices: &[usize],
     state_names: &[String],
     is_ode: bool,
+    kappa_names: &[String],
 ) -> Result<(ScalingSpec, Option<crate::ode::OdeReadout>), String> {
     // Accumulate uniform and per-CMT entries separately, then assemble at
     // the end. Mixing the two forms within the same group (obs_scale or y)
@@ -2113,6 +2167,7 @@ fn parse_scaling_block(
                     indiv_var_names,
                     pk_indices,
                     state_names,
+                    kappa_names,
                 )?;
                 match cmt_opt {
                     None => {
@@ -8923,6 +8978,79 @@ if (1 > 0) {
             (y - 3.0).abs() < 1e-12,
             "expected 3.0 (TVCL must resolve to theta[0]=3), got {}",
             y
+        );
+    }
+
+    /// Issue #107: a Form C ODE output expression that references KAPPA_*
+    /// directly would be evaluated per-observation with kappa=0, so it is
+    /// rejected at parse time for IOV models.
+    fn iov_ode_model_with_y(y_expr: &str) -> String {
+        format!(
+            "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  ode(states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[scaling]
+  {y_expr}
+
+[fit_options]
+  method = focei
+  iov_column = OCC
+  gradient = fd
+"
+        )
+    }
+
+    #[test]
+    fn ode_form_c_output_referencing_kappa_is_rejected_under_iov() {
+        let src = iov_ode_model_with_y("y = central / V * exp(KAPPA_CL)");
+        let err = parse_model_string(&src)
+            .expect_err("Form C output referencing KAPPA_* must be rejected under IOV");
+        assert!(
+            err.contains("KAPPA") && err.contains("#107"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_form_c_output_without_kappa_ref_is_allowed_under_iov() {
+        // The readout reads only the structural state/param; the occasion
+        // dependence enters through CL in the ODE rhs, so this must parse.
+        let src = iov_ode_model_with_y("y = central / V");
+        parse_model_string(&src)
+            .expect("Form C output without a direct KAPPA_* reference must parse under IOV");
+    }
+
+    #[test]
+    fn ode_form_c_output_referencing_kappa_in_condition_is_rejected_under_iov() {
+        // KAPPA_* inside a conditional *condition* (not just a branch) must also
+        // be rejected — the guard walks the condition tree (Copilot review #108).
+        let src = iov_ode_model_with_y("y = if (KAPPA_CL > 0) central / V else central / V");
+        let err = parse_model_string(&src)
+            .expect_err("KAPPA_* in a Form C output condition must be rejected under IOV");
+        assert!(
+            err.contains("KAPPA") && err.contains("#107"),
+            "unexpected error: {err}"
         );
     }
 

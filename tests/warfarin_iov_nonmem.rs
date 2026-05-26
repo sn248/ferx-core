@@ -11,28 +11,31 @@
 //! `iov_objective_characterizes_nonmem_gap` — ferx's FOCEI objective, evaluated
 //! at NONMEM's final MLE (all parameters FIXed), compared to NONMEM's
 //! OFV-without-constant. With the continuous per-occasion-aware prediction
-//! (issue #104, `pk::predict_iov`) ferx lands at ≈291.9 vs NONMEM's 308.83 — a
+//! (issue #104, `pk::predict_iov`) ferx lands at ≈292 vs NONMEM's 308.83 — a
 //! ≈17-unit gap, down from ≈37 under the old Option-A superposition.
 //!
-//! The ≈20-unit improvement is the carryover fix: ferx now propagates each
-//! dose's amount continuously across occasion boundaries with the occasion's
-//! clearance (via the event-driven solver), matching NONMEM's integration model
-//! rather than scoring each occasion against the whole dose history with a
-//! single clearance.
+//! **The prediction is now exact.** ferx's population PRED (η=κ=0) matches
+//! NONMEM's PRED to 5 significant figures on every row of the dataset,
+//! *including the occasion-2 carryover rows* (e.g. t=120.5: 6.1882; t=124:
+//! 11.761). So the carryover fix is fully validated, and the residual gap is
+//! NOT a prediction difference.
 //!
-//! The **residual ≈17 units** is the simultaneous cross-occasion event ordering:
-//! warfarin's occasion-1 obs and occasion-2 dose are both at t=120, and ferx's
-//! event sort processes the dose before the obs (`Dose < Obs` tie-break), so the
-//! [96,120] interval decays with occasion-2's clearance instead of occasion-1's.
-//! NONMEM processes records in data order (obs row first → occasion-1). Closing
-//! this fully requires retaining the original record order for simultaneous
-//! events (not currently stored — doses and observations live in separate
-//! arrays). Non-IOV NONMEM cross-checks (`multi_endpoint`, `ss_lagtime`) match
-//! tightly, confirming the residual is IOV-boundary-specific.
+//! The simultaneous cross-occasion event ordering (occasion-1 obs and
+//! occasion-2 dose both at t=120) was investigated as a candidate: making the
+//! event sort occasion-aware there changes the OFV by only ~0.3 units, so it is
+//! not the residual and was not pursued (an occasion-aware tie-break would also
+//! need per-event occasion data for EVID=2 records to stay correct — see #107).
 //!
-//! This test is `#[ignore]`d: it characterizes and bounds the residual gap. The
-//! optimizer-from-cold-start issue is tracked separately in
-//! `tests/iov_convergence.rs` (issue #101 rec #2).
+//! The **residual ≈17 units (~1.7/subject)** is therefore in the FOCE marginal /
+//! EBE machinery: a cross-engine FOCEI difference for this weakly-identified
+//! multi-random-effect IOV model (ferx's augmented Sheiner–Beal marginal vs
+//! NONMEM's Laplace), plausibly inherent and amplified by NONMEM's own
+//! non-clean convergence here (it terminated on ROUNDING ERRORS). ferx SAEM
+//! (302.9) and FOCEI (288.8) bracket below NONMEM (308.8), consistent with a
+//! genuine approximation spread rather than a bug. Non-IOV NONMEM cross-checks
+//! (`multi_endpoint`, `ss_lagtime`) match tightly, so this is IOV-specific.
+//!
+//! This test is `#[ignore]`d: it characterizes and bounds the residual gap.
 //!
 //! ## Reproducing the NONMEM reference
 //!
@@ -131,11 +134,11 @@ fn iov_objective_characterizes_nonmem_gap() {
         .expect("fixed-param IOV objective evaluation must run");
 
     // Characterize the residual gap (~17 units) after the continuous-prediction
-    // fix (issue #104): ferx sits BELOW NONMEM (the simultaneous-event ordering
-    // decays the [96,120] interval with occasion-2's clearance). If this band is
-    // broken, something changed — either the simultaneous-event ordering was
-    // fixed (gap → ~0, tighten/retire this test) or a regression crept in (gap
-    // grew back toward the old ≈37, or blew up).
+    // fix (issue #104). The prediction is exact (ferx PRED == NONMEM PRED to
+    // 5 s.f.), so this residual is the FOCE marginal / EBE cross-engine
+    // difference, not prediction. ferx sits BELOW NONMEM. If this band is broken,
+    // something changed — a closer FOCE-marginal match (gap → ~0, tighten/retire)
+    // or a regression (gap grew back toward the old ≈37 carryover gap, or blew up).
     let diff = NM_OFV_NO_CONST - result.ofv; // expected ≈ +17
     assert!(
         result.ofv.is_finite() && (8.0..28.0).contains(&diff),

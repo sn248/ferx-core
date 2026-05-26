@@ -242,6 +242,149 @@ pub fn compute_event_pk_params_into(
     }
 }
 
+/// IOV predictions with proper per-dose occasion accounting (issue #104).
+///
+/// Builds per-event PK parameters carrying **each event's occasion kappa** and
+/// runs the state-propagating event-driven solver once. Because that solver
+/// uses the end-of-interval (current-record) parameter convention, a dose's
+/// carryover into a later occasion is eliminated with the *later* occasion's
+/// clearance — matching NONMEM's continuous integration with parameters that
+/// switch at occasion boundaries.
+///
+/// This supersedes the "Option A" per-occasion superposition, which scored
+/// every occasion against the subject's whole dose history using that
+/// occasion's parameters, biasing the likelihood on designs with cross-occasion
+/// carryover (no washout between occasions). See the `individual_nll_iov`
+/// history and issue #104.
+///
+/// `eta_bsv` is the BSV eta (length `n_eta`); `kappas[k]` is the kappa vector
+/// for the k-th occasion group in `split_obs_by_occasion` order. A dose/obs
+/// whose occasion has no kappa group (e.g. a dose in an occasion with no
+/// observations) uses zero kappa. EVID=2 rows carry no occasion label and also
+/// use zero kappa.
+///
+/// Falls back to Option-A superposition only for models with neither an ODE
+/// spec nor event-driven analytical support (none of the current `PkModel`s).
+///
+/// **Occasion-dependent PK dynamics are exact**: per-event params carry the
+/// occasion κ, so CL/V/KA switch correctly across occasions. `[scaling]` is also
+/// applied per occasion (see the call site). One narrow limitation remains: for
+/// ODE models a Form C output expression (`y = <expr>`) is evaluated inside the
+/// ODE solver with a single `eta` (BSV + zero κ), so an output expression that
+/// references `KAPPA_*` directly sees κ=0. The PK state itself is still
+/// occasion-correct (it flows through the per-event params); only a κ-referencing
+/// *readout* is affected. Threading per-event κ into the ODE output readout is
+/// future work.
+pub fn predict_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_bsv: &[f64],
+    kappas: &[Vec<f64>],
+) -> Vec<f64> {
+    use std::collections::HashMap;
+    let n_kappa = model.n_kappa;
+
+    // occasion id -> kappa-group index (split_obs_by_occasion order).
+    let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
+    let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(occ_groups.len());
+    for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
+        occ_to_k.insert(*occ_id, k);
+    }
+    let combined_for = |occ_id: u32| -> Vec<f64> {
+        let mut c = Vec::with_capacity(eta_bsv.len() + n_kappa);
+        c.extend_from_slice(eta_bsv);
+        match occ_to_k.get(&occ_id) {
+            Some(&k) if k < kappas.len() => c.extend_from_slice(&kappas[k]),
+            _ => c.extend(std::iter::repeat(0.0).take(n_kappa)),
+        }
+        c
+    };
+
+    let dose_params: Vec<PkParams> = (0..subject.doses.len())
+        .map(|d| {
+            let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
+            (model.pk_param_fn)(theta, &combined_for(occ), subject.dose_cov(d))
+        })
+        .collect();
+    let obs_params: Vec<PkParams> = (0..subject.obs_times.len())
+        .map(|j| {
+            let occ = subject.occasions.get(j).copied().unwrap_or(0);
+            (model.pk_param_fn)(theta, &combined_for(occ), subject.obs_cov(j))
+        })
+        .collect();
+    // EVID=2 rows carry no occasion label → BSV eta with zero kappa.
+    let pk_only_combined = combined_for(u32::MAX);
+    let pk_only_params: Vec<PkParams> = (0..subject.pk_only_times.len())
+        .map(|m| (model.pk_param_fn)(theta, &pk_only_combined, subject.pk_only_cov(m)))
+        .collect();
+
+    let mut preds = if let Some(ref ode) = model.ode_spec {
+        crate::ode::ode_predictions_event_driven(
+            ode,
+            subject,
+            theta,
+            &pk_only_combined,
+            &dose_params,
+            &obs_params,
+            &pk_only_params,
+        )
+    } else if event_driven::supports_event_driven(model.pk_model) {
+        event_driven::event_driven_predictions(
+            model.pk_model,
+            subject,
+            &dose_params,
+            &obs_params,
+            &pk_only_params,
+        )
+    } else {
+        return predict_iov_option_a(model, subject, theta, eta_bsv, kappas);
+    };
+
+    // `[scaling]` post-multiply, applied **per occasion** so a κ-dependent scale
+    // (or a scale referencing a κ-dependent individual parameter) uses that
+    // occasion's κ — matching the per-occasion prediction. `apply_scaling`
+    // short-circuits on `ScalingSpec::None`, so the common case stays a cheap
+    // no-op. (Form C ODE output `y = <expr>` is applied inside the ODE solver,
+    // not here; see the note below for the κ=0 limitation there.)
+    if !matches!(model.scaling, ScalingSpec::None) {
+        let raw = preds.clone();
+        for (occ_id, obs_indices) in &occ_groups {
+            let combined = combined_for(*occ_id);
+            let mut scaled = raw.clone();
+            apply_scaling(model, subject, theta, &combined, &mut scaled);
+            for &j in obs_indices {
+                preds[j] = scaled[j];
+            }
+        }
+    }
+    preds
+}
+
+/// Legacy Option-A IOV prediction: per-occasion superposition over the whole
+/// dose history. Retained only as a fallback for models that support neither
+/// the ODE nor the event-driven analytical path. See [`predict_iov`].
+fn predict_iov_option_a(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_bsv: &[f64],
+    kappas: &[Vec<f64>],
+) -> Vec<f64> {
+    let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
+    let n_obs = subject.obs_times.len();
+    let mut preds = vec![0.0_f64; n_obs];
+    for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate() {
+        let kap: &[f64] = kappas.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
+        let combined: Vec<f64> = eta_bsv.iter().copied().chain(kap.iter().copied()).collect();
+        let all_preds = compute_predictions_with_tv(model, subject, theta, &combined);
+        for &j in obs_indices {
+            preds[j] = all_preds[j];
+        }
+    }
+    preds
+}
+
 /// Predict concentration at a given time for a subject, summing contributions
 /// from all prior doses (superposition principle).
 ///

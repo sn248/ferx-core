@@ -746,14 +746,7 @@ fn find_ebe_iov(
 
     // H-matrix: BSV columns only, perturbing eta with kappas fixed at EBE values
     let kappas_slices: Vec<Vec<f64>> = kappas_vec.iter().map(|k| k.as_slice().to_vec()).collect();
-    let h_matrix = compute_jacobian_fd_iov(
-        model,
-        subject,
-        &params.theta,
-        &bsv_eta,
-        &kappas_slices,
-        &occ_groups,
-    );
+    let h_matrix = compute_jacobian_fd_iov(model, subject, &params.theta, &bsv_eta, &kappas_slices);
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
@@ -766,23 +759,21 @@ fn find_ebe_iov(
     }
 }
 
-/// Jacobian d(pred)/d(bsv_eta) with kappas fixed, per-occasion predictions.
-/// Returns an n_obs × n_eta matrix.
+/// Jacobian d(pred)/d(bsv_eta) with kappas fixed. Returns an n_obs × n_eta
+/// matrix.
 ///
-/// Shares the cross-occasion dose-carryover convention of `individual_nll_iov`:
-/// occasion-`k`'s predictions are computed using that occasion's combined eta
-/// against the full subject dose history, then only the occasion's obs rows
-/// are written into the Jacobian. This keeps the FD gradient consistent
-/// with the NLL value (both treat each dose's effect as governed by the
-/// observation's occasion, not the dose's). See the docstring on
-/// `individual_nll_iov` for the implications.
+/// Uses the continuous, per-occasion-aware prediction (`pk::predict_iov`), so a
+/// BSV-eta perturbation flows through the whole timeline (it shifts every
+/// occasion's clearance) and the column is dense across rows — consistent with
+/// the NLL value in `individual_nll_iov`, which uses the same prediction. The
+/// occasion list is recovered inside `predict_iov`, so `occ_groups` is no longer
+/// needed here. See issue #104.
 fn compute_jacobian_fd_iov(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
     kappas: &[Vec<f64>],
-    occ_groups: &[(u32, Vec<usize>)],
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
@@ -792,26 +783,16 @@ fn compute_jacobian_fd_iov(
 
     for col in 0..n_eta {
         let h_step = eps * (1.0 + eta[col].abs());
-        for (k, (_, obs_indices)) in occ_groups.iter().enumerate() {
-            if k >= kappas.len() {
-                break;
-            }
-            let mut combined_plus: Vec<f64> = eta_pert.clone();
-            combined_plus[col] = eta[col] + h_step;
-            combined_plus.extend_from_slice(&kappas[k]);
-            let preds_plus = pk::compute_predictions_with_tv(model, subject, theta, &combined_plus);
-
-            let mut combined_minus: Vec<f64> = eta_pert.clone();
-            combined_minus[col] = eta[col] - h_step;
-            combined_minus.extend_from_slice(&kappas[k]);
-            let preds_minus =
-                pk::compute_predictions_with_tv(model, subject, theta, &combined_minus);
-
-            for &j in obs_indices {
-                h[(j, col)] = (preds_plus[j] - preds_minus[j]) / (2.0 * h_step);
-            }
-        }
+        eta_pert[col] = eta[col] + h_step;
+        let preds_plus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
+        eta_pert[col] = eta[col] - h_step;
+        let preds_minus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
         eta_pert[col] = eta[col];
+
+        let inv = 1.0 / (2.0 * h_step);
+        for j in 0..n_obs {
+            h[(j, col)] = (preds_plus[j] - preds_minus[j]) * inv;
+        }
     }
 
     h

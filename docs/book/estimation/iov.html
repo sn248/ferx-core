@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-3c45e8ab.js";
+            window.path_to_searchindex_js = "../searchindex-7f3644dd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-39f227ad.js"></script>
@@ -309,7 +309,7 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 </blockquote>
 <h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
 <ul>
-<li><strong>Cross-occasion dose carryover (Option A).</strong> Each occasion’s predictions are computed with that occasion’s PK parameters applied to the <em>entire</em> dose history, then only that occasion’s observation rows are scored. So a dose from an earlier occasion contributes to a later occasion’s observations using the <em>later</em> occasion’s CL/V/etc., not the dose’s own occasion. For sparse designs with non-overlapping occasion windows the difference is negligible, but for designs with substantial carryover (e.g. warfarin, where occasion 2 doses before occasion 1 has washed out) the IOV FOCE OFV can sit tens of units below a NONMEM reference at matched parameters — see <code>tests/warfarin_iov_nonmem.rs</code>. Full per-dose occasion accounting is future work.</li>
+<li><strong>Cross-occasion dose carryover.</strong> Predictions are computed by <code>pk::predict_iov</code>, which builds per-event PK parameters carrying each event’s occasion kappa and propagates the compartment amounts <em>continuously</em> across occasion boundaries (via the event-driven solver). A dose from an earlier occasion is therefore eliminated through a later occasion with the later occasion’s clearance — matching NONMEM’s integration model (this replaced the earlier “Option A” superposition, which used a single clearance for the whole dose history and biased no-washout designs; issue #104). A small residual gap versus NONMEM (~17 OFV units on the warfarin IOV reference, down from ~37) remains from the ordering of <em>simultaneous</em> cross-occasion events — when an occasion-ending observation and the next occasion’s dose share a timestamp, ferx’s event sort processes the dose first, so the preceding interval uses the new occasion’s clearance, whereas NONMEM follows data order. See <code>tests/warfarin_iov_nonmem.rs</code>.</li>
 <li><strong>Local-optimizer convergence from a far-off cold start.</strong> Pure FOCEI (SLSQP via the auto-scaling above, or BFGS) reaches the minimum from a <em>sensible</em> start, but the IOV variance surface is ill-conditioned and weakly identified, so a <em>far-off</em> start (e.g. a residual-error init off by more than ~2×) can still stall. Set a realistic <code>sigma</code> init (a too-small one drives early omega inflation). The most robust workflow remains <strong>SAEM</strong>, or a <code>methods = [saem, focei]</code> chain (SAEM finds the basin, FOCEI polishes to a strictly better marginal optimum). See <code>tests/iov_convergence.rs</code>.</li>
 <li><strong>Automatic differentiation (AD) is not used</strong> for IOV inner-loop gradients; finite differences are used instead. For large models this is slower than the AD path used for BSV-only models.</li>
 <li>The occasion column must contain non-negative integers. Non-integer or negative values are silently treated as missing (<code>OCC = 0</code>) and a single summary warning is emitted.</li>

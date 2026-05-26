@@ -242,32 +242,29 @@ fn obs_nll_subject_into_iov(
     sigma_values: &[f64],
     eta: &[f64],
     kappas: &[Vec<f64>],
-    pk_scratch: &mut crate::pk::EventPkParams,
+    _pk_scratch: &mut crate::pk::EventPkParams,
 ) -> f64 {
     use crate::stats::special::log_normal_cdf;
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
-    let occ_groups = split_obs_by_occasion(subject);
+    // Continuous per-occasion-aware prediction (issue #104) — same model the
+    // E-step (`individual_nll_iov`) and FOCEI use, so E and M steps stay
+    // consistent. `_pk_scratch` is retained for signature stability but unused
+    // (predict_iov manages its own per-event params).
+    let preds = crate::pk::predict_iov(model, subject, theta, eta, kappas);
     let mut total_nll = 0.0_f64;
-    for (k, (_, obs_indices)) in occ_groups.iter().enumerate() {
-        let kap: &[f64] = kappas.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
-        let combined: Vec<f64> = eta.iter().chain(kap.iter()).copied().collect();
-        let preds = crate::pk::compute_predictions_with_tv_into(
-            model, subject, theta, &combined, pk_scratch,
-        );
-        for &j in obs_indices {
-            // Floors protect log(0) in the M-step objective.  individual_nll_iov
-            // (the E-step evaluator) does not floor — see obs_nll_subject_grad_iov
-            // for why the asymmetry is intentional.
-            let f = preds[j].max(1e-12);
-            let v = model
-                .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
-                .max(1e-12);
-            if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
-                let z = (subject.observations[j] - f) / v.sqrt();
-                total_nll += -log_normal_cdf(z);
-            } else {
-                total_nll += 0.5 * (v.ln() + (subject.observations[j] - f).powi(2) / v);
-            }
+    for j in 0..subject.observations.len() {
+        // Floors protect log(0) in the M-step objective. individual_nll_iov
+        // (the E-step evaluator) does not floor — see obs_nll_subject_grad_iov
+        // for why the asymmetry is intentional.
+        let f = preds[j].max(1e-12);
+        let v = model
+            .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
+            .max(1e-12);
+        if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
+            let z = (subject.observations[j] - f) / v.sqrt();
+            total_nll += -log_normal_cdf(z);
+        } else {
+            total_nll += 0.5 * (v.ln() + (subject.observations[j] - f).powi(2) / v);
         }
     }
     total_nll
@@ -340,38 +337,33 @@ fn obs_nll_subject_grad_iov(
         return (nll_base, grad);
     }
 
-    // Non-M3 path: compute per-occasion base predictions and score.
-    let occ_groups = split_obs_by_occasion(subject);
+    // Non-M3 path: continuous per-occasion-aware base predictions (issue #104).
     let n_obs = subject.observations.len();
+    let preds = crate::pk::predict_iov(model, subject, theta, eta, kappas);
     let mut nll_base = 0.0_f64;
     let mut all_preds_base = vec![0.0f64; n_obs];
     let mut residuals = vec![0.0f64; n_obs];
     let mut variances = vec![0.0f64; n_obs];
     let mut d_nll_d_f = vec![0.0f64; n_obs];
 
-    for (k, (_, obs_indices)) in occ_groups.iter().enumerate() {
-        let kap: &[f64] = kappas.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
-        let combined: Vec<f64> = eta.iter().chain(kap.iter()).copied().collect();
-        let preds = crate::pk::compute_predictions_with_tv_into(
-            model, subject, theta, &combined, pk_scratch,
-        );
-        for &j in obs_indices {
-            let cmt = subject.obs_cmts[j];
-            let f = preds[j].max(1e-12);
-            let v = model.residual_variance_at(cmt, f, sigma_values).max(1e-12);
-            let resid = subject.observations[j] - f;
-            nll_base += 0.5 * (v.ln() + resid * resid / v);
-            all_preds_base[j] = f;
-            residuals[j] = resid;
-            variances[j] = v;
-            let dv_df = model.error_spec.dvar_df(cmt, f, sigma_values);
-            d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
-        }
+    for j in 0..n_obs {
+        let cmt = subject.obs_cmts[j];
+        let f = preds[j].max(1e-12);
+        let v = model.residual_variance_at(cmt, f, sigma_values).max(1e-12);
+        let resid = subject.observations[j] - f;
+        nll_base += 0.5 * (v.ln() + resid * resid / v);
+        all_preds_base[j] = f;
+        residuals[j] = resid;
+        variances[j] = v;
+        let dv_df = model.error_spec.dvar_df(cmt, f, sigma_values);
+        d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
 
     let mut grad = vec![0.0f64; n];
 
-    // Theta gradient: forward-FD of per-occasion predictions.
+    // Theta gradient: forward-FD of the continuous prediction (one perturbed
+    // prediction per theta; κ affects later occasions via carryover so the
+    // sensitivity is captured across all rows).
     let h_fd = 1e-5;
     for i in 0..n_theta {
         if lower[i] == upper[i] {
@@ -380,16 +372,10 @@ fn obs_nll_subject_grad_iov(
         let delta = h_fd * (1.0 + theta[i].abs());
         let mut theta_p = theta.to_vec();
         theta_p[i] += delta;
+        let preds_p = crate::pk::predict_iov(model, subject, &theta_p, eta, kappas);
         let mut d_obs_nll = 0.0_f64;
-        for (k, (_, obs_indices)) in occ_groups.iter().enumerate() {
-            let kap: &[f64] = kappas.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
-            let combined: Vec<f64> = eta.iter().chain(kap.iter()).copied().collect();
-            let preds_p = crate::pk::compute_predictions_with_tv_into(
-                model, subject, &theta_p, &combined, pk_scratch,
-            );
-            for &j in obs_indices {
-                d_obs_nll += d_nll_d_f[j] * (preds_p[j] - all_preds_base[j]) / delta;
-            }
+        for j in 0..n_obs {
+            d_obs_nll += d_nll_d_f[j] * (preds_p[j] - all_preds_base[j]) / delta;
         }
         grad[i] = if theta_packs_log_mask[i] {
             theta[i] * d_obs_nll
@@ -397,18 +383,6 @@ fn obs_nll_subject_grad_iov(
             d_obs_nll
         };
     }
-
-    // split_obs_by_occasion partitions every index in 0..n_obs (one entry per
-    // observation in subject.occasions).  The sigma gradient below sums over
-    // all_preds_base/residuals/variances which are only populated for indices
-    // that appear in occ_groups.  Assert the partition is complete so an
-    // occasion-code gap would surface as a debug-mode failure rather than a
-    // silent wrong gradient.
-    debug_assert_eq!(
-        occ_groups.iter().map(|(_, v)| v.len()).sum::<usize>(),
-        n_obs,
-        "split_obs_by_occasion must partition every observation index"
-    );
 
     // Sigma gradient: analytical — same formula as non-IOV, summed over all obs.
     for k in 0..n_sigma {

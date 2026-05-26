@@ -593,60 +593,39 @@ pub fn foce_subject_nll_iov(
     let k_occ = occ_groups.len();
     let n_b = n_eta + k_occ * n_iov;
 
-    // Per-occasion ipreds at the joint EBE, plus the κ sensitivity columns of
-    // the augmented H-matrix. The BSV columns are copied from the passed-in H
-    // (already computed at the EBE with κ fixed, in `compute_jacobian_fd_iov`).
-    let mut ipreds = vec![0.0_f64; n_obs];
+    // ipreds at the joint EBE via the continuous, per-occasion-aware prediction
+    // (proper cross-occasion carryover; issue #104), plus the augmented
+    // H-matrix. BSV columns come from the passed-in H (FD of the same prediction
+    // w.r.t. η, in `compute_jacobian_fd_iov`); the κ columns are FD here.
+    // Because κ_k changes occasion-k's clearance, it affects occasion-k's
+    // observations AND the carryover into later occasions — so a κ column is
+    // dense across rows, exactly what FD of the continuous prediction captures
+    // (the old Option-A version wrote κ_k only on occasion-k's rows).
+    let kappa_slices: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
+    let ipreds = pk::predict_iov(model, subject, theta, eta_hat.as_slice(), &kappa_slices);
+
     let mut h_full = DMatrix::zeros(n_obs, n_b);
     for j in 0..n_obs {
         for c in 0..n_eta {
             h_full[(j, c)] = h_matrix[(j, c)];
         }
     }
-    // Reused scratch for per-event PK params — avoids a fresh allocation on
-    // every prediction call in this nested (occasion × kappa-dim × ±) loop.
-    let mut pk_scratch = pk::EventPkParams::with_capacity_for(subject);
+    // Reused κ buffer: perturb one element in place and restore it, rather than
+    // cloning all occasions' κ twice per FD step.
+    let mut kpert = kappa_slices.clone();
     const EPS: f64 = 1e-6;
-    for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate() {
-        let kap = kappas[k].as_slice();
-        let combined: Vec<f64> = eta_hat.iter().copied().chain(kap.iter().copied()).collect();
-        let all_preds = model_predictions_into_with_schedule(
-            model,
-            subject,
-            theta,
-            &combined,
-            &mut pk_scratch,
-            None,
-        );
-        for &j in obs_indices {
-            ipreds[j] = all_preds[j];
-        }
-        // ∂pred/∂κ_k[ki] via central FD — written only on this occasion's rows.
+    for k in 0..k_occ {
         let col_base = n_eta + k * n_iov;
         for ki in 0..n_iov {
-            let step = EPS * (1.0 + kap[ki].abs());
-            let mut combined_plus = combined.clone();
-            let mut combined_minus = combined.clone();
-            combined_plus[n_eta + ki] += step;
-            combined_minus[n_eta + ki] -= step;
-            let preds_plus = model_predictions_into_with_schedule(
-                model,
-                subject,
-                theta,
-                &combined_plus,
-                &mut pk_scratch,
-                None,
-            );
-            let preds_minus = model_predictions_into_with_schedule(
-                model,
-                subject,
-                theta,
-                &combined_minus,
-                &mut pk_scratch,
-                None,
-            );
+            let orig = kpert[k][ki];
+            let step = EPS * (1.0 + orig.abs());
+            kpert[k][ki] = orig + step;
+            let preds_plus = pk::predict_iov(model, subject, theta, eta_hat.as_slice(), &kpert);
+            kpert[k][ki] = orig - step;
+            let preds_minus = pk::predict_iov(model, subject, theta, eta_hat.as_slice(), &kpert);
+            kpert[k][ki] = orig;
             let inv_2step = 1.0 / (2.0 * step);
-            for &j in obs_indices {
+            for j in 0..n_obs {
                 h_full[(j, col_base + ki)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
             }
         }
@@ -870,24 +849,17 @@ pub fn build_block_diag_omega(
 /// returned by `split_obs_by_occasion`).  When `kappas` is empty, falls back
 /// to the standard (no-IOV) `individual_nll` path.
 ///
-/// The PK parameters for occasion k are computed from:
-///   `combined_eta_k = [eta[0..n_eta], kappas[k][0..n_kappa]]`
-/// Predictions for occasion-k observations use those PK params with the full
-/// subject dose history.
-///
-/// **Option A simplification — cross-occasion dose carryover.**
-/// Each occasion's predictions are computed with that occasion's pk_params
-/// against the *entire* dose history of the subject; only the obs rows
-/// belonging to that occasion are then scored. So a dose given in occasion
-/// `j` contributes to an occasion-`k` observation (`k > j`) using
-/// occasion-`k`'s CL/V/etc., not occasion-`j`'s. NONMEM's strict per-dose
-/// occasion accounting (each dose's contribution computed with its own
-/// occasion's parameters across the intervals it dominates) is not modeled
-/// here; for typical IOV designs (sparse PK with non-overlapping occasion
-/// windows) the difference is small, but for densely sampled designs with
-/// significant cross-occasion carryover the bias can matter. The
-/// FD Jacobian in `compute_jacobian_fd_iov` shares this convention so
-/// gradients and NLL values are internally consistent.
+/// **Cross-occasion dose carryover (issue #104).** Predictions are computed by
+/// [`pk::predict_iov`], which builds per-event PK parameters carrying each
+/// event's occasion kappa and propagates the compartment amounts continuously
+/// across occasion boundaries (via the event-driven solver). A dose given in an
+/// earlier occasion therefore decays through a later occasion with the *later*
+/// occasion's clearance — matching NONMEM's integration model. This replaced
+/// the earlier "Option A" superposition, which scored each occasion against the
+/// whole dose history with a single clearance and biased the likelihood on
+/// no-washout designs. The FD Jacobian (`compute_jacobian_fd_iov`) and the
+/// augmented marginal (`foce_subject_nll_iov`) use the same prediction, so NLL
+/// and gradients stay consistent.
 pub fn individual_nll_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -929,29 +901,18 @@ pub fn individual_nll_iov(
     }
     let k_occasions = kappas.len();
 
-    // Data NLL — per-occasion predictions
-    let occ_groups = split_obs_by_occasion(subject);
+    // Data NLL — single continuous prediction with per-event occasion kappa
+    // (proper cross-occasion carryover; issue #104).
+    let preds = pk::predict_iov(model, subject, theta, eta, kappas);
     let mut data_ll = 0.0;
-
-    for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate() {
-        if k >= kappas.len() {
-            break; // guard against mismatch
-        }
-        // Build combined eta for this occasion
-        let combined: Vec<f64> = eta.iter().chain(kappas[k].iter()).copied().collect();
-        let all_preds = model_predictions(model, subject, theta, &combined);
-
-        for &j in obs_indices {
-            let y = subject.observations[j];
-            let f_pred = all_preds[j];
-            let v = model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values);
-            if is_m3_bloq(model, subject, j) {
-                let z = (y - f_pred) / v.sqrt();
-                data_ll += -2.0 * log_normal_cdf(z);
-            } else {
-                let resid = y - f_pred;
-                data_ll += resid * resid / v + v.ln();
-            }
+    for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
+        let v = model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values);
+        if is_m3_bloq(model, subject, j) {
+            let z = (y - f_pred) / v.sqrt();
+            data_ll += -2.0 * log_normal_cdf(z);
+        } else {
+            let resid = y - f_pred;
+            data_ll += resid * resid / v + v.ln();
         }
     }
 

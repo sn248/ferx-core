@@ -72,9 +72,9 @@ These run nightly via `slow-tests.yml` and on any push to `main` that touches es
 
 Docs live in `docs/` as an [mdBook](https://rust-lang.github.io/mdBook/):
 
-- `docs/src/` — Markdown sources (edit these).
-- `docs/book/` — built HTML, **committed to the repo** (GitHub Pages deploys from it). Run `cd docs && mdbook build` after editing any `docs/src/*.md` and commit both the source and the built output in the same commit.
+- `docs/src/` — Markdown sources. **These are the only docs files you edit or commit.**
 - `docs/src/SUMMARY.md` — table of contents; new pages must be added here to show up in the book.
+- `docs/book/` — built HTML. **Generated, git-ignored, and never committed.** CI builds and deploys it: the `Deploy Docs` workflow (`.github/workflows/docs.yml`) runs `mdbook build` and publishes to the `gh-pages` branch on every push to `main` that touches `docs/**`. Do **not** run `mdbook build` for the purpose of committing output (you may still build locally to preview — the result stays untracked).
 
 Any user-visible feature (new fit option, new estimator, new file-format directive, behavioural change) must update the relevant page — typically one of:
 

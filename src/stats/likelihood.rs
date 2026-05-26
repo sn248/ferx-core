@@ -582,8 +582,15 @@ pub fn foce_subject_nll_iov(
     let n_obs = subject.obs_times.len();
     let n_eta = eta_hat.len();
     let n_iov = omega_iov.matrix.nrows();
-    // One κ block per occasion that actually carries observations.
-    let k_occ = occ_groups.len().min(kappas.len());
+    // Defensive: the EBE pipeline always yields exactly one κ vector per
+    // occasion group, each of width n_iov. A mismatch would silently leave the
+    // unmatched occasions' ipreds (and H columns) at 0.0 and score the
+    // augmented marginal against wrong predictions, so bail with the large
+    // finite sentinel — mirroring the guards in `individual_nll_iov`.
+    if kappas.len() != occ_groups.len() || kappas.iter().any(|k| k.len() != n_iov) {
+        return 1e20;
+    }
+    let k_occ = occ_groups.len();
     let n_b = n_eta + k_occ * n_iov;
 
     // Per-occasion ipreds at the joint EBE, plus the κ sensitivity columns of
@@ -596,11 +603,21 @@ pub fn foce_subject_nll_iov(
             h_full[(j, c)] = h_matrix[(j, c)];
         }
     }
+    // Reused scratch for per-event PK params — avoids a fresh allocation on
+    // every prediction call in this nested (occasion × kappa-dim × ±) loop.
+    let mut pk_scratch = pk::EventPkParams::with_capacity_for(subject);
     const EPS: f64 = 1e-6;
-    for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate().take(k_occ) {
+    for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate() {
         let kap = kappas[k].as_slice();
         let combined: Vec<f64> = eta_hat.iter().copied().chain(kap.iter().copied()).collect();
-        let all_preds = model_predictions(model, subject, theta, &combined);
+        let all_preds = model_predictions_into_with_schedule(
+            model,
+            subject,
+            theta,
+            &combined,
+            &mut pk_scratch,
+            None,
+        );
         for &j in obs_indices {
             ipreds[j] = all_preds[j];
         }
@@ -612,8 +629,22 @@ pub fn foce_subject_nll_iov(
             let mut combined_minus = combined.clone();
             combined_plus[n_eta + ki] += step;
             combined_minus[n_eta + ki] -= step;
-            let preds_plus = model_predictions(model, subject, theta, &combined_plus);
-            let preds_minus = model_predictions(model, subject, theta, &combined_minus);
+            let preds_plus = model_predictions_into_with_schedule(
+                model,
+                subject,
+                theta,
+                &combined_plus,
+                &mut pk_scratch,
+                None,
+            );
+            let preds_minus = model_predictions_into_with_schedule(
+                model,
+                subject,
+                theta,
+                &combined_minus,
+                &mut pk_scratch,
+                None,
+            );
             let inv_2step = 1.0 / (2.0 * step);
             for &j in obs_indices {
                 h_full[(j, col_base + ki)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
@@ -626,7 +657,7 @@ pub fn foce_subject_nll_iov(
     for i in 0..n_eta {
         b_hat[i] = eta_hat[i];
     }
-    for (k, kap) in kappas.iter().enumerate().take(k_occ) {
+    for (k, kap) in kappas.iter().enumerate() {
         for ki in 0..n_iov {
             b_hat[n_eta + k * n_iov + ki] = kap[ki];
         }

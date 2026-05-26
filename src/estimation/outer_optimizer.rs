@@ -694,24 +694,18 @@ fn optimize_nlopt(
                 return ofv;
             }
             // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
-            // IOV models need EBE-reconverging FD to move the variance components
-            // (issue #101 rec #2); non-IOV uses the cheap fixed-EBE analytical path.
-            let grad_raw = if model.n_kappa > 0 {
-                reconverged_fd_gradient(&x, init_params, model, population, &ehs, &bounds, options)
-            } else {
-                ad_population_gradient(
-                    &x,
-                    n_subj,
-                    init_params,
-                    model,
-                    population,
-                    &ehs,
-                    &hms,
-                    &kappas,
-                    &bounds,
-                    options,
-                )
-            };
+            let grad_raw = population_gradient(
+                &x,
+                n_subj,
+                init_params,
+                model,
+                population,
+                &ehs,
+                &hms,
+                &kappas,
+                &bounds,
+                options,
+            );
             let mut sq = 0.0_f64;
             for k in 0..g.len() {
                 let gi = if grad_raw[k].is_finite() {
@@ -978,30 +972,18 @@ fn optimize_nlopt(
                     return ofv;
                 }
                 // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
-                let grad_raw = if model.n_kappa > 0 {
-                    reconverged_fd_gradient(
-                        &x,
-                        init_params,
-                        model,
-                        population,
-                        &ehs,
-                        &bounds,
-                        options,
-                    )
-                } else {
-                    ad_population_gradient(
-                        &x,
-                        n_subj,
-                        init_params,
-                        model,
-                        population,
-                        &ehs,
-                        &hms,
-                        &kappas,
-                        &bounds,
-                        options,
-                    )
-                };
+                let grad_raw = population_gradient(
+                    &x,
+                    n_subj,
+                    init_params,
+                    model,
+                    population,
+                    &ehs,
+                    &hms,
+                    &kappas,
+                    &bounds,
+                    options,
+                );
                 let mut sq = 0.0_f64;
                 for k in 0..g.len() {
                     let gi = if grad_raw[k].is_finite() {
@@ -1309,24 +1291,19 @@ fn optimize_bfgs(
             options.min_obs_for_convergence_check as usize,
         );
         let ofv = ofv_at_fixed(x, &ehs, &hms, &kappas);
-        // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x). IOV reconverges EBEs in the FD
-        // stencil so the variance components move (issue #101 rec #2).
-        let g = if model.n_kappa > 0 {
-            reconverged_fd_gradient(x, init_params, model, population, &ehs, &bounds, options)
-        } else {
-            ad_population_gradient(
-                x,
-                n_subj,
-                init_params,
-                model,
-                population,
-                &ehs,
-                &hms,
-                &kappas,
-                &bounds,
-                options,
-            )
-        };
+        // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x).
+        let g = population_gradient(
+            x,
+            n_subj,
+            init_params,
+            model,
+            population,
+            &ehs,
+            &hms,
+            &kappas,
+            &bounds,
+            options,
+        );
         let f = if ofv.is_finite() { ofv } else { 1e20 };
         (f, g, ehs, hms)
     };
@@ -1679,6 +1656,42 @@ fn ad_population_gradient(
     (0..np)
         .map(|k| per_subj.iter().map(|gi| gi[k]).sum::<f64>() * 2.0)
         .collect()
+}
+
+/// Population gradient dispatcher. IOV models (`n_kappa > 0`) use the
+/// EBE-reconverging FD gradient — their weakly-identified variance components
+/// need it (issue #101 rec #2) — and everything else uses the cheap analytical
+/// fixed-EBE gradient. Centralised so the optimizer paths (NLopt objective,
+/// NLopt pre-search, BFGS) can't drift apart in how they pick the gradient.
+#[allow(clippy::too_many_arguments)]
+fn population_gradient(
+    x: &[f64],
+    n_subj: usize,
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    ehs: &[DVector<f64>],
+    hms: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    if model.n_kappa > 0 {
+        reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options)
+    } else {
+        ad_population_gradient(
+            x,
+            n_subj,
+            init_params,
+            model,
+            population,
+            ehs,
+            hms,
+            kappas,
+            bounds,
+            options,
+        )
+    }
 }
 
 fn bfgs_update(

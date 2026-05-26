@@ -12,3 +12,6 @@ target
 rustc-ice-*.txt
 .claude/
 .archive/
+
+# Built mdBook output — generated and deployed by CI (.github/workflows/docs.yml)
+docs/book/

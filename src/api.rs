@@ -1,3 +1,4 @@
+use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
@@ -210,7 +211,11 @@ fn build_init_params(parsed: &ParsedModel) -> ModelParameters {
 /// Case-sensitive: `CRCL` and `crcl` are distinct names. Historically a missing
 /// covariate silently evaluated to zero, which left fits stuck at the initial
 /// estimates with no visible diagnostic (see commit introducing this check).
-fn validate_covariates(model: &CompiledModel, population: &Population) -> Result<(), String> {
+///
+/// Returns a diagnostic per problem (here, at most one). The message text is
+/// kept byte-for-byte identical to the historical `Err(String)` so `fit()`'s
+/// error — produced via [`first_error`] — is unchanged.
+fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     let missing: Vec<&str> = model
         .referenced_covariates
         .iter()
@@ -219,7 +224,7 @@ fn validate_covariates(model: &CompiledModel, population: &Population) -> Result
         .collect();
 
     if missing.is_empty() {
-        return Ok(());
+        return Vec::new();
     }
 
     let available = if population.covariate_names.is_empty() {
@@ -227,12 +232,260 @@ fn validate_covariates(model: &CompiledModel, population: &Population) -> Result
     } else {
         population.covariate_names.join(", ")
     };
-    Err(format!(
-        "Model references covariate(s) not found in data (case-sensitive): {}. \
-         Available covariate columns: {}.",
-        missing.join(", "),
-        available
-    ))
+    vec![Diagnostic::error(
+        "E_MISSING_COVARIATE",
+        format!(
+            "Model references covariate(s) not found in data (case-sensitive): {}. \
+             Available covariate columns: {}.",
+            missing.join(", "),
+            available
+        ),
+    )
+    .with_suggestion(format!("available covariate columns: {}", available))]
+}
+
+/// Per-CMT scaling needs every observed CMT to have an entry in the
+/// `ScalingSpec::PerCmt` / `OdeReadout::PerCmt` map. Wraps the existing
+/// `pk::validate_per_cmt_scaling` (which the parser can't run — it doesn't see
+/// the data), preserving its message verbatim.
+fn check_per_cmt_scaling(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    match pk::validate_per_cmt_scaling(model, &population.subjects) {
+        Ok(()) => Vec::new(),
+        Err(msg) => vec![Diagnostic::error("E_PER_CMT_SCALING", msg).with_block("scaling")],
+    }
+}
+
+/// Per-CMT (multi-endpoint) error models: every observed CMT must have a
+/// matching `CMT=N:` entry in `[error_model]`.
+fn check_per_cmt_error_model(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let crate::types::ErrorSpec::PerCmt(map) = &model.error_spec else {
+        return Vec::new();
+    };
+    use std::collections::BTreeSet;
+    let mut missing = BTreeSet::new();
+    for subj in &population.subjects {
+        for &cmt in &subj.obs_cmts {
+            if !map.contains_key(&cmt) {
+                missing.insert(cmt);
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    let list = missing
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![Diagnostic::error(
+        "E_PER_CMT_ERROR_MODEL",
+        format!(
+            "[error_model] has no entry for observed compartment(s) {}; \
+             add a `CMT=N: DV ~ ...` line for each observed CMT.",
+            list
+        ),
+    )
+    .with_block("error_model")]
+}
+
+/// All data-dependent *fatal* compatibility checks between a compiled model and
+/// a dataset, collected into one diagnostic list. Shared by `fit()` (which
+/// stops at the first error via [`first_error`]) and `ferx check` (which
+/// reports every finding). Check order matches the historical inline order in
+/// `fit()` so the first error is unchanged: covariates, scaling, error model.
+pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let mut diags = check_covariates(model, population);
+    diags.extend(check_per_cmt_scaling(model, population));
+    diags.extend(check_per_cmt_error_model(model, population));
+    diags
+}
+
+/// Data-dependent *warning*-level checks: malformed steady-state rows, EVID=3/4
+/// resets under an SDE model, and a negative typical-value lag time. These are
+/// non-fatal — `fit()` pushes their messages into `FitResult.warnings` and
+/// proceeds; `ferx check` reports them as `Warning` diagnostics. Message text
+/// is identical to the historical inline strings.
+pub fn check_model_data_warnings(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+
+    // SS=1 with II ≤ 0 — the SS branch is gated on `dose.ii > 0`, so the dose
+    // is silently treated as a single (non-SS) dose.
+    let n_ss_bad_ii = population
+        .subjects
+        .iter()
+        .filter(|s| s.doses.iter().any(|d| d.ss && d.ii <= 0.0))
+        .count();
+    if n_ss_bad_ii > 0 {
+        diags.push(Diagnostic::warning(
+            "W_STEADY_STATE_II",
+            format!(
+                "{} subject(s) have SS=1 doses with missing or non-positive II. \
+                 SS predictions require II > 0 — these doses are treated as \
+                 non-SS (no steady-state pre-equilibration). Set II in the \
+                 dataset or remove the SS flag.",
+                n_ss_bad_ii
+            ),
+        ));
+    }
+
+    // SS=1 infusion with T_inf > II — overlapping pulses have no closed form;
+    // the SS pre-equilibration is skipped.
+    let n_ss_overlapping_inf = population
+        .subjects
+        .iter()
+        .filter(|s| {
+            s.doses
+                .iter()
+                .any(|d| d.ss && d.ii > 0.0 && d.rate > 0.0 && d.duration > d.ii)
+        })
+        .count();
+    if n_ss_overlapping_inf > 0 {
+        diags.push(Diagnostic::warning(
+            "W_STEADY_STATE_INFUSION",
+            format!(
+                "{} subject(s) have SS=1 infusions with T_inf > II (overlapping \
+                 pulses). No closed form or pulse-expansion scheme covers this \
+                 case — the SS pre-equilibration is skipped and the dose is \
+                 applied as a single (non-SS) infusion, so the system is not at \
+                 steady state at the dose time. Use a shorter infusion (T_inf \
+                 ≤ II) or remove the SS flag.",
+                n_ss_overlapping_inf
+            ),
+        ));
+    }
+
+    // EVID=3/4 resets are not honoured on the EKF/SDE path.
+    if model.is_sde() {
+        let n_reset_sde = population
+            .subjects
+            .iter()
+            .filter(|s| s.has_resets())
+            .count();
+        if n_reset_sde > 0 {
+            diags.push(Diagnostic::warning(
+                "W_SDE_RESET",
+                format!(
+                    "{} subject(s) have EVID=3/4 reset rows with a [diffusion] (SDE) \
+                     model. System resets are not yet honoured on the EKF/SDE path — \
+                     the resets are ignored and compartment amounts carry through. \
+                     Use an ODE or analytical model if resets are required.",
+                    n_reset_sde
+                ),
+            ));
+        }
+    }
+
+    // Negative typical-value lag time at the initial point (eta = 0).
+    if model.has_lagtime() {
+        if let Some(first_subj) = population.subjects.first() {
+            let zero_eta = vec![0.0_f64; model.n_eta];
+            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates);
+            if pk.lagtime() < 0.0 {
+                diags.push(Diagnostic::warning(
+                    "W_NEGATIVE_LAGTIME",
+                    format!(
+                        "Lagtime evaluates to {:.4} (< 0) at the initial typical-value \
+                         point (eta = 0). Negative lagtimes are physically nonsensical \
+                         and are not clamped — consider an exp() or other positive-link \
+                         parameterisation.",
+                        pk.lagtime()
+                    ),
+                ));
+            }
+        }
+    }
+
+    diags
+}
+
+/// Map a free-text parser error string to a single structured [`Diagnostic`].
+/// Recognises the `"Missing [X] block"` shape (→ `E_MISSING_BLOCK`, with the
+/// block name attached) and the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`);
+/// everything else is a generic `E_PARSE`.
+fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
+    if let Some(rest) = err.strip_prefix("Missing [") {
+        if let Some(end) = rest.find(']') {
+            let block = &rest[..end];
+            return Diagnostic::error("E_MISSING_BLOCK", err.to_string()).with_block(block);
+        }
+    }
+    if err.contains("[covariate_nn]") && err.contains("--features nn") {
+        return Diagnostic::error("E_NN_FEATURE_DISABLED", err.to_string())
+            .with_block("covariate_nn");
+    }
+    Diagnostic::error("E_PARSE", err.to_string())
+}
+
+/// Validate a model file (and optionally a dataset) **without fitting**.
+///
+/// Runs the parser plus every data-independent and data-dependent check,
+/// collecting *all* findings into a [`CheckReport`] (rather than stopping at the
+/// first, as `fit()` does). This is the engine behind the `ferx check` CLI
+/// command and is the fast `author → diagnose → fix` loop for tools and agents.
+///
+/// When `data_path` is `None`, only parse/structural validation runs (no data
+/// is read). When it is `Some`, the CSV is read and the covariate / per-CMT /
+/// steady-state / lag-time checks run as well.
+pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport {
+    use crate::parser::model_parser::parse_full_model_file;
+
+    let model_name = Path::new(model_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model")
+        .to_string();
+    let data = data_path.map(|s| s.to_string());
+
+    // 1. Parse. A parse failure is terminal — without an AST there is nothing
+    //    further to validate, so return a report carrying just that diagnostic.
+    let parsed = match parse_full_model_file(Path::new(model_path)) {
+        Ok(p) => p,
+        Err(e) => {
+            return CheckReport::new(model_name, data, vec![parse_error_to_diagnostic(&e)]);
+        }
+    };
+
+    let mut diags: Vec<Diagnostic> = Vec::new();
+
+    // 2. Data-dependent checks (only when a dataset is supplied).
+    if let Some(path) = data_path {
+        let iov_col = parsed.fit_options.iov_column.as_deref();
+        match read_nonmem_csv(Path::new(path), None, iov_col) {
+            Ok(population) => {
+                diags.extend(check_model_data(&parsed.model, &population));
+                let init_params = parsed.model.default_params.clone();
+                diags.extend(check_model_data_warnings(
+                    &parsed.model,
+                    &population,
+                    &init_params,
+                ));
+            }
+            Err(e) => {
+                diags.push(Diagnostic::error(
+                    "E_DATA",
+                    format!("Failed to read data file '{}': {}", path, e),
+                ));
+            }
+        }
+    }
+
+    // 3. Attach block-level line numbers to any diagnostic that named a block.
+    for d in &mut diags {
+        if d.line.is_none() {
+            if let Some(block) = &d.block {
+                if let Some(&ln) = parsed.block_lines.get(block) {
+                    d.line = Some(ln);
+                }
+            }
+        }
+    }
+
+    CheckReport::new(model_name, data, diags)
 }
 
 /// High-level fit: model file path + data file path → FitResult
@@ -311,36 +564,12 @@ pub fn fit(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
-    validate_covariates(model, population)?;
-    // Per-CMT scaling needs every observed CMT to have an entry in the
-    // `ScalingSpec::PerCmt` / `OdeReadout::PerCmt` map. The parser can't
-    // check this — it doesn't see the data — so fire here at fit time.
-    pk::validate_per_cmt_scaling(model, &population.subjects)?;
-    // Same idea for per-CMT (multi-endpoint) error models: every observed CMT
-    // must have a matching `CMT=N:` entry in `[error_model]`.
-    if let crate::types::ErrorSpec::PerCmt(map) = &model.error_spec {
-        use std::collections::BTreeSet;
-        let mut missing = BTreeSet::new();
-        for subj in &population.subjects {
-            for &cmt in &subj.obs_cmts {
-                if !map.contains_key(&cmt) {
-                    missing.insert(cmt);
-                }
-            }
-        }
-        if !missing.is_empty() {
-            let list = missing
-                .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "[error_model] has no entry for observed compartment(s) {}; \
-                 add a `CMT=N: DV ~ ...` line for each observed CMT.",
-                list
-            ));
-        }
-    }
+    // Data-dependent fatal checks (covariates present, per-CMT scaling and
+    // per-CMT error-model coverage). These can't run in the parser — it doesn't
+    // see the data. `ferx check` runs the same `check_model_data` to report
+    // every finding; here we stop at the first error to preserve fit()'s
+    // historical fail-fast behavior and exact error strings.
+    first_error(&check_model_data(model, population))?;
     // If any subject has per-event covariate snapshots that don't carry
     // a variation in covariates the model actually references (e.g.
     // DAY / STIME columns in NONMEM-format datasets), clear those
@@ -691,94 +920,13 @@ fn fit_inner(
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
-    // Steady-state (SS=1) data validation. SS is now supported on every
-    // prediction path: analytical (PR #75 for 1-cpt, #77 for 2-/3-cpt),
-    // ODE-based (numerical pre-equilibration via per-cycle pulse expansion
-    // in `equilibrate_ss_state`), and event-driven (TV-cov; analytical
-    // pulse expansion in `equilibrate_ss_state_event_driven`). The
-    // remaining warnings catch malformed SS rows where the prediction
-    // code can't honour the SS semantic and instead falls back to
-    // treating the dose as if SS=0:
-    //   - SS=1 with II ≤ 0 (missing/invalid interval — SS branch is gated
-    //     on `dose.ii > 0`, so the dose is treated as a single dose)
-    //   - SS=1 infusion with T_inf > II (overlapping pulses — no closed
-    //     form or equilibration scheme; the equilibration call returns
-    //     zero preload, then the dose is applied as a single infusion)
-    let n_ss_bad_ii = population
-        .subjects
-        .iter()
-        .filter(|s| s.doses.iter().any(|d| d.ss && d.ii <= 0.0))
-        .count();
-    if n_ss_bad_ii > 0 {
-        accumulated_warnings.push(format!(
-            "{} subject(s) have SS=1 doses with missing or non-positive II. \
-             SS predictions require II > 0 — these doses are treated as \
-             non-SS (no steady-state pre-equilibration). Set II in the \
-             dataset or remove the SS flag.",
-            n_ss_bad_ii
-        ));
-    }
-    let n_ss_overlapping_inf = population
-        .subjects
-        .iter()
-        .filter(|s| {
-            s.doses
-                .iter()
-                .any(|d| d.ss && d.ii > 0.0 && d.rate > 0.0 && d.duration > d.ii)
-        })
-        .count();
-    if n_ss_overlapping_inf > 0 {
-        accumulated_warnings.push(format!(
-            "{} subject(s) have SS=1 infusions with T_inf > II (overlapping \
-             pulses). No closed form or pulse-expansion scheme covers this \
-             case — the SS pre-equilibration is skipped and the dose is \
-             applied as a single (non-SS) infusion, so the system is not at \
-             steady state at the dose time. Use a shorter infusion (T_inf \
-             ≤ II) or remove the SS flag.",
-            n_ss_overlapping_inf
-        ));
-    }
-
-    // System resets (EVID=3/4) are honoured on the analytical and ODE
-    // prediction paths, but not yet on the EKF/SDE path (`ode_predictions_ekf`
-    // builds its own timeline without a reset event). Warn rather than
-    // silently ignore the resets for SDE models.
-    if model.is_sde() {
-        let n_reset_sde = population
-            .subjects
-            .iter()
-            .filter(|s| s.has_resets())
-            .count();
-        if n_reset_sde > 0 {
-            accumulated_warnings.push(format!(
-                "{} subject(s) have EVID=3/4 reset rows with a [diffusion] (SDE) \
-                 model. System resets are not yet honoured on the EKF/SDE path — \
-                 the resets are ignored and compartment amounts carry through. \
-                 Use an ODE or analytical model if resets are required.",
-                n_reset_sde
-            ));
-        }
-    }
-
-    // Lagtime: probe at the initial typical-value point (eta = 0, mean
-    // covariates). Cheap — one pk_param_fn call per population. Starting
-    // with a negative typical-value lagtime usually signals a
-    // misparameterisation (e.g. an additive `LAGTIME = TVLAG + ETA_LAG`
-    // instead of a multiplicative `TVLAG * exp(ETA_LAG)`).
-    if model.has_lagtime() {
-        if let Some(first_subj) = population.subjects.first() {
-            let zero_eta = vec![0.0_f64; model.n_eta];
-            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates);
-            if pk.lagtime() < 0.0 {
-                accumulated_warnings.push(format!(
-                    "Lagtime evaluates to {:.4} (< 0) at the initial typical-value \
-                     point (eta = 0). Negative lagtimes are physically nonsensical \
-                     and are not clamped — consider an exp() or other positive-link \
-                     parameterisation.",
-                    pk.lagtime()
-                ));
-            }
-        }
+    // Data-dependent warnings: malformed steady-state rows, EVID=3/4 resets
+    // under an SDE model, and a negative typical-value lag time. Extracted into
+    // `check_model_data_warnings` so `ferx check` reports the same findings;
+    // message text is unchanged. Probed against `population` (not the pruned
+    // copy) and `init_params`, matching the historical inline checks.
+    for d in check_model_data_warnings(model, population, init_params) {
+        accumulated_warnings.push(d.message);
     }
     if options.run_covariance_step && n_params_pre > 30 {
         if let Some(n_evals) = covariance_n_evals_estimated {

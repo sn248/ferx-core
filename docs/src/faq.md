@@ -170,3 +170,25 @@ errors at startup with the list of missing CMTs.
 
 See [Scaling](model-file/scaling.md) for the full reference, including
 how this compares to NONMEM's `S1`/`S2` and nlmixr2's `cmt(central); f = ...`.
+
+## How do I validate a model file without running a full fit?
+
+Use `ferx check`:
+
+```bash
+ferx check model.ferx                  # parse + structural validation
+ferx check model.ferx --data data.csv  # also run data-dependent checks
+ferx check model.ferx --data data.csv --json
+```
+
+It runs the parser and every validation step that normally fires at the start
+of a fit — missing blocks, missing covariates, per-CMT scaling / error-model
+coverage, steady-state and lag-time sanity — then reports the findings and
+exits, without fitting. This turns a multi-second fit-to-find-a-typo into a
+sub-second loop.
+
+`--json` emits a structured report (stable `code` per finding, optional block /
+line / suggestion) that tooling and coding agents can consume directly, rather
+than parsing prose. The exit code is `0` when no errors are found, `1` when
+there are errors. See the [check report reference](file-formats/check-report.md)
+for the JSON schema and the full code table.

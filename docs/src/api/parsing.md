@@ -56,8 +56,40 @@ pub struct ParsedModel {
     pub model: CompiledModel,
     pub simulation: Option<SimulationSpec>,
     pub fit_options: FitOptions,
+    /// 1-based source line of each unnamed `[block]` header, keyed by the
+    /// lowercased block type (e.g. `"individual_parameters" -> 7`).
+    pub block_lines: std::collections::HashMap<String, usize>,
 }
 ```
+
+## Validation
+
+### `validate_model_file()`
+
+Validate a model file (and optionally a dataset) **without fitting**, returning
+a structured [`CheckReport`](../file-formats/check-report.md). This is the engine
+behind the [`ferx check`](../cli.md) CLI command: it runs the parser plus every
+data-independent and data-dependent check, collecting *all* findings rather than
+stopping at the first (as `fit()` does).
+
+```rust
+pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport
+```
+
+**Example:**
+```rust
+let report = validate_model_file("model.ferx", Some("data.csv"));
+if !report.valid {
+    for d in &report.diagnostics {
+        eprintln!("{:?} [{}]: {}", d.severity, d.code, d.message);
+    }
+}
+```
+
+When `data_path` is `None`, only parse / structural checks run. The same
+validators feed `fit()` (via the internal `check_model_data` /
+`check_model_data_warnings` functions), so a clean `check` and a `fit()` agree
+on what is and isn't valid.
 
 ## Data Parsing
 

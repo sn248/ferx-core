@@ -1,0 +1,77 @@
+# Check Report (`ferx check --json`)
+
+`ferx check <model.ferx> [--data <data.csv>] --json` emits a structured JSON
+report describing every validation finding, instead of the human-readable
+summary. The report is designed to be consumed programmatically — by editor
+tooling, CI, or a coding agent authoring model files — so findings carry a
+stable machine-readable `code` rather than only prose.
+
+This is the same data the Rust API returns from
+[`validate_model_file`](../api/parsing.md); see also the
+[CLI reference](../cli.md) for the human-readable form and exit codes.
+
+## Top-level shape
+
+```json
+{
+  "valid": false,
+  "model": "mymodel",
+  "data": "data/mydata.csv",
+  "diagnostics": [
+    {
+      "severity": "error",
+      "code": "E_MISSING_COVARIATE",
+      "message": "Model references covariate(s) not found in data (case-sensitive): WGT. Available covariate columns: (none).",
+      "suggestion": "available covariate columns: (none)"
+    }
+  ]
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `valid` | bool | `true` when there are **no** `error`-severity diagnostics (warnings alone keep it `true`). |
+| `model` | string | Model file stem. |
+| `data` | string | Present only when `--data` was supplied. |
+| `diagnostics` | array | Every finding; see below. May be empty. |
+
+## Diagnostic object
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `severity` | `"error"` \| `"warning"` | Only `error` affects `valid` and the exit code. |
+| `code` | string | Stable identifier (see table below). |
+| `message` | string | Human-readable description. |
+| `block` | string | *Optional.* Owning model block, e.g. `"error_model"`. Omitted when not attributable to one block. |
+| `line` | integer | *Optional.* 1-based source line — see the caveat below. |
+| `suggestion` | string | *Optional.* Actionable hint. |
+
+Optional fields are omitted entirely when absent (not emitted as `null`).
+
+## Error / warning codes
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `E_PARSE` | error | The model file failed to parse (catch-all for parser errors). |
+| `E_MISSING_BLOCK` | error | A required `[block]` is absent. `block` names which one. |
+| `E_NN_FEATURE_DISABLED` | error | A `[covariate_nn]` block requires building with `--features nn`. |
+| `E_MISSING_COVARIATE` | error | The model references a covariate not present in the data (case-sensitive). |
+| `E_PER_CMT_SCALING` | error | An observed compartment lacks a per-CMT scaling entry. |
+| `E_PER_CMT_ERROR_MODEL` | error | An observed compartment lacks a per-CMT `[error_model]` entry. |
+| `E_DATA` | error | The `--data` file could not be read or parsed. |
+| `W_STEADY_STATE_II` | warning | SS=1 doses with missing / non-positive `II` (treated as non-SS). |
+| `W_STEADY_STATE_INFUSION` | warning | SS=1 infusion with `T_inf > II` (overlapping pulses; SS skipped). |
+| `W_SDE_RESET` | warning | EVID=3/4 resets under an SDE `[diffusion]` model are not honoured. |
+| `W_NEGATIVE_LAGTIME` | warning | Lag time is negative at the initial typical-value point. |
+
+Codes are stable; new ones may be added over time. Treat an unrecognised code
+as a generic finding of its given `severity`.
+
+## Line-number caveat
+
+`line` is currently **block-level**: when present it points at the `[block]`
+header that owns the finding, not the exact offending token or column. A finding
+that is not attributable to a single block (for example a missing-covariate
+error, where the reference may appear in several blocks) omits `line`. A missing
+*required* block omits `line` too, since the block has no header in the source.
+Token/column-level spans are a possible future enhancement.

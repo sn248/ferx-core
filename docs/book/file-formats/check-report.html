@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Parameters - FeRx-NLME Documentation</title>
+        <title>Check Report (ferx check) - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,227 +177,100 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="parameters"><a class="header" href="#parameters">Parameters</a></h1>
-<p>The <code>[parameters]</code> block defines all model parameters: fixed effects (theta), between-subject variability (omega), and residual error (sigma).</p>
-<h2 id="theta-fixed-effects"><a class="header" href="#theta-fixed-effects">Theta (Fixed Effects)</a></h2>
-<pre><code>theta NAME(initial_value, lower_bound, upper_bound)
+                        <h1 id="check-report-ferx-check---json"><a class="header" href="#check-report-ferx-check---json">Check Report (<code>ferx check --json</code>)</a></h1>
+<p><code>ferx check &lt;model.ferx&gt; [--data &lt;data.csv&gt;] --json</code> emits a structured JSON
+report describing every validation finding, instead of the human-readable
+summary. The report is designed to be consumed programmatically — by editor
+tooling, CI, or a coding agent authoring model files — so findings carry a
+stable machine-readable <code>code</code> rather than only prose.</p>
+<p>This is the same data the Rust API returns from
+<a href="../api/parsing.html"><code>validate_model_file</code></a>; see also the
+<a href="../cli.html">CLI reference</a> for the human-readable form and exit codes.</p>
+<h2 id="top-level-shape"><a class="header" href="#top-level-shape">Top-level shape</a></h2>
+<pre><code class="language-json">{
+  "valid": false,
+  "model": "mymodel",
+  "data": "data/mydata.csv",
+  "diagnostics": [
+    {
+      "severity": "error",
+      "code": "E_MISSING_COVARIATE",
+      "message": "Model references covariate(s) not found in data (case-sensitive): WGT. Available covariate columns: (none).",
+      "suggestion": "available covariate columns: (none)"
+    }
+  ]
+}
 </code></pre>
-<ul>
-<li><strong>NAME</strong>: Parameter name (used in <code>[individual_parameters]</code> expressions)</li>
-<li><strong>initial_value</strong>: Starting value for estimation</li>
-<li><strong>lower_bound</strong>: Lower bound constraint. Thetas with <code>lower_bound &gt;= 0</code>
-are log-transformed internally (so the optimiser sees <code>log(theta)</code>);
-thetas with <code>lower_bound &lt; 0</code> are estimated on the natural scale.
-This lets covariate exponents like <code>theta THETA_AGE_CL(-0.01, -1, 1)</code>
-pass through unchanged while still allowing CL/V/KA to be positivity-
-constrained via the log transform. <strong>Edge case:</strong> <code>lower_bound = 0.0</code>
-still picks the log transform with an internal <code>1e-10</code> floor, so a
-parameter that genuinely needs to reach 0 should declare a small
-negative <code>lower_bound</code> (e.g. <code>-1e-6</code>) to switch to identity packing.</li>
-<li><strong>upper_bound</strong>: Upper bound constraint</li>
-</ul>
-<p>Example:</p>
-<pre><code>theta TVCL(0.134, 0.001, 10.0)
-theta TVV(8.1, 0.1, 500.0)
-theta TVKA(1.0, 0.01, 50.0)
-</code></pre>
-<h2 id="omega-between-subject-variability"><a class="header" href="#omega-between-subject-variability">Omega (Between-Subject Variability)</a></h2>
-<h3 id="diagonal-omega"><a class="header" href="#diagonal-omega">Diagonal omega</a></h3>
-<pre><code>omega NAME ~ value          # value interpreted as variance (default)
-omega NAME ~ value (sd)     # value interpreted as standard deviation
-omega NAME ~ value (variance)   # explicit no-op equivalent to no annotation
-</code></pre>
-<ul>
-<li><strong>NAME</strong>: Random effect name (used in <code>[individual_parameters]</code> as <code>ETA_XXX</code>)</li>
-<li><strong>value</strong>: Initial value. Default scale is <strong>variance</strong> (the diagonal element of the omega matrix). Append <code>(sd)</code> to specify a standard deviation instead — the parser squares it before storing. The optimizer always works on the variance scale internally.</li>
-</ul>
-<p>Example (variance scale, default):</p>
-<pre><code>omega ETA_CL ~ 0.07
-omega ETA_V  ~ 0.02
-omega ETA_KA ~ 0.40
-</code></pre>
-<p>Equivalent declaration using SD coding (<code>(sd)</code> annotation):</p>
-<pre><code>omega ETA_CL ~ 0.265 (sd)    # ≡ ~ 0.0702
-omega ETA_V  ~ 0.141 (sd)    # ≡ ~ 0.0200
-omega ETA_KA ~ 0.632 (sd)    # ≡ ~ 0.400
-</code></pre>
-<p>Each variance represents the between-subject variability for that parameter. The coefficient of variation (CV%) is approximately <code>sqrt(variance) * 100</code> for log-normally distributed parameters. For example, <code>omega ETA_CL ~ 0.09</code> corresponds to ~30% CV.</p>
-<p>The <code>(sd)</code> form is convenient when you’re setting initial values from expected CV%, e.g. “I expect ~25% CV on CL” → <code>omega ETA_CL ~ 0.25 (sd)</code>. The fit result records which form you used so that downstream printers can annotate the estimate with <code>[initial specified as SD]</code>.</p>
-<p>Block omega (<code>block_omega (...) = [...]</code>) is variance-only — <code>(sd)</code> is not accepted there because the lower-triangle list mixes variances and covariances and a single tag would be ambiguous.</p>
-<h3 id="block-omega-correlated-random-effects"><a class="header" href="#block-omega-correlated-random-effects">Block omega (correlated random effects)</a></h3>
-<p>To estimate correlations between random effects, use <code>block_omega</code>:</p>
-<pre><code>block_omega (NAME1, NAME2, ...) = [lower_triangle_values]
-</code></pre>
-<p>The values are the lower triangle of the covariance matrix, specified row-wise. For a 2x2 block:</p>
-<pre><code>block_omega (ETA_CL, ETA_V) = [var_CL, cov_CL_V, var_V]
-</code></pre>
-<p>For a 3x3 block:</p>
-<pre><code>block_omega (ETA_CL, ETA_V, ETA_KA) = [var_CL, cov_CL_V, var_V, cov_CL_KA, cov_V_KA, var_KA]
-</code></pre>
-<h4 id="visualising-the-lower-triangle"><a class="header" href="#visualising-the-lower-triangle">Visualising the lower triangle</a></h4>
-<p>For an N×N block you supply <code>N·(N+1)/2</code> values, walked row by row through the lower triangle (row 1 has 1 value, row 2 has 2, …, row N has N). Drawing it out as a matrix makes the layout obvious:</p>
-<pre><code>          ETA_1   ETA_2   ETA_3   ETA_4
-        ┌                                ┐
-ETA_1   │  v[0]                          │
-ETA_2   │  v[1]   v[2]                   │
-ETA_3   │  v[3]   v[4]    v[5]           │
-ETA_4   │  v[6]   v[7]    v[8]    v[9]   │
-        └                                ┘
-</code></pre>
-<p>The diagonal entries are the variances; the off-diagonals are the covariances (which the optimiser estimates — set them to <code>0.0</code> as initial values and the fit will recover correlations from the data).</p>
-<h4 id="converting-diagonal-omegas-to-a-block"><a class="header" href="#converting-diagonal-omegas-to-a-block">Converting diagonal omegas to a block</a></h4>
-<p>A common pattern: you have all-diagonal omegas and want to replace them with a single fully-correlated block. Each <code>omega</code> variance becomes a diagonal entry; off-diagonals start at <code>0.0</code>. For example:</p>
-<pre><code>omega ETA_CL ~ 0.1
-omega ETA_V1 ~ 0.1
-omega ETA_Q  ~ 0.1
-omega ETA_V2 ~ 0.1
-</code></pre>
-<p>becomes a 4×4 block (10 values: <code>1+2+3+4</code>):</p>
-<pre><code>block_omega (ETA_CL, ETA_V1, ETA_Q, ETA_V2) = [
-  0.1,
-  0.0, 0.1,
-  0.0, 0.0, 0.1,
-  0.0, 0.0, 0.0, 0.1
-]
-</code></pre>
-<p>(Multi-line and single-line layouts are equivalent — line breaks inside <code>[ ... ]</code> are ignored.) Reading the rows: row 1 is <code>var(CL)</code>, row 2 is <code>cov(CL,V1) var(V1)</code>, row 3 is <code>cov(CL,Q) cov(V1,Q) var(Q)</code>, row 4 is <code>cov(CL,V2) cov(V1,V2) cov(Q,V2) var(V2)</code>.</p>
-<p>Block omega regularises poorly-identified parameters by letting them share variability — see the <a href="../faq.html">optimisation FAQ</a> for a worked example where switching from diagonal to <code>block_omega(3)</code> rescues a fit that diagonal-omega couldn’t converge.</p>
-<h4 id="mixing-diagonal-and-block"><a class="header" href="#mixing-diagonal-and-block">Mixing diagonal and block</a></h4>
-<p>You can mix diagonal and block omega specifications. Diagonal omegas specify uncorrelated random effects, while block omegas estimate the full covariance sub-matrix:</p>
-<pre><code>block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
-omega ETA_KA ~ 0.40
-</code></pre>
-<p>This estimates a 3x3 omega where ETA_CL and ETA_V are correlated (2x2 block), but ETA_KA is uncorrelated with both.</p>
-<h3 id="declaration-order"><a class="header" href="#declaration-order">Declaration order</a></h3>
-<p>The order of <code>omega</code> and <code>block_omega</code> lines in the <code>[parameters]</code> block determines the ETA indexing throughout the model: in the omega matrix and all output. For example:</p>
-<pre><code>block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
-omega ETA_KA ~ 0.40
-</code></pre>
-<p>produces ETA order <code>[ETA_CL, ETA_V, ETA_KA]</code> (indices 1, 2, 3), while:</p>
-<pre><code>omega ETA_KA ~ 0.40
-block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
-</code></pre>
-<p>produces <code>[ETA_KA, ETA_CL, ETA_V]</code> (indices 1, 2, 3). The <code>[individual_parameters]</code> block should list assignments in the same order for clarity, though the parameter mapping is by name, not position.</p>
-<h2 id="kappa-inter-occasion-variability"><a class="header" href="#kappa-inter-occasion-variability">Kappa (Inter-Occasion Variability)</a></h2>
-<p>Inter-Occasion Variability (IOV) is declared with <code>kappa</code> (independent per-parameter) or <code>block_kappa</code> (correlated across parameters). Kappa parameters must be paired with <code>iov_column</code> in <code>[fit_options]</code> and an occasion column in the dataset.</p>
-<h3 id="diagonal-kappa--option-a"><a class="header" href="#diagonal-kappa--option-a">Diagonal kappa — Option A</a></h3>
-<pre><code>kappa NAME ~ value              # value interpreted as variance (default)
-kappa NAME ~ value (sd)         # value interpreted as standard deviation
-kappa NAME ~ value FIX
-</code></pre>
-<p>Each <code>kappa</code> line adds one diagonal element to the IOV omega matrix. Occasions are independent. The <code>(sd)</code> annotation is accepted with the same semantics as for <code>omega</code>. <code>block_kappa</code> is variance-only.</p>
-<p>Example:</p>
-<pre><code>kappa KAPPA_CL ~ 0.05
-kappa KAPPA_V  ~ 0.03
-kappa KAPPA_CL ~ 0.02 FIX
-</code></pre>
-<h3 id="block-kappa--option-b-correlated-iov"><a class="header" href="#block-kappa--option-b-correlated-iov">Block kappa — Option B (correlated IOV)</a></h3>
-<pre><code>block_kappa (NAME1, NAME2, ...) = [lower_triangle_values]
-block_kappa (NAME1, NAME2, ...) = [lower_triangle_values] FIX
-</code></pre>
-<p>Mirrors the <code>block_omega</code> syntax — values are the lower triangle of the IOV covariance matrix, row-wise. Use this when IOV effects are expected to be correlated (e.g. correlated occasion shifts in CL and V).</p>
-<p>Example (2×2 block):</p>
-<pre><code>block_kappa (KAPPA_CL, KAPPA_V) = [0.05, 0.01, 0.03]
-</code></pre>
-<p>where <code>0.05</code> = Var(KAPPA_CL), <code>0.01</code> = Cov(KAPPA_CL, KAPPA_V), <code>0.03</code> = Var(KAPPA_V).</p>
-<h3 id="using-kappas-in-individual-parameters"><a class="header" href="#using-kappas-in-individual-parameters">Using kappas in individual parameters</a></h3>
-<p>Reference kappa names exactly like BSV etas in <code>[individual_parameters]</code>:</p>
-<pre><code>[individual_parameters]
-  CL = TVCL * exp(ETA_CL + KAPPA_CL)
-  V  = TVV  * exp(ETA_V  + KAPPA_V)
-  KA = TVKA * exp(ETA_KA)           # no IOV on absorption
-</code></pre>
-<p>Kappas can be combined freely — a parameter can carry BSV only, IOV only, or both.</p>
-<h3 id="mixed-diagonal-and-block-kappa"><a class="header" href="#mixed-diagonal-and-block-kappa">Mixed diagonal and block kappa</a></h3>
-<p>You can mix <code>kappa</code> (uncorrelated) and <code>block_kappa</code> (correlated) declarations in the same model:</p>
-<pre><code>block_kappa (KAPPA_CL, KAPPA_V) = [0.05, 0.01, 0.03]
-kappa KAPPA_KA ~ 0.10
-</code></pre>
-<p>A name may not appear in both <code>kappa</code> and <code>block_kappa</code> — this is a parse error.</p>
-<h3 id="declaration-order-1"><a class="header" href="#declaration-order-1">Declaration order</a></h3>
-<p>Kappa declaration order determines the IOV omega matrix layout and the kappa column order in output. Kappas follow all BSV etas in the internal indexing: if a model has 3 BSV etas and 2 kappas, the kappas sit at indices 4 and 5.</p>
-<h2 id="parameter-level-correlation-in-output"><a class="header" href="#parameter-level-correlation-in-output">Parameter-level correlation in output</a></h2>
-<p>When a <code>block_omega</code> (or <code>block_kappa</code>) is estimated, ferx reports a <strong>parameter-level correlation</strong> for each off-diagonal pair in the console and YAML output. This differs from the eta-level (normal-scale) correlation <code>ω_ij / √(ω_ii · ω_jj)</code>:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Both etas lognormal (<code>THETA * exp(ETA)</code>)</th><th><code>(exp(ω_ij) − 1) / √((exp(ω_ii) − 1)(exp(ω_jj) − 1))</code></th></tr>
+<tr><th>Field</th><th>Type</th><th>Notes</th></tr>
 </thead>
 <tbody>
-<tr><td>Both etas additive (<code>THETA + ETA</code>)</td><td><code>ω_ij / √(ω_ii · ω_jj)</code> (same as eta-level)</td></tr>
-<tr><td>Mixed or complex expressions</td><td>Falls back to eta-level; a warning is added to <code>FitResult.warnings</code></td></tr>
+<tr><td><code>valid</code></td><td>bool</td><td><code>true</code> when there are <strong>no</strong> <code>error</code>-severity diagnostics (warnings alone keep it <code>true</code>).</td></tr>
+<tr><td><code>model</code></td><td>string</td><td>Model file stem.</td></tr>
+<tr><td><code>data</code></td><td>string</td><td>Present only when <code>--data</code> was supplied.</td></tr>
+<tr><td><code>diagnostics</code></td><td>array</td><td>Every finding; see below. May be empty.</td></tr>
 </tbody>
 </table>
 </div>
-<p>The formula for lognormal pairs is the standard bivariate lognormal identity and reflects the correlation between the actual PK/PD parameters (e.g. CL and V) rather than their underlying normal variates.</p>
-<p>The result is exposed as <code>FitResult.omega_param_corr</code> (BSV) and <code>FitResult.omega_iov_param_corr</code> (IOV), and is used wherever ferx prints a <code>corr</code> or <code>correlation</code> value for a block omega pair.</p>
-<h2 id="sigma-residual-error"><a class="header" href="#sigma-residual-error">Sigma (Residual Error)</a></h2>
-<pre><code>sigma NAME ~ value              # value interpreted as variance (default)
-sigma NAME ~ value (sd)         # value interpreted as standard deviation
-sigma NAME ~ value (variance)   # explicit no-op equivalent to no annotation
-</code></pre>
-<ul>
-<li><strong>NAME</strong>: Residual error parameter name (referenced in <code>[error_model]</code>)</li>
-<li><strong>value</strong>: Initial value. Default scale is <strong>variance</strong>, matching omega. Append <code>(sd)</code> to specify a standard deviation; the parser converts it to the internal representation. This unifies the user-facing scale across omega and sigma — see <a href="https://github.com/FeRx-NLME/ferx-core/issues/56">issue #56</a>.</li>
-</ul>
-<p>Example (variance scale, default):</p>
-<pre><code>sigma PROP_ERR ~ 0.0004     # variance 0.0004  →  SD = 0.02  →  2% CV
-sigma ADD_ERR  ~ 1.0        # variance 1.0     →  SD = 1.0
-</code></pre>
-<p>Equivalent declarations using SD coding:</p>
-<pre><code>sigma PROP_ERR ~ 0.02 (sd)
-sigma ADD_ERR  ~ 1.0  (sd)
-</code></pre>
-<p>The interpretation of sigma’s role in the residual-error model depends on the error model:</p>
+<h2 id="diagnostic-object"><a class="header" href="#diagnostic-object">Diagnostic object</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Error Model</th><th>Sigma component</th></tr>
+<tr><th>Field</th><th>Type</th><th>Notes</th></tr>
 </thead>
 <tbody>
-<tr><td>Additive</td><td>Variance (or SD with <code>(sd)</code>) of additive error</td></tr>
-<tr><td>Proportional</td><td>Variance (or SD with <code>(sd)</code>) of the proportional coefficient</td></tr>
-<tr><td>Combined</td><td>First sigma = proportional coefficient, second = additive component</td></tr>
+<tr><td><code>severity</code></td><td><code>"error"</code> | <code>"warning"</code></td><td>Only <code>error</code> affects <code>valid</code> and the exit code.</td></tr>
+<tr><td><code>code</code></td><td>string</td><td>Stable identifier (see table below).</td></tr>
+<tr><td><code>message</code></td><td>string</td><td>Human-readable description.</td></tr>
+<tr><td><code>block</code></td><td>string</td><td><em>Optional.</em> Owning model block, e.g. <code>"error_model"</code>. Omitted when not attributable to one block.</td></tr>
+<tr><td><code>line</code></td><td>integer</td><td><em>Optional.</em> 1-based source line — see the caveat below.</td></tr>
+<tr><td><code>suggestion</code></td><td>string</td><td><em>Optional.</em> Actionable hint.</td></tr>
 </tbody>
 </table>
 </div>
-<blockquote>
-<p><strong>Migration note</strong> (pre-issue-#56 models): <code>sigma NAME ~ value</code> was previously interpreted as a standard deviation. The new default is <strong>variance</strong>, so a pre-#56 value <code>v</code> becomes either <code>v² (variance)</code> or <code>v (sd)</code>. The <code>examples/</code> directory uses the <code>(sd)</code> form to preserve the prior initial values verbatim.</p>
-</blockquote>
-<h2 id="complete-examples"><a class="header" href="#complete-examples">Complete Examples</a></h2>
-<p>Diagonal omega (no correlations):</p>
-<pre><code>[parameters]
-  theta TVCL(0.134, 0.001, 10.0)
-  theta TVV(8.1, 0.1, 500.0)
-  theta TVKA(1.0, 0.01, 50.0)
-
-  omega ETA_CL ~ 0.07
-  omega ETA_V  ~ 0.02
-  omega ETA_KA ~ 0.40
-
-  sigma PROP_ERR ~ 0.01
-</code></pre>
-<p>Block omega (correlated CL and V):</p>
-<pre><code>[parameters]
-  theta TVCL(0.134, 0.001, 10.0)
-  theta TVV(8.1, 0.1, 500.0)
-  theta TVKA(1.0, 0.01, 50.0)
-
-  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
-  omega ETA_KA ~ 0.40
-
-  sigma PROP_ERR ~ 0.01
-</code></pre>
+<p>Optional fields are omitted entirely when absent (not emitted as <code>null</code>).</p>
+<h2 id="error--warning-codes"><a class="header" href="#error--warning-codes">Error / warning codes</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Code</th><th>Severity</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>E_PARSE</code></td><td>error</td><td>The model file failed to parse (catch-all for parser errors).</td></tr>
+<tr><td><code>E_MISSING_BLOCK</code></td><td>error</td><td>A required <code>[block]</code> is absent. <code>block</code> names which one.</td></tr>
+<tr><td><code>E_NN_FEATURE_DISABLED</code></td><td>error</td><td>A <code>[covariate_nn]</code> block requires building with <code>--features nn</code>.</td></tr>
+<tr><td><code>E_MISSING_COVARIATE</code></td><td>error</td><td>The model references a covariate not present in the data (case-sensitive).</td></tr>
+<tr><td><code>E_PER_CMT_SCALING</code></td><td>error</td><td>An observed compartment lacks a per-CMT scaling entry.</td></tr>
+<tr><td><code>E_PER_CMT_ERROR_MODEL</code></td><td>error</td><td>An observed compartment lacks a per-CMT <code>[error_model]</code> entry.</td></tr>
+<tr><td><code>E_DATA</code></td><td>error</td><td>The <code>--data</code> file could not be read or parsed.</td></tr>
+<tr><td><code>W_STEADY_STATE_II</code></td><td>warning</td><td>SS=1 doses with missing / non-positive <code>II</code> (treated as non-SS).</td></tr>
+<tr><td><code>W_STEADY_STATE_INFUSION</code></td><td>warning</td><td>SS=1 infusion with <code>T_inf &gt; II</code> (overlapping pulses; SS skipped).</td></tr>
+<tr><td><code>W_SDE_RESET</code></td><td>warning</td><td>EVID=3/4 resets under an SDE <code>[diffusion]</code> model are not honoured.</td></tr>
+<tr><td><code>W_NEGATIVE_LAGTIME</code></td><td>warning</td><td>Lag time is negative at the initial typical-value point.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Codes are stable; new ones may be added over time. Treat an unrecognised code
+as a generic finding of its given <code>severity</code>.</p>
+<h2 id="line-number-caveat"><a class="header" href="#line-number-caveat">Line-number caveat</a></h2>
+<p><code>line</code> is currently <strong>block-level</strong>: when present it points at the <code>[block]</code>
+header that owns the finding, not the exact offending token or column. A finding
+that is not attributable to a single block (for example a missing-covariate
+error, where the reference may appear in several blocks) omits <code>line</code>. A missing
+<em>required</em> block omits <code>line</code> too, since the block has no header in the source.
+Token/column-level spans are a possible future enhancement.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../model-file/index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../file-formats/fitrx.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../model-file/individual-parameters.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../examples/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -407,11 +280,11 @@ sigma ADD_ERR  ~ 1.0  (sd)
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../model-file/index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../file-formats/fitrx.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../model-file/individual-parameters.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../examples/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-7e2dd857.js";
+            window.path_to_searchindex_js = "searchindex-8fee082a.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-39f227ad.js"></script>
+        <script src="toc-6b798105.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -3499,6 +3499,7 @@ for malformed rows (missing <code>II</code>, overlapping infusions).</p>
 <h2 id="usage-1"><a class="header" href="#usage-1">Usage</a></h2>
 <pre><code class="language-bash">ferx &lt;model.ferx&gt; --data &lt;data.csv&gt; [--output &lt;run.fitrx&gt;] [--include-data]
 ferx &lt;model.ferx&gt; --simulate          [--output &lt;run.fitrx&gt;]
+ferx check &lt;model.ferx&gt; [--data &lt;data.csv&gt;] [--json]
 </code></pre>
 <h2 id="commands"><a class="header" href="#commands">Commands</a></h2>
 <h3 id="fit-with-data"><a class="header" href="#fit-with-data">Fit with Data</a></h3>
@@ -3509,6 +3510,34 @@ ferx &lt;model.ferx&gt; --simulate          [--output &lt;run.fitrx&gt;]
 <pre><code class="language-bash">ferx model.ferx --simulate
 </code></pre>
 <p>Parses the model file, generates simulated data from the <code>[simulation]</code> block, and fits the model to the simulated data. Requires a <code>[simulation]</code> block in the model file.</p>
+<h3 id="validate-without-fitting-check"><a class="header" href="#validate-without-fitting-check">Validate without Fitting (<code>check</code>)</a></h3>
+<pre><code class="language-bash">ferx check model.ferx                  # parse + structural validation
+ferx check model.ferx --data data.csv  # also run data-dependent checks
+ferx check model.ferx --data data.csv --json
+</code></pre>
+<p>Runs the parser and every validation step that normally happens at the start of
+a fit — <em>without</em> fitting — then reports the findings. This is a fast
+<code>author → diagnose → fix</code> loop, especially useful for tooling and coding agents
+that author model files programmatically.</p>
+<ul>
+<li>Without <code>--data</code>, only parse / structural checks run (no data is read).</li>
+<li>With <code>--data</code>, the dataset is read and the data-dependent checks run too:
+referenced covariates present, per-CMT scaling / error-model coverage,
+steady-state dosing well-formed, and non-negative typical-value lag time.</li>
+<li><code>--json</code> emits a structured <a href="#check-report-ferx-check---json">check report</a> to
+stdout instead of the human-readable summary.</li>
+</ul>
+<p>Human output lists one diagnostic per line as
+<code>severity[CODE] block:line: message</code>, with an indented <code>help:</code> line for any
+suggestion, then a one-line summary:</p>
+<pre><code class="language-text">error[E_MISSING_COVARIATE]: Model references covariate(s) not found in data (case-sensitive): WGT. Available covariate columns: (none).
+    help: available covariate columns: (none)
+invalid: mymodel — 1 error(s), 0 warning(s)
+</code></pre>
+<p>The exit code is <code>0</code> when no errors are found (warnings alone still exit <code>0</code>),
+<code>1</code> when any error is found, and <code>2</code> on a usage error. See the
+<a href="#check-report-ferx-check---json">check report reference</a> for the JSON schema and
+the full error-code table.</p>
 <h2 id="output-files"><a class="header" href="#output-files">Output Files</a></h2>
 <p>Three files are always generated, named after the model file:</p>
 <div class="table-wrapper">
@@ -3558,8 +3587,9 @@ Elapsed: 0.496s
 <tr><th>Code</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td>0</td><td>Success</td></tr>
-<tr><td>1</td><td>Error (parse failure, data error, convergence failure)</td></tr>
+<tr><td>0</td><td>Success (for <code>check</code>: no errors found)</td></tr>
+<tr><td>1</td><td>Error (parse failure, data error, convergence failure; for <code>check</code>: errors found)</td></tr>
+<tr><td>2</td><td><code>check</code> usage error (e.g. missing model path)</td></tr>
 </tbody>
 </table>
 </div>
@@ -4003,6 +4033,91 @@ within the same version).</li>
 </ol>
 <p>When the on-disk format changes in a way that breaks readers, <code>format_version</code>
 is incremented.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="check-report-ferx-check---json"><a class="header" href="#check-report-ferx-check---json">Check Report (<code>ferx check --json</code>)</a></h1>
+<p><code>ferx check &lt;model.ferx&gt; [--data &lt;data.csv&gt;] --json</code> emits a structured JSON
+report describing every validation finding, instead of the human-readable
+summary. The report is designed to be consumed programmatically — by editor
+tooling, CI, or a coding agent authoring model files — so findings carry a
+stable machine-readable <code>code</code> rather than only prose.</p>
+<p>This is the same data the Rust API returns from
+<a href="#parsing"><code>validate_model_file</code></a>; see also the
+<a href="#cli-reference">CLI reference</a> for the human-readable form and exit codes.</p>
+<h2 id="top-level-shape"><a class="header" href="#top-level-shape">Top-level shape</a></h2>
+<pre><code class="language-json">{
+  "valid": false,
+  "model": "mymodel",
+  "data": "data/mydata.csv",
+  "diagnostics": [
+    {
+      "severity": "error",
+      "code": "E_MISSING_COVARIATE",
+      "message": "Model references covariate(s) not found in data (case-sensitive): WGT. Available covariate columns: (none).",
+      "suggestion": "available covariate columns: (none)"
+    }
+  ]
+}
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>valid</code></td><td>bool</td><td><code>true</code> when there are <strong>no</strong> <code>error</code>-severity diagnostics (warnings alone keep it <code>true</code>).</td></tr>
+<tr><td><code>model</code></td><td>string</td><td>Model file stem.</td></tr>
+<tr><td><code>data</code></td><td>string</td><td>Present only when <code>--data</code> was supplied.</td></tr>
+<tr><td><code>diagnostics</code></td><td>array</td><td>Every finding; see below. May be empty.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="diagnostic-object"><a class="header" href="#diagnostic-object">Diagnostic object</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>severity</code></td><td><code>"error"</code> | <code>"warning"</code></td><td>Only <code>error</code> affects <code>valid</code> and the exit code.</td></tr>
+<tr><td><code>code</code></td><td>string</td><td>Stable identifier (see table below).</td></tr>
+<tr><td><code>message</code></td><td>string</td><td>Human-readable description.</td></tr>
+<tr><td><code>block</code></td><td>string</td><td><em>Optional.</em> Owning model block, e.g. <code>"error_model"</code>. Omitted when not attributable to one block.</td></tr>
+<tr><td><code>line</code></td><td>integer</td><td><em>Optional.</em> 1-based source line — see the caveat below.</td></tr>
+<tr><td><code>suggestion</code></td><td>string</td><td><em>Optional.</em> Actionable hint.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Optional fields are omitted entirely when absent (not emitted as <code>null</code>).</p>
+<h2 id="error--warning-codes"><a class="header" href="#error--warning-codes">Error / warning codes</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Code</th><th>Severity</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>E_PARSE</code></td><td>error</td><td>The model file failed to parse (catch-all for parser errors).</td></tr>
+<tr><td><code>E_MISSING_BLOCK</code></td><td>error</td><td>A required <code>[block]</code> is absent. <code>block</code> names which one.</td></tr>
+<tr><td><code>E_NN_FEATURE_DISABLED</code></td><td>error</td><td>A <code>[covariate_nn]</code> block requires building with <code>--features nn</code>.</td></tr>
+<tr><td><code>E_MISSING_COVARIATE</code></td><td>error</td><td>The model references a covariate not present in the data (case-sensitive).</td></tr>
+<tr><td><code>E_PER_CMT_SCALING</code></td><td>error</td><td>An observed compartment lacks a per-CMT scaling entry.</td></tr>
+<tr><td><code>E_PER_CMT_ERROR_MODEL</code></td><td>error</td><td>An observed compartment lacks a per-CMT <code>[error_model]</code> entry.</td></tr>
+<tr><td><code>E_DATA</code></td><td>error</td><td>The <code>--data</code> file could not be read or parsed.</td></tr>
+<tr><td><code>W_STEADY_STATE_II</code></td><td>warning</td><td>SS=1 doses with missing / non-positive <code>II</code> (treated as non-SS).</td></tr>
+<tr><td><code>W_STEADY_STATE_INFUSION</code></td><td>warning</td><td>SS=1 infusion with <code>T_inf &gt; II</code> (overlapping pulses; SS skipped).</td></tr>
+<tr><td><code>W_SDE_RESET</code></td><td>warning</td><td>EVID=3/4 resets under an SDE <code>[diffusion]</code> model are not honoured.</td></tr>
+<tr><td><code>W_NEGATIVE_LAGTIME</code></td><td>warning</td><td>Lag time is negative at the initial typical-value point.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Codes are stable; new ones may be added over time. Treat an unrecognised code
+as a generic finding of its given <code>severity</code>.</p>
+<h2 id="line-number-caveat"><a class="header" href="#line-number-caveat">Line-number caveat</a></h2>
+<p><code>line</code> is currently <strong>block-level</strong>: when present it points at the <code>[block]</code>
+header that owns the finding, not the exact offending token or column. A finding
+that is not attributable to a single block (for example a missing-covariate
+error, where the reference may appear in several blocks) omits <code>line</code>. A missing
+<em>required</em> block omits <code>line</code> too, since the block has no header in the source.
+Token/column-level spans are a possible future enhancement.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="examples-4"><a class="header" href="#examples-4">Examples</a></h1>
 <p>FeRx includes several example models in the <code>examples/</code> directory with corresponding datasets in <code>data/</code>.</p>
@@ -5166,8 +5281,36 @@ let model = parse_model_string(model_str)?;
     pub model: CompiledModel,
     pub simulation: Option&lt;SimulationSpec&gt;,
     pub fit_options: FitOptions,
+    /// 1-based source line of each unnamed `[block]` header, keyed by the
+    /// lowercased block type (e.g. `"individual_parameters" -&gt; 7`).
+    pub block_lines: std::collections::HashMap&lt;String, usize&gt;,
 }
 <span class="boring">}</span></code></pre>
+<h2 id="validation-1"><a class="header" href="#validation-1">Validation</a></h2>
+<h3 id="validate_model_file"><a class="header" href="#validate_model_file"><code>validate_model_file()</code></a></h3>
+<p>Validate a model file (and optionally a dataset) <strong>without fitting</strong>, returning
+a structured <a href="#check-report-ferx-check---json"><code>CheckReport</code></a>. This is the engine
+behind the <a href="#cli-reference"><code>ferx check</code></a> CLI command: it runs the parser plus every
+data-independent and data-dependent check, collecting <em>all</em> findings rather than
+stopping at the first (as <code>fit()</code> does).</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub fn validate_model_file(model_path: &amp;str, data_path: Option&lt;&amp;str&gt;) -&gt; CheckReport
+<span class="boring">}</span></code></pre>
+<p><strong>Example:</strong></p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let report = validate_model_file("model.ferx", Some("data.csv"));
+if !report.valid {
+    for d in &amp;report.diagnostics {
+        eprintln!("{:?} [{}]: {}", d.severity, d.code, d.message);
+    }
+}
+<span class="boring">}</span></code></pre>
+<p>When <code>data_path</code> is <code>None</code>, only parse / structural checks run. The same
+validators feed <code>fit()</code> (via the internal <code>check_model_data</code> /
+<code>check_model_data_warnings</code> functions), so a clean <code>check</code> and a <code>fit()</code> agree
+on what is and isn’t valid.</p>
 <h2 id="data-parsing"><a class="header" href="#data-parsing">Data Parsing</a></h2>
 <h3 id="read_nonmem_csv"><a class="header" href="#read_nonmem_csv"><code>read_nonmem_csv()</code></a></h3>
 <p>Read a NONMEM-format CSV file into a <code>Population</code>.</p>
@@ -5332,6 +5475,22 @@ sum-of-moieties, free vs. total), specify a scale per CMT:</p>
 errors at startup with the list of missing CMTs.</p>
 <p>See <a href="#scaling">Scaling</a> for the full reference, including
 how this compares to NONMEM’s <code>S1</code>/<code>S2</code> and nlmixr2’s <code>cmt(central); f = ...</code>.</p>
+<h2 id="how-do-i-validate-a-model-file-without-running-a-full-fit"><a class="header" href="#how-do-i-validate-a-model-file-without-running-a-full-fit">How do I validate a model file without running a full fit?</a></h2>
+<p>Use <code>ferx check</code>:</p>
+<pre><code class="language-bash">ferx check model.ferx                  # parse + structural validation
+ferx check model.ferx --data data.csv  # also run data-dependent checks
+ferx check model.ferx --data data.csv --json
+</code></pre>
+<p>It runs the parser and every validation step that normally fires at the start
+of a fit — missing blocks, missing covariates, per-CMT scaling / error-model
+coverage, steady-state and lag-time sanity — then reports the findings and
+exits, without fitting. This turns a multi-second fit-to-find-a-typo into a
+sub-second loop.</p>
+<p><code>--json</code> emits a structured report (stable <code>code</code> per finding, optional block /
+line / suggestion) that tooling and coding agents can consume directly, rather
+than parsing prose. The exit code is <code>0</code> when no errors are found, <code>1</code> when
+there are errors. See the <a href="#check-report-ferx-check---json">check report reference</a>
+for the JSON schema and the full code table.</p>
 
                     </main>
 

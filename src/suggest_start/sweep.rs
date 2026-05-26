@@ -1,5 +1,5 @@
-/// Option B: rRMSE grid sweep using population predictions (etas=0).
-/// Option C: rRMSE grid sweep using individual EBEs (etas≠0, warm-started).
+/// `nca_sweep`: rRMSE grid sweep using population predictions (etas=0).
+/// `nca_ebe`:   rRMSE grid sweep using individual EBEs (etas≠0, warm-started).
 ///
 /// Theta indices are resolved via [`crate::suggest_start::find_theta_for_slot`]
 /// so user-chosen parameter names and ODE models are handled uniformly.
@@ -77,7 +77,7 @@ pub fn sweep_slots(
 
     let (Some(ia), Some(ib)) = (idx_a, idx_b) else {
         warnings.push(format!(
-            "suggest_start_thorough: could not locate theta indices for {label} sweep (PK slots {slot_a}/{slot_b}); keeping current estimates"
+            "inits_from_nca (nca_sweep): could not locate theta indices for {label} sweep (PK slots {slot_a}/{slot_b}); keeping current estimates"
         ));
         return (base.clone(), warnings);
     };
@@ -122,7 +122,7 @@ pub fn sweep_slots(
 /// ODE PK, PD, and PKPD models without any knowledge of parameter semantics.
 ///
 /// `targets` should be the indices of non-fixed thetas that Option A did not
-/// write (still at model default) — see [`suggest_start_thorough`].
+/// write (still at model default) — see [`crate::suggest_start::inits_from_nca`].
 pub fn sweep_unwritten_thetas(
     model: &CompiledModel,
     population: &Population,
@@ -142,7 +142,7 @@ pub fn sweep_unwritten_thetas(
         let centre = current.theta[idx];
         if centre <= 0.0 {
             warnings.push(format!(
-                "suggest_start_thorough: theta[{idx}] ({name}) has non-positive value {centre}; skipping sweep",
+                "inits_from_nca (nca_sweep): theta[{idx}] ({name}) has non-positive value {centre}; skipping sweep",
                 name = current.theta_names[idx]
             ));
             continue;
@@ -172,7 +172,7 @@ pub fn sweep_unwritten_thetas(
 }
 
 // ---------------------------------------------------------------------------
-// Option C: EBE-based rRMSE (warm-started inner loop)
+// nca_ebe: EBE-based rRMSE (warm-started inner loop)
 // ---------------------------------------------------------------------------
 
 /// Compute rRMSE using per-subject empirical Bayes estimates.
@@ -243,7 +243,7 @@ pub fn sweep_slots_ebe(
 
     let (Some(ia), Some(ib)) = (idx_a, idx_b) else {
         warnings.push(format!(
-            "suggest_start_ebe: could not locate theta indices for {label} sweep; keeping current estimates"
+            "inits_from_nca (nca_ebe): could not locate theta indices for {label} sweep; keeping current estimates"
         ));
         return (base.clone(), warnings);
     };
@@ -301,7 +301,7 @@ pub fn sweep_unwritten_thetas_ebe(
         let centre = current.theta[idx];
         if centre <= 0.0 {
             warnings.push(format!(
-                "suggest_start_ebe: theta[{idx}] ({name}) has non-positive value {centre}; skipping",
+                "inits_from_nca (nca_ebe): theta[{idx}] ({name}) has non-positive value {centre}; skipping",
                 name = current.theta_names[idx]
             ));
             continue;

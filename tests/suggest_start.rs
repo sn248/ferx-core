@@ -1,7 +1,7 @@
-//! Integration tests for `suggest_start` and `suggest_start_thorough`.
+//! Integration tests for `inits_from_nca` (nca / nca_sweep / nca_ebe).
 
 use ferx_core::parser::model_parser::parse_model_file;
-use ferx_core::{read_nonmem_csv, suggest_start, suggest_start_ebe, suggest_start_thorough};
+use ferx_core::{inits_from_nca, read_nonmem_csv, NcaInit};
 use std::path::Path;
 
 fn warfarin() -> (
@@ -31,7 +31,7 @@ fn two_cpt_iv() -> (
 #[test]
 fn test_suggest_start_warfarin_direction() {
     let (model, population) = warfarin();
-    let result = suggest_start(&model, &population);
+    let result = inits_from_nca(&model, &population, NcaInit::Nca);
 
     // Find TVCL index.
     let tvcl_idx = result
@@ -59,7 +59,7 @@ fn test_suggest_start_warfarin_direction() {
 #[test]
 fn test_suggest_start_warfarin_within_bounds() {
     let (model, population) = warfarin();
-    let result = suggest_start(&model, &population);
+    let result = inits_from_nca(&model, &population, NcaInit::Nca);
     for (i, &theta) in result.params.theta.iter().enumerate() {
         let lo = result.params.theta_lower[i];
         let hi = result.params.theta_upper[i];
@@ -76,7 +76,7 @@ fn test_suggest_start_warfarin_within_bounds() {
 #[test]
 fn test_suggest_start_two_cpt_iv_sanity() {
     let (model, population) = two_cpt_iv();
-    let result = suggest_start(&model, &population);
+    let result = inits_from_nca(&model, &population, NcaInit::Nca);
 
     let find = |name: &str| -> f64 {
         let idx = result
@@ -119,7 +119,7 @@ fn test_suggest_start_empty_population() {
         covariate_names: vec![],
         dv_column: "DV".into(),
     };
-    let result = suggest_start(&model, &empty);
+    let result = inits_from_nca(&model, &empty, NcaInit::Nca);
     assert!(!result.warnings.is_empty(), "must warn on empty population");
     assert_eq!(
         result.params.theta, model.default_params.theta,
@@ -127,11 +127,11 @@ fn test_suggest_start_empty_population() {
     );
 }
 
-/// suggest_start_thorough: all thetas within bounds for 2-cpt IV.
+/// nca_sweep: all thetas within bounds for 2-cpt IV.
 #[test]
-fn test_suggest_start_thorough_two_cpt_iv_within_bounds() {
+fn test_nca_sweep_two_cpt_iv_within_bounds() {
     let (model, population) = two_cpt_iv();
-    let result = suggest_start_thorough(&model, &population);
+    let result = inits_from_nca(&model, &population, NcaInit::Sweep);
     for (i, &theta) in result.params.theta.iter().enumerate() {
         let lo = result.params.theta_lower[i];
         let hi = result.params.theta_upper[i];
@@ -143,15 +143,15 @@ fn test_suggest_start_thorough_two_cpt_iv_within_bounds() {
     }
 }
 
-/// suggest_start_thorough should move unwritten thetas away from model default.
+/// nca_sweep should move unwritten thetas away from model default.
 ///
 /// For 2-cpt IV, CL/V1 are written by NCA; Q/V2 start at model default.
 /// After the sweep, Q and/or V2 should have changed (rRMSE found a better value).
 #[test]
-fn test_suggest_start_thorough_moves_unwritten_thetas() {
+fn test_nca_sweep_moves_unwritten_thetas() {
     let (model, population) = two_cpt_iv();
-    let fast = suggest_start(&model, &population);
-    let thorough = suggest_start_thorough(&model, &population);
+    let fast = inits_from_nca(&model, &population, NcaInit::Nca);
+    let thorough = inits_from_nca(&model, &population, NcaInit::Sweep);
 
     // At least one theta should differ between the two results (the sweep did something).
     let any_changed = fast
@@ -163,7 +163,7 @@ fn test_suggest_start_thorough_moves_unwritten_thetas() {
 
     assert!(
         any_changed,
-        "suggest_start_thorough should change at least one theta vs Option A"
+        "nca_sweep should change at least one theta vs nca-only"
     );
 }
 
@@ -195,25 +195,25 @@ fn test_suggest_start_block_omega_preserved() {
         }
         model.default_params.omega = OmegaMatrix::from_matrix_with_mask(m, names, false, free_mask);
 
-        let result = suggest_start(&model, &population);
+        let result = inits_from_nca(&model, &population, NcaInit::Nca);
 
         // Off-diagonal (0,1) must survive the omega update.
         let off_diag = result.params.omega.matrix[(0, 1)];
         assert!(
             (off_diag - 0.02).abs() < 1e-10,
-            "block omega off-diagonal should be preserved after suggest_start, got {off_diag}"
+            "block omega off-diagonal should be preserved after inits_from_nca, got {off_diag}"
         );
     }
 }
 
-/// auto_start = true must produce different theta than the model default when
-/// NCA or the rRMSE sweep finds a better starting point.
+/// inits_from_nca = nca_sweep must produce different theta than the model
+/// default when NCA or the rRMSE sweep finds a better starting point.
 #[test]
-fn test_auto_start_changes_params() {
-    // We test the plumbing by calling suggest_start_thorough directly (same
-    // function that auto_start invokes) and confirming it changes at least one theta.
+fn test_inits_from_nca_sweep_changes_params() {
+    // We test the plumbing by calling the nca_sweep strategy directly (the same
+    // one inits_from_nca = nca_sweep invokes) and confirming it changes a theta.
     let (model, population) = warfarin();
-    let result = suggest_start_thorough(&model, &population);
+    let result = inits_from_nca(&model, &population, NcaInit::Sweep);
     let any_changed = result
         .params
         .theta
@@ -222,13 +222,13 @@ fn test_auto_start_changes_params() {
         .any(|(suggested, &default)| (suggested - default).abs() > 1e-10);
     assert!(
         any_changed,
-        "suggest_start_thorough (used by auto_start) must change at least one theta from model default"
+        "nca_sweep (used by inits_from_nca = nca_sweep) must change at least one theta from model default"
     );
 }
 
-/// suggest_start_ebe on an ODE model must fall back to Option B and emit a warning.
+/// nca_ebe on an ODE model must fall back to nca_sweep and emit a warning.
 #[test]
-fn test_suggest_start_ebe_ode_fallback_warning() {
+fn test_nca_ebe_ode_fallback_warning() {
     // mm_iv.ferx uses an ODE-based Michaelis-Menten model.
     let model = parse_model_file(Path::new("examples/mm_iv.ferx")).expect("mm_iv model must parse");
     let population =
@@ -236,27 +236,27 @@ fn test_suggest_start_ebe_ode_fallback_warning() {
 
     assert!(model.ode_spec.is_some(), "mm_iv model must be an ODE model");
 
-    let result = suggest_start_ebe(&model, &population);
+    let result = inits_from_nca(&model, &population, NcaInit::Ebe);
     let has_ode_warning = result
         .warnings
         .iter()
         .any(|w| w.contains("ODE") && w.contains("Falling back"));
     assert!(
         has_ode_warning,
-        "suggest_start_ebe on an ODE model must emit the ODE-fallback warning; got: {:?}",
+        "nca_ebe on an ODE model must emit the ODE-fallback warning; got: {:?}",
         result.warnings
     );
 }
 
 /// Tier 3 — slow: trust_region should converge from the bad TVCL=0.5 start
-/// when auto_start = true corrects the initial values.
+/// when inits_from_nca = nca_sweep corrects the initial values.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests"
 )]
-fn test_trust_region_converges_with_auto_start() {
-    use ferx_core::{fit, EstimationMethod, FitOptions, Optimizer};
+fn test_trust_region_converges_with_inits_from_nca() {
+    use ferx_core::{fit, EstimationMethod, FitOptions, NcaInit, Optimizer};
 
     let (mut model, population) = warfarin();
 
@@ -272,7 +272,7 @@ fn test_trust_region_converges_with_auto_start() {
     let mut options = FitOptions::default();
     options.method = EstimationMethod::FoceI;
     options.outer_maxiter = 300;
-    options.auto_start = true;
+    options.inits_from_nca = Some(NcaInit::Sweep);
     options.optimizer = Optimizer::TrustRegion;
     options.run_covariance_step = false;
 
@@ -281,6 +281,6 @@ fn test_trust_region_converges_with_auto_start() {
     let ofv = result.ofv;
     assert!(
         ofv < 1000.0,
-        "trust_region + auto_start should converge (OFV < 1000), got {ofv:.2}"
+        "trust_region + inits_from_nca should converge (OFV < 1000), got {ofv:.2}"
     );
 }

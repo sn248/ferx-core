@@ -25,13 +25,14 @@ pub mod suggest_start;
 pub mod types;
 
 pub use api::{
-    fit, fit_from_files, predict, run_from_file, run_model_simulate, run_model_with_data, simulate,
-    simulate_with_seed, simulate_with_uncertainty, SimulateUncertaintyOptions,
+    fit, fit_from_files, predict, run_from_file, run_model_simulate, run_model_with_data,
+    run_model_with_data_inits, simulate, simulate_with_seed, simulate_with_uncertainty,
+    SimulateUncertaintyOptions,
 };
 pub use cancel::CancelFlag;
 pub use estimation::run_sir::run_sir;
 pub use estimation::uncertainty_samples::UncertaintyMethod;
 pub use io::datareader::read_nonmem_csv;
 pub use parser::model_parser::{parse_full_model_file, parse_model_file, parse_model_string};
-pub use suggest_start::{suggest_start, suggest_start_ebe, suggest_start_thorough, SuggestedStart};
+pub use suggest_start::{inits_from_nca, NcaInit, SuggestedStart};
 pub use types::*;

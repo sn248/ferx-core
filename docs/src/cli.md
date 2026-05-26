@@ -5,7 +5,7 @@ The `ferx` command-line tool runs population PK estimation from model files and 
 ## Usage
 
 ```bash
-ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data]
+ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data] [--inits-from-nca[=METHOD]]
 ferx <model.ferx> --simulate          [--output <run.fitrx>]
 ```
 
@@ -49,6 +49,23 @@ default).
 ```bash
 ferx model.ferx --data data.csv --output run1.fitrx --include-data
 ```
+
+## NCA-based starting values (`--inits-from-nca`)
+
+Pass `--inits-from-nca` to derive starting values from the data via
+non-compartmental analysis before fitting, overriding the model file's defaults.
+The flag overrides the `inits_from_nca` `[fit_options]` key for this run. A bare
+`--inits-from-nca` uses the `nca_sweep` strategy; pass an explicit method to pick
+another:
+
+```bash
+ferx model.ferx --data data.csv --inits-from-nca           # = nca_sweep
+ferx model.ferx --data data.csv --inits-from-nca=nca       # NCA only (fastest)
+ferx model.ferx --data data.csv --inits-from-nca=nca_ebe   # EBE-refined sweep
+```
+
+See [NCA-based starting values](model-file/fit-options.md#nca-based-starting-values)
+for what each strategy does.
 
 See [the `.fitrx` format reference](file-formats/fitrx.md) for the full
 schema.

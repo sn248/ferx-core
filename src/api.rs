@@ -66,10 +66,25 @@ pub fn run_model_with_data(
     model_path: &str,
     data_path: &str,
 ) -> Result<(FitResult, Population), String> {
+    run_model_with_data_inits(model_path, data_path, None)
+}
+
+/// Like [`run_model_with_data`], but lets the caller (e.g. the CLI's
+/// `--inits-from-nca` flag) override the model file's `inits_from_nca` fit
+/// option. When `inits_override` is `None` the model-file value is used as-is;
+/// when `Some(method)` it forces that NCA strategy regardless of the file.
+pub fn run_model_with_data_inits(
+    model_path: &str,
+    data_path: &str,
+    inits_override: Option<crate::suggest_start::NcaInit>,
+) -> Result<(FitResult, Population), String> {
     use crate::parser::model_parser::parse_full_model_file;
 
     let mut parsed = parse_full_model_file(Path::new(model_path))?;
     set_model_name(&mut parsed.model, model_path);
+    if let Some(method) = inits_override {
+        parsed.fit_options.inits_from_nca = Some(method);
+    }
 
     eprintln!("Model: {}", parsed.model.name);
 
@@ -770,12 +785,10 @@ fn fit_inner(
         }
     }
 
-    // Auto-start: derive NCA + rRMSE-sweep starting values (Option B) before
-    // the optimizer loop.  Option B is used rather than Option A so that ODE
-    // models and distribution parameters (Q, V2, …) that NCA cannot estimate
-    // are covered by the rRMSE grid sweep.
-    if options.auto_start {
-        let suggested = crate::suggest_start::suggest_start_thorough(model, population);
+    // inits_from_nca: derive NCA-based starting values before the optimizer
+    // loop, using the strategy the user selected (nca / nca_sweep / nca_ebe).
+    if let Some(method) = options.inits_from_nca {
+        let suggested = crate::suggest_start::inits_from_nca(model, population, method);
         stage_params = suggested.params;
         accumulated_warnings.extend(suggested.warnings);
     }

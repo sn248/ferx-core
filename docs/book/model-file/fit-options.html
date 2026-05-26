@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-2459343d.css">
-        <link rel="stylesheet" href="../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-f221896f.js";
+            window.path_to_searchindex_js = "../searchindex-e6c23135.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3a934816.js"></script>
+        <script src="../toc-39f227ad.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -203,10 +203,31 @@
 <tr><td><code>mu_referencing</code></td><td><code>true</code>, <code>false</code></td><td><code>true</code></td><td>Re-centre inner-loop ETA estimates on the current population mean (auto-detected from <code>[individual_parameters]</code>). See the <a href="../faq.html#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem--nlmixr2">FAQ entry</a> for details. Set <code>false</code> to reproduce pre-automatic-mu behaviour.</td></tr>
 <tr><td><code>iov_column</code></td><td>string</td><td>—</td><td>Name of the occasion column in the dataset (e.g. <code>OCC</code>). Required when the model uses <code>kappa</code> or <code>block_kappa</code> declarations. The column must contain integer occasion indices. Case-insensitive. Only supported with <code>foce</code> / <code>focei</code> — not <code>saem</code>. See <a href="../estimation/iov.html">IOV documentation</a>.</td></tr>
 <tr><td><code>optimizer_trace</code></td><td><code>true</code>, <code>false</code></td><td><code>false</code></td><td>Write a per-iteration CSV to <code>/tmp/ferx_trace_&lt;pid&gt;_&lt;ts&gt;.csv</code>. The path is stored in <code>FitResult::trace_path</code>. Useful for diagnosing convergence problems or comparing optimizers. See <a href="#optimizer-trace">Optimizer Trace</a>.</td></tr>
-<tr><td><code>auto_start</code></td><td><code>true</code>, <code>false</code></td><td><code>false</code></td><td>Derive NCA-based starting values automatically before the optimizer loop. When enabled, <code>suggest_start_thorough</code> (Option B) is called: per-subject NCA estimates are pooled to geometric means (CL, V, Ka, F, Q, V2), and any structural theta that NCA could not estimate is swept over a log-space rRMSE grid (etas = 0, 9 points per theta). Fixed thetas are never overwritten; covariate-effect thetas (no mu-referencing link) keep the model default. For ODE or PD models where NCA cannot map parameters to user names, the full rRMSE sweep runs across all non-fixed thetas. <code>auto_start</code> is most useful with <code>method = trust_region</code> or <code>method = gn</code> / <code>method = gn_hybrid</code>, where bad starting values can cause early stalling. For very large IIV (omega &gt; 0.2) on analytical PK models, consider calling <code>suggest_start_ebe</code> (Option C) manually and passing the result as the model defaults.</td></tr>
+<tr><td><code>inits_from_nca</code></td><td><code>true</code>, <code>false</code>, <code>nca</code>, <code>nca_sweep</code>, <code>nca_ebe</code></td><td><code>false</code></td><td>Derive NCA-based starting values from the data before the optimizer loop. <code>true</code> (alias for <code>nca_sweep</code>) and <code>false</code>/<code>off</code> toggle the default strategy; the three named values pick a strategy explicitly (see <a href="#nca-based-starting-values">NCA-based starting values</a>). Fixed thetas are never overwritten; covariate-effect thetas (no mu-referencing link) keep the model default. Most useful with <code>method = trust_region</code> or <code>method = gn</code> / <code>method = gn_hybrid</code>, where bad starting values can cause early stalling. The same estimation is available without running a fit via the CLI flag <code>--inits-from-nca[=METHOD]</code> and (in ferx-r) the <code>ferx_inits_from_nca()</code> function.</td></tr>
 </tbody>
 </table>
 </div>
+<h2 id="nca-based-starting-values"><a class="header" href="#nca-based-starting-values">NCA-based starting values</a></h2>
+<p><code>inits_from_nca</code> estimates starting values directly from the data using
+non-compartmental analysis (NCA), then optionally refines parameters NCA cannot
+estimate. All three strategies are NCA-based; they differ only in how much
+refinement runs on top:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Value</th><th>Strategy</th><th>What it does</th><th>Typical cost</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nca</code></td><td>NCA only</td><td>Per-subject NCA (AUC, terminal slope, Wagner–Nelson Ka, biexponential peeling for 2/3-cpt) pooled to population geometric means. Leaves parameters NCA can’t reach (peripheral Q/V2, all ODE/PD thetas) at the model default.</td><td>&lt; 5 ms</td></tr>
+<tr><td><code>nca_sweep</code></td><td>NCA + sweep</td><td>Runs <code>nca</code>, then sweeps every remaining non-fixed theta over a log-space rRMSE grid using population predictions (etas = 0). Model-agnostic — also covers ODE/PD models. <strong>This is what <code>true</code> selects.</strong></td><td>&lt; 500 ms (analytical)</td></tr>
+<tr><td><code>nca_ebe</code></td><td>NCA + EBE sweep</td><td>Like <code>nca_sweep</code> but evaluates the grid with empirical Bayes estimates (etas ≠ 0); more accurate under large IIV (omega &gt; ~0.2). Falls back to <code>nca_sweep</code> for ODE models.</td><td>&lt; 500 ms (analytical)</td></tr>
+</tbody>
+</table>
+</div>
+<p>The CL eta’s omega is also updated from inter-subject CV² when ≥ 3 subjects have
+a valid NCA estimate.</p>
+<p>When <code>nca_sweep</code> is enabled but the fit fails to converge or the OFV looks
+suspiciously high, try <code>nca_ebe</code>.</p>
 <h2 id="estimation-methods"><a class="header" href="#estimation-methods">Estimation Methods</a></h2>
 <h3 id="focei-default"><a class="header" href="#focei-default">FOCEI (default)</a></h3>
 <pre><code>method = focei
@@ -483,11 +504,11 @@ warnings.</p>
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
-        <script src="../searcher-c2a407aa.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-a0b12cfe.js"></script>
+        <script src="../book-c22b7243.js"></script>
 
         <!-- Custom JS scripts -->
         <script src="../mathjax-config-cc82dc7f.js"></script>

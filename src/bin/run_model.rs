@@ -1,3 +1,4 @@
+use ferx_core::NcaInit;
 use std::env;
 use std::time::Instant;
 
@@ -5,7 +6,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data]");
+        eprintln!("Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]]");
         eprintln!("       ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]");
         eprintln!();
         eprintln!("Fits a NLME model and writes sdtab.csv with residuals.");
@@ -17,6 +18,10 @@ fn main() {
         eprintln!();
         eprintln!("--output PATH  also write a portable .fitrx fit bundle (zip of JSON+CSV)");
         eprintln!("--include-data embed the input --data CSV inside the .fitrx (off by default)");
+        eprintln!();
+        eprintln!("--inits-from-nca[=METHOD]  derive NCA-based starting values before fitting,");
+        eprintln!("               overriding the model file. METHOD is nca, nca_sweep (default),");
+        eprintln!("               or nca_ebe; a bare --inits-from-nca means nca_sweep.");
         std::process::exit(1);
     }
 
@@ -27,6 +32,13 @@ fn main() {
         .and_then(|i| args.get(i + 1));
     let simulate = args.iter().any(|a| a == "--simulate");
     let threads = parse_threads_flag(&args);
+    let inits_from_nca = match parse_inits_from_nca_flag(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
     let output_path = parse_output_flag(&args);
     let include_data = args.iter().any(|a| a == "--include-data");
     if include_data && output_path.is_none() {
@@ -53,7 +65,7 @@ fn main() {
 
     let t_start = Instant::now();
     let result = if let Some(csv_path) = data_path {
-        ferx_core::run_model_with_data(model_path, csv_path)
+        ferx_core::run_model_with_data_inits(model_path, csv_path, inits_from_nca)
     } else if simulate {
         ferx_core::run_model_simulate(model_path)
     } else {
@@ -174,9 +186,38 @@ fn parse_threads_flag(args: &[String]) -> Option<usize> {
     }
 }
 
+/// Parse the optional `--inits-from-nca[=METHOD]` flag. Returns `Ok(None)` when
+/// the flag is absent (use the model file's value), `Ok(Some(method))` when it
+/// is present (overriding the model file). A bare `--inits-from-nca` selects
+/// `nca_sweep`; an explicit method is given as `--inits-from-nca=nca_ebe`.
+/// Returns `Err` for an unrecognised method.
+fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String> {
+    let Some(arg) = args
+        .iter()
+        .find(|a| *a == "--inits-from-nca" || a.starts_with("--inits-from-nca="))
+    else {
+        return Ok(None);
+    };
+    let method = match arg.split_once('=') {
+        None => NcaInit::Sweep, // bare flag → default strategy
+        Some((_, value)) => match value.to_ascii_lowercase().as_str() {
+            "nca" => NcaInit::Nca,
+            "" | "sweep" | "nca_sweep" => NcaInit::Sweep,
+            "ebe" | "nca_ebe" => NcaInit::Ebe,
+            other => {
+                return Err(format!(
+                    "--inits-from-nca: unknown method '{other}' — expected nca, nca_sweep, or nca_ebe"
+                ));
+            }
+        },
+    };
+    Ok(Some(method))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_output_flag, parse_threads_flag};
+    use super::{parse_inits_from_nca_flag, parse_output_flag, parse_threads_flag};
+    use ferx_core::NcaInit;
 
     fn args(extra: &[&str]) -> Vec<String> {
         std::iter::once("ferx")
@@ -217,5 +258,39 @@ mod tests {
             parse_output_flag(&args(&["--output", "run1.fitrx"])),
             Some("run1.fitrx".to_string())
         );
+    }
+
+    #[test]
+    fn inits_absent_is_none() {
+        assert_eq!(parse_inits_from_nca_flag(&args(&["model.ferx"])), Ok(None));
+    }
+
+    #[test]
+    fn inits_bare_flag_defaults_to_sweep() {
+        assert_eq!(
+            parse_inits_from_nca_flag(&args(&["--inits-from-nca"])),
+            Ok(Some(NcaInit::Sweep))
+        );
+    }
+
+    #[test]
+    fn inits_explicit_methods_parse() {
+        assert_eq!(
+            parse_inits_from_nca_flag(&args(&["--inits-from-nca=nca"])),
+            Ok(Some(NcaInit::Nca))
+        );
+        assert_eq!(
+            parse_inits_from_nca_flag(&args(&["--inits-from-nca=nca_sweep"])),
+            Ok(Some(NcaInit::Sweep))
+        );
+        assert_eq!(
+            parse_inits_from_nca_flag(&args(&["--inits-from-nca=nca_ebe"])),
+            Ok(Some(NcaInit::Ebe))
+        );
+    }
+
+    #[test]
+    fn inits_unknown_method_errors() {
+        assert!(parse_inits_from_nca_flag(&args(&["--inits-from-nca=bogus"])).is_err());
     }
 }

@@ -15,8 +15,8 @@
         <link rel="icon" href="favicon-de23e50b.svg">
         <link rel="shortcut icon" href="favicon-8114d1fc.png">
         <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-2459343d.css">
-        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/general-0392ca55.css">
+        <link rel="stylesheet" href="css/chrome-fc474251.css">
         <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-f221896f.js";
+            window.path_to_searchindex_js = "searchindex-e6c23135.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-3a934816.js"></script>
+        <script src="toc-39f227ad.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -180,7 +180,7 @@
                         <h1 id="cli-reference"><a class="header" href="#cli-reference">CLI Reference</a></h1>
 <p>The <code>ferx</code> command-line tool runs population PK estimation from model files and data.</p>
 <h2 id="usage"><a class="header" href="#usage">Usage</a></h2>
-<pre><code class="language-bash">ferx &lt;model.ferx&gt; --data &lt;data.csv&gt; [--output &lt;run.fitrx&gt;] [--include-data]
+<pre><code class="language-bash">ferx &lt;model.ferx&gt; --data &lt;data.csv&gt; [--output &lt;run.fitrx&gt;] [--include-data] [--inits-from-nca[=METHOD]]
 ferx &lt;model.ferx&gt; --simulate          [--output &lt;run.fitrx&gt;]
 </code></pre>
 <h2 id="commands"><a class="header" href="#commands">Commands</a></h2>
@@ -214,6 +214,18 @@ a zip of JSON and CSV designed to be read from Rust, R, Python, or Julia. Use
 default).</p>
 <pre><code class="language-bash">ferx model.ferx --data data.csv --output run1.fitrx --include-data
 </code></pre>
+<h2 id="nca-based-starting-values---inits-from-nca"><a class="header" href="#nca-based-starting-values---inits-from-nca">NCA-based starting values (<code>--inits-from-nca</code>)</a></h2>
+<p>Pass <code>--inits-from-nca</code> to derive starting values from the data via
+non-compartmental analysis before fitting, overriding the model file’s defaults.
+The flag overrides the <code>inits_from_nca</code> <code>[fit_options]</code> key for this run. A bare
+<code>--inits-from-nca</code> uses the <code>nca_sweep</code> strategy; pass an explicit method to pick
+another:</p>
+<pre><code class="language-bash">ferx model.ferx --data data.csv --inits-from-nca           # = nca_sweep
+ferx model.ferx --data data.csv --inits-from-nca=nca       # NCA only (fastest)
+ferx model.ferx --data data.csv --inits-from-nca=nca_ebe   # EBE-refined sweep
+</code></pre>
+<p>See <a href="model-file/fit-options.html#nca-based-starting-values">NCA-based starting values</a>
+for what each strategy does.</p>
 <p>See <a href="file-formats/fitrx.html">the <code>.fitrx</code> format reference</a> for the full
 schema.</p>
 <h2 id="console-output"><a class="header" href="#console-output">Console Output</a></h2>
@@ -311,11 +323,11 @@ cargo run --release --features autodiff --bin ferx -- model.ferx --data data.csv
 
         <script src="elasticlunr-ef4e11c1.min.js"></script>
         <script src="mark-09e88c2c.min.js"></script>
-        <script src="searcher-c2a407aa.js"></script>
+        <script src="searcher-09f2665d.js"></script>
 
         <script src="clipboard-1626706a.min.js"></script>
         <script src="highlight-abc7f01d.js"></script>
-        <script src="book-a0b12cfe.js"></script>
+        <script src="book-c22b7243.js"></script>
 
         <!-- Custom JS scripts -->
         <script src="mathjax-config-cc82dc7f.js"></script>

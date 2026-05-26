@@ -1,11 +1,11 @@
-//! Comparison test: suggest_start (A), suggest_start_thorough (B), suggest_start_ebe (C)
+//! Comparison test: inits_from_nca with NcaInit::Nca (A), ::Sweep (B), ::Ebe (C)
 //! across analytical and ODE model types.
 //!
 //! Run with:
 //!   cargo test --no-default-features --features ci suggest_start_comparison -- --nocapture
 
 use ferx_core::parser::model_parser::parse_model_file;
-use ferx_core::{read_nonmem_csv, suggest_start, suggest_start_ebe, suggest_start_thorough};
+use ferx_core::{inits_from_nca, read_nonmem_csv, NcaInit};
 use std::path::Path;
 use std::time::Instant;
 
@@ -24,15 +24,15 @@ fn run_case(case: &Case) {
         .unwrap_or_else(|e| panic!("data {}: {e}", case.data_path));
 
     let t0 = Instant::now();
-    let a = suggest_start(&model, &population);
+    let a = inits_from_nca(&model, &population, NcaInit::Nca);
     let t_a = t0.elapsed();
 
     let t1 = Instant::now();
-    let b = suggest_start_thorough(&model, &population);
+    let b = inits_from_nca(&model, &population, NcaInit::Sweep);
     let t_b = t1.elapsed();
 
     let t2 = Instant::now();
-    let c = suggest_start_ebe(&model, &population);
+    let c = inits_from_nca(&model, &population, NcaInit::Ebe);
     let t_c = t2.elapsed();
 
     println!("\n══ {} ══", case.label);

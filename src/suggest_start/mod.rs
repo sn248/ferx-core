@@ -1,11 +1,17 @@
 //! NCA-based starting value estimation.
 //!
-//! [`suggest_start`] uses non-compartmental analysis arithmetic only — no
-//! simulation or optimisation — and is fast enough to call before every fit.
+//! The single entry point is [`inits_from_nca`], which selects one of three
+//! NCA-based strategies via [`NcaInit`]:
 //!
-//! [`suggest_start_thorough`] runs Option A first, then performs an rRMSE grid
-//! sweep over distribution parameters (Q, V2, Q2, V3) using [`crate::api::predict`]
-//! with etas = 0.  It takes ~100–500 ms for typical 2/3-cpt datasets.
+//! - [`NcaInit::Nca`] — non-compartmental analysis arithmetic only, no
+//!   simulation or optimisation; fast enough to call before every fit.
+//! - [`NcaInit::Sweep`] — runs the NCA step first, then an rRMSE grid sweep
+//!   over parameters NCA cannot estimate (Q, V2, Q2, V3, or all thetas for ODE
+//!   models) using [`crate::api`] predictions with etas = 0. ~100–500 ms for
+//!   typical 2/3-cpt datasets. This is the default when enabled via a boolean.
+//! - [`NcaInit::Ebe`] — like `Sweep` but evaluates the grid with empirical
+//!   Bayes estimates (etas ≠ 0); more accurate under large IIV. Falls back to
+//!   `Sweep` for ODE models.
 
 mod nca;
 mod pooling;
@@ -24,7 +30,7 @@ use nca::{
 use pooling::{pool_nca, PopNca};
 use sweep::{sweep_slots, sweep_slots_ebe, sweep_unwritten_thetas, sweep_unwritten_thetas_ebe};
 
-/// Output of `suggest_start` / `suggest_start_thorough`.
+/// Output of [`inits_from_nca`].
 #[derive(Debug, Clone)]
 pub struct SuggestedStart {
     /// Clone of `model.default_params` with non-fixed thetas overwritten by NCA
@@ -34,25 +40,56 @@ pub struct SuggestedStart {
     pub warnings: Vec<String>,
 }
 
-/// Fast NCA-based starting value estimation (Option A).
+/// Which NCA-based starting-value strategy [`inits_from_nca`] should run.
 ///
-/// Derives theta starting values from non-compartmental analysis — no inner loop,
-/// no simulation.  Typical cost: < 5 ms for 100 subjects.
+/// User-facing names (fit option, CLI flag, R argument): `nca`, `nca_sweep`,
+/// `nca_ebe`. A boolean `true` maps to [`NcaInit::Sweep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NcaInit {
+    /// Non-compartmental analysis arithmetic only (fastest).
+    Nca,
+    /// NCA, then an etas = 0 rRMSE grid sweep for parameters NCA can't estimate.
+    #[default]
+    Sweep,
+    /// NCA, then an EBE-based (etas ≠ 0) rRMSE grid sweep; falls back to
+    /// `Sweep` for ODE models.
+    Ebe,
+}
+
+/// Derive NCA-based starting values from the data, using the strategy selected
+/// by `method`. See [`NcaInit`] for the trade-offs between the three variants.
 ///
+/// Common to all strategies:
 /// - Fixed thetas are never overwritten.
 /// - Covariate-effect thetas (no mu-referencing link) keep the model default.
 /// - All written values are clamped to `[theta_lower, theta_upper]`.
 /// - Omega for the CL/CL_F eta is updated from inter-subject CV² when ≥ 3
 ///   subjects have a valid CL estimate; all other omegas keep their defaults.
-pub fn suggest_start(model: &CompiledModel, population: &Population) -> SuggestedStart {
+pub fn inits_from_nca(
+    model: &CompiledModel,
+    population: &Population,
+    method: NcaInit,
+) -> SuggestedStart {
+    match method {
+        NcaInit::Nca => nca_only(model, population),
+        NcaInit::Sweep => nca_with_sweep(model, population),
+        NcaInit::Ebe => nca_with_ebe(model, population),
+    }
+}
+
+/// Fast NCA-based starting value estimation (`NcaInit::Nca`).
+///
+/// Derives theta starting values from non-compartmental analysis — no inner loop,
+/// no simulation.  Typical cost: < 5 ms for 100 subjects.
+fn nca_only(model: &CompiledModel, population: &Population) -> SuggestedStart {
     let (nca_vals, mut warnings) = run_nca(model, population);
     let params = build_params(model, &nca_vals, &mut warnings);
     SuggestedStart { params, warnings }
 }
 
-/// Thorough NCA + rRMSE sweep (Option B).
+/// NCA + rRMSE sweep (`NcaInit::Sweep`).
 ///
-/// Runs Option A first, then sweeps every non-fixed theta that Option A left at
+/// Runs the NCA step first, then sweeps every non-fixed theta it left at
 /// the model default — via sequential 1D coordinate sweeps over a log-space grid
 /// using population predictions (etas = 0) to minimise rRMSE.
 ///
@@ -63,8 +100,8 @@ pub fn suggest_start(model: &CompiledModel, population: &Population) -> Suggeste
 /// Cost: 9 `predict()` calls per unwritten theta.  For a typical 2-cpt PK model
 /// where peeling succeeded, 0–2 thetas remain; for a PD model with 5 free
 /// parameters, ~45 calls (~50 ms on 100 subjects).
-pub fn suggest_start_thorough(model: &CompiledModel, population: &Population) -> SuggestedStart {
-    let mut base = suggest_start(model, population);
+fn nca_with_sweep(model: &CompiledModel, population: &Population) -> SuggestedStart {
+    let mut base = nca_only(model, population);
 
     // Collect non-fixed thetas that Option A left unchanged (still at model default).
     let mut remaining: Vec<usize> = (0..model.default_params.theta.len())
@@ -112,7 +149,7 @@ pub fn suggest_start_thorough(model: &CompiledModel, population: &Population) ->
         let n_excluded = n_before - remaining.len();
         if n_excluded > 0 {
             base.warnings.push(format!(
-                "suggest_start_thorough: excluded {n_excluded} covariate theta(s) from rRMSE sweep (no mu-ref link and no standard PK slot)"
+                "inits_from_nca (nca_sweep): excluded {n_excluded} covariate theta(s) from rRMSE sweep (no mu-ref link and no standard PK slot)"
             ));
         }
     }
@@ -162,10 +199,10 @@ pub fn suggest_start_thorough(model: &CompiledModel, population: &Population) ->
     base
 }
 
-/// EBE-based NCA + rRMSE sweep (Option C).
+/// EBE-based NCA + rRMSE sweep (`NcaInit::Ebe`).
 ///
-/// Runs Option A first, then sweeps every non-fixed **lognormal** structural
-/// theta that Option A left at the model default, using individual empirical
+/// Runs the NCA step first, then sweeps every non-fixed **lognormal** structural
+/// theta it left at the model default, using individual empirical
 /// Bayes estimates (etas ≠ 0) to evaluate rRMSE at each grid point.
 ///
 /// Unlike Option B, this method correctly accounts for between-subject
@@ -187,21 +224,21 @@ pub fn suggest_start_thorough(model: &CompiledModel, population: &Population) ->
 /// afterwards with etas=0 (Option B style).
 ///
 /// Typical wall-clock cost on a 30-subject analytical 2-cpt model: 200–500 ms.
-pub fn suggest_start_ebe(model: &CompiledModel, population: &Population) -> SuggestedStart {
+fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStart {
     // ODE fallback: EBE sweeps require per-subject numerical integration per
     // inner iteration — too slow (~minutes) and unreliable from uninformed
-    // defaults.  Delegate to Option B directly (which runs NCA + etas=0 sweep)
-    // rather than calling suggest_start() first and then suggest_start_thorough()
+    // defaults.  Delegate to the etas=0 sweep directly (which runs NCA + sweep)
+    // rather than calling nca_only() first and then nca_with_sweep()
     // (which would run NCA twice).
     if model.ode_spec.is_some() {
-        let mut result = suggest_start_thorough(model, population);
+        let mut result = nca_with_sweep(model, population);
         result.warnings.insert(0,
-            "suggest_start_ebe: ODE model — EBE sweep skipped (too slow; ODE integration per inner iteration). Falling back to etas=0 sweep (Option B).".into(),
+            "inits_from_nca (nca_ebe): ODE model — EBE sweep skipped (too slow; ODE integration per inner iteration). Falling back to etas=0 sweep (nca_sweep).".into(),
         );
         return result;
     }
 
-    let mut base = suggest_start(model, population);
+    let mut base = nca_only(model, population);
 
     let mut remaining: Vec<usize> = (0..model.default_params.theta.len())
         .filter(|&i| {
@@ -256,7 +293,7 @@ pub fn suggest_start_ebe(model: &CompiledModel, population: &Population) -> Sugg
 
     if n_covariate_excluded > 0 {
         base.warnings.push(format!(
-            "suggest_start_ebe: excluded {n_covariate_excluded} covariate theta(s) from rRMSE sweep"
+            "inits_from_nca (nca_ebe): excluded {n_covariate_excluded} covariate theta(s) from rRMSE sweep"
         ));
     }
 
@@ -320,17 +357,17 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
     let mut warnings = Vec::new();
 
     if population.subjects.is_empty() {
-        warnings.push("suggest_start: no subjects in population; using model defaults".into());
+        warnings.push("inits_from_nca: no subjects in population; using model defaults".into());
         return (empty_pop_nca(), warnings);
     }
 
     // ODE models: pk_indices are sequential (slot i = position i), not semantic.
     // NCA can't reliably map estimates to the user's parameter names (which could
     // be KE, EMAX, or anything else — not necessarily CL/V).  Fall back to model
-    // defaults and let suggest_start_thorough() sweep them via rRMSE.
+    // defaults and let the nca_sweep method sweep them via rRMSE.
     if model.ode_spec.is_some() {
         warnings.push(
-            "suggest_start: ODE model detected; NCA estimation skipped (parameter names are user-defined). Use suggest_start_thorough() for rRMSE-based sweep.".into(),
+            "inits_from_nca: ODE model detected; NCA estimation skipped (parameter names are user-defined). Use the nca_sweep method for rRMSE-based sweep.".into(),
         );
         return (empty_pop_nca(), warnings);
     }
@@ -355,7 +392,7 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
     let n_total = per_subject.len();
     if n_valid < n_total {
         warnings.push(format!(
-            "suggest_start: {}/{} subjects had a valid AUC estimate; others excluded from NCA pooling",
+            "inits_from_nca: {}/{} subjects had a valid AUC estimate; others excluded from NCA pooling",
             n_valid, n_total
         ));
     }
@@ -369,12 +406,12 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
         PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion => {
             try_biexp_peel(model, population, &mut pop, &mut warnings);
             warnings.push(
-                "suggest_start: 3-cpt distribution parameters from biexponential peeling are unreliable; consider suggest_start_thorough()".into(),
+                "inits_from_nca: 3-cpt distribution parameters from biexponential peeling are unreliable; consider the nca_sweep method".into(),
             );
         }
         PkModel::ThreeCptOral => {
             warnings.push(
-                "suggest_start: Q/V2/Q2/V3 not estimated for 3-cpt oral; using model defaults — consider suggest_start_thorough()".into(),
+                "inits_from_nca: Q/V2/Q2/V3 not estimated for 3-cpt oral; using model defaults — consider the nca_sweep method".into(),
             );
         }
         _ => {}
@@ -466,7 +503,7 @@ fn try_biexp_peel(
         }
         None => {
             warnings.push(
-                "suggest_start: biexponential peeling failed (poor phase separation); Q/V2 will use model defaults — consider suggest_start_thorough()".into(),
+                "inits_from_nca: biexponential peeling failed (poor phase separation); Q/V2 will use model defaults — consider the nca_sweep method".into(),
             );
         }
     }
@@ -589,7 +626,7 @@ fn build_params(
             let fval = params.theta[fi]; // model default F
             if fval > 0.0 && fval < 1.0 {
                 warnings.push(format!(
-                    "suggest_start: bioavailability F theta found (default={fval:.3}); \
+                    "inits_from_nca: bioavailability F theta found (default={fval:.3}); \
                      NCA CL/V scaled by F_default. F cannot be estimated from oral NCA alone \
                      — Option B will sweep it via rRMSE."
                 ));
@@ -613,7 +650,7 @@ fn build_params(
         let clamped = value.clamp(params.theta_lower[idx], params.theta_upper[idx]);
         if (clamped - value).abs() > 1e-10 {
             warnings.push(format!(
-                "suggest_start: {param_name} estimate {value:.4} clamped to bounds [{:.4}, {:.4}]",
+                "inits_from_nca: {param_name} estimate {value:.4} clamped to bounds [{:.4}, {:.4}]",
                 params.theta_lower[idx], params.theta_upper[idx]
             ));
         }
@@ -628,14 +665,14 @@ fn build_params(
     let scale_factor = match &model.scaling {
         crate::types::ScalingSpec::ScalarScale(k) if *k > 0.0 => {
             warnings.push(format!(
-                "suggest_start: obs_scale = {k} detected; NCA CL/V estimates divided by {k} to match model parameter space"
+                "inits_from_nca: obs_scale = {k} detected; NCA CL/V estimates divided by {k} to match model parameter space"
             ));
             *k
         }
         crate::types::ScalingSpec::ExpressionScale { .. }
         | crate::types::ScalingSpec::PerCmt(_) => {
             warnings.push(
-                "suggest_start: expression/per-compartment obs_scale detected; NCA CL/V estimates may be in wrong units — recommend suggest_start_thorough()".into(),
+                "inits_from_nca: expression/per-compartment obs_scale detected; NCA CL/V estimates may be in wrong units — recommend the nca_sweep method".into(),
             );
             1.0
         }
@@ -654,10 +691,10 @@ fn build_params(
                 warnings,
             );
         } else {
-            warnings.push("suggest_start: could not map CL to a theta (no mu-referencing for CL eta); using model default".into());
+            warnings.push("inits_from_nca: could not map CL to a theta (no mu-referencing for CL eta); using model default".into());
         }
     } else {
-        warnings.push("suggest_start: CL not estimable from NCA; using model default".into());
+        warnings.push("inits_from_nca: CL not estimable from NCA; using model default".into());
     }
 
     // Write V / V1.  Same f_scale correction as CL.
@@ -672,10 +709,10 @@ fn build_params(
             );
         } else {
             warnings
-                .push("suggest_start: could not map V/V1 to a theta; using model default".into());
+                .push("inits_from_nca: could not map V/V1 to a theta; using model default".into());
         }
     } else {
-        warnings.push("suggest_start: V/V1 not estimable from NCA; using model default".into());
+        warnings.push("inits_from_nca: V/V1 not estimable from NCA; using model default".into());
     }
 
     // Write Ka (oral models)
@@ -686,12 +723,12 @@ fn build_params(
                     write_theta(&mut params, idx, ka, "Ka", warnings);
                 } else {
                     warnings.push(
-                        "suggest_start: could not map Ka to a theta; using model default".into(),
+                        "inits_from_nca: could not map Ka to a theta; using model default".into(),
                     );
                 }
             } else {
                 warnings
-                    .push("suggest_start: Ka not estimable from NCA; using model default".into());
+                    .push("inits_from_nca: Ka not estimable from NCA; using model default".into());
             }
         }
         _ => {}
@@ -772,7 +809,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
         };
-        let result = suggest_start(&model, &empty_pop);
+        let result = inits_from_nca(&model, &empty_pop, NcaInit::Nca);
         // Must not panic and should warn.
         assert!(!result.warnings.is_empty());
         // Params should equal model defaults.
@@ -783,7 +820,7 @@ mod tests {
     fn test_suggest_start_respects_bounds() {
         let model = parse_model_file(Path::new("examples/warfarin.ferx")).unwrap();
         let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
-        let result = suggest_start(&model, &population);
+        let result = inits_from_nca(&model, &population, NcaInit::Nca);
         for (i, &theta) in result.params.theta.iter().enumerate() {
             let lo = result.params.theta_lower[i];
             let hi = result.params.theta_upper[i];
@@ -801,7 +838,7 @@ mod tests {
         model.default_params.theta_fixed[0] = true;
         let original_val = model.default_params.theta[0];
         let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
-        let result = suggest_start(&model, &population);
+        let result = inits_from_nca(&model, &population, NcaInit::Nca);
         assert_eq!(
             result.params.theta[0], original_val,
             "fixed theta must not be overwritten"

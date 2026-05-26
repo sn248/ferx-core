@@ -26,7 +26,26 @@ The optional `[fit_options]` block configures the estimation method and optimize
 | `mu_referencing` | `true`, `false` | `true` | Re-centre inner-loop ETA estimates on the current population mean (auto-detected from `[individual_parameters]`). See the [FAQ entry](../faq.md#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem--nlmixr2) for details. Set `false` to reproduce pre-automatic-mu behaviour. |
 | `iov_column` | string | — | Name of the occasion column in the dataset (e.g. `OCC`). Required when the model uses `kappa` or `block_kappa` declarations. The column must contain integer occasion indices. Case-insensitive. Only supported with `foce` / `focei` — not `saem`. See [IOV documentation](../estimation/iov.md). |
 | `optimizer_trace` | `true`, `false` | `false` | Write a per-iteration CSV to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is stored in `FitResult::trace_path`. Useful for diagnosing convergence problems or comparing optimizers. See [Optimizer Trace](#optimizer-trace). |
-| `auto_start` | `true`, `false` | `false` | Derive NCA-based starting values automatically before the optimizer loop. When enabled, `suggest_start_thorough` (Option B) is called: per-subject NCA estimates are pooled to geometric means (CL, V, Ka, F, Q, V2), and any structural theta that NCA could not estimate is swept over a log-space rRMSE grid (etas = 0, 9 points per theta). Fixed thetas are never overwritten; covariate-effect thetas (no mu-referencing link) keep the model default. For ODE or PD models where NCA cannot map parameters to user names, the full rRMSE sweep runs across all non-fixed thetas. `auto_start` is most useful with `method = trust_region` or `method = gn` / `method = gn_hybrid`, where bad starting values can cause early stalling. For very large IIV (omega > 0.2) on analytical PK models, consider calling `suggest_start_ebe` (Option C) manually and passing the result as the model defaults. |
+| `inits_from_nca` | `true`, `false`, `nca`, `nca_sweep`, `nca_ebe` | `false` | Derive NCA-based starting values from the data before the optimizer loop. `true` (alias for `nca_sweep`) and `false`/`off` toggle the default strategy; the three named values pick a strategy explicitly (see [NCA-based starting values](#nca-based-starting-values)). Fixed thetas are never overwritten; covariate-effect thetas (no mu-referencing link) keep the model default. Most useful with `method = trust_region` or `method = gn` / `method = gn_hybrid`, where bad starting values can cause early stalling. The same estimation is available without running a fit via the CLI flag `--inits-from-nca[=METHOD]` and (in ferx-r) the `ferx_inits_from_nca()` function. |
+
+## NCA-based starting values
+
+`inits_from_nca` estimates starting values directly from the data using
+non-compartmental analysis (NCA), then optionally refines parameters NCA cannot
+estimate. All three strategies are NCA-based; they differ only in how much
+refinement runs on top:
+
+| Value | Strategy | What it does | Typical cost |
+|-------|----------|--------------|--------------|
+| `nca` | NCA only | Per-subject NCA (AUC, terminal slope, Wagner–Nelson Ka, biexponential peeling for 2/3-cpt) pooled to population geometric means. Leaves parameters NCA can't reach (peripheral Q/V2, all ODE/PD thetas) at the model default. | < 5 ms |
+| `nca_sweep` | NCA + sweep | Runs `nca`, then sweeps every remaining non-fixed theta over a log-space rRMSE grid using population predictions (etas = 0). Model-agnostic — also covers ODE/PD models. **This is what `true` selects.** | < 500 ms (analytical) |
+| `nca_ebe` | NCA + EBE sweep | Like `nca_sweep` but evaluates the grid with empirical Bayes estimates (etas ≠ 0); more accurate under large IIV (omega > ~0.2). Falls back to `nca_sweep` for ODE models. | < 500 ms (analytical) |
+
+The CL eta's omega is also updated from inter-subject CV² when ≥ 3 subjects have
+a valid NCA estimate.
+
+When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
+suspiciously high, try `nca_ebe`.
 
 ## Estimation Methods
 

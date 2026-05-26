@@ -268,13 +268,12 @@ pub fn compute_event_pk_params_into(
 ///
 /// **Occasion-dependent PK dynamics are exact**: per-event params carry the
 /// occasion κ, so CL/V/KA switch correctly across occasions. `[scaling]` is also
-/// applied per occasion (see the call site). One narrow limitation remains: for
-/// ODE models a Form C output expression (`y = <expr>`) is evaluated inside the
-/// ODE solver with a single `eta` (BSV + zero κ), so an output expression that
-/// references `KAPPA_*` directly sees κ=0. The PK state itself is still
-/// occasion-correct (it flows through the per-event params); only a κ-referencing
-/// *readout* is affected. Threading per-event κ into the ODE output readout is
-/// future work.
+/// applied per occasion (see the call site). One narrow case is handled at parse
+/// time rather than here: a Form C ODE output expression (`y = <expr>`) that
+/// references `KAPPA_*` directly would be evaluated per-observation with a single
+/// eta (κ=0), so the parser rejects it for IOV models (issue #107) — reference
+/// the occasion-dependent structural parameter (e.g. CL) instead. The PK state
+/// is always occasion-correct (it flows through the per-event params).
 pub fn predict_iov(
     model: &CompiledModel,
     subject: &Subject,

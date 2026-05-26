@@ -998,7 +998,14 @@ fn nelder_mead_minimize(
 
     for _iter in 0..max_iter {
         let mut indices: Vec<usize> = (0..=n).collect();
-        indices.sort_by(|&a, &b| fvals[a].partial_cmp(&fvals[b]).unwrap());
+        // NaN-safe: a non-finite objective (e.g. an ODE prediction that blew
+        // up at a simplex vertex) sorts as worst rather than panicking on the
+        // `None` that `partial_cmp` returns for NaN. See issue #97.
+        indices.sort_by(|&a, &b| {
+            fvals[a]
+                .partial_cmp(&fvals[b])
+                .unwrap_or(std::cmp::Ordering::Greater)
+        });
 
         let best = indices[0];
         let worst = indices[n];
@@ -1068,10 +1075,11 @@ fn nelder_mead_minimize(
         }
     }
 
+    // NaN-safe min: a non-finite vertex objective must not panic here either.
     let best = fvals
         .iter()
         .enumerate()
-        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater))
         .map(|(i, _)| i)
         .unwrap();
     x.copy_from_slice(&simplex[best]);
@@ -1305,6 +1313,33 @@ mod tests {
         assert_eq!(n_unconverged, 1);
         // Both fallback counts regardless of min_obs.
         assert_eq!(n_fallback, 1);
+    }
+
+    #[test]
+    fn test_nelder_mead_nan_objective_does_not_panic() {
+        // Regression for issue #97: when a simplex vertex evaluates to a NaN
+        // objective (e.g. an ODE prediction blowing up during the EBE search),
+        // the `partial_cmp().unwrap()` sort used to panic — and, unwinding
+        // through the non-unwinding optimizer callback, abort the whole fit.
+        // NaN must now sort as worst and get reflected away instead.
+        let obj = |x: &[f64]| -> f64 {
+            if x[0] < 0.0 {
+                // The "blow-up" region: objective is non-finite here.
+                f64::NAN
+            } else {
+                (x[0] - 1.0).powi(2) + (x[1] - 1.0).powi(2)
+            }
+        };
+        // Seed the simplex entirely inside the NaN region so the very first
+        // sort encounters only NaN vertices.
+        let mut x = vec![-1.0, -1.0];
+        // The contract under test is "does not panic"; the return flag and
+        // final point are secondary. Coordinates must stay finite.
+        let _converged = nelder_mead_minimize(&obj, &mut x, 2, 200, 1e-8);
+        assert!(
+            x.iter().all(|v| v.is_finite()),
+            "Nelder-Mead must leave the point finite, got {x:?}"
+        );
     }
 }
 

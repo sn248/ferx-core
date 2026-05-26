@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-7e2dd857.js";
+            window.path_to_searchindex_js = "searchindex-f012af5f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-39f227ad.js"></script>
+        <script src="toc-6b798105.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -300,6 +300,22 @@ sum-of-moieties, free vs. total), specify a scale per CMT:</p>
 errors at startup with the list of missing CMTs.</p>
 <p>See <a href="model-file/scaling.html">Scaling</a> for the full reference, including
 how this compares to NONMEM’s <code>S1</code>/<code>S2</code> and nlmixr2’s <code>cmt(central); f = ...</code>.</p>
+<h2 id="how-do-i-validate-a-model-file-without-running-a-full-fit"><a class="header" href="#how-do-i-validate-a-model-file-without-running-a-full-fit">How do I validate a model file without running a full fit?</a></h2>
+<p>Use <code>ferx check</code>:</p>
+<pre><code class="language-bash">ferx check model.ferx                  # parse + structural validation
+ferx check model.ferx --data data.csv  # also run data-dependent checks
+ferx check model.ferx --data data.csv --json
+</code></pre>
+<p>It runs the parser and every validation step that normally fires at the start
+of a fit — missing blocks, missing covariates, per-CMT scaling / error-model
+coverage, steady-state and lag-time sanity — then reports the findings and
+exits, without fitting. This turns a multi-second fit-to-find-a-typo into a
+sub-second loop.</p>
+<p><code>--json</code> emits a structured report (stable <code>code</code> per finding, optional block /
+line / suggestion) that tooling and coding agents can consume directly, rather
+than parsing prose. The exit code is <code>0</code> when no errors are found, <code>1</code> when
+there are errors. See the <a href="file-formats/check-report.html">check report reference</a>
+for the JSON schema and the full code table.</p>
 
                     </main>
 

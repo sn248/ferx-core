@@ -4,9 +4,17 @@ use std::time::Instant;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
+    // `ferx check ...` is a separate, non-fitting subcommand: parse + validate a
+    // model (optionally against data) and report structured diagnostics. Dispatch
+    // before the fit/simulate path so the rest of main() is unchanged.
+    if args.get(1).map(String::as_str) == Some("check") {
+        std::process::exit(run_check(&args));
+    }
+
     if args.len() < 2 {
         eprintln!("Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data]");
         eprintln!("       ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]");
+        eprintln!("       ferx check <model.ferx> [--data <data.csv>] [--json]");
         eprintln!();
         eprintln!("Fits a NLME model and writes sdtab.csv with residuals.");
         eprintln!("Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)");
@@ -135,6 +143,121 @@ fn main() {
     }
 }
 
+/// Parsed `ferx check` arguments.
+#[derive(Debug, PartialEq, Eq)]
+struct CheckArgs<'a> {
+    model: &'a str,
+    data: Option<&'a str>,
+    json: bool,
+}
+
+/// Why `parse_check_args` rejected the arguments.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckArgsError {
+    /// Model path missing or flag-looking — print full usage.
+    Usage,
+    /// `--data` present but missing its value or followed by another flag.
+    MissingDataValue,
+}
+
+/// Parse `ferx check <model> [--data <csv>] [--json]`.
+///
+/// `--data` is parsed like the existing `--output` / `--threads` helpers: when
+/// the flag is present it must be followed by a non-flag value, otherwise we
+/// reject the args rather than silently running without data (or trying to open
+/// a file literally named `--json`).
+fn parse_check_args(args: &[String]) -> Result<CheckArgs<'_>, CheckArgsError> {
+    let model = match args.get(2) {
+        Some(p) if !p.starts_with("--") => p.as_str(),
+        _ => return Err(CheckArgsError::Usage),
+    };
+    let data = match args.iter().position(|a| a == "--data") {
+        None => None,
+        Some(i) => match args.get(i + 1) {
+            Some(v) if !v.starts_with("--") => Some(v.as_str()),
+            _ => return Err(CheckArgsError::MissingDataValue),
+        },
+    };
+    let json = args.iter().any(|a| a == "--json");
+    Ok(CheckArgs { model, data, json })
+}
+
+/// Run the `check` subcommand. Returns the process exit code:
+/// `0` = valid (no errors), `1` = errors found, `2` = usage / serialization error.
+fn run_check(args: &[String]) -> i32 {
+    let parsed = match parse_check_args(args) {
+        Ok(p) => p,
+        Err(CheckArgsError::MissingDataValue) => {
+            eprintln!("Error: --data requires a path (e.g. --data data.csv)");
+            return 2;
+        }
+        Err(CheckArgsError::Usage) => {
+            eprintln!("Usage: ferx check <model.ferx> [--data <data.csv>] [--json]");
+            eprintln!();
+            eprintln!("Validates a model file without fitting and reports structured");
+            eprintln!("diagnostics. With --data, also runs data-dependent checks");
+            eprintln!("(covariates present, per-CMT coverage, steady-state, lag time).");
+            eprintln!("--json   emit the report as JSON to stdout");
+            return 2;
+        }
+    };
+
+    let report = ferx_core::validate_model_file(parsed.model, parsed.data);
+
+    if parsed.json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(s) => println!("{}", s),
+            Err(e) => {
+                eprintln!("Error: failed to serialize check report: {}", e);
+                return 2;
+            }
+        }
+    } else {
+        print_check_human(&report);
+    }
+
+    if report.valid {
+        0
+    } else {
+        1
+    }
+}
+
+/// Print a `CheckReport` in human-readable form to stdout, one diagnostic per
+/// line as `severity[CODE] block:line: message`, with an indented `help:` line
+/// for any suggestion, then a one-line summary.
+fn print_check_human(report: &ferx_core::CheckReport) {
+    for d in &report.diagnostics {
+        let sev = match d.severity {
+            ferx_core::Severity::Error => "error",
+            ferx_core::Severity::Warning => "warning",
+        };
+        let loc = match (&d.block, d.line) {
+            (Some(b), Some(l)) => format!(" {}:{}", b, l),
+            (Some(b), None) => format!(" [{}]", b),
+            _ => String::new(),
+        };
+        println!("{}[{}]{}: {}", sev, d.code, loc, d.message);
+        if let Some(s) = &d.suggestion {
+            println!("    help: {}", s);
+        }
+    }
+    if report.valid {
+        println!(
+            "ok: {} — no errors ({} warning(s))",
+            report.model,
+            report.warning_count()
+        );
+    } else {
+        println!(
+            "invalid: {} — {} error(s), {} warning(s)",
+            report.model,
+            report.error_count(),
+            report.warning_count()
+        );
+    }
+}
+
 /// Parse the optional `--output` flag. Returns `None` when absent; exits with
 /// an error message when present but missing its value, mirroring `--threads`.
 fn parse_output_flag(args: &[String]) -> Option<String> {
@@ -176,7 +299,7 @@ fn parse_threads_flag(args: &[String]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_output_flag, parse_threads_flag};
+    use super::{parse_check_args, parse_output_flag, parse_threads_flag, CheckArgsError};
 
     fn args(extra: &[&str]) -> Vec<String> {
         std::iter::once("ferx")
@@ -216,6 +339,54 @@ mod tests {
         assert_eq!(
             parse_output_flag(&args(&["--output", "run1.fitrx"])),
             Some("run1.fitrx".to_string())
+        );
+    }
+
+    #[test]
+    fn check_args_model_only() {
+        let argv = args(&["check", "model.ferx"]);
+        let a = parse_check_args(&argv).unwrap();
+        assert_eq!(a.model, "model.ferx");
+        assert_eq!(a.data, None);
+        assert!(!a.json);
+    }
+
+    #[test]
+    fn check_args_with_data_and_json() {
+        let argv = args(&["check", "model.ferx", "--data", "d.csv", "--json"]);
+        let a = parse_check_args(&argv).unwrap();
+        assert_eq!(a.model, "model.ferx");
+        assert_eq!(a.data, Some("d.csv"));
+        assert!(a.json);
+    }
+
+    #[test]
+    fn check_args_missing_model_is_usage_error() {
+        assert_eq!(
+            parse_check_args(&args(&["check"])),
+            Err(CheckArgsError::Usage)
+        );
+        assert_eq!(
+            parse_check_args(&args(&["check", "--json"])),
+            Err(CheckArgsError::Usage)
+        );
+    }
+
+    #[test]
+    fn check_args_data_without_value_is_error() {
+        // `--data` as the final token: previously ran silently without data.
+        assert_eq!(
+            parse_check_args(&args(&["check", "model.ferx", "--data"])),
+            Err(CheckArgsError::MissingDataValue)
+        );
+    }
+
+    #[test]
+    fn check_args_data_followed_by_flag_is_error() {
+        // `--data --json`: previously tried to open a file named "--json".
+        assert_eq!(
+            parse_check_args(&args(&["check", "model.ferx", "--data", "--json"])),
+            Err(CheckArgsError::MissingDataValue)
         );
     }
 }

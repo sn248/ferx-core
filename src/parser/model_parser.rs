@@ -1508,6 +1508,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         model,
         simulation,
         fit_options,
+        block_lines: extracted.block_lines.clone(),
     })
 }
 
@@ -2900,6 +2901,10 @@ fn extract_model_name(content: &str) -> String {
 struct ExtractedBlocks {
     unnamed: HashMap<String, Vec<String>>,
     named: HashMap<String, HashMap<String, Vec<String>>>,
+    /// 1-based source line of each unnamed block's header line, keyed by block
+    /// type. First occurrence wins. Used to give `ferx check` diagnostics a
+    /// block-level location.
+    block_lines: HashMap<String, usize>,
 }
 
 fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
@@ -2918,7 +2923,7 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
     }
     let mut current: Option<BlockTarget> = None;
 
-    for line in content.lines() {
+    for (idx, line) in content.lines().enumerate() {
         let without_comment = match line.find('#').into_iter().chain(line.find("//")).min() {
             Some(idx) => &line[..idx],
             None => line,
@@ -2935,7 +2940,11 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
                     ty,
                     name: m.as_str().to_string(),
                 }),
-                None => Some(BlockTarget::Unnamed(ty)),
+                None => {
+                    // Record the 1-based header line; first occurrence wins.
+                    out.block_lines.entry(ty.clone()).or_insert(idx + 1);
+                    Some(BlockTarget::Unnamed(ty))
+                }
             };
             continue;
         }

@@ -7,6 +7,7 @@ The `ferx` command-line tool runs population PK estimation from model files and 
 ```bash
 ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data]
 ferx <model.ferx> --simulate          [--output <run.fitrx>]
+ferx check <model.ferx> [--data <data.csv>] [--json]
 ```
 
 ## Commands
@@ -26,6 +27,43 @@ ferx model.ferx --simulate
 ```
 
 Parses the model file, generates simulated data from the `[simulation]` block, and fits the model to the simulated data. Requires a `[simulation]` block in the model file.
+
+### Validate without Fitting (`check`)
+
+```bash
+ferx check model.ferx                  # parse + structural validation
+ferx check model.ferx --data data.csv  # also run data-dependent checks
+ferx check model.ferx --data data.csv --json
+```
+
+Runs the parser and every validation step that normally happens at the start of
+a fit — *without* fitting — then reports the findings. This is a fast
+`author → diagnose → fix` loop, especially useful for tooling and coding agents
+that author model files programmatically.
+
+- Without `--data`, parse / structural and model–option compatibility checks
+  run (no data is read) — e.g. an SDE model paired with SAEM, or
+  `optimizer = trust_region` on an IOV model.
+- With `--data`, the dataset is read and the data-dependent checks run too:
+  referenced covariates present, per-CMT scaling / error-model coverage,
+  steady-state dosing well-formed, and non-negative typical-value lag time.
+- `--json` emits a structured [check report](file-formats/check-report.md) to
+  stdout instead of the human-readable summary.
+
+Human output lists one diagnostic per line as
+`severity[CODE] block:line: message`, with an indented `help:` line for any
+suggestion, then a one-line summary:
+
+```text
+error[E_MISSING_COVARIATE]: Model references covariate(s) not found in data (case-sensitive): WGT. Available covariate columns: (none).
+    help: available covariate columns: (none)
+invalid: mymodel — 1 error(s), 0 warning(s)
+```
+
+The exit code is `0` when no errors are found (warnings alone still exit `0`),
+`1` when any error is found, and `2` on a usage error. See the
+[check report reference](file-formats/check-report.md) for the JSON schema and
+the full error-code table.
 
 ## Output Files
 
@@ -79,8 +117,9 @@ Elapsed: 0.496s
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success |
-| 1 | Error (parse failure, data error, convergence failure) |
+| 0 | Success (for `check`: no errors found) |
+| 1 | Error (parse failure, data error, convergence failure; for `check`: errors found) |
+| 2 | `check` usage error (e.g. missing model path) |
 
 ## Examples
 

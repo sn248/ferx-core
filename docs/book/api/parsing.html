@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-7e2dd857.js";
+            window.path_to_searchindex_js = "../searchindex-f012af5f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-39f227ad.js"></script>
+        <script src="../toc-6b798105.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -227,8 +227,36 @@ let model = parse_model_string(model_str)?;
     pub model: CompiledModel,
     pub simulation: Option&lt;SimulationSpec&gt;,
     pub fit_options: FitOptions,
+    /// 1-based source line of each unnamed `[block]` header, keyed by the
+    /// lowercased block type (e.g. `"individual_parameters" -&gt; 7`).
+    pub block_lines: std::collections::HashMap&lt;String, usize&gt;,
 }
 <span class="boring">}</span></code></pre>
+<h2 id="validation"><a class="header" href="#validation">Validation</a></h2>
+<h3 id="validate_model_file"><a class="header" href="#validate_model_file"><code>validate_model_file()</code></a></h3>
+<p>Validate a model file (and optionally a dataset) <strong>without fitting</strong>, returning
+a structured <a href="../file-formats/check-report.html"><code>CheckReport</code></a>. This is the engine
+behind the <a href="../cli.html"><code>ferx check</code></a> CLI command: it runs the parser plus every
+data-independent and data-dependent check, collecting <em>all</em> findings rather than
+stopping at the first (as <code>fit()</code> does).</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub fn validate_model_file(model_path: &amp;str, data_path: Option&lt;&amp;str&gt;) -&gt; CheckReport
+<span class="boring">}</span></code></pre>
+<p><strong>Example:</strong></p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let report = validate_model_file("model.ferx", Some("data.csv"));
+if !report.valid {
+    for d in &amp;report.diagnostics {
+        eprintln!("{:?} [{}]: {}", d.severity, d.code, d.message);
+    }
+}
+<span class="boring">}</span></code></pre>
+<p>When <code>data_path</code> is <code>None</code>, only parse / structural checks run. The same
+validators feed <code>fit()</code> (via the internal <code>check_model_data</code> /
+<code>check_model_data_warnings</code> functions), so a clean <code>check</code> and a <code>fit()</code> agree
+on what is and isn’t valid.</p>
 <h2 id="data-parsing"><a class="header" href="#data-parsing">Data Parsing</a></h2>
 <h3 id="read_nonmem_csv"><a class="header" href="#read_nonmem_csv"><code>read_nonmem_csv()</code></a></h3>
 <p>Read a NONMEM-format CSV file into a <code>Population</code>.</p>

@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-7e2dd857.js";
+            window.path_to_searchindex_js = "searchindex-f012af5f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-39f227ad.js"></script>
+        <script src="toc-6b798105.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,6 +182,7 @@
 <h2 id="usage"><a class="header" href="#usage">Usage</a></h2>
 <pre><code class="language-bash">ferx &lt;model.ferx&gt; --data &lt;data.csv&gt; [--output &lt;run.fitrx&gt;] [--include-data]
 ferx &lt;model.ferx&gt; --simulate          [--output &lt;run.fitrx&gt;]
+ferx check &lt;model.ferx&gt; [--data &lt;data.csv&gt;] [--json]
 </code></pre>
 <h2 id="commands"><a class="header" href="#commands">Commands</a></h2>
 <h3 id="fit-with-data"><a class="header" href="#fit-with-data">Fit with Data</a></h3>
@@ -192,6 +193,36 @@ ferx &lt;model.ferx&gt; --simulate          [--output &lt;run.fitrx&gt;]
 <pre><code class="language-bash">ferx model.ferx --simulate
 </code></pre>
 <p>Parses the model file, generates simulated data from the <code>[simulation]</code> block, and fits the model to the simulated data. Requires a <code>[simulation]</code> block in the model file.</p>
+<h3 id="validate-without-fitting-check"><a class="header" href="#validate-without-fitting-check">Validate without Fitting (<code>check</code>)</a></h3>
+<pre><code class="language-bash">ferx check model.ferx                  # parse + structural validation
+ferx check model.ferx --data data.csv  # also run data-dependent checks
+ferx check model.ferx --data data.csv --json
+</code></pre>
+<p>Runs the parser and every validation step that normally happens at the start of
+a fit — <em>without</em> fitting — then reports the findings. This is a fast
+<code>author → diagnose → fix</code> loop, especially useful for tooling and coding agents
+that author model files programmatically.</p>
+<ul>
+<li>Without <code>--data</code>, parse / structural and model–option compatibility checks
+run (no data is read) — e.g. an SDE model paired with SAEM, or
+<code>optimizer = trust_region</code> on an IOV model.</li>
+<li>With <code>--data</code>, the dataset is read and the data-dependent checks run too:
+referenced covariates present, per-CMT scaling / error-model coverage,
+steady-state dosing well-formed, and non-negative typical-value lag time.</li>
+<li><code>--json</code> emits a structured <a href="file-formats/check-report.html">check report</a> to
+stdout instead of the human-readable summary.</li>
+</ul>
+<p>Human output lists one diagnostic per line as
+<code>severity[CODE] block:line: message</code>, with an indented <code>help:</code> line for any
+suggestion, then a one-line summary:</p>
+<pre><code class="language-text">error[E_MISSING_COVARIATE]: Model references covariate(s) not found in data (case-sensitive): WGT. Available covariate columns: (none).
+    help: available covariate columns: (none)
+invalid: mymodel — 1 error(s), 0 warning(s)
+</code></pre>
+<p>The exit code is <code>0</code> when no errors are found (warnings alone still exit <code>0</code>),
+<code>1</code> when any error is found, and <code>2</code> on a usage error. See the
+<a href="file-formats/check-report.html">check report reference</a> for the JSON schema and
+the full error-code table.</p>
 <h2 id="output-files"><a class="header" href="#output-files">Output Files</a></h2>
 <p>Three files are always generated, named after the model file:</p>
 <div class="table-wrapper">
@@ -241,8 +272,9 @@ Elapsed: 0.496s
 <tr><th>Code</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td>0</td><td>Success</td></tr>
-<tr><td>1</td><td>Error (parse failure, data error, convergence failure)</td></tr>
+<tr><td>0</td><td>Success (for <code>check</code>: no errors found)</td></tr>
+<tr><td>1</td><td>Error (parse failure, data error, convergence failure; for <code>check</code>: errors found)</td></tr>
+<tr><td>2</td><td><code>check</code> usage error (e.g. missing model path)</td></tr>
 </tbody>
 </table>
 </div>

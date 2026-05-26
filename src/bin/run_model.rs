@@ -386,6 +386,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn inits_absent_is_none() {
         assert_eq!(parse_inits_from_nca_flag(&args(&["model.ferx"])), Ok(None));
     }

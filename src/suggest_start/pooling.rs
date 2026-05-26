@@ -3,6 +3,7 @@ use super::nca::SubjectNca;
 
 /// Population-level NCA summary (geometric means across subjects).
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // vss/lambda_z/c0/tmax_median exposed for diagnostics
 pub struct PopNca {
     pub cl_f: Option<f64>,
     pub v_f: Option<f64>,

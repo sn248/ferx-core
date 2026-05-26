@@ -7,6 +7,7 @@ use crate::types::Subject;
 /// Per-subject NCA results.  `None` fields indicate the quantity could not be
 /// estimated (too few points, failed R² check, etc.).
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // cmax/auc_inf/mrt exposed for diagnostics
 pub struct SubjectNca {
     pub cl_f: Option<f64>, // CL or CL/F = dose / AUC∞
     pub v_f: Option<f64>,  // Vd or Vd/F = CL_f / lambda_z
@@ -811,7 +812,6 @@ mod tests {
         let v = 8.1;
         let ka = 1.0;
         let k = cl / v;
-        let dose = 100.0;
         let times: Vec<f64> = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
         let concs_norm: Vec<f64> = times
             .iter()

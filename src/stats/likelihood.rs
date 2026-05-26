@@ -524,11 +524,31 @@ pub(crate) fn chol_log_det(l: &DMatrix<f64>) -> f64 {
     2.0 * ld
 }
 
-/// IOV-aware FOCE per-subject NLL.
+/// IOV-aware FOCE per-subject NLL — a *proper* linearised marginal over the
+/// full random-effect vector `b = [η, κ₁, …, κ_K]`.
 ///
-/// Computes per-occasion predictions using combined `[bsv_eta, kappa_k]`,
-/// linearises with the BSV-only H-matrix, and adds explicit kappa priors so
-/// the outer optimiser receives a gradient w.r.t. `omega_iov`.
+/// The per-occasion κ draws are integrated out by the same Sheiner–Beal
+/// marginal that handles the BSV η: we assemble the augmented sensitivity
+/// matrix `H_full = [∂f/∂η │ ∂f/∂κ₁ │ … │ ∂f/∂κ_K]` and the block-diagonal
+/// prior covariance `Σ_b = blkdiag(Ω_bsv, Ω_iov, …, Ω_iov)` (K copies), then
+/// evaluate the ordinary FOCE/FOCEI form `0.5·[(y−f₀)ᵀ R̃⁻¹ (y−f₀) + log|R̃|]`
+/// with `R̃ = H_full Σ_b H_fullᵀ + R`.
+///
+/// Because `∂f/∂κ_k` is non-zero only on occasion-k's observation rows (κ_k
+/// enters only that occasion's predictions, under the cross-occasion
+/// dose-carryover convention of `individual_nll_iov`), the κ columns are
+/// block-structured and the κ blocks of `Σ_b` couple only same-occasion rows
+/// — independent occasions stay independent in `R̃`.
+///
+/// This replaces the earlier shortcut (BSV-only linearisation plus an explicit
+/// `0.5·Σ_k[κᵀΩ_iov⁻¹κ + log|Ω_iov|]` MAP penalty). That penalty omitted the
+/// κ-block Laplace determinant `log|H_κᵀR⁻¹H_κ + Ω_iov⁻¹|`; in a correct
+/// marginal `log|Ω| + log|J|` combine into the bounded `log|R̃/R|`, so dropping
+/// `log|J|` left a bare `+0.5·K·log|Ω_iov|` that → −∞ as Ω_iov → 0, leaving
+/// `omega_iov` unidentified and the FOCE OFV not comparable to NONMEM / SAEM.
+/// See issue #101. With the augmented form, no separate κ prior is added (it
+/// is already folded into `R̃`), and the K=0 case reduces exactly to
+/// [`foce_subject_nll`].
 ///
 /// `kappas[k]` is the EBE kappa vector for occasion k (same order as
 /// `split_obs_by_occasion`).  When `kappas` is empty, falls through to the
@@ -558,36 +578,83 @@ pub fn foce_subject_nll_iov(
         );
     }
 
-    // Build per-occasion ipreds: obs j in occasion k uses combined=[bsv_eta, kappa_k].
     let occ_groups = split_obs_by_occasion(subject);
     let n_obs = subject.obs_times.len();
+    let n_eta = eta_hat.len();
+    let n_iov = omega_iov.matrix.nrows();
+    // One κ block per occasion that actually carries observations.
+    let k_occ = occ_groups.len().min(kappas.len());
+    let n_b = n_eta + k_occ * n_iov;
+
+    // Per-occasion ipreds at the joint EBE, plus the κ sensitivity columns of
+    // the augmented H-matrix. The BSV columns are copied from the passed-in H
+    // (already computed at the EBE with κ fixed, in `compute_jacobian_fd_iov`).
     let mut ipreds = vec![0.0_f64; n_obs];
-    for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate() {
-        let kap: &[f64] = if k < kappas.len() {
-            kappas[k].as_slice()
-        } else {
-            &[]
-        };
+    let mut h_full = DMatrix::zeros(n_obs, n_b);
+    for j in 0..n_obs {
+        for c in 0..n_eta {
+            h_full[(j, c)] = h_matrix[(j, c)];
+        }
+    }
+    const EPS: f64 = 1e-6;
+    for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate().take(k_occ) {
+        let kap = kappas[k].as_slice();
         let combined: Vec<f64> = eta_hat.iter().copied().chain(kap.iter().copied()).collect();
         let all_preds = model_predictions(model, subject, theta, &combined);
         for &j in obs_indices {
             ipreds[j] = all_preds[j];
         }
+        // ∂pred/∂κ_k[ki] via central FD — written only on this occasion's rows.
+        let col_base = n_eta + k * n_iov;
+        for ki in 0..n_iov {
+            let step = EPS * (1.0 + kap[ki].abs());
+            let mut combined_plus = combined.clone();
+            let mut combined_minus = combined.clone();
+            combined_plus[n_eta + ki] += step;
+            combined_minus[n_eta + ki] -= step;
+            let preds_plus = model_predictions(model, subject, theta, &combined_plus);
+            let preds_minus = model_predictions(model, subject, theta, &combined_minus);
+            let inv_2step = 1.0 / (2.0 * step);
+            for &j in obs_indices {
+                h_full[(j, col_base + ki)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
+            }
+        }
     }
 
+    // Joint EBE vector b̂ = [η̂, κ̂₁, …, κ̂_K].
+    let mut b_hat = DVector::zeros(n_b);
+    for i in 0..n_eta {
+        b_hat[i] = eta_hat[i];
+    }
+    for (k, kap) in kappas.iter().enumerate().take(k_occ) {
+        for ki in 0..n_iov {
+            b_hat[n_eta + k * n_iov + ki] = kap[ki];
+        }
+    }
+
+    // Block-diagonal prior covariance Σ_b = blkdiag(Ω_bsv, Ω_iov × K).
+    // `from_matrix` regularises if a sub-block is not PD, matching the
+    // robustness of the non-IOV OmegaMatrix path; the standard/interaction
+    // FOCE routines below read only `Σ_b.matrix`.
+    let sigma_b_mat = build_block_diag_omega(&omega_bsv.matrix, &omega_iov.matrix, k_occ);
+    let sigma_b = OmegaMatrix::from_matrix(sigma_b_mat, Vec::new(), false);
+
+    // The augmented system is now an ordinary FOCE/FOCEI marginal: κ is
+    // integrated out through R̃ exactly like η, so no separate κ prior is
+    // added (doing so would double-count the random-effect penalty).
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
     let p_obs_iov = if model.is_sde() {
         ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
     } else {
         Vec::new()
     };
-    let foce_term = if interaction || m3_active {
+    if interaction || m3_active {
         foce_subject_nll_interaction(
             subject,
             &ipreds,
-            eta_hat,
-            h_matrix,
-            omega_bsv,
+            &b_hat,
+            &h_full,
+            &sigma_b,
             sigma_values,
             &model.error_spec,
             model.bloq_method,
@@ -597,29 +664,15 @@ pub fn foce_subject_nll_iov(
         foce_subject_nll_standard(
             subject,
             &ipreds,
-            eta_hat,
-            h_matrix,
-            omega_bsv,
+            &b_hat,
+            &h_full,
+            &sigma_b,
             sigma_values,
             &model.error_spec,
             model.bloq_method,
             &p_obs_iov,
         )
-    };
-
-    // Kappa prior: 0.5 * [sum_k kappa_k' Omega_iov^{-1} kappa_k + K * log|Omega_iov|]
-    let iov_inv = match omega_iov.matrix.clone().cholesky() {
-        Some(chol) => chol.inverse(),
-        None => return 1e20,
-    };
-    let log_det_iov = omega_log_det(omega_iov);
-    let mut kappa_quad = 0.0;
-    for kap in kappas {
-        kappa_quad += kap.dot(&(&iov_inv * kap));
     }
-    let k_occ = kappas.len() as f64;
-
-    foce_term + 0.5 * (kappa_quad + k_occ * log_det_iov)
 }
 
 /// Population FOCE objective with IOV: sum over all subjects using
@@ -1062,6 +1115,97 @@ mod tests {
             "IOV NLL={}, base NLL={}",
             iov,
             base
+        );
+    }
+
+    /// A model whose CL depends on both the BSV eta and the per-occasion
+    /// kappa (`combined[1]`), so the kappa block genuinely enters the
+    /// augmented R̃. The kappa read is defensive so the BSV-only
+    /// `foce_subject_nll` path (which passes a length-1 eta) doesn't panic.
+    fn make_iov_kappa_model() -> CompiledModel {
+        let mut model = make_model();
+        model.pk_param_fn = Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+            let mut p = PkParams::default();
+            let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
+            p.values[0] = theta[0] * (eta[0] + kappa).exp(); // CL
+            p.values[1] = theta[1]; // V
+            p
+        });
+        model
+    }
+
+    /// Issue #101: `foce_subject_nll_iov` must be a proper augmented marginal,
+    /// not a BSV FOCE term plus an additive kappa MAP penalty.
+    #[test]
+    fn test_foce_subject_nll_iov_is_proper_marginal() {
+        let model = make_iov_kappa_model();
+        let subj = make_simple_subject(); // occasions [1,1,1,2,2,2]
+        let theta = vec![5.0, 50.0];
+        let eta_hat = DVector::from_vec(vec![0.1]);
+        let omega_bsv = make_omega(0.09);
+        let sigma = vec![0.05];
+
+        // BSV-only H via central FD of predictions w.r.t. eta[0] at kappa = 0.
+        let n_obs = subj.observations.len();
+        let mut h_bsv = DMatrix::zeros(n_obs, 1);
+        let eps = 1e-6;
+        let pp = model_predictions(&model, &subj, &theta, &[0.1 + eps]);
+        let pm = model_predictions(&model, &subj, &theta, &[0.1 - eps]);
+        for j in 0..n_obs {
+            h_bsv[(j, 0)] = (pp[j] - pm[j]) / (2.0 * eps);
+        }
+
+        // (1) Reduction: zero kappas + Ω_iov → 0 collapses to the BSV-only
+        //     marginal. The OLD code added 0.5·K·log|Ω_iov| = log(1e-12) ≈ -27.6,
+        //     so this assertion fails without the proper-marginal fix.
+        let base = foce_subject_nll(
+            &model, &subj, &theta, &eta_hat, &h_bsv, &omega_bsv, &sigma, false,
+        );
+        let zero_kappas = vec![DVector::zeros(1), DVector::zeros(1)];
+        let reduced = foce_subject_nll_iov(
+            &model,
+            &subj,
+            &theta,
+            &eta_hat,
+            &h_bsv,
+            &omega_bsv,
+            &sigma,
+            false,
+            &zero_kappas,
+            &make_omega(1e-12),
+        );
+        // max_relative (not epsilon): these are O(1e5), and the residual κ-block
+        // contribution at Ω_iov = 1e-12 is ~1e-11 relative. The old additive
+        // penalty would shift by ~27.6 absolute (≈1.5e-4 relative) and fail.
+        approx::assert_relative_eq!(reduced, base, max_relative = 1e-9);
+
+        // (2) The marginal responds to Ω_iov through R̃ (the determinant term
+        //     the old penalty was missing): with non-zero kappas, two different
+        //     Ω_iov give materially different, finite OFVs.
+        let kappas = vec![
+            DVector::from_vec(vec![0.08]),
+            DVector::from_vec(vec![-0.05]),
+        ];
+        let nll = |iov_var: f64| {
+            foce_subject_nll_iov(
+                &model,
+                &subj,
+                &theta,
+                &eta_hat,
+                &h_bsv,
+                &omega_bsv,
+                &sigma,
+                false,
+                &kappas,
+                &make_omega(iov_var),
+            )
+        };
+        let small = nll(0.005);
+        let large = nll(0.5);
+        assert!(small.is_finite() && large.is_finite());
+        assert!(
+            (small - large).abs() > 1e-6,
+            "Ω_iov must change the marginal OFV (small={small}, large={large})"
         );
     }
 

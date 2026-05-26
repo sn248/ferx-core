@@ -114,10 +114,9 @@ fn extract_eta_indices(expr: &Expression) -> Vec<usize> {
 /// `Covariate` identifier), if any. Used to reject `KAPPA_*` references in a
 /// Form C ODE output expression under IOV (issue #107): in the `[scaling]`
 /// parse context the eta scope is BSV-only, so a kappa name there parses as an
-/// unresolved identifier rather than `Eta(i)`. Walks the value-producing tree
-/// (conditional *branches* included; the condition itself is not checked, which
-/// at worst leaves the pre-existing silent behaviour for the rare
-/// kappa-in-output-condition case — never a wrong rejection).
+/// unresolved identifier rather than `Eta(i)`. Walks the whole value-producing
+/// tree, including conditional branches *and* the condition itself, so any
+/// appearance of a kappa name (e.g. `if (KAPPA_CL > 0) ...`) is caught.
 fn expr_references_kappa(expr: &Expression, kappa_names: &[String]) -> Option<String> {
     fn walk(e: &Expression, kappa: &[String]) -> Option<String> {
         match e {
@@ -127,8 +126,19 @@ fn expr_references_kappa(expr: &Expression, kappa_names: &[String]) -> Option<St
             Expression::BinOp(l, _, r) => walk(l, kappa).or_else(|| walk(r, kappa)),
             Expression::UnaryFn(_, a) => walk(a, kappa),
             Expression::Power(b, e) => walk(b, kappa).or_else(|| walk(e, kappa)),
-            Expression::Conditional(_, t, els) => walk(t, kappa).or_else(|| walk(els, kappa)),
+            Expression::Conditional(cond, t, els) => walk_cond(cond, kappa)
+                .or_else(|| walk(t, kappa))
+                .or_else(|| walk(els, kappa)),
             _ => None,
+        }
+    }
+    fn walk_cond(c: &Condition, kappa: &[String]) -> Option<String> {
+        match c {
+            Condition::Compare(l, _, r) => walk(l, kappa).or_else(|| walk(r, kappa)),
+            Condition::And(l, r) | Condition::Or(l, r) => {
+                walk_cond(l, kappa).or_else(|| walk_cond(r, kappa))
+            }
+            Condition::Not(c) => walk_cond(c, kappa),
         }
     }
     walk(expr, kappa_names)
@@ -9029,6 +9039,19 @@ if (1 > 0) {
         let src = iov_ode_model_with_y("y = central / V");
         parse_model_string(&src)
             .expect("Form C output without a direct KAPPA_* reference must parse under IOV");
+    }
+
+    #[test]
+    fn ode_form_c_output_referencing_kappa_in_condition_is_rejected_under_iov() {
+        // KAPPA_* inside a conditional *condition* (not just a branch) must also
+        // be rejected — the guard walks the condition tree (Copilot review #108).
+        let src = iov_ode_model_with_y("y = if (KAPPA_CL > 0) central / V else central / V");
+        let err = parse_model_string(&src)
+            .expect_err("KAPPA_* in a Form C output condition must be rejected under IOV");
+        assert!(
+            err.contains("KAPPA") && err.contains("#107"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

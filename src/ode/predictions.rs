@@ -683,24 +683,9 @@ pub fn ode_predictions_event_driven(
     for (m, &t) in subject.pk_only_times.iter().enumerate() {
         timeline.push((t, Kind::PkOnly, m));
     }
-    // Occasion-aware tie-break for simultaneous events (issue #107), mirroring
-    // the analytical event-driven path: at a shared time an occasion-ending obs
-    // is processed before the next occasion's dose. Reset/PkOnly carry no
-    // occasion (0, sorting first); InfusionEnd uses a sentinel so it still sorts
-    // last. Non-IOV subjects have empty occasion arrays → 0 everywhere → reduces
-    // to the prior `(time, kind)` order.
-    let occ_of = |k: Kind, idx: usize| -> u32 {
-        match k {
-            Kind::Dose => subject.dose_occasions.get(idx).copied().unwrap_or(0),
-            Kind::Obs => subject.occasions.get(idx).copied().unwrap_or(0),
-            Kind::Reset | Kind::PkOnly => 0,
-            Kind::InfusionEnd => u32::MAX,
-        }
-    };
     timeline.sort_by(|a, b| {
         a.0.partial_cmp(&b.0)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| occ_of(a.1, a.2).cmp(&occ_of(b.1, b.2)))
             .then_with(|| kind_order(a.1).cmp(&kind_order(b.1)))
     });
 

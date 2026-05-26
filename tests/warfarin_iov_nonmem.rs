@@ -18,13 +18,13 @@
 //! NONMEM's PRED to 5 significant figures on every row of the dataset,
 //! *including the occasion-2 carryover rows* (e.g. t=120.5: 6.1882; t=124:
 //! 11.761). So the carryover fix is fully validated, and the residual gap is
-//! NOT a prediction or event-ordering difference.
+//! NOT a prediction difference.
 //!
-//! Notably, the simultaneous cross-occasion event ordering (occasion-1 obs and
-//! occasion-2 dose both at t=120) was *also* made NONMEM-faithful — the event
-//! sort now breaks ties by occasion so the [96,120] interval decays with
-//! occasion-1's clearance (issue #107) — but that changed the OFV by only ~0.3
-//! units, confirming it was not the residual.
+//! The simultaneous cross-occasion event ordering (occasion-1 obs and
+//! occasion-2 dose both at t=120) was investigated as a candidate: making the
+//! event sort occasion-aware there changes the OFV by only ~0.3 units, so it is
+//! not the residual and was not pursued (an occasion-aware tie-break would also
+//! need per-event occasion data for EVID=2 records to stay correct — see #107).
 //!
 //! The **residual ≈17 units (~1.7/subject)** is therefore in the FOCE marginal /
 //! EBE machinery: a cross-engine FOCEI difference for this weakly-identified
@@ -134,12 +134,11 @@ fn iov_objective_characterizes_nonmem_gap() {
         .expect("fixed-param IOV objective evaluation must run");
 
     // Characterize the residual gap (~17 units) after the continuous-prediction
-    // fix (issue #104) and the occasion-aware event ordering (issue #107). The
-    // prediction is exact (ferx PRED == NONMEM PRED to 5 s.f.), so this residual
-    // is the FOCE marginal / EBE cross-engine difference, not prediction. ferx
-    // sits BELOW NONMEM. If this band is broken, something changed — a closer
-    // FOCE-marginal match (gap → ~0, tighten/retire) or a regression (gap grew
-    // back toward the old ≈37 carryover gap, or blew up).
+    // fix (issue #104). The prediction is exact (ferx PRED == NONMEM PRED to
+    // 5 s.f.), so this residual is the FOCE marginal / EBE cross-engine
+    // difference, not prediction. ferx sits BELOW NONMEM. If this band is broken,
+    // something changed — a closer FOCE-marginal match (gap → ~0, tighten/retire)
+    // or a regression (gap grew back toward the old ≈37 carryover gap, or blew up).
     let diff = NM_OFV_NO_CONST - result.ofv; // expected ≈ +17
     assert!(
         result.ofv.is_finite() && (8.0..28.0).contains(&diff),

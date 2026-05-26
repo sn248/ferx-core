@@ -149,31 +149,10 @@ impl EventSchedule {
                 orig_idx: r,
             });
         }
-        // Occasion-aware tie-break for simultaneous events (issue #107): at a
-        // shared time an occasion-ending observation must be processed before
-        // the next occasion's dose, so the interval preceding that time decays
-        // with the ending occasion's clearance — matching NONMEM's data-order
-        // record processing. Occasion is read per-event from the IOV arrays;
-        // Reset/PkOnly carry no occasion (0, so they sort first as before, which
-        // also preserves the Reset-before-Dose / EVID=4 ordering). Non-IOV
-        // subjects have empty occasion arrays, so `occ_of` is 0 everywhere and
-        // this reduces exactly to the prior `(time, kind)` order.
-        let occ_of = |ev: &Event| -> u32 {
-            match ev.kind {
-                EventKind::Dose => subject
-                    .dose_occasions
-                    .get(ev.orig_idx)
-                    .copied()
-                    .unwrap_or(0),
-                EventKind::Obs => subject.occasions.get(ev.orig_idx).copied().unwrap_or(0),
-                EventKind::PkOnly | EventKind::Reset => 0,
-            }
-        };
         events.sort_by(|a, b| {
             a.time
                 .partial_cmp(&b.time)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| occ_of(a).cmp(&occ_of(b)))
                 .then_with(|| kind_order(a.kind).cmp(&kind_order(b.kind)))
         });
 

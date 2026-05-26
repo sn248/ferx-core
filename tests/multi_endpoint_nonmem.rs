@@ -16,12 +16,15 @@
 //! 2. `fit_recovers_theta_and_per_cmt_sigma` — a free ferx fit recovers the
 //!    fixed effects and the two per-CMT residual SDs close to NONMEM.
 //!
-//! Known limitation (NOT asserted tightly here): ferx's outer optimizer
-//! under-converges OMEGA on this dataset — it halts ~2.5 OFV units short of its
-//! own objective minimum (the one check #1 confirms NONMEM reaches), leaving
-//! ETA_CL variance near its initial value. Tracked in issue #99; this is an
-//! outer-optimizer conditioning issue, not a per-CMT error-model problem (the
-//! objective in check #1 agrees with NONMEM).
+//! OMEGA recovery (issue #99, fixed): ferx's outer optimizer used to halt
+//! ~2.5 OFV units short of its own objective minimum here, leaving ETA_CL
+//! variance near its 0.09 initial value. Root cause was the `scale_params`
+//! layer (then default-on): dividing each log/Cholesky coordinate by its
+//! magnitude makes the optimizer's unit step a ≈20× multiplicative jump in
+//! TVV, which overshoots and — through the uniform SLSQP gradient cap —
+//! starves the OMEGA step until SLSQP halts on xtol. With `scale_params` now
+//! default-off, the FOCEI fit reaches OMEGA≈0.046, matching NONMEM, so check
+//! #2 below asserts OMEGA tightly.
 //!
 //! ## Reproducing the NONMEM reference
 //!
@@ -144,9 +147,9 @@ fn objective_matches_nonmem_at_reference_params() {
     );
 }
 
-/// A free ferx FOCEI fit recovers the fixed effects and the two per-CMT
-/// residual SDs close to NONMEM. OMEGA is checked only loosely (see the module
-/// note on the outer-optimizer limitation).
+/// A free ferx FOCEI fit recovers the fixed effects, the two per-CMT residual
+/// SDs, and the ETA_CL variance (OMEGA) close to NONMEM. The OMEGA check is the
+/// acceptance criterion for issue #99 (see the module note).
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -213,12 +216,14 @@ fn fit_recovers_theta_and_per_cmt_sigma() {
         NM_SIGMA_ADD_SD
     );
 
-    // OMEGA: loose sanity only. ferx's outer optimizer under-converges this on
-    // the dataset (see module note); assert finite/positive and within a wide
-    // band rather than tight agreement with NONMEM's 0.046.
+    // OMEGA: ETA_CL variance within 15% of NONMEM's 0.0459 (issue #99). The
+    // wider band than theta/sigma reflects that variance components are less
+    // precisely determined; ferx lands at ≈0.046, essentially on NONMEM.
     assert!(
-        r.omega[(0, 0)].is_finite() && r.omega[(0, 0)] > 0.0 && r.omega[(0, 0)] < 0.2,
-        "ETA_CL variance {} should be a sane positive value",
-        r.omega[(0, 0)]
+        rel(r.omega[(0, 0)], NM_OMEGA_CL) < 0.15,
+        "ETA_CL variance {} vs NONMEM {} (rel {:.3})",
+        r.omega[(0, 0)],
+        NM_OMEGA_CL,
+        rel(r.omega[(0, 0)], NM_OMEGA_CL)
     );
 }

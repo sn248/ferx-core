@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-e22b85ff.js";
+            window.path_to_searchindex_js = "../searchindex-6bd29f91.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-39f227ad.js"></script>
@@ -193,6 +193,7 @@
 <p>For each subject, the inner loop finds the empirical Bayes estimate (EBE) of the random effects \( \hat{\eta}_i \) by minimizing the individual negative log-likelihood:</p>
 <p>\[ -\log p(\eta_i | y_i, \theta, \Omega, \sigma) = \frac{1}{2} \left[ \eta_i^T \Omega^{-1} \eta_i + \log|\Omega| + \sum_j \left( \frac{(y_{ij} - f_{ij})^2}{V_{ij}} + \log V_{ij} \right) \right] \]</p>
 <p>The inner loop uses BFGS with automatic differentiation gradients, falling back to Nelder-Mead simplex if BFGS fails.</p>
+<p>If the EBE search wanders into a region where the individual NLL evaluates to a non-finite value (for example, an ODE model whose integration blows up at extreme \( \eta \)), that point is treated as the worst possible objective rather than aborting the fit. The subject is reported as non-converged and estimation continues for the remaining subjects.</p>
 <h2 id="foce-vs-focei"><a class="header" href="#foce-vs-focei">FOCE vs FOCEI</a></h2>
 <h3 id="standard-foce"><a class="header" href="#standard-foce">Standard FOCE</a></h3>
 <p>Uses linearized predictions around the EBEs:</p>

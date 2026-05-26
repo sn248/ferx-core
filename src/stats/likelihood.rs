@@ -163,7 +163,17 @@ pub fn individual_nll_into_with_schedule(
         }
     }
 
-    0.5 * (eta_prior + log_det_omega + data_ll)
+    let nll = 0.5 * (eta_prior + log_det_omega + data_ll);
+    // Guard a non-finite prediction the same way we guard a non-finite Ω above:
+    // an ODE integration can blow up to NaN/inf when the EBE search pushes eta
+    // into an extreme region, which would otherwise poison the inner optimizer
+    // (e.g. the Nelder-Mead simplex sort). Return the large finite sentinel so
+    // the bad point sorts as worst and gets reflected away. See issue #97.
+    if nll.is_finite() {
+        nll
+    } else {
+        1e20
+    }
 }
 
 /// Observation-only NLL for a single subject with ETAs held fixed.
@@ -991,6 +1001,36 @@ mod tests {
         let base = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma);
         let iov = individual_nll_iov(&model, &subj, &theta, &eta, &[], &omega, None, &sigma);
         approx::assert_relative_eq!(base, iov, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_individual_nll_finite_sentinel_on_nonfinite_eta() {
+        // Regression for issue #97: when the EBE search wanders into an extreme
+        // region (here a non-finite eta, standing in for an ODE blow-up), the
+        // NLL must return the large finite sentinel, never a non-finite value.
+        // A NaN/inf leaking out poisons the inner Nelder-Mead simplex sort and
+        // aborts the fit; this guard mirrors the existing non-finite Ω guard.
+        //
+        // Note the analytical PK path scrubs NaN via `.max()`/`.min()`
+        // (`NaN.max(1e-30) == 1e-30`), so the non-finiteness here enters through
+        // the eta-prior term `η'Ω⁻¹η`, which is exactly the quantity the inner
+        // optimizer drives.
+        let model = make_model();
+        let subj = make_simple_subject();
+        let omega = make_omega(0.09);
+        let nll = individual_nll(
+            &model,
+            &subj,
+            &[5.0, 50.0],
+            &[f64::INFINITY],
+            &omega,
+            &[0.05],
+        );
+        assert!(nll.is_finite(), "NLL must stay finite, got {nll}");
+        assert_eq!(
+            nll, 1e20,
+            "a non-finite NLL should map to the 1e20 sentinel"
+        );
     }
 
     #[test]

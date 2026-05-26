@@ -1,3 +1,4 @@
+use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
@@ -225,7 +226,11 @@ fn build_init_params(parsed: &ParsedModel) -> ModelParameters {
 /// Case-sensitive: `CRCL` and `crcl` are distinct names. Historically a missing
 /// covariate silently evaluated to zero, which left fits stuck at the initial
 /// estimates with no visible diagnostic (see commit introducing this check).
-fn validate_covariates(model: &CompiledModel, population: &Population) -> Result<(), String> {
+///
+/// Returns a diagnostic per problem (here, at most one). The message text is
+/// kept byte-for-byte identical to the historical `Err(String)` so `fit()`'s
+/// error — produced via [`first_error`] — is unchanged.
+fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     let missing: Vec<&str> = model
         .referenced_covariates
         .iter()
@@ -234,7 +239,7 @@ fn validate_covariates(model: &CompiledModel, population: &Population) -> Result
         .collect();
 
     if missing.is_empty() {
-        return Ok(());
+        return Vec::new();
     }
 
     let available = if population.covariate_names.is_empty() {
@@ -242,12 +247,375 @@ fn validate_covariates(model: &CompiledModel, population: &Population) -> Result
     } else {
         population.covariate_names.join(", ")
     };
-    Err(format!(
-        "Model references covariate(s) not found in data (case-sensitive): {}. \
-         Available covariate columns: {}.",
-        missing.join(", "),
-        available
-    ))
+    vec![Diagnostic::error(
+        "E_MISSING_COVARIATE",
+        format!(
+            "Model references covariate(s) not found in data (case-sensitive): {}. \
+             Available covariate columns: {}.",
+            missing.join(", "),
+            available
+        ),
+    )
+    .with_suggestion(format!("available covariate columns: {}", available))]
+}
+
+/// Per-CMT scaling needs every observed CMT to have an entry in the
+/// `ScalingSpec::PerCmt` / `OdeReadout::PerCmt` map. Wraps the existing
+/// `pk::validate_per_cmt_scaling` (which the parser can't run — it doesn't see
+/// the data), preserving its message verbatim.
+fn check_per_cmt_scaling(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    match pk::validate_per_cmt_scaling(model, &population.subjects) {
+        Ok(()) => Vec::new(),
+        Err(msg) => vec![Diagnostic::error("E_PER_CMT_SCALING", msg).with_block("scaling")],
+    }
+}
+
+/// Per-CMT (multi-endpoint) error models: every observed CMT must have a
+/// matching `CMT=N:` entry in `[error_model]`.
+fn check_per_cmt_error_model(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let crate::types::ErrorSpec::PerCmt(map) = &model.error_spec else {
+        return Vec::new();
+    };
+    use std::collections::BTreeSet;
+    let mut missing = BTreeSet::new();
+    for subj in &population.subjects {
+        for &cmt in &subj.obs_cmts {
+            if !map.contains_key(&cmt) {
+                missing.insert(cmt);
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    let list = missing
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![Diagnostic::error(
+        "E_PER_CMT_ERROR_MODEL",
+        format!(
+            "[error_model] has no entry for observed compartment(s) {}; \
+             add a `CMT=N: DV ~ ...` line for each observed CMT.",
+            list
+        ),
+    )
+    .with_block("error_model")]
+}
+
+/// All data-dependent *fatal* compatibility checks between a compiled model and
+/// a dataset, collected into one diagnostic list. Shared by `fit()` (which
+/// stops at the first error via [`first_error`]) and `ferx check` (which
+/// reports every finding). Check order matches the historical inline order in
+/// `fit()` so the first error is unchanged: covariates, scaling, error model.
+pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let mut diags = check_covariates(model, population);
+    diags.extend(check_per_cmt_scaling(model, population));
+    diags.extend(check_per_cmt_error_model(model, population));
+    diags
+}
+
+/// Model + estimation-option *compatibility* checks that don't depend on data:
+/// estimation method vs an SDE (`[diffusion]`) model, IMP chain placement, and
+/// optimizer vs IOV. These mirror the guards at the top of `fit_inner`, so a
+/// clean `ferx check` and a `fit()` agree on which method/model combinations are
+/// rejected (rather than reporting `valid: true` and then failing at fit time).
+/// `fit_inner` consumes these via [`first_error`]; message text is identical to
+/// the historical inline guards. Check order matches `fit_inner` so the first
+/// error is unchanged.
+pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<Diagnostic> {
+    let chain = options.method_chain();
+    let mut diags = Vec::new();
+
+    // SDE ([diffusion]) is incompatible with SAEM, with the Gauss-Newton
+    // methods, and with the autodiff gradient path (EKF estimation requires
+    // FD-FOCE/FOCEI).
+    if model.is_sde() {
+        if chain.iter().any(|&m| m == EstimationMethod::Saem) {
+            diags.push(
+                Diagnostic::error(
+                    "E_SDE_INCOMPATIBLE",
+                    "method = saem is not compatible with a [diffusion] block. \
+                     SDE / EKF estimation requires FOCE or FOCEI. Use method = foce or method = focei.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid))
+        {
+            diags.push(
+                Diagnostic::error(
+                    "E_SDE_INCOMPATIBLE",
+                    "SDE ([diffusion]) is not supported with method = gn or gn_hybrid. \
+                     Use method = foce or method = focei.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if options.gradient_method == crate::types::GradientMethod::Ad {
+            diags.push(
+                Diagnostic::error(
+                    "E_SDE_INCOMPATIBLE",
+                    "gradient_method = ad is not compatible with a [diffusion] block. \
+                     Set gradient_method = fd (or leave it unset — fd is selected automatically).",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
+    // IMP is a likelihood evaluation, not an estimator: it must follow a
+    // parameter-estimating stage, appear at most once, and be the terminal stage.
+    if chain.iter().any(|&m| m == EstimationMethod::Imp) {
+        if chain.first().copied() == Some(EstimationMethod::Imp) {
+            diags.push(
+                Diagnostic::error(
+                    "E_IMP_CHAIN",
+                    "method `imp` cannot be the first stage in a chain — it consumes \
+                     EBEs and Hessians from a preceding estimator. Try `methods = [focei, imp]` \
+                     or `methods = [saem, imp]`.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        let n_imp = chain
+            .iter()
+            .filter(|&&m| m == EstimationMethod::Imp)
+            .count();
+        if n_imp > 1 {
+            diags.push(
+                Diagnostic::error(
+                    "E_IMP_CHAIN",
+                    "method `imp` may appear at most once in a chain.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if chain.last().copied() != Some(EstimationMethod::Imp) {
+            diags.push(
+                Diagnostic::error(
+                    "E_IMP_CHAIN",
+                    "method `imp` must be the final stage of the chain — placing it mid-chain \
+                     would leave `FitResult.importance_sampling` populated with a log-likelihood \
+                     computed at parameters that the following stage then overwrites. Move `imp` \
+                     to the end.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
+    // The trust-region outer optimizer does not thread kappas through its OFV.
+    if model.n_kappa > 0 && options.optimizer == Optimizer::TrustRegion {
+        diags.push(
+            Diagnostic::error(
+                "E_OPTIMIZER_IOV",
+                "optimizer = trust_region does not support IOV (n_kappa > 0). \
+                 Use optimizer = bobyqa, slsqp, lbfgs, nlopt_lbfgs, mma, or bfgs \
+                 for models with kappa declarations.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
+    diags
+}
+
+/// Data-dependent *warning*-level checks: malformed steady-state rows, EVID=3/4
+/// resets under an SDE model, and a negative typical-value lag time. These are
+/// non-fatal — `fit()` pushes their messages into `FitResult.warnings` and
+/// proceeds; `ferx check` reports them as `Warning` diagnostics. Message text
+/// is identical to the historical inline strings.
+pub fn check_model_data_warnings(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+
+    // SS=1 with II ≤ 0 — the SS branch is gated on `dose.ii > 0`, so the dose
+    // is silently treated as a single (non-SS) dose.
+    let n_ss_bad_ii = population
+        .subjects
+        .iter()
+        .filter(|s| s.doses.iter().any(|d| d.ss && d.ii <= 0.0))
+        .count();
+    if n_ss_bad_ii > 0 {
+        diags.push(Diagnostic::warning(
+            "W_STEADY_STATE_II",
+            format!(
+                "{} subject(s) have SS=1 doses with missing or non-positive II. \
+                 SS predictions require II > 0 — these doses are treated as \
+                 non-SS (no steady-state pre-equilibration). Set II in the \
+                 dataset or remove the SS flag.",
+                n_ss_bad_ii
+            ),
+        ));
+    }
+
+    // SS=1 infusion with T_inf > II — overlapping pulses have no closed form;
+    // the SS pre-equilibration is skipped.
+    let n_ss_overlapping_inf = population
+        .subjects
+        .iter()
+        .filter(|s| {
+            s.doses
+                .iter()
+                .any(|d| d.ss && d.ii > 0.0 && d.rate > 0.0 && d.duration > d.ii)
+        })
+        .count();
+    if n_ss_overlapping_inf > 0 {
+        diags.push(Diagnostic::warning(
+            "W_STEADY_STATE_INFUSION",
+            format!(
+                "{} subject(s) have SS=1 infusions with T_inf > II (overlapping \
+                 pulses). No closed form or pulse-expansion scheme covers this \
+                 case — the SS pre-equilibration is skipped and the dose is \
+                 applied as a single (non-SS) infusion, so the system is not at \
+                 steady state at the dose time. Use a shorter infusion (T_inf \
+                 ≤ II) or remove the SS flag.",
+                n_ss_overlapping_inf
+            ),
+        ));
+    }
+
+    // EVID=3/4 resets are not honoured on the EKF/SDE path.
+    if model.is_sde() {
+        let n_reset_sde = population
+            .subjects
+            .iter()
+            .filter(|s| s.has_resets())
+            .count();
+        if n_reset_sde > 0 {
+            diags.push(Diagnostic::warning(
+                "W_SDE_RESET",
+                format!(
+                    "{} subject(s) have EVID=3/4 reset rows with a [diffusion] (SDE) \
+                     model. System resets are not yet honoured on the EKF/SDE path — \
+                     the resets are ignored and compartment amounts carry through. \
+                     Use an ODE or analytical model if resets are required.",
+                    n_reset_sde
+                ),
+            ));
+        }
+    }
+
+    // Negative typical-value lag time at the initial point (eta = 0).
+    if model.has_lagtime() {
+        if let Some(first_subj) = population.subjects.first() {
+            let zero_eta = vec![0.0_f64; model.n_eta];
+            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates);
+            if pk.lagtime() < 0.0 {
+                diags.push(Diagnostic::warning(
+                    "W_NEGATIVE_LAGTIME",
+                    format!(
+                        "Lagtime evaluates to {:.4} (< 0) at the initial typical-value \
+                         point (eta = 0). Negative lagtimes are physically nonsensical \
+                         and are not clamped — consider an exp() or other positive-link \
+                         parameterisation.",
+                        pk.lagtime()
+                    ),
+                ));
+            }
+        }
+    }
+
+    diags
+}
+
+/// Map a free-text parser error string to a single structured [`Diagnostic`].
+/// Recognises the `"Missing [X] block"` shape (→ `E_MISSING_BLOCK`, with the
+/// block name attached) and the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`);
+/// everything else is a generic `E_PARSE`.
+fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
+    if let Some(rest) = err.strip_prefix("Missing [") {
+        if let Some(end) = rest.find(']') {
+            let block = &rest[..end];
+            return Diagnostic::error("E_MISSING_BLOCK", err.to_string()).with_block(block);
+        }
+    }
+    if err.contains("[covariate_nn]") && err.contains("--features nn") {
+        return Diagnostic::error("E_NN_FEATURE_DISABLED", err.to_string())
+            .with_block("covariate_nn");
+    }
+    Diagnostic::error("E_PARSE", err.to_string())
+}
+
+/// Validate a model file (and optionally a dataset) **without fitting**.
+///
+/// Runs the parser plus every data-independent and data-dependent check,
+/// collecting *all* findings into a [`CheckReport`] (rather than stopping at the
+/// first, as `fit()` does). This is the engine behind the `ferx check` CLI
+/// command and is the fast `author → diagnose → fix` loop for tools and agents.
+///
+/// When `data_path` is `None`, only parse/structural and model/option
+/// compatibility validation runs (no data is read). When it is `Some`, the CSV
+/// is read and the covariate / per-CMT / steady-state / lag-time checks run as
+/// well.
+pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport {
+    use crate::parser::model_parser::parse_full_model_file;
+
+    let model_name = Path::new(model_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model")
+        .to_string();
+    let data = data_path.map(|s| s.to_string());
+
+    // 1. Parse. A parse failure is terminal — without an AST there is nothing
+    //    further to validate, so return a report carrying just that diagnostic.
+    let parsed = match parse_full_model_file(Path::new(model_path)) {
+        Ok(p) => p,
+        Err(e) => {
+            return CheckReport::new(model_name, data, vec![parse_error_to_diagnostic(&e)]);
+        }
+    };
+
+    let mut diags: Vec<Diagnostic> = Vec::new();
+
+    // 2. Model / estimation-option compatibility (data-independent): catches
+    //    method/model combinations that `fit()` rejects before fitting, so a
+    //    clean check and a fit agree. Uses the parsed `[fit_options]`, mirroring
+    //    what the CLI fit path (`run_model_with_data`) passes to `fit()`.
+    diags.extend(check_model_options(&parsed.model, &parsed.fit_options));
+
+    // 3. Data-dependent checks (only when a dataset is supplied).
+    if let Some(path) = data_path {
+        let iov_col = parsed.fit_options.iov_column.as_deref();
+        match read_nonmem_csv(Path::new(path), None, iov_col) {
+            Ok(population) => {
+                diags.extend(check_model_data(&parsed.model, &population));
+                let init_params = parsed.model.default_params.clone();
+                diags.extend(check_model_data_warnings(
+                    &parsed.model,
+                    &population,
+                    &init_params,
+                ));
+            }
+            Err(e) => {
+                diags.push(Diagnostic::error(
+                    "E_DATA",
+                    format!("Failed to read data file '{}': {}", path, e),
+                ));
+            }
+        }
+    }
+
+    // 4. Attach block-level line numbers to any diagnostic that named a block.
+    for d in &mut diags {
+        if d.line.is_none() {
+            if let Some(block) = &d.block {
+                if let Some(&ln) = parsed.block_lines.get(block) {
+                    d.line = Some(ln);
+                }
+            }
+        }
+    }
+
+    CheckReport::new(model_name, data, diags)
 }
 
 /// High-level fit: model file path + data file path → FitResult
@@ -326,36 +694,12 @@ pub fn fit(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
-    validate_covariates(model, population)?;
-    // Per-CMT scaling needs every observed CMT to have an entry in the
-    // `ScalingSpec::PerCmt` / `OdeReadout::PerCmt` map. The parser can't
-    // check this — it doesn't see the data — so fire here at fit time.
-    pk::validate_per_cmt_scaling(model, &population.subjects)?;
-    // Same idea for per-CMT (multi-endpoint) error models: every observed CMT
-    // must have a matching `CMT=N:` entry in `[error_model]`.
-    if let crate::types::ErrorSpec::PerCmt(map) = &model.error_spec {
-        use std::collections::BTreeSet;
-        let mut missing = BTreeSet::new();
-        for subj in &population.subjects {
-            for &cmt in &subj.obs_cmts {
-                if !map.contains_key(&cmt) {
-                    missing.insert(cmt);
-                }
-            }
-        }
-        if !missing.is_empty() {
-            let list = missing
-                .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "[error_model] has no entry for observed compartment(s) {}; \
-                 add a `CMT=N: DV ~ ...` line for each observed CMT.",
-                list
-            ));
-        }
-    }
+    // Data-dependent fatal checks (covariates present, per-CMT scaling and
+    // per-CMT error-model coverage). These can't run in the parser — it doesn't
+    // see the data. `ferx check` runs the same `check_model_data` to report
+    // every finding; here we stop at the first error to preserve fit()'s
+    // historical fail-fast behavior and exact error strings.
+    first_error(&check_model_data(model, population))?;
     // If any subject has per-event covariate snapshots that don't carry
     // a variation in covariates the model actually references (e.g.
     // DAY / STIME columns in NONMEM-format datasets), clear those
@@ -584,94 +928,15 @@ fn fit_inner(
         );
     }
 
-    // Guard: SDE ([diffusion] block) is incompatible with SAEM and with the
-    // autodiff gradient path. Fail/warn early so users get a clear message
-    // rather than a silent wrong result.
-    if model.is_sde() {
-        // Note: a per-CMT (multi-endpoint) error model cannot reach the EKF
-        // path. Observing multiple compartments requires a Form C `y[CMT=N]`
-        // readout, which the parser already rejects on SDE models, so an SDE
-        // model is always single-endpoint here. The EKF residual-variance
-        // assumption (`ErrorSpec::Single`) is therefore safe — see the comment
-        // at the EKF call site in stats/likelihood.rs.
-        if chain.iter().any(|&m| m == EstimationMethod::Saem) {
-            return Err(
-                "method = saem is not compatible with a [diffusion] block. \
-                 SDE / EKF estimation requires FOCE or FOCEI. Use method = foce or method = focei."
-                    .to_string(),
-            );
-        }
-        if chain
-            .iter()
-            .any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid))
-        {
-            return Err(
-                "SDE ([diffusion]) is not supported with method = gn or gn_hybrid. \
-                 Use method = foce or method = focei."
-                    .to_string(),
-            );
-        }
-        if options.gradient_method == crate::types::GradientMethod::Ad {
-            return Err(
-                "gradient_method = ad is not compatible with a [diffusion] block. \
-                 Set gradient_method = fd (or leave it unset — fd is selected automatically)."
-                    .to_string(),
-            );
-        }
-        // Auto-mode: force FD silently (the inner loop detects this via
-        // model.gradient_method which the parser will have set to Fd; if
-        // somehow Auto slipped through, enforce it here).
-        if options.gradient_method == crate::types::GradientMethod::Auto {
-            // Nothing to do — the parser enforces Fd when diffusion is present.
-            // This comment is a reminder that Auto on SDE models is safe only
-            // because the ODE path already falls back to Fd in the inner loop.
-        }
-    }
-
-    // Guard: IMP is a likelihood evaluation, not an estimator. It must follow
-    // a parameter-estimating stage (it consumes that stage's EBEs + Hessians),
-    // may appear at most once, and must be the terminal stage. A non-terminal
-    // IMP would leave `FitResult.importance_sampling` populated with an IS-LL
-    // computed at parameters that the following stage then overwrites.
-    if chain.iter().any(|&m| m == EstimationMethod::Imp) {
-        if chain.first().copied() == Some(EstimationMethod::Imp) {
-            return Err(
-                "method `imp` cannot be the first stage in a chain — it consumes \
-                 EBEs and Hessians from a preceding estimator. Try `methods = [focei, imp]` \
-                 or `methods = [saem, imp]`."
-                    .to_string(),
-            );
-        }
-        let n_imp = chain
-            .iter()
-            .filter(|&&m| m == EstimationMethod::Imp)
-            .count();
-        if n_imp > 1 {
-            return Err("method `imp` may appear at most once in a chain.".to_string());
-        }
-        if chain.last().copied() != Some(EstimationMethod::Imp) {
-            return Err(
-                "method `imp` must be the final stage of the chain — placing it mid-chain \
-                 would leave `FitResult.importance_sampling` populated with a log-likelihood \
-                 computed at parameters that the following stage then overwrites. Move `imp` \
-                 to the end."
-                    .to_string(),
-            );
-        }
-    }
-
-    // Guard: the trust-region outer optimizer does not yet thread kappas through
-    // its OFV evaluation (see trust_region.rs::FoceiProblem::ofv_fixed which
-    // passes &[] for kappas). Running it on an IOV model would silently produce
-    // a wrong OFV. Fail early until the trust-region path supports IOV.
-    if model.n_kappa > 0 && options.optimizer == Optimizer::TrustRegion {
-        return Err(
-            "optimizer = trust_region does not support IOV (n_kappa > 0). \
-             Use optimizer = bobyqa, slsqp, lbfgs, nlopt_lbfgs, mma, or bfgs \
-             for models with kappa declarations."
-                .to_string(),
-        );
-    }
+    // Model / estimation-option compatibility guards: SDE vs SAEM / GN / AD,
+    // IMP chain placement, and trust-region vs IOV. Extracted into
+    // `check_model_options` so `ferx check` reports the same incompatibilities;
+    // here we stop at the first error to preserve fail-fast behavior and exact
+    // error strings. (Per-CMT error models cannot reach the EKF path — the
+    // parser rejects Form C `y[CMT=N]` readouts on SDE models — so an SDE model
+    // is always single-endpoint here, which the EKF residual-variance
+    // assumption in stats/likelihood.rs relies on.)
+    first_error(&check_model_options(model, options))?;
 
     // Pre-compute n_params (uses init_params, available before chain runs).
     let fixed_mask = crate::estimation::parameterization::packed_fixed_mask(init_params);
@@ -706,94 +971,13 @@ fn fit_inner(
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
-    // Steady-state (SS=1) data validation. SS is now supported on every
-    // prediction path: analytical (PR #75 for 1-cpt, #77 for 2-/3-cpt),
-    // ODE-based (numerical pre-equilibration via per-cycle pulse expansion
-    // in `equilibrate_ss_state`), and event-driven (TV-cov; analytical
-    // pulse expansion in `equilibrate_ss_state_event_driven`). The
-    // remaining warnings catch malformed SS rows where the prediction
-    // code can't honour the SS semantic and instead falls back to
-    // treating the dose as if SS=0:
-    //   - SS=1 with II ≤ 0 (missing/invalid interval — SS branch is gated
-    //     on `dose.ii > 0`, so the dose is treated as a single dose)
-    //   - SS=1 infusion with T_inf > II (overlapping pulses — no closed
-    //     form or equilibration scheme; the equilibration call returns
-    //     zero preload, then the dose is applied as a single infusion)
-    let n_ss_bad_ii = population
-        .subjects
-        .iter()
-        .filter(|s| s.doses.iter().any(|d| d.ss && d.ii <= 0.0))
-        .count();
-    if n_ss_bad_ii > 0 {
-        accumulated_warnings.push(format!(
-            "{} subject(s) have SS=1 doses with missing or non-positive II. \
-             SS predictions require II > 0 — these doses are treated as \
-             non-SS (no steady-state pre-equilibration). Set II in the \
-             dataset or remove the SS flag.",
-            n_ss_bad_ii
-        ));
-    }
-    let n_ss_overlapping_inf = population
-        .subjects
-        .iter()
-        .filter(|s| {
-            s.doses
-                .iter()
-                .any(|d| d.ss && d.ii > 0.0 && d.rate > 0.0 && d.duration > d.ii)
-        })
-        .count();
-    if n_ss_overlapping_inf > 0 {
-        accumulated_warnings.push(format!(
-            "{} subject(s) have SS=1 infusions with T_inf > II (overlapping \
-             pulses). No closed form or pulse-expansion scheme covers this \
-             case — the SS pre-equilibration is skipped and the dose is \
-             applied as a single (non-SS) infusion, so the system is not at \
-             steady state at the dose time. Use a shorter infusion (T_inf \
-             ≤ II) or remove the SS flag.",
-            n_ss_overlapping_inf
-        ));
-    }
-
-    // System resets (EVID=3/4) are honoured on the analytical and ODE
-    // prediction paths, but not yet on the EKF/SDE path (`ode_predictions_ekf`
-    // builds its own timeline without a reset event). Warn rather than
-    // silently ignore the resets for SDE models.
-    if model.is_sde() {
-        let n_reset_sde = population
-            .subjects
-            .iter()
-            .filter(|s| s.has_resets())
-            .count();
-        if n_reset_sde > 0 {
-            accumulated_warnings.push(format!(
-                "{} subject(s) have EVID=3/4 reset rows with a [diffusion] (SDE) \
-                 model. System resets are not yet honoured on the EKF/SDE path — \
-                 the resets are ignored and compartment amounts carry through. \
-                 Use an ODE or analytical model if resets are required.",
-                n_reset_sde
-            ));
-        }
-    }
-
-    // Lagtime: probe at the initial typical-value point (eta = 0, mean
-    // covariates). Cheap — one pk_param_fn call per population. Starting
-    // with a negative typical-value lagtime usually signals a
-    // misparameterisation (e.g. an additive `LAGTIME = TVLAG + ETA_LAG`
-    // instead of a multiplicative `TVLAG * exp(ETA_LAG)`).
-    if model.has_lagtime() {
-        if let Some(first_subj) = population.subjects.first() {
-            let zero_eta = vec![0.0_f64; model.n_eta];
-            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates);
-            if pk.lagtime() < 0.0 {
-                accumulated_warnings.push(format!(
-                    "Lagtime evaluates to {:.4} (< 0) at the initial typical-value \
-                     point (eta = 0). Negative lagtimes are physically nonsensical \
-                     and are not clamped — consider an exp() or other positive-link \
-                     parameterisation.",
-                    pk.lagtime()
-                ));
-            }
-        }
+    // Data-dependent warnings: malformed steady-state rows, EVID=3/4 resets
+    // under an SDE model, and a negative typical-value lag time. Extracted into
+    // `check_model_data_warnings` so `ferx check` reports the same findings;
+    // message text is unchanged. Probed against `population` (not the pruned
+    // copy) and `init_params`, matching the historical inline checks.
+    for d in check_model_data_warnings(model, population, init_params) {
+        accumulated_warnings.push(d.message);
     }
     if options.run_covariance_step && n_params_pre > 30 {
         if let Some(n_evals) = covariance_n_evals_estimated {
@@ -2446,6 +2630,26 @@ mod iov_integration {
             msg.contains("trust_region") && msg.contains("IOV"),
             "error message should mention trust_region and IOV, got: {msg}"
         );
+    }
+
+    // `ferx check` must surface the same trust_region+IOV incompatibility that
+    // `fit()` rejects — without it, a model could report `valid: true` and then
+    // fail at fit time. `check_model_options` is the shared source of truth.
+    #[test]
+    fn test_check_model_options_flags_trust_region_iov() {
+        let model = make_iov_model();
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::TrustRegion, false);
+        let diags = super::check_model_options(&model, &opts);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_OPTIMIZER_IOV")
+            .expect("expected E_OPTIMIZER_IOV diagnostic");
+        // Same wording fit() produces (regression against the extracted guard).
+        assert!(d.message.contains("trust_region") && d.message.contains("IOV"));
+
+        // A compatible optimizer produces no compatibility diagnostics.
+        let ok_opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        assert!(super::check_model_options(&model, &ok_opts).is_empty());
     }
 }
 

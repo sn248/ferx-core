@@ -29,6 +29,7 @@
 - [CLI Reference](cli.md)
 - [Output Files](output.md)
 - [File Formats](file-formats/fitrx.md)
+  - [Check Report (`ferx check`)](file-formats/check-report.md)
 - [Examples](examples/README.md)
   - [One-Compartment Oral](examples/one-cpt-oral.md)
   - [Two-Compartment IV](examples/two-cpt-iv.md)

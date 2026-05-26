@@ -2019,6 +2019,11 @@ pub struct ParsedModel {
     pub model: CompiledModel,
     pub simulation: Option<SimulationSpec>,
     pub fit_options: FitOptions,
+    /// 1-based source line of each unnamed `[block]` header, keyed by the
+    /// lowercased block type (e.g. `"individual_parameters" -> 7`). Used by
+    /// `ferx check` to attach a block-level location to diagnostics. Empty when
+    /// a model is constructed programmatically rather than parsed from text.
+    pub block_lines: std::collections::HashMap<String, usize>,
 }
 
 /// Factories that build minimal `CompiledModel` instances for unit tests.

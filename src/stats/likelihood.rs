@@ -610,17 +610,20 @@ pub fn foce_subject_nll_iov(
             h_full[(j, c)] = h_matrix[(j, c)];
         }
     }
+    // Reused κ buffer: perturb one element in place and restore it, rather than
+    // cloning all occasions' κ twice per FD step.
+    let mut kpert = kappa_slices.clone();
     const EPS: f64 = 1e-6;
     for k in 0..k_occ {
         let col_base = n_eta + k * n_iov;
         for ki in 0..n_iov {
-            let step = EPS * (1.0 + kappa_slices[k][ki].abs());
-            let mut kp = kappa_slices.clone();
-            let mut km = kappa_slices.clone();
-            kp[k][ki] += step;
-            km[k][ki] -= step;
-            let preds_plus = pk::predict_iov(model, subject, theta, eta_hat.as_slice(), &kp);
-            let preds_minus = pk::predict_iov(model, subject, theta, eta_hat.as_slice(), &km);
+            let orig = kpert[k][ki];
+            let step = EPS * (1.0 + orig.abs());
+            kpert[k][ki] = orig + step;
+            let preds_plus = pk::predict_iov(model, subject, theta, eta_hat.as_slice(), &kpert);
+            kpert[k][ki] = orig - step;
+            let preds_minus = pk::predict_iov(model, subject, theta, eta_hat.as_slice(), &kpert);
+            kpert[k][ki] = orig;
             let inv_2step = 1.0 / (2.0 * step);
             for j in 0..n_obs {
                 h_full[(j, col_base + ki)] = (preds_plus[j] - preds_minus[j]) * inv_2step;

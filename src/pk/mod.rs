@@ -265,6 +265,16 @@ pub fn compute_event_pk_params_into(
 ///
 /// Falls back to Option-A superposition only for models with neither an ODE
 /// spec nor event-driven analytical support (none of the current `PkModel`s).
+///
+/// **Occasion-dependent PK dynamics are exact**: per-event params carry the
+/// occasion κ, so CL/V/KA switch correctly across occasions. `[scaling]` is also
+/// applied per occasion (see the call site). One narrow limitation remains: for
+/// ODE models a Form C output expression (`y = <expr>`) is evaluated inside the
+/// ODE solver with a single `eta` (BSV + zero κ), so an output expression that
+/// references `KAPPA_*` directly sees κ=0. The PK state itself is still
+/// occasion-correct (it flows through the per-event params); only a κ-referencing
+/// *readout* is affected. Threading per-event κ into the ODE output readout is
+/// future work.
 pub fn predict_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -331,10 +341,23 @@ pub fn predict_iov(
         return predict_iov_option_a(model, subject, theta, eta_bsv, kappas);
     };
 
-    // `[scaling]` post-multiply (no-op for ScalingSpec::None). Evaluated with
-    // BSV eta + zero kappa — scale expressions reference thetas/covariates, not
-    // per-occasion kappas.
-    apply_scaling(model, subject, theta, &pk_only_combined, &mut preds);
+    // `[scaling]` post-multiply, applied **per occasion** so a κ-dependent scale
+    // (or a scale referencing a κ-dependent individual parameter) uses that
+    // occasion's κ — matching the per-occasion prediction. `apply_scaling`
+    // short-circuits on `ScalingSpec::None`, so the common case stays a cheap
+    // no-op. (Form C ODE output `y = <expr>` is applied inside the ODE solver,
+    // not here; see the note below for the κ=0 limitation there.)
+    if !matches!(model.scaling, ScalingSpec::None) {
+        let raw = preds.clone();
+        for (occ_id, obs_indices) in &occ_groups {
+            let combined = combined_for(*occ_id);
+            let mut scaled = raw.clone();
+            apply_scaling(model, subject, theta, &combined, &mut scaled);
+            for &j in obs_indices {
+                preds[j] = scaled[j];
+            }
+        }
+    }
     preds
 }
 

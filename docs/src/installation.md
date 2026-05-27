@@ -93,7 +93,7 @@ rustc +enzyme --version --verbose
 
 `--set llvm.download-ci-llvm=false` is the critical flag: by default the Rust build downloads a prebuilt "CI" LLVM, which Enzyme cannot attach to. Forcing a from-source LLVM is what makes the toolchain actually work.
 
-> The stage-1 toolchain has no `cargo` of its own; that's fine. `cargo` comes from the `nightly` you installed in step 1, and rustup falls back to it automatically. A `"cargo is unavailable for the active toolchain"` *info* line is harmless.
+> The stage-1 toolchain bundles only `rustc` — no `cargo`, `rustfmt`, or `clippy`. That's fine for building: `cargo` comes from the `nightly` you installed in step 1 and rustup falls back to it automatically (a `"cargo is unavailable for the active toolchain"` *info* line is harmless). But because `rustfmt`/`clippy` are absent, run those on nightly explicitly — `cargo +nightly fmt`, `cargo +nightly clippy --no-default-features --features ci`. In particular the repo's pre-commit hook runs `cargo fmt` and will **fail under the `enzyme` pin** unless you format on nightly first (or commit with `--no-verify` for non-Rust changes).
 
 ## 4. Verify the toolchain
 
@@ -123,12 +123,36 @@ rustc +enzyme -Zautodiff=Enable -Clto=fat -Copt-level=2 /tmp/ad_check.rs -o /tmp
 
 Expected: the compile finishes **in a few seconds** and prints `autodiff OK: f=22.3355, df/dx=43.1711`. If `rustc` instead **hangs** (pins a core at 100% CPU and never returns), your toolchain has the LLVM/Enzyme mismatch described in the warning at the top — rebuild from source with `--set llvm.download-ci-llvm=false`.
 
-### Multi-user servers
+### Make the toolchain permanent
 
-Stage the built toolchain in `/opt/enzyme-toolchain` so all users share one build:
+The clone lives in `/tmp/rust-src`, and `rustup toolchain link enzyme build/host/stage1` points the `enzyme` toolchain *into* that tree. macOS periodically purges `/tmp`, which would silently break the toolchain. Relocate the stage-1 build (~640 MB once pruned) to a permanent path and re-link:
 
 ```bash
-sudo cp -a /tmp/rust-src/build/host/stage1 /opt/enzyme-toolchain
+# Copy, dereferencing the LLVM/Enzyme dylib symlinks into real files (-L):
+cp -aL /tmp/rust-src/build/host/stage1 ~/.local/share/enzyme-toolchain
+
+# cp prints a few "directory causes a cycle" warnings for the bundled rust
+# source tree — harmless. Prune it (it's only for IDE source browsing, not
+# building) so the copy stays ~640 MB instead of ballooning to ~30 GB:
+rm -rf ~/.local/share/enzyme-toolchain/lib/rustlib/rustc-src \
+       ~/.local/share/enzyme-toolchain/lib/rustlib/src
+
+rustup toolchain uninstall enzyme
+rustup toolchain link enzyme ~/.local/share/enzyme-toolchain
+
+# Re-run the verification above against the new path, then reclaim ~8 GB:
+rm -rf /tmp/rust-src
+```
+
+The `-L` is required: the dylibs inside `stage1` are symlinks into the build tree, so plain `cp -a` would leave them dangling once `/tmp/rust-src` is deleted. The prune is required because `-L` otherwise dereferences the source-tree symlinks (which also contain a build-dir cycle) and bloats the copy to ~30 GB.
+
+### Multi-user servers
+
+Stage the built toolchain in `/opt/enzyme-toolchain` so all users share one build (same `cp -aL` + prune as above — `-L` to materialize the dylib symlinks, prune to avoid the ~30 GB source-tree blowup):
+
+```bash
+sudo cp -aL /tmp/rust-src/build/host/stage1 /opt/enzyme-toolchain
+sudo rm -rf /opt/enzyme-toolchain/lib/rustlib/rustc-src /opt/enzyme-toolchain/lib/rustlib/src
 sudo chown -R root:root /opt/enzyme-toolchain
 sudo chmod -R a+rX /opt/enzyme-toolchain
 ```

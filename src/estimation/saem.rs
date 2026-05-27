@@ -1579,7 +1579,7 @@ pub fn run_saem(
 
             if verbose && (k == 1 || k % 50 == 0 || k == n_iter) {
                 eprintln!(
-                    "  SAEM iter {:>4}/{} [{}] gamma={:.3}  condNLL={:.3}",
+                    "  SAEM iter {:>4}/{} [{}] γ={:.3}  condNLL={:.3}",
                     k, n_iter, phase, gamma, cond_nll
                 );
             }

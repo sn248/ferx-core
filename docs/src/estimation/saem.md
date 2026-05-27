@@ -174,12 +174,32 @@ The SAEM iteration progress is printed to stderr:
 
 ```
 SAEM: 10 subjects, 3 ETAs, 400 total iter (150 explore + 250 converge)
-  SAEM iter    1/400 [explore] gamma=1.000  condNLL=95.244
-  SAEM iter   50/400 [explore] gamma=1.000  condNLL=56.705
-  SAEM iter  150/400 [explore] gamma=1.000  condNLL=46.071
-  SAEM iter  200/400 [converge] gamma=0.020  condNLL=36.799
-  SAEM iter  400/400 [converge] gamma=0.004  condNLL=38.096
+  SAEM iter    1/400 [explore] γ=1.000  condNLL=95.244
+  SAEM iter   50/400 [explore] γ=1.000  condNLL=56.705
+  SAEM iter  150/400 [explore] γ=1.000  condNLL=46.071
+  SAEM iter  200/400 [converge] γ=0.020  condNLL=36.799
+  SAEM iter  400/400 [converge] γ=0.004  condNLL=38.096
 SAEM iterations complete. Computing final EBEs and OFV...
+SAEM completed. Final OFV = ...
 ```
 
-The `condNLL` is the conditional observation negative log-likelihood (not the final OFV). It should generally decrease during the exploration phase and stabilize during convergence.
+### Why `γ` (gamma) is shown
+
+\\( \gamma_k \\) is the **stochastic-approximation step size**, not a model quantity — it is intrinsic to the SAEM algorithm and tells you which phase the run is in and how aggressively the estimates are still moving:
+
+- **Exploration** (`[explore]`, \\( k \le K_1 \\)): \\( \gamma_k = 1 \\). Each iteration fully replaces the running sufficient statistics, so the chain roams freely toward the basin of the MLE.
+- **Convergence** (`[converge]`, \\( k > K_1 \\)): \\( \gamma_k = 1/(k - K_1) \\) decays toward zero. Updates shrink into a decreasing-weight average that damps the Monte-Carlo noise so the estimates settle. The printed value (e.g. `0.020`, `0.004`) is exactly this decaying weight applied to the Ω, θ, and σ updates each iteration.
+
+### Why `condNLL` and not `OFV`
+
+During the iterations ferx prints `condNLL`, the **conditional** (joint) negative log-likelihood summed over subjects, evaluated at the *current MH/HMC-sampled* etas:
+
+\\[ \text{condNLL} = \sum_{i=1}^{N} \text{NLL}(\eta_i^{\text{sampled}}) \\]
+
+This is a cheap per-iteration progress signal. It is **not** the marginal objective function value (OFV): it is evaluated at one stochastic draw of the random effects rather than integrated over their distribution, so unlike the FOCE/FOCEI outer-loop OFV it is noisy, will not decrease monotonically, and is **not comparable across runs** for model selection.
+
+The true marginal **OFV** (\\( -2 \log L \\) via the Laplace approximation, directly comparable with FOCE for AIC/BIC) is expensive and is therefore computed only once, after the iterations finish — this is the `Final OFV = ...` line. See [Post-SAEM Finalization](#post-saem-finalization).
+
+(`NLL` = *negative log-likelihood*, i.e. \\( -\log L \\). NONMEM's `OFV = -2 \log L` is essentially `2 × NLL` plus a constant.)
+
+`condNLL` should generally decrease during the exploration phase and stabilize during convergence.

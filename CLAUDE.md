@@ -68,6 +68,8 @@ These run nightly via `slow-tests.yml` and on any push to `main` that touches es
 
 **Every new feature requires a test** at the appropriate tier. When adding a new parser pattern, fit option, estimator, or any public behaviour, add a corresponding test before considering the change done. Bug fixes should add a regression test that fails without the fix.
 
+**Every new feature requires a comparison with NONMEM output.** When adding an estimator, error model, structural model, or any behaviour that produces numerical results (estimates, OFV, residuals, diagnostics), validate it against equivalent NONMEM output and include the comparison — either in the feature's docs page (e.g. `docs/src/faq.md` or the relevant `docs/src/estimation/*.md`) or in the PR description.
+
 ## Documentation
 
 Docs live in `docs/` as an [mdBook](https://rust-lang.github.io/mdBook/):

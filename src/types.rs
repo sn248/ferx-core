@@ -1670,6 +1670,25 @@ pub struct FitOptions {
     /// model has an analytical PK path (`tv_fn` populated); otherwise falls
     /// back to FD. See [`GradientMethod`] for the full contract.
     pub gradient_method: GradientMethod,
+    /// How often, in gradient evaluations, to re-solve each subject's inner
+    /// EBE loop (η̂ and the FOCE Hessian) during the population gradient
+    /// instead of holding it fixed.
+    ///
+    /// - `0` (default) — never reconverge on non-IOV models: use the cheap
+    ///   fixed-EBE analytical/AD gradient.
+    /// - `1` — reconverge on every gradient evaluation.
+    /// - `N` — reconverge on evals `0, N, 2N, …` and use the cheap fixed-EBE
+    ///   gradient in between.
+    ///
+    /// The reconverged gradient captures the inner-solution response term that
+    /// the fixed-EBE gradient omits — the term whose absence stalls SLSQP well
+    /// above the derivative-free optimum on ill-conditioned non-IOV fits (see
+    /// the `focei-slsqp-fixed-ebe-gradient-bias` note) — at ~5–6× the
+    /// per-gradient cost (the inner loop runs once per perturbed component).
+    /// A larger `N` amortizes that cost while still periodically correcting the
+    /// search direction. IOV models (`n_kappa > 0`) always reconverge and
+    /// ignore this setting.
+    pub reconverge_gradient_interval: usize,
     /// When `true`, write a per-iteration optimizer trace CSV to a temp file
     /// and store its path in `FitResult::trace_path`. Default: `false`.
     pub optimizer_trace: bool,
@@ -1776,6 +1795,7 @@ impl Default for FitOptions {
             cancel: None,
             user_set_keys: Vec::new(),
             gradient_method: GradientMethod::default(),
+            reconverge_gradient_interval: 0,
             optimizer_trace: false,
             scale_params: false,
             max_unconverged_frac: 0.1,
@@ -1976,6 +1996,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "global_search",
             "global_maxeval",
             "stagnation_guard",
+            "reconverge_gradient_interval",
         ],
         EstimationMethod::FoceGn => &["maxiter", "inner_maxiter", "inner_tol", "gn_lambda"],
         EstimationMethod::FoceGnHybrid => &[
@@ -1988,6 +2009,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "global_maxeval",
             "stagnation_guard",
             "gn_lambda",
+            "reconverge_gradient_interval",
         ],
         EstimationMethod::Saem => &[
             "inner_maxiter",

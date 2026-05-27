@@ -149,10 +149,44 @@ The solver automatically adapts step sizes based on local error estimates.
 
 ## Dose Handling
 
-- **Bolus doses**: Applied as instantaneous state changes at dose times. The dose amount is added to the target compartment: `state[cmt] += amt`
-- **Infusion doses** (`RATE > 0`): Treated as a continuous zero-order input. The integrator's timeline is broken at the infusion's end (`time + amt/rate`), and `+rate` is added to the target compartment's derivative for every segment fully spanned by the infusion. Overlapping infusions on the same compartment sum their rates
+- **Bolus doses**: Applied as instantaneous state changes at dose times. The dose amount, scaled by bioavailability, is added to the target compartment: `state[cmt] += F · amt`
+- **Infusion doses** (`RATE > 0`): Treated as a continuous zero-order input. The integrator's timeline is broken at the infusion's end (`time + amt/rate`), and `+F · rate` is added to the target compartment's derivative for every segment fully spanned by the infusion. Overlapping infusions on the same compartment sum their rates
 - **Compartment indexing**: Compartments are 1-indexed in the data file (`CMT=1` corresponds to the first state in the `states` list)
 - **Multiple doses**: The ODE is integrated in segments between dose events, with state discontinuities at each bolus
+
+### Bioavailability
+
+If your `[individual_parameters]` block declares an `F` parameter, the ODE engine
+applies it **when the dose enters the compartment** — the dosing compartment is
+loaded with `F · AMT` (and an infusion rate with `F · RATE`) — exactly like
+NONMEM's `F1` and like ferx's analytical PK functions. Write the depot's
+elimination as the plain `KA · depot` and **do not** multiply by `F` anywhere in
+the right-hand side, or bioavailability is applied twice. `F` defaults to `1.0`
+when not declared, so IV and non-bioavailability models are unaffected.
+
+```text
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = inv_logit(logit(THETA_F) + ETA_F)   # F is applied at dose entry
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - CL/V * central   # no F here
+```
+
+> ⚠️ **Migration note.** Earlier versions of ferx added the *full* dose to the
+> compartment and required `F` to be folded into the absorption flux (e.g.
+> `d/dt(central) = F * KA * depot / V - …`). That `F` must now be removed from
+> the right-hand side — otherwise it is applied both at dose entry **and** in the
+> flux, giving an effective bioavailability of `F²`.
+
+The name `F` (any case) is what flags a parameter as bioavailability and routes
+it to the dosing compartment. If you need a fraction-like quantity inside the
+RHS that is *not* bioavailability, give it a different name.
+
+See `examples/bioavailability_ode.ferx` for a complete worked model.
 
 ## Stochastic ODE Models (SDE)
 

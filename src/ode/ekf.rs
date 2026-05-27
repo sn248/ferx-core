@@ -17,8 +17,9 @@
 //! Only P[obs_cmt, obs_cmt] is returned per observation — the caller adds it
 //! to the residual variance to form V_total.
 
+use crate::ode::predictions::{active_infusions, is_real_infusion};
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
-use crate::types::DoseEvent;
+use crate::types::{DoseEvent, PK_IDX_F};
 use nalgebra::{DMatrix, DVector};
 
 const FD_H: f64 = 1e-5;
@@ -169,6 +170,10 @@ pub fn solve_ekf(
     } else {
         vec![0.0f64; n]
     };
+    // Bioavailability F (slot PK_IDX_F, default 1.0) scales the amount that
+    // enters the dosing compartment — NONMEM's F·AMT (bolus) / F·RATE
+    // (infusion), matching the analytical and plain-ODE paths.
+    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
     let mut p_mat = DMatrix::zeros(n, n);
     let mut results = vec![
         EkfObsPoint {
@@ -189,10 +194,13 @@ pub fn solve_ekf(
     let mut break_times: Vec<f64> = vec![0.0];
     for dose in doses {
         break_times.push(dose.time);
-        if dose.is_infusion() && dose.duration > 0.0 && dose.duration.is_finite() {
+        if is_real_infusion(dose) {
             break_times.push(dose.time + dose.duration);
         }
     }
+    // Bioavailability is constant across doses on the EKF path (no per-dose
+    // time-varying parameters), so the per-dose F slice is uniform.
+    let dose_f_bio = vec![f_bio; doses.len()];
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
@@ -201,14 +209,12 @@ pub fn solve_ekf(
         let t_start = break_times[k];
         let t_end = break_times[k + 1];
 
-        // Apply bolus doses at t_start
+        // Apply bolus doses at t_start (infusions enter via the wrapped RHS).
         for dose in doses {
-            if (dose.time - t_start).abs() < 1e-12
-                && !(dose.is_infusion() && dose.duration > 0.0 && dose.duration.is_finite())
-            {
+            if (dose.time - t_start).abs() < 1e-12 && !is_real_infusion(dose) {
                 let cmt_idx = dose.cmt.saturating_sub(1);
                 if cmt_idx < n {
-                    u[cmt_idx] += dose.amt;
+                    u[cmt_idx] += f_bio * dose.amt;
                 }
             }
         }
@@ -240,18 +246,10 @@ pub fn solve_ekf(
             continue;
         }
 
-        // Active infusion rates for this segment
-        let active: Vec<(usize, f64)> = doses
-            .iter()
-            .filter(|d| {
-                d.is_infusion()
-                    && d.duration > 0.0
-                    && d.duration.is_finite()
-                    && d.time <= t_start + 1e-12
-                    && d.time + d.duration >= t_end - 1e-12
-            })
-            .map(|d| (d.cmt.saturating_sub(1), d.rate))
-            .collect();
+        // Active infusion rates for this segment (shared with the FOCEI ODE
+        // path so the F·RATE / span / lag / reset semantics stay in lockstep).
+        // The EKF path has no per-dose lagtimes and no system resets.
+        let active = active_infusions(doses, t_start, t_end, &[], &dose_f_bio, f64::NEG_INFINITY);
 
         let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
             rhs(y, p, t, dy);
@@ -346,6 +344,10 @@ mod tests {
         let mut p = vec![0.0f64; crate::types::MAX_PK_PARAMS];
         p[crate::types::PK_IDX_CL] = cl;
         p[crate::types::PK_IDX_V] = v;
+        // Default bioavailability to 1.0 (a raw zero-filled vector would set
+        // F = 0, which after issue #122 zeroes every dose and would make
+        // dose-driven comparisons vacuously pass). Mirrors PkParams::default().
+        p[crate::types::PK_IDX_F] = 1.0;
         p
     }
 
@@ -407,6 +409,42 @@ mod tests {
         for (ekf, &ode) in ekf_pts.iter().zip(ode_preds.iter()) {
             assert_relative_eq!(ekf.ipred, ode, epsilon = 1e-4, max_relative = 1e-4);
             assert_relative_eq!(ekf.p_obs, 0.0, epsilon = 1e-10);
+        }
+    }
+
+    /// Issue #122: the EKF dosing path must load the compartment with F·AMT
+    /// (NONMEM convention). For this linear system, halving bioavailability
+    /// halves every ipred.
+    #[test]
+    fn ekf_applies_f_bio_to_bolus_dose() {
+        let obs_times = vec![1.0, 4.0, 8.0, 12.0];
+        let diffusion_var = vec![0.0];
+        let r_obs_vec: Vec<f64> = vec![0.01; obs_times.len()];
+        let doses = vec![bolus_dose(100.0)];
+
+        let mut pk_full = make_pk(5.0, 80.0);
+        pk_full[PK_IDX_F] = 1.0;
+        let mut pk_half = make_pk(5.0, 80.0);
+        pk_half[PK_IDX_F] = 0.5;
+
+        let run = |pk: &[f64]| {
+            solve_ekf(
+                &one_cpt_rhs,
+                1,
+                0,
+                &diffusion_var,
+                pk,
+                &[],
+                &doses,
+                &obs_times,
+                &r_obs_vec,
+            )
+        };
+        let full = run(&pk_full);
+        let half = run(&pk_half);
+        for (f, h) in full.iter().zip(half.iter()) {
+            assert!(f.ipred > 0.0, "expected positive ipred");
+            assert_relative_eq!(h.ipred, 0.5 * f.ipred, epsilon = 1e-9, max_relative = 1e-6);
         }
     }
 

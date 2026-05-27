@@ -8,7 +8,7 @@
 //! derivative for the duration of the infusion via an RHS wrapper.
 
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
-use crate::types::{DoseEvent, PkParams, Subject, PK_IDX_LAGTIME};
+use crate::types::{DoseEvent, PkParams, Subject, PK_IDX_F, PK_IDX_LAGTIME};
 use std::collections::HashMap;
 
 /// Epsilon used to decide whether an infusion fully spans a segment.
@@ -23,7 +23,7 @@ const INFUSION_EPS: f64 = 1e-12;
 /// break that sorts before the dose itself, and NaN would panic the
 /// break-time sort. Such rows fall back to the bolus branch instead
 /// (a zero/negative bolus update — visible, not silently dropped).
-fn is_real_infusion(d: &DoseEvent) -> bool {
+pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
     d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
 }
 
@@ -69,6 +69,12 @@ fn equilibrate_ss_state(
         return u;
     }
 
+    // Bioavailability F (slot PK_IDX_F, default 1.0) scales the amount that
+    // actually enters the dosing compartment — NONMEM's convention (F·AMT for
+    // a bolus, F·RATE for an infusion). Matches the analytical path
+    // (`equilibrate_ss_state_event_driven`).
+    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
+
     let is_inf = is_real_infusion(dose);
     let t_inf = dose.duration;
     if is_inf && t_inf > dose.ii {
@@ -80,7 +86,7 @@ fn equilibrate_ss_state(
         if is_inf {
             // Active-infusion window: wrapped RHS injects rate into the
             // dosing compartment.
-            let rate = dose.rate;
+            let rate = f_bio * dose.rate;
             let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
                 (ode.rhs)(y, p, t, dy);
                 if cmt_idx < dy.len() {
@@ -108,7 +114,7 @@ fn equilibrate_ss_state(
             }
         } else {
             // Bolus pulse + decay for one cycle.
-            u[cmt_idx] += dose.amt;
+            u[cmt_idx] += f_bio * dose.amt;
             let sol = solve_ode(
                 &ode.rhs,
                 &u,
@@ -156,9 +162,12 @@ fn ss_state_at_phase(
     if cmt_idx >= u.len() {
         return u;
     }
+    // Bioavailability scales the amount entering the dosing compartment
+    // (see `equilibrate_ss_state`).
+    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
 
     if is_real_infusion(dose) {
-        let rate = dose.rate;
+        let rate = f_bio * dose.rate;
         let t_inf = dose.duration;
         let active = phase.min(t_inf);
         let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
@@ -186,7 +195,7 @@ fn ss_state_at_phase(
             }
         }
     } else {
-        u[cmt_idx] += dose.amt;
+        u[cmt_idx] += f_bio * dose.amt;
         let sol = solve_ode(&ode.rhs, &u, (0.0, phase), pk_params_flat, &[phase], opts);
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
@@ -202,11 +211,16 @@ fn ss_state_at_phase(
 ///
 /// `dose_lagtimes[k]` shifts dose `k`'s active window. Parallel to `doses`.
 /// An empty slice means "no lagtime" (all zeros).
-fn active_infusions(
+///
+/// `dose_f_bio[k]` is the bioavailability F applied to dose `k`'s infusion rate
+/// (NONMEM's F·RATE convention, mirroring the bolus F·AMT applied at dose
+/// entry). Parallel to `doses`; a missing entry defaults to 1.0.
+pub(crate) fn active_infusions(
     doses: &[DoseEvent],
     t_start: f64,
     t_end: f64,
     dose_lagtimes: &[f64],
+    dose_f_bio: &[f64],
     reset_floor: f64,
 ) -> Vec<(usize, f64)> {
     doses
@@ -221,7 +235,10 @@ fn active_infusions(
                 && d.time + lag <= t_start + INFUSION_EPS
                 && d.time + lag + d.duration >= t_end - INFUSION_EPS
         })
-        .map(|(_, d)| (d.cmt.saturating_sub(1), d.rate))
+        .map(|(k, d)| {
+            let f_bio = dose_f_bio.get(k).copied().unwrap_or(1.0);
+            (d.cmt.saturating_sub(1), f_bio * d.rate)
+        })
         .collect()
 }
 
@@ -387,6 +404,11 @@ pub fn ode_predictions(
     // Per-dose lagtimes for `active_infusions` — uniform for the no-TV
     // path (lagtime is constant across doses).
     let dose_lagtimes: Vec<f64> = vec![lagtime; subject.doses.len()];
+    // Bioavailability F (slot PK_IDX_F, default 1.0) scales the amount that
+    // enters the dosing compartment — NONMEM's F·AMT (bolus) / F·RATE
+    // (infusion). Uniform across doses on the no-TV path.
+    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
+    let dose_f_bio: Vec<f64> = vec![f_bio; subject.doses.len()];
 
     // Build obs_time → indices map. Multiple observations can share a time
     // (e.g. simultaneous PK/PD samples on different CMTs), so each time maps to
@@ -455,7 +477,7 @@ pub fn ode_predictions(
                 // dose.cmt is 1-based; state indices are 0-based
                 let cmt_idx = dose.cmt - 1;
                 if cmt_idx < n {
-                    u[cmt_idx] += dose.amt;
+                    u[cmt_idx] += f_bio * dose.amt;
                 }
             }
         }
@@ -504,6 +526,7 @@ pub fn ode_predictions(
             t_start,
             t_end,
             &dose_lagtimes,
+            &dose_f_bio,
             f64::NEG_INFINITY,
         );
         let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
@@ -670,6 +693,9 @@ pub fn ode_predictions_event_driven(
     }
     // Per-dose lagtimes from the per-event PK snapshot for the dose.
     let dose_lagtimes: Vec<f64> = pk_at_dose.iter().map(|p| p.lagtime()).collect();
+    // Per-dose bioavailability F from the per-event PK snapshot — F may vary
+    // across doses when it depends on time-varying covariates.
+    let dose_f_bio: Vec<f64> = pk_at_dose.iter().map(|p| p.f_bio()).collect();
     for (k, d) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[k];
         timeline.push((d.time + lag, Kind::Dose, k));
@@ -717,8 +743,14 @@ pub fn ode_predictions_event_driven(
         if t_event > cur_t {
             // Wrap the user RHS so any infusion fully spanning
             // [cur_t, t_event] contributes `+rate` to its compartment.
-            let active =
-                active_infusions(&subject.doses, cur_t, t_event, &dose_lagtimes, reset_floor);
+            let active = active_infusions(
+                &subject.doses,
+                cur_t,
+                t_event,
+                &dose_lagtimes,
+                &dose_f_bio,
+                reset_floor,
+            );
             let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
                 (ode.rhs)(y, p, t, dy);
                 for &(cmt_idx, rate) in &active {
@@ -758,7 +790,7 @@ pub fn ode_predictions_event_driven(
                 if !is_real_infusion(d) {
                     let cmt_idx = d.cmt.saturating_sub(1);
                     if cmt_idx < n {
-                        u[cmt_idx] += d.amt;
+                        u[cmt_idx] += pk_now.f_bio() * d.amt;
                     }
                 }
                 last_pk = pk_now;
@@ -1792,5 +1824,112 @@ mod tests {
             "negative readout must be clamped to 0, got {}",
             preds[0]
         );
+    }
+
+    /// Helper: oral PK params with clearance, volume, ka, and bioavailability.
+    fn pk_oral_f(cl: f64, v: f64, ka: f64, f: f64) -> PkParams {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = cl;
+        p.values[crate::types::PK_IDX_V] = v;
+        p.values[crate::types::PK_IDX_KA] = ka;
+        p.values[PK_IDX_F] = f;
+        p
+    }
+
+    #[test]
+    fn ode_applies_f_bio_to_bolus_dose() {
+        // Issue #122: the ODE engine must load the depot with F·AMT (NONMEM
+        // convention), not the full AMT. For this linear oral system the
+        // central readout is exactly proportional to the depot load, so a
+        // bioavailability of F = 0.5 must halve every prediction relative to
+        // F = 1.0. Covers both the plain and event-driven paths.
+        let ode = one_cpt_oral_ode_spec();
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
+        let subj = make_subject(doses, obs_times.clone());
+
+        let pk_full = pk_oral_f(5.0, 50.0, 1.5, 1.0);
+        let pk_half = pk_oral_f(5.0, 50.0, 1.5, 0.5);
+
+        // Plain (non-TV) path.
+        let full = ode_predictions(&ode, &pk_full.values, &[], &[], &subj);
+        let half = ode_predictions(&ode, &pk_half.values, &[], &[], &subj);
+        for (f, h) in full.iter().zip(half.iter()) {
+            assert!(*f > 0.0, "expected positive prediction");
+            assert_relative_eq!(*h, 0.5 * *f, epsilon = 1e-9, max_relative = 1e-6);
+        }
+
+        // Event-driven path.
+        let pk_dose_full = vec![pk_full; subj.doses.len()];
+        let pk_obs_full = vec![pk_full; obs_times.len()];
+        let pk_dose_half = vec![pk_half; subj.doses.len()];
+        let pk_obs_half = vec![pk_half; obs_times.len()];
+        let ed_full =
+            ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose_full, &pk_obs_full, &[]);
+        let ed_half =
+            ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose_half, &pk_obs_half, &[]);
+        for (f, h) in ed_full.iter().zip(ed_half.iter()) {
+            assert_relative_eq!(*h, 0.5 * *f, epsilon = 1e-9, max_relative = 1e-6);
+        }
+    }
+
+    #[test]
+    fn ode_applies_f_bio_to_infusion() {
+        // F scales an infusion rate (F·RATE), so halving F halves predictions
+        // for a zero-order input into the depot, just like a bolus.
+        let ode = one_cpt_oral_ode_spec();
+        let rate = 50.0;
+        let amt = 100.0; // duration = 2 h
+        let doses = vec![DoseEvent::new(0.0, amt, 1, rate, false, 0.0)];
+        let obs_times = vec![1.0, 2.0, 4.0, 8.0];
+        let subj = make_subject(doses, obs_times);
+
+        let full = ode_predictions(
+            &ode,
+            &pk_oral_f(5.0, 50.0, 1.5, 1.0).values,
+            &[],
+            &[],
+            &subj,
+        );
+        let half = ode_predictions(
+            &ode,
+            &pk_oral_f(5.0, 50.0, 1.5, 0.5).values,
+            &[],
+            &[],
+            &subj,
+        );
+        for (f, h) in full.iter().zip(half.iter()) {
+            assert!(*f > 0.0, "expected positive prediction");
+            assert_relative_eq!(*h, 0.5 * *f, epsilon = 1e-9, max_relative = 1e-6);
+        }
+    }
+
+    #[test]
+    fn ode_applies_f_bio_to_ss_dose() {
+        // Steady-state pre-equilibration must also load F·AMT each cycle, so a
+        // halved F halves the steady-state predictions.
+        let ode = one_cpt_oral_ode_spec();
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+        let obs_times = vec![1.0, 4.0, 8.0, 11.0];
+        let subj = make_subject(doses, obs_times);
+
+        let full = ode_predictions(
+            &ode,
+            &pk_oral_f(5.0, 50.0, 1.5, 1.0).values,
+            &[],
+            &[],
+            &subj,
+        );
+        let half = ode_predictions(
+            &ode,
+            &pk_oral_f(5.0, 50.0, 1.5, 0.5).values,
+            &[],
+            &[],
+            &subj,
+        );
+        for (f, h) in full.iter().zip(half.iter()) {
+            assert!(*f > 0.0, "expected positive SS prediction");
+            assert_relative_eq!(*h, 0.5 * *f, epsilon = 1e-9, max_relative = 1e-6);
+        }
     }
 }

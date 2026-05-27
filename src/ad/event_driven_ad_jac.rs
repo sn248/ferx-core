@@ -880,6 +880,7 @@ mod tests {
         let run = |f: f64| -> Vec<f64> {
             let tv = build_tv_constant(&pk_idx, &[cl, v, ka, f], event_times.len());
             let mut out = vec![0.0_f64; event_times.len()];
+            let obs_scale = vec![1.0_f64; event_times.len()];
             predict_all_event_driven_ad(
                 &eta,
                 &tv,
@@ -894,7 +895,7 @@ mod tests {
                 &pk_idx_f64,
                 &sel_flat,
                 pk_model_id,
-                1.0,
+                &obs_scale,
                 &mut out,
             );
             // Drop the dose slot (kind=0) — only obs slots carry preds.
@@ -948,6 +949,7 @@ mod tests {
         let run = |f: f64| -> Vec<f64> {
             let tv = build_tv_constant(&pk_idx, &[cl, v, f], event_times.len());
             let mut out = vec![0.0_f64; event_times.len()];
+            let obs_scale = vec![1.0_f64; event_times.len()];
             predict_all_event_driven_ad(
                 &eta,
                 &tv,
@@ -962,7 +964,7 @@ mod tests {
                 &pk_idx_f64,
                 &sel_flat,
                 pk_model_id,
-                1.0,
+                &obs_scale,
                 &mut out,
             );
             event_kinds

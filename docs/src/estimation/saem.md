@@ -67,6 +67,8 @@ In a single run with `n_leapfrog > 0`, different subjects can therefore use diff
 
 The E-step sampling is parallelized across subjects using Rayon.
 
+The startup banner reports the resolved E-step kernel on a `sampler:` line, e.g. `sampler:  Metropolis-Hastings random walk` or `sampler:  HMC (3 leapfrog steps, autodiff gradients)`. If `n_leapfrog > 0` but HMC is unavailable (no `autodiff` build, or an ODE model), the line says so and reflects the MH fallback. Because SAEM is sampling-based rather than gradient-driven, it does not print the `gradient:` line that FOCE/FOCEI use — the `gradient_method` option only governs the inner EBE/Hessian step (used for diagnostics, and consumed by a following `imp` stage), not the SAEM iterations themselves.
+
 ### 2. Stochastic Approximation Update
 
 Update the sufficient statistic for \\( \Omega \\):

@@ -860,6 +860,32 @@ fn get_mu_ref_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
     pairs
 }
 
+/// One-line description of the SAEM E-step sampler kernel, for the startup
+/// banner. SAEM's estimation is sampling-based (not gradient-driven), so the
+/// banner reports the kernel here instead of a gradient route. HMC is used
+/// only when `saem_n_leapfrog > 0` *and* the build supports its autodiff
+/// gradients on an analytical PK model — the same gate as [`run_saem`]; this
+/// mirrors that condition so the banner reflects what will actually run.
+pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) -> String {
+    let n_leapfrog = options.saem_n_leapfrog;
+    #[cfg(feature = "autodiff")]
+    let using_hmc = n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some();
+    #[cfg(not(feature = "autodiff"))]
+    let using_hmc = {
+        let _ = model;
+        false
+    };
+    if using_hmc {
+        format!("HMC ({n_leapfrog} leapfrog steps, autodiff gradients)")
+    } else if n_leapfrog > 0 {
+        "Metropolis-Hastings random walk \
+         (HMC requested but unavailable — needs the autodiff build + an analytical PK model)"
+            .to_string()
+    } else {
+        "Metropolis-Hastings random walk".to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main SAEM loop
 // ---------------------------------------------------------------------------
@@ -1731,6 +1757,32 @@ mod tests {
     use super::*;
     use crate::types::test_helpers::analytical_model;
     use crate::types::{GradientMethod, MuRef};
+
+    #[test]
+    fn saem_sampler_summary_defaults_to_metropolis_hastings() {
+        // Default options (saem_n_leapfrog = 0) → MH random walk in every build.
+        let model = analytical_model(GradientMethod::Auto);
+        let opts = crate::types::FitOptions::default();
+        let s = saem_sampler_summary(&model, &opts);
+        assert!(
+            s.starts_with("Metropolis-Hastings"),
+            "default SAEM kernel should be MH, got: {s}"
+        );
+        // Requesting leapfrog steps without HMC support must say so, not claim HMC.
+        let mut hmc_opts = crate::types::FitOptions::default();
+        hmc_opts.saem_n_leapfrog = 10;
+        let s2 = saem_sampler_summary(&model, &hmc_opts);
+        #[cfg(not(feature = "autodiff"))]
+        assert!(
+            s2.contains("unavailable"),
+            "no-autodiff build can't run HMC, got: {s2}"
+        );
+        #[cfg(feature = "autodiff")]
+        assert!(
+            s2.starts_with("HMC"),
+            "autodiff build with analytical model + leapfrog steps should use HMC, got: {s2}"
+        );
+    }
 
     fn model_with_mu_refs(
         theta_names: &[&str],

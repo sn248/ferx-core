@@ -35,6 +35,8 @@ The startup banner reports the route **actually resolved** across the population
 
 When the population splits across routes, the banner shows per-route subject counts, e.g. `AD (event-driven) ×118, FD ×3`. A build without the `autodiff` feature always reads `FD  [requested: auto; autodiff not compiled in]`.
 
+This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and for `imp`, which reuses the EBE Hessian built via the same route. SAEM is sampling-based and reports its E-step kernel on a `sampler:` line instead — see [SAEM](saem.md).
+
 If the EBE search wanders into a region where the individual NLL evaluates to a non-finite value (for example, an ODE model whose integration blows up at extreme \\( \eta \\)), that point is treated as the worst possible objective rather than aborting the fit. The subject is reported as non-converged and estimation continues for the remaining subjects.
 
 ## FOCE vs FOCEI

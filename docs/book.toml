@@ -1,6 +1,6 @@
 [book]
 title = "FeRx-NLME Documentation"
-authors = ["InsightRx"]
+authors = ["Teun Post", "Ron Keizer"]
 language = "en"
 src = "src"
 

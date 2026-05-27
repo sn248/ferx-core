@@ -2,12 +2,19 @@
 #
 # Compare to `examples/bioavailability_ode.ferx` — the same model written
 # with the concentration baked into `central` directly (`d/dt(central) =
-# F*KA*depot/V - CL/V*central`). Here the ODE keeps `central` as an
+# KA*depot/V - CL/V*central`). Here the ODE keeps `central` as an
 # amount (no `/V` inside the derivative) and the conversion to
 # concentration lives in the [scaling] block.
 #
-# Both formulations produce identical observed predictions — see
-# `tests/scaling_block.rs::form_c_amount_ode_matches_concentration_ode`.
+# Bioavailability F is applied by the engine when the dose enters the depot
+# (the depot is loaded with F·AMT, NONMEM-style), so F does NOT appear in the
+# absorption flux below.
+#
+# The amount-form vs concentration-form equivalence (independent of F) is
+# checked in `tests/scaling_block.rs::form_c_amount_ode_matches_concentration_ode`,
+# which uses F = 1. The F-at-dose-entry behaviour this example relies on is
+# covered by `tests/bioavailability_ode_nonmem.rs` and the unit tests in
+# `src/ode/predictions.rs`.
 
 [parameters]
   theta TVCL(5.0,   0.1,  50.0)
@@ -33,7 +40,7 @@
   # Both compartments hold amounts (mg). The conversion to mg/L lives
   # in [scaling] below.
   d/dt(depot)   = -KA * depot
-  d/dt(central) = F * KA * depot - CL/V * central
+  d/dt(central) = KA * depot - CL/V * central
 
 [scaling]
   y = central / V                 # observable = concentration (mg/L)

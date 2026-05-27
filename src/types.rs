@@ -44,7 +44,17 @@ impl DoseEvent {
 ///   6: Q3      (intercompartmental clearance, 3-cmt: central ↔ peripheral 2)
 ///   7: V3      (peripheral volume 2, 3-cmt only)
 ///   8: LAGTIME (dose/absorption lagtime, default 0.0; equivalent to NONMEM ALAG)
-pub const MAX_PK_PARAMS: usize = 9;
+///
+/// Slots 0–8 are the named PK parameters above. Slots 9.. are spare capacity
+/// for ODE models, whose `[individual_parameters]` may declare additional
+/// "structural" parameters (rate constants, Emax/EC50, baselines, …) beyond the
+/// named PK slots. `ode_param_slots` routes canonical names to slots 0–8 and
+/// structural names to the remaining free slots, while keeping slots
+/// `PK_IDX_F` and `PK_IDX_LAGTIME` reserved so an undeclared F/lagtime keeps its
+/// default rather than being aliased by a structural parameter (issue #122).
+/// The headroom here therefore bounds how many structural parameters an ODE
+/// model can declare.
+pub const MAX_PK_PARAMS: usize = 16;
 
 pub const PK_IDX_CL: usize = 0;
 pub const PK_IDX_V: usize = 1;
@@ -2327,7 +2337,9 @@ mod tests {
         // NONMEM-style alias maps to the same slot.
         assert_eq!(PkParams::name_to_index("alag"), Some(PK_IDX_LAGTIME));
         assert_eq!(PK_IDX_LAGTIME, 8);
-        assert_eq!(MAX_PK_PARAMS, 9);
+        // Slots 0–8 are named PK params; the rest are ODE structural-param
+        // headroom (see MAX_PK_PARAMS docs / issue #122).
+        assert!(MAX_PK_PARAMS > PK_IDX_LAGTIME);
 
         let default = PkParams::default();
         assert_eq!(default.lagtime(), 0.0);

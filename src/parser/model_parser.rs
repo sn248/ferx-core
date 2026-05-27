@@ -859,6 +859,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .iter()
         .any(|l| l.starts_with("ode(") || l.starts_with("ode "));
 
+    // For ODE models, map each individual parameter to a slot in the fixed
+    // PkParams array (canonical names → their PK slot, others → free slots,
+    // reserving PK_IDX_F / PK_IDX_LAGTIME). The RHS evaluator, the parameter
+    // writer (`build_pk_param_fn`), and `pk_indices` all share this map.
+    // Empty for analytical models, which route through `pk_param_map` instead.
+    let ode_slot_map: Vec<usize> = if is_ode {
+        ode_param_slots(&indiv_var_names)?
+    } else {
+        Vec::new()
+    };
+
     let (
         pk_model,
         pk_param_map,
@@ -877,6 +888,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &state_names,
             obs_cmt_name.as_deref(),
             &indiv_var_names,
+            &ode_slot_map,
         )?;
 
         // Parse optional [diffusion] block
@@ -964,6 +976,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         indiv_stmts.clone(),
         &pk_param_map,
         &indiv_var_names,
+        &ode_slot_map,
         #[cfg(feature = "nn")]
         &covariate_nns_for_closure,
     )?;
@@ -1201,8 +1214,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             })
             .collect()
     } else {
-        // ODE model: sequential indices
-        (0..n_eta).collect()
+        // ODE model: canonical slot map (parallel to indiv_var_names), so a
+        // declared F lands at PK_IDX_F, lagtime at PK_IDX_LAGTIME, etc. — the
+        // same map the RHS evaluator and pk_param_fn use.
+        ode_slot_map.clone()
     };
 
     // Per-tv eta index: for each individual parameter, find which BSV eta its
@@ -2537,11 +2552,71 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
     })
 }
 
+/// Assign each ODE individual parameter (in declaration order) a slot in the
+/// fixed `PkParams.values` array, returned parallel to `names`.
+///
+/// Parameters whose name maps to a canonical PK slot (`CL`, `V`, `KA`, `F`,
+/// `LAGTIME`, …) take that slot, so the ODE engine — which reads bioavailability
+/// from `PK_IDX_F` and absorption lag from `PK_IDX_LAGTIME` — finds them where
+/// it expects. Every other ("structural") parameter takes the lowest free slot
+/// that is neither already claimed by a canonical parameter nor one of the two
+/// engine-reserved slots (`PK_IDX_F`, `PK_IDX_LAGTIME`). Reserving those two
+/// keeps an *undeclared* F at its 1.0 default (and lagtime at 0) instead of
+/// letting an unrelated structural parameter alias the slot and be silently
+/// read as bioavailability — the issue #122 regression.
+///
+/// The RHS evaluator (`build_ode_spec`) and the parameter writer
+/// (`build_pk_param_fn`) both consult this map, so a name binds to the same
+/// slot whether it is being written or read.
+fn ode_param_slots(names: &[String]) -> Result<Vec<usize>, String> {
+    let reserved = [PK_IDX_F, PK_IDX_LAGTIME];
+    let mut taken = [false; MAX_PK_PARAMS];
+    let mut slots = vec![usize::MAX; names.len()];
+
+    // Pass 1: canonical names → their fixed PK slot.
+    for (i, name) in names.iter().enumerate() {
+        if let Some(s) = PkParams::name_to_index(&name.to_lowercase()) {
+            if taken[s] {
+                return Err(format!(
+                    "ODE model declares two individual parameters that map to the same \
+                     PK slot (at `{name}`); rename one."
+                ));
+            }
+            taken[s] = true;
+            slots[i] = s;
+        }
+    }
+
+    // Pass 2: structural names → lowest free, non-reserved slot.
+    for (i, name) in names.iter().enumerate() {
+        if slots[i] != usize::MAX {
+            continue;
+        }
+        match (0..MAX_PK_PARAMS).find(|s| !taken[*s] && !reserved.contains(s)) {
+            Some(s) => {
+                taken[s] = true;
+                slots[i] = s;
+            }
+            None => {
+                return Err(format!(
+                    "ODE model has too many individual parameters for the {MAX_PK_PARAMS}-slot \
+                     PK layout (at `{name}`). Slots {reserved:?} are reserved for F/lagtime, \
+                     leaving room for {} other parameters.",
+                    MAX_PK_PARAMS - reserved.len()
+                ));
+            }
+        }
+    }
+
+    Ok(slots)
+}
+
 fn build_ode_spec(
     lines: &[String],
     state_names: &[String],
     obs_cmt_name: Option<&str>,
     indiv_param_names: &[String],
+    indiv_param_slots: &[usize],
 ) -> Result<crate::ode::OdeSpec, String> {
     let n_states = state_names.len();
     // When the user omitted `obs_cmt=` in `ode(states=[...])` they must
@@ -2693,6 +2768,11 @@ fn build_ode_spec(
 
     let state_names_owned = state_names.to_vec();
     let indiv_names_owned = indiv_param_names.to_vec();
+    // PkParams slot for each individual parameter (parallel to
+    // `indiv_names_owned`). `pk_param_fn` writes each parameter's value here, so
+    // the RHS must read it back from the same slot rather than from the
+    // declaration position. See `ode_param_slots`.
+    let indiv_slots_owned: Vec<usize> = indiv_param_slots.to_vec();
     let stmts_owned = stmts;
     let state_index: HashMap<String, usize> = state_names_owned
         .iter()
@@ -2710,14 +2790,16 @@ fn build_ode_spec(
                 vars.insert(name.to_lowercase(), u[i]);
             }
 
-            // Inject individual parameters by name → params[i]
-            // params = PkParams.values, where pk_param_fn stores individual params
-            // by position matching the order in [individual_parameters] block
+            // Inject individual parameters by name → params[slot]. `pk_param_fn`
+            // writes each parameter to its `ode_param_slots` slot (canonical
+            // names to their PK slot, others to free slots), so read it back
+            // from that same slot.
             for (i, name) in indiv_names_owned.iter().enumerate() {
-                if i < params.len() {
-                    vars.insert(name.clone(), params[i]);
-                    vars.insert(name.to_uppercase(), params[i]);
-                    vars.insert(name.to_lowercase(), params[i]);
+                let slot = indiv_slots_owned.get(i).copied().unwrap_or(i);
+                if slot < params.len() {
+                    vars.insert(name.clone(), params[slot]);
+                    vars.insert(name.to_uppercase(), params[slot]);
+                    vars.insert(name.to_lowercase(), params[slot]);
                 }
             }
 
@@ -2758,6 +2840,7 @@ fn build_ode_spec(
     } else {
         let n = n_states;
         let indiv = indiv_param_names.to_vec();
+        let indiv_slots: Vec<usize> = indiv_param_slots.to_vec();
         let states = state_names.to_vec();
         let specs = init_specs;
         Some(Box::new(move |params: &[f64]| -> Vec<f64> {
@@ -2767,10 +2850,11 @@ fn build_ode_spec(
                 vars.insert(name.to_lowercase(), 0.0);
             }
             for (i, name) in indiv.iter().enumerate() {
-                if i < params.len() {
-                    vars.insert(name.clone(), params[i]);
-                    vars.insert(name.to_uppercase(), params[i]);
-                    vars.insert(name.to_lowercase(), params[i]);
+                let slot = indiv_slots.get(i).copied().unwrap_or(i);
+                if slot < params.len() {
+                    vars.insert(name.clone(), params[slot]);
+                    vars.insert(name.to_uppercase(), params[slot]);
+                    vars.insert(name.to_lowercase(), params[slot]);
                 }
             }
             let empty_theta: [f64; 0] = [];
@@ -3664,6 +3748,7 @@ fn build_pk_param_fn(
     stmts: Vec<Statement>,
     pk_param_map: &HashMap<String, String>,
     var_names: &[String],
+    ode_slot_map: &[usize],
     #[cfg(feature = "nn")] covariate_nns: &[crate::nn::CovariateNn],
 ) -> Result<(PkParamFn, Vec<String>), String> {
     // Covariates referenced anywhere in the block (including inside if-bodies
@@ -3717,27 +3802,24 @@ fn build_pk_param_fn(
         .collect();
     let is_analytical_pk = !pk_param_map.is_empty();
 
-    // ODE branch counterpart of the same pre-resolution. Lagtime is
-    // handled separately because it can live outside the first
-    // MAX_PK_PARAMS positions.
-    let ode_positional_slots: Vec<usize> = vars_in_order
+    // ODE branch counterpart of the analytical pre-resolution: map each
+    // top-level individual parameter to (write_slot, var_slot). `write_slot`
+    // is the parameter's `ode_param_slots` slot in `PkParams.values` (canonical
+    // names → their PK slot, others → free non-reserved slots); `var_slot` is
+    // where the evaluator leaves its value. The RHS reads back from the same
+    // `write_slot`, so F lands at PK_IDX_F / lagtime at PK_IDX_LAGTIME with no
+    // separate side-write and no risk of a structural parameter aliasing those
+    // engine-reserved slots (issue #122). `vars_in_order` is parallel to
+    // `ode_slot_map`.
+    let ode_assignment_mapping: Vec<(usize, usize)> = vars_in_order
         .iter()
         .enumerate()
-        .filter_map(|(pos, var_name)| {
-            if pos >= MAX_PK_PARAMS {
-                return None;
-            }
-            var_idx.get(var_name).copied().map(|s| s)
+        .filter_map(|(i, var_name)| {
+            let write_slot = ode_slot_map.get(i).copied()?;
+            let var_slot = var_idx.get(var_name).copied()?;
+            Some((write_slot, var_slot))
         })
         .collect();
-    let ode_lagtime_slot: Option<usize> = vars_in_order.iter().find_map(|var_name| {
-        let upper = var_name.to_uppercase();
-        if upper == "LAGTIME" || upper == "ALAG" {
-            var_idx.get(var_name).copied()
-        } else {
-            None
-        }
-    });
 
     let cov_names_for_lookup = referenced_covariates.clone();
 
@@ -3790,13 +3872,11 @@ fn build_pk_param_fn(
                     p.values[pk_slot] = vars[var_slot];
                 }
             } else {
-                // ODE model: store individual params by declaration order.
-                for (pos, &var_slot) in ode_positional_slots.iter().enumerate() {
-                    p.values[pos] = vars[var_slot];
-                }
-                // Lagtime side-write (see original commentary).
-                if let Some(lag_slot) = ode_lagtime_slot {
-                    p.values[PK_IDX_LAGTIME] = vars[lag_slot];
+                // ODE model: store each individual parameter at its
+                // `ode_param_slots` slot (canonical names at their PK slot, F at
+                // PK_IDX_F, lagtime at PK_IDX_LAGTIME, others at free slots).
+                for &(slot, var_slot) in &ode_assignment_mapping {
+                    p.values[slot] = vars[var_slot];
                 }
             }
             p
@@ -7511,7 +7591,7 @@ if (1 > 0) {
             "}".into(),
         ];
         let state_names = vec!["central".to_string()];
-        let result = build_ode_spec(&ode_lines, &state_names, Some("central"), &[]);
+        let result = build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[]);
         assert!(
             result.is_ok(),
             "same state in different branches must be allowed"
@@ -8196,6 +8276,124 @@ if (1 > 0) {
             pk.lagtime(),
             0.5,
             "LAGTIME must be routed to PK_IDX_LAGTIME for ODE models"
+        );
+    }
+
+    #[test]
+    fn test_bioavailability_in_ode_model_routes_to_canonical_slot() {
+        // Issue #122: an ODE model that declares an `F` individual parameter
+        // must route its value to the canonical PK_IDX_F slot so the ODE
+        // engine (`ode_predictions`, which reads `pk_params_flat[PK_IDX_F]`)
+        // loads the dosing compartment with F·AMT — NONMEM's convention.
+        // F is declared third here; `ode_param_slots` maps the name `F` to
+        // PK_IDX_F (5) regardless of declaration position.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVF(0.7, 0.001, 0.999)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -1.0 * depot
+  d/dt(central) = depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str).unwrap();
+        let theta: Vec<f64> = parsed.model.default_params.theta.clone();
+        let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        assert_eq!(
+            pk.f_bio(),
+            0.7,
+            "F must be routed to PK_IDX_F for ODE models"
+        );
+    }
+
+    #[test]
+    fn test_ode_structural_param_does_not_alias_bioavailability_slot() {
+        // Issue #122 regression: an ODE model with ≥6 individual parameters and
+        // NO F declared must NOT let a structural parameter land in PK_IDX_F
+        // (slot 5) and be silently read as bioavailability. Before the
+        // `ode_param_slots` fix, the 6th-declared param (here KE0=7.0) was
+        // written positionally into slot 5, so `f_bio()` returned 7.0 and the
+        // engine scaled every dose by 7×. With the canonical slot map, F is
+        // reserved and undeclared → defaults to 1.0.
+        let model_str = "
+[parameters]
+  theta TCL(1.0)
+  theta TV(10.0)
+  theta TQ(2.0)
+  theta TV2(20.0)
+  theta TKA(1.5)
+  theta TKE0(7.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL  = TCL * exp(ETA_CL)
+  V   = TV
+  Q   = TQ
+  V2  = TV2
+  KA  = TKA
+  KE0 = TKE0
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str).unwrap();
+        let theta: Vec<f64> = parsed.model.default_params.theta.clone();
+        let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        assert_eq!(
+            pk.f_bio(),
+            1.0,
+            "undeclared F must default to 1.0, not alias a structural parameter"
+        );
+        assert_eq!(pk.lagtime(), 0.0, "undeclared lagtime must default to 0.0");
+
+        // The structural parameter KE0 must still round-trip: ode_param_slots
+        // assigns it a free, non-reserved slot, pk_param_fn writes its value
+        // there, and the RHS reads it back from the same slot. Assert it lands
+        // off the engine-reserved F/lagtime slots and carries its value (7.0).
+        let ke0_pos = parsed
+            .model
+            .indiv_param_names
+            .iter()
+            .position(|n| n == "KE0")
+            .expect("KE0 declared");
+        let ke0_slot = parsed.model.pk_indices[ke0_pos];
+        assert_ne!(
+            ke0_slot,
+            crate::types::PK_IDX_F,
+            "KE0 must not alias F slot"
+        );
+        assert_ne!(
+            ke0_slot,
+            crate::types::PK_IDX_LAGTIME,
+            "KE0 must not alias lagtime slot"
+        );
+        assert_eq!(
+            pk.values[ke0_slot], 7.0,
+            "KE0 value must round-trip to its assigned slot"
         );
     }
 

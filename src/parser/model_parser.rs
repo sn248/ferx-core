@@ -2996,6 +2996,42 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
 
 // --- Parameter parsing ---
 
+/// Coalesce `[fit_options]`-style bracketed declarations that span several
+/// physical lines back into a single logical line.
+///
+/// `extract_blocks` hands `parse_parameters` one trimmed string per source
+/// line, so a `block_omega`/`block_kappa` whose lower-triangle list is written
+/// across multiple lines arrives split apart. Here we rejoin any run of lines
+/// from the first unbalanced `[` through the matching `]` into one line (joined
+/// with spaces) so the existing single-line regexes match unchanged. Lines with
+/// no bracket, or with balanced brackets, pass through untouched.
+fn join_bracketed_lines(lines: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut depth: i32 = 0;
+    for line in lines {
+        if depth > 0 {
+            buf.push(' ');
+            buf.push_str(line);
+        } else {
+            buf = line.clone();
+        }
+        depth += line.matches('[').count() as i32;
+        depth -= line.matches(']').count() as i32;
+        if depth <= 0 {
+            depth = 0;
+            out.push(std::mem::take(&mut buf));
+        }
+    }
+    // An unterminated `[` leaves text in the buffer; emit it so the downstream
+    // regex fails to match and the user gets a clear "Bad block_omega" error
+    // rather than the line silently vanishing.
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
 fn parse_parameters(
     lines: &[String],
 ) -> Result<
@@ -3073,7 +3109,9 @@ fn parse_parameters(
     let block_kappa_re =
         Regex::new(r"(?i)block_kappa\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?").unwrap();
 
-    for line in lines {
+    // Rejoin multi-line `block_omega`/`block_kappa` declarations before matching.
+    let lines = join_bracketed_lines(lines);
+    for line in &lines {
         if let Some(caps) = theta_re.captures(line) {
             let name = caps[1].to_string();
             let init: f64 = caps[2]
@@ -5998,6 +6036,50 @@ mod tests {
         assert_eq!(block_omegas.len(), 1);
         assert_eq!(block_omegas[0].names, vec!["ETA_CL", "ETA_V"]);
         assert_eq!(block_omegas[0].lower_triangle, vec![0.09, 0.02, 0.04]);
+    }
+
+    #[test]
+    fn test_parse_block_omega_multiline() {
+        // Lower triangle spread across several lines, as extract_blocks would
+        // hand them to parse_parameters (one trimmed string per source line).
+        let lines = vec![
+            "block_omega (ETA_CL, ETA_V) = [".to_string(),
+            "0.09,".to_string(),
+            "0.02, 0.04".to_string(),
+            "]".to_string(),
+        ];
+        let (_, omegas, block_omegas, _, eta_names, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(omegas.len(), 0);
+        assert_eq!(block_omegas.len(), 1);
+        assert_eq!(block_omegas[0].names, vec!["ETA_CL", "ETA_V"]);
+        assert_eq!(block_omegas[0].lower_triangle, vec![0.09, 0.02, 0.04]);
+        assert!(!block_omegas[0].fixed);
+        assert_eq!(eta_names, vec!["ETA_CL", "ETA_V"]);
+    }
+
+    #[test]
+    fn test_parse_block_omega_multiline_fix() {
+        // FIX keyword on the closing-bracket line must still be honored.
+        let lines = vec![
+            "block_omega (ETA_CL, ETA_V) = [0.09,".to_string(),
+            "0.02, 0.04] FIX".to_string(),
+        ];
+        let (_, _, block_omegas, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(block_omegas.len(), 1);
+        assert!(block_omegas[0].fixed);
+    }
+
+    #[test]
+    fn test_parse_block_kappa_multiline() {
+        let lines = vec![
+            "block_kappa (KAPPA_CL, KAPPA_V) = [".to_string(),
+            "0.05, 0.01, 0.03".to_string(),
+            "]".to_string(),
+        ];
+        let (_, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
+        assert_eq!(kappas.block.len(), 1);
+        assert_eq!(kappas.block[0].names, vec!["KAPPA_CL", "KAPPA_V"]);
+        assert_eq!(kappas.block[0].lower_triangle, vec![0.05, 0.01, 0.03]);
     }
 
     #[test]

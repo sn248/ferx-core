@@ -79,7 +79,9 @@ Update the sufficient statistic for \\( \Omega \\):
 
 \\[ \Omega_k = S_2 \\]
 
-with structurally-zero entries (cross-block off-diagonals, standalone-vs-block off-diagonals, and all off-diagonals in a fully-diagonal Ω) zeroed out — the SA accumulator \\( (1/N) \sum_i \eta_i \eta_i^T \\) is dense by construction, but the model declares which entries are free parameters. Without this projection the chain feeds spurious sampling correlations into the next iteration's MH proposal Cholesky and Ω drifts toward rank-deficiency.
+with structurally-zero entries (cross-block off-diagonals, standalone-vs-block off-diagonals, and all off-diagonals in a fully-diagonal Ω) zeroed out — the SA accumulator \\( (1/N) \sum_i \eta_i \eta_i^T \\) is dense by construction, but the model declares which entries are free parameters. Without this projection the chain feeds spurious sampling correlations into the next iteration's MH proposal Cholesky and Ω drifts toward rank-deficiency. Free diagonals are then floored at `1e-6` to keep them away from zero (which would collapse the per-eta proposal scale `δ·chol(Ω)`); this floor does not by itself guarantee positive-definiteness of a full block Ω.
+
+**Burn-in.** This M-step is suppressed for the first `omega_burnin` iterations (default 20, clamped to `n_exploration`): Ω is held at its starting value while the MH chain warms up. The MH proposal scale is \\( \delta_i \cdot \mathrm{chol}(\Omega) \\), so Ω and the sampler are coupled. On sparse data (few observations per subject) a cold-start chain (η = 0, only `n_mh_steps` proposals) produces a tiny \\( (1/N) \sum_i \eta_i \eta_i^T \\); with \\( \gamma_1 = 1 \\) the M-step would install that as Ω on iteration 1, shrinking the proposal, which keeps the chain near zero — a self-reinforcing collapse that dumps between-subject variability into the residual error. The SA statistic \\( S_2 \\) is still refreshed each burn-in iteration (during exploration \\( \gamma_k = 1 \\), so it tracks the current chain spread rather than averaging), so the first Ω update after burn-in reflects the warmed-up chain rather than the cold-start spread. Set `omega_burnin = 0` to recover the previous (no-burn-in) behaviour.
 
 ### 4. M-Step for Theta and Sigma (Optimization)
 
@@ -148,6 +150,7 @@ No additional configuration is required; `method = saem` works for both BSV-only
   n_mh_steps    = 3        # MH steps per subject per iteration (ignored when n_leapfrog > 0)
   n_leapfrog    = 0        # Set > 0 (e.g. 3) to use HMC instead of MH
   adapt_interval = 50      # Step-size adaptation frequency
+  omega_burnin  = 20       # Iterations to hold Ω fixed while the chain warms up
   seed          = 12345    # RNG seed for reproducibility
   covariance    = true     # Compute standard errors
 ```
@@ -159,6 +162,10 @@ No additional configuration is required; `method = saem` works for both BSV-only
 - Increase `n_exploration` (e.g., 300) to give more time for basin finding
 - Increase `n_convergence` (e.g., 500) for a longer averaging window
 - Increase `n_mh_steps` (e.g., 5-10) for better mixing in the E-step
+
+### Ω Collapses / Residual Error Inflates
+
+On sparse data (few observations per subject) the variance components can collapse toward zero on the first iterations while the residual error absorbs the between-subject variability (e.g. tiny `omega` with a large additive `sigma`). The default `omega_burnin = 20` guards against this by holding Ω fixed while the chain warms up. If it still occurs, raise `omega_burnin` (e.g. 40) and/or `n_mh_steps` so the chain reaches a representative spread before Ω is first estimated, then polish with `method = [saem, focei]`.
 
 ### Slow Convergence
 

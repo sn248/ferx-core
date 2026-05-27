@@ -1566,6 +1566,13 @@ pub struct FitOptions {
     pub saem_n_convergence: usize,
     pub saem_n_mh_steps: usize,
     pub saem_adapt_interval: usize,
+    /// Number of initial exploration iterations during which the BSV/IOV Ω
+    /// M-step is suppressed (Ω held at its initial value) while the MH chain
+    /// warms up. Prevents the iteration-1 Ω collapse on sparse data, where a
+    /// cold-start chain (η = 0, few MH steps) yields a tiny `(1/N)Σηηᵀ` that
+    /// the γ=1 M-step would otherwise install as Ω, starving the proposal.
+    /// Clamped to `saem_n_exploration` at use. `0` disables the burn-in.
+    pub saem_omega_burnin: usize,
     pub saem_seed: Option<u64>,
     /// Number of leapfrog steps per HMC proposal in the SAEM E-step.
     /// `0` (default) uses the Metropolis-Hastings random-walk sampler.
@@ -1744,6 +1751,7 @@ impl Default for FitOptions {
             saem_n_convergence: 250,
             saem_n_mh_steps: 3,
             saem_adapt_interval: 50,
+            saem_omega_burnin: 20,
             saem_seed: None,
             saem_n_leapfrog: 0,
             gn_lambda: 0.01,
@@ -1990,6 +1998,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "n_leapfrog",
             "saem_n_leapfrog",
             "adapt_interval",
+            "omega_burnin",
             "seed",
             "saem_seed",
         ],

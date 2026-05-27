@@ -1329,9 +1329,11 @@ pub fn run_saem(
         // ---- Step 3: M-step Omega (BSV + IOV) ----
         // Gated by the burn-in: while `k <= omega_burnin` Ω (and Ω_iov) are held
         // at their initial values so the MH chain can warm up before any
-        // variance component is estimated. The SA sufficient statistics (Step 2)
-        // keep accumulating during burn-in, so the first real update uses a
-        // warmed-up `s2` rather than the cold-start spread.
+        // variance component is estimated. Step 2 still refreshes the SA
+        // statistic `s2` each burn-in iteration (during exploration γ=1, so it
+        // tracks the current chain spread rather than averaging), so the first
+        // Ω update after burn-in reflects the warmed-up chain, not the
+        // cold-start spread.
         if k > omega_burnin {
             // ---- Step 3a: Omega_bsv (closed form) ----
             // Restore FIX-ed rows / columns from the template. An eta flagged FIX

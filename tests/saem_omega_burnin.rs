@@ -12,7 +12,7 @@
 //! steps — far below the true Ω. Because the MH proposal scale is tied to Ω
 //! (`δ·chol(Ω)`), that under-estimate shrinks the proposal and the chain can
 //! never re-inflate Ω: between-subject variability collapses into the residual
-//! error. The burn-in (default `saem_omega_burnin = 20`) holds Ω at its starting
+//! error. The burn-in (default `omega_burnin = 20`) holds Ω at its starting
 //! value while the chain warms up, which prevents the collapse.
 //!
 //! The dataset is fully synthetic (1 observation per subject — deliberately

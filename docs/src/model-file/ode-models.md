@@ -149,8 +149,8 @@ The solver automatically adapts step sizes based on local error estimates.
 
 ## Dose Handling
 
-- **Bolus doses**: Applied as instantaneous state changes at dose times. The dose amount, scaled by bioavailability, is added to the target compartment: `state[cmt] += F · amt`
-- **Infusion doses** (`RATE > 0`): Treated as a continuous zero-order input. The integrator's timeline is broken at the infusion's end (`time + amt/rate`), and `+F · rate` is added to the target compartment's derivative for every segment fully spanned by the infusion. Overlapping infusions on the same compartment sum their rates
+- **Bolus doses**: Applied as instantaneous state changes at dose times. The dose amount, scaled by bioavailability (`F · AMT`), is added to the target compartment (the state at `CMT − 1`, since `CMT` is 1-based — see indexing below)
+- **Infusion doses** (`RATE > 0`): Treated as a continuous zero-order input. The integrator's timeline is broken at the infusion's end (`time + amt/rate`), and `F · RATE` is added to the target compartment's derivative for every segment fully spanned by the infusion. Overlapping infusions on the same compartment sum their rates
 - **Compartment indexing**: Compartments are 1-indexed in the data file (`CMT=1` corresponds to the first state in the `states` list)
 - **Multiple doses**: The ODE is integrated in segments between dose events, with state discontinuities at each bolus
 

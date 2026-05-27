@@ -8242,11 +8242,33 @@ if (1 > 0) {
             1.0,
             "undeclared F must default to 1.0, not alias a structural parameter"
         );
-        // The structural parameter KE0 must still be readable by the RHS — it
-        // is routed to a non-reserved slot (not 5/8). Confirm it round-trips:
-        // KE0 should appear at whatever slot ode_param_slots assigned, and the
-        // engine never confuses it with F or lagtime.
         assert_eq!(pk.lagtime(), 0.0, "undeclared lagtime must default to 0.0");
+
+        // The structural parameter KE0 must still round-trip: ode_param_slots
+        // assigns it a free, non-reserved slot, pk_param_fn writes its value
+        // there, and the RHS reads it back from the same slot. Assert it lands
+        // off the engine-reserved F/lagtime slots and carries its value (7.0).
+        let ke0_pos = parsed
+            .model
+            .indiv_param_names
+            .iter()
+            .position(|n| n == "KE0")
+            .expect("KE0 declared");
+        let ke0_slot = parsed.model.pk_indices[ke0_pos];
+        assert_ne!(
+            ke0_slot,
+            crate::types::PK_IDX_F,
+            "KE0 must not alias F slot"
+        );
+        assert_ne!(
+            ke0_slot,
+            crate::types::PK_IDX_LAGTIME,
+            "KE0 must not alias lagtime slot"
+        );
+        assert_eq!(
+            pk.values[ke0_slot], 7.0,
+            "KE0 value must round-trip to its assigned slot"
+        );
     }
 
     // ── [diffusion] block parsing ─────────────────────────────────────────

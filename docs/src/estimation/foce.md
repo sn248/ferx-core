@@ -21,7 +21,19 @@ For each subject, the inner loop finds the empirical Bayes estimate (EBE) of the
 
 \\[ -\log p(\eta_i | y_i, \theta, \Omega, \sigma) = \frac{1}{2} \left[ \eta_i^T \Omega^{-1} \eta_i + \log|\Omega| + \sum_j \left( \frac{(y_{ij} - f_{ij})^2}{V_{ij}} + \log V_{ij} \right) \right] \\]
 
-The inner loop uses BFGS with automatic differentiation gradients, falling back to Nelder-Mead simplex if BFGS fails.
+The inner loop uses BFGS, falling back to Nelder-Mead simplex if BFGS fails.
+
+### Gradient route (AD vs FD)
+
+The BFGS gradient is computed by reverse-mode **automatic differentiation (AD)** when available, and by central **finite differences (FD)** otherwise. AD requires the crate built with the `autodiff` feature (the Enzyme toolchain) *and* an analytical PK model; it is resolved **per subject**, so individual subjects fall back to FD for ODE models, steady-state (SS) doses, system resets (EVID 3/4), or time-varying covariates on a model the event-driven AD path doesn't yet support. AD is the default (`gradient_method = auto`) and is typically on par with FD on small models and faster as the parameter count grows.
+
+The startup banner reports the route **actually resolved** across the population — not just the requested setting — so a silent AD→FD fallback is visible:
+
+```
+  gradient: AD (single-snapshot)  [requested: auto]
+```
+
+When the population splits across routes, the banner shows per-route subject counts, e.g. `AD (event-driven) ×118, FD ×3`. A build without the `autodiff` feature always reads `FD  [requested: auto; autodiff not compiled in]`.
 
 If the EBE search wanders into a region where the individual NLL evaluates to a non-finite value (for example, an ODE model whose integration blows up at extreme \\( \eta \\)), that point is treated as the worst possible objective rather than aborting the fit. The subject is reported as non-converged and estimation continues for the remaining subjects.
 

@@ -926,6 +926,10 @@ fn fit_inner(
             "  {} thetas, {} etas, {} sigmas",
             model.n_theta, model.n_eta, model.n_epsilon
         );
+        eprintln!(
+            "  gradient: {}",
+            crate::estimation::inner_optimizer::gradient_route_summary(model, population)
+        );
     }
 
     // Model / estimation-option compatibility guards: SDE vs SAEM / GN / AD,

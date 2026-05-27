@@ -172,6 +172,58 @@ fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGra
     }
 }
 
+/// One-line summary of the inner-loop gradient route **actually resolved**
+/// across the population, for the startup banner. Reflects the per-subject
+/// resolution in [`resolve_gradient_method`] — including AD→FD fallbacks for
+/// SS doses, system resets, TV-covariate models the event-driven AD path
+/// doesn't support, ODE/`tv_fn`-less models, or a build without the
+/// `autodiff` feature — rather than the requested [`GradientMethod`]. The
+/// requested setting is appended in brackets so a fallback is visible.
+pub(crate) fn gradient_route_summary(model: &CompiledModel, population: &Population) -> String {
+    let (mut fd, mut ss, mut ed) = (0usize, 0usize, 0usize);
+    for subject in &population.subjects {
+        match resolve_gradient_method(model, subject) {
+            InnerGradientMethod::Fd => fd += 1,
+            InnerGradientMethod::AdSingleSnapshot => ss += 1,
+            InnerGradientMethod::AdEventDriven => ed += 1,
+        }
+    }
+    // Show per-route counts only when the population splits across routes;
+    // a single uniform route reads cleanly as just its label.
+    let mixed = [fd, ss, ed].iter().filter(|&&c| c > 0).count() > 1;
+    let mut parts: Vec<String> = Vec::new();
+    for (count, label) in [
+        (ed, "AD (event-driven)"),
+        (ss, "AD (single-snapshot)"),
+        (fd, "FD"),
+    ] {
+        if count > 0 {
+            parts.push(if mixed {
+                format!("{label} ×{count}")
+            } else {
+                label.to_string()
+            });
+        }
+    }
+    let resolved = if parts.is_empty() {
+        "n/a".to_string()
+    } else {
+        parts.join(", ")
+    };
+
+    let requested = match model.gradient_method {
+        GradientMethod::Auto => "auto",
+        GradientMethod::Ad => "AD",
+        GradientMethod::Fd => "FD",
+    };
+    #[cfg(not(feature = "autodiff"))]
+    let note = "; autodiff not compiled in";
+    #[cfg(feature = "autodiff")]
+    let note = "";
+
+    format!("{resolved}  [requested: {requested}{note}]")
+}
+
 /// Global per-fit timing counters for gradient/Jacobian calls. Printed by
 /// [`fit_inner`] when `FERX_TIME_GRADIENTS=1` in the environment. Atomics so
 /// multiple rayon workers can update concurrently without locking.
@@ -1332,6 +1384,32 @@ mod iov_tests {
         SigmaVector,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn gradient_route_summary_reports_route_taken_not_requested() {
+        // make_iov_model has `tv_fn: None` and the default `gradient_method:
+        // Auto`. With no `tv_fn`, AD is unavailable, so the route resolves to
+        // FD in every build — even though the *requested* method is `auto`.
+        // The banner must report the route actually taken (FD) and surface the
+        // request, so a silent AD→FD fallback is visible.
+        let model = make_iov_model();
+        let population = Population {
+            subjects: vec![make_iov_subject()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+        };
+        let summary = gradient_route_summary(&model, &population);
+        assert!(
+            summary.starts_with("FD"),
+            "tv_fn=None must resolve to FD, got: {summary}"
+        );
+        // Matches both "[requested: auto]" (autodiff build) and
+        // "[requested: auto; autodiff not compiled in]" (ci build).
+        assert!(
+            summary.contains("[requested: auto"),
+            "summary must surface the requested method, got: {summary}"
+        );
+    }
 
     fn make_iov_model() -> CompiledModel {
         let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);

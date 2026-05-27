@@ -6,7 +6,7 @@ FeRx requires a nightly Rust toolchain with Enzyme for automatic differentiation
 >
 > An older approach — `rustup`-install a prebuilt nightly, build the Enzyme plugin (`libEnzyme-<N>.so`/`.dylib`) against a Homebrew/apt LLVM, and copy it into the nightly's sysroot — **does not work**. The plugin's LLVM and the LLVM that the prebuilt `rustc` was compiled against are different builds (even at the same major version), and the mismatch makes Enzyme **hang indefinitely in `llvm::Constant::getNullValue`** the moment it differentiates *anything* — even a trivial scalar function, in both forward and reverse mode.
 >
-> Worse, it fails silently: the usual `rustc +enzyme -Z autodiff=Enable - </dev/null` check still prints `error[E0601]: main function not found` and looks like success, because that check never actually runs differentiation. The only reliable verification is to **compile and run a real `#[autodiff]` function** (see [Verify](#4-verify-the-toolchain)).
+> Worse, it fails silently: the usual `rustc +enzyme -Z autodiff=Enable - </dev/null` check still prints `error[E0601]: main function not found` and looks like success, because that check never actually runs differentiation. The only reliable verification is to **compile and run a real `#[autodiff_forward]`/`#[autodiff_reverse]` function** (see [Verify](#4-verify-the-toolchain)).
 >
 > If you previously set up the toolchain this way, remove it (`rustup toolchain uninstall enzyme`) and rebuild from source as below.
 
@@ -78,8 +78,8 @@ cd /tmp/rust-src
 
 ./configure \
     --release-channel=nightly \
-    --enable-llvm-enzyme \          # build and link the Enzyme plugin
-    --enable-llvm-link-shared \     # shared LLVM (required for the Enzyme plugin)
+    --enable-llvm-enzyme \
+    --enable-llvm-link-shared \
     --enable-ninja \
     --disable-docs \
     --set llvm.download-ci-llvm=false   # REQUIRED: Enzyme cannot build against CI LLVM
@@ -91,13 +91,13 @@ rustup toolchain link enzyme build/host/stage1
 rustc +enzyme --version --verbose
 ```
 
-`--set llvm.download-ci-llvm=false` is the critical flag: by default the Rust build downloads a prebuilt "CI" LLVM, which Enzyme cannot attach to. Forcing a from-source LLVM is what makes the toolchain actually work.
+The flags: `--enable-llvm-enzyme` builds and links the Enzyme plugin into rustc's own LLVM; `--enable-llvm-link-shared` builds LLVM as a shared library (required for the Enzyme plugin to attach). `--set llvm.download-ci-llvm=false` is the critical one: by default the Rust build downloads a prebuilt "CI" LLVM, which Enzyme cannot attach to. Forcing a from-source LLVM is what makes the toolchain actually work.
 
 > The stage-1 toolchain bundles only `rustc` — no `cargo`, `rustfmt`, or `clippy`. That's fine for building: `cargo` comes from the `nightly` you installed in step 1 and rustup falls back to it automatically (a `"cargo is unavailable for the active toolchain"` *info* line is harmless). But because `rustfmt`/`clippy` are absent, run those on nightly explicitly — `cargo +nightly fmt`, `cargo +nightly clippy --no-default-features --features ci`. In particular the repo's pre-commit hook runs `cargo fmt` and will **fail under the `enzyme` pin** unless you format on nightly first (or commit with `--no-verify` for non-Rust changes).
 
 ## 4. Verify the toolchain
 
-**Do not rely on the `E0601` check** — it passes even for a broken toolchain. Instead compile and run a real `#[autodiff]` function. This is the only check that detects the silent `getNullValue` hang:
+**Do not rely on the `E0601` check** — it passes even for a broken toolchain. Instead compile and run a real `#[autodiff_forward]` function (as below). This is the only check that detects the silent `getNullValue` hang:
 
 ```bash
 cat > /tmp/ad_check.rs <<'EOF'

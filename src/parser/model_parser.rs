@@ -2996,15 +2996,17 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
 
 // --- Parameter parsing ---
 
-/// Coalesce `[fit_options]`-style bracketed declarations that span several
-/// physical lines back into a single logical line.
+/// Coalesce `block_omega`/`block_kappa` declarations whose lower-triangle list
+/// spans several physical lines back into a single logical line.
 ///
 /// `extract_blocks` hands `parse_parameters` one trimmed string per source
 /// line, so a `block_omega`/`block_kappa` whose lower-triangle list is written
 /// across multiple lines arrives split apart. Here we rejoin any run of lines
 /// from the first unbalanced `[` through the matching `]` into one line (joined
 /// with spaces) so the existing single-line regexes match unchanged. Lines with
-/// no bracket, or with balanced brackets, pass through untouched.
+/// no bracket, or with balanced brackets, pass through untouched. A trailing
+/// bare `FIX` left on its own line after the closing `]` is folded back onto
+/// the block line so the FIX flag isn't silently lost.
 fn join_bracketed_lines(lines: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut buf = String::new();
@@ -3020,7 +3022,19 @@ fn join_bracketed_lines(lines: &[String]) -> Vec<String> {
         depth -= line.matches(']').count() as i32;
         if depth <= 0 {
             depth = 0;
-            out.push(std::mem::take(&mut buf));
+            let logical = std::mem::take(&mut buf);
+            // Fold a bare `FIX` line onto the block declaration just emitted.
+            // Restricted to a previous line containing `]` so we never attach
+            // it to a non-block parameter line.
+            if logical.trim().eq_ignore_ascii_case("FIX")
+                && out.last().is_some_and(|l: &String| l.contains(']'))
+            {
+                let last = out.last_mut().unwrap();
+                last.push(' ');
+                last.push_str(logical.trim());
+            } else {
+                out.push(logical);
+            }
         }
     }
     // An unterminated `[` leaves text in the buffer; emit it so the downstream
@@ -6063,6 +6077,21 @@ mod tests {
         let lines = vec![
             "block_omega (ETA_CL, ETA_V) = [0.09,".to_string(),
             "0.02, 0.04] FIX".to_string(),
+        ];
+        let (_, _, block_omegas, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(block_omegas.len(), 1);
+        assert!(block_omegas[0].fixed);
+    }
+
+    #[test]
+    fn test_parse_block_omega_multiline_fix_own_line() {
+        // FIX on its own line after the closing bracket must still be honored.
+        let lines = vec![
+            "block_omega (ETA_CL, ETA_V) = [".to_string(),
+            "0.09,".to_string(),
+            "0.02, 0.04".to_string(),
+            "]".to_string(),
+            "FIX".to_string(),
         ];
         let (_, _, block_omegas, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(block_omegas.len(), 1);

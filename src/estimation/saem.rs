@@ -25,6 +25,27 @@ use rand_distr::StandardNormal;
 // SAEM state
 // ---------------------------------------------------------------------------
 
+/// Positive-definite floor for free BSV Ω diagonals in the M-step.
+///
+/// Larger than the IOV floor (1e-8) because the BSV MH proposal scale is
+/// `step_scale · chol(Ω)`: if a diagonal is allowed near zero the proposal for
+/// that η collapses and the chain can no longer move it, so Ω must stay large
+/// enough to keep the random walk alive. 1e-6 keeps a free η explorable while
+/// being far below any plausible estimated variance.
+const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
+
+/// Raise every *free* diagonal entry of the BSV Ω that has fallen below `floor`
+/// up to `floor`. FIX-ed diagonals (`omega_fixed[i] == true`) are left untouched
+/// — they carry the user's declared variance and must not be perturbed.
+fn floor_omega_diagonal(omega_mat: &mut DMatrix<f64>, omega_fixed: &[bool], floor: f64) {
+    for i in 0..omega_mat.nrows() {
+        let fixed = omega_fixed.get(i).copied().unwrap_or(false);
+        if !fixed && omega_mat[(i, i)] < floor {
+            omega_mat[(i, i)] = floor;
+        }
+    }
+}
+
 struct SaemState {
     /// Per-subject current ETAs
     etas: Vec<Vec<f64>>,
@@ -876,6 +897,11 @@ pub fn run_saem(
     let k1 = options.saem_n_exploration;
     let k2 = options.saem_n_convergence;
     let n_iter = k1 + k2;
+    // Suppress the Ω M-step for the first `omega_burnin` iterations so the MH
+    // chain warms up at the initial Ω before any variance component is
+    // estimated. Clamped to the exploration length — burning in past K1 would
+    // freeze Ω into the convergence phase. See `FitOptions::saem_omega_burnin`.
+    let omega_burnin = options.saem_omega_burnin.min(k1);
     let n_mh_steps = options.saem_n_mh_steps;
     let adapt_interval = options.saem_adapt_interval;
     let verbose = options.verbose;
@@ -1300,67 +1326,87 @@ pub fn run_saem(
             state.s2_iov = (1.0 - gamma) * &state.s2_iov + gamma * &kappa_outer;
         }
 
-        // ---- Step 3: M-step Omega_bsv (closed form) ----
-        // Restore FIX-ed rows / columns from the template. An eta flagged FIX
-        // keeps its initial variance AND its initial off-diagonal couplings
-        // (zero for a diagonal declaration, block cov for a FIX-ed block).
-        // Letting the sufficient statistic bleed into row/col of a fixed eta
-        // breaks positive-definiteness once the free-block diagonals shrink
-        // during the exploration phase.
-        state.omega_mat = state.s2.clone();
-        // Zero structurally-absent off-diagonals. `s2 = (1/N) Σ ηη^T` always
-        // produces a dense matrix; entries that aren't free parameters
-        // (standalone etas, or etas from different `block_omega` declarations)
-        // must be zeroed so they don't feed sampling correlations back into
-        // the next iteration's Cholesky proposal. Without this the chain drives
-        // Ω toward a rank-deficient state, log|Ω| → -∞, and the M-step pushes
-        // thetas to bounds to compensate.
-        for i in 0..n_eta {
-            for j in 0..n_eta {
-                if !init_params.omega.free_mask[(i, j)] {
-                    state.omega_mat[(i, j)] = 0.0;
+        // ---- Step 3: M-step Omega (BSV + IOV) ----
+        // Gated by the burn-in: while `k <= omega_burnin` Ω (and Ω_iov) are held
+        // at their initial values so the MH chain can warm up before any
+        // variance component is estimated. The SA sufficient statistics (Step 2)
+        // keep accumulating during burn-in, so the first real update uses a
+        // warmed-up `s2` rather than the cold-start spread.
+        if k > omega_burnin {
+            // ---- Step 3a: Omega_bsv (closed form) ----
+            // Restore FIX-ed rows / columns from the template. An eta flagged FIX
+            // keeps its initial variance AND its initial off-diagonal couplings
+            // (zero for a diagonal declaration, block cov for a FIX-ed block).
+            // Letting the sufficient statistic bleed into row/col of a fixed eta
+            // breaks positive-definiteness once the free-block diagonals shrink
+            // during the exploration phase.
+            state.omega_mat = state.s2.clone();
+            // Zero structurally-absent off-diagonals. `s2 = (1/N) Σ ηη^T` always
+            // produces a dense matrix; entries that aren't free parameters
+            // (standalone etas, or etas from different `block_omega` declarations)
+            // must be zeroed so they don't feed sampling correlations back into
+            // the next iteration's Cholesky proposal. Without this the chain drives
+            // Ω toward a rank-deficient state, log|Ω| → -∞, and the M-step pushes
+            // thetas to bounds to compensate.
+            for i in 0..n_eta {
+                for j in 0..n_eta {
+                    if !init_params.omega.free_mask[(i, j)] {
+                        state.omega_mat[(i, j)] = 0.0;
+                    }
                 }
             }
-        }
-        // Restore FIX-ed rows / columns from the template.
-        for i in 0..n_eta {
-            for j in 0..n_eta {
-                let fi = init_params.omega_fixed.get(i).copied().unwrap_or(false);
-                let fj = init_params.omega_fixed.get(j).copied().unwrap_or(false);
-                if fi || fj {
-                    state.omega_mat[(i, j)] = init_params.omega.matrix[(i, j)];
+            // Restore FIX-ed rows / columns from the template.
+            for i in 0..n_eta {
+                for j in 0..n_eta {
+                    let fi = init_params.omega_fixed.get(i).copied().unwrap_or(false);
+                    let fj = init_params.omega_fixed.get(j).copied().unwrap_or(false);
+                    if fi || fj {
+                        state.omega_mat[(i, j)] = init_params.omega.matrix[(i, j)];
+                    }
                 }
             }
-        }
+            // Floor the free diagonal to keep Ω positive-definite, mirroring the
+            // IOV Ω floor below. On sparse data (few obs/subject) a free η can
+            // sample a near-zero spread early — once that feeds back into the
+            // Cholesky MH proposal the scale collapses and the chain can never
+            // re-inflate Ω, dumping between-subject variability into residual
+            // error. FIX-ed entries were just restored from the template and are
+            // left exactly as declared.
+            floor_omega_diagonal(
+                &mut state.omega_mat,
+                &init_params.omega_fixed,
+                SAEM_OMEGA_DIAG_FLOOR,
+            );
 
-        // ---- Step 3b: M-step Omega_iov (analytic, IOV only) ----
-        // Apply the SA sufficient statistic, zeroing structural off-diagonals
-        // and restoring FIX-ed kappa entries, mirroring the BSV omega treatment.
-        if n_kappa > 0 {
-            if let Some(omega_iov_ref) = init_params.omega_iov.as_ref() {
-                state.omega_iov_mat = state.s2_iov.clone();
-                // Zero structurally-absent off-diagonals.
-                for i in 0..n_kappa {
-                    for j in 0..n_kappa {
-                        if !omega_iov_ref.free_mask[(i, j)] {
-                            state.omega_iov_mat[(i, j)] = 0.0;
+            // ---- Step 3b: Omega_iov (analytic, IOV only) ----
+            // Apply the SA sufficient statistic, zeroing structural off-diagonals
+            // and restoring FIX-ed kappa entries, mirroring the BSV omega treatment.
+            if n_kappa > 0 {
+                if let Some(omega_iov_ref) = init_params.omega_iov.as_ref() {
+                    state.omega_iov_mat = state.s2_iov.clone();
+                    // Zero structurally-absent off-diagonals.
+                    for i in 0..n_kappa {
+                        for j in 0..n_kappa {
+                            if !omega_iov_ref.free_mask[(i, j)] {
+                                state.omega_iov_mat[(i, j)] = 0.0;
+                            }
                         }
                     }
-                }
-                // Restore FIX-ed kappa rows/columns from the template.
-                for i in 0..n_kappa {
-                    for j in 0..n_kappa {
-                        let fi = init_params.kappa_fixed.get(i).copied().unwrap_or(false);
-                        let fj = init_params.kappa_fixed.get(j).copied().unwrap_or(false);
-                        if fi || fj {
-                            state.omega_iov_mat[(i, j)] = omega_iov_ref.matrix[(i, j)];
+                    // Restore FIX-ed kappa rows/columns from the template.
+                    for i in 0..n_kappa {
+                        for j in 0..n_kappa {
+                            let fi = init_params.kappa_fixed.get(i).copied().unwrap_or(false);
+                            let fj = init_params.kappa_fixed.get(j).copied().unwrap_or(false);
+                            if fi || fj {
+                                state.omega_iov_mat[(i, j)] = omega_iov_ref.matrix[(i, j)];
+                            }
                         }
                     }
-                }
-                // Floor diagonal to stay positive-definite.
-                for i in 0..n_kappa {
-                    if state.omega_iov_mat[(i, i)] < 1e-8 {
-                        state.omega_iov_mat[(i, i)] = 1e-8;
+                    // Floor diagonal to stay positive-definite.
+                    for i in 0..n_kappa {
+                        if state.omega_iov_mat[(i, i)] < 1e-8 {
+                            state.omega_iov_mat[(i, i)] = 1e-8;
+                        }
                     }
                 }
             }
@@ -1755,6 +1801,50 @@ mod tests {
             })
             .collect();
         m
+    }
+
+    #[test]
+    fn floor_omega_diagonal_floors_free_entries_only() {
+        // Three etas: a free near-zero diagonal (should be floored), a free
+        // healthy diagonal (untouched), and a FIX-ed near-zero diagonal (kept).
+        let mut omega = DMatrix::<f64>::zeros(3, 3);
+        omega[(0, 0)] = 1e-9; // free, below floor → raised
+        omega[(1, 1)] = 0.2; // free, above floor → unchanged
+        omega[(2, 2)] = 1e-9; // FIX-ed, below floor → preserved
+                              // an off-diagonal that must not be touched by the diagonal floor
+        omega[(0, 1)] = 0.01;
+        omega[(1, 0)] = 0.01;
+
+        let omega_fixed = vec![false, false, true];
+        floor_omega_diagonal(&mut omega, &omega_fixed, 1e-6);
+
+        assert_eq!(
+            omega[(0, 0)],
+            1e-6,
+            "free near-zero diagonal must be floored"
+        );
+        assert_eq!(
+            omega[(1, 1)],
+            0.2,
+            "healthy free diagonal must be unchanged"
+        );
+        assert_eq!(
+            omega[(2, 2)],
+            1e-9,
+            "FIX-ed diagonal must be left exactly as declared"
+        );
+        assert_eq!(omega[(0, 1)], 0.01, "off-diagonals must not be touched");
+    }
+
+    #[test]
+    fn floor_omega_diagonal_treats_missing_fixed_flags_as_free() {
+        // `omega_fixed` shorter than the matrix: missing entries default to free.
+        let mut omega = DMatrix::<f64>::zeros(2, 2);
+        omega[(0, 0)] = 1e-9;
+        omega[(1, 1)] = 1e-9;
+        floor_omega_diagonal(&mut omega, &[], 1e-6);
+        assert_eq!(omega[(0, 0)], 1e-6);
+        assert_eq!(omega[(1, 1)], 1e-6);
     }
 
     #[test]

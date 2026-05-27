@@ -1721,6 +1721,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "n_mh_steps" => opts.saem_n_mh_steps = parse_usize("n_mh_steps")?,
         "n_leapfrog" | "saem_n_leapfrog" => opts.saem_n_leapfrog = parse_usize("n_leapfrog")?,
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
+        "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
         "seed" | "saem_seed" => opts.saem_seed = parse_u64_opt("seed")?,
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
         "sir" => opts.sir = parse_bool("sir")?,
@@ -5375,6 +5376,9 @@ mod tests {
             Ok(true)
         );
         assert_eq!(opts.saem_n_convergence, 400);
+
+        assert_eq!(apply_fit_option(&mut opts, "omega_burnin", "30"), Ok(true));
+        assert_eq!(opts.saem_omega_burnin, 30);
     }
 
     #[test]

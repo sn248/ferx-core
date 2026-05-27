@@ -943,7 +943,11 @@ fn fit_inner(
         if uses_gradient_route {
             eprintln!(
                 "  gradient: {}",
-                crate::estimation::inner_optimizer::gradient_route_summary(model, population)
+                crate::estimation::inner_optimizer::gradient_route_summary(
+                    model,
+                    population,
+                    options.gradient_method,
+                )
             );
         }
         if chain.iter().any(|m| *m == EstimationMethod::Saem) {

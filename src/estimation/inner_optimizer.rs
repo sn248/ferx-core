@@ -177,9 +177,19 @@ fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGra
 /// resolution in [`resolve_gradient_method`] — including AD→FD fallbacks for
 /// SS doses, system resets, TV-covariate models the event-driven AD path
 /// doesn't support, ODE/`tv_fn`-less models, or a build without the
-/// `autodiff` feature — rather than the requested [`GradientMethod`]. The
-/// requested setting is appended in brackets so a fallback is visible.
-pub(crate) fn gradient_route_summary(model: &CompiledModel, population: &Population) -> String {
+/// `autodiff` feature.
+///
+/// `requested` is the user's [`FitOptions::gradient_method`], appended in
+/// brackets so a fallback is visible. It is taken as a parameter rather than
+/// read from `model.gradient_method` because the latter is mutated by
+/// compatibility rules (e.g. an SDE model is forced to `Fd` regardless of the
+/// request) — the banner should report what the user asked for, not the
+/// post-compatibility value.
+pub(crate) fn gradient_route_summary(
+    model: &CompiledModel,
+    population: &Population,
+    requested: GradientMethod,
+) -> String {
     let (mut fd, mut ss, mut ed) = (0usize, 0usize, 0usize);
     for subject in &population.subjects {
         match resolve_gradient_method(model, subject) {
@@ -211,7 +221,7 @@ pub(crate) fn gradient_route_summary(model: &CompiledModel, population: &Populat
         parts.join(", ")
     };
 
-    let requested = match model.gradient_method {
+    let requested_label = match requested {
         GradientMethod::Auto => "auto",
         GradientMethod::Ad => "AD",
         GradientMethod::Fd => "FD",
@@ -221,7 +231,7 @@ pub(crate) fn gradient_route_summary(model: &CompiledModel, population: &Populat
     #[cfg(feature = "autodiff")]
     let note = "";
 
-    format!("{resolved}  [requested: {requested}{note}]")
+    format!("{resolved}  [requested: {requested_label}{note}]")
 }
 
 /// Global per-fit timing counters for gradient/Jacobian calls. Printed by
@@ -1398,7 +1408,9 @@ mod iov_tests {
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
         };
-        let summary = gradient_route_summary(&model, &population);
+        // `requested` is the user's FitOptions value, passed independently of
+        // model.gradient_method (which compatibility rules may have mutated).
+        let summary = gradient_route_summary(&model, &population, GradientMethod::Auto);
         assert!(
             summary.starts_with("FD"),
             "tv_fn=None must resolve to FD, got: {summary}"
@@ -1408,6 +1420,13 @@ mod iov_tests {
         assert!(
             summary.contains("[requested: auto"),
             "summary must surface the requested method, got: {summary}"
+        );
+        // The bracket reflects the passed `requested`, not model.gradient_method
+        // — guards against regressing to the SDE-mislabel Copilot flagged on #117.
+        let fd_summary = gradient_route_summary(&model, &population, GradientMethod::Fd);
+        assert!(
+            fd_summary.contains("[requested: FD"),
+            "bracket must echo the requested arg, got: {fd_summary}"
         );
     }
 

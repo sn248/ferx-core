@@ -69,7 +69,8 @@ cmake -G Ninja .. \
   -DENZYME_CLANG=OFF \
   -DENZYME_FLANG=OFF
 ninja
-# 15–30 min
+# A few minutes when building against the prebuilt llvm-<MAJOR>-dev package
+# installed above; 15–30 min only if you had to build LLVM itself from source.
 ```
 
 ### 4. Install the plugin into nightly's sysroot
@@ -156,24 +157,33 @@ Check which LLVM major version nightly needs:
 rustc +nightly --version --verbose | grep LLVM
 ```
 
-Homebrew only ships a handful of LLVM versions at a time. If the version you need is on Homebrew:
+Homebrew only ships a handful of LLVM versions at a time.
+
+**If the major you need is Homebrew's current `llvm`**, there is no `llvm@<MAJOR>` versioned formula — install plain `llvm` instead. (Check with `brew info llvm`; e.g. in mid-2026 `brew install llvm` gives 22.1.6, which is the LLVM 22 a current nightly wants.) In that case the path is `$(brew --prefix)/opt/llvm/lib/cmake/llvm` — no version suffix — for the `LLVM_DIR` below.
+
+**If you need an older major** that Homebrew still keeps as a versioned formula:
 ```bash
 brew install llvm@<MAJOR>
 # Path will be /opt/homebrew/opt/llvm@<MAJOR> (Apple Silicon)
 # or           /usr/local/opt/llvm@<MAJOR>     (Intel)
 ```
 
-If Homebrew doesn't have your version, you'll need to build LLVM from source (much longer — consider sticking with a slightly older nightly that matches an available LLVM version).
+`llvm` is keg-only (not symlinked into your `PATH`), which is fine — we point `LLVM_DIR` at it explicitly.
+
+If Homebrew has neither, you'll need to build LLVM from source (much longer — consider sticking with a slightly older nightly that matches an available LLVM version).
 
 ### 4. Build the Enzyme plugin
+
+The Enzyme repo's CMake project lives in the `enzyme/` **subdirectory** of the clone, and that directory already contains a Bazel `BUILD` file. On macOS's case-insensitive filesystem `mkdir build` collides with `BUILD`, so use a different out-of-source build directory name (e.g. `cmake-build`) and pass the source path explicitly:
 
 ```bash
 git clone https://github.com/EnzymeAD/Enzyme /tmp/enzyme-build
 cd /tmp/enzyme-build/enzyme
-mkdir build && cd build
+mkdir cmake-build && cd cmake-build
 
-# Adjust paths for your brew prefix (/opt/homebrew or /usr/local)
-cmake -G Ninja .. \
+# For plain `llvm`, drop the @<MAJOR> suffix from LLVM_DIR (see step 3).
+# Adjust the brew prefix as needed (/opt/homebrew on Apple Silicon, /usr/local on Intel).
+cmake -G Ninja /tmp/enzyme-build/enzyme \
   -DLLVM_DIR=$(brew --prefix)/opt/llvm@<MAJOR>/lib/cmake/llvm \
   -DENZYME_CLANG=OFF \
   -DENZYME_FLANG=OFF
@@ -181,6 +191,8 @@ ninja
 ```
 
 You may need to install `ninja` if not present: `brew install ninja cmake`.
+
+**Build time depends entirely on whether you're reusing a prebuilt LLVM.** When `LLVM_DIR` points at a precompiled LLVM (a Homebrew bottle, a distro `llvm-<MAJOR>-dev` package, etc.), `ninja` only compiles Enzyme itself — typically **under a minute to a few minutes** on Apple Silicon, so a sub-minute build is expected and not a sign of a partial build. The 15–30 min figure quoted elsewhere applies only when LLVM itself has to be built from source (the case when Homebrew/your package manager doesn't carry the major version you need). To confirm a fast build is complete rather than truncated, check the plugin is a full-size shared library (tens of MB), e.g. `ls -lh .../Enzyme/LLVMEnzyme-<MAJOR>.dylib`.
 
 ### 5. Install the plugin into nightly's sysroot
 
@@ -193,9 +205,11 @@ TARGET=aarch64-apple-darwin
 # TARGET=x86_64-apple-darwin
 
 # Note: on macOS the shared library extension is .dylib, not .so
-cp /tmp/enzyme-build/enzyme/build/Enzyme/LLVMEnzyme-<MAJOR>.dylib \
+cp /tmp/enzyme-build/enzyme/cmake-build/Enzyme/LLVMEnzyme-<MAJOR>.dylib \
    $SYSROOT/lib/rustlib/$TARGET/lib/libEnzyme-<MAJOR>.dylib
 ```
+
+(If the exact filename differs, `ls /tmp/enzyme-build/enzyme/cmake-build/Enzyme/` to confirm the `LLVMEnzyme-<MAJOR>.dylib` name.)
 
 ### 6. Register and verify
 
@@ -208,6 +222,7 @@ rustc +enzyme -Z autodiff=Enable - </dev/null 2>&1 | head
 ### macOS caveats
 
 - **Apple Silicon (M1/M2/M3/M4)**: use `aarch64-apple-darwin` as `TARGET`. Intel Macs use `x86_64-apple-darwin`
+- **Case-insensitive filesystem**: the default macOS filesystem treats `build` and the Enzyme source tree's `BUILD` (Bazel) file as the same name, so `mkdir build` fails with `File exists`. Use a different build-directory name such as `cmake-build` (as shown above)
 - **System Integrity Protection (SIP)**: If you see code-signing errors loading the `.dylib` during `rustc` invocation, try `sudo codesign --force --sign - <path-to-libEnzyme.dylib>` — should be rare on dev machines
 - **Nightly toolchain distribution mismatches**: Apple Silicon nightlies occasionally lag x86_64 by a day or two; if LLVM version mismatches after `rustup update`, prefer installing a specific dated nightly
 
@@ -245,32 +260,44 @@ Once your Enzyme toolchain is set up:
 git clone https://github.com/FeRx-NLME/ferx-core
 cd ferx-core
 
-cargo build --release --features autodiff
+RUSTFLAGS="-Z autodiff=Enable" cargo build --release --features autodiff
 # Binary at target/release/ferx
 ```
+
+> **`RUSTFLAGS="-Z autodiff=Enable"` is required for every `--features autodiff` build.**
+> The `autodiff` feature won't compile without it — you'll get
+> `error: using the autodiff feature requires -Z autodiff=Enable`.
+>
+> Pass it inline as shown (it's the form CI and the R package use), or export it for
+> the current shell with `export RUSTFLAGS="-Z autodiff=Enable"`.
+>
+> Do **not** bake it into a committed `.cargo/config.toml`: that flag is nightly-only
+> and applies to *all* builds, which breaks the stable toolchain and the no-Enzyme
+> `--features ci` path (including CI). If you want it persistent on your own machine,
+> keep it in a *git-ignored* local `.cargo/config.toml` or a shell/`direnv` export.
 
 ### Build options
 
 ```bash
 # Debug build (faster compile, slower runtime)
-cargo build --features autodiff
+RUSTFLAGS="-Z autodiff=Enable" cargo build --features autodiff
 
 # Quick type-check without building
-cargo check --features autodiff
+RUSTFLAGS="-Z autodiff=Enable" cargo check --features autodiff
 
 # Lints
-cargo clippy --features autodiff
+RUSTFLAGS="-Z autodiff=Enable" cargo clippy --features autodiff
 
-# CI build without autodiff (uses finite differences — no Enzyme needed)
+# CI build without autodiff (uses finite differences — no Enzyme, no RUSTFLAGS needed)
 cargo build --release --no-default-features --features ci
 ```
 
-The `ci` feature is useful for development on machines without the full Enzyme toolchain — at the cost of much slower gradient computation.
+The `ci` feature is useful for development on machines without the full Enzyme toolchain — at the cost of much slower gradient computation. It builds on plain nightly (no Enzyme plugin) and does not need the `RUSTFLAGS` flag.
 
 ### Verify the build
 
 ```bash
-cargo run --release --features autodiff --bin ferx -- examples/warfarin.ferx --simulate
+RUSTFLAGS="-Z autodiff=Enable" cargo run --release --features autodiff --bin ferx -- examples/warfarin.ferx --simulate
 ```
 
 Should print a successful model fit with parameter estimates.
@@ -279,13 +306,26 @@ Should print a successful model fit with parameter estimates.
 
 ## Installing the ferx R package
 
-Ensure the Enzyme toolchain is set up (above). Then:
+The R package handles all of the above automatically — you do **not** set `RUSTFLAGS` yourself. Just:
 
 ```r
 devtools::install_github("FeRx-NLME/ferx-r")
 ```
 
-The R package's build is driven by its `Makevars`, which invokes `cargo` and resolves the `enzyme` toolchain via rustup. Both must be set up correctly in your shell/Renviron before calling `install_github`.
+The package's build is driven by its `src/Makevars`, which:
+
+1. **Probes for the `enzyme` toolchain** with `rustup toolchain list | grep -q '^enzyme'`.
+2. **If Enzyme is present**, it builds the autodiff path: it writes `rustflags = ["-Z", "autodiff=Enable"]` into a generated `rust/.cargo/config.toml` and pins `channel = "enzyme"` in a generated `rust/rust-toolchain.toml` (both build artifacts, not committed), so the flag from option #1 above is supplied for you.
+3. **If Enzyme is missing**, it silently falls back to the stable path (`--no-default-features --features ci,nn`, thin LTO) so the install still succeeds — with finite-difference gradients instead of autodiff. The package prints a notice on load when built this way.
+
+You can override the probe with an environment variable before installing:
+
+- `FERX_NO_AUTODIFF=1` — force the stable (no-autodiff) build even if Enzyme is installed.
+- `FERX_NO_AUTODIFF=0` — force the autodiff build, erroring out if the `enzyme` toolchain isn't found.
+
+To confirm which path your installed package took, call `ferx:::ferx_rust_autodiff_enabled()` in R.
+
+This is exactly why option #2 (a committed `.cargo/config.toml`) is discouraged for the core repo: the R package's `Makevars` already manages the flag conditionally per machine, generating the config only when Enzyme is actually available. A committed flag in `ferx-core` would conflict with that logic and break the no-Enzyme install.
 
 See the [ferx R package README](https://github.com/FeRx-NLME/ferx-r) for API usage.
 

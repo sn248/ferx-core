@@ -170,6 +170,10 @@ struct NloptState {
     cached_h_mats: Vec<DMatrix<f64>>,
     best_ofv: f64,
     n_evals: usize,
+    /// Count of gradient evaluations so far. Distinct from `n_evals` (which
+    /// also counts objective-only line-search probes); drives the
+    /// `reconverge_gradient_interval` schedule.
+    n_grad_evals: usize,
     /// Previous parameter vector — used to compute step_norm for the trace.
     prev_x: Vec<f64>,
     last_improvement_eval: usize,
@@ -225,6 +229,7 @@ fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
         cached_h_mats: Vec::new(),
         best_ofv: f64::INFINITY,
         n_evals: 0,
+        n_grad_evals: 0,
         prev_x: x0.to_vec(),
         last_improvement_eval: 0,
         best_at_last_improvement: f64::INFINITY,
@@ -705,6 +710,7 @@ fn optimize_nlopt(
                 &kappas,
                 &bounds,
                 options,
+                &mut state.n_grad_evals,
             );
             let mut sq = 0.0_f64;
             for k in 0..g.len() {
@@ -983,6 +989,7 @@ fn optimize_nlopt(
                     &kappas,
                     &bounds,
                     options,
+                    &mut state.n_grad_evals,
                 );
                 let mut sq = 0.0_f64;
                 for k in 0..g.len() {
@@ -1276,7 +1283,8 @@ fn optimize_bfgs(
     };
 
     let fdfg = |x: &[f64],
-                prev_etas: &[DVector<f64>]|
+                prev_etas: &[DVector<f64>],
+                grad_eval_idx: &mut usize|
      -> (f64, Vec<f64>, Vec<DVector<f64>>, Vec<DMatrix<f64>>) {
         let params = unpack_params(x, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
@@ -1303,6 +1311,7 @@ fn optimize_bfgs(
             &kappas,
             &bounds,
             options,
+            grad_eval_idx,
         );
         let f = if ofv.is_finite() { ofv } else { 1e20 };
         (f, g, ehs, hms)
@@ -1323,10 +1332,11 @@ fn optimize_bfgs(
 
     // Wrappers that operate in scaled space; unscale before calling base closures.
     let fdfg_s = |xs: &[f64],
-                  prev_etas: &[DVector<f64>]|
+                  prev_etas: &[DVector<f64>],
+                  grad_eval_idx: &mut usize|
      -> (f64, Vec<f64>, Vec<DVector<f64>>, Vec<DMatrix<f64>>) {
         let x_r: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
-        let (f, g_r, ehs, hms) = fdfg(&x_r, prev_etas);
+        let (f, g_r, ehs, hms) = fdfg(&x_r, prev_etas, grad_eval_idx);
         let g_s: Vec<f64> = (0..n).map(|i| g_r[i] * scale[i]).collect();
         (f, g_s, ehs, hms)
     };
@@ -1339,7 +1349,11 @@ fn optimize_bfgs(
     // Scale initial x into optimizer space.
     let mut xs: Vec<f64> = (0..n).map(|i| x[i] / scale[i]).collect();
 
-    let (mut f_val, mut g, ehs, _) = fdfg_s(&xs, &cached_etas);
+    // Gradient-evaluation counter driving the reconverge schedule; advanced
+    // inside `population_gradient` so it counts actual gradient evals (not
+    // outer iterations or objective-only line-search probes).
+    let mut grad_eval_idx = 0usize;
+    let (mut f_val, mut g, ehs, _) = fdfg_s(&xs, &cached_etas, &mut grad_eval_idx);
     cached_etas = ehs;
 
     if options.verbose {
@@ -1399,7 +1413,7 @@ fn optimize_bfgs(
             xs[i] = (xs[i] + alpha * d[i]).clamp(bounds_s.lower[i], bounds_s.upper[i]);
         }
 
-        let (f_new, g_new, ehs, _) = fdfg_s(&xs, &cached_etas);
+        let (f_new, g_new, ehs, _) = fdfg_s(&xs, &cached_etas, &mut grad_eval_idx);
         cached_etas = ehs;
 
         bfgs_update(&mut h_inv, &xs, &xs_old, &g_new, &g, n);
@@ -1658,11 +1672,29 @@ fn ad_population_gradient(
         .collect()
 }
 
+/// Whether gradient evaluation number `grad_idx` (0-based, per optimization
+/// run) should use the expensive reconverged path on a **non-IOV** model.
+///
+/// Driven by `reconverge_gradient_interval`: `0` disables it entirely; `N`
+/// fires on evals `0, N, 2N, …`. The `interval != 0` guard also short-circuits
+/// the modulo, so a `0` interval can never divide by zero. IOV models
+/// reconverge unconditionally and never consult this.
+fn reconverge_this_eval(options: &FitOptions, grad_idx: usize) -> bool {
+    let interval = options.reconverge_gradient_interval;
+    interval != 0 && grad_idx % interval == 0
+}
+
 /// Population gradient dispatcher. IOV models (`n_kappa > 0`) use the
 /// EBE-reconverging FD gradient — their weakly-identified variance components
 /// need it (issue #101 rec #2) — and everything else uses the cheap analytical
-/// fixed-EBE gradient. Centralised so the optimizer paths (NLopt objective,
-/// NLopt pre-search, BFGS) can't drift apart in how they pick the gradient.
+/// fixed-EBE gradient unless the `reconverge_gradient_interval` schedule opts
+/// this evaluation into the reconverged path.
+///
+/// `grad_eval_idx` is the caller's count of gradient evaluations so far; this
+/// function reads it to apply the schedule and then advances it. Owning the
+/// counter here keeps every optimizer path (NLopt objective, NLopt fallback,
+/// BFGS) on one definition of "gradient evaluation" — they can't drift apart in
+/// how they count or pick the gradient.
 #[allow(clippy::too_many_arguments)]
 fn population_gradient(
     x: &[f64],
@@ -1675,8 +1707,18 @@ fn population_gradient(
     kappas: &[Vec<DVector<f64>>],
     bounds: &PackedBounds,
     options: &FitOptions,
+    grad_eval_idx: &mut usize,
 ) -> Vec<f64> {
-    if model.n_kappa > 0 {
+    let reconverge = reconverge_this_eval(options, *grad_eval_idx);
+    *grad_eval_idx += 1;
+    // IOV models always reconverge the inner EBE solution inside the gradient.
+    // For non-IOV models the default is the fixed-EBE analytical/AD gradient,
+    // which is far cheaper but omits the response of (η̂, H) to the population
+    // parameters — an omission that stalls SLSQP well above the derivative-free
+    // optimum on ill-conditioned fits. The `reconverge_gradient_interval`
+    // schedule (via `reconverge_this_eval`) opts a non-IOV fit into the
+    // reconverged path (see focei-slsqp-fixed-ebe-gradient-bias).
+    if model.n_kappa > 0 || reconverge {
         reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options)
     } else {
         ad_population_gradient(
@@ -1952,6 +1994,32 @@ pub(crate) fn compute_covariance(
 mod tests {
     use super::*;
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    #[test]
+    fn test_reconverge_this_eval_schedule() {
+        let mut opts = FitOptions::default();
+
+        // Interval 0 (the default): never reconverge, and never a
+        // divide-by-zero from the modulo (the `!= 0` guard short-circuits).
+        opts.reconverge_gradient_interval = 0;
+        for idx in 0..7 {
+            assert!(!reconverge_this_eval(&opts, idx), "idx {idx}");
+        }
+
+        // Interval 1: every eval reconverges (the always-on case).
+        opts.reconverge_gradient_interval = 1;
+        for idx in 0..7 {
+            assert!(reconverge_this_eval(&opts, idx), "idx {idx}");
+        }
+
+        // Interval 5: reconverge only on 0, 5, 10, …
+        opts.reconverge_gradient_interval = 5;
+        let got: Vec<usize> = (0..12)
+            .filter(|&i| reconverge_this_eval(&opts, i))
+            .collect();
+        assert_eq!(got, vec![0, 5, 10]);
+    }
+
     use crate::types::{
         BloqMethod, CompiledModel, DoseEvent, ErrorModel, FitOptions, GradientMethod,
         ModelParameters, OmegaMatrix, PkModel, PkParams, Population, SigmaVector, Subject,

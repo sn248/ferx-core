@@ -1827,6 +1827,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             };
         }
         "optimizer_trace" => opts.optimizer_trace = parse_bool("optimizer_trace")?,
+        "reconverge_gradient_interval" => {
+            opts.reconverge_gradient_interval = parse_usize("reconverge_gradient_interval")?
+        }
         "scale_params" => opts.scale_params = parse_bool("scale_params")?,
         "max_unconverged_frac" => opts.max_unconverged_frac = parse_f64("max_unconverged_frac")?,
         "min_obs_for_convergence_check" => {
@@ -5730,6 +5733,36 @@ mod tests {
         // Unknown values must fail loudly — silently defaulting would hide
         // typos like `gradient = auo` that a user probably intended as `auto`.
         assert!(parse_fit_options(&["gradient = nope".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_parse_fit_options_reconverge_gradient_interval() {
+        // Defaults to 0 (off) so the cheap fixed-EBE path stays the non-IOV
+        // default.
+        assert_eq!(
+            parse_fit_options(&[]).unwrap().reconverge_gradient_interval,
+            0
+        );
+
+        // Parses as a non-negative integer and is recorded as user-set (so it
+        // isn't flagged as ignored downstream).
+        let opts = parse_fit_options(&["reconverge_gradient_interval = 5".to_string()]).unwrap();
+        assert_eq!(opts.reconverge_gradient_interval, 5);
+        assert!(opts
+            .user_set_keys
+            .iter()
+            .any(|k| k == "reconverge_gradient_interval"));
+
+        // 0 is a valid explicit value (disables reconverging), not an error.
+        assert_eq!(
+            parse_fit_options(&["reconverge_gradient_interval = 0".to_string()])
+                .unwrap()
+                .reconverge_gradient_interval,
+            0
+        );
+
+        // Non-integer values fail loudly.
+        assert!(parse_fit_options(&["reconverge_gradient_interval = lots".to_string()]).is_err());
     }
 
     #[test]

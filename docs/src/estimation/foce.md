@@ -39,6 +39,29 @@ This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and
 
 If the EBE search wanders into a region where the individual NLL evaluates to a non-finite value (for example, an ODE model whose integration blows up at extreme \\( \eta \\)), that point is treated as the worst possible objective rather than aborting the fit. The subject is reported as non-converged and estimation continues for the remaining subjects.
 
+### Gradient accuracy vs cost (reconverged EBEs)
+
+By default the population gradient holds each subject's EBEs (\\( \hat\eta \\)) and FOCE Hessian fixed while perturbing the population parameters — the *fixed-EBE* gradient. This is cheap, but it omits the response of the inner solution to \\( \theta \\) and \\( \Omega \\). On well-conditioned problems that omitted term is negligible and a gradient optimizer matches the derivative-free `bobyqa`. On **ill-conditioned** problems it is not: the omitted term is what separates a true descent direction from a flat-looking plateau, and `slsqp` can report `converged` at an OFV far above the `bobyqa` optimum.
+
+Set `reconverge_gradient_interval = 1` (in `[fit_options]`) to re-solve the inner EBE loop at every finite-difference perturbation, recovering the full surface. This costs roughly **5–6×** per gradient — reserve it for fits whose OFV looks suspiciously high. IOV models (`kappa`/`block_kappa`) always reconverge, so the setting is a no-op there; it only changes non-IOV fits.
+
+To amortize that cost, `reconverge_gradient_interval = N` reconverges only every `N`-th gradient evaluation and uses the cheap fixed-EBE gradient in between — the periodic correction is often enough to keep the optimizer off the plateau at a fraction of the always-on cost. The default `0` disables reconverging entirely (cheap fixed-EBE gradient).
+
+**Validation** — cefepime pediatric population PK, 2-compartment IV infusion, combined error, no IOV (5937 subjects / 17380 observations). All ferx rows use FOCEI and the same likelihood convention, so OFVs are directly comparable:
+
+| Configuration | OFV | Wall time |
+|---|---:|---:|
+| `slsqp` (default, fixed-EBE gradient) | 68,252 | 390 s |
+| `slsqp` + reconverge every 10 (`interval = 10`) | 66,118 | 633 s |
+| `slsqp` + reconverge every 5 (`interval = 5`) | 66,056 | 1,004 s |
+| `slsqp` + reconverge every eval (`interval = 1`) | **65,485** | 1,871 s |
+| `bobyqa` (derivative-free reference) | 65,598 | 315 s |
+| ferx OFV evaluated at NONMEM's final estimates | 67,514 | — |
+
+The fixed-EBE gradient stalls `slsqp` ~2,650 OFV units above `bobyqa`. Reconverging the EBEs on every gradient evaluation closes the entire gap and reaches an optimum marginally below `bobyqa`'s — and below the point NONMEM converged to (NONMEM's estimates score 67,514 under ferx's likelihood), confirming the stall was a gradient-bias artifact, not a worse model.
+
+A larger `reconverge_gradient_interval` trades that accuracy back for speed: reconverging every 5th or 10th gradient still closes ~80% of the stall, but the OFV degrades monotonically as the interval grows (the cheap fixed-EBE gradients in between bias the direction enough that `slsqp` declares convergence slightly early). On this problem every interval setting is dominated by `bobyqa` on *both* OFV and wall time, so a derivative-free search remains the better choice when it is affordable. The reconverged gradient earns its keep when `bobyqa` is not an option — a gradient optimizer is required, or the parameter count is high enough that derivative-free search scales poorly.
+
 ## FOCE vs FOCEI
 
 ### Standard FOCE

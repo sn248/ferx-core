@@ -367,6 +367,25 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         }
     }
 
+    // Explicit `gradient_method = ad` on a build compiled WITHOUT the `autodiff`
+    // feature: AD is unavailable, so the inner loop would silently fall back to
+    // FD and run a different method than the user asked for. Reject it instead.
+    // `auto` (defined to fall back) and `fd` are unaffected.
+    #[cfg(not(feature = "autodiff"))]
+    if options.gradient_method == crate::types::GradientMethod::Ad {
+        diags.push(
+            Diagnostic::error(
+                "E_AD_UNAVAILABLE",
+                "gradient_method = ad was requested, but this build was compiled without the \
+                 `autodiff` feature, so automatic differentiation is unavailable — the fit would \
+                 silently use finite differences. Rebuild with the Enzyme toolchain \
+                 (`--features autodiff`), or set gradient_method = auto (falls back to FD \
+                 automatically) or fd.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
     // IMP is a likelihood evaluation, not an estimator: it must follow a
     // parameter-estimating stage, appear at most once, and be the terminal stage.
     if chain.iter().any(|&m| m == EstimationMethod::Imp) {
@@ -2650,6 +2669,37 @@ mod iov_integration {
         // A compatible optimizer produces no compatibility diagnostics.
         let ok_opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
+    }
+
+    // On a build without the `autodiff` feature, explicitly requesting AD must
+    // error rather than silently running FD. `auto`/`fd` must still pass.
+    #[cfg(not(feature = "autodiff"))]
+    #[test]
+    fn ad_requested_without_autodiff_feature_errors() {
+        let model = make_iov_model();
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+
+        opts.gradient_method = crate::types::GradientMethod::Ad;
+        let diags = super::check_model_options(&model, &opts);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == "E_AD_UNAVAILABLE" && d.is_error()),
+            "explicit gradient_method=ad on a non-autodiff build must error, got: {diags:?}"
+        );
+
+        for gm in [
+            crate::types::GradientMethod::Auto,
+            crate::types::GradientMethod::Fd,
+        ] {
+            opts.gradient_method = gm;
+            assert!(
+                !super::check_model_options(&model, &opts)
+                    .iter()
+                    .any(|d| d.code == "E_AD_UNAVAILABLE"),
+                "gradient_method={gm:?} must not trigger E_AD_UNAVAILABLE"
+            );
+        }
     }
 }
 

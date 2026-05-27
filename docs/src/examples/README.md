@@ -1,6 +1,6 @@
 # Examples
 
-FeRx includes several example models in the `examples/` directory with corresponding datasets in `data/`.
+ferx-core includes several example models in the `examples/` directory with corresponding datasets in `data/`.
 
 | Example | Model | Route | Features |
 |---------|-------|-------|----------|

@@ -1,6 +1,6 @@
 # FOCE / FOCEI
 
-First-Order Conditional Estimation (FOCE) and its interaction variant (FOCEI) are the primary estimation methods in FeRx. They use a two-level nested optimization to find maximum likelihood estimates of population parameters.
+First-Order Conditional Estimation (FOCE) and its interaction variant (FOCEI) are the primary estimation methods in ferx-core. They use a two-level nested optimization to find maximum likelihood estimates of population parameters.
 
 ## Algorithm Overview
 
@@ -100,7 +100,7 @@ The pre-search uses NLopt's CRS2-LM algorithm (Controlled Random Search) to expl
 
 ## Covariance Step
 
-When `covariance = true`, FeRx computes the variance-covariance matrix of the parameter estimates using a finite-difference Hessian at the converged solution. This provides:
+When `covariance = true`, ferx-core computes the variance-covariance matrix of the parameter estimates using a finite-difference Hessian at the converged solution. This provides:
 
 - **Standard errors (SE)** for all parameters
 - **Relative standard errors (%RSE)** for assessing estimation precision

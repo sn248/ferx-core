@@ -19,7 +19,7 @@ where `dW` is a vector of independent Wiener increments.  The diagonal entries
 `σ_w` are the *diffusion standard deviations*; their squares `σ²_w` are the
 **diffusion variances** declared in `[diffusion]`.
 
-FeRx estimates the diffusion variances with an Extended Kalman Filter (EKF):
+ferx-core estimates the diffusion variances with an Extended Kalman Filter (EKF):
 the state covariance matrix `P` is propagated alongside the ODE trajectory and
 updated at each observation.  The total observation variance is:
 
@@ -136,7 +136,7 @@ the ODE alone explains the data; a large value suggests model misspecification.
 
 ## ferx-r usage note
 
-When using FeRx from R via the ferx-r package, the `[diffusion]` block is part
+When using ferx-core from R via the ferx-r package, the `[diffusion]` block is part
 of the `.ferx` model file and requires no special R-side argument.  The
 estimated diffusion variances appear in the returned fit object alongside other
 theta parameters.  See the ferx-r documentation (`?ferx_fit`) for details on

@@ -190,7 +190,7 @@ When the dataset has occasion labels the sdtab CSV gains an `OCC` column (one ro
 
 ## Comparison to NONMEM
 
-| Concept | NONMEM | FeRx |
+| Concept | NONMEM | ferx-core |
 |---------|--------|------|
 | Diagonal IOV | `OMEGA BLOCK(n) SAME` with one kappa per block | `kappa NAME ~ variance` (Option A) |
 | Correlated IOV | `OMEGA BLOCK(n)` shared across occasions | `block_kappa (N1, N2) = [...]` (Option B) |

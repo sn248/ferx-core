@@ -1,6 +1,6 @@
 # Data Format
 
-FeRx reads data in NONMEM-compatible CSV format. This is the standard format used across population PK tools.
+ferx-core reads data in NONMEM-compatible CSV format. This is the standard format used across population PK tools.
 
 ## Required Columns
 

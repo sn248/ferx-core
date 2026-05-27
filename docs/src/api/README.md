@@ -1,6 +1,6 @@
 # Rust API
 
-FeRx-NLME can be used as a Rust library for embedding population PK estimation in your own applications.
+ferx-core can be used as a Rust library for embedding population PK estimation in your own applications.
 
 ## Adding as a Dependency
 

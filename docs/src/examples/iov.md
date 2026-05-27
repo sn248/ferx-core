@@ -11,7 +11,7 @@ Use IOV when:
 
 ## Dataset
 
-The dataset must include an occasion-index column. Add an integer `OCC` column (or any name you choose — tell FeRx via `iov_column`):
+The dataset must include an occasion-index column. Add an integer `OCC` column (or any name you choose — tell ferx-core via `iov_column`):
 
 ```csv
 ID,TIME,DV,EVID,AMT,CMT,MDV,OCC
@@ -28,7 +28,7 @@ Occasion 1 = first period, occasion 2 = second period. Dose records and observat
 
 ## Model File (Option A — diagonal IOV)
 
-This is the contents of [`examples/warfarin_iov.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_iov.ferx):
+This is the contents of [`examples/warfarin_iov.ferx`](https://github.com/ferx-core-NLME/ferx-core/blob/main/examples/warfarin_iov.ferx):
 
 ```
 model warfarin_iov
@@ -66,7 +66,7 @@ model warfarin_iov
 The key additions compared to a standard model:
 1. `kappa KAPPA_CL ~ 0.01` — declares IOV on CL with starting variance 0.01
 2. `+ KAPPA_CL` in the CL expression — kappa enters just like a BSV eta
-3. `iov_column = OCC` — tells FeRx which dataset column carries occasion labels
+3. `iov_column = OCC` — tells ferx-core which dataset column carries occasion labels
 
 Set `covariance = true` if you want standard errors on the IOV variance (the shipped example leaves it off to keep the demo fast).
 

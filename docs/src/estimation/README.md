@@ -1,6 +1,6 @@
 # Estimation Methods
 
-FeRx implements two families of estimation methods for nonlinear mixed effects models:
+ferx-core implements two families of estimation methods for nonlinear mixed effects models:
 
 - **[FOCE / FOCEI](foce.md)** -- First-Order Conditional Estimation (with or without interaction). The workhorse of population PK, using nested optimization to find maximum likelihood estimates.
 

@@ -1,5 +1,5 @@
 [book]
-title = "FeRx-NLME Documentation"
+title = "ferx-core Documentation"
 authors = ["Teun Post", "Ron Keizer"]
 language = "en"
 src = "src"

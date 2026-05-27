@@ -1,6 +1,6 @@
 # ODE Models
 
-For pharmacokinetic models without analytical solutions (e.g., saturable elimination, target-mediated drug disposition), FeRx provides an ODE solver.
+For pharmacokinetic models without analytical solutions (e.g., saturable elimination, target-mediated drug disposition), ferx-core provides an ODE solver.
 
 ## Structural Model Declaration
 
@@ -134,7 +134,7 @@ A one-compartment oral model with saturable (Michaelis-Menten) elimination:
 
 ## Solver Details
 
-FeRx uses a Dormand-Prince RK45 adaptive solver:
+ferx-core uses a Dormand-Prince RK45 adaptive solver:
 
 | Setting | Value |
 |---------|-------|

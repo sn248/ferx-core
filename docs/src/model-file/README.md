@@ -1,6 +1,6 @@
 # Model File Reference
 
-FeRx models are defined in `.ferx` files using a declarative DSL. Each file is organized into blocks, each denoted by a `[block_name]` header.
+ferx-core models are defined in `.ferx` files using a declarative DSL. Each file is organized into blocks, each denoted by a `[block_name]` header.
 
 ## Block Overview
 

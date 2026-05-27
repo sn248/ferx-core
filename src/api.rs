@@ -945,6 +945,36 @@ fn fit_inner(
             "  {} thetas, {} etas, {} sigmas",
             model.n_theta, model.n_eta, model.n_epsilon
         );
+        // Report the route each method actually uses. Gradient-based estimators
+        // (FOCE/FOCEI/GN) are driven by the inner-loop gradient; IMP consumes
+        // the EBE Hessian built via that same route. SAEM is sampling-based, so
+        // it reports its E-step kernel (MH/HMC) instead of a gradient route.
+        let uses_gradient_route = chain.iter().any(|m| {
+            matches!(
+                m,
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::FoceGn
+                    | EstimationMethod::FoceGnHybrid
+                    | EstimationMethod::Imp
+            )
+        });
+        if uses_gradient_route {
+            eprintln!(
+                "  gradient: {}",
+                crate::estimation::inner_optimizer::gradient_route_summary(
+                    model,
+                    population,
+                    options.gradient_method,
+                )
+            );
+        }
+        if chain.iter().any(|m| *m == EstimationMethod::Saem) {
+            eprintln!(
+                "  sampler:  {}",
+                crate::estimation::saem::saem_sampler_summary(model, options)
+            );
+        }
     }
 
     // Model / estimation-option compatibility guards: SDE vs SAEM / GN / AD,

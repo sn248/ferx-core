@@ -6112,6 +6112,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_block_kappa_multiline_fix_own_line() {
+        // FIX on its own line after the closing bracket must be honored for
+        // IOV blocks too (shared fold logic in join_bracketed_lines).
+        let lines = vec![
+            "block_kappa (KAPPA_CL, KAPPA_V) = [".to_string(),
+            "0.05, 0.01, 0.03".to_string(),
+            "]".to_string(),
+            "FIX".to_string(),
+        ];
+        let (_, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
+        assert_eq!(kappas.block.len(), 1);
+        assert!(kappas.block[0].fixed);
+    }
+
+    #[test]
     fn test_parse_block_omega_3x3() {
         let lines = vec![
             "block_omega (ETA_CL, ETA_V, ETA_KA) = [0.09, 0.01, 0.04, 0.005, 0.002, 0.16]"

@@ -558,6 +558,7 @@ pub fn find_ebe(
                         &model.pk_idx_f64,
                         &model.sel_flat,
                         &obs_scale,
+                        model.log_transform,
                     );
                     GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
                     g
@@ -592,6 +593,7 @@ pub fn find_ebe(
                         &model.pk_idx_f64,
                         &model.sel_flat,
                         &event_scale,
+                        model.log_transform,
                     );
                     GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
                     g
@@ -647,6 +649,7 @@ pub fn find_ebe(
                 &model.pk_idx_f64,
                 &model.sel_flat,
                 &obs_scale,
+                model.log_transform,
             );
             GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
             j
@@ -675,6 +678,7 @@ pub fn find_ebe(
                 &model.pk_idx_f64,
                 &model.sel_flat,
                 &event_scale,
+                model.log_transform,
             );
             GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
             j
@@ -1492,6 +1496,8 @@ mod iov_tests {
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
         }
     }
 
@@ -1599,6 +1605,8 @@ mod iov_tests {
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
         };
         let subject = Subject {
             id: "1".into(),

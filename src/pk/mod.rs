@@ -274,6 +274,26 @@ pub fn compute_event_pk_params_into(
 /// eta (κ=0), so the parser rejects it for IOV models (issue #107) — reference
 /// the occasion-dependent structural parameter (e.g. CL) instead. The PK state
 /// is always occasion-correct (it flows through the per-event params).
+/// Positivity floor applied before log-transforming a prediction under LTBS, so
+/// a prediction the optimizer drives toward zero yields a large-but-finite log
+/// value instead of `-inf`/`NaN`.
+pub(crate) const LTBS_FLOOR: f64 = 1e-12;
+
+/// Log-transform predictions in place when the model uses log-transform-both-sides
+/// (LTBS); a no-op otherwise. Applied at every prediction sink so the effective
+/// prediction is `log(f)` everywhere — FOCE linearization, residuals, IWRES/CWRES,
+/// IPRED/PRED, and simulated DV all end up on the log scale (matching NONMEM's
+/// `Y = LOG(F) + EPS`). The mirror transform in the autodiff paths
+/// (`ad::ad_gradients`, `ad::event_driven_ad`) must stay in sync.
+#[inline]
+pub(crate) fn apply_log_transform(model: &CompiledModel, preds: &mut [f64]) {
+    if model.log_transform {
+        for p in preds.iter_mut() {
+            *p = p.max(LTBS_FLOOR).ln();
+        }
+    }
+}
+
 pub fn predict_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -357,6 +377,10 @@ pub fn predict_iov(
             }
         }
     }
+    // LTBS log-wrap. Reached only on the main (event-driven/ODE) path; the
+    // option-A fallback above returns early through `compute_predictions_with_tv`,
+    // which already log-wraps — so predictions are logged exactly once.
+    apply_log_transform(model, &mut preds);
     preds
 }
 
@@ -700,6 +724,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     // Form C (ODE `y = <expr>`) is already applied inside `ode_predictions*`
     // via `OdeSpec::output_fn`, so `model.scaling` is `None` for those.
     apply_scaling(model, subject, theta, eta, &mut preds);
+    apply_log_transform(model, &mut preds);
     preds
 }
 
@@ -870,6 +895,8 @@ mod tests {
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
         }
     }
 
@@ -1184,6 +1211,51 @@ mod tests {
         let mut preds = vec![10.0, 20.0, 30.0];
         apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
         assert_eq!(preds, vec![10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn test_apply_log_transform_noop_when_disabled() {
+        let mut model = cl_from_cr_model();
+        model.log_transform = false;
+        let mut preds = vec![1.0, 2.0, 4.0];
+        apply_log_transform(&model, &mut preds);
+        assert_eq!(preds, vec![1.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn test_apply_log_transform_logs_with_floor() {
+        let mut model = cl_from_cr_model();
+        model.log_transform = true;
+        let mut preds = vec![1.0, std::f64::consts::E, 0.0, -5.0];
+        apply_log_transform(&model, &mut preds);
+        assert_relative_eq!(preds[0], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(preds[1], 1.0, epsilon = 1e-12);
+        // Non-positive predictions are floored, not turned into -inf/NaN.
+        assert_relative_eq!(preds[2], LTBS_FLOOR.ln(), epsilon = 1e-9);
+        assert_relative_eq!(preds[3], LTBS_FLOOR.ln(), epsilon = 1e-9);
+        assert!(preds.iter().all(|p| p.is_finite()));
+    }
+
+    #[test]
+    fn test_ltbs_prediction_is_log_of_natural() {
+        // The whole prediction pipeline (compute_predictions_with_tv) returns
+        // ln(f) when LTBS is active, so log-scale predictions flow into every
+        // downstream consumer (likelihood, IWRES/CWRES, IPRED, simulation).
+        let subj = one_subject_for_scaling();
+        let theta = [1.0];
+
+        let mut natural_model = cl_from_cr_model();
+        natural_model.log_transform = false;
+        let natural = compute_predictions_with_tv(&natural_model, &subj, &theta, &[]);
+
+        let mut ltbs_model = cl_from_cr_model();
+        ltbs_model.log_transform = true;
+        let logged = compute_predictions_with_tv(&ltbs_model, &subj, &theta, &[]);
+
+        assert_eq!(natural.len(), logged.len());
+        for (n, l) in natural.iter().zip(logged.iter()) {
+            assert_relative_eq!(*l, n.max(LTBS_FLOOR).ln(), epsilon = 1e-9);
+        }
     }
 
     #[test]

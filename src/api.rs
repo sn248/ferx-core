@@ -56,7 +56,27 @@ pub(crate) fn model_preds(
         pk::compute_predictions(model.pk_model, subject, pk_params)
     };
     pk::apply_scaling(model, subject, theta, eta, &mut preds);
+    pk::apply_log_transform(model, &mut preds);
     preds
+}
+
+/// Log-transform every observation (including M3 LLOQ values carried on CENS
+/// rows — they live in the same `observations` vector) in place, for LTBS case 2
+/// (`log(DV) ~ additive`, natural-scale data). Returns the count of non-positive
+/// DV values, which are floored to [`crate::pk::LTBS_FLOOR`] before the log so the
+/// result stays finite. Case 1 (`DV ~ log_additive`, `dv_pre_logged`) must NOT
+/// call this — the DV is already on the log scale.
+fn log_transform_observations(pop: &mut Population) -> usize {
+    let mut n_nonpos = 0usize;
+    for subject in &mut pop.subjects {
+        for v in &mut subject.observations {
+            if *v <= 0.0 {
+                n_nonpos += 1;
+            }
+            *v = v.max(crate::pk::LTBS_FLOOR).ln();
+        }
+    }
+    n_nonpos
 }
 
 /// Run a model file with a NONMEM-format CSV dataset.
@@ -179,7 +199,14 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         let sims: Vec<_> = sim_results.iter().filter(|s| s.id == subject.id).collect();
         for (j, s) in sims.iter().enumerate() {
             if j < subject.observations.len() {
-                subject.observations[j] = s.dv_sim.max(0.001);
+                // Under LTBS the simulated DV is on the log scale and may be
+                // negative, so the positivity floor only applies to natural-scale
+                // simulation.
+                subject.observations[j] = if parsed.model.log_transform {
+                    s.dv_sim
+                } else {
+                    s.dv_sim.max(0.001)
+                };
             }
         }
     }
@@ -713,6 +740,34 @@ pub fn fit(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
+    // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
+    // enforces these for `.ferx` models, but a Rust caller could otherwise set
+    // `log_transform = true` together with a proportional/combined error or a
+    // per-CMT spec, which would make the likelihood inconsistent (predictions
+    // log-wrapped while variance still expects natural-scale `f`). Fail fast.
+    if model.log_transform {
+        if !matches!(model.error_model, ErrorModel::Additive) {
+            return Err(
+                "LTBS (`log_transform = true`) requires `error_model = Additive`; \
+                 proportional/combined error on the log scale is not supported"
+                    .to_string(),
+            );
+        }
+        if !matches!(model.error_spec, ErrorSpec::Single(_)) {
+            return Err(
+                "LTBS (`log_transform = true`) is not supported with per-CMT \
+                 (`ErrorSpec::PerCmt`) error models"
+                    .to_string(),
+            );
+        }
+        if model.diffusion_theta_start.is_some() {
+            return Err(
+                "LTBS (`log_transform = true`) is not supported with an SDE \
+                 model (`diffusion_theta_start = Some(_)`)"
+                    .to_string(),
+            );
+        }
+    }
     // Data-dependent fatal checks (covariates present, per-CMT scaling and
     // per-CMT error-model coverage). These can't run in the parser — it doesn't
     // see the data. `ferx check` runs the same `check_model_data` to report
@@ -726,15 +781,37 @@ pub fn fit(
     // cheap analytical/no-TV fast path instead of the event-driven
     // path. Bigger wins on SAD-style datasets where every subject has
     // a varying DAY column but no model expression touches DAY.
+    // Log-transform-both-sides (LTBS) case 2 (`log(DV) ~ additive`): the data's
+    // DV is on the natural scale, so log-transform every observation once here,
+    // before any prediction is scored against it. Case 1 (`DV ~ log_additive`,
+    // `dv_pre_logged`) leaves the already-log DV untouched. Logging into the
+    // owned clone leaves the caller's `Population` (and any `simulate` reuse of
+    // it) unmodified, and avoids double-logging on repeated `fit()` calls.
+    let needs_dv_log = model.log_transform && !model.dv_pre_logged;
+    let mut ltbs_warnings: Vec<String> = Vec::new();
     let pop_pruned: std::borrow::Cow<Population> = {
-        let needs = population.subjects.iter().any(|s| {
+        let needs_prune = population.subjects.iter().any(|s| {
             !s.dose_covariates.is_empty()
                 || !s.obs_covariates.is_empty()
                 || !s.pk_only_covariates.is_empty()
         });
-        if needs {
+        if needs_prune || needs_dv_log {
             let mut p = population.clone();
-            p.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+            if needs_prune {
+                p.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+            }
+            if needs_dv_log {
+                let n_nonpos = log_transform_observations(&mut p);
+                if n_nonpos > 0 {
+                    ltbs_warnings.push(format!(
+                        "LTBS (log(DV) ~ ...): {n_nonpos} observation(s) had DV ≤ 0, which \
+                         cannot be log-transformed; they were floored to log({LTBS_FLOOR:e}). \
+                         Check the data scale, or use `DV ~ log_additive(...)` if DV is \
+                         already log-transformed.",
+                        LTBS_FLOOR = crate::pk::LTBS_FLOOR,
+                    ));
+                }
+            }
             std::borrow::Cow::Owned(p)
         } else {
             std::borrow::Cow::Borrowed(population)
@@ -744,7 +821,7 @@ pub fn fit(
 
     // Single-start fast path (default)
     if options.n_starts <= 1 {
-        return match options.threads {
+        let res = match options.threads {
             Some(n) if n > 0 => {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(n)
@@ -754,6 +831,10 @@ pub fn fit(
             }
             _ => fit_inner(model, pop_ref, init_params, options),
         };
+        return res.map(|mut result| {
+            result.warnings.splice(0..0, ltbs_warnings);
+            result
+        });
     }
 
     // Multi-start: run n_starts fits in parallel, return the lowest-OFV converged result.
@@ -769,7 +850,7 @@ pub fn fit(
     let sigma = options.start_sigma;
 
     // Warn once (before the parallel section) that global_search only runs on start 0.
-    let mut pre_warnings: Vec<String> = Vec::new();
+    let mut pre_warnings: Vec<String> = ltbs_warnings;
     if options.global_search && n > 1 {
         pre_warnings.push(format!(
             "global_search = true with n_starts = {n}: CRS2-LM only runs on start 0 \
@@ -2404,6 +2485,8 @@ mod iov_integration {
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
         }
     }
 
@@ -3205,6 +3288,8 @@ mod simulate_with_uncertainty_tests {
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
         }
     }
 
@@ -3359,6 +3444,23 @@ mod simulate_with_uncertainty_tests {
         let pop = tiny_population();
         let rows = simulate_with_seed(&model, &pop, &model.default_params, 2, 42);
         assert!(rows.iter().all(|r| r.draw == 1));
+    }
+
+    #[test]
+    fn fit_rejects_ltbs_with_proportional_error() {
+        // Defensive guard against hand-built `CompiledModel`s: the parser already
+        // rejects this combination, but a Rust caller flipping `log_transform = true`
+        // on a model with proportional/combined error would silently mis-fit (the
+        // prediction is log-wrapped but the variance still expects natural-scale f).
+        let mut model = tiny_model(); // tiny_model uses Proportional error
+        model.log_transform = true;
+        let pop = tiny_population();
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts).unwrap_err();
+        assert!(
+            err.contains("LTBS") && err.contains("Additive"),
+            "expected LTBS+proportional rejection, got: {err}"
+        );
     }
 
     #[test]

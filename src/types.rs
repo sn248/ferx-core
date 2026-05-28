@@ -1144,6 +1144,20 @@ pub struct CompiledModel {
     /// the prediction is returned unchanged. Forms A/B from the `[scaling]`
     /// block populate this field; Form C lives on `ode_spec.output_fn`.
     pub scaling: ScalingSpec,
+    /// Log-transform-both-sides (LTBS) active. When `true`, the effective
+    /// prediction is `log(f)` and the residual error is additive on the log
+    /// scale (matching NONMEM's `Y = LOG(F) + EPS`). Set by the parser when
+    /// the `[error_model]` uses `log(DV) ~ additive(...)` or
+    /// `DV ~ log_additive(...)`. The prediction sinks log-wrap their output
+    /// when this is set, so IPRED/PRED/IWRES/CWRES and simulated DV are all
+    /// reported on the log scale.
+    pub log_transform: bool,
+    /// Only meaningful when `log_transform` is `true`. `true` means the data's
+    /// `DV` column is *already* on the log scale (case 1, `DV ~ log_additive`),
+    /// so `fit()` must NOT log-transform it again; `false` means `DV` is on the
+    /// natural scale (case 2, `log(DV) ~ additive`) and `fit()` log-transforms
+    /// the observations once at load. Ignored when `log_transform` is `false`.
+    pub dv_pre_logged: bool,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -2154,6 +2168,8 @@ pub(crate) mod test_helpers {
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
         }
     }
 }

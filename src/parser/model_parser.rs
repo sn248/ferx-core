@@ -786,7 +786,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let error_lines = blocks
         .get("error_model")
         .ok_or("Missing [error_model] block")?;
-    let parsed_error_model = parse_error_model(error_lines)?;
+    let (parsed_error_model, ltbs_flags) = parse_error_model(error_lines)?;
+    // LTBS log-transforms the structural prediction, which is incompatible with
+    // the SDE/EKF measurement model (the extended Kalman filter assumes a
+    // natural-scale additive/proportional observation). Reject the combination.
+    if ltbs_flags.log_transform && blocks.contains_key("diffusion") {
+        return Err(
+            "[error_model] log-transform-both-sides is not supported with an SDE \
+             ([diffusion]) model"
+                .to_string(),
+        );
+    }
 
     let indiv_lines = blocks
         .get("individual_parameters")
@@ -1307,6 +1317,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         eta_param_info,
         theta_transform,
         scaling: ScalingSpec::None,
+        log_transform: ltbs_flags.log_transform,
+        dv_pre_logged: ltbs_flags.dv_pre_logged,
     };
 
     // ── Optional blocks ──
@@ -3578,18 +3590,34 @@ enum ParsedErrorModel {
     PerCmt(Vec<(usize, ErrorModel, Vec<String>)>),
 }
 
-fn parse_error_model(lines: &[String]) -> Result<ParsedErrorModel, String> {
+/// Log-transform-both-sides (LTBS) flags extracted from the `[error_model]`
+/// block. `log_transform` mirrors `CompiledModel::log_transform`; `dv_pre_logged`
+/// mirrors `CompiledModel::dv_pre_logged`. Both default `false` (no LTBS).
+#[derive(Clone, Copy, Default)]
+struct LtbsFlags {
+    log_transform: bool,
+    dv_pre_logged: bool,
+}
+
+fn parse_error_model(lines: &[String]) -> Result<(ParsedErrorModel, LtbsFlags), String> {
     // Single-endpoint:
     //   DV ~ proportional(SIGMA_NAME)
     //   DV ~ additive(SIGMA_NAME)
     //   DV ~ combined(SIGMA1, SIGMA2)
+    // Log-transform-both-sides (LTBS), additive error on the log scale:
+    //   log(DV) ~ additive(SIGMA_NAME)   # natural-scale DV; engine logs DV + pred
+    //   DV ~ log_additive(SIGMA_NAME)    # DV already log; engine logs the pred only
     // Multi-endpoint (per-CMT dispatch, ODE models only):
     //   CMT=2: DV ~ proportional(PROP_ERR_PK)
     //   CMT=3: DV ~ additive(ADD_ERR_PD)
     let re = Regex::new(r"(\w+)\s*~\s*(\w+)\(([^)]+)\)").unwrap();
+    // LTBS LHS `log(DV) ~ TYPE(SIGMA)` — captures the logged data column,
+    // the error type, and the sigma list.
+    let log_lhs_re = Regex::new(r"^\s*log\s*\(\s*(\w+)\s*\)\s*~\s*(\w+)\(([^)]+)\)").unwrap();
     let cmt_re = Regex::new(r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$").unwrap();
 
-    let mut singles: Vec<(ErrorModel, Vec<String>)> = Vec::new();
+    // singles carry the per-line LTBS flags so the chosen single can stamp them.
+    let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
 
     for line in lines {
@@ -3608,14 +3636,23 @@ fn parse_error_model(lines: &[String]) -> Result<ParsedErrorModel, String> {
             (None, trimmed.to_string())
         };
 
-        let caps = match re.captures(&body) {
-            Some(c) => c,
-            None => continue, // not an error-model statement
+        // A `log(DV)` LHS (case 2) is detected first since the plain regex's
+        // `\w+` LHS can't match the parenthesised form.
+        let (lhs_logged, caps) = if let Some(c) = log_lhs_re.captures(&body) {
+            (true, c)
+        } else {
+            match re.captures(&body) {
+                Some(c) => (false, c),
+                None => continue, // not an error-model statement
+            }
         };
-        let error_type = &caps[2];
+        let error_type = caps[2].to_lowercase();
         let sigma_names: Vec<String> = caps[3].split(',').map(|s| s.trim().to_string()).collect();
-        let error_model = match error_type.to_lowercase().as_str() {
-            "additive" => ErrorModel::Additive,
+        // `log_additive` (case 1) is additive error whose prediction is logged
+        // while DV is taken as-is (already log-transformed in the data).
+        let type_is_log_additive = error_type == "log_additive";
+        let error_model = match error_type.as_str() {
+            "additive" | "log_additive" => ErrorModel::Additive,
             "proportional" => ErrorModel::Proportional,
             "combined" => ErrorModel::Combined,
             other => return Err(format!("Unknown error model: {}", other)),
@@ -3630,9 +3667,51 @@ fn parse_error_model(lines: &[String]) -> Result<ParsedErrorModel, String> {
             ));
         }
 
+        // LTBS validation. `log(DV) ~ log_additive(...)` double-logs the data and
+        // is rejected; LTBS only supports additive error on the log scale; and the
+        // per-CMT (multi-endpoint) form is out of scope for LTBS.
+        if lhs_logged && type_is_log_additive {
+            return Err(format!(
+                "[error_model] `{}` double-log-transforms DV: use `log(DV) ~ additive(...)` \
+                 (engine logs DV) OR `DV ~ log_additive(...)` (DV already log), not both",
+                trimmed
+            ));
+        }
+        let log_transform = lhs_logged || type_is_log_additive;
+        if log_transform && !matches!(error_model, ErrorModel::Additive) {
+            return Err(format!(
+                "[error_model] log-transform-both-sides supports only additive error on the \
+                 log scale; use `log(DV) ~ additive(...)` or `DV ~ log_additive(...)`: {}",
+                trimmed
+            ));
+        }
+        if log_transform && cmt_opt.is_some() {
+            return Err(
+                "[error_model] log-transform-both-sides (`log(DV) ~ ...` / `log_additive`) \
+                 is not supported with per-CMT (multi-endpoint) error models"
+                    .to_string(),
+            );
+        }
+        // The engine always log-transforms the `DV` column under LTBS — a
+        // different LHS name (e.g. `log(CONC) ~ additive(...)`) would parse but
+        // silently operate on `DV`, which is confusing. Reject it.
+        if log_transform && !caps[1].eq_ignore_ascii_case("DV") {
+            return Err(format!(
+                "[error_model] log-transform-both-sides must reference the `DV` column \
+                 (got `{}`): write `log(DV) ~ additive(...)` or `DV ~ log_additive(...)`",
+                &caps[1]
+            ));
+        }
+        let flags = LtbsFlags {
+            log_transform,
+            // `log(DV)` logs DV in the engine (data is natural scale);
+            // `log_additive` trusts the data is already on the log scale.
+            dv_pre_logged: type_is_log_additive,
+        };
+
         match cmt_opt {
             Some(cmt) => per_cmt.push((cmt, error_model, sigma_names)),
-            None => singles.push((error_model, sigma_names)),
+            None => singles.push((error_model, sigma_names, flags)),
         }
     }
 
@@ -3652,11 +3731,11 @@ fn parse_error_model(lines: &[String]) -> Result<ParsedErrorModel, String> {
                 ));
             }
         }
-        return Ok(ParsedErrorModel::PerCmt(per_cmt));
+        return Ok((ParsedErrorModel::PerCmt(per_cmt), LtbsFlags::default()));
     }
 
     match singles.into_iter().next() {
-        Some((model, names)) => Ok(ParsedErrorModel::Single(model, names)),
+        Some((model, names, flags)) => Ok((ParsedErrorModel::Single(model, names), flags)),
         None => Err("No error model found in [error_model] block".to_string()),
     }
 }
@@ -6767,6 +6846,107 @@ mod tests {
 "#,
             fit_opts
         )
+    }
+
+    /// Build a 1-cpt oral model with a custom `[error_model]` block (and one
+    /// extra sigma so combined/per-CMT cases have enough sigmas to reference).
+    fn model_with_error_block(error_block: &str) -> Result<crate::types::CompiledModel, String> {
+        let content = format!(
+            r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma SIG1 ~ 0.02
+  sigma SIG2 ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+{error_block}
+"#
+        );
+        parse_model_string(&content)
+    }
+
+    #[test]
+    fn test_ltbs_log_dv_additive_case2() {
+        // `log(DV) ~ additive(...)`: engine logs DV (natural-scale data).
+        let m = model_with_error_block("  log(DV) ~ additive(SIG1)").unwrap();
+        assert!(
+            m.log_transform,
+            "log(DV) ~ additive should set log_transform"
+        );
+        assert!(
+            !m.dv_pre_logged,
+            "log(DV) ~ additive: engine logs DV, so dv_pre_logged must be false"
+        );
+        assert_eq!(m.error_model, ErrorModel::Additive);
+    }
+
+    #[test]
+    fn test_ltbs_log_additive_case1() {
+        // `DV ~ log_additive(...)`: DV already log; only the prediction is logged.
+        let m = model_with_error_block("  DV ~ log_additive(SIG1)").unwrap();
+        assert!(m.log_transform, "log_additive should set log_transform");
+        assert!(
+            m.dv_pre_logged,
+            "log_additive: DV is already log, so dv_pre_logged must be true"
+        );
+        assert_eq!(m.error_model, ErrorModel::Additive);
+    }
+
+    #[test]
+    fn test_non_ltbs_additive_unaffected() {
+        let m = model_with_error_block("  DV ~ additive(SIG1)").unwrap();
+        assert!(!m.log_transform);
+        assert!(!m.dv_pre_logged);
+    }
+
+    #[test]
+    fn test_ltbs_rejects_proportional() {
+        let err = model_with_error_block("  log(DV) ~ proportional(SIG1)").unwrap_err();
+        assert!(
+            err.contains("additive"),
+            "expected additive-only message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ltbs_rejects_double_log() {
+        let err = model_with_error_block("  log(DV) ~ log_additive(SIG1)").unwrap_err();
+        assert!(
+            err.contains("double-log"),
+            "expected double-log rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ltbs_rejects_non_dv_lhs() {
+        // `log(<not DV>) ~ additive(...)` would parse silently but the engine
+        // always log-transforms the `DV` column, so the LHS is misleading.
+        let err = model_with_error_block("  log(CONC) ~ additive(SIG1)").unwrap_err();
+        assert!(
+            err.contains("DV"),
+            "expected DV-required rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ltbs_rejects_per_cmt() {
+        // LTBS is single-endpoint only.
+        let err = model_with_error_block("  CMT=1: log(DV) ~ additive(SIG1)").unwrap_err();
+        assert!(
+            err.contains("per-CMT") || err.contains("multi-endpoint"),
+            "expected per-CMT rejection, got: {err}"
+        );
     }
 
     #[test]

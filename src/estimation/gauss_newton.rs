@@ -2219,7 +2219,12 @@ mod tests {
         let mut options = FitOptions::default();
         options.interaction = true;
 
-        let (nll, grad) = subject_nll_pop_grad(
+        // Call the analytical function directly (not through `subject_nll_pop_grad`)
+        // so a silent fall-through to the FD path — which would also match the FD
+        // reference and pass the test — is impossible. `.expect` surfaces any
+        // future fixture regression that drives H̃ non-PD or trips the late
+        // finiteness guard.
+        let (nll, grad) = subject_nll_pop_grad_analytical_laplace(
             &x,
             template,
             &model,
@@ -2227,10 +2232,10 @@ mod tests {
             0,
             &eta_hat,
             &h_matrix,
-            &[],
             &bounds,
             &options,
-        );
+        )
+        .expect("analytical Laplace path must succeed on this fixture");
 
         // NLL must match a direct subject_nll_at call (which routes through
         // foce_subject_nll_interaction = Almquist Laplace under interaction).
@@ -2339,7 +2344,8 @@ mod tests {
         let mut options = FitOptions::default();
         options.interaction = true;
 
-        let (nll, grad) = subject_nll_pop_grad(
+        // Direct analytical call — see sibling test for why we bypass the dispatcher.
+        let (nll, grad) = subject_nll_pop_grad_analytical_laplace(
             &x,
             template,
             &model,
@@ -2347,10 +2353,10 @@ mod tests {
             0,
             &eta_hat,
             &h_matrix,
-            &[],
             &bounds,
             &options,
-        );
+        )
+        .expect("analytical Laplace path must succeed on this fixture");
 
         let params_base = unpack_params(&x, template);
         let nll_ref = subject_nll_at(
@@ -2521,7 +2527,8 @@ mod tests {
         let mut options = FitOptions::default();
         options.interaction = true;
 
-        let (nll, grad) = subject_nll_pop_grad(
+        // Direct analytical call — see sibling test for why we bypass the dispatcher.
+        let (nll, grad) = subject_nll_pop_grad_analytical_laplace(
             &x,
             template,
             &model,
@@ -2529,10 +2536,10 @@ mod tests {
             0,
             &eta_hat,
             &h_matrix,
-            &[],
             &bounds,
             &options,
-        );
+        )
+        .expect("analytical Laplace path must succeed on this fixture");
 
         let params_base = unpack_params(&x, template);
         let nll_ref = subject_nll_at(
@@ -2628,7 +2635,8 @@ mod tests {
         let mut options = FitOptions::default();
         options.interaction = true;
 
-        let (nll, grad) = subject_nll_pop_grad(
+        // Direct analytical call — see sibling test for why we bypass the dispatcher.
+        let (nll, grad) = subject_nll_pop_grad_analytical_laplace(
             &x,
             template,
             &model,
@@ -2636,10 +2644,10 @@ mod tests {
             0,
             &eta_hat,
             &h_matrix,
-            &[],
             &bounds,
             &options,
-        );
+        )
+        .expect("analytical Laplace path must succeed on this fixture");
 
         let params_base = unpack_params(&x, template);
         let nll_ref = subject_nll_at(

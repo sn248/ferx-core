@@ -2044,21 +2044,74 @@ fn build_y_output_fn(
              parameter (e.g. CL) instead. See issue #107."
         ));
     }
-    let state_idx: HashMap<String, usize> = state_names
+    // Mirrors the ODE RHS port (PR #135): resolve the Form C expression to
+    // the indexed evaluator at parse time so the closure can avoid per-call
+    // `HashMap<String, f64>` allocation + string hashing on every observation.
+    // The slow path was the dominant non-RHS HashMap cost in profiling — for a
+    // model with N PK obs + M PD obs per integration, the readout closure was
+    // doing O((N + M) · (n_states + n_indiv)) string-hash inserts.
+    //
+    // Layout: vars[0..n_states]                              = state values
+    //         vars[n_states..n_states + n_indiv]             = indiv-param values
+    //                                                          (read from pk_params_flat
+    //                                                           via the same pk-slot plan
+    //                                                           the old HashMap path used)
+    //
+    // `var_idx` uses last-writer-wins on collisions to preserve the prior
+    // semantics: if a state and an indiv share a name, the old code did
+    // `vars.insert(state)` then `vars.insert(indiv)` — indiv won. The
+    // matching `HashMap::insert` (not `or_insert`) below keeps that.
+    let n_states = state_names.len();
+    let n_indiv = indiv_var_names.len();
+    let mut var_idx: HashMap<String, usize> = HashMap::new();
+    for (i, n) in state_names.iter().enumerate() {
+        var_idx.insert(n.clone(), i);
+    }
+    for (i, n) in indiv_var_names.iter().enumerate() {
+        var_idx.insert(n.clone(), n_states + i);
+    }
+    let n_vars_total = n_states + n_indiv;
+
+    // Indiv-param → pk_params_flat slot plan (preserves the old HashMap
+    // `indiv_idx` semantics).
+    let indiv_to_pk: Vec<usize> = (0..n_indiv)
+        .map(|i| pk_indices.get(i).copied().unwrap_or(i))
+        .collect();
+
+    // Covariate references in the expression are resolved against a small
+    // `cov_idx` built from the names the expression actually references.
+    // Most Form C readouts (including the experiment's Emax model) have
+    // zero — when that's the case the per-call covariate-lookup loop is
+    // a no-op.
+    let mut cov_referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_covariates(&expr, &mut cov_referenced);
+    let cov_names: Vec<String> = {
+        let mut v: Vec<String> = cov_referenced.into_iter().collect();
+        v.sort();
+        v
+    };
+    let cov_idx: HashMap<String, usize> = cov_names
         .iter()
         .enumerate()
         .map(|(i, n)| (n.clone(), i))
         .collect();
-    // Map each individual-parameter name to its PK slot (`pk_params_flat` is
-    // indexed by PK slot via `pk_indices`, NOT by declaration order). Mirrors
-    // the Form B path; without this a readout like `central/V` reads the wrong
-    // (often uninitialised → NaN) slot whenever a param's declaration index
-    // differs from its PK slot.
-    let indiv_idx: HashMap<String, usize> = indiv_var_names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.clone(), pk_indices.get(i).copied().unwrap_or(i)))
-        .collect();
+
+    // Rewrite Variable → VariableIdx and Covariate → CovariateIdx in place.
+    let mut expr = expr;
+    resolve_expr_indices(&mut expr, &var_idx, &cov_idx);
+
+    // Per-thread scratch for the y readout vars + covariate slice. Separate
+    // from `build_ode_rhs_fn`'s `RHS_VARS_SCRATCH` because the two are sized
+    // for different layouts and called in different phases of the
+    // integration (RHS per RK45 stage; readout per observation).
+    thread_local! {
+        static Y_VARS_SCRATCH: std::cell::RefCell<Vec<f64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static Y_COV_SCRATCH: std::cell::RefCell<Vec<f64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let n_cov = cov_names.len();
+
     let out_fn: crate::ode::OdeOutputFn = Box::new(
         move |state: &[f64],
               pk_params_flat: &[f64],
@@ -2066,20 +2119,43 @@ fn build_y_output_fn(
               eta: &[f64],
               covariates: &HashMap<String, f64>|
               -> f64 {
-            let mut vars: HashMap<String, f64> =
-                HashMap::with_capacity(state_idx.len() + indiv_idx.len());
-            for (name, &i) in &state_idx {
-                if i < state.len() {
-                    vars.insert(name.clone(), state[i]);
-                }
-            }
-            for (name, &i) in &indiv_idx {
-                if i < pk_params_flat.len() {
-                    vars.insert(name.clone(), pk_params_flat[i]);
-                }
-            }
-            let empty_nn: Vec<Vec<f64>> = Vec::new();
-            eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
+            Y_VARS_SCRATCH.with(|vcell| {
+                Y_COV_SCRATCH.with(|ccell| {
+                    let mut vars = vcell.borrow_mut();
+                    vars.clear();
+                    vars.resize(n_vars_total, 0.0);
+
+                    // State values from state[]; protect against a malformed
+                    // (state.len() < n_states) input the same way the old
+                    // HashMap path did (it skipped via `if i < state.len()`).
+                    let copy_n = n_states.min(state.len());
+                    vars[..copy_n].copy_from_slice(&state[..copy_n]);
+
+                    // Indiv params from pk_params_flat via the pre-computed
+                    // slot plan; OOB slots leave the var at 0.0.
+                    for (i, &pk_slot) in indiv_to_pk.iter().enumerate() {
+                        if let (Some(dst), Some(&val)) =
+                            (vars.get_mut(n_states + i), pk_params_flat.get(pk_slot))
+                        {
+                            *dst = val;
+                        }
+                    }
+
+                    let mut cov_buf = ccell.borrow_mut();
+                    cov_buf.clear();
+                    if n_cov > 0 {
+                        cov_buf.resize(n_cov, 0.0);
+                        for (i, name) in cov_names.iter().enumerate() {
+                            if let Some(&v) = covariates.get(name) {
+                                cov_buf[i] = v;
+                            }
+                        }
+                    }
+
+                    let empty_nn: Vec<Vec<f64>> = Vec::new();
+                    eval_expression_indexed(&expr, theta, eta, &cov_buf, &vars, &empty_nn)
+                })
+            })
         },
     );
     Ok(out_fn)

@@ -669,6 +669,36 @@ impl ErrorSpec {
         }
     }
 
+    /// `d²(residual variance)/d(prediction f)²` for one observation at `cmt`.
+    ///
+    /// Additive endpoints contribute 0 (variance is `σ_add²`, independent of f).
+    /// Proportional and combined endpoints contribute `2·σ_prop²` (variance has
+    /// a `f²·σ_prop²` term, so the second derivative w.r.t. f is constant).
+    /// `Single` ignores `cmt`; `PerCmt` dispatches on the endpoint registered
+    /// for `cmt`. Used by the Almquist Laplace FOCEI gradient's θ-axis β_j
+    /// chain — keeping the per-CMT routing here lets the same closed-form
+    /// gradient handle multi-endpoint models without changing the call site.
+    pub fn d2var_df2(&self, cmt: usize, sigma: &[f64]) -> f64 {
+        let (em, prop_sigma) = match self {
+            ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
+            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
+                Some(ep) => (
+                    ep.error_model,
+                    ep.sigma_idx
+                        .first()
+                        .and_then(|&i| sigma.get(i))
+                        .copied()
+                        .unwrap_or(0.0),
+                ),
+                None => return 0.0,
+            },
+        };
+        match em {
+            ErrorModel::Additive => 0.0,
+            ErrorModel::Proportional | ErrorModel::Combined => 2.0 * prop_sigma * prop_sigma,
+        }
+    }
+
     /// `d(residual variance)/d(log σ_k)` for one observation at `cmt`, where
     /// `k` indexes the flat global sigma vector. Zero when `σ_k` does not enter
     /// this observation's endpoint, so the SAEM sigma-gradient can sum this over

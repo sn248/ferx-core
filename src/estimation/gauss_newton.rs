@@ -953,12 +953,12 @@ fn subject_nll_pop_grad_analytical_laplace(
 ) -> Option<(f64, Vec<f64>)> {
     use crate::pk;
 
-    // Same single-error-spec invariant the SB path holds (analytical PK only,
-    // no per-CMT, no M3) — the caller's `can_use_analytical` already ensures it.
-    debug_assert!(
-        matches!(model.error_spec, ErrorSpec::Single(_)),
-        "analytical Laplace GN gradient reached with a non-Single error spec"
-    );
+    // The Almquist Laplace gradient now supports both `ErrorSpec::Single` and
+    // `ErrorSpec::PerCmt`. The per-CMT routing flows through `dvar_df`,
+    // `dvar_dlogsigma`, `d2var_df2`, and `variance_at` — every variance-related
+    // call site already takes `subject.obs_cmts[j]`. The caller still gates on
+    // analytical PK and excludes M3 (`can_use_analytical` in
+    // `subject_nll_pop_grad`).
     // Sibling debug_assert to the SB path: this function computes the Almquist
     // Laplace gradient, which is only consistent with the NLL the outer FOCE
     // loop minimises when `options.interaction == true`. The dispatcher already
@@ -1005,28 +1005,17 @@ fn subject_nll_pop_grad_analytical_laplace(
     let d_vec: Vec<f64> = (0..n_obs)
         .map(|j| error_spec.dvar_df(subject.obs_cmts[j], ipreds[j], sigma_values))
         .collect();
-    // ∂²R/∂f² is constant in f for additive/proportional/combined: it's 0 for
-    // additive and 2·σ_prop² for the other two. We read the inner ErrorModel
-    // off the `Single` ErrorSpec (guaranteed by the debug_assert above) rather
-    // than `model.error_model` so this stays consistent with the `variance_at`
-    // / `dvar_df` / `dvar_dlogsigma` calls below — all of which dispatch on
-    // `error_spec`. (`model.error_model` is the legacy single-error field;
-    // hand-built models can desync the two, and the debug_assert is a no-op
-    // in release.)
-    let inner_em = match error_spec {
-        ErrorSpec::Single(em) => *em,
-        // Guard for release builds where the debug_assert is a no-op; PerCmt
-        // does not have a single representative ∂²R/∂f² so we bail and let
-        // the dispatcher fall back to FD.
-        ErrorSpec::PerCmt(_) => return None,
-    };
-    let d2_scalar = match inner_em {
-        ErrorModel::Additive => 0.0,
-        ErrorModel::Proportional | ErrorModel::Combined => {
-            let sp = sigma_values.first().copied().unwrap_or(0.0);
-            2.0 * sp * sp
-        }
-    };
+    // ∂²R/∂f² per observation. f-independent for additive/proportional/combined
+    // (0 for additive, 2·σ_prop² otherwise), but the *per-CMT* value can differ
+    // across observations: e.g. an Emax PK/PD model with proportional error on
+    // PK (CMT=2) and additive on PD (CMT=3) needs `d2 = 2·σ_prop²` at PK obs
+    // and `d2 = 0` at PD obs. Dispatch through `error_spec.d2var_df2` so the
+    // PerCmt case picks up each endpoint's own contribution; `Single` ignores
+    // the cmt argument and returns the scalar value uniformly. The β_j chain
+    // at line ~1095 then reads `d2_vec[j]` per obs.
+    let d2_vec: Vec<f64> = (0..n_obs)
+        .map(|j| error_spec.d2var_df2(subject.obs_cmts[j], sigma_values))
+        .collect();
 
     // Conditional Hessian H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.
     // c̃_{j,k} = dⱼ·a_{j,k}/Rⱼ; we only need the symmetric outer products,
@@ -1083,13 +1072,13 @@ fn subject_nll_pop_grad_analytical_laplace(
     //   αⱼ   = −2·errⱼ/Rⱼ + dⱼ·(Rⱼ − errⱼ²)/Rⱼ²
     //   βⱼ   = −dⱼ/Rⱼ² + dⱼ·d2ⱼ/Rⱼ² − dⱼ³/Rⱼ³
     let mut theta_per_j = vec![0.0f64; n_obs];
-    let d2 = d2_scalar; // f-independent for additive/proportional/combined
     for j in 0..n_obs {
         let r = r_diag[j];
         let inv_r = 1.0 / r;
         let inv_r2 = inv_r * inv_r;
         let inv_r3 = inv_r2 * inv_r;
         let d = d_vec[j];
+        let d2 = d2_vec[j]; // per-obs / per-CMT; constant in f for the current error models
         let e = err[j];
         let alpha_j = -2.0 * e * inv_r + d * (r - e * e) * inv_r2;
         let beta_j = -d * inv_r2 + d * d2 * inv_r2 - d * d * d * inv_r3;
@@ -1273,11 +1262,21 @@ pub(crate) fn subject_nll_pop_grad(
     // `subject_nll_at` stays exactly consistent with the objective the outer
     // FOCE loop minimises. (The old analytical κ-prior gradient matched the
     // since-removed MAP-penalty objective and would now disagree.)
-    let can_use_analytical = model.ode_spec.is_none()
-        && !matches!(model.bloq_method, BloqMethod::M3)
-        && kappas.is_empty();
+    // Two analytical paths with different scope:
+    //   - Sheiner–Beal (no INTER): analytical PK only, single error spec — the
+    //     SB chain rule still assumes `ipreds = f₀ + a·η̂` (a linear surface)
+    //     and a single (∂R/∂σ_k, ∂d/∂σ_k) per obs, both untouched here.
+    //   - Almquist Laplace (INTER): every variance call already dispatches
+    //     through `error_spec` (so per-CMT works), and the θ axis is a
+    //     forward-FD on `pk::compute_predictions_with_tv` — which itself
+    //     dispatches to the ODE solver for ODE models. So Laplace can run on
+    //     ODE + PerCmt models too; the only blockers are M3 and IOV.
+    let common_ok = !matches!(model.bloq_method, BloqMethod::M3) && kappas.is_empty();
+    let sb_ok =
+        common_ok && model.ode_spec.is_none() && matches!(model.error_spec, ErrorSpec::Single(_));
+    let laplace_ok = common_ok;
 
-    if can_use_analytical {
+    if (options.interaction && laplace_ok) || (!options.interaction && sb_ok) {
         // Dispatch to the form whose gradient is exactly consistent with the
         // NLL `foce_subject_nll` is computing for this subject:
         //   - `options.interaction == true`  → Almquist 2015 Laplace

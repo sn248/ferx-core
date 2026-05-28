@@ -4573,11 +4573,14 @@ fn eval_condition_indexed(
     }
 }
 
-/// Indexed-form statement executor; mirror of `eval_statements`. Only
-/// handles `AssignIdx` + `If`; if any non-indexed variant slips through,
-/// it falls back to a no-op (defensive — caller should ensure the AST
-/// was resolved). `DiffEq` is not supported here because the indexed
-/// path is only used by `pk_param_fn` (no derivatives).
+/// Indexed-form statement executor; mirror of `eval_statements`. Handles
+/// `AssignIdx`, `DiffEqIdx`, and `If`; if any non-indexed `Assign` or
+/// `DiffEq` slips through, it falls back to a no-op (defensive — caller
+/// should ensure the AST has been run through `resolve_variable_indices`).
+///
+/// `du` carries the derivative buffer the `DiffEqIdx` arm writes into. ODE
+/// RHS callers (`build_ode_rhs_fn`) pass `Some(du)`; non-derivative callers
+/// (`pk_param_fn`) pass `None` and never construct a `DiffEqIdx`.
 fn eval_statements_indexed(
     stmts: &[Statement],
     theta: &[f64],

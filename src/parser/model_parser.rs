@@ -3692,6 +3692,16 @@ fn parse_error_model(lines: &[String]) -> Result<(ParsedErrorModel, LtbsFlags), 
                     .to_string(),
             );
         }
+        // The engine always log-transforms the `DV` column under LTBS — a
+        // different LHS name (e.g. `log(CONC) ~ additive(...)`) would parse but
+        // silently operate on `DV`, which is confusing. Reject it.
+        if log_transform && !caps[1].eq_ignore_ascii_case("DV") {
+            return Err(format!(
+                "[error_model] log-transform-both-sides must reference the `DV` column \
+                 (got `{}`): write `log(DV) ~ additive(...)` or `DV ~ log_additive(...)`",
+                &caps[1]
+            ));
+        }
         let flags = LtbsFlags {
             log_transform,
             // `log(DV)` logs DV in the engine (data is natural scale);
@@ -6915,6 +6925,17 @@ mod tests {
         assert!(
             err.contains("double-log"),
             "expected double-log rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ltbs_rejects_non_dv_lhs() {
+        // `log(<not DV>) ~ additive(...)` would parse silently but the engine
+        // always log-transforms the `DV` column, so the LHS is misleading.
+        let err = model_with_error_block("  log(CONC) ~ additive(SIG1)").unwrap_err();
+        assert!(
+            err.contains("DV"),
+            "expected DV-required rejection, got: {err}"
         );
     }
 

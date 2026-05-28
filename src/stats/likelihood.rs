@@ -1041,7 +1041,7 @@ mod tests {
         let var = sigma[0] * sigma[0];
         let mut data_ll = 0.0;
         for (j, &f_nat) in natural.iter().enumerate() {
-            let log_f = f_nat.max(1e-12).ln();
+            let log_f = f_nat.max(pk::LTBS_FLOOR).ln();
             let resid = subj.observations[j] - log_f;
             data_ll += resid * resid / var + var.ln();
         }

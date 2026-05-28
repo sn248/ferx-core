@@ -740,6 +740,34 @@ pub fn fit(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
+    // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
+    // enforces these for `.ferx` models, but a Rust caller could otherwise set
+    // `log_transform = true` together with a proportional/combined error or a
+    // per-CMT spec, which would make the likelihood inconsistent (predictions
+    // log-wrapped while variance still expects natural-scale `f`). Fail fast.
+    if model.log_transform {
+        if !matches!(model.error_model, ErrorModel::Additive) {
+            return Err(
+                "LTBS (`log_transform = true`) requires `error_model = Additive`; \
+                 proportional/combined error on the log scale is not supported"
+                    .to_string(),
+            );
+        }
+        if !matches!(model.error_spec, ErrorSpec::Single(_)) {
+            return Err(
+                "LTBS (`log_transform = true`) is not supported with per-CMT \
+                 (`ErrorSpec::PerCmt`) error models"
+                    .to_string(),
+            );
+        }
+        if model.diffusion_theta_start.is_some() {
+            return Err(
+                "LTBS (`log_transform = true`) is not supported with an SDE \
+                 model (`diffusion_theta_start = Some(_)`)"
+                    .to_string(),
+            );
+        }
+    }
     // Data-dependent fatal checks (covariates present, per-CMT scaling and
     // per-CMT error-model coverage). These can't run in the parser — it doesn't
     // see the data. `ferx check` runs the same `check_model_data` to report
@@ -3416,6 +3444,23 @@ mod simulate_with_uncertainty_tests {
         let pop = tiny_population();
         let rows = simulate_with_seed(&model, &pop, &model.default_params, 2, 42);
         assert!(rows.iter().all(|r| r.draw == 1));
+    }
+
+    #[test]
+    fn fit_rejects_ltbs_with_proportional_error() {
+        // Defensive guard against hand-built `CompiledModel`s: the parser already
+        // rejects this combination, but a Rust caller flipping `log_transform = true`
+        // on a model with proportional/combined error would silently mis-fit (the
+        // prediction is log-wrapped but the variance still expects natural-scale f).
+        let mut model = tiny_model(); // tiny_model uses Proportional error
+        model.log_transform = true;
+        let pop = tiny_population();
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts).unwrap_err();
+        assert!(
+            err.contains("LTBS") && err.contains("Additive"),
+            "expected LTBS+proportional rejection, got: {err}"
+        );
     }
 
     #[test]

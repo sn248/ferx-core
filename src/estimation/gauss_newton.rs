@@ -655,6 +655,17 @@ fn subject_nll_pop_grad_analytical(
         matches!(model.error_spec, ErrorSpec::Single(_)),
         "analytical GN gradient reached with a non-Single error spec"
     );
+    // The SB analytical gradient is consistent with `foce_subject_nll_standard`
+    // (the FOCE-without-interaction marginal). Under `options.interaction` the
+    // outer optimiser minimises the Almquist Laplace marginal instead — a
+    // different NLL whose gradient does not match this function — so the
+    // dispatcher routes interaction=true to `subject_nll_pop_grad_analytical_laplace`.
+    // Lock the invariant against direct callers that might bypass the dispatcher.
+    debug_assert!(
+        !options.interaction,
+        "subject_nll_pop_grad_analytical (SB form) called with options.interaction=true; \
+         use subject_nll_pop_grad_analytical_laplace for the Almquist Laplace gradient"
+    );
 
     let n = x.len();
     let n_eta = model.n_eta;
@@ -788,10 +799,16 @@ fn subject_nll_pop_grad_analytical(
         }
         v
     };
+    let free_mask = &template.omega.free_mask;
 
     for (ko, &(row, col)) in omega_entries.iter().enumerate() {
         let k = omega_start + ko;
         if fixed_mask[k] {
+            continue;
+        }
+        // Structural zero (cross-block off-diagonal in a multi-block_omega
+        // declaration): same reasoning as the Laplace path.
+        if !free_mask[(row, col)] {
             continue;
         }
         if row == col {
@@ -882,6 +899,354 @@ fn subject_nll_pop_grad_analytical(
     Some((nll, grad))
 }
 
+/// Analytical per-subject FOCEI **INTER** NLL gradient — Almquist 2015 Laplace
+/// form. Same structure as [`subject_nll_pop_grad_analytical`] but matches the
+/// NLL `foce_subject_nll_interaction` is computing under `options.interaction`:
+///
+/// ```text
+///   NLL_i = 0.5 · [ data_ll(η̂) + η̂'·Ω⁻¹·η̂ + log|Ω| + log|H̃| ]
+/// ```
+/// with
+/// ```text
+///   data_ll(η̂) = Σⱼ [(yⱼ−fⱼ)²/Rⱼ + log Rⱼ]      (R evaluated at η̂)
+///   H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹
+///   c̃_{j,k} = (∂Rⱼ/∂fⱼ)·a_{j,k} / Rⱼ
+/// ```
+///
+/// Like the SB path, η̂ and H (= a) are held fixed under all parameter
+/// perturbations — the "fixed-EBE" gradient. The chain rule then closes
+/// cheaply on small (n_eta × n_eta) Hessian matrices:
+///   - **θ_k**: 1 forward-FD call on `compute_predictions_with_tv` per θ_k,
+///     then `0.5·Σⱼ (αⱼ + βⱼ·qⱼ) · ∂fⱼ/∂θ_k` where
+///     αⱼ = −2·errⱼ/Rⱼ + dⱼ·(Rⱼ − errⱼ²)/Rⱼ²    (data_ll piece)
+///     βⱼ = −dⱼ/Rⱼ² + dⱼ·d2ⱼ/Rⱼ² − dⱼ³/Rⱼ³     (log|H̃| piece via chain on R, c̃)
+///     qⱼ = aⱼ'·H̃⁻¹·aⱼ                          (pre-computed once)
+///     with dⱼ = ∂R/∂f, d2ⱼ = ∂²R/∂f².
+///   - **Ω** (Cholesky-packed): closed form using
+///     z = Ω⁻¹·η̂   and   G = Ω⁻¹·H̃⁻¹·Ω⁻¹.
+///     For diagonal x_k = log L_kk:
+///       ∂NLL/∂x_k = −L_kk·z_k·(v_k'·z) + 1 − L_kk·(G·v_k)_k
+///     For off-diagonal x_k = L[i,j] (block Ω only):
+///       ∂NLL/∂x_k = −z_i·(v_j'·z) − (G·v_j)_i
+///     where v_k = L[:,k] is the k-th column of the Ω Cholesky factor.
+///   - **σ_s**: closed form using ∂R/∂log σ_s and ∂d/∂log σ_s on the same
+///     scalar `qⱼ` reservoir.
+///
+/// **Cost** is the same order as the SB analytical path: one prediction call
+/// per non-fixed θ, then a single per-obs sweep for the inner accumulators.
+/// The n_eta × n_eta matrix ops (Cholesky, inverse, G product) are
+/// constant-cost on n_eta ≲ 10 — far cheaper than the n_obs × n_obs Cholesky
+/// the SB path uses.
+///
+/// Returns `None` (caller falls back to central FD) when `H̃` is not PD.
+#[allow(clippy::too_many_arguments)]
+fn subject_nll_pop_grad_analytical_laplace(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Option<(f64, Vec<f64>)> {
+    use crate::pk;
+
+    // Same single-error-spec invariant the SB path holds (analytical PK only,
+    // no per-CMT, no M3) — the caller's `can_use_analytical` already ensures it.
+    debug_assert!(
+        matches!(model.error_spec, ErrorSpec::Single(_)),
+        "analytical Laplace GN gradient reached with a non-Single error spec"
+    );
+    // Sibling debug_assert to the SB path: this function computes the Almquist
+    // Laplace gradient, which is only consistent with the NLL the outer FOCE
+    // loop minimises when `options.interaction == true`. The dispatcher already
+    // enforces this; the assert guards direct callers.
+    debug_assert!(
+        options.interaction,
+        "subject_nll_pop_grad_analytical_laplace called with options.interaction=false; \
+         use subject_nll_pop_grad_analytical for the Sheiner–Beal gradient"
+    );
+    // `options` is accepted for signature symmetry with the SB path and to
+    // future-proof against new `FitOptions` fields that influence the Laplace
+    // NLL (e.g. a regulariser, a robust-variance toggle). The current
+    // implementation only reads `options.interaction` via the assert above.
+    let _ = options;
+
+    let n = x.len();
+    let n_eta = model.n_eta;
+    let n_theta = template.theta.len();
+    let n_sigma = template.sigma.values.len();
+    let n_obs = population.subjects[subj_idx].observations.len();
+    let subject = &population.subjects[subj_idx];
+    let params = unpack_params(x, template);
+    let fixed_mask = packed_fixed_mask(template);
+    let omega = &params.omega;
+    let sigma_values = &params.sigma.values;
+    let error_spec = &model.error_spec;
+
+    // ── Base quantities at the current parameter point ───────────────────────
+    // ipreds, residuals, R, d = ∂R/∂f, d2 = ∂²R/∂f² per observation.
+    let ipreds = pk::compute_predictions_with_tv(model, subject, &params.theta, eta_hat.as_slice());
+    if ipreds.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+
+    let err: Vec<f64> = (0..n_obs)
+        .map(|j| subject.observations[j] - ipreds[j])
+        .collect();
+    let r_diag: Vec<f64> = (0..n_obs)
+        .map(|j| error_spec.variance_at(subject.obs_cmts[j], ipreds[j], sigma_values))
+        .collect();
+    if r_diag.iter().any(|&v| !(v.is_finite() && v > 0.0)) {
+        return None;
+    }
+    let d_vec: Vec<f64> = (0..n_obs)
+        .map(|j| error_spec.dvar_df(subject.obs_cmts[j], ipreds[j], sigma_values))
+        .collect();
+    // ∂²R/∂f² is constant in f for additive/proportional/combined: it's 0 for
+    // additive and 2·σ_prop² for the other two. We read the inner ErrorModel
+    // off the `Single` ErrorSpec (guaranteed by the debug_assert above) rather
+    // than `model.error_model` so this stays consistent with the `variance_at`
+    // / `dvar_df` / `dvar_dlogsigma` calls below — all of which dispatch on
+    // `error_spec`. (`model.error_model` is the legacy single-error field;
+    // hand-built models can desync the two, and the debug_assert is a no-op
+    // in release.)
+    let inner_em = match error_spec {
+        ErrorSpec::Single(em) => *em,
+        // Guard for release builds where the debug_assert is a no-op; PerCmt
+        // does not have a single representative ∂²R/∂f² so we bail and let
+        // the dispatcher fall back to FD.
+        ErrorSpec::PerCmt(_) => return None,
+    };
+    let d2_scalar = match inner_em {
+        ErrorModel::Additive => 0.0,
+        ErrorModel::Proportional | ErrorModel::Combined => {
+            let sp = sigma_values.first().copied().unwrap_or(0.0);
+            2.0 * sp * sp
+        }
+    };
+
+    // Conditional Hessian H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.
+    // c̃_{j,k} = dⱼ·a_{j,k}/Rⱼ; we only need the symmetric outer products,
+    // which collapse cleanly into the (n_eta × n_eta) accumulator.
+    let mut hrh = DMatrix::<f64>::zeros(n_eta, n_eta);
+    let mut ctc = DMatrix::<f64>::zeros(n_eta, n_eta);
+    for j in 0..n_obs {
+        let aj = h_matrix.row(j);
+        let inv_r = 1.0 / r_diag[j];
+        let c_scale = d_vec[j] * inv_r;
+        let cs2 = c_scale * c_scale;
+        for a in 0..n_eta {
+            let aa = aj[a];
+            for b in 0..n_eta {
+                let outer = aa * aj[b];
+                hrh[(a, b)] += outer * inv_r;
+                ctc[(a, b)] += outer * cs2;
+            }
+        }
+    }
+    let htilde = hrh + 0.5 * ctc + &omega.inv;
+    let htilde_chol = htilde.clone().cholesky()?;
+    let log_det_htilde = chol_log_det(&htilde_chol.l());
+    let htilde_inv = htilde_chol.inverse();
+
+    // Per-obs scalar qⱼ = aⱼ'·H̃⁻¹·aⱼ — central reservoir for the log|H̃|
+    // chain rule. n_eta² flops per obs.
+    let mut q = vec![0.0f64; n_obs];
+    for j in 0..n_obs {
+        let aj = h_matrix.row(j);
+        let mut s = 0.0;
+        for a in 0..n_eta {
+            for b in 0..n_eta {
+                s += aj[a] * htilde_inv[(a, b)] * aj[b];
+            }
+        }
+        q[j] = s;
+    }
+
+    // ── NLL at this parameter point ──────────────────────────────────────────
+    let mut data_ll = 0.0_f64;
+    for j in 0..n_obs {
+        let r = r_diag[j];
+        let e = err[j];
+        data_ll += e * e / r + r.ln();
+    }
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    let log_det_omega = omega.log_det;
+    let nll = 0.5 * (data_ll + eta_prior + log_det_omega + log_det_htilde);
+
+    // ── Theta gradient (forward FD on predictions; closed-form chain rest) ──
+    // Per-obs scalar coeff combines data_ll and log|H̃| contributions:
+    //   per_j = αⱼ + βⱼ·qⱼ
+    //   αⱼ   = −2·errⱼ/Rⱼ + dⱼ·(Rⱼ − errⱼ²)/Rⱼ²
+    //   βⱼ   = −dⱼ/Rⱼ² + dⱼ·d2ⱼ/Rⱼ² − dⱼ³/Rⱼ³
+    let mut theta_per_j = vec![0.0f64; n_obs];
+    let d2 = d2_scalar; // f-independent for additive/proportional/combined
+    for j in 0..n_obs {
+        let r = r_diag[j];
+        let inv_r = 1.0 / r;
+        let inv_r2 = inv_r * inv_r;
+        let inv_r3 = inv_r2 * inv_r;
+        let d = d_vec[j];
+        let e = err[j];
+        let alpha_j = -2.0 * e * inv_r + d * (r - e * e) * inv_r2;
+        let beta_j = -d * inv_r2 + d * d2 * inv_r2 - d * d * d * inv_r3;
+        theta_per_j[j] = alpha_j + beta_j * q[j];
+    }
+
+    let mut grad = vec![0.0f64; n];
+    let eps = 1e-5;
+    for k in 0..n_theta {
+        if fixed_mask[k] {
+            continue;
+        }
+        let h = eps * (1.0 + x[k].abs());
+        let xk_plus = (x[k] + h).min(bounds.upper[k]);
+        let actual_h = xk_plus - x[k];
+        if actual_h.abs() < 1e-16 {
+            continue;
+        }
+        let mut x_pert = x.to_vec();
+        x_pert[k] = xk_plus;
+        let params_pert = unpack_params(&x_pert, template);
+        let ipreds_pert =
+            pk::compute_predictions_with_tv(model, subject, &params_pert.theta, eta_hat.as_slice());
+        if ipreds_pert.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let s: f64 = (0..n_obs)
+            .map(|j| {
+                let df_j = (ipreds_pert[j] - ipreds[j]) / actual_h;
+                theta_per_j[j] * df_j
+            })
+            .sum();
+        grad[k] = 0.5 * s;
+    }
+
+    // ── Omega gradient (closed-form chain rule through Ω⁻¹) ─────────────────
+    // z = Ω⁻¹·η̂;  G = Ω⁻¹·H̃⁻¹·Ω⁻¹ — both (n_eta × n_eta) operations.
+    let z: DVector<f64> = &omega.inv * eta_hat;
+    let g_mat: DMatrix<f64> = &omega.inv * &htilde_inv * &omega.inv;
+
+    let omega_start = n_theta;
+    let omega_entries: Vec<(usize, usize)> = if template.omega.diagonal {
+        (0..n_eta).map(|i| (i, i)).collect()
+    } else {
+        let mut v = Vec::new();
+        for j in 0..n_eta {
+            for i in j..n_eta {
+                v.push((i, j));
+            }
+        }
+        v
+    };
+    let l_omega = &omega.chol;
+    let free_mask = &template.omega.free_mask;
+
+    for (ko, &(row, col)) in omega_entries.iter().enumerate() {
+        let k = omega_start + ko;
+        if fixed_mask[k] {
+            continue;
+        }
+        // Structural zero (cross-block off-diagonal in a multi-block_omega
+        // declaration): the model declares L[row, col] ≡ 0, so its gradient
+        // is zero by construction. Skipping here prevents the outer
+        // optimiser from pulling these slots away from zero on the strength
+        // of an in-block-only chain rule.
+        if !free_mask[(row, col)] {
+            continue;
+        }
+        // v = L[:,col]
+        let v_vec: Vec<f64> = (0..n_eta).map(|r| l_omega[(r, col)]).collect();
+        let v_dot_z: f64 = v_vec.iter().zip(z.iter()).map(|(a, b)| a * b).sum();
+        // (G·v)_row
+        let mut gv_row = 0.0_f64;
+        for c in 0..n_eta {
+            gv_row += g_mat[(row, c)] * v_vec[c];
+        }
+        if row == col {
+            // Diagonal: x_k = log L_kk. NLL has a 0.5·[…] outer factor; the
+            // η'Ω⁻¹η, log|Ω|, and log|H̃| contributions each carry an inner
+            // factor of 2 that cancels with the outer 0.5, so the RHS is the
+            // *full* ∂NLL/∂x_k (not half of it).
+            //   ∂NLL/∂x_k = -L_kk·z_k·(v'z) + 1 - L_kk·(G·v)_k
+            let l_kk = l_omega[(row, row)];
+            grad[k] = -l_kk * z[row] * v_dot_z + 1.0 - l_kk * gv_row;
+        } else {
+            // Off-diagonal: x_k = L[i,j] (i > j). log|Ω| contribution is 0
+            // because L's off-diagonals do not enter ∏ L_ii. Same 0.5/2
+            // cancellation as the diagonal case → RHS is the full ∂NLL/∂x_k.
+            //   ∂NLL/∂x_k = -z_i·(v'z) - (G·v)_i
+            grad[k] = -z[row] * v_dot_z - gv_row;
+        }
+    }
+
+    // ── Sigma gradient (closed-form chain rule through R and c̃) ────────────
+    // Per sigma index s (∈ flat sigma vector):
+    //   ∂R/∂log σ_s, ∂d/∂log σ_s per obs (from `dvar_dlogsigma` and the
+    //   error-model dispatch — `dvar_dlogsigma` is already the right hook
+    //   for ∂R/∂log σ; ∂d/∂log σ for the proportional component is 2·d
+    //   (combined or proportional), and 0 for additive — see the analytical
+    //   SB path's `dr_diag_d_log_sigma` for the matching idiom).
+    //
+    // Resolve SigmaType through `error_spec` (the same dispatcher every other
+    // variance call uses), not `model.error_model`, so this stays internally
+    // consistent under any future refactor that lets the two diverge.
+    let sigma_types = error_spec.sigma_types(n_sigma);
+    let sigma_start = omega_start + omega_entries.len();
+    for ks in 0..n_sigma {
+        let k = sigma_start + ks;
+        if fixed_mask[k] {
+            continue;
+        }
+        let dr_per_obs: Vec<f64> = (0..n_obs)
+            .map(|j| error_spec.dvar_dlogsigma(subject.obs_cmts[j], ks, ipreds[j], sigma_values))
+            .collect();
+        // ∂d/∂log σ_s. For proportional and combined, d = 2·σ_prop²·f, so
+        // ∂d/∂log σ_prop = 2·d and ∂d/∂log σ_add = 0. For additive d = 0
+        // identically.
+        let dd_factor = match sigma_types.get(ks).copied() {
+            Some(SigmaType::Proportional) => 2.0,
+            _ => 0.0,
+        };
+
+        let mut s_acc = 0.0_f64;
+        for j in 0..n_obs {
+            let r = r_diag[j];
+            let inv_r = 1.0 / r;
+            let inv_r2 = inv_r * inv_r;
+            let inv_r3 = inv_r2 * inv_r;
+            let d = d_vec[j];
+            let e = err[j];
+            let dr = dr_per_obs[j];
+            let dd = d * dd_factor;
+            // data_ll piece: ∂R·(1/R − err²/R²) = ∂R·(R − err²)/R²
+            let data_term = dr * (r - e * e) * inv_r2;
+            // log|H̃| piece via chain on R and on c̃:
+            //   γⱼ = -∂R/R² + d·∂d/R² - d²·∂R/R³
+            let gamma_j = -dr * inv_r2 + d * dd * inv_r2 - d * d * dr * inv_r3;
+            s_acc += data_term + gamma_j * q[j];
+        }
+        grad[k] = 0.5 * s_acc;
+    }
+
+    // Late finiteness guard: the `r > 0` admit at line 970 accepts arbitrarily
+    // small positive r (e.g. 1e-160 → inv_r³ overflows to +∞), and an
+    // ill-conditioned H̃ that just barely passes Cholesky can produce an
+    // ~1e300 inverse that overflows q[j] downstream. In either case the
+    // assembled NLL or gradient picks up ±∞/NaN and would silently poison
+    // SLSQP. Bail to the FD fallback instead — `subject_nll_pop_grad` will
+    // central-FD over `subject_nll_at`, which clamps non-finite NLLs to the
+    // 1e20 sentinel and then takes the one-sided FD fork on either side.
+    if !nll.is_finite() || grad.iter().any(|g| !g.is_finite()) {
+        return None;
+    }
+
+    Some((nll, grad))
+}
+
 /// Compute the FOCE NLL and its gradient w.r.t. the packed population parameter
 /// vector for a single subject, with ETAs fixed at their current EBE values.
 ///
@@ -908,38 +1273,61 @@ pub(crate) fn subject_nll_pop_grad(
     // `subject_nll_at` stays exactly consistent with the objective the outer
     // FOCE loop minimises. (The old analytical κ-prior gradient matched the
     // since-removed MAP-penalty objective and would now disagree.)
-    //
-    // Same logic for FOCEI INTER: the analytical path below derives the
-    // gradient from the Sheiner–Beal marginal `(y-f₀)' R̃⁻¹ (y-f₀) + log|R̃|`,
-    // but the actual NLL the optimiser minimises is now the Almquist 2015
-    // Laplace form (`data_ll + η̂'Ω⁻¹η̂ + log|Ω| + log|H̃|` with H̃ including
-    // the `½·c̃'·c̃` INTER correction) — see `foce_subject_nll_interaction`.
-    // The two NLLs disagree for any nonlinear-in-η model, so the analytical
-    // SB gradient would push the outer optimiser away from the Laplace
-    // minimum. Fall back to FD over `subject_nll_at` (which calls the
-    // Laplace NLL). The analytical path is preserved for FOCE without
-    // interaction, which still uses the Sheiner–Beal form
-    // (`foce_subject_nll_standard`).
     let can_use_analytical = model.ode_spec.is_none()
         && !matches!(model.bloq_method, BloqMethod::M3)
-        && kappas.is_empty()
-        && !options.interaction;
+        && kappas.is_empty();
 
     if can_use_analytical {
-        if let Some(result) = subject_nll_pop_grad_analytical(
-            x, template, model, population, subj_idx, eta_hat, h_matrix, bounds, options,
-        ) {
+        // Dispatch to the form whose gradient is exactly consistent with the
+        // NLL `foce_subject_nll` is computing for this subject:
+        //   - `options.interaction == true`  → Almquist 2015 Laplace
+        //     (`data_ll + η̂'Ω⁻¹η̂ + log|Ω| + log|H̃|`, with H̃ carrying the
+        //      `½·c̃'·c̃` INTER correction). See
+        //      `subject_nll_pop_grad_analytical_laplace`.
+        //   - `options.interaction == false` → Sheiner–Beal linearised marginal
+        //     (`(y - f₀)' R̃⁻¹ (y - f₀) + log|R̃|` at R(f₀)). See
+        //      `subject_nll_pop_grad_analytical`.
+        let result = if options.interaction {
+            subject_nll_pop_grad_analytical_laplace(
+                x, template, model, population, subj_idx, eta_hat, h_matrix, bounds, options,
+            )
+        } else {
+            subject_nll_pop_grad_analytical(
+                x, template, model, population, subj_idx, eta_hat, h_matrix, bounds, options,
+            )
+        };
+        if let Some(result) = result {
             return result;
         }
     }
 
-    // Fallback: central FD over full per-subject NLL
+    // Fallback: central FD over full per-subject NLL.
+    //
+    // `subject_nll_at` (via `foce_subject_nll_interaction` / `foce_subject_nll_standard`)
+    // returns the `1e20` sentinel from `stats::likelihood` for ill-conditioned
+    // states (non-PD R̃ / H̃, non-finite intermediate NLL). Central-FD'ing
+    // across that sentinel — or differencing two finite values where one is
+    // the sentinel — would push a ~1e24/h gradient component into the outer
+    // optimiser. Map the sentinel onto +∞ before differencing so the existing
+    // one-sided / zero-gradient fork handles it the same as a NaN.
     let n = x.len();
     let fixed_mask = packed_fixed_mask(template);
     let eps = 1e-4;
+    // The sentinel is the largest finite NLL likelihood.rs ever returns
+    // (~1e20). Anything ≥ that bound is treated as "ill-conditioned" and
+    // hidden from the FD difference; using `>=` keeps us robust to a future
+    // sentinel bump.
+    const NLL_SENTINEL_THRESHOLD: f64 = 1e20;
+    fn mask_sentinel(nll: f64) -> f64 {
+        if nll.is_finite() && nll < NLL_SENTINEL_THRESHOLD {
+            nll
+        } else {
+            f64::INFINITY
+        }
+    }
 
     let params_base = unpack_params(x, template);
-    let nll_base = subject_nll_at(
+    let nll_base_raw = subject_nll_at(
         model,
         population,
         subj_idx,
@@ -949,6 +1337,7 @@ pub(crate) fn subject_nll_pop_grad(
         kappas,
         options,
     );
+    let nll_base_masked = mask_sentinel(nll_base_raw);
 
     let mut grad = vec![0.0f64; n];
     let mut x_work = x.to_vec();
@@ -967,7 +1356,7 @@ pub(crate) fn subject_nll_pop_grad(
 
         x_work[j] = xj_plus;
         let params_plus = unpack_params(&x_work, template);
-        let nll_plus = subject_nll_at(
+        let nll_plus = mask_sentinel(subject_nll_at(
             model,
             population,
             subj_idx,
@@ -976,11 +1365,11 @@ pub(crate) fn subject_nll_pop_grad(
             h_matrix,
             kappas,
             options,
-        );
+        ));
 
         x_work[j] = xj_minus;
         let params_minus = unpack_params(&x_work, template);
-        let nll_minus = subject_nll_at(
+        let nll_minus = mask_sentinel(subject_nll_at(
             model,
             population,
             subj_idx,
@@ -989,25 +1378,29 @@ pub(crate) fn subject_nll_pop_grad(
             h_matrix,
             kappas,
             options,
-        );
+        ));
 
         x_work[j] = x[j];
 
         let deriv = (nll_plus - nll_minus) / actual_2h;
         grad[j] = if deriv.is_finite() {
             deriv
-        } else if nll_plus.is_finite() && nll_base.is_finite() {
-            // One-sided fallback: minus-side was non-finite.
-            (nll_plus - nll_base) / (xj_plus - x[j])
-        } else if nll_minus.is_finite() && nll_base.is_finite() {
-            // One-sided fallback: plus-side was non-finite.
-            (nll_base - nll_minus) / (x[j] - xj_minus)
+        } else if nll_plus.is_finite() && nll_base_masked.is_finite() {
+            // One-sided fallback: minus-side was non-finite or sentinel.
+            (nll_plus - nll_base_masked) / (xj_plus - x[j])
+        } else if nll_minus.is_finite() && nll_base_masked.is_finite() {
+            // One-sided fallback: plus-side was non-finite or sentinel.
+            (nll_base_masked - nll_minus) / (x[j] - xj_minus)
         } else {
+            // Both sides ill-conditioned: gradient is undefined here. Returning
+            // 0 lets the outer optimiser step elsewhere instead of stalling on
+            // a ±1e24/h spike. NLL itself stays at the raw (unmasked) sentinel
+            // so the outer line search still knows the move was infeasible.
             0.0
         };
     }
 
-    (nll_base, grad)
+    (nll_base_raw, grad)
 }
 
 /// Build the Gauss-Newton linear system: gradient and BHHH approximate Hessian
@@ -1796,6 +2189,520 @@ mod tests {
                 "grad[{j}]: subject_nll_pop_grad={:.6e}, ref={:.6e}",
                 grad[j],
                 ref_j,
+            );
+        }
+    }
+
+    /// FOCEI INTER (Almquist Laplace) analytical pop-gradient — checks NLL
+    /// matches `foce_subject_nll_interaction` and each component agrees with a
+    /// central-FD reference to the same `1e-4 · (1 + |ref|)` tolerance the
+    /// SB-path test uses. Exercises non-trivial `eta_hat` and `H` so the
+    /// c̃'·c̃ INTER correction is actually carrying weight in `H̃` (the
+    /// algebra would simplify to the SB-equivalent if both were zero).
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_laplace_matches_fd() {
+        let model = make_model();
+        let population = make_population();
+        let template = &model.default_params;
+
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+
+        let n_obs = 3;
+        let n_eta = 1;
+        let eta_hat = DVector::from_vec(vec![0.07]);
+        // Non-zero H so a'·diag(1/R)·a contributes; combined error so c̃'·c̃
+        // contributes too (model.error_model is Proportional by default in
+        // `make_model`, which gives non-zero d_j and thus non-zero c̃).
+        let h_matrix = nalgebra::DMatrix::from_vec(n_obs, n_eta, vec![2.5, 1.8, 1.2]);
+        let mut options = FitOptions::default();
+        options.interaction = true;
+
+        // Call the analytical function directly (not through `subject_nll_pop_grad`)
+        // so a silent fall-through to the FD path — which would also match the FD
+        // reference and pass the test — is impossible. `.expect` surfaces any
+        // future fixture regression that drives H̃ non-PD or trips the late
+        // finiteness guard.
+        let (nll, grad) = subject_nll_pop_grad_analytical_laplace(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &options,
+        )
+        .expect("analytical Laplace path must succeed on this fixture");
+
+        // NLL must match a direct subject_nll_at call (which routes through
+        // foce_subject_nll_interaction = Almquist Laplace under interaction).
+        let params_base = unpack_params(&x, template);
+        let nll_ref = subject_nll_at(
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
+        );
+        assert!(
+            (nll - nll_ref).abs() < 1e-12,
+            "Laplace nll mismatch: {nll} vs {nll_ref}"
+        );
+
+        for (j, g) in grad.iter().enumerate() {
+            assert!(g.is_finite(), "Laplace grad[{j}] not finite");
+        }
+
+        let eps = 1e-4;
+        for j in 0..n {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let actual_2h = xp[j] - xm[j];
+
+            let params_p = unpack_params(&xp, template);
+            let params_m = unpack_params(&xm, template);
+            let nll_p = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_p,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nll_m = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_m,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let ref_j = (nll_p - nll_m) / actual_2h;
+
+            let tol = 1e-4 * (1.0 + ref_j.abs());
+            assert!(
+                (grad[j] - ref_j).abs() < tol,
+                "Laplace grad[{j}]: analytical={:.6e}, FD-ref={:.6e}, diff={:.3e}, tol={:.3e}",
+                grad[j],
+                ref_j,
+                grad[j] - ref_j,
+                tol,
+            );
+        }
+    }
+
+    /// Almquist Laplace analytical gradient — combined error variant. The
+    /// `½·c̃'·c̃` INTER correction has both σ_prop and σ_add contributions
+    /// here (σ_add zeroes the dd/dlogσ piece but still flows through R), so
+    /// this is a stricter check on the σ-gradient code path than the
+    /// Proportional-only `make_model`. Sigma values are chosen so
+    /// `σ_prop²·f² ≈ σ_add²` at the test predictions — that way both
+    /// branches of the dd_factor switch carry weight (a dd_factor sign
+    /// error on the Proportional slot would shift the σ_prop gradient
+    /// well above the 1e-4·(1+|ref|) tolerance).
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_laplace_combined_error() {
+        let mut model = make_model();
+        model.error_model = ErrorModel::Combined;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+        // Combined needs two sigmas — replace template's single-σ vector and
+        // keep model.n_epsilon / model.sigma_init_as_sd in sync to avoid any
+        // downstream code path that reads those fields tripping on a length
+        // mismatch with `template.sigma.values`.
+        let mut template = model.default_params.clone();
+        template.sigma = SigmaVector {
+            values: vec![0.3, 0.3],
+            names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
+        };
+        template.sigma_fixed = vec![false, false];
+        model.default_params = template.clone();
+        model.n_epsilon = 2;
+        model.sigma_init_as_sd = vec![false, false];
+        let template = &model.default_params;
+
+        let population = make_population();
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+
+        let n_obs = 3;
+        let n_eta = 1;
+        let eta_hat = DVector::from_vec(vec![0.05]);
+        let h_matrix = nalgebra::DMatrix::from_vec(n_obs, n_eta, vec![2.0, 1.5, 1.0]);
+        let mut options = FitOptions::default();
+        options.interaction = true;
+
+        // Direct analytical call — see sibling test for why we bypass the dispatcher.
+        let (nll, grad) = subject_nll_pop_grad_analytical_laplace(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &options,
+        )
+        .expect("analytical Laplace path must succeed on this fixture");
+
+        let params_base = unpack_params(&x, template);
+        let nll_ref = subject_nll_at(
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
+        );
+        assert!(
+            (nll - nll_ref).abs() < 1e-12,
+            "Laplace (combined) nll mismatch: {nll} vs {nll_ref}"
+        );
+
+        let eps = 1e-4;
+        for j in 0..n {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let actual_2h = xp[j] - xm[j];
+            let params_p = unpack_params(&xp, template);
+            let params_m = unpack_params(&xm, template);
+            let nll_p = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_p,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nll_m = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_m,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let ref_j = (nll_p - nll_m) / actual_2h;
+            let tol = 1e-4 * (1.0 + ref_j.abs());
+            assert!(
+                (grad[j] - ref_j).abs() < tol,
+                "Laplace combined grad[{j}]: analytical={:.6e}, FD-ref={:.6e}, diff={:.3e}, tol={:.3e}",
+                grad[j],
+                ref_j,
+                grad[j] - ref_j,
+                tol,
+            );
+        }
+    }
+
+    /// Almquist Laplace analytical gradient — **multi-eta block omega**. This
+    /// is the test the diagonal+n_eta=1 fixtures above cannot exercise:
+    ///   - `template.omega.diagonal == false` routes through the off-diagonal
+    ///     `omega_entries` branch (column-major lower triangle) and the
+    ///     `-z[row]·v_dot_z - gv_row` formula at the off-diagonal slot.
+    ///   - `n_eta == 2` makes every `for a in 0..n_eta { for b in 0..n_eta }`
+    ///     loop in `hrh`, `ctc`, `q_j`, and the `n_eta × n_eta` matrix
+    ///     products do real work (a transposed index would now bite).
+    /// FD-validate every gradient component to the same 1e-4·(1+|ref|)
+    /// tolerance the diagonal tests use.
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_laplace_block_omega() {
+        // Build a 2-eta block-omega fixture: ETA on CL and on V, correlated.
+        let omega_matrix = {
+            let mut m = nalgebra::DMatrix::<f64>::zeros(2, 2);
+            m[(0, 0)] = 0.09;
+            m[(1, 1)] = 0.04;
+            // ρ ≈ 0.5 correlation: cov = 0.5·√(0.09·0.04) = 0.03
+            m[(0, 1)] = 0.03;
+            m[(1, 0)] = 0.03;
+            m
+        };
+        let omega =
+            OmegaMatrix::from_matrix(omega_matrix, vec!["ETA_CL".into(), "ETA_V".into()], false);
+
+        let default_params = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.1, 5.0],
+            theta_upper: vec![50.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega,
+            omega_fixed: vec![false, false],
+            sigma: SigmaVector {
+                values: vec![0.1],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        let model = CompiledModel {
+            name: "gn_block_omega_test".into(),
+            pk_model: PkModel::OneCptIvBolus,
+            error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp(); // CL · exp(ETA_CL)
+                p.values[1] = theta[1] * eta[1].exp(); // V  · exp(ETA_V)
+                p
+            }),
+            n_theta: 2,
+            n_eta: 2,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: Vec::new(),
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: vec!["ETA_CL".into(), "ETA_V".into()],
+            indiv_param_names: vec!["CL".into(), "V".into()],
+            default_params,
+            omega_init_as_sd: vec![false, false],
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: Vec::new(),
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: vec![0, 1],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
+        };
+
+        let template = &model.default_params;
+        let population = make_population();
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+
+        // Block-omega packed layout is 3 entries: log L[0,0], L[1,0], log L[1,1].
+        // n = 2 thetas + 3 omega + 1 sigma = 6.
+        assert_eq!(n, 6, "block-omega packed layout should be 6 entries");
+
+        let n_obs = 3;
+        let n_eta = 2;
+        let eta_hat = DVector::from_vec(vec![0.07, -0.04]);
+        // Non-zero H so both etas enter every observation (otherwise an
+        // off-diagonal index error in the (a,b) loops would silently produce
+        // a zero contribution and pass the test).
+        let h_matrix = nalgebra::DMatrix::from_vec(
+            n_obs,
+            n_eta,
+            vec![2.5, 1.8, 1.2, /* col 1 */ 1.3, 0.9, 0.5],
+        );
+        let mut options = FitOptions::default();
+        options.interaction = true;
+
+        // Direct analytical call — see sibling test for why we bypass the dispatcher.
+        let (nll, grad) = subject_nll_pop_grad_analytical_laplace(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &options,
+        )
+        .expect("analytical Laplace path must succeed on this fixture");
+
+        let params_base = unpack_params(&x, template);
+        let nll_ref = subject_nll_at(
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
+        );
+        assert!(
+            (nll - nll_ref).abs() < 1e-12,
+            "Laplace block-omega nll mismatch: {nll} vs {nll_ref}"
+        );
+
+        let eps = 1e-4;
+        for j in 0..n {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let actual_2h = xp[j] - xm[j];
+            let params_p = unpack_params(&xp, template);
+            let params_m = unpack_params(&xm, template);
+            let nll_p = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_p,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nll_m = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_m,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let ref_j = (nll_p - nll_m) / actual_2h;
+            let tol = 1e-4 * (1.0 + ref_j.abs());
+            assert!(
+                (grad[j] - ref_j).abs() < tol,
+                "Laplace block-omega grad[{j}]: analytical={:.6e}, FD-ref={:.6e}, diff={:.3e}, tol={:.3e}",
+                grad[j],
+                ref_j,
+                grad[j] - ref_j,
+                tol,
+            );
+        }
+    }
+
+    /// Almquist Laplace analytical gradient — **Additive error**. Exercises
+    /// the `d2_scalar = 0`, `d_vec ≡ 0`, `dd_factor = 0` branches that the
+    /// Proportional and Combined tests above cannot hit. With d ≡ 0 the
+    /// `½·c̃'·c̃` correction collapses to zero (so H̃ = a'·diag(1/R)·a +
+    /// Ω⁻¹) and the σ gradient reduces to its data_ll-only form — a
+    /// regression in those zero arms (e.g. wiring `dd_factor = 2` to an
+    /// Additive slot) would shift `grad[σ]` well above the FD tolerance.
+    #[test]
+    fn test_subject_nll_pop_grad_analytical_laplace_additive_error() {
+        let mut model = make_model();
+        model.error_model = ErrorModel::Additive;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Additive);
+        // Bigger σ_add so R is well-conditioned at the test observations
+        // (the default make_model observations span 9..25, so σ_add ≈ 2
+        // gives R ≈ 4 — finite gradients without R → 0 risk).
+        let mut template = model.default_params.clone();
+        template.sigma = SigmaVector {
+            values: vec![2.0],
+            names: vec!["ADD_ERR".into()],
+        };
+        template.sigma_fixed = vec![false];
+        model.default_params = template.clone();
+        let template = &model.default_params;
+
+        let population = make_population();
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+
+        let n_obs = 3;
+        let n_eta = 1;
+        let eta_hat = DVector::from_vec(vec![0.06]);
+        let h_matrix = nalgebra::DMatrix::from_vec(n_obs, n_eta, vec![2.2, 1.6, 1.0]);
+        let mut options = FitOptions::default();
+        options.interaction = true;
+
+        // Direct analytical call — see sibling test for why we bypass the dispatcher.
+        let (nll, grad) = subject_nll_pop_grad_analytical_laplace(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &options,
+        )
+        .expect("analytical Laplace path must succeed on this fixture");
+
+        let params_base = unpack_params(&x, template);
+        let nll_ref = subject_nll_at(
+            &model,
+            &population,
+            0,
+            &params_base,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
+        );
+        assert!(
+            (nll - nll_ref).abs() < 1e-12,
+            "Laplace (additive) nll mismatch: {nll} vs {nll_ref}"
+        );
+
+        let eps = 1e-4;
+        for j in 0..n {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let actual_2h = xp[j] - xm[j];
+            let params_p = unpack_params(&xp, template);
+            let params_m = unpack_params(&xm, template);
+            let nll_p = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_p,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nll_m = subject_nll_at(
+                &model,
+                &population,
+                0,
+                &params_m,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let ref_j = (nll_p - nll_m) / actual_2h;
+            let tol = 1e-4 * (1.0 + ref_j.abs());
+            assert!(
+                (grad[j] - ref_j).abs() < tol,
+                "Laplace additive grad[{j}]: analytical={:.6e}, FD-ref={:.6e}, diff={:.3e}, tol={:.3e}",
+                grad[j],
+                ref_j,
+                grad[j] - ref_j,
+                tol,
             );
         }
     }

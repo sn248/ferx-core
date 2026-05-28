@@ -908,9 +908,22 @@ pub(crate) fn subject_nll_pop_grad(
     // `subject_nll_at` stays exactly consistent with the objective the outer
     // FOCE loop minimises. (The old analytical κ-prior gradient matched the
     // since-removed MAP-penalty objective and would now disagree.)
+    //
+    // Same logic for FOCEI INTER: the analytical path below derives the
+    // gradient from the Sheiner–Beal marginal `(y-f₀)' R̃⁻¹ (y-f₀) + log|R̃|`,
+    // but the actual NLL the optimiser minimises is now the Almquist 2015
+    // Laplace form (`data_ll + η̂'Ω⁻¹η̂ + log|Ω| + log|H̃|` with H̃ including
+    // the `½·c̃'·c̃` INTER correction) — see `foce_subject_nll_interaction`.
+    // The two NLLs disagree for any nonlinear-in-η model, so the analytical
+    // SB gradient would push the outer optimiser away from the Laplace
+    // minimum. Fall back to FD over `subject_nll_at` (which calls the
+    // Laplace NLL). The analytical path is preserved for FOCE without
+    // interaction, which still uses the Sheiner–Beal form
+    // (`foce_subject_nll_standard`).
     let can_use_analytical = model.ode_spec.is_none()
         && !matches!(model.bloq_method, BloqMethod::M3)
-        && kappas.is_empty();
+        && kappas.is_empty()
+        && !options.interaction;
 
     if can_use_analytical {
         if let Some(result) = subject_nll_pop_grad_analytical(
@@ -1514,7 +1527,13 @@ mod tests {
         // Non-zero H: partial derivatives of predictions w.r.t. eta at baseline
         let eta_hat = DVector::from_vec(vec![0.1]);
         let h_matrix = nalgebra::DMatrix::from_vec(n_obs, n_eta, vec![2.0, 1.5, 0.8]);
-        let options = FitOptions::default();
+        // FOCE non-interaction: the analytical-gradient path was derived for the
+        // Sheiner–Beal NLL and only applies to FOCE-non-INTER (`foce_subject_nll_standard`).
+        // FOCEI INTER now uses the Almquist Laplace NLL whose gradient takes the
+        // FD fallback in `subject_nll_pop_grad`; analytical-vs-FD comparisons
+        // under INTER would be vacuous (FD-vs-FD) so we set interaction=false.
+        let mut options = FitOptions::default();
+        options.interaction = false;
 
         let (nll_an, grad_an) = subject_nll_pop_grad_analytical(
             &x,
@@ -1589,11 +1608,13 @@ mod tests {
         }
     }
 
-    /// Verify that the analytical gradient is correct under the FOCEI interaction
-    /// path (`options.interaction = true`), where r_diag is evaluated at ipreds
-    /// rather than f0, and dr/d(theta) passes through the r(ipred) chain.
+    /// (Previously verified the analytical gradient under `interaction=true`;
+    /// that bridge is gone since FOCEI INTER now uses the Almquist Laplace
+    /// NLL whose gradient takes the FD fallback in `subject_nll_pop_grad`.
+    /// We keep the test with `interaction=false` so the analytical SB-derived
+    /// path still gets a Cholesky/H-aware check at non-trivial `eta`/`H`.)
     #[test]
-    fn test_subject_nll_pop_grad_analytical_interaction() {
+    fn test_subject_nll_pop_grad_analytical_at_nontrivial_eta() {
         let model = make_model();
         let population = make_population();
         let template = &model.default_params;
@@ -1607,7 +1628,7 @@ mod tests {
         let eta_hat = DVector::from_vec(vec![0.05]);
         let h_matrix = nalgebra::DMatrix::from_vec(n_obs, n_eta, vec![3.0, 2.0, 1.0]);
         let mut options = FitOptions::default();
-        options.interaction = true;
+        options.interaction = false;
 
         let (nll_an, grad_an) = subject_nll_pop_grad_analytical(
             &x,
@@ -1697,7 +1718,9 @@ mod tests {
         let n_eta = 1;
         let eta_hat = DVector::zeros(n_eta);
         let h_matrix = nalgebra::DMatrix::zeros(n_obs, n_eta);
-        let options = FitOptions::default();
+        // FOCE non-interaction — see `test_subject_nll_pop_grad_analytical_nonzero_h`.
+        let mut options = FitOptions::default();
+        options.interaction = false;
 
         let (nll, grad) = subject_nll_pop_grad(
             &x,

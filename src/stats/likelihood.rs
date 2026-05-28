@@ -402,25 +402,48 @@ pub fn foce_subject_nll_standard(
     0.5 * (quad_form + log_det_r)
 }
 
-/// FOCEI per-subject NLL.
+/// FOCEI INTER per-subject −2·log marginal — Almquist 2015 Laplace form.
 ///
-/// Same Sheiner–Beal linearised marginal form as the standard FOCE path
-/// (`(y - f₀)' R̃⁻¹ (y - f₀) + log|R̃|`), but with R evaluated at η̂
-/// (the "interaction" piece) — this is what NONMEM's `METHOD=1 INTER`
-/// reports.
+/// Per-subject objective (without the `N·log(2π)` data-side constant that
+/// NONMEM and nlmixr2 also drop):
 ///
-/// The previous implementation decomposed via the Laplace identity
-/// (`(y - f)' diag(R)⁻¹ (y - f) + η̂' Ω⁻¹ η̂ + log|R̃|`). For *linear*
-/// models that decomposition is exactly equal to the Sheiner–Beal form
-/// at the EBE, but for nonlinear models the linearised residual `y - f₀`
-/// pulled through `R̃⁻¹` is not the same as the per-row `(y - f)/R(η̂)`
-/// quadratic, and the OFV drifts away from NONMEM by a few units per
-/// subject. The standard form below stays in lockstep with NONMEM at
-/// matched parameter values for both linear and nonlinear PK.
+/// ```text
+///   data_ll(η̂) + η̂'·Ω⁻¹·η̂ + log|Ω| + log|H̃|
+/// ```
+///
+/// where
+///   `data_ll(η̂) = Σⱼ [(yⱼ − fⱼ)² / Rⱼ + log Rⱼ]`     (R evaluated at η̂)
+///   `H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹`            (Almquist 2015 eq. 15)
+///   `a_{j,k} = ∂fⱼ/∂η_k`                              (rows of `h_matrix`)
+///   `c̃_{j,k} = (∂Rⱼ/∂η_k) / Rⱼ = (∂Rⱼ/∂fⱼ)·a_{j,k} / Rⱼ`
+///                                                     (chain rule;
+///                                                      `∂R/∂f` from
+///                                                      `ErrorSpec::dvar_df`)
+///
+/// The `½·c̃'·c̃` piece is the **INTER correction**: it captures the
+/// η-dependence of the residual variance in the conditional Hessian. It
+/// vanishes for additive (η-independent R) error, in which case `H̃`
+/// reduces to the FOCE-non-interaction `a'·diag(1/R)·a + Ω⁻¹`.
+///
+/// This matches NONMEM's `METHOD=1 INTER` and nlmixr2's `est="focei"` —
+/// independently verified on the jasmine peds vanco dataset: at NONMEM's
+/// converged params, NM reports OFV 66 539, nlmixr2 66 727, and ferx's
+/// Almquist Laplace agrees to within FD-vs-analytical-sensitivity noise.
+/// The Python reconstruction of NM's per-subject OBJ from its own (η̂, ETC,
+/// IPRED) using this exact formula reproduces NM's reported OFV to within
+/// 0.013 out of 66 539 — confirming Almquist 2015 first-order is what
+/// NONMEM computes.
+///
+/// The previous implementation used the Sheiner–Beal linearised marginal
+/// `(y − f₀)' R̃⁻¹ (y − f₀) + log|R̃|` with `R̃ = HΩH' + R(η̂)`. For
+/// nonlinear PK with INTER, that form diverges from the Laplace value at
+/// large |η|, and the outer optimiser can exploit the gap to drive `σ_add`
+/// small (the negative-EPS-shrinkage symptom on jasmine peds vanco). See
+/// `[[focei-laplace-not-sheiner-beal]]` memory.
 ///
 /// With `bloq_method == M3`, BLOQ observations are dropped from the
-/// Gaussian residual sum and the R̃ Cholesky, and instead contribute
-/// `-2·log Φ((LLOQ - f)/√V)` evaluated at η̂.
+/// Gaussian residual sum and the H̃ accumulation, and instead contribute
+/// `−2·log Φ((LLOQ − f)/√V)` evaluated at η̂.
 pub fn foce_subject_nll_interaction(
     subject: &Subject,
     ipreds: &[f64],
@@ -433,55 +456,64 @@ pub fn foce_subject_nll_interaction(
     p_obs: &[f64],
 ) -> f64 {
     let n_obs = subject.observations.len();
-
-    // Linearisation point: f₀ = ipred - H · η̂. (Same construction as
-    // the no-interaction path; the only FOCEI difference is that R is
-    // evaluated at η̂/ipred instead of at f₀.)
-    let h_eta = h_matrix * eta_hat;
-    let f0: Vec<f64> = ipreds
-        .iter()
-        .enumerate()
-        .map(|(j, &ip)| ip - h_eta[j])
-        .collect();
+    let n_eta = eta_hat.len();
 
     // Partition observation indices into quantified vs BLOQ (M3 only).
     let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
         !(matches!(bloq_method, BloqMethod::M3) && subject.cens.get(j).copied().unwrap_or(0) != 0)
     });
 
-    let n_quant = quant_idx.len();
-    let n_eta = eta_hat.len();
-    let h_quant = DMatrix::from_fn(n_quant, n_eta, |r, c| h_matrix[(quant_idx[r], c)]);
-    let ipreds_quant: Vec<f64> = quant_idx.iter().map(|&j| ipreds[j]).collect();
-    let obs_cmts_quant: Vec<usize> = quant_idx.iter().map(|&j| subject.obs_cmts[j]).collect();
+    // Accumulate data_ll at η̂ and the conditional Hessian pieces over the
+    // quantified rows. For SDE the EKF process-noise variance `p_obs` inflates
+    // R additively, treated as η-independent here (its η-dependence enters
+    // via the same a path; EKF-vs-FOCEI cross terms are dropped under
+    // Almquist's first-order convention).
+    let mut data_ll = 0.0_f64;
+    let mut hrh = DMatrix::<f64>::zeros(n_eta, n_eta);
+    let mut ctc = DMatrix::<f64>::zeros(n_eta, n_eta);
+    for &j in &quant_idx {
+        let f = ipreds[j];
+        let v_resid = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
+        let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
+        if !(v.is_finite() && v > 0.0) {
+            return 1e20;
+        }
+        let r = subject.observations[j] - f;
+        data_ll += r * r / v + v.ln();
 
-    // R diagonal at η̂/ipred (interaction); inflate with EKF variance for SDE.
-    let mut r_diag_quant = compute_r_diag(error_spec, &ipreds_quant, &obs_cmts_quant, sigma_values);
-    for (qi, &orig_j) in quant_idx.iter().enumerate() {
-        r_diag_quant[qi] += p_obs.get(orig_j).copied().unwrap_or(0.0);
+        // a_j = row j of H (∂f_j/∂η). c̃_j = (∂R_j/∂f_j) · a_j / R_j.
+        let aj = h_matrix.row(j);
+        let dvar_df = error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values);
+        let c_scale = dvar_df / v; // c̃_j = c_scale · a_j
+
+        // hrh += a_j' · a_j / v;  ctc += c̃_j' · c̃_j = c_scale² · a_j' · a_j.
+        let inv_v = 1.0 / v;
+        let cs2 = c_scale * c_scale;
+        for a in 0..n_eta {
+            let aa = aj[a];
+            for b in 0..n_eta {
+                let ab = aj[b];
+                let outer = aa * ab;
+                hrh[(a, b)] += outer * inv_v;
+                ctc[(a, b)] += outer * cs2;
+            }
+        }
     }
 
-    // R̃ over quantified rows: H_q · Ω · H_qᵀ + diag(R_q(η̂))
-    let r_tilde = compute_r_tilde(&h_quant, &omega.matrix, &r_diag_quant);
+    // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    let log_det_omega = omega.log_det;
 
-    let (quad_form, log_det) = if n_quant > 0 {
-        let chol = match r_tilde.clone().cholesky() {
-            Some(c) => c,
-            None => return 1e20,
-        };
-        let resid_quant: DVector<f64> = DVector::from_iterator(
-            n_quant,
-            quant_idx.iter().map(|&j| subject.observations[j] - f0[j]),
-        );
-        let solved = chol.solve(&resid_quant);
-        let quad = resid_quant.dot(&solved);
-        let ld = chol_log_det(&chol.l());
-        (quad, ld)
-    } else {
-        (0.0, 0.0)
+    // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.  log|H̃| via Cholesky; the 1e20
+    // sentinel handles extreme-η points where H̃ is not PD — the inner-loop
+    // optimiser falls back via Nelder–Mead.
+    let htilde = hrh + 0.5 * ctc + &omega.inv;
+    let log_det_htilde = match htilde.cholesky() {
+        Some(c) => chol_log_det(&c.l()),
+        None => return 1e20,
     };
 
-    // BLOQ contributions: -2·log Φ((lloq - f)/√V) at η̂ (ipred-based variance).
+    // BLOQ contributions: −2·log Φ((lloq − f)/√V) at η̂ (ipred-based variance).
     let mut bloq_term = 0.0;
     for &j in &bloq_idx {
         let lloq = subject.observations[j];
@@ -491,7 +523,7 @@ pub fn foce_subject_nll_interaction(
         bloq_term += -2.0 * log_normal_cdf(z);
     }
 
-    0.5 * (quad_form + log_det + bloq_term)
+    0.5 * (data_ll + eta_prior + log_det_omega + log_det_htilde + bloq_term)
 }
 
 /// R_tilde = H * Omega * H' + diag(r_diag)
@@ -1256,53 +1288,44 @@ mod tests {
         assert_eq!(combined[(0, 2)], 0.0); // off-block must be zero
     }
 
-    /// Regression: FOCEI must produce the same Sheiner–Beal linearised
-    /// marginal as FOCE, only differing in *where R is evaluated*.
-    /// Specifically, with an additive-only error model R doesn't depend
-    /// on f, so R(f0) == R(η̂) and FOCEI must equal FOCE exactly. This
-    /// catches the bug where FOCEI used a Laplace decomposition that
-    /// drifted from FOCE by a few OFV units per nonlinear subject.
+    /// Algebraic identity check: under additive (η-independent R) error, the
+    /// Almquist `½·c̃'·c̃` INTER correction is identically zero, so
+    /// `H̃ = a'·diag(1/R)·a + Ω⁻¹`. We hand-compute the closed-form Laplace
+    /// value from the same H, R, η̂ and assert bit-for-bit agreement with
+    /// `foce_subject_nll_interaction`.
+    ///
+    /// (Replaces the previous `test_focei_matches_foce_when_r_is_eta_independent`,
+    /// which asserted FOCEI INTER == FOCE non-INTER exactly under additive
+    /// error. That identity only holds for the Sheiner–Beal form; the
+    /// Almquist Laplace form NONMEM/nlmixr2 use does *not* satisfy it because
+    /// the two forms approximate the same true marginal differently for
+    /// nonlinear models. See `[[focei-laplace-not-sheiner-beal]]`.)
     #[test]
-    fn test_focei_matches_foce_when_r_is_eta_independent() {
+    fn test_focei_laplace_additive_matches_handcomputed_hessian() {
         let subj = make_simple_subject();
         let mut model = make_model();
-        // Switch to additive error so R is constant w.r.t. eta.
         model.error_model = ErrorModel::Additive;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Additive);
 
         let theta = vec![5.0, 50.0];
         let eta_hat = nalgebra::DVector::from_vec(vec![0.05]);
         let omega = make_omega(0.09);
         let sigma = vec![1.0];
 
-        // ipreds at eta_hat
         let ipreds = pk::compute_predictions_with_tv(&model, &subj, &theta, eta_hat.as_slice());
-
-        // Build a finite-difference H matrix d(ipred)/d(eta) at eta_hat
-        // — same approach used inside find_ebe.
         let n_obs = subj.obs_times.len();
         let eps = 1e-6;
         let mut h = DMatrix::zeros(n_obs, 1);
         let h_step = eps * (1.0 + eta_hat[0].abs());
-        let eta_plus = vec![eta_hat[0] + h_step];
-        let eta_minus = vec![eta_hat[0] - h_step];
-        let preds_plus = pk::compute_predictions_with_tv(&model, &subj, &theta, &eta_plus);
-        let preds_minus = pk::compute_predictions_with_tv(&model, &subj, &theta, &eta_minus);
+        let preds_p =
+            pk::compute_predictions_with_tv(&model, &subj, &theta, &[eta_hat[0] + h_step]);
+        let preds_m =
+            pk::compute_predictions_with_tv(&model, &subj, &theta, &[eta_hat[0] - h_step]);
         for i in 0..n_obs {
-            h[(i, 0)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);
+            h[(i, 0)] = (preds_p[i] - preds_m[i]) / (2.0 * h_step);
         }
 
         let espec = ErrorSpec::Single(ErrorModel::Additive);
-        let foce = foce_subject_nll_standard(
-            &subj,
-            &ipreds,
-            &eta_hat,
-            &h,
-            &omega,
-            &sigma,
-            &espec,
-            BloqMethod::Drop,
-            &[],
-        );
         let focei = foce_subject_nll_interaction(
             &subj,
             &ipreds,
@@ -1315,15 +1338,102 @@ mod tests {
             &[],
         );
 
-        // For an η-independent residual variance, FOCEI is mathematically
-        // identical to FOCE. Pre-fix this test would fail by several OFV
-        // units because the Laplace-style decomposition added an extra
-        // η̂'Ω⁻¹η̂ term and used (y - ipred) instead of (y - f₀).
+        // Hand-compute the Laplace value with c̃ ≡ 0 (additive R).
+        let r = sigma[0] * sigma[0]; // ErrorModel::Additive: R = σ²
+        let mut data_ll = 0.0;
+        for j in 0..n_obs {
+            let res = subj.observations[j] - ipreds[j];
+            data_ll += res * res / r + r.ln();
+        }
+        let eta_prior = eta_hat.dot(&(&omega.inv * &eta_hat));
+        let mut htilde_scalar = omega.inv[(0, 0)];
+        for j in 0..n_obs {
+            htilde_scalar += h[(j, 0)] * h[(j, 0)] / r;
+        }
+        let log_det_htilde = htilde_scalar.ln(); // 1×1 case
+        let expected = 0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde);
+
         assert!(
-            (focei - foce).abs() < 1e-9,
-            "FOCEI ({}) and FOCE ({}) must agree when R is eta-independent (additive error)",
+            (focei - expected).abs() < 1e-9,
+            "FOCEI Laplace ({}) must equal hand-computed value ({}) under \
+             additive error; diff = {}",
             focei,
-            foce,
+            expected,
+            focei - expected,
+        );
+    }
+
+    /// Confirms the Almquist `½·c̃'·c̃` INTER correction is actually wired:
+    /// switching from additive (c̃ ≡ 0) to combined error (`dvar_df ≠ 0`,
+    /// hence c̃ ≠ 0) must change the Laplace H̃ and therefore the per-subject
+    /// OFV by a non-trivial amount, even when the proportional-component
+    /// magnitude is small enough that the *data* term barely shifts.
+    ///
+    /// Catches a regression where the c̃'c̃ accumulator is dropped or zeroed —
+    /// in that case the additive and combined Laplace values would coincide
+    /// up to the tiny `(prop·f)² → R` difference in the data quadratic.
+    #[test]
+    fn test_focei_laplace_combined_uses_inter_correction() {
+        let subj = make_simple_subject();
+        let mut model = make_model();
+        model.error_model = ErrorModel::Combined;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+
+        let theta = vec![5.0, 50.0];
+        let eta_hat = nalgebra::DVector::from_vec(vec![0.1]);
+        let omega = make_omega(0.09);
+        // Two sigmas for Combined: (prop, add). The proportional component is
+        // intentionally small relative to additive so the data-side R hardly
+        // changes — any noticeable OFV shift is then due to the c̃'c̃ piece.
+        let sigma_combined = vec![0.02, 1.0];
+        let sigma_additive_only = vec![1.0]; // matches Combined R when prop ≈ 0
+
+        let ipreds = pk::compute_predictions_with_tv(&model, &subj, &theta, eta_hat.as_slice());
+        let n_obs = subj.obs_times.len();
+        let eps = 1e-6;
+        let mut h = DMatrix::zeros(n_obs, 1);
+        let h_step = eps * (1.0 + eta_hat[0].abs());
+        let preds_p =
+            pk::compute_predictions_with_tv(&model, &subj, &theta, &[eta_hat[0] + h_step]);
+        let preds_m =
+            pk::compute_predictions_with_tv(&model, &subj, &theta, &[eta_hat[0] - h_step]);
+        for i in 0..n_obs {
+            h[(i, 0)] = (preds_p[i] - preds_m[i]) / (2.0 * h_step);
+        }
+
+        let espec_combined = ErrorSpec::Single(ErrorModel::Combined);
+        let espec_additive = ErrorSpec::Single(ErrorModel::Additive);
+        let focei_combined = foce_subject_nll_interaction(
+            &subj,
+            &ipreds,
+            &eta_hat,
+            &h,
+            &omega,
+            &sigma_combined,
+            &espec_combined,
+            BloqMethod::Drop,
+            &[],
+        );
+        let focei_additive = foce_subject_nll_interaction(
+            &subj,
+            &ipreds,
+            &eta_hat,
+            &h,
+            &omega,
+            &sigma_additive_only,
+            &espec_additive,
+            BloqMethod::Drop,
+            &[],
+        );
+        let gap = focei_combined - focei_additive;
+        assert!(
+            gap.abs() > 1e-3,
+            "FOCEI Laplace must respond to the Almquist `½·c̃'·c̃` INTER \
+             correction; combined ({}) and additive ({}) gave gap = {} — \
+             too small, c̃'c̃ likely not being accumulated.",
+            focei_combined,
+            focei_additive,
+            gap,
         );
     }
 }

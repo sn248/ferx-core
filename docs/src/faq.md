@@ -132,6 +132,34 @@ Reach for a different optimizer when SLSQP misbehaves:
 See [Fit Options](model-file/fit-options.md#optimizer-choices) for the full
 list.
 
+## How do I fit on the log scale, like NONMEM's `Y = LOG(F) + EPS(1)`?
+
+Use a log-transform-both-sides (LTBS) error model. Two forms are available in the
+`[error_model]` block, depending on the scale of your `DV` column:
+
+```
+# DV on the natural scale — engine log-transforms DV and the prediction:
+log(DV) ~ additive(ADD_LOG)
+
+# DV already log-transformed in the data (e.g. ported from NONMEM):
+DV ~ log_additive(ADD_LOG)
+```
+
+Both compare `log(prediction)` to a log-scale observation with **additive** error
+on the log scale — exactly NONMEM's `IPRED = LOG(F); Y = IPRED + EPS(1)`. Under
+LTBS, `IPRED`/`PRED`, `IWRES`/`CWRES`, and simulated `DV` are all reported on the
+log scale (back-transform with `exp()` for natural-scale values).
+
+**Relationship to proportional error.** For a small residual CV, additive-on-log
+and proportional error coincide. On the warfarin dataset the two
+parameterizations agree closely: `examples/warfarin.ferx` (`DV ~
+proportional(PROP_ERR)`) fits `PROP_ERR ≈ 0.0106` with `TVCL ≈ 0.133, TVV ≈ 7.69,
+TVKA ≈ 0.76`, and `examples/warfarin_ltbs.ferx` (`log(DV) ~ additive(ADD_LOG)`)
+fits `ADD_LOG ≈ 0.0106` with `TVCL ≈ 0.133, TVV ≈ 7.74, TVKA ≈ 0.81` — the same
+structural parameters and the same residual magnitude. See
+[Error Model](model-file/error-model.md#log-transform-both-sides-ltbs) for the
+full reference and restrictions.
+
 ## How do I scale predictions to match my data's units, like NONMEM's `S1`/`S2`?
 
 Use the `[scaling]` block. The convention is divisive

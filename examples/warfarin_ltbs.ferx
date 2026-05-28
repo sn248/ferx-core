@@ -1,0 +1,33 @@
+# One-compartment oral PK model (warfarin), fit on the log scale.
+#
+# Log-transform-both-sides (LTBS): the natural-scale DV column is
+# log-transformed by the engine and compared to log(prediction) with additive
+# error on the log scale — equivalent to NONMEM's `Y = LOG(F) + EPS(1)`. This is
+# the log-scale counterpart of `warfarin.ferx`'s proportional error model.
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma ADD_LOG ~ 0.15 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  log(DV) ~ additive(ADD_LOG)
+
+[fit_options]
+  method     = foce
+  maxiter    = 300
+  covariance = true

@@ -8,6 +8,11 @@
 use crate::types::*;
 use std::autodiff::{autodiff_forward, autodiff_reverse};
 
+/// LTBS positivity floor for the AD paths. Mirrors [`crate::pk::LTBS_FLOOR`];
+/// duplicated as a local `const` so the AD-instrumented code has no cross-module
+/// dependency and Enzyme sees a plain literal.
+const LTBS_FLOOR_AD: f64 = 1e-12;
+
 // ─── Individual NLL: reverse-mode AD for gradient w.r.t. eta ────────────────
 
 #[autodiff_reverse(
@@ -45,15 +50,20 @@ pub fn individual_nll_ad(
     cens_f64: &[f64],      // per-observation censoring flag; > 0.5 ⇒ BLOQ (M3)
     pk_idx_f64: &[f64],    // PK parameter indices as f64 (cast to usize inside)
     sel_flat: &[f64],      // n_tv × n_eta row-major one-hot eta selector
-    pk_and_err_model: f64, // pk_model_id * 10 + error_model_id
+    pk_and_err_model: f64, // pk_model_id * 10 + error_model_id (+100 ⇒ LTBS)
     obs_scale: &[f64],     // per-observation divisor (len = n_obs). All-ones = no-op.
 ) -> f64 {
     let n_eta = eta.len();
     let n_tv = tv.len();
     let n_doses = dose_times.len();
     let n_obs = obs_times.len();
-    let pk_model_id = (pk_and_err_model as i32) / 10;
-    let error_model_id = (pk_and_err_model as i32) % 10;
+    // LTBS is packed as a +100 offset on the model id (pk_model_id ≤ 8 ⇒ base
+    // ≤ 82, so the offset is unambiguous). Under LTBS the effective prediction
+    // is log(conc) and the error model is additive on the log scale.
+    let ltbs = (pk_and_err_model as i32) >= 100;
+    let base = (pk_and_err_model as i32) % 100;
+    let pk_model_id = base / 10;
+    let error_model_id = base % 10;
 
     // Eta prior: eta' * Omega_inv * eta
     let mut eta_prior = 0.0;
@@ -116,6 +126,18 @@ pub fn individual_nll_ad(
             conc = 0.0;
         }
         conc /= obs_scale[obs_idx];
+
+        // LTBS: compare log(prediction) to the (log-scale) observation. Floor
+        // with an explicit comparison — `f64::max` lowers to an LLVM intrinsic
+        // Enzyme can't differentiate (see CLAUDE.md).
+        if ltbs {
+            let c = if conc < LTBS_FLOOR_AD {
+                LTBS_FLOOR_AD
+            } else {
+                conc
+            };
+            conc = c.ln();
+        }
 
         let v = residual_variance_ad(error_model_id, conc, sigma_values);
         if cens_f64[obs_idx] > 0.5 {
@@ -205,7 +227,12 @@ pub fn predict_all_ad(
     let n_tv = tv.len();
     let n_doses = dose_times.len();
     let n_obs = obs_times.len();
-    let pk_id = pk_model_id as i32;
+    // Same +100 LTBS packing as `individual_nll_ad`: the Jacobian must be
+    // d log(f)/dη when LTBS is active, so the forward prediction is log-wrapped
+    // here — otherwise the AD Jacobian (natural scale) and the FD/AD objective
+    // (log scale) would disagree and corrupt FOCEI/CWRES.
+    let ltbs = (pk_model_id as i32) >= 100;
+    let pk_id = (pk_model_id as i32) % 100;
 
     let mut pk = [0.0f64; MAX_PK_PARAMS];
     pk[PK_IDX_F] = 1.0;
@@ -247,7 +274,19 @@ pub fn predict_all_ad(
             }
         }
         let positive = if conc > 0.0 { conc } else { 0.0 };
-        out[obs_idx] = positive / obs_scale[obs_idx];
+        let scaled = positive / obs_scale[obs_idx];
+        // LTBS log-wrap with an explicit-comparison floor (no `f64::max`, per
+        // CLAUDE.md — Enzyme can't differentiate the max intrinsic).
+        out[obs_idx] = if ltbs {
+            let c = if scaled < LTBS_FLOOR_AD {
+                LTBS_FLOOR_AD
+            } else {
+                scaled
+            };
+            c.ln()
+        } else {
+            scaled
+        };
     }
 }
 
@@ -623,11 +662,16 @@ pub fn compute_nll_gradient_ad(
     pk_idx_f64: &[f64],
     sel_flat: &[f64],
     obs_scale: &[f64],
+    log_transform: bool,
 ) -> (f64, Vec<f64>) {
     let n_eta = eta.len();
     let mut d_eta = vec![0.0f64; n_eta];
 
-    let pk_and_err = (pk_model_to_id(pk_model) * 10 + error_model_to_id(error_model)) as f64;
+    // +100 packs LTBS (see `individual_nll_ad`); under LTBS the error model is
+    // additive (id 0) on the log scale.
+    let ltbs_offset = if log_transform { 100 } else { 0 };
+    let pk_and_err =
+        (pk_model_to_id(pk_model) * 10 + error_model_to_id(error_model) + ltbs_offset) as f64;
 
     let nll = individual_nll_ad_grad(
         eta,
@@ -665,9 +709,13 @@ pub fn compute_jacobian_ad(
     pk_idx_f64: &[f64],
     sel_flat: &[f64],
     obs_scale: &[f64],
+    log_transform: bool,
 ) -> nalgebra::DMatrix<f64> {
     let n_eta = eta.len();
-    let pk_id = pk_model_to_id(pk_model) as f64;
+    // +100 packs LTBS so `predict_all_ad` log-wraps the forward prediction, making
+    // this Jacobian d log(f)/dη — consistent with the log-scale objective.
+    let ltbs_offset = if log_transform { 100 } else { 0 };
+    let pk_id = (pk_model_to_id(pk_model) + ltbs_offset) as f64;
     let mut jac = nalgebra::DMatrix::zeros(n_obs, n_eta);
 
     for j in 0..n_eta {
@@ -700,4 +748,84 @@ pub fn compute_jacobian_ad(
     }
 
     jac
+}
+
+#[cfg(test)]
+mod ltbs_ad_tests {
+    use super::*;
+    use crate::types::{ErrorModel, PkModel};
+
+    /// The reverse-mode LTBS gradient (with the +100 log-wrap encoding) must
+    /// match a central difference of the LTBS NLL — i.e. the analytic
+    /// d/dη[ (log DV − log f)² / σ² ] is correct through the `conc.ln()` step.
+    #[test]
+    fn ltbs_ad_gradient_matches_central_difference() {
+        // 1-cpt IV bolus, single eta on CL, additive error on the log scale.
+        let eta = vec![0.1];
+        let tv = vec![1.0, 10.0]; // CL_typical, V
+        let pk_idx_f64 = vec![0.0, 1.0]; // PK_IDX_CL = 0, PK_IDX_V = 1
+        let sel_flat = vec![1.0, 0.0]; // eta applies to CL only (2 tv × 1 eta)
+        let omega = 0.09_f64;
+        let omega_inv_flat = vec![1.0 / omega];
+        let log_det = omega.ln();
+        let sigma = vec![0.3];
+        let dose = FlatDoseData {
+            times: vec![0.0],
+            amts: vec![100.0],
+            rates: vec![0.0],
+            durations: vec![0.0],
+        };
+        let obs_times = vec![1.0, 3.0, 6.0];
+        let observations = vec![2.0, 1.0, 0.0]; // log-scale DV
+        let cens = vec![0.0, 0.0, 0.0];
+        let obs_scale = vec![1.0, 1.0, 1.0];
+
+        let (_, grad) = compute_nll_gradient_ad(
+            &eta,
+            &tv,
+            &omega_inv_flat,
+            log_det,
+            &sigma,
+            &dose,
+            &obs_times,
+            &observations,
+            &cens,
+            PkModel::OneCptIvBolus,
+            ErrorModel::Additive,
+            &pk_idx_f64,
+            &sel_flat,
+            &obs_scale,
+            true, // LTBS
+        );
+
+        // Central FD of the LTBS NLL (pk_and_err = 100 ⇒ LTBS + additive id 0).
+        let nll = |e: &[f64]| {
+            individual_nll_ad(
+                e,
+                &tv,
+                &omega_inv_flat,
+                log_det,
+                &sigma,
+                &dose.times,
+                &dose.amts,
+                &dose.rates,
+                &dose.durations,
+                &obs_times,
+                &observations,
+                &cens,
+                &pk_idx_f64,
+                &sel_flat,
+                100.0,
+                &obs_scale,
+            )
+        };
+        let h = 1e-6;
+        let mut ep = eta.clone();
+        ep[0] += h;
+        let mut em = eta.clone();
+        em[0] -= h;
+        let fd = (nll(&ep) - nll(&em)) / (2.0 * h);
+
+        approx::assert_relative_eq!(grad[0], fd, epsilon = 1e-5, max_relative = 1e-4);
+    }
 }

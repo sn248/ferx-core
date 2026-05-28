@@ -46,6 +46,65 @@ Combines proportional and additive components:
 
 Use when both proportional and additive error sources are present. Requires two sigma parameters defined in `[parameters]`.
 
+## Log-transform-both-sides (LTBS)
+
+For data whose residual error is *multiplicative* (a constant CV across the
+concentration range), an alternative to the proportional model is to fit on the
+**log scale**: both the observation and the prediction are log-transformed and an
+**additive** error is applied on the log scale. This matches NONMEM's
+`Y = LOG(F) + EPS(1)` convention and is the natural choice when importing a model
+or dataset from NONMEM.
+
+There are two ways to declare it, depending on the scale of the `DV` column in
+your dataset:
+
+### `log(DV) ~ additive(SIGMA)` — DV on the natural scale
+
+```
+[parameters]
+  sigma ADD_LOG ~ 0.1     # additive SD on the LOG scale
+
+[error_model]
+  log(DV) ~ additive(ADD_LOG)
+```
+
+The engine log-transforms the `DV` column itself (once, at load), and compares it
+to `log(prediction)`. Use this when your data holds concentrations on the natural
+scale.
+
+### `DV ~ log_additive(SIGMA)` — DV already log-transformed
+
+```
+[error_model]
+  DV ~ log_additive(ADD_LOG)
+```
+
+Use this when the `DV` column is *already* log-transformed in the dataset (e.g.
+exported from a NONMEM workflow that pre-logged the data). The engine takes `DV`
+as-is and log-transforms only the prediction. `log_additive` is additive error on
+the log scale.
+
+### Output scale
+
+Under LTBS, **everything is reported on the log scale**, matching NONMEM:
+`IPRED`/`PRED`, `IWRES`/`CWRES`, and simulated `DV` are all on the log scale.
+Back-transform with `exp()` if you need natural-scale values.
+
+The likelihood term is the additive form on the log scale:
+
+\\[ \text{Var}(\log DV) = \sigma^2, \qquad \text{IWRES} = \frac{\log DV - \log f}{\sigma} \\]
+
+### Restrictions
+
+- **Additive only.** LTBS pairs with additive error on the log scale; `log(DV) ~
+  proportional(...)` / `combined(...)` are rejected at parse time.
+- **Single endpoint.** Not supported with per-CMT (multi-endpoint) error models.
+- **No SDE.** Not supported with a `[diffusion]` (SDE/EKF) model.
+- **BLOQ/M3 is supported** — the LLOQ is log-transformed alongside `DV`.
+- A non-positive `DV` under `log(DV) ~ additive(...)` cannot be log-transformed;
+  it is floored to `log(1e-12)` and a warning is emitted (check your data scale,
+  or use `DV ~ log_additive(...)` if the data is already log-transformed).
+
 ## Multiple endpoints (per-CMT error models)
 
 For simultaneous PK/PD (and other multi-analyte) models, a single observed

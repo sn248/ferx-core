@@ -30,6 +30,10 @@
 use crate::types::*;
 use std::autodiff::autodiff_reverse;
 
+/// LTBS positivity floor for this AD path. Mirrors [`crate::pk::LTBS_FLOOR`] /
+/// `ad_gradients::LTBS_FLOOR_AD`; kept local so Enzyme sees a plain literal.
+const LTBS_FLOOR_AD: f64 = 1e-12;
+
 // ─────────────────────────────────────────────────────────────────────
 // Flat data layout for one subject's event timeline.
 // ─────────────────────────────────────────────────────────────────────
@@ -238,8 +242,12 @@ pub fn individual_nll_event_driven_ad(
     let n_tv = pk_idx_f64.len();
     let n_events = event_times.len();
     let n_doses = dose_times.len();
-    let pk_model_id = (pk_and_err_model as i32) / 10;
-    let error_model_id = (pk_and_err_model as i32) % 10;
+    // +100 packs LTBS (see `ad_gradients::individual_nll_ad`): the prediction is
+    // log-wrapped and the error model is additive on the log scale.
+    let ltbs = (pk_and_err_model as i32) >= 100;
+    let base = (pk_and_err_model as i32) % 100;
+    let pk_model_id = base / 10;
+    let error_model_id = base % 10;
 
     // ── η prior: η' Ω⁻¹ η ───────────────────────────────────────────
     let mut eta_prior = 0.0;
@@ -388,7 +396,19 @@ pub fn individual_nll_event_driven_ad(
         let v_safe = ev_v.abs() + 1e-30;
         let conc_raw = central_amt / v_safe;
         let conc_clamped = (conc_raw + conc_raw.abs()) * 0.5;
-        let conc = conc_clamped / obs_scale[ev_idx];
+        let scaled = conc_clamped / obs_scale[ev_idx];
+        // LTBS: compare log(prediction) to the log-scale observation. Explicit-
+        // comparison floor (no `f64::max`, per CLAUDE.md).
+        let conc = if ltbs {
+            let c = if scaled < LTBS_FLOOR_AD {
+                LTBS_FLOOR_AD
+            } else {
+                scaled
+            };
+            c.ln()
+        } else {
+            scaled
+        };
 
         let v_resid = residual_variance_ad(error_model_id, conc, sigma_values);
         let cens_active = if cens_f64[obs_idx] > 0.5 { 1.0 } else { 0.0 };
@@ -1171,12 +1191,17 @@ pub fn compute_nll_gradient_event_driven_ad(
     // caller pads non-obs entries to 1.0 so the `is_obs` likelihood mask
     // doesn't get corrupted by NaN/0 reads.
     obs_scale: &[f64],
+    log_transform: bool,
 ) -> (f64, Vec<f64>) {
     let n_eta = eta.len();
     let mut d_eta = vec![0.0_f64; n_eta];
 
+    // +100 packs LTBS (see `ad_gradients::individual_nll_ad`); under LTBS the
+    // error model is additive (id 0) on the log scale.
+    let ltbs_offset = if log_transform { 100 } else { 0 };
     let pk_and_err = (crate::ad::ad_gradients::pk_model_to_id(pk_model) * 10
-        + crate::ad::ad_gradients::error_model_to_id(error_model)) as f64;
+        + crate::ad::ad_gradients::error_model_to_id(error_model)
+        + ltbs_offset) as f64;
 
     // Pad zero-length arrays so the AD kernel's masked-but-still-evaluated
     // index loads stay in-bounds. The mask multiplies the read by 0 so

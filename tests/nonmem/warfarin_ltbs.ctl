@@ -1,0 +1,22 @@
+$PROBLEM Warfarin LTBS (log(DV) ~ additive) - ferx-core cross-check (issue #120)
+$DATA warfarin_log.csv IGNORE=@
+$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV
+$SUBROUTINES ADVAN2 TRANS2
+$PK
+  CL = THETA(1)*EXP(ETA(1))
+  V  = THETA(2)*EXP(ETA(2))
+  KA = THETA(3)*EXP(ETA(3))
+  S2 = V
+$ERROR
+  IPRED = LOG(F)
+  Y = IPRED + EPS(1)
+$THETA (0, 0.2)   ; TVCL
+$THETA (0, 10.0)  ; TVV
+$THETA (0, 1.5)   ; TVKA
+$OMEGA 0.09       ; ETA_CL
+$OMEGA 0.04       ; ETA_V
+$OMEGA 0.30       ; ETA_KA
+$SIGMA 0.0225     ; additive variance on log scale (SD 0.15)
+$ESTIMATION METHOD=1 INTER MAXEVAL=9999 NSIG=3 SIGL=9 PRINT=5 NOABORT
+$COVARIANCE UNCONDITIONAL
+$TABLE ID TIME IPRED NOPRINT ONEHEADER FILE=sdtab_ltbs

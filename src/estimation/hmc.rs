@@ -184,6 +184,7 @@ pub fn hmc_step(
                 &model.pk_idx_f64,
                 &model.sel_flat,
                 &event_scale,
+                model.log_transform,
             );
             last_nll.set(nll);
             g
@@ -221,6 +222,7 @@ pub fn hmc_step(
                 &model.pk_idx_f64,
                 &model.sel_flat,
                 &obs_scale,
+                model.log_transform,
             );
             last_nll.set(nll);
             g

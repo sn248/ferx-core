@@ -1008,7 +1008,47 @@ mod tests {
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
         }
+    }
+
+    #[test]
+    fn test_ltbs_individual_nll_matches_additive_on_log_scale() {
+        // Under LTBS the inner-loop NLL must score the (already-log-scale)
+        // observations against log(prediction) with additive variance σ². This
+        // checks the prediction sink's log-wrap flows through `individual_nll`.
+        let mut model = make_model();
+        model.error_model = ErrorModel::Additive;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Additive);
+        model.log_transform = true;
+
+        let theta = vec![5.0, 50.0];
+        let eta = vec![0.0]; // eta_prior = 0
+        let omega = make_omega(0.09);
+        let sigma = vec![0.3]; // additive SD on the log scale
+
+        // Observations on the log scale (what `fit()` produces for case 2).
+        let mut subj = make_simple_subject();
+        for v in &mut subj.observations {
+            *v = v.ln();
+        }
+
+        // Manual reference: log(natural prediction), additive variance σ².
+        let mut natural_model = make_model();
+        natural_model.log_transform = false;
+        let natural = pk::compute_predictions_with_tv(&natural_model, &subj, &theta, &eta);
+        let var = sigma[0] * sigma[0];
+        let mut data_ll = 0.0;
+        for (j, &f_nat) in natural.iter().enumerate() {
+            let log_f = f_nat.max(1e-12).ln();
+            let resid = subj.observations[j] - log_f;
+            data_ll += resid * resid / var + var.ln();
+        }
+        let expected = 0.5 * (omega.log_det + data_ll);
+
+        let got = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma);
+        approx::assert_relative_eq!(got, expected, epsilon = 1e-9);
     }
 
     #[test]

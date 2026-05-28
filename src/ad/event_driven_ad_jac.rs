@@ -19,6 +19,10 @@ use crate::ad::event_driven_ad::{FlatEventData, FlatEventTv};
 use crate::types::*;
 use std::autodiff::autodiff_forward;
 
+/// LTBS positivity floor for this forward-AD path. Mirrors
+/// [`crate::pk::LTBS_FLOOR`]; kept local so Enzyme sees a plain literal.
+const LTBS_FLOOR_AD: f64 = 1e-12;
+
 // ─────────────────────────────────────────────────────────────────────
 // Forward-mode AD-instrumented predict.
 // ─────────────────────────────────────────────────────────────────────
@@ -65,7 +69,10 @@ pub fn predict_all_event_driven_ad(
     let n_tv = pk_idx_f64.len();
     let n_events = event_times.len();
     let n_doses = dose_times.len();
-    let pk_model_id = pk_model_id_f64 as i32;
+    // +100 packs LTBS so the forward Jacobian is d log(f)/dη (see
+    // `ad_gradients::predict_all_ad`).
+    let ltbs = (pk_model_id_f64 as i32) >= 100;
+    let pk_model_id = (pk_model_id_f64 as i32) % 100;
 
     let mut state0 = 0.0_f64;
     let mut state1 = 0.0_f64;
@@ -167,7 +174,18 @@ pub fn predict_all_event_driven_ad(
         let v_safe = ev_v.abs() + 1e-30;
         let conc_raw = central_amt / v_safe;
         let conc_clamped = (conc_raw + conc_raw.abs()) * 0.5;
-        let conc = conc_clamped / obs_scale[ev_idx];
+        let scaled = conc_clamped / obs_scale[ev_idx];
+        // LTBS log-wrap with an explicit-comparison floor (no `f64::max`).
+        let conc = if ltbs {
+            let c = if scaled < LTBS_FLOOR_AD {
+                LTBS_FLOOR_AD
+            } else {
+                scaled
+            };
+            c.ln()
+        } else {
+            scaled
+        };
 
         // Unconditional write: every Dual output slot must be written
         // exactly once for forward-mode pointer tracking. Non-obs slots
@@ -748,9 +766,13 @@ pub fn compute_jacobian_event_driven_ad(
     // caller pads non-obs entries to 1.0 since the AD pass writes scaled
     // conc into every event slot before the wrapper drops non-obs.
     obs_scale: &[f64],
+    log_transform: bool,
 ) -> nalgebra::DMatrix<f64> {
     let n_eta = eta.len();
-    let pk_id = crate::ad::ad_gradients::pk_model_to_id(pk_model) as f64;
+    // +100 packs LTBS so the forward prediction is log-wrapped, making this
+    // Jacobian d log(f)/dη — consistent with the log-scale objective.
+    let ltbs_offset = if log_transform { 100 } else { 0 };
+    let pk_id = (crate::ad::ad_gradients::pk_model_to_id(pk_model) + ltbs_offset) as f64;
     let n_events = event_data.event_times.len();
     let mut jac = nalgebra::DMatrix::zeros(n_obs, n_eta);
 

@@ -1239,9 +1239,17 @@ fn subject_nll_pop_grad_analytical_laplace(
 /// Compute the FOCE NLL and its gradient w.r.t. the packed population parameter
 /// vector for a single subject, with ETAs fixed at their current EBE values.
 ///
-/// For non-IOV analytical PK models without M3 BLOQ, uses an analytical gradient:
-/// exact for omega/sigma parameters; forward-FD of predictions only for theta.
-/// Falls back to central FD for ODE models, IOV, or M3 BLOQ.
+/// Two analytical paths with different scope (see `sb_ok` / `laplace_ok` below):
+///   - **Almquist Laplace (INTER)**: omega/sigma exact, θ via forward-FD of
+///     predictions. Runs for any model except M3 BLOQ and IOV — ODE models and
+///     per-CMT (`ErrorSpec::PerCmt`) error specs are both supported.
+///   - **Sheiner–Beal (non-INTER)**: same θ axis, but the chain rule still
+///     assumes a single error spec and `ipreds = f₀ + a·η̂`, so this branch
+///     additionally requires analytical PK and `ErrorSpec::Single`.
+///
+/// In all other cases — M3 BLOQ, IOV, or the SB path's extra restrictions —
+/// the dispatcher falls back to central FD over `subject_nll_at`. The Laplace
+/// branch can also bail to FD per call when `H̃` fails Cholesky.
 ///
 /// Returns `(nll_i, gradient_i)` where `gradient_i[j] = d(nll_i)/d(x[j])`.
 pub(crate) fn subject_nll_pop_grad(

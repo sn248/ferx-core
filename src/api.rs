@@ -1774,19 +1774,27 @@ fn compute_subject_results(
             };
 
             // Individual predictions: f(eta_hat), with occasion-specific kappas for IOV.
-            // Uses the continuous per-occasion-aware prediction (issue #104) so the
-            // sdtab ipreds match the fitted objective.
+            // Uses the continuous per-occasion-aware prediction (issue #104) for IOV
+            // and the TV-aware dispatcher for everyone else — so the sdtab IPRED/IWRES
+            // match the IPRED that drove the FOCEI marginal at fit time.
+            //
+            // Previously this branch called `model_preds` with a single per-subject
+            // `pk_params_ind` from `subject.covariates`, which on TV-covariate data
+            // silently took the **non-TV** dose-superposition path while the OFV
+            // was being computed on the event-driven path that honours per-event
+            // covariate snapshots. Result: sdtab IPRED collapsed to ~0 in the
+            // terminal phase for subjects with even mild TV covariates, IWRES
+            // exploded, and the EPS-shrinkage warning fired even when the actual
+            // fit (and the inner-loop EBE) were fine. Caught on the jasmine peds
+            // vancomycin testdata — see `[[focei-laplace-not-sheiner-beal]]`.
             let ipred = if !kappas.is_empty() {
                 let kappa_slices: Vec<Vec<f64>> =
                     kappas.iter().map(|k| k.as_slice().to_vec()).collect();
                 crate::pk::predict_iov(model, subject, &params.theta, eta.as_slice(), &kappa_slices)
             } else {
-                let pk_params_ind =
-                    (model.pk_param_fn)(&params.theta, eta.as_slice(), &subject.covariates);
-                model_preds(
+                crate::pk::compute_predictions_with_tv(
                     model,
                     subject,
-                    &pk_params_ind,
                     &params.theta,
                     eta.as_slice(),
                 )

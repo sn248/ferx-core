@@ -2126,7 +2126,13 @@ mod tests {
         let x = pack_params(template);
         let bounds = compute_bounds(template);
         let n = x.len();
-        let options = FitOptions::default();
+        // FOCE non-interaction: the AD/analytical population-gradient path is the
+        // Sheiner–Beal-derived closed form for the SB NLL. FOCEI INTER now uses
+        // the Almquist Laplace NLL, whose gradient takes the FD fallback in
+        // `subject_nll_pop_grad`; under INTER this test would be vacuous
+        // (FD-vs-FD). Set interaction=false to exercise the analytical path.
+        let mut options = FitOptions::default();
+        options.interaction = false;
 
         let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
         // Use a non-zero H-matrix so r_tilde = R + H·Ω·Hᵀ depends on Ω and

@@ -2814,67 +2814,86 @@ fn build_ode_spec(
     //   vars[n_states+n_indiv..n_states+n_indiv+n_inter]   → intermediates written by `Assign` in the ODE block
     //
     // The lookup map carries case-insensitive aliases (lower/upper/original)
-    // to match the existing closure's behaviour.
+    // to match the existing closure's behaviour. Name-collision (case-insensitive)
+    // between any two of state names, indiv-param names, and intermediates is
+    // rejected at parse time — without that check, the eager alias insertion
+    // would silently route reads of one name through another's slot.
+    let state_count = state_names_owned.len();
+    let indiv_count = indiv_names_owned.len();
+
+    // Reuse the existing top-level walker that already collects `Assign` LHS
+    // names with the same dedup-and-recurse-through-If semantics we need.
+    let intermediates: Vec<String> = assigned_vars_in_order(&stmts_owned);
+
+    // Reject covariate references in ODE RHS expressions. Both the old
+    // HashMap evaluator and the new indexed one silently resolve these to
+    // 0.0 (empty covariate map / empty cov_idx) — which means models like
+    // `d/dt(central) = -CL/V * central * (WT/70)^0.75` parse fine and fit
+    // with the WT term collapsed to 0, producing silently-wrong dynamics.
+    // Surface that as a parse-time error so users notice; see issue tracker
+    // for the planned proper support.
+    let mut ode_covariates: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_covariates_in_stmts(&stmts_owned, &mut ode_covariates);
+    if !ode_covariates.is_empty() {
+        let mut covs: Vec<String> = ode_covariates.into_iter().collect();
+        covs.sort();
+        return Err(format!(
+            "[odes]: covariate reference(s) in ODE RHS not supported: {}. \
+             Pre-compute the covariate-dependent term in [individual_parameters] \
+             and reference that variable in the ODE block instead.",
+            covs.join(", ")
+        ));
+    }
+
+    // Reject name collisions (case-insensitive) across the three name spaces.
+    // Without this, the eager alias insertion below would silently route reads
+    // of one identifier through another's slot — pathological but real, and the
+    // failure mode is mid-RHS-call slot-clobbering with no warning.
+    let mut seen_lower: HashMap<String, &'static str> = HashMap::new();
+    let mut check_collision = |name: &str, kind: &'static str| -> Result<(), String> {
+        let lower = name.to_lowercase();
+        if let Some(prev) = seen_lower.insert(lower, kind) {
+            return Err(format!(
+                "[odes]: name `{name}` collides with a previously-declared {prev} \
+                 (case-insensitive); state, individual-parameter, and ODE-block \
+                 intermediate names must all be distinct."
+            ));
+        }
+        Ok(())
+    };
+    for n in &state_names_owned {
+        check_collision(n, "state")?;
+    }
+    for n in &indiv_names_owned {
+        check_collision(n, "individual parameter")?;
+    }
+    for n in &intermediates {
+        check_collision(n, "ODE-block intermediate")?;
+    }
+
+    // Layout is now collision-free; build the slot map. `or_insert` is fine
+    // because the only repeats are within one name's own case-variant set
+    // (which we intentionally collapse to a single slot).
     let mut var_idx: HashMap<String, usize> = HashMap::new();
-    let mut next_slot = 0_usize;
     let add_aliases = |map: &mut HashMap<String, usize>, name: &str, slot: usize| {
         map.entry(name.to_string()).or_insert(slot);
         map.entry(name.to_lowercase()).or_insert(slot);
         map.entry(name.to_uppercase()).or_insert(slot);
     };
-    for n in &state_names_owned {
-        add_aliases(&mut var_idx, n, next_slot);
-        next_slot += 1;
+    for (i, n) in state_names_owned.iter().enumerate() {
+        add_aliases(&mut var_idx, n, i);
     }
-    let state_count = state_names_owned.len();
-    for n in &indiv_names_owned {
-        add_aliases(&mut var_idx, n, next_slot);
-        next_slot += 1;
+    for (i, n) in indiv_names_owned.iter().enumerate() {
+        add_aliases(&mut var_idx, n, state_count + i);
     }
-    let indiv_count = indiv_names_owned.len();
-
-    // Walk the ODE block to find any intermediates (LHS of `Assign`) the user
-    // declares — e.g. `CP = central / V; d/dt(effect) = ke0 * (CP - effect)`.
-    // They get slots after the state/param block. Nested `If` arms are
-    // recursed into so intermediates inside branches also get slots.
-    fn collect_assign_lhs<'a>(stmts: &'a [Statement], names: &mut Vec<&'a str>) {
-        for s in stmts {
-            match s {
-                Statement::Assign(name, _) => {
-                    if !names.iter().any(|n| n == &name.as_str()) {
-                        names.push(name.as_str());
-                    }
-                }
-                Statement::If {
-                    branches,
-                    else_body,
-                } => {
-                    for (_, body) in branches {
-                        collect_assign_lhs(body, names);
-                    }
-                    if let Some(eb) = else_body {
-                        collect_assign_lhs(eb, names);
-                    }
-                }
-                Statement::AssignIdx(_, _)
-                | Statement::DiffEq(_, _)
-                | Statement::DiffEqIdx(_, _) => {}
-            }
-        }
+    for (i, n) in intermediates.iter().enumerate() {
+        add_aliases(&mut var_idx, n, state_count + indiv_count + i);
     }
-    let mut intermediates: Vec<&str> = Vec::new();
-    collect_assign_lhs(&stmts_owned, &mut intermediates);
-    for n in &intermediates {
-        add_aliases(&mut var_idx, n, next_slot);
-        next_slot += 1;
-    }
-    let n_vars_total = next_slot;
+    let n_vars_total = state_count + indiv_count + intermediates.len();
 
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
-    // — pre-resolving names to slot indices. The empty `cov_idx` is intentional:
-    // covariate references in the ODE RHS are not currently supported on this
-    // path (the closure passes an empty covariate slice at eval time), so any
-    // `Covariate(...)` node resolves to `usize::MAX` and reads as 0.0.
+    // — pre-resolving names to slot indices. `cov_idx` stays empty (any
+    // covariate reference would have been rejected above).
     let empty_cov_idx: HashMap<String, usize> = HashMap::new();
     resolve_variable_indices(
         &mut stmts_owned,
@@ -2883,55 +2902,89 @@ fn build_ode_spec(
         Some(&state_index),
     );
 
-    // Pre-build a `(vars_slot, params_slot)` plan for the indiv-param block so
-    // the closure can populate the indiv slice with a tight loop. `indiv_idx_to_params_slot[i]`
-    // gives the params[] index whose value belongs in `vars[state_count + i]`.
+    // Pre-build a `(vars_slot, params_slot)` plan for the indiv-param block.
+    // `ode_param_slots` guarantees this Vec is exactly `indiv_count` long;
+    // an `assert_eq!` makes that contract local. The previous fallback
+    // (`unwrap_or(i)`) silently routed wrong PkParams values if the invariant
+    // ever broke; the deeper fix is `unwrap_or(usize::MAX)` so a corrupted
+    // plan reads 0 instead of garbage and the integrator surfaces the bug.
+    assert_eq!(
+        indiv_count,
+        indiv_slots_owned.len(),
+        "indiv_param_names and indiv_param_slots must be parallel"
+    );
     let indiv_to_params_slot: Vec<usize> = (0..indiv_count)
-        .map(|i| indiv_slots_owned.get(i).copied().unwrap_or(i))
+        .map(|i| indiv_slots_owned.get(i).copied().unwrap_or(usize::MAX))
         .collect();
+
+    // Per-thread scratch for the `vars` slice. The closure type is
+    // `Box<dyn Fn(...) + Send + Sync>`, which forbids a captured `Cell` /
+    // `RefCell`; thread-local storage sidesteps the `Sync` requirement and
+    // amortises the per-call allocation across every RK45 stage on a thread.
+    // `vec.clear(); vec.resize(n, 0.0)` re-zeros the buffer cheaply (no realloc
+    // once the capacity grows), so intermediate slots in untaken if-branches
+    // still read 0 just like the old per-call `vec![0.0; n]` path.
+    thread_local! {
+        static RHS_VARS_SCRATCH: std::cell::RefCell<Vec<f64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
         Box::new(move |u: &[f64], params: &[f64], _t: f64, du: &mut [f64]| {
-            // Per-call scratch. A small heap alloc here, but it's a single
-            // `Vec<f64>` of length ~10–30 rather than a multi-bucket HashMap
-            // populated with O(state + 3·indiv) string keys per call.
-            let mut vars = vec![0.0_f64; n_vars_total];
-
-            // State values from u[]. (Bound check is for safety on malformed
-            // models where u.len() < state_count; the integrator never trips
-            // this in practice.)
-            let copy_n = state_count.min(u.len()).min(vars.len());
-            vars[..copy_n].copy_from_slice(&u[..copy_n]);
-
-            // Individual parameters from params[] via the pre-computed slot
-            // plan. Out-of-bounds slots leave the var at 0.0.
-            for (i, &slot) in indiv_to_params_slot.iter().enumerate() {
-                if let (Some(dst), Some(&val)) = (vars.get_mut(state_count + i), params.get(slot)) {
-                    *dst = val;
-                }
-            }
-
-            // Reset du so a state without a firing d/dt this iteration (e.g.
-            // inside an untaken if-branch) gets 0.0 rather than stale memory.
-            for slot in du.iter_mut() {
-                *slot = 0.0;
-            }
-
-            let empty_theta: [f64; 0] = [];
-            let empty_eta: [f64; 0] = [];
-            let empty_cov: [f64; 0] = [];
-            // `[covariate_nn]` outputs are routed via `pk_param_fn`, not the
-            // ODE RHS, so this stays empty.
-            let empty_nn_outputs: Vec<Vec<f64>> = Vec::new();
-            eval_statements_indexed(
-                &stmts_owned,
-                &empty_theta,
-                &empty_eta,
-                &empty_cov,
-                &mut vars,
-                Some(du),
-                &empty_nn_outputs,
+            // The integrator always passes a `u` whose length matches the
+            // declared state count. The old closure index-panicked on
+            // `u[i]` if that contract ever broke; preserve that signal here
+            // via `debug_assert!` rather than silently truncating.
+            debug_assert!(
+                u.len() >= state_count,
+                "ODE RHS: u.len() = {} < state_count = {}",
+                u.len(),
+                state_count,
             );
+            let copy_n = state_count.min(u.len());
+
+            RHS_VARS_SCRATCH.with(|cell| {
+                let mut vars = cell.borrow_mut();
+                vars.clear();
+                vars.resize(n_vars_total, 0.0);
+
+                // State values from u[].
+                vars[..copy_n].copy_from_slice(&u[..copy_n]);
+
+                // Individual parameters from params[] via the pre-computed
+                // slot plan. `usize::MAX` slots (impossible under the
+                // assert_eq above) leave the var at 0.0.
+                for (i, &slot) in indiv_to_params_slot.iter().enumerate() {
+                    if let (Some(dst), Some(&val)) =
+                        (vars.get_mut(state_count + i), params.get(slot))
+                    {
+                        *dst = val;
+                    }
+                }
+
+                // Reset du so a state without a firing d/dt this iteration
+                // (e.g. inside an untaken if-branch) gets 0.0 rather than
+                // stale memory.
+                for slot in du.iter_mut() {
+                    *slot = 0.0;
+                }
+
+                let empty_theta: [f64; 0] = [];
+                let empty_eta: [f64; 0] = [];
+                let empty_cov: [f64; 0] = [];
+                // `[covariate_nn]` outputs are routed via `pk_param_fn`, not
+                // the ODE RHS, so this stays empty.
+                let empty_nn_outputs: Vec<Vec<f64>> = Vec::new();
+                eval_statements_indexed(
+                    &stmts_owned,
+                    &empty_theta,
+                    &empty_eta,
+                    &empty_cov,
+                    &mut vars,
+                    Some(du),
+                    &empty_nn_outputs,
+                );
+            });
         });
 
     // Build the init_fn closure from the extracted `init(state) = expr`
@@ -4626,13 +4679,16 @@ fn resolve_variable_indices(
             Statement::DiffEq(name, expr) => {
                 resolve_expr_indices(expr, var_idx, cov_idx);
                 if let Some(sidx) = state_idx {
-                    // Case-insensitive match: the unindexed evaluator looks
-                    // states up by both original and lowercase variants.
-                    let slot = sidx
-                        .get(name)
-                        .or_else(|| sidx.get(&name.to_lowercase()))
-                        .copied()
-                        .unwrap_or(usize::MAX);
+                    // The parser's `[odes]: missing d/dt(...)` validator at
+                    // `build_ode_rhs_fn` already enforces exact-string match
+                    // between this `name` and a declared state, so the lookup
+                    // cannot miss; if it ever does, we'd silently drop the
+                    // derivative — assert in debug builds to catch that.
+                    let slot = sidx.get(name).copied().unwrap_or(usize::MAX);
+                    debug_assert!(
+                        slot != usize::MAX,
+                        "resolve_variable_indices: DiffEq state `{name}` not in state_index",
+                    );
                     let taken_expr = std::mem::replace(expr, Expression::Literal(0.0));
                     *s = Statement::DiffEqIdx(slot, taken_expr);
                 }

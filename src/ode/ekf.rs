@@ -398,12 +398,9 @@ mod tests {
         };
         let ode_spec = OdeSpec {
             rhs: Box::new(one_cpt_rhs),
-            rhs_augmented: None,
-            n_eta_for_sens: 0,
             n_states: 1,
             state_names: vec!["central".into()],
             readout: crate::ode::OdeReadout::ObsCmt(0),
-            readout_sensitivity: None,
             diffusion_var: Vec::new(),
             init_fn: None,
         };

@@ -223,7 +223,6 @@ fn build_warfarin_model() -> CompiledModel {
         kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
         indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        ode_sensitivity_rhs: None,
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -339,7 +338,6 @@ fn generate_two_cpt_iv() {
         kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into(), "V".into(), "Q".into(), "V2".into()],
         indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        ode_sensitivity_rhs: None,
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -460,7 +458,6 @@ fn generate_two_cpt_oral_cov() {
             "KA".into(),
         ],
         indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        ode_sensitivity_rhs: None,
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -573,12 +570,9 @@ fn generate_mm_oral() {
         });
     let ode_spec = ferx_core::ode::OdeSpec {
         rhs: ode_rhs,
-        rhs_augmented: None,
-        n_eta_for_sens: 0,
         n_states: 2,
         state_names: vec!["depot".into(), "central".into()],
         readout: ferx_core::ode::OdeReadout::ObsCmt(1),
-        readout_sensitivity: None,
         diffusion_var: Vec::new(),
         init_fn: None,
     };
@@ -626,7 +620,6 @@ fn generate_mm_oral() {
         kappa_names: Vec::new(),
         indiv_param_names: vec!["VMAX".into(), "KM".into(), "V".into(), "KA".into()],
         indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        ode_sensitivity_rhs: None,
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,

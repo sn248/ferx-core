@@ -7,11 +7,6 @@ use std::collections::HashMap;
 // inner `Expression` AST stays parser-private — only `IndivParamPartials::empty`
 // and the `Debug`/`Clone` derives are reachable from outside the crate.
 pub use crate::parser::model_parser::IndivParamPartials;
-/// Milestone-3 augmented ODE sensitivity-RHS bytecodes. Same opaque-to-
-/// external-callers pattern as `IndivParamPartials` — visible enough to
-/// stuff `OdeSensitivityRhs::empty()` into a hand-built `CompiledModel`,
-/// not transparent enough to inspect the parser's `Bytecode` AST.
-pub use crate::parser::model_parser::OdeSensitivityRhs;
 
 /// A single dose event (bolus, infusion, or oral)
 #[derive(Debug, Clone)]
@@ -1090,14 +1085,6 @@ pub struct CompiledModel {
     /// parser-produced partials.
     #[allow(dead_code)] // consumed by milestones 3-5 of the sensitivity work
     pub indiv_param_partials: IndivParamPartials,
-    /// Augmented ODE sensitivity-RHS bytecodes — milestone 3 of the Tier 4a
-    /// sensitivity work. `None` for analytical (non-ODE) models or for ODE
-    /// models where sensitivity codegen failed / was disabled. When `Some`,
-    /// the augmented integrator can evaluate ∂(d state/dt)/∂η for each
-    /// (state, η) pair at every RK45 stage, enabling
-    /// `gradient = sens` opt-in (milestone 5).
-    #[allow(dead_code)] // consumed by integrator wiring + milestone 5 estimator wiring
-    pub ode_sensitivity_rhs: Option<OdeSensitivityRhs>,
     pub default_params: ModelParameters,
     /// Per-eta flag (parallel to `eta_names` / omega diagonal): `true` when
     /// the user wrote `omega NAME ~ X (sd)` and the parser squared the value.
@@ -2183,7 +2170,6 @@ pub(crate) mod test_helpers {
             kappa_names: Vec::new(),
             indiv_param_names: vec!["CL".into()],
             indiv_param_partials: IndivParamPartials::empty(),
-            ode_sensitivity_rhs: None,
             default_params: ModelParameters {
                 theta: vec![1.0],
                 theta_names: vec!["CL".into()],
@@ -2220,12 +2206,9 @@ pub(crate) mod test_helpers {
             ode_spec: if with_ode {
                 Some(crate::ode::OdeSpec {
                     rhs: Box::new(|_y, _p, _t, _dy| {}),
-                    rhs_augmented: None,
-                    n_eta_for_sens: 0,
                     n_states: 2,
                     state_names: vec!["depot".into(), "central".into()],
                     readout: crate::ode::OdeReadout::ObsCmt(0),
-                    readout_sensitivity: None,
                     diffusion_var: Vec::new(),
                     init_fn: None,
                 })

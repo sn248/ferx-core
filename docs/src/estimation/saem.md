@@ -147,7 +147,7 @@ No additional configuration is required; `method = saem` works for both BSV-only
   method        = saem
   n_exploration = 150      # Phase 1 iterations
   n_convergence = 250      # Phase 2 iterations
-  n_mh_steps    = 3        # MH steps per subject per iteration (ignored when n_leapfrog > 0)
+  n_mh_steps    = 10       # MH steps per subject per iteration (ignored when n_leapfrog > 0)
   n_leapfrog    = 0        # Set > 0 (e.g. 3) to use HMC instead of MH
   adapt_interval = 50      # Step-size adaptation frequency
   omega_burnin  = 20       # Iterations to hold Ω fixed while the chain warms up
@@ -161,7 +161,36 @@ No additional configuration is required; `method = saem` works for both BSV-only
 
 - Increase `n_exploration` (e.g., 300) to give more time for basin finding
 - Increase `n_convergence` (e.g., 500) for a longer averaging window
-- Increase `n_mh_steps` (e.g., 5-10) for better mixing in the E-step
+- Raise `n_mh_steps` further (e.g. 20-50) for better mixing in the E-step
+  on hard surfaces — the default 10 is calibrated to escape the basin trap
+  observed on Emax PKPD with stressful initial values (see below), but
+  ODE-with-Form-C readouts may need more proposals to fully decorrelate
+  samples between M-step calls.
+
+### PD-curve thetas collapse on cold start (Emax / sigmoid readouts)
+
+A failure mode specific to models that read population thetas through a Form
+C `[scaling]` block (e.g. `y[CMT=N] = E0 + EMAX * effect^GAMMA / ...`) and
+score them via a per-CMT additive `[error_model]`: from stressful initial
+values (e.g. 1.5× truth) the M-step can lock the PD-curve thetas into a
+degenerate basin where `E0 → 0`, `EMAX` and `EC50` blow up, and `GAMMA`
+collapses below 1. The likelihood at the bad basin is only modestly worse
+than at truth (~150 OFV units on a 100-subject benchmark), so SAEM doesn't
+back out on its own.
+
+The underlying cause is MCMC sample correlation: with the previous default
+`n_mh_steps = 3` the chain didn't decorrelate enough between SAEM outer
+iterations, so the single-draw stochastic M-step received sticky correlated
+ETAs that biased the population-θ update toward the basin. The current
+default `n_mh_steps = 10` resolves this reliably across seeds at ~20% extra
+wall on the affected model and ~0% on simpler PK-only models.
+
+If you still see this signature (E0 hitting its lower bound, EMAX large,
+EC50 large) on a related Emax/Hill model:
+
+1. Try `n_mh_steps = 20` or `n_mh_steps = 50`
+2. Warm-start from a FOCEI fit (`method = [focei, saem]`)
+3. Run with several seeds and keep the lowest OFV
 
 ### Ω Collapses / Residual Error Inflates
 

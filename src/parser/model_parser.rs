@@ -2110,17 +2110,11 @@ fn build_y_output_fn(
     let bc = compile_bytecode(&expr);
 
     // Per-thread scratch for the y readout vars + covariate slice + bytecode
-    // f64 stack. Separate from `build_ode_rhs_fn`'s `RHS_VARS_SCRATCH` because
-    // the two are sized for different layouts and called in different phases
-    // of the integration (RHS per RK45 stage; readout per observation).
-    thread_local! {
-        static Y_VARS_SCRATCH: std::cell::RefCell<Vec<f64>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-        static Y_COV_SCRATCH: std::cell::RefCell<Vec<f64>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-        static Y_BC_STACK: std::cell::RefCell<Vec<f64>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-    }
+    // f64 stack comes from the shared `FERX_SCRATCH` (see `FerxThreadScratch`).
+    // The y-readout fields are kept separate from rhs_vars because the two are
+    // sized for different layouts; the bc_stack is shared because the y readout
+    // and ODE RHS never interleave on a single thread (readout runs
+    // post-integration).
     let n_cov = cov_names.len();
 
     let out_fn: crate::ode::OdeOutputFn = Box::new(
@@ -2130,54 +2124,49 @@ fn build_y_output_fn(
               eta: &[f64],
               covariates: &HashMap<String, f64>|
               -> f64 {
-            Y_VARS_SCRATCH.with(|vcell| {
-                Y_COV_SCRATCH.with(|ccell| {
-                    Y_BC_STACK.with(|scell| {
-                        let mut vars = vcell.borrow_mut();
-                        vars.clear();
-                        vars.resize(n_vars_total, 0.0);
+            FERX_SCRATCH.with(|cell| {
+                let mut s = cell.borrow_mut();
+                let scratch = &mut *s;
+                scratch.y_vars.clear();
+                scratch.y_vars.resize(n_vars_total, 0.0);
 
-                        // State values from state[]; protect against a
-                        // malformed (state.len() < n_states) input the same
-                        // way the old HashMap path did (it skipped via
-                        // `if i < state.len()`).
-                        let copy_n = n_states.min(state.len());
-                        vars[..copy_n].copy_from_slice(&state[..copy_n]);
+                // State values from state[]; protect against a malformed
+                // (state.len() < n_states) input the same way the old
+                // HashMap path did (it skipped via `if i < state.len()`).
+                let copy_n = n_states.min(state.len());
+                scratch.y_vars[..copy_n].copy_from_slice(&state[..copy_n]);
 
-                        // Indiv params from pk_params_flat via the
-                        // pre-computed slot plan; OOB slots leave the var at
-                        // 0.0.
-                        for (i, &pk_slot) in indiv_to_pk.iter().enumerate() {
-                            if let (Some(dst), Some(&val)) =
-                                (vars.get_mut(n_states + i), pk_params_flat.get(pk_slot))
-                            {
-                                *dst = val;
-                            }
+                // Indiv params from pk_params_flat via the pre-computed slot
+                // plan; OOB slots leave the var at 0.0.
+                for (i, &pk_slot) in indiv_to_pk.iter().enumerate() {
+                    if let (Some(dst), Some(&val)) = (
+                        scratch.y_vars.get_mut(n_states + i),
+                        pk_params_flat.get(pk_slot),
+                    ) {
+                        *dst = val;
+                    }
+                }
+
+                scratch.y_cov.clear();
+                if n_cov > 0 {
+                    scratch.y_cov.resize(n_cov, 0.0);
+                    for (i, name) in cov_names.iter().enumerate() {
+                        if let Some(&v) = covariates.get(name) {
+                            scratch.y_cov[i] = v;
                         }
+                    }
+                }
 
-                        let mut cov_buf = ccell.borrow_mut();
-                        cov_buf.clear();
-                        if n_cov > 0 {
-                            cov_buf.resize(n_cov, 0.0);
-                            for (i, name) in cov_names.iter().enumerate() {
-                                if let Some(&v) = covariates.get(name) {
-                                    cov_buf[i] = v;
-                                }
-                            }
-                        }
-
-                        let empty_nn: Vec<Vec<f64>> = Vec::new();
-                        eval_bytecode(
-                            &bc,
-                            theta,
-                            eta,
-                            &cov_buf,
-                            &vars,
-                            &empty_nn,
-                            &mut scell.borrow_mut(),
-                        )
-                    })
-                })
+                let empty_nn: Vec<Vec<f64>> = Vec::new();
+                eval_bytecode(
+                    &bc,
+                    theta,
+                    eta,
+                    &scratch.y_cov,
+                    &scratch.y_vars,
+                    &empty_nn,
+                    &mut scratch.bc_stack,
+                )
             })
         },
     );
@@ -3020,18 +3009,14 @@ fn build_ode_spec(
         .map(|i| indiv_slots_owned.get(i).copied().unwrap_or(usize::MAX))
         .collect();
 
-    // Per-thread scratch for the `vars` slice. The closure type is
+    // Per-thread scratch comes from the shared `FERX_SCRATCH` (see the
+    // `FerxThreadScratch` declaration). The closure type is
     // `Box<dyn Fn(...) + Send + Sync>`, which forbids a captured `Cell` /
     // `RefCell`; thread-local storage sidesteps the `Sync` requirement and
     // amortises the per-call allocation across every RK45 stage on a thread.
     // `vec.clear(); vec.resize(n, 0.0)` re-zeros the buffer cheaply (no realloc
     // once the capacity grows), so intermediate slots in untaken if-branches
     // still read 0 just like the old per-call `vec![0.0; n]` path.
-    thread_local! {
-        static RHS_VARS_SCRATCH: std::cell::RefCell<Vec<f64>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-    }
-
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
         Box::new(move |u: &[f64], params: &[f64], _t: f64, du: &mut [f64]| {
             // The integrator always passes a `u` whose length matches the
@@ -3046,20 +3031,25 @@ fn build_ode_spec(
             );
             let copy_n = state_count.min(u.len());
 
-            RHS_VARS_SCRATCH.with(|cell| {
-                let mut vars = cell.borrow_mut();
-                vars.clear();
-                vars.resize(n_vars_total, 0.0);
+            FERX_SCRATCH.with(|cell| {
+                let mut s = cell.borrow_mut();
+                // Split-field borrows so eval_statements_indexed_with_stack
+                // can take `vars` and `bc_stack` simultaneously without a
+                // second TLS lookup. RefMut::deref_mut returns a `&mut`
+                // to the struct; field reborrows are disjoint.
+                let scratch = &mut *s;
+                scratch.rhs_vars.clear();
+                scratch.rhs_vars.resize(n_vars_total, 0.0);
 
                 // State values from u[].
-                vars[..copy_n].copy_from_slice(&u[..copy_n]);
+                scratch.rhs_vars[..copy_n].copy_from_slice(&u[..copy_n]);
 
                 // Individual parameters from params[] via the pre-computed
                 // slot plan. `usize::MAX` slots (impossible under the
                 // assert_eq above) leave the var at 0.0.
                 for (i, &slot) in indiv_to_params_slot.iter().enumerate() {
                     if let (Some(dst), Some(&val)) =
-                        (vars.get_mut(state_count + i), params.get(slot))
+                        (scratch.rhs_vars.get_mut(state_count + i), params.get(slot))
                     {
                         *dst = val;
                     }
@@ -3078,14 +3068,15 @@ fn build_ode_spec(
                 // `[covariate_nn]` outputs are routed via `pk_param_fn`, not
                 // the ODE RHS, so this stays empty.
                 let empty_nn_outputs: Vec<Vec<f64>> = Vec::new();
-                eval_statements_indexed(
+                eval_statements_indexed_with_stack(
                     &stmts_owned,
                     &empty_theta,
                     &empty_eta,
                     &empty_cov,
-                    &mut vars,
+                    &mut scratch.rhs_vars,
                     Some(du),
                     &empty_nn_outputs,
+                    &mut scratch.bc_stack,
                 );
             });
         });
@@ -4627,6 +4618,45 @@ enum Op {
     Jump(u32),
 }
 
+// ─── Consolidated per-thread scratch ───────────────────────────────────────
+//
+// All hot-path closures in this module need their own `Vec<f64>` scratch:
+//   - `build_ode_rhs_fn`        : `rhs_vars` (state ‖ indiv params ‖ inters)
+//   - `build_y_output_fn`       : `y_vars` + `y_cov` (Form C readout)
+//   - `eval_statements_indexed` : `bc_stack` (bytecode f64 stack)
+//   - `build_y_output_fn`       : also needs the bc_stack for its readout eval
+//
+// Each was originally its own `thread_local!`. A samply profile of the
+// experiment Emax FOCEI fit after #135/#136/#137 attributed ~12% of self
+// time to `std::thread::LocalKey::with` — each closure call paid 1-3 TLS
+// lookups. Consolidating to a single TLS holding a struct with named
+// fields means one `LocalKey::with` + one `RefCell::borrow_mut` per call,
+// and the BC stack is shared between RHS and Y-readout calls (which never
+// interleave on a single thread — the Y readout runs post-integration).
+#[derive(Debug)]
+struct FerxThreadScratch {
+    rhs_vars: Vec<f64>,
+    y_vars: Vec<f64>,
+    y_cov: Vec<f64>,
+    bc_stack: Vec<f64>,
+}
+
+impl FerxThreadScratch {
+    const fn new_empty() -> Self {
+        Self {
+            rhs_vars: Vec::new(),
+            y_vars: Vec::new(),
+            y_cov: Vec::new(),
+            bc_stack: Vec::new(),
+        }
+    }
+}
+
+thread_local! {
+    static FERX_SCRATCH: std::cell::RefCell<FerxThreadScratch> =
+        const { std::cell::RefCell::new(FerxThreadScratch::new_empty()) };
+}
+
 /// Compiled bytecode for a single expression tree. The `constants` pool
 /// holds every literal value referenced by `PushConst(u32)` opcodes; this
 /// avoids paying an 8-byte literal payload on every variant of `Op`. The
@@ -5192,18 +5222,24 @@ fn eval_statements_indexed(
     du: Option<&mut [f64]>,
     nn_outputs: &[Vec<f64>],
 ) {
-    // Acquire the bytecode-stack scratch ONCE per call (the previous
-    // per-statement TLS access was a measurable slowdown vs the AST walker
-    // which LLVM was fully inlining). The borrow is held for the lifetime
-    // of this statement loop and threaded into recursive `If` arms.
-    thread_local! {
-        static BC_STACK: std::cell::RefCell<Vec<f64>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-    }
-    BC_STACK.with(|cell| {
-        let mut stack = cell.borrow_mut();
+    // Acquire the bytecode-stack scratch ONCE per call from the shared
+    // FERX_SCRATCH; the borrow is held for the lifetime of this statement
+    // loop and threaded into recursive `If` arms. Callers that already
+    // hold FERX_SCRATCH (`build_ode_rhs_fn` does, for the rhs_vars setup)
+    // should bypass this wrapper and call eval_statements_indexed_with_stack
+    // directly with the bc_stack field — re-entering the borrow_mut here
+    // would panic.
+    FERX_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
         eval_statements_indexed_with_stack(
-            stmts, theta, eta, covariates, vars, du, nn_outputs, &mut stack,
+            stmts,
+            theta,
+            eta,
+            covariates,
+            vars,
+            du,
+            nn_outputs,
+            &mut s.bc_stack,
         );
     });
 }

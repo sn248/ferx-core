@@ -5553,7 +5553,10 @@ enum DiffAxis {
     /// `v_idx` — an already-resolved variable slot. Used for chain-ruling
     /// into ODE-block intermediates whose own sensitivities are precomputed
     /// and live in the variable pool.
-    #[allow(dead_code)] // wired in milestone 3 (augmented ODE RHS)
+    // No runtime consumer after #145 (the augmented-ODE-RHS path that
+    // would have produced these v_idx leaves was reverted). Kept so the
+    // axis type stays complete for a future symbolic-gradient consumer.
+    #[allow(dead_code)]
     Variable(usize),
 }
 
@@ -5569,10 +5572,10 @@ fn differentiate(expr: &Expression, axis: DiffAxis) -> Expression {
 /// Symbolic differentiator with optional chain-rule substitution at
 /// `VariableIdx(k)` leaves. When `chain` contains a partial expression for
 /// slot `k`, the differentiator returns that expression instead of the
-/// default Kronecker delta. This is how milestone 2 (and milestones 3-4)
-/// chain-rule through intermediate `[individual_parameters]` assignments
-/// and ODE-block intermediates whose own sensitivities live in the variable
-/// pool.
+/// default Kronecker delta. This is how the milestone-2
+/// `build_indiv_param_partials` pass chain-rules through intermediate
+/// `[individual_parameters]` assignments; the ODE-block-intermediate use
+/// case was wired by milestones 3-4 and reverted in #145.
 ///
 /// Concrete example from milestone 2 — given
 ///   ka_mult = TVKAM * exp(ETA_KAM)
@@ -5750,7 +5753,9 @@ fn differentiate_with_chain(
 /// no constant folding across nested BinOps, no algebraic identities like
 /// `x * x` → `x^2`. The point is just to keep `differentiate`'s mechanical
 /// output readable for tests; a full algebraic simplifier is out of scope.
-#[allow(dead_code)] // milestones 2-5 will exercise this
+// Exercised by milestone-2 partials tests only; the milestone 3-5
+// runtime consumers were reverted in #145.
+#[allow(dead_code)]
 fn simplify_expr(expr: &Expression) -> Expression {
     let is_lit = |e: &Expression, v: f64| matches!(e, Expression::Literal(x) if *x == v);
     match expr {
@@ -5833,9 +5838,10 @@ fn simplify_expr(expr: &Expression) -> Expression {
 // Storage shape: outer Vec indexed by indiv-param position (parallel to
 // `CompiledModel.indiv_param_names`), inner Vec indexed by axis. The
 // expressions are stored in resolved form (VariableIdx, not Variable) so
-// downstream consumers (milestones 3-5: augmented RHS, Form C readout
-// sensitivities, estimator wiring) can compile them to Bytecode without
-// re-running `resolve_expr_indices`.
+// a future symbolic-gradient consumer can compile them to Bytecode without
+// re-running `resolve_expr_indices`. (The originally-planned milestones
+// 3-5 — augmented RHS, Form C readout sensitivities, estimator wiring —
+// were reverted in #145; see the field doc on `CompiledModel.indiv_param_partials`.)
 //
 // Top-level `If { … }` statements in `[individual_parameters]` are not
 // differentiated — no in-tree user model uses them and handling them needs
@@ -5849,8 +5855,13 @@ fn simplify_expr(expr: &Expression) -> Expression {
 
 /// Precomputed symbolic partials of `[individual_parameters]` assignments,
 /// produced by [`build_indiv_param_partials`]. Stored on
-/// [`CompiledModel`](crate::types::CompiledModel) for use by the Tier 4a
-/// sensitivity-ODE work (milestones 3-5).
+/// [`CompiledModel`](crate::types::CompiledModel) as a primitive for any
+/// future analytical-η-gradient path. The originally-planned consumers —
+/// Tier 4a milestones 3-5 (augmented ODE RHS, Form C readout sensitivities,
+/// `gradient = sens` estimator wiring) — were reverted in #145; the
+/// partials themselves still pass their own FD-vs-symbolic unit tests
+/// and are kept on `CompiledModel` so the primitive is in place when a
+/// future consumer lands.
 ///
 /// Inner field types reference the parser's private `Expression` AST, so the
 /// fields stay `pub(crate)`. External callers can construct an empty
@@ -5858,7 +5869,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
 /// they need for hand-built `CompiledModel` test fixtures and the
 /// `generate_data` data-generation binary.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields consumed by milestones 3-5
+#[allow(dead_code)] // no runtime consumer after #145; see struct doc.
 pub struct IndivParamPartials {
     /// Indiv-param names parallel to `d_d_theta` / `d_d_eta` outer Vec, in
     /// `[individual_parameters]` source-declaration order. Equals the
@@ -11904,9 +11915,10 @@ if (1 > 0) {
     fn differentiate_emax_pkpd_readout_matches_fd() {
         // y = E0 + EMAX · effect^γ / (EC50^γ + effect^γ)
         // Mapped to slots: θ_0=E0, θ_1=EMAX, θ_2=EC50, θ_3=γ; var_0=effect.
-        // This is the actual experiment Emax PK/PD readout shape; if the
-        // differentiator handles this end-to-end correctly, the milestone-4
-        // Form C codegen will compose without surprise.
+        // This is the Emax PK/PD readout shape the Tier 4a Form C codegen
+        // (milestone 4) would have chain-ruled through. The codegen was
+        // reverted in #145, but the differentiator end-to-end behaviour
+        // on this shape is still worth pinning for any future consumer.
         let theta = &[3.0, 60.0, 7.5, 1.5];
         let eta = &[];
         let vars = &[2.0];

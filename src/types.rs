@@ -1073,17 +1073,21 @@ pub struct CompiledModel {
     /// `n_theta` (user-declared θ) and `n_eta + n_kappa` (extended η) on the
     /// θ and η sides respectively.
     ///
-    /// Consumed by the Tier 4a sensitivity-ODE work (milestones 3-5): the
-    /// augmented ODE RHS and Form C readout chain-rule through these
-    /// partials, and the estimator's `gradient = sens` mode evaluates them
-    /// alongside the regular `pk_param_fn`.
+    /// Reserved for a future analytical-η-gradient path. The original
+    /// downstream consumers (Tier 4a milestones 3-5: augmented ODE RHS,
+    /// Form C readout sensitivities, `gradient = sens` estimator wiring)
+    /// were reverted in #145 after the `gradient = sens` path failed to
+    /// deliver a wall-time win at low n_η. The partials themselves are
+    /// still produced at parse time and are exercised by parser unit
+    /// tests; they're kept on `CompiledModel` so the primitive is in
+    /// place when a future symbolic-gradient consumer lands.
     ///
     /// Field itself is `pub` so external test fixtures and the
     /// `generate_data` binary can write `IndivParamPartials::empty()` into
     /// it. The inner Expression AST stays private — outside callers can
     /// only stuff in an empty placeholder, not read or mutate the
     /// parser-produced partials.
-    #[allow(dead_code)] // consumed by milestones 3-5 of the sensitivity work
+    #[allow(dead_code)] // no runtime consumer after #145; see field doc.
     pub indiv_param_partials: IndivParamPartials,
     pub default_params: ModelParameters,
     /// Per-eta flag (parallel to `eta_names` / omega diagonal): `true` when

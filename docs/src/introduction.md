@@ -8,13 +8,20 @@ ferx-core is a high-performance Nonlinear Mixed Effects (NLME) modeling engine w
 - **SAEM estimation** -- Stochastic Approximation EM for robust convergence on complex models
 - **Gauss-Newton (BHHH)** -- Fast outer optimizer with Levenberg-Marquardt damping, plus a GN+FOCEI hybrid
 - **Importance Sampling (IMP) and SIR** -- For exact likelihood estimation and posterior sampling
-- **Analytical PK solutions** -- Built-in one- and two-compartment models (IV bolus, oral, infusion) with numerical stability guarantees
+- **Analytical PK solutions** -- Built-in one-, two-, and three-compartment models (IV bolus, oral, infusion) with numerical stability guarantees
 - **ODE solver** -- Dormand-Prince RK45 adaptive integrator for custom kinetic models (e.g. Michaelis-Menten)
+- **SDE / diffusion models** -- Extended Kalman Filter path for stochastic differential equations via the `[diffusion]` block
 - **Automatic differentiation** -- Enzyme-based AD for fast, exact gradients
+- **Multiple error models** -- Additive, proportional, combined, and log-transform-both-sides (LTBS); per-CMT multi-endpoint models for joint PK/PD
+- **Inter-occasion variability (IOV)** -- `kappa` random effects with FOCE/FOCEI and SAEM support
+- **Lagtime / ALAG** -- Absorption lag for analytical, AD, and ODE paths
+- **BLOQ handling** -- Beal M3 method for below-LLOQ observations
+- **NCA-based starting values** -- `inits_from_nca` for automatic theta initialization from the data
 - **Simple model DSL** -- Declarative `.ferx` model files that read like equations
 - **NONMEM-compatible data** -- Reads standard NONMEM CSV datasets directly
 - **Covariate support** -- Time-constant and time-varying covariates with automatic detection
 - **Parallel estimation** -- Per-subject computations parallelized via Rayon
+- **Neural network covariates** -- MLP-based covariate mapper behind the `nn` feature (experimental)
 
 ## How It Compares
 
@@ -32,7 +39,7 @@ ferx-core is a high-performance Nonlinear Mixed Effects (NLME) modeling engine w
 
 ferx-core uses a two-level optimization structure:
 
-- **Outer loop**: Optimizes population parameters (theta, omega, sigma) using NLopt SLSQP (default), L-BFGS, MMA, or built-in BFGS
+- **Outer loop**: Optimizes population parameters (theta, omega, sigma) using NLopt SLSQP (default), BOBYQA, L-BFGS, MMA, built-in BFGS, Newton trust-region, or Gauss-Newton (BHHH)
 - **Inner loop**: For each subject, finds empirical Bayes estimates (EBEs) of random effects by minimizing individual negative log-likelihood
 
 Parameters are internally transformed for unconstrained optimization: theta and sigma are log-transformed, and omega uses Cholesky factorization to guarantee positive-definiteness.

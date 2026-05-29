@@ -199,6 +199,41 @@ errors at startup with the list of missing CMTs.
 See [Scaling](model-file/scaling.md) for the full reference, including
 how this compares to NONMEM's `S1`/`S2` and nlmixr2's `cmt(central); f = ...`.
 
+## My DV data is on the log scale (or I want to fit on the log scale). How do I do that?
+
+Use the log-transform-both-sides (LTBS) error model. There are two forms depending on the scale of the `DV` column:
+
+**`DV` is on the natural (concentration) scale** — use `log(DV) ~ additive(SIGMA)`. ferx log-transforms the `DV` column at load time and compares it to `log(prediction)`:
+
+```
+[parameters]
+  sigma ADD_LOG ~ 0.1     # additive SD on the log scale (≈ CV if small)
+
+[error_model]
+  log(DV) ~ additive(ADD_LOG)
+```
+
+**`DV` is already log-transformed in the dataset** — use `DV ~ log_additive(SIGMA)`. ferx takes `DV` as-is and only log-transforms the prediction:
+
+```
+[error_model]
+  DV ~ log_additive(ADD_LOG)
+```
+
+Both produce IPRED, PRED, IWRES, and CWRES on the log scale (back-transform with `exp()` for natural-scale values). BLOQ/M3 is supported; multi-endpoint and SDE models are not. See [Error Model](model-file/error-model.md#log-transform-both-sides-ltbs) for full details.
+
+## Which outer optimizer should I use?
+
+**Default (`slsqp`)** works well for most models. If you're unsure, start here.
+
+**`bobyqa`** is the best single alternative: derivative-free quadratic interpolation, robust when the finite-difference gradient is noisy (sparse data, ODE models). Recommended when `slsqp` reports convergence at a suspiciously high OFV.
+
+**`trust_region`** shines on high-parameter-count models (many thetas/omegas) or when combined with `inits_from_nca` — the second-order curvature helps when starting values are good. Set `steihaug_max_iters` if you want to pin the CG budget.
+
+**`gn` / `gn_hybrid`** for fast iteration during model development: Gauss-Newton converges in 10–30 steps vs 100+ for gradient methods. `gn_hybrid` adds a FOCEI polish pass for robustness.
+
+**Gradient-based (`lbfgs`, `mma`)** are rarely needed; prefer `slsqp` or `bobyqa`. See [FOCE/FOCEI — Optimizer Options](estimation/foce.md#optimizer-options) for a full comparison.
+
 ## How do I validate a model file without running a full fit?
 
 Use `ferx check`:
@@ -220,3 +255,4 @@ line / suggestion) that tooling and coding agents can consume directly, rather
 than parsing prose. The exit code is `0` when no errors are found, `1` when
 there are errors. See the [check report reference](file-formats/check-report.md)
 for the JSON schema and the full code table.
+

@@ -9,6 +9,8 @@ ferx-core includes several example models in the `examples/` directory with corr
 | [Covariates](covariates.md) | 2-cpt | Oral | Weight and renal function effects |
 | [ODE Model](ode-model.md) | 1-cpt | Oral | Michaelis-Menten elimination, ODE solver |
 | [BLOQ (M3 method)](bloq.md) | 1-cpt | Oral | Likelihood-based handling of censored observations |
+| [IOV](iov.md) | 1-cpt | Oral | Inter-occasion variability with `kappa` parameters |
+| [Multi-start](multistart.md) | 1-cpt ODE | Oral | Multiple starting values to avoid local minima |
 
 ## Running Examples
 
@@ -30,4 +32,10 @@ ferx examples/warfarin_saem.ferx --data data/warfarin.csv
 
 # BLOQ (M3 method)
 ferx examples/warfarin_bloq.ferx --data data/warfarin_bloq.csv
+
+# IOV (inter-occasion variability)
+ferx examples/warfarin_iov.ferx --data data/warfarin_iov.csv
+
+# Multi-start (Michaelis-Menten)
+ferx examples/mm_multistart.ferx --data data/mm_oral.csv
 ```

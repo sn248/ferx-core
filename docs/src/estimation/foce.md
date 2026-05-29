@@ -78,11 +78,13 @@ where \\( \tilde{R} = H \Omega H^T + R(f_0) \\).
 
 ### FOCEI (Interaction)
 
-Uses individual predictions directly without linearization:
+Uses individual predictions directly without linearization. ferx-core implements the Laplace approximation form from Almquist et al. (2015):
 
 \\[ \text{OFV}_i = (y - \hat{f})^T V^{-1} (y - \hat{f}) + \hat{\eta}^T \Omega^{-1} \hat{\eta} + \log|\tilde{R}| \\]
 
 FOCEI is more accurate when the residual variance depends on the predicted value (proportional or combined error models), because it captures the interaction between random effects and residual error.
+
+> Almquist, J., et al. (2015). *Comparison of maximum a posteriori and conditional likelihood estimation in the FOCE method.* PAGE 24, Abstr 3516.
 
 ## Optimizer Options
 

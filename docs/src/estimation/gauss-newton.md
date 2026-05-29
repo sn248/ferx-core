@@ -70,9 +70,10 @@ The final result is whichever phase produced the lower OFV. This combines the fa
   method     = gn          # or gn_hybrid
   maxiter    = 100         # max GN iterations
   covariance = true
+  gn_lambda  = 0.01        # initial Levenberg-Marquardt damping (default 0.01)
 ```
 
-The initial Levenberg-Marquardt damping factor defaults to 0.01 and adapts automatically.
+The initial Levenberg-Marquardt damping factor defaults to 0.01 and adapts automatically. Set `gn_lambda` explicitly (range ~0.001–0.1) if the default causes early step rejection on ill-conditioned models. Setting `gn_lambda` on a non-GN method (e.g. `foce`) emits a warning and is ignored.
 
 ## When to Use
 

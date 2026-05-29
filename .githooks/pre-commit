@@ -1,4 +1,8 @@
 #!/bin/sh
 # Reject commits that fail rustfmt. Run once after cloning:
 #   git config core.hooksPath .githooks
+
+# Skip the check when no .rs files are staged (e.g. docs-only commits).
+git diff --cached --name-only | grep -q '\.rs$' || exit 0
+
 cargo fmt --check

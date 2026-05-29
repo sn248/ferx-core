@@ -21,6 +21,18 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::StandardNormal;
 
+/// NLopt algorithm used for the SAEM M-step (non-mu-ref thetas + sigma).
+///
+/// BOBYQA was chosen over the prior SLSQP after the Emax PKPD benchmark
+/// showed SLSQP locking onto one side of the Emax-Hill identifiability
+/// ridge while BOBYQA's quadratic trust-region exploration landed much
+/// closer to truth at ~40% lower wall (no FD-gradient eval per parameter).
+/// On simpler PK-only models the two are numerically equivalent
+/// (|ΔOFV| < 0.1) and within measurement noise on wall.
+///
+/// Exposed pub(crate) so the unit test can pin the choice across refactors.
+pub(crate) const MSTEP_NLOPT_ALGORITHM: nlopt::Algorithm = nlopt::Algorithm::Bobyqa;
+
 // ---------------------------------------------------------------------------
 // SAEM state
 // ---------------------------------------------------------------------------
@@ -622,13 +634,8 @@ fn theta_sigma_mstep_light(
         }
     };
 
-    let mut opt = nlopt::Nlopt::new(
-        nlopt::Algorithm::Slsqp,
-        n,
-        obj_s,
-        nlopt::Target::Minimize,
-        (),
-    );
+    // See `MSTEP_NLOPT_ALGORITHM` for rationale (BOBYQA vs SLSQP).
+    let mut opt = nlopt::Nlopt::new(MSTEP_NLOPT_ALGORITHM, n, obj_s, nlopt::Target::Minimize, ());
     opt.set_lower_bounds(&lower_s).unwrap();
     opt.set_upper_bounds(&upper_s).unwrap();
     opt.set_maxeval(maxiter * (n as u32 + 1)).unwrap();
@@ -1805,6 +1812,32 @@ mod tests {
     use super::*;
     use crate::types::test_helpers::analytical_model;
     use crate::types::{GradientMethod, MuRef};
+
+    /// Pin the SAEM M-step optimizer choice.
+    ///
+    /// BOBYQA (derivative-free trust-region) was chosen over the prior SLSQP
+    /// after the Emax PKPD benchmark surfaced an Emax-Hill identifiability
+    /// failure mode where SLSQP locks population thetas onto one side of the
+    /// ridge (EMAX under-estimated by ~40%, OFV virtually identical to the
+    /// nlmixr2-matching basin). BOBYQA's quadratic trust-region exploration
+    /// lands much closer to truth at ~40% lower wall on that benchmark.
+    /// Simpler PK-only models are numerically equivalent across the two
+    /// algorithms (|ΔOFV| < 0.1).
+    ///
+    /// If a future change switches to a different algorithm — particularly
+    /// any gradient-based one (LBFGS, SLSQP, MMA) — re-run the Emax PKPD
+    /// regression in the experiment repo and confirm EMAX/EC50 recovery
+    /// before merging. The OFV alone is NOT a sufficient regression signal
+    /// here because the Hill ridge produces near-identical OFV at very
+    /// different parameter values.
+    #[test]
+    fn mstep_uses_bobyqa_optimizer() {
+        assert!(
+            matches!(MSTEP_NLOPT_ALGORITHM, nlopt::Algorithm::Bobyqa),
+            "MSTEP_NLOPT_ALGORITHM changed — see comment above this test \
+             for the Emax-Hill identifiability rationale before adjusting."
+        );
+    }
 
     #[test]
     fn saem_sampler_summary_defaults_to_metropolis_hastings() {

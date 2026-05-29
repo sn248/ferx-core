@@ -1647,6 +1647,14 @@ pub struct FitOptions {
     // SAEM-specific options
     pub saem_n_exploration: usize,
     pub saem_n_convergence: usize,
+    /// Number of MH proposals per subject per SAEM outer iteration.
+    /// The default 10 mixes well enough for hard cold-start surfaces
+    /// (e.g. Emax PKPD with stressful initial values, where chains
+    /// at 3 proposals can lock the M-step into a degenerate basin
+    /// with the PD-curve thetas at boundary values). Reduce to 3 for
+    /// the older behaviour on simpler PK-only models; raise (20-50)
+    /// only when the diagnostic shows the M-step is still tracking
+    /// correlated samples.
     pub saem_n_mh_steps: usize,
     pub saem_adapt_interval: usize,
     /// Number of initial exploration iterations during which the BSV/IOV Ω
@@ -1851,7 +1859,7 @@ impl Default for FitOptions {
             global_maxeval: 0,
             saem_n_exploration: 150,
             saem_n_convergence: 250,
-            saem_n_mh_steps: 3,
+            saem_n_mh_steps: 10,
             saem_adapt_interval: 50,
             saem_omega_burnin: 20,
             saem_seed: None,
@@ -2434,5 +2442,27 @@ mod tests {
         m_alias.insert("alag".to_string(), 2.0);
         let p_alias = PkParams::from_hashmap(&m_alias);
         assert_eq!(p_alias.lagtime(), 2.0);
+    }
+
+    /// Guard the SAEM MH-step default. The previous value (3) was too low
+    /// for hard cold-start surfaces — the chain didn't decorrelate between
+    /// SAEM outer iterations, so the single-draw stochastic M-step received
+    /// sticky correlated ETAs and locked the population-θ M-step into a
+    /// degenerate basin (observed on Emax PKPD: PD-curve thetas pinned to
+    /// boundary, ~150 OFV units worse than the correct basin). The current
+    /// default (10) escapes that trap reliably across seeds at ~20% extra
+    /// wall on the affected model and ~0% on simpler PK-only models.
+    ///
+    /// If a future change drops the default below ~5, re-run the Emax PKPD
+    /// regression in the experiment repo before merging — the basin trap
+    /// returns silently (OFV looks fine; PD parameters wrong).
+    #[test]
+    fn saem_n_mh_steps_default_is_10() {
+        let opts = FitOptions::default();
+        assert_eq!(
+            opts.saem_n_mh_steps, 10,
+            "saem_n_mh_steps default changed — see comment above this test \
+             for the basin-trap regression rationale before adjusting."
+        );
     }
 }

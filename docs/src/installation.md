@@ -17,7 +17,7 @@ Autodiff setup has **two distinct one-time steps**. Don't conflate them — they
 | Step | What it is | Roughly | When |
 |---|---|---|---|
 | **1. Build the Enzyme toolchain** | Compile a custom nightly `rustc` + LLVM with Enzyme from source (**this page**) | ~45–60 min | **Once per machine** — reused forever. |
-| **2. Compile ferx / ferx-core** | Build the crates and link them | ~1–2 h (autodiff) / faster (FD) | **First build only** — Cargo caches dependencies, so later builds take minutes. |
+| **2. Compile ferx / ferx-core** | Build the crates and link them | **CPU-dependent**: ~15–30 min on a fast machine, up to ~1–2 h on an older laptop (autodiff); faster for FD | **First build only** — Cargo caches dependencies, so later builds take minutes. |
 
 Step 2 is slower on the autodiff path because it uses **fat LTO** (required for cross-crate Enzyme correctness; see [Building ferx-core](#building-ferx-core-from-source) below). The finite-difference build skips step 1 entirely and uses thin LTO in step 2, so it links noticeably faster.
 
@@ -212,12 +212,16 @@ RUSTFLAGS="-Z autodiff=Enable" cargo build --release --features autodiff
 # Binary at target/release/ferx
 ```
 
-> **Expect a long build.** A `--release --features autodiff` build is the slowest
-> configuration and routinely takes many minutes — the first build especially.
-> Two costs compound:
+> **Expect a long build, scaling with single-core CPU speed.** A
+> `--release --features autodiff` build is the slowest configuration. Because the
+> dominant step is single-threaded (see below), wall-clock time tracks your
+> per-core speed almost linearly: **~15–30 min on a fast modern CPU (recent
+> desktop or native Apple Silicon arm64), up to ~1–2 h on an older / mobile
+> laptop CPU** (which may also thermal-throttle under sustained single-core load).
+> Extra cores do **not** help. Two costs compound:
 > - The release profile uses `lto = "fat"`, which re-optimizes the whole dependency
->   graph in one final, largely **single-threaded** link/codegen step. Your CPU cores
->   will look mostly idle during it — that's normal, not a hang.
+>   graph in one final, largely **single-threaded** link/codegen step. Your other CPU
+>   cores will look mostly idle during it — that's normal, not a hang.
 > - Enzyme runs its differentiation passes during LLVM codegen on top of that.
 >
 > Fat LTO is *required* for cross-crate Enzyme correctness, so it can't be dialed down

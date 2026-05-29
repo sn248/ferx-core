@@ -1010,136 +1010,144 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     )?;
 
     // Tier 4a milestone 3: augmented ODE RHS sensitivity codegen. For ODE
-    // models, walk the captured pre-resolve top-level ODE statements with the
-    // milestone-2 indiv-param partials in hand and produce symbolic
-    // ∂(d s_j/dt)/∂η_k Expressions, then bytecode-compile them so the
-    // augmented integrator can evaluate them per RK45 stage. For analytical
-    // models `ode_sens_ctx` is `None`; sens RHS stays `None` too.
+    // models with at least one η axis to integrate, walk the captured pre-
+    // resolve top-level ODE statements with the milestone-2 indiv-param
+    // partials in hand and produce symbolic ∂(d s_j/dt)/∂η_k Expressions,
+    // then bytecode-compile them so the augmented integrator can evaluate
+    // them per RK45 stage. For analytical models `ode_sens_ctx` is `None`,
+    // and for ODE models with `n_eta_extended_for_partials == 0` there's
+    // nothing to integrate; in both cases `ode_sensitivity_rhs` and
+    // `rhs_augmented` stay `None` so the augmented integration path is
+    // a hard no-op rather than a degenerate `Some` that mirrors `rhs`.
     let mut augmented_rhs_for_ode: Option<crate::ode::AugmentedRhsFn> = None;
-    let ode_sensitivity_rhs: Option<OdeSensitivityRhs> = ode_sens_ctx.map(|ctx| {
-        let sens_exprs = build_ode_sensitivity_rhs(
-            &ctx.raw_stmts,
-            &ctx.var_idx,
-            &ctx.state_names,
-            ctx.state_count,
-            ctx.indiv_count,
-            ctx.intermediate_count,
-            &indiv_param_partials.d_d_eta,
-            n_eta_extended_for_partials,
-        );
-        let sens_bc: Vec<Vec<Bytecode>> = sens_exprs
-            .iter()
-            .map(|row| row.iter().map(compile_bytecode).collect())
-            .collect();
+    let mut ode_sensitivity_rhs: Option<OdeSensitivityRhs> = None;
+    if let Some(ctx) = ode_sens_ctx {
+        if n_eta_extended_for_partials > 0 {
+            let sens_exprs = build_ode_sensitivity_rhs(
+                &ctx.raw_stmts,
+                &ctx.var_idx,
+                &ctx.state_names,
+                ctx.state_count,
+                ctx.indiv_count,
+                ctx.intermediate_count,
+                &indiv_param_partials.d_d_eta,
+                n_eta_extended_for_partials,
+            );
+            let sens_bc: Vec<Vec<Bytecode>> = sens_exprs
+                .iter()
+                .map(|row| row.iter().map(compile_bytecode).collect())
+                .collect();
 
-        // Assemble the augmented closure: at each call it materialises the
-        // augmented `u_aug` into the per-thread `vars` scratch, runs the
-        // original (already-bytecode-compiled) ODE stmts to fill
-        // `du_aug[0..state_count]` AND populate intermediates, then evaluates
-        // each sens-RHS bytecode to fill the sens slots.
-        let aug_compiled_stmts = ctx.compiled_stmts;
-        let aug_indiv_slots = ctx.indiv_to_params_slot;
-        let aug_state_count = ctx.state_count;
-        let aug_n_vars_total = ctx.n_vars_total;
-        let aug_n_eta = n_eta_extended_for_partials;
-        let aug_sens_bc = sens_bc.clone();
-        augmented_rhs_for_ode = Some(Box::new(
-            move |u_aug: &[f64],
-                  theta: &[f64],
-                  eta: &[f64],
-                  params: &[f64],
-                  _t: f64,
-                  du_aug: &mut [f64]| {
-                let total_states = aug_state_count * (1 + aug_n_eta);
-                debug_assert!(
-                    u_aug.len() >= total_states,
-                    "augmented ODE RHS: u_aug.len() {} < total {}",
-                    u_aug.len(),
-                    total_states,
-                );
-                debug_assert!(
-                    du_aug.len() >= total_states,
-                    "augmented ODE RHS: du_aug.len() {} < total {}",
-                    du_aug.len(),
-                    total_states,
-                );
-                // Reset du_aug — RK45 stages reuse the buffer, sens slots
-                // for any state without a firing d/dt (rare but possible
-                // inside untaken if-branches) must default to 0.
-                for slot in du_aug.iter_mut() {
-                    *slot = 0.0;
-                }
-                FERX_SCRATCH.with(|cell| {
-                    let mut s = cell.borrow_mut();
-                    let scratch = &mut *s;
-                    let vars_size = aug_n_vars_total + aug_n_eta * aug_state_count;
-                    scratch.rhs_vars.clear();
-                    scratch.rhs_vars.resize(vars_size, 0.0);
-                    // States from u_aug[0..N].
-                    scratch.rhs_vars[..aug_state_count].copy_from_slice(&u_aug[..aug_state_count]);
-                    // Indiv params from params[].
-                    for (i, &slot) in aug_indiv_slots.iter().enumerate() {
-                        if let Some(&val) = params.get(slot) {
-                            scratch.rhs_vars[aug_state_count + i] = val;
-                        }
-                    }
-                    // Sens states from u_aug tail into vars[n_vars_total..].
-                    let sens_in_u =
-                        &u_aug[aug_state_count..aug_state_count + aug_n_eta * aug_state_count];
-                    scratch.rhs_vars[aug_n_vars_total..aug_n_vars_total + sens_in_u.len()]
-                        .copy_from_slice(sens_in_u);
-
-                    let empty_cov: [f64; 0] = [];
-                    let empty_nn: Vec<Vec<f64>> = Vec::new();
-
-                    // Run the original bytecode stmts. Writes
-                    // du_aug[0..state_count] AND populates intermediates in
-                    // `vars`. The ODE-block expressions don't reference
-                    // theta/eta directly (those flow in via indiv params),
-                    // so empty slices for theta/eta here.
-                    let empty_theta_inner: [f64; 0] = [];
-                    let empty_eta_inner: [f64; 0] = [];
-                    eval_statements_indexed_with_stack(
-                        &aug_compiled_stmts,
-                        &empty_theta_inner,
-                        &empty_eta_inner,
-                        &empty_cov,
-                        &mut scratch.rhs_vars,
-                        Some(&mut du_aug[..aug_state_count]),
-                        &empty_nn,
-                        &mut scratch.bc_stack,
+            // Assemble the augmented closure: at each call it materialises the
+            // augmented `u_aug` into the per-thread `vars` scratch, runs the
+            // original (already-bytecode-compiled) ODE stmts to fill
+            // `du_aug[0..state_count]` AND populate intermediates, then evaluates
+            // each sens-RHS bytecode to fill the sens slots.
+            let aug_compiled_stmts = ctx.compiled_stmts;
+            let aug_indiv_slots = ctx.indiv_to_params_slot;
+            let aug_state_count = ctx.state_count;
+            let aug_n_vars_total = ctx.n_vars_total;
+            let aug_n_eta = n_eta_extended_for_partials;
+            let aug_sens_bc = sens_bc.clone();
+            augmented_rhs_for_ode = Some(Box::new(
+                move |u_aug: &[f64],
+                      theta: &[f64],
+                      eta: &[f64],
+                      params: &[f64],
+                      _t: f64,
+                      du_aug: &mut [f64]| {
+                    let total_states = aug_state_count * (1 + aug_n_eta);
+                    debug_assert!(
+                        u_aug.len() >= total_states,
+                        "augmented ODE RHS: u_aug.len() {} < total {}",
+                        u_aug.len(),
+                        total_states,
                     );
-
-                    // Evaluate sens-RHS bytecodes for the augmented slots.
-                    // These DO need theta/eta (chain-substituted milestone-2
-                    // indiv-param partials reference Theta(k)/Eta(k)).
-                    for k in 0..aug_n_eta {
-                        for j in 0..aug_state_count {
-                            let bc = &aug_sens_bc[j][k];
-                            let val = eval_bytecode(
-                                bc,
-                                theta,
-                                eta,
-                                &empty_cov,
-                                &scratch.rhs_vars,
-                                &empty_nn,
-                                &mut scratch.bc_stack,
-                            );
-                            du_aug[aug_state_count + k * aug_state_count + j] = val;
-                        }
+                    debug_assert!(
+                        du_aug.len() >= total_states,
+                        "augmented ODE RHS: du_aug.len() {} < total {}",
+                        du_aug.len(),
+                        total_states,
+                    );
+                    // Reset du_aug — RK45 stages reuse the buffer, sens slots
+                    // for any state without a firing d/dt (rare but possible
+                    // inside untaken if-branches) must default to 0.
+                    for slot in du_aug.iter_mut() {
+                        *slot = 0.0;
                     }
-                });
-            },
-        ));
+                    FERX_SCRATCH.with(|cell| {
+                        let mut s = cell.borrow_mut();
+                        let scratch = &mut *s;
+                        let vars_size = aug_n_vars_total + aug_n_eta * aug_state_count;
+                        scratch.rhs_vars.clear();
+                        scratch.rhs_vars.resize(vars_size, 0.0);
+                        // States from u_aug[0..N].
+                        scratch.rhs_vars[..aug_state_count]
+                            .copy_from_slice(&u_aug[..aug_state_count]);
+                        // Indiv params from params[].
+                        for (i, &slot) in aug_indiv_slots.iter().enumerate() {
+                            if let Some(&val) = params.get(slot) {
+                                scratch.rhs_vars[aug_state_count + i] = val;
+                            }
+                        }
+                        // Sens states from u_aug tail into vars[n_vars_total..].
+                        let sens_in_u =
+                            &u_aug[aug_state_count..aug_state_count + aug_n_eta * aug_state_count];
+                        scratch.rhs_vars[aug_n_vars_total..aug_n_vars_total + sens_in_u.len()]
+                            .copy_from_slice(sens_in_u);
 
-        OdeSensitivityRhs {
-            sens_rhs_exprs: sens_exprs,
-            sens_rhs_bc: sens_bc,
-            var_pool_size: ctx.n_vars_total,
-            state_count: ctx.state_count,
-            n_eta_extended: n_eta_extended_for_partials,
+                        let empty_cov: [f64; 0] = [];
+                        let empty_nn: Vec<Vec<f64>> = Vec::new();
+
+                        // Run the original bytecode stmts. Writes
+                        // du_aug[0..state_count] AND populates intermediates in
+                        // `vars`. The ODE-block expressions don't reference
+                        // theta/eta directly (those flow in via indiv params),
+                        // so empty slices for theta/eta here.
+                        let empty_theta_inner: [f64; 0] = [];
+                        let empty_eta_inner: [f64; 0] = [];
+                        eval_statements_indexed_with_stack(
+                            &aug_compiled_stmts,
+                            &empty_theta_inner,
+                            &empty_eta_inner,
+                            &empty_cov,
+                            &mut scratch.rhs_vars,
+                            Some(&mut du_aug[..aug_state_count]),
+                            &empty_nn,
+                            &mut scratch.bc_stack,
+                        );
+
+                        // Evaluate sens-RHS bytecodes for the augmented slots.
+                        // These DO need theta/eta (chain-substituted milestone-2
+                        // indiv-param partials reference Theta(k)/Eta(k)).
+                        for k in 0..aug_n_eta {
+                            for j in 0..aug_state_count {
+                                let bc = &aug_sens_bc[j][k];
+                                let val = eval_bytecode(
+                                    bc,
+                                    theta,
+                                    eta,
+                                    &empty_cov,
+                                    &scratch.rhs_vars,
+                                    &empty_nn,
+                                    &mut scratch.bc_stack,
+                                );
+                                du_aug[aug_state_count + k * aug_state_count + j] = val;
+                            }
+                        }
+                    });
+                },
+            ));
+
+            ode_sensitivity_rhs = Some(OdeSensitivityRhs {
+                sens_rhs_exprs: sens_exprs,
+                sens_rhs_bc: sens_bc,
+                var_pool_size: ctx.n_vars_total,
+                state_count: ctx.state_count,
+                n_eta_extended: n_eta_extended_for_partials,
+            });
         }
-    });
+    }
 
     // Hand the augmented closure off to `OdeSpec.rhs_augmented` so the
     // integrator can reach it. Only mutate when we actually built one — for
@@ -12767,9 +12775,17 @@ if (1 > 0) {
     // end-to-end integration test below).
 
     /// Numerically evaluate a symbolic sens-RHS expression at a snapshot:
-    /// states from `u`, indiv params from `params`, intermediates left at 0
-    /// (the differentiator's chain context already substituted their partials
-    /// in-tree), sens-states at 0. `theta` / `eta` are passed through because
+    /// states from `u`, indiv params from `params`, intermediates left at 0,
+    /// sens-states at 0. **Only correct for models whose ODE block has no
+    /// intermediate `Assign` statements** (each `d/dt(...)` is a flat
+    /// expression of states + indiv-params). The differentiator substitutes
+    /// each *intermediate's partial* into the sens-RHS chain at codegen time,
+    /// but the sens-RHS expression itself can still reference the
+    /// intermediate's *value* (e.g. the product-rule `m · ∂state/∂η` term).
+    /// Models with ODE intermediates need to evaluate the original Assign
+    /// statements to populate intermediate slots first. The two in-tree
+    /// snapshot tests below use Emax PKPD, which has no intermediates, so
+    /// the simpler eval path works. `theta` / `eta` are passed through because
     /// the chain-substituted milestone-2 indiv-param partials contain
     /// `Theta(k)` / `Eta(k)` references.
     fn eval_sens_rhs(
@@ -12889,25 +12905,10 @@ if (1 > 0) {
         let u = &[80.0, 25.0, 0.5];
         let pk = (m.pk_param_fn)(theta, eta, &cov);
 
-        // Build a `indiv_slots_to_params` plan: position i in
-        // indiv_param_names maps to PK slot.
-        let indiv_slots: Vec<usize> = m
-            .indiv_param_names
-            .iter()
-            .map(|n| match n.as_str() {
-                "CL" => crate::types::PK_IDX_CL,
-                "V" => crate::types::PK_IDX_V,
-                "KA" => crate::types::PK_IDX_KA,
-                "KE0" => 3, // first free slot per ode_param_slots — Q reserved? actually KE0 → 3 (V2)? let's just trust pk_indices
-                _ => panic!("unexpected indiv param `{n}` in emax_pkpd test"),
-            })
-            .collect();
-        // Override `KE0`'s slot from pk_indices to keep this test independent
-        // of the slot allocator details.
-        let mut indiv_slots = indiv_slots;
-        for (i, _) in m.indiv_param_names.iter().enumerate() {
-            indiv_slots[i] = m.pk_indices[i];
-        }
+        // `pk_indices` is already aligned with `indiv_param_names` by
+        // construction — position i is the PK slot the parser assigned to
+        // indiv-param i. Use it directly.
+        let indiv_slots = m.pk_indices.clone();
 
         for j in 0..sens.state_count {
             for k in 0..sens.n_eta_extended {

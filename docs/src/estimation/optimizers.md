@@ -1,6 +1,17 @@
 # Outer Optimizers
 
-The **outer optimizer** is the algorithm that minimises the population objective function (OFV) over the transformed parameter vector `[log θ, chol(Ω), log σ]`. It is orthogonal to the estimation *method* (FOCE, SAEM, GN): you choose a method first, then choose how its outer loop is driven.
+The **outer optimizer** is the algorithm that minimises the population objective function (OFV) over the transformed parameter vector `[log θ, chol(Ω), log σ]`.
+
+It only applies to methods that *have* a single outer-loop minimisation over that vector:
+
+| method | does `optimizer` apply? |
+|---|---|
+| `foce` / `focei` | yes — picks the algorithm for the population OFV minimisation |
+| `gn` (pure Gauss-Newton) | no — GN runs its own Levenberg-Marquardt loop |
+| `gn_hybrid` | yes for the FOCEI polish phase only; the preceding GN phase ignores it |
+| `saem` | **no** — SAEM has no single outer minimisation; the M-step uses a hardcoded NLopt algorithm and is not user-selectable. Setting `optimizer` under `method = saem` triggers a warning and is otherwise ignored. |
+| `[saem, focei]` (chain) | applies to the FOCEI polish stage only |
+| `imp` | no — IS is a sampling pass, not an optimisation |
 
 Set via `[fit_options]`:
 

@@ -8425,8 +8425,9 @@ mod tests {
 
     #[test]
     fn test_parse_optimizer_defaults_to_bobyqa() {
-        // No [fit_options] block → default optimizer is BOBYQA (derivative-free
-        // trust-region). See `FitOptions::default` for the rationale.
+        // `[fit_options]` block present but `optimizer` omitted → default is
+        // BOBYQA (derivative-free trust-region). See `FitOptions::default` for
+        // the rationale.
         let content = minimal_model_with_fit_options("  maxiter = 100");
         let parsed = parse_full_model(&content).unwrap();
         assert_eq!(parsed.fit_options.optimizer, Optimizer::Bobyqa);

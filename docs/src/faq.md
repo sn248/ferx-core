@@ -112,12 +112,12 @@ prefer a bracketed comparison (`WT >= 70 && WT < 80`) over `WT == 75`.
 
 ## Which outer optimizer should I pick?
 
-`bobyqa` (the default since 2026) is the right choice for most models —
+`bobyqa` (the default) is the right choice for most models —
 derivative-free quadratic trust-region, robust to noisy FD gradients, and
 consistently reaches a lower OFV than `slsqp` on ODE/PD models, sparse data,
-and Hill-ridge identifiability problems. Until the SAEM/FOCEI cleanups for
-ODE models landed the default was `slsqp`; the change is one line away if
-you need the old behaviour (`optimizer = slsqp` in `[fit_options]`).
+and Hill-ridge identifiability problems. Previously the default was `slsqp`;
+the change is one line away if you need the old behaviour
+(`optimizer = slsqp` in `[fit_options]`).
 
 Reach for a different optimizer when the default misbehaves:
 

@@ -61,7 +61,7 @@ Set via `[fit_options]`:
 
 **`lbfgs` / `nlopt_lbfgs` / `mma`** — rarely needed. Prefer `bobyqa` or `slsqp`.
 
-> **Why is BOBYQA the default?** Until 2026 the default was `slsqp`. The Emax PKPD benchmark in [`saem.md`](saem.md) and the cefepime validation below both showed that the fixed-EBE FD gradient drives `slsqp` to local minima hundreds of OFV units above the true optimum on ODE/PD models and sparse data — exactly the workloads that aren't covered by the analytical-PK comfort zone. `bobyqa` doesn't use the gradient, doesn't see the bias, and reaches the same (or lower) OFV in the same or less wall time. The previous behaviour is one line away: `optimizer = slsqp` in `[fit_options]`.
+> **Why is BOBYQA the default?** Previously the default was `slsqp`. The Emax PKPD benchmark in [`saem.md`](saem.md) and the cefepime validation below both showed that the fixed-EBE FD gradient drives `slsqp` to local minima hundreds of OFV units above the true optimum on ODE/PD models and sparse data — exactly the workloads that aren't covered by the analytical-PK comfort zone. `bobyqa` doesn't use the gradient, doesn't see the bias, and reaches the same (or lower) OFV in the same or less wall time. The previous behaviour is one line away: `optimizer = slsqp` in `[fit_options]`.
 
 ---
 

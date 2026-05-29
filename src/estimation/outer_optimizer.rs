@@ -2234,6 +2234,163 @@ mod tests {
         assert_eq!(r.n_clipped, 0);
     }
 
+    // ── detect_stagnation: NLopt stagnation-guard unit tests ─────────────────
+
+    /// Build a minimal `NloptState` for `detect_stagnation` unit tests.
+    /// The non-stagnation fields (`cached_etas`, `cached_h_mats`, `prev_x`)
+    /// are left empty because `detect_stagnation` reads only the
+    /// `*_evals` / `*_improvement` / `stagnation_stopped` fields.
+    fn fresh_state() -> NloptState {
+        NloptState {
+            cached_etas: Vec::new(),
+            cached_h_mats: Vec::new(),
+            best_ofv: 0.0,
+            n_evals: 0,
+            n_grad_evals: 0,
+            prev_x: Vec::new(),
+            last_improvement_eval: 0,
+            best_at_last_improvement: f64::INFINITY,
+            stagnation_stopped: false,
+        }
+    }
+
+    /// `detect_stagnation(enabled=false)` is a no-op: it never latches, never
+    /// fires, even after a window of zero improvement.  Replaces the
+    /// end-to-end `stagnation_guard_toggle_runs_to_natural_termination` test
+    /// (removed from `tests/new_optimizers.rs`), which became unreliable
+    /// after SLSQP's own xtol fires before the guard window elapses on the
+    /// warfarin example (both guard-on and guard-off now exit at exactly
+    /// 100 evals via NLopt `XtolReached`, so the e2e toggle comparison no
+    /// longer discriminates).
+    #[test]
+    fn test_detect_stagnation_disabled_never_fires() {
+        let mut state = fresh_state();
+        state.best_ofv = -100.0;
+        state.best_at_last_improvement = -100.0;
+        // Far past the stagnation window (n=7 → window = max(3*8, 50) = 50)
+        // with zero improvement: still must not fire when disabled.
+        for n_evals in 0..200 {
+            state.n_evals = n_evals;
+            assert!(
+                !detect_stagnation(&mut state, 7, false),
+                "enabled=false must never fire (n_evals={n_evals})"
+            );
+        }
+        assert!(
+            !state.stagnation_stopped,
+            "disabled path must not latch `stagnation_stopped`"
+        );
+    }
+
+    /// `detect_stagnation(enabled=true)` fires once `n_evals - last_improvement`
+    /// reaches the stagnation window and latches sticky thereafter.
+    #[test]
+    fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
+        let mut state = fresh_state();
+        state.best_ofv = -100.0;
+        state.best_at_last_improvement = -100.0; // identical → no improvement
+        state.last_improvement_eval = 0;
+
+        let n = 7usize;
+        let window = (3 * (n + 1)).max(50); // = 50
+
+        // Within the window, no firing.
+        for n_evals in 1..window {
+            state.n_evals = n_evals;
+            assert!(
+                !detect_stagnation(&mut state, n, true),
+                "must not fire inside window (n_evals={n_evals}, window={window})"
+            );
+            assert!(!state.stagnation_stopped);
+        }
+
+        // At the window, fires and latches.
+        state.n_evals = window;
+        assert!(
+            detect_stagnation(&mut state, n, true),
+            "must fire at window (n_evals={window})"
+        );
+        assert!(
+            state.stagnation_stopped,
+            "first firing must latch `stagnation_stopped`"
+        );
+
+        // Latched: subsequent calls keep returning `true` without re-checking
+        // the window arithmetic.  Drop n_evals well below the window to prove
+        // the short-circuit is on `stagnation_stopped`, not on the counter.
+        state.n_evals = 1;
+        assert!(
+            detect_stagnation(&mut state, n, true),
+            "latched state must stay sticky-true regardless of n_evals"
+        );
+    }
+
+    /// `detect_stagnation` resets the improvement counter when OFV moves down
+    /// by more than the 1e-3 threshold — so a long run of fruitful descent
+    /// never triggers the guard.
+    #[test]
+    fn test_detect_stagnation_resets_on_improvement() {
+        let mut state = fresh_state();
+        state.best_ofv = -100.0;
+        state.best_at_last_improvement = -100.0;
+        state.last_improvement_eval = 0;
+
+        let n = 7usize;
+        // Walk almost up to the window with zero improvement…
+        state.n_evals = 49;
+        assert!(!detect_stagnation(&mut state, n, true));
+
+        // …then improve OFV by > 1e-3.  Improvement must reset the
+        // last-improvement counter so the next 50 evals start fresh.
+        state.best_ofv = -100.5;
+        state.n_evals = 50;
+        assert!(
+            !detect_stagnation(&mut state, n, true),
+            "improvement must reset the counter"
+        );
+        assert_eq!(
+            state.last_improvement_eval, 50,
+            "last_improvement_eval must advance to the improving eval"
+        );
+        assert_eq!(
+            state.best_at_last_improvement, -100.5,
+            "best_at_last_improvement must update to the new best"
+        );
+
+        // Now we need another full window of zero improvement before firing.
+        state.n_evals = 99;
+        assert!(!detect_stagnation(&mut state, n, true));
+        state.n_evals = 100;
+        assert!(detect_stagnation(&mut state, n, true));
+    }
+
+    /// Improvement *below* the 1e-3 threshold counts as stagnation — the
+    /// guard is deliberately noise-tolerant.  Without this, OFV noise of a
+    /// few ULPs would constantly reset the counter and the guard would
+    /// never fire.
+    #[test]
+    fn test_detect_stagnation_subthreshold_improvement_does_not_reset() {
+        let mut state = fresh_state();
+        state.best_ofv = -100.0;
+        state.best_at_last_improvement = -100.0;
+        state.last_improvement_eval = 0;
+
+        let n = 7usize;
+        // Improve OFV by 5e-4 — below the 1e-3 threshold.  Counter must
+        // NOT reset.
+        state.best_ofv = -100.0005;
+        state.n_evals = 25;
+        assert!(!detect_stagnation(&mut state, n, true));
+        assert_eq!(
+            state.last_improvement_eval, 0,
+            "sub-threshold improvement must not advance the counter"
+        );
+
+        // 50 evals after the original last_improvement_eval (= 0), it fires.
+        state.n_evals = 50;
+        assert!(detect_stagnation(&mut state, n, true));
+    }
+
     #[test]
     fn test_reconverge_this_eval_schedule() {
         let mut opts = FitOptions::default();

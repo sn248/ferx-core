@@ -166,8 +166,11 @@ fn assigned_vars_in_order(stmts: &[Statement]) -> Vec<String> {
                         out.push(name.clone());
                     }
                 }
-                Statement::AssignIdx(_, _) | Statement::DiffEqIdx(_, _) => {
-                    // Indexed variants only appear after
+                Statement::AssignIdx(_, _)
+                | Statement::DiffEqIdx(_, _)
+                | Statement::AssignBc(_, _)
+                | Statement::DiffEqBc(_, _) => {
+                    // Indexed / bytecode variants only appear after
                     // `resolve_variable_indices`, which runs after all
                     // name-collecting helpers like this one. Treat as no-op
                     // for exhaustiveness.
@@ -228,8 +231,11 @@ fn extract_eta_indices_for_var(stmts: &[Statement], var_name: &str) -> Vec<usize
                         }
                     }
                 }
-                Statement::AssignIdx(_, _) | Statement::DiffEqIdx(_, _) => {
-                    // Indexed-form statements only appear after
+                Statement::AssignIdx(_, _)
+                | Statement::DiffEqIdx(_, _)
+                | Statement::AssignBc(_, _)
+                | Statement::DiffEqBc(_, _) => {
+                    // Indexed / bytecode variants only appear after
                     // `resolve_variable_indices`; this helper runs on the
                     // pre-resolve AST.
                 }
@@ -2096,18 +2102,23 @@ fn build_y_output_fn(
         .map(|(i, n)| (n.clone(), i))
         .collect();
 
-    // Rewrite Variable → VariableIdx and Covariate → CovariateIdx in place.
+    // Rewrite Variable → VariableIdx and Covariate → CovariateIdx in place,
+    // then compile to bytecode so the per-observation hot path is a tight
+    // op-tag loop rather than a recursive `Box<Expression>` walk.
     let mut expr = expr;
     resolve_expr_indices(&mut expr, &var_idx, &cov_idx);
+    let bc = compile_bytecode(&expr);
 
-    // Per-thread scratch for the y readout vars + covariate slice. Separate
-    // from `build_ode_rhs_fn`'s `RHS_VARS_SCRATCH` because the two are sized
-    // for different layouts and called in different phases of the
-    // integration (RHS per RK45 stage; readout per observation).
+    // Per-thread scratch for the y readout vars + covariate slice + bytecode
+    // f64 stack. Separate from `build_ode_rhs_fn`'s `RHS_VARS_SCRATCH` because
+    // the two are sized for different layouts and called in different phases
+    // of the integration (RHS per RK45 stage; readout per observation).
     thread_local! {
         static Y_VARS_SCRATCH: std::cell::RefCell<Vec<f64>> =
             const { std::cell::RefCell::new(Vec::new()) };
         static Y_COV_SCRATCH: std::cell::RefCell<Vec<f64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static Y_BC_STACK: std::cell::RefCell<Vec<f64>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
     let n_cov = cov_names.len();
@@ -2121,39 +2132,51 @@ fn build_y_output_fn(
               -> f64 {
             Y_VARS_SCRATCH.with(|vcell| {
                 Y_COV_SCRATCH.with(|ccell| {
-                    let mut vars = vcell.borrow_mut();
-                    vars.clear();
-                    vars.resize(n_vars_total, 0.0);
+                    Y_BC_STACK.with(|scell| {
+                        let mut vars = vcell.borrow_mut();
+                        vars.clear();
+                        vars.resize(n_vars_total, 0.0);
 
-                    // State values from state[]; protect against a malformed
-                    // (state.len() < n_states) input the same way the old
-                    // HashMap path did (it skipped via `if i < state.len()`).
-                    let copy_n = n_states.min(state.len());
-                    vars[..copy_n].copy_from_slice(&state[..copy_n]);
+                        // State values from state[]; protect against a
+                        // malformed (state.len() < n_states) input the same
+                        // way the old HashMap path did (it skipped via
+                        // `if i < state.len()`).
+                        let copy_n = n_states.min(state.len());
+                        vars[..copy_n].copy_from_slice(&state[..copy_n]);
 
-                    // Indiv params from pk_params_flat via the pre-computed
-                    // slot plan; OOB slots leave the var at 0.0.
-                    for (i, &pk_slot) in indiv_to_pk.iter().enumerate() {
-                        if let (Some(dst), Some(&val)) =
-                            (vars.get_mut(n_states + i), pk_params_flat.get(pk_slot))
-                        {
-                            *dst = val;
-                        }
-                    }
-
-                    let mut cov_buf = ccell.borrow_mut();
-                    cov_buf.clear();
-                    if n_cov > 0 {
-                        cov_buf.resize(n_cov, 0.0);
-                        for (i, name) in cov_names.iter().enumerate() {
-                            if let Some(&v) = covariates.get(name) {
-                                cov_buf[i] = v;
+                        // Indiv params from pk_params_flat via the
+                        // pre-computed slot plan; OOB slots leave the var at
+                        // 0.0.
+                        for (i, &pk_slot) in indiv_to_pk.iter().enumerate() {
+                            if let (Some(dst), Some(&val)) =
+                                (vars.get_mut(n_states + i), pk_params_flat.get(pk_slot))
+                            {
+                                *dst = val;
                             }
                         }
-                    }
 
-                    let empty_nn: Vec<Vec<f64>> = Vec::new();
-                    eval_expression_indexed(&expr, theta, eta, &cov_buf, &vars, &empty_nn)
+                        let mut cov_buf = ccell.borrow_mut();
+                        cov_buf.clear();
+                        if n_cov > 0 {
+                            cov_buf.resize(n_cov, 0.0);
+                            for (i, name) in cov_names.iter().enumerate() {
+                                if let Some(&v) = covariates.get(name) {
+                                    cov_buf[i] = v;
+                                }
+                            }
+                        }
+
+                        let empty_nn: Vec<Vec<f64>> = Vec::new();
+                        eval_bytecode(
+                            &bc,
+                            theta,
+                            eta,
+                            &cov_buf,
+                            &vars,
+                            &empty_nn,
+                            &mut scell.borrow_mut(),
+                        )
+                    })
                 })
             })
         },
@@ -2817,7 +2840,9 @@ fn build_ode_spec(
                 }
                 Statement::Assign(_, _)
                 | Statement::AssignIdx(_, _)
-                | Statement::DiffEqIdx(_, _) => {}
+                | Statement::DiffEqIdx(_, _)
+                | Statement::AssignBc(_, _)
+                | Statement::DiffEqBc(_, _) => {}
             }
         }
     }
@@ -2846,7 +2871,9 @@ fn build_ode_spec(
                 }
                 Statement::Assign(_, _)
                 | Statement::AssignIdx(_, _)
-                | Statement::DiffEqIdx(_, _) => {}
+                | Statement::DiffEqIdx(_, _)
+                | Statement::AssignBc(_, _)
+                | Statement::DiffEqBc(_, _) => {}
             }
         }
         Ok(())
@@ -4263,16 +4290,27 @@ enum Condition {
 #[derive(Debug, Clone)]
 enum Statement {
     Assign(String, Expression),
-    /// Same as `Assign(name, expr)` but pre-resolved to a slot index for
-    /// the `pk_param_fn` hot path. See `Expression::VariableIdx`.
+    /// Same as `Assign(name, expr)` but pre-resolved to a slot index, before
+    /// bytecode compilation. Currently transitional — `resolve_variable_indices`
+    /// goes straight from `Assign` to `AssignBc` — kept around to keep the
+    /// pre-/post-resolve pair symmetric with `DiffEq` / `DiffEqIdx` and so an
+    /// older AST snapshot fed to `eval_statements_indexed` still evaluates
+    /// correctly via the slower expression-tree fallback arm.
+    #[allow(dead_code)]
     AssignIdx(usize, Expression),
     /// `d/dt(NAME) = expr` — only legal in `[odes]` blocks.
     DiffEq(String, Expression),
     /// Same as `DiffEq(name, expr)` but pre-resolved to the state's slot in the
-    /// `du` array — the hot-path counterpart used by the ODE RHS closure so it
-    /// can index `du[state_idx]` directly instead of going through a string
-    /// HashMap. See `Statement::AssignIdx` for the analogous pk_param_fn variant.
+    /// `du` array. Transitional like `AssignIdx` — kept for fallback evaluation
+    /// of any unresolved AST snapshot.
+    #[allow(dead_code)]
     DiffEqIdx(usize, Expression),
+    /// Bytecode-compiled assignment. Emitted by `resolve_variable_indices`
+    /// after `AssignIdx`'s expression has been compiled to `Bytecode` for
+    /// the hot-path `eval_bytecode` interpreter.
+    AssignBc(usize, Bytecode),
+    /// Bytecode-compiled derivative assignment; sibling of `AssignBc`.
+    DiffEqBc(usize, Bytecode),
     /// One or more `if (cond) { ... }` arms followed by an optional `else { ... }`.
     /// Each arm in `branches` is `(condition, body)`.
     If {
@@ -4379,6 +4417,11 @@ fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::
             | Statement::AssignIdx(_, e)
             | Statement::DiffEq(_, e)
             | Statement::DiffEqIdx(_, e) => collect_covariates(e, out),
+            Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {
+                // Bytecode variants only appear after `resolve_variable_indices`;
+                // any covariate reference was already resolved (or rejected
+                // for the ODE-RHS path) before compilation.
+            }
             Statement::If {
                 branches,
                 else_body,
@@ -4518,6 +4561,489 @@ fn eval_condition(
                 || eval_condition(r, theta, eta, covariates, vars, nn_outputs)
         }
         Condition::Not(c) => !eval_condition(c, theta, eta, covariates, vars, nn_outputs),
+    }
+}
+
+// ─── Bytecode interpreter ───────────────────────────────────────────────────
+//
+// Flat-bytecode replacement for the recursive `eval_expression_indexed` AST
+// walker. Profiling the experiment Emax FOCEI fit (#134) showed
+// `eval_expression_indexed` was ~55% of self time after PR #135/#136 —
+// dominated by `Box<Expression>` chasing and recursive function-call
+// overhead. Lowering each parsed expression to a `Vec<Op>` + small f64
+// stack flattens the walk into a tight match-on-tag loop with predictable
+// branches and good cache locality.
+//
+// Compilation is post-resolve (every `Variable(name)` has already been
+// turned into `VariableIdx(slot)` by `resolve_variable_indices`), so the
+// Op variants carry slot indices directly. Constants live in a small
+// pool so the Op enum stays compact (u32-indexed instead of an f64
+// payload).
+//
+// Conditionals lower to forward jumps:
+//   if (cond) { then } else { else }
+//     [cond bytecode pushing 0.0 / 1.0]
+//     JumpIfFalse(L_else)
+//     [then bytecode]
+//     Jump(L_end)
+//   L_else: [else bytecode]
+//   L_end:
+//
+// And/Or/Not are non-short-circuit (the underlying expressions never have
+// side-effects worth short-circuiting: arithmetic only, with `Op::Div`'s
+// `r.abs() < 1e-30 -> 0.0` guard and `Op::Ln`/`Op::Sqrt`'s clamps
+// preserving the slow-path semantics).
+
+#[derive(Debug, Clone, Copy)]
+enum Op {
+    PushConst(u32), // index into Bytecode.constants
+    PushTheta(u32),
+    PushEta(u32),
+    PushVar(u32),
+    PushCov(u32),
+    PushNnOutput(u32, u32),
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Pow,
+    Exp,
+    Ln,   // matches eval's `v.max(1e-30).ln()` guard
+    Sqrt, // matches eval's `v.max(0.0).sqrt()` guard
+    Abs,
+    InvLogit,
+    Logit,
+    CmpLt,
+    CmpLe,
+    CmpGt,
+    CmpGe,
+    CmpEq,
+    CmpNe,
+    // And/Or/Not consume 0.0 / 1.0 booleans on the stack.
+    LogicAnd,
+    LogicOr,
+    LogicNot,
+    JumpIfFalse(u32), // pops top; jumps to bytecode index if value == 0.0
+    Jump(u32),
+}
+
+/// Compiled bytecode for a single expression tree. The `constants` pool
+/// holds every literal value referenced by `PushConst(u32)` opcodes; this
+/// avoids paying an 8-byte literal payload on every variant of `Op`. The
+/// enum size is currently 12 bytes (`PushNnOutput(u32, u32)` carries 8
+/// bytes of payload plus the tag — every variant pads to that size); the
+/// pool still saves 4 bytes per push relative to a hypothetical
+/// `PushLiteral(f64)` (which would force 16-byte alignment). `max_stack`
+/// is computed at compile time so `eval_bytecode` can `reserve` once and
+/// amortize the `Vec::push` bounds checks across all calls.
+#[derive(Debug, Clone)]
+struct Bytecode {
+    ops: Vec<Op>,
+    constants: Vec<f64>,
+    max_stack: usize,
+}
+
+impl Bytecode {
+    fn new() -> Self {
+        Self {
+            ops: Vec::new(),
+            constants: Vec::new(),
+            max_stack: 0,
+        }
+    }
+    fn push_const(&mut self, v: f64) {
+        let idx = self.constants.len() as u32;
+        self.constants.push(v);
+        self.ops.push(Op::PushConst(idx));
+    }
+}
+
+/// Compile a single (post-resolve) `Expression` into `Bytecode`. Unresolved
+/// `Variable` / `Covariate` nodes trip a `debug_assert!(false, …)` in debug
+/// builds and lower to a constant `0.0` push in release; both are intended
+/// to mirror the `eval_expression_indexed` fall-through semantics for
+/// callers that bypass `resolve_expr_indices`.
+fn compile_bytecode(expr: &Expression) -> Bytecode {
+    let mut bc = Bytecode::new();
+    compile_expr_into(&mut bc, expr);
+    bc.max_stack = compute_max_stack(&bc.ops);
+    bc
+}
+
+/// Compute a safe upper bound on the maximum f64 stack depth a bytecode
+/// program reaches. Each Op has a known net stack delta:
+///   Push*       :  +1
+///   Pop2/Push1  :  -1  (arithmetic / compare / logic-binary)
+///   Pop1/Push1  :   0  (unary fn / logic-not)
+///   Jump        :   0
+///   JumpIfFalse :  -1
+///
+/// The single linear scan returns an *upper bound* (not the exact peak):
+/// `Conditional` emits both then- and else-branches inline with a `Jump`
+/// between them, so the linear walk credits BOTH branches' pushes against
+/// running depth even though execution only takes one branch at runtime.
+/// That over-estimate is exactly what `eval_bytecode` wants for its
+/// `stack.reserve(max_stack)` call — under-estimating here would let the
+/// unchecked-write hot loop go OOB on the conservative-FD path. The
+/// `depth >= 0` and balanced-end debug asserts catch a future opcode
+/// addition that violates the invariant; in release builds the over-bound
+/// is the only guard.
+///
+/// If backward jumps (e.g. for loops) are ever added, this linear-scan
+/// algorithm no longer holds — fixed-point iteration would be required.
+fn compute_max_stack(ops: &[Op]) -> usize {
+    let mut depth: i32 = 0;
+    let mut peak: i32 = 0;
+    for op in ops {
+        let delta: i32 = match op {
+            Op::PushConst(_)
+            | Op::PushTheta(_)
+            | Op::PushEta(_)
+            | Op::PushVar(_)
+            | Op::PushCov(_)
+            | Op::PushNnOutput(_, _) => 1,
+            Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Pow
+            | Op::CmpLt
+            | Op::CmpLe
+            | Op::CmpGt
+            | Op::CmpGe
+            | Op::CmpEq
+            | Op::CmpNe
+            | Op::LogicAnd
+            | Op::LogicOr => -1,
+            Op::Exp | Op::Ln | Op::Sqrt | Op::Abs | Op::InvLogit | Op::Logit | Op::LogicNot => 0,
+            Op::JumpIfFalse(_) => -1,
+            Op::Jump(_) => 0,
+        };
+        depth += delta;
+        // Liveness invariant: every Op's deltas must keep the running
+        // (linear-scan) depth ≥ 0 — if not, the compiler emitted an
+        // unbalanced sequence and `eval_bytecode`'s `pop!` macro would
+        // underflow `len` (usize) into UB territory in release.
+        debug_assert!(
+            depth >= 0,
+            "compute_max_stack: depth went negative at op {op:?}; bytecode is unbalanced",
+        );
+        if depth > peak {
+            peak = depth;
+        }
+    }
+    // A well-formed expression bytecode leaves exactly one value on the
+    // stack (the result). Catch off-by-one push/pop emissions in any
+    // future compile_expr_into change.
+    debug_assert!(
+        depth == 1 || ops.is_empty(),
+        "compute_max_stack: bytecode ends at depth {depth}, expected 1",
+    );
+    peak.max(1) as usize
+}
+
+fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
+    match expr {
+        Expression::Literal(v) => bc.push_const(*v),
+        Expression::Theta(i) => bc.ops.push(Op::PushTheta(*i as u32)),
+        Expression::Eta(i) => bc.ops.push(Op::PushEta(*i as u32)),
+        Expression::VariableIdx(i) => bc.ops.push(Op::PushVar(*i as u32)),
+        Expression::CovariateIdx(i) => bc.ops.push(Op::PushCov(*i as u32)),
+        Expression::Variable(_) | Expression::Covariate(_) => {
+            // Reached only if `resolve_expr_indices` was skipped — shouldn't
+            // happen in practice; lower to 0.0 to preserve the
+            // `eval_expression_indexed` fall-through behaviour.
+            debug_assert!(false, "compile_bytecode: unresolved Variable/Covariate");
+            bc.push_const(0.0);
+        }
+        Expression::NnOutput { nn_idx, output_idx } => bc
+            .ops
+            .push(Op::PushNnOutput(*nn_idx as u32, *output_idx as u32)),
+        Expression::BinOp(lhs, op, rhs) => {
+            compile_expr_into(bc, lhs);
+            compile_expr_into(bc, rhs);
+            bc.ops.push(match op {
+                BinOp::Add => Op::Add,
+                BinOp::Sub => Op::Sub,
+                BinOp::Mul => Op::Mul,
+                BinOp::Div => Op::Div,
+            });
+        }
+        Expression::Power(base, exp) => {
+            compile_expr_into(bc, base);
+            compile_expr_into(bc, exp);
+            bc.ops.push(Op::Pow);
+        }
+        Expression::UnaryFn(name, arg) => {
+            compile_expr_into(bc, arg);
+            // Names matched here mirror `eval_expression_indexed`'s UnaryFn
+            // dispatch. Anything else becomes a no-op (the slow path returns
+            // the argument unchanged); preserve that with `Op::Abs` of `Abs`
+            // we can't — fall through to push the value as-is.
+            match name.as_str() {
+                "exp" => bc.ops.push(Op::Exp),
+                "log" | "ln" => bc.ops.push(Op::Ln),
+                "sqrt" => bc.ops.push(Op::Sqrt),
+                "abs" => bc.ops.push(Op::Abs),
+                "inv_logit" | "expit" => bc.ops.push(Op::InvLogit),
+                "logit" => bc.ops.push(Op::Logit),
+                _ => { /* unknown function → leave the argument on the stack */ }
+            }
+        }
+        Expression::Conditional(cond, t_expr, e_expr) => {
+            // Compile condition (leaves 0.0/1.0 on stack), then JumpIfFalse
+            // to the else block, then the then-block + Jump-to-end, then
+            // the else-block. The jumps are patched once we know the
+            // target indices.
+            compile_condition_into(bc, cond);
+            let jif_idx = bc.ops.len();
+            bc.ops.push(Op::JumpIfFalse(0)); // placeholder
+            compile_expr_into(bc, t_expr);
+            let jmp_idx = bc.ops.len();
+            bc.ops.push(Op::Jump(0)); // placeholder
+            let else_target = bc.ops.len() as u32;
+            compile_expr_into(bc, e_expr);
+            let end_target = bc.ops.len() as u32;
+            bc.ops[jif_idx] = Op::JumpIfFalse(else_target);
+            bc.ops[jmp_idx] = Op::Jump(end_target);
+        }
+    }
+}
+
+fn compile_condition_into(bc: &mut Bytecode, cond: &Condition) {
+    match cond {
+        Condition::Compare(l, op, r) => {
+            compile_expr_into(bc, l);
+            compile_expr_into(bc, r);
+            bc.ops.push(match op {
+                CmpOp::Lt => Op::CmpLt,
+                CmpOp::Le => Op::CmpLe,
+                CmpOp::Gt => Op::CmpGt,
+                CmpOp::Ge => Op::CmpGe,
+                CmpOp::Eq => Op::CmpEq,
+                CmpOp::Ne => Op::CmpNe,
+            });
+        }
+        Condition::And(l, r) => {
+            compile_condition_into(bc, l);
+            compile_condition_into(bc, r);
+            bc.ops.push(Op::LogicAnd);
+        }
+        Condition::Or(l, r) => {
+            compile_condition_into(bc, l);
+            compile_condition_into(bc, r);
+            bc.ops.push(Op::LogicOr);
+        }
+        Condition::Not(c) => {
+            compile_condition_into(bc, c);
+            bc.ops.push(Op::LogicNot);
+        }
+    }
+}
+
+/// Stack-machine bytecode evaluator. `stack` is reused across calls via the
+/// caller's thread-local scratch; it's cleared at entry and the bytecode's
+/// pre-computed `max_stack` is reserved up front so no `Vec::push` can
+/// reallocate inside the hot loop.
+///
+/// We use a manual `len` cursor + raw pointer to the underlying buffer
+/// instead of `Vec::push`/`pop` — `compute_max_stack` guarantees the
+/// indices are in bounds, so the per-op bounds checks `Vec::push`/`pop`
+/// emit are pure overhead here. The AST walker the bytecode replaces had no
+/// such bounds checks (it just returned values from recursive calls), so
+/// matching its overhead is the whole point.
+fn eval_bytecode(
+    bc: &Bytecode,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &[f64],
+    vars: &[f64],
+    nn_outputs: &[Vec<f64>],
+    stack: &mut Vec<f64>,
+) -> f64 {
+    stack.clear();
+    stack.reserve(bc.max_stack);
+    let mut pc: usize = 0;
+    let ops = bc.ops.as_slice();
+    let consts = bc.constants.as_slice();
+
+    // SAFETY: `compute_max_stack` walks every op in compile order and the
+    // compile-time stack-depth invariant holds for any well-formed Bytecode
+    // (every variant we emit balances correctly). `stack.reserve(max_stack)`
+    // guarantees the buffer is large enough for all subsequent unchecked
+    // writes; `len` mirrors how many slots are actually live. Any malformed
+    // Bytecode (e.g. produced by a future feature without a matching
+    // `compute_max_stack` update) trips a debug_assert.
+    let buf = stack.as_mut_ptr();
+    let cap = stack.capacity();
+    let mut len: usize = 0;
+    macro_rules! push {
+        ($v:expr) => {{
+            debug_assert!(len < cap, "bytecode stack overflow at pc={pc}");
+            unsafe {
+                *buf.add(len) = $v;
+            }
+            len += 1;
+        }};
+    }
+    macro_rules! pop {
+        () => {{
+            debug_assert!(len > 0, "bytecode stack underflow at pc={pc}");
+            len -= 1;
+            unsafe { *buf.add(len) }
+        }};
+    }
+
+    while pc < ops.len() {
+        match ops[pc] {
+            Op::PushConst(i) => push!(consts[i as usize]),
+            Op::PushTheta(i) => push!(theta.get(i as usize).copied().unwrap_or(0.0)),
+            Op::PushEta(i) => push!(eta.get(i as usize).copied().unwrap_or(0.0)),
+            Op::PushVar(i) => push!(vars.get(i as usize).copied().unwrap_or(0.0)),
+            Op::PushCov(i) => push!(covariates.get(i as usize).copied().unwrap_or(0.0)),
+            Op::PushNnOutput(nn_i, out_i) => {
+                let v = nn_outputs
+                    .get(nn_i as usize)
+                    .and_then(|v| v.get(out_i as usize))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        debug_assert!(
+                            false,
+                            "Op::PushNnOutput nn_idx={nn_i} output_idx={out_i} out of bounds"
+                        );
+                        0.0
+                    });
+                push!(v);
+            }
+            Op::Add => {
+                let b = pop!();
+                let a = pop!();
+                push!(a + b);
+            }
+            Op::Sub => {
+                let b = pop!();
+                let a = pop!();
+                push!(a - b);
+            }
+            Op::Mul => {
+                let b = pop!();
+                let a = pop!();
+                push!(a * b);
+            }
+            Op::Div => {
+                let b = pop!();
+                let a = pop!();
+                push!(if b.abs() < 1e-30 { 0.0 } else { a / b });
+            }
+            Op::Pow => {
+                let e = pop!();
+                let b = pop!();
+                push!(b.powf(e));
+            }
+            Op::Exp => {
+                let v = pop!();
+                push!(v.exp());
+            }
+            Op::Ln => {
+                let v = pop!();
+                let v = if v >= 1e-30 { v } else { 1e-30 };
+                push!(v.ln());
+            }
+            Op::Sqrt => {
+                let v = pop!();
+                let v = if v >= 0.0 { v } else { 0.0 };
+                push!(v.sqrt());
+            }
+            Op::Abs => {
+                let v = pop!();
+                push!(v.abs());
+            }
+            Op::InvLogit => {
+                let v = pop!();
+                let r = if v >= 0.0 {
+                    1.0 / (1.0 + (-v).exp())
+                } else {
+                    let e = v.exp();
+                    e / (1.0 + e)
+                };
+                push!(r);
+            }
+            Op::Logit => {
+                let v = pop!();
+                let clamped = v.clamp(1e-15, 1.0 - 1e-15);
+                push!((clamped / (1.0 - clamped)).ln());
+            }
+            Op::CmpLt => {
+                let r = pop!();
+                let l = pop!();
+                push!(if l < r { 1.0 } else { 0.0 });
+            }
+            Op::CmpLe => {
+                let r = pop!();
+                let l = pop!();
+                push!(if l <= r { 1.0 } else { 0.0 });
+            }
+            Op::CmpGt => {
+                let r = pop!();
+                let l = pop!();
+                push!(if l > r { 1.0 } else { 0.0 });
+            }
+            Op::CmpGe => {
+                let r = pop!();
+                let l = pop!();
+                push!(if l >= r { 1.0 } else { 0.0 });
+            }
+            Op::CmpEq => {
+                let r = pop!();
+                let l = pop!();
+                push!(if l == r { 1.0 } else { 0.0 });
+            }
+            Op::CmpNe => {
+                let r = pop!();
+                let l = pop!();
+                push!(if l != r { 1.0 } else { 0.0 });
+            }
+            Op::LogicAnd => {
+                let b = pop!();
+                let a = pop!();
+                push!(if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 });
+            }
+            Op::LogicOr => {
+                let b = pop!();
+                let a = pop!();
+                push!(if a != 0.0 || b != 0.0 { 1.0 } else { 0.0 });
+            }
+            Op::LogicNot => {
+                let v = pop!();
+                push!(if v == 0.0 { 1.0 } else { 0.0 });
+            }
+            Op::JumpIfFalse(target) => {
+                let v = pop!();
+                if v == 0.0 {
+                    pc = target as usize;
+                    continue;
+                }
+            }
+            Op::Jump(target) => {
+                pc = target as usize;
+                continue;
+            }
+        }
+        pc += 1;
+    }
+    // Balanced-bytecode invariant: every expression's compile produces
+    // exactly one residual value on the stack. Catches off-by-one in any
+    // future compile_expr_into change that compute_max_stack's end-of-scan
+    // assert might miss (the two checks are belt-and-braces against the
+    // same class of UB-on-pop bug).
+    debug_assert!(
+        len == 1,
+        "eval_bytecode: bytecode finished at stack depth {len}, expected 1",
+    );
+    if len > 0 {
+        unsafe { *buf.add(len - 1) }
+    } else {
+        0.0
     }
 }
 
@@ -4666,13 +5192,58 @@ fn eval_statements_indexed(
     du: Option<&mut [f64]>,
     nn_outputs: &[Vec<f64>],
 ) {
-    // `du` shuttles into recursive `If` arms the same way `eval_statements`
-    // handles it. The non-ODE callers (`pk_param_fn`) pass `None` and never
-    // hit a `DiffEqIdx`.
+    // Acquire the bytecode-stack scratch ONCE per call (the previous
+    // per-statement TLS access was a measurable slowdown vs the AST walker
+    // which LLVM was fully inlining). The borrow is held for the lifetime
+    // of this statement loop and threaded into recursive `If` arms.
+    thread_local! {
+        static BC_STACK: std::cell::RefCell<Vec<f64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BC_STACK.with(|cell| {
+        let mut stack = cell.borrow_mut();
+        eval_statements_indexed_with_stack(
+            stmts, theta, eta, covariates, vars, du, nn_outputs, &mut stack,
+        );
+    });
+}
+
+/// Inner statement evaluator threaded with a caller-owned bytecode stack.
+/// Split from `eval_statements_indexed` so recursive `If` evaluation reuses
+/// the same `Vec<f64>` scratch instead of re-acquiring the TLS borrow per
+/// nested call.
+#[allow(clippy::too_many_arguments)]
+fn eval_statements_indexed_with_stack(
+    stmts: &[Statement],
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &[f64],
+    vars: &mut [f64],
+    du: Option<&mut [f64]>,
+    nn_outputs: &[Vec<f64>],
+    bc_stack: &mut Vec<f64>,
+) {
     let mut du_opt = du;
     for s in stmts {
         match s {
+            Statement::AssignBc(idx, bc) => {
+                let v = eval_bytecode(bc, theta, eta, covariates, vars, nn_outputs, bc_stack);
+                if let Some(slot) = vars.get_mut(*idx) {
+                    *slot = v;
+                }
+            }
+            Statement::DiffEqBc(state_idx, bc) => {
+                let v = eval_bytecode(bc, theta, eta, covariates, vars, nn_outputs, bc_stack);
+                if let Some(buf) = du_opt.as_deref_mut() {
+                    if let Some(slot) = buf.get_mut(*state_idx) {
+                        *slot = v;
+                    }
+                }
+            }
             Statement::AssignIdx(idx, expr) => {
+                // Pre-bytecode path — kept for any caller that bypasses
+                // `resolve_variable_indices`. Slightly slower (recursive AST
+                // walk), correct.
                 let v = eval_expression_indexed(expr, theta, eta, covariates, vars, nn_outputs);
                 if let Some(slot) = vars.get_mut(*idx) {
                     *slot = v;
@@ -4693,7 +5264,7 @@ fn eval_statements_indexed(
                 let mut taken = false;
                 for (cond, body) in branches {
                     if eval_condition_indexed(cond, theta, eta, covariates, vars, nn_outputs) {
-                        eval_statements_indexed(
+                        eval_statements_indexed_with_stack(
                             body,
                             theta,
                             eta,
@@ -4701,6 +5272,7 @@ fn eval_statements_indexed(
                             vars,
                             du_opt.as_deref_mut(),
                             nn_outputs,
+                            bc_stack,
                         );
                         taken = true;
                         break;
@@ -4708,7 +5280,7 @@ fn eval_statements_indexed(
                 }
                 if !taken {
                     if let Some(eb) = else_body {
-                        eval_statements_indexed(
+                        eval_statements_indexed_with_stack(
                             eb,
                             theta,
                             eta,
@@ -4716,6 +5288,7 @@ fn eval_statements_indexed(
                             vars,
                             du_opt.as_deref_mut(),
                             nn_outputs,
+                            bc_stack,
                         );
                     }
                 }
@@ -4750,10 +5323,18 @@ fn resolve_variable_indices(
                 resolve_expr_indices(expr, var_idx, cov_idx);
                 let i = var_idx.get(name).copied().unwrap_or(usize::MAX);
                 let taken_expr = std::mem::replace(expr, Expression::Literal(0.0));
-                *s = Statement::AssignIdx(i, taken_expr);
+                let bc = compile_bytecode(&taken_expr);
+                *s = Statement::AssignBc(i, bc);
             }
-            Statement::AssignIdx(_, expr) => {
+            Statement::AssignIdx(idx, expr) => {
+                // Already-resolved (only produced by intermediate parser passes
+                // that didn't go through the bytecode compiler); compile here
+                // so the hot-path evaluator never sees a tree node.
                 resolve_expr_indices(expr, var_idx, cov_idx);
+                let idx = *idx;
+                let taken_expr = std::mem::replace(expr, Expression::Literal(0.0));
+                let bc = compile_bytecode(&taken_expr);
+                *s = Statement::AssignBc(idx, bc);
             }
             Statement::DiffEq(name, expr) => {
                 resolve_expr_indices(expr, var_idx, cov_idx);
@@ -4769,11 +5350,19 @@ fn resolve_variable_indices(
                         "resolve_variable_indices: DiffEq state `{name}` not in state_index",
                     );
                     let taken_expr = std::mem::replace(expr, Expression::Literal(0.0));
-                    *s = Statement::DiffEqIdx(slot, taken_expr);
+                    let bc = compile_bytecode(&taken_expr);
+                    *s = Statement::DiffEqBc(slot, bc);
                 }
             }
-            Statement::DiffEqIdx(_, expr) => {
+            Statement::DiffEqIdx(slot, expr) => {
                 resolve_expr_indices(expr, var_idx, cov_idx);
+                let slot = *slot;
+                let taken_expr = std::mem::replace(expr, Expression::Literal(0.0));
+                let bc = compile_bytecode(&taken_expr);
+                *s = Statement::DiffEqBc(slot, bc);
+            }
+            Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {
+                // Already compiled — re-resolving is a no-op.
             }
             Statement::If {
                 branches,
@@ -4869,8 +5458,11 @@ fn eval_statements(
                 let v = eval_expression(expr, theta, eta, covariates, vars, nn_outputs);
                 vars.insert(name.clone(), v);
             }
-            Statement::AssignIdx(_, _) | Statement::DiffEqIdx(_, _) => {
-                // Indexed-form statements are only produced by
+            Statement::AssignIdx(_, _)
+            | Statement::DiffEqIdx(_, _)
+            | Statement::AssignBc(_, _)
+            | Statement::DiffEqBc(_, _) => {
+                // Indexed / bytecode statements are only produced by
                 // `resolve_variable_indices` for the `pk_param_fn` and ODE
                 // RHS closures, both of which use `eval_statements_indexed`
                 // exclusively. They should never reach this evaluator;
@@ -8040,7 +8632,9 @@ if (1 > 0) {
                         }
                         Statement::Assign(_, _)
                         | Statement::AssignIdx(_, _)
-                        | Statement::DiffEqIdx(_, _) => {}
+                        | Statement::DiffEqIdx(_, _)
+                        | Statement::AssignBc(_, _)
+                        | Statement::DiffEqBc(_, _) => {}
                     }
                 }
                 Ok(())
@@ -10184,5 +10778,232 @@ if (1 > 0) {
             "expected single Form C + AD rejection, got: {}",
             err
         );
+    }
+
+    // ── Bytecode ↔ AST evaluator equivalence ────────────────────────────────
+    //
+    // The bytecode interpreter is a second evaluator for every
+    // Expression/Condition shape ferx supports. These tests pin its
+    // results to `eval_expression_indexed` so future opcode changes can't
+    // silently diverge — Copilot review on #137 flagged the gap.
+
+    fn bc_vs_ast(expr: Expression, vars: &[f64], theta: &[f64], eta: &[f64], covs: &[f64]) {
+        let nn: Vec<Vec<f64>> = Vec::new();
+        let ast = eval_expression_indexed(&expr, theta, eta, covs, vars, &nn);
+        let bc = compile_bytecode(&expr);
+        let mut stack: Vec<f64> = Vec::new();
+        let by = eval_bytecode(&bc, theta, eta, covs, vars, &nn, &mut stack);
+        assert_eq!(
+            ast.to_bits(),
+            by.to_bits(),
+            "bit-identical mismatch: AST = {ast:?}, bytecode = {by:?}, expr = {expr:?}",
+        );
+    }
+
+    fn lit(v: f64) -> Expression {
+        Expression::Literal(v)
+    }
+    fn binop(op: BinOp, l: Expression, r: Expression) -> Expression {
+        Expression::BinOp(Box::new(l), op, Box::new(r))
+    }
+    fn unary(name: &str, arg: Expression) -> Expression {
+        Expression::UnaryFn(name.into(), Box::new(arg))
+    }
+    fn cond(c: Condition, t: Expression, e: Expression) -> Expression {
+        Expression::Conditional(Box::new(c), Box::new(t), Box::new(e))
+    }
+    fn cmp(l: Expression, op: CmpOp, r: Expression) -> Condition {
+        Condition::Compare(l, op, r)
+    }
+
+    #[test]
+    fn bytecode_matches_ast_on_arithmetic_and_literals() {
+        let v = &[3.5, -2.0, 0.0];
+        let t = &[10.0, 0.1];
+        let e = &[0.5];
+        let c = &[];
+        // Lits and slot pushes
+        bc_vs_ast(lit(7.5), v, t, e, c);
+        bc_vs_ast(Expression::Theta(0), v, t, e, c);
+        bc_vs_ast(Expression::Eta(0), v, t, e, c);
+        bc_vs_ast(Expression::VariableIdx(1), v, t, e, c);
+        // Binary arithmetic — left-to-right evaluation
+        bc_vs_ast(binop(BinOp::Add, lit(2.0), lit(3.0)), v, t, e, c);
+        bc_vs_ast(binop(BinOp::Sub, lit(2.0), lit(3.0)), v, t, e, c);
+        bc_vs_ast(binop(BinOp::Mul, lit(2.0), lit(3.0)), v, t, e, c);
+        bc_vs_ast(binop(BinOp::Div, lit(7.0), lit(2.0)), v, t, e, c);
+        // Div-by-tiny guard (both paths clamp `r.abs() < 1e-30 -> 0.0`)
+        bc_vs_ast(binop(BinOp::Div, lit(1.0), lit(1e-40)), v, t, e, c);
+        bc_vs_ast(binop(BinOp::Div, lit(1.0), lit(0.0)), v, t, e, c);
+        // Power
+        bc_vs_ast(
+            Expression::Power(Box::new(lit(2.0)), Box::new(lit(3.0))),
+            v,
+            t,
+            e,
+            c,
+        );
+        bc_vs_ast(
+            Expression::Power(Box::new(lit(4.0)), Box::new(lit(0.5))),
+            v,
+            t,
+            e,
+            c,
+        );
+    }
+
+    #[test]
+    fn bytecode_matches_ast_on_unary_guards() {
+        let v = &[];
+        let t = &[];
+        let e = &[];
+        let c = &[];
+        // exp / abs — no guards
+        bc_vs_ast(unary("exp", lit(0.5)), v, t, e, c);
+        bc_vs_ast(unary("abs", lit(-3.0)), v, t, e, c);
+        // ln / log clamp `v.max(1e-30).ln()` — exercise negative and zero
+        bc_vs_ast(unary("ln", lit(2.0)), v, t, e, c);
+        bc_vs_ast(unary("ln", lit(0.0)), v, t, e, c);
+        bc_vs_ast(unary("ln", lit(-1.0)), v, t, e, c);
+        bc_vs_ast(unary("log", lit(1e-40)), v, t, e, c);
+        // sqrt clamp `v.max(0.0).sqrt()`
+        bc_vs_ast(unary("sqrt", lit(9.0)), v, t, e, c);
+        bc_vs_ast(unary("sqrt", lit(-4.0)), v, t, e, c);
+        // inv_logit numerically-stable branch (v ≥ 0 vs v < 0)
+        bc_vs_ast(unary("inv_logit", lit(2.5)), v, t, e, c);
+        bc_vs_ast(unary("inv_logit", lit(-2.5)), v, t, e, c);
+        bc_vs_ast(unary("expit", lit(0.0)), v, t, e, c);
+        // logit clamp `v.clamp(1e-15, 1.0 - 1e-15)`
+        bc_vs_ast(unary("logit", lit(0.3)), v, t, e, c);
+        bc_vs_ast(unary("logit", lit(0.0)), v, t, e, c);
+        bc_vs_ast(unary("logit", lit(1.0)), v, t, e, c);
+        // Unknown unary name — slow path returns the argument unchanged;
+        // the bytecode no-op'd UnaryFn arm must too.
+        bc_vs_ast(unary("expn", lit(42.0)), v, t, e, c);
+    }
+
+    #[test]
+    fn bytecode_matches_ast_on_conditional_and_logic() {
+        let v = &[];
+        let t = &[];
+        let e = &[];
+        let c = &[];
+        // Simple compare arms
+        for op in [
+            CmpOp::Lt,
+            CmpOp::Le,
+            CmpOp::Gt,
+            CmpOp::Ge,
+            CmpOp::Eq,
+            CmpOp::Ne,
+        ] {
+            bc_vs_ast(
+                cond(cmp(lit(2.0), op, lit(3.0)), lit(1.0), lit(-1.0)),
+                v,
+                t,
+                e,
+                c,
+            );
+            bc_vs_ast(
+                cond(cmp(lit(3.0), op, lit(3.0)), lit(1.0), lit(-1.0)),
+                v,
+                t,
+                e,
+                c,
+            );
+        }
+        // NaN-comparison sanity (NaN compares as false everywhere)
+        bc_vs_ast(
+            cond(
+                cmp(lit(f64::NAN), CmpOp::Eq, lit(f64::NAN)),
+                lit(1.0),
+                lit(-1.0),
+            ),
+            v,
+            t,
+            e,
+            c,
+        );
+        // And / Or / Not over compound conditions
+        bc_vs_ast(
+            cond(
+                Condition::And(
+                    Box::new(cmp(lit(1.0), CmpOp::Lt, lit(2.0))),
+                    Box::new(cmp(lit(3.0), CmpOp::Lt, lit(4.0))),
+                ),
+                lit(42.0),
+                lit(0.0),
+            ),
+            v,
+            t,
+            e,
+            c,
+        );
+        bc_vs_ast(
+            cond(
+                Condition::Or(
+                    Box::new(cmp(lit(1.0), CmpOp::Gt, lit(2.0))),
+                    Box::new(cmp(lit(3.0), CmpOp::Lt, lit(4.0))),
+                ),
+                lit(7.0),
+                lit(0.0),
+            ),
+            v,
+            t,
+            e,
+            c,
+        );
+        bc_vs_ast(
+            cond(
+                Condition::Not(Box::new(cmp(lit(1.0), CmpOp::Lt, lit(2.0)))),
+                lit(7.0),
+                lit(0.0),
+            ),
+            v,
+            t,
+            e,
+            c,
+        );
+        // Nested Conditional — exercises both then- and else-branch bytecode
+        // bookkeeping (the compute_max_stack-over-counts case).
+        let inner = cond(cmp(lit(1.0), CmpOp::Lt, lit(0.5)), lit(11.0), lit(22.0));
+        let outer = cond(
+            cmp(lit(0.0), CmpOp::Lt, lit(1.0)),
+            inner.clone(),
+            binop(BinOp::Add, lit(1.0), inner),
+        );
+        bc_vs_ast(outer, v, t, e, c);
+    }
+
+    #[test]
+    fn bytecode_matches_ast_on_nn_output_fallback() {
+        // PushNnOutput out-of-bounds falls back to 0.0 in both paths.
+        let nn_outputs: Vec<Vec<f64>> = vec![vec![1.0, 2.0, 3.0]];
+        let theta = &[];
+        let eta = &[];
+        let covs = &[];
+        let vars = &[];
+        // Valid index
+        let ast_ok = eval_expression_indexed(
+            &Expression::NnOutput {
+                nn_idx: 0,
+                output_idx: 1,
+            },
+            theta,
+            eta,
+            covs,
+            vars,
+            &nn_outputs,
+        );
+        let bc_ok = {
+            let bc = compile_bytecode(&Expression::NnOutput {
+                nn_idx: 0,
+                output_idx: 1,
+            });
+            let mut stack = Vec::new();
+            eval_bytecode(&bc, theta, eta, covs, vars, &nn_outputs, &mut stack)
+        };
+        assert_eq!(ast_ok, bc_ok);
+        assert_eq!(bc_ok, 2.0);
     }
 }

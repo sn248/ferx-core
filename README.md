@@ -4,7 +4,7 @@
 [![Slow tests](https://github.com/FeRx-NLME/ferx-core/actions/workflows/slow-tests.yml/badge.svg)](https://github.com/FeRx-NLME/ferx-core/actions/workflows/slow-tests.yml)
 [![Docs](https://github.com/FeRx-NLME/ferx-core/actions/workflows/docs.yml/badge.svg)](https://github.com/FeRx-NLME/ferx-core/actions/workflows/docs.yml)
 [![codecov](https://codecov.io/gh/FeRx-NLME/ferx-core/branch/main/graph/badge.svg)](https://codecov.io/gh/FeRx-NLME/ferx-core)
-[![License: MIT](https://img.shields.io/github/license/FeRx-NLME/ferx-core)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A high-performance Nonlinear Mixed Effects (NLME) modeling engine for population pharmacokinetics, written in Rust. Implements FOCE/FOCEI estimation with analytical PK solutions and an optional ODE solver, similar to NONMEM.
 
@@ -79,6 +79,9 @@ Set via `method` in `[fit_options]`:
 | `gn` | Gauss-Newton (BHHH) with Levenberg-Marquardt damping |
 | `gn_hybrid` | Gauss-Newton followed by FOCEI polish |
 | `saem` | Stochastic Approximation EM |
+| `imp` | Importance Sampling (typically chained after another method for OFV evaluation) |
+
+Methods can be chained (e.g. `method = saem, focei, imp`) to run sequentially.
 
 ### Optimizers
 
@@ -89,6 +92,9 @@ For FOCE/FOCEI, the outer optimizer can be set via `optimizer` in `[fit_options]
 | `slsqp` | NLopt Sequential Least Squares Programming (default) |
 | `lbfgs` | NLopt L-BFGS |
 | `mma` | NLopt Method of Moving Asymptotes |
+| `bfgs` | Built-in BFGS |
+| `bobyqa` | NLopt BOBYQA (derivative-free) |
+| `trust_region` | Newton trust-region (argmin + Steihaug CG) |
 
 ## Data Format
 

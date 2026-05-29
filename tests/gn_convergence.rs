@@ -49,9 +49,12 @@ fn warfarin_data_and_model() -> (
 ///
 /// Baseline: best observed OFV from GN-TR under the Almquist Laplace NLL
 /// (-279.1136).  SLSQP reaches -278.7336 on this dataset — GN-TR
-/// consistently finds a marginally better minimum.  Tolerance of 0.5
-/// absorbs minor run-to-run numerical variation; a regression of more
-/// than ~0.5 OFV units indicates a real algorithmic problem.  See the
+/// consistently finds a marginally better minimum (~0.38 OFV).  Tolerance
+/// of 0.25 sits comfortably below that gap, so a regression to SLSQP-level
+/// performance still fails the assert (enforcing the "GN-TR > SLSQP"
+/// invariant), while leaving ~0.24 OFV of headroom for run-to-run
+/// numerical variation (observed variation between GN-TR and GN-hybrid on
+/// this dataset is ~0.01 OFV, so 0.25 is generous).  See the
 /// module-level "Baseline history" comment for why this differs from the
 /// pre-#130 Sheiner-Beal baseline (-285.7163).
 #[test]
@@ -61,7 +64,7 @@ fn warfarin_data_and_model() -> (
 )]
 fn gn_tr_warfarin_ofv_matches_slsqp_baseline() {
     const KNOWN_GOOD_OFV: f64 = -279.1136;
-    const TOLERANCE: f64 = 0.5;
+    const TOLERANCE: f64 = 0.25;
 
     let (model, population) = warfarin_data_and_model();
 
@@ -91,7 +94,10 @@ fn gn_tr_warfarin_ofv_matches_slsqp_baseline() {
 /// must reach the known-good minimum.
 ///
 /// Baseline -279.1243: the FOCEI polish improves on pure GN-TR by ~0.01 OFV.
-/// See the module-level "Baseline history" comment for the Almquist Laplace
+/// SLSQP reaches -278.7336 (gap ~0.39 OFV).  Tolerance of 0.25 keeps the
+/// pass threshold strictly better than SLSQP, so a regression in the
+/// polish stage to SLSQP-level performance fails the assert.  See the
+/// module-level "Baseline history" comment for the Almquist Laplace
 /// shift from the pre-#130 SB baseline.
 #[test]
 #[cfg_attr(
@@ -100,7 +106,7 @@ fn gn_tr_warfarin_ofv_matches_slsqp_baseline() {
 )]
 fn gn_hybrid_tr_warfarin_ofv_matches_slsqp() {
     const KNOWN_GOOD_OFV: f64 = -279.1243;
-    const TOLERANCE: f64 = 0.5;
+    const TOLERANCE: f64 = 0.25;
 
     let (model, population) = warfarin_data_and_model();
 

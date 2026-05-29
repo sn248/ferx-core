@@ -1523,7 +1523,20 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .unwrap_or_default();
         let is_ode_model = model.ode_spec.is_some();
 
-        let (scaling, output_fn) = parse_scaling_block(
+        // Milestone 4 wiring: pass through the model's pre-computed indiv-
+        // param partials and the η-extended count so `build_y_output_fn` can
+        // produce a parallel sens closure for every Form C readout. The
+        // sens closure stays `None` unless we have BOTH a non-empty indiv-
+        // param block (partials available) AND a Form C readout (which only
+        // appears on ODE models).
+        let partials_for_scaling = &model.indiv_param_partials;
+        let n_eta_for_scaling = model
+            .ode_spec
+            .as_ref()
+            .map(|s| s.n_eta_for_sens)
+            .unwrap_or(0);
+
+        let (scaling, output_fn, output_sens_fn) = parse_scaling_block(
             scaling_lines,
             &theta_names_for_scaling,
             &eta_names_for_scaling,
@@ -1532,6 +1545,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &state_names_for_scaling,
             is_ode_model,
             &model.kappa_names,
+            Some(partials_for_scaling),
+            n_eta_for_scaling,
         )?;
 
         // AD compatibility check (Phase 2.5):
@@ -1579,6 +1594,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         if let Some(new_readout) = output_fn {
             let ode_spec = model.ode_spec.as_mut().expect("guarded by is_ode_model");
             ode_spec.readout = new_readout;
+            // Milestone 4: install the matching sens readout if the
+            // builder produced one. Shape parity (Single ↔ Single,
+            // PerCmt ↔ PerCmt) is guaranteed by `parse_scaling_block`'s
+            // accumulation logic.
+            ode_spec.readout_sensitivity = output_sens_fn;
         }
 
         model.scaling = scaling;
@@ -2177,6 +2197,13 @@ fn build_obs_scale_spec(
 
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
 /// the uniform and per-CMT paths.
+/// Output of [`build_y_output_fn`]: the primary `OdeOutputFn` (always
+/// populated for a Form C readout) plus an optional
+/// `OdeOutputSensFn` that evaluates `∂y/∂η_k` at the augmented state for
+/// every η in `0..n_eta_extended`. The sens closure is `None` when
+/// `indiv_param_partials` is `None` or `n_eta_extended == 0`.
+type YOutputBundle = (crate::ode::OdeOutputFn, Option<crate::ode::OdeOutputSensFn>);
+
 fn build_y_output_fn(
     value: &str,
     theta_names: &[String],
@@ -2185,7 +2212,9 @@ fn build_y_output_fn(
     pk_indices: &[usize],
     state_names: &[String],
     kappa_names: &[String],
-) -> Result<crate::ode::OdeOutputFn, String> {
+    indiv_param_partials: Option<&IndivParamPartials>,
+    n_eta_extended: usize,
+) -> Result<YOutputBundle, String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
     let mut defined: Vec<String> = state_names.to_vec();
@@ -2270,6 +2299,19 @@ fn build_y_output_fn(
     // op-tag loop rather than a recursive `Box<Expression>` walk.
     let mut expr = expr;
     resolve_expr_indices(&mut expr, &var_idx, &cov_idx);
+    // Keep the resolved-form Expression around for milestone-4 sensitivity
+    // codegen — the differentiator needs `VariableIdx`/`CovariateIdx` leaves
+    // and re-resolving a clone would duplicate the slot-lookup work. Clone
+    // before bytecode compile so the primary bytecode build stays
+    // single-pass.
+    let resolved_expr_for_sens = expr.clone();
+    // Milestone 4 — clone the captured-into-closure plans NOW, before the
+    // primary `out_fn` closure consumes them by move. The sens closure
+    // built below captures the clones (same plan, same alignment as the
+    // primary), so both closures see the same indiv → pk-slot mapping and
+    // the same covariate name ordering.
+    let sens_indiv_to_pk = indiv_to_pk.clone();
+    let sens_cov_names = cov_names.clone();
     let bc = compile_bytecode(&expr);
 
     // Per-thread scratch for the y readout vars + covariate slice + bytecode
@@ -2333,7 +2375,121 @@ fn build_y_output_fn(
             })
         },
     );
-    Ok(out_fn)
+
+    // ─── Milestone 4: Form C readout sensitivities ──────────────────────
+    //
+    // For each η axis k, build a bytecode that evaluates ∂y/∂η_k at the
+    // augmented state. Chain context:
+    //   state slot s ∈ [0, n_states)            → VariableIdx(sens slot for (s, k))
+    //   indiv slot p ∈ [n_states, n_states+n_indiv) → milestone-2 partial
+    //                                               (remapped from pk-space)
+    // Form C has no ODE-block intermediates, so the chain map needs nothing else.
+    //
+    // The sens closure shares the y_vars / y_cov / bc_stack scratch with the
+    // primary closure. y_vars is resized to `n_vars_total + n_eta·n_states`
+    // to hold sens-state values at the tail.
+    let sens_fn: Option<crate::ode::OdeOutputSensFn> = match (indiv_param_partials, n_eta_extended)
+    {
+        (Some(partials), n_eta) if n_eta > 0 => {
+            // Per-η chain context. Inserted ONCE here; the closure body
+            // doesn't recompute these maps.
+            let mut sens_bcs: Vec<Bytecode> = Vec::with_capacity(n_eta);
+            for k in 0..n_eta {
+                let mut chain: HashMap<usize, Expression> = HashMap::with_capacity(n_vars_total);
+                // ∂(state j)/∂η_k = sens-state slot in the y_vars scratch.
+                for s in 0..n_states {
+                    chain.insert(s, Expression::VariableIdx(n_vars_total + k * n_states + s));
+                }
+                // ∂(indiv param i)/∂η_k = milestone-2 partial, remapped
+                // from pk-param var space to Form-C var space (which uses
+                // the same "states then indiv" layout as the ODE block).
+                for i in 0..n_indiv {
+                    if i < partials.d_d_eta.len() && k < partials.d_d_eta[i].len() {
+                        let p = &partials.d_d_eta[i][k];
+                        let remapped = remap_pk_to_ode_slots(p, n_indiv, n_states);
+                        chain.insert(n_states + i, remapped);
+                    }
+                }
+                let d = differentiate_with_chain(&resolved_expr_for_sens, DiffAxis::Eta(k), &chain);
+                let simplified = simplify_expr(&d);
+                sens_bcs.push(compile_bytecode(&simplified));
+            }
+            let sens_n_cov = n_cov;
+            let sens_n_states = n_states;
+            let sens_n_vars_total = n_vars_total;
+            let sens_n_eta = n_eta;
+            Some(Box::new(
+                move |state_aug: &[f64],
+                      pk_params_flat: &[f64],
+                      theta: &[f64],
+                      eta: &[f64],
+                      covariates: &HashMap<String, f64>,
+                      out: &mut [f64]| {
+                    debug_assert!(
+                        state_aug.len() >= sens_n_states * (1 + sens_n_eta),
+                        "sens readout: state_aug too short ({} < {})",
+                        state_aug.len(),
+                        sens_n_states * (1 + sens_n_eta),
+                    );
+                    debug_assert!(
+                        out.len() >= sens_n_eta,
+                        "sens readout: out too short ({} < {})",
+                        out.len(),
+                        sens_n_eta,
+                    );
+                    FERX_SCRATCH.with(|cell| {
+                        let mut s = cell.borrow_mut();
+                        let scratch = &mut *s;
+                        let vars_size = sens_n_vars_total + sens_n_eta * sens_n_states;
+                        scratch.y_vars.clear();
+                        scratch.y_vars.resize(vars_size, 0.0);
+                        // States from state_aug[0..n_states].
+                        scratch.y_vars[..sens_n_states]
+                            .copy_from_slice(&state_aug[..sens_n_states]);
+                        // Indiv params from pk_params_flat.
+                        for (i, &pk_slot) in sens_indiv_to_pk.iter().enumerate() {
+                            if let (Some(dst), Some(&val)) = (
+                                scratch.y_vars.get_mut(sens_n_states + i),
+                                pk_params_flat.get(pk_slot),
+                            ) {
+                                *dst = val;
+                            }
+                        }
+                        // Sens states from state_aug[n_states..] into the
+                        // tail of y_vars at sens_n_vars_total.
+                        let sens_count = sens_n_eta * sens_n_states;
+                        scratch.y_vars[sens_n_vars_total..sens_n_vars_total + sens_count]
+                            .copy_from_slice(&state_aug[sens_n_states..sens_n_states + sens_count]);
+                        // Covariates.
+                        scratch.y_cov.clear();
+                        if sens_n_cov > 0 {
+                            scratch.y_cov.resize(sens_n_cov, 0.0);
+                            for (i, name) in sens_cov_names.iter().enumerate() {
+                                if let Some(&v) = covariates.get(name) {
+                                    scratch.y_cov[i] = v;
+                                }
+                            }
+                        }
+                        let empty_nn: Vec<Vec<f64>> = Vec::new();
+                        for (k, bc) in sens_bcs.iter().enumerate() {
+                            out[k] = eval_bytecode(
+                                bc,
+                                theta,
+                                eta,
+                                &scratch.y_cov,
+                                &scratch.y_vars,
+                                &empty_nn,
+                                &mut scratch.bc_stack,
+                            );
+                        }
+                    });
+                },
+            ))
+        }
+        _ => None,
+    };
+
+    Ok((out_fn, sens_fn))
 }
 
 /// Parsed contents of a `[scaling]` block.
@@ -2371,7 +2527,16 @@ fn parse_scaling_block(
     state_names: &[String],
     is_ode: bool,
     kappa_names: &[String],
-) -> Result<(ScalingSpec, Option<crate::ode::OdeReadout>), String> {
+    indiv_param_partials: Option<&IndivParamPartials>,
+    n_eta_extended: usize,
+) -> Result<
+    (
+        ScalingSpec,
+        Option<crate::ode::OdeReadout>,
+        Option<crate::ode::OdeReadoutSens>,
+    ),
+    String,
+> {
     // Accumulate uniform and per-CMT entries separately, then assemble at
     // the end. Mixing the two forms within the same group (obs_scale or y)
     // is rejected — keeps the semantic clean and matches NONMEM's
@@ -2380,6 +2545,11 @@ fn parse_scaling_block(
     let mut obs_scale_per_cmt: HashMap<usize, ScalingSpec> = HashMap::new();
     let mut y_uniform: Option<crate::ode::OdeOutputFn> = None;
     let mut y_per_cmt: HashMap<usize, crate::ode::OdeOutputFn> = HashMap::new();
+    // Milestone 4: parallel sens-readout collectors. Same Single / PerCmt
+    // shape as the primary; populated only when build_y_output_fn returns
+    // Some sens closure.
+    let mut y_uniform_sens: Option<crate::ode::OdeOutputSensFn> = None;
+    let mut y_per_cmt_sens: HashMap<usize, crate::ode::OdeOutputSensFn> = HashMap::new();
 
     for line in lines {
         let trimmed = line.trim();
@@ -2459,7 +2629,7 @@ fn parse_scaling_block(
                          use `obs_scale = <expr>` for analytical PK"
                         .into());
                 }
-                let out_fn = build_y_output_fn(
+                let (out_fn, out_sens_fn) = build_y_output_fn(
                     value,
                     theta_names,
                     eta_names,
@@ -2467,6 +2637,8 @@ fn parse_scaling_block(
                     pk_indices,
                     state_names,
                     kappa_names,
+                    indiv_param_partials,
+                    n_eta_extended,
                 )?;
                 match cmt_opt {
                     None => {
@@ -2479,6 +2651,7 @@ fn parse_scaling_block(
                                 .into());
                         }
                         y_uniform = Some(out_fn);
+                        y_uniform_sens = out_sens_fn;
                     }
                     Some(cmt) => {
                         if y_uniform.is_some() {
@@ -2490,6 +2663,9 @@ fn parse_scaling_block(
                             return Err(format!("[scaling]: duplicate `y[CMT={}]` key", cmt));
                         }
                         y_per_cmt.insert(cmt, out_fn);
+                        if let Some(s) = out_sens_fn {
+                            y_per_cmt_sens.insert(cmt, s);
+                        }
                     }
                 }
             }
@@ -2513,7 +2689,18 @@ fn parse_scaling_block(
     } else {
         None
     };
-    Ok((scaling, readout))
+    // Milestone 4: parallel sens readout assembly. Shape must match the
+    // primary `readout` — Single ↔ Single, PerCmt ↔ PerCmt. When the
+    // builder returned `None` for all sens closures (no indiv-param η
+    // dependence, or n_eta == 0), the sens readout stays `None` too.
+    let readout_sensitivity = if let Some(f) = y_uniform_sens {
+        Some(crate::ode::OdeReadoutSens::Single(f))
+    } else if !y_per_cmt_sens.is_empty() {
+        Some(crate::ode::OdeReadoutSens::PerCmt(y_per_cmt_sens))
+    } else {
+        None
+    };
+    Ok((scaling, readout, readout_sensitivity))
 }
 
 // ── [structural_model] ODE variant parser ───────────────────────────────────
@@ -3358,6 +3545,7 @@ fn build_ode_spec(
             n_states,
             state_names: state_names.to_vec(),
             readout: crate::ode::OdeReadout::ObsCmt(obs_cmt_idx),
+            readout_sensitivity: None,
             diffusion_var: Vec::new(),
             init_fn,
         },
@@ -13069,6 +13257,235 @@ if (1 > 0) {
                 "augmented state[{j}] diverges from original: aug={} ref={}",
                 u_t[j],
                 sol_ref[0].u[j],
+            );
+        }
+    }
+
+    // --- Milestone 4: Form C readout sensitivities ∂y/∂η_k ---
+    //
+    // Two tests, mirroring the milestone-3 split:
+    //   1. snapshot — eval sens readout at a fixed (state, η) snapshot with
+    //      sens-states = 0 and compare to central FD on the primary readout.
+    //   2. end-to-end — integrate the augmented system, eval the sens
+    //      readout at the integrated augmented state, compare to FD on
+    //      the original Form C primary readout re-evaluated with η±h
+    //      and the original ODE re-integrated.
+    //
+    // Both use a Form C PerCmt model — `y[CMT=2] = central/V` — which is the
+    // canonical shape from the experiment's Emax PKPD model and exercises
+    // both the indiv-param chain (∂(central/V)/∂η_V chains through ∂V/∂η_V)
+    // AND the state chain (∂(central/V)/∂η_CL chains through ∂central/∂η_CL).
+
+    fn make_emax_pkpd_form_c_model() -> crate::types::CompiledModel {
+        // Same 1cpt-IV + effect-compartment structure as
+        // `make_emax_pkpd_model`, but readout via Form C `y[CMT=2]` so the
+        // sens-readout codegen path is exercised. CMT=2 is the central
+        // compartment (1-based in NONMEM, which is how Form C keys it).
+        let model_str = "
+[parameters]
+  theta TVCL(5.0)
+  theta TVV(30.0)
+  theta TVKA(1.0)
+  theta TVKE0(0.5)
+  omega ETA_CL  ~ 0.09
+  omega ETA_V   ~ 0.09
+  omega ETA_KE0 ~ 0.16
+  sigma EPS ~ 0.04
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  KA  = TVKA
+  KE0 = TVKE0 * exp(ETA_KE0)
+
+[structural_model]
+  ode(states=[depot, central, effect])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - CL/V * central
+  d/dt(effect)  =  KE0 * (central/V - effect)
+
+[scaling]
+  y[CMT=2] = central / V
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        super::parse_full_model(model_str).unwrap().model
+    }
+
+    #[test]
+    fn form_c_sens_readout_present_for_emax_pkpd() {
+        // Sanity: the sens-readout enum lines up with the primary, the
+        // model is a PerCmt with the right CMT key, and the sens closure
+        // is actually populated.
+        let m = make_emax_pkpd_form_c_model();
+        let ode = m.ode_spec.as_ref().expect("ODE model");
+        let readout = &ode.readout;
+        let sens = ode
+            .readout_sensitivity
+            .as_ref()
+            .expect("Form C readout has indiv-param η dependence → sens present");
+        assert!(matches!(readout, crate::ode::OdeReadout::PerCmt(_)));
+        match sens {
+            crate::ode::OdeReadoutSens::PerCmt(map) => {
+                assert!(map.contains_key(&2), "CMT=2 sens present");
+            }
+            crate::ode::OdeReadoutSens::Single(_) => {
+                panic!("PerCmt primary requires PerCmt sens — shape mismatch")
+            }
+        }
+    }
+
+    #[test]
+    fn form_c_sens_readout_matches_fd_at_snapshot() {
+        // Snapshot test: at fixed (state, θ, η) with sens-state = 0, the
+        // sens readout closure should match central FD on
+        // `pk_param_fn(θ, η±h)` → primary readout (which re-evaluates with
+        // perturbed indiv params).
+        let m = make_emax_pkpd_form_c_model();
+        let ode = m.ode_spec.as_ref().unwrap();
+        let n_states = ode.n_states;
+        let n_eta = ode.n_eta_for_sens;
+
+        let theta = vec![5.0, 30.0, 1.0, 0.5];
+        let eta = vec![0.1, -0.2, 0.15];
+        let cov: HashMap<String, f64> = HashMap::new();
+        let u = vec![80.0_f64, 25.0, 0.5]; // depot, central, effect
+        let pk = (m.pk_param_fn)(&theta, &eta, &cov);
+
+        // Augmented state: original states + 3·3 sens slots, all zero
+        // (snapshot — pre-integration).
+        let mut state_aug = vec![0.0_f64; n_states * (1 + n_eta)];
+        state_aug[..n_states].copy_from_slice(&u);
+
+        // Extract the sens closure for CMT=2.
+        let sens_map = match ode.readout_sensitivity.as_ref().unwrap() {
+            crate::ode::OdeReadoutSens::PerCmt(m) => m,
+            _ => panic!("expected PerCmt sens"),
+        };
+        let sens_fn = sens_map.get(&2).expect("CMT=2 sens");
+
+        // Evaluate sens.
+        let mut out = vec![0.0_f64; n_eta];
+        sens_fn(&state_aug, &pk.values, &theta, &eta, &cov, &mut out);
+
+        // FD reference: perturb η, re-evaluate primary readout, diff.
+        let primary_fn = match &ode.readout {
+            crate::ode::OdeReadout::PerCmt(map) => map.get(&2).unwrap(),
+            _ => panic!("expected PerCmt primary"),
+        };
+        let h = 1e-6_f64;
+        for k in 0..n_eta {
+            let mut ep = eta.clone();
+            let mut em = eta.clone();
+            ep[k] += h;
+            em[k] -= h;
+            let pk_plus = (m.pk_param_fn)(&theta, &ep, &cov);
+            let pk_minus = (m.pk_param_fn)(&theta, &em, &cov);
+            let y_plus = primary_fn(&u, &pk_plus.values, &theta, &ep, &cov);
+            let y_minus = primary_fn(&u, &pk_minus.values, &theta, &em, &cov);
+            let fd = (y_plus - y_minus) / (2.0 * h);
+            let sym = out[k];
+            let tol = 1e-6 * sym.abs().max(fd.abs()).max(1e-6);
+            assert!(
+                (sym - fd).abs() < tol,
+                "∂y/∂η_{k} at snapshot: sym={sym} fd={fd} tol={tol:.2e}",
+            );
+        }
+    }
+
+    #[test]
+    fn form_c_sens_readout_augmented_integration_matches_fd() {
+        // End-to-end: integrate augmented ODE, evaluate sens readout at the
+        // integrated augmented state, compare to FD on the primary readout
+        // path (re-integrate original ODE with η±h, evaluate primary
+        // readout at the new states + perturbed indiv params).
+        let m = make_emax_pkpd_form_c_model();
+        let ode = m.ode_spec.as_ref().unwrap();
+        let aug_rhs = ode
+            .rhs_augmented
+            .as_ref()
+            .expect("milestone-3 augmented RHS");
+        let n_states = ode.n_states;
+        let n_eta = ode.n_eta_for_sens;
+
+        let theta = vec![5.0, 30.0, 1.0, 0.5];
+        let eta = vec![0.1, -0.2, 0.15];
+        let cov: HashMap<String, f64> = HashMap::new();
+        let pk = (m.pk_param_fn)(&theta, &eta, &cov);
+
+        // 100 mg bolus → depot.
+        let mut u0_aug = vec![0.0_f64; n_states * (1 + n_eta)];
+        u0_aug[0] = 100.0;
+
+        let theta_cap = theta.clone();
+        let eta_cap = eta.clone();
+        let aug_wrapper = move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+            (aug_rhs)(y, &theta_cap, &eta_cap, p, t, dy);
+        };
+        let opts = crate::ode::OdeSolverOptions {
+            abstol: 1e-10,
+            reltol: 1e-10,
+            ..crate::ode::OdeSolverOptions::default()
+        };
+        let sol =
+            crate::ode::solve_ode(&aug_wrapper, &u0_aug, (0.0, 4.0), &pk.values, &[4.0], &opts);
+        let u_aug = &sol[0].u;
+
+        // Eval sens readout at the integrated augmented state.
+        let sens_map = match ode.readout_sensitivity.as_ref().unwrap() {
+            crate::ode::OdeReadoutSens::PerCmt(m) => m,
+            _ => panic!("expected PerCmt sens"),
+        };
+        let sens_fn = sens_map.get(&2).expect("CMT=2 sens present");
+        let mut out = vec![0.0_f64; n_eta];
+        sens_fn(u_aug, &pk.values, &theta, &eta, &cov, &mut out);
+
+        // FD reference: re-integrate original ODE with η perturbed, then
+        // evaluate primary Form C readout at the new states + perturbed
+        // indiv params + perturbed η.
+        let primary_fn = match &ode.readout {
+            crate::ode::OdeReadout::PerCmt(map) => map.get(&2).unwrap(),
+            _ => panic!("expected PerCmt primary"),
+        };
+        let h = 1e-5_f64;
+        for k in 0..n_eta {
+            let mut ep = eta.clone();
+            let mut em = eta.clone();
+            ep[k] += h;
+            em[k] -= h;
+            let pk_plus = (m.pk_param_fn)(&theta, &ep, &cov);
+            let pk_minus = (m.pk_param_fn)(&theta, &em, &cov);
+            let mut u0_compact = vec![0.0_f64; n_states];
+            u0_compact[0] = 100.0;
+            let sol_plus = crate::ode::solve_ode(
+                &ode.rhs,
+                &u0_compact,
+                (0.0, 4.0),
+                &pk_plus.values,
+                &[4.0],
+                &opts,
+            );
+            let sol_minus = crate::ode::solve_ode(
+                &ode.rhs,
+                &u0_compact,
+                (0.0, 4.0),
+                &pk_minus.values,
+                &[4.0],
+                &opts,
+            );
+            let y_plus = primary_fn(&sol_plus[0].u, &pk_plus.values, &theta, &ep, &cov);
+            let y_minus = primary_fn(&sol_minus[0].u, &pk_minus.values, &theta, &em, &cov);
+            let fd = (y_plus - y_minus) / (2.0 * h);
+            let sym = out[k];
+            let tol = 3e-3 * sym.abs().max(fd.abs()).max(1e-6);
+            assert!(
+                (sym - fd).abs() < tol,
+                "∂y/∂η_{k} (end-to-end): sym={sym} fd={fd} tol={tol:.2e} \
+                 (|Δ|={:.2e})",
+                (sym - fd).abs(),
             );
         }
     }

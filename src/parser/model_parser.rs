@@ -4250,7 +4250,7 @@ enum Expression {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BinOp {
     Add,
     Sub,
@@ -5468,6 +5468,278 @@ fn resolve_condition_indices(
             resolve_condition_indices(r, var_idx, cov_idx);
         }
         Condition::Not(c) => resolve_condition_indices(c, var_idx, cov_idx),
+    }
+}
+
+// ─── Symbolic AST differentiation ──────────────────────────────────────────
+//
+// Pure function `differentiate(expr, axis)` returning the partial derivative
+// of `expr` with respect to one of three axes: a θ slot, an η slot, or an
+// already-resolved variable slot (used when chain-ruling through ODE-block
+// intermediates whose own sensitivities have been precomputed and live in
+// the variable slot pool). This is milestone 1 of the Tier 4a sensitivity-
+// ODE work tracked in issue #134 — the AST-level primitive everything
+// else (param-block partials, augmented-ODE codegen, Form C readout
+// sensitivities) will compose on top.
+//
+// The differentiator handles every Expression variant the parser emits:
+//   Literal                : ∂c/∂x      = 0
+//   Theta(k)               : ∂θ_k/∂θ_j  = δ_{k,j}; 0 against η / Var axis
+//   Eta(k)                 : ∂η_k/∂η_j  = δ_{k,j}; 0 against θ / Var axis
+//   VariableIdx(k)         : ∂v_k/∂v_j  = δ_{k,j}; 0 against θ / η axis
+//   Covariate*, NnOutput   : treated as constants (0)
+//   BinOp(+,-)             : linearity
+//   BinOp(*)               : product rule  L'·R + L·R'
+//   BinOp(/)               : quotient rule (L'·R − L·R') / R²
+//   UnaryFn("exp", a)      : exp(a) · a'
+//   UnaryFn("log"|"ln", a) : a' / a
+//   UnaryFn("sqrt", a)     : a' / (2·sqrt(a))
+//   UnaryFn("abs", a)      : if a ≥ 0 then a' else −a' (boundary undefined)
+//   UnaryFn("inv_logit"|"expit", a) : inv_logit(a) · (1 − inv_logit(a)) · a'
+//   UnaryFn("logit", a)    : a' / (a · (1 − a))
+//   UnaryFn(unknown, a)    : a' (mirrors the slow path's identity fallthrough)
+//   Power(b, e)            : b^e · (e'·ln(b) + e · b'/b)  (general; subsumes
+//                            both constant-base and constant-exponent cases)
+//   Conditional(c, t, e)   : Conditional(c, t', e')   (boundary discontinuity
+//                            ignored — standard AD convention)
+//
+// Returned expressions are NOT simplified — the bytecode compiler's
+// constant pool happily absorbs `0 + x` / `1 * x` slack, and keeping
+// `differentiate` purely mechanical makes the result reviewable as the
+// raw chain-rule output. A separate `simplify_expr` helper is provided
+// for callers (e.g. test output formatting) that want a tidier tree.
+//
+// Unresolved `Variable(name)` / `Covariate(name)` nodes panic — every
+// caller in the sensitivity pipeline runs `resolve_expr_indices` first.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffAxis {
+    /// `θ_idx` — a fixed-effect (population) parameter slot.
+    Theta(usize),
+    /// `η_idx` — a random-effect slot.
+    Eta(usize),
+    /// `v_idx` — an already-resolved variable slot. Used for chain-ruling
+    /// into ODE-block intermediates whose own sensitivities are precomputed
+    /// and live in the variable pool.
+    Variable(usize),
+}
+
+fn differentiate(expr: &Expression, axis: DiffAxis) -> Expression {
+    // Local helpers — avoid `use BinOp::*` because `Expression::BinOp` is a
+    // variant with the same name and would create a glob-import ambiguity.
+    let mul =
+        |l: Expression, r: Expression| Expression::BinOp(Box::new(l), BinOp::Mul, Box::new(r));
+    let add =
+        |l: Expression, r: Expression| Expression::BinOp(Box::new(l), BinOp::Add, Box::new(r));
+    let sub =
+        |l: Expression, r: Expression| Expression::BinOp(Box::new(l), BinOp::Sub, Box::new(r));
+    let div =
+        |l: Expression, r: Expression| Expression::BinOp(Box::new(l), BinOp::Div, Box::new(r));
+    let kron = |slot: usize, target: usize| -> Expression {
+        if slot == target {
+            Expression::Literal(1.0)
+        } else {
+            Expression::Literal(0.0)
+        }
+    };
+    match expr {
+        Expression::Literal(_) => Expression::Literal(0.0),
+        Expression::Theta(k) => match axis {
+            DiffAxis::Theta(j) => kron(*k, j),
+            _ => Expression::Literal(0.0),
+        },
+        Expression::Eta(k) => match axis {
+            DiffAxis::Eta(j) => kron(*k, j),
+            _ => Expression::Literal(0.0),
+        },
+        Expression::VariableIdx(k) => match axis {
+            DiffAxis::Variable(j) => kron(*k, j),
+            _ => Expression::Literal(0.0),
+        },
+        Expression::CovariateIdx(_) | Expression::NnOutput { .. } => Expression::Literal(0.0),
+        Expression::Variable(name) | Expression::Covariate(name) => panic!(
+            "differentiate: unresolved AST node `{name}` reached the \
+             differentiator; resolve_expr_indices must run first",
+        ),
+        Expression::BinOp(l, op, r) => match op {
+            BinOp::Add | BinOp::Sub => Expression::BinOp(
+                Box::new(differentiate(l, axis)),
+                *op,
+                Box::new(differentiate(r, axis)),
+            ),
+            BinOp::Mul => {
+                // L'·R + L·R'
+                let dl = differentiate(l, axis);
+                let dr = differentiate(r, axis);
+                add(mul(dl, (**r).clone()), mul((**l).clone(), dr))
+            }
+            BinOp::Div => {
+                // (L'·R − L·R') / R²
+                let dl = differentiate(l, axis);
+                let dr = differentiate(r, axis);
+                let num = sub(mul(dl, (**r).clone()), mul((**l).clone(), dr));
+                let denom = mul((**r).clone(), (**r).clone());
+                div(num, denom)
+            }
+        },
+        Expression::UnaryFn(name, arg) => {
+            let da = differentiate(arg, axis);
+            match name.as_str() {
+                "exp" => {
+                    // exp(a) · a'
+                    mul(Expression::UnaryFn("exp".into(), arg.clone()), da)
+                }
+                "log" | "ln" => {
+                    // a' / a
+                    div(da, (**arg).clone())
+                }
+                "sqrt" => {
+                    // a' / (2·sqrt(a))
+                    let two_sqrt = mul(
+                        Expression::Literal(2.0),
+                        Expression::UnaryFn("sqrt".into(), arg.clone()),
+                    );
+                    div(da, two_sqrt)
+                }
+                "abs" => {
+                    // if a ≥ 0 then a' else −a'
+                    let neg_da = sub(Expression::Literal(0.0), da.clone());
+                    Expression::Conditional(
+                        Box::new(Condition::Compare(
+                            (**arg).clone(),
+                            CmpOp::Ge,
+                            Expression::Literal(0.0),
+                        )),
+                        Box::new(da),
+                        Box::new(neg_da),
+                    )
+                }
+                "inv_logit" | "expit" => {
+                    // s · (1 − s) · a'   where s = inv_logit(a)
+                    let s = Expression::UnaryFn("inv_logit".into(), arg.clone());
+                    let one_minus_s = sub(Expression::Literal(1.0), s.clone());
+                    mul(mul(s, one_minus_s), da)
+                }
+                "logit" => {
+                    // a' / (a · (1 − a))
+                    let one_minus_a = sub(Expression::Literal(1.0), (**arg).clone());
+                    let denom = mul((**arg).clone(), one_minus_a);
+                    div(da, denom)
+                }
+                _ => {
+                    // Unknown name — the slow path returns the argument
+                    // unchanged, so the derivative is its argument's
+                    // derivative. (See `eval_expression_indexed`'s
+                    // `_ => v` fallthrough.)
+                    da
+                }
+            }
+        }
+        Expression::Power(b, e) => {
+            // d/dx (b^e) = b^e · (e' · ln(b) + e · b' / b)
+            // This subsumes the constant-base and constant-exponent cases:
+            // a Literal exponent has e' = 0 so the e'·ln(b) term vanishes,
+            // leaving b^e · e · b'/b = e · b^(e-1) · b' after `simplify_expr`
+            // (or bytecode constant folding); a Literal base has b' = 0 so
+            // the second term vanishes.
+            let db = differentiate(b, axis);
+            let de = differentiate(e, axis);
+            let pow = Expression::Power(b.clone(), e.clone());
+            let term_e = mul(de, Expression::UnaryFn("ln".into(), b.clone()));
+            let term_b = mul((**e).clone(), div(db, (**b).clone()));
+            let bracket = add(term_e, term_b);
+            mul(pow, bracket)
+        }
+        Expression::Conditional(c, t, e) => {
+            // Boundary discontinuity ignored — standard AD convention.
+            // Away from the discontinuity, the derivative is whichever
+            // branch's derivative the condition selects.
+            Expression::Conditional(
+                c.clone(),
+                Box::new(differentiate(t, axis)),
+                Box::new(differentiate(e, axis)),
+            )
+        }
+    }
+}
+
+/// Optional cosmetic simplification — drops obviously-zero terms in
+/// `differentiate`'s output so the tree printed for debugging or compiled
+/// into bytecode is tidy. NOT required for correctness: bytecode constant
+/// folding (and the eventual `eval_bytecode` runtime arithmetic) would
+/// produce the same value either way.
+///
+/// Applied rules: `0 + x` → `x`, `x + 0` → `x`, `0 - x` → `-x` (kept as
+/// `0 - x`), `x - 0` → `x`, `0 * x` → `0`, `x * 0` → `0`, `1 * x` → `x`,
+/// `x * 1` → `x`, `0 / x` → `0`. The simplifier is intentionally shallow —
+/// no constant folding across nested BinOps, no algebraic identities like
+/// `x * x` → `x^2`. The point is just to keep `differentiate`'s mechanical
+/// output readable for tests; a full algebraic simplifier is out of scope.
+#[allow(dead_code)] // milestones 2-5 will exercise this
+fn simplify_expr(expr: &Expression) -> Expression {
+    let is_lit = |e: &Expression, v: f64| matches!(e, Expression::Literal(x) if *x == v);
+    match expr {
+        Expression::BinOp(l, op, r) => {
+            let l = simplify_expr(l);
+            let r = simplify_expr(r);
+            match op {
+                BinOp::Add => {
+                    if is_lit(&l, 0.0) {
+                        r
+                    } else if is_lit(&r, 0.0) {
+                        l
+                    } else {
+                        Expression::BinOp(Box::new(l), *op, Box::new(r))
+                    }
+                }
+                BinOp::Sub => {
+                    if is_lit(&r, 0.0) {
+                        l
+                    } else {
+                        Expression::BinOp(Box::new(l), *op, Box::new(r))
+                    }
+                }
+                BinOp::Mul => {
+                    if is_lit(&l, 0.0) || is_lit(&r, 0.0) {
+                        Expression::Literal(0.0)
+                    } else if is_lit(&l, 1.0) {
+                        r
+                    } else if is_lit(&r, 1.0) {
+                        l
+                    } else {
+                        Expression::BinOp(Box::new(l), *op, Box::new(r))
+                    }
+                }
+                BinOp::Div => {
+                    if is_lit(&l, 0.0) {
+                        Expression::Literal(0.0)
+                    } else if is_lit(&r, 1.0) {
+                        l
+                    } else {
+                        Expression::BinOp(Box::new(l), *op, Box::new(r))
+                    }
+                }
+            }
+        }
+        Expression::UnaryFn(name, arg) => {
+            Expression::UnaryFn(name.clone(), Box::new(simplify_expr(arg)))
+        }
+        Expression::Power(b, e) => {
+            Expression::Power(Box::new(simplify_expr(b)), Box::new(simplify_expr(e)))
+        }
+        Expression::Conditional(c, t, e) => Expression::Conditional(
+            c.clone(),
+            Box::new(simplify_expr(t)),
+            Box::new(simplify_expr(e)),
+        ),
+        Expression::Literal(_)
+        | Expression::Theta(_)
+        | Expression::Eta(_)
+        | Expression::Variable(_)
+        | Expression::VariableIdx(_)
+        | Expression::Covariate(_)
+        | Expression::CovariateIdx(_)
+        | Expression::NnOutput { .. } => expr.clone(),
     }
 }
 
@@ -11041,5 +11313,403 @@ if (1 > 0) {
         };
         assert_eq!(ast_ok, bc_ok);
         assert_eq!(bc_ok, 2.0);
+    }
+
+    // ── Symbolic AST differentiator ─────────────────────────────────────────
+    //
+    // Verifies `differentiate(expr, axis)` against central finite differences
+    // on `eval_expression_indexed`. The tolerance reflects FD's noise floor:
+    // central FD with h = 1e-5 on a smooth expression gives ~h² ≈ 1e-10
+    // truncation error, so any disagreement larger than ~1e-7 relative
+    // (multiplied by max(|f(x+h)|, |f(x-h)|, 1) for scale) is a real bug.
+
+    /// Evaluate an Expression at the given (theta, eta, vars, covs) point.
+    fn eval_at(expr: &Expression, theta: &[f64], eta: &[f64], vars: &[f64], covs: &[f64]) -> f64 {
+        let nn: Vec<Vec<f64>> = Vec::new();
+        eval_expression_indexed(expr, theta, eta, covs, vars, &nn)
+    }
+
+    /// Central finite-difference of `expr` along `axis` at the given point.
+    /// Caller mutates the point's slot for the axis to compute f(x±h); we
+    /// take a vec for each slice and indirect the mutation.
+    fn fd_along(
+        expr: &Expression,
+        axis: DiffAxis,
+        theta: &[f64],
+        eta: &[f64],
+        vars: &[f64],
+        covs: &[f64],
+    ) -> f64 {
+        let h = 1e-5;
+        let plus = |slot: usize, base: &[f64]| -> Vec<f64> {
+            let mut v = base.to_vec();
+            v[slot] += h;
+            v
+        };
+        let minus = |slot: usize, base: &[f64]| -> Vec<f64> {
+            let mut v = base.to_vec();
+            v[slot] -= h;
+            v
+        };
+        let (fp, fm) = match axis {
+            DiffAxis::Theta(k) => {
+                let tp = plus(k, theta);
+                let tm = minus(k, theta);
+                (
+                    eval_at(expr, &tp, eta, vars, covs),
+                    eval_at(expr, &tm, eta, vars, covs),
+                )
+            }
+            DiffAxis::Eta(k) => {
+                let ep = plus(k, eta);
+                let em = minus(k, eta);
+                (
+                    eval_at(expr, theta, &ep, vars, covs),
+                    eval_at(expr, theta, &em, vars, covs),
+                )
+            }
+            DiffAxis::Variable(k) => {
+                let vp = plus(k, vars);
+                let vm = minus(k, vars);
+                (
+                    eval_at(expr, theta, eta, &vp, covs),
+                    eval_at(expr, theta, eta, &vm, covs),
+                )
+            }
+        };
+        (fp - fm) / (2.0 * h)
+    }
+
+    /// Assert that the symbolic derivative matches central FD to ~FD-noise
+    /// tolerance.
+    fn assert_diff_matches_fd(
+        expr: Expression,
+        axis: DiffAxis,
+        theta: &[f64],
+        eta: &[f64],
+        vars: &[f64],
+        covs: &[f64],
+    ) {
+        let dexpr = differentiate(&expr, axis);
+        let sym = eval_at(&dexpr, theta, eta, vars, covs);
+        let num = fd_along(&expr, axis, theta, eta, vars, covs);
+        let scale = sym.abs().max(num.abs()).max(1.0);
+        let rel = (sym - num).abs() / scale;
+        assert!(
+            rel < 1e-6,
+            "symbolic ≠ FD: sym = {sym}, fd = {num}, axis = {axis:?}, \n  expr = {expr:?}",
+        );
+    }
+
+    // `lit`, `binop`, `unary` are already defined above in the bytecode
+    // equivalence tests; reuse those. Add only `power` (not needed there).
+    fn power(b: Expression, e: Expression) -> Expression {
+        Expression::Power(Box::new(b), Box::new(e))
+    }
+
+    #[test]
+    fn differentiate_constants_zero_against_every_axis() {
+        let theta = &[1.0, 2.0];
+        let eta = &[0.5];
+        let vars = &[3.0];
+        let covs = &[];
+        for axis in [DiffAxis::Theta(0), DiffAxis::Eta(0), DiffAxis::Variable(0)] {
+            let d = differentiate(&lit(7.5), axis);
+            assert_eq!(eval_at(&d, theta, eta, vars, covs), 0.0);
+            let d2 = differentiate(&Expression::CovariateIdx(0), axis);
+            assert_eq!(eval_at(&d2, theta, eta, vars, covs), 0.0);
+            let d3 = differentiate(
+                &Expression::NnOutput {
+                    nn_idx: 0,
+                    output_idx: 0,
+                },
+                axis,
+            );
+            assert_eq!(eval_at(&d3, theta, eta, vars, covs), 0.0);
+        }
+    }
+
+    #[test]
+    fn differentiate_slot_pushes_kronecker_delta() {
+        let theta = &[1.5, 2.5, 3.5];
+        let eta = &[0.1, 0.2];
+        let vars = &[4.0, 5.0];
+        let covs = &[];
+        // ∂θ_1 / ∂θ_j = δ_{1,j}
+        for j in 0..3 {
+            let d = differentiate(&Expression::Theta(1), DiffAxis::Theta(j));
+            let want = if j == 1 { 1.0 } else { 0.0 };
+            assert_eq!(eval_at(&d, theta, eta, vars, covs), want, "θ axis j={j}");
+        }
+        // Cross-axis: ∂θ_1 / ∂η_0 = 0
+        let d = differentiate(&Expression::Theta(1), DiffAxis::Eta(0));
+        assert_eq!(eval_at(&d, theta, eta, vars, covs), 0.0);
+        // ∂η_1 / ∂η_j = δ_{1,j}
+        for j in 0..2 {
+            let d = differentiate(&Expression::Eta(1), DiffAxis::Eta(j));
+            let want = if j == 1 { 1.0 } else { 0.0 };
+            assert_eq!(eval_at(&d, theta, eta, vars, covs), want, "η axis j={j}");
+        }
+        // ∂v_0 / ∂v_0 = 1, ∂v_0 / ∂v_1 = 0
+        for j in 0..2 {
+            let d = differentiate(&Expression::VariableIdx(0), DiffAxis::Variable(j));
+            let want = if j == 0 { 1.0 } else { 0.0 };
+            assert_eq!(eval_at(&d, theta, eta, vars, covs), want, "var axis j={j}");
+        }
+    }
+
+    #[test]
+    fn differentiate_arithmetic_matches_fd() {
+        // expr = θ_0 + θ_1*η_0 − v_0/θ_0
+        let theta = &[1.5, 2.5];
+        let eta = &[0.7];
+        let vars = &[3.0];
+        let covs = &[];
+        let expr = binop(
+            BinOp::Sub,
+            binop(
+                BinOp::Add,
+                Expression::Theta(0),
+                binop(BinOp::Mul, Expression::Theta(1), Expression::Eta(0)),
+            ),
+            binop(BinOp::Div, Expression::VariableIdx(0), Expression::Theta(0)),
+        );
+        for axis in [
+            DiffAxis::Theta(0),
+            DiffAxis::Theta(1),
+            DiffAxis::Eta(0),
+            DiffAxis::Variable(0),
+        ] {
+            assert_diff_matches_fd(expr.clone(), axis, theta, eta, vars, covs);
+        }
+    }
+
+    #[test]
+    fn differentiate_unary_fn_matches_fd() {
+        let theta = &[1.5, 0.8];
+        let eta = &[0.3];
+        let vars = &[2.0];
+        let covs = &[];
+        // exp(θ_0)
+        assert_diff_matches_fd(
+            unary("exp", Expression::Theta(0)),
+            DiffAxis::Theta(0),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        // ln(θ_0 * v_0)
+        assert_diff_matches_fd(
+            unary(
+                "ln",
+                binop(BinOp::Mul, Expression::Theta(0), Expression::VariableIdx(0)),
+            ),
+            DiffAxis::Theta(0),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        assert_diff_matches_fd(
+            unary(
+                "ln",
+                binop(BinOp::Mul, Expression::Theta(0), Expression::VariableIdx(0)),
+            ),
+            DiffAxis::Variable(0),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        // sqrt(θ_0² + v_0²)  — exercises non-trivial chain
+        assert_diff_matches_fd(
+            unary(
+                "sqrt",
+                binop(
+                    BinOp::Add,
+                    power(Expression::Theta(0), lit(2.0)),
+                    power(Expression::VariableIdx(0), lit(2.0)),
+                ),
+            ),
+            DiffAxis::Theta(0),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        // inv_logit(η_0 + θ_1)
+        assert_diff_matches_fd(
+            unary(
+                "inv_logit",
+                binop(BinOp::Add, Expression::Eta(0), Expression::Theta(1)),
+            ),
+            DiffAxis::Eta(0),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        assert_diff_matches_fd(
+            unary(
+                "expit",
+                binop(BinOp::Add, Expression::Eta(0), Expression::Theta(1)),
+            ),
+            DiffAxis::Theta(1),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        // logit needs a point strictly in (0, 1)
+        assert_diff_matches_fd(
+            unary("logit", binop(BinOp::Mul, lit(0.3), Expression::Theta(0))),
+            DiffAxis::Theta(0),
+            &[1.0, 0.0],
+            eta,
+            vars,
+            covs,
+        );
+    }
+
+    #[test]
+    fn differentiate_abs_branches_on_sign() {
+        // abs(θ_0 − 1) at θ_0 = 1.7  → derivative is +1 (positive branch)
+        // abs(θ_0 − 1) at θ_0 = 0.3  → derivative is −1 (negative branch)
+        let eta = &[];
+        let vars = &[];
+        let covs = &[];
+        let expr = unary("abs", binop(BinOp::Sub, Expression::Theta(0), lit(1.0)));
+        assert_diff_matches_fd(expr.clone(), DiffAxis::Theta(0), &[1.7], eta, vars, covs);
+        assert_diff_matches_fd(expr, DiffAxis::Theta(0), &[0.3], eta, vars, covs);
+    }
+
+    #[test]
+    fn differentiate_unknown_unary_passes_through() {
+        // The slow path returns the argument unchanged for unknown names;
+        // the differentiator must return the argument's derivative.
+        let theta = &[2.0];
+        let eta = &[];
+        let vars = &[];
+        let covs = &[];
+        let expr = unary("expn", binop(BinOp::Mul, Expression::Theta(0), lit(3.0)));
+        assert_diff_matches_fd(expr, DiffAxis::Theta(0), theta, eta, vars, covs);
+    }
+
+    #[test]
+    fn differentiate_power_matches_fd_for_constant_and_variable_exponents() {
+        let theta = &[2.5, 1.5];
+        let eta = &[];
+        let vars = &[];
+        let covs = &[];
+        // Constant exponent: θ_0² (the canonical case)
+        assert_diff_matches_fd(
+            power(Expression::Theta(0), lit(2.0)),
+            DiffAxis::Theta(0),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        // Constant exponent, non-integer: θ_0^0.5
+        assert_diff_matches_fd(
+            power(Expression::Theta(0), lit(0.5)),
+            DiffAxis::Theta(0),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        // Variable exponent (rare in PK/PD, but common via the Hill term):
+        // θ_0^θ_1 — exercises the e' · ln(b) path
+        assert_diff_matches_fd(
+            power(Expression::Theta(0), Expression::Theta(1)),
+            DiffAxis::Theta(0),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        assert_diff_matches_fd(
+            power(Expression::Theta(0), Expression::Theta(1)),
+            DiffAxis::Theta(1),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+    }
+
+    #[test]
+    fn differentiate_conditional_picks_taken_branch() {
+        // Conditional(θ_0 > 0, 2·θ_0, 3·θ_0)
+        // At θ_0 = 1.5: derivative is 2; at θ_0 = -1.5: derivative is 3
+        let eta = &[];
+        let vars = &[];
+        let covs = &[];
+        let expr = Expression::Conditional(
+            Box::new(Condition::Compare(
+                Expression::Theta(0),
+                CmpOp::Gt,
+                lit(0.0),
+            )),
+            Box::new(binop(BinOp::Mul, lit(2.0), Expression::Theta(0))),
+            Box::new(binop(BinOp::Mul, lit(3.0), Expression::Theta(0))),
+        );
+        assert_diff_matches_fd(expr.clone(), DiffAxis::Theta(0), &[1.5], eta, vars, covs);
+        assert_diff_matches_fd(expr, DiffAxis::Theta(0), &[-1.5], eta, vars, covs);
+    }
+
+    #[test]
+    fn differentiate_emax_pkpd_readout_matches_fd() {
+        // y = E0 + EMAX · effect^γ / (EC50^γ + effect^γ)
+        // Mapped to slots: θ_0=E0, θ_1=EMAX, θ_2=EC50, θ_3=γ; var_0=effect.
+        // This is the actual experiment Emax PK/PD readout shape; if the
+        // differentiator handles this end-to-end correctly, the milestone-4
+        // Form C codegen will compose without surprise.
+        let theta = &[3.0, 60.0, 7.5, 1.5];
+        let eta = &[];
+        let vars = &[2.0];
+        let covs = &[];
+        let eff = Expression::VariableIdx(0);
+        let e0 = Expression::Theta(0);
+        let emax = Expression::Theta(1);
+        let ec50 = Expression::Theta(2);
+        let gamma = Expression::Theta(3);
+        let eff_g = power(eff.clone(), gamma.clone());
+        let ec_g = power(ec50.clone(), gamma);
+        let denom = binop(BinOp::Add, ec_g, eff_g.clone());
+        let frac = binop(BinOp::Div, eff_g, denom);
+        let expr = binop(BinOp::Add, e0, binop(BinOp::Mul, emax, frac));
+        for axis in [
+            DiffAxis::Theta(0),    // ∂y/∂E0 = 1
+            DiffAxis::Theta(1),    // ∂y/∂EMAX = frac
+            DiffAxis::Theta(2),    // ∂y/∂EC50 — the awkward one
+            DiffAxis::Theta(3),    // ∂y/∂γ
+            DiffAxis::Variable(0), // ∂y/∂effect — the sensitivity-ODE input
+        ] {
+            assert_diff_matches_fd(expr.clone(), axis, theta, eta, vars, covs);
+        }
+    }
+
+    #[test]
+    fn simplify_collapses_zero_and_one() {
+        // 0 + (1 * x) → x
+        let raw = binop(
+            BinOp::Add,
+            lit(0.0),
+            binop(BinOp::Mul, lit(1.0), Expression::Theta(0)),
+        );
+        let simp = simplify_expr(&raw);
+        assert!(matches!(simp, Expression::Theta(0)));
+        // x * 0 → 0
+        let raw = binop(BinOp::Mul, Expression::VariableIdx(2), lit(0.0));
+        assert!(matches!(simplify_expr(&raw), Expression::Literal(v) if v == 0.0));
+        // x - 0 → x
+        let raw = binop(BinOp::Sub, Expression::Eta(0), lit(0.0));
+        assert!(matches!(simplify_expr(&raw), Expression::Eta(0)));
+        // 0 / x → 0
+        let raw = binop(BinOp::Div, lit(0.0), Expression::Theta(1));
+        assert!(matches!(simplify_expr(&raw), Expression::Literal(v) if v == 0.0));
     }
 }

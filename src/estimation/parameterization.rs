@@ -758,6 +758,7 @@ mod tests {
             theta_names,
             eta_names,
             indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
+            indiv_param_partials: crate::types::IndivParamPartials::empty(),
             default_params,
             omega_init_as_sd: vec![false; 3],
             sigma_init_as_sd: vec![false],

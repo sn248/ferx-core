@@ -989,11 +989,19 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     };
 
     // Build pk_param_fn with the extended eta context (BSV + kappa names).
-    let (pk_param_fn, referenced_covariates) = build_pk_param_fn(
+    // `n_theta_base` is the user-declared θ count — indiv params can only
+    // reference these (NN-weight and diffusion θ are appended later and
+    // aren't visible to user expressions). `n_eta_extended` matches the
+    // `eta` slice the closure consumes (BSV η + kappa). Both feed the
+    // Tier 4a milestone-2 partial-derivative builder.
+    let n_eta_extended_for_partials = eta_names.len();
+    let (pk_param_fn, referenced_covariates, indiv_param_partials) = build_pk_param_fn(
         indiv_stmts.clone(),
         &pk_param_map,
         &indiv_var_names,
         &ode_slot_map,
+        thetas.len(),
+        n_eta_extended_for_partials,
         #[cfg(feature = "nn")]
         &covariate_nns_for_closure,
     )?;
@@ -1297,6 +1305,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         eta_names: eta_names_bsv,
         kappa_names,
         indiv_param_names: indiv_var_names.clone(),
+        indiv_param_partials,
         default_params,
         omega_init_as_sd,
         sigma_init_as_sd,
@@ -4067,8 +4076,10 @@ fn build_pk_param_fn(
     pk_param_map: &HashMap<String, String>,
     var_names: &[String],
     ode_slot_map: &[usize],
+    n_theta_base: usize,
+    n_eta_extended: usize,
     #[cfg(feature = "nn")] covariate_nns: &[crate::nn::CovariateNn],
-) -> Result<(PkParamFn, Vec<String>), String> {
+) -> Result<(PkParamFn, Vec<String>, IndivParamPartials), String> {
     // Covariates referenced anywhere in the block (including inside if-bodies
     // and condition expressions). Sorted for deterministic error messages.
     let mut cov_set: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4099,6 +4110,20 @@ fn build_pk_param_fn(
     let n_vars = all_var_names.len();
     let n_cov = referenced_covariates.len();
     let mut stmts_resolved = stmts;
+
+    // Compute symbolic partials BEFORE `resolve_variable_indices` consumes
+    // the Expression nodes by bytecode-compiling them. `build_indiv_param_partials`
+    // takes a `&[Statement]` and works on local clones (then runs
+    // `resolve_expr_indices` itself); no need to defer the bytecode-compile
+    // step or hold a parallel copy of the AST.
+    let indiv_partials = build_indiv_param_partials(
+        &stmts_resolved,
+        &var_idx,
+        &cov_idx,
+        n_theta_base,
+        n_eta_extended,
+    );
+
     resolve_variable_indices(&mut stmts_resolved, &var_idx, &cov_idx, None);
 
     let stmts_owned = stmts_resolved;
@@ -4209,13 +4234,20 @@ fn build_pk_param_fn(
             p
         },
     );
-    Ok((pk_param_fn, referenced_covariates))
+    Ok((pk_param_fn, referenced_covariates, indiv_partials))
 }
 
 // --- Simple expression AST and evaluator ---
+//
+// Visibility note: `Expression` and its sibling enums (`BinOp`, `CmpOp`,
+// `Condition`) are `pub(crate)` so the partial-derivative trees produced by
+// the Tier 4a sensitivity work (`differentiate_with_chain`,
+// `IndivParamPartials`) can be stored on `CompiledModel` (defined in
+// `types.rs`). They remain unexported from the crate root — external users
+// can't construct or pattern-match them.
 
 #[derive(Debug, Clone)]
-enum Expression {
+pub(crate) enum Expression {
     Literal(f64),
     Theta(usize),
     Eta(usize),
@@ -4251,7 +4283,7 @@ enum Expression {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BinOp {
+pub(crate) enum BinOp {
     Add,
     Sub,
     Mul,
@@ -4259,7 +4291,7 @@ enum BinOp {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum CmpOp {
+pub(crate) enum CmpOp {
     Lt,
     Le,
     Gt,
@@ -4269,7 +4301,7 @@ enum CmpOp {
 }
 
 #[derive(Debug, Clone)]
-enum Condition {
+pub(crate) enum Condition {
     Compare(Expression, CmpOp, Expression),
     And(Box<Condition>, Box<Condition>),
     Or(Box<Condition>, Box<Condition>),
@@ -5521,10 +5553,42 @@ enum DiffAxis {
     /// `v_idx` — an already-resolved variable slot. Used for chain-ruling
     /// into ODE-block intermediates whose own sensitivities are precomputed
     /// and live in the variable pool.
+    #[allow(dead_code)] // wired in milestone 3 (augmented ODE RHS)
     Variable(usize),
 }
 
+#[allow(dead_code)] // unit-test convenience wrapper for the no-chain case
 fn differentiate(expr: &Expression, axis: DiffAxis) -> Expression {
+    // No chain context — used by milestone-1 tests and any caller that doesn't
+    // need to chain-rule through intermediates. Equivalent to
+    // `differentiate_with_chain(expr, axis, &HashMap::new())`.
+    static EMPTY: std::sync::OnceLock<HashMap<usize, Expression>> = std::sync::OnceLock::new();
+    differentiate_with_chain(expr, axis, EMPTY.get_or_init(HashMap::new))
+}
+
+/// Symbolic differentiator with optional chain-rule substitution at
+/// `VariableIdx(k)` leaves. When `chain` contains a partial expression for
+/// slot `k`, the differentiator returns that expression instead of the
+/// default Kronecker delta. This is how milestone 2 (and milestones 3-4)
+/// chain-rule through intermediate `[individual_parameters]` assignments
+/// and ODE-block intermediates whose own sensitivities live in the variable
+/// pool.
+///
+/// Concrete example from milestone 2 — given
+///   ka_mult = TVKAM * exp(ETA_KAM)
+///   CL      = TVCL  * exp(ETA_CL) * ka_mult
+/// computing ∂CL/∂η_KAM with `chain = { ka_mult_slot: ∂ka_mult/∂η_KAM }`
+/// substitutes the precomputed partial at the `VariableIdx(ka_mult_slot)`
+/// leaf rather than returning Literal(0.0); the product rule then carries
+/// it through to the final answer `TVCL · exp(ETA_CL) · ∂ka_mult/∂η_KAM`.
+///
+/// When `chain` is empty this is identical to the milestone-1 `differentiate`
+/// and the same FD-verified tests apply.
+fn differentiate_with_chain(
+    expr: &Expression,
+    axis: DiffAxis,
+    chain: &HashMap<usize, Expression>,
+) -> Expression {
     // Local helpers — avoid `use BinOp::*` because `Expression::BinOp` is a
     // variant with the same name and would create a glob-import ambiguity.
     let mul =
@@ -5552,10 +5616,21 @@ fn differentiate(expr: &Expression, axis: DiffAxis) -> Expression {
             DiffAxis::Eta(j) => kron(*k, j),
             _ => Expression::Literal(0.0),
         },
-        Expression::VariableIdx(k) => match axis {
-            DiffAxis::Variable(j) => kron(*k, j),
-            _ => Expression::Literal(0.0),
-        },
+        Expression::VariableIdx(k) => {
+            // Chain-rule entry point: if `k` is an upstream intermediate
+            // whose partial w.r.t. `axis` was precomputed, return that
+            // expression. Otherwise fall back to the Kronecker delta — the
+            // variable is either the differentiation target itself
+            // (DiffAxis::Variable) or a base variable (state, dose-amount,
+            // etc.) that is independent of θ/η.
+            if let Some(partial) = chain.get(k) {
+                return partial.clone();
+            }
+            match axis {
+                DiffAxis::Variable(j) => kron(*k, j),
+                _ => Expression::Literal(0.0),
+            }
+        }
         Expression::CovariateIdx(_) | Expression::NnOutput { .. } => Expression::Literal(0.0),
         Expression::Variable(name) | Expression::Covariate(name) => panic!(
             "differentiate: unresolved AST node `{name}` reached the \
@@ -5563,27 +5638,27 @@ fn differentiate(expr: &Expression, axis: DiffAxis) -> Expression {
         ),
         Expression::BinOp(l, op, r) => match op {
             BinOp::Add | BinOp::Sub => Expression::BinOp(
-                Box::new(differentiate(l, axis)),
+                Box::new(differentiate_with_chain(l, axis, chain)),
                 *op,
-                Box::new(differentiate(r, axis)),
+                Box::new(differentiate_with_chain(r, axis, chain)),
             ),
             BinOp::Mul => {
                 // L'·R + L·R'
-                let dl = differentiate(l, axis);
-                let dr = differentiate(r, axis);
+                let dl = differentiate_with_chain(l, axis, chain);
+                let dr = differentiate_with_chain(r, axis, chain);
                 add(mul(dl, (**r).clone()), mul((**l).clone(), dr))
             }
             BinOp::Div => {
                 // (L'·R − L·R') / R²
-                let dl = differentiate(l, axis);
-                let dr = differentiate(r, axis);
+                let dl = differentiate_with_chain(l, axis, chain);
+                let dr = differentiate_with_chain(r, axis, chain);
                 let num = sub(mul(dl, (**r).clone()), mul((**l).clone(), dr));
                 let denom = mul((**r).clone(), (**r).clone());
                 div(num, denom)
             }
         },
         Expression::UnaryFn(name, arg) => {
-            let da = differentiate(arg, axis);
+            let da = differentiate_with_chain(arg, axis, chain);
             match name.as_str() {
                 "exp" => {
                     // exp(a) · a'
@@ -5642,8 +5717,8 @@ fn differentiate(expr: &Expression, axis: DiffAxis) -> Expression {
             // leaving b^e · e · b'/b = e · b^(e-1) · b' after `simplify_expr`
             // (or bytecode constant folding); a Literal base has b' = 0 so
             // the second term vanishes.
-            let db = differentiate(b, axis);
-            let de = differentiate(e, axis);
+            let db = differentiate_with_chain(b, axis, chain);
+            let de = differentiate_with_chain(e, axis, chain);
             let pow = Expression::Power(b.clone(), e.clone());
             let term_e = mul(de, Expression::UnaryFn("ln".into(), b.clone()));
             let term_b = mul((**e).clone(), div(db, (**b).clone()));
@@ -5656,8 +5731,8 @@ fn differentiate(expr: &Expression, axis: DiffAxis) -> Expression {
             // branch's derivative the condition selects.
             Expression::Conditional(
                 c.clone(),
-                Box::new(differentiate(t, axis)),
-                Box::new(differentiate(e, axis)),
+                Box::new(differentiate_with_chain(t, axis, chain)),
+                Box::new(differentiate_with_chain(e, axis, chain)),
             )
         }
     }
@@ -5740,6 +5815,171 @@ fn simplify_expr(expr: &Expression) -> Expression {
         | Expression::Covariate(_)
         | Expression::CovariateIdx(_)
         | Expression::NnOutput { .. } => expr.clone(),
+    }
+}
+
+// --- Milestone 2: `[individual_parameters]` partial derivatives ---
+//
+// For each top-level assignment `P_i = expr_i` in the `[individual_parameters]`
+// block, precompute the symbolic partial-derivative Expression trees
+//   ∂P_i/∂θ_k  for k in 0..n_theta_base
+//   ∂P_i/∂η_k  for k in 0..n_eta_extended  (BSV η followed by κ)
+// using `differentiate_with_chain`. Each row threads a chain-context map
+// keyed by variable slot so a later assignment whose RHS references an
+// earlier intermediate gets chain-ruled correctly through the earlier
+// partial — no need to inline the intermediate's expression and re-explode
+// the tree.
+//
+// Storage shape: outer Vec indexed by indiv-param position (parallel to
+// `CompiledModel.indiv_param_names`), inner Vec indexed by axis. The
+// expressions are stored in resolved form (VariableIdx, not Variable) so
+// downstream consumers (milestones 3-5: augmented RHS, Form C readout
+// sensitivities, estimator wiring) can compile them to Bytecode without
+// re-running `resolve_expr_indices`.
+//
+// Top-level `If { … }` statements in `[individual_parameters]` are not
+// differentiated — no in-tree user model uses them and handling them needs
+// branch-specific Conditional handling for the assignment-existence
+// boundary. They are silently skipped (their slot has no row in
+// `IndivParamPartials`); a future milestone can lift this restriction if a
+// real model needs it. `NnOutput` references in indiv params have ∂/∂θ = 0
+// (NN weights are treated as a separate axis class, deferred to a later
+// milestone) and the current differentiator correctly returns Literal(0)
+// for them.
+
+/// Precomputed symbolic partials of `[individual_parameters]` assignments,
+/// produced by [`build_indiv_param_partials`]. Stored on
+/// [`CompiledModel`](crate::types::CompiledModel) for use by the Tier 4a
+/// sensitivity-ODE work (milestones 3-5).
+///
+/// Inner field types reference the parser's private `Expression` AST, so the
+/// fields stay `pub(crate)`. External callers can construct an empty
+/// placeholder via [`IndivParamPartials::empty`] — this is the only thing
+/// they need for hand-built `CompiledModel` test fixtures and the
+/// `generate_data` data-generation binary.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields consumed by milestones 3-5
+pub struct IndivParamPartials {
+    /// Indiv-param names parallel to `d_d_theta` / `d_d_eta` outer Vec, in
+    /// `[individual_parameters]` source-declaration order. Equals the
+    /// top-level `Assign(name, _)` order, matching
+    /// `CompiledModel.indiv_param_names`.
+    pub(crate) names: Vec<String>,
+    /// `d_d_theta[i][k]` = ∂P_i/∂θ_k. Inner Vec length = `n_theta_base`
+    /// (user-declared θ count, NOT including NN-weight or diffusion θ which
+    /// indiv params don't reference). Each Expression is in resolved form.
+    pub(crate) d_d_theta: Vec<Vec<Expression>>,
+    /// `d_d_eta[i][k]` = ∂P_i/∂η_k. Inner Vec length = `n_eta_extended` —
+    /// BSV η first (slots 0..n_eta_bsv), kappas appended (slots
+    /// n_eta_bsv..n_eta_bsv+n_kappa). Matches the `eta` slice the
+    /// `pk_param_fn` closure consumes.
+    pub(crate) d_d_eta: Vec<Vec<Expression>>,
+}
+
+impl IndivParamPartials {
+    /// Empty partials — used when there are no indiv params or as a
+    /// placeholder when building a `CompiledModel` by hand (e.g. test
+    /// fixtures, the `generate_data` binary). Fully populated instances are
+    /// produced internally by the parser.
+    pub fn empty() -> Self {
+        Self {
+            names: Vec::new(),
+            d_d_theta: Vec::new(),
+            d_d_eta: Vec::new(),
+        }
+    }
+}
+
+/// Compute partial-derivative expressions for every top-level `Assign` in
+/// `stmts` (the `[individual_parameters]` block, BEFORE
+/// `resolve_variable_indices` has bytecode-compiled it). Resolves each
+/// statement's expression locally (without mutating `stmts`), differentiates
+/// w.r.t. every θ/η axis, and threads a per-axis chain context so chained
+/// intermediate references get chain-ruled correctly.
+///
+/// Top-level `If` and any non-`Assign` variant is skipped. Returns
+/// `IndivParamPartials::empty()` if there are no top-level Assigns.
+fn build_indiv_param_partials(
+    stmts: &[Statement],
+    var_idx: &HashMap<String, usize>,
+    cov_idx: &HashMap<String, usize>,
+    n_theta_base: usize,
+    n_eta_extended: usize,
+) -> IndivParamPartials {
+    // Per-axis chain context: variable slot → precomputed partial Expression
+    // for THIS axis. Indexed by axis index, populated incrementally as we
+    // walk the assignments in source order.
+    let mut chain_theta: Vec<HashMap<usize, Expression>> =
+        (0..n_theta_base).map(|_| HashMap::new()).collect();
+    let mut chain_eta: Vec<HashMap<usize, Expression>> =
+        (0..n_eta_extended).map(|_| HashMap::new()).collect();
+
+    let mut names: Vec<String> = Vec::new();
+    let mut d_d_theta: Vec<Vec<Expression>> = Vec::new();
+    let mut d_d_eta: Vec<Vec<Expression>> = Vec::new();
+
+    for stmt in stmts {
+        let Statement::Assign(name, raw_expr) = stmt else {
+            // If-blocks and any already-resolved variant (defensive — at the
+            // call site `stmts` is the parser's pristine pre-resolve output,
+            // so only Assign/If can appear): skip. Indiv-params with
+            // top-level conditionals get no partials in this milestone.
+            continue;
+        };
+        // Differentiate on a resolved CLONE of the expression — the
+        // caller (`build_pk_param_fn`) will run `resolve_variable_indices`
+        // on `stmts` independently, which destroys the Expression by
+        // compiling it to Bytecode. We can't share that work.
+        let mut resolved = raw_expr.clone();
+        resolve_expr_indices(&mut resolved, var_idx, cov_idx);
+
+        // Slot for this indiv param. `usize::MAX` (the resolve fallback)
+        // would mean the name isn't in `var_idx` — at this call site
+        // that's a parser bug because `[individual_parameters]` names
+        // populate `var_idx` unconditionally; debug-assert so a future
+        // pipeline change doesn't silently drop chain entries.
+        let slot = var_idx.get(name).copied().unwrap_or(usize::MAX);
+        debug_assert!(
+            slot != usize::MAX,
+            "build_indiv_param_partials: indiv-param `{name}` missing from var_idx — \
+             parser pipeline bug (var_idx must be built from the same name list before \
+             differentiation)",
+        );
+
+        let mut row_theta: Vec<Expression> = Vec::with_capacity(n_theta_base);
+        for k in 0..n_theta_base {
+            let d = differentiate_with_chain(&resolved, DiffAxis::Theta(k), &chain_theta[k]);
+            let s = simplify_expr(&d);
+            // Store the simplified partial into the chain context BEFORE
+            // pushing — any later assignment that references slot `k` will
+            // chain-rule through this expression. Always insert (even
+            // Literal(0)) so the chain map's "key present ⇔ slot is an
+            // upstream indiv-param" invariant is robust to zero partials.
+            if slot != usize::MAX {
+                chain_theta[k].insert(slot, s.clone());
+            }
+            row_theta.push(s);
+        }
+
+        let mut row_eta: Vec<Expression> = Vec::with_capacity(n_eta_extended);
+        for k in 0..n_eta_extended {
+            let d = differentiate_with_chain(&resolved, DiffAxis::Eta(k), &chain_eta[k]);
+            let s = simplify_expr(&d);
+            if slot != usize::MAX {
+                chain_eta[k].insert(slot, s.clone());
+            }
+            row_eta.push(s);
+        }
+
+        names.push(name.clone());
+        d_d_theta.push(row_theta);
+        d_d_eta.push(row_eta);
+    }
+
+    IndivParamPartials {
+        names,
+        d_d_theta,
+        d_d_eta,
     }
 }
 
@@ -11711,5 +11951,324 @@ if (1 > 0) {
         // 0 / x → 0
         let raw = binop(BinOp::Div, lit(0.0), Expression::Theta(1));
         assert!(matches!(simplify_expr(&raw), Expression::Literal(v) if v == 0.0));
+    }
+
+    // --- Milestone 2: `[individual_parameters]` partials ---
+    //
+    // Each test parses a small model and asserts the precomputed
+    // `IndivParamPartials` rows agree with central FD on the pk_param_fn
+    // output. We use the parser's `parse_full_model` entry point so the test
+    // exercises the full pipeline: parsing → resolve → differentiate →
+    // simplify → store on CompiledModel.
+
+    /// Numerically evaluate a stored partial Expression with the same inputs
+    /// the pk_param_fn closure sees. Returns the partial's value at
+    /// (theta, eta, covariates), with `vars` cleared to zero (intermediates
+    /// aren't realized — they show up in the partial expression through
+    /// chain-rule substitution at differentiation time, so the eval here
+    /// doesn't need to recompute them).
+    fn eval_partial(
+        partial: &Expression,
+        theta: &[f64],
+        eta: &[f64],
+        cov: &HashMap<String, f64>,
+        var_count: usize,
+    ) -> f64 {
+        let mut cov_vec = vec![0.0_f64; cov.len()];
+        // Build a deterministic cov ordering matching the partial's
+        // CovariateIdx references. For these tests we use NO covariates.
+        let mut keys: Vec<&String> = cov.keys().collect();
+        keys.sort();
+        for (i, k) in keys.iter().enumerate() {
+            cov_vec[i] = cov[k.as_str()];
+        }
+        let mut vars = vec![0.0_f64; var_count];
+        let nn_outputs: Vec<Vec<f64>> = Vec::new();
+        eval_expression_indexed(partial, theta, eta, &cov_vec, &mut vars, &nn_outputs)
+    }
+
+    /// Central-FD reference for ∂(pk_param_fn output at slot i)/∂θ_k.
+    fn fd_d_theta(
+        model: &crate::types::CompiledModel,
+        i: usize,
+        k: usize,
+        theta: &[f64],
+        eta: &[f64],
+        cov: &HashMap<String, f64>,
+    ) -> f64 {
+        let h = 1e-5 * theta[k].abs().max(1.0);
+        let mut tp = theta.to_vec();
+        let mut tm = theta.to_vec();
+        tp[k] += h;
+        tm[k] -= h;
+        let pk_plus = (model.pk_param_fn)(&tp, eta, cov);
+        let pk_minus = (model.pk_param_fn)(&tm, eta, cov);
+        let slot = model.pk_indices[i];
+        (pk_plus.values[slot] - pk_minus.values[slot]) / (2.0 * h)
+    }
+
+    /// Central-FD reference for ∂(pk_param_fn output at slot i)/∂η_k.
+    fn fd_d_eta(
+        model: &crate::types::CompiledModel,
+        i: usize,
+        k: usize,
+        theta: &[f64],
+        eta: &[f64],
+        cov: &HashMap<String, f64>,
+    ) -> f64 {
+        let h = 1e-5_f64.max(eta[k].abs() * 1e-5);
+        let mut ep = eta.to_vec();
+        let mut em = eta.to_vec();
+        ep[k] += h;
+        em[k] -= h;
+        let pk_plus = (model.pk_param_fn)(theta, &ep, cov);
+        let pk_minus = (model.pk_param_fn)(theta, &em, cov);
+        let slot = model.pk_indices[i];
+        (pk_plus.values[slot] - pk_minus.values[slot]) / (2.0 * h)
+    }
+
+    #[test]
+    fn indiv_partials_populated_for_1cpt_oral() {
+        // CL = TVCL * exp(ETA_CL), V = TVV * exp(ETA_V), KA = TVKA * exp(ETA_KA)
+        // Three indiv params, three θ, three η, all flat (no chain).
+        let model_str = "
+[parameters]
+  theta TVCL(7.5)
+  theta TVV(75.0)
+  theta TVKA(1.05)
+  omega ETA_CL ~ 0.135
+  omega ETA_V  ~ 0.135
+  omega ETA_KA ~ 0.225
+  sigma EPS ~ 0.245
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str).unwrap();
+        let m = &parsed.model;
+        let partials = &m.indiv_param_partials;
+        assert_eq!(partials.names, vec!["CL", "V", "KA"]);
+        assert_eq!(partials.d_d_theta.len(), 3);
+        assert_eq!(partials.d_d_eta.len(), 3);
+        // Each row has length n_theta_base (3) and n_eta_extended (3).
+        for row in &partials.d_d_theta {
+            assert_eq!(row.len(), 3);
+        }
+        for row in &partials.d_d_eta {
+            assert_eq!(row.len(), 3);
+        }
+
+        // FD verification at off-zero η so exp(ETA) ≠ 1 and we exercise
+        // the chain through exp.
+        let theta = &[7.5, 75.0, 1.05];
+        let eta = &[0.1, -0.2, 0.05];
+        let cov: HashMap<String, f64> = HashMap::new();
+        for i in 0..3 {
+            for k in 0..3 {
+                let sym = eval_partial(&partials.d_d_theta[i][k], theta, eta, &cov, 8);
+                let fd = fd_d_theta(m, i, k, theta, eta, &cov);
+                assert!(
+                    (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
+                    "∂{}/∂θ_{}: sym={sym}, fd={fd}",
+                    partials.names[i],
+                    k,
+                );
+                let sym = eval_partial(&partials.d_d_eta[i][k], theta, eta, &cov, 8);
+                let fd = fd_d_eta(m, i, k, theta, eta, &cov);
+                assert!(
+                    (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
+                    "∂{}/∂η_{}: sym={sym}, fd={fd}",
+                    partials.names[i],
+                    k,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indiv_partials_zero_for_cross_axis() {
+        // ∂CL/∂η_V = 0, ∂V/∂η_CL = 0. The simplified expressions should be
+        // Literal(0.0) (or a tree that evaluates to 0).
+        let model_str = "
+[parameters]
+  theta TVCL(7.5)
+  theta TVV(75.0)
+  theta TVKA(1.05)
+  omega ETA_CL ~ 0.135
+  omega ETA_V  ~ 0.135
+  omega ETA_KA ~ 0.225
+  sigma EPS ~ 0.245
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str).unwrap();
+        let partials = &parsed.model.indiv_param_partials;
+        // After simplify, ∂CL/∂η_V is exactly Literal(0). Even if a future
+        // simplifier rule leaves it as a tree, eval must produce 0.0.
+        let theta = &[7.5, 75.0, 1.05];
+        let eta = &[0.3, -0.1, 0.2];
+        let cov: HashMap<String, f64> = HashMap::new();
+        // Cross-η partials (indiv i, η k ≠ i).
+        for (i, k) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
+            let v = eval_partial(&partials.d_d_eta[i][k], theta, eta, &cov, 8);
+            assert!(
+                v.abs() < 1e-12,
+                "∂{}/∂η_{} should be 0, got {v}",
+                partials.names[i],
+                k
+            );
+        }
+        // Cross-θ partials.
+        for (i, k) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
+            let v = eval_partial(&partials.d_d_theta[i][k], theta, eta, &cov, 8);
+            assert!(
+                v.abs() < 1e-12,
+                "∂{}/∂θ_{} should be 0, got {v}",
+                partials.names[i],
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn indiv_partials_logit_inv_logit_chain() {
+        // F = inv_logit(logit(THETA_F) + ETA_F)
+        // Exercises the inv_logit/logit derivative rules end-to-end.
+        let model_str = "
+[parameters]
+  theta TVCL(7.5)
+  theta TVV(75.0)
+  theta TVKA(1.05)
+  theta THETA_F(0.6)
+  omega ETA_CL ~ 0.135
+  omega ETA_V  ~ 0.135
+  omega ETA_KA ~ 0.225
+  omega ETA_F  ~ 0.1
+  sigma EPS ~ 0.245
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  F  = inv_logit(logit(THETA_F) + ETA_F)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str).unwrap();
+        let m = &parsed.model;
+        let partials = &m.indiv_param_partials;
+        assert_eq!(partials.names, vec!["CL", "V", "KA", "F"]);
+        let theta = &[7.5, 75.0, 1.05, 0.6];
+        let eta = &[0.05, -0.1, 0.15, 0.2];
+        let cov: HashMap<String, f64> = HashMap::new();
+        // F's row: position 3. Verify ∂F/∂η_F (index 3) and ∂F/∂THETA_F (index 3).
+        let sym = eval_partial(&partials.d_d_eta[3][3], theta, eta, &cov, 8);
+        let fd = fd_d_eta(m, 3, 3, theta, eta, &cov);
+        assert!(
+            (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
+            "∂F/∂η_F: sym={sym}, fd={fd}",
+        );
+        let sym = eval_partial(&partials.d_d_theta[3][3], theta, eta, &cov, 8);
+        let fd = fd_d_theta(m, 3, 3, theta, eta, &cov);
+        assert!(
+            (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
+            "∂F/∂THETA_F: sym={sym}, fd={fd}",
+        );
+        // F doesn't depend on ETA_CL/V/KA — those partials must evaluate to 0.
+        for k in 0..3 {
+            let v = eval_partial(&partials.d_d_eta[3][k], theta, eta, &cov, 8);
+            assert!(v.abs() < 1e-12, "∂F/∂η_{k} should be 0, got {v}");
+        }
+    }
+
+    #[test]
+    fn indiv_partials_chain_rule_through_intermediate() {
+        // Synthetic model exercising the chain-rule substitution at a
+        // VariableIdx leaf — `KA` references `ka_mult` (an earlier
+        // intermediate) by name. The differentiator must chain-rule through
+        // ka_mult's η_KAM dependence into KA's row.
+        //
+        // ka_mult = TVKAM * exp(ETA_KAM)
+        // KA      = TVKA  * ka_mult     (depends on η_KAM via ka_mult)
+        //
+        // ∂KA/∂η_KAM = TVKA * ∂ka_mult/∂η_KAM = TVKA * TVKAM * exp(ETA_KAM)
+        // ∂KA/∂η_KA  = 0
+        // ∂KA/∂TVKAM = TVKA * exp(ETA_KAM)
+        let model_str = "
+[parameters]
+  theta TVCL(7.5)
+  theta TVV(75.0)
+  theta TVKA(1.05)
+  theta TVKAM(2.0)
+  omega ETA_CL  ~ 0.135
+  omega ETA_V   ~ 0.135
+  omega ETA_KAM ~ 0.1
+  sigma EPS ~ 0.245
+
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV  * exp(ETA_V)
+  ka_mult = TVKAM * exp(ETA_KAM)
+  KA      = TVKA * ka_mult
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str).unwrap();
+        let m = &parsed.model;
+        let partials = &m.indiv_param_partials;
+        // ka_mult IS a top-level Assign so it has a row; ordering must match
+        // declaration order.
+        assert_eq!(partials.names, vec!["CL", "V", "ka_mult", "KA"]);
+        let theta = &[7.5, 75.0, 1.05, 2.0];
+        let eta = &[0.0, 0.0, 0.3]; // η_CL=0, η_V=0, η_KAM=0.3
+        let cov: HashMap<String, f64> = HashMap::new();
+        // KA is at indiv-param index 3, η_KAM is at eta index 2.
+        let sym = eval_partial(&partials.d_d_eta[3][2], theta, eta, &cov, 8);
+        let expected = theta[2] * theta[3] * eta[2].exp(); // TVKA * TVKAM * exp(ETA_KAM)
+        assert!(
+            (sym - expected).abs() < 1e-12 * expected.abs().max(1.0),
+            "∂KA/∂η_KAM (chain rule): sym={sym}, expected={expected}",
+        );
+        // FD cross-check via pk_param_fn:
+        let fd = fd_d_eta(m, 3, 2, theta, eta, &cov);
+        assert!(
+            (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
+            "∂KA/∂η_KAM: sym={sym}, fd={fd}",
+        );
+        // ∂KA/∂η_CL = 0 (no chain to ETA_CL).
+        let v = eval_partial(&partials.d_d_eta[3][0], theta, eta, &cov, 8);
+        assert!(v.abs() < 1e-12, "∂KA/∂η_CL should be 0, got {v}");
+        // ∂KA/∂TVKAM (θ index 3): TVKA * exp(ETA_KAM).
+        let sym = eval_partial(&partials.d_d_theta[3][3], theta, eta, &cov, 8);
+        let expected = theta[2] * eta[2].exp();
+        assert!(
+            (sym - expected).abs() < 1e-12 * expected.abs().max(1.0),
+            "∂KA/∂TVKAM: sym={sym}, expected={expected}",
+        );
     }
 }

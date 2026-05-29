@@ -4629,10 +4629,13 @@ enum Op {
 
 /// Compiled bytecode for a single expression tree. The `constants` pool
 /// holds every literal value referenced by `PushConst(u32)` opcodes; this
-/// keeps `Op` four bytes wide instead of paying the 8-byte literal payload
-/// on every other variant. `max_stack` is computed at compile time so
-/// `eval_bytecode` can `reserve` once and amortize the `Vec::push` bounds
-/// checks across all calls.
+/// avoids paying an 8-byte literal payload on every variant of `Op`. The
+/// enum size is currently 12 bytes (`PushNnOutput(u32, u32)` carries 8
+/// bytes of payload plus the tag — every variant pads to that size); the
+/// pool still saves 4 bytes per push relative to a hypothetical
+/// `PushLiteral(f64)` (which would force 16-byte alignment). `max_stack`
+/// is computed at compile time so `eval_bytecode` can `reserve` once and
+/// amortize the `Vec::push` bounds checks across all calls.
 #[derive(Debug, Clone)]
 struct Bytecode {
     ops: Vec<Op>,
@@ -4655,9 +4658,11 @@ impl Bytecode {
     }
 }
 
-/// Compile a single (post-resolve) `Expression` into `Bytecode`. Panics on
-/// unresolved `Variable`/`Covariate` (these should have been rewritten by
-/// `resolve_expr_indices` before reaching this point).
+/// Compile a single (post-resolve) `Expression` into `Bytecode`. Unresolved
+/// `Variable` / `Covariate` nodes trip a `debug_assert!(false, …)` in debug
+/// builds and lower to a constant `0.0` push in release; both are intended
+/// to mirror the `eval_expression_indexed` fall-through semantics for
+/// callers that bypass `resolve_expr_indices`.
 fn compile_bytecode(expr: &Expression) -> Bytecode {
     let mut bc = Bytecode::new();
     compile_expr_into(&mut bc, expr);
@@ -4665,15 +4670,27 @@ fn compile_bytecode(expr: &Expression) -> Bytecode {
     bc
 }
 
-/// Compute the maximum f64 stack depth a bytecode program reaches. Each Op
-/// has a known net stack delta:
+/// Compute a safe upper bound on the maximum f64 stack depth a bytecode
+/// program reaches. Each Op has a known net stack delta:
 ///   Push*       :  +1
 ///   Pop2/Push1  :  -1  (arithmetic / compare / logic-binary)
 ///   Pop1/Push1  :   0  (unary fn / logic-not)
 ///   Jump        :   0
 ///   JumpIfFalse :  -1
-/// `JumpIfFalse(t)` and `Jump(t)` only flow forward in the compiler we emit,
-/// so a single linear scan tracks max depth exactly.
+///
+/// The single linear scan returns an *upper bound* (not the exact peak):
+/// `Conditional` emits both then- and else-branches inline with a `Jump`
+/// between them, so the linear walk credits BOTH branches' pushes against
+/// running depth even though execution only takes one branch at runtime.
+/// That over-estimate is exactly what `eval_bytecode` wants for its
+/// `stack.reserve(max_stack)` call — under-estimating here would let the
+/// unchecked-write hot loop go OOB on the conservative-FD path. The
+/// `depth >= 0` and balanced-end debug asserts catch a future opcode
+/// addition that violates the invariant; in release builds the over-bound
+/// is the only guard.
+///
+/// If backward jumps (e.g. for loops) are ever added, this linear-scan
+/// algorithm no longer holds — fixed-point iteration would be required.
 fn compute_max_stack(ops: &[Op]) -> usize {
     let mut depth: i32 = 0;
     let mut peak: i32 = 0;
@@ -4703,10 +4720,25 @@ fn compute_max_stack(ops: &[Op]) -> usize {
             Op::Jump(_) => 0,
         };
         depth += delta;
+        // Liveness invariant: every Op's deltas must keep the running
+        // (linear-scan) depth ≥ 0 — if not, the compiler emitted an
+        // unbalanced sequence and `eval_bytecode`'s `pop!` macro would
+        // underflow `len` (usize) into UB territory in release.
+        debug_assert!(
+            depth >= 0,
+            "compute_max_stack: depth went negative at op {op:?}; bytecode is unbalanced",
+        );
         if depth > peak {
             peak = depth;
         }
     }
+    // A well-formed expression bytecode leaves exactly one value on the
+    // stack (the result). Catch off-by-one push/pop emissions in any
+    // future compile_expr_into change.
+    debug_assert!(
+        depth == 1 || ops.is_empty(),
+        "compute_max_stack: bytecode ends at depth {depth}, expected 1",
+    );
     peak.max(1) as usize
 }
 
@@ -4999,6 +5031,15 @@ fn eval_bytecode(
         }
         pc += 1;
     }
+    // Balanced-bytecode invariant: every expression's compile produces
+    // exactly one residual value on the stack. Catches off-by-one in any
+    // future compile_expr_into change that compute_max_stack's end-of-scan
+    // assert might miss (the two checks are belt-and-braces against the
+    // same class of UB-on-pop bug).
+    debug_assert!(
+        len == 1,
+        "eval_bytecode: bytecode finished at stack depth {len}, expected 1",
+    );
     if len > 0 {
         unsafe { *buf.add(len - 1) }
     } else {
@@ -10737,5 +10778,232 @@ if (1 > 0) {
             "expected single Form C + AD rejection, got: {}",
             err
         );
+    }
+
+    // ── Bytecode ↔ AST evaluator equivalence ────────────────────────────────
+    //
+    // The bytecode interpreter is a second evaluator for every
+    // Expression/Condition shape ferx supports. These tests pin its
+    // results to `eval_expression_indexed` so future opcode changes can't
+    // silently diverge — Copilot review on #137 flagged the gap.
+
+    fn bc_vs_ast(expr: Expression, vars: &[f64], theta: &[f64], eta: &[f64], covs: &[f64]) {
+        let nn: Vec<Vec<f64>> = Vec::new();
+        let ast = eval_expression_indexed(&expr, theta, eta, covs, vars, &nn);
+        let bc = compile_bytecode(&expr);
+        let mut stack: Vec<f64> = Vec::new();
+        let by = eval_bytecode(&bc, theta, eta, covs, vars, &nn, &mut stack);
+        assert_eq!(
+            ast.to_bits(),
+            by.to_bits(),
+            "bit-identical mismatch: AST = {ast:?}, bytecode = {by:?}, expr = {expr:?}",
+        );
+    }
+
+    fn lit(v: f64) -> Expression {
+        Expression::Literal(v)
+    }
+    fn binop(op: BinOp, l: Expression, r: Expression) -> Expression {
+        Expression::BinOp(Box::new(l), op, Box::new(r))
+    }
+    fn unary(name: &str, arg: Expression) -> Expression {
+        Expression::UnaryFn(name.into(), Box::new(arg))
+    }
+    fn cond(c: Condition, t: Expression, e: Expression) -> Expression {
+        Expression::Conditional(Box::new(c), Box::new(t), Box::new(e))
+    }
+    fn cmp(l: Expression, op: CmpOp, r: Expression) -> Condition {
+        Condition::Compare(l, op, r)
+    }
+
+    #[test]
+    fn bytecode_matches_ast_on_arithmetic_and_literals() {
+        let v = &[3.5, -2.0, 0.0];
+        let t = &[10.0, 0.1];
+        let e = &[0.5];
+        let c = &[];
+        // Lits and slot pushes
+        bc_vs_ast(lit(7.5), v, t, e, c);
+        bc_vs_ast(Expression::Theta(0), v, t, e, c);
+        bc_vs_ast(Expression::Eta(0), v, t, e, c);
+        bc_vs_ast(Expression::VariableIdx(1), v, t, e, c);
+        // Binary arithmetic — left-to-right evaluation
+        bc_vs_ast(binop(BinOp::Add, lit(2.0), lit(3.0)), v, t, e, c);
+        bc_vs_ast(binop(BinOp::Sub, lit(2.0), lit(3.0)), v, t, e, c);
+        bc_vs_ast(binop(BinOp::Mul, lit(2.0), lit(3.0)), v, t, e, c);
+        bc_vs_ast(binop(BinOp::Div, lit(7.0), lit(2.0)), v, t, e, c);
+        // Div-by-tiny guard (both paths clamp `r.abs() < 1e-30 -> 0.0`)
+        bc_vs_ast(binop(BinOp::Div, lit(1.0), lit(1e-40)), v, t, e, c);
+        bc_vs_ast(binop(BinOp::Div, lit(1.0), lit(0.0)), v, t, e, c);
+        // Power
+        bc_vs_ast(
+            Expression::Power(Box::new(lit(2.0)), Box::new(lit(3.0))),
+            v,
+            t,
+            e,
+            c,
+        );
+        bc_vs_ast(
+            Expression::Power(Box::new(lit(4.0)), Box::new(lit(0.5))),
+            v,
+            t,
+            e,
+            c,
+        );
+    }
+
+    #[test]
+    fn bytecode_matches_ast_on_unary_guards() {
+        let v = &[];
+        let t = &[];
+        let e = &[];
+        let c = &[];
+        // exp / abs — no guards
+        bc_vs_ast(unary("exp", lit(0.5)), v, t, e, c);
+        bc_vs_ast(unary("abs", lit(-3.0)), v, t, e, c);
+        // ln / log clamp `v.max(1e-30).ln()` — exercise negative and zero
+        bc_vs_ast(unary("ln", lit(2.0)), v, t, e, c);
+        bc_vs_ast(unary("ln", lit(0.0)), v, t, e, c);
+        bc_vs_ast(unary("ln", lit(-1.0)), v, t, e, c);
+        bc_vs_ast(unary("log", lit(1e-40)), v, t, e, c);
+        // sqrt clamp `v.max(0.0).sqrt()`
+        bc_vs_ast(unary("sqrt", lit(9.0)), v, t, e, c);
+        bc_vs_ast(unary("sqrt", lit(-4.0)), v, t, e, c);
+        // inv_logit numerically-stable branch (v ≥ 0 vs v < 0)
+        bc_vs_ast(unary("inv_logit", lit(2.5)), v, t, e, c);
+        bc_vs_ast(unary("inv_logit", lit(-2.5)), v, t, e, c);
+        bc_vs_ast(unary("expit", lit(0.0)), v, t, e, c);
+        // logit clamp `v.clamp(1e-15, 1.0 - 1e-15)`
+        bc_vs_ast(unary("logit", lit(0.3)), v, t, e, c);
+        bc_vs_ast(unary("logit", lit(0.0)), v, t, e, c);
+        bc_vs_ast(unary("logit", lit(1.0)), v, t, e, c);
+        // Unknown unary name — slow path returns the argument unchanged;
+        // the bytecode no-op'd UnaryFn arm must too.
+        bc_vs_ast(unary("expn", lit(42.0)), v, t, e, c);
+    }
+
+    #[test]
+    fn bytecode_matches_ast_on_conditional_and_logic() {
+        let v = &[];
+        let t = &[];
+        let e = &[];
+        let c = &[];
+        // Simple compare arms
+        for op in [
+            CmpOp::Lt,
+            CmpOp::Le,
+            CmpOp::Gt,
+            CmpOp::Ge,
+            CmpOp::Eq,
+            CmpOp::Ne,
+        ] {
+            bc_vs_ast(
+                cond(cmp(lit(2.0), op, lit(3.0)), lit(1.0), lit(-1.0)),
+                v,
+                t,
+                e,
+                c,
+            );
+            bc_vs_ast(
+                cond(cmp(lit(3.0), op, lit(3.0)), lit(1.0), lit(-1.0)),
+                v,
+                t,
+                e,
+                c,
+            );
+        }
+        // NaN-comparison sanity (NaN compares as false everywhere)
+        bc_vs_ast(
+            cond(
+                cmp(lit(f64::NAN), CmpOp::Eq, lit(f64::NAN)),
+                lit(1.0),
+                lit(-1.0),
+            ),
+            v,
+            t,
+            e,
+            c,
+        );
+        // And / Or / Not over compound conditions
+        bc_vs_ast(
+            cond(
+                Condition::And(
+                    Box::new(cmp(lit(1.0), CmpOp::Lt, lit(2.0))),
+                    Box::new(cmp(lit(3.0), CmpOp::Lt, lit(4.0))),
+                ),
+                lit(42.0),
+                lit(0.0),
+            ),
+            v,
+            t,
+            e,
+            c,
+        );
+        bc_vs_ast(
+            cond(
+                Condition::Or(
+                    Box::new(cmp(lit(1.0), CmpOp::Gt, lit(2.0))),
+                    Box::new(cmp(lit(3.0), CmpOp::Lt, lit(4.0))),
+                ),
+                lit(7.0),
+                lit(0.0),
+            ),
+            v,
+            t,
+            e,
+            c,
+        );
+        bc_vs_ast(
+            cond(
+                Condition::Not(Box::new(cmp(lit(1.0), CmpOp::Lt, lit(2.0)))),
+                lit(7.0),
+                lit(0.0),
+            ),
+            v,
+            t,
+            e,
+            c,
+        );
+        // Nested Conditional — exercises both then- and else-branch bytecode
+        // bookkeeping (the compute_max_stack-over-counts case).
+        let inner = cond(cmp(lit(1.0), CmpOp::Lt, lit(0.5)), lit(11.0), lit(22.0));
+        let outer = cond(
+            cmp(lit(0.0), CmpOp::Lt, lit(1.0)),
+            inner.clone(),
+            binop(BinOp::Add, lit(1.0), inner),
+        );
+        bc_vs_ast(outer, v, t, e, c);
+    }
+
+    #[test]
+    fn bytecode_matches_ast_on_nn_output_fallback() {
+        // PushNnOutput out-of-bounds falls back to 0.0 in both paths.
+        let nn_outputs: Vec<Vec<f64>> = vec![vec![1.0, 2.0, 3.0]];
+        let theta = &[];
+        let eta = &[];
+        let covs = &[];
+        let vars = &[];
+        // Valid index
+        let ast_ok = eval_expression_indexed(
+            &Expression::NnOutput {
+                nn_idx: 0,
+                output_idx: 1,
+            },
+            theta,
+            eta,
+            covs,
+            vars,
+            &nn_outputs,
+        );
+        let bc_ok = {
+            let bc = compile_bytecode(&Expression::NnOutput {
+                nn_idx: 0,
+                output_idx: 1,
+            });
+            let mut stack = Vec::new();
+            eval_bytecode(&bc, theta, eta, covs, vars, &nn_outputs, &mut stack)
+        };
+        assert_eq!(ast_ok, bc_ok);
+        assert_eq!(bc_ok, 2.0);
     }
 }

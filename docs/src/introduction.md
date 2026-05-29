@@ -39,7 +39,7 @@ ferx-core is a high-performance Nonlinear Mixed Effects (NLME) modeling engine w
 
 ferx-core uses a two-level optimization structure:
 
-- **Outer loop**: Optimizes population parameters (theta, omega, sigma) using NLopt SLSQP (default), BOBYQA, L-BFGS, MMA, built-in BFGS, Newton trust-region, or Gauss-Newton (BHHH)
+- **Outer loop**: Optimizes population parameters (theta, omega, sigma) using NLopt BOBYQA (default), SLSQP, L-BFGS, MMA, built-in BFGS, Newton trust-region, or Gauss-Newton (BHHH)
 - **Inner loop**: For each subject, finds empirical Bayes estimates (EBEs) of random effects by minimizing individual negative log-likelihood
 
 Parameters are internally transformed for unconstrained optimization: theta and sigma are log-transformed, and omega uses Cholesky factorization to guarantee positive-definiteness.

@@ -112,15 +112,19 @@ prefer a bracketed comparison (`WT >= 70 && WT < 80`) over `WT == 75`.
 
 ## Which outer optimizer should I pick?
 
-`slsqp` (the default) is the right choice for most models — it is fast, handles
-box constraints cleanly, and behaves well on the log-transformed parameter
-scale that ferx uses internally.
+`bobyqa` (the default) is the right choice for most models —
+derivative-free quadratic trust-region, robust to noisy FD gradients, and
+consistently reaches a lower OFV than `slsqp` on ODE/PD models, sparse data,
+and Hill-ridge identifiability problems. Previously the default was `slsqp`;
+the change is one line away if you need the old behaviour
+(`optimizer = slsqp` in `[fit_options]`).
 
-Reach for a different optimizer when SLSQP misbehaves:
+Reach for a different optimizer when the default misbehaves:
 
-- **`bobyqa`** — derivative-free, good when FOCE's FD gradients are noisy and
-  SLSQP stalls or oscillates. Slower per iteration on smooth problems, but
-  often converges when gradient-based methods give up.
+- **`slsqp`** — gradient-based; faster per iteration on smooth, well-conditioned
+  analytical PK models with many parameters. Can stall above the true minimum
+  on ill-conditioned fits unless paired with `reconverge_gradient_interval = 1`
+  (5–6× cost per gradient).
 - **`trust_region`** — second-order Newton trust-region with an AD-based
   gradient and BHHH approximate Hessian. Can be faster near convergence
   because it uses curvature information; the CG budget defaults to
@@ -224,15 +228,15 @@ Both produce IPRED, PRED, IWRES, and CWRES on the log scale (back-transform with
 
 ## Which outer optimizer should I use?
 
-**Default (`slsqp`)** works well for most models. If you're unsure, start here.
+**Default (`bobyqa`)** works well for most models — including ODE/PD models, sparse data, and Hill-ridge problems where gradient-based optimizers stall. If you're unsure, start here.
 
-**`bobyqa`** is the best single alternative: derivative-free quadratic interpolation, robust when the finite-difference gradient is noisy (sparse data, ODE models). Recommended when `slsqp` reports convergence at a suspiciously high OFV.
+**`slsqp`** is the right pick when `bobyqa` is too slow on a smooth, well-conditioned model with many parameters (it can take many quadratic-interpolation samples to triangulate a high-dimensional surface). Pair with `reconverge_gradient_interval = 1` if it stalls above an expected OFV.
 
 **`trust_region`** shines on high-parameter-count models (many thetas/omegas) or when combined with `inits_from_nca` — the second-order curvature helps when starting values are good. Set `steihaug_max_iters` if you want to pin the CG budget.
 
-**`gn` / `gn_hybrid`** for fast iteration during model development: Gauss-Newton converges in 10–30 steps vs 100+ for gradient methods. `gn_hybrid` adds a FOCEI polish pass for robustness.
+**`gn` / `gn_hybrid`** for fast iteration during model development: Gauss-Newton converges in 10–30 steps vs 100+ for gradient methods. `gn_hybrid` adds a FOCEI polish pass for robustness; that polish stage runs with `bobyqa` by default and inherits any `optimizer` override.
 
-**Gradient-based (`lbfgs`, `mma`)** are rarely needed; prefer `slsqp` or `bobyqa`. See [FOCE/FOCEI — Optimizer Options](estimation/foce.md#optimizer-options) for a full comparison.
+**Gradient-based (`lbfgs`, `mma`)** are rarely needed; prefer `bobyqa` or `slsqp`. See [FOCE/FOCEI — Optimizer Options](estimation/foce.md#optimizer-options) for a full comparison.
 
 ## How do I validate a model file without running a full fit?
 

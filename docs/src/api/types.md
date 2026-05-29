@@ -100,7 +100,7 @@ pub struct FitOptions {
     pub run_covariance_step: bool,     // Default: true
     pub interaction: bool,             // FOCEI flag
     pub verbose: bool,                 // Default: true
-    pub optimizer: Optimizer,          // Default: Slsqp
+    pub optimizer: Optimizer,          // Default: Bobyqa
     pub lbfgs_memory: usize,           // Default: 5
     pub global_search: bool,           // Default: false
     pub global_maxeval: usize,         // Default: 0 (auto)

@@ -403,6 +403,7 @@ mod tests {
             n_states: 1,
             state_names: vec!["central".into()],
             readout: crate::ode::OdeReadout::ObsCmt(0),
+            readout_sensitivity: None,
             diffusion_var: Vec::new(),
             init_fn: None,
         };

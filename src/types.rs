@@ -2225,6 +2225,7 @@ pub(crate) mod test_helpers {
                     n_states: 2,
                     state_names: vec!["depot".into(), "central".into()],
                     readout: crate::ode::OdeReadout::ObsCmt(0),
+                    readout_sensitivity: None,
                     diffusion_var: Vec::new(),
                     init_fn: None,
                 })

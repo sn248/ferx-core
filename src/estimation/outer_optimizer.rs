@@ -3,7 +3,7 @@ use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
 use crate::types::*;
-use nalgebra::{DMatrix, DVector};
+use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1169,7 +1169,7 @@ fn optimize_nlopt(
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            compute_covariance(
+            match compute_covariance(
                 &x0,
                 init_params,
                 model,
@@ -1178,7 +1178,15 @@ fn optimize_nlopt(
                 &final_hms,
                 &final_kappas,
                 options,
-            )
+            ) {
+                Some(out) => {
+                    if let Some(w) = out.warning {
+                        warnings.push(w);
+                    }
+                    Some(out.matrix)
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -1490,7 +1498,7 @@ fn optimize_bfgs(
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            compute_covariance(
+            match compute_covariance(
                 &x_final,
                 init_params,
                 model,
@@ -1499,7 +1507,15 @@ fn optimize_bfgs(
                 &final_hms,
                 &final_kappas,
                 options,
-            )
+            ) {
+                Some(out) => {
+                    if let Some(w) = out.warning {
+                        warnings.push(w);
+                    }
+                    Some(out.matrix)
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -1795,7 +1811,22 @@ fn backtracking_line_search_warm(
     0.0
 }
 
+/// Outcome of the FD covariance step. `matrix` is the n×n covariance with FIX
+/// rows/cols zeroed; `warning` carries a non-fatal note if the free-block
+/// Hessian had to be regularized to recover a PD matrix (see [`invert_psd_with_floor`]).
+pub(crate) struct CovarianceOutput {
+    pub matrix: DMatrix<f64>,
+    pub warning: Option<String>,
+}
+
 /// Compute covariance matrix via finite-difference Hessian at convergence.
+///
+/// Returns `None` only when the FD Hessian itself is structurally unusable
+/// (non-finite or zero-diagonal entries). When the symmetrised free-block
+/// Hessian is near-singular or has negative eigenvalues — a common FD noise
+/// artefact on well-conditioned surfaces (see issue #129) — it is regularised
+/// by clipping eigenvalues to a small positive floor before inversion, and
+/// the returned `warning` records what was done.
 pub(crate) fn compute_covariance(
     x_hat: &[f64],
     template: &ModelParameters,
@@ -1805,7 +1836,7 @@ pub(crate) fn compute_covariance(
     h_matrices: &[DMatrix<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-) -> Option<DMatrix<f64>> {
+) -> Option<CovarianceOutput> {
     let n = x_hat.len();
     let eps = 1e-2; // large step for FD Hessian on log-scale parameters
 
@@ -1949,7 +1980,10 @@ pub(crate) fn compute_covariance(
     if n_free == 0 {
         // Nothing to estimate — return an all-zero covariance so downstream
         // SE extraction reports zeros (all params FIX).
-        return Some(DMatrix::zeros(n, n));
+        return Some(CovarianceOutput {
+            matrix: DMatrix::zeros(n, n),
+            warning: None,
+        });
     }
     let mut hess_free = DMatrix::zeros(n_free, n_free);
     for (a, &i) in free_idx.iter().enumerate() {
@@ -1958,42 +1992,247 @@ pub(crate) fn compute_covariance(
         }
     }
     let hess_free_sym = (&hess_free + hess_free.transpose()) * 0.5;
-    match hess_free_sym.try_inverse() {
-        Some(cov_free) => {
-            let neg_diag: Vec<usize> = (0..n_free).filter(|&a| cov_free[(a, a)] <= 0.0).collect();
-            if !neg_diag.is_empty() {
-                if options.verbose {
-                    eprintln!(
-                        "  Covariance failed: negative diagonal in free-block at {:?}",
-                        neg_diag
-                    );
-                }
-                return None;
-            }
-            let mut cov = DMatrix::zeros(n, n);
-            for (a, &i) in free_idx.iter().enumerate() {
-                for (b, &j) in free_idx.iter().enumerate() {
-                    cov[(i, j)] = cov_free[(a, b)];
-                }
-            }
-            if options.verbose {
-                eprintln!("  Covariance step successful");
-            }
-            Some(cov)
-        }
-        None => {
-            if options.verbose {
-                eprintln!("  Covariance failed: Hessian not invertible");
-            }
-            None
+
+    let inv = invert_psd_with_floor(&hess_free_sym)?;
+    let cov_free = inv.inverse;
+
+    let mut cov = DMatrix::zeros(n, n);
+    for (a, &i) in free_idx.iter().enumerate() {
+        for (b, &j) in free_idx.iter().enumerate() {
+            cov[(i, j)] = cov_free[(a, b)];
         }
     }
+
+    let warning = if inv.n_clipped > 0 {
+        let msg = format!(
+            "Covariance step regularized: eigenvalue floor applied to FD Hessian \
+             ({} of {} free-block eigenvalues clipped; min eig = {:.3e}, floor = {:.3e}). \
+             Standard errors should be interpreted with care.",
+            inv.n_clipped, n_free, inv.min_eigenvalue, inv.floor
+        );
+        if options.verbose {
+            eprintln!("  {}", msg);
+        }
+        Some(msg)
+    } else {
+        if options.verbose {
+            eprintln!("  Covariance step successful");
+        }
+        None
+    };
+
+    Some(CovarianceOutput {
+        matrix: cov,
+        warning,
+    })
+}
+
+/// Result of [`invert_psd_with_floor`].
+pub(crate) struct RegularizedInverse {
+    pub inverse: DMatrix<f64>,
+    /// Smallest eigenvalue of the input matrix (before clipping). `f64::INFINITY`
+    /// for 0×0 matrices.
+    pub min_eigenvalue: f64,
+    /// Floor used for clipping. Same shape rules as `min_eigenvalue`.
+    pub floor: f64,
+    /// How many eigenvalues fell below the floor and were clipped.
+    pub n_clipped: usize,
+}
+
+/// Invert a symmetric matrix by clipping eigenvalues to a small positive floor.
+///
+/// This is the regularised replacement for `try_inverse() + neg-diag check` on
+/// the FD Hessian. The previous code rejected the entire covariance step on a
+/// single negative diagonal of the raw inverse — which on a well-conditioned
+/// surface (FOCE/FOCEI converges cleanly to the same OFV across optimizers) is
+/// almost always an FD-noise artefact rather than real ill-conditioning. The
+/// floor leaves PD inputs untouched (`n_clipped == 0`, exact inverse) and
+/// recovers a PD inverse on near-singular or marginally-indefinite inputs.
+///
+/// Floor: `max(max_eig * 1e-10, 1e-12)`. Anchoring to `max_eig` keeps the
+/// regularisation scale-equivariant; the absolute floor handles the edge case
+/// where the whole spectrum is tiny.
+///
+/// Returns `None` only when the eigendecomposition fails or every eigenvalue
+/// is non-finite or non-positive — i.e. the Hessian carries no usable
+/// curvature information at all, in which case regularisation cannot help.
+pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInverse> {
+    let n = sym.nrows();
+    debug_assert_eq!(
+        n,
+        sym.ncols(),
+        "invert_psd_with_floor requires square input"
+    );
+    if n == 0 {
+        return Some(RegularizedInverse {
+            inverse: DMatrix::zeros(0, 0),
+            min_eigenvalue: f64::INFINITY,
+            floor: f64::INFINITY,
+            n_clipped: 0,
+        });
+    }
+
+    // Symmetric eigendecomposition: H = Q Λ Qᵀ ⇒ H⁻¹ = Q Λ⁻¹ Qᵀ. Inverting via
+    // the eigendecomposition lets us clip non-positive Λ entries before
+    // forming Λ⁻¹, which is what `try_inverse` cannot do.
+    let eig = SymmetricEigen::new(sym.clone());
+    let q = &eig.eigenvectors;
+    let lambdas = &eig.eigenvalues;
+
+    let mut max_eig = f64::NEG_INFINITY;
+    for i in 0..n {
+        let l = lambdas[i];
+        if !l.is_finite() {
+            return None;
+        }
+        if l > max_eig {
+            max_eig = l;
+        }
+    }
+    if !max_eig.is_finite() || max_eig <= 0.0 {
+        // Spectrum is entirely ≤ 0 — no positive curvature anywhere; this is
+        // a genuinely degenerate Hessian, not FD noise. Flag as failure so the
+        // caller can report "Covariance step failed" rather than silently
+        // returning a meaningless matrix.
+        return None;
+    }
+
+    let floor = (max_eig * 1e-10).max(1e-12);
+    let mut min_eig = f64::INFINITY;
+    let mut n_clipped = 0;
+    let mut inv_lambdas = DVector::zeros(n);
+    for i in 0..n {
+        let l = lambdas[i];
+        if l < min_eig {
+            min_eig = l;
+        }
+        let l_clipped = if l < floor {
+            n_clipped += 1;
+            floor
+        } else {
+            l
+        };
+        inv_lambdas[i] = 1.0 / l_clipped;
+    }
+
+    // cov = Q diag(1/λ) Qᵀ — scale columns of Q by 1/λ, then multiply by Qᵀ.
+    let mut q_scaled = q.clone();
+    for j in 0..n {
+        let s = inv_lambdas[j];
+        for i in 0..n {
+            q_scaled[(i, j)] *= s;
+        }
+    }
+    let mut inverse = &q_scaled * q.transpose();
+    // Eigendecomposition + reconstruction is symmetric in exact arithmetic but
+    // not in floating point; symmetrise so downstream consumers (e.g. SIR
+    // proposal Cholesky) see a numerically symmetric matrix.
+    let inv_t = inverse.transpose();
+    inverse = (&inverse + &inv_t) * 0.5;
+
+    Some(RegularizedInverse {
+        inverse,
+        min_eigenvalue: min_eig,
+        floor,
+        n_clipped,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    // ── invert_psd_with_floor: regularised PD inversion ──────────────────────
+
+    /// A genuinely PD matrix is inverted unchanged (n_clipped == 0) and the
+    /// result satisfies `H · H⁻¹ ≈ I` to high precision.
+    #[test]
+    fn test_invert_psd_with_floor_pd_matrix_unchanged() {
+        // 3×3 SPD: build as Lᵀ·L with L lower-triangular so eigenvalues are O(1).
+        let l = DMatrix::from_row_slice(3, 3, &[2.0, 0.0, 0.0, 0.5, 1.5, 0.0, 0.3, 0.2, 1.2]);
+        let h = l.transpose() * &l;
+        let r = invert_psd_with_floor(&h).expect("PD input inverts");
+        assert_eq!(r.n_clipped, 0, "PD input should not trigger clipping");
+        assert!(r.min_eigenvalue > 0.0);
+
+        let prod = &h * &r.inverse;
+        let eye = DMatrix::<f64>::identity(3, 3);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (prod[(i, j)] - eye[(i, j)]).abs() < 1e-9,
+                    "H·H⁻¹ deviates at ({i},{j}): {:.3e}",
+                    (prod[(i, j)] - eye[(i, j)]).abs()
+                );
+            }
+        }
+    }
+
+    /// A near-singular symmetric matrix with one tiny-negative eigenvalue
+    /// (the exact failure mode reported in issue #129) is regularised: the
+    /// helper flags the clip and returns a PD inverse with positive
+    /// diagonals — what the old code rejected as "negative diagonal".
+    #[test]
+    fn test_invert_psd_with_floor_clips_negative_eigenvalue() {
+        // H = Q diag(λ) Qᵀ with λ = [1.0, 0.5, -1e-9]. The tiny-negative
+        // eigenvalue is the kind of FD noise the issue calls out.
+        let q = {
+            // Any orthogonal 3×3 will do. Use a Householder reflector built
+            // from v = (1, 1, 1)/√3:  Q = I - 2 v vᵀ.
+            let v = DVector::from_column_slice(&[1.0, 1.0, 1.0]) / (3.0_f64).sqrt();
+            let mut m = DMatrix::<f64>::identity(3, 3);
+            m -= 2.0 * &v * v.transpose();
+            m
+        };
+        let lambdas = DMatrix::from_diagonal(&DVector::from_column_slice(&[1.0, 0.5, -1e-9]));
+        let h = &q * lambdas * q.transpose();
+
+        let r = invert_psd_with_floor(&h).expect("near-PD input must regularise");
+        assert_eq!(r.n_clipped, 1, "exactly one eigenvalue should clip");
+        assert!(
+            r.min_eigenvalue < 0.0 && r.min_eigenvalue.abs() < 1e-6,
+            "min_eigenvalue should record the raw (pre-clip) value: {:.3e}",
+            r.min_eigenvalue
+        );
+
+        // Inverse is PD ⇒ all diagonal entries positive. This is the assertion
+        // the old neg-diag check used to fail on for the warfarin FD Hessian.
+        for i in 0..3 {
+            assert!(
+                r.inverse[(i, i)] > 0.0,
+                "regularised inverse diag[{i}] = {:.3e} should be positive",
+                r.inverse[(i, i)]
+            );
+        }
+        // Inverse is also numerically symmetric.
+        for i in 0..3 {
+            for j in i + 1..3 {
+                assert!(
+                    (r.inverse[(i, j)] - r.inverse[(j, i)]).abs() < 1e-12,
+                    "inverse not symmetric at ({i},{j})",
+                );
+            }
+        }
+    }
+
+    /// Hopelessly indefinite input (all eigenvalues ≤ 0) returns None — the
+    /// caller surfaces this as the legitimate "Covariance step failed".
+    #[test]
+    fn test_invert_psd_with_floor_rejects_negative_definite() {
+        let h = DMatrix::from_row_slice(2, 2, &[-1.0, 0.0, 0.0, -2.0]);
+        assert!(invert_psd_with_floor(&h).is_none());
+    }
+
+    /// Empty matrix is a valid zero-dimensional input (all-FIX parameter
+    /// case). Returns a 0×0 inverse without clipping.
+    #[test]
+    fn test_invert_psd_with_floor_empty() {
+        let r =
+            invert_psd_with_floor(&DMatrix::<f64>::zeros(0, 0)).expect("0×0 input must succeed");
+        assert_eq!(r.inverse.nrows(), 0);
+        assert_eq!(r.n_clipped, 0);
+    }
 
     #[test]
     fn test_reconverge_this_eval_schedule() {

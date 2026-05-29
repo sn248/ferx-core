@@ -252,40 +252,6 @@ pub(crate) fn active_infusions(
 pub type OdeOutputFn =
     Box<dyn Fn(&[f64], &[f64], &[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
 
-/// Milestone-4 sensitivity readout. Same input layout as `OdeOutputFn`
-/// EXCEPT the leading `state_aug: &[f64]` slice is the augmented state
-/// vector (length `n_states · (1 + n_eta_for_sens)` — same as the
-/// `AugmentedRhsFn` `u_aug` buffer). The closure writes
-/// `∂y/∂η_k for k in 0..n_eta_for_sens` into the trailing `out: &mut [f64]`
-/// slice. `out.len()` must equal `n_eta_for_sens`.
-///
-/// Signature: `(state_aug, pk_params_flat, theta, eta, covariates, out)`.
-///
-/// One closure per Form C readout (one for `Single`, one per CMT for
-/// `PerCmt`). Returns all η partials in a single call so the closure
-/// pays at most one TLS-scratch lookup per observation regardless of how
-/// many η axes the model has.
-#[allow(clippy::type_complexity)]
-pub type OdeOutputSensFn =
-    Box<dyn Fn(&[f64], &[f64], &[f64], &[f64], &HashMap<String, f64>, &mut [f64]) + Send + Sync>;
-
-/// Sensitivity-readout sibling of [`OdeReadout`]. Same `Single` /
-/// `PerCmt` shape but each entry is an [`OdeOutputSensFn`] producing
-/// `∂y/∂η_k` for k in `0..n_eta_for_sens`. `OdeReadout::ObsCmt` has no
-/// dedicated sens variant — its sens is simply
-/// `state_aug[n_states + k·n_states + obs_cmt_idx]` (a direct read of
-/// the integrated sensitivity state), so it doesn't need a closure.
-pub enum OdeReadoutSens {
-    /// Sens for `OdeReadout::Single`: one closure that fills `n_eta`
-    /// partials per call.
-    Single(OdeOutputSensFn),
-    /// Sens for `OdeReadout::PerCmt`: keyed by the same 1-based CMT
-    /// indices as the matching `PerCmt` readout. Missing entries are a
-    /// parse-time bug (validation enforces parity between readout and
-    /// sens), defensively yielding all-NaN at runtime.
-    PerCmt(HashMap<usize, OdeOutputSensFn>),
-}
-
 /// How an ODE model's observable is read at each observation event.
 ///
 /// Replaces the earlier mutually-exclusive `(obs_cmt_idx, output_fn)` pair
@@ -336,44 +302,10 @@ fn read_observable(
     }
 }
 
-/// Augmented RHS for sensitivity ODE integration. When present, the
-/// integrator can integrate `u_aug` (length `n_states * (1 + n_eta_for_sens)`)
-/// to recover both the original state trajectory and `∂state/∂η_k` for each
-/// (state, η_k) pair.
-///
-/// Signature: `(u_aug, theta, eta, params, t, du_aug)`. Extra `theta` /
-/// `eta` slices are needed because the chain-substituted indiv-param partials
-/// from milestone 2 contain `Theta(k)` / `Eta(k)` references (e.g.
-/// `∂CL/∂η_CL = TVCL · exp(ETA_CL)` at runtime needs both `TVCL` from `theta`
-/// and `ETA_CL` from `eta`).
-///
-/// `params` is the same `PkParams.values` slice the original `rhs` reads.
-///
-/// Storage layout for sens-states in `u_aug` / `du_aug`:
-/// ```text
-///   u_aug[0..n_states]                                   = original states
-///   u_aug[n_states + k·n_states + j]                     = ∂(state j)/∂η_k
-/// ```
-/// (η-major within the sens block, so each η_k's sens vector is contiguous).
-#[allow(clippy::type_complexity)]
-pub type AugmentedRhsFn =
-    Box<dyn Fn(&[f64], &[f64], &[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
-
 /// ODE specification for a model
 pub struct OdeSpec {
     /// RHS function: (u, pk_params_flat, t, du) — writes derivatives into du
     pub rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>,
-    /// Augmented sensitivity RHS — produced by milestone-3 codegen when the
-    /// model has indiv-param η dependence and a non-empty `[odes]` block.
-    /// `None` when sensitivity codegen wasn't possible (analytical PK,
-    /// indiv-params with no η dependence, parser hit an unsupported
-    /// construct in the ODE block, etc.). Used by `gradient = sens`
-    /// (milestone 5) to get analytical state-sensitivities instead of FD.
-    pub rhs_augmented: Option<AugmentedRhsFn>,
-    /// Number of η axes the augmented integrator carries. Zero when
-    /// `rhs_augmented` is `None`. The augmented `u` / `du` buffers have
-    /// length `n_states * (1 + n_eta_for_sens)`.
-    pub n_eta_for_sens: usize,
     /// Number of ODE states
     pub n_states: usize,
     /// Names of state variables (e.g., ["depot", "central"])
@@ -381,13 +313,6 @@ pub struct OdeSpec {
     /// How the per-observation observable is computed. Replaces the
     /// earlier `(obs_cmt_idx, output_fn)` pair — see [`OdeReadout`].
     pub readout: OdeReadout,
-    /// Sensitivity readout — milestone 4 of the Tier 4a sensitivity work.
-    /// When present, has the same `Single` / `PerCmt` shape as `readout`
-    /// and produces `∂y/∂η_k` for every η axis at each observation. `None`
-    /// when the readout is `ObsCmt` (its sens is a direct sens-state read,
-    /// no closure needed) OR when sens codegen wasn't possible (no Form C
-    /// expression, no augmented RHS, etc.).
-    pub readout_sensitivity: Option<OdeReadoutSens>,
     /// Per-state diagonal process-noise variances (σ²_w,i) for SDE / EKF.
     /// Length must equal `n_states` when non-empty; empty means standard ODE
     /// (no diffusion). Declared via `[diffusion]` block as `state ~ variance`,
@@ -1040,12 +965,9 @@ mod tests {
                 let ke = if v > 0.0 { cl / v } else { 0.0 };
                 dy[0] = -ke * y[0];
             }),
-            rhs_augmented: None,
-            n_eta_for_sens: 0,
             n_states: 1,
             state_names: vec!["central".into()],
             readout: OdeReadout::ObsCmt(0),
-            readout_sensitivity: None,
             diffusion_var: Vec::new(),
             init_fn: None,
         }
@@ -1086,12 +1008,9 @@ mod tests {
             rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
                 dy[0] = p[0] - p[1] * y[0];
             }),
-            rhs_augmented: None,
-            n_eta_for_sens: 0,
             n_states: 1,
             state_names: vec!["R".into()],
             readout: OdeReadout::ObsCmt(0),
-            readout_sensitivity: None,
             diffusion_var: Vec::new(),
             init_fn: Some(Box::new(|p: &[f64]| {
                 let (kin, kout) = (p[0], p[1]);
@@ -1314,12 +1233,9 @@ mod tests {
                 dy[0] = -ka * y[0];
                 dy[1] = ka * y[0] - ke * y[1];
             }),
-            rhs_augmented: None,
-            n_eta_for_sens: 0,
             n_states: 2,
             state_names: vec!["depot".into(), "central".into()],
             readout: OdeReadout::ObsCmt(1),
-            readout_sensitivity: None,
             diffusion_var: Vec::new(),
             init_fn: None,
         }
@@ -1746,8 +1662,6 @@ mod tests {
                 let ke = if v > 0.0 { cl / v } else { 0.0 };
                 dy[0] = -ke * y[0];
             }),
-            rhs_augmented: None,
-            n_eta_for_sens: 0,
             n_states: 1,
             state_names: vec!["central".into()],
             readout: OdeReadout::Single(Box::new(
@@ -1760,7 +1674,6 @@ mod tests {
                     }
                 },
             )),
-            readout_sensitivity: None,
             diffusion_var: Vec::new(),
             init_fn: None,
         }
@@ -1890,12 +1803,9 @@ mod tests {
             rhs: Box::new(|_y, _p, _t, dy| {
                 dy[0] = -1.0;
             }),
-            rhs_augmented: None,
-            n_eta_for_sens: 0,
             n_states: 1,
             state_names: vec!["central".into()],
             readout: OdeReadout::ObsCmt(0),
-            readout_sensitivity: None,
             diffusion_var: Vec::new(),
             init_fn: None,
         };

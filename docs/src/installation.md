@@ -14,7 +14,7 @@ Pick your platform:
 
 - [**Linux**](#linux) — fully supported
 - [**macOS**](#macos) — supported (Intel and Apple Silicon)
-- [**Windows**](#windows) — **not supported** (use [WSL2](#windows))
+- [**Windows**](#windows) — **native Enzyme autodiff not supported** (use [WSL2](#windows) or Docker; the ferx R package runs natively with finite-difference gradients)
 
 The build takes **~45–60 min** and needs **~30 GB** of free disk (it compiles LLVM and a stage-1 `rustc`). It's a one-time cost.
 
@@ -173,7 +173,9 @@ RUSTUP_TOOLCHAIN=enzyme
 
 ## Windows
 
-**Windows is not currently supported.** The Enzyme-enabled Rust source build is exercised only on Linux and macOS, the `-Z autodiff=Enable` path is untested on `x86_64-pc-windows-msvc`, and there's no Windows CI to back a green signal.
+**Building the Enzyme toolchain from source is not currently supported on Windows.** The Enzyme-enabled Rust source build is exercised only on Linux and macOS, the `-Z autodiff=Enable` path is untested on `x86_64-pc-windows-msvc`, and there's no Windows CI to back a green signal.
+
+Note that the [ferx R package](https://github.com/FeRx-NLME/ferx-r) *does* install and run natively on Windows using finite-difference gradients (no Enzyme). Only native Enzyme autodiff is unavailable - for that, use one of the workarounds below.
 
 ### Workarounds for Windows users
 

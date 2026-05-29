@@ -891,6 +891,7 @@ mod tests {
             parse_warnings: Vec::new(),
             eta_param_info: Vec::new(),
             indiv_param_names: Vec::new(),
+            indiv_param_partials: crate::types::IndivParamPartials::empty(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),

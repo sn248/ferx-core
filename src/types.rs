@@ -1,6 +1,13 @@
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
 
+// Re-export the milestone-2 sensitivity partials placeholder so
+// `CompiledModel` can hold one and external callers (test fixtures and the
+// `generate_data` data-generation binary) can construct an empty one. The
+// inner `Expression` AST stays parser-private — only `IndivParamPartials::empty`
+// and the `Debug`/`Clone` derives are reachable from outside the crate.
+pub use crate::parser::model_parser::IndivParamPartials;
+
 /// A single dose event (bolus, infusion, or oral)
 #[derive(Debug, Clone)]
 pub struct DoseEvent {
@@ -1060,6 +1067,24 @@ pub struct CompiledModel {
     /// read either zero or NaN for those slots. In practice no PK model
     /// approaches this limit.
     pub indiv_param_names: Vec<String>,
+    /// Symbolic partial derivatives of every top-level `[individual_parameters]`
+    /// assignment w.r.t. each θ and η axis, precomputed at parse time. Outer
+    /// Vec is parallel to `indiv_param_names`; inner Vecs have length
+    /// `n_theta` (user-declared θ) and `n_eta + n_kappa` (extended η) on the
+    /// θ and η sides respectively.
+    ///
+    /// Consumed by the Tier 4a sensitivity-ODE work (milestones 3-5): the
+    /// augmented ODE RHS and Form C readout chain-rule through these
+    /// partials, and the estimator's `gradient = sens` mode evaluates them
+    /// alongside the regular `pk_param_fn`.
+    ///
+    /// Field itself is `pub` so external test fixtures and the
+    /// `generate_data` binary can write `IndivParamPartials::empty()` into
+    /// it. The inner Expression AST stays private — outside callers can
+    /// only stuff in an empty placeholder, not read or mutate the
+    /// parser-produced partials.
+    #[allow(dead_code)] // consumed by milestones 3-5 of the sensitivity work
+    pub indiv_param_partials: IndivParamPartials,
     pub default_params: ModelParameters,
     /// Per-eta flag (parallel to `eta_names` / omega diagonal): `true` when
     /// the user wrote `omega NAME ~ X (sd)` and the parser squared the value.
@@ -2144,6 +2169,7 @@ pub(crate) mod test_helpers {
             eta_names: vec!["ETA_CL".into()],
             kappa_names: Vec::new(),
             indiv_param_names: vec!["CL".into()],
+            indiv_param_partials: IndivParamPartials::empty(),
             default_params: ModelParameters {
                 theta: vec![1.0],
                 theta_names: vec!["CL".into()],

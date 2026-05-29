@@ -222,6 +222,7 @@ fn build_warfarin_model() -> CompiledModel {
         n_kappa: 0,
         kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
+        indiv_param_partials: crate::types::IndivParamPartials::empty(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -336,6 +337,7 @@ fn generate_two_cpt_iv() {
         n_kappa: 0,
         kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into(), "V".into(), "Q".into(), "V2".into()],
+        indiv_param_partials: crate::types::IndivParamPartials::empty(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -455,6 +457,7 @@ fn generate_two_cpt_oral_cov() {
             "V2".into(),
             "KA".into(),
         ],
+        indiv_param_partials: crate::types::IndivParamPartials::empty(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -616,6 +619,7 @@ fn generate_mm_oral() {
         n_kappa: 0,
         kappa_names: Vec::new(),
         indiv_param_names: vec!["VMAX".into(), "KM".into(), "V".into(), "KA".into()],
+        indiv_param_partials: crate::types::IndivParamPartials::empty(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,

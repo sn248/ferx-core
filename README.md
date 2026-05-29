@@ -5,7 +5,6 @@
 [![Docs](https://github.com/FeRx-NLME/ferx-core/actions/workflows/docs.yml/badge.svg)](https://github.com/FeRx-NLME/ferx-core/actions/workflows/docs.yml)
 [![codecov](https://codecov.io/gh/FeRx-NLME/ferx-core/branch/main/graph/badge.svg)](https://codecov.io/gh/FeRx-NLME/ferx-core)
 [![License: MIT](https://img.shields.io/github/license/FeRx-NLME/ferx-core)](LICENSE)
-[![Latest release](https://img.shields.io/github/v/tag/FeRx-NLME/ferx-core?label=release)](https://github.com/FeRx-NLME/ferx-core/releases)
 
 A high-performance Nonlinear Mixed Effects (NLME) modeling engine for population pharmacokinetics, written in Rust. Implements FOCE/FOCEI estimation with analytical PK solutions and an optional ODE solver, similar to NONMEM.
 

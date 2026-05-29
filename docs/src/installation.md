@@ -10,13 +10,26 @@ ferx-core requires a nightly Rust toolchain with Enzyme for automatic differenti
 >
 > If you previously set up the toolchain this way, remove it (`rustup toolchain uninstall enzyme`) and rebuild from source as below.
 
+## Two separate one-time costs
+
+Autodiff setup has **two distinct one-time steps**. Don't conflate them — they happen at different times and only the first is documented on this page:
+
+| Step | What it is | Roughly | When |
+|---|---|---|---|
+| **1. Build the Enzyme toolchain** | Compile a custom nightly `rustc` + LLVM with Enzyme from source (**this page**) | ~45–60 min | **Once per machine** — reused forever. |
+| **2. Compile ferx / ferx-core** | Build the crates and link them | ~1–2 h (autodiff) / faster (FD) | **First build only** — Cargo caches dependencies, so later builds take minutes. |
+
+Step 2 is slower on the autodiff path because it uses **fat LTO** (required for cross-crate Enzyme correctness; see [Building ferx-core](#building-ferx-core-from-source) below). The finite-difference build skips step 1 entirely and uses thin LTO in step 2, so it links noticeably faster.
+
+---
+
 Pick your platform:
 
 - [**Linux**](#linux) — fully supported
 - [**macOS**](#macos) — supported (Intel and Apple Silicon)
 - [**Windows**](#windows) — **native Enzyme autodiff not supported** (use [WSL2](#windows) or Docker; the ferx R package runs natively with finite-difference gradients)
 
-The build takes **~45–60 min** and needs **~30 GB** of free disk (it compiles LLVM and a stage-1 `rustc`). It's a one-time cost.
+The **step 1** toolchain build takes **~45–60 min** and needs **~30 GB** of free disk (it compiles LLVM and a stage-1 `rustc`). It's a one-time cost.
 
 ---
 

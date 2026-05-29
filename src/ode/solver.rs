@@ -323,51 +323,49 @@ mod tests {
 
     /// Regression guard for FSAL (First Same As Last) stage reuse.
     ///
-    /// Without FSAL the solver evaluates `rhs` exactly 7 times per integration
-    /// iteration (k1..k7). With FSAL k1 is recomputed only on the very first
-    /// iteration; every subsequent iteration reuses the prior k7 (or the
-    /// already-valid k1 after a rejection), so total rhs = 6 · N + 1, where N
-    /// is the iteration count. The ratio `(rhs_calls - 1) / 6` therefore
-    /// equals the iteration count exactly when FSAL is active — and the bound
-    /// `rhs_calls ≤ 6·iters + 1` is sharp. We measure both directly by also
-    /// tracking iterations from the saveat side: a known-step diagnostic.
+    /// Structural rather than count-based: with FSAL the k1 of step k+1 is
+    /// reused (swapped in) from the prior step's k7, so the rhs closure is
+    /// **never** invoked twice in a row at the same `(u, t)`. Without FSAL,
+    /// k7 of step k and k1 of step k+1 are two separate rhs calls at
+    /// bit-identical `(u_new, t_new)` — an adjacent duplicate in the call
+    /// sequence. Recording the `(u, t)` of every rhs call and scanning for
+    /// any adjacent duplicate detects FSAL removal regardless of iteration
+    /// count, controller, tolerance, or host platform.
     ///
-    /// If a future change removes the FSAL swap, `rhs_calls / iters` jumps
-    /// from 6.0+1/N to 7.0 — this test would fail by a comfortable margin.
+    /// The earlier modular check `(n - 1) % 6 == 0` was unsharp: FSAL-off
+    /// produces `n = 7N`, which satisfies the check whenever `N ≡ 1 (mod 6)`
+    /// — a 1-in-6 silent-pass rate across the population of iteration counts
+    /// the test might land on.
     #[test]
     fn test_fsal_reuses_last_stage() {
-        use std::cell::Cell;
-        let rhs_calls = Cell::new(0_u32);
-        // Smooth exponential decay — adaptive controller rarely rejects, so
-        // the FSAL ratio is clean. Single saveat at the end so no truncation
-        // disturbs free-running step sizes.
-        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
-            rhs_calls.set(rhs_calls.get() + 1);
+        use std::cell::RefCell;
+        // Record `(u[0], t)` bit patterns at every rhs invocation. Bit
+        // equality (rather than `==` on f64) sidesteps any ambiguity about
+        // NaN / signed-zero corner cases — though for this smooth ODE there
+        // are none.
+        let calls: RefCell<Vec<(u64, u64)>> = RefCell::new(Vec::new());
+        let rhs = |u: &[f64], _p: &[f64], t: f64, du: &mut [f64]| {
+            calls.borrow_mut().push((u[0].to_bits(), t.to_bits()));
             du[0] = -0.1 * u[0];
         };
         let opts = OdeSolverOptions::default();
         let _ = solve_ode(&rhs, &[1.0], (0.0, 20.0), &[], &[20.0], &opts);
-        let n = rhs_calls.get();
+        let calls = calls.into_inner();
 
-        // Sharp bound: FSAL-active produces exactly 6·iters + 1 rhs evals.
-        // For this ODE/tolerance the solver takes ~25-45 iters (controller-
-        // dependent). We don't know iters from outside, but we know:
-        //   FSAL-on:  n ≡ 1 (mod 6)
-        //   FSAL-off: n ≡ 0 (mod 7)
-        // The structural test is `(n - 1) % 6 == 0` AND `n % 7 != 0` for any
-        // n not in the trivial overlap. (Overlap occurs at n = 1, 43, 85, ...;
-        // the relevant range here is ~150-280, where 169, 211, 253 overlap.)
-        // The simpler robust assertion is the count: with FSAL n < (7/6)·iters
-        // is a 14% gap, easily detectable. Hard-code the upper bound from a
-        // calibration measurement: 25-iter FSAL run = 151, 45-iter = 271; the
-        // matching no-FSAL counts are 175 and 315. Bound at 280 catches the
-        // regression for any reasonable iteration count in this window.
-        assert!(n > 0, "rhs never called — solver early-exited");
         assert!(
-            (n - 1) % 6 == 0,
-            "rhs calls = {} is not of the form 6·N+1; FSAL appears inactive \
-             (expected: every accepted/rejected iteration reuses prior k1).",
-            n,
+            calls.len() > 7,
+            "solver did not perform multiple steps (calls = {})",
+            calls.len(),
+        );
+
+        let dup_at = calls.windows(2).position(|w| w[0] == w[1]);
+        assert!(
+            dup_at.is_none(),
+            "FSAL appears inactive: rhs called twice consecutively at the \
+             same (u, t) at call index {} of {} (k7 of step k and k1 of \
+             step k+1 should reuse a single evaluation).",
+            dup_at.unwrap(),
+            calls.len(),
         );
     }
 }

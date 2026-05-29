@@ -352,7 +352,7 @@ pub fn run_foce_gn(
                 if verbose {
                     eprintln!("Running covariance step...");
                 }
-                let cov = compute_covariance(
+                match compute_covariance(
                     &x,
                     &gn_params,
                     model,
@@ -361,11 +361,18 @@ pub fn run_foce_gn(
                     &h_matrices,
                     &kappas,
                     options,
-                );
-                if cov.is_none() {
-                    warnings.push("Covariance step failed".to_string());
+                ) {
+                    Some(out) => {
+                        if let Some(w) = out.warning {
+                            warnings.push(w);
+                        }
+                        Some(out.matrix)
+                    }
+                    None => {
+                        warnings.push("Covariance step failed".to_string());
+                        None
+                    }
                 }
-                cov
             } else {
                 None
             };
@@ -448,7 +455,7 @@ pub fn run_foce_gn(
             eprintln!("Running covariance step...");
         }
         let packed = pack_params(&final_params);
-        let cov = compute_covariance(
+        match compute_covariance(
             &packed,
             &final_params,
             model,
@@ -457,11 +464,18 @@ pub fn run_foce_gn(
             &final_h_mats,
             &final_kappas,
             options,
-        );
-        if cov.is_none() {
-            warnings.push("Covariance step failed".to_string());
+        ) {
+            Some(out) => {
+                if let Some(w) = out.warning {
+                    warnings.push(w);
+                }
+                Some(out.matrix)
+            }
+            None => {
+                warnings.push("Covariance step failed".to_string());
+                None
+            }
         }
-        cov
     } else {
         None
     };

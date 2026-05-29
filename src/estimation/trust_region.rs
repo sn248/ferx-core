@@ -399,7 +399,7 @@ pub fn optimize_trust_region(
         if options.verbose {
             eprintln!("Computing covariance matrix...");
         }
-        compute_covariance(
+        match compute_covariance(
             &best_x,
             init_params,
             model,
@@ -408,7 +408,15 @@ pub fn optimize_trust_region(
             &final_hms,
             &final_kappas,
             options,
-        )
+        ) {
+            Some(out) => {
+                if let Some(w) = out.warning {
+                    warnings.push(w);
+                }
+                Some(out.matrix)
+            }
+            None => None,
+        }
     } else {
         None
     };

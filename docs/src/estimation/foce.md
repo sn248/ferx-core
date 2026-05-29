@@ -119,6 +119,18 @@ When `covariance = true`, ferx-core computes the variance-covariance matrix of t
 - **Relative standard errors (%RSE)** for assessing estimation precision
 - **Omega SEs** via delta method from the Cholesky parameterization
 
+### Hessian regularization
+
+The FD second derivative inherits roundoff at scale `≈ (eps_OFV / h²)`, which on well-conditioned surfaces can push one or two eigenvalues of the symmetrised free-block Hessian slightly below zero even when the underlying surface is positive definite (issue [#129](https://github.com/FeRx-NLME/ferx-core/issues/129)). Rather than rejecting the entire covariance step on that artefact, ferx-core inverts via a symmetric eigendecomposition and clips eigenvalues below `max(λ_max · 1e-10, 1e-12)` to that floor before reconstructing `H⁻¹`. PD inputs are inverted unchanged; non-PD inputs recover a PD covariance and a warning is added to `FitResult.warnings`:
+
+```
+Covariance step regularized: eigenvalue floor applied to FD Hessian
+  (1 of 7 free-block eigenvalues clipped; min eig = -3.21e-08, floor = 4.56e-09).
+Standard errors should be interpreted with care.
+```
+
+SEs in the regularised directions are inflated (since `1/λ_clipped` is larger than the would-be true `1/λ`), so when this warning fires the rotated reference NONMEM fit or the autodiff build (`--features autodiff`, machine-precision second derivatives) is the right cross-check. A Hessian whose spectrum is genuinely indefinite — every eigenvalue ≤ 0 — still fails outright with the standard `Covariance step failed` message; the floor only rescues near-PD cases.
+
 ## Convergence
 
 The outer loop terminates when any of:

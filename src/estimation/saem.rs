@@ -1755,7 +1755,7 @@ pub fn run_saem(
                 eprintln!("Running covariance step...");
             }
             let packed = pack_params(&final_params);
-            let cov = compute_covariance(
+            match compute_covariance(
                 &packed,
                 &final_params,
                 model,
@@ -1764,11 +1764,18 @@ pub fn run_saem(
                 &h_matrices,
                 &final_kappas,
                 options,
-            );
-            if cov.is_none() {
-                warnings.push("Covariance step failed — SEs not available".to_string());
+            ) {
+                Some(out) => {
+                    if let Some(w) = out.warning {
+                        warnings.push(w);
+                    }
+                    Some(out.matrix)
+                }
+                None => {
+                    warnings.push("Covariance step failed — SEs not available".to_string());
+                    None
+                }
             }
-            cov
         } else {
             None
         };

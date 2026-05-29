@@ -759,6 +759,7 @@ mod tests {
             eta_names,
             indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
             indiv_param_partials: crate::types::IndivParamPartials::empty(),
+            ode_sensitivity_rhs: None,
             default_params,
             omega_init_as_sd: vec![false; 3],
             sigma_init_as_sd: vec![false],

@@ -1853,7 +1853,16 @@ impl Default for FitOptions {
             run_covariance_step: true,
             interaction: true,
             verbose: true,
-            optimizer: Optimizer::Slsqp,
+            // BOBYQA — derivative-free quadratic trust-region. Chosen as the
+            // default because the fixed-EBE FD gradient that SLSQP/L-BFGS rely
+            // on is biased on ill-conditioned fits (ODE/PD models, sparse data,
+            // Hill-ridge identifiability), and SLSQP can declare convergence
+            // hundreds of OFV units above the true minimum. BOBYQA re-evaluates
+            // EBEs at every trial point and routinely reaches a lower OFV
+            // without the cost of `reconverge_gradient_interval = 1`. See
+            // `docs/src/estimation/optimizers.md` for the cefepime and Emax
+            // PKPD validations and guidance on when to switch back to SLSQP.
+            optimizer: Optimizer::Bobyqa,
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,

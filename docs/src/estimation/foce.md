@@ -41,7 +41,7 @@ If the EBE search wanders into a region where the individual NLL evaluates to a 
 
 ### Gradient accuracy vs cost (reconverged EBEs)
 
-By default the population gradient holds each subject's EBEs (\\( \hat\eta \\)) and FOCE Hessian fixed while perturbing the population parameters — the *fixed-EBE* gradient. This is cheap, but it omits the response of the inner solution to \\( \theta \\) and \\( \Omega \\). On well-conditioned problems that omitted term is negligible and a gradient optimizer matches the derivative-free `bobyqa`. On **ill-conditioned** problems it is not: the omitted term is what separates a true descent direction from a flat-looking plateau, and `slsqp` can report `converged` at an OFV far above the `bobyqa` optimum.
+By default the population gradient holds each subject's EBEs (\\( \hat\eta \\)) and FOCE Hessian fixed while perturbing the population parameters — the *fixed-EBE* gradient. This is cheap, but it omits the response of the inner solution to \\( \theta \\) and \\( \Omega \\). On well-conditioned problems that omitted term is negligible and a gradient optimizer matches the derivative-free `bobyqa` (the default; see [Outer Optimizers](optimizers.md)). On **ill-conditioned** problems it is not: the omitted term is what separates a true descent direction from a flat-looking plateau, and `slsqp` can report `converged` at an OFV far above the `bobyqa` optimum — which is exactly why `bobyqa` is the default.
 
 Set `reconverge_gradient_interval = 1` (in `[fit_options]`) to re-solve the inner EBE loop at every finite-difference perturbation, recovering the full surface. This costs roughly **5–6×** per gradient — reserve it for fits whose OFV looks suspiciously high. IOV models (`kappa`/`block_kappa`) always reconverge, so the setting is a no-op there; it only changes non-IOV fits.
 
@@ -51,16 +51,16 @@ To amortize that cost, `reconverge_gradient_interval = N` reconverges only every
 
 | Configuration | OFV | Wall time |
 |---|---:|---:|
-| `slsqp` (default, fixed-EBE gradient) | 68,252 | 390 s |
+| `slsqp` (fixed-EBE gradient) | 68,252 | 390 s |
 | `slsqp` + reconverge every 10 (`interval = 10`) | 66,118 | 633 s |
 | `slsqp` + reconverge every 5 (`interval = 5`) | 66,056 | 1,004 s |
 | `slsqp` + reconverge every eval (`interval = 1`) | **65,485** | 1,871 s |
-| `bobyqa` (derivative-free reference) | 65,598 | 315 s |
+| `bobyqa` (derivative-free, **default**) | 65,598 | 315 s |
 | ferx OFV evaluated at NONMEM's final estimates | 67,514 | — |
 
 The fixed-EBE gradient stalls `slsqp` ~2,650 OFV units above `bobyqa`. Reconverging the EBEs on every gradient evaluation closes the entire gap and reaches an optimum marginally below `bobyqa`'s — and below the point NONMEM converged to (NONMEM's estimates score 67,514 under ferx's likelihood), confirming the stall was a gradient-bias artifact, not a worse model.
 
-A larger `reconverge_gradient_interval` trades that accuracy back for speed: reconverging every 5th or 10th gradient still closes ~80% of the stall, but the OFV degrades monotonically as the interval grows (the cheap fixed-EBE gradients in between bias the direction enough that `slsqp` declares convergence slightly early). On this problem every interval setting is dominated by `bobyqa` on *both* OFV and wall time, so a derivative-free search remains the better choice when it is affordable. The reconverged gradient earns its keep when `bobyqa` is not an option — a gradient optimizer is required, or the parameter count is high enough that derivative-free search scales poorly.
+A larger `reconverge_gradient_interval` trades that accuracy back for speed: reconverging every 5th or 10th gradient still closes ~80% of the stall, but the OFV degrades monotonically as the interval grows (the cheap fixed-EBE gradients in between bias the direction enough that `slsqp` declares convergence slightly early). On this problem every interval setting is dominated by `bobyqa` on *both* OFV and wall time — which is why `bobyqa` is the default. The reconverged-`slsqp` path earns its keep when a gradient optimizer is required (e.g. parameter count high enough that derivative-free search scales poorly, or downstream tooling that consumes the optimizer's gradient).
 
 ## FOCE vs FOCEI
 
@@ -95,7 +95,7 @@ Set via `[fit_options]`:
 ```
 [fit_options]
   method    = focei
-  optimizer = bobyqa   # default: slsqp
+  optimizer = slsqp    # override the default (bobyqa)
 ```
 
 ## Global Search
@@ -139,5 +139,5 @@ The inner loop warm-starts EBE estimation from the previous outer iteration's EB
   method     = focei
   maxiter    = 500
   covariance = true
-  optimizer  = slsqp
+  # optimizer omitted → uses the default (bobyqa); set explicitly to switch
 ```

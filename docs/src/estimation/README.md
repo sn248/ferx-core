@@ -20,7 +20,7 @@ These chain after a primary method via `methods = [...]` and refine the result r
 
 ## Outer optimizers
 
-The outer loop optimizer is selected independently of the method. See **[Outer Optimizers](optimizers.md)** for a full comparison of SLSQP, BOBYQA, trust-region, BFGS, and the others. Short version: start with `slsqp` (default), switch to `bobyqa` if it stalls.
+The outer loop optimizer is selected independently of the method. See **[Outer Optimizers](optimizers.md)** for a full comparison of BOBYQA, SLSQP, trust-region, BFGS, and the others. Short version: keep the default (`bobyqa` — derivative-free, robust on ODE/PD models and sparse data); switch to `slsqp` for smooth analytical PK models where the gradient is reliable.
 
 ---
 

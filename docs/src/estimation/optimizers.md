@@ -29,8 +29,8 @@ Set via `[fit_options]`:
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `slsqp` | Sequential Least Squares Programming | **Default.** Gradient-based, handles bounds well. Fast on well-conditioned models. |
-| `bobyqa` | Bounded Optimization BY Quadratic Approximation | Derivative-free. Recommended when the fixed-EBE gradient is noisy (ODE models, sparse data). Often reaches a lower OFV than `slsqp` without reconverging. |
+| `bobyqa` | Bounded Optimization BY Quadratic Approximation | **Default.** Derivative-free quadratic trust-region. Avoids the fixed-EBE gradient bias that stalls gradient methods on ill-conditioned fits; consistently reaches a lower OFV on ODE/PD models, sparse data, and Hill-ridge problems without reconverging the inner loop. |
+| `slsqp` | Sequential Least Squares Programming | Gradient-based, handles bounds well. Fast on well-conditioned analytical PK models; can stall above the true minimum on ODE/PD / sparse-data fits unless paired with `reconverge_gradient_interval = 1` (5–6× cost). |
 | `nlopt_lbfgs` | L-BFGS via NLopt | Limited-memory BFGS. Useful for high-parameter-count models. |
 | `mma` | Method of Moving Asymptotes | Alternative constrained gradient optimizer. Rarely needed. |
 
@@ -51,15 +51,17 @@ Set via `[fit_options]`:
 
 ## When to use which
 
-**`slsqp` (default)** — start here. Works well for most 1–2 compartment models with 2–4 random effects.
+**`bobyqa` (default)** — start here. Derivative-free quadratic trust-region; re-evaluates EBEs at every trial point so it avoids the fixed-EBE gradient bias that stalls gradient-based optimizers on ill-conditioned fits. On the cefepime 2-cpt benchmark below it reaches a lower OFV than `slsqp` (even reconverged at full cost) in less wall time. Works equally well on smooth analytical PK models — converges more slowly than gradient methods per iteration but each iteration is cheap (no FD gradient sweep).
 
-**`bobyqa`** — best single alternative. Use when `slsqp` converges to a suspiciously high OFV, or for ODE models and sparse data where the finite-difference gradient is noisy. Derivative-free means it re-evaluates EBEs at every trial point, so it naturally avoids the fixed-EBE gradient bias that can stall `slsqp`.
+**`slsqp`** — switch to this when `bobyqa` is too slow on a smooth, well-conditioned model with many parameters (it can need many quadratic-interpolation samples to triangulate a high-dimensional surface). Gradient-based, handles box constraints cleanly; pair with `reconverge_gradient_interval = 1` if it stalls above an expected OFV.
 
 **`trust_region`** — for models with many parameters (large θ + Ω) or when combined with `inits_from_nca`. The second-order curvature information helps when starting values are already in the basin.
 
-**`gn` / `gn_hybrid`** — these are [Gauss-Newton estimation methods](gauss-newton.md), not outer optimizers in the same sense. They replace the FOCE outer loop entirely rather than selecting an algorithm within it.
+**`gn` / `gn_hybrid`** — these are [Gauss-Newton estimation methods](gauss-newton.md), not outer optimizers in the same sense. They replace the FOCE outer loop entirely rather than selecting an algorithm within it. (`gn_hybrid` polishes via FOCEI and inherits the `optimizer` setting for that stage — so the polish runs with `bobyqa` unless overridden.)
 
-**`lbfgs` / `nlopt_lbfgs` / `mma`** — rarely needed. Prefer `slsqp` or `bobyqa`.
+**`lbfgs` / `nlopt_lbfgs` / `mma`** — rarely needed. Prefer `bobyqa` or `slsqp`.
+
+> **Why is BOBYQA the default?** Until 2026 the default was `slsqp`. The Emax PKPD benchmark in [`saem.md`](saem.md) and the cefepime validation below both showed that the fixed-EBE FD gradient drives `slsqp` to local minima hundreds of OFV units above the true optimum on ODE/PD models and sparse data — exactly the workloads that aren't covered by the analytical-PK comfort zone. `bobyqa` doesn't use the gradient, doesn't see the bias, and reaches the same (or lower) OFV in the same or less wall time. The previous behaviour is one line away: `optimizer = slsqp` in `[fit_options]`.
 
 ---
 
@@ -71,10 +73,10 @@ Set `reconverge_gradient_interval = 1` to re-solve the inner loop at every gradi
 
 | Configuration | OFV | Wall time |
 |---|---:|---:|
-| `slsqp` (fixed-EBE, default) | 68,252 | 390 s |
+| `slsqp` (fixed-EBE) | 68,252 | 390 s |
 | `slsqp` + `interval = 10` | 66,118 | 633 s |
 | `slsqp` + `interval = 1` | **65,485** | 1,871 s |
-| `bobyqa` (derivative-free) | 65,598 | 315 s |
+| `bobyqa` (derivative-free, **default**) | 65,598 | 315 s |
 
 On this cefepime 2-compartment dataset `bobyqa` reaches a near-optimal solution faster than any reconverged `slsqp` setting. The reconverged gradient is most useful when derivative-free search is too slow (high parameter count) or when a gradient optimizer is required for other reasons.
 

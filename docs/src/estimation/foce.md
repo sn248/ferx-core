@@ -88,27 +88,15 @@ FOCEI is more accurate when the residual variance depends on the predicted value
 
 ## Optimizer Options
 
-### NLopt Algorithms (Recommended)
+The outer optimizer is configured independently of the estimation method. See **[Outer Optimizers](optimizers.md)** for a full description of all available algorithms (SLSQP, BOBYQA, trust-region, BFGS, L-BFGS, MMA) and guidance on when to use each.
 
-| Algorithm | Key | Description |
-|-----------|-----|-------------|
-| SLSQP | `slsqp` | Sequential Least Squares Programming. Handles bounds well. **Default and recommended.** |
-| L-BFGS | `nlopt_lbfgs` | Limited-memory BFGS. Good for large parameter spaces. |
-| MMA | `mma` | Method of Moving Asymptotes. Alternative constrained optimizer. |
-| BOBYQA | `bobyqa` | Derivative-free trust-region via quadratic interpolation. Useful when FD gradients are unreliable (e.g. noisy FOCE surface). |
+Set via `[fit_options]`:
 
-### Built-in Algorithms
-
-| Algorithm | Key | Description |
-|-----------|-----|-------------|
-| BFGS | `bfgs` | Quasi-Newton with backtracking line search. |
-| L-BFGS | `lbfgs` | Memory-efficient BFGS variant. |
-
-### Newton Trust-Region (argmin)
-
-| Algorithm | Key | Description |
-|-----------|-----|-------------|
-| Trust region | `trust_region` | Newton trust-region with Steihaug conjugate-gradient subproblem. Uses the AD-based outer gradient (`subject_nll_pop_grad`) and a BHHH approximate Hessian `H ≈ 4 Σ gᵢgᵢᵀ` — always positive semi-definite, so the Steihaug subproblem stays well-conditioned. The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)` (typically 5 for standard NLME models); pin it explicitly with `steihaug_max_iters`. |
+```
+[fit_options]
+  method    = focei
+  optimizer = bobyqa   # default: slsqp
+```
 
 ## Global Search
 

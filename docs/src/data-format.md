@@ -45,7 +45,7 @@ ID,TIME,DV,EVID,AMT,CMT,MDV,OCC
 
 The occasion index can be any positive integer; they do not need to start at 1 or be consecutive, but a different number means a different occasion with its own kappa EBE.
 
-See [IOV documentation](estimation/iov.md) for full details.
+See [IOV documentation](model-file/iov.md) for full details.
 
 ## Covariate Columns
 

@@ -3486,8 +3486,20 @@ fn parse_parameters(
     // The `FIX` keyword is case-insensitive and must be the exact token —
     // the trailing `\b` rejects prefix matches like `FIXED`, which would
     // otherwise silently mark the parameter as fixed.
+    // Accept FIX in any of these positions:
+    //   theta NAME(init, FIX)                   — comma before FIX, inside parens
+    //   theta NAME(init FIX)                    — no comma, inside parens
+    //   theta NAME(init) FIX                    — after closing paren
+    //   theta NAME(init, lower, FIX)            — lower only, FIX inside
+    //   theta NAME(init, lower) FIX             — lower only, FIX outside
+    //   theta NAME(init, lower, upper, FIX)
+    //   theta NAME(init, lower, upper) FIX
+    // Bounds: lower (group 3) is optional; upper (group 4) is optional within
+    // the bounds sub-group, defaulting to 1e9 when absent.
+    // Group 5 captures FIX inside the parens; group 6 captures FIX outside.
+    // `fixed` is true when either group is present.
     let theta_re = Regex::new(
-        r"(?i)theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)\s*,\s*([0-9eE.+-]+))?\s*(?:,\s*(FIX)\b)?\s*\)",
+        r"(?i)theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?",
     )
     .unwrap();
 
@@ -3547,7 +3559,7 @@ fn parse_parameters(
                 .get(4)
                 .map(|m| m.as_str().parse().unwrap_or(1e9))
                 .unwrap_or(1e9);
-            let fixed = caps.get(5).is_some();
+            let fixed = caps.get(5).is_some() || caps.get(6).is_some();
             thetas.push(ThetaSpec {
                 name,
                 init,
@@ -7918,6 +7930,72 @@ mod tests {
         assert!(thetas[0].fixed);
         assert!((thetas[0].lower - 0.01).abs() < 1e-12);
         assert!((thetas[0].upper - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_theta_fix_no_comma_inside_parens() {
+        // theta NAME(init FIX) — no comma before FIX
+        let lines = vec!["theta TVCL(0.75 FIX)".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(thetas[0].fixed);
+        assert!((thetas[0].init - 0.75).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_theta_fix_after_paren() {
+        // theta NAME(init) FIX — FIX outside closing paren
+        let lines = vec!["theta TVCL(0.75) FIX".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(thetas[0].fixed);
+        assert!((thetas[0].init - 0.75).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_theta_fix_after_paren_with_bounds() {
+        // theta NAME(init, lower, upper) FIX — bounds + FIX outside paren
+        let lines = vec!["theta TVKA(1.0, 0.01, 10.0) FIX".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(thetas[0].fixed);
+        assert!((thetas[0].init - 1.0).abs() < 1e-12);
+        assert!((thetas[0].lower - 0.01).abs() < 1e-12);
+        assert!((thetas[0].upper - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_theta_lower_bound_only() {
+        // theta NAME(init, lower) — upper defaults to 1e9
+        let lines = vec!["theta TVCL(1.0, 0.01)".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(!thetas[0].fixed);
+        assert!((thetas[0].init - 1.0).abs() < 1e-12);
+        assert!((thetas[0].lower - 0.01).abs() < 1e-12);
+        assert!((thetas[0].upper - 1e9).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_parse_theta_lower_bound_fix_inside() {
+        // theta NAME(init, lower, FIX) — lower only + FIX inside parens
+        let lines = vec!["theta TVCL(1.0, 0.01, FIX)".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(thetas[0].fixed);
+        assert!((thetas[0].lower - 0.01).abs() < 1e-12);
+        assert!((thetas[0].upper - 1e9).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_parse_theta_lower_bound_fix_outside() {
+        // theta NAME(init, lower) FIX — lower only + FIX after paren
+        let lines = vec!["theta TVCL(1.0, 0.01) FIX".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(thetas[0].fixed);
+        assert!((thetas[0].lower - 0.01).abs() < 1e-12);
+        assert!((thetas[0].upper - 1e9).abs() < 1.0);
     }
 
     #[test]

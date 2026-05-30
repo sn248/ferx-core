@@ -2432,6 +2432,166 @@ mod tests {
         assert_eq!(w.category, "general");
     }
 
+    /// Round-trip table covering every literal warning message emitted by the
+    /// engine, with the (severity, category) it should classify to.
+    ///
+    /// This protects the classifier contract from quiet regressions when a
+    /// message gets a typo fix or a wording change. If you edit a message
+    /// string in `outer_optimizer.rs`, `saem.rs`, `gauss_newton.rs`,
+    /// `trust_region.rs`, or `api.rs`, mirror the edit here so the test
+    /// keeps reflecting the engine's actual output.
+    ///
+    /// Messages built by `format!(..)` are exercised with a representative
+    /// instantiation: the substrings the classifier matches on must remain
+    /// present after interpolation.
+    #[test]
+    fn classify_warning_roundtrips_every_engine_message() {
+        use WarningSeverity::*;
+        let table: &[(&str, WarningSeverity, &str)] = &[
+            // -- outer_optimizer.rs ----------------------------------------
+            (
+                "Outer optimization did not converge",
+                Critical,
+                "convergence",
+            ),
+            ("Covariance step failed", Critical, "covariance_step"),
+            // global_search has two arms: explicit "disabled" is a runtime
+            // failure (Warning); a bare mention without "disabled" is
+            // informational.
+            (
+                "global_search disabled: bad seed",
+                Warning,
+                "optimizer_config",
+            ),
+            ("global_search reached eval cap", Info, "optimizer_config"),
+            ("cancelled by user", Info, "cancelled"),
+            // -- gauss_newton.rs -------------------------------------------
+            (
+                "Gauss-Newton: trust radius collapsed",
+                Warning,
+                "optimizer_health",
+            ),
+            (
+                "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed",
+                Warning,
+                "optimizer_health",
+            ),
+            (
+                "Gauss-Newton: max iterations reached without convergence",
+                Critical,
+                "convergence",
+            ),
+            // -- saem.rs ---------------------------------------------------
+            (
+                "Covariance step failed \u{2014} SEs not available",
+                Critical,
+                "covariance_step",
+            ),
+            (
+                "saem_n_leapfrog > 0 but HMC is unavailable (requires `autodiff` feature)",
+                Info,
+                "gradient_fallback",
+            ),
+            // -- trust_region.rs ------------------------------------------
+            (
+                "Trust-region did not converge: line search stalled",
+                Critical,
+                "convergence",
+            ),
+            // -- api.rs ----------------------------------------------------
+            (
+                "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).",
+                Warning,
+                "dw_autocorrelation",
+            ),
+            (
+                "Negative IWRES autocorrelation detected (Durbin-Watson = 2.80).",
+                Warning,
+                "dw_autocorrelation",
+            ),
+            (
+                "M3 BLOQ handling requires FOCEI semantics",
+                Warning,
+                "bloq_method",
+            ),
+            (
+                "SIR failed: covariance not positive definite",
+                Warning,
+                "sir",
+            ),
+            (
+                "SIR requested but covariance matrix is not available",
+                Warning,
+                "sir",
+            ),
+            (
+                "IMP: 2 subject(s) had ESS = 0 (proposal collapse)",
+                Warning,
+                "importance_sampling",
+            ),
+            (
+                "LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV",
+                Warning,
+                "data_quality",
+            ),
+            (
+                "block omega: ETA_CL x ETA_V have mixed lognormal / additive parameterisations",
+                Warning,
+                "omega_structure",
+            ),
+            ("mu-ref: CL, V, KA", Info, "mu_referencing"),
+            (
+                "Multi-start: best result from start 3/8",
+                Info,
+                "multi_start",
+            ),
+            (
+                "12 threads configured but only 10 subject(s)",
+                Info,
+                "threads",
+            ),
+            ("SAEM with more threads than subjects/2", Info, "threads"),
+            (
+                "Covariance step: 35 parameters \u{2192} n\u{00b2} OFV evaluations",
+                Info,
+                "covariance_step",
+            ),
+            (
+                "Covariance step: 35 parameters -> n^2 OFV evaluations",
+                Info,
+                "covariance_step",
+            ),
+            // -- chain-prefixed (multi-stage) -----------------------------
+            (
+                "[FOCEI] Covariance step failed",
+                Critical,
+                "covariance_step",
+            ),
+            ("[SAEM] mu-ref: CL", Info, "mu_referencing"),
+            (
+                "[FOCEI] Outer optimization did not converge",
+                Critical,
+                "convergence",
+            ),
+        ];
+
+        let mut failures: Vec<String> = Vec::new();
+        for (msg, want_sev, want_cat) in table {
+            let got = classify_warning(msg);
+            if got.severity != *want_sev || got.category != *want_cat {
+                failures.push(format!(
+                    "  {msg:?} -> expected ({:?}, {:?}), got ({:?}, {:?})",
+                    want_sev, want_cat, got.severity, got.category
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "classify_warning round-trip failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[test]
     fn is_ode_based_false_for_analytical() {
         let m = test_helpers::analytical_model(GradientMethod::Auto);

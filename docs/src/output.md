@@ -112,6 +112,17 @@ Both formulas use the **uncentered second moment with `n` divisor**, matching th
 
 Values of `NaN` indicate a zero-variance omega component (ETA) or fewer than two valid residuals (EPS).
 
+**Kappa shrinkage** (IOV models only — `shrinkage_kappa: Vec<f64>` and `shrinkage_kappa_by_occ: Vec<Vec<f64>>`):
+
+When the model contains `kappa` or `block_kappa` declarations, two additional shrinkage metrics are computed using the same uncentered-moment convention.
+
+*Pooled* — one value per kappa parameter, averaged over every (subject, occasion) pair:
+\\[ \text{shrinkage}_{\kappa,j} = 1 - \frac{\sqrt{\frac{1}{N_{\text{subj}} \cdot K}\sum_i \sum_k \hat{\kappa}_{ijk}^2}}{\sqrt{\omega_{\text{iov},jj}}} \\]
+
+*Per-occasion* — the same formula restricted to occasion index `occ_idx` (0-based order of first appearance), stored in `shrinkage_kappa_by_occ[occ_idx][kappa_idx]`. Only reported when two or more occasions are present. Useful for identifying sparse occasions (high shrinkage in a single occasion suggests that occasion has little information on kappa).
+
+Both metrics are `NaN` when `omega_iov` diagonal is zero or fewer than two (subject, occasion) observations are available for that occasion slot.
+
 ### IWRES Autocorrelation
 
 Two pooled autocorrelation diagnostics are reported after every fit:

@@ -400,6 +400,43 @@ pub fn print_results(result: &FitResult) {
             eprintln!("  EPS shrinkage:  {:.1}%", result.shrinkage_eps * 100.0);
         }
     }
+    if !result.shrinkage_kappa.is_empty() {
+        eprintln!("\n--- Kappa Shrinkage (pooled) ---");
+        for (k, &sh) in result.shrinkage_kappa.iter().enumerate() {
+            let name = result
+                .kappa_names
+                .get(k)
+                .map(|s| s.as_str())
+                .unwrap_or("KAPPA");
+            if sh.is_finite() {
+                eprintln!("  {} shrinkage: {:.1}%", name, sh * 100.0);
+            } else {
+                eprintln!("  {} shrinkage: NaN", name);
+            }
+        }
+        if !result.shrinkage_kappa_by_occ.is_empty() {
+            eprintln!("  Per-occasion:");
+            for (occ_idx, occ_sh) in result.shrinkage_kappa_by_occ.iter().enumerate() {
+                let parts: Vec<String> = occ_sh
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &sh)| {
+                        let name = result
+                            .kappa_names
+                            .get(k)
+                            .map(|s| s.as_str())
+                            .unwrap_or("KAPPA");
+                        if sh.is_finite() {
+                            format!("{} {:.1}%", name, sh * 100.0)
+                        } else {
+                            format!("{} NaN", name)
+                        }
+                    })
+                    .collect();
+                eprintln!("    OCC {}: {}", occ_idx + 1, parts.join(", "));
+            }
+        }
+    }
 
     // Run info
     eprintln!("\n--- Run Info ---");
@@ -1006,6 +1043,7 @@ mod tests {
             kappa_init_as_sd: Vec::new(),
             se_kappa: None,
             shrinkage_kappa: Vec::new(),
+            shrinkage_kappa_by_occ: Vec::new(),
             ebe_kappas: Vec::new(),
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,

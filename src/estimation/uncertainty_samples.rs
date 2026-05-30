@@ -370,6 +370,7 @@ mod tests {
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],
+            shrinkage_kappa_by_occ: vec![],
             ebe_kappas: vec![],
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,

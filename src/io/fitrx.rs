@@ -265,6 +265,10 @@ struct IovWire {
     se_kappa: Option<Vec<f64>>,
     #[serde(with = "vec_f64_nan_as_null")]
     shrinkage_kappa: Vec<f64>,
+    /// Per-occasion kappa shrinkage: `[occ_idx][kappa_idx]`.
+    /// Defaulted for backward compatibility with older .fitrx files.
+    #[serde(default)]
+    shrinkage_kappa_by_occ: Vec<Vec<f64>>,
     omega_iov: MatrixWire,
     omega_iov_param_corr: Option<MatrixWire>,
     /// Per-kappa SD-init flag. Defaulted for backward compatibility with
@@ -641,6 +645,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             kappa_fixed: r.kappa_fixed.clone(),
             se_kappa: r.se_kappa.clone(),
             shrinkage_kappa: r.shrinkage_kappa.clone(),
+            shrinkage_kappa_by_occ: r.shrinkage_kappa_by_occ.clone(),
             omega_iov: MatrixWire::from(m),
             omega_iov_param_corr: r.omega_iov_param_corr.as_ref().map(MatrixWire::from),
             kappa_init_as_sd: r.kappa_init_as_sd.clone(),
@@ -1325,6 +1330,7 @@ fn wire_to_fit_result(
         kappa_init_as_sd,
         se_kappa,
         shrinkage_kappa,
+        shrinkage_kappa_by_occ,
         omega_iov_param_corr,
     ) = match w.iov {
         Some(iov) => {
@@ -1345,6 +1351,7 @@ fn wire_to_fit_result(
                 init_as_sd,
                 iov.se_kappa,
                 iov.shrinkage_kappa,
+                iov.shrinkage_kappa_by_occ,
                 iov.omega_iov_param_corr
                     .map(|m| m.into_dmatrix())
                     .transpose()?,
@@ -1356,6 +1363,7 @@ fn wire_to_fit_result(
             Vec::new(),
             Vec::new(),
             None,
+            Vec::new(),
             Vec::new(),
             None,
         ),
@@ -1439,6 +1447,7 @@ fn wire_to_fit_result(
         kappa_init_as_sd,
         se_kappa,
         shrinkage_kappa,
+        shrinkage_kappa_by_occ,
         ebe_kappas,
         saem_mu_ref_m_step_evals_saved: w.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: w.saem_n_subjects_hmc,
@@ -1601,6 +1610,7 @@ mod tests {
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],
+            shrinkage_kappa_by_occ: vec![],
             ebe_kappas: vec![],
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,

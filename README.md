@@ -7,7 +7,15 @@
 [![CodeFactor](https://www.codefactor.io/repository/github/ferx-nlme/ferx-core/badge)](https://www.codefactor.io/repository/github/ferx-nlme/ferx-core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A high-performance Nonlinear Mixed Effects (NLME) modeling engine for population pharmacokinetics, written in Rust. Implements FOCE/FOCEI estimation with analytical PK solutions and an optional ODE solver, similar to NONMEM.
+A high-performance Nonlinear Mixed Effects (NLME) modeling engine for population pharmacokinetics, written in Rust. Implements FOCEI and SAEM estimation with analytical PK solutions and an optional ODE solver, similar to NONMEM.
+
+Additional features:
+- Importance Sampling
+- SIR
+- Deep Compartmental Models & Neural ODEs
+- Stochastic differential equations
+- Various optimizers
+- ... and more
 
 ## Quick Start
 

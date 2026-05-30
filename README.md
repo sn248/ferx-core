@@ -10,11 +10,9 @@
 A high-performance Nonlinear Mixed Effects (NLME) modeling engine for population pharmacokinetics, written in Rust. Implements FOCEI and SAEM estimation with analytical PK solutions and ODE solvers.
 
 Additional features:
-- PK-PD modeling
-- Multi-analyte modeling
-- Importance Sampling
-- BLQ modeling
-- SIR
+- PK-PD and multi-analyte modeling
+- BLQ likelihood modeling
+- Importance Sampling & SIR
 - Deep Compartmental Models & Neural ODEs
 - Stochastic differential equations
 - Simulation with uncertainty

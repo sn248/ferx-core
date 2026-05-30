@@ -1977,7 +1977,19 @@ pub(crate) fn compute_kappa_shrinkage(
 /// Kappa shrinkage broken out by occasion index.
 ///
 /// Returns `shrinkage_by_occ[occ_idx][kappa_idx]` where `occ_idx` is the
-/// 0-based occasion position (order in which occasions were first seen).
+/// **0-based position within each subject's own occasion list** — i.e. the
+/// order in which distinct OCC values were first encountered in that subject's
+/// rows (matching `split_obs_by_occasion`).
+///
+/// **Important limitation for unbalanced designs:** `occ_idx` is a position
+/// index, *not* the raw OCC column value.  When subjects have different OCC
+/// sequences (e.g., a late-entry subject whose data begins at OCC 2), their
+/// position 0 maps to OCC 2 while other subjects' position 0 maps to OCC 1.
+/// Pooling across position 0 then mixes kappas from different occasions.
+/// For unbalanced designs use the pooled `shrinkage_kappa` instead, and
+/// interpret per-occasion values only when the OCC column is aligned across
+/// all subjects.
+///
 /// Returns an empty outer vec when fewer than two distinct occasions are present
 /// or no kappa parameters exist.
 pub(crate) fn compute_kappa_shrinkage_by_occ(
@@ -2313,6 +2325,27 @@ mod tests {
             sh[0][0]
         );
         assert!(sh[1][0] > 0.8, "occ 2 shrinkage high, got {}", sh[1][0]);
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_two_kappas_independent() {
+        // n_kappa = 2: each kappa parameter should be computed independently.
+        // kappa 0: RMS = 1.0 → shrinkage = 0 with omega_00 = 1.0
+        // kappa 1: RMS = 0.1 → shrinkage = 1 - 0.1/1.0 = 0.9 with omega_11 = 1.0
+        let omega = DMatrix::from_diagonal(&DVector::from_vec(vec![1.0, 1.0]));
+        // Each subject has 1 occasion; kappa vector is [k0_val, k1_val].
+        let kappas: Vec<Vec<DVector<f64>>> = vec![
+            vec![DVector::from_vec(vec![1.0, 0.1])],
+            vec![DVector::from_vec(vec![-1.0, -0.1])],
+        ];
+        let sh = compute_kappa_shrinkage(&kappas, &omega);
+        assert_eq!(sh.len(), 2);
+        assert!((sh[0]).abs() < 1e-10, "kappa 0 shrinkage ~0, got {}", sh[0]);
+        assert!(
+            (sh[1] - 0.9).abs() < 1e-10,
+            "kappa 1 shrinkage ~0.9, got {}",
+            sh[1]
+        );
     }
 
     #[test]

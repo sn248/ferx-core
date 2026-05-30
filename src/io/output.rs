@@ -433,7 +433,7 @@ pub fn print_results(result: &FitResult) {
                         }
                     })
                     .collect();
-                eprintln!("    OCC {}: {}", occ_idx + 1, parts.join(", "));
+                eprintln!("    Occasion slot {}: {}", occ_idx + 1, parts.join(", "));
             }
         }
     }

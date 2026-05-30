@@ -1617,8 +1617,11 @@ pub struct FitResult {
     /// subject-occasion pairs.  Empty when `n_kappa == 0`.
     pub shrinkage_kappa: Vec<f64>,
     /// Per-occasion kappa shrinkage: `shrinkage_kappa_by_occ[occ_idx][kappa_idx]`.
-    /// `occ_idx` is the 0-based position in which occasions were first seen across
-    /// subjects (occasion-index order, not raw OCC column values).
+    /// `occ_idx` is the 0-based position within each subject's own occasion list
+    /// (order in which distinct OCC values first appear in that subject's rows),
+    /// **not** the raw OCC column value.  For unbalanced designs where subjects
+    /// have different OCC sequences, a given `occ_idx` may map to different OCC
+    /// values across subjects — use `shrinkage_kappa` (pooled) in that case.
     /// Empty when `n_kappa == 0` or only one occasion is present.
     pub shrinkage_kappa_by_occ: Vec<Vec<f64>>,
     /// Per-subject, per-occasion kappa EBEs.

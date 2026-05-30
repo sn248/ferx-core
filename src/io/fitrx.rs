@@ -76,6 +76,42 @@ mod vec_f64_nan_as_null {
     }
 }
 
+mod vec_vec_f64_nan_as_null {
+    use serde::{de::Deserialize, ser::SerializeSeq, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Vec<Vec<f64>>, ser: S) -> Result<S::Ok, S::Error> {
+        let mut outer = ser.serialize_seq(Some(value.len()))?;
+        for inner in value {
+            // Delegate each inner Vec<f64> to the same NaN-as-null logic.
+            struct NanSafeSlice<'a>(&'a [f64]);
+            impl serde::Serialize for NanSafeSlice<'_> {
+                fn serialize<S2: Serializer>(&self, s: S2) -> Result<S2::Ok, S2::Error> {
+                    use serde::ser::SerializeSeq as _;
+                    let mut seq = s.serialize_seq(Some(self.0.len()))?;
+                    for v in self.0 {
+                        if v.is_finite() {
+                            seq.serialize_element(v)?;
+                        } else {
+                            seq.serialize_element(&Option::<f64>::None)?;
+                        }
+                    }
+                    seq.end()
+                }
+            }
+            outer.serialize_element(&NanSafeSlice(inner))?;
+        }
+        outer.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<Vec<f64>>, D::Error> {
+        let outer: Vec<Vec<Option<f64>>> = Vec::deserialize(de)?;
+        Ok(outer
+            .into_iter()
+            .map(|inner| inner.into_iter().map(|o| o.unwrap_or(f64::NAN)).collect())
+            .collect())
+    }
+}
+
 mod opt_f64_nan_as_null {
     use serde::{de::Deserialize, Deserializer, Serializer};
 
@@ -267,7 +303,7 @@ struct IovWire {
     shrinkage_kappa: Vec<f64>,
     /// Per-occasion kappa shrinkage: `[occ_idx][kappa_idx]`.
     /// Defaulted for backward compatibility with older .fitrx files.
-    #[serde(default)]
+    #[serde(default, with = "vec_vec_f64_nan_as_null")]
     shrinkage_kappa_by_occ: Vec<Vec<f64>>,
     omega_iov: MatrixWire,
     omega_iov_param_corr: Option<MatrixWire>,

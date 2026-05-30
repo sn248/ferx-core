@@ -110,6 +110,15 @@ fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population)
 }
 
 /// Run SAEM with the given burn-in and return the recovered trace(Ω).
+///
+/// `saem_n_mh_steps` is pinned at 3 (the pre-PR #148 default) so the
+/// cold-start collapse this test guards against is reproducible.  The new
+/// default of 10 MH steps mixes the chain well enough on its own that the
+/// no-burn-in run no longer collapses Ω substantially below the burn-in
+/// run — so the new default masks the burn-in fix without removing the
+/// underlying problem.  Anchoring to the pre-#148 default keeps the test
+/// guarding the burn-in mechanism rather than the (orthogonal) MH-step
+/// improvement.
 fn fit_trace(
     model: &ferx_core::types::CompiledModel,
     population: &Population,
@@ -119,6 +128,7 @@ fn fit_trace(
     opts.method = EstimationMethod::Saem;
     opts.saem_n_exploration = 120;
     opts.saem_n_convergence = 120;
+    opts.saem_n_mh_steps = 3;
     opts.saem_omega_burnin = omega_burnin;
     opts.saem_seed = Some(7);
     opts.run_covariance_step = false;

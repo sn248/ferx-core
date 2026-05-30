@@ -13078,10 +13078,19 @@ method = foce
 "#
         );
         let parsed = parse_full_model(&src).expect("parse ok");
+        // The conditional model legitimately triggers a mu-referencing warning
+        // for CL — that is unrelated to our check. Assert only that no
+        // unused-parameter warning is emitted for WT_POW or any other parameter.
+        let unused: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("declared in [parameters] but not referenced"))
+            .collect();
         assert!(
-            parsed.model.parse_warnings.is_empty(),
-            "WT_POW used inside if-branch must not warn; got: {:?}",
-            parsed.model.parse_warnings
+            unused.is_empty(),
+            "WT_POW used inside if-branch must not trigger unused-param warning; got: {:?}",
+            unused
         );
     }
 

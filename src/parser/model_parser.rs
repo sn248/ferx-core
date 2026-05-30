@@ -3512,6 +3512,9 @@ fn parse_parameters(
     // symmetry with sigma.
     // FIX may appear before or after the scale annotation (group 3 = FIX
     // before annotation, group 4 = annotation, group 5 = FIX after).
+    // Note: the first FIX group requires \s+ (at least one space) so that
+    // `value(sd)` without a space between value and annotation still matches
+    // correctly — the annotation group uses \s* (zero or more) intentionally.
     let omega_re = Regex::new(
         r"(?i)omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?",
     )
@@ -8044,6 +8047,30 @@ mod tests {
     }
 
     #[test]
+    fn test_omega_unfixed_no_annotation() {
+        // Baseline: plain omega with no FIX and no annotation — confirms the
+        // group-numbering shift (annotation moved 3→4) didn't regress the
+        // common case.
+        let lines = vec!["omega ETA_CL ~ 0.09".to_string()];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert!(!omegas[0].fixed);
+        assert!(!omegas[0].init_as_sd);
+        assert!((omegas[0].variance - 0.09).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_omega_double_fix_is_harmless() {
+        // `FIX (sd) FIX` — both FIX groups fire; result must still be fixed
+        // with SD squaring applied.
+        let lines = vec!["omega ETA_CL ~ 0.30 FIX (sd) FIX".to_string()];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let expected = 0.30 * 0.30;
+        assert!((omegas[0].variance - expected).abs() < 1e-12);
+        assert!(omegas[0].fixed);
+        assert!(omegas[0].init_as_sd);
+    }
+
+    #[test]
     fn test_parse_sigma_fix() {
         let lines = vec!["sigma PROP ~ 0.05 FIX".to_string()];
         let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
@@ -8154,6 +8181,18 @@ mod tests {
         let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
         assert!(sigmas[0].fixed);
         assert!(sigmas[0].init_as_sd);
+    }
+
+    #[test]
+    fn test_sigma_unfixed_no_annotation() {
+        // Baseline: plain sigma with no FIX and no annotation — confirms the
+        // group-numbering shift didn't regress the common case.
+        let lines = vec!["sigma PROP ~ 0.04".to_string()];
+        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        assert!(!sigmas[0].fixed);
+        assert!(!sigmas[0].init_as_sd);
+        // Stored as SD internally: sqrt(0.04) = 0.2
+        assert!((sigmas[0].value - 0.2).abs() < 1e-12);
     }
 
     #[test]
@@ -8748,6 +8787,17 @@ mod tests {
         let lines = vec!["kappa KAPPA_V ~ 0.05 FIX".to_string()];
         let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
         assert!(ki.diagonal[0].fixed);
+    }
+
+    #[test]
+    fn test_kappa_unfixed_no_annotation() {
+        // Baseline: plain kappa with no FIX and no annotation — confirms the
+        // group-numbering shift didn't regress the common case.
+        let lines = vec!["kappa KAPPA_V ~ 0.05".to_string()];
+        let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+        assert!(!ki.diagonal[0].fixed);
+        assert!(!ki.diagonal[0].init_as_sd);
+        assert!((ki.diagonal[0].variance - 0.05).abs() < 1e-12);
     }
 
     #[test]

@@ -13005,4 +13005,168 @@ method = foce
         );
         assert!(warns[0].contains("kappa"), "warning should mention 'kappa'");
     }
+
+    #[test]
+    fn test_derived_variable_no_false_positive() {
+        // ke = CL / V is a derived variable — no theta/eta directly.
+        // But CL = TVCL * exp(ETA_CL) and V = TVV * exp(ETA_V) ARE in
+        // indiv_stmts and ARE walked, so TVCL/ETA_CL/TVV/ETA_V are found
+        // through those statements. No spurious "unused" warnings expected.
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(0.1)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  ke = CL / V
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method = foce
+"#
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(
+            parsed.model.parse_warnings.is_empty(),
+            "derived variable ke=CL/V must not trigger false positives; \
+             got: {:?}",
+            parsed.model.parse_warnings
+        );
+    }
+
+    #[test]
+    fn test_theta_used_only_in_conditional_branch_no_warn() {
+        // WT_POW is only referenced inside an if-branch — it must still be
+        // found because collect_theta_eta_in_stmts recurses into if-bodies.
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(0.1)
+  theta WT_POW(0.75)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01
+
+[individual_parameters]
+  if (WT > 0) {{
+    CL = TVCL * (WT / 70)^WT_POW * exp(ETA_CL)
+  }} else {{
+    CL = TVCL * exp(ETA_CL)
+  }}
+  V  = 10.0
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method = foce
+"#
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(
+            parsed.model.parse_warnings.is_empty(),
+            "WT_POW used inside if-branch must not warn; got: {:?}",
+            parsed.model.parse_warnings
+        );
+    }
+
+    #[test]
+    fn test_block_omega_one_unused_warns() {
+        // block_omega declares ETA_CL and ETA_V together; only ETA_CL is used.
+        // ETA_V should produce a warning even though it's part of a block.
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(0.1)
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]
+  sigma PROP ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = 10.0
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method = foce
+"#
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("ETA_V"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "ETA_V unused in block_omega should warn; got: {:?}",
+            warns
+        );
+        assert!(warns[0].contains("omega"), "warning should mention 'omega'");
+        // ETA_CL IS used — must not appear in warnings
+        assert!(
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("ETA_CL")),
+            "ETA_CL is used and must not warn"
+        );
+    }
+
+    #[test]
+    fn test_block_omega_all_used_no_warn() {
+        // Both etas in a block_omega are used — no warnings expected.
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(0.1)
+  theta TVV(10.0)
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]
+  sigma PROP ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method = foce
+"#
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(
+            parsed.model.parse_warnings.is_empty(),
+            "all block_omega etas used — no warnings expected; got: {:?}",
+            parsed.model.parse_warnings
+        );
+    }
 }

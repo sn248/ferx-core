@@ -335,7 +335,8 @@ fn check_per_cmt_error_model(model: &CompiledModel, population: &Population) -> 
 /// a dataset, collected into one diagnostic list. Shared by `fit()` (which
 /// stops at the first error via [`first_error`]) and `ferx check` (which
 /// reports every finding). Check order matches the historical inline order in
-/// `fit()` so the first error is unchanged: covariates, scaling, error model.
+/// `fit()` so the first error is unchanged: covariates, scaling, error model,
+/// iov occasions.
 pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     let mut diags = check_covariates(model, population);
     diags.extend(check_per_cmt_scaling(model, population));
@@ -351,7 +352,10 @@ fn check_iov_occasions(model: &CompiledModel, population: &Population) -> Vec<Di
     if model.n_kappa == 0 {
         return Vec::new();
     }
-    let all_empty = population.subjects.iter().all(|s| s.occasions.is_empty());
+    // `all()` on an empty iterator is vacuously true; an empty population is not
+    // a missing-OCC problem so skip the check when there are no subjects.
+    let all_empty = !population.subjects.is_empty()
+        && population.subjects.iter().all(|s| s.occasions.is_empty());
     if !all_empty {
         return Vec::new();
     }
@@ -2819,7 +2823,6 @@ mod iov_integration {
         let mut pop = make_iov_population();
         for subj in &mut pop.subjects {
             subj.occasions.clear();
-            subj.dose_occasions.clear();
         }
         let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
         let result = fit(&model, &pop, &model.default_params, &opts);
@@ -2836,18 +2839,20 @@ mod iov_integration {
 
     #[test]
     fn test_check_model_data_flags_missing_occ() {
+        use crate::diagnostics::Severity;
         let model = make_iov_model();
         let mut pop = make_iov_population();
         for subj in &mut pop.subjects {
             subj.occasions.clear();
-            subj.dose_occasions.clear();
         }
         let diags = super::check_model_data(&model, &pop);
         let d = diags
             .iter()
             .find(|d| d.code == "E_IOV_MISSING_OCC")
             .expect("expected E_IOV_MISSING_OCC diagnostic");
+        assert_eq!(d.severity, Severity::Error);
         assert!(d.message.contains("iov_column") || d.message.contains("kappa"));
+        assert_eq!(d.block.as_deref(), Some("fit_options"));
     }
 
     // `ferx check` must surface the same trust_region+IOV incompatibility that

@@ -46,12 +46,32 @@ fn collect_mul_anchors(expr: &Expression, out: &mut Vec<MuRefAnchor>) {
     }
 }
 
-/// Walk a Mul-chain and find the first `exp(Eta(j))`, returning the eta index.
+/// Walk a Mul-chain and find the first `exp(Eta(j))` or `exp(Eta(a) + Eta(b))`,
+/// returning the eta index. For the two-eta case (IIV+IOV combined pattern)
+/// returns the **minimum** index; BSV etas are numbered `0..n_eta` and kappa etas
+/// `n_eta..`, so min always selects the BSV eta regardless of expression order.
 fn find_exp_eta_in_mul(expr: &Expression) -> Option<usize> {
     match expr {
         Expression::UnaryFn(name, arg) if name == "exp" => {
             if let Expression::Eta(j) = arg.as_ref() {
                 return Some(*j);
+            }
+            // exp(ETA1 + ETA2) — IIV+IOV combined pattern.
+            if let Expression::BinOp(l, BinOp::Add, r) = arg.as_ref() {
+                let li = if let Expression::Eta(j) = l.as_ref() {
+                    Some(*j)
+                } else {
+                    None
+                };
+                let ri = if let Expression::Eta(j) = r.as_ref() {
+                    Some(*j)
+                } else {
+                    None
+                };
+                return match (li, ri) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
             }
             None
         }
@@ -59,6 +79,21 @@ fn find_exp_eta_in_mul(expr: &Expression) -> Option<usize> {
             find_exp_eta_in_mul(l).or_else(|| find_exp_eta_in_mul(r))
         }
         _ => None,
+    }
+}
+
+/// Returns `true` when `expr` contains an `Eta` node that is NOT shielded
+/// inside an `exp(...)` call. Used to guard the log-normal product fallback
+/// classifier: if all etas are inside exp(), the expression is log-normal.
+fn has_bare_eta(expr: &Expression) -> bool {
+    match expr {
+        Expression::Eta(_) => true,
+        // Etas inside exp() enter multiplicatively — they are not "bare".
+        Expression::UnaryFn(name, _) if name == "exp" => false,
+        Expression::BinOp(l, _, r) => has_bare_eta(l) || has_bare_eta(r),
+        Expression::UnaryFn(_, arg) => has_bare_eta(arg),
+        Expression::Power(b, e) => has_bare_eta(b) || has_bare_eta(e),
+        _ => false,
     }
 }
 
@@ -451,10 +486,36 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
             } else {
                 EtaParamType::Additive
             };
+            // Populate theta_idx so apply_class can set linked_theta in
+            // EtaParamInfo. theta_transform stays None — the product/additive
+            // pattern does not change how the theta is packed by the optimizer
+            // (that is driven by theta_lower bounds, not by classification).
+            let theta_idx = match anchor {
+                MuRefAnchor::Theta(ti) if ti < n_theta => Some(ti),
+                _ => None,
+            };
+            return Some(ExprClass {
+                eta_idx: ei,
+                theta_idx,
+                param_type: pt,
+                theta_transform: None,
+            });
+        }
+    }
+
+    // Fallback: BASE * exp(ETA[+KAPPA]) where BASE contains no bare eta
+    // references. Handles derived intermediates like `KTR * exp(ETA_KA)`
+    // where KTR is a variable defined earlier in [individual_parameters] and
+    // collect_mul_anchors therefore finds no direct Theta anchor.
+    // detect_pattern above already handles the Theta-anchored case, so this
+    // only fires when anchors.len() != 1 but the expression is still
+    // structurally log-normal.
+    if let Some(ei) = find_exp_eta_in_mul(expr) {
+        if !has_bare_eta(expr) {
             return Some(ExprClass {
                 eta_idx: ei,
                 theta_idx: None,
-                param_type: pt,
+                param_type: EtaParamType::LogNormal,
                 theta_transform: None,
             });
         }
@@ -9370,10 +9431,104 @@ if (1 > 0) {
             .find(|i| i.eta_name == "ETA_CL")
             .unwrap();
         assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
-        // TVCL * exp(ETA) pattern: theta is not on log scale (theta IS TVCL)
-        assert!(cl_info.linked_theta.is_none());
-        // theta_transform for TVCL (theta index 0) stays Identity
+        // Anchor is the theta TVCL — linked_theta is now populated.
+        assert_eq!(cl_info.linked_theta, Some("TVCL".to_string()));
+        // theta_transform for TVCL (theta index 0) stays Identity — the
+        // product pattern does not imply the theta is on the log scale.
         assert_eq!(model.theta_transform[0], ThetaTransform::Identity);
+    }
+
+    /// `TVCL * exp(ETA_CL + KAPPA_CL)` — IIV and IOV on the same parameter.
+    /// ETA_CL (BSV) should be LogNormal with linked_theta TVCL.
+    /// Also verifies that detect_mu_refs sets mu_ref for ETA_CL → TVCL.
+    #[test]
+    fn test_classify_iov_combined() {
+        use crate::types::EtaParamType;
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma EPS ~ 0.01
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+[fit_options]
+  iov_column = OCC
+";
+        let model = super::parse_full_model(src).unwrap().model;
+        let cl_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .expect("ETA_CL must be classified");
+        assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
+        assert_eq!(cl_info.linked_theta, Some("TVCL".to_string()));
+        // mu_ref must be detected so SAEM can initialise ETA_CL at ln(TVCL).
+        let mu = model.mu_refs.get("ETA_CL").expect("mu_ref for ETA_CL");
+        assert_eq!(mu.theta_name, "TVCL");
+        assert!(mu.log_transformed);
+    }
+
+    /// `KTR = 4.0 / TVMTT; KA = KTR * exp(ETA_KA)` — the base is a derived
+    /// intermediate, not a raw theta. ETA_KA should still be LogNormal (CV%
+    /// can be computed from the omega). linked_theta is None because no direct
+    /// theta anchor is visible in the KA expression.
+    #[test]
+    fn test_classify_lognormal_derived_base() {
+        use crate::types::EtaParamType;
+        // Reuse minimal_model_with_indiv which has TVCL and TVV as thetas.
+        let model = minimal_model_with_indiv(
+            "  KTR = 4.0 / TVCL\n  V = TVV * exp(ETA_V)\n  CL = KTR * exp(ETA_CL)",
+        );
+        let cl_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .expect("ETA_CL must be classified");
+        assert_eq!(
+            cl_info.param_type,
+            EtaParamType::LogNormal,
+            "derived base should still yield LogNormal, not Custom"
+        );
+        // No direct theta is visible in `KTR * exp(ETA_CL)`, so linked_theta is None.
+        assert!(cl_info.linked_theta.is_none());
+    }
+
+    /// Confirms that the covariate-product form `TVCL * (WT/70)^0.75 * exp(ETA_CL)`
+    /// (ferx-r #54) is already classified as LogNormal with linked_theta = TVCL.
+    #[test]
+    fn test_classify_covariate_product() {
+        use crate::types::EtaParamType;
+        let src = r"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma EPS ~ 0.01
+[individual_parameters]
+  CL = TVCL * (WT / 70)^0.75 * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = super::parse_full_model(src).unwrap().model;
+        let cl_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .expect("ETA_CL must be classified");
+        assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
+        assert_eq!(cl_info.linked_theta, Some("TVCL".to_string()));
     }
 
     #[test]

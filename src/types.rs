@@ -1401,6 +1401,136 @@ pub enum CovarianceStatus {
     Failed,
 }
 
+/// Severity level for a structured warning entry.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum WarningSeverity {
+    Critical,
+    Warning,
+    Info,
+}
+
+/// A structured warning with severity, category, and message.
+///
+/// Populated in parallel with `FitResult.warnings` (which remains for
+/// backward compatibility). The `category` is a fixed lowercase vocabulary:
+/// `convergence`, `covariance_step`, `optimizer_health`, `dw_autocorrelation`,
+/// `bloq_method`, `sir`, `importance_sampling`, `data_quality`,
+/// `omega_structure`, `ebe_convergence`, `gradient_fallback`,
+/// `mu_referencing`, `optimizer_config`, `multi_start`, `cancelled`,
+/// `threads`, `condition_number`, `eta_normality`, `eps_shrinkage`, `general`
+/// (fallback for unrecognised messages).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WarningEntry {
+    pub severity: WarningSeverity,
+    /// Fixed lowercase category string (see type-level docs).
+    pub category: String,
+    /// Human-readable message. For messages that carry a multi-stage chain
+    /// prefix such as `[FOCEI] ...`, only the body after the prefix is stored
+    /// here; the method tag is moved into `source_method`. For unprefixed
+    /// messages this is identical to the corresponding entry in
+    /// `FitResult.warnings`.
+    pub message: String,
+    /// For multi-stage chains, the method that produced this warning.
+    pub source_method: Option<String>,
+}
+
+/// Classify a free-text warning message into a structured `WarningEntry`.
+///
+/// This is the single source of truth for warning severity/category in
+/// ferx-core. The R wrapper consumes the structured output directly and never
+/// re-classifies message text. Multi-stage chain prefixes (`[FOCEI] ...`) are
+/// stripped into `source_method`; the remaining message is matched against the
+/// fixed category vocabulary. Unrecognised messages fall back to
+/// `Warning`/`general`.
+pub fn classify_warning(raw: &str) -> WarningEntry {
+    // Strip a leading "[METHOD] " chain prefix into source_method.
+    let (source_method, msg) = if let Some(rest) = raw.strip_prefix('[') {
+        if let Some(idx) = rest.find(']') {
+            let tag = &rest[..idx];
+            let body = rest[idx + 1..].trim_start();
+            (Some(tag.to_string()), body.to_string())
+        } else {
+            (None, raw.to_string())
+        }
+    } else {
+        (None, raw.to_string())
+    };
+
+    let lower = msg.to_lowercase();
+
+    // (severity, category) keyed off distinctive substrings. Order matters:
+    // more specific patterns first.
+    let (severity, category) = if lower.contains("did not converge")
+        || lower.contains("without convergence")
+        || lower.contains("no multi-start run converged")
+    {
+        (WarningSeverity::Critical, "convergence")
+    } else if lower.contains("covariance step failed") || lower.contains("covariance failed") {
+        // "ses not available" and "se not available" intentionally omitted:
+        // the only emitter ("Covariance step failed — SEs not available") already
+        // hits "covariance step failed" above, and bare "se not available" is too
+        // broad to safely match future messages.
+        (WarningSeverity::Critical, "covariance_step")
+    } else if lower.contains("ill-conditioned") || lower.contains("condition number") {
+        (WarningSeverity::Critical, "condition_number")
+    } else if lower.contains("trust radius") || lower.contains("degenerate") {
+        (WarningSeverity::Warning, "optimizer_health")
+    } else if lower.contains("autocorrelation") || lower.contains("durbin") {
+        (WarningSeverity::Warning, "dw_autocorrelation")
+    } else if lower.contains("shapiro") || lower.contains("non-normal") {
+        (WarningSeverity::Warning, "eta_normality")
+    } else if lower.contains("m3 bloq") || lower.contains("bloq handling") {
+        (WarningSeverity::Warning, "bloq_method")
+    } else if lower.contains("sir failed") || lower.contains("sir requested") {
+        (WarningSeverity::Warning, "sir")
+    } else if lower.contains("ess = 0") || lower.contains("proposal collapse") {
+        (WarningSeverity::Warning, "importance_sampling")
+    } else if lower.contains("eps shrinkage") {
+        (WarningSeverity::Warning, "eps_shrinkage")
+    } else if lower.contains("ltbs")
+        || lower.contains("non-positive dv")
+        || lower.contains("ss=1 dose")
+        || lower.contains("ss=1 infusion")
+        || lower.contains("evid=3/4")
+        || lower.contains("lagtime evaluates")
+    {
+        (WarningSeverity::Warning, "data_quality")
+    } else if lower.contains("mixed lognormal") || lower.contains("mixed log-normal") {
+        (WarningSeverity::Warning, "omega_structure")
+    } else if lower.contains("hmc is unavailable") {
+        // "falls back to" intentionally removed: no emitted message uses that exact
+        // phrase. The SAEM HMC message is fully covered by "hmc is unavailable".
+        (WarningSeverity::Info, "gradient_fallback")
+    } else if lower.contains("mu-ref") || lower.contains("mu-referencing") {
+        (WarningSeverity::Info, "mu_referencing")
+    } else if lower.contains("global_search disabled") {
+        // Runtime failure: CRS2-LM init failed — the optimiser ran without global search.
+        (WarningSeverity::Warning, "optimizer_config")
+    } else if lower.contains("global_search") {
+        (WarningSeverity::Info, "optimizer_config")
+    } else if lower.contains("multi-start") {
+        (WarningSeverity::Info, "multi_start")
+    } else if lower.contains("cancelled by user") {
+        (WarningSeverity::Info, "cancelled")
+    } else if lower.contains("threads configured") || lower.contains("threads than subjects") {
+        (WarningSeverity::Info, "threads")
+    } else if lower.contains("n\u{00b2} ofv")
+        || lower.contains("n^2 ofv")
+        || (lower.contains("parameters") && lower.contains("covariance step:"))
+    {
+        (WarningSeverity::Info, "covariance_step")
+    } else {
+        (WarningSeverity::Warning, "general")
+    };
+
+    WarningEntry {
+        severity,
+        category: category.to_string(),
+        message: msg,
+        source_method,
+    }
+}
+
 /// Full fit result
 #[derive(Debug, Clone)]
 pub struct FitResult {
@@ -1454,6 +1584,8 @@ pub struct FitResult {
     pub n_iterations: usize,
     pub interaction: bool,
     pub warnings: Vec<String>,
+    /// Structured counterpart to `warnings` — same entries with severity and category metadata.
+    pub warnings_structured: Vec<WarningEntry>,
     // SIR results (optional)
     pub sir_ci_theta: Option<Vec<(f64, f64)>>,
     pub sir_ci_omega: Option<Vec<(f64, f64)>>,
@@ -2254,6 +2386,51 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_warning_convergence_is_critical() {
+        let w = classify_warning("Outer optimization did not converge");
+        assert_eq!(w.severity, WarningSeverity::Critical);
+        assert_eq!(w.category, "convergence");
+        assert!(w.source_method.is_none());
+    }
+
+    #[test]
+    fn classify_warning_covariance_is_critical() {
+        let w = classify_warning("Covariance step failed");
+        assert_eq!(w.severity, WarningSeverity::Critical);
+        assert_eq!(w.category, "covariance_step");
+    }
+
+    #[test]
+    fn classify_warning_dw_is_warning() {
+        let w = classify_warning("Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).");
+        assert_eq!(w.severity, WarningSeverity::Warning);
+        assert_eq!(w.category, "dw_autocorrelation");
+    }
+
+    #[test]
+    fn classify_warning_mu_ref_is_info() {
+        let w = classify_warning("mu-ref: CL, V");
+        assert_eq!(w.severity, WarningSeverity::Info);
+        assert_eq!(w.category, "mu_referencing");
+    }
+
+    #[test]
+    fn classify_warning_strips_chain_prefix() {
+        let w = classify_warning("[FOCEI] Covariance step failed");
+        assert_eq!(w.source_method.as_deref(), Some("FOCEI"));
+        assert_eq!(w.message, "Covariance step failed");
+        assert_eq!(w.severity, WarningSeverity::Critical);
+        assert_eq!(w.category, "covariance_step");
+    }
+
+    #[test]
+    fn classify_warning_unknown_falls_back_to_general() {
+        let w = classify_warning("some entirely novel message");
+        assert_eq!(w.severity, WarningSeverity::Warning);
+        assert_eq!(w.category, "general");
+    }
 
     #[test]
     fn is_ode_based_false_for_analytical() {

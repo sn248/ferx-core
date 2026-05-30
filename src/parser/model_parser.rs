@@ -4667,6 +4667,11 @@ fn used_sigma_names(parsed: &ParsedErrorModel) -> std::collections::HashSet<Stri
 ///
 /// Only user-declared thetas (indices `0..n_theta_user`) are checked; thetas
 /// added automatically (NN weights, diffusion) are excluded.
+///
+/// Scanning `indiv_stmts` is sufficient for ODE models too: `build_ode_spec`
+/// uses `ParseCtx::ode` which sets `theta_names = []`, so raw theta/eta names
+/// cannot appear in `[odes]` RHS expressions — they must be routed through
+/// `[individual_parameters]` first.
 fn check_unused_parameters(
     thetas: &[ThetaSpec],
     eta_names_bsv: &[String],
@@ -12955,5 +12960,49 @@ method = foce
             "expected warnings for TH_UNUSED, ETA_UNUSED, SIG_UNUSED; got: {:?}",
             unused
         );
+    }
+
+    #[test]
+    fn test_unused_kappa_warns() {
+        // KAPPA_CL declared but not used in any expression (index arithmetic:
+        // Eta(n_eta + i), distinct from BSV etas).
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(0.1)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = 10.0
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method = foce
+  iov_column = OCC
+"#
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("KAPPA_CL"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected one warning for unused KAPPA_CL; got: {:?}",
+            warns
+        );
+        assert!(warns[0].contains("kappa"), "warning should mention 'kappa'");
     }
 }

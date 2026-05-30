@@ -647,9 +647,17 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
 
     let mut diags: Vec<Diagnostic> = Vec::new();
 
-    // 2a. Parse-time warnings (e.g. unused parameters) collected during parsing.
+    // 2a. Parse-time warnings collected during parsing (unused parameters,
+    //     mu-referencing diagnostics, etc.). Each warning embeds its own block
+    //     context in the message text; we use W_PARSE as the generic code here
+    //     rather than a narrower code that would mislabel unrelated warnings.
     for w in &parsed.model.parse_warnings {
-        diags.push(Diagnostic::warning("W_UNUSED_PARAM", w.clone()).with_block("parameters"));
+        let code = if w.contains("declared in [parameters] but not referenced") {
+            "W_UNUSED_PARAM"
+        } else {
+            "W_PARSE"
+        };
+        diags.push(Diagnostic::warning(code, w.clone()));
     }
 
     // 2b. Model / estimation-option compatibility (data-independent): catches

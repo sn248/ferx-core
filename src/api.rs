@@ -647,7 +647,12 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
 
     let mut diags: Vec<Diagnostic> = Vec::new();
 
-    // 2. Model / estimation-option compatibility (data-independent): catches
+    // 2a. Parse-time warnings (e.g. unused parameters) collected during parsing.
+    for w in &parsed.model.parse_warnings {
+        diags.push(Diagnostic::warning("W_UNUSED_PARAM", w.clone()).with_block("parameters"));
+    }
+
+    // 2b. Model / estimation-option compatibility (data-independent): catches
     //    method/model combinations that `fit()` rejects before fitting, so a
     //    clean check and a fit agree. Uses the parsed `[fit_options]`, mirroring
     //    what the CLI fit path (`run_model_with_data`) passes to `fit()`.

@@ -1137,6 +1137,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // For per-CMT (multi-endpoint) models this maps each endpoint's sigma
     // names to indices into this flat vector and enforces the ODE-only
     // restriction.
+    // Capture referenced sigma names before `parsed_error_model` is consumed.
+    let used_sigmas_in_error = used_sigma_names(&parsed_error_model);
     let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
     let sigma = SigmaVector {
         values: sigma_values,
@@ -1366,8 +1368,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         n_kappa,
         n_epsilon,
         theta_names,
-        eta_names: eta_names_bsv,
-        kappa_names,
+        eta_names: eta_names_bsv.clone(),
+        kappa_names: kappa_names.clone(),
         indiv_param_names: indiv_var_names.clone(),
         indiv_param_partials,
         default_params,
@@ -1610,6 +1612,21 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             ));
         }
     }
+
+    // Warn about declared-but-unused parameters. These are not errors because a
+    // user may intentionally comment out expressions (e.g. during model
+    // development), but the warning makes clear that such parameters have no
+    // effect on predictions and will not be meaningfully estimated.
+    let unused_warnings = check_unused_parameters(
+        &thetas,
+        &eta_names_bsv,
+        &kappa_names,
+        n_eta,
+        &model.default_params.sigma.names,
+        &indiv_stmts,
+        &used_sigmas_in_error,
+    );
+    model.parse_warnings.extend(unused_warnings);
 
     Ok(ParsedModel {
         model,
@@ -4546,6 +4563,167 @@ fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::
             }
         }
     }
+}
+
+fn collect_theta_eta(
+    expr: &Expression,
+    thetas: &mut std::collections::HashSet<usize>,
+    etas: &mut std::collections::HashSet<usize>,
+) {
+    match expr {
+        Expression::Theta(i) => {
+            thetas.insert(*i);
+        }
+        Expression::Eta(i) => {
+            etas.insert(*i);
+        }
+        Expression::BinOp(lhs, _, rhs) => {
+            collect_theta_eta(lhs, thetas, etas);
+            collect_theta_eta(rhs, thetas, etas);
+        }
+        Expression::UnaryFn(_, arg) => collect_theta_eta(arg, thetas, etas),
+        Expression::Power(base, exp) => {
+            collect_theta_eta(base, thetas, etas);
+            collect_theta_eta(exp, thetas, etas);
+        }
+        Expression::Conditional(cond, t, e) => {
+            collect_theta_eta_in_condition(cond, thetas, etas);
+            collect_theta_eta(t, thetas, etas);
+            collect_theta_eta(e, thetas, etas);
+        }
+        _ => {}
+    }
+}
+
+fn collect_theta_eta_in_condition(
+    cond: &Condition,
+    thetas: &mut std::collections::HashSet<usize>,
+    etas: &mut std::collections::HashSet<usize>,
+) {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            collect_theta_eta(l, thetas, etas);
+            collect_theta_eta(r, thetas, etas);
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            collect_theta_eta_in_condition(l, thetas, etas);
+            collect_theta_eta_in_condition(r, thetas, etas);
+        }
+        Condition::Not(c) => collect_theta_eta_in_condition(c, thetas, etas),
+    }
+}
+
+fn collect_theta_eta_in_stmts(
+    stmts: &[Statement],
+    thetas: &mut std::collections::HashSet<usize>,
+    etas: &mut std::collections::HashSet<usize>,
+) {
+    for s in stmts {
+        match s {
+            Statement::Assign(_, e)
+            | Statement::AssignIdx(_, e)
+            | Statement::DiffEq(_, e)
+            | Statement::DiffEqIdx(_, e) => collect_theta_eta(e, thetas, etas),
+            Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {}
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (cond, body) in branches {
+                    collect_theta_eta_in_condition(cond, thetas, etas);
+                    collect_theta_eta_in_stmts(body, thetas, etas);
+                }
+                if let Some(eb) = else_body {
+                    collect_theta_eta_in_stmts(eb, thetas, etas);
+                }
+            }
+        }
+    }
+}
+
+/// Collect the sigma names referenced in a `ParsedErrorModel` (before index resolution).
+fn used_sigma_names(parsed: &ParsedErrorModel) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    match parsed {
+        ParsedErrorModel::Single(_, names) => {
+            for n in names {
+                out.insert(n.clone());
+            }
+        }
+        ParsedErrorModel::PerCmt(entries) => {
+            for (_, _, names) in entries {
+                for n in names {
+                    out.insert(n.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Warn about parameters declared in `[parameters]` that are not referenced in
+/// any expression. Returns one warning string per unused parameter; the caller
+/// appends these to `CompiledModel.parse_warnings`.
+///
+/// Only user-declared thetas (indices `0..n_theta_user`) are checked; thetas
+/// added automatically (NN weights, diffusion) are excluded.
+fn check_unused_parameters(
+    thetas: &[ThetaSpec],
+    eta_names_bsv: &[String],
+    kappa_names: &[String],
+    n_eta: usize,
+    sigma_names: &[String],
+    indiv_stmts: &[Statement],
+    used_sigmas: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut used_thetas = std::collections::HashSet::new();
+    let mut used_etas = std::collections::HashSet::new();
+    collect_theta_eta_in_stmts(indiv_stmts, &mut used_thetas, &mut used_etas);
+
+    let mut warnings = Vec::new();
+
+    for (i, t) in thetas.iter().enumerate() {
+        if !used_thetas.contains(&i) {
+            warnings.push(format!(
+                "theta '{}' is declared in [parameters] but not referenced in \
+                 [individual_parameters] — it will not affect predictions or be \
+                 meaningfully estimated",
+                t.name
+            ));
+        }
+    }
+    for (i, name) in eta_names_bsv.iter().enumerate() {
+        if !used_etas.contains(&i) {
+            warnings.push(format!(
+                "omega '{}' is declared in [parameters] but not referenced in \
+                 [individual_parameters] — it will not affect predictions or be \
+                 meaningfully estimated",
+                name
+            ));
+        }
+    }
+    for (i, name) in kappa_names.iter().enumerate() {
+        if !used_etas.contains(&(n_eta + i)) {
+            warnings.push(format!(
+                "kappa '{}' is declared in [parameters] but not referenced in \
+                 [individual_parameters] — it will not affect predictions or be \
+                 meaningfully estimated",
+                name
+            ));
+        }
+    }
+    for name in sigma_names {
+        if !used_sigmas.contains(name) {
+            warnings.push(format!(
+                "sigma '{}' is declared in [parameters] but not referenced in \
+                 [error_model] — it will not affect predictions or be \
+                 meaningfully estimated",
+                name
+            ));
+        }
+    }
+
+    warnings
 }
 
 fn eval_expression(
@@ -12632,6 +12810,150 @@ if (1 > 0) {
         assert!(
             (sym - expected).abs() < 1e-12 * expected.abs().max(1.0),
             "∂KA/∂TVKAM: sym={sym}, expected={expected}",
+        );
+    }
+
+    // ── unused-parameter warning tests ──────────────────────────────────────
+
+    fn minimal_model(parameters: &str, individual_parameters: &str, error_model: &str) -> String {
+        format!(
+            r#"
+[parameters]
+{parameters}
+
+[individual_parameters]
+{individual_parameters}
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+DV ~ proportional({error_model})
+
+[fit_options]
+method = foce
+"#
+        )
+    }
+
+    #[test]
+    fn test_all_used_no_warnings() {
+        let src = minimal_model(
+            "theta TVCL(0.1)\nomega ETA_CL ~ 0.09\nsigma PROP ~ 0.01",
+            "CL = TVCL * exp(ETA_CL)\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(
+            parsed.model.parse_warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            parsed.model.parse_warnings
+        );
+    }
+
+    #[test]
+    fn test_unused_theta_warns() {
+        let src = minimal_model(
+            "theta TVCL(0.1)\ntheta UNUSED(0.5)\nomega ETA_CL ~ 0.09\nsigma PROP ~ 0.01",
+            "CL = TVCL * exp(ETA_CL)\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("UNUSED"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected exactly one warning for UNUSED theta"
+        );
+        assert!(warns[0].contains("theta"), "warning should mention 'theta'");
+    }
+
+    #[test]
+    fn test_unused_omega_warns() {
+        let src = minimal_model(
+            "theta TVCL(0.1)\nomega ETA_CL ~ 0.09\nomega ETA_UNUSED ~ 0.04\nsigma PROP ~ 0.01",
+            "CL = TVCL * exp(ETA_CL)\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("ETA_UNUSED"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected exactly one warning for ETA_UNUSED omega"
+        );
+        assert!(warns[0].contains("omega"), "warning should mention 'omega'");
+    }
+
+    #[test]
+    fn test_unused_sigma_warns() {
+        let src = minimal_model(
+            "theta TVCL(0.1)\nomega ETA_CL ~ 0.09\nsigma PROP ~ 0.01\nsigma ADD_UNUSED ~ 0.01",
+            "CL = TVCL * exp(ETA_CL)\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("ADD_UNUSED"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected exactly one warning for ADD_UNUSED sigma"
+        );
+        assert!(warns[0].contains("sigma"), "warning should mention 'sigma'");
+    }
+
+    #[test]
+    fn test_commented_out_usage_warns() {
+        // Simulates: CL = TVCL #* exp(ETA_CL) — ETA_CL is commented away
+        let src = minimal_model(
+            "theta TVCL(0.1)\nomega ETA_CL ~ 0.09\nsigma PROP ~ 0.01",
+            "CL = TVCL\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("ETA_CL"))
+            .collect();
+        assert_eq!(warns.len(), 1, "ETA_CL not used → should warn");
+    }
+
+    #[test]
+    fn test_multiple_unused_all_reported() {
+        let src = minimal_model(
+            "theta TVCL(0.1)\ntheta TH_UNUSED(0.5)\nomega ETA_CL ~ 0.09\nomega ETA_UNUSED ~ 0.04\nsigma PROP ~ 0.01\nsigma SIG_UNUSED ~ 0.01",
+            "CL = TVCL * exp(ETA_CL)\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let unused: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("UNUSED"))
+            .collect();
+        assert_eq!(
+            unused.len(),
+            3,
+            "expected warnings for TH_UNUSED, ETA_UNUSED, SIG_UNUSED; got: {:?}",
+            unused
         );
     }
 }

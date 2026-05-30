@@ -70,6 +70,8 @@ fn find_exp_eta_in_mul(expr: &Expression) -> Option<usize> {
                 };
                 return match (li, ri) {
                     (Some(a), Some(b)) => Some(a.min(b)),
+                    // One operand is not a bare Eta (e.g. exp(ETA + constant));
+                    // return whichever index was found.
                     (a, b) => a.or(b),
                 };
             }
@@ -507,7 +509,8 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
     // references. Handles derived intermediates like `KTR * exp(ETA_KA)`
     // where KTR is a variable defined earlier in [individual_parameters] and
     // collect_mul_anchors therefore finds no direct Theta anchor.
-    // detect_pattern above already handles the Theta-anchored case, so this
+    // Only reached when detect_pattern returned None above.
+    // detect_pattern already handles the Theta-anchored case, so this
     // only fires when anchors.len() != 1 but the expression is still
     // structurally log-normal.
     if let Some(ei) = find_exp_eta_in_mul(expr) {

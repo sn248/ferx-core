@@ -1463,6 +1463,15 @@ fn fit_inner(
     // Shrinkage
     let shrinkage_eta = compute_eta_shrinkage(&subjects, &result.params.omega.matrix);
     let shrinkage_eps = compute_eps_shrinkage(&subjects);
+    let (shrinkage_kappa, shrinkage_kappa_by_occ) =
+        if let Some(ref omega_iov) = result.params.omega_iov {
+            (
+                compute_kappa_shrinkage(&result.kappas, &omega_iov.matrix),
+                compute_kappa_shrinkage_by_occ(&result.kappas, &omega_iov.matrix),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
     if let Some(w) = eps_shrinkage_warning(shrinkage_eps) {
         warnings.push(w);
@@ -1594,7 +1603,8 @@ fn fit_inner(
         kappa_fixed: result.params.kappa_fixed.clone(),
         kappa_init_as_sd: model.kappa_init_as_sd.clone(),
         se_kappa,
-        shrinkage_kappa: Vec::new(),
+        shrinkage_kappa,
+        shrinkage_kappa_by_occ,
         ebe_kappas: result.kappas.clone(),
         saem_mu_ref_m_step_evals_saved: result.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: result.saem_n_subjects_hmc,
@@ -1929,6 +1939,97 @@ fn compute_subject_results(
         .collect()
 }
 
+/// Kappa shrinkage pooled across all subject-occasion pairs.
+///
+/// `1 - sqrt(mean(κ̂²)) / sqrt(omega_iov_kk)` for each kappa k, where the mean
+/// runs over every (subject, occasion) pair.  Returns NaN for a given kappa when
+/// the corresponding diagonal of `omega_iov` is non-positive or when fewer than
+/// two (subject, occasion) observations are available.
+pub(crate) fn compute_kappa_shrinkage(
+    kappas_per_subject: &[Vec<DVector<f64>>],
+    omega_iov: &DMatrix<f64>,
+) -> Vec<f64> {
+    let n_kappa = omega_iov.nrows();
+    if n_kappa == 0 {
+        return vec![];
+    }
+    // Flatten all per-subject per-occasion kappa vectors into one iterator.
+    let all_kappas: Vec<&DVector<f64>> = kappas_per_subject
+        .iter()
+        .flat_map(|occ_kappas| occ_kappas.iter())
+        .collect();
+    let n = all_kappas.len();
+    if n < 2 {
+        return vec![f64::NAN; n_kappa];
+    }
+    (0..n_kappa)
+        .map(|k| {
+            let var = omega_iov[(k, k)];
+            if var <= 0.0 {
+                return f64::NAN;
+            }
+            let ms = all_kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
+            1.0 - ms.sqrt() / var.sqrt()
+        })
+        .collect()
+}
+
+/// Kappa shrinkage broken out by occasion index.
+///
+/// Returns `shrinkage_by_occ[occ_idx][kappa_idx]` where `occ_idx` is the
+/// **0-based position within each subject's own occasion list** — i.e. the
+/// order in which distinct OCC values were first encountered in that subject's
+/// rows (matching `split_obs_by_occasion`).
+///
+/// **Important limitation for unbalanced designs:** `occ_idx` is a position
+/// index, *not* the raw OCC column value.  When subjects have different OCC
+/// sequences (e.g., a late-entry subject whose data begins at OCC 2), their
+/// position 0 maps to OCC 2 while other subjects' position 0 maps to OCC 1.
+/// Pooling across position 0 then mixes kappas from different occasions.
+/// For unbalanced designs use the pooled `shrinkage_kappa` instead, and
+/// interpret per-occasion values only when the OCC column is aligned across
+/// all subjects.
+///
+/// Returns an empty outer vec when fewer than two distinct occasions are present
+/// or no kappa parameters exist.
+pub(crate) fn compute_kappa_shrinkage_by_occ(
+    kappas_per_subject: &[Vec<DVector<f64>>],
+    omega_iov: &DMatrix<f64>,
+) -> Vec<Vec<f64>> {
+    let n_kappa = omega_iov.nrows();
+    if n_kappa == 0 {
+        return vec![];
+    }
+    // Determine max number of occasions across subjects.
+    let n_occ = kappas_per_subject
+        .iter()
+        .map(|v| v.len())
+        .max()
+        .unwrap_or(0);
+    if n_occ < 2 {
+        return vec![];
+    }
+    (0..n_occ)
+        .map(|occ_idx| {
+            let occ_kappas: Vec<&DVector<f64>> = kappas_per_subject
+                .iter()
+                .filter_map(|occ_vecs| occ_vecs.get(occ_idx))
+                .collect();
+            let n = occ_kappas.len();
+            (0..n_kappa)
+                .map(|k| {
+                    let var = omega_iov[(k, k)];
+                    if var <= 0.0 || n < 2 {
+                        return f64::NAN;
+                    }
+                    let ms = occ_kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
+                    1.0 - ms.sqrt() / var.sqrt()
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// ETA shrinkage: `1 - sqrt(mean(eta_hat_k^2)) / sqrt(omega_kk)` for each random effect k.
 ///
 /// Uses the uncentered second moment with `n` divisor (NONMEM / PsN / Monolix
@@ -2139,6 +2240,112 @@ mod tests {
         assert!(eps_shrinkage_warning(-0.05).is_none());
         // NaN — no warning.
         assert!(eps_shrinkage_warning(f64::NAN).is_none());
+    }
+
+    // ── kappa shrinkage ──────────────────────────────────────────────────────
+
+    fn make_kappas(vals: Vec<Vec<f64>>) -> Vec<Vec<DVector<f64>>> {
+        // vals[subj_idx][occ_idx] = single-kappa value
+        vals.into_iter()
+            .map(|occ_vals| {
+                occ_vals
+                    .into_iter()
+                    .map(|v| DVector::from_vec(vec![v]))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_pooled_zero_when_rms_matches_omega_sd() {
+        // omega_iov = 1.0; kappas = [+1, -1] across 2 subjects × 1 occasion
+        // mean(κ²) = 1 → shrinkage = 0
+        let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+        let kappas = make_kappas(vec![vec![1.0], vec![-1.0]]);
+        let sh = compute_kappa_shrinkage(&kappas, &omega);
+        assert_eq!(sh.len(), 1);
+        assert!((sh[0]).abs() < 1e-10, "expected ~0, got {}", sh[0]);
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_pooled_positive_when_shrunk() {
+        // kappas near zero → shrinkage > 0
+        let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+        let kappas = make_kappas(vec![
+            vec![0.01, 0.02],
+            vec![-0.01, -0.02],
+            vec![0.01, 0.02],
+            vec![-0.01, -0.02],
+        ]);
+        let sh = compute_kappa_shrinkage(&kappas, &omega);
+        assert!(sh[0] > 0.9, "expected high shrinkage, got {}", sh[0]);
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_pooled_nan_when_omega_zero() {
+        let omega = DMatrix::zeros(1, 1);
+        let kappas = make_kappas(vec![vec![0.1], vec![-0.1]]);
+        let sh = compute_kappa_shrinkage(&kappas, &omega);
+        assert!(sh[0].is_nan());
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_pooled_nan_when_fewer_than_2_obs() {
+        let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+        let kappas = make_kappas(vec![vec![0.5]]);
+        let sh = compute_kappa_shrinkage(&kappas, &omega);
+        assert!(sh[0].is_nan());
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_by_occ_returns_empty_for_single_occasion() {
+        let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+        let kappas = make_kappas(vec![vec![0.5], vec![-0.5]]);
+        let sh = compute_kappa_shrinkage_by_occ(&kappas, &omega);
+        assert!(sh.is_empty(), "expected empty for 1 occasion, got {:?}", sh);
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_by_occ_values() {
+        // 4 subjects, 2 occasions.
+        // OCC 1: kappas = [+1, -1, +1, -1] → mean(κ²) = 1 → shrinkage = 0 with omega=1
+        // OCC 2: kappas = [0.1, -0.1, 0.1, -0.1] → mean(κ²) = 0.01 → high shrinkage
+        let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+        let kappas = make_kappas(vec![
+            vec![1.0, 0.1],
+            vec![-1.0, -0.1],
+            vec![1.0, 0.1],
+            vec![-1.0, -0.1],
+        ]);
+        let sh = compute_kappa_shrinkage_by_occ(&kappas, &omega);
+        assert_eq!(sh.len(), 2, "expected 2 occasions");
+        assert!(
+            (sh[0][0]).abs() < 1e-10,
+            "occ 1 shrinkage ~0, got {}",
+            sh[0][0]
+        );
+        assert!(sh[1][0] > 0.8, "occ 2 shrinkage high, got {}", sh[1][0]);
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_two_kappas_independent() {
+        // n_kappa = 2: each kappa parameter should be computed independently.
+        // kappa 0: RMS = 1.0 → shrinkage = 0 with omega_00 = 1.0
+        // kappa 1: RMS = 0.1 → shrinkage = 1 - 0.1/1.0 = 0.9 with omega_11 = 1.0
+        let omega = DMatrix::from_diagonal(&DVector::from_vec(vec![1.0, 1.0]));
+        // Each subject has 1 occasion; kappa vector is [k0_val, k1_val].
+        let kappas: Vec<Vec<DVector<f64>>> = vec![
+            vec![DVector::from_vec(vec![1.0, 0.1])],
+            vec![DVector::from_vec(vec![-1.0, -0.1])],
+        ];
+        let sh = compute_kappa_shrinkage(&kappas, &omega);
+        assert_eq!(sh.len(), 2);
+        assert!((sh[0]).abs() < 1e-10, "kappa 0 shrinkage ~0, got {}", sh[0]);
+        assert!(
+            (sh[1] - 0.9).abs() < 1e-10,
+            "kappa 1 shrinkage ~0.9, got {}",
+            sh[1]
+        );
     }
 
     #[test]
@@ -3475,6 +3682,7 @@ mod simulate_with_uncertainty_tests {
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],
+            shrinkage_kappa_by_occ: vec![],
             ebe_kappas: vec![],
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,

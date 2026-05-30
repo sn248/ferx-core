@@ -1613,7 +1613,17 @@ pub struct FitResult {
     /// `kappa NAME ~ X (sd)`. Always `false` for block_kappa entries.
     pub kappa_init_as_sd: Vec<bool>,
     pub se_kappa: Option<Vec<f64>>,
+    /// Pooled kappa shrinkage: one value per kappa parameter, averaged over all
+    /// subject-occasion pairs.  Empty when `n_kappa == 0`.
     pub shrinkage_kappa: Vec<f64>,
+    /// Per-occasion kappa shrinkage: `shrinkage_kappa_by_occ[occ_idx][kappa_idx]`.
+    /// `occ_idx` is the 0-based position within each subject's own occasion list
+    /// (order in which distinct OCC values first appear in that subject's rows),
+    /// **not** the raw OCC column value.  For unbalanced designs where subjects
+    /// have different OCC sequences, a given `occ_idx` may map to different OCC
+    /// values across subjects — use `shrinkage_kappa` (pooled) in that case.
+    /// Empty when `n_kappa == 0` or only one occasion is present.
+    pub shrinkage_kappa_by_occ: Vec<Vec<f64>>,
     /// Per-subject, per-occasion kappa EBEs.
     /// `ebe_kappas[i][k]` is the kappa vector for subject i, occasion k.
     /// Outer vec is empty when `n_kappa == 0`.

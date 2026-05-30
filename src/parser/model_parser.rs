@@ -7626,13 +7626,17 @@ mod tests {
 
     #[test]
     fn test_detect_mu_ref_rejects_compound_eta_expression() {
-        // exp(ETA_CL + ETA_OCC) is not a bare exp(Eta) — rejected.
+        // exp(ETA_CL + ETA_OCC) — IIV+IOV combined pattern. Since Fix 1,
+        // find_exp_eta_in_mul recognises this and returns the min-index eta
+        // (ETA_CL, index 0), so a mu-ref IS detected for ETA_CL → TVCL.
         let m = detect_one(
             "CL = TVCL * exp(ETA_CL + ETA_OCC)",
             &["TVCL"],
             &["ETA_CL", "ETA_OCC"],
         );
-        assert!(m.is_none());
+        let m = m.expect("IIV+IOV combined pattern should detect mu-ref for ETA_CL");
+        assert_eq!(m.theta_name, "TVCL");
+        assert!(m.log_transformed);
     }
 
     #[test]

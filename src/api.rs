@@ -340,7 +340,28 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
     let mut diags = check_covariates(model, population);
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
+    diags.extend(check_iov_occasions(model, population));
     diags
+}
+
+/// IOV models require occasion labels in the dataset. When `n_kappa > 0` but
+/// every subject has an empty `occasions` vector the kappa random effects are
+/// silently ignored — catch this early instead.
+fn check_iov_occasions(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    if model.n_kappa == 0 {
+        return Vec::new();
+    }
+    let all_empty = population.subjects.iter().all(|s| s.occasions.is_empty());
+    if !all_empty {
+        return Vec::new();
+    }
+    vec![Diagnostic::error(
+        "E_IOV_MISSING_OCC",
+        "Model declares kappa (IOV) parameters but no occasion labels were found in the \
+         dataset. Set `iov_column = \"OCC\"` (or the relevant column name) in \
+         [fit_options] so that per-occasion kappas can be estimated.",
+    )
+    .with_block("fit_options")]
 }
 
 /// Model + estimation-option *compatibility* checks that don't depend on data:
@@ -2786,6 +2807,47 @@ mod iov_integration {
             msg.contains("trust_region") && msg.contains("IOV"),
             "error message should mention trust_region and IOV, got: {msg}"
         );
+    }
+
+    // When a model has kappa declarations but the dataset carries no occasion
+    // labels, `fit()` must return an error and `check_model_data` must surface
+    // E_IOV_MISSING_OCC — rather than silently ignoring the kappas.
+    #[test]
+    fn test_iov_missing_occ_returns_err() {
+        let model = make_iov_model();
+        // Population built without occasion labels (empty `occasions` vectors).
+        let mut pop = make_iov_population();
+        for subj in &mut pop.subjects {
+            subj.occasions.clear();
+            subj.dose_occasions.clear();
+        }
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        let result = fit(&model, &pop, &model.default_params, &opts);
+        assert!(
+            result.is_err(),
+            "IOV model without occasion labels must error"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("iov_column") || msg.contains("OCC") || msg.contains("occasion"),
+            "error message should mention the missing occasion column, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_check_model_data_flags_missing_occ() {
+        let model = make_iov_model();
+        let mut pop = make_iov_population();
+        for subj in &mut pop.subjects {
+            subj.occasions.clear();
+            subj.dose_occasions.clear();
+        }
+        let diags = super::check_model_data(&model, &pop);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_IOV_MISSING_OCC")
+            .expect("expected E_IOV_MISSING_OCC diagnostic");
+        assert!(d.message.contains("iov_column") || d.message.contains("kappa"));
     }
 
     // `ferx check` must surface the same trust_region+IOV incompatibility that

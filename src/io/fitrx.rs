@@ -2157,4 +2157,18 @@ mod tests {
             "omega_init must not be all zeros"
         );
     }
+
+    #[test]
+    fn covariate_names_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cov-roundtrip.fitrx");
+        let r = minimal_fit_result(); // has covariate_names: ["WT", "AGE"]
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(
+            loaded.fit.covariate_names,
+            vec!["WT".to_string(), "AGE".to_string()]
+        );
+    }
 }

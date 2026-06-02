@@ -1704,7 +1704,13 @@ fn fit_inner(
         sigma_init,
         obs_time_range,
         final_gradient: result.final_gradient.clone(),
-        optimizer: options.optimizer.label().to_string(),
+        optimizer: match final_method {
+            EstimationMethod::Saem => "saem",
+            EstimationMethod::FoceGn => "gn",
+            EstimationMethod::FoceGnHybrid => "gn",
+            _ => options.optimizer.label(),
+        }
+        .to_string(),
         n_starts: options.n_starts,
         multi_start_seed: options.multi_start_seed,
         saem_seed: options.saem_seed,

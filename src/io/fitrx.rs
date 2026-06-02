@@ -2055,7 +2055,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("no-omega-init.fitrx");
         let r = minimal_fit_result();
-        let p = dummy_population(&["S1"], 3);
+        let p = dummy_population(&["S1", "S2"], 3);
         save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
 
         // Strip omega_init from fit.json to simulate a pre-PR bundle.

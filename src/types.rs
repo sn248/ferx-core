@@ -1725,6 +1725,26 @@ pub struct FitResult {
     /// SHA-256 hex digest of the data file bytes at fit time. Same semantics
     /// as `model_hash`.
     pub data_hash: Option<String>,
+    /// Verbatim content of the `.ferx` model file. `Some` when the fit was
+    /// launched via `fit_from_files` / CLI or loaded from a `.fitrx` bundle;
+    /// `None` for in-memory `fit()` callers who never had a file path.
+    pub model_text: Option<String>,
+    /// Initial theta values as supplied to the optimizer, parallel to `theta`
+    /// and `theta_names`.
+    pub theta_init: Vec<f64>,
+    /// Initial omega matrix (variance scale), same layout as `omega`.
+    pub omega_init: DMatrix<f64>,
+    /// Initial sigma values, parallel to `sigma` and `sigma_names`.
+    pub sigma_init: Vec<f64>,
+    /// `(min_time, max_time)` across all observation records. `None` only when
+    /// there are no observations at all.
+    pub obs_time_range: Option<(f64, f64)>,
+    /// Gradient of the objective function at the best-OFV parameter point,
+    /// in the packed parameter space (log-theta, Cholesky-omega, log-sigma).
+    /// `Some` only for NLopt gradient-based runs (SLSQP, L-BFGS, MMA) when at
+    /// least one gradient-requesting iteration improved the OFV; `None` for
+    /// BOBYQA (derivative-free), built-in BFGS, GN, and SAEM.
+    pub final_gradient: Option<Vec<f64>>,
     /// One entry per `[covariate_nn NAME]` block in the model, populated by
     /// `fit()` from `CompiledModel.covariate_nns`. Empty when the `nn`
     /// feature is off or no block is declared. Output writers

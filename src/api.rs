@@ -131,6 +131,7 @@ pub fn run_model_with_data_inits(
     result.data_path = Some(data_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    result.model_text = std::fs::read_to_string(model_path).ok();
     Ok((result, population))
 }
 
@@ -229,6 +230,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // non-fatal and just disable the integrity check in `run_sir`.
     result.model_path = Some(model_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
+    result.model_text = std::fs::read_to_string(model_path).ok();
     Ok((result, population))
 }
 
@@ -730,6 +732,7 @@ pub fn fit_from_files(
     result.data_path = Some(data_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    result.model_text = std::fs::read_to_string(model_path).ok();
     Ok(result)
 }
 
@@ -1141,6 +1144,32 @@ fn fit_inner(
         n_params_pre.checked_mul(n_params_pre)
     } else {
         None
+    };
+
+    // Capture initial parameter values before the chain modifies them.
+    let theta_init = init_params.theta.clone();
+    let omega_init = init_params.omega.matrix.clone();
+    let sigma_init = init_params.sigma.values.clone();
+
+    // Compute observation time range from the population.
+    let obs_time_range: Option<(f64, f64)> = {
+        let mut mn = f64::INFINITY;
+        let mut mx = f64::NEG_INFINITY;
+        for s in &population.subjects {
+            for &t in &s.obs_times {
+                if t < mn {
+                    mn = t;
+                }
+                if t > mx {
+                    mx = t;
+                }
+            }
+        }
+        if mn.is_finite() {
+            Some((mn, mx))
+        } else {
+            None
+        }
     };
 
     // Run each stage in sequence, feeding params forward.
@@ -1644,6 +1673,12 @@ fn fit_inner(
         data_path: None,
         model_hash: None,
         data_hash: None,
+        model_text: None,
+        theta_init,
+        omega_init,
+        sigma_init,
+        obs_time_range,
+        final_gradient: result.final_gradient.clone(),
         #[cfg(feature = "nn")]
         neural_networks: build_neural_network_infos(model),
     };
@@ -3717,6 +3752,12 @@ mod simulate_with_uncertainty_tests {
             data_path: None,
             model_hash: None,
             data_hash: None,
+            model_text: None,
+            theta_init: template.theta.clone(),
+            omega_init: template.omega.matrix.clone(),
+            sigma_init: template.sigma.values.clone(),
+            obs_time_range: None,
+            final_gradient: None,
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }

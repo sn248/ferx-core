@@ -29,6 +29,11 @@ pub struct OuterResult {
     pub ebe_convergence_warnings: u32,
     pub max_unconverged_subjects: u32,
     pub total_ebe_fallbacks: u32,
+    /// Gradient at the best-OFV parameter point in packed space (log-theta,
+    /// Cholesky-omega, log-sigma). `Some` for NLopt gradient-based runs
+    /// (SLSQP, L-BFGS, MMA) when at least one gradient-requesting iteration
+    /// improved the OFV; `None` for BOBYQA, built-in BFGS, GN, and SAEM.
+    pub final_gradient: Option<Vec<f64>>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -581,6 +586,9 @@ fn optimize_nlopt(
     let best_seen: Arc<Mutex<Option<(Vec<f64>, f64)>>> = Arc::new(Mutex::new(None));
     let best_seen_cl = Arc::clone(&best_seen);
 
+    let last_gradient: Arc<Mutex<Option<Vec<f64>>>> = Arc::new(Mutex::new(None));
+    let last_gradient_cl = Arc::clone(&last_gradient);
+
     // EBE stats accumulator: tracks worst unconverged count and total fallbacks.
     #[derive(Default)]
     struct EbeAccum {
@@ -725,6 +733,9 @@ fn optimize_nlopt(
             grad_norm_for_trace = Some(sq.sqrt());
             if matches!(algo, nlopt::Algorithm::Slsqp) {
                 cap_slsqp_gradient(g, &lower_s, &upper_s);
+            }
+            if ofv < state.best_ofv {
+                *last_gradient_cl.lock().unwrap() = Some(grad_raw.clone());
             }
         }
 
@@ -899,6 +910,7 @@ fn optimize_nlopt(
         let n_evals_cl2 = Arc::clone(&n_evals_outer);
         let ebe_accum_cl2 = Arc::clone(&ebe_accum);
         let best_seen_cl2 = Arc::clone(&best_seen);
+        let last_gradient_cl2 = Arc::clone(&last_gradient);
         // SLSQP fallback also operates in scaled xs space (same scale as primary opt).
         let objective2 = |xs: &[f64], grad: Option<&mut [f64]>, state: &mut NloptState| -> f64 {
             if crate::cancel::is_cancelled(&options.cancel) {
@@ -1005,6 +1017,9 @@ fn optimize_nlopt(
                 // SLSQP overshoot guard (issue #55) — this fallback
                 // closure is unconditionally SLSQP.
                 cap_slsqp_gradient(g, &lower_s, &upper_s);
+                if ofv < state.best_ofv {
+                    *last_gradient_cl2.lock().unwrap() = Some(grad_raw.clone());
+                }
             }
 
             state.cached_etas = ehs;
@@ -1198,6 +1213,8 @@ fn optimize_nlopt(
         warnings.push("Covariance step failed".to_string());
     }
 
+    let final_gradient = last_gradient.lock().unwrap().clone();
+
     let ebe_final = ebe_accum.lock().unwrap();
     OuterResult {
         params: final_params,
@@ -1219,6 +1236,7 @@ fn optimize_nlopt(
         ebe_convergence_warnings: ebe_final.n_convergence_warnings as u32,
         max_unconverged_subjects: ebe_final.max_unconverged as u32,
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
+        final_gradient,
     }
 }
 
@@ -1545,6 +1563,7 @@ fn optimize_bfgs(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        final_gradient: None,
     }
 }
 

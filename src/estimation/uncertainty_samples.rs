@@ -405,6 +405,12 @@ mod tests {
             data_path: None,
             model_hash: None,
             data_hash: None,
+            model_text: None,
+            theta_init: template.theta.clone(),
+            omega_init: template.omega.matrix.clone(),
+            sigma_init: template.sigma.values.clone(),
+            obs_time_range: None,
+            final_gradient: None,
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }

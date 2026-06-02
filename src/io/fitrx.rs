@@ -236,6 +236,18 @@ struct FitWire {
     model_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     data_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_text: Option<String>,
+    #[serde(default)]
+    theta_init: Vec<f64>,
+    #[serde(default)]
+    omega_init: Option<MatrixWire>,
+    #[serde(default)]
+    sigma_init: Vec<f64>,
+    #[serde(default)]
+    obs_time_range: Option<(f64, f64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_gradient: Option<Vec<f64>>,
     /// `[covariate_nn]` block metadata. Absent (None) on bundles produced
     /// before this field existed or when ferx-core was built without
     /// `--features nn`. Loaders gracefully default to an empty Vec.
@@ -549,8 +561,9 @@ pub fn save_fit(
     entries.push("predictions.csv".into());
 
     // --- model.ferx --------------------------------------------------------
+    let effective_source = result.model_text.as_deref().unwrap_or(model_source);
     zip.start_file("model.ferx", zopts)?;
-    zip.write_all(model_source.as_bytes())?;
+    zip.write_all(effective_source.as_bytes())?;
     entries.push("model.ferx".into());
 
     // --- warnings.txt ------------------------------------------------------
@@ -702,6 +715,12 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         data_path: r.data_path.clone(),
         model_hash: r.model_hash.clone(),
         data_hash: r.data_hash.clone(),
+        model_text: r.model_text.clone(),
+        theta_init: r.theta_init.clone(),
+        omega_init: Some(MatrixWire::from(&r.omega_init)),
+        sigma_init: r.sigma_init.clone(),
+        obs_time_range: r.obs_time_range,
+        final_gradient: r.final_gradient.clone(),
         #[cfg(feature = "nn")]
         neural_networks: if r.neural_networks.is_empty() {
             None
@@ -912,7 +931,8 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
         Vec::new()
     };
 
-    let fit = wire_to_fit_result(wire, subjects, ebe_kappas)?;
+    let mut fit = wire_to_fit_result(wire, subjects, ebe_kappas)?;
+    fit.model_text = Some(model_source.clone());
 
     Ok(LoadedFit {
         fit,
@@ -1357,6 +1377,13 @@ fn wire_to_fit_result(
 
     let omega = w.omega.matrix.into_dmatrix()?;
     let omega_param_corr = w.omega.param_corr.map(|m| m.into_dmatrix()).transpose()?;
+    let omega_init = {
+        let n = omega.nrows();
+        match w.omega_init {
+            Some(m) => m.into_dmatrix()?,
+            None => nalgebra::DMatrix::zeros(n, n),
+        }
+    };
     let covariance_matrix = w.covariance_matrix.map(|m| m.into_dmatrix()).transpose()?;
 
     let (
@@ -1518,6 +1545,12 @@ fn wire_to_fit_result(
         data_path: w.data_path,
         model_hash: w.model_hash,
         data_hash: w.data_hash,
+        model_text: w.model_text,
+        theta_init: w.theta_init,
+        omega_init,
+        sigma_init: w.sigma_init,
+        obs_time_range: w.obs_time_range,
+        final_gradient: w.final_gradient,
         #[cfg(feature = "nn")]
         neural_networks: w.neural_networks.unwrap_or_default(),
     })
@@ -1698,6 +1731,12 @@ mod tests {
             data_path: None,
             model_hash: None,
             data_hash: None,
+            model_text: None,
+            theta_init: vec![1.0, 2.0, 0.5],
+            omega_init: DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]),
+            sigma_init: vec![0.05],
+            obs_time_range: Some((0.25, 24.0)),
+            final_gradient: None,
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }

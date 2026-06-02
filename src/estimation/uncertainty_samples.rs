@@ -411,6 +411,16 @@ mod tests {
             sigma_init: template.sigma.values.clone(),
             obs_time_range: None,
             final_gradient: None,
+            optimizer: "bobyqa".to_string(),
+            n_starts: 1,
+            multi_start_seed: None,
+            saem_seed: None,
+            sir_seed: None,
+            is_seed: None,
+            bloq_method: "drop".to_string(),
+            outer_maxiter: 0,
+            outer_gtol: 0.0,
+            inits_from_nca: None,
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }

@@ -1704,6 +1704,24 @@ fn fit_inner(
         sigma_init,
         obs_time_range,
         final_gradient: result.final_gradient.clone(),
+        optimizer: options.optimizer.label().to_string(),
+        n_starts: options.n_starts,
+        multi_start_seed: options.multi_start_seed,
+        saem_seed: options.saem_seed,
+        sir_seed: options.sir_seed,
+        is_seed: options.is_seed,
+        bloq_method: model.bloq_method.label().to_string(),
+        outer_maxiter: options.outer_maxiter,
+        outer_gtol: options.outer_gtol,
+        inits_from_nca: options.inits_from_nca.map(|m| {
+            use crate::suggest_start::NcaInit;
+            match m {
+                NcaInit::Nca => "nca",
+                NcaInit::Sweep => "nca_sweep",
+                NcaInit::Ebe => "nca_ebe",
+            }
+            .to_string()
+        }),
         #[cfg(feature = "nn")]
         neural_networks: build_neural_network_infos(model),
     };
@@ -3783,6 +3801,16 @@ mod simulate_with_uncertainty_tests {
             sigma_init: template.sigma.values.clone(),
             obs_time_range: None,
             final_gradient: None,
+            optimizer: "bobyqa".to_string(),
+            n_starts: 1,
+            multi_start_seed: None,
+            saem_seed: None,
+            sir_seed: None,
+            is_seed: None,
+            bloq_method: "drop".to_string(),
+            outer_maxiter: 0,
+            outer_gtol: 0.0,
+            inits_from_nca: None,
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }

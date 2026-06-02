@@ -248,6 +248,27 @@ struct FitWire {
     obs_time_range: Option<(f64, f64)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_gradient: Option<Vec<f64>>,
+    // ── Run settings ─────────────────────────────────────────────────────────
+    #[serde(default)]
+    optimizer: String,
+    #[serde(default = "default_one")]
+    n_starts: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    multi_start_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saem_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sir_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    is_seed: Option<u64>,
+    #[serde(default)]
+    bloq_method: String,
+    #[serde(default)]
+    outer_maxiter: usize,
+    #[serde(default)]
+    outer_gtol: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inits_from_nca: Option<String>,
     /// `[covariate_nn]` block metadata. Absent (None) on bundles produced
     /// before this field existed or when ferx-core was built without
     /// `--features nn`. Loaders gracefully default to an empty Vec.
@@ -384,6 +405,10 @@ impl MatrixWire {
 
 fn default_nan() -> f64 {
     f64::NAN
+}
+
+fn default_one() -> usize {
+    1
 }
 
 fn method_to_str(m: EstimationMethod) -> &'static str {
@@ -721,6 +746,16 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         sigma_init: r.sigma_init.clone(),
         obs_time_range: r.obs_time_range,
         final_gradient: r.final_gradient.clone(),
+        optimizer: r.optimizer.clone(),
+        n_starts: r.n_starts,
+        multi_start_seed: r.multi_start_seed,
+        saem_seed: r.saem_seed,
+        sir_seed: r.sir_seed,
+        is_seed: r.is_seed,
+        bloq_method: r.bloq_method.clone(),
+        outer_maxiter: r.outer_maxiter,
+        outer_gtol: r.outer_gtol,
+        inits_from_nca: r.inits_from_nca.clone(),
         #[cfg(feature = "nn")]
         neural_networks: if r.neural_networks.is_empty() {
             None
@@ -1553,6 +1588,16 @@ fn wire_to_fit_result(
         sigma_init: w.sigma_init,
         obs_time_range: w.obs_time_range,
         final_gradient: w.final_gradient,
+        optimizer: w.optimizer,
+        n_starts: w.n_starts,
+        multi_start_seed: w.multi_start_seed,
+        saem_seed: w.saem_seed,
+        sir_seed: w.sir_seed,
+        is_seed: w.is_seed,
+        bloq_method: w.bloq_method,
+        outer_maxiter: w.outer_maxiter,
+        outer_gtol: w.outer_gtol,
+        inits_from_nca: w.inits_from_nca,
         #[cfg(feature = "nn")]
         neural_networks: w.neural_networks.unwrap_or_default(),
     })
@@ -1739,6 +1784,16 @@ mod tests {
             sigma_init: vec![0.05],
             obs_time_range: Some((0.25, 24.0)),
             final_gradient: None,
+            optimizer: "slsqp".to_string(),
+            n_starts: 1,
+            multi_start_seed: None,
+            saem_seed: None,
+            sir_seed: None,
+            is_seed: None,
+            bloq_method: "drop".to_string(),
+            outer_maxiter: 300,
+            outer_gtol: 1e-4,
+            inits_from_nca: None,
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }

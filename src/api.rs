@@ -1722,6 +1722,7 @@ fn fit_inner(
             }
             .to_string()
         }),
+        covariate_names: population.covariate_names.clone(),
         #[cfg(feature = "nn")]
         neural_networks: build_neural_network_infos(model),
     };
@@ -3811,6 +3812,7 @@ mod simulate_with_uncertainty_tests {
             outer_maxiter: 0,
             outer_gtol: 0.0,
             inits_from_nca: None,
+            covariate_names: Vec::new(),
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }

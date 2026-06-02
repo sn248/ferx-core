@@ -1778,6 +1778,12 @@ pub struct FitResult {
     /// One of "nca", "nca_sweep", "nca_ebe", or `None` when the model-file
     /// initial values were used directly.
     pub inits_from_nca: Option<String>,
+    /// Names of covariate columns present in the dataset, in the order they
+    /// appear in the data file's header.  Mirrors the NONMEM `$INPUT` echo —
+    /// lets `ferx_runlog()` report which covariates were available without
+    /// requiring the caller to re-read the CSV.  Empty for in-memory `fit()`
+    /// calls that never touch a file.
+    pub covariate_names: Vec<String>,
     /// One entry per `[covariate_nn NAME]` block in the model, populated by
     /// `fit()` from `CompiledModel.covariate_nns`. Empty when the `nn`
     /// feature is off or no block is declared. Output writers

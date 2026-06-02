@@ -1103,6 +1103,7 @@ mod tests {
             outer_maxiter: 0,
             outer_gtol: 0.0,
             inits_from_nca: None,
+            covariate_names: Vec::new(),
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }
@@ -1421,6 +1422,7 @@ mod tests {
             outer_maxiter: 0,
             outer_gtol: 0.0,
             inits_from_nca: None,
+            covariate_names: Vec::new(),
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }

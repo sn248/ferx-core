@@ -734,8 +734,20 @@ fn optimize_nlopt(
             if matches!(algo, nlopt::Algorithm::Slsqp) {
                 cap_slsqp_gradient(g, &lower_s, &upper_s);
             }
-            if ofv < state.best_ofv {
-                *last_gradient_cl.lock().unwrap() = Some(grad_raw.clone());
+            // Gate on the global best (same reason as the `best_seen` update
+            // below): `state.best_ofv` resets to INFINITY when the SLSQP
+            // fallback starts, so using it here would let the fallback's first
+            // eval overwrite a better gradient found by the primary run.
+            {
+                let global_best = best_seen_cl
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|(_, o)| *o)
+                    .unwrap_or(f64::INFINITY);
+                if ofv < global_best {
+                    *last_gradient_cl.lock().unwrap() = Some(grad_raw.clone());
+                }
             }
         }
 
@@ -1017,8 +1029,18 @@ fn optimize_nlopt(
                 // SLSQP overshoot guard (issue #55) — this fallback
                 // closure is unconditionally SLSQP.
                 cap_slsqp_gradient(g, &lower_s, &upper_s);
-                if ofv < state.best_ofv {
-                    *last_gradient_cl2.lock().unwrap() = Some(grad_raw.clone());
+                // See `best_seen` comment in the primary closure — gate on the
+                // global accumulator, not `state.best_ofv` which is fresh here.
+                {
+                    let global_best = best_seen_cl2
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|(_, o)| *o)
+                        .unwrap_or(f64::INFINITY);
+                    if ofv < global_best {
+                        *last_gradient_cl2.lock().unwrap() = Some(grad_raw.clone());
+                    }
                 }
             }
 

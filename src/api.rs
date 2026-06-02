@@ -1146,11 +1146,6 @@ fn fit_inner(
         None
     };
 
-    // Capture initial parameter values before the chain modifies them.
-    let theta_init = init_params.theta.clone();
-    let omega_init = init_params.omega.matrix.clone();
-    let sigma_init = init_params.sigma.values.clone();
-
     // Compute observation time range from the population.
     let obs_time_range: Option<(f64, f64)> = {
         let mut mn = f64::INFINITY;
@@ -1216,6 +1211,36 @@ fn fit_inner(
         stage_params = suggested.params;
         accumulated_warnings.extend(suggested.warnings);
     }
+
+    // Warn if any subject has a non-numeric ID.  sdtab() parses subject IDs
+    // as f64 and falls back to a 1-based loop index when parsing fails; the
+    // fallback produces a misleading ID column that breaks downstream joins.
+    // NONMEM data always uses numeric IDs, so this fires only for malformed
+    // input.
+    let non_numeric_ids: Vec<&str> = population
+        .subjects
+        .iter()
+        .filter(|s| s.id.parse::<f64>().is_err())
+        .map(|s| s.id.as_str())
+        .collect();
+    if !non_numeric_ids.is_empty() {
+        accumulated_warnings.push(format!(
+            "Non-numeric subject IDs detected ({} subject(s), e.g. {:?}). \
+             The sdtab ID column will fall back to a 1-based loop index for \
+             these subjects, which will break any downstream join by ID.",
+            non_numeric_ids.len(),
+            non_numeric_ids.first().unwrap_or(&""),
+        ));
+    }
+
+    // Capture initial parameter values after NCA override so the stored
+    // values reflect what the optimizer actually started from.  Placed here
+    // rather than at the top of the function so that inits_from_nca-derived
+    // values are captured correctly (init_params is never mutated; only
+    // stage_params is updated by the NCA block above).
+    let theta_init = stage_params.theta.clone();
+    let omega_init = stage_params.omega.matrix.clone();
+    let sigma_init = stage_params.sigma.values.clone();
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;

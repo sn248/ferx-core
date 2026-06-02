@@ -1378,10 +1378,12 @@ fn wire_to_fit_result(
     let omega = w.omega.matrix.into_dmatrix()?;
     let omega_param_corr = w.omega.param_corr.map(|m| m.into_dmatrix()).transpose()?;
     let omega_init = {
-        let n = omega.nrows();
         match w.omega_init {
             Some(m) => m.into_dmatrix()?,
-            None => nalgebra::DMatrix::zeros(n, n),
+            // Pre-PR bundles lack omega_init.  Fall back to the converged
+            // omega rather than a zero matrix — zeros are not positive-definite
+            // and would break any Cholesky-based consumer.
+            None => omega.clone(),
         }
     };
     let covariance_matrix = w.covariance_matrix.map(|m| m.into_dmatrix()).transpose()?;

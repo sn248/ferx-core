@@ -1477,4 +1477,42 @@ mod tests {
             "CMT column should be absent when all obs_cmts == 1"
         );
     }
+
+    // ── Fix 4: non-numeric subject IDs fall back to 1-based loop index ───────
+
+    /// When a subject ID cannot be parsed as f64 the sdtab ID column falls
+    /// back to the 1-based loop index rather than panicking or silently
+    /// emitting 0.  This test pins the fallback behavior; a separate warning
+    /// is issued by fit_inner() for callers that go through the estimation
+    /// path.
+    #[test]
+    fn sdtab_id_column_falls_back_for_non_numeric_ids() {
+        let result = minimal_sdtab_result(vec![
+            sdtab_subject_result("PT-001", 1),
+            sdtab_subject_result("PT-002", 1),
+        ]);
+        let population = Population {
+            subjects: vec![
+                sdtab_subject("PT-001", 1, vec![1]),
+                sdtab_subject("PT-002", 1, vec![1]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+        };
+
+        let cols = sdtab(&result, &population);
+        let id_col = cols
+            .iter()
+            .find(|(name, _)| name == "ID")
+            .map(|(_, v)| v.clone())
+            .expect("ID column missing");
+
+        // Fallback: 1-based loop indices (1.0, 2.0), not NaN or 0.
+        assert_eq!(
+            id_col,
+            vec![1.0, 2.0],
+            "non-numeric IDs should fall back to 1-based index, got {:?}",
+            id_col
+        );
+    }
 }

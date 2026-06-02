@@ -2042,4 +2042,59 @@ mod tests {
             other => panic!("expected Corrupt, got {:?}", other),
         }
     }
+
+    // ── Fix 3: omega_init backward-compat fallback ───────────────────────────
+
+    /// Loading a .fitrx bundle that pre-dates the omega_init field should fall
+    /// back to the converged omega, not to a zero matrix.  A zero matrix is not
+    /// positive-definite and would break any Cholesky-based consumer.
+    #[test]
+    fn omega_init_fallback_uses_omega_not_zeros() {
+        use std::io::{Read as _, Write as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-omega-init.fitrx");
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        // Strip omega_init from fit.json to simulate a pre-PR bundle.
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            if name == "fit.json" {
+                let mut v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+                v.as_object_mut().unwrap().remove("omega_init");
+                buf = serde_json::to_vec_pretty(&v).unwrap();
+            }
+            entries.push((name, buf));
+        }
+        let patched = dir.path().join("no-omega-init-patched.fitrx");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&patched).unwrap());
+        for (name, body) in entries {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap();
+
+        let loaded = load_fit(&patched).unwrap();
+        let omega_init = &loaded.fit.omega_init;
+        let omega = &loaded.fit.omega;
+
+        // Should match the converged omega, not be an all-zero matrix.
+        assert_eq!(
+            omega_init, omega,
+            "omega_init should fall back to converged omega, got {:?}",
+            omega_init
+        );
+        assert!(
+            omega_init.iter().any(|&v| v != 0.0),
+            "omega_init must not be all zeros"
+        );
+    }
 }

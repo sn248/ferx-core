@@ -131,6 +131,7 @@ pub fn run_model_with_data_inits(
     result.data_path = Some(data_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    result.model_text = std::fs::read_to_string(model_path).ok();
     Ok((result, population))
 }
 
@@ -229,6 +230,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // non-fatal and just disable the integrity check in `run_sir`.
     result.model_path = Some(model_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
+    result.model_text = std::fs::read_to_string(model_path).ok();
     Ok((result, population))
 }
 
@@ -730,6 +732,7 @@ pub fn fit_from_files(
     result.data_path = Some(data_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    result.model_text = std::fs::read_to_string(model_path).ok();
     Ok(result)
 }
 
@@ -1143,6 +1146,27 @@ fn fit_inner(
         None
     };
 
+    // Compute observation time range from the population.
+    let obs_time_range: Option<(f64, f64)> = {
+        let mut mn = f64::INFINITY;
+        let mut mx = f64::NEG_INFINITY;
+        for s in &population.subjects {
+            for &t in &s.obs_times {
+                if t < mn {
+                    mn = t;
+                }
+                if t > mx {
+                    mx = t;
+                }
+            }
+        }
+        if mn.is_finite() {
+            Some((mn, mx))
+        } else {
+            None
+        }
+    };
+
     // Run each stage in sequence, feeding params forward.
     let n_stages = chain.len();
     let mut stage_params: ModelParameters = init_params.clone();
@@ -1187,6 +1211,36 @@ fn fit_inner(
         stage_params = suggested.params;
         accumulated_warnings.extend(suggested.warnings);
     }
+
+    // Warn if any subject has a non-numeric ID.  sdtab() parses subject IDs
+    // as f64 and falls back to a 1-based loop index when parsing fails; the
+    // fallback produces a misleading ID column that breaks downstream joins.
+    // NONMEM data always uses numeric IDs, so this fires only for malformed
+    // input.
+    let non_numeric_ids: Vec<&str> = population
+        .subjects
+        .iter()
+        .filter(|s| s.id.parse::<f64>().is_err())
+        .map(|s| s.id.as_str())
+        .collect();
+    if !non_numeric_ids.is_empty() {
+        accumulated_warnings.push(format!(
+            "Non-numeric subject IDs detected ({} subject(s), e.g. {:?}). \
+             The sdtab ID column will fall back to a 1-based loop index for \
+             these subjects, which will break any downstream join by ID.",
+            non_numeric_ids.len(),
+            non_numeric_ids.first().unwrap_or(&""),
+        ));
+    }
+
+    // Capture initial parameter values after NCA override so the stored
+    // values reflect what the optimizer actually started from.  Placed here
+    // rather than at the top of the function so that inits_from_nca-derived
+    // values are captured correctly (init_params is never mutated; only
+    // stage_params is updated by the NCA block above).
+    let theta_init = stage_params.theta.clone();
+    let omega_init = stage_params.omega.matrix.clone();
+    let sigma_init = stage_params.sigma.values.clone();
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
@@ -1644,6 +1698,37 @@ fn fit_inner(
         data_path: None,
         model_hash: None,
         data_hash: None,
+        model_text: None,
+        theta_init,
+        omega_init,
+        sigma_init,
+        obs_time_range,
+        final_gradient: result.final_gradient.clone(),
+        optimizer: match final_method {
+            EstimationMethod::Saem => "saem",
+            EstimationMethod::FoceGn => "gn",
+            EstimationMethod::FoceGnHybrid => "gn",
+            _ => options.optimizer.label(),
+        }
+        .to_string(),
+        n_starts: options.n_starts,
+        multi_start_seed: options.multi_start_seed,
+        saem_seed: options.saem_seed,
+        sir_seed: options.sir_seed,
+        is_seed: options.is_seed,
+        bloq_method: model.bloq_method.label().to_string(),
+        outer_maxiter: options.outer_maxiter,
+        outer_gtol: options.outer_gtol,
+        inits_from_nca: options.inits_from_nca.map(|m| {
+            use crate::suggest_start::NcaInit;
+            match m {
+                NcaInit::Nca => "nca",
+                NcaInit::Sweep => "nca_sweep",
+                NcaInit::Ebe => "nca_ebe",
+            }
+            .to_string()
+        }),
+        covariate_names: population.covariate_names.clone(),
         #[cfg(feature = "nn")]
         neural_networks: build_neural_network_infos(model),
     };
@@ -3717,6 +3802,23 @@ mod simulate_with_uncertainty_tests {
             data_path: None,
             model_hash: None,
             data_hash: None,
+            model_text: None,
+            theta_init: template.theta.clone(),
+            omega_init: template.omega.matrix.clone(),
+            sigma_init: template.sigma.values.clone(),
+            obs_time_range: None,
+            final_gradient: None,
+            optimizer: "bobyqa".to_string(),
+            n_starts: 1,
+            multi_start_seed: None,
+            saem_seed: None,
+            sir_seed: None,
+            is_seed: None,
+            bloq_method: "drop".to_string(),
+            outer_maxiter: 0,
+            outer_gtol: 0.0,
+            inits_from_nca: None,
+            covariate_names: Vec::new(),
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }

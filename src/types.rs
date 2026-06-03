@@ -1725,6 +1725,65 @@ pub struct FitResult {
     /// SHA-256 hex digest of the data file bytes at fit time. Same semantics
     /// as `model_hash`.
     pub data_hash: Option<String>,
+    /// Verbatim content of the `.ferx` model file. `Some` when the fit was
+    /// launched via `fit_from_files` / CLI or loaded from a `.fitrx` bundle;
+    /// `None` for in-memory `fit()` callers who never had a file path.
+    pub model_text: Option<String>,
+    /// Initial theta values as supplied to the optimizer, parallel to `theta`
+    /// and `theta_names`.
+    pub theta_init: Vec<f64>,
+    /// Initial omega matrix (variance scale), same layout as `omega`.
+    pub omega_init: DMatrix<f64>,
+    /// Initial sigma values, parallel to `sigma` and `sigma_names`.
+    pub sigma_init: Vec<f64>,
+    /// `(min_time, max_time)` across all observation records. `None` only when
+    /// there are no observations at all.
+    pub obs_time_range: Option<(f64, f64)>,
+    /// Gradient of the objective function at the best-OFV parameter point,
+    /// in the packed parameter space (log-theta, Cholesky-omega, log-sigma).
+    /// `Some` only for NLopt gradient-based runs (SLSQP, L-BFGS, MMA) when at
+    /// least one gradient-requesting iteration improved the OFV; `None` for
+    /// BOBYQA (derivative-free), built-in BFGS, GN, and SAEM.
+    pub final_gradient: Option<Vec<f64>>,
+    // ── Run settings (for runlog / reproducibility) ──────────────────────────
+    /// Outer optimizer used for this fit, as a short lowercase label
+    /// ("bobyqa", "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs",
+    /// "trust_region").  Always populated; the label is the same regardless of
+    /// method chain length.
+    pub optimizer: String,
+    /// Number of random multi-starts attempted. 1 means a single fit from
+    /// the model-file initial values (no multi-start).
+    pub n_starts: usize,
+    /// Seed used to perturb initial values across multi-starts.  `None` when
+    /// `n_starts == 1` (no perturbation applied) or when no seed was set and
+    /// the run used a random seed derived from the system clock.
+    pub multi_start_seed: Option<u64>,
+    /// Seed used for the SAEM MCMC E-step.  `None` for non-SAEM methods or
+    /// when no explicit seed was set in `[fit_options]`.
+    pub saem_seed: Option<u64>,
+    /// Seed used for the SIR resampling step.  `None` when SIR was not run or
+    /// no explicit seed was set.
+    pub sir_seed: Option<u64>,
+    /// Seed used for the importance-sampling Monte Carlo step.  `None` when IS
+    /// was not run or no explicit seed was set.
+    pub is_seed: Option<u64>,
+    /// BLOQ handling method: "drop" (observations below LOQ are excluded) or
+    /// "m3" (M3 likelihood for censored observations).
+    pub bloq_method: String,
+    /// Maximum number of outer optimizer iterations allowed.
+    pub outer_maxiter: usize,
+    /// Gradient-norm convergence tolerance for the outer optimizer.
+    pub outer_gtol: f64,
+    /// NCA initialisation method used to derive starting values, if any.
+    /// One of "nca", "nca_sweep", "nca_ebe", or `None` when the model-file
+    /// initial values were used directly.
+    pub inits_from_nca: Option<String>,
+    /// Names of covariate columns present in the dataset, in the order they
+    /// appear in the data file's header.  Mirrors the NONMEM `$INPUT` echo —
+    /// lets `ferx_runlog()` report which covariates were available without
+    /// requiring the caller to re-read the CSV.  Empty for in-memory `fit()`
+    /// calls that never touch a file.
+    pub covariate_names: Vec<String>,
     /// One entry per `[covariate_nn NAME]` block in the model, populated by
     /// `fit()` from `CompiledModel.covariate_nns`. Empty when the `nn`
     /// feature is off or no block is declared. Output writers
@@ -2063,6 +2122,15 @@ pub enum BloqMethod {
     M3,
 }
 
+impl BloqMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            BloqMethod::Drop => "drop",
+            BloqMethod::M3 => "m3",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Optimizer {
     Bfgs,
@@ -2083,6 +2151,20 @@ pub enum Optimizer {
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
     TrustRegion,
+}
+
+impl Optimizer {
+    pub fn label(self) -> &'static str {
+        match self {
+            Optimizer::Bfgs => "bfgs",
+            Optimizer::Lbfgs => "lbfgs",
+            Optimizer::Slsqp => "slsqp",
+            Optimizer::NloptLbfgs => "nlopt_lbfgs",
+            Optimizer::Mma => "mma",
+            Optimizer::Bobyqa => "bobyqa",
+            Optimizer::TrustRegion => "trust_region",
+        }
+    }
 }
 
 /// Estimation method

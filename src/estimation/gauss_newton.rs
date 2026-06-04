@@ -111,7 +111,6 @@ pub fn run_foce_gn(
     }
 
     let mut converged = false;
-    let mut final_gradient: Option<Vec<f64>> = None;
 
     for iter in 1..=maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -135,7 +134,6 @@ pub fn run_foce_gn(
             &bounds,
             options,
         );
-        final_gradient = Some(grad.as_slice().to_vec());
 
         // Zero gradient rows / BHHH rows & cols for FIX parameters, and set
         // their diagonal to 1. The clamp at step-application keeps x[i] at its
@@ -336,6 +334,21 @@ pub fn run_foce_gn(
     if !converged {
         warnings.push("Gauss-Newton: max iterations reached without convergence".to_string());
     }
+
+    // Recompute gradient at the final accepted x so the stored value is always
+    // at the converged point (mid-loop capture would be off by one step).
+    let (grad_final, _) = build_gn_system(
+        &x,
+        init_params,
+        model,
+        population,
+        &eta_hats,
+        &h_matrices,
+        &kappas,
+        &bounds,
+        options,
+    );
+    let mut final_gradient: Option<Vec<f64>> = Some(grad_final.as_slice().to_vec());
 
     let gn_ofv = ofv;
     let do_polish = matches!(options.method, EstimationMethod::FoceGnHybrid);

@@ -111,6 +111,7 @@ pub fn run_foce_gn(
     }
 
     let mut converged = false;
+    let mut final_gradient: Option<Vec<f64>> = None;
 
     for iter in 1..=maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -134,6 +135,7 @@ pub fn run_foce_gn(
             &bounds,
             options,
         );
+        final_gradient = Some(grad.as_slice().to_vec());
 
         // Zero gradient rows / BHHH rows & cols for FIX parameters, and set
         // their diagonal to 1. The clamp at step-application keeps x[i] at its
@@ -396,7 +398,7 @@ pub fn run_foce_gn(
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
-            final_gradient: None,
+            final_gradient,
         };
     }
 
@@ -439,6 +441,7 @@ pub fn run_foce_gn(
         final_h_mats = polish_result.h_matrices;
         final_kappas = polish_result.kappas;
         converged = polish_result.converged || converged;
+        final_gradient = polish_result.final_gradient.or(final_gradient);
     } else {
         if verbose {
             eprintln!("  FOCEI polish did not improve (GN result kept)");
@@ -500,7 +503,7 @@ pub fn run_foce_gn(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
-        final_gradient: None,
+        final_gradient,
     }
 }
 

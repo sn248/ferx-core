@@ -68,8 +68,8 @@ pub fn individual_nll_ad(
     let n_tv = tv.len();
     let n_doses = dose_times.len();
     let n_obs = obs_times.len();
-    // LTBS is packed as a +100 offset on the model id (pk_model_id ≤ 8 ⇒ base
-    // ≤ 82, so the offset is unambiguous). Under LTBS the effective prediction
+    // LTBS is packed as a +100 offset on the model id (pk_model_id ≤ 5 ⇒ base
+    // ≤ 52, so the offset is unambiguous). Under LTBS the effective prediction
     // is log(conc) and the error model is additive on the log scale.
     let ltbs = (pk_and_err_model as i32) >= 100;
     let base = (pk_and_err_model as i32) % 100;
@@ -315,11 +315,23 @@ fn single_dose_ad(
         return 0.0;
     }
 
+    // Per issue #176, IV variants no longer split by administration type at
+    // the model level. Each IV branch below handles bolus and infusion via
+    // the per-dose `dur` (and `rate`) — the `dur <= 0.0` fall-through is
+    // exactly the bolus closed form. ID mapping (see `pk_model_to_id`):
+    //   0 OneCptIv, 1 OneCptOral, 2 TwoCptIv, 3 TwoCptOral,
+    //   4 ThreeCptIv, 5 ThreeCptOral.
     match pk_model_id {
         0 => {
-            // OneCptIvBolus
+            // OneCptIv — bolus when dur<=0, infusion otherwise.
             let k = cl / v;
-            (amt / v) * (-k * tau).exp()
+            if dur <= 0.0 {
+                (amt / v) * (-k * tau).exp()
+            } else if tau <= dur {
+                (rate / cl) * (1.0 - (-k * tau).exp())
+            } else {
+                (rate / cl) * (1.0 - (-k * dur).exp()) * (-k * (tau - dur)).exp()
+            }
         }
         1 => {
             // OneCptOral
@@ -332,28 +344,29 @@ fn single_dose_ad(
             }
         }
         2 => {
-            // OneCptInfusion
-            let k = cl / v;
+            // TwoCptIv — bolus when dur<=0, infusion otherwise.
+            // The previous `.abs() < 1e-12` diff guards produced NaN
+            // gradients under Enzyme reverse-mode (branching on .abs()
+            // poisons the adjoint), and were dead for physical params.
+            let (alpha, beta, k21) = macro_rates(cl, v, q, v2);
+            let diff = alpha - beta;
             if dur <= 0.0 {
-                (amt / v) * (-k * tau).exp()
-            } else if tau <= dur {
-                (rate / cl) * (1.0 - (-k * tau).exp())
+                let a = (amt / v) * (alpha - k21) / diff;
+                let b = (amt / v) * (k21 - beta) / diff;
+                a * (-alpha * tau).exp() + b * (-beta * tau).exp()
             } else {
-                (rate / cl) * (1.0 - (-k * dur).exp()) * (-k * (tau - dur)).exp()
+                let a_c = (rate / v) * (alpha - k21) / (diff * alpha);
+                let b_c = (rate / v) * (k21 - beta) / (diff * beta);
+                if tau <= dur {
+                    a_c * (1.0 - (-alpha * tau).exp()) + b_c * (1.0 - (-beta * tau).exp())
+                } else {
+                    let dt = tau - dur;
+                    a_c * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp()
+                        + b_c * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp()
+                }
             }
         }
         3 => {
-            // TwoCptIvBolus
-            let (alpha, beta, k21) = macro_rates(cl, v, q, v2);
-            let diff = alpha - beta;
-            if diff.abs() < 1e-12 {
-                return 0.0;
-            }
-            let a = (amt / v) * (alpha - k21) / diff;
-            let b = (amt / v) * (k21 - beta) / diff;
-            a * (-alpha * tau).exp() + b * (-beta * tau).exp()
-        }
-        4 => {
             // TwoCptOral
             let (alpha, beta, k21) = macro_rates(cl, v, q, v2);
             let diff = alpha - beta;
@@ -378,79 +391,8 @@ fn single_dose_ad(
             };
             p + q_val + r
         }
-        5 => {
-            // TwoCptInfusion
-            let (alpha, beta, k21) = macro_rates(cl, v, q, v2);
-            // For any positive (cl, v, q, v2) we have alpha > 0 and
-            // alpha - beta = disc > 0, and beta = d/alpha >= 0. The previous
-            // `.abs() < 1e-12` guards produced NaN gradients under Enzyme
-            // reverse-mode (branching on .abs() poisons the adjoint), and were
-            // dead for physical params — remove them.
-            let diff = alpha - beta;
-            if dur <= 0.0 {
-                let a = (amt / v) * (alpha - k21) / diff;
-                let b = (amt / v) * (k21 - beta) / diff;
-                a * (-alpha * tau).exp() + b * (-beta * tau).exp()
-            } else {
-                let a_c = (rate / v) * (alpha - k21) / (diff * alpha);
-                let b_c = (rate / v) * (k21 - beta) / (diff * beta);
-                if tau <= dur {
-                    a_c * (1.0 - (-alpha * tau).exp()) + b_c * (1.0 - (-beta * tau).exp())
-                } else {
-                    let dt = tau - dur;
-                    a_c * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp()
-                        + b_c * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp()
-                }
-            }
-        }
-        6 => {
-            // ThreeCptIvBolus
-            let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_ad(cl, v, q, v2, q3, v3);
-            let ab = alpha - beta;
-            let ag = alpha - gamma;
-            let bg = beta - gamma;
-            if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
-                return 0.0;
-            }
-            let d = amt / v;
-            let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
-            let b = d * (beta - k21) * (beta - k31) / (-ab * bg);
-            let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
-            a * (-alpha * tau).exp() + b * (-beta * tau).exp() + g * (-gamma * tau).exp()
-        }
-        7 => {
-            // ThreeCptOral
-            let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_ad(cl, v, q, v2, q3, v3);
-            let ab = alpha - beta;
-            let ag = alpha - gamma;
-            let bg = beta - gamma;
-            if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
-                return 0.0;
-            }
-            let coeff = f_bio * amt * ka / v;
-            let a_c = (alpha - k21) * (alpha - k31) / (ab * ag);
-            let b_c = (beta - k21) * (beta - k31) / (-ab * bg);
-            let g_c = (gamma - k21) * (gamma - k31) / (ag * bg);
-
-            let bateman_a = if (ka - alpha).abs() < 1e-6 {
-                tau * (-alpha * tau).exp()
-            } else {
-                ((-alpha * tau).exp() - (-ka * tau).exp()) / (ka - alpha)
-            };
-            let bateman_b = if (ka - beta).abs() < 1e-6 {
-                tau * (-beta * tau).exp()
-            } else {
-                ((-beta * tau).exp() - (-ka * tau).exp()) / (ka - beta)
-            };
-            let bateman_g = if (ka - gamma).abs() < 1e-6 {
-                tau * (-gamma * tau).exp()
-            } else {
-                ((-gamma * tau).exp() - (-ka * tau).exp()) / (ka - gamma)
-            };
-            coeff * (a_c * bateman_a + b_c * bateman_b + g_c * bateman_g)
-        }
-        8 => {
-            // ThreeCptInfusion
+        4 => {
+            // ThreeCptIv — bolus when dur<=0, infusion otherwise.
             let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_ad(cl, v, q, v2, q3, v3);
             let ab = alpha - beta;
             let ag = alpha - gamma;
@@ -486,6 +428,37 @@ fn single_dose_ad(
                         + g_c * (1.0 - (-gamma * dur).exp()) * (-gamma * dt).exp()
                 }
             }
+        }
+        5 => {
+            // ThreeCptOral
+            let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_ad(cl, v, q, v2, q3, v3);
+            let ab = alpha - beta;
+            let ag = alpha - gamma;
+            let bg = beta - gamma;
+            if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
+                return 0.0;
+            }
+            let coeff = f_bio * amt * ka / v;
+            let a_c = (alpha - k21) * (alpha - k31) / (ab * ag);
+            let b_c = (beta - k21) * (beta - k31) / (-ab * bg);
+            let g_c = (gamma - k21) * (gamma - k31) / (ag * bg);
+
+            let bateman_a = if (ka - alpha).abs() < 1e-6 {
+                tau * (-alpha * tau).exp()
+            } else {
+                ((-alpha * tau).exp() - (-ka * tau).exp()) / (ka - alpha)
+            };
+            let bateman_b = if (ka - beta).abs() < 1e-6 {
+                tau * (-beta * tau).exp()
+            } else {
+                ((-beta * tau).exp() - (-ka * tau).exp()) / (ka - beta)
+            };
+            let bateman_g = if (ka - gamma).abs() < 1e-6 {
+                tau * (-gamma * tau).exp()
+            } else {
+                ((-gamma * tau).exp() - (-ka * tau).exp()) / (ka - gamma)
+            };
+            coeff * (a_c * bateman_a + b_c * bateman_b + g_c * bateman_g)
         }
         _ => 0.0,
     }
@@ -602,15 +575,12 @@ fn residual_variance_ad(error_model_id: i32, f_pred: f64, sigma: &[f64]) -> f64 
 
 pub fn pk_model_to_id(m: PkModel) -> i32 {
     match m {
-        PkModel::OneCptIvBolus => 0,
+        PkModel::OneCptIv => 0,
         PkModel::OneCptOral => 1,
-        PkModel::OneCptInfusion => 2,
-        PkModel::TwoCptIvBolus => 3,
-        PkModel::TwoCptOral => 4,
-        PkModel::TwoCptInfusion => 5,
-        PkModel::ThreeCptIvBolus => 6,
-        PkModel::ThreeCptOral => 7,
-        PkModel::ThreeCptInfusion => 8,
+        PkModel::TwoCptIv => 2,
+        PkModel::TwoCptOral => 3,
+        PkModel::ThreeCptIv => 4,
+        PkModel::ThreeCptOral => 5,
     }
 }
 
@@ -794,7 +764,7 @@ mod ltbs_ad_tests {
             &obs_times,
             &observations,
             &cens,
-            PkModel::OneCptIvBolus,
+            PkModel::OneCptIv,
             ErrorModel::Additive,
             &pk_idx_f64,
             &sel_flat,

@@ -1153,14 +1153,11 @@ pub fn supports_event_driven_ad(pk_model: PkModel) -> bool {
     // dispatch.
     matches!(
         pk_model,
-        PkModel::OneCptIvBolus
-            | PkModel::OneCptInfusion
+        PkModel::OneCptIv
             | PkModel::OneCptOral
-            | PkModel::TwoCptIvBolus
-            | PkModel::TwoCptInfusion
+            | PkModel::TwoCptIv
             | PkModel::TwoCptOral
-            | PkModel::ThreeCptIvBolus
-            | PkModel::ThreeCptInfusion
+            | PkModel::ThreeCptIv
             | PkModel::ThreeCptOral
     )
 }

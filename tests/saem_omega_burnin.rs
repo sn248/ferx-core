@@ -43,7 +43,7 @@ const MODEL: &str = r#"
   V  = TVV  * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)

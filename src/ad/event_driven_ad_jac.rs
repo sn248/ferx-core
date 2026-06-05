@@ -948,7 +948,7 @@ mod tests {
         // 1-cpt IV infusion: dose split across a finite duration so the
         // propagator's per-dose `f_bio * dose_rates[d]` path runs (not the
         // main loop's bolus step).
-        let pk_model_id = pk_model_to_id(PkModel::OneCptInfusion) as f64;
+        let pk_model_id = pk_model_to_id(PkModel::OneCptIv) as f64;
         let event_times = vec![0.0_f64, 0.5, 1.0, 2.0, 4.0, 8.0];
         let event_kinds = vec![0.0_f64, 1.0, 1.0, 1.0, 1.0, 1.0];
         let event_orig = vec![0.0_f64, 0.0, 1.0, 2.0, 3.0, 4.0];

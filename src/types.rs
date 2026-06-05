@@ -2135,19 +2135,28 @@ impl BloqMethod {
 pub enum Optimizer {
     Bfgs,
     Lbfgs,
-    /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based,
-    /// default outer optimizer. Robust on the FOCE/FOCEI objective surface in
-    /// practice: FD-gradient noise from EBE re-estimation is small relative
-    /// to the OFV moves the optimizer cares about.
+    /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based;
+    /// fast per iteration on smooth, well-conditioned analytical PK models where
+    /// the fixed-EBE finite-difference gradient is a faithful proxy for the true
+    /// gradient. On ill-conditioned fits (ODE/PD models, sparse data, Hill-ridge
+    /// identifiability) the fixed-EBE bias can drive SLSQP to declare convergence
+    /// hundreds of OFV units above the true minimum — pair with
+    /// `reconverge_gradient_interval = 1` if it stalls, or switch to `Bobyqa`
+    /// (the default; see `FitOptions::default`).
     Slsqp,
     /// NLopt LD_LBFGS
     NloptLbfgs,
     /// NLopt LD_MMA — Method of Moving Asymptotes
     Mma,
-    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation. Useful when
-    /// FD gradients are unreliable (e.g. small datasets where EBE-loop noise
-    /// dominates per-eval signal). Needs more outer evaluations than SLSQP
-    /// because it must triangulate a quadratic from scratch.
+    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation, default outer
+    /// optimizer. Re-evaluates the FOCE objective (and the inner EBE loop) at
+    /// every trial point, so it never sees the fixed-EBE gradient bias that can
+    /// stall gradient-based optimizers; consistently reaches a lower OFV than
+    /// SLSQP on ODE/PD models, sparse data, and Hill-ridge problems. Needs more
+    /// outer evaluations than SLSQP to triangulate a quadratic from scratch, but
+    /// each evaluation is cheap (no FD gradient sweep). See
+    /// `docs/src/estimation/optimizers.md` for the cefepime and Emax PKPD
+    /// validations behind the default choice.
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
     TrustRegion,

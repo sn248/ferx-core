@@ -13,6 +13,17 @@ use std::autodiff::{autodiff_forward, autodiff_reverse};
 /// dependency and Enzyme sees a plain literal.
 const LTBS_FLOOR_AD: f64 = 1e-12;
 
+/// Identity function that Enzyme can see through for type deduction but LLVM
+/// cannot inline away. Provides an unambiguous `f64 -> f64` type boundary at
+/// phi-node merge points where Enzyme's type-analysis would otherwise deadlock.
+/// Currently unused (the `read_volatile` approach was chosen), kept as a
+/// documented utility for future phi-node issues in AD-instrumented code.
+#[inline(never)]
+#[allow(dead_code)]
+fn ad_type_fence(x: f64) -> f64 {
+    x
+}
+
 // ─── Individual NLL: reverse-mode AD for gradient w.r.t. eta ────────────────
 
 #[autodiff_reverse(
@@ -91,10 +102,10 @@ pub fn individual_nll_ad(
         pk[idx] = tv[i] * eta_contrib.exp();
     }
 
-    // Lagtime shifts the effective start of every dose. Default 0.0 (no
-    // shift) so models that don't declare LAGTIME behave identically to
-    // the pre-feature path. AD-safe: only adds + and <= on scalars.
-    let lagtime = pk[PK_IDX_LAGTIME];
+    // Volatile load prevents LLVM from merging this value with the array's
+    // zero-initializer into a phi node that Enzyme cannot type-analyze.
+    // Safety: `pk` is a stack-local [f64; MAX_PK_PARAMS] at a valid index.
+    let lagtime = unsafe { core::ptr::read_volatile(&pk[PK_IDX_LAGTIME]) };
 
     // Predictions + data likelihood
     let mut data_ll = 0.0;
@@ -102,25 +113,22 @@ pub fn individual_nll_ad(
         let t = obs_times[obs_idx];
         let mut conc = 0.0;
         for d in 0..n_doses {
-            let t_eff = dose_times[d] + lagtime;
-            if t_eff <= t {
-                let tau = t - t_eff;
-                conc += single_dose_ad(
-                    pk_model_id,
-                    tau,
-                    dose_amts[d],
-                    dose_rates[d],
-                    dose_durations[d],
-                    pk[PK_IDX_CL],
-                    pk[PK_IDX_V],
-                    pk[PK_IDX_Q],
-                    pk[PK_IDX_V2],
-                    pk[PK_IDX_KA],
-                    pk[PK_IDX_F],
-                    pk[PK_IDX_Q3],
-                    pk[PK_IDX_V3],
-                );
-            }
+            let tau = t - dose_times[d] - lagtime;
+            conc += single_dose_ad(
+                pk_model_id,
+                tau,
+                dose_amts[d],
+                dose_rates[d],
+                dose_durations[d],
+                pk[PK_IDX_CL],
+                pk[PK_IDX_V],
+                pk[PK_IDX_Q],
+                pk[PK_IDX_V2],
+                pk[PK_IDX_KA],
+                pk[PK_IDX_F],
+                pk[PK_IDX_Q3],
+                pk[PK_IDX_V3],
+            );
         }
         if conc < 0.0 {
             conc = 0.0;
@@ -245,33 +253,29 @@ pub fn predict_all_ad(
         pk[idx] = tv[i] * eta_contrib.exp();
     }
 
-    // Lagtime shifts the effective start of every dose. See
-    // `individual_nll_ad` for the matching path on the NLL side.
-    let lagtime = pk[PK_IDX_LAGTIME];
+    // Volatile load — see matching comment in `individual_nll_ad`.
+    let lagtime = unsafe { core::ptr::read_volatile(&pk[PK_IDX_LAGTIME]) };
 
     for obs_idx in 0..n_obs {
         let t = obs_times[obs_idx];
         let mut conc = 0.0;
         for d in 0..n_doses {
-            let t_eff = dose_times[d] + lagtime;
-            if t_eff <= t {
-                let tau = t - t_eff;
-                conc += single_dose_ad(
-                    pk_id,
-                    tau,
-                    dose_amts[d],
-                    dose_rates[d],
-                    dose_durations[d],
-                    pk[PK_IDX_CL],
-                    pk[PK_IDX_V],
-                    pk[PK_IDX_Q],
-                    pk[PK_IDX_V2],
-                    pk[PK_IDX_KA],
-                    pk[PK_IDX_F],
-                    pk[PK_IDX_Q3],
-                    pk[PK_IDX_V3],
-                );
-            }
+            let tau = t - dose_times[d] - lagtime;
+            conc += single_dose_ad(
+                pk_id,
+                tau,
+                dose_amts[d],
+                dose_rates[d],
+                dose_durations[d],
+                pk[PK_IDX_CL],
+                pk[PK_IDX_V],
+                pk[PK_IDX_Q],
+                pk[PK_IDX_V2],
+                pk[PK_IDX_KA],
+                pk[PK_IDX_F],
+                pk[PK_IDX_Q3],
+                pk[PK_IDX_V3],
+            );
         }
         let positive = if conc > 0.0 { conc } else { 0.0 };
         let scaled = positive / obs_scale[obs_idx];

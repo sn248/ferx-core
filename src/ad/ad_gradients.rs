@@ -345,9 +345,17 @@ fn single_dose_ad(
         }
         2 => {
             // TwoCptIv — bolus when dur<=0, infusion otherwise.
-            // The previous `.abs() < 1e-12` diff guards produced NaN
-            // gradients under Enzyme reverse-mode (branching on .abs()
-            // poisons the adjoint), and were dead for physical params.
+            //
+            // No `diff.abs() < 1e-12 ⇒ 0.0` guard on either branch:
+            // branching on `.abs()` of a continuous argument poisons the
+            // Enzyme reverse-mode adjoint, and the old `TwoCptInfusion`
+            // arm explicitly removed it for that reason. For physical
+            // positive (cl, v, q, v2) the 2-cpt discriminant is
+            // strictly positive, so `diff = α - β = √disc > 0` and the
+            // divisions never blow up in finite precision. The old
+            // `TwoCptIvBolus` arm carried the guard but it was dead in
+            // practice — keeping the bolus and infusion branches
+            // symmetric here matches that prior author's decision.
             let (alpha, beta, k21) = macro_rates(cl, v, q, v2);
             let diff = alpha - beta;
             if dur <= 0.0 {
@@ -393,26 +401,39 @@ fn single_dose_ad(
         }
         4 => {
             // ThreeCptIv — bolus when dur<=0, infusion otherwise.
+            //
+            // The guards differ between the two branches: the bolus
+            // formula only divides by `ab·ag`, `ab·bg`, `ag·bg`, so it
+            // only needs `ab/ag/bg ≈ 0` checks. The infusion formula
+            // additionally divides by `α`, `β`, `γ` in the rate-input
+            // coefficients, so it needs the three extra eigenvalue
+            // checks. Folding all six into a shared guard (as a prior
+            // revision did) collapses physically-valid bolus answers
+            // to zero whenever a slowly-equilibrating 3-cpt has one of
+            // α/β/γ near zero — see issue #176 review.
             let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_ad(cl, v, q, v2, q3, v3);
             let ab = alpha - beta;
             let ag = alpha - gamma;
             let bg = beta - gamma;
-            if ab.abs() < 1e-12
-                || ag.abs() < 1e-12
-                || bg.abs() < 1e-12
-                || alpha.abs() < 1e-12
-                || beta.abs() < 1e-12
-                || gamma.abs() < 1e-12
-            {
-                return 0.0;
-            }
             if dur <= 0.0 {
+                if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
+                    return 0.0;
+                }
                 let d = amt / v;
                 let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
                 let b = d * (beta - k21) * (beta - k31) / (-ab * bg);
                 let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
                 a * (-alpha * tau).exp() + b * (-beta * tau).exp() + g * (-gamma * tau).exp()
             } else {
+                if ab.abs() < 1e-12
+                    || ag.abs() < 1e-12
+                    || bg.abs() < 1e-12
+                    || alpha.abs() < 1e-12
+                    || beta.abs() < 1e-12
+                    || gamma.abs() < 1e-12
+                {
+                    return 0.0;
+                }
                 let rv = rate / v;
                 let a_c = rv * (alpha - k21) * (alpha - k31) / (ab * ag * alpha);
                 let b_c = rv * (beta - k21) * (beta - k31) / (-ab * bg * beta);
@@ -572,15 +593,29 @@ fn residual_variance_ad(error_model_id: i32, f_pred: f64, sigma: &[f64]) -> f64 
 }
 
 // ─── Enum → ID converters ───────────────────────────────────────────────────
+//
+// `pk_model_id` is passed across the autodiff FFI boundary as `f64` (Enzyme
+// cannot carry the Rust enum directly), and the dispatch chains in
+// `event_driven_ad.rs` / `event_driven_ad_jac.rs` compare against literal
+// numbers. Defining the IDs as named constants here means a future
+// renumbering — or a variant rename like #176 — propagates to every dispatch
+// site through the type system rather than silently misrouting.
+
+pub const PK_ID_ONE_CPT_IV: i32 = 0;
+pub const PK_ID_ONE_CPT_ORAL: i32 = 1;
+pub const PK_ID_TWO_CPT_IV: i32 = 2;
+pub const PK_ID_TWO_CPT_ORAL: i32 = 3;
+pub const PK_ID_THREE_CPT_IV: i32 = 4;
+pub const PK_ID_THREE_CPT_ORAL: i32 = 5;
 
 pub fn pk_model_to_id(m: PkModel) -> i32 {
     match m {
-        PkModel::OneCptIv => 0,
-        PkModel::OneCptOral => 1,
-        PkModel::TwoCptIv => 2,
-        PkModel::TwoCptOral => 3,
-        PkModel::ThreeCptIv => 4,
-        PkModel::ThreeCptOral => 5,
+        PkModel::OneCptIv => PK_ID_ONE_CPT_IV,
+        PkModel::OneCptOral => PK_ID_ONE_CPT_ORAL,
+        PkModel::TwoCptIv => PK_ID_TWO_CPT_IV,
+        PkModel::TwoCptOral => PK_ID_TWO_CPT_ORAL,
+        PkModel::ThreeCptIv => PK_ID_THREE_CPT_IV,
+        PkModel::ThreeCptOral => PK_ID_THREE_CPT_ORAL,
     }
 }
 
@@ -722,6 +757,46 @@ pub fn compute_jacobian_ad(
     }
 
     jac
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    /// `pk_model_to_id` and the named `PK_ID_*` constants must stay in
+    /// lockstep — every dispatch chain in `event_driven_ad.rs` and
+    /// `event_driven_ad_jac.rs` compares the AD `pk_model_id: f64`
+    /// argument against these constants. A silent renumbering (e.g.
+    /// adding a variant in the middle of the enum) would misroute
+    /// every fit under the `autodiff` feature without a compile error,
+    /// since the comparisons are on `f64` literals. This test catches
+    /// that drift.
+    #[test]
+    fn pk_model_to_id_matches_named_constants() {
+        assert_eq!(pk_model_to_id(PkModel::OneCptIv), PK_ID_ONE_CPT_IV);
+        assert_eq!(pk_model_to_id(PkModel::OneCptOral), PK_ID_ONE_CPT_ORAL);
+        assert_eq!(pk_model_to_id(PkModel::TwoCptIv), PK_ID_TWO_CPT_IV);
+        assert_eq!(pk_model_to_id(PkModel::TwoCptOral), PK_ID_TWO_CPT_ORAL);
+        assert_eq!(pk_model_to_id(PkModel::ThreeCptIv), PK_ID_THREE_CPT_IV);
+        assert_eq!(pk_model_to_id(PkModel::ThreeCptOral), PK_ID_THREE_CPT_ORAL);
+    }
+
+    /// The LTBS packing `pk_id * 10 + err_id + 100` must not collide
+    /// with the +100 LTBS-offset boundary. With six PK models (max id
+    /// 5) and three error models (max id 2), the base range is [0, 52]
+    /// and the offset-equipped range is [100, 152] — unambiguous.
+    /// Verify the bound is actually met.
+    #[test]
+    fn ltbs_packing_does_not_collide_with_offset_boundary() {
+        let max_pk = pk_model_to_id(PkModel::ThreeCptOral);
+        let max_err = error_model_to_id(ErrorModel::Combined);
+        let max_base = max_pk * 10 + max_err;
+        assert!(
+            max_base < 100,
+            "pk_model_id * 10 + error_model_id overflows the +100 LTBS offset; \
+             got {max_base} from pk={max_pk}, err={max_err}"
+        );
+    }
 }
 
 #[cfg(test)]

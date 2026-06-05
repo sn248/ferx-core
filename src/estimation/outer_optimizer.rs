@@ -531,6 +531,13 @@ fn optimize_nlopt(
     // that made scaling default-off was on non-IOV models and other algorithms
     // (notably MMA, which scaling hurts here), so scope the auto-enable to the
     // IOV + SLSQP combination that actually needs it.
+    //
+    // Scope note: as of #155 the default outer optimizer is `Bobyqa`, not
+    // `Slsqp` — so default-IOV fits no longer hit this branch. BOBYQA is
+    // gradient-free and doesn't suffer the `cap_slsqp_gradient` starvation that
+    // motivates the scaling here, so leaving it disabled on the default path is
+    // intentional. This auto-enable now only fires for an explicit
+    // `optimizer = slsqp` on IOV models (the path it was originally written for).
     let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
     let scale: Vec<f64> = if (options.scale_params || auto_scale_iov) && !has_identity_theta {
         compute_scale(&x0)

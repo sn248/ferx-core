@@ -3898,15 +3898,43 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
         if let Some(caps) = pk_re.captures(line) {
             let model_name = &caps[1];
             let pk_model = match model_name {
-                "one_cpt_iv_bolus" | "one_compartment_iv_bolus" => PkModel::OneCptIvBolus,
+                "one_cpt_iv" | "one_compartment_iv" => PkModel::OneCptIv,
                 "one_cpt_oral" | "one_compartment_oral" => PkModel::OneCptOral,
-                "one_cpt_infusion" | "one_compartment_infusion" => PkModel::OneCptInfusion,
-                "two_cpt_iv_bolus" | "two_compartment_iv_bolus" => PkModel::TwoCptIvBolus,
+                "two_cpt_iv" | "two_compartment_iv" => PkModel::TwoCptIv,
                 "two_cpt_oral" | "two_compartment_oral" => PkModel::TwoCptOral,
-                "two_cpt_infusion" | "two_compartment_infusion" => PkModel::TwoCptInfusion,
-                "three_cpt_iv_bolus" | "three_compartment_iv_bolus" => PkModel::ThreeCptIvBolus,
+                "three_cpt_iv" | "three_compartment_iv" => PkModel::ThreeCptIv,
                 "three_cpt_oral" | "three_compartment_oral" => PkModel::ThreeCptOral,
-                "three_cpt_infusion" | "three_compartment_infusion" => PkModel::ThreeCptInfusion,
+                // Retired names (issue #176): bolus and infusion are no longer
+                // separate model variants — the route is read per-dose from the
+                // RATE column. Emit a migration error so users update their
+                // model files explicitly rather than relying on a silent alias.
+                retired @ ("one_cpt_iv_bolus"
+                | "one_compartment_iv_bolus"
+                | "one_cpt_infusion"
+                | "one_compartment_infusion"
+                | "two_cpt_iv_bolus"
+                | "two_compartment_iv_bolus"
+                | "two_cpt_infusion"
+                | "two_compartment_infusion"
+                | "three_cpt_iv_bolus"
+                | "three_compartment_iv_bolus"
+                | "three_cpt_infusion"
+                | "three_compartment_infusion") => {
+                    let n = if retired.starts_with("one") {
+                        "one"
+                    } else if retired.starts_with("two") {
+                        "two"
+                    } else {
+                        "three"
+                    };
+                    return Err(format!(
+                        "`{retired}` was removed in #176; use `{n}_cpt_iv` instead. \
+                         Bolus and infusion administration are now driven by the \
+                         RATE column in the dataset (RATE=0 for bolus, RATE>0 for \
+                         infusion), so a single `{n}_cpt_iv` model handles either \
+                         or a mix of both within the same subject."
+                    ));
+                }
                 other => return Err(format!("Unknown PK model: {}", other)),
             };
 
@@ -7139,6 +7167,49 @@ fn parse_if_statement(
 mod tests {
     use super::*;
 
+    // Issue #176 retired the split `*_iv_bolus` / `*_infusion` model names
+    // in favour of a single `*_iv` per compartment count. The parser must
+    // reject the old names with a migration message rather than silently
+    // accept or emit a generic "unknown model" error.
+    #[test]
+    fn test_retired_iv_bolus_and_infusion_names_emit_migration_error() {
+        let retired = [
+            ("one_cpt_iv_bolus", "one"),
+            ("one_compartment_iv_bolus", "one"),
+            ("one_cpt_infusion", "one"),
+            ("two_cpt_iv_bolus", "two"),
+            ("two_compartment_infusion", "two"),
+            ("three_cpt_iv_bolus", "three"),
+            ("three_cpt_infusion", "three"),
+        ];
+        for (name, n) in retired {
+            let lines = vec![format!("pk {}(cl=CL, v=V)", name)];
+            let err = parse_structural_model(&lines)
+                .expect_err(&format!("expected retired name `{name}` to error"));
+            assert!(
+                err.contains("#176") && err.contains(&format!("{n}_cpt_iv")),
+                "missing migration hint for `{name}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unified_iv_names_parse_to_iv_variant() {
+        // The new spelling must compile to the unified IV variant.
+        let cases = [
+            ("one_cpt_iv", PkModel::OneCptIv),
+            ("one_compartment_iv", PkModel::OneCptIv),
+            ("two_cpt_iv", PkModel::TwoCptIv),
+            ("three_cpt_iv", PkModel::ThreeCptIv),
+        ];
+        for (name, expected) in cases {
+            let lines = vec![format!("pk {}(cl=CL, v=V, q=Q, v2=V2, q2=Q2, v3=V3)", name)];
+            let (pk_model, _) = parse_structural_model(&lines)
+                .unwrap_or_else(|e| panic!("`{name}` failed to parse: {e}"));
+            assert_eq!(pk_model, expected, "wrong variant for `{name}`");
+        }
+    }
+
     #[test]
     fn test_parse_method_single() {
         let opts = parse_fit_options(&["method = focei".to_string()]).unwrap();
@@ -7890,7 +7961,7 @@ mod tests {
   V  = TVV  * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9024,7 +9095,7 @@ mod tests {
   V  = TVV  * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9115,7 +9186,7 @@ mod tests {
   V  = TVV  * exp(ETA_V + KAPPA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9329,7 +9400,7 @@ if (X < 10) {
   V = TVV * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9363,7 +9434,7 @@ if (X < 10) {
   V = TVV * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9398,7 +9469,7 @@ if (X < 10) {
   V = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9496,7 +9567,7 @@ if (X < 10) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9755,7 +9826,7 @@ if (1 > 0) {
 {}
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(EPS)
@@ -9776,7 +9847,7 @@ if (1 > 0) {
   F = inv_logit(THETA_F + ETA_F)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=1, v=1)
+  pk one_cpt_iv(cl=1, v=1)
 
 [error_model]
   DV ~ proportional(EPS)
@@ -9833,7 +9904,7 @@ if (1 > 0) {
   CL = TVCL * exp(ETA_CL + KAPPA_CL)
   V  = TVV  * exp(ETA_V)
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 [error_model]
   DV ~ proportional(EPS)
 [fit_options]
@@ -9894,7 +9965,7 @@ if (1 > 0) {
   CL = TVCL * (WT / 70)^0.75 * exp(ETA_CL)
   V  = TVV  * exp(ETA_V)
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 [error_model]
   DV ~ proportional(EPS)
 ";
@@ -9966,7 +10037,7 @@ if (1 > 0) {
   F = inv_logit(logit(THETA_F) + ETA_F)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=1, v=1)
+  pk one_cpt_iv(cl=1, v=1)
 
 [error_model]
   DV ~ proportional(EPS)
@@ -9995,7 +10066,7 @@ if (1 > 0) {
   F = inv_logit(logit(THETA_F) + ETA_F)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=1, v=1)
+  pk one_cpt_iv(cl=1, v=1)
 
 [error_model]
   DV ~ proportional(EPS)
@@ -10210,7 +10281,7 @@ if (1 > 0) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(NO_SUCH_SIGMA)
@@ -10234,7 +10305,7 @@ if (1 > 0) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   CMT=1: DV ~ proportional(PROP_ERR_PK)
@@ -10763,7 +10834,7 @@ if (1 > 0) {
   CL = TVCL * exp(ETA_CL)
   V  = TVV
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 [diffusion]
   central ~ 0.01
 [error_model]
@@ -10797,7 +10868,7 @@ if (1 > 0) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ additive(ADD)
@@ -11231,7 +11302,7 @@ if (1 > 0) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -11713,7 +11784,7 @@ if (1 > 0) {
     #[test]
     fn test_parse_scaling_per_cmt_scalar() {
         // Use the analytical template but layer a per-CMT scaling block on
-        // top. Even though one_cpt_iv_bolus only emits CMT=1 observations,
+        // top. Even though one_cpt_iv only emits CMT=1 observations,
         // the parser doesn't validate coverage (that happens at fit time),
         // so this exercises the parse path cleanly.
         let mut src = String::from(
@@ -11729,7 +11800,7 @@ if (1 > 0) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)

@@ -293,7 +293,7 @@ fn generate_two_cpt_iv() {
         });
     let model = CompiledModel {
         name: "two_cpt_iv".into(),
-        pk_model: PkModel::TwoCptIvBolus,
+        pk_model: PkModel::TwoCptIv,
         error_model: ErrorModel::Proportional,
         error_spec: ferx_core::types::ErrorSpec::Single(ErrorModel::Proportional),
         pk_param_fn,

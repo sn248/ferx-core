@@ -71,13 +71,15 @@ Models are defined in a simple DSL. Here is a one-compartment oral PK model for 
 
 | Model | Syntax |
 |-------|--------|
-| 1-compartment IV bolus | `pk one_cpt_iv_bolus(cl=CL, v=V)` |
+| 1-compartment IV (bolus and/or infusion) | `pk one_cpt_iv(cl=CL, v=V)` |
 | 1-compartment oral | `pk one_cpt_oral(cl=CL, v=V, ka=KA)` |
-| 1-compartment infusion | `pk one_cpt_infusion(cl=CL, v=V)` |
-| 2-compartment IV bolus | `pk two_cpt_iv_bolus(cl=CL, v1=V1, q=Q, v2=V2)` |
+| 2-compartment IV (bolus and/or infusion) | `pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)` |
 | 2-compartment oral | `pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)` |
-| 2-compartment infusion | `pk two_cpt_infusion(cl=CL, v1=V1, q=Q, v2=V2)` |
+| 3-compartment IV (bolus and/or infusion) | `pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)` |
+| 3-compartment oral | `pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA)` |
 | ODE-based | Define equations in an `[odes]` block |
+
+For IV models, the closed form (bolus vs infusion) is chosen per dose event from the `RATE` column — a subject can mix bolus and infusion records.
 
 ## Estimation Methods
 

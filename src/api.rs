@@ -2796,7 +2796,7 @@ mod iov_integration {
         };
         CompiledModel {
             name: "iov_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             // pk_param_fn: eta[0]=BSV for CL, eta[1]=KAPPA_CL (appended by IOV path)
@@ -3644,7 +3644,7 @@ mod simulate_with_uncertainty_tests {
         };
         CompiledModel {
             name: "uncertainty_smoke".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -4348,7 +4348,7 @@ mod tests_sdtab_tv_cov {
         };
         let model = CompiledModel {
             name: "tv_cov_sdtab_regression".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             // CL = TVCL · exp(η_CL) · (WT/70) — reads WT from the covariate map

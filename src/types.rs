@@ -544,18 +544,23 @@ impl ModelParameters {
     }
 }
 
-/// Supported PK structural models
+/// Supported PK structural models.
+///
+/// IV (bolus and/or infusion) administration is represented by a single
+/// variant per compartment count; the bolus-vs-infusion choice is made
+/// per dose event from the dataset's RATE column (see
+/// `DoseEvent::is_infusion`). This mirrors NONMEM, nlmixr2, and Monolix
+/// and lets a subject mix bolus and infusion doses in one record.
+/// Oral routes remain a separate variant because they have a distinct
+/// model structure (absorption rate constant KA, bioavailability F).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkModel {
-    OneCptIvBolus,
+    OneCptIv,
     OneCptOral,
-    OneCptInfusion,
-    TwoCptIvBolus,
+    TwoCptIv,
     TwoCptOral,
-    TwoCptInfusion,
-    ThreeCptIvBolus,
+    ThreeCptIv,
     ThreeCptOral,
-    ThreeCptInfusion,
 }
 
 /// Supported residual error models

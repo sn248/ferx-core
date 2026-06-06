@@ -204,6 +204,11 @@ fn read_filtered_population_excludes_low_dv_obs() {
         excl.n_obs_excluded > 0,
         "at least one obs row with DV < 1.0 must be excluded"
     );
+    // Dose rows carry DV='.' (missing → NaN), so `DV < 1.0` must NOT catch them.
+    assert_eq!(
+        excl.n_dose_excluded, 0,
+        "dose rows have missing DV and must not match a DV comparison"
+    );
     assert!(
         filtered.n_obs() < n_obs_all,
         "filtered population has fewer observations"

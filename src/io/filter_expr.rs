@@ -50,6 +50,13 @@ impl FilterExpr {
                     || (rhs_raw.starts_with('\'') && rhs_raw.ends_with('\''))
                 {
                     FilterValue::Str(rhs_raw[1..rhs_raw.len() - 1].to_string())
+                } else if col == "id" {
+                    // ID is a string label, so it is always compared as a string —
+                    // even when written bare (`ID == 3`). Without this, a bare
+                    // numeric would be parsed as `Num`, and `eval` short-circuits
+                    // every numeric comparison against `id` to `false`, so
+                    // `ID == 3` would silently never match.
+                    FilterValue::Str(rhs_raw.to_string())
                 } else if let Ok(n) = rhs_raw.parse::<f64>() {
                     FilterValue::Num(n)
                 } else {
@@ -363,6 +370,28 @@ mod tests {
     fn test_unknown_column_never_fires() {
         // Unknown column: no-op (does not exclude).
         assert!(!eval("NOSUCHCOL == 1", "1", 0.0, 0, 70.0));
+    }
+
+    // ── Missing value (NaN) never matches ────────────────────────────────────
+
+    #[test]
+    fn test_missing_dv_never_matches() {
+        // A missing DV is carried as NaN; every comparison against it is false,
+        // so e.g. a dose row (DV='.') is not caught by `DV < 0.001`.
+        assert!(!eval("DV < 0.001", "1", f64::NAN, 1, 70.0));
+        assert!(!eval("DV > 0.001", "1", f64::NAN, 1, 70.0));
+        assert!(!eval("DV == 0", "1", f64::NAN, 1, 70.0));
+        // `!=` must also not fire on a missing value.
+        assert!(!eval("DV != 0", "1", f64::NAN, 1, 70.0));
+    }
+
+    #[test]
+    fn test_missing_dv_does_not_break_guarded_clause() {
+        // `EVID == 0 && DV < 0.001` on a dose row (NaN DV): the DV term is false,
+        // so the whole && clause is false — dose row retained.
+        assert!(!eval("EVID == 0 && DV < 0.001", "1", f64::NAN, 1, 70.0));
+        // On a real low observation it still fires.
+        assert!(eval("EVID == 0 && DV < 0.001", "1", 0.0005, 0, 70.0));
     }
 
     // ── Parse errors ─────────────────────────────────────────────────────────

@@ -506,6 +506,20 @@ fn parse_f64(s: &str) -> f64 {
     s.parse::<f64>().unwrap_or(0.0)
 }
 
+/// Parse a numeric cell for the data-selection filter, mapping missing/blank
+/// cells (`.`, `NA`, empty) to `NaN`. Because every IEEE comparison against
+/// `NaN` is false (see `cmp_f64`), a record whose value for a referenced column
+/// is missing never matches that condition — so `ignore = DV < 0.001` skips
+/// dose rows (where `DV` is `.`) instead of silently treating them as `0`.
+fn parse_f64_or_nan(s: &str) -> f64 {
+    let t = s.trim();
+    if is_missing_cell(t) {
+        f64::NAN
+    } else {
+        t.parse::<f64>().unwrap_or(f64::NAN)
+    }
+}
+
 fn parse_usize(s: &str) -> usize {
     s.parse::<usize>().unwrap_or(0)
 }
@@ -676,23 +690,25 @@ fn parse_subject(
         // Evaluated after LOCF update so the filter sees current covariate
         // values, matching NONMEM's per-record semantics.
         if let Some(sel) = filter {
-            let dv_for_ctx = parse_f64(row.get(dv_col).map(|s| s.as_str()).unwrap_or("0"));
+            // Missing-sensitive numeric columns map `.`/blank to NaN so the
+            // filter never matches them (see `parse_f64_or_nan`).
+            let dv_for_ctx = parse_f64_or_nan(row.get(dv_col).map(|s| s.as_str()).unwrap_or(""));
             let amt_for_ctx = amt_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s))
-                .unwrap_or(0.0);
+                .map(|s| parse_f64_or_nan(s))
+                .unwrap_or(f64::NAN);
             let cmt_for_ctx = cmt_col
                 .and_then(|c| row.get(c))
                 .map(|s| parse_usize(s))
                 .unwrap_or(1);
             let rate_for_ctx = rate_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s))
-                .unwrap_or(0.0);
+                .map(|s| parse_f64_or_nan(s))
+                .unwrap_or(f64::NAN);
             let ii_for_ctx = ii_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s))
-                .unwrap_or(0.0);
+                .map(|s| parse_f64_or_nan(s))
+                .unwrap_or(f64::NAN);
             let ss_for_ctx = ss_col
                 .and_then(|c| row.get(c))
                 .map(|s| parse_usize(s) > 0)

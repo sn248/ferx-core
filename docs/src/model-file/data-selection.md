@@ -101,6 +101,12 @@ of the CSV).  An entirely excluded subject does not appear in any output.
 
 Column names in expressions are case-insensitive.
 
+A record whose value for a referenced column is **missing** (`.`, blank, `NA`)
+never matches a comparison on that column. For example, `ignore = DV < 0.001`
+does **not** exclude dose rows, whose `DV` is `.`; only observation rows with a
+real `DV` below the threshold are dropped. (You can still write
+`ignore = EVID == 0 && DV < 0.001` to be explicit.)
+
 ---
 
 ## Evaluation order

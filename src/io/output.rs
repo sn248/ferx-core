@@ -1648,6 +1648,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sdtab_omits_eta_columns_even_when_etas_present() {
+        // Fast (no-fit) mirror of the slow-tests integration guard
+        // `tests/map_estimates_outputs.rs::sdtab_omits_eta_columns_after_fit`.
+        // sdtab is strictly per-observation; per-subject EBEs live in
+        // `ebe_etas` on the R side, so even a BSV model with named etas must
+        // NOT surface ETA* columns. This runs under `cargo test --lib`, so the
+        // contract is enforced on every PR — not only in the nightly slow-tests
+        // (a column-shape regression slipped in once because the only guard
+        // required a full fit; this catches that class pre-merge).
+        let mut sr = sdtab_subject_result("1", 2);
+        sr.eta = nalgebra::DVector::from_vec(vec![0.1, -0.2]);
+        let mut result = minimal_sdtab_result(vec![sr]);
+        result.eta_names = vec!["ETA_CL".to_string(), "ETA_V".to_string()];
+
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            warnings: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+
+        let eta_cols: Vec<&&str> = names.iter().filter(|n| n.starts_with("ETA")).collect();
+        assert!(
+            eta_cols.is_empty(),
+            "sdtab must not contain ETA columns (EBEs live in ebe_etas); found: {eta_cols:?}"
+        );
+
+        // Per-observation contract still holds (a future accidental column drop
+        // also fails here).
+        for required in [
+            "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV", "N_OBS", "TAFD",
+            "TAD",
+        ] {
+            assert!(
+                names.contains(&required),
+                "sdtab missing required column `{required}`; have: {names:?}"
+            );
+        }
+    }
+
     // ── Fix 4: non-numeric subject IDs fall back to 1-based loop index ───────
 
     /// When a subject ID cannot be parsed as f64 the sdtab ID column falls

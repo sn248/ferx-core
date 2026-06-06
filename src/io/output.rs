@@ -528,18 +528,10 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         ("N_OBS".to_string(), n_obs_col),
     ]);
 
-    // ETA columns — always included; one per BSV eta, parallel to eta_names.
-    for (k, eta_name) in result.eta_names.iter().enumerate() {
-        let vals: Vec<f64> = result
-            .subjects
-            .iter()
-            .flat_map(|sr| {
-                let v = sr.eta.get(k).copied().unwrap_or(f64::NAN);
-                std::iter::repeat(v).take(sr.ipred.len())
-            })
-            .collect();
-        cols.push((eta_name.clone(), vals));
-    }
+    // NOTE: sdtab intentionally does NOT emit ETA1..ETAn columns. Per-subject
+    // EBEs live in `fit$ebe_etas` on the R side; sdtab is strictly
+    // per-observation diagnostic data (see tests/map_estimates_outputs.rs::
+    // sdtab_omits_eta_columns_after_fit).
 
     // TAFD — mandatory, computed from dose records.
     {

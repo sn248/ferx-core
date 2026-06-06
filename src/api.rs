@@ -3,7 +3,9 @@ use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv, read_nonmem_csv_with_covariates, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
+    read_nonmem_csv, read_nonmem_csv_filtered, read_nonmem_csv_with_covariates,
+    read_nonmem_csv_with_covariates_filtered, SelectionFilter, ERR_COV_MISSING_COLUMNS,
+    ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
@@ -110,12 +112,14 @@ pub fn run_model_with_data_inits(
     eprintln!("Model: {}", parsed.model.name);
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
+    let sel_filter = build_selection_filter(&parsed.fit_options)?;
     let (population, covariate_table) = read_population_for(
         &parsed.model,
         &parsed.covariate_decls,
         data_path,
         None,
         iov_col,
+        sel_filter.as_ref(),
     )?;
     eprintln!(
         "Data:  {} subjects, {} observations from {}",
@@ -190,6 +194,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         covariate_names: vec![],
         dv_column: "dv".into(),
         input_columns: vec![],
+        exclusions: None,
     };
 
     // Simulate
@@ -312,6 +317,58 @@ fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<
 
 /// Single covariate-aware reader used by every file-based entry point (`fit`
 /// wrappers and `ferx check`), so they all apply identical covariate validation.
+/// Build a `SelectionFilter` from a model file's `FitOptions` alone.
+/// Returns `None` when no selection rules are set.
+fn build_selection_filter(opts: &FitOptions) -> Result<Option<SelectionFilter>, String> {
+    if opts.ignore_exprs.is_empty()
+        && opts.accept_exprs.is_empty()
+        && opts.ignore_subjects.is_empty()
+    {
+        return Ok(None);
+    }
+    SelectionFilter::from_opts(
+        &opts.ignore_exprs,
+        &opts.accept_exprs,
+        &opts.ignore_subjects,
+    )
+    .map(Some)
+}
+
+/// Build a `SelectionFilter` merging the model file's rules with a caller-supplied
+/// `FitOptions` (e.g. from the R wrapper). Conditions from both sources are
+/// deduplicated and OR'd (ignore) / AND'd (accept) together.
+fn build_selection_filter_merged(
+    model_opts: &FitOptions,
+    call_opts: &FitOptions,
+) -> Result<Option<SelectionFilter>, String> {
+    // Merge by accumulating unique strings from both sources.
+    let mut ignore = model_opts.ignore_exprs.clone();
+    let mut accept = model_opts.accept_exprs.clone();
+    let mut subjects = model_opts.ignore_subjects.clone();
+    for s in &call_opts.ignore_exprs {
+        let t = s.trim().to_string();
+        if !ignore.iter().any(|e| e == &t) {
+            ignore.push(t);
+        }
+    }
+    for s in &call_opts.accept_exprs {
+        let t = s.trim().to_string();
+        if !accept.iter().any(|e| e == &t) {
+            accept.push(t);
+        }
+    }
+    for s in &call_opts.ignore_subjects {
+        let t = s.trim().to_string();
+        if !subjects.iter().any(|e| e == &t) {
+            subjects.push(t);
+        }
+    }
+    if ignore.is_empty() && accept.is_empty() && subjects.is_empty() {
+        return Ok(None);
+    }
+    SelectionFilter::from_opts(&ignore, &accept, &subjects).map(Some)
+}
+
 ///
 /// When the model declares a `[covariates]` block this routes through the strict
 /// reader (validates declared columns exist + are numeric, builds the table, and
@@ -324,15 +381,31 @@ fn read_population_for(
     data_path: &str,
     fallback_columns: Option<&[&str]>,
     iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
 ) -> Result<(Population, Option<CovariateTable>), String> {
-    match covariate_decls {
-        Some(decls) => {
+    match (covariate_decls, filter) {
+        (Some(decls), Some(sel)) => {
+            let extra = undeclared_referenced(model, decls);
+            let (pop, table) = read_nonmem_csv_with_covariates_filtered(
+                Path::new(data_path),
+                decls,
+                &extra,
+                iov_column,
+                sel,
+            )?;
+            Ok((pop, Some(table)))
+        }
+        (Some(decls), None) => {
             let extra = undeclared_referenced(model, decls);
             let (pop, table) =
                 read_nonmem_csv_with_covariates(Path::new(data_path), decls, &extra, iov_column)?;
             Ok((pop, Some(table)))
         }
-        None => Ok((
+        (None, Some(sel)) => Ok((
+            read_nonmem_csv_filtered(Path::new(data_path), fallback_columns, iov_column, sel)?,
+            None,
+        )),
+        (None, None) => Ok((
             read_nonmem_csv(Path::new(data_path), fallback_columns, iov_column)?,
             None,
         )),
@@ -744,7 +817,14 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    diagnostic rather than a generic read error.
     if let Some(path) = data_path {
         let iov_col = parsed.fit_options.iov_column.as_deref();
-        match read_population_for(&parsed.model, &parsed.covariate_decls, path, None, iov_col) {
+        match read_population_for(
+            &parsed.model,
+            &parsed.covariate_decls,
+            path,
+            None,
+            iov_col,
+            None,
+        ) {
             Ok((population, _table)) => {
                 diags.extend(check_model_data(&parsed.model, &population));
                 let init_params = parsed.model.default_params.clone();
@@ -789,14 +869,16 @@ pub fn fit_from_files(
     // A `[covariates]` declaration takes precedence over the explicit
     // `covariate_columns` argument; otherwise fall back to the argument (or
     // legacy auto-detect when both are absent).
+    let opts = options.unwrap_or_default();
+    let sel_filter_fit = build_selection_filter_merged(&parsed.fit_options, &opts)?;
     let (population, covariate_table) = read_population_for(
         &model,
         &parsed.covariate_decls,
         data_path,
         covariate_columns,
         None,
+        sel_filter_fit.as_ref(),
     )?;
-    let opts = options.unwrap_or_default();
     model.bloq_method = opts.bloq_method;
     // SDE models cannot use autodiff — force FD.
     model.gradient_method =
@@ -2974,6 +3056,7 @@ mod iov_integration {
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
             input_columns: vec![],
+            exclusions: None,
         }
     }
 
@@ -3805,6 +3888,7 @@ mod simulate_with_uncertainty_tests {
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
             input_columns: vec![],
+            exclusions: None,
         }
     }
 
@@ -4133,6 +4217,7 @@ mod sde_integration {
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
             input_columns: vec![],
+            exclusions: None,
         }
     }
 
@@ -4257,6 +4342,7 @@ mod sde_integration {
                 covariate_names: Vec::new(),
                 dv_column: "DV".into(),
                 input_columns: vec![],
+                exclusions: None,
             }
         };
 
@@ -4538,6 +4624,7 @@ mod tests_sdtab_tv_cov {
             covariate_names: vec!["WT".into()],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
         };
 
         // Fixed EBE at η = 0; H matrix is irrelevant for the IPRED check but

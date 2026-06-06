@@ -1482,6 +1482,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
         };
 
         let cols = sdtab(&result, &population);
@@ -1509,6 +1510,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
         };
 
         let cols = sdtab(&result, &population);
@@ -1529,6 +1531,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
         };
 
         let cols = sdtab(&result, &population);
@@ -1559,6 +1562,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
         };
 
         let cols = sdtab(&result, &population);

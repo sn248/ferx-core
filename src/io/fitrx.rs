@@ -1690,6 +1690,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
         }
     }
 

@@ -23,6 +23,7 @@ fn one_subject_pop() -> Population {
         covariate_names: Vec::new(),
         dv_column: "DV".to_string(),
         input_columns: vec![],
+        exclusions: None,
         subjects: vec![Subject {
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -261,6 +262,7 @@ fn two_cmt_pop() -> Population {
         covariate_names: Vec::new(),
         dv_column: "DV".to_string(),
         input_columns: vec![],
+        exclusions: None,
         subjects: vec![mk_subject("1"), mk_subject("2")],
     }
 }

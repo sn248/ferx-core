@@ -1412,6 +1412,7 @@ mod iov_tests {
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
         };
         // `requested` is the user's FitOptions value, passed independently of
         // model.gradient_method (which compatibility rules may have mutated).

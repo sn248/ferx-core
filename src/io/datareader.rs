@@ -1,6 +1,77 @@
-use crate::types::{CovariateDecl, CovariateRow, CovariateTable, DoseEvent, Population, Subject};
+use crate::io::filter_expr::{FilterClause, RowContext};
+use crate::types::{
+    CovariateDecl, CovariateRow, CovariateTable, DoseEvent, ExclusionSummary, Population, Subject,
+};
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Compiled data-selection filter built from `FitOptions` ignore/accept fields.
+/// Passed into `read_nonmem_csv_impl` so filtering happens at read time.
+pub struct SelectionFilter {
+    pub ignore: Vec<FilterClause>,
+    pub accept: Vec<FilterClause>,
+    /// Subject IDs to exclude wholesale (from `ignore_subjects`).
+    pub ignore_subject_ids: Vec<String>,
+}
+
+impl SelectionFilter {
+    /// Build from the raw expression strings stored in `FitOptions`.
+    /// Returns `Err` if any expression fails to parse.
+    pub fn from_opts(
+        ignore_exprs: &[String],
+        accept_exprs: &[String],
+        ignore_subjects: &[String],
+    ) -> Result<Self, String> {
+        let ignore = ignore_exprs
+            .iter()
+            .map(|s| FilterClause::parse(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let accept = accept_exprs
+            .iter()
+            .map(|s| FilterClause::parse(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SelectionFilter {
+            ignore,
+            accept,
+            ignore_subject_ids: ignore_subjects.to_vec(),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ignore.is_empty() && self.accept.is_empty() && self.ignore_subject_ids.is_empty()
+    }
+
+    /// Returns `(excluded, which)`:
+    /// - `excluded = true` when the row should be dropped.
+    /// - `which` is the source string of the first clause that fired (for logging).
+    pub fn should_exclude(&self, ctx: &RowContext<'_>) -> (bool, Option<String>) {
+        // 1. ignore_subjects shorthand.
+        if self.ignore_subject_ids.iter().any(|id| id == ctx.id) {
+            return (true, Some(format!("ignore_subjects: {}", ctx.id)));
+        }
+        // 2. ignore clauses (any match → excluded).
+        for clause in &self.ignore {
+            if clause.eval(ctx) {
+                return (true, Some(format!("ignore: {}", clause.source)));
+            }
+        }
+        // 3. accept clauses (all must pass → if any fails, excluded).
+        for clause in &self.accept {
+            if !clause.eval(ctx) {
+                return (true, Some(format!("accept: {}", clause.source)));
+            }
+        }
+        (false, None)
+    }
+}
+
+/// Per-subject exclusion counts returned by `parse_subject` when a filter is active.
+pub(crate) struct SubjectExclusion {
+    pub n_obs_excluded: usize,
+    pub n_dose_excluded: usize,
+    /// Sources that matched at least one row ("ignore: DV < 0.001", etc.).
+    pub fired: Vec<String>,
+}
 
 /// Leading text of the "declared covariate column absent from data" error.
 /// Shared so the `ferx check` layer can classify the reader's error into the
@@ -35,7 +106,7 @@ pub fn read_nonmem_csv(
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(path, covariate_columns, iov_column, None).map(|(pop, _)| pop)
+    read_nonmem_csv_impl(path, covariate_columns, iov_column, None, None).map(|(pop, _)| pop)
 }
 
 /// Read a NONMEM-format CSV with a `[covariates]` declaration.
@@ -66,7 +137,48 @@ pub fn read_nonmem_csv_with_covariates(
         }
     }
     let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
-    let (pop, table) = read_nonmem_csv_impl(path, Some(&union_refs), iov_column, Some(decls))?;
+    let (pop, table) =
+        read_nonmem_csv_impl(path, Some(&union_refs), iov_column, Some(decls), None)?;
+    Ok((
+        pop,
+        table.expect("covariate table is built whenever table_decls is Some"),
+    ))
+}
+
+/// Like [`read_nonmem_csv`] but applies `[data_selection]` filtering at read time.
+/// Called from `api::read_population_for` when `FitOptions` carries selection rules.
+pub fn read_nonmem_csv_filtered(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: &SelectionFilter,
+) -> Result<Population, String> {
+    read_nonmem_csv_impl(path, covariate_columns, iov_column, None, Some(filter))
+        .map(|(pop, _)| pop)
+}
+
+/// Like [`read_nonmem_csv_with_covariates`] but applies `[data_selection]` filtering.
+pub fn read_nonmem_csv_with_covariates_filtered(
+    path: &Path,
+    decls: &[CovariateDecl],
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    filter: &SelectionFilter,
+) -> Result<(Population, CovariateTable), String> {
+    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
+    for c in extra_columns {
+        if !union.iter().any(|n| n == c) {
+            union.push(c.clone());
+        }
+    }
+    let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
+    let (pop, table) = read_nonmem_csv_impl(
+        path,
+        Some(&union_refs),
+        iov_column,
+        Some(decls),
+        Some(filter),
+    )?;
     Ok((
         pop,
         table.expect("covariate table is built whenever table_decls is Some"),
@@ -84,6 +196,7 @@ fn read_nonmem_csv_impl(
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
     table_decls: Option<&[CovariateDecl]>,
+    filter: Option<&SelectionFilter>,
 ) -> Result<(Population, Option<CovariateTable>), String> {
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
@@ -232,11 +345,16 @@ fn read_nonmem_csv_impl(
         rows_by_id.last_mut().unwrap().1.push(fields);
     }
 
-    // Build subjects
+    // Build subjects, applying selection filter if present.
     let mut subjects = Vec::new();
     let mut total_occ_failures: usize = 0;
+    let n_records_total: usize = rows_by_id.iter().map(|(_, rows)| rows.len()).sum();
+    let mut excl_summary = ExclusionSummary {
+        n_records_total,
+        ..Default::default()
+    };
     for (id, rows) in &rows_by_id {
-        let (subject, occ_failures) = parse_subject(
+        let (subject, occ_failures, subj_excl) = parse_subject(
             id,
             rows,
             time_col,
@@ -251,9 +369,51 @@ fn read_nonmem_csv_impl(
             cens_col,
             occ_col,
             &cov_indices,
+            filter,
         )?;
-        subjects.push(subject);
         total_occ_failures += occ_failures;
+
+        // Accumulate filter statistics.
+        excl_summary.n_obs_excluded += subj_excl.n_obs_excluded;
+        excl_summary.n_dose_excluded += subj_excl.n_dose_excluded;
+        for src in subj_excl.fired {
+            if !excl_summary.fired_ignore.contains(&src)
+                && !excl_summary.fired_accept.contains(&src)
+            {
+                if src.starts_with("accept:") {
+                    excl_summary.fired_accept.push(src);
+                } else {
+                    excl_summary.fired_ignore.push(src);
+                }
+            }
+        }
+
+        // Warn about pathological partial exclusions.
+        let has_doses = !subject.doses.is_empty();
+        let has_obs = !subject.observations.is_empty();
+        let excluded_doses = subj_excl.n_dose_excluded > 0;
+        let excluded_obs = subj_excl.n_obs_excluded > 0;
+
+        if excluded_doses && !has_doses && has_obs {
+            eprintln!(
+                "[ferx] warning: subject {id}: all dose records were excluded by \
+                 [data_selection] but observations remain — predictions will be undefined."
+            );
+        }
+        if excluded_obs && !has_obs && has_doses {
+            eprintln!(
+                "[ferx] warning: subject {id}: all observation records were excluded by \
+                 [data_selection] but dose records remain — subject contributes nothing to \
+                 the likelihood."
+            );
+        }
+
+        if subject.doses.is_empty() && subject.observations.is_empty() {
+            // Subject entirely excluded — do not add to subjects list.
+            excl_summary.excluded_subject_ids.push(id.clone());
+            continue;
+        }
+        subjects.push(subject);
     }
 
     // Surface a single warning if any OCC values were missing/unparseable.
@@ -269,6 +429,12 @@ fn read_nonmem_csv_impl(
             );
         }
     }
+
+    let exclusions = if filter.is_some() {
+        Some(excl_summary)
+    } else {
+        None
+    };
 
     let table = if let Some(decls) = table_decls {
         // `table_indices` (and hence each row's `values`) is in declaration
@@ -297,6 +463,7 @@ fn read_nonmem_csv_impl(
             covariate_names: existing_cov_names,
             dv_column: "dv".to_string(),
             input_columns: headers,
+            exclusions,
         },
         table,
     ))
@@ -348,7 +515,8 @@ fn parse_subject(
     cens_col: Option<usize>,
     occ_col: Option<usize>,
     cov_indices: &[(String, usize)],
-) -> Result<(Subject, usize), String> {
+    filter: Option<&SelectionFilter>,
+) -> Result<(Subject, usize, SubjectExclusion), String> {
     let mut doses = Vec::new();
     let mut obs_times = Vec::new();
     let mut observations = Vec::new();
@@ -357,6 +525,9 @@ fn parse_subject(
     let mut occasions: Vec<u32> = Vec::new();
     let mut dose_occasions: Vec<u32> = Vec::new();
     let mut occ_parse_failures: usize = 0;
+    let mut excl_n_obs: usize = 0;
+    let mut excl_n_dose: usize = 0;
+    let mut excl_fired: Vec<String> = Vec::new();
 
     // Time-constant covariates: first non-missing value across all rows.
     // Used as the subject-static fallback (and for the AD fast path, which
@@ -464,6 +635,66 @@ fn parse_subject(
         } else {
             0
         };
+
+        // ── Data selection filter ─────────────────────────────────────────────
+        // Evaluated after LOCF update so the filter sees current covariate
+        // values, matching NONMEM's per-record semantics.
+        if let Some(sel) = filter {
+            let dv_for_ctx = parse_f64(row.get(dv_col).map(|s| s.as_str()).unwrap_or("0"));
+            let amt_for_ctx = amt_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_f64(s))
+                .unwrap_or(0.0);
+            let cmt_for_ctx = cmt_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_usize(s))
+                .unwrap_or(1);
+            let rate_for_ctx = rate_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_f64(s))
+                .unwrap_or(0.0);
+            let ii_for_ctx = ii_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_f64(s))
+                .unwrap_or(0.0);
+            let ss_for_ctx = ss_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_usize(s) > 0)
+                .unwrap_or(false);
+            let cens_for_ctx = cens_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_usize(s))
+                .unwrap_or(0);
+            let ctx = RowContext {
+                id,
+                time,
+                dv: dv_for_ctx,
+                evid,
+                amt: amt_for_ctx,
+                cmt: cmt_for_ctx,
+                rate: rate_for_ctx,
+                mdv: mdv as u32,
+                cens: if cens_for_ctx > 0 { 1u8 } else { 0u8 },
+                ii: ii_for_ctx,
+                ss: ss_for_ctx,
+                covariates: &locf_state,
+            };
+            let (excluded, which) = sel.should_exclude(&ctx);
+            if excluded {
+                if let Some(src) = which {
+                    if !excl_fired.contains(&src) {
+                        excl_fired.push(src);
+                    }
+                }
+                // Count by record type for the summary.
+                if evid == 1 || evid == 4 {
+                    excl_n_dose += 1;
+                } else if evid == 0 && mdv == 0 {
+                    excl_n_obs += 1;
+                }
+                continue; // skip this row
+            }
+        }
 
         // EVID=3 (reset) and EVID=4 (reset + dose) both zero the compartment
         // state at this time. Record the reset before the dose arm runs so
@@ -584,6 +815,11 @@ fn parse_subject(
             dose_occasions: sorted_dose_occ,
         },
         occ_parse_failures,
+        SubjectExclusion {
+            n_obs_excluded: excl_n_obs,
+            n_dose_excluded: excl_n_dose,
+            fired: excl_fired,
+        },
     ))
 }
 

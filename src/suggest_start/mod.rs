@@ -806,6 +806,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
         };
         let result = inits_from_nca(&model, &empty_pop, NcaInit::Nca);
         // Must not panic and should warn.

@@ -148,9 +148,16 @@ exclusions:
 - `AND` / `OR` keywords are not supported; use `&&` within a line.
 - String comparisons are limited to `==` and `!=`; `<`, `<=`, `>`, `>=` on
   string values have no effect.
-- An unknown column name always evaluates to false (never fires), so a typo
-  silently has no effect — check the exclusion summary if a condition is not
-  being applied.
+- A column name that is not present in the dataset always evaluates to false
+  (never fires), so a typo silently has no effect — check the exclusion summary
+  if a condition is not being applied. (Covariate columns referenced by a
+  condition are read even when a `[covariates]` block does not declare them, so
+  filtering on an undeclared covariate works as expected.)
+- The covariate table echo (`*-covtab.csv`, written only when a `[covariates]`
+  block is declared) is a faithful echo of the **raw input file** and therefore
+  still lists records that `[data_selection]` excluded from the fit. The fit
+  itself, the residual table (`*-sdtab.csv`), and all `[output]` columns are
+  computed from the filtered data, so they only contain retained records.
 
 ---
 

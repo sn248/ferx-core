@@ -200,6 +200,27 @@ impl FilterClause {
     pub fn eval(&self, ctx: &RowContext<'_>) -> bool {
         self.exprs.iter().all(|e| e.eval(ctx))
     }
+
+    /// Non-standard (covariate) column names referenced by this clause, in
+    /// lowercase. Standard NONMEM columns (ID/TIME/DV/...) are excluded since
+    /// they are read directly into [`RowContext`] rather than via the covariate
+    /// map. Used by the reader to ensure a filtered covariate column is read
+    /// even when a `[covariates]` block did not declare it.
+    pub fn covariate_columns(&self) -> impl Iterator<Item = &str> {
+        self.exprs
+            .iter()
+            .map(|e| e.col.as_str())
+            .filter(|c| !is_standard_column(c))
+    }
+}
+
+/// True for the fixed NONMEM columns handled directly in [`RowContext`]
+/// (case-insensitive; `col` is expected already lowercased).
+pub fn is_standard_column(col: &str) -> bool {
+    matches!(
+        col,
+        "id" | "time" | "dv" | "evid" | "amt" | "cmt" | "rate" | "mdv" | "cens" | "ii" | "ss"
+    )
 }
 
 /// Per-row context passed to `FilterClause::eval`.

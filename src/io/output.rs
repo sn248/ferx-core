@@ -555,6 +555,101 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         ("N_OBS".to_string(), n_obs_col),
     ]);
 
+    // NOTE: sdtab intentionally does NOT emit ETA1..ETAn columns. Per-subject
+    // EBEs live in `fit$ebe_etas` on the R side; sdtab is strictly
+    // per-observation diagnostic data (see tests/map_estimates_outputs.rs::
+    // sdtab_omits_eta_columns_after_fit).
+
+    // TAFD — mandatory, computed from dose records.
+    {
+        let vals: Vec<f64> = result
+            .subjects
+            .iter()
+            .zip(population.subjects.iter())
+            .flat_map(|(_sr, subj)| {
+                let first_dose = subj
+                    .doses
+                    .iter()
+                    .map(|d| d.time)
+                    .fold(f64::INFINITY, f64::min);
+                subj.obs_times.iter().map(move |&t| {
+                    if first_dose.is_finite() {
+                        t - first_dose
+                    } else {
+                        f64::NAN
+                    }
+                })
+            })
+            .collect();
+        cols.push(("TAFD".to_string(), vals));
+    }
+
+    // TAD — mandatory, SS-aware. When compute_extra_output_columns has run
+    // (lagtime models or models with [derived]/[output] blocks), per_obs_tad
+    // already reflects the individual lagtime; fall back to lagtime=0 otherwise.
+    {
+        let vals: Vec<f64> = result
+            .subjects
+            .iter()
+            .zip(population.subjects.iter())
+            .flat_map(|(sr, subj)| {
+                (0..sr.ipred.len()).map(|j| {
+                    if !sr.per_obs_tad.is_empty() {
+                        return sr.per_obs_tad[j];
+                    }
+                    let obs_t = subj.obs_times[j];
+                    let last_eff = subj
+                        .doses
+                        .iter()
+                        .filter(|d| d.time <= obs_t + 1e-12)
+                        .map(|d| {
+                            if d.ss && d.ii > 0.0 {
+                                let elapsed = obs_t - d.time;
+                                obs_t - elapsed.rem_euclid(d.ii)
+                            } else {
+                                d.time
+                            }
+                        })
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    if last_eff.is_finite() {
+                        obs_t - last_eff
+                    } else {
+                        f64::NAN
+                    }
+                })
+            })
+            .collect();
+        cols.push(("TAD".to_string(), vals));
+    }
+
+    // extra_columns from [derived] and [output] blocks.
+    if let Some(first_with_extra) = result
+        .subjects
+        .iter()
+        .find(|sr| !sr.extra_columns.is_empty())
+    {
+        let extra_names: Vec<String> = first_with_extra
+            .extra_columns
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        for col_name in &extra_names {
+            let vals: Vec<f64> = result
+                .subjects
+                .iter()
+                .flat_map(|sr| {
+                    sr.extra_columns
+                        .iter()
+                        .find(|(n, _)| n == col_name)
+                        .map(|(_, v)| v.as_slice())
+                        .unwrap_or(&[])
+                        .to_vec()
+                })
+                .collect();
+            cols.push((col_name.clone(), vals));
+        }
+    }
+
     cols
 }
 
@@ -579,12 +674,22 @@ pub fn write_sdtab_csv(
     let header: Vec<&str> = cols.iter().map(|(name, _)| name.as_str()).collect();
     writeln!(f, "{}", header.join(",")).map_err(|e| e.to_string())?;
 
-    // Rows. NaN (used for BLOQ IWRES/CWRES) is written as an empty cell so
-    // downstream tools handle it as missing rather than a sentinel.
+    // Rows. Any non-finite value — NaN (BLOQ IWRES/CWRES) or ±Inf (e.g. from a
+    // derived column) — is written as an empty cell so downstream tools handle
+    // it as missing rather than a sentinel. This is intentionally broader than
+    // the covariate-table writer below (which only blanks NaN via fmt_num), so
+    // adopting fmt_num here would silently change derived-column output.
     for row in 0..n_rows {
         let vals: Vec<String> = cols
             .iter()
-            .map(|(_, values)| fmt_num(values[row]))
+            .map(|(_, values)| {
+                let v = values[row];
+                if !v.is_finite() {
+                    String::new()
+                } else {
+                    format!("{:.6}", v)
+                }
+            })
             .collect();
         writeln!(f, "{}", vals.join(",")).map_err(|e| e.to_string())?;
     }
@@ -1389,6 +1494,8 @@ mod tests {
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
+            extra_columns: vec![],
+            per_obs_tad: vec![],
         }
     }
 
@@ -1537,6 +1644,7 @@ mod tests {
             dv_column: "DV".into(),
             input_columns: vec![],
             exclusions: None,
+            warnings: vec![],
         };
 
         let cols = sdtab(&result, &population);
@@ -1565,6 +1673,7 @@ mod tests {
             dv_column: "DV".into(),
             input_columns: vec![],
             exclusions: None,
+            warnings: vec![],
         };
 
         let cols = sdtab(&result, &population);
@@ -1586,6 +1695,7 @@ mod tests {
             dv_column: "DV".into(),
             input_columns: vec![],
             exclusions: None,
+            warnings: vec![],
         };
 
         let cols = sdtab(&result, &population);
@@ -1593,6 +1703,52 @@ mod tests {
             cols.iter().all(|(name, _)| name != "CMT"),
             "CMT column should be absent when all obs_cmts == 1"
         );
+    }
+
+    #[test]
+    fn sdtab_omits_eta_columns_even_when_etas_present() {
+        // Fast (no-fit) mirror of the slow-tests integration guard
+        // `tests/map_estimates_outputs.rs::sdtab_omits_eta_columns_after_fit`.
+        // sdtab is strictly per-observation; per-subject EBEs live in
+        // `ebe_etas` on the R side, so even a BSV model with named etas must
+        // NOT surface ETA* columns. This runs under `cargo test --lib`, so the
+        // contract is enforced on every PR — not only in the nightly slow-tests
+        // (a column-shape regression slipped in once because the only guard
+        // required a full fit; this catches that class pre-merge).
+        let mut sr = sdtab_subject_result("1", 2);
+        sr.eta = nalgebra::DVector::from_vec(vec![0.1, -0.2]);
+        let mut result = minimal_sdtab_result(vec![sr]);
+        result.eta_names = vec!["ETA_CL".to_string(), "ETA_V".to_string()];
+
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+
+        let eta_cols: Vec<&&str> = names.iter().filter(|n| n.starts_with("ETA")).collect();
+        assert!(
+            eta_cols.is_empty(),
+            "sdtab must not contain ETA columns (EBEs live in ebe_etas); found: {eta_cols:?}"
+        );
+
+        // Per-observation contract still holds (a future accidental column drop
+        // also fails here).
+        for required in [
+            "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV", "N_OBS", "TAFD",
+            "TAD",
+        ] {
+            assert!(
+                names.contains(&required),
+                "sdtab missing required column `{required}`; have: {names:?}"
+            );
+        }
     }
 
     // ── Fix 4: non-numeric subject IDs fall back to 1-based loop index ───────
@@ -1617,6 +1773,7 @@ mod tests {
             dv_column: "DV".into(),
             input_columns: vec![],
             exclusions: None,
+            warnings: vec![],
         };
 
         let cols = sdtab(&result, &population);

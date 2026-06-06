@@ -2181,6 +2181,7 @@ mod tests {
             dv_column: "DV".into(),
             input_columns: vec![],
             exclusions: None,
+            warnings: vec![],
         };
 
         let flag = CancelFlag::new();
@@ -2279,6 +2280,7 @@ mod tests {
             dv_column: "DV".into(),
             input_columns: vec![],
             exclusions: None,
+            warnings: vec![],
         };
 
         let theta = vec![1.5f64, 20.0]; // CL, V
@@ -2432,6 +2434,7 @@ mod tests {
             dv_column: "DV".into(),
             input_columns: vec![],
             exclusions: None,
+            warnings: vec![],
         };
 
         let theta = vec![1.0f64, 10.0, 0.5];

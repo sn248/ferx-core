@@ -20,6 +20,8 @@
   - [Neural Networks (DCM / NODE)](model-file/neural-networks.md)
     - [Covariate NN (DCM)](model-file/covariate-nn.md)
   - [Data Selection](model-file/data-selection.md)
+  - [Derived Columns](model-file/derived.md)
+  - [Output Columns](model-file/output.md)
   - [Fit Options](model-file/fit-options.md)
   - [Simulation](model-file/simulation.md)
 - [Estimation Methods](estimation/README.md)

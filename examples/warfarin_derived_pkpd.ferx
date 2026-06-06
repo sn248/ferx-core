@@ -1,0 +1,68 @@
+# Warfarin one-compartment oral PK with PD effect and time-above-MEC derived quantities.
+#
+# Demonstrates:
+#   - Emax PD model inline in [derived]
+#   - Integral with condition (time above MEC per dosing window)
+#   - Periodic integral (AUC per 24-h interval)
+#   - Multi-condition filter using && operator
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta MEC(0.5, 0.01, 5.0)
+  theta EMAX(80.0, 10.0, 100.0)
+  theta EC50(3.0, 0.1, 20.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 300
+  covariance = true
+
+[derived]
+  # Basic PK metrics
+  KE     = CL / V
+  T_HALF = 0.6931472 / KE
+
+  # Emax PD effect at each observation time point
+  EFF = EMAX * IPRED / (EC50 + IPRED)
+
+  # Cmax within the current dosing interval (TAD < 24 h)
+  CMAX_INTERVAL = max(IPRED, TAD < 24)
+
+  # Steady-state trough: minimum IPRED near dose time (TAD ≈ 0 after ADDL expansion)
+  # 1e-10 absorbs floating-point residuals when TAD is mathematically zero
+  CMIN_TAU = min(IPRED, TAD < 1e-10)
+
+  # Day-1 Cmax vs steady-state (day 14, tau = 24 h → TAFD window [312, 336))
+  CMAX_D1  = max(IPRED, TAFD < 24)
+  CMAX_D14 = max(IPRED, TAFD >= 312 && TAFD < 336)
+
+  # Time above MEC per dose interval (hours): integral of 1 where IPRED > MEC
+  TAM_TAU = integral(1.0, IPRED > MEC, window=24, anchor=0, step=0.1)
+
+  # Time above MEC on day 1 only
+  TAM_D1 = integral(1.0, IPRED > MEC, from=0, to=24, step=0.1)
+
+  # Periodic AUC per dosing interval
+  AUC_TAU = integral(IPRED, window=24, anchor=0, step=0.1)
+
+[output]
+  WT

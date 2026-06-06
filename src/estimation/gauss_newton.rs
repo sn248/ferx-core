@@ -1641,6 +1641,8 @@ mod tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 
@@ -1669,6 +1671,7 @@ mod tests {
             dv_column: "DV".to_string(),
             input_columns: vec![],
             exclusions: None,
+            warnings: vec![],
         }
     }
 
@@ -2544,6 +2547,8 @@ mod tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         };
 
         let template = &model.default_params;
@@ -2817,6 +2822,8 @@ mod tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 
@@ -2843,6 +2850,7 @@ mod tests {
             dv_column: "DV".to_string(),
             input_columns: vec![],
             exclusions: None,
+            warnings: vec![],
         }
     }
 

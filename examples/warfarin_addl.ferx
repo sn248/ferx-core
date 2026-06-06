@@ -1,0 +1,57 @@
+# Warfarin one-compartment oral PK — ADDL dosing design.
+#
+# The dataset uses a single EVID=1 row per subject with ADDL=6, II=24,
+# representing a loading dose plus 6 additional daily doses (7 total).
+# After ADDL expansion, subject.doses contains 7 explicit DoseEvents so
+# TAFD and TAD are computed correctly for each observation.
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 300
+  covariance = true
+
+[derived]
+  KE     = CL / V
+  T_HALF = 0.6931472 / KE
+
+  # Dosing day (tau = 24 h); TAFD anchors to the first dose time
+  DAY = floor(TAFD / 24) + 1
+
+  # Subject-level Cmax across all observations
+  Cmax = max(IPRED)
+
+  # Steady-state trough: minimum IPRED at dose time (TAD resets to ≈ 0 after
+  # ADDL expansion). Use 1e-10 to absorb floating-point residuals from modular
+  # arithmetic (mathematically TAD = 0 but may be ~1e-14 numerically).
+  Cmin_tau = min(IPRED, TAD < 1e-10)
+
+  # Late-interval trough: minimum IPRED in the last 4 h of each interval
+  Cmin_late = min(IPRED, TAD > 20)
+
+  # Periodic AUC per 24-h dosing interval
+  AUC_TAU = integral(IPRED, window=24, anchor=0, step=0.1)
+
+[output]
+  CL V KA

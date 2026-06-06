@@ -1798,19 +1798,28 @@ fn build_derived_filter_fn(cond: Condition) -> DerivedFilterFn {
 /// Build the variable map for derived-expression and derived-filter evaluation.
 ///
 /// Keys for covariates, individual parameters, and prior derived columns are
-/// inserted both with their original case **and** in uppercase, so that
-/// expressions like `wt` resolve correctly even when the dataset header is `WT`.
+/// inserted with their original case **and** both an uppercase and a lowercase
+/// alias, so that an all-lowercase `wt` or all-uppercase `WT` expression resolves
+/// regardless of the dataset header's case. (A header such as `WT` has an
+/// uppercase form identical to itself, so the lowercase alias is what makes a
+/// lowercase `wt` reference resolve.)
 /// Built-in time variables (TIME, TAFD, TAD, IPRED, PRED, DV) are inserted in
 /// both uppercase and lowercase for the same reason.
 fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
     let mut vars: HashMap<String, f64> = HashMap::new();
-    // Insert each name with original case AND an uppercase alias so that
-    // case mismatches (e.g. `wt` vs. header `WT`) resolve correctly.
+    // Insert each name with original case AND uppercase + lowercase aliases so
+    // that case mismatches (e.g. `wt` vs. header `WT`, or `WT` vs. header `wt`)
+    // resolve correctly. `eval_expression` looks names up verbatim, so every
+    // case the user might type must be present as a key.
     let mut insert_ci = |k: &str, v: f64| {
         vars.insert(k.to_string(), v);
         let up = k.to_uppercase();
         if up != k {
             vars.insert(up, v);
+        }
+        let lo = k.to_lowercase();
+        if lo != k {
+            vars.insert(lo, v);
         }
     };
     for (k, &v) in ctx.indiv_params.iter() {
@@ -14303,6 +14312,43 @@ CL V KA WT
             // TAD = 1.0 >> MACHEPS → flag = 0
             let ctx2 = DerivedContext { tad: 1.0, ..ctx };
             assert_eq!(eval(&ctx2), 0.0, "TAD=1 should not be < MACHEPS");
+        }
+    }
+
+    #[test]
+    fn derived_resolves_covariate_case_insensitively() {
+        // Regression: a covariate carried in the dataset under an uppercase
+        // header (`WT`) referenced as lowercase `wt` in a [derived] expression
+        // must resolve to the covariate value, not silently evaluate to 0.
+        // build_derived_vars must insert a lowercase alias because
+        // `eval_expression` looks the name up verbatim.
+        let src = minimal_model_with_derived("WT_DERIVED = wt * 2");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let (theta, eta, indiv, _cov, prev) = make_derived_ctx_simple();
+        // Covariate stored under uppercase `WT`, as a NONMEM header would be.
+        let mut cov = std::collections::HashMap::new();
+        cov.insert("WT".to_string(), 70.0);
+        if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+            let ctx = DerivedContext {
+                theta: &theta,
+                eta: &eta,
+                indiv_params: &indiv,
+                covariates: &cov,
+                ipred: 0.0,
+                pred: 0.0,
+                dv: 0.0,
+                time: 0.0,
+                tafd: 0.0,
+                tad: 0.0,
+                prev_derived: &prev,
+            };
+            assert_eq!(
+                eval(&ctx),
+                140.0,
+                "lowercase `wt` must resolve to covariate header `WT` (=70)"
+            );
+        } else {
+            panic!("expected PerRow derived kind");
         }
     }
 }

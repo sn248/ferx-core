@@ -387,9 +387,19 @@ fn parse_subject(
         } else if evid == 0 && mdv == 0 {
             // Observation record
             let dv = parse_f64(row.get(dv_col).map(|s| s.as_str()).unwrap_or("0"));
+            // Guard "." / blank the same way the dose path does: parse_usize maps
+            // these to 0 (an invalid compartment), but a missing CMT on an
+            // observation row must default to compartment 1.
             let cmt = cmt_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
+                .and_then(|s| {
+                    let t = s.trim();
+                    if t == "." || t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<usize>().ok()
+                    }
+                })
                 .unwrap_or(1);
             let cens_flag = cens_col
                 .and_then(|c| row.get(c))
@@ -478,6 +488,25 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
+    }
+
+    #[test]
+    fn test_obs_cmt_dot_defaults_to_compartment_one() {
+        // Regression: a "." (missing) CMT on an observation row must default to
+        // compartment 1, not 0. `parse_usize(".")` yields 0 — an invalid
+        // compartment — so the observation path must guard "." / blank exactly
+        // like the dose path does.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT\n\
+                   1,0,.,1,100,1\n\
+                   1,1,5.0,0,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(
+            subj.obs_cmts,
+            vec![1],
+            "obs CMT='.' must default to compartment 1, not 0"
+        );
     }
 
     #[test]

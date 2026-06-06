@@ -528,6 +528,103 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         ("N_OBS".to_string(), n_obs_col),
     ]);
 
+    // ETA columns — always included; one per BSV eta, parallel to eta_names.
+    for (k, eta_name) in result.eta_names.iter().enumerate() {
+        let vals: Vec<f64> = result
+            .subjects
+            .iter()
+            .flat_map(|sr| {
+                let v = sr.eta.get(k).copied().unwrap_or(f64::NAN);
+                std::iter::repeat(v).take(sr.ipred.len())
+            })
+            .collect();
+        cols.push((eta_name.clone(), vals));
+    }
+
+    // TAFD — mandatory, computed from dose records.
+    {
+        let vals: Vec<f64> = result
+            .subjects
+            .iter()
+            .zip(population.subjects.iter())
+            .flat_map(|(_sr, subj)| {
+                let first_dose = subj
+                    .doses
+                    .iter()
+                    .map(|d| d.time)
+                    .fold(f64::INFINITY, f64::min);
+                subj.obs_times.iter().map(move |&t| {
+                    if first_dose.is_finite() {
+                        t - first_dose
+                    } else {
+                        f64::NAN
+                    }
+                })
+            })
+            .collect();
+        cols.push(("TAFD".to_string(), vals));
+    }
+
+    // TAD — mandatory, SS-aware.
+    {
+        let vals: Vec<f64> = result
+            .subjects
+            .iter()
+            .zip(population.subjects.iter())
+            .flat_map(|(_sr, subj)| {
+                subj.obs_times.iter().map(|&obs_t| {
+                    let last_eff = subj
+                        .doses
+                        .iter()
+                        .filter(|d| d.time <= obs_t + 1e-12)
+                        .map(|d| {
+                            if d.ss && d.ii > 0.0 {
+                                let elapsed = obs_t - d.time;
+                                obs_t - elapsed.rem_euclid(d.ii)
+                            } else {
+                                d.time
+                            }
+                        })
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    if last_eff.is_finite() {
+                        obs_t - last_eff
+                    } else {
+                        f64::NAN
+                    }
+                })
+            })
+            .collect();
+        cols.push(("TAD".to_string(), vals));
+    }
+
+    // extra_columns from [derived] and [output] blocks.
+    if let Some(first_with_extra) = result
+        .subjects
+        .iter()
+        .find(|sr| !sr.extra_columns.is_empty())
+    {
+        let extra_names: Vec<String> = first_with_extra
+            .extra_columns
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        for col_name in &extra_names {
+            let vals: Vec<f64> = result
+                .subjects
+                .iter()
+                .flat_map(|sr| {
+                    sr.extra_columns
+                        .iter()
+                        .find(|(n, _)| n == col_name)
+                        .map(|(_, v)| v.as_slice())
+                        .unwrap_or(&[])
+                        .to_vec()
+                })
+                .collect();
+            cols.push((col_name.clone(), vals));
+        }
+    }
+
     cols
 }
 
@@ -559,7 +656,7 @@ pub fn write_sdtab_csv(
             .iter()
             .map(|(_, values)| {
                 let v = values[row];
-                if v.is_nan() {
+                if !v.is_finite() {
                     String::new()
                 } else {
                     format!("{:.6}", v)
@@ -1304,6 +1401,7 @@ mod tests {
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
+            extra_columns: vec![],
         }
     }
 

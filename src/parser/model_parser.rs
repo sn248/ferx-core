@@ -1401,6 +1401,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         scaling: ScalingSpec::None,
         log_transform: ltbs_flags.log_transform,
         dv_pre_logged: ltbs_flags.dv_pre_logged,
+        derived_exprs: vec![],
+        output_columns: vec![],
     };
 
     // ── Optional blocks ──
@@ -1628,12 +1630,505 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     );
     model.parse_warnings.extend(unused_warnings);
 
+    // ── [derived] block ──
+    if let Some(derived_lines) = blocks.get("derived") {
+        let cov_names = model.referenced_covariates.clone();
+        let mut derived_warnings = Vec::new();
+        let derived_exprs = parse_derived_block(
+            derived_lines,
+            &model.theta_names.clone(),
+            &model.eta_names.clone(),
+            &model.indiv_param_names.clone(),
+            &cov_names,
+            &mut derived_warnings,
+        )?;
+        model.derived_exprs = derived_exprs;
+        model.parse_warnings.extend(derived_warnings);
+    }
+
+    // ── [output] block ──
+    if let Some(output_lines) = blocks.get("output") {
+        model.output_columns = parse_output_block(output_lines);
+    }
+
     Ok(ParsedModel {
         model,
         simulation,
         fit_options,
         block_lines: extracted.block_lines.clone(),
     })
+}
+
+// ── [derived] and [output] block parsers ────────────────────────────────────
+
+/// Built-in sdtab column names that [derived] names must not clash with.
+const DERIVED_BUILTIN_NAMES: &[&str] = &[
+    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD",
+    "CENS", "OCC", "CMT",
+];
+
+/// Split a token slice at top-level commas (depth 0 inside parentheses).
+fn split_top_level_commas(tokens: &[Token]) -> Vec<&[Token]> {
+    let mut result = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            Token::Comma if depth == 0 => {
+                result.push(&tokens[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < tokens.len() {
+        result.push(&tokens[start..]);
+    }
+    result
+}
+
+/// Returns true when a token slice starts with `IDENT =` (keyword arg pattern).
+fn is_keyword_arg_tokens(tokens: &[Token]) -> bool {
+    matches!(tokens, [Token::Ident(_), Token::Eq, ..])
+}
+
+/// Parse `IDENT = NUMBER` keyword arg, returning (key, value).
+fn parse_keyword_float_arg(tokens: &[Token]) -> Result<(String, f64), String> {
+    match tokens {
+        [Token::Ident(k), Token::Eq, Token::Number(v)] => Ok((k.clone(), *v)),
+        [Token::Ident(k), Token::Eq, ..] => Err(format!(
+            "keyword arg `{k}=` must be followed by a numeric literal"
+        )),
+        _ => Err(format!(
+            "expected keyword arg `name = value`, got unexpected tokens"
+        )),
+    }
+}
+
+/// Returns true when a token slice contains a comparison or logical operator
+/// at parenthesis depth 0. Used to distinguish a condition arg from a
+/// keyword-arg sequence in `integral(...)`.
+fn tokens_contain_comparison(tokens: &[Token]) -> bool {
+    let mut depth = 0usize;
+    for tok in tokens {
+        match tok {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            Token::Lt
+            | Token::Le
+            | Token::Gt
+            | Token::Ge
+            | Token::EqEq
+            | Token::Ne
+            | Token::AndAnd
+            | Token::OrOr
+            | Token::Bang
+                if depth == 0 =>
+            {
+                return true
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Parse a token slice as a fully-consuming arithmetic expression.
+fn parse_derived_expr(tokens: &[Token], ctx: ParseCtx<'_>) -> Result<Expression, String> {
+    if tokens.is_empty() {
+        return Err("expected expression, got empty token list".into());
+    }
+    let (expr, pos) = parse_add_sub(tokens, 0, ctx)?;
+    if pos < tokens.len() {
+        return Err(format!(
+            "unexpected token(s) after expression: {:?}",
+            &tokens[pos..]
+        ));
+    }
+    Ok(expr)
+}
+
+/// Parse a token slice as a fully-consuming boolean condition.
+fn parse_derived_cond(tokens: &[Token], ctx: ParseCtx<'_>) -> Result<Condition, String> {
+    if tokens.is_empty() {
+        return Err("expected condition, got empty token list".into());
+    }
+    let (cond, pos) = parse_condition(tokens, 0, ctx)?;
+    if pos < tokens.len() {
+        return Err(format!(
+            "unexpected token(s) after condition: {:?}",
+            &tokens[pos..]
+        ));
+    }
+    Ok(cond)
+}
+
+/// Build a DerivedEvalFn closure from a parsed Expression.
+/// At evaluation time the closure assembles a `vars` map from the DerivedContext
+/// fields and calls the AST-walking `eval_expression`.
+fn build_derived_eval_fn(expr: Expression) -> DerivedEvalFn {
+    let expr = std::sync::Arc::new(expr);
+    Box::new(move |ctx: &DerivedContext<'_>| {
+        let mut vars: HashMap<String, f64> = HashMap::new();
+        for (k, &v) in ctx.indiv_params.iter() {
+            vars.insert(k.clone(), v);
+        }
+        for (k, &v) in ctx.covariates.iter() {
+            vars.insert(k.clone(), v);
+        }
+        for (k, &v) in ctx.prev_derived.iter() {
+            vars.insert(k.clone(), v);
+        }
+        vars.insert("IPRED".into(), ctx.ipred);
+        vars.insert("PRED".into(), ctx.pred);
+        vars.insert("DV".into(), ctx.dv);
+        vars.insert("TIME".into(), ctx.time);
+        vars.insert("TAFD".into(), ctx.tafd);
+        vars.insert("TAD".into(), ctx.tad);
+        vars.insert("MACHEPS".into(), f64::EPSILON);
+        // Covariates become Variable nodes (fallback_covariate=false at parse time),
+        // so pass an empty covariates map and rely on vars for all name resolution.
+        eval_expression(&expr, ctx.theta, ctx.eta, &HashMap::new(), &vars, &[])
+    })
+}
+
+/// Build a DerivedFilterFn closure from a parsed Condition.
+fn build_derived_filter_fn(cond: Condition) -> DerivedFilterFn {
+    let cond = std::sync::Arc::new(cond);
+    Box::new(move |ctx: &DerivedContext<'_>| {
+        let mut vars: HashMap<String, f64> = HashMap::new();
+        for (k, &v) in ctx.indiv_params.iter() {
+            vars.insert(k.clone(), v);
+        }
+        for (k, &v) in ctx.covariates.iter() {
+            vars.insert(k.clone(), v);
+        }
+        for (k, &v) in ctx.prev_derived.iter() {
+            vars.insert(k.clone(), v);
+        }
+        vars.insert("IPRED".into(), ctx.ipred);
+        vars.insert("PRED".into(), ctx.pred);
+        vars.insert("DV".into(), ctx.dv);
+        vars.insert("TIME".into(), ctx.time);
+        vars.insert("TAFD".into(), ctx.tafd);
+        vars.insert("TAD".into(), ctx.tad);
+        vars.insert("MACHEPS".into(), f64::EPSILON);
+        eval_condition(&cond, ctx.theta, ctx.eta, &HashMap::new(), &vars, &[])
+    })
+}
+
+/// Returns true if the expression subtree references the `DV` variable.
+fn expr_refs_dv(expr: &Expression) -> bool {
+    match expr {
+        Expression::Variable(name) if name.eq_ignore_ascii_case("DV") => true,
+        Expression::BinOp(l, _, r) => expr_refs_dv(l) || expr_refs_dv(r),
+        Expression::UnaryFn(_, arg) => expr_refs_dv(arg),
+        Expression::Power(b, e) => expr_refs_dv(b) || expr_refs_dv(e),
+        Expression::Conditional(c, t, e) => cond_refs_dv(c) || expr_refs_dv(t) || expr_refs_dv(e),
+        _ => false,
+    }
+}
+
+fn cond_refs_dv(cond: &Condition) -> bool {
+    match cond {
+        Condition::Compare(l, _, r) => expr_refs_dv(l) || expr_refs_dv(r),
+        Condition::And(l, r) | Condition::Or(l, r) => cond_refs_dv(l) || cond_refs_dv(r),
+        Condition::Not(c) => cond_refs_dv(c),
+    }
+}
+
+/// Parse the interior args of `integral(...)` into a `DerivedKind::Integral`.
+fn parse_integral_kind(
+    args: &[&[Token]],
+    ctx: ParseCtx<'_>,
+    parse_warnings: &mut Vec<String>,
+) -> Result<DerivedKind, String> {
+    if args.is_empty() {
+        return Err(
+            "[derived] integral() requires at least one argument (the integrand expression)".into(),
+        );
+    }
+
+    let integrand_expr = parse_derived_expr(args[0], ctx)?;
+    let data_based = expr_refs_dv(&integrand_expr);
+
+    let mut condition: Option<DerivedFilterFn> = None;
+    let mut from_val: Option<f64> = None;
+    let mut to_val: Option<f64> = None;
+    let mut window_val: Option<f64> = None;
+    let mut anchor_val: f64 = 0.0;
+    let mut step_val: Option<f64> = None;
+
+    let mut i = 1;
+    // Second positional arg is a condition if it contains comparison operators.
+    if i < args.len() && !is_keyword_arg_tokens(args[i]) && tokens_contain_comparison(args[i]) {
+        let cond = parse_derived_cond(args[i], ctx)?;
+        condition = Some(build_derived_filter_fn(cond));
+        i += 1;
+    }
+
+    // Remaining args are keyword args.
+    while i < args.len() {
+        let (k, v) =
+            parse_keyword_float_arg(args[i]).map_err(|e| format!("[derived] integral(): {e}"))?;
+        match k.to_lowercase().as_str() {
+            "from" => from_val = Some(v),
+            "to" => to_val = Some(v),
+            "window" => window_val = Some(v),
+            "anchor" => anchor_val = v,
+            "step" => step_val = Some(v),
+            other => {
+                return Err(format!(
+                    "[derived] integral(): unknown keyword argument `{other}`"
+                ))
+            }
+        }
+        i += 1;
+    }
+
+    let int_window = if let Some(w) = window_val {
+        if from_val.is_some() || to_val.is_some() {
+            return Err(
+                "[derived] integral(): cannot specify both `window=` and `from=`/`to=`".into(),
+            );
+        }
+        IntegralWindow::Periodic {
+            period: w,
+            anchor: anchor_val,
+        }
+    } else {
+        let f = from_val.ok_or("[derived] integral(): missing required argument `from=`")?;
+        let t = to_val.ok_or("[derived] integral(): missing required argument `to=`")?;
+        IntegralWindow::Explicit { from: f, to: t }
+    };
+
+    let int_step = if data_based {
+        if step_val.is_some() {
+            parse_warnings.push(
+                "[derived] integral(): `step=` is ignored for DV-based integrands \
+                 (W_DERIVED_STEP_IGNORED)"
+                    .into(),
+            );
+        }
+        IntegralStep::ObsTimes
+    } else if let Some(s) = step_val {
+        IntegralStep::Fixed(s)
+    } else {
+        IntegralStep::Auto
+    };
+
+    Ok(DerivedKind::Integral {
+        integrand: build_derived_eval_fn(integrand_expr),
+        condition,
+        data_based,
+        window: int_window,
+        step: int_step,
+    })
+}
+
+/// Parse a `[derived]` block into a sequence of `DerivedExprSpec`s.
+///
+/// Each line must have the form `NAME = <rhs>` where RHS is one of:
+/// - A plain arithmetic expression → `PerRow`
+/// - `max(expr)` / `max(expr, cond)` → `Aggregate(Max)`
+/// - `min(expr)` / `min(expr, cond)` → `Aggregate(Min)`
+/// - `tmax(expr)` / `tmax(expr, cond)` → `Aggregate(Tmax)`
+/// - `integral(expr, ...)` with keyword args → `Integral`
+fn parse_derived_block(
+    lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_param_names: &[String],
+    covariate_names: &[String],
+    parse_warnings: &mut Vec<String>,
+) -> Result<Vec<DerivedExprSpec>, String> {
+    let mut specs: Vec<DerivedExprSpec> = Vec::new();
+    let mut defined_derived: Vec<String> = Vec::new();
+
+    // Names that resolve to Variable (not Theta/Eta) at parse time; these are
+    // looked up in the vars HashMap at closure-call time.
+    const BUILTIN_SPECIALS: &[&str] = &["IPRED", "PRED", "DV", "TIME", "TAFD", "TAD", "MACHEPS"];
+
+    for raw_line in lines {
+        let line = if let Some(idx) = raw_line.find('#') {
+            &raw_line[..idx]
+        } else {
+            raw_line.as_str()
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Split at first `=` to separate NAME from RHS.
+        let eq_pos = line
+            .find('=')
+            .ok_or_else(|| format!("[derived] line `{line}` must have the form `NAME = <expr>`"))?;
+        let name = line[..eq_pos].trim().to_string();
+        let rhs_str = line[eq_pos + 1..].trim().to_string();
+
+        if name.is_empty() {
+            return Err(format!(
+                "[derived] line `{line}` has an empty name before `=`"
+            ));
+        }
+
+        // ── Name conflict checks ──────────────────────────────────────────────
+        if DERIVED_BUILTIN_NAMES
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(&name))
+            || eta_names.iter().any(|e| e.eq_ignore_ascii_case(&name))
+        {
+            return Err(format!(
+                "[derived] name `{name}` conflicts with a built-in sdtab column or eta name \
+                 (E_DERIVED_NAME_CONFLICT)"
+            ));
+        }
+        if theta_names.iter().any(|t| t.eq_ignore_ascii_case(&name))
+            || indiv_param_names
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(&name))
+        {
+            return Err(format!(
+                "[derived] name `{name}` conflicts with a theta or individual-parameter name \
+                 (E_DERIVED_NAME_CONFLICT)"
+            ));
+        }
+        if covariate_names
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&name))
+        {
+            parse_warnings.push(format!(
+                "[derived] name `{name}` shadows a covariate — this may be confusing \
+                 (W_DERIVED_COVARIATE_SHADOW)"
+            ));
+        }
+
+        // ── Build ParseCtx ────────────────────────────────────────────────────
+        // Unknown identifiers become Variable (fallback_covariate = false), so
+        // indiv params, covariates, and context fields (IPRED, DV, etc.) are all
+        // resolved via the vars HashMap at closure-call time.
+        let mut defined_vars: Vec<String> = indiv_param_names.to_vec();
+        defined_vars.extend(BUILTIN_SPECIALS.iter().map(|s| s.to_string()));
+        defined_vars.extend(covariate_names.iter().cloned());
+        defined_vars.extend(defined_derived.iter().cloned());
+
+        let ctx = ParseCtx {
+            theta_names,
+            eta_names,
+            defined_vars: &defined_vars,
+            fallback_covariate: false,
+            nn_specs: &[],
+        };
+
+        // ── Tokenize ──────────────────────────────────────────────────────────
+        let mut tokens = tokenize(&rhs_str)?;
+        tokens.retain(|t| !matches!(t, Token::Newline));
+
+        if tokens.is_empty() {
+            return Err(format!("[derived] `{name}` has an empty right-hand side"));
+        }
+
+        // ── Detect form ───────────────────────────────────────────────────────
+        let kind = if let Token::Ident(func_name) = &tokens[0] {
+            let fname_lc = func_name.to_lowercase();
+            if matches!(fname_lc.as_str(), "max" | "min" | "tmax" | "integral")
+                && tokens.get(1) == Some(&Token::LParen)
+            {
+                // Find the matching closing paren at depth 0 (after the opening LParen at [1]).
+                let mut depth = 0usize;
+                let mut close_idx = None;
+                for (i, tok) in tokens[1..].iter().enumerate() {
+                    match tok {
+                        Token::LParen => depth += 1,
+                        Token::RParen => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close_idx = Some(i + 1); // index in `tokens`
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let close_idx = close_idx.ok_or_else(|| {
+                    format!("[derived] `{name}`: `{fname_lc}(` missing closing `)`")
+                })?;
+
+                // tokens[2..close_idx] is the interior
+                let interior = &tokens[2..close_idx];
+                let args = split_top_level_commas(interior);
+
+                if fname_lc == "integral" {
+                    parse_integral_kind(&args, ctx, parse_warnings)?
+                } else {
+                    // max / min / tmax
+                    let agg_fn = match fname_lc.as_str() {
+                        "max" => AggFunction::Max,
+                        "min" => AggFunction::Min,
+                        "tmax" => AggFunction::Tmax,
+                        _ => unreachable!(),
+                    };
+                    let value_tokens = args.first().copied().unwrap_or(&[]);
+                    let filter_tokens = if args.len() >= 2 { Some(args[1]) } else { None };
+                    let value_expr = parse_derived_expr(value_tokens, ctx)?;
+                    let filter = if let Some(ft) = filter_tokens {
+                        let cond = parse_derived_cond(ft, ctx)?;
+                        Some(build_derived_filter_fn(cond))
+                    } else {
+                        None
+                    };
+                    DerivedKind::Aggregate {
+                        func: agg_fn,
+                        value: build_derived_eval_fn(value_expr),
+                        filter,
+                    }
+                }
+            } else {
+                // Plain expression → PerRow
+                let expr = parse_derived_expr(&tokens, ctx)?;
+                DerivedKind::PerRow {
+                    eval: build_derived_eval_fn(expr),
+                }
+            }
+        } else {
+            // Starts with a literal or unary minus
+            let expr = parse_derived_expr(&tokens, ctx)?;
+            DerivedKind::PerRow {
+                eval: build_derived_eval_fn(expr),
+            }
+        };
+
+        defined_derived.push(name.clone());
+        specs.push(DerivedExprSpec { name, kind });
+    }
+
+    Ok(specs)
+}
+
+/// Parse an `[output]` block: whitespace-separated column names.
+fn parse_output_block(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .flat_map(|line| {
+            let line = if let Some(idx) = line.find('#') {
+                &line[..idx]
+            } else {
+                line.as_str()
+            };
+            line.split_whitespace().map(|s| s.to_string())
+        })
+        .collect()
 }
 
 // ── [simulation] block parser ───────────────────────────────────────────────
@@ -3071,7 +3566,21 @@ fn build_ode_spec(
     for (i, n) in intermediates.iter().enumerate() {
         add_aliases(&mut var_idx, n, state_count + indiv_count + i);
     }
-    let n_vars_total = state_count + indiv_count + intermediates.len();
+    // Reserve extra slots for TIME/T, TAFD, TAD — always appended after intermediates.
+    let n_base_vars = state_count + indiv_count + intermediates.len();
+    let time_slot = n_base_vars;
+    let tafd_slot = n_base_vars + 1;
+    let tad_slot = n_base_vars + 2;
+    // TIME and T are aliases for the same slot.
+    var_idx.entry("TIME".to_string()).or_insert(time_slot);
+    var_idx.entry("time".to_string()).or_insert(time_slot);
+    var_idx.entry("T".to_string()).or_insert(time_slot);
+    var_idx.entry("t".to_string()).or_insert(time_slot);
+    var_idx.entry("TAFD".to_string()).or_insert(tafd_slot);
+    var_idx.entry("tafd".to_string()).or_insert(tafd_slot);
+    var_idx.entry("TAD".to_string()).or_insert(tad_slot);
+    var_idx.entry("tad".to_string()).or_insert(tad_slot);
+    let n_vars_total = n_base_vars + 3;
 
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
@@ -3108,7 +3617,7 @@ fn build_ode_spec(
     // once the capacity grows), so intermediate slots in untaken if-branches
     // still read 0 just like the old per-call `vec![0.0; n]` path.
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
-        Box::new(move |u: &[f64], params: &[f64], _t: f64, du: &mut [f64]| {
+        Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
             // The integrator always passes a `u` whose length matches the
             // declared state count. The old closure index-panicked on
             // `u[i]` if that contract ever broke; preserve that signal here
@@ -3143,6 +3652,27 @@ fn build_ode_spec(
                     {
                         *dst = val;
                     }
+                }
+
+                // TIME / T — solver time axis (same as dataset TIME column).
+                if let Some(dst) = scratch.rhs_vars.get_mut(time_slot) {
+                    *dst = t;
+                }
+                // TAFD — t minus first-dose time, injected via params[MAX_PK_PARAMS].
+                if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
+                    *dst = params
+                        .get(crate::types::MAX_PK_PARAMS)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .map_or(f64::NAN, |first| t - first);
+                }
+                // TAD — t minus last-effective-dose time, injected via params[MAX_PK_PARAMS+1].
+                if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
+                    *dst = params
+                        .get(crate::types::MAX_PK_PARAMS + 1)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .map_or(f64::NAN, |last| t - last);
                 }
 
                 // Reset du so a state without a firing d/dt this iteration
@@ -4420,6 +4950,8 @@ pub(crate) enum BinOp {
     Sub,
     Mul,
     Div,
+    /// Euclidean remainder — result always non-negative for positive divisor.
+    Mod,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4772,7 +5304,13 @@ fn eval_expression(
         Expression::Theta(i) => theta[*i],
         Expression::Eta(i) => eta[*i],
         Expression::Covariate(name) => covariates.get(name).copied().unwrap_or(0.0),
-        Expression::Variable(name) => vars.get(name).copied().unwrap_or(0.0),
+        Expression::Variable(name) => {
+            if name.eq_ignore_ascii_case("MACHEPS") {
+                f64::EPSILON
+            } else {
+                vars.get(name).copied().unwrap_or(0.0)
+            }
+        }
         Expression::VariableIdx(_) | Expression::CovariateIdx(_) => {
             debug_assert!(
                 false,
@@ -4794,6 +5332,7 @@ fn eval_expression(
                         l / r
                     }
                 }
+                BinOp::Mod => l.rem_euclid(r),
             }
         }
         Expression::UnaryFn(name, arg) => {
@@ -4803,6 +5342,9 @@ fn eval_expression(
                 "log" | "ln" => v.max(1e-30).ln(),
                 "sqrt" => v.max(0.0).sqrt(),
                 "abs" => v.abs(),
+                "floor" => v.floor(),
+                "ceil" => v.ceil(),
+                "round" => v.round(),
                 "inv_logit" | "expit" => {
                     // Numerically stable: avoid exp overflow for very negative v
                     if v >= 0.0 {
@@ -4946,6 +5488,10 @@ enum Op {
     LogicNot,
     JumpIfFalse(u32), // pops top; jumps to bytecode index if value == 0.0
     Jump(u32),
+    Mod,   // rem_euclid (binary)
+    Floor, // unary
+    Ceil,  // unary
+    Round, // unary
 }
 
 // ─── Consolidated per-thread scratch ───────────────────────────────────────
@@ -5066,6 +5612,7 @@ fn compute_max_stack(ops: &[Op]) -> usize {
             | Op::Sub
             | Op::Mul
             | Op::Div
+            | Op::Mod
             | Op::Pow
             | Op::CmpLt
             | Op::CmpLe
@@ -5075,7 +5622,16 @@ fn compute_max_stack(ops: &[Op]) -> usize {
             | Op::CmpNe
             | Op::LogicAnd
             | Op::LogicOr => -1,
-            Op::Exp | Op::Ln | Op::Sqrt | Op::Abs | Op::InvLogit | Op::Logit | Op::LogicNot => 0,
+            Op::Exp
+            | Op::Ln
+            | Op::Sqrt
+            | Op::Abs
+            | Op::InvLogit
+            | Op::Logit
+            | Op::LogicNot
+            | Op::Floor
+            | Op::Ceil
+            | Op::Round => 0,
             Op::JumpIfFalse(_) => -1,
             Op::Jump(_) => 0,
         };
@@ -5127,6 +5683,7 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 BinOp::Sub => Op::Sub,
                 BinOp::Mul => Op::Mul,
                 BinOp::Div => Op::Div,
+                BinOp::Mod => Op::Mod,
             });
         }
         Expression::Power(base, exp) => {
@@ -5147,6 +5704,9 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 "abs" => bc.ops.push(Op::Abs),
                 "inv_logit" | "expit" => bc.ops.push(Op::InvLogit),
                 "logit" => bc.ops.push(Op::Logit),
+                "floor" => bc.ops.push(Op::Floor),
+                "ceil" => bc.ops.push(Op::Ceil),
+                "round" => bc.ops.push(Op::Round),
                 _ => { /* unknown function → leave the argument on the stack */ }
             }
         }
@@ -5300,6 +5860,15 @@ fn eval_bytecode(
                 let b = pop!();
                 push!(b.powf(e));
             }
+            Op::Mod => {
+                let b = pop!();
+                let a = pop!();
+                push!(if b.abs() < 1e-30 {
+                    0.0
+                } else {
+                    a.rem_euclid(b)
+                });
+            }
             Op::Exp => {
                 let v = pop!();
                 push!(v.exp());
@@ -5317,6 +5886,18 @@ fn eval_bytecode(
             Op::Abs => {
                 let v = pop!();
                 push!(v.abs());
+            }
+            Op::Floor => {
+                let v = pop!();
+                push!(v.floor());
+            }
+            Op::Ceil => {
+                let v = pop!();
+                push!(v.ceil());
+            }
+            Op::Round => {
+                let v = pop!();
+                push!(v.round());
             }
             Op::InvLogit => {
                 let v = pop!();
@@ -5446,6 +6027,7 @@ fn eval_expression_indexed(
                         l / r
                     }
                 }
+                BinOp::Mod => l.rem_euclid(r),
             }
         }
         Expression::UnaryFn(name, arg) => {
@@ -5455,6 +6037,9 @@ fn eval_expression_indexed(
                 "log" | "ln" => v.max(1e-30).ln(),
                 "sqrt" => v.max(0.0).sqrt(),
                 "abs" => v.abs(),
+                "floor" => v.floor(),
+                "ceil" => v.ceil(),
+                "round" => v.round(),
                 "inv_logit" | "expit" => {
                     if v >= 0.0 {
                         1.0 / (1.0 + (-v).exp())
@@ -5957,6 +6542,7 @@ fn differentiate_with_chain(
                 let denom = mul((**r).clone(), (**r).clone());
                 div(num, denom)
             }
+            BinOp::Mod => Expression::Literal(0.0), // mod is discontinuous; derivative is 0 a.e.
         },
         Expression::UnaryFn(name, arg) => {
             let da = differentiate_with_chain(arg, axis, chain);
@@ -6097,6 +6683,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
                         Expression::BinOp(Box::new(l), *op, Box::new(r))
                     }
                 }
+                BinOp::Mod => Expression::BinOp(Box::new(l), *op, Box::new(r)),
             }
         }
         Expression::UnaryFn(name, arg) => {
@@ -6557,6 +7144,17 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                     {
                         i += 1;
                     }
+                    // Handle optional sign in exponent: e.g. `-1e-10`, `-2.5E+3`.
+                    if i > 0
+                        && (chars[i - 1] == 'e' || chars[i - 1] == 'E')
+                        && i < chars.len()
+                        && (chars[i] == '+' || chars[i] == '-')
+                    {
+                        i += 1;
+                        while i < chars.len() && chars[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
                     let num_str: String = chars[start..i].iter().collect();
                     let num: f64 = num_str
                         .parse()
@@ -6592,6 +7190,17 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                 {
                     i += 1;
                 }
+                // Handle optional sign in exponent: e.g. `1.5e-3`, `.5E+2`.
+                if i > 0
+                    && (chars[i - 1] == 'e' || chars[i - 1] == 'E')
+                    && i < chars.len()
+                    && (chars[i] == '+' || chars[i] == '-')
+                {
+                    i += 1;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
                 let num_str: String = chars[start..i].iter().collect();
                 let num: f64 = num_str
                     .parse()
@@ -6611,6 +7220,17 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                         || chars[i] == 'E')
                 {
                     i += 1;
+                }
+                // Handle optional sign in exponent: e.g. `1e-10`, `2.5E+3`.
+                if i > 0
+                    && (chars[i - 1] == 'e' || chars[i - 1] == 'E')
+                    && i < chars.len()
+                    && (chars[i] == '+' || chars[i] == '-')
+                {
+                    i += 1;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
                 }
                 let num_str: String = chars[start..i].iter().collect();
                 let num: f64 = num_str
@@ -6678,6 +7298,11 @@ fn parse_mul_div(
             Token::Slash => {
                 let (right, p) = parse_power(tokens, pos + 1, ctx)?;
                 left = Expression::BinOp(Box::new(left), BinOp::Div, Box::new(right));
+                pos = p;
+            }
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("mod") => {
+                let (right, p) = parse_power(tokens, pos + 1, ctx)?;
+                left = Expression::BinOp(Box::new(left), BinOp::Mod, Box::new(right));
                 pos = p;
             }
             _ => break,

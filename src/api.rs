@@ -8,6 +8,7 @@ use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll
 use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
+use std::collections::HashMap;
 
 /// Build the `FitResult.neural_networks` summary from the compiled model's
 /// `[covariate_nn]` blocks. Empty when no NN blocks are present, so output
@@ -345,6 +346,7 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_iov_occasions(model, population));
+    diags.extend(validate_output_columns(model, population));
     diags
 }
 
@@ -1013,6 +1015,420 @@ fn probe_nlopt_algorithms() -> Vec<String> {
     }
 }
 
+// ── Step 7: [output] validation and TAFD/TAD helpers ────────────────────────
+
+/// Mandatory sdtab column names that are always written — declaring them in
+/// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
+const OUTPUT_MANDATORY: &[&str] = &[
+    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV",
+    "N_OBS", "TAFD", "TAD",
+];
+
+/// Validate `model.output_columns` against known quantities, emitting
+/// `W_OUTPUT_DUPLICATE` and `E_OUTPUT_UNKNOWN_COLUMN` diagnostics.
+pub fn validate_output_columns(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    let derived_names: Vec<&str> = model
+        .derived_exprs
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    let cov_names = &population.covariate_names;
+
+    for col in &model.output_columns {
+        // Already in mandatory minimum?
+        if OUTPUT_MANDATORY.iter().any(|m| m.eq_ignore_ascii_case(col))
+            || model.eta_names.iter().any(|e| e.eq_ignore_ascii_case(col))
+        {
+            diags.push(Diagnostic::warning(
+                "W_OUTPUT_DUPLICATE",
+                format!(
+                    "[output] column `{col}` is already written to sdtab automatically; \
+                     the declaration is ignored"
+                ),
+            ));
+            continue;
+        }
+        // Valid if it's a covariate, indiv param, or derived name
+        let known = cov_names.iter().any(|c| c.eq_ignore_ascii_case(col))
+            || model
+                .indiv_param_names
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(col))
+            || derived_names.iter().any(|d| d.eq_ignore_ascii_case(col));
+        if !known {
+            let mut candidates: Vec<&str> = cov_names.iter().map(|s| s.as_str()).collect();
+            candidates.extend(model.indiv_param_names.iter().map(|s| s.as_str()));
+            candidates.extend(derived_names.iter().copied());
+            candidates.extend(OUTPUT_MANDATORY.iter().copied());
+            diags.push(Diagnostic::error(
+                "E_OUTPUT_UNKNOWN_COLUMN",
+                format!(
+                    "[output] column `{col}` is not recognised as a covariate, individual \
+                     parameter, or derived expression. Known: {}",
+                    candidates.join(", ")
+                ),
+            ));
+        }
+    }
+    diags
+}
+
+/// Compute TAFD (time after first dose) and TAD (time after last dose,
+/// SS-aware) for observation index `obs_idx` of `subject`.
+pub(crate) fn tafd_tad_for_subject(subject: &Subject, obs_idx: usize, lagtime: f64) -> (f64, f64) {
+    let obs_time = subject.obs_times[obs_idx];
+
+    let first_dose_time = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
+    let tafd = if first_dose_time.is_finite() {
+        obs_time - first_dose_time
+    } else {
+        f64::NAN
+    };
+
+    let last_dose_eff = subject
+        .doses
+        .iter()
+        .filter(|d| d.time + lagtime <= obs_time + 1e-12)
+        .map(|d| {
+            if d.ss && d.ii > 0.0 {
+                let elapsed = obs_time - (d.time + lagtime);
+                obs_time - elapsed.rem_euclid(d.ii)
+            } else {
+                d.time + lagtime
+            }
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    let tad = if last_dose_eff.is_finite() {
+        obs_time - last_dose_eff
+    } else {
+        f64::NAN
+    };
+
+    (tafd, tad)
+}
+
+// ── Step 8: post-fit extra column computation ────────────────────────────────
+
+/// Build a per-observation HashMap mapping `model.indiv_param_names` to their
+/// values from `pk`.
+fn build_indiv_map(pk: &PkParams, names: &[String], pk_indices: &[usize]) -> HashMap<String, f64> {
+    names
+        .iter()
+        .zip(pk_indices.iter())
+        .map(|(name, &idx)| (name.clone(), pk.values[idx]))
+        .collect()
+}
+
+/// Trapezoid integration over (time, value) pairs in the slice.
+fn trapezoid(points: &[(f64, f64)]) -> f64 {
+    if points.len() < 2 {
+        return 0.0;
+    }
+    let mut auc = 0.0;
+    for w in points.windows(2) {
+        let dt = w[1].0 - w[0].0;
+        auc += dt * (w[0].1 + w[1].1) * 0.5;
+    }
+    auc
+}
+
+/// Compute all [derived] and [output] columns post-fit, storing results in
+/// each SubjectResult's `extra_columns` field.
+pub(crate) fn compute_extra_output_columns(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    subjects: &mut [SubjectResult],
+) {
+    use crate::types::{AggFunction, DerivedContext, DerivedKind, IntegralStep, IntegralWindow};
+
+    let derived_names: Vec<&str> = model
+        .derived_exprs
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+
+    for (si, sr) in subjects.iter_mut().enumerate() {
+        let subject = &population.subjects[si];
+        let eta_hat = sr.eta.as_slice();
+        let n_obs = sr.ipred.len();
+
+        // Per-observation PK params, indiv maps, TAFD, TAD
+        let mut per_obs_cov: Vec<&HashMap<String, f64>> = Vec::with_capacity(n_obs);
+        let mut per_obs_indiv: Vec<HashMap<String, f64>> = Vec::with_capacity(n_obs);
+        let mut per_obs_tafd: Vec<f64> = Vec::with_capacity(n_obs);
+        let mut per_obs_tad: Vec<f64> = Vec::with_capacity(n_obs);
+
+        for j in 0..n_obs {
+            let cov_j = subject.obs_cov(j);
+            let pk_j = (model.pk_param_fn)(theta, eta_hat, cov_j);
+            let lagtime = pk_j.lagtime();
+            let indiv_j = build_indiv_map(&pk_j, &model.indiv_param_names, &model.pk_indices);
+            let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, lagtime);
+            per_obs_cov.push(cov_j);
+            per_obs_indiv.push(indiv_j);
+            per_obs_tafd.push(tafd_j);
+            per_obs_tad.push(tad_j);
+        }
+
+        // [output] columns: covariates + indiv params not already in derived
+        for col_name in &model.output_columns {
+            if derived_names
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(col_name))
+            {
+                continue; // will be filled by derived pass below
+            }
+            // Skip mandatory/duplicate columns
+            if OUTPUT_MANDATORY
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(col_name))
+                || model
+                    .eta_names
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(col_name))
+            {
+                continue;
+            }
+            let mut col_vals = Vec::with_capacity(n_obs);
+            for j in 0..n_obs {
+                let v = per_obs_cov[j]
+                    .get(col_name.as_str())
+                    .or_else(|| {
+                        per_obs_indiv[j]
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(col_name))
+                            .map(|(_, v)| v)
+                    })
+                    .copied()
+                    .unwrap_or(f64::NAN);
+                col_vals.push(v);
+            }
+            sr.extra_columns.push((col_name.clone(), col_vals));
+        }
+
+        // [derived] columns, evaluated in declaration order
+        let mut prev_derived: HashMap<String, f64> = HashMap::new();
+
+        for spec in &model.derived_exprs {
+            let col_vals: Vec<f64> = match &spec.kind {
+                DerivedKind::PerRow { eval } => (0..n_obs)
+                    .map(|j| {
+                        let ctx = DerivedContext {
+                            theta,
+                            eta: eta_hat,
+                            indiv_params: &per_obs_indiv[j],
+                            covariates: per_obs_cov[j],
+                            ipred: sr.ipred[j],
+                            pred: sr.pred[j],
+                            dv: subject.observations[j],
+                            time: subject.obs_times[j],
+                            tafd: per_obs_tafd[j],
+                            tad: per_obs_tad[j],
+                            prev_derived: &prev_derived,
+                        };
+                        eval(&ctx)
+                    })
+                    .collect(),
+
+                DerivedKind::Aggregate {
+                    func,
+                    value,
+                    filter,
+                } => {
+                    let mut qualifying: Vec<(usize, f64)> = Vec::new();
+                    for j in 0..n_obs {
+                        let ctx = DerivedContext {
+                            theta,
+                            eta: eta_hat,
+                            indiv_params: &per_obs_indiv[j],
+                            covariates: per_obs_cov[j],
+                            ipred: sr.ipred[j],
+                            pred: sr.pred[j],
+                            dv: subject.observations[j],
+                            time: subject.obs_times[j],
+                            tafd: per_obs_tafd[j],
+                            tad: per_obs_tad[j],
+                            prev_derived: &prev_derived,
+                        };
+                        let include = filter.as_ref().map_or(true, |f| f(&ctx));
+                        if include {
+                            qualifying.push((j, value(&ctx)));
+                        }
+                    }
+                    let scalar = if qualifying.is_empty() {
+                        f64::NAN
+                    } else {
+                        match func {
+                            AggFunction::Max => qualifying
+                                .iter()
+                                .map(|(_, v)| *v)
+                                .fold(f64::NEG_INFINITY, f64::max),
+                            AggFunction::Min => qualifying
+                                .iter()
+                                .map(|(_, v)| *v)
+                                .fold(f64::INFINITY, f64::min),
+                            AggFunction::Tmax => {
+                                // Time of maximum value
+                                qualifying
+                                    .iter()
+                                    .max_by(|(_, a), (_, b)| {
+                                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                    })
+                                    .map(|(j, _)| subject.obs_times[*j])
+                                    .unwrap_or(f64::NAN)
+                            }
+                        }
+                    };
+                    vec![scalar; n_obs]
+                }
+
+                DerivedKind::Integral {
+                    integrand,
+                    condition,
+                    data_based,
+                    window,
+                    step,
+                } => {
+                    // Closure to compute integral over [from, to] using
+                    // observation times (data-based or forced ObsTimes).
+                    let eval_integral_obs = |from: f64, to: f64| -> f64 {
+                        let pts: Vec<(f64, f64)> = (0..n_obs)
+                            .filter_map(|j| {
+                                let t = subject.obs_times[j];
+                                if t < from - 1e-12 || t > to + 1e-12 {
+                                    return None;
+                                }
+                                let ctx = DerivedContext {
+                                    theta,
+                                    eta: eta_hat,
+                                    indiv_params: &per_obs_indiv[j],
+                                    covariates: per_obs_cov[j],
+                                    ipred: sr.ipred[j],
+                                    pred: sr.pred[j],
+                                    dv: subject.observations[j],
+                                    time: t,
+                                    tafd: per_obs_tafd[j],
+                                    tad: per_obs_tad[j],
+                                    prev_derived: &prev_derived,
+                                };
+                                if condition.as_ref().map_or(false, |f| !f(&ctx)) {
+                                    return None;
+                                }
+                                Some((t, integrand(&ctx)))
+                            })
+                            .collect();
+                        trapezoid(&pts)
+                    };
+
+                    // For model-based integrals with a fine grid, use ipred at a
+                    // representative cov snapshot (first obs) across a uniform grid.
+                    // This is an approximation: cov is time-constant at j=0 values.
+                    let eval_integral_grid = |from: f64, to: f64| -> f64 {
+                        let n_steps = match step {
+                            IntegralStep::Fixed(s) => {
+                                let n = ((to - from) / s).ceil() as usize + 1;
+                                n.max(2)
+                            }
+                            _ => 501, // Auto: 500 intervals
+                        };
+                        let dt = (to - from) / (n_steps - 1) as f64;
+                        let cov_0 = per_obs_cov.first().copied().unwrap_or(&subject.covariates);
+                        let indiv_0 = per_obs_indiv.first().cloned().unwrap_or_default();
+                        let pts: Vec<(f64, f64)> = (0..n_steps)
+                            .filter_map(|k| {
+                                let t = from + k as f64 * dt;
+                                let tafd_k = if subject.doses.is_empty() {
+                                    f64::NAN
+                                } else {
+                                    let fd = subject
+                                        .doses
+                                        .iter()
+                                        .map(|d| d.time)
+                                        .fold(f64::INFINITY, f64::min);
+                                    t - fd
+                                };
+                                // For grid-based, IPRED is evaluated at observation-time snapshots
+                                // by approximating with the nearest observation's IPRED.
+                                let nearest_ipred = subject
+                                    .obs_times
+                                    .iter()
+                                    .zip(sr.ipred.iter())
+                                    .min_by(|(&ta, _), (&tb, _)| {
+                                        (ta - t)
+                                            .abs()
+                                            .partial_cmp(&(tb - t).abs())
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    })
+                                    .map(|(_, &ip)| ip)
+                                    .unwrap_or(f64::NAN);
+                                let ctx = DerivedContext {
+                                    theta,
+                                    eta: eta_hat,
+                                    indiv_params: &indiv_0,
+                                    covariates: cov_0,
+                                    ipred: nearest_ipred,
+                                    pred: nearest_ipred,
+                                    dv: f64::NAN, // not available on grid
+                                    time: t,
+                                    tafd: tafd_k,
+                                    tad: f64::NAN, // simplified
+                                    prev_derived: &prev_derived,
+                                };
+                                if condition.as_ref().map_or(false, |f| !f(&ctx)) {
+                                    return None;
+                                }
+                                Some((t, integrand(&ctx)))
+                            })
+                            .collect();
+                        trapezoid(&pts)
+                    };
+
+                    let use_obs = *data_based || matches!(step, IntegralStep::ObsTimes);
+
+                    match window {
+                        IntegralWindow::Explicit { from, to } => {
+                            let val = if use_obs {
+                                eval_integral_obs(*from, *to)
+                            } else {
+                                eval_integral_grid(*from, *to)
+                            };
+                            vec![val; n_obs]
+                        }
+                        IntegralWindow::Periodic { period, anchor } => {
+                            // Compute one integral per observation (window aligned to obs time).
+                            (0..n_obs)
+                                .map(|j| {
+                                    let t = subject.obs_times[j];
+                                    let n_periods = ((t - anchor) / period).floor();
+                                    let from = anchor + n_periods * period;
+                                    let to = from + period;
+                                    if use_obs {
+                                        eval_integral_obs(from, to)
+                                    } else {
+                                        eval_integral_grid(from, to)
+                                    }
+                                })
+                                .collect()
+                        }
+                    }
+                }
+            };
+
+            // Store last value for sequential derived references
+            if let Some(&last) = col_vals.last() {
+                prev_derived.insert(spec.name.clone(), last);
+            }
+            sr.extra_columns.push((spec.name.clone(), col_vals));
+        }
+    }
+}
+
 fn fit_inner(
     model: &CompiledModel,
     population: &Population,
@@ -1405,7 +1821,7 @@ fn fit_inner(
     }
 
     // Compute per-subject diagnostics
-    let subjects = compute_subject_results(
+    let mut subjects = compute_subject_results(
         model,
         population,
         &result.params,
@@ -1414,6 +1830,11 @@ fn fit_inner(
         &result.kappas,
         options.interaction,
     );
+
+    // Post-fit: compute [derived] and [output] columns into extra_columns.
+    if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() {
+        compute_extra_output_columns(model, population, &result.params.theta, &mut subjects);
+    }
 
     let n_obs = population.n_obs();
     let n_params = n_params_pre;
@@ -2021,6 +2442,7 @@ fn compute_subject_results(
                 ofv_contribution: 2.0 * ofv_i,
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
+                extra_columns: vec![],
             }
         })
         .collect()
@@ -2205,6 +2627,7 @@ mod tests {
             ofv_contribution: 0.0,
             cens: vec![0; n],
             n_obs: n,
+            extra_columns: vec![],
         }
     }
 
@@ -2843,6 +3266,8 @@ mod iov_integration {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 
@@ -3690,6 +4115,8 @@ mod simulate_with_uncertainty_tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 
@@ -4404,6 +4831,8 @@ mod tests_sdtab_tv_cov {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)

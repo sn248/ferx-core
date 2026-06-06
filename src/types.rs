@@ -1226,6 +1226,11 @@ pub struct CompiledModel {
     /// natural scale (case 2, `log(DV) ~ additive`) and `fit()` log-transforms
     /// the observations once at load. Ignored when `log_transform` is `false`.
     pub dv_pre_logged: bool,
+    /// Derived expression specifications from [derived] block.
+    /// Empty when no [derived] block is present. Evaluated post-fit.
+    pub derived_exprs: Vec<DerivedExprSpec>,
+    /// Column names from [output] block. Validated at fit time.
+    pub output_columns: Vec<String>,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -1348,6 +1353,87 @@ pub struct SubjectResult {
     pub cens: Vec<u8>,
     /// Number of observations for this subject (MDV=0 rows).
     pub n_obs: usize,
+    /// Extra sdtab columns from [derived] and [output] blocks, computed
+    /// post-fit. Each entry is (column_name, per-observation values). Subject-
+    /// level aggregates (max, AUC, tmax) are repeated across all observation rows.
+    pub extra_columns: Vec<(String, Vec<f64>)>,
+}
+
+// ── Derived expression types ──────────────────────────────────────────────────
+
+/// Context threaded into every [derived] expression evaluation.
+pub struct DerivedContext<'a> {
+    pub theta: &'a [f64],
+    pub eta: &'a [f64],
+    pub indiv_params: &'a HashMap<String, f64>,
+    pub covariates: &'a HashMap<String, f64>,
+    pub ipred: f64,
+    pub pred: f64,
+    pub dv: f64,
+    pub time: f64,
+    pub tafd: f64,
+    pub tad: f64,
+    pub prev_derived: &'a HashMap<String, f64>,
+}
+
+pub type DerivedEvalFn = Box<dyn Fn(&DerivedContext<'_>) -> f64 + Send + Sync>;
+pub type DerivedFilterFn = Box<dyn Fn(&DerivedContext<'_>) -> bool + Send + Sync>;
+
+pub struct DerivedExprSpec {
+    pub name: String,
+    pub kind: DerivedKind,
+}
+
+pub enum DerivedKind {
+    /// Evaluated independently at each observation row.
+    PerRow { eval: DerivedEvalFn },
+    /// Reduction over observation rows (max/min/tmax), optionally filtered.
+    /// The scalar is repeated for all rows of the subject.
+    Aggregate {
+        func: AggFunction,
+        value: DerivedEvalFn,
+        filter: Option<DerivedFilterFn>,
+    },
+    /// Numeric integration over a time window.
+    Integral {
+        integrand: DerivedEvalFn,
+        /// When `Some`, only time points where this evaluates to true contribute.
+        condition: Option<DerivedFilterFn>,
+        /// True when integrand references DV → use observation times only.
+        data_based: bool,
+        window: IntegralWindow,
+        step: IntegralStep,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunction {
+    Max,
+    Min,
+    Tmax,
+}
+
+#[derive(Debug, Clone)]
+pub enum IntegralWindow {
+    Explicit {
+        from: f64,
+        to: f64,
+    },
+    /// One integral per period-aligned window; each observation gets its window's value.
+    Periodic {
+        period: f64,
+        anchor: f64,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum IntegralStep {
+    /// Use observation times only (DV integrals; fallback when model unavailable).
+    ObsTimes,
+    /// Fine internal grid with this step size (hours).
+    Fixed(f64),
+    /// Auto: (to − from) / 500.
+    Auto,
 }
 
 /// How per-occasion kappa random effects are treated in the IS marginal likelihood.
@@ -2492,6 +2578,8 @@ pub(crate) mod test_helpers {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 }

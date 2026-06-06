@@ -1075,6 +1075,7 @@ fn parse_subjects(
             ofv_contribution: ofv,
             cens: Vec::new(),
             n_obs,
+            extra_columns: vec![],
         });
     }
 
@@ -1659,6 +1660,7 @@ mod tests {
             ofv_contribution: 12.34,
             cens: vec![0; n_obs],
             n_obs,
+            extra_columns: vec![],
         }
     }
 

@@ -51,6 +51,7 @@ pub fn read_nonmem_csv(
     let ii_col = col_idx_ci("ii");
     let ss_col = col_idx_ci("ss");
     let cens_col = col_idx_ci("cens");
+    let addl_col = col_idx_ci("addl");
 
     // IOV occasion column (case-insensitive lookup of user-specified name)
     let occ_col: Option<usize> = iov_column.and_then(|name| col_idx_ci(name));
@@ -62,7 +63,7 @@ pub fn read_nonmem_csv(
     }
 
     const STANDARD_COLS: &[&str] = &[
-        "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens",
+        "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens", "addl",
     ];
     let is_standard = |h: &str| {
         STANDARD_COLS.iter().any(|s| h.eq_ignore_ascii_case(s))
@@ -117,6 +118,7 @@ pub fn read_nonmem_csv(
             ss_col,
             cens_col,
             occ_col,
+            addl_col,
             &cov_indices,
         )?;
         subjects.push(subject);
@@ -179,6 +181,7 @@ fn parse_subject(
     ss_col: Option<usize>,
     cens_col: Option<usize>,
     occ_col: Option<usize>,
+    addl_col: Option<usize>,
     cov_indices: &[(String, usize)],
 ) -> Result<(Subject, usize), String> {
     let mut doses = Vec::new();
@@ -189,6 +192,7 @@ fn parse_subject(
     let mut occasions: Vec<u32> = Vec::new();
     let mut dose_occasions: Vec<u32> = Vec::new();
     let mut occ_parse_failures: usize = 0;
+    let mut addl_missing_ii_warned = false;
 
     // Time-constant covariates: first non-missing value across all rows.
     // Used as the subject-static fallback (and for the AD fast path, which
@@ -335,6 +339,41 @@ fn parse_subject(
             }
             if any_tv {
                 dose_covariates.push(locf_state.clone());
+            }
+
+            // ADDL expansion: add additional doses at time + k*II for k=1..=addl.
+            let addl = addl_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_usize(s))
+                .unwrap_or(0);
+            if addl > 0 {
+                if ii <= 0.0 {
+                    if !addl_missing_ii_warned {
+                        eprintln!(
+                            "[ferx] W_ADDL_MISSING_II subject {}: ADDL > 0 but II is zero or \
+                             missing; additional doses not expanded",
+                            id
+                        );
+                        addl_missing_ii_warned = true;
+                    }
+                } else {
+                    for k in 1..=(addl as u32) {
+                        doses.push(DoseEvent::new(
+                            time + (k as f64) * ii,
+                            amt,
+                            cmt,
+                            rate,
+                            false, // expanded doses are never SS themselves
+                            ii,
+                        ));
+                        if occ_col.is_some() {
+                            dose_occasions.push(occ);
+                        }
+                        if any_tv {
+                            dose_covariates.push(locf_state.clone());
+                        }
+                    }
+                }
             }
         } else if evid == 0 && mdv == 0 {
             // Observation record

@@ -410,6 +410,18 @@ pub fn ode_predictions(
     let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
     let dose_f_bio: Vec<f64> = vec![f_bio; subject.doses.len()];
 
+    // Extended params: slots 0..MAX_PK_PARAMS hold the PK parameters; slots
+    // MAX_PK_PARAMS and MAX_PK_PARAMS+1 carry TAFD/TAD anchors for the ODE RHS.
+    let first_dose_time = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
+    let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
+    ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
+    ext_params[crate::types::MAX_PK_PARAMS] = first_dose_time;
+
     // Build obs_time → indices map. Multiple observations can share a time
     // (e.g. simultaneous PK/PD samples on different CMTs), so each time maps to
     // *all* its observation indices — recording only one would leave the others
@@ -516,6 +528,25 @@ pub fn ode_predictions(
             continue;
         }
 
+        // Update TAD anchor (slot MAX_PK_PARAMS+1): last effective dose time
+        // before this segment, SS-aware (gives TAD = t - last_dose_eff).
+        {
+            let last_dose_eff = subject
+                .doses
+                .iter()
+                .filter(|d| d.time + lagtime <= t_start + 1e-12)
+                .map(|d| {
+                    if d.ss && d.ii > 0.0 {
+                        let elapsed = t_start - (d.time + lagtime);
+                        t_start - elapsed.rem_euclid(d.ii)
+                    } else {
+                        d.time + lagtime
+                    }
+                })
+                .fold(f64::NEG_INFINITY, f64::max);
+            ext_params[crate::types::MAX_PK_PARAMS + 1] = last_dose_eff;
+        }
+
         // Integrate. If any infusions are active in this segment, wrap
         // the user RHS so it adds `+rate` to each infusion's compartment.
         // The plain (non-event-driven) ODE path never sees reset subjects —
@@ -541,7 +572,7 @@ pub fn ode_predictions(
             &wrapped_rhs,
             &u,
             (t_start, t_end),
-            pk_params_flat,
+            &ext_params,
             &saveat,
             &opts,
         );
@@ -617,6 +648,13 @@ pub fn ode_predictions_event_driven(
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
     let opts = OdeSolverOptions::default();
+
+    // First-dose time anchor for TAFD injection via extended params.
+    let first_dose_time_ed = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
 
     // Seed compartments from `init(state) = expr` (zeros when none declared).
     // The init expression folds covariates/eta in via the individual-parameter
@@ -741,6 +779,29 @@ pub fn ode_predictions_event_driven(
         };
 
         if t_event > cur_t {
+            // Build extended params for this segment: slots 0..MAX_PK_PARAMS
+            // are pk_now.values; slots MAX_PK_PARAMS and MAX_PK_PARAMS+1 carry
+            // the TAFD/TAD anchors for TIME/TAFD/TAD injection in the ODE RHS.
+            let lagtime_ed = pk_now.lagtime();
+            let last_dose_eff_ed = subject
+                .doses
+                .iter()
+                .filter(|d| d.time + lagtime_ed <= cur_t + 1e-12)
+                .map(|d| {
+                    if d.ss && d.ii > 0.0 {
+                        let elapsed = cur_t - (d.time + lagtime_ed);
+                        cur_t - elapsed.rem_euclid(d.ii)
+                    } else {
+                        d.time + lagtime_ed
+                    }
+                })
+                .fold(f64::NEG_INFINITY, f64::max);
+            let mut ext_params_ed = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+            ext_params_ed[..crate::types::MAX_PK_PARAMS]
+                .copy_from_slice(&pk_now.values[..crate::types::MAX_PK_PARAMS]);
+            ext_params_ed[crate::types::MAX_PK_PARAMS] = first_dose_time_ed;
+            ext_params_ed[crate::types::MAX_PK_PARAMS + 1] = last_dose_eff_ed;
+
             // Wrap the user RHS so any infusion fully spanning
             // [cur_t, t_event] contributes `+rate` to its compartment.
             let active = active_infusions(
@@ -764,7 +825,7 @@ pub fn ode_predictions_event_driven(
                 &wrapped_rhs,
                 &u,
                 (cur_t, t_event),
-                &pk_now.values,
+                &ext_params_ed,
                 &saveat,
                 &opts,
             );

@@ -313,7 +313,15 @@ fn read_nonmem_csv_impl(
     };
     let cov_indices: Vec<(String, usize)> = cov_names
         .iter()
-        .filter_map(|name| col_idx_cs(name).map(|idx| (name.clone(), idx)))
+        .filter_map(|name| {
+            // Prefer an exact header match; fall back to case-insensitive so a
+            // filter-injected lowercase name (e.g. "study" from
+            // `referenced_covariate_columns`) still resolves to a "STUDY" header.
+            // Store the actual header name so covariate keys match the dataset.
+            col_idx_cs(name)
+                .or_else(|| col_idx_ci(name))
+                .map(|idx| (headers[idx].clone(), idx))
+        })
         .collect();
 
     // Optional covariate table over the *declared* covariates. Every declared

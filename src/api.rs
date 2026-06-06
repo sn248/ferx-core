@@ -1326,7 +1326,7 @@ fn fit_inner(
                         } else {
                             msg
                         });
-                    }
+                     }
                     is_result = Some(r);
                 }
                 Err(e) => {

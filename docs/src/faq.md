@@ -278,7 +278,7 @@ only when the expression passes (equivalent to NONMEM's `$DATA ACCEPT=`).
 |--------|------|
 | `$DATA IGNORE=(BW.GT.80)` | `ignore = BW > 80` |
 | `$DATA ACCEPT=(DV.GE.0.001)` | `accept = DV >= 0.001` |
-| `$DATA IGNORE=@ 3,17` | `ignore_subjects = [3, 17]` |
+| `$DATA IGNORE=(ID.EQ.3) IGNORE=(ID.EQ.17)` | `ignore_subjects = [3, 17]` |
 
 Multiple `ignore` lines mean "exclude if any condition matches"; multiple
 `accept` lines mean "exclude unless all conditions pass".  Conditions within a

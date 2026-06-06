@@ -185,7 +185,7 @@ See the ferx-r documentation for `ferx_selection()` and `ferx_fit()`.
 | `$DATA IGNORE=C` | `[data_selection]  ignore = C == 1` |
 | `$DATA IGNORE=(BW.GT.80)` | `[data_selection]  ignore = BW > 80` |
 | `$DATA ACCEPT=(DV.GE.0.001)` | `[data_selection]  accept = DV >= 0.001` |
-| `$DATA IGNORE=@ 3,17` | `[data_selection]  ignore_subjects = [3, 17]` |
+| `$DATA IGNORE=(ID.EQ.3) IGNORE=(ID.EQ.17)` | `[data_selection]  ignore_subjects = [3, 17]` |
 
 ferx uses standard inequality operators (`>`, `>=`, `<`, `<=`, `==`, `!=`)
 instead of NONMEM's Fortran-style `.GT.`, `.GE.`, etc.

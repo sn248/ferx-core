@@ -282,6 +282,12 @@ pub struct ExclusionSummary {
     pub n_obs_excluded: usize,
     /// Number of dose records (EVID 1/4) excluded.
     pub n_dose_excluded: usize,
+    /// Number of other records excluded that are neither a scored observation
+    /// nor a dose — EVID==2 (other event), EVID==3 (reset), and missing-DV
+    /// observation rows (EVID==0, MDV==1). Tracked so the reported counts sum to
+    /// every excluded record and the summary can't read all-zeros while rows
+    /// were dropped.
+    pub n_other_excluded: usize,
     /// Total CSV records read before any filtering.
     pub n_records_total: usize,
     /// `ignore` / `ignore_subjects` clauses that matched at least one record,

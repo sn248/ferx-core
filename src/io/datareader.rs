@@ -62,6 +62,11 @@ impl SelectionFilter {
     /// Returns `(excluded, which)`:
     /// - `excluded = true` when the row should be dropped.
     /// - `which` is the source string of the first clause that fired (for logging).
+    ///
+    /// Checks short-circuit on the first match, so a record is attributed to the
+    /// first rule that excludes it. A rule that only ever matches records already
+    /// removed by an earlier rule therefore never appears in the fired-condition
+    /// summary — see `docs/src/model-file/data-selection.md`.
     pub fn should_exclude(&self, ctx: &RowContext<'_>) -> (bool, Option<String>) {
         // 1. ignore_subjects shorthand.
         if self.ignore_subject_ids.iter().any(|id| id == ctx.id) {
@@ -87,6 +92,9 @@ impl SelectionFilter {
 pub(crate) struct SubjectExclusion {
     pub n_obs_excluded: usize,
     pub n_dose_excluded: usize,
+    /// Records excluded that are neither scored obs nor doses (EVID 2/3, or
+    /// missing-DV obs).
+    pub n_other_excluded: usize,
     /// Sources that matched at least one row ("ignore: DV < 0.001", etc.).
     pub fired: Vec<String>,
 }
@@ -409,6 +417,7 @@ fn read_nonmem_csv_impl(
         // Accumulate filter statistics.
         excl_summary.n_obs_excluded += subj_excl.n_obs_excluded;
         excl_summary.n_dose_excluded += subj_excl.n_dose_excluded;
+        excl_summary.n_other_excluded += subj_excl.n_other_excluded;
         for src in subj_excl.fired {
             if !excl_summary.fired_ignore.contains(&src)
                 && !excl_summary.fired_accept.contains(&src)
@@ -575,6 +584,7 @@ fn parse_subject(
     let mut occ_parse_failures: usize = 0;
     let mut excl_n_obs: usize = 0;
     let mut excl_n_dose: usize = 0;
+    let mut excl_n_other: usize = 0;
     let mut excl_fired: Vec<String> = Vec::new();
     let mut parse_warnings: Vec<String> = Vec::new();
     let mut addl_missing_ii_warned = false;
@@ -738,11 +748,15 @@ fn parse_subject(
                         excl_fired.push(src);
                     }
                 }
-                // Count by record type for the summary.
+                // Count by record type for the summary. The catch-all `other`
+                // bucket (EVID 2/3, missing-DV obs) ensures every excluded
+                // record is reflected in some counter.
                 if evid == 1 || evid == 4 {
                     excl_n_dose += 1;
                 } else if evid == 0 && mdv == 0 {
                     excl_n_obs += 1;
+                } else {
+                    excl_n_other += 1;
                 }
                 continue; // skip this row
             }
@@ -922,6 +936,7 @@ fn parse_subject(
         SubjectExclusion {
             n_obs_excluded: excl_n_obs,
             n_dose_excluded: excl_n_dose,
+            n_other_excluded: excl_n_other,
             fired: excl_fired,
         },
         parse_warnings,
@@ -986,6 +1001,35 @@ mod tests {
         // One dose (t=0), two observations (t=1, t=6) — the reset row is neither.
         assert_eq!(subj.doses.len(), 1);
         assert_eq!(subj.obs_times, vec![1.0, 6.0]);
+    }
+
+    #[test]
+    fn test_filter_on_undeclared_covariate_via_declared_path() {
+        // Regression: a `[data_selection]` condition on a covariate that the
+        // `[covariates]` block did NOT declare must still fire on the declared
+        // read path. Here only WT is declared; `ignore = STUDY == 2` references
+        // the undeclared STUDY column. `referenced_covariate_columns()` must
+        // pull STUDY into the read union so it lands in each subject's covariate
+        // map — otherwise the condition would silently never match.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,WT,STUDY\n\
+                   1,0,.,1,100,1,70,1\n\
+                   1,1,5.0,0,.,1,70,1\n\
+                   2,0,.,1,100,1,80,2\n\
+                   2,1,4.0,0,.,1,80,2\n";
+        let f = write_csv(csv);
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[]).unwrap();
+        let (pop, _table) =
+            read_nonmem_csv_with_covariates_filtered(f.path(), &decls, &[], None, &filter).unwrap();
+        // Subject 2 (STUDY==2) is excluded entirely; only subject 1 survives.
+        assert_eq!(pop.subjects.len(), 1, "subject 2 should be filtered out");
+        assert_eq!(pop.subjects[0].id, "1");
+        let excl = pop.exclusions.as_ref().expect("exclusions present");
+        assert_eq!(excl.excluded_subject_ids, vec!["2".to_string()]);
+        assert!(excl.fired_ignore.iter().any(|s| s.contains("STUDY == 2")));
     }
 
     #[test]

@@ -127,7 +127,7 @@ After reading the data, ferx reports what was dropped:
 
 ```
 --- Data Selection ---
-  Records read: 420  Obs excluded: 12  Doses excluded: 0
+  Records read: 420  Obs excluded: 12  Doses excluded: 0  Other excluded: 0
   Fired ignore conditions:
     * ignore: DV < 0.001
 ```
@@ -140,9 +140,20 @@ exclusions:
   n_records_total: 420
   n_obs_excluded: 12
   n_dose_excluded: 0
+  n_other_excluded: 0
   fired_ignore:
     - "ignore: DV < 0.001"
 ```
+
+`Other excluded` (`n_other_excluded`) counts excluded records that are neither a
+scored observation nor a dose — EVID 2 (other event), EVID 3 (reset), and
+missing-DV observation rows (EVID 0 with MDV 1). The three counts together
+account for every excluded record.
+
+Each fired condition is listed once. Because checks short-circuit on the first
+match (see *Evaluation order*), a record is attributed to the **first** rule
+that excludes it — so a condition that only ever matches records already removed
+by an earlier rule will not appear in the fired list.
 
 ---
 

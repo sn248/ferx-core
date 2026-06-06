@@ -453,8 +453,8 @@ pub fn print_results(result: &FitResult) {
     if let Some(excl) = &result.exclusions {
         eprintln!("\n--- Data Selection ---");
         eprintln!(
-            "  Records read: {}  Obs excluded: {}  Doses excluded: {}",
-            excl.n_records_total, excl.n_obs_excluded, excl.n_dose_excluded
+            "  Records read: {}  Obs excluded: {}  Doses excluded: {}  Other excluded: {}",
+            excl.n_records_total, excl.n_obs_excluded, excl.n_dose_excluded, excl.n_other_excluded
         );
         if !excl.excluded_subject_ids.is_empty() {
             eprintln!(
@@ -1104,6 +1104,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  n_records_total: {}", excl.n_records_total).map_err(|e| e.to_string())?;
         writeln!(f, "  n_obs_excluded: {}", excl.n_obs_excluded).map_err(|e| e.to_string())?;
         writeln!(f, "  n_dose_excluded: {}", excl.n_dose_excluded).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_other_excluded: {}", excl.n_other_excluded).map_err(|e| e.to_string())?;
         if !excl.excluded_subject_ids.is_empty() {
             writeln!(f, "  excluded_subject_ids:").map_err(|e| e.to_string())?;
             for id in &excl.excluded_subject_ids {

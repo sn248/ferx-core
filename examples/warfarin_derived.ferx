@@ -47,8 +47,8 @@
   Cmax = max(IPRED)
   Tmax = tmax(IPRED)
 
-  # Trough: minimum IPRED after the first 12 hours
-  Ctrough = min(IPRED) if TIME > 12
+  # Trough: minimum IPRED after the first 12 hours (filter is the second arg)
+  Ctrough = min(IPRED, TIME > 12)
 
 [output]
   WT

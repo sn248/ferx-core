@@ -1,0 +1,61 @@
+# Warfarin ODE model demonstrating TIME, T, TAFD, and TAD in [odes].
+#
+# TIME (alias T) is the current ODE solver time.
+# TAFD is solver time minus the first dose time.
+# TAD is solver time minus the most recent effective dose time (SS-aware).
+# All four are injected into the ODE RHS at each solver step.
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  ode(obs_cmt=2)
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - CL / V * central
+
+  # Accumulate day-1 AUC using an inline if-expression.
+  # Syntax: if (condition) then_expr else else_expr
+  d/dt(AUC_D1) = if (TIME < 24) central / V else 0.0
+
+  # Accumulate time above 0.5 mg/L within the current dosing interval.
+  # TAD resets at each dose so this gives a per-interval running total.
+  d/dt(TAM_INT) = if (central / V > 0.5 && TAD < 24) 1.0 else 0.0
+
+[scaling]
+  obs_scale = V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 300
+  covariance = true
+
+[derived]
+  KE     = CL / V
+  T_HALF = 0.6931472 / KE
+
+  Cmax   = max(IPRED)
+  Cmin   = min(IPRED, TAD < 1e-10)
+
+  # AUC from the predicted curve (does not use the ODE accumulator)
+  AUC_72 = integral(IPRED, from=0, to=72, step=0.2)
+
+[output]
+  CL V KA

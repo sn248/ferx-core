@@ -73,6 +73,8 @@ Optional fields are omitted entirely when absent (not emitted as `null`).
 | `E_OUTPUT_UNKNOWN_COLUMN` | error | A name in `[output]` is not recognised as a covariate, individual parameter, or derived expression. |
 | `W_OUTPUT_DUPLICATE` | warning | A name in `[output]` is already written to sdtab automatically (e.g. `TAFD`, `TAD`, an eta name). |
 | `W_ADDL_MISSING_II` | warning | ADDL > 0 on a dose row but II is zero or missing; additional doses were not expanded. |
+| `W_IOV_OCC_MISSING` | warning | Some rows in the IOV occasion column had missing or unparseable values; those rows were assigned occasion=0. |
+| `E_IOV_MISSING_OCC` | error | Model declares kappa (IOV) parameters but no occasion labels were found in the dataset. Set `iov_column` in `[fit_options]`. |
 
 Codes are stable; new ones may be added over time. Treat an unrecognised code
 as a generic finding of its given `severity`.

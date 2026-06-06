@@ -320,7 +320,14 @@ fn parse_subject(
                 .unwrap_or(0.0);
             let cmt = cmt_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
+                .and_then(|s| {
+                    let t = s.trim();
+                    if t == "." || t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<usize>().ok()
+                    }
+                })
                 .unwrap_or(1);
             let rate = rate_col
                 .and_then(|c| row.get(c))
@@ -332,7 +339,7 @@ fn parse_subject(
                 .unwrap_or(0.0);
             let ss = ss_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s) > 0)
+                .map(|s| parse_f64(s.trim()) >= 0.5)
                 .unwrap_or(false);
 
             doses.push(DoseEvent::new(time, amt, cmt, rate, ss, ii));

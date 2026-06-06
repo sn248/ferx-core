@@ -681,6 +681,18 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
         let iov_col = parsed.fit_options.iov_column.as_deref();
         match read_nonmem_csv(Path::new(path), None, iov_col) {
             Ok(population) => {
+                // Surface datareader warnings (ADDL missing II, IOV OCC missing)
+                // into the check report so `ferx check` sees the same findings as `fit()`.
+                for w in &population.warnings {
+                    let code = if w.starts_with("W_ADDL_MISSING_II") {
+                        "W_ADDL_MISSING_II"
+                    } else if w.starts_with("W_IOV_OCC_MISSING") {
+                        "W_IOV_OCC_MISSING"
+                    } else {
+                        "W_DATA"
+                    };
+                    diags.push(Diagnostic::warning(code, w.clone()));
+                }
                 diags.extend(check_model_data(&parsed.model, &population));
                 let init_params = parsed.model.default_params.clone();
                 diags.extend(check_model_data_warnings(
@@ -1354,12 +1366,13 @@ pub(crate) fn compute_extra_output_columns(
                     // For model-based integrals with a fine grid, use ipred at a
                     // representative cov snapshot (first obs) across a uniform grid.
                     // This is an approximation: cov is time-constant at j=0 values.
-                    // For prior derived columns, use first-observation values for
-                    // consistency with cov_0 / indiv_0.
-                    let grid_prev: HashMap<String, f64> = prev_derived_vecs
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.first().copied().unwrap_or(f64::NAN)))
-                        .collect();
+                    // For prior derived columns, use LOCF (last observation before or at t)
+                    // so time-varying columns reflect their most recent value at each grid step.
+                    let grid_cov_0 = per_obs_cov.first().copied().unwrap_or(&subject.covariates);
+                    let grid_lagtime = {
+                        let pk_0 = (model.pk_param_fn)(theta, eta_hat, grid_cov_0);
+                        pk_0.lagtime()
+                    };
                     let eval_integral_grid = |from: f64, to: f64| -> f64 {
                         let n_steps = match step {
                             IntegralStep::Fixed(s) => {
@@ -1369,7 +1382,6 @@ pub(crate) fn compute_extra_output_columns(
                             _ => 501, // Auto: 500 intervals
                         };
                         let dt = (to - from) / (n_steps - 1) as f64;
-                        let cov_0 = per_obs_cov.first().copied().unwrap_or(&subject.covariates);
                         let indiv_0 = per_obs_indiv.first().cloned().unwrap_or_default();
                         let pts: Vec<(f64, f64)> = (0..n_steps)
                             .filter_map(|k| {
@@ -1383,6 +1395,26 @@ pub(crate) fn compute_extra_output_columns(
                                         .map(|d| d.time)
                                         .fold(f64::INFINITY, f64::min);
                                     t - fd
+                                };
+                                let tad_k = {
+                                    let last_dose_eff = subject
+                                        .doses
+                                        .iter()
+                                        .filter(|d| d.time + grid_lagtime <= t + 1e-12)
+                                        .map(|d| {
+                                            if d.ss && d.ii > 0.0 {
+                                                let elapsed = t - (d.time + grid_lagtime);
+                                                t - elapsed.rem_euclid(d.ii)
+                                            } else {
+                                                d.time + grid_lagtime
+                                            }
+                                        })
+                                        .fold(f64::NEG_INFINITY, f64::max);
+                                    if last_dose_eff.is_finite() {
+                                        t - last_dose_eff
+                                    } else {
+                                        f64::NAN
+                                    }
                                 };
                                 // For grid-based, IPRED is evaluated at observation-time snapshots
                                 // by approximating with the nearest observation's IPRED.
@@ -1398,18 +1430,35 @@ pub(crate) fn compute_extra_output_columns(
                                     })
                                     .map(|(_, &ip)| ip)
                                     .unwrap_or(f64::NAN);
+                                // LOCF for prev_derived: use the value from the last observation
+                                // at or before t. Falls back to the first obs if t precedes all.
+                                let grid_prev_t: HashMap<String, f64> = prev_derived_vecs
+                                    .iter()
+                                    .map(|(name, vals)| {
+                                        let val = subject
+                                            .obs_times
+                                            .iter()
+                                            .zip(vals.iter())
+                                            .filter(|(&obs_t, _)| obs_t <= t + 1e-12)
+                                            .last()
+                                            .map(|(_, &v)| v)
+                                            .or_else(|| vals.first().copied())
+                                            .unwrap_or(f64::NAN);
+                                        (name.clone(), val)
+                                    })
+                                    .collect();
                                 let ctx = DerivedContext {
                                     theta,
                                     eta: eta_hat,
                                     indiv_params: &indiv_0,
-                                    covariates: cov_0,
+                                    covariates: grid_cov_0,
                                     ipred: nearest_ipred,
                                     pred: nearest_ipred,
                                     dv: f64::NAN, // not available on grid
                                     time: t,
                                     tafd: tafd_k,
-                                    tad: f64::NAN, // simplified
-                                    prev_derived: &grid_prev,
+                                    tad: tad_k,
+                                    prev_derived: &grid_prev_t,
                                 };
                                 if condition.as_ref().map_or(false, |f| !f(&ctx)) {
                                     return None;
@@ -3019,6 +3068,10 @@ fn extract_standard_errors(
 }
 
 /// Simulate observations from a model with given parameters (random seed).
+///
+/// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
+/// callers that obtained `population` via [`read_nonmem_csv`] should inspect
+/// `population.warnings` before calling this function.
 pub fn simulate(
     model: &CompiledModel,
     population: &Population,
@@ -3188,6 +3241,10 @@ pub struct SimulationResult {
 }
 
 /// Predict concentrations for a population using given parameters (no random effects).
+///
+/// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
+/// callers that obtained `population` via [`read_nonmem_csv`] should inspect
+/// `population.warnings` before calling this function.
 pub fn predict(
     model: &CompiledModel,
     population: &Population,

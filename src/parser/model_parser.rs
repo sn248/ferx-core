@@ -1884,9 +1884,23 @@ fn parse_integral_kind(
         match k.to_lowercase().as_str() {
             "from" => from_val = Some(v),
             "to" => to_val = Some(v),
-            "window" => window_val = Some(v),
+            "window" => {
+                if v <= 0.0 {
+                    return Err(format!(
+                        "[derived] integral(): `window=` must be positive, got {v}"
+                    ));
+                }
+                window_val = Some(v);
+            }
             "anchor" => anchor_val = v,
-            "step" => step_val = Some(v),
+            "step" => {
+                if v <= 0.0 {
+                    return Err(format!(
+                        "[derived] integral(): `step=` must be positive, got {v}"
+                    ));
+                }
+                step_val = Some(v);
+            }
             other => {
                 return Err(format!(
                     "[derived] integral(): unknown keyword argument `{other}`"

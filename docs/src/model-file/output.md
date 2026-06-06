@@ -21,7 +21,7 @@ The optional `[output]` block lists additional columns to include in the sdtab b
 
 The following columns are always written to sdtab regardless of `[output]`:
 
-`ID`, `TIME`, `DV`, `IPRED`, `CWRES`, `IWRES`, `TAFD`, `TAD`
+`ID`, `TIME`, `DV`, `CENS`, `OCC`, `CMT`, `PRED`, `IPRED`, `CWRES`, `IWRES`, `EBE_OFV`, `N_OBS`, `TAFD`, `TAD`
 
 Listing any of these in `[output]` is harmless but will emit `W_OUTPUT_DUPLICATE`.
 

@@ -4,8 +4,9 @@
 //! that require a full fit to convergence are gated with `#[cfg_attr(..., ignore)]`.
 
 use ferx_core::api::{check_model_data, tafd_tad_for_subject};
-use ferx_core::parser::model_parser::parse_full_model;
+use ferx_core::parser::model_parser::{parse_full_model, parse_model_string};
 use ferx_core::types::{DoseEvent, Population, Subject};
+use ferx_core::{fit, FitOptions};
 use std::collections::HashMap;
 
 // ── Minimal model template ───────────────────────────────────────────────────
@@ -244,4 +245,98 @@ fn tad_after_addl_expanded_doses() {
     let subj = make_subject_with_doses(vec![50.0], doses);
     let (_, tad) = tafd_tad_for_subject(&subj, 0, 0.0);
     assert!((tad - 2.0).abs() < 1e-10, "TAD should be 2, got {tad}");
+}
+
+// ── End-to-end: fit() produces finite extra_columns ──────────────────────────
+
+/// End-to-end coverage: after a short FOCE-I fit, extra_columns from [derived]
+/// and [output] must be populated with finite, non-NaN values for every subject.
+/// Exercises the full post-fit derived pipeline including PerRow, Aggregate, and
+/// the output-column echo.
+#[test]
+fn fit_produces_finite_derived_and_output_columns() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(1.0, 0.01, 50.0)
+  theta V(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V  = V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+  Cmax = max(IPRED)
+  AUC  = integral(IPRED, from=0, to=24)
+
+[output]
+  CLi
+
+[fit_options]
+  method   = focei
+  maxiter  = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    let pop = one_dose_population();
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("short fit must not error");
+
+    // Every subject result must have extra_columns for Cmax, AUC, and CLi.
+    for sr in &result.subjects {
+        for name in &["Cmax", "AUC", "CLi"] {
+            let col = sr
+                .extra_columns
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("extra column '{name}' missing for subject {}", sr.id));
+            assert!(
+                !col.1.is_empty(),
+                "column '{name}' is empty for subject {}",
+                sr.id
+            );
+            for &v in &col.1 {
+                assert!(
+                    v.is_finite(),
+                    "column '{name}' has non-finite value {v} for subject {}",
+                    sr.id
+                );
+            }
+        }
+    }
+}
+
+/// Parser must reject step=0 and step negative in [derived] integral().
+#[test]
+fn integral_step_zero_is_rejected_at_parse() {
+    let src = base_with_extra("[derived]\n  AUC = integral(IPRED, from=0, to=24, step=0)");
+    let err = parse_full_model(&src)
+        .err()
+        .expect("step=0 must be rejected at parse time");
+    assert!(
+        err.contains("step") && err.contains("positive"),
+        "error should cite step= and positive, got: {err}"
+    );
+}
+
+/// Parser must reject window=0 in [derived] integral().
+#[test]
+fn integral_window_zero_is_rejected_at_parse() {
+    let src = base_with_extra("[derived]\n  AUC = integral(IPRED, window=0)");
+    let err = parse_full_model(&src)
+        .err()
+        .expect("window=0 must be rejected at parse time");
+    assert!(
+        err.contains("window") && err.contains("positive"),
+        "error should cite window= and positive, got: {err}"
+    )
 }

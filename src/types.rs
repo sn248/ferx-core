@@ -1590,6 +1590,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, "importance_sampling")
     } else if lower.contains("eps shrinkage") {
         (WarningSeverity::Warning, "eps_shrinkage")
+    } else if lower.starts_with("w_addl_missing_ii") || lower.contains("addl > 0 but ii") {
+        (WarningSeverity::Warning, "data_quality")
+    } else if lower.starts_with("w_iov_occ_missing")
+        || lower.contains("missing or unparseable values in iov_column")
+    {
+        (WarningSeverity::Warning, "data_quality")
     } else if lower.contains("ltbs")
         || lower.contains("non-positive dv")
         || lower.contains("ss=1 dose")

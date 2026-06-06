@@ -1076,7 +1076,7 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
 
 /// Compute TAFD (time after first dose) and TAD (time after last dose,
 /// SS-aware) for observation index `obs_idx` of `subject`.
-pub(crate) fn tafd_tad_for_subject(subject: &Subject, obs_idx: usize, lagtime: f64) -> (f64, f64) {
+pub fn tafd_tad_for_subject(subject: &Subject, obs_idx: usize, lagtime: f64) -> (f64, f64) {
     let obs_time = subject.obs_times[obs_idx];
 
     let first_dose_time = subject

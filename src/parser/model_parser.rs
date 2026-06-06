@@ -13874,4 +13874,392 @@ method = foce
             parsed.model.parse_warnings
         );
     }
+
+    // ── [derived] block parser unit tests ────────────────────────────────────
+
+    fn minimal_model_with_derived(derived_block: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta CL(1.0, 0, 100)
+  theta V(10.0, 0, 1000)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = exp(log(CL) + ETA_CL)
+  V  = exp(log(V)  + ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+{derived_block}
+"#
+        )
+    }
+
+    fn make_derived_ctx_simple() -> (
+        Vec<f64>,
+        Vec<f64>,
+        std::collections::HashMap<String, f64>,
+        std::collections::HashMap<String, f64>,
+        std::collections::HashMap<String, f64>,
+    ) {
+        let theta = vec![1.0, 10.0];
+        let eta = vec![0.0, 0.0];
+        let mut indiv_params = std::collections::HashMap::new();
+        indiv_params.insert("CL".to_string(), 1.0);
+        indiv_params.insert("V".to_string(), 10.0);
+        let covariates = std::collections::HashMap::new();
+        let prev_derived = std::collections::HashMap::new();
+        (theta, eta, indiv_params, covariates, prev_derived)
+    }
+
+    #[test]
+    fn parse_derived_per_row() {
+        let src = minimal_model_with_derived("KE = CL / V");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert_eq!(parsed.model.derived_exprs.len(), 1);
+        assert_eq!(parsed.model.derived_exprs[0].name, "KE");
+        assert!(matches!(
+            parsed.model.derived_exprs[0].kind,
+            DerivedKind::PerRow { .. }
+        ));
+
+        // Evaluate the closure
+        let (theta, eta, indiv_params, covariates, prev_derived) = make_derived_ctx_simple();
+        if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+            let ctx = DerivedContext {
+                theta: &theta,
+                eta: &eta,
+                indiv_params: &indiv_params,
+                covariates: &covariates,
+                ipred: 0.0,
+                pred: 0.0,
+                dv: 0.0,
+                time: 1.0,
+                tafd: 1.0,
+                tad: 1.0,
+                prev_derived: &prev_derived,
+            };
+            let ke = eval(&ctx);
+            assert!((ke - 0.1).abs() < 1e-10, "KE = CL/V = 1/10 = 0.1, got {ke}");
+        } else {
+            panic!("expected PerRow");
+        }
+    }
+
+    #[test]
+    fn parse_derived_sequential_reference() {
+        let src = minimal_model_with_derived("KE = CL / V\nT_HALF = 0.693 / KE");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert_eq!(parsed.model.derived_exprs.len(), 2);
+
+        let (theta, eta, indiv_params, covariates, _) = make_derived_ctx_simple();
+        let mut prev_derived = std::collections::HashMap::new();
+
+        // Evaluate KE first
+        if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+            let ctx = DerivedContext {
+                theta: &theta,
+                eta: &eta,
+                indiv_params: &indiv_params,
+                covariates: &covariates,
+                ipred: 0.0,
+                pred: 0.0,
+                dv: 0.0,
+                time: 1.0,
+                tafd: 1.0,
+                tad: 1.0,
+                prev_derived: &prev_derived,
+            };
+            let ke = eval(&ctx);
+            prev_derived.insert("KE".to_string(), ke);
+        }
+
+        // Now evaluate T_HALF using prev_derived
+        if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[1].kind {
+            let ctx = DerivedContext {
+                theta: &theta,
+                eta: &eta,
+                indiv_params: &indiv_params,
+                covariates: &covariates,
+                ipred: 0.0,
+                pred: 0.0,
+                dv: 0.0,
+                time: 1.0,
+                tafd: 1.0,
+                tad: 1.0,
+                prev_derived: &prev_derived,
+            };
+            let t_half = eval(&ctx);
+            let expected = 0.693 / 0.1;
+            assert!(
+                (t_half - expected).abs() < 1e-8,
+                "T_HALF = 0.693/KE = {expected}, got {t_half}"
+            );
+        } else {
+            panic!("expected PerRow for T_HALF");
+        }
+    }
+
+    #[test]
+    fn parse_derived_max_with_filter() {
+        let src = minimal_model_with_derived("CMAX = max(IPRED, TIME < 24)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(matches!(
+            parsed.model.derived_exprs[0].kind,
+            DerivedKind::Aggregate {
+                func: AggFunction::Max,
+                filter: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_derived_min_no_filter() {
+        let src = minimal_model_with_derived("CMIN = min(IPRED)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(matches!(
+            parsed.model.derived_exprs[0].kind,
+            DerivedKind::Aggregate {
+                func: AggFunction::Min,
+                filter: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_derived_tmax() {
+        let src = minimal_model_with_derived("TMAX = tmax(IPRED)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(matches!(
+            parsed.model.derived_exprs[0].kind,
+            DerivedKind::Aggregate {
+                func: AggFunction::Tmax,
+                filter: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_derived_integral_explicit() {
+        let src = minimal_model_with_derived("AUC = integral(IPRED, from=0, to=24)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        if let DerivedKind::Integral {
+            data_based,
+            window: IntegralWindow::Explicit { from, to },
+            step: IntegralStep::Auto,
+            ..
+        } = &parsed.model.derived_exprs[0].kind
+        {
+            assert!(!data_based, "IPRED is not DV-based");
+            assert!((from - 0.0).abs() < 1e-10);
+            assert!((to - 24.0).abs() < 1e-10);
+        } else {
+            panic!(
+                "expected Integral(Explicit, Auto), got {:?} kind",
+                parsed.model.derived_exprs[0].name
+            );
+        }
+    }
+
+    #[test]
+    fn parse_derived_integral_dv() {
+        let src = minimal_model_with_derived("AUC_DV = integral(DV, from=0, to=24)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        if let DerivedKind::Integral {
+            data_based,
+            step: IntegralStep::ObsTimes,
+            ..
+        } = &parsed.model.derived_exprs[0].kind
+        {
+            assert!(*data_based, "DV is data_based");
+        } else {
+            panic!("expected Integral with ObsTimes step for DV integrand");
+        }
+    }
+
+    #[test]
+    fn parse_derived_integral_periodic() {
+        let src = minimal_model_with_derived("AUC_TAU = integral(IPRED, window=24, anchor=0)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        if let DerivedKind::Integral {
+            window: IntegralWindow::Periodic { period, anchor },
+            ..
+        } = &parsed.model.derived_exprs[0].kind
+        {
+            assert!((period - 24.0).abs() < 1e-10);
+            assert!((anchor - 0.0).abs() < 1e-10);
+        } else {
+            panic!("expected Integral(Periodic)");
+        }
+    }
+
+    #[test]
+    fn parse_derived_name_conflict_error() {
+        // IPRED is a built-in sdtab column — should error
+        let src = minimal_model_with_derived("IPRED = CL / V");
+        let result = parse_full_model(&src);
+        assert!(
+            result.is_err(),
+            "expected parse error for IPRED name conflict"
+        );
+        let msg = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err"),
+        };
+        assert!(
+            msg.contains("E_DERIVED_NAME_CONFLICT"),
+            "expected E_DERIVED_NAME_CONFLICT in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_output_block() {
+        let src = format!(
+            r#"{}
+[output]
+CL V KA WT
+"#,
+            minimal_model_with_derived("")
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert_eq!(
+            parsed.model.output_columns,
+            vec!["CL", "V", "KA", "WT"],
+            "output_columns mismatch"
+        );
+    }
+
+    #[test]
+    fn parse_output_empty_block_ok() {
+        let src = format!(
+            r#"{}
+[output]
+"#,
+            minimal_model_with_derived("")
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(
+            parsed.model.output_columns.is_empty(),
+            "empty [output] block should produce empty output_columns"
+        );
+    }
+
+    #[test]
+    fn sci_notation_negative_exp() {
+        let src = minimal_model_with_derived("FLAG = if (TAD < 1e-10) 1 else 0");
+        let parsed = parse_full_model(&src).expect("parse ok — 1e-10 must tokenise correctly");
+        assert_eq!(parsed.model.derived_exprs.len(), 1);
+    }
+
+    #[test]
+    fn sci_notation_positive_exp() {
+        let src = minimal_model_with_derived("FLAG = if (TAFD > 1.5E+3) 1 else 0");
+        let parsed = parse_full_model(&src).expect("parse ok — 1.5E+3 must tokenise correctly");
+        assert_eq!(parsed.model.derived_exprs.len(), 1);
+    }
+
+    #[test]
+    fn mod_operator_euclidean() {
+        // 5 mod 2 == 1, 7 mod 3 == 1, -1 mod 24 == 23
+        let tests = [("5 mod 2", 1.0), ("7 mod 3", 1.0), ("-1 mod 24", 23.0)];
+        for (expr_str, expected) in &tests {
+            let expr_src = format!("VAL = {expr_str}");
+            let src = minimal_model_with_derived(&expr_src);
+            let parsed = parse_full_model(&src).expect("parse ok");
+            let (theta, eta, indiv, cov, prev) = make_derived_ctx_simple();
+            if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+                let ctx = DerivedContext {
+                    theta: &theta,
+                    eta: &eta,
+                    indiv_params: &indiv,
+                    covariates: &cov,
+                    ipred: 0.0,
+                    pred: 0.0,
+                    dv: 0.0,
+                    time: 0.0,
+                    tafd: 0.0,
+                    tad: 0.0,
+                    prev_derived: &prev,
+                };
+                let result = eval(&ctx);
+                assert!(
+                    (result - expected).abs() < 1e-10,
+                    "{expr_str}: expected {expected}, got {result}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn floor_ceil_round_functions() {
+        let tests = [
+            ("floor(-2.3)", -3.0),
+            ("ceil(-2.3)", -2.0),
+            ("round(2.5)", 3.0),
+        ];
+        for (expr_str, expected) in &tests {
+            let src = minimal_model_with_derived(&format!("VAL = {expr_str}"));
+            let parsed = parse_full_model(&src).expect("parse ok");
+            let (theta, eta, indiv, cov, prev) = make_derived_ctx_simple();
+            if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+                let ctx = DerivedContext {
+                    theta: &theta,
+                    eta: &eta,
+                    indiv_params: &indiv,
+                    covariates: &cov,
+                    ipred: 0.0,
+                    pred: 0.0,
+                    dv: 0.0,
+                    time: 0.0,
+                    tafd: 0.0,
+                    tad: 0.0,
+                    prev_derived: &prev,
+                };
+                let result = eval(&ctx);
+                assert!(
+                    (result - expected).abs() < 1e-10,
+                    "{expr_str}: expected {expected}, got {result}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn macheps_available_in_derived() {
+        let src = minimal_model_with_derived("FLAG = if (TAD < MACHEPS) 1 else 0");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let (theta, eta, indiv, cov, _prev) = make_derived_ctx_simple();
+        let prev = std::collections::HashMap::new();
+        if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+            // TAD = 0.0 < MACHEPS → flag = 1
+            let ctx = DerivedContext {
+                theta: &theta,
+                eta: &eta,
+                indiv_params: &indiv,
+                covariates: &cov,
+                ipred: 0.0,
+                pred: 0.0,
+                dv: 0.0,
+                time: 1.0,
+                tafd: 1.0,
+                tad: 0.0, // zero
+                prev_derived: &prev,
+            };
+            assert_eq!(eval(&ctx), 1.0, "TAD=0 should be < MACHEPS");
+            // TAD = 1.0 >> MACHEPS → flag = 0
+            let ctx2 = DerivedContext { tad: 1.0, ..ctx };
+            assert_eq!(eval(&ctx2), 0.0, "TAD=1 should not be < MACHEPS");
+        }
+    }
 }

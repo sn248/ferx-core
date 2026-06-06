@@ -163,8 +163,16 @@ by an earlier rule will not appear in the fired list.
   instead — each line is already an independent "any of these reasons"
   condition.
 - `AND` / `OR` keywords are not supported; use `&&` within a line.
-- String comparisons are limited to `==` and `!=`; `<`, `<=`, `>`, `>=` on
-  string values have no effect.
+- String comparisons are limited to `==` and `!=`. Ordered comparisons
+  (`<`, `<=`, `>`, `>=`) on `ID` are rejected at parse time, since `ID` is a
+  string label — use `==`/`!=` or `ignore_subjects`.
+- `ADDL` and the occasion / IOV column are **not** filter targets; a condition
+  referencing them is an inert no-op. Filter on the columns in the table above
+  (or expand `ADDL` rows beforehand if you must select on dose number).
+- Covariate values seen by a condition reflect the subject's full record
+  history (last-observation-carried-forward across all rows), independent of
+  which records the filter removes. This matters only when filtering on a
+  time-varying covariate whose value differs on the rows being excluded.
 - A column name that is not present in the dataset always evaluates to false
   (never fires), so a typo silently has no effect — check the exclusion summary
   if a condition is not being applied. (Covariate columns referenced by a

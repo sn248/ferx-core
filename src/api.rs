@@ -360,8 +360,17 @@ fn build_selection_filter_merged(
         }
     }
     for s in &call_opts.ignore_subjects {
-        let t = s.trim().to_string();
-        if !subjects.iter().any(|e| e == &t) {
+        // Strip surrounding quotes so a caller-supplied `"3"` matches the same
+        // subject as a `.ferx` `ignore_subjects = 3` (the model-file parser
+        // already quote-strips). Without this the two sources disagree and a
+        // duplicate across them fails to dedup.
+        let t = s
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim()
+            .to_string();
+        if !t.is_empty() && !subjects.iter().any(|e| e == &t) {
             subjects.push(t);
         }
     }
@@ -960,6 +969,13 @@ fn perturb_init(
 /// pool of `n` workers, so this setting is per-call (different fits in the
 /// same process can use different thread counts). When `None`, rayon's
 /// global pool is used (one worker per logical CPU).
+///
+/// `[data_selection]` filtering (`options.ignore_exprs` / `accept_exprs` /
+/// `ignore_subjects`) is **not** applied here: it happens at CSV read time in
+/// the file-based entry points (`run_model_with_data`, `fit_from_files`). This
+/// function expects an already-filtered `Population` and simply echoes its
+/// `exclusions` summary onto the result. Callers building a `Population` in
+/// memory should filter their records beforehand.
 pub fn fit(
     model: &CompiledModel,
     population: &Population,

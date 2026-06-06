@@ -45,10 +45,22 @@ impl FilterExpr {
                         s.trim()
                     ));
                 }
-                // String RHS: `"A"` or `'A'`.
-                let rhs = if (rhs_raw.starts_with('"') && rhs_raw.ends_with('"'))
-                    || (rhs_raw.starts_with('\'') && rhs_raw.ends_with('\''))
-                {
+                // ID is a string label; ordered comparisons on it are not
+                // meaningful and would otherwise silently evaluate to false.
+                // Reject them up front with a clear message.
+                if col == "id" && !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                    return Err(format!(
+                        "filter expression '{}': ordered comparisons (<, <=, >, >=) are not \
+                         supported on ID (a string label); use == / != or ignore_subjects.",
+                        s.trim()
+                    ));
+                }
+                // String RHS: `"A"` or `'A'`. Require length >= 2 so a lone quote
+                // (`\"` / `'`) does not underflow the `[1..len-1]` slice below.
+                let is_quoted = rhs_raw.len() >= 2
+                    && ((rhs_raw.starts_with('"') && rhs_raw.ends_with('"'))
+                        || (rhs_raw.starts_with('\'') && rhs_raw.ends_with('\'')));
+                let rhs = if is_quoted {
                     FilterValue::Str(rhs_raw[1..rhs_raw.len() - 1].to_string())
                 } else if col == "id" {
                     // ID is a string label, so it is always compared as a string —
@@ -92,11 +104,13 @@ impl FilterExpr {
                     "cens" => ctx.cens as f64,
                     "ii" => ctx.ii,
                     "ss" => ctx.ss as u8 as f64,
-                    // Case-insensitive lookup so `BW >= 30` matches a "BW" or "bw" column.
+                    // Case-insensitive lookup so `BW >= 30` matches a "BW" or "bw"
+                    // column. `col` is already lowercased; `eq_ignore_ascii_case`
+                    // avoids allocating a lowercased key per row in the read loop.
                     _ => match ctx
                         .covariates
                         .iter()
-                        .find(|(k, _)| k.to_lowercase() == col)
+                        .find(|(k, _)| k.eq_ignore_ascii_case(col))
                         .map(|(_, &v)| v)
                     {
                         Some(v) => v,
@@ -123,9 +137,15 @@ impl FilterExpr {
 }
 
 fn cmp_f64(lhs: f64, rhs: f64, op: CmpOp) -> bool {
+    // Exact comparison. LHS (a CSV cell) and RHS (an expression literal) are both
+    // parsed from decimal text, so `STUDY == 2` / `WT == 70.5` match exactly; an
+    // absolute EPSILON band would instead wrongly equate small nonzero values to
+    // zero and adjacent large integers to each other. A missing value arrives as
+    // NaN and must never match: `==`/`<`/`<=`/`>`/`>=` against NaN are already
+    // false, and `!=` is guarded so NaN does not spuriously satisfy it.
     match op {
-        CmpOp::Eq => (lhs - rhs).abs() < f64::EPSILON,
-        CmpOp::Ne => (lhs - rhs).abs() >= f64::EPSILON,
+        CmpOp::Eq => lhs == rhs,
+        CmpOp::Ne => !lhs.is_nan() && lhs != rhs,
         CmpOp::Lt => lhs < rhs,
         CmpOp::Le => lhs <= rhs,
         CmpOp::Gt => lhs > rhs,
@@ -160,9 +180,11 @@ impl FilterClause {
     /// - `AND` / `OR` keyword forms — parse error: use `&&` / multiple strings.
     pub fn parse(raw: &str) -> Result<Self, String> {
         // Strip surrounding quotes (R passes "DV < 0.001" with quotes intact).
+        // Require length >= 2 so a lone quote does not underflow the slice.
         let s = raw.trim();
-        let s = if (s.starts_with('"') && s.ends_with('"'))
-            || (s.starts_with('\'') && s.ends_with('\''))
+        let s = if s.len() >= 2
+            && ((s.starts_with('"') && s.ends_with('"'))
+                || (s.starts_with('\'') && s.ends_with('\'')))
         {
             &s[1..s.len() - 1]
         } else {
@@ -221,12 +243,27 @@ impl FilterClause {
     }
 }
 
-/// True for the fixed NONMEM columns handled directly in [`RowContext`]
-/// (case-insensitive; `col` is expected already lowercased).
+/// True for the fixed NONMEM columns the reader handles specially, so they are
+/// not mistaken for covariates by `covariate_columns()` (case-insensitive; `col`
+/// is expected already lowercased). `addl` is included — it is a reader-standard
+/// column, not a covariate, even though it has no [`RowContext`] field and so is
+/// not a usable filter target (a condition on it is an inert no-op). The dynamic
+/// occasion / IOV column cannot be listed here; filtering on it is likewise
+/// unsupported (see `docs/src/model-file/data-selection.md`).
 pub fn is_standard_column(col: &str) -> bool {
     matches!(
         col,
-        "id" | "time" | "dv" | "evid" | "amt" | "cmt" | "rate" | "mdv" | "cens" | "ii" | "ss"
+        "id" | "time"
+            | "dv"
+            | "evid"
+            | "amt"
+            | "cmt"
+            | "rate"
+            | "mdv"
+            | "cens"
+            | "ii"
+            | "ss"
+            | "addl"
     )
 }
 
@@ -243,7 +280,9 @@ pub struct RowContext<'a> {
     pub cens: u8,
     pub ii: f64,
     pub ss: bool,
-    /// Covariate values for this row (case-folded keys).
+    /// Covariate values for this row, keyed by the original CSV header name
+    /// (NOT case-folded). `FilterExpr::eval` matches case-insensitively via
+    /// `eq_ignore_ascii_case`, so callers must not assume lowercased keys.
     pub covariates: &'a HashMap<String, f64>,
 }
 
@@ -419,5 +458,37 @@ mod tests {
     #[test]
     fn test_empty_column_rejected() {
         assert!(FilterClause::parse("== 1").is_err());
+    }
+
+    #[test]
+    fn test_lone_quote_does_not_panic() {
+        // A lone quote char must return Err (no comparison operator), not panic
+        // on a `[1..len-1]` slice underflow.
+        assert!(FilterClause::parse("\"").is_err());
+        assert!(FilterClause::parse("'").is_err());
+        // A lone quote as the RHS must not panic either (parses as a 1-char
+        // string label for ID; the point is simply that it does not crash).
+        let _ = FilterClause::parse("ID == \"");
+    }
+
+    #[test]
+    fn test_id_ordered_comparison_rejected() {
+        // Ordered comparisons on ID are a parse error (not a silent no-op).
+        assert!(FilterClause::parse("ID >= 3").is_err());
+        assert!(FilterClause::parse("ID < 10").is_err());
+        assert!(FilterClause::parse("ID > 0").is_err());
+        assert!(FilterClause::parse("ID <= 5").is_err());
+        // == / != still allowed.
+        assert!(FilterClause::parse("ID == 3").is_ok());
+        assert!(FilterClause::parse("ID != 3").is_ok());
+    }
+
+    #[test]
+    fn test_exact_equality_small_and_large() {
+        // Near-zero nonzero value must NOT equal 0 (no EPSILON band).
+        assert!(!eval("DV == 0", "1", 1e-20, 0, 70.0));
+        assert!(eval("DV != 0", "1", 1e-20, 0, 70.0));
+        // Exact integer-coded match still works.
+        assert!(eval("DV == 5", "1", 5.0, 0, 70.0));
     }
 }

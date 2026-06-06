@@ -179,7 +179,24 @@ pub fn read_nonmem_csv_filtered(
     iov_column: Option<&str>,
     filter: &SelectionFilter,
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(path, covariate_columns, iov_column, None, Some(filter))
+    // When an explicit covariate list is supplied, make sure every covariate the
+    // filter references is in it — otherwise a filtered column outside the list
+    // would not be read and the condition would silently never fire. (With
+    // `None`, the auto-detect path already reads every non-standard column, so no
+    // augmentation is needed.) Symmetric with the `[covariates]` reader.
+    let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
+        let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
+        for c in filter.referenced_covariate_columns() {
+            if !v.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
+                v.push(c);
+            }
+        }
+        v
+    });
+    let cols_ref: Option<Vec<&str>> = augmented
+        .as_ref()
+        .map(|v| v.iter().map(|s| s.as_str()).collect());
+    read_nonmem_csv_impl(path, cols_ref.as_deref(), iov_column, None, Some(filter))
         .map(|(pop, _)| pop)
 }
 
@@ -451,8 +468,17 @@ fn read_nonmem_csv_impl(
             ));
         }
 
-        if subject.doses.is_empty() && subject.observations.is_empty() {
-            // Subject entirely excluded — do not add to subjects list.
+        // Only drop a subject as "excluded by data selection" when the filter
+        // actually removed at least one of its records and that left it empty.
+        // Without this guard we would also drop subjects that are empty for
+        // unrelated reasons (e.g. only EVID=2/3 rows) on the no-filter path,
+        // which is a behavior change vs. the pre-feature reader (it pushed every
+        // subject unconditionally). `had_exclusions` is only ever > 0 when a
+        // filter is active.
+        let had_exclusions =
+            subj_excl.n_obs_excluded + subj_excl.n_dose_excluded + subj_excl.n_other_excluded > 0;
+        if had_exclusions && subject.doses.is_empty() && subject.observations.is_empty() {
+            // Subject entirely excluded by the filter — do not add to the list.
             excl_summary.excluded_subject_ids.push(id.clone());
             continue;
         }
@@ -1030,6 +1056,28 @@ mod tests {
         let excl = pop.exclusions.as_ref().expect("exclusions present");
         assert_eq!(excl.excluded_subject_ids, vec!["2".to_string()]);
         assert!(excl.fired_ignore.iter().any(|s| s.contains("STUDY == 2")));
+    }
+
+    #[test]
+    fn test_no_filter_keeps_subject_with_only_other_events() {
+        // Regression: without a [data_selection] filter, a subject made up solely
+        // of EVID=2 (other-event) rows has empty doses+observations but must
+        // still be retained — matching the pre-feature reader, which pushed every
+        // subject unconditionally. The empty-subject skip must be gated on the
+        // filter actually having excluded records.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT\n\
+                   1,0,.,1,100,1\n\
+                   1,1,5.0,0,.,1\n\
+                   2,0,.,2,.,1\n\
+                   2,1,.,2,.,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let ids: Vec<&str> = pop.subjects.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            ids.contains(&"2"),
+            "subject with only EVID=2 rows must be retained when no filter is active; got {ids:?}"
+        );
+        assert!(pop.exclusions.is_none(), "no filter → no exclusion summary");
     }
 
     #[test]

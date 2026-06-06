@@ -279,6 +279,10 @@ pub struct Population {
     pub subjects: Vec<Subject>,
     pub covariate_names: Vec<String>,
     pub dv_column: String,
+    /// All column headers from the data CSV in original order (ID, TIME, DV, AMT, ...,
+    /// covariates). Preserved verbatim so downstream consumers can echo a NONMEM-style
+    /// `$INPUT` line. Empty for in-memory `Population` values that were not read from a file.
+    pub input_columns: Vec<String>,
 }
 
 impl Population {
@@ -1789,6 +1793,9 @@ pub struct FitResult {
     /// requiring the caller to re-read the CSV.  Empty for in-memory `fit()`
     /// calls that never touch a file.
     pub covariate_names: Vec<String>,
+    /// All column headers from the data CSV in original order (ID, TIME, DV, AMT, ...,
+    /// covariates), analogous to NONMEM `$INPUT`. Empty for in-memory `fit()` calls.
+    pub input_columns: Vec<String>,
     /// One entry per `[covariate_nn NAME]` block in the model, populated by
     /// `fit()` from `CompiledModel.covariate_nns`. Empty when the `nn`
     /// feature is off or no block is declared. Output writers

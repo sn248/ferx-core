@@ -113,6 +113,7 @@ fn simulate_subjects(
         subjects: subjects.clone(),
         covariate_names: vec![],
         dv_column: "dv".into(),
+        input_columns: vec![],
     };
 
     let sim = simulate_with_seed(model, &pop, params, 1, seed);
@@ -505,6 +506,7 @@ fn generate_two_cpt_oral_cov() {
         subjects,
         covariate_names: vec!["wt".into(), "crcl".into()],
         dv_column: "dv".into(),
+        input_columns: vec![],
     };
     let sim = simulate_with_seed(&model, &pop, &params, 1, 456);
 

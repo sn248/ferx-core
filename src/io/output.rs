@@ -1104,6 +1104,7 @@ mod tests {
             outer_gtol: 0.0,
             inits_from_nca: None,
             covariate_names: Vec::new(),
+            input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }
@@ -1423,6 +1424,7 @@ mod tests {
             outer_gtol: 0.0,
             inits_from_nca: None,
             covariate_names: Vec::new(),
+            input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }
@@ -1446,6 +1448,7 @@ mod tests {
             ],
             covariate_names: vec![],
             dv_column: "DV".into(),
+            input_columns: vec![],
         };
 
         let cols = sdtab(&result, &population);
@@ -1472,6 +1475,7 @@ mod tests {
             subjects: vec![sdtab_subject("1", 2, vec![1, 2])],
             covariate_names: vec![],
             dv_column: "DV".into(),
+            input_columns: vec![],
         };
 
         let cols = sdtab(&result, &population);
@@ -1491,6 +1495,7 @@ mod tests {
             subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
             covariate_names: vec![],
             dv_column: "DV".into(),
+            input_columns: vec![],
         };
 
         let cols = sdtab(&result, &population);
@@ -1520,6 +1525,7 @@ mod tests {
             ],
             covariate_names: vec![],
             dv_column: "DV".into(),
+            input_columns: vec![],
         };
 
         let cols = sdtab(&result, &population);

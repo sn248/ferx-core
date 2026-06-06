@@ -1136,17 +1136,23 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
     let cov_names = &population.covariate_names;
 
     for col in &model.output_columns {
-        // Already in mandatory minimum?
-        if OUTPUT_MANDATORY.iter().any(|m| m.eq_ignore_ascii_case(col))
-            || model.eta_names.iter().any(|e| e.eq_ignore_ascii_case(col))
-        {
-            diags.push(Diagnostic::warning(
-                "W_OUTPUT_DUPLICATE",
+        // Already in mandatory minimum, or an ETA (reported via ebe_etas, not sdtab)?
+        let is_eta = model.eta_names.iter().any(|e| e.eq_ignore_ascii_case(col));
+        if OUTPUT_MANDATORY.iter().any(|m| m.eq_ignore_ascii_case(col)) || is_eta {
+            let msg = if is_eta {
+                // sdtab is per-observation only; per-subject EBEs live in
+                // `ebe_etas` on the R side, so an ETA can't be an sdtab column.
+                format!(
+                    "[output] column `{col}` is an ETA estimate, reported via `ebe_etas` \
+                     rather than as an sdtab column; the declaration is ignored"
+                )
+            } else {
                 format!(
                     "[output] column `{col}` is already written to sdtab automatically; \
                      the declaration is ignored"
-                ),
-            ));
+                )
+            };
+            diags.push(Diagnostic::warning("W_OUTPUT_DUPLICATE", msg));
             continue;
         }
         // Valid if it's a covariate, indiv param, or derived name

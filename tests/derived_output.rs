@@ -277,7 +277,7 @@ fn fit_produces_finite_derived_and_output_columns() {
   AUC  = integral(IPRED, from=0, to=24)
 
 [output]
-  CLi
+  CL
 
 [fit_options]
   method   = focei
@@ -291,9 +291,9 @@ fn fit_produces_finite_derived_and_output_columns() {
     opts.verbose = false;
     let result = fit(&model, &pop, &model.default_params, &opts).expect("short fit must not error");
 
-    // Every subject result must have extra_columns for Cmax, AUC, and CLi.
+    // Every subject result must have extra_columns for Cmax, AUC, and CL.
     for sr in &result.subjects {
-        for name in &["Cmax", "AUC", "CLi"] {
+        for name in &["Cmax", "AUC", "CL"] {
             let col = sr
                 .extra_columns
                 .iter()
@@ -311,6 +311,67 @@ fn fit_produces_finite_derived_and_output_columns() {
                     sr.id
                 );
             }
+        }
+    }
+}
+
+/// Regression: an [output] covariate referenced with a different case than the
+/// dataset header must echo the covariate value, not NaN. `validate_output_columns`
+/// accepts the name case-insensitively (`wt` matches header `WT`), so the post-fit
+/// echo in `compute_extra_output_columns` must resolve it case-insensitively too.
+#[test]
+fn output_covariate_case_insensitive_echo() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(1.0, 0.01, 50.0)
+  theta V(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V  = V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[output]
+  wt
+
+[fit_options]
+  method   = focei
+  maxiter  = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    // Population covariate header is uppercase `WT` = 70.0; the [output] entry
+    // is lowercase `wt`.
+    let pop = one_dose_population();
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("short fit must not error");
+
+    for sr in &result.subjects {
+        let col = sr
+            .extra_columns
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("wt"))
+            .unwrap_or_else(|| panic!("output column 'wt' missing for subject {}", sr.id));
+        assert!(
+            !col.1.is_empty(),
+            "column 'wt' is empty for subject {}",
+            sr.id
+        );
+        for &v in &col.1 {
+            assert_eq!(
+                v, 70.0,
+                "output 'wt' must echo covariate header WT=70 for subject {}, got {v}",
+                sr.id
+            );
         }
     }
 }

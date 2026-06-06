@@ -1222,8 +1222,14 @@ pub(crate) fn compute_extra_output_columns(
             }
             let mut col_vals = Vec::with_capacity(n_obs);
             for j in 0..n_obs {
+                // Resolve covariates and individual parameters case-insensitively:
+                // validate_output_columns accepts the [output] name regardless of
+                // case, so the echo must match a header like `WT` against a
+                // declared `wt` rather than silently producing NaN.
                 let v = per_obs_cov[j]
-                    .get(col_name.as_str())
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(col_name))
+                    .map(|(_, v)| v)
                     .or_else(|| {
                         per_obs_indiv[j]
                             .iter()

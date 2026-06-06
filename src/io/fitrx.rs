@@ -2177,4 +2177,22 @@ mod tests {
             vec!["WT".to_string(), "AGE".to_string()]
         );
     }
+
+    #[test]
+    fn input_columns_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ic-roundtrip.fitrx");
+        let mut r = minimal_fit_result();
+        r.input_columns = vec![
+            "ID".into(),
+            "TIME".into(),
+            "DV".into(),
+            "AMT".into(),
+            "WT".into(),
+        ];
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.input_columns, r.input_columns);
+    }
 }

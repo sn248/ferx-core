@@ -83,6 +83,7 @@ fn sparse_population(n: usize) -> Population {
         subjects,
         covariate_names: vec![],
         dv_column: "dv".into(),
+        input_columns: vec![],
     }
 }
 

@@ -655,12 +655,22 @@ pub fn write_sdtab_csv(
     let header: Vec<&str> = cols.iter().map(|(name, _)| name.as_str()).collect();
     writeln!(f, "{}", header.join(",")).map_err(|e| e.to_string())?;
 
-    // Rows. NaN (used for BLOQ IWRES/CWRES) is written as an empty cell so
-    // downstream tools handle it as missing rather than a sentinel.
+    // Rows. Any non-finite value — NaN (BLOQ IWRES/CWRES) or ±Inf (e.g. from a
+    // derived column) — is written as an empty cell so downstream tools handle
+    // it as missing rather than a sentinel. This is intentionally broader than
+    // the covariate-table writer below (which only blanks NaN via fmt_num), so
+    // adopting fmt_num here would silently change derived-column output.
     for row in 0..n_rows {
         let vals: Vec<String> = cols
             .iter()
-            .map(|(_, values)| fmt_num(values[row]))
+            .map(|(_, values)| {
+                let v = values[row];
+                if !v.is_finite() {
+                    String::new()
+                } else {
+                    format!("{:.6}", v)
+                }
+            })
             .collect();
         writeln!(f, "{}", vals.join(",")).map_err(|e| e.to_string())?;
     }
@@ -699,10 +709,7 @@ pub fn write_covtab_csv(table: &crate::types::CovariateTable, path: &str) -> Res
 
 /// Format a numeric cell for CSV output: NaN → empty (missing), else 6 dp.
 fn fmt_num(v: f64) -> String {
-    // Any non-finite value (NaN from BLOQ IWRES/CWRES, or ±Inf from a derived
-    // column) is written as an empty cell so downstream tools treat it as
-    // missing rather than a sentinel.
-    if !v.is_finite() {
+    if v.is_nan() {
         String::new()
     } else {
         format!("{:.6}", v)

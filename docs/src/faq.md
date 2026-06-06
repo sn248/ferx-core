@@ -260,3 +260,34 @@ than parsing prose. The exit code is `0` when no errors are found, `1` when
 there are errors. See the [check report reference](file-formats/check-report.md)
 for the JSON schema and the full code table.
 
+## How do I exclude records or subjects, like NONMEM's `$DATA IGNORE=`?
+
+Use the `[data_selection]` block:
+
+```
+[data_selection]
+  ignore = DV < 0.001          # drop any obs where DV is below detection
+  ignore_subjects = [3, 17]    # drop subjects 3 and 17 entirely
+```
+
+The `ignore` key works like NONMEM's `$DATA IGNORE=`: a record is excluded when
+the expression is true.  The `accept` key is the complement: a record is kept
+only when the expression passes (equivalent to NONMEM's `$DATA ACCEPT=`).
+
+| NONMEM | ferx |
+|--------|------|
+| `$DATA IGNORE=(BW.GT.80)` | `ignore = BW > 80` |
+| `$DATA ACCEPT=(DV.GE.0.001)` | `accept = DV >= 0.001` |
+| `$DATA IGNORE=@ 3,17` | `ignore_subjects = [3, 17]` |
+
+Multiple `ignore` lines mean "exclude if any condition matches"; multiple
+`accept` lines mean "exclude unless all conditions pass".  Conditions within a
+single line can be joined with `&&` (both must hold to trigger the rule).
+`||` within a single expression is not supported — use two separate lines
+instead.
+
+After the fit, the CLI prints a `--- Data Selection ---` block and the YAML
+output file includes an `exclusions:` section with record counts and the
+expressions that fired.  See [Data Selection](model-file/data-selection.md) for
+the full reference.
+

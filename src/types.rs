@@ -1893,6 +1893,10 @@ pub struct FitResult {
     /// (which has no raw rows) or when no `[covariates]` block is declared.
     /// Missing values are `f64::NAN`. See [`CovariateTable`].
     pub covariate_table: Option<CovariateTable>,
+    /// Record-level exclusion statistics; `Some` when `[data_selection]` rules
+    /// were active during the fit (or the caller supplied `ignore`/`accept`
+    /// expressions).  `None` means no filtering was requested.
+    pub exclusions: Option<ExclusionSummary>,
 }
 
 /// Minimal per-NN metadata carried on `FitResult` so output writers can

@@ -1902,6 +1902,7 @@ fn fit_inner(
         // `run_model_with_data`) when the model declares a `[covariates]`
         // block; the in-memory `fit()` path has no raw rows to echo.
         covariate_table: None,
+        exclusions: population.exclusions.clone(),
     };
 
     if time_gradients {
@@ -3998,6 +3999,7 @@ mod simulate_with_uncertainty_tests {
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
             covariate_table: None,
+            exclusions: None,
         }
     }
 

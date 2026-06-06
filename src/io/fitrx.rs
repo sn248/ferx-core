@@ -1611,6 +1611,7 @@ fn wire_to_fit_result(
         // The covariate table is not persisted in the .fitrx bundle (yet); a
         // round-tripped result therefore has no covariate table.
         covariate_table: None,
+        exclusions: None,
     })
 }
 
@@ -1812,6 +1813,7 @@ mod tests {
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
             covariate_table: None,
+            exclusions: None,
         }
     }
 

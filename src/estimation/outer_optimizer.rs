@@ -2560,6 +2560,7 @@ mod tests {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
         }
     }
 

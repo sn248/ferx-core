@@ -271,6 +271,8 @@ struct FitWire {
     inits_from_nca: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     covariate_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    input_columns: Vec<String>,
     /// `[covariate_nn]` block metadata. Absent (None) on bundles produced
     /// before this field existed or when ferx-core was built without
     /// `--features nn`. Loaders gracefully default to an empty Vec.
@@ -759,6 +761,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         outer_gtol: r.outer_gtol,
         inits_from_nca: r.inits_from_nca.clone(),
         covariate_names: r.covariate_names.clone(),
+        input_columns: r.input_columns.clone(),
         #[cfg(feature = "nn")]
         neural_networks: if r.neural_networks.is_empty() {
             None
@@ -1602,6 +1605,7 @@ fn wire_to_fit_result(
         outer_gtol: w.outer_gtol,
         inits_from_nca: w.inits_from_nca,
         covariate_names: w.covariate_names,
+        input_columns: w.input_columns,
         #[cfg(feature = "nn")]
         neural_networks: w.neural_networks.unwrap_or_default(),
     })
@@ -1682,6 +1686,7 @@ mod tests {
             subjects,
             covariate_names: vec![],
             dv_column: "DV".into(),
+            input_columns: vec![],
         }
     }
 
@@ -1799,6 +1804,7 @@ mod tests {
             outer_gtol: 1e-4,
             inits_from_nca: None,
             covariate_names: vec!["WT".into(), "AGE".into()],
+            input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }

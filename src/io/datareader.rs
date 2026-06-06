@@ -141,6 +141,7 @@ pub fn read_nonmem_csv(
         subjects,
         covariate_names: cov_names,
         dv_column: "dv".to_string(),
+        input_columns: headers,
     })
 }
 

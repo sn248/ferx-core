@@ -1667,6 +1667,7 @@ mod tests {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
         }
     }
 
@@ -2839,6 +2840,7 @@ mod tests {
             subjects: vec![subject],
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
         }
     }
 

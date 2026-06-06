@@ -180,6 +180,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         subjects,
         covariate_names: vec![],
         dv_column: "dv".into(),
+        input_columns: vec![],
     };
 
     // Simulate
@@ -1729,6 +1730,7 @@ fn fit_inner(
             .to_string()
         }),
         covariate_names: population.covariate_names.clone(),
+        input_columns: population.input_columns.clone(),
         #[cfg(feature = "nn")]
         neural_networks: build_neural_network_infos(model),
     };
@@ -2884,6 +2886,7 @@ mod iov_integration {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
         }
     }
 
@@ -3714,6 +3717,7 @@ mod simulate_with_uncertainty_tests {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
         }
     }
 
@@ -3819,6 +3823,7 @@ mod simulate_with_uncertainty_tests {
             outer_gtol: 0.0,
             inits_from_nca: None,
             covariate_names: Vec::new(),
+            input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
         }
@@ -4039,6 +4044,7 @@ mod sde_integration {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
         }
     }
 
@@ -4162,6 +4168,7 @@ mod sde_integration {
                 subjects: vec![subj],
                 covariate_names: Vec::new(),
                 dv_column: "DV".into(),
+                input_columns: vec![],
             }
         };
 
@@ -4442,6 +4449,7 @@ mod tests_sdtab_tv_cov {
             subjects: vec![subject.clone()],
             covariate_names: vec!["WT".into()],
             dv_column: "DV".into(),
+            input_columns: vec![],
         };
 
         // Fixed EBE at η = 0; H matrix is irrelevant for the IPRED check but

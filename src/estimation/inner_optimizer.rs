@@ -1412,6 +1412,7 @@ mod iov_tests {
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
             input_columns: vec![],
+            warnings: vec![],
         };
         // `requested` is the user's FitOptions value, passed independently of
         // model.gradient_method (which compatibility rules may have mutated).
@@ -1500,6 +1501,8 @@ mod iov_tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 
@@ -1610,6 +1613,8 @@ mod iov_tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         };
         let subject = Subject {
             id: "1".into(),

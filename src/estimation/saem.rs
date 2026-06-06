@@ -2180,6 +2180,7 @@ mod tests {
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
             input_columns: vec![],
+            warnings: vec![],
         };
 
         let flag = CancelFlag::new();
@@ -2277,6 +2278,7 @@ mod tests {
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
             input_columns: vec![],
+            warnings: vec![],
         };
 
         let theta = vec![1.5f64, 20.0]; // CL, V
@@ -2429,6 +2431,7 @@ mod tests {
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
             input_columns: vec![],
+            warnings: vec![],
         };
 
         let theta = vec![1.0f64, 10.0, 0.5];

@@ -2534,6 +2534,8 @@ mod tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 
@@ -2561,6 +2563,7 @@ mod tests {
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
             input_columns: vec![],
+            warnings: vec![],
         }
     }
 
@@ -2721,6 +2724,8 @@ mod tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         };
         check_gradient(&model, &make_population(3), 2);
     }

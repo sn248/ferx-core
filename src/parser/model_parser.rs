@@ -1401,6 +1401,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         scaling: ScalingSpec::None,
         log_transform: ltbs_flags.log_transform,
         dv_pre_logged: ltbs_flags.dv_pre_logged,
+        derived_exprs: vec![],
+        output_columns: vec![],
     };
 
     // ── Optional blocks ──
@@ -1628,6 +1630,27 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     );
     model.parse_warnings.extend(unused_warnings);
 
+    // ── [derived] block ──
+    if let Some(derived_lines) = blocks.get("derived") {
+        let cov_names = model.referenced_covariates.clone();
+        let mut derived_warnings = Vec::new();
+        let derived_exprs = parse_derived_block(
+            derived_lines,
+            &model.theta_names.clone(),
+            &model.eta_names.clone(),
+            &model.indiv_param_names.clone(),
+            &cov_names,
+            &mut derived_warnings,
+        )?;
+        model.derived_exprs = derived_exprs;
+        model.parse_warnings.extend(derived_warnings);
+    }
+
+    // ── [output] block ──
+    if let Some(output_lines) = blocks.get("output") {
+        model.output_columns = parse_output_block(output_lines);
+    }
+
     // ── Optional [covariates] block ──
     // When present it is authoritative for the covariate *table* and typing:
     // only listed columns are tabled, and declared columns are read strictly.
@@ -1664,6 +1687,512 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         covariate_decls,
         block_lines: extracted.block_lines.clone(),
     })
+}
+
+// ── [derived] and [output] block parsers ────────────────────────────────────
+
+/// Built-in sdtab column names that [derived] names must not clash with.
+const DERIVED_BUILTIN_NAMES: &[&str] = &[
+    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD",
+    "CENS", "OCC", "CMT",
+];
+
+/// Split a token slice at top-level commas (depth 0 inside parentheses).
+fn split_top_level_commas(tokens: &[Token]) -> Vec<&[Token]> {
+    let mut result = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            Token::Comma if depth == 0 => {
+                result.push(&tokens[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < tokens.len() {
+        result.push(&tokens[start..]);
+    }
+    result
+}
+
+/// Returns true when a token slice starts with `IDENT =` (keyword arg pattern).
+fn is_keyword_arg_tokens(tokens: &[Token]) -> bool {
+    matches!(tokens, [Token::Ident(_), Token::Eq, ..])
+}
+
+/// Parse `IDENT = NUMBER` keyword arg, returning (key, value).
+fn parse_keyword_float_arg(tokens: &[Token]) -> Result<(String, f64), String> {
+    match tokens {
+        [Token::Ident(k), Token::Eq, Token::Number(v)] => Ok((k.clone(), *v)),
+        [Token::Ident(k), Token::Eq, ..] => Err(format!(
+            "keyword arg `{k}=` must be followed by a numeric literal"
+        )),
+        _ => Err(format!(
+            "expected keyword arg `name = value`, got unexpected tokens"
+        )),
+    }
+}
+
+/// Returns true when a token slice contains a comparison or logical operator
+/// at parenthesis depth 0. Used to distinguish a condition arg from a
+/// keyword-arg sequence in `integral(...)`.
+fn tokens_contain_comparison(tokens: &[Token]) -> bool {
+    let mut depth = 0usize;
+    for tok in tokens {
+        match tok {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            Token::Lt
+            | Token::Le
+            | Token::Gt
+            | Token::Ge
+            | Token::EqEq
+            | Token::Ne
+            | Token::AndAnd
+            | Token::OrOr
+            | Token::Bang
+                if depth == 0 =>
+            {
+                return true
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Parse a token slice as a fully-consuming arithmetic expression.
+fn parse_derived_expr(tokens: &[Token], ctx: ParseCtx<'_>) -> Result<Expression, String> {
+    if tokens.is_empty() {
+        return Err("expected expression, got empty token list".into());
+    }
+    let (expr, pos) = parse_add_sub(tokens, 0, ctx)?;
+    if pos < tokens.len() {
+        return Err(format!(
+            "unexpected token(s) after expression: {:?}",
+            &tokens[pos..]
+        ));
+    }
+    Ok(expr)
+}
+
+/// Parse a token slice as a fully-consuming boolean condition.
+fn parse_derived_cond(tokens: &[Token], ctx: ParseCtx<'_>) -> Result<Condition, String> {
+    if tokens.is_empty() {
+        return Err("expected condition, got empty token list".into());
+    }
+    let (cond, pos) = parse_condition(tokens, 0, ctx)?;
+    if pos < tokens.len() {
+        return Err(format!(
+            "unexpected token(s) after condition: {:?}",
+            &tokens[pos..]
+        ));
+    }
+    Ok(cond)
+}
+
+/// Build a DerivedEvalFn closure from a parsed Expression.
+/// At evaluation time the closure assembles a `vars` map from the DerivedContext
+/// fields and calls the AST-walking `eval_expression`.
+fn build_derived_eval_fn(expr: Expression) -> DerivedEvalFn {
+    let expr = std::sync::Arc::new(expr);
+    Box::new(move |ctx: &DerivedContext<'_>| {
+        let vars = build_derived_vars(ctx);
+        // Covariates become Variable nodes (fallback_covariate=false at parse time),
+        // so pass an empty covariates map and rely on vars for all name resolution.
+        eval_expression(&expr, ctx.theta, ctx.eta, &HashMap::new(), &vars, &[])
+    })
+}
+
+/// Build a DerivedFilterFn closure from a parsed Condition.
+fn build_derived_filter_fn(cond: Condition) -> DerivedFilterFn {
+    let cond = std::sync::Arc::new(cond);
+    Box::new(move |ctx: &DerivedContext<'_>| {
+        let vars = build_derived_vars(ctx);
+        eval_condition(&cond, ctx.theta, ctx.eta, &HashMap::new(), &vars, &[])
+    })
+}
+
+/// Build the variable map for derived-expression and derived-filter evaluation.
+///
+/// Keys for covariates, individual parameters, and prior derived columns are
+/// inserted with their original case **and** both an uppercase and a lowercase
+/// alias, so that an all-lowercase `wt` or all-uppercase `WT` expression resolves
+/// regardless of the dataset header's case. (A header such as `WT` has an
+/// uppercase form identical to itself, so the lowercase alias is what makes a
+/// lowercase `wt` reference resolve.)
+/// Built-in time variables (TIME, TAFD, TAD, IPRED, PRED, DV) are inserted in
+/// both uppercase and lowercase for the same reason.
+fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
+    let mut vars: HashMap<String, f64> = HashMap::new();
+    // Insert each name with original case AND uppercase + lowercase aliases so
+    // that case mismatches (e.g. `wt` vs. header `WT`, or `WT` vs. header `wt`)
+    // resolve correctly. `eval_expression` looks names up verbatim, so every
+    // case the user might type must be present as a key.
+    let mut insert_ci = |k: &str, v: f64| {
+        vars.insert(k.to_string(), v);
+        let up = k.to_uppercase();
+        if up != k {
+            vars.insert(up, v);
+        }
+        let lo = k.to_lowercase();
+        if lo != k {
+            vars.insert(lo, v);
+        }
+    };
+    for (k, &v) in ctx.indiv_params.iter() {
+        insert_ci(k, v);
+    }
+    for (k, &v) in ctx.covariates.iter() {
+        insert_ci(k, v);
+    }
+    for (k, &v) in ctx.prev_derived.iter() {
+        insert_ci(k, v);
+    }
+    // Built-in names: uppercase (canonical) + lowercase alias.
+    for &(name, val) in &[
+        ("IPRED", ctx.ipred),
+        ("PRED", ctx.pred),
+        ("DV", ctx.dv),
+        ("TIME", ctx.time),
+        ("TAFD", ctx.tafd),
+        ("TAD", ctx.tad),
+        ("MACHEPS", f64::EPSILON),
+    ] {
+        vars.insert(name.to_string(), val);
+        vars.insert(name.to_lowercase(), val);
+    }
+    vars
+}
+
+/// Returns true if the expression subtree references the `DV` variable.
+fn expr_refs_dv(expr: &Expression) -> bool {
+    match expr {
+        Expression::Variable(name) if name.eq_ignore_ascii_case("DV") => true,
+        Expression::BinOp(l, _, r) => expr_refs_dv(l) || expr_refs_dv(r),
+        Expression::UnaryFn(_, arg) => expr_refs_dv(arg),
+        Expression::Power(b, e) => expr_refs_dv(b) || expr_refs_dv(e),
+        Expression::Conditional(c, t, e) => cond_refs_dv(c) || expr_refs_dv(t) || expr_refs_dv(e),
+        _ => false,
+    }
+}
+
+fn cond_refs_dv(cond: &Condition) -> bool {
+    match cond {
+        Condition::Compare(l, _, r) => expr_refs_dv(l) || expr_refs_dv(r),
+        Condition::And(l, r) | Condition::Or(l, r) => cond_refs_dv(l) || cond_refs_dv(r),
+        Condition::Not(c) => cond_refs_dv(c),
+    }
+}
+
+/// Parse the interior args of `integral(...)` into a `DerivedKind::Integral`.
+fn parse_integral_kind(
+    args: &[&[Token]],
+    ctx: ParseCtx<'_>,
+    parse_warnings: &mut Vec<String>,
+) -> Result<DerivedKind, String> {
+    if args.is_empty() {
+        return Err(
+            "[derived] integral() requires at least one argument (the integrand expression)".into(),
+        );
+    }
+
+    let integrand_expr = parse_derived_expr(args[0], ctx)?;
+    let data_based = expr_refs_dv(&integrand_expr);
+
+    let mut condition: Option<DerivedFilterFn> = None;
+    let mut from_val: Option<f64> = None;
+    let mut to_val: Option<f64> = None;
+    let mut window_val: Option<f64> = None;
+    let mut anchor_val: f64 = 0.0;
+    let mut step_val: Option<f64> = None;
+
+    let mut i = 1;
+    // Second positional arg is a condition if it contains comparison operators.
+    if i < args.len() && !is_keyword_arg_tokens(args[i]) && tokens_contain_comparison(args[i]) {
+        let cond = parse_derived_cond(args[i], ctx)?;
+        condition = Some(build_derived_filter_fn(cond));
+        i += 1;
+    }
+
+    // Remaining args are keyword args.
+    while i < args.len() {
+        let (k, v) =
+            parse_keyword_float_arg(args[i]).map_err(|e| format!("[derived] integral(): {e}"))?;
+        match k.to_lowercase().as_str() {
+            "from" => from_val = Some(v),
+            "to" => to_val = Some(v),
+            "window" => {
+                if v <= 0.0 {
+                    return Err(format!(
+                        "[derived] integral(): `window=` must be positive, got {v}"
+                    ));
+                }
+                window_val = Some(v);
+            }
+            "anchor" => anchor_val = v,
+            "step" => {
+                if v <= 0.0 {
+                    return Err(format!(
+                        "[derived] integral(): `step=` must be positive, got {v}"
+                    ));
+                }
+                step_val = Some(v);
+            }
+            other => {
+                return Err(format!(
+                    "[derived] integral(): unknown keyword argument `{other}`"
+                ))
+            }
+        }
+        i += 1;
+    }
+
+    let int_window = if let Some(w) = window_val {
+        if from_val.is_some() || to_val.is_some() {
+            return Err(
+                "[derived] integral(): cannot specify both `window=` and `from=`/`to=`".into(),
+            );
+        }
+        IntegralWindow::Periodic {
+            period: w,
+            anchor: anchor_val,
+        }
+    } else {
+        let f = from_val.ok_or("[derived] integral(): missing required argument `from=`")?;
+        let t = to_val.ok_or("[derived] integral(): missing required argument `to=`")?;
+        IntegralWindow::Explicit { from: f, to: t }
+    };
+
+    let int_step = if data_based {
+        if step_val.is_some() {
+            parse_warnings.push(
+                "[derived] integral(): `step=` is ignored for DV-based integrands \
+                 (W_DERIVED_STEP_IGNORED)"
+                    .into(),
+            );
+        }
+        IntegralStep::ObsTimes
+    } else if let Some(s) = step_val {
+        IntegralStep::Fixed(s)
+    } else {
+        IntegralStep::Auto
+    };
+
+    Ok(DerivedKind::Integral {
+        integrand: build_derived_eval_fn(integrand_expr),
+        condition,
+        data_based,
+        window: int_window,
+        step: int_step,
+    })
+}
+
+/// Parse a `[derived]` block into a sequence of `DerivedExprSpec`s.
+///
+/// Each line must have the form `NAME = <rhs>` where RHS is one of:
+/// - A plain arithmetic expression → `PerRow`
+/// - `max(expr)` / `max(expr, cond)` → `Aggregate(Max)`
+/// - `min(expr)` / `min(expr, cond)` → `Aggregate(Min)`
+/// - `tmax(expr)` / `tmax(expr, cond)` → `Aggregate(Tmax)`
+/// - `integral(expr, ...)` with keyword args → `Integral`
+fn parse_derived_block(
+    lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_param_names: &[String],
+    covariate_names: &[String],
+    parse_warnings: &mut Vec<String>,
+) -> Result<Vec<DerivedExprSpec>, String> {
+    let mut specs: Vec<DerivedExprSpec> = Vec::new();
+    let mut defined_derived: Vec<String> = Vec::new();
+
+    // Names that resolve to Variable (not Theta/Eta) at parse time; these are
+    // looked up in the vars HashMap at closure-call time.
+    const BUILTIN_SPECIALS: &[&str] = &["IPRED", "PRED", "DV", "TIME", "TAFD", "TAD", "MACHEPS"];
+
+    for raw_line in lines {
+        let line = if let Some(idx) = raw_line.find('#') {
+            &raw_line[..idx]
+        } else {
+            raw_line.as_str()
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Split at first `=` to separate NAME from RHS.
+        let eq_pos = line
+            .find('=')
+            .ok_or_else(|| format!("[derived] line `{line}` must have the form `NAME = <expr>`"))?;
+        let name = line[..eq_pos].trim().to_string();
+        let rhs_str = line[eq_pos + 1..].trim().to_string();
+
+        if name.is_empty() {
+            return Err(format!(
+                "[derived] line `{line}` has an empty name before `=`"
+            ));
+        }
+
+        // ── Name conflict checks ──────────────────────────────────────────────
+        if DERIVED_BUILTIN_NAMES
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(&name))
+            || eta_names.iter().any(|e| e.eq_ignore_ascii_case(&name))
+        {
+            return Err(format!(
+                "[derived] name `{name}` conflicts with a built-in sdtab column or eta name \
+                 (E_DERIVED_NAME_CONFLICT)"
+            ));
+        }
+        if theta_names.iter().any(|t| t.eq_ignore_ascii_case(&name))
+            || indiv_param_names
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(&name))
+        {
+            return Err(format!(
+                "[derived] name `{name}` conflicts with a theta or individual-parameter name \
+                 (E_DERIVED_NAME_CONFLICT)"
+            ));
+        }
+        if covariate_names
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&name))
+        {
+            parse_warnings.push(format!(
+                "[derived] name `{name}` shadows a covariate — this may be confusing \
+                 (W_DERIVED_COVARIATE_SHADOW)"
+            ));
+        }
+
+        // ── Build ParseCtx ────────────────────────────────────────────────────
+        // Unknown identifiers become Variable (fallback_covariate = false), so
+        // indiv params, covariates, and context fields (IPRED, DV, etc.) are all
+        // resolved via the vars HashMap at closure-call time.
+        let mut defined_vars: Vec<String> = indiv_param_names.to_vec();
+        defined_vars.extend(BUILTIN_SPECIALS.iter().map(|s| s.to_string()));
+        defined_vars.extend(covariate_names.iter().cloned());
+        defined_vars.extend(defined_derived.iter().cloned());
+
+        let ctx = ParseCtx {
+            theta_names,
+            eta_names,
+            defined_vars: &defined_vars,
+            fallback_covariate: false,
+            nn_specs: &[],
+        };
+
+        // ── Tokenize ──────────────────────────────────────────────────────────
+        let mut tokens = tokenize(&rhs_str)?;
+        tokens.retain(|t| !matches!(t, Token::Newline));
+
+        if tokens.is_empty() {
+            return Err(format!("[derived] `{name}` has an empty right-hand side"));
+        }
+
+        // ── Detect form ───────────────────────────────────────────────────────
+        let kind = if let Token::Ident(func_name) = &tokens[0] {
+            let fname_lc = func_name.to_lowercase();
+            if matches!(fname_lc.as_str(), "max" | "min" | "tmax" | "integral")
+                && tokens.get(1) == Some(&Token::LParen)
+            {
+                // Find the matching closing paren at depth 0 (after the opening LParen at [1]).
+                let mut depth = 0usize;
+                let mut close_idx = None;
+                for (i, tok) in tokens[1..].iter().enumerate() {
+                    match tok {
+                        Token::LParen => depth += 1,
+                        Token::RParen => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close_idx = Some(i + 1); // index in `tokens`
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let close_idx = close_idx.ok_or_else(|| {
+                    format!("[derived] `{name}`: `{fname_lc}(` missing closing `)`")
+                })?;
+
+                // tokens[2..close_idx] is the interior
+                let interior = &tokens[2..close_idx];
+                let args = split_top_level_commas(interior);
+
+                if fname_lc == "integral" {
+                    parse_integral_kind(&args, ctx, parse_warnings)?
+                } else {
+                    // max / min / tmax
+                    let agg_fn = match fname_lc.as_str() {
+                        "max" => AggFunction::Max,
+                        "min" => AggFunction::Min,
+                        "tmax" => AggFunction::Tmax,
+                        _ => unreachable!(),
+                    };
+                    let value_tokens = args.first().copied().unwrap_or(&[]);
+                    let filter_tokens = if args.len() >= 2 { Some(args[1]) } else { None };
+                    let value_expr = parse_derived_expr(value_tokens, ctx)?;
+                    let filter = if let Some(ft) = filter_tokens {
+                        let cond = parse_derived_cond(ft, ctx)?;
+                        Some(build_derived_filter_fn(cond))
+                    } else {
+                        None
+                    };
+                    DerivedKind::Aggregate {
+                        func: agg_fn,
+                        value: build_derived_eval_fn(value_expr),
+                        filter,
+                    }
+                }
+            } else {
+                // Plain expression → PerRow
+                let expr = parse_derived_expr(&tokens, ctx)?;
+                DerivedKind::PerRow {
+                    eval: build_derived_eval_fn(expr),
+                }
+            }
+        } else {
+            // Starts with a literal or unary minus
+            let expr = parse_derived_expr(&tokens, ctx)?;
+            DerivedKind::PerRow {
+                eval: build_derived_eval_fn(expr),
+            }
+        };
+
+        defined_derived.push(name.clone());
+        specs.push(DerivedExprSpec { name, kind });
+    }
+
+    Ok(specs)
+}
+
+/// Parse an `[output]` block: whitespace-separated column names.
+fn parse_output_block(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .flat_map(|line| {
+            let line = if let Some(idx) = line.find('#') {
+                &line[..idx]
+            } else {
+                line.as_str()
+            };
+            line.split_whitespace().map(|s| s.to_string())
+        })
+        .collect()
 }
 
 /// Map a `[covariates]` type token to a [`CovariateKind`]. Accepts the full
@@ -3201,7 +3730,39 @@ fn build_ode_spec(
     for (i, n) in intermediates.iter().enumerate() {
         add_aliases(&mut var_idx, n, state_count + indiv_count + i);
     }
-    let n_vars_total = state_count + indiv_count + intermediates.len();
+    // Reserve extra slots for TIME/T, TAFD, TAD — always appended after intermediates.
+    // These names are reserved: reject any ODE state, individual parameter, or
+    // intermediate that collides with a reserved slot so the injected solver-time
+    // values are always reachable.
+    const RESERVED_ODE_NAMES: &[&str] = &["TIME", "T", "TAFD", "TAD"];
+    for reserved in RESERVED_ODE_NAMES {
+        let collides = state_names_owned
+            .iter()
+            .chain(indiv_names_owned.iter())
+            .chain(intermediates.iter())
+            .any(|n| n.eq_ignore_ascii_case(reserved));
+        if collides {
+            return Err(format!(
+                "[odes] the name `{reserved}` is reserved for the solver-injected time \
+                 variable and cannot be used as a state, individual-parameter, or \
+                 intermediate name"
+            ));
+        }
+    }
+    let n_base_vars = state_count + indiv_count + intermediates.len();
+    let time_slot = n_base_vars;
+    let tafd_slot = n_base_vars + 1;
+    let tad_slot = n_base_vars + 2;
+    // Forcefully assign reserved names (overwrite any accidental or_insert entry).
+    var_idx.insert("TIME".to_string(), time_slot);
+    var_idx.insert("time".to_string(), time_slot);
+    var_idx.insert("T".to_string(), time_slot);
+    var_idx.insert("t".to_string(), time_slot);
+    var_idx.insert("TAFD".to_string(), tafd_slot);
+    var_idx.insert("tafd".to_string(), tafd_slot);
+    var_idx.insert("TAD".to_string(), tad_slot);
+    var_idx.insert("tad".to_string(), tad_slot);
+    let n_vars_total = n_base_vars + 3;
 
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
@@ -3238,7 +3799,7 @@ fn build_ode_spec(
     // once the capacity grows), so intermediate slots in untaken if-branches
     // still read 0 just like the old per-call `vec![0.0; n]` path.
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
-        Box::new(move |u: &[f64], params: &[f64], _t: f64, du: &mut [f64]| {
+        Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
             // The integrator always passes a `u` whose length matches the
             // declared state count. The old closure index-panicked on
             // `u[i]` if that contract ever broke; preserve that signal here
@@ -3273,6 +3834,27 @@ fn build_ode_spec(
                     {
                         *dst = val;
                     }
+                }
+
+                // TIME / T — solver time axis (same as dataset TIME column).
+                if let Some(dst) = scratch.rhs_vars.get_mut(time_slot) {
+                    *dst = t;
+                }
+                // TAFD — t minus first-dose time, injected via params[MAX_PK_PARAMS].
+                if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
+                    *dst = params
+                        .get(crate::types::MAX_PK_PARAMS)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .map_or(f64::NAN, |first| t - first);
+                }
+                // TAD — t minus last-effective-dose time, injected via params[MAX_PK_PARAMS+1].
+                if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
+                    *dst = params
+                        .get(crate::types::MAX_PK_PARAMS + 1)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .map_or(f64::NAN, |last| t - last);
                 }
 
                 // Reset du so a state without a firing d/dt this iteration
@@ -4550,6 +5132,8 @@ pub(crate) enum BinOp {
     Sub,
     Mul,
     Div,
+    /// Euclidean remainder — result always non-negative for positive divisor.
+    Mod,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4902,7 +5486,13 @@ fn eval_expression(
         Expression::Theta(i) => theta[*i],
         Expression::Eta(i) => eta[*i],
         Expression::Covariate(name) => covariates.get(name).copied().unwrap_or(0.0),
-        Expression::Variable(name) => vars.get(name).copied().unwrap_or(0.0),
+        Expression::Variable(name) => {
+            if name.eq_ignore_ascii_case("MACHEPS") {
+                f64::EPSILON
+            } else {
+                vars.get(name).copied().unwrap_or(0.0)
+            }
+        }
         Expression::VariableIdx(_) | Expression::CovariateIdx(_) => {
             debug_assert!(
                 false,
@@ -4924,6 +5514,7 @@ fn eval_expression(
                         l / r
                     }
                 }
+                BinOp::Mod => l.rem_euclid(r),
             }
         }
         Expression::UnaryFn(name, arg) => {
@@ -4933,6 +5524,9 @@ fn eval_expression(
                 "log" | "ln" => v.max(1e-30).ln(),
                 "sqrt" => v.max(0.0).sqrt(),
                 "abs" => v.abs(),
+                "floor" => v.floor(),
+                "ceil" => v.ceil(),
+                "round" => v.round(),
                 "inv_logit" | "expit" => {
                     // Numerically stable: avoid exp overflow for very negative v
                     if v >= 0.0 {
@@ -5076,6 +5670,10 @@ enum Op {
     LogicNot,
     JumpIfFalse(u32), // pops top; jumps to bytecode index if value == 0.0
     Jump(u32),
+    Mod,   // rem_euclid (binary)
+    Floor, // unary
+    Ceil,  // unary
+    Round, // unary
 }
 
 // ─── Consolidated per-thread scratch ───────────────────────────────────────
@@ -5196,6 +5794,7 @@ fn compute_max_stack(ops: &[Op]) -> usize {
             | Op::Sub
             | Op::Mul
             | Op::Div
+            | Op::Mod
             | Op::Pow
             | Op::CmpLt
             | Op::CmpLe
@@ -5205,7 +5804,16 @@ fn compute_max_stack(ops: &[Op]) -> usize {
             | Op::CmpNe
             | Op::LogicAnd
             | Op::LogicOr => -1,
-            Op::Exp | Op::Ln | Op::Sqrt | Op::Abs | Op::InvLogit | Op::Logit | Op::LogicNot => 0,
+            Op::Exp
+            | Op::Ln
+            | Op::Sqrt
+            | Op::Abs
+            | Op::InvLogit
+            | Op::Logit
+            | Op::LogicNot
+            | Op::Floor
+            | Op::Ceil
+            | Op::Round => 0,
             Op::JumpIfFalse(_) => -1,
             Op::Jump(_) => 0,
         };
@@ -5257,6 +5865,7 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 BinOp::Sub => Op::Sub,
                 BinOp::Mul => Op::Mul,
                 BinOp::Div => Op::Div,
+                BinOp::Mod => Op::Mod,
             });
         }
         Expression::Power(base, exp) => {
@@ -5277,6 +5886,9 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 "abs" => bc.ops.push(Op::Abs),
                 "inv_logit" | "expit" => bc.ops.push(Op::InvLogit),
                 "logit" => bc.ops.push(Op::Logit),
+                "floor" => bc.ops.push(Op::Floor),
+                "ceil" => bc.ops.push(Op::Ceil),
+                "round" => bc.ops.push(Op::Round),
                 _ => { /* unknown function → leave the argument on the stack */ }
             }
         }
@@ -5430,6 +6042,15 @@ fn eval_bytecode(
                 let b = pop!();
                 push!(b.powf(e));
             }
+            Op::Mod => {
+                let b = pop!();
+                let a = pop!();
+                push!(if b.abs() < 1e-30 {
+                    0.0
+                } else {
+                    a.rem_euclid(b)
+                });
+            }
             Op::Exp => {
                 let v = pop!();
                 push!(v.exp());
@@ -5447,6 +6068,18 @@ fn eval_bytecode(
             Op::Abs => {
                 let v = pop!();
                 push!(v.abs());
+            }
+            Op::Floor => {
+                let v = pop!();
+                push!(v.floor());
+            }
+            Op::Ceil => {
+                let v = pop!();
+                push!(v.ceil());
+            }
+            Op::Round => {
+                let v = pop!();
+                push!(v.round());
             }
             Op::InvLogit => {
                 let v = pop!();
@@ -5576,6 +6209,7 @@ fn eval_expression_indexed(
                         l / r
                     }
                 }
+                BinOp::Mod => l.rem_euclid(r),
             }
         }
         Expression::UnaryFn(name, arg) => {
@@ -5585,6 +6219,9 @@ fn eval_expression_indexed(
                 "log" | "ln" => v.max(1e-30).ln(),
                 "sqrt" => v.max(0.0).sqrt(),
                 "abs" => v.abs(),
+                "floor" => v.floor(),
+                "ceil" => v.ceil(),
+                "round" => v.round(),
                 "inv_logit" | "expit" => {
                     if v >= 0.0 {
                         1.0 / (1.0 + (-v).exp())
@@ -6087,6 +6724,7 @@ fn differentiate_with_chain(
                 let denom = mul((**r).clone(), (**r).clone());
                 div(num, denom)
             }
+            BinOp::Mod => Expression::Literal(0.0), // mod is discontinuous; derivative is 0 a.e.
         },
         Expression::UnaryFn(name, arg) => {
             let da = differentiate_with_chain(arg, axis, chain);
@@ -6227,6 +6865,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
                         Expression::BinOp(Box::new(l), *op, Box::new(r))
                     }
                 }
+                BinOp::Mod => Expression::BinOp(Box::new(l), *op, Box::new(r)),
             }
         }
         Expression::UnaryFn(name, arg) => {
@@ -6687,6 +7326,17 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                     {
                         i += 1;
                     }
+                    // Handle optional sign in exponent: e.g. `-1e-10`, `-2.5E+3`.
+                    if i > 0
+                        && (chars[i - 1] == 'e' || chars[i - 1] == 'E')
+                        && i < chars.len()
+                        && (chars[i] == '+' || chars[i] == '-')
+                    {
+                        i += 1;
+                        while i < chars.len() && chars[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
                     let num_str: String = chars[start..i].iter().collect();
                     let num: f64 = num_str
                         .parse()
@@ -6722,6 +7372,17 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                 {
                     i += 1;
                 }
+                // Handle optional sign in exponent: e.g. `1.5e-3`, `.5E+2`.
+                if i > 0
+                    && (chars[i - 1] == 'e' || chars[i - 1] == 'E')
+                    && i < chars.len()
+                    && (chars[i] == '+' || chars[i] == '-')
+                {
+                    i += 1;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
                 let num_str: String = chars[start..i].iter().collect();
                 let num: f64 = num_str
                     .parse()
@@ -6741,6 +7402,17 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                         || chars[i] == 'E')
                 {
                     i += 1;
+                }
+                // Handle optional sign in exponent: e.g. `1e-10`, `2.5E+3`.
+                if i > 0
+                    && (chars[i - 1] == 'e' || chars[i - 1] == 'E')
+                    && i < chars.len()
+                    && (chars[i] == '+' || chars[i] == '-')
+                {
+                    i += 1;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
                 }
                 let num_str: String = chars[start..i].iter().collect();
                 let num: f64 = num_str
@@ -6808,6 +7480,11 @@ fn parse_mul_div(
             Token::Slash => {
                 let (right, p) = parse_power(tokens, pos + 1, ctx)?;
                 left = Expression::BinOp(Box::new(left), BinOp::Div, Box::new(right));
+                pos = p;
+            }
+            Token::Ident(kw) if kw.eq_ignore_ascii_case("mod") => {
+                let (right, p) = parse_power(tokens, pos + 1, ctx)?;
+                left = Expression::BinOp(Box::new(left), BinOp::Mod, Box::new(right));
                 pos = p;
             }
             _ => break,
@@ -13510,5 +14187,430 @@ method = foce
             "all block_omega etas used — no warnings expected; got: {:?}",
             parsed.model.parse_warnings
         );
+    }
+
+    // ── [derived] block parser unit tests ────────────────────────────────────
+
+    fn minimal_model_with_derived(derived_block: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta CL(1.0, 0, 100)
+  theta V(10.0, 0, 1000)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = exp(log(CL) + ETA_CL)
+  V  = exp(log(V)  + ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+{derived_block}
+"#
+        )
+    }
+
+    fn make_derived_ctx_simple() -> (
+        Vec<f64>,
+        Vec<f64>,
+        std::collections::HashMap<String, f64>,
+        std::collections::HashMap<String, f64>,
+        std::collections::HashMap<String, f64>,
+    ) {
+        let theta = vec![1.0, 10.0];
+        let eta = vec![0.0, 0.0];
+        let mut indiv_params = std::collections::HashMap::new();
+        indiv_params.insert("CL".to_string(), 1.0);
+        indiv_params.insert("V".to_string(), 10.0);
+        let covariates = std::collections::HashMap::new();
+        let prev_derived = std::collections::HashMap::new();
+        (theta, eta, indiv_params, covariates, prev_derived)
+    }
+
+    #[test]
+    fn parse_derived_per_row() {
+        let src = minimal_model_with_derived("KE = CL / V");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert_eq!(parsed.model.derived_exprs.len(), 1);
+        assert_eq!(parsed.model.derived_exprs[0].name, "KE");
+        assert!(matches!(
+            parsed.model.derived_exprs[0].kind,
+            DerivedKind::PerRow { .. }
+        ));
+
+        // Evaluate the closure
+        let (theta, eta, indiv_params, covariates, prev_derived) = make_derived_ctx_simple();
+        if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+            let ctx = DerivedContext {
+                theta: &theta,
+                eta: &eta,
+                indiv_params: &indiv_params,
+                covariates: &covariates,
+                ipred: 0.0,
+                pred: 0.0,
+                dv: 0.0,
+                time: 1.0,
+                tafd: 1.0,
+                tad: 1.0,
+                prev_derived: &prev_derived,
+            };
+            let ke = eval(&ctx);
+            assert!((ke - 0.1).abs() < 1e-10, "KE = CL/V = 1/10 = 0.1, got {ke}");
+        } else {
+            panic!("expected PerRow");
+        }
+    }
+
+    #[test]
+    fn parse_derived_sequential_reference() {
+        let src = minimal_model_with_derived("KE = CL / V\nT_HALF = 0.693 / KE");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert_eq!(parsed.model.derived_exprs.len(), 2);
+
+        let (theta, eta, indiv_params, covariates, _) = make_derived_ctx_simple();
+        let mut prev_derived = std::collections::HashMap::new();
+
+        // Evaluate KE first
+        if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+            let ctx = DerivedContext {
+                theta: &theta,
+                eta: &eta,
+                indiv_params: &indiv_params,
+                covariates: &covariates,
+                ipred: 0.0,
+                pred: 0.0,
+                dv: 0.0,
+                time: 1.0,
+                tafd: 1.0,
+                tad: 1.0,
+                prev_derived: &prev_derived,
+            };
+            let ke = eval(&ctx);
+            prev_derived.insert("KE".to_string(), ke);
+        }
+
+        // Now evaluate T_HALF using prev_derived
+        if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[1].kind {
+            let ctx = DerivedContext {
+                theta: &theta,
+                eta: &eta,
+                indiv_params: &indiv_params,
+                covariates: &covariates,
+                ipred: 0.0,
+                pred: 0.0,
+                dv: 0.0,
+                time: 1.0,
+                tafd: 1.0,
+                tad: 1.0,
+                prev_derived: &prev_derived,
+            };
+            let t_half = eval(&ctx);
+            let expected = 0.693 / 0.1;
+            assert!(
+                (t_half - expected).abs() < 1e-8,
+                "T_HALF = 0.693/KE = {expected}, got {t_half}"
+            );
+        } else {
+            panic!("expected PerRow for T_HALF");
+        }
+    }
+
+    #[test]
+    fn parse_derived_max_with_filter() {
+        let src = minimal_model_with_derived("CMAX = max(IPRED, TIME < 24)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(matches!(
+            parsed.model.derived_exprs[0].kind,
+            DerivedKind::Aggregate {
+                func: AggFunction::Max,
+                filter: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_derived_min_no_filter() {
+        let src = minimal_model_with_derived("CMIN = min(IPRED)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(matches!(
+            parsed.model.derived_exprs[0].kind,
+            DerivedKind::Aggregate {
+                func: AggFunction::Min,
+                filter: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_derived_tmax() {
+        let src = minimal_model_with_derived("TMAX = tmax(IPRED)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(matches!(
+            parsed.model.derived_exprs[0].kind,
+            DerivedKind::Aggregate {
+                func: AggFunction::Tmax,
+                filter: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_derived_integral_explicit() {
+        let src = minimal_model_with_derived("AUC = integral(IPRED, from=0, to=24)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        if let DerivedKind::Integral {
+            data_based,
+            window: IntegralWindow::Explicit { from, to },
+            step: IntegralStep::Auto,
+            ..
+        } = &parsed.model.derived_exprs[0].kind
+        {
+            assert!(!data_based, "IPRED is not DV-based");
+            assert!((from - 0.0).abs() < 1e-10);
+            assert!((to - 24.0).abs() < 1e-10);
+        } else {
+            panic!(
+                "expected Integral(Explicit, Auto), got {:?} kind",
+                parsed.model.derived_exprs[0].name
+            );
+        }
+    }
+
+    #[test]
+    fn parse_derived_integral_dv() {
+        let src = minimal_model_with_derived("AUC_DV = integral(DV, from=0, to=24)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        if let DerivedKind::Integral {
+            data_based,
+            step: IntegralStep::ObsTimes,
+            ..
+        } = &parsed.model.derived_exprs[0].kind
+        {
+            assert!(*data_based, "DV is data_based");
+        } else {
+            panic!("expected Integral with ObsTimes step for DV integrand");
+        }
+    }
+
+    #[test]
+    fn parse_derived_integral_periodic() {
+        let src = minimal_model_with_derived("AUC_TAU = integral(IPRED, window=24, anchor=0)");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        if let DerivedKind::Integral {
+            window: IntegralWindow::Periodic { period, anchor },
+            ..
+        } = &parsed.model.derived_exprs[0].kind
+        {
+            assert!((period - 24.0).abs() < 1e-10);
+            assert!((anchor - 0.0).abs() < 1e-10);
+        } else {
+            panic!("expected Integral(Periodic)");
+        }
+    }
+
+    #[test]
+    fn parse_derived_name_conflict_error() {
+        // IPRED is a built-in sdtab column — should error
+        let src = minimal_model_with_derived("IPRED = CL / V");
+        let result = parse_full_model(&src);
+        assert!(
+            result.is_err(),
+            "expected parse error for IPRED name conflict"
+        );
+        let msg = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err"),
+        };
+        assert!(
+            msg.contains("E_DERIVED_NAME_CONFLICT"),
+            "expected E_DERIVED_NAME_CONFLICT in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_output_block() {
+        let src = format!(
+            r#"{}
+[output]
+CL V KA WT
+"#,
+            minimal_model_with_derived("")
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert_eq!(
+            parsed.model.output_columns,
+            vec!["CL", "V", "KA", "WT"],
+            "output_columns mismatch"
+        );
+    }
+
+    #[test]
+    fn parse_output_empty_block_ok() {
+        let src = format!(
+            r#"{}
+[output]
+"#,
+            minimal_model_with_derived("")
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(
+            parsed.model.output_columns.is_empty(),
+            "empty [output] block should produce empty output_columns"
+        );
+    }
+
+    #[test]
+    fn sci_notation_negative_exp() {
+        let src = minimal_model_with_derived("FLAG = if (TAD < 1e-10) 1 else 0");
+        let parsed = parse_full_model(&src).expect("parse ok — 1e-10 must tokenise correctly");
+        assert_eq!(parsed.model.derived_exprs.len(), 1);
+    }
+
+    #[test]
+    fn sci_notation_positive_exp() {
+        let src = minimal_model_with_derived("FLAG = if (TAFD > 1.5E+3) 1 else 0");
+        let parsed = parse_full_model(&src).expect("parse ok — 1.5E+3 must tokenise correctly");
+        assert_eq!(parsed.model.derived_exprs.len(), 1);
+    }
+
+    #[test]
+    fn mod_operator_euclidean() {
+        // 5 mod 2 == 1, 7 mod 3 == 1, -1 mod 24 == 23
+        let tests = [("5 mod 2", 1.0), ("7 mod 3", 1.0), ("-1 mod 24", 23.0)];
+        for (expr_str, expected) in &tests {
+            let expr_src = format!("VAL = {expr_str}");
+            let src = minimal_model_with_derived(&expr_src);
+            let parsed = parse_full_model(&src).expect("parse ok");
+            let (theta, eta, indiv, cov, prev) = make_derived_ctx_simple();
+            if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+                let ctx = DerivedContext {
+                    theta: &theta,
+                    eta: &eta,
+                    indiv_params: &indiv,
+                    covariates: &cov,
+                    ipred: 0.0,
+                    pred: 0.0,
+                    dv: 0.0,
+                    time: 0.0,
+                    tafd: 0.0,
+                    tad: 0.0,
+                    prev_derived: &prev,
+                };
+                let result = eval(&ctx);
+                assert!(
+                    (result - expected).abs() < 1e-10,
+                    "{expr_str}: expected {expected}, got {result}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn floor_ceil_round_functions() {
+        let tests = [
+            ("floor(-2.3)", -3.0),
+            ("ceil(-2.3)", -2.0),
+            ("round(2.5)", 3.0),
+        ];
+        for (expr_str, expected) in &tests {
+            let src = minimal_model_with_derived(&format!("VAL = {expr_str}"));
+            let parsed = parse_full_model(&src).expect("parse ok");
+            let (theta, eta, indiv, cov, prev) = make_derived_ctx_simple();
+            if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+                let ctx = DerivedContext {
+                    theta: &theta,
+                    eta: &eta,
+                    indiv_params: &indiv,
+                    covariates: &cov,
+                    ipred: 0.0,
+                    pred: 0.0,
+                    dv: 0.0,
+                    time: 0.0,
+                    tafd: 0.0,
+                    tad: 0.0,
+                    prev_derived: &prev,
+                };
+                let result = eval(&ctx);
+                assert!(
+                    (result - expected).abs() < 1e-10,
+                    "{expr_str}: expected {expected}, got {result}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn macheps_available_in_derived() {
+        let src = minimal_model_with_derived("FLAG = if (TAD < MACHEPS) 1 else 0");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let (theta, eta, indiv, cov, _prev) = make_derived_ctx_simple();
+        let prev = std::collections::HashMap::new();
+        if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+            // TAD = 0.0 < MACHEPS → flag = 1
+            let ctx = DerivedContext {
+                theta: &theta,
+                eta: &eta,
+                indiv_params: &indiv,
+                covariates: &cov,
+                ipred: 0.0,
+                pred: 0.0,
+                dv: 0.0,
+                time: 1.0,
+                tafd: 1.0,
+                tad: 0.0, // zero
+                prev_derived: &prev,
+            };
+            assert_eq!(eval(&ctx), 1.0, "TAD=0 should be < MACHEPS");
+            // TAD = 1.0 >> MACHEPS → flag = 0
+            let ctx2 = DerivedContext { tad: 1.0, ..ctx };
+            assert_eq!(eval(&ctx2), 0.0, "TAD=1 should not be < MACHEPS");
+        }
+    }
+
+    #[test]
+    fn derived_resolves_covariate_case_insensitively() {
+        // Regression: a covariate carried in the dataset under an uppercase
+        // header (`WT`) referenced as lowercase `wt` in a [derived] expression
+        // must resolve to the covariate value, not silently evaluate to 0.
+        // build_derived_vars must insert a lowercase alias because
+        // `eval_expression` looks the name up verbatim.
+        let src = minimal_model_with_derived("WT_DERIVED = wt * 2");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let (theta, eta, indiv, _cov, prev) = make_derived_ctx_simple();
+        // Covariate stored under uppercase `WT`, as a NONMEM header would be.
+        let mut cov = std::collections::HashMap::new();
+        cov.insert("WT".to_string(), 70.0);
+        if let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind {
+            let ctx = DerivedContext {
+                theta: &theta,
+                eta: &eta,
+                indiv_params: &indiv,
+                covariates: &cov,
+                ipred: 0.0,
+                pred: 0.0,
+                dv: 0.0,
+                time: 0.0,
+                tafd: 0.0,
+                tad: 0.0,
+                prev_derived: &prev,
+            };
+            assert_eq!(
+                eval(&ctx),
+                140.0,
+                "lowercase `wt` must resolve to covariate header `WT` (=70)"
+            );
+        } else {
+            panic!("expected PerRow derived kind");
+        }
     }
 }

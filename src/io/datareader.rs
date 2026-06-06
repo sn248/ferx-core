@@ -116,6 +116,7 @@ fn read_nonmem_csv_impl(
     let ii_col = col_idx_ci("ii");
     let ss_col = col_idx_ci("ss");
     let cens_col = col_idx_ci("cens");
+    let addl_col = col_idx_ci("addl");
 
     // IOV occasion column (case-insensitive lookup of user-specified name)
     let occ_col: Option<usize> = iov_column.and_then(|name| col_idx_ci(name));
@@ -127,7 +128,7 @@ fn read_nonmem_csv_impl(
     }
 
     const STANDARD_COLS: &[&str] = &[
-        "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens",
+        "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens", "addl",
     ];
     let is_standard = |h: &str| {
         STANDARD_COLS.iter().any(|s| h.eq_ignore_ascii_case(s))
@@ -235,8 +236,9 @@ fn read_nonmem_csv_impl(
     // Build subjects
     let mut subjects = Vec::new();
     let mut total_occ_failures: usize = 0;
+    let mut population_warnings: Vec<String> = Vec::new();
     for (id, rows) in &rows_by_id {
-        let (subject, occ_failures) = parse_subject(
+        let (subject, occ_failures, subj_warnings) = parse_subject(
             id,
             rows,
             time_col,
@@ -250,23 +252,23 @@ fn read_nonmem_csv_impl(
             ss_col,
             cens_col,
             occ_col,
+            addl_col,
             &cov_indices,
         )?;
         subjects.push(subject);
         total_occ_failures += occ_failures;
+        population_warnings.extend(subj_warnings);
     }
 
-    // Surface a single warning if any OCC values were missing/unparseable.
-    // Such rows are silently mapped to occ=0, mixing with valid occ=0 rows —
-    // user should clean the dataset.
+    // Accumulate OCC warning into population_warnings (surfaced via FitResult.warnings).
     if let Some(name) = iov_column {
         if total_occ_failures > 0 {
-            eprintln!(
-                "[ferx] warning: {} row(s) had missing or unparseable values in iov_column '{}'; \
-                 these rows were assigned occasion=0 and may be grouped with valid occ=0 rows. \
-                 Consider cleaning the dataset.",
+            population_warnings.push(format!(
+                "W_IOV_OCC_MISSING: {} row(s) had missing or unparseable values in \
+                 iov_column '{}'; these rows were assigned occasion=0 and may be grouped \
+                 with valid occ=0 rows. Consider cleaning the dataset.",
                 total_occ_failures, name
-            );
+            ));
         }
     }
 
@@ -297,6 +299,7 @@ fn read_nonmem_csv_impl(
             covariate_names: existing_cov_names,
             dv_column: "dv".to_string(),
             input_columns: headers,
+            warnings: population_warnings,
         },
         table,
     ))
@@ -307,7 +310,7 @@ fn parse_f64(s: &str) -> f64 {
 }
 
 fn parse_usize(s: &str) -> usize {
-    s.parse::<usize>().unwrap_or(1)
+    s.parse::<usize>().unwrap_or(0)
 }
 
 /// Parse an EVID cell. A missing / blank / unparseable value maps to 0
@@ -347,8 +350,9 @@ fn parse_subject(
     ss_col: Option<usize>,
     cens_col: Option<usize>,
     occ_col: Option<usize>,
+    addl_col: Option<usize>,
     cov_indices: &[(String, usize)],
-) -> Result<(Subject, usize), String> {
+) -> Result<(Subject, usize, Vec<String>), String> {
     let mut doses = Vec::new();
     let mut obs_times = Vec::new();
     let mut observations = Vec::new();
@@ -357,6 +361,8 @@ fn parse_subject(
     let mut occasions: Vec<u32> = Vec::new();
     let mut dose_occasions: Vec<u32> = Vec::new();
     let mut occ_parse_failures: usize = 0;
+    let mut parse_warnings: Vec<String> = Vec::new();
+    let mut addl_missing_ii_warned = false;
 
     // Time-constant covariates: first non-missing value across all rows.
     // Used as the subject-static fallback (and for the AD fast path, which
@@ -482,7 +488,14 @@ fn parse_subject(
                 .unwrap_or(0.0);
             let cmt = cmt_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
+                .and_then(|s| {
+                    let t = s.trim();
+                    if t == "." || t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<usize>().ok()
+                    }
+                })
                 .unwrap_or(1);
             let rate = rate_col
                 .and_then(|c| row.get(c))
@@ -494,7 +507,7 @@ fn parse_subject(
                 .unwrap_or(0.0);
             let ss = ss_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s) > 0)
+                .map(|s| parse_f64(s.trim()) >= 0.5)
                 .unwrap_or(false);
 
             doses.push(DoseEvent::new(time, amt, cmt, rate, ss, ii));
@@ -504,12 +517,57 @@ fn parse_subject(
             if any_tv {
                 dose_covariates.push(locf_state.clone());
             }
+
+            // ADDL expansion: add additional doses at time + k*II for k=1..=addl.
+            let addl = addl_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_usize(s))
+                .unwrap_or(0);
+            if addl > 0 {
+                if ii <= 0.0 {
+                    if !addl_missing_ii_warned {
+                        parse_warnings.push(format!(
+                            "W_ADDL_MISSING_II subject {}: ADDL > 0 but II is zero or \
+                             missing; additional doses not expanded",
+                            id
+                        ));
+                        addl_missing_ii_warned = true;
+                    }
+                } else {
+                    for k in 1..=(addl as u32) {
+                        doses.push(DoseEvent::new(
+                            time + (k as f64) * ii,
+                            amt,
+                            cmt,
+                            rate,
+                            false, // expanded doses are never SS themselves
+                            ii,
+                        ));
+                        if occ_col.is_some() {
+                            dose_occasions.push(occ);
+                        }
+                        if any_tv {
+                            dose_covariates.push(locf_state.clone());
+                        }
+                    }
+                }
+            }
         } else if evid == 0 && mdv == 0 {
             // Observation record
             let dv = parse_f64(row.get(dv_col).map(|s| s.as_str()).unwrap_or("0"));
+            // Guard "." / blank the same way the dose path does: parse_usize maps
+            // these to 0 (an invalid compartment), but a missing CMT on an
+            // observation row must default to compartment 1.
             let cmt = cmt_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
+                .and_then(|s| {
+                    let t = s.trim();
+                    if t == "." || t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<usize>().ok()
+                    }
+                })
                 .unwrap_or(1);
             let cens_flag = cens_col
                 .and_then(|c| row.get(c))
@@ -584,6 +642,7 @@ fn parse_subject(
             dose_occasions: sorted_dose_occ,
         },
         occ_parse_failures,
+        parse_warnings,
     ))
 }
 
@@ -598,6 +657,25 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
+    }
+
+    #[test]
+    fn test_obs_cmt_dot_defaults_to_compartment_one() {
+        // Regression: a "." (missing) CMT on an observation row must default to
+        // compartment 1, not 0. `parse_usize(".")` yields 0 — an invalid
+        // compartment — so the observation path must guard "." / blank exactly
+        // like the dose path does.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT\n\
+                   1,0,.,1,100,1\n\
+                   1,1,5.0,0,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(
+            subj.obs_cmts,
+            vec![1],
+            "obs CMT='.' must default to compartment 1, not 0"
+        );
     }
 
     #[test]

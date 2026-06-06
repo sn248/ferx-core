@@ -1045,11 +1045,19 @@ mod tests {
         // the undeclared STUDY column. `referenced_covariate_columns()` must
         // pull STUDY into the read union so it lands in each subject's covariate
         // map — otherwise the condition would silently never match.
+        // STUDY is a covariate independent of ID: subjects 1 & 2 are in STUDY 1,
+        // subjects 3 & 4 in STUDY 2. Filtering on STUDY (not ID) must drop a whole
+        // study (3 and 4) while keeping the other (1 and 2). The not-1:1 mapping
+        // ensures the test exercises covariate filtering, not ID matching.
         let csv = "ID,TIME,DV,EVID,AMT,CMT,WT,STUDY\n\
                    1,0,.,1,100,1,70,1\n\
                    1,1,5.0,0,.,1,70,1\n\
-                   2,0,.,1,100,1,80,2\n\
-                   2,1,4.0,0,.,1,80,2\n";
+                   2,0,.,1,100,1,72,1\n\
+                   2,1,4.5,0,.,1,72,1\n\
+                   3,0,.,1,100,1,80,2\n\
+                   3,1,4.0,0,.,1,80,2\n\
+                   4,0,.,1,100,1,85,2\n\
+                   4,1,3.5,0,.,1,85,2\n";
         let f = write_csv(csv);
         let decls = vec![CovariateDecl {
             name: "WT".to_string(),
@@ -1058,11 +1066,14 @@ mod tests {
         let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[]).unwrap();
         let (pop, _table) =
             read_nonmem_csv_with_covariates_filtered(f.path(), &decls, &[], None, &filter).unwrap();
-        // Subject 2 (STUDY==2) is excluded entirely; only subject 1 survives.
-        assert_eq!(pop.subjects.len(), 1, "subject 2 should be filtered out");
-        assert_eq!(pop.subjects[0].id, "1");
+        // Both STUDY==2 subjects (3 and 4) are excluded; STUDY==1 subjects remain.
+        let ids: Vec<&str> = pop.subjects.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2"], "only STUDY==1 subjects should remain");
         let excl = pop.exclusions.as_ref().expect("exclusions present");
-        assert_eq!(excl.excluded_subject_ids, vec!["2".to_string()]);
+        assert_eq!(
+            excl.excluded_subject_ids,
+            vec!["3".to_string(), "4".to_string()]
+        );
         assert!(excl.fired_ignore.iter().any(|s| s.contains("STUDY == 2")));
     }
 

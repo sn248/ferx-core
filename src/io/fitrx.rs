@@ -1608,6 +1608,9 @@ fn wire_to_fit_result(
         input_columns: w.input_columns,
         #[cfg(feature = "nn")]
         neural_networks: w.neural_networks.unwrap_or_default(),
+        // The covariate table is not persisted in the .fitrx bundle (yet); a
+        // round-tripped result therefore has no covariate table.
+        covariate_table: None,
     })
 }
 
@@ -1807,6 +1810,7 @@ mod tests {
             input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
+            covariate_table: None,
         }
     }
 

@@ -2,7 +2,9 @@ use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
-use crate::io::datareader::read_nonmem_csv;
+use crate::io::datareader::{
+    read_nonmem_csv, read_nonmem_csv_with_covariates, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
+};
 use crate::pk;
 use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
 use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
@@ -108,7 +110,13 @@ pub fn run_model_with_data_inits(
     eprintln!("Model: {}", parsed.model.name);
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
-    let population = read_nonmem_csv(Path::new(data_path), None, iov_col)?;
+    let (population, covariate_table) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        data_path,
+        None,
+        iov_col,
+    )?;
     eprintln!(
         "Data:  {} subjects, {} observations from {}",
         population.subjects.len(),
@@ -123,6 +131,7 @@ pub fn run_model_with_data_inits(
         &init_params,
         &parsed.fit_options,
     )?;
+    result.covariate_table = covariate_table;
     // Hash both inputs *after* the fit so we don't double up disk reads
     // (the model and CSV are already in the page cache from parse + read
     // upstream). Errors here are non-fatal: the fit already succeeded, and
@@ -287,6 +296,65 @@ fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagn
         ),
     )
     .with_suggestion(format!("available covariate columns: {}", available))]
+}
+
+/// Covariates referenced by the model but missing from the `[covariates]`
+/// declaration. These are still read (leniently) so the model works; the parser
+/// has already warned that they ought to be declared.
+fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<String> {
+    model
+        .referenced_covariates
+        .iter()
+        .filter(|c| !decls.iter().any(|d| &d.name == *c))
+        .cloned()
+        .collect()
+}
+
+/// Single covariate-aware reader used by every file-based entry point (`fit`
+/// wrappers and `ferx check`), so they all apply identical covariate validation.
+///
+/// When the model declares a `[covariates]` block this routes through the strict
+/// reader (validates declared columns exist + are numeric, builds the table, and
+/// reads referenced-but-undeclared covariates leniently as `extra`). Otherwise
+/// it falls back to the lenient reader with `fallback_columns` (the legacy
+/// `covariate_columns` argument, or `None` for auto-detect).
+fn read_population_for(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+) -> Result<(Population, Option<CovariateTable>), String> {
+    match covariate_decls {
+        Some(decls) => {
+            let extra = undeclared_referenced(model, decls);
+            let (pop, table) =
+                read_nonmem_csv_with_covariates(Path::new(data_path), decls, &extra, iov_column)?;
+            Ok((pop, Some(table)))
+        }
+        None => Ok((
+            read_nonmem_csv(Path::new(data_path), fallback_columns, iov_column)?,
+            None,
+        )),
+    }
+}
+
+/// Map an error string from [`read_population_for`] onto a `ferx check`
+/// diagnostic, so the covariate-validation failures the strict reader raises at
+/// fit time surface with the same code/block in `ferx check` (rather than as a
+/// generic `E_DATA`). Classification keys off the reader's stable message
+/// prefixes ([`ERR_COV_MISSING_COLUMNS`] / [`ERR_COV_NON_NUMERIC`]).
+fn covariate_read_diagnostic(err: &str, path: &str) -> Diagnostic {
+    if err.starts_with(ERR_COV_MISSING_COLUMNS) {
+        Diagnostic::error("E_MISSING_COVARIATE", err.to_string()).with_block("covariates")
+    } else if err.starts_with(ERR_COV_NON_NUMERIC) {
+        Diagnostic::error("E_COVARIATE_NOT_NUMERIC", err.to_string()).with_block("covariates")
+    } else {
+        Diagnostic::error(
+            "E_DATA",
+            format!("Failed to read data file '{}': {}", path, err),
+        )
+    }
 }
 
 /// Per-CMT scaling needs every observed CMT to have an entry in the
@@ -669,11 +737,15 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    what the CLI fit path (`run_model_with_data`) passes to `fit()`.
     diags.extend(check_model_options(&parsed.model, &parsed.fit_options));
 
-    // 3. Data-dependent checks (only when a dataset is supplied).
+    // 3. Data-dependent checks (only when a dataset is supplied). Read through
+    //    the same covariate-aware chokepoint the fit uses, so `ferx check` and
+    //    `fit()` apply identical covariate validation (declared columns present
+    //    + numeric). A covariate-validation failure surfaces as the matching
+    //    diagnostic rather than a generic read error.
     if let Some(path) = data_path {
         let iov_col = parsed.fit_options.iov_column.as_deref();
-        match read_nonmem_csv(Path::new(path), None, iov_col) {
-            Ok(population) => {
+        match read_population_for(&parsed.model, &parsed.covariate_decls, path, None, iov_col) {
+            Ok((population, _table)) => {
                 diags.extend(check_model_data(&parsed.model, &population));
                 let init_params = parsed.model.default_params.clone();
                 diags.extend(check_model_data_warnings(
@@ -683,10 +755,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                 ));
             }
             Err(e) => {
-                diags.push(Diagnostic::error(
-                    "E_DATA",
-                    format!("Failed to read data file '{}': {}", path, e),
-                ));
+                diags.push(covariate_read_diagnostic(&e, path));
             }
         }
     }
@@ -712,8 +781,21 @@ pub fn fit_from_files(
     covariate_columns: Option<&[&str]>,
     options: Option<FitOptions>,
 ) -> Result<FitResult, String> {
-    let mut model = crate::parser::model_parser::parse_model_file(Path::new(model_path))?;
-    let population = read_nonmem_csv(Path::new(data_path), covariate_columns, None)?;
+    // Parse the full model so an authoritative `[covariates]` block is visible
+    // here (the file's `[fit_options]` are still ignored — the caller's
+    // `options` win, preserving historical behaviour).
+    let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(model_path))?;
+    let mut model = parsed.model;
+    // A `[covariates]` declaration takes precedence over the explicit
+    // `covariate_columns` argument; otherwise fall back to the argument (or
+    // legacy auto-detect when both are absent).
+    let (population, covariate_table) = read_population_for(
+        &model,
+        &parsed.covariate_decls,
+        data_path,
+        covariate_columns,
+        None,
+    )?;
     let opts = options.unwrap_or_default();
     model.bloq_method = opts.bloq_method;
     // SDE models cannot use autodiff — force FD.
@@ -724,6 +806,7 @@ pub fn fit_from_files(
             opts.gradient_method
         };
     let mut result = fit(&model, &population, &model.default_params, &opts)?;
+    result.covariate_table = covariate_table;
     // Hash inputs post-fit (same pattern as `run_model_with_data`). The
     // model and CSV were already read by `parse_model_file` and
     // `read_nonmem_csv` upstream, so the OS page cache typically serves
@@ -1733,6 +1816,10 @@ fn fit_inner(
         input_columns: population.input_columns.clone(),
         #[cfg(feature = "nn")]
         neural_networks: build_neural_network_infos(model),
+        // Populated by the file-based entry points (`fit_from_files`,
+        // `run_model_with_data`) when the model declares a `[covariates]`
+        // block; the in-memory `fit()` path has no raw rows to echo.
+        covariate_table: None,
     };
 
     if time_gradients {
@@ -3826,6 +3913,7 @@ mod simulate_with_uncertainty_tests {
             input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
+            covariate_table: None,
         }
     }
 

@@ -425,6 +425,7 @@ mod tests {
             input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
+            covariate_table: None,
         }
     }
 

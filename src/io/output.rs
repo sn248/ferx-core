@@ -557,19 +557,50 @@ pub fn write_sdtab_csv(
     for row in 0..n_rows {
         let vals: Vec<String> = cols
             .iter()
-            .map(|(_, values)| {
-                let v = values[row];
-                if v.is_nan() {
-                    String::new()
-                } else {
-                    format!("{:.6}", v)
-                }
-            })
+            .map(|(_, values)| fmt_num(values[row]))
             .collect();
         writeln!(f, "{}", vals.join(",")).map_err(|e| e.to_string())?;
     }
 
     Ok(())
+}
+
+/// Write the covariate table (from a `[covariates]` block) as a CSV file.
+///
+/// Columns: `ID, TIME, EVID, <declared covariates...>`, one row per input
+/// dataset record. Missing values (`f64::NAN`) are written as empty cells so
+/// downstream tools read them as missing. Uses the `csv` writer so a subject ID
+/// (a free-form string) containing a comma or quote is properly escaped rather
+/// than corrupting column alignment.
+pub fn write_covtab_csv(table: &crate::types::CovariateTable, path: &str) -> Result<(), String> {
+    let mut wtr = csv::WriterBuilder::new()
+        .from_path(path)
+        .map_err(|e| format!("Failed to create {}: {}", path, e))?;
+
+    let mut header: Vec<String> = vec!["ID".into(), "TIME".into(), "EVID".into()];
+    header.extend(table.names.iter().cloned());
+    wtr.write_record(&header).map_err(|e| e.to_string())?;
+
+    for row in &table.rows {
+        let mut rec: Vec<String> = Vec::with_capacity(3 + row.values.len());
+        rec.push(row.id.clone());
+        rec.push(fmt_num(row.time));
+        rec.push(row.evid.to_string());
+        rec.extend(row.values.iter().map(|&v| fmt_num(v)));
+        wtr.write_record(&rec).map_err(|e| e.to_string())?;
+    }
+
+    wtr.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Format a numeric cell for CSV output: NaN → empty (missing), else 6 dp.
+fn fmt_num(v: f64) -> String {
+    if v.is_nan() {
+        String::new()
+    } else {
+        format!("{:.6}", v)
+    }
 }
 
 /// Write parameter estimates and uncertainty as YAML
@@ -1107,6 +1138,7 @@ mod tests {
             input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
+            covariate_table: None,
         }
     }
 
@@ -1427,6 +1459,7 @@ mod tests {
             input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
+            covariate_table: None,
         }
     }
 

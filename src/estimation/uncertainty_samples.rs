@@ -426,6 +426,7 @@ mod tests {
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
             covariate_table: None,
+            exclusions: None,
         }
     }
 

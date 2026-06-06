@@ -84,6 +84,7 @@ fn sparse_population(n: usize) -> Population {
         covariate_names: vec![],
         dv_column: "dv".into(),
         input_columns: vec![],
+        exclusions: None,
         warnings: vec![],
     }
 }

@@ -1410,11 +1410,35 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .get("simulation")
         .map(|lines| parse_simulation_block(lines))
         .transpose()?;
-    let fit_options = if let Some(lines) = blocks.get("fit_options") {
+    let mut fit_options = if let Some(lines) = blocks.get("fit_options") {
         parse_fit_options(lines)?
     } else {
         FitOptions::default()
     };
+
+    // ── [data_selection] block ────────────────────────────────────────────────
+    // Parsed after [fit_options] and merged into the same FitOptions so the
+    // read-time filtering code has a single place to look.
+    if let Some(lines) = blocks.get("data_selection") {
+        for line in lines {
+            let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let key = parts[0];
+            let value = parts[1];
+            if key != "ignore" && key != "accept" && key != "ignore_subjects" {
+                return Err(format!(
+                    "[data_selection]: unknown key `{key}` — valid keys are \
+                     ignore, accept, ignore_subjects"
+                ));
+            }
+            match apply_fit_option(&mut fit_options, key, value) {
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
 
     // Mirror fit-level BLOQ method onto the compiled model so the likelihood
     // functions can branch without threading bloq_method through every call.
@@ -2635,10 +2659,55 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             };
         }
+        // ── [data_selection] keys ─────────────────────────────────────────────
+        "ignore" => {
+            // Validate the expression parses correctly; store verbatim for logging.
+            crate::io::filter_expr::FilterClause::parse(value)
+                .map_err(|e| format!("[data_selection] ignore: {e}"))?;
+            push_unique_expr(&mut opts.ignore_exprs, value);
+            // user_set_keys intentionally not pushed for selection keys — they
+            // are not estimation options and should not trigger "unused key" warnings.
+            return Ok(true);
+        }
+        "accept" => {
+            crate::io::filter_expr::FilterClause::parse(value)
+                .map_err(|e| format!("[data_selection] accept: {e}"))?;
+            push_unique_expr(&mut opts.accept_exprs, value);
+            return Ok(true);
+        }
+        "ignore_subjects" => {
+            // Accept `[3, 17, 42]` or `3` (single value).
+            let raw = value.trim().trim_start_matches('[').trim_end_matches(']');
+            for part in raw.split(',') {
+                let id = part.trim().to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                // Validate it looks like a number or quoted string.
+                let bare = id.trim_matches('"').trim_matches('\'');
+                if bare.is_empty() {
+                    return Err(format!(
+                        "[data_selection] ignore_subjects: empty ID entry in '{value}'"
+                    ));
+                }
+                push_unique_expr(&mut opts.ignore_subjects, bare);
+            }
+            return Ok(true);
+        }
         _ => return Ok(false),
     }
     opts.user_set_keys.push(key.to_string());
     Ok(true)
+}
+
+/// Append `s` (trimmed) to `vec` only if not already present (case-sensitive).
+/// Prevents duplicate conditions when the same expression appears in both the
+/// `.ferx` file and the R call.
+fn push_unique_expr(vec: &mut Vec<String>, s: &str) {
+    let trimmed = s.trim().to_string();
+    if !vec.iter().any(|e| e == &trimmed) {
+        vec.push(trimmed);
+    }
 }
 
 // ── [scaling] block parser ──────────────────────────────────────────────────

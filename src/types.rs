@@ -273,6 +273,30 @@ impl Subject {
     }
 }
 
+/// Summary of records excluded by `[data_selection]` `ignore`/`accept` rules.
+#[derive(Debug, Clone, Default)]
+pub struct ExclusionSummary {
+    /// Subject IDs that had all records removed (zero doses and observations remaining).
+    pub excluded_subject_ids: Vec<String>,
+    /// Number of observation records (EVID==0, MDV==0) excluded.
+    pub n_obs_excluded: usize,
+    /// Number of dose records (EVID 1/4) excluded.
+    pub n_dose_excluded: usize,
+    /// Number of other records excluded that are neither a scored observation
+    /// nor a dose — EVID==2 (other event), EVID==3 (reset), and missing-DV
+    /// observation rows (EVID==0, MDV==1). Tracked so the reported counts sum to
+    /// every excluded record and the summary can't read all-zeros while rows
+    /// were dropped.
+    pub n_other_excluded: usize,
+    /// Total CSV records read before any filtering.
+    pub n_records_total: usize,
+    /// `ignore` / `ignore_subjects` clauses that matched at least one record,
+    /// in declaration order.
+    pub fired_ignore: Vec<String>,
+    /// `accept` clauses that rejected at least one record, in declaration order.
+    pub fired_accept: Vec<String>,
+}
+
 /// A collection of subjects
 #[derive(Debug, Clone)]
 pub struct Population {
@@ -283,6 +307,9 @@ pub struct Population {
     /// covariates). Preserved verbatim so downstream consumers can echo a NONMEM-style
     /// `$INPUT` line. Empty for in-memory `Population` values that were not read from a file.
     pub input_columns: Vec<String>,
+    /// Present when `[data_selection]` rules were applied; `None` when no filtering
+    /// was requested or the population was constructed in-memory.
+    pub exclusions: Option<ExclusionSummary>,
     /// Non-fatal warnings generated while reading the dataset (e.g. ADDL with missing II,
     /// unparseable OCC values). Propagated into `FitResult.warnings` by `fit()`.
     pub warnings: Vec<String>,
@@ -1972,6 +1999,10 @@ pub struct FitResult {
     /// (which has no raw rows) or when no `[covariates]` block is declared.
     /// Missing values are `f64::NAN`. See [`CovariateTable`].
     pub covariate_table: Option<CovariateTable>,
+    /// Record-level exclusion statistics; `Some` when `[data_selection]` rules
+    /// were active during the fit (or the caller supplied `ignore`/`accept`
+    /// expressions).  `None` means no filtering was requested.
+    pub exclusions: Option<ExclusionSummary>,
 }
 
 /// Minimal per-NN metadata carried on `FitResult` so output writers can
@@ -2210,6 +2241,17 @@ pub struct FitOptions {
     /// values from the data. Useful when the model file's defaults are far from
     /// the truth. `None` (the default) disables it.
     pub inits_from_nca: Option<crate::suggest_start::NcaInit>,
+    /// Expression strings for `[data_selection] ignore = ...` / `ignore_subjects`.
+    /// Each string may contain `&&`-joined sub-expressions (all must hold).
+    /// A record is excluded when any clause evaluates to `true`.
+    /// Stored verbatim for logging; compiled to `FilterClause` at read time.
+    pub ignore_exprs: Vec<String>,
+    /// Expression strings for `[data_selection] accept = ...`.
+    /// A record is excluded when any clause evaluates to `false`.
+    pub accept_exprs: Vec<String>,
+    /// Subject IDs to exclude wholesale (syntactic sugar for `ignore = ID == X`).
+    /// Compared as strings against `Subject::id`.
+    pub ignore_subjects: Vec<String>,
 }
 
 impl Default for FitOptions {
@@ -2282,6 +2324,9 @@ impl Default for FitOptions {
             min_obs_for_convergence_check: 2,
             stagnation_guard: true,
             inits_from_nca: None,
+            ignore_exprs: Vec::new(),
+            accept_exprs: Vec::new(),
+            ignore_subjects: Vec::new(),
         }
     }
 }

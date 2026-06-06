@@ -119,6 +119,7 @@ fn test_suggest_start_empty_population() {
         covariate_names: vec![],
         dv_column: "DV".into(),
         input_columns: vec![],
+        exclusions: None,
         warnings: vec![],
     };
     let result = inits_from_nca(&model, &empty, NcaInit::Nca);

@@ -42,6 +42,7 @@ fn one_dose_population() -> Population {
         covariate_names: vec!["WT".to_string()],
         dv_column: "DV".to_string(),
         input_columns: vec![],
+        exclusions: None,
         warnings: vec![],
         subjects: vec![Subject {
             id: "1".into(),

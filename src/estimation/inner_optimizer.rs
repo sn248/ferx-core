@@ -1412,6 +1412,7 @@ mod iov_tests {
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
             warnings: vec![],
         };
         // `requested` is the user's FitOptions value, passed independently of

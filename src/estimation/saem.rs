@@ -2180,6 +2180,7 @@ mod tests {
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
             warnings: vec![],
         };
 
@@ -2278,6 +2279,7 @@ mod tests {
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
             warnings: vec![],
         };
 
@@ -2431,6 +2433,7 @@ mod tests {
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
             warnings: vec![],
         };
 

@@ -449,6 +449,33 @@ pub fn print_results(result: &FitResult) {
     eprintln!("  Wall time:  {:.1}s", result.wall_time_secs);
     eprintln!("  ferx v{}", result.ferx_version);
 
+    // Data selection exclusions
+    if let Some(excl) = &result.exclusions {
+        eprintln!("\n--- Data Selection ---");
+        eprintln!(
+            "  Records read: {}  Obs excluded: {}  Doses excluded: {}  Other excluded: {}",
+            excl.n_records_total, excl.n_obs_excluded, excl.n_dose_excluded, excl.n_other_excluded
+        );
+        if !excl.excluded_subject_ids.is_empty() {
+            eprintln!(
+                "  Subjects excluded entirely: {}",
+                excl.excluded_subject_ids.join(", ")
+            );
+        }
+        if !excl.fired_ignore.is_empty() {
+            eprintln!("  Fired ignore conditions:");
+            for c in &excl.fired_ignore {
+                eprintln!("    * {}", c);
+            }
+        }
+        if !excl.fired_accept.is_empty() {
+            eprintln!("  Fired accept conditions (failed):");
+            for c in &excl.fired_accept {
+                eprintln!("    * {}", c);
+            }
+        }
+    }
+
     // Warnings
     if !result.warnings.is_empty() {
         eprintln!("\n--- Warnings ---");
@@ -1072,6 +1099,32 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    if let Some(excl) = &result.exclusions {
+        writeln!(f, "\nexclusions:").map_err(|e| e.to_string())?;
+        writeln!(f, "  n_records_total: {}", excl.n_records_total).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_obs_excluded: {}", excl.n_obs_excluded).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_dose_excluded: {}", excl.n_dose_excluded).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_other_excluded: {}", excl.n_other_excluded).map_err(|e| e.to_string())?;
+        if !excl.excluded_subject_ids.is_empty() {
+            writeln!(f, "  excluded_subject_ids:").map_err(|e| e.to_string())?;
+            for id in &excl.excluded_subject_ids {
+                writeln!(f, "    - \"{}\"", id).map_err(|e| e.to_string())?;
+            }
+        }
+        if !excl.fired_ignore.is_empty() {
+            writeln!(f, "  fired_ignore:").map_err(|e| e.to_string())?;
+            for c in &excl.fired_ignore {
+                writeln!(f, "    - \"{}\"", c).map_err(|e| e.to_string())?;
+            }
+        }
+        if !excl.fired_accept.is_empty() {
+            writeln!(f, "  fired_accept:").map_err(|e| e.to_string())?;
+            for c in &excl.fired_accept {
+                writeln!(f, "    - \"{}\"", c).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
     if !result.warnings.is_empty() {
         writeln!(f, "\nwarnings:").map_err(|e| e.to_string())?;
         for w in &result.warnings {
@@ -1244,6 +1297,7 @@ mod tests {
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
             covariate_table: None,
+            exclusions: None,
         }
     }
 
@@ -1567,6 +1621,7 @@ mod tests {
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
             covariate_table: None,
+            exclusions: None,
         }
     }
 
@@ -1589,6 +1644,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
             warnings: vec![],
         };
 
@@ -1617,6 +1673,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
             warnings: vec![],
         };
 
@@ -1638,6 +1695,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
             warnings: vec![],
         };
 
@@ -1668,6 +1726,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
             warnings: vec![],
         };
 
@@ -1714,6 +1773,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            exclusions: None,
             warnings: vec![],
         };
 

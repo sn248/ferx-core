@@ -103,8 +103,9 @@ pub fn read_nonmem_csv(
     // Build subjects
     let mut subjects = Vec::new();
     let mut total_occ_failures: usize = 0;
+    let mut population_warnings: Vec<String> = Vec::new();
     for (id, rows) in &rows_by_id {
-        let (subject, occ_failures) = parse_subject(
+        let (subject, occ_failures, subj_warnings) = parse_subject(
             id,
             rows,
             time_col,
@@ -123,19 +124,18 @@ pub fn read_nonmem_csv(
         )?;
         subjects.push(subject);
         total_occ_failures += occ_failures;
+        population_warnings.extend(subj_warnings);
     }
 
-    // Surface a single warning if any OCC values were missing/unparseable.
-    // Such rows are silently mapped to occ=0, mixing with valid occ=0 rows —
-    // user should clean the dataset.
+    // Accumulate OCC warning into population_warnings (surfaced via FitResult.warnings).
     if let Some(name) = iov_column {
         if total_occ_failures > 0 {
-            eprintln!(
-                "[ferx] warning: {} row(s) had missing or unparseable values in iov_column '{}'; \
-                 these rows were assigned occasion=0 and may be grouped with valid occ=0 rows. \
-                 Consider cleaning the dataset.",
+            population_warnings.push(format!(
+                "W_IOV_OCC_MISSING: {} row(s) had missing or unparseable values in \
+                 iov_column '{}'; these rows were assigned occasion=0 and may be grouped \
+                 with valid occ=0 rows. Consider cleaning the dataset.",
                 total_occ_failures, name
-            );
+            ));
         }
     }
 
@@ -144,6 +144,7 @@ pub fn read_nonmem_csv(
         covariate_names: cov_names,
         dv_column: "dv".to_string(),
         input_columns: headers,
+        warnings: population_warnings,
     })
 }
 
@@ -152,7 +153,7 @@ fn parse_f64(s: &str) -> f64 {
 }
 
 fn parse_usize(s: &str) -> usize {
-    s.parse::<usize>().unwrap_or(1)
+    s.parse::<usize>().unwrap_or(0)
 }
 
 /// Parse an occasion-column cell. Returns `None` for blank / `.` / NA / non-integer
@@ -183,7 +184,7 @@ fn parse_subject(
     occ_col: Option<usize>,
     addl_col: Option<usize>,
     cov_indices: &[(String, usize)],
-) -> Result<(Subject, usize), String> {
+) -> Result<(Subject, usize, Vec<String>), String> {
     let mut doses = Vec::new();
     let mut obs_times = Vec::new();
     let mut observations = Vec::new();
@@ -192,6 +193,7 @@ fn parse_subject(
     let mut occasions: Vec<u32> = Vec::new();
     let mut dose_occasions: Vec<u32> = Vec::new();
     let mut occ_parse_failures: usize = 0;
+    let mut parse_warnings: Vec<String> = Vec::new();
     let mut addl_missing_ii_warned = false;
 
     // Time-constant covariates: first non-missing value across all rows.
@@ -349,11 +351,11 @@ fn parse_subject(
             if addl > 0 {
                 if ii <= 0.0 {
                     if !addl_missing_ii_warned {
-                        eprintln!(
-                            "[ferx] W_ADDL_MISSING_II subject {}: ADDL > 0 but II is zero or \
+                        parse_warnings.push(format!(
+                            "W_ADDL_MISSING_II subject {}: ADDL > 0 but II is zero or \
                              missing; additional doses not expanded",
                             id
-                        );
+                        ));
                         addl_missing_ii_warned = true;
                     }
                 } else {
@@ -455,6 +457,7 @@ fn parse_subject(
             dose_occasions: sorted_dose_occ,
         },
         occ_parse_failures,
+        parse_warnings,
     ))
 }
 

@@ -182,6 +182,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         covariate_names: vec![],
         dv_column: "dv".into(),
         input_columns: vec![],
+        warnings: vec![],
     };
 
     // Simulate
@@ -659,6 +660,10 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     for w in &parsed.model.parse_warnings {
         let code = if w.contains("declared in [parameters] but not referenced") {
             "W_UNUSED_PARAM"
+        } else if w.contains("W_DERIVED_COVARIATE_SHADOW") {
+            "W_DERIVED_COVARIATE_SHADOW"
+        } else if w.contains("W_DERIVED_STEP_IGNORED") {
+            "W_DERIVED_STEP_IGNORED"
         } else {
             "W_PARSE"
         };
@@ -1127,7 +1132,7 @@ fn build_indiv_map(pk: &PkParams, names: &[String], pk_indices: &[usize]) -> Has
 /// Trapezoid integration over (time, value) pairs in the slice.
 fn trapezoid(points: &[(f64, f64)]) -> f64 {
     if points.len() < 2 {
-        return 0.0;
+        return f64::NAN;
     }
     let mut auc = 0.0;
     for w in points.windows(2) {
@@ -1176,6 +1181,10 @@ pub(crate) fn compute_extra_output_columns(
             per_obs_tad.push(tad_j);
         }
 
+        // Store per-obs TAD (with individual lagtime) so output.rs can use it
+        // for the mandatory TAD column without re-evaluating PK parameters.
+        sr.per_obs_tad = per_obs_tad.clone();
+
         // [output] columns: covariates + indiv params not already in derived
         for col_name in &model.output_columns {
             if derived_names
@@ -1212,13 +1221,21 @@ pub(crate) fn compute_extra_output_columns(
             sr.extra_columns.push((col_name.clone(), col_vals));
         }
 
-        // [derived] columns, evaluated in declaration order
-        let mut prev_derived: HashMap<String, f64> = HashMap::new();
+        // [derived] columns, evaluated in declaration order.
+        // prev_derived_vecs stores the full per-row vector for each column evaluated
+        // so far. For Aggregate/Integral (same scalar every row), all elements are
+        // identical. This allows sequential references (`B = f(A)`) to see the
+        // correct per-row value at index j, not just the last row's value.
+        let mut prev_derived_vecs: HashMap<String, Vec<f64>> = HashMap::new();
 
         for spec in &model.derived_exprs {
             let col_vals: Vec<f64> = match &spec.kind {
                 DerivedKind::PerRow { eval } => (0..n_obs)
                     .map(|j| {
+                        let row_prev: HashMap<String, f64> = prev_derived_vecs
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v[j]))
+                            .collect();
                         let ctx = DerivedContext {
                             theta,
                             eta: eta_hat,
@@ -1230,7 +1247,7 @@ pub(crate) fn compute_extra_output_columns(
                             time: subject.obs_times[j],
                             tafd: per_obs_tafd[j],
                             tad: per_obs_tad[j],
-                            prev_derived: &prev_derived,
+                            prev_derived: &row_prev,
                         };
                         eval(&ctx)
                     })
@@ -1243,6 +1260,10 @@ pub(crate) fn compute_extra_output_columns(
                 } => {
                     let mut qualifying: Vec<(usize, f64)> = Vec::new();
                     for j in 0..n_obs {
+                        let row_prev: HashMap<String, f64> = prev_derived_vecs
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v[j]))
+                            .collect();
                         let ctx = DerivedContext {
                             theta,
                             eta: eta_hat,
@@ -1254,7 +1275,7 @@ pub(crate) fn compute_extra_output_columns(
                             time: subject.obs_times[j],
                             tafd: per_obs_tafd[j],
                             tad: per_obs_tad[j],
-                            prev_derived: &prev_derived,
+                            prev_derived: &row_prev,
                         };
                         let include = filter.as_ref().map_or(true, |f| f(&ctx));
                         if include {
@@ -1304,6 +1325,10 @@ pub(crate) fn compute_extra_output_columns(
                                 if t < from - 1e-12 || t > to + 1e-12 {
                                     return None;
                                 }
+                                let row_prev: HashMap<String, f64> = prev_derived_vecs
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v[j]))
+                                    .collect();
                                 let ctx = DerivedContext {
                                     theta,
                                     eta: eta_hat,
@@ -1315,7 +1340,7 @@ pub(crate) fn compute_extra_output_columns(
                                     time: t,
                                     tafd: per_obs_tafd[j],
                                     tad: per_obs_tad[j],
-                                    prev_derived: &prev_derived,
+                                    prev_derived: &row_prev,
                                 };
                                 if condition.as_ref().map_or(false, |f| !f(&ctx)) {
                                     return None;
@@ -1329,6 +1354,12 @@ pub(crate) fn compute_extra_output_columns(
                     // For model-based integrals with a fine grid, use ipred at a
                     // representative cov snapshot (first obs) across a uniform grid.
                     // This is an approximation: cov is time-constant at j=0 values.
+                    // For prior derived columns, use first-observation values for
+                    // consistency with cov_0 / indiv_0.
+                    let grid_prev: HashMap<String, f64> = prev_derived_vecs
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.first().copied().unwrap_or(f64::NAN)))
+                        .collect();
                     let eval_integral_grid = |from: f64, to: f64| -> f64 {
                         let n_steps = match step {
                             IntegralStep::Fixed(s) => {
@@ -1378,7 +1409,7 @@ pub(crate) fn compute_extra_output_columns(
                                     time: t,
                                     tafd: tafd_k,
                                     tad: f64::NAN, // simplified
-                                    prev_derived: &prev_derived,
+                                    prev_derived: &grid_prev,
                                 };
                                 if condition.as_ref().map_or(false, |f| !f(&ctx)) {
                                     return None;
@@ -1420,10 +1451,9 @@ pub(crate) fn compute_extra_output_columns(
                 }
             };
 
-            // Store last value for sequential derived references
-            if let Some(&last) = col_vals.last() {
-                prev_derived.insert(spec.name.clone(), last);
-            }
+            // Store full per-row vector so subsequent derived columns can
+            // look up the correct value at each observation row index j.
+            prev_derived_vecs.insert(spec.name.clone(), col_vals.clone());
             sr.extra_columns.push((spec.name.clone(), col_vals));
         }
     }
@@ -1590,6 +1620,9 @@ fn fit_inner(
     let mut result: Option<crate::estimation::outer_optimizer::OuterResult> = None;
     let mut accumulated_warnings: Vec<String> = model.parse_warnings.clone();
     accumulated_warnings.extend(unsupported_warnings);
+    // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING) accumulated
+    // by read_nonmem_csv into population.warnings.
+    accumulated_warnings.extend(population.warnings.iter().cloned());
 
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
@@ -1831,8 +1864,9 @@ fn fit_inner(
         options.interaction,
     );
 
-    // Post-fit: compute [derived] and [output] columns into extra_columns.
-    if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() {
+    // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
+    // (with individual lagtime) for the mandatory TAD column in output.rs.
+    if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_lagtime() {
         compute_extra_output_columns(model, population, &result.params.theta, &mut subjects);
     }
 
@@ -2443,6 +2477,7 @@ fn compute_subject_results(
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
                 extra_columns: vec![],
+                per_obs_tad: vec![],
             }
         })
         .collect()
@@ -2628,6 +2663,7 @@ mod tests {
             cens: vec![0; n],
             n_obs: n,
             extra_columns: vec![],
+            per_obs_tad: vec![],
         }
     }
 
@@ -3312,6 +3348,7 @@ mod iov_integration {
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
             input_columns: vec![],
+            warnings: vec![],
         }
     }
 
@@ -4145,6 +4182,7 @@ mod simulate_with_uncertainty_tests {
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
             input_columns: vec![],
+            warnings: vec![],
         }
     }
 
@@ -4472,6 +4510,7 @@ mod sde_integration {
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
             input_columns: vec![],
+            warnings: vec![],
         }
     }
 
@@ -4596,6 +4635,7 @@ mod sde_integration {
                 covariate_names: Vec::new(),
                 dv_column: "DV".into(),
                 input_columns: vec![],
+                warnings: vec![],
             }
         };
 
@@ -4879,6 +4919,7 @@ mod tests_sdtab_tv_cov {
             covariate_names: vec!["WT".into()],
             dv_column: "DV".into(),
             input_columns: vec![],
+            warnings: vec![],
         };
 
         // Fixed EBE at η = 0; H matrix is irrelevant for the IPRED check but

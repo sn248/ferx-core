@@ -237,6 +237,7 @@ mod tests {
             cens: vec![],
             n_obs: 0,
             extra_columns: vec![],
+            per_obs_tad: vec![],
         }
     }
 

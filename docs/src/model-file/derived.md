@@ -34,7 +34,7 @@ where `name` becomes a new sdtab column and `expression` is evaluated for every 
 
 ## Operators and functions
 
-Standard arithmetic (`+`, `-`, `*`, `/`, `%`), comparison (`<`, `>`, `<=`, `>=`, `==`, `!=`), and logical (`&&`, `||`, `!`) operators are supported, as well as:
+Standard arithmetic (`+`, `-`, `*`, `/`), comparison (`<`, `>`, `<=`, `>=`, `==`, `!=`), and logical (`&&`, `||`, `!`) operators are supported. Use the `mod` keyword for modulo (`a mod b`). As well as:
 
 | Function | Description |
 |----------|-------------|
@@ -43,7 +43,7 @@ Standard arithmetic (`+`, `-`, `*`, `/`, `%`), comparison (`<`, `>`, `<=`, `>=`,
 | `sqrt(x)` | Square root |
 | `abs(x)` | Absolute value |
 | `floor(x)` / `ceil(x)` / `round(x)` | Rounding |
-| `pow(x, y)` | Power |
+| `x ^ y` | Power (use `^`, not a function call) |
 | `max(expr)` | Subject-level maximum of `expr` over all observations |
 | `min(expr)` | Subject-level minimum |
 | `tmax(expr)` | Time at which `expr` is maximised |
@@ -71,10 +71,12 @@ Cmax = max(IPRED)
 Tmax = tmax(IPRED)
 ```
 
-A filter can be applied with `if condition`:
+A filter can be applied as the second argument inside the parentheses:
 
 ```
-CmaxAfter12 = max(IPRED) if TIME > 12
+CmaxAfter12 = max(IPRED, TIME > 12)
+Ctrough      = min(IPRED, TAD < 1e-10)
+CmaxD14      = max(IPRED, TAFD >= 312 && TAFD < 336)
 ```
 
 The filter uses the same expression language. If no observation passes the filter the result is `NaN`.
@@ -91,6 +93,12 @@ AUC24 = integral(IPRED, from=0, to=24)
 AUC24_obs = integral(DV, from=0, to=24)
 AUC24_grid = integral(IPRED, from=0, to=24, step=0.5)
 ```
+
+> **Limitation — obs-based time-above-threshold:** When using `integral(1.0, IPRED > threshold, ...)` without a `step=` argument, only observation time points are evaluated. If the design has sparse sampling, the trapezoidal rule can miss brief periods above threshold between observations. Use `step=` (e.g. `step=0.1`) to force grid evaluation at the cost of approximating IPRED via nearest-neighbour interpolation:
+>
+> ```
+> TAM_TAU = integral(1.0, IPRED > MEC, window=24, anchor=0, step=0.1)
+> ```
 
 ## Naming rules
 

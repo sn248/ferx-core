@@ -565,14 +565,20 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         cols.push(("TAFD".to_string(), vals));
     }
 
-    // TAD — mandatory, SS-aware.
+    // TAD — mandatory, SS-aware. When compute_extra_output_columns has run
+    // (lagtime models or models with [derived]/[output] blocks), per_obs_tad
+    // already reflects the individual lagtime; fall back to lagtime=0 otherwise.
     {
         let vals: Vec<f64> = result
             .subjects
             .iter()
             .zip(population.subjects.iter())
-            .flat_map(|(_sr, subj)| {
-                subj.obs_times.iter().map(|&obs_t| {
+            .flat_map(|(sr, subj)| {
+                (0..sr.ipred.len()).map(|j| {
+                    if !sr.per_obs_tad.is_empty() {
+                        return sr.per_obs_tad[j];
+                    }
+                    let obs_t = subj.obs_times[j];
                     let last_eff = subj
                         .doses
                         .iter()
@@ -1402,6 +1408,7 @@ mod tests {
             cens: vec![0; n_obs],
             n_obs,
             extra_columns: vec![],
+            per_obs_tad: vec![],
         }
     }
 
@@ -1547,6 +1554,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            warnings: vec![],
         };
 
         let cols = sdtab(&result, &population);
@@ -1574,6 +1582,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            warnings: vec![],
         };
 
         let cols = sdtab(&result, &population);
@@ -1594,6 +1603,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            warnings: vec![],
         };
 
         let cols = sdtab(&result, &population);
@@ -1624,6 +1634,7 @@ mod tests {
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
+            warnings: vec![],
         };
 
         let cols = sdtab(&result, &population);

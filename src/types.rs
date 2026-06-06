@@ -283,6 +283,9 @@ pub struct Population {
     /// covariates). Preserved verbatim so downstream consumers can echo a NONMEM-style
     /// `$INPUT` line. Empty for in-memory `Population` values that were not read from a file.
     pub input_columns: Vec<String>,
+    /// Non-fatal warnings generated while reading the dataset (e.g. ADDL with missing II,
+    /// unparseable OCC values). Propagated into `FitResult.warnings` by `fit()`.
+    pub warnings: Vec<String>,
 }
 
 impl Population {
@@ -1357,6 +1360,11 @@ pub struct SubjectResult {
     /// post-fit. Each entry is (column_name, per-observation values). Subject-
     /// level aggregates (max, AUC, tmax) are repeated across all observation rows.
     pub extra_columns: Vec<(String, Vec<f64>)>,
+    /// Per-observation TAD computed with individual lagtime. Populated by
+    /// `compute_extra_output_columns` whenever the model has a lagtime or [derived]/[output]
+    /// blocks exist. Empty if those conditions are not met; output.rs falls back to
+    /// a lagtime=0 approximation in that case (correct for the common case).
+    pub per_obs_tad: Vec<f64>,
 }
 
 // ── Derived expression types ──────────────────────────────────────────────────

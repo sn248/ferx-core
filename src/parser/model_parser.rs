@@ -1779,23 +1779,7 @@ fn parse_derived_cond(tokens: &[Token], ctx: ParseCtx<'_>) -> Result<Condition, 
 fn build_derived_eval_fn(expr: Expression) -> DerivedEvalFn {
     let expr = std::sync::Arc::new(expr);
     Box::new(move |ctx: &DerivedContext<'_>| {
-        let mut vars: HashMap<String, f64> = HashMap::new();
-        for (k, &v) in ctx.indiv_params.iter() {
-            vars.insert(k.clone(), v);
-        }
-        for (k, &v) in ctx.covariates.iter() {
-            vars.insert(k.clone(), v);
-        }
-        for (k, &v) in ctx.prev_derived.iter() {
-            vars.insert(k.clone(), v);
-        }
-        vars.insert("IPRED".into(), ctx.ipred);
-        vars.insert("PRED".into(), ctx.pred);
-        vars.insert("DV".into(), ctx.dv);
-        vars.insert("TIME".into(), ctx.time);
-        vars.insert("TAFD".into(), ctx.tafd);
-        vars.insert("TAD".into(), ctx.tad);
-        vars.insert("MACHEPS".into(), f64::EPSILON);
+        let vars = build_derived_vars(ctx);
         // Covariates become Variable nodes (fallback_covariate=false at parse time),
         // so pass an empty covariates map and rely on vars for all name resolution.
         eval_expression(&expr, ctx.theta, ctx.eta, &HashMap::new(), &vars, &[])
@@ -1806,25 +1790,52 @@ fn build_derived_eval_fn(expr: Expression) -> DerivedEvalFn {
 fn build_derived_filter_fn(cond: Condition) -> DerivedFilterFn {
     let cond = std::sync::Arc::new(cond);
     Box::new(move |ctx: &DerivedContext<'_>| {
-        let mut vars: HashMap<String, f64> = HashMap::new();
-        for (k, &v) in ctx.indiv_params.iter() {
-            vars.insert(k.clone(), v);
-        }
-        for (k, &v) in ctx.covariates.iter() {
-            vars.insert(k.clone(), v);
-        }
-        for (k, &v) in ctx.prev_derived.iter() {
-            vars.insert(k.clone(), v);
-        }
-        vars.insert("IPRED".into(), ctx.ipred);
-        vars.insert("PRED".into(), ctx.pred);
-        vars.insert("DV".into(), ctx.dv);
-        vars.insert("TIME".into(), ctx.time);
-        vars.insert("TAFD".into(), ctx.tafd);
-        vars.insert("TAD".into(), ctx.tad);
-        vars.insert("MACHEPS".into(), f64::EPSILON);
+        let vars = build_derived_vars(ctx);
         eval_condition(&cond, ctx.theta, ctx.eta, &HashMap::new(), &vars, &[])
     })
+}
+
+/// Build the variable map for derived-expression and derived-filter evaluation.
+///
+/// Keys for covariates, individual parameters, and prior derived columns are
+/// inserted both with their original case **and** in uppercase, so that
+/// expressions like `wt` resolve correctly even when the dataset header is `WT`.
+/// Built-in time variables (TIME, TAFD, TAD, IPRED, PRED, DV) are inserted in
+/// both uppercase and lowercase for the same reason.
+fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
+    let mut vars: HashMap<String, f64> = HashMap::new();
+    // Insert each name with original case AND an uppercase alias so that
+    // case mismatches (e.g. `wt` vs. header `WT`) resolve correctly.
+    let mut insert_ci = |k: &str, v: f64| {
+        vars.insert(k.to_string(), v);
+        let up = k.to_uppercase();
+        if up != k {
+            vars.insert(up, v);
+        }
+    };
+    for (k, &v) in ctx.indiv_params.iter() {
+        insert_ci(k, v);
+    }
+    for (k, &v) in ctx.covariates.iter() {
+        insert_ci(k, v);
+    }
+    for (k, &v) in ctx.prev_derived.iter() {
+        insert_ci(k, v);
+    }
+    // Built-in names: uppercase (canonical) + lowercase alias.
+    for &(name, val) in &[
+        ("IPRED", ctx.ipred),
+        ("PRED", ctx.pred),
+        ("DV", ctx.dv),
+        ("TIME", ctx.time),
+        ("TAFD", ctx.tafd),
+        ("TAD", ctx.tad),
+        ("MACHEPS", f64::EPSILON),
+    ] {
+        vars.insert(name.to_string(), val);
+        vars.insert(name.to_lowercase(), val);
+    }
+    vars
 }
 
 /// Returns true if the expression subtree references the `DV` variable.
@@ -3581,19 +3592,37 @@ fn build_ode_spec(
         add_aliases(&mut var_idx, n, state_count + indiv_count + i);
     }
     // Reserve extra slots for TIME/T, TAFD, TAD — always appended after intermediates.
+    // These names are reserved: reject any ODE state, individual parameter, or
+    // intermediate that collides with a reserved slot so the injected solver-time
+    // values are always reachable.
+    const RESERVED_ODE_NAMES: &[&str] = &["TIME", "T", "TAFD", "TAD"];
+    for reserved in RESERVED_ODE_NAMES {
+        let collides = state_names_owned
+            .iter()
+            .chain(indiv_names_owned.iter())
+            .chain(intermediates.iter())
+            .any(|n| n.eq_ignore_ascii_case(reserved));
+        if collides {
+            return Err(format!(
+                "[odes] the name `{reserved}` is reserved for the solver-injected time \
+                 variable and cannot be used as a state, individual-parameter, or \
+                 intermediate name"
+            ));
+        }
+    }
     let n_base_vars = state_count + indiv_count + intermediates.len();
     let time_slot = n_base_vars;
     let tafd_slot = n_base_vars + 1;
     let tad_slot = n_base_vars + 2;
-    // TIME and T are aliases for the same slot.
-    var_idx.entry("TIME".to_string()).or_insert(time_slot);
-    var_idx.entry("time".to_string()).or_insert(time_slot);
-    var_idx.entry("T".to_string()).or_insert(time_slot);
-    var_idx.entry("t".to_string()).or_insert(time_slot);
-    var_idx.entry("TAFD".to_string()).or_insert(tafd_slot);
-    var_idx.entry("tafd".to_string()).or_insert(tafd_slot);
-    var_idx.entry("TAD".to_string()).or_insert(tad_slot);
-    var_idx.entry("tad".to_string()).or_insert(tad_slot);
+    // Forcefully assign reserved names (overwrite any accidental or_insert entry).
+    var_idx.insert("TIME".to_string(), time_slot);
+    var_idx.insert("time".to_string(), time_slot);
+    var_idx.insert("T".to_string(), time_slot);
+    var_idx.insert("t".to_string(), time_slot);
+    var_idx.insert("TAFD".to_string(), tafd_slot);
+    var_idx.insert("tafd".to_string(), tafd_slot);
+    var_idx.insert("TAD".to_string(), tad_slot);
+    var_idx.insert("tad".to_string(), tad_slot);
     let n_vars_total = n_base_vars + 3;
 
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`

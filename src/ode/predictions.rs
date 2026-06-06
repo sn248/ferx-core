@@ -420,7 +420,13 @@ pub fn ode_predictions(
     let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
     let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
     ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
-    ext_params[crate::types::MAX_PK_PARAMS] = first_dose_time;
+    // Store NaN when there are no doses so the ODE RHS injects NaN for TAFD
+    // (consistent with the sdtab convention) rather than -∞ (INFINITY - t).
+    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
+        first_dose_time
+    } else {
+        f64::NAN
+    };
 
     // Build obs_time → indices map. Multiple observations can share a time
     // (e.g. simultaneous PK/PD samples on different CMTs), so each time maps to
@@ -544,7 +550,13 @@ pub fn ode_predictions(
                     }
                 })
                 .fold(f64::NEG_INFINITY, f64::max);
-            ext_params[crate::types::MAX_PK_PARAMS + 1] = last_dose_eff;
+            // Store NaN when no effective prior dose exists so the ODE RHS injects
+            // NaN for TAD (consistent with sdtab) rather than +∞ (t - NEG_INFINITY).
+            ext_params[crate::types::MAX_PK_PARAMS + 1] = if last_dose_eff.is_finite() {
+                last_dose_eff
+            } else {
+                f64::NAN
+            };
         }
 
         // Integrate. If any infusions are active in this segment, wrap
@@ -650,11 +662,20 @@ pub fn ode_predictions_event_driven(
     let opts = OdeSolverOptions::default();
 
     // First-dose time anchor for TAFD injection via extended params.
-    let first_dose_time_ed = subject
-        .doses
-        .iter()
-        .map(|d| d.time)
-        .fold(f64::INFINITY, f64::min);
+    // fold yields INFINITY when there are no doses; convert to NaN so the ODE
+    // RHS injects NaN for TAFD (consistent with sdtab) rather than -∞.
+    let first_dose_time_ed = {
+        let t = subject
+            .doses
+            .iter()
+            .map(|d| d.time)
+            .fold(f64::INFINITY, f64::min);
+        if t.is_finite() {
+            t
+        } else {
+            f64::NAN
+        }
+    };
 
     // Seed compartments from `init(state) = expr` (zeros when none declared).
     // The init expression folds covariates/eta in via the individual-parameter
@@ -796,6 +817,13 @@ pub fn ode_predictions_event_driven(
                     }
                 })
                 .fold(f64::NEG_INFINITY, f64::max);
+            // Store NaN when no effective prior dose exists (fold stays at NEG_INFINITY)
+            // so the ODE RHS injects NaN for TAD rather than +∞ (t - NEG_INFINITY).
+            let last_dose_eff_ed = if last_dose_eff_ed.is_finite() {
+                last_dose_eff_ed
+            } else {
+                f64::NAN
+            };
             let mut ext_params_ed = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
             ext_params_ed[..crate::types::MAX_PK_PARAMS]
                 .copy_from_slice(&pk_now.values[..crate::types::MAX_PK_PARAMS]);

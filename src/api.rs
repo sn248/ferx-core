@@ -1141,13 +1141,17 @@ fn build_indiv_map(pk: &PkParams, names: &[String], pk_indices: &[usize]) -> Has
         .collect()
 }
 
-/// Trapezoid integration over (time, value) pairs in the slice.
+/// Trapezoid integration over (time, value) pairs.
+/// Observation times are not guaranteed to be sorted (preserved in input row
+/// order), so sort by time before integrating to prevent negative dt windows.
 fn trapezoid(points: &[(f64, f64)]) -> f64 {
     if points.len() < 2 {
         return f64::NAN;
     }
+    let mut sorted = points.to_vec();
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let mut auc = 0.0;
-    for w in points.windows(2) {
+    for w in sorted.windows(2) {
         let dt = w[1].0 - w[0].0;
         auc += dt * (w[0].1 + w[1].1) * 0.5;
     }

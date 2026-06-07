@@ -62,6 +62,9 @@ fn pkpd_pop() -> Population {
     Population {
         covariate_names: Vec::new(),
         dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
         subjects: vec![Subject {
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],

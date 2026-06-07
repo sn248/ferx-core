@@ -1411,6 +1411,9 @@ mod iov_tests {
             subjects: vec![make_iov_subject()],
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
         };
         // `requested` is the user's FitOptions value, passed independently of
         // model.gradient_method (which compatibility rules may have mutated).
@@ -1455,7 +1458,7 @@ mod iov_tests {
         };
         CompiledModel {
             name: "iov_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -1499,6 +1502,8 @@ mod iov_tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 
@@ -1518,6 +1523,8 @@ mod iov_tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         }
     }
 
@@ -1566,7 +1573,7 @@ mod iov_tests {
         };
         let model = CompiledModel {
             name: "no_iov".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -1609,6 +1616,8 @@ mod iov_tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         };
         let subject = Subject {
             id: "1".into(),
@@ -1625,6 +1634,8 @@ mod iov_tests {
             cens: vec![0; 3],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         let params = model.default_params.clone();
         let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None);

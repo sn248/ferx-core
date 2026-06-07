@@ -222,6 +222,11 @@ pub struct Subject {
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
+    /// Non-Gaussian observation records (TTE events, discrete states, counts).
+    /// Empty for all-Gaussian subjects. Populated by the data reader when the
+    /// model declares a non-Gaussian endpoint for the row's CMT.
+    #[cfg(feature = "survival")]
+    pub obs_records: Vec<ObsRecord>,
 }
 
 impl Subject {
@@ -273,12 +278,46 @@ impl Subject {
     }
 }
 
+/// Summary of records excluded by `[data_selection]` `ignore`/`accept` rules.
+#[derive(Debug, Clone, Default)]
+pub struct ExclusionSummary {
+    /// Subject IDs that had all records removed (zero doses and observations remaining).
+    pub excluded_subject_ids: Vec<String>,
+    /// Number of observation records (EVID==0, MDV==0) excluded.
+    pub n_obs_excluded: usize,
+    /// Number of dose records (EVID 1/4) excluded.
+    pub n_dose_excluded: usize,
+    /// Number of other records excluded that are neither a scored observation
+    /// nor a dose — EVID==2 (other event), EVID==3 (reset), and missing-DV
+    /// observation rows (EVID==0, MDV==1). Tracked so the reported counts sum to
+    /// every excluded record and the summary can't read all-zeros while rows
+    /// were dropped.
+    pub n_other_excluded: usize,
+    /// Total CSV records read before any filtering.
+    pub n_records_total: usize,
+    /// `ignore` / `ignore_subjects` clauses that matched at least one record,
+    /// in declaration order.
+    pub fired_ignore: Vec<String>,
+    /// `accept` clauses that rejected at least one record, in declaration order.
+    pub fired_accept: Vec<String>,
+}
+
 /// A collection of subjects
 #[derive(Debug, Clone)]
 pub struct Population {
     pub subjects: Vec<Subject>,
     pub covariate_names: Vec<String>,
     pub dv_column: String,
+    /// All column headers from the data CSV in original order (ID, TIME, DV, AMT, ...,
+    /// covariates). Preserved verbatim so downstream consumers can echo a NONMEM-style
+    /// `$INPUT` line. Empty for in-memory `Population` values that were not read from a file.
+    pub input_columns: Vec<String>,
+    /// Present when `[data_selection]` rules were applied; `None` when no filtering
+    /// was requested or the population was constructed in-memory.
+    pub exclusions: Option<ExclusionSummary>,
+    /// Non-fatal warnings generated while reading the dataset (e.g. ADDL with missing II,
+    /// unparseable OCC values). Propagated into `FitResult.warnings` by `fit()`.
+    pub warnings: Vec<String>,
 }
 
 impl Population {
@@ -337,6 +376,66 @@ impl Population {
         }
         pruned
     }
+}
+
+/// Whether a declared covariate is continuous or categorical.
+///
+/// Both kinds are carried as `f64` in the data path (categoricals must be
+/// numerically coded — see [`CovariateDecl`]). The distinction is metadata for
+/// downstream consumers (R-side summary statistics, covariate-search
+/// algorithms) that treat the two differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CovariateKind {
+    Continuous,
+    Categorical,
+}
+
+impl CovariateKind {
+    /// Lowercase label used in the `[covariates]` block and in output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CovariateKind::Continuous => "continuous",
+            CovariateKind::Categorical => "categorical",
+        }
+    }
+}
+
+/// One entry from the optional `[covariates]` DSL block: a dataset column the
+/// modeller declares as a covariate, tagged continuous or categorical. This is
+/// a declaration of *availability* — it does not imply the covariate is used in
+/// the structural model.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CovariateDecl {
+    /// Column name, case-sensitive, matching the CSV header.
+    pub name: String,
+    pub kind: CovariateKind,
+}
+
+/// A single row of the [`CovariateTable`], echoing one input dataset record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CovariateRow {
+    pub id: String,
+    pub time: f64,
+    /// EVID of the source row (0=obs, 1=dose, 2=other, 3=reset, 4=reset+dose).
+    pub evid: u32,
+    /// Covariate values, parallel to [`CovariateTable::names`]. A missing value
+    /// (blank / `.` / `NA` in the source) is encoded as `f64::NAN`.
+    pub values: Vec<f64>,
+}
+
+/// Echo of the declared covariate columns from the input dataset, one row per
+/// input record (including dose / EVID rows — unlike the observation-only
+/// sdtab). Produced at data-read time when a `[covariates]` block is present,
+/// and attached to [`FitResult::covariate_table`]. Missing values are
+/// `f64::NAN`. Restricted to declared columns to bound memory.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CovariateTable {
+    /// Declared covariate names, in declaration order. Parallel to each row's
+    /// `values` and to `kinds`.
+    pub names: Vec<String>,
+    /// Continuous/categorical tag per covariate, parallel to `names`.
+    pub kinds: Vec<CovariateKind>,
+    pub rows: Vec<CovariateRow>,
 }
 
 /// Between-subject variability matrix (Omega)
@@ -544,18 +643,23 @@ impl ModelParameters {
     }
 }
 
-/// Supported PK structural models
+/// Supported PK structural models.
+///
+/// IV (bolus and/or infusion) administration is represented by a single
+/// variant per compartment count; the bolus-vs-infusion choice is made
+/// per dose event from the dataset's RATE column (see
+/// `DoseEvent::is_infusion`). This mirrors NONMEM, nlmixr2, and Monolix
+/// and lets a subject mix bolus and infusion doses in one record.
+/// Oral routes remain a separate variant because they have a distinct
+/// model structure (absorption rate constant KA, bioavailability F).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkModel {
-    OneCptIvBolus,
+    OneCptIv,
     OneCptOral,
-    OneCptInfusion,
-    TwoCptIvBolus,
+    TwoCptIv,
     TwoCptOral,
-    TwoCptInfusion,
-    ThreeCptIvBolus,
+    ThreeCptIv,
     ThreeCptOral,
-    ThreeCptInfusion,
 }
 
 /// Supported residual error models
@@ -1027,6 +1131,131 @@ pub struct MuRef {
     pub log_transformed: bool,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Non-Gaussian endpoint types  (Phase 1: TTE / survival)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "survival")]
+/// Censoring type for a TTE event record.
+#[derive(Debug, Clone)]
+pub enum EventType {
+    Exact,
+    RightCensored,
+    /// Event occurred in the half-open interval (left, right].
+    IntervalCensored {
+        left: f64,
+        right: f64,
+    },
+}
+
+#[cfg(feature = "survival")]
+/// A single non-Gaussian observation record on a subject.
+#[derive(Debug, Clone)]
+pub enum ObsRecord {
+    Event {
+        time: f64,
+        event_type: EventType,
+        /// Left truncation / delayed entry time (0.0 when none).
+        /// The likelihood conditions on survival past entry_time:
+        ///   H_eff(T) = H(T) − H(entry_time)
+        entry_time: f64,
+        cmt: usize,
+    },
+    // DiscreteState and Count variants deferred to Phase 4/5
+}
+
+#[cfg(feature = "survival")]
+/// Analytic parametric hazard families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HazardFamily {
+    Exponential,
+    Weibull,
+    Gompertz,
+}
+
+#[cfg(feature = "survival")]
+/// Closure type for computing hazard parameters from (theta, eta, covariates).
+///
+/// Return layout by family:
+///   Exponential: `[lambda]`
+///   Weibull:     `[scale, shape]`
+///   Gompertz:    `[alpha, gamma, loghr_term]`  (loghr_term cumulates log-hazard
+///                 contributions from covariates; 0.0 when no covariates)
+pub type HazardParamFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> Vec<f64> + Send + Sync>;
+
+#[cfg(feature = "survival")]
+/// Hazard specification for a TTE endpoint.
+pub enum HazardSpec {
+    Analytic {
+        family: HazardFamily,
+        param_fn: HazardParamFn,
+    },
+    // OdeAccumulated deferred to Phase 2
+}
+
+#[cfg(feature = "survival")]
+impl std::fmt::Debug for HazardSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HazardSpec::Analytic { family, .. } => {
+                write!(f, "HazardSpec::Analytic({family:?})")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "survival")]
+/// Per-CMT endpoint likelihood specification.
+pub enum EndpointLikelihood {
+    Gaussian(EndpointError),
+    Tte { hazard: HazardSpec },
+    // Binary, Ordinal, Poisson, NegBin, Ctmm, Dtmm deferred to Phase 4/5
+}
+
+#[cfg(feature = "survival")]
+impl std::fmt::Debug for EndpointLikelihood {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EndpointLikelihood::Gaussian(e) => write!(f, "Gaussian({e:?})"),
+            EndpointLikelihood::Tte { hazard } => write!(f, "Tte({hazard:?})"),
+        }
+    }
+}
+
+/// Outcome of a single simulated observation — replaces the previous `dv_sim: f64` field.
+///
+/// `Continuous` preserves the existing Gaussian path unchanged.
+/// `Event` carries TTE-specific outputs (gated behind `survival` feature).
+#[derive(Debug, Clone)]
+pub enum SimOutcome {
+    /// Gaussian continuous prediction + residual noise (the only variant before Phase 1).
+    Continuous { value: f64 },
+    /// TTE event: simulated event time and whether it occurred before the censoring horizon.
+    #[cfg(feature = "survival")]
+    Event { time: f64, observed: bool },
+}
+
+impl SimOutcome {
+    /// Extract the continuous value for Gaussian outcomes; NAN for all others.
+    ///
+    /// Calling this on a TTE `Event` row is a logic error; a `debug_assert` fires
+    /// in debug builds to catch misuse early.
+    pub fn continuous_value(&self) -> f64 {
+        match self {
+            SimOutcome::Continuous { value } => *value,
+            #[cfg(feature = "survival")]
+            SimOutcome::Event { .. } => {
+                debug_assert!(
+                    false,
+                    "continuous_value() called on a TTE Event row — filter by CMT type first"
+                );
+                f64::NAN
+            }
+        }
+    }
+}
+
 /// A compiled model ready for estimation
 pub struct CompiledModel {
     pub name: String,
@@ -1217,6 +1446,16 @@ pub struct CompiledModel {
     /// natural scale (case 2, `log(DV) ~ additive`) and `fit()` log-transforms
     /// the observations once at load. Ignored when `log_transform` is `false`.
     pub dv_pre_logged: bool,
+    /// Derived expression specifications from [derived] block.
+    /// Empty when no [derived] block is present. Evaluated post-fit.
+    pub derived_exprs: Vec<DerivedExprSpec>,
+    /// Column names from [output] block. Validated at fit time.
+    pub output_columns: Vec<String>,
+    /// Per-CMT non-Gaussian endpoint specifications.
+    /// Empty for models with only Gaussian observations.
+    /// Keyed by the CMT value declared in `[event_model]` / future blocks.
+    #[cfg(feature = "survival")]
+    pub endpoints: HashMap<usize, EndpointLikelihood>,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -1339,6 +1578,92 @@ pub struct SubjectResult {
     pub cens: Vec<u8>,
     /// Number of observations for this subject (MDV=0 rows).
     pub n_obs: usize,
+    /// Extra sdtab columns from [derived] and [output] blocks, computed
+    /// post-fit. Each entry is (column_name, per-observation values). Subject-
+    /// level aggregates (max, AUC, tmax) are repeated across all observation rows.
+    pub extra_columns: Vec<(String, Vec<f64>)>,
+    /// Per-observation TAD computed with individual lagtime. Populated by
+    /// `compute_extra_output_columns` whenever the model has a lagtime or [derived]/[output]
+    /// blocks exist. Empty if those conditions are not met; output.rs falls back to
+    /// a lagtime=0 approximation in that case (correct for the common case).
+    pub per_obs_tad: Vec<f64>,
+}
+
+// ── Derived expression types ──────────────────────────────────────────────────
+
+/// Context threaded into every [derived] expression evaluation.
+pub struct DerivedContext<'a> {
+    pub theta: &'a [f64],
+    pub eta: &'a [f64],
+    pub indiv_params: &'a HashMap<String, f64>,
+    pub covariates: &'a HashMap<String, f64>,
+    pub ipred: f64,
+    pub pred: f64,
+    pub dv: f64,
+    pub time: f64,
+    pub tafd: f64,
+    pub tad: f64,
+    pub prev_derived: &'a HashMap<String, f64>,
+}
+
+pub type DerivedEvalFn = Box<dyn Fn(&DerivedContext<'_>) -> f64 + Send + Sync>;
+pub type DerivedFilterFn = Box<dyn Fn(&DerivedContext<'_>) -> bool + Send + Sync>;
+
+pub struct DerivedExprSpec {
+    pub name: String,
+    pub kind: DerivedKind,
+}
+
+pub enum DerivedKind {
+    /// Evaluated independently at each observation row.
+    PerRow { eval: DerivedEvalFn },
+    /// Reduction over observation rows (max/min/tmax), optionally filtered.
+    /// The scalar is repeated for all rows of the subject.
+    Aggregate {
+        func: AggFunction,
+        value: DerivedEvalFn,
+        filter: Option<DerivedFilterFn>,
+    },
+    /// Numeric integration over a time window.
+    Integral {
+        integrand: DerivedEvalFn,
+        /// When `Some`, only time points where this evaluates to true contribute.
+        condition: Option<DerivedFilterFn>,
+        /// True when integrand references DV → use observation times only.
+        data_based: bool,
+        window: IntegralWindow,
+        step: IntegralStep,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunction {
+    Max,
+    Min,
+    Tmax,
+}
+
+#[derive(Debug, Clone)]
+pub enum IntegralWindow {
+    Explicit {
+        from: f64,
+        to: f64,
+    },
+    /// One integral per period-aligned window; each observation gets its window's value.
+    Periodic {
+        period: f64,
+        anchor: f64,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum IntegralStep {
+    /// Use observation times only (DV integrals; fallback when model unavailable).
+    ObsTimes,
+    /// Fine internal grid with this step size (hours).
+    Fixed(f64),
+    /// Auto: (to − from) / 500.
+    Auto,
 }
 
 /// How per-occasion kappa random effects are treated in the IS marginal likelihood.
@@ -1486,6 +1811,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, "importance_sampling")
     } else if lower.contains("eps shrinkage") {
         (WarningSeverity::Warning, "eps_shrinkage")
+    } else if lower.starts_with("w_addl_missing_ii") || lower.contains("addl > 0 but ii") {
+        (WarningSeverity::Warning, "data_quality")
+    } else if lower.starts_with("w_iov_occ_missing")
+        || lower.contains("missing or unparseable values in iov_column")
+    {
+        (WarningSeverity::Warning, "data_quality")
     } else if lower.contains("ltbs")
         || lower.contains("non-positive dv")
         || lower.contains("ss=1 dose")
@@ -1783,6 +2114,9 @@ pub struct FitResult {
     /// requiring the caller to re-read the CSV.  Empty for in-memory `fit()`
     /// calls that never touch a file.
     pub covariate_names: Vec<String>,
+    /// All column headers from the data CSV in original order (ID, TIME, DV, AMT, ...,
+    /// covariates), analogous to NONMEM `$INPUT`. Empty for in-memory `fit()` calls.
+    pub input_columns: Vec<String>,
     /// One entry per `[covariate_nn NAME]` block in the model, populated by
     /// `fit()` from `CompiledModel.covariate_nns`. Empty when the `nn`
     /// feature is off or no block is declared. Output writers
@@ -1792,6 +2126,17 @@ pub struct FitResult {
     /// `plans/dcm-and-low-dim-node.md` "Option E".
     #[cfg(feature = "nn")]
     pub neural_networks: Vec<NeuralNetworkInfo>,
+    /// Echo of the declared covariate columns from the input dataset (ID, TIME,
+    /// EVID + one column per declared covariate, one row per input record).
+    /// `Some` only when the model has a `[covariates]` block AND the fit was
+    /// launched from a data file; `None` for the in-memory [`fit`] entry point
+    /// (which has no raw rows) or when no `[covariates]` block is declared.
+    /// Missing values are `f64::NAN`. See [`CovariateTable`].
+    pub covariate_table: Option<CovariateTable>,
+    /// Record-level exclusion statistics; `Some` when `[data_selection]` rules
+    /// were active during the fit (or the caller supplied `ignore`/`accept`
+    /// expressions).  `None` means no filtering was requested.
+    pub exclusions: Option<ExclusionSummary>,
 }
 
 /// Minimal per-NN metadata carried on `FitResult` so output writers can
@@ -1847,14 +2192,18 @@ pub struct FitOptions {
     // SAEM-specific options
     pub saem_n_exploration: usize,
     pub saem_n_convergence: usize,
-    /// Number of MH proposals per subject per SAEM outer iteration.
-    /// The default 10 mixes well enough for hard cold-start surfaces
-    /// (e.g. Emax PKPD with stressful initial values, where chains
-    /// at 3 proposals can lock the M-step into a degenerate basin
-    /// with the PD-curve thetas at boundary values). Reduce to 3 for
-    /// the older behaviour on simpler PK-only models; raise (20-50)
-    /// only when the diagnostic shows the M-step is still tracking
-    /// correlated samples.
+    /// Number of block-kernel MH proposals per subject per SAEM outer
+    /// iteration. The default 20 mixes well on hard cold-start surfaces
+    /// (e.g. Emax PKPD with stressful initial values, where chains at 3
+    /// proposals can lock the M-step into a degenerate basin with the
+    /// PD-curve thetas at boundary values) and, together with the
+    /// componentwise kernel (run automatically for multi-η models), keeps a
+    /// block Ω from collapsing to a near rank-1 correlation matrix. The
+    /// componentwise sweep count `max(2, n_mh_steps / n_eta)` is derived from
+    /// this value (the kernel is skipped entirely for single-η models).
+    /// Reduce to 3-10 for the older/faster behaviour on simpler
+    /// well-identified models; raise (30-50) only when the diagnostic shows
+    /// the M-step is still tracking correlated samples.
     pub saem_n_mh_steps: usize,
     pub saem_adapt_interval: usize,
     /// Number of initial exploration iterations during which the BSV/IOV Ω
@@ -2030,6 +2379,17 @@ pub struct FitOptions {
     /// values from the data. Useful when the model file's defaults are far from
     /// the truth. `None` (the default) disables it.
     pub inits_from_nca: Option<crate::suggest_start::NcaInit>,
+    /// Expression strings for `[data_selection] ignore = ...` / `ignore_subjects`.
+    /// Each string may contain `&&`-joined sub-expressions (all must hold).
+    /// A record is excluded when any clause evaluates to `true`.
+    /// Stored verbatim for logging; compiled to `FilterClause` at read time.
+    pub ignore_exprs: Vec<String>,
+    /// Expression strings for `[data_selection] accept = ...`.
+    /// A record is excluded when any clause evaluates to `false`.
+    pub accept_exprs: Vec<String>,
+    /// Subject IDs to exclude wholesale (syntactic sugar for `ignore = ID == X`).
+    /// Compared as strings against `Subject::id`.
+    pub ignore_subjects: Vec<String>,
 }
 
 impl Default for FitOptions {
@@ -2068,7 +2428,7 @@ impl Default for FitOptions {
             global_maxeval: 0,
             saem_n_exploration: 150,
             saem_n_convergence: 250,
-            saem_n_mh_steps: 10,
+            saem_n_mh_steps: 20,
             saem_adapt_interval: 50,
             saem_omega_burnin: 20,
             saem_seed: None,
@@ -2102,6 +2462,9 @@ impl Default for FitOptions {
             min_obs_for_convergence_check: 2,
             stagnation_guard: true,
             inits_from_nca: None,
+            ignore_exprs: Vec::new(),
+            accept_exprs: Vec::new(),
+            ignore_subjects: Vec::new(),
         }
     }
 }
@@ -2134,19 +2497,28 @@ impl BloqMethod {
 pub enum Optimizer {
     Bfgs,
     Lbfgs,
-    /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based,
-    /// default outer optimizer. Robust on the FOCE/FOCEI objective surface in
-    /// practice: FD-gradient noise from EBE re-estimation is small relative
-    /// to the OFV moves the optimizer cares about.
+    /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based;
+    /// fast per iteration on smooth, well-conditioned analytical PK models where
+    /// the fixed-EBE finite-difference gradient is a faithful proxy for the true
+    /// gradient. On ill-conditioned fits (ODE/PD models, sparse data, Hill-ridge
+    /// identifiability) the fixed-EBE bias can drive SLSQP to declare convergence
+    /// hundreds of OFV units above the true minimum — pair with
+    /// `reconverge_gradient_interval = 1` if it stalls, or switch to `Bobyqa`
+    /// (the default; see `FitOptions::default`).
     Slsqp,
     /// NLopt LD_LBFGS
     NloptLbfgs,
     /// NLopt LD_MMA — Method of Moving Asymptotes
     Mma,
-    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation. Useful when
-    /// FD gradients are unreliable (e.g. small datasets where EBE-loop noise
-    /// dominates per-eval signal). Needs more outer evaluations than SLSQP
-    /// because it must triangulate a quadratic from scratch.
+    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation, default outer
+    /// optimizer. Re-evaluates the FOCE objective (and the inner EBE loop) at
+    /// every trial point, so it never sees the fixed-EBE gradient bias that can
+    /// stall gradient-based optimizers; consistently reaches a lower OFV than
+    /// SLSQP on ODE/PD models, sparse data, and Hill-ridge problems. Needs more
+    /// outer evaluations than SLSQP to triangulate a quadratic from scratch, but
+    /// each evaluation is cheap (no FD gradient sweep). See
+    /// `docs/src/estimation/optimizers.md` for the cefepime and Emax PKPD
+    /// validations behind the default choice.
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
     TrustRegion,
@@ -2373,6 +2745,13 @@ pub struct ParsedModel {
     pub model: CompiledModel,
     pub simulation: Option<SimulationSpec>,
     pub fit_options: FitOptions,
+    /// Declarations from the optional `[covariates]` block. `None` when the
+    /// block is absent (legacy auto-detect: every non-standard CSV column is a
+    /// covariate). `Some` (possibly empty) when present, in which case it is
+    /// authoritative — only listed columns are covariates, and each must exist
+    /// in the data and be numerically coded. Drives the file-based readers and
+    /// the [`FitResult::covariate_table`].
+    pub covariate_decls: Option<Vec<CovariateDecl>>,
     /// 1-based source line of each unnamed `[block]` header, keyed by the
     /// lowercased block type (e.g. `"individual_parameters" -> 7`). Used by
     /// `ferx check` to attach a block-level location to diagnostics. Empty when
@@ -2470,6 +2849,10 @@ pub(crate) mod test_helpers {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: HashMap::new(),
         }
     }
 }
@@ -2881,25 +3264,30 @@ mod tests {
         assert_eq!(p_alias.lagtime(), 2.0);
     }
 
-    /// Guard the SAEM MH-step default. The previous value (3) was too low
-    /// for hard cold-start surfaces — the chain didn't decorrelate between
-    /// SAEM outer iterations, so the single-draw stochastic M-step received
-    /// sticky correlated ETAs and locked the population-θ M-step into a
-    /// degenerate basin (observed on Emax PKPD: PD-curve thetas pinned to
-    /// boundary, ~150 OFV units worse than the correct basin). The current
-    /// default (10) escapes that trap reliably across seeds at ~20% extra
-    /// wall on the affected model and ~0% on simpler PK-only models.
+    /// Guard the SAEM MH-step default. An early value (3) was too low for hard
+    /// cold-start surfaces — the chain didn't decorrelate between SAEM outer
+    /// iterations, so the single-draw stochastic M-step received sticky
+    /// correlated ETAs and locked the population-θ M-step into a degenerate
+    /// basin (observed on Emax PKPD: PD-curve thetas pinned to boundary, ~150
+    /// OFV units worse than the correct basin). The default was raised to 10,
+    /// then to 20 alongside the componentwise eta kernel and the damped Ω
+    /// stochastic-approximation step — both added to stop a block (correlated)
+    /// Ω collapsing to a near rank-1 correlation matrix (UVM 2-cpt: every
+    /// off-diagonal correlation → ~0.99, one variance → 0). The larger default
+    /// also sizes the componentwise sweep count (`max(2, n_mh_steps / n_eta)`).
     ///
-    /// If a future change drops the default below ~5, re-run the Emax PKPD
-    /// regression in the experiment repo before merging — the basin trap
-    /// returns silently (OFV looks fine; PD parameters wrong).
+    /// If a future change drops the default below ~5, re-run both the Emax PKPD
+    /// basin regression and the UVM block-Ω collapse regression in the
+    /// experiment repo before merging — both fail silently (OFV looks fine;
+    /// parameters wrong).
     #[test]
-    fn saem_n_mh_steps_default_is_10() {
+    fn saem_n_mh_steps_default_is_20() {
         let opts = FitOptions::default();
         assert_eq!(
-            opts.saem_n_mh_steps, 10,
+            opts.saem_n_mh_steps, 20,
             "saem_n_mh_steps default changed — see comment above this test \
-             for the basin-trap regression rationale before adjusting."
+             for the basin-trap and block-Ω-collapse regression rationale \
+             before adjusting."
         );
     }
 }

@@ -271,6 +271,8 @@ struct FitWire {
     inits_from_nca: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     covariate_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    input_columns: Vec<String>,
     /// `[covariate_nn]` block metadata. Absent (None) on bundles produced
     /// before this field existed or when ferx-core was built without
     /// `--features nn`. Loaders gracefully default to an empty Vec.
@@ -759,6 +761,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         outer_gtol: r.outer_gtol,
         inits_from_nca: r.inits_from_nca.clone(),
         covariate_names: r.covariate_names.clone(),
+        input_columns: r.input_columns.clone(),
         #[cfg(feature = "nn")]
         neural_networks: if r.neural_networks.is_empty() {
             None
@@ -1072,6 +1075,8 @@ fn parse_subjects(
             ofv_contribution: ofv,
             cens: Vec::new(),
             n_obs,
+            extra_columns: vec![],
+            per_obs_tad: vec![],
         });
     }
 
@@ -1602,8 +1607,13 @@ fn wire_to_fit_result(
         outer_gtol: w.outer_gtol,
         inits_from_nca: w.inits_from_nca,
         covariate_names: w.covariate_names,
+        input_columns: w.input_columns,
         #[cfg(feature = "nn")]
         neural_networks: w.neural_networks.unwrap_or_default(),
+        // The covariate table is not persisted in the .fitrx bundle (yet); a
+        // round-tripped result therefore has no covariate table.
+        covariate_table: None,
+        exclusions: None,
     })
 }
 
@@ -1655,6 +1665,8 @@ mod tests {
             ofv_contribution: 12.34,
             cens: vec![0; n_obs],
             n_obs,
+            extra_columns: vec![],
+            per_obs_tad: vec![],
         }
     }
 
@@ -1676,12 +1688,17 @@ mod tests {
                 cens: vec![0; n_obs_each],
                 occasions: vec![],
                 dose_occasions: vec![],
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             });
         }
         Population {
             subjects,
             covariate_names: vec![],
             dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
         }
     }
 
@@ -1799,8 +1816,11 @@ mod tests {
             outer_gtol: 1e-4,
             inits_from_nca: None,
             covariate_names: vec!["WT".into(), "AGE".into()],
+            input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
+            covariate_table: None,
+            exclusions: None,
         }
     }
 
@@ -2170,5 +2190,23 @@ mod tests {
             loaded.fit.covariate_names,
             vec!["WT".to_string(), "AGE".to_string()]
         );
+    }
+
+    #[test]
+    fn input_columns_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ic-roundtrip.fitrx");
+        let mut r = minimal_fit_result();
+        r.input_columns = vec![
+            "ID".into(),
+            "TIME".into(),
+            "DV".into(),
+            "AMT".into(),
+            "WT".into(),
+        ];
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.input_columns, r.input_columns);
     }
 }

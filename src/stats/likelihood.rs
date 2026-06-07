@@ -975,6 +975,8 @@ mod tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         }
     }
 
@@ -985,7 +987,7 @@ mod tests {
     fn make_model() -> CompiledModel {
         CompiledModel {
             name: "test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -1043,6 +1045,8 @@ mod tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 

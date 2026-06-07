@@ -105,6 +105,8 @@ fn simulate_subjects(
                 cens: vec![0; obs_times.len()],
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             }
         })
         .collect();
@@ -113,6 +115,9 @@ fn simulate_subjects(
         subjects: subjects.clone(),
         covariate_names: vec![],
         dv_column: "dv".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
     };
 
     let sim = simulate_with_seed(model, &pop, params, 1, seed);
@@ -121,7 +126,10 @@ fn simulate_subjects(
         .into_iter()
         .map(|subj| {
             let sims: Vec<&SimulationResult> = sim.iter().filter(|s| s.id == subj.id).collect();
-            let obs: Vec<f64> = sims.iter().map(|s| s.dv_sim.max(0.0)).collect();
+            let obs: Vec<f64> = sims
+                .iter()
+                .map(|s| s.outcome.continuous_value().max(0.0))
+                .collect();
             (
                 subj.id,
                 dose_amt,
@@ -228,6 +236,10 @@ fn build_warfarin_model() -> CompiledModel {
         scaling: ScalingSpec::None,
         log_transform: false,
         dv_pre_logged: false,
+        derived_exprs: vec![],
+        output_columns: vec![],
+        #[cfg(feature = "survival")]
+        endpoints: std::collections::HashMap::new(),
     }
 }
 
@@ -293,7 +305,7 @@ fn generate_two_cpt_iv() {
         });
     let model = CompiledModel {
         name: "two_cpt_iv".into(),
-        pk_model: PkModel::TwoCptIvBolus,
+        pk_model: PkModel::TwoCptIv,
         error_model: ErrorModel::Proportional,
         error_spec: ferx_core::types::ErrorSpec::Single(ErrorModel::Proportional),
         pk_param_fn,
@@ -343,6 +355,10 @@ fn generate_two_cpt_iv() {
         scaling: ScalingSpec::None,
         log_transform: false,
         dv_pre_logged: false,
+        derived_exprs: vec![],
+        output_columns: vec![],
+        #[cfg(feature = "survival")]
+        endpoints: std::collections::HashMap::new(),
     };
     let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0];
     let subjects = simulate_subjects(&model, &params, 15, 100.0, 1, &obs_times, 123, None);
@@ -463,6 +479,10 @@ fn generate_two_cpt_oral_cov() {
         scaling: ScalingSpec::None,
         log_transform: false,
         dv_pre_logged: false,
+        derived_exprs: vec![],
+        output_columns: vec![],
+        #[cfg(feature = "survival")]
+        endpoints: std::collections::HashMap::new(),
     };
 
     // Generate random covariates (matching Julia seed 456)
@@ -499,12 +519,17 @@ fn generate_two_cpt_oral_cov() {
             cens: vec![0; obs_times.len()],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         })
         .collect();
     let pop = Population {
         subjects,
         covariate_names: vec!["wt".into(), "crcl".into()],
         dv_column: "dv".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
     };
     let sim = simulate_with_seed(&model, &pop, &params, 1, 456);
 
@@ -513,7 +538,10 @@ fn generate_two_cpt_oral_cov() {
         .iter()
         .map(|subj| {
             let sims: Vec<_> = sim.iter().filter(|s| s.id == subj.id).collect();
-            let obs: Vec<f64> = sims.iter().map(|s| s.dv_sim.max(0.0)).collect();
+            let obs: Vec<f64> = sims
+                .iter()
+                .map(|s| s.outcome.continuous_value().max(0.0))
+                .collect();
             (
                 subj.id.clone(),
                 250.0,
@@ -625,6 +653,10 @@ fn generate_mm_oral() {
         scaling: ScalingSpec::None,
         log_transform: false,
         dv_pre_logged: false,
+        derived_exprs: vec![],
+        output_columns: vec![],
+        #[cfg(feature = "survival")]
+        endpoints: std::collections::HashMap::new(),
     };
     let obs_times = vec![
         0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0,

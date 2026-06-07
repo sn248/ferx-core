@@ -1598,7 +1598,7 @@ mod tests {
         };
         CompiledModel {
             name: "gn_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -1641,6 +1641,8 @@ mod tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 
@@ -1661,12 +1663,17 @@ mod tests {
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             })
             .collect();
         Population {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
         }
     }
 
@@ -2499,7 +2506,7 @@ mod tests {
         };
         let model = CompiledModel {
             name: "gn_block_omega_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -2542,6 +2549,8 @@ mod tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         };
 
         let template = &model.default_params;
@@ -2771,7 +2780,7 @@ mod tests {
         };
         CompiledModel {
             name: "iov_gn_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -2815,6 +2824,8 @@ mod tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 
@@ -2834,11 +2845,16 @@ mod tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         Population {
             subjects: vec![subject],
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
         }
     }
 

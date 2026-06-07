@@ -1,6 +1,118 @@
-use crate::types::{DoseEvent, Population, Subject};
+use crate::io::filter_expr::{FilterClause, RowContext};
+use crate::types::{
+    CovariateDecl, CovariateRow, CovariateTable, DoseEvent, ExclusionSummary, Population, Subject,
+};
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Compiled data-selection filter built from `FitOptions` ignore/accept fields.
+/// Passed into `read_nonmem_csv_impl` so filtering happens at read time.
+pub struct SelectionFilter {
+    pub ignore: Vec<FilterClause>,
+    pub accept: Vec<FilterClause>,
+    /// Subject IDs to exclude wholesale (from `ignore_subjects`).
+    pub ignore_subject_ids: Vec<String>,
+}
+
+impl SelectionFilter {
+    /// Build from the raw expression strings stored in `FitOptions`.
+    /// Returns `Err` if any expression fails to parse.
+    pub fn from_opts(
+        ignore_exprs: &[String],
+        accept_exprs: &[String],
+        ignore_subjects: &[String],
+    ) -> Result<Self, String> {
+        let ignore = ignore_exprs
+            .iter()
+            .map(|s| FilterClause::parse(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let accept = accept_exprs
+            .iter()
+            .map(|s| FilterClause::parse(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SelectionFilter {
+            ignore,
+            accept,
+            ignore_subject_ids: ignore_subjects.to_vec(),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ignore.is_empty() && self.accept.is_empty() && self.ignore_subject_ids.is_empty()
+    }
+
+    /// De-duplicated, lowercased covariate column names referenced by any
+    /// ignore/accept clause (standard NONMEM columns excluded). The declared
+    /// `[covariates]` reader uses this to guarantee a filtered column is read
+    /// into each subject's covariate map even when the model file did not
+    /// declare it — otherwise `ignore = STUDY == 2` against an undeclared
+    /// `STUDY` column would silently never fire.
+    pub fn referenced_covariate_columns(&self) -> Vec<String> {
+        let mut cols: Vec<String> = Vec::new();
+        for clause in self.ignore.iter().chain(self.accept.iter()) {
+            for c in clause.covariate_columns() {
+                if !cols.iter().any(|existing| existing == c) {
+                    cols.push(c.to_string());
+                }
+            }
+        }
+        cols
+    }
+
+    /// Returns `(excluded, which)`:
+    /// - `excluded = true` when the row should be dropped.
+    /// - `which` is the source string of the first clause that fired (for logging).
+    ///
+    /// Checks short-circuit on the first match, so a record is attributed to the
+    /// first rule that excludes it. A rule that only ever matches records already
+    /// removed by an earlier rule therefore never appears in the fired-condition
+    /// summary — see `docs/src/model-file/data-selection.md`.
+    pub fn should_exclude(&self, ctx: &RowContext<'_>) -> (bool, Option<String>) {
+        // 1. ignore_subjects shorthand.
+        if self.ignore_subject_ids.iter().any(|id| id == ctx.id) {
+            return (true, Some(format!("ignore_subjects: {}", ctx.id)));
+        }
+        // 2. ignore clauses (any match → excluded).
+        for clause in &self.ignore {
+            if clause.eval(ctx) {
+                return (true, Some(format!("ignore: {}", clause.source)));
+            }
+        }
+        // 3. accept clauses (all must pass → if any fails, excluded).
+        for clause in &self.accept {
+            if !clause.eval(ctx) {
+                return (true, Some(format!("accept: {}", clause.source)));
+            }
+        }
+        (false, None)
+    }
+}
+
+/// Per-subject exclusion counts returned by `parse_subject` when a filter is active.
+pub(crate) struct SubjectExclusion {
+    pub n_obs_excluded: usize,
+    pub n_dose_excluded: usize,
+    /// Records excluded that are neither scored obs nor doses (EVID 2/3, or
+    /// missing-DV obs).
+    pub n_other_excluded: usize,
+    /// Sources that matched at least one row ("ignore: DV < 0.001", etc.).
+    pub fired: Vec<String>,
+}
+
+/// Leading text of the "declared covariate column absent from data" error.
+/// Shared so the `ferx check` layer can classify the reader's error into the
+/// right diagnostic code without matching on the full (formatted) message.
+pub(crate) const ERR_COV_MISSING_COLUMNS: &str =
+    "[covariates]: declared covariate column(s) not found in data";
+/// Leading text of the "declared covariate value is not numeric" error.
+pub(crate) const ERR_COV_NON_NUMERIC: &str = "[covariates]: non-numeric value";
+
+/// True when a CSV cell represents a missing value (blank / `.` / `NA` / `NaN`).
+/// NONMEM convention uses `.` for missing.
+fn is_missing_cell(s: &str) -> bool {
+    let t = s.trim();
+    t.is_empty() || t == "." || t.eq_ignore_ascii_case("na") || t.eq_ignore_ascii_case("nan")
+}
 
 /// Read a NONMEM-format CSV file into a Population.
 ///
@@ -20,6 +132,126 @@ pub fn read_nonmem_csv(
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
 ) -> Result<Population, String> {
+    read_nonmem_csv_impl(path, covariate_columns, iov_column, None, None).map(|(pop, _)| pop)
+}
+
+/// Read a NONMEM-format CSV with a `[covariates]` declaration.
+///
+/// `decls` are the declared covariates: each must exist as a column and be
+/// numerically coded (a non-numeric value is a hard error, not a silent `0.0`),
+/// and they populate the returned [`CovariateTable`].
+///
+/// `extra_columns` are covariates *used by the model but not declared*. They are
+/// still read into the [`Population`] (leniently, like the auto-detect path) so
+/// the model works, but they are not strictly validated and do not appear in the
+/// table. The parser emits a warning recommending they be declared.
+///
+/// The table echoes the declared columns: one row per input record (including
+/// dose / EVID rows), with `f64::NAN` for missing values.
+pub fn read_nonmem_csv_with_covariates(
+    path: &Path,
+    decls: &[CovariateDecl],
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+) -> Result<(Population, CovariateTable), String> {
+    // Population reads the union of declared + referenced-but-undeclared columns,
+    // declared first so the table's column order matches the declaration.
+    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
+    for c in extra_columns {
+        if !union.iter().any(|n| n == c) {
+            union.push(c.clone());
+        }
+    }
+    let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
+    let (pop, table) =
+        read_nonmem_csv_impl(path, Some(&union_refs), iov_column, Some(decls), None)?;
+    Ok((
+        pop,
+        table.expect("covariate table is built whenever table_decls is Some"),
+    ))
+}
+
+/// Like [`read_nonmem_csv`] but applies `[data_selection]` filtering at read time.
+/// Called from `api::read_population_for` when `FitOptions` carries selection rules.
+pub fn read_nonmem_csv_filtered(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: &SelectionFilter,
+) -> Result<Population, String> {
+    // When an explicit covariate list is supplied, make sure every covariate the
+    // filter references is in it — otherwise a filtered column outside the list
+    // would not be read and the condition would silently never fire. (With
+    // `None`, the auto-detect path already reads every non-standard column, so no
+    // augmentation is needed.) Symmetric with the `[covariates]` reader.
+    let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
+        let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
+        for c in filter.referenced_covariate_columns() {
+            if !v.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
+                v.push(c);
+            }
+        }
+        v
+    });
+    let cols_ref: Option<Vec<&str>> = augmented
+        .as_ref()
+        .map(|v| v.iter().map(|s| s.as_str()).collect());
+    read_nonmem_csv_impl(path, cols_ref.as_deref(), iov_column, None, Some(filter))
+        .map(|(pop, _)| pop)
+}
+
+/// Like [`read_nonmem_csv_with_covariates`] but applies `[data_selection]` filtering.
+pub fn read_nonmem_csv_with_covariates_filtered(
+    path: &Path,
+    decls: &[CovariateDecl],
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    filter: &SelectionFilter,
+) -> Result<(Population, CovariateTable), String> {
+    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
+    for c in extra_columns {
+        if !union.iter().any(|n| n == c) {
+            union.push(c.clone());
+        }
+    }
+    // Ensure any covariate column referenced by an ignore/accept clause is read
+    // into each subject's covariate map, even if the model never declared it.
+    // Without this, a filter on an undeclared column would silently never fire
+    // on the declared-`[covariates]` read path (`union` would lack the column,
+    // so it would be absent from `locf_state`). Case-insensitive dedup: the
+    // referenced names are lowercased, declared names may not be.
+    for c in filter.referenced_covariate_columns() {
+        if !union.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
+            union.push(c);
+        }
+    }
+    let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
+    let (pop, table) = read_nonmem_csv_impl(
+        path,
+        Some(&union_refs),
+        iov_column,
+        Some(decls),
+        Some(filter),
+    )?;
+    Ok((
+        pop,
+        table.expect("covariate table is built whenever table_decls is Some"),
+    ))
+}
+
+/// Shared CSV reader. `table_decls`, when `Some`, requests building a
+/// [`CovariateTable`] over exactly those declared covariates — each must exist
+/// as a column and is validated as numeric (non-numeric → hard error). The
+/// columns in `covariate_columns` (a superset, including referenced-but-
+/// undeclared covariates) are read into the [`Population`] leniently. `None` on
+/// both is the legacy auto-detect [`read_nonmem_csv`] path.
+fn read_nonmem_csv_impl(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    table_decls: Option<&[CovariateDecl]>,
+    filter: Option<&SelectionFilter>,
+) -> Result<(Population, Option<CovariateTable>), String> {
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
         .has_headers(true)
@@ -51,6 +283,7 @@ pub fn read_nonmem_csv(
     let ii_col = col_idx_ci("ii");
     let ss_col = col_idx_ci("ss");
     let cens_col = col_idx_ci("cens");
+    let addl_col = col_idx_ci("addl");
 
     // IOV occasion column (case-insensitive lookup of user-specified name)
     let occ_col: Option<usize> = iov_column.and_then(|name| col_idx_ci(name));
@@ -62,7 +295,7 @@ pub fn read_nonmem_csv(
     }
 
     const STANDARD_COLS: &[&str] = &[
-        "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens",
+        "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens", "addl",
     ];
     let is_standard = |h: &str| {
         STANDARD_COLS.iter().any(|s| h.eq_ignore_ascii_case(s))
@@ -80,8 +313,45 @@ pub fn read_nonmem_csv(
     };
     let cov_indices: Vec<(String, usize)> = cov_names
         .iter()
-        .filter_map(|name| col_idx_cs(name).map(|idx| (name.clone(), idx)))
+        .filter_map(|name| {
+            // Prefer an exact header match; fall back to case-insensitive so a
+            // filter-injected lowercase name (e.g. "study" from
+            // `referenced_covariate_columns`) still resolves to a "STUDY" header.
+            // Store the actual header name so covariate keys match the dataset.
+            col_idx_cs(name)
+                .or_else(|| col_idx_ci(name))
+                .map(|idx| (headers[idx].clone(), idx))
+        })
         .collect();
+
+    // Optional covariate table over the *declared* covariates. Every declared
+    // column must exist — otherwise it would silently vanish and evaluate to
+    // nothing — so resolve indices up front and fail loudly on any miss.
+    let table_indices: Vec<(String, usize)> = if let Some(decls) = table_decls {
+        let missing: Vec<&str> = decls
+            .iter()
+            .filter(|d| col_idx_cs(&d.name).is_none())
+            .map(|d| d.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "{ERR_COV_MISSING_COLUMNS} (case-sensitive): {}. Available columns: {}.",
+                missing.join(", "),
+                headers.join(", ")
+            ));
+        }
+        decls
+            .iter()
+            .map(|d| (d.name.clone(), col_idx_cs(&d.name).unwrap()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Covariate table: one row per input record, in file order. Only built when
+    // declarations were supplied (authoritative `[covariates]` path).
+    let build_table = table_decls.is_some();
+    let mut table_rows: Vec<CovariateRow> = Vec::new();
 
     // Parse rows grouped by ID
     let mut rows_by_id: Vec<(String, Vec<Vec<String>>)> = Vec::new();
@@ -92,6 +362,45 @@ pub fn read_nonmem_csv(
         let fields: Vec<String> = record.iter().map(|f| f.trim().to_string()).collect();
 
         let id = fields.get(id_col).cloned().unwrap_or_default();
+
+        if build_table {
+            let time = parse_f64(fields.get(time_col).map(|s| s.as_str()).unwrap_or("0"));
+            // Mirror `parse_subject`'s EVID computation so the table's EVID
+            // agrees with how each row was classified.
+            let evid = evid_col
+                .and_then(|c| fields.get(c))
+                .map(|s| parse_evid(s))
+                .unwrap_or(0);
+            let mut values = Vec::with_capacity(table_indices.len());
+            for (name, idx) in &table_indices {
+                let cell = fields.get(*idx).map(|s| s.as_str()).unwrap_or("");
+                if is_missing_cell(cell) {
+                    values.push(f64::NAN);
+                } else {
+                    match cell.trim().parse::<f64>() {
+                        Ok(v) => values.push(v),
+                        Err(_) => {
+                            return Err(format!(
+                                "{ERR_COV_NON_NUMERIC} '{}' for covariate '{}' (ID {}, TIME {}). \
+                                 Covariates must be numerically coded — encode categoricals as \
+                                 integer levels.",
+                                cell.trim(),
+                                name,
+                                id,
+                                time
+                            ));
+                        }
+                    }
+                }
+            }
+            table_rows.push(CovariateRow {
+                id: id.clone(),
+                time,
+                evid,
+                values,
+            });
+        }
+
         if id != current_id {
             current_id = id.clone();
             rows_by_id.push((id, Vec::new()));
@@ -99,11 +408,17 @@ pub fn read_nonmem_csv(
         rows_by_id.last_mut().unwrap().1.push(fields);
     }
 
-    // Build subjects
+    // Build subjects, applying selection filter if present.
     let mut subjects = Vec::new();
     let mut total_occ_failures: usize = 0;
+    let mut population_warnings: Vec<String> = Vec::new();
+    let n_records_total: usize = rows_by_id.iter().map(|(_, rows)| rows.len()).sum();
+    let mut excl_summary = ExclusionSummary {
+        n_records_total,
+        ..Default::default()
+    };
     for (id, rows) in &rows_by_id {
-        let (subject, occ_failures) = parse_subject(
+        let (subject, occ_failures, subj_excl, subj_warnings) = parse_subject(
             id,
             rows,
             time_col,
@@ -117,39 +432,150 @@ pub fn read_nonmem_csv(
             ss_col,
             cens_col,
             occ_col,
+            addl_col,
             &cov_indices,
+            filter,
         )?;
-        subjects.push(subject);
         total_occ_failures += occ_failures;
+        population_warnings.extend(subj_warnings);
+
+        // Accumulate filter statistics.
+        excl_summary.n_obs_excluded += subj_excl.n_obs_excluded;
+        excl_summary.n_dose_excluded += subj_excl.n_dose_excluded;
+        excl_summary.n_other_excluded += subj_excl.n_other_excluded;
+        for src in subj_excl.fired {
+            if !excl_summary.fired_ignore.contains(&src)
+                && !excl_summary.fired_accept.contains(&src)
+            {
+                if src.starts_with("accept:") {
+                    excl_summary.fired_accept.push(src);
+                } else {
+                    excl_summary.fired_ignore.push(src);
+                }
+            }
+        }
+
+        // Warn about pathological partial exclusions. Collected into
+        // `population_warnings` (not printed) per the warning convention —
+        // they surface via `FitResult.warnings`.
+        let has_doses = !subject.doses.is_empty();
+        let has_obs = !subject.observations.is_empty();
+        let excluded_doses = subj_excl.n_dose_excluded > 0;
+        let excluded_obs = subj_excl.n_obs_excluded > 0;
+
+        if excluded_doses && !has_doses && has_obs {
+            population_warnings.push(format!(
+                "subject {id}: all dose records were excluded by [data_selection] but \
+                 observations remain — predictions will be undefined."
+            ));
+        }
+        if excluded_obs && !has_obs && has_doses {
+            population_warnings.push(format!(
+                "subject {id}: all observation records were excluded by [data_selection] but \
+                 dose records remain — subject contributes nothing to the likelihood."
+            ));
+        }
+
+        // Only drop a subject as "excluded by data selection" when the filter
+        // actually removed at least one of its records and that left it empty.
+        // Without this guard we would also drop subjects that are empty for
+        // unrelated reasons (e.g. only EVID=2/3 rows) on the no-filter path,
+        // which is a behavior change vs. the pre-feature reader (it pushed every
+        // subject unconditionally). `had_exclusions` is only ever > 0 when a
+        // filter is active.
+        let had_exclusions =
+            subj_excl.n_obs_excluded + subj_excl.n_dose_excluded + subj_excl.n_other_excluded > 0;
+        if had_exclusions && subject.doses.is_empty() && subject.observations.is_empty() {
+            // Subject entirely excluded by the filter — do not add to the list.
+            excl_summary.excluded_subject_ids.push(id.clone());
+            continue;
+        }
+        subjects.push(subject);
     }
 
-    // Surface a single warning if any OCC values were missing/unparseable.
-    // Such rows are silently mapped to occ=0, mixing with valid occ=0 rows —
-    // user should clean the dataset.
+    // Accumulate OCC warning into population_warnings (surfaced via FitResult.warnings).
     if let Some(name) = iov_column {
         if total_occ_failures > 0 {
-            eprintln!(
-                "[ferx] warning: {} row(s) had missing or unparseable values in iov_column '{}'; \
-                 these rows were assigned occasion=0 and may be grouped with valid occ=0 rows. \
-                 Consider cleaning the dataset.",
+            population_warnings.push(format!(
+                "W_IOV_OCC_MISSING: {} row(s) had missing or unparseable values in \
+                 iov_column '{}'; these rows were assigned occasion=0 and may be grouped \
+                 with valid occ=0 rows. Consider cleaning the dataset.",
                 total_occ_failures, name
-            );
+            ));
         }
     }
 
-    Ok(Population {
-        subjects,
-        covariate_names: cov_names,
-        dv_column: "dv".to_string(),
-    })
+    let exclusions = if filter.is_some() {
+        Some(excl_summary)
+    } else {
+        None
+    };
+
+    let table = if let Some(decls) = table_decls {
+        // `table_indices` (and hence each row's `values`) is in declaration
+        // order, so names/kinds taken from `decls` stay aligned.
+        Some(CovariateTable {
+            names: decls.iter().map(|d| d.name.clone()).collect(),
+            kinds: decls.iter().map(|d| d.kind).collect(),
+            rows: table_rows,
+        })
+    } else {
+        None
+    };
+
+    // `covariate_names` reports only columns that actually exist in the data
+    // (derived from `cov_indices`). A requested column that isn't in the CSV —
+    // e.g. a referenced-but-undeclared covariate passed in the union that turns
+    // out to be absent — must NOT appear here, otherwise `check_covariates`
+    // would treat it as present and let the fit run with that covariate at 0.0
+    // instead of failing with E_MISSING_COVARIATE. (For the auto-detect path
+    // `cov_names` is already existing-only, so this is a no-op there.)
+    let existing_cov_names: Vec<String> = cov_indices.iter().map(|(n, _)| n.clone()).collect();
+
+    Ok((
+        Population {
+            subjects,
+            covariate_names: existing_cov_names,
+            dv_column: "dv".to_string(),
+            input_columns: headers,
+            exclusions,
+            warnings: population_warnings,
+        },
+        table,
+    ))
 }
 
 fn parse_f64(s: &str) -> f64 {
     s.parse::<f64>().unwrap_or(0.0)
 }
 
+/// Parse a numeric cell for the data-selection filter, mapping missing/blank
+/// cells (`.`, `NA`, empty) to `NaN`. Because every IEEE comparison against
+/// `NaN` is false (see `cmp_f64`), a record whose value for a referenced column
+/// is missing never matches that condition — so `ignore = DV < 0.001` skips
+/// dose rows (where `DV` is `.`) instead of silently treating them as `0`.
+fn parse_f64_or_nan(s: &str) -> f64 {
+    let t = s.trim();
+    if is_missing_cell(t) {
+        f64::NAN
+    } else {
+        t.parse::<f64>().unwrap_or(f64::NAN)
+    }
+}
+
 fn parse_usize(s: &str) -> usize {
-    s.parse::<usize>().unwrap_or(1)
+    s.parse::<usize>().unwrap_or(0)
+}
+
+/// Parse an EVID cell. A missing / blank / unparseable value maps to 0
+/// (observation) — NONMEM's documented default. (`parse_usize` defaults to 1,
+/// which would mislabel a blank-EVID observation row as a dose.)
+fn parse_evid(s: &str) -> u32 {
+    let t = s.trim();
+    if is_missing_cell(t) {
+        return 0;
+    }
+    t.parse::<u32>().unwrap_or(0)
 }
 
 /// Parse an occasion-column cell. Returns `None` for blank / `.` / NA / non-integer
@@ -157,7 +583,7 @@ fn parse_usize(s: &str) -> usize {
 /// uses `.` for missing.
 fn parse_occ(s: &str) -> Option<u32> {
     let t = s.trim();
-    if t.is_empty() || t == "." || t.eq_ignore_ascii_case("na") || t.eq_ignore_ascii_case("nan") {
+    if is_missing_cell(t) {
         return None;
     }
     t.parse::<u32>().ok()
@@ -178,8 +604,10 @@ fn parse_subject(
     ss_col: Option<usize>,
     cens_col: Option<usize>,
     occ_col: Option<usize>,
+    addl_col: Option<usize>,
     cov_indices: &[(String, usize)],
-) -> Result<(Subject, usize), String> {
+    filter: Option<&SelectionFilter>,
+) -> Result<(Subject, usize, SubjectExclusion, Vec<String>), String> {
     let mut doses = Vec::new();
     let mut obs_times = Vec::new();
     let mut observations = Vec::new();
@@ -188,6 +616,12 @@ fn parse_subject(
     let mut occasions: Vec<u32> = Vec::new();
     let mut dose_occasions: Vec<u32> = Vec::new();
     let mut occ_parse_failures: usize = 0;
+    let mut excl_n_obs: usize = 0;
+    let mut excl_n_dose: usize = 0;
+    let mut excl_n_other: usize = 0;
+    let mut excl_fired: Vec<String> = Vec::new();
+    let mut parse_warnings: Vec<String> = Vec::new();
+    let mut addl_missing_ii_warned = false;
 
     // Time-constant covariates: first non-missing value across all rows.
     // Used as the subject-static fallback (and for the AD fast path, which
@@ -274,7 +708,7 @@ fn parse_subject(
         let time = parse_f64(row.get(time_col).map(|s| s.as_str()).unwrap_or("0"));
         let evid = evid_col
             .and_then(|c| row.get(c))
-            .map(|s| parse_usize(s))
+            .map(|s| parse_evid(s))
             .unwrap_or(0);
         let mdv = mdv_col
             .and_then(|c| row.get(c))
@@ -296,6 +730,72 @@ fn parse_subject(
             0
         };
 
+        // ── Data selection filter ─────────────────────────────────────────────
+        // Evaluated after LOCF update so the filter sees current covariate
+        // values, matching NONMEM's per-record semantics.
+        if let Some(sel) = filter {
+            // Missing-sensitive numeric columns map `.`/blank to NaN so the
+            // filter never matches them (see `parse_f64_or_nan`).
+            let dv_for_ctx = parse_f64_or_nan(row.get(dv_col).map(|s| s.as_str()).unwrap_or(""));
+            let amt_for_ctx = amt_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_f64_or_nan(s))
+                .unwrap_or(f64::NAN);
+            let cmt_for_ctx = cmt_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_usize(s))
+                .unwrap_or(1);
+            let rate_for_ctx = rate_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_f64_or_nan(s))
+                .unwrap_or(f64::NAN);
+            let ii_for_ctx = ii_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_f64_or_nan(s))
+                .unwrap_or(f64::NAN);
+            let ss_for_ctx = ss_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_usize(s) > 0)
+                .unwrap_or(false);
+            let cens_for_ctx = cens_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_usize(s))
+                .unwrap_or(0);
+            let ctx = RowContext {
+                id,
+                time,
+                dv: dv_for_ctx,
+                evid,
+                amt: amt_for_ctx,
+                cmt: cmt_for_ctx,
+                rate: rate_for_ctx,
+                mdv: mdv as u32,
+                cens: if cens_for_ctx > 0 { 1u8 } else { 0u8 },
+                ii: ii_for_ctx,
+                ss: ss_for_ctx,
+                covariates: &locf_state,
+            };
+            let (excluded, which) = sel.should_exclude(&ctx);
+            if excluded {
+                if let Some(src) = which {
+                    if !excl_fired.contains(&src) {
+                        excl_fired.push(src);
+                    }
+                }
+                // Count by record type for the summary. The catch-all `other`
+                // bucket (EVID 2/3, missing-DV obs) ensures every excluded
+                // record is reflected in some counter.
+                if evid == 1 || evid == 4 {
+                    excl_n_dose += 1;
+                } else if evid == 0 && mdv == 0 {
+                    excl_n_obs += 1;
+                } else {
+                    excl_n_other += 1;
+                }
+                continue; // skip this row
+            }
+        }
+
         // EVID=3 (reset) and EVID=4 (reset + dose) both zero the compartment
         // state at this time. Record the reset before the dose arm runs so
         // EVID=4 captures both the reset and its dose.
@@ -313,7 +813,14 @@ fn parse_subject(
                 .unwrap_or(0.0);
             let cmt = cmt_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
+                .and_then(|s| {
+                    let t = s.trim();
+                    if t == "." || t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<usize>().ok()
+                    }
+                })
                 .unwrap_or(1);
             let rate = rate_col
                 .and_then(|c| row.get(c))
@@ -325,7 +832,7 @@ fn parse_subject(
                 .unwrap_or(0.0);
             let ss = ss_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s) > 0)
+                .map(|s| parse_f64(s.trim()) >= 0.5)
                 .unwrap_or(false);
 
             doses.push(DoseEvent::new(time, amt, cmt, rate, ss, ii));
@@ -335,12 +842,57 @@ fn parse_subject(
             if any_tv {
                 dose_covariates.push(locf_state.clone());
             }
+
+            // ADDL expansion: add additional doses at time + k*II for k=1..=addl.
+            let addl = addl_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_usize(s))
+                .unwrap_or(0);
+            if addl > 0 {
+                if ii <= 0.0 {
+                    if !addl_missing_ii_warned {
+                        parse_warnings.push(format!(
+                            "W_ADDL_MISSING_II subject {}: ADDL > 0 but II is zero or \
+                             missing; additional doses not expanded",
+                            id
+                        ));
+                        addl_missing_ii_warned = true;
+                    }
+                } else {
+                    for k in 1..=(addl as u32) {
+                        doses.push(DoseEvent::new(
+                            time + (k as f64) * ii,
+                            amt,
+                            cmt,
+                            rate,
+                            false, // expanded doses are never SS themselves
+                            ii,
+                        ));
+                        if occ_col.is_some() {
+                            dose_occasions.push(occ);
+                        }
+                        if any_tv {
+                            dose_covariates.push(locf_state.clone());
+                        }
+                    }
+                }
+            }
         } else if evid == 0 && mdv == 0 {
             // Observation record
             let dv = parse_f64(row.get(dv_col).map(|s| s.as_str()).unwrap_or("0"));
+            // Guard "." / blank the same way the dose path does: parse_usize maps
+            // these to 0 (an invalid compartment), but a missing CMT on an
+            // observation row must default to compartment 1.
             let cmt = cmt_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
+                .and_then(|s| {
+                    let t = s.trim();
+                    if t == "." || t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<usize>().ok()
+                    }
+                })
                 .unwrap_or(1);
             let cens_flag = cens_col
                 .and_then(|c| row.get(c))
@@ -413,14 +965,24 @@ fn parse_subject(
             cens,
             occasions,
             dose_occasions: sorted_dose_occ,
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         },
         occ_parse_failures,
+        SubjectExclusion {
+            n_obs_excluded: excl_n_obs,
+            n_dose_excluded: excl_n_dose,
+            n_other_excluded: excl_n_other,
+            fired: excl_fired,
+        },
+        parse_warnings,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::CovariateKind;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -428,6 +990,25 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
+    }
+
+    #[test]
+    fn test_obs_cmt_dot_defaults_to_compartment_one() {
+        // Regression: a "." (missing) CMT on an observation row must default to
+        // compartment 1, not 0. `parse_usize(".")` yields 0 — an invalid
+        // compartment — so the observation path must guard "." / blank exactly
+        // like the dose path does.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT\n\
+                   1,0,.,1,100,1\n\
+                   1,1,5.0,0,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(
+            subj.obs_cmts,
+            vec![1],
+            "obs CMT='.' must default to compartment 1, not 0"
+        );
     }
 
     #[test]
@@ -456,6 +1037,68 @@ mod tests {
         // One dose (t=0), two observations (t=1, t=6) — the reset row is neither.
         assert_eq!(subj.doses.len(), 1);
         assert_eq!(subj.obs_times, vec![1.0, 6.0]);
+    }
+
+    #[test]
+    fn test_filter_on_undeclared_covariate_via_declared_path() {
+        // Regression: a `[data_selection]` condition on a covariate that the
+        // `[covariates]` block did NOT declare must still fire on the declared
+        // read path. Here only WT is declared; `ignore = STUDY == 2` references
+        // the undeclared STUDY column. `referenced_covariate_columns()` must
+        // pull STUDY into the read union so it lands in each subject's covariate
+        // map — otherwise the condition would silently never match.
+        // STUDY is a covariate independent of ID: subjects 1 & 2 are in STUDY 1,
+        // subjects 3 & 4 in STUDY 2. Filtering on STUDY (not ID) must drop a whole
+        // study (3 and 4) while keeping the other (1 and 2). The not-1:1 mapping
+        // ensures the test exercises covariate filtering, not ID matching.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,WT,STUDY\n\
+                   1,0,.,1,100,1,70,1\n\
+                   1,1,5.0,0,.,1,70,1\n\
+                   2,0,.,1,100,1,72,1\n\
+                   2,1,4.5,0,.,1,72,1\n\
+                   3,0,.,1,100,1,80,2\n\
+                   3,1,4.0,0,.,1,80,2\n\
+                   4,0,.,1,100,1,85,2\n\
+                   4,1,3.5,0,.,1,85,2\n";
+        let f = write_csv(csv);
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[]).unwrap();
+        let (pop, _table) =
+            read_nonmem_csv_with_covariates_filtered(f.path(), &decls, &[], None, &filter).unwrap();
+        // Both STUDY==2 subjects (3 and 4) are excluded; STUDY==1 subjects remain.
+        let ids: Vec<&str> = pop.subjects.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2"], "only STUDY==1 subjects should remain");
+        let excl = pop.exclusions.as_ref().expect("exclusions present");
+        assert_eq!(
+            excl.excluded_subject_ids,
+            vec!["3".to_string(), "4".to_string()]
+        );
+        assert!(excl.fired_ignore.iter().any(|s| s.contains("STUDY == 2")));
+    }
+
+    #[test]
+    fn test_no_filter_keeps_subject_with_only_other_events() {
+        // Regression: without a [data_selection] filter, a subject made up solely
+        // of EVID=2 (other-event) rows has empty doses+observations but must
+        // still be retained — matching the pre-feature reader, which pushed every
+        // subject unconditionally. The empty-subject skip must be gated on the
+        // filter actually having excluded records.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT\n\
+                   1,0,.,1,100,1\n\
+                   1,1,5.0,0,.,1\n\
+                   2,0,.,2,.,1\n\
+                   2,1,.,2,.,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let ids: Vec<&str> = pop.subjects.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            ids.contains(&"2"),
+            "subject with only EVID=2 rows must be retained when no filter is active; got {ids:?}"
+        );
+        assert!(pop.exclusions.is_none(), "no filter → no exclusion summary");
     }
 
     #[test]
@@ -672,6 +1315,143 @@ mod tests {
         assert!(subj.pk_only_covariates.is_empty());
     }
 
+    fn decl(name: &str, kind: CovariateKind) -> CovariateDecl {
+        CovariateDecl {
+            name: name.to_string(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn test_covariate_table_one_row_per_input_record() {
+        // 1 dose + 2 obs = 3 input rows → 3 table rows, including the dose row.
+        let csv = "ID,TIME,DV,EVID,AMT,WT,SEX\n\
+                   1,0,.,1,100,70,1\n\
+                   1,1,5.0,0,.,70,1\n\
+                   1,2,3.0,0,.,70,1\n";
+        let f = write_csv(csv);
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("SEX", CovariateKind::Categorical),
+        ];
+        let (_pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap();
+        assert_eq!(table.names, vec!["WT", "SEX"]);
+        assert_eq!(
+            table.kinds,
+            vec![CovariateKind::Continuous, CovariateKind::Categorical]
+        );
+        assert_eq!(table.rows.len(), 3);
+        // Dose row preserved with EVID=1.
+        assert_eq!(table.rows[0].evid, 1);
+        assert_eq!(table.rows[0].time, 0.0);
+        assert_eq!(table.rows[0].values, vec![70.0, 1.0]);
+        assert_eq!(table.rows[1].evid, 0);
+        assert_eq!(table.rows[2].time, 2.0);
+    }
+
+    #[test]
+    fn test_covariate_table_missing_value_is_nan() {
+        let csv = "ID,TIME,DV,EVID,AMT,WT,SEX\n\
+                   1,0,.,1,100,70,.\n\
+                   1,1,5.0,0,.,,1\n";
+        let f = write_csv(csv);
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("SEX", CovariateKind::Categorical),
+        ];
+        let (_pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap();
+        // Row 0: SEX is "." → NaN. Row 1: WT is blank → NaN.
+        assert!(table.rows[0].values[1].is_nan());
+        assert!(table.rows[1].values[0].is_nan());
+        assert_eq!(table.rows[0].values[0], 70.0);
+    }
+
+    #[test]
+    fn test_covariate_strict_numeric_errors_on_non_numeric() {
+        let csv = "ID,TIME,DV,EVID,AMT,WT,SEX\n\
+                   1,0,.,1,100,70,M\n\
+                   1,1,5.0,0,.,70,M\n";
+        let f = write_csv(csv);
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("SEX", CovariateKind::Categorical),
+        ];
+        let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
+        assert!(err.contains("non-numeric"), "got: {err}");
+        assert!(err.contains("SEX"), "got: {err}");
+    }
+
+    #[test]
+    fn test_covariate_declared_column_missing_errors() {
+        let csv = "ID,TIME,DV,EVID,AMT,WT\n\
+                   1,0,.,1,100,70\n";
+        let f = write_csv(csv);
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("CRCL", CovariateKind::Continuous),
+        ];
+        let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+        assert!(err.contains("CRCL"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_evid_defaults_to_observation() {
+        // parse_usize defaults to 1; parse_evid must default to 0 (observation)
+        // for blank / missing / unparseable cells.
+        assert_eq!(parse_evid("1"), 1);
+        assert_eq!(parse_evid("0"), 0);
+        assert_eq!(parse_evid(""), 0);
+        assert_eq!(parse_evid("."), 0);
+        assert_eq!(parse_evid("NA"), 0);
+        assert_eq!(parse_evid("x"), 0);
+    }
+
+    #[test]
+    fn test_covtab_blank_evid_is_observation_not_dose() {
+        // A blank EVID cell on an observation row must be EVID=0 in the covtab,
+        // not 1 (which parse_usize would have produced).
+        let csv = "ID,TIME,DV,EVID,AMT,WT\n\
+                   1,0,.,1,100,70\n\
+                   1,1,5.0,,.,70\n";
+        let f = write_csv(csv);
+        let decls = vec![decl("WT", CovariateKind::Continuous)];
+        let (_pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap();
+        assert_eq!(table.rows[0].evid, 1); // explicit dose row
+        assert_eq!(table.rows[1].evid, 0); // blank EVID → observation
+    }
+
+    #[test]
+    fn test_absent_extra_covariate_excluded_from_covariate_names() {
+        // A referenced-but-undeclared covariate passed in `extra` that is NOT a
+        // real column must not appear in covariate_names — otherwise the fit's
+        // E_MISSING_COVARIATE guard would be masked and it would silently read
+        // as 0.0. (Regression test for the masking bug.)
+        let csv = "ID,TIME,DV,EVID,AMT,WT,CRCL\n\
+                   1,0,.,1,100,70,80\n\
+                   1,1,5.0,0,.,70,80\n";
+        let f = write_csv(csv);
+        let decls = vec![decl("WT", CovariateKind::Continuous)];
+        let extra = vec!["GHOST".to_string()]; // not a column in the CSV
+        let (pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, &extra, None).unwrap();
+        assert!(!pop.covariate_names.contains(&"GHOST".to_string()));
+        assert!(pop.covariate_names.contains(&"WT".to_string()));
+        // The table still reflects only declared columns.
+        assert_eq!(table.names, vec!["WT"]);
+    }
+
+    #[test]
+    fn test_legacy_read_still_succeeds_with_non_numeric_covariate() {
+        // The legacy auto-detect path must remain unchanged (no strict numeric
+        // check): a non-numeric covariate column loads without erroring.
+        let csv = "ID,TIME,DV,EVID,AMT,SEX\n\
+                   1,0,.,1,100,M\n\
+                   1,1,5.0,0,.,M\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(pop.covariate_names.contains(&"SEX".to_string()));
+    }
+
     #[test]
     fn test_tv_covariate_locf_handles_missing_intermediate() {
         // Missing CR values are filled forward (LOCF), matching NONMEM.
@@ -689,5 +1469,23 @@ mod tests {
         assert_eq!(subj.obs_covariates[1]["CR"], 2.0);
         // Obs 2 (t=3, CR missing) → LOCF → 2.0.
         assert_eq!(subj.obs_covariates[2]["CR"], 2.0);
+    }
+
+    #[test]
+    fn test_input_columns_preserves_full_header_order() {
+        // input_columns must carry every column in original order and case,
+        // including standard columns (ID, TIME, DV, …) that are excluded from
+        // covariate_names, and IOV columns.
+        let csv = "ID,TIME,DV,EVID,AMT,OCC,WT\n\
+                   1,0,.,1,100,1,70\n\
+                   1,1,5.0,0,.,1,70\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap();
+        assert_eq!(
+            pop.input_columns,
+            vec!["ID", "TIME", "DV", "EVID", "AMT", "OCC", "WT"]
+        );
+        // Standard and IOV columns must not appear in covariate_names.
+        assert_eq!(pop.covariate_names, vec!["WT"]);
     }
 }

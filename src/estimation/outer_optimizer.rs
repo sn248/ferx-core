@@ -531,6 +531,13 @@ fn optimize_nlopt(
     // that made scaling default-off was on non-IOV models and other algorithms
     // (notably MMA, which scaling hurts here), so scope the auto-enable to the
     // IOV + SLSQP combination that actually needs it.
+    //
+    // Scope note: as of #155 the default outer optimizer is `Bobyqa`, not
+    // `Slsqp` — so default-IOV fits no longer hit this branch. BOBYQA is
+    // gradient-free and doesn't suffer the `cap_slsqp_gradient` starvation that
+    // motivates the scaling here, so leaving it disabled on the default path is
+    // intentional. This auto-enable now only fires for an explicit
+    // `optimizer = slsqp` on IOV models (the path it was originally written for).
     let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
     let scale: Vec<f64> = if (options.scale_params || auto_scale_iov) && !has_identity_theta {
         compute_scale(&x0)
@@ -2484,7 +2491,7 @@ mod tests {
         };
         CompiledModel {
             name: "outer_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -2527,6 +2534,8 @@ mod tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         }
     }
 
@@ -2547,12 +2556,17 @@ mod tests {
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             })
             .collect();
         Population {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
         }
     }
 
@@ -2670,7 +2684,7 @@ mod tests {
         };
         let model = CompiledModel {
             name: "block_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -2713,6 +2727,8 @@ mod tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
         };
         check_gradient(&model, &make_population(3), 2);
     }

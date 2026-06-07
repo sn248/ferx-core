@@ -1,6 +1,6 @@
 # Installation
 
-ferx-core requires a nightly Rust toolchain with Enzyme for automatic differentiation. The **supported way to get one is to build `rustc` from source with Enzyme enabled**, so that `rustc`, LLVM, and Enzyme are all compiled from the same tree and are guaranteed version-compatible. This is also how the [ferx-r Docker image](https://github.com/ferx-core-NLME/ferx-r) builds its toolchain.
+ferx-core requires a nightly Rust toolchain with Enzyme for automatic differentiation. The **supported way to get one is to build `rustc` from source with Enzyme enabled**, so that `rustc`, LLVM, and Enzyme are all compiled from the same tree and are guaranteed version-compatible. This is also how the [ferx-r Docker image](https://github.com/FeRx-NLME/ferx-r) builds its toolchain.
 
 > ## ⚠️ Do not build a standalone Enzyme *plugin* against a separately-installed LLVM
 >
@@ -136,6 +136,8 @@ rustc +enzyme -Zautodiff=Enable -Clto=fat -Copt-level=2 /tmp/ad_check.rs -o /tmp
 
 Expected: the compile finishes **in a few seconds** and prints `autodiff OK: f=22.3355, df/dx=43.1711`. If `rustc` instead **hangs** (pins a core at 100% CPU and never returns), your toolchain has the LLVM/Enzyme mismatch described in the warning at the top — rebuild from source with `--set llvm.download-ci-llvm=false`.
 
+> **The ferx R package runs this check for you.** Installing [ferx-r](https://github.com/FeRx-NLME/ferx-r) on the autodiff path runs the same compile-and-run self-test automatically (under a timeout) before the long fat-LTO build, and aborts with a pointer back here if the toolchain hangs — so a broken toolchain fails fast instead of wedging `rustc`. You only need to run the check above by hand when setting the toolchain up outside the R package (e.g. for the `ferx` CLI). Set `FERX_AD_PREFLIGHT_SKIP=1` to skip it once verified.
+
 ### Make the toolchain permanent
 
 The clone lives in `/tmp/rust-src`, and `rustup toolchain link enzyme build/host/stage1` points the `enzyme` toolchain *into* that tree. macOS periodically purges `/tmp`, which would silently break the toolchain. Relocate the stage-1 build (~640 MB once pruned) to a permanent path and re-link:
@@ -205,7 +207,7 @@ Once upstream Enzyme integration is distributed via rustup (tracked at [rust-lan
 Once your Enzyme toolchain is set up and **verified**:
 
 ```bash
-git clone https://github.com/ferx-core-NLME/ferx-core
+git clone https://github.com/FeRx-NLME/ferx-core
 cd ferx-core
 
 RUSTFLAGS="-Z autodiff=Enable" cargo build --release --features autodiff
@@ -282,8 +284,11 @@ Should print a successful model fit with parameter estimates.
 The R package handles all of the above automatically — you do **not** set `RUSTFLAGS` yourself. Just:
 
 ```r
-devtools::install_github("ferx-core-NLME/ferx-r")
+pak::pak("FeRx-NLME/ferx-r")
+# or: devtools::install_github("FeRx-NLME/ferx-r")
 ```
+
+> **The autodiff final link spikes memory.** At the very end of the fat-LTO build all linked objects are optimised together in a single pass. On a machine with 16 GB RAM, close other applications first — if `rustc` is OOM-killed the install silently fails mid-link and must be re-run.
 
 The package's build is driven by its `src/Makevars`, which:
 
@@ -300,7 +305,7 @@ To confirm which path your installed package took, call `ferx:::ferx_rust_autodi
 
 This is why a committed `.cargo/config.toml` is discouraged for the core repo: the R package's `Makevars` already manages the flag conditionally per machine, generating the config only when Enzyme is actually available. A committed flag in `ferx-core` would conflict with that logic and break the no-Enzyme install.
 
-See the [ferx R package README](https://github.com/ferx-core-NLME/ferx-r) for API usage.
+See the [ferx R package README](https://github.com/FeRx-NLME/ferx-r) for API usage.
 
 ### Cancelling a running fit (Ctrl-C)
 

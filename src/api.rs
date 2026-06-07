@@ -2,12 +2,17 @@ use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
-use crate::io::datareader::read_nonmem_csv;
+use crate::io::datareader::{
+    read_nonmem_csv, read_nonmem_csv_filtered, read_nonmem_csv_with_covariates,
+    read_nonmem_csv_with_covariates_filtered, SelectionFilter, ERR_COV_MISSING_COLUMNS,
+    ERR_COV_NON_NUMERIC,
+};
 use crate::pk;
 use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
 use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
+use std::collections::HashMap;
 
 /// Build the `FitResult.neural_networks` summary from the compiled model's
 /// `[covariate_nn]` blocks. Empty when no NN blocks are present, so output
@@ -108,7 +113,15 @@ pub fn run_model_with_data_inits(
     eprintln!("Model: {}", parsed.model.name);
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
-    let population = read_nonmem_csv(Path::new(data_path), None, iov_col)?;
+    let sel_filter = build_selection_filter(&parsed.fit_options)?;
+    let (population, covariate_table) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        data_path,
+        None,
+        iov_col,
+        sel_filter.as_ref(),
+    )?;
     eprintln!(
         "Data:  {} subjects, {} observations from {}",
         population.subjects.len(),
@@ -123,6 +136,7 @@ pub fn run_model_with_data_inits(
         &init_params,
         &parsed.fit_options,
     )?;
+    result.covariate_table = covariate_table;
     // Hash both inputs *after* the fit so we don't double up disk reads
     // (the model and CSV are already in the page cache from parse + read
     // upstream). Errors here are non-fatal: the fit already succeeded, and
@@ -174,12 +188,17 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             cens: vec![0; sim_spec.obs_times.len()],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         })
         .collect();
     let template = Population {
         subjects,
         covariate_names: vec![],
         dv_column: "dv".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
     };
 
     // Simulate
@@ -203,10 +222,11 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                 // Under LTBS the simulated DV is on the log scale and may be
                 // negative, so the positivity floor only applies to natural-scale
                 // simulation.
+                let v = s.outcome.continuous_value();
                 subject.observations[j] = if parsed.model.log_transform {
-                    s.dv_sim
+                    v
                 } else {
-                    s.dv_sim.max(0.001)
+                    v.max(0.001)
                 };
             }
         }
@@ -288,6 +308,142 @@ fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagn
     .with_suggestion(format!("available covariate columns: {}", available))]
 }
 
+/// Covariates referenced by the model but missing from the `[covariates]`
+/// declaration. These are still read (leniently) so the model works; the parser
+/// has already warned that they ought to be declared.
+fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<String> {
+    model
+        .referenced_covariates
+        .iter()
+        .filter(|c| !decls.iter().any(|d| &d.name == *c))
+        .cloned()
+        .collect()
+}
+
+/// Single covariate-aware reader used by every file-based entry point (`fit`
+/// wrappers and `ferx check`), so they all apply identical covariate validation.
+/// Build a `SelectionFilter` from a model file's `FitOptions` alone.
+/// Returns `None` when no selection rules are set.
+fn build_selection_filter(opts: &FitOptions) -> Result<Option<SelectionFilter>, String> {
+    if opts.ignore_exprs.is_empty()
+        && opts.accept_exprs.is_empty()
+        && opts.ignore_subjects.is_empty()
+    {
+        return Ok(None);
+    }
+    SelectionFilter::from_opts(
+        &opts.ignore_exprs,
+        &opts.accept_exprs,
+        &opts.ignore_subjects,
+    )
+    .map(Some)
+}
+
+/// Build a `SelectionFilter` merging the model file's rules with a caller-supplied
+/// `FitOptions` (e.g. from the R wrapper). Conditions from both sources are
+/// deduplicated and OR'd (ignore) / AND'd (accept) together.
+fn build_selection_filter_merged(
+    model_opts: &FitOptions,
+    call_opts: &FitOptions,
+) -> Result<Option<SelectionFilter>, String> {
+    // Merge by accumulating unique strings from both sources.
+    let mut ignore = model_opts.ignore_exprs.clone();
+    let mut accept = model_opts.accept_exprs.clone();
+    let mut subjects = model_opts.ignore_subjects.clone();
+    for s in &call_opts.ignore_exprs {
+        let t = s.trim().to_string();
+        if !ignore.iter().any(|e| e == &t) {
+            ignore.push(t);
+        }
+    }
+    for s in &call_opts.accept_exprs {
+        let t = s.trim().to_string();
+        if !accept.iter().any(|e| e == &t) {
+            accept.push(t);
+        }
+    }
+    for s in &call_opts.ignore_subjects {
+        // Strip surrounding quotes so a caller-supplied `"3"` matches the same
+        // subject as a `.ferx` `ignore_subjects = 3` (the model-file parser
+        // already quote-strips). Without this the two sources disagree and a
+        // duplicate across them fails to dedup.
+        let t = s
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim()
+            .to_string();
+        if !t.is_empty() && !subjects.iter().any(|e| e == &t) {
+            subjects.push(t);
+        }
+    }
+    if ignore.is_empty() && accept.is_empty() && subjects.is_empty() {
+        return Ok(None);
+    }
+    SelectionFilter::from_opts(&ignore, &accept, &subjects).map(Some)
+}
+
+///
+/// When the model declares a `[covariates]` block this routes through the strict
+/// reader (validates declared columns exist + are numeric, builds the table, and
+/// reads referenced-but-undeclared covariates leniently as `extra`). Otherwise
+/// it falls back to the lenient reader with `fallback_columns` (the legacy
+/// `covariate_columns` argument, or `None` for auto-detect).
+fn read_population_for(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+) -> Result<(Population, Option<CovariateTable>), String> {
+    match (covariate_decls, filter) {
+        (Some(decls), Some(sel)) => {
+            let extra = undeclared_referenced(model, decls);
+            let (pop, table) = read_nonmem_csv_with_covariates_filtered(
+                Path::new(data_path),
+                decls,
+                &extra,
+                iov_column,
+                sel,
+            )?;
+            Ok((pop, Some(table)))
+        }
+        (Some(decls), None) => {
+            let extra = undeclared_referenced(model, decls);
+            let (pop, table) =
+                read_nonmem_csv_with_covariates(Path::new(data_path), decls, &extra, iov_column)?;
+            Ok((pop, Some(table)))
+        }
+        (None, Some(sel)) => Ok((
+            read_nonmem_csv_filtered(Path::new(data_path), fallback_columns, iov_column, sel)?,
+            None,
+        )),
+        (None, None) => Ok((
+            read_nonmem_csv(Path::new(data_path), fallback_columns, iov_column)?,
+            None,
+        )),
+    }
+}
+
+/// Map an error string from [`read_population_for`] onto a `ferx check`
+/// diagnostic, so the covariate-validation failures the strict reader raises at
+/// fit time surface with the same code/block in `ferx check` (rather than as a
+/// generic `E_DATA`). Classification keys off the reader's stable message
+/// prefixes ([`ERR_COV_MISSING_COLUMNS`] / [`ERR_COV_NON_NUMERIC`]).
+fn covariate_read_diagnostic(err: &str, path: &str) -> Diagnostic {
+    if err.starts_with(ERR_COV_MISSING_COLUMNS) {
+        Diagnostic::error("E_MISSING_COVARIATE", err.to_string()).with_block("covariates")
+    } else if err.starts_with(ERR_COV_NON_NUMERIC) {
+        Diagnostic::error("E_COVARIATE_NOT_NUMERIC", err.to_string()).with_block("covariates")
+    } else {
+        Diagnostic::error(
+            "E_DATA",
+            format!("Failed to read data file '{}': {}", path, err),
+        )
+    }
+}
+
 /// Per-CMT scaling needs every observed CMT to have an entry in the
 /// `ScalingSpec::PerCmt` / `OdeReadout::PerCmt` map. Wraps the existing
 /// `pk::validate_per_cmt_scaling` (which the parser can't run — it doesn't see
@@ -344,6 +500,7 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_iov_occasions(model, population));
+    diags.extend(validate_output_columns(model, population));
     diags
 }
 
@@ -656,6 +813,10 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     for w in &parsed.model.parse_warnings {
         let code = if w.contains("declared in [parameters] but not referenced") {
             "W_UNUSED_PARAM"
+        } else if w.contains("W_DERIVED_COVARIATE_SHADOW") {
+            "W_DERIVED_COVARIATE_SHADOW"
+        } else if w.contains("W_DERIVED_STEP_IGNORED") {
+            "W_DERIVED_STEP_IGNORED"
         } else {
             "W_PARSE"
         };
@@ -668,11 +829,34 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    what the CLI fit path (`run_model_with_data`) passes to `fit()`.
     diags.extend(check_model_options(&parsed.model, &parsed.fit_options));
 
-    // 3. Data-dependent checks (only when a dataset is supplied).
+    // 3. Data-dependent checks (only when a dataset is supplied). Read through
+    //    the same covariate-aware chokepoint the fit uses, so `ferx check` and
+    //    `fit()` apply identical covariate validation (declared columns present
+    //    + numeric). A covariate-validation failure surfaces as the matching
+    //    diagnostic rather than a generic read error.
     if let Some(path) = data_path {
         let iov_col = parsed.fit_options.iov_column.as_deref();
-        match read_nonmem_csv(Path::new(path), None, iov_col) {
-            Ok(population) => {
+        match read_population_for(
+            &parsed.model,
+            &parsed.covariate_decls,
+            path,
+            None,
+            iov_col,
+            None,
+        ) {
+            Ok((population, _table)) => {
+                // Surface datareader warnings (ADDL missing II, IOV OCC missing)
+                // into the check report so `ferx check` sees the same findings as `fit()`.
+                for w in &population.warnings {
+                    let code = if w.starts_with("W_ADDL_MISSING_II") {
+                        "W_ADDL_MISSING_II"
+                    } else if w.starts_with("W_IOV_OCC_MISSING") {
+                        "W_IOV_OCC_MISSING"
+                    } else {
+                        "W_DATA"
+                    };
+                    diags.push(Diagnostic::warning(code, w.clone()));
+                }
                 diags.extend(check_model_data(&parsed.model, &population));
                 let init_params = parsed.model.default_params.clone();
                 diags.extend(check_model_data_warnings(
@@ -682,10 +866,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                 ));
             }
             Err(e) => {
-                diags.push(Diagnostic::error(
-                    "E_DATA",
-                    format!("Failed to read data file '{}': {}", path, e),
-                ));
+                diags.push(covariate_read_diagnostic(&e, path));
             }
         }
     }
@@ -711,9 +892,24 @@ pub fn fit_from_files(
     covariate_columns: Option<&[&str]>,
     options: Option<FitOptions>,
 ) -> Result<FitResult, String> {
-    let mut model = crate::parser::model_parser::parse_model_file(Path::new(model_path))?;
-    let population = read_nonmem_csv(Path::new(data_path), covariate_columns, None)?;
+    // Parse the full model so an authoritative `[covariates]` block is visible
+    // here (the file's `[fit_options]` are still ignored — the caller's
+    // `options` win, preserving historical behaviour).
+    let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(model_path))?;
+    let mut model = parsed.model;
+    // A `[covariates]` declaration takes precedence over the explicit
+    // `covariate_columns` argument; otherwise fall back to the argument (or
+    // legacy auto-detect when both are absent).
     let opts = options.unwrap_or_default();
+    let sel_filter_fit = build_selection_filter_merged(&parsed.fit_options, &opts)?;
+    let (population, covariate_table) = read_population_for(
+        &model,
+        &parsed.covariate_decls,
+        data_path,
+        covariate_columns,
+        None,
+        sel_filter_fit.as_ref(),
+    )?;
     model.bloq_method = opts.bloq_method;
     // SDE models cannot use autodiff — force FD.
     model.gradient_method =
@@ -723,6 +919,7 @@ pub fn fit_from_files(
             opts.gradient_method
         };
     let mut result = fit(&model, &population, &model.default_params, &opts)?;
+    result.covariate_table = covariate_table;
     // Hash inputs post-fit (same pattern as `run_model_with_data`). The
     // model and CSV were already read by `parse_model_file` and
     // `read_nonmem_csv` upstream, so the OS page cache typically serves
@@ -775,6 +972,13 @@ fn perturb_init(
 /// pool of `n` workers, so this setting is per-call (different fits in the
 /// same process can use different thread counts). When `None`, rayon's
 /// global pool is used (one worker per logical CPU).
+///
+/// `[data_selection]` filtering (`options.ignore_exprs` / `accept_exprs` /
+/// `ignore_subjects`) is **not** applied here: it happens at CSV read time in
+/// the file-based entry points (`run_model_with_data`, `fit_from_files`). This
+/// function expects an already-filtered `Population` and simply echoes its
+/// `exclusions` summary onto the result. Callers building a `Population` in
+/// memory should filter their records beforehand.
 pub fn fit(
     model: &CompiledModel,
     population: &Population,
@@ -1012,6 +1216,498 @@ fn probe_nlopt_algorithms() -> Vec<String> {
     }
 }
 
+// ── Step 7: [output] validation and TAFD/TAD helpers ────────────────────────
+
+/// Mandatory sdtab column names that are always written — declaring them in
+/// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
+const OUTPUT_MANDATORY: &[&str] = &[
+    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV",
+    "N_OBS", "TAFD", "TAD",
+];
+
+/// Validate `model.output_columns` against known quantities, emitting
+/// `W_OUTPUT_DUPLICATE` and `E_OUTPUT_UNKNOWN_COLUMN` diagnostics.
+pub fn validate_output_columns(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    let derived_names: Vec<&str> = model
+        .derived_exprs
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    let cov_names = &population.covariate_names;
+
+    for col in &model.output_columns {
+        // Already in mandatory minimum, or an ETA (reported via ebe_etas, not sdtab)?
+        let is_eta = model.eta_names.iter().any(|e| e.eq_ignore_ascii_case(col));
+        if OUTPUT_MANDATORY.iter().any(|m| m.eq_ignore_ascii_case(col)) || is_eta {
+            let msg = if is_eta {
+                // sdtab is per-observation only; per-subject EBEs live in
+                // `ebe_etas` on the R side, so an ETA can't be an sdtab column.
+                format!(
+                    "[output] column `{col}` is an ETA estimate, reported via `ebe_etas` \
+                     rather than as an sdtab column; the declaration is ignored"
+                )
+            } else {
+                format!(
+                    "[output] column `{col}` is already written to sdtab automatically; \
+                     the declaration is ignored"
+                )
+            };
+            diags.push(Diagnostic::warning("W_OUTPUT_DUPLICATE", msg));
+            continue;
+        }
+        // Valid if it's a covariate, indiv param, or derived name
+        let known = cov_names.iter().any(|c| c.eq_ignore_ascii_case(col))
+            || model
+                .indiv_param_names
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(col))
+            || derived_names.iter().any(|d| d.eq_ignore_ascii_case(col));
+        if !known {
+            let mut candidates: Vec<&str> = cov_names.iter().map(|s| s.as_str()).collect();
+            candidates.extend(model.indiv_param_names.iter().map(|s| s.as_str()));
+            candidates.extend(derived_names.iter().copied());
+            candidates.extend(OUTPUT_MANDATORY.iter().copied());
+            diags.push(Diagnostic::error(
+                "E_OUTPUT_UNKNOWN_COLUMN",
+                format!(
+                    "[output] column `{col}` is not recognised as a covariate, individual \
+                     parameter, or derived expression. Known: {}",
+                    candidates.join(", ")
+                ),
+            ));
+        }
+    }
+    diags
+}
+
+/// Compute TAFD (time after first dose) and TAD (time after last dose,
+/// SS-aware) for observation index `obs_idx` of `subject`.
+pub fn tafd_tad_for_subject(subject: &Subject, obs_idx: usize, lagtime: f64) -> (f64, f64) {
+    let obs_time = subject.obs_times[obs_idx];
+
+    let first_dose_time = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
+    let tafd = if first_dose_time.is_finite() {
+        obs_time - first_dose_time
+    } else {
+        f64::NAN
+    };
+
+    let last_dose_eff = subject
+        .doses
+        .iter()
+        .filter(|d| d.time + lagtime <= obs_time + 1e-12)
+        .map(|d| {
+            if d.ss && d.ii > 0.0 {
+                let elapsed = obs_time - (d.time + lagtime);
+                obs_time - elapsed.rem_euclid(d.ii)
+            } else {
+                d.time + lagtime
+            }
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    let tad = if last_dose_eff.is_finite() {
+        obs_time - last_dose_eff
+    } else {
+        f64::NAN
+    };
+
+    (tafd, tad)
+}
+
+// ── Step 8: post-fit extra column computation ────────────────────────────────
+
+/// Build a per-observation HashMap mapping `model.indiv_param_names` to their
+/// values from `pk`.
+fn build_indiv_map(pk: &PkParams, names: &[String], pk_indices: &[usize]) -> HashMap<String, f64> {
+    names
+        .iter()
+        .zip(pk_indices.iter())
+        .map(|(name, &idx)| (name.clone(), pk.values[idx]))
+        .collect()
+}
+
+/// Trapezoid integration over (time, value) pairs.
+/// Observation times are not guaranteed to be sorted (preserved in input row
+/// order), so sort by time before integrating to prevent negative dt windows.
+fn trapezoid(points: &[(f64, f64)]) -> f64 {
+    if points.len() < 2 {
+        return f64::NAN;
+    }
+    let mut sorted = points.to_vec();
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut auc = 0.0;
+    for w in sorted.windows(2) {
+        let dt = w[1].0 - w[0].0;
+        auc += dt * (w[0].1 + w[1].1) * 0.5;
+    }
+    auc
+}
+
+/// Compute all [derived] and [output] columns post-fit, storing results in
+/// each SubjectResult's `extra_columns` field.
+pub(crate) fn compute_extra_output_columns(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    subjects: &mut [SubjectResult],
+) {
+    use crate::types::{AggFunction, DerivedContext, DerivedKind, IntegralStep, IntegralWindow};
+
+    let derived_names: Vec<&str> = model
+        .derived_exprs
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+
+    for (si, sr) in subjects.iter_mut().enumerate() {
+        let subject = &population.subjects[si];
+        let eta_hat = sr.eta.as_slice();
+        let n_obs = sr.ipred.len();
+
+        // Per-observation PK params, indiv maps, TAFD, TAD
+        let mut per_obs_cov: Vec<&HashMap<String, f64>> = Vec::with_capacity(n_obs);
+        let mut per_obs_indiv: Vec<HashMap<String, f64>> = Vec::with_capacity(n_obs);
+        let mut per_obs_tafd: Vec<f64> = Vec::with_capacity(n_obs);
+        let mut per_obs_tad: Vec<f64> = Vec::with_capacity(n_obs);
+
+        for j in 0..n_obs {
+            let cov_j = subject.obs_cov(j);
+            let pk_j = (model.pk_param_fn)(theta, eta_hat, cov_j);
+            let lagtime = pk_j.lagtime();
+            let indiv_j = build_indiv_map(&pk_j, &model.indiv_param_names, &model.pk_indices);
+            let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, lagtime);
+            per_obs_cov.push(cov_j);
+            per_obs_indiv.push(indiv_j);
+            per_obs_tafd.push(tafd_j);
+            per_obs_tad.push(tad_j);
+        }
+
+        // Store per-obs TAD (with individual lagtime) so output.rs can use it
+        // for the mandatory TAD column without re-evaluating PK parameters.
+        sr.per_obs_tad = per_obs_tad.clone();
+
+        // [output] columns: covariates + indiv params not already in derived
+        for col_name in &model.output_columns {
+            if derived_names
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(col_name))
+            {
+                continue; // will be filled by derived pass below
+            }
+            // Skip mandatory/duplicate columns
+            if OUTPUT_MANDATORY
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(col_name))
+                || model
+                    .eta_names
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(col_name))
+            {
+                continue;
+            }
+            let mut col_vals = Vec::with_capacity(n_obs);
+            for j in 0..n_obs {
+                // Resolve covariates and individual parameters case-insensitively:
+                // validate_output_columns accepts the [output] name regardless of
+                // case, so the echo must match a header like `WT` against a
+                // declared `wt` rather than silently producing NaN.
+                let v = per_obs_cov[j]
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(col_name))
+                    .map(|(_, v)| v)
+                    .or_else(|| {
+                        per_obs_indiv[j]
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(col_name))
+                            .map(|(_, v)| v)
+                    })
+                    .copied()
+                    .unwrap_or(f64::NAN);
+                col_vals.push(v);
+            }
+            sr.extra_columns.push((col_name.clone(), col_vals));
+        }
+
+        // [derived] columns, evaluated in declaration order.
+        // prev_derived_vecs stores the full per-row vector for each column evaluated
+        // so far. For Aggregate/Integral (same scalar every row), all elements are
+        // identical. This allows sequential references (`B = f(A)`) to see the
+        // correct per-row value at index j, not just the last row's value.
+        let mut prev_derived_vecs: HashMap<String, Vec<f64>> = HashMap::new();
+
+        for spec in &model.derived_exprs {
+            let col_vals: Vec<f64> = match &spec.kind {
+                DerivedKind::PerRow { eval } => (0..n_obs)
+                    .map(|j| {
+                        let row_prev: HashMap<String, f64> = prev_derived_vecs
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v[j]))
+                            .collect();
+                        let ctx = DerivedContext {
+                            theta,
+                            eta: eta_hat,
+                            indiv_params: &per_obs_indiv[j],
+                            covariates: per_obs_cov[j],
+                            ipred: sr.ipred[j],
+                            pred: sr.pred[j],
+                            dv: subject.observations[j],
+                            time: subject.obs_times[j],
+                            tafd: per_obs_tafd[j],
+                            tad: per_obs_tad[j],
+                            prev_derived: &row_prev,
+                        };
+                        eval(&ctx)
+                    })
+                    .collect(),
+
+                DerivedKind::Aggregate {
+                    func,
+                    value,
+                    filter,
+                } => {
+                    let mut qualifying: Vec<(usize, f64)> = Vec::new();
+                    for j in 0..n_obs {
+                        let row_prev: HashMap<String, f64> = prev_derived_vecs
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v[j]))
+                            .collect();
+                        let ctx = DerivedContext {
+                            theta,
+                            eta: eta_hat,
+                            indiv_params: &per_obs_indiv[j],
+                            covariates: per_obs_cov[j],
+                            ipred: sr.ipred[j],
+                            pred: sr.pred[j],
+                            dv: subject.observations[j],
+                            time: subject.obs_times[j],
+                            tafd: per_obs_tafd[j],
+                            tad: per_obs_tad[j],
+                            prev_derived: &row_prev,
+                        };
+                        let include = filter.as_ref().map_or(true, |f| f(&ctx));
+                        if include {
+                            qualifying.push((j, value(&ctx)));
+                        }
+                    }
+                    let scalar = if qualifying.is_empty() {
+                        f64::NAN
+                    } else {
+                        match func {
+                            AggFunction::Max => qualifying
+                                .iter()
+                                .map(|(_, v)| *v)
+                                .fold(f64::NEG_INFINITY, f64::max),
+                            AggFunction::Min => qualifying
+                                .iter()
+                                .map(|(_, v)| *v)
+                                .fold(f64::INFINITY, f64::min),
+                            AggFunction::Tmax => {
+                                // Time of maximum value
+                                qualifying
+                                    .iter()
+                                    .max_by(|(_, a), (_, b)| {
+                                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                    })
+                                    .map(|(j, _)| subject.obs_times[*j])
+                                    .unwrap_or(f64::NAN)
+                            }
+                        }
+                    };
+                    vec![scalar; n_obs]
+                }
+
+                DerivedKind::Integral {
+                    integrand,
+                    condition,
+                    data_based,
+                    window,
+                    step,
+                } => {
+                    // Closure to compute integral over [from, to] using
+                    // observation times (data-based or forced ObsTimes).
+                    let eval_integral_obs = |from: f64, to: f64| -> f64 {
+                        let pts: Vec<(f64, f64)> = (0..n_obs)
+                            .filter_map(|j| {
+                                let t = subject.obs_times[j];
+                                if t < from - 1e-12 || t > to + 1e-12 {
+                                    return None;
+                                }
+                                let row_prev: HashMap<String, f64> = prev_derived_vecs
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v[j]))
+                                    .collect();
+                                let ctx = DerivedContext {
+                                    theta,
+                                    eta: eta_hat,
+                                    indiv_params: &per_obs_indiv[j],
+                                    covariates: per_obs_cov[j],
+                                    ipred: sr.ipred[j],
+                                    pred: sr.pred[j],
+                                    dv: subject.observations[j],
+                                    time: t,
+                                    tafd: per_obs_tafd[j],
+                                    tad: per_obs_tad[j],
+                                    prev_derived: &row_prev,
+                                };
+                                if condition.as_ref().map_or(false, |f| !f(&ctx)) {
+                                    return None;
+                                }
+                                Some((t, integrand(&ctx)))
+                            })
+                            .collect();
+                        trapezoid(&pts)
+                    };
+
+                    // For model-based integrals with a fine grid, use ipred at a
+                    // representative cov snapshot (first obs) across a uniform grid.
+                    // This is an approximation: cov is time-constant at j=0 values.
+                    // For prior derived columns, use LOCF (last observation before or at t)
+                    // so time-varying columns reflect their most recent value at each grid step.
+                    let grid_cov_0 = per_obs_cov.first().copied().unwrap_or(&subject.covariates);
+                    let grid_lagtime = {
+                        let pk_0 = (model.pk_param_fn)(theta, eta_hat, grid_cov_0);
+                        pk_0.lagtime()
+                    };
+                    let eval_integral_grid = |from: f64, to: f64| -> f64 {
+                        let n_steps = match step {
+                            IntegralStep::Fixed(s) => {
+                                let n = ((to - from) / s).ceil() as usize + 1;
+                                n.max(2)
+                            }
+                            _ => 501, // Auto: 500 intervals
+                        };
+                        let dt = (to - from) / (n_steps - 1) as f64;
+                        let indiv_0 = per_obs_indiv.first().cloned().unwrap_or_default();
+                        let pts: Vec<(f64, f64)> = (0..n_steps)
+                            .filter_map(|k| {
+                                let t = from + k as f64 * dt;
+                                let tafd_k = if subject.doses.is_empty() {
+                                    f64::NAN
+                                } else {
+                                    let fd = subject
+                                        .doses
+                                        .iter()
+                                        .map(|d| d.time)
+                                        .fold(f64::INFINITY, f64::min);
+                                    t - fd
+                                };
+                                let tad_k = {
+                                    let last_dose_eff = subject
+                                        .doses
+                                        .iter()
+                                        .filter(|d| d.time + grid_lagtime <= t + 1e-12)
+                                        .map(|d| {
+                                            if d.ss && d.ii > 0.0 {
+                                                let elapsed = t - (d.time + grid_lagtime);
+                                                t - elapsed.rem_euclid(d.ii)
+                                            } else {
+                                                d.time + grid_lagtime
+                                            }
+                                        })
+                                        .fold(f64::NEG_INFINITY, f64::max);
+                                    if last_dose_eff.is_finite() {
+                                        t - last_dose_eff
+                                    } else {
+                                        f64::NAN
+                                    }
+                                };
+                                // For grid-based, IPRED is evaluated at observation-time snapshots
+                                // by approximating with the nearest observation's IPRED.
+                                let nearest_ipred = subject
+                                    .obs_times
+                                    .iter()
+                                    .zip(sr.ipred.iter())
+                                    .min_by(|(&ta, _), (&tb, _)| {
+                                        (ta - t)
+                                            .abs()
+                                            .partial_cmp(&(tb - t).abs())
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    })
+                                    .map(|(_, &ip)| ip)
+                                    .unwrap_or(f64::NAN);
+                                // LOCF for prev_derived: use the value from the last observation
+                                // at or before t. Falls back to the first obs if t precedes all.
+                                let grid_prev_t: HashMap<String, f64> = prev_derived_vecs
+                                    .iter()
+                                    .map(|(name, vals)| {
+                                        let val = subject
+                                            .obs_times
+                                            .iter()
+                                            .zip(vals.iter())
+                                            .filter(|(&obs_t, _)| obs_t <= t + 1e-12)
+                                            .last()
+                                            .map(|(_, &v)| v)
+                                            .or_else(|| vals.first().copied())
+                                            .unwrap_or(f64::NAN);
+                                        (name.clone(), val)
+                                    })
+                                    .collect();
+                                let ctx = DerivedContext {
+                                    theta,
+                                    eta: eta_hat,
+                                    indiv_params: &indiv_0,
+                                    covariates: grid_cov_0,
+                                    ipred: nearest_ipred,
+                                    pred: nearest_ipred,
+                                    dv: f64::NAN, // not available on grid
+                                    time: t,
+                                    tafd: tafd_k,
+                                    tad: tad_k,
+                                    prev_derived: &grid_prev_t,
+                                };
+                                if condition.as_ref().map_or(false, |f| !f(&ctx)) {
+                                    return None;
+                                }
+                                Some((t, integrand(&ctx)))
+                            })
+                            .collect();
+                        trapezoid(&pts)
+                    };
+
+                    let use_obs = *data_based || matches!(step, IntegralStep::ObsTimes);
+
+                    match window {
+                        IntegralWindow::Explicit { from, to } => {
+                            let val = if use_obs {
+                                eval_integral_obs(*from, *to)
+                            } else {
+                                eval_integral_grid(*from, *to)
+                            };
+                            vec![val; n_obs]
+                        }
+                        IntegralWindow::Periodic { period, anchor } => {
+                            // Compute one integral per observation (window aligned to obs time).
+                            (0..n_obs)
+                                .map(|j| {
+                                    let t = subject.obs_times[j];
+                                    let n_periods = ((t - anchor) / period).floor();
+                                    let from = anchor + n_periods * period;
+                                    let to = from + period;
+                                    if use_obs {
+                                        eval_integral_obs(from, to)
+                                    } else {
+                                        eval_integral_grid(from, to)
+                                    }
+                                })
+                                .collect()
+                        }
+                    }
+                }
+            };
+
+            // Store full per-row vector so subsequent derived columns can
+            // look up the correct value at each observation row index j.
+            prev_derived_vecs.insert(spec.name.clone(), col_vals.clone());
+            sr.extra_columns.push((spec.name.clone(), col_vals));
+        }
+    }
+}
+
 fn fit_inner(
     model: &CompiledModel,
     population: &Population,
@@ -1173,6 +1869,9 @@ fn fit_inner(
     let mut result: Option<crate::estimation::outer_optimizer::OuterResult> = None;
     let mut accumulated_warnings: Vec<String> = model.parse_warnings.clone();
     accumulated_warnings.extend(unsupported_warnings);
+    // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING) accumulated
+    // by read_nonmem_csv into population.warnings.
+    accumulated_warnings.extend(population.warnings.iter().cloned());
 
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
@@ -1404,7 +2103,7 @@ fn fit_inner(
     }
 
     // Compute per-subject diagnostics
-    let subjects = compute_subject_results(
+    let mut subjects = compute_subject_results(
         model,
         population,
         &result.params,
@@ -1413,6 +2112,12 @@ fn fit_inner(
         &result.kappas,
         options.interaction,
     );
+
+    // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
+    // (with individual lagtime) for the mandatory TAD column in output.rs.
+    if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_lagtime() {
+        compute_extra_output_columns(model, population, &result.params.theta, &mut subjects);
+    }
 
     let n_obs = population.n_obs();
     let n_params = n_params_pre;
@@ -1729,8 +2434,14 @@ fn fit_inner(
             .to_string()
         }),
         covariate_names: population.covariate_names.clone(),
+        input_columns: population.input_columns.clone(),
         #[cfg(feature = "nn")]
         neural_networks: build_neural_network_infos(model),
+        // Populated by the file-based entry points (`fit_from_files`,
+        // `run_model_with_data`) when the model declares a `[covariates]`
+        // block; the in-memory `fit()` path has no raw rows to echo.
+        covariate_table: None,
+        exclusions: population.exclusions.clone(),
     };
 
     if time_gradients {
@@ -2019,6 +2730,8 @@ fn compute_subject_results(
                 ofv_contribution: 2.0 * ofv_i,
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
+                extra_columns: vec![],
+                per_obs_tad: vec![],
             }
         })
         .collect()
@@ -2203,6 +2916,8 @@ mod tests {
             ofv_contribution: 0.0,
             cens: vec![0; n],
             n_obs: n,
+            extra_columns: vec![],
+            per_obs_tad: vec![],
         }
     }
 
@@ -2558,6 +3273,10 @@ fn extract_standard_errors(
 }
 
 /// Simulate observations from a model with given parameters (random seed).
+///
+/// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
+/// callers that obtained `population` via [`read_nonmem_csv`] should inspect
+/// `population.warnings` before calling this function.
 pub fn simulate(
     model: &CompiledModel,
     population: &Population,
@@ -2621,22 +3340,36 @@ fn simulate_inner_with_draw<R: rand::Rng>(
             // Predict concentrations
             let ipreds = model_preds(model, subject, &pk_params, &params.theta, &eta_slice);
 
-            // Add residual error
+            // Add residual error (Gaussian path)
             for (j, &ipred) in ipreds.iter().enumerate() {
                 let var =
                     model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
                 let eps: f64 = rng.sample(normal);
-                let dv_sim = ipred + var.sqrt() * eps;
+                let value = ipred + var.sqrt() * eps;
 
                 results.push(SimulationResult {
                     draw,
                     sim: sim_idx + 1,
                     id: subject.id.clone(),
                     time: subject.obs_times[j],
+                    cmt: subject.obs_cmts[j],
                     ipred,
-                    dv_sim,
+                    outcome: SimOutcome::Continuous { value },
                 });
             }
+
+            // TTE simulation path (requires survival feature)
+            #[cfg(feature = "survival")]
+            crate::survival::simulate_tte(
+                model,
+                subject,
+                &params.theta,
+                &eta_slice,
+                draw,
+                sim_idx + 1,
+                rng,
+                &mut results,
+            );
         }
     }
 
@@ -2721,12 +3454,26 @@ pub struct SimulationResult {
     pub draw: usize,
     pub sim: usize,
     pub id: String,
+    /// For Gaussian rows: the scheduled observation time from the subject's grid.
+    /// For TTE rows: the sampled event time (equals `SimOutcome::Event::time`; the
+    /// outer field exists for uniform iteration without matching on `outcome`).
     pub time: f64,
+    /// CMT column value for this observation row. For Gaussian subjects this mirrors the data
+    /// file's CMT (e.g. 1 for a central-compartment PK endpoint — not necessarily 0). For TTE
+    /// rows (requires `survival` feature) it matches the `[event_model] cmt` declaration.
+    pub cmt: usize,
+    /// Individual prediction at η (Gaussian path only; NAN for non-Gaussian).
     pub ipred: f64,
-    pub dv_sim: f64,
+    /// Simulated observation outcome.  For Gaussian: `SimOutcome::Continuous { value }`.
+    /// For TTE (requires `survival` feature): `SimOutcome::Event { time, observed }`.
+    pub outcome: SimOutcome,
 }
 
 /// Predict concentrations for a population using given parameters (no random effects).
+///
+/// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
+/// callers that obtained `population` via [`read_nonmem_csv`] should inspect
+/// `population.warnings` before calling this function.
 pub fn predict(
     model: &CompiledModel,
     population: &Population,
@@ -2796,7 +3543,7 @@ mod iov_integration {
         };
         CompiledModel {
             name: "iov_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             // pk_param_fn: eta[0]=BSV for CL, eta[1]=KAPPA_CL (appended by IOV path)
@@ -2841,6 +3588,10 @@ mod iov_integration {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         }
     }
 
@@ -2878,12 +3629,17 @@ mod iov_integration {
                 cens: vec![0; 6],
                 occasions: occasions.clone(),
                 dose_occasions: dose_occ.clone(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             })
             .collect();
         Population {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
         }
     }
 
@@ -3644,7 +4400,7 @@ mod simulate_with_uncertainty_tests {
         };
         CompiledModel {
             name: "uncertainty_smoke".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -3687,6 +4443,10 @@ mod simulate_with_uncertainty_tests {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         }
     }
 
@@ -3708,12 +4468,17 @@ mod simulate_with_uncertainty_tests {
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             })
             .collect();
         Population {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
         }
     }
 
@@ -3819,8 +4584,11 @@ mod simulate_with_uncertainty_tests {
             outer_gtol: 0.0,
             inits_from_nca: None,
             covariate_names: Vec::new(),
+            input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
+            covariate_table: None,
+            exclusions: None,
         }
     }
 
@@ -4033,12 +4801,17 @@ mod sde_integration {
                 cens: vec![0; 3],
                 occasions: vec![1u32; 3],
                 dose_occasions: vec![1u32],
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             })
             .collect();
         Population {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
         }
     }
 
@@ -4157,11 +4930,16 @@ mod sde_integration {
                 cens: vec![0],
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             };
             Population {
                 subjects: vec![subj],
                 covariate_names: Vec::new(),
                 dv_column: "DV".into(),
+                input_columns: vec![],
+                exclusions: None,
+                warnings: vec![],
             }
         };
 
@@ -4348,7 +5126,7 @@ mod tests_sdtab_tv_cov {
         };
         let model = CompiledModel {
             name: "tv_cov_sdtab_regression".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             // CL = TVCL · exp(η_CL) · (WT/70) — reads WT from the covariate map
@@ -4397,6 +5175,10 @@ mod tests_sdtab_tv_cov {
             scaling: ScalingSpec::None,
             log_transform: false,
             dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -4430,6 +5212,8 @@ mod tests_sdtab_tv_cov {
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         // Sanity: this subject must be classified TV — that's the regime the
         // bug lived in.
@@ -4442,6 +5226,9 @@ mod tests_sdtab_tv_cov {
             subjects: vec![subject.clone()],
             covariate_names: vec!["WT".into()],
             dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
         };
 
         // Fixed EBE at η = 0; H matrix is irrelevant for the IPRED check but

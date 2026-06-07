@@ -381,6 +381,9 @@ mod tests {
             subjects: vec![],
             covariate_names: vec![],
             dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
         };
         let r = rrmse(&model, &empty_pop, &model.default_params);
         assert!(

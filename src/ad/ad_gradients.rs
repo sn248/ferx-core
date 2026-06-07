@@ -68,8 +68,8 @@ pub fn individual_nll_ad(
     let n_tv = tv.len();
     let n_doses = dose_times.len();
     let n_obs = obs_times.len();
-    // LTBS is packed as a +100 offset on the model id (pk_model_id ≤ 8 ⇒ base
-    // ≤ 82, so the offset is unambiguous). Under LTBS the effective prediction
+    // LTBS is packed as a +100 offset on the model id (pk_model_id ≤ 5 ⇒ base
+    // ≤ 52, so the offset is unambiguous). Under LTBS the effective prediction
     // is log(conc) and the error model is additive on the log scale.
     let ltbs = (pk_and_err_model as i32) >= 100;
     let base = (pk_and_err_model as i32) % 100;
@@ -315,11 +315,23 @@ fn single_dose_ad(
         return 0.0;
     }
 
+    // Per issue #176, IV variants no longer split by administration type at
+    // the model level. Each IV branch below handles bolus and infusion via
+    // the per-dose `dur` (and `rate`) — the `dur <= 0.0` fall-through is
+    // exactly the bolus closed form. ID mapping (see `pk_model_to_id`):
+    //   0 OneCptIv, 1 OneCptOral, 2 TwoCptIv, 3 TwoCptOral,
+    //   4 ThreeCptIv, 5 ThreeCptOral.
     match pk_model_id {
         0 => {
-            // OneCptIvBolus
+            // OneCptIv — bolus when dur<=0, infusion otherwise.
             let k = cl / v;
-            (amt / v) * (-k * tau).exp()
+            if dur <= 0.0 {
+                (amt / v) * (-k * tau).exp()
+            } else if tau <= dur {
+                (rate / cl) * (1.0 - (-k * tau).exp())
+            } else {
+                (rate / cl) * (1.0 - (-k * dur).exp()) * (-k * (tau - dur)).exp()
+            }
         }
         1 => {
             // OneCptOral
@@ -332,28 +344,37 @@ fn single_dose_ad(
             }
         }
         2 => {
-            // OneCptInfusion
-            let k = cl / v;
+            // TwoCptIv — bolus when dur<=0, infusion otherwise.
+            //
+            // No `diff.abs() < 1e-12 ⇒ 0.0` guard on either branch:
+            // branching on `.abs()` of a continuous argument poisons the
+            // Enzyme reverse-mode adjoint, and the old `TwoCptInfusion`
+            // arm explicitly removed it for that reason. For physical
+            // positive (cl, v, q, v2) the 2-cpt discriminant is
+            // strictly positive, so `diff = α - β = √disc > 0` and the
+            // divisions never blow up in finite precision. The old
+            // `TwoCptIvBolus` arm carried the guard but it was dead in
+            // practice — keeping the bolus and infusion branches
+            // symmetric here matches that prior author's decision.
+            let (alpha, beta, k21) = macro_rates(cl, v, q, v2);
+            let diff = alpha - beta;
             if dur <= 0.0 {
-                (amt / v) * (-k * tau).exp()
-            } else if tau <= dur {
-                (rate / cl) * (1.0 - (-k * tau).exp())
+                let a = (amt / v) * (alpha - k21) / diff;
+                let b = (amt / v) * (k21 - beta) / diff;
+                a * (-alpha * tau).exp() + b * (-beta * tau).exp()
             } else {
-                (rate / cl) * (1.0 - (-k * dur).exp()) * (-k * (tau - dur)).exp()
+                let a_c = (rate / v) * (alpha - k21) / (diff * alpha);
+                let b_c = (rate / v) * (k21 - beta) / (diff * beta);
+                if tau <= dur {
+                    a_c * (1.0 - (-alpha * tau).exp()) + b_c * (1.0 - (-beta * tau).exp())
+                } else {
+                    let dt = tau - dur;
+                    a_c * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp()
+                        + b_c * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp()
+                }
             }
         }
         3 => {
-            // TwoCptIvBolus
-            let (alpha, beta, k21) = macro_rates(cl, v, q, v2);
-            let diff = alpha - beta;
-            if diff.abs() < 1e-12 {
-                return 0.0;
-            }
-            let a = (amt / v) * (alpha - k21) / diff;
-            let b = (amt / v) * (k21 - beta) / diff;
-            a * (-alpha * tau).exp() + b * (-beta * tau).exp()
-        }
-        4 => {
             // TwoCptOral
             let (alpha, beta, k21) = macro_rates(cl, v, q, v2);
             let diff = alpha - beta;
@@ -378,47 +399,58 @@ fn single_dose_ad(
             };
             p + q_val + r
         }
-        5 => {
-            // TwoCptInfusion
-            let (alpha, beta, k21) = macro_rates(cl, v, q, v2);
-            // For any positive (cl, v, q, v2) we have alpha > 0 and
-            // alpha - beta = disc > 0, and beta = d/alpha >= 0. The previous
-            // `.abs() < 1e-12` guards produced NaN gradients under Enzyme
-            // reverse-mode (branching on .abs() poisons the adjoint), and were
-            // dead for physical params — remove them.
-            let diff = alpha - beta;
-            if dur <= 0.0 {
-                let a = (amt / v) * (alpha - k21) / diff;
-                let b = (amt / v) * (k21 - beta) / diff;
-                a * (-alpha * tau).exp() + b * (-beta * tau).exp()
-            } else {
-                let a_c = (rate / v) * (alpha - k21) / (diff * alpha);
-                let b_c = (rate / v) * (k21 - beta) / (diff * beta);
-                if tau <= dur {
-                    a_c * (1.0 - (-alpha * tau).exp()) + b_c * (1.0 - (-beta * tau).exp())
-                } else {
-                    let dt = tau - dur;
-                    a_c * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp()
-                        + b_c * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp()
-                }
-            }
-        }
-        6 => {
-            // ThreeCptIvBolus
+        4 => {
+            // ThreeCptIv — bolus when dur<=0, infusion otherwise.
+            //
+            // The guards differ between the two branches: the bolus
+            // formula only divides by `ab·ag`, `ab·bg`, `ag·bg`, so it
+            // only needs `ab/ag/bg ≈ 0` checks. The infusion formula
+            // additionally divides by `α`, `β`, `γ` in the rate-input
+            // coefficients, so it needs the three extra eigenvalue
+            // checks. Folding all six into a shared guard (as a prior
+            // revision did) collapses physically-valid bolus answers
+            // to zero whenever a slowly-equilibrating 3-cpt has one of
+            // α/β/γ near zero — see issue #176 review.
             let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_ad(cl, v, q, v2, q3, v3);
             let ab = alpha - beta;
             let ag = alpha - gamma;
             let bg = beta - gamma;
-            if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
-                return 0.0;
+            if dur <= 0.0 {
+                if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
+                    return 0.0;
+                }
+                let d = amt / v;
+                let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
+                let b = d * (beta - k21) * (beta - k31) / (-ab * bg);
+                let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
+                a * (-alpha * tau).exp() + b * (-beta * tau).exp() + g * (-gamma * tau).exp()
+            } else {
+                if ab.abs() < 1e-12
+                    || ag.abs() < 1e-12
+                    || bg.abs() < 1e-12
+                    || alpha.abs() < 1e-12
+                    || beta.abs() < 1e-12
+                    || gamma.abs() < 1e-12
+                {
+                    return 0.0;
+                }
+                let rv = rate / v;
+                let a_c = rv * (alpha - k21) * (alpha - k31) / (ab * ag * alpha);
+                let b_c = rv * (beta - k21) * (beta - k31) / (-ab * bg * beta);
+                let g_c = rv * (gamma - k21) * (gamma - k31) / (ag * bg * gamma);
+                if tau <= dur {
+                    a_c * (1.0 - (-alpha * tau).exp())
+                        + b_c * (1.0 - (-beta * tau).exp())
+                        + g_c * (1.0 - (-gamma * tau).exp())
+                } else {
+                    let dt = tau - dur;
+                    a_c * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp()
+                        + b_c * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp()
+                        + g_c * (1.0 - (-gamma * dur).exp()) * (-gamma * dt).exp()
+                }
             }
-            let d = amt / v;
-            let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
-            let b = d * (beta - k21) * (beta - k31) / (-ab * bg);
-            let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
-            a * (-alpha * tau).exp() + b * (-beta * tau).exp() + g * (-gamma * tau).exp()
         }
-        7 => {
+        5 => {
             // ThreeCptOral
             let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_ad(cl, v, q, v2, q3, v3);
             let ab = alpha - beta;
@@ -448,44 +480,6 @@ fn single_dose_ad(
                 ((-gamma * tau).exp() - (-ka * tau).exp()) / (ka - gamma)
             };
             coeff * (a_c * bateman_a + b_c * bateman_b + g_c * bateman_g)
-        }
-        8 => {
-            // ThreeCptInfusion
-            let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_ad(cl, v, q, v2, q3, v3);
-            let ab = alpha - beta;
-            let ag = alpha - gamma;
-            let bg = beta - gamma;
-            if ab.abs() < 1e-12
-                || ag.abs() < 1e-12
-                || bg.abs() < 1e-12
-                || alpha.abs() < 1e-12
-                || beta.abs() < 1e-12
-                || gamma.abs() < 1e-12
-            {
-                return 0.0;
-            }
-            if dur <= 0.0 {
-                let d = amt / v;
-                let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
-                let b = d * (beta - k21) * (beta - k31) / (-ab * bg);
-                let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
-                a * (-alpha * tau).exp() + b * (-beta * tau).exp() + g * (-gamma * tau).exp()
-            } else {
-                let rv = rate / v;
-                let a_c = rv * (alpha - k21) * (alpha - k31) / (ab * ag * alpha);
-                let b_c = rv * (beta - k21) * (beta - k31) / (-ab * bg * beta);
-                let g_c = rv * (gamma - k21) * (gamma - k31) / (ag * bg * gamma);
-                if tau <= dur {
-                    a_c * (1.0 - (-alpha * tau).exp())
-                        + b_c * (1.0 - (-beta * tau).exp())
-                        + g_c * (1.0 - (-gamma * tau).exp())
-                } else {
-                    let dt = tau - dur;
-                    a_c * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp()
-                        + b_c * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp()
-                        + g_c * (1.0 - (-gamma * dur).exp()) * (-gamma * dt).exp()
-                }
-            }
         }
         _ => 0.0,
     }
@@ -599,18 +593,29 @@ fn residual_variance_ad(error_model_id: i32, f_pred: f64, sigma: &[f64]) -> f64 
 }
 
 // ─── Enum → ID converters ───────────────────────────────────────────────────
+//
+// `pk_model_id` is passed across the autodiff FFI boundary as `f64` (Enzyme
+// cannot carry the Rust enum directly), and the dispatch chains in
+// `event_driven_ad.rs` / `event_driven_ad_jac.rs` compare against literal
+// numbers. Defining the IDs as named constants here means a future
+// renumbering — or a variant rename like #176 — propagates to every dispatch
+// site through the type system rather than silently misrouting.
+
+pub const PK_ID_ONE_CPT_IV: i32 = 0;
+pub const PK_ID_ONE_CPT_ORAL: i32 = 1;
+pub const PK_ID_TWO_CPT_IV: i32 = 2;
+pub const PK_ID_TWO_CPT_ORAL: i32 = 3;
+pub const PK_ID_THREE_CPT_IV: i32 = 4;
+pub const PK_ID_THREE_CPT_ORAL: i32 = 5;
 
 pub fn pk_model_to_id(m: PkModel) -> i32 {
     match m {
-        PkModel::OneCptIvBolus => 0,
-        PkModel::OneCptOral => 1,
-        PkModel::OneCptInfusion => 2,
-        PkModel::TwoCptIvBolus => 3,
-        PkModel::TwoCptOral => 4,
-        PkModel::TwoCptInfusion => 5,
-        PkModel::ThreeCptIvBolus => 6,
-        PkModel::ThreeCptOral => 7,
-        PkModel::ThreeCptInfusion => 8,
+        PkModel::OneCptIv => PK_ID_ONE_CPT_IV,
+        PkModel::OneCptOral => PK_ID_ONE_CPT_ORAL,
+        PkModel::TwoCptIv => PK_ID_TWO_CPT_IV,
+        PkModel::TwoCptOral => PK_ID_TWO_CPT_ORAL,
+        PkModel::ThreeCptIv => PK_ID_THREE_CPT_IV,
+        PkModel::ThreeCptOral => PK_ID_THREE_CPT_ORAL,
     }
 }
 
@@ -755,6 +760,46 @@ pub fn compute_jacobian_ad(
 }
 
 #[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    /// `pk_model_to_id` and the named `PK_ID_*` constants must stay in
+    /// lockstep — every dispatch chain in `event_driven_ad.rs` and
+    /// `event_driven_ad_jac.rs` compares the AD `pk_model_id: f64`
+    /// argument against these constants. A silent renumbering (e.g.
+    /// adding a variant in the middle of the enum) would misroute
+    /// every fit under the `autodiff` feature without a compile error,
+    /// since the comparisons are on `f64` literals. This test catches
+    /// that drift.
+    #[test]
+    fn pk_model_to_id_matches_named_constants() {
+        assert_eq!(pk_model_to_id(PkModel::OneCptIv), PK_ID_ONE_CPT_IV);
+        assert_eq!(pk_model_to_id(PkModel::OneCptOral), PK_ID_ONE_CPT_ORAL);
+        assert_eq!(pk_model_to_id(PkModel::TwoCptIv), PK_ID_TWO_CPT_IV);
+        assert_eq!(pk_model_to_id(PkModel::TwoCptOral), PK_ID_TWO_CPT_ORAL);
+        assert_eq!(pk_model_to_id(PkModel::ThreeCptIv), PK_ID_THREE_CPT_IV);
+        assert_eq!(pk_model_to_id(PkModel::ThreeCptOral), PK_ID_THREE_CPT_ORAL);
+    }
+
+    /// The LTBS packing `pk_id * 10 + err_id + 100` must not collide
+    /// with the +100 LTBS-offset boundary. With six PK models (max id
+    /// 5) and three error models (max id 2), the base range is [0, 52]
+    /// and the offset-equipped range is [100, 152] — unambiguous.
+    /// Verify the bound is actually met.
+    #[test]
+    fn ltbs_packing_does_not_collide_with_offset_boundary() {
+        let max_pk = pk_model_to_id(PkModel::ThreeCptOral);
+        let max_err = error_model_to_id(ErrorModel::Combined);
+        let max_base = max_pk * 10 + max_err;
+        assert!(
+            max_base < 100,
+            "pk_model_id * 10 + error_model_id overflows the +100 LTBS offset; \
+             got {max_base} from pk={max_pk}, err={max_err}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod ltbs_ad_tests {
     use super::*;
     use crate::types::{ErrorModel, PkModel};
@@ -794,7 +839,7 @@ mod ltbs_ad_tests {
             &obs_times,
             &observations,
             &cens,
-            PkModel::OneCptIvBolus,
+            PkModel::OneCptIv,
             ErrorModel::Additive,
             &pk_idx_f64,
             &sel_flat,

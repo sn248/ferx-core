@@ -1,6 +1,24 @@
 # Output Files
 
-Each model run produces three output files.
+Each model run produces three output files (plus a fourth, `{model}-covtab.csv`,
+when the model declares a [`[covariates]`](model-file/covariates.md) block).
+
+## Quick reference: where to find what
+
+Different quantities live in different outputs — this table is the fastest way to find what you need.
+
+| What you want | Where it lives | Shape | When present |
+|---------------|---------------|-------|--------------|
+| Covariates in sdtab (via [`[output]`](model-file/output.md)) | `{model}-sdtab.csv` | one row per **observation** | declared in `[output]` |
+| Raw covariate values for all dataset records | `{model}-covtab.csv` | one row per **dataset record** (doses + obs) | model has `[covariates]` block |
+| ETA / EBE values per subject | `ebes.csv` inside `.fitrx` | one row per **subject** | always |
+| `[derived]` computed columns | `{model}-sdtab.csv` | one row per **observation** | model has `[derived]` block |
+| `[output]` declared columns (covariates, individual PK parameters) | `{model}-sdtab.csv` | one row per **observation** | declared in `[output]` |
+
+**Key distinctions:**
+
+- `[output]` covariates in the sdtab use LOCF — each observation row carries the covariate value that was active at that time. The covtab carries the covariate exactly as read from each row of the input dataset, including dose and event rows where sdtab has no entry.
+- ETA / EBE values are **not** written to sdtab. They live in `fit$ebe_etas` (and `ebes.csv` in the `.fitrx` bundle) — one row per subject. ETAs are available as context variables in `[derived]` expressions (e.g. `KE = CL / V` can reference `ETA_CL`), but are not columns in the sdtab itself.
 
 ## sdtab CSV (`{model}-sdtab.csv`)
 
@@ -13,13 +31,19 @@ A CSV file with per-observation diagnostics, one row per observation per subject
 | `ID` | Subject identifier |
 | `TIME` | Observation time |
 | `DV` | Observed value |
+| `CENS` | Censoring flag (0/1); omitted when no censored observations |
+| `OCC` | Occasion label; omitted when model has no IOV block |
+| `CMT` | Observation compartment; omitted for single-compartment models |
 | `PRED` | Population prediction (eta = 0) |
 | `IPRED` | Individual prediction (eta = EBE) |
 | `CWRES` | Conditional weighted residual |
 | `IWRES` | Individual weighted residual |
-| `ETA1`, `ETA2`, ... | Empirical Bayes estimates of random effects |
 | `EBE_OFV` | Each subject's contribution to the total OFV |
 | `N_OBS` | Number of observations for the subject |
+| `TAFD` | Time after first dose |
+| `TAD` | Time after most recent dose (SS-aware) |
+| *`[derived]` names* | One column per expression in the `[derived]` block |
+| *`[output]` names* | Covariates and individual parameters declared in `[output]` |
 
 ### Residual Definitions
 
@@ -34,9 +58,35 @@ where \\( f_0 = f(\hat{\eta}) - H\hat{\eta} \\) is the linearized population pre
 ### Example
 
 ```csv
-ID,TIME,DV,PRED,IPRED,CWRES,IWRES,ETA1,ETA2,ETA3
-1,0.5,9.49,10.12,9.55,-0.23,-0.06,0.15,-0.08,0.32
-1,1.0,14.42,14.87,14.35,0.18,0.05,0.15,-0.08,0.32
+ID,TIME,DV,PRED,IPRED,CWRES,IWRES,EBE_OFV,N_OBS,TAFD,TAD
+1,0.5,9.49,10.12,9.55,-0.23,-0.06,2.14,8,0.5,0.5
+1,1.0,14.42,14.87,14.35,0.18,0.05,2.14,8,1.0,1.0
+```
+
+## covtab CSV (`{model}-covtab.csv`)
+
+Written only when the model declares a [`[covariates]`](model-file/covariates.md)
+block. Unlike sdtab (observation rows only), it echoes the declared covariate
+columns with **one row per input dataset record**, including dose and other-event
+rows. Missing values are written as empty cells. It is also available
+programmatically as `FitResult::covariate_table`.
+
+### Columns
+
+| Column | Description |
+|--------|-------------|
+| `ID` | Subject identifier |
+| `TIME` | Record time |
+| `EVID` | Event ID of the source row (0=obs, 1=dose, 2=other, 3=reset, 4=reset+dose) |
+| *declared covariates* | One column per covariate in the `[covariates]` block, in declaration order |
+
+### Example
+
+```csv
+ID,TIME,EVID,WT,CRCL
+1,0.000000,1,70.600000,73.700000
+1,0.500000,0,70.600000,73.700000
+1,1.000000,0,70.600000,73.700000
 ```
 
 ## Fit YAML (`{model}-fit.yaml`)

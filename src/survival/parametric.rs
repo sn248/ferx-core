@@ -59,6 +59,9 @@ pub fn cum_hazard(family: HazardFamily, t: f64, params: &[f64]) -> f64 {
 /// small u (very early events) or extreme parameters the result is clamped
 /// at f64::MAX to avoid infinity.
 pub fn sample_event_time(family: HazardFamily, params: &[f64], u: f64) -> f64 {
+    // Clamp away from 0 and 1: Standard distribution can yield exactly 0, making
+    // -ln(0) = +∞.  Callers should prefer Open01; this is a defence-in-depth guard.
+    let u = u.clamp(f64::EPSILON, 1.0 - f64::EPSILON);
     let neg_log_u = -u.ln(); // -log U, always positive for u ∈ (0,1)
     let t = match family {
         HazardFamily::Exponential => {
@@ -102,6 +105,7 @@ pub fn sample_conditional_event_time(
     entry_time: f64,
     u: f64,
 ) -> f64 {
+    let u = u.clamp(f64::EPSILON, 1.0 - f64::EPSILON);
     let neg_log_u = -u.ln();
     let t = match family {
         HazardFamily::Exponential => {

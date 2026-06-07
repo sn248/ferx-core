@@ -3458,7 +3458,9 @@ pub struct SimulationResult {
     /// For TTE rows: the sampled event time (equals `SimOutcome::Event::time`; the
     /// outer field exists for uniform iteration without matching on `outcome`).
     pub time: f64,
-    /// CMT that produced this observation (0 for Gaussian observations on all-Gaussian models).
+    /// CMT column value for this observation row. For Gaussian subjects this mirrors the data
+    /// file's CMT (e.g. 1 for a central-compartment PK endpoint — not necessarily 0). For TTE
+    /// rows (requires `survival` feature) it matches the `[event_model] cmt` declaration.
     pub cmt: usize,
     /// Individual prediction at η (Gaussian path only; NAN for non-Gaussian).
     pub ipred: f64,

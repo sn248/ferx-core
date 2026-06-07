@@ -75,14 +75,21 @@ pub fn tte_data_term(
             EventType::IntervalCensored { left, right } => {
                 let h_l = cum_hazard(*family, *left, &params);
                 let h_r = cum_hazard(*family, *right, &params);
-                // Conditional survival in interval: S(left|entry) - S(right|entry)
-                let s_left = (-(h_l - h_entry)).exp();
-                let s_right = (-(h_r - h_entry)).exp();
-                let prob = s_left - s_right;
-                if prob <= 0.0 {
+                let a = h_l - h_entry; // H(left) − H(entry) ≥ 0
+                let delta = h_r - h_l; // H(right) − H(left) > 0 for a proper interval
+                if delta <= 0.0 {
+                    // Degenerate: right ≤ left, or hazard non-monotone (bad params).
                     return 1e20;
                 }
-                nll -= prob.ln();
+                // log P(left < T ≤ right | T > entry) = −a + log(1 − exp(−delta))
+                // Use expm1 for numerical precision when delta is small (tight interval).
+                // Computing exp(-a) − exp(-b) in probability space would lose significant
+                // digits for small Δ or large hazards — the log-domain form avoids that.
+                let log_prob = -a + (-delta).exp_m1().abs().ln();
+                if !log_prob.is_finite() {
+                    return 1e20;
+                }
+                nll -= log_prob;
             }
         }
     }
@@ -201,7 +208,9 @@ pub fn simulate_tte<R: rand::Rng>(
         let HazardSpec::Analytic { family, param_fn } = hazard;
         let params = param_fn(theta, eta, &subject.covariates);
 
-        let u: f64 = rng.gen();
+        // Open01 samples from (0, 1) exclusive, avoiding the u=0 edge case that
+        // would send -ln(u) to +∞ and clamp the event time to f64::MAX.
+        let u: f64 = rng.sample(rand::distributions::Open01);
         let t_event = if *entry_time > 0.0 {
             sample_conditional_event_time(*family, &params, *entry_time, u)
         } else {
@@ -329,5 +338,63 @@ mod tests {
         };
         let nll = tte_data_term(&records, &hazard, &[0.1], &[0.0], &HashMap::new());
         assert_abs_diff_eq!(nll, 0.5, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn tte_data_term_interval_censored_exponential() {
+        use crate::types::HazardFamily;
+        // Exponential, lambda=0.2, interval (3, 5), entry=0.
+        // H(3)=0.6, H(5)=1.0, delta=0.4
+        // log_prob = −0.6 + log(1 − exp(−0.4)) = −0.6 + log(0.32968...) = −1.70881...
+        // nll = 1.70881...
+        let records = vec![ObsRecord::Event {
+            time: 5.0, // right bound (time field = right for interval-censored)
+            event_type: EventType::IntervalCensored {
+                left: 3.0,
+                right: 5.0,
+            },
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let param_fn: crate::types::HazardParamFn =
+            Box::new(|theta: &[f64], _: &[f64], _: &HashMap<String, f64>| vec![theta[0]]);
+        let hazard = HazardSpec::Analytic {
+            family: HazardFamily::Exponential,
+            param_fn,
+        };
+        let nll = tte_data_term(&records, &hazard, &[0.2], &[0.0], &HashMap::new());
+        let expected = -(-(0.6_f64) + ((-0.4_f64).exp_m1().abs().ln()));
+        assert_abs_diff_eq!(nll, expected, epsilon = 1e-10);
+        assert!(nll > 0.0 && nll.is_finite());
+    }
+
+    #[test]
+    fn tte_data_term_interval_censored_tight_interval() {
+        use crate::types::HazardFamily;
+        // Tight interval: left=10.0, right=10.0001, lambda=0.1.
+        // Old probability-space subtraction would lose ~4 significant digits here.
+        // The expm1 form should stay finite and positive.
+        let records = vec![ObsRecord::Event {
+            time: 10.0001,
+            event_type: EventType::IntervalCensored {
+                left: 10.0,
+                right: 10.0001,
+            },
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let param_fn: crate::types::HazardParamFn =
+            Box::new(|theta: &[f64], _: &[f64], _: &HashMap<String, f64>| vec![theta[0]]);
+        let hazard = HazardSpec::Analytic {
+            family: HazardFamily::Exponential,
+            param_fn,
+        };
+        let nll = tte_data_term(&records, &hazard, &[0.1], &[0.0], &HashMap::new());
+        // NLL must be finite and positive; exact value verified via log-domain formula.
+        assert!(nll.is_finite() && nll > 0.0, "nll = {nll}");
+        let delta = 0.1 * 0.0001; // H(right) - H(left)
+        let a = 0.1 * 10.0; // H(left) - H(entry)
+        let expected = a - ((-delta).exp_m1().abs().ln());
+        assert_abs_diff_eq!(nll, expected, epsilon = 1e-8);
     }
 }

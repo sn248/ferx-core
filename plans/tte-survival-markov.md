@@ -1,7 +1,7 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Status:** Planning / Pre-implementation  
-**Scope:** Evaluate only — no code changes in this document  
+**Status:** Phase 1 in progress — infrastructure scaffold merged (PR #190, v0.1.6)  
+**Scope:** Active implementation — code changes underway  
 **Revised:** 2026-06-07 (deep research edition — NONMEM/nlmixr2/Monolix docs, tutorial papers, methods improvements, adjacent fields)
 
 ---
@@ -878,18 +878,23 @@ survival data.
 
 ## 5. Gap Analysis — What ferx-core Currently Lacks
 
-### 5.1 Observation type system
+### 5.1 Observation type system ✅ *Partially resolved — PR #190*
 
-`Subject` supports only Gaussian observations. No event indicator, state index, or count.
+`ObsRecord::Event`, `EventType`, and `Subject.obs_records` have been added (behind
+`#[cfg(feature = "survival")]`). Binary/ordinal/count variants deferred to Phase 4.
+`CompiledModel.endpoints: HashMap<usize, EndpointLikelihood>` added (always empty until
+`[event_model]` parser lands in the next Phase 1 PR).
 
 ### 5.2 Individual NLL dispatch
 
 `individual_nll` hardcodes `Σ(y-f)²/V + log V`. Needs endpoint-type dispatch.
+*(Not yet resolved — requires `[event_model]` parser + `likelihood.rs` changes.)*
 
-### 5.3 Outer Laplace data Hessian for non-Gaussian
+### 5.3 Outer Laplace data Hessian for non-Gaussian ✅ *Math done — PR #190*
 
-`foce_subject_nll_interaction` uses the analytic Almquist formula — Gaussian only. Need
-FD Hessian fallback including the `½ log|det(D_i^data)|` term (§2.2).
+`data_term_hessian_fd` (4-point central stencil) and `shi_step_sizes` (Shi 2021 §3.4)
+implemented in `src/survival/mod.rs`. Wiring into `foce_subject_nll_interaction` is
+the next Phase 1 PR — that function still uses the Gaussian Almquist path only.
 
 ### 5.4 Model DSL blocks
 
@@ -912,6 +917,7 @@ DV must optionally be interpreted as event indicator, state index, or count. CMT
 
 The SAEM M-step analytic sigma update is Gaussian-specific. Must skip or generalize
 for endpoints without a sigma parameter.
+*(Not yet resolved — requires `[event_model]` parser so TTE subjects are identifiable.)*
 
 ### 5.9 f-SAEM proposal (improvement opportunity)
 
@@ -1429,28 +1435,55 @@ Two structural assumptions break for non-Gaussian endpoints:
   models generate their own timeline up to a horizon, then observe on a schedule. `time`
   flips from an input echo to a simulated output.
 
-#### 8.8.1 Extended result types
+#### 8.8.1 Extended result types ✅ *SimulationResult merged — PR #190*
+
+**As merged in PR #190** (`src/api.rs`, `src/types.rs`):
 
 ```rust
+/// Unconditional variants (always compiled).  Feature-gated variants below.
+#[derive(Debug, Clone)]
 pub enum SimOutcome {
-    Continuous { value: f64 },                  // existing path
-    Category   { state: usize },                // binary/ordinal/DTMM/observed CTMM state
-    Count      { count: u32 },                  // Poisson/NB
-    Event      { time: f64, observed: bool },   // TTE/RTTE: time is simulated, not input
+    Continuous { value: f64 },
+    // Phase 4+: Category { state: usize }, Count { count: u32 }
+    #[cfg(feature = "survival")]
+    Event { time: f64, observed: bool },   // TTE/RTTE
+}
+
+impl SimOutcome {
+    /// Returns the continuous DV value, or NAN for Event rows.
+    pub fn continuous_value(&self) -> f64 { ... }
 }
 
 pub struct SimulationResult {
-    pub draw: usize, pub sim: usize, pub id: String,
-    pub time: f64,            // schedule time for grid models; event time for TTE
-    pub cmt:  usize,
-    pub outcome: SimOutcome,  // replaces dv_sim; ipred retained only for Continuous
+    pub draw:    usize,
+    pub sim:     usize,
+    pub id:      String,
+    /// Scheduled obs time (Gaussian) or sampled event time (TTE).
+    pub time:    f64,
+    /// CMT that produced this row; 0 for all-Gaussian models.
+    pub cmt:     usize,
+    /// Individual prediction at η (Gaussian only; NAN for TTE).
+    pub ipred:   f64,
+    /// Simulated outcome — replaces the old `dv_sim: f64` field.
+    pub outcome: SimOutcome,
 }
+```
 
+**Breaking change:** `dv_sim: f64` field removed; callers must use
+`row.outcome.continuous_value()`. Version bumped 0.1.5 → 0.1.6.
+
+**Future variants** (`Category`, `Count`) will be added to `SimOutcome` unconditionally
+(no feature flag) once Phase 4 lands. The `Event` variant will likewise be promoted
+to default-on after Phase 1 validation.
+
+The target `Prediction` enum and `SurvivalPredictionResult` remain as planned:
+
+```rust
 pub enum Prediction {
     Continuous { pred: f64 },
-    Survival   { s: f64, cum_hazard: f64, hazard: f64 },  // TTE at time t (a curve)
-    CatProbs   { probs: Vec<f64> },                       // categorical / CTMM occupancy
-    Rate       { lambda: f64 },                           // count
+    Survival   { s: f64, cum_hazard: f64, hazard: f64 },  // TTE — Phase 1
+    CatProbs   { probs: Vec<f64> },                       // categorical — Phase 4
+    Rate       { lambda: f64 },                           // count — Phase 4
 }
 ```
 
@@ -2045,37 +2078,58 @@ treated as bugs:
 
 ## 12. Implementation Phases
 
-### Phase 1 — Parametric TTE, standalone, Laplace ← START HERE
+### Phase 1 — Parametric TTE, standalone, Laplace
 
-**Scope:** Exponential and Weibull; fixed and random hazard parameters; FOCEI Laplace;
-right-censored, interval-censored, and **left-truncated (delayed entry)**; no PK.
+**Scope:** Exponential, Weibull, and Gompertz; fixed and random hazard parameters; FOCEI
+Laplace; right-censored, interval-censored, and **left-truncated (delayed entry)**; no PK.
 
-**Files:** `src/types.rs`, `src/io/datareader.rs`, `src/parser/model_parser.rs`,
-`src/stats/likelihood.rs`, new `src/survival/mod.rs`, new `src/survival/parametric.rs`.
+**Status: in progress.** PR #190 (v0.1.6) merged the infrastructure scaffold. The
+remaining work is the wiring: parser, datareader, likelihood dispatch, tests, and docs.
 
-**Deliverables:**
-- `ObsRecord::Event` in `Subject`; datareader extension
-- `EndpointLikelihood::TTE`; `HazardSpec::Analytic` for Exponential + Weibull
-- `tte_data_term` including `δ·log h − H`, interval-censored variant, and the
-  **left-truncation correction** `H(T) − H(T_entry)` (§3.6); `TENTRY` column in the datareader
-  → `ObsRecord::Event.entry_time`
-- `data_term_hessian_fd` with Shi step-size (§9.3) — shared across all non-Gaussian
-- `foce_subject_nll_interaction` dispatches to FD Hessian + `½ log|det H_total|` for TTE
-- `individual_nll` endpoint dispatch
-- **Disable the SAEM analytic σ M-step for endpoints with no residual variance** (TTE):
-  skip rather than update, else omega is biased (§5.8, D3). Applies to every TTE-only fit.
-- **Simulation** (§8.8.2): `simulate()` dispatch for TTE via analytic inverse-CDF
-  (Exponential, Weibull, Gompertz); `SimOutcome::Event`; administrative censoring at horizon;
-  conditional draw when `entry_time > 0` (solve `H(T) − H(T_entry) = −log u`)
-- **Prediction** (§8.8.1): `predict()` returns `Prediction::Survival { s, cum_hazard, hazard }`
-  on a requested time grid; plus median survival / E[T]
-- Example: `examples/tte_exponential.ferx` + `data/tte_exponential.csv`
-- NONMEM comparison table in `docs/src/estimation/tte.md`
-- Tests: Tier 2 smoke (incl. **fixed-effects `n_eta=0` Weibull PH**, §16 D7);
-  Tier 3 convergence (Holford exponential dataset);
-  **Tier 3 SSE** (simulate→fit→recover, §8.8.8); **Tier 1 left-truncation regression**
-  (analytic `H(T)−H(T_entry)` vs. a hand-computed value, and recovery on a delayed-entry
-  dataset vs. `flexsurv` / `survival::survreg` with `Surv(TENTRY, TIME, event)`)
+#### Done — PR #190 (infrastructure scaffold)
+
+- ✅ `survival = []` feature flag in `Cargo.toml`; version 0.1.5 → 0.1.6
+- ✅ **`SimulationResult` redesigned** (breaking): `dv_sim: f64` removed; `outcome: SimOutcome`
+  + `cmt: usize` added. `SimOutcome::Continuous` unconditional; `SimOutcome::Event` gated on
+  `survival`. `continuous_value()` returns NAN for Event rows with a debug_assert guard.
+- ✅ New types in `src/types.rs`: `EventType`, `ObsRecord`, `HazardFamily`, `HazardParamFn`,
+  `HazardSpec::Analytic`, `EndpointLikelihood::Tte` — all `#[cfg(feature = "survival")]`
+- ✅ `Subject.obs_records: Vec<ObsRecord>` and `CompiledModel.endpoints: HashMap<usize,
+  EndpointLikelihood>` — cfg-gated, empty in all existing builds (no overhead)
+- ✅ `src/survival/parametric.rs` — `hazard_and_cum_hazard`, `cum_hazard`, `sample_event_time`,
+  `sample_conditional_event_time` for Exponential, Weibull, Gompertz; full Tier 1 test suite
+- ✅ `src/survival/mod.rs` — `tte_data_term` (all EventType variants + left truncation);
+  `data_term_hessian_fd` (4-point central stencil); `shi_step_sizes` (Shi 2021 §3.4);
+  `simulate_tte` (draws event times; called from `api::simulate_inner_with_draw` but
+  effectively no-ops until `model.endpoints` is populated by the parser)
+- ✅ Reference files: `tests/reference/tte_exponential/`, `tte_weibull/`, `tte_gompertz/`
+  (simulate.R, nlmixr2.R, nonmem.ctl, expected.md for each)
+
+**Note on `simulate_tte`:** the function is correct and fully implemented, but it iterates
+`model.endpoints` which is always empty until the `[event_model]` parser lands. It will
+silently produce no output until then — not a stub, just wired to an empty map.
+
+#### Remaining — next Phase 1 PR
+
+- ❌ `[event_model]` block parsing in `src/parser/model_parser.rs` — populates
+  `model.endpoints[cmt]` with `EndpointLikelihood::Tte { hazard }` using a `param_fn`
+  closure. Keys: `cmt`, `family` (exponential|weibull|gompertz), `shape`, `scale`/`rate`,
+  `loghr` (optional PH covariate term).
+- ❌ Datareader TTE row routing in `src/io/datareader.rs` — detect `TENTRY` column;
+  for EVID=0 rows where `cmt ∈ tte_cmts`: parse DV as censoring code (0=right-censored,
+  1=exact, 2=interval bound) and push to `subject.obs_records` instead of the Gaussian Vecs
+- ❌ `individual_nll` dispatch for TTE data term (`src/stats/likelihood.rs`)
+- ❌ `foce_subject_nll_interaction` dispatch: FD Hessian + `½ log|det H_total|` for TTE CMTs
+  (`src/stats/likelihood.rs`)
+- ❌ SAEM analytic σ M-step skip for TTE subjects (`src/estimation/saem.rs`)
+- ❌ `predict_survival` in `src/api.rs`: returns `Prediction::Survival { s, cum_hazard,
+  hazard }` on a time grid; median survival + E[T]
+- ❌ Example files: `examples/tte_exponential.ferx`, `examples/tte_weibull.ferx`,
+  `examples/tte_gompertz.ferx` + `data/tte_exponential.csv` (run simulate.R)
+- ❌ Tier 2 smoke tests (`tests/tte_smoke.rs`): `fit()` in ≤5 outer iterations; fixed-effects
+  `n_eta=0` Weibull PH (validates empty-Ω path, §16 D7)
+- ❌ Tier 3 convergence + SSE tests (`tests/tte_convergence.rs`, gated `slow-tests`)
+- ❌ `docs/src/estimation/tte.md` + entry in `docs/src/SUMMARY.md`; NONMEM comparison table
 
 ### Phase 1b — Competing risks (cause-specific hazard)
 

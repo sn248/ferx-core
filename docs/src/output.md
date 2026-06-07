@@ -3,6 +3,22 @@
 Each model run produces three output files (plus a fourth, `{model}-covtab.csv`,
 when the model declares a [`[covariates]`](model-file/covariates.md) block).
 
+## Quick reference: where to find what
+
+Different quantities live in different outputs — this table is the fastest way to find what you need.
+
+| What you want | Where it lives | Shape | When present |
+|---------------|---------------|-------|--------------|
+| Covariates in sdtab (via [`[output]`](model-file/output.md)) | `{model}-sdtab.csv` | one row per **observation** | declared in `[output]` |
+| Raw covariate values for all dataset records | `{model}-covtab.csv` | one row per **dataset record** (doses + obs) | model has `[covariates]` block |
+| ETA / EBE values per observation row | `{model}-sdtab.csv` (`ETA_CL`, `ETA_V`, …) | one row per **observation**, value repeated | always (automatic) |
+| ETA / EBE values per subject | `ebes.csv` inside `.fitrx` | one row per **subject** | always |
+
+**Key distinctions:**
+
+- `[output]` covariates in the sdtab use LOCF — each observation row carries the covariate value that was active at that time. The covtab carries the covariate exactly as read from each row of the input dataset, including dose and event rows where sdtab has no entry.
+- ETA columns in the sdtab repeat the same EBE value for every observation row of a subject, making them easy to join with observation-level residuals. `ebes.csv` gives the compact per-subject form used for ETA-covariate plots and normality checks.
+
 ## sdtab CSV (`{model}-sdtab.csv`)
 
 A CSV file with per-observation diagnostics, one row per observation per subject.

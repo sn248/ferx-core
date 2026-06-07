@@ -222,6 +222,11 @@ pub struct Subject {
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
+    /// Non-Gaussian observation records (TTE events, discrete states, counts).
+    /// Empty for all-Gaussian subjects. Populated by the data reader when the
+    /// model declares a non-Gaussian endpoint for the row's CMT.
+    #[cfg(feature = "survival")]
+    pub obs_records: Vec<ObsRecord>,
 }
 
 impl Subject {
@@ -1126,6 +1131,131 @@ pub struct MuRef {
     pub log_transformed: bool,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Non-Gaussian endpoint types  (Phase 1: TTE / survival)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "survival")]
+/// Censoring type for a TTE event record.
+#[derive(Debug, Clone)]
+pub enum EventType {
+    Exact,
+    RightCensored,
+    /// Event occurred in the half-open interval (left, right].
+    IntervalCensored {
+        left: f64,
+        right: f64,
+    },
+}
+
+#[cfg(feature = "survival")]
+/// A single non-Gaussian observation record on a subject.
+#[derive(Debug, Clone)]
+pub enum ObsRecord {
+    Event {
+        time: f64,
+        event_type: EventType,
+        /// Left truncation / delayed entry time (0.0 when none).
+        /// The likelihood conditions on survival past entry_time:
+        ///   H_eff(T) = H(T) − H(entry_time)
+        entry_time: f64,
+        cmt: usize,
+    },
+    // DiscreteState and Count variants deferred to Phase 4/5
+}
+
+#[cfg(feature = "survival")]
+/// Analytic parametric hazard families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HazardFamily {
+    Exponential,
+    Weibull,
+    Gompertz,
+}
+
+#[cfg(feature = "survival")]
+/// Closure type for computing hazard parameters from (theta, eta, covariates).
+///
+/// Return layout by family:
+///   Exponential: `[lambda]`
+///   Weibull:     `[scale, shape]`
+///   Gompertz:    `[alpha, gamma, loghr_term]`  (loghr_term cumulates log-hazard
+///                 contributions from covariates; 0.0 when no covariates)
+pub type HazardParamFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> Vec<f64> + Send + Sync>;
+
+#[cfg(feature = "survival")]
+/// Hazard specification for a TTE endpoint.
+pub enum HazardSpec {
+    Analytic {
+        family: HazardFamily,
+        param_fn: HazardParamFn,
+    },
+    // OdeAccumulated deferred to Phase 2
+}
+
+#[cfg(feature = "survival")]
+impl std::fmt::Debug for HazardSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HazardSpec::Analytic { family, .. } => {
+                write!(f, "HazardSpec::Analytic({family:?})")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "survival")]
+/// Per-CMT endpoint likelihood specification.
+pub enum EndpointLikelihood {
+    Gaussian(EndpointError),
+    Tte { hazard: HazardSpec },
+    // Binary, Ordinal, Poisson, NegBin, Ctmm, Dtmm deferred to Phase 4/5
+}
+
+#[cfg(feature = "survival")]
+impl std::fmt::Debug for EndpointLikelihood {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EndpointLikelihood::Gaussian(e) => write!(f, "Gaussian({e:?})"),
+            EndpointLikelihood::Tte { hazard } => write!(f, "Tte({hazard:?})"),
+        }
+    }
+}
+
+/// Outcome of a single simulated observation — replaces the previous `dv_sim: f64` field.
+///
+/// `Continuous` preserves the existing Gaussian path unchanged.
+/// `Event` carries TTE-specific outputs (gated behind `survival` feature).
+#[derive(Debug, Clone)]
+pub enum SimOutcome {
+    /// Gaussian continuous prediction + residual noise (the only variant before Phase 1).
+    Continuous { value: f64 },
+    /// TTE event: simulated event time and whether it occurred before the censoring horizon.
+    #[cfg(feature = "survival")]
+    Event { time: f64, observed: bool },
+}
+
+impl SimOutcome {
+    /// Extract the continuous value for Gaussian outcomes; NAN for all others.
+    ///
+    /// Calling this on a TTE `Event` row is a logic error; a `debug_assert` fires
+    /// in debug builds to catch misuse early.
+    pub fn continuous_value(&self) -> f64 {
+        match self {
+            SimOutcome::Continuous { value } => *value,
+            #[cfg(feature = "survival")]
+            SimOutcome::Event { .. } => {
+                debug_assert!(
+                    false,
+                    "continuous_value() called on a TTE Event row — filter by CMT type first"
+                );
+                f64::NAN
+            }
+        }
+    }
+}
+
 /// A compiled model ready for estimation
 pub struct CompiledModel {
     pub name: String,
@@ -1321,6 +1451,11 @@ pub struct CompiledModel {
     pub derived_exprs: Vec<DerivedExprSpec>,
     /// Column names from [output] block. Validated at fit time.
     pub output_columns: Vec<String>,
+    /// Per-CMT non-Gaussian endpoint specifications.
+    /// Empty for models with only Gaussian observations.
+    /// Keyed by the CMT value declared in `[event_model]` / future blocks.
+    #[cfg(feature = "survival")]
+    pub endpoints: HashMap<usize, EndpointLikelihood>,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -2713,6 +2848,8 @@ pub(crate) mod test_helpers {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: HashMap::new(),
         }
     }
 }

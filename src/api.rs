@@ -188,6 +188,8 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             cens: vec![0; sim_spec.obs_times.len()],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         })
         .collect();
     let template = Population {
@@ -220,10 +222,11 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                 // Under LTBS the simulated DV is on the log scale and may be
                 // negative, so the positivity floor only applies to natural-scale
                 // simulation.
+                let v = s.outcome.continuous_value();
                 subject.observations[j] = if parsed.model.log_transform {
-                    s.dv_sim
+                    v
                 } else {
-                    s.dv_sim.max(0.001)
+                    v.max(0.001)
                 };
             }
         }
@@ -3337,22 +3340,36 @@ fn simulate_inner_with_draw<R: rand::Rng>(
             // Predict concentrations
             let ipreds = model_preds(model, subject, &pk_params, &params.theta, &eta_slice);
 
-            // Add residual error
+            // Add residual error (Gaussian path)
             for (j, &ipred) in ipreds.iter().enumerate() {
                 let var =
                     model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
                 let eps: f64 = rng.sample(normal);
-                let dv_sim = ipred + var.sqrt() * eps;
+                let value = ipred + var.sqrt() * eps;
 
                 results.push(SimulationResult {
                     draw,
                     sim: sim_idx + 1,
                     id: subject.id.clone(),
                     time: subject.obs_times[j],
+                    cmt: subject.obs_cmts[j],
                     ipred,
-                    dv_sim,
+                    outcome: SimOutcome::Continuous { value },
                 });
             }
+
+            // TTE simulation path (requires survival feature)
+            #[cfg(feature = "survival")]
+            crate::survival::simulate_tte(
+                model,
+                subject,
+                &params.theta,
+                &eta_slice,
+                draw,
+                sim_idx + 1,
+                rng,
+                &mut results,
+            );
         }
     }
 
@@ -3438,8 +3455,13 @@ pub struct SimulationResult {
     pub sim: usize,
     pub id: String,
     pub time: f64,
+    /// CMT that produced this observation (0 for Gaussian observations on all-Gaussian models).
+    pub cmt: usize,
+    /// Individual prediction at η (Gaussian path only; NAN for non-Gaussian).
     pub ipred: f64,
-    pub dv_sim: f64,
+    /// Simulated observation outcome.  For Gaussian: `SimOutcome::Continuous { value }`.
+    /// For TTE (requires `survival` feature): `SimOutcome::Event { time, observed }`.
+    pub outcome: SimOutcome,
 }
 
 /// Predict concentrations for a population using given parameters (no random effects).
@@ -3563,6 +3585,8 @@ mod iov_integration {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         }
     }
 
@@ -3600,6 +3624,8 @@ mod iov_integration {
                 cens: vec![0; 6],
                 occasions: occasions.clone(),
                 dose_occasions: dose_occ.clone(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             })
             .collect();
         Population {
@@ -4414,6 +4440,8 @@ mod simulate_with_uncertainty_tests {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         }
     }
 
@@ -4435,6 +4463,8 @@ mod simulate_with_uncertainty_tests {
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             })
             .collect();
         Population {
@@ -4766,6 +4796,8 @@ mod sde_integration {
                 cens: vec![0; 3],
                 occasions: vec![1u32; 3],
                 dose_occasions: vec![1u32],
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             })
             .collect();
         Population {
@@ -4893,6 +4925,8 @@ mod sde_integration {
                 cens: vec![0],
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             };
             Population {
                 subjects: vec![subj],
@@ -5138,6 +5172,8 @@ mod tests_sdtab_tv_cov {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -5171,6 +5207,8 @@ mod tests_sdtab_tv_cov {
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         // Sanity: this subject must be classified TV — that's the regime the
         // bug lived in.

@@ -2063,6 +2063,8 @@ mod tests {
             cens: vec![0],
             occasions: vec![],
             dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]);
         let sigma = SigmaVector {
@@ -2174,6 +2176,8 @@ mod tests {
             cens: vec![0, 0],
             occasions: vec![],
             dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         let population = Population {
             subjects: vec![subj],
@@ -2268,6 +2272,8 @@ mod tests {
             cens: vec![0, 0, 0],
             occasions: vec![],
             dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
 
         let population = Population {
@@ -2427,6 +2433,8 @@ mod tests {
             cens: vec![0; 6],
             occasions: vec![],
             dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         let population = Population {
             subjects: vec![make_subj("1", 1.0), make_subj("2", 1.1)],
@@ -2536,6 +2544,8 @@ mod tests {
             cens: vec![0; 4],
             occasions: vec![1u32, 1, 2, 2],
             dose_occasions: vec![1u32],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
 
         let omega_bsv = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);

@@ -1238,11 +1238,20 @@ pub enum SimOutcome {
 
 impl SimOutcome {
     /// Extract the continuous value for Gaussian outcomes; NAN for all others.
+    ///
+    /// Calling this on a TTE `Event` row is a logic error; a `debug_assert` fires
+    /// in debug builds to catch misuse early.
     pub fn continuous_value(&self) -> f64 {
         match self {
             SimOutcome::Continuous { value } => *value,
             #[cfg(feature = "survival")]
-            SimOutcome::Event { .. } => f64::NAN,
+            SimOutcome::Event { .. } => {
+                debug_assert!(
+                    false,
+                    "continuous_value() called on a TTE Event row — filter by CMT type first"
+                );
+                f64::NAN
+            }
         }
     }
 }

@@ -160,7 +160,8 @@ pub fn shi_step_sizes(eval: impl Fn(&[f64]) -> f64, eta_hat: &[f64]) -> Vec<f64>
         grad_norms.push(g_j.abs().max(1e-10));
     }
 
-    // Harmonic mean of gradient norms
+    // Harmonic mean of gradient norms; then apply Shi (2021) eq. (3.4):
+    //   h_opt ≈ (harmonic_norm)^(1/3) · ε_mach^(1/3)
     let n_f = n as f64;
     let inv_sum: f64 = grad_norms.iter().map(|g| 1.0 / g).sum();
     let harmonic = if inv_sum > 0.0 { n_f / inv_sum } else { 1e-4 };
@@ -216,7 +217,11 @@ pub fn simulate_tte<R: rand::Rng>(
             ipred: f64::NAN,
             outcome: SimOutcome::Event {
                 time: t_event,
-                observed: true, // unconditional draw — no administrative censoring yet
+                // TODO(phase-2): apply horizon censoring from [simulation] block;
+                // set observed=false and time=horizon when t_event >= horizon.
+                // Until then, every draw is an uncensored event — simulated data
+                // will not match the censoring pattern of the reference scripts.
+                observed: true,
             },
         });
     }

@@ -3454,6 +3454,9 @@ pub struct SimulationResult {
     pub draw: usize,
     pub sim: usize,
     pub id: String,
+    /// For Gaussian rows: the scheduled observation time from the subject's grid.
+    /// For TTE rows: the sampled event time (equals `SimOutcome::Event::time`; the
+    /// outer field exists for uniform iteration without matching on `outcome`).
     pub time: f64,
     /// CMT that produced this observation (0 for Gaussian observations on all-Gaussian models).
     pub cmt: usize,

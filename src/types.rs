@@ -184,11 +184,10 @@ pub struct Subject {
     /// TIME restarts (see `io/datareader`), `obs_times` carries the internal
     /// monotonic timeline while this keeps the raw value for the user-clock
     /// diagnostics: sdtab/covtab TIME and `predict()`/`simulate()` TIME.
-    /// (`[derived]` absolute windows still evaluate on the internal `obs_times`
-    /// — see the known limitation in `docs/src/data-format.md`.) Populated for
-    /// every observation read from a CSV (equal to `obs_times` when no shift
-    /// occurred); empty only for in-memory subjects, where consumers fall back
-    /// to `obs_times`.
+    /// `[derived]` integral windows use raw times so per-occasion AUC is
+    /// correct. Populated for every observation read from a CSV (equal to
+    /// `obs_times` when no shift occurred); empty only for in-memory subjects,
+    /// where consumers fall back to `obs_times`.
     pub obs_raw_times: Vec<f64>,
     pub observations: Vec<f64>,
     pub obs_cmts: Vec<usize>,

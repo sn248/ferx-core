@@ -130,12 +130,17 @@ Diagnostics are reported on the **raw** data clock: the `TIME` column of
 `TAFD` / `TAD` reset per occasion (time after that occasion's first / most
 recent dose). The monotonic shift is purely internal to the prediction engine.
 
-> **Known limitation.** A `[derived]` integral column with an *absolute* window
-> (`[from, to]` or a periodic `anchor`) is evaluated on the internal linearised
-> timeline, so its boundaries do not align with the raw per-occasion `TIME` for
-> subjects with stacked reset occasions. Integrals over the subject's own
-> observation span are unaffected; absolute windows combined with stacked resets
-> are not yet supported per-occasion.
+> **`[derived]` integrals and stacked resets.** Integral columns with an absolute
+> window (`[from, to]` or a periodic `anchor`) are evaluated per occasion in raw
+> `TIME` coordinates. Each occasion is integrated independently, so crossover
+> designs produce correct per-occasion AUC values. Occasions with no observations
+> inside the window return `NaN` for that row.
+>
+> **Grid-based integrals** (`step = <dt>` or `step = auto`) evaluate on the
+> internal shifted clock rather than raw `TIME`, so expressions referencing
+> `TIME` inside a grid integral will see the shifted value. Use observation-based
+> integrals (`step = obs` or `data_based = true`) when raw `TIME` must appear
+> inside the integrand expression.
 
 Notes:
 

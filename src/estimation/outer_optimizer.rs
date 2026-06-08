@@ -2536,6 +2536,8 @@ mod tests {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         }
     }
 
@@ -2730,6 +2732,8 @@ mod tests {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         };
         check_gradient(&model, &make_population(3), 2);
     }

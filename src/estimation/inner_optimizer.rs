@@ -1582,6 +1582,8 @@ mod iov_tests {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         }
     }
 
@@ -1697,6 +1699,8 @@ mod iov_tests {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         };
         let subject = Subject {
             id: "1".into(),

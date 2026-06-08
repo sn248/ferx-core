@@ -1114,8 +1114,26 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     }
     // set here after diffusion thetas are appended above
     n_theta = theta_names.len();
+    // A `[event_model]` (TTE) endpoint makes a fixed-effects model legitimate:
+    // the hazard parameters can be pure theta/covariate, so n_eta = 0 (an empty
+    // BSV Omega) is valid — even though `build_omega_matrix` rejects an empty
+    // Omega for ordinary PK models. Detect the block from the raw parse so the
+    // same `.ferx` parses identically with or without the `survival` feature
+    // compiled in (the actual TTE endpoints are only built under `survival`).
+    let has_event_model = blocks.get("event_model").is_some()
+        || extracted
+            .named
+            .get("event_model")
+            .is_some_and(|m| !m.is_empty());
     // BSV omega is built from the BSV-only eta names (no kappas)
-    let omega = build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?;
+    let omega = if eta_names_bsv.is_empty() && has_event_model {
+        // 0×0 Omega — `from_matrix` handles the empty matrix (cholesky of a
+        // 0-dim matrix is trivial, log|Ω| = 0); `build_omega_fixed` below
+        // already returns an empty `Vec` for an empty eta list.
+        OmegaMatrix::from_diagonal(&[], Vec::new())
+    } else {
+        build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?
+    };
     let omega_fixed = build_omega_fixed(&omegas, &block_omegas, &eta_names_bsv)?;
     // Per-eta SD-init flags, parallel to `eta_names_bsv`. Diagonal omega
     // declarations carry their `(sd)` flag from the parser; block-omega etas
@@ -1705,6 +1723,38 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     } else {
         None
     };
+
+    // ── [event_model] / [event_model NAME] blocks ──────────────────────────────
+    // Unnamed: `[event_model]` — one TTE endpoint.
+    // Named:   `[event_model LABEL]` — multiple TTE endpoints keyed by CMT.
+    // Each block holds `cmt`, `family`, and family-specific parameter expressions.
+    // Only compiled when the `survival` feature is enabled; the field
+    // `model.endpoints` is always present (cfg-gated) and stays empty otherwise.
+    #[cfg(feature = "survival")]
+    {
+        let theta_names = model.theta_names.clone();
+        let eta_names = model.eta_names.clone();
+
+        // Collect all [event_model] line-sets: unnamed (at most one) + named (any number).
+        let mut event_blocks: Vec<&Vec<String>> = Vec::new();
+        if let Some(lines) = blocks.get("event_model") {
+            event_blocks.push(lines);
+        }
+        if let Some(named_map) = extracted.named.get("event_model") {
+            for lines in named_map.values() {
+                event_blocks.push(lines);
+            }
+        }
+
+        for lines in event_blocks {
+            let (cmt, endpoint) =
+                parse_event_model_block(lines, &theta_names, &eta_names, &model.error_spec)?;
+            if model.endpoints.contains_key(&cmt) {
+                return Err(format!("[event_model]: CMT={cmt} declared more than once"));
+            }
+            model.endpoints.insert(cmt, endpoint);
+        }
+    }
 
     Ok(ParsedModel {
         model,
@@ -2319,6 +2369,224 @@ fn parse_covariates_block(lines: &[String]) -> Result<Vec<CovariateDecl>, String
     }
 
     Ok(decls)
+}
+
+// ── [event_model] block parser ─────────────────────────────────────────────
+
+/// Parse one `[event_model]` (or `[event_model NAME]`) block.
+///
+/// Returns `(cmt, EndpointLikelihood::Tte { hazard })` ready to insert into
+/// `CompiledModel::endpoints`.
+///
+/// Supported keys:
+/// - `cmt`    — required; positive integer (data-file CMT column value)
+/// - `family` — required; `exponential` | `weibull` | `gompertz`
+/// - `scale`  — required for Exponential (= λ, the rate) and Weibull (= scale parameter)
+/// - `rate`   — alias for `scale` (Exponential only; kept for user ergonomics)
+/// - `shape`  — required for Weibull
+/// - `alpha`  — required for Gompertz (baseline hazard at t=0)
+/// - `gamma`  — required for Gompertz (hazard growth rate)
+/// - `loghr`  — optional (all families); log-hazard-ratio covariate term Σ(β·x)
+#[cfg(feature = "survival")]
+fn parse_event_model_block(
+    lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    error_spec: &ErrorSpec,
+) -> Result<(usize, crate::types::EndpointLikelihood), String> {
+    use crate::types::{EndpointLikelihood, HazardFamily, HazardSpec};
+
+    let ctx = ParseCtx::new(theta_names, eta_names, &[]);
+
+    let mut cmt_opt: Option<usize> = None;
+    let mut family_opt: Option<HazardFamily> = None;
+    // Exponential / Weibull scale parameter (lambda for Exp).
+    let mut scale_expr: Option<Expression> = None;
+    // Weibull shape (p).
+    let mut shape_expr: Option<Expression> = None;
+    // Gompertz: α (baseline hazard at t=0).
+    let mut alpha_expr: Option<Expression> = None;
+    // Gompertz: γ (hazard growth rate).
+    let mut gamma_expr: Option<Expression> = None;
+    // Any family: Σ(β·covariate) added on the log-hazard scale.
+    let mut loghr_expr: Option<Expression> = None;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.splitn(2, '=').map(|s| s.trim()).collect();
+        if parts.len() != 2 {
+            return Err(format!(
+                "[event_model]: invalid line `{trimmed}` — expected `key = value`"
+            ));
+        }
+        let (key, value) = (parts[0], parts[1]);
+
+        match key {
+            "cmt" => {
+                cmt_opt = Some(value.parse::<usize>().map_err(|_| {
+                    format!("[event_model]: invalid cmt `{value}` — expected a positive integer")
+                })?);
+            }
+            "family" => {
+                family_opt = Some(match value {
+                    "exponential" => HazardFamily::Exponential,
+                    "weibull" => HazardFamily::Weibull,
+                    "gompertz" => HazardFamily::Gompertz,
+                    other => {
+                        return Err(format!(
+                            "[event_model]: unknown family `{other}` \
+                             — valid: exponential, weibull, gompertz"
+                        ))
+                    }
+                });
+            }
+            "scale" | "rate" => {
+                scale_expr = Some(parse_scalar_expression(value, ctx)?);
+            }
+            "shape" => {
+                shape_expr = Some(parse_scalar_expression(value, ctx)?);
+            }
+            "alpha" => {
+                alpha_expr = Some(parse_scalar_expression(value, ctx)?);
+            }
+            "gamma" => {
+                gamma_expr = Some(parse_scalar_expression(value, ctx)?);
+            }
+            "loghr" => {
+                loghr_expr = Some(parse_scalar_expression(value, ctx)?);
+            }
+            other => {
+                return Err(format!(
+                    "[event_model]: unknown key `{other}` \
+                     — valid keys: cmt, family, scale, rate, shape, alpha, gamma, loghr"
+                ));
+            }
+        }
+    }
+
+    let cmt = cmt_opt.ok_or("[event_model]: missing required key `cmt`")?;
+    let family = family_opt.ok_or("[event_model]: missing required key `family`")?;
+
+    // Guard: same CMT can't be both Gaussian and TTE.
+    match error_spec {
+        ErrorSpec::PerCmt(cmt_map) => {
+            if cmt_map.contains_key(&cmt) {
+                return Err(format!(
+                    "[event_model]: CMT={cmt} is already declared as a Gaussian endpoint \
+                     in [error_model] — the same CMT cannot be both Gaussian and TTE"
+                ));
+            }
+        }
+        ErrorSpec::Single(_) => {
+            // A Single error model has no CMT restriction — it applies to every Gaussian
+            // observation regardless of the CMT column value.  We cannot detect a collision
+            // at parse time because the error model carries no CMT information.  If the user
+            // places both Gaussian and TTE observations on the same CMT value in their dataset,
+            // the data reader's two-path routing (Gaussian → obs_times, TTE → obs_records)
+            // prevents actual double-counting in the NLL; however, the Gaussian path would
+            // silently consume those rows via the Single error model, which is almost certainly
+            // unintended.  Use a per-CMT error model (`DV[CMT=N] ~ ...`) to get unambiguous
+            // parse-time validation.
+        }
+    }
+
+    // Validate family-specific keys: reject keys that do not belong to the chosen family.
+    // Accepting and silently dropping them would mislead users into thinking they had an effect.
+    match family {
+        HazardFamily::Exponential => {
+            if shape_expr.is_some() {
+                return Err("[event_model] family=exponential does not accept `shape` \
+                     — remove it or switch to `family = weibull`"
+                    .into());
+            }
+            if alpha_expr.is_some() || gamma_expr.is_some() {
+                return Err(
+                    "[event_model] family=exponential does not accept `alpha` or `gamma` \
+                     — use `family = gompertz` for the Gompertz family"
+                        .into(),
+                );
+            }
+        }
+        HazardFamily::Weibull => {
+            if alpha_expr.is_some() || gamma_expr.is_some() {
+                return Err(
+                    "[event_model] family=weibull does not accept `alpha` or `gamma` \
+                     — use `family = gompertz` for the Gompertz family"
+                        .into(),
+                );
+            }
+        }
+        HazardFamily::Gompertz => {
+            if scale_expr.is_some() {
+                return Err("[event_model] family=gompertz does not accept `scale` \
+                     — use `alpha` (baseline hazard at t=0) and `gamma` (growth rate) instead"
+                    .into());
+            }
+            if shape_expr.is_some() {
+                return Err("[event_model] family=gompertz does not accept `shape` \
+                     — use `family = weibull` for the Weibull family"
+                    .into());
+            }
+        }
+    }
+
+    // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
+    // Expression nodes hold only indices, so they're safe to move into the closure.
+    // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
+    let param_fn: crate::types::HazardParamFn = match family {
+        HazardFamily::Exponential => {
+            let scale = scale_expr
+                .ok_or("[event_model] family=exponential requires `scale` (or `rate`)")?;
+            Box::new(
+                move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
+                    let lambda =
+                        eval_expression(&scale, theta, eta, covariates, &HashMap::new(), &[]);
+                    let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
+                        eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
+                    });
+                    vec![lambda, lhr]
+                },
+            )
+        }
+        HazardFamily::Weibull => {
+            let scale = scale_expr.ok_or("[event_model] family=weibull requires `scale`")?;
+            let shape = shape_expr.ok_or("[event_model] family=weibull requires `shape`")?;
+            Box::new(
+                move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
+                    let s = eval_expression(&scale, theta, eta, covariates, &HashMap::new(), &[]);
+                    let p = eval_expression(&shape, theta, eta, covariates, &HashMap::new(), &[]);
+                    let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
+                        eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
+                    });
+                    vec![s, p, lhr]
+                },
+            )
+        }
+        HazardFamily::Gompertz => {
+            let alpha = alpha_expr.ok_or("[event_model] family=gompertz requires `alpha`")?;
+            let gamma = gamma_expr.ok_or("[event_model] family=gompertz requires `gamma`")?;
+            Box::new(
+                move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
+                    let a = eval_expression(&alpha, theta, eta, covariates, &HashMap::new(), &[]);
+                    let g = eval_expression(&gamma, theta, eta, covariates, &HashMap::new(), &[]);
+                    let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
+                        eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
+                    });
+                    vec![a, g, lhr]
+                },
+            )
+        }
+    };
+
+    Ok((
+        cmt,
+        EndpointLikelihood::Tte {
+            hazard: HazardSpec::Analytic { family, param_fn },
+        },
+    ))
 }
 
 // ── [simulation] block parser ───────────────────────────────────────────────

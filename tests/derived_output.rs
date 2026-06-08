@@ -60,6 +60,8 @@ fn one_dose_population() -> Population {
             cens: vec![0; n_obs],
             occasions: vec![],
             dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         }],
     }
 }
@@ -187,6 +189,8 @@ fn make_subject_with_doses(obs_times: Vec<f64>, doses: Vec<DoseEvent>) -> Subjec
         cens: vec![0; n],
         occasions: vec![],
         dose_occasions: vec![],
+        #[cfg(feature = "survival")]
+        obs_records: vec![],
     }
 }
 

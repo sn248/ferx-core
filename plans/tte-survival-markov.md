@@ -1,8 +1,8 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Status:** Phase 1 in progress — infrastructure scaffold merged (PR #190, v0.1.6)  
+**Status:** Phase 1 wiring complete — ferx-core PR #192 ready to merge; ferx-r PR #134 (Draft) unblocks on #192 merge  
 **Scope:** Active implementation — code changes underway  
-**Revised:** 2026-06-07 (deep research edition — NONMEM/nlmixr2/Monolix docs, tutorial papers, methods improvements, adjacent fields)
+**Revised:** 2026-06-08 (Phase 1 wiring PRs complete)
 
 ---
 
@@ -2083,8 +2083,8 @@ treated as bugs:
 **Scope:** Exponential, Weibull, and Gompertz; fixed and random hazard parameters; FOCEI
 Laplace; right-censored, interval-censored, and **left-truncated (delayed entry)**; no PK.
 
-**Status: in progress.** PR #190 (v0.1.6) merged the infrastructure scaffold. The
-remaining work is the wiring: parser, datareader, likelihood dispatch, tests, and docs.
+**Status: wiring complete.** PR #190 merged the infrastructure scaffold; PR #192 wires it
+end-to-end and is ready to merge. ferx-r PR #134 (Draft) unblocks immediately after.
 
 #### Done — PR #190 (infrastructure scaffold)
 
@@ -2100,36 +2100,92 @@ remaining work is the wiring: parser, datareader, likelihood dispatch, tests, an
   `sample_conditional_event_time` for Exponential, Weibull, Gompertz; full Tier 1 test suite
 - ✅ `src/survival/mod.rs` — `tte_data_term` (all EventType variants + left truncation);
   `data_term_hessian_fd` (4-point central stencil); `shi_step_sizes` (Shi 2021 §3.4);
-  `simulate_tte` (draws event times; called from `api::simulate_inner_with_draw` but
-  effectively no-ops until `model.endpoints` is populated by the parser)
+  `simulate_tte` (draws event times; called from `api::simulate_inner_with_draw`)
 - ✅ Reference files: `tests/reference/tte_exponential/`, `tte_weibull/`, `tte_gompertz/`
   (simulate.R, nlmixr2.R, nonmem.ctl, expected.md for each)
 
-**Note on `simulate_tte`:** the function is correct and fully implemented, but it iterates
-`model.endpoints` which is always empty until the `[event_model]` parser lands. It will
-silently produce no output until then — not a stub, just wired to an empty map.
+#### Done — PR #192 (wiring, ready to merge)
 
-#### Remaining — next Phase 1 PR
+**Parser (`src/parser/model_parser.rs`):**
+- ✅ `[event_model]` block parsing — `param_fn` closure for Exponential, Weibull, Gompertz;
+  keys: `cmt`, `family`, `scale`/`rate`, `shape`, `alpha`, `gamma`, `loghr` (optional PH term)
+- ✅ Named blocks (`[event_model NAME]`) for multiple TTE endpoints; duplicate-CMT guard
+- ✅ Incompatible key validation (e.g. `shape` in `exponential` → parse error)
+- ✅ `n_eta=0` fix: `build_omega_matrix` returns 0×0 Omega when no etas declared
 
-- ❌ `[event_model]` block parsing in `src/parser/model_parser.rs` — populates
-  `model.endpoints[cmt]` with `EndpointLikelihood::Tte { hazard }` using a `param_fn`
-  closure. Keys: `cmt`, `family` (exponential|weibull|gompertz), `shape`, `scale`/`rate`,
-  `loghr` (optional PH covariate term).
-- ❌ Datareader TTE row routing in `src/io/datareader.rs` — detect `TENTRY` column;
-  for EVID=0 rows where `cmt ∈ tte_cmts`: parse DV as censoring code (0=right-censored,
-  1=exact, 2=interval bound) and push to `subject.obs_records` instead of the Gaussian Vecs
-- ❌ `individual_nll` dispatch for TTE data term (`src/stats/likelihood.rs`)
-- ❌ `foce_subject_nll_interaction` dispatch: FD Hessian + `½ log|det H_total|` for TTE CMTs
-  (`src/stats/likelihood.rs`)
-- ❌ SAEM analytic σ M-step skip for TTE subjects (`src/estimation/saem.rs`)
-- ❌ `predict_survival` in `src/api.rs`: returns `Prediction::Survival { s, cum_hazard,
-  hazard }` on a time grid; median survival + E[T]
-- ❌ Example files: `examples/tte_exponential.ferx`, `examples/tte_weibull.ferx`,
-  `examples/tte_gompertz.ferx` + `data/tte_exponential.csv` (run simulate.R)
-- ❌ Tier 2 smoke tests (`tests/tte_smoke.rs`): `fit()` in ≤5 outer iterations; fixed-effects
-  `n_eta=0` Weibull PH (validates empty-Ω path, §16 D7)
-- ❌ Tier 3 convergence + SSE tests (`tests/tte_convergence.rs`, gated `slow-tests`)
-- ❌ `docs/src/estimation/tte.md` + entry in `docs/src/SUMMARY.md`; NONMEM comparison table
+**Datareader (`src/io/datareader.rs`):**
+- ✅ `TENTRY` column auto-detected; DV=0/1/2 routed to `subject.obs_records` via
+  deferred-flush pattern; end-of-subject flush for remaining pending left bounds
+- ✅ Non-integer DV on TTE CMT → hard parse error (previously silently truncated)
+- ✅ `TENTRY > TIME` → parse warning + row skip (previously silent negative cumulative hazard)
+- ✅ Dead `#[cfg(not(feature="survival"))]` fallback branch removed (was unreachable)
+
+**Likelihood (`src/stats/likelihood.rs`):**
+- ✅ `individual_nll_into_with_schedule`: TTE data term added (2× scaling to match Gaussian
+  halving convention); iterates `model.endpoints` directly (no `HashSet` scan)
+- ✅ `foce_subject_nll_interaction_with_tte`: FD Hessian + `½ log|det H_total|` for TTE CMTs;
+  seeds TTE NLL + Hessian into combined Laplace correction; iterates `model.endpoints`
+
+**API (`src/api.rs`):**
+- ✅ `read_population_for` promoted to `pub` — single entry point handling covariates,
+  `[data_selection]` filters, and TTE routing; the function external consumers should call
+- ✅ `predict_survival` + `SurvivalPredictionResult`: S(t), H(t), h(t) on a time grid per
+  subject × TTE CMT. Note: `median_survival` / `mean_survival` not yet implemented (deferred)
+
+**Tests (`tests/tte_smoke.rs`, Tier 2):**
+- ✅ `tte_exponential_model_parses`, `tte_weibull_model_parses`, `tte_gompertz_model_parses`
+  — all three parser branches covered
+- ✅ `tte_fixed_effects_model_parses` (n_eta=0 path), `tte_fit_exponential_3iter`,
+  `tte_fit_fixed_effects_n_eta_0`, `tte_loghr_nonzero_changes_ofv` (OFV shift > 1.0),
+  `tte_duplicate_cmt_parse_error`, `tte_incompatible_key_*` (two error cases)
+
+**Docs:**
+- ✅ `docs/src/estimation/tte.md` — overview, syntax, DV coding, TENTRY, hazard families
+  table (with `exp(loghr)` multiplier), loghr examples, estimation notes, placeholder
+  NONMEM/nlmixr2 comparison table
+- ✅ `docs/src/model-file/event-model.md` — `[event_model]` key reference including
+  `loghr` and `rate`; expression namespace Note callout
+- ✅ `docs/src/SUMMARY.md` updated
+
+**Examples + data:**
+- ✅ `examples/tte_exponential.ferx` (using correct theta/eta expressions)
+- ✅ `data/tte_exponential.csv` (30-subject simulated dataset)
+
+#### Remaining — follow-up after #192 merges
+
+**Estimation:**
+- ❌ SAEM analytic σ M-step skip for TTE subjects (`src/estimation/saem.rs`) — needed
+  before SAEM estimation on TTE data works correctly (FOCEI path is fine)
+- ❌ Tier 3 convergence tests (`tests/tte_convergence.rs`, gated `slow-tests`)
+- ❌ NONMEM/nlmixr2 reference comparison — run `tests/reference/tte_exponential/` scripts;
+  fill the comparison table in `docs/src/estimation/tte.md`
+
+**Parser / DSL:**
+- ❌ `[event_model]` expressions cannot reference `[individual_parameters]` names — `param_fn`
+  evaluates in theta/eta/covariate namespace only; documented with Note callout; fix requires
+  threading individual_parameters evaluator into `parse_event_model_block`
+- ❌ Allow absent `[structural_model]` / `[error_model]` for TTE-only models (currently
+  requires dummy fixed blocks)
+- ❌ `[event_model]` covariate names (e.g. from `loghr = BETA_WT * WT`) not added to
+  `model.referenced_covariates` — strict covariate reader won't auto-validate them
+
+**API / output:**
+- ❌ `predict_survival` / `SurvivalPredictionResult` not re-exported at crate root (`src/lib.rs`)
+- ❌ `SurvivalPredictionResult` missing `median_survival` and `mean_survival` fields
+- ❌ `examples/tte_weibull.ferx`, `examples/tte_gompertz.ferx` not yet added
+
+**Code quality:**
+- ❌ `foce_subject_nll_interaction_with_tte` duplicates the Gaussian interaction loop — any
+  future fix to the Gaussian path must be replicated; refactor candidate
+
+**ferx-r:**
+- ✅ `r.dv_sim` → `r.outcome.continuous_value()` migration — ferx-r PR #132 (merged)
+- ✅ TTE datareader routing — ferx-r PR #134 (Draft; unblocks on #192 merge)
+  — `ferx_rust_fit` 4-way dispatch → `read_population_for`; all 5 simulate/predict
+  helpers updated; also fixes pre-existing covariates+filter gap in `ferx_rust_fit`
+- ❌ `predict_survival` R wrapper (post Phase 1, once median/mean fields are added)
+- ❌ R-side end-to-end TTE test (Tier 2: parse model with `[event_model]`, read CSV,
+  verify `obs_records` populated, OFV finite)
 
 ### Phase 1b — Competing risks (cause-specific hazard)
 

@@ -3,8 +3,9 @@ use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv, read_nonmem_csv_filtered, read_nonmem_csv_with_covariates,
-    read_nonmem_csv_with_covariates_filtered, SelectionFilter, ERR_COV_MISSING_COLUMNS,
+    read_nonmem_csv, read_nonmem_csv_filtered, read_nonmem_csv_filtered_tte,
+    read_nonmem_csv_with_covariates, read_nonmem_csv_with_covariates_filtered,
+    read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
     ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
@@ -394,13 +395,19 @@ fn build_selection_filter_merged(
     SelectionFilter::from_opts(&ignore, &accept, &subjects).map(Some)
 }
 
+/// Read a [`Population`] from `data_path` using the correct reader for `model`.
 ///
 /// When the model declares a `[covariates]` block this routes through the strict
 /// reader (validates declared columns exist + are numeric, builds the table, and
 /// reads referenced-but-undeclared covariates leniently as `extra`). Otherwise
 /// it falls back to the lenient reader with `fallback_columns` (the legacy
 /// `covariate_columns` argument, or `None` for auto-detect).
-fn read_population_for(
+///
+/// When the model contains `[event_model]` blocks (TTE endpoints), TTE rows are
+/// automatically routed to `subject.obs_records` instead of the Gaussian parallel
+/// vectors. Library consumers (e.g. the R glue) should call this instead of the
+/// individual `read_nonmem_csv*` functions so that TTE routing is applied.
+pub fn read_population_for(
     model: &CompiledModel,
     covariate_decls: &Option<Vec<CovariateDecl>>,
     data_path: &str,
@@ -408,32 +415,82 @@ fn read_population_for(
     iov_column: Option<&str>,
     filter: Option<&SelectionFilter>,
 ) -> Result<(Population, Option<CovariateTable>), String> {
-    match (covariate_decls, filter) {
-        (Some(decls), Some(sel)) => {
-            let extra = undeclared_referenced(model, decls);
-            let (pop, table) = read_nonmem_csv_with_covariates_filtered(
-                Path::new(data_path),
-                decls,
-                &extra,
-                iov_column,
-                sel,
-            )?;
-            Ok((pop, Some(table)))
+    // Extract TTE CMTs from model endpoints so the reader can route TTE rows
+    // to obs_records instead of the Gaussian parallel Vecs.
+    #[cfg(feature = "survival")]
+    let tte_cmts: std::collections::HashSet<usize> = model
+        .endpoints
+        .iter()
+        .filter_map(|(&cmt, ep)| {
+            if matches!(ep, EndpointLikelihood::Tte { .. }) {
+                Some(cmt)
+            } else {
+                None
+            }
+        })
+        .collect();
+    #[cfg(not(feature = "survival"))]
+    let tte_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    if tte_cmts.is_empty() {
+        // Gaussian-only model: use the existing (faster) path without TTE overhead.
+        match (covariate_decls, filter) {
+            (Some(decls), Some(sel)) => {
+                let extra = undeclared_referenced(model, decls);
+                let (pop, table) = read_nonmem_csv_with_covariates_filtered(
+                    Path::new(data_path),
+                    decls,
+                    &extra,
+                    iov_column,
+                    sel,
+                )?;
+                Ok((pop, Some(table)))
+            }
+            (Some(decls), None) => {
+                let extra = undeclared_referenced(model, decls);
+                let (pop, table) = read_nonmem_csv_with_covariates(
+                    Path::new(data_path),
+                    decls,
+                    &extra,
+                    iov_column,
+                )?;
+                Ok((pop, Some(table)))
+            }
+            (None, Some(sel)) => Ok((
+                read_nonmem_csv_filtered(Path::new(data_path), fallback_columns, iov_column, sel)?,
+                None,
+            )),
+            (None, None) => Ok((
+                read_nonmem_csv(Path::new(data_path), fallback_columns, iov_column)?,
+                None,
+            )),
         }
-        (Some(decls), None) => {
-            let extra = undeclared_referenced(model, decls);
-            let (pop, table) =
-                read_nonmem_csv_with_covariates(Path::new(data_path), decls, &extra, iov_column)?;
-            Ok((pop, Some(table)))
+    } else {
+        // Model has TTE endpoints: use TTE-aware reader so obs_records are populated.
+        match covariate_decls {
+            Some(decls) => {
+                let extra = undeclared_referenced(model, decls);
+                let (pop, table) = read_nonmem_csv_with_covariates_tte(
+                    Path::new(data_path),
+                    decls,
+                    &extra,
+                    iov_column,
+                    filter,
+                    &tte_cmts,
+                )?;
+                Ok((pop, Some(table)))
+            }
+            None => {
+                let pop = read_nonmem_csv_filtered_tte(
+                    Path::new(data_path),
+                    fallback_columns,
+                    iov_column,
+                    filter,
+                    &tte_cmts,
+                )?;
+                Ok((pop, None))
+            }
         }
-        (None, Some(sel)) => Ok((
-            read_nonmem_csv_filtered(Path::new(data_path), fallback_columns, iov_column, sel)?,
-            None,
-        )),
-        (None, None) => Ok((
-            read_nonmem_csv(Path::new(data_path), fallback_columns, iov_column)?,
-            None,
-        )),
     }
 }
 
@@ -3521,6 +3578,72 @@ pub struct PredictionResult {
     pub id: String,
     pub time: f64,
     pub pred: f64,
+}
+
+// ── TTE / survival prediction ─────────────────────────────────────────────────
+
+/// Survival function prediction for one (subject, time) grid point.
+#[cfg(feature = "survival")]
+#[derive(Debug, Clone)]
+pub struct SurvivalPredictionResult {
+    /// Subject ID.
+    pub id: String,
+    /// CMT of the TTE endpoint.
+    pub cmt: usize,
+    /// Time at which S(t), H(t), h(t) are evaluated.
+    pub time: f64,
+    /// Survival probability S(t) = exp(−H(t)).
+    pub survival: f64,
+    /// Cumulative hazard H(t).
+    pub cum_hazard: f64,
+    /// Instantaneous hazard h(t).
+    pub hazard: f64,
+}
+
+/// Compute survival function predictions for TTE endpoints.
+///
+/// For each subject and each TTE CMT in `model.endpoints`, evaluates
+/// `S(t) = exp(−H(t))`, `H(t)`, and `h(t)` at every point in `time_grid`
+/// using population typical values (η = 0).
+///
+/// Returns an empty Vec when the model has no TTE endpoints.
+#[cfg(feature = "survival")]
+pub fn predict_survival(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    time_grid: &[f64],
+) -> Vec<SurvivalPredictionResult> {
+    use crate::survival::hazard_and_cum_hazard;
+    use crate::types::EndpointLikelihood;
+
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    let mut results = Vec::new();
+
+    for subject in &population.subjects {
+        for (&cmt, endpoint) in &model.endpoints {
+            let EndpointLikelihood::Tte { hazard } = endpoint else {
+                continue;
+            };
+            let crate::types::HazardSpec::Analytic { family, param_fn } = hazard;
+            let params_vec = param_fn(&params.theta, &zero_eta, &subject.covariates);
+
+            for &t in time_grid {
+                let (h_val, cum_h) = hazard_and_cum_hazard(*family, t, &params_vec);
+                let s = (-cum_h).exp();
+                results.push(SurvivalPredictionResult {
+                    id: subject.id.clone(),
+                    cmt,
+                    time: t,
+                    survival: s,
+                    cum_hazard: cum_h,
+                    hazard: h_val,
+                });
+            }
+        }
+    }
+
+    results
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

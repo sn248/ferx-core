@@ -179,7 +179,7 @@ pub fn run_importance_sampling(
                     &params.sigma.values,
                     &h_matrices[i],
                     &omega_inv,
-                    &omega_iov_inv.as_ref().unwrap(),
+                    omega_iov_inv.as_ref().unwrap(),
                     n_eta,
                     n_iov,
                     n_occ,
@@ -189,7 +189,7 @@ pub fn run_importance_sampling(
                 // Build joint prior covariance (block-diagonal: Omega_bsv + K copies of Omega_iov)
                 let omega_joint_inv = build_joint_omega_inv(
                     &omega_inv,
-                    &omega_iov_inv.as_ref().unwrap(),
+                    omega_iov_inv.as_ref().unwrap(),
                     n_eta,
                     n_iov,
                     n_occ,
@@ -246,7 +246,6 @@ pub fn run_importance_sampling(
                     &params.sigma.values,
                     eta_hat,
                     &h_post,
-                    kap,
                     &omega_inv,
                     log_det_omega,
                     n_eta,
@@ -348,7 +347,6 @@ fn subject_is_estimate(
     sigma: &[f64],
     eta_hat: &DVector<f64>,
     h: &DMatrix<f64>,
-    kappas_of_subject: &[DVector<f64>],
     omega_inv: &DMatrix<f64>,
     log_det_omega: f64,
     d: usize,
@@ -407,20 +405,7 @@ fn subject_is_estimate(
             *e += eta_hat[j];
         }
 
-        // log p(y | η, θ, κ̂):  IOV path branches on whether the subject has occasions.
-        let obs_nll = if kappas_of_subject.is_empty() {
-            obs_nll_subject_into(model, subject, theta, sigma, &eta_sample, scratch)
-        } else {
-            obs_nll_iov_fixed_kappa(
-                model,
-                subject,
-                theta,
-                sigma,
-                &eta_sample,
-                kappas_of_subject,
-                scratch,
-            )
-        };
+        let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &eta_sample, scratch);
         let log_p_y = -obs_nll;
 
         // log p(η | θ): multivariate-normal quadratic form `η' Ω⁻¹ η`,
@@ -518,17 +503,6 @@ fn compute_joint_posterior_hessian(
         return build_joint_omega_inv(omega_inv, omega_iov_inv, n_eta, n_iov, n_occ);
     }
 
-    // Build the joint mode vector
-    let mut mode = vec![0.0_f64; n_b];
-    for i in 0..n_eta {
-        mode[i] = eta_hat[i];
-    }
-    for (k, kappa_occ) in kappas.iter().enumerate() {
-        for ki in 0..n_iov {
-            mode[n_eta + k * n_iov + ki] = kappa_occ[ki];
-        }
-    }
-
     // Compute predictions at the joint mode using predict_iov for proper cross-occasion carryover
     let kappa_slices: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
     let ipreds = predict_iov(model, subject, theta, eta_hat.as_slice(), &kappa_slices);
@@ -563,7 +537,8 @@ fn compute_joint_posterior_hessian(
 
             // Backward perturbation
             kap_perturbed[k][ki] = orig - step;
-            let preds_minus = predict_iov(model, subject, theta, eta_hat.as_slice(), &kap_perturbed);
+            let preds_minus =
+                predict_iov(model, subject, theta, eta_hat.as_slice(), &kap_perturbed);
 
             // Restore
             kap_perturbed[k][ki] = orig;
@@ -700,7 +675,9 @@ fn subject_is_estimate_joint(
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
             let f = f.max(1e-12);
-            let v = model.residual_variance_at(subject.obs_cmts[j], f, sigma).max(1e-12);
+            let v = model
+                .residual_variance_at(subject.obs_cmts[j], f, sigma)
+                .max(1e-12);
             if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
                 let z = (y - f) / v.sqrt();
                 obs_nll += -log_normal_cdf(z);
@@ -738,7 +715,11 @@ fn subject_is_estimate_joint(
         0.0
     } else {
         let sum_sq: f64 = weights_norm.iter().map(|w| w * w).sum();
-        if sum_sq > 0.0 { 1.0 / sum_sq } else { 0.0 }
+        if sum_sq > 0.0 {
+            1.0 / sum_sq
+        } else {
+            0.0
+        }
     };
     let ess_fraction = ess / (k_samples as f64);
 
@@ -910,54 +891,6 @@ fn logsumexp_with_normalised(xs: &[f64]) -> (f64, Vec<f64>) {
     (lse, weights)
 }
 
-/// IOV-aware obs NLL with κ fixed at its EBE. Mirrors the per-occasion split
-/// in `foce_subject_nll_iov` but returns only the obs term — no Laplace/FOCE
-/// linearisation.
-//
-// IOV-aware obs NLL with κ fixed at its EBE. Mirrors the per-occasion split
-// in `foce_subject_nll_iov` but returns only the obs term — no Laplace/FOCE
-// linearisation.
-fn obs_nll_iov_fixed_kappa(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    eta_bsv: &[f64],
-    kappas_of_subject: &[DVector<f64>],
-    scratch: &mut EventPkParams,
-) -> f64 {
-    let occ_groups = split_obs_by_occasion(subject);
-    let n_obs = subject.obs_times.len();
-    let mut ipreds = vec![0.0_f64; n_obs];
-    for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate() {
-        let kap: &[f64] = if k < kappas_of_subject.len() {
-            kappas_of_subject[k].as_slice()
-        } else {
-            &[]
-        };
-        let combined: Vec<f64> = eta_bsv.iter().copied().chain(kap.iter().copied()).collect();
-        let all_preds = compute_predictions_with_tv_into(model, subject, theta, &combined, scratch);
-        for &j in obs_indices {
-            ipreds[j] = all_preds[j];
-        }
-    }
-    let m3 = matches!(model.bloq_method, BloqMethod::M3);
-    let mut nll = 0.0;
-    for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
-        let f = f.max(1e-12);
-        let v = model
-            .residual_variance_at(subject.obs_cmts[j], f, sigma)
-            .max(1e-12);
-        if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
-            let z = (y - f) / v.sqrt();
-            nll += -log_normal_cdf(z);
-        } else {
-            nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
-        }
-    }
-    nll
-}
-
 /// Sheiner–Beal posterior-Hessian approximation at η̂.
 ///
 /// `H_post ≈ J' R⁻¹ J + Ω⁻¹` where J is the Jacobian `df/dη` (the misleadingly-
@@ -1093,6 +1026,35 @@ mod tests {
         let z_sq: f64 = z.iter().map(|v| v * v).sum();
         // Jitter tilts this slightly; loose tolerance is fine here.
         assert!((m - z_sq).abs() < 1e-3, "m={} vs ||z||²={}", m, z_sq);
+    }
+
+    #[test]
+    fn build_joint_omega_inv_block_diagonal_structure() {
+        // 1 BSV param, 2 IOV params, 3 occasions → 7×7 matrix.
+        // BSV block: [[2.0]], IOV block: [[3.0, 0.5], [0.5, 4.0]]
+        let omega_inv = DMatrix::from_row_slice(1, 1, &[2.0]);
+        let omega_iov_inv = DMatrix::from_row_slice(2, 2, &[3.0, 0.5, 0.5, 4.0]);
+        let m = build_joint_omega_inv(&omega_inv, &omega_iov_inv, 1, 2, 3);
+
+        assert_eq!(m.nrows(), 7);
+        assert_eq!(m.ncols(), 7);
+
+        // BSV block (top-left 1×1)
+        assert_eq!(m[(0, 0)], 2.0);
+
+        // Three IOV blocks on the diagonal at offsets 1, 3, 5
+        for occ in 0..3 {
+            let off = 1 + occ * 2;
+            assert_eq!(m[(off, off)], 3.0, "occ {occ} diag[0,0]");
+            assert_eq!(m[(off, off + 1)], 0.5, "occ {occ} off-diag");
+            assert_eq!(m[(off + 1, off)], 0.5, "occ {occ} off-diag sym");
+            assert_eq!(m[(off + 1, off + 1)], 4.0, "occ {occ} diag[1,1]");
+        }
+
+        // Cross-block entries must be zero
+        assert_eq!(m[(0, 1)], 0.0);
+        assert_eq!(m[(1, 3)], 0.0);
+        assert_eq!(m[(3, 5)], 0.0);
     }
 
     #[test]

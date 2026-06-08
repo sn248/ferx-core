@@ -5720,15 +5720,16 @@ mod tests_derived_session_clock {
 
     /// Periodic integral aligns windows to raw TIME, not shifted time.
     ///
-    /// Period=4, anchor=0.  Both sessions' obs at raw t=1 fall in the raw window
-    /// [0, 4), so `eval_integral_obs_for` for each session should see its own
-    /// [0,1,4] points and return AUC=8.0.
+    /// Period=5, anchor=0.  All raw obs at [0, 1, 4] satisfy floor(t/5)=0, so
+    /// every obs lands in the first period window [0, 5).  All three per-session
+    /// points contribute → AUC = trapezoid([(0,0),(1,1),(4,4)]) = 8.0.
     ///
-    /// With the old code, the window was derived from `subject.obs_times[j]`:
-    ///   - Session 0, j=1: shifted t=1 → window [0,4) — coincidentally correct
-    ///   - Session 1, j=4: shifted t=6 → window [4,8) — WRONG (cross-period)
+    /// With the old (broken) code, session-1 obs at shifted times [5, 6, 9] give
+    /// floor(t/5) = 1 → window [5, 10).  Integrating (5,5),(6,6),(9,9) yields 28.0,
+    /// not 8.0 — a clear mismatch caught by the `v == 8.0` assertion.
     ///
-    /// After the fix both j=1 and j=4 use raw t=1 → window [0,4) → correct AUC.
+    /// After the fix, session-1 obs use raw t ∈ {0, 1, 4} → floor(t/5) = 0 →
+    /// window [0, 5) → correct AUC = 8.0.
     #[test]
     fn derived_integral_periodic_uses_raw_clock() {
         let derived_exprs = vec![DerivedExprSpec {
@@ -5738,7 +5739,7 @@ mod tests_derived_session_clock {
                 condition: None,
                 data_based: true,
                 window: IntegralWindow::Periodic {
-                    period: 4.0,
+                    period: 5.0,
                     anchor: 0.0,
                 },
                 step: IntegralStep::ObsTimes,
@@ -5757,8 +5758,8 @@ mod tests_derived_session_clock {
         let mut subjects_results = vec![sr_for(6)];
         compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
-        // Every obs is in the raw window [0,4) for its session; all three obs in
-        // each session contribute → AUC=8.0.
+        // All obs land in the raw-clock window [0,5); all three per-session
+        // points contribute → AUC=8.0 for every row.
         for (j, &v) in col.iter().enumerate() {
             assert!(
                 (v - 8.0).abs() < 1e-12,

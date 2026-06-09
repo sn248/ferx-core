@@ -5,6 +5,7 @@ use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1949,6 +1950,10 @@ fn packed_param_label(packed_idx: usize, template: &ModelParameters) -> String {
 }
 
 /// Format a single eigenvalue for display: `"0"`, fixed-4, or scientific-3.
+///
+/// The exact-zero branch handles rank-deficient inputs (e.g. a parameter block
+/// that is entirely FIX) where `SymmetricEigen` returns eigenvalue `0.0` exactly.
+/// Any non-zero value — even 1e-300 — uses fixed or scientific notation instead.
 fn fmt_eig(v: f64) -> String {
     let abs = v.abs();
     if abs == 0.0 {
@@ -2111,10 +2116,11 @@ pub(crate) fn compute_covariance(
     // The FD loop never stores non-finite values (guarded by is_finite() below),
     // so post-hoc non-finite checks on `hess` would always be false. Instead we
     // record which packed indices had a NaN/Inf stencil result here.
-    let mut fd_diag_nan: Vec<usize> = Vec::new();
+    // HashSet gives O(1) insertion and lookup vs. O(n) for Vec.
+    let mut fd_diag_nan: HashSet<usize> = HashSet::new();
     // Packed indices for which at least one cross-partial stencil returned NaN/Inf.
     // The stored off-diagonal stays 0 (no correlation info) — not fatal, but noted.
-    let mut fd_offdiag_nan: Vec<usize> = Vec::new();
+    let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
     for &i in &free_idx {
         let hi = eps * (1.0 + x_hat[i].abs());
@@ -2130,7 +2136,7 @@ pub(crate) fn compute_covariance(
         if h_ii.is_finite() {
             hess[(i, i)] = h_ii;
         } else {
-            fd_diag_nan.push(i);
+            fd_diag_nan.insert(i);
         }
 
         // Off-diagonal: 4-point stencil (over free indices only)
@@ -2161,13 +2167,10 @@ pub(crate) fn compute_covariance(
                 hess[(i, j)] = h_ij;
                 hess[(j, i)] = h_ij;
             } else {
-                // Both parameters lose their shared cross-partial; track each once.
-                if !fd_offdiag_nan.contains(&i) {
-                    fd_offdiag_nan.push(i);
-                }
-                if !fd_offdiag_nan.contains(&j) {
-                    fd_offdiag_nan.push(j);
-                }
+                // Both parameters lose their shared cross-partial.
+                // HashSet::insert is idempotent — no manual dedup needed.
+                fd_offdiag_nan.insert(i);
+                fd_offdiag_nan.insert(j);
             }
         }
     }
@@ -2288,7 +2291,11 @@ pub(crate) fn compute_covariance(
     // so off-diagonal correlation is missing for these parameters. SEs for the named
     // parameters may be over-optimistic (correlation with other parameters is absent).
     if !fd_offdiag_nan.is_empty() {
-        let names: Vec<String> = fd_offdiag_nan
+        // Sort by packed index so the warning message is deterministic regardless
+        // of HashSet iteration order.
+        let mut sorted_idx: Vec<usize> = fd_offdiag_nan.iter().cloned().collect();
+        sorted_idx.sort_unstable();
+        let names: Vec<String> = sorted_idx
             .iter()
             .map(|&i| packed_param_label(i, template))
             .collect();
@@ -2604,8 +2611,14 @@ mod tests {
         assert_eq!(label_diag2, "omega[ETA_V, ETA_V]", "diagonal 1,1");
     }
 
-    /// format_non_pd_warning with all-positive eigenvalues (no negative) still
-    /// says "not positive definite" — the function formats whatever list it receives.
+    /// `format_non_pd_warning` is a pure formatting function: it embeds whatever
+    /// eigenvalue list it receives, regardless of sign. This test exercises the
+    /// fixed-4 and scientific-3 branches of `fmt_eig` without needing an actual
+    /// non-PD Hessian.
+    ///
+    /// Note: in production `format_non_pd_warning` is only reached when
+    /// `invert_psd_with_floor` returns `None` (all eigenvalues ≤ 0), so the
+    /// "all-positive" input below is a formatter unit test, not a semantic one.
     #[test]
     fn test_format_non_pd_warning_all_positive() {
         let ev = vec![5.0, 0.01, 1e-9];

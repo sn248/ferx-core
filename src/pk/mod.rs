@@ -681,6 +681,12 @@ pub fn analytical_state_at_times(
     pk_params: &PkParams,
     times: &[f64],
 ) -> Vec<Vec<f64>> {
+    debug_assert!(
+        subject.reset_times.is_empty(),
+        "analytical_state_at_times called on a subject with EVID=3/4 resets — \
+         superposition is invalid across reset boundaries; the caller should \
+         return empty states for analytical+reset subjects instead"
+    );
     let lagtime = pk_params.lagtime();
     let n_states = match pk_model {
         PkModel::OneCptIv => 1,
@@ -749,25 +755,25 @@ pub fn predict_all_states(
 /// Compute predictions AND full compartment states for all observations.
 /// Returns `(ipred_vec, compartment_states_vec)`.
 ///
-/// Routes through the standard `compute_predictions_with_tv` for ipred, and
-/// `predict_all_states` for the states. The two calls use the same PK params so
-/// the values are consistent (but computed independently — a future optimisation
-/// could fuse them if profiling shows this as a bottleneck).
+/// For ODE models the states come from the same ODE integration that produces ipred
+/// (single-pass for non-TV, non-reset subjects). For analytical models the states are
+/// computed via superposition using the same PK params.
 ///
-/// For subjects with resets (EVID=3/4), the reset disrupts superposition; states
-/// are set to the post-reset analytical values from the event-driven path.
-/// For IOV models, states are left empty (the IOV path is complex and the primary
-/// use case is post-fit ODE models).
+/// For subjects with resets (EVID=3/4), the reset disrupts superposition; analytical
+/// states are left empty (→ NaN in `[derived]`; `W_DERIVED_CMT_RESET_ANALYTICAL`
+/// explains why). ODE subjects with resets are handled correctly via the event-driven
+/// solver. For IOV models, states are left empty.
 pub fn compute_predictions_with_states(
     model: &crate::types::CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
-    let ipred = compute_predictions_with_tv(model, subject, theta, eta);
-    let states = if let Some(ref ode) = model.ode_spec {
-        // ODE path: delegate to ode_predictions_with_states which captures the full
-        // solver state at each obs time. Resets are handled inside that function.
+    if let Some(ref ode) = model.ode_spec {
+        // ODE path: both ipred and states come from a single ODE integration.
+        // TV-covariate and reset subjects need the event-driven path (which also
+        // handles resets as break-points). Plain subjects use the simpler function
+        // that avoids the per-event PK-parameter machinery.
         let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
         if subject.has_tv_covariates() || subject.has_resets() {
             let mut scratch = EventPkParams::with_capacity_for(subject);
@@ -781,26 +787,30 @@ pub fn compute_predictions_with_states(
                 &scratch.obs,
                 &scratch.pk_only,
             )
-            .1
         } else {
-            crate::ode::ode_predictions_with_states(ode, &pk.values, theta, eta, subject).1
+            // Single-pass: one ODE integration yields both ipred and states.
+            crate::ode::ode_predictions_with_states(ode, &pk.values, theta, eta, subject)
         }
-    } else if subject.has_resets() {
-        // Analytical with resets: reset mid-timeline invalidates simple superposition;
-        // the event-driven analytical path does not yet return states.
-        vec![vec![]; subject.obs_times.len()]
-    } else if subject.has_tv_covariates() {
-        // Analytical with TV covariates: superposition would use baseline pk_params
-        // from subject.covariates while ipred honours per-event TV parameters.
-        // Returning states from mismatched PK params is worse than returning empty
-        // (empty → NaN in [derived]; the W_DERIVED_CMT_TV_ANALYTICAL warning in
-        // fit() explains why). ODE TV-covariate is handled above via event_driven.
-        vec![vec![]; subject.obs_times.len()]
     } else {
-        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-        predict_all_states(model.pk_model, subject, &pk)
-    };
-    (ipred, states)
+        // Analytical path: ipred via compute_predictions_with_tv (handles SS, resets,
+        // TV covariates); states via predict_all_states (superposition only — valid
+        // for the no-reset, no-TV case).
+        let ipred = compute_predictions_with_tv(model, subject, theta, eta);
+        let states = if subject.has_resets() {
+            // Superposition is invalid across resets; return empty so compartments[i]
+            // → NaN. W_DERIVED_CMT_RESET_ANALYTICAL in fit() explains why.
+            vec![vec![]; subject.obs_times.len()]
+        } else if subject.has_tv_covariates() {
+            // Superposition would use baseline pk_params while ipred honours per-event
+            // TV parameters — mismatched states would be silently wrong.
+            // W_DERIVED_CMT_TV_ANALYTICAL in fit() explains why.
+            vec![vec![]; subject.obs_times.len()]
+        } else {
+            let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+            predict_all_states(model.pk_model, subject, &pk)
+        };
+        (ipred, states)
+    }
 }
 
 /// Compute predictions for all observation times of a subject.

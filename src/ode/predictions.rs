@@ -1252,6 +1252,17 @@ pub fn ode_predictions_with_states(
 ///
 /// Called post-fit for TV-covariate ODE models to populate
 /// `SubjectResult::compartment_states`.
+///
+/// # Approximation for TV-covariate subjects
+///
+/// `ipred` is exact (the event-driven path uses per-event PK parameters). The
+/// compartment `states`, however, are derived from a second pass via
+/// [`ode_dense_solve_states`] using **the first observation's PK parameters held
+/// fixed** for the entire timeline. For subjects with genuinely time-varying
+/// covariates (CL, V, etc. changing between observations) the states will be
+/// approximate. `fit()` emits `W_DERIVED_CMT_TV_ODE` to alert users to this
+/// limitation. For reset-only subjects (no TV covariates) `pk_at_obs` is
+/// uniformly filled, so using the first entry is exact.
 pub fn ode_predictions_event_driven_with_states(
     ode: &OdeSpec,
     subject: &Subject,

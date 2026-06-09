@@ -1582,3 +1582,214 @@ fn ode_integral_over_compartment_with_evid4_reset() {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bug regression: out-of-range compartments[i] must return NaN, not 0.0
+// Before the fix, `build_derived_vars` only pre-seeded 0..n_expected with NaN;
+// indices beyond n_expected fell through to eval_expression's unwrap_or(0.0).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `compartments[8]` on a 1-cpt model (which has only 1 compartment) must
+/// produce NaN — not 0.0 (which looks like an empty compartment and is wrong).
+#[test]
+fn out_of_range_compartment_index_returns_nan() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(2.0, 0.01, 50.0)
+  theta V(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V  = V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+  C_valid = compartments[0]
+  C_oor   = compartments[8]
+
+[fit_options]
+  method  = focei
+  maxiter = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    let pop = simple_iv_population();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    for sr in &result.subjects {
+        let c_valid = sr
+            .extra_columns
+            .iter()
+            .find(|(n, _)| n == "C_valid")
+            .expect("C_valid must exist");
+        let c_oor = sr
+            .extra_columns
+            .iter()
+            .find(|(n, _)| n == "C_oor")
+            .expect("C_oor must exist");
+
+        // C_valid should equal IPRED (not NaN)
+        for &v in &c_valid.1 {
+            assert!(
+                v.is_finite(),
+                "subject {}: C_valid (compartments[0]) should be finite, got {v}",
+                sr.id
+            );
+        }
+        // C_oor (out-of-range) must be NaN, not 0.0
+        for (j, &v) in c_oor.1.iter().enumerate() {
+            assert!(
+                v.is_nan(),
+                "subject {}: C_oor (compartments[8]) at obs {j} = {v:.6} — \
+                 expected NaN for out-of-range index; before the fix this returned 0.0",
+                sr.id
+            );
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bug regression: analytical model + EVID=3 reset + integral(compartments[i])
+// Before the fix, analytical_state_at_times was called even for reset subjects,
+// returning wrong superposition values instead of NaN.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Regression: analytical model + EVID=3 reset + `integral(compartments[0])`.
+///
+/// Before the fix the grid-integral path called `analytical_state_at_times`
+/// on the reset subject, which does plain superposition and returns ≈41 mg·h
+/// for the post-reset window [12, 24] — identical to the pre-fdbbc95 ODE bug.
+///
+/// After the fix, the analytical branch returns empty states for reset subjects,
+/// so the integral evaluates to NaN (< 2 grid-points inside the session window).
+///
+/// Also verifies that `W_DERIVED_CMT_RESET_ANALYTICAL` is emitted.
+#[test]
+fn analytical_integral_over_compartment_with_evid3_reset_returns_nan() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(2.0, 0.01, 50.0)
+  theta V(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD    ~ 0.25
+
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V  = V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[derived]
+  AUC_pre  = integral(compartments[0], from=0,  to=12, step=1.0)
+  AUC_post = integral(compartments[0], from=12, to=24, step=1.0)
+  C_cmt0   = compartments[0]
+
+[fit_options]
+  method   = focei
+  maxiter  = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    // Reuse the same EVID=3 population as the ODE regression test
+    let pop = {
+        let obs_times = vec![1.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0];
+        let n = obs_times.len();
+        Population {
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+            subjects: vec![Subject {
+                id: "1".into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times,
+                obs_raw_times: vec![],
+                observations: vec![8.2, 4.5, 2.0, 0.9, 0.05, 0.05, 0.05],
+                obs_cmts: vec![1; n],
+                covariates: HashMap::new(),
+                dose_covariates: vec![],
+                obs_covariates: vec![],
+                pk_only_times: vec![],
+                pk_only_covariates: vec![],
+                reset_times: vec![12.0],
+                cens: vec![0; n],
+                occasions: vec![],
+                dose_occasions: vec![],
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            }],
+        }
+    };
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    // W_DERIVED_CMT_RESET_ANALYTICAL must be emitted
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_DERIVED_CMT_RESET_ANALYTICAL")),
+        "expected W_DERIVED_CMT_RESET_ANALYTICAL warning; got: {:?}",
+        result.warnings
+    );
+
+    for sr in &result.subjects {
+        macro_rules! col {
+            ($name:expr) => {
+                sr.extra_columns
+                    .iter()
+                    .find(|(n, _)| n == $name)
+                    .unwrap_or_else(|| panic!("{} column must exist", $name))
+                    .1
+                    .as_slice()
+            };
+        }
+        let auc_pre_vals = col!("AUC_pre");
+        let auc_post_vals = col!("AUC_post");
+        let c_cmt0_vals = col!("C_cmt0");
+
+        // All per-obs compartment states must be NaN (analytical+reset → empty states)
+        for (j, &v) in c_cmt0_vals.iter().enumerate() {
+            assert!(
+                v.is_nan(),
+                "subject {}: C_cmt0[{j}] = {v:.6} — expected NaN for \
+                 analytical+reset subject (compartment states unsupported)",
+                sr.id
+            );
+        }
+
+        // AUC_pre and AUC_post must also be NaN (grid integral on empty states)
+        for (j, &v) in auc_pre_vals.iter().enumerate() {
+            assert!(
+                v.is_nan(),
+                "subject {}: AUC_pre[{j}] = {v:.6} — expected NaN; before the fix \
+                 this returned wrong superposition values (≈452 mg·h pre-reset)",
+                sr.id
+            );
+        }
+        for (j, &v) in auc_post_vals.iter().enumerate() {
+            assert!(
+                v.is_nan(),
+                "subject {}: AUC_post[{j}] = {v:.6} — expected NaN; before the fix \
+                 this returned ≈41 mg·h (reset ignored in analytical superposition)",
+                sr.id
+            );
+        }
+    }
+}

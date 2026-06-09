@@ -1788,6 +1788,13 @@ pub(crate) fn compute_extra_output_columns(
                                     subject,
                                     &grid_times,
                                 )
+                            } else if subject.has_resets() {
+                                // Analytical model + EVID=3/4 reset: superposition is invalid
+                                // across reset boundaries. Return empty so every grid point
+                                // evaluates to NaN, consistent with per-obs compartment_states
+                                // being empty for such subjects. W_DERIVED_CMT_RESET_ANALYTICAL
+                                // in fit_inner tells the user why.
+                                vec![]
                             } else {
                                 let pk_j = (model.pk_param_fn)(theta, eta_hat, grid_cov);
                                 crate::pk::analytical_state_at_times(
@@ -2442,6 +2449,21 @@ fn fit_inner(
                  (first-observation PK parameters used for the deterministic state \
                  pass; ipred is exact). Use compartments[i] results with care for \
                  those subjects."
+                    .to_string(),
+            );
+        }
+        // Analytical model with EVID=3/4 resets: superposition is invalid across
+        // reset boundaries. Per-obs compartment states are empty (→ NaN) and the
+        // grid-integral path also returns NaN for affected sessions.
+        // ODE models with resets are handled correctly (ode_dense_solve_states applies
+        // the reset as a break-point); this warning is analytical-only.
+        if model.ode_spec.is_none() && population.subjects.iter().any(|s| s.has_resets()) {
+            warnings.push(
+                "W_DERIVED_CMT_RESET_ANALYTICAL: analytical model with EVID=3/4 \
+                 reset events — compartment states and compartment-based integrals \
+                 are not available for subjects with resets; [derived] expressions \
+                 that reference compartments[i] evaluate to NaN for those subjects. \
+                 Use an ODE model if compartment states across resets are required."
                     .to_string(),
             );
         }

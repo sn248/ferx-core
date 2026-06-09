@@ -1921,15 +1921,15 @@ fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
     let mut vars: HashMap<String, f64> = HashMap::new();
 
     // Index-based compartment keys.
-    // Pre-populate all expected indices (0..n_names) with NaN so that when
-    // compartment_states is empty (IOV subjects, analytical TV-covariate subjects)
-    // the expression `compartments[i]` evaluates to NaN rather than the generic
-    // 0.0 undefined-variable fallback. Actual values then overwrite the NaN sentinels.
-    // Indices beyond n_names (out-of-range access) still fall back to 0.0 — those
-    // are user errors that the parser already blocks for Phase 1 (only literal indices,
-    // no dynamic indexing).
-    let n_expected = ctx.compartment_names.len();
-    for i in 0..n_expected {
+    // Pre-seed indices 0..MAX_CMT_SENTINEL with NaN so that:
+    //   a) valid indices with empty compartment_states (IOV, analytical TV-covariate,
+    //      analytical reset subjects) evaluate to NaN rather than 0.0, and
+    //   b) out-of-range accesses (e.g. compartments[5] on a 1-cpt model) also
+    //      produce NaN — 0.0 would silently look like an empty compartment.
+    // Actual values then overwrite the NaN sentinels for valid indices.
+    // MAX_CMT_SENTINEL is chosen to cover all practical PK/PBPK models.
+    const MAX_CMT_SENTINEL: usize = 64;
+    for i in 0..MAX_CMT_SENTINEL {
         vars.insert(format!("__cmt_{i}"), f64::NAN);
     }
     for (i, &v) in ctx.compartments.iter().enumerate() {
@@ -2172,6 +2172,25 @@ fn parse_derived_block(
     // Names that resolve to Variable (not Theta/Eta) at parse time; these are
     // looked up in the vars HashMap at closure-call time.
     const BUILTIN_SPECIALS: &[&str] = &["IPRED", "PRED", "DV", "TIME", "TAFD", "TAD", "MACHEPS"];
+
+    // Warn if any ODE state name collides with an individual parameter name.
+    // In build_derived_vars the priority order is: compartment state < indiv param,
+    // so the indiv param value would silently shadow the ODE state in [derived]
+    // expressions. E.g., an ODE state named `CL` would be masked by theta-based `CL`.
+    for state_name in ode_state_names {
+        if indiv_param_names
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(state_name))
+        {
+            parse_warnings.push(format!(
+                "W_DERIVED_CMT_NAME_SHADOWED: ODE state '{state_name}' has the same \
+                 name as an individual parameter; in [derived] expressions '{state_name}' \
+                 resolves to the individual parameter value, not the compartment state. \
+                 Rename the ODE state (e.g. 'A_{state_name}') or use compartments[i] \
+                 by index to access the state unambiguously."
+            ));
+        }
+    }
 
     for raw_line in lines {
         let line = if let Some(idx) = raw_line.find('#') {
@@ -15118,5 +15137,51 @@ CL V KA WT
         } else {
             panic!("expected PerRow derived kind");
         }
+    }
+
+    /// W_DERIVED_CMT_NAME_SHADOWED is emitted when an ODE state name collides
+    /// with an individual parameter name.  The warning fires at parse time so
+    /// the user is alerted before the fit runs.
+    #[test]
+    fn parse_derived_warns_when_ode_state_name_shadows_indiv_param() {
+        let model_str = "
+[parameters]
+  theta CL(2.0, 0.01, 50.0)
+  theta V(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.25
+
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V  = V
+
+[structural_model]
+  ode(states=[CL, central])
+
+[odes]
+  d/dt(CL)      = 0.0
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ additive(ADD)
+
+[derived]
+  obs = CL
+
+[fit_options]
+  method  = focei
+  maxiter = 1
+";
+        let model = parse_model_string(model_str).expect("model must parse");
+        let has_shadow_warning = model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("W_DERIVED_CMT_NAME_SHADOWED") && w.contains("'CL'"));
+        assert!(
+            has_shadow_warning,
+            "expected W_DERIVED_CMT_NAME_SHADOWED for ODE state 'CL' clashing with \
+             individual parameter 'CL'; got warnings: {:?}",
+            model.parse_warnings
+        );
     }
 }

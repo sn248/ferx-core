@@ -1920,12 +1920,20 @@ fn build_derived_filter_fn(cond: Condition) -> DerivedFilterFn {
 fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
     let mut vars: HashMap<String, f64> = HashMap::new();
 
-    // Index-based compartment keys use direct insert (before the closure below
-    // captures `vars`). They have the lowest priority: everything inserted by
-    // `insert_ci` below will overwrite any clash (rare for internal `__cmt_N`
-    // names — they cannot conflict with user-visible names).
+    // Index-based compartment keys.
+    // Pre-populate all expected indices (0..n_names) with NaN so that when
+    // compartment_states is empty (IOV, TV-covariate, EKF subjects) the
+    // expression `compartments[i]` evaluates to NaN rather than the generic
+    // 0.0 undefined-variable fallback. Actual values then overwrite the
+    // NaN sentinels. Indices beyond n_names (out-of-range access) still fall
+    // back to 0.0 — those are user errors that the parser already blocks for
+    // Phase 1 (only literal indices, no dynamic indexing).
+    let n_expected = ctx.compartment_names.len();
+    for i in 0..n_expected {
+        vars.insert(format!("__cmt_{i}"), f64::NAN);
+    }
     for (i, &v) in ctx.compartments.iter().enumerate() {
-        vars.insert(format!("__cmt_{i}"), v);
+        vars.insert(format!("__cmt_{i}"), v); // overwrite sentinel with actual
     }
 
     // Insert each name with original case AND uppercase + lowercase aliases so
@@ -1945,9 +1953,13 @@ fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
     };
 
     // Named compartment access — lowest priority among `insert_ci` inserts.
-    // Individual params, covariates, and built-ins below will overwrite any clash.
+    // Pre-insert NaN so unavailable states surface as NaN in [derived];
+    // individual params, covariates, and built-ins below overwrite any clash.
+    for name in ctx.compartment_names.iter() {
+        insert_ci(name, f64::NAN);
+    }
     for (name, &v) in ctx.compartment_names.iter().zip(ctx.compartments.iter()) {
-        insert_ci(name, v);
+        insert_ci(name, v); // overwrite sentinel with actual value
     }
 
     for (k, &v) in ctx.indiv_params.iter() {

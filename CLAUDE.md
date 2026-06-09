@@ -12,6 +12,10 @@ The R wrapper package lives at `../ferx-r` (sibling directory). The R package's 
 
 Note that ferx-r's **CI** does not get the change automatically: it builds from the ferx-core commit pinned in `ferx-r/src/rust/Cargo.lock` (the patch only applies locally). A ferx-r PR that needs a new ferx-core commit — e.g. a newly-`pub` API — must bump that lock, via `ferx-r/tools/update-ferx-core-lock.sh` (never a bare `cargo update`, which the patch will unpin). Otherwise CI fails with `error[E0603]: ... is private`.
 
+## Worktree isolation
+
+When working on a feature branch or any branch other than `main`, always use `EnterWorktree` at the start of the session. This prevents uncommitted WIP from one session contaminating another session on a different branch (a real problem when two chats share the same checkout directory).
+
 ## First-time setup
 
 After cloning, activate the shared pre-commit hook (blocks commits that fail `rustfmt`):

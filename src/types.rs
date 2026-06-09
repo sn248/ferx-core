@@ -1699,6 +1699,10 @@ pub type DerivedFilterFn = Box<dyn Fn(&DerivedContext<'_>) -> bool + Send + Sync
 pub struct DerivedExprSpec {
     pub name: String,
     pub kind: DerivedKind,
+    /// True if any sub-expression in `kind` references `compartments[i]` or a
+    /// named ODE state variable.  Used to gate `W_DERIVED_CMT_*` warnings so
+    /// they fire only when compartment states are actually requested.
+    pub uses_compartments: bool,
 }
 
 pub enum DerivedKind {

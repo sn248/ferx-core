@@ -2255,7 +2255,12 @@ fn parse_derived_block(
         }
 
         // ── Detect form ───────────────────────────────────────────────────────
-        let kind = if let Token::Ident(func_name) = &tokens[0] {
+        // `spec_uses_compartments` tracks whether this derived expression
+        // references compartments[i] or named ODE state variables anywhere.
+        // Propagated into `DerivedExprSpec::uses_compartments` so that the
+        // post-fit warning logic can gate on "compartments actually requested"
+        // rather than "any [derived] block exists".
+        let (kind, spec_uses_compartments) = if let Token::Ident(func_name) = &tokens[0] {
             let fname_lc = func_name.to_lowercase();
             if matches!(fname_lc.as_str(), "max" | "min" | "tmax" | "integral")
                 && tokens.get(1) == Some(&Token::LParen)
@@ -2285,7 +2290,15 @@ fn parse_derived_block(
                 let args = split_top_level_commas(interior);
 
                 if fname_lc == "integral" {
-                    parse_integral_kind(&args, ctx, parse_warnings)?
+                    let kind = parse_integral_kind(&args, ctx, parse_warnings)?;
+                    let uses = matches!(
+                        kind,
+                        DerivedKind::Integral {
+                            uses_compartments: true,
+                            ..
+                        }
+                    );
+                    (kind, uses)
                 } else {
                     // max / min / tmax
                     let agg_fn = match fname_lc.as_str() {
@@ -2297,35 +2310,50 @@ fn parse_derived_block(
                     let value_tokens = args.first().copied().unwrap_or(&[]);
                     let filter_tokens = if args.len() >= 2 { Some(args[1]) } else { None };
                     let value_expr = parse_derived_expr(value_tokens, ctx)?;
-                    let filter = if let Some(ft) = filter_tokens {
+                    let value_uses = expr_refs_compartments(&value_expr, ctx.ode_state_names);
+                    let (filter, filter_uses) = if let Some(ft) = filter_tokens {
                         let cond = parse_derived_cond(ft, ctx)?;
-                        Some(build_derived_filter_fn(cond))
+                        let uses = cond_refs_compartments(&cond, ctx.ode_state_names);
+                        (Some(build_derived_filter_fn(cond)), uses)
                     } else {
-                        None
+                        (None, false)
                     };
-                    DerivedKind::Aggregate {
+                    let kind = DerivedKind::Aggregate {
                         func: agg_fn,
                         value: build_derived_eval_fn(value_expr),
                         filter,
-                    }
+                    };
+                    (kind, value_uses || filter_uses)
                 }
             } else {
                 // Plain expression → PerRow
                 let expr = parse_derived_expr(&tokens, ctx)?;
-                DerivedKind::PerRow {
-                    eval: build_derived_eval_fn(expr),
-                }
+                let uses = expr_refs_compartments(&expr, ctx.ode_state_names);
+                (
+                    DerivedKind::PerRow {
+                        eval: build_derived_eval_fn(expr),
+                    },
+                    uses,
+                )
             }
         } else {
             // Starts with a literal or unary minus
             let expr = parse_derived_expr(&tokens, ctx)?;
-            DerivedKind::PerRow {
-                eval: build_derived_eval_fn(expr),
-            }
+            let uses = expr_refs_compartments(&expr, ctx.ode_state_names);
+            (
+                DerivedKind::PerRow {
+                    eval: build_derived_eval_fn(expr),
+                },
+                uses,
+            )
         };
 
         defined_derived.push(name.clone());
-        specs.push(DerivedExprSpec { name, kind });
+        specs.push(DerivedExprSpec {
+            name,
+            kind,
+            uses_compartments: spec_uses_compartments,
+        });
     }
 
     Ok(specs)

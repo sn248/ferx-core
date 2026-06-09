@@ -1414,12 +1414,171 @@ fn ode_integral_over_compartment_with_evid3_reset() {
         for (j, &v) in c_cmt0_vals.iter().enumerate().skip(n.saturating_sub(3)) {
             assert!(
                 v.is_finite() && v < 0.5,
-                "subject {}: C_cmt0 at obs {} (t={}) = {v:.6} — \
+                "subject {}: C_cmt0 at obs {} (ipred={:.6}) = {v:.6} — \
                  expected ≈0 after EVID=3 reset at t=12",
                 sr.id,
                 j,
                 sr.ipred.get(j).copied().unwrap_or(f64::NAN)
             );
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EVID=4 (reset + re-dose) regression
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn evid4_reset_population() -> Population {
+    // Session 0: 100 mg IV dose at t=0; obs at t=1,4,8,12.
+    // Session 1: 50 mg IV re-dose at t=12 (EVID=4: reset + dose); obs at t=16,20,24.
+    let obs_times = vec![1.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0];
+    let n = obs_times.len();
+    Population {
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 50.0, 1, 0.0, false, 0.0), // re-dose
+            ],
+            obs_times,
+            obs_raw_times: vec![],
+            // Session 0 DV ≈ monoexponential decay from 100 mg.
+            // Session 1 DV > 0 because a 50 mg dose fires at t=12.
+            observations: vec![8.2, 4.5, 2.0, 0.9, 4.0, 2.2, 1.1],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: vec![],
+            obs_covariates: vec![],
+            pk_only_times: vec![],
+            pk_only_covariates: vec![],
+            reset_times: vec![12.0], // EVID=4 reset at t=12 (re-dose also fires)
+            cens: vec![0; n],
+            occasions: vec![],
+            dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }],
+    }
+}
+
+/// Regression for fdbbc95 — `ode_dense_solve_states` with EVID=4 (reset + re-dose).
+///
+/// An EVID=4 at t=12 zeros all ODE compartments *and* fires a 50 mg dose.
+/// Unlike EVID=3, `AUC_post` must be substantially > 0 because the new dose
+/// contributes.  `AUC_post` should also be < `AUC_pre` because the re-dose
+/// is only 50 mg (half the initial 100 mg).
+///
+/// At initial parameters (CL=2 L/h, V=10 L, ke=0.2 h⁻¹):
+///   AUC_pre  (grid [0..12],  step=1)  ≈ 452 mg·h
+///   AUC_post (grid [12..24], step=1)  ≈ 226 mg·h  (≈ AUC_pre / 2, dose halved)
+#[test]
+fn ode_integral_over_compartment_with_evid4_reset() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(2.0, 0.01, 50.0)
+  theta V(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.25
+
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V  = V
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ additive(ADD)
+
+[derived]
+  AUC_pre  = integral(compartments[0], from=0,  to=12, step=1.0)
+  AUC_post = integral(compartments[0], from=12, to=24, step=1.0)
+
+[fit_options]
+  method   = focei
+  maxiter  = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    let pop = evid4_reset_population();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    for sr in &result.subjects {
+        macro_rules! col {
+            ($name:expr) => {
+                sr.extra_columns
+                    .iter()
+                    .find(|(n, _)| n == $name)
+                    .unwrap_or_else(|| panic!("{} column must exist", $name))
+                    .1
+                    .as_slice()
+            };
+        }
+        let auc_pre_vals = col!("AUC_pre");
+        let auc_post_vals = col!("AUC_post");
+
+        // ── Session 0 (t ≤ 12) — AUC_pre is finite ───────────────────────
+        let auc_pre_finite: Vec<f64> = auc_pre_vals
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .collect();
+        assert!(
+            !auc_pre_finite.is_empty(),
+            "subject {}: at least one finite AUC_pre expected",
+            sr.id
+        );
+        for &v in &auc_pre_finite {
+            assert!(
+                v > 50.0,
+                "subject {}: AUC_pre = {v:.2} — unexpectedly small; \
+                 expected >50 mg·h for 100 mg dose integral over [0,12]",
+                sr.id
+            );
+        }
+
+        // ── Session 1 (t > 12) — AUC_post must be > 0 (new 50 mg dose) ──
+        let auc_post_finite: Vec<f64> = auc_post_vals
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .collect();
+        assert!(
+            !auc_post_finite.is_empty(),
+            "subject {}: at least one finite AUC_post expected (EVID=4 re-dose should \
+             give positive integral)",
+            sr.id
+        );
+        for &v in &auc_post_finite {
+            assert!(
+                v > 10.0,
+                "subject {}: AUC_post = {v:.4} — after EVID=4 reset a 50 mg re-dose \
+                 fires; expected AUC_post > 10 mg·h, got ≈0 (reset not applied?)",
+                sr.id
+            );
+            // AUC_post must be < AUC_pre (50 mg vs 100 mg dose, same PK)
+            for &pre in &auc_pre_finite {
+                assert!(
+                    v < pre,
+                    "subject {}: AUC_post ({v:.2}) ≥ AUC_pre ({pre:.2}) — re-dose is \
+                     half the initial dose so post-reset AUC should be smaller",
+                    sr.id
+                );
+            }
         }
     }
 }

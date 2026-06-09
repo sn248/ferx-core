@@ -2407,7 +2407,9 @@ fn fit_inner(
 
     // Warn when [derived] expressions that reference compartments[i] will
     // silently evaluate to NaN due to unsupported model/subject configurations.
-    if !model.derived_exprs.is_empty() {
+    // Gate on `uses_compartments` so that a `[derived]` block with only IPRED/DV
+    // integrals (no compartment references) does not emit spurious CMT warnings.
+    if model.derived_exprs.iter().any(|s| s.uses_compartments) {
         // IOV (kappa) subjects: the predict_iov path does not compute compartment
         // states — they stay as vec![] so compartments[i] yields NaN.
         if result.kappas.iter().any(|ks| !ks.is_empty()) {
@@ -5855,6 +5857,7 @@ mod tests_derived_session_clock {
             kind: DerivedKind::PerRow {
                 eval: Box::new(|ctx: &DerivedContext| ctx.time),
             },
+            uses_compartments: false,
         }];
         let model = minimal_model(derived_exprs);
         let subject = two_session_subject();
@@ -5896,6 +5899,7 @@ mod tests_derived_session_clock {
                 value: Box::new(|ctx: &DerivedContext| ctx.ipred),
                 filter: None,
             },
+            uses_compartments: false,
         }];
         let model = minimal_model(derived_exprs);
         let subject = two_session_subject();
@@ -5942,6 +5946,7 @@ mod tests_derived_session_clock {
                 window: IntegralWindow::Explicit { from: 0.0, to: 4.0 },
                 step: IntegralStep::ObsTimes,
             },
+            uses_compartments: false,
         }];
         let model = minimal_model(derived_exprs);
         let subject = two_session_subject();
@@ -5992,6 +5997,7 @@ mod tests_derived_session_clock {
                 },
                 step: IntegralStep::ObsTimes,
             },
+            uses_compartments: false,
         }];
         let model = minimal_model(derived_exprs);
         let subject = two_session_subject();
@@ -6032,6 +6038,7 @@ mod tests_derived_session_clock {
                 window: IntegralWindow::Explicit { from: 0.0, to: 4.0 },
                 step: IntegralStep::ObsTimes,
             },
+            uses_compartments: false,
         }];
         let model = minimal_model(derived_exprs);
         let subject = Subject {

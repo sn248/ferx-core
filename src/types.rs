@@ -1827,12 +1827,21 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || lower.contains("no multi-start run converged")
     {
         (WarningSeverity::Critical, "convergence")
-    } else if lower.contains("covariance step failed") || lower.contains("covariance failed") {
-        // "ses not available" and "se not available" intentionally omitted:
-        // the only emitter ("Covariance step failed — SEs not available") already
-        // hits "covariance step failed" above, and bare "se not available" is too
-        // broad to safely match future messages.
+    } else if lower.contains("covariance step failed")
+        || lower.contains("covariance failed")
+        || (lower.contains("covariance step") && lower.contains("not positive definite"))
+    {
+        // "ses not available" intentionally omitted — too broad.
+        // The compound check catches format_non_pd_warning ("Covariance step:
+        // Hessian is not positive definite") whose prefix differs from "failed:"
+        // messages. It must be compound so that "SIR failed: covariance not
+        // positive definite" (no "covariance step" token) still routes to "sir".
         (WarningSeverity::Critical, "covariance_step")
+    } else if lower.contains("covariance step regularized") {
+        // Regularisation warning — SEs may be degraded but are present.
+        // Severity within the message (minor/moderate/severe) informs guidance;
+        // the category is always covariance_step.
+        (WarningSeverity::Warning, "covariance_step")
     } else if lower.contains("ill-conditioned") || lower.contains("condition number") {
         (WarningSeverity::Critical, "condition_number")
     } else if lower.contains("trust radius") || lower.contains("degenerate") {
@@ -3081,9 +3090,67 @@ mod tests {
                 Info,
                 "covariance_step",
             ),
+            // format_non_pd_warning path (NonPdHessian variant).
+            (
+                "Covariance step: Hessian is not positive definite. \
+                 Eigenvalues: [8.4000, 2.1000, -0.0100]. SE estimates not available.",
+                Critical,
+                "covariance_step",
+            ),
+            // Covariance step regularised — present in all three severity tiers.
+            (
+                "Covariance step regularized: eigenvalue floor applied to FD Hessian \
+                 (1 of 3 free-block eigenvalues clipped; min eig = 1.2e-6, floor = 8.4e-14; \
+                 severity: minor). Standard errors are likely reliable.",
+                Warning,
+                "covariance_step",
+            ),
+            (
+                "Covariance step regularized: eigenvalue floor applied to FD Hessian \
+                 (3 of 5 free-block eigenvalues clipped; min eig = 1.2e-6, floor = 8.4e-14; \
+                 severity: severe). Standard errors are likely unreliable; \
+                 SIR-based confidence intervals are recommended.",
+                Warning,
+                "covariance_step",
+            ),
+            // Unusable messages introduced in commit 2.
+            (
+                "Covariance step failed: base OFV is non-finite at convergence \
+                 (likely numerical overflow or underflow in model evaluation). \
+                 SE estimates not available.",
+                Critical,
+                "covariance_step",
+            ),
+            (
+                "Covariance step failed: Hessian has ill-conditioned entries for the \
+                 following parameter(s) — theta[CL] (non-finite diagonal); \
+                 sigma[1] (non-finite off-diagonal). SE estimates not available.",
+                Critical,
+                "covariance_step",
+            ),
+            (
+                "Covariance step failed: Omega matrix is not positive definite at \
+                 convergence (min eigenvalue = 1.2e-10; eigenvalues: [0.5000, 1.2e-10]). \
+                 SE estimates not available.",
+                Critical,
+                "covariance_step",
+            ),
+            // SIR message that also contains "not positive definite" — must
+            // still route to "sir", NOT to covariance_step.
+            (
+                "SIR failed: covariance not positive definite",
+                Warning,
+                "sir",
+            ),
             // -- chain-prefixed (multi-stage) -----------------------------
             (
                 "[FOCEI] Covariance step failed",
+                Critical,
+                "covariance_step",
+            ),
+            (
+                "[FOCEI] Covariance step: Hessian is not positive definite. \
+                 Eigenvalues: [2.1000, -0.0100]. SE estimates not available.",
                 Critical,
                 "covariance_step",
             ),

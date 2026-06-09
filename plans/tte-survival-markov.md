@@ -1,8 +1,8 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Status:** Phase 1 wiring complete — ferx-core PR #192 ready to merge; ferx-r PR #134 (Draft) unblocks on #192 merge  
+**Status:** Phase 1 complete — PR #192 merged; PR #206 (follow-up + bug fixes) ready to merge; ferx-r `feat/tte-reader-routing` unblocks after #206 merge  
 **Scope:** Active implementation — code changes underway  
-**Revised:** 2026-06-08 (Phase 1 wiring PRs complete)
+**Revised:** 2026-06-09 (PR #206 ready to merge)
 
 ---
 
@@ -2083,8 +2083,11 @@ treated as bugs:
 **Scope:** Exponential, Weibull, and Gompertz; fixed and random hazard parameters; FOCEI
 Laplace; right-censored, interval-censored, and **left-truncated (delayed entry)**; no PK.
 
-**Status: wiring complete.** PR #190 merged the infrastructure scaffold; PR #192 wires it
-end-to-end and is ready to merge. ferx-r PR #134 (Draft) unblocks immediately after.
+**Status: wiring complete; follow-up pending merge.** PR #190 merged the infrastructure
+scaffold; PR #192 (wiring) merged to main (2026-06-06). PR #206 (follow-up: optional blocks
+for TTE-only models, covariate tracking, simulated datasets, warning + BIC fixes) is open and
+ready to merge. ferx-r `feat/tte-reader-routing` (routing all callsites through
+`read_population_for`) unblocks immediately after PR #206 merges.
 
 #### Done — PR #190 (infrastructure scaffold)
 
@@ -2104,7 +2107,7 @@ end-to-end and is ready to merge. ferx-r PR #134 (Draft) unblocks immediately af
 - ✅ Reference files: `tests/reference/tte_exponential/`, `tte_weibull/`, `tte_gompertz/`
   (simulate.R, nlmixr2.R, nonmem.ctl, expected.md for each)
 
-#### Done — PR #192 (wiring, ready to merge)
+#### Done — PR #192 (wiring, merged 2026-06-06)
 
 **Parser (`src/parser/model_parser.rs`):**
 - ✅ `[event_model]` block parsing — `param_fn` closure for Exponential, Weibull, Gompertz;
@@ -2154,7 +2157,38 @@ end-to-end and is ready to merge. ferx-r PR #134 (Draft) unblocks immediately af
 - ✅ `examples/tte_weibull.ferx`, `examples/tte_gompertz.ferx` (clean TTE-only syntax)
 - ✅ `data/tte_exponential.csv` (30-subject simulated dataset)
 
-#### Remaining — follow-up after #205 merges
+#### Done — PR #206 (follow-up, ready to merge)
+
+**Parser / DSL:**
+- ✅ `[individual_parameters]`, `[structural_model]`, `[error_model]` blocks optional when
+  `[event_model]` is the sole endpoint — TTE-only `.ferx` files parse and fit without them
+- ✅ Covariate names referenced inside `[event_model]` expressions propagated into
+  `CompiledModel.referenced_covariates` — `event_model_covariate_names_tracked` test
+- ✅ False "parameter not referenced in [individual_parameters]" warnings suppressed for
+  TTE-only models (`check_unused_parameters` early-returns when `has_event_model && indiv_stmts.is_empty()`)
+
+**Estimation / API:**
+- ✅ BIC finite for TTE-only models — `n_for_bic` uses TTE `obs_records` count when
+  `n_obs == 0`; prevents `ln(0) = -inf`
+- ✅ SAEM TTE smoke test (`tte_fit_saem_3iter`) — covers `method = saem` with `[event_model]`
+
+**Examples + data:**
+- ✅ `data/tte_weibull.csv` (30-subject simulated Weibull dataset)
+- ✅ `data/tte_gompertz.csv` (50-subject, BSV on gamma, 80 h censoring, 42/50 events)
+- ✅ `examples/tte_gompertz.ferx` redesigned — BSV on gamma (not alpha) for clean recovery;
+  TVALPHA=0.002038, TVGAMMA=0.051491 vs truth 0.002/0.05; collinearity note in header comment
+
+**Code quality:**
+- ✅ `foce_subject_nll_interaction_with_tte` refactored — `gaussian_foce_accum` helper
+  eliminates the duplicated inner loop from both FOCE functions
+
+**ferx-r:**
+- ✅ `r.dv_sim` → `r.outcome.continuous_value()` migration — ferx-r PR #132 (merged)
+- ✅ TTE datareader routing — ferx-r `feat/tte-reader-routing` branch (two commits:
+  `8bf4c6d` routes all reader callsites through `read_population_for`; `61c4698` Cargo pin);
+  **opens as PR after #206 merges** (run `tools/update-ferx-core-lock.sh` to bump Cargo pin first)
+
+#### Remaining — after PR #206 merges
 
 **Estimation:**
 - ❌ Tier 3 convergence tests (`tests/tte_convergence.rs`, gated `slow-tests`)
@@ -2166,16 +2200,8 @@ end-to-end and is ready to merge. ferx-r PR #134 (Draft) unblocks immediately af
   evaluates in theta/eta/covariate namespace only; documented with Note callout; fix requires
   threading individual_parameters evaluator into `parse_event_model_block`
 
-**Code quality:**
-- ✅ `foce_subject_nll_interaction_with_tte` refactored — `gaussian_foce_accum` helper
-  eliminates the duplicated inner loop from both FOCE functions
-
 **ferx-r:**
-- ✅ `r.dv_sim` → `r.outcome.continuous_value()` migration — ferx-r PR #132 (merged)
-- ✅ TTE datareader routing — ferx-r PR #134 (Draft; unblocks on #192 merge)
-  — `ferx_rust_fit` 4-way dispatch → `read_population_for`; all 5 simulate/predict
-  helpers updated; also fixes pre-existing covariates+filter gap in `ferx_rust_fit`
-- ❌ `predict_survival` R wrapper (now unblocked — median/mean fields added)
+- ❌ `predict_survival` R wrapper (unblocked once #206 + `feat/tte-reader-routing` merge)
 - ❌ R-side end-to-end TTE test (Tier 2: parse model with `[event_model]`, read CSV,
   verify `obs_records` populated, OFV finite)
 

@@ -2653,12 +2653,10 @@ mod tests {
                 approx::relative_eq!(preds_ws[j], preds_ref[j], max_relative = 1e-6),
                 "ipred diverges at t={t} — TAD anchor mismatch for SS dose"
             );
-            // For a 1-cpt ODE the state is amount A = C * V = ipred * V.
-            // (We have one dose at t=0 with no repeat; the ODE just decays from
-            //  the SS initial condition, so the amount at time t is ipred(t) * V.)
+            // For ObsCmt(0) readout, ipred == u[0] == state[0], so they must agree.
             assert!(
-                approx::relative_eq!(states[j][0], preds_ws[j] * v, max_relative = 1e-6),
-                "state != ipred*V at t={t} — state not self-consistent with ipred"
+                approx::relative_eq!(states[j][0], preds_ws[j], max_relative = 1e-9),
+                "state != ipred at t={t} — state not self-consistent with ipred"
             );
         }
     }

@@ -2009,6 +2009,13 @@ pub(crate) fn compute_covariance(
 ) -> CovarianceStepResult {
     let n = x_hat.len();
     let eps = options.fd_hessian_step;
+    if eps <= 0.0 || !eps.is_finite() {
+        return CovarianceStepResult::Unusable(format!(
+            "Covariance step failed: fd_hessian_step must be positive and finite, got {}. \
+             SE estimates not available.",
+            eps
+        ));
+    }
 
     // OFV for covariance step: includes explicit Omega terms (log|Omega| + eta'*Omega_inv*eta)
     // so the Hessian is sensitive to Omega parameters.

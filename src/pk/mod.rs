@@ -577,12 +577,114 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
 fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParams) -> Vec<f64> {
     let cl = p.cl();
     let v = p.v();
+    let infusion = dose.is_infusion();
+
+    // SS early-exit: mirrors single_dose_concentration's top-level guard.
+    //
+    // Peripheral and depot helpers (two_cpt_iv_peripheral, two_cpt_oral_peripheral,
+    // three_cpt_iv_peripherals, three_cpt_oral_peripherals, one_cpt_oral_depot) all
+    // handle SS internally via their own `dose.ss && dose.ii > 0.0` checks, so they
+    // are called with the same arguments regardless of SS — the correct SS value is
+    // returned automatically. Only the *central* concentration functions need explicit
+    // SS dispatch here (they lack the internal guard in their non-SS variants).
+    if dose.ss && dose.ii > 0.0 {
+        match pk_model {
+            PkModel::OneCptIv => {
+                let c = if infusion {
+                    one_cpt_infusion_ss(dose, tau, cl, v)
+                } else {
+                    one_cpt_iv_bolus_ss(dose, tau, cl, v)
+                };
+                return vec![c];
+            }
+            PkModel::OneCptOral => {
+                // one_cpt_oral_depot handles SS internally.
+                let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
+                let central = one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio());
+                return vec![depot, central];
+            }
+            PkModel::TwoCptIv => {
+                let central = if infusion {
+                    two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2())
+                } else {
+                    two_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2())
+                };
+                // two_cpt_iv_peripheral handles SS internally.
+                let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
+                return vec![central, periph];
+            }
+            PkModel::TwoCptOral => {
+                if infusion {
+                    // Infusions bypass depot; treat as 2-cpt IV SS infusion.
+                    let c = two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2());
+                    let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
+                    return vec![0.0, c, periph];
+                } else {
+                    // Depot and peripheral handle SS internally.
+                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
+                    let central =
+                        two_cpt_oral_f_ss(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
+                    let periph =
+                        two_cpt_oral_peripheral(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
+                    return vec![depot, central, periph];
+                }
+            }
+            PkModel::ThreeCptIv => {
+                let central = if infusion {
+                    three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+                } else {
+                    three_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+                };
+                // three_cpt_iv_peripherals handles SS internally.
+                let [p1, p2] =
+                    three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+                return vec![central, p1, p2];
+            }
+            PkModel::ThreeCptOral => {
+                if infusion {
+                    // Infusions bypass depot; treat as 3-cpt IV SS infusion.
+                    let c = three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+                    let [p1, p2] =
+                        three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+                    return vec![0.0, c, p1, p2];
+                } else {
+                    // Depot and peripherals handle SS internally.
+                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
+                    let central = three_cpt_oral_f_ss(
+                        dose,
+                        tau,
+                        cl,
+                        v,
+                        p.q(),
+                        p.v2(),
+                        p.q3(),
+                        p.v3(),
+                        p.ka(),
+                        p.f_bio(),
+                    );
+                    let [p1, p2] = three_cpt_oral_peripherals(
+                        dose,
+                        tau,
+                        cl,
+                        v,
+                        p.q(),
+                        p.v2(),
+                        p.q3(),
+                        p.v3(),
+                        p.ka(),
+                        p.f_bio(),
+                    );
+                    return vec![depot, central, p1, p2];
+                }
+            }
+        }
+    }
+
+    // Non-SS path.
     match pk_model {
         PkModel::OneCptIv => {
-            let c = if dose.is_infusion() {
+            let c = if infusion {
                 one_cpt_infusion(dose, tau, cl, v)
-            } else if dose.ss && dose.ii > 0.0 {
-                one_cpt_iv_bolus_ss(dose, tau, cl, v)
             } else {
                 one_cpt_iv_bolus(dose, tau, cl, v)
             };
@@ -594,10 +696,8 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
             vec![depot, central]
         }
         PkModel::TwoCptIv => {
-            let central = if dose.is_infusion() {
+            let central = if infusion {
                 two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
-            } else if dose.ss && dose.ii > 0.0 {
-                two_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2())
             } else {
                 two_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2())
             };
@@ -605,7 +705,7 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
             vec![central, periph]
         }
         PkModel::TwoCptOral => {
-            if dose.is_infusion() {
+            if infusion {
                 // Infusions bypass depot; treat as 2-cpt IV
                 let c = two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2());
                 let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
@@ -619,10 +719,8 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
             }
         }
         PkModel::ThreeCptIv => {
-            let central = if dose.is_infusion() {
+            let central = if infusion {
                 three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-            } else if dose.ss && dose.ii > 0.0 {
-                three_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
             } else {
                 three_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
             };
@@ -631,7 +729,7 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
             vec![central, p1, p2]
         }
         PkModel::ThreeCptOral => {
-            if dose.is_infusion() {
+            if infusion {
                 let c = three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
                 let [p1, p2] =
                     three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
@@ -1891,5 +1989,140 @@ mod tests {
                 obs_times[i]
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for single_dose_states SS dispatch
+    // -----------------------------------------------------------------------
+
+    /// Bug regression: single_dose_states must use the SS formula for the
+    /// central compartment when dose.ss = true.  Before the fix, oral and
+    /// IV-infusion SS doses fell through to single-dose formulas, returning
+    /// concentrations that were typically 5-15× too low at trough.
+    ///
+    /// For each model the test checks that the SS central state matches
+    /// single_dose_concentration (the long-standing, validated scalar path).
+    #[test]
+    fn single_dose_states_central_matches_concentration_for_ss_doses() {
+        use crate::pk::{
+            one_cpt_infusion_ss, one_cpt_iv_bolus_ss, one_cpt_oral_f_ss, two_cpt_infusion_ss,
+            two_cpt_iv_bolus_ss, two_cpt_oral_f_ss,
+        };
+        // --- helpers ---
+        fn bolus_ss(amt: f64, ii: f64) -> DoseEvent {
+            DoseEvent::new(0.0, amt, 1, 0.0, true, ii)
+        }
+        fn infusion_ss(amt: f64, rate: f64, ii: f64) -> DoseEvent {
+            DoseEvent::new(0.0, amt, 1, rate, true, ii)
+        }
+
+        let cl = 5.0_f64;
+        let v = 80.0_f64;
+        let q = 2.0_f64;
+        let v2 = 40.0_f64;
+        let ka = 1.0_f64;
+        let f_bio = 1.0_f64;
+        let ii = 24.0_f64;
+        let amt = 100.0_f64;
+        let rate = 50.0_f64; // 2 h infusion
+        let tau = 6.0_f64;
+
+        let mut p1iv = PkParams::default();
+        p1iv.values[crate::types::PK_IDX_CL] = cl;
+        p1iv.values[crate::types::PK_IDX_V] = v;
+
+        let mut p1oral = PkParams::default();
+        p1oral.values[crate::types::PK_IDX_CL] = cl;
+        p1oral.values[crate::types::PK_IDX_V] = v;
+        p1oral.values[crate::types::PK_IDX_KA] = ka;
+        p1oral.values[crate::types::PK_IDX_F] = f_bio;
+
+        let mut p2iv = PkParams::default();
+        p2iv.values[crate::types::PK_IDX_CL] = cl;
+        p2iv.values[crate::types::PK_IDX_V] = v;
+        p2iv.values[crate::types::PK_IDX_Q] = q;
+        p2iv.values[crate::types::PK_IDX_V2] = v2;
+
+        let mut p2oral = PkParams::default();
+        p2oral.values[crate::types::PK_IDX_CL] = cl;
+        p2oral.values[crate::types::PK_IDX_V] = v;
+        p2oral.values[crate::types::PK_IDX_Q] = q;
+        p2oral.values[crate::types::PK_IDX_V2] = v2;
+        p2oral.values[crate::types::PK_IDX_KA] = ka;
+        p2oral.values[crate::types::PK_IDX_F] = f_bio;
+
+        // OneCptIv SS bolus — central index 0
+        let d = bolus_ss(amt, ii);
+        let states = single_dose_states(PkModel::OneCptIv, &d, tau, &p1iv);
+        let expected = one_cpt_iv_bolus_ss(&d, tau, cl, v);
+        assert!(
+            approx::relative_eq!(states[0], expected, max_relative = 1e-9),
+            "OneCptIv SS bolus: central mismatch"
+        );
+
+        // OneCptIv SS infusion — was using non-SS formula before fix
+        let d = infusion_ss(amt, rate, ii);
+        let states = single_dose_states(PkModel::OneCptIv, &d, tau, &p1iv);
+        let expected = one_cpt_infusion_ss(&d, tau, cl, v);
+        assert!(
+            approx::relative_eq!(states[0], expected, max_relative = 1e-9),
+            "OneCptIv SS infusion: central mismatch"
+        );
+
+        // OneCptOral SS bolus — was using one_cpt_oral_f (non-SS) before fix
+        let d = bolus_ss(amt, ii);
+        let states = single_dose_states(PkModel::OneCptOral, &d, tau, &p1oral);
+        let expected = one_cpt_oral_f_ss(&d, tau, cl, v, ka, f_bio);
+        assert!(
+            approx::relative_eq!(states[1], expected, max_relative = 1e-9),
+            "OneCptOral SS: central (index 1) mismatch"
+        );
+
+        // TwoCptIv SS bolus
+        let d = bolus_ss(amt, ii);
+        let states = single_dose_states(PkModel::TwoCptIv, &d, tau, &p2iv);
+        let expected = two_cpt_iv_bolus_ss(&d, tau, cl, v, q, v2);
+        assert!(
+            approx::relative_eq!(states[0], expected, max_relative = 1e-9),
+            "TwoCptIv SS bolus: central mismatch"
+        );
+
+        // TwoCptIv SS infusion — was using two_cpt_infusion (non-SS) before fix
+        let d = infusion_ss(amt, rate, ii);
+        let states = single_dose_states(PkModel::TwoCptIv, &d, tau, &p2iv);
+        let expected = two_cpt_infusion_ss(&d, tau, cl, v, q, v2);
+        assert!(
+            approx::relative_eq!(states[0], expected, max_relative = 1e-9),
+            "TwoCptIv SS infusion: central mismatch"
+        );
+
+        // TwoCptOral SS bolus — was using two_cpt_oral_f (non-SS) before fix
+        let d = bolus_ss(amt, ii);
+        let states = single_dose_states(PkModel::TwoCptOral, &d, tau, &p2oral);
+        let expected = two_cpt_oral_f_ss(&d, tau, cl, v, q, v2, ka, f_bio);
+        assert!(
+            approx::relative_eq!(states[1], expected, max_relative = 1e-9),
+            "TwoCptOral SS bolus: central (index 1) mismatch"
+        );
+
+        // TwoCptOral SS infusion central — was using two_cpt_infusion (non-SS) before fix
+        let d = infusion_ss(amt, rate, ii);
+        let states = single_dose_states(PkModel::TwoCptOral, &d, tau, &p2oral);
+        let expected = two_cpt_infusion_ss(&d, tau, cl, v, q, v2);
+        assert!(
+            approx::relative_eq!(states[1], expected, max_relative = 1e-9),
+            "TwoCptOral SS infusion: central (index 1) mismatch"
+        );
+
+        // SS states must exceed single-dose states (accumulation guard).
+        let d_single = DoseEvent::new(0.0, amt, 1, 0.0, false, 0.0);
+        let states_ss = single_dose_states(PkModel::OneCptOral, &bolus_ss(amt, ii), tau, &p1oral);
+        let states_sd = single_dose_states(PkModel::OneCptOral, &d_single, tau, &p1oral);
+        assert!(
+            states_ss[1] > states_sd[1],
+            "SS central must be > single-dose central (accumulation): ss={} sd={}",
+            states_ss[1],
+            states_sd[1]
+        );
     }
 }

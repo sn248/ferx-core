@@ -1927,8 +1927,12 @@ fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
     //   b) out-of-range accesses (e.g. compartments[5] on a 1-cpt model) also
     //      produce NaN — 0.0 would silently look like an empty compartment.
     // Actual values then overwrite the NaN sentinels for valid indices.
-    // MAX_CMT_SENTINEL is chosen to cover all practical PK/PBPK models.
-    const MAX_CMT_SENTINEL: usize = 64;
+    // MAX_CMT_SENTINEL is chosen to cover all practical PK/PBPK models
+    // (largest published PBPK has ~30 compartments; 256 leaves generous headroom).
+    // Any access compartments[i] for i ≥ actual n_states but i < MAX_CMT_SENTINEL
+    // returns NaN; without this sentinel the HashMap miss returns 0.0, which
+    // silently looks like an empty compartment.
+    const MAX_CMT_SENTINEL: usize = 256;
     for i in 0..MAX_CMT_SENTINEL {
         vars.insert(format!("__cmt_{i}"), f64::NAN);
     }

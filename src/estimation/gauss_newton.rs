@@ -465,33 +465,34 @@ pub fn run_foce_gn(
     }
 
     // ---- Covariance step ----
-    let covariance_matrix = if options.run_covariance_step {
-        if verbose {
-            eprintln!("Running covariance step...");
-        }
-        let packed = pack_params(&final_params);
-        match compute_covariance(
-            &packed,
-            &final_params,
-            model,
-            population,
-            &final_etas,
-            &final_h_mats,
-            &final_kappas,
-            options,
-        ) {
-            CovarianceStepResult::Success(out) => {
-                warnings.extend(out.warnings);
-                Some(out.matrix)
+    let covariance_matrix =
+        if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
+            if verbose {
+                eprintln!("Running covariance step...");
             }
-            CovarianceStepResult::Unusable(msg) => {
-                warnings.push(msg);
-                None
+            let packed = pack_params(&final_params);
+            match compute_covariance(
+                &packed,
+                &final_params,
+                model,
+                population,
+                &final_etas,
+                &final_h_mats,
+                &final_kappas,
+                options,
+            ) {
+                CovarianceStepResult::Success(out) => {
+                    warnings.extend(out.warnings);
+                    Some(out.matrix)
+                }
+                CovarianceStepResult::Unusable(msg) => {
+                    warnings.push(msg);
+                    None
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     if verbose {
         eprintln!("FOCE-GN completed. Final OFV = {:.4}", final_ofv);

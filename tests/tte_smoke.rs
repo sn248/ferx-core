@@ -738,7 +738,7 @@ mod survival_smoke {
         (26.03, 1),
     ];
 
-    /// Simulated Gompertz TTE data (30 subjects, seed=42).
+    /// Simulated Gompertz TTE data (50 subjects, seed=42).
     /// TVALPHA=0.002 h⁻¹, TVGAMMA=0.05 h⁻¹, omega(ETA_GAMMA)=0.04, censor=80 h.
     /// Mirrors data/tte_gompertz.csv (BSV on gamma, censoring at 80 h, 42/50 events).
     const GOMPERTZ_DATA: &[(f64, u8)] = &[

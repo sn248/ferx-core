@@ -52,6 +52,11 @@ pub fn hazard_and_cum_hazard(family: HazardFamily, t: f64, params: &[f64]) -> (f
             let gamma = params[1];
             let loghr = params.get(2).copied().unwrap_or(0.0);
             let exp_loghr = loghr.exp();
+            if gamma == 0.0 {
+                // γ=0: limit of (alpha/gamma)*(exp(gamma*t)-1) as γ→0 is alpha*t
+                let eff = alpha * exp_loghr;
+                return (eff, eff * t);
+            }
             // h(t) = alpha * exp(gamma*t) * exp(loghr)
             // H(t) = (alpha/gamma) * (exp(gamma*t) - 1) * exp(loghr)
             let exp_gt = (gamma * t).exp();
@@ -88,10 +93,11 @@ pub fn median_survival(family: HazardFamily, params: &[f64]) -> f64 {
             let scale = params[0];
             let shape = params[1];
             let loghr = params.get(2).copied().unwrap_or(0.0);
+            let exp_lhr = loghr.exp();
             // H(T) = (T/scale)^shape * exp(loghr) = ln2
             // T = scale * (ln2 / exp(loghr))^(1/shape)
-            if scale > 0.0 && shape > 0.0 {
-                scale * (LN_2 / loghr.exp()).powf(1.0 / shape)
+            if scale > 0.0 && shape > 0.0 && exp_lhr > 0.0 {
+                scale * (LN_2 / exp_lhr).powf(1.0 / shape)
             } else {
                 f64::NAN
             }
@@ -101,7 +107,7 @@ pub fn median_survival(family: HazardFamily, params: &[f64]) -> f64 {
             let gamma = params[1];
             let loghr = params.get(2).copied().unwrap_or(0.0);
             let exp_lhr = loghr.exp();
-            if alpha <= 0.0 {
+            if alpha <= 0.0 || !(exp_lhr > 0.0) {
                 return f64::NAN;
             }
             // H(T) = (alpha/gamma)*(exp(gamma*T)-1)*exp(loghr) = ln2
@@ -143,8 +149,9 @@ pub fn mean_survival(family: HazardFamily, params: &[f64]) -> f64 {
             if matches!(family, HazardFamily::Gompertz) && params[1] == 0.0 {
                 let alpha = params[0];
                 let loghr = params.get(2).copied().unwrap_or(0.0);
-                return if alpha > 0.0 {
-                    1.0 / (alpha * loghr.exp())
+                let exp_lhr = loghr.exp();
+                return if alpha > 0.0 && exp_lhr > 0.0 {
+                    1.0 / (alpha * exp_lhr)
                 } else {
                     f64::NAN
                 };

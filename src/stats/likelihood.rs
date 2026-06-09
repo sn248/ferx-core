@@ -259,7 +259,8 @@ pub(crate) fn obs_nll_subject_into(
                 if records_for_cmt.is_empty() {
                     continue;
                 }
-                nll += tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+                nll +=
+                    0.5 * tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
             }
         }
     }
@@ -738,6 +739,9 @@ fn gaussian_foce_accum(
         let lloq = subject.observations[j];
         let f = ipreds[j];
         let v = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
+        if !(v.is_finite() && v > 0.0) {
+            return None;
+        }
         let z = (lloq - f) / v.sqrt();
         bloq_term += -2.0 * log_normal_cdf(z);
     }

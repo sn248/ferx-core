@@ -8982,6 +8982,13 @@ mod tests {
                     continue;
                 }
             }
+            // TTE-only files (no [structural_model]) require the survival feature.
+            if !cfg!(feature = "survival") {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                if src.contains("[event_model") && !src.contains("[structural_model") {
+                    continue;
+                }
+            }
             seen += 1;
             if let Err(e) = parse_full_model_file(&path) {
                 panic!("failed to parse {}: {}", path.display(), e);

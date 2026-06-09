@@ -925,4 +925,116 @@ mod survival_smoke {
             obs_records: vec![],
         }
     }
+
+    // ── Phase 1 follow-up: IOV + TTE subjects ────────────────────────────────
+
+    /// Mixed IOV+TTE model: one-cpt IV PK with a per-occasion kappa on CL,
+    /// plus an exponential TTE endpoint on CMT=2.  `maxiter=3` keeps it Tier-2.
+    const IOV_TTE_MODEL: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TVLAMBDA(0.05, 0.001, 5.0)
+
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+
+  sigma SIGMA_ADD ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_ADD)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_CL)
+
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+
+    /// Build a population of `n` subjects each having:
+    ///   - 2 IV doses (occasions 0 and 1)
+    ///   - 1 PK observation per occasion (CMT=1)
+    ///   - 1 TTE event (CMT=2)
+    ///
+    /// This exercises the code path in `foce_subject_nll_iov` that was
+    /// previously bypassing the TTE Laplace correction when kappas are
+    /// non-empty (fix in commit 9d954f1).
+    fn iov_tte_population(n: usize, event_times: &[f64]) -> Population {
+        // For TVCL=1.0, TVV=10.0, dose=100 at t=0:
+        //   conc(t=4) = 100/10 * exp(-0.1*4) ≈ 6.7
+        let pk_conc = 6.7_f64;
+
+        let subjects = (0..n)
+            .map(|i| Subject {
+                id: format!("{}", i + 1),
+                // Dose 100 at t=0 (occ 0) and dose 100 at t=24 (occ 1).
+                doses: vec![
+                    DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+                ],
+                dose_occasions: vec![0, 1],
+                // One PK obs per occasion at t=4 and t=28.
+                obs_times: vec![4.0, 28.0],
+                obs_raw_times: vec![4.0, 28.0],
+                observations: vec![pk_conc, pk_conc],
+                obs_cmts: vec![1, 1],
+                occasions: vec![0, 1],
+                obs_records: vec![ObsRecord::Event {
+                    time: event_times[i % event_times.len()],
+                    event_type: EventType::Exact,
+                    entry_time: 0.0,
+                    cmt: 2,
+                }],
+                covariates: HashMap::new(),
+                dose_covariates: vec![],
+                obs_covariates: vec![],
+                pk_only_times: vec![],
+                pk_only_covariates: vec![],
+                reset_times: vec![],
+                cens: vec![0, 0],
+            })
+            .collect();
+
+        Population {
+            covariate_names: vec![],
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+            subjects,
+        }
+    }
+
+    /// IOV subjects with TTE obs_records must produce a finite FOCEI OFV.
+    ///
+    /// This is the Tier-2 regression guard for `foce_subject_nll_iov`:
+    /// when kappas are non-empty AND the subject carries TTE obs_records,
+    /// the function must route through `foce_subject_nll_interaction_with_tte`
+    /// rather than the plain interaction/standard paths that ignore TTE.
+    #[test]
+    fn iov_tte_focei_returns_finite_ofv() {
+        let model = parse_model_string(IOV_TTE_MODEL).expect("IOV+TTE model must parse");
+        let event_times = [16.0_f64, 10.0, 22.0, 8.0, 30.0, 18.0];
+        let pop = iov_tte_population(6, &event_times);
+        let mut opts = FitOptions::default();
+        opts.verbose = false;
+        match fit(&model, &pop, &model.default_params, &opts) {
+            Ok(r) => assert!(
+                r.ofv.is_finite(),
+                "IOV+TTE FOCEI OFV must be finite; got {}",
+                r.ofv
+            ),
+            Err(e) => panic!("IOV+TTE FOCEI fit must not error: {e}"),
+        }
+    }
 }

@@ -245,6 +245,9 @@ pub(crate) fn obs_nll_subject_into(
         use crate::types::EndpointLikelihood;
         for (cmt, endpoint) in &model.endpoints {
             if let EndpointLikelihood::Tte { hazard } = endpoint {
+                // ObsRecord::Event is the only variant (DiscreteState/Count deferred);
+                // the `..` pattern captures all EventType variants (Exact, RightCensored,
+                // IntervalCensored), so this filter correctly passes every TTE record type.
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()

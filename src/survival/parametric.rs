@@ -138,6 +138,17 @@ pub fn mean_survival(family: HazardFamily, params: &[f64]) -> f64 {
             }
         }
         _ => {
+            // Gompertz γ=0 degenerates to Exponential: hazard_and_cum_hazard returns NaN
+            // for cum_h at γ=0 (0/0 form), so take the analytic limit directly.
+            if matches!(family, HazardFamily::Gompertz) && params[1] == 0.0 {
+                let alpha = params[0];
+                let loghr = params.get(2).copied().unwrap_or(0.0);
+                return if alpha > 0.0 {
+                    1.0 / (alpha * loghr.exp())
+                } else {
+                    f64::NAN
+                };
+            }
             let t_med = median_survival(family, params);
             if !t_med.is_finite() || t_med <= 0.0 {
                 return f64::NAN;
@@ -509,6 +520,22 @@ mod tests {
         assert!(
             (t_gompertz - t_exp).abs() < 1e-10,
             "Gompertz(γ=0) median {t_gompertz} should equal Exponential median {t_exp}"
+        );
+    }
+
+    #[test]
+    fn mean_gompertz_gamma_zero_matches_exponential() {
+        // γ=0: mean must equal 1/α (analytic Exponential limit), not NaN.
+        let alpha = 0.05_f64;
+        let m_gompertz = mean_survival(HazardFamily::Gompertz, &[alpha, 0.0, 0.0]);
+        let m_exp = mean_survival(HazardFamily::Exponential, &[alpha]);
+        assert!(
+            m_gompertz.is_finite(),
+            "Gompertz γ=0 mean must be finite, got {m_gompertz}"
+        );
+        assert!(
+            (m_gompertz - m_exp).abs() < 1e-10,
+            "Gompertz(γ=0) mean {m_gompertz} should equal Exponential mean {m_exp}"
         );
     }
 

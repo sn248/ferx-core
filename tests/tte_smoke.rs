@@ -697,7 +697,7 @@ mod survival_smoke {
             other => panic!("expected Tte endpoint for CMT=2 (Gompertz), got: {other:?}"),
         }
         assert_eq!(model.n_theta, 2, "n_theta should be 2 (TVALPHA, TVGAMMA)");
-        assert_eq!(model.n_eta, 1, "n_eta should be 1 (ETA_ALPHA)");
+        assert_eq!(model.n_eta, 1, "n_eta should be 1 (ETA_GAMMA)");
     }
 
     // ── Phase 1 follow-up: Weibull / Gompertz fit smoke tests ─────────────────
@@ -739,7 +739,7 @@ mod survival_smoke {
     ];
 
     /// Simulated Gompertz TTE data (30 subjects, seed=42).
-    /// TVALPHA=0.002 h⁻¹, TVGAMMA=0.05 h⁻¹, omega(ETA_ALPHA)=0.09, censor=60 h.
+    /// TVALPHA=0.002 h⁻¹, TVGAMMA=0.05 h⁻¹, omega(ETA_GAMMA)=0.04, censor=80 h.
     /// Mirrors data/tte_gompertz.csv (BSV on gamma, censoring at 80 h, 42/50 events).
     const GOMPERTZ_DATA: &[(f64, u8)] = &[
         (61.16, 1),

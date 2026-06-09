@@ -399,6 +399,32 @@ fn obs_nll_subject_into_iov(
             total_nll += 0.5 * (v.ln() + (subject.observations[j] - f).powi(2) / v);
         }
     }
+
+    // TTE term: same convention as obs_nll_subject_into (weight 1.0 to match
+    // the true NLL, since Gaussian obs already contribute at 0.5*(log v + r²/v)).
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        use crate::survival::tte_data_term;
+        use crate::types::EndpointLikelihood;
+        for (cmt, endpoint) in &model.endpoints {
+            if let EndpointLikelihood::Tte { hazard } = endpoint {
+                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned()
+                    .collect();
+                if records_for_cmt.is_empty() {
+                    continue;
+                }
+                total_nll +=
+                    tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+            }
+        }
+    }
+
     total_nll
 }
 

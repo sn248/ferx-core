@@ -204,6 +204,10 @@ pub fn sample_event_time(family: HazardFamily, params: &[f64], u: f64) -> f64 {
             let gamma = params[1];
             let loghr = params.get(2).copied().unwrap_or(0.0);
             let exp_loghr = loghr.exp();
+            if gamma == 0.0 {
+                // γ=0: degenerate to Exponential; H(T) = alpha*exp(loghr)*T = -log U
+                return neg_log_u / (alpha * exp_loghr);
+            }
             // H(T) = -log U  =>  (alpha/gamma)*(exp(gamma*T)-1)*exp(loghr) = neg_log_u
             // exp(gamma*T) = 1 + neg_log_u * gamma / (alpha * exp(loghr))
             let inner = 1.0 + neg_log_u * gamma / (alpha * exp_loghr);
@@ -257,6 +261,10 @@ pub fn sample_conditional_event_time(
             let gamma = params[1];
             let loghr = params.get(2).copied().unwrap_or(0.0);
             let exp_loghr = loghr.exp();
+            if gamma == 0.0 {
+                // γ=0: memoryless Exponential limit; shift by entry_time
+                return entry_time + neg_log_u / (alpha * exp_loghr);
+            }
             // exp(gamma*T) = exp(gamma*entry) + neg_log_u * gamma / (alpha * exp_loghr)
             let exp_entry = (gamma * entry_time).exp();
             let inner = exp_entry + neg_log_u * gamma / (alpha * exp_loghr);

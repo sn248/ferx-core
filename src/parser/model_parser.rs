@@ -1730,28 +1730,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // ── Optional [covariates] block ──
     // When present it is authoritative for the covariate *table* and typing:
     // only listed columns are tabled, and declared columns are read strictly.
-    // A covariate used in [individual_parameters] but not declared is still
-    // usable (it is read leniently, like the auto-detect path) — we just warn
-    // that it ought to be declared so its type is known.
+    // A covariate used in [individual_parameters] or [event_model] but not declared
+    // is still usable (read leniently) — we warn after all covariate sources have
+    // been collected (including [event_model], parsed below).
     let covariate_decls = if let Some(lines) = blocks.get("covariates") {
-        let decls = parse_covariates_block(lines)?;
-        let declared: std::collections::HashSet<&str> =
-            decls.iter().map(|d| d.name.as_str()).collect();
-        let undeclared: Vec<&str> = model
-            .referenced_covariates
-            .iter()
-            .filter(|c| !declared.contains(c.as_str()))
-            .map(|s| s.as_str())
-            .collect();
-        if !undeclared.is_empty() {
-            model.parse_warnings.push(format!(
-                "Covariate(s) used in [individual_parameters] but not declared in [covariates]: \
-                 {}. They are still usable, but declaring them (with `continuous`/`categorical`) \
-                 lets ferx record their type and include them in the covariate table.",
-                undeclared.join(", ")
-            ));
-        }
-        Some(decls)
+        Some(parse_covariates_block(lines)?)
     } else {
         None
     };
@@ -1794,6 +1777,27 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             }
         }
         model.referenced_covariates.sort();
+    }
+
+    // Undeclared-covariate warning: checked here (after [event_model] parsing) so
+    // that covariates used only in [event_model] expressions are included.
+    if let Some(decls) = &covariate_decls {
+        let declared: std::collections::HashSet<&str> =
+            decls.iter().map(|d| d.name.as_str()).collect();
+        let undeclared: Vec<&str> = model
+            .referenced_covariates
+            .iter()
+            .filter(|c| !declared.contains(c.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        if !undeclared.is_empty() {
+            model.parse_warnings.push(format!(
+                "Covariate(s) used in model expressions but not declared in [covariates]: \
+                 {}. They are still usable, but declaring them (with `continuous`/`categorical`) \
+                 lets ferx record their type and include them in the covariate table.",
+                undeclared.join(", ")
+            ));
+        }
     }
 
     Ok(ParsedModel {

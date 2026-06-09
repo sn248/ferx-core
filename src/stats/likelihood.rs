@@ -259,8 +259,7 @@ pub(crate) fn obs_nll_subject_into(
                 if records_for_cmt.is_empty() {
                     continue;
                 }
-                nll +=
-                    0.5 * tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+                nll += tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
             }
         }
     }

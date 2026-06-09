@@ -1678,12 +1678,18 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     if let Some(derived_lines) = blocks.get("derived") {
         let cov_names = model.referenced_covariates.clone();
         let mut derived_warnings = Vec::new();
+        let ode_state_names: Vec<String> = model
+            .ode_spec
+            .as_ref()
+            .map(|s| s.state_names.clone())
+            .unwrap_or_default();
         let derived_exprs = parse_derived_block(
             derived_lines,
             &model.theta_names.clone(),
             &model.eta_names.clone(),
             &model.indiv_param_names.clone(),
             &cov_names,
+            &ode_state_names,
             &mut derived_warnings,
         )?;
         model.derived_exprs = derived_exprs;
@@ -1913,6 +1919,15 @@ fn build_derived_filter_fn(cond: Condition) -> DerivedFilterFn {
 /// both uppercase and lowercase for the same reason.
 fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
     let mut vars: HashMap<String, f64> = HashMap::new();
+
+    // Index-based compartment keys use direct insert (before the closure below
+    // captures `vars`). They have the lowest priority: everything inserted by
+    // `insert_ci` below will overwrite any clash (rare for internal `__cmt_N`
+    // names — they cannot conflict with user-visible names).
+    for (i, &v) in ctx.compartments.iter().enumerate() {
+        vars.insert(format!("__cmt_{i}"), v);
+    }
+
     // Insert each name with original case AND uppercase + lowercase aliases so
     // that case mismatches (e.g. `wt` vs. header `WT`, or `WT` vs. header `wt`)
     // resolve correctly. `eval_expression` looks names up verbatim, so every
@@ -1928,6 +1943,13 @@ fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
             vars.insert(lo, v);
         }
     };
+
+    // Named compartment access — lowest priority among `insert_ci` inserts.
+    // Individual params, covariates, and built-ins below will overwrite any clash.
+    for (name, &v) in ctx.compartment_names.iter().zip(ctx.compartments.iter()) {
+        insert_ci(name, v);
+    }
+
     for (k, &v) in ctx.indiv_params.iter() {
         insert_ci(k, v);
     }
@@ -1973,6 +1995,43 @@ fn cond_refs_dv(cond: &Condition) -> bool {
     }
 }
 
+/// Returns true if the expression subtree references a compartment state.
+/// Matches both `__cmt_N` (from `compartments[N]` syntax) and named ODE state
+/// variables (e.g. `Ce`, `depot`). Named references are detected by checking
+/// `ode_state_names`; an empty slice means only subscript-style access matches.
+fn expr_refs_compartments(expr: &Expression, ode_state_names: &[String]) -> bool {
+    match expr {
+        Expression::Variable(s) => {
+            s.starts_with("__cmt_") || ode_state_names.iter().any(|n| n.eq_ignore_ascii_case(s))
+        }
+        Expression::BinOp(l, _, r) => {
+            expr_refs_compartments(l, ode_state_names) || expr_refs_compartments(r, ode_state_names)
+        }
+        Expression::UnaryFn(_, arg) => expr_refs_compartments(arg, ode_state_names),
+        Expression::Power(b, e) => {
+            expr_refs_compartments(b, ode_state_names) || expr_refs_compartments(e, ode_state_names)
+        }
+        Expression::Conditional(c, t, e) => {
+            cond_refs_compartments(c, ode_state_names)
+                || expr_refs_compartments(t, ode_state_names)
+                || expr_refs_compartments(e, ode_state_names)
+        }
+        _ => false,
+    }
+}
+
+fn cond_refs_compartments(cond: &Condition, ode_state_names: &[String]) -> bool {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            expr_refs_compartments(l, ode_state_names) || expr_refs_compartments(r, ode_state_names)
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            cond_refs_compartments(l, ode_state_names) || cond_refs_compartments(r, ode_state_names)
+        }
+        Condition::Not(c) => cond_refs_compartments(c, ode_state_names),
+    }
+}
+
 /// Parse the interior args of `integral(...)` into a `DerivedKind::Integral`.
 fn parse_integral_kind(
     args: &[&[Token]],
@@ -1987,6 +2046,7 @@ fn parse_integral_kind(
 
     let integrand_expr = parse_derived_expr(args[0], ctx)?;
     let data_based = expr_refs_dv(&integrand_expr);
+    let uses_compartments = expr_refs_compartments(&integrand_expr, ctx.ode_state_names);
 
     let mut condition: Option<DerivedFilterFn> = None;
     let mut from_val: Option<f64> = None;
@@ -2071,6 +2131,7 @@ fn parse_integral_kind(
         integrand: build_derived_eval_fn(integrand_expr),
         condition,
         data_based,
+        uses_compartments,
         window: int_window,
         step: int_step,
     })
@@ -2090,6 +2151,7 @@ fn parse_derived_block(
     eta_names: &[String],
     indiv_param_names: &[String],
     covariate_names: &[String],
+    ode_state_names: &[String],
     parse_warnings: &mut Vec<String>,
 ) -> Result<Vec<DerivedExprSpec>, String> {
     let mut specs: Vec<DerivedExprSpec> = Vec::new();
@@ -2169,6 +2231,7 @@ fn parse_derived_block(
             defined_vars: &defined_vars,
             fallback_covariate: false,
             nn_specs: &[],
+            ode_state_names,
         };
 
         // ── Tokenize ──────────────────────────────────────────────────────────
@@ -5546,17 +5609,22 @@ struct ParseCtx<'a> {
     /// when no `[covariate_nn]` block is present in the model (the
     /// dot-access parser then errors on `FOO.BAR`).
     nn_specs: &'a [(String, Vec<String>)],
+    /// ODE state variable names for detecting compartment references in
+    /// integral integrands (`uses_compartments` flag). Empty for analytical models.
+    ode_state_names: &'a [String],
 }
 
 impl<'a> ParseCtx<'a> {
     fn new(theta_names: &'a [String], eta_names: &'a [String], defined_vars: &'a [String]) -> Self {
         const EMPTY_NN: &[(String, Vec<String>)] = &[];
+        const EMPTY: &[String] = &[];
         Self {
             theta_names,
             eta_names,
             defined_vars,
             fallback_covariate: true,
             nn_specs: EMPTY_NN,
+            ode_state_names: EMPTY,
         }
     }
 
@@ -5569,6 +5637,7 @@ impl<'a> ParseCtx<'a> {
             defined_vars,
             fallback_covariate: false,
             nn_specs: EMPTY_NN,
+            ode_state_names: EMPTY,
         }
     }
 
@@ -7490,6 +7559,8 @@ enum Token {
     Ident(String),
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     LBrace,
     RBrace,
     Plus,
@@ -7620,6 +7691,14 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::RParen);
                 i += 1;
             }
+            '[' => {
+                tokens.push(Token::LBracket);
+                i += 1;
+            }
+            ']' => {
+                tokens.push(Token::RBracket);
+                i += 1;
+            }
             '+' => {
                 tokens.push(Token::Plus);
                 i += 1;
@@ -7631,6 +7710,7 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                         tokens.last(),
                         Some(
                             Token::LParen
+                                | Token::LBracket
                                 | Token::LBrace
                                 | Token::Plus
                                 | Token::Minus
@@ -7880,6 +7960,39 @@ fn parse_atom(
             Ok((expr, p + 1))
         }
         Token::Ident(name) => {
+            // compartments[N] — subscript access into DerivedContext::compartments.
+            // Emits Variable("__cmt_N") which build_derived_vars populates at eval time.
+            // Only literal non-negative integer indices are supported.
+            if name.eq_ignore_ascii_case("compartments")
+                && pos + 1 < tokens.len()
+                && tokens[pos + 1] == Token::LBracket
+            {
+                let n_tok = tokens
+                    .get(pos + 2)
+                    .ok_or_else(|| "[derived] `compartments[`: missing index".to_string())?;
+                let n = match n_tok {
+                    Token::Number(v) => {
+                        if v.fract() != 0.0 || *v < 0.0 {
+                            return Err(format!(
+                                "[derived] `compartments[{v}]`: index must be a non-negative integer"
+                            ));
+                        }
+                        *v as usize
+                    }
+                    _ => {
+                        return Err(
+                            "[derived] `compartments[...]`: only literal integer indices are \
+                             supported in Phase 1 — use `compartments[0]`, `compartments[1]`, etc."
+                                .to_string(),
+                        )
+                    }
+                };
+                if tokens.get(pos + 3) != Some(&Token::RBracket) {
+                    return Err("[derived] `compartments[N`: missing closing `]`".to_string());
+                }
+                return Ok((Expression::Variable(format!("__cmt_{n}")), pos + 4));
+            }
+
             // Inline conditional expression: `if (cond) then_expr else else_expr`
             // Used as a value (e.g. `CL = if (SEX == 1) TVCL * 1.2 else TVCL`).
             if name.eq_ignore_ascii_case("if") {
@@ -8111,18 +8224,18 @@ enum StatementMode {
 /// because they separate statements within a block body.
 fn strip_newlines_in_groups(tokens: Vec<Token>) -> Vec<Token> {
     let mut out = Vec::with_capacity(tokens.len());
-    let mut paren_depth = 0i32;
+    let mut depth = 0i32;
     for t in tokens {
         match t {
-            Token::LParen => {
-                paren_depth += 1;
-                out.push(Token::LParen);
+            Token::LParen | Token::LBracket => {
+                depth += 1;
+                out.push(t);
             }
-            Token::RParen => {
-                paren_depth -= 1;
-                out.push(Token::RParen);
+            Token::RParen | Token::RBracket => {
+                depth -= 1;
+                out.push(t);
             }
-            Token::Newline if paren_depth > 0 => {
+            Token::Newline if depth > 0 => {
                 // drop
             }
             other => out.push(other),
@@ -14599,6 +14712,8 @@ method = foce
                 tafd: 1.0,
                 tad: 1.0,
                 prev_derived: &prev_derived,
+                compartments: &[],
+                compartment_names: &[],
             };
             let ke = eval(&ctx);
             assert!((ke - 0.1).abs() < 1e-10, "KE = CL/V = 1/10 = 0.1, got {ke}");
@@ -14630,6 +14745,8 @@ method = foce
                 tafd: 1.0,
                 tad: 1.0,
                 prev_derived: &prev_derived,
+                compartments: &[],
+                compartment_names: &[],
             };
             let ke = eval(&ctx);
             prev_derived.insert("KE".to_string(), ke);
@@ -14649,6 +14766,8 @@ method = foce
                 tafd: 1.0,
                 tad: 1.0,
                 prev_derived: &prev_derived,
+                compartments: &[],
+                compartment_names: &[],
             };
             let t_half = eval(&ctx);
             let expected = 0.693 / 0.1;
@@ -14844,6 +14963,8 @@ CL V KA WT
                     tafd: 0.0,
                     tad: 0.0,
                     prev_derived: &prev,
+                    compartments: &[],
+                    compartment_names: &[],
                 };
                 let result = eval(&ctx);
                 assert!(
@@ -14878,6 +14999,8 @@ CL V KA WT
                     tafd: 0.0,
                     tad: 0.0,
                     prev_derived: &prev,
+                    compartments: &[],
+                    compartment_names: &[],
                 };
                 let result = eval(&ctx);
                 assert!(
@@ -14908,6 +15031,8 @@ CL V KA WT
                 tafd: 1.0,
                 tad: 0.0, // zero
                 prev_derived: &prev,
+                compartments: &[],
+                compartment_names: &[],
             };
             assert_eq!(eval(&ctx), 1.0, "TAD=0 should be < MACHEPS");
             // TAD = 1.0 >> MACHEPS → flag = 0
@@ -14942,6 +15067,8 @@ CL V KA WT
                 tafd: 0.0,
                 tad: 0.0,
                 prev_derived: &prev,
+                compartments: &[],
+                compartment_names: &[],
             };
             assert_eq!(
                 eval(&ctx),

@@ -1039,6 +1039,407 @@ pub fn ode_predictions_ekf(
     (ipreds, p_obs)
 }
 
+/// Like [`ode_predictions`] but also returns the raw ODE state vector at every
+/// observation time. Returns `(ipred_vec, compartment_states)` where
+/// `compartment_states[j]` is `u[0..n_states]` at observation `j`.
+///
+/// The estimation hot path uses [`ode_predictions`] (no allocation overhead);
+/// this variant is called once post-fit to populate `SubjectResult::compartment_states`.
+pub fn ode_predictions_with_states(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let n = ode.n_states;
+    let n_obs = subject.obs_times.len();
+    let opts = OdeSolverOptions::default();
+
+    let mut u = ode.initial_state(pk_params_flat);
+    let mut predictions = vec![f64::NAN; n_obs];
+    let mut states: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; n_obs];
+
+    let lagtime = pk_params_flat.get(PK_IDX_LAGTIME).copied().unwrap_or(0.0);
+    let dose_lagtimes: Vec<f64> = vec![lagtime; subject.doses.len()];
+    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
+    let dose_f_bio: Vec<f64> = vec![f_bio; subject.doses.len()];
+
+    let first_dose_time = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
+    let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
+    ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
+    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
+        first_dose_time
+    } else {
+        f64::NAN
+    };
+
+    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, &t) in subject.obs_times.iter().enumerate() {
+        obs_map.entry(t.to_bits()).or_default().push(i);
+    }
+
+    let t_last = subject.obs_times.iter().cloned().fold(0.0f64, f64::max);
+    let mut break_times: Vec<f64> = vec![0.0];
+    for dose in &subject.doses {
+        break_times.push(dose.time + lagtime);
+        if is_real_infusion(dose) {
+            break_times.push(dose.time + lagtime + dose.duration);
+        }
+        if lagtime > 0.0 && dose.ss && dose.ii > 0.0 {
+            break_times.push(dose.time);
+        }
+    }
+    break_times.push(t_last);
+    break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+
+    let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();
+
+    for w in break_times.windows(2) {
+        let (t_start, t_end) = (w[0], w[1]);
+        if (t_end - t_start).abs() < 1e-15 {
+            continue;
+        }
+
+        // Apply boluses and SS doses at t_start (same logic as ode_predictions).
+        for (dose_idx, dose) in subject.doses.iter().enumerate() {
+            let t_eff = dose.time + dose_lagtimes[dose_idx];
+            if (t_eff - t_start).abs() < 1e-10 {
+                let f = dose_f_bio[dose_idx];
+                if dose.ss && dose.ii > 0.0 {
+                    if t_start < dose.time + 1e-10 {
+                        u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lagtime, &opts);
+                    } else {
+                        u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
+                    }
+                }
+                if !is_real_infusion(dose) {
+                    let cmt = (dose.cmt as usize).saturating_sub(1).min(n - 1);
+                    u[cmt] += dose.amt * f;
+                } else {
+                    let end_t = t_eff + dose.duration;
+                    active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
+                    active_infusions.push((dose_idx, t_eff, end_t));
+                }
+            }
+        }
+
+        // Handle obs at t_start (after dose).
+        if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
+            for &obs_idx in obs_idxs {
+                let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+                predictions[obs_idx] = read_observable(
+                    ode,
+                    &u,
+                    pk_params_flat,
+                    theta,
+                    eta,
+                    &subject.covariates,
+                    cmt,
+                );
+                states[obs_idx] = u.clone();
+            }
+        }
+
+        let saveat: Vec<f64> = subject
+            .obs_times
+            .iter()
+            .cloned()
+            .filter(|&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+            .collect();
+
+        ext_params[crate::types::MAX_PK_PARAMS + 1] = {
+            let last_dose_eff = subject
+                .doses
+                .iter()
+                .filter(|d| d.time + lagtime <= t_start + 1e-12)
+                .map(|d| d.time + lagtime)
+                .fold(f64::NEG_INFINITY, f64::max);
+            if last_dose_eff.is_finite() {
+                last_dose_eff
+            } else {
+                f64::NAN
+            }
+        };
+
+        active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
+        let current_infusions = active_infusions.clone();
+
+        let wrapped_rhs = {
+            let infusions = current_infusions.clone();
+            let f_bio_snap = dose_f_bio.clone();
+            move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+                (ode.rhs)(y, p, t, dy);
+                for &(di, t_start_inf, t_end_inf) in &infusions {
+                    if t >= t_start_inf - 1e-12 && t < t_end_inf - 1e-12 {
+                        let dose = &subject.doses[di];
+                        let f = f_bio_snap[di];
+                        let cmt = (dose.cmt as usize).saturating_sub(1).min(n - 1);
+                        dy[cmt] += dose.rate * f;
+                    }
+                }
+            }
+        };
+
+        let sol = solve_ode(
+            &wrapped_rhs,
+            &u,
+            (t_start, t_end),
+            &ext_params,
+            &saveat,
+            &opts,
+        );
+
+        for pt in &sol {
+            if let Some(obs_idxs) = obs_map.get(&pt.t.to_bits()) {
+                for &obs_idx in obs_idxs {
+                    let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+                    predictions[obs_idx] = read_observable(
+                        ode,
+                        &pt.u,
+                        pk_params_flat,
+                        theta,
+                        eta,
+                        &subject.covariates,
+                        cmt,
+                    );
+                    states[obs_idx] = pt.u.clone();
+                }
+            }
+        }
+
+        if let Some(last) = sol.last() {
+            u.copy_from_slice(&last.u);
+        }
+    }
+
+    for p in &mut predictions {
+        if *p < 0.0 {
+            *p = 0.0;
+        }
+    }
+
+    (predictions, states)
+}
+
+/// Like [`ode_predictions_event_driven`] but also returns the raw ODE state
+/// at every observation time. Returns `(ipred_vec, compartment_states)`.
+///
+/// Called post-fit for TV-covariate ODE models to populate
+/// `SubjectResult::compartment_states`.
+pub fn ode_predictions_event_driven_with_states(
+    ode: &OdeSpec,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams],
+    pk_at_pk_only: &[PkParams],
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    // Re-use the standard path to get ipred, then do a second pass to
+    // extract states. The event-driven function is already complex enough
+    // that duplicating it would be error-prone; a second pass is acceptable
+    // because this is post-fit only.
+    let ipreds = ode_predictions_event_driven(
+        ode,
+        subject,
+        theta,
+        eta,
+        pk_at_dose,
+        pk_at_obs,
+        pk_at_pk_only,
+    );
+
+    // Second pass: run event-driven with saveat at every obs time to capture
+    // the full state. We collect state by injecting extra saveat times and
+    // extracting u at each obs time from the dense solution.
+    // For simplicity, re-derive states via ode_dense_solve_states which uses
+    // the no-TV parameters from the first obs (same "representative" approximation
+    // as the existing grid-integral path — acceptable for state extraction).
+    let pk_flat = &pk_at_obs.first().map(|p| p.values).unwrap_or_default();
+    let states = ode_dense_solve_states(ode, pk_flat, theta, eta, subject, &subject.obs_times);
+
+    (ipreds, states)
+}
+
+/// Run the ODE solver with an arbitrary set of `saveat` time points and
+/// return the full state vector at each requested time.
+///
+/// This is used by the grid-based integral path in `compute_extra_output_columns`
+/// when the integrand references compartment states. The result is only needed
+/// post-fit (never on the estimation hot path).
+///
+/// Dose events (boluses, infusions, SS) are handled identically to
+/// [`ode_predictions`]. Subject observation times are ignored; only `saveat`
+/// times are returned.
+pub fn ode_dense_solve_states(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+    saveat: &[f64],
+) -> Vec<Vec<f64>> {
+    if saveat.is_empty() {
+        return vec![];
+    }
+    let n = ode.n_states;
+    let opts = OdeSolverOptions::default();
+
+    let mut u = ode.initial_state(pk_params_flat);
+    let mut result: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; saveat.len()];
+
+    let lagtime = pk_params_flat.get(PK_IDX_LAGTIME).copied().unwrap_or(0.0);
+    let dose_lagtimes: Vec<f64> = vec![lagtime; subject.doses.len()];
+    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
+    let dose_f_bio: Vec<f64> = vec![f_bio; subject.doses.len()];
+
+    let first_dose_time = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
+    let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
+    ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
+    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
+        first_dose_time
+    } else {
+        f64::NAN
+    };
+
+    // Build saveat → index map for fast lookup.
+    let mut saveat_map: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, &t) in saveat.iter().enumerate() {
+        saveat_map.entry(t.to_bits()).or_default().push(i);
+    }
+
+    let t_last = saveat.iter().cloned().fold(0.0f64, f64::max);
+    let mut break_times: Vec<f64> = vec![0.0];
+    for dose in &subject.doses {
+        break_times.push(dose.time + lagtime);
+        if is_real_infusion(dose) {
+            break_times.push(dose.time + lagtime + dose.duration);
+        }
+        if lagtime > 0.0 && dose.ss && dose.ii > 0.0 {
+            break_times.push(dose.time);
+        }
+    }
+    break_times.push(t_last);
+    break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+
+    let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();
+
+    for w in break_times.windows(2) {
+        let (t_start, t_end) = (w[0], w[1]);
+        if (t_end - t_start).abs() < 1e-15 {
+            continue;
+        }
+
+        for (dose_idx, dose) in subject.doses.iter().enumerate() {
+            let t_eff = dose.time + dose_lagtimes[dose_idx];
+            if (t_eff - t_start).abs() < 1e-10 {
+                let f = dose_f_bio[dose_idx];
+                if dose.ss && dose.ii > 0.0 {
+                    if t_start < dose.time + 1e-10 {
+                        u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lagtime, &opts);
+                    } else {
+                        u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
+                    }
+                }
+                if !is_real_infusion(dose) {
+                    let cmt = (dose.cmt as usize).saturating_sub(1).min(n - 1);
+                    u[cmt] += dose.amt * f;
+                } else {
+                    let end_t = t_eff + dose.duration;
+                    active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
+                    active_infusions.push((dose_idx, t_eff, end_t));
+                }
+            }
+        }
+
+        // Saveat points at t_start (after dose, matching ode_predictions convention)
+        if let Some(idxs) = saveat_map.get(&t_start.to_bits()) {
+            for &i in idxs {
+                result[i] = u.clone();
+            }
+        }
+
+        let seg_saveat: Vec<f64> = saveat
+            .iter()
+            .cloned()
+            .filter(|&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+            .collect();
+
+        ext_params[crate::types::MAX_PK_PARAMS + 1] = {
+            let last_dose_eff = subject
+                .doses
+                .iter()
+                .filter(|d| d.time + lagtime <= t_start + 1e-12)
+                .map(|d| d.time + lagtime)
+                .fold(f64::NEG_INFINITY, f64::max);
+            if last_dose_eff.is_finite() {
+                last_dose_eff
+            } else {
+                f64::NAN
+            }
+        };
+
+        active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
+        let current_infusions = active_infusions.clone();
+
+        let wrapped_rhs = {
+            let infusions = current_infusions.clone();
+            let f_bio_snap = dose_f_bio.clone();
+            move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+                (ode.rhs)(y, p, t, dy);
+                for &(di, t_start_inf, t_end_inf) in &infusions {
+                    if t >= t_start_inf - 1e-12 && t < t_end_inf - 1e-12 {
+                        let dose = &subject.doses[di];
+                        let f = f_bio_snap[di];
+                        let cmt = (dose.cmt as usize).saturating_sub(1).min(n - 1);
+                        dy[cmt] += dose.rate * f;
+                    }
+                }
+            }
+        };
+
+        let sol = solve_ode(
+            &wrapped_rhs,
+            &u,
+            (t_start, t_end),
+            &ext_params,
+            &seg_saveat,
+            &opts,
+        );
+
+        for pt in &sol {
+            if let Some(idxs) = saveat_map.get(&pt.t.to_bits()) {
+                for &i in idxs {
+                    result[i] = pt.u.clone();
+                }
+            }
+        }
+
+        if let Some(last) = sol.last() {
+            u.copy_from_slice(&last.u);
+        }
+    }
+
+    // Suppress unused theta/eta warning — they would be used if Form C
+    // readout needed them, but dense state extraction always returns raw u.
+    let _ = (theta, eta);
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

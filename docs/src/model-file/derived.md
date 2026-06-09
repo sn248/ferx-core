@@ -32,6 +32,8 @@ where `name` becomes a new sdtab column and `expression` is evaluated for every 
 | `TAFD` | Time after first dose |
 | `TAD` | Time after most recent dose (SS-aware) |
 | `TIME` | Nominal time |
+| `compartments[i]` | Amount/concentration in ODE compartment `i` (0-based) or equivalent analytical state |
+| *state name* (ODE) | Named ODE state variable directly, e.g. `Ce`, `depot`, `A_central` |
 
 ## Operators and functions
 
@@ -123,3 +125,113 @@ A derived expression may reference the name of any **preceding** derived column 
   CLi  = CL
   VDSS = CLi / 0.693    # ok — CLi defined on the line above
 ```
+
+## Compartment states (ODE and analytical models)
+
+After the fit, the state of every model compartment is available in `[derived]` expressions. There are two equivalent syntaxes:
+
+- **Subscript**: `compartments[i]` — 0-based index into the state vector.
+- **Named** (ODE models only): the ODE state variable name directly, e.g. `Ce`, `depot`, `A_central`.
+
+### ODE example — effect compartment
+
+```
+[odes]
+  dA_central/dt = -CL/V * A_central
+  dCe/dt        = Ke0 * (A_central/V - Ce)
+
+[derived]
+  Ce_idx   = compartments[1]   # effect compartment by index
+  Ce_named = Ce                # same value, by ODE state name
+  AUC_Ce   = integral(Ce, from=0, to=24)
+```
+
+`Ce_idx` and `Ce_named` will be identical. Both refer to the raw ODE state
+`u[1]` — whatever units the ODE produces.
+
+### Analytical model compartment layout
+
+Analytical PK models expose a fixed compartment layout:
+
+| Model | `compartments[0]` | `compartments[1]` | `compartments[2]` | `compartments[3]` |
+|-------|-------------------|-------------------|-------------------|-------------------|
+| `one_cpt_iv` | `central` (conc) | — | — | — |
+| `one_cpt_oral` | `depot` (amount) | `central` (conc) | — | — |
+| `two_cpt_iv` | `central` (conc) | `peripheral` (conc) | — | — |
+| `two_cpt_oral` | `depot` (amount) | `central` (conc) | `peripheral` (conc) | — |
+| `three_cpt_iv` | `central` (conc) | `peripheral1` (conc) | `peripheral2` (conc) | — |
+| `three_cpt_oral` | `depot` (amount) | `central` (conc) | `peripheral1` (conc) | `peripheral2` (conc) |
+
+Named access works for analytical models too:
+
+```
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+
+[derived]
+  C_periph = peripheral           # named access
+  C_periph_idx = compartments[1] # same value, by index
+```
+
+### Scaling
+
+`compartments[i]` is **never scaled**. It is the raw solver state or analytical
+formula output:
+
+- For analytical models: depot compartments are in **amounts** (dose units); central
+  and peripheral compartments are in **concentrations** matching `IPRED`.
+- For ODE models: the value is whatever the ODE produces. If your ODE tracks amounts
+  (`dA/dt = ...`) then `compartments[i]` is an amount; if it tracks concentrations
+  (`dC/dt = ...`) it is a concentration.
+
+If a `[scaling]` block is active, `IPRED` is the scaled output but `compartments[i]`
+for the observed compartment remains unscaled. Compute the scaled value explicitly if
+needed:
+
+```
+[derived]
+  C_periph_scaled = compartments[1] / V2
+```
+
+### `integral` over compartment states
+
+When an `integral(...)` integrand references `compartments[i]` or a named ODE state
+variable, ferx **re-runs the ODE solver** (or analytical formula) at the grid points
+rather than interpolating from stored per-observation states. This gives an exact
+result at the cost of a second solver pass per subject — typically negligible for
+post-fit diagnostics.
+
+```
+[derived]
+  AUC_Ce = integral(compartments[1], from=0, to=24, step=0.5)
+```
+
+> **Named state variables in `integral` (ODE models):** ferx detects whether the
+> integrand references a compartment by name at parse time. For this detection to
+> work, the model must have an `[odes]` block (named access is not available for
+> integrals in analytical models — use the `compartments[i]` subscript form instead).
+
+### Name priority
+
+When a named ODE state variable shares a name with a covariate, individual
+parameter, or other derived column:
+
+1. Built-in columns (`IPRED`, `TIME`, `DV`, `TAFD`, `TAD`, etc.) — highest priority
+2. Individual parameter names (`CL`, `V`, `KA`, …)
+3. Theta / eta names
+4. Covariate names
+5. ODE state variable names — lowest priority
+
+If a state name shadows a covariate you will receive `W_DERIVED_COVARIATE_SHADOW`.
+If a state name coincides with an individual parameter, the **parameter value** wins
+and the compartment state is inaccessible by name — use `compartments[i]` instead.
+
+### Limitations (Phase 1)
+
+- `compartments[i]` requires a **literal integer index**. Dynamic indexing
+  (`compartments[N]` where `N` is a parameter) is not supported and will produce a
+  parse error.
+- Named access is not available for integrals in **analytical models**. Use
+  `compartments[i]` in `integral(...)` for analytical models.
+- EKF/SDE models: `compartment_states` is not populated; using `compartments[i]`
+  in `[derived]` with an EKF model will yield `NaN` values.

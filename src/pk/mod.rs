@@ -561,6 +561,301 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
     }
 }
 
+// --- Compartment-state helpers for `compartment_states` in SubjectResult ---
+
+/// Returns the full state vector contribution from one dose at elapsed time `tau`.
+///
+/// Layout per PkModel:
+///   OneCptIv:     [C_central]
+///   OneCptOral:   [A_depot, C_central]
+///   TwoCptIv:     [C_central, C_periph]
+///   TwoCptOral:   [A_depot, C_central, C_periph]
+///   ThreeCptIv:   [C_central, C_periph1, C_periph2]
+///   ThreeCptOral: [A_depot, C_central, C_periph1, C_periph2]
+///
+/// Scaling is NOT applied — these are the raw analytical PK states.
+fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParams) -> Vec<f64> {
+    let cl = p.cl();
+    let v = p.v();
+    match pk_model {
+        PkModel::OneCptIv => {
+            let c = if dose.is_infusion() {
+                one_cpt_infusion(dose, tau, cl, v)
+            } else if dose.ss && dose.ii > 0.0 {
+                one_cpt_iv_bolus_ss(dose, tau, cl, v)
+            } else {
+                one_cpt_iv_bolus(dose, tau, cl, v)
+            };
+            vec![c]
+        }
+        PkModel::OneCptOral => {
+            let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
+            let central = one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio());
+            vec![depot, central]
+        }
+        PkModel::TwoCptIv => {
+            let central = if dose.is_infusion() {
+                two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
+            } else if dose.ss && dose.ii > 0.0 {
+                two_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2())
+            } else {
+                two_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2())
+            };
+            let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
+            vec![central, periph]
+        }
+        PkModel::TwoCptOral => {
+            if dose.is_infusion() {
+                // Infusions bypass depot; treat as 2-cpt IV
+                let c = two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2());
+                let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
+                vec![0.0, c, periph]
+            } else {
+                let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
+                let central = two_cpt_oral_f(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
+                let periph =
+                    two_cpt_oral_peripheral(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
+                vec![depot, central, periph]
+            }
+        }
+        PkModel::ThreeCptIv => {
+            let central = if dose.is_infusion() {
+                three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+            } else if dose.ss && dose.ii > 0.0 {
+                three_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+            } else {
+                three_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+            };
+            let [p1, p2] =
+                three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+            vec![central, p1, p2]
+        }
+        PkModel::ThreeCptOral => {
+            if dose.is_infusion() {
+                let c = three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+                let [p1, p2] =
+                    three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+                vec![0.0, c, p1, p2]
+            } else {
+                let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
+                let central = three_cpt_oral_f(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.q3(),
+                    p.v3(),
+                    p.ka(),
+                    p.f_bio(),
+                );
+                let [p1, p2] = three_cpt_oral_peripherals(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.q3(),
+                    p.v3(),
+                    p.ka(),
+                    p.f_bio(),
+                );
+                vec![depot, central, p1, p2]
+            }
+        }
+    }
+}
+
+/// Superposition of compartment states across all doses at each observation time.
+///
+/// Returns a `Vec<Vec<f64>>` where `[j]` is the full state vector at observation
+/// time `j`. Uses the same lagtime/SS logic as `predict_concentration`.
+pub fn predict_all_states(
+    pk_model: PkModel,
+    subject: &Subject,
+    pk_params: &PkParams,
+) -> Vec<Vec<f64>> {
+    let lagtime = pk_params.lagtime();
+    let n_states = match pk_model {
+        PkModel::OneCptIv => 1,
+        PkModel::OneCptOral => 2,
+        PkModel::TwoCptIv => 2,
+        PkModel::TwoCptOral => 3,
+        PkModel::ThreeCptIv => 3,
+        PkModel::ThreeCptOral => 4,
+    };
+    subject
+        .obs_times
+        .iter()
+        .map(|&t| {
+            let mut state = vec![0.0_f64; n_states];
+            for dose in &subject.doses {
+                let t_eff = dose.time + lagtime;
+                let tau = if t_eff <= t {
+                    t - t_eff
+                } else if dose.ss && dose.ii > 0.0 && t >= dose.time {
+                    let raw = t - t_eff;
+                    let n = (-raw / dose.ii).ceil();
+                    let wrapped = raw + n * dose.ii;
+                    if wrapped >= 0.0 {
+                        wrapped
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+                let contrib = single_dose_states(pk_model, dose, tau, pk_params);
+                for (s, v) in state.iter_mut().zip(contrib.iter()) {
+                    *s += v;
+                }
+            }
+            // Floor: states cannot be negative (amounts/concentrations)
+            for s in &mut state {
+                if *s < 0.0 {
+                    *s = 0.0;
+                }
+            }
+            state
+        })
+        .collect()
+}
+
+/// Compute the full compartment state vector at arbitrary `times` for an analytical model.
+/// Used by the grid-integral path in `compute_extra_output_columns` when an integrand
+/// references compartment states (`uses_compartments = true`).
+pub fn analytical_state_at_times(
+    pk_model: PkModel,
+    subject: &Subject,
+    pk_params: &PkParams,
+    times: &[f64],
+) -> Vec<Vec<f64>> {
+    let lagtime = pk_params.lagtime();
+    let n_states = match pk_model {
+        PkModel::OneCptIv => 1,
+        PkModel::OneCptOral => 2,
+        PkModel::TwoCptIv => 2,
+        PkModel::TwoCptOral => 3,
+        PkModel::ThreeCptIv => 3,
+        PkModel::ThreeCptOral => 4,
+    };
+    times
+        .iter()
+        .map(|&t| {
+            let mut state = vec![0.0_f64; n_states];
+            for dose in &subject.doses {
+                let t_eff = dose.time + lagtime;
+                let tau = if t_eff <= t {
+                    t - t_eff
+                } else if dose.ss && dose.ii > 0.0 && t >= dose.time {
+                    let raw = t - t_eff;
+                    let n = (-raw / dose.ii).ceil();
+                    let wrapped = raw + n * dose.ii;
+                    if wrapped >= 0.0 {
+                        wrapped
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+                let contrib = single_dose_states(pk_model, dose, tau, pk_params);
+                for (s, v) in state.iter_mut().zip(contrib.iter()) {
+                    *s += v;
+                }
+            }
+            for s in &mut state {
+                if *s < 0.0 {
+                    *s = 0.0;
+                }
+            }
+            state
+        })
+        .collect()
+}
+
+/// Compute predictions AND full compartment states for all observations.
+/// Returns `(ipred_vec, compartment_states_vec)`.
+///
+/// Routes through the standard `compute_predictions_with_tv` for ipred, and
+/// `predict_all_states` for the states. The two calls use the same PK params so
+/// the values are consistent (but computed independently — a future optimisation
+/// could fuse them if profiling shows this as a bottleneck).
+///
+/// For subjects with resets (EVID=3/4), the reset disrupts superposition; states
+/// are set to the post-reset analytical values from the event-driven path.
+/// For IOV models, states are left empty (the IOV path is complex and the primary
+/// use case is post-fit ODE models).
+pub fn compute_predictions_with_states(
+    model: &crate::types::CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let ipred = compute_predictions_with_tv(model, subject, theta, eta);
+    let states = if let Some(ref ode) = model.ode_spec {
+        // ODE path: delegate to ode_predictions_with_states which captures the full
+        // solver state at each obs time. Resets are handled inside that function.
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        if subject.has_tv_covariates() || subject.has_resets() {
+            let mut scratch = EventPkParams::with_capacity_for(subject);
+            compute_event_pk_params_into(model, subject, theta, eta, &mut scratch);
+            crate::ode::ode_predictions_event_driven_with_states(
+                ode,
+                subject,
+                theta,
+                eta,
+                &scratch.dose,
+                &scratch.obs,
+                &scratch.pk_only,
+            )
+            .1
+        } else {
+            crate::ode::ode_predictions_with_states(ode, &pk.values, theta, eta, subject).1
+        }
+    } else if subject.has_resets() {
+        // Analytical with resets: for now return empty states (reset mid-timeline
+        // invalidates simple superposition; the event-driven analytical path does
+        // not yet return states).
+        vec![vec![]; subject.obs_times.len()]
+    } else {
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        predict_all_states(model.pk_model, subject, &pk)
+    };
+    (ipred, states)
+}
+
+/// ODE-specific version: returns `(ipred, compartment_states)` using the ODE solver.
+pub fn compute_predictions_ode_with_states(
+    ode_spec: &crate::ode::OdeSpec,
+    subject: &Subject,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    if subject.has_resets() {
+        let mut pk = PkParams::default();
+        let n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
+        pk.values[..n].copy_from_slice(&pk_params_flat[..n]);
+        let pk_dose = vec![pk; subject.doses.len()];
+        let pk_obs = vec![pk; subject.obs_times.len()];
+        let pk_pk_only = vec![pk; subject.pk_only_times.len()];
+        crate::ode::ode_predictions_event_driven_with_states(
+            ode_spec,
+            subject,
+            theta,
+            eta,
+            &pk_dose,
+            &pk_obs,
+            &pk_pk_only,
+        )
+    } else {
+        crate::ode::ode_predictions_with_states(ode_spec, pk_params_flat, theta, eta, subject)
+    }
+}
+
 /// Compute predictions for all observation times of a subject.
 /// Uses analytical equations for standard PK models, or delegates to ODE solver
 /// when an OdeSpec is provided.

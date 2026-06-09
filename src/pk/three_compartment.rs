@@ -661,10 +661,17 @@ pub(crate) fn three_cpt_oral_peripherals(
         * (-(alpha - k31) / ((ka - alpha) * ab * ag) * ss_bat(alpha)
             + (beta - k31) / ((ka - beta) * ab * bg) * ss_bat(beta)
             - (gamma - k31) / ((ka - gamma) * ag * bg) * ss_bat(gamma));
-    // Handle ka ≈ eigenvalue singularity in the denominator coefficients.
-    // When (ka - lambda).abs() < 1e-6, the Bateman L'Hôpital contributes a
-    // finite term; the denominator (ka-lambda) then makes it 0/0 → use limit.
-    // For simplicity, zero out the coefficient for the singular eigenvalue pair.
+    // When ka ≈ any eigenvalue, the outer `(ka − λ)` denominator is near-zero
+    // even though `ss_bat(λ)` already applied L'Hôpital's rule to `bateman(λ)`.
+    // The combined limit `ss_bat(λ) / (ka − λ)` requires a second-order
+    // L'Hôpital derivation.  For peripheral compartments that derivation
+    // produces a finite but algebraically complex expression; until it is
+    // implemented we conservatively zero the *entire* peripheral result when
+    // *any* eigenvalue is near ka.  This is overly aggressive — only the
+    // singular eigenvalue term is actually undefined — but the edge case
+    // (ka ≈ an eigenvalue of a 3-cpt system) is rare in real PK data.
+    // The central concentration is not affected (it is zeroed separately in
+    // the central formula).
     let c2 = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 || (ka - gamma).abs() < 1e-6 {
         0.0
     } else {
@@ -676,6 +683,7 @@ pub(crate) fn three_cpt_oral_peripherals(
         * (-(alpha - k21) / ((ka - alpha) * ab * ag) * ss_bat(alpha)
             + (beta - k21) / ((ka - beta) * ab * bg) * ss_bat(beta)
             - (gamma - k21) / ((ka - gamma) * ag * bg) * ss_bat(gamma));
+    // Same conservative guard as c2 above.
     let c3 = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 || (ka - gamma).abs() < 1e-6 {
         0.0
     } else {

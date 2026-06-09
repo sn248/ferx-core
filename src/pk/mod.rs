@@ -711,6 +711,14 @@ pub fn analytical_state_at_times(
                     continue;
                 };
                 let contrib = single_dose_states(pk_model, dose, tau, pk_params);
+                debug_assert_eq!(
+                    contrib.len(),
+                    n_states,
+                    "single_dose_states returned {} values but n_states={}; \
+                     update both match arms together",
+                    contrib.len(),
+                    n_states
+                );
                 for (s, v) in state.iter_mut().zip(contrib.iter()) {
                     *s += v;
                 }
@@ -793,35 +801,6 @@ pub fn compute_predictions_with_states(
         predict_all_states(model.pk_model, subject, &pk)
     };
     (ipred, states)
-}
-
-/// ODE-specific version: returns `(ipred, compartment_states)` using the ODE solver.
-pub fn compute_predictions_ode_with_states(
-    ode_spec: &crate::ode::OdeSpec,
-    subject: &Subject,
-    pk_params_flat: &[f64],
-    theta: &[f64],
-    eta: &[f64],
-) -> (Vec<f64>, Vec<Vec<f64>>) {
-    if subject.has_resets() {
-        let mut pk = PkParams::default();
-        let n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
-        pk.values[..n].copy_from_slice(&pk_params_flat[..n]);
-        let pk_dose = vec![pk; subject.doses.len()];
-        let pk_obs = vec![pk; subject.obs_times.len()];
-        let pk_pk_only = vec![pk; subject.pk_only_times.len()];
-        crate::ode::ode_predictions_event_driven_with_states(
-            ode_spec,
-            subject,
-            theta,
-            eta,
-            &pk_dose,
-            &pk_obs,
-            &pk_pk_only,
-        )
-    } else {
-        crate::ode::ode_predictions_with_states(ode_spec, pk_params_flat, theta, eta, subject)
-    }
 }
 
 /// Compute predictions for all observation times of a subject.

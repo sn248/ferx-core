@@ -1045,6 +1045,15 @@ pub fn ode_predictions_ekf(
 ///
 /// The estimation hot path uses [`ode_predictions`] (no allocation overhead);
 /// this variant is called once post-fit to populate `SubjectResult::compartment_states`.
+///
+/// # KEEP-IN-SYNC with [`ode_predictions`]
+///
+/// This function is a near-copy of `ode_predictions` with the single addition of
+/// `states[obs_idx] = u.clone()` / `states[obs_idx] = pt.u.clone()` at every
+/// observation capture site. Any change to dose-event handling, SS logic,
+/// infusion tracking, break-time construction, or `read_observable` calls in
+/// `ode_predictions` **must be mirrored here**. Search for the parallel line in
+/// `ode_predictions` and apply the same change.
 pub fn ode_predictions_with_states(
     ode: &OdeSpec,
     pk_params_flat: &[f64],
@@ -1444,8 +1453,11 @@ pub fn ode_dense_solve_states(
         }
     }
 
-    // Suppress unused theta/eta warning — they would be used if Form C
-    // readout needed them, but dense state extraction always returns raw u.
+    // `theta` and `eta` are accepted for API symmetry with sibling ODE functions
+    // (e.g. `ode_predictions_with_states`) but are not consumed here: this
+    // function returns the raw ODE state vector `u` without applying any
+    // `output_fn` / Form-C scaling. A future extension that returns scaled
+    // observables alongside states would use them. Suppress the unused warning.
     let _ = (theta, eta);
 
     result

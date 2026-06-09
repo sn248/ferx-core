@@ -663,6 +663,225 @@ mod survival_smoke {
         }
     }
 
+    // ── Phase 1 follow-up: example file parse tests ───────────────────────────
+
+    /// `examples/tte_weibull.ferx` must parse and expose a CMT-2 Weibull endpoint.
+    /// Guards against syntax drift in the example file — CI catches it here.
+    #[test]
+    fn tte_weibull_example_file_parses() {
+        let src = include_str!("../examples/tte_weibull.ferx");
+        let model = parse_model_string(src).expect("tte_weibull.ferx must parse");
+        assert!(
+            model.endpoints.contains_key(&2),
+            "CMT=2 must be registered as a TTE endpoint"
+        );
+        match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte { hazard: _ }) => {}
+            other => panic!("expected Tte endpoint for CMT=2 (Weibull), got: {other:?}"),
+        }
+        assert_eq!(model.n_theta, 2, "n_theta should be 2 (TVSCALE, TVSHAPE)");
+        assert_eq!(model.n_eta, 1, "n_eta should be 1 (ETA_SCALE)");
+    }
+
+    /// `examples/tte_gompertz.ferx` must parse and expose a CMT-2 Gompertz endpoint.
+    #[test]
+    fn tte_gompertz_example_file_parses() {
+        let src = include_str!("../examples/tte_gompertz.ferx");
+        let model = parse_model_string(src).expect("tte_gompertz.ferx must parse");
+        assert!(
+            model.endpoints.contains_key(&2),
+            "CMT=2 must be registered as a TTE endpoint"
+        );
+        match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte { hazard: _ }) => {}
+            other => panic!("expected Tte endpoint for CMT=2 (Gompertz), got: {other:?}"),
+        }
+        assert_eq!(model.n_theta, 2, "n_theta should be 2 (TVALPHA, TVGAMMA)");
+        assert_eq!(model.n_eta, 1, "n_eta should be 1 (ETA_ALPHA)");
+    }
+
+    // ── Phase 1 follow-up: Weibull / Gompertz fit smoke tests ─────────────────
+
+    /// Simulated Weibull TTE data (30 subjects, seed=42).
+    /// TVSCALE=20 h, TVSHAPE=1.5, omega(ETA_SCALE)=0.04, censor=60 h.
+    /// Mirrors data/tte_weibull.csv.
+    const WEIBULL_DATA: &[(f64, u8)] = &[
+        (23.04, 1),
+        (25.31, 1),
+        (4.59, 1),
+        (26.89, 1),
+        (25.32, 1),
+        (15.87, 1),
+        (13.01, 1),
+        (14.66, 1),
+        (7.46, 1),
+        (60.0, 0),
+        (23.39, 1),
+        (22.63, 1),
+        (42.43, 1),
+        (33.56, 1),
+        (8.37, 1),
+        (7.41, 1),
+        (11.62, 1),
+        (12.52, 1),
+        (6.42, 1),
+        (10.51, 1),
+        (25.52, 1),
+        (21.77, 1),
+        (39.51, 1),
+        (25.29, 1),
+        (17.57, 1),
+        (23.34, 1),
+        (10.9, 1),
+        (19.99, 1),
+        (34.66, 1),
+        (26.03, 1),
+    ];
+
+    /// Simulated Gompertz TTE data (30 subjects, seed=42).
+    /// TVALPHA=0.002 h⁻¹, TVGAMMA=0.05 h⁻¹, omega(ETA_ALPHA)=0.09, censor=60 h.
+    /// Mirrors data/tte_gompertz.csv.
+    const GOMPERTZ_DATA: &[(f64, u8)] = &[
+        (60.0, 0),
+        (60.0, 0),
+        (27.54, 1),
+        (60.0, 0),
+        (60.0, 0),
+        (57.22, 1),
+        (45.74, 1),
+        (55.05, 1),
+        (35.53, 1),
+        (60.0, 0),
+        (60.0, 0),
+        (60.0, 0),
+        (60.0, 0),
+        (60.0, 0),
+        (33.11, 1),
+        (49.7, 1),
+        (60.0, 0),
+        (58.7, 1),
+        (27.97, 1),
+        (60.0, 0),
+        (60.0, 0),
+        (60.0, 0),
+        (60.0, 0),
+        (60.0, 0),
+        (60.0, 0),
+        (60.0, 0),
+        (50.82, 1),
+        (39.34, 1),
+        (60.0, 0),
+        (56.44, 1),
+    ];
+
+    /// TTE-only Weibull model for smoke-fit tests (maxiter=3 for speed).
+    const WEIBULL_TTE_ONLY: &str = r"
+[parameters]
+  theta TVSCALE(20.0, 0.1, 500.0)
+  theta TVSHAPE(1.5,  0.1, 10.0)
+  omega ETA_SCALE ~ 0.04
+
+[event_model]
+  cmt    = 2
+  family = weibull
+  scale  = TVSCALE * exp(ETA_SCALE)
+  shape  = TVSHAPE
+
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+
+    /// TTE-only Gompertz model for smoke-fit tests (maxiter=3 for speed).
+    const GOMPERTZ_TTE_ONLY: &str = r"
+[parameters]
+  theta TVALPHA(0.002, 1e-5, 1.0)
+  theta TVGAMMA(0.05,  1e-4, 5.0)
+  omega ETA_ALPHA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  family = gompertz
+  alpha  = TVALPHA * exp(ETA_ALPHA)
+  gamma  = TVGAMMA
+
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+
+    /// SAEM model for the M-step TTE smoke test.  Uses the compact TTE-only syntax
+    /// and SAEM with minimal iterations — verifies that the SAEM M-step includes the
+    /// TTE data term (obs_nll_subject_into fix, item 2 of Phase 1 follow-up).
+    const EXP_TTE_SAEM: &str = r"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+
+[fit_options]
+  method        = saem
+  n_exploration = 2
+  n_convergence = 2
+  maxiter       = 3
+";
+
+    /// Weibull TTE fit must return a finite OFV after 3 outer iterations.
+    #[test]
+    fn tte_weibull_fit_completes() {
+        let model = parse_model_string(WEIBULL_TTE_ONLY).expect("WEIBULL_TTE_ONLY must parse");
+        let pop = tte_population(WEIBULL_DATA);
+        let mut opts = FitOptions::default();
+        opts.verbose = false;
+        match fit(&model, &pop, &model.default_params, &opts) {
+            Ok(r) => assert!(
+                r.ofv.is_finite(),
+                "Weibull OFV must be finite; got {}",
+                r.ofv
+            ),
+            Err(e) => panic!("Weibull TTE fit must not error: {e}"),
+        }
+    }
+
+    /// Gompertz TTE fit must return a finite OFV after 3 outer iterations.
+    #[test]
+    fn tte_gompertz_fit_completes() {
+        let model = parse_model_string(GOMPERTZ_TTE_ONLY).expect("GOMPERTZ_TTE_ONLY must parse");
+        let pop = tte_population(GOMPERTZ_DATA);
+        let mut opts = FitOptions::default();
+        opts.verbose = false;
+        match fit(&model, &pop, &model.default_params, &opts) {
+            Ok(r) => assert!(
+                r.ofv.is_finite(),
+                "Gompertz OFV must be finite; got {}",
+                r.ofv
+            ),
+            Err(e) => panic!("Gompertz TTE fit must not error: {e}"),
+        }
+    }
+
+    /// SAEM on a TTE-only exponential model must return a finite OFV.
+    /// Specifically exercises the obs_nll_subject_into TTE data term (SAEM M-step fix).
+    #[test]
+    fn tte_saem_fit_completes() {
+        let model = parse_model_string(EXP_TTE_SAEM).expect("EXP_TTE_SAEM must parse");
+        let pop = tte_population(TTE_DATA);
+        let mut opts = FitOptions::default();
+        opts.verbose = false;
+        match fit(&model, &pop, &model.default_params, &opts) {
+            Ok(r) => assert!(
+                r.ofv.is_finite(),
+                "SAEM TTE OFV must be finite; got {}",
+                r.ofv
+            ),
+            Err(e) => panic!("SAEM TTE fit must not error: {e}"),
+        }
+    }
+
     /// DoseEvent helper — not used in TTE-only tests but checks Subject
     /// constructors compile correctly with the obs_records field.
     #[allow(dead_code)]

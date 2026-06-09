@@ -5,7 +5,9 @@ use rayon::prelude::*;
 
 use crate::estimation::gauss_newton::subject_nll_pop_grad;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
-use crate::estimation::outer_optimizer::{compute_covariance, pop_nll, OuterResult};
+use crate::estimation::outer_optimizer::{
+    compute_covariance, format_non_pd_warning, pop_nll, CovarianceStepResult, OuterResult,
+};
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params, PackedBounds,
 };
@@ -409,21 +411,24 @@ pub fn optimize_trust_region(
             &final_kappas,
             options,
         ) {
-            Some(out) => {
+            CovarianceStepResult::Success(out) => {
                 if let Some(w) = out.warning {
                     warnings.push(w);
                 }
                 Some(out.matrix)
             }
-            None => None,
+            CovarianceStepResult::NonPdHessian(eigvals) => {
+                warnings.push(format_non_pd_warning(&eigvals));
+                None
+            }
+            CovarianceStepResult::Unusable => {
+                warnings.push("Covariance step failed".to_string());
+                None
+            }
         }
     } else {
         None
     };
-
-    if covariance_matrix.is_none() && options.run_covariance_step {
-        warnings.push("Covariance step failed".to_string());
-    }
 
     OuterResult {
         params: final_params,

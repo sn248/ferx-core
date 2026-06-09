@@ -15,7 +15,9 @@
 /// converges in 10-30 iterations vs 100+ for first-order methods.
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::pop_nll;
-use crate::estimation::outer_optimizer::{compute_covariance, OuterResult};
+use crate::estimation::outer_optimizer::{
+    compute_covariance, format_non_pd_warning, CovarianceStepResult, OuterResult,
+};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
 use crate::stats::likelihood::{
@@ -377,13 +379,17 @@ pub fn run_foce_gn(
                     &kappas,
                     options,
                 ) {
-                    Some(out) => {
+                    CovarianceStepResult::Success(out) => {
                         if let Some(w) = out.warning {
                             warnings.push(w);
                         }
                         Some(out.matrix)
                     }
-                    None => {
+                    CovarianceStepResult::NonPdHessian(eigvals) => {
+                        warnings.push(format_non_pd_warning(&eigvals));
+                        None
+                    }
+                    CovarianceStepResult::Unusable => {
                         warnings.push("Covariance step failed".to_string());
                         None
                     }
@@ -482,13 +488,17 @@ pub fn run_foce_gn(
             &final_kappas,
             options,
         ) {
-            Some(out) => {
+            CovarianceStepResult::Success(out) => {
                 if let Some(w) = out.warning {
                     warnings.push(w);
                 }
                 Some(out.matrix)
             }
-            None => {
+            CovarianceStepResult::NonPdHessian(eigvals) => {
+                warnings.push(format_non_pd_warning(&eigvals));
+                None
+            }
+            CovarianceStepResult::Unusable => {
                 warnings.push("Covariance step failed".to_string());
                 None
             }

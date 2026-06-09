@@ -7,7 +7,9 @@
 ///   Phase 1 (exploration, k ≤ K1):  γₖ = 1          — rapid basin convergence
 ///   Phase 2 (convergence, k > K1):  γₖ = 1/(k−K1)   — almost-sure convergence to MLE
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
-use crate::estimation::outer_optimizer::{compute_covariance, pop_nll, OuterResult};
+use crate::estimation::outer_optimizer::{
+    compute_covariance, format_non_pd_warning, pop_nll, CovarianceStepResult, OuterResult,
+};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
@@ -1995,13 +1997,17 @@ pub fn run_saem(
                 &final_kappas,
                 options,
             ) {
-                Some(out) => {
+                CovarianceStepResult::Success(out) => {
                     if let Some(w) = out.warning {
                         warnings.push(w);
                     }
                     Some(out.matrix)
                 }
-                None => {
+                CovarianceStepResult::NonPdHessian(eigvals) => {
+                    warnings.push(format_non_pd_warning(&eigvals));
+                    None
+                }
+                CovarianceStepResult::Unusable => {
                     warnings.push("Covariance step failed — SEs not available".to_string());
                     None
                 }

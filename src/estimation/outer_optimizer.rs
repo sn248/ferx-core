@@ -1223,13 +1223,20 @@ fn optimize_nlopt(
                 &final_kappas,
                 options,
             ) {
-                Some(out) => {
+                CovarianceStepResult::Success(out) => {
                     if let Some(w) = out.warning {
                         warnings.push(w);
                     }
                     Some(out.matrix)
                 }
-                None => None,
+                CovarianceStepResult::NonPdHessian(eigvals) => {
+                    warnings.push(format_non_pd_warning(&eigvals));
+                    None
+                }
+                CovarianceStepResult::Unusable => {
+                    warnings.push("Covariance step failed".to_string());
+                    None
+                }
             }
         } else {
             None
@@ -1237,9 +1244,6 @@ fn optimize_nlopt(
 
     if !converged {
         warnings.push("Outer optimization did not converge".to_string());
-    }
-    if covariance_matrix.is_none() && options.run_covariance_step {
-        warnings.push("Covariance step failed".to_string());
     }
 
     let final_gradient = last_gradient.lock().unwrap().clone();
@@ -1555,13 +1559,20 @@ fn optimize_bfgs(
                 &final_kappas,
                 options,
             ) {
-                Some(out) => {
+                CovarianceStepResult::Success(out) => {
                     if let Some(w) = out.warning {
                         warnings.push(w);
                     }
                     Some(out.matrix)
                 }
-                None => None,
+                CovarianceStepResult::NonPdHessian(eigvals) => {
+                    warnings.push(format_non_pd_warning(&eigvals));
+                    None
+                }
+                CovarianceStepResult::Unusable => {
+                    warnings.push("Covariance step failed".to_string());
+                    None
+                }
             }
         } else {
             None
@@ -1569,12 +1580,6 @@ fn optimize_bfgs(
 
     if !converged {
         warnings.push("Outer optimization did not converge".to_string());
-    }
-    if covariance_matrix.is_none()
-        && options.run_covariance_step
-        && !crate::cancel::is_cancelled(&options.cancel)
-    {
-        warnings.push("Covariance step failed".to_string());
     }
 
     OuterResult {
@@ -1867,14 +1872,60 @@ pub(crate) struct CovarianceOutput {
     pub warning: Option<String>,
 }
 
+/// Return type of [`compute_covariance`].
+pub(crate) enum CovarianceStepResult {
+    /// Covariance computed successfully. `warning` is Some when regularisation was applied.
+    Success(CovarianceOutput),
+    /// Hessian is not positive definite; eigenvalues listed in descending order.
+    NonPdHessian(Vec<f64>),
+    /// Structurally unusable: non-finite OFV, Hessian entries, or no positive curvature.
+    Unusable,
+}
+
+/// Eigenvalues of `sym` sorted descending. Returns `None` if any eigenvalue is non-finite.
+fn extract_eigenvalues(sym: &DMatrix<f64>) -> Option<Vec<f64>> {
+    let eig = SymmetricEigen::new(sym.clone());
+    if eig.eigenvalues.iter().any(|l| !l.is_finite()) {
+        return None;
+    }
+    let mut eigvals: Vec<f64> = eig.eigenvalues.iter().cloned().collect();
+    eigvals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    Some(eigvals)
+}
+
+/// Format a diagnostic warning for a non-positive-definite covariance Hessian.
+pub(crate) fn format_non_pd_warning(eigvals: &[f64]) -> String {
+    let fmt = eigvals
+        .iter()
+        .map(|&v| {
+            let abs = v.abs();
+            if abs == 0.0 {
+                "0".to_string()
+            } else if abs >= 1e-4 && abs < 1e5 {
+                format!("{:.4}", v)
+            } else {
+                format!("{:.3e}", v)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Covariance step: Hessian is not positive definite. \
+         Eigenvalues: [{}]. SE estimates not available.",
+        fmt
+    )
+}
+
 /// Compute covariance matrix via finite-difference Hessian at convergence.
 ///
-/// Returns `None` only when the FD Hessian itself is structurally unusable
-/// (non-finite or zero-diagonal entries). When the symmetrised free-block
+/// Returns [`CovarianceStepResult::Unusable`] when the FD Hessian is structurally
+/// unusable (non-finite or zero-diagonal entries). When the symmetrised free-block
 /// Hessian is near-singular or has negative eigenvalues — a common FD noise
 /// artefact on well-conditioned surfaces (see issue #129) — it is regularised
-/// by clipping eigenvalues to a small positive floor before inversion, and
-/// the returned `warning` records what was done.
+/// by clipping eigenvalues to a small positive floor before inversion, and the
+/// returned `warning` records what was done. When the Hessian has no positive
+/// curvature at all (all eigenvalues ≤ 0), returns
+/// [`CovarianceStepResult::NonPdHessian`] with the eigenvalue list.
 pub(crate) fn compute_covariance(
     x_hat: &[f64],
     template: &ModelParameters,
@@ -1884,7 +1935,7 @@ pub(crate) fn compute_covariance(
     h_matrices: &[DMatrix<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-) -> Option<CovarianceOutput> {
+) -> CovarianceStepResult {
     let n = x_hat.len();
     let eps = 1e-2; // large step for FD Hessian on log-scale parameters
 
@@ -1937,7 +1988,7 @@ pub(crate) fn compute_covariance(
         if options.verbose {
             eprintln!("  Covariance failed: base OFV is non-finite");
         }
-        return None;
+        return CovarianceStepResult::Unusable;
     }
 
     // FIX parameters contribute no information — skip their FD stencils and,
@@ -2019,7 +2070,7 @@ pub(crate) fn compute_covariance(
                 n_nonfinite, n_zero
             );
         }
-        return None;
+        return CovarianceStepResult::Unusable;
     }
 
     // Build the reduced Hessian over free indices, invert, then embed back
@@ -2028,7 +2079,7 @@ pub(crate) fn compute_covariance(
     if n_free == 0 {
         // Nothing to estimate — return an all-zero covariance so downstream
         // SE extraction reports zeros (all params FIX).
-        return Some(CovarianceOutput {
+        return CovarianceStepResult::Success(CovarianceOutput {
             matrix: DMatrix::zeros(n, n),
             warning: None,
         });
@@ -2041,7 +2092,13 @@ pub(crate) fn compute_covariance(
     }
     let hess_free_sym = (&hess_free + hess_free.transpose()) * 0.5;
 
-    let inv = invert_psd_with_floor(&hess_free_sym)?;
+    let inv = match invert_psd_with_floor(&hess_free_sym) {
+        Some(inv) => inv,
+        None => match extract_eigenvalues(&hess_free_sym) {
+            Some(eigvals) => return CovarianceStepResult::NonPdHessian(eigvals),
+            None => return CovarianceStepResult::Unusable,
+        },
+    };
     let cov_free = inv.inverse;
 
     let mut cov = DMatrix::zeros(n, n);
@@ -2069,7 +2126,7 @@ pub(crate) fn compute_covariance(
         None
     };
 
-    Some(CovarianceOutput {
+    CovarianceStepResult::Success(CovarianceOutput {
         matrix: cov,
         warning,
     })
@@ -2265,11 +2322,50 @@ mod tests {
     }
 
     /// Hopelessly indefinite input (all eigenvalues ≤ 0) returns None — the
-    /// caller surfaces this as the legitimate "Covariance step failed".
+    /// caller surfaces this as CovarianceStepResult::NonPdHessian.
     #[test]
     fn test_invert_psd_with_floor_rejects_negative_definite() {
         let h = DMatrix::from_row_slice(2, 2, &[-1.0, 0.0, 0.0, -2.0]);
         assert!(invert_psd_with_floor(&h).is_none());
+    }
+
+    /// extract_eigenvalues returns eigenvalues sorted descending and returns None
+    /// for inputs with non-finite entries.
+    #[test]
+    fn test_extract_eigenvalues_sorts_descending() {
+        let h = DMatrix::from_row_slice(2, 2, &[-1.0, 0.0, 0.0, -2.0]);
+        let ev = extract_eigenvalues(&h).expect("finite eigenvalues for this input");
+        assert_eq!(ev.len(), 2);
+        assert!(ev[0] >= ev[1], "eigenvalues must be sorted descending");
+        assert!(
+            ev.iter().all(|&e| e < 0.0),
+            "both eigenvalues must be negative"
+        );
+    }
+
+    /// format_non_pd_warning produces a message with the expected structure and
+    /// includes the eigenvalue list.
+    #[test]
+    fn test_format_non_pd_warning_structure() {
+        let ev = vec![8.4, 2.1, 0.3, -0.01];
+        let msg = format_non_pd_warning(&ev);
+        assert!(
+            msg.contains("Hessian is not positive definite"),
+            "message must flag non-PD Hessian"
+        );
+        assert!(
+            msg.contains("Eigenvalues:"),
+            "message must include eigenvalue list"
+        );
+        assert!(
+            msg.contains("SE estimates not available"),
+            "message must indicate SEs are unavailable"
+        );
+        // Most-negative eigenvalue appears in the output.
+        assert!(
+            msg.contains("-0.0100"),
+            "negative eigenvalue must appear: {msg}"
+        );
     }
 
     /// Empty matrix is a valid zero-dimensional input (all-FIX parameter

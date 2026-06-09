@@ -144,8 +144,10 @@ pub fn mean_survival(family: HazardFamily, params: &[f64]) -> f64 {
             }
         }
         _ => {
-            // Gompertz γ=0 degenerates to Exponential: hazard_and_cum_hazard returns NaN
-            // for cum_h at γ=0 (0/0 form), so take the analytic limit directly.
+            // Gompertz γ=0 degenerates to Exponential with rate α·exp(loghr).
+            // hazard_and_cum_hazard has its own γ=0 guard, but the integration
+            // upper bound would be 40×median which overshoots the analytic limit —
+            // so we return the exact value directly.
             if matches!(family, HazardFamily::Gompertz) && params[1] == 0.0 {
                 let alpha = params[0];
                 let loghr = params.get(2).copied().unwrap_or(0.0);

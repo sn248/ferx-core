@@ -1776,20 +1776,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Warn about declared-but-unused parameters. Runs here (after [event_model]
     // parsing) so that parameters used only in [event_model] are not falsely
     // reported as unused in mixed PK+TTE models.
-    {
-        let unused_warnings = check_unused_parameters(
-            &thetas,
-            &eta_names_bsv,
-            &kappa_names,
-            n_eta,
-            &model.default_params.sigma.names,
-            &indiv_stmts,
-            &used_sigmas_in_error,
-            &event_model_used_thetas,
-            &event_model_used_etas,
-        );
-        model.parse_warnings.extend(unused_warnings);
-    }
+    model.parse_warnings.extend(check_unused_parameters(
+        &thetas,
+        &eta_names_bsv,
+        &kappa_names,
+        n_eta,
+        &model.default_params.sigma.names,
+        &indiv_stmts,
+        &used_sigmas_in_error,
+        &event_model_used_thetas,
+        &event_model_used_etas,
+    ));
 
     // Undeclared-covariate warning: checked here (after [event_model] parsing) so
     // that covariates used only in [event_model] expressions are included.

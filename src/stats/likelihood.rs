@@ -428,7 +428,9 @@ pub fn foce_subject_nll(
             &p_obs,
             tte_nll_at_mode,
             tte_h,
-            interaction,
+            // Promote to interaction when M3 BLOQ is active, matching the
+            // non-TTE branch below so M3 subjects always get the CᵀC correction.
+            interaction || m3_active,
         );
     }
 
@@ -957,10 +959,8 @@ pub fn foce_subject_nll_iov(
         // Embed the n_eta × n_eta BSV Hessian into the top-left block of the
         // n_b × n_b augmented Hessian (kappa rows/cols remain zero).
         let mut tte_h = DMatrix::<f64>::zeros(n_b, n_b);
-        for row in 0..n_eta {
-            for col in 0..n_eta {
-                tte_h[(row, col)] = tte_h_bsv[(row, col)];
-            }
+        if n_eta > 0 {
+            tte_h.view_mut((0, 0), (n_eta, n_eta)).copy_from(&tte_h_bsv);
         }
 
         return foce_subject_nll_interaction_with_tte(
@@ -975,7 +975,8 @@ pub fn foce_subject_nll_iov(
             &p_obs_iov,
             tte_nll_at_mode,
             tte_h,
-            interaction,
+            // Promote to interaction when M3 BLOQ is active (same as non-TTE path).
+            interaction || m3_active,
         );
     }
 
@@ -1234,6 +1235,32 @@ pub fn individual_nll_iov(
         } else {
             let resid = y - f_pred;
             data_ll += resid * resid / v + v.ln();
+        }
+    }
+
+    // TTE data term: same convention as individual_nll_into_with_schedule —
+    // multiply by 2.0 so the final 0.5 factor gives a net weight of 1.0×.
+    // Kappas are PK-only; the hazard param_fn uses BSV eta, not kappas.
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        use crate::survival::tte_data_term;
+        use crate::types::EndpointLikelihood;
+        for (cmt, endpoint) in &model.endpoints {
+            if let EndpointLikelihood::Tte { hazard } = endpoint {
+                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned()
+                    .collect();
+                if records_for_cmt.is_empty() {
+                    continue;
+                }
+                data_ll +=
+                    2.0 * tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+            }
         }
     }
 

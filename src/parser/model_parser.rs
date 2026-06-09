@@ -10312,6 +10312,36 @@ mod tests {
         assert!(apply_fit_option(&mut opts, "inner_tol", "not_a_num").is_err());
     }
 
+    #[test]
+    fn test_apply_fit_option_fd_hessian_step_valid() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(&mut opts, "fd_hessian_step", "0.05"),
+            Ok(true)
+        );
+        assert!((opts.fd_hessian_step - 0.05).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_apply_fit_option_fd_hessian_step_zero_rejected() {
+        let mut opts = FitOptions::default();
+        let err = apply_fit_option(&mut opts, "fd_hessian_step", "0").unwrap_err();
+        assert!(
+            err.contains("positive"),
+            "error must mention 'positive': {err}"
+        );
+    }
+
+    #[test]
+    fn test_apply_fit_option_fd_hessian_step_negative_rejected() {
+        let mut opts = FitOptions::default();
+        let err = apply_fit_option(&mut opts, "fd_hessian_step", "-0.01").unwrap_err();
+        assert!(
+            err.contains("positive"),
+            "error must mention 'positive': {err}"
+        );
+    }
+
     // ── IOV: kappa keyword and iov_column ──────────────────────────────────
 
     #[test]

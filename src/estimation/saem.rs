@@ -8,7 +8,7 @@
 ///   Phase 2 (convergence, k > K1):  γₖ = 1/(k−K1)   — almost-sure convergence to MLE
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{
-    compute_covariance, format_non_pd_warning, pop_nll, CovarianceStepResult, OuterResult,
+    compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
@@ -1998,14 +1998,8 @@ pub fn run_saem(
                 options,
             ) {
                 CovarianceStepResult::Success(out) => {
-                    if let Some(w) = out.warning {
-                        warnings.push(w);
-                    }
+                    warnings.extend(out.warnings);
                     Some(out.matrix)
-                }
-                CovarianceStepResult::NonPdHessian(eigvals) => {
-                    warnings.push(format_non_pd_warning(&eigvals));
-                    None
                 }
                 CovarianceStepResult::Unusable(msg) => {
                     warnings.push(msg);

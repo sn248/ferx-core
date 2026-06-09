@@ -15,9 +15,7 @@
 /// converges in 10-30 iterations vs 100+ for first-order methods.
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::pop_nll;
-use crate::estimation::outer_optimizer::{
-    compute_covariance, format_non_pd_warning, CovarianceStepResult, OuterResult,
-};
+use crate::estimation::outer_optimizer::{compute_covariance, CovarianceStepResult, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
 use crate::stats::likelihood::{
@@ -380,14 +378,8 @@ pub fn run_foce_gn(
                     options,
                 ) {
                     CovarianceStepResult::Success(out) => {
-                        if let Some(w) = out.warning {
-                            warnings.push(w);
-                        }
+                        warnings.extend(out.warnings);
                         Some(out.matrix)
-                    }
-                    CovarianceStepResult::NonPdHessian(eigvals) => {
-                        warnings.push(format_non_pd_warning(&eigvals));
-                        None
                     }
                     CovarianceStepResult::Unusable(msg) => {
                         warnings.push(msg);

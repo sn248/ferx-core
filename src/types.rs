@@ -1843,6 +1843,10 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // the category is always covariance_step.
         (WarningSeverity::Warning, "covariance_step")
     } else if lower.contains("ill-conditioned") || lower.contains("condition number") {
+        // Note: "covariance step failed: Hessian has ill-conditioned entries" contains
+        // "ill-conditioned" but is caught by "covariance step failed" above (else-if chain).
+        // Any future covariance message that contains "ill-conditioned" but NOT "failed:"
+        // would land here instead — keep this ordering in mind when adding new messages.
         (WarningSeverity::Critical, "condition_number")
     } else if lower.contains("trust radius") || lower.contains("degenerate") {
         (WarningSeverity::Warning, "optimizer_health")

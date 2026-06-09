@@ -1224,14 +1224,8 @@ fn optimize_nlopt(
                 options,
             ) {
                 CovarianceStepResult::Success(out) => {
-                    if let Some(w) = out.warning {
-                        warnings.push(w);
-                    }
+                    warnings.extend(out.warnings);
                     Some(out.matrix)
-                }
-                CovarianceStepResult::NonPdHessian(eigvals) => {
-                    warnings.push(format_non_pd_warning(&eigvals));
-                    None
                 }
                 CovarianceStepResult::Unusable(msg) => {
                     warnings.push(msg);
@@ -1560,14 +1554,8 @@ fn optimize_bfgs(
                 options,
             ) {
                 CovarianceStepResult::Success(out) => {
-                    if let Some(w) = out.warning {
-                        warnings.push(w);
-                    }
+                    warnings.extend(out.warnings);
                     Some(out.matrix)
-                }
-                CovarianceStepResult::NonPdHessian(eigvals) => {
-                    warnings.push(format_non_pd_warning(&eigvals));
-                    None
                 }
                 CovarianceStepResult::Unusable(msg) => {
                     warnings.push(msg);
@@ -1865,19 +1853,17 @@ fn backtracking_line_search_warm(
 }
 
 /// Outcome of the FD covariance step. `matrix` is the n×n covariance with FIX
-/// rows/cols zeroed; `warning` carries a non-fatal note if the free-block
-/// Hessian had to be regularized to recover a PD matrix (see [`invert_psd_with_floor`]).
+/// rows/cols zeroed; `warnings` carries non-fatal notes (regularisation applied,
+/// off-diagonal FD stencil failures, etc.). Empty when everything was clean.
 pub(crate) struct CovarianceOutput {
     pub matrix: DMatrix<f64>,
-    pub warning: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 /// Return type of [`compute_covariance`].
 pub(crate) enum CovarianceStepResult {
-    /// Covariance computed successfully. `warning` is Some when regularisation was applied.
+    /// Covariance computed (possibly with non-fatal warnings).
     Success(CovarianceOutput),
-    /// Hessian is not positive definite; eigenvalues listed in descending order.
-    NonPdHessian(Vec<f64>),
     /// Structurally unusable. Carries a complete user-facing warning message
     /// (already ends with "SE estimates not available.").
     Unusable(String),
@@ -1920,18 +1906,20 @@ fn packed_param_label(
             (omega_idx, omega_idx)
         } else {
             let mut cnt = 0usize;
+            let mut found = false;
             let mut res = (0, 0);
             'search: for c in 0..n_eta {
                 for r in c..n_eta {
                     if cnt == omega_idx {
                         res = (r, c);
+                        found = true;
                         break 'search;
                     }
                     cnt += 1;
                 }
             }
             debug_assert!(
-                cnt == omega_idx,
+                found,
                 "unreachable: omega_idx={omega_idx} >= n_omega={n_omega}"
             );
             res
@@ -1974,7 +1962,7 @@ fn extract_eigenvalues(sym: &DMatrix<f64>) -> Option<Vec<f64>> {
 }
 
 /// Format a diagnostic warning for a non-positive-definite covariance Hessian.
-pub(crate) fn format_non_pd_warning(eigvals: &[f64]) -> String {
+fn format_non_pd_warning(eigvals: &[f64]) -> String {
     let fmt = eigvals
         .iter()
         .map(|&v| fmt_eig(v))
@@ -1996,7 +1984,7 @@ pub(crate) fn format_non_pd_warning(eigvals: &[f64]) -> String {
 /// by clipping eigenvalues to a small positive floor before inversion, and the
 /// returned `warning` records what was done. When the Hessian has no positive
 /// curvature at all (all eigenvalues ≤ 0), returns
-/// [`CovarianceStepResult::NonPdHessian`] with the eigenvalue list.
+/// [`CovarianceStepResult::Unusable`] carrying the eigenvalue list formatted as a warning.
 pub(crate) fn compute_covariance(
     x_hat: &[f64],
     template: &ModelParameters,
@@ -2077,10 +2065,10 @@ pub(crate) fn compute_covariance(
                 };
                 format!(
                     "Covariance step failed: Omega matrix is {} at convergence \
-                     (min eigenvalue = {:.3e}; eigenvalues: [{}]). \
+                     (min eigenvalue = {}; eigenvalues: [{}]). \
                      SE estimates not available.",
                     descriptor,
-                    min_eig,
+                    fmt_eig(min_eig),
                     ev.iter()
                         .map(|&v| fmt_eig(v))
                         .collect::<Vec<_>>()
@@ -2109,6 +2097,15 @@ pub(crate) fn compute_covariance(
 
     let f0 = base_ofv;
 
+    // Track FD failures at source so diagnostics name the right cause.
+    // The FD loop never stores non-finite values (guarded by is_finite() below),
+    // so post-hoc non-finite checks on `hess` would always be false. Instead we
+    // record which packed indices had a NaN/Inf stencil result here.
+    let mut fd_diag_nan: Vec<usize> = Vec::new();
+    // Packed indices for which at least one cross-partial stencil returned NaN/Inf.
+    // The stored off-diagonal stays 0 (no correlation info) — not fatal, but noted.
+    let mut fd_offdiag_nan: Vec<usize> = Vec::new();
+
     for &i in &free_idx {
         let hi = eps * (1.0 + x_hat[i].abs());
 
@@ -2122,6 +2119,8 @@ pub(crate) fn compute_covariance(
         let h_ii = (fp - 2.0 * f0 + fm) / (hi * hi);
         if h_ii.is_finite() {
             hess[(i, i)] = h_ii;
+        } else {
+            fd_diag_nan.push(i);
         }
 
         // Off-diagonal: 4-point stencil (over free indices only)
@@ -2151,29 +2150,36 @@ pub(crate) fn compute_covariance(
             if h_ij.is_finite() {
                 hess[(i, j)] = h_ij;
                 hess[(j, i)] = h_ij;
+            } else {
+                // Both parameters lose their shared cross-partial; track each once.
+                if !fd_offdiag_nan.contains(&i) {
+                    fd_offdiag_nan.push(i);
+                }
+                if !fd_offdiag_nan.contains(&j) {
+                    fd_offdiag_nan.push(j);
+                }
             }
         }
     }
 
-    // Check for non-finite or zero Hessian entries *in the free block*.
-    // Rows/columns of FIX parameters are intentionally zero and excluded via free_idx.
-    // Track per-parameter rather than raw counts for actionable diagnostics.
+    // Diagnose fatal Hessian problems. Use the FD-failure trackers for accurate
+    // cause labels — post-hoc checks on `hess` would always read 0 (finite) because
+    // non-finite FD results are never stored (only the zero initialisation remains).
     let mut problem_params: Vec<String> = Vec::new();
     for &i in &free_idx {
         let diag = hess[(i, i)];
-        if !diag.is_finite() {
+        if fd_diag_nan.contains(&i) {
+            // Diagonal FD stencil overflowed; zero stored value does not mean flat
+            // objective. Adjust fd_hessian_step or check for model overflow.
             problem_params.push(format!(
-                "{} (non-finite diagonal)",
+                "{} (FD stencil non-finite; model may overflow at perturbation — \
+                 try tuning fd_hessian_step)",
                 packed_param_label(i, template, model)
             ));
         } else if diag.abs() < 1e-30 {
+            // Genuine flat objective: the FD stencil succeeded but returned ~0 curvature.
             problem_params.push(format!(
                 "{} (zero diagonal — flat objective)",
-                packed_param_label(i, template, model)
-            ));
-        } else if free_idx.iter().any(|&j| !hess[(i, j)].is_finite()) {
-            problem_params.push(format!(
-                "{} (non-finite off-diagonal)",
                 packed_param_label(i, template, model)
             ));
         }
@@ -2199,7 +2205,7 @@ pub(crate) fn compute_covariance(
         // SE extraction reports zeros (all params FIX).
         return CovarianceStepResult::Success(CovarianceOutput {
             matrix: DMatrix::zeros(n, n),
-            warning: None,
+            warnings: vec![],
         });
     }
     let mut hess_free = DMatrix::zeros(n_free, n_free);
@@ -2212,12 +2218,18 @@ pub(crate) fn compute_covariance(
 
     let inv = match invert_psd_with_floor(&hess_free_sym) {
         Some(inv) => inv,
-        None => match extract_eigenvalues(&hess_free_sym) {
-            Some(eigvals) => return CovarianceStepResult::NonPdHessian(eigvals),
-            None => return CovarianceStepResult::Unusable(
-                "Covariance step failed: could not compute eigenvalues of the FD Hessian (Hessian may contain NaN or Inf). SE estimates not available.".to_string()
-            ),
-        },
+        None => {
+            // invert_psd_with_floor returns None only when no eigenvalue is positive.
+            // Fold NonPdHessian into Unusable here so callers have a uniform interface.
+            let msg = match extract_eigenvalues(&hess_free_sym) {
+                Some(eigvals) => format_non_pd_warning(&eigvals),
+                None => "Covariance step failed: could not compute eigenvalues of the \
+                         FD Hessian (Hessian may contain NaN or Inf). \
+                         SE estimates not available."
+                    .to_string(),
+            };
+            return CovarianceStepResult::Unusable(msg);
+        }
     };
     let cov_free = inv.inverse;
 
@@ -2228,9 +2240,13 @@ pub(crate) fn compute_covariance(
         }
     }
 
-    let warning = if inv.n_clipped > 0 {
+    let mut cov_warnings: Vec<String> = Vec::new();
+
+    if inv.n_clipped > 0 {
         let pct = inv.n_clipped * 100 / n_free.max(1);
         // Informal thresholds: ≤33 % clipped → minor concern; 34–50 % → caution; >50 % → unreliable.
+        // Note: integer truncation means the boundary moves in steps of 1/n_free; for small
+        // n_free adjacent clipped counts can jump directly from "minor" to "severe".
         let (severity, interp) = match pct {
             0..=33 => ("minor", "Standard errors are likely reliable."),
             34..=50 => (
@@ -2253,17 +2269,34 @@ pub(crate) fn compute_covariance(
         if options.verbose {
             eprintln!("  {}", msg);
         }
-        Some(msg)
-    } else {
+        cov_warnings.push(msg);
+    } else if options.verbose {
+        eprintln!("  Covariance step successful");
+    }
+
+    // Soft warning: cross-partial FD stencils that returned NaN/Inf were stored as 0,
+    // so off-diagonal correlation is missing for these parameters. SEs for the named
+    // parameters may be over-optimistic (correlation with other parameters is absent).
+    if !fd_offdiag_nan.is_empty() {
+        let names: Vec<String> = fd_offdiag_nan
+            .iter()
+            .map(|&i| packed_param_label(i, template, model))
+            .collect();
+        let msg = format!(
+            "Covariance step: off-diagonal FD stencil(s) non-finite for {}. \
+             Cross-partial correlation set to 0; SE for these parameter(s) \
+             may be over-optimistic. Try tuning fd_hessian_step.",
+            names.join(", ")
+        );
         if options.verbose {
-            eprintln!("  Covariance step successful");
+            eprintln!("  {}", msg);
         }
-        None
-    };
+        cov_warnings.push(msg);
+    }
 
     CovarianceStepResult::Success(CovarianceOutput {
         matrix: cov,
-        warning,
+        warnings: cov_warnings,
     })
 }
 
@@ -2457,7 +2490,7 @@ mod tests {
     }
 
     /// Hopelessly indefinite input (all eigenvalues ≤ 0) returns None — the
-    /// caller surfaces this as CovarianceStepResult::NonPdHessian.
+    /// caller surfaces this as CovarianceStepResult::Unusable with the eigenvalue list.
     #[test]
     fn test_invert_psd_with_floor_rejects_negative_definite() {
         let h = DMatrix::from_row_slice(2, 2, &[-1.0, 0.0, 0.0, -2.0]);
@@ -2560,6 +2593,151 @@ mod tests {
 
         let label_diag2 = packed_param_label(4, &template, &model);
         assert_eq!(label_diag2, "omega[ETA_V, ETA_V]", "diagonal 1,1");
+    }
+
+    /// format_non_pd_warning with all-positive eigenvalues (no negative) still
+    /// says "not positive definite" — the function formats whatever list it receives.
+    #[test]
+    fn test_format_non_pd_warning_all_positive() {
+        let ev = vec![5.0, 0.01, 1e-9];
+        let msg = format_non_pd_warning(&ev);
+        assert!(
+            msg.contains("Hessian is not positive definite"),
+            "message must flag non-PD Hessian even for all-positive inputs: {msg}"
+        );
+        assert!(
+            msg.contains("5.0000"),
+            "largest eigenvalue in output: {msg}"
+        );
+        assert!(msg.contains("0.0100"), "medium eigenvalue in output: {msg}");
+        // Tiny eigenvalue formatted in scientific notation.
+        assert!(msg.contains("e-"), "tiny eigenvalue in scientific: {msg}");
+    }
+
+    /// packed_param_label — sigma[1] and sigma[2] paths (1-indexed by convention).
+    #[test]
+    fn test_packed_param_label_sigma() {
+        use crate::types::SigmaVector;
+        // n_theta=1 (diagonal omega), n_omega=1 (diagonal), n_sigma=2
+        let model = make_model(); // eta_names has "ETA_CL"
+        let template = ModelParameters {
+            theta: vec![5.0],
+            theta_names: vec!["CL".into()],
+            theta_lower: vec![0.1],
+            theta_upper: vec![50.0],
+            theta_fixed: vec![false],
+            omega: crate::types::OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]),
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.1, 0.2],
+                names: vec!["ADD".into(), "PROP".into()],
+            },
+            sigma_fixed: vec![false, false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        // packed layout: [theta(0), omega(1), sigma(2), sigma(3)]
+        assert_eq!(packed_param_label(2, &template, &model), "sigma[1]");
+        assert_eq!(packed_param_label(3, &template, &model), "sigma[2]");
+    }
+
+    /// packed_param_label — kappa[1] path (IOV diagonal omega).
+    #[test]
+    fn test_packed_param_label_kappa() {
+        use crate::types::SigmaVector;
+        let model = make_model();
+        let template = ModelParameters {
+            theta: vec![5.0],
+            theta_names: vec!["CL".into()],
+            theta_lower: vec![0.1],
+            theta_upper: vec![50.0],
+            theta_fixed: vec![false],
+            omega: crate::types::OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]),
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.1],
+                names: vec!["ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: Some(crate::types::OmegaMatrix::from_diagonal(
+                &[0.02],
+                vec!["KAPPA_CL".into()],
+            )),
+            kappa_fixed: vec![false],
+        };
+        // packed layout: [theta(0), omega(1), sigma(2), kappa(3)]
+        assert_eq!(packed_param_label(3, &template, &model), "kappa[1]");
+    }
+
+    /// invert_psd_with_floor severity thresholds: 1-of-3 clipped → pct=33 → "minor".
+    #[test]
+    fn test_regularization_severity_minor() {
+        // Build a matrix with exactly one eigenvalue near-zero so exactly 1 of 3 is clipped.
+        // Diagonal 3×3: eigenvalues are the diagonal entries.
+        let h = DMatrix::from_diagonal(&nalgebra::DVector::from_row_slice(&[
+            1.0, 1.0, 1e-20, // this one will be clipped
+        ]));
+        let r = invert_psd_with_floor(&h).expect("should succeed");
+        assert_eq!(r.n_clipped, 1, "exactly one eigenvalue should be clipped");
+        // pct = 1*100/3 = 33 → "minor" threshold
+        let pct = r.n_clipped * 100 / 3;
+        assert_eq!(pct, 33, "33% → minor severity bucket");
+    }
+
+    /// fd_hessian_step = 0.0 triggers Unusable early return in compute_covariance.
+    #[test]
+    fn test_compute_covariance_invalid_eps() {
+        use crate::types::{FitOptions, OmegaMatrix, SigmaVector};
+        let model = make_model();
+        let population = make_population(1);
+        let template = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["CL".into(), "V".into()],
+            theta_lower: vec![0.1, 1.0],
+            theta_upper: vec![50.0, 500.0],
+            theta_fixed: vec![false, false],
+            omega: OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]),
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.1],
+                names: vec!["ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+        };
+        let x_hat: Vec<f64> = vec![
+            5.0_f64.ln(),
+            50.0_f64.ln(),
+            0.04_f64.sqrt().ln(),
+            0.1_f64.ln(),
+        ];
+        let eta_hats = vec![nalgebra::DVector::zeros(1)];
+        let h_mats = vec![DMatrix::zeros(1, 1)];
+        let kappas = vec![vec![]];
+        let mut opts = FitOptions::default();
+        opts.fd_hessian_step = 0.0;
+
+        let result = compute_covariance(
+            &x_hat,
+            &template,
+            &model,
+            &population,
+            &eta_hats,
+            &h_mats,
+            &kappas,
+            &opts,
+        );
+        assert!(
+            matches!(result, CovarianceStepResult::Unusable(_)),
+            "eps=0.0 must return Unusable"
+        );
+        if let CovarianceStepResult::Unusable(msg) = result {
+            assert!(
+                msg.contains("fd_hessian_step"),
+                "message names the option: {msg}"
+            );
+        }
     }
 
     /// Empty matrix is a valid zero-dimensional input (all-FIX parameter

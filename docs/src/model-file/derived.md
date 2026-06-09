@@ -173,6 +173,14 @@ Named access works for analytical models too:
   C_periph_idx = compartments[1] # same value, by index
 ```
 
+> **Validation.** The analytical peripheral/depot states are cross-checked
+> against NONMEM 7.5.1. For 2-cpt IV/oral and 3-cpt IV/oral models, evaluating
+> at fixed θ with η = 0 reproduces NONMEM's tabled compartment amounts `A(i)`
+> (rescaled by the matching volume, since ferx reports central/peripheral
+> compartments as concentrations) to within `1e-4` relative. See
+> `tests/compartment_states_nonmem.rs` and the control files in
+> `tests/nonmem/` (`iv2`, `iv3`, `oral2`, `oral3`).
+
 ### Scaling
 
 `compartments[i]` is **never scaled**. It is the raw solver state or analytical

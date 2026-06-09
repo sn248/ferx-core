@@ -586,11 +586,13 @@ pub(crate) fn three_cpt_iv_peripherals(
 
 /// Returns [C_periph1, C_periph2] for a 3-cpt oral single dose at elapsed time tau.
 ///
-/// C2(t) = D·(q2/v2) · [ −(α−k31)/((ka-α)·ab·ag) · B(α)
-///                        + (β−k31)/((ka-β)·ab·bg) · B(β)
-///                        − (γ−k31)/((ka-γ)·ag·bg) · B(γ) ]
-/// where B(λ) = (exp(−λ·t) − exp(−ka·t)) / (ka−λ).
-/// L'Hôpital limits are applied when ka ≈ any eigenvalue (returns 0 for that term).
+/// C2(t) = D·(q2/v2) · [ −(α−k31)/((ka−α)·ab·ag) · e^(−ατ)
+///                        + (β−k31)/((ka−β)·ab·bg) · e^(−βτ)
+///                        − (γ−k31)/((ka−γ)·ag·bg) · e^(−γτ)
+///                        + (k31−ka)/((α−ka)(β−ka)(γ−ka)) · e^(−kaτ) ]
+/// and C3 likewise with k21 substituted for k31 and (q3/v3) for (q2/v2).
+/// Each exp term gains a 1/(1−e^(−λ·II)) factor at steady state.
+/// Returns 0 when ka ≈ any eigenvalue (L'Hôpital singularity, see body).
 pub(crate) fn three_cpt_oral_peripherals(
     dose: &DoseEvent,
     tau: f64,
@@ -626,69 +628,52 @@ pub(crate) fn three_cpt_oral_peripherals(
     let q2_over_v2 = q2 / v2;
     let q3_over_v3 = q3 / v3;
 
-    // Bateman function for each eigenvalue. L'Hôpital case returns t*exp(-lambda*t).
-    let bateman = |lambda: f64| -> f64 {
-        if (ka - lambda).abs() < 1e-6 {
-            tau * (-lambda * tau).exp() // L'Hôpital limit
-        } else {
-            ((-lambda * tau).exp() - (-ka * tau).exp()) / (ka - lambda)
-        }
-    };
+    // When ka ≈ any eigenvalue the (ka−λ) residue denominators below are
+    // singular (a genuine L'Hôpital case). The finite limit is algebraically
+    // complex; we conservatively zero the *entire* peripheral result. This
+    // matches the 2-cpt oral peripheral and the edge case (ka coinciding with
+    // a 3-cpt eigenvalue) is rare in real PK data. The central concentration is
+    // unaffected (handled separately in the central formula).
+    if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 || (ka - gamma).abs() < 1e-6 {
+        return [0.0, 0.0];
+    }
 
-    let ss_bat = |lambda: f64| -> f64 {
+    // Per-exponential term, with steady-state geometric accumulation when SS.
+    // The single-dose solution is a sum of exp(−λτ) terms (λ ∈ {α,β,γ,ka}); SS
+    // superposition applies the 1/(1−exp(−λ·II)) factor to each independently.
+    let term = |lambda: f64| -> f64 {
+        let base = (-lambda * tau).exp();
         if dose.ss && dose.ii > 0.0 {
-            let ii = dose.ii;
-            if (ka - lambda).abs() < 1e-6 {
-                // SS L'Hôpital: Σ (τ+n·II)·exp(-λ·(τ+n·II))
-                let x = (-lambda * ii).exp();
-                let omx = 1.0 - x;
-                if omx <= 0.0 {
-                    return 0.0;
-                }
-                (-lambda * tau).exp() * (tau / omx + ii * x / (omx * omx))
-            } else {
-                ((-lambda * tau).exp() * ss_coeff_3(lambda, ii)
-                    - (-ka * tau).exp() * ss_coeff_3(ka, ii))
-                    / (ka - lambda)
-            }
+            base * ss_coeff_3(lambda, dose.ii)
         } else {
-            bateman(lambda)
+            base
         }
     };
 
+    // Closed form (issue #205, NONMEM-validated). In Laplace space the central
+    // *amount* after oral input is
+    //   A1(s) = F·D·ka·(s+k21)(s+k31) / [(s+ka)(s+α)(s+β)(s+γ)],
+    // so the peripheral amounts are
+    //   A2(s) = k12·A1(s)/(s+k21) = F·D·ka·k12·(s+k31) / [(s+ka)(s+α)(s+β)(s+γ)]
+    //   A3(s) = k13·A1(s)/(s+k31) = F·D·ka·k13·(s+k21) / [(s+ka)(s+α)(s+β)(s+γ)]
+    // — the coupling pole cancels, leaving four poles. Inverting and dividing
+    // by the peripheral volume gives a residue on each exp(−λτ), λ ∈ {α,β,γ,ka}.
+    // (The prior implementation multiplied each eigenvalue residue by a Bateman
+    // helper, introducing a spurious extra 1/(ka−λ) and a double-counted
+    // exp(−ka·τ) pole — it produced wrong, often negative, peripheral states.)
     let c2 = q2_over_v2
         * d
-        * (-(alpha - k31) / ((ka - alpha) * ab * ag) * ss_bat(alpha)
-            + (beta - k31) / ((ka - beta) * ab * bg) * ss_bat(beta)
-            - (gamma - k31) / ((ka - gamma) * ag * bg) * ss_bat(gamma));
-    // When ka ≈ any eigenvalue, the outer `(ka − λ)` denominator is near-zero
-    // even though `ss_bat(λ)` already applied L'Hôpital's rule to `bateman(λ)`.
-    // The combined limit `ss_bat(λ) / (ka − λ)` requires a second-order
-    // L'Hôpital derivation.  For peripheral compartments that derivation
-    // produces a finite but algebraically complex expression; until it is
-    // implemented we conservatively zero the *entire* peripheral result when
-    // *any* eigenvalue is near ka.  This is overly aggressive — only the
-    // singular eigenvalue term is actually undefined — but the edge case
-    // (ka ≈ an eigenvalue of a 3-cpt system) is rare in real PK data.
-    // The central concentration is not affected (it is zeroed separately in
-    // the central formula).
-    let c2 = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 || (ka - gamma).abs() < 1e-6 {
-        0.0
-    } else {
-        c2
-    };
+        * (-(alpha - k31) / ((ka - alpha) * ab * ag) * term(alpha)
+            + (beta - k31) / ((ka - beta) * ab * bg) * term(beta)
+            - (gamma - k31) / ((ka - gamma) * ag * bg) * term(gamma)
+            + (k31 - ka) / ((alpha - ka) * (beta - ka) * (gamma - ka)) * term(ka));
 
     let c3 = q3_over_v3
         * d
-        * (-(alpha - k21) / ((ka - alpha) * ab * ag) * ss_bat(alpha)
-            + (beta - k21) / ((ka - beta) * ab * bg) * ss_bat(beta)
-            - (gamma - k21) / ((ka - gamma) * ag * bg) * ss_bat(gamma));
-    // Same conservative guard as c2 above.
-    let c3 = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 || (ka - gamma).abs() < 1e-6 {
-        0.0
-    } else {
-        c3
-    };
+        * (-(alpha - k21) / ((ka - alpha) * ab * ag) * term(alpha)
+            + (beta - k21) / ((ka - beta) * ab * bg) * term(beta)
+            - (gamma - k21) / ((ka - gamma) * ag * bg) * term(gamma)
+            + (k21 - ka) / ((alpha - ka) * (beta - ka) * (gamma - ka)) * term(ka));
 
     [c2, c3]
 }
@@ -737,6 +722,30 @@ mod tests {
 
     fn infusion_dose(amt: f64, rate: f64) -> DoseEvent {
         DoseEvent::new(0.0, amt, 1, rate, false, 0.0)
+    }
+
+    /// Regression guard for the `three_cpt_oral_peripherals` fix (issue #205).
+    /// Reference peripheral *concentrations* are NONMEM 7.5.1 ADVAN12 TRANS4
+    /// amounts `A(3)`/`A(4)` divided by the peripheral volumes (V2=20, V3=30);
+    /// see `tests/nonmem/oral3.ctl`. Dose 100 to depot, CL=5 V1=10 Q2=2 V2=20
+    /// Q3=1.5 V3=30 KA=1. The previous (Bateman-helper) implementation returned
+    /// negative, ~30× too large values here.
+    #[test]
+    fn oral_peripherals_match_nonmem() {
+        let dose = bolus_dose(100.0);
+        // (tau, periph1_conc = A(3)/20, periph2_conc = A(4)/30)
+        let refs = [
+            (0.5, 1.8163070319 / 20.0, 1.3744591951 / 30.0),
+            (1.0, 5.3388312327 / 20.0, 4.0814462953 / 30.0),
+            (4.0, 17.378583631 / 20.0, 14.498493707 / 30.0),
+            (12.0, 12.175881952 / 20.0, 13.856525401 / 30.0),
+        ];
+        for (tau, p1_ref, p2_ref) in refs {
+            let [p1, p2] =
+                three_cpt_oral_peripherals(&dose, tau, 5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 1.0, 1.0);
+            assert_relative_eq!(p1, p1_ref, max_relative = 1e-4);
+            assert_relative_eq!(p2, p2_ref, max_relative = 1e-4);
+        }
     }
 
     // Typical 3-cpt PK parameters

@@ -2173,25 +2173,6 @@ fn parse_derived_block(
     // looked up in the vars HashMap at closure-call time.
     const BUILTIN_SPECIALS: &[&str] = &["IPRED", "PRED", "DV", "TIME", "TAFD", "TAD", "MACHEPS"];
 
-    // Warn if any ODE state name collides with an individual parameter name.
-    // In build_derived_vars the priority order is: compartment state < indiv param,
-    // so the indiv param value would silently shadow the ODE state in [derived]
-    // expressions. E.g., an ODE state named `CL` would be masked by theta-based `CL`.
-    for state_name in ode_state_names {
-        if indiv_param_names
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(state_name))
-        {
-            parse_warnings.push(format!(
-                "W_DERIVED_CMT_NAME_SHADOWED: ODE state '{state_name}' has the same \
-                 name as an individual parameter; in [derived] expressions '{state_name}' \
-                 resolves to the individual parameter value, not the compartment state. \
-                 Rename the ODE state (e.g. 'A_{state_name}') or use compartments[i] \
-                 by index to access the state unambiguously."
-            ));
-        }
-    }
-
     for raw_line in lines {
         let line = if let Some(idx) = raw_line.find('#') {
             &raw_line[..idx]
@@ -15137,51 +15118,5 @@ CL V KA WT
         } else {
             panic!("expected PerRow derived kind");
         }
-    }
-
-    /// W_DERIVED_CMT_NAME_SHADOWED is emitted when an ODE state name collides
-    /// with an individual parameter name.  The warning fires at parse time so
-    /// the user is alerted before the fit runs.
-    #[test]
-    fn parse_derived_warns_when_ode_state_name_shadows_indiv_param() {
-        let model_str = "
-[parameters]
-  theta CL(2.0, 0.01, 50.0)
-  theta V(10.0, 0.1, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma ADD ~ 0.25
-
-[individual_parameters]
-  CL = CL * exp(ETA_CL)
-  V  = V
-
-[structural_model]
-  ode(states=[CL, central])
-
-[odes]
-  d/dt(CL)      = 0.0
-  d/dt(central) = -(CL/V) * central
-
-[error_model]
-  DV ~ additive(ADD)
-
-[derived]
-  obs = CL
-
-[fit_options]
-  method  = focei
-  maxiter = 1
-";
-        let model = parse_model_string(model_str).expect("model must parse");
-        let has_shadow_warning = model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("W_DERIVED_CMT_NAME_SHADOWED") && w.contains("'CL'"));
-        assert!(
-            has_shadow_warning,
-            "expected W_DERIVED_CMT_NAME_SHADOWED for ODE state 'CL' clashing with \
-             individual parameter 'CL'; got warnings: {:?}",
-            model.parse_warnings
-        );
     }
 }

@@ -1837,10 +1837,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // messages. It must be compound so that "SIR failed: covariance not
         // positive definite" (no "covariance step" token) still routes to "sir".
         (WarningSeverity::Critical, "covariance_step")
-    } else if lower.contains("covariance step regularized") {
-        // Regularisation warning — SEs may be degraded but are present.
-        // Severity within the message (minor/moderate/severe) informs guidance;
-        // the category is always covariance_step.
+    } else if lower.contains("covariance step regularized")
+        || lower.contains("off-diagonal fd stencil")
+    {
+        // Regularisation warning and off-diagonal NaN soft warning both indicate a
+        // degraded-but-present covariance step result. Severity within the message
+        // (minor/moderate/severe, or "over-optimistic") informs guidance; the
+        // category is always covariance_step.
         (WarningSeverity::Warning, "covariance_step")
     } else if lower.contains("ill-conditioned") || lower.contains("condition number") {
         // Note: "covariance step failed: Hessian has ill-conditioned entries" contains
@@ -3114,6 +3117,22 @@ mod tests {
                  (3 of 5 free-block eigenvalues clipped; min eig = 1.2e-6, floor = 8.4e-14; \
                  severity: severe). Standard errors are likely unreliable; \
                  SIR-based confidence intervals are recommended.",
+                Warning,
+                "covariance_step",
+            ),
+            // Off-diagonal NaN soft warning — Success result, but correlation missing.
+            (
+                "Covariance step: off-diagonal FD stencil(s) non-finite for theta[CL], sigma[1]. \
+                 Cross-partial correlation set to 0; SE for these parameter(s) \
+                 may be over-optimistic. Try tuning fd_hessian_step.",
+                Warning,
+                "covariance_step",
+            ),
+            // Chain-prefixed off-diagonal warning.
+            (
+                "[FOCEI] Covariance step: off-diagonal FD stencil(s) non-finite for theta[CL]. \
+                 Cross-partial correlation set to 0; SE for these parameter(s) \
+                 may be over-optimistic. Try tuning fd_hessian_step.",
                 Warning,
                 "covariance_step",
             ),

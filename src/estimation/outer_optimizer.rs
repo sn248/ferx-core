@@ -1871,11 +1871,11 @@ pub(crate) enum CovarianceStepResult {
 
 /// Human-readable label for the packed parameter at position `packed_idx`.
 /// E.g. `"theta[CL]"`, `"omega[ETA_1, ETA_2]"`, `"sigma[1]"`.
-fn packed_param_label(
-    packed_idx: usize,
-    template: &ModelParameters,
-    model: &CompiledModel,
-) -> String {
+///
+/// Uses names from `template` directly (`theta_names`, `omega.eta_names`) rather
+/// than from the `CompiledModel`, so the label is correct even when a test
+/// constructs a `ModelParameters` whose dimensions differ from the test model.
+fn packed_param_label(packed_idx: usize, template: &ModelParameters) -> String {
     let n_theta = template.theta.len();
     let n_eta = template.omega.dim();
     let n_omega = if template.omega.diagonal {
@@ -1894,7 +1894,7 @@ fn packed_param_label(
     });
 
     if packed_idx < n_theta {
-        let name = model
+        let name = template
             .theta_names
             .get(packed_idx)
             .map(String::as_str)
@@ -1924,8 +1924,18 @@ fn packed_param_label(
             );
             res
         };
-        let nr = model.eta_names.get(row).map(String::as_str).unwrap_or("?");
-        let nc = model.eta_names.get(col).map(String::as_str).unwrap_or("?");
+        let nr = template
+            .omega
+            .eta_names
+            .get(row)
+            .map(String::as_str)
+            .unwrap_or("?");
+        let nc = template
+            .omega
+            .eta_names
+            .get(col)
+            .map(String::as_str)
+            .unwrap_or("?");
         format!("omega[{}, {}]", nr, nc)
     } else if packed_idx < n_theta + n_omega + n_sigma {
         let idx = packed_idx - n_theta - n_omega + 1;
@@ -2174,13 +2184,13 @@ pub(crate) fn compute_covariance(
             problem_params.push(format!(
                 "{} (FD stencil non-finite; model may overflow at perturbation — \
                  try tuning fd_hessian_step)",
-                packed_param_label(i, template, model)
+                packed_param_label(i, template)
             ));
         } else if diag.abs() < 1e-30 {
             // Genuine flat objective: the FD stencil succeeded but returned ~0 curvature.
             problem_params.push(format!(
                 "{} (zero diagonal — flat objective)",
-                packed_param_label(i, template, model)
+                packed_param_label(i, template)
             ));
         }
     }
@@ -2280,7 +2290,7 @@ pub(crate) fn compute_covariance(
     if !fd_offdiag_nan.is_empty() {
         let names: Vec<String> = fd_offdiag_nan
             .iter()
-            .map(|&i| packed_param_label(i, template, model))
+            .map(|&i| packed_param_label(i, template))
             .collect();
         let msg = format!(
             "Covariance step: off-diagonal FD stencil(s) non-finite for {}. \
@@ -2581,17 +2591,16 @@ mod tests {
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
-        let model = make_model();
 
         // n_theta=2, so: idx=2 → omega[ETA_CL, ETA_CL], idx=3 → omega[ETA_V, ETA_CL] (off-diag),
         // idx=4 → omega[ETA_V, ETA_V].
-        let label_diag = packed_param_label(2, &template, &model);
+        let label_diag = packed_param_label(2, &template);
         assert_eq!(label_diag, "omega[ETA_CL, ETA_CL]", "diagonal 0,0");
 
-        let label_off = packed_param_label(3, &template, &model);
+        let label_off = packed_param_label(3, &template);
         assert_eq!(label_off, "omega[ETA_V, ETA_CL]", "off-diagonal 1,0");
 
-        let label_diag2 = packed_param_label(4, &template, &model);
+        let label_diag2 = packed_param_label(4, &template);
         assert_eq!(label_diag2, "omega[ETA_V, ETA_V]", "diagonal 1,1");
     }
 
@@ -2619,7 +2628,6 @@ mod tests {
     fn test_packed_param_label_sigma() {
         use crate::types::SigmaVector;
         // n_theta=1 (diagonal omega), n_omega=1 (diagonal), n_sigma=2
-        let model = make_model(); // eta_names has "ETA_CL"
         let template = ModelParameters {
             theta: vec![5.0],
             theta_names: vec!["CL".into()],
@@ -2637,15 +2645,14 @@ mod tests {
             kappa_fixed: Vec::new(),
         };
         // packed layout: [theta(0), omega(1), sigma(2), sigma(3)]
-        assert_eq!(packed_param_label(2, &template, &model), "sigma[1]");
-        assert_eq!(packed_param_label(3, &template, &model), "sigma[2]");
+        assert_eq!(packed_param_label(2, &template), "sigma[1]");
+        assert_eq!(packed_param_label(3, &template), "sigma[2]");
     }
 
     /// packed_param_label — kappa[1] path (IOV diagonal omega).
     #[test]
     fn test_packed_param_label_kappa() {
         use crate::types::SigmaVector;
-        let model = make_model();
         let template = ModelParameters {
             theta: vec![5.0],
             theta_names: vec!["CL".into()],
@@ -2666,7 +2673,7 @@ mod tests {
             kappa_fixed: vec![false],
         };
         // packed layout: [theta(0), omega(1), sigma(2), kappa(3)]
-        assert_eq!(packed_param_label(3, &template, &model), "kappa[1]");
+        assert_eq!(packed_param_label(3, &template), "kappa[1]");
     }
 
     /// invert_psd_with_floor severity thresholds: 1-of-3 clipped → pct=33 → "minor".

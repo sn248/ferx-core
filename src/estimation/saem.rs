@@ -2007,8 +2007,8 @@ pub fn run_saem(
                     warnings.push(format_non_pd_warning(&eigvals));
                     None
                 }
-                CovarianceStepResult::Unusable => {
-                    warnings.push("Covariance step failed — SEs not available".to_string());
+                CovarianceStepResult::Unusable(msg) => {
+                    warnings.push(msg);
                     None
                 }
             }

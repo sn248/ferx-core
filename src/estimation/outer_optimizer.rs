@@ -1233,8 +1233,8 @@ fn optimize_nlopt(
                     warnings.push(format_non_pd_warning(&eigvals));
                     None
                 }
-                CovarianceStepResult::Unusable => {
-                    warnings.push("Covariance step failed".to_string());
+                CovarianceStepResult::Unusable(msg) => {
+                    warnings.push(msg);
                     None
                 }
             }
@@ -1569,8 +1569,8 @@ fn optimize_bfgs(
                     warnings.push(format_non_pd_warning(&eigvals));
                     None
                 }
-                CovarianceStepResult::Unusable => {
-                    warnings.push("Covariance step failed".to_string());
+                CovarianceStepResult::Unusable(msg) => {
+                    warnings.push(msg);
                     None
                 }
             }
@@ -1878,8 +1878,72 @@ pub(crate) enum CovarianceStepResult {
     Success(CovarianceOutput),
     /// Hessian is not positive definite; eigenvalues listed in descending order.
     NonPdHessian(Vec<f64>),
-    /// Structurally unusable: non-finite OFV, Hessian entries, or no positive curvature.
-    Unusable,
+    /// Structurally unusable. Carries a complete user-facing warning message
+    /// (already ends with "SE estimates not available.").
+    Unusable(String),
+}
+
+/// Human-readable label for the packed parameter at position `packed_idx`.
+/// E.g. `"theta[CL]"`, `"omega[ETA_1, ETA_2]"`, `"sigma[1]"`.
+fn packed_param_label(
+    packed_idx: usize,
+    template: &ModelParameters,
+    model: &CompiledModel,
+) -> String {
+    let n_theta = template.theta.len();
+    let n_eta = template.omega.dim();
+    let n_omega = if template.omega.diagonal {
+        n_eta
+    } else {
+        n_eta * (n_eta + 1) / 2
+    };
+    let n_sigma = template.sigma.values.len();
+    let n_iov = template.omega_iov.as_ref().map_or(0, |m| {
+        let d = m.dim();
+        if m.diagonal {
+            d
+        } else {
+            d * (d + 1) / 2
+        }
+    });
+
+    if packed_idx < n_theta {
+        let name = model
+            .theta_names
+            .get(packed_idx)
+            .map(String::as_str)
+            .unwrap_or("?");
+        format!("theta[{}]", name)
+    } else if packed_idx < n_theta + n_omega {
+        let omega_idx = packed_idx - n_theta;
+        let (row, col) = if template.omega.diagonal {
+            (omega_idx, omega_idx)
+        } else {
+            let mut cnt = 0usize;
+            let mut res = (0, 0);
+            'search: for c in 0..n_eta {
+                for r in c..n_eta {
+                    if cnt == omega_idx {
+                        res = (r, c);
+                        break 'search;
+                    }
+                    cnt += 1;
+                }
+            }
+            res
+        };
+        let nr = model.eta_names.get(row).map(String::as_str).unwrap_or("?");
+        let nc = model.eta_names.get(col).map(String::as_str).unwrap_or("?");
+        format!("omega[{}, {}]", nr, nc)
+    } else if packed_idx < n_theta + n_omega + n_sigma {
+        let idx = packed_idx - n_theta - n_omega + 1;
+        format!("sigma[{}]", idx)
+    } else if packed_idx < n_theta + n_omega + n_sigma + n_iov {
+        let idx = packed_idx - n_theta - n_omega - n_sigma + 1;
+        format!("kappa[{}]", idx)
+    } else {
+        format!("packed[{}]", packed_idx)
+    }
 }
 
 /// Eigenvalues of `sym` sorted descending. Returns `None` if any eigenvalue is non-finite.
@@ -1937,7 +2001,7 @@ pub(crate) fn compute_covariance(
     options: &FitOptions,
 ) -> CovarianceStepResult {
     let n = x_hat.len();
-    let eps = 1e-2; // large step for FD Hessian on log-scale parameters
+    let eps = options.fd_hessian_step;
 
     // OFV for covariance step: includes explicit Omega terms (log|Omega| + eta'*Omega_inv*eta)
     // so the Hessian is sensitive to Omega parameters.
@@ -1985,10 +2049,38 @@ pub(crate) fn compute_covariance(
 
     let base_ofv = ofv_fixed(x_hat);
     if !base_ofv.is_finite() {
+        // Diagnose: check Omega conditioning to distinguish Omega collapse from
+        // a model-evaluation overflow/underflow.
+        let params_at = unpack_params(x_hat, template);
+        let reason = match extract_eigenvalues(&params_at.omega.matrix) {
+            Some(ref ev) if ev.last().copied().unwrap_or(1.0) <= 1e-8 => format!(
+                "Covariance step failed: Omega matrix is not positive definite at convergence \
+                 (min eigenvalue = {:.3e}; eigenvalues: [{}]). \
+                 SE estimates not available.",
+                ev.last().copied().unwrap_or(f64::NAN),
+                ev.iter()
+                    .map(|&v| {
+                        let a = v.abs();
+                        if a == 0.0 {
+                            "0".to_string()
+                        } else if a >= 1e-4 && a < 1e5 {
+                            format!("{:.4}", v)
+                        } else {
+                            format!("{:.3e}", v)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            _ => "Covariance step failed: base OFV is non-finite at convergence \
+                  (likely numerical overflow or underflow in model evaluation). \
+                  SE estimates not available."
+                .to_string(),
+        };
         if options.verbose {
-            eprintln!("  Covariance failed: base OFV is non-finite");
+            eprintln!("  {}", reason);
         }
-        return CovarianceStepResult::Unusable;
+        return CovarianceStepResult::Unusable(reason);
     }
 
     // FIX parameters contribute no information — skip their FD stencils and,
@@ -2048,29 +2140,40 @@ pub(crate) fn compute_covariance(
         }
     }
 
-    // Check for non-finite or zero Hessian entries *in the free block*. Rows
-    // and columns of FIX parameters are intentionally zero.
-    let mut n_nonfinite = 0;
-    let mut n_zero = 0;
+    // Check for non-finite or zero Hessian entries *in the free block*.
+    // Rows/columns of FIX parameters are intentionally zero and excluded via free_idx.
+    // Track per-parameter rather than raw counts for actionable diagnostics.
+    let mut problem_params: Vec<String> = Vec::new();
     for &i in &free_idx {
-        if hess[(i, i)].abs() < 1e-30 {
-            n_zero += 1;
-        }
-        for &j in &free_idx {
-            if !hess[(i, j)].is_finite() {
-                n_nonfinite += 1;
-            }
+        let diag = hess[(i, i)];
+        if !diag.is_finite() {
+            problem_params.push(format!(
+                "{} (non-finite diagonal)",
+                packed_param_label(i, template, model)
+            ));
+        } else if diag.abs() < 1e-30 {
+            problem_params.push(format!(
+                "{} (zero diagonal — flat objective)",
+                packed_param_label(i, template, model)
+            ));
+        } else if free_idx.iter().any(|&j| !hess[(i, j)].is_finite()) {
+            problem_params.push(format!(
+                "{} (non-finite off-diagonal)",
+                packed_param_label(i, template, model)
+            ));
         }
     }
 
-    if n_nonfinite > 0 || n_zero > 0 {
+    if !problem_params.is_empty() {
+        let reason = format!(
+            "Covariance step failed: Hessian has ill-conditioned entries for the following \
+             parameter(s) — {}. SE estimates not available.",
+            problem_params.join("; ")
+        );
         if options.verbose {
-            eprintln!(
-                "  Covariance failed: Hessian has {} non-finite, {} zero-diagonal entries",
-                n_nonfinite, n_zero
-            );
+            eprintln!("  {}", reason);
         }
-        return CovarianceStepResult::Unusable;
+        return CovarianceStepResult::Unusable(reason);
     }
 
     // Build the reduced Hessian over free indices, invert, then embed back
@@ -2096,7 +2199,9 @@ pub(crate) fn compute_covariance(
         Some(inv) => inv,
         None => match extract_eigenvalues(&hess_free_sym) {
             Some(eigvals) => return CovarianceStepResult::NonPdHessian(eigvals),
-            None => return CovarianceStepResult::Unusable,
+            None => return CovarianceStepResult::Unusable(
+                "Covariance step failed: could not compute eigenvalues of the FD Hessian (Hessian may contain NaN or Inf). SE estimates not available.".to_string()
+            ),
         },
     };
     let cov_free = inv.inverse;
@@ -2109,11 +2214,25 @@ pub(crate) fn compute_covariance(
     }
 
     let warning = if inv.n_clipped > 0 {
+        let pct = inv.n_clipped * 100 / n_free.max(1);
+        let (severity, interp) = match pct {
+            0..=33 => ("minor", "Standard errors are likely reliable."),
+            34..=50 => (
+                "moderate",
+                "Standard errors should be interpreted with caution; \
+                 consider SIR-based confidence intervals.",
+            ),
+            _ => (
+                "severe",
+                "Standard errors are likely unreliable; \
+                 SIR-based confidence intervals are recommended.",
+            ),
+        };
         let msg = format!(
             "Covariance step regularized: eigenvalue floor applied to FD Hessian \
-             ({} of {} free-block eigenvalues clipped; min eig = {:.3e}, floor = {:.3e}). \
-             Standard errors should be interpreted with care.",
-            inv.n_clipped, n_free, inv.min_eigenvalue, inv.floor
+             ({} of {} free-block eigenvalues clipped; min eig = {:.3e}, floor = {:.3e}; \
+             severity: {}). {}",
+            inv.n_clipped, n_free, inv.min_eigenvalue, inv.floor, severity, interp
         );
         if options.verbose {
             eprintln!("  {}", msg);

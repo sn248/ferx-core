@@ -389,8 +389,8 @@ pub fn run_foce_gn(
                         warnings.push(format_non_pd_warning(&eigvals));
                         None
                     }
-                    CovarianceStepResult::Unusable => {
-                        warnings.push("Covariance step failed".to_string());
+                    CovarianceStepResult::Unusable(msg) => {
+                        warnings.push(msg);
                         None
                     }
                 }
@@ -498,8 +498,8 @@ pub fn run_foce_gn(
                 warnings.push(format_non_pd_warning(&eigvals));
                 None
             }
-            CovarianceStepResult::Unusable => {
-                warnings.push("Covariance step failed".to_string());
+            CovarianceStepResult::Unusable(msg) => {
+                warnings.push(msg);
                 None
             }
         }

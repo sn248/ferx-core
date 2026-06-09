@@ -397,38 +397,39 @@ pub fn optimize_trust_region(
         eprintln!("Final OFV = {:.6}", final_ofv);
     }
 
-    let covariance_matrix = if options.run_covariance_step {
-        if options.verbose {
-            eprintln!("Computing covariance matrix...");
-        }
-        match compute_covariance(
-            &best_x,
-            init_params,
-            model,
-            population,
-            &final_ehs,
-            &final_hms,
-            &final_kappas,
-            options,
-        ) {
-            CovarianceStepResult::Success(out) => {
-                if let Some(w) = out.warning {
-                    warnings.push(w);
+    let covariance_matrix =
+        if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
+            if options.verbose {
+                eprintln!("Computing covariance matrix...");
+            }
+            match compute_covariance(
+                &best_x,
+                init_params,
+                model,
+                population,
+                &final_ehs,
+                &final_hms,
+                &final_kappas,
+                options,
+            ) {
+                CovarianceStepResult::Success(out) => {
+                    if let Some(w) = out.warning {
+                        warnings.push(w);
+                    }
+                    Some(out.matrix)
                 }
-                Some(out.matrix)
+                CovarianceStepResult::NonPdHessian(eigvals) => {
+                    warnings.push(format_non_pd_warning(&eigvals));
+                    None
+                }
+                CovarianceStepResult::Unusable(msg) => {
+                    warnings.push(msg);
+                    None
+                }
             }
-            CovarianceStepResult::NonPdHessian(eigvals) => {
-                warnings.push(format_non_pd_warning(&eigvals));
-                None
-            }
-            CovarianceStepResult::Unusable => {
-                warnings.push("Covariance step failed".to_string());
-                None
-            }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     OuterResult {
         params: final_params,

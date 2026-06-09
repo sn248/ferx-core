@@ -2219,6 +2219,12 @@ pub struct FitOptions {
     pub inner_maxiter: usize,
     pub inner_tol: f64,
     pub run_covariance_step: bool,
+    /// Relative step size for the finite-difference Hessian in the covariance step.
+    /// The actual step for parameter i is `fd_hessian_step * (1 + |x_hat[i]|)`.
+    /// Default `1e-2`. Increase (e.g. `0.1`) when the default produces non-finite
+    /// Hessian entries; decrease (e.g. `1e-3`) for smoother OFV surfaces where
+    /// FD noise is the main concern.
+    pub fd_hessian_step: f64,
     pub interaction: bool,
     pub verbose: bool,
     pub optimizer: Optimizer,
@@ -2449,6 +2455,7 @@ impl Default for FitOptions {
             // tighter EBEs (e.g. very-small-data simulation work).
             inner_tol: 1e-4,
             run_covariance_step: true,
+            fd_hessian_step: 1e-2,
             interaction: true,
             verbose: true,
             // BOBYQA — derivative-free quadratic trust-region. Chosen as the
@@ -2689,6 +2696,7 @@ impl FitOptions {
 pub fn framework_keys() -> &'static [&'static str] {
     &[
         "covariance",
+        "fd_hessian_step",
         "verbose",
         "sir",
         "sir_samples",

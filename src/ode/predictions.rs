@@ -1054,6 +1054,16 @@ pub fn ode_predictions_ekf(
 /// infusion tracking, break-time construction, or `read_observable` calls in
 /// `ode_predictions` **must be mirrored here**. Search for the parallel line in
 /// `ode_predictions` and apply the same change.
+///
+/// # Precondition
+///
+/// The caller **must not** pass a subject that has EVID=3/4 resets
+/// (`subject.reset_times` non-empty) or time-varying covariates
+/// (`subject.has_tv_covariates()`).  For those subjects
+/// `compute_predictions_with_states` routes through
+/// `ode_predictions_event_driven_with_states`, which handles resets correctly.
+/// Calling this function directly on a reset subject would produce incorrect
+/// states because the re-seed events are absent from the break-time list.
 pub fn ode_predictions_with_states(
     ode: &OdeSpec,
     pk_params_flat: &[f64],

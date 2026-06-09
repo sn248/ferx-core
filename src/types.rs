@@ -1591,6 +1591,10 @@ impl CompiledModel {
     /// For ODE models use `ode_spec.state_names` instead.
     /// Returns a `'static` slice so it can be used in `DerivedContext` without lifetime issues.
     pub fn analytical_compartment_names(&self) -> &'static [String] {
+        debug_assert!(
+            self.ode_spec.is_none(),
+            "analytical_compartment_names called on an ODE model — use ode_spec.state_names instead"
+        );
         use std::sync::OnceLock;
         macro_rules! names {
             ($lock:ident, $($name:expr),+) => {{

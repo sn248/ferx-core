@@ -1695,6 +1695,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &model.default_params.sigma.names,
         &indiv_stmts,
         &used_sigmas_in_error,
+        has_event_model_block,
     );
     model.parse_warnings.extend(unused_warnings);
 
@@ -5817,12 +5818,21 @@ fn check_unused_parameters(
     sigma_names: &[String],
     indiv_stmts: &[Statement],
     used_sigmas: &std::collections::HashSet<String>,
+    has_event_model: bool,
 ) -> Vec<String> {
     let mut used_thetas = std::collections::HashSet::new();
     let mut used_etas = std::collections::HashSet::new();
     collect_theta_eta_in_stmts(indiv_stmts, &mut used_thetas, &mut used_etas);
 
     let mut warnings = Vec::new();
+
+    // TTE-only models have no [individual_parameters] block; parameters are used
+    // in [event_model] expressions instead. Skip theta/eta/kappa warnings to
+    // avoid false "not referenced in [individual_parameters]" noise.
+    // Sigma warnings are not suppressed — TTE-only models have no sigmas anyway.
+    if has_event_model && indiv_stmts.is_empty() {
+        return warnings;
+    }
 
     for (i, t) in thetas.iter().enumerate() {
         if !used_thetas.contains(&i) {

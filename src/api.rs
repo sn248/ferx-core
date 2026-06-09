@@ -2333,7 +2333,18 @@ fn fit_inner(
 
     let ofv = result.ofv;
     let aic = ofv + 2.0 * n_params as f64;
-    let bic = ofv + n_params as f64 * (n_obs as f64).ln();
+    // BIC = OFV + k·ln(n). For TTE-only models n_obs == 0 (no Gaussian records),
+    // giving ln(0) = -inf. Use total record count (Gaussian + TTE) so BIC is finite.
+    #[cfg(feature = "survival")]
+    let n_for_bic: usize = n_obs
+        + population
+            .subjects
+            .iter()
+            .map(|s| s.obs_records.len())
+            .sum::<usize>();
+    #[cfg(not(feature = "survival"))]
+    let n_for_bic: usize = n_obs;
+    let bic = ofv + n_params as f64 * (n_for_bic as f64).ln();
 
     // Extract SEs from covariance matrix using converged parameter values
     let (se_theta, se_omega, se_sigma, se_kappa) =

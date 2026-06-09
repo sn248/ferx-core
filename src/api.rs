@@ -3745,6 +3745,11 @@ pub struct SurvivalPredictionResult {
     pub cum_hazard: f64,
     /// Instantaneous hazard h(t).
     pub hazard: f64,
+    /// Median survival time T₅₀ (where S(T₅₀) = 0.5); analytic closed form.
+    pub median_survival: f64,
+    /// Mean survival time E[T] = ∫₀^∞ S(t) dt; analytic for Exponential,
+    /// numerical midpoint rule (2 000 steps) for Weibull and Gompertz.
+    pub mean_survival: f64,
 }
 
 /// Compute survival function predictions for TTE endpoints.
@@ -3761,7 +3766,7 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
-    use crate::survival::hazard_and_cum_hazard;
+    use crate::survival::{hazard_and_cum_hazard, mean_survival, median_survival};
     use crate::types::EndpointLikelihood;
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
@@ -3775,6 +3780,11 @@ pub fn predict_survival(
             let crate::types::HazardSpec::Analytic { family, param_fn } = hazard;
             let params_vec = param_fn(&params.theta, &zero_eta, &subject.covariates);
 
+            // Distributional summaries are parameter-dependent, not time-dependent —
+            // compute once per (subject, cmt) pair and repeat across the time grid.
+            let t_median = median_survival(*family, &params_vec);
+            let t_mean = mean_survival(*family, &params_vec);
+
             for &t in time_grid {
                 let (h_val, cum_h) = hazard_and_cum_hazard(*family, t, &params_vec);
                 let s = (-cum_h).exp();
@@ -3785,6 +3795,8 @@ pub fn predict_survival(
                     survival: s,
                     cum_hazard: cum_h,
                     hazard: h_val,
+                    median_survival: t_median,
+                    mean_survival: t_mean,
                 });
             }
         }

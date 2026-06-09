@@ -17,8 +17,9 @@ mod survival_smoke {
 
     // ── Model strings ────────────────────────────────────────────────────────
 
-    /// Standalone exponential TTE model.  A dummy 1-cpt structural block is
-    /// required syntactically; it is never invoked (no CMT-1 observations).
+    /// Standalone exponential TTE model.  Kept with its legacy dummy 1-cpt structural
+    /// block for historical reference; the block is never invoked (no CMT-1 observations).
+    /// See `EXP_TTE_ONLY` below for the equivalent model using the compact TTE-only syntax.
     const EXP_TTE_MODEL: &str = r"
 [parameters]
   theta TVLAMBDA(0.05, 0.001, 10.0)
@@ -533,6 +534,133 @@ mod survival_smoke {
             err.contains("CMT=2") || err.contains("more than once"),
             "error must mention duplicate CMT: {err}"
         );
+    }
+
+    // ── Phase 1 follow-up: TTE-only model syntax (no dummy PK blocks) ─────────
+
+    /// Minimal TTE-only model: no [structural_model], [error_model], or
+    /// [individual_parameters] — all three blocks are now optional when an
+    /// [event_model] block is present.
+    const EXP_TTE_ONLY: &str = r"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+
+    /// TTE-only with a covariate term — tests that covariate names from
+    /// [event_model] expressions are injected into model.referenced_covariates.
+    const EXP_TTE_WITH_COVARIATE: &str = r"
+[parameters]
+  theta TVLAMBDA(0.05, FIX)
+  theta BETA_WT(0.1, -5.0, 5.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+  loghr  = BETA_WT * WT
+
+[fit_options]
+  method  = focei
+  maxiter = 1
+";
+
+    #[test]
+    fn tte_only_model_parses_without_pk_blocks() {
+        let model =
+            parse_model_string(EXP_TTE_ONLY).expect("TTE-only model without PK blocks must parse");
+        // Should still have the TTE endpoint registered.
+        assert!(
+            model.endpoints.contains_key(&2),
+            "endpoints must contain CMT=2 for TTE-only model"
+        );
+        assert_eq!(model.n_theta, 1, "n_theta should be 1 (TVLAMBDA only)");
+        assert_eq!(model.n_eta, 1, "n_eta should be 1 (ETA_LAMBDA)");
+    }
+
+    #[test]
+    fn tte_only_fit_completes_without_pk_blocks() {
+        let model = parse_model_string(EXP_TTE_ONLY).expect("must parse");
+        let pop = tte_population(TTE_DATA);
+        let mut opts = ferx_core::FitOptions::default();
+        opts.verbose = false;
+        let result = ferx_core::fit(&model, &pop, &model.default_params, &opts);
+        match result {
+            Ok(r) => assert!(r.ofv.is_finite(), "OFV must be finite; got {}", r.ofv),
+            Err(e) => panic!("TTE-only fit must not error: {e}"),
+        }
+    }
+
+    #[test]
+    fn event_model_covariate_names_tracked() {
+        let model = parse_model_string(EXP_TTE_WITH_COVARIATE)
+            .expect("model with covariate loghr must parse");
+        assert!(
+            model.referenced_covariates.contains(&"WT".to_string()),
+            "referenced_covariates must include WT from [event_model] loghr expression; \
+             got: {:?}",
+            model.referenced_covariates
+        );
+    }
+
+    // ── Phase 1 follow-up: median/mean survival in predict_survival ───────────
+
+    #[test]
+    fn predict_survival_has_median_and_mean() {
+        use ferx_core::predict_survival;
+
+        let model = parse_model_string(EXP_TTE_MODEL).expect("must parse");
+        let pop = tte_population(&TTE_DATA[..3]);
+        let grid = vec![1.0, 5.0, 10.0, 20.0];
+        let rows = predict_survival(&model, &pop, &model.default_params, &grid);
+        assert!(
+            !rows.is_empty(),
+            "predict_survival must return rows for TTE model"
+        );
+        for row in &rows {
+            assert!(
+                row.median_survival.is_finite() && row.median_survival > 0.0,
+                "median_survival must be finite and positive; got {}",
+                row.median_survival
+            );
+            assert!(
+                row.mean_survival.is_finite() && row.mean_survival > 0.0,
+                "mean_survival must be finite and positive; got {}",
+                row.mean_survival
+            );
+            // For Exponential: mean = 1/lambda, median = ln(2)/lambda; mean > median.
+            assert!(
+                row.mean_survival > row.median_survival,
+                "Exponential: mean_survival {} must exceed median_survival {}",
+                row.mean_survival,
+                row.median_survival
+            );
+            // median_survival and mean_survival are constant across the time grid
+            // for the same subject (they are distributional properties, not time-varying).
+        }
+        // All rows for the same subject should have identical median/mean.
+        let first_median = rows[0].median_survival;
+        let first_mean = rows[0].mean_survival;
+        for row in rows.iter().filter(|r| r.id == rows[0].id) {
+            assert_eq!(
+                row.median_survival, first_median,
+                "median should be constant per subject"
+            );
+            assert_eq!(
+                row.mean_survival, first_mean,
+                "mean should be constant per subject"
+            );
+        }
     }
 
     /// DoseEvent helper — not used in TTE-only tests but checks Subject

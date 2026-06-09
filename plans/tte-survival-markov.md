@@ -2130,7 +2130,7 @@ end-to-end and is ready to merge. ferx-r PR #134 (Draft) unblocks immediately af
 - ✅ `read_population_for` promoted to `pub` — single entry point handling covariates,
   `[data_selection]` filters, and TTE routing; the function external consumers should call
 - ✅ `predict_survival` + `SurvivalPredictionResult`: S(t), H(t), h(t) on a time grid per
-  subject × TTE CMT. Note: `median_survival` / `mean_survival` not yet implemented (deferred)
+  subject × TTE CMT, plus `median_survival` and `mean_survival` fields
 
 **Tests (`tests/tte_smoke.rs`, Tier 2):**
 - ✅ `tte_exponential_model_parses`, `tte_weibull_model_parses`, `tte_gompertz_model_parses`
@@ -2138,6 +2138,8 @@ end-to-end and is ready to merge. ferx-r PR #134 (Draft) unblocks immediately af
 - ✅ `tte_fixed_effects_model_parses` (n_eta=0 path), `tte_fit_exponential_3iter`,
   `tte_fit_fixed_effects_n_eta_0`, `tte_loghr_nonzero_changes_ofv` (OFV shift > 1.0),
   `tte_duplicate_cmt_parse_error`, `tte_incompatible_key_*` (two error cases)
+- ✅ `tte_only_model_parses_without_pk_blocks`, `tte_only_fit_completes_without_pk_blocks`,
+  `event_model_covariate_names_tracked`, `predict_survival_has_median_and_mean`
 
 **Docs:**
 - ✅ `docs/src/estimation/tte.md` — overview, syntax, DV coding, TENTRY, hazard families
@@ -2149,13 +2151,12 @@ end-to-end and is ready to merge. ferx-r PR #134 (Draft) unblocks immediately af
 
 **Examples + data:**
 - ✅ `examples/tte_exponential.ferx` (using correct theta/eta expressions)
+- ✅ `examples/tte_weibull.ferx`, `examples/tte_gompertz.ferx` (clean TTE-only syntax)
 - ✅ `data/tte_exponential.csv` (30-subject simulated dataset)
 
-#### Remaining — follow-up after #192 merges
+#### Remaining — follow-up after #205 merges
 
 **Estimation:**
-- ❌ SAEM analytic σ M-step skip for TTE subjects (`src/estimation/saem.rs`) — needed
-  before SAEM estimation on TTE data works correctly (FOCEI path is fine)
 - ❌ Tier 3 convergence tests (`tests/tte_convergence.rs`, gated `slow-tests`)
 - ❌ NONMEM/nlmixr2 reference comparison — run `tests/reference/tte_exponential/` scripts;
   fill the comparison table in `docs/src/estimation/tte.md`
@@ -2164,26 +2165,17 @@ end-to-end and is ready to merge. ferx-r PR #134 (Draft) unblocks immediately af
 - ❌ `[event_model]` expressions cannot reference `[individual_parameters]` names — `param_fn`
   evaluates in theta/eta/covariate namespace only; documented with Note callout; fix requires
   threading individual_parameters evaluator into `parse_event_model_block`
-- ❌ Allow absent `[structural_model]` / `[error_model]` for TTE-only models (currently
-  requires dummy fixed blocks)
-- ❌ `[event_model]` covariate names (e.g. from `loghr = BETA_WT * WT`) not added to
-  `model.referenced_covariates` — strict covariate reader won't auto-validate them
-
-**API / output:**
-- ❌ `predict_survival` / `SurvivalPredictionResult` not re-exported at crate root (`src/lib.rs`)
-- ❌ `SurvivalPredictionResult` missing `median_survival` and `mean_survival` fields
-- ❌ `examples/tte_weibull.ferx`, `examples/tte_gompertz.ferx` not yet added
 
 **Code quality:**
-- ❌ `foce_subject_nll_interaction_with_tte` duplicates the Gaussian interaction loop — any
-  future fix to the Gaussian path must be replicated; refactor candidate
+- ✅ `foce_subject_nll_interaction_with_tte` refactored — `gaussian_foce_accum` helper
+  eliminates the duplicated inner loop from both FOCE functions
 
 **ferx-r:**
 - ✅ `r.dv_sim` → `r.outcome.continuous_value()` migration — ferx-r PR #132 (merged)
 - ✅ TTE datareader routing — ferx-r PR #134 (Draft; unblocks on #192 merge)
   — `ferx_rust_fit` 4-way dispatch → `read_population_for`; all 5 simulate/predict
   helpers updated; also fixes pre-existing covariates+filter gap in `ferx_rust_fit`
-- ❌ `predict_survival` R wrapper (post Phase 1, once median/mean fields are added)
+- ❌ `predict_survival` R wrapper (now unblocked — median/mean fields added)
 - ❌ R-side end-to-end TTE test (Tier 2: parse model with `[event_model]`, read CSV,
   verify `obs_records` populated, OFV finite)
 

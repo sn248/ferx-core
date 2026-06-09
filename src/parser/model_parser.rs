@@ -850,14 +850,30 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         );
     }
 
-    let struct_lines = blocks
-        .get("structural_model")
-        .ok_or("Missing [structural_model] block")?;
+    // A model with [event_model] but no Gaussian PK blocks is valid (TTE-only).
+    // Detect this case early so the three normally-required blocks can be omitted.
+    #[cfg(feature = "survival")]
+    let has_event_model_block =
+        blocks.contains_key("event_model") || extracted.named.contains_key("event_model");
+    #[cfg(not(feature = "survival"))]
+    let has_event_model_block = false;
 
-    let error_lines = blocks
-        .get("error_model")
-        .ok_or("Missing [error_model] block")?;
-    let (parsed_error_model, ltbs_flags) = parse_error_model(error_lines)?;
+    let struct_lines_opt = blocks.get("structural_model");
+    if struct_lines_opt.is_none() && !has_event_model_block {
+        return Err("Missing [structural_model] block".to_string());
+    }
+    let struct_lines: &[String] = struct_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
+
+    let error_lines_opt = blocks.get("error_model");
+    if error_lines_opt.is_none() && !has_event_model_block {
+        return Err("Missing [error_model] block".to_string());
+    }
+    let (parsed_error_model, ltbs_flags) = if let Some(error_lines) = error_lines_opt {
+        parse_error_model(error_lines)?
+    } else {
+        // TTE-only model: no Gaussian error model — empty per-CMT spec.
+        (ParsedErrorModel::PerCmt(vec![]), LtbsFlags::default())
+    };
     // LTBS log-transforms the structural prediction, which is incompatible with
     // the SDE/EKF measurement model (the extended Kalman filter assumes a
     // natural-scale additive/proportional observation). Reject the combination.
@@ -869,9 +885,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         );
     }
 
-    let indiv_lines = blocks
-        .get("individual_parameters")
-        .ok_or("Missing [individual_parameters] block")?;
+    let indiv_lines_opt = blocks.get("individual_parameters");
+    if indiv_lines_opt.is_none() && !has_event_model_block {
+        return Err("Missing [individual_parameters] block".to_string());
+    }
+    let indiv_lines: &[String] = indiv_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
 
     // theta_names is extended below after NN-weight and diffusion thetas are appended
     let mut theta_names: Vec<String> = thetas.iter().map(|t| t.name.clone()).collect();
@@ -1021,7 +1039,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     .to_string(),
             );
         }
-        let (pk_model, pk_param_map) = parse_structural_model(struct_lines)?;
+        // TTE-only models have no [structural_model] block — supply a no-op placeholder.
+        // The PK model is never invoked for pure-TTE subjects (no Gaussian observations).
+        let (pk_model, pk_param_map) = if struct_lines.is_empty() {
+            (PkModel::OneCptIv, HashMap::new())
+        } else {
+            parse_structural_model(struct_lines)?
+        };
         (
             pk_model,
             pk_param_map,
@@ -1747,13 +1771,21 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
 
         for lines in event_blocks {
-            let (cmt, endpoint) =
+            let (cmt, endpoint, event_covs) =
                 parse_event_model_block(lines, &theta_names, &eta_names, &model.error_spec)?;
             if model.endpoints.contains_key(&cmt) {
                 return Err(format!("[event_model]: CMT={cmt} declared more than once"));
             }
             model.endpoints.insert(cmt, endpoint);
+            // Union covariate names from [event_model] expressions into the model's
+            // covariate set so they appear in the covariate table and validation warnings.
+            for cov in event_covs {
+                if !model.referenced_covariates.contains(&cov) {
+                    model.referenced_covariates.push(cov);
+                }
+            }
         }
+        model.referenced_covariates.sort();
     }
 
     Ok(ParsedModel {
@@ -2393,7 +2425,7 @@ fn parse_event_model_block(
     theta_names: &[String],
     eta_names: &[String],
     error_spec: &ErrorSpec,
-) -> Result<(usize, crate::types::EndpointLikelihood), String> {
+) -> Result<(usize, crate::types::EndpointLikelihood, Vec<String>), String> {
     use crate::types::{EndpointLikelihood, HazardFamily, HazardSpec};
 
     let ctx = ParseCtx::new(theta_names, eta_names, &[]);
@@ -2533,6 +2565,27 @@ fn parse_event_model_block(
         }
     }
 
+    // Collect covariate names referenced in any expression BEFORE they are moved
+    // into the param_fn closure.  These are unioned into model.referenced_covariates
+    // by the caller so that the covariate table and validation warnings include them.
+    let event_model_covariates: Vec<String> = {
+        let mut cov_set = std::collections::HashSet::new();
+        for expr_opt in [
+            &scale_expr,
+            &shape_expr,
+            &alpha_expr,
+            &gamma_expr,
+            &loghr_expr,
+        ] {
+            if let Some(expr) = expr_opt {
+                collect_covariates(expr, &mut cov_set);
+            }
+        }
+        let mut v: Vec<String> = cov_set.into_iter().collect();
+        v.sort();
+        v
+    };
+
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
     // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
@@ -2586,6 +2639,7 @@ fn parse_event_model_block(
         EndpointLikelihood::Tte {
             hazard: HazardSpec::Analytic { family, param_fn },
         },
+        event_model_covariates,
     ))
 }
 
@@ -5198,7 +5252,9 @@ fn build_error_spec(
             Ok((model, ErrorSpec::Single(model)))
         }
         ParsedErrorModel::PerCmt(entries) => {
-            if !is_ode {
+            // An empty PerCmt arises for TTE-only models (no [error_model] block) —
+            // allow it regardless of is_ode.  Non-empty PerCmt still requires ODE.
+            if !entries.is_empty() && !is_ode {
                 return Err(
                     "Per-CMT error models (`CMT=N: DV ~ ...`) require an ODE-based \
                      [structural_model]; analytical PK models support a single error \

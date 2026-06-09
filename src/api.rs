@@ -2344,7 +2344,11 @@ fn fit_inner(
             .sum::<usize>();
     #[cfg(not(feature = "survival"))]
     let n_for_bic: usize = n_obs;
-    let bic = ofv + n_params as f64 * (n_for_bic as f64).ln();
+    let bic = if n_for_bic > 0 {
+        ofv + n_params as f64 * (n_for_bic as f64).ln()
+    } else {
+        f64::NAN
+    };
 
     // Extract SEs from covariance matrix using converged parameter values
     let (se_theta, se_omega, se_sigma, se_kappa) =

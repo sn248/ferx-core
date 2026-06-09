@@ -101,11 +101,18 @@ pub fn median_survival(family: HazardFamily, params: &[f64]) -> f64 {
             let gamma = params[1];
             let loghr = params.get(2).copied().unwrap_or(0.0);
             let exp_lhr = loghr.exp();
+            if alpha <= 0.0 {
+                return f64::NAN;
+            }
             // H(T) = (alpha/gamma)*(exp(gamma*T)-1)*exp(loghr) = ln2
-            // exp(gamma*T) = 1 + ln2*gamma / (alpha*exp_lhr)
-            let inner = 1.0 + LN_2 * gamma / (alpha * exp_lhr);
-            if inner > 1.0 && gamma > 0.0 {
-                inner.ln() / gamma
+            // exp(gamma*T) = 1 + x  where  x = ln2·γ / (α·exp(loghr))
+            if gamma == 0.0 {
+                // γ=0: Gompertz degenerates to Exponential with rate α·exp(loghr)
+                LN_2 / (alpha * exp_lhr)
+            } else if gamma > 0.0 {
+                // ln_1p is numerically stable when γ is small (avoids cancellation in (1+x).ln())
+                let x = LN_2 * gamma / (alpha * exp_lhr);
+                x.ln_1p() / gamma
             } else {
                 f64::NAN
             }
@@ -484,6 +491,40 @@ mod tests {
         assert!(
             ((-cum).exp() - 0.5).abs() < 1e-10,
             "S(median)={} for Gompertz",
+            (-cum).exp()
+        );
+    }
+
+    #[test]
+    fn median_gompertz_gamma_zero_matches_exponential() {
+        // γ=0: Gompertz degenerates to Exponential; median must equal ln2/α.
+        // (hazard_and_cum_hazard has a 0/0 form at γ=0, so verify analytically.)
+        let alpha = 0.05_f64;
+        let t_gompertz = median_survival(HazardFamily::Gompertz, &[alpha, 0.0, 0.0]);
+        let t_exp = median_survival(HazardFamily::Exponential, &[alpha]);
+        assert!(
+            t_gompertz.is_finite(),
+            "Gompertz γ=0 median must be finite, got {t_gompertz}"
+        );
+        assert!(
+            (t_gompertz - t_exp).abs() < 1e-10,
+            "Gompertz(γ=0) median {t_gompertz} should equal Exponential median {t_exp}"
+        );
+    }
+
+    #[test]
+    fn median_gompertz_small_gamma_stable() {
+        // Very small γ — ln_1p path must not return NaN
+        let params = [0.002_f64, 1e-10_f64, 0.0_f64];
+        let t_50 = median_survival(HazardFamily::Gompertz, &params);
+        assert!(
+            t_50.is_finite(),
+            "Gompertz small-γ median must be finite, got {t_50}"
+        );
+        let (_, cum) = hazard_and_cum_hazard(HazardFamily::Gompertz, t_50, &params);
+        assert!(
+            ((-cum).exp() - 0.5).abs() < 1e-8,
+            "S(median)={} for small-γ Gompertz",
             (-cum).exp()
         );
     }

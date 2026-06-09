@@ -859,13 +859,21 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let has_event_model_block = false;
 
     let struct_lines_opt = blocks.get("structural_model");
-    if struct_lines_opt.is_none() && !has_event_model_block {
+    let error_lines_opt = blocks.get("error_model");
+    let indiv_lines_opt = blocks.get("individual_parameters");
+    // All three Gaussian blocks must be absent together for a valid TTE-only model.
+    // Partial omission (e.g. [structural_model] present but no [individual_parameters])
+    // would create an invalid mixed-model state.
+    let is_tte_only = has_event_model_block
+        && struct_lines_opt.is_none()
+        && error_lines_opt.is_none()
+        && indiv_lines_opt.is_none();
+    if struct_lines_opt.is_none() && !is_tte_only {
         return Err("Missing [structural_model] block".to_string());
     }
     let struct_lines: &[String] = struct_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
 
-    let error_lines_opt = blocks.get("error_model");
-    if error_lines_opt.is_none() && !has_event_model_block {
+    if error_lines_opt.is_none() && !is_tte_only {
         return Err("Missing [error_model] block".to_string());
     }
     let (parsed_error_model, ltbs_flags) = if let Some(error_lines) = error_lines_opt {
@@ -885,8 +893,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         );
     }
 
-    let indiv_lines_opt = blocks.get("individual_parameters");
-    if indiv_lines_opt.is_none() && !has_event_model_block {
+    if indiv_lines_opt.is_none() && !is_tte_only {
         return Err("Missing [individual_parameters] block".to_string());
     }
     let indiv_lines: &[String] = indiv_lines_opt.map(Vec::as_slice).unwrap_or(&[]);

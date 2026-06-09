@@ -1690,22 +1690,6 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
     }
 
-    // Warn about declared-but-unused parameters. These are not errors because a
-    // user may intentionally comment out expressions (e.g. during model
-    // development), but the warning makes clear that such parameters have no
-    // effect on predictions and will not be meaningfully estimated.
-    let unused_warnings = check_unused_parameters(
-        &thetas,
-        &eta_names_bsv,
-        &kappa_names,
-        n_eta,
-        &model.default_params.sigma.names,
-        &indiv_stmts,
-        &used_sigmas_in_error,
-        has_event_model_block,
-    );
-    model.parse_warnings.extend(unused_warnings);
-
     // ── [derived] block ──
     if let Some(derived_lines) = blocks.get("derived") {
         let cov_names = model.referenced_covariates.clone();
@@ -1745,6 +1729,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Each block holds `cmt`, `family`, and family-specific parameter expressions.
     // Only compiled when the `survival` feature is enabled; the field
     // `model.endpoints` is always present (cfg-gated) and stays empty otherwise.
+    //
+    // Theta/eta indices used in event_model expressions are collected here so
+    // that check_unused_parameters (below) can suppress false "not referenced"
+    // warnings for parameters that only appear in [event_model].
+    let mut event_model_used_thetas: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    let mut event_model_used_etas: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
     #[cfg(feature = "survival")]
     {
         let theta_names = model.theta_names.clone();
@@ -1762,7 +1754,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
 
         for lines in event_blocks {
-            let (cmt, endpoint, event_covs) =
+            let (cmt, endpoint, event_covs, blk_thetas, blk_etas) =
                 parse_event_model_block(lines, &theta_names, &eta_names, &model.error_spec)?;
             if model.endpoints.contains_key(&cmt) {
                 return Err(format!("[event_model]: CMT={cmt} declared more than once"));
@@ -1775,8 +1767,28 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     model.referenced_covariates.push(cov);
                 }
             }
+            event_model_used_thetas.extend(blk_thetas);
+            event_model_used_etas.extend(blk_etas);
         }
         model.referenced_covariates.sort();
+    }
+
+    // Warn about declared-but-unused parameters. Runs here (after [event_model]
+    // parsing) so that parameters used only in [event_model] are not falsely
+    // reported as unused in mixed PK+TTE models.
+    {
+        let unused_warnings = check_unused_parameters(
+            &thetas,
+            &eta_names_bsv,
+            &kappa_names,
+            n_eta,
+            &model.default_params.sigma.names,
+            &indiv_stmts,
+            &used_sigmas_in_error,
+            &event_model_used_thetas,
+            &event_model_used_etas,
+        );
+        model.parse_warnings.extend(unused_warnings);
     }
 
     // Undeclared-covariate warning: checked here (after [event_model] parsing) so
@@ -2437,7 +2449,16 @@ fn parse_event_model_block(
     theta_names: &[String],
     eta_names: &[String],
     error_spec: &ErrorSpec,
-) -> Result<(usize, crate::types::EndpointLikelihood, Vec<String>), String> {
+) -> Result<
+    (
+        usize,
+        crate::types::EndpointLikelihood,
+        Vec<String>,
+        std::collections::HashSet<usize>,
+        std::collections::HashSet<usize>,
+    ),
+    String,
+> {
     use crate::types::{EndpointLikelihood, HazardFamily, HazardSpec};
 
     let ctx = ParseCtx::new(theta_names, eta_names, &[]);
@@ -2577,11 +2598,15 @@ fn parse_event_model_block(
         }
     }
 
-    // Collect covariate names referenced in any expression BEFORE they are moved
-    // into the param_fn closure.  These are unioned into model.referenced_covariates
-    // by the caller so that the covariate table and validation warnings include them.
-    let event_model_covariates: Vec<String> = {
+    // Collect covariate/theta/eta references from all expressions BEFORE they are
+    // moved into the param_fn closure.
+    let event_model_covariates: Vec<String>;
+    let event_model_thetas: std::collections::HashSet<usize>;
+    let event_model_etas: std::collections::HashSet<usize>;
+    {
         let mut cov_set = std::collections::HashSet::new();
+        let mut theta_set = std::collections::HashSet::new();
+        let mut eta_set = std::collections::HashSet::new();
         for expr_opt in [
             &scale_expr,
             &shape_expr,
@@ -2591,12 +2616,15 @@ fn parse_event_model_block(
         ] {
             if let Some(expr) = expr_opt {
                 collect_covariates(expr, &mut cov_set);
+                collect_theta_eta(expr, &mut theta_set, &mut eta_set);
             }
         }
         let mut v: Vec<String> = cov_set.into_iter().collect();
         v.sort();
-        v
-    };
+        event_model_covariates = v;
+        event_model_thetas = theta_set;
+        event_model_etas = eta_set;
+    }
 
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
@@ -2652,6 +2680,8 @@ fn parse_event_model_block(
             hazard: HazardSpec::Analytic { family, param_fn },
         },
         event_model_covariates,
+        event_model_thetas,
+        event_model_etas,
     ))
 }
 
@@ -5829,27 +5859,24 @@ fn check_unused_parameters(
     sigma_names: &[String],
     indiv_stmts: &[Statement],
     used_sigmas: &std::collections::HashSet<String>,
-    has_event_model: bool,
+    event_model_thetas: &std::collections::HashSet<usize>,
+    event_model_etas: &std::collections::HashSet<usize>,
 ) -> Vec<String> {
     let mut used_thetas = std::collections::HashSet::new();
     let mut used_etas = std::collections::HashSet::new();
     collect_theta_eta_in_stmts(indiv_stmts, &mut used_thetas, &mut used_etas);
+    // Union in parameters used in [event_model] so mixed PK+TTE models do not
+    // produce false "not referenced" warnings for hazard-model thetas/etas.
+    used_thetas.extend(event_model_thetas.iter().copied());
+    used_etas.extend(event_model_etas.iter().copied());
 
     let mut warnings = Vec::new();
-
-    // TTE-only models have no [individual_parameters] block; parameters are used
-    // in [event_model] expressions instead. Skip theta/eta/kappa warnings to
-    // avoid false "not referenced in [individual_parameters]" noise.
-    // Sigma warnings are not suppressed — TTE-only models have no sigmas anyway.
-    if has_event_model && indiv_stmts.is_empty() {
-        return warnings;
-    }
 
     for (i, t) in thetas.iter().enumerate() {
         if !used_thetas.contains(&i) {
             warnings.push(format!(
-                "theta '{}' is declared in [parameters] but not referenced in \
-                 [individual_parameters] — it will not affect predictions or be \
+                "theta '{}' is declared in [parameters] but not referenced in any \
+                 model expression — it will not affect predictions or be \
                  meaningfully estimated",
                 t.name
             ));
@@ -5858,8 +5885,8 @@ fn check_unused_parameters(
     for (i, name) in eta_names_bsv.iter().enumerate() {
         if !used_etas.contains(&i) {
             warnings.push(format!(
-                "omega '{}' is declared in [parameters] but not referenced in \
-                 [individual_parameters] — it will not affect predictions or be \
+                "omega '{}' is declared in [parameters] but not referenced in any \
+                 model expression — it will not affect predictions or be \
                  meaningfully estimated",
                 name
             ));
@@ -5868,8 +5895,8 @@ fn check_unused_parameters(
     for (i, name) in kappa_names.iter().enumerate() {
         if !used_etas.contains(&(n_eta + i)) {
             warnings.push(format!(
-                "kappa '{}' is declared in [parameters] but not referenced in \
-                 [individual_parameters] — it will not affect predictions or be \
+                "kappa '{}' is declared in [parameters] but not referenced in any \
+                 model expression — it will not affect predictions or be \
                  meaningfully estimated",
                 name
             ));

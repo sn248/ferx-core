@@ -917,6 +917,68 @@ pub fn foce_subject_nll_iov(
     } else {
         Vec::new()
     };
+
+    // TTE Laplace correction for IOV subjects: mirrors foce_subject_nll but
+    // the TTE Hessian is in the BSV block only (kappas don't enter the hazard)
+    // and is embedded in the top-left n_eta×n_eta corner of the n_b×n_b matrix.
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        use crate::survival::{data_term_hessian_fd, shi_step_sizes, tte_data_term};
+        use crate::types::EndpointLikelihood;
+
+        let mut tte_nll_at_mode = 0.0_f64;
+        let mut tte_h_bsv = DMatrix::<f64>::zeros(n_eta, n_eta);
+
+        for (cmt, endpoint) in &model.endpoints {
+            if let EndpointLikelihood::Tte { hazard } = endpoint {
+                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned()
+                    .collect();
+                if records_for_cmt.is_empty() {
+                    continue;
+                }
+                let covariates = &subject.covariates;
+                let tte_fn = |eta_eval: &[f64]| -> f64 {
+                    tte_data_term(&records_for_cmt, hazard, theta, eta_eval, covariates)
+                };
+                tte_nll_at_mode += tte_fn(eta_hat.as_slice());
+                if n_eta > 0 {
+                    let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
+                    tte_h_bsv += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
+                }
+            }
+        }
+
+        // Embed the n_eta × n_eta BSV Hessian into the top-left block of the
+        // n_b × n_b augmented Hessian (kappa rows/cols remain zero).
+        let mut tte_h = DMatrix::<f64>::zeros(n_b, n_b);
+        for row in 0..n_eta {
+            for col in 0..n_eta {
+                tte_h[(row, col)] = tte_h_bsv[(row, col)];
+            }
+        }
+
+        return foce_subject_nll_interaction_with_tte(
+            subject,
+            &ipreds,
+            &b_hat,
+            &h_full,
+            &sigma_b,
+            sigma_values,
+            &model.error_spec,
+            model.bloq_method,
+            &p_obs_iov,
+            tte_nll_at_mode,
+            tte_h,
+            interaction,
+        );
+    }
+
     if interaction || m3_active {
         foce_subject_nll_interaction(
             subject,

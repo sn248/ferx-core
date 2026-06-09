@@ -399,6 +399,32 @@ fn obs_nll_subject_into_iov(
             total_nll += 0.5 * (v.ln() + (subject.observations[j] - f).powi(2) / v);
         }
     }
+
+    // TTE term: same convention as obs_nll_subject_into (weight 1.0 to match
+    // the true NLL, since Gaussian obs already contribute at 0.5*(log v + r²/v)).
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        use crate::survival::tte_data_term;
+        use crate::types::EndpointLikelihood;
+        for (cmt, endpoint) in &model.endpoints {
+            if let EndpointLikelihood::Tte { hazard } = endpoint {
+                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned()
+                    .collect();
+                if records_for_cmt.is_empty() {
+                    continue;
+                }
+                total_nll +=
+                    tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+            }
+        }
+    }
+
     total_nll
 }
 
@@ -425,9 +451,13 @@ fn obs_nll_subject_grad_iov(
 ) -> (f64, Vec<f64>) {
     let n = n_theta + n_sigma;
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
+    // Fall back to full FD when TTE endpoints are present: the analytic non-M3
+    // path is Gaussian-only and would silently zero hazard-parameter gradients.
+    #[cfg(feature = "survival")]
+    let m3 = m3 || !model.endpoints.is_empty();
 
     if m3 {
-        // M3 path: forward-FD of obs_nll_subject_into_iov.
+        // M3 / TTE path: forward-FD of obs_nll_subject_into_iov.
         let nll_base =
             obs_nll_subject_into_iov(model, subject, theta, sigma_values, eta, kappas, pk_scratch);
         let mut grad = vec![0.0f64; n];
@@ -784,9 +814,13 @@ fn obs_nll_subject_grad(
 ) -> (f64, Vec<f64>) {
     let n = n_theta + n_sigma;
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
+    // Fall back to the full-FD path when TTE endpoints are present: the analytic
+    // non-M3 path is Gaussian-only and would silently zero hazard-parameter gradients.
+    #[cfg(feature = "survival")]
+    let m3 = m3 || !model.endpoints.is_empty();
 
     if m3 {
-        // M3 path: forward-FD of obs_nll_subject_into for all parameters.
+        // M3 / TTE path: forward-FD of obs_nll_subject_into for all parameters.
         let nll_base = obs_nll_subject_into(model, subject, theta, sigma_values, eta, pk_scratch);
         let mut grad = vec![0.0f64; n];
         let h = 1e-5;

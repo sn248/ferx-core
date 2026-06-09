@@ -850,14 +850,38 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         );
     }
 
-    let struct_lines = blocks
-        .get("structural_model")
-        .ok_or("Missing [structural_model] block")?;
+    // A model with [event_model] but no Gaussian PK blocks is valid (TTE-only).
+    // Detect this case early so the three normally-required blocks can be omitted.
+    #[cfg(feature = "survival")]
+    let has_event_model_block =
+        blocks.contains_key("event_model") || extracted.named.contains_key("event_model");
+    #[cfg(not(feature = "survival"))]
+    let has_event_model_block = false;
 
-    let error_lines = blocks
-        .get("error_model")
-        .ok_or("Missing [error_model] block")?;
-    let (parsed_error_model, ltbs_flags) = parse_error_model(error_lines)?;
+    let struct_lines_opt = blocks.get("structural_model");
+    let error_lines_opt = blocks.get("error_model");
+    let indiv_lines_opt = blocks.get("individual_parameters");
+    // All three Gaussian blocks must be absent together for a valid TTE-only model.
+    // Partial omission (e.g. [structural_model] present but no [individual_parameters])
+    // would create an invalid mixed-model state.
+    let is_tte_only = has_event_model_block
+        && struct_lines_opt.is_none()
+        && error_lines_opt.is_none()
+        && indiv_lines_opt.is_none();
+    if struct_lines_opt.is_none() && !is_tte_only {
+        return Err("Missing [structural_model] block".to_string());
+    }
+    let struct_lines: &[String] = struct_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
+
+    if error_lines_opt.is_none() && !is_tte_only {
+        return Err("Missing [error_model] block".to_string());
+    }
+    let (parsed_error_model, ltbs_flags) = if let Some(error_lines) = error_lines_opt {
+        parse_error_model(error_lines)?
+    } else {
+        // TTE-only model: no Gaussian error model — empty per-CMT spec.
+        (ParsedErrorModel::PerCmt(vec![]), LtbsFlags::default())
+    };
     // LTBS log-transforms the structural prediction, which is incompatible with
     // the SDE/EKF measurement model (the extended Kalman filter assumes a
     // natural-scale additive/proportional observation). Reject the combination.
@@ -869,9 +893,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         );
     }
 
-    let indiv_lines = blocks
-        .get("individual_parameters")
-        .ok_or("Missing [individual_parameters] block")?;
+    if indiv_lines_opt.is_none() && !is_tte_only {
+        return Err("Missing [individual_parameters] block".to_string());
+    }
+    let indiv_lines: &[String] = indiv_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
 
     // theta_names is extended below after NN-weight and diffusion thetas are appended
     let mut theta_names: Vec<String> = thetas.iter().map(|t| t.name.clone()).collect();
@@ -1021,7 +1046,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     .to_string(),
             );
         }
-        let (pk_model, pk_param_map) = parse_structural_model(struct_lines)?;
+        // TTE-only models have no [structural_model] block — supply a no-op placeholder.
+        // The PK model is never invoked for pure-TTE subjects (no Gaussian observations).
+        let (pk_model, pk_param_map) = if struct_lines.is_empty() {
+            (PkModel::OneCptIv, HashMap::new())
+        } else {
+            parse_structural_model(struct_lines)?
+        };
         (
             pk_model,
             pk_param_map,
@@ -1659,21 +1690,6 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
     }
 
-    // Warn about declared-but-unused parameters. These are not errors because a
-    // user may intentionally comment out expressions (e.g. during model
-    // development), but the warning makes clear that such parameters have no
-    // effect on predictions and will not be meaningfully estimated.
-    let unused_warnings = check_unused_parameters(
-        &thetas,
-        &eta_names_bsv,
-        &kappa_names,
-        n_eta,
-        &model.default_params.sigma.names,
-        &indiv_stmts,
-        &used_sigmas_in_error,
-    );
-    model.parse_warnings.extend(unused_warnings);
-
     // ── [derived] block ──
     if let Some(derived_lines) = blocks.get("derived") {
         let cov_names = model.referenced_covariates.clone();
@@ -1698,28 +1714,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // ── Optional [covariates] block ──
     // When present it is authoritative for the covariate *table* and typing:
     // only listed columns are tabled, and declared columns are read strictly.
-    // A covariate used in [individual_parameters] but not declared is still
-    // usable (it is read leniently, like the auto-detect path) — we just warn
-    // that it ought to be declared so its type is known.
+    // A covariate used in [individual_parameters] or [event_model] but not declared
+    // is still usable (read leniently) — we warn after all covariate sources have
+    // been collected (including [event_model], parsed below).
     let covariate_decls = if let Some(lines) = blocks.get("covariates") {
-        let decls = parse_covariates_block(lines)?;
-        let declared: std::collections::HashSet<&str> =
-            decls.iter().map(|d| d.name.as_str()).collect();
-        let undeclared: Vec<&str> = model
-            .referenced_covariates
-            .iter()
-            .filter(|c| !declared.contains(c.as_str()))
-            .map(|s| s.as_str())
-            .collect();
-        if !undeclared.is_empty() {
-            model.parse_warnings.push(format!(
-                "Covariate(s) used in [individual_parameters] but not declared in [covariates]: \
-                 {}. They are still usable, but declaring them (with `continuous`/`categorical`) \
-                 lets ferx record their type and include them in the covariate table.",
-                undeclared.join(", ")
-            ));
-        }
-        Some(decls)
+        Some(parse_covariates_block(lines)?)
     } else {
         None
     };
@@ -1730,6 +1729,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Each block holds `cmt`, `family`, and family-specific parameter expressions.
     // Only compiled when the `survival` feature is enabled; the field
     // `model.endpoints` is always present (cfg-gated) and stays empty otherwise.
+    //
+    // Theta/eta indices used in event_model expressions are collected here so
+    // that check_unused_parameters (below) can suppress false "not referenced"
+    // warnings for parameters that only appear in [event_model].
+    let mut event_model_used_thetas: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    let mut event_model_used_etas: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
     #[cfg(feature = "survival")]
     {
         let theta_names = model.theta_names.clone();
@@ -1747,12 +1754,58 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
 
         for lines in event_blocks {
-            let (cmt, endpoint) =
+            let (cmt, endpoint, event_covs, blk_thetas, blk_etas) =
                 parse_event_model_block(lines, &theta_names, &eta_names, &model.error_spec)?;
             if model.endpoints.contains_key(&cmt) {
                 return Err(format!("[event_model]: CMT={cmt} declared more than once"));
             }
             model.endpoints.insert(cmt, endpoint);
+            // Union covariate names from [event_model] expressions into the model's
+            // covariate set so they appear in the covariate table and validation warnings.
+            for cov in event_covs {
+                if !model.referenced_covariates.contains(&cov) {
+                    model.referenced_covariates.push(cov);
+                }
+            }
+            event_model_used_thetas.extend(blk_thetas);
+            event_model_used_etas.extend(blk_etas);
+        }
+        model.referenced_covariates.sort();
+    }
+
+    // Warn about declared-but-unused parameters. Runs here (after [event_model]
+    // parsing) so that parameters used only in [event_model] are not falsely
+    // reported as unused in mixed PK+TTE models.
+    model.parse_warnings.extend(check_unused_parameters(
+        &thetas,
+        &eta_names_bsv,
+        &kappa_names,
+        n_eta,
+        &model.default_params.sigma.names,
+        &indiv_stmts,
+        &used_sigmas_in_error,
+        &event_model_used_thetas,
+        &event_model_used_etas,
+    ));
+
+    // Undeclared-covariate warning: checked here (after [event_model] parsing) so
+    // that covariates used only in [event_model] expressions are included.
+    if let Some(decls) = &covariate_decls {
+        let declared: std::collections::HashSet<&str> =
+            decls.iter().map(|d| d.name.as_str()).collect();
+        let undeclared: Vec<&str> = model
+            .referenced_covariates
+            .iter()
+            .filter(|c| !declared.contains(c.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        if !undeclared.is_empty() {
+            model.parse_warnings.push(format!(
+                "Covariate(s) used in model expressions but not declared in [covariates]: \
+                 {}. They are still usable, but declaring them (with `continuous`/`categorical`) \
+                 lets ferx record their type and include them in the covariate table.",
+                undeclared.join(", ")
+            ));
         }
     }
 
@@ -2393,7 +2446,16 @@ fn parse_event_model_block(
     theta_names: &[String],
     eta_names: &[String],
     error_spec: &ErrorSpec,
-) -> Result<(usize, crate::types::EndpointLikelihood), String> {
+) -> Result<
+    (
+        usize,
+        crate::types::EndpointLikelihood,
+        Vec<String>,
+        std::collections::HashSet<usize>,
+        std::collections::HashSet<usize>,
+    ),
+    String,
+> {
     use crate::types::{EndpointLikelihood, HazardFamily, HazardSpec};
 
     let ctx = ParseCtx::new(theta_names, eta_names, &[]);
@@ -2533,6 +2595,34 @@ fn parse_event_model_block(
         }
     }
 
+    // Collect covariate/theta/eta references from all expressions BEFORE they are
+    // moved into the param_fn closure.
+    let event_model_covariates: Vec<String>;
+    let event_model_thetas: std::collections::HashSet<usize>;
+    let event_model_etas: std::collections::HashSet<usize>;
+    {
+        let mut cov_set = std::collections::HashSet::new();
+        let mut theta_set = std::collections::HashSet::new();
+        let mut eta_set = std::collections::HashSet::new();
+        for expr_opt in [
+            &scale_expr,
+            &shape_expr,
+            &alpha_expr,
+            &gamma_expr,
+            &loghr_expr,
+        ] {
+            if let Some(expr) = expr_opt {
+                collect_covariates(expr, &mut cov_set);
+                collect_theta_eta(expr, &mut theta_set, &mut eta_set);
+            }
+        }
+        let mut v: Vec<String> = cov_set.into_iter().collect();
+        v.sort();
+        event_model_covariates = v;
+        event_model_thetas = theta_set;
+        event_model_etas = eta_set;
+    }
+
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
     // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
@@ -2586,6 +2676,9 @@ fn parse_event_model_block(
         EndpointLikelihood::Tte {
             hazard: HazardSpec::Analytic { family, param_fn },
         },
+        event_model_covariates,
+        event_model_thetas,
+        event_model_etas,
     ))
 }
 
@@ -5198,7 +5291,9 @@ fn build_error_spec(
             Ok((model, ErrorSpec::Single(model)))
         }
         ParsedErrorModel::PerCmt(entries) => {
-            if !is_ode {
+            // An empty PerCmt arises for TTE-only models (no [error_model] block) —
+            // allow it regardless of is_ode.  Non-empty PerCmt still requires ODE.
+            if !entries.is_empty() && !is_ode {
                 return Err(
                     "Per-CMT error models (`CMT=N: DV ~ ...`) require an ODE-based \
                      [structural_model]; analytical PK models support a single error \
@@ -5761,18 +5856,24 @@ fn check_unused_parameters(
     sigma_names: &[String],
     indiv_stmts: &[Statement],
     used_sigmas: &std::collections::HashSet<String>,
+    event_model_thetas: &std::collections::HashSet<usize>,
+    event_model_etas: &std::collections::HashSet<usize>,
 ) -> Vec<String> {
     let mut used_thetas = std::collections::HashSet::new();
     let mut used_etas = std::collections::HashSet::new();
     collect_theta_eta_in_stmts(indiv_stmts, &mut used_thetas, &mut used_etas);
+    // Union in parameters used in [event_model] so mixed PK+TTE models do not
+    // produce false "not referenced" warnings for hazard-model thetas/etas.
+    used_thetas.extend(event_model_thetas.iter().copied());
+    used_etas.extend(event_model_etas.iter().copied());
 
     let mut warnings = Vec::new();
 
     for (i, t) in thetas.iter().enumerate() {
         if !used_thetas.contains(&i) {
             warnings.push(format!(
-                "theta '{}' is declared in [parameters] but not referenced in \
-                 [individual_parameters] — it will not affect predictions or be \
+                "theta '{}' is declared in [parameters] but not referenced in any \
+                 model expression — it will not affect predictions or be \
                  meaningfully estimated",
                 t.name
             ));
@@ -5781,8 +5882,8 @@ fn check_unused_parameters(
     for (i, name) in eta_names_bsv.iter().enumerate() {
         if !used_etas.contains(&i) {
             warnings.push(format!(
-                "omega '{}' is declared in [parameters] but not referenced in \
-                 [individual_parameters] — it will not affect predictions or be \
+                "omega '{}' is declared in [parameters] but not referenced in any \
+                 model expression — it will not affect predictions or be \
                  meaningfully estimated",
                 name
             ));
@@ -5791,8 +5892,8 @@ fn check_unused_parameters(
     for (i, name) in kappa_names.iter().enumerate() {
         if !used_etas.contains(&(n_eta + i)) {
             warnings.push(format!(
-                "kappa '{}' is declared in [parameters] but not referenced in \
-                 [individual_parameters] — it will not affect predictions or be \
+                "kappa '{}' is declared in [parameters] but not referenced in any \
+                 model expression — it will not affect predictions or be \
                  meaningfully estimated",
                 name
             ));
@@ -8923,6 +9024,19 @@ mod tests {
             if !cfg!(feature = "nn") {
                 let src = std::fs::read_to_string(&path).unwrap_or_default();
                 if src.contains("[covariate_nn") || src.contains("[dynamics_nn") {
+                    continue;
+                }
+            }
+            // TTE-only files (no [structural_model] block) require the survival feature.
+            // Use a line-start check so the comment "# Note: [structural_model] ..."
+            // present in example file headers does not falsely count as a block.
+            if !cfg!(feature = "survival") {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                let has_event_model = src.contains("[event_model");
+                let has_struct_block = src
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("[structural_model"));
+                if has_event_model && !has_struct_block {
                     continue;
                 }
             }

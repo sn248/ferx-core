@@ -1219,3 +1219,207 @@ fn auc_ce_2cpt_iv_effect_convergence_and_analytical_ref() {
         result.subjects.len(),
     );
 }
+
+// ── Regression: EVID=3 reset in ode_dense_solve_states (fdbbc95) ─────────────
+//
+// Fix: `ode_dense_solve_states` must add `subject.reset_times` to its
+// `break_times` so the ODE state is re-seeded at the reset boundary when
+// computing grid-integral derived variables.
+//
+// Without the fix the break-time list has no entry at t=12.  The solver
+// runs in a single segment [0, t_last] and never applies the re-seed, so
+// the integral captures the ongoing exponential decay instead of zero.
+//
+// Model: 1-cpt IV ODE (amount-tracking), 100 mg bolus at t=0, EVID=3 reset
+// at t=12.  Observations at [1,4,8,12,16,20,24] h.
+//
+// Derived variables:
+//   AUC_pre  = integral(compartments[0], from=0,  to=12, step=1.0)
+//              → session 0 observations (t ≤ 12); should be ≈452 mg·h
+//   AUC_post = integral(compartments[0], from=12, to=24, step=1.0)
+//              → session 1 observations (t > 12); should be ≈0
+//   C_cmt0   = compartments[0]  per-row  → ~0 for t > 12 (event-driven path)
+//
+// Regression check: `AUC_post < 1.0`.  Without fdbbc95 the value is ≈41 mg·h.
+
+fn evid3_reset_population() -> Population {
+    // Session 0: t = 1, 4, 8, 12  (at and before the EVID=3 reset)
+    // Session 1: t = 16, 20, 24   (after the reset; model predicts ≈0)
+    let obs_times = vec![1.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0];
+    let n = obs_times.len();
+    Population {
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times,
+            obs_raw_times: vec![],
+            // DV ≈ model prediction: monoexponential up to reset, near-zero after.
+            // Additive error on the model side avoids proportional-error issues
+            // when IPRED ≈ 0 post-reset.
+            observations: vec![8.2, 4.5, 2.0, 0.9, 0.05, 0.05, 0.05],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: vec![],
+            obs_covariates: vec![],
+            pk_only_times: vec![],
+            pk_only_covariates: vec![],
+            reset_times: vec![12.0], // EVID=3 reset at t=12
+            cens: vec![0; n],
+            occasions: vec![],
+            dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }],
+    }
+}
+
+/// Regression for fdbbc95 — `ode_dense_solve_states` with EVID=3 reset.
+///
+/// An EVID=3 reset at t=12 zeros all ODE compartments.  The trapezoidal
+/// integral of `compartments[0]` over [12, 24] must therefore return ≈0.
+///
+/// At initial parameters (CL=2 L/h, V=10 L, ke=0.2 h⁻¹, dose=100 mg):
+///   AUC_post (grid [12..24], step=1)  = 0       (states zeroed after reset)
+///   AUC_pre  (grid [0..12],  step=1)  ≈ 452 mg·h (pre-reset accumulation)
+///
+/// Without fdbbc95 the reset is silently ignored and AUC_post ≈ 41 mg·h.
+#[test]
+fn ode_integral_over_compartment_with_evid3_reset() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(2.0, 0.01, 50.0)
+  theta V(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.25
+
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V  = V
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ additive(ADD)
+
+[derived]
+  AUC_pre  = integral(compartments[0], from=0,  to=12, step=1.0)
+  AUC_post = integral(compartments[0], from=12, to=24, step=1.0)
+  C_cmt0   = compartments[0]
+
+[fit_options]
+  method   = focei
+  maxiter  = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    let pop = evid3_reset_population();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    for sr in &result.subjects {
+        macro_rules! col {
+            ($name:expr) => {
+                sr.extra_columns
+                    .iter()
+                    .find(|(n, _)| n == $name)
+                    .unwrap_or_else(|| panic!("{} column must exist", $name))
+                    .1
+                    .as_slice()
+            };
+        }
+        let auc_pre_vals = col!("AUC_pre");
+        let auc_post_vals = col!("AUC_post");
+        let c_cmt0_vals = col!("C_cmt0");
+
+        let n_obs = sr.ipred.len();
+        assert_eq!(auc_pre_vals.len(), n_obs, "AUC_pre must have n_obs values");
+        assert_eq!(
+            auc_post_vals.len(),
+            n_obs,
+            "AUC_post must have n_obs values"
+        );
+        assert_eq!(c_cmt0_vals.len(), n_obs, "C_cmt0 must have n_obs values");
+
+        // ── Session 0: observations at t ≤ 12 (indices 0..=3 in obs_times) ──
+        // AUC_pre is finite here (window [0,12] is inside session 0).
+        // AUC_post is NaN (window [12,24] starts at the session boundary).
+        //
+        // At initial theta (CL=2, V=10) the expected trapezoidal AUC_pre ≈ 452
+        // (see module-level comment). We allow a wide range to accommodate any
+        // parameter movement over 2 outer iterations.
+        let auc_pre_finite: Vec<f64> = auc_pre_vals
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .collect();
+        assert!(
+            !auc_pre_finite.is_empty(),
+            "subject {}: at least one finite AUC_pre expected (session 0 observations)",
+            sr.id
+        );
+        for &v in &auc_pre_finite {
+            assert!(
+                v > 50.0,
+                "subject {}: AUC_pre = {v:.2} — unexpectedly small; \
+                 expected >50 mg·h for integral(compartments[0], 0→12) with a 100 mg dose",
+                sr.id
+            );
+        }
+
+        // ── Session 1: observations at t > 12 (indices 4..=6 in obs_times) ──
+        // AUC_post is finite here (window [12,24] is inside session 1).
+        // AUC_pre is NaN (window [0,12] ends at the session boundary).
+        //
+        // Key regression assertion: after an EVID=3 reset at t=12 the ODE
+        // state is zeroed, so the integral over [12,24] must be ≈0.
+        // Without fdbbc95 the integral returns ≈41 mg·h (reset ignored).
+        let auc_post_finite: Vec<f64> = auc_post_vals
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .collect();
+        assert!(
+            !auc_post_finite.is_empty(),
+            "subject {}: at least one finite AUC_post expected (session 1 observations)",
+            sr.id
+        );
+        for &v in &auc_post_finite {
+            assert!(
+                v < 1.0,
+                "subject {}: AUC_post = {v:.4} — EVID=3 reset at t=12 not applied in \
+                 ode_dense_solve_states; expected ≈0 (with fix), pre-fix value ≈41 mg·h. \
+                 Regression: fdbbc95 (add reset_times to break_times)",
+                sr.id
+            );
+        }
+
+        // ── Per-row compartment states (event-driven path) ───────────────────
+        // C_cmt0 = compartments[0] for session 1 obs (t > 12) should be ≈0
+        // because the reset zeroes the central compartment and no new dose fires.
+        // Values at the last 3 observations (t=16,20,24) are checked.
+        let n = c_cmt0_vals.len();
+        for (j, &v) in c_cmt0_vals.iter().enumerate().skip(n.saturating_sub(3)) {
+            assert!(
+                v.is_finite() && v < 0.5,
+                "subject {}: C_cmt0 at obs {} (t={}) = {v:.6} — \
+                 expected ≈0 after EVID=3 reset at t=12",
+                sr.id,
+                j,
+                sr.ipred.get(j).copied().unwrap_or(f64::NAN)
+            );
+        }
+    }
+}

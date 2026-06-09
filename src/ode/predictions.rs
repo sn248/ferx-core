@@ -1256,12 +1256,23 @@ pub fn ode_predictions_event_driven_with_states(
         pk_at_pk_only,
     );
 
-    // Second pass: run event-driven with saveat at every obs time to capture
-    // the full state. We collect state by injecting extra saveat times and
-    // extracting u at each obs time from the dense solution.
-    // For simplicity, re-derive states via ode_dense_solve_states which uses
-    // the no-TV parameters from the first obs (same "representative" approximation
-    // as the existing grid-integral path — acceptable for state extraction).
+    // Second pass: extract the full ODE state at each obs time via
+    // `ode_dense_solve_states`. That function runs the standard (non-event-driven)
+    // solver, so it uses a single fixed set of PK params for the entire timeline.
+    //
+    // For subjects with EVID=3/4 resets but *no* TV covariates, `pk_at_obs` is
+    // uniformly filled (every entry identical), so using `first()` is exact.
+    //
+    // For subjects with genuine TV covariates, `pk_at_obs` varies per timepoint.
+    // Using `first()` here is an approximation: the compartment state trajectory
+    // will be computed with the first-observation PK params (CL/V/etc.) held fixed,
+    // while `ipreds` correctly reflect per-event covariate snapshots. For most PK
+    // contexts this approximation is acceptable post-fit, but the caller
+    // (`compute_predictions_with_states`) emits W_DERIVED_CMT_TV warning when
+    // TV covariates are present so users know the states are approximate.
+    //
+    // A future improvement: duplicate the event-driven loop to capture `u` at each
+    // obs time directly — exact states, but ~2× the integration work post-fit.
     let pk_flat = &pk_at_obs.first().map(|p| p.values).unwrap_or_default();
     let states = ode_dense_solve_states(ode, pk_flat, theta, eta, subject, &subject.obs_times);
 

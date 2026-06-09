@@ -474,9 +474,8 @@ pub(crate) fn three_cpt_iv_peripherals(
             // Helper for infusion SS peripheral (after-infusion formula with SS coeff)
             let infusion_periph_ss = |c_scalar: f64, k_far: f64| -> f64 {
                 let r = dose.rate;
-                let rc = r * c_scalar / (ag/* placeholder */);
-                let _ = rc; // silence — inline below
-                            // Use the after-infusion formula with SS geometric series
+                // After-infusion peripheral formula with SS geometric series:
+                // coeff_X = rate · c_scalar · (X_eigenvalue_residue) / (product · eigenvalue)
                 let coeff_a = -r * c_scalar * (alpha - k_far) / (ab * ag * alpha);
                 let coeff_b = r * c_scalar * (beta - k_far) / (ab * bg * beta);
                 let coeff_g = -r * c_scalar * (gamma - k_far) / (ag * bg * gamma);

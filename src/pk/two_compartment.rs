@@ -388,6 +388,21 @@ pub(crate) fn two_cpt_iv_peripheral(
 
 /// Peripheral concentration for a 2-cpt oral single dose at elapsed time tau.
 ///
+/// **Derivation — why only 3 terms (no exp(-k21·τ) term):**
+///
+/// In Laplace space:
+/// ```text
+///   A_central(s)  = F·D·ka·(s+k21) / [(s+ka)(s+α)(s+β)]
+///   A_periph(s)   = k12 · A_central(s) / (s+k21)
+///                 = k12·F·D·ka / [(s+ka)(s+α)(s+β)]
+/// ```
+/// The `(s+k21)` factor in `A_central(s)` cancels the `(s+k21)` pole of
+/// `1/(s+k21)`, leaving only 3 poles: `−ka`, `−α`, `−β`. Partial-fraction
+/// expansion gives the 3-term Bateman result below. The `exp(-ka·τ)` term is
+/// implicitly correct: because `A_periph(0) = 0` (no drug in peripheral at
+/// time 0), the residues must sum to zero, so the `exp(-ka·τ)` coefficient
+/// equals minus the sum of the eigenvalue residues.
+///
 /// Formula (non-L'Hôpital):
 ///   D = f_bio·dose.amt·ka/v1
 ///   C2(τ) = (q/v2)·D · [ exp(-α·τ)/((ka-α)(β-α)) + exp(-β·τ)/((ka-β)(α-β)) + exp(-ka·τ)/((α-ka)(β-ka)) ]

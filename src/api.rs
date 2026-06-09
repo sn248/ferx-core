@@ -1457,9 +1457,7 @@ pub(crate) fn compute_extra_output_columns(
 
         // Compartment states and names for [derived] expressions.
         // Empty slices are used for observations where states are not available
-        // (analytical models before their states are populated, EKF models).
-        static EMPTY_CMT_NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-        let empty_names = EMPTY_CMT_NAMES.get_or_init(Vec::new);
+        // (IOV subjects, analytical TV-covariate subjects — see W_DERIVED_CMT_* warnings).
         let model_cmt_names: &[String] = model
             .ode_spec
             .as_ref()
@@ -1473,7 +1471,6 @@ pub(crate) fn compute_extra_output_columns(
                     .unwrap_or(&[])
             })
             .collect();
-        let _ = empty_names; // suppress unused warning if model_cmt_names is always set
 
         // Session infrastructure for EVID=3/4 stacked subjects.
         // For subjects with no resets (the common case) n_sessions=1, session_obs[0]
@@ -2407,6 +2404,33 @@ fn fit_inner(
 
     // Optional SIR step
     let mut warnings = result.warnings;
+
+    // Warn when [derived] expressions that reference compartments[i] will
+    // silently evaluate to NaN due to unsupported model/subject configurations.
+    if !model.derived_exprs.is_empty() {
+        // IOV (kappa) subjects: the predict_iov path does not compute compartment
+        // states — they stay as vec![] so compartments[i] yields NaN.
+        if result.kappas.iter().any(|ks| !ks.is_empty()) {
+            warnings.push(
+                "W_DERIVED_CMT_IOV_UNSUPPORTED: subjects with IOV (kappa) parameters \
+                 do not have compartment states available; [derived] expressions that \
+                 reference compartments[i] evaluate to NaN for those subjects."
+                    .to_string(),
+            );
+        }
+        // Analytical TV-covariate subjects: states would be computed with baseline
+        // PK params while ipred uses time-varying params — inconsistency is worse
+        // than NaN, so the states path returns empty for such subjects.
+        if model.ode_spec.is_none() && population.subjects.iter().any(|s| s.has_tv_covariates()) {
+            warnings.push(
+                "W_DERIVED_CMT_TV_ANALYTICAL: analytical model with time-varying \
+                 covariates — compartment states are not available for subjects \
+                 with TV covariates; [derived] expressions that reference \
+                 compartments[i] evaluate to NaN for those subjects."
+                    .to_string(),
+            );
+        }
+    }
 
     // Report detected mu-referencing relationships (only when feature is enabled)
     if options.mu_referencing && !model.mu_refs.is_empty() {

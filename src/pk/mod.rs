@@ -668,64 +668,13 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
     }
 }
 
-/// Superposition of compartment states across all doses at each observation time.
-///
-/// Returns a `Vec<Vec<f64>>` where `[j]` is the full state vector at observation
-/// time `j`. Uses the same lagtime/SS logic as `predict_concentration`.
-pub fn predict_all_states(
-    pk_model: PkModel,
-    subject: &Subject,
-    pk_params: &PkParams,
-) -> Vec<Vec<f64>> {
-    let lagtime = pk_params.lagtime();
-    let n_states = match pk_model {
-        PkModel::OneCptIv => 1,
-        PkModel::OneCptOral => 2,
-        PkModel::TwoCptIv => 2,
-        PkModel::TwoCptOral => 3,
-        PkModel::ThreeCptIv => 3,
-        PkModel::ThreeCptOral => 4,
-    };
-    subject
-        .obs_times
-        .iter()
-        .map(|&t| {
-            let mut state = vec![0.0_f64; n_states];
-            for dose in &subject.doses {
-                let t_eff = dose.time + lagtime;
-                let tau = if t_eff <= t {
-                    t - t_eff
-                } else if dose.ss && dose.ii > 0.0 && t >= dose.time {
-                    let raw = t - t_eff;
-                    let n = (-raw / dose.ii).ceil();
-                    let wrapped = raw + n * dose.ii;
-                    if wrapped >= 0.0 {
-                        wrapped
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                };
-                let contrib = single_dose_states(pk_model, dose, tau, pk_params);
-                for (s, v) in state.iter_mut().zip(contrib.iter()) {
-                    *s += v;
-                }
-            }
-            // Floor: states cannot be negative (amounts/concentrations)
-            for s in &mut state {
-                if *s < 0.0 {
-                    *s = 0.0;
-                }
-            }
-            state
-        })
-        .collect()
-}
-
 /// Compute the full compartment state vector at arbitrary `times` for an analytical model.
+///
+/// Returns a `Vec<Vec<f64>>` where `[k]` is the full state vector at `times[k]`.
+/// Uses the same lagtime/SS superposition logic as `predict_concentration`.
 /// Used by the grid-integral path in `compute_extra_output_columns` when an integrand
-/// references compartment states (`uses_compartments = true`).
+/// references compartment states (`uses_compartments = true`), and by
+/// `predict_all_states` which is the per-observation-time convenience wrapper.
 pub fn analytical_state_at_times(
     pk_model: PkModel,
     subject: &Subject,
@@ -766,6 +715,7 @@ pub fn analytical_state_at_times(
                     *s += v;
                 }
             }
+            // Floor: states cannot be negative (amounts/concentrations).
             for s in &mut state {
                 if *s < 0.0 {
                     *s = 0.0;
@@ -774,6 +724,18 @@ pub fn analytical_state_at_times(
             state
         })
         .collect()
+}
+
+/// Superposition of compartment states at each observation time.
+///
+/// Convenience wrapper around [`analytical_state_at_times`] that uses
+/// `subject.obs_times` as the time vector.
+pub fn predict_all_states(
+    pk_model: PkModel,
+    subject: &Subject,
+    pk_params: &PkParams,
+) -> Vec<Vec<f64>> {
+    analytical_state_at_times(pk_model, subject, pk_params, &subject.obs_times)
 }
 
 /// Compute predictions AND full compartment states for all observations.
@@ -816,9 +778,15 @@ pub fn compute_predictions_with_states(
             crate::ode::ode_predictions_with_states(ode, &pk.values, theta, eta, subject).1
         }
     } else if subject.has_resets() {
-        // Analytical with resets: for now return empty states (reset mid-timeline
-        // invalidates simple superposition; the event-driven analytical path does
-        // not yet return states).
+        // Analytical with resets: reset mid-timeline invalidates simple superposition;
+        // the event-driven analytical path does not yet return states.
+        vec![vec![]; subject.obs_times.len()]
+    } else if subject.has_tv_covariates() {
+        // Analytical with TV covariates: superposition would use baseline pk_params
+        // from subject.covariates while ipred honours per-event TV parameters.
+        // Returning states from mismatched PK params is worse than returning empty
+        // (empty → NaN in [derived]; the W_DERIVED_CMT_TV_ANALYTICAL warning in
+        // fit() explains why). ODE TV-covariate is handled above via event_driven.
         vec![vec![]; subject.obs_times.len()]
     } else {
         let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);

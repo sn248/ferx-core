@@ -481,14 +481,8 @@ pub fn run_foce_gn(
             options,
         ) {
             CovarianceStepResult::Success(out) => {
-                if let Some(w) = out.warning {
-                    warnings.push(w);
-                }
+                warnings.extend(out.warnings);
                 Some(out.matrix)
-            }
-            CovarianceStepResult::NonPdHessian(eigvals) => {
-                warnings.push(format_non_pd_warning(&eigvals));
-                None
             }
             CovarianceStepResult::Unusable(msg) => {
                 warnings.push(msg);

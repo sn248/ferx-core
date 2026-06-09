@@ -349,3 +349,177 @@ fn parse_integral_compartment_subscript_sets_uses_compartments() {
         panic!("AUC_IP must be Integral kind");
     }
 }
+
+// ── ODE model tests ───────────────────────────────────────────────────────────
+//
+// These cover code paths that the analytical tests above cannot reach:
+//   • `ode_predictions_with_states`   (src/ode/predictions.rs)
+//   • `ode_dense_solve_states`        (src/ode/predictions.rs)
+//   • `compute_predictions_with_states` ODE branch (src/pk/mod.rs)
+//   • `compute_extra_output_columns`  with `uses_compartments=true` (src/api.rs)
+//
+// Model: 2-cpt IV + effect compartment (3 ODE states).
+//   State 0: central    (mg, amount)
+//   State 1: peripheral (mg, amount)
+//   State 2: effect     (mg/L, concentration, as written in the ODE)
+// Dose lands in CMT=1 → central. Observations are from central (scaled by V1).
+
+const ODE_2CPT_EFFECT: &str = "
+[parameters]
+  theta CL(2.0, 0.01, 50.0)
+  theta V1(10.0, 0.1, 500.0)
+  theta Q(1.0, 0.01, 50.0)
+  theta V2(20.0, 0.1, 1000.0)
+  theta KE0(0.5, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL  = CL * exp(ETA_CL)
+  V1  = V1
+  Q   = Q
+  V2  = V2
+  KE0 = KE0
+
+[structural_model]
+  ode(states=[central, peripheral, effect])
+
+[odes]
+  d/dt(central)    = -(CL/V1 + Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) = (Q/V1) * central - (Q/V2) * peripheral
+  d/dt(effect)     = KE0 * (central/V1 - effect)
+
+[scaling]
+  y = central / V1
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+/// ODE 2-cpt + effect compartment: `compartments[2]` (subscript) and named
+/// state `effect` must yield identical, finite, positive values at every
+/// observation. Exercises `ode_predictions_with_states` end-to-end.
+#[test]
+fn ode_2cpt_effect_compartment_derived() {
+    let model_str = format!(
+        "{ODE_2CPT_EFFECT}
+[derived]
+  Ce       = compartments[2]
+  Ce_named = effect
+
+[fit_options]
+  method   = focei
+  maxiter  = 2
+  gradient = fd
+"
+    );
+    let model = parse_model_string(&model_str).expect("model must parse");
+    let pop = simple_iv_population();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    for sr in &result.subjects {
+        let ce_col = sr
+            .extra_columns
+            .iter()
+            .find(|(n, _)| n == "Ce")
+            .expect("Ce column must exist");
+        let ce_named_col = sr
+            .extra_columns
+            .iter()
+            .find(|(n, _)| n == "Ce_named")
+            .expect("Ce_named column must exist");
+
+        assert_eq!(
+            ce_col.1.len(),
+            sr.ipred.len(),
+            "Ce must have same length as IPRED"
+        );
+
+        for (j, (&by_idx, &by_name)) in ce_col.1.iter().zip(ce_named_col.1.iter()).enumerate() {
+            assert!(
+                by_idx.is_finite() && by_idx > 0.0,
+                "subject {}: Ce (compartments[2]) at obs {j} must be finite+positive, \
+                 got {by_idx}",
+                sr.id
+            );
+            assert!(
+                (by_idx - by_name).abs() < 1e-10,
+                "subject {}: subscript compartments[2]={by_idx:.8} != named \
+                 effect={by_name:.8} at obs {j}",
+                sr.id
+            );
+        }
+    }
+}
+
+/// ODE effect compartment: `integral(compartments[2], ...)` and
+/// `integral(effect, ...)` both trigger the `uses_compartments=true`
+/// grid-integral re-solve path. Both AUCs must be finite, positive, and
+/// identical. Exercises `ode_dense_solve_states` via the grid-integral path.
+#[test]
+fn ode_integral_over_compartment() {
+    let model_str = format!(
+        "{ODE_2CPT_EFFECT}
+[derived]
+  AUC_Ce    = integral(compartments[2], from=0, to=24, step=1.0)
+  AUC_named = integral(effect, from=0, to=24, step=1.0)
+
+[fit_options]
+  method   = focei
+  maxiter  = 2
+  gradient = fd
+"
+    );
+    let model = parse_model_string(&model_str).expect("model must parse");
+
+    // Parse-time check: both integrands reference a compartment state, so
+    // uses_compartments must be true for each.
+    for spec in &model.derived_exprs {
+        if let ferx_core::types::DerivedKind::Integral {
+            uses_compartments, ..
+        } = &spec.kind
+        {
+            assert!(
+                uses_compartments,
+                "{} integral must have uses_compartments=true (references ODE state)",
+                spec.name
+            );
+        }
+    }
+
+    let pop = simple_iv_population();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    for sr in &result.subjects {
+        let auc_col = sr
+            .extra_columns
+            .iter()
+            .find(|(n, _)| n == "AUC_Ce")
+            .expect("AUC_Ce column must exist");
+        let auc_named_col = sr
+            .extra_columns
+            .iter()
+            .find(|(n, _)| n == "AUC_named")
+            .expect("AUC_named column must exist");
+
+        for (j, &auc) in auc_col.1.iter().enumerate() {
+            assert!(
+                auc.is_finite() && auc > 0.0,
+                "subject {}: AUC_Ce at obs {j} must be finite+positive, got {auc}",
+                sr.id
+            );
+        }
+        // Named-state integral and subscript integral must agree.
+        for (j, (&by_idx, &by_name)) in auc_col.1.iter().zip(auc_named_col.1.iter()).enumerate() {
+            assert!(
+                (by_idx - by_name).abs() < 1e-8,
+                "subject {}: AUC_Ce={by_idx:.6} != AUC_named={by_name:.6} at obs {j}",
+                sr.id
+            );
+        }
+    }
+}

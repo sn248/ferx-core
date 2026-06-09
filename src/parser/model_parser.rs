@@ -2773,7 +2773,16 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "covariance" => opts.run_covariance_step = parse_bool("covariance")?,
-        "fd_hessian_step" => opts.fd_hessian_step = parse_f64("fd_hessian_step")?,
+        "fd_hessian_step" => {
+            let v = parse_f64("fd_hessian_step")?;
+            if v <= 0.0 || !v.is_finite() {
+                return Err(format!(
+                    "fd_hessian_step must be a positive finite value, got {}",
+                    v
+                ));
+            }
+            opts.fd_hessian_step = v;
+        }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {

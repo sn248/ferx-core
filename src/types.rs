@@ -3128,9 +3128,18 @@ mod tests {
                 Critical,
                 "covariance_step",
             ),
+            // Omega near-singular (tiny positive eigenvalue) — "near-singular" descriptor.
+            (
+                "Covariance step failed: Omega matrix is near-singular at \
+                 convergence (min eigenvalue = 1.2e-10; eigenvalues: [0.5000, 1.2e-10]). \
+                 SE estimates not available.",
+                Critical,
+                "covariance_step",
+            ),
+            // Omega truly non-PD (negative eigenvalue) — "not positive definite" descriptor.
             (
                 "Covariance step failed: Omega matrix is not positive definite at \
-                 convergence (min eigenvalue = 1.2e-10; eigenvalues: [0.5000, 1.2e-10]). \
+                 convergence (min eigenvalue = -1.0e-3; eigenvalues: [0.5000, -1.0e-3]). \
                  SE estimates not available.",
                 Critical,
                 "covariance_step",

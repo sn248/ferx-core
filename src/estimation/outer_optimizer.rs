@@ -1930,6 +1930,10 @@ fn packed_param_label(
                     cnt += 1;
                 }
             }
+            debug_assert!(
+                cnt == omega_idx,
+                "unreachable: omega_idx={omega_idx} >= n_omega={n_omega}"
+            );
             res
         };
         let nr = model.eta_names.get(row).map(String::as_str).unwrap_or("?");
@@ -1943,6 +1947,18 @@ fn packed_param_label(
         format!("kappa[{}]", idx)
     } else {
         format!("packed[{}]", packed_idx)
+    }
+}
+
+/// Format a single eigenvalue for display: `"0"`, fixed-4, or scientific-3.
+fn fmt_eig(v: f64) -> String {
+    let abs = v.abs();
+    if abs == 0.0 {
+        "0".to_string()
+    } else if abs >= 1e-4 && abs < 1e5 {
+        format!("{:.4}", v)
+    } else {
+        format!("{:.3e}", v)
     }
 }
 
@@ -1961,16 +1977,7 @@ fn extract_eigenvalues(sym: &DMatrix<f64>) -> Option<Vec<f64>> {
 pub(crate) fn format_non_pd_warning(eigvals: &[f64]) -> String {
     let fmt = eigvals
         .iter()
-        .map(|&v| {
-            let abs = v.abs();
-            if abs == 0.0 {
-                "0".to_string()
-            } else if abs >= 1e-4 && abs < 1e5 {
-                format!("{:.4}", v)
-            } else {
-                format!("{:.3e}", v)
-            }
-        })
+        .map(|&v| fmt_eig(v))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -2053,25 +2060,26 @@ pub(crate) fn compute_covariance(
         // a model-evaluation overflow/underflow.
         let params_at = unpack_params(x_hat, template);
         let reason = match extract_eigenvalues(&params_at.omega.matrix) {
-            Some(ref ev) if ev.last().copied().unwrap_or(1.0) <= 1e-8 => format!(
-                "Covariance step failed: Omega matrix is not positive definite at convergence \
-                 (min eigenvalue = {:.3e}; eigenvalues: [{}]). \
-                 SE estimates not available.",
-                ev.last().copied().unwrap_or(f64::NAN),
-                ev.iter()
-                    .map(|&v| {
-                        let a = v.abs();
-                        if a == 0.0 {
-                            "0".to_string()
-                        } else if a >= 1e-4 && a < 1e5 {
-                            format!("{:.4}", v)
-                        } else {
-                            format!("{:.3e}", v)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            Some(ref ev) if ev.last().copied().unwrap_or(1.0) <= 1e-8 => {
+                let min_eig = ev.last().copied().unwrap_or(f64::NAN);
+                // Distinguish truly negative eigenvalues from tiny-positive (near-singular).
+                let descriptor = if min_eig < 0.0 {
+                    "not positive definite"
+                } else {
+                    "near-singular"
+                };
+                format!(
+                    "Covariance step failed: Omega matrix is {} at convergence \
+                     (min eigenvalue = {:.3e}; eigenvalues: [{}]). \
+                     SE estimates not available.",
+                    descriptor,
+                    min_eig,
+                    ev.iter()
+                        .map(|&v| fmt_eig(v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
             _ => "Covariance step failed: base OFV is non-finite at convergence \
                   (likely numerical overflow or underflow in model evaluation). \
                   SE estimates not available."
@@ -2215,6 +2223,7 @@ pub(crate) fn compute_covariance(
 
     let warning = if inv.n_clipped > 0 {
         let pct = inv.n_clipped * 100 / n_free.max(1);
+        // Informal thresholds: ≤33 % clipped → minor concern; 34–50 % → caution; >50 % → unreliable.
         let (severity, interp) = match pct {
             0..=33 => ("minor", "Standard errors are likely reliable."),
             34..=50 => (
@@ -2485,6 +2494,65 @@ mod tests {
             msg.contains("-0.0100"),
             "negative eigenvalue must appear: {msg}"
         );
+    }
+
+    /// extract_eigenvalues returns None when the matrix contains a NaN entry.
+    #[test]
+    fn test_extract_eigenvalues_none_on_nan() {
+        let mut h = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 1.0]);
+        h[(0, 0)] = f64::NAN;
+        assert!(
+            extract_eigenvalues(&h).is_none(),
+            "NaN entry must cause None return"
+        );
+    }
+
+    /// packed_param_label decodes the lower-triangular block-omega index correctly.
+    /// Packing order (column-major lower triangle): (0,0), (1,0), (1,1).
+    /// With n_theta=2, packed_idx=3 → omega_idx=1 → (row=1, col=0).
+    #[test]
+    fn test_packed_param_label_block_omega() {
+        use crate::types::{OmegaMatrix, SigmaVector};
+        let mut mat = DMatrix::zeros(2, 2);
+        mat[(0, 0)] = 0.04;
+        mat[(1, 1)] = 0.04;
+        mat[(0, 1)] = 0.01;
+        mat[(1, 0)] = 0.01;
+        let free_mask = DMatrix::from_element(2, 2, true);
+        let omega = OmegaMatrix::from_matrix_with_mask(
+            mat,
+            vec!["ETA_CL".into(), "ETA_V".into()],
+            false,
+            free_mask,
+        );
+        let template = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.1, 5.0],
+            theta_upper: vec![50.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega,
+            omega_fixed: vec![false, false, false],
+            sigma: SigmaVector {
+                values: vec![0.1],
+                names: vec!["ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        let model = make_model();
+
+        // n_theta=2, so: idx=2 → omega[ETA_CL, ETA_CL], idx=3 → omega[ETA_V, ETA_CL] (off-diag),
+        // idx=4 → omega[ETA_V, ETA_V].
+        let label_diag = packed_param_label(2, &template, &model);
+        assert_eq!(label_diag, "omega[ETA_CL, ETA_CL]", "diagonal 0,0");
+
+        let label_off = packed_param_label(3, &template, &model);
+        assert_eq!(label_off, "omega[ETA_V, ETA_CL]", "off-diagonal 1,0");
+
+        let label_diag2 = packed_param_label(4, &template, &model);
+        assert_eq!(label_diag2, "omega[ETA_V, ETA_V]", "diagonal 1,1");
     }
 
     /// Empty matrix is a valid zero-dimensional input (all-FIX parameter

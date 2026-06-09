@@ -1413,6 +1413,10 @@ pub(crate) fn compute_extra_output_columns(
         let (session_obs, session_shift): (Vec<Vec<usize>>, Vec<f64>) = {
             let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n_sessions];
             for j in 0..n_obs {
+                // 1e-9: datareader inserts RESET_SEGMENT_GAP = 1.0 h between
+                // sessions, so no real observation lands within 1e-9 h of a
+                // reset boundary.  Larger than the ±1e-12 used for integral
+                // window filters, which must match exact user-supplied endpoints.
                 let s = subject
                     .reset_times
                     .iter()
@@ -1430,15 +1434,14 @@ pub(crate) fn compute_extra_output_columns(
                 .collect();
             (groups, shifts)
         };
-        let obs_session: Vec<usize> = (0..n_obs)
-            .map(|j| {
-                subject
-                    .reset_times
-                    .iter()
-                    .filter(|&&r| r <= subject.obs_times[j] + 1e-9)
-                    .count()
-            })
-            .collect();
+        // Invert session_obs: obs_session[j] = session index for observation j.
+        // Derived by inversion in O(n_obs) rather than re-scanning reset_times.
+        let mut obs_session = vec![0usize; n_obs];
+        for (s, indices) in session_obs.iter().enumerate() {
+            for &j in indices {
+                obs_session[j] = s;
+            }
+        }
 
         // [output] columns: covariates + indiv params not already in derived
         for col_name in &model.output_columns {
@@ -1622,34 +1625,50 @@ pub(crate) fn compute_extra_output_columns(
                         trapezoid(&pts)
                     };
 
+                    let use_obs = *data_based || matches!(step, IntegralStep::ObsTimes);
+
                     // Per-session grid snapshots: covariate, lagtime, and indiv params
-                    // from each session's first observation.  For subjects with no resets,
-                    // session_grid_cov[0] == per_obs_cov[0] — identical to the old path.
+                    // from each session's first observation.  Only allocated for
+                    // model-based integrals (`!use_obs`); stays empty — and is never
+                    // indexed — when `use_obs = true`.
+                    //
                     // This is the same "representative first-obs" approximation the old
                     // single-session grid used; it extends correctly per-session here.
-                    let session_grid_cov: Vec<&HashMap<String, f64>> = session_obs
-                        .iter()
-                        .map(|g| {
-                            g.first()
-                                .map(|&j| per_obs_cov[j])
-                                .unwrap_or(&subject.covariates)
-                        })
-                        .collect();
-                    let session_grid_lagtime: Vec<f64> = session_grid_cov
-                        .iter()
-                        .map(|cov| {
-                            let pk = (model.pk_param_fn)(theta, eta_hat, cov);
-                            pk.lagtime()
-                        })
-                        .collect();
-                    let session_grid_indiv: Vec<HashMap<String, f64>> = session_obs
-                        .iter()
-                        .map(|g| {
-                            g.first()
-                                .map(|&j| per_obs_indiv[j].clone())
-                                .unwrap_or_default()
-                        })
-                        .collect();
+                    let session_grid_cov: Vec<&HashMap<String, f64>> = if use_obs {
+                        vec![]
+                    } else {
+                        session_obs
+                            .iter()
+                            .map(|g| {
+                                g.first()
+                                    .map(|&j| per_obs_cov[j])
+                                    .unwrap_or(&subject.covariates)
+                            })
+                            .collect()
+                    };
+                    let session_grid_lagtime: Vec<f64> = if use_obs {
+                        vec![]
+                    } else {
+                        session_grid_cov
+                            .iter()
+                            .map(|cov| {
+                                let pk = (model.pk_param_fn)(theta, eta_hat, cov);
+                                pk.lagtime()
+                            })
+                            .collect()
+                    };
+                    let session_grid_indiv: Vec<HashMap<String, f64>> = if use_obs {
+                        vec![]
+                    } else {
+                        session_obs
+                            .iter()
+                            .map(|g| {
+                                g.first()
+                                    .map(|&j| per_obs_indiv[j].clone())
+                                    .unwrap_or_default()
+                            })
+                            .collect()
+                    };
 
                     // Fine-grid trapezoidal integral for session `session_idx`.
                     // `from` / `to` must be in the shifted internal clock (raw + shift,
@@ -1780,44 +1799,31 @@ pub(crate) fn compute_extra_output_columns(
                             }
                         };
 
-                    let use_obs = *data_based || matches!(step, IntegralStep::ObsTimes);
-
                     match window {
                         IntegralWindow::Explicit { from, to } => {
-                            let is_multi =
-                                subject.has_resets() && !subject.obs_raw_times.is_empty();
-                            if !is_multi {
-                                // Single-session path: one scalar repeated for all rows.
-                                let all_idx: Vec<usize> = (0..n_obs).collect();
-                                let val = if use_obs {
-                                    eval_integral_obs_for(&all_idx, *from, *to)
-                                } else {
-                                    eval_integral_grid(*from, *to, 0)
-                                };
-                                vec![val; n_obs]
-                            } else {
-                                // Multi-session: each session is integrated independently
-                                // in the raw-clock window [from, to].  Sessions with no
-                                // observations in that window yield NaN — never inherited.
-                                let mut result = vec![f64::NAN; n_obs];
-                                for (s, j_indices) in session_obs.iter().enumerate() {
-                                    if j_indices.is_empty() {
-                                        continue;
-                                    }
-                                    let val = if use_obs {
-                                        eval_integral_obs_for(j_indices, *from, *to)
-                                    } else {
-                                        match session_grid_window(s, *from, *to) {
-                                            Some((fs, ts)) => eval_integral_grid(fs, ts, s),
-                                            None => f64::NAN,
-                                        }
-                                    };
-                                    for &j in j_indices {
-                                        result[j] = val;
-                                    }
+                            // Unified loop: single-session subjects (n_sessions=1)
+                            // produce one iteration covering all obs — identical result
+                            // to the old `vec![val; n_obs]` scalar path.  Multi-session
+                            // subjects integrate each session independently; sessions
+                            // with no obs in the window return NaN (never inherited).
+                            let mut result = vec![f64::NAN; n_obs];
+                            for (s, j_indices) in session_obs.iter().enumerate() {
+                                if j_indices.is_empty() {
+                                    continue;
                                 }
-                                result
+                                let val = if use_obs {
+                                    eval_integral_obs_for(j_indices, *from, *to)
+                                } else {
+                                    match session_grid_window(s, *from, *to) {
+                                        Some((fs, ts)) => eval_integral_grid(fs, ts, s),
+                                        None => f64::NAN,
+                                    }
+                                };
+                                for &j in j_indices {
+                                    result[j] = val;
+                                }
                             }
+                            result
                         }
                         IntegralWindow::Periodic { period, anchor } => {
                             // Per-observation integral whose window is aligned to the
@@ -5475,9 +5481,9 @@ mod tests_derived_session_clock {
     use super::*;
     use crate::types::{
         AggFunction, BloqMethod, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind,
-        DoseEvent, ErrorModel, ErrorSpec, GradientMethod, IndivParamPartials, IntegralStep,
-        IntegralWindow, ModelParameters, OmegaMatrix, PkModel, PkParams, Population, ScalingSpec,
-        SigmaVector, Subject,
+        ErrorModel, ErrorSpec, GradientMethod, IndivParamPartials, IntegralStep, IntegralWindow,
+        ModelParameters, OmegaMatrix, PkModel, PkParams, Population, ScalingSpec, SigmaVector,
+        Subject,
     };
     use nalgebra::DVector;
     use std::collections::HashMap;

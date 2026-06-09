@@ -233,5 +233,17 @@ and the compartment state is inaccessible by name — use `compartments[i]` inst
   parse error.
 - Named access is not available for integrals in **analytical models**. Use
   `compartments[i]` in `integral(...)` for analytical models.
-- EKF/SDE models: `compartment_states` is not populated; using `compartments[i]`
-  in `[derived]` with an EKF model will yield `NaN` values.
+- **SDE models** (`[diffusion]` block): `compartments[i]` returns the
+  **deterministic ODE state** at each observation time, not the EKF-filtered state.
+  For most post-fit derived quantities this is sufficient, but values will differ
+  from the EKF posterior mean when process noise is large.
+- **IOV subjects**: `compartments[i]` evaluates to `NaN` — compartment states are
+  not yet available on the IOV prediction path
+  (`W_DERIVED_CMT_IOV_UNSUPPORTED` warning is emitted).
+- **Analytical models with time-varying covariates**: `compartments[i]` evaluates
+  to `NaN` for affected subjects — states would require time-varying PK params that
+  the superposition path does not support
+  (`W_DERIVED_CMT_TV_ANALYTICAL` warning is emitted).
+- **ODE models with time-varying covariates**: `compartments[i]` is approximate —
+  states are computed with first-observation PK parameters while `IPRED` uses the
+  correct per-event PK (`W_DERIVED_CMT_TV_ODE` warning is emitted).

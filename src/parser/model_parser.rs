@@ -1922,12 +1922,12 @@ fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
 
     // Index-based compartment keys.
     // Pre-populate all expected indices (0..n_names) with NaN so that when
-    // compartment_states is empty (IOV, TV-covariate, EKF subjects) the
-    // expression `compartments[i]` evaluates to NaN rather than the generic
-    // 0.0 undefined-variable fallback. Actual values then overwrite the
-    // NaN sentinels. Indices beyond n_names (out-of-range access) still fall
-    // back to 0.0 — those are user errors that the parser already blocks for
-    // Phase 1 (only literal indices, no dynamic indexing).
+    // compartment_states is empty (IOV subjects, analytical TV-covariate subjects)
+    // the expression `compartments[i]` evaluates to NaN rather than the generic
+    // 0.0 undefined-variable fallback. Actual values then overwrite the NaN sentinels.
+    // Indices beyond n_names (out-of-range access) still fall back to 0.0 — those
+    // are user errors that the parser already blocks for Phase 1 (only literal indices,
+    // no dynamic indexing).
     let n_expected = ctx.compartment_names.len();
     for i in 0..n_expected {
         vars.insert(format!("__cmt_{i}"), f64::NAN);

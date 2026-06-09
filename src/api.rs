@@ -2430,6 +2430,19 @@ fn fit_inner(
                     .to_string(),
             );
         }
+        // ODE TV-covariate subjects: states are computed via a deterministic pass
+        // using first-obs PK params — approximate when CL/V/etc. vary over time.
+        // ipred (from the event-driven path) is exact; only states are approximate.
+        if model.ode_spec.is_some() && population.subjects.iter().any(|s| s.has_tv_covariates()) {
+            warnings.push(
+                "W_DERIVED_CMT_TV_ODE: ODE model with time-varying covariates — \
+                 compartment states for TV-covariate subjects are approximate \
+                 (first-observation PK parameters used for the deterministic state \
+                 pass; ipred is exact). Use compartments[i] results with care for \
+                 those subjects."
+                    .to_string(),
+            );
+        }
     }
 
     // Report detected mu-referencing relationships (only when feature is enabled)

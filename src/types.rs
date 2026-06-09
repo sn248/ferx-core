@@ -1653,9 +1653,12 @@ pub struct SubjectResult {
     pub per_obs_tad: Vec<f64>,
     /// Full compartment state vector at each observation time. For ODE models this
     /// is the raw solver state `u[i]` in whatever units the ODE defines (typically
-    /// amounts for standard PK ODEs). For analytical models this is the natural
-    /// per-compartment value (amounts for depot, concentrations for central/peripheral).
-    /// Indexed `[obs_j][cmt_i]`. Empty for EKF/SDE models (tracked as follow-up).
+    /// amounts for standard PK ODEs). For SDE models (`[diffusion]` block), these are
+    /// the deterministic ODE states, not EKF-filtered states. For analytical models
+    /// this is the natural per-compartment value (amounts for depot, concentrations for
+    /// central/peripheral). Indexed `[obs_j][cmt_i]`.
+    /// Empty for IOV subjects and analytical TV-covariate subjects (those cases yield
+    /// NaN in `[derived]`; see W_DERIVED_CMT_IOV_UNSUPPORTED / W_DERIVED_CMT_TV_ANALYTICAL).
     /// Scaling (`apply_scaling`, Form A/C) is never applied here — only `ipred` is scaled.
     pub compartment_states: Vec<Vec<f64>>,
 }
@@ -1676,9 +1679,11 @@ pub struct DerivedContext<'a> {
     pub tad: f64,
     pub prev_derived: &'a HashMap<String, f64>,
     /// Raw compartment state at this observation time. For ODE models this is
-    /// the solver state `u[i]`; for analytical models it follows the convention in
-    /// the `compartment_states` docs on `SubjectResult`. Empty slice for EKF/SDE models
-    /// and for grid-integral points when `uses_compartments` is false.
+    /// the solver state `u[i]`; for SDE models these are deterministic ODE states
+    /// (not EKF-filtered). For analytical models it follows the convention in
+    /// the `compartment_states` docs on `SubjectResult`. Empty slice for IOV subjects,
+    /// analytical TV-covariate subjects, and grid-integral points when
+    /// `uses_compartments` is false.
     pub compartments: &'a [f64],
     /// Names parallel to `compartments` — ODE state names or analytical names.
     pub compartment_names: &'a [String],

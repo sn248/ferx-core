@@ -1277,8 +1277,8 @@ pub fn ode_predictions_event_driven_with_states(
     // will be computed with the first-observation PK params (CL/V/etc.) held fixed,
     // while `ipreds` correctly reflect per-event covariate snapshots. For most PK
     // contexts this approximation is acceptable post-fit, but the caller
-    // (`compute_predictions_with_states`) emits W_DERIVED_CMT_TV warning when
-    // TV covariates are present so users know the states are approximate.
+    // (`compute_predictions_with_states`) is the approximate path; `fit()` emits
+    // W_DERIVED_CMT_TV_ODE when TV covariates are present so users know.
     //
     // A future improvement: duplicate the event-driven loop to capture `u` at each
     // obs time directly — exact states, but ~2× the integration work post-fit.
@@ -1351,6 +1351,10 @@ pub fn ode_dense_solve_states(
             break_times.push(dose.time);
         }
     }
+    // EVID=3/4 resets must be break-points so the re-seed happens at the exact boundary.
+    for &rt in &subject.reset_times {
+        break_times.push(rt);
+    }
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
@@ -1361,6 +1365,16 @@ pub fn ode_dense_solve_states(
         let (t_start, t_end) = (w[0], w[1]);
         if (t_end - t_start).abs() < 1e-15 {
             continue;
+        }
+
+        // EVID=3/4 reset: re-seed compartments before processing doses at this time.
+        // Resets sort before doses at the same time (mirroring Kind::Reset < Kind::Dose).
+        for &rt in &subject.reset_times {
+            if (rt - t_start).abs() < 1e-10 {
+                u = ode.initial_state(pk_params_flat);
+                active_infusions.clear();
+                break;
+            }
         }
 
         for (dose_idx, dose) in subject.doses.iter().enumerate() {

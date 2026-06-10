@@ -1678,11 +1678,15 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     if let Some(derived_lines) = blocks.get("derived") {
         let cov_names = model.referenced_covariates.clone();
         let mut derived_warnings = Vec::new();
+        // For ODE models, ode_state_names drives uses_compartments detection.
+        // For analytical models, use analytical_compartment_names() so that
+        // named references like `central`, `depot`, `peripheral` in [derived]
+        // also set uses_compartments=true and trigger W_DERIVED_CMT_* warnings.
         let ode_state_names: Vec<String> = model
             .ode_spec
             .as_ref()
             .map(|s| s.state_names.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| model.analytical_compartment_names().to_vec());
         let derived_exprs = parse_derived_block(
             derived_lines,
             &model.theta_names.clone(),
@@ -8031,6 +8035,18 @@ fn parse_atom(
                         )
                     }
                 };
+                // MAX_CMT_SENTINEL in build_derived_vars pre-seeds keys __cmt_0
+                // through __cmt_255.  Any index ≥ 256 is not in the map and
+                // eval_expression's .unwrap_or(0.0) would silently return 0.0
+                // (a plausible drug concentration).  Reject at parse time instead.
+                const MAX_CMT_IDX: usize = 255;
+                if n > MAX_CMT_IDX {
+                    return Err(format!(
+                        "[derived] `compartments[{n}]`: index {n} exceeds the maximum \
+                         supported value ({MAX_CMT_IDX}). \
+                         Use compartments[0] through compartments[{MAX_CMT_IDX}]."
+                    ));
+                }
                 if tokens.get(pos + 3) != Some(&Token::RBracket) {
                     return Err("[derived] `compartments[N`: missing closing `]`".to_string());
                 }
@@ -15122,5 +15138,82 @@ CL V KA WT
         } else {
             panic!("expected PerRow derived kind");
         }
+    }
+
+    /// Regression: named analytical compartment references (e.g. `central`,
+    /// `depot`) in a [derived] expression on an analytical model must set
+    /// `uses_compartments = true` so that W_DERIVED_CMT_* warnings fire.
+    ///
+    /// Before the fix, `ode_state_names` was empty for analytical models, so
+    /// `expr_refs_compartments` never detected named access — all four
+    /// W_DERIVED_CMT_* guards were silently suppressed.
+    #[test]
+    fn analytical_model_named_compartment_sets_uses_compartments() {
+        // one_cpt_iv has a single compartment named "central"
+        let src = minimal_model_with_derived("C_CENTRAL = central");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let expr = &parsed.model.derived_exprs[0];
+        assert_eq!(expr.name, "C_CENTRAL");
+        assert!(
+            expr.uses_compartments,
+            "`central` in [derived] on a one_cpt_iv model must set uses_compartments=true"
+        );
+
+        // two_cpt_oral has depot, central, peripheral
+        let src2 = r#"
+[parameters]
+  theta CL(1.0, 0, 100)
+  theta V1(10.0, 0, 1000)
+  theta Q(0.5, 0, 50)
+  theta V2(5.0, 0, 500)
+  theta KA(1.0, 0, 10)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+[individual_parameters]
+  CL = exp(log(CL) + ETA_CL)
+  V1 = V1
+  Q  = Q
+  V2 = V2
+  KA = KA
+[structural_model]
+  pk two_cpt_oral(cl=CL, v=V1, q=Q, v2=V2, ka=KA)
+[error_model]
+  DV ~ proportional(PROP)
+[derived]
+  C_PERIPH = peripheral
+"#;
+        let parsed2 = parse_full_model(src2).expect("parse ok (two_cpt_oral)");
+        let expr2 = &parsed2.model.derived_exprs[0];
+        assert_eq!(expr2.name, "C_PERIPH");
+        assert!(
+            expr2.uses_compartments,
+            "`peripheral` in [derived] on a two_cpt_oral model must set uses_compartments=true"
+        );
+    }
+
+    /// Regression: `compartments[N]` with N ≥ 256 must fail at parse time
+    /// rather than silently evaluating to 0.0.
+    ///
+    /// MAX_CMT_SENTINEL = 256 pre-seeds `__cmt_0..=__cmt_255` with NaN.
+    /// Any index ≥ 256 misses the map and `.unwrap_or(0.0)` would return 0.0 —
+    /// a plausible drug concentration that masks the out-of-range access.
+    #[test]
+    fn compartments_index_out_of_range_is_parse_error() {
+        let src = minimal_model_with_derived("X = compartments[256]");
+        match parse_full_model(&src) {
+            Err(err) => assert!(
+                err.contains("256") && err.contains("exceeds"),
+                "error should mention the index and 'exceeds': {err}"
+            ),
+            Ok(_) => panic!("compartments[256] should be a parse error"),
+        }
+
+        // 255 is the last valid index — must succeed
+        let src_ok = minimal_model_with_derived("X = compartments[255]");
+        parse_full_model(&src_ok).expect("compartments[255] should parse ok");
+
+        // 0 must still work
+        let src_zero = minimal_model_with_derived("X = compartments[0]");
+        parse_full_model(&src_zero).expect("compartments[0] should parse ok");
     }
 }

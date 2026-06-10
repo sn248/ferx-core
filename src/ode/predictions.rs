@@ -1193,6 +1193,11 @@ pub fn ode_predictions_with_states(
         if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
             saveat.push(t_end);
         }
+        // Mirror ode_predictions lines 530-531: sort + dedup so solve_ode's
+        // linear save_idx cursor works correctly even if obs_times contains
+        // duplicate entries or arrives out of order.
+        saveat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
         // TAD anchor: last effective dose time before this segment, SS-aware.
         // For SS doses, rem_euclid maps the elapsed time back into [0, II) so
@@ -1227,7 +1232,11 @@ pub fn ode_predictions_with_states(
             move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
                 (ode.rhs)(y, p, t, dy);
                 for &(di, t_start_inf, t_end_inf) in &infusions {
-                    if t >= t_start_inf - 1e-12 && t < t_end_inf - 1e-12 {
+                    // Use +1e-12 on the upper bound (not -1e-12) so the infusion
+                    // is active right up to t_end_inf. The reference ode_predictions
+                    // applies the rate for the whole segment via active_infusions;
+                    // the dynamic gate here must not cut off the last sub-step.
+                    if t >= t_start_inf - 1e-12 && t < t_end_inf + 1e-12 {
                         let dose = &subject.doses[di];
                         let f = f_bio_snap[di];
                         // dose.cmt is 1-based; CMT=0 means no compartment — ignore.
@@ -1485,6 +1494,11 @@ pub fn ode_dense_solve_states(
         if seg_saveat.is_empty() || (seg_saveat.last().unwrap() - t_end).abs() > 1e-12 {
             seg_saveat.push(t_end);
         }
+        // Mirror ode_predictions lines 530-531 (and the same fix applied to
+        // ode_predictions_with_states): sort + dedup so solve_ode's linear
+        // save_idx cursor works correctly for duplicate / out-of-order times.
+        seg_saveat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        seg_saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
         // TAD anchor: SS-aware, matching ode_predictions (rem_euclid wraps
         // the elapsed time back into [0, II)).
@@ -1518,7 +1532,10 @@ pub fn ode_dense_solve_states(
             move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
                 (ode.rhs)(y, p, t, dy);
                 for &(di, t_start_inf, t_end_inf) in &infusions {
-                    if t >= t_start_inf - 1e-12 && t < t_end_inf - 1e-12 {
+                    // Use +1e-12 on the upper bound — same fix as applied to
+                    // ode_predictions_with_states — so the infusion is active
+                    // right up to t_end_inf rather than cutting off 1e-12 early.
+                    if t >= t_start_inf - 1e-12 && t < t_end_inf + 1e-12 {
                         let dose = &subject.doses[di];
                         let f = f_bio_snap[di];
                         // dose.cmt is 1-based; CMT=0 means no compartment — ignore.

@@ -496,7 +496,13 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
                 };
             }
             PkModel::TwoCptOral => {
-                return two_cpt_oral_f_ss(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
+                // Infusions bypass the depot and enter central directly —
+                // use the IV infusion SS formula, matching single_dose_states.
+                return if infusion {
+                    two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2())
+                } else {
+                    two_cpt_oral_f_ss(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio())
+                };
             }
             PkModel::ThreeCptIv => {
                 return if infusion {
@@ -506,18 +512,23 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
                 };
             }
             PkModel::ThreeCptOral => {
-                return three_cpt_oral_f_ss(
-                    dose,
-                    tau,
-                    cl,
-                    v,
-                    p.q(),
-                    p.v2(),
-                    p.q3(),
-                    p.v3(),
-                    p.ka(),
-                    p.f_bio(),
-                );
+                // Same infusion-bypasses-depot logic as TwoCptOral.
+                return if infusion {
+                    three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+                } else {
+                    three_cpt_oral_f_ss(
+                        dose,
+                        tau,
+                        cl,
+                        v,
+                        p.q(),
+                        p.v2(),
+                        p.q3(),
+                        p.v3(),
+                        p.ka(),
+                        p.f_bio(),
+                    )
+                };
             }
         }
     }
@@ -538,7 +549,14 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
                 two_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2())
             }
         }
-        PkModel::TwoCptOral => two_cpt_oral_f(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio()),
+        PkModel::TwoCptOral => {
+            // Infusions bypass the depot — use the IV formula, matching single_dose_states.
+            if infusion {
+                two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
+            } else {
+                two_cpt_oral_f(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio())
+            }
+        }
         PkModel::ThreeCptIv => {
             if infusion {
                 three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
@@ -546,18 +564,25 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
                 three_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
             }
         }
-        PkModel::ThreeCptOral => three_cpt_oral_f(
-            dose,
-            tau,
-            cl,
-            v,
-            p.q(),
-            p.v2(),
-            p.q3(),
-            p.v3(),
-            p.ka(),
-            p.f_bio(),
-        ),
+        PkModel::ThreeCptOral => {
+            // Same infusion-bypasses-depot logic as TwoCptOral.
+            if infusion {
+                three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+            } else {
+                three_cpt_oral_f(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.q3(),
+                    p.v3(),
+                    p.ka(),
+                    p.f_bio(),
+                )
+            }
+        }
     }
 }
 
@@ -2123,6 +2148,74 @@ mod tests {
             "SS central must be > single-dose central (accumulation): ss={} sd={}",
             states_ss[1],
             states_sd[1]
+        );
+    }
+
+    /// Regression test: `single_dose_concentration` and `single_dose_states[central]`
+    /// must agree for TwoCptOral infusion doses (both SS and non-SS).
+    ///
+    /// Before the fix, `single_dose_concentration` used the oral formula
+    /// (`two_cpt_oral_f_ss` / `two_cpt_oral_f`) for infusion doses, while
+    /// `single_dose_states` correctly used the IV infusion formula (since infusions
+    /// bypass the depot).  This caused `ipred ≠ compartment_states[central]` for
+    /// any TwoCptOral model with infusion doses.
+    #[test]
+    fn single_dose_concentration_matches_states_for_two_cpt_oral_infusion() {
+        fn infusion(amt: f64, rate: f64) -> DoseEvent {
+            DoseEvent::new(0.0, amt, 1, rate, false, 0.0)
+        }
+        fn infusion_ss(amt: f64, rate: f64, ii: f64) -> DoseEvent {
+            DoseEvent::new(0.0, amt, 1, rate, true, ii)
+        }
+
+        let cl = 5.0_f64;
+        let v = 80.0_f64;
+        let q = 2.0_f64;
+        let v2 = 40.0_f64;
+        let ka = 1.2_f64;
+        let f_bio = 1.0_f64;
+        let ii = 24.0_f64;
+        let amt = 200.0_f64;
+        let rate = 100.0_f64; // 2 h infusion
+        let tau = 8.0_f64;
+
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = cl;
+        p.values[crate::types::PK_IDX_V] = v;
+        p.values[crate::types::PK_IDX_Q] = q;
+        p.values[crate::types::PK_IDX_V2] = v2;
+        p.values[crate::types::PK_IDX_KA] = ka;
+        p.values[crate::types::PK_IDX_F] = f_bio;
+
+        // Non-SS infusion: single_dose_concentration must equal central state
+        let d = infusion(amt, rate);
+        let conc = single_dose_concentration(PkModel::TwoCptOral, &d, tau, &p);
+        let states = single_dose_states(PkModel::TwoCptOral, &d, tau, &p);
+        // central is index 1 for TwoCptOral: [depot=0, central=1, periph=2]
+        assert!(
+            approx::relative_eq!(conc, states[1], max_relative = 1e-9),
+            "TwoCptOral non-SS infusion: concentration={conc} ≠ central state={}",
+            states[1]
+        );
+
+        // SS infusion
+        let d = infusion_ss(amt, rate, ii);
+        let conc = single_dose_concentration(PkModel::TwoCptOral, &d, tau, &p);
+        let states = single_dose_states(PkModel::TwoCptOral, &d, tau, &p);
+        assert!(
+            approx::relative_eq!(conc, states[1], max_relative = 1e-9),
+            "TwoCptOral SS infusion: concentration={conc} ≠ central state={}",
+            states[1]
+        );
+
+        // Bolus should be unchanged (oral formula is correct for bolus)
+        let d = DoseEvent::new(0.0, amt, 1, 0.0, false, 0.0);
+        let conc = single_dose_concentration(PkModel::TwoCptOral, &d, tau, &p);
+        let states = single_dose_states(PkModel::TwoCptOral, &d, tau, &p);
+        assert!(
+            approx::relative_eq!(conc, states[1], max_relative = 1e-9),
+            "TwoCptOral bolus: concentration={conc} ≠ central state={}",
+            states[1]
         );
     }
 }

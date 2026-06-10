@@ -61,10 +61,6 @@ section of the SDLC for the versioning policy).
   structural-zero cross-block off-diagonals (`free_mask == false`) are excluded
   from the parameter set like FIX parameters, so their flat Hessian diagonal no
   longer aborts the step. This affected both FOCE and FOCEI (#243).
-- Covariance step: the inner EBE loop is now reconverged to a tighter tolerance
-  (≤ `1e-6`, never looser than `inner_tol`) at each finite-difference point,
-  removing an inner-loop noise floor the difference quotient amplified into the
-  standard errors and sharpening agreement with NONMEM `$COVARIANCE` (#223).
 - Covariance standard errors now match NONMEM `$COVARIANCE MATRIX=R` (within ~2%
   on warfarin). The covariance step reconverges the inner EBE loop at every
   finite-difference point — holding the EBEs fixed gave an indefinite Hessian

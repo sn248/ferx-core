@@ -2166,6 +2166,20 @@ fn select_fd_step<F: Fn(&[f64]) -> f64>(
 /// the wrong curvature, indefinite even on well-conditioned surfaces like
 /// warfarin, which forced eigenvalue clipping (#129) and inflated the SEs.
 ///
+/// Inner-EBE reconvergence tolerance for the covariance step.
+///
+/// The FD Hessian differences gradients/OFVs that are each reconverged in the
+/// inner loop; an EBE solved only to the *fit* tolerance leaves a residual the
+/// difference quotient amplifies by `1/(2h)`. We therefore reconverge more
+/// tightly here — capped at `1e-6` so the warm-started inner BFGS still finishes
+/// inside `inner_maxiter`, but never looser than the user's own `inner_tol`
+/// (a user who already conditions tighter than `1e-6` keeps their setting).
+/// See [`compute_covariance`] (#223).
+pub(crate) fn covariance_reconverge_tol(fit_inner_tol: f64) -> f64 {
+    const COVARIANCE_INNER_TOL_CAP: f64 = 1e-6;
+    fit_inner_tol.min(COVARIANCE_INNER_TOL_CAP)
+}
+
 /// Two stencils:
 /// - **non-IOV**: central FD of the analytical population gradient (issue #209),
 ///   `H[:,k] ≈ (g(x̂+hₖeₖ) − g(x̂−hₖeₖ)) / 2hₖ` — `2·n_free` gradient evaluations.
@@ -2175,6 +2189,10 @@ fn select_fd_step<F: Fn(&[f64]) -> f64>(
 ///
 /// The returned covariance is `2·H⁻¹`: the objective is `−2·logL`, so its Hessian
 /// is twice the observed information.
+///
+/// EBEs are reconverged at every perturbed point to [`covariance_reconverge_tol`]
+/// (tighter than the fit's `inner_tol`) so the difference quotient is not limited
+/// by inner-loop noise.
 ///
 /// Returns [`CovarianceStepResult::Unusable`] when the FD Hessian is structurally
 /// unusable (non-finite or zero-diagonal entries, or eigenvalues that diverge to
@@ -2220,6 +2238,17 @@ pub(crate) fn compute_covariance(
     // with the wrong curvature — indefinite even on warfarin, which previously
     // forced eigenvalue clipping (#129) and inflated the SEs. Both the
     // gradient-FD and scalar-FD paths below reconverge through this helper.
+    //
+    // The FD Hessian differences these reconverged gradients/OFVs, so an EBE that
+    // is only solved to the *fit* tolerance (`inner_tol`, default 1e-4) injects
+    // noise that the difference quotient amplifies by 1/(2h) ≈ 50 at the default
+    // step — a ~5e-3 relative noise floor that dominates the O(h²) ≈ 2e-5
+    // truncation error and scatters the SEs. NONMEM conditions the EBEs more
+    // tightly in `$COV` for the same reason; mirror that by reconverging to
+    // `covariance_reconverge_tol` (≤ 1e-6, and never looser than the user's fit
+    // tolerance). The cap keeps the warm-started inner BFGS inside `inner_maxiter`
+    // on models the user already conditioned tightly (#223).
+    let cov_inner_tol = covariance_reconverge_tol(options.inner_tol);
     let reconverge = |xv: &[f64]| {
         let params = unpack_params(xv, template);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
@@ -2228,7 +2257,7 @@ pub(crate) fn compute_covariance(
             population,
             &params,
             options.inner_maxiter,
-            options.inner_tol,
+            cov_inner_tol,
             Some(eta_hats),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
@@ -4119,6 +4148,19 @@ mod tests {
             result.ofv.is_finite(),
             "presearch run produced non-finite OFV"
         );
+    }
+
+    #[test]
+    fn covariance_reconverge_tol_tightens_loose_fit_and_respects_tight_fit() {
+        // Default loose fit tolerance is tightened to the 1e-6 cap.
+        assert_eq!(covariance_reconverge_tol(1e-4), 1e-6);
+        // A looser-than-default fit is also pulled to the cap.
+        assert_eq!(covariance_reconverge_tol(1e-3), 1e-6);
+        // Exactly at the cap stays at the cap.
+        assert_eq!(covariance_reconverge_tol(1e-6), 1e-6);
+        // A user already conditioning tighter than the cap keeps their setting
+        // (we never loosen the covariance step relative to the fit).
+        assert_eq!(covariance_reconverge_tol(1e-8), 1e-8);
     }
 
     // ── Covariance Hessian throughput benchmark (issue #209) ─────────────────

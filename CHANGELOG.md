@@ -32,6 +32,13 @@ section of the SDLC for the versioning policy).
 - Combined ferx-core + ferx-r development documentation: a Development Lifecycle
   (SDLC) page and a Contributing page in the book.
 
+### Changed
+- IMP (importance sampling) now jointly samples (η, κ) for IOV models,
+  integrating over inter-occasion variability so the reported `−2 log L` is
+  directly comparable to FOCE/FOCEI and NONMEM `METHOD=IMP`. Previously κ was
+  held fixed at its EBE mode, giving a partial marginal; `kappa_treatment` in
+  the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
+
 ### Fixed
 - Covariance standard errors now match NONMEM `$COVARIANCE MATRIX=R` (within ~2%
   on warfarin). The covariance step reconverges the inner EBE loop at every

@@ -743,6 +743,24 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
+/// Format a covariance matrix entry in YAML 1.1-compatible scientific notation.
+///
+/// Rust's `{:.6e}` omits the `+` sign on non-negative exponents (e.g. `1.0` →
+/// `"1.000000e0"`), which YAML 1.1 parsers (R yaml, PyYAML) reject as a float
+/// and read back as a string.  This helper always emits an explicit sign:
+/// `"1.000000e+0"`, `"1.234567e-4"`, etc.
+fn fmt_cov_entry(v: f64) -> String {
+    let s = format!("{:.6e}", v);
+    // Insert '+' before a bare non-negative exponent, e.g. "e0" → "e+0".
+    if let Some(pos) = s.find('e') {
+        let exp = &s[pos + 1..];
+        if !exp.starts_with('-') {
+            return format!("{}e+{}", &s[..pos], exp);
+        }
+    }
+    s
+}
+
 /// Build the ordered parameter name list that matches `pack_params` layout:
 /// `[theta..., omega_packed..., sigma..., kappa_packed...]`.
 ///
@@ -1236,23 +1254,20 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     // Emitted when the covariance step succeeded or was regularized, giving
     // downstream tools (bootstrap, SIR, uncertainty propagation) the full
     // parameter covariance without re-running the fit.
-    // Values are written in Rust's default scientific notation (`{:.6e}`),
-    // which omits the `+` sign and leading zero in the exponent, e.g.
-    // `1.234567e-4`.  Standard YAML parsers (PyYAML, R yaml, serde_yaml)
-    // all accept this form.
     if let Some(ref cov) = result.covariance_matrix {
         let n = cov.nrows();
         let names = packed_param_names(result, n);
         writeln!(f, "\ncovariance_matrix:").map_err(|e| e.to_string())?;
         writeln!(
             f,
-            "  # optimizer parameterization: theta/sigma log-transformed, omega/kappa Cholesky-factored"
+            "  # optimizer parameterization: theta log-transformed when lower bound >= 0 \
+             (identity otherwise), sigma log-transformed, omega/kappa Cholesky-factored"
         )
         .map_err(|e| e.to_string())?;
         writeln!(f, "  parameters: [{}]", names.join(", ")).map_err(|e| e.to_string())?;
         writeln!(f, "  rows:").map_err(|e| e.to_string())?;
         for i in 0..n {
-            let row: Vec<String> = (0..n).map(|j| format!("{:.6e}", cov[(i, j)])).collect();
+            let row: Vec<String> = (0..n).map(|j| fmt_cov_entry(cov[(i, j)])).collect();
             writeln!(f, "    {}: [{}]", names[i], row.join(", ")).map_err(|e| e.to_string())?;
         }
     }
@@ -2284,10 +2299,14 @@ mod tests {
         assert!(yaml.contains("    CL: ["), "CL row missing");
         assert!(yaml.contains("    var_ETA_CL: ["), "var_ETA_CL row missing");
         assert!(yaml.contains("    EPS_1: ["), "EPS_1 row missing");
-        // Identity matrix: diagonal 1, off-diagonal 0
+        // Identity matrix: diagonal 1 → "1.000000e+0", off-diagonal 0 → "0.000000e+0"
         assert!(
-            yaml.contains("1.000000e0") || yaml.contains("1.000000e"),
-            "diagonal 1 missing"
+            yaml.contains("1.000000e+0"),
+            "diagonal 1 missing or wrong exponent format"
+        );
+        assert!(
+            yaml.contains("0.000000e+0"),
+            "off-diagonal 0 missing or wrong exponent format"
         );
 
         // Full-block omega (2 etas): packed names include chol_ off-diagonal entry

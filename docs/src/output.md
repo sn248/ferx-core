@@ -129,7 +129,25 @@ sigma:
   sigma_1:
     estimate: 0.010638
     se: 0.000788
+covariance_matrix:
+  # optimizer parameterization: theta log-transformed when lower bound >= 0
+  # (identity otherwise), sigma log-transformed, omega/kappa Cholesky-factored
+  parameters: [TVCL, TVV, var_ETA_CL, var_ETA_V, sigma_1]
+  rows:
+    TVCL:      [1.234567e-4, 2.345678e-5, 0.000000e+0, 0.000000e+0, 0.000000e+0]
+    TVV:       [2.345678e-5, 1.456789e-3, 0.000000e+0, 0.000000e+0, 0.000000e+0]
+    var_ETA_CL: [0.000000e+0, 0.000000e+0, 5.678901e-5, 0.000000e+0, 0.000000e+0]
+    var_ETA_V:  [0.000000e+0, 0.000000e+0, 0.000000e+0, 2.345678e-6, 0.000000e+0]
+    sigma_1:   [0.000000e+0, 0.000000e+0, 0.000000e+0, 0.000000e+0, 7.890123e-7]
 ```
+
+The `covariance_matrix:` block is only present when the covariance step ran
+successfully or was regularised. The values are in **optimizer space** — thetas
+and sigma are on the log scale (or identity scale when the lower bound is
+negative), omega and kappa are Cholesky-factored. The `parameters:` list gives
+the canonical column order; `rows:` keys match that order. Omega diagonal
+entries appear as `var_<eta>` and off-diagonal Cholesky entries as
+`chol_<eta_row>_<eta_col>`.
 
 ### Key Fields
 

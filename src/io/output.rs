@@ -1838,6 +1838,7 @@ mod tests {
             n_obs: 2,
             extra_columns: Vec::new(),
             per_obs_tad: Vec::new(),
+            compartment_states: Vec::new(),
         };
         let result = minimal_sdtab_result(vec![sr]);
         let population = Population {

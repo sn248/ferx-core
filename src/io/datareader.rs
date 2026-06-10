@@ -2,7 +2,7 @@ use crate::io::filter_expr::{FilterClause, RowContext};
 use crate::types::{
     CovariateDecl, CovariateRow, CovariateTable, DoseEvent, ExclusionSummary, Population, Subject,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Compiled data-selection filter built from `FitOptions` ignore/accept fields.
@@ -107,6 +107,15 @@ pub(crate) const ERR_COV_MISSING_COLUMNS: &str =
 /// Leading text of the "declared covariate value is not numeric" error.
 pub(crate) const ERR_COV_NON_NUMERIC: &str = "[covariates]: non-numeric value";
 
+/// Wall-clock gap inserted between reset-delimited occasion segments when a
+/// subject's TIME column restarts (see the segmentation logic in
+/// `parse_subject`). The reset zeros every compartment at the boundary, so no
+/// drug carries across the gap and its magnitude is numerically irrelevant
+/// (it cancels in every dose/observation time difference within a segment); a
+/// small positive value simply keeps the two occasions from colliding on the
+/// sorted absolute timeline.
+const RESET_SEGMENT_GAP: f64 = 1.0;
+
 /// True when a CSV cell represents a missing value (blank / `.` / `NA` / `NaN`).
 /// NONMEM convention uses `.` for missing.
 fn is_missing_cell(s: &str) -> bool {
@@ -132,7 +141,15 @@ pub fn read_nonmem_csv(
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(path, covariate_columns, iov_column, None, None).map(|(pop, _)| pop)
+    read_nonmem_csv_impl(
+        path,
+        covariate_columns,
+        iov_column,
+        None,
+        None,
+        &HashSet::new(),
+    )
+    .map(|(pop, _)| pop)
 }
 
 /// Read a NONMEM-format CSV with a `[covariates]` declaration.
@@ -163,8 +180,14 @@ pub fn read_nonmem_csv_with_covariates(
         }
     }
     let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
-    let (pop, table) =
-        read_nonmem_csv_impl(path, Some(&union_refs), iov_column, Some(decls), None)?;
+    let (pop, table) = read_nonmem_csv_impl(
+        path,
+        Some(&union_refs),
+        iov_column,
+        Some(decls),
+        None,
+        &HashSet::new(),
+    )?;
     Ok((
         pop,
         table.expect("covariate table is built whenever table_decls is Some"),
@@ -196,8 +219,15 @@ pub fn read_nonmem_csv_filtered(
     let cols_ref: Option<Vec<&str>> = augmented
         .as_ref()
         .map(|v| v.iter().map(|s| s.as_str()).collect());
-    read_nonmem_csv_impl(path, cols_ref.as_deref(), iov_column, None, Some(filter))
-        .map(|(pop, _)| pop)
+    read_nonmem_csv_impl(
+        path,
+        cols_ref.as_deref(),
+        iov_column,
+        None,
+        Some(filter),
+        &HashSet::new(),
+    )
+    .map(|(pop, _)| pop)
 }
 
 /// Like [`read_nonmem_csv_with_covariates`] but applies `[data_selection]` filtering.
@@ -232,6 +262,83 @@ pub fn read_nonmem_csv_with_covariates_filtered(
         iov_column,
         Some(decls),
         Some(filter),
+        &HashSet::new(),
+    )?;
+    Ok((
+        pop,
+        table.expect("covariate table is built whenever table_decls is Some"),
+    ))
+}
+
+// ── TTE-aware readers (pub(crate) — used by api::read_population_for) ────────
+
+/// Like [`read_nonmem_csv_filtered`] but routes EVID=0 rows on `tte_cmts` to
+/// `Subject::obs_records` instead of the Gaussian parallel Vecs.
+///
+/// Used by `api::read_population_for` when the model has one or more TTE endpoints.
+pub(crate) fn read_nonmem_csv_filtered_tte(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    tte_cmts: &HashSet<usize>,
+) -> Result<Population, String> {
+    let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
+        let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
+        if let Some(f) = filter {
+            for c in f.referenced_covariate_columns() {
+                if !v.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
+                    v.push(c);
+                }
+            }
+        }
+        v
+    });
+    let cols_ref: Option<Vec<&str>> = augmented
+        .as_ref()
+        .map(|v| v.iter().map(|s| s.as_str()).collect());
+    read_nonmem_csv_impl(
+        path,
+        cols_ref.as_deref(),
+        iov_column,
+        None,
+        filter,
+        tte_cmts,
+    )
+    .map(|(pop, _)| pop)
+}
+
+/// Like [`read_nonmem_csv_with_covariates_filtered`] but routes EVID=0 rows on
+/// `tte_cmts` to `Subject::obs_records`.
+pub(crate) fn read_nonmem_csv_with_covariates_tte(
+    path: &Path,
+    decls: &[CovariateDecl],
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    tte_cmts: &HashSet<usize>,
+) -> Result<(Population, CovariateTable), String> {
+    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
+    for c in extra_columns {
+        if !union.iter().any(|n| n == c) {
+            union.push(c.clone());
+        }
+    }
+    if let Some(f) = filter {
+        for c in f.referenced_covariate_columns() {
+            if !union.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
+                union.push(c);
+            }
+        }
+    }
+    let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
+    let (pop, table) = read_nonmem_csv_impl(
+        path,
+        Some(&union_refs),
+        iov_column,
+        Some(decls),
+        filter,
+        tte_cmts,
     )?;
     Ok((
         pop,
@@ -245,12 +352,16 @@ pub fn read_nonmem_csv_with_covariates_filtered(
 /// columns in `covariate_columns` (a superset, including referenced-but-
 /// undeclared covariates) are read into the [`Population`] leniently. `None` on
 /// both is the legacy auto-detect [`read_nonmem_csv`] path.
+///
+/// `tte_cmts`: CMTs whose EVID=0 rows should be routed to `Subject::obs_records`
+/// (TTE endpoint) instead of the Gaussian parallel Vecs. Empty for all-Gaussian models.
 fn read_nonmem_csv_impl(
     path: &Path,
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
     table_decls: Option<&[CovariateDecl]>,
     filter: Option<&SelectionFilter>,
+    tte_cmts: &HashSet<usize>,
 ) -> Result<(Population, Option<CovariateTable>), String> {
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
@@ -284,6 +395,9 @@ fn read_nonmem_csv_impl(
     let ss_col = col_idx_ci("ss");
     let cens_col = col_idx_ci("cens");
     let addl_col = col_idx_ci("addl");
+    // TENTRY column: left-truncation / delayed-entry time for TTE rows.
+    // Absent in Gaussian-only datasets; only used when tte_cmts is non-empty.
+    let tentry_col = col_idx_ci("tentry");
 
     // IOV occasion column (case-insensitive lookup of user-specified name)
     let occ_col: Option<usize> = iov_column.and_then(|name| col_idx_ci(name));
@@ -296,6 +410,7 @@ fn read_nonmem_csv_impl(
 
     const STANDARD_COLS: &[&str] = &[
         "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens", "addl",
+        "tentry",
     ];
     let is_standard = |h: &str| {
         STANDARD_COLS.iter().any(|s| h.eq_ignore_ascii_case(s))
@@ -435,6 +550,8 @@ fn read_nonmem_csv_impl(
             addl_col,
             &cov_indices,
             filter,
+            tte_cmts,
+            tentry_col,
         )?;
         total_occ_failures += occ_failures;
         population_warnings.extend(subj_warnings);
@@ -607,9 +724,16 @@ fn parse_subject(
     addl_col: Option<usize>,
     cov_indices: &[(String, usize)],
     filter: Option<&SelectionFilter>,
+    // CMTs to route to `obs_records` instead of the Gaussian parallel Vecs.
+    // Empty for Gaussian-only models. Always available; feature-gated routing
+    // runs inside `#[cfg(feature = "survival")]` blocks.
+    tte_cmts: &HashSet<usize>,
+    // Column index of the TENTRY (left-truncation time) column, if present.
+    tentry_col: Option<usize>,
 ) -> Result<(Subject, usize, SubjectExclusion, Vec<String>), String> {
     let mut doses = Vec::new();
     let mut obs_times = Vec::new();
+    let mut obs_raw_times = Vec::new();
     let mut observations = Vec::new();
     let mut obs_cmts = Vec::new();
     let mut cens = Vec::new();
@@ -622,6 +746,16 @@ fn parse_subject(
     let mut excl_fired: Vec<String> = Vec::new();
     let mut parse_warnings: Vec<String> = Vec::new();
     let mut addl_missing_ii_warned = false;
+
+    // TTE state — only meaningful when tte_cmts is non-empty.
+    // obs_records: finalised TTE observation records for this subject.
+    // tte_pending_left: per-CMT pending DV=0 row (may be a left-bound for an interval
+    //   or a right-censored event, depending on whether the next row is DV=2).
+    //   Map value is (time, entry_time).
+    #[cfg(feature = "survival")]
+    let mut tte_obs_records: Vec<crate::types::ObsRecord> = Vec::new();
+    #[cfg(feature = "survival")]
+    let mut tte_pending_left: HashMap<usize, (f64, f64)> = HashMap::new();
 
     // Time-constant covariates: first non-missing value across all rows.
     // Used as the subject-static fallback (and for the AD fast path, which
@@ -688,6 +822,23 @@ fn parse_subject(
     // compartment amount at `time`; EVID=4 additionally records a dose
     // (handled in the `evid == 1 || evid == 4` arm below).
     let mut reset_times: Vec<f64> = Vec::new();
+
+    // Reset-delimited occasion segmentation. NONMEM processes records
+    // sequentially, so an EVID=3/4 reset whose TIME restarts at/below the
+    // running timeline begins a fresh occasion that reuses the previous
+    // occasion's wall-clock (e.g. two infusion occasions both timed from 0,
+    // stacked under one ID). Our event engine sorts events by absolute time,
+    // which would interleave such occasions and double the administered dose.
+    // We instead shift each restarting segment — and every event after it,
+    // until the next restart — past the prior segment onto a single monotonic
+    // timeline. The reset zeros all compartments at the boundary, so the
+    // inserted gap carries no drug: predictions are identical to integrating
+    // each occasion independently, while the subject keeps one shared set of
+    // random effects (matching NONMEM's EVID=4 semantics). `time_offset` is
+    // the running shift; `max_eff_time` is the largest effective (shifted)
+    // event time emitted so far.
+    let mut time_offset = 0.0f64;
+    let mut max_eff_time = f64::NEG_INFINITY;
 
     for row in rows {
         // Update LOCF state from this row's TV-covariate values *before*
@@ -796,6 +947,26 @@ fn parse_subject(
             }
         }
 
+        // Raw (unshifted) TIME for this row, preserved before the occasion
+        // shift below so the user-clock diagnostics (sdtab/covtab TIME and
+        // predict/simulate TIME) report the value the user wrote, while the
+        // engine uses the shifted monotonic `time`.
+        let raw_time = time;
+
+        // Reset-delimited occasion segmentation (see `time_offset` above).
+        // When an EVID=3/4 reset's TIME would land at or before the running
+        // timeline, start a new segment by shifting it (and the rest of this
+        // occasion) just past the latest event seen so far. `time` is then the
+        // effective, monotonic event time used everywhere downstream; `raw_time`
+        // keeps the original column value for the diagnostic outputs.
+        if (evid == 3 || evid == 4) && time + time_offset <= max_eff_time {
+            time_offset = max_eff_time + RESET_SEGMENT_GAP - time;
+        }
+        let time = time + time_offset;
+        if time > max_eff_time {
+            max_eff_time = time;
+        }
+
         // EVID=3 (reset) and EVID=4 (reset + dose) both zero the compartment
         // state at this time. Record the reset before the dose arm runs so
         // EVID=4 captures both the reset and its dose.
@@ -842,6 +1013,22 @@ fn parse_subject(
             if any_tv {
                 dose_covariates.push(locf_state.clone());
             }
+            // Advance the occasion watermark past this dose's *end* (start +
+            // infusion duration), not just its start. A later reset-restarting
+            // occasion is shifted past `max_eff_time`; if a dose here ends after
+            // the last observation, the watermark must reflect that so the next
+            // occasion doesn't land inside this one's dosing window. Reuses the
+            // duration `DoseEvent::new` already computed (single source of truth).
+            // NOTE: dose lagtime (ALAG) is a model parameter unknown at parse
+            // time, so the watermark uses unlagged times; a heavily-lagged dose
+            // whose effective start crosses an occasion boundary is not covered.
+            let dose_end = {
+                let d = doses.last().unwrap();
+                d.time + d.duration
+            };
+            if dose_end > max_eff_time {
+                max_eff_time = dose_end;
+            }
 
             // ADDL expansion: add additional doses at time + k*II for k=1..=addl.
             let addl = addl_col
@@ -860,11 +1047,9 @@ fn parse_subject(
                     }
                 } else {
                     for k in 1..=(addl as u32) {
+                        let addl_time = time + (k as f64) * ii;
                         doses.push(DoseEvent::new(
-                            time + (k as f64) * ii,
-                            amt,
-                            cmt,
-                            rate,
+                            addl_time, amt, cmt, rate,
                             false, // expanded doses are never SS themselves
                             ii,
                         ));
@@ -873,6 +1058,19 @@ fn parse_subject(
                         }
                         if any_tv {
                             dose_covariates.push(locf_state.clone());
+                        }
+                        // Fold each expanded dose's end into the watermark so a
+                        // following reset-restarting occasion is shifted past the
+                        // whole ADDL train (issue #195 review): ADDL bolus doses
+                        // landing after the next occasion's reset would otherwise
+                        // fire onto it, since boluses aren't gated by reset_floor.
+                        // Reuses the just-pushed dose's stored duration.
+                        let addl_end = {
+                            let d = doses.last().unwrap();
+                            d.time + d.duration
+                        };
+                        if addl_end > max_eff_time {
+                            max_eff_time = addl_end;
                         }
                     }
                 }
@@ -894,19 +1092,123 @@ fn parse_subject(
                     }
                 })
                 .unwrap_or(1);
-            let cens_flag = cens_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
-                .unwrap_or(0);
-            obs_times.push(time);
-            observations.push(dv);
-            obs_cmts.push(cmt);
-            cens.push(if cens_flag > 0 { 1u8 } else { 0u8 });
-            if occ_col.is_some() {
-                occasions.push(occ);
-            }
-            if any_tv {
-                obs_covariates.push(locf_state.clone());
+
+            // TTE row routing: when this CMT belongs to a TTE endpoint, route to
+            // obs_records instead of the Gaussian parallel Vecs.
+            // The `tte_cmts.contains` check is always compiled (HashSet is not
+            // feature-gated); the inner ObsRecord construction is cfg-gated.
+            if tte_cmts.contains(&cmt) {
+                #[cfg(feature = "survival")]
+                {
+                    use crate::types::{EventType, ObsRecord};
+                    let raw_entry = tentry_col
+                        .and_then(|c| row.get(c))
+                        .map(|s| parse_f64(s))
+                        .unwrap_or(0.0)
+                        .max(0.0);
+                    if raw_entry > time + 1e-12 {
+                        parse_warnings.push(format!(
+                            "Subject {id}: TENTRY={raw_entry} > TIME={time} on CMT={cmt} \
+                             — entry time after the event/censoring time yields a negative \
+                             effective cumulative hazard; row skipped"
+                        ));
+                        // Skip this malformed row rather than producing an invalid NLL.
+                        continue;
+                    }
+                    let entry_time = raw_entry;
+                    // DV must be an integer code (0/1/2).  Reject fractional values
+                    // explicitly: a DV of 1.9 would silently truncate to 1 (Exact event),
+                    // misclassifying a censored observation.
+                    let dv_rounded = dv.round();
+                    if (dv - dv_rounded).abs() > 1e-9 {
+                        return Err(format!(
+                            "Subject {id}: TTE endpoint CMT={cmt} has non-integer DV={dv} \
+                             at TIME={time}; DV must be 0 (right-censored), \
+                             1 (exact event), or 2 (interval-censored right bound)"
+                        ));
+                    }
+                    let dv_code = dv_rounded as i64;
+                    match dv_code {
+                        0 => {
+                            // DV=0: tentatively a right-censored event, or left-bound of
+                            // interval-censored pair. Save as pending; flush on next row.
+                            // Flush any existing pending for this CMT first.
+                            if let Some((t_left, e_left)) = tte_pending_left.remove(&cmt) {
+                                tte_obs_records.push(ObsRecord::Event {
+                                    time: t_left,
+                                    event_type: EventType::RightCensored,
+                                    entry_time: e_left,
+                                    cmt,
+                                });
+                            }
+                            tte_pending_left.insert(cmt, (time, entry_time));
+                        }
+                        1 => {
+                            // DV=1: exact event. Flush any pending left for this CMT.
+                            if let Some((t_left, e_left)) = tte_pending_left.remove(&cmt) {
+                                tte_obs_records.push(ObsRecord::Event {
+                                    time: t_left,
+                                    event_type: EventType::RightCensored,
+                                    entry_time: e_left,
+                                    cmt,
+                                });
+                            }
+                            tte_obs_records.push(ObsRecord::Event {
+                                time,
+                                event_type: EventType::Exact,
+                                entry_time,
+                                cmt,
+                            });
+                        }
+                        2 => {
+                            // DV=2: interval-censored right-bound. Must follow a DV=0.
+                            let left = tte_pending_left.remove(&cmt).ok_or_else(|| {
+                                format!(
+                                    "Subject {id}: DV=2 row at TIME={time} on CMT={cmt} \
+                                     not preceded by a DV=0 row on the same CMT — \
+                                     DV=2 marks the right bound of an interval-censored event"
+                                )
+                            })?;
+                            let (t_left, e_left) = left;
+                            tte_obs_records.push(ObsRecord::Event {
+                                time,
+                                event_type: EventType::IntervalCensored {
+                                    left: t_left,
+                                    right: time,
+                                },
+                                entry_time: e_left,
+                                cmt,
+                            });
+                        }
+                        other => {
+                            return Err(format!(
+                                "Subject {id}: TTE endpoint CMT={cmt} has DV={other} \
+                                 at TIME={time}; valid DV codes are 0 (right-censored), \
+                                 1 (exact event), 2 (interval-censored right bound)"
+                            ));
+                        }
+                    }
+                }
+                // Note: no fallback needed here. `tte_cmts` is always empty when the
+                // `survival` feature is off (callers pass `&HashSet::new()`), so this
+                // branch is never entered in that build. The dead cfg block was removed.
+            } else {
+                // Gaussian path (unchanged)
+                let cens_flag = cens_col
+                    .and_then(|c| row.get(c))
+                    .map(|s| parse_usize(s))
+                    .unwrap_or(0);
+                obs_times.push(time);
+                obs_raw_times.push(raw_time);
+                observations.push(dv);
+                obs_cmts.push(cmt);
+                cens.push(if cens_flag > 0 { 1u8 } else { 0u8 });
+                if occ_col.is_some() {
+                    occasions.push(occ);
+                }
+                if any_tv {
+                    obs_covariates.push(locf_state.clone());
+                }
             }
         } else if evid == 2 && any_tv {
             // EVID=2 "other event" — typically a covariate-change marker.
@@ -949,11 +1251,25 @@ fn parse_subject(
     // sort defensively so the event-driven propagators see them in order.
     reset_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Flush any remaining pending TTE left-bounds as right-censored events.
+    // This handles the common case: final row is a right-censored DV=0 with no
+    // following DV=2 — the subject was censored at its last observation time.
+    #[cfg(feature = "survival")]
+    for (cmt, (t_left, e_left)) in tte_pending_left {
+        tte_obs_records.push(crate::types::ObsRecord::Event {
+            time: t_left,
+            event_type: crate::types::EventType::RightCensored,
+            entry_time: e_left,
+            cmt,
+        });
+    }
+
     Ok((
         Subject {
             id: id.to_string(),
             doses: sorted_doses,
             obs_times,
+            obs_raw_times,
             observations,
             obs_cmts,
             covariates,
@@ -966,7 +1282,7 @@ fn parse_subject(
             occasions,
             dose_occasions: sorted_dose_occ,
             #[cfg(feature = "survival")]
-            obs_records: vec![],
+            obs_records: tte_obs_records,
         },
         occ_parse_failures,
         SubjectExclusion {
@@ -1032,10 +1348,16 @@ mod tests {
         let f = write_csv(csv);
         let pop = read_nonmem_csv(f.path(), None, None).unwrap();
         let subj = &pop.subjects[0];
+        // Also the no-shift guard for a *forward* reset (TIME=5 advances past
+        // the prior obs at TIME=1): the occasion-segmentation shift must only
+        // fire on a restarting clock, so reset_times and obs_times keep their
+        // raw values here (a spurious shift would push the reset past 5 and
+        // move the t=6 obs).
         assert_eq!(subj.reset_times, vec![5.0]);
         assert!(subj.has_resets());
         // One dose (t=0), two observations (t=1, t=6) — the reset row is neither.
         assert_eq!(subj.doses.len(), 1);
+        assert_eq!(subj.doses[0].time, 0.0);
         assert_eq!(subj.obs_times, vec![1.0, 6.0]);
     }
 
@@ -1126,6 +1448,95 @@ mod tests {
         let pop = read_nonmem_csv(f.path(), None, None).unwrap();
         assert!(pop.subjects[0].reset_times.is_empty());
         assert!(!pop.subjects[0].has_resets());
+    }
+
+    #[test]
+    fn test_evid4_restart_shifts_second_occasion_onto_monotonic_timeline() {
+        // Two dosing occasions stacked under one ID, each opened by an EVID=4
+        // reset whose TIME column restarts at 0 (NONMEM processes records
+        // sequentially, so this is a fresh occasion sharing the first's clock).
+        // The reader must shift the second occasion past the first so the two
+        // don't collide on the sorted absolute timeline — otherwise both doses
+        // land at t=0 and the subject is double-dosed (issue #195).
+        let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,4,100\n\
+                   1,2,5.0,0,.\n\
+                   1,8,2.0,0,.\n\
+                   1,0,.,4,100\n\
+                   1,2,4.0,0,.\n\
+                   1,8,1.5,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        // Two distinct reset times (the second shifted past the first occasion).
+        assert_eq!(subj.reset_times.len(), 2);
+        assert_eq!(subj.reset_times[0], 0.0);
+        assert!(
+            subj.reset_times[1] > 8.0,
+            "second reset must be shifted past the first occasion's last event (t=8), got {}",
+            subj.reset_times[1]
+        );
+
+        // Two doses, no longer colliding at t=0.
+        assert_eq!(subj.doses.len(), 2);
+        assert_eq!(subj.doses[0].time, 0.0);
+        assert_eq!(subj.doses[1].time, subj.reset_times[1]);
+
+        // Observation times are strictly increasing across the occasion
+        // boundary (the second occasion's relative spacing is preserved).
+        assert_eq!(subj.obs_times.len(), 4);
+        for w in subj.obs_times.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "obs times must be monotonic: {:?}",
+                subj.obs_times
+            );
+        }
+        // Within-occasion spacing is unchanged: second occasion's two obs are
+        // still 6 time units apart (raw t=2 and t=8).
+        let gap2 = subj.obs_times[3] - subj.obs_times[2];
+        assert!(
+            (gap2 - 6.0).abs() < 1e-9,
+            "second occasion spacing preserved"
+        );
+    }
+
+    #[test]
+    fn test_addl_train_advances_occasion_watermark() {
+        // Regression for the issue #195 review: occasion 1 carries an ADDL dose
+        // train (II=10, ADDL=3 → boluses at 0,10,20,30) but its only observation
+        // is at t=5. A following EVID=4 occasion restarts at TIME=0. The
+        // occasion shift must place the new reset past the *whole* ADDL train,
+        // not just past the last observation — otherwise the later ADDL boluses
+        // (which a reset does not cancel) would land after the reset and
+        // contaminate occasion 2.
+        let csv = "ID,TIME,DV,EVID,AMT,II,ADDL\n\
+                   1,0,.,1,100,10,3\n\
+                   1,5,5.0,0,.,.,.\n\
+                   1,0,.,4,100,0,0\n\
+                   1,5,4.0,0,.,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        // Occasion 1 doses: 0,10,20,30 (raw). The single reset (occasion 2)
+        // must be shifted strictly past the last ADDL dose at t=30.
+        assert_eq!(subj.reset_times.len(), 1);
+        let reset = subj.reset_times[0];
+        assert!(
+            reset > 30.0,
+            "occasion-2 reset must be shifted past the ADDL train (last dose t=30), got {reset}"
+        );
+        // No occasion-1 dose lands at or after the reset (which would inject it
+        // into occasion 2). Exactly one dose — occasion 2's own — is >= reset.
+        let after_reset = subj.doses.iter().filter(|d| d.time >= reset - 1e-9).count();
+        assert_eq!(
+            after_reset,
+            1,
+            "only occasion 2's own dose may sit at/after its reset; doses={:?}",
+            subj.doses.iter().map(|d| d.time).collect::<Vec<_>>()
+        );
     }
 
     #[test]

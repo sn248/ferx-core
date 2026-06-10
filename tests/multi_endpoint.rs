@@ -69,6 +69,7 @@ fn pkpd_pop() -> Population {
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times,
+            obs_raw_times: Vec::new(),
             observations: vec![8.0, 1.0, 6.0, 2.0, 4.0, 3.0],
             obs_cmts: cmts,
             covariates: HashMap::new(),
@@ -80,6 +81,8 @@ fn pkpd_pop() -> Population {
             cens: vec![0; n],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         }],
     }
 }

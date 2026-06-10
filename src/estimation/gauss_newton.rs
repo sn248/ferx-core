@@ -15,7 +15,7 @@
 /// converges in 10-30 iterations vs 100+ for first-order methods.
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::pop_nll;
-use crate::estimation::outer_optimizer::{compute_covariance, OuterResult};
+use crate::estimation::outer_optimizer::{compute_covariance, CovarianceStepResult, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
 use crate::stats::likelihood::{
@@ -377,14 +377,12 @@ pub fn run_foce_gn(
                     &kappas,
                     options,
                 ) {
-                    Some(out) => {
-                        if let Some(w) = out.warning {
-                            warnings.push(w);
-                        }
+                    CovarianceStepResult::Success(out) => {
+                        warnings.extend(out.warnings);
                         Some(out.matrix)
                     }
-                    None => {
-                        warnings.push("Covariance step failed".to_string());
+                    CovarianceStepResult::Unusable(msg) => {
+                        warnings.push(msg);
                         None
                     }
                 }
@@ -467,35 +465,34 @@ pub fn run_foce_gn(
     }
 
     // ---- Covariance step ----
-    let covariance_matrix = if options.run_covariance_step {
-        if verbose {
-            eprintln!("Running covariance step...");
-        }
-        let packed = pack_params(&final_params);
-        match compute_covariance(
-            &packed,
-            &final_params,
-            model,
-            population,
-            &final_etas,
-            &final_h_mats,
-            &final_kappas,
-            options,
-        ) {
-            Some(out) => {
-                if let Some(w) = out.warning {
-                    warnings.push(w);
+    let covariance_matrix =
+        if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
+            if verbose {
+                eprintln!("Running covariance step...");
+            }
+            let packed = pack_params(&final_params);
+            match compute_covariance(
+                &packed,
+                &final_params,
+                model,
+                population,
+                &final_etas,
+                &final_h_mats,
+                &final_kappas,
+                options,
+            ) {
+                CovarianceStepResult::Success(out) => {
+                    warnings.extend(out.warnings);
+                    Some(out.matrix)
                 }
-                Some(out.matrix)
+                CovarianceStepResult::Unusable(msg) => {
+                    warnings.push(msg);
+                    None
+                }
             }
-            None => {
-                warnings.push("Covariance step failed".to_string());
-                None
-            }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     if verbose {
         eprintln!("FOCE-GN completed. Final OFV = {:.4}", final_ofv);
@@ -1643,6 +1640,8 @@ mod tests {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         }
     }
 
@@ -1652,6 +1651,7 @@ mod tests {
                 id: "S1".into(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 4.0, 8.0],
+                obs_raw_times: Vec::new(),
                 observations: vec![25.0, 15.0, 9.0],
                 obs_cmts: vec![1, 1, 1],
                 covariates: HashMap::new(),
@@ -2551,6 +2551,8 @@ mod tests {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         };
 
         let template = &model.default_params;
@@ -2826,6 +2828,8 @@ mod tests {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         }
     }
 
@@ -2834,6 +2838,7 @@ mod tests {
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![0.5, 1.0, 2.0, 3.0, 5.0, 8.0],
+            obs_raw_times: Vec::new(),
             observations: vec![40.0, 32.0, 25.0, 38.0, 22.0, 14.0],
             obs_cmts: vec![1; 6],
             covariates: HashMap::new(),

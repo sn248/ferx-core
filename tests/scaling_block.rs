@@ -29,6 +29,7 @@ fn one_subject_pop() -> Population {
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times,
+            obs_raw_times: Vec::new(),
             observations: vec![0.0; n_obs],
             obs_cmts: vec![1; n_obs],
             covariates: HashMap::new(),
@@ -40,6 +41,8 @@ fn one_subject_pop() -> Population {
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         }],
     }
 }
@@ -247,6 +250,7 @@ fn two_cmt_pop() -> Population {
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: obs_times.clone(),
+        obs_raw_times: Vec::new(),
         observations: vec![0.0; n_obs],
         obs_cmts: obs_cmts.clone(),
         covariates: HashMap::new(),
@@ -258,6 +262,8 @@ fn two_cmt_pop() -> Population {
         cens: vec![0; n_obs],
         occasions: Vec::new(),
         dose_occasions: Vec::new(),
+        #[cfg(feature = "survival")]
+        obs_records: vec![],
     };
     Population {
         covariate_names: Vec::new(),

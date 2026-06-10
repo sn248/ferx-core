@@ -77,6 +77,7 @@ fn sparse_population(n: usize) -> Population {
                 id: format!("{i}"),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![t],
+                obs_raw_times: Vec::new(),
                 observations: vec![0.0],
                 obs_cmts: vec![1],
                 covariates: HashMap::new(),
@@ -88,6 +89,8 @@ fn sparse_population(n: usize) -> Population {
                 cens: vec![0],
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             }
         })
         .collect();

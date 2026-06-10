@@ -1793,3 +1793,211 @@ fn analytical_integral_over_compartment_with_evid3_reset_returns_nan() {
         }
     }
 }
+
+// ── TV-covariate warning tests (review finding #5) ──────────────────────────
+
+/// Population whose single subject has time-varying WT supplied via
+/// `obs_covariates`. Used to trigger `has_tv_covariates() == true` for
+/// both the analytical and ODE TV-covariate warning tests.
+fn tv_covariate_iv_population() -> Population {
+    let obs_times = vec![1.0, 4.0, 12.0, 24.0];
+    let n = obs_times.len();
+    // Per-observation covariate maps: WT changes over the study.
+    let obs_covariates: Vec<HashMap<String, f64>> = obs_times
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let mut m = HashMap::new();
+            m.insert("WT".into(), 60.0 + i as f64 * 5.0);
+            m
+        })
+        .collect();
+    Population {
+        covariate_names: vec!["WT".into()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times,
+            obs_raw_times: vec![],
+            observations: vec![5.0, 3.0, 1.5, 0.7],
+            obs_cmts: vec![1; n],
+            covariates: {
+                let mut m = HashMap::new();
+                m.insert("WT".into(), 70.0);
+                m
+            },
+            dose_covariates: vec![],
+            obs_covariates,
+            pk_only_times: vec![],
+            pk_only_covariates: vec![],
+            reset_times: vec![],
+            cens: vec![0; n],
+            occasions: vec![],
+            dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }],
+    }
+}
+
+/// Regression for review finding #5 (analytical TV-covariate + compartments[i]).
+///
+/// For an analytical model whose individual CL depends on a time-varying
+/// covariate (WT), `compartment_states` cannot be computed by superposition
+/// because the baseline PK params would disagree with the TV ipred.
+/// `fit()` must:
+///   1. Emit `W_DERIVED_CMT_TV_ANALYTICAL`.
+///   2. Return empty inner slices for each observation (so that
+///      `compartments[i]` in `[derived]` evaluates to NaN, not a silently
+///      wrong value derived from baseline params).
+#[test]
+fn analytical_tv_covariate_with_compartments_derived_emits_warning() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(5.0, 0.01, 50.0)
+  theta V(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = CL * (WT/70)^0.75 * exp(ETA_CL)
+  V  = V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+  c0 = compartments[0]
+
+[fit_options]
+  method   = foce
+  maxiter  = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    let pop = tv_covariate_iv_population();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    // Warning must be emitted.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_DERIVED_CMT_TV_ANALYTICAL")),
+        "expected W_DERIVED_CMT_TV_ANALYTICAL warning; got: {:?}",
+        result.warnings
+    );
+    // Per-observation state rows must exist (n_obs outer entries) but each
+    // inner slice must be empty so that compartments[i] → NaN rather than a
+    // silently-wrong baseline-PK value.
+    for sr in &result.subjects {
+        assert_eq!(
+            sr.compartment_states.len(),
+            sr.ipred.len(),
+            "compartment_states must have {} outer entries for TV-covariate subject {}",
+            sr.ipred.len(),
+            sr.id
+        );
+        for (j, row) in sr.compartment_states.iter().enumerate() {
+            assert!(
+                row.is_empty(),
+                "compartment_states[{j}] must be empty for TV-covariate subject {} \
+                 (non-empty would silently use baseline PK, disagrees with ipred)",
+                sr.id
+            );
+        }
+    }
+}
+
+/// Regression for review finding #5 (ODE TV-covariate + compartments[i]).
+///
+/// For an ODE model with a time-varying covariate the event-driven path
+/// (`ode_predictions_event_driven_with_states`) is used, which holds PK
+/// parameters constant at the first observation value for the state trajectory
+/// (exact for ipred, approximate for states). `fit()` must emit
+/// `W_DERIVED_CMT_TV_ODE` to inform the user that states may be approximate.
+/// Unlike the analytical case, states are populated (not empty) because the
+/// approximation is documented and useful; only ipred is exact.
+#[test]
+fn ode_tv_covariate_with_compartments_derived_emits_warning() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(5.0, 0.01, 50.0)
+  theta V(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = CL * (WT/70)^0.75 * exp(ETA_CL)
+  V  = V
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+  c0 = compartments[0]
+
+[fit_options]
+  method   = foce
+  maxiter  = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    let pop = tv_covariate_iv_population();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    // Warning must be emitted.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_DERIVED_CMT_TV_ODE")),
+        "expected W_DERIVED_CMT_TV_ODE warning; got: {:?}",
+        result.warnings
+    );
+    // For ODE TV-covariate subjects, states are populated (approximate via
+    // first-obs PK params) — they must be non-empty and finite.
+    for sr in &result.subjects {
+        assert_eq!(
+            sr.compartment_states.len(),
+            sr.ipred.len(),
+            "compartment_states must have {} outer entries for TV-covariate ODE subject {}",
+            sr.ipred.len(),
+            sr.id
+        );
+        for (j, row) in sr.compartment_states.iter().enumerate() {
+            assert!(
+                !row.is_empty(),
+                "ODE TV-covariate subject {}: compartment_states[{j}] must not be empty",
+                sr.id
+            );
+            for (k, &v) in row.iter().enumerate() {
+                assert!(
+                    v.is_finite(),
+                    "ODE TV-covariate subject {}: compartment_states[{j}][{k}] = {v:.6} is not finite",
+                    sr.id
+                );
+            }
+        }
+    }
+}

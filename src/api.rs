@@ -4394,6 +4394,55 @@ mod iov_integration {
             );
         }
     }
+
+    /// Regression for review finding #5 (IOV + compartments[i]).
+    ///
+    /// When the model has a [derived] expression that references `compartments[i]`
+    /// and the fit has IOV subjects, `W_DERIVED_CMT_IOV_UNSUPPORTED` must be
+    /// emitted. The `predict_iov` path does not compute compartment states; the
+    /// per-subject `compartment_states` vec stays empty (`vec![]`), so any
+    /// `compartments[i]` reference evaluates to NaN. The warning makes this
+    /// explicit rather than silent.
+    #[test]
+    fn iov_with_compartments_derived_emits_unsupported_warning() {
+        let mut model = make_iov_model();
+        // Inject a derived expression that sets uses_compartments = true,
+        // just like a parsed `[derived] cmt0 = compartments[0]` would.
+        model.derived_exprs.push(DerivedExprSpec {
+            name: "cmt0".into(),
+            kind: DerivedKind::PerRow {
+                eval: Box::new(|ctx| ctx.compartments.first().copied().unwrap_or(f64::NAN)),
+            },
+            uses_compartments: true,
+        });
+        let pop = make_iov_population();
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        let result =
+            fit(&model, &pop, &model.default_params.clone(), &opts).expect("fit must succeed");
+
+        // Warning must be present.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("W_DERIVED_CMT_IOV_UNSUPPORTED")),
+            "expected W_DERIVED_CMT_IOV_UNSUPPORTED warning; got: {:?}",
+            result.warnings
+        );
+        // Compartment states for IOV subjects must be entirely empty (outer vec
+        // is vec![], not vec![vec![]; n_obs]) — the predict_iov path never
+        // populates them.
+        for sr in &result.subjects {
+            assert!(
+                sr.compartment_states.is_empty(),
+                "IOV subject {} must have empty compartment_states (len={}), \
+                 got {}",
+                sr.id,
+                sr.ipred.len(),
+                sr.compartment_states.len()
+            );
+        }
+    }
 }
 
 #[cfg(test)]

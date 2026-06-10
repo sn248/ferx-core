@@ -2020,6 +2020,41 @@ fn format_non_pd_warning(eigvals: &[f64]) -> String {
     )
 }
 
+/// Choose a finite-difference step that keeps all free-parameter diagonal
+/// stencils finite, starting from `initial_eps` and halving up to
+/// `MAX_HALVINGS` times.
+///
+/// Returns `(chosen_eps, n_halvings)`. If every halving fails (all stencils
+/// still non-finite at `initial_eps / 2^MAX_HALVINGS`), returns the final
+/// eps anyway — the FD loop will detect and report the remaining failures.
+fn select_fd_step<F: Fn(&[f64]) -> f64>(
+    x_hat: &[f64],
+    free_idx: &[usize],
+    initial_eps: f64,
+    f0: f64,
+    ofv: &F,
+) -> (f64, usize) {
+    const MAX_HALVINGS: usize = 8;
+    let mut eps = initial_eps;
+    let mut x = x_hat.to_vec();
+    for halvings in 0..MAX_HALVINGS {
+        let all_ok = free_idx.iter().all(|&i| {
+            let hi = eps * (1.0 + x_hat[i].abs());
+            x[i] = x_hat[i] + hi;
+            let fp = ofv(&x);
+            x[i] = x_hat[i] - hi;
+            let fm = ofv(&x);
+            x[i] = x_hat[i]; // always restore before returning
+            fp.is_finite() && fm.is_finite() && (fp - 2.0 * f0 + fm).is_finite()
+        });
+        if all_ok {
+            return (eps, halvings);
+        }
+        eps *= 0.5;
+    }
+    (eps, MAX_HALVINGS)
+}
+
 /// Compute the parameter covariance matrix at convergence (the R-matrix:
 /// inverse observed Fisher information).
 ///
@@ -2055,12 +2090,12 @@ pub(crate) fn compute_covariance(
     options: &FitOptions,
 ) -> CovarianceStepResult {
     let n = x_hat.len();
-    let eps = options.fd_hessian_step;
-    if eps <= 0.0 || !eps.is_finite() {
+    let initial_eps = options.fd_hessian_step;
+    if initial_eps <= 0.0 || !initial_eps.is_finite() {
         return CovarianceStepResult::Unusable(format!(
             "Covariance step failed: fd_hessian_step must be positive and finite, got {}. \
              SE estimates not available.",
-            eps
+            initial_eps
         ));
     }
     let bounds = compute_bounds(template);
@@ -2183,6 +2218,22 @@ pub(crate) fn compute_covariance(
     let free_idx: Vec<usize> = (0..n)
         .filter(|&i| !fixed_mask[i] && !structural_zero[i])
         .collect();
+
+    let f0 = base_ofv;
+
+    // Adaptively select the FD step: halve up to 8× until all free-parameter
+    // diagonal stencils are finite. Most models use the initial step; halving
+    // only kicks in when the OFV overflows at the default perturbation size.
+    let (eps, n_halvings) = select_fd_step(x_hat, &free_idx, initial_eps, f0, &ofv_fixed);
+    if options.verbose && n_halvings > 0 {
+        eprintln!(
+            "  [covariance] Adaptive FD step: reduced {:.3e} → {:.3e} ({} halving{})",
+            initial_eps,
+            eps,
+            n_halvings,
+            if n_halvings == 1 { "" } else { "s" }
+        );
+    }
 
     let mut hess = DMatrix::zeros(n, n);
     let is_iov = kappas.iter().any(|k| !k.is_empty());
@@ -3945,6 +3996,7 @@ mod tests {
     #[test]
     #[ignore = "benchmark: run with -- --ignored --nocapture"]
     fn bench_cov_hessian_throughput() {
+
         use std::time::Instant;
 
         let model = make_model();
@@ -4082,5 +4134,57 @@ mod tests {
         println!("  scalar-FD (old): {:.2}ms/Hessian", scalar_ms);
         println!("  gradient-FD (new): {:.2}ms/Hessian", grad_ms);
         println!("  speedup: {:.1}×", scalar_ms / grad_ms);
+    }
+
+    // ── select_fd_step ───────────────────────────────────────────────────────
+
+    /// When all stencils are finite from the start, no halvings occur and the
+    /// initial step is returned unchanged.
+    #[test]
+    fn select_fd_step_no_halving_needed() {
+        let ofv = |x: &[f64]| x[0] * x[0] + x[1] * x[1];
+        let x_hat = [1.0f64, 2.0];
+        let free_idx = [0usize, 1];
+        let f0 = ofv(&x_hat);
+        let (eps, halvings) = select_fd_step(&x_hat, &free_idx, 0.01, f0, &ofv);
+        assert_eq!(eps, 0.01, "step should be unchanged");
+        assert_eq!(halvings, 0, "no halvings expected");
+    }
+
+    /// When the initial step causes overflow (NaN stencils), the function halves
+    /// until stencils are finite and returns the reduced step.
+    #[test]
+    fn select_fd_step_halves_on_overflow() {
+        // Returns NaN whenever |x[0]| >= 0.5 — simulates model overflow.
+        let ofv = |x: &[f64]| {
+            if x[0].abs() >= 0.5 {
+                f64::NAN
+            } else {
+                x[0] * x[0]
+            }
+        };
+        let x_hat = [0.0f64];
+        let free_idx = [0usize];
+        let f0 = 0.0f64;
+        // initial_eps=1.0 → hi=1.0 → x=1.0 ≥ 0.5 → NaN → halve
+        // eps=0.5 → hi=0.5 → x=0.5 ≥ 0.5 → NaN → halve
+        // eps=0.25 → hi=0.25 → x=0.25 < 0.5 → 0.0625 → OK
+        let (eps, halvings) = select_fd_step(&x_hat, &free_idx, 1.0, f0, &ofv);
+        assert_eq!(eps, 0.25, "should have halved twice");
+        assert_eq!(halvings, 2);
+        // Verify the chosen step actually produces finite stencils.
+        let hi = eps * (1.0 + x_hat[0].abs());
+        let fp = ofv(&[x_hat[0] + hi]);
+        let fm = ofv(&[x_hat[0] - hi]);
+        assert!(fp.is_finite() && fm.is_finite());
+    }
+
+    /// Empty free_idx — vacuously all OK, returns initial eps without halvings.
+    #[test]
+    fn select_fd_step_empty_free_idx() {
+        let ofv = |_x: &[f64]| f64::NAN; // would fail any real stencil
+        let (eps, halvings) = select_fd_step(&[1.0], &[], 0.01, 0.0, &ofv);
+        assert_eq!(eps, 0.01);
+        assert_eq!(halvings, 0);
     }
 }

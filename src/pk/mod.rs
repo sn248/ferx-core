@@ -925,7 +925,7 @@ pub fn compute_predictions_with_states(
         // handles resets as break-points). Plain subjects use the simpler function
         // that avoids the per-event PK-parameter machinery.
         let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-        if subject.has_tv_covariates() || subject.has_resets() {
+        let (mut ipred, states) = if subject.has_tv_covariates() || subject.has_resets() {
             let mut scratch = EventPkParams::with_capacity_for(subject);
             compute_event_pk_params_into(model, subject, theta, eta, &mut scratch);
             crate::ode::ode_predictions_event_driven_with_states(
@@ -940,7 +940,15 @@ pub fn compute_predictions_with_states(
         } else {
             // Single-pass: one ODE integration yields both ipred and states.
             crate::ode::ode_predictions_with_states(ode, &pk.values, theta, eta, subject)
-        }
+        };
+        // Apply [scaling] and LTBS log-transform — the single insertion point
+        // shared with compute_predictions_with_tv_into_with_schedule (lines 1153–1154).
+        // Without this, ODE models with `obs_scale` or `log_transform = true` would
+        // get raw, unscaled ipred in SubjectResult. For Form C (ODE output_fn) models,
+        // model.scaling is ScalingSpec::None, so apply_scaling is a no-op there.
+        apply_scaling(model, subject, theta, eta, &mut ipred);
+        apply_log_transform(model, &mut ipred);
+        (ipred, states)
     } else {
         // Analytical path: ipred via compute_predictions_with_tv (handles SS, resets,
         // TV covariates); states via predict_all_states (superposition only — valid

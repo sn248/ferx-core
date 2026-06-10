@@ -2077,7 +2077,9 @@ fn parse_integral_kind(
 
     let integrand_expr = parse_derived_expr(args[0], ctx)?;
     let data_based = expr_refs_dv(&integrand_expr);
-    let uses_compartments = expr_refs_compartments(&integrand_expr, ctx.ode_state_names);
+    // Also checked against condition below — must be `mut` so we can OR in
+    // the condition's compartment references before the struct is built.
+    let mut uses_compartments = expr_refs_compartments(&integrand_expr, ctx.ode_state_names);
 
     let mut condition: Option<DerivedFilterFn> = None;
     let mut from_val: Option<f64> = None;
@@ -2090,6 +2092,15 @@ fn parse_integral_kind(
     // Second positional arg is a condition if it contains comparison operators.
     if i < args.len() && !is_keyword_arg_tokens(args[i]) && tokens_contain_comparison(args[i]) {
         let cond = parse_derived_cond(args[i], ctx)?;
+        // If the filter condition references a compartment (e.g.
+        // `integral(IPRED, compartments[0] > threshold, from=0, to=24)`),
+        // we must set uses_compartments so the grid path populates the state
+        // vectors before the condition closure is evaluated — otherwise the
+        // filter sees NaN for all __cmt_N keys. Matches max/min/tmax handling
+        // at lines 2332–2335.
+        if cond_refs_compartments(&cond, ctx.ode_state_names) {
+            uses_compartments = true;
+        }
         condition = Some(build_derived_filter_fn(cond));
         i += 1;
     }
@@ -15226,5 +15237,43 @@ CL V KA WT
         // 0 must still work
         let src_zero = minimal_model_with_derived("X = compartments[0]");
         parse_full_model(&src_zero).expect("compartments[0] should parse ok");
+    }
+
+    /// Regression: `uses_compartments` on `integral()` must also fire when the
+    /// **condition** (filter) clause references a compartment, not just the
+    /// integrand. Before the fix, `integral(IPRED, compartments[0] > 1, from=0,
+    /// to=24)` had `uses_compartments = false` because only the integrand was
+    /// checked — the filter closure silently received NaN for all `__cmt_N` keys,
+    /// and the integral silently integrated over the wrong set of observations.
+    #[test]
+    fn integral_condition_referencing_compartment_sets_uses_compartments() {
+        // Integrand is IPRED (no compartment ref); condition references compartments[0].
+        let src = minimal_model_with_derived(
+            "AUC_FILTERED = integral(IPRED, compartments[0] > 1.0, from=0, to=24)",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let expr = &parsed.model.derived_exprs[0];
+        assert_eq!(expr.name, "AUC_FILTERED");
+        assert!(
+            expr.uses_compartments,
+            "integral() condition referencing compartments[0] must set uses_compartments=true"
+        );
+
+        // Sanity check: integrand-only reference still works
+        let src2 = minimal_model_with_derived("AUC_CMT = integral(compartments[0], from=0, to=24)");
+        let parsed2 = parse_full_model(&src2).expect("parse ok");
+        assert!(
+            parsed2.model.derived_exprs[0].uses_compartments,
+            "integral() integrand referencing compartments[0] must still set uses_compartments"
+        );
+
+        // Sanity check: no compartment reference in either integrand or condition → false
+        let src3 =
+            minimal_model_with_derived("AUC_PLAIN = integral(IPRED, DV > 0.0, from=0, to=24)");
+        let parsed3 = parse_full_model(&src3).expect("parse ok");
+        assert!(
+            !parsed3.model.derived_exprs[0].uses_compartments,
+            "integral() with no compartment reference must leave uses_compartments=false"
+        );
     }
 }

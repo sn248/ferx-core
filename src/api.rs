@@ -1778,7 +1778,15 @@ pub(crate) fn compute_extra_output_columns(
                         // we re-run the solver at grid points (exact); for analytical models
                         // we evaluate the superposition formula at each grid point.
                         let grid_cmt_states: Vec<Vec<f64>> = if *uses_compartments {
-                            if let Some(ref ode) = model.ode_spec {
+                            if model.n_kappa > 0 {
+                                // IOV subjects: eta_hat is BSV-only (kappas zeroed); states
+                                // computed here would use kappa=0 regardless of the actual
+                                // occasion, producing finite but wrong values. Return empty
+                                // so every grid point evaluates to NaN, consistent with
+                                // per-obs compartment_states being empty for IOV subjects.
+                                // W_DERIVED_CMT_IOV_UNSUPPORTED explains why.
+                                vec![]
+                            } else if let Some(ref ode) = model.ode_spec {
                                 let pk_j = (model.pk_param_fn)(theta, eta_hat, grid_cov);
                                 crate::ode::ode_dense_solve_states(
                                     ode,

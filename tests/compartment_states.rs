@@ -2084,3 +2084,300 @@ fn analytical_tv_covariate_integral_of_compartment_is_nan() {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bug regression: IOV model + integral(compartments[i]) → NaN, not finite wrong
+// Before Fix 3 (eval_integral_grid IOV guard), analytical IOV subjects without
+// resets or TV-covariates fell through to `analytical_state_at_times` with
+// BSV-only eta (kappa=0), returning finite but wrong integral values silently.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Regression for Fix 3 (eval_integral_grid IOV guard): analytical IOV model
+/// + `integral(compartments[0])`.
+///
+/// Before the fix, `eval_integral_grid` had no IOV guard. Subjects with
+/// IOV (kappa) parameters and no resets / no TV-covariates fell through to
+/// `analytical_state_at_times` with BSV-only eta (kappa=0), producing finite
+/// but wrong integral values (the per-occasion kappa contribution was silently
+/// zeroed out).
+///
+/// After the fix, `model.n_kappa > 0` returns `vec![]` immediately, so every
+/// grid point evaluates to NaN — consistent with per-obs `compartment_states`
+/// being empty for IOV subjects.
+///
+/// Also verifies that `W_DERIVED_CMT_IOV_UNSUPPORTED` is emitted and that
+/// per-obs `compartment_states` is outer-empty for IOV subjects.
+#[test]
+fn iov_analytical_integral_of_compartment_is_nan() {
+    const MODEL: &str = "
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.01
+  sigma ADD ~ 0.25
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[derived]
+  cmt0     = compartments[0]
+  AUC_cmt0 = integral(compartments[0], from=0, to=24, step=1.0)
+
+[fit_options]
+  method  = foce
+  maxiter = 5
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    assert!(
+        model.n_kappa > 0,
+        "model must have n_kappa > 0 for this IOV regression test to be meaningful"
+    );
+
+    // Two-occasion population: occ 1 at t=[1,4,12], occ 2 at t=[25,28,36].
+    // Two doses: 100 mg at t=0 (occ 1) and 100 mg at t=24 (occ 2).
+    // Observations are rough IV-bolus concentrations (CL=2,V=10,dose=100):
+    //   C(t) = 10*exp(-0.2*t) for each occasion.
+    let obs_times = vec![1.0, 4.0, 12.0, 25.0, 28.0, 36.0];
+    let n = obs_times.len();
+    let pop = Population {
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), // occ 1
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0), // occ 2
+            ],
+            obs_times,
+            obs_raw_times: vec![],
+            observations: vec![7.0, 4.0, 1.5, 7.5, 4.5, 2.0],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: vec![],
+            obs_covariates: vec![],
+            pk_only_times: vec![],
+            pk_only_covariates: vec![],
+            reset_times: vec![],
+            cens: vec![0; n],
+            occasions: vec![1, 1, 1, 2, 2, 2],
+            dose_occasions: vec![1, 2],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }],
+    };
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    // W_DERIVED_CMT_IOV_UNSUPPORTED must be emitted when kappas are present.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_DERIVED_CMT_IOV_UNSUPPORTED")),
+        "expected W_DERIVED_CMT_IOV_UNSUPPORTED warning; got: {:?}",
+        result.warnings
+    );
+
+    for sr in &result.subjects {
+        // IOV subjects: compartment_states must be outer-empty (vec![]).
+        assert!(
+            sr.compartment_states.is_empty(),
+            "subject {}: compartment_states must be outer-empty for IOV subjects, \
+             got {} inner vecs",
+            sr.id,
+            sr.compartment_states.len()
+        );
+
+        macro_rules! col {
+            ($name:expr) => {
+                sr.extra_columns
+                    .iter()
+                    .find(|(n, _)| n == $name)
+                    .unwrap_or_else(|| panic!("{} column must exist", $name))
+                    .1
+                    .as_slice()
+            };
+        }
+
+        // Per-obs cmt0 must be NaN (IOV subjects have no compartment states).
+        for (j, &v) in col!("cmt0").iter().enumerate() {
+            assert!(
+                v.is_nan(),
+                "subject {}: cmt0[{j}] = {v} — expected NaN for IOV subject",
+                sr.id
+            );
+        }
+
+        // integral must also be NaN.
+        // Fix 3 regression: before the eval_integral_grid IOV guard was added,
+        // this returned a finite approximation computed with BSV-only eta
+        // (kappa=0), silently ignoring the per-occasion kappa contribution.
+        for (j, &v) in col!("AUC_cmt0").iter().enumerate() {
+            assert!(
+                v.is_nan(),
+                "subject {}: AUC_cmt0[{j}] = {v} — expected NaN; before Fix 3 this \
+                 returned a finite wrong value (kappa zeroed in analytical_state_at_times)",
+                sr.id
+            );
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bug regression: ODE model with [scaling] + compartments[i] in [derived]
+// Before Fix 1 (apply_scaling in compute_predictions_with_states ODE branch),
+// SubjectResult.ipred was NOT divided by obs_scale when any [derived] expression
+// referenced compartments[i] — because uses_compartments=true caused
+// compute_predictions_with_states to be called instead of
+// compute_predictions_with_tv, and the new function's ODE branch missed the
+// apply_scaling / apply_log_transform insertion point.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Regression for Fix 1 (apply_scaling in compute_predictions_with_states ODE
+/// branch): ODE model with `[scaling] obs_scale = 1000` + `[derived] cmt0 =
+/// compartments[0]`.
+///
+/// `cmt0 = compartments[0]` sets `uses_compartments = true`, which causes
+/// `compute_predictions_with_states` (the new function introduced by PR #207)
+/// to be called for this subject.  Before Fix 1, the ODE branch of that
+/// function returned ipred straight from the ODE readout without calling
+/// `apply_scaling`.  After Fix 1 the same `apply_scaling` / `apply_log_transform`
+/// insertion point used by `compute_predictions_with_tv_into_with_schedule` is
+/// applied, so `ipred = raw_ode_state / 1000`.
+///
+/// `compartments[0]` intentionally returns the raw unscaled state (documented
+/// design).  After Fix 1: `cmt0[j] == ipred[j] * 1000` exactly (both values
+/// originate from the same ODE solve; the only difference is the division).
+/// Before Fix 1: `cmt0[j] ≈ ipred[j]` (no division applied), so the ratio
+/// would be ~1 instead of ~1000 and this check would fail.
+#[test]
+fn ode_with_scaling_ipred_is_correctly_scaled() {
+    // Amount-based 1-cpt IV ODE.  DV = central_amount / 1000 (trivial scaling
+    // chosen to make the regression numerically obvious).
+    // With CL=2 L/h, V=10 L, dose=100 mg: central(t) = 100*exp(-0.2*t) mg.
+    // ipred(t) = central(t)/1000 ≈ [0.082, 0.045, 0.011, 0.001] at t=[1,4,12,24].
+    const MODEL: &str = "
+[parameters]
+  theta TVCL(2.0, 0.01, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  obs_scale = 1000
+
+[derived]
+  cmt0 = compartments[0]
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method  = focei
+  maxiter = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+
+    // Observations roughly consistent with central_amount/1000.
+    let obs_times = vec![1.0, 4.0, 12.0, 24.0];
+    let n = obs_times.len();
+    let pop = Population {
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times,
+            obs_raw_times: vec![],
+            observations: vec![0.082, 0.045, 0.011, 0.001],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: vec![],
+            obs_covariates: vec![],
+            pk_only_times: vec![],
+            pk_only_covariates: vec![],
+            reset_times: vec![],
+            cens: vec![0; n],
+            occasions: vec![],
+            dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }],
+    };
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    for sr in &result.subjects {
+        let cmt0_col = sr
+            .extra_columns
+            .iter()
+            .find(|(n, _)| n == "cmt0")
+            .expect("cmt0 column must exist")
+            .1
+            .as_slice();
+
+        assert_eq!(
+            cmt0_col.len(),
+            sr.ipred.len(),
+            "cmt0 and ipred must have the same length"
+        );
+
+        for (j, (&raw, &ip)) in cmt0_col.iter().zip(sr.ipred.iter()).enumerate() {
+            assert!(
+                raw.is_finite() && raw > 0.0,
+                "subject {}: cmt0[{j}] = {raw} — raw ODE state must be finite and positive",
+                sr.id
+            );
+            assert!(
+                ip.is_finite() && ip > 0.0,
+                "subject {}: ipred[{j}] = {ip} — scaled ipred must be finite and positive",
+                sr.id
+            );
+            // After Fix 1: ipred = raw_state / 1000, so raw_state = ipred * 1000.
+            // Both originate from the same ODE solve; only a single division
+            // separates them, so relative error must be negligible (< 1e-9).
+            // Before Fix 1: apply_scaling was not called in the ODE branch of
+            // compute_predictions_with_states, so ipred ≈ raw_state and
+            // raw_state / (ipred * 1000) ≈ 0.001 — this assertion would fail.
+            let ratio = raw / (ip * 1000.0);
+            let scaled = ip * 1000.0;
+            assert!(
+                (ratio - 1.0).abs() < 1e-9,
+                "subject {}: obs {j}: cmt0={raw:.6e} should equal ipred*1000={scaled:.6e} \
+                 (ratio={ratio:.6}); before Fix 1 apply_scaling was skipped in the \
+                 ODE branch of compute_predictions_with_states",
+                sr.id
+            );
+        }
+    }
+}

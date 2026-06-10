@@ -2866,6 +2866,16 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "covariance" => opts.run_covariance_step = parse_bool("covariance")?,
+        "fd_hessian_step" => {
+            let v = parse_f64("fd_hessian_step")?;
+            if v <= 0.0 || !v.is_finite() {
+                return Err(format!(
+                    "fd_hessian_step must be a positive finite value, got {}",
+                    v
+                ));
+            }
+            opts.fd_hessian_step = v;
+        }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -10414,6 +10424,36 @@ mod tests {
 
         assert!(apply_fit_option(&mut opts, "inner_maxiter", "oops").is_err());
         assert!(apply_fit_option(&mut opts, "inner_tol", "not_a_num").is_err());
+    }
+
+    #[test]
+    fn test_apply_fit_option_fd_hessian_step_valid() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(&mut opts, "fd_hessian_step", "0.05"),
+            Ok(true)
+        );
+        assert!((opts.fd_hessian_step - 0.05).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_apply_fit_option_fd_hessian_step_zero_rejected() {
+        let mut opts = FitOptions::default();
+        let err = apply_fit_option(&mut opts, "fd_hessian_step", "0").unwrap_err();
+        assert!(
+            err.contains("positive"),
+            "error must mention 'positive': {err}"
+        );
+    }
+
+    #[test]
+    fn test_apply_fit_option_fd_hessian_step_negative_rejected() {
+        let mut opts = FitOptions::default();
+        let err = apply_fit_option(&mut opts, "fd_hessian_step", "-0.01").unwrap_err();
+        assert!(
+            err.contains("positive"),
+            "error must mention 'positive': {err}"
+        );
     }
 
     // ── IOV: kappa keyword and iov_column ──────────────────────────────────

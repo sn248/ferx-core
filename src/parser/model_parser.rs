@@ -1777,6 +1777,16 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
 // ── [derived] and [output] block parsers ────────────────────────────────────
 
+/// Maximum `compartments[N]` index accepted at parse time.
+///
+/// `build_derived_vars` pre-seeds sentinel NaN entries for `__cmt_0` through
+/// `__cmt_{MAX_CMT_INDEX}` (i.e. `MAX_CMT_INDEX + 1` entries total).  Any
+/// index > MAX_CMT_INDEX is rejected at parse time so `eval_expression`'s
+/// `.unwrap_or(0.0)` fallback can never silently return 0.0 for an
+/// out-of-range access.  Both constants are derived from this single value so
+/// they cannot drift apart.
+pub(crate) const MAX_CMT_INDEX: usize = 255;
+
 /// Built-in sdtab column names that [derived] names must not clash with.
 const DERIVED_BUILTIN_NAMES: &[&str] = &[
     "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD",
@@ -1925,19 +1935,20 @@ fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
     let mut vars: HashMap<String, f64> = HashMap::new();
 
     // Index-based compartment keys.
-    // Pre-seed indices 0..MAX_CMT_SENTINEL with NaN so that:
+    // Pre-seed indices 0..=MAX_CMT_INDEX with NaN so that:
     //   a) valid indices with empty compartment_states (IOV, analytical TV-covariate,
     //      analytical reset subjects) evaluate to NaN rather than 0.0, and
     //   b) out-of-range accesses (e.g. compartments[5] on a 1-cpt model) also
     //      produce NaN — 0.0 would silently look like an empty compartment.
     // Actual values then overwrite the NaN sentinels for valid indices.
-    // MAX_CMT_SENTINEL is chosen to cover all practical PK/PBPK models
+    // MAX_CMT_INDEX is chosen to cover all practical PK/PBPK models
     // (largest published PBPK has ~30 compartments; 256 leaves generous headroom).
-    // Any access compartments[i] for i ≥ actual n_states but i < MAX_CMT_SENTINEL
-    // returns NaN; without this sentinel the HashMap miss returns 0.0, which
-    // silently looks like an empty compartment.
-    const MAX_CMT_SENTINEL: usize = 256;
-    for i in 0..MAX_CMT_SENTINEL {
+    // Any access compartments[i] for i > MAX_CMT_INDEX is rejected at parse time;
+    // indices 0..=MAX_CMT_INDEX that are beyond the model's actual n_states return
+    // NaN via this sentinel. Without the sentinel the HashMap miss returns 0.0,
+    // which silently looks like an empty compartment.
+    // MAX_CMT_INDEX is defined at module scope; the sentinel covers 0..=MAX_CMT_INDEX.
+    for i in 0..=MAX_CMT_INDEX {
         vars.insert(format!("__cmt_{i}"), f64::NAN);
     }
     for (i, &v) in ctx.compartments.iter().enumerate() {
@@ -8035,16 +8046,15 @@ fn parse_atom(
                         )
                     }
                 };
-                // MAX_CMT_SENTINEL in build_derived_vars pre-seeds keys __cmt_0
-                // through __cmt_255.  Any index ≥ 256 is not in the map and
-                // eval_expression's .unwrap_or(0.0) would silently return 0.0
-                // (a plausible drug concentration).  Reject at parse time instead.
-                const MAX_CMT_IDX: usize = 255;
-                if n > MAX_CMT_IDX {
+                // MAX_CMT_INDEX is defined at module scope (same value that
+                // build_derived_vars uses to bound its sentinel loop).  Any index
+                // beyond it is not in the sentinel map and would silently return 0.0
+                // via eval_expression's .unwrap_or(0.0).  Reject at parse time.
+                if n > MAX_CMT_INDEX {
                     return Err(format!(
                         "[derived] `compartments[{n}]`: index {n} exceeds the maximum \
-                         supported value ({MAX_CMT_IDX}). \
-                         Use compartments[0] through compartments[{MAX_CMT_IDX}]."
+                         supported value ({MAX_CMT_INDEX}). \
+                         Use compartments[0] through compartments[{MAX_CMT_INDEX}]."
                     ));
                 }
                 if tokens.get(pos + 3) != Some(&Token::RBracket) {
@@ -15191,12 +15201,13 @@ CL V KA WT
         );
     }
 
-    /// Regression: `compartments[N]` with N ≥ 256 must fail at parse time
-    /// rather than silently evaluating to 0.0.
+    /// Regression: `compartments[N]` with N > MAX_CMT_INDEX (255) must fail at
+    /// parse time rather than silently evaluating to 0.0.
     ///
-    /// MAX_CMT_SENTINEL = 256 pre-seeds `__cmt_0..=__cmt_255` with NaN.
-    /// Any index ≥ 256 misses the map and `.unwrap_or(0.0)` would return 0.0 —
-    /// a plausible drug concentration that masks the out-of-range access.
+    /// MAX_CMT_INDEX is the module-level constant; `build_derived_vars` seeds
+    /// `__cmt_0..=__cmt_{MAX_CMT_INDEX}` with NaN. Any index beyond that misses
+    /// the map and `.unwrap_or(0.0)` would return 0.0 — a plausible drug
+    /// concentration masking the out-of-range access.
     #[test]
     fn compartments_index_out_of_range_is_parse_error() {
         let src = minimal_model_with_derived("X = compartments[256]");

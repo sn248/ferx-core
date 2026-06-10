@@ -1896,25 +1896,18 @@ fn analytical_tv_covariate_with_compartments_derived_emits_warning() {
         "expected W_DERIVED_CMT_TV_ANALYTICAL warning; got: {:?}",
         result.warnings
     );
-    // Per-observation state rows must exist (n_obs outer entries) but each
-    // inner slice must be empty so that compartments[i] → NaN rather than a
-    // silently-wrong baseline-PK value.
+    // compartment_states must be outer-empty (vec![]) — the same convention as IOV
+    // and reset subjects — so that downstream .get(j).unwrap_or(&[]) gives &[] and
+    // compartments[i] evaluates to NaN rather than a silently-wrong baseline-PK value.
     for sr in &result.subjects {
-        assert_eq!(
-            sr.compartment_states.len(),
-            sr.ipred.len(),
-            "compartment_states must have {} outer entries for TV-covariate subject {}",
-            sr.ipred.len(),
-            sr.id
+        assert!(
+            sr.compartment_states.is_empty(),
+            "TV-covariate analytical subject {} must have outer-empty compartment_states \
+             (len={}), got len={}",
+            sr.id,
+            0,
+            sr.compartment_states.len()
         );
-        for (j, row) in sr.compartment_states.iter().enumerate() {
-            assert!(
-                row.is_empty(),
-                "compartment_states[{j}] must be empty for TV-covariate subject {} \
-                 (non-empty would silently use baseline PK, disagrees with ipred)",
-                sr.id
-            );
-        }
     }
 }
 
@@ -1998,6 +1991,96 @@ fn ode_tv_covariate_with_compartments_derived_emits_warning() {
                     sr.id
                 );
             }
+        }
+    }
+}
+
+/// Regression: integral grid path for analytical TV-covariate subjects must
+/// return NaN (not a silently-wrong finite approximation).
+///
+/// Before the fix, `eval_integral_grid` in `api.rs` had a `has_resets()` guard
+/// but no `has_tv_covariates()` guard. For an analytical TV-covariate subject
+/// with no resets it fell through to `analytical_state_at_times` using baseline
+/// covariates, producing a finite but wrong approximate AUC while the per-obs
+/// `compartments[i]` correctly returned NaN.
+///
+/// After the fix, `integral(compartments[0])` must also be NaN for such subjects,
+/// consistent with the per-observation path and W_DERIVED_CMT_TV_ANALYTICAL.
+#[test]
+fn analytical_tv_covariate_integral_of_compartment_is_nan() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(5.0, 0.01, 50.0)
+  theta V(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = CL * (WT/70)^0.75 * exp(ETA_CL)
+  V  = V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+  cmt0     = compartments[0]
+  AUC_cmt0 = integral(compartments[0], from=0, to=24)
+
+[fit_options]
+  method   = foce
+  maxiter  = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    let pop = tv_covariate_iv_population();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_DERIVED_CMT_TV_ANALYTICAL")),
+        "expected W_DERIVED_CMT_TV_ANALYTICAL; got: {:?}",
+        result.warnings
+    );
+
+    for sr in &result.subjects {
+        // Per-observation column: compartments[0] → NaN.
+        let cmt0_col = sr
+            .extra_columns
+            .iter()
+            .find(|(name, _)| name == "cmt0")
+            .map(|(_, vals)| vals.as_slice())
+            .unwrap_or(&[]);
+        for (j, &v) in cmt0_col.iter().enumerate() {
+            assert!(
+                v.is_nan(),
+                "subject {}: cmt0[{j}] = {v} — expected NaN for TV-covariate analytical",
+                sr.id
+            );
+        }
+
+        // Integral column: integral(compartments[0]) must also be NaN — not a
+        // finite approximate value computed with baseline PK params.
+        let auc_col = sr
+            .extra_columns
+            .iter()
+            .find(|(name, _)| name == "AUC_cmt0")
+            .map(|(_, vals)| vals.as_slice())
+            .unwrap_or(&[]);
+        for (j, &v) in auc_col.iter().enumerate() {
+            assert!(
+                v.is_nan(),
+                "subject {}: AUC_cmt0[{j}] = {v} — integral(compartments[0]) must be \
+                 NaN for TV-covariate analytical subject (was a finite wrong approximation \
+                 before the has_tv_covariates() guard was added to eval_integral_grid)",
+                sr.id
+            );
         }
     }
 }

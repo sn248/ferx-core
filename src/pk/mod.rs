@@ -487,7 +487,15 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
                     one_cpt_iv_bolus_ss(dose, tau, cl, v)
                 };
             }
-            PkModel::OneCptOral => return one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio()),
+            PkModel::OneCptOral => {
+                // Infusions bypass the depot — use the IV infusion SS formula,
+                // matching single_dose_states and the TwoCptOral/ThreeCptOral fix.
+                return if infusion {
+                    one_cpt_infusion_ss(dose, tau, cl, v)
+                } else {
+                    one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio())
+                };
+            }
             PkModel::TwoCptIv => {
                 return if infusion {
                     two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2())
@@ -541,7 +549,14 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
                 one_cpt_iv_bolus(dose, tau, cl, v)
             }
         }
-        PkModel::OneCptOral => one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio()),
+        PkModel::OneCptOral => {
+            // Infusions bypass the depot — use the IV infusion formula.
+            if infusion {
+                one_cpt_infusion(dose, tau, cl, v)
+            } else {
+                one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio())
+            }
+        }
         PkModel::TwoCptIv => {
             if infusion {
                 two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
@@ -623,6 +638,12 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                 return vec![c];
             }
             PkModel::OneCptOral => {
+                // Infusions bypass the depot — treat as 1-cpt IV SS infusion,
+                // consistent with single_dose_concentration and TwoCptOral/ThreeCptOral.
+                if infusion {
+                    let c = one_cpt_infusion_ss(dose, tau, cl, v);
+                    return vec![0.0, c];
+                }
                 // one_cpt_oral_depot handles SS internally.
                 let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
                 let central = one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio());
@@ -716,9 +737,15 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
             vec![c]
         }
         PkModel::OneCptOral => {
-            let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
-            let central = one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio());
-            vec![depot, central]
+            // Infusions bypass the depot — treat as 1-cpt IV, matching single_dose_concentration.
+            if infusion {
+                let c = one_cpt_infusion(dose, tau, cl, v);
+                vec![0.0, c]
+            } else {
+                let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
+                let central = one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio());
+                vec![depot, central]
+            }
         }
         PkModel::TwoCptIv => {
             let central = if infusion {
@@ -920,14 +947,15 @@ pub fn compute_predictions_with_states(
         // for the no-reset, no-TV case).
         let ipred = compute_predictions_with_tv(model, subject, theta, eta);
         let states = if subject.has_resets() {
-            // Superposition is invalid across resets; return empty so compartments[i]
-            // → NaN. W_DERIVED_CMT_RESET_ANALYTICAL in fit() explains why.
-            vec![vec![]; subject.obs_times.len()]
+            // Superposition is invalid across resets; return outer-empty vec so
+            // compartments[i] → NaN via the .unwrap_or(&[]) fallback. Consistent
+            // with the IOV convention. W_DERIVED_CMT_RESET_ANALYTICAL explains why.
+            vec![]
         } else if subject.has_tv_covariates() {
             // Superposition would use baseline pk_params while ipred honours per-event
-            // TV parameters — mismatched states would be silently wrong.
-            // W_DERIVED_CMT_TV_ANALYTICAL in fit() explains why.
-            vec![vec![]; subject.obs_times.len()]
+            // TV parameters — silently wrong states. Outer-empty → NaN, consistent
+            // with IOV and reset. W_DERIVED_CMT_TV_ANALYTICAL explains why.
+            vec![]
         } else {
             let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
             predict_all_states(model.pk_model, subject, &pk)
@@ -2149,6 +2177,71 @@ mod tests {
             states_ss[1],
             states_sd[1]
         );
+    }
+
+    /// Regression: `single_dose_concentration` and `single_dose_states[central]` must
+    /// agree for OneCptOral infusion doses.  Before the fix both functions used the
+    /// oral Bateman formula for infusions (which bypass the depot), so both returned
+    /// a consistent but wrong value.  After the fix both route to the IV infusion
+    /// formula, keeping ipred == compartment_states[central] and matching NONMEM.
+    #[test]
+    fn single_dose_concentration_matches_states_for_one_cpt_oral_infusion() {
+        fn infusion(amt: f64, rate: f64) -> DoseEvent {
+            DoseEvent::new(0.0, amt, 1, rate, false, 0.0)
+        }
+        fn infusion_ss(amt: f64, rate: f64, ii: f64) -> DoseEvent {
+            DoseEvent::new(0.0, amt, 1, rate, true, ii)
+        }
+
+        let cl = 3.0_f64;
+        let v = 50.0_f64;
+        let ka = 1.2_f64; // ka present but must NOT affect infusion formula
+        let f_bio = 0.9_f64;
+        let ii = 12.0_f64;
+        let amt = 100.0_f64;
+        let rate = 50.0_f64; // 2 h infusion
+        let tau = 5.0_f64;
+
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = cl;
+        p.values[crate::types::PK_IDX_V] = v;
+        p.values[crate::types::PK_IDX_KA] = ka;
+        p.values[crate::types::PK_IDX_F] = f_bio;
+
+        // Non-SS infusion: central (index 1) must equal single_dose_concentration
+        let d = infusion(amt, rate);
+        let conc = single_dose_concentration(PkModel::OneCptOral, &d, tau, &p);
+        let states = single_dose_states(PkModel::OneCptOral, &d, tau, &p);
+        assert!(
+            approx::relative_eq!(conc, states[1], max_relative = 1e-9),
+            "OneCptOral non-SS infusion: concentration={conc} ≠ central state={} \
+             (depot is index 0, central is index 1)",
+            states[1]
+        );
+        // Depot must be zero for an infusion (bypasses depot)
+        assert_eq!(states[0], 0.0, "OneCptOral infusion: depot must be 0.0");
+
+        // SS infusion
+        let d = infusion_ss(amt, rate, ii);
+        let conc = single_dose_concentration(PkModel::OneCptOral, &d, tau, &p);
+        let states = single_dose_states(PkModel::OneCptOral, &d, tau, &p);
+        assert!(
+            approx::relative_eq!(conc, states[1], max_relative = 1e-9),
+            "OneCptOral SS infusion: concentration={conc} ≠ central state={}",
+            states[1]
+        );
+        assert_eq!(states[0], 0.0, "OneCptOral SS infusion: depot must be 0.0");
+
+        // Bolus must be unchanged (oral formula correct for bolus)
+        let d_bolus = DoseEvent::new(0.0, amt, 1, 0.0, false, 0.0);
+        let conc = single_dose_concentration(PkModel::OneCptOral, &d_bolus, tau, &p);
+        let states = single_dose_states(PkModel::OneCptOral, &d_bolus, tau, &p);
+        assert!(
+            approx::relative_eq!(conc, states[1], max_relative = 1e-9),
+            "OneCptOral bolus: concentration={conc} ≠ central state={}",
+            states[1]
+        );
+        assert!(states[0] > 0.0, "OneCptOral bolus: depot must be > 0");
     }
 
     /// Regression test: `single_dose_concentration` and `single_dose_states[central]`

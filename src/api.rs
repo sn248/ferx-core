@@ -1795,6 +1795,15 @@ pub(crate) fn compute_extra_output_columns(
                                 // being empty for such subjects. W_DERIVED_CMT_RESET_ANALYTICAL
                                 // in fit_inner tells the user why.
                                 vec![]
+                            } else if subject.has_tv_covariates() {
+                                // Analytical model + TV covariates: superposition would use
+                                // a single fixed PK snapshot (grid_cov) while ipred honours
+                                // per-observation TV parameters — the states would be
+                                // silently wrong and finite rather than NaN.  Return empty
+                                // (same as the per-obs path in compute_predictions_with_states)
+                                // so every grid point evaluates to NaN, consistent with
+                                // W_DERIVED_CMT_TV_ANALYTICAL warning.
+                                vec![]
                             } else {
                                 let pk_j = (model.pk_param_fn)(theta, eta_hat, grid_cov);
                                 crate::pk::analytical_state_at_times(

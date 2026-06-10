@@ -1586,6 +1586,37 @@ impl CompiledModel {
     pub fn residual_variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
         self.error_spec.variance_at(cmt, f_pred, sigma)
     }
+
+    /// Canonical compartment names for analytical models, used in `[derived]` expressions.
+    /// For ODE models use `ode_spec.state_names` instead.
+    /// Returns a `'static` slice so it can be used in `DerivedContext` without lifetime issues.
+    pub fn analytical_compartment_names(&self) -> &'static [String] {
+        debug_assert!(
+            self.ode_spec.is_none(),
+            "analytical_compartment_names called on an ODE model — use ode_spec.state_names instead"
+        );
+        use std::sync::OnceLock;
+        macro_rules! names {
+            ($lock:ident, $($name:expr),+) => {{
+                static $lock: OnceLock<Vec<String>> = OnceLock::new();
+                $lock.get_or_init(|| vec![$($name.to_string()),+]).as_slice()
+            }};
+        }
+        match self.pk_model {
+            PkModel::OneCptIv => names!(ONE_CMT_IV, "central"),
+            PkModel::OneCptOral => names!(ONE_CMT_ORAL, "depot", "central"),
+            PkModel::TwoCptIv => names!(TWO_CMT_IV, "central", "peripheral"),
+            PkModel::TwoCptOral => names!(TWO_CMT_ORAL, "depot", "central", "peripheral"),
+            PkModel::ThreeCptIv => names!(THREE_CMT_IV, "central", "peripheral1", "peripheral2"),
+            PkModel::ThreeCptOral => names!(
+                THREE_CMT_ORAL,
+                "depot",
+                "central",
+                "peripheral1",
+                "peripheral2"
+            ),
+        }
+    }
 }
 
 impl std::fmt::Debug for CompiledModel {
@@ -1624,6 +1655,16 @@ pub struct SubjectResult {
     /// blocks exist. Empty if those conditions are not met; output.rs falls back to
     /// a lagtime=0 approximation in that case (correct for the common case).
     pub per_obs_tad: Vec<f64>,
+    /// Full compartment state vector at each observation time. For ODE models this
+    /// is the raw solver state `u[i]` in whatever units the ODE defines (typically
+    /// amounts for standard PK ODEs). For SDE models (`[diffusion]` block), these are
+    /// the deterministic ODE states, not EKF-filtered states. For analytical models
+    /// this is the natural per-compartment value (amounts for depot, concentrations for
+    /// central/peripheral). Indexed `[obs_j][cmt_i]`.
+    /// Empty for IOV subjects and analytical TV-covariate subjects (those cases yield
+    /// NaN in `[derived]`; see W_DERIVED_CMT_IOV_UNSUPPORTED / W_DERIVED_CMT_TV_ANALYTICAL).
+    /// Scaling (`apply_scaling`, Form A/C) is never applied here — only `ipred` is scaled.
+    pub compartment_states: Vec<Vec<f64>>,
 }
 
 // ── Derived expression types ──────────────────────────────────────────────────
@@ -1641,6 +1682,15 @@ pub struct DerivedContext<'a> {
     pub tafd: f64,
     pub tad: f64,
     pub prev_derived: &'a HashMap<String, f64>,
+    /// Raw compartment state at this observation time. For ODE models this is
+    /// the solver state `u[i]`; for SDE models these are deterministic ODE states
+    /// (not EKF-filtered). For analytical models it follows the convention in
+    /// the `compartment_states` docs on `SubjectResult`. Empty slice for IOV subjects,
+    /// analytical TV-covariate subjects, and grid-integral points when
+    /// `uses_compartments` is false.
+    pub compartments: &'a [f64],
+    /// Names parallel to `compartments` — ODE state names or analytical names.
+    pub compartment_names: &'a [String],
 }
 
 pub type DerivedEvalFn = Box<dyn Fn(&DerivedContext<'_>) -> f64 + Send + Sync>;
@@ -1649,6 +1699,10 @@ pub type DerivedFilterFn = Box<dyn Fn(&DerivedContext<'_>) -> bool + Send + Sync
 pub struct DerivedExprSpec {
     pub name: String,
     pub kind: DerivedKind,
+    /// True if any sub-expression in `kind` references `compartments[i]` or a
+    /// named ODE state variable.  Used to gate `W_DERIVED_CMT_*` warnings so
+    /// they fire only when compartment states are actually requested.
+    pub uses_compartments: bool,
 }
 
 pub enum DerivedKind {
@@ -1668,6 +1722,10 @@ pub enum DerivedKind {
         condition: Option<DerivedFilterFn>,
         /// True when integrand references DV → use observation times only.
         data_based: bool,
+        /// True when the integrand references `compartments[i]` or a named ODE
+        /// state variable. When true and the integral uses a fine grid, the ODE
+        /// solver (or analytical formula) is re-run at grid points for accuracy.
+        uses_compartments: bool,
         window: IntegralWindow,
         step: IntegralStep,
     },

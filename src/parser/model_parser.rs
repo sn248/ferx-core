@@ -1694,12 +1694,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     if let Some(derived_lines) = blocks.get("derived") {
         let cov_names = model.referenced_covariates.clone();
         let mut derived_warnings = Vec::new();
+        // For ODE models, ode_state_names drives uses_compartments detection.
+        // For analytical models, use analytical_compartment_names() so that
+        // named references like `central`, `depot`, `peripheral` in [derived]
+        // also set uses_compartments=true and trigger W_DERIVED_CMT_* warnings.
+        let ode_state_names: Vec<String> = model
+            .ode_spec
+            .as_ref()
+            .map(|s| s.state_names.clone())
+            .unwrap_or_else(|| model.analytical_compartment_names().to_vec());
         let derived_exprs = parse_derived_block(
             derived_lines,
             &model.theta_names.clone(),
             &model.eta_names.clone(),
             &model.indiv_param_names.clone(),
             &cov_names,
+            &ode_state_names,
             &mut derived_warnings,
         )?;
         model.derived_exprs = derived_exprs;
@@ -1819,6 +1829,16 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 }
 
 // ── [derived] and [output] block parsers ────────────────────────────────────
+
+/// Maximum `compartments[N]` index accepted at parse time.
+///
+/// `build_derived_vars` pre-seeds sentinel NaN entries for `__cmt_0` through
+/// `__cmt_{MAX_CMT_INDEX}` (i.e. `MAX_CMT_INDEX + 1` entries total).  Any
+/// index > MAX_CMT_INDEX is rejected at parse time so `eval_expression`'s
+/// `.unwrap_or(0.0)` fallback can never silently return 0.0 for an
+/// out-of-range access.  Both constants are derived from this single value so
+/// they cannot drift apart.
+pub(crate) const MAX_CMT_INDEX: usize = 255;
 
 /// Built-in sdtab column names that [derived] names must not clash with.
 const DERIVED_BUILTIN_NAMES: &[&str] = &[
@@ -1966,6 +1986,28 @@ fn build_derived_filter_fn(cond: Condition) -> DerivedFilterFn {
 /// both uppercase and lowercase for the same reason.
 fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
     let mut vars: HashMap<String, f64> = HashMap::new();
+
+    // Index-based compartment keys.
+    // Pre-seed indices 0..=MAX_CMT_INDEX with NaN so that:
+    //   a) valid indices with empty compartment_states (IOV, analytical TV-covariate,
+    //      analytical reset subjects) evaluate to NaN rather than 0.0, and
+    //   b) out-of-range accesses (e.g. compartments[5] on a 1-cpt model) also
+    //      produce NaN — 0.0 would silently look like an empty compartment.
+    // Actual values then overwrite the NaN sentinels for valid indices.
+    // MAX_CMT_INDEX is chosen to cover all practical PK/PBPK models
+    // (largest published PBPK has ~30 compartments; 256 leaves generous headroom).
+    // Any access compartments[i] for i > MAX_CMT_INDEX is rejected at parse time;
+    // indices 0..=MAX_CMT_INDEX that are beyond the model's actual n_states return
+    // NaN via this sentinel. Without the sentinel the HashMap miss returns 0.0,
+    // which silently looks like an empty compartment.
+    // MAX_CMT_INDEX is defined at module scope; the sentinel covers 0..=MAX_CMT_INDEX.
+    for i in 0..=MAX_CMT_INDEX {
+        vars.insert(format!("__cmt_{i}"), f64::NAN);
+    }
+    for (i, &v) in ctx.compartments.iter().enumerate() {
+        vars.insert(format!("__cmt_{i}"), v); // overwrite sentinel with actual
+    }
+
     // Insert each name with original case AND uppercase + lowercase aliases so
     // that case mismatches (e.g. `wt` vs. header `WT`, or `WT` vs. header `wt`)
     // resolve correctly. `eval_expression` looks names up verbatim, so every
@@ -1981,6 +2023,17 @@ fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
             vars.insert(lo, v);
         }
     };
+
+    // Named compartment access — lowest priority among `insert_ci` inserts.
+    // Pre-insert NaN so unavailable states surface as NaN in [derived];
+    // individual params, covariates, and built-ins below overwrite any clash.
+    for name in ctx.compartment_names.iter() {
+        insert_ci(name, f64::NAN);
+    }
+    for (name, &v) in ctx.compartment_names.iter().zip(ctx.compartments.iter()) {
+        insert_ci(name, v); // overwrite sentinel with actual value
+    }
+
     for (k, &v) in ctx.indiv_params.iter() {
         insert_ci(k, v);
     }
@@ -2026,6 +2079,43 @@ fn cond_refs_dv(cond: &Condition) -> bool {
     }
 }
 
+/// Returns true if the expression subtree references a compartment state.
+/// Matches both `__cmt_N` (from `compartments[N]` syntax) and named ODE state
+/// variables (e.g. `Ce`, `depot`). Named references are detected by checking
+/// `ode_state_names`; an empty slice means only subscript-style access matches.
+fn expr_refs_compartments(expr: &Expression, ode_state_names: &[String]) -> bool {
+    match expr {
+        Expression::Variable(s) => {
+            s.starts_with("__cmt_") || ode_state_names.iter().any(|n| n.eq_ignore_ascii_case(s))
+        }
+        Expression::BinOp(l, _, r) => {
+            expr_refs_compartments(l, ode_state_names) || expr_refs_compartments(r, ode_state_names)
+        }
+        Expression::UnaryFn(_, arg) => expr_refs_compartments(arg, ode_state_names),
+        Expression::Power(b, e) => {
+            expr_refs_compartments(b, ode_state_names) || expr_refs_compartments(e, ode_state_names)
+        }
+        Expression::Conditional(c, t, e) => {
+            cond_refs_compartments(c, ode_state_names)
+                || expr_refs_compartments(t, ode_state_names)
+                || expr_refs_compartments(e, ode_state_names)
+        }
+        _ => false,
+    }
+}
+
+fn cond_refs_compartments(cond: &Condition, ode_state_names: &[String]) -> bool {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            expr_refs_compartments(l, ode_state_names) || expr_refs_compartments(r, ode_state_names)
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            cond_refs_compartments(l, ode_state_names) || cond_refs_compartments(r, ode_state_names)
+        }
+        Condition::Not(c) => cond_refs_compartments(c, ode_state_names),
+    }
+}
+
 /// Parse the interior args of `integral(...)` into a `DerivedKind::Integral`.
 fn parse_integral_kind(
     args: &[&[Token]],
@@ -2040,6 +2130,9 @@ fn parse_integral_kind(
 
     let integrand_expr = parse_derived_expr(args[0], ctx)?;
     let data_based = expr_refs_dv(&integrand_expr);
+    // Also checked against condition below — must be `mut` so we can OR in
+    // the condition's compartment references before the struct is built.
+    let mut uses_compartments = expr_refs_compartments(&integrand_expr, ctx.ode_state_names);
 
     let mut condition: Option<DerivedFilterFn> = None;
     let mut from_val: Option<f64> = None;
@@ -2052,6 +2145,15 @@ fn parse_integral_kind(
     // Second positional arg is a condition if it contains comparison operators.
     if i < args.len() && !is_keyword_arg_tokens(args[i]) && tokens_contain_comparison(args[i]) {
         let cond = parse_derived_cond(args[i], ctx)?;
+        // If the filter condition references a compartment (e.g.
+        // `integral(IPRED, compartments[0] > threshold, from=0, to=24)`),
+        // we must set uses_compartments so the grid path populates the state
+        // vectors before the condition closure is evaluated — otherwise the
+        // filter sees NaN for all __cmt_N keys. Matches max/min/tmax handling
+        // at lines 2332–2335.
+        if cond_refs_compartments(&cond, ctx.ode_state_names) {
+            uses_compartments = true;
+        }
         condition = Some(build_derived_filter_fn(cond));
         i += 1;
     }
@@ -2124,6 +2226,7 @@ fn parse_integral_kind(
         integrand: build_derived_eval_fn(integrand_expr),
         condition,
         data_based,
+        uses_compartments,
         window: int_window,
         step: int_step,
     })
@@ -2143,6 +2246,7 @@ fn parse_derived_block(
     eta_names: &[String],
     indiv_param_names: &[String],
     covariate_names: &[String],
+    ode_state_names: &[String],
     parse_warnings: &mut Vec<String>,
 ) -> Result<Vec<DerivedExprSpec>, String> {
     let mut specs: Vec<DerivedExprSpec> = Vec::new();
@@ -2222,6 +2326,7 @@ fn parse_derived_block(
             defined_vars: &defined_vars,
             fallback_covariate: false,
             nn_specs: &[],
+            ode_state_names,
         };
 
         // ── Tokenize ──────────────────────────────────────────────────────────
@@ -2233,7 +2338,12 @@ fn parse_derived_block(
         }
 
         // ── Detect form ───────────────────────────────────────────────────────
-        let kind = if let Token::Ident(func_name) = &tokens[0] {
+        // `spec_uses_compartments` tracks whether this derived expression
+        // references compartments[i] or named ODE state variables anywhere.
+        // Propagated into `DerivedExprSpec::uses_compartments` so that the
+        // post-fit warning logic can gate on "compartments actually requested"
+        // rather than "any [derived] block exists".
+        let (kind, spec_uses_compartments) = if let Token::Ident(func_name) = &tokens[0] {
             let fname_lc = func_name.to_lowercase();
             if matches!(fname_lc.as_str(), "max" | "min" | "tmax" | "integral")
                 && tokens.get(1) == Some(&Token::LParen)
@@ -2263,7 +2373,15 @@ fn parse_derived_block(
                 let args = split_top_level_commas(interior);
 
                 if fname_lc == "integral" {
-                    parse_integral_kind(&args, ctx, parse_warnings)?
+                    let kind = parse_integral_kind(&args, ctx, parse_warnings)?;
+                    let uses = matches!(
+                        kind,
+                        DerivedKind::Integral {
+                            uses_compartments: true,
+                            ..
+                        }
+                    );
+                    (kind, uses)
                 } else {
                     // max / min / tmax
                     let agg_fn = match fname_lc.as_str() {
@@ -2275,35 +2393,50 @@ fn parse_derived_block(
                     let value_tokens = args.first().copied().unwrap_or(&[]);
                     let filter_tokens = if args.len() >= 2 { Some(args[1]) } else { None };
                     let value_expr = parse_derived_expr(value_tokens, ctx)?;
-                    let filter = if let Some(ft) = filter_tokens {
+                    let value_uses = expr_refs_compartments(&value_expr, ctx.ode_state_names);
+                    let (filter, filter_uses) = if let Some(ft) = filter_tokens {
                         let cond = parse_derived_cond(ft, ctx)?;
-                        Some(build_derived_filter_fn(cond))
+                        let uses = cond_refs_compartments(&cond, ctx.ode_state_names);
+                        (Some(build_derived_filter_fn(cond)), uses)
                     } else {
-                        None
+                        (None, false)
                     };
-                    DerivedKind::Aggregate {
+                    let kind = DerivedKind::Aggregate {
                         func: agg_fn,
                         value: build_derived_eval_fn(value_expr),
                         filter,
-                    }
+                    };
+                    (kind, value_uses || filter_uses)
                 }
             } else {
                 // Plain expression → PerRow
                 let expr = parse_derived_expr(&tokens, ctx)?;
-                DerivedKind::PerRow {
-                    eval: build_derived_eval_fn(expr),
-                }
+                let uses = expr_refs_compartments(&expr, ctx.ode_state_names);
+                (
+                    DerivedKind::PerRow {
+                        eval: build_derived_eval_fn(expr),
+                    },
+                    uses,
+                )
             }
         } else {
             // Starts with a literal or unary minus
             let expr = parse_derived_expr(&tokens, ctx)?;
-            DerivedKind::PerRow {
-                eval: build_derived_eval_fn(expr),
-            }
+            let uses = expr_refs_compartments(&expr, ctx.ode_state_names);
+            (
+                DerivedKind::PerRow {
+                    eval: build_derived_eval_fn(expr),
+                },
+                uses,
+            )
         };
 
         defined_derived.push(name.clone());
-        specs.push(DerivedExprSpec { name, kind });
+        specs.push(DerivedExprSpec {
+            name,
+            kind,
+            uses_compartments: spec_uses_compartments,
+        });
     }
 
     Ok(specs)
@@ -5651,17 +5784,22 @@ struct ParseCtx<'a> {
     /// when no `[covariate_nn]` block is present in the model (the
     /// dot-access parser then errors on `FOO.BAR`).
     nn_specs: &'a [(String, Vec<String>)],
+    /// ODE state variable names for detecting compartment references in
+    /// integral integrands (`uses_compartments` flag). Empty for analytical models.
+    ode_state_names: &'a [String],
 }
 
 impl<'a> ParseCtx<'a> {
     fn new(theta_names: &'a [String], eta_names: &'a [String], defined_vars: &'a [String]) -> Self {
         const EMPTY_NN: &[(String, Vec<String>)] = &[];
+        const EMPTY: &[String] = &[];
         Self {
             theta_names,
             eta_names,
             defined_vars,
             fallback_covariate: true,
             nn_specs: EMPTY_NN,
+            ode_state_names: EMPTY,
         }
     }
 
@@ -5674,6 +5812,7 @@ impl<'a> ParseCtx<'a> {
             defined_vars,
             fallback_covariate: false,
             nn_specs: EMPTY_NN,
+            ode_state_names: EMPTY,
         }
     }
 
@@ -7601,6 +7740,8 @@ enum Token {
     Ident(String),
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     LBrace,
     RBrace,
     Plus,
@@ -7731,6 +7872,14 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::RParen);
                 i += 1;
             }
+            '[' => {
+                tokens.push(Token::LBracket);
+                i += 1;
+            }
+            ']' => {
+                tokens.push(Token::RBracket);
+                i += 1;
+            }
             '+' => {
                 tokens.push(Token::Plus);
                 i += 1;
@@ -7742,6 +7891,7 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                         tokens.last(),
                         Some(
                             Token::LParen
+                                | Token::LBracket
                                 | Token::LBrace
                                 | Token::Plus
                                 | Token::Minus
@@ -7991,6 +8141,50 @@ fn parse_atom(
             Ok((expr, p + 1))
         }
         Token::Ident(name) => {
+            // compartments[N] — subscript access into DerivedContext::compartments.
+            // Emits Variable("__cmt_N") which build_derived_vars populates at eval time.
+            // Only literal non-negative integer indices are supported.
+            if name.eq_ignore_ascii_case("compartments")
+                && pos + 1 < tokens.len()
+                && tokens[pos + 1] == Token::LBracket
+            {
+                let n_tok = tokens
+                    .get(pos + 2)
+                    .ok_or_else(|| "[derived] `compartments[`: missing index".to_string())?;
+                let n = match n_tok {
+                    Token::Number(v) => {
+                        if v.fract() != 0.0 || *v < 0.0 {
+                            return Err(format!(
+                                "[derived] `compartments[{v}]`: index must be a non-negative integer"
+                            ));
+                        }
+                        *v as usize
+                    }
+                    _ => {
+                        return Err(
+                            "[derived] `compartments[...]`: only literal integer indices are \
+                             supported in Phase 1 — use `compartments[0]`, `compartments[1]`, etc."
+                                .to_string(),
+                        )
+                    }
+                };
+                // MAX_CMT_INDEX is defined at module scope (same value that
+                // build_derived_vars uses to bound its sentinel loop).  Any index
+                // beyond it is not in the sentinel map and would silently return 0.0
+                // via eval_expression's .unwrap_or(0.0).  Reject at parse time.
+                if n > MAX_CMT_INDEX {
+                    return Err(format!(
+                        "[derived] `compartments[{n}]`: index {n} exceeds the maximum \
+                         supported value ({MAX_CMT_INDEX}). \
+                         Use compartments[0] through compartments[{MAX_CMT_INDEX}]."
+                    ));
+                }
+                if tokens.get(pos + 3) != Some(&Token::RBracket) {
+                    return Err("[derived] `compartments[N`: missing closing `]`".to_string());
+                }
+                return Ok((Expression::Variable(format!("__cmt_{n}")), pos + 4));
+            }
+
             // Inline conditional expression: `if (cond) then_expr else else_expr`
             // Used as a value (e.g. `CL = if (SEX == 1) TVCL * 1.2 else TVCL`).
             if name.eq_ignore_ascii_case("if") {
@@ -8222,18 +8416,18 @@ enum StatementMode {
 /// because they separate statements within a block body.
 fn strip_newlines_in_groups(tokens: Vec<Token>) -> Vec<Token> {
     let mut out = Vec::with_capacity(tokens.len());
-    let mut paren_depth = 0i32;
+    let mut depth = 0i32;
     for t in tokens {
         match t {
-            Token::LParen => {
-                paren_depth += 1;
-                out.push(Token::LParen);
+            Token::LParen | Token::LBracket => {
+                depth += 1;
+                out.push(t);
             }
-            Token::RParen => {
-                paren_depth -= 1;
-                out.push(Token::RParen);
+            Token::RParen | Token::RBracket => {
+                depth -= 1;
+                out.push(t);
             }
-            Token::Newline if paren_depth > 0 => {
+            Token::Newline if depth > 0 => {
                 // drop
             }
             other => out.push(other),
@@ -14753,6 +14947,8 @@ method = foce
                 tafd: 1.0,
                 tad: 1.0,
                 prev_derived: &prev_derived,
+                compartments: &[],
+                compartment_names: &[],
             };
             let ke = eval(&ctx);
             assert!((ke - 0.1).abs() < 1e-10, "KE = CL/V = 1/10 = 0.1, got {ke}");
@@ -14784,6 +14980,8 @@ method = foce
                 tafd: 1.0,
                 tad: 1.0,
                 prev_derived: &prev_derived,
+                compartments: &[],
+                compartment_names: &[],
             };
             let ke = eval(&ctx);
             prev_derived.insert("KE".to_string(), ke);
@@ -14803,6 +15001,8 @@ method = foce
                 tafd: 1.0,
                 tad: 1.0,
                 prev_derived: &prev_derived,
+                compartments: &[],
+                compartment_names: &[],
             };
             let t_half = eval(&ctx);
             let expected = 0.693 / 0.1;
@@ -14998,6 +15198,8 @@ CL V KA WT
                     tafd: 0.0,
                     tad: 0.0,
                     prev_derived: &prev,
+                    compartments: &[],
+                    compartment_names: &[],
                 };
                 let result = eval(&ctx);
                 assert!(
@@ -15032,6 +15234,8 @@ CL V KA WT
                     tafd: 0.0,
                     tad: 0.0,
                     prev_derived: &prev,
+                    compartments: &[],
+                    compartment_names: &[],
                 };
                 let result = eval(&ctx);
                 assert!(
@@ -15062,6 +15266,8 @@ CL V KA WT
                 tafd: 1.0,
                 tad: 0.0, // zero
                 prev_derived: &prev,
+                compartments: &[],
+                compartment_names: &[],
             };
             assert_eq!(eval(&ctx), 1.0, "TAD=0 should be < MACHEPS");
             // TAD = 1.0 >> MACHEPS → flag = 0
@@ -15096,6 +15302,8 @@ CL V KA WT
                 tafd: 0.0,
                 tad: 0.0,
                 prev_derived: &prev,
+                compartments: &[],
+                compartment_names: &[],
             };
             assert_eq!(
                 eval(&ctx),
@@ -15105,5 +15313,121 @@ CL V KA WT
         } else {
             panic!("expected PerRow derived kind");
         }
+    }
+
+    /// Regression: named analytical compartment references (e.g. `central`,
+    /// `depot`) in a [derived] expression on an analytical model must set
+    /// `uses_compartments = true` so that W_DERIVED_CMT_* warnings fire.
+    ///
+    /// Before the fix, `ode_state_names` was empty for analytical models, so
+    /// `expr_refs_compartments` never detected named access — all four
+    /// W_DERIVED_CMT_* guards were silently suppressed.
+    #[test]
+    fn analytical_model_named_compartment_sets_uses_compartments() {
+        // one_cpt_iv has a single compartment named "central"
+        let src = minimal_model_with_derived("C_CENTRAL = central");
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let expr = &parsed.model.derived_exprs[0];
+        assert_eq!(expr.name, "C_CENTRAL");
+        assert!(
+            expr.uses_compartments,
+            "`central` in [derived] on a one_cpt_iv model must set uses_compartments=true"
+        );
+
+        // two_cpt_oral has depot, central, peripheral
+        let src2 = r#"
+[parameters]
+  theta CL(1.0, 0, 100)
+  theta V1(10.0, 0, 1000)
+  theta Q(0.5, 0, 50)
+  theta V2(5.0, 0, 500)
+  theta KA(1.0, 0, 10)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+[individual_parameters]
+  CL = exp(log(CL) + ETA_CL)
+  V1 = V1
+  Q  = Q
+  V2 = V2
+  KA = KA
+[structural_model]
+  pk two_cpt_oral(cl=CL, v=V1, q=Q, v2=V2, ka=KA)
+[error_model]
+  DV ~ proportional(PROP)
+[derived]
+  C_PERIPH = peripheral
+"#;
+        let parsed2 = parse_full_model(src2).expect("parse ok (two_cpt_oral)");
+        let expr2 = &parsed2.model.derived_exprs[0];
+        assert_eq!(expr2.name, "C_PERIPH");
+        assert!(
+            expr2.uses_compartments,
+            "`peripheral` in [derived] on a two_cpt_oral model must set uses_compartments=true"
+        );
+    }
+
+    /// Regression: `compartments[N]` with N > MAX_CMT_INDEX (255) must fail at
+    /// parse time rather than silently evaluating to 0.0.
+    ///
+    /// MAX_CMT_INDEX is the module-level constant; `build_derived_vars` seeds
+    /// `__cmt_0..=__cmt_{MAX_CMT_INDEX}` with NaN. Any index beyond that misses
+    /// the map and `.unwrap_or(0.0)` would return 0.0 — a plausible drug
+    /// concentration masking the out-of-range access.
+    #[test]
+    fn compartments_index_out_of_range_is_parse_error() {
+        let src = minimal_model_with_derived("X = compartments[256]");
+        match parse_full_model(&src) {
+            Err(err) => assert!(
+                err.contains("256") && err.contains("exceeds"),
+                "error should mention the index and 'exceeds': {err}"
+            ),
+            Ok(_) => panic!("compartments[256] should be a parse error"),
+        }
+
+        // 255 is the last valid index — must succeed
+        let src_ok = minimal_model_with_derived("X = compartments[255]");
+        parse_full_model(&src_ok).expect("compartments[255] should parse ok");
+
+        // 0 must still work
+        let src_zero = minimal_model_with_derived("X = compartments[0]");
+        parse_full_model(&src_zero).expect("compartments[0] should parse ok");
+    }
+
+    /// Regression: `uses_compartments` on `integral()` must also fire when the
+    /// **condition** (filter) clause references a compartment, not just the
+    /// integrand. Before the fix, `integral(IPRED, compartments[0] > 1, from=0,
+    /// to=24)` had `uses_compartments = false` because only the integrand was
+    /// checked — the filter closure silently received NaN for all `__cmt_N` keys,
+    /// and the integral silently integrated over the wrong set of observations.
+    #[test]
+    fn integral_condition_referencing_compartment_sets_uses_compartments() {
+        // Integrand is IPRED (no compartment ref); condition references compartments[0].
+        let src = minimal_model_with_derived(
+            "AUC_FILTERED = integral(IPRED, compartments[0] > 1.0, from=0, to=24)",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let expr = &parsed.model.derived_exprs[0];
+        assert_eq!(expr.name, "AUC_FILTERED");
+        assert!(
+            expr.uses_compartments,
+            "integral() condition referencing compartments[0] must set uses_compartments=true"
+        );
+
+        // Sanity check: integrand-only reference still works
+        let src2 = minimal_model_with_derived("AUC_CMT = integral(compartments[0], from=0, to=24)");
+        let parsed2 = parse_full_model(&src2).expect("parse ok");
+        assert!(
+            parsed2.model.derived_exprs[0].uses_compartments,
+            "integral() integrand referencing compartments[0] must still set uses_compartments"
+        );
+
+        // Sanity check: no compartment reference in either integrand or condition → false
+        let src3 =
+            minimal_model_with_derived("AUC_PLAIN = integral(IPRED, DV > 0.0, from=0, to=24)");
+        let parsed3 = parse_full_model(&src3).expect("parse ok");
+        assert!(
+            !parsed3.model.derived_exprs[0].uses_compartments,
+            "integral() with no compartment reference must leave uses_compartments=false"
+        );
     }
 }

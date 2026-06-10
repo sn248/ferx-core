@@ -766,6 +766,15 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
     let n_remaining = n.saturating_sub(n_theta + n_sigma);
 
     // Try all four diagonal/block combinations; take the first match.
+    //
+    // Known ambiguity: when n_eta == n_kappa > 1 and the two structures differ
+    // (one diagonal, one full-block), both (false, true) and (true, false)
+    // yield the same n_remaining and the code always picks (false, true) —
+    // full-block omega + diagonal kappa.  In that rare case the packed names
+    // will be wrong for the minority of models where kappa is full-block while
+    // omega is diagonal.  A proper fix requires storing `omega_is_block` /
+    // `kappa_is_block` on `FitResult` so the output layer doesn't have to
+    // infer the structure.
     let combos = [
         (true, true, n_omega_diag + n_kappa_diag),
         (false, true, n_omega_full + n_kappa_diag),
@@ -1227,6 +1236,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     // Emitted when the covariance step succeeded or was regularized, giving
     // downstream tools (bootstrap, SIR, uncertainty propagation) the full
     // parameter covariance without re-running the fit.
+    // Values are written in Rust's default scientific notation (`{:.6e}`),
+    // which omits the `+` sign and leading zero in the exponent, e.g.
+    // `1.234567e-4`.  Standard YAML parsers (PyYAML, R yaml, serde_yaml)
+    // all accept this form.
     if let Some(ref cov) = result.covariance_matrix {
         let n = cov.nrows();
         let names = packed_param_names(result, n);

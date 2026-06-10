@@ -362,6 +362,7 @@ pub fn run_foce_gn(
 
     if !do_polish {
         // Pure GN — skip FOCEI polish, go directly to covariance step
+        let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
         let covariance_matrix =
             if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
                 if verbose {
@@ -381,9 +382,16 @@ pub fn run_foce_gn(
                         warnings.extend(out.warnings);
                         Some(out.matrix)
                     }
-                    CovarianceStepResult::Unusable(msg)
-                    | CovarianceStepResult::FailedNonPd { reason: msg, .. } => {
+                    CovarianceStepResult::Unusable(msg) => {
                         warnings.push(msg);
+                        None
+                    }
+                    CovarianceStepResult::FailedNonPd {
+                        reason,
+                        fallback_proposal,
+                    } => {
+                        warnings.push(reason);
+                        sir_fallback_proposal = Some(fallback_proposal);
                         None
                     }
                 }
@@ -411,7 +419,7 @@ pub fn run_foce_gn(
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             final_gradient,
-            sir_fallback_proposal: None,
+            sir_fallback_proposal,
         };
     }
 
@@ -467,6 +475,7 @@ pub fn run_foce_gn(
     }
 
     // ---- Covariance step ----
+    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if verbose {
@@ -487,9 +496,16 @@ pub fn run_foce_gn(
                     warnings.extend(out.warnings);
                     Some(out.matrix)
                 }
-                CovarianceStepResult::Unusable(msg)
-                | CovarianceStepResult::FailedNonPd { reason: msg, .. } => {
+                CovarianceStepResult::Unusable(msg) => {
                     warnings.push(msg);
+                    None
+                }
+                CovarianceStepResult::FailedNonPd {
+                    reason,
+                    fallback_proposal,
+                } => {
+                    warnings.push(reason);
+                    sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
             }
@@ -517,7 +533,7 @@ pub fn run_foce_gn(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient,
-        sir_fallback_proposal: None,
+        sir_fallback_proposal,
     }
 }
 

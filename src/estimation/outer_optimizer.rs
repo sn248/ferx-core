@@ -2053,15 +2053,37 @@ fn format_non_pd_warning(eigvals: &[f64]) -> String {
     )
 }
 
+/// Largest condition number permitted for the non-PD fallback proposal. The
+/// eigenvalue magnitudes are floored at `λ_max_abs / COND` so a near-zero
+/// curvature direction can't blow its proposal variance up without bound (see
+/// [`build_non_pd_fallback_proposal`]).
+const FALLBACK_PROPOSAL_MAX_COND: f64 = 1e8;
+
 /// Build a SIR proposal covariance for the non-PD-Hessian fallback path.
 ///
-/// Takes the symmetrised free-block Hessian (which has at least one non-positive
-/// eigenvalue), replaces each eigenvalue with `inflation / |λ|` (so the proposal
-/// is `inflation`× wider than the inverted absolute Hessian), and embeds the
-/// result into the full packed-parameter covariance (zeros for FIX parameters).
+/// This is the standard eigenvalue-modification heuristic: the symmetrised
+/// free-block Hessian has at least one non-positive eigenvalue, so it cannot be
+/// inverted into a covariance directly. We take each eigenvalue's *magnitude*
+/// `|λ_i|` as the curvature in that direction, and use `inflation / |λ_i|` as the
+/// corresponding proposal variance (`inflation`× wider than the inverted
+/// absolute Hessian).
+///
+/// The magnitudes are floored **relative to the largest** at
+/// `|λ|_max / FALLBACK_PROPOSAL_MAX_COND` rather than at a fixed absolute value.
+/// A fixed floor (e.g. `1e-10`) is not scale-invariant: on a well-scaled Hessian
+/// a near-zero eigenvalue would yield a proposal variance of `inflation / 1e-10`
+/// ≈ 1e10, scattering every SIR draw far outside the parameter bounds so the
+/// fallback degenerates to "all samples had invalid weights". The relative floor
+/// caps the proposal's condition number at `FALLBACK_PROPOSAL_MAX_COND`, keeping
+/// the draws in a usable range while still giving the weakly-identified
+/// directions the widest proposal.
 ///
 /// `inflation = 4.0` is the recommended default: heavier tails account for the
 /// uncertainty introduced by the non-PD correction.
+///
+/// The result is embedded into the full packed-parameter covariance (zeros for
+/// FIX parameters) and explicitly symmetrised, since the eigen-reconstruction
+/// `V·diag·Vᵀ` can leave sub-ULP asymmetry that a downstream Cholesky rejects.
 fn build_non_pd_fallback_proposal(
     hess_free_sym: &DMatrix<f64>,
     free_idx: &[usize],
@@ -2069,11 +2091,21 @@ fn build_non_pd_fallback_proposal(
     inflation: f64,
 ) -> DMatrix<f64> {
     let eig = SymmetricEigen::new(hess_free_sym.clone());
-    // Proposal covariance eigenvalues: inflation / |λ_i|, floored to avoid ÷0.
-    let inv_eigs: DVector<f64> = eig.eigenvalues.map(|v| inflation / v.abs().max(1e-10));
-    // Reconstruct: C_free = V * diag(inv_eigs) * V^T
-    let cov_free =
+    // Largest absolute eigenvalue anchors the relative floor. Guard the
+    // all-zero block (max_abs == 0) with a tiny absolute fallback so the floor
+    // stays positive and we never divide by zero.
+    let max_abs = eig
+        .eigenvalues
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let floor = (max_abs / FALLBACK_PROPOSAL_MAX_COND).max(1e-10);
+    // Proposal covariance eigenvalues: inflation / max(|λ_i|, floor).
+    let inv_eigs: DVector<f64> = eig.eigenvalues.map(|v| inflation / v.abs().max(floor));
+    // Reconstruct: C_free = V * diag(inv_eigs) * V^T, then symmetrise to remove
+    // any floating-point asymmetry from the matrix products.
+    let cov_free_raw =
         &eig.eigenvectors * DMatrix::from_diagonal(&inv_eigs) * eig.eigenvectors.transpose();
+    let cov_free = (&cov_free_raw + cov_free_raw.transpose()) * 0.5;
     // Embed free block into full n×n (FIX rows/cols stay zero).
     let mut cov = DMatrix::zeros(n_full, n_full);
     for (a, &i) in free_idx.iter().enumerate() {
@@ -2109,7 +2141,13 @@ fn select_fd_step<F: Fn(&[f64]) -> f64>(
             x[i] = x_hat[i] - hi;
             let fm = ofv(&x);
             x[i] = x_hat[i]; // always restore before returning
-            fp.is_finite() && fm.is_finite() && (fp - 2.0 * f0 + fm).is_finite()
+                             // Mirror the diagonal stencil the FD loop actually computes —
+                             // (fp - 2·f0 + fm) / hi² — including the division. A finite
+                             // numerator can still overflow once divided by a tiny hi², and the
+                             // FD loop rejects on the quotient, so accepting the step here on the
+                             // numerator alone would hand back an eps the loop then rejects.
+            let h_ii = (fp - 2.0 * f0 + fm) / (hi * hi);
+            h_ii.is_finite()
         });
         if all_ok {
             return (eps, halvings);
@@ -2139,10 +2177,16 @@ fn select_fd_step<F: Fn(&[f64]) -> f64>(
 /// is twice the observed information.
 ///
 /// Returns [`CovarianceStepResult::Unusable`] when the FD Hessian is structurally
-/// unusable (non-finite or zero-diagonal entries) or has no positive curvature at
-/// all. A near-singular or marginally-indefinite free block is regularised by
-/// clipping eigenvalues to a small positive floor before inversion (rare now that
-/// the EBEs reconverge), recorded in the returned `warnings`.
+/// unusable (non-finite or zero-diagonal entries, or eigenvalues that diverge to
+/// NaN/Inf so no proposal can be built). When the symmetrised free-block Hessian
+/// is near-singular or has negative eigenvalues — a common FD noise artefact on
+/// well-conditioned surfaces (see issue #129) — it is regularised by clipping
+/// eigenvalues to a small positive floor before inversion, and the returned
+/// `warning` records what was done. When the Hessian has finite eigenvalues but
+/// no positive curvature at all (all eigenvalues ≤ 0), returns
+/// [`CovarianceStepResult::FailedNonPd`], carrying the eigenvalue list formatted
+/// as a warning together with an `|eigenvalue|`-rectified proposal covariance the
+/// caller can hand to SIR when `covariance_fallback = sir`.
 pub(crate) fn compute_covariance(
     x_hat: &[f64],
     template: &ModelParameters,
@@ -2459,21 +2503,36 @@ pub(crate) fn compute_covariance(
     let inv = match invert_psd_with_floor(&hess_free_sym) {
         Some(inv) => inv,
         None => {
-            // invert_psd_with_floor returns None only when no eigenvalue is positive.
-            // Return FailedNonPd so the caller can optionally run SIR as a fallback.
-            let reason = match extract_eigenvalues(&hess_free_sym) {
-                Some(eigvals) => format_non_pd_warning(&eigvals),
-                None => "Covariance step failed: could not compute eigenvalues of the \
+            // `invert_psd_with_floor` returns None in two distinct cases, and we
+            // must not conflate them: (a) every eigenvalue is finite but the
+            // spectrum has no positive curvature (a genuine non-PD Hessian — a
+            // SIR fallback is meaningful here), or (b) the eigendecomposition
+            // itself diverged and produced a non-finite eigenvalue (the Hessian
+            // contains NaN/Inf — no usable proposal can be built).
+            //
+            // `extract_eigenvalues` returns None for exactly case (b). Building a
+            // fallback proposal there would re-run the same divergent
+            // decomposition and embed NaN eigenvectors into the proposal
+            // covariance, which SIR would then silently turn into NaN samples.
+            // So only build the proposal when the eigenvalues are finite.
+            match extract_eigenvalues(&hess_free_sym) {
+                Some(eigvals) => {
+                    let fallback_proposal =
+                        build_non_pd_fallback_proposal(&hess_free_sym, &free_idx, n, 4.0);
+                    return CovarianceStepResult::FailedNonPd {
+                        reason: format_non_pd_warning(&eigvals),
+                        fallback_proposal,
+                    };
+                }
+                None => {
+                    return CovarianceStepResult::Unusable(
+                        "Covariance step failed: could not compute eigenvalues of the \
                          FD Hessian (Hessian may contain NaN or Inf). \
                          SE estimates not available."
-                    .to_string(),
-            };
-            let fallback_proposal =
-                build_non_pd_fallback_proposal(&hess_free_sym, &free_idx, n, 4.0);
-            return CovarianceStepResult::FailedNonPd {
-                reason,
-                fallback_proposal,
-            };
+                            .to_string(),
+                    );
+                }
+            }
         }
     };
     // The FD Hessian is of the OFV = −2·logL. The asymptotic covariance is the
@@ -2741,12 +2800,23 @@ mod tests {
         }
     }
 
-    /// Hopelessly indefinite input (all eigenvalues ≤ 0) returns None — the
-    /// caller surfaces this as CovarianceStepResult::Unusable with the eigenvalue list.
+    /// Hopelessly indefinite input (all eigenvalues ≤ 0) returns None. Because
+    /// the eigenvalues are finite, `compute_covariance` surfaces this as
+    /// `CovarianceStepResult::FailedNonPd` — carrying the eigenvalue-list warning
+    /// and a usable fallback proposal — rather than `Unusable`.
     #[test]
     fn test_invert_psd_with_floor_rejects_negative_definite() {
         let h = DMatrix::from_row_slice(2, 2, &[-1.0, 0.0, 0.0, -2.0]);
         assert!(invert_psd_with_floor(&h).is_none());
+        // The eigenvalues are finite, so the fallback path is taken (not Unusable):
+        // extract_eigenvalues succeeds and the proposal is all-finite and PD.
+        let eigs = extract_eigenvalues(&h).expect("finite eigenvalues");
+        assert!(eigs.iter().all(|e| e.is_finite()));
+        let proposal = build_non_pd_fallback_proposal(&h, &[0, 1], 2, 4.0);
+        assert!(
+            proposal.iter().all(|v| v.is_finite()),
+            "fallback proposal must be finite for a finite non-PD Hessian"
+        );
     }
 
     /// extract_eigenvalues returns eigenvalues sorted descending and returns None
@@ -4255,6 +4325,36 @@ mod tests {
         assert_eq!(proposal[(2, 2)], 0.0, "fixed param row/col must be zero");
     }
 
+    /// A near-zero eigenvalue must be floored *relative* to the largest, capping
+    /// the proposal's condition number at `FALLBACK_PROPOSAL_MAX_COND`. With the
+    /// old absolute `1e-10` floor a 1e-9 eigenvalue would give a variance of
+    /// 4/1e-9 = 4e9 (and a 1e12 condition number) — far enough to scatter every
+    /// SIR draw out of bounds. The relative floor caps it at 4/(λ_max/1e8).
+    #[test]
+    fn build_fallback_proposal_caps_condition_number() {
+        // diag(1000, 1e-9): one well-determined direction, one near-flat.
+        let hess = DMatrix::from_row_slice(2, 2, &[1000.0_f64, 0.0, 0.0, 1e-9]);
+        let free_idx = [0usize, 1];
+        let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0);
+        let eig = SymmetricEigen::new(proposal.clone());
+        let max_var = eig.eigenvalues.iter().cloned().fold(f64::MIN, f64::max);
+        let min_var = eig.eigenvalues.iter().cloned().fold(f64::MAX, f64::min);
+        // floor = 1000 / 1e8 = 1e-5 ⇒ largest variance = 4 / 1e-5 = 4e5,
+        // well below the un-floored 4e9.
+        assert!(
+            max_var < 1e6,
+            "near-zero direction variance must be capped by the relative floor, got {max_var:e}"
+        );
+        // Condition number of the proposal must not exceed the cap (allow a
+        // little slack for the inflation/eigen round-trip).
+        assert!(
+            max_var / min_var <= FALLBACK_PROPOSAL_MAX_COND * 1.01,
+            "proposal condition number {} exceeds cap {}",
+            max_var / min_var,
+            FALLBACK_PROPOSAL_MAX_COND
+        );
+    }
+
     // ── select_fd_step ───────────────────────────────────────────────────────
 
     /// When all stencils are finite from the start, no halvings occur and the
@@ -4305,5 +4405,42 @@ mod tests {
         let (eps, halvings) = select_fd_step(&[1.0], &[], 0.01, 0.0, &ofv);
         assert_eq!(eps, 0.01);
         assert_eq!(halvings, 0);
+    }
+
+    /// Regression: a stencil whose *numerator* (fp − 2·f0 + fm) is finite but
+    /// whose *quotient* (÷ hi²) overflows must not be accepted at halvings == 0.
+    /// The old numerator-only check declared this step usable, then the FD loop —
+    /// which divides — rejected the diagonal and the covariance step failed
+    /// without ever halving. select_fd_step now applies the same quotient the FD
+    /// loop does, so it recognises the step as unusable (and exhausts its
+    /// halvings rather than falsely reporting success on the first try).
+    #[test]
+    fn select_fd_step_rejects_finite_numerator_infinite_quotient() {
+        // f0 = 0; any non-zero perturbation returns 1e200, so the numerator is a
+        // finite 2e200 but hi² is ~1e-200, making the quotient overflow to +inf.
+        let ofv = |x: &[f64]| if x[0] == 0.0 { 0.0 } else { 1e200 };
+        let x_hat = [0.0f64];
+        let free_idx = [0usize];
+        let f0 = 0.0f64;
+        let initial_eps = 1e-100;
+        // Numerator is finite (the old check would accept immediately) …
+        let hi = initial_eps * (1.0 + x_hat[0].abs());
+        let numerator = ofv(&[hi]) - 2.0 * f0 + ofv(&[-hi]);
+        assert!(
+            numerator.is_finite(),
+            "test setup: numerator must be finite"
+        );
+        assert!(
+            !(numerator / (hi * hi)).is_finite(),
+            "test setup: quotient must overflow"
+        );
+        // … but the quotient overflows, so the step is not accepted on the first
+        // pass: halvings > 0 (smaller steps can't rescue this pathological case,
+        // so it exhausts the budget — the point is it did not return 0).
+        let (_eps, halvings) = select_fd_step(&x_hat, &free_idx, initial_eps, f0, &ofv);
+        assert!(
+            halvings > 0,
+            "finite-numerator/infinite-quotient step must not be accepted at halvings == 0"
+        );
     }
 }

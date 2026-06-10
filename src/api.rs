@@ -2693,15 +2693,11 @@ fn fit_inner(
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
     // Covariance status
-    let covariance_status = if !options.run_covariance_step {
-        CovarianceStatus::NotRequested
-    } else if result.covariance_matrix.is_some() {
-        CovarianceStatus::Computed
-    } else if sir_fallback_result.is_some() {
-        CovarianceStatus::SirFallback
-    } else {
-        CovarianceStatus::Failed
-    };
+    let covariance_status = resolve_covariance_status(
+        options.run_covariance_step,
+        result.covariance_matrix.is_some(),
+        sir_fallback_result.is_some(),
+    );
 
     let wall_time_secs = fit_start.elapsed().as_secs_f64();
 
@@ -3051,6 +3047,28 @@ fn compute_param_corr(
         }
     }
     Some(corr)
+}
+
+/// Resolve the reported [`CovarianceStatus`] from the three signals that
+/// determine it: whether the covariance step was requested, whether it produced
+/// a covariance matrix, and whether the SIR fallback (`covariance_fallback =
+/// sir`) produced a result. Pulled out of `fit()` so the precedence — a real
+/// covariance always wins over a fallback, which wins over a plain failure — is
+/// unit-testable without driving a full fit to a non-PD Hessian.
+fn resolve_covariance_status(
+    run_covariance_step: bool,
+    has_covariance_matrix: bool,
+    has_sir_fallback: bool,
+) -> CovarianceStatus {
+    if !run_covariance_step {
+        CovarianceStatus::NotRequested
+    } else if has_covariance_matrix {
+        CovarianceStatus::Computed
+    } else if has_sir_fallback {
+        CovarianceStatus::SirFallback
+    } else {
+        CovarianceStatus::Failed
+    }
 }
 
 fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
@@ -4913,6 +4931,53 @@ mod tests_cov_diagnostics {
         assert!(
             (cn - 1.0).abs() < 1e-12,
             "condition_number must be 1.0, got {cn}"
+        );
+    }
+
+    // ── resolve_covariance_status ────────────────────────────────────────────
+
+    #[test]
+    fn cov_status_not_requested_when_step_off() {
+        // When the covariance step is off, neither a (stale) covariance matrix
+        // nor a fallback result can change the reported status.
+        assert_eq!(
+            resolve_covariance_status(false, true, true),
+            CovarianceStatus::NotRequested
+        );
+        assert_eq!(
+            resolve_covariance_status(false, false, false),
+            CovarianceStatus::NotRequested
+        );
+    }
+
+    #[test]
+    fn cov_status_computed_takes_precedence_over_fallback() {
+        // A real covariance matrix always wins, even if a fallback also ran.
+        assert_eq!(
+            resolve_covariance_status(true, true, false),
+            CovarianceStatus::Computed
+        );
+        assert_eq!(
+            resolve_covariance_status(true, true, true),
+            CovarianceStatus::Computed
+        );
+    }
+
+    #[test]
+    fn cov_status_sir_fallback_when_no_matrix_but_fallback_ran() {
+        // The branch the SIR-fallback wiring depends on: no H⁻¹ covariance, but
+        // the |eigenvalue|-rectified SIR fallback produced a result.
+        assert_eq!(
+            resolve_covariance_status(true, false, true),
+            CovarianceStatus::SirFallback
+        );
+    }
+
+    #[test]
+    fn cov_status_failed_when_requested_but_nothing_produced() {
+        assert_eq!(
+            resolve_covariance_status(true, false, false),
+            CovarianceStatus::Failed
         );
     }
 }

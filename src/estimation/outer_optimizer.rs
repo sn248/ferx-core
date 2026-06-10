@@ -35,6 +35,11 @@ pub struct OuterResult {
     /// (SLSQP, L-BFGS, MMA) when at least one gradient-requesting iteration
     /// improved the OFV; `None` for BOBYQA, built-in BFGS, GN, and SAEM.
     pub final_gradient: Option<Vec<f64>>,
+    /// Fallback proposal covariance for the SIR sampler, set when the FD
+    /// Hessian is non-PD. Built from the `|eigenvalue|`-rectified free-block
+    /// Hessian, inflated 4×, and embedded into the full packed parameter space.
+    /// `None` when the Hessian succeeded or the covariance step was skipped.
+    pub sir_fallback_proposal: Option<DMatrix<f64>>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1209,6 +1214,7 @@ fn optimize_nlopt(
 
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
+    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
@@ -1230,6 +1236,14 @@ fn optimize_nlopt(
                 }
                 CovarianceStepResult::Unusable(msg) => {
                     warnings.push(msg);
+                    None
+                }
+                CovarianceStepResult::FailedNonPd {
+                    reason,
+                    fallback_proposal,
+                } => {
+                    warnings.push(reason);
+                    sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
             }
@@ -1265,6 +1279,7 @@ fn optimize_nlopt(
         max_unconverged_subjects: ebe_final.max_unconverged as u32,
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
         final_gradient,
+        sir_fallback_proposal,
     }
 }
 
@@ -1539,6 +1554,7 @@ fn optimize_bfgs(
     );
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
+    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
@@ -1560,6 +1576,14 @@ fn optimize_bfgs(
                 }
                 CovarianceStepResult::Unusable(msg) => {
                     warnings.push(msg);
+                    None
+                }
+                CovarianceStepResult::FailedNonPd {
+                    reason,
+                    fallback_proposal,
+                } => {
+                    warnings.push(reason);
+                    sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
             }
@@ -1587,6 +1611,7 @@ fn optimize_bfgs(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        sir_fallback_proposal,
     }
 }
 
@@ -1898,6 +1923,14 @@ pub(crate) enum CovarianceStepResult {
     /// Structurally unusable. Carries a complete user-facing warning message
     /// (already ends with "SE estimates not available.").
     Unusable(String),
+    /// FD Hessian symmetrised free-block has no positive eigenvalues — cannot
+    /// be inverted. Carries the warning message and a ready-to-use fallback
+    /// proposal covariance (full packed space, zeros for FIX params) built
+    /// from `|eigenvalue|`-rectified Hessian, inflated 4×.
+    FailedNonPd {
+        reason: String,
+        fallback_proposal: DMatrix<f64>,
+    },
 }
 
 /// Human-readable label for the packed parameter at position `packed_idx`.
@@ -2018,6 +2051,37 @@ fn format_non_pd_warning(eigvals: &[f64]) -> String {
          Eigenvalues: [{}]. SE estimates not available.",
         fmt
     )
+}
+
+/// Build a SIR proposal covariance for the non-PD-Hessian fallback path.
+///
+/// Takes the symmetrised free-block Hessian (which has at least one non-positive
+/// eigenvalue), replaces each eigenvalue with `inflation / |λ|` (so the proposal
+/// is `inflation`× wider than the inverted absolute Hessian), and embeds the
+/// result into the full packed-parameter covariance (zeros for FIX parameters).
+///
+/// `inflation = 4.0` is the recommended default: heavier tails account for the
+/// uncertainty introduced by the non-PD correction.
+fn build_non_pd_fallback_proposal(
+    hess_free_sym: &DMatrix<f64>,
+    free_idx: &[usize],
+    n_full: usize,
+    inflation: f64,
+) -> DMatrix<f64> {
+    let eig = SymmetricEigen::new(hess_free_sym.clone());
+    // Proposal covariance eigenvalues: inflation / |λ_i|, floored to avoid ÷0.
+    let inv_eigs: DVector<f64> = eig.eigenvalues.map(|v| inflation / v.abs().max(1e-10));
+    // Reconstruct: C_free = V * diag(inv_eigs) * V^T
+    let cov_free =
+        &eig.eigenvectors * DMatrix::from_diagonal(&inv_eigs) * eig.eigenvectors.transpose();
+    // Embed free block into full n×n (FIX rows/cols stay zero).
+    let mut cov = DMatrix::zeros(n_full, n_full);
+    for (a, &i) in free_idx.iter().enumerate() {
+        for (b, &j) in free_idx.iter().enumerate() {
+            cov[(i, j)] = cov_free[(a, b)];
+        }
+    }
+    cov
 }
 
 /// Choose a finite-difference step that keeps all free-parameter diagonal
@@ -2396,15 +2460,20 @@ pub(crate) fn compute_covariance(
         Some(inv) => inv,
         None => {
             // invert_psd_with_floor returns None only when no eigenvalue is positive.
-            // Fold NonPdHessian into Unusable here so callers have a uniform interface.
-            let msg = match extract_eigenvalues(&hess_free_sym) {
+            // Return FailedNonPd so the caller can optionally run SIR as a fallback.
+            let reason = match extract_eigenvalues(&hess_free_sym) {
                 Some(eigvals) => format_non_pd_warning(&eigvals),
                 None => "Covariance step failed: could not compute eigenvalues of the \
                          FD Hessian (Hessian may contain NaN or Inf). \
                          SE estimates not available."
                     .to_string(),
             };
-            return CovarianceStepResult::Unusable(msg);
+            let fallback_proposal =
+                build_non_pd_fallback_proposal(&hess_free_sym, &free_idx, n, 4.0);
+            return CovarianceStepResult::FailedNonPd {
+                reason,
+                fallback_proposal,
+            };
         }
     };
     // The FD Hessian is of the OFV = −2·logL. The asymptotic covariance is the
@@ -4134,6 +4203,56 @@ mod tests {
         println!("  scalar-FD (old): {:.2}ms/Hessian", scalar_ms);
         println!("  gradient-FD (new): {:.2}ms/Hessian", grad_ms);
         println!("  speedup: {:.1}×", scalar_ms / grad_ms);
+    }
+
+    // ── build_non_pd_fallback_proposal ───────────────────────────────────────
+
+    /// Diagonal 2×2 Hessian with one negative eigenvalue (-2) and one positive
+    /// (4). The proposal covariance should have eigenvalues inflation / |λ_i|,
+    /// inflated by factor 4: so 4/2 = 2.0 and 4/4 = 1.0.
+    #[test]
+    fn build_fallback_proposal_is_pd_and_inflated() {
+        let hess = DMatrix::from_row_slice(2, 2, &[-2.0_f64, 0.0, 0.0, 4.0]);
+        let free_idx = [0usize, 1];
+        let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0);
+        // Result must be symmetric PD.
+        assert!(proposal[(0, 0)] > 0.0, "diagonal must be positive");
+        assert!(proposal[(1, 1)] > 0.0, "diagonal must be positive");
+        assert!(
+            (proposal[(0, 1)] - proposal[(1, 0)]).abs() < 1e-12,
+            "must be symmetric"
+        );
+        // Eigenvalues of the proposal should be inflation / |original eigenvalue|.
+        let eig = SymmetricEigen::new(proposal.clone());
+        let mut evs: Vec<f64> = eig.eigenvalues.iter().cloned().collect();
+        evs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Expected: [4/4, 4/2] = [1.0, 2.0]
+        assert!(
+            (evs[0] - 1.0).abs() < 1e-10,
+            "smaller eigenvalue should be 1.0: {:?}",
+            evs
+        );
+        assert!(
+            (evs[1] - 2.0).abs() < 1e-10,
+            "larger eigenvalue should be 2.0: {:?}",
+            evs
+        );
+    }
+
+    /// Fixed parameter (index 2 absent from free_idx) stays zero in full matrix.
+    #[test]
+    fn build_fallback_proposal_zeros_fixed_params() {
+        let hess = DMatrix::from_row_slice(1, 1, &[2.0_f64]);
+        let free_idx = [0usize];
+        let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 3, 4.0);
+        assert_eq!(proposal.nrows(), 3);
+        assert_eq!(proposal.ncols(), 3);
+        assert!(
+            proposal[(0, 0)] > 0.0,
+            "free param row/col must be non-zero"
+        );
+        assert_eq!(proposal[(1, 1)], 0.0, "fixed param row/col must be zero");
+        assert_eq!(proposal[(2, 2)], 0.0, "fixed param row/col must be zero");
     }
 
     // ── select_fd_step ───────────────────────────────────────────────────────

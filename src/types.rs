@@ -1818,6 +1818,20 @@ pub enum CovarianceStatus {
     Computed,
     /// Step was attempted but failed (e.g. singular Hessian).
     Failed,
+    /// FD Hessian was non-PD; SIR was run as a fallback and succeeded.
+    SirFallback,
+}
+
+/// What to do when the covariance step produces a non-positive-definite Hessian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CovarianceFallback {
+    /// Do nothing; leave the covariance step as failed (default).
+    #[default]
+    None,
+    /// Run SIR with a proposal built from the rectified (|eigenvalue|) Hessian,
+    /// inflated 4× for heavier tails. The fit-YAML reports SE estimates from
+    /// the SIR posterior quantiles instead of `H⁻¹`.
+    Sir,
 }
 
 /// Severity level for a structured warning entry.
@@ -2302,6 +2316,11 @@ pub struct FitOptions {
     /// Hessian entries; decrease (e.g. `1e-3`) for smoother OFV surfaces where
     /// FD noise is the main concern.
     pub fd_hessian_step: f64,
+    /// What to do when the FD Hessian is non-positive-definite.
+    /// Default [`CovarianceFallback::None`] leaves the covariance step as failed.
+    /// [`CovarianceFallback::Sir`] runs SIR with a fallback proposal covariance
+    /// built from the rectified (`|eigenvalue|`) Hessian, inflated 4×.
+    pub covariance_fallback: CovarianceFallback,
     pub interaction: bool,
     pub verbose: bool,
     pub optimizer: Optimizer,
@@ -2533,6 +2552,7 @@ impl Default for FitOptions {
             inner_tol: 1e-4,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
+            covariance_fallback: CovarianceFallback::None,
             interaction: true,
             verbose: true,
             // BOBYQA — derivative-free quadratic trust-region. Chosen as the

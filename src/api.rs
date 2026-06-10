@@ -2619,6 +2619,39 @@ fn fit_inner(
         None
     };
 
+    // SIR fallback: when the FD Hessian is non-PD and covariance_fallback = sir,
+    // run SIR with the rectified |eigenvalue| proposal built inside compute_covariance.
+    let sir_fallback_result = if options.covariance_fallback == CovarianceFallback::Sir
+        && result.covariance_matrix.is_none()
+        && sir_result.is_none()
+        && !crate::cancel::is_cancelled(&options.cancel)
+    {
+        if let Some(ref proposal) = result.sir_fallback_proposal {
+            if options.verbose {
+                eprintln!("\nRunning SIR fallback (non-PD Hessian)...");
+            }
+            match crate::estimation::sir::run_sir_core(
+                model,
+                population,
+                &result.params,
+                &result.eta_hats,
+                proposal,
+                result.ofv,
+                options,
+            ) {
+                Ok(sir) => Some(sir),
+                Err(e) => {
+                    warnings.push(format!("SIR fallback failed: {}", e));
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // `final_method` reports the last *estimating* stage — IMP is a likelihood
     // evaluation and doesn't produce parameters, so a chain like `[saem, imp]`
     // surfaces as `method = SAEM`. The full chain (including IMP) is preserved
@@ -2664,6 +2697,8 @@ fn fit_inner(
         CovarianceStatus::NotRequested
     } else if result.covariance_matrix.is_some() {
         CovarianceStatus::Computed
+    } else if sir_fallback_result.is_some() {
+        CovarianceStatus::SirFallback
     } else {
         CovarianceStatus::Failed
     };
@@ -2772,11 +2807,27 @@ fn fit_inner(
         interaction: options.interaction,
         warnings,
         warnings_structured: vec![],
-        sir_ci_theta: sir_result.as_ref().map(|s| s.ci_theta.clone()),
-        sir_ci_omega: sir_result.as_ref().map(|s| s.ci_omega.clone()),
-        sir_ci_sigma: sir_result.as_ref().map(|s| s.ci_sigma.clone()),
-        sir_ess: sir_result.as_ref().map(|s| s.effective_sample_size),
-        sir_resamples_packed: sir_result.as_ref().and_then(|s| s.resamples_packed.clone()),
+        // If the normal SIR ran, use that; otherwise use the fallback result.
+        sir_ci_theta: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.ci_theta.clone()),
+        sir_ci_omega: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.ci_omega.clone()),
+        sir_ci_sigma: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.ci_sigma.clone()),
+        sir_ess: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.effective_sample_size),
+        sir_resamples_packed: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .and_then(|s| s.resamples_packed.clone()),
         importance_sampling: is_result,
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),

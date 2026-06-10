@@ -381,7 +381,8 @@ pub fn run_foce_gn(
                         warnings.extend(out.warnings);
                         Some(out.matrix)
                     }
-                    CovarianceStepResult::Unusable(msg) => {
+                    CovarianceStepResult::Unusable(msg)
+                    | CovarianceStepResult::FailedNonPd { reason: msg, .. } => {
                         warnings.push(msg);
                         None
                     }
@@ -410,6 +411,7 @@ pub fn run_foce_gn(
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             final_gradient,
+            sir_fallback_proposal: None,
         };
     }
 
@@ -485,7 +487,8 @@ pub fn run_foce_gn(
                     warnings.extend(out.warnings);
                     Some(out.matrix)
                 }
-                CovarianceStepResult::Unusable(msg) => {
+                CovarianceStepResult::Unusable(msg)
+                | CovarianceStepResult::FailedNonPd { reason: msg, .. } => {
                     warnings.push(msg);
                     None
                 }
@@ -514,6 +517,7 @@ pub fn run_foce_gn(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient,
+        sir_fallback_proposal: None,
     }
 }
 

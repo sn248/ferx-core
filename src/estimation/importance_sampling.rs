@@ -105,6 +105,32 @@ pub fn run_importance_sampling(
         }
     }
 
+    // Defensive: the joint (η, κ) path builds a mode vector of size
+    // `n_eta + n_occ·n_iov`, filling the κ blocks from the per-occasion EBEs in
+    // `kappas[i]`. The two notions of "number of occasions" — the EBE count and
+    // `split_obs_by_occasion(subject).len()` — must agree, or the fill loop
+    // would index out of bounds (κ too long) or silently leave occasions at
+    // κ = 0 (κ too short). Verify once up front so the parallel loop can index
+    // freely. Subjects with no κ EBEs fall through to the η-only path.
+    if model.n_kappa > 0 {
+        for (i, subject) in population.subjects.iter().enumerate() {
+            let kap_len = kappas.get(i).map(|v| v.len()).unwrap_or(0);
+            if kap_len == 0 {
+                continue;
+            }
+            let n_occ = split_obs_by_occasion(subject).len();
+            if kap_len != n_occ {
+                return Err(format!(
+                    "IS: subject {} has {} κ occasion block(s) but {} observation \
+                     occasion(s); the joint (η, κ) proposal requires these to match. \
+                     This usually means the preceding estimator produced κ EBEs on a \
+                     different occasion grouping than the data.",
+                    subject.id, kap_len, n_occ,
+                ));
+            }
+        }
+    }
+
     let n_eta = model.n_eta;
     let k_samples = options.is_samples;
     let nu = options.is_proposal_df;
@@ -134,11 +160,20 @@ pub fn run_importance_sampling(
     let log_det_omega = omega.log_det;
 
     // For IOV models, pre-compute Ω_iov⁻¹ and log|Ω_iov| for the joint proposal.
+    // An IOV model (`n_kappa > 0`) must carry Ω_iov; enforce that here so the
+    // per-subject joint path can rely on it without `Option` handling (and
+    // `unwrap`) in the hot loop.
     let (omega_iov_inv, log_det_omega_iov) = if let Some(ref iov) = params.omega_iov {
         if !iov.log_det.is_finite() {
             return Err("IS: Ω_iov log-determinant is not finite — cannot evaluate κ prior".into());
         }
         (Some(iov.inv.clone()), Some(iov.log_det))
+    } else if model.n_kappa > 0 {
+        return Err(
+            "IS: model declares κ (IOV) but params.omega_iov is missing — \
+                    cannot build the joint (η, κ) proposal"
+                .into(),
+        );
     } else {
         (None, None)
     };
@@ -163,11 +198,26 @@ pub fn run_importance_sampling(
             let subj_seed = seed.wrapping_add(i as u64);
 
             if model.n_kappa > 0 && !kap.is_empty() {
-                // Joint (eta, kappa) sampling for IOV models
+                // Joint (eta, kappa) sampling for IOV models. Ω_iov is guaranteed
+                // present by the up-front check in this function, so bind the
+                // references once instead of unwrapping in the hot path.
+                let omega_iov_inv = omega_iov_inv
+                    .as_ref()
+                    .expect("omega_iov present for IOV model (checked in run_importance_sampling)");
+                let log_det_omega_iov = log_det_omega_iov
+                    .expect("omega_iov present for IOV model (checked in run_importance_sampling)");
+
                 let occ_groups = split_obs_by_occasion(subject);
                 let n_occ = occ_groups.len();
                 let n_iov = model.n_kappa;
                 let n_b = n_eta + n_occ * n_iov;
+
+                // Joint prior precision (block-diagonal: Ω_bsv⁻¹ plus one Ω_iov⁻¹
+                // block per occasion). Built once and shared by the Hessian
+                // assembly, the proposal, and the per-draw prior quadratic form.
+                let omega_joint_inv =
+                    build_joint_omega_inv(&omega_inv, omega_iov_inv, n_eta, n_iov, n_occ);
+                let log_det_omega_joint = log_det_omega + n_occ as f64 * log_det_omega_iov;
 
                 // Build joint posterior Hessian via FD
                 let h_joint = compute_joint_posterior_hessian(
@@ -178,23 +228,12 @@ pub fn run_importance_sampling(
                     kap,
                     &params.sigma.values,
                     &h_matrices[i],
-                    &omega_inv,
-                    omega_iov_inv.as_ref().unwrap(),
+                    &omega_joint_inv,
                     n_eta,
                     n_iov,
                     n_occ,
                     scratch,
                 );
-
-                // Build joint prior covariance (block-diagonal: Omega_bsv + K copies of Omega_iov)
-                let omega_joint_inv = build_joint_omega_inv(
-                    &omega_inv,
-                    omega_iov_inv.as_ref().unwrap(),
-                    n_eta,
-                    n_iov,
-                    n_occ,
-                );
-                let log_det_omega_joint = log_det_omega + n_occ as f64 * log_det_omega_iov.unwrap();
 
                 // Build joint mode vector [eta_hat, kappa_1, ..., kappa_K]
                 let mut mode_joint = vec![0.0_f64; n_b];
@@ -488,8 +527,7 @@ fn compute_joint_posterior_hessian(
     kappas: &[DVector<f64>],
     sigma: &[f64],
     jacobian_eta: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    omega_iov_inv: &DMatrix<f64>,
+    omega_joint_inv: &DMatrix<f64>,
     n_eta: usize,
     n_iov: usize,
     n_occ: usize,
@@ -500,7 +538,7 @@ fn compute_joint_posterior_hessian(
 
     if n_obs == 0 {
         // No observations: posterior = prior
-        return build_joint_omega_inv(omega_inv, omega_iov_inv, n_eta, n_iov, n_occ);
+        return omega_joint_inv.clone();
     }
 
     // Compute predictions at the joint mode using predict_iov for proper cross-occasion carryover
@@ -551,8 +589,7 @@ fn compute_joint_posterior_hessian(
     }
 
     // Build H_post = J' R^{-1} J + Omega_joint^{-1}
-    let omega_joint_inv = build_joint_omega_inv(omega_inv, omega_iov_inv, n_eta, n_iov, n_occ);
-    let mut h_post = omega_joint_inv;
+    let mut h_post = omega_joint_inv.clone();
 
     for j in 0..n_obs {
         let rj = r_diag[j].max(1e-12);
@@ -646,6 +683,10 @@ fn subject_is_estimate_joint(
     let mut z = vec![0.0_f64; n_b];
     let mut sample_joint = vec![0.0_f64; n_b];
     let mut diff = vec![0.0_f64; n_b];
+    // Reused across draws: overwriting in place avoids K allocations of the
+    // outer `Vec` plus its per-occasion κ vectors (a hot-loop allocator cost
+    // at K in the thousands).
+    let mut kappas_sampled: Vec<Vec<f64>> = (0..n_occ).map(|_| vec![0.0_f64; n_iov]).collect();
 
     for _ in 0..k_samples {
         // Draw from joint proposal
@@ -659,13 +700,11 @@ fn subject_is_estimate_joint(
             *e += mode_joint[j];
         }
 
-        // Split into eta and kappa parts
+        // Split into eta and kappa parts (κ buffer reused across draws).
         let eta_sample = &sample_joint[..n_eta];
-        let mut kappas_sampled: Vec<Vec<f64>> = Vec::with_capacity(n_occ);
-        for k in 0..n_occ {
+        for (k, kappa_occ) in kappas_sampled.iter_mut().enumerate() {
             let start = n_eta + k * n_iov;
-            let end = start + n_iov;
-            kappas_sampled.push(sample_joint[start..end].to_vec());
+            kappa_occ.copy_from_slice(&sample_joint[start..start + n_iov]);
         }
 
         // Compute obs NLL with sampled eta and kappa using predict_iov

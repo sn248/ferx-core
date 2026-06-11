@@ -48,6 +48,16 @@ section of the SDLC for the versioning policy).
   the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
 
 ### Fixed
+- FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
+  `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The
+  covariance step had added the Ω prior (`η̂ᵀΩ⁻¹η̂ + log|Ω|`) on top of the
+  Sheiner–Beal marginal, which already carries Ω through `R̃ = HΩHᵀ + R` —
+  double-counting Ω and flattening the omega-block curvature. FOCE estimates were
+  already correct; only the SEs were affected (#243).
+- The covariance step now succeeds on models with a mixed block + diagonal Ω: the
+  structural-zero cross-block off-diagonals (`free_mask == false`) are excluded
+  from the parameter set like FIX parameters, so their flat Hessian diagonal no
+  longer aborts the step. This affected both FOCE and FOCEI (#243).
 - Covariance standard errors now match NONMEM `$COVARIANCE MATRIX=R` (within ~2%
   on warfarin). The covariance step reconverges the inner EBE loop at every
   finite-difference point — holding the EBEs fixed gave an indefinite Hessian

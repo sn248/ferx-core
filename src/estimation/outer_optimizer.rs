@@ -2332,7 +2332,7 @@ pub(crate) fn compute_covariance(
     // Adaptively select the FD step: halve up to 8× until all free-parameter
     // diagonal stencils are finite. Most models use the initial step; halving
     // only kicks in when the OFV overflows at the default perturbation size.
-    let (eps, n_halvings) = select_fd_step(x_hat, &free_idx, initial_eps, f0, &ofv_fixed);
+    let (eps, n_halvings) = select_fd_step(x_hat, &free_idx, initial_eps, f0, &ofv);
     if options.verbose && n_halvings > 0 {
         eprintln!(
             "  [covariance] Adaptive FD step: reduced {:.3e} → {:.3e} ({} halving{})",
@@ -3806,6 +3806,9 @@ mod tests {
             CovarianceStepResult::Unusable(msg) => {
                 panic!("covariance must compute on the synthetic 1-cpt model: {msg}")
             }
+            CovarianceStepResult::FailedNonPd { reason, .. } => {
+                panic!("covariance must be PD on synthetic 1-cpt model: {reason}")
+            }
         };
 
         // (a) No eigenvalue clipping on this well-conditioned surface.
@@ -4135,7 +4138,6 @@ mod tests {
     #[test]
     #[ignore = "benchmark: run with -- --ignored --nocapture"]
     fn bench_cov_hessian_throughput() {
-
         use std::time::Instant;
 
         let model = make_model();

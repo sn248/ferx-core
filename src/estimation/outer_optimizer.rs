@@ -2166,6 +2166,93 @@ fn select_fd_step<F: Fn(&[f64]) -> f64>(
     (eps, MAX_HALVINGS)
 }
 
+fn covariance_method_label(m: CovarianceMethod) -> &'static str {
+    match m {
+        CovarianceMethod::Hessian => "r",
+        CovarianceMethod::CrossProduct => "s",
+        CovarianceMethod::Sandwich => "rsr",
+    }
+}
+
+/// Combine the observed-information inverse `r_inv = R⁻¹` (already `2·H_ofv⁻¹`)
+/// and the score cross-product `S` into the covariance estimator selected by
+/// `method`:
+///   - `Hessian`      → `R⁻¹`            (model-based; `S` ignored)
+///   - `CrossProduct` → `S⁻¹`            (empirical information)
+///   - `Sandwich`     → `R⁻¹ S R⁻¹`      (Huber–White, robust)
+///
+/// Returns `None` only for `CrossProduct` when `S` is singular (it shares the
+/// Hessian's eigenvalue-floor inversion). `Sandwich` never inverts `S`, so it is
+/// defined even when `S` is rank-deficient.
+fn combine_covariance(
+    method: CovarianceMethod,
+    r_inv: DMatrix<f64>,
+    s: &DMatrix<f64>,
+) -> Option<DMatrix<f64>> {
+    match method {
+        CovarianceMethod::Hessian => Some(r_inv),
+        CovarianceMethod::Sandwich => Some(&r_inv * s * &r_inv),
+        CovarianceMethod::CrossProduct => invert_psd_with_floor(s).map(|inv| inv.inverse),
+    }
+}
+
+/// Assemble the per-subject score cross-product `S = Σᵢ gᵢgᵢᵀ` over the free
+/// parameter block, where `gᵢ = ∂(−logLᵢ)/∂θ` is subject `i`'s contribution to
+/// the population score (the same per-subject gradient the Gauss–Newton optimizer
+/// uses for its BHHH step). `S` is NONMEM's `S` matrix; combined with the
+/// observed-information `R` it yields the `S⁻¹` and `R⁻¹SR⁻¹` covariance forms.
+///
+/// The result is `n_free × n_free`, ordered to match `free_idx`. Caller embeds it
+/// (or its inverse) back into the full packed space.
+#[allow(clippy::too_many_arguments)]
+fn assemble_score_cross_product(
+    x_hat: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    free_idx: &[usize],
+) -> DMatrix<f64> {
+    let n_free = free_idx.len();
+    let n_subj = population.subjects.len();
+
+    // Per-subject scores in parallel (mirrors `build_gn_system`).
+    let scores: Vec<Vec<f64>> = (0..n_subj)
+        .into_par_iter()
+        .map(|i| {
+            let kap_i = if i < kappas.len() {
+                kappas[i].as_slice()
+            } else {
+                &[]
+            };
+            let (_, gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
+                x_hat,
+                template,
+                model,
+                population,
+                i,
+                &eta_hats[i],
+                &h_matrices[i],
+                kap_i,
+                bounds,
+                options,
+            );
+            gi
+        })
+        .collect();
+
+    let mut s = DMatrix::zeros(n_free, n_free);
+    for gi in &scores {
+        let gi_free = DVector::from_iterator(n_free, free_idx.iter().map(|&k| gi[k]));
+        s.ger(1.0, &gi_free, &gi_free, 1.0); // s += gi_free * gi_freeᵀ (full outer product)
+    }
+    s
+}
+
 /// Compute the parameter covariance matrix at convergence (the R-matrix:
 /// inverse observed Fisher information).
 ///
@@ -2196,6 +2283,10 @@ fn select_fd_step<F: Fn(&[f64]) -> f64>(
 /// [`CovarianceStepResult::FailedNonPd`], carrying the eigenvalue list formatted
 /// as a warning together with an `|eigenvalue|`-rectified proposal covariance the
 /// caller can hand to SIR when `covariance_fallback = sir`.
+///
+/// The estimator assembled from the Hessian `R` is selected by
+/// [`FitOptions::covariance_method`] — `R⁻¹` (default), the score cross-product
+/// `S⁻¹`, or the sandwich `R⁻¹SR⁻¹` (see [`assemble_score_cross_product`]).
 pub(crate) fn compute_covariance(
     x_hat: &[f64],
     template: &ModelParameters,
@@ -2213,6 +2304,18 @@ pub(crate) fn compute_covariance(
             "Covariance step failed: fd_hessian_step must be positive and finite, got {}. \
              SE estimates not available.",
             initial_eps
+        ));
+    }
+    // Fail fast on a covariance_method that needs the per-subject score cross
+    // product `S` but whose score is inconsistent with the Hessian: the FOCE /
+    // Sheiner–Beal score omits the Ω prior (ηᵀΩ⁻¹η + log|Ω|) that the covariance
+    // OFV adds separately, so `S` would not match `R`. Only FOCEI/Laplace (and
+    // IOV) carry that prior in the marginal. Reject before doing any Hessian work.
+    if options.covariance_method != CovarianceMethod::Hessian && !options.interaction {
+        return CovarianceStepResult::Unusable(format!(
+            "covariance_method = {} requires FOCEI (interaction); it is not yet supported for \
+             FOCE / Sheiner–Beal. Use covariance_method = r, or set method = focei.",
+            covariance_method_label(options.covariance_method),
         ));
     }
     let bounds = compute_bounds(template);
@@ -2545,9 +2648,34 @@ pub(crate) fn compute_covariance(
         }
     };
     // The FD Hessian is of the OFV = −2·logL. The asymptotic covariance is the
-    // inverse observed Fisher information = Hessian of −logL = ½·H_ofv, so
-    // cov = 2·H_ofv⁻¹. Without this factor every SE is 1/√2 too small.
-    let cov_free = inv.inverse * 2.0;
+    // inverse observed Fisher information R = Hessian of −logL = ½·H_ofv, so
+    // R⁻¹ = 2·H_ofv⁻¹. Without this factor every SE is 1/√2 too small.
+    let r_inv = inv.inverse * 2.0;
+
+    // Select the covariance estimator (NONMEM `$COV MATRIX=`). `R⁻¹` is the
+    // model-based default; `S⁻¹` and `R⁻¹SR⁻¹` additionally need the per-subject
+    // score cross-product `S = Σᵢ gᵢgᵢᵀ`.
+    let cov_free = if options.covariance_method == CovarianceMethod::Hessian {
+        r_inv
+    } else {
+        // S/RSR: the non-interaction FOCE case was already rejected at entry (the
+        // per-subject score is only Ω-prior-consistent under interaction).
+        let s_free = assemble_score_cross_product(
+            x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
+            &free_idx,
+        );
+        match combine_covariance(options.covariance_method, r_inv, &s_free) {
+            Some(c) => c,
+            None => {
+                return CovarianceStepResult::Unusable(
+                    "Covariance step failed: the score cross-product matrix S is singular \
+                     (covariance_method = s); typically fewer subjects than free parameters. \
+                     SE estimates not available."
+                        .to_string(),
+                );
+            }
+        }
+    };
 
     let mut cov = DMatrix::zeros(n, n);
     for (a, &i) in free_idx.iter().enumerate() {
@@ -2760,6 +2888,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Helper: assert two matrices agree element-wise.
+    #[cfg(test)]
+    fn assert_mat_close(a: &DMatrix<f64>, b: &DMatrix<f64>, tol: f64, ctx: &str) {
+        assert_eq!(a.shape(), b.shape(), "{ctx}: shape mismatch");
+        for i in 0..a.nrows() {
+            for j in 0..a.ncols() {
+                assert!(
+                    (a[(i, j)] - b[(i, j)]).abs() < tol,
+                    "{ctx}: ({i},{j}) {:.6e} vs {:.6e}",
+                    a[(i, j)],
+                    b[(i, j)]
+                );
+            }
+        }
+    }
+
+    /// Information-matrix equality: when `S = R`, all three estimators collapse
+    /// to the model-based `R⁻¹` (`R⁻¹SR⁻¹ = R⁻¹RR⁻¹ = R⁻¹`, and `S⁻¹ = R⁻¹`). This
+    /// is the asymptotic behaviour at the MLE of a correctly-specified model.
+    #[test]
+    fn test_combine_covariance_collapses_when_s_equals_r() {
+        let l = DMatrix::from_row_slice(2, 2, &[2.0, 0.0, 0.5, 1.3]);
+        let r = l.transpose() * &l; // SPD
+        let r_inv = invert_psd_with_floor(&r).expect("R PD").inverse;
+        for m in [
+            CovarianceMethod::Hessian,
+            CovarianceMethod::CrossProduct,
+            CovarianceMethod::Sandwich,
+        ] {
+            let cov = combine_covariance(m, r_inv.clone(), &r)
+                .unwrap_or_else(|| panic!("{m:?} should produce a covariance"));
+            assert_mat_close(&cov, &r_inv, 1e-9, &format!("{m:?} with S=R"));
+        }
+    }
+
+    /// With `S ≠ R`, the sandwich is exactly `R⁻¹ S R⁻¹`.
+    #[test]
+    fn test_combine_covariance_sandwich_matches_explicit_product() {
+        let l = DMatrix::from_row_slice(2, 2, &[1.7, 0.0, 0.3, 1.1]);
+        let r = l.transpose() * &l;
+        let r_inv = invert_psd_with_floor(&r).expect("R PD").inverse;
+        let s = DMatrix::from_row_slice(2, 2, &[3.0, 0.4, 0.4, 2.0]);
+        let sandwich =
+            combine_covariance(CovarianceMethod::Sandwich, r_inv.clone(), &s).expect("sandwich");
+        let expected = &r_inv * &s * &r_inv;
+        assert_mat_close(&sandwich, &expected, 1e-12, "sandwich = R⁻¹SR⁻¹");
+        // Sandwich must stay symmetric (S and R⁻¹ are symmetric).
+        assert_mat_close(
+            &sandwich,
+            &sandwich.transpose(),
+            1e-12,
+            "sandwich symmetric",
+        );
+    }
+
+    /// A rank-deficient `S` (here a single score's outer product) is singular, so
+    /// `S⁻¹` (cross-product) is unavailable — but the sandwich, which never
+    /// inverts `S`, is still defined.
+    #[test]
+    fn test_combine_covariance_singular_s() {
+        let l = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.2, 1.0]);
+        let r = l.transpose() * &l;
+        let r_inv = invert_psd_with_floor(&r).expect("R PD").inverse;
+        let g = DVector::from_column_slice(&[1.0, 2.0]);
+        let s_rank1 = &g * g.transpose(); // rank-1, singular 2×2
+        assert!(
+            combine_covariance(CovarianceMethod::CrossProduct, r_inv.clone(), &s_rank1).is_none(),
+            "S⁻¹ must report singular S"
+        );
+        assert!(
+            combine_covariance(CovarianceMethod::Sandwich, r_inv, &s_rank1).is_some(),
+            "sandwich must tolerate rank-deficient S"
+        );
     }
 
     /// A near-singular symmetric matrix with one tiny-negative eigenvalue

@@ -26,6 +26,10 @@ section of the SDLC for the versioning policy).
   Experimental features (`[diffusion]` / SDE, `[covariate_nn]` / neural networks)
   now emit a runtime warning at fit time (`W_EXPERIMENTAL_SDE`,
   `W_EXPERIMENTAL_NN`), also surfaced by `ferx check` (#175).
+- `covariance_method` fit option: choose the covariance estimator, mirroring
+  NONMEM `$COV MATRIX=` — `r` (inverse Hessian `R⁻¹`, default), `s` (inverse
+  score cross-product `S⁻¹`), or `rsr` (the Huber–White sandwich `R⁻¹SR⁻¹`,
+  robust to model mis-specification). Supported for FOCEI/IOV fits (#223).
 - `covariance_fallback = sir` fit option: when the FD Hessian is non-positive-definite,
   run SIR with an `|eigenvalue|`-rectified proposal (4× inflated) instead of leaving
   the covariance step as failed; `covariance_status` reports `sir_fallback` (#223).

@@ -162,6 +162,27 @@ and **FOCE** (`$EST METHOD=1`, no `INTER`), where ferx's OFV/estimates already m
 
 (autodiff build; the FD-Jacobian build agrees to within ~10% on the ω block.) Both methods are guarded by `tests/warfarin_covariance_nonmem.rs` within a 20% band.
 
+### Covariance estimator: R, S, or sandwich
+
+By default ferx reports the **R-matrix** covariance `R⁻¹` (the inverse observed information), which assumes the model is correctly specified. `covariance_method` selects an alternative, mirroring NONMEM's `$COVARIANCE MATRIX=`:
+
+| `covariance_method` | Estimator | NONMEM | Use when |
+|---|---|---|---|
+| `r` (default) | `R⁻¹` | `MATRIX=R` | Model is well-specified; you want the model-based SEs. |
+| `s` | `S⁻¹` | `MATRIX=S` | You want the empirical-information (cross-product) SEs. |
+| `rsr` | `R⁻¹ S R⁻¹` | `MATRIX=RSR` | You want SEs robust to model mis-specification (the Huber–White "sandwich"). |
+
+Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vectors `gᵢ = ∂(−logLᵢ)/∂θ` — the same per-subject gradients the [Gauss–Newton](optimizers.md) optimizer uses for its BHHH step. At the MLE of a correctly-specified model the information-matrix equality gives `R ≈ S`, so all three estimators converge to the same SEs; they diverge when the model is mis-specified, where `rsr` is the conservative choice.
+
+```
+[fit_options]
+  method           = focei
+  covariance       = true
+  covariance_method = rsr
+```
+
+`s` and `rsr` are currently available for **FOCEI and IOV** fits. They require the per-subject score, whose Ω-prior term (`ηᵀΩ⁻¹η + log|Ω|`) is only consistent with the Hessian under interaction; FOCE / Sheiner–Beal support is a follow-up. Requesting `s`/`rsr` under non-interaction FOCE returns a clear covariance-step error rather than an inconsistent matrix.
+
 ### Hessian regularization
 
 Because the EBEs reconverge, the Hessian is positive-definite on well-conditioned surfaces and no regularization is needed. As a safety net for genuinely ill-conditioned or near-singular problems, ferx-core still inverts via a symmetric eigendecomposition and clips eigenvalues below `max(λ_max · 1e-10, 1e-12)` to that floor before reconstructing `H⁻¹`, adding a warning to `FitResult.warnings`:

@@ -1614,6 +1614,9 @@ fn wire_to_fit_result(
         total_ebe_fallbacks: w.total_ebe_fallbacks,
         covariance_status: covariance_status_from_str(&w.covariance_status)?,
         shrinkage_eta: w.omega.shrinkage,
+        // The conditional-distribution pass is not persisted to .fitrx yet
+        // (#257); a loaded fit reports `None` for it.
+        cond_dist: None,
         shrinkage_eps: w.shrinkage_eps,
         iwres_lag1_r: w.iwres_lag1_r,
         dw_statistic: w.dw_statistic,
@@ -1814,6 +1817,7 @@ mod tests {
             total_ebe_fallbacks: 0,
             covariance_status: CovarianceStatus::Computed,
             shrinkage_eta: vec![0.1, 0.15],
+            cond_dist: None,
             shrinkage_eps: 0.05,
             iwres_lag1_r: 0.12,
             dw_statistic: 1.75,

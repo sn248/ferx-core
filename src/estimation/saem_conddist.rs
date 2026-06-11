@@ -39,27 +39,6 @@ use rayon::prelude::*;
 /// `master_seed + k * 100_000 + i`, plus `999_999` for the kappa kernel).
 const CONDDIST_SEED_OFFSET: u64 = 777_000_000;
 
-/// Per-subject conditional distribution of the random effects, estimated by
-/// MCMC at the fixed SAEM population parameters.
-#[derive(Debug, Clone)]
-pub struct CondDist {
-    /// Conditional mean of η per subject: `cond_mean[i]` has length `n_eta`.
-    pub cond_mean: Vec<Vec<f64>>,
-    /// Conditional SD of η per subject (sample SD over the retained draws).
-    pub cond_sd: Vec<Vec<f64>>,
-    /// Retained draws per subject: `samples[i]` is `nsamp × n_eta`. Empty for
-    /// every subject unless `saem_conddist_keep_samples` is set.
-    pub samples: Vec<Vec<Vec<f64>>>,
-    /// Distribution-based η-shrinkage per eta:
-    /// `1 - SD_over_subjects(cond_mean[·][j]) / sqrt(Ω_jj)`. `NaN` when there
-    /// are fewer than two subjects (sample SD undefined).
-    pub shrinkage: Vec<f64>,
-    /// Number of retained draws per subject (after burn-in).
-    pub nsamp: usize,
-    /// Burn-in sweeps discarded before accumulation.
-    pub burnin: usize,
-}
-
 /// Nudge an MH step scale toward `target` acceptance, matching the main SAEM
 /// loop's multiplicative adaptation (×1.1 / ×0.9, clamped to [0.01, 5.0]).
 fn adapt_scale(scale: &mut f64, accepted: usize, proposed: usize, target: f64) {

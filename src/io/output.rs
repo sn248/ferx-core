@@ -783,6 +783,91 @@ pub fn write_covtab_csv(table: &crate::types::CovariateTable, path: &str) -> Res
     Ok(())
 }
 
+/// Write the SAEM conditional-distribution summary (`saem_conddist = true`,
+/// #257) as a long-format CSV: one row per subject per random effect.
+///
+/// Columns: `ID, ETA, COND_MEAN, COND_SD, COND_MODE` — the conditional mean and
+/// SD from the MCMC pass (`p(η_i | y_i; θ̂)`) alongside the conditional **mode**
+/// (the EBE, `SubjectResult.eta`) for direct comparison. This is the ferx
+/// analogue of saemix's `cond.mean.phi` / `cond.sd` and Monolix's
+/// `*_mean` / `*_sd` columns. Returns `Err` if the fit carries no
+/// conditional-distribution results.
+pub fn write_conddist_csv(result: &FitResult, path: &str) -> Result<(), String> {
+    let cd = result
+        .cond_dist
+        .as_ref()
+        .ok_or("fit has no conditional-distribution results (saem_conddist was not enabled)")?;
+
+    let mut wtr = csv::WriterBuilder::new()
+        .from_path(path)
+        .map_err(|e| format!("Failed to create {}: {}", path, e))?;
+    wtr.write_record(["ID", "ETA", "COND_MEAN", "COND_SD", "COND_MODE"])
+        .map_err(|e| e.to_string())?;
+
+    for (i, subj) in result.subjects.iter().enumerate() {
+        let mean_i = cd.cond_mean.get(i);
+        let sd_i = cd.cond_sd.get(i);
+        for (j, eta_name) in result.eta_names.iter().enumerate() {
+            let mean = mean_i.and_then(|m| m.get(j)).copied().unwrap_or(f64::NAN);
+            let sd = sd_i.and_then(|s| s.get(j)).copied().unwrap_or(f64::NAN);
+            // The conditional mode is the EBE already on the subject result.
+            let mode = subj.eta.get(j).copied().unwrap_or(f64::NAN);
+            wtr.write_record([
+                subj.id.clone(),
+                eta_name.clone(),
+                fmt_num(mean),
+                fmt_num(sd),
+                fmt_num(mode),
+            ])
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    wtr.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Write the retained per-subject conditional-distribution draws
+/// (`saem_conddist_keep_samples = true`) as a wide CSV: one row per draw.
+///
+/// Columns: `ID, SAMPLE, <eta_names...>`. The analogue of Monolix's
+/// `simulatedRandomEffects.txt`. Returns `Err` if no samples were retained.
+pub fn write_conddist_samples_csv(result: &FitResult, path: &str) -> Result<(), String> {
+    let cd = result
+        .cond_dist
+        .as_ref()
+        .ok_or("fit has no conditional-distribution results (saem_conddist was not enabled)")?;
+    if cd.samples.iter().all(|s| s.is_empty()) {
+        return Err(
+            "no conditional-distribution draws retained (saem_conddist_keep_samples was false)"
+                .to_string(),
+        );
+    }
+
+    let mut wtr = csv::WriterBuilder::new()
+        .from_path(path)
+        .map_err(|e| format!("Failed to create {}: {}", path, e))?;
+    let mut header: Vec<String> = vec!["ID".into(), "SAMPLE".into()];
+    header.extend(result.eta_names.iter().cloned());
+    wtr.write_record(&header).map_err(|e| e.to_string())?;
+
+    for (i, subj) in result.subjects.iter().enumerate() {
+        let Some(draws) = cd.samples.get(i) else {
+            continue;
+        };
+        for (s, draw) in draws.iter().enumerate() {
+            let mut rec: Vec<String> = Vec::with_capacity(2 + draw.len());
+            rec.push(subj.id.clone());
+            rec.push((s + 1).to_string());
+            rec.extend(draw.iter().map(|&v| fmt_num(v)));
+            wtr.write_record(&rec).map_err(|e| e.to_string())?;
+        }
+    }
+
+    wtr.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Format a numeric cell for CSV output: NaN → empty (missing), else 6 dp.
 fn fmt_num(v: f64) -> String {
     if v.is_nan() {
@@ -1491,6 +1576,7 @@ mod tests {
             total_ebe_fallbacks: 0,
             covariance_status: CovarianceStatus::NotRequested,
             shrinkage_eta: Vec::new(),
+            cond_dist: None,
             shrinkage_eps: f64::NAN,
             iwres_lag1_r: f64::NAN,
             dw_statistic: f64::NAN,
@@ -1825,6 +1911,7 @@ mod tests {
             total_ebe_fallbacks: 0,
             covariance_status: CovarianceStatus::NotRequested,
             shrinkage_eta: Vec::new(),
+            cond_dist: None,
             shrinkage_eps: f64::NAN,
             iwres_lag1_r: f64::NAN,
             dw_statistic: f64::NAN,

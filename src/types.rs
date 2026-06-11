@@ -2469,6 +2469,32 @@ pub struct SubjectResult {
     pub compartment_states: Vec<Vec<f64>>,
 }
 
+/// Per-subject conditional distribution of the random effects, produced by the
+/// opt-in SAEM conditional-distribution pass (`saem_conddist = true`, #257).
+///
+/// All per-subject vectors are indexed in the same order as the fit's subjects.
+/// This is the SAEM analogue of saemix `conddist.saemix` / Monolix's
+/// "Conditional Distribution" task — the distribution `p(η_i | y_i; θ̂)` rather
+/// than just its mode (the EBE on `SubjectResult.eta`).
+#[derive(Debug, Clone)]
+pub struct CondDist {
+    /// Conditional mean of η per subject: `cond_mean[i]` has length `n_eta`.
+    pub cond_mean: Vec<Vec<f64>>,
+    /// Conditional SD of η per subject (sample SD over the retained draws).
+    pub cond_sd: Vec<Vec<f64>>,
+    /// Retained draws per subject: `samples[i]` is `nsamp × n_eta`. Empty for
+    /// every subject unless `saem_conddist_keep_samples` was set.
+    pub samples: Vec<Vec<Vec<f64>>>,
+    /// Distribution-based η-shrinkage per eta:
+    /// `1 - SD_over_subjects(cond_mean[·][j]) / sqrt(Ω_jj)`. `NaN` when there
+    /// are fewer than two subjects.
+    pub shrinkage: Vec<f64>,
+    /// Number of retained draws per subject (after burn-in).
+    pub nsamp: usize,
+    /// Burn-in sweeps discarded before accumulation.
+    pub burnin: usize,
+}
+
 // ── Derived expression types ──────────────────────────────────────────────────
 
 /// Context threaded into every [derived] expression evaluation.
@@ -3044,8 +3070,14 @@ pub struct FitResult {
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,
     /// ETA shrinkage per random effect: `1 - SD(eta_hat_k) / sqrt(omega_kk)`.
-    /// `NaN` when `omega_kk` is zero.
+    /// `NaN` when `omega_kk` is zero. Computed from the conditional **mode**
+    /// (EBE); for the distribution-based counterpart see
+    /// `cond_dist.shrinkage`.
     pub shrinkage_eta: Vec<f64>,
+    /// Per-subject conditional distribution of the random effects from the
+    /// opt-in SAEM conditional-distribution pass. `Some` only when
+    /// `method = saem` and `saem_conddist = true`; `None` otherwise (#257).
+    pub cond_dist: Option<CondDist>,
     /// EPS shrinkage: `1 - SD(IWRES)`.  `NaN` when fewer than 2 valid residuals.
     pub shrinkage_eps: f64,
     /// Pooled lag-1 Pearson correlation of IWRES across subjects.

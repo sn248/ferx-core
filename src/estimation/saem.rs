@@ -2228,6 +2228,30 @@ pub fn run_saem(
         None
     };
 
+    // ---- Post-fit conditional-distribution pass (opt-in, #257) ----
+    // Characterise each subject's p(η_i | y_i; θ̂) by MCMC at the fixed
+    // population parameters, warm-started from the EBE mode (`eta_hats`).
+    let cond_dist = if options.saem_conddist {
+        if verbose {
+            eprintln!(
+                "Running SAEM conditional-distribution pass ({} samples/subject, {} burn-in)...",
+                options.saem_conddist_nsamp, options.saem_conddist_burnin
+            );
+        }
+        Some(
+            crate::estimation::saem_conddist::run_conditional_distribution(
+                model,
+                population,
+                &final_params,
+                &eta_hats,
+                &final_kappas,
+                options,
+            ),
+        )
+    } else {
+        None
+    };
+
     Ok(OuterResult {
         params: final_params,
         ofv,
@@ -2247,6 +2271,7 @@ pub fn run_saem(
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
+        cond_dist,
     })
 }
 

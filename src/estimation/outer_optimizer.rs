@@ -2181,9 +2181,14 @@ fn covariance_method_label(m: CovarianceMethod) -> &'static str {
 ///   - `CrossProduct` → `S⁻¹`            (empirical information)
 ///   - `Sandwich`     → `R⁻¹ S R⁻¹`      (Huber–White, robust)
 ///
-/// Returns `None` only for `CrossProduct` when `S` is singular (it shares the
-/// Hessian's eigenvalue-floor inversion). `Sandwich` never inverts `S`, so it is
-/// defined even when `S` is rank-deficient.
+/// Returns `None` only for `CrossProduct`, when `S` is not strictly
+/// positive-definite — singular *or* merely rank-deficient (fewer subjects than
+/// free parameters, or collinear scores). Unlike the Hessian path, a
+/// rank-deficient `S` is **rejected** rather than eigenvalue-floored: `S⁻¹` of a
+/// regularised `S` would silently report finite-but-fictitious SEs in the
+/// unidentified directions, so the cross-product estimator requires a full-rank
+/// `S`. `Sandwich` never inverts `S`, so it stays defined even when `S` is
+/// rank-deficient.
 fn combine_covariance(
     method: CovarianceMethod,
     r_inv: DMatrix<f64>,
@@ -2192,7 +2197,12 @@ fn combine_covariance(
     match method {
         CovarianceMethod::Hessian => Some(r_inv),
         CovarianceMethod::Sandwich => Some(&r_inv * s * &r_inv),
-        CovarianceMethod::CrossProduct => invert_psd_with_floor(s).map(|inv| inv.inverse),
+        // Accept S⁻¹ only when S is full-rank (no eigenvalues clipped); a
+        // rank-deficient or indefinite S yields `None`.
+        CovarianceMethod::CrossProduct => match invert_psd_with_floor(s) {
+            Some(inv) if inv.n_clipped == 0 => Some(inv.inverse),
+            _ => None,
+        },
     }
 }
 
@@ -2668,9 +2678,10 @@ pub(crate) fn compute_covariance(
             Some(c) => c,
             None => {
                 return CovarianceStepResult::Unusable(
-                    "Covariance step failed: the score cross-product matrix S is singular \
-                     (covariance_method = s); typically fewer subjects than free parameters. \
-                     SE estimates not available."
+                    "Covariance step failed: the score cross-product matrix S is singular or \
+                     rank-deficient (covariance_method = s); typically fewer subjects than free \
+                     parameters, or collinear per-subject scores. Use covariance_method = r or \
+                     rsr. SE estimates not available."
                         .to_string(),
                 );
             }
@@ -2686,7 +2697,11 @@ pub(crate) fn compute_covariance(
 
     let mut cov_warnings: Vec<String> = Vec::new();
 
-    if inv.n_clipped > 0 {
+    // The Hessian eigenvalue-floor warning is about `R`. It is relevant only when
+    // the returned covariance actually uses `R⁻¹` (Hessian and sandwich); the
+    // cross-product path returns `S⁻¹` (with a full-rank `S` guaranteed above), so
+    // a clipped `R` there would be a misleading note about a matrix it didn't use.
+    if inv.n_clipped > 0 && options.covariance_method != CovarianceMethod::CrossProduct {
         let pct = inv.n_clipped * 100 / n_free.max(1);
         // Informal thresholds: ≤33 % clipped → minor concern; 34–50 % → caution; >50 % → unreliable.
         // Note: integer truncation means the boundary moves in steps of 1/n_free; for small

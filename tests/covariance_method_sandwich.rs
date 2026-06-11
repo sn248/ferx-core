@@ -208,8 +208,10 @@ fn covariance_method_rsr_rejects_foce_without_interaction() {
         "rsr under non-interaction FOCE must fail the covariance step, not return a matrix"
     );
     assert!(
-        r.warnings.iter().any(|w| w.contains("requires FOCEI")),
-        "expected a `requires FOCEI` covariance warning, got: {:?}",
+        r.warnings
+            .iter()
+            .any(|w| w.contains("not yet validated for FOCE")),
+        "expected a `not yet validated for FOCE` covariance warning, got: {:?}",
         r.warnings
     );
 }

@@ -2123,6 +2123,15 @@ fn build_non_pd_fallback_proposal(
 /// Returns `(chosen_eps, n_halvings)`. If every halving fails (all stencils
 /// still non-finite at `initial_eps / 2^MAX_HALVINGS`), returns the final
 /// eps anyway — the FD loop will detect and report the remaining failures.
+///
+/// The probe is on the scalar-OFV second-difference stencil
+/// `(f₊ − 2·f₀ + f₋)/h²`, which is the exact stencil the IOV Hessian path uses.
+/// The non-IOV path instead assembles the Hessian from central differences of
+/// the analytical population gradient, so the OFV probe is a deliberate *proxy*
+/// there: it shares the same underlying model evaluations (an OFV overflow at a
+/// perturbation implies the gradient overflows too), is far cheaper than probing
+/// the gradient, and the gradient FD loop carries its own `is_finite()` guard as
+/// a backstop for the rare case the two disagree.
 fn select_fd_step<F: Fn(&[f64]) -> f64>(
     x_hat: &[f64],
     free_idx: &[usize],

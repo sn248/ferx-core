@@ -3351,6 +3351,27 @@ pub struct FitOptions {
     /// Clamped to `saem_n_exploration` at use. `0` disables the burn-in.
     pub saem_omega_burnin: usize,
     pub saem_seed: Option<u64>,
+    /// Run a post-fit conditional-distribution pass after SAEM converges.
+    ///
+    /// When `true`, after the population parameters are fixed the existing MH
+    /// kernels are re-run per subject (warm-started at the EBE mode) and the
+    /// draws are *accumulated* to estimate each subject's conditional mean and
+    /// SD of η — the analogue of saemix `conddist.saemix` / Monolix's
+    /// "Conditional Distribution" task. Default `false` (mode-only output,
+    /// unchanged behaviour). See `docs/src/estimation/saem.md` (#257).
+    pub saem_conddist: bool,
+    /// Number of retained MH sweeps per subject in the conditional-distribution
+    /// pass (after burn-in). Larger values tighten the conditional mean/SD
+    /// estimates at linear wall cost. Only used when `saem_conddist = true`.
+    pub saem_conddist_nsamp: usize,
+    /// Burn-in sweeps discarded before accumulation in the conditional-
+    /// distribution pass, to forget the EBE-mode warm start. Only used when
+    /// `saem_conddist = true`.
+    pub saem_conddist_burnin: usize,
+    /// Retain the raw per-subject draws (not just mean/SD) from the
+    /// conditional-distribution pass on the result. Adds
+    /// `n_subjects * nsamp * n_eta * 8` bytes; default `false`.
+    pub saem_conddist_keep_samples: bool,
     /// Number of leapfrog steps per HMC proposal in the SAEM E-step.
     /// `0` (default) uses the Metropolis-Hastings random-walk sampler.
     /// A positive value (e.g. `3`) enables HMC; requires an analytical PK
@@ -3709,6 +3730,10 @@ impl Default for FitOptions {
             saem_adapt_interval: 50,
             saem_omega_burnin: 20,
             saem_seed: None,
+            saem_conddist: false,
+            saem_conddist_nsamp: 50,
+            saem_conddist_burnin: 20,
+            saem_conddist_keep_samples: false,
             saem_n_leapfrog: 0,
             bayes_warmup: 1000,
             bayes_iters: 1000,
@@ -4123,6 +4148,11 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "saem_n_leapfrog",
             "adapt_interval",
             "omega_burnin",
+            "conddist",
+            "saem_conddist",
+            "conddist_nsamp",
+            "conddist_burnin",
+            "conddist_keep_samples",
             "seed",
             "saem_seed",
         ],

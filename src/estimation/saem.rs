@@ -46,7 +46,7 @@ pub(crate) const MSTEP_NLOPT_ALGORITHM: nlopt::Algorithm = nlopt::Algorithm::Bob
 /// that η collapses and the chain can no longer move it, so Ω must stay large
 /// enough to keep the random walk alive. 1e-6 keeps a free η explorable while
 /// being far below any plausible estimated variance.
-const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
+pub(crate) const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
 
 /// Target acceptance rate for the componentwise (1-D) eta kernel. The optimal
 /// scaling result for single-coordinate random-walk Metropolis is ≈0.44
@@ -233,7 +233,7 @@ pub(crate) fn mh_steps(
 /// sufficient statistic recovers the true correlation. See the
 /// `saem-block-omega-rank1-collapse` investigation.
 #[allow(clippy::too_many_arguments)]
-fn mh_steps_componentwise(
+pub(crate) fn mh_steps_componentwise(
     eta: &mut [f64],
     nll_current: f64,
     subject: &Subject,

@@ -18,3 +18,4 @@ rustc-ice-*.txt
 
 # Built mdBook output — generated and deployed by CI (.github/workflows/docs.yml)
 docs/book/
+bench_*.csv

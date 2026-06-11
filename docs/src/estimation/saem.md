@@ -196,12 +196,15 @@ Results are exposed on `FitResult.cond_dist` and written by the CLI to
 `{model}-conddist.csv` (`ID, ETA, COND_MEAN, COND_SD, COND_MODE`), with the raw
 draws in `{model}-conddist-samples.csv` when retained.
 
-### Validation against saemix
+### Validation against saemix and NONMEM
 
 On the bundled warfarin data (10 subjects, 1-cpt oral, log-normal CL/V/KA,
-proportional error), ferx and saemix converge to identical population parameters
-(TVCL 0.1327, TVV 7.737, TVKA 0.811) and their per-subject conditional
-distributions agree to within Monte-Carlo noise:
+proportional error), all three engines converge to identical population
+parameters (TVCL 0.1327, TVV 7.737, TVKA 0.811), and ferx's per-subject
+conditional distribution agrees with both references to within Monte-Carlo
+noise.
+
+**vs saemix** (`conddist.saemix`):
 
 | Quantity (per-subject η) | corr | max&#124;diff&#124; | RMSE |
 |---|---|---|---|
@@ -209,8 +212,17 @@ distributions agree to within Monte-Carlo noise:
 | conditional SD   | 0.9909 | 0.0023 | 0.0009 |
 | mode / MAP       | 1.0000 | 0.0002 | 0.0001 |
 
-(ferx `conddist_nsamp = 2000`; saemix `conddist.saemix(nsamp = 1)`. Comparison
-script: `bench_saemix_conddist.R`.)
+**vs NONMEM** (`$EST METHOD=SAEM` then `METHOD=IMP EONLY=1`; conditional moments
+read from the `.phi` file — `PHI(k) − log θ_k` is the η conditional mean,
+`sqrt(PHC(k,k))` the conditional SD):
+
+| Quantity (per-subject η) | corr | max&#124;diff&#124; | RMSE |
+|---|---|---|---|
+| conditional mean | 1.0000 | 0.0018 | 0.0006 |
+| conditional SD   | 0.9964 | 0.0015 | 0.0005 |
+
+(ferx `conddist_nsamp = 2000`. Comparison scripts: `bench_saemix_conddist.R`,
+`parse_nm_conddist.R`.)
 
 ## Inter-Occasion Variability (IOV)
 

@@ -183,6 +183,8 @@ Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vecto
 
 `s` and `rsr` are currently available for **FOCEI and IOV** fits. They require the per-subject score, whose Ω-prior term (`ηᵀΩ⁻¹η + log|Ω|`) is only consistent with the Hessian under interaction; FOCE / Sheiner–Beal support is a follow-up. Requesting `s`/`rsr` under non-interaction FOCE returns a clear covariance-step error rather than an inconsistent matrix.
 
+> **Validation status.** The `s` / `rsr` standard errors are not yet anchored to a NONMEM `$COV MATRIX=S` / `MATRIX=RSR` reference — the current cross-check (`tests/covariance_method_sandwich.rs`) only verifies internal consistency (`R ≈ S` at the MLE), so treat the absolute `s` / `rsr` SE values as provisional until that validation lands ([#250](https://github.com/FeRx-NLME/ferx-core/issues/250)). Note also that ferx defaults to `covariance_method = r` whereas NONMEM's `$COVARIANCE` default is the `rsr` sandwich; set `covariance_method = rsr` when reconciling SEs against a default NONMEM run.
+
 ### Hessian regularization
 
 Because the EBEs reconverge, the Hessian is positive-definite on well-conditioned surfaces and no regularization is needed. As a safety net for genuinely ill-conditioned or near-singular problems, ferx-core still inverts via a symmetric eigendecomposition and clips eigenvalues below `max(λ_max · 1e-10, 1e-12)` to that floor before reconstructing `H⁻¹`, adding a warning to `FitResult.warnings`:

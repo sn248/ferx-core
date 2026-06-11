@@ -2665,6 +2665,14 @@ pub(crate) fn compute_covariance(
     // Select the covariance estimator (NONMEM `$COV MATRIX=`). `R⁻¹` is the
     // model-based default; `S⁻¹` and `R⁻¹SR⁻¹` additionally need the per-subject
     // score cross-product `S = Σᵢ gᵢgᵢᵀ`.
+    //
+    // TODO(#250): the absolute scale of the `s` / `rsr` SEs is not yet anchored
+    // to a NONMEM `$COV MATRIX=S` / `RSR` run. The scaling is correct as written
+    // — `S` is on the −logL scale (`gᵢ = ∂(−logLᵢ)/∂θ`, no factor of 2), matching
+    // `R = ½·H_ofv` — but the slow-test consistency band [0.33, 3.0] cannot catch
+    // a constant 2×/4× rescale, so a tight NONMEM reference is still pending. #250
+    // also tracks the `s`-requires-PD-`R` limitation (this branch needs `r_inv`,
+    // computed above) and the `r`-vs-NONMEM-`rsr` default-mismatch doc note.
     let cov_free = if options.covariance_method == CovarianceMethod::Hessian {
         r_inv
     } else {

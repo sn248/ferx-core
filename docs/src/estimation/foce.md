@@ -183,7 +183,23 @@ Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vecto
 
 `s` and `rsr` are currently available for **FOCEI and IOV** fits. They require the per-subject score, whose Ω-prior term (`ηᵀΩ⁻¹η + log|Ω|`) is only consistent with the Hessian under interaction; FOCE / Sheiner–Beal support is a follow-up. Requesting `s`/`rsr` under non-interaction FOCE returns a clear covariance-step error rather than an inconsistent matrix.
 
-> **Validation status.** The `s` / `rsr` standard errors are not yet anchored to a NONMEM `$COV MATRIX=S` / `MATRIX=RSR` reference — the current cross-check (`tests/covariance_method_sandwich.rs`) only verifies internal consistency (`R ≈ S` at the MLE), so treat the absolute `s` / `rsr` SE values as provisional until that validation lands ([#250](https://github.com/FeRx-NLME/ferx-core/issues/250)). Note also that ferx defaults to `covariance_method = r` whereas NONMEM's `$COVARIANCE` default is the `rsr` sandwich; set `covariance_method = rsr` when reconciling SEs against a default NONMEM run.
+#### NONMEM cross-check (S / RSR)
+
+Same warfarin FOCEI fit as the `MATRIX=R` table above, with two additional NONMEM covariance runs (`$COVARIANCE MATRIX=S` and `MATRIX=RSR`); SEs are the `.ext` `ITERATION = -1000000001` row ([#266](https://github.com/FeRx-NLME/ferx-core/issues/266)):
+
+| Parameter | ferx `s` | NONMEM `MATRIX=S` | rel. diff | ferx `rsr` | NONMEM `MATRIX=RSR` | rel. diff |
+|-----------|----------|-------------------|-----------|------------|---------------------|-----------|
+| TVCL      | 0.01031  | 0.00930 | +10.9% | 0.00742 | 0.00710 | +4.6% |
+| TVV       | 0.4250   | 0.4602  | −7.7%  | 0.2418  | 0.2403  | +0.6% |
+| TVKA      | 0.2157   | 0.2268  | −4.9%  | 0.1555  | 0.1487  | +4.5% |
+| PROP_ERR (SD) | 0.001519 | 0.001545 | −1.7% | 0.000790 | 0.000796 | −0.7% |
+| ω²(CL)    | 0.02005  | 0.01764 | +13.7% | 0.01170 | 0.01093 | +7.1% |
+| ω²(V)     | 0.007139 | 0.008287 | −13.9% | 0.003699 | 0.003978 | −7.0% |
+| ω²(KA)    | 0.2265   | 0.2596  | −12.8% | 0.1311  | 0.1396  | −6.1% |
+
+(`ci`/FD build.) The `s` cross-product matches NONMEM within ~14% and `rsr` within ~7% — note the `s` SEs are uniformly larger than `r`/`rsr` here, because with only 10 subjects the score outer-product is a noisy information estimate (the model-equality `R ≈ S` is exact only asymptotically). Guarded by `covariance_se_matches_nonmem_s_rsr` in `tests/covariance_method_sandwich.rs` (20% band for `s`, 15% for `rsr`). The per-subject score `S` is on the `−logL` (NLL) scale and, unlike `R`, carries no factor of two; the close `s` agreement confirms that scaling is correct.
+
+Note that ferx defaults to `covariance_method = r` whereas NONMEM's `$COVARIANCE` default is the `rsr` sandwich; set `covariance_method = rsr` when reconciling SEs against a default NONMEM run.
 
 ### Hessian regularization
 

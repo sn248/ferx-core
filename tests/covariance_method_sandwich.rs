@@ -5,10 +5,11 @@
 //! that the per-subject score cross-product `S` assembles, that all three
 //! estimators produce finite positive SEs, and that the FOCE guard fires.
 //!
-//! NONMEM `$COV MATRIX=S` / `MATRIX=RSR` reference values are a follow-up (they
-//! need a dedicated NONMEM run); the sanity anchor here is the information-matrix
-//! equality — at the MLE of a well-specified model `R ≈ S`, so the `s` and `rsr`
-//! SEs land within the same order of magnitude as the `r` SEs.
+//! `covariance_se_matches_nonmem_s_rsr` anchors the `s` / `rsr` SEs to a
+//! dedicated NONMEM 7.5.1 `$COV MATRIX=S` / `MATRIX=RSR` run (#266); the older
+//! `covariance_methods_produce_consistent_ses_on_warfarin` keeps the
+//! information-matrix sanity anchor (`R ≈ S` at the MLE) as a build-independent
+//! cross-check that the estimators assemble at all.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::{
@@ -103,6 +104,77 @@ fn covariance_methods_produce_consistent_ses_on_warfarin() {
                 (0.33..=3.0).contains(&ratio),
                 "covariance_method={name}: SE[{k}] = {a:.4e} differs from R-matrix {r:.4e} \
                  by ratio {ratio:.2} (outside [0.33, 3.0]) — likely an assembly bug"
+            );
+        }
+    }
+}
+
+/// NONMEM-anchored `s` / `rsr` SE cross-check (#266).
+///
+/// Warfarin FOCEI (`$EST METHOD=1 INTER`) on `data/warfarin.csv`, two extra
+/// covariance runs added to the existing `MATRIX=R` reference:
+///   - `$COVARIANCE MATRIX=S`   → `S⁻¹` SEs (`covariance_method = s`)
+///   - `$COVARIANCE MATRIX=RSR` → `R⁻¹SR⁻¹` SEs (`covariance_method = rsr`)
+///
+/// SEs are the `.ext` row at `ITERATION = -1000000001`, in the order
+/// [TVCL, TVV, TVKA, PROP_SD, ωCL, ωV, ωKA]; ω are variance-scale, PROP_ERR is
+/// the proportional-SD THETA(4) (SD-scale), matching ferx's `se_sigma[0]`.
+///
+/// Bands: the `s` cross-product is the noisiest estimator (a 10-subject
+/// outer-product info matrix), so it gets the same 20% band as the R-matrix
+/// reference (`warfarin_covariance_nonmem.rs`); on the `ci`/FD build ferx lands
+/// within ~14%. The `rsr` sandwich tracks R closely (ferx within ~7%), so it is
+/// held to 15%. A factor-of-2 error in the score scale would push the `s` SEs
+/// ~29–41% off systematically — well outside these bands (issue #266 note).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored s/rsr covariance SE cross-check (#266): opt in with --features slow-tests"
+)]
+fn covariance_se_matches_nonmem_s_rsr() {
+    let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+
+    // NONMEM 7.5.1 FOCEI SEs (.ext, ITER=-1000000001), order
+    // [TVCL, TVV, TVKA, PROP_SD, ωCL, ωV, ωKA].
+    let nm_s = [
+        9.29659e-3, 4.60240e-1, 2.26835e-1, 1.54472e-3, 1.76426e-2, 8.28678e-3, 2.59564e-1,
+    ];
+    let nm_rsr = [
+        7.09785e-3, 2.40313e-1, 1.48728e-1, 7.96181e-4, 1.09264e-2, 3.97787e-3, 1.39645e-1,
+    ];
+    let names = [
+        "TVCL", "TVV", "TVKA", "PROP_ERR", "omega_CL", "omega_V", "omega_KA",
+    ];
+
+    let ferx_ses = |m: CovarianceMethod| {
+        let r = fit(&model, &pop, &model.default_params, &warfarin_focei_opts(m))
+            .unwrap_or_else(|e| panic!("{m:?} fit failed: {e}"));
+        assert_eq!(
+            r.covariance_status,
+            CovarianceStatus::Computed,
+            "{m:?}: covariance must be Computed"
+        );
+        let t = r.se_theta.expect("theta SEs");
+        let om = r.se_omega.expect("omega SEs");
+        let s = r.se_sigma.expect("sigma SEs");
+        [t[0], t[1], t[2], s[0], om[0], om[1], om[2]]
+    };
+
+    for (method, nm, tol) in [
+        (CovarianceMethod::CrossProduct, &nm_s, 0.20),
+        (CovarianceMethod::Sandwich, &nm_rsr, 0.15),
+    ] {
+        let ferx = ferx_ses(method);
+        for ((name, &f), &n) in names.iter().zip(ferx.iter()).zip(nm.iter()) {
+            let rel = (f - n).abs() / n;
+            assert!(
+                f.is_finite() && rel < tol,
+                "{method:?} SE({name}) = {f:.6e} vs NONMEM {n:.6e} — relative diff \
+                 {:.1}% exceeds {:.0}% band",
+                rel * 100.0,
+                tol * 100.0
             );
         }
     }

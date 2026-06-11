@@ -2317,11 +2317,13 @@ pub(crate) fn compute_covariance(
         ));
     }
     // Fail fast on a covariance_method that needs the per-subject score `S` for
-    // FOCE (non-interaction). After #249 removed the separately-added omega_terms
-    // from the FOCE covariance OFV, the SB per-subject score is internally
-    // consistent with the corrected FOCE R-matrix — so the math holds. The guard
-    // is kept as a conservative "not yet validated" gate until a NONMEM
-    // `$COV MATRIX=S`/`RSR` FOCE reference is available to anchor the SEs (#250).
+    // FOCE (non-interaction). The FOCEI `s`/`rsr` SEs are NONMEM-anchored (#266:
+    // warfarin FOCEI matches `$COV MATRIX=S`/`RSR` within ~14%/~7%), so the
+    // estimator scale is validated *under interaction*. FOCE stays gated: after
+    // #249 removed the separately-added omega_terms the SB score is internally
+    // consistent with the corrected FOCE R-matrix, but no NONMEM `MATRIX=S`/`RSR`
+    // *FOCE* reference yet anchors that absolute scale (#250), so it remains a
+    // conservative "not yet validated" gate.
     if options.covariance_method != CovarianceMethod::Hessian && !options.interaction {
         return CovarianceStepResult::Unusable(format!(
             "covariance_method = {} is not yet validated for FOCE (non-interaction); \

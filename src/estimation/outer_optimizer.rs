@@ -2316,15 +2316,16 @@ pub(crate) fn compute_covariance(
             initial_eps
         ));
     }
-    // Fail fast on a covariance_method that needs the per-subject score cross
-    // product `S` but whose score is inconsistent with the Hessian: the FOCE /
-    // Sheiner–Beal score omits the Ω prior (ηᵀΩ⁻¹η + log|Ω|) that the covariance
-    // OFV adds separately, so `S` would not match `R`. Only FOCEI/Laplace (and
-    // IOV) carry that prior in the marginal. Reject before doing any Hessian work.
+    // Fail fast on a covariance_method that needs the per-subject score `S` for
+    // FOCE (non-interaction). After #249 removed the separately-added omega_terms
+    // from the FOCE covariance OFV, the SB per-subject score is internally
+    // consistent with the corrected FOCE R-matrix — so the math holds. The guard
+    // is kept as a conservative "not yet validated" gate until a NONMEM
+    // `$COV MATRIX=S`/`RSR` FOCE reference is available to anchor the SEs (#250).
     if options.covariance_method != CovarianceMethod::Hessian && !options.interaction {
         return CovarianceStepResult::Unusable(format!(
-            "covariance_method = {} requires FOCEI (interaction); it is not yet supported for \
-             FOCE / Sheiner–Beal. Use covariance_method = r, or set method = focei.",
+            "covariance_method = {} is not yet validated for FOCE (non-interaction); \
+             use covariance_method = r, or set method = focei.",
             covariance_method_label(options.covariance_method),
         ));
     }
@@ -2676,8 +2677,7 @@ pub(crate) fn compute_covariance(
     let cov_free = if options.covariance_method == CovarianceMethod::Hessian {
         r_inv
     } else {
-        // S/RSR: the non-interaction FOCE case was already rejected at entry (the
-        // per-subject score is only Ω-prior-consistent under interaction).
+        // S/RSR: non-interaction FOCE was rejected at entry (not yet validated, see guard above).
         let s_free = assemble_score_cross_product(
             x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
             &free_idx,

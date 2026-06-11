@@ -7,6 +7,9 @@ target
 *-fit.yaml
 *-sdtab.csv
 *-timing.txt
+*-conddist.csv
+*-conddist-samples.csv
+*-covtab.csv
 
 # Rust compiler crash dumps
 rustc-ice-*.txt

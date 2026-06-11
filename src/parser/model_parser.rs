@@ -3011,6 +3011,19 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             };
         }
+        "covariance_method" => {
+            opts.covariance_method = match value.to_lowercase().as_str() {
+                "r" | "hessian" => crate::types::CovarianceMethod::Hessian,
+                "s" | "cross_product" => crate::types::CovarianceMethod::CrossProduct,
+                "rsr" | "sandwich" => crate::types::CovarianceMethod::Sandwich,
+                other => {
+                    return Err(format!(
+                        "fit option `covariance_method`: unknown value `{other}` — \
+                         expected r/s/rsr"
+                    ));
+                }
+            };
+        }
         "fd_hessian_step" => {
             let v = parse_f64("fd_hessian_step")?;
             if v <= 0.0 || !v.is_finite() {
@@ -9301,6 +9314,28 @@ mod tests {
         // Invalid value returns error
         let err = parse_fit_options(&["covariance_fallback = hmc".to_string()]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_parse_covariance_method() {
+        use crate::types::CovarianceMethod;
+        // default
+        let def = parse_fit_options(&[]).unwrap();
+        assert_eq!(def.covariance_method, CovarianceMethod::Hessian);
+        // r / s / rsr (and the long-form aliases), case-insensitive
+        for (input, expected) in [
+            ("r", CovarianceMethod::Hessian),
+            ("hessian", CovarianceMethod::Hessian),
+            ("S", CovarianceMethod::CrossProduct),
+            ("cross_product", CovarianceMethod::CrossProduct),
+            ("RSR", CovarianceMethod::Sandwich),
+            ("sandwich", CovarianceMethod::Sandwich),
+        ] {
+            let opts = parse_fit_options(&[format!("covariance_method = {input}")]).unwrap();
+            assert_eq!(opts.covariance_method, expected, "input `{input}`");
+        }
+        // invalid
+        assert!(parse_fit_options(&["covariance_method = bhhh".to_string()]).is_err());
     }
 
     // ── mu-referencing pattern detection ─────────────────────────────────

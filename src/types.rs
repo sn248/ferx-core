@@ -1835,6 +1835,25 @@ pub enum CovarianceFallback {
     Sir,
 }
 
+/// Which estimator to use for the parameter covariance matrix, mirroring
+/// NONMEM's `$COVARIANCE MATRIX=` options. All three share the same FD Hessian
+/// `R` (the observed information) and per-subject score cross-product
+/// `S = Σᵢ gᵢgᵢᵀ`; they differ only in how those are combined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CovarianceMethod {
+    /// `R⁻¹` — inverse observed-information (Hessian) matrix. The model-based
+    /// covariance; assumes the model is correctly specified (default, NONMEM
+    /// `MATRIX=R`).
+    #[default]
+    Hessian,
+    /// `S⁻¹` — inverse cross-product (outer-product-of-gradients) matrix. The
+    /// empirical-information covariance (NONMEM `MATRIX=S`).
+    CrossProduct,
+    /// `R⁻¹ S R⁻¹` — the Huber–White "sandwich". Robust to model
+    /// mis-specification; NONMEM's default (`MATRIX=RSR`).
+    Sandwich,
+}
+
 /// Severity level for a structured warning entry.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum WarningSeverity {
@@ -2323,6 +2342,11 @@ pub struct FitOptions {
     /// [`CovarianceFallback::Sir`] runs SIR with a fallback proposal covariance
     /// built from the rectified (`|eigenvalue|`) Hessian, inflated 4×.
     pub covariance_fallback: CovarianceFallback,
+    /// Which covariance estimator to assemble, mirroring NONMEM `$COV MATRIX=`.
+    /// Default [`CovarianceMethod::Hessian`] (`R⁻¹`). [`CovarianceMethod::CrossProduct`]
+    /// (`S⁻¹`) and [`CovarianceMethod::Sandwich`] (`R⁻¹SR⁻¹`) add the per-subject
+    /// score cross-product `S`; currently supported for FOCEI and IOV fits.
+    pub covariance_method: CovarianceMethod,
     pub interaction: bool,
     pub verbose: bool,
     pub optimizer: Optimizer,
@@ -2555,6 +2579,7 @@ impl Default for FitOptions {
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
+            covariance_method: CovarianceMethod::Hessian,
             interaction: true,
             verbose: true,
             // BOBYQA — derivative-free quadratic trust-region. Chosen as the

@@ -174,6 +174,24 @@ Standard errors should be interpreted with care.
 
 SEs in the regularised directions are inflated (since `1/λ_clipped` is larger than the would-be true `1/λ`). With the reconverging covariance step this warning should now be rare; if it fires, the surface is genuinely near-identifiable and the SEs in those directions warrant scrutiny. A Hessian whose spectrum is genuinely indefinite — every eigenvalue ≤ 0 — still fails outright with the standard `Covariance step failed` message.
 
+### SIR fallback for non-PD Hessians
+
+When a model is poorly identified or converges to a saddle point, the FD Hessian can have every free-block eigenvalue ≤ 0, making Hessian inversion impossible. Setting `covariance_fallback = sir` triggers a SIR (Sampling Importance Resampling) run instead of leaving the covariance step as failed:
+
+```
+[fit_options]
+  covariance_fallback = sir
+```
+
+ferx-core constructs a proposal covariance by taking the absolute values of the Hessian eigenvalues, inflating by 4× (heavier tails to account for the non-PD correction), and running the same SIR sampler used by `sir = true`. The result is reported as 95% credible intervals in the fit YAML; `covariance_status` is set to `sir_fallback`.
+
+Use this option when:
+- The Hessian is non-PD at convergence due to model mis-specification or weak identifiability
+- You want distributional uncertainty estimates without re-fitting with a more constrained model
+- You need to proceed to a downstream analysis despite a non-PD Hessian
+
+The SIR fallback inherits all `sir_*` settings (`sir_samples`, `sir_df`, `sir_resamples`, etc.) from `[fit_options]`.
+
 ## Convergence
 
 The outer loop terminates when any of:

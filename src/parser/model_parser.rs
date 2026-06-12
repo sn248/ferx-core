@@ -1681,6 +1681,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             }
         }
         if !mu_ref_disabled.is_empty() {
+            // NOTE: `resolve_gradient_method` (estimation/inner_optimizer.rs)
+            // also keys off the "conditional parameter(s)" substring in this
+            // warning to route conditional-ETA models to FD (the analytical AD
+            // kernels can't represent if-branches). Keep the phrase stable, or
+            // update both sites. Guarded by the `if_expression_ad_matches_fd`
+            // integration test.
             model.parse_warnings.push(format!(
                 "Mu-referencing disabled for conditional parameter(s): {}. \
                  Assign TV* unconditionally and apply the if-block to the individual \

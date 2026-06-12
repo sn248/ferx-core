@@ -182,6 +182,54 @@ pub(crate) fn resolve_gradient_method(
         if !want_ad {
             return InnerGradientMethod::Fd;
         }
+        // Non-log-normal ETA parameterisation. Every analytical AD kernel
+        // (single-snapshot `ad_gradients` and event-driven `event_driven_ad`)
+        // hardcodes the log-normal map `param = tv * exp(dot(sel, eta))` and
+        // ignores `EtaParamType`. An additive (`tv + eta`), logit
+        // (`inv_logit(... + eta)`), or custom/unrecognised parameterisation
+        // therefore gets the wrong `exp()` gradient — inconsistent with the
+        // objective the inner loop minimises, which evaluates the real
+        // individual-parameter expressions. FD differentiates those expressions
+        // directly, so route any non-log-normal ETA model to FD. See issue #278.
+        if model
+            .eta_param_info
+            .iter()
+            .any(|e| e.param_type != EtaParamType::LogNormal)
+        {
+            return InnerGradientMethod::Fd;
+        }
+        // Log-transform-both-sides (LTBS / `log_additive`, `log(DV) ~ ...`).
+        // The analytical single-snapshot AD kernel's `+100` log-wrap produces a
+        // d log(f)/deta Jacobian that diverges from the FD reference (issue
+        // #278): on well-conditioned data the error is small, but on
+        // ill-conditioned fits it drives the optimiser to a spurious
+        // variance-collapsed optimum with an OFV far below the true minimum.
+        // Until the kernel is corrected, route LTBS models to FD. (ODE models
+        // are already FD via the `tv_fn.is_none()` guard above, so this only
+        // affects analytical models.)
+        if model.log_transform {
+            return InnerGradientMethod::Fd;
+        }
+        // Conditional individual-parameter expressions, e.g.
+        // `if (WT > 70) { CL = TVCL * (WT/70)^0.75 * exp(ETA_CL) } else { ... }`.
+        // Here the ETA is still log-normal (`* exp(ETA)`), so `eta_param_info`
+        // looks ordinary, but the parameter is assigned inside an `if`-branch.
+        // The analytical AD kernels can't represent that branch structure, and
+        // their gradient disagrees with the branch-aware objective the inner
+        // loop minimises (issue #278 — observed as a ~985 OFV gap on
+        // `warfarin_if`). The parser already flags such parameters while
+        // disabling mu-referencing for them, via a `parse_warnings` entry that
+        // names them "conditional parameter(s)"; reuse that signal. This
+        // coupling is held in sync by the `if_expression_ad_matches_fd`
+        // integration test. (TODO: promote to a structured `CompiledModel`
+        // flag to avoid depending on the warning text.)
+        if model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("conditional parameter"))
+        {
+            return InnerGradientMethod::Fd;
+        }
         // SS=1 doses in the AD paths would require threading `dose.ss` and
         // `dose.ii` through the AD-instrumented propagators and adding
         // closed-form SS branches inside them. Until that lands, fall back
@@ -1834,6 +1882,110 @@ mod iov_tests {
             resolve_gradient_method(&model, &infusion),
             InnerGradientMethod::Fd,
             "oral + infusion must route to FD (AD oral propagators are bolus-only)"
+        );
+    }
+
+    // The analytical AD kernels hardcode the log-normal map `param = tv*exp(eta)`
+    // and ignore `EtaParamType`. Additive / logit / custom ETAs therefore get a
+    // wrong gradient (issue #278) and must route to FD.
+    #[cfg(feature = "autodiff")]
+    #[test]
+    fn non_lognormal_eta_routes_to_fd() {
+        let mut model = make_iov_model();
+        model.tv_fn = Some(Box::new(
+            |_t: &[f64], _c: &std::collections::HashMap<String, f64>| vec![0.0, 0.0],
+        ));
+        model.pk_model = PkModel::OneCptOral;
+        let subj = make_iov_subject(); // oral bolus
+
+        // Empty eta_param_info (synthetic fixture) keeps the existing AD route.
+        assert_ne!(
+            resolve_gradient_method(&model, &subj),
+            InnerGradientMethod::Fd,
+            "log-normal / unspecified ETA must keep an AD route"
+        );
+
+        let mut info = crate::types::EtaParamInfo {
+            eta_name: "ETA_CL".into(),
+            param_type: crate::types::EtaParamType::LogNormal,
+            linked_theta: None,
+            individual_param_name: "CL".into(),
+        };
+        // Explicit LogNormal -> still AD.
+        model.eta_param_info = vec![info.clone()];
+        assert_ne!(
+            resolve_gradient_method(&model, &subj),
+            InnerGradientMethod::Fd,
+            "explicit LogNormal ETA must keep an AD route"
+        );
+        // Additive / Logit / LogitProbability / Custom -> FD.
+        for pt in [
+            crate::types::EtaParamType::Additive,
+            crate::types::EtaParamType::Logit,
+            crate::types::EtaParamType::LogitProbability,
+            crate::types::EtaParamType::Custom,
+        ] {
+            info.param_type = pt;
+            model.eta_param_info = vec![info.clone()];
+            assert_eq!(
+                resolve_gradient_method(&model, &subj),
+                InnerGradientMethod::Fd,
+                "non-log-normal ETA ({pt:?}) must route to FD"
+            );
+        }
+    }
+
+    // LTBS / log_additive: the analytical single-snapshot AD log-wrap diverges
+    // from the FD reference (issue #278), so log-transformed models route to FD.
+    #[cfg(feature = "autodiff")]
+    #[test]
+    fn ltbs_log_transform_routes_to_fd() {
+        let mut model = make_iov_model();
+        model.tv_fn = Some(Box::new(
+            |_t: &[f64], _c: &std::collections::HashMap<String, f64>| vec![0.0, 0.0],
+        ));
+        model.pk_model = PkModel::OneCptOral;
+        let subj = make_iov_subject();
+
+        assert_ne!(
+            resolve_gradient_method(&model, &subj),
+            InnerGradientMethod::Fd,
+            "non-LTBS oral bolus must keep an AD route"
+        );
+        model.log_transform = true;
+        assert_eq!(
+            resolve_gradient_method(&model, &subj),
+            InnerGradientMethod::Fd,
+            "LTBS (log_transform) must route to FD"
+        );
+    }
+
+    // Conditional individual-parameter expressions (`if (cov) { CL = ... }`)
+    // keep log-normal ETAs, so `eta_param_info` looks ordinary; the gate keys
+    // off the parser's "conditional parameter(s)" warning instead (issue #278).
+    #[cfg(feature = "autodiff")]
+    #[test]
+    fn conditional_param_routes_to_fd() {
+        let mut model = make_iov_model();
+        model.tv_fn = Some(Box::new(
+            |_t: &[f64], _c: &std::collections::HashMap<String, f64>| vec![0.0, 0.0],
+        ));
+        model.pk_model = PkModel::OneCptOral;
+        let subj = make_iov_subject();
+
+        assert_ne!(
+            resolve_gradient_method(&model, &subj),
+            InnerGradientMethod::Fd,
+            "no conditional warning -> AD route"
+        );
+        model.parse_warnings = vec!["Mu-referencing disabled for conditional parameter(s): CL. \
+             Assign TV* unconditionally and apply the if-block to the individual \
+             parameter expression to re-enable mu-referencing."
+            .to_string()];
+        assert_eq!(
+            resolve_gradient_method(&model, &subj),
+            InnerGradientMethod::Fd,
+            "conditional-parameter model must route to FD"
         );
     }
 }

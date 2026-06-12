@@ -55,6 +55,17 @@ section of the SDLC for the versioning policy).
   the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
 
 ### Fixed
+- Autodiff builds now fall back to finite differences for analytical models the
+  single-snapshot AD kernel cannot represent faithfully: non-log-normal ETAs
+  (additive / logit), conditional (`if`-branch) individual-parameter
+  expressions, and log-transform-both-sides (`log_additive`) error. The kernel
+  hardcodes the log-normal map `param = tv*exp(eta)` (and a log-wrap for LTBS),
+  so these previously produced inner gradients inconsistent with the objective -
+  a small bias on well-conditioned data, but on ill-conditioned FOCEI-INTER fits
+  a spurious variance-collapsed optimum with an OFV far below NONMEM's. FD-only
+  CI never exercised the AD path, so the divergence went undetected (surfaced by
+  an external NONMEM/OpenPMX/ferx benchmark, FeRx-NLME/ferx-r#154). The default
+  non-autodiff build was never affected (#278).
 - FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
   `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The
   covariance step had added the Ω prior (`η̂ᵀΩ⁻¹η̂ + log|Ω|`) on top of the

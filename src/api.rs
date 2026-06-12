@@ -1467,6 +1467,7 @@ pub(crate) fn compute_extra_output_columns(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
+    kappas_per_subject: &[Vec<DVector<f64>>],
     subjects: &mut [SubjectResult],
 ) {
     use crate::types::{AggFunction, DerivedContext, DerivedKind, IntegralStep, IntegralWindow};
@@ -1482,15 +1483,50 @@ pub(crate) fn compute_extra_output_columns(
         let eta_hat = sr.eta.as_slice();
         let n_obs = sr.ipred.len();
 
+        // Per-observation full eta vector [BSV η … | occasion κ …].
+        //
+        // `eta_hat` (= `sr.eta`) is BSV-only (length `n_eta`); for IOV models
+        // (`n_kappa > 0`) `pk_param_fn` and `[derived]` expressions expect the
+        // full `n_eta + n_kappa` vector, with the kappas belonging to *this
+        // observation's occasion*. Mirror `pk::predict_iov`'s occasion→kappa
+        // selection exactly so the post-fit derived/diagnostic columns use the
+        // same per-occasion kappa as the predictions that drove the fit. Without
+        // this the kappa slots silently read 0 for every observation (issue #238).
+        let subj_kappas: &[DVector<f64>] = kappas_per_subject
+            .get(si)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
+        let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(occ_groups.len());
+        for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
+            occ_to_k.insert(*occ_id, k);
+        }
+        let combined_for = |occ_id: u32| -> Vec<f64> {
+            let mut c = Vec::with_capacity(eta_hat.len() + model.n_kappa);
+            c.extend_from_slice(eta_hat);
+            if model.n_kappa > 0 {
+                match occ_to_k.get(&occ_id) {
+                    Some(&k) if k < subj_kappas.len() => {
+                        c.extend_from_slice(subj_kappas[k].as_slice())
+                    }
+                    _ => c.extend(std::iter::repeat_n(0.0, model.n_kappa)),
+                }
+            }
+            c
+        };
+        let per_obs_eta_full: Vec<Vec<f64>> = (0..n_obs)
+            .map(|j| combined_for(subject.occasions.get(j).copied().unwrap_or(0)))
+            .collect();
+
         // Per-observation PK params, indiv maps, TAFD, TAD
         let mut per_obs_cov: Vec<&HashMap<String, f64>> = Vec::with_capacity(n_obs);
         let mut per_obs_indiv: Vec<HashMap<String, f64>> = Vec::with_capacity(n_obs);
         let mut per_obs_tafd: Vec<f64> = Vec::with_capacity(n_obs);
         let mut per_obs_tad: Vec<f64> = Vec::with_capacity(n_obs);
 
-        for j in 0..n_obs {
+        for (j, eta_full) in per_obs_eta_full.iter().enumerate() {
             let cov_j = subject.obs_cov(j);
-            let pk_j = (model.pk_param_fn)(theta, eta_hat, cov_j);
+            let pk_j = (model.pk_param_fn)(theta, eta_full, cov_j);
             let lagtime = pk_j.lagtime();
             let indiv_j = build_indiv_map(&pk_j, &model.indiv_param_names, &model.pk_indices);
             let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, lagtime);
@@ -1625,7 +1661,7 @@ pub(crate) fn compute_extra_output_columns(
                             .collect();
                         let ctx = DerivedContext {
                             theta,
-                            eta: eta_hat,
+                            eta: &per_obs_eta_full[j],
                             indiv_params: &per_obs_indiv[j],
                             covariates: per_obs_cov[j],
                             ipred: sr.ipred[j],
@@ -1655,7 +1691,7 @@ pub(crate) fn compute_extra_output_columns(
                             .collect();
                         let ctx = DerivedContext {
                             theta,
-                            eta: eta_hat,
+                            eta: &per_obs_eta_full[j],
                             indiv_params: &per_obs_indiv[j],
                             covariates: per_obs_cov[j],
                             ipred: sr.ipred[j],
@@ -1733,7 +1769,7 @@ pub(crate) fn compute_extra_output_columns(
                                     .collect();
                                 let ctx = DerivedContext {
                                     theta,
-                                    eta: eta_hat,
+                                    eta: &per_obs_eta_full[j],
                                     indiv_params: &per_obs_indiv[j],
                                     covariates: per_obs_cov[j],
                                     ipred: sr.ipred[j],
@@ -1776,13 +1812,31 @@ pub(crate) fn compute_extra_output_columns(
                             })
                             .collect()
                     };
+                    // Per-session representative full eta vector (BSV η + the κ of
+                    // the session's first observation's occasion). Mirrors the
+                    // first-obs approximation used for session_grid_cov/indiv, so a
+                    // model-based integral over an IOV session uses that occasion's
+                    // κ rather than κ=0 (issue #238).
+                    let session_grid_eta_full: Vec<&[f64]> = if use_obs {
+                        vec![]
+                    } else {
+                        session_obs
+                            .iter()
+                            .map(|g| {
+                                g.first()
+                                    .map(|&j| per_obs_eta_full[j].as_slice())
+                                    .unwrap_or(eta_hat)
+                            })
+                            .collect()
+                    };
                     let session_grid_lagtime: Vec<f64> = if use_obs {
                         vec![]
                     } else {
                         session_grid_cov
                             .iter()
-                            .map(|cov| {
-                                let pk = (model.pk_param_fn)(theta, eta_hat, cov);
+                            .zip(session_grid_eta_full.iter())
+                            .map(|(cov, eta_full)| {
+                                let pk = (model.pk_param_fn)(theta, eta_full, cov);
                                 pk.lagtime()
                             })
                             .collect()
@@ -1811,6 +1865,7 @@ pub(crate) fn compute_extra_output_columns(
                         let grid_cov = session_grid_cov[session_idx];
                         let grid_lagtime = session_grid_lagtime[session_idx];
                         let indiv_s = &session_grid_indiv[session_idx];
+                        let grid_eta_full = session_grid_eta_full[session_idx];
                         let n_steps = match step {
                             IntegralStep::Fixed(s) => {
                                 let n = ((to - from) / s).ceil() as usize + 1;
@@ -1828,20 +1883,22 @@ pub(crate) fn compute_extra_output_columns(
                         // we evaluate the superposition formula at each grid point.
                         let grid_cmt_states: Vec<Vec<f64>> = if *uses_compartments {
                             if model.n_kappa > 0 {
-                                // IOV subjects: eta_hat is BSV-only (kappas zeroed); states
-                                // computed here would use kappa=0 regardless of the actual
-                                // occasion, producing finite but wrong values. Return empty
-                                // so every grid point evaluates to NaN, consistent with
-                                // per-obs compartment_states being empty for IOV subjects.
-                                // W_DERIVED_CMT_IOV_UNSUPPORTED explains why.
+                                // IOV subjects: a single fixed PK snapshot (one occasion's
+                                // kappa) cannot represent a dose history spanning multiple
+                                // occasions — the analytical superposition / single-pass
+                                // solve here would mix occasions and be silently wrong
+                                // (the same reason predict_iov uses the event-driven path).
+                                // Return empty so every grid point evaluates to NaN,
+                                // consistent with per-obs compartment_states being empty
+                                // for IOV subjects. W_DERIVED_CMT_IOV_UNSUPPORTED explains why.
                                 vec![]
                             } else if let Some(ref ode) = model.ode_spec {
-                                let pk_j = (model.pk_param_fn)(theta, eta_hat, grid_cov);
+                                let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov);
                                 crate::ode::ode_dense_solve_states(
                                     ode,
                                     &pk_j.values,
                                     theta,
-                                    eta_hat,
+                                    grid_eta_full,
                                     subject,
                                     &grid_times,
                                 )
@@ -1862,7 +1919,7 @@ pub(crate) fn compute_extra_output_columns(
                                 // W_DERIVED_CMT_TV_ANALYTICAL warning.
                                 vec![]
                             } else {
-                                let pk_j = (model.pk_param_fn)(theta, eta_hat, grid_cov);
+                                let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov);
                                 crate::pk::analytical_state_at_times(
                                     model.pk_model,
                                     subject,
@@ -1942,7 +1999,7 @@ pub(crate) fn compute_extra_output_columns(
                                 };
                                 let ctx = DerivedContext {
                                     theta,
-                                    eta: eta_hat,
+                                    eta: grid_eta_full,
                                     indiv_params: indiv_s,
                                     covariates: grid_cov,
                                     ipred: nearest_ipred,
@@ -2465,7 +2522,13 @@ fn fit_inner(
     // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
     // (with individual lagtime) for the mandatory TAD column in output.rs.
     if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_lagtime() {
-        compute_extra_output_columns(model, population, &result.params.theta, &mut subjects);
+        compute_extra_output_columns(
+            model,
+            population,
+            &result.params.theta,
+            &result.kappas,
+            &mut subjects,
+        );
     }
 
     let n_obs = population.n_obs();
@@ -6224,7 +6287,7 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(6)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         let expected = vec![0.0, 1.0, 4.0, 0.0, 1.0, 4.0];
         for (j, (&got, &exp)) in col.iter().zip(expected.iter()).enumerate() {
@@ -6269,7 +6332,7 @@ mod tests_derived_session_clock {
         // ipred peak is at j=4 (shifted t=6, raw t=1) which should give tmax=1.
         sr.ipred = vec![1.0, 2.0, 1.5, 0.5, 3.0, 1.0];
         let mut subjects_results = vec![sr];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // All entries should be 1.0 (raw time of peak at j=4).
         for &v in col {
@@ -6313,7 +6376,7 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(6)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // Expected AUC = 8.0 for every row in each session.
         for (j, &v) in col.iter().enumerate() {
@@ -6364,7 +6427,7 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(6)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // All obs land in the raw-clock window [0,5); all three per-session
         // points contribute → AUC=8.0 for every row.
@@ -6423,13 +6486,252 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(3)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // AUC = trapezoid([(0,0),(1,1),(4,4)]) = 8.0
         for &v in col {
             assert!(
                 (v - 8.0).abs() < 1e-12,
                 "Single-session AUC should be 8.0, got {v}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_derived_iov_kappa {
+    //! Regression tests for issue #238: `compute_extra_output_columns` must
+    //! thread each observation's **occasion** kappa into `pk_param_fn` and into
+    //! `DerivedContext.eta`, instead of silently using a BSV-only eta vector
+    //! (kappas → 0). Both the individual-parameter map (driving `[derived]`
+    //! expressions and `[output]` columns) and `ctx.eta` are checked.
+
+    use super::*;
+    use crate::types::{
+        BloqMethod, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind, ErrorModel,
+        ErrorSpec, GradientMethod, IndivParamPartials, ModelParameters, OmegaMatrix, PkModel,
+        PkParams, Population, ScalingSpec, SigmaVector, Subject,
+    };
+    use nalgebra::DVector;
+    use std::collections::HashMap;
+
+    /// 1-cpt IV model with one BSV eta (`ETA_CL`) and one IOV kappa
+    /// (`KAPPA_CL`). CL = 10 · exp(κ); the kappa is read from `eta[1]` with a
+    /// `.get(1)` guard, so the *broken* (BSV-only) path would read κ=0 → CL=10
+    /// for every observation, while the fix yields the per-occasion CL.
+    fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
+        CompiledModel {
+            name: "test_iov_kappa".into(),
+            pk_model: PkModel::OneCptIv,
+            error_model: ErrorModel::Additive,
+            error_spec: ErrorSpec::Single(ErrorModel::Additive),
+            pk_param_fn: Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| {
+                let kappa = eta.get(1).copied().unwrap_or(0.0);
+                let mut p = PkParams::default();
+                p.values[0] = 10.0 * kappa.exp(); // CL slot
+                p
+            }),
+            n_theta: 0,
+            n_eta: 1,
+            n_epsilon: 1,
+            n_kappa: 1,
+            kappa_names: vec!["KAPPA_CL".into()],
+            theta_names: Vec::new(),
+            eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into()],
+            indiv_param_partials: IndivParamPartials::empty(),
+            default_params: ModelParameters {
+                theta: Vec::new(),
+                theta_names: Vec::new(),
+                theta_lower: Vec::new(),
+                theta_upper: Vec::new(),
+                theta_fixed: Vec::new(),
+                omega: OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]),
+                omega_fixed: vec![false],
+                sigma: SigmaVector {
+                    values: vec![0.1],
+                    names: vec!["ERR".into()],
+                },
+                sigma_fixed: vec![false],
+                omega_iov: Some(OmegaMatrix::from_diagonal(&[1.0], vec!["KAPPA_CL".into()])),
+                kappa_fixed: vec![false],
+            },
+            omega_init_as_sd: vec![false],
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: vec![false],
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: Some(Box::new(|_t, _c| vec![])),
+            pk_indices: vec![0],
+            eta_map: Vec::new(),
+            pk_idx_f64: Vec::new(),
+            sel_flat: Vec::new(),
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
+            derived_exprs,
+            output_columns: Vec::new(),
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Subject with two occasions: obs 0,1 on occasion 1; obs 2,3 on occasion 2.
+    fn two_occasion_subject() -> Subject {
+        Subject {
+            id: "S1".into(),
+            doses: Vec::new(),
+            obs_times: vec![0.0, 1.0, 2.0, 3.0],
+            obs_raw_times: vec![0.0, 1.0, 2.0, 3.0],
+            observations: vec![1.0; 4],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    fn sr_iov(n_obs: usize) -> SubjectResult {
+        SubjectResult {
+            id: "S1".into(),
+            eta: DVector::from_vec(vec![0.0]), // BSV η = 0 so CL is driven purely by κ
+            ipred: vec![1.0; n_obs],
+            pred: vec![1.0; n_obs],
+            iwres: vec![0.0; n_obs],
+            cwres: vec![0.0; n_obs],
+            ofv_contribution: 0.0,
+            cens: vec![0; n_obs],
+            n_obs,
+            extra_columns: Vec::new(),
+            per_obs_tad: Vec::new(),
+            compartment_states: Vec::new(),
+        }
+    }
+
+    /// Both the indiv-param map (CL, via `pk_param_fn`) and `ctx.eta` must carry
+    /// the per-observation occasion kappa. With κ₁ = ln 2 (occasion 1) and
+    /// κ₂ = ln 3 (occasion 2), CL = 10·exp(κ) = [20, 20, 30, 30] and the kappa
+    /// exposed through `ctx.eta[1]` = [ln2, ln2, ln3, ln3]. The pre-fix code
+    /// produced CL = 10 for every row (κ silently 0).
+    #[test]
+    fn derived_and_indiv_use_per_occasion_kappa() {
+        let ln2 = 2.0_f64.ln();
+        let ln3 = 3.0_f64.ln();
+
+        let derived_exprs = vec![
+            // CL_OUT exercises the pk_param_fn call that builds per_obs_indiv.
+            DerivedExprSpec {
+                name: "CL_OUT".into(),
+                kind: DerivedKind::PerRow {
+                    eval: Box::new(|ctx: &DerivedContext| {
+                        ctx.indiv_params.get("CL").copied().unwrap_or(f64::NAN)
+                    }),
+                },
+                uses_compartments: false,
+            },
+            // K_OUT exercises DerivedContext.eta threading (eta[1] = occasion κ).
+            DerivedExprSpec {
+                name: "K_OUT".into(),
+                kind: DerivedKind::PerRow {
+                    eval: Box::new(|ctx: &DerivedContext| ctx.eta.get(1).copied().unwrap_or(-1.0)),
+                },
+                uses_compartments: false,
+            },
+        ];
+
+        let model = minimal_iov_model(derived_exprs);
+        let population = Population {
+            subjects: vec![two_occasion_subject()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        // ebe_kappas[subject][occasion]; occasion order matches split_obs_by_occasion
+        // (first-seen): occasion 1 → index 0 (κ=ln2), occasion 2 → index 1 (κ=ln3).
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![
+            DVector::from_vec(vec![ln2]),
+            DVector::from_vec(vec![ln3]),
+        ]];
+        let mut subjects_results = vec![sr_iov(4)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let cols = &subjects_results[0].extra_columns;
+        let cl = &cols.iter().find(|(n, _)| n == "CL_OUT").unwrap().1;
+        let kout = &cols.iter().find(|(n, _)| n == "K_OUT").unwrap().1;
+
+        let expected_cl = [20.0, 20.0, 30.0, 30.0];
+        let expected_k = [ln2, ln2, ln3, ln3];
+        for (j, (&got, &exp)) in cl.iter().zip(expected_cl.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-9,
+                "CL_OUT[{j}] (occasion {}): got {got}, expected {exp}",
+                if j < 2 { 1 } else { 2 }
+            );
+        }
+        for (j, (&got, &exp)) in kout.iter().zip(expected_k.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-12,
+                "ctx.eta[1] at obs {j}: got {got}, expected occasion κ {exp}"
+            );
+        }
+    }
+
+    /// Defensive path: when a subject's kappa vector is missing (e.g. fewer
+    /// occasion entries than occasions seen), the kappa slots fall back to 0
+    /// rather than panicking — CL collapses to the κ=0 value (10).
+    #[test]
+    fn missing_kappa_falls_back_to_zero() {
+        let derived_exprs = vec![DerivedExprSpec {
+            name: "CL_OUT".into(),
+            kind: DerivedKind::PerRow {
+                eval: Box::new(|ctx: &DerivedContext| {
+                    ctx.indiv_params.get("CL").copied().unwrap_or(f64::NAN)
+                }),
+            },
+            uses_compartments: false,
+        }];
+        let model = minimal_iov_model(derived_exprs);
+        let population = Population {
+            subjects: vec![two_occasion_subject()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        // Empty kappas for the subject → every occasion lookup misses → κ=0.
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]];
+        let mut subjects_results = vec![sr_iov(4)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let cl = &subjects_results[0].extra_columns[0].1;
+        for (j, &v) in cl.iter().enumerate() {
+            assert!(
+                (v - 10.0).abs() < 1e-9,
+                "CL_OUT[{j}] with missing kappa should fall back to κ=0 → 10, got {v}"
             );
         }
     }

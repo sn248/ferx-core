@@ -239,10 +239,14 @@ fn parse_nonmem_cl_reference(path: &Path) -> BTreeMap<(String, u32), f64> {
     out
 }
 
+// NOT `#[ignore]`d: this runs in PR CI via the `test` job's dedicated NONMEM
+// cross-check step (`cargo test --test warfarin_iov_nonmem`), since the per-PR
+// `cargo test --lib` does not build integration tests. The reference fixture
+// (tests/nonmem/warfarin_iov_cl_reference.csv) is committed and the FIXed-MLE
+// fit is sub-second. Part B no-ops with a clear message only if that fixture is
+// somehow absent; with it present (the committed state) the cross-engine
+// comparison runs and gates the PR.
 #[test]
-#[ignore = "NONMEM-anchored per-occasion CL cross-check (issue #238): asserts the sdtab CL \
-            column carries each observation's occasion kappa; Part B needs \
-            tests/nonmem/warfarin_iov_cl_reference.csv (see module docs)"]
 fn iov_individual_cl_matches_nonmem() {
     // examples/warfarin_iov.ferx structural model, parameters FIXed at NONMEM's
     // MLE, with CL/V/KA echoed as [output] columns so the post-fit per-occasion

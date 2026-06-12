@@ -1418,7 +1418,21 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
 
 /// Compute TAFD (time after first dose) and TAD (time after last dose,
 /// SS-aware) for observation index `obs_idx` of `subject`.
-pub fn tafd_tad_for_subject(subject: &Subject, obs_idx: usize, lagtime: f64) -> (f64, f64) {
+///
+/// `dose_lagtimes[d]` is the absorption lag for dose `d`, evaluated with that
+/// dose's occasion kappa (see [`crate::pk::predict_iov`]). Each dose's effective
+/// arrival is `dose.time + dose_lagtimes[d]`, so under IOV-on-lag a dose given in
+/// one occasion is shifted by its *own* lag rather than the observation's — which
+/// matters for the most-recent-dose pick when occasions have different lags (e.g.
+/// BID dosing spanning two occasions). Missing entries (`dose_lagtimes` shorter
+/// than `subject.doses`, or `&[]`) default to a zero lag, so callers with no
+/// IOV-on-lag can pass `&[]`. TAFD is unaffected — it is measured from the raw
+/// first-dose time, not the lagged arrival.
+pub fn tafd_tad_for_subject(
+    subject: &Subject,
+    obs_idx: usize,
+    dose_lagtimes: &[f64],
+) -> (f64, f64) {
     let obs_time = subject.obs_times[obs_idx];
 
     let first_dose_time = subject.occasion_first_dose_time(obs_time);
@@ -1431,14 +1445,19 @@ pub fn tafd_tad_for_subject(subject: &Subject, obs_idx: usize, lagtime: f64) -> 
     let last_dose_eff = subject
         .doses
         .iter()
-        .filter(|d| d.time + lagtime <= obs_time + 1e-12)
-        .map(|d| {
-            if d.ss && d.ii > 0.0 {
-                let elapsed = obs_time - (d.time + lagtime);
-                obs_time - elapsed.rem_euclid(d.ii)
-            } else {
-                d.time + lagtime
+        .enumerate()
+        .filter_map(|(d, dose)| {
+            let lag = dose_lagtimes.get(d).copied().unwrap_or(0.0);
+            if dose.time + lag > obs_time + 1e-12 {
+                return None;
             }
+            let eff = if dose.ss && dose.ii > 0.0 {
+                let elapsed = obs_time - (dose.time + lag);
+                obs_time - elapsed.rem_euclid(dose.ii)
+            } else {
+                dose.time + lag
+            };
+            Some(eff)
         })
         .fold(f64::NEG_INFINITY, f64::max);
     let tad = if last_dose_eff.is_finite() {
@@ -1536,6 +1555,21 @@ pub(crate) fn compute_extra_output_columns(
             .map(|j| combined_for(subject.occasions.get(j).copied().unwrap_or(0)))
             .collect();
 
+        // Per-dose absorption lag, each evaluated with that dose's occasion kappa
+        // (mirrors predict_iov's per-dose PK params). TAD shifts every dose by its
+        // own lag, so a dose given in one occasion is not mis-shifted by the
+        // observation's occasion lag — matters only when the lag carries IOV and
+        // dosing spans occasions (e.g. BID across two occasions). Computed once per
+        // subject (dose-indexed, not obs-indexed); for non-IOV every entry equals
+        // the single lag, leaving TAD unchanged.
+        let dose_lagtimes: Vec<f64> = (0..subject.doses.len())
+            .map(|d| {
+                let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
+                let eta_d = combined_for(occ);
+                (model.pk_param_fn)(theta, &eta_d, subject.dose_cov(d)).lagtime()
+            })
+            .collect();
+
         // Per-observation PK params, indiv maps, TAFD, TAD
         let mut per_obs_cov: Vec<&HashMap<String, f64>> = Vec::with_capacity(n_obs);
         let mut per_obs_indiv: Vec<HashMap<String, f64>> = Vec::with_capacity(n_obs);
@@ -1545,9 +1579,8 @@ pub(crate) fn compute_extra_output_columns(
         for (j, eta_full) in per_obs_eta_full.iter().enumerate() {
             let cov_j = subject.obs_cov(j);
             let pk_j = (model.pk_param_fn)(theta, eta_full, cov_j);
-            let lagtime = pk_j.lagtime();
             let indiv_j = build_indiv_map(&pk_j, &model.indiv_param_names, &model.pk_indices);
-            let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, lagtime);
+            let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, &dose_lagtimes);
             per_obs_cov.push(cov_j);
             per_obs_indiv.push(indiv_j);
             per_obs_tafd.push(tafd_j);

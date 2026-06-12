@@ -72,11 +72,13 @@ section of the SDLC for the versioning policy).
   silently treating every kappa as zero. Post-fit diagnostic columns that depend
   on a κ-varying parameter (e.g. `CL`, `V`, `KA`) were wrong for IOV subjects;
   the fitted estimates, OFV, and IPRED/IWRES were unaffected (#238).
-- IOV models with inter-occasion variability on the **absorption lag**: the
-  `sdtab` TAD column now shifts each dose by its own occasion's lag, rather than
-  applying the observation's occasion lag to every dose. This only changed TAD
-  when the lag carries IOV and dosing spans occasions (e.g. BID across two
-  occasions); models without IOV-on-lag are unaffected (follow-up to #238).
+- The `sdtab` TAD column now shifts each dose by **its own** absorption lag —
+  evaluated with that dose's occasion kappa and that dose's covariate snapshot —
+  rather than applying the observation's lag to every dose. This changes TAD only
+  when the absorption lag varies across doses, i.e. when it carries IOV (kappa) or
+  depends on a time-varying covariate, *and* dosing spans the differing values
+  (e.g. BID across two occasions); models with a constant lag are unaffected
+  (follow-up to #238).
 - FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
   `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The
   covariance step had added the Ω prior (`η̂ᵀΩ⁻¹η̂ + log|Ω|`) on top of the

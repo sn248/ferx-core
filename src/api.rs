@@ -6638,9 +6638,9 @@ mod tests_derived_iov_kappa {
 
     use super::*;
     use crate::types::{
-        BloqMethod, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind, ErrorModel,
-        ErrorSpec, GradientMethod, IndivParamPartials, ModelParameters, OmegaMatrix, PkModel,
-        PkParams, Population, ScalingSpec, SigmaVector, Subject,
+        BloqMethod, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind, DoseEvent,
+        ErrorModel, ErrorSpec, GradientMethod, IndivParamPartials, ModelParameters, OmegaMatrix,
+        PkModel, PkParams, Population, ScalingSpec, SigmaVector, Subject, PK_IDX_LAGTIME,
     };
     use nalgebra::DVector;
     use std::collections::HashMap;
@@ -6864,5 +6864,81 @@ mod tests_derived_iov_kappa {
                 "CL_OUT[{j}] with missing kappa should fall back to κ=0 → 10, got {v}"
             );
         }
+    }
+
+    /// Caller-level regression for the per-dose-occasion absorption lag
+    /// (follow-up to #238). `compute_extra_output_columns` must build TAD using
+    /// each *dose's* occasion lag, not the observation's. The model puts IOV on
+    /// the lag (`lag = 1.0 + κ`); a subject is dosed BID across two occasions:
+    ///   morning dose @0  (occasion 1, κ=0.0 → lag 1.0)
+    ///   evening dose @12 (occasion 2, κ=0.5 → lag 1.5)
+    /// with observations @2 (occ 1) and @13 (occ 2). At obs @13 the evening dose
+    /// arrives at 13.5 — not yet absorbed — so TAD counts from the morning dose's
+    /// arrival at 1.0 → 12.0. Applying the obs-occasion lag (1.5) to every dose,
+    /// as before this follow-up, would give 11.5.
+    #[test]
+    fn tad_uses_per_dose_occasion_lag() {
+        let mut model = minimal_iov_model(vec![]);
+        // Drive the absorption lag (slot PK_IDX_LAGTIME) from the occasion kappa.
+        model.pk_param_fn = Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| {
+            let kappa = eta.get(1).copied().unwrap_or(0.0);
+            let mut p = PkParams::default();
+            p.values[PK_IDX_LAGTIME] = 1.0 + kappa;
+            p
+        });
+
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![2.0, 13.0],
+            obs_raw_times: vec![2.0, 13.0],
+            observations: vec![1.0, 1.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 2],
+            dose_occasions: vec![1, 2],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        // ebe_kappas in split_obs_by_occasion order: occ 1 → idx 0 (κ=0.0),
+        // occ 2 → idx 1 (κ=0.5).
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![
+            DVector::from_vec(vec![0.0]),
+            DVector::from_vec(vec![0.5]),
+        ]];
+        let mut subjects_results = vec![sr_iov(2)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let tad = &subjects_results[0].per_obs_tad;
+        assert!(
+            (tad[0] - 1.0).abs() < 1e-9,
+            "obs@2 TAD: morning dose arrives @1.0 → 1.0, got {}",
+            tad[0]
+        );
+        assert!(
+            (tad[1] - 12.0).abs() < 1e-9,
+            "obs@13 TAD must be 12.0 (evening dose uses its own occ-2 lag 1.5 → arrives \
+             @13.5, excluded; counts from morning @1.0). The pre-follow-up obs-occasion \
+             lag would give 11.5. Got {}",
+            tad[1]
+        );
     }
 }

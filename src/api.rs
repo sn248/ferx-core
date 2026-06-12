@@ -1416,37 +1416,62 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
     diags
 }
 
-/// Compute TAFD (time after first dose) and TAD (time after last dose,
-/// SS-aware) for observation index `obs_idx` of `subject`.
-pub fn tafd_tad_for_subject(subject: &Subject, obs_idx: usize, lagtime: f64) -> (f64, f64) {
-    let obs_time = subject.obs_times[obs_idx];
+/// Time after the most recent **absorbed** dose at time `t` (SS-aware), shifting
+/// each dose by its own lag from `dose_lagtimes`. Missing entries — a slice
+/// shorter than `subject.doses`, or `&[]` — default to zero lag. Returns NaN when
+/// no dose has been absorbed by `t`. Shared by the per-observation TAD column and
+/// the model-based integral grid so both apply identical per-dose-lag logic.
+fn tad_at_time(subject: &Subject, t: f64, dose_lagtimes: &[f64]) -> f64 {
+    let last_dose_eff = subject
+        .doses
+        .iter()
+        .enumerate()
+        .filter_map(|(d, dose)| {
+            let lag = dose_lagtimes.get(d).copied().unwrap_or(0.0);
+            if dose.time + lag > t + 1e-12 {
+                return None;
+            }
+            let eff = if dose.ss && dose.ii > 0.0 {
+                let elapsed = t - (dose.time + lag);
+                t - elapsed.rem_euclid(dose.ii)
+            } else {
+                dose.time + lag
+            };
+            Some(eff)
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    if last_dose_eff.is_finite() {
+        t - last_dose_eff
+    } else {
+        f64::NAN
+    }
+}
 
+/// Compute TAFD (time after first dose) and TAD (time after last dose, SS-aware)
+/// for observation index `obs_idx` of `subject`.
+///
+/// `dose_lagtimes[d]` is the absorption lag for dose `d`, evaluated with that
+/// dose's occasion kappa and covariate snapshot (see [`crate::pk::predict_iov`]).
+/// Each dose's effective arrival is `dose.time + dose_lagtimes[d]`, so under a lag
+/// that varies across doses — IOV on the lag, or a time-varying covariate — a dose
+/// given in one occasion is shifted by its *own* lag rather than the observation's,
+/// which matters for the most-recent-dose pick (e.g. BID dosing spanning two
+/// occasions). Missing entries default to zero lag, so callers with no lag can
+/// pass `&[]`. TAFD is unaffected — measured from the raw first-dose time, not the
+/// lagged arrival.
+pub fn tafd_tad_for_subject(
+    subject: &Subject,
+    obs_idx: usize,
+    dose_lagtimes: &[f64],
+) -> (f64, f64) {
+    let obs_time = subject.obs_times[obs_idx];
     let first_dose_time = subject.occasion_first_dose_time(obs_time);
     let tafd = if first_dose_time.is_finite() {
         obs_time - first_dose_time
     } else {
         f64::NAN
     };
-
-    let last_dose_eff = subject
-        .doses
-        .iter()
-        .filter(|d| d.time + lagtime <= obs_time + 1e-12)
-        .map(|d| {
-            if d.ss && d.ii > 0.0 {
-                let elapsed = obs_time - (d.time + lagtime);
-                obs_time - elapsed.rem_euclid(d.ii)
-            } else {
-                d.time + lagtime
-            }
-        })
-        .fold(f64::NEG_INFINITY, f64::max);
-    let tad = if last_dose_eff.is_finite() {
-        obs_time - last_dose_eff
-    } else {
-        f64::NAN
-    };
-
+    let tad = tad_at_time(subject, obs_time, dose_lagtimes);
     (tafd, tad)
 }
 
@@ -1536,6 +1561,27 @@ pub(crate) fn compute_extra_output_columns(
             .map(|j| combined_for(subject.occasions.get(j).copied().unwrap_or(0)))
             .collect();
 
+        // Per-dose absorption lag, each evaluated with that dose's occasion kappa
+        // and covariate snapshot (mirrors predict_iov's per-dose PK params). TAD
+        // shifts every dose by its own lag, so a dose given in one occasion is not
+        // mis-shifted by the observation's lag — matters when the lag varies across
+        // doses (IOV on the lag, or a time-varying covariate) and dosing spans the
+        // differing values (e.g. BID across two occasions). Computed once per
+        // subject (dose-indexed). Skipped entirely when the model declares no lag:
+        // `dose_lagtimes` stays empty and `tad_at_time` falls back to zero lag,
+        // so the common no-lag case pays nothing for this per-dose pass.
+        let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
+            (0..subject.doses.len())
+                .map(|d| {
+                    let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
+                    let eta_d = combined_for(occ);
+                    (model.pk_param_fn)(theta, &eta_d, subject.dose_cov(d)).lagtime()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Per-observation PK params, indiv maps, TAFD, TAD
         let mut per_obs_cov: Vec<&HashMap<String, f64>> = Vec::with_capacity(n_obs);
         let mut per_obs_indiv: Vec<HashMap<String, f64>> = Vec::with_capacity(n_obs);
@@ -1545,9 +1591,8 @@ pub(crate) fn compute_extra_output_columns(
         for (j, eta_full) in per_obs_eta_full.iter().enumerate() {
             let cov_j = subject.obs_cov(j);
             let pk_j = (model.pk_param_fn)(theta, eta_full, cov_j);
-            let lagtime = pk_j.lagtime();
             let indiv_j = build_indiv_map(&pk_j, &model.indiv_param_names, &model.pk_indices);
-            let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, lagtime);
+            let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, &dose_lagtimes);
             per_obs_cov.push(cov_j);
             per_obs_indiv.push(indiv_j);
             per_obs_tafd.push(tafd_j);
@@ -1847,18 +1892,6 @@ pub(crate) fn compute_extra_output_columns(
                             })
                             .collect()
                     };
-                    let session_grid_lagtime: Vec<f64> = if use_obs {
-                        vec![]
-                    } else {
-                        session_grid_cov
-                            .iter()
-                            .zip(session_grid_eta_full.iter())
-                            .map(|(cov, eta_full)| {
-                                let pk = (model.pk_param_fn)(theta, eta_full, cov);
-                                pk.lagtime()
-                            })
-                            .collect()
-                    };
                     let session_grid_indiv: Vec<HashMap<String, f64>> = if use_obs {
                         vec![]
                     } else {
@@ -1881,7 +1914,6 @@ pub(crate) fn compute_extra_output_columns(
                     // expressions referencing TIME see the internal clock, not raw TIME.
                     let eval_integral_grid = |from: f64, to: f64, session_idx: usize| -> f64 {
                         let grid_cov = session_grid_cov[session_idx];
-                        let grid_lagtime = session_grid_lagtime[session_idx];
                         let indiv_s = &session_grid_indiv[session_idx];
                         let grid_eta_full = session_grid_eta_full[session_idx];
                         let n_steps = match step {
@@ -1961,26 +1993,11 @@ pub(crate) fn compute_extra_output_columns(
                                         f64::NAN
                                     }
                                 };
-                                let tad_k = {
-                                    let last_dose_eff = subject
-                                        .doses
-                                        .iter()
-                                        .filter(|d| d.time + grid_lagtime <= t + 1e-12)
-                                        .map(|d| {
-                                            if d.ss && d.ii > 0.0 {
-                                                let elapsed = t - (d.time + grid_lagtime);
-                                                t - elapsed.rem_euclid(d.ii)
-                                            } else {
-                                                d.time + grid_lagtime
-                                            }
-                                        })
-                                        .fold(f64::NEG_INFINITY, f64::max);
-                                    if last_dose_eff.is_finite() {
-                                        t - last_dose_eff
-                                    } else {
-                                        f64::NAN
-                                    }
-                                };
+                                // Same per-dose-lag TAD as the per-observation column
+                                // (shared `tad_at_time`), so a `[derived]` integral over
+                                // TAD agrees with the `sdtab` TAD column under IOV/TV-cov
+                                // lag — not the old session-representative scalar lag.
+                                let tad_k = tad_at_time(subject, t, &dose_lagtimes);
                                 // Nearest IPRED from this session's observations only.
                                 let nearest_ipred = session_obs[session_idx]
                                     .iter()
@@ -6605,9 +6622,9 @@ mod tests_derived_iov_kappa {
 
     use super::*;
     use crate::types::{
-        BloqMethod, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind, ErrorModel,
-        ErrorSpec, GradientMethod, IndivParamPartials, ModelParameters, OmegaMatrix, PkModel,
-        PkParams, Population, ScalingSpec, SigmaVector, Subject,
+        BloqMethod, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind, DoseEvent,
+        ErrorModel, ErrorSpec, GradientMethod, IndivParamPartials, ModelParameters, OmegaMatrix,
+        PkModel, PkParams, Population, ScalingSpec, SigmaVector, Subject, PK_IDX_LAGTIME,
     };
     use nalgebra::DVector;
     use std::collections::HashMap;
@@ -6831,5 +6848,150 @@ mod tests_derived_iov_kappa {
                 "CL_OUT[{j}] with missing kappa should fall back to κ=0 → 10, got {v}"
             );
         }
+    }
+
+    /// Caller-level regression for the per-dose-occasion absorption lag
+    /// (follow-up to #238). `compute_extra_output_columns` must build TAD using
+    /// each *dose's* occasion lag, not the observation's. The model puts IOV on
+    /// the lag (`lag = 1.0 + κ`); a subject is dosed BID across two occasions:
+    ///   morning dose @0  (occasion 1, κ=0.0 → lag 1.0)
+    ///   evening dose @12 (occasion 2, κ=0.5 → lag 1.5)
+    /// with observations @2 (occ 1) and @13 (occ 2). At obs @13 the evening dose
+    /// arrives at 13.5 — not yet absorbed — so TAD counts from the morning dose's
+    /// arrival at 1.0 → 12.0. Applying the obs-occasion lag (1.5) to every dose,
+    /// as before this follow-up, would give 11.5.
+    #[test]
+    fn tad_uses_per_dose_occasion_lag() {
+        let mut model = minimal_iov_model(vec![]);
+        // Declare an absorption lag (ALAG → PK_IDX_LAGTIME) so `model.has_lagtime()`
+        // holds; compute_extra_output_columns only builds per-dose lags for models
+        // that declare a lag.
+        model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
+        model.pk_indices = vec![0, PK_IDX_LAGTIME];
+        // Drive the absorption lag (slot PK_IDX_LAGTIME) from the occasion kappa.
+        model.pk_param_fn = Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| {
+            let kappa = eta.get(1).copied().unwrap_or(0.0);
+            let mut p = PkParams::default();
+            p.values[PK_IDX_LAGTIME] = 1.0 + kappa;
+            p
+        });
+
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![2.0, 13.0],
+            obs_raw_times: vec![2.0, 13.0],
+            observations: vec![1.0, 1.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 2],
+            dose_occasions: vec![1, 2],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        // ebe_kappas in split_obs_by_occasion order: occ 1 → idx 0 (κ=0.0),
+        // occ 2 → idx 1 (κ=0.5).
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![
+            DVector::from_vec(vec![0.0]),
+            DVector::from_vec(vec![0.5]),
+        ]];
+        let mut subjects_results = vec![sr_iov(2)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let tad = &subjects_results[0].per_obs_tad;
+        assert!(
+            (tad[0] - 1.0).abs() < 1e-9,
+            "obs@2 TAD: morning dose arrives @1.0 → 1.0, got {}",
+            tad[0]
+        );
+        assert!(
+            (tad[1] - 12.0).abs() < 1e-9,
+            "obs@13 TAD must be 12.0 (evening dose uses its own occ-2 lag 1.5 → arrives \
+             @13.5, excluded; counts from morning @1.0). The pre-follow-up obs-occasion \
+             lag would give 11.5. Got {}",
+            tad[1]
+        );
+    }
+
+    /// Caller-level regression: the per-dose lag uses each dose's *covariate*
+    /// snapshot (`dose_cov`), not the observation's — so a lag depending on a
+    /// time-varying covariate is shifted by conditions at dosing, matching
+    /// `predict_iov`. Lag = `LAGCOV`: the dose sees `LAGCOV=1` (lag 1.0), the
+    /// observation sees `LAGCOV=5` (lag 5.0). With a dose @0 and obs @3, the dose
+    /// covariate gives arrival @1.0 → TAD 2.0; the obs covariate would push arrival
+    /// to @5.0 (after the obs) → TAD NaN. Asserting TAD = 2.0 proves `dose_cov` is
+    /// used. (No IOV here — this isolates the covariate basis, not kappa.)
+    #[test]
+    fn tad_lag_uses_dose_covariate_not_obs() {
+        let mut model = minimal_iov_model(vec![]);
+        model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
+        model.pk_indices = vec![0, PK_IDX_LAGTIME];
+        // Lag = LAGCOV covariate (time-varying); independent of eta/kappa.
+        model.pk_param_fn = Box::new(|_theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
+            let mut p = PkParams::default();
+            p.values[PK_IDX_LAGTIME] = cov.get("LAGCOV").copied().unwrap_or(0.0);
+            p
+        });
+
+        let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
+        let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![3.0],
+            obs_raw_times: vec![3.0],
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: vec![cov_dose],
+            obs_covariates: vec![cov_obs],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: vec!["LAGCOV".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![DVector::from_vec(vec![0.0])]];
+        let mut subjects_results = vec![sr_iov(1)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let tad = &subjects_results[0].per_obs_tad;
+        assert!(
+            (tad[0] - 2.0).abs() < 1e-9,
+            "TAD must use the dose covariate (LAGCOV=1 → lag 1.0 → arrival @1.0 → TAD 2.0); \
+             the obs covariate (LAGCOV=5) would push arrival to @5.0 (after the obs) → NaN. \
+             Got {}",
+            tad[0]
+        );
     }
 }

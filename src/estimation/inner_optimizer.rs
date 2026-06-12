@@ -159,6 +159,60 @@ fn lagtime_depends_on_eta(model: &CompiledModel) -> bool {
         })
 }
 
+/// Model-level features the analytical AD inner-gradient kernels can't represent
+/// faithfully, forcing the inner loop onto finite differences. Returns
+/// `Some(reason)` when the model is AD-unsafe, `None` when the analytical
+/// AD fast-path is valid.
+///
+/// The kernels (`ad_gradients`, `event_driven_ad`) hardcode the log-normal map
+/// `param = tv * exp(dot(sel, eta))` and a `+100` log-wrap for LTBS; anything
+/// outside that mould yields an inner gradient inconsistent with the objective
+/// the inner loop minimises (issue #278).
+///
+/// This predicate is deliberately **independent of `feature = "autodiff"`** so
+/// the routing decision is unit-testable in the FD-only `ci` build — the build
+/// that, by never exercising the AD path, let these gaps regress in the first
+/// place. The numerical AD-vs-FD *agreement* still needs an Enzyme build (see
+/// `tests/autodiff_fd_consistency.rs`).
+#[cfg_attr(not(feature = "autodiff"), allow(dead_code))]
+pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'static str> {
+    // Non-log-normal ETA: additive (`tv + eta`), logit (`inv_logit(... + eta)`),
+    // logit-probability, or custom/unrecognised. The kernels apply `exp(eta)`
+    // unconditionally and ignore `EtaParamType`.
+    if model
+        .eta_param_info
+        .iter()
+        .any(|e| e.param_type != EtaParamType::LogNormal)
+    {
+        return Some("non-log-normal ETA parameterisation");
+    }
+    // Log-transform-both-sides (`log_additive`, `log(DV) ~ ...`). The `+100`
+    // log-wrap Jacobian diverges from the FD reference: small on well-conditioned
+    // data, but on ill-conditioned FOCEI-INTER fits it drives a spurious
+    // variance-collapsed optimum (the symptom that surfaced this, ferx-r#154).
+    if model.log_transform {
+        return Some("log-transform-both-sides (LTBS) error model");
+    }
+    // Conditional individual-parameter expressions, e.g.
+    // `if (WT > 70) { CL = TVCL * (WT/70)^0.75 * exp(ETA_CL) } else { ... }`.
+    // The ETA stays log-normal so `eta_param_info` looks ordinary, but the
+    // parameter is assigned inside an `if`-branch the analytical kernels can't
+    // represent. The parser already flags these while disabling mu-referencing,
+    // via a `parse_warnings` entry naming them "conditional parameter(s)"; reuse
+    // that signal. (TODO: promote to a structured `CompiledModel` flag to avoid
+    // depending on the warning text. Held in sync by the
+    // `if_expression_ad_matches_fd` integration test and the
+    // `conditional_param_routes_to_fd` unit test.)
+    if model
+        .parse_warnings
+        .iter()
+        .any(|w| w.contains("conditional parameter"))
+    {
+        return Some("conditional (if-branch) individual-parameter expression");
+    }
+    None
+}
+
 pub(crate) fn resolve_gradient_method(
     model: &CompiledModel,
     subject: &Subject,
@@ -182,52 +236,13 @@ pub(crate) fn resolve_gradient_method(
         if !want_ad {
             return InnerGradientMethod::Fd;
         }
-        // Non-log-normal ETA parameterisation. Every analytical AD kernel
-        // (single-snapshot `ad_gradients` and event-driven `event_driven_ad`)
-        // hardcodes the log-normal map `param = tv * exp(dot(sel, eta))` and
-        // ignores `EtaParamType`. An additive (`tv + eta`), logit
-        // (`inv_logit(... + eta)`), or custom/unrecognised parameterisation
-        // therefore gets the wrong `exp()` gradient — inconsistent with the
-        // objective the inner loop minimises, which evaluates the real
-        // individual-parameter expressions. FD differentiates those expressions
-        // directly, so route any non-log-normal ETA model to FD. See issue #278.
-        if model
-            .eta_param_info
-            .iter()
-            .any(|e| e.param_type != EtaParamType::LogNormal)
-        {
-            return InnerGradientMethod::Fd;
-        }
-        // Log-transform-both-sides (LTBS / `log_additive`, `log(DV) ~ ...`).
-        // The analytical single-snapshot AD kernel's `+100` log-wrap produces a
-        // d log(f)/deta Jacobian that diverges from the FD reference (issue
-        // #278): on well-conditioned data the error is small, but on
-        // ill-conditioned fits it drives the optimiser to a spurious
-        // variance-collapsed optimum with an OFV far below the true minimum.
-        // Until the kernel is corrected, route LTBS models to FD. (ODE models
-        // are already FD via the `tv_fn.is_none()` guard above, so this only
-        // affects analytical models.)
-        if model.log_transform {
-            return InnerGradientMethod::Fd;
-        }
-        // Conditional individual-parameter expressions, e.g.
-        // `if (WT > 70) { CL = TVCL * (WT/70)^0.75 * exp(ETA_CL) } else { ... }`.
-        // Here the ETA is still log-normal (`* exp(ETA)`), so `eta_param_info`
-        // looks ordinary, but the parameter is assigned inside an `if`-branch.
-        // The analytical AD kernels can't represent that branch structure, and
-        // their gradient disagrees with the branch-aware objective the inner
-        // loop minimises (issue #278 — observed as a ~985 OFV gap on
-        // `warfarin_if`). The parser already flags such parameters while
-        // disabling mu-referencing for them, via a `parse_warnings` entry that
-        // names them "conditional parameter(s)"; reuse that signal. This
-        // coupling is held in sync by the `if_expression_ad_matches_fd`
-        // integration test. (TODO: promote to a structured `CompiledModel`
-        // flag to avoid depending on the warning text.)
-        if model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("conditional parameter"))
-        {
+        // Model-level features the analytical AD kernels can't represent
+        // faithfully (non-log-normal ETA, LTBS, conditional params) -> FD.
+        // Extracted into a build-independent predicate so the routing decision
+        // is unit-testable in the FD-only `ci` build (the AD-vs-FD *numerical*
+        // check needs Enzyme, but "is this model classified AD-unsafe?" does
+        // not). See [`analytical_ad_unsupported`] and issue #278.
+        if analytical_ad_unsupported(model).is_some() {
             return InnerGradientMethod::Fd;
         }
         // SS=1 doses in the AD paths would require threading `dose.ss` and
@@ -1987,5 +2002,40 @@ mod iov_tests {
             InnerGradientMethod::Fd,
             "conditional-parameter model must route to FD"
         );
+    }
+
+    // Unlike the routing tests above (which exercise `resolve_gradient_method`
+    // and so are `cfg(autodiff)`), this tests the extracted predicate directly.
+    // It is build-independent, so it runs in the FD-only `ci` CI build and
+    // guards the gate *logic* even where the AD-vs-FD numerical harness
+    // (`tests/autodiff_fd_consistency.rs`) cannot run without Enzyme. See #278
+    // and the Enzyme-CI follow-up.
+    #[test]
+    fn analytical_ad_unsupported_flags_each_class() {
+        let mut model = make_iov_model();
+        // Plain log-normal fixture -> supported.
+        assert!(analytical_ad_unsupported(&model).is_none());
+
+        // Non-log-normal ETA.
+        model.eta_param_info = vec![crate::types::EtaParamInfo {
+            eta_name: "ETA_CL".into(),
+            param_type: crate::types::EtaParamType::Additive,
+            linked_theta: None,
+            individual_param_name: "CL".into(),
+        }];
+        assert!(analytical_ad_unsupported(&model).is_some());
+        model.eta_param_info.clear();
+        assert!(analytical_ad_unsupported(&model).is_none());
+
+        // LTBS.
+        model.log_transform = true;
+        assert!(analytical_ad_unsupported(&model).is_some());
+        model.log_transform = false;
+        assert!(analytical_ad_unsupported(&model).is_none());
+
+        // Conditional parameter (parser-warning signal).
+        model.parse_warnings =
+            vec!["Mu-referencing disabled for conditional parameter(s): CL.".to_string()];
+        assert!(analytical_ad_unsupported(&model).is_some());
     }
 }

@@ -2501,6 +2501,12 @@ pub(crate) fn compute_covariance(
             let np = xv.len();
             // Gradient of `2·pop_nll` (no omega-prior add-back; both the SB and
             // Laplace marginals already carry Ω — issue #243/#249).
+            //
+            // Keep this as a per-subject collect followed by `Σᵢ gᵢ[k] · 2` — it
+            // reproduces `ad_population_gradient`'s exact summation order, which is
+            // what makes the FOCE covariance bit-identical to the pre-#256 serial
+            // stencil. Do NOT fuse it with the Δ loop below (interleaving `2·gᵢ`
+            // and `2·tᵢ` per subject changes the floating-point reduction order).
             let per_subj: Vec<Vec<f64>> = (0..n_subj_cov)
                 .map(|i| {
                     crate::estimation::gauss_newton::subject_nll_pop_grad(

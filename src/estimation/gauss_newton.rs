@@ -1145,12 +1145,11 @@ fn subject_nll_pop_grad_analytical_laplace(
         let r = r_diag[j];
         let inv_r = 1.0 / r;
         let inv_r2 = inv_r * inv_r;
-        let inv_r3 = inv_r2 * inv_r;
         let d = d_vec[j];
         let d2 = d2_vec[j]; // per-obs / per-CMT; constant in f for the current error models
         let e = err[j];
         let alpha_j = -2.0 * e * inv_r + d * (r - e * e) * inv_r2;
-        let beta_j = -d * inv_r2 + d * d2 * inv_r2 - d * d * d * inv_r3;
+        let beta_j = logdet_htilde_beta(d, d2, inv_r);
         theta_per_j[j] = alpha_j + beta_j * q[j];
     }
 
@@ -1316,6 +1315,18 @@ fn subject_nll_pop_grad_analytical_laplace(
     Some((nll, grad))
 }
 
+/// Per-observation coefficient of the `qⱼ = aⱼ'H̃⁻¹aⱼ` reservoir in the `log|H̃|`
+/// chain rule along the prediction axis: `βⱼ = −dⱼ/Rⱼ² + dⱼ·d2ⱼ/Rⱼ² − dⱼ³/Rⱼ³`,
+/// where `dⱼ = ∂R/∂f` and `d2ⱼ = ∂²R/∂f²`. Shared by the Laplace θ-gradient
+/// (`∂log|H̃|/∂θ` via `df/dθ`) and the #274 EBE-response correction
+/// (`∂log|H̃|/∂η` via `df/dη = a`), so the formula lives in one place.
+#[inline]
+fn logdet_htilde_beta(d: f64, d2: f64, inv_r: f64) -> f64 {
+    let inv_r2 = inv_r * inv_r;
+    let inv_r3 = inv_r2 * inv_r;
+    -d * inv_r2 + d * d2 * inv_r2 - d * d * d * inv_r3
+}
+
 /// Leading-order estimate of the per-subject `log|H̃|` EBE-response gradient term
 /// that the fixed-η̂ analytic Laplace gradient drops.
 ///
@@ -1420,25 +1431,19 @@ pub(crate) fn subject_eta_response_correction(
                 qj += aj[a] * htilde_inv[(a, b)] * aj[b];
             }
         }
-        let r = r_diag[j];
-        let inv_r = 1.0 / r;
-        let inv_r2 = inv_r * inv_r;
-        let inv_r3 = inv_r2 * inv_r;
-        let d = d_vec[j];
-        let d2 = d2_vec[j];
-        let beta_j = -d * inv_r2 + d * d2 * inv_r2 - d * d * d * inv_r3;
+        let inv_r = 1.0 / r_diag[j];
+        let beta_j = logdet_htilde_beta(d_vec[j], d2_vec[j], inv_r);
         let coef = beta_j * qj;
         for m in 0..n_eta {
             g_eta[m] += coef * aj[m];
         }
     }
 
-    // w = H̃⁻¹ gη (the shared EBE-response weight); u = G·w for the θ block.
-    let w = &htilde_inv * &g_eta;
-    let u = &hrh * &w;
-    if u.iter().any(|v| !v.is_finite()) || w.iter().any(|v| !v.is_finite()) {
-        return None;
-    }
+    // u = G·H̃⁻¹·gη;  t_i[k] = −½ u_{j'} for mu-ref θ_k↔η_{j'}. A non-finite entry
+    // can only reach the result through a mapped `u[jp]`, which the final
+    // finiteness check below catches (returning `None` so the subject contributes
+    // 0) — no separate intermediate guard needed.
+    let u = &hrh * (&htilde_inv * &g_eta);
     let fixed_mask = packed_fixed_mask(template);
     let mut t = vec![0.0f64; n];
 

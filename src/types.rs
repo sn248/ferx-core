@@ -1030,13 +1030,14 @@ impl ScalingSpec {
     ///
     /// All variants are subject-static: the closure (`ExpressionScale`)
     /// is evaluated at most once per subject. AD therefore treats the
-    /// scale as a constant w.r.t. eta, which matches the documented
-    /// Phase 1 simplification — for the common case where the scale
-    /// expression doesn't reference eta (e.g. `WT/70`, `TVV/1000`,
-    /// `V` which only sees the EBE value), AD and FD give identical
-    /// gradients. For the rare case of a scale that explicitly references
-    /// eta, the AD gradient ignores that dependence; FD captures it. See
-    /// `docs/src/model-file/scaling.md` for the user-facing note.
+    /// scale as a constant w.r.t. eta. For a genuinely eta-independent
+    /// scale (`WT/70`, `TVV/1000` — covariates/thetas only) AD and FD give
+    /// identical gradients. For a scale that depends on eta (e.g.
+    /// `obs_scale = V` with `V = TVV*exp(ETA_V)`, or `1000/V`) the frozen
+    /// scale drops `d obs_scale / d eta`, so the inner loop is routed to FD
+    /// by `inner_optimizer::analytical_ad_unsupported`
+    /// (`ScalingSpec::breaks_ad_inner_gradient`) rather than silently
+    /// producing a wrong AD gradient. See `docs/src/model-file/scaling.md`.
     ///
     /// Invalid scale values (0, negative, NaN, inf — e.g. from a covariate
     /// that's missing, or from a `1/(TVV-x)` near a singularity) propagate
@@ -1138,6 +1139,32 @@ impl ScalingSpec {
             Self::None | Self::ScalarScale(_) => false,
             Self::ExpressionScale { .. } => true,
             Self::PerCmt(map) => map.values().any(Self::needs_pk_eval),
+        }
+    }
+
+    /// Returns true when an `ExpressionScale` makes the analytical AD inner
+    /// gradient unsafe, so the inner loop must use finite differences.
+    ///
+    /// `build_obs_scale_array` materialises the scale **subject-static** (once
+    /// per gradient call), so the AD Jacobian treats `obs_scale` as constant
+    /// w.r.t. eta. When the scale expression actually depends on eta (e.g.
+    /// `obs_scale = V` with `V = TVV*exp(ETA_V)`, or `1000/V`), that drops
+    /// `d obs_scale / d eta` and the AD gradient disagrees with the objective -
+    /// observed as a ~12 OFV gap on the bundled `scaling_expression` example
+    /// (issue #278 follow-up).
+    ///
+    /// This is **conservative**: it returns true for *any* `ExpressionScale`,
+    /// including the eta-independent ones (`WT/70`, `TVV/1000`) that are AD-exact
+    /// - routing those to FD costs a little speed but never correctness. A
+    /// precise eta-dependence check would need the parser to record whether the
+    /// scale expression reads an eta-bearing quantity; tracked as a follow-up.
+    /// `None` / `ScalarScale` are always eta-independent and stay on AD.
+    #[inline]
+    pub fn breaks_ad_inner_gradient(&self) -> bool {
+        match self {
+            Self::None | Self::ScalarScale(_) => false,
+            Self::ExpressionScale { .. } => true,
+            Self::PerCmt(map) => map.values().any(Self::breaks_ad_inner_gradient),
         }
     }
 }

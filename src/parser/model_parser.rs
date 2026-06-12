@@ -1531,11 +1531,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // `inner_optimizer::build_scale_array_for_ad`. The slice is
         // materialised once per gradient call from a subject-static pk
         // evaluation, so AD treats the scale as constant w.r.t. eta.
-        // That's exact for the common eta-independent scale (`WT/70`,
-        // `TVV/1000`, `V` reading the EBE value) and a documented
-        // approximation for the rare eta-dependent case — users who
-        // explicitly need eta-sensitive gradients should set
-        // `gradient = fd`.
+        // That's exact for an eta-independent scale (`WT/70`, `TVV/1000` -
+        // covariates/thetas only). An eta-dependent scale (e.g.
+        // `obs_scale = V` with `V = TVV*exp(ETA_V)`) is now auto-routed to
+        // FD by `inner_optimizer::analytical_ad_unsupported`
+        // (`ScalingSpec::breaks_ad_inner_gradient`), so the user gets a
+        // correct gradient without having to set `gradient = fd` by hand.
         //
         // Form C readouts (`OdeReadout::Single` / `PerCmt`) STILL force
         // FD: they only exist on ODE models, and the AD path requires

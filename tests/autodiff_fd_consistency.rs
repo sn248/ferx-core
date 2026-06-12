@@ -127,3 +127,13 @@ fn if_expression_ad_matches_fd() {
         .expect("read examples/warfarin_if.ferx");
     assert_ad_matches_fd("covariate if-expression", &src, "data/warfarin_if.csv");
 }
+
+/// Eta-dependent `obs_scale` (`obs_scale = V`, `V = TVV*exp(ETA_V)`) — the AD path
+/// freezes the scale subject-static, dropping `d obs_scale / d eta`; gated AD->FD.
+/// Bundled example; diverged ~12 OFV before the gate.
+#[test]
+fn scaling_expression_ad_matches_fd() {
+    let src = std::fs::read_to_string("examples/scaling_expression.ferx")
+        .expect("read examples/scaling_expression.ferx");
+    assert_ad_matches_fd("eta-dependent obs_scale", &src, "data/one_cpt_iv.csv");
+}

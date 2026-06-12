@@ -210,6 +210,12 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     {
         return Some("conditional (if-branch) individual-parameter expression");
     }
+    // Eta-dependent `[scaling] obs_scale` expression. `build_obs_scale_array`
+    // freezes the scale subject-static, so the AD Jacobian drops
+    // `d obs_scale / d eta` (see `ScalingSpec::breaks_ad_inner_gradient`).
+    if model.scaling.breaks_ad_inner_gradient() {
+        return Some("eta-dependent obs_scale (ExpressionScale)");
+    }
     None
 }
 
@@ -2037,5 +2043,15 @@ mod iov_tests {
         model.parse_warnings =
             vec!["Mu-referencing disabled for conditional parameter(s): CL.".to_string()];
         assert!(analytical_ad_unsupported(&model).is_some());
+        model.parse_warnings.clear();
+        assert!(analytical_ad_unsupported(&model).is_none());
+
+        // Expression-scale obs_scale (conservatively AD-unsafe; could read eta).
+        model.scaling = crate::types::ScalingSpec::ExpressionScale {
+            scale_fn: Box::new(|_, _, _, _| 1.0),
+        };
+        assert!(analytical_ad_unsupported(&model).is_some());
+        model.scaling = crate::types::ScalingSpec::ScalarScale(1000.0);
+        assert!(analytical_ad_unsupported(&model).is_none());
     }
 }

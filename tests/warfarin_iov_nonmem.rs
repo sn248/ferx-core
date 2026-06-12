@@ -361,18 +361,18 @@ fn iov_individual_cl_matches_nonmem() {
          post-fit CL column (regression of issue #238)"
     );
 
-    // ── Part B: cross-engine check against NONMEM (fixture-gated) ──
+    // ── Part B: cross-engine check against NONMEM ──
+    // The reference fixture is committed and this test gates every PR (see the
+    // dedicated CI step), so a missing fixture is a hard failure — never a silent
+    // skip that would let the cross-engine comparison quietly stop running.
     let ref_path = Path::new("tests/nonmem/warfarin_iov_cl_reference.csv");
-    if !ref_path.exists() {
-        eprintln!(
-            "[skip] NONMEM CL reference not found at {}. Generate it by running \
-             tests/nonmem/warfarin_iov.ctl (NONMEM 7.5.1 FOCEI) and saving the per-(ID,OCC) CL \
-             from sdtab_iov as 'ID,OCC,CL' (see module docs). The internal-consistency checks \
-             above still ran.",
-            ref_path.display()
-        );
-        return;
-    }
+    assert!(
+        ref_path.exists(),
+        "NONMEM CL reference missing at {} — it is a committed fixture this test depends on. \
+         Regenerate it by running tests/nonmem/warfarin_iov.ctl (NONMEM 7.5.1 FOCEI) and saving \
+         the per-(ID,OCC) CL from sdtab_iov as 'ID,OCC,CL' (see module docs).",
+        ref_path.display()
+    );
     let nm = parse_nonmem_cl_reference(ref_path);
     let fx = ferx_cl_by_id_occ(&pop, &result);
     let mut worst = 0.0_f64;

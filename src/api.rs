@@ -5303,6 +5303,10 @@ mod tests_sir_fallback {
         opts.verbose = false;
         opts.sir_samples = 400;
         opts.sir_resamples = 200;
+        // Own the determinism explicitly rather than leaning on run_sir_core's
+        // `None => fixed seed` fallback, so a future change to that fallback can't
+        // silently make this sampling test flaky.
+        opts.sir_seed = Some(20240612);
 
         let mut warnings = Vec::new();
         let result = resolve_sir_fallback(
@@ -5314,6 +5318,8 @@ mod tests_sir_fallback {
             &pop,
             &params,
             &eta_hats,
+            // ofv_hat cancels in the SIR log-sum-exp weight normalisation, so any
+            // finite value yields identical CIs — 0.0 keeps the fixture simple.
             0.0,
             &mut warnings,
         );

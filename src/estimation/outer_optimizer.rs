@@ -1,5 +1,5 @@
 use crate::estimation::gauss_newton::subject_nll_pop_grad;
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::{find_ebe, run_inner_loop_warm};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
 use crate::types::*;
@@ -1878,14 +1878,12 @@ fn backtracking_line_search_warm(
     0.0
 }
 
-/// Gradient of the covariance-step objective `2·pop_nll` w.r.t. the packed
-/// parameter vector, with ETAs and H-matrices held fixed.
-///
-/// Both methods carry the Ω dependence inside `pop_nll` already — FOCE through
-/// `R̃ = HΩHᵀ + R` in the Sheiner–Beal marginal (equivalent by Woodbury to the
-/// conditional form with `η̂ᵀΩ⁻¹η̂ + log|Ω|`), FOCEI through the explicit prior in
-/// the Almquist–Laplace marginal — so the gradient is just `ad_population_gradient`
-/// with no separate omega-prior term (issue #243).
+/// Analytic covariance-step gradient with ETAs/H fixed: `2·pop_nll` with no
+/// omega-prior add-back (both the SB and Laplace marginals already carry Ω —
+/// #243/#249). The production stencil inlines a serial variant (plus the #274 Δ
+/// correction); this thin wrapper over [`ad_population_gradient`] is retained for
+/// the gradient-consistency tests that finite-difference the fixed-EBE objective.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn covariance_gradient(
     x: &[f64],
@@ -1899,10 +1897,6 @@ fn covariance_gradient(
     options: &FitOptions,
 ) -> Vec<f64> {
     let n_subj = population.subjects.len();
-    // Gradient of `2·pop_nll` for both methods — no omega-prior add-back. The SB
-    // (FOCE) and Almquist–Laplace (FOCEI) marginals both already carry the Ω
-    // dependence (R̃ for SB, the explicit prior for Laplace); adding it again
-    // double-counted Ω and under-stated the FOCE omega SEs (issue #243).
     ad_population_gradient(
         x, n_subj, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
     )
@@ -2387,17 +2381,6 @@ pub(crate) fn compute_covariance(
         2.0 * foce_nll
     };
 
-    // Gradient of the covariance OFV at a reconverged point. Uses the analytical
-    // population gradient — issue #196's H-column shortcut makes the θ part exact
-    // for mu-referenced parameters — which is exactly the gradient of `2·pop_nll`
-    // (= `ofv` above) for both FOCE and FOCEI; no omega-prior add-back (#243).
-    let grad = |xv: &[f64]| -> Vec<f64> {
-        let (_, ehs, hms, kaps) = reconverge(xv);
-        covariance_gradient(
-            xv, template, model, population, &ehs, &hms, &kaps, &bounds, options,
-        )
-    };
-
     let base_ofv = ofv(x_hat);
     if !base_ofv.is_finite() {
         // Diagnose: check Omega conditioning to distinguish Omega collapse from
@@ -2477,19 +2460,89 @@ pub(crate) fn compute_covariance(
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
     if !is_iov {
-        // Issue #209: central FD of the analytical population gradient —
+        // Issue #209 + #256 + #274: central FD of the analytical population
+        // gradient, as one flat `par_iter` over the 2·n_free perturbed points.
         //   H[:,k] ≈ (g(x̂ + hₖ·eₖ) − g(x̂ − hₖ·eₖ)) / 2hₖ
-        // 2·n_free gradient evaluations vs ~2·n_free² scalar-OFV evaluations, with
-        // no 4-point cross-stencil cancellation (#129). `grad` reconverges the EBEs
-        // at each perturbed point, so the curvature includes the EBE response.
+        // `point_grad` reconverges the EBEs serially at each perturbed point, so
+        // the curvature includes the EBE response (and the determinant curvature).
+        //
+        // #256: the work-list is point-level, not the per-subject `par_iter` the
+        // gradient used to fan out into. Each point runs its subjects serially, so
+        // there is no nested parallelism, and the parallel width (2·n_free)
+        // saturates the pool even when n_subj < n_cores — removing the fork/join
+        // overhead of firing 4·n_free rayon barriers in series (~9–11× faster).
+        //
+        // #274: for FOCEI the per-point gradient adds the dropped `log|H̃|`
+        // EBE-response term `2·Σᵢ tᵢ` (`subject_eta_response_correction`). The
+        // fixed-η̂ analytic gradient invokes the envelope theorem, which zeros only
+        // the inner objective — not `log|H̃|` — so without this term the non-IOV
+        // FD Hessian omits the determinant EBE-response curvature `Δ` that the IOV
+        // scalar-OFV stencil captures. Adding it makes the two stencils consistent
+        // and recovers ∇²(−2logL). Mu-ref θ block only; vanishes for additive error.
+        let n_subj_cov = population.subjects.len();
+        let point_grad = |xv: &[f64]| -> Vec<f64> {
+            let params = unpack_params(xv, template);
+            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+            let mut ehs: Vec<DVector<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut hms: Vec<DMatrix<f64>> = Vec::with_capacity(n_subj_cov);
+            for i in 0..n_subj_cov {
+                let ebe = find_ebe(
+                    model,
+                    &population.subjects[i],
+                    &params,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    Some(eta_hats[i].as_slice()),
+                    Some(&mu_k),
+                );
+                ehs.push(ebe.eta);
+                hms.push(ebe.h_matrix);
+            }
+            let np = xv.len();
+            // Gradient of `2·pop_nll` (no omega-prior add-back; both the SB and
+            // Laplace marginals already carry Ω — issue #243/#249).
+            let per_subj: Vec<Vec<f64>> = (0..n_subj_cov)
+                .map(|i| {
+                    crate::estimation::gauss_newton::subject_nll_pop_grad(
+                        xv, template, model, population, i, &ehs[i], &hms[i], &[], &bounds, options,
+                    )
+                    .1
+                })
+                .collect();
+            let mut g: Vec<f64> = (0..np)
+                .map(|kk| per_subj.iter().map(|gi| gi[kk]).sum::<f64>() * 2.0)
+                .collect();
+            // #274 Δ correction (FOCEI only); summed in subject order to match.
+            if options.interaction {
+                for i in 0..n_subj_cov {
+                    if let Some(ti) = crate::estimation::gauss_newton::subject_eta_response_correction(
+                        xv, template, model, population, i, &ehs[i], &hms[i], options,
+                    ) {
+                        for (gk, tk) in g.iter_mut().zip(ti.iter()) {
+                            *gk += 2.0 * *tk;
+                        }
+                    }
+                }
+            }
+            g
+        };
+
+        let mut points: Vec<(usize, f64, Vec<f64>)> = Vec::with_capacity(2 * free_idx.len());
         for &k in &free_idx {
             let hk = eps * (1.0 + x_hat[k].abs());
             let mut x_p = x_hat.to_vec();
             let mut x_m = x_hat.to_vec();
             x_p[k] += hk;
             x_m[k] -= hk;
-            let g_p = grad(&x_p);
-            let g_m = grad(&x_m);
+            points.push((k, hk, x_p));
+            points.push((k, hk, x_m));
+        }
+        let point_grads: Vec<Vec<f64>> =
+            points.par_iter().map(|(_, _, xv)| point_grad(xv)).collect();
+        for (pair, &k) in free_idx.iter().enumerate() {
+            let g_p = &point_grads[2 * pair];
+            let g_m = &point_grads[2 * pair + 1];
+            let hk = points[2 * pair].1;
             for &j in &free_idx {
                 let h_jk = (g_p[j] - g_m[j]) / (2.0 * hk);
                 if h_jk.is_finite() {
@@ -3988,12 +4041,16 @@ mod tests {
         }
     }
 
-    /// End-to-end guard for `compute_covariance` (#209 + the factor-of-2 fix):
-    /// the reconverging central gradient-FD covariance must (a) compute without
-    /// regularization on a well-conditioned surface, (b) be positive-definite,
-    /// and (c) equal `2·H⁻¹` of an *independently* reconverged scalar-FD Hessian.
-    /// A missing factor of two would be ~29% off (caught by the 15% band); a
-    /// broken reconvergence would diverge wildly.
+    /// End-to-end guard for `compute_covariance` (#209 factor-of-2, #256 flatten,
+    /// #274 Δ correction): the reconverging point-flatten gradient-FD covariance
+    /// must (a) compute without regularization on a well-conditioned surface,
+    /// (b) be positive-definite, and (c) equal `2·H⁻¹` of an *independently*
+    /// reconverged scalar-FD Hessian of the same FOCEI objective. Because the
+    /// model has proportional error, the reference (a second difference of the
+    /// reconverged OFV) carries the `log|H̃|` EBE-response curvature `Δ`; the
+    /// gradient-FD path only matches it because the #274 correction adds `Δ` back —
+    /// so this also guards the Δ correction. A missing factor of two would be ~29%
+    /// off (caught by the 15% band); a broken reconvergence would diverge wildly.
     #[test]
     fn test_compute_covariance_reconverged_matches_scalar_fd_with_factor_two() {
         let model = make_model();

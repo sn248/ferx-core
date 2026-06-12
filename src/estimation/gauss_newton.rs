@@ -1316,6 +1316,150 @@ fn subject_nll_pop_grad_analytical_laplace(
     Some((nll, grad))
 }
 
+/// Leading-order estimate of the per-subject `log|H̃|` EBE-response gradient term
+/// that the fixed-η̂ analytic Laplace gradient drops.
+///
+/// The analytic Laplace gradient computes `∂NLL_i/∂θ` holding η̂ fixed and
+/// invoking the envelope theorem — which zeros only the *inner* objective
+/// (`data_ll + η'Ω⁻¹η`), NOT `log|H̃|`. The true total gradient therefore carries
+/// an extra term:
+/// ```text
+///   dΦ_i/dθ = ∂NLL_i/∂θ + (∂NLL_i/∂η)·(dη̂_i/dθ),   ∂NLL_i/∂η = ½ ∂log|H̃_i|/∂η
+///   t_i[k]  = ½ (∂log|H̃_i|/∂η)' · (dη̂_i/dθ_k)
+/// ```
+/// Adding `t_i` back to the covariance-step gradient (only) makes the central FD
+/// of that gradient recover the full marginal Hessian `∇²(−2logL)` — including the
+/// EBE-response cross-curvature `Δ = d/dθ[½ ∂log|H̃|/∂η · dη̂/dθ]` that the non-IOV
+/// stencil otherwise omits (the term the IOV scalar-OFV-2nd-difference captures).
+///
+/// For a mu-referenced `θ_k ↔ η_{j'}` every factor is already formed by the
+/// Laplace gradient, so this reduces to a few `n_eta × n_eta` products:
+/// ```text
+///   gη_i[m] = Σ_j β_j q_j a_{j,m}        (= ∂log|H̃_i|/∂η_m, a-fixed / Fisher approx)
+///   G_i     = a'diag(1/R)a   (= hrh),    dη̂_i/dθ_k = −H̃_i⁻¹ G_i[:,j']   (IFT, GN)
+///   t_i[k]  = −½ ( G_i · H̃_i⁻¹ · gη_i )_{j'}
+/// ```
+/// Returns `None` on an ill-conditioned point (caller then skips the correction).
+/// Covers the **mu-ref θ block** (`m_k = G[:,j']`). The σ SE is corrected
+/// indirectly through the θ/σ off-diagonals (matrix coupling), so no σ-direct term
+/// is needed. The ω block (closed form `m_k = ∂Ω⁻¹/∂x_k·η̂`) is deferred: its
+/// `z_i·(H̃⁻¹g^η)_i` form lacks the θ block's `G·H̃⁻¹ ≈ I` cancellation, so it is
+/// sensitive to the leading-order `g^η` (dropped `∂²f/∂η²`) and overshoots
+/// large-IIV components — see issue #274.
+pub(crate) fn subject_eta_response_correction(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    options: &FitOptions,
+) -> Option<Vec<f64>> {
+    use crate::pk;
+    let n = x.len();
+    let n_eta = model.n_eta;
+    let n_theta = template.theta.len();
+    let subject = &population.subjects[subj_idx];
+    let n_obs = subject.observations.len();
+    if n_eta == 0 || n_obs == 0 {
+        return Some(vec![0.0; n]);
+    }
+    let params = unpack_params(x, template);
+    let omega = &params.omega;
+    let sigma_values = &params.sigma.values;
+    let error_spec = &model.error_spec;
+
+    let ipreds = pk::compute_predictions_with_tv(model, subject, &params.theta, eta_hat.as_slice());
+    if ipreds.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let r_diag: Vec<f64> = (0..n_obs)
+        .map(|j| error_spec.variance_at(subject.obs_cmts[j], ipreds[j], sigma_values))
+        .collect();
+    if r_diag.iter().any(|&v| !(v.is_finite() && v > 0.0)) {
+        return None;
+    }
+    let d_vec: Vec<f64> = (0..n_obs)
+        .map(|j| error_spec.dvar_df(subject.obs_cmts[j], ipreds[j], sigma_values))
+        .collect();
+    let d2_vec: Vec<f64> = (0..n_obs)
+        .map(|j| error_spec.d2var_df2(subject.obs_cmts[j], sigma_values))
+        .collect();
+
+    // H̃ = a'diag(1/R)a + ½·c̃'c̃ + Ω⁻¹, and G = hrh = a'diag(1/R)a — identical to
+    // the Laplace gradient's construction (so the EBE-response reuses the same H̃).
+    let mut hrh = DMatrix::<f64>::zeros(n_eta, n_eta);
+    let mut ctc = DMatrix::<f64>::zeros(n_eta, n_eta);
+    for j in 0..n_obs {
+        let aj = h_matrix.row(j);
+        let inv_r = 1.0 / r_diag[j];
+        let c_scale = d_vec[j] * inv_r;
+        let cs2 = c_scale * c_scale;
+        for a in 0..n_eta {
+            let aa = aj[a];
+            for b in 0..n_eta {
+                let outer = aa * aj[b];
+                hrh[(a, b)] += outer * inv_r;
+                ctc[(a, b)] += outer * cs2;
+            }
+        }
+    }
+    let htilde = &hrh + 0.5 * &ctc + &omega.inv;
+    let htilde_chol = htilde.clone().cholesky()?;
+    let htilde_inv = htilde_chol.inverse();
+
+    // gη_m = Σ_j β_j q_j a_{j,m}: the η-gradient of log|H̃| under the same a-fixed
+    // chain the θ-gradient uses (q_j = a_j'H̃⁻¹a_j; β_j the log|H̃| coefficient).
+    let mut g_eta = DVector::<f64>::zeros(n_eta);
+    for j in 0..n_obs {
+        let aj = h_matrix.row(j);
+        let mut qj = 0.0;
+        for a in 0..n_eta {
+            for b in 0..n_eta {
+                qj += aj[a] * htilde_inv[(a, b)] * aj[b];
+            }
+        }
+        let r = r_diag[j];
+        let inv_r = 1.0 / r;
+        let inv_r2 = inv_r * inv_r;
+        let inv_r3 = inv_r2 * inv_r;
+        let d = d_vec[j];
+        let d2 = d2_vec[j];
+        let beta_j = -d * inv_r2 + d * d2 * inv_r2 - d * d * d * inv_r3;
+        let coef = beta_j * qj;
+        for m in 0..n_eta {
+            g_eta[m] += coef * aj[m];
+        }
+    }
+
+    // w = H̃⁻¹ gη (the shared EBE-response weight); u = G·w for the θ block.
+    let w = &htilde_inv * &g_eta;
+    let u = &hrh * &w;
+    if u.iter().any(|v| !v.is_finite()) || w.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let fixed_mask = packed_fixed_mask(template);
+    let mut t = vec![0.0f64; n];
+
+    // ── θ block (mu-ref): dη̂/dθ_k = −H̃⁻¹ G[:,j'],  t_i[k] = −½ u_{j'}. ──
+    if options.mu_referencing {
+        for k in 0..n_theta {
+            if fixed_mask[k] {
+                continue;
+            }
+            if let Some(jp) = mu_ref_eta_index(model, template, k) {
+                t[k] = -0.5 * u[jp];
+            }
+        }
+    }
+
+    if t.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    Some(t)
+}
+
 /// Compute the FOCE NLL and its gradient w.r.t. the packed population parameter
 /// vector for a single subject, with ETAs fixed at their current EBE values.
 ///
@@ -1623,7 +1767,7 @@ mod tests {
         BloqMethod, CompiledModel, DoseEvent, ErrorModel, FitOptions, GradientMethod,
         ModelParameters, OmegaMatrix, PkModel, PkParams, Population, SigmaVector, Subject,
     };
-    use nalgebra::DVector;
+    use nalgebra::{DMatrix, DVector};
     use std::collections::HashMap;
 
     fn make_model() -> CompiledModel {
@@ -1725,6 +1869,58 @@ mod tests {
             input_columns: vec![],
             exclusions: None,
             warnings: vec![],
+        }
+    }
+
+    /// The `log|H̃|` EBE-response correction (#274) must vanish for additive error:
+    /// `∂R/∂f = 0` ⇒ `β_j = 0` ⇒ `g^η = 0` ⇒ every `t_i[k] = 0`. This is the Δ=0
+    /// control that guarantees the correction is inert when there is no η-σ
+    /// interaction (additive residual variance), so additive-error SEs are
+    /// unchanged. Contrast: the proportional model gives a non-zero correction.
+    #[test]
+    fn eta_response_correction_zero_for_additive_nonzero_for_proportional() {
+        let pop = make_population();
+        let eta_hat = DVector::from_vec(vec![0.15]);
+        // Plausible Jacobian dpred/dη (3 obs × 1 eta) — sign/scale immaterial to
+        // the additive-zero claim (β_j = 0 regardless).
+        let h = DMatrix::from_column_slice(3, 1, &[-0.20, -0.50, -0.60]);
+        let mut opts = FitOptions::default();
+        opts.interaction = true;
+        opts.mu_referencing = true;
+
+        // mu-reference TVCL ↔ ETA_CL (log-transformed) so the θ block is active.
+        let mu = || {
+            let mut m = HashMap::new();
+            m.insert(
+                "ETA_CL".to_string(),
+                crate::types::MuRef { theta_name: "TVCL".to_string(), log_transformed: true },
+            );
+            m
+        };
+
+        // Proportional: correction is active (some |t| > 0).
+        let mut model_p = make_model();
+        model_p.mu_refs = mu();
+        let template_p = model_p.default_params.clone();
+        let xp = pack_params(&template_p);
+        let tp = subject_eta_response_correction(&xp, &template_p, &model_p, &pop, 0, &eta_hat, &h, &opts)
+            .expect("correction computes (proportional)");
+        assert!(
+            tp.iter().any(|&v| v.abs() > 0.0),
+            "proportional error must give a non-zero EBE-response correction"
+        );
+
+        // Additive: correction is exactly zero everywhere (even with the mu-ref).
+        let mut model_a = make_model();
+        model_a.mu_refs = mu();
+        model_a.error_model = ErrorModel::Additive;
+        model_a.error_spec = crate::types::ErrorSpec::Single(ErrorModel::Additive);
+        let template_a = model_a.default_params.clone();
+        let xa = pack_params(&template_a);
+        let ta = subject_eta_response_correction(&xa, &template_a, &model_a, &pop, 0, &eta_hat, &h, &opts)
+            .expect("correction computes (additive)");
+        for (k, &v) in ta.iter().enumerate() {
+            assert_eq!(v, 0.0, "additive error must give zero correction at packed param {k}");
         }
     }
 

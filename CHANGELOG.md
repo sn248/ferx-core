@@ -55,6 +55,14 @@ section of the SDLC for the versioning policy).
   the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
 
 ### Fixed
+- FOCEI covariance standard errors (non-IOV) now include the `log|H̃|` EBE-response
+  curvature for mu-referenced structural parameters, bringing the non-IOV stencil
+  in line with the IOV stencil and matching NONMEM `$COV MATRIX=R` more closely on
+  models with η-dependent (proportional/combined) residual error. The fixed-η̂
+  analytic gradient previously dropped this term — the envelope theorem zeros the
+  inner objective but not `log|H̃|` — and the resulting SE gap grew with the
+  proportional error magnitude. Additive-error SEs are unchanged (the correction is
+  identically zero when `∂R/∂f = 0`) (#274).
 - FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
   `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The
   covariance step had added the Ω prior (`η̂ᵀΩ⁻¹η̂ + log|Ω|`) on top of the
@@ -84,6 +92,13 @@ section of the SDLC for the versioning policy).
   (#199, #200).
 
 ### Performance
+- The covariance step is now built as a single parallel work-list over the
+  finite-difference points (subjects iterated serially within each point) instead
+  of firing a per-subject parallel reduction at every perturbed point. This removes
+  the fork/join overhead of up to `4·n_free` rayon barriers in series — the
+  bottleneck was scheduling, not core utilisation — making the covariance step
+  ~9–11× faster across error models and structures, with bit-identical results
+  (#256).
 - The covariance Hessian is built from a central difference of the analytical
   population gradient — reusing H-matrix columns for mu-referenced parameters
   instead of finite-differencing predictions — making the covariance step ~9×

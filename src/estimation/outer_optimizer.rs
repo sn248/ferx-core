@@ -2504,7 +2504,16 @@ pub(crate) fn compute_covariance(
             let per_subj: Vec<Vec<f64>> = (0..n_subj_cov)
                 .map(|i| {
                     crate::estimation::gauss_newton::subject_nll_pop_grad(
-                        xv, template, model, population, i, &ehs[i], &hms[i], &[], &bounds, options,
+                        xv,
+                        template,
+                        model,
+                        population,
+                        i,
+                        &ehs[i],
+                        &hms[i],
+                        &[],
+                        &bounds,
+                        options,
                     )
                     .1
                 })
@@ -2515,9 +2524,11 @@ pub(crate) fn compute_covariance(
             // #274 Δ correction (FOCEI only); summed in subject order to match.
             if options.interaction {
                 for i in 0..n_subj_cov {
-                    if let Some(ti) = crate::estimation::gauss_newton::subject_eta_response_correction(
-                        xv, template, model, population, i, &ehs[i], &hms[i], options,
-                    ) {
+                    if let Some(ti) =
+                        crate::estimation::gauss_newton::subject_eta_response_correction(
+                            xv, template, model, population, i, &ehs[i], &hms[i], options,
+                        )
+                    {
                         for (gk, tk) in g.iter_mut().zip(ti.iter()) {
                             *gk += 2.0 * *tk;
                         }

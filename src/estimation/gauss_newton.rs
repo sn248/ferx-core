@@ -1893,7 +1893,10 @@ mod tests {
             let mut m = HashMap::new();
             m.insert(
                 "ETA_CL".to_string(),
-                crate::types::MuRef { theta_name: "TVCL".to_string(), log_transformed: true },
+                crate::types::MuRef {
+                    theta_name: "TVCL".to_string(),
+                    log_transformed: true,
+                },
             );
             m
         };
@@ -1903,8 +1906,17 @@ mod tests {
         model_p.mu_refs = mu();
         let template_p = model_p.default_params.clone();
         let xp = pack_params(&template_p);
-        let tp = subject_eta_response_correction(&xp, &template_p, &model_p, &pop, 0, &eta_hat, &h, &opts)
-            .expect("correction computes (proportional)");
+        let tp = subject_eta_response_correction(
+            &xp,
+            &template_p,
+            &model_p,
+            &pop,
+            0,
+            &eta_hat,
+            &h,
+            &opts,
+        )
+        .expect("correction computes (proportional)");
         assert!(
             tp.iter().any(|&v| v.abs() > 0.0),
             "proportional error must give a non-zero EBE-response correction"
@@ -1917,10 +1929,22 @@ mod tests {
         model_a.error_spec = crate::types::ErrorSpec::Single(ErrorModel::Additive);
         let template_a = model_a.default_params.clone();
         let xa = pack_params(&template_a);
-        let ta = subject_eta_response_correction(&xa, &template_a, &model_a, &pop, 0, &eta_hat, &h, &opts)
-            .expect("correction computes (additive)");
+        let ta = subject_eta_response_correction(
+            &xa,
+            &template_a,
+            &model_a,
+            &pop,
+            0,
+            &eta_hat,
+            &h,
+            &opts,
+        )
+        .expect("correction computes (additive)");
         for (k, &v) in ta.iter().enumerate() {
-            assert_eq!(v, 0.0, "additive error must give zero correction at packed param {k}");
+            assert_eq!(
+                v, 0.0,
+                "additive error must give zero correction at packed param {k}"
+            );
         }
     }
 

@@ -97,8 +97,10 @@ section of the SDLC for the versioning policy).
   of firing a per-subject parallel reduction at every perturbed point. This removes
   the fork/join overhead of up to `4·n_free` rayon barriers in series — the
   bottleneck was scheduling, not core utilisation — making the covariance step
-  ~9–11× faster across error models and structures, with bit-identical results
-  (#256).
+  ~9–11× faster across error models and structures, with bit-identical results.
+  Both stencils are flattened: the non-IOV analytic-gradient difference and the
+  IOV `OFV`-second-difference (the latter has `~2·n_free²` points, so it benefits
+  even more) (#256).
 - The covariance Hessian is built from a central difference of the analytical
   population gradient — reusing H-matrix columns for mu-referenced parameters
   instead of finite-differencing predictions — making the covariance step ~9×

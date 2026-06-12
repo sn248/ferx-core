@@ -2584,59 +2584,108 @@ pub(crate) fn compute_covariance(
             }
         }
     } else {
-        // IOV fallback: no fixed-EBE analytical gradient covers the kappa block, so
-        // build the Hessian from second differences of the reconverged OFV (3-point
-        // diagonal, 4-point off-diagonal). `ofv` reconverges the joint (η, κ) EBEs.
+        // IOV: no fixed-EBE analytical gradient covers the kappa block, so build
+        // the Hessian from second differences of the reconverged OFV (3-point
+        // diagonal, 4-point off-diagonal), reconverging the joint (η, κ) EBEs.
+        //
+        // #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV
+        // points (subjects iterated serially inside `serial_ofv`) instead of the
+        // old serial loop that fired a per-subject `par_iter` at every point —
+        // removing the fork/join overhead of firing a rayon barrier per point.
+        // Bit-identical to the serial stencil: each point's OFV is the same
+        // `2·pop_nll` at the same per-subject `find_ebe`, and the difference
+        // formulas/assembly are unchanged; only the scheduling differs.
         let f0 = base_ofv;
-        let mut x_ij = x_hat.to_vec();
-        for &i in &free_idx {
-            let hi = eps * (1.0 + x_hat[i].abs());
+        let n_subj_cov = population.subjects.len();
+        let serial_ofv = |xv: &[f64]| -> f64 {
+            let params = unpack_params(xv, template);
+            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+            let mut ehs: Vec<DVector<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut hms: Vec<DMatrix<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut kaps: Vec<Vec<DVector<f64>>> = Vec::with_capacity(n_subj_cov);
+            for i in 0..n_subj_cov {
+                let ebe = find_ebe(
+                    model,
+                    &population.subjects[i],
+                    &params,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    Some(eta_hats[i].as_slice()),
+                    Some(&mu_k),
+                );
+                ehs.push(ebe.eta);
+                hms.push(ebe.h_matrix);
+                kaps.push(ebe.kappas);
+            }
+            2.0 * pop_nll(
+                model,
+                population,
+                &params,
+                &ehs,
+                &hms,
+                &kaps,
+                options.interaction,
+            )
+        };
 
-            // Diagonal: 3-point formula  (f(x+h) - 2f(x) + f(x-h)) / h^2
-            x_ij[i] = x_hat[i] + hi;
-            let fp = ofv(&x_ij);
-            x_ij[i] = x_hat[i] - hi;
-            let fm = ofv(&x_ij);
-            x_ij[i] = x_hat[i];
-
-            let h_ii = (fp - 2.0 * f0 + fm) / (hi * hi);
+        let nf = free_idx.len();
+        let hsteps: Vec<f64> = free_idx
+            .iter()
+            .map(|&i| eps * (1.0 + x_hat[i].abs()))
+            .collect();
+        // Flat point list: 2 per diagonal (±hᵢ), then 4 per (a<b) off-diagonal pair.
+        let mut pts: Vec<Vec<f64>> = Vec::with_capacity(2 * nf + 2 * nf * nf);
+        for a in 0..nf {
+            let i = free_idx[a];
+            let hi = hsteps[a];
+            let mut xp = x_hat.to_vec();
+            xp[i] += hi;
+            let mut xm = x_hat.to_vec();
+            xm[i] -= hi;
+            pts.push(xp);
+            pts.push(xm);
+        }
+        let n_diag = pts.len();
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for a in 0..nf {
+            for b in (a + 1)..nf {
+                let (i, j) = (free_idx[a], free_idx[b]);
+                let (hi, hj) = (hsteps[a], hsteps[b]);
+                for (si, sj) in [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)] {
+                    let mut xv = x_hat.to_vec();
+                    xv[i] += si * hi;
+                    xv[j] += sj * hj;
+                    pts.push(xv);
+                }
+                pairs.push((a, b));
+            }
+        }
+        let vals: Vec<f64> = pts.par_iter().map(|xv| serial_ofv(xv)).collect();
+        // Diagonal: (f(x+h) − 2f(x) + f(x−h)) / h².
+        for a in 0..nf {
+            let i = free_idx[a];
+            let hi = hsteps[a];
+            let h_ii = (vals[2 * a] - 2.0 * f0 + vals[2 * a + 1]) / (hi * hi);
             if h_ii.is_finite() {
                 hess[(i, i)] = h_ii;
             } else {
                 fd_diag_nan.insert(i);
             }
-
-            // Off-diagonal: 4-point stencil (over free indices only)
-            for &j in &free_idx {
-                if j <= i {
-                    continue;
-                }
-                let hj = eps * (1.0 + x_hat[j].abs());
-
-                x_ij[i] = x_hat[i] + hi;
-                x_ij[j] = x_hat[j] + hj;
-                let fpp = ofv(&x_ij);
-
-                x_ij[j] = x_hat[j] - hj;
-                let fpm = ofv(&x_ij);
-
-                x_ij[i] = x_hat[i] - hi;
-                let fmm = ofv(&x_ij);
-
-                x_ij[j] = x_hat[j] + hj;
-                let fmp = ofv(&x_ij);
-
-                x_ij[i] = x_hat[i];
-                x_ij[j] = x_hat[j];
-
-                let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
-                if h_ij.is_finite() {
-                    hess[(i, j)] = h_ij;
-                    hess[(j, i)] = h_ij;
-                } else {
-                    fd_offdiag_nan.insert(i);
-                    fd_offdiag_nan.insert(j);
-                }
+        }
+        // Off-diagonal: (f++ − f+− − f−+ + f−−) / (4 hᵢ hⱼ).
+        let mut off = n_diag;
+        for &(a, b) in &pairs {
+            let (i, j) = (free_idx[a], free_idx[b]);
+            let (hi, hj) = (hsteps[a], hsteps[b]);
+            let (fpp, fpm, fmm, fmp) = (vals[off], vals[off + 1], vals[off + 2], vals[off + 3]);
+            off += 4;
+            let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+            if h_ij.is_finite() {
+                hess[(i, j)] = h_ij;
+                hess[(j, i)] = h_ij;
+            } else {
+                fd_offdiag_nan.insert(i);
+                fd_offdiag_nan.insert(j);
             }
         }
     }

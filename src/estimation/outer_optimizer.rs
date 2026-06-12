@@ -2166,14 +2166,6 @@ fn select_fd_step<F: Fn(&[f64]) -> f64>(
     (eps, MAX_HALVINGS)
 }
 
-fn covariance_method_label(m: CovarianceMethod) -> &'static str {
-    match m {
-        CovarianceMethod::Hessian => "r",
-        CovarianceMethod::CrossProduct => "s",
-        CovarianceMethod::Sandwich => "rsr",
-    }
-}
-
 /// Combine the observed-information inverse `r_inv = R⁻¹` (already `2·H_ofv⁻¹`)
 /// and the score cross-product `S` into the covariance estimator selected by
 /// `method`:
@@ -2314,21 +2306,6 @@ pub(crate) fn compute_covariance(
             "Covariance step failed: fd_hessian_step must be positive and finite, got {}. \
              SE estimates not available.",
             initial_eps
-        ));
-    }
-    // Fail fast on a covariance_method that needs the per-subject score `S` for
-    // FOCE (non-interaction). The FOCEI `s`/`rsr` SEs are NONMEM-anchored (#266:
-    // warfarin FOCEI matches `$COV MATRIX=S`/`RSR` within ~14%/~7%), so the
-    // estimator scale is validated *under interaction*. FOCE stays gated: after
-    // #249 removed the separately-added omega_terms the SB score is internally
-    // consistent with the corrected FOCE R-matrix, but no NONMEM `MATRIX=S`/`RSR`
-    // *FOCE* reference yet anchors that absolute scale (#250), so it remains a
-    // conservative "not yet validated" gate.
-    if options.covariance_method != CovarianceMethod::Hessian && !options.interaction {
-        return CovarianceStepResult::Unusable(format!(
-            "covariance_method = {} is not yet validated for FOCE (non-interaction); \
-             use covariance_method = r, or set method = focei.",
-            covariance_method_label(options.covariance_method),
         ));
     }
     let bounds = compute_bounds(template);
@@ -2667,19 +2644,13 @@ pub(crate) fn compute_covariance(
 
     // Select the covariance estimator (NONMEM `$COV MATRIX=`). `R⁻¹` is the
     // model-based default; `S⁻¹` and `R⁻¹SR⁻¹` additionally need the per-subject
-    // score cross-product `S = Σᵢ gᵢgᵢᵀ`.
-    //
-    // TODO(#250): the absolute scale of the `s` / `rsr` SEs is not yet anchored
-    // to a NONMEM `$COV MATRIX=S` / `RSR` run. The scaling is correct as written
-    // — `S` is on the −logL scale (`gᵢ = ∂(−logLᵢ)/∂θ`, no factor of 2), matching
-    // `R = ½·H_ofv` — but the slow-test consistency band [0.33, 3.0] cannot catch
-    // a constant 2×/4× rescale, so a tight NONMEM reference is still pending. #250
-    // also tracks the `s`-requires-PD-`R` limitation (this branch needs `r_inv`,
-    // computed above) and the `r`-vs-NONMEM-`rsr` default-mismatch doc note.
+    // score cross-product `S = Σᵢ gᵢgᵢᵀ`. `S` is on the −logL scale
+    // (`gᵢ = ∂(−logLᵢ)/∂θ`, no factor of 2), matching `R = ½·H_ofv`.
+    // Anchored against NONMEM `$COV MATRIX=S`/`RSR` for both FOCEI (#266) and
+    // FOCE (no-INTER) (#250): all SEs within ~10% of NONMEM.
     let cov_free = if options.covariance_method == CovarianceMethod::Hessian {
         r_inv
     } else {
-        // S/RSR: non-interaction FOCE was rejected at entry (not yet validated, see guard above).
         let s_free = assemble_score_cross_product(
             x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
             &free_idx,

@@ -1682,6 +1682,7 @@ mod tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -2595,6 +2596,7 @@ mod tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -2872,6 +2874,7 @@ mod tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -3104,6 +3107,7 @@ mod tests {
                 referenced_covariates: Vec::new(),
                 gradient_method: GradientMethod::Fd,
                 parse_warnings: Vec::new(),
+                has_conditional_eta_params: false,
                 eta_param_info: Vec::new(),
                 theta_transform: Vec::new(),
                 #[cfg(feature = "nn")]

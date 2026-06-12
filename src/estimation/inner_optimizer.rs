@@ -197,17 +197,9 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     // `if (WT > 70) { CL = TVCL * (WT/70)^0.75 * exp(ETA_CL) } else { ... }`.
     // The ETA stays log-normal so `eta_param_info` looks ordinary, but the
     // parameter is assigned inside an `if`-branch the analytical kernels can't
-    // represent. The parser already flags these while disabling mu-referencing,
-    // via a `parse_warnings` entry naming them "conditional parameter(s)"; reuse
-    // that signal. (TODO: promote to a structured `CompiledModel` flag to avoid
-    // depending on the warning text. Held in sync by the
-    // `if_expression_ad_matches_fd` integration test and the
-    // `conditional_param_routes_to_fd` unit test.)
-    if model
-        .parse_warnings
-        .iter()
-        .any(|w| w.contains("conditional parameter"))
-    {
+    // represent. The parser sets this flag (and also disables mu-referencing)
+    // when an if-branch assigns an eta-bearing parameter.
+    if model.has_conditional_eta_params {
         return Some("conditional (if-branch) individual-parameter expression");
     }
     // Eta-dependent `[scaling] obs_scale` expression. `build_obs_scale_array`
@@ -1650,6 +1642,7 @@ mod iov_tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -1767,6 +1760,7 @@ mod iov_tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -2005,12 +1999,9 @@ mod iov_tests {
         assert_ne!(
             resolve_gradient_method(&model, &subj),
             InnerGradientMethod::Fd,
-            "no conditional warning -> AD route"
+            "no conditional flag -> AD route"
         );
-        model.parse_warnings = vec!["Mu-referencing disabled for conditional parameter(s): CL. \
-             Assign TV* unconditionally and apply the if-block to the individual \
-             parameter expression to re-enable mu-referencing."
-            .to_string()];
+        model.has_conditional_eta_params = true;
         assert_eq!(
             resolve_gradient_method(&model, &subj),
             InnerGradientMethod::Fd,
@@ -2047,11 +2038,10 @@ mod iov_tests {
         model.log_transform = false;
         assert!(analytical_ad_unsupported(&model).is_none());
 
-        // Conditional parameter (parser-warning signal).
-        model.parse_warnings =
-            vec!["Mu-referencing disabled for conditional parameter(s): CL.".to_string()];
+        // Conditional parameter (structured flag).
+        model.has_conditional_eta_params = true;
         assert!(analytical_ad_unsupported(&model).is_some());
-        model.parse_warnings.clear();
+        model.has_conditional_eta_params = false;
         assert!(analytical_ad_unsupported(&model).is_none());
 
         // Expression-scale obs_scale (conservatively AD-unsafe; could read eta).

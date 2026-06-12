@@ -1474,6 +1474,13 @@ pub struct CompiledModel {
     /// Warnings generated at parse time (e.g. mu-referencing disabled for
     /// conditional parameters).  Prepended to `FitResult.warnings` by `fit()`.
     pub parse_warnings: Vec<String>,
+    /// True when an individual parameter is assigned inside an `if`-branch that
+    /// references an ETA (e.g. `if (WT>70) { CL = TVCL*exp(ETA_CL) } else {...}`).
+    /// Set by the parser. The analytical AD kernels can't represent the branch
+    /// structure, so `inner_optimizer::analytical_ad_unsupported` routes such
+    /// models to FD. (Structured replacement for matching the "conditional
+    /// parameter" `parse_warnings` string.)
+    pub has_conditional_eta_params: bool,
     /// Per-ETA transformation metadata derived from the `[individual_parameters]`
     /// expressions at parse time. Length ≤ n_eta (only ETAs whose expression was
     /// classified are present). Forwarded into `FitResult`.
@@ -3059,6 +3066,7 @@ pub(crate) mod test_helpers {
             referenced_covariates: vec![],
             gradient_method,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]

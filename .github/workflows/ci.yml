@@ -52,6 +52,15 @@ jobs:
       - name: cargo test
         run: cargo test --lib --no-default-features --features ci --release
 
+      # The NONMEM-anchored per-(ID,OCC) CL cross-check for IOV (issue #238)
+      # lives in an integration test, which `--lib` above does not build or run.
+      # Run that one file explicitly so the agreement with NONMEM is guarded on
+      # every PR (not just nightly). It is a FIXed-MLE fit over 10 subjects — no
+      # convergence loop, sub-second — and self-contained (reference fixture
+      # committed at tests/nonmem/warfarin_iov_cl_reference.csv).
+      - name: cargo test (NONMEM IOV CL cross-check, issue #238)
+        run: cargo test --test warfarin_iov_nonmem --no-default-features --features ci --release
+
   survival:
     name: Survival (TTE)
     runs-on: ubuntu-latest

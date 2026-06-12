@@ -67,6 +67,11 @@ section of the SDLC for the versioning policy).
   the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
 
 ### Fixed
+- IOV models: `[derived]` columns, `[output]` individual parameters, and the
+  TAD column in `sdtab` now use each observation's **occasion** kappa instead of
+  silently treating every kappa as zero. Post-fit diagnostic columns that depend
+  on a κ-varying parameter (e.g. `CL`, `V`, `KA`) were wrong for IOV subjects;
+  the fitted estimates, OFV, and IPRED/IWRES were unaffected (#238).
 - FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
   `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The
   covariance step had added the Ω prior (`η̂ᵀΩ⁻¹η̂ + log|Ω|`) on top of the

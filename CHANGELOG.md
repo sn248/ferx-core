@@ -58,13 +58,17 @@ section of the SDLC for the versioning policy).
 - Autodiff builds now fall back to finite differences for analytical models the
   single-snapshot AD kernel cannot represent faithfully: non-log-normal ETAs
   (additive / logit), conditional (`if`-branch) individual-parameter
-  expressions, and log-transform-both-sides (`log_additive`) error. The kernel
-  hardcodes the log-normal map `param = tv*exp(eta)` (and a log-wrap for LTBS),
-  so these previously produced inner gradients inconsistent with the objective -
-  a small bias on well-conditioned data, but on ill-conditioned FOCEI-INTER fits
-  a spurious variance-collapsed optimum with an OFV far below NONMEM's. FD-only
-  CI never exercised the AD path, so the divergence went undetected (surfaced by
-  an external NONMEM/OpenPMX/ferx benchmark, FeRx-NLME/ferx-r#154). The default
+  expressions, log-transform-both-sides (`log_additive`) error, eta-dependent
+  `[scaling] obs_scale` expressions (e.g. `obs_scale = V`), and time-to-event
+  (`[event_model]`) hazard likelihoods. The kernel hardcodes the log-normal map
+  `param = tv*exp(eta)` (plus a log-wrap for LTBS, a subject-static eta-frozen
+  `obs_scale`, and the PK NLL rather than the hazard term for TTE), so these
+  previously
+  produced inner gradients inconsistent with the objective - a small bias on
+  well-conditioned data, but on ill-conditioned FOCEI-INTER fits a spurious
+  variance-collapsed optimum with an OFV far below NONMEM's. FD-only CI never
+  exercised the AD path, so the divergence went undetected (surfaced by an
+  external NONMEM/OpenPMX/ferx benchmark, FeRx-NLME/ferx-r#154). The default
   non-autodiff build was never affected (#278).
 - FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
   `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The

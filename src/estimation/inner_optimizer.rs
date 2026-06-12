@@ -216,6 +216,14 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     if model.scaling.breaks_ad_inner_gradient() {
         return Some("eta-dependent obs_scale (ExpressionScale)");
     }
+    // Time-to-event (`[event_model]`) endpoint. The analytical single-snapshot
+    // AD kernel computes the PK-observation NLL, not the hazard/survival
+    // likelihood, so the eta-gradient through the hazard (especially shape
+    // params) is wrong - `tte_weibull` / `tte_gompertz` diverged ~2-5 OFV from
+    // FD under AD. Route TTE models to FD. (Always false without `survival`.)
+    if model.has_tte() {
+        return Some("time-to-event ([event_model]) hazard likelihood");
+    }
     None
 }
 

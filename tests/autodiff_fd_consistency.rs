@@ -21,15 +21,18 @@
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::GradientMethod;
-use ferx_core::{fit, read_nonmem_csv, FitOptions};
-use std::path::Path;
+use ferx_core::{fit, FitOptions};
 
 fn fit_ofv(model_src: &str, data: &str, gm: GradientMethod) -> f64 {
     let mut model = parse_model_string(model_src).expect("model parses");
     // `resolve_gradient_method` reads `model.gradient_method`; set it directly so
     // each run is pinned to AD or FD regardless of the default `Auto`.
     model.gradient_method = gm;
-    let pop = read_nonmem_csv(Path::new(data), None, None).expect("data loads");
+    // `read_population_for` (not the bare `read_nonmem_csv`) so `[event_model]`
+    // TTE rows are routed to `obs_records` - otherwise the TTE fits error. For
+    // Gaussian models it falls through to the same `read_nonmem_csv` path.
+    let (pop, _) = ferx_core::api::read_population_for(&model, &None, data, None, None, None)
+        .expect("data loads");
     let mut opts = FitOptions::default();
     opts.gradient_method = gm;
     opts.outer_maxiter = 300;
@@ -136,4 +139,25 @@ fn scaling_expression_ad_matches_fd() {
     let src = std::fs::read_to_string("examples/scaling_expression.ferx")
         .expect("read examples/scaling_expression.ferx");
     assert_ad_matches_fd("eta-dependent obs_scale", &src, "data/one_cpt_iv.csv");
+}
+
+/// TTE hazard (`[event_model]`) — the analytical AD kernel computes the PK NLL,
+/// not the hazard likelihood, so the eta-gradient through the hazard shape is
+/// wrong; gated AD->FD. weibull/gompertz diverged ~2-5 OFV before the gate
+/// (exponential, no shape param, was borderline). Needs the `survival` feature
+/// (TTE parsing) in addition to `autodiff`.
+#[cfg(feature = "survival")]
+#[test]
+fn tte_weibull_ad_matches_fd() {
+    let src = std::fs::read_to_string("examples/tte_weibull.ferx")
+        .expect("read examples/tte_weibull.ferx");
+    assert_ad_matches_fd("TTE weibull hazard", &src, "data/tte_weibull.csv");
+}
+
+#[cfg(feature = "survival")]
+#[test]
+fn tte_gompertz_ad_matches_fd() {
+    let src = std::fs::read_to_string("examples/tte_gompertz.ferx")
+        .expect("read examples/tte_gompertz.ferx");
+    assert_ad_matches_fd("TTE gompertz hazard", &src, "data/tte_gompertz.csv");
 }

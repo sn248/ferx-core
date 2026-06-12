@@ -1586,6 +1586,26 @@ impl CompiledModel {
         self.diffusion_theta_start.is_some()
     }
 
+    /// Returns true when the model has a time-to-event (`[event_model]`)
+    /// endpoint. The analytical single-snapshot AD kernel computes the
+    /// PK-observation NLL, not the hazard/survival likelihood, so its
+    /// eta-gradient through the hazard (especially the shape parameters) is
+    /// wrong - `tte_weibull` / `tte_gompertz` diverged ~2-5 OFV from FD under
+    /// AD. `inner_optimizer::analytical_ad_unsupported` routes these to FD.
+    #[cfg(feature = "survival")]
+    pub fn has_tte(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|e| matches!(e, EndpointLikelihood::Tte { .. }))
+    }
+
+    /// Always false without the `survival` feature - TTE endpoints can't be
+    /// parsed, so no model can carry one.
+    #[cfg(not(feature = "survival"))]
+    pub fn has_tte(&self) -> bool {
+        false
+    }
+
     /// Returns true when `[individual_parameters]` declares `LAGTIME` (or its
     /// `ALAG` alias). Used by the prediction dispatcher and inner optimizer
     /// to choose between cached-schedule / AD fast paths and the lagtime-

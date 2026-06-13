@@ -5320,6 +5320,41 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
                 }
             }
 
+            // Reject a model that omits a required PK parameter for its structure.
+            // An unmapped slot would otherwise stay at `PkParams::default()` (0.0)
+            // and the fit silently "converges" to a structurally broken optimum —
+            // the #261 failure mode reached by *omission* rather than by a bad
+            // reference (issue #309). Check at the canonical-slot level so the
+            // `v`/`v1` and `q`/`q2` aliases satisfy the requirement.
+            let mapped_slots: std::collections::HashSet<usize> = param_map
+                .keys()
+                .filter_map(|k| PkParams::name_to_index(k))
+                .collect();
+            let missing: Vec<&str> = pk_model
+                .required_pk_params()
+                .iter()
+                .filter(|(slot, _)| !mapped_slots.contains(slot))
+                .map(|(_, name)| *name)
+                .collect();
+            if !missing.is_empty() {
+                let list = missing
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let (verb, pron) = if missing.len() == 1 {
+                    ("is", "it")
+                } else {
+                    ("are", "them")
+                };
+                let first = missing[0];
+                let first_upper = first.to_uppercase();
+                return Err(format!(
+                    "[structural_model] {model_name} requires {list}, which {verb} \
+                     not mapped. Add {pron}, e.g. `{first}={first_upper}`."
+                ));
+            }
+
             return Ok((pk_model, param_map));
         }
     }
@@ -8740,10 +8775,83 @@ mod tests {
             ("three_cpt_iv", PkModel::ThreeCptIv),
         ];
         for (name, expected) in cases {
-            let lines = vec![format!("pk {}(cl=CL, v=V, q=Q, v2=V2, q2=Q2, v3=V3)", name)];
+            // Map every required slot for the most demanding variant (`three_cpt_iv`
+            // also needs `q3`) so the required-parameter check (#309) passes for all
+            // cases; this test only asserts the name→variant mapping.
+            let lines = vec![format!(
+                "pk {}(cl=CL, v=V, q=Q, v2=V2, q2=Q2, q3=Q3, v3=V3)",
+                name
+            )];
             let (pk_model, _) = parse_structural_model(&lines)
                 .unwrap_or_else(|e| panic!("`{name}` failed to parse: {e}"));
             assert_eq!(pk_model, expected, "wrong variant for `{name}`");
+        }
+    }
+
+    #[test]
+    fn test_missing_required_pk_param_errors() {
+        // Omitting a required structural parameter must be a hard parse error,
+        // not a silent default-to-0.0 broken fit (issue #309).
+
+        // Single missing param: exact message (matches the #309 acceptance text).
+        let lines = vec!["pk one_cpt_oral(cl=CL, v=V)".to_string()];
+        let err = parse_structural_model(&lines).expect_err("one_cpt_oral without `ka` must error");
+        assert_eq!(
+            err,
+            "[structural_model] one_cpt_oral requires `ka`, which is not mapped. \
+             Add it, e.g. `ka=KA`."
+        );
+
+        // Multiple missing params: plural grammar, names all of them.
+        let lines = vec!["pk two_cpt_iv(cl=CL, v1=V1)".to_string()];
+        let err =
+            parse_structural_model(&lines).expect_err("two_cpt_iv without `q`/`v2` must error");
+        assert!(err.contains("`q`"), "should name q: {err}");
+        assert!(err.contains("`v2`"), "should name v2: {err}");
+        assert!(
+            err.contains("are not mapped") && err.contains("Add them"),
+            "plural grammar expected: {err}"
+        );
+
+        // `ka` omitted on a three-cpt oral model (every other slot present).
+        let lines = vec!["pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)".to_string()];
+        let err =
+            parse_structural_model(&lines).expect_err("three_cpt_oral without `ka` must error");
+        assert!(err.contains("`ka`"), "should name ka: {err}");
+    }
+
+    #[test]
+    fn test_required_params_present_parses_ok() {
+        // A fixture that maps every required slot parses Ok — including via the
+        // `v`/`v1` and `q`/`q2` aliases (canonical-slot check). `f`/`lagtime`
+        // stay optional, so omitting them is fine.
+        let cases: &[(&str, PkModel)] = &[
+            ("pk one_cpt_iv(cl=CL, v=V)", PkModel::OneCptIv),
+            ("pk one_cpt_oral(cl=CL, v=V, ka=KA)", PkModel::OneCptOral),
+            ("pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)", PkModel::TwoCptIv),
+            // `q2` alias used where `q` is the canonical display name:
+            (
+                "pk two_cpt_iv(cl=CL, v1=V1, q2=Q, v2=V2)",
+                PkModel::TwoCptIv,
+            ),
+            (
+                "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+                PkModel::TwoCptOral,
+            ),
+            (
+                "pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)",
+                PkModel::ThreeCptIv,
+            ),
+            (
+                "pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA)",
+                PkModel::ThreeCptOral,
+            ),
+        ];
+        for (line, expected) in cases {
+            let lines = vec![line.to_string()];
+            let (pk_model, _) = parse_structural_model(&lines)
+                .unwrap_or_else(|e| panic!("`{line}` should parse: {e}"));
+            assert_eq!(pk_model, *expected, "wrong variant for `{line}`");
         }
     }
 

@@ -699,6 +699,54 @@ pub enum PkModel {
     ThreeCptOral,
 }
 
+impl PkModel {
+    /// Canonical PK slots that MUST be mapped in a `[structural_model]` `pk(...)`
+    /// line for this model, each paired with the conventional name shown in
+    /// parser errors. `f`/`lagtime` are intentionally absent — they are optional
+    /// and default to 1.0 / 0.0 (see `PkParams::default`).
+    ///
+    /// Slots are canonical (`name_to_index` values), so the `v`/`v1` and `q`/`q2`
+    /// aliases satisfy the same requirement. The display names mirror the
+    /// "Required Parameters" table in `docs/src/model-file/structural-model.md`;
+    /// the parser enforces what that table documents (issue #309).
+    pub(crate) fn required_pk_params(&self) -> &'static [(usize, &'static str)] {
+        match self {
+            PkModel::OneCptIv => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v")],
+            PkModel::OneCptOral => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v"), (PK_IDX_KA, "ka")],
+            PkModel::TwoCptIv => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q"),
+                (PK_IDX_V2, "v2"),
+            ],
+            PkModel::TwoCptOral => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_KA, "ka"),
+            ],
+            PkModel::ThreeCptIv => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q2"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_Q3, "q3"),
+                (PK_IDX_V3, "v3"),
+            ],
+            PkModel::ThreeCptOral => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q2"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_Q3, "q3"),
+                (PK_IDX_V3, "v3"),
+                (PK_IDX_KA, "ka"),
+            ],
+        }
+    }
+}
+
 /// Supported residual error models
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorModel {
@@ -3132,6 +3180,41 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_pk_params_match_docs_table() {
+        // Locks the per-model required slots to the "Required Parameters" table
+        // in docs/src/model-file/structural-model.md (issue #309).
+        use PkModel::*;
+        let cases: &[(PkModel, &[&str])] = &[
+            (OneCptIv, &["cl", "v"]),
+            (OneCptOral, &["cl", "v", "ka"]),
+            (TwoCptIv, &["cl", "v1", "q", "v2"]),
+            (TwoCptOral, &["cl", "v1", "q", "v2", "ka"]),
+            (ThreeCptIv, &["cl", "v1", "q2", "v2", "q3", "v3"]),
+            (ThreeCptOral, &["cl", "v1", "q2", "v2", "q3", "v3", "ka"]),
+        ];
+        for (model, expected_names) in cases {
+            let req = model.required_pk_params();
+            let names: Vec<&str> = req.iter().map(|(_, n)| *n).collect();
+            assert_eq!(&names, expected_names, "wrong required names for {model:?}");
+            // Every (slot, name) pair must be self-consistent with name_to_index,
+            // so the parser's key→slot canonicalisation lines up with this table.
+            for (slot, name) in req {
+                assert_eq!(
+                    PkParams::name_to_index(name),
+                    Some(*slot),
+                    "slot/name mismatch for `{name}` in {model:?}"
+                );
+            }
+            // f / lagtime are optional and must never appear as required.
+            assert!(
+                !req.iter()
+                    .any(|(s, _)| *s == PK_IDX_F || *s == PK_IDX_LAGTIME),
+                "{model:?} must not require f/lagtime"
+            );
+        }
+    }
 
     #[test]
     fn classify_warning_convergence_is_critical() {

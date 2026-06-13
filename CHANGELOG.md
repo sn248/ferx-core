@@ -73,6 +73,10 @@ section of the SDLC for the versioning policy).
   directly comparable to FOCE/FOCEI and NONMEM `METHOD=IMP`. Previously κ was
   held fixed at its EBE mode, giving a partial marginal; `kappa_treatment` in
   the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
+- A `[structural_model]` `pk(...)` line that omits a required parameter for the
+  chosen model (e.g. `ka` for `one_cpt_oral`) is now a parse error naming the
+  missing parameter, instead of silently defaulting that slot to `0.0` and
+  fitting to a structurally broken optimum (#309).
 
 ### Fixed
 - Datasets without an `EVID` column no longer silently fit a dose-free model.

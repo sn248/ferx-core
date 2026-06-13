@@ -49,7 +49,9 @@ section of the SDLC for the versioning policy).
 - `covariance_method` fit option: choose the covariance estimator, mirroring
   NONMEM `$COV MATRIX=` — `r` (inverse Hessian `R⁻¹`, default), `s` (inverse
   score cross-product `S⁻¹`), or `rsr` (the Huber–White sandwich `R⁻¹SR⁻¹`,
-  robust to model mis-specification). Supported for FOCEI/IOV fits (#223).
+  robust to model mis-specification). Supported for FOCEI, FOCE, and IOV fits;
+  anchored against NONMEM `$COV MATRIX=S`/`RSR` within ~10% for both FOCEI (#266)
+  and FOCE (#250) (#223).
 - `covariance_fallback = sir` fit option: when the FD Hessian is non-positive-definite,
   run SIR with an `|eigenvalue|`-rectified proposal (4× inflated) instead of leaving
   the covariance step as failed; `covariance_status` reports `sir_fallback` (#223).

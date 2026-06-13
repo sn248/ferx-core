@@ -204,9 +204,12 @@ jobs:
             "https://codecov.io/api/v2/github/FeRx-NLME/repos/ferx-core/totals/" \
             | python3 -c "import json,sys; print(json.load(sys.stdin)['totals']['coverage'])" 2>/dev/null || true)
           if [ -z "${cov:-}" ]; then echo "no coverage figure; skipping nudge"; exit 0; fi
-          below=$(python3 -c "print('1' if float('$cov') < 90 else '0')")
-          existing=$(gh api "repos/$REPO/issues/$PR/comments" \
-            --jq "[.[] | select(.body | contains(\"$marker\"))][0].id" 2>/dev/null || true)
+          below=$(python3 -c "import sys; print('1' if float(sys.argv[1]) < 90 else '0')" "$cov")
+          # `// empty` so a no-match yields an empty string (-> POST a new
+          # comment) instead of the literal `null`; `--paginate` so the marker
+          # isn't missed past the first page of comments.
+          existing=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq "[.[] | select(.body | contains(\"$marker\"))][0].id // empty" 2>/dev/null || true)
           if [ "$below" = "1" ]; then
             body=$(printf '%s\n📉 **Coverage floor not yet met.** Project coverage is **%s%%**, below the **90%%** floor enforced on the weekly full-coverage run (see #286).\n\nThis PR is **not blocked**. If it adds code, please make sure the new lines are covered — the `patch` check (target 90%%) grades exactly your changed lines, and the Codecov report below shows the gaps. Thanks for helping clear the floor. 🙏' "$marker" "$cov")
           else

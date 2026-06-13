@@ -4287,11 +4287,12 @@ fn build_ode_spec(
         .cloned()
         .chain(indiv_param_names.iter().cloned())
         .collect();
-    // Names an init expression can actually resolve, mirroring the exact keys
-    // the `init_fn` closure seeds below: states (original + lowercase, bound to
-    // 0 at init time) and individual parameters (original + upper + lowercase).
-    // Any `Variable` outside this set silently reads 0.0 via `eval_expression`
-    // (issue #314), so reject it at parse time.
+    // Names an init expression can resolve, mirroring the exact keys the
+    // `init_fn` closure seeds below: states (original + lowercase, bound to 0 at
+    // init time) and individual parameters (original + upper + lowercase). A
+    // `Variable` outside this set (the MACHEPS builtin aside — handled in the
+    // loop below) silently reads 0.0 via `eval_expression` (issue #314), so
+    // reject it at parse time.
     let mut init_defined: HashMap<String, usize> = HashMap::new();
     for n in state_names {
         init_defined.insert(n.clone(), 0);
@@ -4302,10 +4303,6 @@ fn build_ode_spec(
         init_defined.insert(n.to_uppercase(), 0);
         init_defined.insert(n.to_lowercase(), 0);
     }
-    // MACHEPS is a builtin constant that `eval_expression` resolves to
-    // f64::EPSILON regardless of case, so it must not be flagged as undefined.
-    init_defined.insert("MACHEPS".to_string(), 0);
-    init_defined.insert("macheps".to_string(), 0);
     let mut init_specs: Vec<(usize, Expression)> = Vec::new();
     let mut seen_init: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rhs_lines: Vec<String> = Vec::with_capacity(lines.len());
@@ -4328,6 +4325,10 @@ fn build_ode_spec(
                 .map_err(|e| format!("[odes] init({}): {}", name, e))?;
             let mut undef: std::collections::HashSet<String> = std::collections::HashSet::new();
             collect_undefined_vars(&expr, &init_defined, &mut undef);
+            // MACHEPS is a builtin constant that `eval_expression` resolves to
+            // f64::EPSILON case-insensitively, so accept any casing here (the
+            // exact-key `init_defined` carries only states/params, not MACHEPS).
+            undef.retain(|n| !n.eq_ignore_ascii_case("MACHEPS"));
             if !undef.is_empty() {
                 let mut names: Vec<String> = undef.into_iter().collect();
                 names.sort();
@@ -13899,6 +13900,17 @@ if (1 > 0) {
         // MACHEPS is available in init expressions (eval_expression resolves it)
         // — the undefined-name check must accept it, and it evaluates to EPSILON.
         let src = turnover_ode_model("  init(response) = MACHEPS");
+        let parsed = parse_full_model(&src).unwrap();
+        let ode = parsed.model.ode_spec.as_ref().unwrap();
+        assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![f64::EPSILON]);
+    }
+
+    #[test]
+    fn test_init_macheps_is_case_insensitive() {
+        // `eval_expression` resolves MACHEPS case-insensitively, so a mixed-case
+        // spelling must not be rejected by the undefined-name check (regression:
+        // exact-key matching against init_defined would have flagged it).
+        let src = turnover_ode_model("  init(response) = MachEps");
         let parsed = parse_full_model(&src).unwrap();
         let ode = parsed.model.ode_spec.as_ref().unwrap();
         assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![f64::EPSILON]);

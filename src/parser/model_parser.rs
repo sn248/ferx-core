@@ -8818,16 +8818,34 @@ mod tests {
         let err =
             parse_structural_model(&lines).expect_err("three_cpt_oral without `ka` must error");
         assert!(err.contains("`ka`"), "should name ka: {err}");
+
+        // Supplying an *optional* parameter (`f`) must not mask a *missing*
+        // required one: `ka` is still reported even though `f` is present.
+        let lines = vec!["pk one_cpt_oral(cl=CL, v=V, f=F)".to_string()];
+        let err = parse_structural_model(&lines)
+            .expect_err("optional `f` must not satisfy the required `ka`");
+        assert!(err.contains("`ka`"), "should still name ka: {err}");
     }
 
     #[test]
     fn test_required_params_present_parses_ok() {
         // A fixture that maps every required slot parses Ok — including via the
         // `v`/`v1` and `q`/`q2` aliases (canonical-slot check). `f`/`lagtime`
-        // stay optional, so omitting them is fine.
+        // (alias `alag`) stay optional: omitting them is fine, and supplying
+        // them is accepted (neither required nor rejected).
         let cases: &[(&str, PkModel)] = &[
             ("pk one_cpt_iv(cl=CL, v=V)", PkModel::OneCptIv),
             ("pk one_cpt_oral(cl=CL, v=V, ka=KA)", PkModel::OneCptOral),
+            // Optional `f` + `lagtime` present alongside the required params:
+            (
+                "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=TLAG)",
+                PkModel::OneCptOral,
+            ),
+            // `alag` alias for lagtime, also optional:
+            (
+                "pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=TLAG)",
+                PkModel::OneCptOral,
+            ),
             ("pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)", PkModel::TwoCptIv),
             // `q2` alias used where `q` is the canonical display name:
             (

@@ -745,6 +745,19 @@ impl PkModel {
             ],
         }
     }
+
+    /// The canonical short model name (e.g. `one_cpt_oral`), used in parser
+    /// diagnostics. Long-form aliases (`one_compartment_oral`) normalise to this.
+    pub(crate) fn canonical_name(&self) -> &'static str {
+        match self {
+            PkModel::OneCptIv => "one_cpt_iv",
+            PkModel::OneCptOral => "one_cpt_oral",
+            PkModel::TwoCptIv => "two_cpt_iv",
+            PkModel::TwoCptOral => "two_cpt_oral",
+            PkModel::ThreeCptIv => "three_cpt_iv",
+            PkModel::ThreeCptOral => "three_cpt_oral",
+        }
+    }
 }
 
 /// Supported residual error models
@@ -3214,6 +3227,17 @@ mod tests {
                 "{model:?} must not require f/lagtime"
             );
         }
+    }
+
+    #[test]
+    fn canonical_name_covers_all_variants() {
+        use PkModel::*;
+        assert_eq!(OneCptIv.canonical_name(), "one_cpt_iv");
+        assert_eq!(OneCptOral.canonical_name(), "one_cpt_oral");
+        assert_eq!(TwoCptIv.canonical_name(), "two_cpt_iv");
+        assert_eq!(TwoCptOral.canonical_name(), "two_cpt_oral");
+        assert_eq!(ThreeCptIv.canonical_name(), "three_cpt_iv");
+        assert_eq!(ThreeCptOral.canonical_name(), "three_cpt_oral");
     }
 
     #[test]

@@ -1101,6 +1101,45 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &covariate_nns_for_closure,
     )?;
 
+    // Reject an analytical model that omits a required PK parameter for its
+    // structure (issue #309). Runs *after* build_pk_param_fn so the per-key
+    // validation (unknown key / undefined reference, #308) reports first; every
+    // surviving key is then a known PK name, so the canonical-slot set is exact
+    // and the `v`/`v1`, `q`/`q2` aliases satisfy their slot. An unmapped required
+    // slot would otherwise stay at `PkParams::default()` (0.0) and the fit would
+    // silently "converge" to a structurally broken optimum.
+    if !pk_param_map.is_empty() {
+        let mapped_slots: std::collections::HashSet<usize> = pk_param_map
+            .keys()
+            .filter_map(|k| PkParams::name_to_index(k))
+            .collect();
+        let missing: Vec<&str> = pk_model
+            .required_pk_params()
+            .iter()
+            .filter(|(slot, _)| !mapped_slots.contains(slot))
+            .map(|(_, name)| *name)
+            .collect();
+        if !missing.is_empty() {
+            let list = missing
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (verb, pron) = if missing.len() == 1 {
+                ("is", "it")
+            } else {
+                ("are", "them")
+            };
+            let first = missing[0];
+            let first_upper = first.to_uppercase();
+            return Err(format!(
+                "[structural_model] {} requires {list}, which {verb} not mapped. \
+                 Add {pron}, e.g. `{first}={first_upper}`.",
+                pk_model.canonical_name()
+            ));
+        }
+    }
+
     // Append NN-weight thetas (Phase A M1), then diffusion variances. Both
     // sit at the tail of the theta vector so existing user-declared theta
     // indices are unaffected.
@@ -1812,6 +1851,41 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &event_model_used_thetas,
         &event_model_used_etas,
     ));
+
+    // Warn about analytical PK parameters that are mapped but unused by the
+    // chosen model — e.g. `ka` on an IV model (no absorption), or `q`/`v2` on a
+    // one-compartment model. They are set but have no effect (#309). `f`
+    // (bioavailability) and `lagtime` are dose modifiers every model applies, so
+    // they are never flagged. Sibling to the declared-but-unused check above.
+    if !pk_param_map.is_empty() {
+        let required: std::collections::HashSet<usize> = pk_model
+            .required_pk_params()
+            .iter()
+            .map(|(slot, _)| *slot)
+            .collect();
+        let mut unused: Vec<&str> = pk_param_map
+            .iter()
+            .filter_map(|(key, _)| {
+                let slot = PkParams::name_to_index(key)?;
+                let used = required.contains(&slot) || slot == PK_IDX_F || slot == PK_IDX_LAGTIME;
+                (!used).then_some(key.as_str())
+            })
+            .collect();
+        unused.sort_unstable();
+        if !unused.is_empty() {
+            let list = unused
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            model.parse_warnings.push(format!(
+                "[structural_model] {} does not use parameter(s) {list}; they are \
+                 mapped but have no effect on this model. Remove them, or use a model \
+                 that needs them.",
+                pk_model.canonical_name()
+            ));
+        }
+    }
 
     // Undeclared-covariate warning: checked here (after [event_model] parsing) so
     // that covariates used only in [event_model] expressions are included.
@@ -5320,51 +5394,11 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
                 }
             }
 
-            // Enforce that every required PK parameter for the model is mapped.
-            // An unmapped slot would otherwise stay at `PkParams::default()` (0.0)
-            // and the fit silently "converges" to a structurally broken optimum —
-            // the #261 failure mode reached by *omission* rather than by a bad
-            // reference (issue #309). Check at the canonical-slot level so the
-            // `v`/`v1` and `q`/`q2` aliases satisfy the requirement.
-            //
-            // Defer when an *unrecognized* key is present (e.g. the typo `clx`):
-            // `build_pk_param_fn` reports that bad key by name, which is more
-            // actionable than "a required slot is missing", so the unknown-key
-            // error takes precedence (#308). Without this guard a typo'd key
-            // would mask its own slot and surface as a confusing "requires" error.
-            let has_unknown_key = param_map
-                .keys()
-                .any(|k| PkParams::name_to_index(k).is_none());
-            if !has_unknown_key {
-                let mapped_slots: std::collections::HashSet<usize> = param_map
-                    .keys()
-                    .filter_map(|k| PkParams::name_to_index(k))
-                    .collect();
-                let missing: Vec<&str> = pk_model
-                    .required_pk_params()
-                    .iter()
-                    .filter(|(slot, _)| !mapped_slots.contains(slot))
-                    .map(|(_, name)| *name)
-                    .collect();
-                if !missing.is_empty() {
-                    let list = missing
-                        .iter()
-                        .map(|n| format!("`{n}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let (verb, pron) = if missing.len() == 1 {
-                        ("is", "it")
-                    } else {
-                        ("are", "them")
-                    };
-                    let first = missing[0];
-                    let first_upper = first.to_uppercase();
-                    return Err(format!(
-                        "[structural_model] {model_name} requires {list}, which {verb} \
-                         not mapped. Add {pron}, e.g. `{first}={first_upper}`."
-                    ));
-                }
-            }
+            // Structural-mapping validation (required params present, unused
+            // params, undefined references) is deferred to `parse_full_model`,
+            // which runs it *after* `build_pk_param_fn` so the per-key checks
+            // (unknown key / undefined reference, #308) report first and the
+            // required-completeness / unused checks (#309) layer cleanly on top.
 
             return Ok((pk_model, param_map));
         }
@@ -8833,17 +8867,49 @@ mod tests {
             ("three_cpt_iv", PkModel::ThreeCptIv),
         ];
         for (name, expected) in cases {
-            // Map every required slot for the most demanding variant (`three_cpt_iv`
-            // also needs `q3`) so the required-parameter check (#309) passes for all
-            // cases; this test only asserts the name→variant mapping.
-            let lines = vec![format!(
-                "pk {}(cl=CL, v=V, q=Q, v2=V2, q2=Q2, q3=Q3, v3=V3)",
-                name
-            )];
+            // `parse_structural_model` only resolves the model name → variant;
+            // required-parameter completeness is checked later in `parse_full_model`.
+            let lines = vec![format!("pk {}(cl=CL, v=V, q=Q, v2=V2, q2=Q2, v3=V3)", name)];
             let (pk_model, _) = parse_structural_model(&lines)
                 .unwrap_or_else(|e| panic!("`{name}` failed to parse: {e}"));
             assert_eq!(pk_model, expected, "wrong variant for `{name}`");
         }
+    }
+
+    /// A complete analytical model wrapping `pk_line`, with every commonly
+    /// referenced individual parameter defined so `build_pk_param_fn`'s per-key
+    /// value validation passes and only the structural-mapping checks (required /
+    /// unused, run in `parse_full_model`) are exercised. Surplus declared params
+    /// just produce the usual declared-but-unused warnings, which don't affect
+    /// whether parsing succeeds.
+    fn structural_model_with(pk_line: &str) -> String {
+        format!(
+            "
+[parameters]
+  theta TVX(1.0, 0.001, 100.0)
+  omega ETA ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL   = TVX * exp(ETA)
+  V    = TVX
+  V1   = TVX
+  Q    = TVX
+  Q2   = TVX
+  V2   = TVX
+  Q3   = TVX
+  V3   = TVX
+  KA   = TVX
+  F    = TVX
+  TLAG = TVX
+
+[structural_model]
+  {pk_line}
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        )
     }
 
     #[test]
@@ -8852,8 +8918,7 @@ mod tests {
         // not a silent default-to-0.0 broken fit (issue #309).
 
         // Single missing param: exact message (matches the #309 acceptance text).
-        let lines = vec!["pk one_cpt_oral(cl=CL, v=V)".to_string()];
-        let err = parse_structural_model(&lines).expect_err("one_cpt_oral without `ka` must error");
+        let err = expect_parse_err(&structural_model_with("pk one_cpt_oral(cl=CL, v=V)"));
         assert_eq!(
             err,
             "[structural_model] one_cpt_oral requires `ka`, which is not mapped. \
@@ -8861,9 +8926,7 @@ mod tests {
         );
 
         // Multiple missing params: plural grammar, names all of them.
-        let lines = vec!["pk two_cpt_iv(cl=CL, v1=V1)".to_string()];
-        let err =
-            parse_structural_model(&lines).expect_err("two_cpt_iv without `q`/`v2` must error");
+        let err = expect_parse_err(&structural_model_with("pk two_cpt_iv(cl=CL, v1=V1)"));
         assert!(err.contains("`q`"), "should name q: {err}");
         assert!(err.contains("`v2`"), "should name v2: {err}");
         assert!(
@@ -8872,63 +8935,81 @@ mod tests {
         );
 
         // `ka` omitted on a three-cpt oral model (every other slot present).
-        let lines = vec!["pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)".to_string()];
-        let err =
-            parse_structural_model(&lines).expect_err("three_cpt_oral without `ka` must error");
+        let err = expect_parse_err(&structural_model_with(
+            "pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)",
+        ));
         assert!(err.contains("`ka`"), "should name ka: {err}");
 
         // Supplying an *optional* parameter (`f`) must not mask a *missing*
         // required one: `ka` is still reported even though `f` is present.
-        let lines = vec!["pk one_cpt_oral(cl=CL, v=V, f=F)".to_string()];
-        let err = parse_structural_model(&lines)
-            .expect_err("optional `f` must not satisfy the required `ka`");
+        let err = expect_parse_err(&structural_model_with("pk one_cpt_oral(cl=CL, v=V, f=F)"));
         assert!(err.contains("`ka`"), "should still name ka: {err}");
     }
 
     #[test]
     fn test_required_params_present_parses_ok() {
-        // A fixture that maps every required slot parses Ok — including via the
-        // `v`/`v1` and `q`/`q2` aliases (canonical-slot check). `f`/`lagtime`
-        // (alias `alag`) stay optional: omitting them is fine, and supplying
-        // them is accepted (neither required nor rejected).
-        let cases: &[(&str, PkModel)] = &[
-            ("pk one_cpt_iv(cl=CL, v=V)", PkModel::OneCptIv),
-            ("pk one_cpt_oral(cl=CL, v=V, ka=KA)", PkModel::OneCptOral),
-            // Optional `f` + `lagtime` present alongside the required params:
-            (
-                "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=TLAG)",
-                PkModel::OneCptOral,
-            ),
-            // `alag` alias for lagtime, also optional:
-            (
-                "pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=TLAG)",
-                PkModel::OneCptOral,
-            ),
-            ("pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)", PkModel::TwoCptIv),
-            // `q2` alias used where `q` is the canonical display name:
-            (
-                "pk two_cpt_iv(cl=CL, v1=V1, q2=Q, v2=V2)",
-                PkModel::TwoCptIv,
-            ),
-            (
-                "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
-                PkModel::TwoCptOral,
-            ),
-            (
-                "pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)",
-                PkModel::ThreeCptIv,
-            ),
-            (
-                "pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA)",
-                PkModel::ThreeCptOral,
-            ),
+        // A model that maps every required slot parses without a structural error
+        // — including via the `v`/`v1` and `q`/`q2` aliases (canonical-slot check)
+        // and with optional `f`/`lagtime`/`alag` present. The required-
+        // completeness check runs after `build_pk_param_fn` (issue #309).
+        let ok_lines = [
+            "pk one_cpt_iv(cl=CL, v=V)",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+            // optional f + lagtime present alongside the required params:
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=TLAG)",
+            // `alag` alias for lagtime:
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=TLAG)",
+            "pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)",
+            // `q2` alias satisfies the `q` slot; `v` alias satisfies `v1`:
+            "pk two_cpt_iv(cl=CL, v=V1, q2=Q, v2=V2)",
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)",
+            "pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA)",
         ];
-        for (line, expected) in cases {
-            let lines = vec![line.to_string()];
-            let (pk_model, _) = parse_structural_model(&lines)
-                .unwrap_or_else(|e| panic!("`{line}` should parse: {e}"));
-            assert_eq!(pk_model, *expected, "wrong variant for `{line}`");
+        for line in ok_lines {
+            assert!(
+                super::parse_full_model(&structural_model_with(line)).is_ok(),
+                "`{line}` should parse without a structural error"
+            );
         }
+    }
+
+    #[test]
+    fn test_unused_pk_param_warns() {
+        // A PK parameter that is mapped but not used by the chosen model — here
+        // `ka` on an IV model, which has no absorption — parses Ok but emits a
+        // parse warning so the user notices the no-op mapping (#309). `f`/`lagtime`
+        // are never flagged (every model applies them to the dose).
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str)
+            .expect("unused param is a warning, not a parse error");
+        assert!(
+            parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("does not use") && w.contains("`ka`")),
+            "expected an unused-`ka` warning, got: {:?}",
+            parsed.model.parse_warnings
+        );
     }
 
     #[test]

@@ -9201,6 +9201,99 @@ mod tests {
     }
 
     #[test]
+    fn test_param_used_only_in_derived_not_flagged_dead() {
+        // An individual parameter referenced only in [derived] — not mapped into
+        // pk(...) and not used by another parameter — must NOT be flagged
+        // "computed but never used": the census tokenizes every block (#309).
+        let model = |derived: &str| -> String {
+            format!(
+                "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = 1.0
+  KEL = CL / V
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+{derived}
+[error_model]
+  DV ~ proportional(EPS)
+"
+            )
+        };
+        // KEL is referenced in [derived] → used → no dead warning.
+        let p =
+            super::parse_full_model(&model("\n[derived]\n  RATE = KEL * 2\n")).expect("parse ok");
+        assert!(
+            !p.model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used")),
+            "KEL is used in [derived] and must not be flagged dead: {:?}",
+            p.model.parse_warnings
+        );
+        // Negative control: with no [derived] reference, KEL IS dead.
+        let p2 = super::parse_full_model(&model("")).expect("parse ok");
+        assert!(
+            p2.model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used") && w.contains("`KEL`")),
+            "without the [derived] use KEL must be flagged dead: {:?}",
+            p2.model.parse_warnings
+        );
+    }
+
+    #[test]
+    fn test_undeclared_name_in_derived_is_accepted_silently() {
+        // [derived] uses `fallback_covariate = false`: an unknown identifier
+        // becomes a Variable resolved at output time, not a covariate. So an
+        // undeclared name used only in [derived] parses without error and without
+        // any warning — unlike an ODE RHS (which rejects covariate references), or
+        // [individual_parameters] when a [covariates] block is present (strict
+        // mode, which warns on an undeclared covariate).
+        let src = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[derived]
+  RATIO = MYSTERY_NAME / CL
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed =
+            super::parse_full_model(src).expect("undeclared name in [derived] should parse");
+        assert!(
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("MYSTERY_NAME")),
+            "undeclared name in [derived] is a silent Variable, no warning: {:?}",
+            parsed.model.parse_warnings
+        );
+    }
+
+    #[test]
     fn test_parse_method_single() {
         let opts = parse_fit_options(&["method = focei".to_string()]).unwrap();
         assert_eq!(opts.method, EstimationMethod::FoceI);

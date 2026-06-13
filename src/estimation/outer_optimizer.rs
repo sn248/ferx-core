@@ -1750,6 +1750,17 @@ fn ad_population_gradient(
             .1
         })
         .collect();
+    assemble_population_gradient(&per_subj, np)
+}
+
+/// Assemble the covariance-step population gradient `2·Σᵢ gᵢ` from per-subject
+/// gradients, summing over subjects in index order. Both the parallel
+/// [`ad_population_gradient`] and the serial per-point gradient inside
+/// [`compute_covariance`] route their reduction through here, so there is a
+/// single summation order — which is what keeps the flattened (#256) covariance
+/// bit-identical to the pre-flatten serial stencil for FOCE. `np` is the packed
+/// parameter count; each `gᵢ` has length `np`.
+fn assemble_population_gradient(per_subj: &[Vec<f64>], np: usize) -> Vec<f64> {
     (0..np)
         .map(|k| per_subj.iter().map(|gi| gi[k]).sum::<f64>() * 2.0)
         .collect()
@@ -2502,11 +2513,13 @@ pub(crate) fn compute_covariance(
             // Gradient of `2·pop_nll` (no omega-prior add-back; both the SB and
             // Laplace marginals already carry Ω — issue #243/#249).
             //
-            // Keep this as a per-subject collect followed by `Σᵢ gᵢ[k] · 2` — it
-            // reproduces `ad_population_gradient`'s exact summation order, which is
-            // what makes the FOCE covariance bit-identical to the pre-#256 serial
-            // stencil. Do NOT fuse it with the Δ loop below (interleaving `2·gᵢ`
-            // and `2·tᵢ` per subject changes the floating-point reduction order).
+            // Build the per-subject gradients serially (subjects are serial inside
+            // each point — the #256 flatten parallelises over points, not subjects)
+            // and reduce through `assemble_population_gradient`, the same reduction
+            // `ad_population_gradient` uses — so the summation order matches and the
+            // FOCE covariance stays bit-identical to the pre-#256 serial stencil.
+            // The Δ correction below is kept as a separate loop (NOT fused): summing
+            // `2·tᵢ` after `2·Σ gᵢ` preserves that reduction order exactly.
             let per_subj: Vec<Vec<f64>> = (0..n_subj_cov)
                 .map(|i| {
                     crate::estimation::gauss_newton::subject_nll_pop_grad(
@@ -2524,9 +2537,7 @@ pub(crate) fn compute_covariance(
                     .1
                 })
                 .collect();
-            let mut g: Vec<f64> = (0..np)
-                .map(|kk| per_subj.iter().map(|gi| gi[kk]).sum::<f64>() * 2.0)
-                .collect();
+            let mut g = assemble_population_gradient(&per_subj, np);
             // #274 Δ correction (FOCEI only); summed in subject order to match.
             if options.interaction {
                 for i in 0..n_subj_cov {

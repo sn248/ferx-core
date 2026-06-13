@@ -748,6 +748,11 @@ impl PkModel {
 
     /// The canonical short model name (e.g. `one_cpt_oral`), used in parser
     /// diagnostics. Long-form aliases (`one_compartment_oral`) normalise to this.
+    ///
+    /// Deliberately the inverse of the string→`PkModel` match in
+    /// `parse_structural_model` (which additionally accepts the long-form
+    /// aliases, so the two can't be a single bidirectional table);
+    /// `canonical_name_round_trips_through_parser` guards them against drift.
     pub(crate) fn canonical_name(&self) -> &'static str {
         match self {
             PkModel::OneCptIv => "one_cpt_iv",
@@ -760,7 +765,12 @@ impl PkModel {
     }
 
     /// Whether this is a first-order-absorption (oral) model. Oral models read
-    /// `ka` and `f`; IV models do not.
+    /// `ka` and `f`; IV models do not. The canonical home for this predicate.
+    ///
+    /// The `#[cfg(feature = "autodiff")]` free fn `is_oral_model` in
+    /// `estimation/inner_optimizer.rs` is a pre-existing identical copy; it should
+    /// delegate here, but that path isn't compiled in the default/CI build, so the
+    /// change can't be verified yet — fold it in when autodiff runs in CI (#281).
     pub(crate) fn is_oral(&self) -> bool {
         matches!(
             self,

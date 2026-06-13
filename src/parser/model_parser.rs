@@ -1893,6 +1893,15 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // produces a false "unused" warning. Analytical models only: ODE models
     // auto-route parameters to slots by name (including engine-applied
     // F/lagtime), so textual absence there would not imply unused.
+    //
+    // A raw-text census (rather than resolving against the parsed ASTs) is the
+    // deliberate choice: it covers *every* block uniformly — including ones whose
+    // references aren't retained as walkable ASTs at this point (`[output]`,
+    // `[scaling]`, …) — so it cannot false-positive by overlooking a usage site.
+    // It iterates `blocks.values()` = the *unnamed* blocks only; this is safe
+    // because individual-parameter names are confined to unnamed blocks (named
+    // `[event_model LABEL]` / `[covariate_nn NAME]` blocks reference thetas/etas/
+    // covariates, never indiv params — so a param can't be "used" solely there).
     if !pk_param_map.is_empty() {
         let mut token_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();

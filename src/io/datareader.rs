@@ -1979,4 +1979,69 @@ mod tests {
         // Standard and IOV columns must not appear in covariate_names.
         assert_eq!(pop.covariate_names, vec!["WT"]);
     }
+
+    #[test]
+    fn tte_aware_readers_route_through_gaussian_path_with_empty_tte_cmts() {
+        // `read_nonmem_csv_filtered_tte` / `_with_covariates_tte` (used by
+        // api::read_population_for for [event_model] models) are always compiled
+        // but only *called* on the TTE path, so they read as uncovered in the
+        // FD-only build. With an empty tte_cmts set they delegate to the Gaussian
+        // reader; drive them directly to cover the column-augmentation / union /
+        // delegation lines. (The cfg(survival) row-routing inside the impl is
+        // exercised by the survival job, not here.)
+        let no_tte = std::collections::HashSet::new();
+        let csv = "ID,TIME,DV,EVID,AMT,WT,STUDY,AGE\n\
+                   1,0,.,1,100,70,1,30\n\
+                   1,1,5.0,0,.,70,1,30\n\
+                   2,0,.,1,100,80,2,40\n\
+                   2,1,4.0,0,.,80,2,40\n";
+        let f = write_csv(csv);
+
+        // filtered_tte: explicit covariate list, augmented by a filter that
+        // references an out-of-list column (STUDY) — exercises the augmentation
+        // branch; the filter then drops STUDY==2 (subject 2).
+        let cols: &[&str] = &["WT"];
+        let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[]).unwrap();
+        let pop = read_nonmem_csv_filtered_tte(f.path(), Some(cols), None, Some(&filter), &no_tte)
+            .unwrap();
+        assert_eq!(
+            pop.subjects
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"],
+            "STUDY==2 subject should be filtered out via the augmented column"
+        );
+
+        // with_covariates_tte: declared WT + an undeclared `extra` (STUDY) + a
+        // filter referencing a *third* column (AGE) — exercises BOTH the
+        // extra-columns dedup loop and the filter-referenced-column merge, and
+        // *validates* the merge: AGE==40 can only drop subject 2 if AGE was
+        // actually pulled into the read union, so the assertion fails if the
+        // merge regresses.
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let extra = ["STUDY".to_string()];
+        let drop_age40 = SelectionFilter::from_opts(&["AGE == 40".to_string()], &[], &[]).unwrap();
+        let (pop2, _table) = read_nonmem_csv_with_covariates_tte(
+            f.path(),
+            &decls,
+            &extra,
+            None,
+            Some(&drop_age40),
+            &no_tte,
+        )
+        .unwrap();
+        // Subject 2 (AGE=40) is dropped via the merged AGE column; subject 1 remains.
+        assert_eq!(
+            pop2.subjects
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"],
+            "AGE==40 must drop subject 2 — proving AGE was pulled into the read union"
+        );
+    }
 }

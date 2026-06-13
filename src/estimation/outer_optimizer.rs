@@ -2520,30 +2520,46 @@ pub(crate) fn compute_covariance(
             // FOCE covariance stays bit-identical to the pre-#256 serial stencil.
             // The Δ correction below is kept as a separate loop (NOT fused): summing
             // `2·tᵢ` after `2·Σ gᵢ` preserves that reduction order exactly.
-            let per_subj: Vec<Vec<f64>> = (0..n_subj_cov)
-                .map(|i| {
-                    crate::estimation::gauss_newton::subject_nll_pop_grad(
-                        xv,
-                        template,
-                        model,
-                        population,
-                        i,
-                        &ehs[i],
-                        &hms[i],
-                        &[],
-                        &bounds,
-                        options,
-                    )
-                    .1
-                })
-                .collect();
-            let mut g = assemble_population_gradient(&per_subj, np);
+            //
+            // `subject_nll_pop_grad_with_cache` also hands back the per-subject
+            // Laplace intermediates (when this subject took the FOCEI analytical
+            // path); the Δ loop below reuses them so it does not recompute the
+            // predictions or re-factorise H̃.
+            let mut grads: Vec<Vec<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut caches: Vec<Option<crate::estimation::gauss_newton::LaplaceGradCache>> =
+                Vec::with_capacity(n_subj_cov);
+            for i in 0..n_subj_cov {
+                let (_, gi, ci) = crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
+                    xv,
+                    template,
+                    model,
+                    population,
+                    i,
+                    &ehs[i],
+                    &hms[i],
+                    &[],
+                    &bounds,
+                    options,
+                );
+                grads.push(gi);
+                caches.push(ci);
+            }
+            let mut g = assemble_population_gradient(&grads, np);
             // #274 Δ correction (FOCEI only); summed in subject order to match.
             if options.interaction {
                 for i in 0..n_subj_cov {
                     if let Some(ti) =
                         crate::estimation::gauss_newton::subject_eta_response_correction(
-                            xv, template, model, population, i, &ehs[i], &hms[i], options,
+                            caches[i].as_ref(),
+                            xv,
+                            template,
+                            model,
+                            population,
+                            i,
+                            &ehs[i],
+                            &hms[i],
+                            &bounds,
+                            options,
                         )
                     {
                         for (gk, tk) in g.iter_mut().zip(ti.iter()) {

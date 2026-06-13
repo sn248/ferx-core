@@ -12,6 +12,8 @@ For standard compartmental models, use the `pk` keyword with a model function:
 pk MODEL_NAME(param=VALUE, param=VALUE, ...)
 ```
 
+Each `VALUE` is either a parameter defined in `[individual_parameters]` or a numeric constant (e.g. `ka=1.0` fixes absorption at 1.0). Referencing a name that is **not** a defined parameter is a parse error — ferx does not silently default the slot to 0.0 (which previously produced a "converged" but structurally broken fit, #261). An unrecognized `param` key (e.g. the typo `clx=`) is likewise rejected.
+
 ### Available Models
 
 | Model Function | Compartments | Route | Required Parameters |

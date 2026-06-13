@@ -75,6 +75,13 @@ section of the SDLC for the versioning policy).
   the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
 
 ### Fixed
+- A `[structural_model]` PK parameter that references a name not defined in
+  `[individual_parameters]` (e.g. `pk one_cpt_oral(cl=CL, ...)` with no `CL`)
+  is now a parse error instead of being silently dropped and defaulting the
+  slot to 0.0 — which previously produced a "converged" but structurally broken
+  fit (all predictions floored, 100% shrinkage). An unrecognized PK-parameter
+  key (e.g. the typo `clx=`) is likewise rejected, and a numeric-literal value
+  (e.g. `ka=1.0`) is now honored as a constant rather than dropped to 0.0 (#261).
 - Datasets without an `EVID` column no longer silently fit a dose-free model.
   ferx now infers a dose from a nonzero `AMT` when `EVID` is absent (matching
   NONMEM), so legacy datasets that mark doses only by `AMT`/`MDV=1` administer

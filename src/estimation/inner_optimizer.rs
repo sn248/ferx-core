@@ -492,12 +492,20 @@ pub fn find_ebe(
     }
 
     // mu: shift vector (zeros when no mu-referencing)
-    let mu: Vec<f64> = mu_k.map(|m| m.to_vec()).unwrap_or_else(|| vec![0.0; n_eta]);
-
-    // psi_init: warm start converted to psi-space, or prior mode (psi = mu, eta_true = 0)
-    let mut psi: Vec<f64> = match eta_init {
-        Some(warm) => warm.iter().zip(mu.iter()).map(|(e, m)| e + m).collect(),
-        None => mu.clone(),
+    // The inner EBE is optimised directly in eta_true space. Mu-referencing is a
+    // pure reparametrisation of the search frame (`psi = eta_true + mu`) — it does
+    // NOT change the EBE, since the minimum of `individual_nll(eta) + eta'Ω⁻¹eta`
+    // is invariant to the constant shift. Searching the offset psi-space mis-scaled
+    // the FD gradient step (`~|psi|`) for **additive** mu-refs, where `mu = TVx` is
+    // large (e.g. 8) while the curvature lives at `eta ~ O(1)`; the biased gradient
+    // drove the inner loop to a wrong eta and a degenerate marginal (issue #302).
+    // mu-referencing's real benefit (the H-column gradient reuse) lives in the
+    // OUTER loop, so dropping the shift here is correct and leaves the AD inner
+    // path bit-identical (an exact gradient is shift-invariant).
+    let _ = mu_k;
+    let mut eta: Vec<f64> = match eta_init {
+        Some(warm) => warm.to_vec(),
+        None => vec![0.0; n_eta],
     };
 
     // Per-subject scratch buffers, built once and reused across every
@@ -534,15 +542,14 @@ pub fn find_ebe(
         None
     };
 
-    // Objective in psi-space: model always receives eta_true = psi - mu.
-    let obj = |p: &[f64]| -> f64 {
+    // Objective evaluated directly at eta_true (the optimiser variable).
+    let obj = |e: &[f64]| -> f64 {
         let mut scratch = pk_scratch_cell.borrow_mut();
-        let eta_t: Vec<f64> = p.iter().zip(mu.iter()).map(|(pi, mi)| pi - mi).collect();
         individual_nll_into_with_schedule(
             model,
             subject,
             &params.theta,
-            &eta_t,
+            e,
             &params.omega,
             &params.sigma.values,
             &mut scratch,
@@ -682,14 +689,12 @@ pub fn find_ebe(
         let omega_inv_flat = ad_omega_inv_flat.as_ref().unwrap();
         let log_det_omega = ad_log_det_omega.unwrap();
         let cens_f64 = ad_cens_f64.as_ref().unwrap();
-        let mu_ad = mu.clone();
 
         match grad_method {
             InnerGradientMethod::AdSingleSnapshot => {
                 let tv_adjusted = ad_tv_adjusted.as_ref().unwrap();
                 let grad_fn = |p: &[f64]| -> Vec<f64> {
-                    let eta_t: Vec<f64> =
-                        p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
+                    let eta_t: Vec<f64> = p.to_vec();
                     let t0 = std::time::Instant::now();
                     let obs_scale = build_scale_array_for_ad(model, subject, &params.theta, &eta_t);
                     let (_, g) = ad_gradients::compute_nll_gradient_ad(
@@ -712,14 +717,13 @@ pub fn find_ebe(
                     GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
                     g
                 };
-                bfgs_minimize_with_grad(&obj, &grad_fn, &mut psi, n_eta, max_iter, tol)
+                bfgs_minimize_with_grad(&obj, &grad_fn, &mut eta, n_eta, max_iter, tol)
             }
             InnerGradientMethod::AdEventDriven => {
                 let event_data = ad_event_data.as_ref().unwrap();
                 let tv_per_event = ad_tv_per_event.as_ref().unwrap();
                 let grad_fn = |p: &[f64]| -> Vec<f64> {
-                    let eta_t: Vec<f64> =
-                        p.iter().zip(mu_ad.iter()).map(|(pi, mi)| pi - mi).collect();
+                    let eta_t: Vec<f64> = p.to_vec();
                     let t0 = std::time::Instant::now();
                     let event_scale = build_event_scale_array_for_ad(
                         model,
@@ -747,35 +751,35 @@ pub fn find_ebe(
                     GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
                     g
                 };
-                bfgs_minimize_with_grad(&obj, &grad_fn, &mut psi, n_eta, max_iter, tol)
+                bfgs_minimize_with_grad(&obj, &grad_fn, &mut eta, n_eta, max_iter, tol)
             }
             InnerGradientMethod::Fd => unreachable!("guarded above"),
         }
     } else {
-        bfgs_minimize(&obj, &mut psi, n_eta, max_iter, tol)
+        bfgs_minimize(&obj, &mut eta, n_eta, max_iter, tol)
     };
 
     #[cfg(not(feature = "autodiff"))]
     let result = {
         let _ = grad_method; // silence unused warning on stable builds
-        bfgs_minimize(&obj, &mut psi, n_eta, max_iter, tol)
+        bfgs_minimize(&obj, &mut eta, n_eta, max_iter, tol)
     };
 
-    // If BFGS failed, try Nelder-Mead from the prior mode (psi = mu, eta_true = 0)
+    // If BFGS failed, try Nelder-Mead from the prior mode (eta_true = 0).
     let bfgs_converged = result;
     let (nm_converged, used_fallback) = if !bfgs_converged {
-        psi = mu.clone();
-        let nm_ok = nelder_mead_minimize(&obj, &mut psi, n_eta, max_iter * 5, tol);
+        eta = vec![0.0; n_eta];
+        let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
         (nm_ok, true)
     } else {
         (false, false)
     };
 
     let ebe_converged = bfgs_converged || nm_converged;
-    let nll = obj(&psi);
+    let nll = obj(&eta);
 
-    // Recover eta_true = psi - mu (mean-zero, NONMEM-compatible output)
-    let eta_true: Vec<f64> = psi.iter().zip(mu.iter()).map(|(p, m)| p - m).collect();
+    // The optimiser variable already is eta_true (mean-zero, NONMEM-compatible).
+    let eta_true: Vec<f64> = eta;
 
     // Compute Jacobian at eta_true — match the gradient path so the H matrix
     // is consistent with the gradient that drove convergence. Reuses the
@@ -1797,6 +1801,114 @@ mod iov_tests {
         let params = model.default_params.clone();
         let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None);
         assert!(result.kappas.is_empty());
+    }
+
+    /// Regression guard for #302: the non-IOV inner EBE must be invariant to the
+    /// mu-reference shift — it is a pure reparametrization of the search frame.
+    /// The bug was searching the offset psi-space (`psi = eta + mu`), which
+    /// mis-scaled the FD gradient step (`~|psi|`) for a LARGE mu (additive
+    /// mu-refs, `mu = TVx`), driving the EBE to a wrong point. A large `mu_k`
+    /// must yield the same `eta_true` as `mu_k = None`.
+    #[test]
+    fn find_ebe_noniov_invariant_to_large_mu_shift() {
+        let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+        let default_params = crate::types::ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.01, 1.0],
+            theta_upper: vec![100.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        let model = CompiledModel {
+            name: "noniov_mu".into(),
+            has_conditional_eta_params: false,
+            pk_model: PkModel::OneCptIv,
+            error_model: ErrorModel::Proportional,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp();
+                p.values[1] = theta[1];
+                p
+            }),
+            n_theta: 2,
+            n_eta: 1,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: Vec::new(),
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into(), "V".into()],
+            indiv_param_partials: crate::types::IndivParamPartials::empty(),
+            default_params,
+            omega_init_as_sd: vec![false],
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: Vec::new(),
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: vec![0],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::default(),
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
+        };
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 4.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![40.0, 32.0, 20.0],
+            obs_cmts: vec![1; 3],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 3],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let params = model.default_params.clone();
+        let r_none = find_ebe(&model, &subject, &params, 200, 1e-6, None, None);
+        // A large mu (e.g. an additive mu-ref's typical value) is the case that
+        // mis-converged in psi-space; the EBE must be unchanged.
+        let r_mu = find_ebe(&model, &subject, &params, 200, 1e-6, None, Some(&[8.0]));
+        assert!(
+            (r_none.eta[0] - r_mu.eta[0]).abs() < 1e-9,
+            "non-IOV EBE must be mu-shift invariant: none={}, mu=8 -> {}",
+            r_none.eta[0],
+            r_mu.eta[0]
+        );
     }
 
     #[test]

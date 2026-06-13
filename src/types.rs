@@ -699,6 +699,102 @@ pub enum PkModel {
     ThreeCptOral,
 }
 
+impl PkModel {
+    /// Canonical PK slots that MUST be mapped in a `[structural_model]` `pk(...)`
+    /// line for this model, each paired with the conventional name shown in
+    /// parser errors. `f`/`lagtime` are intentionally absent — they are optional
+    /// and default to 1.0 / 0.0 (see `PkParams::default`).
+    ///
+    /// Slots are canonical (`name_to_index` values), so the `v`/`v1` and `q`/`q2`
+    /// aliases satisfy the same requirement. The display names mirror the
+    /// "Required Parameters" table in `docs/src/model-file/structural-model.md`;
+    /// the parser enforces what that table documents (issue #309).
+    pub(crate) fn required_pk_params(&self) -> &'static [(usize, &'static str)] {
+        match self {
+            PkModel::OneCptIv => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v")],
+            PkModel::OneCptOral => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v"), (PK_IDX_KA, "ka")],
+            PkModel::TwoCptIv => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q"),
+                (PK_IDX_V2, "v2"),
+            ],
+            PkModel::TwoCptOral => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_KA, "ka"),
+            ],
+            PkModel::ThreeCptIv => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q2"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_Q3, "q3"),
+                (PK_IDX_V3, "v3"),
+            ],
+            PkModel::ThreeCptOral => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q2"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_Q3, "q3"),
+                (PK_IDX_V3, "v3"),
+                (PK_IDX_KA, "ka"),
+            ],
+        }
+    }
+
+    /// The canonical short model name (e.g. `one_cpt_oral`), used in parser
+    /// diagnostics. Long-form aliases (`one_compartment_oral`) normalise to this.
+    ///
+    /// Deliberately the inverse of the string→`PkModel` match in
+    /// `parse_structural_model` (which additionally accepts the long-form
+    /// aliases, so the two can't be a single bidirectional table);
+    /// `canonical_name_round_trips_through_parser` guards them against drift.
+    pub(crate) fn canonical_name(&self) -> &'static str {
+        match self {
+            PkModel::OneCptIv => "one_cpt_iv",
+            PkModel::OneCptOral => "one_cpt_oral",
+            PkModel::TwoCptIv => "two_cpt_iv",
+            PkModel::TwoCptOral => "two_cpt_oral",
+            PkModel::ThreeCptIv => "three_cpt_iv",
+            PkModel::ThreeCptOral => "three_cpt_oral",
+        }
+    }
+
+    /// Whether this is a first-order-absorption (oral) model. Oral models read
+    /// `ka` and `f`; IV models do not. The canonical home for this predicate.
+    ///
+    /// The `#[cfg(feature = "autodiff")]` free fn `is_oral_model` in
+    /// `estimation/inner_optimizer.rs` is a pre-existing identical copy; it should
+    /// delegate here, but that path isn't compiled in the default/CI build, so the
+    /// change can't be verified yet — fold it in when autodiff runs in CI (#281).
+    pub(crate) fn is_oral(&self) -> bool {
+        matches!(
+            self,
+            PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+        )
+    }
+
+    /// Whether the analytical solver for this model actually reads the given PK
+    /// slot. This is the single source of truth for "is a mapped param used", and
+    /// it mirrors what the `pk/` closed forms consume — pinned to real solver
+    /// behaviour by `consumes_pk_slot_matches_solver` in `pk/mod.rs`, so a future
+    /// variant that reads a new slot can't silently drift from this:
+    ///   - every required structural slot (`required_pk_params`);
+    ///   - `lagtime`, applied to *every* dose (`predict_concentration` shifts the
+    ///     effective dose time for IV and oral alike);
+    ///   - `f` (bioavailability) **only** for oral models — the IV closed forms
+    ///     never read it, so `f` on an IV model is inert.
+    pub(crate) fn consumes_pk_slot(&self, slot: usize) -> bool {
+        slot == PK_IDX_LAGTIME
+            || (slot == PK_IDX_F && self.is_oral())
+            || self.required_pk_params().iter().any(|(s, _)| *s == slot)
+    }
+}
+
 /// Supported residual error models
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorModel {
@@ -3132,6 +3228,52 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_pk_params_match_docs_table() {
+        // Locks the per-model required slots to the "Required Parameters" table
+        // in docs/src/model-file/structural-model.md (issue #309).
+        use PkModel::*;
+        let cases: &[(PkModel, &[&str])] = &[
+            (OneCptIv, &["cl", "v"]),
+            (OneCptOral, &["cl", "v", "ka"]),
+            (TwoCptIv, &["cl", "v1", "q", "v2"]),
+            (TwoCptOral, &["cl", "v1", "q", "v2", "ka"]),
+            (ThreeCptIv, &["cl", "v1", "q2", "v2", "q3", "v3"]),
+            (ThreeCptOral, &["cl", "v1", "q2", "v2", "q3", "v3", "ka"]),
+        ];
+        for (model, expected_names) in cases {
+            let req = model.required_pk_params();
+            let names: Vec<&str> = req.iter().map(|(_, n)| *n).collect();
+            assert_eq!(&names, expected_names, "wrong required names for {model:?}");
+            // Every (slot, name) pair must be self-consistent with name_to_index,
+            // so the parser's key→slot canonicalisation lines up with this table.
+            for (slot, name) in req {
+                assert_eq!(
+                    PkParams::name_to_index(name),
+                    Some(*slot),
+                    "slot/name mismatch for `{name}` in {model:?}"
+                );
+            }
+            // f / lagtime are optional and must never appear as required.
+            assert!(
+                !req.iter()
+                    .any(|(s, _)| *s == PK_IDX_F || *s == PK_IDX_LAGTIME),
+                "{model:?} must not require f/lagtime"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_name_covers_all_variants() {
+        use PkModel::*;
+        assert_eq!(OneCptIv.canonical_name(), "one_cpt_iv");
+        assert_eq!(OneCptOral.canonical_name(), "one_cpt_oral");
+        assert_eq!(TwoCptIv.canonical_name(), "two_cpt_iv");
+        assert_eq!(TwoCptOral.canonical_name(), "two_cpt_oral");
+        assert_eq!(ThreeCptIv.canonical_name(), "three_cpt_iv");
+        assert_eq!(ThreeCptOral.canonical_name(), "three_cpt_oral");
+    }
 
     #[test]
     fn classify_warning_convergence_is_critical() {

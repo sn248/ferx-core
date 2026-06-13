@@ -66,6 +66,13 @@ section of the SDLC for the versioning policy).
   plus an `ExclusionSummary` on `FitResult` surfaced in the CLI and YAML output.
 - Combined ferx-core + ferx-r development documentation: a Development Lifecycle
   (SDLC) page and a Contributing page in the book.
+- `[structural_model]` now warns when a `pk(...)` line maps a parameter the
+  chosen model does not use (e.g. `ka` or `f` on an IV model, or `q`/`v2` on a
+  one-compartment model); the mapping is accepted but has no effect (#309).
+- `[individual_parameters]` now warns when a declared parameter is computed but
+  never used — neither mapped into the `pk(...)` model nor referenced in any
+  other block (e.g. declaring `F` but forgetting `f=F`); it silently has no
+  effect (#309).
 
 ### Changed
 - IMP (importance sampling) now jointly samples (η, κ) for IOV models,
@@ -73,6 +80,10 @@ section of the SDLC for the versioning policy).
   directly comparable to FOCE/FOCEI and NONMEM `METHOD=IMP`. Previously κ was
   held fixed at its EBE mode, giving a partial marginal; `kappa_treatment` in
   the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
+- A `[structural_model]` `pk(...)` line that omits a required parameter for the
+  chosen model (e.g. `ka` for `one_cpt_oral`) is now a parse error naming the
+  missing parameter, instead of silently defaulting that slot to `0.0` and
+  fitting to a structurally broken optimum (#309).
 
 ### Fixed
 - A `[structural_model]` PK parameter that references a name not defined in

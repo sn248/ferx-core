@@ -1101,6 +1101,45 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &covariate_nns_for_closure,
     )?;
 
+    // Reject an analytical model that omits a required PK parameter for its
+    // structure (issue #309). Runs *after* build_pk_param_fn so the per-key
+    // validation (unknown key / undefined reference, #308) reports first; every
+    // surviving key is then a known PK name, so the canonical-slot set is exact
+    // and the `v`/`v1`, `q`/`q2` aliases satisfy their slot. An unmapped required
+    // slot would otherwise stay at `PkParams::default()` (0.0) and the fit would
+    // silently "converge" to a structurally broken optimum.
+    if !pk_param_map.is_empty() {
+        let mapped_slots: std::collections::HashSet<usize> = pk_param_map
+            .keys()
+            .filter_map(|k| PkParams::name_to_index(k))
+            .collect();
+        let missing: Vec<&str> = pk_model
+            .required_pk_params()
+            .iter()
+            .filter(|(slot, _)| !mapped_slots.contains(slot))
+            .map(|(_, name)| *name)
+            .collect();
+        if !missing.is_empty() {
+            let list = missing
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (verb, pron) = if missing.len() == 1 {
+                ("is", "it")
+            } else {
+                ("are", "them")
+            };
+            let first = missing[0];
+            let first_upper = first.to_uppercase();
+            return Err(format!(
+                "[structural_model] {} requires {list}, which {verb} not mapped. \
+                 Add {pron}, e.g. `{first}={first_upper}`.",
+                pk_model.canonical_name()
+            ));
+        }
+    }
+
     // Append NN-weight thetas (Phase A M1), then diffusion variances. Both
     // sit at the tail of the theta vector so existing user-declared theta
     // indices are unaffected.
@@ -1812,6 +1851,95 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &event_model_used_thetas,
         &event_model_used_etas,
     ));
+
+    // Warn about analytical PK parameters that are mapped but unused by the
+    // chosen model — e.g. `ka` or `f` on an IV model (no absorption / no
+    // bioavailability term), or `q`/`v2` on a one-compartment model. They are set
+    // but have no effect (#309). `PkModel::consumes_pk_slot` is the single source
+    // of truth for what each model's closed form actually reads (`lagtime` for
+    // every model, `f` only for oral). Sibling to the declared-but-unused check.
+    if !pk_param_map.is_empty() {
+        let mut unused: Vec<&str> = pk_param_map
+            .iter()
+            .filter_map(|(key, _)| {
+                let slot = PkParams::name_to_index(key)?;
+                (!pk_model.consumes_pk_slot(slot)).then_some(key.as_str())
+            })
+            .collect();
+        unused.sort_unstable();
+        if !unused.is_empty() {
+            let list = unused
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            model.parse_warnings.push(format!(
+                "[structural_model] {} does not use parameter(s) {list}; they are \
+                 mapped but have no effect on this model. Remove them, or use a model \
+                 that needs them.",
+                pk_model.canonical_name()
+            ));
+        }
+    }
+
+    // Warn about an individual parameter that is computed but never used: not
+    // mapped into the analytical PK model and not referenced in any other block,
+    // so it silently has no effect — e.g. an oral model that declares `F` to
+    // estimate bioavailability but forgets `f=F`, or an unused intermediate like
+    // `ke = CL/V`. Implemented as a whole-identifier census over every model
+    // block: a declared parameter whose name appears exactly once — its own
+    // `[individual_parameters]` declaration — is dead. Over-counting (e.g. a name
+    // in a comment) only ever makes a parameter look *used*, so this never
+    // produces a false "unused" warning. Analytical models only: ODE models
+    // auto-route parameters to slots by name (including engine-applied
+    // F/lagtime), so textual absence there would not imply unused.
+    //
+    // A raw-text census (rather than resolving against the parsed ASTs) is the
+    // deliberate choice: it covers *every* block uniformly — including ones whose
+    // references aren't retained as walkable ASTs at this point (`[output]`,
+    // `[scaling]`, …) — so it cannot false-positive by overlooking a usage site.
+    // It iterates `blocks.values()` = the *unnamed* blocks only; this is safe
+    // because individual-parameter names are confined to unnamed blocks (named
+    // `[event_model LABEL]` / `[covariate_nn NAME]` blocks reference thetas/etas/
+    // covariates, never indiv params — so a param can't be "used" solely there).
+    if !pk_param_map.is_empty() {
+        let mut token_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for lines in blocks.values() {
+            for line in lines {
+                for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                    if tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                        *token_counts.entry(tok.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut dead: Vec<String> = model
+            .indiv_param_names
+            .iter()
+            .filter(|name| token_counts.get(name.as_str()).copied().unwrap_or(0) <= 1)
+            .cloned()
+            .collect();
+        dead.sort_unstable();
+        if !dead.is_empty() {
+            let list = dead
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (verb, subj, obj, aux) = if dead.len() == 1 {
+                ("is", "it", "it", "has")
+            } else {
+                ("are", "they", "them", "have")
+            };
+            model.parse_warnings.push(format!(
+                "[individual_parameters] {list} {verb} computed but never used — not \
+                 mapped into the `pk(...)` model and not referenced in any other block, \
+                 so {subj} {aux} no effect. Map {obj} in [structural_model] (e.g. \
+                 `f=F`) or remove {obj}."
+            ));
+        }
+    }
 
     // Undeclared-covariate warning: checked here (after [event_model] parsing) so
     // that covariates used only in [event_model] expressions are included.
@@ -5320,6 +5448,12 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
                 }
             }
 
+            // Structural-mapping validation (required params present, unused
+            // params, undefined references) is deferred to `parse_full_model`,
+            // which runs it *after* `build_pk_param_fn` so the per-key checks
+            // (unknown key / undefined reference, #308) report first and the
+            // required-completeness / unused checks (#309) layer cleanly on top.
+
             return Ok((pk_model, param_map));
         }
     }
@@ -8787,10 +8921,562 @@ mod tests {
             ("three_cpt_iv", PkModel::ThreeCptIv),
         ];
         for (name, expected) in cases {
+            // `parse_structural_model` only resolves the model name → variant;
+            // required-parameter completeness is checked later in `parse_full_model`.
             let lines = vec![format!("pk {}(cl=CL, v=V, q=Q, v2=V2, q2=Q2, v3=V3)", name)];
             let (pk_model, _) = parse_structural_model(&lines)
                 .unwrap_or_else(|e| panic!("`{name}` failed to parse: {e}"));
             assert_eq!(pk_model, expected, "wrong variant for `{name}`");
+        }
+    }
+
+    #[test]
+    fn canonical_name_round_trips_through_parser() {
+        // Every `PkModel::canonical_name()` must be a model name the parser
+        // accepts and maps back to the same variant — guards `canonical_name`
+        // (types.rs) against drifting from this name table.
+        for model in [
+            PkModel::OneCptIv,
+            PkModel::OneCptOral,
+            PkModel::TwoCptIv,
+            PkModel::TwoCptOral,
+            PkModel::ThreeCptIv,
+            PkModel::ThreeCptOral,
+        ] {
+            let lines = vec![format!("pk {}(cl=CL, v=V)", model.canonical_name())];
+            let (parsed, _) = parse_structural_model(&lines).unwrap_or_else(|e| {
+                panic!(
+                    "canonical_name `{}` did not parse: {e}",
+                    model.canonical_name()
+                )
+            });
+            assert_eq!(
+                parsed,
+                model,
+                "canonical_name `{}` did not round-trip",
+                model.canonical_name()
+            );
+        }
+    }
+
+    /// A complete analytical model wrapping `pk_line`, with every commonly
+    /// referenced individual parameter defined so `build_pk_param_fn`'s per-key
+    /// value validation passes and only the structural-mapping checks (required /
+    /// unused, run in `parse_full_model`) are exercised. Surplus declared params
+    /// just produce the usual declared-but-unused warnings, which don't affect
+    /// whether parsing succeeds.
+    fn structural_model_with(pk_line: &str) -> String {
+        format!(
+            "
+[parameters]
+  theta TVX(1.0, 0.001, 100.0)
+  omega ETA ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL   = TVX * exp(ETA)
+  V    = TVX
+  V1   = TVX
+  Q    = TVX
+  Q2   = TVX
+  V2   = TVX
+  Q3   = TVX
+  V3   = TVX
+  KA   = TVX
+  F    = TVX
+  TLAG = TVX
+
+[structural_model]
+  {pk_line}
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        )
+    }
+
+    #[test]
+    fn test_missing_required_pk_param_errors() {
+        // Omitting a required structural parameter must be a hard parse error,
+        // not a silent default-to-0.0 broken fit (issue #309).
+
+        // Single missing param: exact message (matches the #309 acceptance text).
+        let err = expect_parse_err(&structural_model_with("pk one_cpt_oral(cl=CL, v=V)"));
+        assert_eq!(
+            err,
+            "[structural_model] one_cpt_oral requires `ka`, which is not mapped. \
+             Add it, e.g. `ka=KA`."
+        );
+
+        // Multiple missing params: plural grammar, names all of them.
+        let err = expect_parse_err(&structural_model_with("pk two_cpt_iv(cl=CL, v1=V1)"));
+        assert!(err.contains("`q`"), "should name q: {err}");
+        assert!(err.contains("`v2`"), "should name v2: {err}");
+        assert!(
+            err.contains("are not mapped") && err.contains("Add them"),
+            "plural grammar expected: {err}"
+        );
+
+        // `ka` omitted on a three-cpt oral model (every other slot present).
+        let err = expect_parse_err(&structural_model_with(
+            "pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)",
+        ));
+        assert!(err.contains("`ka`"), "should name ka: {err}");
+
+        // Supplying an *optional* parameter (`f`) must not mask a *missing*
+        // required one: `ka` is still reported even though `f` is present.
+        let err = expect_parse_err(&structural_model_with("pk one_cpt_oral(cl=CL, v=V, f=F)"));
+        assert!(err.contains("`ka`"), "should still name ka: {err}");
+    }
+
+    #[test]
+    fn test_required_params_present_parses_ok() {
+        // A model that maps every required slot parses without a structural error
+        // — including via the `v`/`v1` and `q`/`q2` aliases (canonical-slot check)
+        // and with optional `f`/`lagtime`/`alag` present. The required-
+        // completeness check runs after `build_pk_param_fn` (issue #309).
+        let ok_lines = [
+            "pk one_cpt_iv(cl=CL, v=V)",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+            // optional f + lagtime present alongside the required params:
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=TLAG)",
+            // `alag` alias for lagtime:
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=TLAG)",
+            "pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)",
+            // `q2` alias satisfies the `q` slot; `v` alias satisfies `v1`:
+            "pk two_cpt_iv(cl=CL, v=V1, q2=Q, v2=V2)",
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)",
+            "pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA)",
+        ];
+        for line in ok_lines {
+            assert!(
+                super::parse_full_model(&structural_model_with(line)).is_ok(),
+                "`{line}` should parse without a structural error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unused_pk_param_warns() {
+        // PK parameters mapped but not used by the chosen model parse Ok but warn
+        // (#309): on an IV model both `ka` (no absorption) AND `f` (no
+        // bioavailability term in the IV closed form) are flagged. `lagtime`,
+        // which every model applies to the dose, must NOT be flagged.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  theta TVF(1.0, 0.01, 10.0)
+  theta TVLAG(0.5)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+  F   = TVF
+  LAG = TVLAG
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, ka=KA, f=F, lagtime=LAG)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str)
+            .expect("unused params are a warning, not a parse error");
+        let warn = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .find(|w| w.contains("does not use"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected an unused-param warning, got: {:?}",
+                    parsed.model.parse_warnings
+                )
+            });
+        assert!(
+            warn.contains("`ka`"),
+            "ka should be flagged unused on IV: {warn}"
+        );
+        assert!(
+            warn.contains("`f`"),
+            "f should be flagged unused on IV: {warn}"
+        );
+        assert!(
+            !warn.contains("`lagtime`"),
+            "lagtime is applied to every dose and must not be flagged: {warn}"
+        );
+    }
+
+    #[test]
+    fn test_f_lagtime_warning_matrix() {
+        // Pins the f/lagtime warning matrix (#309). Two distinct checks fire:
+        //  - "does not use" (`consumes_pk_slot`): a param mapped in `pk(...)` but
+        //    not consumed — `f` is consumed only by oral models, `lagtime` by all;
+        //  - "computed but never used": a param declared in [individual_parameters]
+        //    but never mapped or referenced anywhere.
+        // KA/F/LAG are literals so the helper declares no surplus thetas (which
+        // would otherwise add unrelated unused-theta warnings).
+        let model = |indiv: &str, pk: &str| -> String {
+            format!(
+                "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+{indiv}
+
+[structural_model]
+  {pk}
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+            )
+        };
+        let warns = |indiv: &str, pk: &str| -> Vec<String> {
+            super::parse_full_model(&model(indiv, pk))
+                .unwrap_or_else(|e| panic!("`{pk}` should parse: {e}"))
+                .model
+                .parse_warnings
+        };
+        let has = |ws: &[String], needle: &str| ws.iter().any(|w| w.contains(needle));
+        let clv = "  CL = TVCL * exp(ETA_CL)\n  V = TVV";
+
+        // (1) IV + `f` mapped → "does not use `f`" (f is oral-only).
+        let ws = warns(
+            &format!("{clv}\n  F = 0.8"),
+            "pk one_cpt_iv(cl=CL, v=V, f=F)",
+        );
+        assert!(
+            has(&ws, "does not use") && has(&ws, "`f`"),
+            "IV + mapped f should warn unused: {ws:?}"
+        );
+
+        // (2) IV + `lagtime` mapped → NOT flagged (every model applies lagtime).
+        let ws = warns(
+            &format!("{clv}\n  LAG = 0.5"),
+            "pk one_cpt_iv(cl=CL, v=V, lagtime=LAG)",
+        );
+        assert!(
+            !has(&ws, "does not use"),
+            "IV + lagtime must not warn: {ws:?}"
+        );
+
+        // (3) Oral + `f` mapped (defined) → no warning.
+        let ws = warns(
+            &format!("{clv}\n  KA = 1.0\n  F = 0.8"),
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)",
+        );
+        assert!(
+            !has(&ws, "does not use") && !has(&ws, "computed but never used"),
+            "oral + used f must not warn: {ws:?}"
+        );
+
+        // (4) Oral + `f` mapped to an UNDEFINED variable → parse error (#308).
+        assert!(
+            super::parse_full_model(&model(
+                "  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = 1.0",
+                "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=FNOPE)",
+            ))
+            .is_err(),
+            "oral + undefined `f` reference must error"
+        );
+
+        // (5) Oral + `F` declared but NOT mapped → "computed but never used `F`".
+        let ws = warns(
+            &format!("{clv}\n  KA = 1.0\n  F = 0.8"),
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        );
+        assert!(
+            has(&ws, "computed but never used") && has(&ws, "`F`"),
+            "oral + declared-not-mapped F should warn dead: {ws:?}"
+        );
+
+        // (6) IV + `F` declared but NOT mapped → "computed but never used `F`".
+        let ws = warns(&format!("{clv}\n  F = 0.8"), "pk one_cpt_iv(cl=CL, v=V)");
+        assert!(
+            has(&ws, "computed but never used") && has(&ws, "`F`"),
+            "IV + declared-not-mapped F should warn dead: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn test_param_used_only_in_derived_not_flagged_dead() {
+        // An individual parameter referenced only in [derived] — not mapped into
+        // pk(...) and not used by another parameter — must NOT be flagged
+        // "computed but never used": the census tokenizes every block (#309).
+        let model = |derived: &str| -> String {
+            format!(
+                "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = 1.0
+  KEL = CL / V
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+{derived}
+[error_model]
+  DV ~ proportional(EPS)
+"
+            )
+        };
+        // KEL is referenced in [derived] → used → no dead warning.
+        let p =
+            super::parse_full_model(&model("\n[derived]\n  RATE = KEL * 2\n")).expect("parse ok");
+        assert!(
+            !p.model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used")),
+            "KEL is used in [derived] and must not be flagged dead: {:?}",
+            p.model.parse_warnings
+        );
+        // Negative control: with no [derived] reference, KEL IS dead.
+        let p2 = super::parse_full_model(&model("")).expect("parse ok");
+        assert!(
+            p2.model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used") && w.contains("`KEL`")),
+            "without the [derived] use KEL must be flagged dead: {:?}",
+            p2.model.parse_warnings
+        );
+    }
+
+    #[test]
+    fn test_undeclared_name_in_derived_is_accepted_silently() {
+        // [derived] uses `fallback_covariate = false`: an unknown identifier
+        // becomes a Variable resolved at output time, not a covariate. So an
+        // undeclared name used only in [derived] parses without error and without
+        // any warning — unlike an ODE RHS (which rejects covariate references), or
+        // [individual_parameters] when a [covariates] block is present (strict
+        // mode, which warns on an undeclared covariate).
+        let src = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[derived]
+  RATIO = MYSTERY_NAME / CL
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed =
+            super::parse_full_model(src).expect("undeclared name in [derived] should parse");
+        assert!(
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("MYSTERY_NAME")),
+            "undeclared name in [derived] is a silent Variable, no warning: {:?}",
+            parsed.model.parse_warnings
+        );
+    }
+
+    #[test]
+    fn test_pk_key_relevance_matrix() {
+        // Exhaustively pins every (model, PK key) cell, classified
+        // R(equired) / O(ptional, used) / U(nused) — hardcoded independently of
+        // `consumes_pk_slot`/`required_pk_params` so the test can't co-drift with
+        // the code it checks:
+        //   R → omitting the key is an error naming it;
+        //   O → mapping the key is silently accepted (no "does not use" warning);
+        //   U → mapping the key warns "does not use `key`".
+        // Keys use each model's canonical slot name (`v`/`v1`, `q`/`q2`), so the
+        // required-omission error (which echoes the canonical name) matches.
+        let matrix: &[(&str, [(&str, char); 9])] = &[
+            (
+                "one_cpt_iv",
+                [
+                    ("cl", 'R'),
+                    ("v", 'R'),
+                    ("q", 'U'),
+                    ("v2", 'U'),
+                    ("ka", 'U'),
+                    ("f", 'U'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "one_cpt_oral",
+                [
+                    ("cl", 'R'),
+                    ("v", 'R'),
+                    ("q", 'U'),
+                    ("v2", 'U'),
+                    ("ka", 'R'),
+                    ("f", 'O'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "two_cpt_iv",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'U'),
+                    ("f", 'U'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "two_cpt_oral",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'R'),
+                    ("f", 'O'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "three_cpt_iv",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q2", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'U'),
+                    ("f", 'U'),
+                    ("q3", 'R'),
+                    ("v3", 'R'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "three_cpt_oral",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q2", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'R'),
+                    ("f", 'O'),
+                    ("q3", 'R'),
+                    ("v3", 'R'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+        ];
+        // `cl` carries the theta/eta so [parameters] has no unused declarations;
+        // every other mapped key is a literal so there are no surplus declared
+        // individual parameters to flag as dead.
+        let build = |model: &str, keys: &[&str]| -> String {
+            let indiv: String = keys
+                .iter()
+                .map(|k| {
+                    let var = k.to_uppercase();
+                    if *k == "cl" {
+                        format!("  {var} = TVX * exp(ETA)\n")
+                    } else {
+                        format!("  {var} = 1.0\n")
+                    }
+                })
+                .collect();
+            let pk = keys
+                .iter()
+                .map(|k| format!("{k}={}", k.to_uppercase()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "
+[parameters]
+  theta TVX(1.0, 0.001, 100.0)
+  omega ETA ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+{indiv}
+[structural_model]
+  pk {model}({pk})
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+            )
+        };
+        for entry in matrix {
+            let model = entry.0;
+            let cells = &entry.1;
+            let required: Vec<&str> = cells.iter().filter(|c| c.1 == 'R').map(|c| c.0).collect();
+            for cell in cells {
+                let key = cell.0;
+                match cell.1 {
+                    'R' => {
+                        // Map every required key EXCEPT this one → error naming it.
+                        let keys: Vec<&str> =
+                            required.iter().copied().filter(|k| *k != key).collect();
+                        let err = super::parse_full_model(&build(model, &keys))
+                            .err()
+                            .unwrap_or_else(|| {
+                                panic!("{model}: omitting required `{key}` must error")
+                            });
+                        assert!(
+                            err.contains(&format!("`{key}`")),
+                            "{model}: omitting `{key}` should name it, got: {err}"
+                        );
+                    }
+                    class @ ('O' | 'U') => {
+                        // Map every required key PLUS this one → warn iff unused.
+                        let mut keys: Vec<&str> = required.clone();
+                        keys.push(key);
+                        let parsed = super::parse_full_model(&build(model, &keys))
+                            .unwrap_or_else(|e| panic!("{model} + `{key}` should parse: {e}"));
+                        let warned =
+                            parsed.model.parse_warnings.iter().any(|w| {
+                                w.contains("does not use") && w.contains(&format!("`{key}`"))
+                            });
+                        assert_eq!(
+                            warned,
+                            class == 'U',
+                            "{model} `{key}` ({class}): unexpected warning state, got: {:?}",
+                            parsed.model.parse_warnings
+                        );
+                    }
+                    other => panic!("bad classification `{other}`"),
+                }
+            }
         }
     }
 
@@ -12514,6 +13200,78 @@ if (1 > 0) {
     }
 
     #[test]
+    fn test_undefined_optional_pk_param_errors() {
+        // The undefined-reference guard (#261/#308) applies uniformly to the
+        // *optional* params too — `f`, `lagtime`, and the `alag` alias — not just
+        // the required ones. A typo'd / undefined optional reference must error,
+        // never silently default the slot. (#309 keeps `f`/`lagtime` *optional*,
+        // i.e. omitting them is fine; this is the orthogonal value-validation:
+        // if you DO map them, the referenced variable must exist.) All required
+        // params (cl/v/ka) are defined here so the model reaches value resolution.
+        let header = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, ";
+        let footer = ")
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        // (pk key, undefined variable) — one per optional slot, incl. the alias.
+        for (key, badvar) in [("f", "BADF"), ("lagtime", "BADLAG"), ("alag", "BADALAG")] {
+            let model_str = format!("{header}{key}={badvar}{footer}");
+            let err = expect_parse_err(&model_str);
+            assert!(
+                err.contains(badvar) && err.contains("not defined"),
+                "optional `{key}={badvar}` must error as an undefined reference, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_key_precedes_missing_required() {
+        // Precedence: when a key is unrecognized (a typo like `vx` for `v`) the
+        // error must name that bad key (#308), not report the now-unmapped slot
+        // as a missing required param (#309). The required-param check defers to
+        // the unknown-key check so the message points at the actual mistake.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, vx=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = expect_parse_err(model_str);
+        assert!(
+            err.contains("vx") && err.contains("unknown PK parameter"),
+            "unknown key `vx` must be reported, not a missing-required error, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
         // Regression for the ODE-with-lagtime path. For ODE models there is
         // no [structural_model] pk= line, so pk_param_map is empty and
@@ -15164,10 +15922,18 @@ method = foce
 "#
         );
         let parsed = parse_full_model(&src).expect("parse ok");
+        // `ke = CL/V` is itself an unused intermediate, now flagged by the
+        // computed-but-unused check (#309). This test's point is narrower: the
+        // thetas/etas it references (TVCL, TVV, ETA_CL, ETA_V) must NOT be falsely
+        // reported as unused.
         assert!(
-            parsed.model.parse_warnings.is_empty(),
-            "derived variable ke=CL/V must not trigger false positives; \
-             got: {:?}",
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("not referenced in any model expression")),
+            "thetas/etas used via the derived variable ke=CL/V must not be flagged \
+             unused; got: {:?}",
             parsed.model.parse_warnings
         );
     }

@@ -27,6 +27,12 @@ Each `VALUE` is either a parameter defined in `[individual_parameters]` or a num
 
 Each model has a `*_compartment_*` long-form alias (e.g. `three_compartment_iv`); the short and long names are interchangeable.
 
+Every parameter in the **Required Parameters** column must be mapped on the `pk(...)` line. Omitting one is a parse error (issue #309) — ferx will **not** silently default the missing slot to `0.0`, which would otherwise yield a structurally broken fit (e.g. a missing `ka` means no absorption, so every prediction floors to the log constant). Bioavailability `f` and `lagtime` (alias `alag`) are optional and default to `1.0` and `0.0` respectively.
+
+Conversely, mapping a parameter the chosen model does **not** use — e.g. `ka` or `f` on an IV model (no absorption, no bioavailability term), or `q`/`v2` on a one-compartment model — is accepted but emits a parse warning, since the mapping has no effect. `lagtime` is never flagged (every model applies it to the dose); `f` (bioavailability) is applied only by **oral** models, so mapping it on an IV model is flagged.
+
+In the other direction, an individual parameter that is **declared but never used** — neither mapped into the `pk(...)` line nor referenced in any other block — is also flagged, since it is computed but has no effect. The common case is declaring `F` to estimate bioavailability but forgetting to add `f=F` to the `pk(...)` line: analytical models bind `F` (and `lagtime`) only through an explicit `f=`/`lagtime=` mapping.
+
 There is no separate bolus or infusion variant: every IV model selects the closed form per dose from the `RATE` column (`RATE=0` ⇒ bolus, `RATE>0` ⇒ infusion). A single subject can mix the two. This matches NONMEM, nlmixr2, and Monolix.
 
 The earlier `*_iv_bolus` and `*_infusion` model names were retired in #176. The parser now rejects them with a migration message pointing at the unified `*_iv` name.

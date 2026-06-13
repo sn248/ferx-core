@@ -65,6 +65,12 @@ coverage:
       default:
         target: 90% # new/changed lines must be tested
         threshold: 0%
+        # Patch is a pull-request concept — grade changed lines only on PRs.
+        # On a push to `main` the `fast` flag is absent (its job is PR-only), so
+        # patch falls back to `survival` alone and mis-grades the merge commit's
+        # diff against a stale base: a false red on `main` that blocks nothing.
+        # `only_pulls` confines the status to PR comparisons. (#300)
+        only_pulls: true
         # `fast` + `survival` are the two FRESH per-PR coverage sources, so they
         # grade the changed lines. `survival` is required here: survival-gated
         # changes are compiled out of the `fast` build, so without it a survival

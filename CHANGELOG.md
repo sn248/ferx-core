@@ -73,6 +73,8 @@ section of the SDLC for the versioning policy).
   never used — neither mapped into the `pk(...)` model nor referenced in any
   other block (e.g. declaring `F` but forgetting `f=F`); it silently has no
   effect (#309).
+- `MACHEPS` (machine epsilon) is now available in `[odes]` RHS and `init(...)`
+  expressions, matching its existing availability in `[derived]` (#314).
 
 ### Changed
 - IMP (importance sampling) now jointly samples (η, κ) for IOV models,

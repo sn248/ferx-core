@@ -4302,6 +4302,10 @@ fn build_ode_spec(
         init_defined.insert(n.to_uppercase(), 0);
         init_defined.insert(n.to_lowercase(), 0);
     }
+    // MACHEPS is a builtin constant that `eval_expression` resolves to
+    // f64::EPSILON regardless of case, so it must not be flagged as undefined.
+    init_defined.insert("MACHEPS".to_string(), 0);
+    init_defined.insert("macheps".to_string(), 0);
     let mut init_specs: Vec<(usize, Expression)> = Vec::new();
     let mut seen_init: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rhs_lines: Vec<String> = Vec::with_capacity(lines.len());
@@ -4332,7 +4336,8 @@ fn build_ode_spec(
                 return Err(format!(
                     "[odes] init({}): references undefined name(s): {}. An init \
                      expression may only reference declared states (0 at init \
-                     time) or individual parameters (defined: {}).",
+                     time), individual parameters, or the MACHEPS constant \
+                     (defined: {}).",
                     name,
                     names.join(", "),
                     defined.join(", "),
@@ -4554,7 +4559,7 @@ fn build_ode_spec(
     // These names are reserved: reject any ODE state, individual parameter, or
     // intermediate that collides with a reserved slot so the injected solver-time
     // values are always reachable.
-    const RESERVED_ODE_NAMES: &[&str] = &["TIME", "T", "TAFD", "TAD"];
+    const RESERVED_ODE_NAMES: &[&str] = &["TIME", "T", "TAFD", "TAD", "MACHEPS"];
     for reserved in RESERVED_ODE_NAMES {
         let collides = state_names_owned
             .iter()
@@ -4563,9 +4568,9 @@ fn build_ode_spec(
             .any(|n| n.eq_ignore_ascii_case(reserved));
         if collides {
             return Err(format!(
-                "[odes] the name `{reserved}` is reserved for the solver-injected time \
-                 variable and cannot be used as a state, individual-parameter, or \
-                 intermediate name"
+                "[odes] the name `{reserved}` is reserved for a solver-injected builtin \
+                 (TIME/TAFD/TAD/MACHEPS) and cannot be used as a state, \
+                 individual-parameter, or intermediate name"
             ));
         }
     }
@@ -4573,6 +4578,7 @@ fn build_ode_spec(
     let time_slot = n_base_vars;
     let tafd_slot = n_base_vars + 1;
     let tad_slot = n_base_vars + 2;
+    let macheps_slot = n_base_vars + 3;
     // Forcefully assign reserved names (overwrite any accidental or_insert entry).
     var_idx.insert("TIME".to_string(), time_slot);
     var_idx.insert("time".to_string(), time_slot);
@@ -4582,7 +4588,11 @@ fn build_ode_spec(
     var_idx.insert("tafd".to_string(), tafd_slot);
     var_idx.insert("TAD".to_string(), tad_slot);
     var_idx.insert("tad".to_string(), tad_slot);
-    let n_vars_total = n_base_vars + 3;
+    // MACHEPS — machine epsilon, a compile-time constant. Matches its
+    // availability in `[derived]` and `init(...)` expressions.
+    var_idx.insert("MACHEPS".to_string(), macheps_slot);
+    var_idx.insert("macheps".to_string(), macheps_slot);
+    let n_vars_total = n_base_vars + 4;
 
     // Reject undefined identifiers in ODE RHS expressions (issue #314). In the
     // ODE parse context `fallback_covariate = false`, so a typo'd, omitted,
@@ -4610,8 +4620,8 @@ fn build_ode_spec(
         return Err(format!(
             "[odes]: RHS references undefined name(s): {}. An ODE RHS may only \
              reference declared states, individual parameters, ODE-block \
-             intermediates, or the reserved TIME/TAFD/TAD variables (defined: \
-             {}). If one of these is a covariate, pre-compute the \
+             intermediates, or the reserved TIME/TAFD/TAD/MACHEPS variables \
+             (defined: {}). If one of these is a covariate, pre-compute the \
              covariate-dependent term in [individual_parameters] and reference \
              that variable here instead.",
             names.join(", "),
@@ -4710,6 +4720,11 @@ fn build_ode_spec(
                         .copied()
                         .filter(|v| v.is_finite())
                         .map_or(f64::NAN, |last| t - last);
+                }
+                // MACHEPS — machine epsilon constant, available in every ODE
+                // expression (parallels its `[derived]`/`init` availability).
+                if let Some(dst) = scratch.rhs_vars.get_mut(macheps_slot) {
+                    *dst = f64::EPSILON;
                 }
 
                 // Reset du so a state without a firing d/dt this iteration
@@ -12522,6 +12537,44 @@ if (1 > 0) {
     }
 
     #[test]
+    fn test_ode_rhs_macheps_resolves_to_epsilon() {
+        // MACHEPS is a reserved ODE builtin (machine epsilon): it must resolve
+        // to f64::EPSILON in an ODE RHS — not be flagged as undefined, and not
+        // silently read 0.0.
+        let ode_lines: Vec<String> = vec!["d/dt(central) = MACHEPS".into()];
+        let state_names = vec!["central".to_string()];
+        let spec = match build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[]) {
+            Ok(s) => s,
+            Err(e) => panic!("MACHEPS in an ODE RHS must parse, got: {e}"),
+        };
+        let params = vec![0.0; crate::types::MAX_PK_PARAMS + 2];
+        let mut du = vec![0.0_f64];
+        (spec.rhs)(&[0.0], &params, 0.0, &mut du);
+        assert_eq!(
+            du[0],
+            f64::EPSILON,
+            "d/dt(central) = MACHEPS must evaluate to machine epsilon"
+        );
+    }
+
+    #[test]
+    fn test_ode_reserved_builtin_name_collision_errors() {
+        // A state / individual parameter / intermediate may not reuse a reserved
+        // builtin name — `MACHEPS` is now reserved alongside TIME/TAFD/TAD.
+        let ode_lines: Vec<String> = vec!["d/dt(MACHEPS) = -MACHEPS".into()];
+        let state_names = vec!["MACHEPS".to_string()];
+        let result = build_ode_spec(&ode_lines, &state_names, Some("MACHEPS"), &[], &[]);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a state named MACHEPS must collide with the reserved builtin"),
+        };
+        assert!(
+            err.contains("MACHEPS") && err.contains("reserved"),
+            "expected a reserved-name collision error, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_mu_ref_warning_for_conditional_param() {
         // A model where CL is assigned only inside an if-block should emit a
         // parse_warning about mu-referencing being disabled.
@@ -13839,6 +13892,16 @@ if (1 > 0) {
             err.contains("undefined name(s): BASE."),
             "error should flag only BASE as undefined, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_init_macheps_resolves_to_epsilon() {
+        // MACHEPS is available in init expressions (eval_expression resolves it)
+        // — the undefined-name check must accept it, and it evaluates to EPSILON.
+        let src = turnover_ode_model("  init(response) = MACHEPS");
+        let parsed = parse_full_model(&src).unwrap();
+        let ode = parsed.model.ode_spec.as_ref().unwrap();
+        assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![f64::EPSILON]);
     }
 
     #[test]

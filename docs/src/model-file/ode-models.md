@@ -26,6 +26,8 @@ The `[odes]` block defines the right-hand side of the ODE system:
 Expressions can reference:
 - State variables by name
 - Individual parameters defined in `[individual_parameters]`
+- The reserved builtins `TIME`/`TAFD`/`TAD` (solver time axes) and `MACHEPS`
+  (machine epsilon, `f64::EPSILON`)
 - Arithmetic operators and functions (`exp`, `log`, `sqrt`, etc.)
 - Conditional logic with the same `if (cond) { ... } else { ... }` and inline
   `if (cond) expr else expr` syntax described in
@@ -49,8 +51,8 @@ Expressions can reference:
 
 Every name in an ODE expression must resolve to a declared state, an individual
 parameter, an intermediate variable assigned earlier in the block, or one of the
-reserved time variables `TIME`/`TAFD`/`TAD`. A name that matches none of these —
-a typo, an omitted parameter, or a covariate — is **rejected at parse time**
+reserved builtins `TIME`/`TAFD`/`TAD`/`MACHEPS`. A name that matches none of
+these — a typo, an omitted parameter, or a covariate — is **rejected at parse time**
 rather than silently read as `0.0`, the same structurally-broken-fit guard the
 analytical `pk(...)` mappings apply. Covariates cannot be referenced directly in
 an ODE RHS: pre-compute the covariate-dependent term in `[individual_parameters]`

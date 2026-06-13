@@ -82,6 +82,27 @@ section of the SDLC for the versioning policy).
   fit (all predictions floored, 100% shrinkage). An unrecognized PK-parameter
   key (e.g. the typo `clx=`) is likewise rejected, and a numeric-literal value
   (e.g. `ka=1.0`) is now honored as a constant rather than dropped to 0.0 (#261).
+- Datasets without an `EVID` column no longer silently fit a dose-free model.
+  ferx now infers a dose from a nonzero `AMT` when `EVID` is absent (matching
+  NONMEM), so legacy datasets that mark doses only by `AMT`/`MDV=1` administer
+  correctly. As a safety net, the reader also warns when `AMT != 0` rows are not
+  treated as doses (`W_AMT_NOT_DOSED`) or when a population with observations
+  parses zero dose events (`W_NO_DOSES`) (#262).
+- Autodiff builds now fall back to finite differences for analytical models the
+  single-snapshot AD kernel cannot represent faithfully: non-log-normal ETAs
+  (additive / logit), conditional (`if`-branch) individual-parameter
+  expressions, log-transform-both-sides (`log_additive`) error, eta-dependent
+  `[scaling] obs_scale` expressions (e.g. `obs_scale = V`), and time-to-event
+  (`[event_model]`) hazard likelihoods. The kernel hardcodes the log-normal map
+  `param = tv*exp(eta)` (plus a log-wrap for LTBS, a subject-static eta-frozen
+  `obs_scale`, and the PK NLL rather than the hazard term for TTE), so these
+  previously
+  produced inner gradients inconsistent with the objective - a small bias on
+  well-conditioned data, but on ill-conditioned FOCEI-INTER fits a spurious
+  variance-collapsed optimum with an OFV far below NONMEM's. FD-only CI never
+  exercised the AD path, so the divergence went undetected (surfaced by an
+  external NONMEM/OpenPMX/ferx benchmark, FeRx-NLME/ferx-r#154). The default
+  non-autodiff build was never affected (#278).
 - FOCEI covariance standard errors (non-IOV) now include the `log|H̃|` EBE-response
   curvature for mu-referenced structural parameters, bringing the non-IOV stencil
   in line with the IOV stencil and matching NONMEM `$COV MATRIX=R` more closely on

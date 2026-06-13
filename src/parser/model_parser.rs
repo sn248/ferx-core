@@ -1445,6 +1445,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         referenced_covariates,
         gradient_method: GradientMethod::default(),
         parse_warnings: Vec::new(), // populated below
+        has_conditional_eta_params: false,
         eta_param_info,
         theta_transform,
         scaling: ScalingSpec::None,
@@ -1531,11 +1532,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // `inner_optimizer::build_scale_array_for_ad`. The slice is
         // materialised once per gradient call from a subject-static pk
         // evaluation, so AD treats the scale as constant w.r.t. eta.
-        // That's exact for the common eta-independent scale (`WT/70`,
-        // `TVV/1000`, `V` reading the EBE value) and a documented
-        // approximation for the rare eta-dependent case — users who
-        // explicitly need eta-sensitive gradients should set
-        // `gradient = fd`.
+        // That's exact for an eta-independent scale (`WT/70`, `TVV/1000` -
+        // covariates/thetas only). An eta-dependent scale (e.g.
+        // `obs_scale = V` with `V = TVV*exp(ETA_V)`) is now auto-routed to
+        // FD by `inner_optimizer::analytical_ad_unsupported`
+        // (`ScalingSpec::breaks_ad_inner_gradient`), so the user gets a
+        // correct gradient without having to set `gradient = fd` by hand.
         //
         // Form C readouts (`OdeReadout::Single` / `PerCmt`) STILL force
         // FD: they only exist on ODE models, and the AD path requires
@@ -1622,14 +1624,41 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // assign the typical-value (TV*) unconditionally and only apply the
     // conditional inside the individual parameter expression.
     {
-        // Collect variables that appear inside if-branches but NOT at top level.
-        let conditional_only: Vec<&String> = all_assigned
-            .iter()
-            .filter(|n| !indiv_var_names.contains(n))
-            .collect();
-        // Also collect top-level vars that are assigned ONLY inside if-blocks
-        // (i.e. they appear in an If branch but have no top-level Assign).
-        // Union: any var in an if-branch that references an eta → warn.
+        // Does `var` receive an eta-bearing assignment anywhere inside an
+        // `if`/`else` body, at ANY nesting depth? A top-level (unconditional)
+        // assignment does not count — only ones reached through a branch. This
+        // recurses into nested ifs: a parameter assigned only inside a *nested*
+        // branch must still disable mu-referencing and route the inner loop to
+        // FD. The earlier single-level scan missed those, leaving such models on
+        // the analytical AD kernel they can't represent faithfully (#278/#280).
+        fn body_assigns_eta(body: &[Statement], var: &str, n_eta: usize) -> bool {
+            for bs in body {
+                match bs {
+                    Statement::Assign(name, expr) => {
+                        if name == var && extract_eta_indices(expr).iter().any(|&i| i < n_eta) {
+                            return true;
+                        }
+                    }
+                    Statement::If {
+                        branches,
+                        else_body,
+                    } => {
+                        for (_, b) in branches {
+                            if body_assigns_eta(b, var, n_eta) {
+                                return true;
+                            }
+                        }
+                        if let Some(eb) = else_body {
+                            if body_assigns_eta(eb, var, n_eta) {
+                                return true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
         fn any_if_branch_assigns_eta(stmts: &[Statement], var: &str, n_eta: usize) -> bool {
             for s in stmts {
                 if let Statement::If {
@@ -1638,49 +1667,35 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 } = s
                 {
                     for (_, body) in branches {
-                        for bs in body {
-                            if let Statement::Assign(name, expr) = bs {
-                                if name == var
-                                    && extract_eta_indices(expr).iter().any(|&i| i < n_eta)
-                                {
-                                    return true;
-                                }
-                            }
+                        if body_assigns_eta(body, var, n_eta) {
+                            return true;
                         }
                     }
                     if let Some(eb) = else_body {
-                        for bs in eb {
-                            if let Statement::Assign(name, expr) = bs {
-                                if name == var
-                                    && extract_eta_indices(expr).iter().any(|&i| i < n_eta)
-                                {
-                                    return true;
-                                }
-                            }
+                        if body_assigns_eta(eb, var, n_eta) {
+                            return true;
                         }
                     }
                 }
             }
             false
         }
+        // `all_assigned` is the deduped union of top-level and if-only
+        // assignments, so one pass flags both "assigned only inside an if" and
+        // "unconditional default + conditional eta override" with no
+        // double-counting. Order is the source-declaration order of
+        // `all_assigned`.
         let mut mu_ref_disabled: Vec<String> = Vec::new();
-        for var in &conditional_only {
+        for var in &all_assigned {
             if any_if_branch_assigns_eta(&indiv_stmts, var, n_eta) {
-                mu_ref_disabled.push((*var).clone());
-            }
-        }
-        // Also catch top-level vars whose only eta-bearing assignment is
-        // inside a nested if — these are in indiv_var_names but not mu_refs.
-        for var in &indiv_var_names {
-            if !model.mu_refs.contains_key(var)
-                && any_if_branch_assigns_eta(&indiv_stmts, var, n_eta)
-            {
-                if !mu_ref_disabled.contains(var) {
-                    mu_ref_disabled.push(var.clone());
-                }
+                mu_ref_disabled.push(var.clone());
             }
         }
         if !mu_ref_disabled.is_empty() {
+            // The analytical AD inner-gradient kernels can't represent an
+            // if-branch that assigns an eta-bearing parameter, so flag the model
+            // for `inner_optimizer::analytical_ad_unsupported` to route it to FD.
+            model.has_conditional_eta_params = true;
             model.parse_warnings.push(format!(
                 "Mu-referencing disabled for conditional parameter(s): {}. \
                  Assign TV* unconditionally and apply the if-block to the individual \
@@ -11610,6 +11625,41 @@ if (1 > 0) {
         assert!(
             w.contains("Mu-referencing disabled"),
             "warning should mention mu-referencing"
+        );
+    }
+
+    #[test]
+    fn nested_if_eta_param_sets_conditional_flag() {
+        // Regression for #278/#280: an eta-bearing parameter assigned inside a
+        // *nested* if-branch must still set `has_conditional_eta_params`, so the
+        // inner loop routes to FD instead of the analytical AD kernel (which
+        // cannot represent the branch). Detection previously looked only one
+        // level deep and silently missed nested conditionals, leaving the model
+        // on a wrong AD gradient — the exact failure class this gate prevents.
+        let plain = minimal_model_with_indiv(
+            "  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)",
+        );
+        assert!(
+            !plain.has_conditional_eta_params,
+            "an unconditional model must not be flagged conditional"
+        );
+
+        let nested = minimal_model_with_indiv(
+            "  CL = TVCL
+  V  = TVV * exp(ETA_V)
+  if (1 > 0) {
+    if (1 > 0) {
+      CL = TVCL * exp(ETA_CL)
+    } else {
+      CL = TVCL * exp(ETA_CL)
+    }
+  }",
+        );
+        assert!(
+            nested.has_conditional_eta_params,
+            "eta-bearing param assigned only inside a nested if must set \
+             has_conditional_eta_params"
         );
     }
 

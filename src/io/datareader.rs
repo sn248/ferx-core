@@ -2015,23 +2015,33 @@ mod tests {
 
         // with_covariates_tte: declared WT + an undeclared `extra` (STUDY) + a
         // filter referencing a *third* column (AGE) — exercises BOTH the
-        // extra-columns dedup loop and the filter-referenced-column merge. The
-        // filter matches no row, so both subjects are retained.
+        // extra-columns dedup loop and the filter-referenced-column merge, and
+        // *validates* the merge: AGE==40 can only drop subject 2 if AGE was
+        // actually pulled into the read union, so the assertion fails if the
+        // merge regresses.
         let decls = vec![CovariateDecl {
             name: "WT".to_string(),
             kind: CovariateKind::Continuous,
         }];
         let extra = ["STUDY".to_string()];
-        let nomatch = SelectionFilter::from_opts(&["AGE == 999".to_string()], &[], &[]).unwrap();
+        let drop_age40 = SelectionFilter::from_opts(&["AGE == 40".to_string()], &[], &[]).unwrap();
         let (pop2, _table) = read_nonmem_csv_with_covariates_tte(
             f.path(),
             &decls,
             &extra,
             None,
-            Some(&nomatch),
+            Some(&drop_age40),
             &no_tte,
         )
         .unwrap();
-        assert_eq!(pop2.subjects.len(), 2, "AGE==999 matches no row");
+        // Subject 2 (AGE=40) is dropped via the merged AGE column; subject 1 remains.
+        assert_eq!(
+            pop2.subjects
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"],
+            "AGE==40 must drop subject 2 — proving AGE was pulled into the read union"
+        );
     }
 }

@@ -69,6 +69,10 @@ section of the SDLC for the versioning policy).
 - `[structural_model]` now warns when a `pk(...)` line maps a parameter the
   chosen model does not use (e.g. `ka` or `f` on an IV model, or `q`/`v2` on a
   one-compartment model); the mapping is accepted but has no effect (#309).
+- `[individual_parameters]` now warns when a declared parameter is computed but
+  never used — neither mapped into the `pk(...)` model nor referenced in any
+  other block (e.g. declaring `F` but forgetting `f=F`); it silently has no
+  effect (#309).
 
 ### Changed
 - IMP (importance sampling) now jointly samples (η, κ) for IOV models,

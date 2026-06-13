@@ -1882,6 +1882,56 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
     }
 
+    // Warn about an individual parameter that is computed but never used: not
+    // mapped into the analytical PK model and not referenced in any other block,
+    // so it silently has no effect — e.g. an oral model that declares `F` to
+    // estimate bioavailability but forgets `f=F`, or an unused intermediate like
+    // `ke = CL/V`. Implemented as a whole-identifier census over every model
+    // block: a declared parameter whose name appears exactly once — its own
+    // `[individual_parameters]` declaration — is dead. Over-counting (e.g. a name
+    // in a comment) only ever makes a parameter look *used*, so this never
+    // produces a false "unused" warning. Analytical models only: ODE models
+    // auto-route parameters to slots by name (including engine-applied
+    // F/lagtime), so textual absence there would not imply unused.
+    if !pk_param_map.is_empty() {
+        let mut token_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for lines in blocks.values() {
+            for line in lines {
+                for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                    if tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                        *token_counts.entry(tok.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut dead: Vec<String> = model
+            .indiv_param_names
+            .iter()
+            .filter(|name| token_counts.get(name.as_str()).copied().unwrap_or(0) <= 1)
+            .cloned()
+            .collect();
+        dead.sort_unstable();
+        if !dead.is_empty() {
+            let list = dead
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (verb, subj, obj, aux) = if dead.len() == 1 {
+                ("is", "it", "it", "has")
+            } else {
+                ("are", "they", "them", "have")
+            };
+            model.parse_warnings.push(format!(
+                "[individual_parameters] {list} {verb} computed but never used — not \
+                 mapped into the `pk(...)` model and not referenced in any other block, \
+                 so {subj} {aux} no effect. Map {obj} in [structural_model] (e.g. \
+                 `f=F`) or remove {obj}."
+            ));
+        }
+    }
+
     // Undeclared-covariate warning: checked here (after [event_model] parsing) so
     // that covariates used only in [event_model] expressions are included.
     if let Some(decls) = &covariate_decls {
@@ -9055,6 +9105,102 @@ mod tests {
     }
 
     #[test]
+    fn test_f_lagtime_warning_matrix() {
+        // Pins the f/lagtime warning matrix (#309). Two distinct checks fire:
+        //  - "does not use" (`consumes_pk_slot`): a param mapped in `pk(...)` but
+        //    not consumed — `f` is consumed only by oral models, `lagtime` by all;
+        //  - "computed but never used": a param declared in [individual_parameters]
+        //    but never mapped or referenced anywhere.
+        // KA/F/LAG are literals so the helper declares no surplus thetas (which
+        // would otherwise add unrelated unused-theta warnings).
+        let model = |indiv: &str, pk: &str| -> String {
+            format!(
+                "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+{indiv}
+
+[structural_model]
+  {pk}
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+            )
+        };
+        let warns = |indiv: &str, pk: &str| -> Vec<String> {
+            super::parse_full_model(&model(indiv, pk))
+                .unwrap_or_else(|e| panic!("`{pk}` should parse: {e}"))
+                .model
+                .parse_warnings
+        };
+        let has = |ws: &[String], needle: &str| ws.iter().any(|w| w.contains(needle));
+        let clv = "  CL = TVCL * exp(ETA_CL)\n  V = TVV";
+
+        // (1) IV + `f` mapped → "does not use `f`" (f is oral-only).
+        let ws = warns(
+            &format!("{clv}\n  F = 0.8"),
+            "pk one_cpt_iv(cl=CL, v=V, f=F)",
+        );
+        assert!(
+            has(&ws, "does not use") && has(&ws, "`f`"),
+            "IV + mapped f should warn unused: {ws:?}"
+        );
+
+        // (2) IV + `lagtime` mapped → NOT flagged (every model applies lagtime).
+        let ws = warns(
+            &format!("{clv}\n  LAG = 0.5"),
+            "pk one_cpt_iv(cl=CL, v=V, lagtime=LAG)",
+        );
+        assert!(
+            !has(&ws, "does not use"),
+            "IV + lagtime must not warn: {ws:?}"
+        );
+
+        // (3) Oral + `f` mapped (defined) → no warning.
+        let ws = warns(
+            &format!("{clv}\n  KA = 1.0\n  F = 0.8"),
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)",
+        );
+        assert!(
+            !has(&ws, "does not use") && !has(&ws, "computed but never used"),
+            "oral + used f must not warn: {ws:?}"
+        );
+
+        // (4) Oral + `f` mapped to an UNDEFINED variable → parse error (#308).
+        assert!(
+            super::parse_full_model(&model(
+                "  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = 1.0",
+                "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=FNOPE)",
+            ))
+            .is_err(),
+            "oral + undefined `f` reference must error"
+        );
+
+        // (5) Oral + `F` declared but NOT mapped → "computed but never used `F`".
+        let ws = warns(
+            &format!("{clv}\n  KA = 1.0\n  F = 0.8"),
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        );
+        assert!(
+            has(&ws, "computed but never used") && has(&ws, "`F`"),
+            "oral + declared-not-mapped F should warn dead: {ws:?}"
+        );
+
+        // (6) IV + `F` declared but NOT mapped → "computed but never used `F`".
+        let ws = warns(&format!("{clv}\n  F = 0.8"), "pk one_cpt_iv(cl=CL, v=V)");
+        assert!(
+            has(&ws, "computed but never used") && has(&ws, "`F`"),
+            "IV + declared-not-mapped F should warn dead: {ws:?}"
+        );
+    }
+
+    #[test]
     fn test_parse_method_single() {
         let opts = parse_fit_options(&["method = focei".to_string()]).unwrap();
         assert_eq!(opts.method, EstimationMethod::FoceI);
@@ -15496,10 +15642,18 @@ method = foce
 "#
         );
         let parsed = parse_full_model(&src).expect("parse ok");
+        // `ke = CL/V` is itself an unused intermediate, now flagged by the
+        // computed-but-unused check (#309). This test's point is narrower: the
+        // thetas/etas it references (TVCL, TVV, ETA_CL, ETA_V) must NOT be falsely
+        // reported as unused.
         assert!(
-            parsed.model.parse_warnings.is_empty(),
-            "derived variable ke=CL/V must not trigger false positives; \
-             got: {:?}",
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("not referenced in any model expression")),
+            "thetas/etas used via the derived variable ke=CL/V must not be flagged \
+             unused; got: {:?}",
             parsed.model.parse_warnings
         );
     }

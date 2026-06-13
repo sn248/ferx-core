@@ -732,6 +732,23 @@ fn parse_evid(s: &str) -> u32 {
     t.parse::<u32>().unwrap_or(0)
 }
 
+/// True for EVID values that administer a dose (1 = dose, 4 = reset + dose).
+/// Single source of truth for the dose test, shared by the dose-record arm, the
+/// data-selection exclusion tally, and the ignored-AMT counter.
+fn is_dose_evid(evid: u32) -> bool {
+    evid == 1 || evid == 4
+}
+
+/// True when an `AMT` value denotes an actual dose: **finite and nonzero**. A
+/// missing cell (or absent column) parses to `0.0` — not a dose. A literal
+/// `nan`/`inf`/`infinity` parses to a non-finite value (Rust's `f64::from_str`
+/// accepts those, and [`parse_f64`] does not route through `is_missing_cell`),
+/// which is malformed and is also rejected here — so a stray non-finite AMT
+/// never silently becomes an infinite/NaN-amount dose (#262).
+fn is_dosing_amt(amt: f64) -> bool {
+    amt.is_finite() && amt != 0.0
+}
+
 /// Compute a record's effective EVID.
 ///
 /// When an `EVID` column is present its value governs (a blank / `.` /
@@ -747,8 +764,8 @@ fn parse_evid(s: &str) -> u32 {
 /// carries a nonzero `AMT` (infusions too — `RATE` is the rate, `AMT` the
 /// amount), so a `RATE`-only row would just create a no-op zero-amount dose.
 ///
-/// `amt_col` resolves through [`parse_f64`], which maps a missing column or `.`
-/// cell to `0.0`, so `amt != 0.0` never sees a `NaN`.
+/// Only a finite, nonzero `AMT` infers a dose: a missing cell parses to `0.0`
+/// and a non-finite `nan`/`inf` is rejected, both via [`is_dosing_amt`].
 fn effective_evid(row: &[String], evid_col: Option<usize>, amt_col: Option<usize>) -> u32 {
     match evid_col {
         Some(c) => row.get(c).map(|s| parse_evid(s)).unwrap_or(0),
@@ -757,7 +774,7 @@ fn effective_evid(row: &[String], evid_col: Option<usize>, amt_col: Option<usize
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64(s))
                 .unwrap_or(0.0);
-            if amt != 0.0 {
+            if is_dosing_amt(amt) {
                 1
             } else {
                 0
@@ -1012,7 +1029,7 @@ fn parse_subject(
                 // Count by record type for the summary. The catch-all `other`
                 // bucket (EVID 2/3, missing-DV obs) ensures every excluded
                 // record is reflected in some counter.
-                if evid == 1 || evid == 4 {
+                if is_dose_evid(evid) {
                     excl_n_dose += 1;
                 } else if evid == 0 && mdv == 0 {
                     excl_n_obs += 1;
@@ -1029,12 +1046,16 @@ fn parse_subject(
             .and_then(|c| row.get(c))
             .map(|s| parse_f64(s))
             .unwrap_or(0.0);
-        // Track AMT that won't be administered: a nonzero AMT on a non-dose
-        // record (EVID not 1/4). When the dataset has no EVID column,
-        // `effective_evid` already promoted such rows to doses, so this only
-        // catches an EVID-present dataset whose dose row was mistyped (e.g.
-        // EVID=0 with AMT=5000). Surfaced as a population warning. #262
-        if row_amt != 0.0 && evid != 1 && evid != 4 {
+        // Track AMT that won't be administered: a dose-like AMT (finite,
+        // nonzero) on a record that is neither a dose (EVID 1/4) nor a *scored*
+        // observation (`mdv != 0`). The `mdv != 0` gate is what keeps this from
+        // false-firing: a scored observation (MDV=0) that merely carries a
+        // redundant / forward-filled AMT is benign — a real dropped dose is a
+        // non-scored record (a NONMEM dose row is MDV=1). With no EVID column
+        // `effective_evid` already promoted dose rows to doses, so this fires
+        // mainly on an EVID-present dataset whose dose row was mistyped (e.g.
+        // EVID=0, MDV=1, AMT=5000). Surfaced as a population warning. #262
+        if is_dosing_amt(row_amt) && !is_dose_evid(evid) && mdv != 0 {
             amt_ignored_rows += 1;
         }
 
@@ -1067,7 +1088,7 @@ fn parse_subject(
 
         if evid == 3 {
             // Pure system reset: no dose, no observation. Nothing else to do.
-        } else if evid == 1 || evid == 4 {
+        } else if is_dose_evid(evid) {
             // Dose record
             let amt = row_amt;
             let cmt = cmt_col
@@ -1675,6 +1696,50 @@ mod tests {
             pop.warnings
         );
         assert_eq!(pop.subjects[0].doses.len(), 1);
+    }
+
+    #[test]
+    fn scored_obs_carrying_amt_does_not_warn_amt_not_dosed() {
+        // A *scored* observation (EVID=0, MDV=0) that carries a nonzero AMT —
+        // e.g. a pipeline that forward-fills / LOCFs the AMT column across all
+        // rows — must NOT trip W_AMT_NOT_DOSED: it is a real observation, not a
+        // dropped dose (a NONMEM dose row is MDV=1). The EVID=1 dose administers
+        // and both observations are recorded.
+        let csv = "ID,TIME,DV,EVID,AMT,MDV\n\
+                   1,0,.,1,100,1\n\
+                   1,1,5.0,0,100,0\n\
+                   1,2,3.0,0,100,0\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(subj.doses.len(), 1);
+        assert_eq!(subj.observations, vec![5.0, 3.0]);
+        assert!(
+            !pop.warnings.iter().any(|w| w.contains("W_AMT_NOT_DOSED")),
+            "a scored obs carrying a forward-filled AMT must not warn, got {:?}",
+            pop.warnings
+        );
+    }
+
+    #[test]
+    fn nonfinite_amt_is_not_inferred_as_a_dose() {
+        // Robustness: a stray non-finite AMT ('inf'/'nan') must not become an
+        // infinite/NaN-amount dose. parse_f64 accepts 'inf' (Rust FromStr), so
+        // without the is_dosing_amt finiteness guard `amt != 0.0` would be true
+        // and the row would infer a bogus dose. With no EVID column it is
+        // instead rejected, leaving zero doses.
+        let csv = "ID,TIME,DV,MDV,AMT\n\
+                   1,0,.,1,inf\n\
+                   1,1,5.0,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(
+            pop.subjects[0].doses.is_empty(),
+            "a non-finite AMT must not be inferred as a dose, got {:?}",
+            pop.subjects[0].doses
+        );
+        // The non-finite AMT is also not counted as an ignored dose-like AMT.
+        assert!(!pop.warnings.iter().any(|w| w.contains("W_AMT_NOT_DOSED")));
     }
 
     #[test]

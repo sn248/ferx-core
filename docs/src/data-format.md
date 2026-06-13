@@ -47,9 +47,11 @@ column **is** present, its values govern and nothing is inferred.
 Two non-fatal warnings (collected into the fit's warnings) guard against a
 silently dose-free fit:
 
-- **`W_AMT_NOT_DOSED`** — one or more rows carry `AMT != 0` but were not treated
-  as doses because an `EVID` column is present and codes them as something other
-  than `1`/`4` (e.g. a dose row mistyped `EVID=0`). Their `AMT` was ignored.
+- **`W_AMT_NOT_DOSED`** — one or more **non-observation** rows carry `AMT != 0`
+  but were not treated as doses: an `EVID` column is present and codes a dose row
+  as something other than `1`/`4` (e.g. a dose row mistyped `EVID=0` with
+  `MDV=1`). Their `AMT` was ignored. A *scored* observation (`MDV=0`) that merely
+  carries a redundant or forward-filled `AMT` does **not** trigger this.
 - **`W_NO_DOSES`** — the dataset parsed **zero** dose events even though scored
   observations are present (usually a missing `AMT`/`EVID`). Not emitted for
   time-to-event/survival datasets, which legitimately have no PK doses.

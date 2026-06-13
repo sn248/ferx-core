@@ -7,41 +7,51 @@
 //! cleanly and lands on the NONMEM objective rather than one of the two broken
 //! regimes the issue surfaced.
 //!
-//! ## Provenance / reference
+//! ## Provenance
 //!
-//! Model + data come from FeRx-NLME/ferx-r#154 (an external NONMEM/OpenPMX/ferx
-//! benchmark; the dataset is the PAGE blind-analysis "DATASIM" set — 1-cpt oral,
-//! DV already on the log scale, hence `DV ~ log_additive`). `data/datsim_oral.csv`
-//! is that dataset with the `EVID` column already present (dose rows
-//! `EVID=1, AMT=10000, MDV=1`), so it does not depend on the no-EVID dose
-//! inference tracked separately in #262.
+//! Model, data, and NONMEM control are Douglas Eleveld's exact reproduction from
+//! FeRx-NLME/ferx-r#154 (the data is the PAGE blind-analysis "DATASIM" set —
+//! 1-cpt oral, DV already on the log scale, hence `DV ~ log_additive`):
+//!   - `MODEL_SRC` below is byte-identical to his `datsim.ferx`;
+//!   - `data/datsim_oral.csv` is his `data.ferx.csv` (the `EVID` column is
+//!     present, so this does not depend on the no-EVID dose inference in #262);
+//!   - `tests/nonmem/datsim_oral.{ctl,lst}` is his NONMEM 7.6 control + output.
 //!
-//! Reference objective values on this exact model + data:
-//!   - NONMEM 7.x `#OBJV`            : 70.85  (without the 2pi constant)
-//!   - ferx-core `main`, autodiff    : 71.28
-//!   - ferx-core `main`, FD (`ci`)   : ~72.14 (the gradient path shifts the
-//!                                     ill-conditioned minimum slightly)
-//! and the two broken regimes #261/#154 surfaced, which this test must exclude:
+//! ## NONMEM cross-check
+//!
+//! From `tests/nonmem/datsim_oral.lst` (NONMEM 7.6, FOCEI INTER, `$SIGMA 1`):
+//!
+//! | Parameter | ferx (FD) | NONMEM 7.6 |
+//! |-----------|-----------|------------|
+//! | OFV       | ~72.14    | 70.851 (WITHOUT CONSTANT) |
+//! | TVV       | ~3.3      | 3.32       |
+//! | TVKE      | ~-1.3     | -1.35      |
+//! | TVKA      | ~-1.2     | -1.20      |
+//!
+//! ferx-core `main` reports OFV 71.28 on the autodiff path and ~72.14 on the FD
+//! path (`--features ci`, the path this test runs under). The ~1.3-OFV ferx–
+//! NONMEM gap — vs the near-exact match on well-conditioned data (cf.
+//! `ltbs_convergence.rs`) — is this model's ill-conditioning: NONMEM itself only
+//! reached `MINIMIZATION TERMINATED` (ωKA ≈ 93% CV). For that reason this test
+//! does **not** assert `result.converged`; it only checks that the OFV lands in
+//! a band that excludes the two broken regimes #261/#154 surfaced:
 //!   - `CL` undefined → predictions floored → OFV ~2400 (now a parse error)
 //!   - pre-Almquist FOCEI-INTER marginal → variance collapse → OFV ~ -29.5
 //!
-//! The band is therefore **two-sided** and centered on the NONMEM/ferx
-//! agreement — a one-sided "lower is better" check (as in `gn_convergence.rs`)
-//! would wrongly *pass* the -29.5 collapse. It is deliberately generous (±4):
-//! the model is ill-conditioned (NONMEM itself only reached MINIMIZATION
-//! TERMINATED), the FD-vs-autodiff minimum differs by ~1 OFV, and slow-tests do
-//! not run on PR CI, so there is no pre-merge feedback loop to tune against.
-//! Either broken regime is ~100+ OFV away and still fails decisively. Re-anchor
-//! `EXPECTED_OFV` if a deliberate marginal-likelihood change moves the minimum
-//! (cf. the "Baseline history" note in `gn_convergence.rs`).
+//! The band is centered on the FD value (what CI computes) and is two-sided ±3:
+//! generous enough for FD/optimizer noise on this ill-conditioned surface, but
+//! either broken regime is ~70+ OFV away and fails decisively. A one-sided
+//! "lower is better" check (as in `gn_convergence.rs`) would wrongly *pass* the
+//! -29.5 collapse. Re-anchor `EXPECTED_OFV` if a deliberate marginal-likelihood
+//! change moves the minimum.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::path::Path;
 
 /// The #154 benchmark model, corrected by restoring the `CL = KE * V` line whose
-/// omission is the subject of #261. `[fit_options]` are set programmatically
-/// below so the fit configuration does not depend on string parsing.
+/// omission is the subject of #261. Byte-identical to Doug's `datsim.ferx`;
+/// `[fit_options]` are set programmatically below.
 const MODEL_SRC: &str = r"
 [parameters]
   theta TVV (3.40, 1.61, 4.1)   # V  (log scale)
@@ -77,8 +87,12 @@ const MODEL_SRC: &str = r"
     ignore = "slow + NONMEM-anchored #261 / ferx-r#154 acceptance: opt in with --features slow-tests"
 )]
 fn corrected_structural_model_matches_nonmem_ofv() {
-    const EXPECTED_OFV: f64 = 71.28; // ferx-core main; NONMEM #OBJV 70.85
-    const TOLERANCE: f64 = 4.0;
+    // CI runs the FD path (`--features ci`); the ferx FD minimum on this model is
+    // ~72.14 (ferx-r#154). NONMEM #OBJV (WITHOUT CONSTANT) is 70.851 and the ferx
+    // autodiff minimum 71.28 — both within the band. See module docs for why the
+    // band is two-sided, ±3, and why `converged` is not asserted.
+    const EXPECTED_OFV: f64 = 72.14; // ferx FD path (what CI exercises)
+    const TOLERANCE: f64 = 3.0;
 
     let model = parse_model_string(MODEL_SRC).expect("corrected #154 model must parse");
     let pop = read_nonmem_csv(Path::new("data/datsim_oral.csv"), None, None)
@@ -100,9 +114,9 @@ fn corrected_structural_model_matches_nonmem_ofv() {
     );
     assert!(
         (result.ofv - EXPECTED_OFV).abs() < TOLERANCE,
-        "OFV {:.3} is outside the NONMEM-anchored band {:.2} ± {:.1} \
-         (NONMEM #OBJV 70.85); a value near -29.5 (marginal collapse) or ~2400 \
-         (floored predictions) is the #261 / ferx-r#154 regression this guards",
+        "OFV {:.3} is outside the NONMEM-anchored band {:.2} ± {:.1} (NONMEM #OBJV \
+         70.851, tests/nonmem/datsim_oral.lst); a value near -29.5 (marginal collapse) \
+         or ~2400 (floored predictions) is the #261 / ferx-r#154 regression this guards",
         result.ofv,
         EXPECTED_OFV,
         TOLERANCE,

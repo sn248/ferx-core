@@ -1,0 +1,23 @@
+$PROB Datasim
+$INPUT NSIM ID TIME RDV DV MDV AMT EVID
+$DATA "data.ferx.csv" IGNORE=@
+$SUBROUTINES ADVAN2 TRANS2
+$PK
+	V  = EXP(THETA(1) + ETA(1));
+	KE = EXP(THETA(2) + ETA(2));
+	KA = KE + EXP(THETA(3) + ETA(3));
+	CL = KE * V;
+$ERROR
+	CP = A(2)/V;
+	Y  = log(CP) + ERR(1);
+$THETA
+	( 1.61, 3.40, 4.1) ;	/* V */
+	( -4.6, -1.2, 0.7) ;	/* KE */
+	( -4.6, -0.7, 0.7) ;	/* KA */
+$OMEGA BLOCK(3)
+	1
+	0.001 1
+	0.001 0.001 1
+$SIGMA
+	1
+$ESTM SIG=5 MAX=5000 METHOD=1 INTERACT NOABORT POSTHOC PRINT=1

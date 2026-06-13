@@ -243,11 +243,13 @@ pub(crate) fn resolve_gradient_method(
             return InnerGradientMethod::Fd;
         }
         // Model-level features the analytical AD kernels can't represent
-        // faithfully (non-log-normal ETA, LTBS, conditional params) -> FD.
-        // Extracted into a build-independent predicate so the routing decision
-        // is unit-testable in the FD-only `ci` build (the AD-vs-FD *numerical*
-        // check needs Enzyme, but "is this model classified AD-unsafe?" does
-        // not). See [`analytical_ad_unsupported`] and issue #278.
+        // faithfully -> FD. See [`analytical_ad_unsupported`] for the
+        // authoritative list of gated classes (non-log-normal ETA, LTBS,
+        // conditional params, eta-dependent obs_scale, TTE). Extracted into a
+        // build-independent predicate so the routing decision is unit-testable
+        // in the FD-only `ci` build (the AD-vs-FD *numerical* check needs
+        // Enzyme, but "is this model classified AD-unsafe?" does not). See
+        // issue #278.
         if analytical_ad_unsupported(model).is_some() {
             return InnerGradientMethod::Fd;
         }

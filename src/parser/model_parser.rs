@@ -1624,14 +1624,6 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // assign the typical-value (TV*) unconditionally and only apply the
     // conditional inside the individual parameter expression.
     {
-        // Collect variables that appear inside if-branches but NOT at top level.
-        let conditional_only: Vec<&String> = all_assigned
-            .iter()
-            .filter(|n| !indiv_var_names.contains(n))
-            .collect();
-        // Also collect top-level vars that are assigned ONLY inside if-blocks
-        // (i.e. they appear in an If branch but have no top-level Assign).
-        // Union: any var in an if-branch that references an eta → warn.
         // Does `var` receive an eta-bearing assignment anywhere inside an
         // `if`/`else` body, at ANY nesting depth? A top-level (unconditional)
         // assignment does not count — only ones reached through a branch. This
@@ -1688,20 +1680,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             }
             false
         }
+        // `all_assigned` is the deduped union of top-level and if-only
+        // assignments, so one pass flags both "assigned only inside an if" and
+        // "unconditional default + conditional eta override" with no
+        // double-counting. Order is the source-declaration order of
+        // `all_assigned`.
         let mut mu_ref_disabled: Vec<String> = Vec::new();
-        for var in &conditional_only {
+        for var in &all_assigned {
             if any_if_branch_assigns_eta(&indiv_stmts, var, n_eta) {
-                mu_ref_disabled.push((*var).clone());
-            }
-        }
-        // Also catch a top-level var whose eta-bearing assignment lives inside
-        // an if (possibly nested) — e.g. `CL = TVCL` unconditionally plus a
-        // conditional `CL = TVCL*exp(ETA_CL)` override. Such a var is in
-        // indiv_var_names (so excluded from `conditional_only` above) yet still
-        // needs mu-referencing disabled and FD routing.
-        for var in &indiv_var_names {
-            if any_if_branch_assigns_eta(&indiv_stmts, var, n_eta) && !mu_ref_disabled.contains(var)
-            {
                 mu_ref_disabled.push(var.clone());
             }
         }

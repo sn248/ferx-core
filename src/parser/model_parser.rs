@@ -1853,22 +1853,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     ));
 
     // Warn about analytical PK parameters that are mapped but unused by the
-    // chosen model — e.g. `ka` on an IV model (no absorption), or `q`/`v2` on a
-    // one-compartment model. They are set but have no effect (#309). `f`
-    // (bioavailability) and `lagtime` are dose modifiers every model applies, so
-    // they are never flagged. Sibling to the declared-but-unused check above.
+    // chosen model — e.g. `ka` or `f` on an IV model (no absorption / no
+    // bioavailability term), or `q`/`v2` on a one-compartment model. They are set
+    // but have no effect (#309). `PkModel::consumes_pk_slot` is the single source
+    // of truth for what each model's closed form actually reads (`lagtime` for
+    // every model, `f` only for oral). Sibling to the declared-but-unused check.
     if !pk_param_map.is_empty() {
-        let required: std::collections::HashSet<usize> = pk_model
-            .required_pk_params()
-            .iter()
-            .map(|(slot, _)| *slot)
-            .collect();
         let mut unused: Vec<&str> = pk_param_map
             .iter()
             .filter_map(|(key, _)| {
                 let slot = PkParams::name_to_index(key)?;
-                let used = required.contains(&slot) || slot == PK_IDX_F || slot == PK_IDX_LAGTIME;
-                (!used).then_some(key.as_str())
+                (!pk_model.consumes_pk_slot(slot)).then_some(key.as_str())
             })
             .collect();
         unused.sort_unstable();
@@ -8876,6 +8871,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn canonical_name_round_trips_through_parser() {
+        // Every `PkModel::canonical_name()` must be a model name the parser
+        // accepts and maps back to the same variant — guards `canonical_name`
+        // (types.rs) against drifting from this name table.
+        for model in [
+            PkModel::OneCptIv,
+            PkModel::OneCptOral,
+            PkModel::TwoCptIv,
+            PkModel::TwoCptOral,
+            PkModel::ThreeCptIv,
+            PkModel::ThreeCptOral,
+        ] {
+            let lines = vec![format!("pk {}(cl=CL, v=V)", model.canonical_name())];
+            let (parsed, _) = parse_structural_model(&lines).unwrap_or_else(|e| {
+                panic!(
+                    "canonical_name `{}` did not parse: {e}",
+                    model.canonical_name()
+                )
+            });
+            assert_eq!(
+                parsed,
+                model,
+                "canonical_name `{}` did not round-trip",
+                model.canonical_name()
+            );
+        }
+    }
+
     /// A complete analytical model wrapping `pk_line`, with every commonly
     /// referenced individual parameter defined so `build_pk_param_fn`'s per-key
     /// value validation passes and only the structural-mapping checks (required /
@@ -8976,39 +9000,57 @@ mod tests {
 
     #[test]
     fn test_unused_pk_param_warns() {
-        // A PK parameter that is mapped but not used by the chosen model — here
-        // `ka` on an IV model, which has no absorption — parses Ok but emits a
-        // parse warning so the user notices the no-op mapping (#309). `f`/`lagtime`
-        // are never flagged (every model applies them to the dose).
+        // PK parameters mapped but not used by the chosen model parse Ok but warn
+        // (#309): on an IV model both `ka` (no absorption) AND `f` (no
+        // bioavailability term in the IV closed form) are flagged. `lagtime`,
+        // which every model applies to the dose, must NOT be flagged.
         let model_str = "
 [parameters]
   theta TVCL(1.0, 0.001, 100.0)
   theta TVV(10.0, 0.1, 1000.0)
   theta TVKA(1.0, 0.01, 100.0)
+  theta TVF(1.0, 0.01, 10.0)
+  theta TVLAG(0.5)
   omega ETA_CL ~ 0.1
   sigma EPS ~ 0.01
 
 [individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-  KA = TVKA
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+  F   = TVF
+  LAG = TVLAG
 
 [structural_model]
-  pk one_cpt_iv(cl=CL, v=V, ka=KA)
+  pk one_cpt_iv(cl=CL, v=V, ka=KA, f=F, lagtime=LAG)
 
 [error_model]
   DV ~ proportional(EPS)
 ";
         let parsed = super::parse_full_model(model_str)
-            .expect("unused param is a warning, not a parse error");
+            .expect("unused params are a warning, not a parse error");
+        let warn = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .find(|w| w.contains("does not use"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected an unused-param warning, got: {:?}",
+                    parsed.model.parse_warnings
+                )
+            });
         assert!(
-            parsed
-                .model
-                .parse_warnings
-                .iter()
-                .any(|w| w.contains("does not use") && w.contains("`ka`")),
-            "expected an unused-`ka` warning, got: {:?}",
-            parsed.model.parse_warnings
+            warn.contains("`ka`"),
+            "ka should be flagged unused on IV: {warn}"
+        );
+        assert!(
+            warn.contains("`f`"),
+            "f should be flagged unused on IV: {warn}"
+        );
+        assert!(
+            !warn.contains("`lagtime`"),
+            "lagtime is applied to every dose and must not be flagged: {warn}"
         );
     }
 

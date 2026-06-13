@@ -67,7 +67,7 @@ section of the SDLC for the versioning policy).
 - Combined ferx-core + ferx-r development documentation: a Development Lifecycle
   (SDLC) page and a Contributing page in the book.
 - `[structural_model]` now warns when a `pk(...)` line maps a parameter the
-  chosen model does not use (e.g. `ka` on an IV model, or `q`/`v2` on a
+  chosen model does not use (e.g. `ka` or `f` on an IV model, or `q`/`v2` on a
   one-compartment model); the mapping is accepted but has no effect (#309).
 
 ### Changed

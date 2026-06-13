@@ -758,6 +758,31 @@ impl PkModel {
             PkModel::ThreeCptOral => "three_cpt_oral",
         }
     }
+
+    /// Whether this is a first-order-absorption (oral) model. Oral models read
+    /// `ka` and `f`; IV models do not.
+    pub(crate) fn is_oral(&self) -> bool {
+        matches!(
+            self,
+            PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+        )
+    }
+
+    /// Whether the analytical solver for this model actually reads the given PK
+    /// slot. This is the single source of truth for "is a mapped param used", and
+    /// it mirrors what the `pk/` closed forms consume — pinned to real solver
+    /// behaviour by `consumes_pk_slot_matches_solver` in `pk/mod.rs`, so a future
+    /// variant that reads a new slot can't silently drift from this:
+    ///   - every required structural slot (`required_pk_params`);
+    ///   - `lagtime`, applied to *every* dose (`predict_concentration` shifts the
+    ///     effective dose time for IV and oral alike);
+    ///   - `f` (bioavailability) **only** for oral models — the IV closed forms
+    ///     never read it, so `f` on an IV model is inert.
+    pub(crate) fn consumes_pk_slot(&self, slot: usize) -> bool {
+        slot == PK_IDX_LAGTIME
+            || (slot == PK_IDX_F && self.is_oral())
+            || self.required_pk_params().iter().any(|(s, _)| *s == slot)
+    }
 }
 
 /// Supported residual error models

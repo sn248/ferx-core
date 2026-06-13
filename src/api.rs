@@ -4554,6 +4554,7 @@ mod iov_integration {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -5712,6 +5713,7 @@ mod simulate_with_uncertainty_tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -6475,6 +6477,7 @@ mod tests_sdtab_tv_cov {
             referenced_covariates: vec!["WT".into()],
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -6680,6 +6683,7 @@ mod tests_derived_session_clock {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -7054,6 +7058,7 @@ mod tests_derived_iov_kappa {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]

@@ -1882,17 +1882,27 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
     }
 
-    // Warn about an individual parameter that is computed but never used: not
-    // mapped into the analytical PK model and not referenced in any other block,
-    // so it silently has no effect — e.g. an oral model that declares `F` to
-    // estimate bioavailability but forgets `f=F`, or an unused intermediate like
-    // `ke = CL/V`. Implemented as a whole-identifier census over every model
-    // block: a declared parameter whose name appears exactly once — its own
+    // Warn about an individual parameter that is computed but never used: it has
+    // no effect because it is neither consumed by the structural model nor
+    // referenced in any other block — e.g. an analytical oral model that declares
+    // `F` to estimate bioavailability but forgets `f=F`, an ODE model that declares
+    // `KE` but never uses it in the `[odes]` RHS, or an unused intermediate like
+    // `ke = CL/V`. Implemented as a whole-identifier census over every model block:
+    // a declared parameter whose name appears exactly once — its own
     // `[individual_parameters]` declaration — is dead. Over-counting (e.g. a name
     // in a comment) only ever makes a parameter look *used*, so this never
-    // produces a false "unused" warning. Analytical models only: ODE models
-    // auto-route parameters to slots by name (including engine-applied
-    // F/lagtime), so textual absence there would not imply unused.
+    // produces a false "unused" warning.
+    //
+    // Runs for analytical (`pk(...)`) and ODE models alike — the census already
+    // tokenizes `[odes]` (an unnamed block), so a parameter used in the RHS counts
+    // as used. The one ODE carve-out: parameters that `ode_param_slots` routes to
+    // the engine-reserved slots `PK_IDX_F` / `PK_IDX_LAGTIME` (named `f`/`lagtime`/
+    // `alag`) are applied to the dose by the engine without ever appearing in the
+    // RHS, so their textual absence does not make them dead (#315). Analytical
+    // models bind F/lagtime only via an explicit `pk(...)` mapping, which the
+    // census counts, so they need no carve-out there. Pure-TTE models (no `pk(...)`,
+    // no `[odes]`) are skipped: their params live in named `[event_model LABEL]`
+    // blocks, which the census deliberately does not tokenize (see below).
     //
     // A raw-text census (rather than resolving against the parsed ASTs) is the
     // deliberate choice: it covers *every* block uniformly — including ones whose
@@ -1902,7 +1912,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // because individual-parameter names are confined to unnamed blocks (named
     // `[event_model LABEL]` / `[covariate_nn NAME]` blocks reference thetas/etas/
     // covariates, never indiv params — so a param can't be "used" solely there).
-    if !pk_param_map.is_empty() {
+    if !pk_param_map.is_empty() || is_ode {
         let mut token_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for lines in blocks.values() {
@@ -1917,8 +1927,23 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         let mut dead: Vec<String> = model
             .indiv_param_names
             .iter()
-            .filter(|name| token_counts.get(name.as_str()).copied().unwrap_or(0) <= 1)
-            .cloned()
+            .enumerate()
+            .filter(|(_, name)| token_counts.get(name.as_str()).copied().unwrap_or(0) <= 1)
+            // Exempt engine-applied slots on ODE models: `f`/`lagtime`/`alag` are
+            // applied to the dose by the engine without a textual RHS reference, so
+            // absence from `[odes]` does not make them dead. Reuse `ode_param_slots`'
+            // own routing (`ode_slot_map`, parallel to `indiv_param_names`) rather
+            // than re-deriving the slot from the name, so the exemption can't drift
+            // from how the parameter is actually routed. No-op for analytical models
+            // (`is_ode` false; their F/lagtime are bound via an explicit `pk(...)`
+            // mapping the census already counts).
+            .filter(|(i, _)| {
+                !(is_ode
+                    && ode_slot_map
+                        .get(*i)
+                        .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot)))
+            })
+            .map(|(_, name)| name.clone())
             .collect();
         dead.sort_unstable();
         if !dead.is_empty() {
@@ -1932,11 +1957,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             } else {
                 ("are", "they", "them", "have")
             };
+            // Shared scaffold; only the cause clause and the remediation hint
+            // differ between analytical (`pk(...)`) and ODE models.
+            let (cause, fix) = if is_ode {
+                (
+                    "not referenced in the [odes] RHS or any other block",
+                    format!(
+                        "Reference {obj} in [odes] (or [scaling]/[derived]/[output]) or remove {obj}."
+                    ),
+                )
+            } else {
+                (
+                    "not mapped into the `pk(...)` model and not referenced in any other block",
+                    format!("Map {obj} in [structural_model] (e.g. `f=F`) or remove {obj}."),
+                )
+            };
             model.parse_warnings.push(format!(
-                "[individual_parameters] {list} {verb} computed but never used — not \
-                 mapped into the `pk(...)` model and not referenced in any other block, \
-                 so {subj} {aux} no effect. Map {obj} in [structural_model] (e.g. \
-                 `f=F`) or remove {obj}."
+                "[individual_parameters] {list} {verb} computed but never used — {cause}, \
+                 so {subj} {aux} no effect. {fix}"
             ));
         }
     }
@@ -4208,7 +4246,7 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
 /// (`build_pk_param_fn`) both consult this map, so a name binds to the same
 /// slot whether it is being written or read.
 fn ode_param_slots(names: &[String]) -> Result<Vec<usize>, String> {
-    let reserved = [PK_IDX_F, PK_IDX_LAGTIME];
+    let reserved = RESERVED_PK_SLOTS;
     let mut taken = [false; MAX_PK_PARAMS];
     let mut slots = vec![usize::MAX; names.len()];
 
@@ -9358,6 +9396,169 @@ mod tests {
                 .any(|w| w.contains("computed but never used") && w.contains("`KEL`")),
             "without the [derived] use KEL must be flagged dead: {:?}",
             p2.model.parse_warnings
+        );
+    }
+
+    #[test]
+    fn test_ode_dead_indiv_param_warns() {
+        // #315: an ODE [individual_parameters] entry never referenced in the
+        // [odes] RHS (and not engine-applied f/lagtime) is routed to a free slot,
+        // computed every evaluation, but never read — silently inert. The #310
+        // "computed but never used" census skipped ODE models; it now covers them.
+        let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKE(0.5, 0.001, 10.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_KE ~ 0.09
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KE = TVKE * exp(ETA_KE)   # never referenced in [odes]
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+        let ws = super::parse_full_model(content)
+            .expect("a dead ODE param is a warning, not an error")
+            .model
+            .parse_warnings;
+        let dead: Vec<&String> = ws
+            .iter()
+            .filter(|w| w.contains("computed but never used"))
+            .collect();
+        assert_eq!(
+            dead.len(),
+            1,
+            "exactly one dead-param warning expected, got: {ws:?}"
+        );
+        let w = dead[0];
+        assert!(w.contains("`KE`"), "warning must name KE: {w}");
+        // The params actually used in the RHS must not be flagged.
+        assert!(
+            !w.contains("`CL`") && !w.contains("`V`"),
+            "used params must not be flagged dead: {w}"
+        );
+        // ODE-flavored guidance points at [odes], not the analytical pk(...) map.
+        assert!(
+            w.contains("[odes]") && !w.contains("pk(...)"),
+            "ODE warning should reference [odes], not pk(...): {w}"
+        );
+    }
+
+    #[test]
+    fn test_ode_engine_applied_f_lagtime_not_flagged_dead() {
+        // #315 carve-out: F and lagtime on an ODE model are routed to the
+        // engine-reserved PK_IDX_F / PK_IDX_LAGTIME slots (`ode_param_slots`) and
+        // applied to the dose by the engine without ever appearing in the [odes]
+        // RHS, so their textual absence must NOT flag them dead. Mirrors
+        // examples/bioavailability_ode.ferx and examples/warfarin_ode_lagtime.ferx.
+        let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.001, 10.0)
+  theta THETA_F(0.0, -10.0, 10.0)
+  theta TVLAG(0.5, 0.001, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  KA      = TVKA
+  F       = inv_logit(THETA_F)
+  LAGTIME = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+        let ws = super::parse_full_model(content)
+            .expect("engine-applied F/lagtime on an ODE model must parse")
+            .model
+            .parse_warnings;
+        assert!(
+            !ws.iter().any(|w| w.contains("computed but never used")),
+            "engine-applied F/LAGTIME on an ODE model must not be flagged dead: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn test_ode_multiple_dead_params_use_plural_message() {
+        // #315: two+ dead ODE params share one warning and use the plural grammar
+        // ("are … they … them") in the ODE-flavored message. Locks the plural
+        // branch + name list for ODE (the singular case is covered above).
+        let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKE(0.5, 0.001, 10.0)
+  theta TVKE2(0.2, 0.001, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KE  = TVKE      # never referenced in [odes]
+  KE2 = TVKE2     # never referenced in [odes]
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+        let ws = super::parse_full_model(content)
+            .expect("dead ODE params are a warning, not an error")
+            .model
+            .parse_warnings;
+        let dead: Vec<&String> = ws
+            .iter()
+            .filter(|w| w.contains("computed but never used"))
+            .collect();
+        assert_eq!(
+            dead.len(),
+            1,
+            "both dead params share a single warning, got: {ws:?}"
+        );
+        let w = dead[0];
+        // Both names listed (sorted, comma-joined), neither used param flagged.
+        assert!(
+            w.contains("`KE`") && w.contains("`KE2`"),
+            "both dead params must be named: {w}"
+        );
+        assert!(
+            !w.contains("`CL`") && !w.contains("`V`"),
+            "used params not flagged: {w}"
+        );
+        // Plural grammar + ODE-flavored guidance.
+        assert!(
+            w.contains("are computed but never used") && w.contains("remove them"),
+            "plural ODE message expected: {w}"
+        );
+        assert!(
+            w.contains("[odes]") && !w.contains("pk(...)"),
+            "ODE plural warning should reference [odes], not pk(...): {w}"
         );
     }
 

@@ -49,7 +49,9 @@ section of the SDLC for the versioning policy).
 - `covariance_method` fit option: choose the covariance estimator, mirroring
   NONMEM `$COV MATRIX=` — `r` (inverse Hessian `R⁻¹`, default), `s` (inverse
   score cross-product `S⁻¹`), or `rsr` (the Huber–White sandwich `R⁻¹SR⁻¹`,
-  robust to model mis-specification). Supported for FOCEI/IOV fits (#223).
+  robust to model mis-specification). Supported for FOCEI, FOCE, and IOV fits;
+  anchored against NONMEM `$COV MATRIX=S`/`RSR` within ~10% for both FOCEI (#266)
+  and FOCE (#250) (#223).
 - `covariance_fallback = sir` fit option: when the FD Hessian is non-positive-definite,
   run SIR with an `|eigenvalue|`-rectified proposal (4× inflated) instead of leaving
   the covariance step as failed; `covariance_status` reports `sir_fallback` (#223).
@@ -75,6 +77,11 @@ section of the SDLC for the versioning policy).
   effect (#309).
 - `MACHEPS` (machine epsilon) is now available in `[odes]` RHS and `init(...)`
   expressions, matching its existing availability in `[derived]` (#314).
+- The "computed but never used" warning above now also covers **ODE models**: an
+  `[individual_parameters]` entry never referenced in the `[odes]` right-hand
+  side (nor in `[scaling]`/`[derived]`/`[output]`) is flagged the same way. The
+  engine-applied `F` (bioavailability) and `lagtime` (alias `alag`), which act on
+  the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
 - IMP (importance sampling) now jointly samples (η, κ) for IOV models,

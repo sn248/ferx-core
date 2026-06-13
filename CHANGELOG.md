@@ -75,6 +75,12 @@ section of the SDLC for the versioning policy).
   the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
 
 ### Fixed
+- Datasets without an `EVID` column no longer silently fit a dose-free model.
+  ferx now infers a dose from a nonzero `AMT` when `EVID` is absent (matching
+  NONMEM), so legacy datasets that mark doses only by `AMT`/`MDV=1` administer
+  correctly. As a safety net, the reader also warns when `AMT != 0` rows are not
+  treated as doses (`W_AMT_NOT_DOSED`) or when a population with observations
+  parses zero dose events (`W_NO_DOSES`) (#262).
 - FOCEI covariance standard errors (non-IOV) now include the `log|H̃|` EBE-response
   curvature for mu-referenced structural parameters, bringing the non-IOV stencil
   in line with the IOV stencil and matching NONMEM `$COV MATRIX=R` more closely on

@@ -5672,19 +5672,61 @@ fn build_pk_param_fn(
     let vars_in_order = var_names.to_vec();
 
     // Pre-resolve pk_map → indexed (pk_slot, var_slot) pairs so the hot
-    // loop is two array reads instead of two HashMap probes.
-    let pk_assignment_mapping: Vec<(usize, usize)> = pk_param_map
-        .iter()
-        .filter_map(|(pk_name, var_name)| {
-            let pk_slot = PkParams::name_to_index(pk_name)?;
-            let var_slot = var_idx.get(var_name).copied().or_else(|| {
-                // Fall back to lowercase lookup — matches the previous
-                // `vars.get(var_name.to_lowercase())` compat behaviour.
-                var_idx.get(&var_name.to_lowercase()).copied()
-            })?;
-            Some((pk_slot, var_slot))
-        })
-        .collect();
+    // loop is two array reads instead of two HashMap probes. Each structural
+    // PK value is one of three things, in this precedence:
+    //   1. a defined [individual_parameters] variable → bound by slot;
+    //   2. a numeric literal (e.g. `ka=1.0`)           → bound as a constant;
+    //   3. neither                                     → hard parse error.
+    // The earlier `filter_map` silently `?`-dropped both the undefined-variable
+    // (3) and the literal (2) cases, leaving the slot at `PkParams::default()`
+    // (0.0 for everything but F). For an undefined reference that produced a
+    // structurally-broken model that still "converged" with every prediction
+    // floored to the log constant (#261); for a literal it silently meant the
+    // value 0.0. Both now resolve correctly or error.
+    //
+    // Iterate in sorted key order so a model with several bad bindings always
+    // reports the same one (HashMap iteration order is otherwise arbitrary).
+    let mut pk_entries: Vec<(&String, &String)> = pk_param_map.iter().collect();
+    pk_entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut pk_assignment_mapping: Vec<(usize, usize)> = Vec::with_capacity(pk_entries.len());
+    let mut pk_const_mapping: Vec<(usize, f64)> = Vec::new();
+    for (pk_name, var_name) in pk_entries {
+        let pk_slot = PkParams::name_to_index(pk_name).ok_or_else(|| {
+            format!(
+                "[structural_model] unknown PK parameter `{pk_name}`; valid names are \
+                 cl, v/v1, q/q2, v2, ka, f, q3, v3, lagtime/alag"
+            )
+        })?;
+        // Fall back to lowercase lookup — matches the previous
+        // `vars.get(var_name.to_lowercase())` compat behaviour.
+        let var_slot = var_idx
+            .get(var_name)
+            .copied()
+            .or_else(|| var_idx.get(&var_name.to_lowercase()).copied());
+        if let Some(var_slot) = var_slot {
+            pk_assignment_mapping.push((pk_slot, var_slot));
+        } else if let Ok(c) = var_name.parse::<f64>() {
+            // A numeric literal binds the slot to a constant — but `f64::from_str`
+            // also accepts `inf`/`nan`/`infinity`, which are never a meaningful PK
+            // value. Reject them rather than binding a silently-degenerate
+            // constant (the same silent-wrong default #261 set out to remove).
+            if !c.is_finite() {
+                return Err(format!(
+                    "[structural_model] parameter `{pk_name}` has non-finite constant value \
+                     `{var_name}`; use a finite number or a defined [individual_parameters] \
+                     variable"
+                ));
+            }
+            pk_const_mapping.push((pk_slot, c));
+        } else {
+            return Err(format!(
+                "[structural_model] parameter `{pk_name}` references variable `{var_name}`, \
+                 which is not defined in [individual_parameters] (defined: {}). \
+                 Define it, e.g. `{var_name} = ...`.",
+                var_names.join(", ")
+            ));
+        }
+    }
     let is_analytical_pk = !pk_param_map.is_empty();
 
     // ODE branch counterpart of the analytical pre-resolution: map each
@@ -5764,6 +5806,11 @@ fn build_pk_param_fn(
             if is_analytical_pk {
                 for &(pk_slot, var_slot) in &pk_assignment_mapping {
                     p.values[pk_slot] = vars[var_slot];
+                }
+                // Literal-valued slots (e.g. `ka=1.0`) are constants — no
+                // per-call evaluation, just write the parsed value.
+                for &(pk_slot, c) in &pk_const_mapping {
+                    p.values[pk_slot] = c;
                 }
             } else {
                 // ODE model: store each individual parameter at its
@@ -12428,6 +12475,168 @@ if (1 > 0) {
         let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
         let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
         assert_eq!(pk.lagtime(), 0.75);
+    }
+
+    #[test]
+    fn test_undefined_structural_param_errors() {
+        // #261: a [structural_model] PK value that names a variable not defined
+        // in [individual_parameters] must be a hard parse error, not silently
+        // defaulted to 0.0 (which yields a "converged" but structurally broken
+        // fit). Here `cl=CL` but only V, KE, KA are defined.
+        let model_str = "
+[parameters]
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKE(0.1, 0.001, 10.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  V  = TVV * exp(ETA_V)
+  KE = TVKE
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = expect_parse_err(model_str);
+        assert!(
+            err.contains("CL") && err.contains("not defined"),
+            "expected an undefined-variable error naming CL, got: {err}"
+        );
+        // The message should list the defined parameters to make the fix obvious.
+        assert!(
+            err.contains("KE"),
+            "error should list defined params: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_pk_param_key_errors() {
+        // Audit of the same silent-drop pattern on the key side: an unrecognized
+        // PK-parameter name (`clx` here, a typo for `cl`) previously dropped the
+        // binding, leaving cl at its 0.0 default. It must now error.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(clx=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = expect_parse_err(model_str);
+        assert!(
+            err.contains("clx") && err.contains("unknown PK parameter"),
+            "expected an unknown-PK-parameter error naming clx, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_literal_pk_param_binds_constant() {
+        // A numeric literal value (`ka=2.5`) is bound as a constant rather than
+        // silently dropped to 0.0. Companion to #261: the same filter_map that
+        // dropped undefined references also dropped literals. `cl=CL` (a defined
+        // variable) must still bind, confirming the two paths coexist.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=2.5)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str).unwrap();
+        let theta: Vec<f64> = parsed.model.default_params.theta.clone();
+        let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        assert_eq!(pk.ka(), 2.5, "literal ka should bind as the constant 2.5");
+        assert!(
+            pk.cl() > 0.0,
+            "cl should still bind to the defined variable, got {}",
+            pk.cl()
+        );
+    }
+
+    #[test]
+    fn test_valid_structural_param_still_parses() {
+        // #261 acceptance: the repro fixed by defining CL (= KE * V) parses
+        // without error and binds cl to a positive value.
+        let model_str = "
+[parameters]
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKE(0.1, 0.001, 10.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  V  = TVV * exp(ETA_V)
+  KE = TVKE
+  KA = TVKA
+  CL = KE * V
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed =
+            super::parse_full_model(model_str).expect("model with CL defined should parse");
+        let theta: Vec<f64> = parsed.model.default_params.theta.clone();
+        let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        assert!(pk.cl() > 0.0, "cl should bind to KE * V, got {}", pk.cl());
+    }
+
+    #[test]
+    fn test_non_finite_literal_pk_param_errors() {
+        // `f64::from_str` accepts "inf"/"nan", so a non-finite literal value
+        // must be rejected rather than silently bound as a degenerate constant
+        // (the same silent-wrong default #261 removes for undefined references).
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=inf)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = expect_parse_err(model_str);
+        assert!(
+            err.contains("non-finite") && err.contains("ka"),
+            "expected a non-finite-constant error naming ka, got: {err}"
+        );
     }
 
     #[test]

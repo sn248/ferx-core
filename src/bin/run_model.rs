@@ -350,7 +350,7 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 mod tests {
     use super::{
         parse_check_args, parse_inits_from_nca_flag, parse_output_flag, parse_threads_flag,
-        run_check, CheckArgsError,
+        print_check_human, run_check, CheckArgsError,
     };
     use ferx_core::NcaInit;
 
@@ -527,5 +527,36 @@ mod tests {
         let bad_path = bad.to_str().unwrap();
         assert_eq!(run_check(&args(&["check", bad_path])), 1);
         assert_eq!(run_check(&args(&["check", bad_path, "--json"])), 1);
+    }
+
+    #[test]
+    fn print_check_human_covers_all_diagnostic_shapes() {
+        // Drive `print_check_human` directly over diagnostics that hit every arm:
+        // both severities, all three `loc` shapes (block+line / block-only /
+        // none), and suggestion present/absent — branches the model-file fixtures
+        // above don't deterministically reach.
+        use ferx_core::{CheckReport, Diagnostic};
+        let invalid = CheckReport::new(
+            "m.ferx",
+            Some("d.csv".to_string()),
+            vec![
+                Diagnostic::warning("W_X", "a warning")
+                    .with_block("error_model")
+                    .with_line(7)
+                    .with_suggestion("try this instead"),
+                Diagnostic::error("E_Y", "block-scoped error").with_block("odes"),
+                Diagnostic::error("E_Z", "locationless error"),
+            ],
+        );
+        // Must not panic; output is captured by the test harness.
+        print_check_human(&invalid);
+        assert!(!invalid.valid);
+        assert_eq!(invalid.error_count(), 2);
+        assert_eq!(invalid.warning_count(), 1);
+
+        // A clean report exercises the valid-summary branch through the same printer.
+        let ok = CheckReport::new("m.ferx", None, vec![]);
+        print_check_human(&ok);
+        assert!(ok.valid);
     }
 }

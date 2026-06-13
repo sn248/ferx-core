@@ -45,12 +45,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
-      # `--release` pays an extra ~3-5 min compile vs default once, then runs
-      # the population-fit tests (SDE, IOV, FOCEI, GN-hybrid) 5-10× faster.
-      # Net: replaces the >80 min debug test wall with a single-digit-minute
-      # release wall on average.
+      # `--profile ci-test` keeps release-level optimisation (population-fit
+      # tests — SDE, IOV, FOCEI, GN-hybrid — run 5-10× faster than debug) but
+      # drops fat LTO, whose whole-program link dominated these jobs. Net:
+      # avoids the >80 min debug wall without paying the LTO compile tax.
       - name: cargo test
-        run: cargo test --lib --no-default-features --features ci --release
+        run: cargo test --lib --no-default-features --features ci --profile ci-test
 
       # The NONMEM-anchored per-(ID,OCC) CL cross-check for IOV (issue #238)
       # lives in an integration test, which `--lib` above does not build or run.
@@ -59,7 +59,7 @@ jobs:
       # convergence loop, sub-second — and self-contained (reference fixture
       # committed at tests/nonmem/warfarin_iov_cl_reference.csv).
       - name: cargo test (NONMEM IOV CL cross-check, issue #238)
-        run: cargo test --test warfarin_iov_nonmem --no-default-features --features ci --release
+        run: cargo test --test warfarin_iov_nonmem --no-default-features --features ci --profile ci-test
 
   survival:
     name: Survival (TTE)
@@ -78,7 +78,7 @@ jobs:
       # `tte_smoke` integration tests are Tier-2 (a handful of outer iterations),
       # so `--tests` stays fast.
       - name: cargo test (survival)
-        run: cargo test --tests --no-default-features --features ci,survival --release
+        run: cargo test --tests --no-default-features --features ci,survival --profile ci-test
 
   clippy:
     name: Clippy
@@ -135,7 +135,7 @@ jobs:
         # `--no-fail-fast` so a single test-binary failure doesn't abort
         # cargo's run and silently drop coverage from every later binary
         # (mirrors the same flag in slow-tests.yml).
-        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,slow-tests --release --lcov --output-path lcov.info
+        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,slow-tests --profile ci-test --lcov --output-path lcov.info
 
       - name: Upload to Codecov (slow flag)
         uses: codecov/codecov-action@v7
@@ -171,11 +171,11 @@ jobs:
       - name: Generate fast coverage report
         # Fast tier only: `--features ci` (no `slow-tests`, no `survival`). This
         # is the per-PR patch gate; the full `ci,slow-tests` run is nightly (the
-        # `coverage` job above). Runs in parallel with the other PR jobs and
-        # fits inside the existing Survival-job wall-clock, so PR feedback time
-        # is unchanged. `--tests` so the integration tests count (same rationale
-        # as the nightly job).
-        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci --release --lcov --output-path lcov.info
+        # `coverage` job above). Runs in parallel with the other PR jobs and,
+        # like them, builds with `--profile ci-test` (no fat LTO), so it stays
+        # within the PR wall-clock. `--tests` so the integration tests count
+        # (same rationale as the nightly job).
+        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci --profile ci-test --lcov --output-path lcov.info
 
       - name: Upload to Codecov (fast flag)
         uses: codecov/codecov-action@v7

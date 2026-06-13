@@ -6171,237 +6171,167 @@ impl<'a> ParseCtx<'a> {
     }
 }
 
-/// Walk an expression tree and accumulate every covariate name it references.
-fn collect_covariates(expr: &Expression, out: &mut std::collections::HashSet<String>) {
+/// Pre-order walk over every node of an expression tree, invoking `f` on each.
+/// This single traversal backs the `collect_covariates`, `collect_undefined_vars`,
+/// and `collect_theta_eta` families below — each is a thin wrapper supplying a
+/// leaf-matching closure. Adding a name-bearing `Expression` variant therefore
+/// only requires updating this walker (plus `visit_condition_nodes` /
+/// `visit_stmt_nodes`), not every collector.
+fn visit_expr_nodes(expr: &Expression, f: &mut dyn FnMut(&Expression)) {
+    f(expr);
     match expr {
-        Expression::Covariate(name) => {
-            out.insert(name.clone());
-        }
         Expression::BinOp(lhs, _, rhs) => {
-            collect_covariates(lhs, out);
-            collect_covariates(rhs, out);
+            visit_expr_nodes(lhs, f);
+            visit_expr_nodes(rhs, f);
         }
-        Expression::UnaryFn(_, arg) => collect_covariates(arg, out),
+        Expression::UnaryFn(_, arg) => visit_expr_nodes(arg, f),
         Expression::Power(base, exp) => {
-            collect_covariates(base, out);
-            collect_covariates(exp, out);
+            visit_expr_nodes(base, f);
+            visit_expr_nodes(exp, f);
         }
         Expression::Conditional(cond, t, e) => {
-            collect_covariates_in_condition(cond, out);
-            collect_covariates(t, out);
-            collect_covariates(e, out);
+            visit_condition_nodes(cond, f);
+            visit_expr_nodes(t, f);
+            visit_expr_nodes(e, f);
         }
         _ => {}
     }
 }
 
-fn collect_covariates_in_condition(cond: &Condition, out: &mut std::collections::HashSet<String>) {
+/// Walk every expression embedded in a condition (see `visit_expr_nodes`).
+fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
     match cond {
         Condition::Compare(l, _, r) => {
-            collect_covariates(l, out);
-            collect_covariates(r, out);
+            visit_expr_nodes(l, f);
+            visit_expr_nodes(r, f);
         }
         Condition::And(l, r) | Condition::Or(l, r) => {
-            collect_covariates_in_condition(l, out);
-            collect_covariates_in_condition(r, out);
+            visit_condition_nodes(l, f);
+            visit_condition_nodes(r, f);
         }
-        Condition::Not(c) => collect_covariates_in_condition(c, out),
+        Condition::Not(c) => visit_condition_nodes(c, f),
     }
 }
 
-/// Walk a list of statements (assignments and if-blocks) and accumulate every
-/// covariate name they reference.
-fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
+/// Walk every expression in a statement list — assignment/diff-eq RHSs and the
+/// conditions + bodies of `if` blocks (see `visit_expr_nodes`). Bytecode
+/// variants carry no tree to walk (they only appear after
+/// `resolve_variable_indices`).
+fn visit_stmt_nodes(stmts: &[Statement], f: &mut dyn FnMut(&Expression)) {
     for s in stmts {
         match s {
             Statement::Assign(_, e)
             | Statement::AssignIdx(_, e)
             | Statement::DiffEq(_, e)
-            | Statement::DiffEqIdx(_, e) => collect_covariates(e, out),
-            Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {
-                // Bytecode variants only appear after `resolve_variable_indices`;
-                // any covariate reference was already resolved (or rejected
-                // for the ODE-RHS path) before compilation.
-            }
-            Statement::If {
-                branches,
-                else_body,
-            } => {
-                for (cond, body) in branches {
-                    collect_covariates_in_condition(cond, out);
-                    collect_covariates_in_stmts(body, out);
-                }
-                if let Some(eb) = else_body {
-                    collect_covariates_in_stmts(eb, out);
-                }
-            }
-        }
-    }
-}
-
-/// Walk an expression and accumulate every `Variable(name)` whose name is not a
-/// key in `defined` — i.e. a name that would resolve to the `usize::MAX`
-/// "reads 0.0" sentinel in the ODE RHS bytecode (or `vars.get(name).unwrap_or(0.0)`
-/// in an `init` expression). Used to reject undefined references in the `[odes]`
-/// block before they silently corrupt the dynamics (issue #314). Membership is
-/// by exact key: the ODE var maps already carry lower/upper/original aliases for
-/// every resolvable name, so a name absent from `defined` genuinely cannot
-/// resolve. Mirrors `collect_covariates`.
-fn collect_undefined_vars(
-    expr: &Expression,
-    defined: &HashMap<String, usize>,
-    out: &mut std::collections::HashSet<String>,
-) {
-    match expr {
-        Expression::Variable(name) => {
-            if !defined.contains_key(name) {
-                out.insert(name.clone());
-            }
-        }
-        Expression::BinOp(lhs, _, rhs) => {
-            collect_undefined_vars(lhs, defined, out);
-            collect_undefined_vars(rhs, defined, out);
-        }
-        Expression::UnaryFn(_, arg) => collect_undefined_vars(arg, defined, out),
-        Expression::Power(base, exp) => {
-            collect_undefined_vars(base, defined, out);
-            collect_undefined_vars(exp, defined, out);
-        }
-        Expression::Conditional(cond, t, e) => {
-            collect_undefined_vars_in_condition(cond, defined, out);
-            collect_undefined_vars(t, defined, out);
-            collect_undefined_vars(e, defined, out);
-        }
-        _ => {}
-    }
-}
-
-fn collect_undefined_vars_in_condition(
-    cond: &Condition,
-    defined: &HashMap<String, usize>,
-    out: &mut std::collections::HashSet<String>,
-) {
-    match cond {
-        Condition::Compare(l, _, r) => {
-            collect_undefined_vars(l, defined, out);
-            collect_undefined_vars(r, defined, out);
-        }
-        Condition::And(l, r) | Condition::Or(l, r) => {
-            collect_undefined_vars_in_condition(l, defined, out);
-            collect_undefined_vars_in_condition(r, defined, out);
-        }
-        Condition::Not(c) => collect_undefined_vars_in_condition(c, defined, out),
-    }
-}
-
-/// Walk a list of `[odes]` statements and accumulate every `Variable` reference
-/// (in a d/dt RHS, an intermediate assignment, or an if-condition) whose name is
-/// not a key in `defined`. Mirrors `collect_covariates_in_stmts`.
-fn collect_undefined_vars_in_stmts(
-    stmts: &[Statement],
-    defined: &HashMap<String, usize>,
-    out: &mut std::collections::HashSet<String>,
-) {
-    for s in stmts {
-        match s {
-            Statement::Assign(_, e)
-            | Statement::AssignIdx(_, e)
-            | Statement::DiffEq(_, e)
-            | Statement::DiffEqIdx(_, e) => collect_undefined_vars(e, defined, out),
-            Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {
-                // Bytecode variants only appear after `resolve_variable_indices`,
-                // which runs after this check.
-            }
-            Statement::If {
-                branches,
-                else_body,
-            } => {
-                for (cond, body) in branches {
-                    collect_undefined_vars_in_condition(cond, defined, out);
-                    collect_undefined_vars_in_stmts(body, defined, out);
-                }
-                if let Some(eb) = else_body {
-                    collect_undefined_vars_in_stmts(eb, defined, out);
-                }
-            }
-        }
-    }
-}
-
-fn collect_theta_eta(
-    expr: &Expression,
-    thetas: &mut std::collections::HashSet<usize>,
-    etas: &mut std::collections::HashSet<usize>,
-) {
-    match expr {
-        Expression::Theta(i) => {
-            thetas.insert(*i);
-        }
-        Expression::Eta(i) => {
-            etas.insert(*i);
-        }
-        Expression::BinOp(lhs, _, rhs) => {
-            collect_theta_eta(lhs, thetas, etas);
-            collect_theta_eta(rhs, thetas, etas);
-        }
-        Expression::UnaryFn(_, arg) => collect_theta_eta(arg, thetas, etas),
-        Expression::Power(base, exp) => {
-            collect_theta_eta(base, thetas, etas);
-            collect_theta_eta(exp, thetas, etas);
-        }
-        Expression::Conditional(cond, t, e) => {
-            collect_theta_eta_in_condition(cond, thetas, etas);
-            collect_theta_eta(t, thetas, etas);
-            collect_theta_eta(e, thetas, etas);
-        }
-        _ => {}
-    }
-}
-
-fn collect_theta_eta_in_condition(
-    cond: &Condition,
-    thetas: &mut std::collections::HashSet<usize>,
-    etas: &mut std::collections::HashSet<usize>,
-) {
-    match cond {
-        Condition::Compare(l, _, r) => {
-            collect_theta_eta(l, thetas, etas);
-            collect_theta_eta(r, thetas, etas);
-        }
-        Condition::And(l, r) | Condition::Or(l, r) => {
-            collect_theta_eta_in_condition(l, thetas, etas);
-            collect_theta_eta_in_condition(r, thetas, etas);
-        }
-        Condition::Not(c) => collect_theta_eta_in_condition(c, thetas, etas),
-    }
-}
-
-fn collect_theta_eta_in_stmts(
-    stmts: &[Statement],
-    thetas: &mut std::collections::HashSet<usize>,
-    etas: &mut std::collections::HashSet<usize>,
-) {
-    for s in stmts {
-        match s {
-            Statement::Assign(_, e)
-            | Statement::AssignIdx(_, e)
-            | Statement::DiffEq(_, e)
-            | Statement::DiffEqIdx(_, e) => collect_theta_eta(e, thetas, etas),
+            | Statement::DiffEqIdx(_, e) => visit_expr_nodes(e, f),
             Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {}
             Statement::If {
                 branches,
                 else_body,
             } => {
                 for (cond, body) in branches {
-                    collect_theta_eta_in_condition(cond, thetas, etas);
-                    collect_theta_eta_in_stmts(body, thetas, etas);
+                    visit_condition_nodes(cond, f);
+                    visit_stmt_nodes(body, f);
                 }
                 if let Some(eb) = else_body {
-                    collect_theta_eta_in_stmts(eb, thetas, etas);
+                    visit_stmt_nodes(eb, f);
                 }
             }
         }
     }
+}
+
+/// Accumulate every covariate name referenced in an expression.
+fn collect_covariates(expr: &Expression, out: &mut std::collections::HashSet<String>) {
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if let Expression::Covariate(name) = e {
+            out.insert(name.clone());
+        }
+    });
+}
+
+/// Accumulate every covariate name referenced across a statement list.
+fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
+    visit_stmt_nodes(stmts, &mut |e: &Expression| {
+        if let Expression::Covariate(name) = e {
+            out.insert(name.clone());
+        }
+    });
+}
+
+/// Accumulate every `Variable(name)` in an expression whose name is not a key in
+/// `defined` — i.e. a name that would resolve to the `usize::MAX` "reads 0.0"
+/// sentinel in the ODE RHS bytecode (or `vars.get(name).unwrap_or(0.0)` in an
+/// `init` expression). Used to reject undefined references in the `[odes]` block
+/// before they silently corrupt the dynamics (issue #314). Membership is by
+/// exact key: the ODE var maps already carry lower/upper/original aliases for
+/// every resolvable name, so a name absent from `defined` genuinely cannot
+/// resolve.
+fn collect_undefined_vars(
+    expr: &Expression,
+    defined: &HashMap<String, usize>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if let Expression::Variable(name) = e {
+            if !defined.contains_key(name) {
+                out.insert(name.clone());
+            }
+        }
+    });
+}
+
+/// Accumulate undefined `Variable` names (see `collect_undefined_vars`) across a
+/// statement list — a d/dt RHS, an intermediate assignment, or an if-condition.
+fn collect_undefined_vars_in_stmts(
+    stmts: &[Statement],
+    defined: &HashMap<String, usize>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    visit_stmt_nodes(stmts, &mut |e: &Expression| {
+        if let Expression::Variable(name) = e {
+            if !defined.contains_key(name) {
+                out.insert(name.clone());
+            }
+        }
+    });
+}
+
+/// Accumulate the theta and eta indices referenced in an expression. Only the
+/// statement-level variant is used outside the `survival` feature, so this
+/// expression-level entry is gated to its sole caller (`parse_event_model_block`).
+#[cfg(feature = "survival")]
+fn collect_theta_eta(
+    expr: &Expression,
+    thetas: &mut std::collections::HashSet<usize>,
+    etas: &mut std::collections::HashSet<usize>,
+) {
+    visit_expr_nodes(expr, &mut |e: &Expression| match e {
+        Expression::Theta(i) => {
+            thetas.insert(*i);
+        }
+        Expression::Eta(i) => {
+            etas.insert(*i);
+        }
+        _ => {}
+    });
+}
+
+/// Accumulate the theta and eta indices referenced across a statement list.
+fn collect_theta_eta_in_stmts(
+    stmts: &[Statement],
+    thetas: &mut std::collections::HashSet<usize>,
+    etas: &mut std::collections::HashSet<usize>,
+) {
+    visit_stmt_nodes(stmts, &mut |e: &Expression| match e {
+        Expression::Theta(i) => {
+            thetas.insert(*i);
+        }
+        Expression::Eta(i) => {
+            etas.insert(*i);
+        }
+        _ => {}
+    });
 }
 
 /// Collect the sigma names referenced in a `ParsedErrorModel` (before index resolution).

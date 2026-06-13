@@ -12640,6 +12640,46 @@ if (1 > 0) {
     }
 
     #[test]
+    fn test_undefined_optional_pk_param_errors() {
+        // The undefined-reference guard (#261/#308) applies uniformly to the
+        // *optional* params too — `f`, `lagtime`, and the `alag` alias — not just
+        // the required ones. A typo'd / undefined optional reference must error,
+        // never silently default the slot. (#309 keeps `f`/`lagtime` *optional*,
+        // i.e. omitting them is fine; this is the orthogonal value-validation:
+        // if you DO map them, the referenced variable must exist.) All required
+        // params (cl/v/ka) are defined here so the model reaches value resolution.
+        let header = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, ";
+        let footer = ")
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        // (pk key, undefined variable) — one per optional slot, incl. the alias.
+        for (key, badvar) in [("f", "BADF"), ("lagtime", "BADLAG"), ("alag", "BADALAG")] {
+            let model_str = format!("{header}{key}={badvar}{footer}");
+            let err = expect_parse_err(&model_str);
+            assert!(
+                err.contains(badvar) && err.contains("not defined"),
+                "optional `{key}={badvar}` must error as an undefined reference, got: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
         // Regression for the ODE-with-lagtime path. For ODE models there is
         // no [structural_model] pk= line, so pk_param_map is empty and

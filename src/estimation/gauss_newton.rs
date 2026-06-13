@@ -1020,6 +1020,48 @@ fn subject_nll_pop_grad_analytical_laplace(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Option<(f64, Vec<f64>)> {
+    subject_nll_pop_grad_analytical_laplace_cached(
+        x, template, model, population, subj_idx, eta_hat, h_matrix, bounds, options,
+    )
+    .map(|(nll, grad, _)| (nll, grad))
+}
+
+/// Per-subject Laplace intermediates the FOCEI θ/Ω/σ gradient already forms,
+/// captured so the #274 covariance EBE-response correction can reuse them
+/// instead of recomputing the predictions and re-factorising `H̃`. Every field
+/// is evaluated at the same `(η̂, parameter)` point as the gradient that
+/// produced it, so a correction built from the cache is bit-identical to one
+/// that recomputes from scratch. See [`subject_eta_response_correction`].
+pub(crate) struct LaplaceGradCache {
+    /// Per-observation residual variance `Rⱼ`.
+    pub r_diag: Vec<f64>,
+    /// Per-observation `dⱼ = ∂R/∂f`.
+    pub d_vec: Vec<f64>,
+    /// Per-observation `d2ⱼ = ∂²R/∂f²`.
+    pub d2_vec: Vec<f64>,
+    /// `G = a'diag(1/R)a` (the `hrh` accumulator — `H̃` without the `½c̃'c̃` and
+    /// `Ω⁻¹` terms).
+    pub hrh: DMatrix<f64>,
+    /// `H̃⁻¹`.
+    pub htilde_inv: DMatrix<f64>,
+    /// Per-observation `qⱼ = aⱼ'H̃⁻¹aⱼ`.
+    pub q: Vec<f64>,
+}
+
+/// As [`subject_nll_pop_grad_analytical_laplace`], but also returns the
+/// [`LaplaceGradCache`] of reusable per-subject intermediates.
+#[allow(clippy::too_many_arguments)]
+fn subject_nll_pop_grad_analytical_laplace_cached(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Option<(f64, Vec<f64>, LaplaceGradCache)> {
     use crate::pk;
 
     // The Almquist Laplace gradient now supports both `ErrorSpec::Single` and
@@ -1105,7 +1147,7 @@ fn subject_nll_pop_grad_analytical_laplace(
             }
         }
     }
-    let htilde = hrh + 0.5 * ctc + &omega.inv;
+    let htilde = &hrh + 0.5 * &ctc + &omega.inv;
     let htilde_chol = htilde.clone().cholesky()?;
     let log_det_htilde = chol_log_det(&htilde_chol.l());
     let htilde_inv = htilde_chol.inverse();
@@ -1145,12 +1187,11 @@ fn subject_nll_pop_grad_analytical_laplace(
         let r = r_diag[j];
         let inv_r = 1.0 / r;
         let inv_r2 = inv_r * inv_r;
-        let inv_r3 = inv_r2 * inv_r;
         let d = d_vec[j];
         let d2 = d2_vec[j]; // per-obs / per-CMT; constant in f for the current error models
         let e = err[j];
         let alpha_j = -2.0 * e * inv_r + d * (r - e * e) * inv_r2;
-        let beta_j = -d * inv_r2 + d * d2 * inv_r2 - d * d * d * inv_r3;
+        let beta_j = logdet_htilde_beta(d, d2, inv_r);
         theta_per_j[j] = alpha_j + beta_j * q[j];
     }
 
@@ -1313,7 +1354,137 @@ fn subject_nll_pop_grad_analytical_laplace(
         return None;
     }
 
-    Some((nll, grad))
+    let cache = LaplaceGradCache {
+        r_diag,
+        d_vec,
+        d2_vec,
+        hrh,
+        htilde_inv,
+        q,
+    };
+    Some((nll, grad, cache))
+}
+
+/// Per-observation coefficient of the `qⱼ = aⱼ'H̃⁻¹aⱼ` reservoir in the `log|H̃|`
+/// chain rule along the prediction axis: `βⱼ = −dⱼ/Rⱼ² + dⱼ·d2ⱼ/Rⱼ² − dⱼ³/Rⱼ³`,
+/// where `dⱼ = ∂R/∂f` and `d2ⱼ = ∂²R/∂f²`. Shared by the Laplace θ-gradient
+/// (`∂log|H̃|/∂θ` via `df/dθ`) and the #274 EBE-response correction
+/// (`∂log|H̃|/∂η` via `df/dη = a`), so the formula lives in one place.
+#[inline]
+fn logdet_htilde_beta(d: f64, d2: f64, inv_r: f64) -> f64 {
+    let inv_r2 = inv_r * inv_r;
+    let inv_r3 = inv_r2 * inv_r;
+    -d * inv_r2 + d * d2 * inv_r2 - d * d * d * inv_r3
+}
+
+/// Leading-order estimate of the per-subject `log|H̃|` EBE-response gradient term
+/// that the fixed-η̂ analytic Laplace gradient drops.
+///
+/// The analytic Laplace gradient computes `∂NLL_i/∂θ` holding η̂ fixed and
+/// invoking the envelope theorem — which zeros only the *inner* objective
+/// (`data_ll + η'Ω⁻¹η`), NOT `log|H̃|`. The true total gradient therefore carries
+/// an extra term:
+/// ```text
+///   dΦ_i/dθ = ∂NLL_i/∂θ + (∂NLL_i/∂η)·(dη̂_i/dθ),   ∂NLL_i/∂η = ½ ∂log|H̃_i|/∂η
+///   t_i[k]  = ½ (∂log|H̃_i|/∂η)' · (dη̂_i/dθ_k)
+/// ```
+/// Adding `t_i` back to the covariance-step gradient (only) makes the central FD
+/// of that gradient recover the full marginal Hessian `∇²(−2logL)` — including the
+/// EBE-response cross-curvature `Δ = d/dθ[½ ∂log|H̃|/∂η · dη̂/dθ]` that the non-IOV
+/// stencil otherwise omits (the term the IOV scalar-OFV-2nd-difference captures).
+///
+/// For a mu-referenced `θ_k ↔ η_{j'}` every factor is already formed by the
+/// Laplace gradient, so this reduces to a few `n_eta × n_eta` products:
+/// ```text
+///   gη_i[m] = Σ_j β_j q_j a_{j,m}        (= ∂log|H̃_i|/∂η_m, a-fixed / Fisher approx)
+///   G_i     = a'diag(1/R)a   (= hrh),    dη̂_i/dθ_k = −H̃_i⁻¹ G_i[:,j']   (IFT, GN)
+///   t_i[k]  = −½ ( G_i · H̃_i⁻¹ · gη_i )_{j'}
+/// ```
+/// Returns `None` on an ill-conditioned point (caller then skips the correction).
+/// Covers the **mu-ref θ block** (`m_k = G[:,j']`). The σ SE is corrected
+/// indirectly through the θ/σ off-diagonals (matrix coupling), so no σ-direct term
+/// is needed. The ω block (closed form `m_k = ∂Ω⁻¹/∂x_k·η̂`) is deferred: its
+/// `z_i·(H̃⁻¹g^η)_i` form lacks the θ block's `G·H̃⁻¹ ≈ I` cancellation, so it is
+/// sensitive to the leading-order `g^η` (dropped `∂²f/∂η²`) and overshoots
+/// large-IIV components — see issue #274.
+///
+/// `cache` carries the per-subject Laplace intermediates (`R`, `d`, `d2`, `G`,
+/// `H̃⁻¹`, `q`) the FOCEI gradient already formed at this point. The covariance
+/// step passes `Some(..)` so the correction does not recompute the predictions
+/// or re-factorise `H̃`. Pass `None` to have the correction re-derive them
+/// itself (used by the unit test and any FD-fallback subject).
+pub(crate) fn subject_eta_response_correction(
+    cache: Option<&LaplaceGradCache>,
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Option<Vec<f64>> {
+    let n = x.len();
+    let n_eta = model.n_eta;
+    let n_theta = template.theta.len();
+    let n_obs = population.subjects[subj_idx].observations.len();
+    if n_eta == 0 || n_obs == 0 {
+        return Some(vec![0.0; n]);
+    }
+
+    // Reuse the gradient's per-subject intermediates when the covariance step
+    // already formed them (the common path); otherwise re-derive them by running
+    // the cached Laplace gradient here. Either way the intermediates are the same
+    // `R/d/d2/G/H̃⁻¹/q` the gradient uses, so the correction is unchanged.
+    let owned;
+    let c: &LaplaceGradCache = match cache {
+        Some(c) => c,
+        None => {
+            let (_, _, computed) = subject_nll_pop_grad_analytical_laplace_cached(
+                x, template, model, population, subj_idx, eta_hat, h_matrix, bounds, options,
+            )?;
+            owned = computed;
+            &owned
+        }
+    };
+
+    // gη_m = Σ_j β_j q_j a_{j,m}: the η-gradient of log|H̃| under the same a-fixed
+    // chain the θ-gradient uses (q_j = a_j'H̃⁻¹a_j; β_j the log|H̃| coefficient).
+    let mut g_eta = DVector::<f64>::zeros(n_eta);
+    for j in 0..n_obs {
+        let aj = h_matrix.row(j);
+        let beta_j = logdet_htilde_beta(c.d_vec[j], c.d2_vec[j], 1.0 / c.r_diag[j]);
+        let coef = beta_j * c.q[j];
+        for m in 0..n_eta {
+            g_eta[m] += coef * aj[m];
+        }
+    }
+
+    // u = G·H̃⁻¹·gη;  t_i[k] = −½ u_{j'} for mu-ref θ_k↔η_{j'}. A non-finite entry
+    // can only reach the result through a mapped `u[jp]`, which the final
+    // finiteness check below catches (returning `None` so the subject contributes
+    // 0) — no separate intermediate guard needed.
+    let u = &c.hrh * (&c.htilde_inv * &g_eta);
+    let fixed_mask = packed_fixed_mask(template);
+    let mut t = vec![0.0f64; n];
+
+    // ── θ block (mu-ref): dη̂/dθ_k = −H̃⁻¹ G[:,j'],  t_i[k] = −½ u_{j'}. ──
+    if options.mu_referencing {
+        for k in 0..n_theta {
+            if fixed_mask[k] {
+                continue;
+            }
+            if let Some(jp) = mu_ref_eta_index(model, template, k) {
+                t[k] = -0.5 * u[jp];
+            }
+        }
+    }
+
+    if t.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    Some(t)
 }
 
 /// Compute the FOCE NLL and its gradient w.r.t. the packed population parameter
@@ -1490,6 +1661,44 @@ pub(crate) fn subject_nll_pop_grad(
     (nll_base_raw, grad)
 }
 
+/// [`subject_nll_pop_grad`] that additionally returns the [`LaplaceGradCache`]
+/// when this subject took the FOCEI Laplace analytical path — letting the
+/// covariance step's #274 EBE-response correction reuse the predictions and `H̃`
+/// factorisation rather than recomputing them. The cache is `None` for FOCE, for
+/// the M3/IOV/FD-fallback path, and when the Laplace gradient bails (non-PD `H̃`);
+/// in every `None` case the returned `(nll, grad)` is exactly what
+/// [`subject_nll_pop_grad`] returns, so callers can treat this as a drop-in.
+///
+/// On the rare Laplace bail the analytical path is attempted twice (once here,
+/// once inside the delegated `subject_nll_pop_grad`); this only happens on an
+/// ill-conditioned point that was going to fall back to FD anyway.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn subject_nll_pop_grad_with_cache(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    kappas: &[DVector<f64>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> (f64, Vec<f64>, Option<LaplaceGradCache>) {
+    let laplace_ok = !matches!(model.bloq_method, BloqMethod::M3) && kappas.is_empty();
+    if options.interaction && laplace_ok {
+        if let Some((nll, grad, cache)) = subject_nll_pop_grad_analytical_laplace_cached(
+            x, template, model, population, subj_idx, eta_hat, h_matrix, bounds, options,
+        ) {
+            return (nll, grad, Some(cache));
+        }
+    }
+    let (nll, grad) = subject_nll_pop_grad(
+        x, template, model, population, subj_idx, eta_hat, h_matrix, kappas, bounds, options,
+    );
+    (nll, grad, None)
+}
+
 /// Build the Gauss-Newton linear system: gradient and BHHH approximate Hessian
 /// of the FOCE population objective.
 ///
@@ -1623,7 +1832,7 @@ mod tests {
         BloqMethod, CompiledModel, DoseEvent, ErrorModel, FitOptions, GradientMethod,
         ModelParameters, OmegaMatrix, PkModel, PkParams, Population, SigmaVector, Subject,
     };
-    use nalgebra::DVector;
+    use nalgebra::{DMatrix, DVector};
     use std::collections::HashMap;
 
     fn make_model() -> CompiledModel {
@@ -1726,6 +1935,90 @@ mod tests {
             input_columns: vec![],
             exclusions: None,
             warnings: vec![],
+        }
+    }
+
+    /// The `log|H̃|` EBE-response correction (#274) must vanish for additive error:
+    /// `∂R/∂f = 0` ⇒ `β_j = 0` ⇒ `g^η = 0` ⇒ every `t_i[k] = 0`. This is the Δ=0
+    /// control that guarantees the correction is inert when there is no η-σ
+    /// interaction (additive residual variance), so additive-error SEs are
+    /// unchanged. Contrast: the proportional model gives a non-zero correction.
+    #[test]
+    fn eta_response_correction_zero_for_additive_nonzero_for_proportional() {
+        let pop = make_population();
+        let eta_hat = DVector::from_vec(vec![0.15]);
+        // Plausible Jacobian dpred/dη (3 obs × 1 eta) — sign/scale immaterial to
+        // the additive-zero claim (β_j = 0 regardless).
+        let h = DMatrix::from_column_slice(3, 1, &[-0.20, -0.50, -0.60]);
+        let mut opts = FitOptions::default();
+        opts.interaction = true;
+        opts.mu_referencing = true;
+
+        // mu-reference TVCL ↔ ETA_CL (log-transformed) so the θ block is active.
+        let mu = || {
+            let mut m = HashMap::new();
+            m.insert(
+                "ETA_CL".to_string(),
+                crate::types::MuRef {
+                    theta_name: "TVCL".to_string(),
+                    log_transformed: true,
+                },
+            );
+            m
+        };
+
+        // Proportional: correction is active (some |t| > 0).
+        let mut model_p = make_model();
+        model_p.mu_refs = mu();
+        let template_p = model_p.default_params.clone();
+        let xp = pack_params(&template_p);
+        let bounds_p = compute_bounds(&template_p);
+        // `None` cache: exercise the re-derive path (the covariance step passes a
+        // cache, but the unit test checks the standalone correction).
+        let tp = subject_eta_response_correction(
+            None,
+            &xp,
+            &template_p,
+            &model_p,
+            &pop,
+            0,
+            &eta_hat,
+            &h,
+            &bounds_p,
+            &opts,
+        )
+        .expect("correction computes (proportional)");
+        assert!(
+            tp.iter().any(|&v| v.abs() > 0.0),
+            "proportional error must give a non-zero EBE-response correction"
+        );
+
+        // Additive: correction is exactly zero everywhere (even with the mu-ref).
+        let mut model_a = make_model();
+        model_a.mu_refs = mu();
+        model_a.error_model = ErrorModel::Additive;
+        model_a.error_spec = crate::types::ErrorSpec::Single(ErrorModel::Additive);
+        let template_a = model_a.default_params.clone();
+        let xa = pack_params(&template_a);
+        let bounds_a = compute_bounds(&template_a);
+        let ta = subject_eta_response_correction(
+            None,
+            &xa,
+            &template_a,
+            &model_a,
+            &pop,
+            0,
+            &eta_hat,
+            &h,
+            &bounds_a,
+            &opts,
+        )
+        .expect("correction computes (additive)");
+        for (k, &v) in ta.iter().enumerate() {
+            assert_eq!(
+                v, 0.0,
+                "additive error must give zero correction at packed param {k}"
+            );
         }
     }
 

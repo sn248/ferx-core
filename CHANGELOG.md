@@ -20,6 +20,26 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Propensity-score-matched simulation: `simulate_with_options()` with a new
+  `SimulateOptions { seed, propensity_match }`. When `propensity_match` is set,
+  each replicate's drawn etas are reassigned to subjects by optimal Mahalanobis
+  matching (under the model Ω) against the subjects' fitted (posthoc) etas, so a
+  subject's observed dosing/sampling design is paired with a similar drawn eta.
+  This corrects VPC bias from treatment adaptation in real-world data (longer
+  intervals for high-clearance patients, etc.). Operates on observed data;
+  returns the usual simulation rows for the caller to build the VPC (#288).
+- New `importance_sampling_map` (alias `impmap`) estimation method: a Monte-Carlo
+  EM estimator equivalent to NONMEM `METHOD=IMPMAP`. Each iteration re-centers a
+  per-subject importance-sampling proposal on the conditional mode (MAP) and
+  updates θ/Ω/σ from the importance-weighted posterior moments. Runs standalone
+  or chained (`methods = [focei, impmap]`); multivariate-normal proposal by
+  default (`impmap_proposal_df = normal`), Student-t optional. Validated against
+  FOCEI on warfarin. IOV and SDE models are not yet supported (#270).
+- Importance sampling can now run **standalone** (`method = imp`), evaluating the
+  IS log-likelihood at the initial parameters — IMP derives the EBEs/Jacobian it
+  needs via a FOCE inner loop at those parameters instead of requiring a
+  preceding estimator. Useful for scoring imported/fixed parameter sets. IMP
+  still may appear at most once and must be the terminal stage of a chain.
 - Feature maturity labels (`stable` / `beta` / `experimental`) documented for
   every major feature: a new *Feature Maturity* docs page with definitions and a
   per-feature table, plus a maturity banner on each feature reference page.
@@ -70,6 +90,26 @@ section of the SDLC for the versioning policy).
   exercised the AD path, so the divergence went undetected (surfaced by an
   external NONMEM/OpenPMX/ferx benchmark, FeRx-NLME/ferx-r#154). The default
   non-autodiff build was never affected (#278).
+- FOCEI covariance standard errors (non-IOV) now include the `log|H̃|` EBE-response
+  curvature for mu-referenced structural parameters, bringing the non-IOV stencil
+  in line with the IOV stencil and matching NONMEM `$COV MATRIX=R` more closely on
+  models with η-dependent (proportional/combined) residual error. The fixed-η̂
+  analytic gradient previously dropped this term — the envelope theorem zeros the
+  inner objective but not `log|H̃|` — and the resulting SE gap grew with the
+  proportional error magnitude. Additive-error SEs are unchanged (the correction is
+  identically zero when `∂R/∂f = 0`) (#274).
+- IOV models: `[derived]` columns, `[output]` individual parameters, and the
+  TAD column in `sdtab` now use each observation's **occasion** kappa instead of
+  silently treating every kappa as zero. Post-fit diagnostic columns that depend
+  on a κ-varying parameter (e.g. `CL`, `V`, `KA`) were wrong for IOV subjects;
+  the fitted estimates, OFV, and IPRED/IWRES were unaffected (#238).
+- The `sdtab` TAD column now shifts each dose by **its own** absorption lag —
+  evaluated with that dose's occasion kappa and that dose's covariate snapshot —
+  rather than applying the observation's lag to every dose. This changes TAD only
+  when the absorption lag varies across doses, i.e. when it carries IOV (kappa) or
+  depends on a time-varying covariate, *and* dosing spans the differing values
+  (e.g. BID across two occasions); models with a constant lag are unaffected
+  (follow-up to #238).
 - FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
   `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The
   covariance step had added the Ω prior (`η̂ᵀΩ⁻¹η̂ + log|Ω|`) on top of the
@@ -99,6 +139,15 @@ section of the SDLC for the versioning policy).
   (#199, #200).
 
 ### Performance
+- The covariance step is now built as a single parallel work-list over the
+  finite-difference points (subjects iterated serially within each point) instead
+  of firing a per-subject parallel reduction at every perturbed point. This removes
+  the fork/join overhead of up to `4·n_free` rayon barriers in series — the
+  bottleneck was scheduling, not core utilisation — making the covariance step
+  ~9–11× faster across error models and structures, with bit-identical results.
+  Both stencils are flattened: the non-IOV analytic-gradient difference and the
+  IOV `OFV`-second-difference (the latter has `~2·n_free²` points, so it benefits
+  even more) (#256).
 - The covariance Hessian is built from a central difference of the analytical
   population gradient — reusing H-matrix columns for mu-referenced parameters
   instead of finite-differencing predictions — making the covariance step ~9×

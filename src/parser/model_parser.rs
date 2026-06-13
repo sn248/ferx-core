@@ -5656,6 +5656,17 @@ fn build_pk_param_fn(
         if let Some(var_slot) = var_slot {
             pk_assignment_mapping.push((pk_slot, var_slot));
         } else if let Ok(c) = var_name.parse::<f64>() {
+            // A numeric literal binds the slot to a constant — but `f64::from_str`
+            // also accepts `inf`/`nan`/`infinity`, which are never a meaningful PK
+            // value. Reject them rather than binding a silently-degenerate
+            // constant (the same silent-wrong default #261 set out to remove).
+            if !c.is_finite() {
+                return Err(format!(
+                    "[structural_model] parameter `{pk_name}` has non-finite constant value \
+                     `{var_name}`; use a finite number or a defined [individual_parameters] \
+                     variable"
+                ));
+            }
             pk_const_mapping.push((pk_slot, c));
         } else {
             return Err(format!(
@@ -12421,6 +12432,35 @@ if (1 > 0) {
         let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
         let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
         assert!(pk.cl() > 0.0, "cl should bind to KE * V, got {}", pk.cl());
+    }
+
+    #[test]
+    fn test_non_finite_literal_pk_param_errors() {
+        // `f64::from_str` accepts "inf"/"nan", so a non-finite literal value
+        // must be rejected rather than silently bound as a degenerate constant
+        // (the same silent-wrong default #261 removes for undefined references).
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=inf)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = expect_parse_err(model_str);
+        assert!(
+            err.contains("non-finite") && err.contains("ka"),
+            "expected a non-finite-constant error naming ka, got: {err}"
+        );
     }
 
     #[test]

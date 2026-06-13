@@ -73,6 +73,11 @@ section of the SDLC for the versioning policy).
   never used — neither mapped into the `pk(...)` model nor referenced in any
   other block (e.g. declaring `F` but forgetting `f=F`); it silently has no
   effect (#309).
+- The "computed but never used" warning above now also covers **ODE models**: an
+  `[individual_parameters]` entry never referenced in the `[odes]` right-hand
+  side (nor in `[scaling]`/`[derived]`/`[output]`) is flagged the same way. The
+  engine-applied `F` (bioavailability) and `lagtime` (alias `alag`), which act on
+  the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
 - IMP (importance sampling) now jointly samples (η, κ) for IOV models,

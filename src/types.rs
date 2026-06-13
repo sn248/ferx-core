@@ -73,6 +73,13 @@ pub const PK_IDX_Q3: usize = 6;
 pub const PK_IDX_V3: usize = 7;
 pub const PK_IDX_LAGTIME: usize = 8;
 
+/// The engine-reserved PK slots: bioavailability (`F`) and absorption lag
+/// (`lagtime`). `ode_param_slots` keeps these free for an undeclared F/lagtime
+/// (issue #122), both the analytical and ODE engines apply them to the dose
+/// itself rather than the RHS, and the "computed but never used" census exempts
+/// parameters routed here. Single source of truth so those sites can't drift.
+pub(crate) const RESERVED_PK_SLOTS: [usize; 2] = [PK_IDX_F, PK_IDX_LAGTIME];
+
 #[derive(Debug, Clone, Copy)]
 pub struct PkParams {
     pub values: [f64; MAX_PK_PARAMS],

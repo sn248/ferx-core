@@ -1990,11 +1990,11 @@ mod tests {
         // delegation lines. (The cfg(survival) row-routing inside the impl is
         // exercised by the survival job, not here.)
         let no_tte = std::collections::HashSet::new();
-        let csv = "ID,TIME,DV,EVID,AMT,WT,STUDY\n\
-                   1,0,.,1,100,70,1\n\
-                   1,1,5.0,0,.,70,1\n\
-                   2,0,.,1,100,80,2\n\
-                   2,1,4.0,0,.,80,2\n";
+        let csv = "ID,TIME,DV,EVID,AMT,WT,STUDY,AGE\n\
+                   1,0,.,1,100,70,1,30\n\
+                   1,1,5.0,0,.,70,1,30\n\
+                   2,0,.,1,100,80,2,40\n\
+                   2,1,4.0,0,.,80,2,40\n";
         let f = write_csv(csv);
 
         // filtered_tte: explicit covariate list, augmented by a filter that
@@ -2013,14 +2013,25 @@ mod tests {
             "STUDY==2 subject should be filtered out via the augmented column"
         );
 
-        // with_covariates_tte: declared covariates + table building, no filter.
+        // with_covariates_tte: declared WT + an undeclared `extra` (STUDY) + a
+        // filter referencing a *third* column (AGE) — exercises BOTH the
+        // extra-columns dedup loop and the filter-referenced-column merge. The
+        // filter matches no row, so both subjects are retained.
         let decls = vec![CovariateDecl {
             name: "WT".to_string(),
             kind: CovariateKind::Continuous,
         }];
-        let (pop2, _table) =
-            read_nonmem_csv_with_covariates_tte(f.path(), &decls, &[], None, None, &no_tte)
-                .unwrap();
-        assert_eq!(pop2.subjects.len(), 2);
+        let extra = ["STUDY".to_string()];
+        let nomatch = SelectionFilter::from_opts(&["AGE == 999".to_string()], &[], &[]).unwrap();
+        let (pop2, _table) = read_nonmem_csv_with_covariates_tte(
+            f.path(),
+            &decls,
+            &extra,
+            None,
+            Some(&nomatch),
+            &no_tte,
+        )
+        .unwrap();
+        assert_eq!(pop2.subjects.len(), 2, "AGE==999 matches no row");
     }
 }

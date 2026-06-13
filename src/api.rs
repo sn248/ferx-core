@@ -5324,7 +5324,12 @@ mod tests_sir_fallback {
             &mut warnings,
         );
 
-        let fired = result.is_some();
+        // Derive the reported status from the actual outcome, *before* unwrapping,
+        // so this checks the real fire→status mapping rather than a constant.
+        assert_eq!(
+            resolve_covariance_status(true, false, result.is_some()),
+            CovarianceStatus::SirFallback
+        );
         let sir = result.expect("fallback should fire and SIR should succeed with a tame proposal");
 
         assert!(!sir.ci_theta.is_empty(), "theta CIs must be populated");
@@ -5347,11 +5352,6 @@ mod tests_sir_fallback {
         assert!(
             !warnings.iter().any(|w| w.contains("SIR fallback failed")),
             "no failure warning expected on the success path: {warnings:?}"
-        );
-        // The status the caller derives from a fired fallback is SirFallback.
-        assert_eq!(
-            resolve_covariance_status(true, false, fired),
-            CovarianceStatus::SirFallback
         );
     }
 }

@@ -9294,6 +9294,184 @@ mod tests {
     }
 
     #[test]
+    fn test_pk_key_relevance_matrix() {
+        // Exhaustively pins every (model, PK key) cell, classified
+        // R(equired) / O(ptional, used) / U(nused) — hardcoded independently of
+        // `consumes_pk_slot`/`required_pk_params` so the test can't co-drift with
+        // the code it checks:
+        //   R → omitting the key is an error naming it;
+        //   O → mapping the key is silently accepted (no "does not use" warning);
+        //   U → mapping the key warns "does not use `key`".
+        // Keys use each model's canonical slot name (`v`/`v1`, `q`/`q2`), so the
+        // required-omission error (which echoes the canonical name) matches.
+        let matrix: &[(&str, [(&str, char); 9])] = &[
+            (
+                "one_cpt_iv",
+                [
+                    ("cl", 'R'),
+                    ("v", 'R'),
+                    ("q", 'U'),
+                    ("v2", 'U'),
+                    ("ka", 'U'),
+                    ("f", 'U'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "one_cpt_oral",
+                [
+                    ("cl", 'R'),
+                    ("v", 'R'),
+                    ("q", 'U'),
+                    ("v2", 'U'),
+                    ("ka", 'R'),
+                    ("f", 'O'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "two_cpt_iv",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'U'),
+                    ("f", 'U'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "two_cpt_oral",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'R'),
+                    ("f", 'O'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "three_cpt_iv",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q2", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'U'),
+                    ("f", 'U'),
+                    ("q3", 'R'),
+                    ("v3", 'R'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "three_cpt_oral",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q2", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'R'),
+                    ("f", 'O'),
+                    ("q3", 'R'),
+                    ("v3", 'R'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+        ];
+        // `cl` carries the theta/eta so [parameters] has no unused declarations;
+        // every other mapped key is a literal so there are no surplus declared
+        // individual parameters to flag as dead.
+        let build = |model: &str, keys: &[&str]| -> String {
+            let indiv: String = keys
+                .iter()
+                .map(|k| {
+                    let var = k.to_uppercase();
+                    if *k == "cl" {
+                        format!("  {var} = TVX * exp(ETA)\n")
+                    } else {
+                        format!("  {var} = 1.0\n")
+                    }
+                })
+                .collect();
+            let pk = keys
+                .iter()
+                .map(|k| format!("{k}={}", k.to_uppercase()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "
+[parameters]
+  theta TVX(1.0, 0.001, 100.0)
+  omega ETA ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+{indiv}
+[structural_model]
+  pk {model}({pk})
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+            )
+        };
+        for entry in matrix {
+            let model = entry.0;
+            let cells = &entry.1;
+            let required: Vec<&str> = cells.iter().filter(|c| c.1 == 'R').map(|c| c.0).collect();
+            for cell in cells {
+                let key = cell.0;
+                match cell.1 {
+                    'R' => {
+                        // Map every required key EXCEPT this one → error naming it.
+                        let keys: Vec<&str> =
+                            required.iter().copied().filter(|k| *k != key).collect();
+                        let err = super::parse_full_model(&build(model, &keys))
+                            .err()
+                            .unwrap_or_else(|| {
+                                panic!("{model}: omitting required `{key}` must error")
+                            });
+                        assert!(
+                            err.contains(&format!("`{key}`")),
+                            "{model}: omitting `{key}` should name it, got: {err}"
+                        );
+                    }
+                    class @ ('O' | 'U') => {
+                        // Map every required key PLUS this one → warn iff unused.
+                        let mut keys: Vec<&str> = required.clone();
+                        keys.push(key);
+                        let parsed = super::parse_full_model(&build(model, &keys))
+                            .unwrap_or_else(|e| panic!("{model} + `{key}` should parse: {e}"));
+                        let warned =
+                            parsed.model.parse_warnings.iter().any(|w| {
+                                w.contains("does not use") && w.contains(&format!("`{key}`"))
+                            });
+                        assert_eq!(
+                            warned,
+                            class == 'U',
+                            "{model} `{key}` ({class}): unexpected warning state, got: {:?}",
+                            parsed.model.parse_warnings
+                        );
+                    }
+                    other => panic!("bad classification `{other}`"),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_parse_method_single() {
         let opts = parse_fit_options(&["method = focei".to_string()]).unwrap();
         assert_eq!(opts.method, EstimationMethod::FoceI);

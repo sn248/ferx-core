@@ -10,6 +10,9 @@
 # Slow-tests NEVER run on PRs: per-PR upload = `fast` flag (--features ci);
 # nightly upload = `slow` flag (--features ci,slow-tests). carryforward lets the
 # nightly `slow` data augment the project number on PRs without re-running it.
+# Feature-gated TTE/survival code is compiled OUT of the `fast`/`slow` FD builds,
+# so the `survival` job uploads a `survival` flag (--features ci,survival) that
+# Codecov merges in — counting those lines where they're actually exercised (#293).
 
 coverage:
   range: 85..95
@@ -31,6 +34,7 @@ coverage:
         flags:
           - fast
           - slow
+          - survival
       # The explicit 90% gap, shown on every PR so the author sees how far
       # under the floor they are — informational, so it challenges without
       # gatekeeping.
@@ -41,6 +45,7 @@ coverage:
         flags:
           - fast
           - slow
+          - survival
       # The teeth: ENFORCED on the weekly full-coverage run on `main` only, so
       # the project status genuinely goes RED there while we're below 90%.
       # Never evaluated on PRs (branches: main), so it blocks no one. No later
@@ -55,12 +60,19 @@ coverage:
         flags:
           - fast
           - slow
+          - survival
     patch:
       default:
         target: 90% # new/changed lines must be tested
         threshold: 0%
+        # `fast` + `survival` are the two FRESH per-PR coverage sources, so they
+        # grade the changed lines. `survival` is required here: survival-gated
+        # changes are compiled out of the `fast` build, so without it a survival
+        # PR's own new lines would read as uncovered. `slow` stays excluded — it's
+        # carryforward (stale for brand-new code).
         flags:
           - fast
+          - survival
 
 flag_management:
   default_rules:
@@ -69,6 +81,11 @@ flag_management:
     - name: fast
       carryforward: false
     - name: slow
+      carryforward: true
+    - name: survival
+      # The `survival` job runs on PRs, main pushes, AND the weekly schedule, so it
+      # normally uploads fresh. carryforward is a safety net: the flag still
+      # contributes on any run where that job didn't upload (fresh data overrides).
       carryforward: true
 
 comment:

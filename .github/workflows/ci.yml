@@ -106,7 +106,7 @@ jobs:
         run: cargo fmt -- --check
 
   coverage:
-    name: Coverage
+    name: Coverage (full, nightly)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
@@ -137,9 +137,86 @@ jobs:
         # (mirrors the same flag in slow-tests.yml).
         run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,slow-tests --release --lcov --output-path lcov.info
 
-      - name: Upload to Codecov
+      - name: Upload to Codecov (slow flag)
         uses: codecov/codecov-action@v7
         with:
           files: lcov.info
+          flags: slow
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  coverage-pr:
+    name: Coverage (fast, patch)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write # for the below-floor nudge comment
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal -c llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Own cache key: the instrumented build can't share artifacts with the
+          # normal `ci` cache (different RUSTFLAGS).
+          shared-key: ci-cov
+      - name: Install cargo-llvm-cov
+        # Prebuilt binary (no compile) so the per-PR job stays fast.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate fast coverage report
+        # Fast tier only: `--features ci` (no `slow-tests`, no `survival`). This
+        # is the per-PR patch gate; the full `ci,slow-tests` run is nightly (the
+        # `coverage` job above). Runs in parallel with the other PR jobs and
+        # fits inside the existing Survival-job wall-clock, so PR feedback time
+        # is unchanged. `--tests` so the integration tests count (same rationale
+        # as the nightly job).
+        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci --release --lcov --output-path lcov.info
+
+      - name: Upload to Codecov (fast flag)
+        uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          flags: fast
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Nudge the author while the project is below the floor
+        # Informational, non-blocking. If the project (full, slow-inclusive)
+        # coverage on `main` is below the 90% floor the weekly run enforces,
+        # post/update ONE sticky PR comment so the author is nudged to cover new
+        # lines. Self-resolves once the backfill clears 90%. Never fails the PR
+        # (continue-on-error); skipped on forks (read-only token).
+        if: ${{ github.event.pull_request.head.repo.fork == false }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -u
+          marker='<!-- coverage-floor-nudge -->'
+          cov=$(curl -s --max-time 20 \
+            "https://codecov.io/api/v2/github/FeRx-NLME/repos/ferx-core/totals/" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['totals']['coverage'])" 2>/dev/null || true)
+          if [ -z "${cov:-}" ]; then echo "no coverage figure; skipping nudge"; exit 0; fi
+          below=$(python3 -c "import sys; print('1' if float(sys.argv[1]) < 90 else '0')" "$cov")
+          # `// empty` so a no-match yields an empty string (-> POST a new
+          # comment) instead of the literal `null`; `--paginate` so the marker
+          # isn't missed past the first page of comments.
+          existing=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq "[.[] | select(.body | contains(\"$marker\"))][0].id // empty" 2>/dev/null || true)
+          if [ "$below" = "1" ]; then
+            body=$(printf '%s\n📉 **Coverage floor not yet met.** Project coverage is **%s%%**, below the **90%%** floor enforced on the weekly full-coverage run (see #286).\n\nThis PR is **not blocked**. If it adds code, please make sure the new lines are covered — the `patch` check (target 90%%) grades exactly your changed lines, and the Codecov report below shows the gaps. Thanks for helping clear the floor. 🙏' "$marker" "$cov")
+          else
+            body=$(printf '%s\n✅ Project coverage is at or above the 90%% floor — thanks for keeping it green!' "$marker")
+          fi
+          if [ -n "${existing:-}" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -f body="$body" >/dev/null
+          elif [ "$below" = "1" ]; then
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$body" >/dev/null
+          fi

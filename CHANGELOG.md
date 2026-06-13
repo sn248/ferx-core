@@ -20,6 +20,18 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- New `importance_sampling_map` (alias `impmap`) estimation method: a Monte-Carlo
+  EM estimator equivalent to NONMEM `METHOD=IMPMAP`. Each iteration re-centers a
+  per-subject importance-sampling proposal on the conditional mode (MAP) and
+  updates θ/Ω/σ from the importance-weighted posterior moments. Runs standalone
+  or chained (`methods = [focei, impmap]`); multivariate-normal proposal by
+  default (`impmap_proposal_df = normal`), Student-t optional. Validated against
+  FOCEI on warfarin. IOV and SDE models are not yet supported (#270).
+- Importance sampling can now run **standalone** (`method = imp`), evaluating the
+  IS log-likelihood at the initial parameters — IMP derives the EBEs/Jacobian it
+  needs via a FOCE inner loop at those parameters instead of requiring a
+  preceding estimator. Useful for scoring imported/fixed parameter sets. IMP
+  still may appear at most once and must be the terminal stage of a chain.
 - Feature maturity labels (`stable` / `beta` / `experimental`) documented for
   every major feature: a new *Feature Maturity* docs page with definitions and a
   per-feature table, plus a maturity banner on each feature reference page.
@@ -63,6 +75,18 @@ section of the SDLC for the versioning policy).
   inner objective but not `log|H̃|` — and the resulting SE gap grew with the
   proportional error magnitude. Additive-error SEs are unchanged (the correction is
   identically zero when `∂R/∂f = 0`) (#274).
+- IOV models: `[derived]` columns, `[output]` individual parameters, and the
+  TAD column in `sdtab` now use each observation's **occasion** kappa instead of
+  silently treating every kappa as zero. Post-fit diagnostic columns that depend
+  on a κ-varying parameter (e.g. `CL`, `V`, `KA`) were wrong for IOV subjects;
+  the fitted estimates, OFV, and IPRED/IWRES were unaffected (#238).
+- The `sdtab` TAD column now shifts each dose by **its own** absorption lag —
+  evaluated with that dose's occasion kappa and that dose's covariate snapshot —
+  rather than applying the observation's lag to every dose. This changes TAD only
+  when the absorption lag varies across doses, i.e. when it carries IOV (kappa) or
+  depends on a time-varying covariate, *and* dosing spans the differing values
+  (e.g. BID across two occasions); models with a constant lag are unaffected
+  (follow-up to #238).
 - FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
   `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The
   covariance step had added the Ω prior (`η̂ᵀΩ⁻¹η̂ + log|Ω|`) on top of the

@@ -75,6 +75,14 @@ section of the SDLC for the versioning policy).
   the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
 
 ### Fixed
+- FOCEI covariance standard errors (non-IOV) now include the `log|H̃|` EBE-response
+  curvature for mu-referenced structural parameters, bringing the non-IOV stencil
+  in line with the IOV stencil and matching NONMEM `$COV MATRIX=R` more closely on
+  models with η-dependent (proportional/combined) residual error. The fixed-η̂
+  analytic gradient previously dropped this term — the envelope theorem zeros the
+  inner objective but not `log|H̃|` — and the resulting SE gap grew with the
+  proportional error magnitude. Additive-error SEs are unchanged (the correction is
+  identically zero when `∂R/∂f = 0`) (#274).
 - IOV models: `[derived]` columns, `[output]` individual parameters, and the
   TAD column in `sdtab` now use each observation's **occasion** kappa instead of
   silently treating every kappa as zero. Post-fit diagnostic columns that depend
@@ -116,6 +124,15 @@ section of the SDLC for the versioning policy).
   (#199, #200).
 
 ### Performance
+- The covariance step is now built as a single parallel work-list over the
+  finite-difference points (subjects iterated serially within each point) instead
+  of firing a per-subject parallel reduction at every perturbed point. This removes
+  the fork/join overhead of up to `4·n_free` rayon barriers in series — the
+  bottleneck was scheduling, not core utilisation — making the covariance step
+  ~9–11× faster across error models and structures, with bit-identical results.
+  Both stencils are flattened: the non-IOV analytic-gradient difference and the
+  IOV `OFV`-second-difference (the latter has `~2·n_free²` points, so it benefits
+  even more) (#256).
 - The covariance Hessian is built from a central difference of the analytical
   population gradient — reusing H-matrix columns for mu-referenced parameters
   instead of finite-differencing predictions — making the covariance step ~9×

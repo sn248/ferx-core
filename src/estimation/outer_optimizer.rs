@@ -1,5 +1,5 @@
 use crate::estimation::gauss_newton::subject_nll_pop_grad;
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::{find_ebe, run_inner_loop_warm};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
 use crate::types::*;
@@ -1750,6 +1750,17 @@ fn ad_population_gradient(
             .1
         })
         .collect();
+    assemble_population_gradient(&per_subj, np)
+}
+
+/// Assemble the covariance-step population gradient `2·Σᵢ gᵢ` from per-subject
+/// gradients, summing over subjects in index order. Both the parallel
+/// [`ad_population_gradient`] and the serial per-point gradient inside
+/// [`compute_covariance`] route their reduction through here, so there is a
+/// single summation order — which is what keeps the flattened (#256) covariance
+/// bit-identical to the pre-flatten serial stencil for FOCE. `np` is the packed
+/// parameter count; each `gᵢ` has length `np`.
+fn assemble_population_gradient(per_subj: &[Vec<f64>], np: usize) -> Vec<f64> {
     (0..np)
         .map(|k| per_subj.iter().map(|gi| gi[k]).sum::<f64>() * 2.0)
         .collect()
@@ -1878,14 +1889,12 @@ fn backtracking_line_search_warm(
     0.0
 }
 
-/// Gradient of the covariance-step objective `2·pop_nll` w.r.t. the packed
-/// parameter vector, with ETAs and H-matrices held fixed.
-///
-/// Both methods carry the Ω dependence inside `pop_nll` already — FOCE through
-/// `R̃ = HΩHᵀ + R` in the Sheiner–Beal marginal (equivalent by Woodbury to the
-/// conditional form with `η̂ᵀΩ⁻¹η̂ + log|Ω|`), FOCEI through the explicit prior in
-/// the Almquist–Laplace marginal — so the gradient is just `ad_population_gradient`
-/// with no separate omega-prior term (issue #243).
+/// Analytic covariance-step gradient with ETAs/H fixed: `2·pop_nll` with no
+/// omega-prior add-back (both the SB and Laplace marginals already carry Ω —
+/// #243/#249). The production stencil inlines a serial variant (plus the #274 Δ
+/// correction); this thin wrapper over [`ad_population_gradient`] is retained for
+/// the gradient-consistency tests that finite-difference the fixed-EBE objective.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn covariance_gradient(
     x: &[f64],
@@ -1899,10 +1908,6 @@ fn covariance_gradient(
     options: &FitOptions,
 ) -> Vec<f64> {
     let n_subj = population.subjects.len();
-    // Gradient of `2·pop_nll` for both methods — no omega-prior add-back. The SB
-    // (FOCE) and Almquist–Laplace (FOCEI) marginals both already carry the Ω
-    // dependence (R̃ for SB, the explicit prior for Laplace); adding it again
-    // double-counted Ω and under-stated the FOCE omega SEs (issue #243).
     ad_population_gradient(
         x, n_subj, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
     )
@@ -2387,17 +2392,6 @@ pub(crate) fn compute_covariance(
         2.0 * foce_nll
     };
 
-    // Gradient of the covariance OFV at a reconverged point. Uses the analytical
-    // population gradient — issue #196's H-column shortcut makes the θ part exact
-    // for mu-referenced parameters — which is exactly the gradient of `2·pop_nll`
-    // (= `ofv` above) for both FOCE and FOCEI; no omega-prior add-back (#243).
-    let grad = |xv: &[f64]| -> Vec<f64> {
-        let (_, ehs, hms, kaps) = reconverge(xv);
-        covariance_gradient(
-            xv, template, model, population, &ehs, &hms, &kaps, &bounds, options,
-        )
-    };
-
     let base_ofv = ofv(x_hat);
     if !base_ofv.is_finite() {
         // Diagnose: check Omega conditioning to distinguish Omega collapse from
@@ -2477,19 +2471,122 @@ pub(crate) fn compute_covariance(
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
     if !is_iov {
-        // Issue #209: central FD of the analytical population gradient —
+        // Issue #209 + #256 + #274: central FD of the analytical population
+        // gradient, as one flat `par_iter` over the 2·n_free perturbed points.
         //   H[:,k] ≈ (g(x̂ + hₖ·eₖ) − g(x̂ − hₖ·eₖ)) / 2hₖ
-        // 2·n_free gradient evaluations vs ~2·n_free² scalar-OFV evaluations, with
-        // no 4-point cross-stencil cancellation (#129). `grad` reconverges the EBEs
-        // at each perturbed point, so the curvature includes the EBE response.
+        // `point_grad` reconverges the EBEs serially at each perturbed point, so
+        // the curvature includes the EBE response (and the determinant curvature).
+        //
+        // #256: the work-list is point-level, not the per-subject `par_iter` the
+        // gradient used to fan out into. Each point runs its subjects serially, so
+        // there is no nested parallelism, and the parallel width (2·n_free)
+        // saturates the pool even when n_subj < n_cores — removing the fork/join
+        // overhead of firing 4·n_free rayon barriers in series (~9–11× faster).
+        //
+        // #274: for FOCEI the per-point gradient adds the dropped `log|H̃|`
+        // EBE-response term `2·Σᵢ tᵢ` (`subject_eta_response_correction`). The
+        // fixed-η̂ analytic gradient invokes the envelope theorem, which zeros only
+        // the inner objective — not `log|H̃|` — so without this term the non-IOV
+        // FD Hessian omits the determinant EBE-response curvature `Δ` that the IOV
+        // scalar-OFV stencil captures. Adding it makes the two stencils consistent
+        // and recovers ∇²(−2logL). Mu-ref θ block only; vanishes for additive error.
+        let n_subj_cov = population.subjects.len();
+        let point_grad = |xv: &[f64]| -> Vec<f64> {
+            let params = unpack_params(xv, template);
+            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+            let mut ehs: Vec<DVector<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut hms: Vec<DMatrix<f64>> = Vec::with_capacity(n_subj_cov);
+            for i in 0..n_subj_cov {
+                let ebe = find_ebe(
+                    model,
+                    &population.subjects[i],
+                    &params,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    Some(eta_hats[i].as_slice()),
+                    Some(&mu_k),
+                );
+                ehs.push(ebe.eta);
+                hms.push(ebe.h_matrix);
+            }
+            let np = xv.len();
+            // Gradient of `2·pop_nll` (no omega-prior add-back; both the SB and
+            // Laplace marginals already carry Ω — issue #243/#249).
+            //
+            // Build the per-subject gradients serially (subjects are serial inside
+            // each point — the #256 flatten parallelises over points, not subjects)
+            // and reduce through `assemble_population_gradient`, the same reduction
+            // `ad_population_gradient` uses — so the summation order matches and the
+            // FOCE covariance stays bit-identical to the pre-#256 serial stencil.
+            // The Δ correction below is kept as a separate loop (NOT fused): summing
+            // `2·tᵢ` after `2·Σ gᵢ` preserves that reduction order exactly.
+            //
+            // `subject_nll_pop_grad_with_cache` also hands back the per-subject
+            // Laplace intermediates (when this subject took the FOCEI analytical
+            // path); the Δ loop below reuses them so it does not recompute the
+            // predictions or re-factorise H̃.
+            let mut grads: Vec<Vec<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut caches: Vec<Option<crate::estimation::gauss_newton::LaplaceGradCache>> =
+                Vec::with_capacity(n_subj_cov);
+            for i in 0..n_subj_cov {
+                let (_, gi, ci) = crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
+                    xv,
+                    template,
+                    model,
+                    population,
+                    i,
+                    &ehs[i],
+                    &hms[i],
+                    &[],
+                    &bounds,
+                    options,
+                );
+                grads.push(gi);
+                caches.push(ci);
+            }
+            let mut g = assemble_population_gradient(&grads, np);
+            // #274 Δ correction (FOCEI only); summed in subject order to match.
+            if options.interaction {
+                for i in 0..n_subj_cov {
+                    if let Some(ti) =
+                        crate::estimation::gauss_newton::subject_eta_response_correction(
+                            caches[i].as_ref(),
+                            xv,
+                            template,
+                            model,
+                            population,
+                            i,
+                            &ehs[i],
+                            &hms[i],
+                            &bounds,
+                            options,
+                        )
+                    {
+                        for (gk, tk) in g.iter_mut().zip(ti.iter()) {
+                            *gk += 2.0 * *tk;
+                        }
+                    }
+                }
+            }
+            g
+        };
+
+        let mut points: Vec<(usize, f64, Vec<f64>)> = Vec::with_capacity(2 * free_idx.len());
         for &k in &free_idx {
             let hk = eps * (1.0 + x_hat[k].abs());
             let mut x_p = x_hat.to_vec();
             let mut x_m = x_hat.to_vec();
             x_p[k] += hk;
             x_m[k] -= hk;
-            let g_p = grad(&x_p);
-            let g_m = grad(&x_m);
+            points.push((k, hk, x_p));
+            points.push((k, hk, x_m));
+        }
+        let point_grads: Vec<Vec<f64>> =
+            points.par_iter().map(|(_, _, xv)| point_grad(xv)).collect();
+        for (pair, &k) in free_idx.iter().enumerate() {
+            let g_p = &point_grads[2 * pair];
+            let g_m = &point_grads[2 * pair + 1];
+            let hk = points[2 * pair].1;
             for &j in &free_idx {
                 let h_jk = (g_p[j] - g_m[j]) / (2.0 * hk);
                 if h_jk.is_finite() {
@@ -2514,59 +2611,108 @@ pub(crate) fn compute_covariance(
             }
         }
     } else {
-        // IOV fallback: no fixed-EBE analytical gradient covers the kappa block, so
-        // build the Hessian from second differences of the reconverged OFV (3-point
-        // diagonal, 4-point off-diagonal). `ofv` reconverges the joint (η, κ) EBEs.
+        // IOV: no fixed-EBE analytical gradient covers the kappa block, so build
+        // the Hessian from second differences of the reconverged OFV (3-point
+        // diagonal, 4-point off-diagonal), reconverging the joint (η, κ) EBEs.
+        //
+        // #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV
+        // points (subjects iterated serially inside `serial_ofv`) instead of the
+        // old serial loop that fired a per-subject `par_iter` at every point —
+        // removing the fork/join overhead of firing a rayon barrier per point.
+        // Bit-identical to the serial stencil: each point's OFV is the same
+        // `2·pop_nll` at the same per-subject `find_ebe`, and the difference
+        // formulas/assembly are unchanged; only the scheduling differs.
         let f0 = base_ofv;
-        let mut x_ij = x_hat.to_vec();
-        for &i in &free_idx {
-            let hi = eps * (1.0 + x_hat[i].abs());
+        let n_subj_cov = population.subjects.len();
+        let serial_ofv = |xv: &[f64]| -> f64 {
+            let params = unpack_params(xv, template);
+            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+            let mut ehs: Vec<DVector<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut hms: Vec<DMatrix<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut kaps: Vec<Vec<DVector<f64>>> = Vec::with_capacity(n_subj_cov);
+            for i in 0..n_subj_cov {
+                let ebe = find_ebe(
+                    model,
+                    &population.subjects[i],
+                    &params,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    Some(eta_hats[i].as_slice()),
+                    Some(&mu_k),
+                );
+                ehs.push(ebe.eta);
+                hms.push(ebe.h_matrix);
+                kaps.push(ebe.kappas);
+            }
+            2.0 * pop_nll(
+                model,
+                population,
+                &params,
+                &ehs,
+                &hms,
+                &kaps,
+                options.interaction,
+            )
+        };
 
-            // Diagonal: 3-point formula  (f(x+h) - 2f(x) + f(x-h)) / h^2
-            x_ij[i] = x_hat[i] + hi;
-            let fp = ofv(&x_ij);
-            x_ij[i] = x_hat[i] - hi;
-            let fm = ofv(&x_ij);
-            x_ij[i] = x_hat[i];
-
-            let h_ii = (fp - 2.0 * f0 + fm) / (hi * hi);
+        let nf = free_idx.len();
+        let hsteps: Vec<f64> = free_idx
+            .iter()
+            .map(|&i| eps * (1.0 + x_hat[i].abs()))
+            .collect();
+        // Flat point list: 2 per diagonal (±hᵢ), then 4 per (a<b) off-diagonal pair.
+        let mut pts: Vec<Vec<f64>> = Vec::with_capacity(2 * nf + 2 * nf * nf);
+        for a in 0..nf {
+            let i = free_idx[a];
+            let hi = hsteps[a];
+            let mut xp = x_hat.to_vec();
+            xp[i] += hi;
+            let mut xm = x_hat.to_vec();
+            xm[i] -= hi;
+            pts.push(xp);
+            pts.push(xm);
+        }
+        let n_diag = pts.len();
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for a in 0..nf {
+            for b in (a + 1)..nf {
+                let (i, j) = (free_idx[a], free_idx[b]);
+                let (hi, hj) = (hsteps[a], hsteps[b]);
+                for (si, sj) in [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)] {
+                    let mut xv = x_hat.to_vec();
+                    xv[i] += si * hi;
+                    xv[j] += sj * hj;
+                    pts.push(xv);
+                }
+                pairs.push((a, b));
+            }
+        }
+        let vals: Vec<f64> = pts.par_iter().map(|xv| serial_ofv(xv)).collect();
+        // Diagonal: (f(x+h) − 2f(x) + f(x−h)) / h².
+        for a in 0..nf {
+            let i = free_idx[a];
+            let hi = hsteps[a];
+            let h_ii = (vals[2 * a] - 2.0 * f0 + vals[2 * a + 1]) / (hi * hi);
             if h_ii.is_finite() {
                 hess[(i, i)] = h_ii;
             } else {
                 fd_diag_nan.insert(i);
             }
-
-            // Off-diagonal: 4-point stencil (over free indices only)
-            for &j in &free_idx {
-                if j <= i {
-                    continue;
-                }
-                let hj = eps * (1.0 + x_hat[j].abs());
-
-                x_ij[i] = x_hat[i] + hi;
-                x_ij[j] = x_hat[j] + hj;
-                let fpp = ofv(&x_ij);
-
-                x_ij[j] = x_hat[j] - hj;
-                let fpm = ofv(&x_ij);
-
-                x_ij[i] = x_hat[i] - hi;
-                let fmm = ofv(&x_ij);
-
-                x_ij[j] = x_hat[j] + hj;
-                let fmp = ofv(&x_ij);
-
-                x_ij[i] = x_hat[i];
-                x_ij[j] = x_hat[j];
-
-                let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
-                if h_ij.is_finite() {
-                    hess[(i, j)] = h_ij;
-                    hess[(j, i)] = h_ij;
-                } else {
-                    fd_offdiag_nan.insert(i);
-                    fd_offdiag_nan.insert(j);
-                }
+        }
+        // Off-diagonal: (f++ − f+− − f−+ + f−−) / (4 hᵢ hⱼ).
+        let mut off = n_diag;
+        for &(a, b) in &pairs {
+            let (i, j) = (free_idx[a], free_idx[b]);
+            let (hi, hj) = (hsteps[a], hsteps[b]);
+            let (fpp, fpm, fmm, fmp) = (vals[off], vals[off + 1], vals[off + 2], vals[off + 3]);
+            off += 4;
+            let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+            if h_ij.is_finite() {
+                hess[(i, j)] = h_ij;
+                hess[(j, i)] = h_ij;
+            } else {
+                fd_offdiag_nan.insert(i);
+                fd_offdiag_nan.insert(j);
             }
         }
     }
@@ -3988,12 +4134,16 @@ mod tests {
         }
     }
 
-    /// End-to-end guard for `compute_covariance` (#209 + the factor-of-2 fix):
-    /// the reconverging central gradient-FD covariance must (a) compute without
-    /// regularization on a well-conditioned surface, (b) be positive-definite,
-    /// and (c) equal `2·H⁻¹` of an *independently* reconverged scalar-FD Hessian.
-    /// A missing factor of two would be ~29% off (caught by the 15% band); a
-    /// broken reconvergence would diverge wildly.
+    /// End-to-end guard for `compute_covariance` (#209 factor-of-2, #256 flatten,
+    /// #274 Δ correction): the reconverging point-flatten gradient-FD covariance
+    /// must (a) compute without regularization on a well-conditioned surface,
+    /// (b) be positive-definite, and (c) equal `2·H⁻¹` of an *independently*
+    /// reconverged scalar-FD Hessian of the same FOCEI objective. Because the
+    /// model has proportional error, the reference (a second difference of the
+    /// reconverged OFV) carries the `log|H̃|` EBE-response curvature `Δ`; the
+    /// gradient-FD path only matches it because the #274 correction adds `Δ` back —
+    /// so this also guards the Δ correction. A missing factor of two would be ~29%
+    /// off (caught by the 15% band); a broken reconvergence would diverge wildly.
     #[test]
     fn test_compute_covariance_reconverged_matches_scalar_fd_with_factor_two() {
         let model = make_model();

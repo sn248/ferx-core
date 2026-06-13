@@ -1308,6 +1308,86 @@ mod tests {
         f
     }
 
+    // ── "no happy paths": malformed-input rejection ──────────────────────────
+    // The reader's validation surface — branches where a bug silently corrupts
+    // (or crashes on) real NONMEM datasets. All deterministic and fit-free:
+    // feed malformed CSV, assert the exact error or warning. These error paths
+    // are otherwise exercised only indirectly, if at all.
+
+    #[test]
+    fn missing_required_columns_are_rejected() {
+        // ID / TIME / DV are mandatory; each missing one is a hard error that
+        // names the absent column.
+        let f = write_csv("TIME,DV,EVID,AMT\n0,.,1,100\n");
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("Missing ID column"), "{err}");
+
+        let f = write_csv("ID,DV,EVID,AMT\n1,.,1,100\n");
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("Missing TIME column"), "{err}");
+
+        let f = write_csv("ID,TIME,EVID,AMT\n1,0,1,100\n");
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("Missing DV column"), "{err}");
+    }
+
+    #[test]
+    fn unknown_iov_column_is_rejected() {
+        // A requested IOV column that isn't in the header is a hard error, not a
+        // silent "no occasions" — otherwise an IOV model would quietly collapse.
+        let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
+        let err = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap_err();
+        assert!(
+            err.contains("iov_column 'OCC'") && err.contains("not found"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn declared_covariate_column_missing_is_rejected() {
+        // `[covariates]` declares WT but the dataset has no WT column → hard
+        // error (a silently-vanished covariate would evaluate to nothing).
+        let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
+        assert!(err.contains(ERR_COV_MISSING_COLUMNS), "{err}");
+        assert!(err.contains("WT"), "missing column should be named: {err}");
+    }
+
+    #[test]
+    fn declared_covariate_non_numeric_value_is_rejected() {
+        // A declared covariate must be numerically coded; a text value is a hard
+        // error rather than a silent 0.0 that would bias the fit.
+        let f = write_csv("ID,TIME,DV,EVID,AMT,WT\n1,0,.,1,100,heavy\n1,1,5.0,0,.,heavy\n");
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
+        assert!(err.contains(ERR_COV_NON_NUMERIC), "{err}");
+        assert!(
+            err.contains("WT"),
+            "offending covariate should be named: {err}"
+        );
+    }
+
+    #[test]
+    fn unparseable_iov_occasion_values_warn_not_fail() {
+        // A non-numeric occasion value doesn't abort the read: the row is
+        // assigned occ=0 and surfaced as a W_IOV_OCC_MISSING population warning
+        // so the user can clean the data (a hard error here would be too brittle).
+        let f = write_csv("ID,TIME,DV,EVID,AMT,OCC\n1,0,.,1,100,x\n1,1,5.0,0,.,x\n");
+        let pop = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap();
+        assert!(
+            pop.warnings.iter().any(|w| w.contains("W_IOV_OCC_MISSING")),
+            "expected an IOV-occasion warning, got {:?}",
+            pop.warnings
+        );
+    }
+
     #[test]
     fn test_obs_cmt_dot_defaults_to_compartment_one() {
         // Regression: a "." (missing) CMT on an observation row must default to

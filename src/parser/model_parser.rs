@@ -4287,6 +4287,21 @@ fn build_ode_spec(
         .cloned()
         .chain(indiv_param_names.iter().cloned())
         .collect();
+    // Names an init expression can actually resolve, mirroring the exact keys
+    // the `init_fn` closure seeds below: states (original + lowercase, bound to
+    // 0 at init time) and individual parameters (original + upper + lowercase).
+    // Any `Variable` outside this set silently reads 0.0 via `eval_expression`
+    // (issue #314), so reject it at parse time.
+    let mut init_defined: HashMap<String, usize> = HashMap::new();
+    for n in state_names {
+        init_defined.insert(n.clone(), 0);
+        init_defined.insert(n.to_lowercase(), 0);
+    }
+    for n in indiv_param_names {
+        init_defined.insert(n.clone(), 0);
+        init_defined.insert(n.to_uppercase(), 0);
+        init_defined.insert(n.to_lowercase(), 0);
+    }
     let mut init_specs: Vec<(usize, Expression)> = Vec::new();
     let mut seen_init: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rhs_lines: Vec<String> = Vec::with_capacity(lines.len());
@@ -4307,6 +4322,22 @@ fn build_ode_spec(
             let ctx = ParseCtx::ode(&init_ctx_defined);
             let expr = parse_scalar_expression(&expr_str, ctx)
                 .map_err(|e| format!("[odes] init({}): {}", name, e))?;
+            let mut undef: std::collections::HashSet<String> = std::collections::HashSet::new();
+            collect_undefined_vars(&expr, &init_defined, &mut undef);
+            if !undef.is_empty() {
+                let mut names: Vec<String> = undef.into_iter().collect();
+                names.sort();
+                let mut defined = init_ctx_defined.clone();
+                defined.sort();
+                return Err(format!(
+                    "[odes] init({}): references undefined name(s): {}. An init \
+                     expression may only reference declared states (0 at init \
+                     time) or individual parameters (defined: {}).",
+                    name,
+                    names.join(", "),
+                    defined.join(", "),
+                ));
+            }
             init_specs.push((idx, expr));
         } else {
             rhs_lines.push(raw.clone());
@@ -4552,6 +4583,41 @@ fn build_ode_spec(
     var_idx.insert("TAD".to_string(), tad_slot);
     var_idx.insert("tad".to_string(), tad_slot);
     let n_vars_total = n_base_vars + 3;
+
+    // Reject undefined identifiers in ODE RHS expressions (issue #314). In the
+    // ODE parse context `fallback_covariate = false`, so a typo'd, omitted,
+    // theta-only, or covariate name becomes a plain `Variable` that
+    // `resolve_expr_indices` maps to the `usize::MAX` sentinel — the bytecode
+    // read then silently returns 0.0, producing a structurally-broken fit with
+    // no diagnostic. `var_idx` now holds every resolvable name (states,
+    // individual parameters, ODE-block intermediates, and the reserved
+    // TIME/TAFD/TAD slots), so any `Variable` whose name is not a key in it
+    // cannot resolve. (The covariate guard above only matches `Covariate`
+    // nodes, which this parse context never emits, so this is what actually
+    // surfaces the bug.)
+    let mut undefined_rhs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_undefined_vars_in_stmts(&stmts_owned, &var_idx, &mut undefined_rhs);
+    if !undefined_rhs.is_empty() {
+        let mut names: Vec<String> = undefined_rhs.into_iter().collect();
+        names.sort();
+        let mut defined: Vec<String> = state_names_owned
+            .iter()
+            .chain(indiv_names_owned.iter())
+            .chain(intermediates.iter())
+            .cloned()
+            .collect();
+        defined.sort();
+        return Err(format!(
+            "[odes]: RHS references undefined name(s): {}. An ODE RHS may only \
+             reference declared states, individual parameters, ODE-block \
+             intermediates, or the reserved TIME/TAFD/TAD variables (defined: \
+             {}). If one of these is a covariate, pre-compute the \
+             covariate-dependent term in [individual_parameters] and reference \
+             that variable here instead.",
+            names.join(", "),
+            defined.join(", "),
+        ));
+    }
 
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
@@ -6151,6 +6217,95 @@ fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::
                 }
                 if let Some(eb) = else_body {
                     collect_covariates_in_stmts(eb, out);
+                }
+            }
+        }
+    }
+}
+
+/// Walk an expression and accumulate every `Variable(name)` whose name is not a
+/// key in `defined` — i.e. a name that would resolve to the `usize::MAX`
+/// "reads 0.0" sentinel in the ODE RHS bytecode (or `vars.get(name).unwrap_or(0.0)`
+/// in an `init` expression). Used to reject undefined references in the `[odes]`
+/// block before they silently corrupt the dynamics (issue #314). Membership is
+/// by exact key: the ODE var maps already carry lower/upper/original aliases for
+/// every resolvable name, so a name absent from `defined` genuinely cannot
+/// resolve. Mirrors `collect_covariates`.
+fn collect_undefined_vars(
+    expr: &Expression,
+    defined: &HashMap<String, usize>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        Expression::Variable(name) => {
+            if !defined.contains_key(name) {
+                out.insert(name.clone());
+            }
+        }
+        Expression::BinOp(lhs, _, rhs) => {
+            collect_undefined_vars(lhs, defined, out);
+            collect_undefined_vars(rhs, defined, out);
+        }
+        Expression::UnaryFn(_, arg) => collect_undefined_vars(arg, defined, out),
+        Expression::Power(base, exp) => {
+            collect_undefined_vars(base, defined, out);
+            collect_undefined_vars(exp, defined, out);
+        }
+        Expression::Conditional(cond, t, e) => {
+            collect_undefined_vars_in_condition(cond, defined, out);
+            collect_undefined_vars(t, defined, out);
+            collect_undefined_vars(e, defined, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_undefined_vars_in_condition(
+    cond: &Condition,
+    defined: &HashMap<String, usize>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            collect_undefined_vars(l, defined, out);
+            collect_undefined_vars(r, defined, out);
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            collect_undefined_vars_in_condition(l, defined, out);
+            collect_undefined_vars_in_condition(r, defined, out);
+        }
+        Condition::Not(c) => collect_undefined_vars_in_condition(c, defined, out),
+    }
+}
+
+/// Walk a list of `[odes]` statements and accumulate every `Variable` reference
+/// (in a d/dt RHS, an intermediate assignment, or an if-condition) whose name is
+/// not a key in `defined`. Mirrors `collect_covariates_in_stmts`.
+fn collect_undefined_vars_in_stmts(
+    stmts: &[Statement],
+    defined: &HashMap<String, usize>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    for s in stmts {
+        match s {
+            Statement::Assign(_, e)
+            | Statement::AssignIdx(_, e)
+            | Statement::DiffEq(_, e)
+            | Statement::DiffEqIdx(_, e) => collect_undefined_vars(e, defined, out),
+            Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {
+                // Bytecode variants only appear after `resolve_variable_indices`,
+                // which runs after this check.
+            }
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (cond, body) in branches {
+                    collect_undefined_vars_in_condition(cond, defined, out);
+                    collect_undefined_vars_in_stmts(body, defined, out);
+                }
+                if let Some(eb) = else_body {
+                    collect_undefined_vars_in_stmts(eb, defined, out);
                 }
             }
         }
@@ -12278,6 +12433,95 @@ if (1 > 0) {
     }
 
     #[test]
+    fn test_ode_rhs_undefined_name_errors() {
+        // #314: a name in an ODE RHS that is not a state, individual parameter,
+        // intermediate, or reserved time var must error — it would otherwise
+        // resolve to the `usize::MAX` sentinel and silently read 0.0, producing
+        // a structurally-broken fit. Here `central` is a state and `CL` is an
+        // individual parameter, but `V` is undeclared.
+        let ode_lines: Vec<String> = vec!["d/dt(central) = -(CL/V) * central".into()];
+        let state_names = vec!["central".to_string()];
+        let result = build_ode_spec(
+            &ode_lines,
+            &state_names,
+            Some("central"),
+            &["CL".to_string()],
+            &[0],
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("undefined RHS name `V` must error"),
+        };
+        assert!(
+            err.contains("undefined name(s): V."),
+            "error should name the undefined `V`, got: {err}"
+        );
+        // The defined names are listed to make the fix obvious.
+        assert!(
+            err.contains("CL") && err.contains("central"),
+            "error should list the defined names, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ode_rhs_undefined_name_walks_all_nodes() {
+        // Exercises every arm of the undefined-name walker: an intermediate
+        // assignment RHS, a block `if` condition, `&&`/`||`/`!` boolean
+        // operators, an inline conditional, `exp(...)`, and `^`. Every BAD*
+        // name is undefined; `k` (intermediate), `central` (state), `CL`
+        // (param), and `TIME` (reserved) must NOT be flagged.
+        let ode_lines: Vec<String> = vec![
+            "k = CL / V1".into(),
+            "if (BADIF > 0) {".into(),
+            "  d/dt(central) = exp(BADEXP) + BADPOW^2 - k * central + (if (BADAND1 > 0 && BADAND2 > 0) 1.0 else 0.0) + (if (BADOR1 > 0 || BADOR2 > 0) 1.0 else 0.0) + (if (!(BADNOT > 0)) 1.0 else 0.0)".into(),
+            "} else {".into(),
+            "  d/dt(central) = -k * central".into(),
+            "}".into(),
+        ];
+        let state_names = vec!["central".to_string()];
+        let result = build_ode_spec(
+            &ode_lines,
+            &state_names,
+            Some("central"),
+            &["CL".to_string()],
+            &[0],
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("undefined names in nested expressions must error"),
+        };
+        for bad in [
+            "V1", "BADIF", "BADEXP", "BADPOW", "BADAND1", "BADAND2", "BADOR1", "BADOR2", "BADNOT",
+        ] {
+            assert!(err.contains(bad), "error should name `{bad}`, got: {err}");
+        }
+    }
+
+    #[test]
+    fn test_ode_rhs_defined_names_ok() {
+        // Regression guard against false positives: an intermediate (`k`),
+        // individual parameters (`CL`, `V`), a state (`central`), and the
+        // reserved `TIME` variable must all resolve and parse cleanly.
+        let ode_lines: Vec<String> = vec![
+            "k = CL / V".into(),
+            "d/dt(central) = if (TIME < 24.0) -k * central else 0.0".into(),
+        ];
+        let state_names = vec!["central".to_string()];
+        let result = build_ode_spec(
+            &ode_lines,
+            &state_names,
+            Some("central"),
+            &["CL".to_string(), "V".to_string()],
+            &[0, 1],
+        );
+        assert!(
+            result.is_ok(),
+            "intermediate + params + TIME must parse, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
     fn test_mu_ref_warning_for_conditional_param() {
         // A model where CL is assigned only inside an if-block should emit a
         // parse_warning about mu-referencing being disabled.
@@ -13573,6 +13817,28 @@ if (1 > 0) {
         let parsed = parse_full_model(&src).unwrap();
         let ode = parsed.model.ode_spec.as_ref().unwrap();
         assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![7.5]);
+    }
+
+    #[test]
+    fn test_init_undefined_name_errors() {
+        // #314: an init expression referencing a name that is neither a state
+        // nor an individual parameter must error rather than silently reading
+        // 0.0 via `eval_expression`. `KIN` is a declared parameter (must not be
+        // flagged); `BASE` is undeclared.
+        let src = turnover_ode_model("  init(response) = BASE * KIN");
+        let err = match parse_full_model(&src) {
+            Err(e) => e,
+            Ok(_) => panic!("expected undefined-name error for init(response)"),
+        };
+        assert!(
+            err.contains("init(response)"),
+            "error should reference init(response), got: {err}"
+        );
+        // Only BASE is flagged — KIN resolves to the declared parameter.
+        assert!(
+            err.contains("undefined name(s): BASE."),
+            "error should flag only BASE as undefined, got: {err}"
+        );
     }
 
     #[test]

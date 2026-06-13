@@ -93,6 +93,11 @@ section of the SDLC for the versioning policy).
   fit (all predictions floored, 100% shrinkage). An unrecognized PK-parameter
   key (e.g. the typo `clx=`) is likewise rejected, and a numeric-literal value
   (e.g. `ka=1.0`) is now honored as a constant rather than dropped to 0.0 (#261).
+- A name in an `[odes]` RHS or `init(...)` expression that is not a declared
+  state, individual parameter, ODE-block intermediate, or reserved time variable
+  (`TIME`/`TAFD`/`TAD`) is now a parse error instead of silently resolving to
+  `0.0` — the ODE counterpart of the analytical guard above, which otherwise
+  produced a "converged" but structurally broken fit (#314).
 - Datasets without an `EVID` column no longer silently fit a dose-free model.
   ferx now infers a dose from a nonzero `AMT` when `EVID` is absent (matching
   NONMEM), so legacy datasets that mark doses only by `AMT`/`MDV=1` administer

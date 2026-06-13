@@ -47,6 +47,15 @@ Expressions can reference:
   that aren't assigned in the firing branch this step receive a derivative
   of `0`.
 
+Every name in an ODE expression must resolve to a declared state, an individual
+parameter, an intermediate variable assigned earlier in the block, or one of the
+reserved time variables `TIME`/`TAFD`/`TAD`. A name that matches none of these —
+a typo, an omitted parameter, or a covariate — is **rejected at parse time**
+rather than silently read as `0.0`, the same structurally-broken-fit guard the
+analytical `pk(...)` mappings apply. Covariates cannot be referenced directly in
+an ODE RHS: pre-compute the covariate-dependent term in `[individual_parameters]`
+and reference that variable here instead.
+
 ## Initial Compartment Amounts
 
 By default every compartment starts at zero, and drug enters only through dose
@@ -65,6 +74,8 @@ for an indirect-response / turnover model — declare an initial condition in th
   `theta`, `eta`, and covariates through the `[individual_parameters]` layer).
   State names referenced in an `init` expression are treated as `0` (no drug
   is present yet).
+- A name in an `init` expression that is not a declared state or individual
+  parameter is rejected at parse time (it would otherwise be read as `0.0`).
 - Compartments without an `init(...)` line start at zero, as before.
 - This is the analogue of NONMEM's `A_0(n)`.
 

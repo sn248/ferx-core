@@ -5320,39 +5320,50 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
                 }
             }
 
-            // Reject a model that omits a required PK parameter for its structure.
+            // Enforce that every required PK parameter for the model is mapped.
             // An unmapped slot would otherwise stay at `PkParams::default()` (0.0)
             // and the fit silently "converges" to a structurally broken optimum —
             // the #261 failure mode reached by *omission* rather than by a bad
             // reference (issue #309). Check at the canonical-slot level so the
             // `v`/`v1` and `q`/`q2` aliases satisfy the requirement.
-            let mapped_slots: std::collections::HashSet<usize> = param_map
+            //
+            // Defer when an *unrecognized* key is present (e.g. the typo `clx`):
+            // `build_pk_param_fn` reports that bad key by name, which is more
+            // actionable than "a required slot is missing", so the unknown-key
+            // error takes precedence (#308). Without this guard a typo'd key
+            // would mask its own slot and surface as a confusing "requires" error.
+            let has_unknown_key = param_map
                 .keys()
-                .filter_map(|k| PkParams::name_to_index(k))
-                .collect();
-            let missing: Vec<&str> = pk_model
-                .required_pk_params()
-                .iter()
-                .filter(|(slot, _)| !mapped_slots.contains(slot))
-                .map(|(_, name)| *name)
-                .collect();
-            if !missing.is_empty() {
-                let list = missing
+                .any(|k| PkParams::name_to_index(k).is_none());
+            if !has_unknown_key {
+                let mapped_slots: std::collections::HashSet<usize> = param_map
+                    .keys()
+                    .filter_map(|k| PkParams::name_to_index(k))
+                    .collect();
+                let missing: Vec<&str> = pk_model
+                    .required_pk_params()
                     .iter()
-                    .map(|n| format!("`{n}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let (verb, pron) = if missing.len() == 1 {
-                    ("is", "it")
-                } else {
-                    ("are", "them")
-                };
-                let first = missing[0];
-                let first_upper = first.to_uppercase();
-                return Err(format!(
-                    "[structural_model] {model_name} requires {list}, which {verb} \
-                     not mapped. Add {pron}, e.g. `{first}={first_upper}`."
-                ));
+                    .filter(|(slot, _)| !mapped_slots.contains(slot))
+                    .map(|(_, name)| *name)
+                    .collect();
+                if !missing.is_empty() {
+                    let list = missing
+                        .iter()
+                        .map(|n| format!("`{n}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let (verb, pron) = if missing.len() == 1 {
+                        ("is", "it")
+                    } else {
+                        ("are", "them")
+                    };
+                    let first = missing[0];
+                    let first_upper = first.to_uppercase();
+                    return Err(format!(
+                        "[structural_model] {model_name} requires {list}, which {verb} \
+                         not mapped. Add {pron}, e.g. `{first}={first_upper}`."
+                    ));
+                }
             }
 
             return Ok((pk_model, param_map));
@@ -12677,6 +12688,38 @@ if (1 > 0) {
                 "optional `{key}={badvar}` must error as an undefined reference, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn test_unknown_key_precedes_missing_required() {
+        // Precedence: when a key is unrecognized (a typo like `vx` for `v`) the
+        // error must name that bad key (#308), not report the now-unmapped slot
+        // as a missing required param (#309). The required-param check defers to
+        // the unknown-key check so the message points at the actual mistake.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, vx=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = expect_parse_err(model_str);
+        assert!(
+            err.contains("vx") && err.contains("unknown PK parameter"),
+            "unknown key `vx` must be reported, not a missing-required error, got: {err}"
+        );
     }
 
     #[test]

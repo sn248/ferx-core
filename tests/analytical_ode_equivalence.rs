@@ -32,7 +32,8 @@
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::predict;
 use ferx_core::types::{DoseEvent, Population, Subject};
-use std::collections::HashMap;
+
+mod common;
 
 /// The RK45 solver defaults to `abstol = 1e-6`, `reltol = 1e-4`
 /// (`src/ode/solver.rs`), so the ODE path can only reproduce the exact closed
@@ -279,31 +280,13 @@ fn build_pair(f: &Family, lag: bool, fbio: bool) -> (String, String) {
 
 fn subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>, obs_cmt: usize) -> Subject {
     let n = obs_times.len();
-    Subject {
-        id: "1".into(),
-        doses,
-        obs_times,
-        obs_raw_times: Vec::new(),
-        observations: vec![0.0; n],
-        // Carried for realism, but inert for the models under test: the ODE
-        // twin selects its readout from the `obs_cmt=central` structural
-        // directive (`OdeReadout::ObsCmt`) and the analytical path always reads
-        // central, so neither side consults `subject.obs_cmts` here. It would
-        // only matter under a `PerCmt` readout. So this test does *not* by
-        // itself verify per-observation compartment routing.
-        obs_cmts: vec![obs_cmt; n],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        cens: vec![0; n],
-        occasions: Vec::new(),
-        dose_occasions: Vec::new(),
-        #[cfg(feature = "survival")]
-        obs_records: vec![],
-    }
+    // `obs_cmts` is carried for realism but inert for the models under test: the
+    // ODE twin selects its readout from the `obs_cmt=central` structural
+    // directive (`OdeReadout::ObsCmt`) and the analytical path always reads
+    // central, so neither side consults `subject.obs_cmts` here. It would only
+    // matter under a `PerCmt` readout. So this test does *not* by itself verify
+    // per-observation compartment routing.
+    common::subject("1", doses, obs_times, vec![0.0; n], vec![obs_cmt; n])
 }
 
 fn population(doses: Vec<DoseEvent>, obs_times: Vec<f64>, obs_cmt: usize) -> Population {

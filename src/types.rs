@@ -1691,6 +1691,21 @@ impl CompiledModel {
         self.ode_spec.is_some()
     }
 
+    /// Copy the configured ODE solver tolerances from `opts` onto this model's
+    /// [`OdeSpec`] (no-op for analytical models). Call this once after the
+    /// model file's `[fit_options]` and any call-time `settings` overrides have
+    /// been merged into `opts`, so the integrator uses the requested accuracy.
+    /// The parser calls it at parse time (covering `predict`, which receives no
+    /// options); the fit entry re-applies it so call-time `ode_reltol` /
+    /// `ode_abstol` / `ode_max_steps` overrides take effect. Idempotent.
+    pub fn sync_ode_solver_opts(&mut self, opts: &FitOptions) {
+        if let Some(ode) = self.ode_spec.as_mut() {
+            ode.solver_opts.reltol = opts.ode_reltol;
+            ode.solver_opts.abstol = opts.ode_abstol;
+            ode.solver_opts.max_steps = opts.ode_max_steps;
+        }
+    }
+
     /// Returns true when the model has a `[diffusion]` block (SDE / EKF path).
     pub fn is_sde(&self) -> bool {
         self.diffusion_theta_start.is_some()
@@ -2486,6 +2501,22 @@ pub struct FitOptions {
     pub outer_gtol: f64,
     pub inner_maxiter: usize,
     pub inner_tol: f64,
+    /// RK45 ODE solver relative tolerance (`[fit_options] ode_reltol`, or via
+    /// `ferx_fit(settings = list(ode_reltol = ...))`). Default `1e-4`. Only
+    /// affects ODE models. The default reproduces analytical closed forms in
+    /// PRED to ~1e-4, but the FOCE OFV amplifies solver error, so a tighter
+    /// value (e.g. `1e-10`) is needed for the ODE-form OFV to match the
+    /// analytical OFV. Copied onto `OdeSpec::solver_opts` via
+    /// [`CompiledModel::sync_ode_solver_opts`].
+    pub ode_reltol: f64,
+    /// RK45 ODE solver absolute tolerance (`[fit_options] ode_abstol`).
+    /// Default `1e-6`. See [`FitOptions::ode_reltol`].
+    pub ode_abstol: f64,
+    /// RK45 ODE solver maximum step count per integration segment
+    /// (`[fit_options] ode_max_steps`). Default `10000`. Raise if a tight
+    /// `ode_reltol` exhausts the step budget on stiff multi-compartment
+    /// segments. See [`FitOptions::ode_reltol`].
+    pub ode_max_steps: usize,
     pub run_covariance_step: bool,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
@@ -2756,6 +2787,12 @@ impl Default for FitOptions {
             // `inner_tol = ...` in `[fit_options]` for studies that need
             // tighter EBEs (e.g. very-small-data simulation work).
             inner_tol: 1e-4,
+            // ODE solver tolerances: match OdeSolverOptions::default() so the
+            // engine default is unchanged. Opt into tighter accuracy per model
+            // via `[fit_options] ode_reltol = ...` (see FitOptions::ode_reltol).
+            ode_reltol: 1e-4,
+            ode_abstol: 1e-6,
+            ode_max_steps: 10_000,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
@@ -3208,6 +3245,7 @@ pub(crate) mod test_helpers {
                     readout: crate::ode::OdeReadout::ObsCmt(0),
                     diffusion_var: Vec::new(),
                     init_fn: None,
+                    solver_opts: crate::ode::OdeSolverOptions::default(),
                 })
             } else {
                 None

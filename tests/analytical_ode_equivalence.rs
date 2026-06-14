@@ -24,7 +24,8 @@
 //!     `F*AMT` (issue ferx-core #122).
 //!
 //! Runs on the default/CI feature set (no autodiff) and is fast (no `fit()`),
-//! so it is not gated behind `slow-tests`.
+//! so it is not gated behind `slow-tests` and is run explicitly on every PR
+//! from `ci.yml` (not just nightly).
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::predict;
@@ -38,9 +39,12 @@ use std::collections::HashMap;
 /// pure relative check.
 const ATOL: f64 = 1e-5;
 const RTOL: f64 = 1e-4;
-/// Steady-state predictions accumulate the solver tolerance over the
-/// dose-superposition / SS iteration, so they get a slightly looser bound.
-const SS_RTOL: f64 = 1e-3;
+/// Long trajectories accumulate the solver's per-step error across many dose
+/// restarts (multidose out to t=72 over three doses) or the SS iteration, so
+/// the ODE path drifts past the per-step `reltol` (1e-4). `RTOL` alone equals
+/// that per-step target and is too tight for these cases — give them a looser
+/// combined bound so a faithful transcription doesn't flake.
+const ACCUM_RTOL: f64 = 1e-3;
 
 /// One standard analytical model and the pieces needed to build its ODE twin.
 struct Family {
@@ -58,11 +62,22 @@ struct Family {
     odes: &'static str,
     /// `[scaling] obs_scale = <expr>` right-hand side (`V` or `V1`).
     obs_scale: &'static str,
-    /// Compartment the dose enters (1 = central for IV, 1 = depot for oral).
-    dose_cmt: usize,
-    /// Compartment observed (central): 1 for IV, 2 for oral.
-    obs_cmt: usize,
     is_oral: bool,
+}
+
+impl Family {
+    /// The dose always enters compartment 1 — central for IV, depot for oral.
+    const DOSE_CMT: usize = 1;
+
+    /// Observed (central) compartment: index 2 for oral (behind the depot),
+    /// index 1 for IV. Derived from the route so the pair can never drift apart.
+    fn obs_cmt(&self) -> usize {
+        if self.is_oral {
+            2
+        } else {
+            1
+        }
+    }
 }
 
 fn families() -> Vec<Family> {
@@ -75,8 +90,6 @@ fn families() -> Vec<Family> {
             ode_struct: "ode(obs_cmt=central, states=[central])",
             odes: "  d/dt(central) = -(CL/V) * central\n",
             obs_scale: "V",
-            dose_cmt: 1,
-            obs_cmt: 1,
             is_oral: false,
         },
         Family {
@@ -89,8 +102,6 @@ fn families() -> Vec<Family> {
             odes: "  d/dt(depot)   = -KA * depot\n  \
                    d/dt(central) =  KA * depot - (CL/V) * central\n",
             obs_scale: "V",
-            dose_cmt: 1,
-            obs_cmt: 2,
             is_oral: true,
         },
         Family {
@@ -103,8 +114,6 @@ fn families() -> Vec<Family> {
             odes: "  d/dt(central) = -(CL/V1 + Q/V1) * central + (Q/V2) * periph\n  \
                    d/dt(periph)  =  (Q/V1) * central - (Q/V2) * periph\n",
             obs_scale: "V1",
-            dose_cmt: 1,
-            obs_cmt: 1,
             is_oral: false,
         },
         Family {
@@ -119,8 +128,6 @@ fn families() -> Vec<Family> {
                    d/dt(central) =  KA * depot - (CL/V1 + Q/V1) * central + (Q/V2) * periph\n  \
                    d/dt(periph)  =  (Q/V1) * central - (Q/V2) * periph\n",
             obs_scale: "V1",
-            dose_cmt: 1,
-            obs_cmt: 2,
             is_oral: true,
         },
         Family {
@@ -137,8 +144,6 @@ fn families() -> Vec<Family> {
                     d/dt(periph1)  =  (Q2/V1) * central - (Q2/V2) * periph1\n  \
                     d/dt(periph2)  =  (Q3/V1) * central - (Q3/V3) * periph2\n",
             obs_scale: "V1",
-            dose_cmt: 1,
-            obs_cmt: 1,
             is_oral: false,
         },
         Family {
@@ -157,8 +162,6 @@ fn families() -> Vec<Family> {
                     d/dt(periph1)  =  (Q2/V1) * central - (Q2/V2) * periph1\n  \
                     d/dt(periph2)  =  (Q3/V1) * central - (Q3/V3) * periph2\n",
             obs_scale: "V1",
-            dose_cmt: 1,
-            obs_cmt: 2,
             is_oral: true,
         },
     ]
@@ -215,6 +218,12 @@ fn subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>, obs_cmt: usize) -> Subjec
         obs_times,
         obs_raw_times: Vec::new(),
         observations: vec![0.0; n],
+        // Carried for realism, but inert for the models under test: the ODE
+        // twin selects its readout from the `obs_cmt=central` structural
+        // directive (`OdeReadout::ObsCmt`) and the analytical path always reads
+        // central, so neither side consults `subject.obs_cmts` here. It would
+        // only matter under a `PerCmt` readout. So this test does *not* by
+        // itself verify per-observation compartment routing.
         obs_cmts: vec![obs_cmt; n],
         covariates: HashMap::new(),
         dose_covariates: Vec::new(),
@@ -255,13 +264,10 @@ fn assert_equiv(label: &str, analytical_src: &str, ode_src: &str, pop: &Populati
     assert_eq!(pa.len(), po.len(), "[{label}] prediction count mismatch");
     assert!(!pa.is_empty(), "[{label}] produced no predictions");
 
+    // Both models `predict()` the same population, so results come back in the
+    // same order — pairing by index is valid. (A literal `x.time == y.time`
+    // check would be vacuous: both derive `time` from the identical `obs_times`.)
     for (x, y) in pa.iter().zip(po.iter()) {
-        assert!(
-            (x.time - y.time).abs() < 1e-9,
-            "[{label}] time mismatch: {} vs {}",
-            x.time,
-            y.time
-        );
         let tol = ATOL + rtol * x.pred.abs();
         assert!(
             (x.pred - y.pred).abs() <= tol,
@@ -280,8 +286,8 @@ fn analytical_ode_equivalence_across_models_and_dosing() {
     let obs = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
 
     for f in families() {
-        let dc = f.dose_cmt;
-        let oc = f.obs_cmt;
+        let dc = Family::DOSE_CMT;
+        let oc = f.obs_cmt();
 
         // -- base model (no lag, no F) across dosing modes -------------------
         let (an, ode) = build_pair(&f, false, false);
@@ -313,7 +319,9 @@ fn analytical_ode_equivalence_across_models_and_dosing() {
                 vec![1.0, 6.0, 12.0, 25.0, 30.0, 49.0, 54.0, 72.0],
                 oc,
             ),
-            RTOL,
+            // Long trajectory across three dose restarts — solver error
+            // accumulates past the per-step `reltol`, like the SS case.
+            ACCUM_RTOL,
         );
 
         // steady state (II = 24)
@@ -326,7 +334,7 @@ fn analytical_ode_equivalence_across_models_and_dosing() {
                 vec![1.0, 4.0, 8.0, 12.0, 23.0],
                 oc,
             ),
-            SS_RTOL,
+            ACCUM_RTOL,
         );
 
         // infusion (IV only - infusion into a depot is not a standard combo)

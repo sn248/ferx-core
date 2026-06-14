@@ -47,6 +47,11 @@ const RTOL: f64 = 1e-4;
 /// that per-step target and is too tight for these cases — give them a looser
 /// combined bound so a faithful transcription doesn't flake.
 const ACCUM_RTOL: f64 = 1e-3;
+/// Relative tolerance for the fixed-parameter OFV (population joint-NLL)
+/// equivalence check. The NLL amplifies the per-point prediction error (a tight
+/// proportional weight times the residual), so a ~1e-4 prediction agreement
+/// shows up as a few × 1e-4 relative NLL agreement, worst at the IV bolus spike.
+const OFV_RTOL: f64 = 2e-3;
 
 /// One standard analytical model and the pieces needed to build its ODE twin.
 struct Family {
@@ -345,6 +350,10 @@ fn assert_equiv(label: &str, analytical_src: &str, ode_src: &str, pop: &Populati
 
 /// Exercise every dosing mode for one model family.
 fn run_family(f: &Family) {
+    // Structural equivalence at the likelihood level: same OFV at fixed params,
+    // including eta != 0 (a stronger check than the eta=0 PRED sweep below).
+    assert_ofv_equiv(f);
+
     let obs = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
     let dc = Family::DOSE_CMT;
     let oc = f.obs_cmt();
@@ -463,3 +472,59 @@ equiv_test!(two_cpt_iv, fam_two_cpt_iv);
 equiv_test!(two_cpt_oral, fam_two_cpt_oral);
 equiv_test!(three_cpt_iv, fam_three_cpt_iv);
 equiv_test!(three_cpt_oral, fam_three_cpt_oral);
+
+/// Fixed-parameter OFV equivalence: at identical params and a *fixed* eta (no
+/// optimizer), the analytical and ODE forms must produce the same population
+/// joint NLL — the deterministic inner objective the EBE loop minimizes.
+/// Evaluated at eta = 0 and eta != 0 so the random-effect path is exercised,
+/// not just the typical-value structure.
+///
+/// Why not compare a converged `fit()` OFV instead? Because that conflates
+/// structural equivalence with optimizer path and ODE-solver noise: two fits of
+/// equivalent models from the same start can stop at different points on the
+/// (identical) likelihood surface and report OFVs differing by whole units. A
+/// fixed-parameter evaluation isolates the thing we actually want to guarantee.
+fn assert_ofv_equiv(f: &Family) {
+    use ferx_core::stats::likelihood::individual_nll;
+
+    let dc = Family::DOSE_CMT;
+    let oc = f.obs_cmt();
+    let obs_t = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
+    let (an_src, ode_src) = build_pair(f, false, false);
+    let an = parse_full_model(&an_src).unwrap().model;
+    let ode = parse_full_model(&ode_src).unwrap().model;
+
+    // DV from the analytical PRED at eta=0, scaled per subject so the NLL has
+    // real (non-degenerate) residuals to weigh.
+    let dose = || vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)];
+    let base = population(dose(), obs_t.clone(), oc);
+    let preds = predict(&an, &base, &an.default_params);
+    let mut subjects = Vec::new();
+    for (i, fac) in [0.85_f64, 1.0, 1.15].into_iter().enumerate() {
+        let mut s = subject(dose(), obs_t.clone(), oc);
+        s.id = format!("{}", i + 1);
+        s.observations = preds.iter().map(|p| (p.pred * fac).max(1e-6)).collect();
+        subjects.push(s);
+    }
+    let pop = Population { subjects, ..base };
+
+    let pop_nll = |m: &ferx_core::CompiledModel, eta: f64| -> f64 {
+        let p = &m.default_params;
+        pop.subjects
+            .iter()
+            .map(|s| individual_nll(m, s, &p.theta, &[eta], &p.omega, &p.sigma.values))
+            .sum::<f64>()
+    };
+
+    for eta in [0.0, 0.3, -0.3] {
+        let a = pop_nll(&an, eta);
+        let o = pop_nll(&ode, eta);
+        let rel = (a - o).abs() / a.abs().max(1.0);
+        assert!(
+            rel <= OFV_RTOL,
+            "[{}] OFV mismatch at eta={eta}: analytical {a:.6} vs ODE {o:.6} \
+             (rel {rel:.2e} > {OFV_RTOL:.0e})",
+            f.label
+        );
+    }
+}

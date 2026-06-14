@@ -25,7 +25,9 @@
 //!
 //! Runs on the default/CI feature set (no autodiff) and is fast (no `fit()`),
 //! so it is not gated behind `slow-tests` and is run explicitly on every PR
-//! from `ci.yml` (not just nightly).
+//! from `ci.yml` (not just nightly). Each of the six models is its own
+//! `#[test]` (see the `equiv_test!` macro at the bottom) so a regression is
+//! isolated to one model and a single case can be run with `cargo test <model>`.
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::predict;
@@ -80,91 +82,151 @@ impl Family {
     }
 }
 
-fn families() -> Vec<Family> {
-    vec![
-        Family {
-            label: "one_cpt_iv",
-            thetas: "  theta TVCL(3.0, 0.01, 100.0)\n  theta TVV(20.0, 1.0, 500.0)\n",
-            indiv: "  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n",
-            pk_open: "pk one_cpt_iv(cl=CL, v=V",
-            ode_struct: "ode(obs_cmt=central, states=[central])",
-            odes: "  d/dt(central) = -(CL/V) * central\n",
-            obs_scale: "V",
-            is_oral: false,
-        },
-        Family {
-            label: "one_cpt_oral",
-            thetas: "  theta TVCL(0.13, 0.001, 10.0)\n  theta TVV(8.0, 0.1, 500.0)\n  \
-                     theta TVKA(1.2, 0.01, 50.0)\n",
-            indiv: "  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n  KA = TVKA\n",
-            pk_open: "pk one_cpt_oral(cl=CL, v=V, ka=KA",
-            ode_struct: "ode(obs_cmt=central, states=[depot, central])",
-            odes: "  d/dt(depot)   = -KA * depot\n  \
-                   d/dt(central) =  KA * depot - (CL/V) * central\n",
-            obs_scale: "V",
-            is_oral: true,
-        },
-        Family {
-            label: "two_cpt_iv",
-            thetas: "  theta TVCL(3.0, 0.01, 100.0)\n  theta TVV1(15.0, 1.0, 500.0)\n  \
-                     theta TVQ(3.0, 0.01, 100.0)\n  theta TVV2(30.0, 1.0, 500.0)\n",
-            indiv: "  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1\n  Q  = TVQ\n  V2 = TVV2\n",
-            pk_open: "pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2",
-            ode_struct: "ode(obs_cmt=central, states=[central, periph])",
-            odes: "  d/dt(central) = -(CL/V1 + Q/V1) * central + (Q/V2) * periph\n  \
-                   d/dt(periph)  =  (Q/V1) * central - (Q/V2) * periph\n",
-            obs_scale: "V1",
-            is_oral: false,
-        },
-        Family {
-            label: "two_cpt_oral",
-            thetas: "  theta TVCL(3.0, 0.01, 100.0)\n  theta TVV1(15.0, 1.0, 500.0)\n  \
-                     theta TVQ(3.0, 0.01, 100.0)\n  theta TVV2(30.0, 1.0, 500.0)\n  \
-                     theta TVKA(1.1, 0.01, 50.0)\n",
-            indiv: "  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1\n  Q  = TVQ\n  V2 = TVV2\n  KA = TVKA\n",
-            pk_open: "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA",
-            ode_struct: "ode(obs_cmt=central, states=[depot, central, periph])",
-            odes: "  d/dt(depot)   = -KA * depot\n  \
-                   d/dt(central) =  KA * depot - (CL/V1 + Q/V1) * central + (Q/V2) * periph\n  \
-                   d/dt(periph)  =  (Q/V1) * central - (Q/V2) * periph\n",
-            obs_scale: "V1",
-            is_oral: true,
-        },
-        Family {
-            label: "three_cpt_iv",
-            thetas: "  theta TVCL(3.0, 0.01, 100.0)\n  theta TVV1(15.0, 1.0, 500.0)\n  \
-                     theta TVQ2(3.0, 0.01, 100.0)\n  theta TVV2(30.0, 1.0, 500.0)\n  \
-                     theta TVQ3(1.5, 0.01, 100.0)\n  theta TVV3(60.0, 1.0, 999.0)\n",
-            indiv: "  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1\n  Q2 = TVQ2\n  V2 = TVV2\n  \
-                    Q3 = TVQ3\n  V3 = TVV3\n",
-            pk_open: "pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3",
-            ode_struct: "ode(obs_cmt=central, states=[central, periph1, periph2])",
-            odes: "  d/dt(central)  = -(CL/V1 + Q2/V1 + Q3/V1) * central \
-                    + (Q2/V2) * periph1 + (Q3/V3) * periph2\n  \
-                    d/dt(periph1)  =  (Q2/V1) * central - (Q2/V2) * periph1\n  \
-                    d/dt(periph2)  =  (Q3/V1) * central - (Q3/V3) * periph2\n",
-            obs_scale: "V1",
-            is_oral: false,
-        },
-        Family {
-            label: "three_cpt_oral",
-            thetas: "  theta TVCL(3.0, 0.01, 100.0)\n  theta TVV1(15.0, 1.0, 500.0)\n  \
-                     theta TVQ2(3.0, 0.01, 100.0)\n  theta TVV2(30.0, 1.0, 500.0)\n  \
-                     theta TVQ3(1.5, 0.01, 100.0)\n  theta TVV3(60.0, 1.0, 999.0)\n  \
-                     theta TVKA(1.1, 0.01, 50.0)\n",
-            indiv: "  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1\n  Q2 = TVQ2\n  V2 = TVV2\n  \
-                    Q3 = TVQ3\n  V3 = TVV3\n  KA = TVKA\n",
-            pk_open: "pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA",
-            ode_struct: "ode(obs_cmt=central, states=[depot, central, periph1, periph2])",
-            odes: "  d/dt(depot)    = -KA * depot\n  \
-                    d/dt(central)  =  KA * depot - (CL/V1 + Q2/V1 + Q3/V1) * central \
-                    + (Q2/V2) * periph1 + (Q3/V3) * periph2\n  \
-                    d/dt(periph1)  =  (Q2/V1) * central - (Q2/V2) * periph1\n  \
-                    d/dt(periph2)  =  (Q3/V1) * central - (Q3/V3) * periph2\n",
-            obs_scale: "V1",
-            is_oral: true,
-        },
-    ]
+fn fam_one_cpt_iv() -> Family {
+    Family {
+        label: "one_cpt_iv",
+        thetas: r"  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+",
+        indiv: r"  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+",
+        pk_open: "pk one_cpt_iv(cl=CL, v=V",
+        ode_struct: "ode(obs_cmt=central, states=[central])",
+        odes: r"  d/dt(central) = -(CL/V) * central
+",
+        obs_scale: "V",
+        is_oral: false,
+    }
+}
+
+fn fam_one_cpt_oral() -> Family {
+    Family {
+        label: "one_cpt_oral",
+        thetas: r"  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.2, 0.01, 50.0)
+",
+        indiv: r"  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+",
+        pk_open: "pk one_cpt_oral(cl=CL, v=V, ka=KA",
+        ode_struct: "ode(obs_cmt=central, states=[depot, central])",
+        odes: r"  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+",
+        obs_scale: "V",
+        is_oral: true,
+    }
+}
+
+fn fam_two_cpt_iv() -> Family {
+    Family {
+        label: "two_cpt_iv",
+        thetas: r"  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV1(15.0, 1.0, 500.0)
+  theta TVQ(3.0, 0.01, 100.0)
+  theta TVV2(30.0, 1.0, 500.0)
+",
+        indiv: r"  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+",
+        pk_open: "pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2",
+        ode_struct: "ode(obs_cmt=central, states=[central, periph])",
+        odes: r"  d/dt(central) = -(CL/V1 + Q/V1) * central + (Q/V2) * periph
+  d/dt(periph)  =  (Q/V1) * central - (Q/V2) * periph
+",
+        obs_scale: "V1",
+        is_oral: false,
+    }
+}
+
+fn fam_two_cpt_oral() -> Family {
+    Family {
+        label: "two_cpt_oral",
+        thetas: r"  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV1(15.0, 1.0, 500.0)
+  theta TVQ(3.0, 0.01, 100.0)
+  theta TVV2(30.0, 1.0, 500.0)
+  theta TVKA(1.1, 0.01, 50.0)
+",
+        indiv: r"  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+",
+        pk_open: "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA",
+        ode_struct: "ode(obs_cmt=central, states=[depot, central, periph])",
+        odes: r"  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V1 + Q/V1) * central + (Q/V2) * periph
+  d/dt(periph)  =  (Q/V1) * central - (Q/V2) * periph
+",
+        obs_scale: "V1",
+        is_oral: true,
+    }
+}
+
+fn fam_three_cpt_iv() -> Family {
+    Family {
+        label: "three_cpt_iv",
+        thetas: r"  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV1(15.0, 1.0, 500.0)
+  theta TVQ2(3.0, 0.01, 100.0)
+  theta TVV2(30.0, 1.0, 500.0)
+  theta TVQ3(1.5, 0.01, 100.0)
+  theta TVV3(60.0, 1.0, 999.0)
+",
+        indiv: r"  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q2 = TVQ2
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+",
+        pk_open: "pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3",
+        ode_struct: "ode(obs_cmt=central, states=[central, periph1, periph2])",
+        odes: r"  d/dt(central)  = -(CL/V1 + Q2/V1 + Q3/V1) * central + (Q2/V2) * periph1 + (Q3/V3) * periph2
+  d/dt(periph1)  =  (Q2/V1) * central - (Q2/V2) * periph1
+  d/dt(periph2)  =  (Q3/V1) * central - (Q3/V3) * periph2
+",
+        obs_scale: "V1",
+        is_oral: false,
+    }
+}
+
+fn fam_three_cpt_oral() -> Family {
+    Family {
+        label: "three_cpt_oral",
+        thetas: r"  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV1(15.0, 1.0, 500.0)
+  theta TVQ2(3.0, 0.01, 100.0)
+  theta TVV2(30.0, 1.0, 500.0)
+  theta TVQ3(1.5, 0.01, 100.0)
+  theta TVV3(60.0, 1.0, 999.0)
+  theta TVKA(1.1, 0.01, 50.0)
+",
+        indiv: r"  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q2 = TVQ2
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA
+",
+        pk_open: "pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA",
+        ode_struct: "ode(obs_cmt=central, states=[depot, central, periph1, periph2])",
+        odes: r"  d/dt(depot)    = -KA * depot
+  d/dt(central)  =  KA * depot - (CL/V1 + Q2/V1 + Q3/V1) * central + (Q2/V2) * periph1 + (Q3/V3) * periph2
+  d/dt(periph1)  =  (Q2/V1) * central - (Q2/V2) * periph1
+  d/dt(periph2)  =  (Q3/V1) * central - (Q3/V3) * periph2
+",
+        obs_scale: "V1",
+        is_oral: true,
+    }
 }
 
 /// Build the analytical and ODE source for a family, optionally adding lag time
@@ -281,22 +343,99 @@ fn assert_equiv(label: &str, analytical_src: &str, ode_src: &str, pop: &Populati
     }
 }
 
-#[test]
-fn analytical_ode_equivalence_across_models_and_dosing() {
+/// Exercise every dosing mode for one model family.
+fn run_family(f: &Family) {
     let obs = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
+    let dc = Family::DOSE_CMT;
+    let oc = f.obs_cmt();
 
-    for f in families() {
-        let dc = Family::DOSE_CMT;
-        let oc = f.obs_cmt();
+    // -- base model (no lag, no F) across dosing modes ----------------------
+    let (an, ode) = build_pair(f, false, false);
 
-        // -- base model (no lag, no F) across dosing modes -------------------
-        let (an, ode) = build_pair(&f, false, false);
+    // single bolus
+    assert_equiv(
+        &format!("{}/bolus", f.label),
+        &an,
+        &ode,
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)],
+            obs.clone(),
+            oc,
+        ),
+        RTOL,
+    );
 
-        // single bolus
+    // multiple doses (q24h x3)
+    assert_equiv(
+        &format!("{}/multidose", f.label),
+        &an,
+        &ode,
+        &population(
+            vec![
+                DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, dc, 0.0, false, 0.0),
+                DoseEvent::new(48.0, 100.0, dc, 0.0, false, 0.0),
+            ],
+            vec![1.0, 6.0, 12.0, 25.0, 30.0, 49.0, 54.0, 72.0],
+            oc,
+        ),
+        // Long trajectory across three dose restarts — solver error
+        // accumulates past the per-step `reltol`, like the SS case.
+        ACCUM_RTOL,
+    );
+
+    // steady state (II = 24)
+    assert_equiv(
+        &format!("{}/steady_state", f.label),
+        &an,
+        &ode,
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, dc, 0.0, true, 24.0)],
+            vec![1.0, 4.0, 8.0, 12.0, 23.0],
+            oc,
+        ),
+        ACCUM_RTOL,
+    );
+
+    // infusion (IV only - infusion into a depot is not a standard combo)
+    if !f.is_oral {
         assert_equiv(
-            &format!("{}/bolus", f.label),
+            &format!("{}/infusion", f.label),
             &an,
             &ode,
+            &population(
+                vec![DoseEvent::new(0.0, 100.0, dc, 50.0, false, 0.0)],
+                obs.clone(),
+                oc,
+            ),
+            RTOL,
+        );
+    }
+
+    // -- lag time -----------------------------------------------------------
+    let (an_l, ode_l) = build_pair(f, true, false);
+    assert_equiv(
+        &format!("{}/lagtime", f.label),
+        &an_l,
+        &ode_l,
+        // 0.75 h sits just past the 0.5 h lag, so the early-rise region right
+        // after arrival is checked — not only the late curve. A lag applied
+        // in the wrong direction would show up here.
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)],
+            vec![0.75, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+            oc,
+        ),
+        RTOL,
+    );
+
+    // -- bioavailability (oral only) ----------------------------------------
+    if f.is_oral {
+        let (an_f, ode_f) = build_pair(f, false, true);
+        assert_equiv(
+            &format!("{}/bioavailability", f.label),
+            &an_f,
+            &ode_f,
             &population(
                 vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)],
                 obs.clone(),
@@ -304,83 +443,23 @@ fn analytical_ode_equivalence_across_models_and_dosing() {
             ),
             RTOL,
         );
-
-        // multiple doses (q24h x3)
-        assert_equiv(
-            &format!("{}/multidose", f.label),
-            &an,
-            &ode,
-            &population(
-                vec![
-                    DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0),
-                    DoseEvent::new(24.0, 100.0, dc, 0.0, false, 0.0),
-                    DoseEvent::new(48.0, 100.0, dc, 0.0, false, 0.0),
-                ],
-                vec![1.0, 6.0, 12.0, 25.0, 30.0, 49.0, 54.0, 72.0],
-                oc,
-            ),
-            // Long trajectory across three dose restarts — solver error
-            // accumulates past the per-step `reltol`, like the SS case.
-            ACCUM_RTOL,
-        );
-
-        // steady state (II = 24)
-        assert_equiv(
-            &format!("{}/steady_state", f.label),
-            &an,
-            &ode,
-            &population(
-                vec![DoseEvent::new(0.0, 100.0, dc, 0.0, true, 24.0)],
-                vec![1.0, 4.0, 8.0, 12.0, 23.0],
-                oc,
-            ),
-            ACCUM_RTOL,
-        );
-
-        // infusion (IV only - infusion into a depot is not a standard combo)
-        if !f.is_oral {
-            assert_equiv(
-                &format!("{}/infusion", f.label),
-                &an,
-                &ode,
-                &population(
-                    vec![DoseEvent::new(0.0, 100.0, dc, 50.0, false, 0.0)],
-                    obs.clone(),
-                    oc,
-                ),
-                RTOL,
-            );
-        }
-
-        // -- lag time -------------------------------------------------------
-        let (an_l, ode_l) = build_pair(&f, true, false);
-        assert_equiv(
-            &format!("{}/lagtime", f.label),
-            &an_l,
-            &ode_l,
-            // observe comfortably past the 0.5 h lag
-            &population(
-                vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)],
-                vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-                oc,
-            ),
-            RTOL,
-        );
-
-        // -- bioavailability (oral only) -----------------------------------
-        if f.is_oral {
-            let (an_f, ode_f) = build_pair(&f, false, true);
-            assert_equiv(
-                &format!("{}/bioavailability", f.label),
-                &an_f,
-                &ode_f,
-                &population(
-                    vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)],
-                    obs.clone(),
-                    oc,
-                ),
-                RTOL,
-            );
-        }
     }
 }
+
+/// One `#[test]` per model family, so a regression names the offending model
+/// and `cargo test <model>` runs just that one.
+macro_rules! equiv_test {
+    ($test:ident, $ctor:ident) => {
+        #[test]
+        fn $test() {
+            run_family(&$ctor());
+        }
+    };
+}
+
+equiv_test!(one_cpt_iv, fam_one_cpt_iv);
+equiv_test!(one_cpt_oral, fam_one_cpt_oral);
+equiv_test!(two_cpt_iv, fam_two_cpt_iv);
+equiv_test!(two_cpt_oral, fam_two_cpt_oral);
+equiv_test!(three_cpt_iv, fam_three_cpt_iv);
+equiv_test!(three_cpt_oral, fam_three_cpt_oral);

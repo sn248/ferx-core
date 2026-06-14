@@ -2648,9 +2648,14 @@ pub(crate) fn compute_covariance(
             }
         }
     } else {
-        // IOV: no fixed-EBE analytical gradient covers the kappa block, so build
-        // the Hessian from second differences of the reconverged OFV (3-point
-        // diagonal, 4-point off-diagonal), reconverging the joint (η, κ) EBEs.
+        // Reconverged-OFV second-difference Hessian (3-point diagonal, 4-point
+        // off-diagonal), reconverging the EBEs at each perturbed point. Taken
+        // when the analytical fixed-EBE gradient does not cover the true marginal
+        // curvature: (a) IOV — no analytical gradient covers the kappa block; or
+        // (b) `force_ofv_hessian` — non-IOV FOCE with f-dependent error, whose SB
+        // gradient lacks the EBE-response Δ and yields an indefinite analytical
+        // Hessian. `pop_nll` dispatches on the kappa count, so this stencil is
+        // correct for both the IOV (joint η, κ) and the non-IOV (η-only) cases.
         //
         // #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV
         // points (subjects iterated serially inside `serial_ofv`) instead of the

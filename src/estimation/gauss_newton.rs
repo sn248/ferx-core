@@ -1464,6 +1464,17 @@ pub(crate) fn subject_eta_response_correction(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Option<Vec<f64>> {
+    // Sibling debug_assert to the Laplace gradient (which forms the `cache` this
+    // reuses): the `log|H̃|` EBE-response term is part of the FOCEI marginal only.
+    // For FOCE (no interaction) it is not a term of the objective and adding it
+    // would corrupt the gradient/covariance. Every production caller already
+    // gates on `options.interaction` (the FOCE paths never build the cache, so
+    // they never reach here); this assert guards direct callers.
+    debug_assert!(
+        options.interaction,
+        "subject_eta_response_correction called with options.interaction=false; \
+         the log|H̃| EBE-response correction is a FOCEI-only term"
+    );
     let n = x.len();
     let n_eta = model.n_eta;
     let n_theta = template.theta.len();

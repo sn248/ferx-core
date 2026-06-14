@@ -1,4 +1,3 @@
-use crate::estimation::gauss_newton::subject_nll_pop_grad;
 use crate::estimation::inner_optimizer::{find_ebe, run_inner_loop_warm};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
@@ -1732,22 +1731,48 @@ fn ad_population_gradient(
     debug_assert_eq!(hms.len(), n_subj);
     debug_assert_eq!(kappas.len(), n_subj);
     let np = x.len();
+    // For FOCEI (interaction), add the `log|H̃|` EBE-response term `t_i` (the
+    // #274/#289 Δ) the fixed-η̂ analytic gradient drops, so slsqp/L-BFGS see the
+    // full marginal gradient and reach the true minimum instead of stalling
+    // above it. Reuses the Laplace cache the gradient just formed (one extra
+    // n_eta×n_eta solve per subject); θ-block (mu-ref) only, zero for additive
+    // error. IOV routes through the reconverged-FD gradient, not here, so this
+    // only affects non-IOV FOCEI gradient steps.
     let per_subj: Vec<Vec<f64>> = (0..n_subj)
         .into_par_iter()
         .map(|i| {
-            subject_nll_pop_grad(
-                x,
-                init_params,
-                model,
-                population,
-                i,
-                &ehs[i],
-                &hms[i],
-                kappas[i].as_slice(),
-                bounds,
-                options,
-            )
-            .1
+            let (_, mut gi, cache) =
+                crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
+                    x,
+                    init_params,
+                    model,
+                    population,
+                    i,
+                    &ehs[i],
+                    &hms[i],
+                    kappas[i].as_slice(),
+                    bounds,
+                    options,
+                );
+            if let Some(c) = cache.as_ref() {
+                if let Some(t) = crate::estimation::gauss_newton::subject_eta_response_correction(
+                    Some(c),
+                    x,
+                    init_params,
+                    model,
+                    population,
+                    i,
+                    &ehs[i],
+                    &hms[i],
+                    bounds,
+                    options,
+                ) {
+                    for (g, ti) in gi.iter_mut().zip(t.iter()) {
+                        *g += *ti;
+                    }
+                }
+            }
+            gi
         })
         .collect();
     assemble_population_gradient(&per_subj, np)
@@ -4558,11 +4583,10 @@ mod tests {
     ///
     /// Gated under `slow-tests` because it calls fit() to convergence.
     #[test]
-    // TEMP-DISABLED (#317): #312's eta-space inner-EBE change makes the default
-    // gradient-free BOBYQA outer optimiser false-converge on this mu-ref model.
-    // Re-enabled by the FOCE/gradient-based-outer fix (tracked in the follow-up
-    // issues split out of #317).
-    #[ignore = "temporarily disabled pending #312 regression fix (#317)"]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn test_slsqp_moves_on_mu_referenced_two_cpt_oral_cov() {
         use crate::api::fit_from_files;
         use crate::types::{EstimationMethod, FitOptions, Optimizer};

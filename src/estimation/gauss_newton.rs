@@ -1520,6 +1520,15 @@ pub(crate) fn subject_eta_response_correction(
         }
     }
 
+    // The ω and σ EBE-response blocks are intentionally omitted: an ω block was
+    // prototyped (closed form via z=Ω⁻¹η̂, w=H̃⁻¹gη, p=Ω⁻¹w) but, lacking the θ
+    // block's G·H̃⁻¹≈I cancellation, it is exposed to the dropped ∂²f/∂η² and
+    // overshoots weakly-identified ω — it adds nothing for the optimizer (slsqp
+    // reaches the true minimum on the θ block alone) and is below the covariance
+    // step's FD-conditioning noise floor. Deferred to #335 (needs analytic
+    // second-order sensitivities). The σ SE is corrected indirectly via the θ/σ
+    // off-diagonals.
+
     if t.iter().any(|v| !v.is_finite()) {
         return None;
     }
@@ -1759,7 +1768,21 @@ fn build_gn_system(
     let n = x.len();
     let n_subj = population.subjects.len();
 
-    let per_subj: Vec<(f64, Vec<f64>)> = (0..n_subj)
+    // For FOCEI (interaction) the fixed-η̂ analytic gradient drops the `log|H̃|`
+    // EBE-response term `t_i` (the #274/#289 Δ, envelope theorem zeros the inner
+    // objective but not `log|H̃|`). Adding it back gives the gradient optimizer
+    // the full marginal gradient, so it reaches the true minimum instead of
+    // stalling above it (warfarin FOCEI -276.6 → -286.0). We reuse the Laplace
+    // cache the gradient already formed, so the correction costs one extra
+    // n_eta×n_eta solve per subject (no re-derivation); identically zero for
+    // additive error.
+    //
+    // `t_i` is a *curvature* term (∂log|H̃|/∂η · dη̂/dθ), NOT part of the score.
+    // It is added to the GRADIENT only; the BHHH Hessian `4·Σ gᵢgᵢᵀ` must stay
+    // on the raw score `gᵢ` (folding `t_i` into the outer product corrupts the
+    // Hessian and sends GN to a spurious point). So each subject returns
+    // `(nll, gᵢ_raw, t_i)` separately.
+    let per_subj: Vec<(f64, Vec<f64>, Vec<f64>)> = (0..n_subj)
         .into_par_iter()
         .map(|i| {
             let kap_i = if i < kappas.len() {
@@ -1767,7 +1790,7 @@ fn build_gn_system(
             } else {
                 &[]
             };
-            subject_nll_pop_grad(
+            let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
                 x,
                 template,
                 model,
@@ -1778,18 +1801,39 @@ fn build_gn_system(
                 kap_i,
                 bounds,
                 options,
-            )
+            );
+            let ti = cache
+                .as_ref()
+                .and_then(|c| {
+                    subject_eta_response_correction(
+                        Some(c),
+                        x,
+                        template,
+                        model,
+                        population,
+                        i,
+                        &eta_hats[i],
+                        &h_matrices[i],
+                        bounds,
+                        options,
+                    )
+                })
+                .unwrap_or_else(|| vec![0.0; n]);
+            (nll, gi, ti)
         })
         .collect();
 
     // For OFV = 2 * Σ nll_i:
-    //   grad(OFV)    = 2 * Σ g_i
-    //   H_bhhh(OFV) ≈ 4 * Σ g_i g_i^T
+    //   grad(OFV)    = 2 * Σ (g_i + t_i)   (score + EBE-response curvature)
+    //   H_bhhh(OFV) ≈ 4 * Σ g_i g_i^T      (raw score outer product only)
     let mut grad = DVector::zeros(n);
     let mut h_bhhh = DMatrix::zeros(n, n);
-    for (_, gi) in &per_subj {
+    for (_, gi, ti) in &per_subj {
         let gi_vec = DVector::from_column_slice(gi);
         grad += 2.0 * &gi_vec;
+        for (k, &tk) in ti.iter().enumerate() {
+            grad[k] += 2.0 * tk;
+        }
         h_bhhh += 4.0 * &gi_vec * gi_vec.transpose();
     }
 

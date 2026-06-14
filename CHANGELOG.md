@@ -84,6 +84,14 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- FOCEI gradient-based optimizers (SLSQP, L-BFGS, built-in BFGS, Gauss-Newton)
+  now add the `log|H̃|` EBE-response term (the #274/#289 Δ) to the population
+  gradient, so they reach the true marginal minimum instead of stalling above it
+  on the fixed-EBE gradient (e.g. warfarin FOCEI −282.8 → −286.0, matching the
+  derivative-free BOBYQA default). The term reuses the Laplace intermediates the
+  gradient already forms (one extra `n_eta×n_eta` solve per subject) and is zero
+  for additive error; the BOBYQA default is unaffected (it uses no gradient). The
+  ω-block of the correction remains deferred (#335) (#330).
 - The default inner (per-subject EBE) convergence tolerance `inner_tol` is now
   `1e-5` (was `1e-4`). A looser inner tolerance left residual noise in each
   subject's EBE solution that propagated into the marginal objective, causing the

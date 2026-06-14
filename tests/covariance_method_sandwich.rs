@@ -131,11 +131,12 @@ fn covariance_methods_produce_consistent_ses_on_warfarin() {
 /// held to 15%. A factor-of-2 error in the score scale would push the `s` SEs
 /// ~29–41% off systematically — well outside these bands (issue #266 note).
 #[test]
-// TEMP-DISABLED (#335): the tighter default inner_tol (1e-4 -> 1e-5, #330) shifts
-// the score cross-product S, pushing the RSR sandwich SE(TVKA) to ~24% (band 15%).
-// The Hessian-R covariance (covariance_se_matches_nonmem) still matches NONMEM; only
-// the S-based sandwich regresses. Re-enabled by the deferred gradient/score rework.
-#[ignore = "temporarily disabled pending #335 (covariance-S sandwich vs tighter inner_tol)"]
+// TEMP-DISABLED (#335): the tighter default inner_tol (1e-4 → 1e-5, #330) shifts
+// the covariance score cross-product S, pushing the RSR sandwich SE(TVKA) to ~24%
+// (band 15%). The Hessian-R covariance (covariance_se_matches_nonmem) still matches
+// NONMEM; only the S-based sandwich regresses. The θ-block Δ goes to the optimizer
+// gradient, not the covariance S. Tracked in #335.
+#[ignore = "covariance-S sandwich SE vs tighter inner_tol — tracked in #335"]
 fn covariance_se_matches_nonmem_s_rsr() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
     let pop =

@@ -1695,9 +1695,16 @@ impl CompiledModel {
     /// [`OdeSpec`] (no-op for analytical models). Call this once after the
     /// model file's `[fit_options]` and any call-time `settings` overrides have
     /// been merged into `opts`, so the integrator uses the requested accuracy.
-    /// The parser calls it at parse time (covering `predict`, which receives no
-    /// options); the fit entry re-applies it so call-time `ode_reltol` /
-    /// `ode_abstol` / `ode_max_steps` overrides take effect. Idempotent.
+    /// The parser calls it at parse time, so `.ferx` `[fit_options]` and any
+    /// entry that integrates the parsed spec as-is (`predict`, `fit_from_files`)
+    /// already use the configured accuracy.
+    ///
+    /// Note: [`fit`](crate::fit) takes `&CompiledModel` and does **not** call
+    /// this. The integrator reads [`OdeSpec::solver_opts`], never
+    /// `FitOptions::ode_reltol` directly, so a caller that merges call-time
+    /// `settings` into its own `FitOptions` (as the R wrapper's `ferx_fit`
+    /// does) must re-apply this on an owned model *before* `fit` for those
+    /// overrides to reach the solver. Idempotent.
     pub fn sync_ode_solver_opts(&mut self, opts: &FitOptions) {
         if let Some(ode) = self.ode_spec.as_mut() {
             ode.solver_opts.reltol = opts.ode_reltol;

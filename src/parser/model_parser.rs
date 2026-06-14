@@ -1537,9 +1537,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     model.bloq_method = fit_options.bloq_method;
 
     // Bake the configured ODE solver tolerances from [fit_options] onto the
-    // OdeSpec so predict() (which receives no fit options) integrates at the
-    // requested accuracy. The fit entry re-applies this after merging call-time
-    // `settings` so command-line overrides win. No-op for analytical models.
+    // OdeSpec so predict()/fit_from_files (which integrate the parsed spec
+    // as-is) use the requested accuracy. Callers that merge call-time `settings`
+    // into their own FitOptions (the R wrapper's ferx_fit) must re-apply
+    // sync_ode_solver_opts on the owned model for those overrides to win;
+    // ferx-core fit() takes &CompiledModel and does not. No-op for analytical.
     model.sync_ode_solver_opts(&fit_options);
 
     // ── [scaling] block ──

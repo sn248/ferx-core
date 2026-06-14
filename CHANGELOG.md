@@ -20,6 +20,9 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Example `dose_rate.ferx` (+ `data/dose_rate.csv`) demonstrating the supported
+  NONMEM `RATE` dosing forms — a bolus (`RATE=0`) and a constant-rate infusion
+  (`RATE>0`) mixed in one dataset (#324).
 - Configurable RK45 ODE solver tolerances via `[fit_options]` (and call-time
   settings): `ode_reltol` (default `1e-4`), `ode_abstol` (default `1e-6`), and
   `ode_max_steps` (default `10000`). Defaults are unchanged, so existing fits
@@ -131,6 +134,12 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- NONMEM coded `RATE` values (`-1` = modeled rate, `-2` = modeled duration) — and
+  any other negative or non-finite `RATE` on a dose row — are now rejected with an
+  informative error naming the subject and time, instead of being silently treated
+  as an IV bolus (which produced wrong predictions with no warning). Modeled
+  rate/duration support is not yet implemented; convert such rows to an explicit
+  positive `RATE` (= `AMT`/duration) before importing (#324).
 - A `[structural_model]` PK parameter that references a name not defined in
   `[individual_parameters]` (e.g. `pk one_cpt_oral(cl=CL, ...)` with no `CL`)
   is now a parse error instead of being silently dropped and defaulting the

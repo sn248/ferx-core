@@ -6861,14 +6861,28 @@ fn compute_max_stack(ops: &[Op]) -> usize {
             peak = depth;
         }
     }
-    // A well-formed expression bytecode leaves exactly one value on the
-    // stack (the result). Catch off-by-one push/pop emissions in any
-    // future compile_expr_into change.
+    // A well-formed *jump-free* expression leaves exactly one value on the
+    // stack (the result); this catches off-by-one push/pop emissions in any
+    // future `compile_expr_into` change. Bytecode with branches can't be
+    // checked this way (the linear scan walks both arms — see
+    // `bytecode_has_branch`), so skip the end-depth check when a jump is
+    // present. `peak` stays a safe over-estimate either way.
     debug_assert!(
-        depth == 1 || ops.is_empty(),
+        ops.is_empty() || bytecode_has_branch(ops) || depth == 1,
         "compute_max_stack: bytecode ends at depth {depth}, expected 1",
     );
     peak.max(1) as usize
+}
+
+/// True if `ops` contains a branch (`Jump` / `JumpIfFalse`). The end-of-scan
+/// depth invariant in [`compute_max_stack`] only holds for branch-free
+/// bytecode: a `Conditional` emits both arms inline, so the linear walk ends
+/// above depth 1 even though execution takes one arm. Extracted (and
+/// unit-tested directly) so the branch check is exercised independently of the
+/// debug-only assertion that consumes it.
+fn bytecode_has_branch(ops: &[Op]) -> bool {
+    ops.iter()
+        .any(|op| matches!(op, Op::Jump(_) | Op::JumpIfFalse(_)))
 }
 
 fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
@@ -15370,6 +15384,54 @@ if (1 > 0) {
     }
     fn cmp(l: Expression, op: CmpOp, r: Expression) -> Condition {
         Condition::Compare(l, op, r)
+    }
+
+    #[test]
+    fn compute_max_stack_allows_branching_bytecode() {
+        // Regression: a `Conditional` compiles to
+        //   cond; JumpIfFalse(else); then; Jump(end); else
+        // so `compute_max_stack`'s linear scan walks BOTH arms and ends above
+        // depth 1 (one extra per branch). The end-depth assertion must be
+        // skipped when jumps are present; before the fix, `compile_bytecode`
+        // panicked here under debug-assertions ("bytecode ends at depth 2").
+        let expr = cond(cmp(lit(2.0), CmpOp::Lt, lit(3.0)), lit(1.0), lit(-1.0));
+        let bc = compile_bytecode(&expr); // would panic pre-fix
+        assert!(
+            bc.max_stack >= 1,
+            "max_stack must be >= 1, got {}",
+            bc.max_stack
+        );
+
+        // The reserved size must actually be sufficient to evaluate correctly:
+        // 2 < 3 ⇒ the `then` arm (1.0).
+        let nn: Vec<Vec<f64>> = Vec::new();
+        let mut stack: Vec<f64> = Vec::new();
+        let by = eval_bytecode(&bc, &[], &[], &[], &[], &nn, &mut stack);
+        assert_eq!(by.to_bits(), 1.0_f64.to_bits());
+
+        // Nested conditionals (deeper branch nesting) must also not trip it,
+        // and a deeper `peak` must still be returned.
+        let nested = cond(
+            cmp(lit(1.0), CmpOp::Gt, lit(0.0)),
+            cond(cmp(lit(2.0), CmpOp::Lt, lit(5.0)), lit(10.0), lit(20.0)),
+            lit(-1.0),
+        );
+        assert!(compute_max_stack(&compile_bytecode(&nested).ops) >= 1);
+
+        // The jump-free path is unchanged: `1 + 2` pushes two operands before
+        // `Add`, so the peak (the returned size) is 2 — and its end-depth of 1
+        // still satisfies the (retained) jump-free assertion.
+        assert_eq!(
+            compute_max_stack(&compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops),
+            2
+        );
+
+        // `bytecode_has_branch` (which gates the assertion) — true for
+        // conditional bytecode, false for a jump-free arithmetic expression.
+        assert!(bytecode_has_branch(&compile_bytecode(&expr).ops));
+        assert!(!bytecode_has_branch(
+            &compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops
+        ));
     }
 
     #[test]

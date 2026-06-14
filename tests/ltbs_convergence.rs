@@ -46,11 +46,10 @@ use ferx_core::{fit, read_nonmem_csv, FitOptions};
 use std::path::Path;
 
 #[test]
-// TEMP-DISABLED (#317): #312's eta-space inner-EBE regression shifts the
-// LTBS (FD-inner) fit so ω²(CL) lands just outside the NONMEM band under the
-// default BOBYQA outer optimiser. Re-enabled by the FOCE/outer-optimiser fix
-// (tracked in the follow-up issues split out of #317).
-#[ignore = "temporarily disabled pending #312 regression fix (#317)"]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
 fn ltbs_warfarin_fit_converges_and_recovers_pk() {
     let model = parse_model_file(Path::new("examples/warfarin_ltbs.ferx"))
         .expect("LTBS warfarin model must parse");
@@ -148,11 +147,10 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
 /// variance-scale SE `1.69e-5` is converted to the SD scale via the delta method
 /// `SE(σ) = SE(σ²) / (2σ)` with `σ = sqrt(1.11601e-4) = 0.010564`.
 #[test]
-// TEMP-DISABLED (#317): #312 regression — the LTBS covariance SE(omega_V) lands
-// outside the NONMEM band because the fit converges to a slightly off point under
-// the default BOBYQA outer optimiser. Re-enabled by the FOCE/outer-optimiser fix
-// (tracked in the follow-up issues split out of #317).
-#[ignore = "temporarily disabled pending #312 regression fix (#317)"]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored LTBS covariance SE cross-check: opt in with --features slow-tests"
+)]
 fn ltbs_covariance_se_matches_nonmem() {
     let model = parse_model_file(Path::new("examples/warfarin_ltbs.ferx"))
         .expect("LTBS warfarin model must parse");

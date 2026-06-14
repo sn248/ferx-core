@@ -6865,10 +6865,10 @@ fn compute_max_stack(ops: &[Op]) -> usize {
     // stack (the result); this catches off-by-one push/pop emissions in any
     // future `compile_expr_into` change. Bytecode with branches can't be
     // checked this way (the linear scan walks both arms — see
-    // `bytecode_has_branch`), so skip the end-depth check when a jump is
-    // present. `peak` stays a safe over-estimate either way.
+    // `bytecode_has_branch`), so the predicate exempts them. `peak` stays a
+    // safe over-estimate either way.
     debug_assert!(
-        ops.is_empty() || bytecode_has_branch(ops) || depth == 1,
+        ends_at_expected_depth(ops, depth),
         "compute_max_stack: bytecode ends at depth {depth}, expected 1",
     );
     peak.max(1) as usize
@@ -6883,6 +6883,20 @@ fn compute_max_stack(ops: &[Op]) -> usize {
 fn bytecode_has_branch(ops: &[Op]) -> bool {
     ops.iter()
         .any(|op| matches!(op, Op::Jump(_) | Op::JumpIfFalse(_)))
+}
+
+/// Whether a completed linear scan of `ops` ending at `depth` satisfies the
+/// well-formed end-depth invariant: a jump-free expression must leave exactly
+/// one value on the stack. Branchy bytecode is exempt — a `Conditional` emits
+/// both arms inline, so the linear walk ends above depth 1 even though
+/// execution takes one arm (see [`bytecode_has_branch`]). The cheap `depth`
+/// check is tried first so the common jump-free path skips the O(n) scan.
+///
+/// Returned rather than inlined into the `debug_assert!` so the invariant is
+/// exercised even under the `ci-test` profile, where `debug_assert!` is
+/// compiled out and the assertion itself never runs.
+fn ends_at_expected_depth(ops: &[Op], depth: i32) -> bool {
+    depth == 1 || ops.is_empty() || bytecode_has_branch(ops)
 }
 
 fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
@@ -15432,6 +15446,18 @@ if (1 > 0) {
         assert!(!bytecode_has_branch(
             &compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops
         ));
+
+        // `ends_at_expected_depth` — the returnable predicate the `debug_assert!`
+        // consumes. Exercised directly so the end-depth invariant is covered
+        // even under the `ci-test` profile (debug-assertions off), where the
+        // assertion is compiled out and never runs. Branchy bytecode is exempt
+        // at any end depth; jump-free bytecode must end at depth 1.
+        let cond_ops = compile_bytecode(&expr).ops;
+        let addops = compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops;
+        assert!(ends_at_expected_depth(&cond_ops, 2)); // branchy: exempt even at depth 2
+        assert!(ends_at_expected_depth(&addops, 1)); // jump-free: depth 1 ok
+        assert!(!ends_at_expected_depth(&addops, 2)); // jump-free: depth 2 rejected
+        assert!(ends_at_expected_depth(&[], 0)); // empty: ok
     }
 
     #[test]

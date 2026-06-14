@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Configurable RK45 ODE solver tolerances via `[fit_options]` (and call-time
+  settings): `ode_reltol` (default `1e-4`), `ode_abstol` (default `1e-6`), and
+  `ode_max_steps` (default `10000`). Defaults are unchanged, so existing fits
+  are unaffected. Previously the tolerance was hardcoded, which made the OFV of
+  an ODE-form model differ from its analytical equivalent by several units
+  (the FOCE objective amplifies the ~`1e-4` solver error); a tighter
+  `ode_reltol` now lets the two forms agree. Carried on `OdeSpec::solver_opts`
+  and applied via `CompiledModel::sync_ode_solver_opts` (#127).
 - Propensity-score-matched simulation: `simulate_with_options()` with a new
   `SimulateOptions { seed, propensity_match }`. When `propensity_match` is set,
   each replicate's drawn etas are reassigned to subjects by optimal Mahalanobis

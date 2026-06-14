@@ -528,3 +528,72 @@ fn assert_ofv_equiv(f: &Family) {
         );
     }
 }
+
+/// Covariate-on-ODE equivalence. The model-family sweep above carries no
+/// covariates, so covariate handling in the ODE path was otherwise guarded only
+/// by the ferx-r example test (`two_cpt_oral_cov`). Covariates enter both forms
+/// identically — through the shared `[individual_parameters]` block — so an
+/// analytical model and its ODE twin must still agree pointwise once a covariate
+/// actually moves a parameter. Here WT scales CL on a one-compartment oral
+/// model; two subjects with different WT ensure the covariate term is exercised
+/// rather than cancelling to the typical value.
+#[test]
+fn covariate_model_equiv() {
+    // Shared params + indiv block (WT on CL); both forms parse the same header.
+    let header = "\
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.2, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+";
+
+    let analytical = format!(
+        "{header}\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         [covariates]\n  WT continuous\n\n[error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let ode = format!(
+        "{header}\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n\n\
+         [odes]\n  d/dt(depot)   = -KA * depot\n  d/dt(central) =  KA * depot - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V\n\n[covariates]\n  WT continuous\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+
+    // Oral single dose into depot (cmt 1); observe central (cmt 2).
+    let obs = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
+    let mk = |id: &str, wt: f64| {
+        let mut s = subject(
+            vec![DoseEvent::new(
+                0.0,
+                100.0,
+                Family::DOSE_CMT,
+                0.0,
+                false,
+                0.0,
+            )],
+            obs.clone(),
+            2,
+        );
+        s.id = id.into();
+        s.covariates.insert("WT".into(), wt);
+        s
+    };
+    let pop = Population {
+        covariate_names: vec!["WT".into()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![mk("1", 55.0), mk("2", 95.0)],
+    };
+
+    // Single dose out to 24 h is in the per-step `reltol` regime, so `RTOL`.
+    assert_equiv("one_cpt_oral_cov/bolus", &analytical, &ode, &pop, RTOL);
+}

@@ -10,9 +10,10 @@
 use ferx_core::types::{DoseEvent, Subject};
 use std::collections::HashMap;
 
-/// Build a [`Subject`] from the fields tests usually vary, defaulting all the
-/// boilerplate vectors (covariates, occasions, censoring, …) to empty. Set any
-/// remaining field on the returned value, e.g.
+/// Build a [`Subject`] from the fields tests usually vary, defaulting the
+/// boilerplate vectors (covariates, occasions, …) to empty and `cens` to
+/// all-uncensored (`vec![0; obs_times.len()]`). Set any remaining field on the
+/// returned value, e.g.
 ///
 /// ```ignore
 /// let mut s = common::subject("1", doses, obs_times, observations, obs_cmts);

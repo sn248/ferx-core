@@ -2999,10 +2999,12 @@ pub enum Optimizer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ParameterScaling {
     /// **Default.** Apply `Rescale2` for the gradient-based optimizers that
-    /// benefit from it (`Bfgs`, `Lbfgs`, `NloptLbfgs`) and no scaling otherwise
-    /// (so the derivative-free `Bobyqa` default, where `Rescale2` is harmful, and
-    /// `Slsqp`/`Mma`/`TrustRegion` are left unscaled — the legacy `scale_params`
-    /// / IOV+SLSQP auto-enable still applies in the unscaled branch).
+    /// benefit from it (`Bfgs`, `Lbfgs`, `NloptLbfgs`, `Slsqp`) and no scaling
+    /// otherwise — so the derivative-free `Bobyqa` default (where `Rescale2` is
+    /// harmful) and `Mma`/`TrustRegion` are left unscaled, with the legacy
+    /// `scale_params` / IOV-auto-enable still applying in that unscaled branch.
+    /// `Slsqp` is scaled because the bound-half-width rescaling fixes its
+    /// cold-start convergence on IOV models (#335).
     #[default]
     Auto,
     /// No scaling: fall back to the legacy `scale_params` bool (and the IOV+SLSQP

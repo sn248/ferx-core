@@ -1275,18 +1275,28 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
             &unpack_params(&x_pert, template).theta,
             eta_hat.as_slice(),
         );
-        if ipreds_plus
-            .iter()
-            .chain(ipreds_minus.iter())
-            .any(|v| !v.is_finite())
-        {
+        // Degrade to one-sided FD (against the base `ipreds`, which is finite —
+        // checked at the top) when a perturbation pushes a PK parameter past a
+        // singularity (e.g. a θ near its lower bound driving CL→0). This keeps the
+        // analytical σ/ω gradient already computed for this subject instead of
+        // discarding it and falling back to the slower full-NLL central FD. Only
+        // bail (`None`) when *both* sides are non-finite.
+        let plus_ok = ipreds_plus.iter().all(|v| v.is_finite());
+        let minus_ok = ipreds_minus.iter().all(|v| v.is_finite());
+        let (num_lhs, num_rhs, denom): (&[f64], &[f64], f64) = if plus_ok && minus_ok {
+            (&ipreds_plus, &ipreds_minus, actual_h)
+        } else if plus_ok {
+            (&ipreds_plus, ipreds.as_slice(), xk_plus - x[k])
+        } else if minus_ok {
+            (ipreds.as_slice(), &ipreds_minus, x[k] - xk_minus)
+        } else {
             return None;
+        };
+        if denom.abs() < 1e-16 {
+            continue;
         }
         let s: f64 = (0..n_obs)
-            .map(|j| {
-                let df_j = (ipreds_plus[j] - ipreds_minus[j]) / actual_h;
-                theta_per_j[j] * df_j
-            })
+            .map(|j| theta_per_j[j] * (num_lhs[j] - num_rhs[j]) / denom)
             .sum();
         grad[k] = 0.5 * s;
     }

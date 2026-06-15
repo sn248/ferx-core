@@ -1275,7 +1275,11 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
             &unpack_params(&x_pert, template).theta,
             eta_hat.as_slice(),
         );
-        if ipreds_plus.iter().chain(ipreds_minus.iter()).any(|v| !v.is_finite()) {
+        if ipreds_plus
+            .iter()
+            .chain(ipreds_minus.iter())
+            .any(|v| !v.is_finite())
+        {
             return None;
         }
         let s: f64 = (0..n_obs)

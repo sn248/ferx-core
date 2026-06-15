@@ -1397,8 +1397,21 @@ mod ltbs_ad_tests {
             let dz = vec![0.0f64; eta.len()];
             let dtvz = vec![0.0f64; tvv.len()];
             predict_all_ad_tangent(
-                &eta, &dz, tvv, &dtvz, &dose.times, &dose.amts, &dose.rates, &dose.durations,
-                &obs_times, &pk_idx_f64, &sel_flat, pk_id, &obs_scale, &mut out, &mut d_out,
+                &eta,
+                &dz,
+                tvv,
+                &dtvz,
+                &dose.times,
+                &dose.amts,
+                &dose.rates,
+                &dose.durations,
+                &obs_times,
+                &pk_idx_f64,
+                &sel_flat,
+                pk_id,
+                &obs_scale,
+                &mut out,
+                &mut d_out,
             );
             out
         };
@@ -1413,7 +1426,12 @@ mod ltbs_ad_tests {
             let fm = predict(&tm);
             for i in 0..n_obs {
                 let fd = (fp[i] - fm[i]) / (2.0 * h);
-                approx::assert_relative_eq!(jac_ad[(i, k)], fd, epsilon = 1e-6, max_relative = 1e-4);
+                approx::assert_relative_eq!(
+                    jac_ad[(i, k)],
+                    fd,
+                    epsilon = 1e-6,
+                    max_relative = 1e-4
+                );
             }
         }
     }
@@ -1450,17 +1468,41 @@ mod ltbs_ad_tests {
         let obs_scale = vec![1.0, 1.0, 1.0];
 
         let hess = compute_nll_hessian_eta_ad(
-            &eta, &tv, &omega_inv_flat, log_det_omega, &sigma, &dose, &obs_times,
-            &observations, &cens, PkModel::OneCptOral, ErrorModel::Proportional,
-            &pk_idx_f64, &sel_flat, &obs_scale, false,
+            &eta,
+            &tv,
+            &omega_inv_flat,
+            log_det_omega,
+            &sigma,
+            &dose,
+            &obs_times,
+            &observations,
+            &cens,
+            PkModel::OneCptOral,
+            ErrorModel::Proportional,
+            &pk_idx_f64,
+            &sel_flat,
+            &obs_scale,
+            false,
         );
 
         // Central FD of the reverse-mode gradient.
         let grad = |e: &[f64]| -> Vec<f64> {
             compute_nll_gradient_ad(
-                e, &tv, &omega_inv_flat, log_det_omega, &sigma, &dose, &obs_times,
-                &observations, &cens, PkModel::OneCptOral, ErrorModel::Proportional,
-                &pk_idx_f64, &sel_flat, &obs_scale, false,
+                e,
+                &tv,
+                &omega_inv_flat,
+                log_det_omega,
+                &sigma,
+                &dose,
+                &obs_times,
+                &observations,
+                &cens,
+                PkModel::OneCptOral,
+                ErrorModel::Proportional,
+                &pk_idx_f64,
+                &sel_flat,
+                &obs_scale,
+                false,
             )
             .1
         };
@@ -1521,16 +1563,40 @@ mod ltbs_ad_tests {
 
         // cross[(j, k)] = ∂²nll/∂η_j∂tv_k
         let cross = compute_nll_cross_eta_theta_ad(
-            &eta, &tv, &omega_inv_flat, log_det_omega, &sigma, &dose, &obs_times,
-            &observations, &cens, PkModel::OneCptOral, ErrorModel::Proportional,
-            &pk_idx_f64, &sel_flat, &obs_scale, false,
+            &eta,
+            &tv,
+            &omega_inv_flat,
+            log_det_omega,
+            &sigma,
+            &dose,
+            &obs_times,
+            &observations,
+            &cens,
+            PkModel::OneCptOral,
+            ErrorModel::Proportional,
+            &pk_idx_f64,
+            &sel_flat,
+            &obs_scale,
+            false,
         );
 
         let grad = |t: &[f64]| -> Vec<f64> {
             compute_nll_gradient_ad(
-                &eta, t, &omega_inv_flat, log_det_omega, &sigma, &dose, &obs_times,
-                &observations, &cens, PkModel::OneCptOral, ErrorModel::Proportional,
-                &pk_idx_f64, &sel_flat, &obs_scale, false,
+                &eta,
+                t,
+                &omega_inv_flat,
+                log_det_omega,
+                &sigma,
+                &dose,
+                &obs_times,
+                &observations,
+                &cens,
+                PkModel::OneCptOral,
+                ErrorModel::Proportional,
+                &pk_idx_f64,
+                &sel_flat,
+                &obs_scale,
+                false,
             )
             .1
         };
@@ -1579,16 +1645,41 @@ mod ltbs_ad_tests {
         let obs_scale = vec![1.0, 1.0, 1.0];
 
         let hess = compute_nll_hessian_theta_ad(
-            &eta, &tv, &omega_inv_flat, log_det_omega, &sigma, &dose, &obs_times,
-            &observations, &cens, PkModel::OneCptOral, ErrorModel::Proportional,
-            &pk_idx_f64, &sel_flat, &obs_scale, false,
+            &eta,
+            &tv,
+            &omega_inv_flat,
+            log_det_omega,
+            &sigma,
+            &dose,
+            &obs_times,
+            &observations,
+            &cens,
+            PkModel::OneCptOral,
+            ErrorModel::Proportional,
+            &pk_idx_f64,
+            &sel_flat,
+            &obs_scale,
+            false,
         );
 
         let nll = |t: &[f64]| -> f64 {
             individual_nll_ad(
-                &eta, t, &omega_inv_flat, log_det_omega, &sigma, &dose.times, &dose.amts,
-                &dose.rates, &dose.durations, &obs_times, &observations, &cens, &pk_idx_f64,
-                &sel_flat, 1.0 * 10.0 + 1.0, &obs_scale, // pk_id=1 (oral), err=1 (prop)
+                &eta,
+                t,
+                &omega_inv_flat,
+                log_det_omega,
+                &sigma,
+                &dose.times,
+                &dose.amts,
+                &dose.rates,
+                &dose.durations,
+                &obs_times,
+                &observations,
+                &cens,
+                &pk_idx_f64,
+                &sel_flat,
+                1.0 * 10.0 + 1.0,
+                &obs_scale, // pk_id=1 (oral), err=1 (prop)
             )
         };
         let h = 1e-4;
@@ -1615,8 +1706,18 @@ mod ltbs_ad_tests {
                 tmm[l] -= h;
                 tmm[k] -= h;
                 let fd_lk = (nll(&tpp) - nll(&tpm) - nll(&tmp) + nll(&tmm)) / (4.0 * h * h);
-                approx::assert_relative_eq!(hess[(l, k)], fd_lk, epsilon = 1e-3, max_relative = 2e-2);
-                approx::assert_relative_eq!(hess[(l, k)], hess[(k, l)], epsilon = 1e-7, max_relative = 1e-5);
+                approx::assert_relative_eq!(
+                    hess[(l, k)],
+                    fd_lk,
+                    epsilon = 1e-3,
+                    max_relative = 2e-2
+                );
+                approx::assert_relative_eq!(
+                    hess[(l, k)],
+                    hess[(k, l)],
+                    epsilon = 1e-7,
+                    max_relative = 1e-5
+                );
             }
         }
     }

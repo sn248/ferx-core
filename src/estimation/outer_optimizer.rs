@@ -2588,8 +2588,7 @@ pub(crate) fn compute_covariance(
     // `∂a/∂θ` curvature the analytical stencil drops — which removes the
     // weakly-identified-θ SE bias (e.g. warfarin TVKA ~9% high; see the
     // `r_matrix_vs_richardson_fd_ground_truth` harness).
-    let force_ofv_hessian = (!options.interaction
-        && model.error_spec.has_f_dependent_variance())
+    let force_ofv_hessian = (!options.interaction && model.error_spec.has_f_dependent_variance())
         || options.covariance_ofv_hessian;
     let use_analytical = !is_iov && !force_ofv_hessian;
 
@@ -5266,7 +5265,10 @@ mod tests {
         let cov_true = hess.try_inverse().expect("ground-truth Hessian invertible");
 
         let cov_r = res_r.covariance_matrix.as_ref().expect("R covariance");
-        let cov_r_ofv = res_r_ofv.covariance_matrix.as_ref().expect("OFV-R covariance");
+        let cov_r_ofv = res_r_ofv
+            .covariance_matrix
+            .as_ref()
+            .expect("OFV-R covariance");
         let cov_s = res_s.covariance_matrix.as_ref().expect("S covariance");
 
         println!("\n=== covariance R (analytical vs OFV) vs Richardson FD-of-OFV ground truth ===");
@@ -5366,11 +5368,8 @@ mod tests {
         let mut mle = model.default_params.clone();
         mle.theta = res.theta.clone();
         mle.sigma.values = res.sigma.clone();
-        mle.omega = OmegaMatrix::from_matrix(
-            res.omega.clone(),
-            res.eta_names.clone(),
-            mle.omega.diagonal,
-        );
+        mle.omega =
+            OmegaMatrix::from_matrix(res.omega.clone(), res.eta_names.clone(), mle.omega.diagonal);
         let n_theta = mle.theta.len();
         let n_eta = model.n_eta;
         let n_subj = pop.subjects.len();
@@ -5396,19 +5395,55 @@ mod tests {
             let obs_scale = vec![1.0f64; n_obs];
             let cens = vec![0.0f64; n_obs];
             let h_ee = compute_nll_hessian_eta_ad(
-                eta, &tv, &omega_inv_flat, log_det_omega, &mle.sigma.values, &dose,
-                &subj.obs_times, &subj.observations, &cens, model.pk_model, model.error_model,
-                &model.pk_idx_f64, &model.sel_flat, &obs_scale, false,
+                eta,
+                &tv,
+                &omega_inv_flat,
+                log_det_omega,
+                &mle.sigma.values,
+                &dose,
+                &subj.obs_times,
+                &subj.observations,
+                &cens,
+                model.pk_model,
+                model.error_model,
+                &model.pk_idx_f64,
+                &model.sel_flat,
+                &obs_scale,
+                false,
             );
             let h_et = compute_nll_cross_eta_theta_ad(
-                eta, &tv, &omega_inv_flat, log_det_omega, &mle.sigma.values, &dose,
-                &subj.obs_times, &subj.observations, &cens, model.pk_model, model.error_model,
-                &model.pk_idx_f64, &model.sel_flat, &obs_scale, false,
+                eta,
+                &tv,
+                &omega_inv_flat,
+                log_det_omega,
+                &mle.sigma.values,
+                &dose,
+                &subj.obs_times,
+                &subj.observations,
+                &cens,
+                model.pk_model,
+                model.error_model,
+                &model.pk_idx_f64,
+                &model.sel_flat,
+                &obs_scale,
+                false,
             );
             let h_tt = compute_nll_hessian_theta_ad(
-                eta, &tv, &omega_inv_flat, log_det_omega, &mle.sigma.values, &dose,
-                &subj.obs_times, &subj.observations, &cens, model.pk_model, model.error_model,
-                &model.pk_idx_f64, &model.sel_flat, &obs_scale, false,
+                eta,
+                &tv,
+                &omega_inv_flat,
+                log_det_omega,
+                &mle.sigma.values,
+                &dose,
+                &subj.obs_times,
+                &subj.observations,
+                &cens,
+                model.pk_model,
+                model.error_model,
+                &model.pk_idx_f64,
+                &model.sel_flat,
+                &obs_scale,
+                false,
             );
             let h_ee_inv = h_ee.try_inverse().expect("H_ee invertible");
             r_schur += &h_tt - h_et.transpose() * h_ee_inv * &h_et;
@@ -5426,7 +5461,9 @@ mod tests {
         };
         let hstep = 1e-4;
         let f0 = marginal(&mle.theta);
-        let st: Vec<f64> = (0..n_theta).map(|k| hstep * (1.0 + mle.theta[k].abs())).collect();
+        let st: Vec<f64> = (0..n_theta)
+            .map(|k| hstep * (1.0 + mle.theta[k].abs()))
+            .collect();
         let mut r_marg = DMatrix::<f64>::zeros(n_theta, n_theta);
         for a in 0..n_theta {
             let mut tp = mle.theta.clone();
@@ -5437,7 +5474,10 @@ mod tests {
         }
 
         println!("\n=== AD Schur profile R_θθ vs FD-of-marginal (diagonal) ===");
-        println!("{:<6} {:>14} {:>14} {:>10}", "θ", "AD_schur", "FD_marginal", "schur/marg");
+        println!(
+            "{:<6} {:>14} {:>14} {:>10}",
+            "θ", "AD_schur", "FD_marginal", "schur/marg"
+        );
         for k in 0..n_theta {
             println!(
                 "{:<6} {:>14.6e} {:>14.6e} {:>10.4}",

@@ -3350,6 +3350,7 @@ pub(crate) mod test_helpers {
                     diffusion_var: Vec::new(),
                     init_fn: None,
                     solver_opts: crate::ode::OdeSolverOptions::default(),
+                    input_rate: Vec::new(),
                 })
             } else {
                 None

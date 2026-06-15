@@ -20,6 +20,20 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
+  input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
+  `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The
+  dose is delivered as this appearance rate into the depot (∫R_in dt = F·Dose) —
+  not also as a bolus — so a flexible, continuously-estimable absorption shape
+  takes one line instead of a hand-coded transit chain. Honors `F`/lagtime and
+  superposes over doses; works with IIV/IOV, resets, and time-varying covariates.
+  Unsupported combinations are rejected with a clear error rather than silently
+  mis-modeled: steady-state dosing into a transit compartment (`E_ABSORPTION_SS`),
+  an infusion (`RATE>0`) into a transit compartment (`E_ABSORPTION_RATE`, which
+  would double-count the dose), a `[diffusion]` block together with `transit()`
+  (`E_ABSORPTION_DIFFUSION`), and an out-of-domain `mtt`/`n` at typical values
+  (`E_ABSORPTION_DOMAIN`). New example `examples/transit_savic.ferx` and docs
+  page *Built-in Absorption Models* (#322).
 - Example `dose_rate.ferx` (+ `data/dose_rate.csv`) demonstrating the supported
   NONMEM `RATE` dosing forms — a bolus (`RATE=0`) and a constant-rate infusion
   (`RATE>0`) mixed in one dataset (#324).

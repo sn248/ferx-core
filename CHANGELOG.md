@@ -134,6 +134,10 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- A missing `DV` (`.`/`NA`/blank) on an `EVID=0` observation row without `MDV=1`
+  is no longer silently scored as `DV=0`. Such rows are now treated as `MDV=1`
+  (skipped) and a single `W_MISSING_DV` warning reports how many rows were
+  skipped, surfaced in fit warnings and `ferx check` (#258).
 - NONMEM coded `RATE` values (`-1` = modeled rate, `-2` = modeled duration) — and
   any other negative or non-finite `RATE` on a dose row — are now rejected with an
   informative error naming the subject and time, instead of being silently treated

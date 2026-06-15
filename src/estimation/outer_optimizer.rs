@@ -2321,7 +2321,8 @@ fn assemble_score_cross_product(
     // alternative `∂a/∂θ` "a-response" was tested and is NOT what NONMEM's S
     // carries (it holds the model sensitivities `a` fixed at the linearization).
     // FOCE (`!interaction`) uses the Sheiner–Beal gradient, which has no `log|H̃|`
-    // term, so the correction does not apply there.
+    // term — applying this Laplace-form `tᵢ` to FOCE was tested and over-corrects
+    // (warfarin FOCE RSR 1.3% → 9.8% vs NONMEM), so the correction is FOCEI-only.
     let scores: Vec<Vec<f64>> = (0..n_subj)
         .into_par_iter()
         .map(|i| {

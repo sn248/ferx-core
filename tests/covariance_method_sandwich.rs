@@ -67,6 +67,35 @@ fn all_ses(r: &ferx_core::FitResult) -> Vec<f64> {
     v
 }
 
+/// Fast (not slow-gated) cross-check that the FOCEI `rsr` covariance assembles
+/// and returns finite positive SEs. This is the Tier-2 guard that runs in the
+/// per-PR fast job — where the NONMEM-anchored convergence tests below are
+/// `#[ignore]`d — so it exercises the score cross-product's `log|H̃|`
+/// EBE-response path (#335) and `compute_covariance`'s OFV-Hessian R stencil on
+/// every PR. Accuracy vs NONMEM is asserted by the slow tests; this guards that
+/// the assembly runs and the EBE-response term stays finite. A modest
+/// `outer_maxiter` keeps it fast (the covariance step still runs at the final
+/// point regardless of convergence).
+#[test]
+fn covariance_rsr_assembles_finite_ses_fast() {
+    let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let mut opts = warfarin_focei_opts(CovarianceMethod::Sandwich);
+    opts.outer_maxiter = 60;
+    let r = fit(&model, &pop, &model.default_params, &opts).expect("FOCEI rsr fit must succeed");
+    assert_eq!(
+        r.covariance_status,
+        CovarianceStatus::Computed,
+        "rsr covariance must be Computed"
+    );
+    let ses = all_ses(&r);
+    assert!(
+        ses.iter().all(|s| s.is_finite() && *s > 0.0),
+        "all rsr SEs must be finite and positive, got {ses:?}"
+    );
+}
+
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),

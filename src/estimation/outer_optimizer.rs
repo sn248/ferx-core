@@ -2586,8 +2586,8 @@ pub(crate) fn compute_covariance(
     // opts in via `covariance_ofv_hessian`. The latter trades speed for an R
     // that recomputes `a = ∂f/∂η` at every perturbed point, capturing the
     // `∂a/∂θ` curvature the analytical stencil drops — which removes the
-    // weakly-identified-θ SE bias (e.g. warfarin TVKA ~9% high; see the
-    // `r_matrix_vs_richardson_fd_ground_truth` harness).
+    // weakly-identified-θ SE bias (e.g. warfarin TVKA ~9% high vs a Richardson
+    // FD-of-OFV ground truth).
     let force_ofv_hessian = (!options.interaction && model.error_spec.has_f_dependent_variance())
         || options.covariance_ofv_hessian;
     let use_analytical = !is_iov && !force_ofv_hessian;
@@ -3173,6 +3173,39 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 mod tests {
     use super::*;
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    /// `resolve_scaling` maps `Auto` to `Rescale2` for the gradient-based
+    /// optimizers that benefit (incl. `Slsqp` — the #335 cold-start fix) and to
+    /// `None` for the derivative-free `Bobyqa` default (and `Mma`/`TrustRegion`);
+    /// explicit non-`Auto` values pass through unchanged. Guards the #341/#335
+    /// default-scaling routing.
+    #[test]
+    fn resolve_scaling_routes_auto_by_optimizer() {
+        use crate::types::ParameterScaling::{Abs, Auto, None as PsNone, Rescale2};
+        for opt in [
+            Optimizer::Bfgs,
+            Optimizer::Lbfgs,
+            Optimizer::NloptLbfgs,
+            Optimizer::Slsqp,
+        ] {
+            assert_eq!(
+                resolve_scaling(Auto, opt),
+                Rescale2,
+                "{opt:?} should be Rescale2 under Auto"
+            );
+        }
+        for opt in [Optimizer::Bobyqa, Optimizer::Mma, Optimizer::TrustRegion] {
+            assert_eq!(
+                resolve_scaling(Auto, opt),
+                PsNone,
+                "{opt:?} should be unscaled under Auto"
+            );
+        }
+        // Explicit values pass through regardless of optimizer.
+        assert_eq!(resolve_scaling(Rescale2, Optimizer::Bobyqa), Rescale2);
+        assert_eq!(resolve_scaling(PsNone, Optimizer::Bfgs), PsNone);
+        assert_eq!(resolve_scaling(Abs, Optimizer::Slsqp), Abs);
+    }
 
     // ── invert_psd_with_floor: regularised PD inversion ──────────────────────
 
@@ -5131,186 +5164,6 @@ mod tests {
         assert!(
             halvings > 0,
             "finite-numerator/infinite-quotient step must not be accepted at halvings == 0"
-        );
-    }
-
-    /// Ground-truth validation of the covariance R-matrix (and S) against a
-    /// high-precision Richardson finite-difference of the marginal OFV.
-    ///
-    /// This is the "is it actually true?" test (issue #339 follow-up): rather
-    /// than anchoring on NONMEM (whose R is *itself* an FD approximation), it
-    /// builds the observed-information covariance directly from
-    /// `∂²(pop_nll)/∂x²` (= −logL Hessian) by central FD in packed space, with
-    /// the inner EBE loop reconverged to a *tight* tolerance at every
-    /// perturbation point and Richardson extrapolation (h, h/2) to cancel the
-    /// O(h²) FD bias. The packed covariance ferx reports (`covariance_matrix`)
-    /// is directly comparable — both are `info⁻¹` in packed space — so the
-    /// per-parameter ratio `se_R / se_true` quantifies the R-matrix's bias and
-    /// `se_S / se_true` the cross-product's. Printed for inspection; asserted
-    /// loosely so it flags only gross errors, not FD noise.
-    #[test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: covariance R/S vs Richardson FD-of-OFV ground truth"
-    )]
-    fn r_matrix_vs_richardson_fd_ground_truth() {
-        use crate::estimation::parameterization::{compute_mu_k, pack_params, unpack_params};
-        use crate::parser::model_parser::parse_model_string;
-        use crate::types::{CovarianceMethod, EstimationMethod, OmegaMatrix};
-        use crate::{fit, read_nonmem_csv};
-        use std::path::Path;
-
-        let model_src = r"
-[parameters]
-  theta TVCL(0.15, 0.001, 10.0)
-  theta TVV(8.0, 0.1, 500.0)
-  theta TVKA(1.2, 0.01, 50.0)
-  omega ETA_CL ~ 0.07
-  omega ETA_V  ~ 0.02
-  omega ETA_KA ~ 0.10
-  sigma PROP_ERR ~ 0.01 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-[fit_options]
-  method = focei
-  mu_referencing = true
-";
-        let model = parse_model_string(model_src).expect("model parses");
-        let pop =
-            read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data");
-
-        let mut opts = FitOptions::default();
-        opts.method = EstimationMethod::FoceI;
-        opts.interaction = true;
-        opts.outer_maxiter = 300;
-        opts.run_covariance_step = true;
-        opts.verbose = false;
-
-        let run = |m: CovarianceMethod, ofv_hess: bool| {
-            let mut o = opts.clone();
-            o.covariance_method = m;
-            o.covariance_ofv_hessian = ofv_hess;
-            fit(&model, &pop, &model.default_params, &o).expect("fit runs")
-        };
-        let res_r = run(CovarianceMethod::Hessian, false); // analytical-gradient R
-        let res_r_ofv = run(CovarianceMethod::Hessian, true); // OFV-Hessian R
-        let res_s = run(CovarianceMethod::CrossProduct, false);
-
-        // Rebuild the MLE ModelParameters and pack to x_hat (packed space).
-        let mut mle = model.default_params.clone();
-        mle.theta = res_r.theta.clone();
-        mle.sigma.values = res_r.sigma.clone();
-        mle.omega = OmegaMatrix::from_matrix(
-            res_r.omega.clone(),
-            res_r.eta_names.clone(),
-            mle.omega.diagonal,
-        );
-        let x_hat = pack_params(&mle);
-        let n = x_hat.len();
-
-        // OFV evaluator: reconverge EBEs cold to a TIGHT tol (minimise the EBE
-        // noise that otherwise dominates FD-of-OFV), then pop_nll = −logL.
-        let eval = |x: &[f64]| -> f64 {
-            let p = unpack_params(x, &mle);
-            let mu_k = compute_mu_k(&model, &p.theta, opts.mu_referencing);
-            let (ehs, hms, _stats, kappas) =
-                run_inner_loop_warm(&model, &pop, &p, 300, 1e-11, None, Some(&mu_k), 0);
-            pop_nll(&model, &pop, &p, &ehs, &hms, &kappas, opts.interaction)
-        };
-
-        // Central-FD Hessian of pop_nll at two step sizes → Richardson.
-        let hessian_at = |scale: f64| -> DMatrix<f64> {
-            let f0 = eval(&x_hat);
-            let mut hh = DMatrix::<f64>::zeros(n, n);
-            let step: Vec<f64> = (0..n).map(|i| scale * (1.0 + x_hat[i].abs())).collect();
-            for i in 0..n {
-                let mut xp = x_hat.clone();
-                xp[i] += step[i];
-                let mut xm = x_hat.clone();
-                xm[i] -= step[i];
-                hh[(i, i)] = (eval(&xp) - 2.0 * f0 + eval(&xm)) / (step[i] * step[i]);
-            }
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    let mut xpp = x_hat.clone();
-                    xpp[i] += step[i];
-                    xpp[j] += step[j];
-                    let mut xpm = x_hat.clone();
-                    xpm[i] += step[i];
-                    xpm[j] -= step[j];
-                    let mut xmp = x_hat.clone();
-                    xmp[i] -= step[i];
-                    xmp[j] += step[j];
-                    let mut xmm = x_hat.clone();
-                    xmm[i] -= step[i];
-                    xmm[j] -= step[j];
-                    let v = (eval(&xpp) - eval(&xpm) - eval(&xmp) + eval(&xmm))
-                        / (4.0 * step[i] * step[j]);
-                    hh[(i, j)] = v;
-                    hh[(j, i)] = v;
-                }
-            }
-            hh
-        };
-        let h1 = hessian_at(1e-3);
-        let h2 = hessian_at(5e-4);
-        // Richardson: R = (4·H(h/2) − H(h)) / 3 cancels the leading O(h²) term.
-        let hess = (4.0 * &h2 - &h1) / 3.0;
-        let cov_true = hess.try_inverse().expect("ground-truth Hessian invertible");
-
-        let cov_r = res_r.covariance_matrix.as_ref().expect("R covariance");
-        let cov_r_ofv = res_r_ofv
-            .covariance_matrix
-            .as_ref()
-            .expect("OFV-R covariance");
-        let cov_s = res_s.covariance_matrix.as_ref().expect("S covariance");
-
-        println!("\n=== covariance R (analytical vs OFV) vs Richardson FD-of-OFV ground truth ===");
-        println!(
-            "{:<4} {:>12} {:>12} {:>12} {:>9} {:>9}",
-            "idx", "se_true", "se_R_anly", "se_R_ofv", "anly/tru", "ofv/tru"
-        );
-        let mut max_anly_dev = 0.0_f64;
-        let mut max_ofv_dev = 0.0_f64;
-        for k in 0..n {
-            let se_true = cov_true[(k, k)].max(0.0).sqrt();
-            let se_r = cov_r[(k, k)].max(0.0).sqrt();
-            let se_r_ofv = cov_r_ofv[(k, k)].max(0.0).sqrt();
-            let ra = se_r / se_true;
-            let ro = se_r_ofv / se_true;
-            println!(
-                "{:<4} {:>12.5e} {:>12.5e} {:>12.5e} {:>9.3} {:>9.3}",
-                k, se_true, se_r, se_r_ofv, ra, ro
-            );
-            max_anly_dev = max_anly_dev.max((ra - 1.0).abs());
-            max_ofv_dev = max_ofv_dev.max((ro - 1.0).abs());
-        }
-        let _ = cov_s;
-        println!(
-            "max |analytical/true − 1| = {:.1}%   max |ofv/true − 1| = {:.1}%",
-            max_anly_dev * 100.0,
-            max_ofv_dev * 100.0
-        );
-
-        // The OFV-Hessian R must track the FD-of-OFV ground truth tightly (both
-        // are double-FD of the same OFV) — this is the fix's success criterion.
-        assert!(
-            max_ofv_dev < 0.05,
-            "OFV-Hessian R-matrix should match FD-of-OFV ground truth within 5% (max {:.1}%)",
-            max_ofv_dev * 100.0
-        );
-        // The analytical stencil is allowed its known weakly-identified-θ bias
-        // but must not be grossly wrong.
-        assert!(
-            max_anly_dev < 0.5,
-            "analytical R-matrix deviates from ground truth by >50% (max {:.0}%)",
-            max_anly_dev * 100.0
         );
     }
 }

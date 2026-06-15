@@ -10617,6 +10617,29 @@ mod tests {
         assert!(parse_fit_options(&["covariance_method = bhhh".to_string()]).is_err());
     }
 
+    #[test]
+    fn test_parse_parameter_scaling_and_ofv_hessian() {
+        use crate::types::ParameterScaling;
+        // Defaults: parameter_scaling = Auto, covariance_ofv_hessian = true.
+        let def = parse_fit_options(&[]).unwrap();
+        assert_eq!(def.parameter_scaling, ParameterScaling::Auto);
+        assert!(def.covariance_ofv_hessian);
+        // parameter_scaling keywords, case-insensitive.
+        for (input, expected) in [
+            ("auto", ParameterScaling::Auto),
+            ("none", ParameterScaling::None),
+            ("ABS", ParameterScaling::Abs),
+            ("rescale2", ParameterScaling::Rescale2),
+        ] {
+            let opts = parse_fit_options(&[format!("parameter_scaling = {input}")]).unwrap();
+            assert_eq!(opts.parameter_scaling, expected, "input `{input}`");
+        }
+        assert!(parse_fit_options(&["parameter_scaling = bogus".to_string()]).is_err());
+        // covariance_ofv_hessian bool.
+        let off = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap();
+        assert!(!off.covariance_ofv_hessian);
+    }
+
     // ── mu-referencing pattern detection ─────────────────────────────────
 
     fn detect_one(line: &str, theta_names: &[&str], eta_names: &[&str]) -> Option<MuRef> {

@@ -221,8 +221,9 @@ read from the `.phi` file — `PHI(k) − log θ_k` is the η conditional mean,
 | conditional mean | 1.0000 | 0.0018 | 0.0006 |
 | conditional SD   | 0.9964 | 0.0015 | 0.0005 |
 
-(ferx `conddist_nsamp = 2000`. Comparison scripts: `bench_saemix_conddist.R`,
-`parse_nm_conddist.R`.)
+(ferx `conddist_nsamp = 2000`. Comparison scripts:
+`tests/reference/saem_conddist/bench_saemix_conddist.R`,
+`tests/reference/saem_conddist/parse_nm_conddist.R`.)
 
 ## Inter-Occasion Variability (IOV)
 

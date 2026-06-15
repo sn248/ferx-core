@@ -115,21 +115,27 @@ fn main() {
             }
 
             // SAEM conditional-distribution outputs (only when the pass ran).
-            if fit_result.cond_dist.is_some() {
+            if let Some(cd) = &fit_result.cond_dist {
                 let cd_path = format!("{}-conddist.csv", model_name);
                 match ferx_core::io::output::write_conddist_csv(&fit_result, &cd_path) {
                     Ok(()) => eprintln!("Conditional distribution written to {}", cd_path),
                     Err(e) => eprintln!("Warning: failed to write conddist: {}", e),
                 }
-                // Raw draws, only if the user asked to retain them.
-                let samples_path = format!("{}-conddist-samples.csv", model_name);
-                match ferx_core::io::output::write_conddist_samples_csv(&fit_result, &samples_path)
-                {
-                    Ok(()) => {
-                        eprintln!("Conditional-distribution draws written to {}", samples_path)
+                // Raw draws — only write when samples were retained; skip quietly otherwise.
+                if !cd.samples.iter().all(|s| s.is_empty()) {
+                    let samples_path = format!("{}-conddist-samples.csv", model_name);
+                    match ferx_core::io::output::write_conddist_samples_csv(
+                        &fit_result,
+                        &samples_path,
+                    ) {
+                        Ok(()) => {
+                            eprintln!(
+                                "Conditional-distribution draws written to {}",
+                                samples_path
+                            )
+                        }
+                        Err(e) => eprintln!("Warning: failed to write conddist draws: {}", e),
                     }
-                    // Not retaining samples is the default — stay quiet about it.
-                    Err(_) => {}
                 }
             }
 

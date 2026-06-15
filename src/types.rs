@@ -3763,7 +3763,7 @@ impl Default for FitOptions {
             saem_omega_burnin: 20,
             saem_seed: None,
             saem_conddist: false,
-            saem_conddist_nsamp: 50,
+            saem_conddist_nsamp: 200,
             saem_conddist_burnin: 20,
             saem_conddist_keep_samples: false,
             saem_n_leapfrog: 0,

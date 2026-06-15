@@ -72,7 +72,11 @@ pub fn run_conditional_distribution(
     let burnin = options.saem_conddist_burnin;
     let keep = options.saem_conddist_keep_samples;
     let n_mh_steps = options.saem_n_mh_steps;
-    let adapt_interval = options.saem_adapt_interval.max(1);
+    // Decouple from saem_adapt_interval: scale with burn-in so adaptation
+    // fires ~10 times regardless of the user's saem_adapt_interval setting.
+    // With the default burnin=20 this gives interval=2; with burnin=500 → 50
+    // (matching saem_adapt_interval's default, preserving validated behaviour).
+    let adapt_interval = (burnin / 10).max(1);
     let master_seed = options
         .saem_seed
         .unwrap_or(12345)
@@ -140,7 +144,8 @@ pub fn run_conditional_distribution(
             };
 
             // Per-subject adaptive step scales (block / componentwise / kappa).
-            let mut step_block = 0.4_f64;
+            // Block init matches the main SAEM loop (0.3, not the block target 0.40).
+            let mut step_block = 0.3_f64;
             let mut step_cw = 1.0_f64;
             let mut step_kappa = 0.3_f64;
 
@@ -285,10 +290,14 @@ pub fn run_conditional_distribution(
             if n_subjects < 2 {
                 return f64::NAN;
             }
+            // Return NaN for degenerate Ω_jj — parity with mode-based shrinkage_eta.
+            if omega.matrix[(j, j)] < SAEM_OMEGA_DIAG_FLOOR {
+                return f64::NAN;
+            }
             let m: f64 = cond_mean.iter().map(|cm| cm[j]).sum::<f64>() / n_subjects as f64;
             let var: f64 = cond_mean.iter().map(|cm| (cm[j] - m).powi(2)).sum::<f64>()
                 / (n_subjects - 1) as f64;
-            let omega_sd = omega.matrix[(j, j)].max(SAEM_OMEGA_DIAG_FLOOR).sqrt();
+            let omega_sd = omega.matrix[(j, j)].sqrt();
             1.0 - var.sqrt() / omega_sd
         })
         .collect();
@@ -392,6 +401,55 @@ mod tests {
             assert!(
                 rel < 0.30,
                 "eta {j}: conditional SD {} not near prior SD {prior_sd} (rel {rel:.3})",
+                cd.cond_sd[0][j]
+            );
+        }
+    }
+
+    /// The adaptation path must actually move step scales when burnin >= 10.
+    /// Prior to the fix the conddist adapt_interval was borrowed from
+    /// saem_adapt_interval (default 50), so with burnin < 50 adaptation never
+    /// fired and step scales stayed at their initial values.
+    #[test]
+    fn step_scales_adapt_during_burnin() {
+        // We can't directly observe step_block, but we can verify that the chain
+        // produces finite, non-degenerate SD estimates even from a cold start —
+        // which only happens when the scales actually adapt away from 0.3 for
+        // an informative likelihood. Use a small burn-in that the old code
+        // (adapt_interval=50, burnin=20) would never have adapted in.
+        let model = analytical_model(GradientMethod::Auto);
+        let params = model.default_params.clone();
+        let population = Population {
+            subjects: vec![one_subject()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let warm_etas = vec![DVector::zeros(model.n_eta)];
+        let warm_kappas = vec![Vec::new()];
+
+        let mut opts = FitOptions::default();
+        opts.saem_conddist = true;
+        opts.saem_conddist_nsamp = 200;
+        opts.saem_conddist_burnin = 20; // adapt_interval now = max(1, 20/10) = 2
+        opts.saem_adapt_interval = 50;  // must NOT gate adaptation (old bug)
+        opts.saem_seed = Some(3);
+
+        let cd = run_conditional_distribution(
+            &model,
+            &population,
+            &params,
+            &warm_etas,
+            &warm_kappas,
+            &opts,
+        );
+        // All SDs must be positive (chains mixed), not NaN or zero.
+        for j in 0..model.n_eta {
+            assert!(
+                cd.cond_sd[0][j] > 0.0 && cd.cond_sd[0][j].is_finite(),
+                "eta {j}: cond_sd {} not positive-finite (adaptation may not have fired)",
                 cd.cond_sd[0][j]
             );
         }

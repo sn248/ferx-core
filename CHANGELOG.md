@@ -167,6 +167,11 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- The covariance-family fit options `covariance_method`, `covariance_fallback`,
+  and `covariance_ofv_hessian` no longer emit a spurious "is not used by method
+  `<method>` and will be ignored" warning. They are framework-wide covariance-step
+  options (honoured for every estimator) but were missing from the warning's
+  allowlist; the options were always applied — only the warning was wrong.
 - A missing `DV` (`.`/`NA`/blank) on an `EVID=0` observation row without `MDV=1`
   is no longer silently scored as `DV=0`. Such rows are now treated as `MDV=1`
   (skipped) and a single `W_MISSING_DV` warning reports how many rows were

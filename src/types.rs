@@ -3154,6 +3154,9 @@ impl FitOptions {
 pub fn framework_keys() -> &'static [&'static str] {
     &[
         "covariance",
+        "covariance_method",
+        "covariance_fallback",
+        "covariance_ofv_hessian",
         "fd_hessian_step",
         "verbose",
         "sir",

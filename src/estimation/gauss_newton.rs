@@ -1118,10 +1118,8 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
         "subject_nll_pop_grad_analytical_laplace called with options.interaction=false; \
          use subject_nll_pop_grad_analytical for the Sheiner–Beal gradient"
     );
-    // `options` is accepted for signature symmetry with the SB path and to
-    // future-proof against new `FitOptions` fields that influence the Laplace
-    // NLL (e.g. a regulariser, a robust-variance toggle). The current
-    // implementation only reads `options.interaction` via the assert above.
+    // `options` drives the `interaction` assert above and the `mu_referencing`
+    // shortcut in the θ loop.
     let _ = options;
 
     let n = x.len();
@@ -1250,24 +1248,39 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
                 continue;
             }
         }
-        // FD fallback for non-mu-referenced thetas.
+        // FD fallback for non-mu-referenced thetas (e.g. covariate coefficients).
+        // Central difference: more accurate than one-sided forward FD, at the cost
+        // of a second prediction call. Both perturbations are clamped to bounds
+        // and the actual span is used as the denominator (degrades gracefully to
+        // one-sided at a boundary).
         let h = eps * (1.0 + x[k].abs());
         let xk_plus = (x[k] + h).min(bounds.upper[k]);
-        let actual_h = xk_plus - x[k];
+        let xk_minus = (x[k] - h).max(bounds.lower[k]);
+        let actual_h = xk_plus - xk_minus;
         if actual_h.abs() < 1e-16 {
             continue;
         }
         let mut x_pert = x.to_vec();
         x_pert[k] = xk_plus;
-        let params_pert = unpack_params(&x_pert, template);
-        let ipreds_pert =
-            pk::compute_predictions_with_tv(model, subject, &params_pert.theta, eta_hat.as_slice());
-        if ipreds_pert.iter().any(|v| !v.is_finite()) {
+        let ipreds_plus = pk::compute_predictions_with_tv(
+            model,
+            subject,
+            &unpack_params(&x_pert, template).theta,
+            eta_hat.as_slice(),
+        );
+        x_pert[k] = xk_minus;
+        let ipreds_minus = pk::compute_predictions_with_tv(
+            model,
+            subject,
+            &unpack_params(&x_pert, template).theta,
+            eta_hat.as_slice(),
+        );
+        if ipreds_plus.iter().chain(ipreds_minus.iter()).any(|v| !v.is_finite()) {
             return None;
         }
         let s: f64 = (0..n_obs)
             .map(|j| {
-                let df_j = (ipreds_pert[j] - ipreds[j]) / actual_h;
+                let df_j = (ipreds_plus[j] - ipreds_minus[j]) / actual_h;
                 theta_per_j[j] * df_j
             })
             .sum();
@@ -1515,6 +1528,14 @@ pub(crate) fn subject_eta_response_correction(
     // can only reach the result through a mapped `u[jp]`, which the final
     // finiteness check below catches (returning `None` so the subject contributes
     // 0) — no separate intermediate guard needed.
+    //
+    // NB: the EXACT form is `t_i[k] = −½ gη[j']` (under mu-referencing the IFT
+    // collapses to `dη̂/dθ_k = −e_{j'}`; validated by the forward-over-reverse
+    // 2nd-order AD terms). It was tried and is net-negative: it hurt slsqp badly
+    // (−1175/−1163 on two_cpt_oral_cov) and only marginally helped bfgs, because
+    // the `gη = ∂log|H̃|/∂η` factor it multiplies is itself a-fixed (exact needs
+    // 3rd-order). The `G·H̃⁻¹` factor here inadvertently balances the two
+    // approximations, so it is kept. See #335.
     let u = &c.hrh * (&c.htilde_inv * &g_eta);
     let fixed_mask = packed_fixed_mask(template);
     let mut t = vec![0.0f64; n];

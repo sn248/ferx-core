@@ -3253,6 +3253,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.fd_hessian_step = v;
         }
+        "covariance_ofv_hessian" => {
+            opts.covariance_ofv_hessian = parse_bool("covariance_ofv_hessian")?
+        }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -3429,6 +3432,20 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.reconverge_gradient_interval = parse_usize("reconverge_gradient_interval")?
         }
         "scale_params" => opts.scale_params = parse_bool("scale_params")?,
+        "parameter_scaling" => {
+            opts.parameter_scaling = match value.to_lowercase().as_str() {
+                "auto" => ParameterScaling::Auto,
+                "none" | "off" => ParameterScaling::None,
+                "abs" => ParameterScaling::Abs,
+                "rescale2" => ParameterScaling::Rescale2,
+                other => {
+                    return Err(format!(
+                        "fit option `parameter_scaling`: unknown value `{other}` — \
+                         expected auto/none/abs/rescale2"
+                    ));
+                }
+            };
+        }
         "max_unconverged_frac" => opts.max_unconverged_frac = parse_f64("max_unconverged_frac")?,
         "min_obs_for_convergence_check" => {
             opts.min_obs_for_convergence_check =

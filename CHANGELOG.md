@@ -31,6 +31,25 @@ section of the SDLC for the versioning policy).
   (the FOCE objective amplifies the ~`1e-4` solver error); a tighter
   `ode_reltol` now lets the two forms agree. Carried on `OdeSpec::solver_opts`
   and applied via `CompiledModel::sync_ode_solver_opts` (#127).
+- `parameter_scaling` fit option (`none` / `abs` / `rescale2`): parameter
+  scaling for the outer optimizer. `rescale2` is the nlmixr2-style
+  bound-half-width normalisation (maps each packed parameter toward `(−1, 1)`)
+  and substantially improves cold-start convergence for gradient-based
+  optimizers on ill-conditioned multi-parameter surfaces — e.g. `bfgs` reaches
+  OFV −1198.97 on `two_cpt_oral_cov` (≈ nlmixr2's −1199.24) where the unscaled
+  optimizer stalls near −1192. The default `auto` applies `rescale2` to the
+  gradient-based optimizers (`bfgs`/`lbfgs`/`nlopt_lbfgs`/`slsqp`) and leaves the
+  derivative-free `bobyqa` unscaled (where `rescale2` distorts its trust region)
+  (#341).
+- `covariance_ofv_hessian` fit option: build the covariance R-matrix from second
+  differences of the reconverged marginal OFV instead of a central difference of
+  the analytical population gradient. The analytical stencil holds the H-matrix
+  `a = ∂f/∂η` fixed in the `log|H̃|` θ-gradient, biasing the SE of
+  weakly-identified structural parameters (e.g. warfarin TVKA reads ~9% high
+  versus a Richardson FD-of-OFV ground truth); the OFV-Hessian stencil recomputes
+  `a` at every perturbed point and matches the ground truth to <1%, at ≈ the same
+  wall-clock cost (both stencils parallelise over perturbation points). Default
+  `true`; set `false` to force the faster analytical-gradient stencil (#335).
 - Propensity-score-matched simulation: `simulate_with_options()` with a new
   `SimulateOptions { seed, propensity_match }`. When `propensity_match` is set,
   each replicate's drawn etas are reassigned to subjects by optimal Mahalanobis
@@ -144,6 +163,19 @@ section of the SDLC for the versioning policy).
   as an IV bolus (which produced wrong predictions with no warning). Modeled
   rate/duration support is not yet implemented; convert such rows to an explicit
   positive `RATE` (= `AMT`/duration) before importing (#324).
+- Cold-start FOCEI/SLSQP on IOV models now reaches the marginal minimum instead
+  of stalling: under the default `parameter_scaling = auto`, `slsqp` now gets the
+  `rescale2` bound-half-width scaling, so pure FOCEI/SLSQP on `warfarin_iov`
+  converges to OFV 307.84 (ω_iov ≈ 0.046) from the cold default start rather than
+  stalling at 343.5 with ω_iov pinned at its init (#335).
+- FOCEI covariance score cross-product (`covariance_method = s` / `rsr`) now
+  carries the `log|H̃|` EBE-response term (`½·∂log|H̃|/∂η̂·dη̂/dθ`, the #274 `tᵢ`):
+  the per-subject score is differenced with the conditional estimate η̂ responding
+  to the parameters, matching how NONMEM forms its S matrix. Previously the score
+  held η̂ fixed (the R-matrix already captured this term via reconvergence, but S
+  did not), so the RSR sandwich SEs were biased on weakly-identified structural
+  parameters — warfarin SE(TVKA) ~5% out. With the term, FOCEI RSR matches NONMEM
+  7.5.1 to <1.8% on every parameter (#335).
 - A `[structural_model]` PK parameter that references a name not defined in
   `[individual_parameters]` (e.g. `pk one_cpt_oral(cl=CL, ...)` with no `CL`)
   is now a parse error instead of being silently dropped and defaulting the

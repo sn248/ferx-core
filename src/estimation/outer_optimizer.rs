@@ -496,6 +496,49 @@ fn run_global_presearch(
     }
 }
 
+/// nlmixr2-style `rescale2` preconditioner: scale each packed param by its
+/// bounds half-range `(hi−lo)/2`, so every coordinate spans ~2 units in scaled
+/// space (the optimizer sees comparable per-parameter search ranges → similar
+/// gradient/step magnitudes). This is value/bounds-based normalization (what
+/// nlmixr2's `normType="rescale2"` does), not curvature-based — it worked where
+/// the BHHH-diagonal preconditioner did not. Fixed params (lo==hi) and
+/// degenerate ranges fall back to 1.0. Selected by
+/// `parameter_scaling = rescale2` (see [`ParameterScaling::Rescale2`]).
+fn compute_rescale2_scale(bounds: &PackedBounds) -> Vec<f64> {
+    (0..bounds.lower.len())
+        .map(|k| {
+            let hw = (bounds.upper[k] - bounds.lower[k]).abs() * 0.5;
+            if hw.is_finite() && hw > 1e-6 {
+                hw
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
+/// Resolve [`ParameterScaling::Auto`] to a concrete strategy. `Auto` applies
+/// `Rescale2` to the gradient-based optimizers that benefit (`Bfgs`, `Lbfgs`,
+/// `NloptLbfgs`, `Slsqp`) and `None` otherwise — critically, the derivative-free
+/// default `Bobyqa` is left unscaled because `Rescale2` distorts its trust-region
+/// quadratic model and regresses multi-cpt / PD fits (e.g. emax_pkpd −36.8→−13.5,
+/// three_cpt_iv −730.6→−715.9). `Slsqp` is included because the bound-half-width
+/// rescaling fixes its cold-start convergence — e.g. pure FOCEI/SLSQP on
+/// warfarin_iov reaches OFV 307.84 from the cold default start instead of
+/// stalling at 343.5 (#335). `Mma`/`TrustRegion` are left to the unscaled (legacy
+/// `scale_params` / IOV-auto) branch. Non-`Auto` values pass through unchanged.
+fn resolve_scaling(ps: ParameterScaling, opt: Optimizer) -> ParameterScaling {
+    match ps {
+        ParameterScaling::Auto => match opt {
+            Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::NloptLbfgs | Optimizer::Slsqp => {
+                ParameterScaling::Rescale2
+            }
+            _ => ParameterScaling::None,
+        },
+        other => other,
+    }
+}
+
 fn optimize_nlopt(
     model: &CompiledModel,
     population: &Population,
@@ -544,10 +587,17 @@ fn optimize_nlopt(
     // intentional. This auto-enable now only fires for an explicit
     // `optimizer = slsqp` on IOV models (the path it was originally written for).
     let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
-    let scale: Vec<f64> = if (options.scale_params || auto_scale_iov) && !has_identity_theta {
-        compute_scale(&x0)
-    } else {
-        vec![1.0; n]
+    let scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
+        ParameterScaling::Rescale2 => compute_rescale2_scale(&bounds),
+        ParameterScaling::Abs => compute_scale(&x0),
+        // `Auto` is resolved away by `resolve_scaling`; group with `None`.
+        ParameterScaling::None | ParameterScaling::Auto => {
+            if (options.scale_params || auto_scale_iov) && !has_identity_theta {
+                compute_scale(&x0)
+            } else {
+                vec![1.0; n]
+            }
+        }
     };
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
@@ -1386,10 +1436,16 @@ fn optimize_bfgs(
     };
 
     // Per-element scale factors for the BFGS outer loop.
-    let scale: Vec<f64> = if options.scale_params {
-        compute_scale(&x)
-    } else {
-        vec![1.0; n]
+    let scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
+        ParameterScaling::Rescale2 => compute_rescale2_scale(&bounds),
+        ParameterScaling::Abs => compute_scale(&x),
+        ParameterScaling::None | ParameterScaling::Auto => {
+            if options.scale_params {
+                compute_scale(&x)
+            } else {
+                vec![1.0; n]
+            }
+        }
     };
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
@@ -2253,6 +2309,19 @@ fn assemble_score_cross_product(
     let n_subj = population.subjects.len();
 
     // Per-subject scores in parallel (mirrors `build_gn_system`).
+    //
+    // The score cross-product evaluates the per-subject gradient directly at x̂.
+    // Unlike the FD-built R-matrix — which reconverges η̂ at every perturbed point
+    // and so captures the `log|H̃|` EBE-response `½·∂log|H̃|/∂η̂·dη̂/dθ` — the raw
+    // analytic gradient holds η̂ fixed and drops it. Add it back here (the #274
+    // `tᵢ` term, in −logL units; `point_grad` adds `2·tᵢ` to the −2logL gradient)
+    // so the score matches how NONMEM differences the individual objective with
+    // its conditional estimate responding to θ. This is what makes the FOCEI
+    // S/RSR match NONMEM (warfarin RSR ≈ 1.8% with it, ≈ 5% without); the
+    // alternative `∂a/∂θ` "a-response" was tested and is NOT what NONMEM's S
+    // carries (it holds the model sensitivities `a` fixed at the linearization).
+    // FOCE (`!interaction`) uses the Sheiner–Beal gradient, which has no `log|H̃|`
+    // term, so the correction does not apply there.
     let scores: Vec<Vec<f64>> = (0..n_subj)
         .into_par_iter()
         .map(|i| {
@@ -2261,7 +2330,7 @@ fn assemble_score_cross_product(
             } else {
                 &[]
             };
-            let (_, gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
+            let (_, mut gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
                 x_hat,
                 template,
                 model,
@@ -2273,6 +2342,24 @@ fn assemble_score_cross_product(
                 bounds,
                 options,
             );
+            if options.interaction {
+                if let Some(ti) = crate::estimation::gauss_newton::subject_eta_response_correction(
+                    None,
+                    x_hat,
+                    template,
+                    model,
+                    population,
+                    i,
+                    &eta_hats[i],
+                    &h_matrices[i],
+                    bounds,
+                    options,
+                ) {
+                    for (g, t) in gi.iter_mut().zip(ti.iter()) {
+                        *g += *t;
+                    }
+                }
+            }
             gi
         })
         .collect();
@@ -2494,7 +2581,16 @@ pub(crate) fn compute_covariance(
     // for FOCEI, #274), so its central-FD Hessian comes out indefinite on the
     // f-dependent FOCE surface. Additive FOCE keeps the cheap analytical path
     // (the Δ vanishes for f-independent variance, and it already matches NONMEM).
-    let force_ofv_hessian = !options.interaction && model.error_spec.has_f_dependent_variance();
+    // Route through the OFV second-difference Hessian when: (a) f-dependent FOCE
+    // (the analytical SB gradient comes out indefinite there), or (b) the user
+    // opts in via `covariance_ofv_hessian`. The latter trades speed for an R
+    // that recomputes `a = ∂f/∂η` at every perturbed point, capturing the
+    // `∂a/∂θ` curvature the analytical stencil drops — which removes the
+    // weakly-identified-θ SE bias (e.g. warfarin TVKA ~9% high; see the
+    // `r_matrix_vs_richardson_fd_ground_truth` harness).
+    let force_ofv_hessian = (!options.interaction
+        && model.error_spec.has_f_dependent_variance())
+        || options.covariance_ofv_hessian;
     let use_analytical = !is_iov && !force_ofv_hessian;
 
     // Track FD failures at source so diagnostics name the right cause (a NaN/Inf
@@ -5037,5 +5133,327 @@ mod tests {
             halvings > 0,
             "finite-numerator/infinite-quotient step must not be accepted at halvings == 0"
         );
+    }
+
+    /// Ground-truth validation of the covariance R-matrix (and S) against a
+    /// high-precision Richardson finite-difference of the marginal OFV.
+    ///
+    /// This is the "is it actually true?" test (issue #339 follow-up): rather
+    /// than anchoring on NONMEM (whose R is *itself* an FD approximation), it
+    /// builds the observed-information covariance directly from
+    /// `∂²(pop_nll)/∂x²` (= −logL Hessian) by central FD in packed space, with
+    /// the inner EBE loop reconverged to a *tight* tolerance at every
+    /// perturbation point and Richardson extrapolation (h, h/2) to cancel the
+    /// O(h²) FD bias. The packed covariance ferx reports (`covariance_matrix`)
+    /// is directly comparable — both are `info⁻¹` in packed space — so the
+    /// per-parameter ratio `se_R / se_true` quantifies the R-matrix's bias and
+    /// `se_S / se_true` the cross-product's. Printed for inspection; asserted
+    /// loosely so it flags only gross errors, not FD noise.
+    #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: covariance R/S vs Richardson FD-of-OFV ground truth"
+    )]
+    fn r_matrix_vs_richardson_fd_ground_truth() {
+        use crate::estimation::parameterization::{compute_mu_k, pack_params, unpack_params};
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{CovarianceMethod, EstimationMethod, OmegaMatrix};
+        use crate::{fit, read_nonmem_csv};
+        use std::path::Path;
+
+        let model_src = r"
+[parameters]
+  theta TVCL(0.15, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.2, 0.01, 50.0)
+  omega ETA_CL ~ 0.07
+  omega ETA_V  ~ 0.02
+  omega ETA_KA ~ 0.10
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  mu_referencing = true
+";
+        let model = parse_model_string(model_src).expect("model parses");
+        let pop =
+            read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data");
+
+        let mut opts = FitOptions::default();
+        opts.method = EstimationMethod::FoceI;
+        opts.interaction = true;
+        opts.outer_maxiter = 300;
+        opts.run_covariance_step = true;
+        opts.verbose = false;
+
+        let run = |m: CovarianceMethod, ofv_hess: bool| {
+            let mut o = opts.clone();
+            o.covariance_method = m;
+            o.covariance_ofv_hessian = ofv_hess;
+            fit(&model, &pop, &model.default_params, &o).expect("fit runs")
+        };
+        let res_r = run(CovarianceMethod::Hessian, false); // analytical-gradient R
+        let res_r_ofv = run(CovarianceMethod::Hessian, true); // OFV-Hessian R
+        let res_s = run(CovarianceMethod::CrossProduct, false);
+
+        // Rebuild the MLE ModelParameters and pack to x_hat (packed space).
+        let mut mle = model.default_params.clone();
+        mle.theta = res_r.theta.clone();
+        mle.sigma.values = res_r.sigma.clone();
+        mle.omega = OmegaMatrix::from_matrix(
+            res_r.omega.clone(),
+            res_r.eta_names.clone(),
+            mle.omega.diagonal,
+        );
+        let x_hat = pack_params(&mle);
+        let n = x_hat.len();
+
+        // OFV evaluator: reconverge EBEs cold to a TIGHT tol (minimise the EBE
+        // noise that otherwise dominates FD-of-OFV), then pop_nll = −logL.
+        let eval = |x: &[f64]| -> f64 {
+            let p = unpack_params(x, &mle);
+            let mu_k = compute_mu_k(&model, &p.theta, opts.mu_referencing);
+            let (ehs, hms, _stats, kappas) =
+                run_inner_loop_warm(&model, &pop, &p, 300, 1e-11, None, Some(&mu_k), 0);
+            pop_nll(&model, &pop, &p, &ehs, &hms, &kappas, opts.interaction)
+        };
+
+        // Central-FD Hessian of pop_nll at two step sizes → Richardson.
+        let hessian_at = |scale: f64| -> DMatrix<f64> {
+            let f0 = eval(&x_hat);
+            let mut hh = DMatrix::<f64>::zeros(n, n);
+            let step: Vec<f64> = (0..n).map(|i| scale * (1.0 + x_hat[i].abs())).collect();
+            for i in 0..n {
+                let mut xp = x_hat.clone();
+                xp[i] += step[i];
+                let mut xm = x_hat.clone();
+                xm[i] -= step[i];
+                hh[(i, i)] = (eval(&xp) - 2.0 * f0 + eval(&xm)) / (step[i] * step[i]);
+            }
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let mut xpp = x_hat.clone();
+                    xpp[i] += step[i];
+                    xpp[j] += step[j];
+                    let mut xpm = x_hat.clone();
+                    xpm[i] += step[i];
+                    xpm[j] -= step[j];
+                    let mut xmp = x_hat.clone();
+                    xmp[i] -= step[i];
+                    xmp[j] += step[j];
+                    let mut xmm = x_hat.clone();
+                    xmm[i] -= step[i];
+                    xmm[j] -= step[j];
+                    let v = (eval(&xpp) - eval(&xpm) - eval(&xmp) + eval(&xmm))
+                        / (4.0 * step[i] * step[j]);
+                    hh[(i, j)] = v;
+                    hh[(j, i)] = v;
+                }
+            }
+            hh
+        };
+        let h1 = hessian_at(1e-3);
+        let h2 = hessian_at(5e-4);
+        // Richardson: R = (4·H(h/2) − H(h)) / 3 cancels the leading O(h²) term.
+        let hess = (4.0 * &h2 - &h1) / 3.0;
+        let cov_true = hess.try_inverse().expect("ground-truth Hessian invertible");
+
+        let cov_r = res_r.covariance_matrix.as_ref().expect("R covariance");
+        let cov_r_ofv = res_r_ofv.covariance_matrix.as_ref().expect("OFV-R covariance");
+        let cov_s = res_s.covariance_matrix.as_ref().expect("S covariance");
+
+        println!("\n=== covariance R (analytical vs OFV) vs Richardson FD-of-OFV ground truth ===");
+        println!(
+            "{:<4} {:>12} {:>12} {:>12} {:>9} {:>9}",
+            "idx", "se_true", "se_R_anly", "se_R_ofv", "anly/tru", "ofv/tru"
+        );
+        let mut max_anly_dev = 0.0_f64;
+        let mut max_ofv_dev = 0.0_f64;
+        for k in 0..n {
+            let se_true = cov_true[(k, k)].max(0.0).sqrt();
+            let se_r = cov_r[(k, k)].max(0.0).sqrt();
+            let se_r_ofv = cov_r_ofv[(k, k)].max(0.0).sqrt();
+            let ra = se_r / se_true;
+            let ro = se_r_ofv / se_true;
+            println!(
+                "{:<4} {:>12.5e} {:>12.5e} {:>12.5e} {:>9.3} {:>9.3}",
+                k, se_true, se_r, se_r_ofv, ra, ro
+            );
+            max_anly_dev = max_anly_dev.max((ra - 1.0).abs());
+            max_ofv_dev = max_ofv_dev.max((ro - 1.0).abs());
+        }
+        let _ = cov_s;
+        println!(
+            "max |analytical/true − 1| = {:.1}%   max |ofv/true − 1| = {:.1}%",
+            max_anly_dev * 100.0,
+            max_ofv_dev * 100.0
+        );
+
+        // The OFV-Hessian R must track the FD-of-OFV ground truth tightly (both
+        // are double-FD of the same OFV) — this is the fix's success criterion.
+        assert!(
+            max_ofv_dev < 0.05,
+            "OFV-Hessian R-matrix should match FD-of-OFV ground truth within 5% (max {:.1}%)",
+            max_ofv_dev * 100.0
+        );
+        // The analytical stencil is allowed its known weakly-identified-θ bias
+        // but must not be grossly wrong.
+        assert!(
+            max_anly_dev < 0.5,
+            "analytical R-matrix deviates from ground truth by >50% (max {:.0}%)",
+            max_anly_dev * 100.0
+        );
+    }
+
+    /// Pure-AD covariance via the Schur-complement profile Hessian, co-resident
+    /// with `fit()`. Builds `R_θθ = Σᵢ (H_θθ − H_θη H_ηη⁻¹ H_ηθ)ᵢ` from the three
+    /// forward-over-reverse AD Hessian blocks and compares the θ-block against an
+    /// FD of the full marginal `pop_nll` (the true θ-block Hessian). The gap is
+    /// the `½∂²log|H̃|/∂θ²` term a pure-AD profile R omits and the FD-of-OFV
+    /// stencil captures. Warfarin is mu-ref, no covariates ⇒ tv ≡ θ. Avoids any
+    /// direct `individual_nll_ad` primal call (that specific co-residency aborts
+    /// Enzyme TypeAnalysis); the `compute_nll_*` wrappers coexist with `fit` fine.
+    #[cfg(feature = "autodiff")]
+    #[test]
+    fn ad_schur_r_vs_marginal() {
+        use crate::ad::ad_gradients::{
+            compute_nll_cross_eta_theta_ad, compute_nll_hessian_eta_ad,
+            compute_nll_hessian_theta_ad, FlatDoseData,
+        };
+        use crate::estimation::parameterization::compute_mu_k;
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EstimationMethod, OmegaMatrix};
+        use crate::{fit, read_nonmem_csv};
+        use std::path::Path;
+
+        let model_src = r"
+[parameters]
+  theta TVCL(0.15, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.2, 0.01, 50.0)
+  omega ETA_CL ~ 0.07
+  omega ETA_V  ~ 0.02
+  omega ETA_KA ~ 0.10
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  mu_referencing = true
+";
+        let model = parse_model_string(model_src).expect("model parses");
+        let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("data");
+        let mut opts = FitOptions::default();
+        opts.method = EstimationMethod::FoceI;
+        opts.interaction = true;
+        opts.outer_maxiter = 300;
+        opts.run_covariance_step = false;
+        let res = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+
+        let mut mle = model.default_params.clone();
+        mle.theta = res.theta.clone();
+        mle.sigma.values = res.sigma.clone();
+        mle.omega = OmegaMatrix::from_matrix(
+            res.omega.clone(),
+            res.eta_names.clone(),
+            mle.omega.diagonal,
+        );
+        let n_theta = mle.theta.len();
+        let n_eta = model.n_eta;
+        let n_subj = pop.subjects.len();
+        let mut omega_inv_flat = vec![0.0f64; n_eta * n_eta];
+        for i in 0..n_eta {
+            for j in 0..n_eta {
+                omega_inv_flat[i * n_eta + j] = mle.omega.inv[(i, j)];
+            }
+        }
+        let log_det_omega = mle.omega.log_det;
+        let tv_fn = model.tv_fn.as_ref().expect("tv_fn");
+
+        // AD Schur-complement profile θ-block (tv ≡ θ for this mu-ref model).
+        let mu_k = compute_mu_k(&model, &mle.theta, true);
+        let ehs = run_inner_loop_warm(&model, &pop, &mle, 300, 1e-11, None, Some(&mu_k), 0).0;
+        let mut r_schur = DMatrix::<f64>::zeros(n_theta, n_theta);
+        for i in 0..n_subj {
+            let subj = &pop.subjects[i];
+            let eta = ehs[i].as_slice();
+            let tv = tv_fn(&mle.theta, &subj.covariates);
+            let dose = FlatDoseData::from_subject(subj);
+            let n_obs = subj.observations.len();
+            let obs_scale = vec![1.0f64; n_obs];
+            let cens = vec![0.0f64; n_obs];
+            let h_ee = compute_nll_hessian_eta_ad(
+                eta, &tv, &omega_inv_flat, log_det_omega, &mle.sigma.values, &dose,
+                &subj.obs_times, &subj.observations, &cens, model.pk_model, model.error_model,
+                &model.pk_idx_f64, &model.sel_flat, &obs_scale, false,
+            );
+            let h_et = compute_nll_cross_eta_theta_ad(
+                eta, &tv, &omega_inv_flat, log_det_omega, &mle.sigma.values, &dose,
+                &subj.obs_times, &subj.observations, &cens, model.pk_model, model.error_model,
+                &model.pk_idx_f64, &model.sel_flat, &obs_scale, false,
+            );
+            let h_tt = compute_nll_hessian_theta_ad(
+                eta, &tv, &omega_inv_flat, log_det_omega, &mle.sigma.values, &dose,
+                &subj.obs_times, &subj.observations, &cens, model.pk_model, model.error_model,
+                &model.pk_idx_f64, &model.sel_flat, &obs_scale, false,
+            );
+            let h_ee_inv = h_ee.try_inverse().expect("H_ee invertible");
+            r_schur += &h_tt - h_et.transpose() * h_ee_inv * &h_et;
+        }
+
+        // FD of the full marginal pop_nll w.r.t. θ (true θ-block Hessian). Uses
+        // pop_nll only — no direct individual_nll_ad primal call.
+        let marginal = |th: &[f64]| -> f64 {
+            let mut p = mle.clone();
+            p.theta = th.to_vec();
+            let mk = compute_mu_k(&model, &p.theta, true);
+            let (e, h, _s, k) =
+                run_inner_loop_warm(&model, &pop, &p, 300, 1e-11, None, Some(&mk), 0);
+            pop_nll(&model, &pop, &p, &e, &h, &k, true)
+        };
+        let hstep = 1e-4;
+        let f0 = marginal(&mle.theta);
+        let st: Vec<f64> = (0..n_theta).map(|k| hstep * (1.0 + mle.theta[k].abs())).collect();
+        let mut r_marg = DMatrix::<f64>::zeros(n_theta, n_theta);
+        for a in 0..n_theta {
+            let mut tp = mle.theta.clone();
+            tp[a] += st[a];
+            let mut tm = mle.theta.clone();
+            tm[a] -= st[a];
+            r_marg[(a, a)] = (marginal(&tp) - 2.0 * f0 + marginal(&tm)) / (st[a] * st[a]);
+        }
+
+        println!("\n=== AD Schur profile R_θθ vs FD-of-marginal (diagonal) ===");
+        println!("{:<6} {:>14} {:>14} {:>10}", "θ", "AD_schur", "FD_marginal", "schur/marg");
+        for k in 0..n_theta {
+            println!(
+                "{:<6} {:>14.6e} {:>14.6e} {:>10.4}",
+                k,
+                r_schur[(k, k)],
+                r_marg[(k, k)],
+                r_schur[(k, k)] / r_marg[(k, k)]
+            );
+        }
+        // The AD profile Hessian must be finite and positive on the diagonal;
+        // the gap to the marginal quantifies the dropped log|H̃| term (printed).
+        for k in 0..n_theta {
+            assert!(
+                r_schur[(k, k)].is_finite() && r_schur[(k, k)] > 0.0,
+                "AD Schur diagonal must be finite positive"
+            );
+        }
     }
 }

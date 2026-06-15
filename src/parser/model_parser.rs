@@ -10627,7 +10627,12 @@ mod tests {
         for method in ["foce", "focei", "gn", "gn_hybrid", "saem"] {
             let opts = parse_fit_options(&[
                 format!("method = {method}"),
-                "covariance = false".to_string(),
+                "covariance = true".to_string(),
+                // The whole covariance family is framework-wide — none of these
+                // are method-specific, so none must warn under any method.
+                "covariance_method = s".to_string(),
+                "covariance_fallback = sir".to_string(),
+                "covariance_ofv_hessian = true".to_string(),
                 "verbose = false".to_string(),
                 "sir = true".to_string(),
                 "bloq_method = m3".to_string(),

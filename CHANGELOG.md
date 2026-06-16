@@ -20,6 +20,19 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Simulation-based NPDE / NPD diagnostics** in the `sdtab` output. Set
+  `[fit_options] npde_nsim = 1000` (and optionally `npde_seed`) to add `NPDE`
+  (Normalized Prediction Distribution Errors, decorrelated within subject) and
+  `NPD` (Normalized Prediction Discrepancies) columns, computed post-fit by
+  Monte-Carlo simulation under the fitted model (Brendel et al. 2006; Comets et
+  al. 2008). Unlike CWRES, these are robust to model nonlinearity and non-Gaussian
+  random effects, and follow N(0,1) under a correctly specified model. Off by
+  default (`npde_nsim = 0`). The effective simulation seed (including the default
+  when `npde_seed` is unset) is recorded as `npde_seed` in `{model}-fit.yaml` and
+  the `.fitrx` archive, so the diagnostics are reproducible from the saved fit.
+  Validated against a NONMEM `$SIMULATION` + `npde` R-package reference on the
+  warfarin example. M3/BLQ censoring and IOV-kappa resampling are out of scope
+  (#260).
 - **Compartment-indexed bioavailability and lag for ODE models** — name an
   individual parameter `F{n}` or `ALAG{n}`/`LAGTIME{n}` (e.g. `F2`, `ALAG2`) to
   apply a per-route bioavailability/lag to doses into compartment `n`, mirroring

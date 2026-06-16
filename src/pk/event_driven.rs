@@ -685,19 +685,19 @@ fn propagate_with_bounds(
                 propagate_one_cpt(state, dt, pk, rate_central);
             }
             PkModel::OneCptOral => {
-                propagate_one_cpt_oral(state, dt, pk);
+                propagate_one_cpt_oral(state, dt, pk, rate_central);
             }
             PkModel::TwoCptIv => {
                 propagate_two_cpt(state, dt, pk, rate_central, rate_periph1);
             }
             PkModel::TwoCptOral => {
-                propagate_two_cpt_oral(state, dt, pk);
+                propagate_two_cpt_oral(state, dt, pk, rate_central);
             }
             PkModel::ThreeCptIv => {
                 propagate_three_cpt(state, dt, pk, rate_central, rate_periph1, rate_periph2);
             }
             PkModel::ThreeCptOral => {
-                propagate_three_cpt_oral(state, dt, pk);
+                propagate_three_cpt_oral(state, dt, pk, rate_central);
             }
         }
     }
@@ -804,11 +804,13 @@ fn propagate_two_cpt(
 
 // ─── Oral models ─────────────────────────────────────────────────────
 
-/// 1-cpt oral propagator. State = `[A_depot, A_central]`. Bolus only:
-/// the dose-event handler adds to state[0] (depot); during propagation
-/// the depot drains into the central compartment via the absorption
-/// rate `ka`.
-fn propagate_one_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
+/// 1-cpt oral propagator. State = `[A_depot, A_central]`. The dose-event
+/// handler adds a bolus to state[0] (depot); during propagation the depot
+/// drains into the central compartment via the absorption rate `ka`.
+/// `rate_central` is a constant zero-order input into the central compartment
+/// over this sub-interval — a depot-bypassing infusion (RATE>0 into cmt 2) —
+/// added by linear superposition. The depot is untouched.
+fn propagate_one_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_central: f64) {
     let cl = pk.cl();
     let v = pk.v();
     let ka = pk.ka();
@@ -832,11 +834,23 @@ fn propagate_one_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
     } else {
         state[1] = a_c_0 * e_ke + (ka * a_d_0 / (ke - ka)) * (e_ka - e_ke);
     }
+
+    // Constant infusion into central (depot bypass). By linearity its forced
+    // response is the IV propagator's input term from a zero initial state, so
+    // reuse `propagate_one_cpt` to avoid duplicating the closed form (#327
+    // follow-up: the event-driven path previously dropped this input on oral
+    // models).
+    if rate_central > 0.0 {
+        let mut inflow = [0.0_f64];
+        propagate_one_cpt(&mut inflow, dt, pk, rate_central);
+        state[1] += inflow[0];
+    }
 }
 
 /// 2-cpt oral propagator. State = `[A_depot, A_central, A_periph]`.
-/// Bolus only — see module-level docs for infusion-into-oral support.
-fn propagate_two_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
+/// `rate_central` is a constant zero-order input into the central compartment
+/// (depot-bypassing infusion, RATE>0 into cmt 2), added by linear superposition.
+fn propagate_two_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_central: f64) {
     let cl = pk.cl();
     let v1 = pk.v();
     let q = pk.q();
@@ -910,6 +924,15 @@ fn propagate_two_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
 
     state[1] = h_c_dt + cap_a * e_ka;
     state[2] = h_p_dt + cap_b * e_ka;
+
+    // Constant infusion into central (depot bypass) — see propagate_one_cpt_oral.
+    // Reuse the 2-cpt IV propagator's forced response from a zero initial state.
+    if rate_central > 0.0 {
+        let mut inflow = [0.0_f64, 0.0];
+        propagate_two_cpt(&mut inflow, dt, pk, rate_central, 0.0);
+        state[1] += inflow[0];
+        state[2] += inflow[1];
+    }
 }
 
 // ─── 3-compartment models ────────────────────────────────────────────
@@ -1059,8 +1082,10 @@ fn propagate_three_cpt(
 /// 3-cpt oral propagator. State = `[A_depot, A_central, A_p1, A_p2]`.
 /// Depot decays independently; the central+peripheral subsystem follows
 /// the 3-cpt homogeneous evolution plus a depot-driven particular solution
-/// of the form `(A, B, C)·exp(-ka·t)`.
-fn propagate_three_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
+/// of the form `(A, B, C)·exp(-ka·t)`. `rate_central` is a constant zero-order
+/// input into the central compartment (depot-bypassing infusion, RATE>0 into
+/// cmt 2), added by linear superposition.
+fn propagate_three_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_central: f64) {
     let cl = pk.cl();
     let v1 = pk.v();
     let q2 = pk.q();
@@ -1131,6 +1156,16 @@ fn propagate_three_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
     state[1] = ca + cb + cg + cap_a * e_ka;
     state[2] = p1a + p1b + p1g + cap_b * e_ka;
     state[3] = p2a + p2b + p2g + cap_c * e_ka;
+
+    // Constant infusion into central (depot bypass) — see propagate_one_cpt_oral.
+    // Reuse the 3-cpt IV propagator's forced response from a zero initial state.
+    if rate_central > 0.0 {
+        let mut inflow = [0.0_f64, 0.0, 0.0];
+        propagate_three_cpt(&mut inflow, dt, pk, rate_central, 0.0, 0.0);
+        state[1] += inflow[0];
+        state[2] += inflow[1];
+        state[3] += inflow[2];
+    }
 }
 
 #[cfg(test)]
@@ -1950,6 +1985,233 @@ mod tests {
             .collect();
         for (a, e) in preds.iter().zip(expected.iter()) {
             assert_relative_eq!(*a, *e, epsilon = 1e-8, max_relative = 1e-8);
+        }
+    }
+
+    #[test]
+    fn event_driven_applies_oral_infusion_into_central() {
+        // Regression: the event-driven path previously DROPPED infusion input on
+        // oral models — `propagate_*_oral` ignored the central input rate — so an
+        // infusion into an oral model's central compartment (cmt 2, depot bypass)
+        // returned ~0 instead of the correct curve. This affected TV-covariate,
+        // reset, and IOV subjects on oral+infusion models.
+        //
+        // Three checks:
+        //   1. At F=1, event-driven == the superposition reference
+        //      (`predict_concentration` models an oral infusion as a depot-
+        //      bypassing IV-into-central infusion — the NONMEM result). Before
+        //      the fix this was ~0 vs a positive curve.
+        //   2. Predictions scale linearly with F (F=0.4 → 0.4×), confirming F is
+        //      applied to the infusion rate.
+        //   3. Cross-path agreement at F≠1: with #327/#349 now applying F on the
+        //      superposition path too, event-driven == superposition at F=0.4 —
+        //      not just F=1. Guards against either path silently dropping F
+        //      (the gap Ron's #351 review flagged that the F=1-only check (1)
+        //      cannot catch).
+        let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
+        // rate=25 → 4 h infusion into central (cmt 2) on an oral model.
+        let dose = DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0);
+        let subj = make_subject(vec![dose], obs_times.clone());
+
+        let cases: Vec<(&str, PkModel, PkParams)> = vec![
+            (
+                "1cpt-oral",
+                PkModel::OneCptOral,
+                pk_one_oral(5.0, 50.0, 1.2),
+            ),
+            (
+                "2cpt-oral",
+                PkModel::TwoCptOral,
+                pk_two_oral(5.0, 40.0, 3.0, 60.0, 1.2),
+            ),
+            (
+                "3cpt-oral",
+                PkModel::ThreeCptOral,
+                pk_three_oral(5.0, 40.0, 3.0, 60.0, 1.0, 120.0, 1.2),
+            ),
+        ];
+
+        for (label, model, base) in cases {
+            // (1) F=1: event-driven matches the superposition reference.
+            let mut pk1 = base;
+            pk1.values[crate::types::PK_IDX_F] = 1.0;
+            let ed = event_driven_predictions(
+                model,
+                &subj,
+                &vec![pk1; 1],
+                &vec![pk1; obs_times.len()],
+                &[],
+            );
+            let sup: Vec<f64> = obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk1))
+                .collect();
+            for (j, (&e, &s)) in ed.iter().zip(sup.iter()).enumerate() {
+                assert!(
+                    e > 0.0,
+                    "{label}: event-driven oral infusion should be >0 at obs {j} \
+                     (was dropped before the fix)"
+                );
+                assert_relative_eq!(e, s, epsilon = 1e-9, max_relative = 1e-7);
+            }
+
+            // (2) Linear in F (the infusion rate is scaled by f_bio).
+            let mut pkf = base;
+            pkf.values[crate::types::PK_IDX_F] = 0.4;
+            let ed_f = event_driven_predictions(
+                model,
+                &subj,
+                &vec![pkf; 1],
+                &vec![pkf; obs_times.len()],
+                &[],
+            );
+            for (a_f, a_1) in ed_f.iter().zip(ed.iter()) {
+                assert_relative_eq!(*a_f, 0.4 * *a_1, max_relative = 1e-9);
+            }
+
+            // (3) Cross-path agreement at F≠1: the superposition reference must
+            // match the event-driven path at F=0.4, not only F=1. This fails iff
+            // one path applies F to the infusion rate and the other does not.
+            let sup_f: Vec<f64> = obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pkf))
+                .collect();
+            for (a_f, s_f) in ed_f.iter().zip(sup_f.iter()) {
+                assert_relative_eq!(*a_f, *s_f, epsilon = 1e-9, max_relative = 1e-7);
+            }
+        }
+    }
+
+    #[test]
+    fn event_driven_applies_oral_ss_infusion_into_central() {
+        // Steady-state companion to the test above. An SS (ss=1, II=24 h)
+        // infusion into an oral model's central compartment must equilibrate
+        // correctly — it shares `propagate_*_oral`, which previously dropped the
+        // input — not return ~0. Cross-path uses a looser tolerance because the
+        // event-driven path equilibrates SS with a finite cycle count vs the
+        // exact analytical SS closed form; the F-linearity check is exact.
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
+        // SS infusion into central (cmt 2); dur = amt/rate = 4 h < II.
+        let dose = DoseEvent::new(0.0, 100.0, 2, 25.0, true, 24.0);
+        let subj = make_subject(vec![dose], obs_times.clone());
+
+        let cases: Vec<(&str, PkModel, PkParams)> = vec![
+            (
+                "1cpt-oral SS",
+                PkModel::OneCptOral,
+                pk_one_oral(5.0, 50.0, 1.2),
+            ),
+            (
+                "2cpt-oral SS",
+                PkModel::TwoCptOral,
+                pk_two_oral(5.0, 40.0, 3.0, 60.0, 1.2),
+            ),
+            (
+                "3cpt-oral SS",
+                PkModel::ThreeCptOral,
+                pk_three_oral(5.0, 40.0, 3.0, 60.0, 1.0, 120.0, 1.2),
+            ),
+        ];
+
+        for (label, model, base) in cases {
+            let mut pk1 = base;
+            pk1.values[crate::types::PK_IDX_F] = 1.0;
+            let ed = event_driven_predictions(
+                model,
+                &subj,
+                &vec![pk1; 1],
+                &vec![pk1; obs_times.len()],
+                &[],
+            );
+            let sup: Vec<f64> = obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk1))
+                .collect();
+            for (j, (&e, &s)) in ed.iter().zip(sup.iter()).enumerate() {
+                assert!(
+                    e > 0.0,
+                    "{label}: SS oral infusion should be >0 at obs {j} (was dropped before the fix)"
+                );
+                assert_relative_eq!(e, s, epsilon = 1e-9, max_relative = 2e-3);
+            }
+
+            // F-linearity (exact — the infusion rate is scaled by f_bio).
+            let mut pkf = base;
+            pkf.values[crate::types::PK_IDX_F] = 0.4;
+            let ed_f = event_driven_predictions(
+                model,
+                &subj,
+                &vec![pkf; 1],
+                &vec![pkf; obs_times.len()],
+                &[],
+            );
+            for (a_f, a_1) in ed_f.iter().zip(ed.iter()) {
+                assert_relative_eq!(*a_f, 0.4 * *a_1, max_relative = 1e-9);
+            }
+
+            // Cross-path agreement at F≠1 (looser SS tolerance, as for F=1):
+            // the SS equilibration path also applies F to the infusion rate, so
+            // event-driven == superposition at F=0.4, guarding the SS path
+            // against silently dropping F.
+            let sup_f: Vec<f64> = obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pkf))
+                .collect();
+            for (a_f, s_f) in ed_f.iter().zip(sup_f.iter()) {
+                assert_relative_eq!(*a_f, *s_f, epsilon = 1e-9, max_relative = 2e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn event_driven_oral_multi_dose_infusion_matches_superposition() {
+        // Review gap: only a single oral central infusion was covered. Two
+        // sequential infusions into an oral model's central compartment (cmt 2,
+        // depot bypass) must accumulate across intervals on the event-driven
+        // path exactly as the superposition reference does — exercising state
+        // carried forward between doses (and an infusion still ongoing at an
+        // observation), not just a single isolated forced response.
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 2, 25.0, false, 0.0),
+        ];
+        // 12.5 and 14.0 fall inside the second (t=12..16) infusion.
+        let obs_times = vec![0.5, 2.0, 4.0, 8.0, 12.5, 14.0, 16.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+
+        let cases: Vec<(&str, PkModel, PkParams)> = vec![
+            (
+                "1cpt-oral",
+                PkModel::OneCptOral,
+                pk_one_oral(5.0, 50.0, 1.2),
+            ),
+            (
+                "2cpt-oral",
+                PkModel::TwoCptOral,
+                pk_two_oral(5.0, 40.0, 3.0, 60.0, 1.2),
+            ),
+            (
+                "3cpt-oral",
+                PkModel::ThreeCptOral,
+                pk_three_oral(5.0, 40.0, 3.0, 60.0, 1.0, 120.0, 1.2),
+            ),
+        ];
+
+        for (label, model, pk) in cases {
+            let pk_dose = vec![pk; subj.doses.len()];
+            let pk_obs = vec![pk; obs_times.len()];
+            let preds = event_driven_predictions(model, &subj, &pk_dose, &pk_obs, &[]);
+            let expected: Vec<f64> = obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk))
+                .collect();
+            for (j, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    *a > 0.0,
+                    "{label}: obs {j} should be >0 (infusion accumulation)"
+                );
+                assert_relative_eq!(*a, *e, epsilon = 1e-8, max_relative = 1e-7);
+            }
         }
     }
 

@@ -1375,4 +1375,83 @@ mod tests {
         let model = parse_model_string(THREECPT).expect("parse");
         run_packed_check_foce(&model, &[5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 1.0]);
     }
+
+    // --- Eq. 48 EBE warm-start predictor: is it correct & better than plain warm? ---
+
+    /// The Eq. 48 predictor `η⁰ = η̂_prev + (dη̂/dx)·Δx` is a first-order Taylor
+    /// extrapolation of the EBE as the packed parameters move x_prev → x_new. So
+    /// against the *converged* EBE at x_new it must beat the plain warm-start
+    /// (reuse η̂_prev): the prediction error is `O(‖Δx‖²)` while the warm-start
+    /// error is `O(‖Δx‖)`. This walks several step sizes in a representative
+    /// direction and checks (a) prediction strictly beats warm for small steps,
+    /// and (b) the prediction/warm error ratio shrinks ∝ ‖Δx‖ (second order).
+    #[test]
+    fn eta_predictor_beats_warm_start() {
+        use crate::estimation::parameterization::pack_params;
+
+        let model = parse_model_string(TWOCPT).expect("parse");
+        let theta = vec![5.0, 30.0, 2.0, 50.0, 1.0];
+        let times = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+        let subjects = [
+            subject_with_obs(&model, &theta, &times),
+            subject_with_obs(&model, &theta, &[0.5, 1.5, 3.0, 6.0, 12.0, 36.0]),
+        ];
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.clone();
+        let x0 = pack_params(&template);
+        let n = x0.len();
+
+        // A fixed, representative outer direction (unit-norm in packed space).
+        let mut dir: Vec<f64> = (0..n).map(|k| 0.5 + 0.1 * k as f64).collect();
+        let dnorm = dir.iter().map(|d| d * d).sum::<f64>().sqrt();
+        for d in dir.iter_mut() {
+            *d /= dnorm;
+        }
+
+        // Base EBEs and dη̂/dx at x0.
+        let p0 = unpack_params(&x0, &template);
+        let eta0: Vec<DVector<f64>> = subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &p0)))
+            .collect();
+        let jac: Vec<Vec<DVector<f64>>> = subjects
+            .iter()
+            .enumerate()
+            .map(|(i, s)| subject_eta_dx(&model, s, &template, &x0, eta0[i].as_slice()).unwrap())
+            .collect();
+
+        eprintln!("  step    warm_err   pred_err   ratio");
+        let mut prev_ratio: Option<f64> = None;
+        for &s in &[0.20_f64, 0.10, 0.05, 0.025] {
+            let x1: Vec<f64> = (0..n).map(|k| x0[k] + s * dir[k]).collect();
+            let p1 = unpack_params(&x1, &template);
+
+            let pred = predict_warm_etas(&eta0, &jac, &x0, &x1);
+
+            let mut warm_err = 0.0;
+            let mut pred_err = 0.0;
+            for (i, subj) in subjects.iter().enumerate() {
+                let eta1 = DVector::from_vec(precise_ebe(&model, subj, &p1));
+                warm_err += (&eta0[i] - &eta1).norm();
+                pred_err += (&pred[i] - &eta1).norm();
+            }
+            let ratio = pred_err / warm_err.max(1e-300);
+            eprintln!("  {s:>5.3}  {warm_err:>9.2e}  {pred_err:>9.2e}  {ratio:>6.3}");
+
+            // (a) the predictor must be a real improvement on warm-start.
+            assert!(
+                pred_err < 0.5 * warm_err,
+                "predictor (err {pred_err:.3e}) should beat warm-start (err {warm_err:.3e}) at step {s}"
+            );
+            // (b) halving the step should shrink the ratio (second-order error).
+            if let Some(pr) = prev_ratio {
+                assert!(
+                    ratio < pr + 1e-9,
+                    "pred/warm ratio should not grow as the step shrinks ({ratio:.3} vs {pr:.3})"
+                );
+            }
+            prev_ratio = Some(ratio);
+        }
+    }
 }

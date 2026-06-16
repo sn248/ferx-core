@@ -28,8 +28,11 @@ section of the SDLC for the versioning policy).
   Enzyme. FOCEI differentiates the Laplace marginal (Eq. 23); FOCE differentiates
   ferx's Sheiner–Beal linearized marginal — both carry the exact EBE response
   (Eq. 46) on every θ/Ω/σ block, share an exact inner-loop Jacobian, and use an
-  EBE warm-start predictor (Eq. 48). Estimates and OFV are unchanged; `lbfgs`/
-  `nlopt_lbfgs` fits are ~3–4× faster. Validated against NONMEM on warfarin
+  EBE warm-start predictor (Eq. 48). Estimates and OFV are unchanged; the
+  gradient is exact (no fixed-EBE bias) and each evaluation is a closed form
+  rather than an `O(n)` finite-difference sweep, so `lbfgs`/`nlopt_lbfgs` reach
+  the true optimum at wall-time comparable to the derivative-free default and
+  several × faster than the built-in `bfgs`. Validated against NONMEM on warfarin
   (FOCE OFV −280.36, FOCEI −286.00 — both matching to ~4–5 significant figures).
   Models outside the analytical scope (ODE, IOV, LTBS, output scaling, lagtime,
   time-varying covariates, resets, overlapping steady-state infusion #379)

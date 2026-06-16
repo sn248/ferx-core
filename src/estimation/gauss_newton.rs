@@ -1064,6 +1064,13 @@ pub(crate) struct LaplaceGradCache {
     pub htilde_inv: DMatrix<f64>,
     /// Per-observation `qⱼ = aⱼ'H̃⁻¹aⱼ`.
     pub q: Vec<f64>,
+    /// Per-packed-parameter GN gradient EBE-response correction:
+    /// `t_i[k] = −½ Σⱼ (q̃ⱼ/Rⱼ) · ∂fⱼ/∂θ_k`
+    /// where `q̃ⱼ = (H̃⁻¹ gη)' aⱼ` and `gη[m] = Σⱼ βⱼ qⱼ a_{j,m}`.
+    /// Only the theta block (indices `0..n_theta`) is filled; omega/sigma stay zero (#335).
+    /// Used by `build_gn_system` to correct the fixed-η̂ Laplace gradient for the
+    /// `log|H̃|` EBE-response term the envelope theorem drops.
+    pub gn_theta_correction: Vec<f64>,
 }
 
 /// As [`subject_nll_pop_grad_analytical_laplace`], but also returns the
@@ -1192,6 +1199,36 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     let log_det_omega = omega.log_det;
     let nll = 0.5 * (data_ll + eta_prior + log_det_omega + log_det_htilde);
 
+    // ── GN gradient EBE-response correction coefficients ─────────────────────
+    // The fixed-η̂ Laplace gradient drops the log|H̃| EBE-response curvature
+    // (envelope theorem zeros the inner NLL but not log|H̃|).  The total gradient
+    // correction for θ_k is t_i[k] = -½ Σⱼ (q̃ⱼ/Rⱼ) · ∂fⱼ/∂θ_k, where:
+    //   gη[m] = Σⱼ βⱼ qⱼ a_{j,m}   (∂log|H̃|/∂η, a-fixed)
+    //   w     = H̃⁻¹ gη              (IFT: dη̂/dθ_k = -H̃⁻¹ · Σⱼ (aⱼ/Rⱼ) ∂fⱼ/∂θ_k)
+    //   q̃ⱼ   = w' · aⱼ             (per-obs scalar)
+    // Accumulated in the theta FD loop below into `gn_theta_correction`.
+    // Identically zero for additive error (βⱼ = 0 when d = 0).
+    let mut g_eta_gn = DVector::zeros(n_eta);
+    for j in 0..n_obs {
+        let aj = h_matrix.row(j);
+        let beta_j = logdet_htilde_beta(d_vec[j], d2_vec[j], 1.0 / r_diag[j]);
+        let coef = beta_j * q[j];
+        for m in 0..n_eta {
+            g_eta_gn[m] += coef * aj[m];
+        }
+    }
+    let w_gn = &htilde_inv * &g_eta_gn;
+    let mut q_tilde = vec![0.0f64; n_obs];
+    for j in 0..n_obs {
+        let aj = h_matrix.row(j);
+        let mut s = 0.0;
+        for m in 0..n_eta {
+            s += w_gn[m] * aj[m];
+        }
+        q_tilde[j] = s;
+    }
+    let mut gn_theta_correction = vec![0.0f64; n];
+
     // ── Theta gradient (forward FD on predictions; closed-form chain rest) ──
     // Per-obs scalar coeff combines data_ll and log|H̃| contributions:
     //   per_j = αⱼ + βⱼ·qⱼ
@@ -1263,10 +1300,15 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
         if denom.abs() < 1e-16 {
             continue;
         }
-        let s: f64 = (0..n_obs)
-            .map(|j| theta_per_j[j] * (num_lhs[j] - num_rhs[j]) / denom)
-            .sum();
+        let mut s = 0.0f64;
+        let mut s_corr = 0.0f64;
+        for j in 0..n_obs {
+            let df = (num_lhs[j] - num_rhs[j]) / denom;
+            s += theta_per_j[j] * df;
+            s_corr += -(q_tilde[j] / r_diag[j]) * df;
+        }
         grad[k] = 0.5 * s;
+        gn_theta_correction[k] = 0.5 * s_corr;
     }
 
     // ── Omega gradient (closed-form chain rule through Ω⁻¹) ─────────────────
@@ -1395,6 +1437,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
         hrh,
         htilde_inv,
         q,
+        gn_theta_correction,
     };
     Some((nll, grad, cache))
 }
@@ -1801,20 +1844,7 @@ fn build_gn_system(
             );
             let ti = cache
                 .as_ref()
-                .and_then(|c| {
-                    subject_eta_response_correction(
-                        Some(c),
-                        x,
-                        template,
-                        model,
-                        population,
-                        i,
-                        &eta_hats[i],
-                        &h_matrices[i],
-                        bounds,
-                        options,
-                    )
-                })
+                .map(|c| c.gn_theta_correction.clone())
                 .unwrap_or_else(|| vec![0.0; n]);
             (nll, gi, ti)
         })

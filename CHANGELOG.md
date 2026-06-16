@@ -185,6 +185,16 @@ section of the SDLC for the versioning policy).
   is no longer silently scored as `DV=0`. Such rows are now treated as `MDV=1`
   (skipped) and a single `W_MISSING_DV` warning reports how many rows were
   skipped, surfaced in fit warnings and `ferx check` (#258).
+- Bioavailability `F` is now applied to **IV bolus and infusion** doses on the
+  analytical path, not just oral depot doses. The analytical superposition path
+  (used for subjects with no time-varying covariates) previously dropped `F` for
+  IV/infusion dosing, so the same model gave `F`×-different predictions for a
+  no-TV subject versus a time-varying/IOV subject (the event-driven path applied
+  `F` correctly) — a silent inconsistency that biased fits and made an estimated
+  `F` a no-op on all-IV/infusion datasets. `F` now scales the bioavailable
+  amount/rate on every route, matching NONMEM's `F1`, the ODE engine, and the
+  event-driven path. Mapping `f=` on an IV model is no longer warned as unused
+  (#327).
 - NONMEM coded `RATE` values (`-1` = modeled rate, `-2` = modeled duration) — and
   any other negative or non-finite `RATE` on a dose row — are now rejected with an
   informative error naming the subject and time, instead of being silently treated

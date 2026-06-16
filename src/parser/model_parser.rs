@@ -1996,11 +1996,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     ));
 
     // Warn about analytical PK parameters that are mapped but unused by the
-    // chosen model — e.g. `ka` or `f` on an IV model (no absorption / no
-    // bioavailability term), or `q`/`v2` on a one-compartment model. They are set
-    // but have no effect (#309). `PkModel::consumes_pk_slot` is the single source
-    // of truth for what each model's closed form actually reads (`lagtime` for
-    // every model, `f` only for oral). Sibling to the declared-but-unused check.
+    // chosen model — e.g. `ka` on an IV model (no absorption compartment), or
+    // `q`/`v2` on a one-compartment model. They are set but have no effect
+    // (#309). `PkModel::consumes_pk_slot` is the single source of truth for what
+    // each model's closed form actually reads (`f` and `lagtime` apply to every
+    // model — `f` scales IV bolus/infusion doses too since #327). Sibling to the
+    // declared-but-unused check.
     if !pk_param_map.is_empty() {
         let mut unused: Vec<&str> = pk_param_map
             .iter()
@@ -9747,9 +9748,9 @@ mod tests {
     #[test]
     fn test_unused_pk_param_warns() {
         // PK parameters mapped but not used by the chosen model parse Ok but warn
-        // (#309): on an IV model both `ka` (no absorption) AND `f` (no
-        // bioavailability term in the IV closed form) are flagged. `lagtime`,
-        // which every model applies to the dose, must NOT be flagged.
+        // (#309): on an IV model `ka` (no absorption) is flagged. `f`
+        // (bioavailability — applied to IV bolus/infusion since #327) and
+        // `lagtime` (applied to every dose) are both used, so neither is flagged.
         let model_str = "
 [parameters]
   theta TVCL(1.0, 0.001, 100.0)
@@ -9791,8 +9792,8 @@ mod tests {
             "ka should be flagged unused on IV: {warn}"
         );
         assert!(
-            warn.contains("`f`"),
-            "f should be flagged unused on IV: {warn}"
+            !warn.contains("`f`"),
+            "f is applied to IV bolus/infusion (#327) and must not be flagged: {warn}"
         );
         assert!(
             !warn.contains("`lagtime`"),
@@ -9804,7 +9805,8 @@ mod tests {
     fn test_f_lagtime_warning_matrix() {
         // Pins the f/lagtime warning matrix (#309). Two distinct checks fire:
         //  - "does not use" (`consumes_pk_slot`): a param mapped in `pk(...)` but
-        //    not consumed — `f` is consumed only by oral models, `lagtime` by all;
+        //    not consumed — `f` and `lagtime` are consumed by every model (#327),
+        //    so neither warns; an unused structural slot (e.g. `ka` on IV) does;
         //  - "computed but never used": a param declared in [individual_parameters]
         //    but never mapped or referenced anywhere.
         // KA/F/LAG are literals so the helper declares no surplus thetas (which
@@ -9838,14 +9840,16 @@ mod tests {
         let has = |ws: &[String], needle: &str| ws.iter().any(|w| w.contains(needle));
         let clv = "  CL = TVCL * exp(ETA_CL)\n  V = TVV";
 
-        // (1) IV + `f` mapped → "does not use `f`" (f is oral-only).
+        // (1) IV + `f` mapped → NOT flagged. F scales the bioavailable amount
+        // on every route — IV bolus and infusion included (#327) — so it is
+        // used, not inert, on IV models.
         let ws = warns(
             &format!("{clv}\n  F = 0.8"),
             "pk one_cpt_iv(cl=CL, v=V, f=F)",
         );
         assert!(
-            has(&ws, "does not use") && has(&ws, "`f`"),
-            "IV + mapped f should warn unused: {ws:?}"
+            !has(&ws, "does not use"),
+            "IV + mapped f must not warn now that F applies to IV doses (#327): {ws:?}"
         );
 
         // (2) IV + `lagtime` mapped → NOT flagged (every model applies lagtime).
@@ -10172,7 +10176,7 @@ mod tests {
                     ("q", 'U'),
                     ("v2", 'U'),
                     ("ka", 'U'),
-                    ("f", 'U'),
+                    ("f", 'O'),
                     ("q3", 'U'),
                     ("v3", 'U'),
                     ("lagtime", 'O'),
@@ -10200,7 +10204,7 @@ mod tests {
                     ("q", 'R'),
                     ("v2", 'R'),
                     ("ka", 'U'),
-                    ("f", 'U'),
+                    ("f", 'O'),
                     ("q3", 'U'),
                     ("v3", 'U'),
                     ("lagtime", 'O'),
@@ -10228,7 +10232,7 @@ mod tests {
                     ("q2", 'R'),
                     ("v2", 'R'),
                     ("ka", 'U'),
-                    ("f", 'U'),
+                    ("f", 'O'),
                     ("q3", 'R'),
                     ("v3", 'R'),
                     ("lagtime", 'O'),

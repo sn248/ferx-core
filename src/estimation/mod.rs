@@ -7,6 +7,7 @@ pub mod outer_optimizer;
 pub mod parameterization;
 pub mod run_sir;
 pub mod saem;
+pub mod sens_outer_gradient;
 pub mod sir;
 pub mod trace;
 pub mod trust_region;

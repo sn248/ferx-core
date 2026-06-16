@@ -1480,6 +1480,29 @@ fn optimize_bfgs(
     let (mut f_val, mut g, ehs, _) = fdfg_s(&xs, &cached_etas, &mut grad_eval_idx);
     cached_etas = ehs;
 
+    // EBE warm-start predictor (Almquist Eq. 48): extrapolate each subject's EBE
+    // to the next outer point via dη̂/dx, so the inner solve starts closer and
+    // needs fewer iterations. dη̂/dx is interaction-independent (shared inner
+    // objective), so it engages for both FOCE and FOCEI on analytical models;
+    // set FERX_EBE_PREDICTOR=0 to disable (A/B timing). When the Jacobian is
+    // unavailable it degrades to plain warm-start from prior η̂.
+    let use_predictor = crate::sens::provider::analytical_supported(model)
+        && std::env::var("FERX_EBE_PREDICTOR")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    let mut x_anchor_real: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
+    let mut last_jac: Option<Vec<Vec<DVector<f64>>>> = if use_predictor {
+        crate::estimation::sens_outer_gradient::population_eta_dx(
+            model,
+            population,
+            init_params,
+            &x_anchor_real,
+            &cached_etas,
+        )
+    } else {
+        None
+    };
+
     if options.verbose {
         eprintln!("Iter {:>4}: OFV = {:.6}", 0, f_val);
     }
@@ -1537,8 +1560,30 @@ fn optimize_bfgs(
             xs[i] = (xs[i] + alpha * d[i]).clamp(bounds_s.lower[i], bounds_s.upper[i]);
         }
 
-        let (f_new, g_new, ehs, _) = fdfg_s(&xs, &cached_etas, &mut grad_eval_idx);
+        // Eq. 48: predict the accepted point's EBEs from the anchor before the
+        // inner solve; falls back to plain warm-start when no Jacobian.
+        let x_new_real: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
+        let warm: Vec<DVector<f64>> = match &last_jac {
+            Some(jac) => crate::estimation::sens_outer_gradient::predict_warm_etas(
+                &cached_etas,
+                jac,
+                &x_anchor_real,
+                &x_new_real,
+            ),
+            None => cached_etas.clone(),
+        };
+        let (f_new, g_new, ehs, _) = fdfg_s(&xs, &warm, &mut grad_eval_idx);
         cached_etas = ehs;
+        if use_predictor {
+            last_jac = crate::estimation::sens_outer_gradient::population_eta_dx(
+                model,
+                population,
+                init_params,
+                &x_new_real,
+                &cached_etas,
+            );
+            x_anchor_real = x_new_real;
+        }
 
         bfgs_update(&mut h_inv, &xs, &xs_old, &g_new, &g, n);
 
@@ -1886,6 +1931,37 @@ fn population_gradient(
 ) -> Vec<f64> {
     let reconverge = reconverge_this_eval(options, *grad_eval_idx);
     *grad_eval_idx += 1;
+    // Analytic-sensitivity gradient (Almquist 2015 Eq. 23, closed form via the
+    // `sens` provider): the exact marginal FOCEI gradient including the Eq. 46
+    // EBE response on every θ/Ω/σ block — no fixed-EBE bias, no FD noise, so it
+    // supersedes both branches below where it applies. Gated to the supported
+    // analytical 1-cpt scope; `population_gradient_sens` returns `None` (→ the
+    // existing FD/Laplace path) if any subject is outside provider scope.
+    // FOCEI uses the Almquist Laplace marginal (R at f(η̂), ½c̃ᵀc̃ in H̃); plain
+    // FOCE uses the Sheiner–Beal linearized marginal (R̃ = JΩJᵀ + R⁰). Both have
+    // exact closed-form gradients here, sharing the same EBE/inner-Hessian core.
+    if crate::sens::provider::analytical_supported(model) {
+        let g = if options.interaction {
+            crate::estimation::sens_outer_gradient::population_gradient_sens(
+                model,
+                population,
+                init_params,
+                x,
+                ehs,
+            )
+        } else {
+            crate::estimation::sens_outer_gradient::population_gradient_sens_foce(
+                model,
+                population,
+                init_params,
+                x,
+                ehs,
+            )
+        };
+        if let Some(g) = g {
+            return g;
+        }
+    }
     // IOV models always reconverge the inner EBE solution inside the gradient.
     // For non-IOV models the default is the fixed-EBE analytical/AD gradient,
     // which is far cheaper but omits the response of (η̂, H) to the population

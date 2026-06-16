@@ -785,8 +785,19 @@ pub fn find_ebe(
     // is consistent with the gradient that drove convergence. Reuses the
     // same per-subject helpers built once at the top of find_ebe; previously
     // these were rebuilt here, doubling the per-subject helper cost.
+    // Inner half of the gradient-path policy ("gradient-based optimizers use
+    // sensitivities, FD fallback"): an exact analytic ∂f/∂η Jacobian when the
+    // model is in the supported analytical 1-cpt scope, else `None` and we keep
+    // the AD/FD Jacobian below. Perf follow-up: skip building the FD Jacobian
+    // when the analytic one is available — for this first landing it is computed
+    // and then overridden, which keeps the diff minimal and trivially
+    // revertible while the values come from the exact sensitivities.
+    let analytic_jac: Option<DMatrix<f64>> =
+        crate::sens::provider::subject_eta_jacobian(model, subject, &params.theta, &eta_true)
+            .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j));
+
     #[cfg(feature = "autodiff")]
-    let h_matrix = match grad_method {
+    let h_matrix_fb = match grad_method {
         InnerGradientMethod::AdSingleSnapshot => {
             let tv_adjusted = ad_tv_adjusted.as_ref().unwrap();
             let dose_data = ad_dose_data.as_ref().unwrap();
@@ -853,7 +864,7 @@ pub fn find_ebe(
     };
 
     #[cfg(not(feature = "autodiff"))]
-    let h_matrix = {
+    let h_matrix_fb = {
         let mut scratch = pk_scratch_cell.borrow_mut();
         let t0 = std::time::Instant::now();
         let j = compute_jacobian_fd(
@@ -867,6 +878,8 @@ pub fn find_ebe(
         GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
         j
     };
+
+    let h_matrix = analytic_jac.unwrap_or(h_matrix_fb);
 
     EbeResult {
         eta: DVector::from_column_slice(&eta_true),

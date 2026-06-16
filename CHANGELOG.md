@@ -20,6 +20,20 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic FOCE and FOCEI outer gradient** for analytical 1-/2-/3-compartment
+  models (IV bolus/infusion, oral, and steady state): the gradient-based outer
+  optimizers (`bfgs`, `lbfgs`, `nlopt_lbfgs`, `slsqp`) now drive both FOCEI and
+  FOCE with an exact closed-form marginal gradient (Almquist et al. 2015), evaluated
+  through hand-rolled second-order dual numbers — no finite differences and no
+  Enzyme. FOCEI differentiates the Laplace marginal (Eq. 23); FOCE differentiates
+  ferx's Sheiner–Beal linearized marginal — both carry the exact EBE response
+  (Eq. 46) on every θ/Ω/σ block, share an exact inner-loop Jacobian, and use an
+  EBE warm-start predictor (Eq. 48). Estimates and OFV are unchanged; `lbfgs`/
+  `nlopt_lbfgs` fits are ~3–4× faster. Validated against NONMEM on warfarin
+  (FOCE OFV −280.36, FOCEI −286.00 — both matching to ~4–5 significant figures).
+  Models outside the analytical scope (ODE, IOV, LTBS, output scaling, lagtime,
+  time-varying covariates, resets, overlapping steady-state infusion #379)
+  transparently fall back to the existing finite-difference gradient (#367).
 - Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
   input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
   `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The

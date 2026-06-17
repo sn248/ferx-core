@@ -107,19 +107,18 @@ enum ExKind {
     OneCptOral,
     /// 2-cpt IV: bolus + infusion.
     TwoCptIv,
-    /// 3-cpt IV: bolus only (infusion not yet hand-derived).
+    /// 3-cpt IV: bolus + infusion.
     ThreeCptIv,
 }
 
 impl ExKind {
     /// True when a hand-written kernel covers this dose. Steady state (every
-    /// class) and 3-cpt infusion are not yet derived, so a subject containing one
-    /// routes entirely to the exact `Dual2<N>` path.
+    /// class) is not yet derived, so a subject containing one routes entirely to
+    /// the exact `Dual2<N>` path.
     fn covers(self, dose: &DoseEvent) -> bool {
         let ss = dose.ss && dose.ii > 0.0;
         match self {
-            ExKind::OneCptIv | ExKind::OneCptOral | ExKind::TwoCptIv => !ss,
-            ExKind::ThreeCptIv => !ss && !dose.is_infusion(),
+            ExKind::OneCptIv | ExKind::OneCptOral | ExKind::TwoCptIv | ExKind::ThreeCptIv => !ss,
         }
     }
 }
@@ -647,9 +646,24 @@ fn eval_dose_explicit<const N: usize>(
             f
         }
         ExKind::ThreeCptIv => {
-            let (f, gs, hs) = super::three_cpt_explicit::iv_bolus_explicit(
-                dose.amt, elapsed, cl, v1, q, v2, q3, v3,
-            );
+            let (f, gs, hs) = if dose.is_infusion() {
+                super::three_cpt_explicit::infusion_explicit(
+                    dose.rate,
+                    dose.duration,
+                    dose.amt,
+                    elapsed,
+                    cl,
+                    v1,
+                    q,
+                    v2,
+                    q3,
+                    v3,
+                )
+            } else {
+                super::three_cpt_explicit::iv_bolus_explicit(
+                    dose.amt, elapsed, cl, v1, q, v2, q3, v3,
+                )
+            };
             scatter_compact(
                 gv,
                 hv,

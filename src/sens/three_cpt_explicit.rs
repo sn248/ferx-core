@@ -30,7 +30,7 @@
 //! `pλ≈0`) and invalid cases fall back to the dual path.
 
 use super::dual2::Dual2;
-use super::three_cpt::three_cpt_iv_bolus_g;
+use super::three_cpt::{three_cpt_infusion_g, three_cpt_iv_bolus_g};
 
 /// A second-order jet over the six PK parameters `[CL, V1, Q2, V2, Q3, V3]`.
 #[derive(Clone, Copy)]
@@ -186,35 +186,20 @@ fn root_jet(lambda: f64, e1: &J6, e2: &J6, e3: &J6) -> Option<J6> {
     Some(r)
 }
 
-/// `(f, ∂f/∂[CL,V1,Q2,V2,Q3,V3], ∂²f/∂[CL,V1,Q2,V2,Q3,V3]²)` for the 3-cpt IV
-/// bolus `C = A·e^{−αt} + B·e^{−βt} + G·e^{−γt}`.
-pub fn iv_bolus_explicit(
-    amt: f64,
-    t: f64,
+/// The disposition eigenvalue jets `(α, β, γ, k21, k31)` over
+/// `[CL,V1,Q2,V2,Q3,V3]`, or `None` when the roots are near-degenerate (the
+/// closed-form coefficients carry `1/Δ` factors) and the caller should fall back
+/// to the dual path. `α` (largest) and `γ` (smallest) come from implicit
+/// differentiation of the characteristic cubic; `β = e₁ − α − γ` by Vieta.
+#[allow(clippy::type_complexity)]
+fn macro_rate_jets_3cpt(
     cl: f64,
     v1: f64,
     q2: f64,
     v2: f64,
     q3: f64,
     v3: f64,
-) -> (f64, [f64; 6], [[f64; 6]; 6]) {
-    let fallback = || {
-        let d = three_cpt_iv_bolus_g::<Dual2<6>>(
-            amt,
-            t,
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q2, 2),
-            Dual2::var(v2, 3),
-            Dual2::var(q3, 4),
-            Dual2::var(v3, 5),
-        );
-        (d.value, d.grad, d.hess)
-    };
-    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || v3 <= 0.0 || cl <= 0.0 || q2 < 0.0 || q3 < 0.0 {
-        return (0.0, [0.0; 6], [[0.0; 6]; 6]);
-    }
-
+) -> Option<(J6, J6, J6, J6, J6)> {
     // Micro-rates and the symmetric functions (cubic coefficients) as jets.
     let k10 = ratio_jet(cl, 0, v1, 1);
     let k12 = ratio_jet(q2, 2, v1, 1);
@@ -266,24 +251,61 @@ pub fn iv_bolus_explicit(
     let bv = s2 - av - gv;
     // Distinct-root guard (coefficients carry 1/Δ factors).
     if (av - bv).abs() < 1e-9 || (av - gv).abs() < 1e-9 || (bv - gv).abs() < 1e-9 {
-        return fallback();
+        return None;
     }
 
     // α (largest) and γ (smallest) by implicit diff; β = e₁ − α − γ (Vieta).
-    let alpha = match root_jet(av, &e1, &e2, &e3) {
-        Some(j) => j,
-        None => return fallback(),
-    };
-    let gamma = match root_jet(gv, &e1, &e2, &e3) {
-        Some(j) => j,
-        None => return fallback(),
-    };
+    let alpha = root_jet(av, &e1, &e2, &e3)?;
+    let gamma = root_jet(gv, &e1, &e2, &e3)?;
     let beta = e1.sub(alpha).sub(gamma);
+    Some((alpha, beta, gamma, k21, k31))
+}
+
+/// `num/V1` as a jet: depends on `V1` only (seed axis 1). Used for the `amt/V1`
+/// (bolus) and `rate/V1` (infusion) prefactors.
+#[inline]
+fn over_v1(num: f64, v1: f64) -> J6 {
+    let mut j = J6::cst(num / v1);
+    j.g[1] = -num / (v1 * v1);
+    j.h[1][1] = 2.0 * num / (v1 * v1 * v1);
+    j
+}
+
+/// `(f, ∂f/∂[CL,V1,Q2,V2,Q3,V3], ∂²f/∂[CL,V1,Q2,V2,Q3,V3]²)` for the 3-cpt IV
+/// bolus `C = A·e^{−αt} + B·e^{−βt} + G·e^{−γt}`.
+pub fn iv_bolus_explicit(
+    amt: f64,
+    t: f64,
+    cl: f64,
+    v1: f64,
+    q2: f64,
+    v2: f64,
+    q3: f64,
+    v3: f64,
+) -> (f64, [f64; 6], [[f64; 6]; 6]) {
+    let fallback = || {
+        let d = three_cpt_iv_bolus_g::<Dual2<6>>(
+            amt,
+            t,
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q2, 2),
+            Dual2::var(v2, 3),
+            Dual2::var(q3, 4),
+            Dual2::var(v3, 5),
+        );
+        (d.value, d.grad, d.hess)
+    };
+    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || v3 <= 0.0 || cl <= 0.0 || q2 < 0.0 || q3 < 0.0 {
+        return (0.0, [0.0; 6], [[0.0; 6]; 6]);
+    }
+    let (alpha, beta, gamma, k21, k31) = match macro_rate_jets_3cpt(cl, v1, q2, v2, q3, v3) {
+        Some(x) => x,
+        None => return fallback(),
+    };
 
     // Coefficients: A = d(α−k21)(α−k31)/[(α−β)(α−γ)], etc., d = amt/V1.
-    let mut d = J6::cst(amt / v1);
-    d.g[1] = -amt / (v1 * v1);
-    d.h[1][1] = 2.0 * amt / (v1 * v1 * v1);
+    let d = over_v1(amt, v1);
 
     let ab = alpha.sub(beta);
     let ag = alpha.sub(gamma);
@@ -308,6 +330,97 @@ pub fn iv_bolus_explicit(
         .mul(alpha.scale(-t).exp())
         .add(b.mul(beta.scale(-t).exp()))
         .add(g.mul(gamma.scale(-t).exp()));
+    (c.v, c.g, c.h)
+}
+
+/// `(f, ∂f/∂[CL,V1,Q2,V2,Q3,V3], ∂²f/∂[...]²)` for the 3-cpt infusion (rate
+/// `rate`, duration `dur`). Same eigenvalue jets as the bolus; the coefficients
+/// carry an extra `1/α`, `1/β`, `1/γ` (zero-order input) and the response is the
+/// during/after piecewise of [`three_cpt_infusion_g`].
+#[allow(clippy::too_many_arguments)]
+pub fn infusion_explicit(
+    rate: f64,
+    dur: f64,
+    amt: f64,
+    t: f64,
+    cl: f64,
+    v1: f64,
+    q2: f64,
+    v2: f64,
+    q3: f64,
+    v3: f64,
+) -> (f64, [f64; 6], [[f64; 6]; 6]) {
+    let fallback = || {
+        let d = three_cpt_infusion_g::<Dual2<6>>(
+            rate,
+            dur,
+            amt,
+            t,
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q2, 2),
+            Dual2::var(v2, 3),
+            Dual2::var(q3, 4),
+            Dual2::var(v3, 5),
+        );
+        (d.value, d.grad, d.hess)
+    };
+    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || v3 <= 0.0 || cl <= 0.0 || q2 < 0.0 || q3 < 0.0 {
+        return (0.0, [0.0; 6], [[0.0; 6]; 6]);
+    }
+    if dur <= 0.0 {
+        return iv_bolus_explicit(amt, t, cl, v1, q2, v2, q3, v3);
+    }
+    let (alpha, beta, gamma, k21, k31) = match macro_rate_jets_3cpt(cl, v1, q2, v2, q3, v3) {
+        Some(x) => x,
+        None => return fallback(),
+    };
+    // Coefficients divide by α, β, γ; bail if any is near-zero.
+    if alpha.v.abs() < 1e-12 || beta.v.abs() < 1e-12 || gamma.v.abs() < 1e-12 {
+        return fallback();
+    }
+
+    let rv = over_v1(rate, v1);
+    let ab = alpha.sub(beta);
+    let ag = alpha.sub(gamma);
+    let bg = beta.sub(gamma);
+
+    // a = rv(α−k21)(α−k31)/[(α−β)(α−γ)·α], etc.; denom_b = −(α−β)(β−γ)·β.
+    let a_coeff = rv
+        .mul(alpha.sub(k21))
+        .mul(alpha.sub(k31))
+        .mul(ab.mul(ag).mul(alpha).recip());
+    let b_coeff = rv
+        .mul(beta.sub(k21))
+        .mul(beta.sub(k31))
+        .mul(ab.scale(-1.0).mul(bg).mul(beta).recip());
+    let g_coeff = rv
+        .mul(gamma.sub(k21))
+        .mul(gamma.sub(k31))
+        .mul(ag.mul(bg).mul(gamma).recip());
+
+    let one = J6::cst(1.0);
+    let c = if t <= dur {
+        let ea = alpha.scale(-t).exp();
+        let eb = beta.scale(-t).exp();
+        let eg = gamma.scale(-t).exp();
+        a_coeff
+            .mul(one.sub(ea))
+            .add(b_coeff.mul(one.sub(eb)))
+            .add(g_coeff.mul(one.sub(eg)))
+    } else {
+        let ead = alpha.scale(-dur).exp();
+        let ebd = beta.scale(-dur).exp();
+        let egd = gamma.scale(-dur).exp();
+        let eadt = alpha.scale(-(t - dur)).exp();
+        let ebdt = beta.scale(-(t - dur)).exp();
+        let egdt = gamma.scale(-(t - dur)).exp();
+        a_coeff
+            .mul(one.sub(ead))
+            .mul(eadt)
+            .add(b_coeff.mul(one.sub(ebd)).mul(ebdt))
+            .add(g_coeff.mul(one.sub(egd)).mul(egdt))
+    };
     (c.v, c.g, c.h)
 }
 
@@ -358,6 +471,63 @@ mod tests {
                         hd[i][j],
                         max_relative = 1e-6,
                         epsilon = 1e-10
+                    );
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dual_infusion(
+        rate: f64,
+        dur: f64,
+        amt: f64,
+        t: f64,
+        cl: f64,
+        v1: f64,
+        q2: f64,
+        v2: f64,
+        q3: f64,
+        v3: f64,
+    ) -> (f64, [f64; 6], [[f64; 6]; 6]) {
+        let d = three_cpt_infusion_g::<Dual2<6>>(
+            rate,
+            dur,
+            amt,
+            t,
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q2, 2),
+            Dual2::var(v2, 3),
+            Dual2::var(q3, 4),
+            Dual2::var(v3, 5),
+        );
+        (d.value, d.grad, d.hess)
+    }
+
+    #[test]
+    fn three_cpt_infusion_explicit_matches_dual() {
+        // dur = amt/rate; cover both during (t ≤ dur) and after (t > dur).
+        for &(rate, amt, t, cl, v1, q2, v2, q3, v3) in &[
+            (500.0, 1000.0, 1.0, 5.0, 10.0, 2.0, 20.0, 1.5, 30.0), // during (dur=2)
+            (500.0, 1000.0, 6.0, 5.0, 10.0, 2.0, 20.0, 1.5, 30.0), // after
+            (250.0, 1000.0, 2.0, 8.0, 15.0, 3.0, 40.0, 0.8, 60.0), // during (dur=4)
+            (250.0, 1000.0, 10.0, 8.0, 15.0, 3.0, 40.0, 0.8, 60.0), // after
+            (1000.0, 1000.0, 0.5, 3.2, 12.4, 1.1, 25.0, 0.6, 50.0), // during (dur=1), fit-ish
+            (1000.0, 1000.0, 4.0, 3.2, 12.4, 1.1, 25.0, 0.6, 50.0), // after
+        ] {
+            let dur = amt / rate;
+            let (fe, ge, he) = infusion_explicit(rate, dur, amt, t, cl, v1, q2, v2, q3, v3);
+            let (fd, gd, hd) = dual_infusion(rate, dur, amt, t, cl, v1, q2, v2, q3, v3);
+            approx::assert_relative_eq!(fe, fd, max_relative = 1e-9, epsilon = 1e-12);
+            for i in 0..6 {
+                approx::assert_relative_eq!(ge[i], gd[i], max_relative = 1e-6, epsilon = 1e-10);
+                for j in 0..6 {
+                    approx::assert_relative_eq!(
+                        he[i][j],
+                        hd[i][j],
+                        max_relative = 1e-5,
+                        epsilon = 1e-9
                     );
                 }
             }

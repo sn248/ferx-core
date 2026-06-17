@@ -717,7 +717,7 @@ pub fn find_ebe(
                     GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
                     g
                 };
-                bfgs_minimize_with_grad(&obj, &grad_fn, &mut eta, n_eta, max_iter, tol)
+                inner_minimize_with_grad(&obj, &grad_fn, &mut eta, n_eta, max_iter, tol)
             }
             InnerGradientMethod::AdEventDriven => {
                 let event_data = ad_event_data.as_ref().unwrap();
@@ -751,18 +751,18 @@ pub fn find_ebe(
                     GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
                     g
                 };
-                bfgs_minimize_with_grad(&obj, &grad_fn, &mut eta, n_eta, max_iter, tol)
+                inner_minimize_with_grad(&obj, &grad_fn, &mut eta, n_eta, max_iter, tol)
             }
             InnerGradientMethod::Fd => unreachable!("guarded above"),
         }
     } else {
-        bfgs_minimize(&obj, &mut eta, n_eta, max_iter, tol)
+        inner_minimize(&obj, &mut eta, n_eta, max_iter, tol)
     };
 
     #[cfg(not(feature = "autodiff"))]
     let result = {
         let _ = grad_method; // silence unused warning on stable builds
-        bfgs_minimize(&obj, &mut eta, n_eta, max_iter, tol)
+        inner_minimize(&obj, &mut eta, n_eta, max_iter, tol)
     };
 
     // If BFGS failed, try Nelder-Mead from the prior mode (eta_true = 0).
@@ -954,7 +954,7 @@ fn find_ebe_iov(
         )
     };
 
-    let bfgs_converged = bfgs_minimize(&obj, &mut x, n_flat, max_iter, tol);
+    let bfgs_converged = inner_minimize(&obj, &mut x, n_flat, max_iter, tol);
     let (nm_converged, used_fallback) = if !bfgs_converged {
         // Reset to prior mode: bsv_psi = mu (eta_true = 0), kappas = 0.
         x = vec![0.0; n_flat];
@@ -1032,46 +1032,124 @@ fn compute_jacobian_fd_iov(
 
 /// BFGS minimization with backtracking line search.
 /// Uses analytical-style gradient via forward FD with small step.
-fn bfgs_minimize(
+/// L-BFGS two-loop recursion: the search direction `d = −H·g` from the bounded
+/// `(s, y, ρ)` history, with implicit initial Hessian `H₀ = γI`,
+/// `γ = sᵀy / yᵀy` of the most recent pair (Nocedal & Wright, Alg. 7.4). With an
+/// empty history this returns `−g` (steepest descent), so the first step matches
+/// the old dense-BFGS start.
+fn lbfgs_direction(
+    g: &[f64],
+    s_hist: &[Vec<f64>],
+    y_hist: &[Vec<f64>],
+    rho_hist: &[f64],
+    n: usize,
+) -> Vec<f64> {
+    let dotp = |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+    let m = s_hist.len();
+    let mut q = g.to_vec();
+    let mut alpha = vec![0.0; m];
+    for i in (0..m).rev() {
+        let a = rho_hist[i] * dotp(&s_hist[i], &q);
+        alpha[i] = a;
+        for j in 0..n {
+            q[j] -= a * y_hist[i][j];
+        }
+    }
+    let gamma = if m > 0 {
+        let sy = dotp(&s_hist[m - 1], &y_hist[m - 1]);
+        let yy = dotp(&y_hist[m - 1], &y_hist[m - 1]);
+        if yy > 1e-12 {
+            sy / yy
+        } else {
+            1.0
+        }
+    } else {
+        1.0
+    };
+    let mut z: Vec<f64> = q.iter().map(|qi| gamma * qi).collect();
+    for i in 0..m {
+        let b = rho_hist[i] * dotp(&y_hist[i], &z);
+        for j in 0..n {
+            z[j] += (alpha[i] - b) * s_hist[i][j];
+        }
+    }
+    z.iter().map(|zi| -zi).collect()
+}
+
+/// Number of curvature pairs retained by the L-BFGS history.
+const LBFGS_MEMORY: usize = 8;
+
+/// Inner-problem dimension at/above which L-BFGS replaces dense BFGS. Below it,
+/// the dense `n×n` inverse-Hessian Newton-converges in a few steps and is faster
+/// (benchmarked: dense wins for `n ≲ 8`, L-BFGS wins 2× at n=64, 17× at n=256 —
+/// see `inner_solver_scaling_bench`). The threshold sits well above the typical
+/// PK `n_eta` (≤ ~8) and modest IOV, so only genuinely high-dimensional inner
+/// problems (large IOV: `n_eta + K·n_kappa`) take the L-BFGS path.
+const INNER_LBFGS_MIN_DIM: usize = 32;
+
+/// Inner EBE minimization with a finite-difference gradient. Dispatches to dense
+/// BFGS (small `n`) or L-BFGS (large `n`) by [`INNER_LBFGS_MIN_DIM`]; both
+/// converge to the same EBE (stationary point of `individual_nll + ½η'Ω⁻¹η`).
+fn inner_minimize(
     obj: &dyn Fn(&[f64]) -> f64,
     x: &mut [f64],
     n: usize,
     max_iter: usize,
     tol: f64,
 ) -> bool {
-    let mut h_inv = DMatrix::identity(n, n);
-    let mut g = gradient_fd(obj, x, n);
-    let mut first_step = true;
+    let grad = |p: &[f64]| gradient_fd(obj, p, n);
+    if n >= INNER_LBFGS_MIN_DIM {
+        lbfgs_core(obj, &grad, x, n, max_iter, tol)
+    } else {
+        dense_bfgs_core(obj, &grad, x, n, max_iter, tol)
+    }
+}
+
+/// Inner EBE minimization with an externally-provided gradient (for AD). Same
+/// dense-vs-L-BFGS dispatch as [`inner_minimize`].
+#[cfg(feature = "autodiff")]
+fn inner_minimize_with_grad(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+) -> bool {
+    if n >= INNER_LBFGS_MIN_DIM {
+        lbfgs_core(obj, grad, x, n, max_iter, tol)
+    } else {
+        dense_bfgs_core(obj, grad, x, n, max_iter, tol)
+    }
+}
+
+/// Shared L-BFGS driver: two-loop direction + backtracking line search, bounded
+/// `(s, y, ρ)` history. `grad` supplies the gradient (FD or AD).
+fn lbfgs_core(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+) -> bool {
+    let mut s_hist: Vec<Vec<f64>> = Vec::new();
+    let mut y_hist: Vec<Vec<f64>> = Vec::new();
+    let mut rho_hist: Vec<f64> = Vec::new();
+    let mut g = grad(x);
 
     for _iter in 0..max_iter {
         let gnorm: f64 = g.iter().map(|&gi| gi * gi).sum::<f64>().sqrt();
-
-        // Scale initial Hessian so first step is O(1) not O(gnorm)
-        if first_step && gnorm > 1.0 {
-            let scale = 1.0 / gnorm;
-            h_inv *= scale;
-            first_step = false;
-        }
         if gnorm < tol {
             return true;
         }
 
-        // Search direction
-        let g_vec = DVector::from_column_slice(&g);
-        let d_vec = -&h_inv * &g_vec;
-        let d: Vec<f64> = d_vec.iter().copied().collect();
-
+        let mut d = lbfgs_direction(&g, &s_hist, &y_hist, &rho_hist, n);
+        // Guard against a non-descent direction (e.g. after a bad curvature
+        // pair) by falling back to steepest descent.
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
         if dg >= 0.0 {
-            // Reset to steepest descent
-            h_inv = DMatrix::identity(n, n);
-            let d: Vec<f64> = g.iter().map(|gi| -gi).collect();
-            let alpha = backtracking_line_search(obj, x, &d, &g, n);
-            for i in 0..n {
-                x[i] += alpha * d[i];
-            }
-            g = gradient_fd(obj, x, n);
-            continue;
+            d = g.iter().map(|gi| -gi).collect();
         }
 
         let alpha = backtracking_line_search(obj, x, &d, &g, n);
@@ -1079,26 +1157,24 @@ fn bfgs_minimize(
             return false;
         }
 
-        // s = alpha * d
         let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
         for i in 0..n {
             x[i] += s[i];
         }
 
-        let g_new = gradient_fd(obj, x, n);
+        let g_new = grad(x);
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
 
-        // BFGS update
-        let s_vec = DVector::from_column_slice(&s);
-        let y_vec = DVector::from_column_slice(&y);
-        let sy = s_vec.dot(&y_vec);
+        let sy: f64 = s.iter().zip(y.iter()).map(|(si, yi)| si * yi).sum();
         if sy > 1e-12 {
-            let rho = 1.0 / sy;
-            let eye = DMatrix::identity(n, n);
-            let s_yt = rho * &s_vec * y_vec.transpose();
-            let y_st = rho * &y_vec * s_vec.transpose();
-            let s_st = rho * &s_vec * s_vec.transpose();
-            h_inv = (&eye - &s_yt) * &h_inv * (&eye - &y_st) + s_st;
+            if s_hist.len() == LBFGS_MEMORY {
+                s_hist.remove(0);
+                y_hist.remove(0);
+                rho_hist.remove(0);
+            }
+            rho_hist.push(1.0 / sy);
+            s_hist.push(s);
+            y_hist.push(y);
         }
 
         g = g_new;
@@ -1107,9 +1183,10 @@ fn bfgs_minimize(
     false
 }
 
-/// BFGS minimization with an externally-provided gradient function (for AD).
-#[cfg(feature = "autodiff")]
-fn bfgs_minimize_with_grad(
+/// Dense (`n×n` inverse-Hessian) BFGS driver, retained for low-dimensional inner
+/// problems where it beats L-BFGS (no two-loop bookkeeping) and for the
+/// solver-scaling benchmark. `grad` supplies the gradient (FD or analytic).
+fn dense_bfgs_core(
     obj: &dyn Fn(&[f64]) -> f64,
     grad: &dyn Fn(&[f64]) -> Vec<f64>,
     x: &mut [f64],
@@ -1123,13 +1200,10 @@ fn bfgs_minimize_with_grad(
 
     for _iter in 0..max_iter {
         let gnorm: f64 = g.iter().map(|&gi| gi * gi).sum::<f64>().sqrt();
-
         if first_step && gnorm > 1.0 {
-            let scale = 1.0 / gnorm;
-            h_inv *= scale;
+            h_inv *= 1.0 / gnorm;
             first_step = false;
         }
-
         if gnorm < tol {
             return true;
         }
@@ -1463,6 +1537,61 @@ pub fn run_inner_loop_warm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dense BFGS vs L-BFGS scaling with inner dimension `n`, on an
+    /// ill-conditioned 1-D-Laplacian quadratic `½xᵀLx − 1ᵀx` (cond ≈ (n/π)², so
+    /// the solve needs ~O(n) curvature updates — representative of a curved inner
+    /// NLL). Both use the **analytic** gradient `Lx − 1` so the per-iteration cost
+    /// is dominated by the solver's linear algebra, not the gradient: dense is
+    /// `O(n²)`/step (matvec + rank-2 update), L-BFGS `O(m·n)`/step. Isolates the
+    /// solver, unlike a real fit where the prediction/FD cost dominates.
+    #[test]
+    #[ignore = "bench: cargo test --release ... -- --ignored --nocapture inner_solver_scaling_bench"]
+    fn inner_solver_scaling_bench() {
+        use std::time::Instant;
+        eprintln!("inner-solver scaling (analytic-gradient Laplacian quadratic):");
+        for &n in &[4usize, 8, 16, 32, 64, 128, 256] {
+            // f(x) = ½ Σ_i (x_i − x_{i-1})² + ½ x_0²  −  Σ_i x_i   (x_{-1}=0).
+            let obj = move |x: &[f64]| -> f64 {
+                let mut f = 0.5 * x[0] * x[0];
+                for i in 1..n {
+                    let d = x[i] - x[i - 1];
+                    f += 0.5 * d * d;
+                }
+                f - x.iter().sum::<f64>()
+            };
+            // grad = L x − 1, L the Dirichlet 1-D Laplacian (tridiag 2,−1).
+            let grad = move |x: &[f64]| -> Vec<f64> {
+                let mut g = vec![0.0; n];
+                for i in 0..n {
+                    let mut v = 2.0 * x[i];
+                    if i > 0 {
+                        v -= x[i - 1];
+                    }
+                    if i + 1 < n {
+                        v -= x[i + 1];
+                    }
+                    g[i] = v - 1.0;
+                }
+                g
+            };
+            let runs = 50;
+            let time_it = |solver: &dyn Fn(&mut [f64]) -> bool| -> f64 {
+                let t0 = Instant::now();
+                for _ in 0..runs {
+                    let mut x = vec![0.0; n];
+                    std::hint::black_box(solver(&mut x));
+                }
+                t0.elapsed().as_secs_f64() * 1e3 / runs as f64
+            };
+            let t_dense = time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8));
+            let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8));
+            eprintln!(
+                "  n={n:4}  dense={t_dense:8.3} ms  lbfgs={t_lbfgs:8.3} ms  dense/lbfgs={:.2}x",
+                t_dense / t_lbfgs
+            );
+        }
+    }
 
     #[test]
     fn test_inner_loop_stats_default() {

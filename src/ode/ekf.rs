@@ -409,6 +409,8 @@ mod tests {
             init_fn: None,
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
         };
         let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 

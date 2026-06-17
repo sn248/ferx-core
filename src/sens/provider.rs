@@ -82,6 +82,42 @@ fn slot_to_dim(slot: usize) -> Option<usize> {
 /// Number of seeded PK dimensions (`CL, V1, Q2, V2, KA, F, Q3, V3`).
 const N_PK: usize = 8;
 
+/// Measurement toggle: `FERX_EXPLICIT_SENS=1` routes supported models to the
+/// hand-written explicit-derivative kernels (`*_explicit`) instead of the
+/// `Dual2<8>` provider path. Default off (Dual2). Used to A/B the per-kernel
+/// speedup on a real fit; not a shipped feature.
+fn explicit_sens_enabled() -> bool {
+    std::env::var("FERX_EXPLICIT_SENS")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Which explicit kernel applies to a subject (model + all-doses-plain).
+#[derive(Clone, Copy)]
+enum ExKind {
+    OneCptBolus,
+    OneCptOral,
+    TwoCptBolus,
+    ThreeCptBolus,
+}
+
+/// Accumulate an `M`-parameter explicit `(grad, hess)` into the 8-slot PK layout
+/// via `map` (small-array index → PK slot).
+fn scatter_explicit<const M: usize>(
+    g: &mut [f64; N_PK],
+    h: &mut [[f64; N_PK]; N_PK],
+    gs: &[f64; M],
+    hs: &[[f64; M]; M],
+    map: &[usize; M],
+) {
+    for a in 0..M {
+        g[map[a]] += gs[a];
+        for b in 0..M {
+            h[map[a]][map[b]] += hs[a][b];
+        }
+    }
+}
+
 /// True when [`subject_sensitivities`] can serve this model: analytical 1-cpt or
 /// 2-cpt, `tv_fn` present, no ODE. Per-subject gates (TV covariates) are checked
 /// separately in [`subject_sensitivities`].
@@ -107,6 +143,14 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
 }
 
+/// True when the exact `sens` outer gradient applies to this model: either the
+/// analytical PK provider ([`analytical_supported`]) or the ODE sensitivity
+/// provider ([`ode_analytical_supported`](crate::sens::ode_provider::ode_analytical_supported)).
+/// Used to gate the gradient dispatch and the Eq. 48 EBE predictor.
+pub fn sens_supported(model: &CompiledModel) -> bool {
+    analytical_supported(model) || crate::sens::ode_provider::ode_analytical_supported(model)
+}
+
 /// The per-observation `∂f/∂η` Jacobian (`n_obs × n_eta`, row-major) as a flat
 /// vector, or `None` when unsupported. Convenience for the inner loop, whose
 /// `h_matrix` is exactly this Jacobian at the converged η̂.
@@ -129,7 +173,11 @@ pub fn subject_eta_jacobian(
 /// `∂tv_i/∂θ_m` by bound-agnostic central finite difference of `tv_fn`. Returns
 /// a row-major `n_tv × n_theta` matrix. `tv_fn` folds covariates and evaluates
 /// at η = 0, so this is purely the θ → typical-value Jacobian.
-fn tv_theta_jacobian(model: &CompiledModel, subject: &Subject, theta: &[f64]) -> Vec<Vec<f64>> {
+pub(crate) fn tv_theta_jacobian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+) -> Vec<Vec<f64>> {
     let tv_fn = model
         .tv_fn
         .as_ref()
@@ -163,6 +211,13 @@ pub fn subject_sensitivities(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
+    // ODE models route to the ODE sensitivity provider (issue #367, Option A):
+    // it produces the same `SubjectSens`, so every downstream consumer
+    // (`subject_packed_gradient*`, `subject_eta_jacobian`, the inner loop)
+    // works unchanged.
+    if model.ode_spec.is_some() {
+        return crate::sens::ode_provider::ode_subject_sensitivities(model, subject, theta, eta);
+    }
     if !analytical_supported(model) || subject.has_tv_covariates() || subject.has_resets() {
         return None;
     }
@@ -231,42 +286,100 @@ pub fn subject_sensitivities(
         });
     }
 
+    // Explicit-kernel fast path (A/B toggle): only when all doses are plain
+    // (non-SS, non-infusion) single inputs for a covered model.
+    let explicit_kind =
+        if explicit_sens_enabled() && subject.doses.iter().all(|d| !d.ss && !d.is_infusion()) {
+            match model.pk_model {
+                PkModel::OneCptIv => Some(ExKind::OneCptBolus),
+                PkModel::OneCptOral => Some(ExKind::OneCptOral),
+                PkModel::TwoCptIv => Some(ExKind::TwoCptBolus),
+                PkModel::ThreeCptIv => Some(ExKind::ThreeCptBolus),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
     let mut out = Vec::with_capacity(subject.obs_times.len());
     for &t_obs in subject.obs_times.iter() {
-        // Seed PK params as Dual2<8> on [CL, V1, Q2, V2, KA, F, Q3, V3]. Lower-
-        // dimensional solutions ignore the unused dims, leaving those
-        // derivatives identically zero.
-        let cl_d = Dual2::<N_PK>::var(cl, 0);
-        let v1_d = Dual2::<N_PK>::var(v1, 1);
-        let q_d = Dual2::<N_PK>::var(q, 2);
-        let v2_d = Dual2::<N_PK>::var(v2, 3);
-        let ka_d = Dual2::<N_PK>::var(ka, 4);
-        let f_d = Dual2::<N_PK>::var(f_bio, 5);
-        let q3_d = Dual2::<N_PK>::var(q3, 6);
-        let v3_d = Dual2::<N_PK>::var(v3, 7);
-
-        // Superpose dose contributions: f = Σ_doses conc(dose, t_obs − dose.time).
-        let mut fd = Dual2::<N_PK>::constant(0.0);
-        for dose in &subject.doses {
-            // SS doses act from their record time; non-SS only after the dose.
-            let elapsed = t_obs - dose.time;
-            if elapsed < 0.0 {
-                continue;
+        // `(f, ∂f/∂pk, ∂²f/∂pk²)` in the 8-slot layout — from the explicit
+        // kernels when applicable, else the generic Dual2<8> path.
+        let (fval, g, h): (f64, [f64; N_PK], [[f64; N_PK]; N_PK]) = if let Some(kind) =
+            explicit_kind
+        {
+            let mut gv = [0.0; N_PK];
+            let mut hv = [[0.0; N_PK]; N_PK];
+            let mut val = 0.0;
+            for dose in &subject.doses {
+                let elapsed = t_obs - dose.time;
+                if elapsed < 0.0 {
+                    continue;
+                }
+                match kind {
+                    ExKind::OneCptBolus => {
+                        let (f, gs, hs) =
+                            super::one_cpt_explicit::iv_bolus_explicit(dose.amt, elapsed, cl, v1);
+                        val += f;
+                        scatter_explicit(&mut gv, &mut hv, &gs, &hs, &[0, 1]);
+                    }
+                    ExKind::OneCptOral => {
+                        let (f, gs, hs) = super::one_cpt_explicit::oral_explicit(
+                            dose.amt, elapsed, cl, v1, ka, f_bio,
+                        );
+                        val += f;
+                        scatter_explicit(&mut gv, &mut hv, &gs, &hs, &[0, 1, 4, 5]);
+                    }
+                    ExKind::TwoCptBolus => {
+                        let (f, gs, hs) = super::two_cpt_explicit::iv_bolus_explicit(
+                            dose.amt, elapsed, cl, v1, q, v2,
+                        );
+                        val += f;
+                        scatter_explicit(&mut gv, &mut hv, &gs, &hs, &[0, 1, 2, 3]);
+                    }
+                    ExKind::ThreeCptBolus => {
+                        let (f, gs, hs) = super::three_cpt_explicit::iv_bolus_explicit(
+                            dose.amt, elapsed, cl, v1, q, v2, q3, v3,
+                        );
+                        val += f;
+                        // [CL,V1,Q2,V2,Q3,V3] → 8-slot layout (Q3=6, V3=7).
+                        scatter_explicit(&mut gv, &mut hv, &gs, &hs, &[0, 1, 2, 3, 6, 7]);
+                    }
+                }
             }
-            let c = if three_cpt {
-                three_cpt_conc_g(
-                    dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
-                )
-            } else if two_cpt {
-                two_cpt_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, ka_d, f_d, oral)
-            } else {
-                one_cpt_conc_g(dose, elapsed, cl_d, v1_d, ka_d, f_d, oral)
-            };
-            fd = fd + c;
-        }
+            (val, gv, hv)
+        } else {
+            // Seed PK params as Dual2<8> on [CL, V1, Q2, V2, KA, F, Q3, V3].
+            // Lower-dimensional solutions ignore the unused dims.
+            let cl_d = Dual2::<N_PK>::var(cl, 0);
+            let v1_d = Dual2::<N_PK>::var(v1, 1);
+            let q_d = Dual2::<N_PK>::var(q, 2);
+            let v2_d = Dual2::<N_PK>::var(v2, 3);
+            let ka_d = Dual2::<N_PK>::var(ka, 4);
+            let f_d = Dual2::<N_PK>::var(f_bio, 5);
+            let q3_d = Dual2::<N_PK>::var(q3, 6);
+            let v3_d = Dual2::<N_PK>::var(v3, 7);
 
-        let g = fd.grad; // ∂f/∂[CL,V1,Q2,V2,KA,F,Q3,V3]
-        let h = fd.hess; // ∂²f/∂[CL,V1,Q2,V2,KA,F,Q3,V3]²
+            // Superpose dose contributions: f = Σ conc(dose, t_obs − dose.time).
+            let mut fd = Dual2::<N_PK>::constant(0.0);
+            for dose in &subject.doses {
+                let elapsed = t_obs - dose.time;
+                if elapsed < 0.0 {
+                    continue;
+                }
+                let c = if three_cpt {
+                    three_cpt_conc_g(
+                        dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
+                    )
+                } else if two_cpt {
+                    two_cpt_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, ka_d, f_d, oral)
+                } else {
+                    one_cpt_conc_g(dose, elapsed, cl_d, v1_d, ka_d, f_d, oral)
+                };
+                fd = fd + c;
+            }
+            (fd.value, fd.grad, fd.hess)
+        };
 
         let mut df_deta = vec![0.0; n_eta];
         let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
@@ -317,7 +430,7 @@ pub fn subject_sensitivities(
         }
 
         out.push(ObsSens {
-            f: fd.value,
+            f: fval,
             df_deta,
             d2f_deta2,
             df_dtheta,

@@ -1560,7 +1560,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .unwrap_or_default();
         let is_ode_model = model.ode_spec.is_some();
 
-        let (scaling, output_fn) = parse_scaling_block(
+        let (scaling, output_fn, output_program) = parse_scaling_block(
             scaling_lines,
             &theta_names_for_scaling,
             &eta_names_for_scaling,
@@ -1617,6 +1617,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         if let Some(new_readout) = output_fn {
             let ode_spec = model.ode_spec.as_mut().expect("guarded by is_ode_model");
             ode_spec.readout = new_readout;
+            // Form C sensitivity program (issue #367); `None` for per-CMT.
+            ode_spec.readout_program = output_program;
         }
 
         model.scaling = scaling;
@@ -3648,7 +3650,7 @@ fn build_y_output_fn(
     pk_indices: &[usize],
     state_names: &[String],
     kappa_names: &[String],
-) -> Result<crate::ode::OdeOutputFn, String> {
+) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram), String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
     let mut defined: Vec<String> = state_names.to_vec();
@@ -3735,6 +3737,24 @@ fn build_y_output_fn(
     resolve_expr_indices(&mut expr, &var_idx, &cov_idx);
     let bc = compile_bytecode(&expr);
 
+    // Snapshot the readout as an `OdeOutputProgram` for the analytic-sensitivity
+    // path (issue #367): same bytecode + layout, evaluated over `Dual2<N>`. It is
+    // `simple` (dual-evaluable with empty θ/η/cov) when the expression references
+    // only states / individual parameters / constants.
+    let output_simple = !bc.ops.iter().any(|op| {
+        matches!(
+            op,
+            Op::PushTheta(_) | Op::PushEta(_) | Op::PushCov(_) | Op::PushNnOutput(_, _)
+        )
+    });
+    let output_program = OdeOutputProgram {
+        bc: bc.clone(),
+        n_states,
+        n_indiv,
+        indiv_to_pk: indiv_to_pk.clone(),
+        simple: output_simple,
+    };
+
     // Per-thread scratch for the y readout vars + covariate slice + bytecode
     // f64 stack comes from the shared `FERX_SCRATCH` (see `FerxThreadScratch`).
     // The y-readout fields are kept separate from rhs_vars because the two are
@@ -3796,7 +3816,7 @@ fn build_y_output_fn(
             })
         },
     );
-    Ok(out_fn)
+    Ok((out_fn, output_program))
 }
 
 /// Parsed contents of a `[scaling]` block.
@@ -3834,7 +3854,14 @@ fn parse_scaling_block(
     state_names: &[String],
     is_ode: bool,
     kappa_names: &[String],
-) -> Result<(ScalingSpec, Option<crate::ode::OdeReadout>), String> {
+) -> Result<
+    (
+        ScalingSpec,
+        Option<crate::ode::OdeReadout>,
+        Option<OdeOutputProgram>,
+    ),
+    String,
+> {
     // Accumulate uniform and per-CMT entries separately, then assemble at
     // the end. Mixing the two forms within the same group (obs_scale or y)
     // is rejected — keeps the semantic clean and matches NONMEM's
@@ -3843,6 +3870,9 @@ fn parse_scaling_block(
     let mut obs_scale_per_cmt: HashMap<usize, ScalingSpec> = HashMap::new();
     let mut y_uniform: Option<crate::ode::OdeOutputFn> = None;
     let mut y_per_cmt: HashMap<usize, crate::ode::OdeOutputFn> = HashMap::new();
+    // Sensitivity program for the uniform `y = <expr>` readout (issue #367); the
+    // per-CMT form is out of the analytic-sensitivity scope, so it carries none.
+    let mut y_uniform_program: Option<OdeOutputProgram> = None;
 
     for line in lines {
         let trimmed = line.trim();
@@ -3922,7 +3952,7 @@ fn parse_scaling_block(
                          use `obs_scale = <expr>` for analytical PK"
                         .into());
                 }
-                let out_fn = build_y_output_fn(
+                let (out_fn, out_program) = build_y_output_fn(
                     value,
                     theta_names,
                     eta_names,
@@ -3942,6 +3972,7 @@ fn parse_scaling_block(
                                 .into());
                         }
                         y_uniform = Some(out_fn);
+                        y_uniform_program = Some(out_program);
                     }
                     Some(cmt) => {
                         if y_uniform.is_some() {
@@ -3976,7 +4007,13 @@ fn parse_scaling_block(
     } else {
         None
     };
-    Ok((scaling, readout))
+    // The output program accompanies the uniform `Single` readout only.
+    let readout_program = if readout.is_some() {
+        y_uniform_program
+    } else {
+        None
+    };
+    Ok((scaling, readout, readout_program))
 }
 
 // ── [structural_model] ODE variant parser ───────────────────────────────────
@@ -4957,6 +4994,20 @@ fn build_ode_spec(
     // `vec.clear(); vec.resize(n, 0.0)` re-zeros the buffer cheaply (no realloc
     // once the capacity grows), so intermediate slots in untaken if-branches
     // still read 0 just like the old per-call `vec![0.0; n]` path.
+    // Snapshot the resolved RHS program for the analytic-sensitivity path
+    // (issue #367) before the f64 closure moves `stmts_owned`. Same statements,
+    // same var layout — evaluated over `Dual2<N>` by `eval_rhs_dual`.
+    let rhs_program = OdeRhsProgram {
+        stmts: stmts_owned.clone(),
+        n_vars_total,
+        state_count,
+        indiv_to_params_slot: indiv_to_params_slot.clone(),
+        time_slot,
+        tafd_slot,
+        tad_slot,
+        macheps_slot,
+    };
+
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
         Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
             // The integrator always passes a `u` whose length matches the
@@ -5100,6 +5151,10 @@ fn build_ode_spec(
         // Built-in absorption forcing terms split out of the [odes] RHS above
         // (design A); empty for models with no transit()/etc. input-rate call.
         input_rate,
+        rhs_program: Some(rhs_program),
+        // Form C readout program (if any) is attached later, when `[scaling]`
+        // is parsed (see the `parse_scaling_block` wiring).
+        readout_program: None,
     })
 }
 
@@ -7468,6 +7523,228 @@ fn eval_bytecode(
     }
 }
 
+/// Generic counterpart to [`eval_bytecode`] for the analytic-sensitivity path:
+/// the same `Bytecode`, evaluated over any [`PkNum`] `T` so a single program
+/// serves both the scalar value (`T = f64`) and its exact PK-parameter
+/// derivatives (`T = Dual2<N>`). Only `vars` carries `T` — that slice holds the
+/// ODE state and individual parameters, the things seeded as dual variables.
+/// `theta`/`eta`/`covariates`/`nn_outputs` are lifted as constants (we do not
+/// differentiate w.r.t. them here; η/θ enter through the provider's outer chain).
+///
+/// **This is a second evaluator and must stay semantically identical to
+/// [`eval_bytecode`]'s `f64` path** — the smooth ops route through `PkNum`, the
+/// guards (`Div`/`Mod`/`Ln`/`Sqrt`) and value-based ops (`Cmp*`/`Logic*`/`Mod`/
+/// `Floor`/`Ceil`/`Round`/jumps) branch on `.val()` exactly as the scalar path
+/// branches on the `f64`. The `bytecode_g_matches_f64_*` tests pin `T::val()` to
+/// `eval_bytecode` so the two cannot drift.
+// Wired into the `Dual2`-state ODE integrator in Phase 3 of #367; until then it
+// has only test callers, so the non-test build sees it as unused.
+#[allow(dead_code)]
+fn eval_bytecode_g<T: crate::sens::num::PkNum>(
+    bc: &Bytecode,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &[f64],
+    vars: &[T],
+    nn_outputs: &[Vec<f64>],
+    stack: &mut Vec<T>,
+) -> T {
+    stack.clear();
+    stack.reserve(bc.max_stack);
+    let mut pc: usize = 0;
+    let ops = bc.ops.as_slice();
+    let consts = bc.constants.as_slice();
+    let k = T::from_f64;
+
+    macro_rules! push {
+        ($v:expr) => {
+            stack.push($v)
+        };
+    }
+    macro_rules! pop {
+        () => {
+            stack.pop().unwrap_or_else(|| {
+                debug_assert!(false, "eval_bytecode_g stack underflow at pc={pc}");
+                k(0.0)
+            })
+        };
+    }
+
+    while pc < ops.len() {
+        match ops[pc] {
+            Op::PushConst(i) => push!(k(consts[i as usize])),
+            Op::PushTheta(i) => push!(k(theta.get(i as usize).copied().unwrap_or(0.0))),
+            Op::PushEta(i) => push!(k(eta.get(i as usize).copied().unwrap_or(0.0))),
+            Op::PushVar(i) => push!(*vars.get(i as usize).unwrap_or(&k(0.0))),
+            Op::PushCov(i) => push!(k(covariates.get(i as usize).copied().unwrap_or(0.0))),
+            Op::PushNnOutput(nn_i, out_i) => {
+                let v = nn_outputs
+                    .get(nn_i as usize)
+                    .and_then(|v| v.get(out_i as usize))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        debug_assert!(
+                            false,
+                            "Op::PushNnOutput nn_idx={nn_i} output_idx={out_i} out of bounds"
+                        );
+                        0.0
+                    });
+                push!(k(v));
+            }
+            Op::Add => {
+                let b = pop!();
+                let a = pop!();
+                push!(a + b);
+            }
+            Op::Sub => {
+                let b = pop!();
+                let a = pop!();
+                push!(a - b);
+            }
+            Op::Mul => {
+                let b = pop!();
+                let a = pop!();
+                push!(a * b);
+            }
+            Op::Div => {
+                let b = pop!();
+                let a = pop!();
+                push!(if b.val().abs() < 1e-30 { k(0.0) } else { a / b });
+            }
+            Op::Pow => {
+                let e = pop!();
+                let b = pop!();
+                push!(b.pow(e));
+            }
+            Op::Mod => {
+                let b = pop!();
+                let a = pop!();
+                // Non-differentiable: compute on values, lift as a constant.
+                push!(if b.val().abs() < 1e-30 {
+                    k(0.0)
+                } else {
+                    k(a.val().rem_euclid(b.val()))
+                });
+            }
+            Op::Exp => {
+                let v = pop!();
+                push!(v.exp());
+            }
+            Op::Ln => {
+                let v = pop!();
+                push!(v.guard_floor(1e-30).ln());
+            }
+            Op::Sqrt => {
+                let v = pop!();
+                push!(v.guard_floor(0.0).sqrt());
+            }
+            Op::Abs => {
+                let v = pop!();
+                push!(v.abs());
+            }
+            Op::Floor => {
+                let v = pop!();
+                push!(k(v.val().floor()));
+            }
+            Op::Ceil => {
+                let v = pop!();
+                push!(k(v.val().ceil()));
+            }
+            Op::Round => {
+                let v = pop!();
+                push!(k(v.val().round()));
+            }
+            Op::InvLogit => {
+                let v = pop!();
+                push!(v.inv_logit());
+            }
+            Op::Logit => {
+                let v = pop!();
+                // Match the scalar path's clamp to (0,1); the clamped region is
+                // flat (zero jet for duals).
+                let r = if v.val() <= 1e-15 {
+                    k((1e-15_f64 / (1.0 - 1e-15)).ln())
+                } else if v.val() >= 1.0 - 1e-15 {
+                    k(((1.0 - 1e-15_f64) / 1e-15).ln())
+                } else {
+                    v.logit()
+                };
+                push!(r);
+            }
+            Op::CmpLt => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() < r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::CmpLe => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() <= r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::CmpGt => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() > r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::CmpGe => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() >= r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::CmpEq => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() == r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::CmpNe => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() != r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::LogicAnd => {
+                let b = pop!();
+                let a = pop!();
+                push!(k(if a.val() != 0.0 && b.val() != 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }));
+            }
+            Op::LogicOr => {
+                let b = pop!();
+                let a = pop!();
+                push!(k(if a.val() != 0.0 || b.val() != 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }));
+            }
+            Op::LogicNot => {
+                let v = pop!();
+                push!(k(if v.val() == 0.0 { 1.0 } else { 0.0 }));
+            }
+            Op::JumpIfFalse(target) => {
+                let v = pop!();
+                if v.val() == 0.0 {
+                    pc = target as usize;
+                    continue;
+                }
+            }
+            Op::Jump(target) => {
+                pc = target as usize;
+                continue;
+            }
+        }
+        pc += 1;
+    }
+    debug_assert!(
+        stack.len() == 1,
+        "eval_bytecode_g: bytecode finished at stack depth {}, expected 1",
+        stack.len()
+    );
+    stack.pop().unwrap_or_else(|| k(0.0))
+}
+
 /// Indexed-form evaluator: `vars` is a `Vec<f64>` indexed by parse-time
 /// variable slot; `covariates` is a `Vec<f64>` aligned to
 /// `CompiledModel.referenced_covariates`. Hot-path replacement for the
@@ -7729,6 +8006,192 @@ fn eval_statements_indexed_with_stack(
             // rewrites them. Silently skip if one slips through.
             Statement::Assign(_, _) | Statement::DiffEq(_, _) => {}
         }
+    }
+}
+
+/// [`eval_statements_indexed_with_stack`] generic over `T: PkNum`, for the ODE
+/// sensitivity RHS (`T = Dual2<N>`). The resolved ODE RHS only ever contains
+/// `AssignBc`/`DiffEqBc`/`If`, so the smooth assignments route through
+/// [`eval_bytecode_g`] and `If` conditions — value-based branch decisions —
+/// evaluate on a `.val()` view via the existing scalar [`eval_condition_indexed`]
+/// (theta/eta/cov/nn are empty in the ODE RHS). Mirrors the f64 evaluator
+/// statement-for-statement; the `eval_statements_g_*` tests pin it to that path.
+// Wired into the `Dual2`-state ODE RHS in Phase 3 of #367; test-only caller so far.
+#[allow(dead_code)]
+fn eval_statements_g<T: crate::sens::num::PkNum>(
+    stmts: &[Statement],
+    vars: &mut [T],
+    du: Option<&mut [T]>,
+    bc_stack: &mut Vec<T>,
+) {
+    let empty: [f64; 0] = [];
+    let empty_nn: Vec<Vec<f64>> = Vec::new();
+    let mut du_opt = du;
+    for s in stmts {
+        match s {
+            Statement::AssignBc(idx, bc) => {
+                let v = eval_bytecode_g::<T>(bc, &empty, &empty, &empty, vars, &empty_nn, bc_stack);
+                if let Some(slot) = vars.get_mut(*idx) {
+                    *slot = v;
+                }
+            }
+            Statement::DiffEqBc(state_idx, bc) => {
+                let v = eval_bytecode_g::<T>(bc, &empty, &empty, &empty, vars, &empty_nn, bc_stack);
+                if let Some(buf) = du_opt.as_deref_mut() {
+                    if let Some(slot) = buf.get_mut(*state_idx) {
+                        *slot = v;
+                    }
+                }
+            }
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                // Conditions are value-based; evaluate on a scalar view of `vars`.
+                let vars_val: Vec<f64> = vars.iter().map(|v| v.val()).collect();
+                let mut taken = false;
+                for (cond, body) in branches {
+                    if eval_condition_indexed(cond, &empty, &empty, &empty, &vars_val, &empty_nn) {
+                        eval_statements_g::<T>(body, vars, du_opt.as_deref_mut(), bc_stack);
+                        taken = true;
+                        break;
+                    }
+                }
+                if !taken {
+                    if let Some(eb) = else_body {
+                        eval_statements_g::<T>(eb, vars, du_opt.as_deref_mut(), bc_stack);
+                    }
+                }
+            }
+            Statement::AssignIdx(_, _)
+            | Statement::DiffEqIdx(_, _)
+            | Statement::Assign(_, _)
+            | Statement::DiffEq(_, _) => {}
+        }
+    }
+}
+
+/// Compiled ODE RHS program + var layout, exposed so the analytic-sensitivity
+/// provider can evaluate the same RHS over `Dual2<N>` (issue #367, Option A).
+/// Carries exactly what the f64 `rhs` closure binds, so [`eval_rhs_dual`]
+/// reproduces that binding but seeds the individual parameters as dual variables.
+///
+/// [`eval_rhs_dual`]: OdeRhsProgram::eval_rhs_dual
+///
+/// `pub` only so it can appear in the (public) [`OdeSpec`](crate::ode::OdeSpec)
+/// field; all fields are private, so it is opaque outside the crate and can be
+/// produced only by the parser.
+pub struct OdeRhsProgram {
+    stmts: Vec<Statement>,
+    n_vars_total: usize,
+    state_count: usize,
+    /// Per individual parameter `i`, the slot in the flat `params` vector it is
+    /// read from (its PK slot). Same plan the f64 `rhs` closure uses.
+    indiv_to_params_slot: Vec<usize>,
+    time_slot: usize,
+    tafd_slot: usize,
+    tad_slot: usize,
+    macheps_slot: usize,
+}
+
+impl OdeRhsProgram {
+    /// Evaluate `du = f(u, p, t)` over `Dual2<N>`. `u` is the current state;
+    /// `params` is the flat PK-parameter vector with the differentiated slots
+    /// already seeded as dual variables (so individual parameter `i`, read from
+    /// `params[indiv_to_params_slot[i]]`, carries its derivative); `tafd`/`tad`
+    /// are the time-after-first/last-dose anchors (constants w.r.t. the
+    /// parameters, lifted as such). `vars`/`stack` are caller-owned scratch
+    /// reused across RK stages. Writes `du` (length `state_count`). Mirrors the
+    /// f64 binding in the `rhs` closure statement-for-statement.
+    pub(crate) fn eval_rhs_dual<const N: usize>(
+        &self,
+        u: &[crate::sens::dual2::Dual2<N>],
+        params: &[crate::sens::dual2::Dual2<N>],
+        t: f64,
+        tafd: f64,
+        tad: f64,
+        du: &mut [crate::sens::dual2::Dual2<N>],
+        vars: &mut Vec<crate::sens::dual2::Dual2<N>>,
+        stack: &mut Vec<crate::sens::dual2::Dual2<N>>,
+    ) {
+        use crate::sens::dual2::Dual2;
+        vars.clear();
+        vars.resize(self.n_vars_total, Dual2::<N>::constant(0.0));
+        let copy_n = self.state_count.min(u.len());
+        vars[..copy_n].copy_from_slice(&u[..copy_n]);
+        for (i, &slot) in self.indiv_to_params_slot.iter().enumerate() {
+            if let (Some(dst), Some(&val)) = (vars.get_mut(self.state_count + i), params.get(slot))
+            {
+                *dst = val;
+            }
+        }
+        if let Some(d) = vars.get_mut(self.time_slot) {
+            *d = Dual2::constant(t);
+        }
+        if let Some(d) = vars.get_mut(self.tafd_slot) {
+            *d = Dual2::constant(tafd);
+        }
+        if let Some(d) = vars.get_mut(self.tad_slot) {
+            *d = Dual2::constant(tad);
+        }
+        if let Some(d) = vars.get_mut(self.macheps_slot) {
+            *d = Dual2::constant(f64::EPSILON);
+        }
+        for d in du.iter_mut() {
+            *d = Dual2::constant(0.0);
+        }
+        eval_statements_g::<Dual2<N>>(&self.stmts, vars, Some(du), stack);
+    }
+}
+
+/// Compiled Form C ODE output expression (`[scaling] y = <expr>`) + var layout,
+/// exposed so the analytic-sensitivity provider can evaluate the readout
+/// (e.g. `central / V1`) over `Dual2<N>` — turning the integrated dual state and
+/// the dual PK parameters into the scaled observable with exact derivatives
+/// (issue #367, Option A). Mirrors the f64 readout closure in `build_y_output_fn`.
+pub struct OdeOutputProgram {
+    bc: Bytecode,
+    n_states: usize,
+    n_indiv: usize,
+    /// Per individual parameter `i`, its slot in the flat PK-parameter vector.
+    indiv_to_pk: Vec<usize>,
+    /// True when the expression references only states / individual parameters /
+    /// constants (no θ/η/covariate/NN terms) — the case the dual readout can
+    /// evaluate with empty θ/η/cov inputs.
+    simple: bool,
+}
+
+impl OdeOutputProgram {
+    /// See [`OdeOutputProgram::simple`].
+    pub(crate) fn is_simple(&self) -> bool {
+        self.simple
+    }
+
+    /// Evaluate the output expression over `Dual2<N>`. `state` is the integrated
+    /// dual state; `params` is the flat PK-parameter vector with the
+    /// differentiated slots seeded as dual variables (so `V1`'s derivative flows
+    /// into `central / V1`). `vars`/`stack` are caller-owned scratch. Only valid
+    /// when [`is_simple`](Self::is_simple) holds.
+    pub(crate) fn eval_output_dual<const N: usize>(
+        &self,
+        state: &[crate::sens::dual2::Dual2<N>],
+        params: &[crate::sens::dual2::Dual2<N>],
+        vars: &mut Vec<crate::sens::dual2::Dual2<N>>,
+        stack: &mut Vec<crate::sens::dual2::Dual2<N>>,
+    ) -> crate::sens::dual2::Dual2<N> {
+        use crate::sens::dual2::Dual2;
+        vars.clear();
+        vars.resize(self.n_states + self.n_indiv, Dual2::<N>::constant(0.0));
+        let copy_n = self.n_states.min(state.len());
+        vars[..copy_n].copy_from_slice(&state[..copy_n]);
+        for (i, &slot) in self.indiv_to_pk.iter().enumerate() {
+            if let (Some(dst), Some(&v)) = (vars.get_mut(self.n_states + i), params.get(slot)) {
+                *dst = v;
+            }
+        }
+        let empty: [f64; 0] = [];
+        let empty_nn: Vec<Vec<f64>> = Vec::new();
+        eval_bytecode_g::<Dual2<N>>(&self.bc, &empty, &empty, &empty, vars, &empty_nn, stack)
     }
 }
 
@@ -15766,6 +16229,240 @@ if (1 > 0) {
     }
     fn cmp(l: Expression, op: CmpOp, r: Expression) -> Condition {
         Condition::Compare(l, op, r)
+    }
+
+    // ── Generic bytecode VM (`eval_bytecode_g`) ──────────────────────────────
+    //
+    // The Dual2 analytic-sensitivity path reuses the same `Bytecode` through
+    // `eval_bytecode_g`. These tests pin it to the scalar evaluator: the `f64`
+    // monomorphization must be bit-identical to `eval_bytecode`, and the
+    // `Dual2<2>` value/grad/Hessian must match the f64 path and its finite
+    // differences — so the second evaluator cannot silently drift.
+
+    fn varidx(i: usize) -> Expression {
+        Expression::VariableIdx(i)
+    }
+    fn power_expr(b: Expression, e: Expression) -> Expression {
+        Expression::Power(Box::new(b), Box::new(e))
+    }
+    fn close(a: f64, b: f64, rel: f64, eps: f64) -> bool {
+        let d = (a - b).abs();
+        d <= eps || d <= rel * a.abs().max(b.abs())
+    }
+
+    fn bc_g_f64_matches(expr: &Expression, vars: &[f64]) {
+        let nn: Vec<Vec<f64>> = Vec::new();
+        let bc = compile_bytecode(expr);
+        let mut s1: Vec<f64> = Vec::new();
+        let f = eval_bytecode(&bc, &[], &[], &[], vars, &nn, &mut s1);
+        let mut s2: Vec<f64> = Vec::new();
+        let g = eval_bytecode_g::<f64>(&bc, &[], &[], &[], vars, &nn, &mut s2);
+        assert_eq!(
+            f.to_bits(),
+            g.to_bits(),
+            "f64 generic VM drift: expr={expr:?} f={f} g={g}"
+        );
+    }
+
+    /// Vars 0 and 1 are seeded as `Dual2<2>` variables; check value/grad/Hessian
+    /// against the f64 evaluator and its central finite differences.
+    fn bc_g_dual2_fd(expr: &Expression, x: f64, y: f64, gtol: f64, htol: f64) {
+        use crate::sens::dual2::Dual2;
+        let nn: Vec<Vec<f64>> = Vec::new();
+        let bc = compile_bytecode(expr);
+        let vd = [Dual2::<2>::var(x, 0), Dual2::<2>::var(y, 1)];
+        let mut sd: Vec<Dual2<2>> = Vec::new();
+        let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        let v = |a: f64, b: f64| {
+            let mut s: Vec<f64> = Vec::new();
+            eval_bytecode(&bc, &[], &[], &[], &[a, b], &nn, &mut s)
+        };
+        assert!(close(d.value, v(x, y), 1e-12, 1e-12), "value: {expr:?}");
+        let h = 1e-5;
+        let gx = (v(x + h, y) - v(x - h, y)) / (2.0 * h);
+        let gy = (v(x, y + h) - v(x, y - h)) / (2.0 * h);
+        assert!(
+            close(d.grad[0], gx, gtol, 1e-7),
+            "grad0 {:?}: {} vs {}",
+            expr,
+            d.grad[0],
+            gx
+        );
+        assert!(
+            close(d.grad[1], gy, gtol, 1e-7),
+            "grad1 {:?}: {} vs {}",
+            expr,
+            d.grad[1],
+            gy
+        );
+        let hh = 1e-4;
+        let hxx = (v(x + hh, y) - 2.0 * v(x, y) + v(x - hh, y)) / (hh * hh);
+        let hyy = (v(x, y + hh) - 2.0 * v(x, y) + v(x, y - hh)) / (hh * hh);
+        let hxy = (v(x + hh, y + hh) - v(x + hh, y - hh) - v(x - hh, y + hh) + v(x - hh, y - hh))
+            / (4.0 * hh * hh);
+        assert!(
+            close(d.hess[0][0], hxx, htol, 1e-4),
+            "hxx {:?}: {} vs {}",
+            expr,
+            d.hess[0][0],
+            hxx
+        );
+        assert!(
+            close(d.hess[1][1], hyy, htol, 1e-4),
+            "hyy {:?}: {} vs {}",
+            expr,
+            d.hess[1][1],
+            hyy
+        );
+        assert!(
+            close(d.hess[0][1], hxy, htol, 1e-4),
+            "hxy {:?}: {} vs {}",
+            expr,
+            d.hess[0][1],
+            hxy
+        );
+        assert!(
+            close(d.hess[0][1], d.hess[1][0], 1e-12, 1e-12),
+            "hess symmetry"
+        );
+    }
+
+    #[test]
+    fn bytecode_g_f64_bit_identical() {
+        let vars = [1.7_f64, 0.8];
+        let exprs = [
+            binop(BinOp::Add, varidx(0), varidx(1)),
+            binop(BinOp::Sub, varidx(0), varidx(1)),
+            binop(BinOp::Mul, varidx(0), varidx(1)),
+            binop(BinOp::Div, varidx(0), varidx(1)),
+            binop(BinOp::Mod, varidx(0), lit(0.5)),
+            power_expr(varidx(0), lit(2.5)),
+            power_expr(varidx(0), varidx(1)),
+            unary("exp", binop(BinOp::Sub, lit(0.0), varidx(0))),
+            unary("ln", binop(BinOp::Mul, varidx(0), varidx(1))),
+            unary("sqrt", binop(BinOp::Add, varidx(0), varidx(1))),
+            unary("abs", binop(BinOp::Sub, varidx(0), varidx(1))),
+            unary("inv_logit", binop(BinOp::Sub, varidx(0), varidx(1))),
+            unary("logit", binop(BinOp::Mul, lit(0.3), varidx(1))),
+            unary("floor", varidx(0)),
+            unary("ceil", varidx(0)),
+            unary("round", varidx(0)),
+            cond(cmp(varidx(0), CmpOp::Gt, varidx(1)), lit(1.0), lit(2.0)),
+        ];
+        for e in &exprs {
+            bc_g_f64_matches(e, &vars);
+        }
+        // Guard branches: zero divisor, ln/sqrt of a non-positive argument.
+        bc_g_f64_matches(&binop(BinOp::Div, varidx(0), lit(0.0)), &vars);
+        bc_g_f64_matches(&unary("ln", binop(BinOp::Sub, lit(0.0), varidx(0))), &vars);
+        bc_g_f64_matches(
+            &unary("sqrt", binop(BinOp::Sub, lit(0.0), varidx(0))),
+            &vars,
+        );
+    }
+
+    #[test]
+    fn eval_statements_g_matches_f64_and_fd() {
+        use crate::sens::dual2::Dual2;
+        // vars: slot0=u (state), slot1=k (param), slot2=tmp (intermediate).
+        //   tmp = k·u ;  d/dt(u) = −tmp.
+        let stmts = vec![
+            Statement::AssignBc(
+                2,
+                compile_bytecode(&binop(BinOp::Mul, varidx(1), varidx(0))),
+            ),
+            Statement::DiffEqBc(0, compile_bytecode(&binop(BinOp::Sub, lit(0.0), varidx(2)))),
+        ];
+
+        let mut vf = vec![2.0_f64, 0.3, 0.0];
+        let mut duf = vec![0.0_f64];
+        let mut sf: Vec<f64> = Vec::new();
+        eval_statements_indexed_with_stack(
+            &stmts,
+            &[],
+            &[],
+            &[],
+            &mut vf,
+            Some(&mut duf),
+            &[],
+            &mut sf,
+        );
+
+        // Seed k (slot 1) as the differentiated variable.
+        let mut vd = vec![
+            Dual2::<1>::constant(2.0),
+            Dual2::<1>::var(0.3, 0),
+            Dual2::<1>::constant(0.0),
+        ];
+        let mut dud = vec![Dual2::<1>::constant(0.0)];
+        let mut sd: Vec<Dual2<1>> = Vec::new();
+        eval_statements_g::<Dual2<1>>(&stmts, &mut vd, Some(&mut dud), &mut sd);
+
+        assert!(close(dud[0].value, duf[0], 1e-12, 1e-12), "value vs f64");
+        // du[0] = −k·u = −0.6; ∂/∂k = −u = −2; ∂²/∂k² = 0.
+        assert!(close(dud[0].value, -0.6, 1e-12, 1e-12));
+        assert!(close(dud[0].grad[0], -2.0, 1e-9, 1e-9));
+        assert!(close(dud[0].hess[0][0], 0.0, 1e-9, 1e-9));
+    }
+
+    #[test]
+    fn bytecode_g_dual2_matches_fd() {
+        bc_g_dual2_fd(
+            &unary("ln", binop(BinOp::Mul, varidx(0), varidx(1))),
+            1.7,
+            0.8,
+            1e-6,
+            1e-3,
+        );
+        bc_g_dual2_fd(&power_expr(varidx(0), lit(2.5)), 1.7, 0.8, 1e-6, 1e-3);
+        bc_g_dual2_fd(&power_expr(varidx(0), varidx(1)), 1.7, 0.8, 1e-6, 2e-3);
+        bc_g_dual2_fd(
+            &unary("sqrt", binop(BinOp::Add, varidx(0), varidx(1))),
+            1.7,
+            0.8,
+            1e-6,
+            1e-3,
+        );
+        bc_g_dual2_fd(
+            &unary("inv_logit", binop(BinOp::Sub, varidx(0), varidx(1))),
+            0.6,
+            0.2,
+            1e-6,
+            1e-3,
+        );
+        bc_g_dual2_fd(
+            &unary(
+                "abs",
+                binop(
+                    BinOp::Sub,
+                    binop(BinOp::Mul, varidx(0), varidx(0)),
+                    varidx(1),
+                ),
+            ),
+            2.0,
+            1.0,
+            1e-6,
+            1e-3,
+        );
+        // 1-cpt IV-bolus shape: (1/V)·exp(−(CL/V)). vars: 0=CL, 1=V.
+        bc_g_dual2_fd(
+            &binop(
+                BinOp::Mul,
+                binop(BinOp::Div, lit(1.0), varidx(1)),
+                unary(
+                    "exp",
+                    binop(
+                        BinOp::Sub,
+                        lit(0.0),
+                        binop(BinOp::Div, varidx(0), varidx(1)),
+                    ),
+                ),
+            ),
+            3.0,
+            5.0,
+            1e-6,
+            1e-3,
+        );
     }
 
     #[test]

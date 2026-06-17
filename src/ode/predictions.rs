@@ -547,6 +547,17 @@ pub struct OdeSpec {
     /// that injects `+rate` for infusions. Empty for models with no built-in
     /// `transit()`/etc. input-rate term (the historical default).
     pub input_rate: Vec<crate::pk::absorption::InputRateForcing>,
+    /// Compiled RHS program for the analytic-sensitivity path (issue #367,
+    /// Option A): lets the sensitivity provider evaluate the same RHS over
+    /// `Dual2<N>` to obtain exact PK-parameter derivatives. `None` for
+    /// hand-built specs (tests, EKF) and any model outside the ODE-sensitivity
+    /// scope gate; those fall back to the gradient-free path.
+    pub rhs_program: Option<crate::parser::model_parser::OdeRhsProgram>,
+    /// Compiled Form C readout (`[scaling] y = <expr>`) for the analytic-
+    /// sensitivity path (issue #367): lets the provider evaluate the scaled
+    /// observable (e.g. `central / V1`) over `Dual2<N>`. `None` for `ObsCmt`
+    /// readouts (read the state directly), per-CMT Form C, and hand-built specs.
+    pub readout_program: Option<crate::parser::model_parser::OdeOutputProgram>,
 }
 
 impl OdeSpec {
@@ -1833,6 +1844,8 @@ mod tests {
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
             init_fn: None,
         }
     }
@@ -1881,6 +1894,8 @@ mod tests {
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
             init_fn: Some(Box::new(|p: &[f64]| {
                 let (kin, kout) = (p[0], p[1]);
                 vec![if kout > 0.0 { kin / kout } else { 0.0 }]
@@ -1918,6 +1933,8 @@ mod tests {
                 arg_slots: vec![6, 7],
             }],
             init_fn: None,
+            rhs_program: None,
+            readout_program: None,
         }
     }
 
@@ -2412,6 +2429,8 @@ mod tests {
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
             init_fn: None,
         }
     }
@@ -2852,6 +2871,8 @@ mod tests {
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
             init_fn: None,
         }
     }
@@ -2986,6 +3007,8 @@ mod tests {
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
             init_fn: None,
         };
         let pk = pk_one(1.0, 1.0);

@@ -3354,6 +3354,8 @@ pub(crate) mod test_helpers {
                     init_fn: None,
                     solver_opts: crate::ode::OdeSolverOptions::default(),
                     input_rate: Vec::new(),
+                    rhs_program: None,
+                    readout_program: None,
                 })
             } else {
                 None

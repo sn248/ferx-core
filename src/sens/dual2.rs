@@ -135,6 +135,85 @@ impl<const N: usize> Dual2<N> {
         }
     }
 
+    /// `ln(self)`. With `u = ln(x)`: `u' = x'/x`, `u'' = x''/x − x'⊗x'/x²`.
+    pub fn ln(self) -> Self {
+        let x = self.value;
+        let inv = 1.0 / x;
+        let inv2 = inv * inv;
+        let mut grad = [0.0; N];
+        let mut hess = [[0.0; N]; N];
+        for i in 0..N {
+            grad[i] = self.grad[i] * inv;
+        }
+        for i in 0..N {
+            for j in 0..N {
+                hess[i][j] = self.hess[i][j] * inv - self.grad[i] * self.grad[j] * inv2;
+            }
+        }
+        Dual2 {
+            value: x.ln(),
+            grad,
+            hess,
+        }
+    }
+
+    /// `self.powd(e) = self^e`. When `e` is a constant (zero jet) the power rule
+    /// `aⁿ` is used directly — exact for any base sign with integer `n`, matching
+    /// `f64::powf`. Otherwise the general `exp(e·ln(self))` form is used (requires
+    /// `self.value > 0`, as does the underlying `powf`).
+    pub fn powd(self, e: Self) -> Self {
+        let exp_const =
+            e.grad.iter().all(|&g| g == 0.0) && e.hess.iter().flatten().all(|&h| h == 0.0);
+        if exp_const {
+            let n = e.value;
+            let a = self.value;
+            let an = a.powf(n);
+            // Guard a == 0: derivatives of aⁿ are 0 (n>1) or singular; mirror the
+            // value and drop the jet rather than emit inf/NaN.
+            if a == 0.0 {
+                return Dual2::constant(an);
+            }
+            let c1 = n * a.powf(n - 1.0);
+            let c2 = n * (n - 1.0) * a.powf(n - 2.0);
+            let mut grad = [0.0; N];
+            let mut hess = [[0.0; N]; N];
+            for i in 0..N {
+                grad[i] = c1 * self.grad[i];
+            }
+            for i in 0..N {
+                for j in 0..N {
+                    hess[i][j] = c1 * self.hess[i][j] + c2 * self.grad[i] * self.grad[j];
+                }
+            }
+            return Dual2 {
+                value: an,
+                grad,
+                hess,
+            };
+        }
+        (e * self.ln()).exp()
+    }
+
+    /// `|self|`. Away from the kink `x = 0` this is `±self`; the second derivative
+    /// is `sign(x)·x''` (the cusp at 0 is measure-zero and ignored).
+    pub fn abs(self) -> Self {
+        if self.value >= 0.0 {
+            self
+        } else {
+            -self
+        }
+    }
+
+    /// `inv_logit(self) = 1/(1+e^{−x})` (logistic sigmoid), via `exp`/`recip`.
+    pub fn inv_logit(self) -> Self {
+        ((-self).exp() + 1.0).recip()
+    }
+
+    /// `logit(self) = ln(x/(1−x)) = ln(x) − ln(1−x)`, via `ln`.
+    pub fn logit(self) -> Self {
+        self.ln() - ((-self) + 1.0).ln()
+    }
+
     /// `1/self`. With `u = 1/b`: `u' = −b'/b²`, `u'' = −b''/b² + 2·b'⊗b'/b³`.
     pub fn recip(self) -> Self {
         let b = self.value;
@@ -301,5 +380,96 @@ mod tests {
         // ∂²f/∂x² = val/y²; symmetric Hessian.
         approx::assert_relative_eq!(f.hess[0][0], val / (y * y), max_relative = 1e-10);
         approx::assert_relative_eq!(f.hess[0][1], f.hess[1][0], max_relative = 1e-12);
+    }
+
+    /// Validate a `Dual2<2>` expression's grad/Hessian against central finite
+    /// differences of its value, at `(x, y)`.
+    fn fd_check<F>(f: F, x: f64, y: f64, gtol: f64, htol: f64)
+    where
+        F: Fn(Dual2<2>, Dual2<2>) -> Dual2<2>,
+    {
+        let d = f(Dual2::var(x, 0), Dual2::var(y, 1));
+        let v = |a: f64, b: f64| f(Dual2::var(a, 0), Dual2::var(b, 1)).value;
+        let h = 1e-5;
+        let gx = (v(x + h, y) - v(x - h, y)) / (2.0 * h);
+        let gy = (v(x, y + h) - v(x, y - h)) / (2.0 * h);
+        approx::assert_relative_eq!(d.grad[0], gx, max_relative = gtol, epsilon = 1e-8);
+        approx::assert_relative_eq!(d.grad[1], gy, max_relative = gtol, epsilon = 1e-8);
+
+        let hh = 1e-4;
+        let hxx = (v(x + hh, y) - 2.0 * v(x, y) + v(x - hh, y)) / (hh * hh);
+        let hyy = (v(x, y + hh) - 2.0 * v(x, y) + v(x, y - hh)) / (hh * hh);
+        let hxy = (v(x + hh, y + hh) - v(x + hh, y - hh) - v(x - hh, y + hh) + v(x - hh, y - hh))
+            / (4.0 * hh * hh);
+        approx::assert_relative_eq!(d.hess[0][0], hxx, max_relative = htol, epsilon = 1e-5);
+        approx::assert_relative_eq!(d.hess[1][1], hyy, max_relative = htol, epsilon = 1e-5);
+        approx::assert_relative_eq!(d.hess[0][1], hxy, max_relative = htol, epsilon = 1e-5);
+        // Hessian symmetry is a structural invariant.
+        approx::assert_relative_eq!(d.hess[0][1], d.hess[1][0], max_relative = 1e-12);
+    }
+
+    #[test]
+    fn ln_matches_fd() {
+        fd_check(|x, y| (x * y).ln(), 2.0, 3.0, 1e-6, 1e-3);
+        fd_check(|x, y| (x + y * y).ln(), 1.5, 0.7, 1e-6, 1e-3);
+    }
+
+    #[test]
+    fn pow_constant_exponent_matches_fd() {
+        // aⁿ power rule, including a non-integer exponent (positive base).
+        fd_check(
+            |x, y| x.powd(Dual2::constant(2.5)) * y,
+            1.7,
+            0.9,
+            1e-6,
+            1e-3,
+        );
+        // Integer exponent works for a negative base.
+        fd_check(
+            |x, y| (x - y).powd(Dual2::constant(3.0)),
+            1.0,
+            2.5,
+            1e-6,
+            1e-3,
+        );
+    }
+
+    #[test]
+    fn pow_variable_exponent_matches_fd() {
+        // General aᵇ = exp(b·ln a) form (both vary; base > 0).
+        fd_check(|x, y| x.powd(y), 1.7, 0.8, 1e-6, 1e-3);
+        fd_check(|x, y| (x * y).powd(x), 1.3, 1.1, 1e-6, 2e-3);
+    }
+
+    #[test]
+    fn abs_matches_fd_away_from_kink() {
+        // Positive branch: |x²−y| = x²−y.
+        fd_check(|x, y| (x * x - y).abs(), 2.0, 1.0, 1e-6, 1e-3);
+        // Negative branch: |x²−y| = −(x²−y).
+        fd_check(|x, y| (x * x - y).abs(), 1.0, 3.0, 1e-6, 1e-3);
+    }
+
+    #[test]
+    fn inv_logit_matches_fd() {
+        fd_check(|x, y| (x - y).inv_logit(), 0.6, 0.2, 1e-6, 1e-3);
+        fd_check(|x, y| (x * y).inv_logit(), 1.2, 0.5, 1e-6, 1e-3);
+    }
+
+    #[test]
+    fn logit_matches_fd() {
+        // Argument must lie in (0, 1).
+        fd_check(|x, y| (x * y).logit(), 0.3, 0.9, 1e-6, 1e-3);
+        fd_check(|x, _y| x.logit(), 0.42, 0.0, 1e-6, 1e-3);
+    }
+
+    /// `logit` and `inv_logit` are inverses: `inv_logit(logit(p)) = p`, with the
+    /// jet propagating consistently.
+    #[test]
+    fn logit_inv_logit_roundtrip() {
+        let p = Dual2::<2>::var(0.37, 0);
+        let r = p.logit().inv_logit();
+        approx::assert_relative_eq!(r.value, 0.37, max_relative = 1e-12);
+        approx::assert_relative_eq!(r.grad[0], 1.0, max_relative = 1e-9);
+        approx::assert_relative_eq!(r.hess[0][0], 0.0, epsilon = 1e-7);
     }
 }

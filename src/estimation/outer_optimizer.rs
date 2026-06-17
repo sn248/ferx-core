@@ -1486,7 +1486,7 @@ fn optimize_bfgs(
     // objective), so it engages for both FOCE and FOCEI on analytical models;
     // set FERX_EBE_PREDICTOR=0 to disable (A/B timing). When the Jacobian is
     // unavailable it degrades to plain warm-start from prior η̂.
-    let use_predictor = crate::sens::provider::analytical_supported(model)
+    let use_predictor = crate::sens::provider::sens_supported(model)
         && std::env::var("FERX_EBE_PREDICTOR")
             .map(|v| v != "0")
             .unwrap_or(true);
@@ -1940,7 +1940,7 @@ fn population_gradient(
     // FOCEI uses the Almquist Laplace marginal (R at f(η̂), ½c̃ᵀc̃ in H̃); plain
     // FOCE uses the Sheiner–Beal linearized marginal (R̃ = JΩJᵀ + R⁰). Both have
     // exact closed-form gradients here, sharing the same EBE/inner-Hessian core.
-    if crate::sens::provider::analytical_supported(model) {
+    if crate::sens::provider::sens_supported(model) {
         let g = if options.interaction {
             crate::estimation::sens_outer_gradient::population_gradient_sens(
                 model,

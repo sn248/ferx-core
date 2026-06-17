@@ -38,6 +38,19 @@ section of the SDLC for the versioning policy).
   Models outside the analytical scope (ODE, IOV, LTBS, output scaling, lagtime,
   time-varying covariates, resets, overlapping steady-state infusion #379)
   transparently fall back to the existing finite-difference gradient (#367).
+- **Analytic FOCE/FOCEI gradient for user-specified `[odes]` models** (issue #367,
+  Option A): the same exact closed-form marginal gradient now covers hand-written
+  ODE models, not just the analytical PK solutions. The compiled `[odes]` RHS is
+  evaluated over hand-rolled second-order dual numbers through a generic bytecode
+  VM, and a dual-state RK45 (value-based step control) propagates the exact
+  PK-parameter sensitivities through the integration — no Enzyme, no finite
+  differences of the integrator. Supported scope: IV **bolus and infusion** doses,
+  **bioavailability F** (including estimated, any parameterization — log-normal,
+  logit-normal, additive), `obs_cmt` or simple Form C (`y = central/V1`) readouts,
+  static covariates, and up to 12 individual parameters. Models outside this scope
+  (steady-state dosing, lagtime, non-zero `init(...)`, built-in input-rate
+  absorption, IOV, EVID 3/4 resets, SDE, `obs_scale`/LTBS transforms, time-varying
+  covariates) transparently fall back to the finite-difference gradient (#367).
 - Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
   input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
   `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The
@@ -295,6 +308,15 @@ section of the SDLC for the versioning policy).
   (#199, #200).
 
 ### Performance
+- The inner EBE optimizer now selects between dense BFGS and L-BFGS by the inner
+  problem dimension: dense BFGS (full inverse-Hessian, Newton-fast and cheap at
+  low dimension) for the usual `n_eta ≲ 8` PK case, and L-BFGS (two-loop
+  recursion, `O(m·n)` per step) once the inner dimension is large enough that the
+  dense `O(n²)` update dominates — high-dimensional IOV (`n_eta + K·n_kappa`).
+  Converges to the same EBEs (estimates and OFV unchanged); the crossover keeps
+  small problems on the faster dense solver while making large random-effect
+  inner problems scale (benchmarked: L-BFGS ~2× faster at dim 64, ~17× at 256)
+  (#367).
 - The covariance step is now built as a single parallel work-list over the
   finite-difference points (subjects iterated serially within each point) instead
   of firing a per-subject parallel reduction at every perturbed point. This removes

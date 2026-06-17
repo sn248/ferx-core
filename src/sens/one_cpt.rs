@@ -288,6 +288,105 @@ mod tests {
         }
     }
 
+    /// Force the full `f+grad+hess` of an IV-bolus sensitivity at dual width `N`
+    /// (seed CL@0, V@1; the other N−2 dims stay zero but still cost O(N²) work).
+    /// Returns a reduction over every component so nothing is optimised away.
+    fn iv_bolus_width<const N: usize>(amt: f64, t: f64, cl: f64, v: f64) -> f64 {
+        let f = one_cpt_iv_bolus_g::<Dual2<N>>(amt, t, Dual2::var(cl, 0), Dual2::var(v, 1));
+        let mut s = f.value;
+        for i in 0..N {
+            s += f.grad[i];
+            for j in 0..N {
+                s += f.hess[i][j];
+            }
+        }
+        s
+    }
+
+    /// Same for 1-cpt oral (seed CL@0, V@1, KA@2, F@3).
+    fn oral_width<const N: usize>(amt: f64, t: f64, cl: f64, v: f64, ka: f64, fb: f64) -> f64 {
+        let f = one_cpt_oral_g::<Dual2<N>>(
+            amt,
+            t,
+            Dual2::var(cl, 0),
+            Dual2::var(v, 1),
+            Dual2::var(ka, 2),
+            Dual2::var(fb, 3),
+        );
+        let mut s = f.value;
+        for i in 0..N {
+            s += f.grad[i];
+            for j in 0..N {
+                s += f.hess[i][j];
+            }
+        }
+        s
+    }
+
+    /// Reduction over the explicit (Option-B) IV-bolus f+grad+hess, parity with
+    /// `iv_bolus_width` (sum value + 2 grad + 4 hess entries).
+    fn iv_bolus_explicit_reduce(amt: f64, t: f64, cl: f64, v: f64) -> f64 {
+        let (f, g, h) = iv_bolus_hardcoded(amt, t, cl, v);
+        f + g[0] + g[1] + h[0][0] + h[0][1] + h[1][0] + h[1][1]
+    }
+
+    /// Option B (explicit closed-form derivatives) vs `Dual2<N>` forward-mode, for
+    /// the per-observation `f + ∂f/∂pk + ∂²f/∂pk²` kernel. Shows (a) the explicit
+    /// path vs the minimal-width dual, and (b) the O(N²) penalty the provider pays
+    /// by seeding `Dual2<8>` for every model regardless of active parameter count.
+    #[test]
+    #[ignore = "bench: run with -- --ignored --nocapture"]
+    fn option_b_vs_dual2_widths() {
+        use std::time::Instant;
+        let n = 20_000_000u64;
+        let (amt, cl, v, ka, fb) = (100.0, 1.2, 12.0, 0.8, 0.9);
+        let time_it = |label: &str, f: &dyn Fn(f64) -> f64| {
+            let t0 = Instant::now();
+            let mut acc = 0.0;
+            for i in 0..n {
+                let t = (i % 24) as f64 * 0.5;
+                acc += f(t);
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / n as f64;
+            std::hint::black_box(acc);
+            eprintln!("  {label:<34} {ns:6.2} ns/eval");
+            ns
+        };
+
+        eprintln!("IV bolus (2 active params: CL, V) — f + grad + hess:");
+        let exp = time_it("Option B (explicit f64)", &|t| {
+            iv_bolus_explicit_reduce(amt, t, cl, v)
+        });
+        let d2 = time_it("Dual2<2> (minimal width)", &|t| {
+            iv_bolus_width::<2>(amt, t, cl, v)
+        });
+        let d4 = time_it("Dual2<4>", &|t| iv_bolus_width::<4>(amt, t, cl, v));
+        let d8 = time_it("Dual2<8> (provider width)", &|t| {
+            iv_bolus_width::<8>(amt, t, cl, v)
+        });
+        eprintln!(
+            "  → explicit is {:.1}x faster than Dual2<2>, {:.1}x faster than Dual2<8>",
+            d2 / exp,
+            d8 / exp
+        );
+        eprintln!(
+            "  → Dual2<8> is {:.1}x slower than Dual2<2> (O(N^2) width penalty)\n",
+            d8 / d2
+        );
+
+        eprintln!("1-cpt oral (3-4 active params: CL, V, KA[, F]) — f + grad + hess:");
+        let o4 = time_it("Dual2<4> (minimal width)", &|t| {
+            oral_width::<4>(amt, t, cl, v, ka, fb)
+        });
+        let o8 = time_it("Dual2<8> (provider width)", &|t| {
+            oral_width::<8>(amt, t, cl, v, ka, fb)
+        });
+        eprintln!(
+            "  → Dual2<8> is {:.1}x slower than Dual2<4> for oral (provider over-seeds)\n",
+            o8 / o4
+        );
+    }
+
     /// Overhead of value + gradient + Hessian (`Dual2`) vs the bare `f64` value.
     #[test]
     #[ignore = "bench: run with -- --ignored --nocapture"]

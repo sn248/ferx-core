@@ -25,6 +25,49 @@
 //! still panics — that's a rare clinical setup tracked as a follow-up.
 
 use crate::types::{DoseEvent, PkModel, PkParams, Subject};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+// ── Lightweight profiling / A-B toggles (measurement only) ────────────
+//
+// `FERX_PROFILE=1` accumulates the count and wall-time of the f64 event-driven
+// prediction across the whole fit (printed by the CLI via [`profile_report`]).
+// `FERX_NO_PROP_CACHE=1` forces the per-walk eigen-decomposition cache to always
+// recompute, for A/B-measuring what the caching buys. Both are env-gated once.
+
+static PROFILE_PRED_CALLS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PRED_NANOS: AtomicU64 = AtomicU64::new(0);
+
+fn profile_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("FERX_PROFILE").map(|v| v == "1").unwrap_or(false))
+}
+
+fn prop_cache_disabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("FERX_NO_PROP_CACHE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Print the accumulated f64-prediction profile (no-op unless `FERX_PROFILE=1`).
+pub fn profile_report() {
+    if !profile_enabled() {
+        return;
+    }
+    let c = PROFILE_PRED_CALLS.load(Ordering::Relaxed);
+    let n = PROFILE_PRED_NANOS.load(Ordering::Relaxed);
+    if c > 0 {
+        eprintln!(
+            "[profile] event-driven f64 predictions: {} calls, {:.3}s total, {:.1} ns/call",
+            c,
+            n as f64 / 1e9,
+            n as f64 / c as f64
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
@@ -433,6 +476,39 @@ pub fn event_driven_predictions(
 /// infusion-bound construction otherwise dominate per-call CPU on the
 /// TV-cov path.
 pub fn event_driven_predictions_with_schedule(
+    pk_model: PkModel,
+    subject: &Subject,
+    schedule: &EventSchedule,
+    pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams],
+    pk_at_pk_only: &[PkParams],
+) -> Vec<f64> {
+    if !profile_enabled() {
+        return event_driven_predictions_with_schedule_impl(
+            pk_model,
+            subject,
+            schedule,
+            pk_at_dose,
+            pk_at_obs,
+            pk_at_pk_only,
+        );
+    }
+    let t0 = std::time::Instant::now();
+    let r = event_driven_predictions_with_schedule_impl(
+        pk_model,
+        subject,
+        schedule,
+        pk_at_dose,
+        pk_at_obs,
+        pk_at_pk_only,
+    );
+    PROFILE_PRED_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    PROFILE_PRED_CALLS.fetch_add(1, Ordering::Relaxed);
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn event_driven_predictions_with_schedule_impl(
     pk_model: PkModel,
     subject: &Subject,
     schedule: &EventSchedule,
@@ -927,7 +1003,7 @@ impl TwoCptRateCache {
     #[inline]
     fn get(&mut self, cl: f64, v1: f64, q: f64, v2: f64) -> (f64, f64, f64, f64, f64) {
         let key = [cl, v1, q, v2];
-        if self.key != Some(key) {
+        if prop_cache_disabled() || self.key != Some(key) {
             let k10 = cl / v1;
             let k12 = q / v1;
             let k21 = q / v2;
@@ -1018,7 +1094,7 @@ impl ThreeCptRateCache {
         v3: f64,
     ) -> ((f64, f64, f64, f64, f64, f64, f64), [ThreeCptMode; 3]) {
         let key = [cl, v1, q2, v2, q3, v3];
-        if self.key != Some(key) {
+        if prop_cache_disabled() || self.key != Some(key) {
             let (alpha, beta, gamma, k21, k31) = macro_rates_three(cl, v1, q2, v2, q3, v3);
             let (k12, k13) = (q2 / v1, q3 / v1);
             self.raw = (alpha, beta, gamma, k21, k31, k12, k13);

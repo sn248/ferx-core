@@ -14,13 +14,14 @@
 //!
 //! **Supported:** single-endpoint `ObsCmt` or simple Form C (`y = central/V1`)
 //! readout; **bolus and infusion** doses; **bioavailability F** (incl. estimated,
-//! any parameterization — log-normal, logit-normal, additive); static covariates;
-//! up to [`MAX_ODE_SENS_DIM`] individual parameters.
+//! any parameterization — log-normal, logit-normal, additive); **EVID 3/4 resets
+//! / multi-occasion**; static covariates; up to [`MAX_ODE_SENS_DIM`] individual
+//! parameters.
 //!
 //! **Not yet supported** (falls back to the gradient-free path): steady-state
 //! dosing, lagtime, non-zero `init(...)`, built-in input-rate absorption, IOV,
-//! EVID 3/4 resets, SDE/diffusion, `obs_scale`/LTBS output transforms,
-//! time-varying covariates, per-CMT Form C.
+//! SDE/diffusion, `obs_scale`/LTBS output transforms, time-varying covariates,
+//! per-CMT Form C.
 #![allow(clippy::needless_range_loop)]
 
 use super::dual2::Dual2;
@@ -85,7 +86,7 @@ pub fn ode_subject_sensitivities(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
-    if !ode_analytical_supported(model) || subject.has_tv_covariates() || subject.has_resets() {
+    if !ode_analytical_supported(model) || subject.has_tv_covariates() {
         return None;
     }
     // Steady-state dosing is not yet supported over the dual loop (needs dual
@@ -410,6 +411,11 @@ fn integrate_dual<const N: usize>(
             break_times.push(dose.time + dose.duration);
         }
     }
+    // EVID 3/4 reset times also break the timeline so the state can be zeroed
+    // there (the datareader places obs/dose/reset on one absolute timeline).
+    for &rt in &subject.reset_times {
+        break_times.push(rt);
+    }
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
@@ -421,6 +427,20 @@ fn integrate_dual<const N: usize>(
     for w in 0..(break_times.len() - 1) {
         let t_start = break_times[w];
         let t_end = break_times[w + 1];
+
+        // EVID 3/4 reset: zero the state at this time, *before* the same-time
+        // dose (EVID=4 = reset + dose). `init(...)` is gated out, so reset →
+        // zero. Infusions from a prior occasion live at earlier absolute times,
+        // so they are naturally no longer active after the reset.
+        if subject
+            .reset_times
+            .iter()
+            .any(|&rt| (rt - t_start).abs() < 1e-12)
+        {
+            for s in u.iter_mut() {
+                *s = Dual2::constant(0.0);
+            }
+        }
 
         // Apply bolus doses (non-infusions) at t_start: u[cmt] += F·amt.
         for dose in &subject.doses {
@@ -776,6 +796,21 @@ mod tests {
         // amt=1000, rate=200 → 5 h infusion into central; obs during and after.
         let mut subject = bolus_subject(&[1.0, 3.0, 5.0, 6.0, 9.0, 24.0]);
         subject.doses = vec![DoseEvent::new(0.0, 1000.0, 1, 200.0, false, 0.0)];
+        check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
+    }
+
+    /// EVID 3/4 reset: a two-occasion subject (reset + re-dose at t=10) must zero
+    /// the dual state at the reset and match the production event-driven path
+    /// across both occasions.
+    #[test]
+    fn ode_provider_2cpt_reset_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 11.0, 13.0, 16.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(10.0, 1000.0, 1, 0.0, false, 0.0),
+        ];
+        subject.reset_times = vec![10.0];
         check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
     }
 

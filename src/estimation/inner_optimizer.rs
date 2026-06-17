@@ -796,90 +796,100 @@ pub fn find_ebe(
         crate::sens::provider::subject_eta_jacobian(model, subject, &params.theta, &eta_true)
             .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j));
 
-    #[cfg(feature = "autodiff")]
-    let h_matrix_fb = match grad_method {
-        InnerGradientMethod::AdSingleSnapshot => {
-            let tv_adjusted = ad_tv_adjusted.as_ref().unwrap();
-            let dose_data = ad_dose_data.as_ref().unwrap();
-            let t0 = std::time::Instant::now();
-            let obs_scale = build_scale_array_for_ad(model, subject, &params.theta, &eta_true);
-            let j = ad_gradients::compute_jacobian_ad(
-                &eta_true,
-                tv_adjusted,
-                dose_data,
-                &subject.obs_times,
-                subject.obs_times.len(),
-                model.pk_model,
-                &model.pk_idx_f64,
-                &model.sel_flat,
-                &obs_scale,
-                model.log_transform,
-            );
-            GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
-            j
-        }
-        InnerGradientMethod::AdEventDriven => {
-            // Forward-mode AD Jacobian — kernel lives in
-            // `ad::event_driven_ad_jac` (sibling module so the AD pass
-            // stays isolated from the reverse-mode NLL pass; sharing
-            // helpers tripped Enzyme's reverse-mode type deduction).
-            let event_data = ad_event_data.as_ref().unwrap();
-            let tv_per_event = ad_tv_per_event.as_ref().unwrap();
-            let t0 = std::time::Instant::now();
-            let event_scale = build_event_scale_array_for_ad(
-                model,
-                subject,
-                event_data,
-                &params.theta,
-                &eta_true,
-            );
-            let j = crate::ad::event_driven_ad_jac::compute_jacobian_event_driven_ad(
-                &eta_true,
-                tv_per_event,
-                event_data,
-                subject.obs_times.len(),
-                model.pk_model,
-                &model.pk_idx_f64,
-                &model.sel_flat,
-                &event_scale,
-                model.log_transform,
-            );
-            GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
-            j
-        }
-        InnerGradientMethod::Fd => {
-            let mut scratch = pk_scratch_cell.borrow_mut();
-            let t0 = std::time::Instant::now();
-            let j = compute_jacobian_fd(
-                model,
-                subject,
-                &params.theta,
-                &eta_true,
-                &mut scratch,
-                schedule.as_ref(),
-            );
-            GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
-            j
+    // When the exact analytic Jacobian is available, skip the FD/AD fallback
+    // entirely — previously it was always computed and then discarded by an
+    // `unwrap_or`, a full O(n_eta) sweep per subject per outer iteration that
+    // directly undercut the speed premise (PR #381 review finding #10).
+    let h_matrix = match analytic_jac {
+        Some(j) => j,
+        None => {
+            #[cfg(feature = "autodiff")]
+            let h_matrix_fb = match grad_method {
+                InnerGradientMethod::AdSingleSnapshot => {
+                    let tv_adjusted = ad_tv_adjusted.as_ref().unwrap();
+                    let dose_data = ad_dose_data.as_ref().unwrap();
+                    let t0 = std::time::Instant::now();
+                    let obs_scale =
+                        build_scale_array_for_ad(model, subject, &params.theta, &eta_true);
+                    let j = ad_gradients::compute_jacobian_ad(
+                        &eta_true,
+                        tv_adjusted,
+                        dose_data,
+                        &subject.obs_times,
+                        subject.obs_times.len(),
+                        model.pk_model,
+                        &model.pk_idx_f64,
+                        &model.sel_flat,
+                        &obs_scale,
+                        model.log_transform,
+                    );
+                    GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
+                    j
+                }
+                InnerGradientMethod::AdEventDriven => {
+                    // Forward-mode AD Jacobian — kernel lives in
+                    // `ad::event_driven_ad_jac` (sibling module so the AD pass
+                    // stays isolated from the reverse-mode NLL pass; sharing
+                    // helpers tripped Enzyme's reverse-mode type deduction).
+                    let event_data = ad_event_data.as_ref().unwrap();
+                    let tv_per_event = ad_tv_per_event.as_ref().unwrap();
+                    let t0 = std::time::Instant::now();
+                    let event_scale = build_event_scale_array_for_ad(
+                        model,
+                        subject,
+                        event_data,
+                        &params.theta,
+                        &eta_true,
+                    );
+                    let j = crate::ad::event_driven_ad_jac::compute_jacobian_event_driven_ad(
+                        &eta_true,
+                        tv_per_event,
+                        event_data,
+                        subject.obs_times.len(),
+                        model.pk_model,
+                        &model.pk_idx_f64,
+                        &model.sel_flat,
+                        &event_scale,
+                        model.log_transform,
+                    );
+                    GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
+                    j
+                }
+                InnerGradientMethod::Fd => {
+                    let mut scratch = pk_scratch_cell.borrow_mut();
+                    let t0 = std::time::Instant::now();
+                    let j = compute_jacobian_fd(
+                        model,
+                        subject,
+                        &params.theta,
+                        &eta_true,
+                        &mut scratch,
+                        schedule.as_ref(),
+                    );
+                    GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
+                    j
+                }
+            };
+
+            #[cfg(not(feature = "autodiff"))]
+            let h_matrix_fb = {
+                let mut scratch = pk_scratch_cell.borrow_mut();
+                let t0 = std::time::Instant::now();
+                let j = compute_jacobian_fd(
+                    model,
+                    subject,
+                    &params.theta,
+                    &eta_true,
+                    &mut scratch,
+                    schedule.as_ref(),
+                );
+                GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
+                j
+            };
+
+            h_matrix_fb
         }
     };
-
-    #[cfg(not(feature = "autodiff"))]
-    let h_matrix_fb = {
-        let mut scratch = pk_scratch_cell.borrow_mut();
-        let t0 = std::time::Instant::now();
-        let j = compute_jacobian_fd(
-            model,
-            subject,
-            &params.theta,
-            &eta_true,
-            &mut scratch,
-            schedule.as_ref(),
-        );
-        GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
-        j
-    };
-
-    let h_matrix = analytic_jac.unwrap_or(h_matrix_fb);
 
     EbeResult {
         eta: DVector::from_column_slice(&eta_true),

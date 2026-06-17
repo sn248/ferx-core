@@ -1904,6 +1904,15 @@ fn reconverge_this_eval(options: &FitOptions, grad_idx: usize) -> bool {
     interval != 0 && grad_idx % interval == 0
 }
 
+/// `FERX_SENS_CHECK=1` enables the per-eval analytic-vs-reconverged-FD outer
+/// gradient cross-check in [`population_gradient`] (off by default — it doubles
+/// the gradient cost, so it is a CI/diagnostic backstop, not a production path).
+fn sens_check_enabled() -> bool {
+    std::env::var("FERX_SENS_CHECK")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// Population gradient dispatcher. IOV models (`n_kappa > 0`) use the
 /// EBE-reconverging FD gradient — their weakly-identified variance components
 /// need it (issue #101 rec #2) — and everything else uses the cheap analytical
@@ -1940,7 +1949,14 @@ fn population_gradient(
     // FOCEI uses the Almquist Laplace marginal (R at f(η̂), ½c̃ᵀc̃ in H̃); plain
     // FOCE uses the Sheiner–Beal linearized marginal (R̃ = JΩJᵀ + R⁰). Both have
     // exact closed-form gradients here, sharing the same EBE/inner-Hessian core.
-    if crate::sens::provider::sens_supported(model) {
+    //
+    // `reconverge` (driven by `reconverge_gradient_interval`) overrides the
+    // analytic path: it is the documented opt-out / escape hatch (PR #381 review
+    // findings #6/#7). Setting `reconverge_gradient_interval = 1` forces the
+    // reconverged-FD gradient on every eval even for analytical models — so the
+    // numeric fallback remains available if the analytic gradient is ever
+    // suspect, and the setting is honoured rather than silently ignored.
+    if !reconverge && crate::sens::provider::sens_supported(model) {
         let g = if options.interaction {
             crate::estimation::sens_outer_gradient::population_gradient_sens(
                 model,
@@ -1959,7 +1975,48 @@ fn population_gradient(
             )
         };
         if let Some(g) = g {
-            return g;
+            // Always-on finiteness backstop: a non-finite analytic component (the
+            // class PR #381 review finding #3 warns about — a degenerate acos /
+            // singular eigenvalue producing NaN) would poison the optimizer. Rather
+            // than return it, fall through to the numeric path. Cheap (a scan of a
+            // length-`np` vector) and reliable, unlike a mid-run magnitude compare
+            // to reconverged-FD: with loosely-converged EBEs the analytic and
+            // reconverged-FD gradients legitimately differ away from the optimum
+            // (they agree to ~1e-11 only at convergence — see the unit tests), so a
+            // value-tolerance assert here cries wolf. With FERX_SENS_CHECK=1 the
+            // divergence is additionally reported for diagnosis.
+            if g.iter().all(|v| v.is_finite()) {
+                if sens_check_enabled() {
+                    let fd = reconverged_fd_gradient(
+                        x,
+                        init_params,
+                        model,
+                        population,
+                        ehs,
+                        bounds,
+                        options,
+                    );
+                    let max_abs = g
+                        .iter()
+                        .chain(fd.iter())
+                        .fold(1e-8_f64, |m, v| m.max(v.abs()));
+                    let max_diff = g
+                        .iter()
+                        .zip(fd.iter())
+                        .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+                    eprintln!(
+                        "[FERX_SENS_CHECK] analytic vs reconverged-FD outer gradient: \
+                         max abs diff {max_diff:.3e}, rel {:.2e} (interaction={})",
+                        max_diff / max_abs,
+                        options.interaction
+                    );
+                }
+                return g;
+            } else if options.verbose {
+                eprintln!(
+                    "warning: non-finite analytic outer gradient — falling back to the numeric path"
+                );
+            }
         }
     }
     // IOV models always reconverge the inner EBE solution inside the gradient.

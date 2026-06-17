@@ -15,13 +15,12 @@
 //! **Supported:** single-endpoint `ObsCmt` or simple Form C (`y = central/V1`)
 //! readout; **bolus and infusion** doses; **bioavailability F** (incl. estimated,
 //! any parameterization — log-normal, logit-normal, additive); **EVID 3/4 resets
-//! / multi-occasion**; static covariates; up to [`MAX_ODE_SENS_DIM`] individual
-//! parameters.
+//! / multi-occasion**; **non-zero `init(...)` initial conditions**; static
+//! covariates; up to [`MAX_ODE_SENS_DIM`] individual parameters.
 //!
 //! **Not yet supported** (falls back to the gradient-free path): steady-state
-//! dosing, lagtime, non-zero `init(...)`, built-in input-rate absorption, IOV,
-//! SDE/diffusion, `obs_scale`/LTBS output transforms, time-varying covariates,
-//! per-CMT Form C.
+//! dosing, lagtime, built-in input-rate absorption, IOV, SDE/diffusion,
+//! `obs_scale`/LTBS output transforms, time-varying covariates, per-CMT Form C.
 #![allow(clippy::needless_range_loop)]
 
 use super::dual2::Dual2;
@@ -34,6 +33,10 @@ use std::cell::RefCell;
 /// Largest individual-parameter count for which the `Dual2<N>` path is
 /// monomorphised; models wider than this fall back to the gradient-free path.
 const MAX_ODE_SENS_DIM: usize = 12;
+
+/// Largest (θ + η) axis count for which the analytical η/θ chain (the
+/// individual-parameter program over `Dual2<M>`) is monomorphised.
+const MAX_ODE_AXES: usize = 16;
 
 /// True when [`ode_subject_sensitivities`] can serve this model: an ODE model
 /// with a compiled RHS program, single `ObsCmt` readout, no built-in absorption,
@@ -57,7 +60,7 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if !readout_ok {
         return false;
     }
-    if !ode.input_rate.is_empty() || ode.init_fn.is_some() || !ode.diffusion_var.is_empty() {
+    if !ode.input_rate.is_empty() || !ode.diffusion_var.is_empty() {
         return false;
     }
     // The divisor (`obs_scale`) scaling form is not yet handled over Dual2; Form C
@@ -72,6 +75,20 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // Bioavailability F *is* supported (it scales the dose amount/rate as a dual).
     if model.pk_indices.iter().any(|&s| s == PK_IDX_LAGTIME) {
         return false;
+    }
+    // The η/θ chain evaluates the individual-parameter program over `Dual2`
+    // seeded on (θ, η); require it present, with matching axis counts (no NN-θ /
+    // IOV), and within the analytic-chain dual-width cap.
+    match ode.indiv_param_program.as_ref() {
+        Some(p) => {
+            if p.n_theta_axis() != model.n_theta
+                || p.n_eta_axis() != model.n_eta
+                || p.n_axes() > MAX_ODE_AXES
+            {
+                return false;
+            }
+        }
+        None => return false,
     }
     let n = model.pk_indices.len();
     (1..=MAX_ODE_SENS_DIM).contains(&n)
@@ -107,23 +124,20 @@ pub fn ode_subject_sensitivities(
     dispatch!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
 }
 
-/// Derivatives of the individual parameters `p_i` w.r.t. η and θ, by central
-/// finite difference of `pk_param_fn` at the actual `(θ, η)`. This is the
-/// **general** η/θ chain — it makes no log-normal assumption, so it handles
-/// log-normal (`p = tv·exp(η)`), logit-normal bioavailability
-/// (`F = inv_logit(logit(TVF)+η)`), additive, and any other individual-parameter
-/// form, reducing to the closed-form `p·sel` chain in the log-normal case.
-/// `pk_param_fn` is cheap (no ODE integration), so the FD cost is negligible
-/// next to one dual integration.
-struct ParamDerivs {
+/// Exact `∂p/∂η`, `∂p/∂θ` (and second order) of the individual parameters,
+/// obtained by evaluating the compiled `[individual_parameters]` program over
+/// `Dual2` seeded on (θ, η) — **analytical**, any parameterization (log-normal,
+/// logit-normal F, additive, …), no finite differences. (The FD fallback for
+/// unsupported models is the existing gradient-free path.)
+pub(crate) struct ParamDerivs {
     /// `∂p_i/∂η_k`.
-    dp_deta: Vec<Vec<f64>>,
+    pub(crate) dp_deta: Vec<Vec<f64>>,
     /// `∂p_i/∂θ_m`.
-    dp_dtheta: Vec<Vec<f64>>,
+    pub(crate) dp_dtheta: Vec<Vec<f64>>,
     /// `∂²p_i/∂η_k∂η_l`.
-    d2p_deta2: Vec<Vec<Vec<f64>>>,
+    pub(crate) d2p_deta2: Vec<Vec<Vec<f64>>>,
     /// `∂²p_i/∂η_k∂θ_m`.
-    d2p_detadtheta: Vec<Vec<Vec<f64>>>,
+    pub(crate) d2p_detadtheta: Vec<Vec<Vec<f64>>>,
 }
 
 fn param_derivatives(
@@ -131,112 +145,138 @@ fn param_derivatives(
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
+) -> Option<ParamDerivs> {
+    let prog = model.ode_spec.as_ref()?.indiv_param_program.as_ref()?;
+    param_derivatives_from_prog(prog, model, subject, theta, eta)
+}
+
+/// Analytical `∂p/∂(θ,η)` (+ second order) from an explicit individual-parameter
+/// program, shared by the ODE provider (program on `ode_spec`) and the analytical
+/// PK provider (program on `indiv_param_partials`). Returns `None` — caller falls
+/// back to FD — when the program's axis counts don't match the model's θ/η (e.g.
+/// NN-weight θ or IOV kappa present) or the axis count exceeds the dispatch table.
+pub(crate) fn param_derivatives_from_prog(
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<ParamDerivs> {
+    if prog.n_theta_axis() != model.n_theta || prog.n_eta_axis() != model.n_eta {
+        return None;
+    }
+    macro_rules! disp {
+        ($($mm:literal),+) => {
+            match prog.n_axes() {
+                $($mm => Some(pd_from_program::<$mm>(prog, model, &subject.covariates, theta, eta)),)+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+}
+
+/// Pack `∂p/∂(θ,η)` and `∂²p/∂(θ,η)²` from the `Dual2<M>` individual parameters,
+/// where dual dimension `m` is `θ_m` (`m < n_theta`) and `n_theta + k` is `η_k`.
+pub(crate) fn pd_from_program<const M: usize>(
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    model: &CompiledModel,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    eta: &[f64],
 ) -> ParamDerivs {
-    let cov = &subject.covariates;
-    let slots = &model.pk_indices;
-    let n_indiv = slots.len();
-    let n_eta = model.n_eta;
-    let n_theta = model.n_theta;
-    let pval = |th: &[f64], et: &[f64]| -> Vec<f64> {
-        let r = (model.pk_param_fn)(th, et, cov);
-        slots.iter().map(|&s| r.values[s]).collect()
-    };
-    let he = 1e-6; // first-derivative step
-    let h2 = 1e-4; // second-derivative step (4-point is round-off-prone)
-    let base = pval(theta, eta);
-
-    let mut dp_deta = vec![vec![0.0; n_eta]; n_indiv];
-    for k in 0..n_eta {
-        let mut ep = eta.to_vec();
-        ep[k] += he;
-        let mut em = eta.to_vec();
-        em[k] -= he;
-        let (up, dn) = (pval(theta, &ep), pval(theta, &em));
-        for i in 0..n_indiv {
-            dp_deta[i][k] = (up[i] - dn[i]) / (2.0 * he);
+    let p = prog.eval_param_duals::<M>(theta, eta, cov);
+    let nt = model.n_theta;
+    let ne = model.n_eta;
+    let ni = model.pk_indices.len();
+    let mut dp_deta = vec![vec![0.0; ne]; ni];
+    let mut dp_dtheta = vec![vec![0.0; nt]; ni];
+    let mut d2p_deta2 = vec![vec![vec![0.0; ne]; ne]; ni];
+    let mut d2p_detadtheta = vec![vec![vec![0.0; nt]; ne]; ni];
+    for i in 0..ni {
+        let g = &p[i].grad;
+        let h = &p[i].hess;
+        for k in 0..ne {
+            dp_deta[i][k] = g[nt + k];
         }
-    }
-
-    let mut dp_dtheta = vec![vec![0.0; n_theta]; n_indiv];
-    for m in 0..n_theta {
-        let s = he * (1.0 + theta[m].abs());
-        let mut tp = theta.to_vec();
-        tp[m] += s;
-        let mut tm = theta.to_vec();
-        tm[m] -= s;
-        let (up, dn) = (pval(&tp, eta), pval(&tm, eta));
-        for i in 0..n_indiv {
-            dp_dtheta[i][m] = (up[i] - dn[i]) / (2.0 * s);
+        for m in 0..nt {
+            dp_dtheta[i][m] = g[m];
         }
-    }
-
-    let mut d2p_deta2 = vec![vec![vec![0.0; n_eta]; n_eta]; n_indiv];
-    for k in 0..n_eta {
-        let mut ep = eta.to_vec();
-        ep[k] += h2;
-        let mut em = eta.to_vec();
-        em[k] -= h2;
-        let (up, dn) = (pval(theta, &ep), pval(theta, &em));
-        for i in 0..n_indiv {
-            d2p_deta2[i][k][k] = (up[i] - 2.0 * base[i] + dn[i]) / (h2 * h2);
-        }
-        for l in (k + 1)..n_eta {
-            let mut pp = eta.to_vec();
-            pp[k] += h2;
-            pp[l] += h2;
-            let mut pm = eta.to_vec();
-            pm[k] += h2;
-            pm[l] -= h2;
-            let mut mp = eta.to_vec();
-            mp[k] -= h2;
-            mp[l] += h2;
-            let mut mm = eta.to_vec();
-            mm[k] -= h2;
-            mm[l] -= h2;
-            let (vpp, vpm, vmp, vmm) = (
-                pval(theta, &pp),
-                pval(theta, &pm),
-                pval(theta, &mp),
-                pval(theta, &mm),
-            );
-            for i in 0..n_indiv {
-                let v = (vpp[i] - vpm[i] - vmp[i] + vmm[i]) / (4.0 * h2 * h2);
-                d2p_deta2[i][k][l] = v;
-                d2p_deta2[i][l][k] = v;
+        for k in 0..ne {
+            for l in 0..ne {
+                d2p_deta2[i][k][l] = h[nt + k][nt + l];
+            }
+            for m in 0..nt {
+                d2p_detadtheta[i][k][m] = h[nt + k][m];
             }
         }
     }
-
-    let mut d2p_detadtheta = vec![vec![vec![0.0; n_theta]; n_eta]; n_indiv];
-    for k in 0..n_eta {
-        let mut ep = eta.to_vec();
-        ep[k] += h2;
-        let mut em = eta.to_vec();
-        em[k] -= h2;
-        for m in 0..n_theta {
-            let s = h2 * (1.0 + theta[m].abs());
-            let mut tp = theta.to_vec();
-            tp[m] += s;
-            let mut tm = theta.to_vec();
-            tm[m] -= s;
-            let (vpp, vpm, vmp, vmm) = (
-                pval(&tp, &ep),
-                pval(&tm, &ep),
-                pval(&tp, &em),
-                pval(&tm, &em),
-            );
-            for i in 0..n_indiv {
-                d2p_detadtheta[i][k][m] = (vpp[i] - vpm[i] - vmp[i] + vmm[i]) / (4.0 * h2 * s);
-            }
-        }
-    }
-
     ParamDerivs {
         dp_deta,
         dp_dtheta,
         d2p_deta2,
         d2p_detadtheta,
     }
+}
+
+/// The `Dual2<N>` initial state from a model's `init(...)` directives, seeding
+/// each compartment's value **and its PK-parameter derivatives** by central FD of
+/// the f64 `init_fn` over the differentiated PK slots. `init_fn` is a cheap
+/// HashMap eval (no integration), so the FD cost is negligible.
+fn dual_init_state<const N: usize>(
+    init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
+    pk: &[f64],
+    pk_indices: &[usize],
+    n_states: usize,
+) -> Vec<Dual2<N>> {
+    let base = init_fn(pk);
+    let he = 1e-6;
+    let h2 = 1e-4;
+    let mut out: Vec<Dual2<N>> = (0..n_states)
+        .map(|s| Dual2::constant(base.get(s).copied().unwrap_or(0.0)))
+        .collect();
+
+    for (i, &si) in pk_indices.iter().enumerate() {
+        let mut pp = pk.to_vec();
+        pp[si] += he;
+        let mut pm = pk.to_vec();
+        pm[si] -= he;
+        let (up, dn) = (init_fn(&pp), init_fn(&pm));
+        for s in 0..n_states {
+            out[s].grad[i] = (up[s] - dn[s]) / (2.0 * he);
+        }
+    }
+    for (i, &si) in pk_indices.iter().enumerate() {
+        let mut pp = pk.to_vec();
+        pp[si] += h2;
+        let mut pm = pk.to_vec();
+        pm[si] -= h2;
+        let (up, dn) = (init_fn(&pp), init_fn(&pm));
+        for s in 0..n_states {
+            out[s].hess[i][i] = (up[s] - 2.0 * base[s] + dn[s]) / (h2 * h2);
+        }
+        for (j, &sj) in pk_indices.iter().enumerate().skip(i + 1) {
+            let mut a = pk.to_vec();
+            a[si] += h2;
+            a[sj] += h2;
+            let mut b = pk.to_vec();
+            b[si] += h2;
+            b[sj] -= h2;
+            let mut c = pk.to_vec();
+            c[si] -= h2;
+            c[sj] += h2;
+            let mut d = pk.to_vec();
+            d[si] -= h2;
+            d[sj] -= h2;
+            let (va, vb, vc, vd) = (init_fn(&a), init_fn(&b), init_fn(&c), init_fn(&d));
+            for s in 0..n_states {
+                let v = (va[s] - vb[s] - vc[s] + vd[s]) / (4.0 * h2 * h2);
+                out[s].hess[i][j] = v;
+                out[s].hess[j][i] = v;
+            }
+        }
+    }
+    out
 }
 
 fn run_subject<const N: usize>(
@@ -260,8 +300,8 @@ fn run_subject<const N: usize>(
     for (i, &slot) in model.pk_indices.iter().enumerate() {
         params_dual[slot] = Dual2::var(pk.values[slot], i);
     }
-    // Individual-parameter η/θ derivatives (general parameterization).
-    let pd = param_derivatives(model, subject, theta, eta);
+    // Individual-parameter η/θ derivatives (analytical, over Dual2 seeded on θ/η).
+    let pd = param_derivatives(model, subject, theta, eta)?;
 
     // Lagtime (a nonzero dose-time shift) is not yet supported over the dual loop.
     if pk.values[PK_IDX_LAGTIME].abs() > 1e-12 {
@@ -274,6 +314,13 @@ fn run_subject<const N: usize>(
         params_dual[PK_IDX_F]
     } else {
         Dual2::constant(1.0)
+    };
+
+    // Initial state from `init(...)` (dual-seeded by FD of init_fn); zeros when
+    // none is declared. Re-applied at every EVID 3/4 reset.
+    let init_state: Vec<Dual2<N>> = match ode.init_fn.as_ref() {
+        Some(f) => dual_init_state::<N>(f.as_ref(), &pk.values, &model.pk_indices, ode.n_states),
+        None => vec![Dual2::constant(0.0); ode.n_states],
     };
 
     // Dose-time anchors for TAFD/TAD (constants w.r.t. the parameters).
@@ -291,6 +338,7 @@ fn run_subject<const N: usize>(
         subject,
         &params_dual,
         f_bio,
+        &init_state,
         first_dose_time,
         &opts,
     )?;
@@ -385,13 +433,14 @@ fn integrate_dual<const N: usize>(
     subject: &Subject,
     params_dual: &[Dual2<N>],
     f_bio: Dual2<N>,
+    init_state: &[Dual2<N>],
     first_dose_time: f64,
     opts: &crate::ode::solver::OdeSolverOptions,
 ) -> Option<Vec<Vec<Dual2<N>>>> {
     let n_obs = subject.obs_times.len();
     let mut states: Vec<Vec<Dual2<N>>> = vec![vec![Dual2::<N>::constant(0.0); n_states]; n_obs];
     let mut recorded = vec![false; n_obs];
-    let mut u = vec![Dual2::<N>::constant(0.0); n_states];
+    let mut u = init_state.to_vec();
 
     // obs time → all indices sharing it.
     use std::collections::HashMap;
@@ -428,18 +477,16 @@ fn integrate_dual<const N: usize>(
         let t_start = break_times[w];
         let t_end = break_times[w + 1];
 
-        // EVID 3/4 reset: zero the state at this time, *before* the same-time
-        // dose (EVID=4 = reset + dose). `init(...)` is gated out, so reset →
-        // zero. Infusions from a prior occasion live at earlier absolute times,
-        // so they are naturally no longer active after the reset.
+        // EVID 3/4 reset: re-seed the state to the initial conditions at this
+        // time, *before* the same-time dose (EVID=4 = reset + dose). Infusions
+        // from a prior occasion live at earlier absolute times, so they are
+        // naturally no longer active after the reset.
         if subject
             .reset_times
             .iter()
             .any(|&rt| (rt - t_start).abs() < 1e-12)
         {
-            for s in u.iter_mut() {
-                *s = Dual2::constant(0.0);
-            }
+            u.copy_from_slice(init_state);
         }
 
         // Apply bolus doses (non-infusions) at t_start: u[cmt] += F·amt.
@@ -797,6 +844,45 @@ mod tests {
         let mut subject = bolus_subject(&[1.0, 3.0, 5.0, 6.0, 9.0, 24.0]);
         subject.doses = vec![DoseEvent::new(0.0, 1000.0, 1, 200.0, false, 0.0)];
         check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
+    }
+
+    // 1-cpt with a non-zero `init(central) = 1000/V` baseline (depends on V), no
+    // dose — exercises the dual-seeded initial state and its V derivative.
+    const INIT_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = 1000.0 / V
+  d/dt(central) = -CL/V * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// Non-zero `init(...)`: the dual initial state (value + parameter derivative)
+    /// must match the production predictor + FD across the decay from baseline.
+    #[test]
+    fn ode_provider_init_matches_production() {
+        let model = parse_model_string(INIT_ODE).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "init(...) should be in scope"
+        );
+        let mut subject = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        subject.doses = vec![]; // baseline comes from init, not a dose
+        check_vs_production(&model, &subject, &[1.0, 20.0], &[0.1, -0.05]);
     }
 
     /// EVID 3/4 reset: a two-occasion subject (reset + re-dose at t=10) must zero

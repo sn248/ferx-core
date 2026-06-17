@@ -612,6 +612,7 @@ fn generate_mm_oral() {
         input_rate: Vec::new(),
         rhs_program: None,
         readout_program: None,
+        indiv_param_program: None,
     };
     let model = CompiledModel {
         name: "mm_oral".into(),

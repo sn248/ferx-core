@@ -47,11 +47,11 @@ section of the SDLC for the versioning policy).
   differences of the integrator. Supported scope: IV **bolus and infusion** doses,
   **bioavailability F** (including estimated, any parameterization — log-normal,
   logit-normal, additive), `obs_cmt` or simple Form C (`y = central/V1`) readouts,
-  static covariates, **EVID 3/4 resets / multi-occasion**, and up to 12
-  individual parameters. Models outside this scope (steady-state dosing, lagtime,
-  non-zero `init(...)`, built-in input-rate absorption, IOV, SDE, `obs_scale`/LTBS
-  transforms, time-varying covariates) transparently fall back to the
-  finite-difference gradient (#367).
+  static covariates, **EVID 3/4 resets / multi-occasion**, **non-zero `init(...)`
+  initial conditions**, and up to 12 individual parameters. Models outside this
+  scope (steady-state dosing, lagtime, built-in input-rate absorption, IOV, SDE,
+  `obs_scale`/LTBS transforms, time-varying covariates) transparently fall back
+  to the finite-difference gradient (#367).
 - Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
   input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
   `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The

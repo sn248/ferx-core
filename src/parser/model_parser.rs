@@ -979,7 +979,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let (
         pk_model,
         pk_param_map,
-        ode_spec,
+        mut ode_spec,
         diffusion_theta_names,
         diffusion_theta_inits,
         diffusion_theta_fixed,
@@ -1090,16 +1090,26 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // `eta` slice the closure consumes (BSV η + kappa). Both feed the
     // Tier 4a milestone-2 partial-derivative builder.
     let n_eta_extended_for_partials = eta_names.len();
-    let (pk_param_fn, referenced_covariates, indiv_param_partials) = build_pk_param_fn(
-        indiv_stmts.clone(),
-        &pk_param_map,
-        &indiv_var_names,
-        &ode_slot_map,
-        thetas.len(),
-        n_eta_extended_for_partials,
-        #[cfg(feature = "nn")]
-        &covariate_nns_for_closure,
-    )?;
+    let (pk_param_fn, referenced_covariates, mut indiv_param_partials, indiv_param_program) =
+        build_pk_param_fn(
+            indiv_stmts.clone(),
+            &pk_param_map,
+            &indiv_var_names,
+            &ode_slot_map,
+            thetas.len(),
+            n_eta_extended_for_partials,
+            #[cfg(feature = "nn")]
+            &covariate_nns_for_closure,
+        )?;
+
+    // Attach the individual-parameter program to the ODE spec (if any) for the
+    // analytic-sensitivity η/θ chain (issue #367). The analytical PK provider
+    // reads its copy from `indiv_param_partials` (ODE models route to the ODE
+    // provider, so the partials copy is unused there — a single parse-time clone).
+    indiv_param_partials.indiv_param_program = Some(indiv_param_program.clone());
+    if let Some(ode_spec) = ode_spec.as_mut() {
+        ode_spec.indiv_param_program = Some(indiv_param_program);
+    }
 
     // Reject an analytical model that omits a required PK parameter for its
     // structure (issue #309). Runs *after* build_pk_param_fn so the per-key
@@ -5152,9 +5162,10 @@ fn build_ode_spec(
         // (design A); empty for models with no transit()/etc. input-rate call.
         input_rate,
         rhs_program: Some(rhs_program),
-        // Form C readout program (if any) is attached later, when `[scaling]`
-        // is parsed (see the `parse_scaling_block` wiring).
+        // Form C readout + individual-parameter programs are attached later, when
+        // `[scaling]` / `[individual_parameters]` are parsed (see the wiring).
         readout_program: None,
+        indiv_param_program: None,
     })
 }
 
@@ -6156,7 +6167,15 @@ fn build_pk_param_fn(
     n_theta_base: usize,
     n_eta_extended: usize,
     #[cfg(feature = "nn")] covariate_nns: &[crate::nn::CovariateNn],
-) -> Result<(PkParamFn, Vec<String>, IndivParamPartials), String> {
+) -> Result<
+    (
+        PkParamFn,
+        Vec<String>,
+        IndivParamPartials,
+        IndivParamProgram,
+    ),
+    String,
+> {
     // Covariates referenced anywhere in the block (including inside if-bodies
     // and condition expressions). Sorted for deterministic error messages.
     let mut cov_set: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -6285,6 +6304,24 @@ fn build_pk_param_fn(
 
     let cov_names_for_lookup = referenced_covariates.clone();
 
+    // Snapshot the resolved individual-parameter program for the analytic
+    // sensitivity chain (issue #367) before the f64 `pk_param_fn` closure moves
+    // `stmts_owned` / the mappings. `pk_var_slots` is `(pk_slot, var_slot)` per
+    // individual parameter; ODE models use `ode_assignment_mapping`, analytical
+    // models `pk_assignment_mapping` (both are `(pk_slot, var_slot)`).
+    let indiv_param_program = IndivParamProgram {
+        stmts: stmts_owned.clone(),
+        n_vars,
+        pk_var_slots: if is_analytical_pk {
+            pk_assignment_mapping.clone()
+        } else {
+            ode_assignment_mapping.clone()
+        },
+        n_theta: n_theta_base,
+        n_eta: n_eta_extended,
+        cov_names: cov_names_for_lookup.clone(),
+    };
+
     // Snapshot the NN handles into the closure. Empty when no
     // `[covariate_nn]` blocks are present, in which case the per-call
     // forward-pass loop below is a no-op (just an empty `Vec<Vec<f64>>`
@@ -6358,7 +6395,12 @@ fn build_pk_param_fn(
             p
         },
     );
-    Ok((pk_param_fn, referenced_covariates, indiv_partials))
+    Ok((
+        pk_param_fn,
+        referenced_covariates,
+        indiv_partials,
+        indiv_param_program,
+    ))
 }
 
 // --- Simple expression AST and evaluator ---
@@ -7542,8 +7584,8 @@ fn eval_bytecode(
 #[allow(dead_code)]
 fn eval_bytecode_g<T: crate::sens::num::PkNum>(
     bc: &Bytecode,
-    theta: &[f64],
-    eta: &[f64],
+    theta: &[T],
+    eta: &[T],
     covariates: &[f64],
     vars: &[T],
     nn_outputs: &[Vec<f64>],
@@ -7573,8 +7615,8 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
     while pc < ops.len() {
         match ops[pc] {
             Op::PushConst(i) => push!(k(consts[i as usize])),
-            Op::PushTheta(i) => push!(k(theta.get(i as usize).copied().unwrap_or(0.0))),
-            Op::PushEta(i) => push!(k(eta.get(i as usize).copied().unwrap_or(0.0))),
+            Op::PushTheta(i) => push!(theta.get(i as usize).copied().unwrap_or_else(|| k(0.0))),
+            Op::PushEta(i) => push!(eta.get(i as usize).copied().unwrap_or_else(|| k(0.0))),
             Op::PushVar(i) => push!(*vars.get(i as usize).unwrap_or(&k(0.0))),
             Op::PushCov(i) => push!(k(covariates.get(i as usize).copied().unwrap_or(0.0))),
             Op::PushNnOutput(nn_i, out_i) => {
@@ -8020,23 +8062,25 @@ fn eval_statements_indexed_with_stack(
 #[allow(dead_code)]
 fn eval_statements_g<T: crate::sens::num::PkNum>(
     stmts: &[Statement],
+    theta: &[T],
+    eta: &[T],
+    cov: &[f64],
     vars: &mut [T],
     du: Option<&mut [T]>,
     bc_stack: &mut Vec<T>,
 ) {
-    let empty: [f64; 0] = [];
     let empty_nn: Vec<Vec<f64>> = Vec::new();
     let mut du_opt = du;
     for s in stmts {
         match s {
             Statement::AssignBc(idx, bc) => {
-                let v = eval_bytecode_g::<T>(bc, &empty, &empty, &empty, vars, &empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
                 if let Some(slot) = vars.get_mut(*idx) {
                     *slot = v;
                 }
             }
             Statement::DiffEqBc(state_idx, bc) => {
-                let v = eval_bytecode_g::<T>(bc, &empty, &empty, &empty, vars, &empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
                 if let Some(buf) = du_opt.as_deref_mut() {
                     if let Some(slot) = buf.get_mut(*state_idx) {
                         *slot = v;
@@ -8047,19 +8091,38 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                 branches,
                 else_body,
             } => {
-                // Conditions are value-based; evaluate on a scalar view of `vars`.
+                // Conditions are value-based; evaluate on `.val()` views.
+                let theta_val: Vec<f64> = theta.iter().map(|v| v.val()).collect();
+                let eta_val: Vec<f64> = eta.iter().map(|v| v.val()).collect();
                 let vars_val: Vec<f64> = vars.iter().map(|v| v.val()).collect();
                 let mut taken = false;
                 for (cond, body) in branches {
-                    if eval_condition_indexed(cond, &empty, &empty, &empty, &vars_val, &empty_nn) {
-                        eval_statements_g::<T>(body, vars, du_opt.as_deref_mut(), bc_stack);
+                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, &empty_nn)
+                    {
+                        eval_statements_g::<T>(
+                            body,
+                            theta,
+                            eta,
+                            cov,
+                            vars,
+                            du_opt.as_deref_mut(),
+                            bc_stack,
+                        );
                         taken = true;
                         break;
                     }
                 }
                 if !taken {
                     if let Some(eb) = else_body {
-                        eval_statements_g::<T>(eb, vars, du_opt.as_deref_mut(), bc_stack);
+                        eval_statements_g::<T>(
+                            eb,
+                            theta,
+                            eta,
+                            cov,
+                            vars,
+                            du_opt.as_deref_mut(),
+                            bc_stack,
+                        );
                     }
                 }
             }
@@ -8140,7 +8203,111 @@ impl OdeRhsProgram {
         for d in du.iter_mut() {
             *d = Dual2::constant(0.0);
         }
-        eval_statements_g::<Dual2<N>>(&self.stmts, vars, Some(du), stack);
+        // The ODE RHS references states/indiv-params (in `vars`) only, not
+        // θ/η/cov directly — so those are empty here.
+        eval_statements_g::<Dual2<N>>(&self.stmts, &[], &[], &[], vars, Some(du), stack);
+    }
+}
+
+/// Compiled `[individual_parameters]` block + var layout, exposed so the
+/// analytic-sensitivity provider can obtain `∂p/∂η`, `∂p/∂θ` (and second order)
+/// **analytically** — by evaluating the same statements over `Dual2<M>` seeded on
+/// (θ, η) — instead of finite-differencing `pk_param_fn` (issue #367). Mirrors the
+/// f64 binding in the `pk_param_fn` closure.
+#[derive(Debug, Clone)]
+pub struct IndivParamProgram {
+    stmts: Vec<Statement>,
+    n_vars: usize,
+    /// `(pk_slot, var_slot)` per individual parameter, in declaration order
+    /// (parallel to `CompiledModel.pk_indices`).
+    pk_var_slots: Vec<(usize, usize)>,
+    /// User-declared θ count the individual parameters can reference.
+    n_theta: usize,
+    /// η count the `pk_param_fn` consumes (BSV + IOV kappa).
+    n_eta: usize,
+    /// Covariate names in `referenced_covariates` order (for the cov slice).
+    cov_names: Vec<String>,
+}
+
+impl IndivParamProgram {
+    /// Dual width needed to seed every (θ, η) axis: `n_theta + n_eta`.
+    pub(crate) fn n_axes(&self) -> usize {
+        self.n_theta + self.n_eta
+    }
+    /// User-declared θ count the individual parameters reference (the dual seed
+    /// dimension of η axis `k` is `n_theta_axis() + k`).
+    pub(crate) fn n_theta_axis(&self) -> usize {
+        self.n_theta
+    }
+    /// η count the individual parameters reference (BSV + IOV kappa).
+    pub(crate) fn n_eta_axis(&self) -> usize {
+        self.n_eta
+    }
+
+    /// The PK slot each row of [`eval_param_duals`](Self::eval_param_duals) /
+    /// [`pd_from_program`](crate::sens::ode_provider::pd_from_program) corresponds
+    /// to, in the program's own (analytical: alphabetical-by-PK-name; ODE:
+    /// declaration) order. The analytical provider uses this to pair each `∂p/∂·`
+    /// row with the right slot of the 8-slot PK gradient — `pk_var_slots` order is
+    /// NOT `CompiledModel.pk_indices` (declaration) order.
+    pub(crate) fn pk_slots(&self) -> Vec<usize> {
+        self.pk_var_slots.iter().map(|&(slot, _)| slot).collect()
+    }
+
+    /// Evaluate the individual parameters over `Dual2<M>` seeded on (θ, η):
+    /// `θ_m → var(·, m)`, `η_k → var(·, n_theta + k)`. Returns one `Dual2<M>` per
+    /// individual parameter (declaration order), whose `grad`/`hess` are the exact
+    /// `∂p/∂(θ,η)` / `∂²p/∂(θ,η)²`. Requires `M ≥ n_axes()`.
+    pub(crate) fn eval_param_duals<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Vec<crate::sens::dual2::Dual2<M>> {
+        use crate::sens::dual2::Dual2;
+        let theta_d: Vec<Dual2<M>> = theta
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                if m < M {
+                    Dual2::var(v, m)
+                } else {
+                    Dual2::constant(v)
+                }
+            })
+            .collect();
+        let eta_d: Vec<Dual2<M>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                let dim = self.n_theta + k;
+                if dim < M {
+                    Dual2::var(v, dim)
+                } else {
+                    Dual2::constant(v)
+                }
+            })
+            .collect();
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![Dual2::<M>::constant(0.0); self.n_vars];
+        let mut stack: Vec<Dual2<M>> = Vec::new();
+        eval_statements_g::<Dual2<M>>(
+            &self.stmts,
+            &theta_d,
+            &eta_d,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+        );
+        self.pk_var_slots
+            .iter()
+            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual2::constant(0.0)))
+            .collect()
     }
 }
 
@@ -8189,9 +8356,8 @@ impl OdeOutputProgram {
                 *dst = v;
             }
         }
-        let empty: [f64; 0] = [];
         let empty_nn: Vec<Vec<f64>> = Vec::new();
-        eval_bytecode_g::<Dual2<N>>(&self.bc, &empty, &empty, &empty, vars, &empty_nn, stack)
+        eval_bytecode_g::<Dual2<N>>(&self.bc, &[], &[], &[], vars, &empty_nn, stack)
     }
 }
 
@@ -8713,6 +8879,15 @@ pub struct IndivParamPartials {
     /// n_eta_bsv..n_eta_bsv+n_kappa). Matches the `eta` slice the
     /// `pk_param_fn` closure consumes.
     pub(crate) d_d_eta: Vec<Vec<Expression>>,
+    /// The compiled individual-parameter program, so the analytical PK
+    /// sensitivity provider can obtain exact `∂p/∂(θ,η)` by evaluating it over
+    /// `Dual2` seeded on (θ, η) — replacing the finite-difference `tv_theta_jacobian`
+    /// θ chain and the log-normal-only `sel` η chain (issue #367). Unlike the
+    /// `d_d_theta`/`d_d_eta` symbolic partials (reserved, no runtime consumer),
+    /// this field IS consumed at runtime by `sens::provider`. `None` for
+    /// hand-built fixtures and when no `[individual_parameters]` block exists;
+    /// the ODE provider reads its own copy from `ode_spec`.
+    pub(crate) indiv_param_program: Option<IndivParamProgram>,
 }
 
 impl IndivParamPartials {
@@ -8725,6 +8900,7 @@ impl IndivParamPartials {
             names: Vec::new(),
             d_d_theta: Vec::new(),
             d_d_eta: Vec::new(),
+            indiv_param_program: None,
         }
     }
 }
@@ -8819,6 +8995,9 @@ fn build_indiv_param_partials(
         names,
         d_d_theta,
         d_d_eta,
+        // Attached by the caller (`build_pk_param_fn` site) after the program is
+        // compiled; the symbolic-partials builder itself doesn't produce it.
+        indiv_param_program: None,
     }
 }
 
@@ -16396,7 +16575,7 @@ if (1 > 0) {
         ];
         let mut dud = vec![Dual2::<1>::constant(0.0)];
         let mut sd: Vec<Dual2<1>> = Vec::new();
-        eval_statements_g::<Dual2<1>>(&stmts, &mut vd, Some(&mut dud), &mut sd);
+        eval_statements_g::<Dual2<1>>(&stmts, &[], &[], &[], &mut vd, Some(&mut dud), &mut sd);
 
         assert!(close(dud[0].value, duf[0], 1e-12, 1e-12), "value vs f64");
         // du[0] = −k·u = −0.6; ∂/∂k = −u = −2; ∂²/∂k² = 0.

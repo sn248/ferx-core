@@ -411,6 +411,7 @@ mod tests {
             input_rate: Vec::new(),
             rhs_program: None,
             readout_program: None,
+            indiv_param_program: None,
         };
         let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 

@@ -3356,6 +3356,7 @@ pub(crate) mod test_helpers {
                     input_rate: Vec::new(),
                     rhs_program: None,
                     readout_program: None,
+                    indiv_param_program: None,
                 })
             } else {
                 None

@@ -112,9 +112,31 @@ impl<const N: usize> Dual2<N> {
 
     /// `acos(self)`. With `u = acos(x)`: `u' = g₁·x'`, `u'' = g₁·x'' + g₂·x'⊗x'`,
     /// where `g₁ = −1/√(1−x²)` and `g₂ = −x·(1−x²)^{−3/2}`.
+    ///
+    /// Self-defending at the `|x|→1` boundary: the value is clamped to `[−1, 1]`
+    /// (so `acos` is never NaN on a rounded/saturated arg) and `1−x²` is floored
+    /// before the `√`/divide. Without the floor, `g₁ = −1/√0 = −inf` and, for a
+    /// clamped-constant argument (`grad = 0`), `grad[i] = −inf·0 = NaN` — which
+    /// would silently poison the whole subject's PK sensitivities (PR #381 review
+    /// finding #3). The floored derivative stays finite; at a genuine saturation
+    /// the second-order term is a bounded approximation rather than a NaN.
     pub fn acos(self) -> Self {
         let v = self.value;
-        let one_minus = 1.0 - v * v;
+        let v_clamped = if v > 1.0 {
+            1.0
+        } else if v < -1.0 {
+            -1.0
+        } else {
+            v
+        };
+        let one_minus = {
+            let x = 1.0 - v * v;
+            if x > 1e-12 {
+                x
+            } else {
+                1e-12
+            }
+        };
         let s = one_minus.sqrt();
         let g1 = -1.0 / s;
         let g2 = -v / (one_minus * s);
@@ -129,7 +151,7 @@ impl<const N: usize> Dual2<N> {
             }
         }
         Dual2 {
-            value: v.acos(),
+            value: v_clamped.acos(),
             grad,
             hess,
         }

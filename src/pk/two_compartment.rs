@@ -104,18 +104,25 @@ pub fn two_cpt_oral_f(
     //              + (k21-ka)/((α-ka)(β-ka)) · e^{-ka·t} ]
     //
     // Handle singularities when ka ≈ alpha or ka ≈ beta via L'Hopital limits.
+    // The e^{-αt} term and the e^{-ka·t} term BOTH carry the 1/(ka-α) pole, so as
+    // ka→α they must be combined *before* taking the limit. The combined limit is
+    //   d·e^{-αt}·[ (α-k21)/diff·t − (k21-β)/diff² ],   diff = α-β
+    // (and symmetric for ka→β). Applying L'Hôpital to the α-term alone and zeroing
+    // the ka-term — as an earlier version did — drops the −(k21-β)/diff² piece and
+    // is ~14% off near the pole.
     let p = if (ka - alpha).abs() < 1e-6 {
-        d * (alpha - k21) / diff * t * (-alpha * t).exp()
+        d * (-alpha * t).exp() * ((alpha - k21) / diff * t - (k21 - beta) / (diff * diff))
     } else {
         d * (k21 - alpha) / ((ka - alpha) * (beta - alpha)) * (-alpha * t).exp()
     };
 
     let q_val = if (ka - beta).abs() < 1e-6 {
-        d * (k21 - beta) / diff * t * (-beta * t).exp()
+        d * (-beta * t).exp() * ((k21 - beta) / diff * t - (k21 - alpha) / (diff * diff))
     } else {
         d * (k21 - beta) / ((ka - beta) * (alpha - beta)) * (-beta * t).exp()
     };
 
+    // The e^{-ka·t} term is folded into `p` (ka≈α) or `q_val` (ka≈β) above.
     let r = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 {
         0.0
     } else {
@@ -266,15 +273,20 @@ pub fn two_cpt_oral_f_ss(
         (-lambda * tau).exp() * (tau / one_minus_x + ii * x / (one_minus_x * one_minus_x))
     }
 
+    // Combined ka→α (or ka→β) L'Hôpital limit — the e^{-ka·t} term shares the
+    // 1/(ka-α) pole and is folded in, contributing the −(k21-β)/diff²·SS term that
+    // the t-only limit drops (see `two_cpt_oral_f`).
     let p = if (ka - alpha).abs() < 1e-6 {
-        d * (alpha - k21) / diff * lhopital_ss_sum(t, alpha, ii)
+        d * ((alpha - k21) / diff * lhopital_ss_sum(t, alpha, ii)
+            - (k21 - beta) / (diff * diff) * (-alpha * t).exp() * ss_coeff(alpha, ii))
     } else {
         d * (k21 - alpha) / ((ka - alpha) * (beta - alpha))
             * (-alpha * t).exp()
             * ss_coeff(alpha, ii)
     };
     let q_val = if (ka - beta).abs() < 1e-6 {
-        d * (k21 - beta) / diff * lhopital_ss_sum(t, beta, ii)
+        d * ((k21 - beta) / diff * lhopital_ss_sum(t, beta, ii)
+            - (k21 - alpha) / (diff * diff) * (-beta * t).exp() * ss_coeff(beta, ii))
     } else {
         d * (k21 - beta) / ((ka - beta) * (alpha - beta)) * (-beta * t).exp() * ss_coeff(beta, ii)
     };
@@ -676,6 +688,50 @@ mod tests {
             let cf = two_cpt_oral_ss(&dose, t, CL, V1, Q, V2, ka);
             let num = ss_numerical_sum(t, ii, |tt| two_cpt_oral(&single, tt, CL, V1, Q, V2, ka));
             assert_relative_eq!(cf, num, epsilon = 1e-6, max_relative = 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_oral_lhopital_matches_nonsingular_limit_independent() {
+        // Independent (non-self-referential) check for the ka≈α / ka≈β L'Hôpital
+        // limits. At ka = λ the singular branch must equal the limit of the
+        // NON-singular formula as ka → λ — and the non-singular branch never
+        // touches the L'Hôpital code, so it is independent truth (the prior tests
+        // built "truth" from the same singular branch and so missed the bug).
+        // Central average cancels the O(δ) term. Regression-guards the ~14% defect
+        // (true ≈ 8.309 vs buggy ≈ 9.504) from the PR #381 review.
+        let (cl, v1, q, v2, amt) = (10.0, 50.0, 15.0, 100.0, 1000.0);
+        let (alpha, beta, _) = macro_rates(cl, v1, q, v2);
+        let single = bolus_dose(amt);
+        let delta = 1e-3;
+        for &lambda in &[alpha, beta] {
+            for &t in &[0.5, 2.0, 6.0] {
+                let c_sing = two_cpt_oral(&single, t, cl, v1, q, v2, lambda);
+                let c_lo = two_cpt_oral(&single, t, cl, v1, q, v2, lambda - delta);
+                let c_hi = two_cpt_oral(&single, t, cl, v1, q, v2, lambda + delta);
+                let truth = 0.5 * (c_lo + c_hi);
+                assert_relative_eq!(c_sing, truth, max_relative = 2e-4, epsilon = 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn test_ss_oral_lhopital_matches_nonsingular_limit_independent() {
+        // SS analog of the independent continuity check: the singular SS branch at
+        // ka = λ must match the non-singular SS formula limit as ka → λ.
+        let ii: f64 = 24.0;
+        let (cl, v1, q, v2, amt) = (10.0, 50.0, 15.0, 100.0, 500.0);
+        let (alpha, beta, _) = macro_rates(cl, v1, q, v2);
+        let dose = ss_bolus_dose(amt, ii);
+        let delta = 1e-3;
+        for &lambda in &[alpha, beta] {
+            for &t in &[0.5, 2.0, 12.0] {
+                let c_sing = two_cpt_oral_ss(&dose, t, cl, v1, q, v2, lambda);
+                let c_lo = two_cpt_oral_ss(&dose, t, cl, v1, q, v2, lambda - delta);
+                let c_hi = two_cpt_oral_ss(&dose, t, cl, v1, q, v2, lambda + delta);
+                let truth = 0.5 * (c_lo + c_hi);
+                assert_relative_eq!(c_sing, truth, max_relative = 2e-4, epsilon = 1e-9);
+            }
         }
     }
 

@@ -411,6 +411,14 @@ pub fn subject_packed_gradient(
     x: &[f64],
     eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
+    // Under M3/BLOQ the objective replaces a censored row with −logΦ((LLOQ−f)/√V),
+    // but this analytic path computes the Gaussian ½(ε²/R + lnR) for every row — so
+    // a censored subject would differentiate an objective the optimizer is not
+    // minimizing, stalling silently. Fall back to FD, mirroring the FOCE sibling
+    // (`subject_packed_gradient_foce`). PR #381 review finding #2.
+    if subject.cens.iter().any(|&c| c != 0) {
+        return None;
+    }
     let params = unpack_params(x, template);
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
     let prep = prepare(model, subject, &params, &sens)?;
@@ -805,18 +813,30 @@ pub fn predict_warm_etas(
     x_prev: &[f64],
     x_new: &[f64],
 ) -> Vec<DVector<f64>> {
+    // Cap on the L2 norm of a single predicted η warm-start step. The inner solve
+    // re-refines from the warm start, so this only needs to keep it inside a sane
+    // region: on a large or ill-conditioned outer step the linear Eq.48
+    // extrapolation can overshoot the basin, and if the inner BFGS then hits
+    // max_iter it can land at a different mode, perturbing the reported OFV.
+    // η live on the O(1) random-effects scale, so ~2 (a few IIV SDs) rarely binds
+    // on a normal step but blocks a runaway one. PR #381 review finding #8.
+    const MAX_PREDICT_STEP_NORM: f64 = 2.0;
     prev_etas
         .iter()
         .zip(jacs.iter())
         .map(|(eta, jac)| {
-            let mut e = eta.clone();
+            let mut step = DVector::zeros(eta.len());
             for (k, jk) in jac.iter().enumerate() {
                 let dx = x_new[k] - x_prev[k];
                 if dx != 0.0 {
-                    e += jk * dx;
+                    step += jk * dx;
                 }
             }
-            e
+            let norm = step.norm();
+            if norm > MAX_PREDICT_STEP_NORM {
+                step *= MAX_PREDICT_STEP_NORM / norm;
+            }
+            eta + step
         })
         .collect()
 }

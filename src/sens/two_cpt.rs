@@ -102,13 +102,16 @@ pub fn two_cpt_oral_g<T: PkNum>(amt: f64, t: f64, cl: T, v1: T, q: T, v2: T, ka:
     let d = f_bio * T::from_f64(amt) * ka / v1;
     let tt = T::from_f64(t);
 
+    // Combined ka→α (or ka→β) L'Hôpital limit: the e^{-ka·t} term shares the
+    // 1/(ka-α) pole and is folded in, contributing −(k21-β)/diff²·e^{-αt} (the
+    // piece a t-only limit drops). Mirror of `pk::two_compartment::two_cpt_oral_f`.
     let p = if (ka.val() - alpha.val()).abs() < 1e-6 {
-        d * (alpha - k21) / diff * tt * (-(alpha * tt)).exp()
+        d * (-(alpha * tt)).exp() * ((alpha - k21) / diff * tt - (k21 - beta) / (diff * diff))
     } else {
         d * (k21 - alpha) / ((ka - alpha) * (beta - alpha)) * (-(alpha * tt)).exp()
     };
     let q_val = if (ka.val() - beta.val()).abs() < 1e-6 {
-        d * (k21 - beta) / diff * tt * (-(beta * tt)).exp()
+        d * (-(beta * tt)).exp() * ((k21 - beta) / diff * tt - (k21 - alpha) / (diff * diff))
     } else {
         d * (k21 - beta) / ((ka - beta) * (alpha - beta)) * (-(beta * tt)).exp()
     };
@@ -187,15 +190,20 @@ pub fn two_cpt_oral_ss_g<T: PkNum>(
         (-(lambda * tt)).exp() * (tt / omx + (x * T::from_f64(ii)) / (omx * omx))
     };
 
+    // Combined ka→α (or ka→β) L'Hôpital limit, SS form: add the
+    // −(k21-β)/diff²·e^{-ατ}·ss_coeff term the t-only limit drops (see
+    // `pk::two_compartment::two_cpt_oral_f_ss`).
     let p = if (ka.val() - alpha.val()).abs() < 1e-6 {
-        d * (alpha - k21) / diff * lhop(alpha)
+        d * ((alpha - k21) / diff * lhop(alpha)
+            - (k21 - beta) / (diff * diff) * (-(alpha * tt)).exp() * ss_coeff_g(alpha, ii))
     } else {
         d * (k21 - alpha) / ((ka - alpha) * (beta - alpha))
             * (-(alpha * tt)).exp()
             * ss_coeff_g(alpha, ii)
     };
     let q_val = if (ka.val() - beta.val()).abs() < 1e-6 {
-        d * (k21 - beta) / diff * lhop(beta)
+        d * ((k21 - beta) / diff * lhop(beta)
+            - (k21 - alpha) / (diff * diff) * (-(beta * tt)).exp() * ss_coeff_g(beta, ii))
     } else {
         d * (k21 - beta) / ((ka - beta) * (alpha - beta))
             * (-(beta * tt)).exp()

@@ -101,23 +101,6 @@ enum ExKind {
     ThreeCptBolus,
 }
 
-/// Accumulate an `M`-parameter explicit `(grad, hess)` into the 8-slot PK layout
-/// via `map` (small-array index → PK slot).
-fn scatter_explicit<const M: usize>(
-    g: &mut [f64; N_PK],
-    h: &mut [[f64; N_PK]; N_PK],
-    gs: &[f64; M],
-    hs: &[[f64; M]; M],
-    map: &[usize; M],
-) {
-    for a in 0..M {
-        g[map[a]] += gs[a];
-        for b in 0..M {
-            h[map[a]][map[b]] += hs[a][b];
-        }
-    }
-}
-
 /// True when [`subject_sensitivities`] can serve this model: analytical 1-cpt or
 /// 2-cpt, `tv_fn` present, no ODE. Per-subject gates (TV covariates) are checked
 /// separately in [`subject_sensitivities`].
@@ -202,6 +185,59 @@ pub(crate) fn tv_theta_jacobian(
     jac
 }
 
+/// Fallback `∂p/∂(θ,η)` for the closed-form log-normal parameterization
+/// `pk_i = tv_i·exp(Σ_k sel[i,k]·η_k)`, used when the exact `Dual2`-over-program
+/// path is unavailable (NN-weight θ or IOV kappa make the program's axis counts
+/// disagree with the model's θ/η). The η chain is closed form; the θ chain uses
+/// the FD `tv_theta_jacobian` (ρ). Produces the same `ParamDerivs` shape the
+/// program path returns so the downstream chain is identical:
+///   `∂p_i/∂η_k = pk_i·sel_ik`, `∂p_i/∂θ_m = pk_i·ρ_im`,
+///   `∂²p_i/∂η_k∂η_l = pk_i·sel_ik·sel_il`, `∂²p_i/∂η_k∂θ_m = pk_i·sel_ik·ρ_im`.
+fn lognormal_param_derivatives(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    pk: &crate::types::PkParams,
+) -> crate::sens::ode_provider::ParamDerivs {
+    let n_eta = model.n_eta;
+    let n_theta = model.n_theta;
+    let tv = (model.tv_fn.as_ref().unwrap())(theta, &subject.covariates);
+    let tv_jac = tv_theta_jacobian(model, subject, theta);
+    let ni = model.pk_indices.len();
+    let mut dp_deta = vec![vec![0.0; n_eta]; ni];
+    let mut dp_dtheta = vec![vec![0.0; n_theta]; ni];
+    let mut d2p_deta2 = vec![vec![vec![0.0; n_eta]; n_eta]; ni];
+    let mut d2p_detadtheta = vec![vec![vec![0.0; n_theta]; n_eta]; ni];
+    for (i, &slot) in model.pk_indices.iter().enumerate() {
+        let pk_val = pk.values[slot];
+        let tv_i = tv[i];
+        let sel: Vec<f64> = (0..n_eta).map(|k| model.sel_flat[i * n_eta + k]).collect();
+        let rho: Vec<f64> = if tv_i.abs() > 0.0 {
+            (0..n_theta).map(|m| tv_jac[i][m] / tv_i).collect()
+        } else {
+            vec![0.0; n_theta]
+        };
+        for m in 0..n_theta {
+            dp_dtheta[i][m] = pk_val * rho[m];
+        }
+        for k in 0..n_eta {
+            dp_deta[i][k] = pk_val * sel[k];
+            for l in 0..n_eta {
+                d2p_deta2[i][k][l] = pk_val * sel[k] * sel[l];
+            }
+            for m in 0..n_theta {
+                d2p_detadtheta[i][k][m] = pk_val * sel[k] * rho[m];
+            }
+        }
+    }
+    crate::sens::ode_provider::ParamDerivs {
+        dp_deta,
+        dp_dtheta,
+        d2p_deta2,
+        d2p_detadtheta,
+    }
+}
+
 /// Compute per-observation analytic sensitivities, or `None` if this
 /// model/subject is outside the supported analytical 1-cpt scope (caller falls
 /// back to the gradient-free path).
@@ -218,7 +254,17 @@ pub fn subject_sensitivities(
     if model.ode_spec.is_some() {
         return crate::sens::ode_provider::ode_subject_sensitivities(model, subject, theta, eta);
     }
-    if !analytical_supported(model) || subject.has_tv_covariates() || subject.has_resets() {
+    if !analytical_supported(model) || subject.has_tv_covariates() {
+        return None;
+    }
+    // EVID=3/4 resets are handled by restricting dose superposition to the
+    // current reset segment (see `reset_floor` in the obs loop): for linear PK a
+    // reset zeros the compartments, so the prediction at an observation is the
+    // superposition of only the doses since the most recent reset — which carries
+    // the exact `∂f/∂pk` through the same closed forms. Steady-state doses assume
+    // an infinite periodic history that a mid-record reset contradicts, so a
+    // subject mixing SS with resets falls back to FD.
+    if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
     // Overlapping steady-state infusion (`T_inf > II`) has no single-interval
@@ -244,46 +290,56 @@ pub fn subject_sensitivities(
 
     // PK parameter values at (θ, η): pk_s = tv_s·exp(sel·η). pk_param_fn folds η.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-    let (cl, v1, q, v2, ka, f_bio, q3, v3) = (
-        pk.cl(),
-        pk.v(),
-        pk.q(),
-        pk.v2(),
-        pk.ka(),
-        pk.f_bio(),
-        pk.q3(),
-        pk.v3(),
-    );
 
-    // Typical values (η = 0) and their θ Jacobian for the ρ chain.
-    let tv = (model.tv_fn.as_ref().unwrap())(theta, &subject.covariates);
-    let tv_jac = tv_theta_jacobian(model, subject, theta);
+    // `∂p/∂(θ,η)` (and second order) plus `slots`: the PK slot each `pd` row maps
+    // to, in `pd`-row order. Analytical where possible: evaluate the compiled
+    // `[individual_parameters]` program over `Dual2` seeded on (θ, η) — exact for
+    // ANY parameterization (log-normal, logit-normal F, additive), no finite
+    // differences (issue #367). Its rows follow the program's `pk_var_slots` order
+    // (analytical: alphabetical by PK name), NOT `pk_indices` (declaration) order.
+    // Falls back to the closed-form log-normal `sel` η chain plus the FD
+    // `tv_theta_jacobian` θ chain (`ρ`) — whose rows ARE in `pk_indices` order —
+    // when the program path is unavailable (NN-weight θ / IOV kappa axis mismatch,
+    // or a literal-const PK slot the program omits).
+    let (pd, slots): (crate::sens::ode_provider::ParamDerivs, Vec<usize>) = match model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .filter(|prog| prog.pk_slots().len() == model.pk_indices.len())
+        .and_then(|prog| {
+            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
+                .map(|pd| (pd, prog.pk_slots()))
+        }) {
+        Some((pd, slots)) => (pd, slots),
+        None => {
+            // The closed-form fallback assumes `∂p/∂η = pk·sel` (log-normal). It is
+            // only valid when every PK-param eta is LogNormal; for additive / logit
+            // / custom etas the exact `∂p/∂η` must come from the program chain
+            // above, and if that is unavailable (NN-weight θ or IOV kappa axis
+            // mismatch) we fall back to FD rather than mis-apply the log-normal
+            // chain (which would be off by a factor of `pk` vs `1`). PR #381 #4.
+            if !model
+                .eta_param_info
+                .iter()
+                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
+            {
+                return None;
+            }
+            let pd = lognormal_param_derivatives(model, subject, theta, &pk);
+            (pd, model.pk_indices.clone())
+        }
+    };
 
-    // Per individual-parameter assignment i: its seed dim, PK value, sel row,
-    // and ρ row. These drive the whole chain.
-    struct Term {
-        dim: usize,
-        pk_val: f64,
-        sel: Vec<f64>, // length n_eta
-        rho: Vec<f64>, // length n_theta
-    }
-    let mut terms: Vec<Term> = Vec::with_capacity(model.pk_indices.len());
-    for (i, &slot) in model.pk_indices.iter().enumerate() {
-        let dim = slot_to_dim(slot)?; // guaranteed Some by analytical_supported
-        let pk_val = pk.values[slot];
-        let sel: Vec<f64> = (0..n_eta).map(|k| model.sel_flat[i * n_eta + k]).collect();
-        let tv_i = tv[i];
-        let rho: Vec<f64> = if tv_i.abs() > 0.0 {
-            (0..n_theta).map(|m| tv_jac[i][m] / tv_i).collect()
-        } else {
-            vec![0.0; n_theta]
-        };
-        terms.push(Term {
-            dim,
-            pk_val,
-            sel,
-            rho,
-        });
+    // Right-size the dual width to the number of differentiated PK parameters
+    // (issue #367): seed only those on a compact `0..N`, so a 2-cpt IV model runs
+    // `Dual2<4>` (4× fewer Hessian entries per op than the former fixed `Dual2<8>`),
+    // 3-cpt `Dual2<6>`, etc. `seed_dim[s]` is the compact dual axis for PK slot `s`
+    // (`None` = constant, not differentiated); `pd` row `i` ↔ compact axis `i`.
+    let mut seed_dim: [Option<usize>; N_PK] = [None; N_PK];
+    for (i, &slot) in slots.iter().enumerate() {
+        if slot < N_PK {
+            seed_dim[slot] = Some(i);
+        }
     }
 
     // Explicit-kernel fast path (A/B toggle): only when all doses are plain
@@ -301,19 +357,75 @@ pub fn subject_sensitivities(
             None
         };
 
+    // Dispatch on the differentiated-parameter count so the dual width is
+    // right-sized. `pk_indices.len()` ≤ `N_PK` (the fixed PK slot table).
+    macro_rules! disp {
+        ($($n:literal),+) => {
+            match slots.len() {
+                $($n => Some(SubjectSens {
+                    obs: run_obs::<$n>(
+                        &seed_dim, &pk, oral, two_cpt, three_cpt, explicit_kind, subject, &pd,
+                        n_eta, n_theta,
+                    ),
+                }),)+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8)
+}
+
+/// Per-observation value/grad/Hessian chain at a right-sized dual width `N`
+/// (= number of differentiated PK parameters). `seed_dim[s]` is the compact dual
+/// axis for PK slot `s` (`None` = constant); `pd` rows are in compact-axis order,
+/// so the chain reads `g[i]`/`h[i][j]` directly (identity dims).
+#[allow(clippy::too_many_arguments)]
+fn run_obs<const N: usize>(
+    seed_dim: &[Option<usize>; N_PK],
+    pk: &crate::types::PkParams,
+    oral: bool,
+    two_cpt: bool,
+    three_cpt: bool,
+    explicit_kind: Option<ExKind>,
+    subject: &Subject,
+    pd: &crate::sens::ode_provider::ParamDerivs,
+    n_eta: usize,
+    n_theta: usize,
+) -> Vec<ObsSens> {
+    let (cl, v1, q, v2, ka, f_bio, q3, v3) = (
+        pk.cl(),
+        pk.v(),
+        pk.q(),
+        pk.v2(),
+        pk.ka(),
+        pk.f_bio(),
+        pk.q3(),
+        pk.v3(),
+    );
     let mut out = Vec::with_capacity(subject.obs_times.len());
     for &t_obs in subject.obs_times.iter() {
-        // `(f, ∂f/∂pk, ∂²f/∂pk²)` in the 8-slot layout — from the explicit
-        // kernels when applicable, else the generic Dual2<8> path.
-        let (fval, g, h): (f64, [f64; N_PK], [[f64; N_PK]; N_PK]) = if let Some(kind) =
-            explicit_kind
-        {
-            let mut gv = [0.0; N_PK];
-            let mut hv = [[0.0; N_PK]; N_PK];
+        // Reset segment: the most recent EVID=3/4 reset at or before this
+        // observation (−∞ when the subject has no resets). Doses before it were
+        // zeroed out of the compartments, so they're excluded from the
+        // superposition below — mirroring the event-driven walker's
+        // `event_reset_floor`. A reset+dose record (EVID=4) sits exactly at the
+        // floor and is kept (`dose.time >= reset_floor`).
+        let reset_floor = subject
+            .reset_times
+            .iter()
+            .copied()
+            .filter(|&r| r <= t_obs)
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        // `(f, ∂f/∂pk, ∂²f/∂pk²)` in the compact `0..N` layout — from the explicit
+        // kernels when applicable, else the generic `Dual2<N>` path.
+        let (fval, g, h): (f64, [f64; N], [[f64; N]; N]) = if let Some(kind) = explicit_kind {
+            let mut gv = [0.0; N];
+            let mut hv = [[0.0; N]; N];
             let mut val = 0.0;
             for dose in &subject.doses {
                 let elapsed = t_obs - dose.time;
-                if elapsed < 0.0 {
+                if elapsed < 0.0 || dose.time < reset_floor {
                     continue;
                 }
                 match kind {
@@ -321,50 +433,86 @@ pub fn subject_sensitivities(
                         let (f, gs, hs) =
                             super::one_cpt_explicit::iv_bolus_explicit(dose.amt, elapsed, cl, v1);
                         val += f;
-                        scatter_explicit(&mut gv, &mut hv, &gs, &hs, &[0, 1]);
+                        scatter_compact(
+                            &mut gv,
+                            &mut hv,
+                            &gs,
+                            &hs,
+                            &[PK_IDX_CL, PK_IDX_V],
+                            seed_dim,
+                        );
                     }
                     ExKind::OneCptOral => {
                         let (f, gs, hs) = super::one_cpt_explicit::oral_explicit(
                             dose.amt, elapsed, cl, v1, ka, f_bio,
                         );
                         val += f;
-                        scatter_explicit(&mut gv, &mut hv, &gs, &hs, &[0, 1, 4, 5]);
+                        scatter_compact(
+                            &mut gv,
+                            &mut hv,
+                            &gs,
+                            &hs,
+                            &[PK_IDX_CL, PK_IDX_V, PK_IDX_KA, PK_IDX_F],
+                            seed_dim,
+                        );
                     }
                     ExKind::TwoCptBolus => {
                         let (f, gs, hs) = super::two_cpt_explicit::iv_bolus_explicit(
                             dose.amt, elapsed, cl, v1, q, v2,
                         );
                         val += f;
-                        scatter_explicit(&mut gv, &mut hv, &gs, &hs, &[0, 1, 2, 3]);
+                        scatter_compact(
+                            &mut gv,
+                            &mut hv,
+                            &gs,
+                            &hs,
+                            &[PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2],
+                            seed_dim,
+                        );
                     }
                     ExKind::ThreeCptBolus => {
                         let (f, gs, hs) = super::three_cpt_explicit::iv_bolus_explicit(
                             dose.amt, elapsed, cl, v1, q, v2, q3, v3,
                         );
                         val += f;
-                        // [CL,V1,Q2,V2,Q3,V3] → 8-slot layout (Q3=6, V3=7).
-                        scatter_explicit(&mut gv, &mut hv, &gs, &hs, &[0, 1, 2, 3, 6, 7]);
+                        scatter_compact(
+                            &mut gv,
+                            &mut hv,
+                            &gs,
+                            &hs,
+                            &[
+                                PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_Q3, PK_IDX_V3,
+                            ],
+                            seed_dim,
+                        );
                     }
                 }
             }
             (val, gv, hv)
         } else {
-            // Seed PK params as Dual2<8> on [CL, V1, Q2, V2, KA, F, Q3, V3].
-            // Lower-dimensional solutions ignore the unused dims.
-            let cl_d = Dual2::<N_PK>::var(cl, 0);
-            let v1_d = Dual2::<N_PK>::var(v1, 1);
-            let q_d = Dual2::<N_PK>::var(q, 2);
-            let v2_d = Dual2::<N_PK>::var(v2, 3);
-            let ka_d = Dual2::<N_PK>::var(ka, 4);
-            let f_d = Dual2::<N_PK>::var(f_bio, 5);
-            let q3_d = Dual2::<N_PK>::var(q3, 6);
-            let v3_d = Dual2::<N_PK>::var(v3, 7);
+            // Seed only the differentiated PK params as `Dual2<N>` on their compact
+            // axes; everything else is a constant. `dv(slot, value)` does the lookup.
+            let dv = |slot: usize, value: f64| -> Dual2<N> {
+                match seed_dim[slot] {
+                    Some(k) => Dual2::<N>::var(value, k),
+                    None => Dual2::<N>::constant(value),
+                }
+            };
+            let cl_d = dv(PK_IDX_CL, cl);
+            let v1_d = dv(PK_IDX_V, v1);
+            let q_d = dv(PK_IDX_Q, q);
+            let v2_d = dv(PK_IDX_V2, v2);
+            let ka_d = dv(PK_IDX_KA, ka);
+            let f_d = dv(PK_IDX_F, f_bio);
+            let q3_d = dv(PK_IDX_Q3, q3);
+            let v3_d = dv(PK_IDX_V3, v3);
 
-            // Superpose dose contributions: f = Σ conc(dose, t_obs − dose.time).
-            let mut fd = Dual2::<N_PK>::constant(0.0);
+            // Superpose dose contributions: f = Σ conc(dose, t_obs − dose.time),
+            // restricted to the current reset segment (`dose.time >= reset_floor`).
+            let mut fd = Dual2::<N>::constant(0.0);
             for dose in &subject.doses {
                 let elapsed = t_obs - dose.time;
-                if elapsed < 0.0 {
+                if elapsed < 0.0 || dose.time < reset_floor {
                     continue;
                 }
                 let c = if three_cpt {
@@ -381,49 +529,57 @@ pub fn subject_sensitivities(
             (fd.value, fd.grad, fd.hess)
         };
 
+        // Match production's `conc.max(0.0)` clamp (`pk/mod.rs`): when the closed
+        // form goes slightly negative (cancellation at extreme params during a
+        // line-search step), the objective uses `f = 0`, so the gradient of
+        // `max(f, 0)` is also 0 there. Returning the raw negative `f` and its
+        // derivatives would make the analytic gradient inconsistent with the
+        // objective it differentiates (PR #381 review finding #5).
+        let (fval, g, h) = if fval < 0.0 {
+            (0.0, [0.0; N], [[0.0; N]; N])
+        } else {
+            (fval, g, h)
+        };
+
         let mut df_deta = vec![0.0; n_eta];
         let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
         let mut df_dtheta = vec![0.0; n_theta];
         let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
 
-        // First-order chains: ∂f/∂η_k = Σ_i g[d_i]·pk_i·sel[i,k]; likewise θ.
-        for term in &terms {
-            let gi = g[term.dim];
+        // Chain ∂f/∂p, ∂²f/∂p² (exact, from the seeded PK Dual2 in compact layout)
+        // with ∂p/∂(θ,η) (from `pd`, analytical or FD fallback):
+        //   ∂f/∂η_k      = Σ_i g[i]·pᵢ,η_k
+        //   ∂²f/∂η_k∂η_l = Σ_ij H[i][j]·pᵢ,η_k·pⱼ,η_l + Σ_i g[i]·pᵢ,η_kη_l
+        // and likewise with θ in one slot. Compact axis `i` ↔ `pd` row `i`.
+        for i in 0..N {
+            let gi = g[i];
             for k in 0..n_eta {
-                df_deta[k] += gi * term.pk_val * term.sel[k];
+                df_deta[k] += gi * pd.dp_deta[i][k];
             }
             for m in 0..n_theta {
-                df_dtheta[m] += gi * term.pk_val * term.rho[m];
+                df_dtheta[m] += gi * pd.dp_dtheta[i][m];
             }
         }
-
-        // Second-order: H term (cross over assignments) + g·(∂²pk) self term.
-        // ∂²f/∂η_k∂η_l = Σ_{i,j} H[d_i][d_j]·(pk_i sel_ik)(pk_j sel_jl)
-        //              + Σ_i g[d_i]·pk_i·sel_ik·sel_il.
         for k in 0..n_eta {
             for l in 0..n_eta {
                 let mut acc = 0.0;
-                for ti in &terms {
-                    let a = ti.pk_val * ti.sel[k];
-                    for tj in &terms {
-                        acc += h[ti.dim][tj.dim] * a * (tj.pk_val * tj.sel[l]);
+                for i in 0..N {
+                    for j in 0..N {
+                        acc += h[i][j] * pd.dp_deta[i][k] * pd.dp_deta[j][l];
                     }
-                    acc += g[ti.dim] * ti.pk_val * ti.sel[k] * ti.sel[l];
+                    acc += g[i] * pd.d2p_deta2[i][k][l];
                 }
                 d2f_deta2[k * n_eta + l] = acc;
             }
         }
-        // ∂²f/∂η_k∂θ_m = Σ_{i,j} H[d_i][d_j]·(pk_i sel_ik)(pk_j ρ_jm)
-        //              + Σ_i g[d_i]·pk_i·sel_ik·ρ_im.
         for k in 0..n_eta {
             for m in 0..n_theta {
                 let mut acc = 0.0;
-                for ti in &terms {
-                    let a = ti.pk_val * ti.sel[k];
-                    for tj in &terms {
-                        acc += h[ti.dim][tj.dim] * a * (tj.pk_val * tj.rho[m]);
+                for i in 0..N {
+                    for j in 0..N {
+                        acc += h[i][j] * pd.dp_deta[i][k] * pd.dp_dtheta[j][m];
                     }
-                    acc += g[ti.dim] * ti.pk_val * ti.sel[k] * ti.rho[m];
+                    acc += g[i] * pd.d2p_detadtheta[i][k][m];
                 }
                 d2f_deta_dtheta[k * n_theta + m] = acc;
             }
@@ -437,8 +593,34 @@ pub fn subject_sensitivities(
             d2f_deta_dtheta,
         });
     }
+    out
+}
 
-    Some(SubjectSens { obs: out })
+/// Scatter an explicit kernel's `M`-parameter `(grad, hess)` into the compact
+/// `N`-axis layout via `seed_dim` (PK slot → compact axis). `map8[a]` is the PK
+/// slot of explicit param `a`; a param whose slot isn't differentiated
+/// (`seed_dim = None`, e.g. a literal-const PK value) is dropped — its derivative
+/// is not chained.
+fn scatter_compact<const M: usize, const N: usize>(
+    g: &mut [f64; N],
+    h: &mut [[f64; N]; N],
+    gs: &[f64; M],
+    hs: &[[f64; M]; M],
+    map8: &[usize; M],
+    seed_dim: &[Option<usize>; N_PK],
+) {
+    for a in 0..M {
+        let ca = match seed_dim[map8[a]] {
+            Some(c) => c,
+            None => continue,
+        };
+        g[ca] += gs[a];
+        for b in 0..M {
+            if let Some(cb) = seed_dim[map8[b]] {
+                h[ca][cb] += hs[a][b];
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -779,6 +961,77 @@ mod tests {
             subject_sensitivities(&iv, &ss_inf, &[10.0, 50.0, 15.0, 100.0], &[0.1, -0.05])
                 .is_none()
         );
+    }
+
+    /// Build a subject carrying explicit doses and EVID=3/4 reset times (no
+    /// covariates, no IOV) for the reset-superposition tests.
+    fn subject_with_doses_and_resets(
+        doses: Vec<DoseEvent>,
+        times: &[f64],
+        reset_times: Vec<f64>,
+    ) -> Subject {
+        let n = times.len();
+        Subject {
+            id: "1".to_string(),
+            doses,
+            obs_times: times.to_vec(),
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times,
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    /// Two infusion occasions on a 3-cpt IV model separated by an EVID=4 reset:
+    /// occasion-2 observations must rebuild from zero (no occasion-1 carryover).
+    /// The provider's reset-segment superposition must reproduce the production
+    /// event-driven predictor and its FD sensitivities.
+    #[test]
+    fn provider_3cpt_two_occasion_reset_matches_production() {
+        let iv = parse_model_string(THREECPT_IV).expect("parse");
+        let theta = vec![5.0, 10.0, 2.0, 20.0, 1.5, 30.0];
+        let eta = vec![0.12, -0.08];
+        // Occasion 1: infusion at t=0 (rate 200, amt 1000 → 5 h). Occasion 2:
+        // same infusion at t=120, opened by an EVID=4 reset at t=120.
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 200.0, false, 0.0),
+            DoseEvent::new(120.0, 1000.0, 1, 200.0, false, 0.0),
+        ];
+        let times = [2.0, 4.0, 8.0, 60.0, 122.0, 126.0, 150.0];
+        let subject = subject_with_doses_and_resets(doses, &times, vec![120.0]);
+        assert!(subject.has_resets(), "fixture must carry a reset");
+        check_provider_vs_production(&iv, &subject, &theta, &eta);
+    }
+
+    /// A reset that lands mid-infusion (1-cpt IV): the ongoing infusion is turned
+    /// off and the compartment zeroed, so post-reset observations see only doses
+    /// from the new segment. Exercises the `dose.time < reset_floor` exclusion of
+    /// an in-flight infusion.
+    #[test]
+    fn provider_1cpt_reset_midinfusion_matches_production() {
+        let m = parse_model_string(
+            "[parameters]\n  theta TVCL(10.0,1.0,100.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        )
+        .expect("parse");
+        // Infusion 0–8 h (rate 125, amt 1000); reset at t=4 mid-infusion; a fresh
+        // bolus opens the new segment at t=4.
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 125.0, false, 0.0),
+            DoseEvent::new(4.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let times = [1.0, 3.0, 5.0, 7.0, 10.0];
+        let subject = subject_with_doses_and_resets(doses, &times, vec![4.0]);
+        check_provider_vs_production(&m, &subject, &[10.0, 50.0], &[0.1, -0.05]);
     }
 
     /// Provider's exact η/θ sensitivities must match central finite differences

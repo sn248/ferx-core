@@ -558,6 +558,12 @@ pub struct OdeSpec {
     /// observable (e.g. `central / V1`) over `Dual2<N>`. `None` for `ObsCmt`
     /// readouts (read the state directly), per-CMT Form C, and hand-built specs.
     pub readout_program: Option<crate::parser::model_parser::OdeOutputProgram>,
+    /// Compiled `[individual_parameters]` program for the analytic-sensitivity
+    /// η/θ chain (issue #367): lets the provider compute `∂p/∂η`, `∂p/∂θ`
+    /// **analytically** over `Dual2`, instead of finite-differencing `pk_param_fn`.
+    /// Attached after `[individual_parameters]` is parsed; `None` for hand-built
+    /// specs.
+    pub indiv_param_program: Option<crate::parser::model_parser::IndivParamProgram>,
 }
 
 impl OdeSpec {
@@ -1846,6 +1852,7 @@ mod tests {
             input_rate: Vec::new(),
             rhs_program: None,
             readout_program: None,
+            indiv_param_program: None,
             init_fn: None,
         }
     }
@@ -1896,6 +1903,7 @@ mod tests {
             input_rate: Vec::new(),
             rhs_program: None,
             readout_program: None,
+            indiv_param_program: None,
             init_fn: Some(Box::new(|p: &[f64]| {
                 let (kin, kout) = (p[0], p[1]);
                 vec![if kout > 0.0 { kin / kout } else { 0.0 }]
@@ -1935,6 +1943,7 @@ mod tests {
             init_fn: None,
             rhs_program: None,
             readout_program: None,
+            indiv_param_program: None,
         }
     }
 
@@ -2431,6 +2440,7 @@ mod tests {
             input_rate: Vec::new(),
             rhs_program: None,
             readout_program: None,
+            indiv_param_program: None,
             init_fn: None,
         }
     }
@@ -2873,6 +2883,7 @@ mod tests {
             input_rate: Vec::new(),
             rhs_program: None,
             readout_program: None,
+            indiv_param_program: None,
             init_fn: None,
         }
     }
@@ -3009,6 +3020,7 @@ mod tests {
             input_rate: Vec::new(),
             rhs_program: None,
             readout_program: None,
+            indiv_param_program: None,
             init_fn: None,
         };
         let pk = pk_one(1.0, 1.0);

@@ -307,6 +307,7 @@ fn equilibrate_ss_state_event_driven(
         vec![0.0, dose.ii]
     };
 
+    let mut cache = PropCache::default();
     for _ in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
         if !is_inf {
             // Bolus pulse: instantaneous amount jump (with F).
@@ -320,6 +321,7 @@ fn equilibrate_ss_state_event_driven(
             &synthetic_dose,
             &synthetic_lagtimes,
             f64::NEG_INFINITY,
+            &mut cache,
         );
     }
 
@@ -372,6 +374,7 @@ fn ss_state_at_phase_event_driven(
             &synthetic_dose,
             &synthetic_lagtimes,
             f64::NEG_INFINITY,
+            &mut PropCache::default(),
         );
     } else {
         state[cmt_idx] += pk.f_bio() * dose.amt;
@@ -383,6 +386,7 @@ fn ss_state_at_phase_event_driven(
             &[],
             &[],
             f64::NEG_INFINITY,
+            &mut PropCache::default(),
         );
     }
     state
@@ -458,6 +462,11 @@ pub fn event_driven_predictions_with_schedule(
     // reset means every infusion is eligible.
     let mut reset_floor = f64::NEG_INFINITY;
 
+    // Eigen-decomposition cache, reused across every interval of this walk. For a
+    // non-time-varying subject the PK params are constant, so the 2-/3-cpt
+    // eigenvalue solve and projector basis are computed once, not per interval.
+    let mut prop_cache = PropCache::default();
+
     for (i, ev) in schedule.events.iter().enumerate() {
         // EVID=3 / EVID=4 reset: zero every compartment. Any drug carried
         // by the interval ending here would just be discarded, so skip the
@@ -489,6 +498,7 @@ pub fn event_driven_predictions_with_schedule(
                 &subject.doses,
                 &schedule.dose_lagtimes,
                 reset_floor,
+                &mut prop_cache,
             );
             cur_t = ev.time;
         }
@@ -627,6 +637,7 @@ fn pk_for(
 /// `f64::NEG_INFINITY` when none has happened. Infusions whose (lagged) start
 /// is strictly before `reset_floor` are treated as turned off — a reset stops
 /// ongoing infusions, just as it zeros the compartments.
+#[allow(clippy::too_many_arguments)]
 fn propagate_with_bounds(
     state: &mut [f64],
     bounds: &[f64],
@@ -635,6 +646,7 @@ fn propagate_with_bounds(
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
     reset_floor: f64,
+    cache: &mut PropCache,
 ) {
     for w in bounds.windows(2) {
         let s0 = w[0];
@@ -689,16 +701,24 @@ fn propagate_with_bounds(
                 propagate_one_cpt_oral(state, dt, pk);
             }
             PkModel::TwoCptIv => {
-                propagate_two_cpt(state, dt, pk, rate_central, rate_periph1);
+                propagate_two_cpt(state, dt, pk, rate_central, rate_periph1, &mut cache.two);
             }
             PkModel::TwoCptOral => {
-                propagate_two_cpt_oral(state, dt, pk);
+                propagate_two_cpt_oral(state, dt, pk, &mut cache.two);
             }
             PkModel::ThreeCptIv => {
-                propagate_three_cpt(state, dt, pk, rate_central, rate_periph1, rate_periph2);
+                propagate_three_cpt(
+                    state,
+                    dt,
+                    pk,
+                    rate_central,
+                    rate_periph1,
+                    rate_periph2,
+                    &mut cache.three,
+                );
             }
             PkModel::ThreeCptOral => {
-                propagate_three_cpt_oral(state, dt, pk);
+                propagate_three_cpt_oral(state, dt, pk, &mut cache.three);
             }
         }
     }
@@ -728,6 +748,7 @@ fn propagate_two_cpt(
     pk: &PkParams,
     rate_central: f64,
     rate_periph: f64,
+    rates: &mut TwoCptRateCache,
 ) {
     let cl = pk.cl();
     let v1 = pk.v();
@@ -736,22 +757,7 @@ fn propagate_two_cpt(
     if v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q <= 0.0 {
         return;
     }
-    let k10 = cl / v1;
-    let k12 = q / v1;
-    let k21 = q / v2;
-    let s = k10 + k12 + k21;
-    let d = k10 * k21;
-    let disc = {
-        let x = s * s - 4.0 * d;
-        if x > 0.0 {
-            x.sqrt()
-        } else {
-            0.0
-        }
-    };
-    let alpha = (s + disc) / 2.0;
-    // Vieta: alpha * beta = d (avoids cancellation).
-    let beta = if alpha > 1e-30 { d / alpha } else { 0.0 };
+    let (alpha, beta, k10, k12, k21) = rates.get(cl, v1, q, v2);
 
     // Steady-state amounts under constant input b = (rate_central, rate_periph).
     //   A_ss = -K^{-1} b = (1/(k21·k10)) * [k21·b1 + k21·b2,
@@ -837,7 +843,7 @@ fn propagate_one_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
 
 /// 2-cpt oral propagator. State = `[A_depot, A_central, A_periph]`.
 /// Bolus only — see module-level docs for infusion-into-oral support.
-fn propagate_two_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
+fn propagate_two_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rates: &mut TwoCptRateCache) {
     let cl = pk.cl();
     let v1 = pk.v();
     let q = pk.q();
@@ -846,21 +852,7 @@ fn propagate_two_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
     if v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q <= 0.0 || ka <= 0.0 {
         return;
     }
-    let k10 = cl / v1;
-    let k12 = q / v1;
-    let k21 = q / v2;
-    let s = k10 + k12 + k21;
-    let d_eig = k10 * k21;
-    let disc = {
-        let x = s * s - 4.0 * d_eig;
-        if x > 0.0 {
-            x.sqrt()
-        } else {
-            0.0
-        }
-    };
-    let alpha = (s + disc) * 0.5;
-    let beta = if alpha > 1e-30 { d_eig / alpha } else { 0.0 };
+    let (alpha, beta, _k10, k12, k21) = rates.get(cl, v1, q, v2);
 
     let a_d_0 = state[0];
     let a_c_0 = state[1];
@@ -913,6 +905,143 @@ fn propagate_two_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
     state[2] = h_p_dt + cap_b * e_ka;
 }
 
+// ─── Per-walk eigen-decomposition caches ─────────────────────────────
+//
+// The macro-rates and structural micro-rates are a pure function of the
+// disposition PK params, which are **constant across event intervals** for a
+// subject without time-varying covariates. The eigenvalue solve (`sqrt` for
+// 2-cpt, `acos`/`cos`/`sqrt` for 3-cpt) is the dominant per-interval cost on
+// reset/infusion-heavy fits (e.g. Schnider propofol, ~100 intervals/prediction),
+// so recomputing it every interval is ~100× wasted work. Each cache is keyed on
+// the relevant params; a value change (time-varying covariate) is a cache miss
+// that recomputes transparently, so results are bit-identical either way.
+
+/// Cache of the 2-cpt eigen-decomposition `(α, β, k10, k12, k21)`.
+#[derive(Clone, Copy, Default)]
+struct TwoCptRateCache {
+    key: Option<[f64; 4]>,
+    rates: (f64, f64, f64, f64, f64),
+}
+
+impl TwoCptRateCache {
+    #[inline]
+    fn get(&mut self, cl: f64, v1: f64, q: f64, v2: f64) -> (f64, f64, f64, f64, f64) {
+        let key = [cl, v1, q, v2];
+        if self.key != Some(key) {
+            let k10 = cl / v1;
+            let k12 = q / v1;
+            let k21 = q / v2;
+            let s = k10 + k12 + k21;
+            let d = k10 * k21;
+            let disc = {
+                let x = s * s - 4.0 * d;
+                if x > 0.0 {
+                    x.sqrt()
+                } else {
+                    0.0
+                }
+            };
+            let alpha = (s + disc) * 0.5;
+            let beta = if alpha > 1e-30 { d / alpha } else { 0.0 };
+            self.rates = (alpha, beta, k10, k12, k21);
+            self.key = Some(key);
+        }
+        self.rates
+    }
+}
+
+/// One 3-cpt eigenmode's PK-constant spectral data: the eigenvalue `mu`, the
+/// right/left eigenvectors `v`/`w`, and their pairing `norm = w·v`. All depend
+/// only on `(mu, k12, k13, k21, k31)`, so they are computed once per PK and
+/// reused across every interval — see [`apply_three_cpt_mode`].
+#[derive(Clone, Copy, Default)]
+struct ThreeCptMode {
+    mu: f64,
+    v: [f64; 3],
+    w: [f64; 3],
+    norm: f64,
+}
+
+/// Build the spectral data for eigenvalue `mu` (robust normalisation that stays
+/// well-defined when `mu` nears `k21`/`k31`); mirrors the old `three_cpt_mode`
+/// vector construction.
+#[inline]
+fn build_three_cpt_mode(mu: f64, k12: f64, k13: f64, k21: f64, k31: f64) -> ThreeCptMode {
+    let d21 = k21 - mu;
+    let d31 = k31 - mu;
+    let v = [d21 * d31, k12 * d31, k13 * d21];
+    let w = [d21 * d31, k21 * d31, k31 * d21];
+    let norm = v[0] * w[0] + v[1] * w[1] + v[2] * w[2];
+    ThreeCptMode { mu, v, w, norm }
+}
+
+/// Apply a precomputed eigenmode to the homogeneous state `(c, p1, p2)` over
+/// `dt`: the per-interval work reduces to one projection (`w·state`), one
+/// `exp(-mu·dt)`, and the scaled eigenvector — the expensive `v`/`w`/`norm`
+/// construction was hoisted into [`build_three_cpt_mode`]. Numerically identical
+/// to the former inlined `three_cpt_mode`.
+#[inline]
+fn apply_three_cpt_mode(m: &ThreeCptMode, c: f64, p1: f64, p2: f64, dt: f64) -> (f64, f64, f64) {
+    if m.norm.abs() < 1e-30 {
+        return (0.0, 0.0, 0.0);
+    }
+    let proj = m.w[0] * c + m.w[1] * p1 + m.w[2] * p2;
+    let coef = proj / m.norm;
+    let exp_term = (-m.mu * dt).exp();
+    (
+        coef * m.v[0] * exp_term,
+        coef * m.v[1] * exp_term,
+        coef * m.v[2] * exp_term,
+    )
+}
+
+/// Cache of the 3-cpt eigen-decomposition: the raw rates `(α, β, γ, k21, k31,
+/// k12, k13)` (the oral path needs them for its depot particular solution) and
+/// the three precomputed eigenmodes (the homogeneous propagation basis, shared
+/// by IV and oral).
+#[derive(Clone, Copy, Default)]
+struct ThreeCptRateCache {
+    key: Option<[f64; 6]>,
+    raw: (f64, f64, f64, f64, f64, f64, f64),
+    modes: [ThreeCptMode; 3],
+}
+
+impl ThreeCptRateCache {
+    #[inline]
+    fn get(
+        &mut self,
+        cl: f64,
+        v1: f64,
+        q2: f64,
+        v2: f64,
+        q3: f64,
+        v3: f64,
+    ) -> ((f64, f64, f64, f64, f64, f64, f64), [ThreeCptMode; 3]) {
+        let key = [cl, v1, q2, v2, q3, v3];
+        if self.key != Some(key) {
+            let (alpha, beta, gamma, k21, k31) = macro_rates_three(cl, v1, q2, v2, q3, v3);
+            let (k12, k13) = (q2 / v1, q3 / v1);
+            self.raw = (alpha, beta, gamma, k21, k31, k12, k13);
+            self.modes = [
+                build_three_cpt_mode(alpha, k12, k13, k21, k31),
+                build_three_cpt_mode(beta, k12, k13, k21, k31),
+                build_three_cpt_mode(gamma, k12, k13, k21, k31),
+            ];
+            self.key = Some(key);
+        }
+        (self.raw, self.modes)
+    }
+}
+
+/// Per-walk propagation caches, threaded through one prediction. 1-cpt needs no
+/// cache (only `cl/v`, no transcendental beyond the unavoidable per-interval
+/// `exp`).
+#[derive(Clone, Copy, Default)]
+struct PropCache {
+    two: TwoCptRateCache,
+    three: ThreeCptRateCache,
+}
+
 // ─── 3-compartment models ────────────────────────────────────────────
 
 /// Three-compartment macro-rate constants and the auxiliary (k21, k31).
@@ -952,52 +1081,6 @@ fn macro_rates_three(
     (alpha, beta, gamma, k21, k31)
 }
 
-/// Spectral propagation of one 3-cpt eigenmode `μ` applied to state vector
-/// `(c, p1, p2)`. Returns the mode's contribution to the new state at +dt.
-///
-/// Uses the *robust* eigenvector normalisation that stays well-defined
-/// even when an eigenvalue happens to be close to one of the structural
-/// rate constants (`k21` or `k31`) — common in 3-cpt models where the
-/// slowest eigenvalue γ is dominated by the slowest peripheral rate:
-///
-///   v_μ = ((k21-μ)(k31-μ),  k12·(k31-μ),  k13·(k21-μ))
-///   w_μ = ((k21-μ)(k31-μ),  k21·(k31-μ),  k31·(k21-μ))
-///
-/// Spectral projector: `P_μ = v_μ wᵀ_μ / (w_μ · v_μ)`.
-#[allow(clippy::too_many_arguments)]
-fn three_cpt_mode(
-    mu: f64,
-    c: f64,
-    p1: f64,
-    p2: f64,
-    k12: f64,
-    k13: f64,
-    k21: f64,
-    k31: f64,
-    dt: f64,
-) -> (f64, f64, f64) {
-    let d21 = k21 - mu;
-    let d31 = k31 - mu;
-    let v_c = d21 * d31;
-    let v_p1 = k12 * d31;
-    let v_p2 = k13 * d21;
-    let w_c = d21 * d31;
-    let w_p1 = k21 * d31;
-    let w_p2 = k31 * d21;
-    let norm = v_c * w_c + v_p1 * w_p1 + v_p2 * w_p2;
-    if norm.abs() < 1e-30 {
-        return (0.0, 0.0, 0.0);
-    }
-    let proj = w_c * c + w_p1 * p1 + w_p2 * p2;
-    let coef = proj / norm;
-    let exp_term = (-mu * dt).exp();
-    (
-        coef * v_c * exp_term,
-        coef * v_p1 * exp_term,
-        coef * v_p2 * exp_term,
-    )
-}
-
 /// 3-cpt linear propagator (IV models). State = `[A_central, A_p1, A_p2]`.
 /// Spectral decomposition along (α, β, γ) eigenmodes. Constant infusion
 /// `(rate_central, rate_periph1, rate_periph2)` into the three slots is
@@ -1019,6 +1102,7 @@ fn propagate_three_cpt(
     rate_central: f64,
     rate_periph1: f64,
     rate_periph2: f64,
+    rates: &mut ThreeCptRateCache,
 ) {
     let cl = pk.cl();
     let v1 = pk.v();
@@ -1029,9 +1113,7 @@ fn propagate_three_cpt(
     if v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q2 <= 0.0 || v3 <= 0.0 || q3 <= 0.0 {
         return;
     }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three(cl, v1, q2, v2, q3, v3);
-    let k12 = q2 / v1;
-    let k13 = q3 / v1;
+    let (_raw, modes) = rates.get(cl, v1, q2, v2, q3, v3);
 
     // Combined steady-state amounts under inputs (r_c, r_p1, r_p2).
     // Central slot: total input divided by k10 = (r_c+r_p1+r_p2)·v1/cl.
@@ -1048,9 +1130,9 @@ fn propagate_three_cpt(
     let h_p1 = state[1] - a_ss_p1;
     let h_p2 = state[2] - a_ss_p2;
 
-    let (ca, p1a, p2a) = three_cpt_mode(alpha, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
-    let (cb, p1b, p2b) = three_cpt_mode(beta, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
-    let (cg, p1g, p2g) = three_cpt_mode(gamma, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
+    let (ca, p1a, p2a) = apply_three_cpt_mode(&modes[0], h_c, h_p1, h_p2, dt);
+    let (cb, p1b, p2b) = apply_three_cpt_mode(&modes[1], h_c, h_p1, h_p2, dt);
+    let (cg, p1g, p2g) = apply_three_cpt_mode(&modes[2], h_c, h_p1, h_p2, dt);
 
     state[0] = ca + cb + cg + a_ss_c;
     state[1] = p1a + p1b + p1g + a_ss_p1;
@@ -1061,7 +1143,12 @@ fn propagate_three_cpt(
 /// Depot decays independently; the central+peripheral subsystem follows
 /// the 3-cpt homogeneous evolution plus a depot-driven particular solution
 /// of the form `(A, B, C)·exp(-ka·t)`.
-fn propagate_three_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
+fn propagate_three_cpt_oral(
+    state: &mut [f64],
+    dt: f64,
+    pk: &PkParams,
+    rates: &mut ThreeCptRateCache,
+) {
     let cl = pk.cl();
     let v1 = pk.v();
     let q2 = pk.q();
@@ -1072,9 +1159,7 @@ fn propagate_three_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
     if v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q2 <= 0.0 || v3 <= 0.0 || q3 <= 0.0 || ka <= 0.0 {
         return;
     }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three(cl, v1, q2, v2, q3, v3);
-    let k12 = q2 / v1;
-    let k13 = q3 / v1;
+    let ((alpha, beta, gamma, k21, k31, k12, k13), modes) = rates.get(cl, v1, q2, v2, q3, v3);
 
     let a_d_0 = state[0];
     let a_c_0 = state[1];
@@ -1125,9 +1210,9 @@ fn propagate_three_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
     let h_p1 = a_p1_0 - cap_b;
     let h_p2 = a_p2_0 - cap_c;
 
-    let (ca, p1a, p2a) = three_cpt_mode(alpha, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
-    let (cb, p1b, p2b) = three_cpt_mode(beta, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
-    let (cg, p1g, p2g) = three_cpt_mode(gamma, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
+    let (ca, p1a, p2a) = apply_three_cpt_mode(&modes[0], h_c, h_p1, h_p2, dt);
+    let (cb, p1b, p2b) = apply_three_cpt_mode(&modes[1], h_c, h_p1, h_p2, dt);
+    let (cg, p1g, p2g) = apply_three_cpt_mode(&modes[2], h_c, h_p1, h_p2, dt);
 
     state[1] = ca + cb + cg + cap_a * e_ka;
     state[2] = p1a + p1b + p1g + cap_b * e_ka;

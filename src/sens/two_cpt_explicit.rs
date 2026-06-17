@@ -19,7 +19,7 @@
 //! invalid cases fall back to the dual path.
 
 use super::dual2::Dual2;
-use super::two_cpt::two_cpt_iv_bolus_g;
+use super::two_cpt::{two_cpt_infusion_g, two_cpt_iv_bolus_g};
 
 /// A second-order jet over the four PK parameters `[CL, V1, Q, V2]`.
 #[derive(Clone, Copy)]
@@ -116,30 +116,11 @@ impl J4 {
     }
 }
 
-/// `(f, ∂f/∂[CL,V1,Q,V2], ∂²f/∂[CL,V1,Q,V2]²)` for the 2-cpt IV bolus.
-pub fn iv_bolus_explicit(
-    amt: f64,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-) -> (f64, [f64; 4], [[f64; 4]; 4]) {
-    let fallback = || {
-        let d = two_cpt_iv_bolus_g::<Dual2<4>>(
-            amt,
-            t,
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q, 2),
-            Dual2::var(v2, 3),
-        );
-        (d.value, d.grad, d.hess)
-    };
-    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 {
-        return (0.0, [0.0; 4], [[0.0; 4]; 4]);
-    }
-
+/// The macro-rate eigenvalue jets `(α, β, k21)` over `[CL,V1,Q,V2]`, or `None`
+/// when the disposition is degenerate (`disc≈0`, `α≈0`, or `α≈β`) and the caller
+/// should fall back to the dual path. Obtained by implicit differentiation of
+/// Vieta's relations (closed form, no `√`-jet); see the module header.
+fn macro_rate_jets(cl: f64, v1: f64, q: f64, v2: f64) -> Option<(J4, J4, J4)> {
     // Micro-rates as jets (closed-form sparse grad/hess).
     let mut k10 = J4::cst(cl / v1);
     k10.g = [1.0 / v1, -cl / (v1 * v1), 0.0, 0.0];
@@ -166,17 +147,17 @@ pub fn iv_bolus_explicit(
     // Eigenvalues via Vieta + implicit differentiation (closed form, no √-jet).
     let disc_sq = s.v * s.v - 4.0 * d.v;
     if disc_sq <= 1e-300 {
-        return fallback();
+        return None;
     }
     let disc = disc_sq.sqrt();
     let av = 0.5 * (s.v + disc);
     if av <= 1e-300 {
-        return fallback();
+        return None;
     }
     let bv = d.v / av;
     let delta = av - bv;
     if delta.abs() < 1e-12 {
-        return fallback();
+        return None;
     }
     let inv_d = 1.0 / delta;
     let inv_d2 = inv_d * inv_d;
@@ -214,12 +195,48 @@ pub fn iv_bolus_explicit(
             beta.h[j][i] = b;
         }
     }
+    Some((alpha, beta, k21))
+}
+
+/// `R/V1` (or `amt/V1`) as a jet: depends on `V1` only (axis 1).
+#[inline]
+fn over_v1(num: f64, v1: f64) -> J4 {
+    let mut j = J4::cst(num / v1);
+    j.g[1] = -num / (v1 * v1);
+    j.h[1][1] = 2.0 * num / (v1 * v1 * v1);
+    j
+}
+
+/// `(f, ∂f/∂[CL,V1,Q,V2], ∂²f/∂[CL,V1,Q,V2]²)` for the 2-cpt IV bolus.
+pub fn iv_bolus_explicit(
+    amt: f64,
+    t: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+) -> (f64, [f64; 4], [[f64; 4]; 4]) {
+    let fallback = || {
+        let d = two_cpt_iv_bolus_g::<Dual2<4>>(
+            amt,
+            t,
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q, 2),
+            Dual2::var(v2, 3),
+        );
+        (d.value, d.grad, d.hess)
+    };
+    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 {
+        return (0.0, [0.0; 4], [[0.0; 4]; 4]);
+    }
+    let (alpha, beta, k21) = match macro_rate_jets(cl, v1, q, v2) {
+        Some(x) => x,
+        None => return fallback(),
+    };
 
     // Coefficients: a = (amt/V1)(α−k21)/Δ, b = (amt/V1)(k21−β)/Δ, Δ = α−β.
-    let mut amt_v1 = J4::cst(amt / v1);
-    amt_v1.g[1] = -amt / (v1 * v1);
-    amt_v1.h[1][1] = 2.0 * amt / (v1 * v1 * v1);
-
+    let amt_v1 = over_v1(amt, v1);
     let diff = alpha.sub(beta);
     let inv_diff = diff.recip();
     let a = amt_v1.mul(alpha.sub(k21)).mul(inv_diff);
@@ -229,6 +246,75 @@ pub fn iv_bolus_explicit(
     let e_a = alpha.scale(-t).exp();
     let e_b = beta.scale(-t).exp();
     let c = a.mul(e_a).add(b.mul(e_b));
+    (c.v, c.g, c.h)
+}
+
+/// `(f, ∂f/∂[CL,V1,Q,V2], ∂²f/∂[CL,V1,Q,V2]²)` for the 2-cpt infusion (rate
+/// `rate`, duration `dur`). Same eigenvalue jets as the bolus; the coefficients
+/// carry an extra `1/α`, `1/β` (zero-order input), and the response is the
+/// during/after piecewise of [`two_cpt_infusion_g`].
+pub fn infusion_explicit(
+    rate: f64,
+    dur: f64,
+    amt: f64,
+    t: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+) -> (f64, [f64; 4], [[f64; 4]; 4]) {
+    let fallback = || {
+        let d = two_cpt_infusion_g::<Dual2<4>>(
+            rate,
+            dur,
+            amt,
+            t,
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q, 2),
+            Dual2::var(v2, 3),
+        );
+        (d.value, d.grad, d.hess)
+    };
+    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 {
+        return (0.0, [0.0; 4], [[0.0; 4]; 4]);
+    }
+    if dur <= 0.0 {
+        return iv_bolus_explicit(amt, t, cl, v1, q, v2);
+    }
+    let (alpha, beta, k21) = match macro_rate_jets(cl, v1, q, v2) {
+        Some(x) => x,
+        None => return fallback(),
+    };
+    // The coefficients divide by α and β; bail to the dual path if either is
+    // near-zero (the generic form returns 0 there, but FD-matching that
+    // degenerate zero buys nothing).
+    if alpha.v.abs() < 1e-12 || beta.v.abs() < 1e-12 {
+        return fallback();
+    }
+
+    // a = (R/V1)(α−k21)/(Δ·α), b = (R/V1)(k21−β)/(Δ·β), Δ = α−β.
+    let r_v1 = over_v1(rate, v1);
+    let diff = alpha.sub(beta);
+    let inv_diff = diff.recip();
+    let a_coeff = r_v1.mul(alpha.sub(k21)).mul(inv_diff).mul(alpha.recip());
+    let b_coeff = r_v1.mul(k21.sub(beta)).mul(inv_diff).mul(beta.recip());
+
+    let one = J4::cst(1.0);
+    let c = if t <= dur {
+        let e_a = alpha.scale(-t).exp();
+        let e_b = beta.scale(-t).exp();
+        a_coeff.mul(one.sub(e_a)).add(b_coeff.mul(one.sub(e_b)))
+    } else {
+        let e_ad = alpha.scale(-dur).exp();
+        let e_bd = beta.scale(-dur).exp();
+        let e_adt = alpha.scale(-(t - dur)).exp();
+        let e_bdt = beta.scale(-(t - dur)).exp();
+        a_coeff
+            .mul(one.sub(e_ad))
+            .mul(e_adt)
+            .add(b_coeff.mul(one.sub(e_bd)).mul(e_bdt))
+    };
     (c.v, c.g, c.h)
 }
 
@@ -275,6 +361,58 @@ mod tests {
                         hd[i][j],
                         max_relative = 1e-7,
                         epsilon = 1e-11
+                    );
+                }
+            }
+        }
+    }
+
+    fn dual_infusion(
+        rate: f64,
+        dur: f64,
+        amt: f64,
+        t: f64,
+        cl: f64,
+        v1: f64,
+        q: f64,
+        v2: f64,
+    ) -> (f64, [f64; 4], [[f64; 4]; 4]) {
+        let d = two_cpt_infusion_g::<Dual2<4>>(
+            rate,
+            dur,
+            amt,
+            t,
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q, 2),
+            Dual2::var(v2, 3),
+        );
+        (d.value, d.grad, d.hess)
+    }
+
+    #[test]
+    fn two_cpt_infusion_explicit_matches_dual() {
+        // dur = amt/rate; cover both during (t ≤ dur) and after (t > dur).
+        for &(rate, amt, t, cl, v1, q, v2) in &[
+            (500.0, 1000.0, 1.0, 10.0, 50.0, 15.0, 100.0), // during (dur=2)
+            (500.0, 1000.0, 6.0, 10.0, 50.0, 15.0, 100.0), // after
+            (250.0, 1000.0, 2.0, 5.0, 30.0, 2.0, 50.0),    // during (dur=4)
+            (250.0, 1000.0, 10.0, 5.0, 30.0, 2.0, 50.0),   // after
+            (1000.0, 1000.0, 0.5, 4.41, 15.5, 3.14, 29.3), // during (dur=1), fit-ish
+            (1000.0, 1000.0, 3.0, 4.41, 15.5, 3.14, 29.3), // after
+        ] {
+            let dur = amt / rate;
+            let (fe, ge, he) = infusion_explicit(rate, dur, amt, t, cl, v1, q, v2);
+            let (fd, gd, hd) = dual_infusion(rate, dur, amt, t, cl, v1, q, v2);
+            approx::assert_relative_eq!(fe, fd, max_relative = 1e-10, epsilon = 1e-12);
+            for i in 0..4 {
+                approx::assert_relative_eq!(ge[i], gd[i], max_relative = 1e-8, epsilon = 1e-11);
+                for j in 0..4 {
+                    approx::assert_relative_eq!(
+                        he[i][j],
+                        hd[i][j],
+                        max_relative = 1e-7,
+                        epsilon = 1e-10
                     );
                 }
             }

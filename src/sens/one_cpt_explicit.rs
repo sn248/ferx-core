@@ -119,10 +119,62 @@ pub fn oral_explicit(
     (f, grad, hess)
 }
 
+/// `(f, ∂f/∂[CL,V], ∂²f/∂[CL,V]²)` for the 1-cpt infusion (rate `rate`, duration
+/// `dur`). The response shape `f = (R/CL)·G(k)` has a single disposition rate
+/// `k = CL/V`, so the whole 2×2 reduces to the **1-D** derivatives `G'(k)`,
+/// `G''(k)` chained through `k(CL,V)` and the `A = R/CL` prefactor:
+///
+/// * during the infusion (`t ≤ dur`):  `G = 1 − e^{−kt}`
+/// * after (`t > dur`, `Δ = t−dur`):   `G = e^{−kΔ} − e^{−kt}`
+///
+/// with `k_CL = 1/V`, `k_V = −k/V`, `k_VV = 2k/V²`, `k_CL,V = −1/V²`.
+pub fn infusion_explicit(
+    rate: f64,
+    dur: f64,
+    amt: f64,
+    t: f64,
+    cl: f64,
+    v: f64,
+) -> (f64, [f64; 2], [[f64; 2]; 2]) {
+    if t < 0.0 || v <= 0.0 || cl <= 0.0 {
+        return (0.0, [0.0; 2], [[0.0; 2]; 2]);
+    }
+    if dur <= 0.0 {
+        return iv_bolus_explicit(amt, t, cl, v);
+    }
+    let k = cl / v;
+    // G(k), G'(k), G''(k) for the infusion shape.
+    let (g, g1, g2) = if t <= dur {
+        let e = (-k * t).exp();
+        (1.0 - e, t * e, -t * t * e)
+    } else {
+        let dt = t - dur;
+        let edt = (-k * dt).exp();
+        let et = (-k * t).exp();
+        (edt - et, -dt * edt + t * et, dt * dt * edt - t * t * et)
+    };
+    // A = R/CL (depends only on CL); k = CL/V.
+    let a = rate / cl;
+    let ac = -rate / (cl * cl);
+    let acc = 2.0 * rate / (cl * cl * cl);
+    let kc = 1.0 / v;
+    let kv = -k / v;
+    let kcv = -1.0 / (v * v);
+    let kvv = 2.0 * k / (v * v);
+    let f = a * g;
+    // f = A(CL)·G(k(CL,V)); product + chain rule. k_CL,CL = 0.
+    let fc = ac * g + a * g1 * kc;
+    let fv = a * g1 * kv;
+    let fcc = acc * g + 2.0 * ac * g1 * kc + a * (g2 * kc * kc);
+    let fcv = ac * g1 * kv + a * (g2 * kc * kv + g1 * kcv);
+    let fvv = a * (g2 * kv * kv + g1 * kvv);
+    (f, [fc, fv], [[fcc, fcv], [fcv, fvv]])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sens::one_cpt::{one_cpt_iv_bolus_g, one_cpt_oral_g};
+    use crate::sens::one_cpt::{one_cpt_infusion_g, one_cpt_iv_bolus_g, one_cpt_oral_g};
 
     fn dual_bolus(amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2]) {
         let d = one_cpt_iv_bolus_g::<Dual2<2>>(amt, t, Dual2::var(cl, 0), Dual2::var(v, 1));
@@ -157,6 +209,46 @@ mod tests {
                 approx::assert_relative_eq!(ge[i], gd[i], max_relative = 1e-10);
                 for j in 0..2 {
                     approx::assert_relative_eq!(he[i][j], hd[i][j], max_relative = 1e-10);
+                }
+            }
+        }
+    }
+
+    fn dual_infusion(
+        rate: f64,
+        dur: f64,
+        amt: f64,
+        t: f64,
+        cl: f64,
+        v: f64,
+    ) -> (f64, [f64; 2], [[f64; 2]; 2]) {
+        let d =
+            one_cpt_infusion_g::<Dual2<2>>(rate, dur, amt, t, Dual2::var(cl, 0), Dual2::var(v, 1));
+        (d.value, d.grad, d.hess)
+    }
+
+    #[test]
+    fn infusion_explicit_matches_dual() {
+        // dur = amt/rate; cover both during (t ≤ dur) and after (t > dur).
+        for &(rate, amt, t, cl, v) in &[
+            (100.0, 1000.0, 5.0, 10.0, 100.0),  // during (dur=10)
+            (100.0, 1000.0, 15.0, 10.0, 100.0), // after
+            (200.0, 1000.0, 5.0, 3.0, 30.0),    // after (dur=5)
+            (50.0, 500.0, 2.0, 0.5, 8.0),       // during (dur=10)
+        ] {
+            let dur = amt / rate;
+            let (fe, ge, he) = infusion_explicit(rate, dur, amt, t, cl, v);
+            let (fd, gd, hd) = dual_infusion(rate, dur, amt, t, cl, v);
+            approx::assert_relative_eq!(fe, fd, max_relative = 1e-11, epsilon = 1e-12);
+            for i in 0..2 {
+                approx::assert_relative_eq!(ge[i], gd[i], max_relative = 1e-9, epsilon = 1e-12);
+                for j in 0..2 {
+                    approx::assert_relative_eq!(
+                        he[i][j],
+                        hd[i][j],
+                        max_relative = 1e-8,
+                        epsilon = 1e-12
+                    );
                 }
             }
         }

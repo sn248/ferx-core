@@ -35,8 +35,8 @@ use super::one_cpt::one_cpt_conc_g;
 use super::three_cpt::three_cpt_conc_g;
 use super::two_cpt::two_cpt_conc_g;
 use crate::types::{
-    CompiledModel, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_F, PK_IDX_KA, PK_IDX_Q,
-    PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
+    CompiledModel, DoseEvent, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_F, PK_IDX_KA,
+    PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
 };
 
 /// Exact sensitivities of one observation w.r.t. η and θ. Hessian-shaped fields
@@ -82,23 +82,46 @@ fn slot_to_dim(slot: usize) -> Option<usize> {
 /// Number of seeded PK dimensions (`CL, V1, Q2, V2, KA, F, Q3, V3`).
 const N_PK: usize = 8;
 
-/// Measurement toggle: `FERX_EXPLICIT_SENS=1` routes supported models to the
-/// hand-written explicit-derivative kernels (`*_explicit`) instead of the
-/// `Dual2<8>` provider path. Default off (Dual2). Used to A/B the per-kernel
-/// speedup on a real fit; not a shipped feature.
-fn explicit_sens_enabled() -> bool {
-    std::env::var("FERX_EXPLICIT_SENS")
+/// Escape hatch: `FERX_DISABLE_EXPLICIT_SENS=1` forces every subject onto the
+/// generic `Dual2<N>` provider path instead of the hand-written explicit-
+/// derivative kernels (`*_explicit`). The explicit kernels are the default — they
+/// compute the same `(f, ∂f/∂pk, ∂²f/∂pk²)` to ~1e-8 (validated per-kernel
+/// against the dual oracle) at a fraction of the cost. This toggle exists to A/B
+/// the two on a real fit and as a fallback if a kernel is ever suspected wrong.
+fn explicit_sens_disabled() -> bool {
+    std::env::var("FERX_DISABLE_EXPLICIT_SENS")
         .map(|v| v == "1")
         .unwrap_or(false)
 }
 
-/// Which explicit kernel applies to a subject (model + all-doses-plain).
+/// Which explicit-kernel model class serves a subject. A class covers a subset of
+/// dose kinds ([`ExKind::covers`]); a subject whose doses are *all* covered takes
+/// the explicit path, otherwise the whole subject falls back to `Dual2<N>` (the
+/// per-observation chain is identical either way — only `(f, ∂f/∂pk, ∂²f/∂pk²)`
+/// is sourced differently).
 #[derive(Clone, Copy)]
 enum ExKind {
-    OneCptBolus,
+    /// 1-cpt IV: bolus + infusion.
+    OneCptIv,
+    /// 1-cpt oral: first-order absorption + infusion-into-central.
     OneCptOral,
-    TwoCptBolus,
-    ThreeCptBolus,
+    /// 2-cpt IV: bolus + infusion.
+    TwoCptIv,
+    /// 3-cpt IV: bolus only (infusion not yet hand-derived).
+    ThreeCptIv,
+}
+
+impl ExKind {
+    /// True when a hand-written kernel covers this dose. Steady state (every
+    /// class) and 3-cpt infusion are not yet derived, so a subject containing one
+    /// routes entirely to the exact `Dual2<N>` path.
+    fn covers(self, dose: &DoseEvent) -> bool {
+        let ss = dose.ss && dose.ii > 0.0;
+        match self {
+            ExKind::OneCptIv | ExKind::OneCptOral | ExKind::TwoCptIv => !ss,
+            ExKind::ThreeCptIv => !ss && !dose.is_infusion(),
+        }
+    }
 }
 
 /// True when [`subject_sensitivities`] can serve this model: analytical 1-cpt or
@@ -342,20 +365,22 @@ pub fn subject_sensitivities(
         }
     }
 
-    // Explicit-kernel fast path (A/B toggle): only when all doses are plain
-    // (non-SS, non-infusion) single inputs for a covered model.
-    let explicit_kind =
-        if explicit_sens_enabled() && subject.doses.iter().all(|d| !d.ss && !d.is_infusion()) {
-            match model.pk_model {
-                PkModel::OneCptIv => Some(ExKind::OneCptBolus),
-                PkModel::OneCptOral => Some(ExKind::OneCptOral),
-                PkModel::TwoCptIv => Some(ExKind::TwoCptBolus),
-                PkModel::ThreeCptIv => Some(ExKind::ThreeCptBolus),
-                _ => None,
-            }
-        } else {
-            None
-        };
+    // Explicit-kernel fast path (the default): pick the model class, then take it
+    // only if a hand-written kernel covers every dose (else the whole subject uses
+    // `Dual2<N>`). `FERX_DISABLE_EXPLICIT_SENS=1` forces the dual path everywhere.
+    let explicit_kind = if explicit_sens_disabled() {
+        None
+    } else {
+        match model.pk_model {
+            PkModel::OneCptIv => Some(ExKind::OneCptIv),
+            PkModel::OneCptOral => Some(ExKind::OneCptOral),
+            PkModel::TwoCptIv => Some(ExKind::TwoCptIv),
+            PkModel::ThreeCptIv => Some(ExKind::ThreeCptIv),
+            // 2-/3-cpt oral and 3-cpt infusion have no explicit kernel yet.
+            _ => None,
+        }
+        .filter(|kind| subject.doses.iter().all(|d| kind.covers(d)))
+    };
 
     // Dispatch on the differentiated-parameter count so the dual width is
     // right-sized. `pk_indices.len()` ≤ `N_PK` (the fixed PK slot table).
@@ -428,65 +453,10 @@ fn run_obs<const N: usize>(
                 if elapsed < 0.0 || dose.time < reset_floor {
                     continue;
                 }
-                match kind {
-                    ExKind::OneCptBolus => {
-                        let (f, gs, hs) =
-                            super::one_cpt_explicit::iv_bolus_explicit(dose.amt, elapsed, cl, v1);
-                        val += f;
-                        scatter_compact(
-                            &mut gv,
-                            &mut hv,
-                            &gs,
-                            &hs,
-                            &[PK_IDX_CL, PK_IDX_V],
-                            seed_dim,
-                        );
-                    }
-                    ExKind::OneCptOral => {
-                        let (f, gs, hs) = super::one_cpt_explicit::oral_explicit(
-                            dose.amt, elapsed, cl, v1, ka, f_bio,
-                        );
-                        val += f;
-                        scatter_compact(
-                            &mut gv,
-                            &mut hv,
-                            &gs,
-                            &hs,
-                            &[PK_IDX_CL, PK_IDX_V, PK_IDX_KA, PK_IDX_F],
-                            seed_dim,
-                        );
-                    }
-                    ExKind::TwoCptBolus => {
-                        let (f, gs, hs) = super::two_cpt_explicit::iv_bolus_explicit(
-                            dose.amt, elapsed, cl, v1, q, v2,
-                        );
-                        val += f;
-                        scatter_compact(
-                            &mut gv,
-                            &mut hv,
-                            &gs,
-                            &hs,
-                            &[PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2],
-                            seed_dim,
-                        );
-                    }
-                    ExKind::ThreeCptBolus => {
-                        let (f, gs, hs) = super::three_cpt_explicit::iv_bolus_explicit(
-                            dose.amt, elapsed, cl, v1, q, v2, q3, v3,
-                        );
-                        val += f;
-                        scatter_compact(
-                            &mut gv,
-                            &mut hv,
-                            &gs,
-                            &hs,
-                            &[
-                                PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_Q3, PK_IDX_V3,
-                            ],
-                            seed_dim,
-                        );
-                    }
-                }
+                val += eval_dose_explicit(
+                    kind, dose, elapsed, cl, v1, q, v2, ka, f_bio, q3, v3, seed_dim, &mut gv,
+                    &mut hv,
+                );
             }
             (val, gv, hv)
         } else {
@@ -594,6 +564,105 @@ fn run_obs<const N: usize>(
         });
     }
     out
+}
+
+/// One dose's explicit-kernel contribution to `(f, ∂f/∂pk, ∂²f/∂pk²)` at the
+/// compact axis layout: dispatches on `(kind, dose)` to the right hand-written
+/// kernel (bolus / infusion / oral), scatters its `(grad, hess)` into `gv`/`hv`
+/// via [`scatter_compact`], and returns the value. Only `kind`-covered doses
+/// reach here ([`ExKind::covers`] gates the subject), so the match is total over
+/// the covered set; the mirror of [`one_cpt_conc_g`]/[`two_cpt_conc_g`] dispatch.
+#[allow(clippy::too_many_arguments)]
+fn eval_dose_explicit<const N: usize>(
+    kind: ExKind,
+    dose: &DoseEvent,
+    elapsed: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    ka: f64,
+    f_bio: f64,
+    q3: f64,
+    v3: f64,
+    seed_dim: &[Option<usize>; N_PK],
+    gv: &mut [f64; N],
+    hv: &mut [[f64; N]; N],
+) -> f64 {
+    match kind {
+        ExKind::OneCptIv | ExKind::OneCptOral => {
+            if dose.is_infusion() {
+                let (f, gs, hs) = super::one_cpt_explicit::infusion_explicit(
+                    dose.rate,
+                    dose.duration,
+                    dose.amt,
+                    elapsed,
+                    cl,
+                    v1,
+                );
+                scatter_compact(gv, hv, &gs, &hs, &[PK_IDX_CL, PK_IDX_V], seed_dim);
+                f
+            } else if matches!(kind, ExKind::OneCptOral) {
+                let (f, gs, hs) =
+                    super::one_cpt_explicit::oral_explicit(dose.amt, elapsed, cl, v1, ka, f_bio);
+                scatter_compact(
+                    gv,
+                    hv,
+                    &gs,
+                    &hs,
+                    &[PK_IDX_CL, PK_IDX_V, PK_IDX_KA, PK_IDX_F],
+                    seed_dim,
+                );
+                f
+            } else {
+                let (f, gs, hs) =
+                    super::one_cpt_explicit::iv_bolus_explicit(dose.amt, elapsed, cl, v1);
+                scatter_compact(gv, hv, &gs, &hs, &[PK_IDX_CL, PK_IDX_V], seed_dim);
+                f
+            }
+        }
+        ExKind::TwoCptIv => {
+            let (f, gs, hs) = if dose.is_infusion() {
+                super::two_cpt_explicit::infusion_explicit(
+                    dose.rate,
+                    dose.duration,
+                    dose.amt,
+                    elapsed,
+                    cl,
+                    v1,
+                    q,
+                    v2,
+                )
+            } else {
+                super::two_cpt_explicit::iv_bolus_explicit(dose.amt, elapsed, cl, v1, q, v2)
+            };
+            scatter_compact(
+                gv,
+                hv,
+                &gs,
+                &hs,
+                &[PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2],
+                seed_dim,
+            );
+            f
+        }
+        ExKind::ThreeCptIv => {
+            let (f, gs, hs) = super::three_cpt_explicit::iv_bolus_explicit(
+                dose.amt, elapsed, cl, v1, q, v2, q3, v3,
+            );
+            scatter_compact(
+                gv,
+                hv,
+                &gs,
+                &hs,
+                &[
+                    PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_Q3, PK_IDX_V3,
+                ],
+                seed_dim,
+            );
+            f
+        }
+    }
 }
 
 /// Scatter an explicit kernel's `M`-parameter `(grad, hess)` into the compact

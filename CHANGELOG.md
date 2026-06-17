@@ -20,6 +20,20 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Modeled infusion duration (`RATE=-2` → `Dn`) for ODE models** — NONMEM's
+  `RATE=-2` makes a zero-order infusion's *duration* a modeled parameter: name an
+  individual parameter `D{n}` for the dose compartment `n` and ferx infuses `AMT`
+  over that duration (rate `AMT/Dn`), resolved per iteration and occasion (so it
+  can carry covariate effects and IOV). Composes with `F{n}` (applied exactly
+  once — `F·AMT` over `Dn`) and `ALAG{n}` (shifts the window; `Dn` sets its
+  length), and works with steady state, multi-dose, and system resets. A
+  `RATE=-2` dose with no matching `D{n}` parameter — or on an analytical model —
+  is now a loud error rather than a silent bolus (the original #324 bug), both at
+  the model+data join (`fit`/`ferx check`) and at the `predict()`/`simulate()`
+  entrypoints (which skip the full data-check). A modeled `D{n}` that is
+  non-positive at the initial estimate is flagged with a `W_MODELED_DURATION_NONPOSITIVE`
+  warning (use a positive link such as `exp`). `RATE=-1` (modeled *rate*, `Rn`)
+  and analytical-engine support remain tracked #324 follow-ups (#324).
 - **Simulation-based NPDE / NPD diagnostics** in the `sdtab` output. Set
   `[fit_options] npde_nsim = 1000` (and optionally `npde_seed`) to add `NPDE`
   (Normalized Prediction Distribution Errors, decorrelated within subject) and

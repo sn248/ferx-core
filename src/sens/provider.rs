@@ -124,13 +124,13 @@ enum ExKind {
 }
 
 impl ExKind {
-    /// True when a hand-written kernel covers this dose. Steady state (every
-    /// class) is not yet derived, so a subject containing one routes entirely to
-    /// the exact `Dual2<N>` path; every other (bolus / infusion / oral) dose is
-    /// covered.
-    fn covers(self, dose: &DoseEvent) -> bool {
-        let ss = dose.ss && dose.ii > 0.0;
-        !ss
+    /// True when a hand-written kernel covers this dose. Every dose kind —
+    /// bolus / infusion / oral and their steady-state variants — now has an
+    /// explicit kernel, so this is unconditional; the genuinely unsupported SS
+    /// edges (overlapping SS infusion, SS mixed with resets) are screened earlier
+    /// in [`subject_sensitivities`] and never reach here.
+    fn covers(self, _dose: &DoseEvent) -> bool {
+        true
     }
 }
 
@@ -606,22 +606,36 @@ fn eval_dose_explicit<const N: usize>(
     gv: &mut [f64; N],
     hv: &mut [[f64; N]; N],
 ) -> f64 {
+    // Steady-state doses (`ss` flag + positive interval) take the SS kernels;
+    // otherwise the single-dose kernels. The scatter map (which PK slots the
+    // kernel differentiates) is the same for a kind's SS and non-SS variants.
+    let ss = dose.ss && dose.ii > 0.0;
+    let ii = dose.ii;
+    use super::{one_cpt_explicit as e1, three_cpt_explicit as e3, two_cpt_explicit as e2};
     match kind {
         ExKind::OneCptIv | ExKind::OneCptOral => {
             if dose.is_infusion() {
-                let (f, gs, hs) = super::one_cpt_explicit::infusion_explicit(
-                    dose.rate,
-                    dose.duration,
-                    dose.amt,
-                    elapsed,
-                    cl,
-                    v1,
-                );
+                let (f, gs, hs) = if ss {
+                    e1::infusion_ss_explicit(
+                        dose.rate,
+                        dose.duration,
+                        dose.amt,
+                        elapsed,
+                        ii,
+                        cl,
+                        v1,
+                    )
+                } else {
+                    e1::infusion_explicit(dose.rate, dose.duration, dose.amt, elapsed, cl, v1)
+                };
                 scatter_compact(gv, hv, &gs, &hs, &[PK_IDX_CL, PK_IDX_V], seed_dim);
                 f
             } else if matches!(kind, ExKind::OneCptOral) {
-                let (f, gs, hs) =
-                    super::one_cpt_explicit::oral_explicit(dose.amt, elapsed, cl, v1, ka, f_bio);
+                let (f, gs, hs) = if ss {
+                    e1::oral_ss_explicit(dose.amt, elapsed, ii, cl, v1, ka, f_bio)
+                } else {
+                    e1::oral_explicit(dose.amt, elapsed, cl, v1, ka, f_bio)
+                };
                 scatter_compact(
                     gv,
                     hv,
@@ -632,24 +646,41 @@ fn eval_dose_explicit<const N: usize>(
                 );
                 f
             } else {
-                let (f, gs, hs) =
-                    super::one_cpt_explicit::iv_bolus_explicit(dose.amt, elapsed, cl, v1);
+                let (f, gs, hs) = if ss {
+                    e1::iv_bolus_ss_explicit(dose.amt, elapsed, ii, cl, v1)
+                } else {
+                    e1::iv_bolus_explicit(dose.amt, elapsed, cl, v1)
+                };
                 scatter_compact(gv, hv, &gs, &hs, &[PK_IDX_CL, PK_IDX_V], seed_dim);
                 f
             }
         }
         ExKind::TwoCptIv | ExKind::TwoCptOral => {
             if dose.is_infusion() {
-                let (f, gs, hs) = super::two_cpt_explicit::infusion_explicit(
-                    dose.rate,
-                    dose.duration,
-                    dose.amt,
-                    elapsed,
-                    cl,
-                    v1,
-                    q,
-                    v2,
-                );
+                let (f, gs, hs) = if ss {
+                    e2::infusion_ss_explicit(
+                        dose.rate,
+                        dose.duration,
+                        dose.amt,
+                        elapsed,
+                        ii,
+                        cl,
+                        v1,
+                        q,
+                        v2,
+                    )
+                } else {
+                    e2::infusion_explicit(
+                        dose.rate,
+                        dose.duration,
+                        dose.amt,
+                        elapsed,
+                        cl,
+                        v1,
+                        q,
+                        v2,
+                    )
+                };
                 scatter_compact(
                     gv,
                     hv,
@@ -660,9 +691,11 @@ fn eval_dose_explicit<const N: usize>(
                 );
                 f
             } else if matches!(kind, ExKind::TwoCptOral) {
-                let (f, gs, hs) = super::two_cpt_explicit::oral_explicit(
-                    dose.amt, elapsed, cl, v1, q, v2, ka, f_bio,
-                );
+                let (f, gs, hs) = if ss {
+                    e2::oral_ss_explicit(dose.amt, elapsed, ii, cl, v1, q, v2, ka, f_bio)
+                } else {
+                    e2::oral_explicit(dose.amt, elapsed, cl, v1, q, v2, ka, f_bio)
+                };
                 scatter_compact(
                     gv,
                     hv,
@@ -675,8 +708,11 @@ fn eval_dose_explicit<const N: usize>(
                 );
                 f
             } else {
-                let (f, gs, hs) =
-                    super::two_cpt_explicit::iv_bolus_explicit(dose.amt, elapsed, cl, v1, q, v2);
+                let (f, gs, hs) = if ss {
+                    e2::iv_bolus_ss_explicit(dose.amt, elapsed, ii, cl, v1, q, v2)
+                } else {
+                    e2::iv_bolus_explicit(dose.amt, elapsed, cl, v1, q, v2)
+                };
                 scatter_compact(
                     gv,
                     hv,
@@ -690,18 +726,34 @@ fn eval_dose_explicit<const N: usize>(
         }
         ExKind::ThreeCptIv | ExKind::ThreeCptOral => {
             if dose.is_infusion() {
-                let (f, gs, hs) = super::three_cpt_explicit::infusion_explicit(
-                    dose.rate,
-                    dose.duration,
-                    dose.amt,
-                    elapsed,
-                    cl,
-                    v1,
-                    q,
-                    v2,
-                    q3,
-                    v3,
-                );
+                let (f, gs, hs) = if ss {
+                    e3::infusion_ss_explicit(
+                        dose.rate,
+                        dose.duration,
+                        dose.amt,
+                        elapsed,
+                        ii,
+                        cl,
+                        v1,
+                        q,
+                        v2,
+                        q3,
+                        v3,
+                    )
+                } else {
+                    e3::infusion_explicit(
+                        dose.rate,
+                        dose.duration,
+                        dose.amt,
+                        elapsed,
+                        cl,
+                        v1,
+                        q,
+                        v2,
+                        q3,
+                        v3,
+                    )
+                };
                 scatter_compact(
                     gv,
                     hv,
@@ -714,9 +766,11 @@ fn eval_dose_explicit<const N: usize>(
                 );
                 f
             } else if matches!(kind, ExKind::ThreeCptOral) {
-                let (f, gs, hs) = super::three_cpt_explicit::oral_explicit(
-                    dose.amt, elapsed, cl, v1, q, v2, q3, v3, ka, f_bio,
-                );
+                let (f, gs, hs) = if ss {
+                    e3::oral_ss_explicit(dose.amt, elapsed, ii, cl, v1, q, v2, q3, v3, ka, f_bio)
+                } else {
+                    e3::oral_explicit(dose.amt, elapsed, cl, v1, q, v2, q3, v3, ka, f_bio)
+                };
                 scatter_compact(
                     gv,
                     hv,
@@ -730,9 +784,11 @@ fn eval_dose_explicit<const N: usize>(
                 );
                 f
             } else {
-                let (f, gs, hs) = super::three_cpt_explicit::iv_bolus_explicit(
-                    dose.amt, elapsed, cl, v1, q, v2, q3, v3,
-                );
+                let (f, gs, hs) = if ss {
+                    e3::iv_bolus_ss_explicit(dose.amt, elapsed, ii, cl, v1, q, v2, q3, v3)
+                } else {
+                    e3::iv_bolus_explicit(dose.amt, elapsed, cl, v1, q, v2, q3, v3)
+                };
                 scatter_compact(
                     gv,
                     hv,

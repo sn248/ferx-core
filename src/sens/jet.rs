@@ -141,6 +141,18 @@ impl<const N: usize> Jet<N> {
         r
     }
 
+    /// Steady-state geometric factor `1/(1 − e^{−λ·ii})` as a jet, with `λ = self`.
+    /// `None` when the denominator is non-positive (degenerate `λ·ii`; caller
+    /// falls back to the dual path).
+    #[inline]
+    pub fn ss_coeff(self, ii: f64) -> Option<Self> {
+        let denom = Jet::<N>::cst(1.0).sub(self.scale(-ii).exp());
+        if denom.v <= 0.0 {
+            return None;
+        }
+        Some(denom.recip())
+    }
+
     /// Average `h[i][j]` and `h[j][i]` to kill round-off asymmetry after a step
     /// (e.g. implicit eigenvalue differentiation) that fills the two via
     /// mathematically-equal-but-distinct expressions.

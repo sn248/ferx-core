@@ -21,7 +21,10 @@
 
 use super::dual2::Dual2;
 use super::jet::Jet;
-use super::two_cpt::{two_cpt_infusion_g, two_cpt_iv_bolus_g, two_cpt_oral_g};
+use super::two_cpt::{
+    two_cpt_infusion_g, two_cpt_infusion_ss_g, two_cpt_iv_bolus_g, two_cpt_iv_bolus_ss_g,
+    two_cpt_oral_g, two_cpt_oral_ss_g,
+};
 
 /// The macro-rate eigenvalue jets `(α, β, k21)` over the `N`-axis layout
 /// `[CL,V1,Q,V2, …]` (oral uses `N=6` with `KA,F` on axes 4,5, which the
@@ -276,6 +279,205 @@ pub fn oral_explicit(
     (c.v, c.g, c.h)
 }
 
+/// `(f, ∂f/∂[CL,V1,Q,V2], ∂²f/∂[...]²)` for the 2-cpt IV bolus at steady state:
+/// the bolus coefficients with each `e^{−λt}` term carrying the SS factor
+/// `1/(1−e^{−λ·II})`.
+pub fn iv_bolus_ss_explicit(
+    amt: f64,
+    t: f64,
+    ii: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+) -> (f64, [f64; 4], [[f64; 4]; 4]) {
+    let fallback = || {
+        let d = two_cpt_iv_bolus_ss_g::<Dual2<4>>(
+            amt,
+            t,
+            ii,
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q, 2),
+            Dual2::var(v2, 3),
+        );
+        (d.value, d.grad, d.hess)
+    };
+    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 || ii <= 0.0 {
+        return (0.0, [0.0; 4], [[0.0; 4]; 4]);
+    }
+    let (alpha, beta, k21) = match macro_rate_jets::<4>(cl, v1, q, v2) {
+        Some(x) => x,
+        None => return fallback(),
+    };
+    let (ss_a, ss_b) = match (alpha.ss_coeff(ii), beta.ss_coeff(ii)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return fallback(),
+    };
+    let amt_v1 = over_v1::<4>(amt, v1);
+    let inv_diff = alpha.sub(beta).recip();
+    let a = amt_v1.mul(alpha.sub(k21)).mul(inv_diff);
+    let b = amt_v1.mul(k21.sub(beta)).mul(inv_diff);
+    let c = a
+        .mul(alpha.scale(-t).exp())
+        .mul(ss_a)
+        .add(b.mul(beta.scale(-t).exp()).mul(ss_b));
+    (c.v, c.g, c.h)
+}
+
+/// `(f, ∂f/∂[CL,V1,Q,V2,KA,F], ∂²f/∂[...]²)` for 2-cpt oral at steady state: the
+/// non-SS oral `p + q + r` with each `e^{−λt}` carrying `1/(1−e^{−λ·II})`. The
+/// `ka≈α/β` L'Hôpital limits route to the dual path.
+#[allow(clippy::too_many_arguments)]
+pub fn oral_ss_explicit(
+    amt: f64,
+    t: f64,
+    ii: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    ka: f64,
+    f_bio: f64,
+) -> (f64, [f64; 6], [[f64; 6]; 6]) {
+    let fallback = || {
+        let d = two_cpt_oral_ss_g::<Dual2<6>>(
+            amt,
+            t,
+            ii,
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q, 2),
+            Dual2::var(v2, 3),
+            Dual2::var(ka, 4),
+            Dual2::var(f_bio, 5),
+        );
+        (d.value, d.grad, d.hess)
+    };
+    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 || ka <= 0.0 || ii <= 0.0 {
+        return (0.0, [0.0; 6], [[0.0; 6]; 6]);
+    }
+    let (alpha, beta, k21) = match macro_rate_jets::<6>(cl, v1, q, v2) {
+        Some(x) => x,
+        None => return fallback(),
+    };
+    if (ka - alpha.v).abs() < 1e-6 || (ka - beta.v).abs() < 1e-6 {
+        return fallback();
+    }
+    let ka_j = Jet::<6>::var(ka, 4);
+    let (ss_a, ss_b, ss_k) = match (alpha.ss_coeff(ii), beta.ss_coeff(ii), ka_j.ss_coeff(ii)) {
+        (Some(a), Some(b), Some(k)) => (a, b, k),
+        _ => return fallback(),
+    };
+    let f_j = Jet::<6>::var(f_bio, 5);
+    let d = over_v1::<6>(amt, v1).mul(f_j).mul(ka_j);
+
+    let p = d
+        .mul(k21.sub(alpha))
+        .mul(ka_j.sub(alpha).mul(beta.sub(alpha)).recip())
+        .mul(alpha.scale(-t).exp())
+        .mul(ss_a);
+    let q_term = d
+        .mul(k21.sub(beta))
+        .mul(ka_j.sub(beta).mul(alpha.sub(beta)).recip())
+        .mul(beta.scale(-t).exp())
+        .mul(ss_b);
+    let r = d
+        .mul(k21.sub(ka_j))
+        .mul(alpha.sub(ka_j).mul(beta.sub(ka_j)).recip())
+        .mul(ka_j.scale(-t).exp())
+        .mul(ss_k);
+    let c = p.add(q_term).add(r);
+    (c.v, c.g, c.h)
+}
+
+/// `(f, ∂f/∂[CL,V1,Q,V2], ∂²f/∂[...]²)` for 2-cpt infusion at steady state
+/// (non-overlapping `dur ≤ II`): the during/after pieces plus the past-pulse
+/// superposition of [`two_cpt_infusion_ss_g`], each carrying `1/(1−e^{−λ·II})`.
+#[allow(clippy::too_many_arguments)]
+pub fn infusion_ss_explicit(
+    rate: f64,
+    dur: f64,
+    amt: f64,
+    t: f64,
+    ii: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+) -> (f64, [f64; 4], [[f64; 4]; 4]) {
+    let fallback = || {
+        let d = two_cpt_infusion_ss_g::<Dual2<4>>(
+            rate,
+            dur,
+            amt,
+            t,
+            ii,
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q, 2),
+            Dual2::var(v2, 3),
+        );
+        (d.value, d.grad, d.hess)
+    };
+    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 || ii <= 0.0 {
+        return (0.0, [0.0; 4], [[0.0; 4]; 4]);
+    }
+    if dur <= 0.0 {
+        return iv_bolus_ss_explicit(amt, t, ii, cl, v1, q, v2);
+    }
+    if dur > ii {
+        return (0.0, [0.0; 4], [[0.0; 4]; 4]);
+    }
+    let (alpha, beta, k21) = match macro_rate_jets::<4>(cl, v1, q, v2) {
+        Some(x) => x,
+        None => return fallback(),
+    };
+    if alpha.v.abs() < 1e-12 || beta.v.abs() < 1e-12 {
+        return fallback();
+    }
+    let (ss_a, ss_b) = match (alpha.ss_coeff(ii), beta.ss_coeff(ii)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return fallback(),
+    };
+    let r_v1 = over_v1::<4>(rate, v1);
+    let inv_diff = alpha.sub(beta).recip();
+    let a_coeff = r_v1.mul(alpha.sub(k21)).mul(inv_diff).mul(alpha.recip());
+    let b_coeff = r_v1.mul(k21.sub(beta)).mul(inv_diff).mul(beta.recip());
+    let one = Jet::<4>::cst(1.0);
+
+    // Past pulses (n ≥ 1): always "after-infusion".
+    let past_a = a_coeff
+        .mul(one.sub(alpha.scale(-dur).exp()))
+        .mul(alpha.scale(-(t - dur)).exp())
+        .mul(alpha.scale(-ii).exp())
+        .mul(ss_a);
+    let past_b = b_coeff
+        .mul(one.sub(beta.scale(-dur).exp()))
+        .mul(beta.scale(-(t - dur)).exp())
+        .mul(beta.scale(-ii).exp())
+        .mul(ss_b);
+    let c = if t <= dur {
+        a_coeff
+            .mul(one.sub(alpha.scale(-t).exp()))
+            .add(b_coeff.mul(one.sub(beta.scale(-t).exp())))
+            .add(past_a)
+            .add(past_b)
+    } else {
+        a_coeff
+            .mul(one.sub(alpha.scale(-dur).exp()))
+            .mul(alpha.scale(-(t - dur)).exp())
+            .mul(ss_a)
+            .add(
+                b_coeff
+                    .mul(one.sub(beta.scale(-dur).exp()))
+                    .mul(beta.scale(-(t - dur)).exp())
+                    .mul(ss_b),
+            )
+    };
+    (c.v, c.g, c.h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +621,101 @@ mod tests {
                     approx::assert_relative_eq!(
                         he[i][j],
                         hd[i][j],
+                        max_relative = 1e-6,
+                        epsilon = 1e-9
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_cpt_ss_explicit_matches_dual() {
+        // bolus SS
+        for &(amt, t, ii, cl, v1, q, v2) in &[
+            (1000.0, 2.0, 24.0, 10.0, 50.0, 15.0, 100.0),
+            (1000.0, 18.0, 24.0, 10.0, 50.0, 15.0, 100.0),
+            (500.0, 4.0, 12.0, 5.0, 30.0, 2.0, 50.0),
+        ] {
+            let (fe, ge, he) = iv_bolus_ss_explicit(amt, t, ii, cl, v1, q, v2);
+            let d = two_cpt_iv_bolus_ss_g::<Dual2<4>>(
+                amt,
+                t,
+                ii,
+                Dual2::var(cl, 0),
+                Dual2::var(v1, 1),
+                Dual2::var(q, 2),
+                Dual2::var(v2, 3),
+            );
+            approx::assert_relative_eq!(fe, d.value, max_relative = 1e-10, epsilon = 1e-12);
+            for i in 0..4 {
+                approx::assert_relative_eq!(ge[i], d.grad[i], max_relative = 1e-8, epsilon = 1e-11);
+                for j in 0..4 {
+                    approx::assert_relative_eq!(
+                        he[i][j],
+                        d.hess[i][j],
+                        max_relative = 1e-7,
+                        epsilon = 1e-10
+                    );
+                }
+            }
+        }
+        // oral SS
+        for &(amt, t, ii, cl, v1, q, v2, ka, fb) in &[
+            (100.0, 2.0, 24.0, 10.0, 50.0, 15.0, 100.0, 1.2, 0.9),
+            (100.0, 18.0, 24.0, 10.0, 50.0, 15.0, 100.0, 0.8, 1.0),
+            (500.0, 4.0, 12.0, 5.0, 30.0, 2.0, 50.0, 2.0, 0.75),
+        ] {
+            let (fe, ge, he) = oral_ss_explicit(amt, t, ii, cl, v1, q, v2, ka, fb);
+            let d = two_cpt_oral_ss_g::<Dual2<6>>(
+                amt,
+                t,
+                ii,
+                Dual2::var(cl, 0),
+                Dual2::var(v1, 1),
+                Dual2::var(q, 2),
+                Dual2::var(v2, 3),
+                Dual2::var(ka, 4),
+                Dual2::var(fb, 5),
+            );
+            approx::assert_relative_eq!(fe, d.value, max_relative = 1e-9, epsilon = 1e-12);
+            for i in 0..6 {
+                approx::assert_relative_eq!(ge[i], d.grad[i], max_relative = 1e-7, epsilon = 1e-10);
+                for j in 0..6 {
+                    approx::assert_relative_eq!(
+                        he[i][j],
+                        d.hess[i][j],
+                        max_relative = 1e-6,
+                        epsilon = 1e-9
+                    );
+                }
+            }
+        }
+        // infusion SS (dur ≤ ii): during + after
+        for &(rate, dur, amt, t, ii, cl, v1, q, v2) in &[
+            (500.0, 2.0, 1000.0, 1.0, 12.0, 10.0, 50.0, 15.0, 100.0),
+            (500.0, 2.0, 1000.0, 6.0, 12.0, 10.0, 50.0, 15.0, 100.0),
+            (250.0, 4.0, 1000.0, 10.0, 24.0, 5.0, 30.0, 2.0, 50.0),
+        ] {
+            let (fe, ge, he) = infusion_ss_explicit(rate, dur, amt, t, ii, cl, v1, q, v2);
+            let d = two_cpt_infusion_ss_g::<Dual2<4>>(
+                rate,
+                dur,
+                amt,
+                t,
+                ii,
+                Dual2::var(cl, 0),
+                Dual2::var(v1, 1),
+                Dual2::var(q, 2),
+                Dual2::var(v2, 3),
+            );
+            approx::assert_relative_eq!(fe, d.value, max_relative = 1e-9, epsilon = 1e-12);
+            for i in 0..4 {
+                approx::assert_relative_eq!(ge[i], d.grad[i], max_relative = 1e-7, epsilon = 1e-10);
+                for j in 0..4 {
+                    approx::assert_relative_eq!(
+                        he[i][j],
+                        d.hess[i][j],
                         max_relative = 1e-6,
                         epsilon = 1e-9
                     );

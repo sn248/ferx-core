@@ -1542,6 +1542,7 @@ pub fn fit(
     // path above). Here we always use the global pool for the outer par_iter.
     let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
     let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
+    let base_bayes_seed: u64 = options.bayes_seed.unwrap_or(12345);
     let n = options.n_starts;
     let sigma = options.start_sigma;
 
@@ -1560,8 +1561,11 @@ pub fn fit(
         .map(|k| {
             let init_k = perturb_init(init_params, k, sigma, base_seed);
             // Per-start option overrides for k > 0:
-            // - saem_seed: derive from base so each start gets a different MH trajectory.
-            //   Start 0 keeps the user's seed for reproducibility of the unperturbed run.
+            // - saem_seed / bayes_seed: derive from base so each start gets a different
+            //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
+            //   perturbing it every start runs an identical RNG trajectory (differing
+            //   only by the perturbed init) — wasted compute and false multi-start
+            //   robustness. Start 0 keeps the user's seeds for reproducibility.
             // - global_search: CRS2-LM ignores the starting point and samples freely in
             //   [lower, upper], so running it on starts 1..n overrides the perturbation
             //   and makes multi-start a no-op for those starts. Only run it on start 0.
@@ -1571,6 +1575,7 @@ pub fn fit(
             } else {
                 opts_k_storage = FitOptions {
                     saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
+                    bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
                     global_search: false,
                     ..options.clone()
                 };
@@ -2732,6 +2737,13 @@ fn fit_inner(
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
         }
+        // Bayesian estimation reports posterior credible intervals, not a
+        // Hessian-based covariance matrix; the FD covariance / SIR steps are
+        // meaningless (and wasteful) for it.
+        if matches!(method, EstimationMethod::Bayes) {
+            stage_opts.run_covariance_step = false;
+            stage_opts.sir = false;
+        }
 
         if options.verbose && n_stages > 1 {
             eprintln!(
@@ -2794,6 +2806,7 @@ fn fit_inner(
                     total_ebe_fallbacks: 0,
                     final_gradient: None,
                     sir_fallback_proposal: None,
+                    bayes: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -2881,6 +2894,9 @@ fn fit_inner(
                 )
             }
             EstimationMethod::Imp => unreachable!("handled by the IMP branch above"),
+            EstimationMethod::Bayes => {
+                crate::estimation::bayes::run_bayes(model, population, &stage_params, &stage_opts)?
+            }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
 
@@ -3177,9 +3193,11 @@ fn fit_inner(
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
-    // Covariance status
+    // Covariance status. Bayesian fits report posterior credible intervals
+    // instead of a Hessian covariance, so the covariance step is never
+    // "requested" for them (reporting it as FAILED would be misleading).
     let covariance_status = resolve_covariance_status(
-        options.run_covariance_step,
+        options.run_covariance_step && result.bayes.is_none(),
         result.covariance_matrix.is_some(),
         sir_fallback_result.is_some(),
     );
@@ -3310,6 +3328,7 @@ fn fit_inner(
             .or(sir_fallback_result.as_ref())
             .and_then(|s| s.resamples_packed.clone()),
         importance_sampling: is_result,
+        bayes: result.bayes.clone(),
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
@@ -6182,6 +6201,7 @@ mod simulate_with_uncertainty_tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            bayes: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],

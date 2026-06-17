@@ -20,6 +20,17 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Full MCMC Bayesian estimation** (`method = bayes`, Gibbs-within-HMC, NONMEM
+  `METHOD=BAYES` parity). Draws from the joint posterior `p(θ, Ω, Σ, {ηᵢ} | y)`:
+  per-subject η block (block-MH, or gradient HMC on autodiff builds with
+  `n_leapfrog > 0`), conjugate inverse-Wishart Ω block, exact Gaussian
+  full-conditional draw for mu-referenced θ, and a random-walk block for the
+  remaining θ/σ. Reports posterior summaries (mean/sd/2.5%/median/97.5%) with
+  split-R̂, ESS, and MCSE per parameter on `FitResult.bayes` and in the
+  `.fit.yaml` `bayes:` section. Options: `bayes_warmup`, `bayes_iters`,
+  `bayes_chains`, `bayes_thin`, `bayes_seed`. Supports BSV and zero-mean IOV
+  (per-occasion `kappa`, with a conjugate inverse-Wishart `Omega_iov` draw).
+  Validated against FOCEI and NONMEM `METHOD=BAYES` on warfarin (#380).
 - **Modeled infusion duration (`RATE=-2` → `Dn`) for ODE models** — NONMEM's
   `RATE=-2` makes a zero-order infusion's *duration* a modeled parameter: name an
   individual parameter `D{n}` for the dose compartment `n` and ferx infuses `AMT`

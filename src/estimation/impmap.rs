@@ -594,6 +594,7 @@ pub fn run_impmap(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal,
+        bayes: None,
     })
 }
 

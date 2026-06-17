@@ -136,7 +136,7 @@ struct SaemState {
 /// `log(CL_i) − log(TVCL)`, while `mu_k = log(TVCL)`, so the model evaluated
 /// `CL = TVCL · exp(log TVCL) = TVCL²` for every accepted exploration step.
 #[allow(clippy::too_many_arguments)]
-fn mh_steps(
+pub(crate) fn mh_steps(
     eta: &mut [f64],
     nll_current: f64,
     subject: &Subject,
@@ -301,7 +301,7 @@ fn mh_steps_componentwise(
 ///
 /// Returns `(n_accepted, n_proposed, updated_nll)`.
 #[allow(clippy::too_many_arguments)]
-fn mh_kappa_steps(
+pub(crate) fn mh_kappa_steps(
     kappas: &mut [Vec<f64>],
     nll_current: f64,
     subject: &Subject,
@@ -1445,7 +1445,7 @@ pub fn run_saem(
                         // flag reported back for diagnostics.
                         #[cfg(feature = "autodiff")]
                         let did_hmc = if using_hmc {
-                            if let Some((new_eta, new_nll, accepted)) =
+                            if let Some((new_eta, new_nll, accepted, _divergent)) =
                                 crate::estimation::hmc::hmc_step(
                                     subject, &eta_work, nll, model, theta_ref, omega_ref,
                                     sigma_ref, scale, n_leapfrog, &mut rng,
@@ -2086,6 +2086,7 @@ pub fn run_saem(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal,
+        bayes: None,
     })
 }
 

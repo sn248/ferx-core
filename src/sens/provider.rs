@@ -82,6 +82,14 @@ fn slot_to_dim(slot: usize) -> Option<usize> {
 /// Number of seeded PK dimensions (`CL, V1, Q2, V2, KA, F, Q3, V3`).
 const N_PK: usize = 8;
 
+/// Master switch for the user-ODE sensitivity path (issue #367, Option A). The
+/// provider in [`crate::sens::ode_provider`] is complete and tested, but the
+/// analytic-sensitivity rollout ships scoped to the analytical PK models first;
+/// ODE-model sensitivities are a deferred follow-up. While `false`, ODE models
+/// take the prior path (gradient-free outer, AD/FD inner) and the infrastructure
+/// stays compiled and exercised by its own tests. Flip to `true` to re-arm.
+const ODE_SENS_ENABLED: bool = false;
+
 /// Escape hatch: `FERX_DISABLE_EXPLICIT_SENS=1` forces every subject onto the
 /// generic `Dual2<N>` provider path instead of the hand-written explicit-
 /// derivative kernels (`*_explicit`). The explicit kernels are the default — they
@@ -156,7 +164,8 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
 /// provider ([`ode_analytical_supported`](crate::sens::ode_provider::ode_analytical_supported)).
 /// Used to gate the gradient dispatch and the Eq. 48 EBE predictor.
 pub fn sens_supported(model: &CompiledModel) -> bool {
-    analytical_supported(model) || crate::sens::ode_provider::ode_analytical_supported(model)
+    analytical_supported(model)
+        || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model))
 }
 
 /// The per-observation `∂f/∂η` Jacobian (`n_obs × n_eta`, row-major) as a flat
@@ -272,12 +281,18 @@ pub fn subject_sensitivities(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
-    // ODE models route to the ODE sensitivity provider (issue #367, Option A):
-    // it produces the same `SubjectSens`, so every downstream consumer
-    // (`subject_packed_gradient*`, `subject_eta_jacobian`, the inner loop)
-    // works unchanged.
+    // ODE models: the ODE sensitivity provider (issue #367, Option A) is complete
+    // and tested in `ode_provider`, but the analytic-sensitivity rollout is scoped
+    // to the *analytical* PK models for now — user-ODE sensitivities land in a
+    // follow-up. Gated off here (not deleted): ODE models fall back to the prior
+    // path (gradient-free outer, AD/FD inner). Flip `ODE_SENS_ENABLED` to re-arm.
     if model.ode_spec.is_some() {
-        return crate::sens::ode_provider::ode_subject_sensitivities(model, subject, theta, eta);
+        if ODE_SENS_ENABLED {
+            return crate::sens::ode_provider::ode_subject_sensitivities(
+                model, subject, theta, eta,
+            );
+        }
+        return None;
     }
     if !analytical_supported(model) || subject.has_tv_covariates() {
         return None;

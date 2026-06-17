@@ -107,19 +107,22 @@ enum ExKind {
     OneCptOral,
     /// 2-cpt IV: bolus + infusion.
     TwoCptIv,
+    /// 2-cpt oral: first-order absorption + infusion-into-central.
+    TwoCptOral,
     /// 3-cpt IV: bolus + infusion.
     ThreeCptIv,
+    /// 3-cpt oral: first-order absorption + infusion-into-central.
+    ThreeCptOral,
 }
 
 impl ExKind {
     /// True when a hand-written kernel covers this dose. Steady state (every
     /// class) is not yet derived, so a subject containing one routes entirely to
-    /// the exact `Dual2<N>` path.
+    /// the exact `Dual2<N>` path; every other (bolus / infusion / oral) dose is
+    /// covered.
     fn covers(self, dose: &DoseEvent) -> bool {
         let ss = dose.ss && dose.ii > 0.0;
-        match self {
-            ExKind::OneCptIv | ExKind::OneCptOral | ExKind::TwoCptIv | ExKind::ThreeCptIv => !ss,
-        }
+        !ss
     }
 }
 
@@ -370,15 +373,15 @@ pub fn subject_sensitivities(
     let explicit_kind = if explicit_sens_disabled() {
         None
     } else {
-        match model.pk_model {
-            PkModel::OneCptIv => Some(ExKind::OneCptIv),
-            PkModel::OneCptOral => Some(ExKind::OneCptOral),
-            PkModel::TwoCptIv => Some(ExKind::TwoCptIv),
-            PkModel::ThreeCptIv => Some(ExKind::ThreeCptIv),
-            // 2-/3-cpt oral and 3-cpt infusion have no explicit kernel yet.
-            _ => None,
-        }
-        .filter(|kind| subject.doses.iter().all(|d| kind.covers(d)))
+        let kind = match model.pk_model {
+            PkModel::OneCptIv => ExKind::OneCptIv,
+            PkModel::OneCptOral => ExKind::OneCptOral,
+            PkModel::TwoCptIv => ExKind::TwoCptIv,
+            PkModel::TwoCptOral => ExKind::TwoCptOral,
+            PkModel::ThreeCptIv => ExKind::ThreeCptIv,
+            PkModel::ThreeCptOral => ExKind::ThreeCptOral,
+        };
+        Some(kind).filter(|kind| subject.doses.iter().all(|d| kind.covers(d)))
     };
 
     // Dispatch on the differentiated-parameter count so the dual width is
@@ -620,9 +623,9 @@ fn eval_dose_explicit<const N: usize>(
                 f
             }
         }
-        ExKind::TwoCptIv => {
-            let (f, gs, hs) = if dose.is_infusion() {
-                super::two_cpt_explicit::infusion_explicit(
+        ExKind::TwoCptIv | ExKind::TwoCptOral => {
+            if dose.is_infusion() {
+                let (f, gs, hs) = super::two_cpt_explicit::infusion_explicit(
                     dose.rate,
                     dose.duration,
                     dose.amt,
@@ -631,23 +634,48 @@ fn eval_dose_explicit<const N: usize>(
                     v1,
                     q,
                     v2,
-                )
+                );
+                scatter_compact(
+                    gv,
+                    hv,
+                    &gs,
+                    &hs,
+                    &[PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2],
+                    seed_dim,
+                );
+                f
+            } else if matches!(kind, ExKind::TwoCptOral) {
+                let (f, gs, hs) = super::two_cpt_explicit::oral_explicit(
+                    dose.amt, elapsed, cl, v1, q, v2, ka, f_bio,
+                );
+                scatter_compact(
+                    gv,
+                    hv,
+                    &gs,
+                    &hs,
+                    &[
+                        PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_KA, PK_IDX_F,
+                    ],
+                    seed_dim,
+                );
+                f
             } else {
-                super::two_cpt_explicit::iv_bolus_explicit(dose.amt, elapsed, cl, v1, q, v2)
-            };
-            scatter_compact(
-                gv,
-                hv,
-                &gs,
-                &hs,
-                &[PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2],
-                seed_dim,
-            );
-            f
+                let (f, gs, hs) =
+                    super::two_cpt_explicit::iv_bolus_explicit(dose.amt, elapsed, cl, v1, q, v2);
+                scatter_compact(
+                    gv,
+                    hv,
+                    &gs,
+                    &hs,
+                    &[PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2],
+                    seed_dim,
+                );
+                f
+            }
         }
-        ExKind::ThreeCptIv => {
-            let (f, gs, hs) = if dose.is_infusion() {
-                super::three_cpt_explicit::infusion_explicit(
+        ExKind::ThreeCptIv | ExKind::ThreeCptOral => {
+            if dose.is_infusion() {
+                let (f, gs, hs) = super::three_cpt_explicit::infusion_explicit(
                     dose.rate,
                     dose.duration,
                     dose.amt,
@@ -658,23 +686,50 @@ fn eval_dose_explicit<const N: usize>(
                     v2,
                     q3,
                     v3,
-                )
+                );
+                scatter_compact(
+                    gv,
+                    hv,
+                    &gs,
+                    &hs,
+                    &[
+                        PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_Q3, PK_IDX_V3,
+                    ],
+                    seed_dim,
+                );
+                f
+            } else if matches!(kind, ExKind::ThreeCptOral) {
+                let (f, gs, hs) = super::three_cpt_explicit::oral_explicit(
+                    dose.amt, elapsed, cl, v1, q, v2, q3, v3, ka, f_bio,
+                );
+                scatter_compact(
+                    gv,
+                    hv,
+                    &gs,
+                    &hs,
+                    &[
+                        PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_Q3, PK_IDX_V3, PK_IDX_KA,
+                        PK_IDX_F,
+                    ],
+                    seed_dim,
+                );
+                f
             } else {
-                super::three_cpt_explicit::iv_bolus_explicit(
+                let (f, gs, hs) = super::three_cpt_explicit::iv_bolus_explicit(
                     dose.amt, elapsed, cl, v1, q, v2, q3, v3,
-                )
-            };
-            scatter_compact(
-                gv,
-                hv,
-                &gs,
-                &hs,
-                &[
-                    PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_Q3, PK_IDX_V3,
-                ],
-                seed_dim,
-            );
-            f
+                );
+                scatter_compact(
+                    gv,
+                    hv,
+                    &gs,
+                    &hs,
+                    &[
+                        PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_Q3, PK_IDX_V3,
+                    ],
+                    seed_dim,
+                );
+                f
+            }
         }
     }
 }

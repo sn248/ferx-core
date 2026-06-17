@@ -13,132 +13,32 @@
 //!   β''ᵢⱼ = [(d''ᵢⱼ − β'ⱼ s'ᵢ − β s''ᵢⱼ)Δ − (d'ᵢ − β s'ᵢ)(α'ⱼ−β'ⱼ)] / Δ²
 //! ```
 //!
-//! and propagate the coefficient/exponential assembly with a small 4-variable
-//! second-order jet. Seeds are `[CL, V1, Q, V2]`. Validated against
-//! [`Dual2<4>`](super::dual2::Dual2) to ~1e-8; the near-degenerate (`Δ≈0`) and
-//! invalid cases fall back to the dual path.
+//! and propagate the coefficient/exponential assembly with a small second-order
+//! [`Jet`](super::jet::Jet). Seeds are `[CL, V1, Q, V2]` (plus `KA, F` on axes
+//! 4,5 for oral). Validated against [`Dual2`](super::dual2::Dual2) to ~1e-8; the
+//! near-degenerate (`Δ≈0`) and `ka≈α/β` L'Hôpital cases fall back to the dual
+//! path.
 
 use super::dual2::Dual2;
-use super::two_cpt::{two_cpt_infusion_g, two_cpt_iv_bolus_g};
+use super::jet::Jet;
+use super::two_cpt::{two_cpt_infusion_g, two_cpt_iv_bolus_g, two_cpt_oral_g};
 
-/// A second-order jet over the four PK parameters `[CL, V1, Q, V2]`.
-#[derive(Clone, Copy)]
-struct J4 {
-    v: f64,
-    g: [f64; 4],
-    h: [[f64; 4]; 4],
-}
-
-impl J4 {
-    #[inline]
-    fn cst(v: f64) -> Self {
-        J4 {
-            v,
-            g: [0.0; 4],
-            h: [[0.0; 4]; 4],
-        }
-    }
-    #[inline]
-    fn add(self, o: Self) -> Self {
-        let mut r = J4::cst(self.v + o.v);
-        for i in 0..4 {
-            r.g[i] = self.g[i] + o.g[i];
-            for j in 0..4 {
-                r.h[i][j] = self.h[i][j] + o.h[i][j];
-            }
-        }
-        r
-    }
-    #[inline]
-    fn sub(self, o: Self) -> Self {
-        let mut r = J4::cst(self.v - o.v);
-        for i in 0..4 {
-            r.g[i] = self.g[i] - o.g[i];
-            for j in 0..4 {
-                r.h[i][j] = self.h[i][j] - o.h[i][j];
-            }
-        }
-        r
-    }
-    /// Multiply by a plain scalar (no derivatives of the scalar).
-    #[inline]
-    fn scale(self, k: f64) -> Self {
-        let mut r = J4::cst(self.v * k);
-        for i in 0..4 {
-            r.g[i] = self.g[i] * k;
-            for j in 0..4 {
-                r.h[i][j] = self.h[i][j] * k;
-            }
-        }
-        r
-    }
-    /// Leibniz product: `(ab)ᵢ = a bᵢ + aᵢ b`, `(ab)ᵢⱼ = a bᵢⱼ + aᵢbⱼ + aⱼbᵢ + aᵢⱼ b`.
-    #[inline]
-    fn mul(self, o: Self) -> Self {
-        let (a, b) = (self.v, o.v);
-        let mut r = J4::cst(a * b);
-        for i in 0..4 {
-            r.g[i] = a * o.g[i] + self.g[i] * b;
-            for j in 0..4 {
-                r.h[i][j] =
-                    a * o.h[i][j] + self.g[i] * o.g[j] + self.g[j] * o.g[i] + self.h[i][j] * b;
-            }
-        }
-        r
-    }
-    /// `1/self`: `u' = −b'/b²`, `u'' = −b''/b² + 2 b'⊗b'/b³`.
-    #[inline]
-    fn recip(self) -> Self {
-        let inv = 1.0 / self.v;
-        let inv2 = inv * inv;
-        let inv3 = inv2 * inv;
-        let mut r = J4::cst(inv);
-        for i in 0..4 {
-            r.g[i] = -self.g[i] * inv2;
-            for j in 0..4 {
-                r.h[i][j] = -self.h[i][j] * inv2 + 2.0 * self.g[i] * self.g[j] * inv3;
-            }
-        }
-        r
-    }
-    /// `exp(self)`: `u' = u·x'`, `u'' = u·(x'' + x'⊗x')`.
-    #[inline]
-    fn exp(self) -> Self {
-        let e = self.v.exp();
-        let mut r = J4::cst(e);
-        for i in 0..4 {
-            r.g[i] = e * self.g[i];
-            for j in 0..4 {
-                r.h[i][j] = e * (self.h[i][j] + self.g[i] * self.g[j]);
-            }
-        }
-        r
-    }
-}
-
-/// The macro-rate eigenvalue jets `(α, β, k21)` over `[CL,V1,Q,V2]`, or `None`
-/// when the disposition is degenerate (`disc≈0`, `α≈0`, or `α≈β`) and the caller
-/// should fall back to the dual path. Obtained by implicit differentiation of
-/// Vieta's relations (closed form, no `√`-jet); see the module header.
-fn macro_rate_jets(cl: f64, v1: f64, q: f64, v2: f64) -> Option<(J4, J4, J4)> {
-    // Micro-rates as jets (closed-form sparse grad/hess).
-    let mut k10 = J4::cst(cl / v1);
-    k10.g = [1.0 / v1, -cl / (v1 * v1), 0.0, 0.0];
-    k10.h[0][1] = -1.0 / (v1 * v1);
-    k10.h[1][0] = -1.0 / (v1 * v1);
-    k10.h[1][1] = 2.0 * cl / (v1 * v1 * v1);
-
-    let mut k12 = J4::cst(q / v1);
-    k12.g = [0.0, -q / (v1 * v1), 1.0 / v1, 0.0];
-    k12.h[1][2] = -1.0 / (v1 * v1);
-    k12.h[2][1] = -1.0 / (v1 * v1);
-    k12.h[1][1] = 2.0 * q / (v1 * v1 * v1);
-
-    let mut k21 = J4::cst(q / v2);
-    k21.g = [0.0, 0.0, 1.0 / v2, -q / (v2 * v2)];
-    k21.h[2][3] = -1.0 / (v2 * v2);
-    k21.h[3][2] = -1.0 / (v2 * v2);
-    k21.h[3][3] = 2.0 * q / (v2 * v2 * v2);
+/// The macro-rate eigenvalue jets `(α, β, k21)` over the `N`-axis layout
+/// `[CL,V1,Q,V2, …]` (oral uses `N=6` with `KA,F` on axes 4,5, which the
+/// eigenvalues don't depend on), or `None` when the disposition is degenerate
+/// (`disc≈0`, `α≈0`, or `α≈β`) and the caller should fall back to the dual path.
+/// Obtained by implicit differentiation of Vieta's relations (closed form, no
+/// `√`-jet); see the module header.
+fn macro_rate_jets<const N: usize>(
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+) -> Option<(Jet<N>, Jet<N>, Jet<N>)> {
+    // Micro-rates as jets (closed-form sparse grad/hess on axes CL=0,V1=1,Q=2,V2=3).
+    let k10 = Jet::<N>::ratio(cl, 0, v1, 1);
+    let k12 = Jet::<N>::ratio(q, 2, v1, 1);
+    let k21 = Jet::<N>::ratio(q, 2, v2, 3);
 
     // s = k10 + k12 + k21 ; d = k10·k21.
     let s = k10.add(k12).add(k21);
@@ -162,16 +62,16 @@ fn macro_rate_jets(cl: f64, v1: f64, q: f64, v2: f64) -> Option<(J4, J4, J4)> {
     let inv_d = 1.0 / delta;
     let inv_d2 = inv_d * inv_d;
 
-    let mut alpha = J4::cst(av);
-    let mut beta = J4::cst(bv);
+    let mut alpha = Jet::<N>::cst(av);
+    let mut beta = Jet::<N>::cst(bv);
     // First derivatives.
-    for i in 0..4 {
+    for i in 0..N {
         alpha.g[i] = (av * s.g[i] - d.g[i]) * inv_d;
         beta.g[i] = (d.g[i] - bv * s.g[i]) * inv_d;
     }
-    // Second derivatives (see module header). Symmetrised for the jet invariant.
-    for i in 0..4 {
-        for j in 0..4 {
+    // Second derivatives (see module header).
+    for i in 0..N {
+        for j in 0..N {
             let dg = alpha.g[j] - beta.g[j];
             let a_ij = ((alpha.g[j] * s.g[i] + av * s.h[i][j] - d.h[i][j]) * delta
                 - (av * s.g[i] - d.g[i]) * dg)
@@ -183,25 +83,15 @@ fn macro_rate_jets(cl: f64, v1: f64, q: f64, v2: f64) -> Option<(J4, J4, J4)> {
             beta.h[i][j] = b_ij;
         }
     }
-    // Symmetrise (the formula evaluates [i][j] and [j][i] via different but
-    // mathematically equal expressions; average to kill round-off asymmetry).
-    for i in 0..4 {
-        for j in (i + 1)..4 {
-            let a = 0.5 * (alpha.h[i][j] + alpha.h[j][i]);
-            alpha.h[i][j] = a;
-            alpha.h[j][i] = a;
-            let b = 0.5 * (beta.h[i][j] + beta.h[j][i]);
-            beta.h[i][j] = b;
-            beta.h[j][i] = b;
-        }
-    }
+    alpha.symmetrise();
+    beta.symmetrise();
     Some((alpha, beta, k21))
 }
 
 /// `R/V1` (or `amt/V1`) as a jet: depends on `V1` only (axis 1).
 #[inline]
-fn over_v1(num: f64, v1: f64) -> J4 {
-    let mut j = J4::cst(num / v1);
+fn over_v1<const N: usize>(num: f64, v1: f64) -> Jet<N> {
+    let mut j = Jet::<N>::cst(num / v1);
     j.g[1] = -num / (v1 * v1);
     j.h[1][1] = 2.0 * num / (v1 * v1 * v1);
     j
@@ -230,13 +120,13 @@ pub fn iv_bolus_explicit(
     if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 {
         return (0.0, [0.0; 4], [[0.0; 4]; 4]);
     }
-    let (alpha, beta, k21) = match macro_rate_jets(cl, v1, q, v2) {
+    let (alpha, beta, k21) = match macro_rate_jets::<4>(cl, v1, q, v2) {
         Some(x) => x,
         None => return fallback(),
     };
 
     // Coefficients: a = (amt/V1)(α−k21)/Δ, b = (amt/V1)(k21−β)/Δ, Δ = α−β.
-    let amt_v1 = over_v1(amt, v1);
+    let amt_v1 = over_v1::<4>(amt, v1);
     let diff = alpha.sub(beta);
     let inv_diff = diff.recip();
     let a = amt_v1.mul(alpha.sub(k21)).mul(inv_diff);
@@ -282,7 +172,7 @@ pub fn infusion_explicit(
     if dur <= 0.0 {
         return iv_bolus_explicit(amt, t, cl, v1, q, v2);
     }
-    let (alpha, beta, k21) = match macro_rate_jets(cl, v1, q, v2) {
+    let (alpha, beta, k21) = match macro_rate_jets::<4>(cl, v1, q, v2) {
         Some(x) => x,
         None => return fallback(),
     };
@@ -294,13 +184,13 @@ pub fn infusion_explicit(
     }
 
     // a = (R/V1)(α−k21)/(Δ·α), b = (R/V1)(k21−β)/(Δ·β), Δ = α−β.
-    let r_v1 = over_v1(rate, v1);
+    let r_v1 = over_v1::<4>(rate, v1);
     let diff = alpha.sub(beta);
     let inv_diff = diff.recip();
     let a_coeff = r_v1.mul(alpha.sub(k21)).mul(inv_diff).mul(alpha.recip());
     let b_coeff = r_v1.mul(k21.sub(beta)).mul(inv_diff).mul(beta.recip());
 
-    let one = J4::cst(1.0);
+    let one = Jet::<4>::cst(1.0);
     let c = if t <= dur {
         let e_a = alpha.scale(-t).exp();
         let e_b = beta.scale(-t).exp();
@@ -315,6 +205,74 @@ pub fn infusion_explicit(
             .mul(e_adt)
             .add(b_coeff.mul(one.sub(e_bd)).mul(e_bdt))
     };
+    (c.v, c.g, c.h)
+}
+
+/// `(f, ∂f/∂[CL,V1,Q,V2,KA,F], ∂²f/∂[...]²)` for 2-cpt oral (first-order
+/// absorption). The disposition eigenvalues come from the closed-form Vieta jet
+/// (`macro_rate_jets::<6>`, `KA,F` on axes 4,5); the Bateman assembly is plain
+/// jet arithmetic (`p + q + r` of [`two_cpt_oral_g`]), so the jet carries the
+/// `KA`/`F` derivatives automatically. The `ka≈α`/`ka≈β` L'Hôpital limits (where
+/// two terms share the `1/(ka−λ)` pole) are measure-zero and route to the dual
+/// path, which folds them exactly — mirroring `one_cpt_explicit::oral_explicit`.
+#[allow(clippy::too_many_arguments)]
+pub fn oral_explicit(
+    amt: f64,
+    t: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    ka: f64,
+    f_bio: f64,
+) -> (f64, [f64; 6], [[f64; 6]; 6]) {
+    let fallback = || {
+        let d = two_cpt_oral_g::<Dual2<6>>(
+            amt,
+            t,
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q, 2),
+            Dual2::var(v2, 3),
+            Dual2::var(ka, 4),
+            Dual2::var(f_bio, 5),
+        );
+        (d.value, d.grad, d.hess)
+    };
+    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 || ka <= 0.0 {
+        return (0.0, [0.0; 6], [[0.0; 6]; 6]);
+    }
+    let (alpha, beta, k21) = match macro_rate_jets::<6>(cl, v1, q, v2) {
+        Some(x) => x,
+        None => return fallback(),
+    };
+    // Shared-pole L'Hôpital limits → exact dual fallback (rare).
+    if (ka - alpha.v).abs() < 1e-6 || (ka - beta.v).abs() < 1e-6 {
+        return fallback();
+    }
+
+    let ka_j = Jet::<6>::var(ka, 4);
+    let f_j = Jet::<6>::var(f_bio, 5);
+    // d = f_bio·amt·ka/V1.
+    let d = over_v1::<6>(amt, v1).mul(f_j).mul(ka_j);
+
+    // p = d(k21−α)/[(ka−α)(β−α)]·e^{−αt}
+    let p = d
+        .mul(k21.sub(alpha))
+        .mul(ka_j.sub(alpha).mul(beta.sub(alpha)).recip())
+        .mul(alpha.scale(-t).exp());
+    // q = d(k21−β)/[(ka−β)(α−β)]·e^{−βt}
+    let q_term = d
+        .mul(k21.sub(beta))
+        .mul(ka_j.sub(beta).mul(alpha.sub(beta)).recip())
+        .mul(beta.scale(-t).exp());
+    // r = d(k21−ka)/[(α−ka)(β−ka)]·e^{−ka·t}
+    let r = d
+        .mul(k21.sub(ka_j))
+        .mul(alpha.sub(ka_j).mul(beta.sub(ka_j)).recip())
+        .mul(ka_j.scale(-t).exp());
+
+    let c = p.add(q_term).add(r);
     (c.v, c.g, c.h)
 }
 
@@ -413,6 +371,56 @@ mod tests {
                         hd[i][j],
                         max_relative = 1e-7,
                         epsilon = 1e-10
+                    );
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dual_oral(
+        amt: f64,
+        t: f64,
+        cl: f64,
+        v1: f64,
+        q: f64,
+        v2: f64,
+        ka: f64,
+        f_bio: f64,
+    ) -> (f64, [f64; 6], [[f64; 6]; 6]) {
+        let d = two_cpt_oral_g::<Dual2<6>>(
+            amt,
+            t,
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q, 2),
+            Dual2::var(v2, 3),
+            Dual2::var(ka, 4),
+            Dual2::var(f_bio, 5),
+        );
+        (d.value, d.grad, d.hess)
+    }
+
+    #[test]
+    fn two_cpt_oral_explicit_matches_dual() {
+        // Spread of (CL,V1,Q,V2,KA,F) avoiding the ka≈α/β limits, plus F≠1.
+        for &(amt, t, cl, v1, q, v2, ka, fb) in &[
+            (100.0, 1.0, 10.0, 50.0, 15.0, 100.0, 1.2, 0.9),
+            (100.0, 4.0, 10.0, 50.0, 15.0, 100.0, 0.8, 1.0),
+            (500.0, 0.5, 5.0, 30.0, 2.0, 50.0, 2.0, 0.75),
+            (1000.0, 8.0, 4.41, 15.5, 3.14, 29.3, 0.6, 1.0), // fit-ish
+        ] {
+            let (fe, ge, he) = oral_explicit(amt, t, cl, v1, q, v2, ka, fb);
+            let (fd, gd, hd) = dual_oral(amt, t, cl, v1, q, v2, ka, fb);
+            approx::assert_relative_eq!(fe, fd, max_relative = 1e-9, epsilon = 1e-12);
+            for i in 0..6 {
+                approx::assert_relative_eq!(ge[i], gd[i], max_relative = 1e-7, epsilon = 1e-10);
+                for j in 0..6 {
+                    approx::assert_relative_eq!(
+                        he[i][j],
+                        hd[i][j],
+                        max_relative = 1e-6,
+                        epsilon = 1e-9
                     );
                 }
             }

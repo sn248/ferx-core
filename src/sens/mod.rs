@@ -14,6 +14,7 @@
 //!     dual number.
 
 pub mod dual2;
+pub mod jet;
 pub mod num;
 pub mod ode_provider;
 pub mod one_cpt;

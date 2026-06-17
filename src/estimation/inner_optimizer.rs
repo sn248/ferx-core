@@ -762,7 +762,26 @@ pub fn find_ebe(
     #[cfg(not(feature = "autodiff"))]
     let result = {
         let _ = grad_method; // silence unused warning on stable builds
-        inner_minimize(&obj, &mut eta, n_eta, max_iter, tol)
+                             // Exact analytic η-gradient from the sensitivity provider when in scope
+                             // (Almquist et al. 2015): one provider evaluation per inner step instead
+                             // of the FD gradient's ~2·n_eta+1 predictions, and exact → fewer steps.
+                             // Per-point FD fallback if the provider can't serve a given (θ, η).
+        if analytic_inner_grad_supported(model, subject) {
+            let agrad = |e: &[f64]| -> Vec<f64> {
+                analytic_eta_nll_gradient(
+                    model,
+                    subject,
+                    &params.theta,
+                    e,
+                    &params.omega,
+                    &params.sigma.values,
+                )
+                .unwrap_or_else(|| gradient_fd(&obj, e, n_eta))
+            };
+            inner_minimize_with_grad(&obj, &agrad, &mut eta, n_eta, max_iter, tol)
+        } else {
+            inner_minimize(&obj, &mut eta, n_eta, max_iter, tol)
+        }
     };
 
     // If BFGS failed, try Nelder-Mead from the prior mode (eta_true = 0).
@@ -1097,6 +1116,81 @@ const LBFGS_MEMORY: usize = 8;
 /// problems (large IOV: `n_eta + K·n_kappa`) take the L-BFGS path.
 const INNER_LBFGS_MIN_DIM: usize = 32;
 
+/// Whether the exact analytic η-gradient of the individual NLL
+/// ([`analytic_eta_nll_gradient`]) applies to this model/subject: the analytic
+/// sensitivity provider must serve it, and the likelihood must be the plain
+/// Gaussian data term (no SDE EKF, no M3 censoring, no TTE) whose η-gradient the
+/// closed form below covers.
+fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    // Escape hatch / A-B toggle: force the FD inner gradient everywhere.
+    if std::env::var("FERX_NO_ANALYTIC_INNER")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if model.is_sde() {
+        return false;
+    }
+    if matches!(model.bloq_method, crate::types::BloqMethod::M3)
+        && subject.cens.iter().any(|&c| c != 0)
+    {
+        return false;
+    }
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        return false;
+    }
+    crate::sens::provider::analytical_supported(model) && !subject.has_tv_covariates()
+}
+
+/// Exact η-gradient of the individual NLL `½(η'Ω⁻¹η + ln|Ω| + Σ_j[ε_j²/v_j + ln v_j])`
+/// from the analytic sensitivity provider — the closed-form analog of the
+/// sensitivity-equation gradient (Almquist, Leander & Jirstrand 2015). Replaces
+/// the FD gradient's `~2·n_eta+1` predictions per inner step with one provider
+/// evaluation. `None` when the provider can't serve this `(θ, η)` (degenerate
+/// params / out of scope), so the caller falls back to FD for that point.
+///
+/// Per observation `j`, with `f = f_j(η)`, `ε = y_j − f`, `v = R(f)` the residual
+/// variance and `R'(f)` its `f`-derivative:
+/// ```text
+///   ∂nll/∂η_k = Σ_j ∂f_j/∂η_k · ( −ε/v + ½·R'(f)·(1/v − ε²/v²) ) + (Ω⁻¹η)_k
+/// ```
+fn analytic_eta_nll_gradient(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &crate::types::OmegaMatrix,
+    sigma: &[f64],
+) -> Option<Vec<f64>> {
+    let sens = crate::sens::provider::subject_sensitivities(model, subject, theta, eta)?;
+    let n_eta = model.n_eta;
+    let mut grad = vec![0.0_f64; n_eta];
+    for (j, obs) in sens.obs.iter().enumerate() {
+        let y = subject.observations[j];
+        let cmt = subject.obs_cmts[j];
+        let f = obs.f;
+        let v = model.residual_variance_at(cmt, f, sigma);
+        if !(v > 0.0) {
+            return None;
+        }
+        let dv_df = model.error_spec.dvar_df(cmt, f, sigma);
+        let eps = y - f;
+        let coef = -eps / v + 0.5 * dv_df * (1.0 / v - eps * eps / (v * v));
+        for k in 0..n_eta {
+            grad[k] += coef * obs.df_deta[k];
+        }
+    }
+    // Prior: ∂/∂η ½ η'Ω⁻¹η = Ω⁻¹η.
+    let eta_v = nalgebra::DVector::from_column_slice(eta);
+    let prior = &omega.inv * &eta_v;
+    for (k, g) in grad.iter_mut().enumerate() {
+        *g += prior[k];
+    }
+    Some(grad)
+}
+
 /// Inner EBE minimization with a finite-difference gradient. Dispatches to dense
 /// BFGS (small `n`) or L-BFGS (large `n`) by [`INNER_LBFGS_MIN_DIM`]; both
 /// converge to the same EBE (stationary point of `individual_nll + ½η'Ω⁻¹η`).
@@ -1115,9 +1209,8 @@ fn inner_minimize(
     }
 }
 
-/// Inner EBE minimization with an externally-provided gradient (for AD). Same
-/// dense-vs-L-BFGS dispatch as [`inner_minimize`].
-#[cfg(feature = "autodiff")]
+/// Inner EBE minimization with an externally-provided gradient (analytic
+/// sensitivities or AD). Same dense-vs-L-BFGS dispatch as [`inner_minimize`].
 fn inner_minimize_with_grad(
     obj: &dyn Fn(&[f64]) -> f64,
     grad: &dyn Fn(&[f64]) -> Vec<f64>,

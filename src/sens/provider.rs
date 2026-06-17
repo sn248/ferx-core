@@ -272,10 +272,57 @@ fn lognormal_param_derivatives(
     }
 }
 
+/// Accumulated `subject_sensitivities` call count and wall-time across a fit,
+/// for `FERX_PROFILE=1` (printed by the CLI via [`profile_report`]). No overhead
+/// when off (the `Instant` is only taken when profiling is enabled).
+pub static PROFILE_SENS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROFILE_SENS_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn sens_profile_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("FERX_PROFILE").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Print the accumulated analytic-provider profile (no-op unless `FERX_PROFILE=1`).
+pub fn profile_report() {
+    if !sens_profile_enabled() {
+        return;
+    }
+    let c = PROFILE_SENS_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let n = PROFILE_SENS_NANOS.load(std::sync::atomic::Ordering::Relaxed);
+    if c > 0 {
+        eprintln!(
+            "[profile] analytic provider (subject_sensitivities): {} calls, {:.3}s total, {:.1} ns/call",
+            c,
+            n as f64 / 1e9,
+            n as f64 / c as f64
+        );
+    }
+}
+
 /// Compute per-observation analytic sensitivities, or `None` if this
 /// model/subject is outside the supported analytical 1-cpt scope (caller falls
 /// back to the gradient-free path).
 pub fn subject_sensitivities(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<SubjectSens> {
+    if !sens_profile_enabled() {
+        return subject_sensitivities_impl(model, subject, theta, eta);
+    }
+    let t0 = std::time::Instant::now();
+    let r = subject_sensitivities_impl(model, subject, theta, eta);
+    PROFILE_SENS_NANOS.fetch_add(
+        t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    PROFILE_SENS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+fn subject_sensitivities_impl(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],

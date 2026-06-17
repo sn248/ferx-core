@@ -90,6 +90,7 @@ fn main() {
             ferx_core::io::output::print_results(&fit_result);
             // Measurement only (no-op unless FERX_PROFILE=1).
             ferx_core::pk::event_driven::profile_report();
+            ferx_core::sens::provider::profile_report();
 
             // Derive model name from model file path
             let model_name = std::path::Path::new(model_path)

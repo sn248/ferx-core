@@ -23,9 +23,7 @@
 //! algebraic shape.
 
 use super::dual2::Dual2;
-use super::one_cpt::{
-    one_cpt_infusion_ss_g, one_cpt_iv_bolus_ss_g, one_cpt_oral_g, one_cpt_oral_ss_g,
-};
+use super::one_cpt::{one_cpt_oral_g, one_cpt_oral_ss_g};
 
 /// A 1-D second-order jet over a single scalar variable (here the disposition
 /// rate `k`): `v` value, `d1 = d/dk`, `d2 = d²/dk²`. Cheap (3 `f64`s, scalar

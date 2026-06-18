@@ -1,4 +1,14 @@
+use crate::sens::two_cpt::{
+    two_cpt_infusion_g, two_cpt_infusion_ss_g, two_cpt_iv_bolus_g, two_cpt_iv_bolus_ss_g,
+    two_cpt_oral_g, two_cpt_oral_ss_g,
+};
 use crate::types::DoseEvent;
+
+// The 2-cpt single-dose concentration closed forms are the single source of truth
+// in `crate::sens::two_cpt` (generic over `PkNum`); these f64 entry points delegate
+// to the generic `*_g` at `T = f64` (issue #408 / Ron review #9). `#[inline]` keeps
+// the hot path identical. The peripheral-amount helpers (`*_peripheral`) and the
+// local `macro_rates` they share have no concentration analogue and stay here.
 
 /// Compute macro-rate constants (alpha, beta) from micro-constants.
 /// Uses Vieta's formula for beta to avoid catastrophic cancellation
@@ -26,57 +36,25 @@ fn macro_rates(cl: f64, v1: f64, q: f64, v2: f64) -> (f64, f64, f64) {
 
 /// Two-compartment IV bolus
 /// C(t) = A*exp(-alpha*t) + B*exp(-beta*t)
+#[inline]
 pub fn two_cpt_iv_bolus(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 {
-        return 0.0;
-    }
-
-    let a = (dose.amt / v1) * (alpha - k21) / diff;
-    let b = (dose.amt / v1) * (k21 - beta) / diff;
-
-    a * (-alpha * t).exp() + b * (-beta * t).exp()
+    two_cpt_iv_bolus_g::<f64>(dose.amt, t, cl, v1, q, v2)
 }
 
 /// Two-compartment infusion
+#[inline]
 pub fn two_cpt_infusion(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 || alpha.abs() < 1e-12 || beta.abs() < 1e-12 {
-        return 0.0;
-    }
-
-    let rate = dose.rate;
-    let dur = dose.duration;
-    if dur <= 0.0 {
-        return two_cpt_iv_bolus(dose, t, cl, v1, q, v2);
-    }
-
-    let a_coeff = (rate / v1) * (alpha - k21) / (diff * alpha);
-    let b_coeff = (rate / v1) * (k21 - beta) / (diff * beta);
-
-    if t <= dur {
-        a_coeff * (1.0 - (-alpha * t).exp()) + b_coeff * (1.0 - (-beta * t).exp())
-    } else {
-        let dt = t - dur;
-        a_coeff * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp()
-            + b_coeff * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp()
-    }
+    two_cpt_infusion_g::<f64>(dose.rate, dose.duration, dose.amt, t, cl, v1, q, v2)
 }
 
 /// Two-compartment oral absorption
 /// C(t) = P*exp(-alpha*t) + Q*exp(-beta*t) + R*exp(-ka*t)
+#[inline]
 pub fn two_cpt_oral(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64, ka: f64) -> f64 {
     two_cpt_oral_f(dose, t, cl, v1, q, v2, ka, 1.0)
 }
 
+#[inline]
 pub fn two_cpt_oral_f(
     dose: &DoseEvent,
     t: f64,
@@ -87,49 +65,7 @@ pub fn two_cpt_oral_f(
     ka: f64,
     f_bio: f64,
 ) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || ka <= 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 {
-        return 0.0;
-    }
-
-    let d = f_bio * dose.amt * ka / v1;
-
-    // Standard formula:
-    //   C(t) = d * [ (k21-α)/((ka-α)(β-α)) · e^{-αt}
-    //              + (k21-β)/((ka-β)(α-β)) · e^{-βt}
-    //              + (k21-ka)/((α-ka)(β-ka)) · e^{-ka·t} ]
-    //
-    // Handle singularities when ka ≈ alpha or ka ≈ beta via L'Hopital limits.
-    // The e^{-αt} term and the e^{-ka·t} term BOTH carry the 1/(ka-α) pole, so as
-    // ka→α they must be combined *before* taking the limit. The combined limit is
-    //   d·e^{-αt}·[ (α-k21)/diff·t − (k21-β)/diff² ],   diff = α-β
-    // (and symmetric for ka→β). Applying L'Hôpital to the α-term alone and zeroing
-    // the ka-term — as an earlier version did — drops the −(k21-β)/diff² piece and
-    // is ~14% off near the pole.
-    let p = if (ka - alpha).abs() < 1e-6 {
-        d * (-alpha * t).exp() * ((alpha - k21) / diff * t - (k21 - beta) / (diff * diff))
-    } else {
-        d * (k21 - alpha) / ((ka - alpha) * (beta - alpha)) * (-alpha * t).exp()
-    };
-
-    let q_val = if (ka - beta).abs() < 1e-6 {
-        d * (-beta * t).exp() * ((k21 - beta) / diff * t - (k21 - alpha) / (diff * diff))
-    } else {
-        d * (k21 - beta) / ((ka - beta) * (alpha - beta)) * (-beta * t).exp()
-    };
-
-    // The e^{-ka·t} term is folded into `p` (ka≈α) or `q_val` (ka≈β) above.
-    let r = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 {
-        0.0
-    } else {
-        d * (k21 - ka) / ((alpha - ka) * (beta - ka)) * (-ka * t).exp()
-    };
-
-    p + q_val + r
+    two_cpt_oral_g::<f64>(dose.amt, t, cl, v1, q, v2, ka, f_bio)
 }
 
 /// Predict concentration from a single dose at elapsed time t using 2-cmt model.
@@ -173,85 +109,30 @@ fn ss_coeff(lambda: f64, ii: f64) -> f64 {
 }
 
 /// Two-compartment IV bolus at steady state.
+#[inline]
 pub fn two_cpt_iv_bolus_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q < 0.0 || dose.ii <= 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 {
-        return 0.0;
-    }
-    let ii = dose.ii;
-    let a = (dose.amt / v1) * (alpha - k21) / diff;
-    let b = (dose.amt / v1) * (k21 - beta) / diff;
-    a * (-alpha * t).exp() * ss_coeff(alpha, ii) + b * (-beta * t).exp() * ss_coeff(beta, ii)
+    two_cpt_iv_bolus_ss_g::<f64>(dose.amt, t, dose.ii, cl, v1, q, v2)
 }
 
 /// Two-compartment infusion at steady state, for any `T_inf` — including
 /// overlapping pulses (`T_inf > II`). Evaluated at phase `t ∈ [0, II)`.
+#[inline]
 pub fn two_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q < 0.0 || dose.ii <= 0.0 {
-        return 0.0;
-    }
-    let dur = dose.duration;
-    if dur <= 0.0 {
-        return two_cpt_iv_bolus_ss(dose, t, cl, v1, q, v2);
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 || alpha.abs() < 1e-12 || beta.abs() < 1e-12 {
-        return 0.0;
-    }
-    let ii = dose.ii;
-    let rate = dose.rate;
-    let a_coeff = (rate / v1) * (alpha - k21) / (diff * alpha);
-    let b_coeff = (rate / v1) * (k21 - beta) / (diff * beta);
-
-    if dur > ii {
-        // Overlapping infusions: superpose the past pulse train per eigenvalue.
-        // For each λ with coefficient `c`, with `N` pulses still infusing at
-        // phase `t` (N = ⌊(T_inf − t)/II⌋ + 1) and `sc = 1/(1 − e^{−λ·II})`:
-        //   c·[ N − e^{−λt}(1 − e^{−λ·N·II})·sc + (1 − e^{−λ·T_inf})·e^{−λ(t − T_inf + N·II)}·sc ].
-        // Reduces to the non-overlapping branches at N ∈ {0, 1} (see the 1-cpt
-        // form in `one_cpt_infusion_ss`).
-        let n_active = (((dur - t) / ii).floor() + 1.0).max(0.0);
-        let nii = n_active * ii;
-        let overlap = |c: f64, lambda: f64| -> f64 {
-            let sc = ss_coeff(lambda, ii);
-            let a = n_active - (-lambda * t).exp() * (1.0 - (-lambda * nii).exp()) * sc;
-            let d = (1.0 - (-lambda * dur).exp()) * (-lambda * (t - dur + nii)).exp() * sc;
-            c * (a + d)
-        };
-        return overlap(a_coeff, alpha) + overlap(b_coeff, beta);
-    }
-
-    // Past-pulses contribution (n ≥ 1): always "after-infusion".
-    let exp_neg_a_ii = (-alpha * ii).exp();
-    let exp_neg_b_ii = (-beta * ii).exp();
-    let past_a = a_coeff
-        * (1.0 - (-alpha * dur).exp())
-        * (-alpha * (t - dur)).exp()
-        * exp_neg_a_ii
-        * ss_coeff(alpha, ii);
-    let past_b = b_coeff
-        * (1.0 - (-beta * dur).exp())
-        * (-beta * (t - dur)).exp()
-        * exp_neg_b_ii
-        * ss_coeff(beta, ii);
-    if t <= dur {
-        // Current pulse is during infusion.
-        a_coeff * (1.0 - (-alpha * t).exp()) + b_coeff * (1.0 - (-beta * t).exp()) + past_a + past_b
-    } else {
-        // Current pulse is after — all pulses are "after"; combine with the
-        // past-pulses tail by replacing the (n ≥ 1) sum with (n ≥ 0).
-        let dt = t - dur;
-        a_coeff * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp() * ss_coeff(alpha, ii)
-            + b_coeff * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp() * ss_coeff(beta, ii)
-    }
+    two_cpt_infusion_ss_g::<f64>(
+        dose.rate,
+        dose.duration,
+        dose.amt,
+        t,
+        dose.ii,
+        cl,
+        v1,
+        q,
+        v2,
+    )
 }
 
 /// Two-compartment oral absorption at steady state (with bioavailability).
+#[inline]
 pub fn two_cpt_oral_f_ss(
     dose: &DoseEvent,
     t: f64,
@@ -262,56 +143,11 @@ pub fn two_cpt_oral_f_ss(
     ka: f64,
     f_bio: f64,
 ) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || ka <= 0.0 || v2 <= 0.0 || q < 0.0 || dose.ii <= 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 {
-        return 0.0;
-    }
-    let ii = dose.ii;
-    let d = f_bio * dose.amt * ka / v1;
-
-    // Standard 2-cpt oral with per-eigenvalue SS geometric-series factor.
-    // L'Hopital limits apply when ka ≈ α or ka ≈ β; the SS sum of
-    // (τ + n·II)·exp(-λ·(τ + n·II)) closed form is
-    //   exp(-λ·τ) · [τ/(1-x) + II·x/(1-x)²]  with x = exp(-λ·ii).
-    fn lhopital_ss_sum(tau: f64, lambda: f64, ii: f64) -> f64 {
-        let x = (-lambda * ii).exp();
-        let one_minus_x = 1.0 - x;
-        if one_minus_x <= 0.0 {
-            return 0.0;
-        }
-        (-lambda * tau).exp() * (tau / one_minus_x + ii * x / (one_minus_x * one_minus_x))
-    }
-
-    // Combined ka→α (or ka→β) L'Hôpital limit — the e^{-ka·t} term shares the
-    // 1/(ka-α) pole and is folded in, contributing the −(k21-β)/diff²·SS term that
-    // the t-only limit drops (see `two_cpt_oral_f`).
-    let p = if (ka - alpha).abs() < 1e-6 {
-        d * ((alpha - k21) / diff * lhopital_ss_sum(t, alpha, ii)
-            - (k21 - beta) / (diff * diff) * (-alpha * t).exp() * ss_coeff(alpha, ii))
-    } else {
-        d * (k21 - alpha) / ((ka - alpha) * (beta - alpha))
-            * (-alpha * t).exp()
-            * ss_coeff(alpha, ii)
-    };
-    let q_val = if (ka - beta).abs() < 1e-6 {
-        d * ((k21 - beta) / diff * lhopital_ss_sum(t, beta, ii)
-            - (k21 - alpha) / (diff * diff) * (-beta * t).exp() * ss_coeff(beta, ii))
-    } else {
-        d * (k21 - beta) / ((ka - beta) * (alpha - beta)) * (-beta * t).exp() * ss_coeff(beta, ii)
-    };
-    let r = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 {
-        0.0
-    } else {
-        d * (k21 - ka) / ((alpha - ka) * (beta - ka)) * (-ka * t).exp() * ss_coeff(ka, ii)
-    };
-    p + q_val + r
+    two_cpt_oral_ss_g::<f64>(dose.amt, t, dose.ii, cl, v1, q, v2, ka, f_bio)
 }
 
 /// Two-compartment oral absorption at steady state (F = 1).
+#[inline]
 pub fn two_cpt_oral_ss(
     dose: &DoseEvent,
     t: f64,

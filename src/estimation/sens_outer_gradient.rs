@@ -1063,6 +1063,373 @@ pub fn population_gradient_sens_foce(
     Some(grad)
 }
 
+/// Lower-triangle packed-entry list for an Ω of dimension `n` (diagonal: `(i,i)`;
+/// block: `(r,c)`, `c ≤ r`), matching `pack_params` order.
+fn lower_tri_entries(n: usize, diagonal: bool) -> Vec<(usize, usize)> {
+    if diagonal {
+        (0..n).map(|i| (i, i)).collect()
+    } else {
+        let mut e = Vec::new();
+        for c in 0..n {
+            for r in c..n {
+                e.push((r, c));
+            }
+        }
+        e
+    }
+}
+
+/// Block-diagonal Cholesky factor `L_Σb = blkdiag(L_bsv, L_iov × K)` of the IOV
+/// prior `Σ_b = Ω_bsv ⊕ K·Ω_iov`.
+fn block_chol_full(
+    l_bsv: &DMatrix<f64>,
+    l_iov: &DMatrix<f64>,
+    k: usize,
+    n_eta: usize,
+    n_iov: usize,
+) -> DMatrix<f64> {
+    let n = n_eta + k * n_iov;
+    let mut l = DMatrix::zeros(n, n);
+    for r in 0..n_eta {
+        for c in 0..n_eta {
+            l[(r, c)] = l_bsv[(r, c)];
+        }
+    }
+    for kk in 0..k {
+        let off = n_eta + kk * n_iov;
+        for r in 0..n_iov {
+            for c in 0..n_iov {
+                l[(off + r, off + c)] = l_iov[(r, c)];
+            }
+        }
+    }
+    l
+}
+
+/// EBE response `dη̂/dx` for an analytical **IOV** subject (FOCE coupling +
+/// Eq. 48 predictor), over the stacked `[η_bsv, κ₁..κ_K]` with block-Ω. Mirrors
+/// [`subject_eta_dx`] but the Ω coords split: BSV packed entries map to the
+/// top-left Cholesky block; the shared κ-variance packed entries sum the response
+/// across the K IOV Cholesky blocks. `None` outside the IOV-analytical scope.
+pub fn subject_eta_dx_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    stacked_eta_hat: &[f64],
+) -> Option<Vec<DVector<f64>>> {
+    let params = unpack_params(x, template);
+    let sens =
+        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, stacked_eta_hat)?;
+    let k = crate::stats::likelihood::split_obs_by_occasion(subject).len();
+    let n_eta_bsv = model.n_eta;
+    let n_iov = model.n_kappa;
+    let n_st = n_eta_bsv + k * n_iov;
+    if stacked_eta_hat.len() != n_st {
+        return None;
+    }
+    let omega_iov = params.omega_iov.as_ref()?;
+    let block = crate::stats::likelihood::build_block_diag_omega(
+        &params.omega.matrix,
+        &omega_iov.matrix,
+        k,
+    );
+    let omega_inv = block.cholesky()?.inverse();
+    let prep = prepare_stacked(model, subject, &params, &sens, n_st, omega_inv)?;
+    let n_theta = params.theta.len();
+    let n_sigma = params.sigma.values.len();
+    let mut out: Vec<DVector<f64>> = vec![DVector::zeros(n_st); x.len()];
+
+    // θ coords.
+    for m in 0..n_theta {
+        let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
+            params.theta[m]
+        } else {
+            1.0
+        };
+        let mvec = mixed_eta_theta(&sens.obs, &prep.et, n_st, prep.n_obs, m);
+        out[m] = -(&prep.h_inner_inv * mvec) * dtheta_dx;
+    }
+
+    // Ω coords (per Cholesky entry of Σ_b, pre-chain response).
+    let z = &prep.omega_inv * DVector::from_column_slice(stacked_eta_hat);
+    let l_bsv = &params.omega.chol;
+    let l_iov = &omega_iov.chol;
+    let l_full = block_chol_full(l_bsv, l_iov, k, n_eta_bsv, n_iov);
+    let m_l_response = |row: usize, col: usize| -> DVector<f64> {
+        let v = l_full.column(col).into_owned();
+        let vz = v.dot(&z);
+        let oinv_v = &prep.omega_inv * &v;
+        let oinv_col_row: DVector<f64> = prep.omega_inv.column(row).into_owned();
+        let m_l = -(oinv_col_row * vz + oinv_v * z[row]);
+        -(&prep.h_inner_inv * m_l)
+    };
+    let omega_start = n_theta;
+    let bsv_entries = lower_tri_entries(n_eta_bsv, params.omega.diagonal);
+    for (e, &(row, col)) in bsv_entries.iter().enumerate() {
+        let chain = if row == col { l_bsv[(row, row)] } else { 1.0 };
+        out[omega_start + e] = m_l_response(row, col) * chain;
+    }
+    let sigma_start = omega_start + bsv_entries.len();
+    let iov_start = sigma_start + n_sigma;
+    let iov_entries = lower_tri_entries(n_iov, omega_iov.diagonal);
+    for (e, &(i, j)) in iov_entries.iter().enumerate() {
+        let mut resp = DVector::zeros(n_st);
+        for kk in 0..k {
+            resp += m_l_response(n_eta_bsv + kk * n_iov + i, n_eta_bsv + kk * n_iov + j);
+        }
+        let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
+        out[iov_start + e] = resp * chain;
+    }
+
+    // σ coords (no M3 in IOV scope).
+    let sigma = &params.sigma.values;
+    for kk in 0..n_sigma {
+        let h = 1e-6 * (1.0 + sigma[kk].abs());
+        let mut sp = sigma.clone();
+        sp[kk] += h;
+        let mut sm = sigma.clone();
+        sm[kk] -= h;
+        let mut mvec = DVector::<f64>::zeros(n_st);
+        for (j, obs) in sens.obs.iter().enumerate() {
+            let cmt = subject.obs_cmts[j];
+            let f = obs.f;
+            let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
+            let r_sig = (model.error_spec.variance_at(cmt, f, &sp)
+                - model.error_spec.variance_at(cmt, f, &sm))
+                / (2.0 * h);
+            let d_sig = (model.error_spec.dvar_df(cmt, f, &sp)
+                - model.error_spec.dvar_df(cmt, f, &sm))
+                / (2.0 * h);
+            let inv_r = 1.0 / r;
+            let inv_r2 = inv_r * inv_r;
+            let inv_r3 = inv_r2 * inv_r;
+            let dalpha = (2.0 * eps * inv_r2 + d * (2.0 * eps * eps - r) * inv_r3) * r_sig
+                + ((r - eps * eps) * inv_r2) * d_sig;
+            for m in 0..n_st {
+                mvec[m] += 0.5 * dalpha * obs.df_deta[m];
+            }
+        }
+        out[sigma_start + kk] = -(&prep.h_inner_inv * mvec) * sigma[kk];
+    }
+
+    Some(out)
+}
+
+/// The exact per-subject **FOCE** (non-interaction) packed gradient for an
+/// analytical **IOV** subject, in `pack_params` order `[θ, Ω_bsv, σ, Ω_iov]`. The
+/// Sheiner–Beal linearized marginal `½[ρᵀR̃⁻¹ρ + log|R̃|]`, `R̃ = J Σ_b Jᵀ + R⁰`,
+/// over the stacked `J = ∂f/∂[η_bsv,κ]` and block-Ω `Σ_b`. The Ω blocks split the
+/// per-Cholesky-entry SB gradient over `Σ_b`'s factor (BSV block direct; the K
+/// IOV blocks summed for the shared κ-variance); the coupling `∂F/∂η̂` reuses
+/// [`subject_eta_dx_iov`]. `None` outside the IOV-analytical scope.
+pub fn subject_packed_gradient_foce_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    stacked_eta_hat: &[f64],
+) -> Option<Vec<f64>> {
+    let params = unpack_params(x, template);
+    let sens =
+        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, stacked_eta_hat)?;
+    let k = crate::stats::likelihood::split_obs_by_occasion(subject).len();
+    let n_eta_bsv = model.n_eta;
+    let n_iov = model.n_kappa;
+    let n_st = n_eta_bsv + k * n_iov;
+    if stacked_eta_hat.len() != n_st {
+        return None;
+    }
+    let n_obs = subject.observations.len();
+    if n_obs == 0 {
+        return None;
+    }
+    let zeros = vec![0.0f64; n_st];
+    let sens0 = crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, &zeros)?;
+    if sens.obs.len() != n_obs || sens0.obs.len() != n_obs {
+        return None;
+    }
+    let sigma = &params.sigma.values;
+    let omega_iov = params.omega_iov.as_ref()?;
+    let omega_full = crate::stats::likelihood::build_block_diag_omega(
+        &params.omega.matrix,
+        &omega_iov.matrix,
+        k,
+    );
+
+    // J = ∂f/∂[η,κ], ρ = ε + J·b̂, R⁰ and d⁰ at f(all-zero).
+    let mut jmat = DMatrix::<f64>::zeros(n_obs, n_st);
+    let mut rho = DVector::<f64>::zeros(n_obs);
+    let mut r0 = vec![0.0f64; n_obs];
+    let mut d0 = vec![0.0f64; n_obs];
+    for j in 0..n_obs {
+        let obs = &sens.obs[j];
+        let mut jeta = 0.0;
+        for kk in 0..n_st {
+            jmat[(j, kk)] = obs.df_deta[kk];
+            jeta += obs.df_deta[kk] * stacked_eta_hat[kk];
+        }
+        rho[j] = subject.observations[j] - (obs.f - jeta);
+        let cmt = subject.obs_cmts[j];
+        let f0act = sens0.obs[j].f;
+        let r = model.error_spec.variance_at(cmt, f0act, sigma);
+        if !(r.is_finite() && r > 0.0) {
+            return None;
+        }
+        r0[j] = r;
+        d0[j] = model.error_spec.dvar_df(cmt, f0act, sigma);
+    }
+
+    let jo = &jmat * &omega_full;
+    let mut rtilde = &jo * jmat.transpose();
+    for j in 0..n_obs {
+        rtilde[(j, j)] += r0[j];
+    }
+    let rtilde_inv = rtilde.cholesky()?.inverse();
+    let u = &rtilde_inv * &rho;
+    let ojt = &omega_full * jmat.transpose();
+
+    let n_theta = params.theta.len();
+    let n_sigma = sigma.len();
+    let mut fixed = vec![0.0f64; x.len()];
+
+    // θ (fixed η̂).
+    for m in 0..n_theta {
+        let mut qm = DVector::<f64>::zeros(n_obs);
+        let mut em = DMatrix::<f64>::zeros(n_obs, n_st);
+        let mut dvar = 0.0;
+        for j in 0..n_obs {
+            let obs = &sens.obs[j];
+            let mut bjeta = 0.0;
+            for l in 0..n_st {
+                let bjl = obs.d2f_deta_dtheta[l * n_theta + m];
+                em[(j, l)] = bjl;
+                bjeta += bjl * stacked_eta_hat[l];
+            }
+            qm[j] = -obs.df_dtheta[m] + bjeta;
+            let dr0 = d0[j] * sens0.obs[j].df_dtheta[m];
+            dvar += dr0 * (rtilde_inv[(j, j)] - u[j] * u[j]);
+        }
+        let emojt = &em * &ojt;
+        let tr = (&rtilde_inv * &emojt).trace();
+        let uemu = u.dot(&(&emojt * &u));
+        let nat = u.dot(&qm) + tr - uemu + 0.5 * dvar;
+        let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
+            params.theta[m]
+        } else {
+            1.0
+        };
+        fixed[m] = nat * dtheta_dx;
+    }
+
+    // Ω (fixed η̂): per Cholesky entry of Σ_b, BSV direct + K-summed IOV.
+    let l_bsv = &params.omega.chol;
+    let l_iov = &omega_iov.chol;
+    let l_full = block_chol_full(l_bsv, l_iov, k, n_eta_bsv, n_iov);
+    let jl = &jmat * &l_full;
+    let entry_grad = |row: usize, col: usize| -> f64 {
+        let jr = jmat.column(row);
+        let jv = jl.column(col);
+        let rinv_jr = &rtilde_inv * jr;
+        jv.dot(&rinv_jr) - jr.dot(&u) * jv.dot(&u)
+    };
+    let omega_start = n_theta;
+    let bsv_entries = lower_tri_entries(n_eta_bsv, params.omega.diagonal);
+    for (e, &(row, col)) in bsv_entries.iter().enumerate() {
+        let chain = if row == col { l_bsv[(row, row)] } else { 1.0 };
+        fixed[omega_start + e] = entry_grad(row, col) * chain;
+    }
+    let sigma_start = omega_start + bsv_entries.len();
+
+    // σ (fixed η̂).
+    for kk in 0..n_sigma {
+        let hsig = 1e-6 * (1.0 + sigma[kk].abs());
+        let mut sp = sigma.clone();
+        sp[kk] += hsig;
+        let mut sm = sigma.clone();
+        sm[kk] -= hsig;
+        let mut nat = 0.0;
+        for j in 0..n_obs {
+            let cmt = subject.obs_cmts[j];
+            let f0act = sens0.obs[j].f;
+            let dr0 = (model.error_spec.variance_at(cmt, f0act, &sp)
+                - model.error_spec.variance_at(cmt, f0act, &sm))
+                / (2.0 * hsig);
+            nat += 0.5 * dr0 * (rtilde_inv[(j, j)] - u[j] * u[j]);
+        }
+        fixed[sigma_start + kk] = nat * sigma[kk];
+    }
+    let iov_start = sigma_start + n_sigma;
+    let iov_entries = lower_tri_entries(n_iov, omega_iov.diagonal);
+    for (e, &(i, j)) in iov_entries.iter().enumerate() {
+        let mut raw = 0.0;
+        for kk in 0..k {
+            raw += entry_grad(n_eta_bsv + kk * n_iov + i, n_eta_bsv + kk * n_iov + j);
+        }
+        let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
+        fixed[iov_start + e] = raw * chain;
+    }
+
+    // Coupling c = ∂F/∂η̂ over the stacked random effects.
+    let mut coupling = DVector::<f64>::zeros(n_st);
+    for kk in 0..n_st {
+        let mut pk = DVector::<f64>::zeros(n_obs);
+        let mut dk = DMatrix::<f64>::zeros(n_obs, n_st);
+        for j in 0..n_obs {
+            let obs = &sens.obs[j];
+            let mut s = 0.0;
+            for l in 0..n_st {
+                let a_kl = obs.d2f_deta2[kk * n_st + l];
+                s += a_kl * stacked_eta_hat[l];
+                dk[(j, l)] = a_kl;
+            }
+            pk[j] = s;
+        }
+        let dkojt = &dk * &ojt;
+        let tr = (&rtilde_inv * &dkojt).trace();
+        let udku = u.dot(&(&dkojt * &u));
+        coupling[kk] = u.dot(&pk) + tr - udku;
+    }
+
+    let eta_dx = subject_eta_dx_iov(model, subject, template, x, stacked_eta_hat)?;
+    let mut g = vec![0.0f64; x.len()];
+    for kk in 0..x.len() {
+        g[kk] = fixed[kk] + coupling.dot(&eta_dx[kk]);
+    }
+    Some(g)
+}
+
+/// The exact analytic **FOCE** population gradient for an IOV model, packed space.
+/// `eta_hats[i]` are BSV EBEs, `kappas[i]` the per-occasion κ̂; stacked per subject.
+pub fn population_gradient_sens_foce_iov(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Option<Vec<f64>> {
+    let n = x.len();
+    let mut grad = vec![0.0f64; n];
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let mut stacked: Vec<f64> = eta_hats[i].iter().copied().collect();
+        for kap in &kappas[i] {
+            stacked.extend(kap.iter().copied());
+        }
+        let gi = subject_packed_gradient_foce_iov(model, subject, template, x, &stacked)?;
+        for kk in 0..n {
+            grad[kk] += 2.0 * gi[kk];
+        }
+    }
+    let fixed = packed_fixed_mask(template);
+    for kk in 0..n {
+        if fixed[kk] {
+            grad[kk] = 0.0;
+        }
+    }
+    Some(grad)
+}
+
 /// Per-packed-coordinate EBE response `dη̂/dx_k` (each a length-`n_eta` vector),
 /// for the Almquist Eq. 48 warm-start predictor. Same `H⁻¹·∂²lᵢ/∂η∂x` solves the
 /// gradient already forms, chained natural→packed. `None` when unsupported.
@@ -2281,9 +2648,15 @@ mod tests {
         (stacked, eta, kappas, hm)
     }
 
-    /// IOV FOCEI marginal at the analytically-reconverged joint EBE for `params`
-    /// (no inner-solver noise; the BSV H-matrix is the provider's exact Jacobian).
-    fn marginal_nll_iov(model: &CompiledModel, subject: &Subject, params: &ModelParameters) -> f64 {
+    /// IOV marginal at the analytically-reconverged joint EBE for `params` (no
+    /// inner-solver noise; the BSV H-matrix is the provider's exact Jacobian).
+    /// `interaction = true` → FOCEI, `false` → FOCE (Sheiner–Beal).
+    fn marginal_nll_iov_inter(
+        model: &CompiledModel,
+        subject: &Subject,
+        params: &ModelParameters,
+        interaction: bool,
+    ) -> f64 {
         let (_stacked, eta, kappas, hm) = precise_ebe_iov(model, subject, params);
         crate::stats::likelihood::foce_subject_nll_iov(
             model,
@@ -2293,10 +2666,14 @@ mod tests {
             &hm,
             &params.omega,
             &params.sigma.values,
-            true,
+            interaction,
             &kappas,
             params.omega_iov.as_ref().expect("IOV model has omega_iov"),
         )
+    }
+
+    fn marginal_nll_iov(model: &CompiledModel, subject: &Subject, params: &ModelParameters) -> f64 {
+        marginal_nll_iov_inter(model, subject, params, true)
     }
 
     /// The analytic IOV θ-gradient (paper-exact over the stacked η + block-Ω) must
@@ -2377,6 +2754,51 @@ mod tests {
             let fd = (4.0 * f2 - f1) / 3.0; // Richardson
             eprintln!(
                 "iov x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[i],
+                fd,
+                (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+            );
+            approx::assert_relative_eq!(analytic[i], fd, max_relative = 2e-3, epsilon = 2e-5);
+        }
+    }
+
+    /// The full analytic IOV **FOCE** (non-interaction) packed gradient must match
+    /// the Richardson reconverged FD of the production IOV FOCE marginal
+    /// (`foce_subject_nll_iov` with `interaction = false`, the Sheiner–Beal
+    /// linearized objective) over every packed coordinate — the path
+    /// `method = foce` (warfarin_iov's default) actually exercises.
+    #[test]
+    fn iov_packed_gradient_foce_matches_reconverged_fd() {
+        let model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_subject_outer(&model, &theta);
+        let template = params.clone();
+        let x = crate::estimation::parameterization::pack_params(&params);
+
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+        let analytic = subject_packed_gradient_foce_iov(&model, &subject, &template, &x, &stacked)
+            .expect("IOV FOCE packed gradient supported");
+
+        let f = |xx: &[f64]| -> f64 {
+            let p = unpack_params(xx, &template);
+            marginal_nll_iov_inter(&model, &subject, &p, false)
+        };
+        for i in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[i].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[i] += hh;
+                let mut xm = x.clone();
+                xm[i] -= hh;
+                (f(&xp) - f(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            eprintln!(
+                "iov foce x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
                 analytic[i],
                 fd,
                 (analytic[i] - fd).abs() / fd.abs().max(1e-9)

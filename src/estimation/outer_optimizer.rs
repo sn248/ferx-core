@@ -2013,7 +2013,14 @@ fn population_gradient(
                     kappas,
                 )
             } else {
-                None
+                crate::estimation::sens_outer_gradient::population_gradient_sens_foce_iov(
+                    model,
+                    population,
+                    init_params,
+                    x,
+                    ehs,
+                    kappas,
+                )
             }
         } else if options.interaction {
             crate::estimation::sens_outer_gradient::population_gradient_sens(

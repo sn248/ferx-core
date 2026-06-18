@@ -135,13 +135,27 @@ fn prepare(
     params: &ModelParameters,
     sens: &SubjectSens,
 ) -> Option<Prep> {
-    let n_eta = model.n_eta;
+    prepare_stacked(model, subject, params, sens, model.n_eta, params.omega.inv.clone())
+}
+
+/// [`prepare`] generalized over the random-effect dimension and prior precision,
+/// so it serves both the non-IOV path (`n_eta = model.n_eta`, `Ω⁻¹ = params.omega.inv`)
+/// and the **IOV** path, where the random effects are the stacked
+/// `[η_bsv, κ₁..κ_K]` and `omega_inv` is the inverse of the block-diagonal
+/// `Ω_bsv ⊕ K·Ω_iov`. Everything else (error model, σ, censoring) is shared.
+fn prepare_stacked(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    n_eta: usize,
+    omega_inv: DMatrix<f64>,
+) -> Option<Prep> {
     let n_obs = subject.observations.len();
     if sens.obs.len() != n_obs {
         return None;
     }
     let sigma = &params.sigma.values;
-    let omega_inv = params.omega.inv.clone();
 
     // H̃ = Σ pⱼ aⱼaⱼᵀ + Ω⁻¹ ; true inner Hessian H = ½Σ(α'ⱼ aⱼaⱼᵀ + αⱼ Aⱼ) + Ω⁻¹.
     let mut htilde = omega_inv.clone();
@@ -279,6 +293,39 @@ fn theta_block(prep: &Prep, sens: &SubjectSens, n_theta: usize) -> Vec<f64> {
         grad[m] = g + 0.5 * resp;
     }
     grad
+}
+
+/// The exact per-subject θ-gradient for an analytical **IOV** subject, evaluated
+/// over the stacked random-effects vector `[η_bsv, κ₁..κ_K]` with the
+/// block-diagonal prior `Ω = Ω_bsv ⊕ K·Ω_iov`. `None` outside the IOV-analytical
+/// scope (caller falls back). `stacked_eta_hat` must be the joint EBE for `params`
+/// (the gradient identity holds at the inner optimum).
+///
+/// The IOV FOCEI marginal (`foce_subject_nll_iov`) is exactly the ordinary FOCEI
+/// Laplace objective over the augmented system `b = [η, κ]` with prior `Σ_b`, so
+/// the same paper-exact assembly applies — only `n_eta` and `Ω⁻¹` change.
+pub fn subject_theta_gradient_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    stacked_eta_hat: &[f64],
+) -> Option<Vec<f64>> {
+    let sens =
+        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, stacked_eta_hat)?;
+    let k_groups = crate::stats::likelihood::split_obs_by_occasion(subject).len();
+    let n_stacked = model.n_eta + k_groups * model.n_kappa;
+    if stacked_eta_hat.len() != n_stacked {
+        return None;
+    }
+    let omega_iov = params.omega_iov.as_ref()?;
+    let block = crate::stats::likelihood::build_block_diag_omega(
+        &params.omega.matrix,
+        &omega_iov.matrix,
+        k_groups,
+    );
+    let omega_inv = block.cholesky()?.inverse();
+    let prep = prepare_stacked(model, subject, params, &sens, n_stacked, omega_inv)?;
+    Some(theta_block(&prep, &sens, params.theta.len()))
 }
 
 /// The exact per-subject Ω-gradient `dFᵢ/dΩ` over the free Ω entries, in the
@@ -1917,6 +1964,213 @@ mod tests {
                 );
             }
             prev_ratio = Some(ratio);
+        }
+    }
+
+    // --- IOV: analytic θ-gradient over the stacked (η_bsv, κ) with block-Ω ---
+
+    const WARFARIN_IOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// Two-occasion IOV subject (no washout — carryover spans the boundary), with
+    /// observations synthesised from the model at a reference (η, κ) so residuals
+    /// are realistic.
+    fn iov_subject_outer(model: &CompiledModel, theta: &[f64]) -> Subject {
+        let obs_times = vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0];
+        let occasions = vec![1u32, 1, 1, 2, 2, 2];
+        let n = obs_times.len();
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions,
+            dose_occasions: vec![1, 2],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        // Reference (η_bsv, κ_g0, κ_g1) → realistic ε ≠ 0.
+        let preds = crate::pk::predict_iov(
+            model,
+            &subject,
+            theta,
+            &[0.12, -0.08, 0.2],
+            &[vec![0.05], vec![-0.07]],
+        );
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        subject
+    }
+
+    /// Precisely locate the joint IOV EBE by analytic Newton on the stacked inner
+    /// objective (exact gradient ½Σαⱼaⱼ + Ω_block⁻¹b and true Hessian from the IOV
+    /// provider), so the marginal FD is not contaminated by inner-solver
+    /// reconvergence noise — the IOV analog of [`precise_ebe`]. Returns the stacked
+    /// `b̂`, plus the `(η̂, κ̂, BSV H-matrix)` form `foce_subject_nll_iov` consumes
+    /// (H-matrix = the provider's exact `∂f/∂η_bsv`).
+    fn precise_ebe_iov(
+        model: &CompiledModel,
+        subject: &Subject,
+        params: &ModelParameters,
+    ) -> (Vec<f64>, DVector<f64>, Vec<DVector<f64>>, DMatrix<f64>) {
+        let k = crate::stats::likelihood::split_obs_by_occasion(subject).len();
+        let n_eta = model.n_eta;
+        let n_kappa = model.n_kappa;
+        let n_st = n_eta + k * n_kappa;
+        let warm = find_ebe(model, subject, params, 80, 1e-10, None, None);
+        let mut stacked = vec![0.0; n_st];
+        for i in 0..n_eta {
+            stacked[i] = warm.eta[i];
+        }
+        for (g, kap) in warm.kappas.iter().enumerate() {
+            for ki in 0..n_kappa {
+                stacked[n_eta + g * n_kappa + ki] = kap[ki];
+            }
+        }
+        let block = crate::stats::likelihood::build_block_diag_omega(
+            &params.omega.matrix,
+            &params.omega_iov.as_ref().unwrap().matrix,
+            k,
+        );
+        let omega_inv = block.cholesky().unwrap().inverse();
+        let sigma = &params.sigma.values;
+        for _ in 0..50 {
+            let sens =
+                crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, &stacked)
+                    .unwrap();
+            let mut g = &omega_inv * DVector::from_column_slice(&stacked);
+            let mut h = omega_inv.clone();
+            for (j, obs) in sens.obs.iter().enumerate() {
+                let cmt = subject.obs_cmts[j];
+                let f = obs.f;
+                let r = model.error_spec.variance_at(cmt, f, sigma);
+                let d = model.error_spec.dvar_df(cmt, f, sigma);
+                let d2 = model.error_spec.d2var_df2(cmt, sigma);
+                let t = err_terms(r, d, d2, subject.observations[j] - f);
+                let a = &obs.df_deta;
+                for kk in 0..n_st {
+                    g[kk] += 0.5 * t.alpha * a[kk];
+                    for ll in 0..n_st {
+                        h[(kk, ll)] +=
+                            0.5 * (t.alpha_p * a[kk] * a[ll] + t.alpha * obs.d2f_deta2[kk * n_st + ll]);
+                    }
+                }
+            }
+            let step = h.cholesky().unwrap().solve(&g);
+            for kk in 0..n_st {
+                stacked[kk] -= step[kk];
+            }
+            if step.norm() < 1e-13 {
+                break;
+            }
+        }
+        let eta = DVector::from_column_slice(&stacked[..n_eta]);
+        let kappas: Vec<DVector<f64>> = (0..k)
+            .map(|gi| {
+                DVector::from_column_slice(&stacked[n_eta + gi * n_kappa..n_eta + (gi + 1) * n_kappa])
+            })
+            .collect();
+        let sens =
+            crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, &stacked)
+                .unwrap();
+        let n_obs = subject.obs_times.len();
+        let mut hm = DMatrix::zeros(n_obs, n_eta);
+        for j in 0..n_obs {
+            for c in 0..n_eta {
+                hm[(j, c)] = sens.obs[j].df_deta[c];
+            }
+        }
+        (stacked, eta, kappas, hm)
+    }
+
+    /// IOV FOCEI marginal at the analytically-reconverged joint EBE for `params`
+    /// (no inner-solver noise; the BSV H-matrix is the provider's exact Jacobian).
+    fn marginal_nll_iov(model: &CompiledModel, subject: &Subject, params: &ModelParameters) -> f64 {
+        let (_stacked, eta, kappas, hm) = precise_ebe_iov(model, subject, params);
+        crate::stats::likelihood::foce_subject_nll_iov(
+            model,
+            subject,
+            &params.theta,
+            &eta,
+            &hm,
+            &params.omega,
+            &params.sigma.values,
+            true,
+            &kappas,
+            params.omega_iov.as_ref().expect("IOV model has omega_iov"),
+        )
+    }
+
+    /// The analytic IOV θ-gradient (paper-exact over the stacked η + block-Ω) must
+    /// match the Richardson-extrapolated reconverged FD of the production IOV FOCEI
+    /// marginal `foce_subject_nll_iov` — the same objective validated against NONMEM
+    /// (`tests/warfarin_iov_nonmem.rs`, ferx ≈308.2 vs NONMEM 308.83). This closes
+    /// the IOV outer-gradient θ block end-to-end against a NONMEM-grounded target.
+    #[test]
+    fn iov_theta_gradient_matches_reconverged_fd() {
+        let model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_subject_outer(&model, &theta);
+
+        // Joint EBE [η_bsv (3), κ_g0 (1), κ_g1 (1)], analytically reconverged.
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+
+        let analytic = subject_theta_gradient_iov(&model, &subject, &params, &stacked)
+            .expect("IOV θ-gradient supported");
+
+        let fd_at = |m: usize, h: f64| -> f64 {
+            let mut pp = params.clone();
+            pp.theta[m] += h;
+            let mut pm = params.clone();
+            pm.theta[m] -= h;
+            (marginal_nll_iov(&model, &subject, &pp) - marginal_nll_iov(&model, &subject, &pm))
+                / (2.0 * h)
+        };
+        for m in 0..theta.len() {
+            let h = 1e-4 * (1.0 + theta[m].abs());
+            let f1 = fd_at(m, h);
+            let f2 = fd_at(m, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "iov theta[{m}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[m],
+                fd,
+                (analytic[m] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic[m], fd, max_relative = 3e-3, epsilon = 1e-5);
         }
     }
 }

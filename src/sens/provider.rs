@@ -326,6 +326,407 @@ fn lognormal_param_derivatives(
     }
 }
 
+// ─── IOV (inter-occasion variability) analytic sensitivities ──────────
+//
+// IOV makes the PK parameters switch mid-decay at occasion boundaries (NONMEM
+// #104): a dose given in occasion 1 decays with occasion-1 params until the
+// boundary, then the carried-over amount continues with occasion-2 params. Dose
+// superposition with a single per-subject `pk` (the `subject_sensitivities` path)
+// cannot represent that, so IOV runs through the **event-driven sensitivity
+// walk** (`crate::sens::propagate::event_driven_sens_one_cpt_g`) instead — the
+// same engine production's `predict_iov` uses for the f64 prediction, here over
+// `Dual2`.
+//
+// The inner/outer "η" for an IOV subject is the **stacked** random-effects vector
+//   `[η_bsv (n_eta) , κ_group0 (n_kappa) , κ_group1 , … , κ_group(K−1)]`
+// with `K = split_obs_by_occasion(subject).len()`. The returned [`SubjectSens`]
+// is over that stacked vector (plus the usual θ block), so the caller's block-Ω
+// (BSV ⊕ K·IOV) assembly consumes it directly.
+
+/// Per-occasion individual-parameter derivatives in the **combined** layout
+/// `(θ, η_bsv, κ)` — the program's native axes for an IOV model
+/// (`n_eff = n_eta_bsv + n_kappa`). One of these is built per occasion group from
+/// that group's combined effect vector; the chain then scatters its η_bsv columns
+/// to the shared BSV block and its κ columns to the group's own κ block.
+struct CombinedDerivs {
+    /// `∂p_i/∂(η_bsv, κ)`, row-major `n_rows × n_eff`.
+    deta: Vec<Vec<f64>>,
+    /// `∂p_i/∂θ_m`, `n_rows × n_theta`.
+    dtheta: Vec<Vec<f64>>,
+    /// `∂²p_i/∂(η_bsv,κ)²`, `n_rows × n_eff × n_eff`.
+    d2eta: Vec<Vec<Vec<f64>>>,
+    /// `∂²p_i/∂(η_bsv,κ)∂θ`, `n_rows × n_eff × n_theta`.
+    d2eta_theta: Vec<Vec<Vec<f64>>>,
+}
+
+/// Evaluate the compiled `[individual_parameters]` program over `Dual2<MP>` seeded
+/// on `(θ, combined)` (`combined = [η_bsv, κ]`, `MP = n_theta + n_eff`) and pack
+/// the per-row derivatives in the combined layout.
+fn iov_combined_derivs<const MP: usize>(
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    n_theta: usize,
+    n_eff: usize,
+    n_rows: usize,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    combined: &[f64],
+) -> CombinedDerivs {
+    let p = prog.eval_param_duals::<MP>(theta, combined, cov);
+    let mut deta = vec![vec![0.0; n_eff]; n_rows];
+    let mut dtheta = vec![vec![0.0; n_theta]; n_rows];
+    let mut d2eta = vec![vec![vec![0.0; n_eff]; n_eff]; n_rows];
+    let mut d2eta_theta = vec![vec![vec![0.0; n_theta]; n_eff]; n_rows];
+    for i in 0..n_rows {
+        let g = &p[i].grad;
+        let h = &p[i].hess;
+        for m in 0..n_theta {
+            dtheta[i][m] = g[m];
+        }
+        for a in 0..n_eff {
+            deta[i][a] = g[n_theta + a];
+            for b in 0..n_eff {
+                d2eta[i][a][b] = h[n_theta + a][n_theta + b];
+            }
+            for m in 0..n_theta {
+                d2eta_theta[i][a][m] = h[n_theta + a][m];
+            }
+        }
+    }
+    CombinedDerivs {
+        deta,
+        dtheta,
+        d2eta,
+        d2eta_theta,
+    }
+}
+
+/// Per PK-axis chain info for one occasion group's seeded PK parameter: how that
+/// parameter's value moves the **stacked** random-effects vector and θ. Built once
+/// per (group, differentiated-PK-row); the per-observation chain reads these.
+struct AxisChain {
+    /// `∂p/∂stacked_η`, length `n_stacked`.
+    dstacked: Vec<f64>,
+    /// `∂p/∂θ_m`, length `n_theta`.
+    dtheta: Vec<f64>,
+    /// `∂²p/∂stacked_η²`, `n_stacked × n_stacked` (sparse: only this group's
+    /// {η_bsv, κ} support is non-zero).
+    d2stacked: Vec<Vec<f64>>,
+    /// `∂²p/∂stacked_η∂θ`, `n_stacked × n_theta`.
+    d2stacked_theta: Vec<Vec<f64>>,
+}
+
+/// True when [`subject_sensitivities_iov`] can serve this model: analytical 1-cpt
+/// IOV (`n_kappa > 0`), no ODE, no scaling/LTBS/lagtime/TV-cov, a usable
+/// `[individual_parameters]` program whose axes are `(n_theta, n_eta_bsv+n_kappa)`.
+/// Narrowly scoped on purpose — anything outside falls back to the gradient-free
+/// path (matching the rest of the provider's gating).
+pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
+    if model.n_kappa == 0 || model.ode_spec.is_some() {
+        return false;
+    }
+    if !matches!(model.pk_model, PkModel::OneCptIv | PkModel::OneCptOral) {
+        return false;
+    }
+    if !matches!(model.scaling, ScalingSpec::None) || model.log_transform || model.has_lagtime() {
+        return false;
+    }
+    let n_eff = model.n_eta + model.n_kappa;
+    match model.indiv_param_partials.indiv_param_program.as_ref() {
+        Some(prog) => {
+            prog.pk_slots().len() == model.pk_indices.len()
+                && prog.n_theta_axis() == model.n_theta
+                && prog.n_eta_axis() == n_eff
+                && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
+        }
+        None => false,
+    }
+}
+
+/// Exact analytic sensitivities for an analytical 1-cpt **IOV** subject, over the
+/// stacked random-effects vector `[η_bsv, κ_group0, …, κ_group(K−1)]` (plus the θ
+/// block). Returns `None` outside the supported scope (caller falls back).
+///
+/// `stacked_eta` must have length `n_eta_bsv + K·n_kappa`. Each occasion group's
+/// PK parameters are seeded on their own `Dual2` axis block; the event-driven walk
+/// carries the dual amounts across occasion boundaries (exact carryover), and the
+/// `run_obs`-style two-level chain maps `∂conc/∂pk` back to the stacked η and θ
+/// through each group's [`CombinedDerivs`].
+pub fn subject_sensitivities_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<SubjectSens> {
+    if !iov_analytical_supported(model) || subject.has_tv_covariates() || subject.has_resets() {
+        return None;
+    }
+    // Keep the first cut to the clean shape: no EVID=2 rows, every dose/obs in a
+    // real occasion group. Anything else falls back.
+    if !subject.pk_only_times.is_empty() {
+        return None;
+    }
+
+    let n_eta = model.n_eta; // BSV
+    let n_kappa = model.n_kappa;
+    let n_theta = model.n_theta;
+    let n_eff = n_eta + n_kappa;
+    let oral = matches!(model.pk_model, PkModel::OneCptOral);
+
+    let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
+    let k_groups = occ_groups.len();
+    if k_groups == 0 {
+        return None;
+    }
+    let n_stacked = n_eta + k_groups * n_kappa;
+    if stacked_eta.len() != n_stacked {
+        return None;
+    }
+    let mut occ_to_k: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::with_capacity(k_groups);
+    for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
+        occ_to_k.insert(*occ_id, k);
+    }
+    // Combined effect vector for group `k`: `[η_bsv, κ_k]`.
+    let eta_bsv = &stacked_eta[..n_eta];
+    let combined_for = |k: usize| -> Vec<f64> {
+        let mut c = Vec::with_capacity(n_eff);
+        c.extend_from_slice(eta_bsv);
+        let base = n_eta + k * n_kappa;
+        c.extend_from_slice(&stacked_eta[base..base + n_kappa]);
+        c
+    };
+
+    let prog = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("iov_analytical_supported guarantees the program");
+    let slots = prog.pk_slots();
+    let n_diff = slots.len();
+    // PK slot → differentiated-row index (for seeding the dual axis).
+    let mut slot_row: [Option<usize>; N_PK] = [None; N_PK];
+    for (i, &s) in slots.iter().enumerate() {
+        if s < N_PK {
+            slot_row[s] = Some(i);
+        }
+    }
+
+    // Per-group: pk values + combined derivatives (evaluated once per group).
+    let cov = &subject.covariates;
+    let mp = n_theta + n_eff;
+    let mut group_pk: Vec<crate::types::PkParams> = Vec::with_capacity(k_groups);
+    let mut group_cd: Vec<CombinedDerivs> = Vec::with_capacity(k_groups);
+    for k in 0..k_groups {
+        let combined = combined_for(k);
+        let pk = (model.pk_param_fn)(theta, &combined, cov);
+        let cd = match mp {
+            1 => iov_combined_derivs::<1>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            2 => iov_combined_derivs::<2>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            3 => iov_combined_derivs::<3>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            4 => iov_combined_derivs::<4>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            5 => iov_combined_derivs::<5>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            6 => iov_combined_derivs::<6>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            7 => iov_combined_derivs::<7>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            8 => iov_combined_derivs::<8>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            9 => iov_combined_derivs::<9>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            10 => iov_combined_derivs::<10>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            11 => iov_combined_derivs::<11>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            12 => iov_combined_derivs::<12>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            13 => iov_combined_derivs::<13>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            14 => iov_combined_derivs::<14>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            15 => iov_combined_derivs::<15>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            16 => iov_combined_derivs::<16>(prog, n_theta, n_eff, n_diff, cov, theta, &combined),
+            _ => return None,
+        };
+        group_pk.push(pk);
+        group_cd.push(cd);
+    }
+
+    // Per PK-axis chain info: axis `a = g·n_diff + i` ↔ group `g`, differentiated
+    // row `i` (PK slot `slots[i]`). Map the combined-layout derivatives to the
+    // stacked η layout: η_bsv columns → shared `0..n_eta`; κ columns → group g's
+    // block `n_eta + g·n_kappa ..`.
+    let n_axes = k_groups * n_diff;
+    let mut axis: Vec<AxisChain> = Vec::with_capacity(n_axes);
+    for g in 0..k_groups {
+        let cd = &group_cd[g];
+        let kappa_base = n_eta + g * n_kappa;
+        // Combined index `c` → stacked index.
+        let stacked_of = |c: usize| -> usize {
+            if c < n_eta {
+                c
+            } else {
+                kappa_base + (c - n_eta)
+            }
+        };
+        for i in 0..n_diff {
+            let mut dstacked = vec![0.0; n_stacked];
+            let mut d2stacked = vec![vec![0.0; n_stacked]; n_stacked];
+            let mut d2stacked_theta = vec![vec![0.0; n_theta]; n_stacked];
+            for a in 0..n_eff {
+                dstacked[stacked_of(a)] = cd.deta[i][a];
+                for b in 0..n_eff {
+                    d2stacked[stacked_of(a)][stacked_of(b)] = cd.d2eta[i][a][b];
+                }
+                for m in 0..n_theta {
+                    d2stacked_theta[stacked_of(a)][m] = cd.d2eta_theta[i][a][m];
+                }
+            }
+            axis.push(AxisChain {
+                dstacked,
+                dtheta: cd.dtheta[i].clone(),
+                d2stacked,
+                d2stacked_theta,
+            });
+        }
+    }
+
+    // Build per-event seeded dual PK params and run the walk, dispatched on the
+    // total PK-axis count `n_axes = K·n_diff`.
+    macro_rules! disp {
+        ($($n:literal),+) => {
+            match n_axes {
+                $($n => run_obs_iov::<$n>(
+                    model, subject, oral, &occ_to_k, &group_pk, &slot_row, n_diff,
+                    &axis, n_stacked, n_theta,
+                ),)+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
+}
+
+/// The dual-width-`N` inner of [`subject_sensitivities_iov`]: seed each occasion
+/// group's PK params on its axis block, run the event-driven sensitivity walk, and
+/// chain `∂conc/∂pk` (walk grad/Hess over the `N` PK axes) to the stacked η and θ
+/// via the precomputed [`AxisChain`] table — the `run_obs` two-level formula.
+#[allow(clippy::too_many_arguments)]
+fn run_obs_iov<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    oral: bool,
+    occ_to_k: &std::collections::HashMap<u32, usize>,
+    group_pk: &[crate::types::PkParams],
+    slot_row: &[Option<usize>; N_PK],
+    n_diff: usize,
+    axis: &[AxisChain],
+    n_stacked: usize,
+    n_theta: usize,
+) -> Option<SubjectSens> {
+    use crate::pk::event_driven::EventSchedule;
+    use crate::sens::propagate::{event_driven_sens_one_cpt_g, OneCptPk};
+
+    // Seed PK slot `s` (value from group `g`'s pk) on axis `g·n_diff + row(s)`.
+    let mk = |g: usize| -> OneCptPk<Dual2<N>> {
+        let pk = &group_pk[g];
+        let base = g * n_diff;
+        let dv = |slot: usize, val: f64| -> Dual2<N> {
+            match slot_row[slot] {
+                Some(i) => Dual2::<N>::var(val, base + i),
+                None => Dual2::<N>::constant(val),
+            }
+        };
+        OneCptPk {
+            cl: dv(PK_IDX_CL, pk.cl()),
+            v: dv(PK_IDX_V, pk.v()),
+            ka: dv(PK_IDX_KA, pk.ka()),
+            f: dv(PK_IDX_F, pk.f_bio()),
+        }
+    };
+
+    // Per-event params: doses by dose-occasion, observations by obs-occasion. A
+    // dose/obs whose occasion has no group makes the whole subject fall back
+    // (keeps the first-cut scope to the clean, fully-grouped shape).
+    let mut pk_at_dose: Vec<OneCptPk<Dual2<N>>> = Vec::with_capacity(subject.doses.len());
+    for d in 0..subject.doses.len() {
+        let occ = subject.dose_occasions.get(d).copied()?;
+        let g = *occ_to_k.get(&occ)?;
+        pk_at_dose.push(mk(g));
+    }
+    let mut pk_at_obs: Vec<OneCptPk<Dual2<N>>> = Vec::with_capacity(subject.obs_times.len());
+    for j in 0..subject.obs_times.len() {
+        let occ = subject.occasions.get(j).copied()?;
+        let g = *occ_to_k.get(&occ)?;
+        pk_at_obs.push(mk(g));
+    }
+
+    // No lagtime in IOV scope → zero dose lagtimes.
+    let dose_lagtimes = vec![0.0; subject.doses.len()];
+    let schedule = EventSchedule::for_subject(subject, model.pk_model, &dose_lagtimes);
+    let conc = event_driven_sens_one_cpt_g::<Dual2<N>>(
+        oral,
+        subject,
+        &schedule,
+        &pk_at_dose,
+        &pk_at_obs,
+        &[],
+    );
+
+    let n_axes = N;
+    let mut obs_out = Vec::with_capacity(conc.len());
+    for c in &conc {
+        // Clamp parity with production `conc.max(0.0)`.
+        let (g, h) = if c.value < 0.0 {
+            ([0.0; N], [[0.0; N]; N])
+        } else {
+            (c.grad, c.hess)
+        };
+
+        let mut df_deta = vec![0.0; n_stacked];
+        let mut df_dtheta = vec![0.0; n_theta];
+        let mut d2f_deta2 = vec![0.0; n_stacked * n_stacked];
+        let mut d2f_deta_dtheta = vec![0.0; n_stacked * n_theta];
+
+        for a in 0..n_axes {
+            let ga = g[a];
+            let ax = &axis[a];
+            for p in 0..n_stacked {
+                df_deta[p] += ga * ax.dstacked[p];
+            }
+            for m in 0..n_theta {
+                df_dtheta[m] += ga * ax.dtheta[m];
+            }
+        }
+        for p in 0..n_stacked {
+            for q in 0..n_stacked {
+                let mut acc = 0.0;
+                for a in 0..n_axes {
+                    let dap = axis[a].dstacked[p];
+                    for b in 0..n_axes {
+                        acc += h[a][b] * dap * axis[b].dstacked[q];
+                    }
+                    acc += g[a] * axis[a].d2stacked[p][q];
+                }
+                d2f_deta2[p * n_stacked + q] = acc;
+            }
+        }
+        for p in 0..n_stacked {
+            for m in 0..n_theta {
+                let mut acc = 0.0;
+                for a in 0..n_axes {
+                    let dap = axis[a].dstacked[p];
+                    for b in 0..n_axes {
+                        acc += h[a][b] * dap * axis[b].dtheta[m];
+                    }
+                    acc += g[a] * axis[a].d2stacked_theta[p][m];
+                }
+                d2f_deta_dtheta[p * n_theta + m] = acc;
+            }
+        }
+
+        let fval = if c.value < 0.0 { 0.0 } else { c.value };
+        obs_out.push(ObsSens {
+            f: fval,
+            df_deta,
+            d2f_deta2,
+            df_dtheta,
+            d2f_deta_dtheta,
+        });
+    }
+    Some(SubjectSens { obs: obs_out })
+}
+
 /// Accumulated `subject_sensitivities` call count and wall-time across a fit,
 /// for `FERX_PROFILE=1` (printed by the CLI via [`profile_report`]). No overhead
 /// when off (the `Instant` is only taken when profiling is enabled).
@@ -2307,5 +2708,163 @@ mod tests {
         );
         let subject = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
         check_full_provider_vs_fd(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
+    }
+
+    // ── IOV analytic sensitivities ───────────────────────────────────
+
+    const WARFARIN_IOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// Two-occasion IOV subject: a dose + observations in occasion 1, then a dose +
+    /// observations in occasion 2 (no washout — carryover spans the boundary).
+    fn iov_subject() -> Subject {
+        let obs_times = vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0];
+        let occasions = vec![1u32, 1, 1, 2, 2, 2];
+        let n = obs_times.len();
+        Subject {
+            id: "1".to_string(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions,
+            dose_occasions: vec![1, 2],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    /// The IOV provider's exact sensitivities over the stacked random-effects
+    /// vector `[η_bsv, κ_g0, κ_g1]` (and the θ block) must match central finite
+    /// differences of the production IOV predictor `predict_iov` — an independent
+    /// f64 path (no dual code), so this validates the whole walk + (η,κ,θ) chain.
+    #[test]
+    fn iov_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        assert_eq!(model.n_kappa, 1, "model must carry one kappa");
+        assert!(
+            iov_analytical_supported(&model),
+            "warfarin IOV must be IOV-provider supported"
+        );
+        let subject = iov_subject();
+        let theta = vec![0.2, 10.0, 1.5];
+        let n_eta = model.n_eta; // 3
+        let n_theta = theta.len();
+        // K = 2 occasion groups; stacked = [η_cl, η_v, η_ka, κ_g0, κ_g1].
+        let stacked = vec![0.12, -0.08, 0.20, 0.05, -0.10];
+
+        let sens = subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("supported");
+
+        // Map a stacked-η vector to predict_iov's (η_bsv, kappas-per-group) form.
+        let pred = |st: &[f64], th: &[f64], j: usize| -> f64 {
+            let eta_bsv = st[..n_eta].to_vec();
+            let kappas: Vec<Vec<f64>> = vec![vec![st[n_eta]], vec![st[n_eta + 1]]];
+            crate::pk::predict_iov(&model, &subject, th, &eta_bsv, &kappas)[j]
+        };
+
+        let n_st = stacked.len();
+        let he = 1e-6;
+        let heh = 1e-4;
+        for (j, obs) in sens.obs.iter().enumerate() {
+            approx::assert_relative_eq!(
+                obs.f,
+                pred(&stacked, &theta, j),
+                max_relative = 1e-9,
+                epsilon = 1e-12
+            );
+            // ∂f/∂stacked and ∂²f/∂stacked².
+            for k in 0..n_st {
+                let mut sp = stacked.clone();
+                sp[k] += he;
+                let mut sm = stacked.clone();
+                sm[k] -= he;
+                let g = (pred(&sp, &theta, j) - pred(&sm, &theta, j)) / (2.0 * he);
+                approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 2e-4, epsilon = 1e-7);
+                for l in 0..n_st {
+                    let mut pp = stacked.clone();
+                    pp[k] += heh;
+                    pp[l] += heh;
+                    let mut pm = stacked.clone();
+                    pm[k] += heh;
+                    pm[l] -= heh;
+                    let mut mp = stacked.clone();
+                    mp[k] -= heh;
+                    mp[l] += heh;
+                    let mut mm = stacked.clone();
+                    mm[k] -= heh;
+                    mm[l] -= heh;
+                    let hh = (pred(&pp, &theta, j) - pred(&pm, &theta, j) - pred(&mp, &theta, j)
+                        + pred(&mm, &theta, j))
+                        / (4.0 * heh * heh);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta2[k * n_st + l],
+                        hh,
+                        max_relative = 3e-3,
+                        epsilon = 1e-5
+                    );
+                }
+            }
+            // ∂f/∂θ and ∂²f/∂stacked∂θ.
+            for m in 0..n_theta {
+                let s = he * (1.0 + theta[m].abs());
+                let mut tp = theta.clone();
+                tp[m] += s;
+                let mut tm = theta.clone();
+                tm[m] -= s;
+                let g = (pred(&stacked, &tp, j) - pred(&stacked, &tm, j)) / (2.0 * s);
+                approx::assert_relative_eq!(obs.df_dtheta[m], g, max_relative = 2e-4, epsilon = 1e-7);
+                for k in 0..n_st {
+                    let sh = heh * (1.0 + theta[m].abs());
+                    let mut ep = stacked.clone();
+                    ep[k] += heh;
+                    let mut em = stacked.clone();
+                    em[k] -= heh;
+                    let mut tp2 = theta.clone();
+                    tp2[m] += sh;
+                    let mut tm2 = theta.clone();
+                    tm2[m] -= sh;
+                    let hh = (pred(&ep, &tp2, j) - pred(&ep, &tm2, j) - pred(&em, &tp2, j)
+                        + pred(&em, &tm2, j))
+                        / (4.0 * heh * sh);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta_dtheta[k * n_theta + m],
+                        hh,
+                        max_relative = 3e-3,
+                        epsilon = 1e-5
+                    );
+                }
+            }
+        }
     }
 }

@@ -1140,11 +1140,6 @@ impl PkModel {
     /// Whether this is a first-order-absorption (oral) model. Oral models read
     /// `ka`; IV models do not. (`f` is read by every model since #327 — it scales
     /// IV bolus/infusion doses too.) The canonical home for this predicate.
-    ///
-    /// The `#[cfg(feature = "autodiff")]` free fn `is_oral_model` in
-    /// `estimation/inner_optimizer.rs` is a pre-existing identical copy; it should
-    /// delegate here, but that path isn't compiled in the default/CI build, so the
-    /// change can't be verified yet — fold it in when autodiff runs in CI (#281).
     pub(crate) fn is_oral(&self) -> bool {
         matches!(
             self,

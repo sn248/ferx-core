@@ -7,174 +7,28 @@ use nalgebra::{DMatrix, DVector};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(feature = "autodiff")]
-use crate::ad::ad_gradients::{self, FlatDoseData};
-
-/// Materialise the per-observation `obs_scale` array for one subject,
-/// suitable for passing to the analytical AD entry points
-/// (`individual_nll_ad`, `predict_all_ad`) as a `Const` slice.
+/// The inner-loop η-gradient route resolved for a subject. Reported in the
+/// startup banner ([`gradient_route_summary`]) and used by [`find_ebe`].
 ///
-/// Computes pk once per call only when `model.scaling.needs_pk_eval()`
-/// — i.e. there's at least one `ExpressionScale` closure (top level or
-/// nested in `PerCmt`) that consults pk. Scalar-only scaling skips the
-/// pk_param_fn call (which can be expensive on models with parsed
-/// expressions or NN forward passes). (Caught by Copilot review on PR
-/// #85.)
-#[cfg(feature = "autodiff")]
-pub(crate) fn build_scale_array_for_ad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-) -> Vec<f64> {
-    let pk_owned;
-    let pk_ref: &PkParams = if model.scaling.needs_pk_eval() {
-        pk_owned = (model.pk_param_fn)(theta, eta, &subject.covariates);
-        &pk_owned
-    } else {
-        // Safe placeholder: no ExpressionScale closure will fire when
-        // needs_pk_eval() is false, so pk values are never read.
-        static DEFAULT_PK: PkParams = PkParams {
-            values: [0.0; crate::types::MAX_PK_PARAMS],
-        };
-        &DEFAULT_PK
-    };
-    model
-        .scaling
-        .build_obs_scale_array(theta, eta, &subject.covariates, pk_ref, &subject.obs_cmts)
-}
-
-/// Build a per-event scale array for the event-driven AD entry points
-/// (`individual_nll_event_driven_ad`, `predict_all_event_driven_ad`).
-///
-/// Length = `event_data.event_times.len()`. Obs events (`event_kinds[i]`
-/// in (0.5, 1.5)) get the corresponding per-observation scale; non-obs
-/// events (dose, pk-only) get `1.0`. Padding non-obs entries to `1.0` is
-/// essential — the AD body divides `conc / obs_scale[ev_idx]` for every
-/// event before the `is_obs` mask drops the non-obs contributions, and
-/// NaN/0 in a non-obs slot would propagate through the masked add as NaN
-/// (per IEEE 754 `0 * NaN = NaN`).
-#[cfg(feature = "autodiff")]
-pub(crate) fn build_event_scale_array_for_ad(
-    model: &CompiledModel,
-    subject: &Subject,
-    event_data: &crate::ad::event_driven_ad::FlatEventData,
-    theta: &[f64],
-    eta: &[f64],
-) -> Vec<f64> {
-    let obs_scales = build_scale_array_for_ad(model, subject, theta, eta);
-    let n_events = event_data.event_times.len();
-    let mut event_scales = vec![1.0; n_events];
-    for ev_idx in 0..n_events {
-        // event_kinds: 0 = dose, 1 = obs, 2 = pk-only. Only obs entries
-        // route to the per-observation scale; everything else stays 1.0.
-        let kind = event_data.event_kinds[ev_idx];
-        if kind > 0.5 && kind < 1.5 {
-            let obs_idx = event_data.event_orig_idx_f64[ev_idx] as usize;
-            if let Some(&s) = obs_scales.get(obs_idx) {
-                event_scales[ev_idx] = s;
-            }
-        }
-    }
-    event_scales
-}
-
-/// Resolve [`GradientMethod::Auto`] to a concrete AD/FD choice for this model.
-/// Returns `true` for AD, `false` for FD.
-///
-/// Policy (`Auto` case): prefer AD whenever it is available. Empirically
-/// (`FERX_TIME_GRADIENTS=1` on 1-cpt oral, 2-cpt infusion, 3-cpt infusion)
-/// reverse-mode AD is 1.5-5x faster per BFGS gradient call than central FD
-/// across the tested range of models — the tape/backward overhead is
-/// dominated by the savings from one gradient call vs `2·n_eta` forward
-/// perturbations, even at small `n_eta`.
-///
-/// AD requires (a) the crate compiled with `feature = "autodiff"` and
-/// (b) the model to have `tv_fn` populated (analytical PK path only).
-/// ODE models have no AD path, so `Auto` resolves to FD there.
-///
-/// For subjects with time-varying covariates *or* system resets (EVID=3/4),
-/// the *event-driven* AD path is used when the structural model is in
-/// [`crate::ad::event_driven_ad::supports_event_driven_ad`] (all six
-/// analytical PK models). Lagtime is handled there too (a Const per-dose lag
-/// baked into the event timeline). Models outside that set fall back to FD —
-/// the single-snapshot AD path can't honour per-event covariate values or
-/// resets.
+/// The Enzyme AD path was retired; the two live routes are the exact analytic
+/// `Dual2` η-gradient ([`analytic_eta_nll_gradient`]) and central finite
+/// differences. The choice is [`analytic_inner_grad_supported`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InnerGradientMethod {
-    /// Finite differences. Used when AD is unavailable/disabled, when the
-    /// model has no `tv_fn`, on a structural model the event-driven AD path
-    /// doesn't support (`supports_event_driven_ad` == false, e.g. ODE models),
-    /// or when AD would be inconsistent with the analytical objective:
-    /// SS doses, an oral model with a zero-order (infusion) dose (the AD oral
-    /// propagators are bolus-only), or eta-dependent lagtime (the AD paths
-    /// freeze lag w.r.t. eta).
+    /// Exact analytic η-gradient from the `Dual2` sensitivity provider — one
+    /// provider evaluation per inner step (vs FD's `~2·n_eta+1` predictions).
+    Analytic,
+    /// Central finite differences. Used when the provider can't serve the model
+    /// (ODE, LTBS, expression scaling, time-varying covariates, SDE) or the
+    /// `FERX_NO_ANALYTIC_INNER` escape hatch is set.
     Fd,
-    /// Reverse-mode AD with a single per-subject `tv_adjusted` vector
-    /// — the legacy fast path. Correct only when the subject has no
-    /// time-varying covariates and no system resets.
-    AdSingleSnapshot,
-    /// Reverse-mode AD with per-event `tv` arrays — required for
-    /// time-varying covariates and/or system resets (EVID=3/4) to be
-    /// reflected in gradients.
-    AdEventDriven,
 }
 
-/// True for the extravascular (oral / first-order absorption) analytical PK
-/// models, whose AD propagators are bolus-only (see the oral-infusion guard in
-/// [`resolve_gradient_method`]).
-#[cfg(feature = "autodiff")]
-fn is_oral_model(pk_model: PkModel) -> bool {
-    matches!(
-        pk_model,
-        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
-    )
-}
-
-/// True when any BSV eta acts on the lagtime parameter, i.e. the model declares
-/// `lagtime`/`ALAG` with between-subject variability. Detected from the one-hot
-/// eta selector `sel_flat` (row-major `n_tv × n_eta`, parallel to `pk_indices`):
-/// a nonzero entry on the `PK_IDX_LAGTIME` row means eta moves the lag.
-///
-/// The AD paths freeze lagtime w.r.t. eta, so an eta-dependent lag makes the AD
-/// gradient inconsistent with the analytical objective — those subjects route
-/// to FD (see [`resolve_gradient_method`]).
-#[cfg(feature = "autodiff")]
-fn lagtime_depends_on_eta(model: &CompiledModel) -> bool {
-    let n_eta = model.n_eta;
-    if n_eta == 0 {
-        return false;
-    }
-    model
-        .pk_indices
-        .iter()
-        .enumerate()
-        .filter(|(_, &pk_idx)| pk_idx == crate::types::PK_IDX_LAGTIME)
-        .any(|(row, _)| {
-            let base = row * n_eta;
-            model
-                .sel_flat
-                .get(base..base + n_eta)
-                .is_some_and(|r| r.iter().any(|&c| c != 0.0))
-        })
-}
-
-/// Model-level features the analytical AD inner-gradient kernels can't represent
-/// faithfully, forcing the inner loop onto finite differences. Returns
-/// `Some(reason)` when the model is AD-unsafe, `None` when the analytical
-/// AD fast-path is valid.
-///
-/// The kernels (`ad_gradients`, `event_driven_ad`) hardcode the log-normal map
-/// `param = tv * exp(dot(sel, eta))` and a `+100` log-wrap for LTBS; anything
-/// outside that mould yields an inner gradient inconsistent with the objective
-/// the inner loop minimises (issue #278).
-///
-/// This predicate is deliberately **independent of `feature = "autodiff"`** so
-/// the routing decision is unit-testable in the FD-only `ci` build — the build
-/// that, by never exercising the AD path, let these gaps regress in the first
-/// place. The numerical AD-vs-FD *agreement* still needs an Enzyme build (see
-/// `tests/autodiff_fd_consistency.rs`).
-#[cfg_attr(not(feature = "autodiff"), allow(dead_code))]
+/// Model-level features that classify a model as outside the closed-form
+/// inner-gradient scope, returning `Some(reason)` (else `None`). Historically
+/// gated the retired Enzyme AD inner gradient; retained as a named-reason
+/// classifier (the live scope check is [`analytic_inner_grad_supported`]).
+#[allow(dead_code)]
 pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'static str> {
     // Non-log-normal ETA: additive (`tv + eta`), logit (`inv_logit(... + eta)`),
     // logit-probability, or custom/unrecognised. The kernels apply `exp(eta)`
@@ -223,104 +77,18 @@ pub(crate) fn resolve_gradient_method(
     model: &CompiledModel,
     subject: &Subject,
 ) -> InnerGradientMethod {
-    #[cfg(not(feature = "autodiff"))]
-    {
-        let _ = model;
-        let _ = subject;
-        return InnerGradientMethod::Fd;
-    }
-    #[cfg(feature = "autodiff")]
-    {
-        if model.tv_fn.is_none() {
-            return InnerGradientMethod::Fd;
-        }
-        let want_ad = match model.gradient_method {
-            GradientMethod::Ad => true,
-            GradientMethod::Fd => false,
-            GradientMethod::Auto => true,
-        };
-        if !want_ad {
-            return InnerGradientMethod::Fd;
-        }
-        // Model-level features the analytical AD kernels can't represent
-        // faithfully -> FD. See [`analytical_ad_unsupported`] for the
-        // authoritative list of gated classes (non-log-normal ETA, LTBS,
-        // conditional params, eta-dependent obs_scale, TTE). Extracted into a
-        // build-independent predicate so the routing decision is unit-testable
-        // in the FD-only `ci` build (the AD-vs-FD *numerical* check needs
-        // Enzyme, but "is this model classified AD-unsafe?" does not). See
-        // issue #278.
-        if analytical_ad_unsupported(model).is_some() {
-            return InnerGradientMethod::Fd;
-        }
-        // SS=1 doses in the AD paths would require threading `dose.ss` and
-        // `dose.ii` through the AD-instrumented propagators and adding
-        // closed-form SS branches inside them. Until that lands, fall back
-        // to FD whenever the subject has any SS dose — otherwise AD
-        // gradients (computed against the single-dose response) would not
-        // match the SS-aware predictions from `predict_concentration`.
-        if subject.has_ss_doses() {
-            return InnerGradientMethod::Fd;
-        }
-        // Modeled-`RATE` doses (RATE=-2 → `D{cmt}`; #324/#394): the analytical AD
-        // kernels snapshot each dose's concrete `rate`/`duration` into flat f64
-        // arrays and assert `all_doses_fixed()`. Resolving a modeled duration to a
-        // value (via `resolve_rate`) drops its `∂duration/∂η`, so an η-dependent
-        // `D{cmt}` would make the AD gradient disagree with the analytical
-        // (current-eta) objective the inner loop minimizes. Route to FD, which
-        // recomputes the duration at each perturbation. (The value path resolves
-        // these doses upstream; only the AD gradient path needs this guard.)
-        if !subject.all_doses_fixed() {
-            return InnerGradientMethod::Fd;
-        }
-        // Oral models with a zero-order (infusion, RATE>0) dose: every AD oral
-        // propagator — both the single-snapshot superposition (`ad_gradients`)
-        // and the event-driven (`event_driven_ad`) path — is bolus-only. They
-        // inject `amt` into the depot and ignore the infusion rate, whereas the
-        // analytical value path applies the central zero-order input
-        // (`event_driven::propagate_*_oral` now carry it; the superposition path
-        // models it as a depot-bypassing IV-into-central infusion). Differentiating
-        // that mismatch yields a gradient inconsistent with the objective, so
-        // route these subjects to FD. (When the AD oral kernels learn the infusion
-        // input — tracked with #281 autodiff CI — this guard can narrow.)
-        if is_oral_model(model.pk_model) && subject.doses.iter().any(|d| d.rate > 0.0) {
-            return InnerGradientMethod::Fd;
-        }
-        // Eta-dependent lagtime: the AD paths treat lagtime as Const w.r.t. eta
-        // (the event-driven path bakes a per-dose lag frozen at eta=0 into the
-        // timeline; the single-snapshot path reads it `volatile`), so `∂lag/∂η`
-        // is dropped and the AD gradient disagrees with the analytical
-        // (current-eta) objective the inner loop minimizes. Exact only when no
-        // eta acts on lagtime — fall back to FD when one does.
-        if lagtime_depends_on_eta(model) {
-            return InnerGradientMethod::Fd;
-        }
-        // System resets (EVID=3/4) and time-varying covariates both need the
-        // event-driven AD path: a reset zeros the compartment state mid-record
-        // (and turns off ongoing infusions), neither of which the
-        // single-snapshot superposition path in `ad_gradients.rs` can express.
-        // The event-driven AD kernel handles resets via a per-event reset-floor
-        // mask (mirrors `pk::event_driven`'s `reset_floor`) and lagtime via a
-        // Const per-dose lag baked into the event timeline (see
-        // `FlatEventData::from_subject`).
-        if subject.has_resets() || subject.has_tv_covariates() {
-            if crate::ad::event_driven_ad::supports_event_driven_ad(model.pk_model) {
-                InnerGradientMethod::AdEventDriven
-            } else {
-                InnerGradientMethod::Fd
-            }
-        } else {
-            InnerGradientMethod::AdSingleSnapshot
-        }
+    if analytic_inner_grad_supported(model, subject) {
+        InnerGradientMethod::Analytic
+    } else {
+        InnerGradientMethod::Fd
     }
 }
 
 /// One-line summary of the inner-loop gradient route **actually resolved**
 /// across the population, for the startup banner. Reflects the per-subject
-/// resolution in [`resolve_gradient_method`] — including AD→FD fallbacks for
-/// SS doses, system resets, TV-covariate models the event-driven AD path
-/// doesn't support, ODE/`tv_fn`-less models, or a build without the
-/// `autodiff` feature.
+/// resolution in [`resolve_gradient_method`] — the analytic `Dual2` η-gradient
+/// where it is in scope, central FD elsewhere (ODE / LTBS / expression scaling /
+/// TV-covariate / SDE models, or `gradient = fd`).
 ///
 /// `requested` is the user's [`FitOptions::gradient_method`], appended in
 /// brackets so a fallback is visible. It is taken as a parameter rather than
@@ -333,23 +101,18 @@ pub(crate) fn gradient_route_summary(
     population: &Population,
     requested: GradientMethod,
 ) -> String {
-    let (mut fd, mut ss, mut ed) = (0usize, 0usize, 0usize);
+    let (mut analytic, mut fd) = (0usize, 0usize);
     for subject in &population.subjects {
         match resolve_gradient_method(model, subject) {
+            InnerGradientMethod::Analytic => analytic += 1,
             InnerGradientMethod::Fd => fd += 1,
-            InnerGradientMethod::AdSingleSnapshot => ss += 1,
-            InnerGradientMethod::AdEventDriven => ed += 1,
         }
     }
     // Show per-route counts only when the population splits across routes;
     // a single uniform route reads cleanly as just its label.
-    let mixed = [fd, ss, ed].iter().filter(|&&c| c > 0).count() > 1;
+    let mixed = [analytic, fd].iter().filter(|&&c| c > 0).count() > 1;
     let mut parts: Vec<String> = Vec::new();
-    for (count, label) in [
-        (ed, "AD (event-driven)"),
-        (ss, "AD (single-snapshot)"),
-        (fd, "FD"),
-    ] {
+    for (count, label) in [(analytic, "analytic (Dual2)"), (fd, "FD")] {
         if count > 0 {
             parts.push(if mixed {
                 format!("{label} ×{count}")
@@ -366,27 +129,23 @@ pub(crate) fn gradient_route_summary(
 
     let requested_label = match requested {
         GradientMethod::Auto => "auto",
-        GradientMethod::Ad => "AD",
+        GradientMethod::Ad => "AD (retired → analytic)",
         GradientMethod::Fd => "FD",
     };
-    #[cfg(not(feature = "autodiff"))]
-    let note = "; autodiff not compiled in";
-    #[cfg(feature = "autodiff")]
-    let note = "";
 
-    format!("{resolved}  [requested: {requested_label}{note}]")
+    format!("{resolved}  [requested: {requested_label}]")
 }
 
 /// Global per-fit timing counters for gradient/Jacobian calls. Printed by
 /// [`fit_inner`] when `FERX_TIME_GRADIENTS=1` in the environment. Atomics so
 /// multiple rayon workers can update concurrently without locking.
 pub(crate) struct GradientTimings {
-    pub ad_calls: AtomicU64,
-    pub ad_nanos: AtomicU64,
+    pub analytic_calls: AtomicU64,
+    pub analytic_nanos: AtomicU64,
     pub fd_calls: AtomicU64,
     pub fd_nanos: AtomicU64,
-    pub jac_ad_calls: AtomicU64,
-    pub jac_ad_nanos: AtomicU64,
+    pub jac_analytic_calls: AtomicU64,
+    pub jac_analytic_nanos: AtomicU64,
     pub jac_fd_calls: AtomicU64,
     pub jac_fd_nanos: AtomicU64,
 }
@@ -394,20 +153,20 @@ pub(crate) struct GradientTimings {
 impl GradientTimings {
     const fn new() -> Self {
         Self {
-            ad_calls: AtomicU64::new(0),
-            ad_nanos: AtomicU64::new(0),
+            analytic_calls: AtomicU64::new(0),
+            analytic_nanos: AtomicU64::new(0),
             fd_calls: AtomicU64::new(0),
             fd_nanos: AtomicU64::new(0),
-            jac_ad_calls: AtomicU64::new(0),
-            jac_ad_nanos: AtomicU64::new(0),
+            jac_analytic_calls: AtomicU64::new(0),
+            jac_analytic_nanos: AtomicU64::new(0),
             jac_fd_calls: AtomicU64::new(0),
             jac_fd_nanos: AtomicU64::new(0),
         }
     }
     #[inline]
-    fn record_ad(&self, ns: u64) {
-        self.ad_calls.fetch_add(1, Ordering::Relaxed);
-        self.ad_nanos.fetch_add(ns, Ordering::Relaxed);
+    fn record_analytic(&self, ns: u64) {
+        self.analytic_calls.fetch_add(1, Ordering::Relaxed);
+        self.analytic_nanos.fetch_add(ns, Ordering::Relaxed);
     }
     #[inline]
     fn record_fd(&self, ns: u64) {
@@ -415,9 +174,9 @@ impl GradientTimings {
         self.fd_nanos.fetch_add(ns, Ordering::Relaxed);
     }
     #[inline]
-    fn record_jac_ad(&self, ns: u64) {
-        self.jac_ad_calls.fetch_add(1, Ordering::Relaxed);
-        self.jac_ad_nanos.fetch_add(ns, Ordering::Relaxed);
+    fn record_jac_analytic(&self, ns: u64) {
+        self.jac_analytic_calls.fetch_add(1, Ordering::Relaxed);
+        self.jac_analytic_nanos.fetch_add(ns, Ordering::Relaxed);
     }
     #[inline]
     fn record_jac_fd(&self, ns: u64) {
@@ -425,23 +184,23 @@ impl GradientTimings {
         self.jac_fd_nanos.fetch_add(ns, Ordering::Relaxed);
     }
     pub(crate) fn reset(&self) {
-        self.ad_calls.store(0, Ordering::Relaxed);
-        self.ad_nanos.store(0, Ordering::Relaxed);
+        self.analytic_calls.store(0, Ordering::Relaxed);
+        self.analytic_nanos.store(0, Ordering::Relaxed);
         self.fd_calls.store(0, Ordering::Relaxed);
         self.fd_nanos.store(0, Ordering::Relaxed);
-        self.jac_ad_calls.store(0, Ordering::Relaxed);
-        self.jac_ad_nanos.store(0, Ordering::Relaxed);
+        self.jac_analytic_calls.store(0, Ordering::Relaxed);
+        self.jac_analytic_nanos.store(0, Ordering::Relaxed);
         self.jac_fd_calls.store(0, Ordering::Relaxed);
         self.jac_fd_nanos.store(0, Ordering::Relaxed);
     }
     pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         (
-            self.ad_calls.load(Ordering::Relaxed),
-            self.ad_nanos.load(Ordering::Relaxed),
+            self.analytic_calls.load(Ordering::Relaxed),
+            self.analytic_nanos.load(Ordering::Relaxed),
             self.fd_calls.load(Ordering::Relaxed),
             self.fd_nanos.load(Ordering::Relaxed),
-            self.jac_ad_calls.load(Ordering::Relaxed),
-            self.jac_ad_nanos.load(Ordering::Relaxed),
+            self.jac_analytic_calls.load(Ordering::Relaxed),
+            self.jac_analytic_nanos.load(Ordering::Relaxed),
             self.jac_fd_calls.load(Ordering::Relaxed),
             self.jac_fd_nanos.load(Ordering::Relaxed),
         )
@@ -575,218 +334,15 @@ pub fn find_ebe(
         )
     };
 
-    // Resolve Auto → concrete method based on model/eta characteristics.
-    // Autodiff is only available when the crate was compiled with the feature
-    // and the model provides tv_fn (the parser attaches it for analytical PK).
-    let grad_method = resolve_gradient_method(model, subject);
-
-    // ── Per-subject AD helpers, built ONCE per find_ebe call ──
-    //
-    // theta is fixed for the whole inner-loop (BFGS gradient calls) AND
-    // for the post-convergence Jacobian, so all the per-event tv arrays
-    // and dose-flat arrays are stable across both. Hoist them out of
-    // the inner closures and out of the Jacobian site so each helper is
-    // only constructed once per outer iteration per subject — was twice
-    // before this refactor, with `pk_param_fn` re-evaluated per event.
-    #[cfg(feature = "autodiff")]
-    let (
-        ad_dose_data,
-        ad_omega_inv_flat,
-        ad_log_det_omega,
-        ad_cens_f64,
-        ad_tv_adjusted,
-        ad_event_data,
-        ad_tv_per_event,
-    ) = if grad_method != InnerGradientMethod::Fd {
-        let dose_data = FlatDoseData::from_subject(subject);
-        let omega_inv = params
-            .omega
-            .matrix
-            .clone()
-            .cholesky()
-            .map(|c| c.inverse())
-            .unwrap_or_else(|| nalgebra::DMatrix::identity(n_eta, n_eta));
-        let mut omega_inv_flat = Vec::with_capacity(n_eta * n_eta);
-        for i in 0..n_eta {
-            for j in 0..n_eta {
-                omega_inv_flat.push(omega_inv[(i, j)]);
-            }
-        }
-        // Same early-return on degenerate omega as before — must run
-        // before any heavy helper allocation.
-        let log_det_omega = {
-            let mut ld = 0.0;
-            for i in 0..n_eta {
-                let lii = params.omega.chol[(i, i)];
-                ld += if lii > 0.0 {
-                    lii.ln()
-                } else {
-                    return EbeResult {
-                        eta: DVector::zeros(n_eta),
-                        h_matrix: DMatrix::zeros(0, 0),
-                        converged: false,
-                        used_fallback: false,
-                        grad_norm: 0.0,
-                        nll: 1e20,
-                        kappas: Vec::new(),
-                    };
-                };
-            }
-            2.0 * ld
-        };
-        // Under M3, feed actual CENS flags so the AD path applies
-        // -log Φ to censored rows. Otherwise pass zeros — Enzyme
-        // traces the Gaussian branch for every observation.
-        let cens_f64: Vec<f64> = if matches!(model.bloq_method, BloqMethod::M3) {
-            subject.cens.iter().map(|&c| c as f64).collect()
-        } else {
-            vec![0.0; subject.observations.len()]
-        };
-        // Per-method helpers — only one of the two is built.
-        let tv_fn = model
-            .tv_fn
-            .as_ref()
-            .expect("resolve_gradient_method guarantees tv_fn for AD branches");
-        let (tv_adjusted, event_data, tv_per_event) = match grad_method {
-            InnerGradientMethod::AdSingleSnapshot => {
-                (Some(tv_fn(&params.theta, &subject.covariates)), None, None)
-            }
-            InnerGradientMethod::AdEventDriven => {
-                // Per-dose lagtimes for the lagged event timeline, evaluated at
-                // (theta, covariate) with eta = 0 so they're Const w.r.t. the
-                // gradient. Exact for the usual eta-independent lagtime; the
-                // rare eta-dependent case drops ∂lag/∂η (documented in
-                // `FlatEventData::from_subject`). Empty when the model declares
-                // no lagtime — `from_subject` then applies zero shift.
-                let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
-                    let zeros = vec![0.0; n_eta];
-                    crate::pk::compute_event_pk_params(model, subject, &params.theta, &zeros)
-                        .dose
-                        .iter()
-                        .map(|p| p.lagtime())
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                (
-                    None,
-                    Some(crate::ad::event_driven_ad::FlatEventData::from_subject(
-                        subject,
-                        &dose_lagtimes,
-                    )),
-                    Some(crate::ad::event_driven_ad::FlatEventTv::from_subject(
-                        model,
-                        subject,
-                        &params.theta,
-                        &dose_lagtimes,
-                    )),
-                )
-            }
-            InnerGradientMethod::Fd => (None, None, None),
-        };
-        (
-            Some(dose_data),
-            Some(omega_inv_flat),
-            Some(log_det_omega),
-            Some(cens_f64),
-            tv_adjusted,
-            event_data,
-            tv_per_event,
-        )
-    } else {
-        (None, None, None, None, None, None, None)
-    };
-
-    // Try BFGS — AD gradient when `grad_method` is one of the AD variants,
-    // FD otherwise. The AD gradient of individual_nll w.r.t. psi equals the
-    // gradient w.r.t. eta_true (chain rule: d/dpsi = d/d(eta_true), since
-    // psi = eta_true + mu).
-    #[cfg(feature = "autodiff")]
-    let result = if grad_method != InnerGradientMethod::Fd {
-        let dose_data = ad_dose_data.as_ref().unwrap();
-        let omega_inv_flat = ad_omega_inv_flat.as_ref().unwrap();
-        let log_det_omega = ad_log_det_omega.unwrap();
-        let cens_f64 = ad_cens_f64.as_ref().unwrap();
-
-        match grad_method {
-            InnerGradientMethod::AdSingleSnapshot => {
-                let tv_adjusted = ad_tv_adjusted.as_ref().unwrap();
-                let grad_fn = |p: &[f64]| -> Vec<f64> {
-                    let eta_t: Vec<f64> = p.to_vec();
-                    let t0 = std::time::Instant::now();
-                    let obs_scale = build_scale_array_for_ad(model, subject, &params.theta, &eta_t);
-                    let (_, g) = ad_gradients::compute_nll_gradient_ad(
-                        &eta_t,
-                        tv_adjusted,
-                        omega_inv_flat,
-                        log_det_omega,
-                        &params.sigma.values,
-                        dose_data,
-                        &subject.obs_times,
-                        &subject.observations,
-                        cens_f64,
-                        model.pk_model,
-                        model.error_model,
-                        &model.pk_idx_f64,
-                        &model.sel_flat,
-                        &obs_scale,
-                        model.log_transform,
-                    );
-                    GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
-                    g
-                };
-                inner_minimize_with_grad(&obj, &grad_fn, &mut eta, n_eta, max_iter, tol)
-            }
-            InnerGradientMethod::AdEventDriven => {
-                let event_data = ad_event_data.as_ref().unwrap();
-                let tv_per_event = ad_tv_per_event.as_ref().unwrap();
-                let grad_fn = |p: &[f64]| -> Vec<f64> {
-                    let eta_t: Vec<f64> = p.to_vec();
-                    let t0 = std::time::Instant::now();
-                    let event_scale = build_event_scale_array_for_ad(
-                        model,
-                        subject,
-                        event_data,
-                        &params.theta,
-                        &eta_t,
-                    );
-                    let (_, g) = crate::ad::event_driven_ad::compute_nll_gradient_event_driven_ad(
-                        &eta_t,
-                        tv_per_event,
-                        omega_inv_flat,
-                        log_det_omega,
-                        &params.sigma.values,
-                        event_data,
-                        &subject.observations,
-                        cens_f64,
-                        model.pk_model,
-                        model.error_model,
-                        &model.pk_idx_f64,
-                        &model.sel_flat,
-                        &event_scale,
-                        model.log_transform,
-                    );
-                    GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
-                    g
-                };
-                inner_minimize_with_grad(&obj, &grad_fn, &mut eta, n_eta, max_iter, tol)
-            }
-            InnerGradientMethod::Fd => unreachable!("guarded above"),
-        }
-    } else {
-        inner_minimize(&obj, &mut eta, n_eta, max_iter, tol)
-    };
-
-    #[cfg(not(feature = "autodiff"))]
+    // BFGS with the exact analytic η-gradient from the sensitivity provider when
+    // in scope (Almquist et al. 2015): one provider evaluation per inner step
+    // instead of the FD gradient's ~2·n_eta+1 predictions, and exact → fewer
+    // steps. Per-point FD fallback if the provider can't serve a given (θ, η).
     let result = {
-        let _ = grad_method; // silence unused warning on stable builds
-                             // Exact analytic η-gradient from the sensitivity provider when in scope
-                             // (Almquist et al. 2015): one provider evaluation per inner step instead
-                             // of the FD gradient's ~2·n_eta+1 predictions, and exact → fewer steps.
-                             // Per-point FD fallback if the provider can't serve a given (θ, η).
         if analytic_inner_grad_supported(model, subject) {
             let profile = inner_profile_enabled();
             let agrad = |e: &[f64]| -> Vec<f64> {
+                let t0 = std::time::Instant::now();
                 match analytic_eta_nll_gradient(
                     model,
                     subject,
@@ -796,6 +352,7 @@ pub fn find_ebe(
                     &params.sigma.values,
                 ) {
                     Some(g) => {
+                        GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
                         if profile {
                             PROFILE_INNER_ANALYTIC_GRAD
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -803,11 +360,13 @@ pub fn find_ebe(
                         g
                     }
                     None => {
+                        let g = gradient_fd(&obj, e, n_eta);
+                        GRADIENT_TIMINGS.record_fd(t0.elapsed().as_nanos() as u64);
                         if profile {
                             PROFILE_INNER_FD_FALLBACK
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        gradient_fd(&obj, e, n_eta)
+                        g
                     }
                 }
             };
@@ -844,102 +403,34 @@ pub fn find_ebe(
     // when the analytic one is available — for this first landing it is computed
     // and then overridden, which keeps the diff minimal and trivially
     // revertible while the values come from the exact sensitivities.
+    let t_jac = std::time::Instant::now();
     let analytic_jac: Option<DMatrix<f64>> =
         crate::sens::provider::subject_eta_jacobian(model, subject, &params.theta, &eta_true)
             .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j));
+    if analytic_jac.is_some() {
+        GRADIENT_TIMINGS.record_jac_analytic(t_jac.elapsed().as_nanos() as u64);
+    }
 
-    // When the exact analytic Jacobian is available, skip the FD/AD fallback
+    // When the exact analytic Jacobian is available, skip the FD fallback
     // entirely — previously it was always computed and then discarded by an
     // `unwrap_or`, a full O(n_eta) sweep per subject per outer iteration that
     // directly undercut the speed premise (PR #381 review finding #10).
     let h_matrix = match analytic_jac {
         Some(j) => j,
         None => {
-            #[cfg(feature = "autodiff")]
-            let h_matrix_fb = match grad_method {
-                InnerGradientMethod::AdSingleSnapshot => {
-                    let tv_adjusted = ad_tv_adjusted.as_ref().unwrap();
-                    let dose_data = ad_dose_data.as_ref().unwrap();
-                    let t0 = std::time::Instant::now();
-                    let obs_scale =
-                        build_scale_array_for_ad(model, subject, &params.theta, &eta_true);
-                    let j = ad_gradients::compute_jacobian_ad(
-                        &eta_true,
-                        tv_adjusted,
-                        dose_data,
-                        &subject.obs_times,
-                        subject.obs_times.len(),
-                        model.pk_model,
-                        &model.pk_idx_f64,
-                        &model.sel_flat,
-                        &obs_scale,
-                        model.log_transform,
-                    );
-                    GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
-                    j
-                }
-                InnerGradientMethod::AdEventDriven => {
-                    // Forward-mode AD Jacobian — kernel lives in
-                    // `ad::event_driven_ad_jac` (sibling module so the AD pass
-                    // stays isolated from the reverse-mode NLL pass; sharing
-                    // helpers tripped Enzyme's reverse-mode type deduction).
-                    let event_data = ad_event_data.as_ref().unwrap();
-                    let tv_per_event = ad_tv_per_event.as_ref().unwrap();
-                    let t0 = std::time::Instant::now();
-                    let event_scale = build_event_scale_array_for_ad(
-                        model,
-                        subject,
-                        event_data,
-                        &params.theta,
-                        &eta_true,
-                    );
-                    let j = crate::ad::event_driven_ad_jac::compute_jacobian_event_driven_ad(
-                        &eta_true,
-                        tv_per_event,
-                        event_data,
-                        subject.obs_times.len(),
-                        model.pk_model,
-                        &model.pk_idx_f64,
-                        &model.sel_flat,
-                        &event_scale,
-                        model.log_transform,
-                    );
-                    GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
-                    j
-                }
-                InnerGradientMethod::Fd => {
-                    let mut scratch = pk_scratch_cell.borrow_mut();
-                    let t0 = std::time::Instant::now();
-                    let j = compute_jacobian_fd(
-                        model,
-                        subject,
-                        &params.theta,
-                        &eta_true,
-                        &mut scratch,
-                        schedule.as_ref(),
-                    );
-                    GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
-                    j
-                }
-            };
-
-            #[cfg(not(feature = "autodiff"))]
-            let h_matrix_fb = {
-                let mut scratch = pk_scratch_cell.borrow_mut();
-                let t0 = std::time::Instant::now();
-                let j = compute_jacobian_fd(
-                    model,
-                    subject,
-                    &params.theta,
-                    &eta_true,
-                    &mut scratch,
-                    schedule.as_ref(),
-                );
-                GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
-                j
-            };
-
-            h_matrix_fb
+            // FD Jacobian fallback for models the analytic provider doesn't cover.
+            let mut scratch = pk_scratch_cell.borrow_mut();
+            let t0 = std::time::Instant::now();
+            let j = compute_jacobian_fd(
+                model,
+                subject,
+                &params.theta,
+                &eta_true,
+                &mut scratch,
+                schedule.as_ref(),
+            );
+            GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
+            j
         }
     };
 
@@ -2678,196 +2169,11 @@ mod iov_tests {
         );
     }
 
-    #[cfg(feature = "autodiff")]
-    #[test]
-    fn is_oral_model_classifies_extravascular_models() {
-        assert!(is_oral_model(PkModel::OneCptOral));
-        assert!(is_oral_model(PkModel::TwoCptOral));
-        assert!(is_oral_model(PkModel::ThreeCptOral));
-        assert!(!is_oral_model(PkModel::OneCptIv));
-        assert!(!is_oral_model(PkModel::TwoCptIv));
-        assert!(!is_oral_model(PkModel::ThreeCptIv));
-    }
-
-    #[cfg(feature = "autodiff")]
-    #[test]
-    fn lagtime_depends_on_eta_detects_bsv_on_lag() {
-        // Base model has no lagtime row (pk_indices = [CL, V]).
-        let mut model = make_iov_model();
-        assert!(!lagtime_depends_on_eta(&model), "no lag row -> false");
-
-        // Add a lagtime tv-row carrying eta (nonzero sel entry).
-        model.pk_indices = vec![0, 1, crate::types::PK_IDX_LAGTIME];
-        model.sel_flat = vec![1.0, 0.0, 1.0]; // 3 rows x n_eta=1; lag row has eta
-        assert!(lagtime_depends_on_eta(&model), "lag row with eta -> true");
-
-        // Same lagtime row but eta-independent (zero sel) -> false.
-        model.sel_flat = vec![1.0, 0.0, 0.0];
-        assert!(
-            !lagtime_depends_on_eta(&model),
-            "eta-independent lag -> false"
-        );
-    }
-
-    #[cfg(feature = "autodiff")]
-    #[test]
-    fn reset_only_subject_routes_to_event_driven() {
-        // A subject with a system reset but no TV covariates must take the
-        // reset-aware event-driven AD path (not single-snapshot, which can't
-        // express resets). Both find_ebe and hmc_step dispatch on this.
-        let mut model = make_iov_model();
-        model.tv_fn = Some(Box::new(
-            |_t: &[f64], _c: &std::collections::HashMap<String, f64>| vec![0.0, 0.0],
-        ));
-        model.pk_model = PkModel::OneCptIv; // supports event-driven AD
-        let mut subj = make_iov_subject();
-        assert!(!subj.has_tv_covariates(), "fixture has no TV covariates");
-        subj.reset_times = vec![3.5];
-        assert_eq!(
-            resolve_gradient_method(&model, &subj),
-            InnerGradientMethod::AdEventDriven,
-            "reset-only subject must take the event-driven AD path"
-        );
-    }
-
-    #[cfg(feature = "autodiff")]
-    #[test]
-    fn oral_infusion_subject_routes_to_fd() {
-        // tv_fn = Some so the AD branches are reachable; pk_model oral.
-        let mut model = make_iov_model();
-        model.tv_fn = Some(Box::new(
-            |_t: &[f64], _c: &std::collections::HashMap<String, f64>| vec![0.0, 0.0],
-        ));
-        model.pk_model = PkModel::OneCptOral;
-
-        // Oral *bolus* subject (RATE=0): AD is fine -> not FD.
-        let bolus = make_iov_subject();
-        assert!(bolus.doses.iter().all(|d| d.rate == 0.0));
-        assert_ne!(
-            resolve_gradient_method(&model, &bolus),
-            InnerGradientMethod::Fd,
-            "oral bolus should still take an AD route"
-        );
-
-        // Add a zero-order (infusion) dose -> guard routes to FD.
-        let mut infusion = make_iov_subject();
-        infusion
-            .doses
-            .push(DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)); // RATE>0
-        assert_eq!(
-            resolve_gradient_method(&model, &infusion),
-            InnerGradientMethod::Fd,
-            "oral + infusion must route to FD (AD oral propagators are bolus-only)"
-        );
-    }
-
-    // The analytical AD kernels hardcode the log-normal map `param = tv*exp(eta)`
-    // and ignore `EtaParamType`. Additive / logit / custom ETAs therefore get a
-    // wrong gradient (issue #278) and must route to FD.
-    #[cfg(feature = "autodiff")]
-    #[test]
-    fn non_lognormal_eta_routes_to_fd() {
-        let mut model = make_iov_model();
-        model.tv_fn = Some(Box::new(
-            |_t: &[f64], _c: &std::collections::HashMap<String, f64>| vec![0.0, 0.0],
-        ));
-        model.pk_model = PkModel::OneCptOral;
-        let subj = make_iov_subject(); // oral bolus
-
-        // Empty eta_param_info (synthetic fixture) keeps the existing AD route.
-        assert_ne!(
-            resolve_gradient_method(&model, &subj),
-            InnerGradientMethod::Fd,
-            "log-normal / unspecified ETA must keep an AD route"
-        );
-
-        let mut info = crate::types::EtaParamInfo {
-            eta_name: "ETA_CL".into(),
-            param_type: crate::types::EtaParamType::LogNormal,
-            linked_theta: None,
-            individual_param_name: "CL".into(),
-        };
-        // Explicit LogNormal -> still AD.
-        model.eta_param_info = vec![info.clone()];
-        assert_ne!(
-            resolve_gradient_method(&model, &subj),
-            InnerGradientMethod::Fd,
-            "explicit LogNormal ETA must keep an AD route"
-        );
-        // Additive / Logit / LogitProbability / Custom -> FD.
-        for pt in [
-            crate::types::EtaParamType::Additive,
-            crate::types::EtaParamType::Logit,
-            crate::types::EtaParamType::LogitProbability,
-            crate::types::EtaParamType::Custom,
-        ] {
-            info.param_type = pt;
-            model.eta_param_info = vec![info.clone()];
-            assert_eq!(
-                resolve_gradient_method(&model, &subj),
-                InnerGradientMethod::Fd,
-                "non-log-normal ETA ({pt:?}) must route to FD"
-            );
-        }
-    }
-
-    // LTBS / log_additive: the analytical single-snapshot AD log-wrap diverges
-    // from the FD reference (issue #278), so log-transformed models route to FD.
-    #[cfg(feature = "autodiff")]
-    #[test]
-    fn ltbs_log_transform_routes_to_fd() {
-        let mut model = make_iov_model();
-        model.tv_fn = Some(Box::new(
-            |_t: &[f64], _c: &std::collections::HashMap<String, f64>| vec![0.0, 0.0],
-        ));
-        model.pk_model = PkModel::OneCptOral;
-        let subj = make_iov_subject();
-
-        assert_ne!(
-            resolve_gradient_method(&model, &subj),
-            InnerGradientMethod::Fd,
-            "non-LTBS oral bolus must keep an AD route"
-        );
-        model.log_transform = true;
-        assert_eq!(
-            resolve_gradient_method(&model, &subj),
-            InnerGradientMethod::Fd,
-            "LTBS (log_transform) must route to FD"
-        );
-    }
-
-    // Conditional individual-parameter expressions (`if (cov) { CL = ... }`)
-    // keep log-normal ETAs, so `eta_param_info` looks ordinary; the gate keys
-    // off the parser's "conditional parameter(s)" warning instead (issue #278).
-    #[cfg(feature = "autodiff")]
-    #[test]
-    fn conditional_param_routes_to_fd() {
-        let mut model = make_iov_model();
-        model.tv_fn = Some(Box::new(
-            |_t: &[f64], _c: &std::collections::HashMap<String, f64>| vec![0.0, 0.0],
-        ));
-        model.pk_model = PkModel::OneCptOral;
-        let subj = make_iov_subject();
-
-        assert_ne!(
-            resolve_gradient_method(&model, &subj),
-            InnerGradientMethod::Fd,
-            "no conditional flag -> AD route"
-        );
-        model.has_conditional_eta_params = true;
-        assert_eq!(
-            resolve_gradient_method(&model, &subj),
-            InnerGradientMethod::Fd,
-            "conditional-parameter model must route to FD"
-        );
-    }
-
-    // Unlike the routing tests above (which exercise `resolve_gradient_method`
-    // and so are `cfg(autodiff)`), this tests the extracted predicate directly.
-    // It is build-independent, so it runs in the FD-only `ci` CI build and
-    // guards the gate *logic* even where the AD-vs-FD numerical harness
-    // (`tests/autodiff_fd_consistency.rs`) cannot run without Enzyme. See #278
-    // and the Enzyme-CI follow-up.
+    // The model classes below (non-log-normal ETA, LTBS, conditional params,
+    // eta-dependent obs_scale, TTE) sit outside the closed-form inner-gradient
+    // scope. This tests the named-reason predicate directly; the live routing
+    // gate is `analytic_inner_grad_supported`. It is build-independent and runs
+    // in the FD-only `ci` CI build, guarding the classification logic (#278).
     #[test]
     fn analytical_ad_unsupported_flags_each_class() {
         let mut model = make_iov_model();

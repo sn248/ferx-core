@@ -876,20 +876,18 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // Explicit `gradient_method = ad` on a build compiled WITHOUT the `autodiff`
-    // feature: AD is unavailable, so the inner loop would silently fall back to
-    // FD and run a different method than the user asked for. Reject it instead.
-    // `auto` (defined to fall back) and `fd` are unaffected.
-    #[cfg(not(feature = "autodiff"))]
+    // Explicit `gradient_method = ad`: the Enzyme autodiff path was retired in
+    // favour of the hand-rolled `Dual2` analytic sensitivities. Reject it rather
+    // than silently running a different method. `auto` (analytic where in scope,
+    // else FD) and `fd` are unaffected.
     if options.gradient_method == crate::types::GradientMethod::Ad {
         diags.push(
             Diagnostic::error(
-                "E_AD_UNAVAILABLE",
-                "gradient_method = ad was requested, but this build was compiled without the \
-                 `autodiff` feature, so automatic differentiation is unavailable — the fit would \
-                 silently use finite differences. Rebuild with the Enzyme toolchain \
-                 (`--features autodiff`), or set gradient_method = auto (falls back to FD \
-                 automatically) or fd.",
+                "E_AD_RETIRED",
+                "gradient_method = ad is no longer supported: the Enzyme automatic-differentiation \
+                 path was retired in favour of the analytic `Dual2` sensitivities. Set \
+                 gradient_method = auto (uses the exact analytic gradient where it is in scope and \
+                 falls back to finite differences otherwise) or fd.",
             )
             .with_block("fit_options"),
         );
@@ -3494,7 +3492,7 @@ fn fit_inner(
     };
 
     if time_gradients {
-        let (ad_c, ad_n, fd_c, fd_n, jac_ad_c, jac_ad_n, jac_fd_c, jac_fd_n) =
+        let (an_c, an_n, fd_c, fd_n, jac_an_c, jac_an_n, jac_fd_c, jac_fd_n) =
             crate::estimation::inner_optimizer::GRADIENT_TIMINGS.snapshot();
         let ms = |n: u64| (n as f64) / 1_000_000.0;
         let avg_us = |n: u64, c: u64| {
@@ -3506,25 +3504,25 @@ fn fit_inner(
         };
         eprintln!("--- Gradient timings (FERX_TIME_GRADIENTS=1) ---");
         eprintln!(
-            "  BFGS (AD):  {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
-            ad_c,
-            ms(ad_n),
-            avg_us(ad_n, ad_c)
+            "  BFGS (analytic): {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
+            an_c,
+            ms(an_n),
+            avg_us(an_n, an_c)
         );
         eprintln!(
-            "  BFGS (FD):  {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
+            "  BFGS (FD):       {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
             fd_c,
             ms(fd_n),
             avg_us(fd_n, fd_c)
         );
         eprintln!(
-            "  Jac  (AD):  {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
-            jac_ad_c,
-            ms(jac_ad_n),
-            avg_us(jac_ad_n, jac_ad_c)
+            "  Jac  (analytic): {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
+            jac_an_c,
+            ms(jac_an_n),
+            avg_us(jac_an_n, jac_an_c)
         );
         eprintln!(
-            "  Jac  (FD):  {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
+            "  Jac  (FD):       {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
             jac_fd_c,
             ms(jac_fd_n),
             avg_us(jac_fd_n, jac_fd_c)
@@ -5498,11 +5496,10 @@ mod iov_integration {
         assert!(d.is_error() && d.message.contains("inter-occasion"));
     }
 
-    // On a build without the `autodiff` feature, explicitly requesting AD must
-    // error rather than silently running FD. `auto`/`fd` must still pass.
-    #[cfg(not(feature = "autodiff"))]
+    // The Enzyme AD path was retired, so explicitly requesting AD must error
+    // rather than silently running a different method. `auto`/`fd` must still pass.
     #[test]
-    fn ad_requested_without_autodiff_feature_errors() {
+    fn ad_requested_errors_now_that_ad_is_retired() {
         let model = make_iov_model();
         let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
 
@@ -5511,8 +5508,8 @@ mod iov_integration {
         assert!(
             diags
                 .iter()
-                .any(|d| d.code == "E_AD_UNAVAILABLE" && d.is_error()),
-            "explicit gradient_method=ad on a non-autodiff build must error, got: {diags:?}"
+                .any(|d| d.code == "E_AD_RETIRED" && d.is_error()),
+            "explicit gradient_method=ad must error now that AD is retired, got: {diags:?}"
         );
 
         for gm in [
@@ -5523,8 +5520,8 @@ mod iov_integration {
             assert!(
                 !super::check_model_options(&model, &opts)
                     .iter()
-                    .any(|d| d.code == "E_AD_UNAVAILABLE"),
-                "gradient_method={gm:?} must not trigger E_AD_UNAVAILABLE"
+                    .any(|d| d.code == "E_AD_RETIRED"),
+                "gradient_method={gm:?} must not trigger E_AD_RETIRED"
             );
         }
     }

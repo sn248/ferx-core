@@ -1893,31 +1893,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
         // AD compatibility check (Phase 2.5):
         //
-        // ScalingSpec — None / ScalarScale / ExpressionScale / PerCmt —
-        // all support AD now via the per-observation `obs_scale: &[f64]`
-        // slice threaded into the four AD entry points and built by
-        // `inner_optimizer::build_scale_array_for_ad`. The slice is
-        // materialised once per gradient call from a subject-static pk
-        // evaluation, so AD treats the scale as constant w.r.t. eta.
-        // That's exact for an eta-independent scale (`WT/70`, `TVV/1000` -
-        // covariates/thetas only). An eta-dependent scale (e.g.
-        // `obs_scale = V` with `V = TVV*exp(ETA_V)`) is now auto-routed to
-        // FD by `inner_optimizer::analytical_ad_unsupported`
-        // (`ScalingSpec::breaks_ad_inner_gradient`), so the user gets a
-        // correct gradient without having to set `gradient = fd` by hand.
-        //
-        // Form C readouts (`OdeReadout::Single` / `PerCmt`) STILL force
-        // FD: they only exist on ODE models, and the AD path requires
-        // `tv_fn.is_some()` which is only set for analytical models. The
-        // runtime check would silently demote `gradient = ad` to FD; the
-        // parse-time guard here surfaces it as a loud error so the user
-        // knows AD isn't actually doing anything for their Form C model.
+        // Form C readouts (`OdeReadout::Single` / `PerCmt`) only exist on ODE
+        // models, which have no analytical PK path (`tv_fn.is_none()`) and so
+        // always use FD. `gradient = ad` is itself retired (errors in
+        // `check_model_options`); this parse-time guard surfaces the same
+        // mismatch with a Form-C-specific message.
         let ad_explicit = fit_options.gradient_method == GradientMethod::Ad;
-        let ad_auto_likely = fit_options.gradient_method == GradientMethod::Auto
-            && model.tv_fn.is_some()
-            && cfg!(feature = "autodiff");
         let readout_needs_fd = output_fn.as_ref().map(|r| r.requires_fd()).unwrap_or(false);
-        if readout_needs_fd && (ad_explicit || ad_auto_likely) {
+        if readout_needs_fd && ad_explicit {
             let kind = match output_fn.as_ref() {
                 Some(crate::ode::OdeReadout::PerCmt(_)) => "per-CMT `y[CMT=N]` (Form C)",
                 Some(crate::ode::OdeReadout::Single(_)) => "`y = <expr>` (Form C)",

@@ -184,16 +184,31 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
     ) && model.ode_spec.is_none()
         && model.tv_fn.is_some()
         && model.n_kappa == 0
-        // Output transform: the provider applies a constant `ScalarScale` divisor
-        // to `f` and (linearly) to every derivative — exact, since `∂k/∂η = ∂k/∂θ
-        // = 0`. `ExpressionScale`/`PerCmt` (η/θ/CMT-dependent) still route to FD.
-        // LTBS (`log_transform`) is applied as a closed-form jet transform
-        // `g = ln(f)` at the provider tail (after scaling), mirroring
-        // `pk::apply_log_transform`.
-        && matches!(model.scaling, ScalingSpec::None | ScalingSpec::ScalarScale(_))
+        && scaling_supported(model)
         // Every individual-parameter slot must be one we differentiate. A
         // LAGTIME (slot 8) routes to fall back.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
+}
+
+/// Maximum `(θ, η)` axis count for the differentiable `ExpressionScale` program
+/// (the `Dual2<M>` dispatch table). Beyond this the scale falls back to FD.
+const MAX_SCALE_AXES: usize = 16;
+
+/// Whether the model's output scaling is one the provider differentiates exactly:
+/// `None` / constant `ScalarScale` (a per-jet divisor, `∂k/∂η = ∂k/∂θ = 0`), or an
+/// `ExpressionScale` carrying a `Dual2`-differentiable program whose axis counts
+/// match the model and fit the dispatch table. `ExpressionScale` without a program
+/// and `PerCmt` route to FD.
+fn scaling_supported(model: &CompiledModel) -> bool {
+    match &model.scaling {
+        ScalingSpec::None | ScalingSpec::ScalarScale(_) => true,
+        ScalingSpec::ExpressionScale { deriv: Some(p), .. } => {
+            p.n_theta_axis() == model.n_theta
+                && p.n_eta_axis() == model.n_eta
+                && (1..=MAX_SCALE_AXES).contains(&p.n_axes())
+        }
+        _ => false,
+    }
 }
 
 /// True when the exact `sens` outer gradient applies to this model: either the
@@ -408,6 +423,12 @@ fn subject_eta_grad_impl(
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
+    // The light (first-order) provider doesn't carry the `ExpressionScale`
+    // quotient-rule, so the inner EBE loop reverts to FD there (the analytic
+    // *outer* gradient still serves these models). Mirrors the LTBS inner choice.
+    if matches!(model.scaling, ScalingSpec::ExpressionScale { .. }) {
+        return None;
+    }
 
     let n_eta = model.n_eta;
     let oral = matches!(
@@ -616,6 +637,122 @@ pub fn subject_sensitivities(
     r
 }
 
+/// Apply an `ExpressionScale` divisor `s(θ, η)` to a subject's already-computed
+/// jet in place: `scaled_f = f / s`. The scale's own value, `∂s/∂(θ,η)` and
+/// Hessian come from the differentiable scale program evaluated over `Dual2<M>`
+/// (`M = n_theta + n_eta`); the individual parameters it references are fed in as
+/// duals built from the provider's `ParamDerivs`. The quotient rule
+///   `∂(f/s)/∂x      = f_x/s − f·s_x/s²`
+///   `∂²(f/s)/∂x∂y   = f_xy/s − f_x s_y/s² − f_y s_x/s² − f s_xy/s² + 2 f s_x s_y/s³`
+/// is applied over the η-η and η-θ blocks (the only second-order blocks the outer
+/// gradient consumes). `s` is subject-static, so it is evaluated once and reused
+/// for every observation. Dual dimension `m < n_theta` is `θ_m`; `n_theta + k` is
+/// `η_k`.
+#[allow(clippy::too_many_arguments)]
+fn apply_expression_scale<const M: usize>(
+    sens: &mut SubjectSens,
+    prog: &crate::parser::model_parser::ScaleDerivProgram,
+    pk: &crate::types::PkParams,
+    pd: &crate::sens::ode_provider::ParamDerivs,
+    slots: &[usize],
+    theta: &[f64],
+    eta: &[f64],
+    cov: &std::collections::HashMap<String, f64>,
+    n_theta: usize,
+    n_eta: usize,
+) {
+    // Build the dual for each PK slot the scale references: value + ∂p/∂(θ,η),
+    // with the unused θ-θ Hessian block left zero (the quotient rule only reads
+    // η-η and η-θ). PK params not in `slots` (literal constants / undifferentiated)
+    // enter as constants.
+    let var_duals: Vec<Dual2<M>> = prog
+        .var_to_pk_slot()
+        .iter()
+        .map(|&s| match slots.iter().position(|&x| x == s) {
+            Some(j) => {
+                let mut grad = [0.0; M];
+                let mut hess = [[0.0; M]; M];
+                for m in 0..n_theta.min(M) {
+                    grad[m] = pd.dp_dtheta[j][m];
+                }
+                for k in 0..n_eta {
+                    if n_theta + k < M {
+                        grad[n_theta + k] = pd.dp_deta[j][k];
+                    }
+                }
+                for k in 0..n_eta {
+                    for l in 0..n_eta {
+                        if n_theta + k < M && n_theta + l < M {
+                            hess[n_theta + k][n_theta + l] = pd.d2p_deta2[j][k][l];
+                        }
+                    }
+                    for m in 0..n_theta {
+                        if n_theta + k < M && m < M {
+                            let v = pd.d2p_detadtheta[j][k][m];
+                            hess[n_theta + k][m] = v;
+                            hess[m][n_theta + k] = v;
+                        }
+                    }
+                }
+                Dual2 {
+                    value: pk.values.get(s).copied().unwrap_or(0.0),
+                    grad,
+                    hess,
+                }
+            }
+            None => Dual2::constant(pk.values.get(s).copied().unwrap_or(0.0)),
+        })
+        .collect();
+
+    let s = prog.eval_scale_dual::<M>(theta, eta, cov, &var_duals);
+    let sv = s.value;
+    let inv = 1.0 / sv;
+    let inv2 = inv * inv;
+    let inv3 = inv2 * inv;
+
+    for o in sens.obs.iter_mut() {
+        let f = o.f;
+        let fk = o.df_deta.clone(); // original ∂f/∂η
+        let fm = o.df_dtheta.clone(); // original ∂f/∂θ
+                                      // η-η Hessian.
+        for k in 0..n_eta {
+            for l in 0..n_eta {
+                let idx = k * n_eta + l;
+                let s_k = s.grad[n_theta + k];
+                let s_l = s.grad[n_theta + l];
+                let s_kl = s.hess[n_theta + k][n_theta + l];
+                o.d2f_deta2[idx] = o.d2f_deta2[idx] * inv
+                    - fk[k] * s_l * inv2
+                    - fk[l] * s_k * inv2
+                    - f * s_kl * inv2
+                    + 2.0 * f * s_k * s_l * inv3;
+            }
+        }
+        // η-θ Hessian.
+        for k in 0..n_eta {
+            for m in 0..n_theta {
+                let idx = k * n_theta + m;
+                let s_k = s.grad[n_theta + k];
+                let s_m = s.grad[m];
+                let s_km = s.hess[n_theta + k][m];
+                o.d2f_deta_dtheta[idx] = o.d2f_deta_dtheta[idx] * inv
+                    - fk[k] * s_m * inv2
+                    - fm[m] * s_k * inv2
+                    - f * s_km * inv2
+                    + 2.0 * f * s_k * s_m * inv3;
+            }
+        }
+        // First derivatives and value.
+        for k in 0..n_eta {
+            o.df_deta[k] = fk[k] * inv - f * s.grad[n_theta + k] * inv2;
+        }
+        for m in 0..n_theta {
+            o.df_dtheta[m] = fm[m] * inv - f * s.grad[m] * inv2;
+        }
+        o.f = f * inv;
+    }
+}
+
 fn subject_sensitivities_impl(
     model: &CompiledModel,
     subject: &Subject,
@@ -766,6 +903,27 @@ fn subject_sensitivities_impl(
                 }
             }
         }
+    }
+    // ExpressionScale: divide by a per-subject scale `s(θ, η)` whose own jet is
+    // computed exactly from the differentiable scale program; quotient-combine
+    // `scaled_f = f / s` over every η-η / η-θ block (`apply_expression_scale`).
+    // Dispatched on the scale program's `(θ, η)` axis count.
+    if let ScalingSpec::ExpressionScale {
+        deriv: Some(prog), ..
+    } = &model.scaling
+    {
+        macro_rules! disp_scale {
+            ($($mm:literal),+) => {
+                match prog.n_axes() {
+                    $($mm => apply_expression_scale::<$mm>(
+                        &mut sens, prog, &pk, &pd, &slots, theta, eta,
+                        &subject.covariates, n_theta, n_eta,
+                    ),)+
+                    _ => {}
+                }
+            };
+        }
+        disp_scale!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
     }
     // LTBS: transform the full jet to `g = ln(f)` (after scaling), mirroring
     // `pk::apply_log_transform`. With `inv = 1/f`:
@@ -2122,5 +2280,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `[scaling] obs_scale = 1000 / V` with `V = TVV·exp(ETA_V)`: an
+    /// η/θ-dependent `ExpressionScale`. The provider divides the whole jet by the
+    /// scale via the differentiable scale program (quotient rule), so its exact
+    /// value/∂η/∂²η/∂θ/∂²η∂θ must match FD of the production predictor (which
+    /// applies the same scale through `apply_scaling`).
+    #[test]
+    fn provider_expression_scale_matches_production() {
+        let src = WARFARIN.replace(
+            "[error_model]\n  DV ~ proportional(PROP_ERR)",
+            "[error_model]\n  DV ~ proportional(PROP_ERR)\n[scaling]\n  obs_scale = 1000 / V",
+        );
+        let model = parse_model_string(&src).expect("scaling model parses");
+        assert!(
+            matches!(
+                model.scaling,
+                ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+            ),
+            "model must carry a differentiable scale program"
+        );
+        assert!(
+            analytical_supported(&model),
+            "η/θ-dependent ExpressionScale must be provider-supported"
+        );
+        let subject = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_full_provider_vs_fd(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
     }
 }

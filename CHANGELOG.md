@@ -19,6 +19,15 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **Analytic sensitivities for expression output scaling** (`[scaling] obs_scale =
+  <expr>`) on analytical PK models. An `obs_scale` expression that references
+  individual parameters, θ, or covariates (e.g. `1000 / V`, `WT / 70`) is now
+  compiled to a `Dual2`-differentiable program, so the analytic FOCE/FOCEI outer
+  gradient differentiates the scaled prediction `f / scale` exactly (quotient
+  rule) instead of falling back to finite differences. Validated against finite
+  differences of the production predictor and against a NONMEM reference (#367).
+
 ### Fixed
 - **Overlapping steady-state infusions (`T_inf > II`)** are now solved exactly for
   the analytical 1-/2-/3-compartment models instead of being skipped. Previously

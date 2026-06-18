@@ -1115,8 +1115,15 @@ pub enum ScalingSpec {
     /// Constant divisor applied to every prediction.
     ScalarScale(f64),
     /// Per-subject divisor evaluated from `(theta, eta, covariates, pk)`.
-    /// Used for expressions like `obs_scale = 1000 / V`.
-    ExpressionScale { scale_fn: ScaleFn },
+    /// Used for expressions like `obs_scale = 1000 / V`. `deriv` is the same
+    /// expression compiled to a `Dual2`-differentiable program (issue #367), so
+    /// the analytic sensitivity provider can differentiate `f / scale` exactly;
+    /// `None` for hand-constructed specs / closures with no parsed expression
+    /// (those fall back to finite differences).
+    ExpressionScale {
+        scale_fn: ScaleFn,
+        deriv: Option<crate::parser::model_parser::ScaleDerivProgram>,
+    },
     /// Per-CMT dispatch for multi-analyte models (parent+metabolite,
     /// sum-of-moieties, free vs total, ...). Key is the 1-based CMT
     /// index from the data file's CMT column (matches
@@ -1182,7 +1189,7 @@ impl ScalingSpec {
                 };
                 vec![v; n]
             }
-            Self::ExpressionScale { scale_fn } => {
+            Self::ExpressionScale { scale_fn, .. } => {
                 let s = scale_fn(theta, eta, covariates, pk);
                 let v = if s > 0.0 && s.is_finite() {
                     s
@@ -1198,7 +1205,7 @@ impl ScalingSpec {
                         let s = match inner {
                             Self::None => 1.0,
                             Self::ScalarScale(k) => *k,
-                            Self::ExpressionScale { scale_fn } => {
+                            Self::ExpressionScale { scale_fn, .. } => {
                                 scale_fn(theta, eta, covariates, pk)
                             }
                             Self::PerCmt(_) => {

@@ -123,6 +123,18 @@ scale expression that explicitly references eta (e.g.
 while FD captures it numerically — set `gradient = fd` if you need the
 eta sensitivity in the gradient.
 
+**Analytic sensitivity provider (the gradient-based outer optimizers).**
+Separately from the `gradient = ad` (Enzyme) path above, the analytic
+sensitivity provider that drives the gradient-based outer optimizers
+(`bfgs`, `lbfgs`, `slsqp`, …) on analytical 1-/2-/3-compartment models
+now compiles an `obs_scale` *expression* to a `Dual2`-differentiable
+program and differentiates the scaled prediction `f / scale` **exactly**
+— including the η and θ dependence the subject-static AD note above drops.
+So an η-dependent scale like `1000 / V` is handled exactly by the analytic
+FOCE/FOCEI outer gradient with no `gradient = fd` needed (the per-subject
+inner EBE loop still uses finite differences for these models, matching
+the LTBS choice).
+
 ## Interaction with SDE / `[diffusion]`
 
 In Phase 1, `[scaling]` is **not supported** on SDE models. The EKF /

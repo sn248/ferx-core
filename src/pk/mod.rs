@@ -1801,7 +1801,10 @@ mod tests {
         let bad_returns = [0.0_f64, -1.0_f64, f64::NAN, f64::INFINITY];
         for &val in &bad_returns {
             let scale_fn: crate::types::ScaleFn = Box::new(move |_, _, _, _| val);
-            let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn });
+            let model = model_with_scaling(ScalingSpec::ExpressionScale {
+                scale_fn,
+                deriv: None,
+            });
             let subj = one_subject_for_scaling();
             let mut preds = vec![1.0, 2.0, 3.0];
             apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
@@ -1843,7 +1846,10 @@ mod tests {
             Box::new(|_theta, _eta, cov: &HashMap<String, f64>, _pk: &PkParams| {
                 cov.get("WT").copied().unwrap_or(70.0) / 70.0
             });
-        let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn });
+        let model = model_with_scaling(ScalingSpec::ExpressionScale {
+            scale_fn,
+            deriv: None,
+        });
         let mut subj = one_subject_for_scaling();
         subj.covariates.insert("WT".to_string(), 84.0); // scale = 84/70 = 1.2
         let mut preds = vec![12.0, 24.0];
@@ -1862,7 +1868,10 @@ mod tests {
             Box::new(|_theta, _eta, _cov: &HashMap<String, f64>, pk: &PkParams| {
                 pk.values[crate::types::PK_IDX_V] / 10.0
             });
-        let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn });
+        let model = model_with_scaling(ScalingSpec::ExpressionScale {
+            scale_fn,
+            deriv: None,
+        });
         let subj = one_subject_for_scaling();
         let mut preds = vec![100.0, 50.0];
         apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
@@ -1999,7 +2008,10 @@ mod tests {
     fn test_build_obs_scale_array_expression() {
         // Closure returns 5.0; array should be 5.0 for every obs.
         let scale_fn: crate::types::ScaleFn = Box::new(|_, _, _, _| 5.0);
-        let spec = ScalingSpec::ExpressionScale { scale_fn };
+        let spec = ScalingSpec::ExpressionScale {
+            scale_fn,
+            deriv: None,
+        };
         let pk = PkParams::default();
         let arr = spec.build_obs_scale_array(&[], &[], &HashMap::new(), &pk, &[1; 3]);
         assert_eq!(arr, vec![5.0; 3]);

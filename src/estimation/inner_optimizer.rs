@@ -1234,6 +1234,15 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     if model.log_transform {
         return false;
     }
+    // `ExpressionScale` keeps the FD inner gradient (the light provider doesn't
+    // carry the scale quotient-rule); the analytic *outer* gradient still serves
+    // it. Mirrors the LTBS choice above.
+    if matches!(
+        model.scaling,
+        crate::types::ScalingSpec::ExpressionScale { .. }
+    ) {
+        return false;
+    }
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
         return false;
@@ -2699,6 +2708,7 @@ mod iov_tests {
         // Expression-scale obs_scale (conservatively AD-unsafe; could read eta).
         model.scaling = crate::types::ScalingSpec::ExpressionScale {
             scale_fn: Box::new(|_, _, _, _| 1.0),
+            deriv: None,
         };
         assert!(analytical_ad_unsupported(&model).is_some());
         model.scaling = crate::types::ScalingSpec::ScalarScale(1000.0);

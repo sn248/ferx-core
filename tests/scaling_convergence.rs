@@ -46,6 +46,65 @@ use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, FitOptions, Optimizer};
 use std::path::Path;
 
+/// Expression `obs_scale` (`obs_scale = TVSCALE`, TVSCALE fixed at 10) routed
+/// through the differentiable scale program must reproduce the constant-scale
+/// NONMEM reference (`tests/nonmem/warfarin_scaled.lst`). This exercises the
+/// `ExpressionScale` analytic path — the scale's `∂/∂(θ,η)` jet is evaluated by a
+/// `Dual2`-differentiable bytecode program (not a constant divisor) — and, with
+/// TVSCALE fixed, the optimum is identical to the scalar case (#367).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored expression-scaling cross-check: opt in with --features slow-tests"
+)]
+fn expression_scale_matches_nonmem() {
+    let model = parse_model_file(Path::new("examples/warfarin_exprscale_additive.ferx"))
+        .expect("expression-scaled model must parse");
+    assert!(
+        matches!(
+            model.scaling,
+            ferx_core::ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+        ),
+        "model must carry a differentiable ExpressionScale program"
+    );
+    let population = read_nonmem_csv(Path::new("tests/nonmem/warfarin_scaled.csv"), None, None)
+        .expect("scaled warfarin data must load");
+
+    let mut opt = FitOptions::default();
+    opt.optimizer = Optimizer::Lbfgs;
+    opt.inner_tol = 1e-8;
+    opt.outer_maxiter = 300;
+    opt.run_covariance_step = false;
+    opt.verbose = false;
+    let r = fit(&model, &population, &model.default_params, &opt)
+        .expect("analytic expression-scale fit must succeed");
+    assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
+
+    // Same NONMEM 7.5.1 reference as the constant-scale case (S2 = V*10):
+    // the differentiable scale program reproduces it to ~5 significant figures.
+    let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
+    const NM_OFV: f64 = -740.83761;
+    const NM_TVCL: f64 = 0.132943;
+    const NM_TVV: f64 = 7.72787;
+    const NM_TVKA: f64 = 0.810919;
+    const NM_ADD_SD: f64 = 0.0086872;
+    assert!(
+        (r.ofv - NM_OFV).abs() < 0.1,
+        "OFV {:.4} vs NONMEM {NM_OFV:.4}",
+        r.ofv
+    );
+    assert!(rel(r.theta[0], NM_TVCL) < 0.01, "TVCL {}", r.theta[0]);
+    assert!(rel(r.theta[1], NM_TVV) < 0.01, "TVV {}", r.theta[1]);
+    assert!(rel(r.theta[2], NM_TVKA) < 0.02, "TVKA {}", r.theta[2]);
+    assert!(rel(r.sigma[0], NM_ADD_SD) < 0.02, "ADD {}", r.sigma[0]);
+    // TVSCALE stays fixed at its declared value.
+    assert!(
+        (r.theta[3] - 10.0).abs() < 1e-9,
+        "TVSCALE must stay fixed at 10, got {}",
+        r.theta[3]
+    );
+}
+
 /// The analytic scaling path converges and the gradient-based (analytic
 /// L-BFGS) and gradient-free (default BOBYQA) optimizers agree — the scaling jet
 /// transform is self-consistent with the scaled production objective. Pins ferx

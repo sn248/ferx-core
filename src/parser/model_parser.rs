@@ -3649,6 +3649,40 @@ fn build_obs_scale_spec(
         .enumerate()
         .map(|(i, name)| (name.clone(), pk_indices.get(i).copied().unwrap_or(i)))
         .collect();
+    // Differentiable scale program (issue #367): compile the same expression to
+    // bytecode over (θ, η, individual-parameter vars, covariates) so the analytic
+    // sensitivity provider can differentiate `f / scale` exactly instead of
+    // finite-differencing the opaque closure. `Variable(name)` (an individual
+    // parameter) → var slot `i` (flat PK slot `pk_indices[i]`); covariates → cov
+    // slots; θ/η are read directly from the seed duals.
+    let deriv = {
+        let mut e = expr.clone();
+        let var_idx: HashMap<String, usize> = indiv_var_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i))
+            .collect();
+        let var_to_pk_slot: Vec<usize> = (0..indiv_var_names.len())
+            .map(|i| pk_indices.get(i).copied().unwrap_or(i))
+            .collect();
+        let mut cov_set = std::collections::HashSet::new();
+        collect_covariates(&e, &mut cov_set);
+        let mut cov_names: Vec<String> = cov_set.into_iter().collect();
+        cov_names.sort();
+        let cov_idx: HashMap<String, usize> = cov_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+        resolve_expr_indices(&mut e, &var_idx, &cov_idx);
+        Some(ScaleDerivProgram {
+            bc: compile_bytecode(&e),
+            n_theta: theta_names.len(),
+            n_eta: eta_names.len(),
+            var_to_pk_slot,
+            cov_names,
+        })
+    };
     let scale_fn: ScaleFn = Box::new(
         move |theta: &[f64],
               eta: &[f64],
@@ -3665,7 +3699,7 @@ fn build_obs_scale_spec(
             eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
         },
     );
-    Ok(ScalingSpec::ExpressionScale { scale_fn })
+    Ok(ScalingSpec::ExpressionScale { scale_fn, deriv })
 }
 
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
@@ -8376,6 +8410,89 @@ impl OdeOutputProgram {
         }
         let empty_nn: Vec<Vec<f64>> = Vec::new();
         eval_bytecode_g::<Dual2<N>>(&self.bc, &[], &[], &[], vars, &empty_nn, stack)
+    }
+}
+
+/// Differentiable form of an `obs_scale = <expr>` scaling expression (issue #367).
+/// Holds the scale expression compiled to bytecode plus the layout to evaluate it
+/// over `Dual2<M>` seeded on (θ, η): θ/η references read the seed duals directly;
+/// individual-parameter references read `vars[i]`, where var slot `i` is fed by
+/// the provider as a dual for flat PK slot `var_to_pk_slot[i]` (value + ∂p/∂(θ,η));
+/// covariates are constants. This lets the analytic sensitivity provider
+/// differentiate the scaled prediction `f / scale` exactly instead of falling back
+/// to finite differences for `ExpressionScale` models. Mirrors [`OdeOutputProgram`].
+pub struct ScaleDerivProgram {
+    bc: Bytecode,
+    n_theta: usize,
+    n_eta: usize,
+    /// `vars` slot `i` (the bytecode's `PushVar(i)`) → flat PK slot whose value
+    /// and `∂/∂(θ,η)` the provider feeds in. Parallel to the individual-parameter
+    /// declaration order.
+    var_to_pk_slot: Vec<usize>,
+    cov_names: Vec<String>,
+}
+
+impl ScaleDerivProgram {
+    /// Dual width needed to seed every (θ, η) axis.
+    pub(crate) fn n_axes(&self) -> usize {
+        self.n_theta + self.n_eta
+    }
+    pub(crate) fn n_theta_axis(&self) -> usize {
+        self.n_theta
+    }
+    pub(crate) fn n_eta_axis(&self) -> usize {
+        self.n_eta
+    }
+    /// `vars` slot → flat PK slot (so the provider knows which PK params to seed).
+    pub(crate) fn var_to_pk_slot(&self) -> &[usize] {
+        &self.var_to_pk_slot
+    }
+
+    /// Evaluate the scale over `Dual2<M>` seeded on (θ, η): `θ_m → var(·, m)`,
+    /// `η_k → var(·, n_theta + k)`. `var_duals[i]` is the dual for the individual
+    /// parameter at PK slot `var_to_pk_slot[i]` (value + `∂/∂(θ,η)`). Returns the
+    /// scale's value, gradient `∂scale/∂(θ,η)`, and Hessian. Requires `M ≥ n_axes()`.
+    pub(crate) fn eval_scale_dual<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        cov: &HashMap<String, f64>,
+        var_duals: &[crate::sens::dual2::Dual2<M>],
+    ) -> crate::sens::dual2::Dual2<M> {
+        use crate::sens::dual2::Dual2;
+        let theta_d: Vec<Dual2<M>> = theta
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                if m < M {
+                    Dual2::var(v, m)
+                } else {
+                    Dual2::constant(v)
+                }
+            })
+            .collect();
+        let eta_d: Vec<Dual2<M>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                let dim = self.n_theta + k;
+                if dim < M {
+                    Dual2::var(v, dim)
+                } else {
+                    Dual2::constant(v)
+                }
+            })
+            .collect();
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| cov.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let empty_nn: Vec<Vec<f64>> = Vec::new();
+        let mut stack: Vec<Dual2<M>> = Vec::new();
+        eval_bytecode_g::<Dual2<M>>(
+            &self.bc, &theta_d, &eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
+        )
     }
 }
 
@@ -15896,7 +16013,7 @@ if (1 > 0) {
         let src = analytical_model_with_scaling(Some("  obs_scale = TVV / 10\n"));
         let model = parse_model_string(&src).expect("expression scaling parses");
         match model.scaling {
-            ScalingSpec::ExpressionScale { ref scale_fn } => {
+            ScalingSpec::ExpressionScale { ref scale_fn, .. } => {
                 // TVV = 50 (the parsed default), so scale = 50/10 = 5.
                 let theta = vec![1.0, 50.0]; // [TVCL, TVV]
                 let eta = vec![0.0];
@@ -15910,11 +16027,106 @@ if (1 > 0) {
     }
 
     #[test]
+    fn scale_deriv_program_matches_fd() {
+        // The differentiable scale program's `∂scale/∂(θ,η)` must match FD of the
+        // scale closure composed with `pk_param_fn` (issue #367). `obs_scale =
+        // 1000 / V`, V = TVV·exp(ETA_V) — so the scale depends on θ (via TVV) and
+        // η (via ETA_V) through the individual parameter V.
+        use crate::sens::dual2::Dual2;
+        let src = "\
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 0.20
+  sigma PROP ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP)
+[scaling]
+  obs_scale = 1000 / V
+";
+        let model = parse_model_string(src).expect("scaling model parses");
+        let (scale_fn, prog) = match &model.scaling {
+            ScalingSpec::ExpressionScale {
+                scale_fn,
+                deriv: Some(p),
+            } => (scale_fn, p),
+            other => panic!("expected ExpressionScale with deriv, got {:?}", other),
+        };
+        assert_eq!(prog.n_theta_axis(), 3);
+        assert_eq!(prog.n_eta_axis(), 3);
+        assert_eq!(prog.n_axes(), 6);
+
+        const M: usize = 6; // n_theta(3) + n_eta(3)
+        let theta = vec![0.13, 8.0, 1.0];
+        let eta = vec![0.1, -0.05, 0.2];
+        let cov: HashMap<String, f64> = HashMap::new();
+
+        // Individual-parameter duals over (θ, η) from the same program the
+        // provider uses, mapped to the scale program's var slots.
+        let ipp = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("indiv param program");
+        let pk_duals = ipp.eval_param_duals::<M>(&theta, &eta, &cov);
+        let pk_slots = ipp.pk_slots();
+        let mut slot_dual: HashMap<usize, Dual2<M>> = HashMap::new();
+        for (i, &s) in pk_slots.iter().enumerate() {
+            slot_dual.insert(s, pk_duals[i]);
+        }
+        let pk_vals = (model.pk_param_fn)(&theta, &eta, &cov);
+        let var_duals: Vec<Dual2<M>> = prog
+            .var_to_pk_slot()
+            .iter()
+            .map(|&s| {
+                slot_dual
+                    .get(&s)
+                    .copied()
+                    .unwrap_or_else(|| Dual2::constant(pk_vals.values[s]))
+            })
+            .collect();
+        let scale = prog.eval_scale_dual::<M>(&theta, &eta, &cov, &var_duals);
+
+        // Reference: scale as a function of (θ, η) through pk_param_fn.
+        let g = |th: &[f64], et: &[f64]| -> f64 {
+            let pk = (model.pk_param_fn)(th, et, &cov);
+            scale_fn(th, et, &cov, &pk)
+        };
+        approx::assert_relative_eq!(scale.value, g(&theta, &eta), max_relative = 1e-12);
+        let h = 1e-6;
+        for m in 0..3 {
+            let mut tp = theta.clone();
+            tp[m] += h;
+            let mut tm = theta.clone();
+            tm[m] -= h;
+            let fd = (g(&tp, &eta) - g(&tm, &eta)) / (2.0 * h);
+            approx::assert_relative_eq!(scale.grad[m], fd, max_relative = 1e-5, epsilon = 1e-9);
+        }
+        for k in 0..3 {
+            let mut ep = eta.clone();
+            ep[k] += h;
+            let mut em = eta.clone();
+            em[k] -= h;
+            let fd = (g(&theta, &ep) - g(&theta, &em)) / (2.0 * h);
+            approx::assert_relative_eq!(scale.grad[3 + k], fd, max_relative = 1e-5, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
     fn test_parse_scaling_expression_uses_covariate() {
         let src = analytical_model_with_scaling(Some("  obs_scale = WT / 70\n"));
         let model = parse_model_string(&src).expect("covariate scaling parses");
         match model.scaling {
-            ScalingSpec::ExpressionScale { ref scale_fn } => {
+            ScalingSpec::ExpressionScale { ref scale_fn, .. } => {
                 let theta = vec![1.0, 50.0];
                 let eta = vec![0.0];
                 let mut cov = HashMap::new();
@@ -15937,7 +16149,7 @@ if (1 > 0) {
         let src = analytical_model_with_scaling(Some("  obs_scale = 1000 / V\n"));
         let model = parse_model_string(&src).expect("indiv-param ref in obs_scale parses");
         match model.scaling {
-            ScalingSpec::ExpressionScale { ref scale_fn } => {
+            ScalingSpec::ExpressionScale { ref scale_fn, .. } => {
                 let theta = vec![1.0, 50.0]; // [TVCL, TVV]
                 let eta = vec![0.0];
                 let cov = HashMap::new();

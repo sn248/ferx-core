@@ -400,21 +400,6 @@ fn iov_combined_derivs<const MP: usize>(
     }
 }
 
-/// Per PK-axis chain info for one occasion group's seeded PK parameter: how that
-/// parameter's value moves the **stacked** random-effects vector and θ. Built once
-/// per (group, differentiated-PK-row); the per-observation chain reads these.
-struct AxisChain {
-    /// `∂p/∂stacked_η`, length `n_stacked`.
-    dstacked: Vec<f64>,
-    /// `∂p/∂θ_m`, length `n_theta`.
-    dtheta: Vec<f64>,
-    /// `∂²p/∂stacked_η²`, `n_stacked × n_stacked` (sparse: only this group's
-    /// {η_bsv, κ} support is non-zero).
-    d2stacked: Vec<Vec<f64>>,
-    /// `∂²p/∂stacked_η∂θ`, `n_stacked × n_theta`.
-    d2stacked_theta: Vec<Vec<f64>>,
-}
-
 /// True when [`subject_sensitivities_iov`] can serve this model: analytical 1-cpt
 /// IOV (`n_kappa > 0`), no ODE, no scaling/LTBS/lagtime/TV-cov, a usable
 /// `[individual_parameters]` program whose axes are `(n_theta, n_eta_bsv+n_kappa)`.
@@ -542,89 +527,108 @@ pub fn subject_sensitivities_iov(
         group_cd.push(cd);
     }
 
-    // Per PK-axis chain info: axis `a = g·n_diff + i` ↔ group `g`, differentiated
-    // row `i` (PK slot `slots[i]`). Map the combined-layout derivatives to the
-    // stacked η layout: η_bsv columns → shared `0..n_eta`; κ columns → group g's
-    // block `n_eta + g·n_kappa ..`.
-    let n_axes = k_groups * n_diff;
-    let mut axis: Vec<AxisChain> = Vec::with_capacity(n_axes);
-    for g in 0..k_groups {
-        let cd = &group_cd[g];
-        let kappa_base = n_eta + g * n_kappa;
-        // Combined index `c` → stacked index.
-        let stacked_of = |c: usize| -> usize {
-            if c < n_eta {
-                c
-            } else {
-                kappa_base + (c - n_eta)
-            }
-        };
-        for i in 0..n_diff {
-            let mut dstacked = vec![0.0; n_stacked];
-            let mut d2stacked = vec![vec![0.0; n_stacked]; n_stacked];
-            let mut d2stacked_theta = vec![vec![0.0; n_theta]; n_stacked];
-            for a in 0..n_eff {
-                dstacked[stacked_of(a)] = cd.deta[i][a];
-                for b in 0..n_eff {
-                    d2stacked[stacked_of(a)][stacked_of(b)] = cd.d2eta[i][a][b];
-                }
-                for m in 0..n_theta {
-                    d2stacked_theta[stacked_of(a)][m] = cd.d2eta_theta[i][a][m];
-                }
-            }
-            axis.push(AxisChain {
-                dstacked,
-                dtheta: cd.dtheta[i].clone(),
-                d2stacked,
-                d2stacked_theta,
-            });
-        }
-    }
-
-    // Build per-event seeded dual PK params and run the walk, dispatched on the
-    // total PK-axis count `n_axes = K·n_diff`.
+    // Seed each occasion group's PK-param duals directly on the stacked unknowns
+    // `(θ, η_bsv, κ)` and run the walk over `Dual2<M>` (M = n_theta + n_stacked).
+    // The walk then yields `∂conc/∂unknowns` directly — no manual chain — and the
+    // dual width tracks the *unknowns* (n_eta + K·n_kappa + n_theta), not the PK
+    // axes (K·n_diff), so it stays narrow for many occasions / more compartments
+    // whenever n_kappa < n_diff (the usual κ-on-CL case).
+    let m_dim = n_theta + n_stacked;
     macro_rules! disp {
-        ($($n:literal),+) => {
-            match n_axes {
-                $($n => run_obs_iov::<$n>(
-                    model, subject, oral, &occ_to_k, &group_pk, &slot_row, n_diff,
-                    &axis, n_stacked, n_theta,
+        ($($m:literal),+) => {
+            match m_dim {
+                $($m => run_obs_iov::<$m>(
+                    model, subject, oral, &occ_to_k, &group_pk, &group_cd, &slot_row,
+                    n_eta, n_kappa, n_eff, n_stacked, n_theta,
                 ),)+
                 _ => None,
             }
         };
     }
-    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
+    disp!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    )
 }
 
-/// The dual-width-`N` inner of [`subject_sensitivities_iov`]: seed each occasion
-/// group's PK params on its axis block, run the event-driven sensitivity walk, and
-/// chain `∂conc/∂pk` (walk grad/Hess over the `N` PK axes) to the stacked η and θ
-/// via the precomputed [`AxisChain`] table — the `run_obs` two-level formula.
+/// The dual-width-`M` inner of [`subject_sensitivities_iov`] (`M = n_theta +
+/// n_stacked`). Builds each occasion group's PK-param duals seeded directly on the
+/// stacked `(θ, η_bsv, κ)` unknowns (from that group's [`CombinedDerivs`]), runs
+/// the event-driven sensitivity walk over `Dual2<M>`, and reads `∂conc/∂unknowns`
+/// straight off the resulting dual — the walk composes the whole chain, so there
+/// is no separate two-level assembly. Dual dimension `m < n_theta` is `θ_m`;
+/// `n_theta + p` is stacked-η axis `p`.
 #[allow(clippy::too_many_arguments)]
-fn run_obs_iov<const N: usize>(
+fn run_obs_iov<const M: usize>(
     model: &CompiledModel,
     subject: &Subject,
     oral: bool,
     occ_to_k: &std::collections::HashMap<u32, usize>,
     group_pk: &[crate::types::PkParams],
+    group_cd: &[CombinedDerivs],
     slot_row: &[Option<usize>; N_PK],
-    n_diff: usize,
-    axis: &[AxisChain],
+    n_eta: usize,
+    n_kappa: usize,
+    n_eff: usize,
     n_stacked: usize,
     n_theta: usize,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_one_cpt_g, OneCptPk};
 
-    // Seed PK slot `s` (value from group `g`'s pk) on axis `g·n_diff + row(s)`.
-    let mk = |g: usize| -> OneCptPk<Dual2<N>> {
+    // Build the `Dual2<M>` for PK slot `s` (row `i` of group `g`'s differentiated
+    // params), carrying value `pk.values[s]` and `∂/∂(θ, stacked-η)`. The combined
+    // column `c` maps to stacked axis: η_bsv (`c < n_eta`) → shared `n_theta + c`;
+    // κ (`c ≥ n_eta`) → group g's block `n_theta + n_eta + g·n_kappa + (c−n_eta)`.
+    // The θ-θ Hessian block is unused downstream (left zero), mirroring the scale
+    // program's var-dual construction.
+    let seed = |g: usize, i: usize, val: f64| -> Dual2<M> {
+        let cd = &group_cd[g];
+        let kappa_base = n_theta + n_eta + g * n_kappa;
+        let stacked_axis = |c: usize| -> usize {
+            if c < n_eta {
+                n_theta + c
+            } else {
+                kappa_base + (c - n_eta)
+            }
+        };
+        let mut grad = [0.0; M];
+        let mut hess = [[0.0; M]; M];
+        for m in 0..n_theta.min(M) {
+            grad[m] = cd.dtheta[i][m];
+        }
+        for c in 0..n_eff {
+            let ax = stacked_axis(c);
+            if ax < M {
+                grad[ax] = cd.deta[i][c];
+            }
+            for d in 0..n_eff {
+                let bx = stacked_axis(d);
+                if ax < M && bx < M {
+                    hess[ax][bx] = cd.d2eta[i][c][d];
+                }
+            }
+            for m in 0..n_theta.min(M) {
+                if ax < M {
+                    let v = cd.d2eta_theta[i][c][m];
+                    hess[ax][m] = v;
+                    hess[m][ax] = v;
+                }
+            }
+        }
+        Dual2 {
+            value: val,
+            grad,
+            hess,
+        }
+    };
+
+    // Per-group PK param duals: seed differentiated slots, constants otherwise.
+    let mk = |g: usize| -> OneCptPk<Dual2<M>> {
         let pk = &group_pk[g];
-        let base = g * n_diff;
-        let dv = |slot: usize, val: f64| -> Dual2<N> {
+        let dv = |slot: usize, val: f64| -> Dual2<M> {
             match slot_row[slot] {
-                Some(i) => Dual2::<N>::var(val, base + i),
-                None => Dual2::<N>::constant(val),
+                Some(i) => seed(g, i, val),
+                None => Dual2::<M>::constant(val),
             }
         };
         OneCptPk {
@@ -638,23 +642,30 @@ fn run_obs_iov<const N: usize>(
     // Per-event params: doses by dose-occasion, observations by obs-occasion. A
     // dose/obs whose occasion has no group makes the whole subject fall back
     // (keeps the first-cut scope to the clean, fully-grouped shape).
-    let mut pk_at_dose: Vec<OneCptPk<Dual2<N>>> = Vec::with_capacity(subject.doses.len());
+    let mut group_dual: Vec<Option<OneCptPk<Dual2<M>>>> = vec![None; group_pk.len()];
+    let mut event_dual = |g: usize| -> OneCptPk<Dual2<M>> {
+        if group_dual[g].is_none() {
+            group_dual[g] = Some(mk(g));
+        }
+        group_dual[g].unwrap()
+    };
+    let mut pk_at_dose: Vec<OneCptPk<Dual2<M>>> = Vec::with_capacity(subject.doses.len());
     for d in 0..subject.doses.len() {
         let occ = subject.dose_occasions.get(d).copied()?;
         let g = *occ_to_k.get(&occ)?;
-        pk_at_dose.push(mk(g));
+        pk_at_dose.push(event_dual(g));
     }
-    let mut pk_at_obs: Vec<OneCptPk<Dual2<N>>> = Vec::with_capacity(subject.obs_times.len());
+    let mut pk_at_obs: Vec<OneCptPk<Dual2<M>>> = Vec::with_capacity(subject.obs_times.len());
     for j in 0..subject.obs_times.len() {
         let occ = subject.occasions.get(j).copied()?;
         let g = *occ_to_k.get(&occ)?;
-        pk_at_obs.push(mk(g));
+        pk_at_obs.push(event_dual(g));
     }
 
     // No lagtime in IOV scope → zero dose lagtimes.
     let dose_lagtimes = vec![0.0; subject.doses.len()];
     let schedule = EventSchedule::for_subject(subject, model.pk_model, &dose_lagtimes);
-    let conc = event_driven_sens_one_cpt_g::<Dual2<N>>(
+    let conc = event_driven_sens_one_cpt_g::<Dual2<M>>(
         oral,
         subject,
         &schedule,
@@ -663,61 +674,31 @@ fn run_obs_iov<const N: usize>(
         &[],
     );
 
-    let n_axes = N;
     let mut obs_out = Vec::with_capacity(conc.len());
     for c in &conc {
-        // Clamp parity with production `conc.max(0.0)`.
-        let (g, h) = if c.value < 0.0 {
-            ([0.0; N], [[0.0; N]; N])
-        } else {
-            (c.grad, c.hess)
-        };
-
+        // Clamp parity with production `conc.max(0.0)`: a negative value's
+        // derivatives vanish (consistency with the OFV).
+        let neg = c.value < 0.0;
         let mut df_deta = vec![0.0; n_stacked];
         let mut df_dtheta = vec![0.0; n_theta];
         let mut d2f_deta2 = vec![0.0; n_stacked * n_stacked];
         let mut d2f_deta_dtheta = vec![0.0; n_stacked * n_theta];
-
-        for a in 0..n_axes {
-            let ga = g[a];
-            let ax = &axis[a];
+        if !neg {
             for p in 0..n_stacked {
-                df_deta[p] += ga * ax.dstacked[p];
+                df_deta[p] = c.grad[n_theta + p];
+                for q in 0..n_stacked {
+                    d2f_deta2[p * n_stacked + q] = c.hess[n_theta + p][n_theta + q];
+                }
+                for m in 0..n_theta {
+                    d2f_deta_dtheta[p * n_theta + m] = c.hess[n_theta + p][m];
+                }
             }
             for m in 0..n_theta {
-                df_dtheta[m] += ga * ax.dtheta[m];
+                df_dtheta[m] = c.grad[m];
             }
         }
-        for p in 0..n_stacked {
-            for q in 0..n_stacked {
-                let mut acc = 0.0;
-                for a in 0..n_axes {
-                    let dap = axis[a].dstacked[p];
-                    for b in 0..n_axes {
-                        acc += h[a][b] * dap * axis[b].dstacked[q];
-                    }
-                    acc += g[a] * axis[a].d2stacked[p][q];
-                }
-                d2f_deta2[p * n_stacked + q] = acc;
-            }
-        }
-        for p in 0..n_stacked {
-            for m in 0..n_theta {
-                let mut acc = 0.0;
-                for a in 0..n_axes {
-                    let dap = axis[a].dstacked[p];
-                    for b in 0..n_axes {
-                        acc += h[a][b] * dap * axis[b].dtheta[m];
-                    }
-                    acc += g[a] * axis[a].d2stacked_theta[p][m];
-                }
-                d2f_deta_dtheta[p * n_theta + m] = acc;
-            }
-        }
-
-        let fval = if c.value < 0.0 { 0.0 } else { c.value };
         obs_out.push(ObsSens {
-            f: fval,
+            f: if neg { 0.0 } else { c.value },
             df_deta,
             d2f_deta2,
             df_dtheta,

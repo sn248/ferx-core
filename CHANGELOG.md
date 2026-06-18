@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic sensitivities for oral infusion** on the analytical 1-/2-/3-cpt
+  models: a depot-bypass infusion into the central compartment (RATE>0 into cmt 2,
+  #350) and a zero-order input into the oral depot (RATE>0 into cmt 1, #400) are
+  now carried through the second-order-dual event-driven walk (`rate_central`/
+  `rate_depot` forced responses), so these subjects drive the exact analytic
+  FOCE/FOCEI gradient instead of falling back to finite differences. Validated
+  against finite differences of the production predictor across 1-/2-/3-cpt and
+  both infusion compartments (#367).
 - **Analytic sensitivities for expression output scaling** (`[scaling] obs_scale =
   <expr>`) on analytical PK models. An `obs_scale` expression that references
   individual parameters, θ, or covariates (e.g. `1000 / V`, `WT / 70`) is now

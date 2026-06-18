@@ -65,9 +65,12 @@ fn fit_runs_on_reset_iv_washout_dataset() {
     let model = parsed.model;
     let options = parsed.fit_options;
 
-    let population =
-        read_nonmem_csv(std::path::Path::new("data/reset_iv_washout.csv"), None, None)
-            .expect("reset dataset loads");
+    let population = read_nonmem_csv(
+        std::path::Path::new("data/reset_iv_washout.csv"),
+        None,
+        None,
+    )
+    .expect("reset dataset loads");
 
     assert!(
         population.subjects.iter().any(|s| s.has_resets()),

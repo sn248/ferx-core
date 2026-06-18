@@ -105,12 +105,15 @@ Gaussian residual is undefined when the observed value is censored).
 - **Activation requires both pieces**: the `CENS` column in the data file *and*
   `bloq_method = m3` in `[fit_options]`. Without the option, `CENS=1` rows are
   treated as ordinary observations at the LLOQ value, which biases the fit.
-- **FOCE is auto-promoted to FOCEI on affected subjects.** Mixing linearized
-  Gaussian residuals with non-linearized `log Φ` terms produces inconsistent
-  OFVs near the LLOQ boundary, so when `method = foce` and a subject has any
-  `CENS=1` row, that subject is evaluated with η-interaction. A notice is
-  written to `FitResult.warnings`; set `method = focei` explicitly to silence
-  it.
+- **FOCE and FOCEI give different M3 optima.** `method = foce` keeps a consistent
+  Sheiner–Beal objective: censored rows leave the linearized marginal and re-enter
+  as `−log Φ((LLOQ − f̂)/√R⁰)` with the population (η=0) variance, matching NONMEM
+  `METHOD=1 LAPLACE` *without* INTER. `method = focei` evaluates the censored term
+  at the conditional variance (NONMEM with INTER). Both have exact analytic
+  gradients. On warfarin BLOQ the two land at meaningfully different `TVKA`
+  (FOCE ≈ 0.71, FOCEI ≈ 0.81), exactly as the corresponding NONMEM runs do — pick
+  the method to match your reference fit. (Earlier versions silently promoted
+  censored subjects to FOCEI under `method = foce`.)
 - **Gauss-Newton caveat.** With `method = gn` or `gn_hybrid`, the BHHH
   information-matrix approximation degrades as the BLOQ fraction grows (each
   censored row carries less Fisher information than its Gaussian counterpart).

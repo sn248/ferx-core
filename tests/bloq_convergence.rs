@@ -41,15 +41,15 @@
 //! the censored rows carries a different additive constant than ferx's M3 term
 //! (ferx −217.18 vs NONMEM −216.79), so the cross-check pins the MLE, not the OFV.
 //!
-//! Convergence note: FOCEI-M3 now uses an exact closed-form censored outer
-//! gradient (`prepare`'s M3 branch), so a gradient optimizer reaches the true
-//! minimum directly. Plain FOCE-M3 forces the reconverged-FD gradient
-//! (`m3_censored_present && !interaction`). Without one of these a gradient
-//! optimizer stalled on this flat KA ridge at TVKA ≈ 1.10 / OFV ≈ −213.8 (the
-//! stale `docs/src/examples/bloq.md` numbers); BOBYQA reconverges anyway.
+//! Convergence note: both FOCEI-M3 (`prepare`'s M3 branch) and FOCE-M3
+//! (`subject_packed_gradient_foce`, censored rows excluded from R̃) now have exact
+//! closed-form censored outer gradients, so a gradient optimizer reaches the true
+//! minimum directly. Without that, the fixed-EBE FD fallback was biased and a
+//! gradient optimizer stalled on this flat KA ridge at TVKA ≈ 1.10 / OFV ≈ −213.8;
+//! BOBYQA reconverges anyway.
 
 use ferx_core::parser::model_parser::parse_model_file;
-use ferx_core::{fit, read_nonmem_csv, FitOptions, Optimizer};
+use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
 use std::path::Path;
 
 /// The M3 analytic inner-gradient path (with the auto-reconverged outer gradient)
@@ -141,5 +141,74 @@ fn bloq_m3_analytic_lbfgs_matches_nonmem() {
         rel(om[2], NM_OM_KA) < 0.05,
         "ω²(KA) {} vs NM {NM_OM_KA}",
         om[2]
+    );
+}
+
+/// FOCE-M3 (no interaction) on the analytic FOCE censored gradient. ferx no longer
+/// promotes M3 subjects to FOCEI — plain FOCE keeps a consistent Sheiner–Beal
+/// objective with the censored rows entering as `−logΦ((LLOQ−f̂)/√R⁰)` (excluded
+/// from R̃, population variance). FOCE-M3 is a genuinely different optimum than
+/// FOCEI-M3 (TVKA ≈ 0.71 vs 0.81), matching NONMEM `METHOD=1 LAPLACE` (no INTER):
+/// `tests/nonmem/warfarin_bloq_foce.{ctl,lst}` gives TVCL 0.131073 / TVV 7.76460 /
+/// TVKA 0.711871 / PROP(SD) 0.011148, which ferx recovers to <1%.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored FOCE-M3 cross-check: opt in with --features slow-tests"
+)]
+fn bloq_m3_foce_analytic_matches_nonmem() {
+    let model = parse_model_file(Path::new("examples/warfarin_bloq.ferx"))
+        .expect("warfarin BLOQ model must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin_bloq.csv"), None, None)
+        .expect("warfarin BLOQ data must load");
+
+    // method = FOCE (no interaction) on the built-in L-BFGS analytic gradient.
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::Foce;
+    opts.optimizer = Optimizer::Lbfgs;
+    opts.inner_tol = 1e-8;
+    opts.outer_maxiter = 300;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("analytic FOCE-M3 fit must succeed");
+    assert!(
+        result.ofv.is_finite(),
+        "OFV must be finite, got {}",
+        result.ofv
+    );
+
+    // NONMEM 7.5.1 FOCE (no INTER) M3 MLE. OFV not compared (F_FLAG offset).
+    let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
+    const NM_TVCL: f64 = 0.131073;
+    const NM_TVV: f64 = 7.76460;
+    const NM_TVKA: f64 = 0.711871;
+    const NM_PROP_SD: f64 = 0.0111483;
+    assert!(
+        rel(result.theta[0], NM_TVCL) < 0.01,
+        "TVCL {} vs NM {NM_TVCL}",
+        result.theta[0]
+    );
+    assert!(
+        rel(result.theta[1], NM_TVV) < 0.01,
+        "TVV {} vs NM {NM_TVV}",
+        result.theta[1]
+    );
+    assert!(
+        rel(result.theta[2], NM_TVKA) < 0.02,
+        "TVKA {} vs NM {NM_TVKA}",
+        result.theta[2]
+    );
+    assert!(
+        rel(result.sigma[0], NM_PROP_SD) < 0.02,
+        "PROP {} vs NM {NM_PROP_SD}",
+        result.sigma[0]
+    );
+    // FOCE-M3 must be distinct from FOCEI-M3 (interaction shifts TVKA ~0.81).
+    assert!(
+        result.theta[2] < 0.76,
+        "FOCE TVKA {} should be well below FOCEI ~0.81",
+        result.theta[2]
     );
 }

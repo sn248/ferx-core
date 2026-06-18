@@ -1946,23 +1946,6 @@ fn sens_check_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// True when the model uses the M3 BLOQ likelihood and at least one subject has
-/// a censored row. For these the analytic outer gradient (`subject_packed_gradient`)
-/// declines on the censored subject — it differentiates the Gaussian data term,
-/// not `−logΦ(z)` — so the only consistent gradient is the EBE-reconverging FD
-/// one. Like IOV, M3 therefore forces the reconverged path; the fixed-EBE FD
-/// gradient (the `ad_population_gradient` fallback) is biased on the censored
-/// rows and stalls a gradient optimizer above the true minimum (validated vs
-/// NONMEM on warfarin BLOQ: reconverged reaches TVKA ≈ 0.81 / OFV ≈ −217, the
-/// fixed-EBE path stalls at TVKA ≈ 1.10 / OFV ≈ −213.8).
-fn m3_censored_present(model: &CompiledModel, population: &Population) -> bool {
-    matches!(model.bloq_method, BloqMethod::M3)
-        && population
-            .subjects
-            .iter()
-            .any(|s| s.cens.iter().any(|&c| c != 0))
-}
-
 /// Population gradient dispatcher. IOV models (`n_kappa > 0`) and M3-censored
 /// models use the EBE-reconverging FD gradient — their weakly-identified variance
 /// components / non-Gaussian censored rows need it — and everything else uses the
@@ -1990,13 +1973,11 @@ fn population_gradient(
 ) -> Vec<f64> {
     let reconverge = reconverge_this_eval(options, *grad_eval_idx);
     *grad_eval_idx += 1;
-    // FOCE-M3 forces the reconverged path: the plain-FOCE analytic gradient
-    // declines on censored subjects (`subject_packed_gradient_foce`) and the
-    // fixed-EBE FD fallback is biased there. FOCEI-M3 has an exact analytic
-    // censored gradient (`subject_packed_gradient` + `prepare`'s M3 branch), so it
-    // takes the analytic path like any other interaction fit.
-    let force_reconverge =
-        reconverge || (!options.interaction && m3_censored_present(model, population));
+    // M3-censored models now have an exact analytic censored gradient on both the
+    // FOCEI (`subject_packed_gradient` + `prepare`'s M3 branch) and the FOCE
+    // (`subject_packed_gradient_foce`, censored rows excluded from R̃ and added as
+    // `−logΦ`) paths, so M3 takes the analytic path like any other fit.
+    let force_reconverge = reconverge;
     // Analytic-sensitivity gradient (Almquist 2015 Eq. 23, closed form via the
     // `sens` provider): the exact marginal FOCEI gradient including the Eq. 46
     // EBE response on every θ/Ω/σ block — no fixed-EBE bias, no FD noise, so it

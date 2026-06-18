@@ -20,14 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
-- **Analytic M3 (BLOQ) FOCEI outer gradient** for analytical PK models: the exact
-  closed-form marginal gradient now covers M3-censored subjects under FOCEI. A
-  censored row enters the Almquist assembly as a data term `−logΦ((LLOQ−f)/√V)`
-  plus its true-inner-Hessian curvature, excluded from `H̃`/`log|H̃|` — matching
-  ferx's M3 objective, which accumulates the conditional Hessian over quantified
-  rows only. Validated against reconverged finite differences (~1e-6 on every
-  θ/Ω/σ packed parameter) and against NONMEM. Plain FOCE with M3 still uses the
-  reconverged-FD gradient (#367).
+- **Analytic M3 (BLOQ) outer gradient for both FOCE and FOCEI** on analytical PK
+  models: the exact closed-form marginal gradient now covers M3-censored subjects.
+  Under FOCEI a censored row enters the Almquist Laplace assembly as a data term
+  `−logΦ((LLOQ−f)/√V)` plus its true-inner-Hessian curvature, excluded from
+  `H̃`/`log|H̃|`. Under FOCE it leaves the Sheiner–Beal marginal (`R̃` and the
+  quadratic form are built over the quantified rows only) and re-enters as
+  `−logΦ((LLOQ−f̂)/√R⁰)` with the population variance. Both match ferx's M3
+  objective and are validated against reconverged finite differences (~1e-6 on
+  every θ/Ω/σ packed parameter) and against NONMEM (`METHOD=1 LAPLACE` with and
+  without INTER) to <1% on the structural parameters (#367).
 - **Analytic M3 (BLOQ) inner EBE gradient** for analytical PK models: the
   per-subject EBE optimiser now has an exact closed-form η-gradient for the M3
   censored term `−logΦ((LLOQ−f)/√V)` (inverse-Mills-ratio coefficient), replacing
@@ -185,6 +187,15 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- **`method = foce` with M3 BLOQ no longer promotes censored subjects to FOCEI.**
+  Previously a subject with any `CENS=1` row was silently evaluated with
+  η-interaction (mixing a Sheiner–Beal FOCE objective with a FOCEI censored term).
+  Plain FOCE now keeps a consistent Sheiner–Beal objective for the whole subject,
+  with censored rows entering as `−logΦ((LLOQ−f̂)/√R⁰)` (population variance,
+  excluded from `R̃`). FOCE-M3 and FOCEI-M3 are genuinely different optima — on
+  warfarin BLOQ, FOCE TVKA ≈ 0.71 vs FOCEI ≈ 0.81, each matching the corresponding
+  NONMEM `METHOD=1 LAPLACE` (with/without INTER) fit. M3 fits that relied on the
+  old auto-promotion should set `method = focei` explicitly (#367).
 - FOCEI gradient-based optimizers (SLSQP, L-BFGS, built-in BFGS, Gauss-Newton)
   now add the `log|H̃|` EBE-response term (the #274/#289 Δ) to the population
   gradient, so they reach the true marginal minimum instead of stalling above it

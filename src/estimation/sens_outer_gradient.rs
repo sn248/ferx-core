@@ -591,11 +591,6 @@ pub fn subject_packed_gradient_foce(
     x: &[f64],
     eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
-    // Censored rows under M3 are routed to the interaction path by ferx's FOCE
-    // dispatcher; fall back rather than mis-model them on the non-interaction path.
-    if subject.cens.iter().any(|&c| c != 0) {
-        return None;
-    }
     let params = unpack_params(x, template);
     let n_eta = model.n_eta;
     let n_obs = subject.observations.len();
@@ -615,65 +610,122 @@ pub fn subject_packed_gradient_foce(
     let sigma = &params.sigma.values;
     let omega = &params.omega.matrix;
 
-    // J = ∂f/∂η (n_obs×n_eta), ρ = y − f0 = ε + J·η̂, R⁰ and d⁰ at f(η=0).
-    let mut jmat = DMatrix::<f64>::zeros(n_obs, n_eta);
-    let mut rho = DVector::<f64>::zeros(n_obs);
-    let mut r0 = vec![0.0f64; n_obs];
-    let mut d0 = vec![0.0f64; n_obs];
-    for j in 0..n_obs {
+    // M3 BLOQ: censored rows leave the Sheiner–Beal marginal (R̃ and the quadratic
+    // form are built over the quantified rows only) and re-enter as
+    // `−logΦ((LLOQ − f(η̂))/√R⁰)` data terms — the same objective as
+    // `foce_subject_nll_standard`. `quant` maps SB-local row i → original obs index.
+    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3)
+        && subject.cens.iter().any(|&c| c != 0);
+    let quant: Vec<usize> = (0..n_obs)
+        .filter(|&j| !(m3 && subject.cens.get(j).copied().unwrap_or(0) != 0))
+        .collect();
+    let nq = quant.len();
+    if nq == 0 {
+        return None;
+    }
+
+    // J = ∂f/∂η (nq×n_eta), ρ = y − f0 = ε + J·η̂, R⁰ and d⁰ at f(η=0) — quant rows.
+    let mut jmat = DMatrix::<f64>::zeros(nq, n_eta);
+    let mut rho = DVector::<f64>::zeros(nq);
+    let mut r0 = vec![0.0f64; nq];
+    let mut d0 = vec![0.0f64; nq];
+    for (i, &j) in quant.iter().enumerate() {
         let obs = &sens.obs[j];
         let mut jeta = 0.0;
         for k in 0..n_eta {
-            jmat[(j, k)] = obs.df_deta[k];
+            jmat[(i, k)] = obs.df_deta[k];
             jeta += obs.df_deta[k] * eta_hat[k];
         }
-        rho[j] = subject.observations[j] - (obs.f - jeta);
+        rho[i] = subject.observations[j] - (obs.f - jeta);
         let cmt = subject.obs_cmts[j];
         let f0act = sens0.obs[j].f;
         let r = model.error_spec.variance_at(cmt, f0act, sigma);
         if !(r.is_finite() && r > 0.0) {
             return None;
         }
-        r0[j] = r;
-        d0[j] = model.error_spec.dvar_df(cmt, f0act, sigma);
+        r0[i] = r;
+        d0[i] = model.error_spec.dvar_df(cmt, f0act, sigma);
     }
 
-    // R̃ = J Ω Jᵀ + diag(R⁰); u = R̃⁻¹ ρ; ΩJᵀ reused throughout.
+    // Censored rows: `−logΦ(z)`, z = (LLOQ − f(η̂))/√R⁰. Precompute the inverse
+    // Mills ratio h and the population variance / its f-derivative per row.
+    struct Cens {
+        j: usize,
+        resid: f64, // LLOQ − f(η̂)
+        w: f64,     // √R⁰
+        h: f64,     // φ(z)/Φ(z)
+        d0: f64,    // ∂R⁰/∂f at f(η=0)
+        f0act: f64, // f(η=0)
+        cmt: usize,
+    }
+    let mut cens: Vec<Cens> = Vec::new();
+    if m3 {
+        for j in 0..n_obs {
+            if subject.cens.get(j).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let cmt = subject.obs_cmts[j];
+            let f0act = sens0.obs[j].f;
+            let r0c = model.error_spec.variance_at(cmt, f0act, sigma);
+            if !(r0c.is_finite() && r0c > 0.0) {
+                return None;
+            }
+            let w = r0c.sqrt();
+            let resid = subject.observations[j] - sens.obs[j].f;
+            cens.push(Cens {
+                j,
+                resid,
+                w,
+                h: inv_mills(resid / w),
+                d0: model.error_spec.dvar_df(cmt, f0act, sigma),
+                f0act,
+                cmt,
+            });
+        }
+    }
+
+    // R̃ = J Ω Jᵀ + diag(R⁰) over quant rows; u = R̃⁻¹ ρ; ΩJᵀ reused throughout.
     let jo = &jmat * omega; // J Ω
     let mut rtilde = &jo * jmat.transpose();
-    for j in 0..n_obs {
-        rtilde[(j, j)] += r0[j];
+    for i in 0..nq {
+        rtilde[(i, i)] += r0[i];
     }
     let rtilde_inv = rtilde.cholesky()?.inverse();
     let u = &rtilde_inv * &rho;
-    let ojt = omega * jmat.transpose(); // Ω Jᵀ (n_eta×n_obs)
+    let ojt = omega * jmat.transpose(); // Ω Jᵀ (n_eta×nq)
 
     let n_theta = params.theta.len();
     let n_sigma = sigma.len();
     let mut fixed = vec![0.0f64; x.len()];
 
-    // θ (fixed η̂): ∂F/∂θₘ = u·Qₘ + tr(R̃⁻¹EₘΩJᵀ) − u·(EₘΩJᵀu) + ½Σⱼ ∂R⁰ⱼ/∂θₘ (R̃⁻¹ⱼⱼ − u²ⱼ).
-    //   Qₘ[j] = −bⱼₘ + Σₗ Bⱼ[l,m] η̂ₗ,  Eₘ[j,l] = Bⱼ[l,m],  ∂R⁰/∂θ = d⁰·∂f(η=0)/∂θ.
+    // θ (fixed η̂): SB part over quant rows + censored `−logΦ` θ-gradient.
+    //   SB: u·Qₘ + tr(R̃⁻¹EₘΩJᵀ) − u·(EₘΩJᵀu) + ½Σ ∂R⁰/∂θ (R̃⁻¹ᵢᵢ − u²ᵢ).
+    //   censored: h·[ b̂ⱼₘ/w + (LLOQ−f̂)·∂R⁰/∂θ /(2w³) ], ∂R⁰/∂θ = d⁰·∂f(η=0)/∂θ.
     for m in 0..n_theta {
-        let mut qm = DVector::<f64>::zeros(n_obs);
-        let mut em = DMatrix::<f64>::zeros(n_obs, n_eta);
+        let mut qm = DVector::<f64>::zeros(nq);
+        let mut em = DMatrix::<f64>::zeros(nq, n_eta);
         let mut dvar = 0.0;
-        for j in 0..n_obs {
+        for (i, &j) in quant.iter().enumerate() {
             let obs = &sens.obs[j];
             let mut bjeta = 0.0;
             for l in 0..n_eta {
                 let bjl_m = obs.d2f_deta_dtheta[l * n_theta + m];
-                em[(j, l)] = bjl_m;
+                em[(i, l)] = bjl_m;
                 bjeta += bjl_m * eta_hat[l];
             }
-            qm[j] = -obs.df_dtheta[m] + bjeta;
-            let dr0 = d0[j] * sens0.obs[j].df_dtheta[m];
-            dvar += dr0 * (rtilde_inv[(j, j)] - u[j] * u[j]);
+            qm[i] = -obs.df_dtheta[m] + bjeta;
+            let dr0 = d0[i] * sens0.obs[j].df_dtheta[m];
+            dvar += dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
         }
         let emojt = &em * &ojt;
         let tr = (&rtilde_inv * &emojt).trace();
         let uemu = u.dot(&(&emojt * &u));
-        let nat = u.dot(&qm) + tr - uemu + 0.5 * dvar;
+        let mut nat = u.dot(&qm) + tr - uemu + 0.5 * dvar;
+        for c in &cens {
+            let bhat = sens.obs[c.j].df_dtheta[m];
+            let dr0 = c.d0 * sens0.obs[c.j].df_dtheta[m];
+            nat += c.h * (bhat / c.w + c.resid * dr0 / (2.0 * c.w * c.w * c.w));
+        }
         let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
             params.theta[m]
         } else {
@@ -682,17 +734,17 @@ pub fn subject_packed_gradient_foce(
         fixed[m] = nat * dtheta_dx;
     }
 
-    // Ω (fixed η̂, packed Cholesky-L): ∂F/∂L_rc = jvᵀR̃⁻¹jr − (jrᵀu)(jvᵀu),
-    //   jr = J[:,row], jv = (J L)[:,col]; ×L_kk for the diagonal log-chain.
+    // Ω (fixed η̂, packed Cholesky-L): SB over quant rows. The censored term has no
+    // direct Ω-gradient (R⁰ and f(η̂) do not depend on Ω); it enters only via dη̂/dx.
     let l = &params.omega.chol;
     let jl = &jmat * l;
     let entries: Vec<(usize, usize)> = if params.omega.diagonal {
         (0..n_eta).map(|i| (i, i)).collect()
     } else {
         let mut e = Vec::new();
-        for c in 0..n_eta {
-            for r in c..n_eta {
-                e.push((r, c));
+        for col in 0..n_eta {
+            for r in col..n_eta {
+                e.push((r, col));
             }
         }
         e
@@ -707,8 +759,9 @@ pub fn subject_packed_gradient_foce(
         fixed[omega_start + ko] = fixed_l * chain;
     }
 
-    // σ (fixed η̂): ∂F/∂σ_k = ½Σⱼ ∂R⁰ⱼ/∂σ_k (R̃⁻¹ⱼⱼ − u²ⱼ); ×σ for log-σ. ∂R⁰/∂σ
-    // by central FD of the closed-form variance at f(η=0).
+    // σ (fixed η̂): SB part over quant + censored. ∂R⁰/∂σ by central FD of the
+    // closed-form variance at f(η=0) — works for FOCE here and FOCEI in sigma_block.
+    //   censored: h·(LLOQ−f̂)·∂R⁰/∂σ /(2w³).
     let sigma_start = omega_start + entries.len();
     for k in 0..n_sigma {
         let hsig = 1e-6 * (1.0 + sigma[k].abs());
@@ -716,46 +769,56 @@ pub fn subject_packed_gradient_foce(
         sp[k] += hsig;
         let mut sm = sigma.clone();
         sm[k] -= hsig;
-        let mut dvar = 0.0;
-        for j in 0..n_obs {
+        let mut nat = 0.0;
+        for (i, &j) in quant.iter().enumerate() {
             let cmt = subject.obs_cmts[j];
             let f0act = sens0.obs[j].f;
             let dr0 = (model.error_spec.variance_at(cmt, f0act, &sp)
                 - model.error_spec.variance_at(cmt, f0act, &sm))
                 / (2.0 * hsig);
-            dvar += dr0 * (rtilde_inv[(j, j)] - u[j] * u[j]);
+            nat += 0.5 * dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
         }
-        fixed[sigma_start + k] = 0.5 * dvar * sigma[k];
+        for c in &cens {
+            let dr0 = (model.error_spec.variance_at(c.cmt, c.f0act, &sp)
+                - model.error_spec.variance_at(c.cmt, c.f0act, &sm))
+                / (2.0 * hsig);
+            nat += c.h * c.resid * dr0 / (2.0 * c.w * c.w * c.w);
+        }
+        fixed[sigma_start + k] = nat * sigma[k];
     }
 
-    // Coupling c = ∂F/∂η̂:  c_k = u·P_k + tr(R̃⁻¹ Dk ΩJᵀ) − u·(Dk ΩJᵀ u),
-    //   P_k[j] = (Aⱼη̂)_k = Σₗ Aⱼ[k,l] η̂ₗ,  Dk[j,l] = Aⱼ[l,k]  (Aⱼ = ∂²f/∂η², symmetric).
-    let mut c = DVector::<f64>::zeros(n_eta);
+    // Coupling c = ∂F/∂η̂: SB part over quant rows + censored (∂(−logΦ)/∂η̂ = h·â/w).
+    //   SB: u·P_k + tr(R̃⁻¹ Dk ΩJᵀ) − u·(Dk ΩJᵀ u),  P_k[i]=(Aⱼη̂)_k, Dk[i,l]=Aⱼ[k,l].
+    let mut coupling = DVector::<f64>::zeros(n_eta);
     for k in 0..n_eta {
-        let mut pk = DVector::<f64>::zeros(n_obs);
-        let mut dk = DMatrix::<f64>::zeros(n_obs, n_eta);
-        for j in 0..n_obs {
+        let mut pk = DVector::<f64>::zeros(nq);
+        let mut dk = DMatrix::<f64>::zeros(nq, n_eta);
+        for (i, &j) in quant.iter().enumerate() {
             let obs = &sens.obs[j];
             let mut s = 0.0;
             for l in 0..n_eta {
                 let a_kl = obs.d2f_deta2[k * n_eta + l];
                 s += a_kl * eta_hat[l];
-                dk[(j, l)] = a_kl; // A symmetric: Aⱼ[l,k] = Aⱼ[k,l]
+                dk[(i, l)] = a_kl; // A symmetric: Aⱼ[l,k] = Aⱼ[k,l]
             }
-            pk[j] = s;
+            pk[i] = s;
         }
         let dkojt = &dk * &ojt;
         let tr = (&rtilde_inv * &dkojt).trace();
         let udku = u.dot(&(&dkojt * &u));
-        c[k] = u.dot(&pk) + tr - udku;
+        let mut ck = u.dot(&pk) + tr - udku;
+        for c in &cens {
+            ck += c.h * sens.obs[c.j].df_deta[k] / c.w;
+        }
+        coupling[k] = ck;
     }
 
     // Total: dFᵢ/dx_k = ∂Fᵢ/∂x_k|_η̂ + c·(dη̂/dx_k). dη̂/dx is interaction-
-    // independent (shared inner objective), so it is reused as-is.
+    // independent (shared inner objective, M3-aware), so it is reused as-is.
     let eta_dx = subject_eta_dx(model, subject, template, x, eta_hat)?;
     let mut g = vec![0.0f64; x.len()];
     for k in 0..x.len() {
-        g[k] = fixed[k] + c.dot(&eta_dx[k]);
+        g[k] = fixed[k] + coupling.dot(&eta_dx[k]);
     }
     Some(g)
 }
@@ -853,6 +916,30 @@ pub fn subject_eta_dx(
         for (j, obs) in sens.obs.iter().enumerate() {
             let cmt = subject.obs_cmts[j];
             let f = obs.f;
+            // M3 censored inner term uses the conditional variance R(f(η̂)); its
+            // `½∂α/∂σ = ∂g1/∂σ` by central FD of the closed-form censored scalar.
+            if prep.censored.get(j).copied().unwrap_or(false) {
+                let y = subject.observations[j];
+                let (g1p, _) = m3_censored_scalars(
+                    y,
+                    f,
+                    model.error_spec.variance_at(cmt, f, &sp),
+                    model.error_spec.dvar_df(cmt, f, &sp),
+                    model.error_spec.d2var_df2(cmt, &sp),
+                );
+                let (g1m, _) = m3_censored_scalars(
+                    y,
+                    f,
+                    model.error_spec.variance_at(cmt, f, &sm),
+                    model.error_spec.dvar_df(cmt, f, &sm),
+                    model.error_spec.d2var_df2(cmt, &sm),
+                );
+                let dg1 = (g1p - g1m) / (2.0 * h);
+                for m in 0..n_eta {
+                    mvec[m] += dg1 * obs.df_deta[m];
+                }
+                continue;
+            }
             let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
             let r_sig = (model.error_spec.variance_at(cmt, f, &sp)
                 - model.error_spec.variance_at(cmt, f, &sm))
@@ -1518,6 +1605,79 @@ mod tests {
                 .subjects
                 .iter()
                 .map(|s| marginal_nll(&model, s, &p))
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            eprintln!(
+                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[k],
+                fd,
+                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 5e-3, epsilon = 1e-5);
+        }
+    }
+
+    /// The analytic **FOCE** (Sheiner–Beal, non-interaction) M3 packed gradient
+    /// (censored rows excluded from R̃, added as `−logΦ((LLOQ−f̂)/√R⁰)` with the
+    /// population variance) must match the reconverged-FD of ferx's FOCE-M3
+    /// objective (`foce_subject_nll_standard` with the censored term).
+    #[test]
+    fn population_packed_gradient_m3_foce_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::{BloqMethod, Population};
+
+        let mut model = parse_model_string(WARFARIN).expect("parse");
+        model.bloq_method = BloqMethod::M3;
+        let theta = [0.22, 11.0, 1.4];
+
+        let mut s1 = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let mut s2 = subject_with_obs(&model, &theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0, 72.0]);
+        for s in [&mut s1, &mut s2] {
+            let n = s.observations.len();
+            s.cens[n - 1] = 1;
+            s.cens[n - 2] = 1;
+        }
+
+        let pop = Population {
+            subjects: vec![s1, s2],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+
+        let analytic =
+            population_gradient_sens_foce(&model, &pop, &template, &x, &ehs).expect("M3 FOCE");
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| marginal_nll_foce(&model, s, &p))
                 .sum::<f64>()
         };
         let fd_at = |k: usize, h: f64| -> f64 {

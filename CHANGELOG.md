@@ -36,7 +36,31 @@ section of the SDLC for the versioning policy).
   rule) instead of falling back to finite differences. Validated against finite
   differences of the production predictor and against a NONMEM reference (#367).
 
+### Changed
+- **FOCE/FOCEI and SAEM/Bayes HMC gradients now come from hand-rolled analytic
+  `Dual2` sensitivities** rather than Enzyme automatic differentiation. The inner
+  EBE gradient, the outer θ/Ω/Σ gradient, and the SAEM/Bayes HMC η-sampler all use
+  the same exact closed-form sensitivity provider; models outside its scope (ODE,
+  LTBS, expression scaling, time-varying covariates, SDE) fall back to finite
+  differences. The HMC sampler (`saem_n_leapfrog > 0`) no longer requires an
+  autodiff build — it matches the FOCEI point estimate on warfarin with R̂ ≈ 1.00
+  (#367).
+
+### Removed
+- **The Enzyme automatic-differentiation path is retired** — the `ad/` module, the
+  `autodiff` Cargo feature, and the custom `enzyme` toolchain pin are removed.
+  ferx-core now builds on a stock nightly toolchain with `cargo build` (no
+  from-source compiler, no `RUSTFLAGS="-Z autodiff=Enable"`). `gradient_method = ad`
+  now returns an `E_AD_RETIRED` error; use `gradient = auto` (the exact analytic
+  gradient where it is in scope, finite differences otherwise) or `gradient = fd`
+  (#367).
+
 ### Fixed
+- **SAEM/Bayes HMC step-size adaptation** targeted the random-walk acceptance rate
+  (≈0.234) for the gradient-guided HMC η-kernel, which over-inflated the leapfrog
+  step until trajectories diverged — over-dispersing η and biasing the residual
+  error (a warfarin Bayes-HMC run gave `PROP_ERR` ≈ 0.05 / R̂ > 2 vs the correct
+  ≈ 0.011). The HMC kernel now adapts toward ≈0.7, matching the SAEM split (#367).
 - **Overlapping steady-state infusions (`T_inf > II`)** are now solved exactly for
   the analytical 1-/2-/3-compartment models instead of being skipped. Previously
   the closed form returned 0 and the dose was applied as a single (non-SS)
@@ -192,8 +216,8 @@ section of the SDLC for the versioning policy).
   NONMEM's `$PK D{n}` (#394, follow-up to #324).
 - **Full MCMC Bayesian estimation** (`method = bayes`, Gibbs-within-HMC, NONMEM
   `METHOD=BAYES` parity). Draws from the joint posterior `p(θ, Ω, Σ, {ηᵢ} | y)`:
-  per-subject η block (block-MH, or gradient HMC on autodiff builds with
-  `n_leapfrog > 0`), conjugate inverse-Wishart Ω block, exact Gaussian
+  per-subject η block (block-MH, or gradient HMC on the analytic `Dual2` gradient
+  with `n_leapfrog > 0`), conjugate inverse-Wishart Ω block, exact Gaussian
   full-conditional draw for mu-referenced θ, and a random-walk block for the
   remaining θ/σ. Reports posterior summaries (mean/sd/2.5%/median/97.5%) with
   split-R̂, ESS, and MCSE per parameter on `FitResult.bayes` and in the

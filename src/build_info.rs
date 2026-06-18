@@ -26,7 +26,9 @@ pub const BUILD_INFO: BuildInfo = BuildInfo {
         }
         n
     },
-    has_autodiff: cfg!(feature = "autodiff"),
+    // The Enzyme autodiff path was retired; analytic Dual2 sensitivities serve the
+    // gradient solvers. Always false now (kept for build-metadata API stability).
+    has_autodiff: false,
 };
 
 /// Reported gradient method for a fit loop (inner or outer).

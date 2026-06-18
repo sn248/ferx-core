@@ -16,7 +16,14 @@ use crate::types::DoseEvent;
 /// trigonometric solution of the disposition cubic. Branches on `.val()` only,
 /// so the dual derivatives flow through the selected roots unchanged.
 #[allow(clippy::many_single_char_names)]
-fn macro_rates_three_cpt_g<T: PkNum>(cl: T, v1: T, q2: T, v2: T, q3: T, v3: T) -> (T, T, T, T, T) {
+pub(crate) fn macro_rates_three_cpt_g<T: PkNum>(
+    cl: T,
+    v1: T,
+    q2: T,
+    v2: T,
+    q3: T,
+    v3: T,
+) -> (T, T, T, T, T) {
     let k10 = cl / v1;
     let k12 = q2 / v1;
     let k21 = q2 / v2;

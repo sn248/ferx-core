@@ -195,9 +195,166 @@ pub fn propagate_two_cpt_oral_g<T: PkNum>(state: &mut [T], dt: f64, cl: T, v1: T
     state[2] = h_p_dt + cap_b * e_ka;
 }
 
+/// One 3-cpt eigenmode's spectral data over `T` (mirror of
+/// `event_driven::ThreeCptMode` / `build_three_cpt_mode`).
+#[derive(Clone, Copy)]
+struct ThreeCptModeG<T: PkNum> {
+    mu: T,
+    v: [T; 3],
+    w: [T; 3],
+    norm: T,
+}
+
+#[inline]
+fn build_three_cpt_mode_g<T: PkNum>(mu: T, k12: T, k13: T, k21: T, k31: T) -> ThreeCptModeG<T> {
+    let d21 = k21 - mu;
+    let d31 = k31 - mu;
+    let v = [d21 * d31, k12 * d31, k13 * d21];
+    let w = [d21 * d31, k21 * d31, k31 * d21];
+    let norm = v[0] * w[0] + v[1] * w[1] + v[2] * w[2];
+    ThreeCptModeG { mu, v, w, norm }
+}
+
+#[inline]
+fn apply_three_cpt_mode_g<T: PkNum>(m: &ThreeCptModeG<T>, c: T, p1: T, p2: T, dt: f64) -> (T, T, T) {
+    if m.norm.val().abs() < 1e-30 {
+        return (T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0));
+    }
+    let proj = m.w[0] * c + m.w[1] * p1 + m.w[2] * p2;
+    let coef = proj / m.norm;
+    let exp_term = (-(m.mu * T::from_f64(dt))).exp();
+    (
+        coef * m.v[0] * exp_term,
+        coef * m.v[1] * exp_term,
+        coef * m.v[2] * exp_term,
+    )
+}
+
+/// 3-cpt IV/central propagator: `state = [A_central, A_p1, A_p2]`. Spectral
+/// decomposition along (α, β, γ) with the steady-state + homogeneous pattern for
+/// constant infusion. Generic mirror of
+/// [`crate::pk::event_driven::propagate_three_cpt`].
+#[allow(clippy::too_many_arguments)]
+pub fn propagate_three_cpt_g<T: PkNum>(
+    state: &mut [T],
+    dt: f64,
+    cl: T,
+    v1: T,
+    q2: T,
+    v2: T,
+    q3: T,
+    v3: T,
+    rate_central: T,
+    rate_periph1: T,
+    rate_periph2: T,
+) {
+    if v1.val() <= 0.0
+        || cl.val() <= 0.0
+        || v2.val() <= 0.0
+        || q2.val() <= 0.0
+        || v3.val() <= 0.0
+        || q3.val() <= 0.0
+    {
+        return;
+    }
+    let (alpha, beta, gamma, k21, k31) =
+        crate::sens::three_cpt::macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
+    let k12 = q2 / v1;
+    let k13 = q3 / v1;
+    let modes = [
+        build_three_cpt_mode_g(alpha, k12, k13, k21, k31),
+        build_three_cpt_mode_g(beta, k12, k13, k21, k31),
+        build_three_cpt_mode_g(gamma, k12, k13, k21, k31),
+    ];
+
+    let r_total = rate_central + rate_periph1 + rate_periph2;
+    let a_ss_c = r_total * v1 / cl;
+    let a_ss_p1 = (rate_central + rate_periph2) * v2 / cl
+        + rate_periph1 * (cl + q2) * v2 / (cl * q2);
+    let a_ss_p2 = (rate_central + rate_periph1) * v3 / cl
+        + rate_periph2 * (cl + q3) * v3 / (cl * q3);
+
+    let h_c = state[0] - a_ss_c;
+    let h_p1 = state[1] - a_ss_p1;
+    let h_p2 = state[2] - a_ss_p2;
+
+    let (ca, p1a, p2a) = apply_three_cpt_mode_g(&modes[0], h_c, h_p1, h_p2, dt);
+    let (cb, p1b, p2b) = apply_three_cpt_mode_g(&modes[1], h_c, h_p1, h_p2, dt);
+    let (cg, p1g, p2g) = apply_three_cpt_mode_g(&modes[2], h_c, h_p1, h_p2, dt);
+
+    state[0] = ca + cb + cg + a_ss_c;
+    state[1] = p1a + p1b + p1g + a_ss_p1;
+    state[2] = p2a + p2b + p2g + a_ss_p2;
+}
+
+/// 3-cpt oral propagator: `state = [A_depot, A_central, A_p1, A_p2]` (bolus only;
+/// depot drains into central at `ka` with a depot-driven particular solution).
+/// Generic mirror of [`crate::pk::event_driven::propagate_three_cpt_oral`].
+#[allow(clippy::too_many_arguments)]
+pub fn propagate_three_cpt_oral_g<T: PkNum>(
+    state: &mut [T],
+    dt: f64,
+    cl: T,
+    v1: T,
+    q2: T,
+    v2: T,
+    q3: T,
+    v3: T,
+    ka: T,
+) {
+    if v1.val() <= 0.0
+        || cl.val() <= 0.0
+        || v2.val() <= 0.0
+        || q2.val() <= 0.0
+        || v3.val() <= 0.0
+        || q3.val() <= 0.0
+        || ka.val() <= 0.0
+    {
+        return;
+    }
+    let (alpha, beta, gamma, k21, k31) =
+        crate::sens::three_cpt::macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
+    let k12 = q2 / v1;
+    let k13 = q3 / v1;
+    let modes = [
+        build_three_cpt_mode_g(alpha, k12, k13, k21, k31),
+        build_three_cpt_mode_g(beta, k12, k13, k21, k31),
+        build_three_cpt_mode_g(gamma, k12, k13, k21, k31),
+    ];
+
+    let a_d_0 = state[0];
+    let a_c_0 = state[1];
+    let a_p1_0 = state[2];
+    let a_p2_0 = state[3];
+
+    let e_ka = (-(ka * T::from_f64(dt))).exp();
+    state[0] = a_d_0 * e_ka;
+
+    let denom_depot = (ka - alpha) * (ka - beta) * (ka - gamma);
+    let d21 = k21 - ka;
+    let d31 = k31 - ka;
+    let (cap_a, cap_b, cap_c) = if denom_depot.val().abs() < 1e-12 {
+        (T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0))
+    } else {
+        let scale = -(ka * a_d_0) / denom_depot;
+        (scale * d21 * d31, scale * k12 * d31, scale * k13 * d21)
+    };
+
+    let h_c = a_c_0 - cap_a;
+    let h_p1 = a_p1_0 - cap_b;
+    let h_p2 = a_p2_0 - cap_c;
+
+    let (ca, p1a, p2a) = apply_three_cpt_mode_g(&modes[0], h_c, h_p1, h_p2, dt);
+    let (cb, p1b, p2b) = apply_three_cpt_mode_g(&modes[1], h_c, h_p1, h_p2, dt);
+    let (cg, p1g, p2g) = apply_three_cpt_mode_g(&modes[2], h_c, h_p1, h_p2, dt);
+
+    state[1] = ca + cb + cg + cap_a * e_ka;
+    state[2] = p1a + p1b + p1g + cap_b * e_ka;
+    state[3] = p2a + p2b + p2g + cap_c * e_ka;
+}
+
 /// Per-event PK params for the generic walk, carrying every disposition slot the
-/// 1-/2-cpt propagators read (3-cpt slots `q3`/`v3` are reserved for the upcoming
-/// extension). Unused slots for a given model are simply ignored.
+/// 1-/2-/3-cpt propagators read. Unused slots for a given model are simply ignored.
 #[derive(Clone, Copy)]
 pub struct PkDual<T: PkNum> {
     pub cl: T,
@@ -255,14 +412,19 @@ fn state_layout_g(pk_model: PkModel) -> (usize, usize) {
     }
 }
 
-/// True when the generic walk implements this model. 3-cpt is gated off until its
-/// propagators land; callers (`subject_sensitivities_iov`) screen earlier, this is
-/// the defensive backstop.
+/// True when the generic walk implements this model — all six analytical 1-/2-/3-
+/// cpt models. Callers (`subject_sensitivities_iov`) screen earlier; this is the
+/// defensive backstop.
 #[inline]
 fn walk_supports(pk_model: PkModel) -> bool {
     matches!(
         pk_model,
-        PkModel::OneCptIv | PkModel::OneCptOral | PkModel::TwoCptIv | PkModel::TwoCptOral
+        PkModel::OneCptIv
+            | PkModel::OneCptOral
+            | PkModel::TwoCptIv
+            | PkModel::TwoCptOral
+            | PkModel::ThreeCptIv
+            | PkModel::ThreeCptOral
     )
 }
 
@@ -305,6 +467,7 @@ fn propagate_bounds_g<T: PkNum>(
         // the production model→cmt arms.
         let mut rate_central = T::from_f64(0.0);
         let mut rate_periph1 = T::from_f64(0.0);
+        let mut rate_periph2 = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
             let t_start = d.time + lag;
@@ -320,6 +483,10 @@ fn propagate_bounds_g<T: PkNum>(
                     (PkModel::TwoCptIv, 1) => rate_central = rate_central + r,
                     (PkModel::TwoCptIv, 2) => rate_periph1 = rate_periph1 + r,
                     (PkModel::TwoCptOral, 2) => rate_central = rate_central + r,
+                    (PkModel::ThreeCptIv, 1) => rate_central = rate_central + r,
+                    (PkModel::ThreeCptIv, 2) => rate_periph1 = rate_periph1 + r,
+                    (PkModel::ThreeCptIv, 3) => rate_periph2 = rate_periph2 + r,
+                    (PkModel::ThreeCptOral, 2) => rate_central = rate_central + r,
                     _ => {}
                 }
             }
@@ -340,8 +507,22 @@ fn propagate_bounds_g<T: PkNum>(
             PkModel::TwoCptOral => {
                 propagate_two_cpt_oral_g(state, dt, pk.cl, pk.v, pk.q, pk.v2, pk.ka)
             }
-            // Screened by `walk_supports`; never reached.
-            PkModel::ThreeCptIv | PkModel::ThreeCptOral => {}
+            PkModel::ThreeCptIv => propagate_three_cpt_g(
+                state,
+                dt,
+                pk.cl,
+                pk.v,
+                pk.q,
+                pk.v2,
+                pk.q3,
+                pk.v3,
+                rate_central,
+                rate_periph1,
+                rate_periph2,
+            ),
+            PkModel::ThreeCptOral => propagate_three_cpt_oral_g(
+                state, dt, pk.cl, pk.v, pk.q, pk.v2, pk.q3, pk.v3, pk.ka,
+            ),
         }
     }
 }
@@ -873,6 +1054,133 @@ mod tests {
                     out.hess[i][j],
                     he[i][j],
                     max_relative = 3e-3,
+                    epsilon = 1e-7
+                );
+            }
+        }
+    }
+
+    fn pk_3cpt(cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64, ka: f64) -> PkParams {
+        let mut p = PkParams::default();
+        p.values[PK_IDX_CL] = cl;
+        p.values[PK_IDX_V] = v1;
+        p.values[crate::types::PK_IDX_Q] = q2;
+        p.values[crate::types::PK_IDX_V2] = v2;
+        p.values[crate::types::PK_IDX_Q3] = q3;
+        p.values[crate::types::PK_IDX_V3] = v3;
+        p.values[PK_IDX_KA] = ka;
+        p.values[crate::types::PK_IDX_F] = 1.0;
+        p
+    }
+
+    fn pk_dual_3cpt_f64(p: &PkParams) -> PkDual<f64> {
+        PkDual {
+            cl: p.cl(),
+            v: p.v(),
+            q: p.q(),
+            v2: p.v2(),
+            ka: p.ka(),
+            q3: p.q3(),
+            v3: p.v3(),
+            f: p.f_bio(),
+        }
+    }
+
+    /// The generic 3-cpt walk at `f64` must reproduce the production event-driven
+    /// predictions across IV bolus, IV infusion, and oral — confirming the
+    /// eigenmode propagators match production bit-for-bit.
+    #[test]
+    fn event_walk_g_3cpt_matches_production_f64() {
+        struct Case {
+            model: PkModel,
+            dose: DoseEvent,
+        }
+        let obs = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0];
+        let (cl, v1, q2, v2, q3, v3, ka) = (3.0, 30.0, 2.0, 40.0, 0.8, 120.0, 1.2);
+        let cases = [
+            Case {
+                model: PkModel::ThreeCptIv,
+                dose: DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            },
+            Case {
+                model: PkModel::ThreeCptIv,
+                dose: DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0), // 5 h infusion
+            },
+            Case {
+                model: PkModel::ThreeCptOral,
+                dose: DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            },
+        ];
+        for (ci, c) in cases.iter().enumerate() {
+            let subj = make_subject(vec![c.dose.clone()], obs.clone());
+            let pk = pk_3cpt(cl, v1, q2, v2, q3, v3, ka);
+            let prod = event_driven_predictions(c.model, &subj, &[pk], &vec![pk; obs.len()], &[]);
+            let schedule = EventSchedule::for_subject(&subj, c.model, &[0.0]);
+            let pkd = pk_dual_3cpt_f64(&pk);
+            let walk = event_driven_sens_g::<f64>(
+                c.model,
+                &subj,
+                &schedule,
+                &[pkd],
+                &vec![pkd; obs.len()],
+                &[],
+            );
+            for (j, (&p, &w)) in prod.iter().zip(walk.iter()).enumerate() {
+                approx::assert_relative_eq!(w, p, max_relative = 1e-10, epsilon = 1e-11);
+                assert!(p >= 0.0, "case {ci} obs {j}: production conc negative");
+            }
+        }
+    }
+
+    /// The 3-cpt walk's `Dual2` grad/Hessian (w.r.t. cl, v1) must match FD of the
+    /// `f64` walk — the eigenmode propagator differentiates exactly.
+    #[test]
+    fn event_walk_g_3cpt_dual_matches_fd() {
+        let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        let obs = vec![6.0];
+        let subj = make_subject(vec![dose], obs.clone());
+        let (cl, v1, q2, v2, q3, v3) = (3.0, 30.0, 2.0, 40.0, 0.8, 120.0);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::ThreeCptIv, &[0.0]);
+        let seed = |cl: Dual2<2>, v1: Dual2<2>| PkDual {
+            cl,
+            v: v1,
+            q: Dual2::<2>::constant(q2),
+            v2: Dual2::<2>::constant(v2),
+            ka: Dual2::<2>::constant(0.0),
+            q3: Dual2::<2>::constant(q3),
+            v3: Dual2::<2>::constant(v3),
+            f: Dual2::<2>::constant(1.0),
+        };
+        let pk_d = seed(Dual2::var(cl, 0), Dual2::var(v1, 1));
+        let walk = event_driven_sens_g::<Dual2<2>>(
+            PkModel::ThreeCptIv,
+            &subj,
+            &schedule,
+            &[pk_d],
+            &[pk_d],
+            &[],
+        );
+        let out = walk[0];
+        let (g, he) = fd2([cl, v1], |p| {
+            let pkd = PkDual {
+                cl: p[0],
+                v: p[1],
+                q: q2,
+                v2,
+                ka: 0.0,
+                q3,
+                v3,
+                f: 1.0,
+            };
+            event_driven_sens_g::<f64>(PkModel::ThreeCptIv, &subj, &schedule, &[pkd], &[pkd], &[])[0]
+        });
+        for i in 0..2 {
+            approx::assert_relative_eq!(out.grad[i], g[i], max_relative = 1e-5, epsilon = 1e-9);
+            for j in 0..2 {
+                approx::assert_relative_eq!(
+                    out.hess[i][j],
+                    he[i][j],
+                    max_relative = 4e-3,
                     epsilon = 1e-7
                 );
             }

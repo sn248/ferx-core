@@ -411,7 +411,12 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     }
     if !matches!(
         model.pk_model,
-        PkModel::OneCptIv | PkModel::OneCptOral | PkModel::TwoCptIv | PkModel::TwoCptOral
+        PkModel::OneCptIv
+            | PkModel::OneCptOral
+            | PkModel::TwoCptIv
+            | PkModel::TwoCptOral
+            | PkModel::ThreeCptIv
+            | PkModel::ThreeCptOral
     ) {
         return false;
     }
@@ -2911,6 +2916,57 @@ mod tests {
             &model,
             &subject,
             &[0.2, 10.0, 0.5, 20.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    const WARFARIN_IOV_3CPT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ2(0.5, 0.001, 50.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVQ3(0.3, 0.001, 50.0)
+  theta TVV3(50.0, 0.1, 1000.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  Q  = TVQ2
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk three_cpt_oral(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// 3-cpt oral IOV: same FD check, exercising the generic 3-cpt eigenmode
+    /// event-driven sensitivity walk under occasion carryover.
+    #[test]
+    fn iov_provider_3cpt_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_3CPT).expect("parse 3cpt warfarin IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert!(
+            iov_analytical_supported(&model),
+            "3-cpt warfarin IOV must be IOV-provider supported"
+        );
+        let subject = iov_subject();
+        // θ = [TVCL,TVV,TVQ2,TVV2,TVQ3,TVV3,TVKA]; stacked = [η_cl,η_v,η_ka,κ_g0,κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.5, 20.0, 0.3, 50.0, 1.5],
             &[0.12, -0.08, 0.20, 0.05, -0.10],
         );
     }

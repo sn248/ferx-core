@@ -109,27 +109,49 @@ pub fn propagate_one_cpt_oral_g<T: PkNum>(
 // how they were seeded, which keeps it testable in isolation against FD of the
 // `f64` production walk.
 
-/// 2-cpt IV/central propagator: evolve `state = [A_central, A_periph]` over `dt`
-/// with constant inputs `rate_central` / `rate_periph`. Generic mirror of
-/// [`crate::pk::event_driven::propagate_two_cpt`] (eigen-decomposition of the rate
-/// matrix; `α, β` from [`crate::sens::two_cpt::macro_rates_g`]).
-#[allow(clippy::too_many_arguments)]
-pub fn propagate_two_cpt_g<T: PkNum>(
+/// Precomputed 2-cpt disposition eigendata — the eigenvalues (α, β) and the
+/// micro-rates the propagator formulas read. [`two_cpt_eigen_g`] is the **only**
+/// place the 2-cpt eigenvalue solve lives; both the inline `*_g` wrappers and the
+/// per-walk [`EigenCacheG`] feed the same `*_core_g` formulas. Caching this across
+/// a constant-parameter walk avoids re-solving `sqrt` every interval (the cost
+/// profiling flagged on infusion/reset-heavy 3-cpt fits — the 2-cpt analogue).
+#[derive(Clone, Copy)]
+pub struct TwoCptEigen<T: PkNum> {
+    pub alpha: T,
+    pub beta: T,
+    pub k10: T,
+    pub k12: T,
+    pub k21: T,
+}
+
+/// Compute the 2-cpt eigendata, or `None` for degenerate params (the single guard
+/// + eigenvalue solve). `None` ⇒ callers skip propagation, matching the old f64
+/// propagators' early return.
+pub fn two_cpt_eigen_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> Option<TwoCptEigen<T>> {
+    if v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || q.val() <= 0.0 {
+        return None;
+    }
+    let (alpha, beta, k21) = crate::sens::two_cpt::macro_rates_g(cl, v1, q, v2);
+    Some(TwoCptEigen {
+        alpha,
+        beta,
+        k10: cl / v1,
+        k12: q / v1,
+        k21,
+    })
+}
+
+/// 2-cpt IV/central propagation over `dt` from **precomputed** eigendata — the
+/// single source of the 2-cpt eigenmode formula, shared by the inline wrapper and
+/// the cached walk path.
+pub fn propagate_two_cpt_core_g<T: PkNum>(
     state: &mut [T],
     dt: f64,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
+    e: &TwoCptEigen<T>,
     rate_central: T,
     rate_periph: T,
 ) {
-    if v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || q.val() <= 0.0 {
-        return;
-    }
-    let (alpha, beta, k21) = crate::sens::two_cpt::macro_rates_g(cl, v1, q, v2);
-    let k10 = cl / v1;
-    let k12 = q / v1;
+    let (alpha, beta, k10, k12, k21) = (e.alpha, e.beta, e.k10, e.k12, e.k21);
     let dtt = T::from_f64(dt);
 
     let denom_ss = k21 * k10;
@@ -167,30 +189,43 @@ pub fn propagate_two_cpt_g<T: PkNum>(
     state[1] = h2_dt + a_ss_2;
 }
 
-/// 2-cpt oral propagator: `state = [A_depot, A_central, A_periph]`. `rate_central`
-/// is a constant zero-order input into central (depot-bypass infusion, RATE>0 into
-/// cmt 2); `rate_depot` is a constant zero-order input into the depot (RATE>0 into
-/// cmt 1, #400). Both are added by linear superposition and are `0` for bolus
-/// dosing. Generic mirror of
-/// [`crate::pk::event_driven::propagate_two_cpt_oral`].
+/// 2-cpt IV/central propagator computing its eigendata inline. Generic mirror of
+/// [`crate::pk::event_driven::propagate_two_cpt`]; the cached walk path computes
+/// eigendata once via [`two_cpt_eigen_g`] and calls [`propagate_two_cpt_core_g`].
 #[allow(clippy::too_many_arguments)]
-pub fn propagate_two_cpt_oral_g<T: PkNum>(
+pub fn propagate_two_cpt_g<T: PkNum>(
     state: &mut [T],
     dt: f64,
     cl: T,
     v1: T,
     q: T,
     v2: T,
+    rate_central: T,
+    rate_periph: T,
+) {
+    if let Some(e) = two_cpt_eigen_g(cl, v1, q, v2) {
+        propagate_two_cpt_core_g(state, dt, &e, rate_central, rate_periph);
+    }
+}
+
+/// 2-cpt oral propagator: `state = [A_depot, A_central, A_periph]`. `rate_central`
+/// is a constant zero-order input into central (depot-bypass infusion, RATE>0 into
+/// cmt 2); `rate_depot` is a constant zero-order input into the depot (RATE>0 into
+/// cmt 1, #400). Both are added by linear superposition and are `0` for bolus
+/// dosing. Generic mirror of
+/// [`crate::pk::event_driven::propagate_two_cpt_oral`].
+/// 2-cpt oral propagation from **precomputed** eigendata — the single source of the
+/// 2-cpt oral eigenmode + forced-response formula. `ka` is absorption; `rate_central`
+/// / `rate_depot` are the #350/#400 infusion inputs.
+pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
+    state: &mut [T],
+    dt: f64,
+    e: &TwoCptEigen<T>,
     ka: T,
     rate_central: T,
     rate_depot: T,
 ) {
-    if v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || q.val() <= 0.0 || ka.val() <= 0.0 {
-        return;
-    }
-    let (alpha, beta, k21) = crate::sens::two_cpt::macro_rates_g(cl, v1, q, v2);
-    let k10 = cl / v1;
-    let k12 = q / v1;
+    let (alpha, beta, k10, k12, k21) = (e.alpha, e.beta, e.k10, e.k12, e.k21);
     let dtt = T::from_f64(dt);
 
     let a_d_0 = state[0];
@@ -243,16 +278,7 @@ pub fn propagate_two_cpt_oral_g<T: PkNum>(
     // derivative-safe and just skips the no-infusion intervals.
     if rate_central.val() > 0.0 {
         let mut inflow = [T::from_f64(0.0), T::from_f64(0.0)];
-        propagate_two_cpt_g(
-            &mut inflow,
-            dt,
-            cl,
-            v1,
-            q,
-            v2,
-            rate_central,
-            T::from_f64(0.0),
-        );
+        propagate_two_cpt_core_g(&mut inflow, dt, e, rate_central, T::from_f64(0.0));
         state[1] = state[1] + inflow[0];
         state[2] = state[2] + inflow[1];
     }
@@ -272,31 +298,113 @@ pub fn propagate_two_cpt_oral_g<T: PkNum>(
         };
         let d_ss = rate_depot / ka;
         let mut xss = [d_ss, c_ss, p_ss];
-        propagate_two_cpt_oral_g(
-            &mut xss,
-            dt,
-            cl,
-            v1,
-            q,
-            v2,
-            ka,
-            T::from_f64(0.0),
-            T::from_f64(0.0),
-        );
+        propagate_two_cpt_oral_core_g(&mut xss, dt, e, ka, T::from_f64(0.0), T::from_f64(0.0));
         state[0] = state[0] + (d_ss - xss[0]);
         state[1] = state[1] + (c_ss - xss[1]);
         state[2] = state[2] + (p_ss - xss[2]);
     }
 }
 
+/// 2-cpt oral propagator computing its eigendata inline (the dual-walk wrapper).
+#[allow(clippy::too_many_arguments)]
+pub fn propagate_two_cpt_oral_g<T: PkNum>(
+    state: &mut [T],
+    dt: f64,
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    ka: T,
+    rate_central: T,
+    rate_depot: T,
+) {
+    if ka.val() <= 0.0 {
+        return;
+    }
+    if let Some(e) = two_cpt_eigen_g(cl, v1, q, v2) {
+        propagate_two_cpt_oral_core_g(state, dt, &e, ka, rate_central, rate_depot);
+    }
+}
+
 /// One 3-cpt eigenmode's spectral data over `T` (mirror of
 /// `event_driven::ThreeCptMode` / `build_three_cpt_mode`).
 #[derive(Clone, Copy)]
-struct ThreeCptModeG<T: PkNum> {
+pub struct ThreeCptModeG<T: PkNum> {
     mu: T,
     v: [T; 3],
     w: [T; 3],
     norm: T,
+}
+
+/// Precomputed 3-cpt disposition eigendata: the eigenvalues (α, β, γ), micro-rates,
+/// the three eigenmodes (the homogeneous propagation basis), and the raw
+/// disposition params the IV steady-state amounts read directly (kept verbatim so
+/// the formula is bit-identical, not re-derived). [`three_cpt_eigen_g`] is the only
+/// place the cubic `acos` eigenvalue solve lives; [`EigenCacheG`] caches it across a
+/// constant-parameter walk (the cost the original per-walk cache targeted).
+#[derive(Clone, Copy)]
+pub struct ThreeCptEigen<T: PkNum> {
+    pub alpha: T,
+    pub beta: T,
+    pub gamma: T,
+    pub k10: T,
+    pub k12: T,
+    pub k13: T,
+    pub k21: T,
+    pub k31: T,
+    pub modes: [ThreeCptModeG<T>; 3],
+    pub cl: T,
+    pub v1: T,
+    pub v2: T,
+    pub q2: T,
+    pub v3: T,
+    pub q3: T,
+}
+
+/// Compute the 3-cpt eigendata, or `None` for degenerate params.
+pub fn three_cpt_eigen_g<T: PkNum>(
+    cl: T,
+    v1: T,
+    q2: T,
+    v2: T,
+    q3: T,
+    v3: T,
+) -> Option<ThreeCptEigen<T>> {
+    if v1.val() <= 0.0
+        || cl.val() <= 0.0
+        || v2.val() <= 0.0
+        || q2.val() <= 0.0
+        || v3.val() <= 0.0
+        || q3.val() <= 0.0
+    {
+        return None;
+    }
+    let (alpha, beta, gamma, k21, k31) =
+        crate::sens::three_cpt::macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
+    let k12 = q2 / v1;
+    let k13 = q3 / v1;
+    let modes = [
+        build_three_cpt_mode_g(alpha, k12, k13, k21, k31),
+        build_three_cpt_mode_g(beta, k12, k13, k21, k31),
+        build_three_cpt_mode_g(gamma, k12, k13, k21, k31),
+    ];
+    Some(ThreeCptEigen {
+        alpha,
+        beta,
+        gamma,
+        k10: cl / v1,
+        k12,
+        k13,
+        k21,
+        k31,
+        modes,
+        cl,
+        v1,
+        v2,
+        q2,
+        v3,
+        q3,
+    })
 }
 
 #[inline]
@@ -330,10 +438,41 @@ fn apply_three_cpt_mode_g<T: PkNum>(
     )
 }
 
-/// 3-cpt IV/central propagator: `state = [A_central, A_p1, A_p2]`. Spectral
-/// decomposition along (α, β, γ) with the steady-state + homogeneous pattern for
-/// constant infusion. Generic mirror of
-/// [`crate::pk::event_driven::propagate_three_cpt`].
+/// 3-cpt IV/central propagation from **precomputed** eigendata — the single source
+/// of the 3-cpt eigenmode formula. Spectral decomposition along (α, β, γ) with the
+/// steady-state + homogeneous pattern for constant infusion.
+pub fn propagate_three_cpt_core_g<T: PkNum>(
+    state: &mut [T],
+    dt: f64,
+    e: &ThreeCptEigen<T>,
+    rate_central: T,
+    rate_periph1: T,
+    rate_periph2: T,
+) {
+    let (cl, v1, v2, q2, v3, q3) = (e.cl, e.v1, e.v2, e.q2, e.v3, e.q3);
+
+    let r_total = rate_central + rate_periph1 + rate_periph2;
+    let a_ss_c = r_total * v1 / cl;
+    let a_ss_p1 =
+        (rate_central + rate_periph2) * v2 / cl + rate_periph1 * (cl + q2) * v2 / (cl * q2);
+    let a_ss_p2 =
+        (rate_central + rate_periph1) * v3 / cl + rate_periph2 * (cl + q3) * v3 / (cl * q3);
+
+    let h_c = state[0] - a_ss_c;
+    let h_p1 = state[1] - a_ss_p1;
+    let h_p2 = state[2] - a_ss_p2;
+
+    let (ca, p1a, p2a) = apply_three_cpt_mode_g(&e.modes[0], h_c, h_p1, h_p2, dt);
+    let (cb, p1b, p2b) = apply_three_cpt_mode_g(&e.modes[1], h_c, h_p1, h_p2, dt);
+    let (cg, p1g, p2g) = apply_three_cpt_mode_g(&e.modes[2], h_c, h_p1, h_p2, dt);
+
+    state[0] = ca + cb + cg + a_ss_c;
+    state[1] = p1a + p1b + p1g + a_ss_p1;
+    state[2] = p2a + p2b + p2g + a_ss_p2;
+}
+
+/// 3-cpt IV propagator computing its eigendata inline (the dual-walk wrapper).
+/// Generic mirror of [`crate::pk::event_driven::propagate_three_cpt`].
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_three_cpt_g<T: PkNum>(
     state: &mut [T],
@@ -348,43 +487,9 @@ pub fn propagate_three_cpt_g<T: PkNum>(
     rate_periph1: T,
     rate_periph2: T,
 ) {
-    if v1.val() <= 0.0
-        || cl.val() <= 0.0
-        || v2.val() <= 0.0
-        || q2.val() <= 0.0
-        || v3.val() <= 0.0
-        || q3.val() <= 0.0
-    {
-        return;
+    if let Some(e) = three_cpt_eigen_g(cl, v1, q2, v2, q3, v3) {
+        propagate_three_cpt_core_g(state, dt, &e, rate_central, rate_periph1, rate_periph2);
     }
-    let (alpha, beta, gamma, k21, k31) =
-        crate::sens::three_cpt::macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
-    let k12 = q2 / v1;
-    let k13 = q3 / v1;
-    let modes = [
-        build_three_cpt_mode_g(alpha, k12, k13, k21, k31),
-        build_three_cpt_mode_g(beta, k12, k13, k21, k31),
-        build_three_cpt_mode_g(gamma, k12, k13, k21, k31),
-    ];
-
-    let r_total = rate_central + rate_periph1 + rate_periph2;
-    let a_ss_c = r_total * v1 / cl;
-    let a_ss_p1 =
-        (rate_central + rate_periph2) * v2 / cl + rate_periph1 * (cl + q2) * v2 / (cl * q2);
-    let a_ss_p2 =
-        (rate_central + rate_periph1) * v3 / cl + rate_periph2 * (cl + q3) * v3 / (cl * q3);
-
-    let h_c = state[0] - a_ss_c;
-    let h_p1 = state[1] - a_ss_p1;
-    let h_p2 = state[2] - a_ss_p2;
-
-    let (ca, p1a, p2a) = apply_three_cpt_mode_g(&modes[0], h_c, h_p1, h_p2, dt);
-    let (cb, p1b, p2b) = apply_three_cpt_mode_g(&modes[1], h_c, h_p1, h_p2, dt);
-    let (cg, p1g, p2g) = apply_three_cpt_mode_g(&modes[2], h_c, h_p1, h_p2, dt);
-
-    state[0] = ca + cb + cg + a_ss_c;
-    state[1] = p1a + p1b + p1g + a_ss_p1;
-    state[2] = p2a + p2b + p2g + a_ss_p2;
 }
 
 /// 3-cpt oral propagator: `state = [A_depot, A_central, A_p1, A_p2]`. `rate_central`
@@ -393,40 +498,18 @@ pub fn propagate_three_cpt_g<T: PkNum>(
 /// cmt 1, #400). Both are added by linear superposition and are `0` for bolus
 /// dosing. Generic mirror of
 /// [`crate::pk::event_driven::propagate_three_cpt_oral`].
-#[allow(clippy::too_many_arguments)]
-pub fn propagate_three_cpt_oral_g<T: PkNum>(
+/// 3-cpt oral propagation from **precomputed** eigendata — the single source of the
+/// 3-cpt oral eigenmode + depot forced-response formula.
+pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     state: &mut [T],
     dt: f64,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
+    e: &ThreeCptEigen<T>,
     ka: T,
     rate_central: T,
     rate_depot: T,
 ) {
-    if v1.val() <= 0.0
-        || cl.val() <= 0.0
-        || v2.val() <= 0.0
-        || q2.val() <= 0.0
-        || v3.val() <= 0.0
-        || q3.val() <= 0.0
-        || ka.val() <= 0.0
-    {
-        return;
-    }
-    let (alpha, beta, gamma, k21, k31) =
-        crate::sens::three_cpt::macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
-    let k10 = cl / v1;
-    let k12 = q2 / v1;
-    let k13 = q3 / v1;
-    let modes = [
-        build_three_cpt_mode_g(alpha, k12, k13, k21, k31),
-        build_three_cpt_mode_g(beta, k12, k13, k21, k31),
-        build_three_cpt_mode_g(gamma, k12, k13, k21, k31),
-    ];
+    let (alpha, beta, gamma, k10, k12, k13, k21, k31) =
+        (e.alpha, e.beta, e.gamma, e.k10, e.k12, e.k13, e.k21, e.k31);
 
     let a_d_0 = state[0];
     let a_c_0 = state[1];
@@ -450,9 +533,9 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
     let h_p1 = a_p1_0 - cap_b;
     let h_p2 = a_p2_0 - cap_c;
 
-    let (ca, p1a, p2a) = apply_three_cpt_mode_g(&modes[0], h_c, h_p1, h_p2, dt);
-    let (cb, p1b, p2b) = apply_three_cpt_mode_g(&modes[1], h_c, h_p1, h_p2, dt);
-    let (cg, p1g, p2g) = apply_three_cpt_mode_g(&modes[2], h_c, h_p1, h_p2, dt);
+    let (ca, p1a, p2a) = apply_three_cpt_mode_g(&e.modes[0], h_c, h_p1, h_p2, dt);
+    let (cb, p1b, p2b) = apply_three_cpt_mode_g(&e.modes[1], h_c, h_p1, h_p2, dt);
+    let (cg, p1g, p2g) = apply_three_cpt_mode_g(&e.modes[2], h_c, h_p1, h_p2, dt);
 
     state[1] = ca + cb + cg + cap_a * e_ka;
     state[2] = p1a + p1b + p1g + cap_b * e_ka;
@@ -463,15 +546,10 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
     // (`rate_central` is structurally 0 or positive).
     if rate_central.val() > 0.0 {
         let mut inflow = [T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0)];
-        propagate_three_cpt_g(
+        propagate_three_cpt_core_g(
             &mut inflow,
             dt,
-            cl,
-            v1,
-            q2,
-            v2,
-            q3,
-            v3,
+            e,
             rate_central,
             T::from_f64(0.0),
             T::from_f64(0.0),
@@ -498,23 +576,93 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
         };
         let d_ss = rate_depot / ka;
         let mut xss = [d_ss, c_ss, p1_ss, p2_ss];
-        propagate_three_cpt_oral_g(
-            &mut xss,
-            dt,
-            cl,
-            v1,
-            q2,
-            v2,
-            q3,
-            v3,
-            ka,
-            T::from_f64(0.0),
-            T::from_f64(0.0),
-        );
+        propagate_three_cpt_oral_core_g(&mut xss, dt, e, ka, T::from_f64(0.0), T::from_f64(0.0));
         state[0] = state[0] + (d_ss - xss[0]);
         state[1] = state[1] + (c_ss - xss[1]);
         state[2] = state[2] + (p1_ss - xss[2]);
         state[3] = state[3] + (p2_ss - xss[3]);
+    }
+}
+
+/// 3-cpt oral propagator computing its eigendata inline (the dual-walk wrapper).
+#[allow(clippy::too_many_arguments)]
+pub fn propagate_three_cpt_oral_g<T: PkNum>(
+    state: &mut [T],
+    dt: f64,
+    cl: T,
+    v1: T,
+    q2: T,
+    v2: T,
+    q3: T,
+    v3: T,
+    ka: T,
+    rate_central: T,
+    rate_depot: T,
+) {
+    if ka.val() <= 0.0 {
+        return;
+    }
+    if let Some(e) = three_cpt_eigen_g(cl, v1, q2, v2, q3, v3) {
+        propagate_three_cpt_oral_core_g(state, dt, &e, ka, rate_central, rate_depot);
+    }
+}
+
+/// Per-walk eigendata memo, keyed on the disposition parameter **values**. For a
+/// constant-parameter walk every interval shares the same params, so the 2-/3-cpt
+/// eigenvalue solve (`sqrt` / `acos`) runs once and is reused across all intervals;
+/// a time-varying-covariate change is a cache miss that recomputes transparently,
+/// so results are bit-identical either way. Generic over `T` — the f64 prediction
+/// walk (the path the original per-walk cache sped up on Schnider) and any `Dual2`
+/// caller share one memo and, via the `*_core_g` propagators, one formula.
+pub struct EigenCacheG<T: PkNum> {
+    two: Option<([f64; 4], Option<TwoCptEigen<T>>)>,
+    three: Option<([f64; 6], Option<ThreeCptEigen<T>>)>,
+}
+
+impl<T: PkNum> Default for EigenCacheG<T> {
+    fn default() -> Self {
+        Self {
+            two: None,
+            three: None,
+        }
+    }
+}
+
+impl<T: PkNum> EigenCacheG<T> {
+    /// 2-cpt eigendata for these params, computed once and reused while the param
+    /// values are unchanged. `None` for degenerate params.
+    pub fn two_cpt(&mut self, cl: T, v1: T, q: T, v2: T) -> Option<TwoCptEigen<T>> {
+        let key = [cl.val(), v1.val(), q.val(), v2.val()];
+        if let Some((k, e)) = self.two {
+            if k == key {
+                return e;
+            }
+        }
+        let e = two_cpt_eigen_g(cl, v1, q, v2);
+        self.two = Some((key, e));
+        e
+    }
+
+    /// 3-cpt eigendata for these params, computed once and reused while the param
+    /// values are unchanged. `None` for degenerate params.
+    pub fn three_cpt(
+        &mut self,
+        cl: T,
+        v1: T,
+        q2: T,
+        v2: T,
+        q3: T,
+        v3: T,
+    ) -> Option<ThreeCptEigen<T>> {
+        let key = [cl.val(), v1.val(), q2.val(), v2.val(), q3.val(), v3.val()];
+        if let Some((k, e)) = self.three {
+            if k == key {
+                return e;
+            }
+        }
+        let e = three_cpt_eigen_g(cl, v1, q2, v2, q3, v3);
+        self.three = Some((key, e));
+        e
     }
 }
 

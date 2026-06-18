@@ -348,6 +348,8 @@ fn equilibrate_ss_state_event_driven(
         vec![0.0, dose.ii]
     };
 
+    // Constant params across all SS-equilibration cycles → one eigendata solve.
+    let mut eigen = crate::sens::propagate::EigenCacheG::<f64>::default();
     for _ in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
         if !is_inf {
             // Bolus pulse: instantaneous amount jump (with F).
@@ -361,6 +363,7 @@ fn equilibrate_ss_state_event_driven(
             &synthetic_dose,
             &synthetic_lagtimes,
             f64::NEG_INFINITY,
+            &mut eigen,
         );
     }
 
@@ -394,6 +397,7 @@ fn ss_state_at_phase_event_driven(
     }
 
     let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
+    let mut eigen = crate::sens::propagate::EigenCacheG::<f64>::default();
     if is_inf {
         let t_inf = dose.duration;
         let synthetic_dose = vec![DoseEvent::new(
@@ -413,6 +417,7 @@ fn ss_state_at_phase_event_driven(
             &synthetic_dose,
             &synthetic_lagtimes,
             f64::NEG_INFINITY,
+            &mut eigen,
         );
     } else {
         state[cmt_idx] += pk.bioavailable_amount(dose.amt);
@@ -424,6 +429,7 @@ fn ss_state_at_phase_event_driven(
             &[],
             &[],
             f64::NEG_INFINITY,
+            &mut eigen,
         );
     }
     state
@@ -547,6 +553,12 @@ fn event_driven_predictions_with_schedule_impl(
     // reset means every infusion is eligible.
     let mut reset_floor = f64::NEG_INFINITY;
 
+    // Per-walk eigendata memo: for a subject without time-varying covariates the
+    // disposition params are constant across every interval, so the 2-/3-cpt
+    // eigenvalue solve runs once and is reused (the Schnider speedup). A TV-cov
+    // change is a cache miss that recomputes transparently.
+    let mut eigen = crate::sens::propagate::EigenCacheG::<f64>::default();
+
     for (i, ev) in schedule.events.iter().enumerate() {
         // EVID=3 / EVID=4 reset: zero every compartment. Any drug carried
         // by the interval ending here would just be discarded, so skip the
@@ -578,6 +590,7 @@ fn event_driven_predictions_with_schedule_impl(
                 &subject.doses,
                 &schedule.dose_lagtimes,
                 reset_floor,
+                &mut eigen,
             );
             cur_t = ev.time;
         }
@@ -725,6 +738,7 @@ fn propagate_with_bounds(
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
     reset_floor: f64,
+    eigen: &mut crate::sens::propagate::EigenCacheG<f64>,
 ) {
     for w in bounds.windows(2) {
         let s0 = w[0];
@@ -777,6 +791,14 @@ fn propagate_with_bounds(
             }
         }
 
+        // 2-/3-cpt dispatch goes through the per-walk eigendata memo (`eigen`) and
+        // the single-source `*_core_g` propagators: the `sqrt`/`acos` eigenvalue
+        // solve runs once per distinct param set and is reused across the walk's
+        // intervals (the Schnider speedup), with the formula living once in `sens`.
+        use crate::sens::propagate::{
+            propagate_three_cpt_core_g, propagate_three_cpt_oral_core_g, propagate_two_cpt_core_g,
+            propagate_two_cpt_oral_core_g,
+        };
         match pk_model {
             PkModel::OneCptIv => {
                 propagate_one_cpt(state, dt, pk, rate_central);
@@ -785,16 +807,47 @@ fn propagate_with_bounds(
                 propagate_one_cpt_oral(state, dt, pk, rate_central, rate_depot);
             }
             PkModel::TwoCptIv => {
-                propagate_two_cpt(state, dt, pk, rate_central, rate_periph1);
+                if let Some(e) = eigen.two_cpt(pk.cl(), pk.v(), pk.q(), pk.v2()) {
+                    propagate_two_cpt_core_g::<f64>(state, dt, &e, rate_central, rate_periph1);
+                }
             }
             PkModel::TwoCptOral => {
-                propagate_two_cpt_oral(state, dt, pk, rate_central, rate_depot);
+                if let Some(e) = eigen.two_cpt(pk.cl(), pk.v(), pk.q(), pk.v2()) {
+                    propagate_two_cpt_oral_core_g::<f64>(
+                        state,
+                        dt,
+                        &e,
+                        pk.ka(),
+                        rate_central,
+                        rate_depot,
+                    );
+                }
             }
             PkModel::ThreeCptIv => {
-                propagate_three_cpt(state, dt, pk, rate_central, rate_periph1, rate_periph2);
+                if let Some(e) = eigen.three_cpt(pk.cl(), pk.v(), pk.q(), pk.v2(), pk.q3(), pk.v3())
+                {
+                    propagate_three_cpt_core_g::<f64>(
+                        state,
+                        dt,
+                        &e,
+                        rate_central,
+                        rate_periph1,
+                        rate_periph2,
+                    );
+                }
             }
             PkModel::ThreeCptOral => {
-                propagate_three_cpt_oral(state, dt, pk, rate_central, rate_depot);
+                if let Some(e) = eigen.three_cpt(pk.cl(), pk.v(), pk.q(), pk.v2(), pk.q3(), pk.v3())
+                {
+                    propagate_three_cpt_oral_core_g::<f64>(
+                        state,
+                        dt,
+                        &e,
+                        pk.ka(),
+                        rate_central,
+                        rate_depot,
+                    );
+                }
             }
         }
     }
@@ -808,28 +861,6 @@ fn propagate_with_bounds(
 /// the `Dual2` sensitivity walk uses. There is no separate f64 formula to drift.
 pub(crate) fn propagate_one_cpt(state: &mut [f64], dt: f64, pk: &PkParams, rate: f64) {
     crate::sens::propagate::propagate_one_cpt_g::<f64>(state, dt, pk.cl(), pk.v(), rate);
-}
-
-/// 2-cpt linear propagator with constant input rates into central and
-/// peripheral compartments. Delegates to the single generic source
-/// `sens::propagate::propagate_two_cpt_g` at `T = f64`.
-fn propagate_two_cpt(
-    state: &mut [f64],
-    dt: f64,
-    pk: &PkParams,
-    rate_central: f64,
-    rate_periph: f64,
-) {
-    crate::sens::propagate::propagate_two_cpt_g::<f64>(
-        state,
-        dt,
-        pk.cl(),
-        pk.v(),
-        pk.q(),
-        pk.v2(),
-        rate_central,
-        rate_periph,
-    );
 }
 
 // ─── Oral models ─────────────────────────────────────────────────────
@@ -860,100 +891,7 @@ pub(crate) fn propagate_one_cpt_oral(
     );
 }
 
-/// 2-cpt oral propagator. Delegates to the single generic source
-/// `sens::propagate::propagate_two_cpt_oral_g` at `T = f64`. `rate_central` is a
-/// depot-bypass infusion into central (RATE>0 into cmt 2, #350); `rate_depot` is a
-/// zero-order input into the depot (RATE>0 into cmt 1, #400).
-fn propagate_two_cpt_oral(
-    state: &mut [f64],
-    dt: f64,
-    pk: &PkParams,
-    rate_central: f64,
-    rate_depot: f64,
-) {
-    crate::sens::propagate::propagate_two_cpt_oral_g::<f64>(
-        state,
-        dt,
-        pk.cl(),
-        pk.v(),
-        pk.q(),
-        pk.v2(),
-        pk.ka(),
-        rate_central,
-        rate_depot,
-    );
-}
-
 // ─── 3-compartment models ────────────────────────────────────────────
-
-/// 3-cpt linear propagator (IV models). State = `[A_central, A_p1, A_p2]`.
-/// Spectral decomposition along (α, β, γ) eigenmodes. Constant infusion
-/// `(rate_central, rate_periph1, rate_periph2)` into the three slots is
-/// handled via the steady-state + homogeneous decomposition pattern.
-///
-/// Steady-state per input channel (linear superposition):
-///   - Channel 1 (central):   `A_ss = (r·v1/cl, r·v2/cl, r·v3/cl)`
-///   - Channel 2 (periph 1):  `A_ss[0] = r·v1/cl,
-///                             A_ss[1] = r·(cl+q2)·v2/(cl·q2),
-///                             A_ss[2] = r·v3/cl`
-///   - Channel 3 (periph 2):  `A_ss[0] = r·v1/cl,
-///                             A_ss[1] = r·v2/cl,
-///                             A_ss[2] = r·(cl+q3)·v3/(cl·q3)`
-/// Combined `A_ss` is the sum across channels.
-#[allow(clippy::too_many_arguments)]
-fn propagate_three_cpt(
-    state: &mut [f64],
-    dt: f64,
-    pk: &PkParams,
-    rate_central: f64,
-    rate_periph1: f64,
-    rate_periph2: f64,
-) {
-    crate::sens::propagate::propagate_three_cpt_g::<f64>(
-        state,
-        dt,
-        pk.cl(),
-        pk.v(),
-        pk.q(),
-        pk.v2(),
-        pk.q3(),
-        pk.v3(),
-        rate_central,
-        rate_periph1,
-        rate_periph2,
-    );
-}
-
-/// 3-cpt oral propagator. State = `[A_depot, A_central, A_p1, A_p2]`.
-/// Depot decays independently; the central+peripheral subsystem follows
-/// the 3-cpt homogeneous evolution plus a depot-driven particular solution
-/// of the form `(A, B, C)·exp(-ka·t)`. `rate_central` is a constant zero-order
-/// input into the central compartment (depot-bypassing infusion, RATE>0 into
-/// cmt 2), added by linear superposition. `rate_depot` is a constant zero-order
-/// input into the **depot** (RATE>0 into cmt 1, #400): zero-order release into
-/// the depot, then first-order `ka` absorption into central. The eigenrates and
-/// micro-rates come from the per-walk `ThreeCptRateCache`.
-fn propagate_three_cpt_oral(
-    state: &mut [f64],
-    dt: f64,
-    pk: &PkParams,
-    rate_central: f64,
-    rate_depot: f64,
-) {
-    crate::sens::propagate::propagate_three_cpt_oral_g::<f64>(
-        state,
-        dt,
-        pk.cl(),
-        pk.v(),
-        pk.q(),
-        pk.v2(),
-        pk.q3(),
-        pk.v3(),
-        pk.ka(),
-        rate_central,
-        rate_depot,
-    );
-}
 
 #[cfg(test)]
 mod tests {

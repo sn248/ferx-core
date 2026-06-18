@@ -1,4 +1,15 @@
+use crate::sens::three_cpt::{
+    three_cpt_infusion_g, three_cpt_infusion_ss_g, three_cpt_iv_bolus_g, three_cpt_iv_bolus_ss_g,
+    three_cpt_oral_g, three_cpt_oral_ss_g,
+};
 use crate::types::DoseEvent;
+
+// The 3-cpt single-dose concentration closed forms are the single source of truth
+// in `crate::sens::three_cpt` (generic over `PkNum`); these f64 entry points
+// delegate to the generic `*_g` at `T = f64` (issue #408 / Ron review #9).
+// `#[inline]` keeps the hot path identical. The peripheral-amount helpers
+// (`three_cpt_*_peripherals`) and the local `macro_rates_three_cpt` they share have
+// no concentration analogue and stay here.
 
 /// Compute macro-rate constants (alpha, beta, gamma) from micro-constants
 /// for a three-compartment model using the trigonometric (Vieta) method.
@@ -61,6 +72,7 @@ fn macro_rates_three_cpt(
 
 /// Three-compartment IV bolus
 /// C(t) = A*exp(-alpha*t) + B*exp(-beta*t) + G*exp(-gamma*t)
+#[inline]
 pub fn three_cpt_iv_bolus(
     dose: &DoseEvent,
     t: f64,
@@ -71,26 +83,11 @@ pub fn three_cpt_iv_bolus(
     q3: f64,
     v3: f64,
 ) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || v3 <= 0.0 || cl <= 0.0 || q2 < 0.0 || q3 < 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
-        return 0.0;
-    }
-
-    let d = dose.amt / v1;
-    let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
-    let b = d * (beta - k21) * (beta - k31) / (-ab * bg);
-    let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
-
-    a * (-alpha * t).exp() + b * (-beta * t).exp() + g * (-gamma * t).exp()
+    three_cpt_iv_bolus_g::<f64>(dose.amt, t, cl, v1, q2, v2, q3, v3)
 }
 
 /// Three-compartment constant-rate IV infusion
+#[inline]
 pub fn three_cpt_infusion(
     dose: &DoseEvent,
     t: f64,
@@ -101,47 +98,22 @@ pub fn three_cpt_infusion(
     q3: f64,
     v3: f64,
 ) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || v3 <= 0.0 || cl <= 0.0 || q2 < 0.0 || q3 < 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    if ab.abs() < 1e-12
-        || ag.abs() < 1e-12
-        || bg.abs() < 1e-12
-        || alpha.abs() < 1e-12
-        || beta.abs() < 1e-12
-        || gamma.abs() < 1e-12
-    {
-        return 0.0;
-    }
-
-    let rate = dose.rate;
-    let dur = dose.duration;
-    if dur <= 0.0 {
-        return three_cpt_iv_bolus(dose, t, cl, v1, q2, v2, q3, v3);
-    }
-
-    let rv = rate / v1;
-    let a_coeff = rv * (alpha - k21) * (alpha - k31) / (ab * ag * alpha);
-    let b_coeff = rv * (beta - k21) * (beta - k31) / (-ab * bg * beta);
-    let g_coeff = rv * (gamma - k21) * (gamma - k31) / (ag * bg * gamma);
-
-    if t <= dur {
-        a_coeff * (1.0 - (-alpha * t).exp())
-            + b_coeff * (1.0 - (-beta * t).exp())
-            + g_coeff * (1.0 - (-gamma * t).exp())
-    } else {
-        let dt = t - dur;
-        a_coeff * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp()
-            + b_coeff * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp()
-            + g_coeff * (1.0 - (-gamma * dur).exp()) * (-gamma * dt).exp()
-    }
+    three_cpt_infusion_g::<f64>(
+        dose.rate,
+        dose.duration,
+        dose.amt,
+        t,
+        cl,
+        v1,
+        q2,
+        v2,
+        q3,
+        v3,
+    )
 }
 
 /// Three-compartment oral absorption with bioavailability
+#[inline]
 pub fn three_cpt_oral_f(
     dose: &DoseEvent,
     t: f64,
@@ -154,42 +126,7 @@ pub fn three_cpt_oral_f(
     ka: f64,
     f_bio: f64,
 ) -> f64 {
-    if t < 0.0
-        || v1 <= 0.0
-        || v2 <= 0.0
-        || v3 <= 0.0
-        || cl <= 0.0
-        || q2 < 0.0
-        || q3 < 0.0
-        || ka <= 0.0
-    {
-        return 0.0;
-    }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
-        return 0.0;
-    }
-
-    let coeff = f_bio * dose.amt * ka / v1;
-
-    // Normalized residue coefficients
-    let a = (alpha - k21) * (alpha - k31) / (ab * ag);
-    let b = (beta - k21) * (beta - k31) / (-ab * bg);
-    let c = (gamma - k21) * (gamma - k31) / (ag * bg);
-
-    // Bateman function with L'Hôpital singularity handling
-    let bateman = |lambda: f64| -> f64 {
-        if (ka - lambda).abs() < 1e-6 {
-            t * (-lambda * t).exp()
-        } else {
-            ((-lambda * t).exp() - (-ka * t).exp()) / (ka - lambda)
-        }
-    };
-
-    coeff * (a * bateman(alpha) + b * bateman(beta) + c * bateman(gamma))
+    three_cpt_oral_g::<f64>(dose.amt, t, cl, v1, q2, v2, q3, v3, ka, f_bio)
 }
 
 /// Three-compartment oral absorption (F=1.0 default)
@@ -224,6 +161,7 @@ fn ss_coeff_3(lambda: f64, ii: f64) -> f64 {
 }
 
 /// Three-compartment IV bolus at steady state.
+#[inline]
 pub fn three_cpt_iv_bolus_ss(
     dose: &DoseEvent,
     t: f64,
@@ -234,36 +172,12 @@ pub fn three_cpt_iv_bolus_ss(
     q3: f64,
     v3: f64,
 ) -> f64 {
-    if t < 0.0
-        || v1 <= 0.0
-        || v2 <= 0.0
-        || v3 <= 0.0
-        || cl <= 0.0
-        || q2 < 0.0
-        || q3 < 0.0
-        || dose.ii <= 0.0
-    {
-        return 0.0;
-    }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
-        return 0.0;
-    }
-    let ii = dose.ii;
-    let d = dose.amt / v1;
-    let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
-    let b = d * (beta - k21) * (beta - k31) / (-ab * bg);
-    let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
-    a * (-alpha * t).exp() * ss_coeff_3(alpha, ii)
-        + b * (-beta * t).exp() * ss_coeff_3(beta, ii)
-        + g * (-gamma * t).exp() * ss_coeff_3(gamma, ii)
+    three_cpt_iv_bolus_ss_g::<f64>(dose.amt, t, dose.ii, cl, v1, q2, v2, q3, v3)
 }
 
 /// Three-compartment infusion at steady state, for any `T_inf` — including
 /// overlapping pulses (`T_inf > II`). Evaluated at phase `t ∈ [0, II)`.
+#[inline]
 pub fn three_cpt_infusion_ss(
     dose: &DoseEvent,
     t: f64,
@@ -274,85 +188,23 @@ pub fn three_cpt_infusion_ss(
     q3: f64,
     v3: f64,
 ) -> f64 {
-    if t < 0.0
-        || v1 <= 0.0
-        || v2 <= 0.0
-        || v3 <= 0.0
-        || cl <= 0.0
-        || q2 < 0.0
-        || q3 < 0.0
-        || dose.ii <= 0.0
-    {
-        return 0.0;
-    }
-    let dur = dose.duration;
-    if dur <= 0.0 {
-        return three_cpt_iv_bolus_ss(dose, t, cl, v1, q2, v2, q3, v3);
-    }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    if ab.abs() < 1e-12
-        || ag.abs() < 1e-12
-        || bg.abs() < 1e-12
-        || alpha.abs() < 1e-12
-        || beta.abs() < 1e-12
-        || gamma.abs() < 1e-12
-    {
-        return 0.0;
-    }
-    let ii = dose.ii;
-    let rate = dose.rate;
-    let rv = rate / v1;
-    let a_coeff = rv * (alpha - k21) * (alpha - k31) / (ab * ag * alpha);
-    let b_coeff = rv * (beta - k21) * (beta - k31) / (-ab * bg * beta);
-    let g_coeff = rv * (gamma - k21) * (gamma - k31) / (ag * bg * gamma);
-
-    if dur > ii {
-        // Overlapping infusions: superpose the past pulse train per eigenvalue
-        // (mirror of the 1-cpt form in `one_cpt_infusion_ss`). `N` = count of
-        // pulses still infusing at phase `t`; `sc = 1/(1 − e^{−λ·II})`.
-        let n_active = (((dur - t) / ii).floor() + 1.0).max(0.0);
-        let nii = n_active * ii;
-        let overlap = |c: f64, lambda: f64| -> f64 {
-            let sc = ss_coeff_3(lambda, ii);
-            let a = n_active - (-lambda * t).exp() * (1.0 - (-lambda * nii).exp()) * sc;
-            let d = (1.0 - (-lambda * dur).exp()) * (-lambda * (t - dur + nii)).exp() * sc;
-            c * (a + d)
-        };
-        return overlap(a_coeff, alpha) + overlap(b_coeff, beta) + overlap(g_coeff, gamma);
-    }
-
-    // Helper: contribution from past pulses (n ≥ 1) for one eigenvalue —
-    // always "after-infusion" because τ + n·II ≥ II ≥ T_inf.
-    let past = |coeff: f64, lambda: f64| -> f64 {
-        coeff
-            * (1.0 - (-lambda * dur).exp())
-            * (-lambda * (t - dur)).exp()
-            * (-lambda * ii).exp()
-            * ss_coeff_3(lambda, ii)
-    };
-
-    if t <= dur {
-        // n=0 is during the current infusion.
-        a_coeff * (1.0 - (-alpha * t).exp())
-            + b_coeff * (1.0 - (-beta * t).exp())
-            + g_coeff * (1.0 - (-gamma * t).exp())
-            + past(a_coeff, alpha)
-            + past(b_coeff, beta)
-            + past(g_coeff, gamma)
-    } else {
-        // All pulses are "after-infusion" — fold n=0 in by replacing the
-        // tail's (n ≥ 1) sum with (n ≥ 0).
-        let dt = t - dur;
-        a_coeff * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp() * ss_coeff_3(alpha, ii)
-            + b_coeff * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp() * ss_coeff_3(beta, ii)
-            + g_coeff * (1.0 - (-gamma * dur).exp()) * (-gamma * dt).exp() * ss_coeff_3(gamma, ii)
-    }
+    three_cpt_infusion_ss_g::<f64>(
+        dose.rate,
+        dose.duration,
+        dose.amt,
+        t,
+        dose.ii,
+        cl,
+        v1,
+        q2,
+        v2,
+        q3,
+        v3,
+    )
 }
 
 /// Three-compartment oral absorption at steady state (with bioavailability).
+#[inline]
 pub fn three_cpt_oral_f_ss(
     dose: &DoseEvent,
     t: f64,
@@ -365,52 +217,7 @@ pub fn three_cpt_oral_f_ss(
     ka: f64,
     f_bio: f64,
 ) -> f64 {
-    if t < 0.0
-        || v1 <= 0.0
-        || v2 <= 0.0
-        || v3 <= 0.0
-        || cl <= 0.0
-        || q2 < 0.0
-        || q3 < 0.0
-        || ka <= 0.0
-        || dose.ii <= 0.0
-    {
-        return 0.0;
-    }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
-        return 0.0;
-    }
-    let ii = dose.ii;
-    let coeff = f_bio * dose.amt * ka / v1;
-    let a = (alpha - k21) * (alpha - k31) / (ab * ag);
-    let b = (beta - k21) * (beta - k31) / (-ab * bg);
-    let c = (gamma - k21) * (gamma - k31) / (ag * bg);
-
-    // SS bateman per eigenvalue λ:
-    //   Σ_n [exp(-λ·(τ + n·II)) - exp(-ka·(τ + n·II))] / (ka - λ)
-    //     = [exp(-λ·τ)/(1-exp(-λ·II)) - exp(-ka·τ)/(1-exp(-ka·II))] / (ka - λ)
-    // L'Hopital limit when ka ≈ λ:
-    //   Σ_n (τ + n·II) · exp(-λ·(τ + n·II))
-    //     = exp(-λ·τ) · [τ/(1-x) + II·x/(1-x)²]  with x = exp(-λ·ii).
-    let bateman_ss = |lambda: f64| -> f64 {
-        if (ka - lambda).abs() < 1e-6 {
-            let x = (-lambda * ii).exp();
-            let one_minus_x = 1.0 - x;
-            if one_minus_x <= 0.0 {
-                return 0.0;
-            }
-            (-lambda * t).exp() * (t / one_minus_x + ii * x / (one_minus_x * one_minus_x))
-        } else {
-            ((-lambda * t).exp() * ss_coeff_3(lambda, ii) - (-ka * t).exp() * ss_coeff_3(ka, ii))
-                / (ka - lambda)
-        }
-    };
-
-    coeff * (a * bateman_ss(alpha) + b * bateman_ss(beta) + c * bateman_ss(gamma))
+    three_cpt_oral_ss_g::<f64>(dose.amt, t, dose.ii, cl, v1, q2, v2, q3, v3, ka, f_bio)
 }
 
 /// Three-compartment oral absorption at steady state (F = 1).

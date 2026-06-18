@@ -1507,6 +1507,15 @@ fn optimize_bfgs(
         eprintln!("Iter {:>4}: OFV = {:.6}", 0, f_val);
     }
 
+    // Two outer Hessian strategies share this loop: `Optimizer::Lbfgs` uses a
+    // limited-memory L-BFGS two-loop recursion over the last `LBFGS_MEMORY`
+    // curvature pairs (no dense matrix); `Optimizer::Bfgs` keeps the full inverse
+    // Hessian `h_inv`. Both consume the same analytic gradient and Eq. 48 warm
+    // EBEs below.
+    let use_lbfgs = matches!(options.optimizer, Optimizer::Lbfgs);
+    const LBFGS_MEMORY: usize = 10;
+    let mut s_hist: Vec<DVector<f64>> = Vec::new();
+    let mut y_hist: Vec<DVector<f64>> = Vec::new();
     let mut h_inv = DMatrix::<f64>::identity(n, n);
     let mut converged = false;
     let mut n_iterations = 0;
@@ -1529,13 +1538,20 @@ fn optimize_bfgs(
             break;
         }
 
-        let g_vec = DVector::from_column_slice(&g);
-        let d_vec = -&h_inv * &g_vec;
-        let mut d: Vec<f64> = d_vec.iter().copied().collect();
+        let mut d: Vec<f64> = if use_lbfgs {
+            lbfgs_two_loop(&g, &s_hist, &y_hist)
+        } else {
+            let g_vec = DVector::from_column_slice(&g);
+            (-&h_inv * &g_vec).iter().copied().collect()
+        };
 
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
         if dg >= 0.0 || !dg.is_finite() {
+            // Non-descent direction: discard curvature memory and take steepest
+            // descent (L-BFGS clears its history; dense BFGS resets `h_inv`).
             d = g.iter().map(|gi| -gi).collect();
+            s_hist.clear();
+            y_hist.clear();
             h_inv = DMatrix::identity(n, n);
         }
 
@@ -1550,6 +1566,8 @@ fn optimize_bfgs(
                 }
                 break;
             }
+            s_hist.clear();
+            y_hist.clear();
             h_inv = DMatrix::identity(n, n);
             continue;
         }
@@ -1585,7 +1603,22 @@ fn optimize_bfgs(
             x_anchor_real = x_new_real;
         }
 
-        bfgs_update(&mut h_inv, &xs, &xs_old, &g_new, &g, n);
+        if use_lbfgs {
+            // Push the new curvature pair (s = Δx, y = Δg) with the same `s·y > 0`
+            // filter `bfgs_update` uses, capping the history at `LBFGS_MEMORY`.
+            let s = DVector::from_iterator(n, (0..n).map(|i| xs[i] - xs_old[i]));
+            let y = DVector::from_iterator(n, (0..n).map(|i| g_new[i] - g[i]));
+            if s.dot(&y) > 1e-12 {
+                s_hist.push(s);
+                y_hist.push(y);
+                if s_hist.len() > LBFGS_MEMORY {
+                    s_hist.remove(0);
+                    y_hist.remove(0);
+                }
+            }
+        } else {
+            bfgs_update(&mut h_inv, &xs, &xs_old, &g_new, &g, n);
+        }
 
         let prev_ofv = f_val;
         f_val = f_new;
@@ -1913,11 +1946,28 @@ fn sens_check_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Population gradient dispatcher. IOV models (`n_kappa > 0`) use the
-/// EBE-reconverging FD gradient — their weakly-identified variance components
-/// need it (issue #101 rec #2) — and everything else uses the cheap analytical
-/// fixed-EBE gradient unless the `reconverge_gradient_interval` schedule opts
-/// this evaluation into the reconverged path.
+/// True when the model uses the M3 BLOQ likelihood and at least one subject has
+/// a censored row. For these the analytic outer gradient (`subject_packed_gradient`)
+/// declines on the censored subject — it differentiates the Gaussian data term,
+/// not `−logΦ(z)` — so the only consistent gradient is the EBE-reconverging FD
+/// one. Like IOV, M3 therefore forces the reconverged path; the fixed-EBE FD
+/// gradient (the `ad_population_gradient` fallback) is biased on the censored
+/// rows and stalls a gradient optimizer above the true minimum (validated vs
+/// NONMEM on warfarin BLOQ: reconverged reaches TVKA ≈ 0.81 / OFV ≈ −217, the
+/// fixed-EBE path stalls at TVKA ≈ 1.10 / OFV ≈ −213.8).
+fn m3_censored_present(model: &CompiledModel, population: &Population) -> bool {
+    matches!(model.bloq_method, BloqMethod::M3)
+        && population
+            .subjects
+            .iter()
+            .any(|s| s.cens.iter().any(|&c| c != 0))
+}
+
+/// Population gradient dispatcher. IOV models (`n_kappa > 0`) and M3-censored
+/// models use the EBE-reconverging FD gradient — their weakly-identified variance
+/// components / non-Gaussian censored rows need it — and everything else uses the
+/// cheap analytical fixed-EBE gradient unless the `reconverge_gradient_interval`
+/// schedule opts this evaluation into the reconverged path.
 ///
 /// `grad_eval_idx` is the caller's count of gradient evaluations so far; this
 /// function reads it to apply the schedule and then advances it. Owning the
@@ -1940,6 +1990,10 @@ fn population_gradient(
 ) -> Vec<f64> {
     let reconverge = reconverge_this_eval(options, *grad_eval_idx);
     *grad_eval_idx += 1;
+    // M3-censored models force the reconverged path (see `m3_censored_present`):
+    // the analytic gradient declines on censored subjects and the fixed-EBE FD
+    // fallback is biased there, so a gradient optimizer would stall otherwise.
+    let force_reconverge = reconverge || m3_censored_present(model, population);
     // Analytic-sensitivity gradient (Almquist 2015 Eq. 23, closed form via the
     // `sens` provider): the exact marginal FOCEI gradient including the Eq. 46
     // EBE response on every θ/Ω/σ block — no fixed-EBE bias, no FD noise, so it
@@ -1956,7 +2010,7 @@ fn population_gradient(
     // reconverged-FD gradient on every eval even for analytical models — so the
     // numeric fallback remains available if the analytic gradient is ever
     // suspect, and the setting is honoured rather than silently ignored.
-    if !reconverge && crate::sens::provider::sens_supported(model) {
+    if !force_reconverge && crate::sens::provider::sens_supported(model) {
         let g = if options.interaction {
             crate::estimation::sens_outer_gradient::population_gradient_sens(
                 model,
@@ -2026,7 +2080,7 @@ fn population_gradient(
     // optimum on ill-conditioned fits. The `reconverge_gradient_interval`
     // schedule (via `reconverge_this_eval`) opts a non-IOV fit into the
     // reconverged path (see focei-slsqp-fixed-ebe-gradient-bias).
-    if model.n_kappa > 0 || reconverge {
+    if model.n_kappa > 0 || force_reconverge {
         reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options)
     } else {
         ad_population_gradient(
@@ -2067,6 +2121,40 @@ fn bfgs_update(
     } else {
         *h_inv = DMatrix::identity(n, n);
     }
+}
+
+/// Limited-memory L-BFGS search direction `d = −H∇f` via the two-loop recursion
+/// (Nocedal & Wright Alg. 7.4), using the most recent `(s, y)` history pairs
+/// (newest last). The implicit inverse-Hessian seed is `γ·I` with
+/// `γ = (sₖ·yₖ)/(yₖ·yₖ)` from the newest pair (Barzilai–Borwein scaling) — the
+/// standard choice that keeps the step well-scaled without ever forming the
+/// dense `n×n` matrix `bfgs_update` maintains. With no history it returns plain
+/// steepest descent `−∇f`. Curvature filtering (`s·y > 0`) is enforced by the
+/// caller before a pair is pushed, so every stored `ρᵢ = 1/(yᵢ·sᵢ)` is finite.
+fn lbfgs_two_loop(g: &[f64], s_hist: &[DVector<f64>], y_hist: &[DVector<f64>]) -> Vec<f64> {
+    let m = s_hist.len();
+    debug_assert_eq!(m, y_hist.len());
+    let mut q = DVector::from_column_slice(g);
+    if m == 0 {
+        return (-q).iter().copied().collect();
+    }
+    let rho: Vec<f64> = (0..m).map(|i| 1.0 / y_hist[i].dot(&s_hist[i])).collect();
+    let mut alpha = vec![0.0f64; m];
+    // First loop: newest → oldest.
+    for i in (0..m).rev() {
+        alpha[i] = rho[i] * s_hist[i].dot(&q);
+        q -= alpha[i] * &y_hist[i];
+    }
+    // Seed with γ·I from the newest pair.
+    let last = m - 1;
+    let gamma = s_hist[last].dot(&y_hist[last]) / y_hist[last].dot(&y_hist[last]);
+    let mut r = gamma * q;
+    // Second loop: oldest → newest.
+    for i in 0..m {
+        let beta = rho[i] * y_hist[i].dot(&r);
+        r += (alpha[i] - beta) * &s_hist[i];
+    }
+    (-r).iter().copied().collect()
 }
 
 fn backtracking_line_search_warm(

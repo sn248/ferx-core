@@ -73,21 +73,28 @@ ferx examples/warfarin_bloq.ferx --data data/warfarin_bloq.csv
 
 ```
 --- Objective Function ---
-OFV:  -213.9104
+OFV:  -217.1841
 
 --- THETA Estimates ---
-TVCL                 0.126263
-TVV                  7.629401
-TVKA                 1.083302
+TVCL                 0.132811
+TVV                  7.732354
+TVKA                 0.811661
 
 --- OMEGA Estimates ---
-  OMEGA(1,1) = 0.031381  (CV% = 17.7)
-  OMEGA(2,2) = 0.009723  (CV% = 9.9)
-  OMEGA(3,3) = 0.419327  (CV% = 64.8)
+  OMEGA(1,1) = 0.029021  (CV% = 17.0)
+  OMEGA(2,2) = 0.009557  (CV% = 9.8)
+  OMEGA(3,3) = 0.338106  (CV% = 58.1)
 
 --- SIGMA Estimates ---
-  SIGMA(1) = 0.010766
+  SIGMA(1) = 0.010761
 ```
+
+These match a NONMEM 7.5.1 LAPLACE M3 reference (`tests/nonmem/warfarin_bloq.{ctl,lst}`)
+to ~4 significant figures on the structural and variance parameters (TVCL 0.132801,
+TVV 7.73139, TVKA 0.809824, PROP 0.010760, ω 0.028849 / 0.009544 / 0.335772). The
+NONMEM objective uses the F_FLAG likelihood convention for censored rows, which
+carries a different additive constant than ferx's M3 term, so the OFV is not directly
+comparable (the MLE is).
 
 The diagnostic table (`warfarin_bloq-sdtab.csv`) gains a `CENS` column, and the
 `IWRES` / `CWRES` cells for censored rows are written as empty (a weighted

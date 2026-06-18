@@ -94,7 +94,9 @@ Because the gradient is both exact and bias-free here, `lbfgs` / `nlopt_lbfgs` a
 
 The exact gradient lands on the same optimum as the underlying objective, validated against NONMEM on the warfarin 1-cpt oral model: FOCE reaches OFV −280.36 (NONMEM −280.36; TVCL 0.1330, TVKA 0.7252, ω²: 0.0286 / 0.00958 / 0.349) and FOCEI reaches −286.00 (NONMEM −286.00) — both agreeing to ~4–5 significant figures across θ, Ω, and σ.
 
-The fallback (finite-difference) gradient is used when the model has: an ODE system, inter-occasion variability (`kappa`), log-transformed-both-sides (LTBS) or output scaling, a dose lagtime, time-varying covariates, system resets, or an overlapping steady-state infusion (`T_inf > II`, [#379](https://github.com/FeRx-NLME/ferx-core/issues/379)). For those, the guidance above (prefer `bobyqa`, or reconverge `slsqp`) still applies.
+The exact gradient also covers log-transform-both-sides (`log(DV) ~ additive(...)`) and constant output scaling (`[scaling] obs_scale = k`): the analytic provider applies the `g = ln(f)` jet transform (value, gradient, and Hessian) and the constant divisor in closed form. Validated against NONMEM on the warfarin LTBS model — the gradient-based `lbfgs` path reaches OFV −675.302 and recovers NONMEM's MLE (TVCL 0.1327, TVV 7.738, TVKA 0.811) to ~4 significant figures.
+
+The fallback (finite-difference) gradient is used when the model has: an ODE system, inter-occasion variability (`kappa`), a dose lagtime, time-varying covariates, system resets, expression/per-compartment output scaling, or an overlapping steady-state infusion (`T_inf > II`, [#379](https://github.com/FeRx-NLME/ferx-core/issues/379)). For those, the guidance above (prefer `bobyqa`, or reconverge `slsqp`) still applies.
 
 ---
 

@@ -480,7 +480,10 @@ pub fn infusion_ss_explicit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sens::one_cpt::{one_cpt_infusion_g, one_cpt_iv_bolus_g, one_cpt_oral_g};
+    use crate::sens::one_cpt::{
+        one_cpt_infusion_g, one_cpt_infusion_ss_g, one_cpt_iv_bolus_g, one_cpt_iv_bolus_ss_g,
+        one_cpt_oral_g,
+    };
 
     fn dual_bolus(amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2]) {
         let d = one_cpt_iv_bolus_g::<Dual2<2>>(amt, t, Dual2::var(cl, 0), Dual2::var(v, 1));

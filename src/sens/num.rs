@@ -3,6 +3,7 @@
 //! and its exact sensitivities (`T = Dual2<N>`). No Enzyme, no codegen: the same
 //! source is monomorphised for each numeric type.
 
+use super::dual1::Dual1;
 use super::dual2::Dual2;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
@@ -90,6 +91,61 @@ impl PkNum for f64 {
     #[inline]
     fn guard_floor(self, lo: f64) -> Self {
         self.max(lo)
+    }
+}
+
+impl<const N: usize> PkNum for Dual1<N> {
+    #[inline]
+    fn from_f64(x: f64) -> Self {
+        Dual1::constant(x)
+    }
+    #[inline]
+    fn val(self) -> f64 {
+        self.value
+    }
+    #[inline]
+    fn exp(self) -> Self {
+        Dual1::exp(self)
+    }
+    #[inline]
+    fn ln(self) -> Self {
+        Dual1::ln(self)
+    }
+    #[inline]
+    fn sqrt(self) -> Self {
+        Dual1::sqrt(self)
+    }
+    #[inline]
+    fn pow(self, e: Self) -> Self {
+        Dual1::powd(self, e)
+    }
+    #[inline]
+    fn abs(self) -> Self {
+        Dual1::abs(self)
+    }
+    #[inline]
+    fn inv_logit(self) -> Self {
+        Dual1::inv_logit(self)
+    }
+    #[inline]
+    fn logit(self) -> Self {
+        Dual1::logit(self)
+    }
+    #[inline]
+    fn cos(self) -> Self {
+        Dual1::cos(self)
+    }
+    #[inline]
+    fn acos(self) -> Self {
+        Dual1::acos(self)
+    }
+    #[inline]
+    fn guard_floor(self, lo: f64) -> Self {
+        if self.value < lo {
+            Dual1::constant(lo)
+        } else {
+            self
+        }
     }
 }
 

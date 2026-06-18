@@ -484,6 +484,10 @@ pub fn find_ebe(
 ) -> EbeResult {
     let n_eta = model.n_eta;
 
+    if inner_profile_enabled() {
+        PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     // ── IOV branch ─────────────────────────────────────────────────────────
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
@@ -767,16 +771,31 @@ pub fn find_ebe(
                              // of the FD gradient's ~2·n_eta+1 predictions, and exact → fewer steps.
                              // Per-point FD fallback if the provider can't serve a given (θ, η).
         if analytic_inner_grad_supported(model, subject) {
+            let profile = inner_profile_enabled();
             let agrad = |e: &[f64]| -> Vec<f64> {
-                analytic_eta_nll_gradient(
+                match analytic_eta_nll_gradient(
                     model,
                     subject,
                     &params.theta,
                     e,
                     &params.omega,
                     &params.sigma.values,
-                )
-                .unwrap_or_else(|| gradient_fd(&obj, e, n_eta))
+                ) {
+                    Some(g) => {
+                        if profile {
+                            PROFILE_INNER_ANALYTIC_GRAD
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        g
+                    }
+                    None => {
+                        if profile {
+                            PROFILE_INNER_FD_FALLBACK
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        gradient_fd(&obj, e, n_eta)
+                    }
+                }
             };
             inner_minimize_with_grad(&obj, &agrad, &mut eta, n_eta, max_iter, tol)
         } else {
@@ -1113,14 +1132,86 @@ const LBFGS_MEMORY: usize = 8;
 /// (benchmarked: dense wins for `n ≲ 8`, L-BFGS wins 2× at n=64, 17× at n=256 —
 /// see `inner_solver_scaling_bench`). The threshold sits well above the typical
 /// PK `n_eta` (≤ ~8) and modest IOV, so only genuinely high-dimensional inner
-/// problems (large IOV: `n_eta + K·n_kappa`) take the L-BFGS path.
-const INNER_LBFGS_MIN_DIM: usize = 32;
+/// problems (large IOV: `n_eta + K·n_kappa`) take the L-BFGS path. Only consulted
+/// in [`InnerOptimizer::Auto`]; an explicit `inner_optimizer` pins the solver.
+pub const INNER_LBFGS_MIN_DIM: usize = 32;
+
+/// Fit-scoped inner-loop optimizer mode, set once per fit from
+/// `FitOptions::inner_optimizer` via [`set_inner_optimizer`] and read by the inner
+/// dispatch. Stored as the [`InnerOptimizer`] discriminant (`0 = Auto`, the
+/// default), so a fit that never sets it behaves exactly as before. A plain
+/// process-global (not threaded through every `find_ebe` caller) because the
+/// inner loop fans out over subjects via rayon and they all read one fit setting.
+static INNER_OPT_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Set the inner-loop optimizer for the current fit. Call once at fit start.
+pub fn set_inner_optimizer(mode: crate::types::InnerOptimizer) {
+    use crate::types::InnerOptimizer::*;
+    let code = match mode {
+        Auto => 0,
+        Bfgs => 1,
+        Lbfgs => 2,
+        NelderMead => 3,
+    };
+    INNER_OPT_MODE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn inner_optimizer_mode() -> crate::types::InnerOptimizer {
+    use crate::types::InnerOptimizer::*;
+    match INNER_OPT_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Bfgs,
+        2 => Lbfgs,
+        3 => NelderMead,
+        _ => Auto,
+    }
+}
+
+/// `FERX_PROFILE=1` attribution counters for the inner loop: how many EBE solves
+/// run, and per inner gradient step whether the exact analytic gradient served it
+/// or it fell back to the `~2·n_eta+1`-prediction FD gradient. A high fallback
+/// rate is the prime suspect when inner value-eval (prediction) counts balloon.
+pub static PROFILE_INNER_SOLVES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PROFILE_INNER_ANALYTIC_GRAD: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PROFILE_INNER_FD_FALLBACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn inner_profile_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("FERX_PROFILE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Print the accumulated inner-loop attribution profile (no-op unless `FERX_PROFILE=1`).
+pub fn profile_report() {
+    if !inner_profile_enabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let solves = PROFILE_INNER_SOLVES.load(Relaxed);
+    let ana = PROFILE_INNER_ANALYTIC_GRAD.load(Relaxed);
+    let fd = PROFILE_INNER_FD_FALLBACK.load(Relaxed);
+    if solves > 0 {
+        let tot = (ana + fd).max(1);
+        eprintln!(
+            "[profile] inner: {} EBE solves; {} analytic-grad steps, {} FD-fallback steps ({:.2}% fallback)",
+            solves,
+            ana,
+            fd,
+            100.0 * fd as f64 / tot as f64
+        );
+    }
+}
 
 /// Whether the exact analytic η-gradient of the individual NLL
 /// ([`analytic_eta_nll_gradient`]) applies to this model/subject: the analytic
-/// sensitivity provider must serve it, and the likelihood must be the plain
-/// Gaussian data term (no SDE EKF, no M3 censoring, no TTE) whose η-gradient the
-/// closed form below covers.
+/// sensitivity provider must serve it, and the likelihood must be one the closed
+/// form below covers — the Gaussian data term or the M3 censored term
+/// (`−logΦ((LLOQ−f)/√V)`), but not the SDE EKF or TTE terms.
 fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
     // Escape hatch / A-B toggle: force the FD inner gradient everywhere.
     if std::env::var("FERX_NO_ANALYTIC_INNER")
@@ -1132,9 +1223,15 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     if model.is_sde() {
         return false;
     }
-    if matches!(model.bloq_method, crate::types::BloqMethod::M3)
-        && subject.cens.iter().any(|&c| c != 0)
-    {
+    // LTBS keeps the FD inner gradient. The provider's generic closed forms and
+    // the objective's `compute_predictions` agree only to ~1e-9, and the LTBS
+    // `g = ln(f)` wrap with a small additive-on-log σ amplifies that mismatch in
+    // the covariance OFV second-difference Hessian (the analytic-EBE minimum sits
+    // ~1e-9 off the objective's, enough to corrupt the curvature and inflate the
+    // SEs ~5×). FD reconverges the *objective's* own EBE, so the Hessian stays
+    // clean. The analytic *outer* gradient still serves LTBS (the fit matches
+    // NONMEM); only the inner EBE finder reverts here.
+    if model.log_transform {
         return false;
     }
     #[cfg(feature = "survival")]
@@ -1156,6 +1253,25 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
 /// ```text
 ///   ∂nll/∂η_k = Σ_j ∂f_j/∂η_k · ( −ε/v + ½·R'(f)·(1/v − ε²/v²) ) + (Ω⁻¹η)_k
 /// ```
+/// On an M3-censored row (`CENS=1`, with `y` carrying the LLOQ) the data term is
+/// `−logΦ(z)`, `z = (y−f)/√v`, so its per-row coefficient becomes
+/// `h·( 1/√v + (y−f)·R'(f)/(2·v^{3/2}) )` with `h = φ(z)/Φ(z)` the inverse Mills
+/// ratio — matching the censored branch of [`individual_nll`].
+/// `∂/∂f` of the M3 censored per-observation data term `−logΦ(z)`,
+/// `z = (y−f)/√v`, where `y` carries the LLOQ, `v = R(f)` is the residual
+/// variance and `dv_df = R'(f)`. Multiplying by `∂f/∂η_k` yields the censored
+/// row's contribution to `∂nll/∂η_k`. `h = φ(z)/Φ(z)` is the inverse Mills ratio,
+/// evaluated through logs so it stays finite in the far tail (`Φ(z)→0` when the
+/// prediction sits well above the LLOQ).
+#[inline]
+fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
+    let sqrt_v = v.sqrt();
+    let z = (y - f) / sqrt_v;
+    let ln_phi = -0.5 * z * z - 0.5 * std::f64::consts::TAU.ln();
+    let h = (ln_phi - crate::stats::special::log_normal_cdf(z)).exp();
+    h * (1.0 / sqrt_v + (y - f) * dv_df / (2.0 * v * sqrt_v))
+}
+
 fn analytic_eta_nll_gradient(
     model: &CompiledModel,
     subject: &Subject,
@@ -1164,10 +1280,13 @@ fn analytic_eta_nll_gradient(
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
 ) -> Option<Vec<f64>> {
-    let sens = crate::sens::provider::subject_sensitivities(model, subject, theta, eta)?;
+    // Light first-order provider (value + ∂f/∂η only); the inner gradient never
+    // needs the second-order / θ blocks the full `subject_sensitivities` carries.
+    let sens = crate::sens::provider::subject_eta_grad(model, subject, theta, eta)?;
     let n_eta = model.n_eta;
+    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
     let mut grad = vec![0.0_f64; n_eta];
-    for (j, obs) in sens.obs.iter().enumerate() {
+    for (j, obs) in sens.iter().enumerate() {
         let y = subject.observations[j];
         let cmt = subject.obs_cmts[j];
         let f = obs.f;
@@ -1176,8 +1295,12 @@ fn analytic_eta_nll_gradient(
             return None;
         }
         let dv_df = model.error_spec.dvar_df(cmt, f, sigma);
-        let eps = y - f;
-        let coef = -eps / v + 0.5 * dv_df * (1.0 / v - eps * eps / (v * v));
+        let coef = if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
+            m3_censored_dterm_df(y, f, v, dv_df)
+        } else {
+            let eps = y - f;
+            -eps / v + 0.5 * dv_df * (1.0 / v - eps * eps / (v * v))
+        };
         for k in 0..n_eta {
             grad[k] += coef * obs.df_deta[k];
         }
@@ -1191,9 +1314,26 @@ fn analytic_eta_nll_gradient(
     Some(grad)
 }
 
-/// Inner EBE minimization with a finite-difference gradient. Dispatches to dense
-/// BFGS (small `n`) or L-BFGS (large `n`) by [`INNER_LBFGS_MIN_DIM`]; both
-/// converge to the same EBE (stationary point of `individual_nll + ½η'Ω⁻¹η`).
+/// Whether to take the L-BFGS path for inner dimension `n` under the current
+/// [`inner_optimizer_mode`]. `Auto` consults the [`INNER_LBFGS_MIN_DIM`] threshold;
+/// an explicit `Bfgs`/`Lbfgs` pins it; `NelderMead` is handled by the callers
+/// before this is reached (it ignores the gradient).
+fn inner_use_lbfgs(n: usize) -> bool {
+    use crate::types::InnerOptimizer::*;
+    match inner_optimizer_mode() {
+        Auto => n >= INNER_LBFGS_MIN_DIM,
+        Lbfgs => true,
+        // Bfgs and NelderMead never take the L-BFGS branch (NelderMead is dispatched
+        // earlier); Bfgs forces dense.
+        _ => false,
+    }
+}
+
+/// Inner EBE minimization with a finite-difference gradient. Dispatches per the
+/// fit-scoped [`inner_optimizer_mode`] (dense BFGS / L-BFGS / Nelder–Mead); in
+/// `Auto` it falls back to the [`INNER_LBFGS_MIN_DIM`] size threshold. All
+/// gradient-based variants converge to the same EBE (stationary point of
+/// `individual_nll + ½η'Ω⁻¹η`).
 fn inner_minimize(
     obj: &dyn Fn(&[f64]) -> f64,
     x: &mut [f64],
@@ -1201,8 +1341,14 @@ fn inner_minimize(
     max_iter: usize,
     tol: f64,
 ) -> bool {
+    if matches!(
+        inner_optimizer_mode(),
+        crate::types::InnerOptimizer::NelderMead
+    ) {
+        return nelder_mead_minimize(obj, x, n, max_iter, tol);
+    }
     let grad = |p: &[f64]| gradient_fd(obj, p, n);
-    if n >= INNER_LBFGS_MIN_DIM {
+    if inner_use_lbfgs(n) {
         lbfgs_core(obj, &grad, x, n, max_iter, tol)
     } else {
         dense_bfgs_core(obj, &grad, x, n, max_iter, tol)
@@ -1210,7 +1356,8 @@ fn inner_minimize(
 }
 
 /// Inner EBE minimization with an externally-provided gradient (analytic
-/// sensitivities or AD). Same dense-vs-L-BFGS dispatch as [`inner_minimize`].
+/// sensitivities or AD). Same fit-scoped dispatch as [`inner_minimize`]; the
+/// `NelderMead` mode ignores the supplied gradient.
 fn inner_minimize_with_grad(
     obj: &dyn Fn(&[f64]) -> f64,
     grad: &dyn Fn(&[f64]) -> Vec<f64>,
@@ -1219,7 +1366,13 @@ fn inner_minimize_with_grad(
     max_iter: usize,
     tol: f64,
 ) -> bool {
-    if n >= INNER_LBFGS_MIN_DIM {
+    if matches!(
+        inner_optimizer_mode(),
+        crate::types::InnerOptimizer::NelderMead
+    ) {
+        return nelder_mead_minimize(obj, x, n, max_iter, tol);
+    }
+    if inner_use_lbfgs(n) {
         lbfgs_core(obj, grad, x, n, max_iter, tol)
     } else {
         dense_bfgs_core(obj, grad, x, n, max_iter, tol)
@@ -1641,6 +1794,96 @@ pub fn run_inner_loop_warm(
 mod tests {
     use super::*;
 
+    /// The M3 censored coefficient `∂/∂f[−logΦ((y−f)/√v)]` must equal a central
+    /// finite difference of that data term — across additive (`dv_df = 0`) and
+    /// f-dependent (`dv_df ≠ 0`, e.g. proportional/combined) variance, and across
+    /// the regimes `f < LLOQ`, `f ≈ LLOQ`, and `f ≫ LLOQ` (deep tail, where the
+    /// inverse Mills ratio's log-domain evaluation matters).
+    #[test]
+    fn m3_censored_dterm_df_matches_fd() {
+        // Per-row censored data term −logΦ(z), z = (y−f)/√v(f), with v(f) a
+        // generic affine-in-f² residual variance: v = sig_add² + (sig_prop·f)².
+        let term = |y: f64, f: f64, sig_add: f64, sig_prop: f64| -> f64 {
+            let v = sig_add * sig_add + sig_prop * sig_prop * f * f;
+            let z = (y - f) / v.sqrt();
+            -crate::stats::special::log_normal_cdf(z)
+        };
+        let lloq = 1.0_f64;
+        let cases = [
+            // (f, sig_add, sig_prop)
+            (0.6, 0.2, 0.0),  // additive, f below LLOQ
+            (1.0, 0.2, 0.0),  // additive, f at LLOQ
+            (0.8, 0.0, 0.25), // proportional, dv_df ≠ 0
+            (0.7, 0.15, 0.2), // combined, dv_df ≠ 0
+            (3.0, 0.2, 0.0),  // f ≫ LLOQ: deep tail (Φ(z)→0)
+        ];
+        for (f, sig_add, sig_prop) in cases {
+            let v = sig_add * sig_add + sig_prop * sig_prop * f * f;
+            let dv_df = 2.0 * sig_prop * sig_prop * f; // ∂v/∂f
+            let analytic = m3_censored_dterm_df(lloq, f, v, dv_df);
+            // `normal_cdf` is a rational approximation (~1.5e-7 abs error); a tiny
+            // FD step amplifies that noise (noise/h), so use a moderate step where
+            // truncation and approximation error both sit well under the band.
+            let h = 1e-3;
+            let fd = (term(lloq, f + h, sig_add, sig_prop) - term(lloq, f - h, sig_add, sig_prop))
+                / (2.0 * h);
+            assert!(
+                (analytic - fd).abs() < 1e-3 * (1.0 + fd.abs()),
+                "f={f}, sig_add={sig_add}, sig_prop={sig_prop}: analytic {analytic} vs FD {fd}"
+            );
+        }
+    }
+
+    /// End-to-end: the analytic M3 inner η-gradient must match a central finite
+    /// difference of the inner objective (`individual_nll_into_with_schedule`,
+    /// which carries the `−2·logΦ(z)` censored term) on the real warfarin BLOQ
+    /// model + data — exercising the full wiring (provider, cens lookup, coef
+    /// dispatch), not just the isolated coefficient.
+    #[test]
+    fn analytic_inner_gradient_m3_matches_fd_on_warfarin_bloq() {
+        use std::cell::RefCell;
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin_bloq.ferx"))
+                .expect("warfarin BLOQ model parses");
+        assert!(
+            matches!(model.bloq_method, crate::types::BloqMethod::M3),
+            "model must be M3"
+        );
+        let pop =
+            crate::io::datareader::read_nonmem_csv(Path::new("data/warfarin_bloq.csv"), None, None)
+                .expect("warfarin BLOQ data loads");
+        let subject = pop
+            .subjects
+            .iter()
+            .find(|s| s.cens.iter().any(|&c| c != 0))
+            .expect("at least one subject with a censored row");
+
+        let theta = &model.default_params.theta;
+        let omega = &model.default_params.omega;
+        let sigma = &model.default_params.sigma.values;
+        let eta = vec![0.12, -0.05, 0.2];
+
+        let analytic = analytic_eta_nll_gradient(&model, subject, theta, &eta, omega, sigma)
+            .expect("analytic M3 inner gradient must be supported");
+
+        let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
+        let obj = |e: &[f64]| -> f64 {
+            let mut s = scratch.borrow_mut();
+            individual_nll_into_with_schedule(&model, subject, theta, e, omega, sigma, &mut s, None)
+        };
+        let fd = gradient_fd(&obj, &eta, model.n_eta);
+
+        for k in 0..model.n_eta {
+            assert!(
+                (analytic[k] - fd[k]).abs() < 1e-4 * (1.0 + fd[k].abs()),
+                "η[{k}]: analytic {} vs FD {}",
+                analytic[k],
+                fd[k]
+            );
+        }
+    }
+
     /// Dense BFGS vs L-BFGS scaling with inner dimension `n`, on an
     /// ill-conditioned 1-D-Laplacian quadratic `½xᵀLx − 1ᵀx` (cond ≈ (n/π)², so
     /// the solve needs ~O(n) curvature updates — representative of a curved inner
@@ -1951,6 +2194,56 @@ mod iov_tests {
         // H-matrix: n_obs × n_eta (BSV only, kappas fixed)
         assert_eq!(result.h_matrix.nrows(), subject.obs_times.len());
         assert_eq!(result.h_matrix.ncols(), model.n_eta);
+    }
+
+    /// Pinning `inner_optimizer` to dense BFGS vs L-BFGS must reach the *same* EBE
+    /// — both are gradient-based solvers of the same convex inner objective, so the
+    /// explicit choice only changes the path, not the stationary point. Guards the
+    /// `inner_optimizer` dispatch (and that pinning bypasses the size threshold).
+    #[test]
+    fn inner_optimizer_pin_reaches_same_ebe() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::InnerOptimizer;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(5.0,0.5,50.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        )
+        .expect("parse");
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![18.0, 16.0, 13.0, 9.0, 4.5, 2.2],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 6],
+            occasions: vec![1; 6],
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let params = model.default_params.clone();
+
+        set_inner_optimizer(InnerOptimizer::Bfgs);
+        let bfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None);
+        set_inner_optimizer(InnerOptimizer::Lbfgs);
+        let lbfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None);
+        set_inner_optimizer(InnerOptimizer::Auto);
+
+        assert!(bfgs.converged && lbfgs.converged, "both must converge");
+        for k in 0..model.n_eta {
+            approx::assert_relative_eq!(
+                bfgs.eta[k],
+                lbfgs.eta[k],
+                max_relative = 1e-5,
+                epsilon = 1e-7
+            );
+        }
     }
 
     #[test]

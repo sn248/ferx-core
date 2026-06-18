@@ -3272,7 +3272,11 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
                 "slsqp" => Optimizer::Slsqp,
-                "lbfgs" | "nlopt_lbfgs" => Optimizer::NloptLbfgs,
+                // `lbfgs` is the built-in limited-memory L-BFGS (analytic gradient,
+                // Eq. 48 warm EBEs, no SLSQP polish). The NLopt L-BFGS + SLSQP-polish
+                // path is still reachable explicitly via `nlopt_lbfgs`.
+                "lbfgs" => Optimizer::Lbfgs,
+                "nlopt_lbfgs" => Optimizer::NloptLbfgs,
                 "mma" => Optimizer::Mma,
                 "bfgs" => Optimizer::Bfgs,
                 "bobyqa" => Optimizer::Bobyqa,
@@ -3281,6 +3285,20 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                     return Err(format!(
                         "fit option `optimizer`: unknown value `{other}` — expected \
                          slsqp/lbfgs/nlopt_lbfgs/mma/bfgs/bobyqa/trust_region"
+                    ));
+                }
+            };
+        }
+        "inner_optimizer" => {
+            opts.inner_optimizer = match value.to_lowercase().as_str() {
+                "auto" => crate::types::InnerOptimizer::Auto,
+                "bfgs" => crate::types::InnerOptimizer::Bfgs,
+                "lbfgs" => crate::types::InnerOptimizer::Lbfgs,
+                "nelder_mead" | "neldermead" => crate::types::InnerOptimizer::NelderMead,
+                other => {
+                    return Err(format!(
+                        "fit option `inner_optimizer`: unknown value `{other}` — expected \
+                         auto/bfgs/lbfgs/nelder_mead"
                     ));
                 }
             };
@@ -11248,11 +11266,37 @@ mod tests {
     #[test]
     fn test_apply_fit_option_optimizer_and_bloq() {
         let mut opts = FitOptions::default();
+        // `lbfgs` resolves to the built-in limited-memory L-BFGS; the NLopt
+        // L-BFGS + SLSQP-polish path keeps the explicit `nlopt_lbfgs` keyword.
         assert_eq!(apply_fit_option(&mut opts, "optimizer", "lbfgs"), Ok(true));
+        assert_eq!(opts.optimizer, Optimizer::Lbfgs);
+        assert_eq!(
+            apply_fit_option(&mut opts, "optimizer", "nlopt_lbfgs"),
+            Ok(true)
+        );
         assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
 
         assert_eq!(apply_fit_option(&mut opts, "bloq", "m3"), Ok(true));
         assert_eq!(opts.bloq_method, BloqMethod::M3);
+    }
+
+    #[test]
+    fn test_apply_fit_option_inner_optimizer() {
+        use crate::types::InnerOptimizer;
+        let mut opts = FitOptions::default();
+        // Default is Auto (size-based dispatch).
+        assert_eq!(opts.inner_optimizer, InnerOptimizer::Auto);
+        for (s, want) in [
+            ("auto", InnerOptimizer::Auto),
+            ("bfgs", InnerOptimizer::Bfgs),
+            ("lbfgs", InnerOptimizer::Lbfgs),
+            ("nelder_mead", InnerOptimizer::NelderMead),
+            ("neldermead", InnerOptimizer::NelderMead),
+        ] {
+            assert_eq!(apply_fit_option(&mut opts, "inner_optimizer", s), Ok(true));
+            assert_eq!(opts.inner_optimizer, want, "inner_optimizer = {s}");
+        }
+        assert!(apply_fit_option(&mut opts, "inner_optimizer", "nope").is_err());
     }
 
     // ── Warn on options that don't apply to the selected estimation method.
@@ -11365,6 +11409,23 @@ mod tests {
         }
         // And it uses the new phrasing, not the old "Available options".
         assert!(w.contains("Method-specific options"), "got: {w}");
+    }
+
+    #[test]
+    fn test_inner_optimizer_under_focei_does_not_warn() {
+        // `inner_optimizer` drives the per-subject EBE loop, which FOCEI uses —
+        // it must be in the method's recognized keys and not flagged "ignored".
+        let opts = parse_fit_options(&[
+            "method = focei".to_string(),
+            "inner_optimizer = lbfgs".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(opts.inner_optimizer, crate::types::InnerOptimizer::Lbfgs);
+        let warnings = opts.unsupported_keys_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.contains("inner_optimizer")),
+            "inner_optimizer should not warn under FOCEI, got: {warnings:?}"
+        );
     }
 
     #[test]

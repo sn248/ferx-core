@@ -13,6 +13,7 @@
 //!   * the same solution evaluated over the [`dual2::Dual2`] forward-2nd-order
 //!     dual number.
 
+pub mod dual1;
 pub mod dual2;
 pub mod jet;
 pub mod num;

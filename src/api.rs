@@ -1231,6 +1231,10 @@ pub fn fit(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
+    // Apply the fit-scoped inner-loop optimizer choice before any EBE solve runs.
+    // `Auto` (the default) reproduces the historical size-based dispatch, so this
+    // is a no-op unless the user pinned `inner_optimizer`.
+    crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
     // enforces these for `.ferx` models, but a Rust caller could otherwise set
     // `log_transform = true` together with a proportional/combined error or a

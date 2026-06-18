@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic M3 (BLOQ) inner EBE gradient** for analytical PK models: the
+  per-subject EBE optimiser now has an exact closed-form η-gradient for the M3
+  censored term `−logΦ((LLOQ−f)/√V)` (inverse-Mills-ratio coefficient), replacing
+  the finite-difference inner gradient on `bloq_method = m3` fits. The converged
+  EBEs — and therefore the fit — are unchanged; the inner loop just runs without
+  per-step finite differencing. The outer marginal gradient still uses finite
+  differences on censored subjects (#367).
 - **Analytic FOCE and FOCEI outer gradient** for analytical 1-/2-/3-compartment
   models (IV bolus/infusion, oral, and steady state): the gradient-based outer
   optimizers (`bfgs`, `lbfgs`, `nlopt_lbfgs`, `slsqp`) now drive both FOCEI and
@@ -35,9 +42,22 @@ section of the SDLC for the versioning policy).
   the only FD setting that also converges (`reconverge_gradient_interval = 1`:
   0.30 s vs 4.11 s). Validated against NONMEM on warfarin (FOCE OFV −280.36,
   FOCEI −286.00 — both matching to ~4–5 significant figures).
-  Models outside the analytical scope (ODE, IOV, LTBS, output scaling, lagtime,
-  time-varying covariates, resets, overlapping steady-state infusion #379)
-  transparently fall back to the existing finite-difference gradient (#367).
+  Models outside the analytical scope (ODE, IOV, lagtime, time-varying
+  covariates, overlapping steady-state infusion #379) transparently fall back to
+  the existing finite-difference gradient (#367).
+- **Analytic gradient now covers log-transform-both-sides (LTBS) and constant
+  output scaling** for the analytical PK models: the sensitivity provider applies
+  the `g = ln(f)` jet transform (value, gradient, and Hessian via
+  `∂²g/∂x∂y = f_xy/f − f_x·f_y/f²`) and the constant `obs_scale` divisor in closed
+  form, so `log(DV) ~ additive(...)` and `[scaling] obs_scale = k` fits run on the
+  exact analytic FOCE/FOCEI gradient instead of falling back to finite
+  differences. Validated against NONMEM on the warfarin LTBS model: the
+  gradient-based L-BFGS path reaches OFV −675.302 and recovers NONMEM's MLE to
+  ~4 significant figures (#367).
+- **`inner_optimizer` fit option** (`auto` | `bfgs` | `lbfgs` | `nelder_mead`)
+  to pin the inner EBE optimizer explicitly. `auto` (default) preserves the prior
+  behaviour (dense BFGS, switching to L-BFGS above 32 random effects); the other
+  values force a single algorithm with no automatic switching (#367).
 - **Analytic FOCE/FOCEI gradient for user-specified `[odes]` models** (issue #367,
   Option A): the same exact closed-form marginal gradient now covers hand-written
   ODE models, not just the analytical PK solutions. The compiled `[odes]` RHS is
@@ -199,6 +219,17 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **M3 BLOQ fits with a gradient-based optimizer no longer stall above the true
+  minimum.** The analytic outer gradient declines on censored subjects (it
+  differentiates the Gaussian term, not the censored `−logΦ`), and the fixed-EBE
+  finite-difference fallback is biased there — so on warfarin BLOQ a gradient
+  optimizer settled at TVKA ≈ 1.10 / OFV ≈ −213.8 while the derivative-free BOBYQA
+  reached the true TVKA ≈ 0.81 / OFV ≈ −217.2. M3-censored models now force the
+  EBE-reconverging gradient automatically (as IOV already does), so every
+  optimizer reaches the minimum and matches a NONMEM 7.5.1 LAPLACE M3 reference
+  (TVCL 0.1328, TVV 7.731, TVKA 0.810, to ~4 significant figures). The
+  `docs/src/examples/bloq.md` expected results, which showed the stalled point,
+  are corrected (#367).
 - The covariance-family fit options `covariance_method`, `covariance_fallback`,
   and `covariance_ofv_hessian` no longer emit a spurious "is not used by method
   `<method>` and will be ignored" warning. They are framework-wide covariance-step

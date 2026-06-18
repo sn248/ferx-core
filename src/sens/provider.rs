@@ -30,6 +30,7 @@
 //! to the gradient-free path.
 #![allow(clippy::needless_range_loop)]
 
+use super::dual1::Dual1;
 use super::dual2::Dual2;
 use super::one_cpt::one_cpt_conc_g;
 use super::three_cpt::three_cpt_conc_g;
@@ -149,11 +150,13 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
     ) && model.ode_spec.is_none()
         && model.tv_fn.is_some()
         && model.n_kappa == 0
-        // The provider returns the raw concentration `f` and its `∂f`. The
-        // production predictor only agrees with that when there is no output
-        // transform: no observation scaling and no log-transformed DV (LTBS).
-        && matches!(model.scaling, ScalingSpec::None)
-        && !model.log_transform
+        // Output transform: the provider applies a constant `ScalarScale` divisor
+        // to `f` and (linearly) to every derivative — exact, since `∂k/∂η = ∂k/∂θ
+        // = 0`. `ExpressionScale`/`PerCmt` (η/θ/CMT-dependent) still route to FD.
+        // LTBS (`log_transform`) is applied as a closed-form jet transform
+        // `g = ln(f)` at the provider tail (after scaling), mirroring
+        // `pk::apply_log_transform`.
+        && matches!(model.scaling, ScalingSpec::None | ScalingSpec::ScalarScale(_))
         // Every individual-parameter slot must be one we differentiate. A
         // LAGTIME (slot 8) routes to fall back.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
@@ -170,17 +173,19 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 
 /// The per-observation `∂f/∂η` Jacobian (`n_obs × n_eta`, row-major) as a flat
 /// vector, or `None` when unsupported. Convenience for the inner loop, whose
-/// `h_matrix` is exactly this Jacobian at the converged η̂.
+/// `h_matrix` is exactly this Jacobian at the converged η̂. Uses the light
+/// first-order provider ([`subject_eta_grad`]) — this is `∂f/∂η` only, so the
+/// second-order `Dual2` work the full provider does would be wasted here.
 pub fn subject_eta_jacobian(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<f64>> {
-    let sens = subject_sensitivities(model, subject, theta, eta)?;
+    let sens = subject_eta_grad(model, subject, theta, eta)?;
     let n_eta = model.n_eta;
-    let mut jac = Vec::with_capacity(sens.obs.len() * n_eta);
-    for obs in &sens.obs {
+    let mut jac = Vec::with_capacity(sens.len() * n_eta);
+    for obs in &sens {
         jac.extend_from_slice(&obs.df_deta);
     }
     debug_assert_eq!(jac.len(), subject.obs_times.len() * n_eta);
@@ -280,7 +285,11 @@ pub static PROFILE_SENS_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 
 fn sens_profile_enabled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("FERX_PROFILE").map(|v| v == "1").unwrap_or(false))
+    *E.get_or_init(|| {
+        std::env::var("FERX_PROFILE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 /// Print the accumulated analytic-provider profile (no-op unless `FERX_PROFILE=1`).
@@ -298,6 +307,258 @@ pub fn profile_report() {
             n as f64 / c as f64
         );
     }
+    let ec = PROFILE_ETA_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let en = PROFILE_ETA_NANOS.load(std::sync::atomic::Ordering::Relaxed);
+    if ec > 0 {
+        eprintln!(
+            "[profile] light η provider (subject_eta_grad): {} calls, {:.3}s total, {:.1} ns/call",
+            ec,
+            en as f64 / 1e9,
+            en as f64 / ec as f64
+        );
+    }
+}
+
+/// Value and first-order η-gradient of one observation — the light-provider
+/// counterpart of [`ObsSens`] (no `∂²f/∂η²`, no θ-block).
+#[derive(Debug, Clone)]
+pub struct ObsGrad {
+    pub f: f64,
+    /// `∂f/∂η_k`, length `n_eta`.
+    pub df_deta: Vec<f64>,
+}
+
+/// Accumulated [`subject_eta_grad`] call count and wall-time (`FERX_PROFILE=1`).
+pub static PROFILE_ETA_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROFILE_ETA_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// **Light first-order provider** for the inner EBE loop: per observation, the
+/// value `f` and `∂f/∂η` only — never the second-order `∂²f/∂η²` or the θ-block.
+/// Seeds the PK parameters as [`Dual1<N>`] (gradient, no Hessian) through the same
+/// generic closed-form PK solution the full [`subject_sensitivities`] uses, then
+/// applies the closed-form log-normal η chain `∂p_i/∂η_k = pk_i·sel[i,k]`. Roughly
+/// halves the per-op cost of the inner gradient (the hot path: millions of calls).
+///
+/// Scope is a strict subset of [`subject_sensitivities`]: it additionally requires
+/// every η to be log-normal (so the closed-form `pk·sel` chain is exact). Anything
+/// else returns `None`, and the caller falls back to the full provider / FD.
+pub fn subject_eta_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
+    if !sens_profile_enabled() {
+        return subject_eta_grad_impl(model, subject, theta, eta);
+    }
+    let t0 = std::time::Instant::now();
+    let r = subject_eta_grad_impl(model, subject, theta, eta);
+    PROFILE_ETA_NANOS.fetch_add(
+        t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    PROFILE_ETA_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+fn subject_eta_grad_impl(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
+    // Same model/subject scope as the full provider …
+    if model.ode_spec.is_some() || !analytical_supported(model) || subject.has_tv_covariates() {
+        return None;
+    }
+    if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
+        return None;
+    }
+    if subject
+        .doses
+        .iter()
+        .any(|d| d.ss && d.ii > 0.0 && d.is_infusion() && d.duration > d.ii)
+    {
+        return None;
+    }
+
+    let n_eta = model.n_eta;
+    let oral = matches!(
+        model.pk_model,
+        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+    );
+    let two_cpt = matches!(model.pk_model, PkModel::TwoCptIv | PkModel::TwoCptOral);
+    let three_cpt = matches!(model.pk_model, PkModel::ThreeCptIv | PkModel::ThreeCptOral);
+
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+
+    // First-order `∂p_i/∂η_k`, exact for ANY parameterization — the η-block of the
+    // same `pd` the full provider builds. The compiled `[individual_parameters]`
+    // program path (`param_derivatives_from_prog`, evaluated once per subject)
+    // covers log-normal, logit-normal F, additive, … ; its `slots` follow the
+    // program order. Falls back to the closed-form log-normal `pk·sel` chain (rows
+    // in `pk_indices` order) when the program path is unavailable, and to `None`
+    // (→ caller's per-point FD) only when neither applies — so the light provider
+    // serves exactly the analytical scope the full `subject_sensitivities` does.
+    let (dp_deta, slots): (Vec<Vec<f64>>, Vec<usize>) = match model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .filter(|prog| prog.pk_slots().len() == model.pk_indices.len())
+        .and_then(|prog| {
+            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
+                .map(|pd| (pd.dp_deta, prog.pk_slots()))
+        }) {
+        Some(v) => v,
+        None => {
+            if !model
+                .eta_param_info
+                .iter()
+                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
+            {
+                return None;
+            }
+            let pd = lognormal_param_derivatives(model, subject, theta, &pk);
+            (pd.dp_deta, model.pk_indices.clone())
+        }
+    };
+    let mut seed_dim: [Option<usize>; N_PK] = [None; N_PK];
+    for (i, &slot) in slots.iter().enumerate() {
+        if slot < N_PK {
+            seed_dim[slot] = Some(i);
+        }
+    }
+
+    macro_rules! disp {
+        ($($n:literal),+) => {
+            match slots.len() {
+                $($n => Some(run_obs_grad::<$n>(
+                    &seed_dim, &pk, oral, two_cpt, three_cpt, subject, &dp_deta, n_eta,
+                )),)+
+                _ => None,
+            }
+        };
+    }
+    let mut out = disp!(1, 2, 3, 4, 5, 6, 7, 8)?;
+    // Constant `ScalarScale` output divisor: `f_scaled = f/k`, and `∂f/∂η` is
+    // linear in `f` so it divides by the same `k` (η-independent). Matches
+    // `pk::apply_scaling` (`pred /= s`). Other scaling variants are gated out.
+    if let ScalingSpec::ScalarScale(k) = model.scaling {
+        if k != 1.0 {
+            for o in out.iter_mut() {
+                o.f /= k;
+                for g in o.df_deta.iter_mut() {
+                    *g /= k;
+                }
+            }
+        }
+    }
+    // LTBS: `g = ln(f)`, so `∂g/∂η = ∂f/∂η / f`. Applied after scaling, mirroring
+    // `pk::apply_log_transform` (`p = p.max(LTBS_FLOOR).ln()`). Below the floor the
+    // production transform clamps to a constant, so the gradient vanishes.
+    if model.log_transform {
+        for o in out.iter_mut() {
+            if o.f > crate::pk::LTBS_FLOOR {
+                let inv = 1.0 / o.f;
+                for g in o.df_deta.iter_mut() {
+                    *g *= inv;
+                }
+                o.f = o.f.ln();
+            } else {
+                for g in o.df_deta.iter_mut() {
+                    *g = 0.0;
+                }
+                o.f = crate::pk::LTBS_FLOOR.ln();
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Per-observation `(f, ∂f/∂η)` chain at dual width `N`, via `Dual1<N>` (grad,
+/// no Hessian) — the light counterpart of [`run_obs`]. `seed_dim[s]` is the
+/// compact dual axis for PK slot `s`; `dp_deta` rows are in compact-axis order.
+#[allow(clippy::too_many_arguments)]
+fn run_obs_grad<const N: usize>(
+    seed_dim: &[Option<usize>; N_PK],
+    pk: &crate::types::PkParams,
+    oral: bool,
+    two_cpt: bool,
+    three_cpt: bool,
+    subject: &Subject,
+    dp_deta: &[Vec<f64>],
+    n_eta: usize,
+) -> Vec<ObsGrad> {
+    let (cl, v1, q, v2, ka, f_bio, q3, v3) = (
+        pk.cl(),
+        pk.v(),
+        pk.q(),
+        pk.v2(),
+        pk.ka(),
+        pk.f_bio(),
+        pk.q3(),
+        pk.v3(),
+    );
+    let dv = |slot: usize, value: f64| -> Dual1<N> {
+        match seed_dim[slot] {
+            Some(k) => Dual1::<N>::var(value, k),
+            None => Dual1::<N>::constant(value),
+        }
+    };
+    let cl_d = dv(PK_IDX_CL, cl);
+    let v1_d = dv(PK_IDX_V, v1);
+    let q_d = dv(PK_IDX_Q, q);
+    let v2_d = dv(PK_IDX_V2, v2);
+    let ka_d = dv(PK_IDX_KA, ka);
+    let f_d = dv(PK_IDX_F, f_bio);
+    let q3_d = dv(PK_IDX_Q3, q3);
+    let v3_d = dv(PK_IDX_V3, v3);
+
+    let mut out = Vec::with_capacity(subject.obs_times.len());
+    for &t_obs in subject.obs_times.iter() {
+        let reset_floor = subject
+            .reset_times
+            .iter()
+            .copied()
+            .filter(|&r| r <= t_obs)
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let mut fd = Dual1::<N>::constant(0.0);
+        for dose in &subject.doses {
+            let elapsed = t_obs - dose.time;
+            if elapsed < 0.0 || dose.time < reset_floor {
+                continue;
+            }
+            let c = if three_cpt {
+                three_cpt_conc_g(
+                    dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
+                )
+            } else if two_cpt {
+                two_cpt_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, ka_d, f_d, oral)
+            } else {
+                one_cpt_conc_g(dose, elapsed, cl_d, v1_d, ka_d, f_d, oral)
+            };
+            fd = fd + c;
+        }
+
+        // Mirror production's `conc.max(0.0)`: a negative closed-form value clamps
+        // to 0, so its η-gradient is 0 there too (consistency with the objective).
+        let (fval, g) = if fd.value < 0.0 {
+            (0.0, [0.0; N])
+        } else {
+            (fd.value, fd.grad)
+        };
+
+        let mut df_deta = vec![0.0; n_eta];
+        for i in 0..N {
+            let gi = g[i];
+            for k in 0..n_eta {
+                df_deta[k] += gi * dp_deta[i][k];
+            }
+        }
+        out.push(ObsGrad { f: fval, df_deta });
+    }
+    out
 }
 
 /// Compute per-observation analytic sensitivities, or `None` if this
@@ -461,7 +722,77 @@ fn subject_sensitivities_impl(
             }
         };
     }
-    disp!(1, 2, 3, 4, 5, 6, 7, 8)
+    let mut sens = disp!(1, 2, 3, 4, 5, 6, 7, 8)?;
+    // Constant `ScalarScale` output divisor: `f_scaled = f/k`. Every derivative is
+    // linear in `f` and `k` is constant (`∂k/∂η = ∂k/∂θ = 0`), so the whole jet
+    // divides by `k`. Matches `pk::apply_scaling` (`pred /= s`).
+    if let ScalingSpec::ScalarScale(k) = model.scaling {
+        if k != 1.0 {
+            let inv = 1.0 / k;
+            for o in sens.obs.iter_mut() {
+                o.f *= inv;
+                for v in o
+                    .df_deta
+                    .iter_mut()
+                    .chain(o.d2f_deta2.iter_mut())
+                    .chain(o.df_dtheta.iter_mut())
+                    .chain(o.d2f_deta_dtheta.iter_mut())
+                {
+                    *v *= inv;
+                }
+            }
+        }
+    }
+    // LTBS: transform the full jet to `g = ln(f)` (after scaling), mirroring
+    // `pk::apply_log_transform`. With `inv = 1/f`:
+    //   g          = ln(f)
+    //   ∂g/∂x      = inv · ∂f/∂x
+    //   ∂²g/∂x∂y   = inv · ∂²f/∂x∂y − inv² · ∂f/∂x · ∂f/∂y     (x,y ∈ {η,θ})
+    // Second derivatives are computed from the *original* first derivatives, so
+    // those are read before `df_deta`/`df_dtheta` are overwritten. Below the floor
+    // the production transform clamps to a constant ⇒ all derivatives vanish.
+    if model.log_transform {
+        let n_eta = sens.obs.first().map_or(0, |o| o.df_deta.len());
+        let n_theta = sens.obs.first().map_or(0, |o| o.df_dtheta.len());
+        for o in sens.obs.iter_mut() {
+            if o.f > crate::pk::LTBS_FLOOR {
+                let inv = 1.0 / o.f;
+                let inv2 = inv * inv;
+                // η–η Hessian: g_kl = inv·f_kl − inv²·f_k·f_l.
+                for k in 0..n_eta {
+                    for l in 0..n_eta {
+                        let idx = k * n_eta + l;
+                        o.d2f_deta2[idx] =
+                            inv * o.d2f_deta2[idx] - inv2 * o.df_deta[k] * o.df_deta[l];
+                    }
+                }
+                // η–θ cross: g_km = inv·f_km − inv²·f_k(η)·f_m(θ).
+                for k in 0..n_eta {
+                    for m in 0..n_theta {
+                        let idx = k * n_theta + m;
+                        o.d2f_deta_dtheta[idx] =
+                            inv * o.d2f_deta_dtheta[idx] - inv2 * o.df_deta[k] * o.df_dtheta[m];
+                    }
+                }
+                for g in o.df_deta.iter_mut().chain(o.df_dtheta.iter_mut()) {
+                    *g *= inv;
+                }
+                o.f = o.f.ln();
+            } else {
+                for v in o
+                    .df_deta
+                    .iter_mut()
+                    .chain(o.d2f_deta2.iter_mut())
+                    .chain(o.df_dtheta.iter_mut())
+                    .chain(o.d2f_deta_dtheta.iter_mut())
+                {
+                    *v = 0.0;
+                }
+                o.f = crate::pk::LTBS_FLOOR.ln();
+            }
+        }
+    }
+    Some(sens)
 }
 
 /// Per-observation value/grad/Hessian chain at a right-sized dual width `N`
@@ -996,6 +1327,29 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
 
+    // 2-cpt IV with an *additive* η on V1 (`V1 = TVV1 + ETA_V1`): a non-log-normal
+    // parameterization, so `∂V1/∂η = 1` (not `V1·sel`). Forces both providers down
+    // the compiled-program `∂p/∂η` path.
+    const TWOCPT_IV_ADDITIVE_V1: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(15.0, 1.0, 100.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 9.0
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 + ETA_V1
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
     const THREECPT_ORAL: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.5, 50.0)
@@ -1089,6 +1443,113 @@ mod tests {
                     g,
                     max_relative = 3e-4,
                     epsilon = 1e-7
+                );
+            }
+        }
+    }
+
+    /// The light provider [`subject_eta_grad`] must return exactly the `f` and
+    /// `∂f/∂η` the full [`subject_sensitivities`] does — same generic PK source,
+    /// same log-normal η chain, just first-order. Checked across 1-/2-/3-cpt IV +
+    /// oral and a steady-state case.
+    #[test]
+    fn light_provider_matches_full_provider_eta_grad() {
+        let times = [0.25, 1.0, 4.0, 12.0];
+        let cases: Vec<(CompiledModel, Subject, Vec<f64>, Vec<f64>)> = vec![
+            {
+                let m = parse_model_string(WARFARIN).unwrap();
+                let s = oral_subject(&times);
+                (m, s, vec![0.2, 10.0, 1.5], vec![0.15, -0.10, 0.25])
+            },
+            {
+                let m = parse_model_string(TWOCPT_IV).unwrap();
+                let s =
+                    subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0), &times);
+                (m, s, vec![10.0, 50.0, 15.0, 100.0], vec![0.12, -0.08])
+            },
+            {
+                let m = parse_model_string(THREECPT_IV).unwrap();
+                let s = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), &times);
+                (
+                    m,
+                    s,
+                    vec![5.0, 10.0, 2.0, 20.0, 1.5, 30.0],
+                    vec![0.12, -0.08],
+                )
+            },
+            {
+                let m = parse_model_string(THREECPT_ORAL).unwrap();
+                let s = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 0.0, true, 24.0), &times);
+                (
+                    m,
+                    s,
+                    vec![5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 1.5],
+                    vec![0.12, -0.08, 0.2],
+                )
+            },
+            {
+                // Non-log-normal η (additive on V1): exercises the program-path
+                // `∂p/∂η` branch, not the closed-form `pk·sel` chain.
+                let m = parse_model_string(TWOCPT_IV_ADDITIVE_V1).unwrap();
+                let s =
+                    subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0), &times);
+                (m, s, vec![10.0, 50.0, 15.0, 100.0], vec![0.1, 3.0])
+            },
+        ];
+        for (m, s, theta, eta) in &cases {
+            let full = subject_sensitivities(m, s, theta, eta).expect("full supported");
+            let light = subject_eta_grad(m, s, theta, eta).expect("light supported");
+            assert_eq!(full.obs.len(), light.len());
+            for (fo, lo) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-14);
+                for k in 0..m.n_eta {
+                    approx::assert_relative_eq!(
+                        fo.df_deta[k],
+                        lo.df_deta[k],
+                        max_relative = 1e-12,
+                        epsilon = 1e-14
+                    );
+                }
+            }
+        }
+    }
+
+    /// A constant `obs_scale` divisor (`ScalarScale`) must flow through `f` and
+    /// every η/θ derivative — the provider divides the whole jet by `k`, and the
+    /// production predictor (`compute_predictions_with_tv` → `apply_scaling`)
+    /// divides its predictions by the same `k`, so they (and the FD derivatives)
+    /// must still agree.
+    #[test]
+    fn provider_scalar_scale_matches_production() {
+        let scaled = WARFARIN.replace(
+            "[error_model]",
+            "[scaling]\n  obs_scale = 1000\n[error_model]",
+        );
+        let model = parse_model_string(&scaled).expect("parse");
+        assert!(
+            matches!(model.scaling, ScalingSpec::ScalarScale(k) if (k - 1000.0).abs() < 1e-9),
+            "model must carry the ScalarScale"
+        );
+        assert!(
+            analytical_supported(&model),
+            "ScalarScale must be supported"
+        );
+        let subject = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_provider_vs_production(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
+
+        // The light η-provider must agree with the full provider under scaling too.
+        let full = subject_sensitivities(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25])
+            .expect("full");
+        let light = subject_eta_grad(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25])
+            .expect("light");
+        for (fo, lo) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-14);
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    fo.df_deta[k],
+                    lo.df_deta[k],
+                    max_relative = 1e-12,
+                    epsilon = 1e-14
                 );
             }
         }
@@ -1290,22 +1751,26 @@ mod tests {
         check_provider_vs_production(&m, &subject, &[10.0, 50.0], &[0.1, -0.05]);
     }
 
-    /// Provider's exact η/θ sensitivities must match central finite differences
-    /// of the production predictor `compute_predictions_with_tv`.
-    #[test]
-    fn provider_matches_fd_of_production_predictor() {
-        let model = parse_model_string(WARFARIN).expect("parse");
-        let subject = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-        let theta = vec![0.2, 10.0, 1.5];
-        let eta = vec![0.15, -0.10, 0.25];
-        let n_eta = 3;
-        let n_theta = 3;
+    /// Provider's exact η/θ sensitivities (value, ∂/∂η, ∂²/∂η², ∂/∂θ, ∂²/∂η∂θ)
+    /// must match central finite differences of the production predictor
+    /// `compute_predictions_with_tv`. Shared by the natural-scale and LTBS checks —
+    /// for an LTBS model the production predictor returns `ln(f)`, and the provider
+    /// applies the matching `g = ln(f)` jet transform, so the same FD check covers
+    /// the log-scale value, gradient, and Hessian.
+    fn check_full_provider_vs_fd(
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        eta: &[f64],
+    ) {
+        let n_eta = model.n_eta;
+        let n_theta = theta.len();
 
-        let sens = subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+        let sens = subject_sensitivities(model, subject, theta, eta).expect("supported");
 
         // FD helpers over the full prediction vector (returns obs j's value).
         let pred = |e: &[f64], th: &[f64], j: usize| -> f64 {
-            compute_predictions_with_tv(&model, &subject, th, e)[j]
+            compute_predictions_with_tv(model, subject, th, e)[j]
         };
         let he = 1e-6; // first-derivative step
         let ht = 1e-6;
@@ -1318,23 +1783,23 @@ mod tests {
 
             // ∂f/∂η and ∂²f/∂η²
             for k in 0..n_eta {
-                let mut ep = eta.clone();
+                let mut ep = eta.to_vec();
                 ep[k] += he;
-                let mut em = eta.clone();
+                let mut em = eta.to_vec();
                 em[k] -= he;
                 let g = (pred(&ep, &theta, j) - pred(&em, &theta, j)) / (2.0 * he);
                 approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 2e-4, epsilon = 1e-7);
                 for l in 0..n_eta {
-                    let mut pp = eta.clone();
+                    let mut pp = eta.to_vec();
                     pp[k] += heh;
                     pp[l] += heh;
-                    let mut pm = eta.clone();
+                    let mut pm = eta.to_vec();
                     pm[k] += heh;
                     pm[l] -= heh;
-                    let mut mp = eta.clone();
+                    let mut mp = eta.to_vec();
                     mp[k] -= heh;
                     mp[l] += heh;
-                    let mut mm = eta.clone();
+                    let mut mm = eta.to_vec();
                     mm[k] -= heh;
                     mm[l] -= heh;
                     let hh = (pred(&pp, &theta, j) - pred(&pm, &theta, j) - pred(&mp, &theta, j)
@@ -1351,9 +1816,9 @@ mod tests {
 
             // ∂f/∂θ
             for m in 0..n_theta {
-                let mut tp = theta.clone();
+                let mut tp = theta.to_vec();
                 tp[m] += ht * (1.0 + theta[m].abs());
-                let mut tm = theta.clone();
+                let mut tm = theta.to_vec();
                 tm[m] -= ht * (1.0 + theta[m].abs());
                 let step = ht * (1.0 + theta[m].abs());
                 let g = (pred(&eta, &tp, j) - pred(&eta, &tm, j)) / (2.0 * step);
@@ -1369,13 +1834,13 @@ mod tests {
             for k in 0..n_eta {
                 for m in 0..n_theta {
                     let s = heh * (1.0 + theta[m].abs());
-                    let mut ep = eta.clone();
+                    let mut ep = eta.to_vec();
                     ep[k] += heh;
-                    let mut em = eta.clone();
+                    let mut em = eta.to_vec();
                     em[k] -= heh;
-                    let mut tp = theta.clone();
+                    let mut tp = theta.to_vec();
                     tp[m] += s;
-                    let mut tm = theta.clone();
+                    let mut tm = theta.to_vec();
                     tm[m] -= s;
                     let hh = (pred(&ep, &tp, j) - pred(&ep, &tm, j) - pred(&em, &tp, j)
                         + pred(&em, &tm, j))
@@ -1385,6 +1850,82 @@ mod tests {
                         hh,
                         max_relative = 3e-3,
                         epsilon = 1e-5
+                    );
+                }
+            }
+        }
+    }
+
+    /// Provider's exact η/θ sensitivities must match central finite differences
+    /// of the production predictor `compute_predictions_with_tv`.
+    #[test]
+    fn provider_matches_fd_of_production_predictor() {
+        let model = parse_model_string(WARFARIN).expect("parse");
+        let subject = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_full_provider_vs_fd(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
+    }
+
+    /// LTBS (`log(DV) ~ additive(...)`): the production predictor returns `ln(f)`,
+    /// and the provider applies the matching `g = ln(f)` jet transform. The full
+    /// value/gradient/Hessian must still match FD of the (log-scale) production
+    /// predictor, and the light η-provider must agree with the full one — over
+    /// 1-/2-/3-cpt so the second-order `g_kl = f_kl/f − f_k·f_l/f²` chain is covered.
+    #[test]
+    fn provider_ltbs_matches_production() {
+        let ltbs = |src: &str| {
+            src.replace(
+                "[error_model]\n  DV ~ proportional(PROP_ERR)",
+                "[error_model]\n  log(DV) ~ additive(PROP_ERR)",
+            )
+        };
+        let times = [0.25, 1.0, 4.0, 12.0];
+        let cases: Vec<(CompiledModel, Subject, Vec<f64>, Vec<f64>)> = vec![
+            {
+                let m = parse_model_string(&WARFARIN.replace(
+                    "[error_model]\n  DV ~ proportional(PROP_ERR)",
+                    "[error_model]\n  log(DV) ~ additive(PROP_ERR)",
+                ))
+                .expect("parse warfarin LTBS");
+                assert!(m.log_transform, "LTBS flag must be set");
+                (
+                    m,
+                    oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
+                    vec![0.2, 10.0, 1.5],
+                    vec![0.15, -0.10, 0.25],
+                )
+            },
+            {
+                let m = parse_model_string(&ltbs(TWOCPT_IV)).expect("parse 2cpt LTBS");
+                let s =
+                    subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0), &times);
+                (m, s, vec![10.0, 50.0, 15.0, 100.0], vec![0.12, -0.08])
+            },
+            {
+                let m = parse_model_string(&ltbs(THREECPT_ORAL)).expect("parse 3cpt LTBS");
+                let s = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 0.0, true, 24.0), &times);
+                (
+                    m,
+                    s,
+                    vec![5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 1.5],
+                    vec![0.12, -0.08, 0.2],
+                )
+            },
+        ];
+        for (m, s, theta, eta) in &cases {
+            assert!(analytical_supported(m), "LTBS must be provider-supported");
+            check_full_provider_vs_fd(m, s, theta, eta);
+
+            // Light η-provider must equal the full provider's log-scale f and ∂g/∂η.
+            let full = subject_sensitivities(m, s, theta, eta).expect("full");
+            let light = subject_eta_grad(m, s, theta, eta).expect("light");
+            for (fo, lo) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-14);
+                for k in 0..m.n_eta {
+                    approx::assert_relative_eq!(
+                        fo.df_deta[k],
+                        lo.df_deta[k],
+                        max_relative = 1e-12,
+                        epsilon = 1e-14
                     );
                 }
             }

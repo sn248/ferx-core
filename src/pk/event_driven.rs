@@ -40,7 +40,11 @@ static PROFILE_PRED_NANOS: AtomicU64 = AtomicU64::new(0);
 
 fn profile_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("FERX_PROFILE").map(|v| v == "1").unwrap_or(false))
+    *E.get_or_init(|| {
+        std::env::var("FERX_PROFILE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 fn prop_cache_disabled() -> bool {

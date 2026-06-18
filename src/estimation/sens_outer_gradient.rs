@@ -750,6 +750,39 @@ pub fn population_gradient_sens(
     Some(grad)
 }
 
+/// The exact analytic population gradient for an **IOV** model (FOCEI), packed
+/// space, or `None` if any subject is outside the IOV-analytical scope. `eta_hats`
+/// are the per-subject **BSV** EBEs and `kappas[i]` the per-occasion κ̂ for subject
+/// `i`; the two are stacked into `[η_bsv, κ₁..κ_K]` per subject before assembly.
+pub fn population_gradient_sens_iov(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Option<Vec<f64>> {
+    let n = x.len();
+    let mut grad = vec![0.0f64; n];
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let mut stacked: Vec<f64> = eta_hats[i].iter().copied().collect();
+        for kap in &kappas[i] {
+            stacked.extend(kap.iter().copied());
+        }
+        let gi = subject_packed_gradient_iov(model, subject, template, x, &stacked)?;
+        for k in 0..n {
+            grad[k] += 2.0 * gi[k];
+        }
+    }
+    let fixed = packed_fixed_mask(template);
+    for k in 0..n {
+        if fixed[k] {
+            grad[k] = 0.0;
+        }
+    }
+    Some(grad)
+}
+
 /// The exact per-subject **FOCE** (non-interaction) packed gradient `dFᵢ/dx`, or
 /// `None` when unsupported. ferx's FOCE objective is the Sheiner–Beal linearized
 /// marginal (the algebraic equal of the paper's Laplace FOCE, Eq. 18, with the

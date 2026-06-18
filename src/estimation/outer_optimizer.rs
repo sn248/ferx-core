@@ -1994,8 +1994,28 @@ fn population_gradient(
     // reconverged-FD gradient on every eval even for analytical models — so the
     // numeric fallback remains available if the analytic gradient is ever
     // suspect, and the setting is honoured rather than silently ignored.
-    if !force_reconverge && crate::sens::provider::sens_supported(model) {
-        let g = if options.interaction {
+    // IOV-analytical models route to the dedicated stacked-η / block-Ω assembly
+    // (FOCEI only for now; non-interaction IOV falls back to FD). Their gradient
+    // needs the per-occasion κ̂ alongside the BSV EBEs, so it is dispatched
+    // separately from the non-IOV `sens_supported` path.
+    let iov_analytic = crate::sens::provider::iov_analytical_supported(model);
+    if !force_reconverge
+        && (crate::sens::provider::sens_supported(model) || iov_analytic)
+    {
+        let g = if iov_analytic {
+            if options.interaction {
+                crate::estimation::sens_outer_gradient::population_gradient_sens_iov(
+                    model,
+                    population,
+                    init_params,
+                    x,
+                    ehs,
+                    kappas,
+                )
+            } else {
+                None
+            }
+        } else if options.interaction {
             crate::estimation::sens_outer_gradient::population_gradient_sens(
                 model,
                 population,

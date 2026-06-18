@@ -494,6 +494,18 @@ fn run_mcem(
 
     let mut last_eta_hats: Vec<DVector<f64>> = Vec::new();
 
+    // ---- FREM Rao-Blackwellisation (issue #406) ----
+    // For FREM models, integrate the covariate etas analytically and importance
+    // sample only the PK etas (a well-conditioned low-dim problem with near-unit
+    // ESS) instead of all n_eta etas (~1–2% ESS). Partition is model-static;
+    // per-subject covariate deviations are computed inside the E-step. `None` for
+    // non-FREM models → the full-dimensional path is used unchanged.
+    let frem_rb: Option<(Vec<usize>, Vec<usize>)> = model
+        .frem_config
+        .as_ref()
+        .map(|fc| crate::estimation::importance_sampling::frem_pk_cov_partition(fc, n_eta))
+        .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty());
+
     // ---- Trace: collect per-iteration parameters (analogous to NONMEM .ext) ----
     let mut trace_rows: Vec<ImpmapTraceRow> = if collect_trace {
         Vec::with_capacity(n_iter + 2)
@@ -607,6 +619,48 @@ fn run_mcem(
                     (center, h_post)
                 };
                 let subj_seed = seed.wrapping_add(i as u64).wrapping_add((k as u64) << 32);
+
+                // FREM: Rao-Blackwellised low-dimensional PK sampling. The
+                // conditional PK proposal is well matched, so the per-subject
+                // ISCALE pilot search (a full-dimensional ESS rescue) is skipped.
+                if let Some((ref pk_idx, ref cov_idx)) = frem_rb {
+                    if let Some(fc) = model.frem_config.as_ref() {
+                        if let Some(d) =
+                            crate::estimation::importance_sampling::subject_cov_deviations(
+                                subject,
+                                &params_k.theta,
+                                fc,
+                                cov_idx,
+                            )
+                        {
+                            if let Some(rb) =
+                                crate::estimation::importance_sampling::subject_is_draws_frem_rb(
+                                    model,
+                                    subject,
+                                    &params_k.theta,
+                                    &params_k.sigma.values,
+                                    &center,
+                                    &h_post,
+                                    &omega_inv,
+                                    &params_k.omega.matrix,
+                                    pk_idx,
+                                    cov_idx,
+                                    &d,
+                                    n_eta,
+                                    k_samples,
+                                    nu,
+                                    subj_seed,
+                                    scratch,
+                                    1.0,
+                                    use_sobol,
+                                )
+                            {
+                                return rb;
+                            }
+                        }
+                    }
+                }
+
                 let iscale = find_optimal_iscale(
                     model,
                     subject,

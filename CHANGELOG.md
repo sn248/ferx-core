@@ -229,6 +229,15 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- **IMP/IMPMAP now Rao-Blackwellise FREM covariate ETAs**: the Gaussian covariate
+  pseudo-observation ETAs are integrated analytically (conditional PK prior from
+  the Ω precision blocks) and only the PK ETAs are importance-sampled. This turns
+  the high-dimensional, multi-scale IS (≈1–2% effective sample size, unstable
+  M-step) into a well-conditioned low-dimensional one: on the workshop 12-ETA FREM
+  the share of low-ESS subjects dropped from ~80% to ~23%, the −2logL trajectory
+  is smooth (no spikes), and estimates land near NONMEM (TVCL 6.7 vs 6.97, TVMAT
+  2.8 vs 2.75). Automatic for FREM models; falls back to full-dimensional IS if
+  the PK/covariate partition is degenerate. (#406)
 - **`imp` is now a Monte-Carlo EM estimator by default** (NONMEM `METHOD=IMP`
   parity): `method = imp` updates θ/Ω/σ instead of only evaluating the marginal
   `−2 log L`. **Breaking:** model files that used `imp` (e.g. `[focei, imp]`)

@@ -11,33 +11,34 @@ use crate::types::DoseEvent;
 
 // ── Generic closed-form single-dose solutions ────────────────────────────────
 
-/// 1-cpt IV bolus: `C(t) = (D/V)·exp(−(CL/V)·t)`.
-pub fn one_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: f64, cl: T, v: T) -> T {
-    if t < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 {
+/// 1-cpt IV bolus: `C(t) = (D/V)·exp(−(CL/V)·t)`. `t` (elapsed time since dose) is
+/// generic so the caller can seed it as a dual carrying the lagtime sensitivity
+/// (`∂t/∂lagtime = −1`); pass an `f64` for the plain prediction.
+pub fn one_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: T, cl: T, v: T) -> T {
+    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let k = cl / v;
-    (T::from_f64(amt) / v) * (-(k * T::from_f64(t))).exp()
+    (T::from_f64(amt) / v) * (-(k * t)).exp()
 }
 
 /// 1-cpt oral (first-order absorption), with the `KA ≈ k` L'Hôpital limit.
-pub fn one_cpt_oral_g<T: PkNum>(amt: f64, t: f64, cl: T, v: T, ka: T, f_bio: T) -> T {
-    if t < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || ka.val() <= 0.0 {
+pub fn one_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, ka: T, f_bio: T) -> T {
+    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || ka.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let k = cl / v;
     let d = f_bio * T::from_f64(amt);
-    let tt = T::from_f64(t);
     if (ka.val() - k.val()).abs() < 1e-6 {
-        (d * ka / v) * tt * (-(k * tt)).exp()
+        (d * ka / v) * t * (-(k * t)).exp()
     } else {
-        (d * ka / (v * (ka - k))) * ((-(k * tt)).exp() - (-(ka * tt)).exp())
+        (d * ka / (v * (ka - k))) * ((-(k * t)).exp() - (-(ka * t)).exp())
     }
 }
 
 /// 1-cpt infusion (zero-order input of duration `dur`, rate `rate`).
-pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: f64, cl: T, v: T) -> T {
-    if t < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 {
+pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, v: T) -> T {
+    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
@@ -46,16 +47,16 @@ pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: f64, cl: T
     let k = cl / v;
     let r_cl = T::from_f64(rate) / cl;
     let one = T::from_f64(1.0);
-    if t <= dur {
-        r_cl * (one - (-(k * T::from_f64(t))).exp())
+    if t.val() <= dur {
+        r_cl * (one - (-(k * t)).exp())
     } else {
-        r_cl * (one - (-(k * T::from_f64(dur))).exp()) * (-(k * T::from_f64(t - dur))).exp()
+        r_cl * (one - (-(k * T::from_f64(dur))).exp()) * (-(k * (t - T::from_f64(dur)))).exp()
     }
 }
 
 /// 1-cpt IV bolus at steady state (interval `ii`).
-pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: f64, ii: f64, cl: T, v: T) -> T {
-    if t < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || ii <= 0.0 {
+pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T) -> T {
+    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || ii <= 0.0 {
         return T::from_f64(0.0);
     }
     let k = cl / v;
@@ -63,17 +64,16 @@ pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: f64, ii: f64, cl: T, v: T) -
     if denom.val() <= 0.0 {
         return T::from_f64(0.0);
     }
-    (T::from_f64(amt) / v) * (-(k * T::from_f64(t))).exp() / denom
+    (T::from_f64(amt) / v) * (-(k * t)).exp() / denom
 }
 
 /// 1-cpt oral at steady state (interval `ii`), with the `KA ≈ k` L'Hôpital limit.
-pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: f64, ii: f64, cl: T, v: T, ka: T, f_bio: T) -> T {
-    if t < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || ka.val() <= 0.0 || ii <= 0.0 {
+pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T, ka: T, f_bio: T) -> T {
+    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || ka.val() <= 0.0 || ii <= 0.0 {
         return T::from_f64(0.0);
     }
     let k = cl / v;
     let d = f_bio * T::from_f64(amt);
-    let tt = T::from_f64(t);
     if (ka.val() - k.val()).abs() < 1e-6 {
         // Σ_{n≥0} (τ+nII)·e^{-k(τ+nII)} = e^{-kτ}·[τ/(1-x) + II·x/(1-x)²], x=e^{-kII}.
         let x = (-(k * T::from_f64(ii))).exp();
@@ -81,15 +81,15 @@ pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: f64, ii: f64, cl: T, v: T, ka: T
         if omx.val() <= 0.0 {
             return T::from_f64(0.0);
         }
-        let s = tt / omx + (x * T::from_f64(ii)) / (omx * omx);
-        (d * ka / v) * (-(k * tt)).exp() * s
+        let s = t / omx + (x * T::from_f64(ii)) / (omx * omx);
+        (d * ka / v) * (-(k * t)).exp() * s
     } else {
         let denom_k = T::from_f64(1.0) - (-(k * T::from_f64(ii))).exp();
         let denom_ka = T::from_f64(1.0) - (-(ka * T::from_f64(ii))).exp();
         if denom_k.val() <= 0.0 || denom_ka.val() <= 0.0 {
             return T::from_f64(0.0);
         }
-        (d * ka / (v * (ka - k))) * ((-(k * tt)).exp() / denom_k - (-(ka * tt)).exp() / denom_ka)
+        (d * ka / (v * (ka - k))) * ((-(k * t)).exp() / denom_k - (-(ka * t)).exp() / denom_ka)
     }
 }
 
@@ -100,12 +100,12 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
     rate: f64,
     dur: f64,
     amt: f64,
-    t: f64,
+    t: T,
     ii: f64,
     cl: T,
     v: T,
 ) -> T {
-    if t < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || ii <= 0.0 {
+    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || ii <= 0.0 {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
@@ -122,11 +122,11 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
     let r_over_cl = T::from_f64(rate) / cl;
     let one_minus_e_kt_inf = T::from_f64(1.0) - (-(k * T::from_f64(dur))).exp();
     // Past pulses (n ≥ 1) are always "after-infusion".
-    let past = r_over_cl * one_minus_e_kt_inf * (-(k * T::from_f64(t + ii - dur))).exp() / denom;
-    if t <= dur {
-        r_over_cl * (T::from_f64(1.0) - (-(k * T::from_f64(t))).exp()) + past
+    let past = r_over_cl * one_minus_e_kt_inf * (-(k * (t + T::from_f64(ii - dur)))).exp() / denom;
+    if t.val() <= dur {
+        r_over_cl * (T::from_f64(1.0) - (-(k * t)).exp()) + past
     } else {
-        r_over_cl * one_minus_e_kt_inf * (-(k * T::from_f64(t - dur))).exp() / denom
+        r_over_cl * one_minus_e_kt_inf * (-(k * (t - T::from_f64(dur)))).exp() / denom
     }
 }
 
@@ -137,7 +137,7 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
 /// per-dose). `cl`/`v`/`ka`/`f_bio` are the seeded PK params.
 pub fn one_cpt_conc_g<T: PkNum>(
     dose: &DoseEvent,
-    t: f64,
+    t: T,
     cl: T,
     v: T,
     ka: T,
@@ -165,7 +165,12 @@ pub fn one_cpt_conc_g<T: PkNum>(
 
 /// `(f, ∂f/∂[CL,V], ∂²f/∂[CL,V]²)` for the IV bolus.
 pub fn iv_bolus_sens(amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2]) {
-    let f = one_cpt_iv_bolus_g::<Dual2<2>>(amt, t, Dual2::var(cl, 0), Dual2::var(v, 1));
+    let f = one_cpt_iv_bolus_g::<Dual2<2>>(
+        amt,
+        Dual2::constant(t),
+        Dual2::var(cl, 0),
+        Dual2::var(v, 1),
+    );
     (f.value, f.grad, f.hess)
 }
 
@@ -180,7 +185,7 @@ pub fn oral_sens(
 ) -> (f64, [f64; 4], [[f64; 4]; 4]) {
     let f = one_cpt_oral_g::<Dual2<4>>(
         amt,
-        t,
+        Dual2::constant(t),
         Dual2::var(cl, 0),
         Dual2::var(v, 1),
         Dual2::var(ka, 2),
@@ -292,7 +297,12 @@ mod tests {
     /// (seed CL@0, V@1; the other N−2 dims stay zero but still cost O(N²) work).
     /// Returns a reduction over every component so nothing is optimised away.
     fn iv_bolus_width<const N: usize>(amt: f64, t: f64, cl: f64, v: f64) -> f64 {
-        let f = one_cpt_iv_bolus_g::<Dual2<N>>(amt, t, Dual2::var(cl, 0), Dual2::var(v, 1));
+        let f = one_cpt_iv_bolus_g::<Dual2<N>>(
+            amt,
+            Dual2::constant(t),
+            Dual2::var(cl, 0),
+            Dual2::var(v, 1),
+        );
         let mut s = f.value;
         for i in 0..N {
             s += f.grad[i];
@@ -307,7 +317,7 @@ mod tests {
     fn oral_width<const N: usize>(amt: f64, t: f64, cl: f64, v: f64, ka: f64, fb: f64) -> f64 {
         let f = one_cpt_oral_g::<Dual2<N>>(
             amt,
-            t,
+            Dual2::constant(t),
             Dual2::var(cl, 0),
             Dual2::var(v, 1),
             Dual2::var(ka, 2),

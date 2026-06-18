@@ -218,7 +218,7 @@ pub fn oral_explicit(
         // L'Hôpital limit — rare; let the dual path handle it exactly.
         let d = one_cpt_oral_g::<Dual2<4>>(
             amt,
-            t,
+            Dual2::constant(t),
             Dual2::var(cl, 0),
             Dual2::var(v, 1),
             Dual2::var(ka, 2),
@@ -328,7 +328,7 @@ pub fn oral_ss_explicit(
     let fallback = || {
         let d = one_cpt_oral_ss_g::<Dual2<4>>(
             amt,
-            t,
+            Dual2::constant(t),
             ii,
             Dual2::var(cl, 0),
             Dual2::var(v, 1),
@@ -486,7 +486,12 @@ mod tests {
     };
 
     fn dual_bolus(amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2]) {
-        let d = one_cpt_iv_bolus_g::<Dual2<2>>(amt, t, Dual2::var(cl, 0), Dual2::var(v, 1));
+        let d = one_cpt_iv_bolus_g::<Dual2<2>>(
+            amt,
+            Dual2::constant(t),
+            Dual2::var(cl, 0),
+            Dual2::var(v, 1),
+        );
         (d.value, d.grad, d.hess)
     }
     fn dual_oral(
@@ -499,7 +504,7 @@ mod tests {
     ) -> (f64, [f64; 4], [[f64; 4]; 4]) {
         let d = one_cpt_oral_g::<Dual2<4>>(
             amt,
-            t,
+            Dual2::constant(t),
             Dual2::var(cl, 0),
             Dual2::var(v, 1),
             Dual2::var(ka, 2),
@@ -531,8 +536,14 @@ mod tests {
         cl: f64,
         v: f64,
     ) -> (f64, [f64; 2], [[f64; 2]; 2]) {
-        let d =
-            one_cpt_infusion_g::<Dual2<2>>(rate, dur, amt, t, Dual2::var(cl, 0), Dual2::var(v, 1));
+        let d = one_cpt_infusion_g::<Dual2<2>>(
+            rate,
+            dur,
+            amt,
+            Dual2::constant(t),
+            Dual2::var(cl, 0),
+            Dual2::var(v, 1),
+        );
         (d.value, d.grad, d.hess)
     }
 
@@ -564,7 +575,13 @@ mod tests {
     }
 
     fn dual_bolus_ss(amt: f64, t: f64, ii: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2]) {
-        let d = one_cpt_iv_bolus_ss_g::<Dual2<2>>(amt, t, ii, Dual2::var(cl, 0), Dual2::var(v, 1));
+        let d = one_cpt_iv_bolus_ss_g::<Dual2<2>>(
+            amt,
+            Dual2::constant(t),
+            ii,
+            Dual2::var(cl, 0),
+            Dual2::var(v, 1),
+        );
         (d.value, d.grad, d.hess)
     }
 
@@ -605,7 +622,7 @@ mod tests {
             rate,
             dur,
             amt,
-            t,
+            Dual2::constant(t),
             ii,
             Dual2::var(cl, 0),
             Dual2::var(v, 1),
@@ -676,7 +693,7 @@ mod tests {
     ) -> (f64, [f64; 4], [[f64; 4]; 4]) {
         let d = one_cpt_oral_ss_g::<Dual2<4>>(
             amt,
-            t,
+            Dual2::constant(t),
             ii,
             Dual2::var(cl, 0),
             Dual2::var(v, 1),
@@ -737,7 +754,7 @@ mod tests {
         let d4 = run("Dual2<4> (minimal width)", &|t| {
             let d = one_cpt_oral_g::<Dual2<4>>(
                 amt,
-                t,
+                Dual2::constant(t),
                 Dual2::var(cl, 0),
                 Dual2::var(v, 1),
                 Dual2::var(ka, 2),
@@ -748,7 +765,7 @@ mod tests {
         let d8 = run("Dual2<8> (provider width)", &|t| {
             let d = one_cpt_oral_g::<Dual2<8>>(
                 amt,
-                t,
+                Dual2::constant(t),
                 Dual2::var(cl, 0),
                 Dual2::var(v, 1),
                 Dual2::var(ka, 2),

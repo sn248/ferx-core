@@ -84,7 +84,7 @@ fn macro_rates_three_cpt_g<T: PkNum>(cl: T, v1: T, q2: T, v2: T, q3: T, v3: T) -
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_iv_bolus_g<T: PkNum>(
     amt: f64,
-    t: f64,
+    t: T,
     cl: T,
     v1: T,
     q2: T,
@@ -92,7 +92,7 @@ pub fn three_cpt_iv_bolus_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> T {
-    if t < 0.0 || v1.val() <= 0.0 || v2.val() <= 0.0 || v3.val() <= 0.0 || cl.val() <= 0.0 {
+    if t.val() < 0.0 || v1.val() <= 0.0 || v2.val() <= 0.0 || v3.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
@@ -106,7 +106,7 @@ pub fn three_cpt_iv_bolus_g<T: PkNum>(
     let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
     let b = d * (beta - k21) * (beta - k31) / (-(ab) * bg);
     let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
-    let tt = T::from_f64(t);
+    let tt = t;
     a * (-(alpha * tt)).exp() + b * (-(beta * tt)).exp() + g * (-(gamma * tt)).exp()
 }
 
@@ -116,7 +116,7 @@ pub fn three_cpt_infusion_g<T: PkNum>(
     rate: f64,
     dur: f64,
     amt: f64,
-    t: f64,
+    t: T,
     cl: T,
     v1: T,
     q2: T,
@@ -124,7 +124,7 @@ pub fn three_cpt_infusion_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> T {
-    if t < 0.0 || v1.val() <= 0.0 || v2.val() <= 0.0 || v3.val() <= 0.0 || cl.val() <= 0.0 {
+    if t.val() < 0.0 || v1.val() <= 0.0 || v2.val() <= 0.0 || v3.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
@@ -149,13 +149,13 @@ pub fn three_cpt_infusion_g<T: PkNum>(
     let g_coeff = rv * (gamma - k21) * (gamma - k31) / (ag * bg * gamma);
     let one = T::from_f64(1.0);
     let dd = T::from_f64(dur);
-    if t <= dur {
-        let tt = T::from_f64(t);
+    if t.val() <= dur {
+        let tt = t;
         a_coeff * (one - (-(alpha * tt)).exp())
             + b_coeff * (one - (-(beta * tt)).exp())
             + g_coeff * (one - (-(gamma * tt)).exp())
     } else {
-        let dt = T::from_f64(t - dur);
+        let dt = t - dd;
         a_coeff * (one - (-(alpha * dd)).exp()) * (-(alpha * dt)).exp()
             + b_coeff * (one - (-(beta * dd)).exp()) * (-(beta * dt)).exp()
             + g_coeff * (one - (-(gamma * dd)).exp()) * (-(gamma * dt)).exp()
@@ -167,7 +167,7 @@ pub fn three_cpt_infusion_g<T: PkNum>(
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_oral_g<T: PkNum>(
     amt: f64,
-    t: f64,
+    t: T,
     cl: T,
     v1: T,
     q2: T,
@@ -177,7 +177,7 @@ pub fn three_cpt_oral_g<T: PkNum>(
     ka: T,
     f_bio: T,
 ) -> T {
-    if t < 0.0
+    if t.val() < 0.0
         || v1.val() <= 0.0
         || v2.val() <= 0.0
         || v3.val() <= 0.0
@@ -197,7 +197,7 @@ pub fn three_cpt_oral_g<T: PkNum>(
     let a = (alpha - k21) * (alpha - k31) / (ab * ag);
     let b = (beta - k21) * (beta - k31) / (-(ab) * bg);
     let c = (gamma - k21) * (gamma - k31) / (ag * bg);
-    let tt = T::from_f64(t);
+    let tt = t;
 
     // Bateman per eigenvalue λ with L'Hôpital limit when ka ≈ λ.
     let bateman = |lambda: T| -> T {
@@ -225,7 +225,7 @@ fn ss_coeff_g<T: PkNum>(lambda: T, ii: f64) -> T {
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_iv_bolus_ss_g<T: PkNum>(
     amt: f64,
-    t: f64,
+    t: T,
     ii: f64,
     cl: T,
     v1: T,
@@ -234,7 +234,7 @@ pub fn three_cpt_iv_bolus_ss_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> T {
-    if t < 0.0
+    if t.val() < 0.0
         || v1.val() <= 0.0
         || v2.val() <= 0.0
         || v3.val() <= 0.0
@@ -254,7 +254,7 @@ pub fn three_cpt_iv_bolus_ss_g<T: PkNum>(
     let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
     let b = d * (beta - k21) * (beta - k31) / (-(ab) * bg);
     let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
-    let tt = T::from_f64(t);
+    let tt = t;
     a * (-(alpha * tt)).exp() * ss_coeff_g(alpha, ii)
         + b * (-(beta * tt)).exp() * ss_coeff_g(beta, ii)
         + g * (-(gamma * tt)).exp() * ss_coeff_g(gamma, ii)
@@ -264,7 +264,7 @@ pub fn three_cpt_iv_bolus_ss_g<T: PkNum>(
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_oral_ss_g<T: PkNum>(
     amt: f64,
-    t: f64,
+    t: T,
     ii: f64,
     cl: T,
     v1: T,
@@ -275,7 +275,7 @@ pub fn three_cpt_oral_ss_g<T: PkNum>(
     ka: T,
     f_bio: T,
 ) -> T {
-    if t < 0.0
+    if t.val() < 0.0
         || v1.val() <= 0.0
         || v2.val() <= 0.0
         || v3.val() <= 0.0
@@ -296,7 +296,7 @@ pub fn three_cpt_oral_ss_g<T: PkNum>(
     let a = (alpha - k21) * (alpha - k31) / (ab * ag);
     let b = (beta - k21) * (beta - k31) / (-(ab) * bg);
     let c = (gamma - k21) * (gamma - k31) / (ag * bg);
-    let tt = T::from_f64(t);
+    let tt = t;
 
     // SS Bateman per eigenvalue λ, with L'Hôpital limit when ka ≈ λ:
     //   Σ_n (τ + n·II)·e^{−λ(τ+nII)} = e^{−λτ}·[τ/(1−x) + II·x/(1−x)²], x=e^{−λII}.
@@ -325,7 +325,7 @@ pub fn three_cpt_infusion_ss_g<T: PkNum>(
     rate: f64,
     dur: f64,
     amt: f64,
-    t: f64,
+    t: T,
     ii: f64,
     cl: T,
     v1: T,
@@ -334,7 +334,7 @@ pub fn three_cpt_infusion_ss_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> T {
-    if t < 0.0
+    if t.val() < 0.0
         || v1.val() <= 0.0
         || v2.val() <= 0.0
         || v3.val() <= 0.0
@@ -369,17 +369,18 @@ pub fn three_cpt_infusion_ss_g<T: PkNum>(
     let one = T::from_f64(1.0);
     let dd = T::from_f64(dur);
 
+    let dt = t - dd;
     // Past pulses (n ≥ 1): always "after-infusion" since τ + n·II ≥ II ≥ dur.
     let past = |coeff: T, lambda: T| -> T {
         coeff
             * (one - (-(lambda * dd)).exp())
-            * (-(lambda * T::from_f64(t - dur))).exp()
+            * (-(lambda * dt)).exp()
             * (-(lambda * T::from_f64(ii))).exp()
             * ss_coeff_g(lambda, ii)
     };
 
-    if t <= dur {
-        let tt = T::from_f64(t);
+    if t.val() <= dur {
+        let tt = t;
         a_coeff * (one - (-(alpha * tt)).exp())
             + b_coeff * (one - (-(beta * tt)).exp())
             + g_coeff * (one - (-(gamma * tt)).exp())
@@ -387,7 +388,6 @@ pub fn three_cpt_infusion_ss_g<T: PkNum>(
             + past(b_coeff, beta)
             + past(g_coeff, gamma)
     } else {
-        let dt = T::from_f64(t - dur);
         a_coeff * (one - (-(alpha * dd)).exp()) * (-(alpha * dt)).exp() * ss_coeff_g(alpha, ii)
             + b_coeff * (one - (-(beta * dd)).exp()) * (-(beta * dt)).exp() * ss_coeff_g(beta, ii)
             + g_coeff
@@ -403,7 +403,7 @@ pub fn three_cpt_infusion_ss_g<T: PkNum>(
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_conc_g<T: PkNum>(
     dose: &DoseEvent,
-    t: f64,
+    t: T,
     cl: T,
     v1: T,
     q2: T,

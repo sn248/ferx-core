@@ -23,8 +23,9 @@
 //!
 //! Scope (issue #367): analytical 1-/2-/3-cpt (IV bolus/infusion + oral, incl.
 //! steady state — SS infusion only for non-overlapping `T_inf ≤ II`), single
-//! endpoint, log-normal η, no output transform (no scaling, no LTBS), no IOV,
-//! no time-varying covariates, no resets, no dose lagtime.
+//! endpoint, log-normal η, optional scalar output scaling / LTBS, and dose
+//! lagtime (seeded as an extra dual axis through the elapsed-time argument). No
+//! IOV, no time-varying covariates, no resets mixed with steady state.
 //! [`analytical_supported`] (+ per-subject gates in [`subject_sensitivities`])
 //! gate exactly that; everything else returns `None` so the caller falls back
 //! to the gradient-free path.
@@ -32,12 +33,13 @@
 
 use super::dual1::Dual1;
 use super::dual2::Dual2;
+use super::num::PkNum;
 use super::one_cpt::one_cpt_conc_g;
 use super::three_cpt::three_cpt_conc_g;
 use super::two_cpt::two_cpt_conc_g;
 use crate::types::{
     CompiledModel, DoseEvent, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_F, PK_IDX_KA,
-    PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
+    PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
 };
 
 /// Exact sensitivities of one observation w.r.t. η and θ. Hessian-shaped fields
@@ -62,9 +64,10 @@ pub struct SubjectSens {
     pub obs: Vec<ObsSens>,
 }
 
-/// Map a fixed PK slot to its `Dual2<8>` seed dimension. The analytical 1-/2-/
-/// 3-cpt solutions read `CL, V1, Q2, V2, KA, F, Q3, V3` (slots 0,1,2,3,4,5,6,7)
-/// — an identity map; any other slot (LAGTIME) is out of scope.
+/// Map a fixed PK slot to its seed dimension. The analytical 1-/2-/3-cpt
+/// solutions read `CL, V1, Q2, V2, KA, F, Q3, V3` (slots 0,1,2,3,4,5,6,7) — an
+/// identity map; `LAGTIME` (slot 8) is differentiated too, entering each dose's
+/// concentration through the elapsed-time argument (`∂elapsed/∂lagtime = −1`).
 #[inline]
 fn slot_to_dim(slot: usize) -> Option<usize> {
     match slot {
@@ -76,12 +79,43 @@ fn slot_to_dim(slot: usize) -> Option<usize> {
         PK_IDX_F => Some(5),
         PK_IDX_Q3 => Some(6),
         PK_IDX_V3 => Some(7),
+        PK_IDX_LAGTIME => Some(8),
         _ => None,
     }
 }
 
-/// Number of seeded PK dimensions (`CL, V1, Q2, V2, KA, F, Q3, V3`).
-const N_PK: usize = 8;
+/// Number of seeded dimensions (`CL, V1, Q2, V2, KA, F, Q3, V3, LAGTIME`).
+const N_PK: usize = 9;
+
+/// Elapsed time since a dose's *lagged* arrival, as a dual carrying the lagtime
+/// sensitivity (`∂elapsed/∂lagtime = −1`). Mirrors [`crate::pk::predict_concentration`]:
+/// the dose contributes from `dose.time + lagtime` onward, and a steady-state
+/// dose additionally shows its pre-arrival tail (the previous interval's pulse)
+/// by wrapping the negative elapsed time up into `[0, II)`. Returns `None` when
+/// the dose does not contribute at `t_obs`. `lag_d` is the seeded lagtime dual;
+/// `lag_val` its value (kept separate to branch on `.val()` without a borrow).
+#[inline]
+fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T) -> Option<T> {
+    let t_eff = dose.time + lag_val;
+    if t_eff <= t_obs {
+        // `elapsed = (t_obs − dose.time) − lagtime`.
+        Some(T::from_f64(t_obs - dose.time) - lag_d)
+    } else if dose.ss && dose.ii > 0.0 && t_obs >= dose.time {
+        // Pre-arrival steady-state tail: the most recent pulse landed at
+        // `t_eff − n·II`; wrap the negative elapsed up into `[0, II)`. `n` is
+        // locally constant, so `∂elapsed/∂lagtime = −1` still holds.
+        let raw = t_obs - t_eff;
+        let n = (-raw / dose.ii).ceil();
+        let wrapped = T::from_f64(t_obs - dose.time + n * dose.ii) - lag_d;
+        if wrapped.val() < 0.0 {
+            None
+        } else {
+            Some(wrapped)
+        }
+    } else {
+        None
+    }
+}
 
 /// Master switch for the user-ODE sensitivity path (issue #367, Option A). The
 /// provider in [`crate::sens::ode_provider`] is complete and tested, but the
@@ -439,7 +473,7 @@ fn subject_eta_grad_impl(
             }
         };
     }
-    let mut out = disp!(1, 2, 3, 4, 5, 6, 7, 8)?;
+    let mut out = disp!(1, 2, 3, 4, 5, 6, 7, 8, 9)?;
     // Constant `ScalarScale` output divisor: `f_scaled = f/k`, and `∂f/∂η` is
     // linear in `f` so it divides by the same `k` (η-independent). Matches
     // `pk::apply_scaling` (`pred /= s`). Other scaling variants are gated out.
@@ -513,6 +547,10 @@ fn run_obs_grad<const N: usize>(
     let f_d = dv(PK_IDX_F, f_bio);
     let q3_d = dv(PK_IDX_Q3, q3);
     let v3_d = dv(PK_IDX_V3, v3);
+    // Lagtime enters each dose's concentration through the elapsed-time argument
+    // (`elapsed = (t_obs − dose.time) − lagtime`), so seed it as its own dual axis.
+    let lag_val = pk.lagtime();
+    let lag_d = dv(PK_IDX_LAGTIME, lag_val);
 
     let mut out = Vec::with_capacity(subject.obs_times.len());
     for &t_obs in subject.obs_times.iter() {
@@ -525,10 +563,12 @@ fn run_obs_grad<const N: usize>(
 
         let mut fd = Dual1::<N>::constant(0.0);
         for dose in &subject.doses {
-            let elapsed = t_obs - dose.time;
-            if elapsed < 0.0 || dose.time < reset_floor {
+            if dose.time < reset_floor {
                 continue;
             }
+            let Some(elapsed) = lagged_elapsed(dose, t_obs, lag_val, lag_d) else {
+                continue;
+            };
             let c = if three_cpt {
                 three_cpt_conc_g(
                     dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
@@ -693,7 +733,9 @@ fn subject_sensitivities_impl(
     // Explicit-kernel fast path (the default): pick the model class, then take it
     // only if a hand-written kernel covers every dose (else the whole subject uses
     // `Dual2<N>`). `FERX_DISABLE_EXPLICIT_SENS=1` forces the dual path everywhere.
-    let explicit_kind = if explicit_sens_disabled() {
+    // Lagtime forces the generic path too: the explicit kernels read a plain `f64`
+    // elapsed time and so can't carry the `∂elapsed/∂lagtime` sensitivity.
+    let explicit_kind = if explicit_sens_disabled() || model.has_lagtime() {
         None
     } else {
         let kind = match model.pk_model {
@@ -722,7 +764,7 @@ fn subject_sensitivities_impl(
             }
         };
     }
-    let mut sens = disp!(1, 2, 3, 4, 5, 6, 7, 8)?;
+    let mut sens = disp!(1, 2, 3, 4, 5, 6, 7, 8, 9)?;
     // Constant `ScalarScale` output divisor: `f_scaled = f/k`. Every derivative is
     // linear in `f` and `k` is constant (`∂k/∂η = ∂k/∂θ = 0`), so the whole jet
     // divides by `k`. Matches `pk::apply_scaling` (`pred /= s`).
@@ -871,15 +913,22 @@ fn run_obs<const N: usize>(
             let f_d = dv(PK_IDX_F, f_bio);
             let q3_d = dv(PK_IDX_Q3, q3);
             let v3_d = dv(PK_IDX_V3, v3);
+            // Lagtime enters each dose's concentration through the elapsed-time
+            // argument; seed it as its own dual axis (`∂elapsed/∂lagtime = −1`).
+            let lag_val = pk.lagtime();
+            let lag_d = dv(PK_IDX_LAGTIME, lag_val);
 
-            // Superpose dose contributions: f = Σ conc(dose, t_obs − dose.time),
-            // restricted to the current reset segment (`dose.time >= reset_floor`).
+            // Superpose dose contributions: f = Σ conc(dose, elapsed), restricted
+            // to the current reset segment (`dose.time >= reset_floor`); `elapsed`
+            // carries the lagtime shift and the SS pre-arrival tail wrap.
             let mut fd = Dual2::<N>::constant(0.0);
             for dose in &subject.doses {
-                let elapsed = t_obs - dose.time;
-                if elapsed < 0.0 || dose.time < reset_floor {
+                if dose.time < reset_floor {
                     continue;
                 }
+                let Some(elapsed) = lagged_elapsed(dose, t_obs, lag_val, lag_d) else {
+                    continue;
+                };
                 let c = if three_cpt {
                     three_cpt_conc_g(
                         dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
@@ -1926,6 +1975,152 @@ mod tests {
                         lo.df_deta[k],
                         max_relative = 1e-12,
                         epsilon = 1e-14
+                    );
+                }
+            }
+        }
+    }
+
+    // 1-cpt oral with a log-normal dose lagtime (`LAGTIME = TVLAG·exp(ETA_LAG)`).
+    const ONECPT_ORAL_LAG: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVLAG(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_LAG ~ 0.05
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    // 1-cpt IV bolus with a log-normal lagtime (`alag=` alias, IV route).
+    const ONECPT_IV_LAG: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVLAG(1.0, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_LAG ~ 0.05
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, alag=LAGTIME)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    // 2-cpt oral with a log-normal lagtime.
+    const TWOCPT_ORAL_LAG: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(15.0, 1.0, 100.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  theta TVKA(1.0, 0.05, 20.0)
+  theta TVLAG(0.6, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  omega ETA_KA ~ 0.10
+  omega ETA_LAG ~ 0.05
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA * exp(ETA_KA)
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v=V1, q=Q, v2=V2, ka=KA, lagtime=LAGTIME)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// Dose lagtime is now a differentiated PK slot: it enters every dose through
+    /// the elapsed-time argument (`∂elapsed/∂lagtime = −1`), seeded as its own dual
+    /// axis. The provider's exact value/∂η/∂²η/∂θ/∂η∂θ must match FD of the
+    /// production predictor for IV bolus, 1-/2-cpt oral, and — crucially — a
+    /// steady-state oral dose with an observation in the pre-arrival window
+    /// `[dose.time, dose.time + lagtime)`, which exercises the SS tail wrap.
+    #[test]
+    fn provider_lagtime_matches_production() {
+        let cases: Vec<(CompiledModel, Subject, Vec<f64>, Vec<f64>)> = vec![
+            {
+                let m = parse_model_string(ONECPT_ORAL_LAG).expect("parse 1cpt oral lag");
+                assert!(m.has_lagtime(), "model must carry a lagtime");
+                (
+                    m,
+                    oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]),
+                    vec![0.2, 10.0, 1.5, 0.75],
+                    vec![0.15, -0.10, 0.25, 0.12],
+                )
+            },
+            {
+                let m = parse_model_string(ONECPT_IV_LAG).expect("parse 1cpt iv lag");
+                let s = subject_with_dose(
+                    DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                    &[1.5, 3.0, 6.0, 12.0],
+                );
+                (m, s, vec![10.0, 50.0, 1.0], vec![0.1, -0.05, 0.2])
+            },
+            {
+                let m = parse_model_string(TWOCPT_ORAL_LAG).expect("parse 2cpt oral lag");
+                (
+                    m,
+                    oral_subject(&[1.0, 2.0, 6.0, 12.0, 24.0]),
+                    vec![10.0, 50.0, 15.0, 100.0, 1.0, 0.6],
+                    vec![0.12, -0.08, 0.15, 0.1],
+                )
+            },
+            {
+                // Steady-state oral with an observation at t=0.5 inside the
+                // pre-arrival window (lagtime ≈ 0.8 h): the SS tail wrap branch.
+                let m = parse_model_string(ONECPT_ORAL_LAG).expect("parse 1cpt oral lag ss");
+                let s = subject_with_dose(
+                    DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0),
+                    &[0.5, 2.0, 6.0, 12.0, 23.0],
+                );
+                (
+                    m,
+                    s,
+                    vec![0.2, 10.0, 1.5, 0.75],
+                    vec![0.15, -0.10, 0.25, 0.12],
+                )
+            },
+        ];
+        for (m, s, theta, eta) in &cases {
+            assert!(
+                analytical_supported(m),
+                "lagtime must be provider-supported"
+            );
+            check_full_provider_vs_fd(m, s, theta, eta);
+
+            // Light η-provider must equal the full provider's f and ∂f/∂η.
+            let full = subject_sensitivities(m, s, theta, eta).expect("full");
+            let light = subject_eta_grad(m, s, theta, eta).expect("light");
+            for (fo, lo) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-10, epsilon = 1e-12);
+                for k in 0..m.n_eta {
+                    approx::assert_relative_eq!(
+                        fo.df_deta[k],
+                        lo.df_deta[k],
+                        max_relative = 1e-9,
+                        epsilon = 1e-11
                     );
                 }
             }

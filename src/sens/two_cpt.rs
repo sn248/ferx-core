@@ -35,9 +35,10 @@ fn macro_rates_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> (T, T, T) {
     (alpha, beta, k21)
 }
 
-/// 2-cpt IV bolus: `C = A·e^{−αt} + B·e^{−βt}`.
-pub fn two_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: f64, cl: T, v1: T, q: T, v2: T) -> T {
-    if t < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 {
+/// 2-cpt IV bolus: `C = A·e^{−αt} + B·e^{−βt}`. `t` is generic so the caller can
+/// seed it as a dual carrying the lagtime sensitivity (`∂t/∂lagtime = −1`).
+pub fn two_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T) -> T {
+    if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
@@ -48,8 +49,7 @@ pub fn two_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: f64, cl: T, v1: T, q: T, v2: T)
     let amt_v1 = T::from_f64(amt) / v1;
     let a = amt_v1 * (alpha - k21) / diff;
     let b = amt_v1 * (k21 - beta) / diff;
-    let tt = T::from_f64(t);
-    a * (-(alpha * tt)).exp() + b * (-(beta * tt)).exp()
+    a * (-(alpha * t)).exp() + b * (-(beta * t)).exp()
 }
 
 /// 2-cpt infusion (zero-order input, duration `dur`, rate `rate`).
@@ -57,13 +57,13 @@ pub fn two_cpt_infusion_g<T: PkNum>(
     rate: f64,
     dur: f64,
     amt: f64,
-    t: f64,
+    t: T,
     cl: T,
     v1: T,
     q: T,
     v2: T,
 ) -> T {
-    if t < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 {
+    if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
@@ -78,20 +78,19 @@ pub fn two_cpt_infusion_g<T: PkNum>(
     let a_coeff = r_v1 * (alpha - k21) / (diff * alpha);
     let b_coeff = r_v1 * (k21 - beta) / (diff * beta);
     let one = T::from_f64(1.0);
-    let tt = T::from_f64(t);
     let dd = T::from_f64(dur);
-    if t <= dur {
-        a_coeff * (one - (-(alpha * tt)).exp()) + b_coeff * (one - (-(beta * tt)).exp())
+    if t.val() <= dur {
+        a_coeff * (one - (-(alpha * t)).exp()) + b_coeff * (one - (-(beta * t)).exp())
     } else {
-        let dt = T::from_f64(t - dur);
+        let dt = t - dd;
         a_coeff * (one - (-(alpha * dd)).exp()) * (-(alpha * dt)).exp()
             + b_coeff * (one - (-(beta * dd)).exp()) * (-(beta * dt)).exp()
     }
 }
 
 /// 2-cpt oral (first-order absorption), with `ka ≈ α`/`ka ≈ β` L'Hôpital limits.
-pub fn two_cpt_oral_g<T: PkNum>(amt: f64, t: f64, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T) -> T {
-    if t < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 || ka.val() <= 0.0 {
+pub fn two_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T) -> T {
+    if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 || ka.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
@@ -100,7 +99,7 @@ pub fn two_cpt_oral_g<T: PkNum>(amt: f64, t: f64, cl: T, v1: T, q: T, v2: T, ka:
         return T::from_f64(0.0);
     }
     let d = f_bio * T::from_f64(amt) * ka / v1;
-    let tt = T::from_f64(t);
+    let tt = t;
 
     // Combined ka→α (or ka→β) L'Hôpital limit: the e^{-ka·t} term shares the
     // 1/(ka-α) pole and is folded in, contributing −(k21-β)/diff²·e^{-αt} (the
@@ -134,8 +133,8 @@ fn ss_coeff_g<T: PkNum>(lambda: T, ii: f64) -> T {
 }
 
 /// 2-cpt IV bolus at steady state.
-pub fn two_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: f64, ii: f64, cl: T, v1: T, q: T, v2: T) -> T {
-    if t < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || ii <= 0.0 {
+pub fn two_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v1: T, q: T, v2: T) -> T {
+    if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || ii <= 0.0 {
         return T::from_f64(0.0);
     }
     let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
@@ -146,7 +145,7 @@ pub fn two_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: f64, ii: f64, cl: T, v1: T, 
     let amt_v1 = T::from_f64(amt) / v1;
     let a = amt_v1 * (alpha - k21) / diff;
     let b = amt_v1 * (k21 - beta) / diff;
-    let tt = T::from_f64(t);
+    let tt = t;
     a * (-(alpha * tt)).exp() * ss_coeff_g(alpha, ii)
         + b * (-(beta * tt)).exp() * ss_coeff_g(beta, ii)
 }
@@ -154,7 +153,7 @@ pub fn two_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: f64, ii: f64, cl: T, v1: T, 
 /// 2-cpt oral at steady state, with `ka ≈ α`/`ka ≈ β` L'Hôpital limits.
 pub fn two_cpt_oral_ss_g<T: PkNum>(
     amt: f64,
-    t: f64,
+    t: T,
     ii: f64,
     cl: T,
     v1: T,
@@ -163,7 +162,7 @@ pub fn two_cpt_oral_ss_g<T: PkNum>(
     ka: T,
     f_bio: T,
 ) -> T {
-    if t < 0.0
+    if t.val() < 0.0
         || v1.val() <= 0.0
         || cl.val() <= 0.0
         || ka.val() <= 0.0
@@ -178,7 +177,7 @@ pub fn two_cpt_oral_ss_g<T: PkNum>(
         return T::from_f64(0.0);
     }
     let d = f_bio * T::from_f64(amt) * ka / v1;
-    let tt = T::from_f64(t);
+    let tt = t;
 
     // L'Hôpital SS sum of (τ+nII)e^{−λ(τ+nII)} = e^{−λτ}[τ/(1−x) + II·x/(1−x)²].
     let lhop = |lambda: T| -> T {
@@ -224,14 +223,14 @@ pub fn two_cpt_infusion_ss_g<T: PkNum>(
     rate: f64,
     dur: f64,
     amt: f64,
-    t: f64,
+    t: T,
     ii: f64,
     cl: T,
     v1: T,
     q: T,
     v2: T,
 ) -> T {
-    if t < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || ii <= 0.0 {
+    if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || ii <= 0.0 {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
@@ -250,25 +249,24 @@ pub fn two_cpt_infusion_ss_g<T: PkNum>(
     let b_coeff = r_v1 * (k21 - beta) / (diff * beta);
     let one = T::from_f64(1.0);
     let dd = T::from_f64(dur);
+    let dt = t - dd;
     // Past pulses (n ≥ 1): always "after-infusion".
     let past_a = a_coeff
         * (one - (-(alpha * dd)).exp())
-        * (-(alpha * T::from_f64(t - dur))).exp()
+        * (-(alpha * dt)).exp()
         * (-(alpha * T::from_f64(ii))).exp()
         * ss_coeff_g(alpha, ii);
     let past_b = b_coeff
         * (one - (-(beta * dd)).exp())
-        * (-(beta * T::from_f64(t - dur))).exp()
+        * (-(beta * dt)).exp()
         * (-(beta * T::from_f64(ii))).exp()
         * ss_coeff_g(beta, ii);
-    if t <= dur {
-        let tt = T::from_f64(t);
-        a_coeff * (one - (-(alpha * tt)).exp())
-            + b_coeff * (one - (-(beta * tt)).exp())
+    if t.val() <= dur {
+        a_coeff * (one - (-(alpha * t)).exp())
+            + b_coeff * (one - (-(beta * t)).exp())
             + past_a
             + past_b
     } else {
-        let dt = T::from_f64(t - dur);
         a_coeff * (one - (-(alpha * dd)).exp()) * (-(alpha * dt)).exp() * ss_coeff_g(alpha, ii)
             + b_coeff * (one - (-(beta * dd)).exp()) * (-(beta * dt)).exp() * ss_coeff_g(beta, ii)
     }
@@ -280,7 +278,7 @@ pub fn two_cpt_infusion_ss_g<T: PkNum>(
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_conc_g<T: PkNum>(
     dose: &DoseEvent,
-    t: f64,
+    t: T,
     cl: T,
     v1: T,
     q: T,

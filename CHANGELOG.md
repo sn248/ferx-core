@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic sensitivities for dose lagtime (ALAG)** on analytical PK models: a
+  declared `LAGTIME`/`alag` parameter is now differentiated exactly by the
+  sensitivity provider — it enters every dose through the elapsed-time argument
+  (`∂elapsed/∂lagtime = −1`, seeded as its own dual axis), including the
+  steady-state pre-arrival tail. Lagtime models therefore drive the analytic
+  FOCE/FOCEI outer gradient and the analytic inner EBE gradient instead of
+  falling back to finite differences. Validated against finite differences of the
+  production predictor (value, ∂/∂η, ∂²/∂η², ∂/∂θ, ∂²/∂η∂θ) and as a full packed
+  outer gradient (#367).
 - **Analytic M3 (BLOQ) outer gradient for both FOCE and FOCEI** on analytical PK
   models: the exact closed-form marginal gradient now covers M3-censored subjects.
   Under FOCEI a censored row enters the Almquist Laplace assembly as a data term

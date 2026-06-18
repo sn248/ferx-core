@@ -175,7 +175,7 @@ pub fn iv_bolus_explicit(
     let fallback = || {
         let d = three_cpt_iv_bolus_g::<Dual2<6>>(
             amt,
-            t,
+            Dual2::constant(t),
             Dual2::var(cl, 0),
             Dual2::var(v1, 1),
             Dual2::var(q2, 2),
@@ -244,7 +244,7 @@ pub fn infusion_explicit(
             rate,
             dur,
             amt,
-            t,
+            Dual2::constant(t),
             Dual2::var(cl, 0),
             Dual2::var(v1, 1),
             Dual2::var(q2, 2),
@@ -335,7 +335,7 @@ pub fn oral_explicit(
     let fallback = || {
         let d = three_cpt_oral_g::<Dual2<8>>(
             amt,
-            t,
+            Dual2::constant(t),
             Dual2::var(cl, 0),
             Dual2::var(v1, 1),
             Dual2::var(q2, 2),
@@ -417,7 +417,7 @@ pub fn iv_bolus_ss_explicit(
     let fallback = || {
         let d = three_cpt_iv_bolus_ss_g::<Dual2<6>>(
             amt,
-            t,
+            Dual2::constant(t),
             ii,
             Dual2::var(cl, 0),
             Dual2::var(v1, 1),
@@ -491,7 +491,7 @@ pub fn oral_ss_explicit(
     let fallback = || {
         let d = three_cpt_oral_ss_g::<Dual2<8>>(
             amt,
-            t,
+            Dual2::constant(t),
             ii,
             Dual2::var(cl, 0),
             Dual2::var(v1, 1),
@@ -586,7 +586,7 @@ pub fn infusion_ss_explicit(
             rate,
             dur,
             amt,
-            t,
+            Dual2::constant(t),
             ii,
             Dual2::var(cl, 0),
             Dual2::var(v1, 1),
@@ -689,7 +689,7 @@ mod tests {
     ) -> (f64, [f64; 6], [[f64; 6]; 6]) {
         let d = three_cpt_iv_bolus_g::<Dual2<6>>(
             amt,
-            t,
+            Dual2::constant(t),
             Dual2::var(cl, 0),
             Dual2::var(v1, 1),
             Dual2::var(q2, 2),
@@ -743,7 +743,7 @@ mod tests {
             rate,
             dur,
             amt,
-            t,
+            Dual2::constant(t),
             Dual2::var(cl, 0),
             Dual2::var(v1, 1),
             Dual2::var(q2, 2),
@@ -798,7 +798,7 @@ mod tests {
     ) -> (f64, [f64; 8], [[f64; 8]; 8]) {
         let d = three_cpt_oral_g::<Dual2<8>>(
             amt,
-            t,
+            Dual2::constant(t),
             Dual2::var(cl, 0),
             Dual2::var(v1, 1),
             Dual2::var(q2, 2),
@@ -847,7 +847,7 @@ mod tests {
             let (fe, ge, he) = iv_bolus_ss_explicit(amt, t, ii, cl, v1, q2, v2, q3, v3);
             let d = three_cpt_iv_bolus_ss_g::<Dual2<6>>(
                 amt,
-                t,
+                Dual2::constant(t),
                 ii,
                 Dual2::var(cl, 0),
                 Dual2::var(v1, 1),
@@ -879,7 +879,7 @@ mod tests {
             let (fe, ge, he) = oral_ss_explicit(amt, t, ii, cl, v1, q2, v2, q3, v3, ka, fb);
             let d = three_cpt_oral_ss_g::<Dual2<8>>(
                 amt,
-                t,
+                Dual2::constant(t),
                 ii,
                 Dual2::var(cl, 0),
                 Dual2::var(v1, 1),
@@ -917,7 +917,7 @@ mod tests {
                 rate,
                 dur,
                 amt,
-                t,
+                Dual2::constant(t),
                 ii,
                 Dual2::var(cl, 0),
                 Dual2::var(v1, 1),
@@ -966,7 +966,7 @@ mod tests {
         let d6 = run("Dual2<6> (minimal width)", &|t| {
             let d = three_cpt_iv_bolus_g::<Dual2<6>>(
                 amt,
-                t,
+                Dual2::constant(t),
                 Dual2::var(cl, 0),
                 Dual2::var(v1, 1),
                 Dual2::var(q2, 2),
@@ -979,7 +979,7 @@ mod tests {
         let d8 = run("Dual2<8> (provider width)", &|t| {
             let d = three_cpt_iv_bolus_g::<Dual2<8>>(
                 amt,
-                t,
+                Dual2::constant(t),
                 Dual2::var(cl, 0),
                 Dual2::var(v1, 1),
                 Dual2::var(q2, 2),

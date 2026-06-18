@@ -1550,6 +1550,119 @@ mod tests {
         run_population_packed_gradient_check(&model, &[5.0, 30.0, 2.0, 50.0, 1.0]);
     }
 
+    // 1-cpt oral with a log-normal dose lagtime (`LAGTIME = TVLAG·exp(ETA_LAG)`):
+    // the lagtime θ (`TVLAG`) and ω (`ETA_LAG`) enter the packed gradient through
+    // the provider's `∂f/∂θ` / `∂²f/∂η∂θ` for the lag slot, with no special-casing.
+    const WARFARIN_LAG: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVLAG(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_LAG ~ 0.05
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// Full packed-gradient check (8 params: 4 θ + 4 Ω-Cholesky + 1 σ) for a model
+    /// with a differentiated dose lagtime, vs Richardson reconverged-FD of the
+    /// marginal NLL. Confirms the lagtime axis flows through the Almquist assembly.
+    #[test]
+    fn population_packed_gradient_lagtime_matches_fd() {
+        use crate::estimation::parameterization::{pack_params, unpack_params};
+        use crate::types::Population;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(WARFARIN_LAG).expect("parse lag");
+        let theta = [0.22, 11.0, 1.4, 0.7];
+
+        // Two subjects, observations built at a 4-component reference η (all obs
+        // times comfortably past the lagged arrival so residuals are smooth).
+        let build = |times: &[f64]| -> Subject {
+            let n = times.len();
+            let mut s = Subject {
+                id: "1".to_string(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: times.to_vec(),
+                obs_raw_times: Vec::new(),
+                observations: vec![0.0; n],
+                obs_cmts: vec![1; n],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; n],
+                occasions: vec![1; n],
+                dose_occasions: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            };
+            let eta_ref = [0.12, -0.08, 0.2, 0.1];
+            let preds = crate::pk::compute_predictions_with_tv(&model, &s, &theta, &eta_ref);
+            s.observations = preds.iter().map(|p| p * 0.85).collect();
+            s
+        };
+        let pop = Population {
+            subjects: vec![
+                build(&[1.0, 2.0, 4.0, 8.0, 24.0]),
+                build(&[1.5, 3.0, 6.0, 12.0, 36.0]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+
+        let analytic =
+            population_gradient_sens(&model, &pop, &template, &x, &ehs).expect("supported");
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| marginal_nll(&model, s, &p))
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
+        }
+    }
+
     /// The analytic FOCEI **M3** packed gradient (censored rows enter `prepare`'s
     /// M3 branch: data `−logΦ` + true-inner-Hessian, excluded from `H̃`) must match
     /// the reconverged-FD of ferx's M3 FOCEI objective (`foce_subject_nll_interaction`

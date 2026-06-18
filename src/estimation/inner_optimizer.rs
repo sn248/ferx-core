@@ -1310,7 +1310,12 @@ fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
     h * (1.0 / sqrt_v + (y - f) * dv_df / (2.0 * v * sqrt_v))
 }
 
-fn analytic_eta_nll_gradient(
+/// Exact analytic `∂NLL_i/∂η` from the light first-order sensitivity provider:
+/// `Σ_j (∂nll/∂f_j)·(∂f_j/∂η) + Ω⁻¹η`. `Some` only when the model is in the
+/// provider's scope (returns `None` for ODE / TV-cov / oral-infusion / SS+reset /
+/// expression-scale subjects). Shared by the inner EBE loop and the HMC sampler so
+/// both estimators use the same Dual2 gradient (replacing the retired Enzyme path).
+pub(crate) fn analytic_eta_nll_gradient(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],

@@ -1084,19 +1084,13 @@ pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) 
     // HMC is BSV-only (`hmc_step` and the AD NLL/gradient are kappa-unaware), so
     // it is disabled for IOV models (`n_kappa > 0`); those subjects use the MH
     // kernels, whose acceptance targets the IOV conditional p(η | κ, θ, data).
-    #[cfg(feature = "autodiff")]
     let using_hmc =
         n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && model.n_kappa == 0;
-    #[cfg(not(feature = "autodiff"))]
-    let using_hmc = {
-        let _ = model;
-        false
-    };
     if using_hmc {
-        format!("HMC ({n_leapfrog} leapfrog steps, autodiff gradients)")
+        format!("HMC ({n_leapfrog} leapfrog steps, Dual2 analytic gradients)")
     } else if n_leapfrog > 0 {
         "Metropolis-Hastings random walk \
-         (HMC requested but unavailable — needs the autodiff build + an analytical PK model)"
+         (HMC requested but unavailable — needs an analytical PK model, no IOV)"
             .to_string()
     } else {
         "Metropolis-Hastings random walk".to_string()
@@ -1144,14 +1138,8 @@ pub fn run_saem(
     // `n_leapfrog > 0` would propose eta against the kappa-free posterior and
     // hand a BSV-only NLL to the componentwise kernel as its (mismatched)
     // acceptance baseline.
-    let using_hmc: bool = {
-        #[cfg(feature = "autodiff")]
-        {
-            n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && n_kappa == 0
-        }
-        #[cfg(not(feature = "autodiff"))]
-        false
-    };
+    let using_hmc: bool =
+        n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && n_kappa == 0;
 
     let n_theta = init_params.theta.len();
     let n_sigma = init_params.sigma.values.len();
@@ -1173,7 +1161,7 @@ pub fn run_saem(
         let reason = if n_kappa > 0 {
             "HMC is unavailable for IOV models (it is kappa-unaware)"
         } else {
-            "HMC is unavailable (requires `autodiff` feature and analytical PK model)"
+            "HMC is unavailable (requires an analytical PK model the Dual2 gradient supports)"
         };
         warnings.push(format!(
             "saem_n_leapfrog > 0 but {reason}; falling back to Metropolis-Hastings"
@@ -1535,7 +1523,6 @@ pub fn run_saem(
                         // (e.g. TV-cov subject with unsupported PK model); fall through
                         // to the block MH kernel. `did_hmc` doubles as the `used_hmc`
                         // flag reported back for diagnostics.
-                        #[cfg(feature = "autodiff")]
                         let did_hmc = if using_hmc {
                             if let Some((new_eta, new_nll, accepted, _divergent)) =
                                 crate::estimation::hmc::hmc_step(
@@ -1554,8 +1541,6 @@ pub fn run_saem(
                         } else {
                             false
                         };
-                        #[cfg(not(feature = "autodiff"))]
-                        let did_hmc = false;
 
                         if !did_hmc {
                             let (n_acc, nll_new) = mh_steps(
@@ -2241,15 +2226,9 @@ mod tests {
         let mut hmc_opts = crate::types::FitOptions::default();
         hmc_opts.saem_n_leapfrog = 10;
         let s2 = saem_sampler_summary(&model, &hmc_opts);
-        #[cfg(not(feature = "autodiff"))]
-        assert!(
-            s2.contains("unavailable"),
-            "no-autodiff build can't run HMC, got: {s2}"
-        );
-        #[cfg(feature = "autodiff")]
         assert!(
             s2.starts_with("HMC"),
-            "autodiff build with analytical model + leapfrog steps should use HMC, got: {s2}"
+            "analytical model + leapfrog steps should use HMC (Dual2 gradient), got: {s2}"
         );
     }
 

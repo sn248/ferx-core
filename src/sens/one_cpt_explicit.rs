@@ -23,7 +23,7 @@
 //! algebraic shape.
 
 use super::dual2::Dual2;
-use super::one_cpt::{one_cpt_oral_g, one_cpt_oral_ss_g};
+use super::one_cpt::{one_cpt_infusion_ss_g, one_cpt_oral_g, one_cpt_oral_ss_g};
 
 /// A 1-D second-order jet over a single scalar variable (here the disposition
 /// rate `k`): `v` value, `d1 = d/dk`, `d2 = d²/dk²`. Cheap (3 `f64`s, scalar
@@ -451,9 +451,19 @@ pub fn infusion_ss_explicit(
         return iv_bolus_ss_explicit(amt, t, ii, cl, v);
     }
     if dur > ii {
-        // Overlapping SS infusion has no single-interval closed form (production
-        // returns 0 / routes to ODE); match the generic zero.
-        return (0.0, [0.0; 2], [[0.0; 2]; 2]);
+        // Overlapping SS infusion: delegate to the generic dual kernel, which
+        // superposes the past pulse train (#379). Rare enough not to warrant a
+        // hand-written explicit variant.
+        let d = one_cpt_infusion_ss_g::<Dual2<2>>(
+            rate,
+            dur,
+            amt,
+            Dual2::constant(t),
+            ii,
+            Dual2::var(cl, 0),
+            Dual2::var(v, 1),
+        );
+        return (d.value, d.grad, d.hess);
     }
     let k = cl / v;
     let kj = D1::var(k);

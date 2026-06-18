@@ -391,9 +391,10 @@ pub fn oral_ss_explicit(
     (c.v, c.g, c.h)
 }
 
-/// `(f, ∂f/∂[CL,V1,Q,V2], ∂²f/∂[...]²)` for 2-cpt infusion at steady state
-/// (non-overlapping `dur ≤ II`): the during/after pieces plus the past-pulse
-/// superposition of [`two_cpt_infusion_ss_g`], each carrying `1/(1−e^{−λ·II})`.
+/// `(f, ∂f/∂[CL,V1,Q,V2], ∂²f/∂[...]²)` for 2-cpt infusion at steady state: the
+/// during/after pieces plus the past-pulse superposition, each carrying
+/// `1/(1−e^{−λ·II})`. Overlapping pulses (`dur > II`) delegate to the generic
+/// dual kernel [`two_cpt_infusion_ss_g`] (#379).
 #[allow(clippy::too_many_arguments)]
 pub fn infusion_ss_explicit(
     rate: f64,
@@ -427,7 +428,9 @@ pub fn infusion_ss_explicit(
         return iv_bolus_ss_explicit(amt, t, ii, cl, v1, q, v2);
     }
     if dur > ii {
-        return (0.0, [0.0; 4], [[0.0; 4]; 4]);
+        // Overlapping SS infusion: delegate to the generic dual kernel, which
+        // superposes the past pulse train (#379).
+        return fallback();
     }
     let (alpha, beta, k21) = match macro_rate_jets::<4>(cl, v1, q, v2) {
         Some(x) => x,

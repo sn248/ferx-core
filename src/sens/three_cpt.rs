@@ -318,8 +318,8 @@ pub fn three_cpt_oral_ss_g<T: PkNum>(
     coeff * (a * bateman_ss(alpha) + b * bateman_ss(beta) + c * bateman_ss(gamma))
 }
 
-/// 3-cpt infusion at steady state (interval `ii`). Closed form requires
-/// `dur ≤ ii`; returns 0 otherwise (matches production `three_cpt_infusion_ss`).
+/// 3-cpt infusion at steady state (interval `ii`), for any `dur` — including
+/// overlapping pulses (`dur > ii`). Mirrors production `three_cpt_infusion_ss`.
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_infusion_ss_g<T: PkNum>(
     rate: f64,
@@ -346,9 +346,6 @@ pub fn three_cpt_infusion_ss_g<T: PkNum>(
     if dur <= 0.0 {
         return three_cpt_iv_bolus_ss_g(amt, t, ii, cl, v1, q2, v2, q3, v3);
     }
-    if dur > ii {
-        return T::from_f64(0.0);
-    }
     let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
     let ab = alpha - beta;
     let ag = alpha - gamma;
@@ -368,6 +365,22 @@ pub fn three_cpt_infusion_ss_g<T: PkNum>(
     let g_coeff = rv * (gamma - k21) * (gamma - k31) / (ag * bg * gamma);
     let one = T::from_f64(1.0);
     let dd = T::from_f64(dur);
+
+    if dur > ii {
+        // Overlapping infusions: superpose the past pulse train per eigenvalue
+        // (mirror of `crate::pk::three_cpt_infusion_ss`). `N` = count of pulses
+        // still infusing at phase `t`, a locally-constant integer seeded by value.
+        let n_active = (((dur - t.val()) / ii).floor() + 1.0).max(0.0);
+        let nii = T::from_f64(n_active * ii);
+        let overlap = |c: T, lambda: T| -> T {
+            let sc = ss_coeff_g(lambda, ii);
+            let a = T::from_f64(n_active)
+                - (-(lambda * t)).exp() * (one - (-(lambda * nii)).exp()) * sc;
+            let d = (one - (-(lambda * dd)).exp()) * (-(lambda * (t - dd + nii))).exp() * sc;
+            c * (a + d)
+        };
+        return overlap(a_coeff, alpha) + overlap(b_coeff, beta) + overlap(g_coeff, gamma);
+    }
 
     let dt = t - dd;
     // Past pulses (n ≥ 1): always "after-infusion" since τ + n·II ≥ II ≥ dur.

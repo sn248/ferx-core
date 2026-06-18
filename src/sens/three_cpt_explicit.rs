@@ -612,7 +612,9 @@ pub fn infusion_ss_explicit(
         return iv_bolus_ss_explicit(amt, t, ii, cl, v1, q2, v2, q3, v3);
     }
     if dur > ii {
-        return (0.0, [0.0; 6], [[0.0; 6]; 6]);
+        // Overlapping SS infusion: delegate to the generic dual kernel, which
+        // superposes the past pulse train (#379).
+        return fallback();
     }
     let (alpha, beta, gamma, k21, k31) = match macro_rate_jets_3cpt::<6>(cl, v1, q2, v2, q3, v3) {
         Some(x) => x,

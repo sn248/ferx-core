@@ -22,8 +22,8 @@
 //! `pk_indices`, and `tv_fn` all already live on `CompiledModel`.
 //!
 //! Scope (issue #367): analytical 1-/2-/3-cpt (IV bolus/infusion + oral, incl.
-//! steady state — SS infusion only for non-overlapping `T_inf ≤ II`), single
-//! endpoint, log-normal η, optional scalar output scaling / LTBS, and dose
+//! steady state — SS infusion for any `T_inf`, including overlapping `T_inf > II`),
+//! single endpoint, log-normal η, optional scalar output scaling / LTBS, and dose
 //! lagtime (seeded as an extra dual axis through the elapsed-time argument). No
 //! IOV, no time-varying covariates, no resets mixed with steady state.
 //! [`analytical_supported`] (+ per-subject gates in [`subject_sensitivities`])
@@ -408,13 +408,6 @@ fn subject_eta_grad_impl(
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
-    if subject
-        .doses
-        .iter()
-        .any(|d| d.ss && d.ii > 0.0 && d.is_infusion() && d.duration > d.ii)
-    {
-        return None;
-    }
 
     let n_eta = model.n_eta;
     let oral = matches!(
@@ -653,17 +646,6 @@ fn subject_sensitivities_impl(
     // an infinite periodic history that a mid-record reset contradicts, so a
     // subject mixing SS with resets falls back to FD.
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
-        return None;
-    }
-    // Overlapping steady-state infusion (`T_inf > II`) has no single-interval
-    // closed form — production returns 0 there too, but rather than match a
-    // degenerate zero, fall back to FD. Non-overlapping SS infusion is handled
-    // by the `*_infusion_ss_g` closed forms.
-    if subject
-        .doses
-        .iter()
-        .any(|d| d.ss && d.ii > 0.0 && d.is_infusion() && d.duration > d.ii)
-    {
         return None;
     }
 
@@ -1715,18 +1697,33 @@ mod tests {
     }
 
     #[test]
-    fn provider_falls_back_on_overlapping_ss_infusion() {
-        // Overlapping SS infusion (rate=200, amt=1000 → dur=5; II=2 → dur>II):
-        // no single-interval closed form → fall back to FD.
+    fn provider_overlapping_ss_infusion_matches_production() {
+        // Overlapping SS infusion (rate=200, amt=1000 → dur=5; II=2 → dur>II): the
+        // provider now carries the same superposed closed form as production (#379),
+        // so its value/η/θ sensitivities match FD of the production predictor.
+        // Observations sampled within the dosing interval [0, II).
         let iv = parse_model_string(TWOCPT_IV).expect("parse");
         let ss_inf = subject_with_dose(
             DoseEvent::new(0.0, 1000.0, 1, 200.0, true, 2.0),
-            &[0.5, 1.0],
+            &[0.3, 0.8, 1.2, 1.7],
         );
         assert!(
             subject_sensitivities(&iv, &ss_inf, &[10.0, 50.0, 15.0, 100.0], &[0.1, -0.05])
-                .is_none()
+                .is_some(),
+            "overlapping SS infusion is now provider-supported"
         );
+        check_provider_vs_production(&iv, &ss_inf, &[10.0, 50.0, 15.0, 100.0], &[0.1, -0.05]);
+
+        // 1-cpt IV overlapping too (dur = 1000/200 = 5 > II = 2).
+        let one = parse_model_string(
+            "[parameters]\n  theta TVCL(10.0,1.0,100.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        )
+        .expect("parse");
+        let one_inf = subject_with_dose(
+            DoseEvent::new(0.0, 1000.0, 1, 200.0, true, 2.0),
+            &[0.3, 0.8, 1.2, 1.7],
+        );
+        check_provider_vs_production(&one, &one_inf, &[10.0, 50.0], &[0.1, -0.05]);
     }
 
     /// Build a subject carrying explicit doses and EVID=3/4 reset times (no

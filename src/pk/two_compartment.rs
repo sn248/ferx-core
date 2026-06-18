@@ -188,10 +188,8 @@ pub fn two_cpt_iv_bolus_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v
     a * (-alpha * t).exp() * ss_coeff(alpha, ii) + b * (-beta * t).exp() * ss_coeff(beta, ii)
 }
 
-/// Two-compartment infusion at steady state.
-///
-/// Closed form requires `T_inf ≤ II` (non-overlapping infusions); returns 0.0
-/// otherwise. The `api.rs` warning catches this case for users.
+/// Two-compartment infusion at steady state, for any `T_inf` — including
+/// overlapping pulses (`T_inf > II`). Evaluated at phase `t ∈ [0, II)`.
 pub fn two_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
     if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q < 0.0 || dose.ii <= 0.0 {
         return 0.0;
@@ -199,9 +197,6 @@ pub fn two_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v
     let dur = dose.duration;
     if dur <= 0.0 {
         return two_cpt_iv_bolus_ss(dose, t, cl, v1, q, v2);
-    }
-    if dur > dose.ii {
-        return 0.0;
     }
     let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
     let diff = alpha - beta;
@@ -212,6 +207,24 @@ pub fn two_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v
     let rate = dose.rate;
     let a_coeff = (rate / v1) * (alpha - k21) / (diff * alpha);
     let b_coeff = (rate / v1) * (k21 - beta) / (diff * beta);
+
+    if dur > ii {
+        // Overlapping infusions: superpose the past pulse train per eigenvalue.
+        // For each λ with coefficient `c`, with `N` pulses still infusing at
+        // phase `t` (N = ⌊(T_inf − t)/II⌋ + 1) and `sc = 1/(1 − e^{−λ·II})`:
+        //   c·[ N − e^{−λt}(1 − e^{−λ·N·II})·sc + (1 − e^{−λ·T_inf})·e^{−λ(t − T_inf + N·II)}·sc ].
+        // Reduces to the non-overlapping branches at N ∈ {0, 1} (see the 1-cpt
+        // form in `one_cpt_infusion_ss`).
+        let n_active = (((dur - t) / ii).floor() + 1.0).max(0.0);
+        let nii = n_active * ii;
+        let overlap = |c: f64, lambda: f64| -> f64 {
+            let sc = ss_coeff(lambda, ii);
+            let a = n_active - (-lambda * t).exp() * (1.0 - (-lambda * nii).exp()) * sc;
+            let d = (1.0 - (-lambda * dur).exp()) * (-lambda * (t - dur + nii)).exp() * sc;
+            c * (a + d)
+        };
+        return overlap(a_coeff, alpha) + overlap(b_coeff, beta);
+    }
 
     // Past-pulses contribution (n ≥ 1): always "after-infusion".
     let exp_neg_a_ii = (-alpha * ii).exp();
@@ -770,10 +783,26 @@ mod tests {
     }
 
     #[test]
-    fn test_ss_infusion_with_t_inf_gt_ii_returns_zero() {
-        // amt=1000, rate=500 → duration=2; ii=1 → t_inf > ii.
-        let dose = DoseEvent::new(0.0, 1000.0, 1, 500.0, true, 1.0);
-        assert_eq!(two_cpt_infusion_ss(&dose, 0.5, CL, V1, Q, V2), 0.0);
+    fn test_ss_infusion_overlapping_matches_numerical_sum() {
+        // Overlapping infusions (T_inf > II) must equal the explicit pulse-train
+        // superposition (#379). amt=1000/rate=500 → duration=2, ii=1 (2 overlap);
+        // amt=900/rate=300 → duration=3, ii=2.
+        // A 2-cpt terminal eigenvalue can be small (≈0.016 here), so the past
+        // pulse train decays slowly — sum far more pulses than `ss_numerical_sum`
+        // for a converged reference.
+        let big_sum = |t: f64, ii: f64, c_single: &dyn Fn(f64) -> f64| -> f64 {
+            (0..50_000).map(|n| c_single(t + (n as f64) * ii)).sum()
+        };
+        for &(rate, amt, ii) in &[(500.0_f64, 1000.0_f64, 1.0_f64), (300.0, 900.0, 2.0)] {
+            let dose = ss_infusion_dose(amt, rate, ii);
+            let single = infusion_dose(amt, rate);
+            assert!(dose.duration > ii, "fixture must overlap");
+            for &t in &[0.0, 0.3 * ii, 0.5 * ii, 0.9 * ii, 0.999 * ii] {
+                let cf = two_cpt_infusion_ss(&dose, t, CL, V1, Q, V2);
+                let num = big_sum(t, ii, &|tt| two_cpt_infusion(&single, tt, CL, V1, Q, V2));
+                assert_relative_eq!(cf, num, epsilon = 1e-6, max_relative = 1e-6);
+            }
+        }
     }
 
     #[test]

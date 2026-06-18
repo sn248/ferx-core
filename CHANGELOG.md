@@ -19,6 +19,18 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+- **Overlapping steady-state infusions (`T_inf > II`)** are now solved exactly for
+  the analytical 1-/2-/3-compartment models instead of being skipped. Previously
+  the closed form returned 0 and the dose was applied as a single (non-SS)
+  infusion (with a `W_STEADY_STATE_INFUSION` warning); the steady-state
+  concentration now superposes the infinite past pulse train (several pulses
+  simultaneously active), validated against explicit superposition. The analytic
+  FOCE/FOCEI sensitivity provider carries the same closed form, so these subjects
+  no longer fall back to finite differences. The warning now fires only for model
+  paths that still skip SS pre-equilibration (ODE models, or EVID=3/4 resets)
+  (#379).
+
 ### Added
 - **Analytic sensitivities for dose lagtime (ALAG)** on analytical PK models: a
   declared `LAGTIME`/`alag` parameter is now differentiated exactly by the

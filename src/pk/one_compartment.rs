@@ -156,11 +156,9 @@ pub(crate) fn one_cpt_oral_depot(dose: &DoseEvent, tau: f64, ka: f64, f_bio: f64
     }
 }
 
-/// One-compartment infusion at steady state.
-///
-/// Closed form requires `T_inf ≤ II` (non-overlapping infusions). For
-/// `T_inf > II` returns 0.0 — caller is responsible for warning; this case
-/// should route through the ODE solver instead.
+/// One-compartment infusion at steady state, for any `T_inf` — including
+/// overlapping pulses (`T_inf > II`), where several infusions are simultaneously
+/// active. Evaluated at phase `t ∈ [0, II)`.
 pub fn one_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v: f64) -> f64 {
     if t < 0.0 || v <= 0.0 || cl <= 0.0 || dose.ii <= 0.0 {
         return 0.0;
@@ -170,10 +168,6 @@ pub fn one_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v: f64) -> f64 {
     if t_inf <= 0.0 {
         return one_cpt_iv_bolus_ss(dose, t, cl, v);
     }
-    if t_inf > dose.ii {
-        // Overlapping-infusion SS case; not handled here.
-        return 0.0;
-    }
     let k = cl / v;
     let ii = dose.ii;
     let denom = 1.0 - (-k * ii).exp();
@@ -182,6 +176,21 @@ pub fn one_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v: f64) -> f64 {
     }
     let r_over_cl = rate / cl;
     let one_minus_e_kt_inf = 1.0 - (-k * t_inf).exp();
+    if t_inf > ii {
+        // Overlapping infusions: superpose the infinite past pulse train
+        // C(τ) = (R/CL)·[A(τ) + D(τ)]. At phase τ, `N` pulses are still infusing
+        // (`τ + n·II < T_inf`, n = 0..N−1) and the rest have ended:
+        //   N = max(0, ⌊(T_inf − τ)/II⌋ + 1)
+        //   A = N − e^{−kτ}(1 − e^{−k·N·II})/(1 − x)                (still infusing)
+        //   D = (1 − e^{−k·T_inf})·e^{−k(τ − T_inf + N·II)}/(1 − x) (decayed tail)
+        // with x = e^{−k·II} (so `1 − x = denom`). This reduces algebraically to
+        // the non-overlapping branches below at N ∈ {0, 1}. The `D` exponent
+        // `τ − T_inf + N·II ≥ 0` is kept in a single `exp` to avoid `inf·0`.
+        let n_active = (((t_inf - t) / ii).floor() + 1.0).max(0.0);
+        let a = n_active - (-k * t).exp() * (1.0 - (-k * n_active * ii).exp()) / denom;
+        let d = one_minus_e_kt_inf * (-k * (t - t_inf + n_active * ii)).exp() / denom;
+        return r_over_cl * (a + d);
+    }
     // Contribution from past pulses (n ≥ 1) is always "after-infusion"
     // because τ + n·II ≥ II ≥ T_inf. The combined exponent
     // `exp(-k·(t + II - t_inf))` is ≤ 1 for the in-range domain
@@ -505,10 +514,23 @@ mod tests {
     }
 
     #[test]
-    fn test_ss_infusion_with_t_inf_gt_ii_returns_zero() {
-        // Overlapping-infusion case not handled by closed form; expect 0.
-        // (rate=200, amt=1000 → duration=5; ii=2 → t_inf > ii)
-        let dose = DoseEvent::new(0.0, 1000.0, 1, 200.0, true, 2.0);
-        assert_eq!(one_cpt_infusion_ss(&dose, 1.0, 10.0, 100.0), 0.0);
+    fn test_ss_infusion_overlapping_matches_numerical_sum() {
+        // Overlapping infusions (T_inf > II): several pulses are simultaneously
+        // active, so the closed form must still equal the explicit superposition
+        // of single-dose responses (#379). Two regimes: duration=5/II=2 (≈2.5
+        // pulses overlap) and duration=7/II=3.
+        let cl: f64 = 10.0;
+        let v: f64 = 100.0;
+        for &(rate, amt, ii) in &[(200.0_f64, 1000.0_f64, 2.0_f64), (140.0, 980.0, 3.0)] {
+            let dose = ss_infusion_dose(amt, rate, ii);
+            let single = infusion_dose(amt, rate);
+            assert!(dose.duration > ii, "fixture must overlap");
+            // Phase τ ∈ [0, II): the physically meaningful SS sampling window.
+            for &t in &[0.0, 0.3, 0.5, 0.9 * ii, 0.999 * ii] {
+                let cf = one_cpt_infusion_ss(&dose, t, cl, v);
+                let num = ss_numerical_sum(t, ii, |tt| one_cpt_infusion(&single, tt, cl, v));
+                assert_relative_eq!(cf, num, epsilon = 1e-8, max_relative = 1e-7);
+            }
+        }
     }
 }

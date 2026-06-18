@@ -93,9 +93,10 @@ pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T, ka: T, 
     }
 }
 
-/// 1-cpt infusion at steady state (interval `ii`). Closed form requires
-/// `dur ≤ ii` (non-overlapping); returns 0 otherwise (matches the production
-/// `one_cpt_infusion_ss`, which routes the overlapping case to the ODE solver).
+/// 1-cpt infusion at steady state (interval `ii`), for any `dur` — including
+/// overlapping pulses (`dur > ii`). Mirrors the production
+/// [`crate::pk::one_cpt_infusion_ss`]; the `dur > ii` branch superposes the
+/// infinite past pulse train (`N` simultaneously-active infusions at phase `t`).
 pub fn one_cpt_infusion_ss_g<T: PkNum>(
     rate: f64,
     dur: f64,
@@ -111,9 +112,6 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
     if dur <= 0.0 {
         return one_cpt_iv_bolus_ss_g(amt, t, ii, cl, v);
     }
-    if dur > ii {
-        return T::from_f64(0.0);
-    }
     let k = cl / v;
     let denom = T::from_f64(1.0) - (-(k * T::from_f64(ii))).exp();
     if denom.val() <= 0.0 {
@@ -121,6 +119,19 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
     }
     let r_over_cl = T::from_f64(rate) / cl;
     let one_minus_e_kt_inf = T::from_f64(1.0) - (-(k * T::from_f64(dur))).exp();
+    if dur > ii {
+        // Overlapping infusions: C = (R/CL)·[A + D] with `N` pulses still
+        // infusing at phase `t` (see `crate::pk::one_cpt_infusion_ss`). `N`
+        // depends on `t` only through its value (a locally-constant integer), so
+        // it is seeded as a constant and the dual derivatives flow through the
+        // exponentials.
+        let n_active = (((dur - t.val()) / ii).floor() + 1.0).max(0.0);
+        let nii = T::from_f64(n_active * ii);
+        let a = T::from_f64(n_active)
+            - (-(k * t)).exp() * (T::from_f64(1.0) - (-(k * nii)).exp()) / denom;
+        let d = one_minus_e_kt_inf * (-(k * (t - T::from_f64(dur) + nii))).exp() / denom;
+        return r_over_cl * (a + d);
+    }
     // Past pulses (n ≥ 1) are always "after-infusion".
     let past = r_over_cl * one_minus_e_kt_inf * (-(k * (t + T::from_f64(ii - dur)))).exp() / denom;
     if t.val() <= dur {

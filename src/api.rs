@@ -887,15 +887,20 @@ pub fn check_model_data_warnings(
         ));
     }
 
-    // SS=1 infusion with T_inf > II — overlapping pulses have no closed form;
-    // the SS pre-equilibration is skipped.
+    // SS=1 infusion with T_inf > II (overlapping pulses). The analytical 1-/2-/3-
+    // cpt closed forms now superpose the overlapping past pulse train (#379), so
+    // these are handled exactly. Only ODE models — and subjects that route to the
+    // event-driven walker (EVID 3/4 resets) — still skip SS pre-equilibration.
+    let analytic_handles_overlap = model.ode_spec.is_none();
     let n_ss_overlapping_inf = population
         .subjects
         .iter()
         .filter(|s| {
-            s.doses
+            let overlapping = s
+                .doses
                 .iter()
-                .any(|d| d.ss && d.ii > 0.0 && d.rate > 0.0 && d.duration > d.ii)
+                .any(|d| d.ss && d.ii > 0.0 && d.rate > 0.0 && d.duration > d.ii);
+            overlapping && (!analytic_handles_overlap || s.has_resets())
         })
         .count();
     if n_ss_overlapping_inf > 0 {
@@ -903,11 +908,12 @@ pub fn check_model_data_warnings(
             "W_STEADY_STATE_INFUSION",
             format!(
                 "{} subject(s) have SS=1 infusions with T_inf > II (overlapping \
-                 pulses). No closed form or pulse-expansion scheme covers this \
-                 case — the SS pre-equilibration is skipped and the dose is \
-                 applied as a single (non-SS) infusion, so the system is not at \
-                 steady state at the dose time. Use a shorter infusion (T_inf \
-                 ≤ II) or remove the SS flag.",
+                 pulses) on a model path that does not pre-equilibrate steady \
+                 state (ODE model, or EVID=3/4 resets routing to the event-driven \
+                 walker) — the dose is applied as a single (non-SS) infusion, so \
+                 the system is not at steady state at the dose time. The analytical \
+                 1-/2-/3-cpt closed forms do handle this case; use a shorter \
+                 infusion (T_inf ≤ II) or remove the SS flag otherwise.",
                 n_ss_overlapping_inf
             ),
         ));

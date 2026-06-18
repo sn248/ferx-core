@@ -216,8 +216,8 @@ pub fn two_cpt_oral_ss_g<T: PkNum>(
     p + q_val + r
 }
 
-/// 2-cpt infusion at steady state (interval `ii`). Closed form requires
-/// `dur ≤ ii`; returns 0 otherwise (matches production `two_cpt_infusion_ss`).
+/// 2-cpt infusion at steady state (interval `ii`), for any `dur` — including
+/// overlapping pulses (`dur > ii`). Mirrors production `two_cpt_infusion_ss`.
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_infusion_ss_g<T: PkNum>(
     rate: f64,
@@ -236,9 +236,6 @@ pub fn two_cpt_infusion_ss_g<T: PkNum>(
     if dur <= 0.0 {
         return two_cpt_iv_bolus_ss_g(amt, t, ii, cl, v1, q, v2);
     }
-    if dur > ii {
-        return T::from_f64(0.0);
-    }
     let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
     let diff = alpha - beta;
     if diff.val().abs() < 1e-12 || alpha.val().abs() < 1e-12 || beta.val().abs() < 1e-12 {
@@ -249,6 +246,21 @@ pub fn two_cpt_infusion_ss_g<T: PkNum>(
     let b_coeff = r_v1 * (k21 - beta) / (diff * beta);
     let one = T::from_f64(1.0);
     let dd = T::from_f64(dur);
+    if dur > ii {
+        // Overlapping infusions: superpose the past pulse train per eigenvalue
+        // (mirror of `crate::pk::two_cpt_infusion_ss`). `N` (count of pulses still
+        // infusing at phase `t`) is a locally-constant integer, seeded as a value.
+        let n_active = (((dur - t.val()) / ii).floor() + 1.0).max(0.0);
+        let nii = T::from_f64(n_active * ii);
+        let overlap = |c: T, lambda: T| -> T {
+            let sc = ss_coeff_g(lambda, ii);
+            let a = T::from_f64(n_active)
+                - (-(lambda * t)).exp() * (one - (-(lambda * nii)).exp()) * sc;
+            let d = (one - (-(lambda * dd)).exp()) * (-(lambda * (t - dd + nii))).exp() * sc;
+            c * (a + d)
+        };
+        return overlap(a_coeff, alpha) + overlap(b_coeff, beta);
+    }
     let dt = t - dd;
     // Past pulses (n ≥ 1): always "after-infusion".
     let past_a = a_coeff

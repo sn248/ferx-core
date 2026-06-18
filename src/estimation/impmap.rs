@@ -158,7 +158,10 @@ fn mu_ref_log_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
 /// FOCEI/NONMEM value of ~0.4). NONMEM's IMP methods require every estimated
 /// parameter to carry a random effect; ferx applies mu-referencing
 /// automatically, so the user only needs to add the ETA.
-fn non_fixed_thetas_without_eta(model: &CompiledModel, theta_fixed: &[bool]) -> Vec<String> {
+pub(crate) fn non_fixed_thetas_without_eta(
+    model: &CompiledModel,
+    theta_fixed: &[bool],
+) -> Vec<String> {
     use std::collections::HashSet;
     let with_eta: HashSet<&str> = model
         .mu_refs

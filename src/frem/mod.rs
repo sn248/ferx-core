@@ -40,6 +40,9 @@ pub struct FremPrepareResult {
     pub covariate_variances: Vec<(String, f64)>,
     pub fremtype_map: Vec<(String, u16)>,
     pub n_total_etas: usize,
+    /// Advisory messages surfaced at conversion time (e.g. estimated parameters
+    /// without a random effect, which IMP/IMPMAP estimate poorly — see #406).
+    pub warnings: Vec<String>,
 }
 
 /// Information about how a categorical covariate is expanded into indicators.
@@ -795,6 +798,27 @@ pub fn prepare_frem(
 
     let n_total = base_model.n_eta + frem_info.covariate_names.len();
 
+    // Conversion-time advisory: estimated parameters with no random effect are
+    // estimated poorly by IMP/IMPMAP (the importance-weighted M-step is biased for
+    // weakly-identified fixed effects — see #406). Flag them now so the user can
+    // add an ETA before fitting; ferx mu-references automatically.
+    let mut warnings: Vec<String> = Vec::new();
+    let no_eta = crate::estimation::impmap::non_fixed_thetas_without_eta(
+        base_model,
+        &base_model.default_params.theta_fixed,
+    );
+    if !no_eta.is_empty() {
+        warnings.push(format!(
+            "FREM conversion: estimated parameter(s) [{}] have no associated ETA. When fitting \
+             this model with IMP/IMPMAP, a fixed-effect-only parameter is estimated solely through \
+             the importance-weighted M-step, which is biased for weakly-identified parameters and \
+             may converge to the wrong value. Add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with \
+             a small, optionally FIX, omega — ferx mu-references automatically), hold it FIX, or \
+             fit with FOCEI.",
+            no_eta.join(", ")
+        ));
+    }
+
     Ok(FremPrepareResult {
         model_path: out_model.to_path_buf(),
         data_path: out_data.to_path_buf(),
@@ -812,6 +836,7 @@ pub fn prepare_frem(
             .collect(),
         fremtype_map: frem_info.fremtype_map.clone(),
         n_total_etas: n_total,
+        warnings,
     })
 }
 

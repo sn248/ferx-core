@@ -235,7 +235,9 @@ section of the SDLC for the versioning policy).
   can converge to the wrong value (e.g. a FREM absorption fraction drifting to ~0.9
   vs a FOCEI/NONMEM value of ~0.4). The estimator now emits a strong warning naming
   such parameters and recommending an `ETA` be added (ferx mu-references
-  automatically), the parameter be held `FIX`, or FOCEI be used. (#406)
+  automatically), the parameter be held `FIX`, or FOCEI be used. `prepare_frem`
+  (`ferx_to_frem`) also surfaces this advisory at conversion time via a new
+  `FremPrepareResult.warnings` field, so it shows up before fitting. (#406)
 - **IMP/IMPMAP now Rao-Blackwellise FREM covariate ETAs**: the Gaussian covariate
   pseudo-observation ETAs are integrated analytically (conditional PK prior from
   the Ω precision blocks) and only the PK ETAs are importance-sampled. This turns

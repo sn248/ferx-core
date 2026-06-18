@@ -286,6 +286,13 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **FREM model generation dropped the `[scaling]` / `[odes]` blocks**: `prepare_frem`
+  now carries the base model's `[scaling]` (e.g. `obs_scale`) and `[odes]` blocks
+  into the generated FREM model. Previously they were silently omitted, so a base
+  model with `obs_scale` (NONMEM `CP = A*1000/V`) produced a FREM model whose
+  predictions were mis-scaled; the estimator then compensated by collapsing a PK
+  typical value (TVCL → ~1e-2 instead of ~7 on the workshop FREM model, now ~6.6
+  vs NONMEM 6.97). (#406)
 - **IMP/IMPMAP on high-dimensional FREM**: the inner EBE/MAP solver no longer
   returns a nonsensical joint mode on multi-scale FREM posteriors (3 PK + many
   covariate ETAs). The inner BFGS is now FREM-preconditioned (per-dimension

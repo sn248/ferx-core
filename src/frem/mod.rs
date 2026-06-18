@@ -534,6 +534,31 @@ pub fn generate_frem_model(
     }
     model.push('\n');
 
+    // ── Structural-companion blocks carried over verbatim ──
+    // [scaling] and [odes] describe the structural prediction and are NOT
+    // reconstructed elsewhere; dropping them silently changes the model the
+    // FREM run fits. Notably, omitting `[scaling] obs_scale` (e.g. NONMEM's
+    // `CP = A*1000/V`) rescales every prediction, which the estimator then
+    // compensates by collapsing a PK typical value (TVCL drove to ~1e-2 instead
+    // of ~7 on the workshop FREM model). Copy each block as-is when present.
+    for block_name in ["scaling", "odes"] {
+        if let Some(block_lines) = blocks.get(block_name) {
+            if block_lines
+                .iter()
+                .any(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+            {
+                model.push_str(&format!("[{}]\n", block_name));
+                for line in block_lines {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        model.push_str(&format!("  {}\n", trimmed));
+                    }
+                }
+                model.push('\n');
+            }
+        }
+    }
+
     // ── [error_model] block ──
     model.push_str("[error_model]\n");
     if let Some(err_lines) = blocks.get("error_model") {
@@ -1126,6 +1151,57 @@ mod tests {
             .filter(|s| !s.trim().is_empty())
             .count();
         assert_eq!(n_values, 10); // 4*(4+1)/2
+    }
+
+    #[test]
+    fn test_generate_frem_model_preserves_scaling_block() {
+        // Regression (#406): the base model's `[scaling] obs_scale` block must be
+        // carried into the generated FREM model. Dropping it rescales every
+        // prediction (here NONMEM's CP = A*1000/V), which the estimator then
+        // compensates by collapsing a PK typical value (TVCL → ~1e-2).
+        let base_text = r"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[scaling]
+  obs_scale = 0.001
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+        let pop = make_test_population();
+        let model = make_test_model();
+        let covs = vec!["WT".to_string()];
+        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
+
+        let model_text =
+            generate_frem_model(base_text, &model, &info, Path::new("test.csv")).unwrap();
+
+        assert!(
+            model_text.contains("[scaling]"),
+            "generated FREM model dropped the [scaling] block:\n{model_text}"
+        );
+        assert!(
+            model_text.contains("obs_scale = 0.001"),
+            "generated FREM model dropped obs_scale:\n{model_text}"
+        );
+        // The generated model must still parse (block placement is valid).
+        crate::parser::model_parser::parse_model_string(&model_text)
+            .expect("generated FREM model parses");
     }
 
     #[test]

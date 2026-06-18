@@ -206,6 +206,54 @@ fn frem_dataset_row_count() {
     assert_eq!(ft_200_count, 10, "should have 10 AGE pseudo-obs");
 }
 
+/// IMPMAP on a FREM model exercises the Rao-Blackwellised E-step
+/// (`subject_is_draws_frem_rb`): the covariate etas are integrated analytically
+/// and only the PK etas are importance-sampled (#406). A few iterations must
+/// produce a finite OFV, a 5x5 omega, and the covariate-omega cc-block ≈ the
+/// covariate sample covariance (which RB reconstructs exactly as `d dᵀ`).
+#[test]
+fn frem_impmap_rao_blackwell_runs_finite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = setup_frem(tmp.path());
+
+    let model = parse_model_file(&result.model_path).unwrap();
+    let pop = read_nonmem_csv(&result.data_path, None, None).unwrap();
+
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Impmap;
+    opts.impmap_iterations = 3; // fast — just exercise the RB E-step + M-step
+    opts.impmap_samples = 200;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+
+    let fit_result =
+        fit(&model, &pop, &model.default_params, &opts).expect("FREM IMPMAP fit should not error");
+
+    assert!(
+        fit_result.ofv.is_finite(),
+        "IMPMAP OFV should be finite, got {}",
+        fit_result.ofv
+    );
+    let omega = &fit_result.omega;
+    assert_eq!(omega.nrows(), 5);
+    assert_eq!(omega.ncols(), 5);
+    for i in 0..5 {
+        assert!(
+            omega[(i, i)] > 0.0 && omega[(i, i)].is_finite(),
+            "omega[{i},{i}] should be positive finite, got {}",
+            omega[(i, i)]
+        );
+    }
+    // Covariate cc-block ≈ sample covariance (WT var ≈ 111.6, AGE var ≈ 99.4);
+    // RB sets it from d dᵀ so it stays in the right ballpark even after 3 iters.
+    assert!(
+        omega[(3, 3)] > 50.0 && omega[(4, 4)] > 50.0,
+        "covariate omega diagonals should be near the sample variances, got {} / {}",
+        omega[(3, 3)],
+        omega[(4, 4)]
+    );
+}
+
 /// FREM fit completes (fast, 3 outer iterations) with finite OFV and correct omega size.
 #[test]
 fn frem_fit_completes_with_finite_ofv() {

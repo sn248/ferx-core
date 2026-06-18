@@ -304,6 +304,14 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **FREM covariate pseudo-observations are no longer clamped to a positive
+  prediction**: the observation likelihood clamped every prediction to `≥1e-12`,
+  but a FREM covariate pseudo-obs predicts a covariate *value* (centered,
+  standardized, or log-scale covariates are routinely `≤0`). Clamping a
+  non-positive covariate prediction fabricated a huge residual, which corrupted
+  the Rao-Blackwellised IS marginal/weights for affected subjects. Covariate rows
+  now keep their (possibly negative) prediction; ordinary PK rows keep the
+  positivity clamp. (#406)
 - **FREM model generation dropped the `[scaling]` / `[odes]` blocks**: `prepare_frem`
   now carries the base model's `[scaling]` (e.g. `obs_scale`) and `[odes]` blocks
   into the generated FREM model. Previously they were silently omitted, so a base

@@ -1230,6 +1230,55 @@ mod tests {
     }
 
     #[test]
+    fn obs_nll_does_not_clamp_negative_covariate_pseudo_obs() {
+        // Regression (#406): a FREM covariate pseudo-observation predicts a
+        // covariate *value* (TV+eta), which can be ≤ 0 for centered/standardized/
+        // log-scale covariates. obs_nll_subject_into must NOT clamp that prediction
+        // to 1e-12 (which would fabricate a huge residual and corrupt the
+        // Rao-Blackwellised IS marginal/weights). Here the covariate obs is -5.0
+        // and eta is chosen so the prediction is exactly -5.0 (residual 0), so the
+        // row must contribute only 0.5·ln(R). Without the fix the clamped
+        // prediction (1e-12) gives residual ≈ -5 and obs_nll ≈ 0.5·(25/R) ≈ 3.1e4.
+        let mut model = make_test_model();
+        let mut map = std::collections::HashMap::new();
+        map.insert(100u16, (0usize, 1usize)); // FREMTYPE 100 -> (theta TVCL idx 0, eta idx 1)
+        model.frem_config = Some(FremConfig {
+            fremtype_to_indices: map,
+            covariate_sigma_index: 0, // sigma[0] = 0.02 -> R = 4e-4
+        });
+
+        let mut subj = make_test_population().subjects.remove(0);
+        subj.obs_times = vec![1.0];
+        subj.obs_raw_times = vec![1.0];
+        subj.observations = vec![-5.0]; // negative covariate pseudo-obs
+        subj.obs_cmts = vec![1];
+        subj.cens = vec![0];
+        subj.fremtype = vec![100];
+
+        let theta = model.default_params.theta.clone(); // [0.2, 10.0, 1.5]
+                                                        // pred(cov row) = theta[0] + eta[1] = 0.2 + eta[1]; want -5.0 -> eta[1] = -5.2
+        let eta = vec![0.0, -5.2, 0.0];
+        let sigma = model.default_params.sigma.values.clone();
+        let mut scratch = crate::pk::EventPkParams::with_capacity_for(&subj);
+
+        let nll = crate::stats::likelihood::obs_nll_subject_into(
+            &model,
+            &subj,
+            &theta,
+            &sigma,
+            &eta,
+            &mut scratch,
+        );
+        assert!(nll.is_finite(), "obs_nll should be finite, got {nll}");
+        // R = 0.02² = 4e-4; with residual 0 the row contributes 0.5·ln(4e-4) ≈ -3.9.
+        assert!(
+            nll < 1.0,
+            "negative covariate pseudo-obs with residual 0 should give a small \
+             obs_nll (~-3.9), not the clamped ~3.1e4; got {nll}"
+        );
+    }
+
+    #[test]
     fn test_parse_blocks() {
         let content = "[parameters]\n  theta TVCL(0.2)\n\n[error_model]\n  DV ~ additive(ERR)\n";
         let blocks = parse_blocks(content).unwrap();

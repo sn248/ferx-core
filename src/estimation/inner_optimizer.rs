@@ -825,8 +825,8 @@ pub fn find_ebe(
     // these were rebuilt here, doubling the per-subject helper cost.
     // Inner half of the gradient-path policy ("gradient-based optimizers use
     // sensitivities, FD fallback"): an exact analytic ∂f/∂η Jacobian when the
-    // model is in the supported analytical 1-cpt scope, else `None` and we keep
-    // the AD/FD Jacobian below. Perf follow-up: skip building the FD Jacobian
+    // model is in the supported analytical PK scope (1-/2-/3-cpt), else `None`
+    // and we keep the AD/FD Jacobian below. Perf follow-up: skip building the FD Jacobian
     // when the analytic one is available — for this first landing it is computed
     // and then overridden, which keeps the diff minimal and trivially
     // revertible while the values come from the exact sensitivities.

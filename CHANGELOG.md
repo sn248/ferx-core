@@ -88,15 +88,21 @@ section of the SDLC for the versioning policy).
   subjects now route through the second-order-dual event-driven walk, with each
   event's PK-parameter derivatives evaluated at that event's covariate snapshot.
   The walk handles covariate breakpoints carried by EVID=2 records between
-  observations and combined with EVID 3/4 resets. The result is the standard
-  `(η, θ)` jet, so the exact θ/Ω/σ packed gradient (incl. the covariate
-  coefficients and the EBE response) is assembled unchanged. Validated against
-  reconverged finite differences (~1e-6 on every packed parameter, FOCEI and FOCE)
-  and end-to-end on a simulated WT-on-CL dataset. Requires a gradient-based outer
-  optimizer (`lbfgs`/`bfgs`/`slsqp`); the analytic *inner* EBE gradient still uses
-  finite differences for these subjects, and time-varying covariates combined with
-  steady-state dosing, lagtime, output scaling, or IOV fall back to finite
-  differences (#367).
+  observations, combined with EVID 3/4 resets, with **steady-state dosing** (each
+  occasion's SS state is equilibrated at the dose's covariate snapshot), with a
+  **constant `obs_scale` divisor**, and with **inter-occasion variability (IOV)**
+  (the covariate and κ both switch the individual parameters across occasions).
+  The result is the standard `(η, θ)` jet, so the exact θ/Ω/σ packed gradient
+  (incl. the covariate coefficients and the EBE response) is assembled unchanged.
+  Validated against reconverged finite differences (~1e-6 on every packed
+  parameter, FOCEI and FOCE), against finite differences of the production
+  predictor across 1-/2-/3-cpt (incl. SS, the constant scale, and the IOV+covariate
+  merge with an EVID=2 breakpoint), and end-to-end on a simulated WT-on-CL dataset.
+  Requires a gradient-based outer optimizer (`lbfgs`/`bfgs`/`slsqp`); the analytic
+  *inner* EBE gradient still uses finite differences for these subjects. Time-varying
+  covariates combined with **dose lagtime** or with **expression-based output
+  scaling** (`obs_scale = <expr>` referencing parameters/covariates) still fall back
+  to the finite-difference gradient (#367).
 - **Analytic FOCE/FOCEI outer gradient for inter-occasion variability (IOV)** on
   the analytical 1-/2-/3-compartment models. The exact closed-form marginal
   gradient now covers κ (kappa) random effects: the EBE response, inner Jacobian,

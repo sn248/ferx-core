@@ -26,7 +26,11 @@ Plus Ron's headline ask — a runtime analytic-vs-FD cross-check outside
 
 ## A. Blockers (must land before "ready for review")
 
-### A1. Validate the IOV + TV-covariate merge
+### A1. Validate the IOV + TV-covariate merge ✅ DONE
+Landed: `iov_tvcov_*` provider tests (1/2/3-cpt + EVID=2 breakpoint, vs FD of
+`predict_iov`) and `iov_tvcov_packed_gradient_matches_reconverged_fd` (FOCEI +
+FOCE outer, vs Richardson reconverged-FD). All green.
+
 The per-event seeding refactor in `subject_sensitivities_iov` / `run_obs_iov`
 landed this session (sources carry per-event `(pk, cd, group)`; `pk_only`/EVID=2
 events seed κ=0; non-TV path still caches one source per occasion group). All 60
@@ -40,7 +44,14 @@ the existing IOV harnesses:
 - These also cover the refactor's new `pk_only` handling on the **non-TV** IOV
   path (previously a hard bail).
 
-### A2. Changelog + docs consolidation (scope drift)
+### A2. Changelog + docs consolidation (scope drift) ✅ DONE
+Landed: CHANGELOG TV-cov entry now lists SS / constant `ScalarScale` / IOV as
+supported and narrows the fallback to lagtime + expression scaling; covariates.md
+fallback list updated; iov.md rewritten for the analytic IOV gradient (inner
+Jacobian, outer gradient, limitations); stale "1-cpt" comments fixed in
+`inner_optimizer.rs` + `outer_optimizer.rs`; consolidated FD-fallback matrix added
+above for follow-up PRs.
+
 - **CHANGELOG**: the TV-cov entry now also covers **SS** and constant
   **`ScalarScale`** — drop them from its fallback list (remaining fallbacks:
   dose lagtime, `ExpressionScale`/`PerCmt` scaling). Add an **IOV + TV-cov**
@@ -85,6 +96,29 @@ realized; it is now fixed in **both** copies with an independent test, so the
   is covered by the unit + outer tests; verify no diff line reads red.
 - **rustfmt**: pre-commit hook checks staged files; keep formatting churn scoped
   to touched files (don't whole-crate-fmt unrelated drift).
+
+## Remaining finite-difference fallbacks (follow-up PR surface)
+
+Canonical list of analytic-PK feature combinations that still route to the
+finite-difference outer gradient, so follow-up PRs have one place to pick from.
+Each is a *transparent* fallback: the fit still runs (correct estimates), only the
+gradient is numeric, so a gradient-based optimizer is slower / may stall on
+weakly-identified variance components. Mirrored in CHANGELOG (TV-cov + IOV entries)
+and `docs/src/model-file/covariates.md` / `iov.md`.
+
+| Combination | Status | Notes / where to start |
+|---|---|---|
+| TV-covariate **+ dose lagtime** | FD fallback | genuine gap; lagtime seeds a `−1` elapsed-time axis — needs per-event lag duals in the walk |
+| TV-covariate **+ expression `obs_scale`** (`obs_scale = f(θ,cov)`) | FD fallback | constant `ScalarScale` IS analytic; only the covariate/parameter-dependent expression scale on the TV-cov walk falls back |
+| **IOV + steady-state** doses | FD fallback | SS pre-equilibration not yet wired into the IOV stacked-κ walk |
+| **ODE** `[odes]` models (all) | FD fallback (gated off) | analytic infra built but `ODE_SENS_ENABLED = false`; see section C |
+| ODE + SS / lagtime / input-rate / SDE / `obs_scale`/LTBS / IOV / TV-cov | FD fallback | out of the `ode_analytical_supported` scope even once ODE is re-armed |
+| Any model under **derivative-free BOBYQA** (default) | no gradient used | analytic path only runs under `lbfgs`/`bfgs`/`slsqp` |
+
+Now analytic (no longer fallbacks, this PR): TV-cov alone, TV-cov + SS, TV-cov +
+constant `ScalarScale`, TV-cov + EVID 3/4 resets, TV-cov + IOV, IOV alone (FOCEI
+**and** FOCE), IOV + resets, lagtime alone, expression `obs_scale` alone, LTBS,
+overlapping SS infusions.
 
 ## C. Stretch (separate decision): ODE eta sensitivities
 

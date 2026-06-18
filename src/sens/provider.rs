@@ -3736,4 +3736,218 @@ mod tests {
             &[0.12, -0.08, 0.20, 0.05, -0.10],
         );
     }
+
+    // ── IOV combined with time-varying covariates ────────────────────────
+    //
+    // These models carry BOTH a kappa (IOV) and a WT-on-CL covariate that varies
+    // within the subject. Each event's PK-param duals must be seeded at that
+    // event's covariate snapshot *and* at the right occasion's κ — the per-event
+    // `sources` refactor in `subject_sensitivities_iov`. The FD reference is the
+    // production `predict_iov`, which already seeds per-event covariates, so the
+    // check validates the merged (η_bsv, κ, θ, WT) chain end to end.
+
+    const WARFARIN_IOV_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    const WARFARIN_IOV_TVCOV_2CPT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 50.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v=V, q=Q, v2=V2, ka=KA)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    const WARFARIN_IOV_TVCOV_3CPT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ2(0.5, 0.001, 50.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVQ3(0.3, 0.001, 50.0)
+  theta TVV3(50.0, 0.1, 1000.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  Q  = TVQ2
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk three_cpt_oral(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3, ka=KA)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// Two-occasion IOV subject with a WT covariate that varies across records
+    /// (occasion-1 doses/obs at a lighter weight, occasion-2 heavier), so the
+    /// individual `CL` switches both by κ (occasion) and by WT (covariate). When
+    /// `pk_only` is set, an EVID=2 covariate breakpoint (WT jump at t=18, no
+    /// occasion) sits between the occasion-2 observations — exercising the κ=0
+    /// `pk_only` source on the IOV+TV-cov path.
+    fn iov_tvcov_subject(pk_only: bool) -> Subject {
+        let obs_times = vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0];
+        let occasions = vec![1u32, 1, 1, 2, 2, 2];
+        let obs_wts = [70.0, 72.0, 78.0, 88.0, 90.0, 95.0];
+        let n = obs_times.len();
+        let (pk_only_times, pk_only_covariates) = if pk_only {
+            (vec![18.0], vec![wt_map(85.0)])
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Subject {
+            id: "1".to_string(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; n],
+            obs_cmts: vec![1; n],
+            covariates: wt_map(70.0),
+            dose_covariates: vec![wt_map(70.0), wt_map(85.0)],
+            obs_covariates: obs_wts.iter().map(|&w| wt_map(w)).collect(),
+            pk_only_times,
+            pk_only_covariates,
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions,
+            dose_occasions: vec![1, 2],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    /// 1-cpt oral IOV **+ WT-on-CL time-varying covariate**: the provider's
+    /// value/grad/Hessian over `[η_bsv, κ_g0, κ_g1]` + θ (now including `THETA_WT`)
+    /// must match FD of `predict_iov`, which seeds each event at its own covariate
+    /// snapshot and occasion κ. Validates the per-event `sources` merge.
+    #[test]
+    fn iov_tvcov_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_TVCOV).expect("parse warfarin IOV+TVcov");
+        assert_eq!(model.n_kappa, 1);
+        assert!(iov_analytical_supported(&model));
+        let subject = iov_tvcov_subject(false);
+        assert!(subject.has_tv_covariates(), "fixture must carry TV cov");
+        // θ = [TVCL, TVV, TVKA, THETA_WT]; stacked = [η_cl, η_v, η_ka, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.5, 0.75],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// 1-cpt oral IOV + TV-cov **with an EVID=2 covariate breakpoint**: a WT jump
+    /// carried by a `pk_only` record (no occasion → κ fixed at 0) between the
+    /// occasion-2 observations. Exercises the new `pk_only` source on the IOV path,
+    /// which the previous code bailed out of.
+    #[test]
+    fn iov_tvcov_pkonly_breakpoint_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_TVCOV).expect("parse warfarin IOV+TVcov");
+        let subject = iov_tvcov_subject(true);
+        assert!(
+            !subject.pk_only_times.is_empty(),
+            "fixture must carry EVID=2"
+        );
+        assert!(subject.has_tv_covariates(), "fixture must carry TV cov");
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.5, 0.75],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// 2-cpt oral IOV + WT-on-CL TV covariate: same FD check through the generic
+    /// 2-cpt event-driven sensitivity walk under per-event covariate seeding.
+    #[test]
+    fn iov_tvcov_2cpt_matches_fd_of_predict_iov() {
+        let model =
+            parse_model_string(WARFARIN_IOV_TVCOV_2CPT).expect("parse 2cpt warfarin IOV+TVcov");
+        assert_eq!(model.n_kappa, 1);
+        let subject = iov_tvcov_subject(false);
+        // θ = [TVCL, TVV, TVQ, TVV2, TVKA, THETA_WT].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.5, 20.0, 1.5, 0.75],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// 3-cpt oral IOV + WT-on-CL TV covariate: same FD check through the generic
+    /// 3-cpt eigenmode walk (widest dual on the IOV+TV-cov path).
+    #[test]
+    fn iov_tvcov_3cpt_matches_fd_of_predict_iov() {
+        let model =
+            parse_model_string(WARFARIN_IOV_TVCOV_3CPT).expect("parse 3cpt warfarin IOV+TVcov");
+        assert_eq!(model.n_kappa, 1);
+        let subject = iov_tvcov_subject(false);
+        // θ = [TVCL, TVV, TVQ2, TVV2, TVQ3, TVV3, TVKA, THETA_WT].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.5, 20.0, 0.3, 50.0, 1.5, 0.75],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
 }

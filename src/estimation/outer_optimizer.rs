@@ -1982,8 +1982,8 @@ fn population_gradient(
     // `sens` provider): the exact marginal FOCEI gradient including the Eq. 46
     // EBE response on every θ/Ω/σ block — no fixed-EBE bias, no FD noise, so it
     // supersedes both branches below where it applies. Gated to the supported
-    // analytical 1-cpt scope; `population_gradient_sens` returns `None` (→ the
-    // existing FD/Laplace path) if any subject is outside provider scope.
+    // analytical PK scope (1-/2-/3-cpt); `population_gradient_sens` returns `None`
+    // (→ the existing FD/Laplace path) if any subject is outside provider scope.
     // FOCEI uses the Almquist Laplace marginal (R at f(η̂), ½c̃ᵀc̃ in H̃); plain
     // FOCE uses the Sheiner–Beal linearized marginal (R̃ = JΩJᵀ + R⁰). Both have
     // exact closed-form gradients here, sharing the same EBE/inner-Hessian core.
@@ -1995,13 +1995,11 @@ fn population_gradient(
     // numeric fallback remains available if the analytic gradient is ever
     // suspect, and the setting is honoured rather than silently ignored.
     // IOV-analytical models route to the dedicated stacked-η / block-Ω assembly
-    // (FOCEI only for now; non-interaction IOV falls back to FD). Their gradient
+    // (both FOCEI and FOCE — see the interaction branch below). Their gradient
     // needs the per-occasion κ̂ alongside the BSV EBEs, so it is dispatched
     // separately from the non-IOV `sens_supported` path.
     let iov_analytic = crate::sens::provider::iov_analytical_supported(model);
-    if !force_reconverge
-        && (crate::sens::provider::sens_supported(model) || iov_analytic)
-    {
+    if !force_reconverge && (crate::sens::provider::sens_supported(model) || iov_analytic) {
         let g = if iov_analytic {
             if options.interaction {
                 crate::estimation::sens_outer_gradient::population_gradient_sens_iov(

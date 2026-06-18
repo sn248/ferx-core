@@ -84,11 +84,15 @@ that carries the amounts across each covariate change. Under a **gradient-based
 outer optimizer** (`lbfgs`, `bfgs`, or `slsqp`) these subjects also drive the
 **exact analytic FOCE/FOCEI gradient** (each event's parameter derivatives are
 taken at that event's covariate snapshot), rather than falling back to finite
-differences. Covariate changes carried by EVID=2 records between observations, and
-combined with EVID 3/4 resets, are supported. Time-varying covariates combined
-with steady-state dosing, dose lagtime, output scaling, or IOV currently fall back
-to the finite-difference gradient. (See [FOCE/FOCEI](../estimation/foce.md) for
-the optimizer/gradient interaction.)
+differences. Covariate changes carried by EVID=2 records between observations are
+supported, as are combinations with EVID 3/4 resets, **steady-state dosing**, a
+**constant `obs_scale` divisor**, and **inter-occasion variability (IOV)** (the
+covariate and κ both switch the individual parameters across occasions). Two
+combinations still fall back to the finite-difference gradient: time-varying
+covariates with **dose lagtime**, and time-varying covariates with
+**expression-based output scaling** (`obs_scale = <expr>` that references
+parameters or covariates). (See [FOCE/FOCEI](../estimation/foce.md) for the
+optimizer/gradient interaction.)
 
 ## Covariate table
 

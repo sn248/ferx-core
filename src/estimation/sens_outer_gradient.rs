@@ -3272,4 +3272,135 @@ mod tests {
             }
         }
     }
+
+    // --- IOV combined with a time-varying covariate ---
+
+    /// IOV model that *also* carries a WT-on-CL covariate (`THETA_WT`), so a
+    /// subject whose WT varies across records switches `CL` by both κ (occasion)
+    /// and WT (covariate). θ = [TVCL, TVV, TVKA, THETA_WT].
+    const WARFARIN_IOV_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// Two-occasion IOV subject carrying a WT covariate that varies across records
+    /// (lighter in occasion 1, heavier in occasion 2, plus an EVID=2 breakpoint at
+    /// t=18). Observations are synthesised through `predict_iov` (which seeds each
+    /// event at its own covariate) so residuals are realistic on the merged path.
+    fn iov_tvcov_subject_outer(model: &CompiledModel, theta: &[f64]) -> Subject {
+        let obs_times = vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0];
+        let occasions = vec![1u32, 1, 1, 2, 2, 2];
+        let obs_wts = [70.0, 72.0, 78.0, 88.0, 90.0, 95.0];
+        let n = obs_times.len();
+        let mut wt_map = |w: f64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("WT".to_string(), w);
+            m
+        };
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: wt_map(70.0),
+            dose_covariates: vec![wt_map(70.0), wt_map(85.0)],
+            obs_covariates: obs_wts.iter().map(|&w| wt_map(w)).collect(),
+            pk_only_times: vec![18.0],
+            pk_only_covariates: vec![wt_map(85.0)],
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions,
+            dose_occasions: vec![1, 2],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let preds = crate::pk::predict_iov(
+            model,
+            &subject,
+            theta,
+            &[0.12, -0.08, 0.2],
+            &[vec![0.05], vec![-0.07]],
+        );
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        subject
+    }
+
+    /// The full analytic IOV+TV-cov **packed** gradient — FOCEI **and** FOCE — must
+    /// match the Richardson reconverged FD of the production IOV marginal over every
+    /// packed coordinate (θ incl. `THETA_WT`, Ω_bsv, σ, Ω_iov). Closes the merged
+    /// IOV × time-varying-covariate path end to end against the same `predict_iov`-
+    /// grounded objective the non-TV IOV tests use.
+    #[test]
+    fn iov_tvcov_packed_gradient_matches_reconverged_fd() {
+        let model = parse_model_string(WARFARIN_IOV_TVCOV).expect("parse warfarin IOV+TVcov");
+        let theta = vec![0.22, 11.0, 1.4, 0.7];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_tvcov_subject_outer(&model, &theta);
+        assert!(subject.has_tv_covariates(), "fixture must carry TV cov");
+        let template = params.clone();
+        let x = crate::estimation::parameterization::pack_params(&params);
+
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+
+        for interaction in [true, false] {
+            let analytic = if interaction {
+                subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+            } else {
+                subject_packed_gradient_foce_iov(&model, &subject, &template, &x, &stacked)
+            }
+            .expect("IOV+TVcov packed gradient supported");
+
+            let f = |xx: &[f64]| -> f64 {
+                let p = unpack_params(xx, &template);
+                marginal_nll_iov_inter(&model, &subject, &p, interaction)
+            };
+            for i in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[i].abs());
+                let fd_at = |hh: f64| -> f64 {
+                    let mut xp = x.clone();
+                    xp[i] += hh;
+                    let mut xm = x.clone();
+                    xm[i] -= hh;
+                    (f(&xp) - f(&xm)) / (2.0 * hh)
+                };
+                let f1 = fd_at(h);
+                let f2 = fd_at(h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+                eprintln!(
+                    "iov tvcov interaction={interaction} x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                    analytic[i],
+                    fd,
+                    (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+                );
+                approx::assert_relative_eq!(analytic[i], fd, max_relative = 2e-3, epsilon = 2e-5);
+            }
+        }
+    }
 }

@@ -20,6 +20,7 @@ pub mod num;
 pub mod ode_provider;
 pub mod one_cpt;
 pub mod one_cpt_explicit;
+pub mod propagate;
 pub mod provider;
 pub mod three_cpt;
 pub mod three_cpt_explicit;

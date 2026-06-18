@@ -806,7 +806,7 @@ fn propagate_with_bounds(
 
 /// 1-cpt linear propagator with constant input `rate` into central:
 ///   A(t+dt) = exp(-ke·dt)·A(t) + (rate/ke)·(1 - exp(-ke·dt))
-fn propagate_one_cpt(state: &mut [f64], dt: f64, pk: &PkParams, rate: f64) {
+pub(crate) fn propagate_one_cpt(state: &mut [f64], dt: f64, pk: &PkParams, rate: f64) {
     let cl = pk.cl();
     let v = pk.v();
     if v <= 0.0 || cl <= 0.0 {
@@ -895,7 +895,7 @@ fn propagate_two_cpt(
 /// the dose-event handler adds to state[0] (depot); during propagation
 /// the depot drains into the central compartment via the absorption
 /// rate `ka`.
-fn propagate_one_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
+pub(crate) fn propagate_one_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams) {
     let cl = pk.cl();
     let v = pk.v();
     let ka = pk.ka();

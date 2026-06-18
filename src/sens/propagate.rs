@@ -19,7 +19,7 @@
 
 use super::num::PkNum;
 use crate::pk::event_driven::{Event, EventKind, EventSchedule};
-use crate::types::{DoseEvent, Subject};
+use crate::types::{DoseEvent, PkModel, Subject};
 
 /// 1-cpt IV/central propagator: evolve `state[0]` (central amount) over `dt` with
 /// a constant input `rate` into the central compartment. Mirror of
@@ -81,27 +81,198 @@ pub fn propagate_one_cpt_oral_g<T: PkNum>(state: &mut [T], dt: f64, cl: T, v: T,
 // how they were seeded, which keeps it testable in isolation against FD of the
 // `f64` production walk.
 
-/// Per-event 1-cpt PK params for the generic walk. `ka` is unused for IV models.
+/// 2-cpt IV/central propagator: evolve `state = [A_central, A_periph]` over `dt`
+/// with constant inputs `rate_central` / `rate_periph`. Generic mirror of
+/// [`crate::pk::event_driven::propagate_two_cpt`] (eigen-decomposition of the rate
+/// matrix; `α, β` from [`crate::sens::two_cpt::macro_rates_g`]).
+#[allow(clippy::too_many_arguments)]
+pub fn propagate_two_cpt_g<T: PkNum>(
+    state: &mut [T],
+    dt: f64,
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    rate_central: T,
+    rate_periph: T,
+) {
+    if v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || q.val() <= 0.0 {
+        return;
+    }
+    let (alpha, beta, k21) = crate::sens::two_cpt::macro_rates_g(cl, v1, q, v2);
+    let k10 = cl / v1;
+    let k12 = q / v1;
+    let dtt = T::from_f64(dt);
+
+    let denom_ss = k21 * k10;
+    let (a_ss_1, a_ss_2) = if denom_ss.val() > 1e-30 {
+        (
+            (k21 * rate_central + k21 * rate_periph) / denom_ss,
+            (k12 * rate_central + (k10 + k12) * rate_periph) / denom_ss,
+        )
+    } else {
+        (T::from_f64(0.0), T::from_f64(0.0))
+    };
+
+    let h1_0 = state[0] - a_ss_1;
+    let h2_0 = state[1] - a_ss_2;
+
+    let denom = beta - alpha;
+    let (c1, c2) = if k12.val().abs() < 1e-30 {
+        (T::from_f64(0.0), T::from_f64(0.0))
+    } else if denom.val().abs() < 1e-30 {
+        let s_homog = h2_0 / k12;
+        (s_homog * T::from_f64(0.5), s_homog * T::from_f64(0.5))
+    } else {
+        let s_homog = h2_0 / k12;
+        let c1 = (h1_0 - s_homog * (k21 - beta)) / denom;
+        let c2 = s_homog - c1;
+        (c1, c2)
+    };
+
+    let e_alpha = (-(alpha * dtt)).exp();
+    let e_beta = (-(beta * dtt)).exp();
+    let h1_dt = c1 * (k21 - alpha) * e_alpha + c2 * (k21 - beta) * e_beta;
+    let h2_dt = (c1 * e_alpha + c2 * e_beta) * k12;
+
+    state[0] = h1_dt + a_ss_1;
+    state[1] = h2_dt + a_ss_2;
+}
+
+/// 2-cpt oral propagator: `state = [A_depot, A_central, A_periph]` (bolus only —
+/// the depot drains into central at `ka`). Generic mirror of
+/// [`crate::pk::event_driven::propagate_two_cpt_oral`].
+pub fn propagate_two_cpt_oral_g<T: PkNum>(state: &mut [T], dt: f64, cl: T, v1: T, q: T, v2: T, ka: T) {
+    if v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || q.val() <= 0.0 || ka.val() <= 0.0 {
+        return;
+    }
+    let (alpha, beta, k21) = crate::sens::two_cpt::macro_rates_g(cl, v1, q, v2);
+    let k12 = q / v1;
+    let dtt = T::from_f64(dt);
+
+    let a_d_0 = state[0];
+    let a_c_0 = state[1];
+    let a_p_0 = state[2];
+
+    let e_ka = (-(ka * dtt)).exp();
+    let e_alpha = (-(alpha * dtt)).exp();
+    let e_beta = (-(beta * dtt)).exp();
+
+    state[0] = a_d_0 * e_ka;
+
+    let denom_depot = (ka - alpha) * (ka - beta);
+    let (cap_a, cap_b) = if denom_depot.val().abs() < 1e-12 {
+        (T::from_f64(0.0), T::from_f64(0.0))
+    } else {
+        let a = ka * a_d_0 * (k21 - ka) / denom_depot;
+        let b = ka * a_d_0 * k12 / denom_depot;
+        (a, b)
+    };
+
+    let h_c_0 = a_c_0 - cap_a;
+    let h_p_0 = a_p_0 - cap_b;
+
+    let denom = beta - alpha;
+    let (c1, c2) = if k12.val().abs() < 1e-30 || denom.val().abs() < 1e-30 {
+        let kk = if k12.val().abs() < 1e-30 {
+            T::from_f64(1e-30)
+        } else {
+            k12
+        };
+        let s_homog = h_p_0 / kk;
+        (s_homog * T::from_f64(0.5), s_homog * T::from_f64(0.5))
+    } else {
+        let s_homog = h_p_0 / k12;
+        let c1 = (h_c_0 - s_homog * (k21 - beta)) / denom;
+        let c2 = s_homog - c1;
+        (c1, c2)
+    };
+
+    let h_c_dt = c1 * (k21 - alpha) * e_alpha + c2 * (k21 - beta) * e_beta;
+    let h_p_dt = (c1 * e_alpha + c2 * e_beta) * k12;
+
+    state[1] = h_c_dt + cap_a * e_ka;
+    state[2] = h_p_dt + cap_b * e_ka;
+}
+
+/// Per-event PK params for the generic walk, carrying every disposition slot the
+/// 1-/2-cpt propagators read (3-cpt slots `q3`/`v3` are reserved for the upcoming
+/// extension). Unused slots for a given model are simply ignored.
+#[derive(Clone, Copy)]
+pub struct PkDual<T: PkNum> {
+    pub cl: T,
+    pub v: T,
+    pub q: T,
+    pub v2: T,
+    pub ka: T,
+    pub q3: T,
+    pub v3: T,
+    /// Bioavailability `F` (multiplies bolus amount and infusion rate).
+    pub f: T,
+}
+
+/// Back-compat 1-cpt view — kept so the focused 1-cpt propagator tests and any
+/// 1-cpt caller stay terse. Converts to [`PkDual`] for the shared walk.
 #[derive(Clone, Copy)]
 pub struct OneCptPk<T: PkNum> {
     pub cl: T,
     pub v: T,
     pub ka: T,
-    /// Bioavailability `F` (multiplies bolus amount and infusion rate).
     pub f: T,
+}
+
+impl<T: PkNum> OneCptPk<T> {
+    fn to_pk_dual(self) -> PkDual<T> {
+        PkDual {
+            cl: self.cl,
+            v: self.v,
+            q: T::from_f64(0.0),
+            v2: T::from_f64(0.0),
+            ka: self.ka,
+            q3: T::from_f64(0.0),
+            v3: T::from_f64(0.0),
+            f: self.f,
+        }
+    }
 }
 
 /// Cycles to expand for SS equilibration — mirrors
 /// `event_driven::EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES` (kept private there).
 const SS_EQUILIBRATION_CYCLES: usize = 50;
 
+/// State-vector dimension and central-compartment read-out slot for a `pk_model`.
+/// Mirrors `event_driven::state_layout` (kept private there). 3-cpt rows are
+/// included for the forthcoming extension; the walk currently propagates 1-/2-cpt.
+#[inline]
+fn state_layout_g(pk_model: PkModel) -> (usize, usize) {
+    match pk_model {
+        PkModel::OneCptIv => (1, 0),
+        PkModel::OneCptOral => (2, 1),
+        PkModel::TwoCptIv => (2, 0),
+        PkModel::TwoCptOral => (3, 1),
+        PkModel::ThreeCptIv => (3, 0),
+        PkModel::ThreeCptOral => (4, 1),
+    }
+}
+
+/// True when the generic walk implements this model. 3-cpt is gated off until its
+/// propagators land; callers (`subject_sensitivities_iov`) screen earlier, this is
+/// the defensive backstop.
+#[inline]
+fn walk_supports(pk_model: PkModel) -> bool {
+    matches!(
+        pk_model,
+        PkModel::OneCptIv | PkModel::OneCptOral | PkModel::TwoCptIv | PkModel::TwoCptOral
+    )
+}
+
 #[inline]
 fn pk_for_g<T: PkNum>(
     ev: Event,
-    pk_at_dose: &[OneCptPk<T>],
-    pk_at_obs: &[OneCptPk<T>],
-    pk_at_pk_only: &[OneCptPk<T>],
-) -> OneCptPk<T> {
+    pk_at_dose: &[PkDual<T>],
+    pk_at_obs: &[PkDual<T>],
+    pk_at_pk_only: &[PkDual<T>],
+) -> PkDual<T> {
     match ev.kind {
         EventKind::Dose => pk_at_dose[ev.orig_idx],
         EventKind::Obs => pk_at_obs[ev.orig_idx],
@@ -110,31 +281,30 @@ fn pk_for_g<T: PkNum>(
     }
 }
 
-/// Propagate the dual 1-cpt state across pre-built sub-event bounds (the
-/// `EventSchedule` sub-interval boundaries), applying any active central
-/// infusion per sub-interval. Generic mirror of
-/// `event_driven::propagate_with_bounds` restricted to the 1-cpt models.
-fn propagate_one_cpt_bounds_g<T: PkNum>(
+/// Propagate the dual state across pre-built sub-event bounds, applying any active
+/// infusion per sub-interval (central / peripheral-1, per the production
+/// model→cmt map). Generic mirror of `event_driven::propagate_with_bounds` for the
+/// 1-/2-cpt models.
+fn propagate_bounds_g<T: PkNum>(
     state: &mut [T],
     bounds: &[f64],
-    pk: &OneCptPk<T>,
-    oral: bool,
+    pk: &PkDual<T>,
+    pk_model: PkModel,
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
     reset_floor: f64,
 ) {
+    let oral = matches!(pk_model, PkModel::OneCptOral | PkModel::TwoCptOral);
     for w in bounds.windows(2) {
         let dt = w[1] - w[0];
         if dt <= 0.0 {
             continue;
         }
         let mid = 0.5 * (w[0] + w[1]);
-        // Active central-infusion rate (F·rate). Only inputs into the central
-        // compartment are summed — IV cmt 1, oral cmt 2; this matches the
-        // production 1-cpt match arms. (The oral propagator ignores `rate`, as
-        // production's `propagate_one_cpt_oral` does, so an oral central infusion
-        // is a no-op here too — a deliberate parity choice, not a new gap.)
+        // Active infusion rates (F·rate) into central / peripheral-1, summed per
+        // the production model→cmt arms.
         let mut rate_central = T::from_f64(0.0);
+        let mut rate_periph1 = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
             let t_start = d.time + lag;
@@ -143,27 +313,46 @@ fn propagate_one_cpt_bounds_g<T: PkNum>(
                 continue;
             }
             if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
-                let into_central = (!oral && d.cmt == 1) || (oral && d.cmt == 2);
-                if into_central {
-                    rate_central = rate_central + pk.f * T::from_f64(d.rate);
+                let r = pk.f * T::from_f64(d.rate);
+                match (pk_model, d.cmt) {
+                    (PkModel::OneCptIv, 1) => rate_central = rate_central + r,
+                    (PkModel::OneCptOral, 2) => rate_central = rate_central + r,
+                    (PkModel::TwoCptIv, 1) => rate_central = rate_central + r,
+                    (PkModel::TwoCptIv, 2) => rate_periph1 = rate_periph1 + r,
+                    (PkModel::TwoCptOral, 2) => rate_central = rate_central + r,
+                    _ => {}
                 }
             }
         }
-        if oral {
-            propagate_one_cpt_oral_g(state, dt, pk.cl, pk.v, pk.ka);
-        } else {
-            propagate_one_cpt_g(state, dt, pk.cl, pk.v, rate_central);
+        match pk_model {
+            PkModel::OneCptIv => propagate_one_cpt_g(state, dt, pk.cl, pk.v, rate_central),
+            PkModel::OneCptOral => propagate_one_cpt_oral_g(state, dt, pk.cl, pk.v, pk.ka),
+            PkModel::TwoCptIv => propagate_two_cpt_g(
+                state,
+                dt,
+                pk.cl,
+                pk.v,
+                pk.q,
+                pk.v2,
+                rate_central,
+                rate_periph1,
+            ),
+            PkModel::TwoCptOral => {
+                propagate_two_cpt_oral_g(state, dt, pk.cl, pk.v, pk.q, pk.v2, pk.ka)
+            }
+            // Screened by `walk_supports`; never reached.
+            PkModel::ThreeCptIv | PkModel::ThreeCptOral => {}
         }
     }
 }
 
-/// Equilibrate the dual 1-cpt state to its SS value for an SS=1 dose, per-event
-/// (uses `pk`, the dose-event's params). Generic mirror of
-/// `event_driven::equilibrate_ss_state_event_driven` for the 1-cpt models;
+/// Equilibrate the dual state to its SS value for an SS=1 dose, per-event (uses
+/// `pk`, the dose-event's params). Generic mirror of
+/// `event_driven::equilibrate_ss_state_event_driven` for the 1-/2-cpt models;
 /// overlapping SS infusions (`T_inf > II`) return the empty state, matching
 /// production's reject.
-fn equilibrate_ss_one_cpt_g<T: PkNum>(oral: bool, pk: &OneCptPk<T>, dose: &DoseEvent) -> Vec<T> {
-    let n_states = if oral { 2 } else { 1 };
+fn equilibrate_ss_g<T: PkNum>(pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEvent) -> Vec<T> {
+    let (n_states, _) = state_layout_g(pk_model);
     let mut state = vec![T::from_f64(0.0); n_states];
     if dose.ii <= 0.0 || dose.cmt == 0 {
         return state;
@@ -191,11 +380,11 @@ fn equilibrate_ss_one_cpt_g<T: PkNum>(oral: bool, pk: &OneCptPk<T>, dose: &DoseE
         if !is_inf {
             state[cmt_idx] = state[cmt_idx] + pk.f * T::from_f64(dose.amt);
         }
-        propagate_one_cpt_bounds_g(
+        propagate_bounds_g(
             &mut state,
             &bounds,
             pk,
-            oral,
+            pk_model,
             &synthetic_dose,
             &synthetic_lag,
             f64::NEG_INFINITY,
@@ -204,35 +393,35 @@ fn equilibrate_ss_one_cpt_g<T: PkNum>(oral: bool, pk: &OneCptPk<T>, dose: &DoseE
     state
 }
 
-/// Event-driven 1-cpt **sensitivity** walk: returns the dual concentration at
-/// every observation, parallel to `subject.obs_times`. The `Dual2`-differentiable
-/// mirror of `event_driven::event_driven_predictions_with_schedule_impl` for
-/// `OneCptIv` (`oral = false`) and `OneCptOral` (`oral = true`).
+/// Event-driven **sensitivity** walk for the 1-/2-cpt models: returns the dual
+/// concentration at every observation, parallel to `subject.obs_times`. The
+/// `Dual2`-differentiable mirror of
+/// `event_driven::event_driven_predictions_with_schedule_impl`.
 ///
 /// `pk_at_dose` / `pk_at_obs` / `pk_at_pk_only` are the **per-event** PK params,
 /// already seeded as `T` (parallel to `subject.doses` / `obs_times` /
 /// `pk_only_times`). The walk carries dual amounts across boundaries and switches
 /// to each event's params, so IOV / time-varying covariates are exact; SS doses
-/// equilibrate per-event. Resets (EVID 3/4) zero the dual state; central infusion
-/// is applied through the bounds.
+/// equilibrate per-event. Resets (EVID 3/4) zero the dual state; infusions are
+/// applied through the bounds.
 ///
 /// The `f64` instantiation reproduces the production walk bit-for-bit (one source
 /// of truth); the `Dual2` instantiation yields exact `∂(conc)/∂(seeded axes)` and
 /// second order.
-pub fn event_driven_sens_one_cpt_g<T: PkNum>(
-    oral: bool,
+pub fn event_driven_sens_g<T: PkNum>(
+    pk_model: PkModel,
     subject: &Subject,
     schedule: &EventSchedule,
-    pk_at_dose: &[OneCptPk<T>],
-    pk_at_obs: &[OneCptPk<T>],
-    pk_at_pk_only: &[OneCptPk<T>],
+    pk_at_dose: &[PkDual<T>],
+    pk_at_obs: &[PkDual<T>],
+    pk_at_pk_only: &[PkDual<T>],
 ) -> Vec<T> {
     let n_obs = subject.obs_times.len();
     let mut preds = vec![T::from_f64(0.0); n_obs];
-    if n_obs == 0 || schedule.events.is_empty() {
+    if n_obs == 0 || schedule.events.is_empty() || !walk_supports(pk_model) {
         return preds;
     }
-    let (n_states, central_slot) = if oral { (2, 1) } else { (1, 0) };
+    let (n_states, central_slot) = state_layout_g(pk_model);
 
     let mut state = vec![T::from_f64(0.0); n_states];
     let mut cur_t = schedule.events[0].time;
@@ -249,11 +438,11 @@ pub fn event_driven_sens_one_cpt_g<T: PkNum>(
 
         if ev.time > cur_t {
             let bounds = &schedule.bounds_per_interval[i - 1];
-            propagate_one_cpt_bounds_g(
+            propagate_bounds_g(
                 &mut state,
                 bounds,
                 &pk_now,
-                oral,
+                pk_model,
                 &subject.doses,
                 &schedule.dose_lagtimes,
                 reset_floor,
@@ -265,7 +454,7 @@ pub fn event_driven_sens_one_cpt_g<T: PkNum>(
             EventKind::Dose => {
                 let d = &subject.doses[ev.orig_idx];
                 if d.ss && d.ii > 0.0 {
-                    state = equilibrate_ss_one_cpt_g(oral, &pk_now, d);
+                    state = equilibrate_ss_g(pk_model, &pk_now, d);
                 }
                 if d.rate <= 0.0 {
                     let cmt_idx = d.cmt.saturating_sub(1);
@@ -295,6 +484,28 @@ pub fn event_driven_sens_one_cpt_g<T: PkNum>(
     }
 
     preds
+}
+
+/// 1-cpt convenience wrapper around [`event_driven_sens_g`] (maps `oral` to the
+/// `PkModel` and lifts [`OneCptPk`] to [`PkDual`]). Kept for the focused 1-cpt
+/// tests and terse 1-cpt callers.
+pub fn event_driven_sens_one_cpt_g<T: PkNum>(
+    oral: bool,
+    subject: &Subject,
+    schedule: &EventSchedule,
+    pk_at_dose: &[OneCptPk<T>],
+    pk_at_obs: &[OneCptPk<T>],
+    pk_at_pk_only: &[OneCptPk<T>],
+) -> Vec<T> {
+    let pk_model = if oral {
+        PkModel::OneCptOral
+    } else {
+        PkModel::OneCptIv
+    };
+    let dose: Vec<PkDual<T>> = pk_at_dose.iter().map(|p| p.to_pk_dual()).collect();
+    let obs: Vec<PkDual<T>> = pk_at_obs.iter().map(|p| p.to_pk_dual()).collect();
+    let only: Vec<PkDual<T>> = pk_at_pk_only.iter().map(|p| p.to_pk_dual()).collect();
+    event_driven_sens_g(pk_model, subject, schedule, &dose, &obs, &only)
 }
 
 #[cfg(test)]
@@ -539,6 +750,131 @@ mod tests {
             for (j, (&p, &w)) in prod.iter().zip(walk.iter()).enumerate() {
                 approx::assert_relative_eq!(w, p, max_relative = 1e-12, epsilon = 1e-12);
                 assert!(p >= 0.0, "case {ci} obs {j}: production conc negative");
+            }
+        }
+    }
+
+    fn pk_2cpt(cl: f64, v1: f64, q: f64, v2: f64, ka: f64) -> PkParams {
+        let mut p = PkParams::default();
+        p.values[PK_IDX_CL] = cl;
+        p.values[PK_IDX_V] = v1;
+        p.values[crate::types::PK_IDX_Q] = q;
+        p.values[crate::types::PK_IDX_V2] = v2;
+        p.values[PK_IDX_KA] = ka;
+        p.values[crate::types::PK_IDX_F] = 1.0;
+        p
+    }
+
+    fn pk_dual_2cpt_f64(p: &PkParams) -> PkDual<f64> {
+        PkDual {
+            cl: p.cl(),
+            v: p.v(),
+            q: p.q(),
+            v2: p.v2(),
+            ka: p.ka(),
+            q3: 0.0,
+            v3: 0.0,
+            f: p.f_bio(),
+        }
+    }
+
+    /// The generic 2-cpt walk (`event_driven_sens_g`) at `f64` must reproduce the
+    /// production event-driven predictions across IV bolus, IV infusion, and oral —
+    /// confirming the eigen-decomposition propagators match production bit-for-bit.
+    #[test]
+    fn event_walk_g_2cpt_matches_production_f64() {
+        struct Case {
+            model: PkModel,
+            dose: DoseEvent,
+        }
+        let obs = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
+        let (cl, v1, q, v2, ka) = (3.0, 30.0, 1.5, 40.0, 1.2);
+        let cases = [
+            Case {
+                model: PkModel::TwoCptIv,
+                dose: DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            },
+            Case {
+                model: PkModel::TwoCptIv,
+                dose: DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0), // 5 h infusion
+            },
+            Case {
+                model: PkModel::TwoCptOral,
+                dose: DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            },
+        ];
+        for (ci, c) in cases.iter().enumerate() {
+            let subj = make_subject(vec![c.dose.clone()], obs.clone());
+            let pk = pk_2cpt(cl, v1, q, v2, ka);
+            let prod = event_driven_predictions(c.model, &subj, &[pk], &vec![pk; obs.len()], &[]);
+            let schedule = EventSchedule::for_subject(&subj, c.model, &[0.0]);
+            let pkd = pk_dual_2cpt_f64(&pk);
+            let walk = event_driven_sens_g::<f64>(
+                c.model,
+                &subj,
+                &schedule,
+                &[pkd],
+                &vec![pkd; obs.len()],
+                &[],
+            );
+            for (j, (&p, &w)) in prod.iter().zip(walk.iter()).enumerate() {
+                approx::assert_relative_eq!(w, p, max_relative = 1e-12, epsilon = 1e-12);
+                assert!(p >= 0.0, "case {ci} obs {j}: production conc negative");
+            }
+        }
+    }
+
+    /// The 2-cpt walk's `Dual2` grad/Hessian (w.r.t. cl, v1) must match FD of the
+    /// `f64` walk — the eigen-decomposition propagator differentiates exactly.
+    #[test]
+    fn event_walk_g_2cpt_dual_matches_fd() {
+        let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        let obs = vec![4.0];
+        let subj = make_subject(vec![dose], obs.clone());
+        let (cl, v1, q, v2) = (3.0, 30.0, 1.5, 40.0);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::TwoCptIv, &[0.0]);
+        let seed = |cl: Dual2<2>, v1: Dual2<2>| PkDual {
+            cl,
+            v: v1,
+            q: Dual2::<2>::constant(q),
+            v2: Dual2::<2>::constant(v2),
+            ka: Dual2::<2>::constant(0.0),
+            q3: Dual2::<2>::constant(0.0),
+            v3: Dual2::<2>::constant(0.0),
+            f: Dual2::<2>::constant(1.0),
+        };
+        let pk_d = seed(Dual2::var(cl, 0), Dual2::var(v1, 1));
+        let walk = event_driven_sens_g::<Dual2<2>>(
+            PkModel::TwoCptIv,
+            &subj,
+            &schedule,
+            &[pk_d],
+            &[pk_d],
+            &[],
+        );
+        let out = walk[0];
+        let (g, he) = fd2([cl, v1], |p| {
+            let pkd = PkDual {
+                cl: p[0],
+                v: p[1],
+                q,
+                v2,
+                ka: 0.0,
+                q3: 0.0,
+                v3: 0.0,
+                f: 1.0,
+            };
+            event_driven_sens_g::<f64>(PkModel::TwoCptIv, &subj, &schedule, &[pkd], &[pkd], &[])[0]
+        });
+        for i in 0..2 {
+            approx::assert_relative_eq!(out.grad[i], g[i], max_relative = 1e-5, epsilon = 1e-9);
+            for j in 0..2 {
+                approx::assert_relative_eq!(
+                    out.hess[i][j],
+                    he[i][j],
+                    max_relative = 3e-3,
+                    epsilon = 1e-7
+                );
             }
         }
     }

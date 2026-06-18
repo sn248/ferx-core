@@ -12,7 +12,7 @@ use crate::types::DoseEvent;
 
 /// Macro-rate constants `(α, β, k21)` from the PK params, via Vieta's `β = d/α`
 /// (avoids catastrophic cancellation). Branches on `.val()` only.
-fn macro_rates_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> (T, T, T) {
+pub(crate) fn macro_rates_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> (T, T, T) {
     let k10 = cl / v1;
     let k12 = q / v1;
     let k21 = q / v2;

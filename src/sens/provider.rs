@@ -409,7 +409,10 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if model.n_kappa == 0 || model.ode_spec.is_some() {
         return false;
     }
-    if !matches!(model.pk_model, PkModel::OneCptIv | PkModel::OneCptOral) {
+    if !matches!(
+        model.pk_model,
+        PkModel::OneCptIv | PkModel::OneCptOral | PkModel::TwoCptIv | PkModel::TwoCptOral
+    ) {
         return false;
     }
     if !matches!(model.scaling, ScalingSpec::None) || model.log_transform || model.has_lagtime() {
@@ -455,7 +458,6 @@ pub fn subject_sensitivities_iov(
     let n_kappa = model.n_kappa;
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
-    let oral = matches!(model.pk_model, PkModel::OneCptOral);
 
     let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
     let k_groups = occ_groups.len();
@@ -538,7 +540,7 @@ pub fn subject_sensitivities_iov(
         ($($m:literal),+) => {
             match m_dim {
                 $($m => run_obs_iov::<$m>(
-                    model, subject, oral, &occ_to_k, &group_pk, &group_cd, &slot_row,
+                    model, subject, &occ_to_k, &group_pk, &group_cd, &slot_row,
                     n_eta, n_kappa, n_eff, n_stacked, n_theta,
                 ),)+
                 _ => None,
@@ -561,7 +563,6 @@ pub fn subject_sensitivities_iov(
 fn run_obs_iov<const M: usize>(
     model: &CompiledModel,
     subject: &Subject,
-    oral: bool,
     occ_to_k: &std::collections::HashMap<u32, usize>,
     group_pk: &[crate::types::PkParams],
     group_cd: &[CombinedDerivs],
@@ -573,7 +574,7 @@ fn run_obs_iov<const M: usize>(
     n_theta: usize,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
-    use crate::sens::propagate::{event_driven_sens_one_cpt_g, OneCptPk};
+    use crate::sens::propagate::{event_driven_sens_g, PkDual};
 
     // Build the `Dual2<M>` for PK slot `s` (row `i` of group `g`'s differentiated
     // params), carrying value `pk.values[s]` and `∂/∂(θ, stacked-η)`. The combined
@@ -623,7 +624,7 @@ fn run_obs_iov<const M: usize>(
     };
 
     // Per-group PK param duals: seed differentiated slots, constants otherwise.
-    let mk = |g: usize| -> OneCptPk<Dual2<M>> {
+    let mk = |g: usize| -> PkDual<Dual2<M>> {
         let pk = &group_pk[g];
         let dv = |slot: usize, val: f64| -> Dual2<M> {
             match slot_row[slot] {
@@ -631,10 +632,14 @@ fn run_obs_iov<const M: usize>(
                 None => Dual2::<M>::constant(val),
             }
         };
-        OneCptPk {
+        PkDual {
             cl: dv(PK_IDX_CL, pk.cl()),
             v: dv(PK_IDX_V, pk.v()),
+            q: dv(PK_IDX_Q, pk.q()),
+            v2: dv(PK_IDX_V2, pk.v2()),
             ka: dv(PK_IDX_KA, pk.ka()),
+            q3: dv(PK_IDX_Q3, pk.q3()),
+            v3: dv(PK_IDX_V3, pk.v3()),
             f: dv(PK_IDX_F, pk.f_bio()),
         }
     };
@@ -642,20 +647,20 @@ fn run_obs_iov<const M: usize>(
     // Per-event params: doses by dose-occasion, observations by obs-occasion. A
     // dose/obs whose occasion has no group makes the whole subject fall back
     // (keeps the first-cut scope to the clean, fully-grouped shape).
-    let mut group_dual: Vec<Option<OneCptPk<Dual2<M>>>> = vec![None; group_pk.len()];
-    let mut event_dual = |g: usize| -> OneCptPk<Dual2<M>> {
+    let mut group_dual: Vec<Option<PkDual<Dual2<M>>>> = vec![None; group_pk.len()];
+    let mut event_dual = |g: usize| -> PkDual<Dual2<M>> {
         if group_dual[g].is_none() {
             group_dual[g] = Some(mk(g));
         }
         group_dual[g].unwrap()
     };
-    let mut pk_at_dose: Vec<OneCptPk<Dual2<M>>> = Vec::with_capacity(subject.doses.len());
+    let mut pk_at_dose: Vec<PkDual<Dual2<M>>> = Vec::with_capacity(subject.doses.len());
     for d in 0..subject.doses.len() {
         let occ = subject.dose_occasions.get(d).copied()?;
         let g = *occ_to_k.get(&occ)?;
         pk_at_dose.push(event_dual(g));
     }
-    let mut pk_at_obs: Vec<OneCptPk<Dual2<M>>> = Vec::with_capacity(subject.obs_times.len());
+    let mut pk_at_obs: Vec<PkDual<Dual2<M>>> = Vec::with_capacity(subject.obs_times.len());
     for j in 0..subject.obs_times.len() {
         let occ = subject.occasions.get(j).copied()?;
         let g = *occ_to_k.get(&occ)?;
@@ -665,8 +670,8 @@ fn run_obs_iov<const M: usize>(
     // No lagtime in IOV scope → zero dose lagtimes.
     let dose_lagtimes = vec![0.0; subject.doses.len()];
     let schedule = EventSchedule::for_subject(subject, model.pk_model, &dose_lagtimes);
-    let conc = event_driven_sens_one_cpt_g::<Dual2<M>>(
-        oral,
+    let conc = event_driven_sens_g::<Dual2<M>>(
+        model.pk_model,
         subject,
         &schedule,
         &pk_at_dose,
@@ -2746,34 +2751,56 @@ mod tests {
         }
     }
 
-    /// The IOV provider's exact sensitivities over the stacked random-effects
-    /// vector `[η_bsv, κ_g0, κ_g1]` (and the θ block) must match central finite
-    /// differences of the production IOV predictor `predict_iov` — an independent
-    /// f64 path (no dual code), so this validates the whole walk + (η,κ,θ) chain.
-    #[test]
-    fn iov_provider_matches_fd_of_predict_iov() {
-        let model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
-        assert_eq!(model.n_kappa, 1, "model must carry one kappa");
-        assert!(
-            iov_analytical_supported(&model),
-            "warfarin IOV must be IOV-provider supported"
-        );
-        let subject = iov_subject();
-        let theta = vec![0.2, 10.0, 1.5];
-        let n_eta = model.n_eta; // 3
-        let n_theta = theta.len();
-        // K = 2 occasion groups; stacked = [η_cl, η_v, η_ka, κ_g0, κ_g1].
-        let stacked = vec![0.12, -0.08, 0.20, 0.05, -0.10];
+    const WARFARIN_IOV_2CPT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 50.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v=V, q=Q, v2=V2, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
 
-        let sens = subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("supported");
+    /// Shared FD-vs-predict_iov check for a two-occasion IOV model: value, gradient,
+    /// and Hessian over the stacked random-effects vector `[η_bsv, κ_g0, κ_g1]` and
+    /// the θ block must match central differences of the production `predict_iov`
+    /// (an independent f64 path), validating the whole walk + (η,κ,θ) chain.
+    fn check_iov_provider_vs_fd(
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        stacked: &[f64],
+    ) {
+        let n_eta = model.n_eta;
+        let n_theta = theta.len();
+        let sens = subject_sensitivities_iov(model, subject, theta, stacked).expect("supported");
 
         // Map a stacked-η vector to predict_iov's (η_bsv, kappas-per-group) form.
         let pred = |st: &[f64], th: &[f64], j: usize| -> f64 {
             let eta_bsv = st[..n_eta].to_vec();
             let kappas: Vec<Vec<f64>> = vec![vec![st[n_eta]], vec![st[n_eta + 1]]];
-            crate::pk::predict_iov(&model, &subject, th, &eta_bsv, &kappas)[j]
+            crate::pk::predict_iov(model, subject, th, &eta_bsv, &kappas)[j]
         };
 
+        let theta = theta.to_vec();
+        let stacked = stacked.to_vec();
         let n_st = stacked.len();
         let he = 1e-6;
         let heh = 1e-4;
@@ -2847,5 +2874,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 1-cpt oral IOV: provider == FD of `predict_iov` over `[η_bsv, κ_g0, κ_g1]`.
+    #[test]
+    fn iov_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        assert_eq!(model.n_kappa, 1, "model must carry one kappa");
+        assert!(
+            iov_analytical_supported(&model),
+            "warfarin IOV must be IOV-provider supported"
+        );
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, η_ka, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// 2-cpt oral IOV: same FD check, exercising the generic 2-cpt event-driven
+    /// sensitivity walk (eigen-decomposition propagators) under occasion carryover.
+    #[test]
+    fn iov_provider_2cpt_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_2CPT).expect("parse 2cpt warfarin IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert!(
+            iov_analytical_supported(&model),
+            "2-cpt warfarin IOV must be IOV-provider supported"
+        );
+        let subject = iov_subject();
+        // θ = [TVCL, TVV, TVQ, TVV2, TVKA]; stacked = [η_cl, η_v, η_ka, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.5, 20.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
     }
 }

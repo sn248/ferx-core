@@ -1021,7 +1021,13 @@ pub fn run_bayes(
                 }
                 if prop_eta > 0 {
                     let r = acc_eta as f64 / prop_eta as f64;
-                    eta_scale *= (r - 0.234).exp();
+                    // Target acceptance differs by kernel: ~0.234 is optimal for the
+                    // random-walk block move, but HMC wants a much higher rate
+                    // (~0.7); adapting the HMC leapfrog step toward 0.234 inflates it
+                    // until trajectories diverge (over-dispersing η, biasing σ). Same
+                    // split SAEM uses for its η scale.
+                    let target = if using_hmc { 0.7 } else { 0.234 };
+                    eta_scale *= (r - target).exp();
                     eta_scale = eta_scale.clamp(1e-4, 100.0);
                 }
                 acc_eta = 0;
@@ -1722,8 +1728,11 @@ mod tests {
         assert!(model.ode_spec.is_none() && model.tv_fn.is_some() && model.n_kappa == 0);
 
         let mut opts = FitOptions::default();
-        opts.bayes_warmup = 200;
-        opts.bayes_iters = 200;
+        // Warmup long enough for the HMC leapfrog step-size adaptation to settle
+        // (a too-short warmup leaves the step over-sized → η over-dispersion → σ
+        // inflation; see the PROP_ERR guard below).
+        opts.bayes_warmup = 600;
+        opts.bayes_iters = 400;
         opts.bayes_chains = 2;
         opts.bayes_seed = Some(1);
         opts.saem_n_leapfrog = 3; // > 0 ⇒ HMC η block (vs random-walk default)
@@ -1750,7 +1759,21 @@ mod tests {
             .expect("TVCL summary");
         // Short HMC run (200+200 sweeps, 2 chains): a sanity range around the
         // warfarin TVCL, not a convergence assertion.
-        assert!((0.10..0.25).contains(&tvcl.mean), "TVCL {}", tvcl.mean);
+        assert!((0.10..0.20).contains(&tvcl.mean), "TVCL {}", tvcl.mean);
+        // Guard the HMC η-block step-size tuning: an HMC leapfrog step adapted to
+        // the random-walk target (0.234 instead of ~0.7) over-disperses η and
+        // inflates the residual error — PROP_ERR ballooned to ~0.05 (vs the FOCEI
+        // value ~0.011) with R̂ > 2. Pin it near the truth.
+        let prop = bayes
+            .summaries
+            .iter()
+            .find(|s| s.name == "PROP_ERR")
+            .expect("PROP_ERR summary");
+        assert!(
+            prop.mean < 0.02,
+            "PROP_ERR {} — HMC η over-dispersing?",
+            prop.mean
+        );
         assert!(res.ofv.is_finite(), "OFV not finite");
         assert!(bayes.max_rhat.is_finite());
         assert_eq!(res.eta_hats.len(), pop.subjects.len());

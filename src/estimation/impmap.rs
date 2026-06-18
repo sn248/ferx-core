@@ -150,6 +150,32 @@ fn mu_ref_log_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
     pairs
 }
 
+/// Names of non-fixed thetas that have **no associated ETA** (are not the target
+/// of any mu-reference). Under IMP/IMPMAP such fixed-effect-only parameters are
+/// estimated solely through the importance-weighted θ M-step, which carries an
+/// IS-weight bias for weakly-identified parameters and can converge to the wrong
+/// value (issue #406: the FREM `FRD1` absorption-fraction drove to 0.90 vs a
+/// FOCEI/NONMEM value of ~0.4). NONMEM's IMP methods require every estimated
+/// parameter to carry a random effect; ferx applies mu-referencing
+/// automatically, so the user only needs to add the ETA.
+fn non_fixed_thetas_without_eta(model: &CompiledModel, theta_fixed: &[bool]) -> Vec<String> {
+    use std::collections::HashSet;
+    let with_eta: HashSet<&str> = model
+        .mu_refs
+        .values()
+        .map(|m| m.theta_name.as_str())
+        .collect();
+    model
+        .theta_names
+        .iter()
+        .enumerate()
+        .filter(|(i, name)| {
+            !theta_fixed.get(*i).copied().unwrap_or(false) && !with_eta.contains(name.as_str())
+        })
+        .map(|(_, name)| name.clone())
+        .collect()
+}
+
 /// Multi-start MAP: for each subject, run `find_ebe` with the warm-start (or
 /// cold-start) and then `mceta` additional random starting points drawn from
 /// N(0, Ω). The start with the lowest NLL wins. When `mceta == 0` this
@@ -463,6 +489,25 @@ fn run_mcem(
     // governs inner-loop `compute_mu_k` centering, a separate concern). NONMEM's
     // EM methods likewise require mu-referencing.
     let mut warnings: Vec<String> = Vec::new();
+
+    // STRONG warning: any estimated (non-fixed) θ without an associated ETA is
+    // handled only by the weighted M-step, which is biased for such parameters
+    // under importance sampling. ferx mu-references automatically, so the user
+    // only needs to attach a random effect.
+    let thetas_without_eta = non_fixed_thetas_without_eta(model, &init_params.theta_fixed);
+    if !thetas_without_eta.is_empty() {
+        warnings.push(format!(
+            "{label}: estimated parameter(s) [{}] have NO associated ETA. NONMEM's \
+             IMP/IMPMAP require every estimated parameter to carry a random effect; a \
+             fixed-effect-only parameter is estimated solely through the importance-weighted \
+             M-step, which is biased for weakly-identified parameters and may converge to the \
+             wrong value. STRONGLY add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, \
+             optionally FIX, omega — ferx applies mu-referencing automatically), or hold the \
+             parameter FIX, or use FOCEI.",
+            thetas_without_eta.join(", ")
+        ));
+    }
+
     let mu_ref_pairs = mu_ref_log_pairs(model);
     let use_closed_form = !mu_ref_pairs.is_empty();
     if !use_closed_form {
@@ -1156,6 +1201,69 @@ fn theta_sigma_weighted_mstep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flags_non_fixed_theta_without_eta() {
+        // CL/V have ETAs (mu-referenced); FRAC is an estimated theta with no ETA;
+        // TVFIX is FIX. Only FRAC should be flagged.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.0)
+  theta TVV(10.0, 0.0)
+  theta FRAC(0.5, 0.0, 1.0)
+  theta TVFIX(2.0, FIX)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.1
+  sigma PROP ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = FRAC + TVFIX
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let fixed = &model.default_params.theta_fixed;
+        let flagged = non_fixed_thetas_without_eta(&model, fixed);
+        assert!(
+            flagged.contains(&"FRAC".to_string()),
+            "FRAC flagged: {flagged:?}"
+        );
+        assert!(!flagged.contains(&"TVCL".to_string()), "TVCL has ETA");
+        assert!(!flagged.contains(&"TVV".to_string()), "TVV has ETA");
+        assert!(!flagged.contains(&"TVFIX".to_string()), "TVFIX is FIX");
+    }
+
+    #[test]
+    fn no_flag_when_all_thetas_have_eta() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.0)
+  theta TVV(10.0, 0.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.1
+  sigma PROP ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let fixed = &model.default_params.theta_fixed;
+        let flagged = non_fixed_thetas_without_eta(&model, fixed);
+        assert!(flagged.is_empty(), "expected no flags, got {flagged:?}");
+    }
 
     #[test]
     fn covariance_to_proposal_hessian_inverts_an_in_bounds_covariance() {

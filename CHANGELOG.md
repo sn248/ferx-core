@@ -229,6 +229,13 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- **IMP/IMPMAP now warn about estimated parameters with no random effect**: any
+  non-fixed `theta` that has no associated `ETA` is estimated only through the
+  importance-weighted M-step, which is biased for weakly-identified parameters and
+  can converge to the wrong value (e.g. a FREM absorption fraction drifting to ~0.9
+  vs a FOCEI/NONMEM value of ~0.4). The estimator now emits a strong warning naming
+  such parameters and recommending an `ETA` be added (ferx mu-references
+  automatically), the parameter be held `FIX`, or FOCEI be used. (#406)
 - **IMP/IMPMAP now Rao-Blackwellise FREM covariate ETAs**: the Gaussian covariate
   pseudo-observation ETAs are integrated analytically (conditional PK prior from
   the Ω precision blocks) and only the PK ETAs are importance-sampled. This turns

@@ -36,31 +36,59 @@ pub fn propagate_one_cpt_g<T: PkNum>(state: &mut [T], dt: f64, cl: T, v: T, rate
 }
 
 /// 1-cpt oral propagator. `state = [A_depot, A_central]`; the depot drains into
-/// the central compartment at absorption rate `ka` (bolus dosing — doses are added
-/// to the depot by the event handler). Mirror of
-/// [`crate::pk::event_driven::propagate_one_cpt_oral`], including the `ka ≈ ke`
-/// L'Hôpital limit.
-pub fn propagate_one_cpt_oral_g<T: PkNum>(state: &mut [T], dt: f64, cl: T, v: T, ka: T) {
+/// the central compartment at absorption rate `ka`. `rate_central` is a constant
+/// zero-order input into central (depot-bypass infusion, RATE>0 into cmt 2);
+/// `rate_depot` is a constant zero-order input into the depot (RATE>0 into cmt 1,
+/// #400). Both are added by linear superposition and are `0` for bolus dosing.
+/// Mirror of [`crate::pk::event_driven::propagate_one_cpt_oral`], including the
+/// `ka ≈ ke` L'Hôpital limit.
+pub fn propagate_one_cpt_oral_g<T: PkNum>(
+    state: &mut [T],
+    dt: f64,
+    cl: T,
+    v: T,
+    ka: T,
+    rate_central: T,
+    rate_depot: T,
+) {
     if v.val() <= 0.0 || cl.val() <= 0.0 || ka.val() <= 0.0 {
         return;
     }
     let ke = cl / v;
     let dtt = T::from_f64(dt);
+    let one = T::from_f64(1.0);
     let e_ka = (-(ka * dtt)).exp();
     let e_ke = (-(ke * dtt)).exp();
     let a_d_0 = state[0];
     let a_c_0 = state[1];
+    let near = (ka.val() - ke.val()).abs() < 1e-9;
 
     // Depot decays exponentially (decoupled).
     state[0] = a_d_0 * e_ka;
 
     // Central: homogeneous decay of A_c(0) plus the depot-driven Bateman term,
     // with the `ka ≈ ke` L'Hôpital fallback (branch on `.val()`).
-    if (ka.val() - ke.val()).abs() < 1e-9 {
+    if near {
         state[1] = a_c_0 * e_ke + ka * a_d_0 * dtt * e_ke;
     } else {
         state[1] = a_c_0 * e_ke + (ka * a_d_0 / (ke - ka)) * (e_ka - e_ke);
     }
+
+    // Constant infusion into central (depot bypass): forced response of the 1-cpt
+    // IV propagator from a zero initial state, `(R/ke)·(1 − e_ke)`. Zero when
+    // `rate_central` is zero, so applied unconditionally (derivative-safe).
+    state[1] = state[1] + (rate_central / ke) * (one - e_ke);
+
+    // Constant zero-order input into the depot (#400), added by linearity:
+    //   depot:   (R/ka)·(1 − e_ka)
+    //   central: (R/ke)·(1 − e_ke) − R·(e_ka − e_ke)/(ke − ka), L'Hôpital → R·dt·e_ke.
+    state[0] = state[0] + (rate_depot / ka) * (one - e_ka);
+    let central_forced = if near {
+        rate_depot / ke * (one - e_ke) - rate_depot * dtt * e_ke
+    } else {
+        rate_depot / ke * (one - e_ke) - rate_depot * (e_ka - e_ke) / (ke - ka)
+    };
+    state[1] = state[1] + central_forced;
 }
 
 // ─── 1-cpt event-driven sensitivity walk ─────────────────────────────
@@ -139,9 +167,13 @@ pub fn propagate_two_cpt_g<T: PkNum>(
     state[1] = h2_dt + a_ss_2;
 }
 
-/// 2-cpt oral propagator: `state = [A_depot, A_central, A_periph]` (bolus only —
-/// the depot drains into central at `ka`). Generic mirror of
+/// 2-cpt oral propagator: `state = [A_depot, A_central, A_periph]`. `rate_central`
+/// is a constant zero-order input into central (depot-bypass infusion, RATE>0 into
+/// cmt 2); `rate_depot` is a constant zero-order input into the depot (RATE>0 into
+/// cmt 1, #400). Both are added by linear superposition and are `0` for bolus
+/// dosing. Generic mirror of
 /// [`crate::pk::event_driven::propagate_two_cpt_oral`].
+#[allow(clippy::too_many_arguments)]
 pub fn propagate_two_cpt_oral_g<T: PkNum>(
     state: &mut [T],
     dt: f64,
@@ -150,11 +182,14 @@ pub fn propagate_two_cpt_oral_g<T: PkNum>(
     q: T,
     v2: T,
     ka: T,
+    rate_central: T,
+    rate_depot: T,
 ) {
     if v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || q.val() <= 0.0 || ka.val() <= 0.0 {
         return;
     }
     let (alpha, beta, k21) = crate::sens::two_cpt::macro_rates_g(cl, v1, q, v2);
+    let k10 = cl / v1;
     let k12 = q / v1;
     let dtt = T::from_f64(dt);
 
@@ -201,6 +236,57 @@ pub fn propagate_two_cpt_oral_g<T: PkNum>(
 
     state[1] = h_c_dt + cap_a * e_ka;
     state[2] = h_p_dt + cap_b * e_ka;
+
+    // Constant infusion into central (depot bypass): forced response of the 2-cpt
+    // IV propagator from a zero initial state. `rate_central` is structurally 0 or
+    // positive (never crossing during differentiation), so the `.val()` guard is
+    // derivative-safe and just skips the no-infusion intervals.
+    if rate_central.val() > 0.0 {
+        let mut inflow = [T::from_f64(0.0), T::from_f64(0.0)];
+        propagate_two_cpt_g(
+            &mut inflow,
+            dt,
+            cl,
+            v1,
+            q,
+            v2,
+            rate_central,
+            T::from_f64(0.0),
+        );
+        state[1] = state[1] + inflow[0];
+        state[2] = state[2] + inflow[1];
+    }
+
+    // Constant zero-order input into the depot (#400): forced response from a zero
+    // initial state = `x_ss − e^{A·dt}·x_ss`, where `x_ss` is the full steady state
+    // under constant depot input R (central_ss = R/k10, periph_ss = k12·R/(k21·k10),
+    // depot_ss = R/ka). `e^{A·dt}·x_ss` is this propagator's homogeneous evolution,
+    // obtained by recursing once with zero rates (the `.val()` guard bounds the
+    // recursion to depth 1 and is derivative-safe).
+    if rate_depot.val() > 0.0 {
+        let denom_ss = k21 * k10;
+        let (c_ss, p_ss) = if denom_ss.val() > 1e-30 {
+            (rate_depot / k10, k12 * rate_depot / denom_ss)
+        } else {
+            (T::from_f64(0.0), T::from_f64(0.0))
+        };
+        let d_ss = rate_depot / ka;
+        let mut xss = [d_ss, c_ss, p_ss];
+        propagate_two_cpt_oral_g(
+            &mut xss,
+            dt,
+            cl,
+            v1,
+            q,
+            v2,
+            ka,
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+        );
+        state[0] = state[0] + (d_ss - xss[0]);
+        state[1] = state[1] + (c_ss - xss[1]);
+        state[2] = state[2] + (p_ss - xss[2]);
+    }
 }
 
 /// One 3-cpt eigenmode's spectral data over `T` (mirror of
@@ -301,9 +387,12 @@ pub fn propagate_three_cpt_g<T: PkNum>(
     state[2] = p2a + p2b + p2g + a_ss_p2;
 }
 
-/// 3-cpt oral propagator: `state = [A_depot, A_central, A_p1, A_p2]` (bolus only;
-/// depot drains into central at `ka` with a depot-driven particular solution).
-/// Generic mirror of [`crate::pk::event_driven::propagate_three_cpt_oral`].
+/// 3-cpt oral propagator: `state = [A_depot, A_central, A_p1, A_p2]`. `rate_central`
+/// is a constant zero-order input into central (depot-bypass infusion, RATE>0 into
+/// cmt 2); `rate_depot` is a constant zero-order input into the depot (RATE>0 into
+/// cmt 1, #400). Both are added by linear superposition and are `0` for bolus
+/// dosing. Generic mirror of
+/// [`crate::pk::event_driven::propagate_three_cpt_oral`].
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_three_cpt_oral_g<T: PkNum>(
     state: &mut [T],
@@ -315,6 +404,8 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
     q3: T,
     v3: T,
     ka: T,
+    rate_central: T,
+    rate_depot: T,
 ) {
     if v1.val() <= 0.0
         || cl.val() <= 0.0
@@ -328,6 +419,7 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
     }
     let (alpha, beta, gamma, k21, k31) =
         crate::sens::three_cpt::macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
+    let k10 = cl / v1;
     let k12 = q2 / v1;
     let k13 = q3 / v1;
     let modes = [
@@ -365,6 +457,65 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
     state[1] = ca + cb + cg + cap_a * e_ka;
     state[2] = p1a + p1b + p1g + cap_b * e_ka;
     state[3] = p2a + p2b + p2g + cap_c * e_ka;
+
+    // Constant infusion into central (depot bypass): forced response of the 3-cpt
+    // IV propagator from a zero initial state. `.val()` guard is derivative-safe
+    // (`rate_central` is structurally 0 or positive).
+    if rate_central.val() > 0.0 {
+        let mut inflow = [T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0)];
+        propagate_three_cpt_g(
+            &mut inflow,
+            dt,
+            cl,
+            v1,
+            q2,
+            v2,
+            q3,
+            v3,
+            rate_central,
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+        );
+        state[1] = state[1] + inflow[0];
+        state[2] = state[2] + inflow[1];
+        state[3] = state[3] + inflow[2];
+    }
+
+    // Constant zero-order input into the depot (#400): forced response from a zero
+    // initial state = `x_ss − e^{A·dt}·x_ss`. At steady state the depot holds R/ka
+    // and delivers R into central (central_ss = R/k10, p1_ss = k12·R/(k21·k10),
+    // p2_ss = k13·R/(k31·k10)); the homogeneous evolution is obtained by recursing
+    // once with zero rates (the guard bounds it to depth 1).
+    if rate_depot.val() > 0.0 {
+        let (c_ss, p1_ss, p2_ss) = if k10.val() > 1e-30 && k21.val() > 1e-30 && k31.val() > 1e-30 {
+            (
+                rate_depot / k10,
+                k12 * rate_depot / (k21 * k10),
+                k13 * rate_depot / (k31 * k10),
+            )
+        } else {
+            (T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0))
+        };
+        let d_ss = rate_depot / ka;
+        let mut xss = [d_ss, c_ss, p1_ss, p2_ss];
+        propagate_three_cpt_oral_g(
+            &mut xss,
+            dt,
+            cl,
+            v1,
+            q2,
+            v2,
+            q3,
+            v3,
+            ka,
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+        );
+        state[0] = state[0] + (d_ss - xss[0]);
+        state[1] = state[1] + (c_ss - xss[1]);
+        state[2] = state[2] + (p1_ss - xss[2]);
+        state[3] = state[3] + (p2_ss - xss[3]);
+    }
 }
 
 /// Per-event PK params for the generic walk, carrying every disposition slot the
@@ -470,18 +621,19 @@ fn propagate_bounds_g<T: PkNum>(
     dose_lagtimes: &[f64],
     reset_floor: f64,
 ) {
-    let oral = matches!(pk_model, PkModel::OneCptOral | PkModel::TwoCptOral);
     for w in bounds.windows(2) {
         let dt = w[1] - w[0];
         if dt <= 0.0 {
             continue;
         }
         let mid = 0.5 * (w[0] + w[1]);
-        // Active infusion rates (F·rate) into central / peripheral-1, summed per
-        // the production model→cmt arms.
+        // Active infusion rates (F·rate) summed per the production model→cmt arms:
+        // central / peripheral-1 / peripheral-2 for the disposition compartments,
+        // plus `rate_depot` for a zero-order input into the oral depot (cmt 1, #400).
         let mut rate_central = T::from_f64(0.0);
         let mut rate_periph1 = T::from_f64(0.0);
         let mut rate_periph2 = T::from_f64(0.0);
+        let mut rate_depot = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
             let t_start = d.time + lag;
@@ -493,13 +645,16 @@ fn propagate_bounds_g<T: PkNum>(
                 let r = pk.f * T::from_f64(d.rate);
                 match (pk_model, d.cmt) {
                     (PkModel::OneCptIv, 1) => rate_central = rate_central + r,
+                    (PkModel::OneCptOral, 1) => rate_depot = rate_depot + r,
                     (PkModel::OneCptOral, 2) => rate_central = rate_central + r,
                     (PkModel::TwoCptIv, 1) => rate_central = rate_central + r,
                     (PkModel::TwoCptIv, 2) => rate_periph1 = rate_periph1 + r,
+                    (PkModel::TwoCptOral, 1) => rate_depot = rate_depot + r,
                     (PkModel::TwoCptOral, 2) => rate_central = rate_central + r,
                     (PkModel::ThreeCptIv, 1) => rate_central = rate_central + r,
                     (PkModel::ThreeCptIv, 2) => rate_periph1 = rate_periph1 + r,
                     (PkModel::ThreeCptIv, 3) => rate_periph2 = rate_periph2 + r,
+                    (PkModel::ThreeCptOral, 1) => rate_depot = rate_depot + r,
                     (PkModel::ThreeCptOral, 2) => rate_central = rate_central + r,
                     _ => {}
                 }
@@ -507,7 +662,9 @@ fn propagate_bounds_g<T: PkNum>(
         }
         match pk_model {
             PkModel::OneCptIv => propagate_one_cpt_g(state, dt, pk.cl, pk.v, rate_central),
-            PkModel::OneCptOral => propagate_one_cpt_oral_g(state, dt, pk.cl, pk.v, pk.ka),
+            PkModel::OneCptOral => {
+                propagate_one_cpt_oral_g(state, dt, pk.cl, pk.v, pk.ka, rate_central, rate_depot)
+            }
             PkModel::TwoCptIv => propagate_two_cpt_g(
                 state,
                 dt,
@@ -518,9 +675,17 @@ fn propagate_bounds_g<T: PkNum>(
                 rate_central,
                 rate_periph1,
             ),
-            PkModel::TwoCptOral => {
-                propagate_two_cpt_oral_g(state, dt, pk.cl, pk.v, pk.q, pk.v2, pk.ka)
-            }
+            PkModel::TwoCptOral => propagate_two_cpt_oral_g(
+                state,
+                dt,
+                pk.cl,
+                pk.v,
+                pk.q,
+                pk.v2,
+                pk.ka,
+                rate_central,
+                rate_depot,
+            ),
             PkModel::ThreeCptIv => propagate_three_cpt_g(
                 state,
                 dt,
@@ -534,9 +699,19 @@ fn propagate_bounds_g<T: PkNum>(
                 rate_periph1,
                 rate_periph2,
             ),
-            PkModel::ThreeCptOral => {
-                propagate_three_cpt_oral_g(state, dt, pk.cl, pk.v, pk.q, pk.v2, pk.q3, pk.v3, pk.ka)
-            }
+            PkModel::ThreeCptOral => propagate_three_cpt_oral_g(
+                state,
+                dt,
+                pk.cl,
+                pk.v,
+                pk.q,
+                pk.v2,
+                pk.q3,
+                pk.v3,
+                pk.ka,
+                rate_central,
+                rate_depot,
+            ),
         }
     }
 }
@@ -747,7 +922,7 @@ mod tests {
             (3.0, 30.0, 0.1, 3.0, 40.0, 2.0),
         ] {
             let mut s_g = [ad, ac];
-            propagate_one_cpt_oral_g::<f64>(&mut s_g, dt, cl, v, ka);
+            propagate_one_cpt_oral_g::<f64>(&mut s_g, dt, cl, v, ka, 0.0, 0.0);
             let mut s_p = [ad, ac];
             crate::pk::event_driven::propagate_one_cpt_oral(
                 &mut s_p,
@@ -1303,10 +1478,12 @@ mod tests {
             Dual2::var(cl, 0),
             Dual2::var(v, 1),
             Dual2::constant(ka),
+            Dual2::constant(0.0),
+            Dual2::constant(0.0),
         );
         let (g, he) = fd2([cl, v], |p| {
             let mut s = [ad, ac];
-            propagate_one_cpt_oral_g::<f64>(&mut s, dt, p[0], p[1], ka);
+            propagate_one_cpt_oral_g::<f64>(&mut s, dt, p[0], p[1], ka, 0.0, 0.0);
             s[1] // central amount
         });
         for i in 0..2 {

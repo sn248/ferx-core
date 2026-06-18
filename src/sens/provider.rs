@@ -456,10 +456,6 @@ pub fn subject_sensitivities_iov(
     if !iov_analytical_supported(model) {
         return None;
     }
-    // Oral infusion (#350/#400) is not yet mirrored in the sensitivity walk.
-    if oral_infusion_unsupported(model, subject) {
-        return None;
-    }
     // EVID=3/4 resets are honoured by the event-driven walk: it zeros the dual
     // state at each reset and rebuilds the post-reset occasion from the schedule,
     // exactly as production's `event_driven_predictions` does (the `f64` instance
@@ -895,11 +891,11 @@ pub fn subject_sensitivities_tvcov(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
-    if !tvcov_analytical_supported(model) || !subject.has_tv_covariates() {
-        return None;
-    }
-    // Oral infusion (#350/#400) is not yet mirrored in the sensitivity walk.
-    if oral_infusion_unsupported(model, subject) {
+    // Routed here for time-varying covariates *or* oral infusion (#350/#400) — both
+    // need the state-propagating walk rather than dose superposition.
+    if !tvcov_analytical_supported(model)
+        || !(subject.has_tv_covariates() || subject_has_oral_infusion(model, subject))
+    {
         return None;
     }
     // Steady-state doses equilibrate per-event in the walk (`equilibrate_ss_g`,
@@ -1200,8 +1196,11 @@ fn subject_eta_grad_impl(
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
-    // Oral infusion (#350/#400) is not yet mirrored in the sensitivity kernels.
-    if oral_infusion_unsupported(model, subject) {
+    // The light first-order provider uses the superposition kernels, which don't
+    // carry the oral-infusion forced responses (#350/#400); the full provider
+    // routes those subjects through the walk, but here we fall back to the FD inner
+    // Jacobian for them.
+    if subject_has_oral_infusion(model, subject) {
         return None;
     }
     // The light (first-order) provider doesn't carry the `ExpressionScale`
@@ -1534,17 +1533,16 @@ fn apply_expression_scale<const M: usize>(
     }
 }
 
-/// Oral models with an **infusion** dose (RATE>0 into the depot/central, or a
-/// modeled-duration `D{cmt}`) are not yet mirrored in the sensitivity path: main's
-/// #350 (depot-bypass infusion into oral central) and #400 (zero-order input into
-/// the oral depot) added the `rate_central`/`rate_depot` terms to the production
-/// f64 propagators / analytical kernels, but the `Dual2` walk's oral propagators
-/// (`propagate_*_oral_g`) and the superposition kernels drop them. Producing an
-/// analytic gradient here would be inconsistent with the (now infusion-correct)
-/// objective, so fall back to the finite-difference gradient. Bolus oral dosing —
-/// the overwhelmingly common case — is unaffected. Mirroring oral infusion into
-/// the dual walk is a tracked follow-up.
-pub(crate) fn oral_infusion_unsupported(model: &CompiledModel, subject: &Subject) -> bool {
+/// True when an **oral** model carries an **infusion** dose (RATE>0 into the
+/// depot/central, or a modeled-duration `D{cmt}`). Such subjects switch the
+/// compartment dynamics that dose superposition can't express — the depot
+/// zero-order forced response (#400) and the depot-bypass central infusion (#350)
+/// — so the full provider routes them through the state-propagating `Dual2` walk
+/// (whose oral propagators now carry `rate_central`/`rate_depot`), exactly as
+/// production's `compute_predictions` routes oral-depot infusion to the
+/// event-driven path. The light first-order inner provider has no walk, so it
+/// still falls back to the FD inner Jacobian for these subjects.
+pub(crate) fn subject_has_oral_infusion(model: &CompiledModel, subject: &Subject) -> bool {
     matches!(
         model.pk_model,
         PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
@@ -1573,15 +1571,15 @@ fn subject_sensitivities_impl(
     if !analytical_supported(model) {
         return None;
     }
-    // Oral infusion (#350/#400) is not yet mirrored in the sensitivity kernels.
-    if oral_infusion_unsupported(model, subject) {
-        return None;
-    }
     // Time-varying covariates make the PK parameters switch mid-decay, which dose
     // superposition can't express — route them to the event-driven Dual2 walk
-    // (IOV-minus-κ). The returned `SubjectSens` has the same `(η, θ)` shape, so the
-    // outer gradient / inner Jacobian consume it identically.
-    if subject.has_tv_covariates() {
+    // (IOV-minus-κ). The same walk carries the oral-infusion forced responses
+    // (#350 depot-bypass central / #400 zero-order depot) that the superposition
+    // kernels don't, so oral-infusion subjects route there too — mirroring
+    // production's `compute_predictions` dispatch. The returned `SubjectSens` has
+    // the same `(η, θ)` shape, so the outer gradient / inner Jacobian consume it
+    // identically.
+    if subject.has_tv_covariates() || subject_has_oral_infusion(model, subject) {
         return subject_sensitivities_tvcov(model, subject, theta, eta);
     }
     // EVID=3/4 resets are handled by restricting dose superposition to the
@@ -2722,6 +2720,116 @@ mod tests {
             fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
+        }
+    }
+
+    /// Oral models with an **infusion** dose (#350 depot-bypass central, RATE>0
+    /// into cmt 2; #400 zero-order into the depot, RATE>0 into cmt 1) route through
+    /// the state-propagating Dual2 walk — whose oral propagators now carry
+    /// `rate_central`/`rate_depot` — rather than dose superposition. The provider's
+    /// value/∂η/∂²η/∂θ/∂²η∂θ must match central FD of the production predictor
+    /// (`compute_predictions_with_tv`, the independent infusion-correct f64 path)
+    /// across 1-/2-/3-cpt and both infusion compartments.
+    #[test]
+    fn oral_infusion_provider_matches_fd_of_production() {
+        const ONECPT_ORAL: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 0.10
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        const THREECPT_ORAL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.5, 50.0)
+  theta TVV1(10.0, 1.0, 100.0)
+  theta TVQ2(2.0, 0.1, 20.0)
+  theta TVV2(20.0, 2.0, 200.0)
+  theta TVQ3(1.5, 0.1, 20.0)
+  theta TVV3(30.0, 3.0, 300.0)
+  theta TVKA(1.0, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  omega ETA_KA ~ 0.10
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q2 = TVQ2
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        // Infusion of amt 1000 over 8 h (rate 125), then a later oral bolus.
+        let inf = |cmt: usize| {
+            vec![
+                DoseEvent::new(0.0, 1000.0, cmt, 125.0, false, 0.0),
+                DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+            ]
+        };
+        let times = [1.0, 4.0, 7.0, 10.0, 14.0, 24.0];
+        let cases: Vec<(CompiledModel, Subject, Vec<f64>, Vec<f64>)> = vec![
+            // 1-cpt oral, zero-order into the **depot** (cmt 1, #400).
+            {
+                let m = parse_model_string(ONECPT_ORAL).expect("parse 1cpt oral");
+                let s = subject_with_doses_and_resets(inf(1), &times, Vec::new());
+                (m, s, vec![10.0, 50.0, 1.0], vec![0.1, -0.05, 0.08])
+            },
+            // 1-cpt oral, depot-bypass infusion into **central** (cmt 2, #350).
+            {
+                let m = parse_model_string(ONECPT_ORAL).expect("parse 1cpt oral");
+                let s = subject_with_doses_and_resets(inf(2), &times, Vec::new());
+                (m, s, vec![10.0, 50.0, 1.0], vec![0.1, -0.05, 0.08])
+            },
+            // 2-cpt oral, zero-order into the depot (cmt 1).
+            {
+                let m = parse_model_string(TWOCPT_ORAL).expect("parse 2cpt oral");
+                let s = subject_with_doses_and_resets(inf(1), &times, Vec::new());
+                (
+                    m,
+                    s,
+                    vec![10.0, 50.0, 15.0, 100.0, 1.0],
+                    vec![0.1, -0.05, 0.08],
+                )
+            },
+            // 3-cpt oral, zero-order into the depot (cmt 1).
+            {
+                let m = parse_model_string(THREECPT_ORAL).expect("parse 3cpt oral");
+                let s = subject_with_doses_and_resets(inf(1), &times, Vec::new());
+                (
+                    m,
+                    s,
+                    vec![5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 1.0],
+                    vec![0.1, -0.05, 0.08],
+                )
+            },
+        ];
+        for (m, s, theta, eta) in &cases {
+            assert!(
+                subject_has_oral_infusion(m, s),
+                "fixture must carry an oral infusion"
+            );
+            assert!(
+                subject_sensitivities(m, s, theta, eta).is_some(),
+                "oral-infusion subject must take the analytic provider (via the walk)"
+            );
+            check_provider_vs_production(m, s, theta, eta);
         }
     }
 

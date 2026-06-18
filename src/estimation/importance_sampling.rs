@@ -1212,10 +1212,17 @@ impl Proposal {
 
 /// Build the IS proposal scale matrix from a per-subject inner-loop Hessian.
 ///
-/// Strategy: Cholesky(H + λI), with λ = max(1e−6 · trace(H)/d, 1e−10). If H
-/// is so degenerate that even the jittered matrix isn't positive-definite,
-/// fall back to Σ = Ω (the prior covariance) — a broad proposal that won't
-/// give a sharp likelihood estimate but stays well-defined.
+/// Strategy: Cholesky(H + Λ) with a **per-dimension** relative jitter
+/// `Λᵢᵢ = max(1e−6·|Hᵢᵢ|, 1e−10)`. A single global `λ = 1e−6·trace(H)/d`
+/// (the previous strategy) is dominated by the sharpest dimensions: on a FREM
+/// model the covariate pseudo-obs dims (~1e6) and near-fixed dims (~1e10) push
+/// `λ` to ~1e3, which then swamps the well-conditioned PK dims (~1e2) and
+/// collapses their proposal width 5–10×, hurting ESS even when the mode is
+/// correct (issue #406). The per-dimension form regularizes each dimension
+/// proportionally to its own curvature, leaving every dimension's proposal
+/// width intact. If H is so degenerate that even the jittered matrix isn't
+/// positive-definite, fall back to Σ = Ω (the prior covariance) — a broad
+/// proposal that won't give a sharp likelihood estimate but stays well-defined.
 ///
 /// Returns `None` only when `d == 0`.
 fn build_proposal(h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize) -> Option<Proposal> {
@@ -1225,11 +1232,9 @@ fn build_proposal(h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize) -> Optio
     debug_assert_eq!(h.nrows(), d);
     debug_assert_eq!(h.ncols(), d);
 
-    let trace = (0..d).map(|i| h[(i, i)]).sum::<f64>();
-    let lambda = (1e-6 * trace / d as f64).max(1e-10);
     let mut h_reg = h.clone();
     for i in 0..d {
-        h_reg[(i, i)] += lambda;
+        h_reg[(i, i)] += (1e-6 * h[(i, i)].abs()).max(1e-10);
     }
     if let Some(chol) = h_reg.clone().cholesky() {
         let l = chol.l();

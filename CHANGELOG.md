@@ -286,6 +286,16 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **IMP/IMPMAP on high-dimensional FREM**: the inner EBE/MAP solver no longer
+  returns a nonsensical joint mode on multi-scale FREM posteriors (3 PK + many
+  covariate ETAs). The inner BFGS is now FREM-preconditioned (per-dimension
+  initial inverse-Hessian ≈ posterior variance) and the covariate ETAs are
+  cold-started at their data-implied mode `cov_obs − TV`; the IS proposal jitter
+  is now per-dimension instead of a single global value. Previously the mode
+  collapsed (obs-NLL ~1e8) and standalone IMP/IMPMAP diverged (−2logL ~1e13) on
+  ≥8-covariate FREM models; the typical-value estimates for volume and absorption
+  now recover. (Full NONMEM parity still pending the mu-referencing θ M-step and
+  high-dimensional IS effective-sample-size work — see #406.) (#406)
 - **Bayesian estimation** (`method = bayes`) now responds to a cooperative
   cancellation (e.g. an R-session interrupt): the Gibbs sampler polls the cancel
   flag at each sweep boundary and aborts within one sweep, returning

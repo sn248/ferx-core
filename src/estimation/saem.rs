@@ -1076,9 +1076,9 @@ fn get_mu_ref_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
 /// One-line description of the SAEM E-step sampler kernel, for the startup
 /// banner. SAEM's estimation is sampling-based (not gradient-driven), so the
 /// banner reports the kernel here instead of a gradient route. HMC is used
-/// only when `saem_n_leapfrog > 0` *and* the build supports its autodiff
-/// gradients on an analytical PK model — the same gate as [`run_saem`]; this
-/// mirrors that condition so the banner reflects what will actually run.
+/// only when `saem_n_leapfrog > 0` on an analytical PK model (its η-gradient is
+/// the analytic Dual2 gradient) — the same gate as [`run_saem`]; this mirrors
+/// that condition so the banner reflects what will actually run.
 pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) -> String {
     let n_leapfrog = options.saem_n_leapfrog;
     // HMC is BSV-only (`hmc_step` and the AD NLL/gradient are kappa-unaware), so

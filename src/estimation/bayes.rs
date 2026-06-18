@@ -577,8 +577,8 @@ pub fn run_bayes(
                 .collect();
 
             // ---- 1. η block ----
-            // HMC (gradient-guided) when available + opt-in (n_leapfrog > 0 on
-            // an autodiff build, analytical-PK subject); otherwise the
+            // HMC (gradient-guided, on the analytic Dual2 η-gradient) when opted in
+            // (n_leapfrog > 0, analytical-PK subject); otherwise the
             // chol(Ω)-preconditioned block random walk. Same routing as SAEM.
             for i in 0..n_subjects {
                 let did_hmc = if using_hmc {

@@ -1745,8 +1745,7 @@ mod iov_tests {
             summary.starts_with("FD"),
             "tv_fn=None must resolve to FD, got: {summary}"
         );
-        // Matches both "[requested: auto]" (autodiff build) and
-        // "[requested: auto; autodiff not compiled in]" (ci build).
+        // The bracket echoes the requested method, e.g. "[requested: auto]".
         assert!(
             summary.contains("[requested: auto"),
             "summary must surface the requested method, got: {summary}"

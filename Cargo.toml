@@ -13,9 +13,11 @@ name = "ferx"
 path = "src/bin/run_model.rs"
 
 [features]
-default = ["autodiff"]
-autodiff = []
-ci = []  # Allows building without autodiff for CI (nightly, no Enzyme)
+default = []
+# The Enzyme autodiff sensitivity path was retired in favour of the hand-rolled
+# `Dual2` analytic sensitivities (`sens/`) for FOCE/FOCEI; `ci` remains as a no-op
+# so existing `--features ci` invocations keep working.
+ci = []
 # Opt-in support for neural-network-based covariate models (DCM) and
 # dynamics (low-dim NODE). See `plans/dcm-and-low-dim-node.md`. No new
 # runtime deps — the MLP runs on top of `nalgebra`.

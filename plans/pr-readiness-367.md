@@ -19,7 +19,7 @@ the branch a clean, reviewable PR.
 | 6/7 | `h_matrix`/`reconverge` override, no opt-out | ✅ `reconverge_gradient_interval` honored as escape hatch |
 | 8 | predictor step, no clamp | ✅ step clamped to bounds |
 | 10 | FD/AD Jacobian computed then discarded | ✅ skipped when analytic Jacobian available |
-| 9 | **cleanup: hoist `pk/*` generic, delete `sens/*_cpt.rs`** | ❌ **not done** (duplicates remain) |
+| 9 | **cleanup: hoist `pk/*` generic, delete `sens/*_cpt.rs`** | ✅ deferred to tracked follow-up **#408** (correctness already fixed in both copies + test) |
 
 Plus Ron's headline ask — a runtime analytic-vs-FD cross-check outside
 `#[cfg(test)]` — exists as `FERX_SENS_CHECK=1`.
@@ -65,7 +65,7 @@ above for follow-up PRs.
   `inner_optimizer.rs:~828` and `outer_optimizer.rs:~1985` ("analytical 1-cpt
   scope") — change to "analytical PK scope".
 
-### A3. Decision on Ron #9 (pk/* dedup)
+### A3. Decision on Ron #9 (pk/* dedup) ✅ DONE — filed as #408
 The duplicate closed forms (`sens/{one,two,three}_cpt.rs` ↔
 `pk/{one,two,three}_compartment.rs`) remain. The #1 bug is the drift risk
 realized; it is now fixed in **both** copies with an independent test, so the

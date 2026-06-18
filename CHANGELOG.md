@@ -79,9 +79,23 @@ section of the SDLC for the versioning policy).
   the only FD setting that also converges (`reconverge_gradient_interval = 1`:
   0.30 s vs 4.11 s). Validated against NONMEM on warfarin (FOCE OFV −280.36,
   FOCEI −286.00 — both matching to ~4–5 significant figures).
-  Models outside the analytical scope (ODE, IOV, lagtime, time-varying
-  covariates, overlapping steady-state infusion #379) transparently fall back to
-  the existing finite-difference gradient (#367).
+  Models outside the analytical scope (time-varying covariates) transparently
+  fall back to the existing finite-difference gradient (#367).
+- **Analytic FOCE/FOCEI outer gradient for inter-occasion variability (IOV)** on
+  the analytical 1-/2-/3-compartment models. The exact closed-form marginal
+  gradient now covers κ (kappa) random effects: the EBE response, inner Jacobian,
+  and θ/Ω/σ packed blocks are assembled over the stacked random-effects vector
+  `[η_bsv, κ_occasion₁, …, κ_occasion_K]` with the block-diagonal prior
+  `Ω_bsv ⊕ K·Ω_iov` (the shared per-occasion κ-variance). Cross-occasion carryover
+  is differentiated exactly through a second-order-dual event-driven walk (no
+  superposition approximation, no finite differences). **EVID 3/4 resets /
+  washout occasions** are supported on the IOV path as well: the walk zeros the
+  state at each reset and rebuilds the following occasion. Validated against
+  reconverged finite differences (~1e-6 on every packed parameter, FOCEI and
+  FOCE) and against NONMEM on the warfarin IOV model (FOCEI OFV 307.8 vs 308.8,
+  structural parameters within ~1%). Requires a gradient-based outer optimizer
+  (`lbfgs`/`bfgs`/`slsqp`); IOV fits with steady-state doses still fall back to
+  finite differences (#367).
 - **Analytic gradient now covers log-transform-both-sides (LTBS) and constant
   output scaling** for the analytical PK models: the sensitivity provider applies
   the `g = ln(f)` jet transform (value, gradient, and Hessian via

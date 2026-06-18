@@ -135,7 +135,14 @@ fn prepare(
     params: &ModelParameters,
     sens: &SubjectSens,
 ) -> Option<Prep> {
-    prepare_stacked(model, subject, params, sens, model.n_eta, params.omega.inv.clone())
+    prepare_stacked(
+        model,
+        subject,
+        params,
+        sens,
+        model.n_eta,
+        params.omega.inv.clone(),
+    )
 }
 
 /// [`prepare`] generalized over the random-effect dimension and prior precision,
@@ -310,8 +317,12 @@ pub fn subject_theta_gradient_iov(
     params: &ModelParameters,
     stacked_eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
-    let sens =
-        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, stacked_eta_hat)?;
+    let sens = crate::sens::provider::subject_sensitivities_iov(
+        model,
+        subject,
+        &params.theta,
+        stacked_eta_hat,
+    )?;
     let k_groups = crate::stats::likelihood::split_obs_by_occasion(subject).len();
     let n_stacked = model.n_eta + k_groups * model.n_kappa;
     if stacked_eta_hat.len() != n_stacked {
@@ -607,8 +618,12 @@ pub fn subject_packed_gradient_iov(
     stacked_eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
     let params = unpack_params(x, template);
-    let sens =
-        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, stacked_eta_hat)?;
+    let sens = crate::sens::provider::subject_sensitivities_iov(
+        model,
+        subject,
+        &params.theta,
+        stacked_eta_hat,
+    )?;
     let k = crate::stats::likelihood::split_obs_by_occasion(subject).len();
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
@@ -1119,8 +1134,12 @@ pub fn subject_eta_dx_iov(
     stacked_eta_hat: &[f64],
 ) -> Option<Vec<DVector<f64>>> {
     let params = unpack_params(x, template);
-    let sens =
-        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, stacked_eta_hat)?;
+    let sens = crate::sens::provider::subject_sensitivities_iov(
+        model,
+        subject,
+        &params.theta,
+        stacked_eta_hat,
+    )?;
     let k = crate::stats::likelihood::split_obs_by_occasion(subject).len();
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
@@ -1231,8 +1250,12 @@ pub fn subject_packed_gradient_foce_iov(
     stacked_eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
     let params = unpack_params(x, template);
-    let sens =
-        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, stacked_eta_hat)?;
+    let sens = crate::sens::provider::subject_sensitivities_iov(
+        model,
+        subject,
+        &params.theta,
+        stacked_eta_hat,
+    )?;
     let k = crate::stats::likelihood::split_obs_by_occasion(subject).len();
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
@@ -1245,7 +1268,8 @@ pub fn subject_packed_gradient_foce_iov(
         return None;
     }
     let zeros = vec![0.0f64; n_st];
-    let sens0 = crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, &zeros)?;
+    let sens0 =
+        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, &zeros)?;
     if sens.obs.len() != n_obs || sens0.obs.len() != n_obs {
         return None;
     }
@@ -2131,6 +2155,150 @@ mod tests {
         run_population_packed_gradient_check(&model, &[5.0, 30.0, 2.0, 50.0, 1.0]);
     }
 
+    // 1-cpt IV (log-normal CL/V) used by the EVID=3/4 reset gradient checks: the
+    // provider rebuilds each observation from the doses in its current reset
+    // segment, so a reset subject's `∂f/∂η`, `∂²f/∂η²`, `∂f/∂θ`, `∂²f/∂η∂θ` jet —
+    // and therefore the assembled θ/Ω/σ packed gradient — must still match
+    // reconverged FD with no special-casing in the outer assembly.
+    const ONECPT_IV_RESET: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// Two IV-infusion occasions separated by an EVID=4 reset at t=120: occasion-2
+    /// observations must rebuild from zero (no carryover across the reset). The
+    /// observations are synthesised from the production predictor at a reference η
+    /// so residuals are realistic and nonzero.
+    fn reset_subject_outer(
+        model: &CompiledModel,
+        theta: &[f64],
+        eta_ref: &[f64],
+        id: &str,
+    ) -> Subject {
+        let obs_times = vec![2.0, 4.0, 8.0, 60.0, 122.0, 126.0, 150.0];
+        let n = obs_times.len();
+        let mut subject = Subject {
+            id: id.to_string(),
+            doses: vec![
+                DoseEvent::new(0.0, 1000.0, 1, 200.0, false, 0.0),
+                DoseEvent::new(120.0, 1000.0, 1, 200.0, false, 0.0),
+            ],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: vec![120.0],
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        assert!(subject.has_resets(), "fixture must carry a reset");
+        let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, eta_ref);
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        subject
+    }
+
+    /// FOCEI and FOCE packed gradients for a population containing a reset-bearing
+    /// subject must both match Richardson reconverged-FD of their respective
+    /// marginal objectives. This is the outer-assembly counterpart to the
+    /// provider-vs-production reset tests in `sens::provider`: it confirms the
+    /// reset segment's jet flows correctly through the θ/Ω/σ blocks (incl. the EBE
+    /// response) for both estimation methods.
+    #[test]
+    fn population_packed_gradient_reset_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+
+        let model = parse_model_string(ONECPT_IV_RESET).expect("parse");
+        let theta = [0.22, 11.0];
+        let eta_ref = [0.12, -0.08];
+
+        // One reset subject + one ordinary subject, so the population mixes both.
+        let s_reset = reset_subject_outer(&model, &theta, &eta_ref, "reset");
+        let s_plain = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let pop = Population {
+            subjects: vec![s_reset, s_plain],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+
+        // Both FOCEI (Almquist Laplace) and FOCE (Sheiner–Beal) paths.
+        for interaction in [true, false] {
+            let analytic = if interaction {
+                population_gradient_sens(&model, &pop, &template, &x, &ehs)
+            } else {
+                population_gradient_sens_foce(&model, &pop, &template, &x, &ehs)
+            }
+            .expect("reset subject supported by analytic gradient");
+
+            let ofv = |xv: &[f64]| -> f64 {
+                let p = unpack_params(xv, &template);
+                2.0 * pop
+                    .subjects
+                    .iter()
+                    .map(|s| {
+                        if interaction {
+                            marginal_nll(&model, s, &p)
+                        } else {
+                            marginal_nll_foce(&model, s, &p)
+                        }
+                    })
+                    .sum::<f64>()
+            };
+            let fd_at = |k: usize, h: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[k] += h;
+                let mut xm = x.clone();
+                xm[k] -= h;
+                (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+            };
+            for k in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[k].abs());
+                let f1 = fd_at(k, h);
+                let f2 = fd_at(k, h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0;
+                eprintln!(
+                    "interaction={interaction} x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                    analytic[k],
+                    fd,
+                    (analytic[k] - fd).abs() / fd.abs().max(1e-12)
+                );
+                approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
+            }
+        }
+    }
+
     // 1-cpt oral with a log-normal dose lagtime (`LAGTIME = TVLAG·exp(ETA_LAG)`):
     // the lagtime θ (`TVLAG`) and ω (`ETA_LAG`) enter the packed gradient through
     // the provider's `∂f/∂θ` / `∂²f/∂η∂θ` for the lag slot, with no special-casing.
@@ -2600,9 +2768,13 @@ mod tests {
         let omega_inv = block.cholesky().unwrap().inverse();
         let sigma = &params.sigma.values;
         for _ in 0..50 {
-            let sens =
-                crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, &stacked)
-                    .unwrap();
+            let sens = crate::sens::provider::subject_sensitivities_iov(
+                model,
+                subject,
+                &params.theta,
+                &stacked,
+            )
+            .unwrap();
             let mut g = &omega_inv * DVector::from_column_slice(&stacked);
             let mut h = omega_inv.clone();
             for (j, obs) in sens.obs.iter().enumerate() {
@@ -2616,8 +2788,8 @@ mod tests {
                 for kk in 0..n_st {
                     g[kk] += 0.5 * t.alpha * a[kk];
                     for ll in 0..n_st {
-                        h[(kk, ll)] +=
-                            0.5 * (t.alpha_p * a[kk] * a[ll] + t.alpha * obs.d2f_deta2[kk * n_st + ll]);
+                        h[(kk, ll)] += 0.5
+                            * (t.alpha_p * a[kk] * a[ll] + t.alpha * obs.d2f_deta2[kk * n_st + ll]);
                     }
                 }
             }
@@ -2632,12 +2804,18 @@ mod tests {
         let eta = DVector::from_column_slice(&stacked[..n_eta]);
         let kappas: Vec<DVector<f64>> = (0..k)
             .map(|gi| {
-                DVector::from_column_slice(&stacked[n_eta + gi * n_kappa..n_eta + (gi + 1) * n_kappa])
+                DVector::from_column_slice(
+                    &stacked[n_eta + gi * n_kappa..n_eta + (gi + 1) * n_kappa],
+                )
             })
             .collect();
-        let sens =
-            crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, &stacked)
-                .unwrap();
+        let sens = crate::sens::provider::subject_sensitivities_iov(
+            model,
+            subject,
+            &params.theta,
+            &stacked,
+        )
+        .unwrap();
         let n_obs = subject.obs_times.len();
         let mut hm = DMatrix::zeros(n_obs, n_eta);
         for j in 0..n_obs {
@@ -2804,6 +2982,75 @@ mod tests {
                 (analytic[i] - fd).abs() / fd.abs().max(1e-9)
             );
             approx::assert_relative_eq!(analytic[i], fd, max_relative = 2e-3, epsilon = 2e-5);
+        }
+    }
+
+    /// IOV with an EVID=4 washout reset at the occasion boundary: the same
+    /// two-occasion subject as `iov_subject_outer`, but occasion 2 rebuilds from
+    /// zero (no carryover). The full packed gradient — FOCEI **and** FOCE — must
+    /// still match Richardson reconverged FD of the IOV marginal, confirming the
+    /// reset jet flows through the stacked-η / block-Ω assembly unchanged.
+    fn iov_subject_outer_reset(model: &CompiledModel, theta: &[f64]) -> Subject {
+        let mut s = iov_subject_outer(model, theta);
+        s.reset_times = vec![24.0];
+        assert!(s.has_resets(), "fixture must carry a reset");
+        // Re-synthesise observations through the reset-aware predict_iov so ε ≠ 0.
+        let preds = crate::pk::predict_iov(
+            model,
+            &s,
+            theta,
+            &[0.12, -0.08, 0.2],
+            &[vec![0.05], vec![-0.07]],
+        );
+        s.observations = preds.iter().map(|p| p * 0.85).collect();
+        s
+    }
+
+    #[test]
+    fn iov_packed_gradient_reset_matches_reconverged_fd() {
+        let model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_subject_outer_reset(&model, &theta);
+        let template = params.clone();
+        let x = crate::estimation::parameterization::pack_params(&params);
+
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+
+        // FOCEI (Almquist Laplace) and FOCE (Sheiner–Beal) over the reset subject.
+        for interaction in [true, false] {
+            let analytic = if interaction {
+                subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+            } else {
+                subject_packed_gradient_foce_iov(&model, &subject, &template, &x, &stacked)
+            }
+            .expect("IOV+reset packed gradient supported");
+
+            let f = |xx: &[f64]| -> f64 {
+                let p = unpack_params(xx, &template);
+                marginal_nll_iov_inter(&model, &subject, &p, interaction)
+            };
+            for i in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[i].abs());
+                let fd_at = |hh: f64| -> f64 {
+                    let mut xp = x.clone();
+                    xp[i] += hh;
+                    let mut xm = x.clone();
+                    xm[i] -= hh;
+                    (f(&xp) - f(&xm)) / (2.0 * hh)
+                };
+                let f1 = fd_at(h);
+                let f2 = fd_at(h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+                eprintln!(
+                    "iov reset interaction={interaction} x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                    analytic[i],
+                    fd,
+                    (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+                );
+                approx::assert_relative_eq!(analytic[i], fd, max_relative = 2e-3, epsilon = 2e-5);
+            }
         }
     }
 }

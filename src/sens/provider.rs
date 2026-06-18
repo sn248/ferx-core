@@ -450,7 +450,16 @@ pub fn subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
-    if !iov_analytical_supported(model) || subject.has_tv_covariates() || subject.has_resets() {
+    if !iov_analytical_supported(model) || subject.has_tv_covariates() {
+        return None;
+    }
+    // EVID=3/4 resets are honoured by the event-driven walk: it zeros the dual
+    // state at each reset and rebuilds the post-reset occasion from the schedule,
+    // exactly as production's `event_driven_predictions` does (the `f64` instance
+    // of the same walk). Steady-state doses assume an infinite periodic history
+    // that a mid-record reset contradicts, so a subject mixing SS with resets
+    // falls back to FD — mirroring the non-IOV provider.
+    if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
     // Keep the first cut to the clean shape: no EVID=2 rows, every dose/obs in a
@@ -552,9 +561,7 @@ pub fn subject_sensitivities_iov(
             }
         };
     }
-    disp!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
-    )
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
 }
 
 /// The dual-width-`M` inner of [`subject_sensitivities_iov`] (`M = n_theta +
@@ -2856,7 +2863,12 @@ mod tests {
                 let mut tm = theta.clone();
                 tm[m] -= s;
                 let g = (pred(&stacked, &tp, j) - pred(&stacked, &tm, j)) / (2.0 * s);
-                approx::assert_relative_eq!(obs.df_dtheta[m], g, max_relative = 2e-4, epsilon = 1e-7);
+                approx::assert_relative_eq!(
+                    obs.df_dtheta[m],
+                    g,
+                    max_relative = 2e-4,
+                    epsilon = 1e-7
+                );
                 for k in 0..n_st {
                     let sh = heh * (1.0 + theta[m].abs());
                     let mut ep = stacked.clone();
@@ -2892,6 +2904,66 @@ mod tests {
         );
         let subject = iov_subject();
         // stacked = [η_cl, η_v, η_ka, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// Two-occasion IOV subject with a washout: an EVID=4 reset at t=24 zeros the
+    /// state and opens occasion 2, so there is NO carryover across the boundary
+    /// (the complement of `iov_subject`, which carries occasion-1 amounts forward).
+    /// Exercises the walk's reset handling under per-occasion κ seeding.
+    fn iov_reset_subject() -> Subject {
+        let obs_times = vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0];
+        let occasions = vec![1u32, 1, 1, 2, 2, 2];
+        let n = obs_times.len();
+        Subject {
+            id: "1".to_string(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: vec![24.0],
+            cens: vec![0; n],
+            occasions,
+            dose_occasions: vec![1, 2],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    /// 1-cpt oral IOV **with an EVID=4 washout reset** at the occasion boundary:
+    /// the provider's value/grad/Hessian over `[η_bsv, κ_g0, κ_g1]` + θ must still
+    /// match FD of `predict_iov` (which routes the reset through the same
+    /// event-driven walk). Confirms ungating resets in `subject_sensitivities_iov`
+    /// keeps the (η, κ, θ) chain exact across the reset.
+    #[test]
+    fn iov_provider_with_reset_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        let subject = iov_reset_subject();
+        assert!(subject.has_resets(), "fixture must carry a reset");
+        assert!(
+            subject_sensitivities_iov(
+                &model,
+                &subject,
+                &[0.2, 10.0, 1.5],
+                &[0.1, 0.0, 0.1, 0.0, 0.0]
+            )
+            .is_some(),
+            "IOV + reset subject must be analytic-supported"
+        );
         check_iov_provider_vs_fd(
             &model,
             &subject,

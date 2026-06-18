@@ -2348,15 +2348,16 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
 
-    /// TV-cov subject: one oral dose with `WT` changing across observations (and an
-    /// optional EVID=2 covariate breakpoint at `pk_only_times`). Observations are
-    /// synthesised from the production predictor at a reference η so residuals are
-    /// realistic and nonzero.
+    /// TV-cov subject: one dose with `WT` changing across observations (and an
+    /// optional EVID=2 covariate breakpoint at `pk_only_times`). `dose` lets the
+    /// caller pass a steady-state dose. Observations are synthesised from the
+    /// production predictor at a reference η so residuals are realistic and nonzero.
     #[allow(clippy::too_many_arguments)]
     fn tvcov_subject_outer(
         model: &CompiledModel,
         theta: &[f64],
         eta_ref: &[f64],
+        dose: DoseEvent,
         obs_times: &[f64],
         obs_wts: &[f64],
         pk_only_times: Vec<f64>,
@@ -2371,7 +2372,7 @@ mod tests {
         };
         let mut subject = Subject {
             id: id.to_string(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            doses: vec![dose],
             obs_times: obs_times.to_vec(),
             obs_raw_times: Vec::new(),
             observations: vec![0.0; n],
@@ -2417,6 +2418,7 @@ mod tests {
             &model,
             &theta,
             &eta_ref,
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             &[1.0, 2.0, 4.0, 8.0, 24.0],
             &[70.0, 74.0, 82.0, 88.0, 95.0],
             Vec::new(),
@@ -2427,14 +2429,33 @@ mod tests {
             &model,
             &theta,
             &eta_ref,
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             &[1.0, 2.0, 6.0, 12.0],
             &[70.0, 70.0, 95.0, 95.0],
             vec![4.0],
             &[95.0],
             "tvcov_brk",
         );
+        // Third subject: a steady-state (II=24) oral dose with WT changing across
+        // observations, so the SS-equilibrated jet flows through the packed
+        // gradient and its reconverged-FD reference too.
+        let s_ss = tvcov_subject_outer(
+            &model,
+            &theta,
+            &eta_ref,
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0),
+            &[1.0, 4.0, 9.0, 15.0, 22.0],
+            &[70.0, 76.0, 84.0, 90.0, 96.0],
+            Vec::new(),
+            &[],
+            "tvcov_ss",
+        );
+        assert!(
+            s_ss.doses.iter().any(|d| d.ss),
+            "SS fixture must carry an SS dose"
+        );
         let pop = Population {
-            subjects: vec![s_obs, s_brk],
+            subjects: vec![s_obs, s_brk, s_ss],
             covariate_names: vec!["WT".into()],
             dv_column: "DV".into(),
             input_columns: vec![],

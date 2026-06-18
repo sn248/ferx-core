@@ -10,28 +10,13 @@ use crate::types::DoseEvent;
 // the hot path identical. The peripheral-amount helpers (`*_peripheral`) and the
 // local `macro_rates` they share have no concentration analogue and stay here.
 
-/// Compute macro-rate constants (alpha, beta) from micro-constants.
-/// Uses Vieta's formula for beta to avoid catastrophic cancellation
-/// when s >> sqrt(s^2 - 4d).
+/// Compute macro-rate constants (alpha, beta, k21) from micro-constants —
+/// delegates to the single generic source `sens::two_cpt::macro_rates_g` at
+/// `T = f64` (the peripheral-amount helpers below are the only remaining f64
+/// callers).
+#[inline]
 fn macro_rates(cl: f64, v1: f64, q: f64, v2: f64) -> (f64, f64, f64) {
-    let k10 = cl / v1;
-    let k12 = q / v1;
-    let k21 = q / v2;
-    let s = k10 + k12 + k21;
-    let d = k10 * k21;
-    let disc = {
-        let x = s * s - 4.0 * d;
-        if x > 0.0 {
-            x.sqrt()
-        } else {
-            0.0
-        }
-    };
-    let alpha = (s + disc) / 2.0;
-    // Vieta's formula: alpha * beta = d, so beta = d / alpha
-    // This avoids subtracting two nearly-equal large numbers.
-    let beta = if alpha > 1e-30 { d / alpha } else { 0.0 };
-    (alpha, beta, k21)
+    crate::sens::two_cpt::macro_rates_g::<f64>(cl, v1, q, v2)
 }
 
 /// Two-compartment IV bolus

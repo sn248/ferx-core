@@ -11,10 +11,12 @@ use crate::types::DoseEvent;
 // (`three_cpt_*_peripherals`) and the local `macro_rates_three_cpt` they share have
 // no concentration analogue and stay here.
 
-/// Compute macro-rate constants (alpha, beta, gamma) from micro-constants
-/// for a three-compartment model using the trigonometric (Vieta) method.
-///
-/// Returns (alpha, beta, gamma, k21, k31) where alpha > beta > gamma > 0.
+/// Compute macro-rate constants (alpha, beta, gamma, k21, k31) from
+/// micro-constants for a three-compartment model — delegates to the single
+/// generic source `sens::three_cpt::macro_rates_three_cpt_g` at `T = f64` (the
+/// trigonometric/Vieta cubic solve lives once; the peripheral-amount helpers
+/// below are the only remaining f64 callers).
+#[inline]
 fn macro_rates_three_cpt(
     cl: f64,
     v1: f64,
@@ -23,51 +25,7 @@ fn macro_rates_three_cpt(
     q3: f64,
     v3: f64,
 ) -> (f64, f64, f64, f64, f64) {
-    let k10 = cl / v1;
-    let k12 = q2 / v1;
-    let k21 = q2 / v2;
-    let k13 = q3 / v1;
-    let k31 = q3 / v3;
-
-    // Symmetric functions of the roots (Vieta's formulas)
-    let s2 = k10 + k12 + k13 + k21 + k31;
-    let s1 = k10 * k21 + k10 * k31 + k21 * k31 + k12 * k31 + k13 * k21;
-    let s0 = k10 * k21 * k31;
-
-    // Depress the cubic: lambda = x + s2/3
-    let h = s2 / 3.0;
-    let p = s1 - s2 * s2 / 3.0;
-    let q = s1 * s2 / 3.0 - 2.0 * s2 * s2 * s2 / 27.0 - s0;
-
-    // Trigonometric solution (three distinct real roots guaranteed for valid PK params)
-    let p_safe = p.min(-1e-30); // guard against p=0
-    let m = 2.0 * (-p_safe / 3.0).sqrt();
-    let arg = (3.0 * q / (p_safe * m)).clamp(-1.0, 1.0);
-    let phi = arg.acos() / 3.0;
-
-    let pi_2_3 = 2.0 * std::f64::consts::FRAC_PI_3;
-    let lambda0 = m * phi.cos() + h;
-    let lambda1 = m * (phi - pi_2_3).cos() + h;
-    let lambda2 = m * (phi - 2.0 * pi_2_3).cos() + h;
-
-    // Sort: alpha > beta > gamma
-    let alpha = if lambda0 >= lambda1 && lambda0 >= lambda2 {
-        lambda0
-    } else if lambda1 >= lambda2 {
-        lambda1
-    } else {
-        lambda2
-    };
-    let gamma = if lambda0 <= lambda1 && lambda0 <= lambda2 {
-        lambda0
-    } else if lambda1 <= lambda2 {
-        lambda1
-    } else {
-        lambda2
-    };
-    let beta = s2 - alpha - gamma;
-
-    (alpha, beta, gamma, k21, k31)
+    crate::sens::three_cpt::macro_rates_three_cpt_g::<f64>(cl, v1, q2, v2, q3, v3)
 }
 
 /// Three-compartment IV bolus

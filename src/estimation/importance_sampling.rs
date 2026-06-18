@@ -386,7 +386,8 @@ pub fn run_importance_sampling(
                 // draws routine and keep only its marginal-LL / ESS diagnostics.
                 if let Some((ref pk_idx, ref cov_idx)) = frem_rb {
                     if let Some(fc) = model.frem_config.as_ref() {
-                        if let Some(d) = subject_cov_deviations(subject, &params.theta, fc, cov_idx)
+                        if let Some((sampled, observed, d)) =
+                            subject_frem_partition(subject, &params.theta, fc, pk_idx, cov_idx)
                         {
                             if let Some(rb) = subject_is_draws_frem_rb(
                                 model,
@@ -397,8 +398,8 @@ pub fn run_importance_sampling(
                                 &h_post,
                                 &omega_inv,
                                 &params.omega.matrix,
-                                pk_idx,
-                                cov_idx,
+                                &sampled,
+                                &observed,
                                 &d,
                                 n_eta,
                                 k_samples,
@@ -743,29 +744,57 @@ pub(crate) fn frem_pk_cov_partition(fc: &FremConfig, n_eta: usize) -> (Vec<usize
     (pk_idx, cov_idx)
 }
 
-/// Per-subject covariate deviations `dₖ = cov_obsₖ − TVₖ`, ordered to match
-/// `cov_idx`. Returns `None` (→ caller falls back to full-dimensional IS) if any
-/// covariate eta has no matching FREMTYPE pseudo-observation row in this subject.
-pub(crate) fn subject_cov_deviations(
+/// Per-subject Rao-Blackwell partition for a FREM model with possibly-missing
+/// covariates. Splits the covariate etas into:
+///   - **observed** (a FREMTYPE pseudo-observation row exists): pinned at their
+///     data value `dₖ = cov_obsₖ − TVₖ` and integrated analytically, and
+///   - **missing** (no pseudo-obs row — the FREM data omits rows for missing
+///     covariate values): latent, so they are sampled together with the PK etas
+///     (the omega correlation structure imputes them, matching NONMEM).
+///
+/// Returns `(sampled_idx, observed_idx, d)` where `sampled_idx = pk_idx ∪
+/// missing-covariate etas` (ascending) and `observed_idx` / `d` are aligned. The
+/// precision-form conditional prior in [`subject_is_draws_frem_rb`] is exact for
+/// this split because *all* of `observed_idx` is conditioned on and *everything
+/// else* is sampled. Returns `None` only when no covariate is observed for the
+/// subject (→ caller falls back to full-dimensional IS).
+pub(crate) fn subject_frem_partition(
     subject: &Subject,
     theta: &[f64],
     fc: &FremConfig,
+    pk_idx: &[usize],
     cov_idx: &[usize],
-) -> Option<Vec<f64>> {
+) -> Option<(Vec<usize>, Vec<usize>, Vec<f64>)> {
     // eta_idx → (fremtype, theta_idx)
     let mut eta_to_ft: std::collections::HashMap<usize, (u16, usize)> =
         std::collections::HashMap::new();
     for (&ft, &(t, e)) in fc.fremtype_to_indices.iter() {
         eta_to_ft.insert(e, (ft, t));
     }
+    let mut observed = Vec::with_capacity(cov_idx.len());
     let mut d = Vec::with_capacity(cov_idx.len());
+    let mut missing = Vec::new();
     for &e in cov_idx {
-        let (ft, t) = *eta_to_ft.get(&e)?;
-        let row = subject.fremtype.iter().position(|&x| x == ft)?;
-        let obs = *subject.observations.get(row)?;
-        d.push(obs - theta.get(t).copied().unwrap_or(0.0));
+        match eta_to_ft.get(&e) {
+            Some(&(ft, t)) => match subject.fremtype.iter().position(|&x| x == ft) {
+                Some(row) => match subject.observations.get(row) {
+                    Some(&obs) => {
+                        observed.push(e);
+                        d.push(obs - theta.get(t).copied().unwrap_or(0.0));
+                    }
+                    None => missing.push(e),
+                },
+                None => missing.push(e),
+            },
+            None => missing.push(e),
+        }
     }
-    Some(d)
+    if observed.is_empty() {
+        return None;
+    }
+    let mut sampled: Vec<usize> = pk_idx.iter().chain(missing.iter()).copied().collect();
+    sampled.sort_unstable();
+    Some((sampled, observed, d))
 }
 
 /// Extract the sub-matrix `m[rows, cols]`.
@@ -780,8 +809,13 @@ fn submatrix(m: &DMatrix<f64>, rows: &[usize], cols: &[usize]) -> DMatrix<f64> {
 }
 
 /// Rao-Blackwellised FREM E-step for one subject. See the module section above.
-/// Returns `None` if the partition/conditioning is degenerate (caller then falls
-/// back to the full-dimensional [`subject_is_draws`]).
+///
+/// `pk_idx` is the **sampled** eta set (PK etas plus any missing-covariate etas,
+/// from [`subject_frem_partition`]) and `cov_idx` / `d` are the **observed**
+/// covariate etas pinned at their data deviations. The precision-form conditional
+/// prior is exact for this split: all of `cov_idx` is conditioned on and
+/// everything in `pk_idx` is sampled. Returns `None` if the conditioning is
+/// degenerate (caller then falls back to the full-dimensional [`subject_is_draws`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_is_draws_frem_rb(
     model: &CompiledModel,

@@ -673,11 +673,12 @@ fn run_mcem(
                 // ISCALE pilot search (a full-dimensional ESS rescue) is skipped.
                 if let Some((ref pk_idx, ref cov_idx)) = frem_rb {
                     if let Some(fc) = model.frem_config.as_ref() {
-                        if let Some(d) =
-                            crate::estimation::importance_sampling::subject_cov_deviations(
+                        if let Some((sampled, observed, d)) =
+                            crate::estimation::importance_sampling::subject_frem_partition(
                                 subject,
                                 &params_k.theta,
                                 fc,
+                                pk_idx,
                                 cov_idx,
                             )
                         {
@@ -691,8 +692,8 @@ fn run_mcem(
                                     &h_post,
                                     &omega_inv,
                                     &params_k.omega.matrix,
-                                    pk_idx,
-                                    cov_idx,
+                                    &sampled,
+                                    &observed,
                                     &d,
                                     n_eta,
                                     k_samples,

@@ -304,6 +304,15 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **IMP/IMPMAP no longer diverge on FREM models with missing covariates**: the
+  Rao-Blackwellised E-step previously bailed to the unstable full-dimensional
+  importance sampler for any subject missing a covariate pseudo-observation row
+  (the FREM data omits rows for missing covariate values — ~28% of subjects on
+  the workshop model). Those subjects then blew the −2logL up to ~1e14 within a
+  few iterations under `method = imp`. Missing-covariate etas (which have no data)
+  are now sampled together with the PK etas, conditioning only on the *observed*
+  covariates; both IMP and IMPMAP now converge with near-zero low-ESS subjects and
+  agree on the estimates. (#406)
 - **FREM covariate pseudo-observations are no longer clamped to a positive
   prediction**: the observation likelihood clamped every prediction to `≥1e-12`,
   but a FREM covariate pseudo-obs predicts a covariate *value* (centered,

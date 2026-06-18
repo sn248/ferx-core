@@ -1230,6 +1230,49 @@ mod tests {
     }
 
     #[test]
+    fn frem_partition_samples_missing_covariate_etas() {
+        // Regression (#406): a subject missing a covariate pseudo-obs row (the
+        // FREM data omits rows for missing covariate values) must NOT bail to the
+        // unstable full-dimensional IS. subject_frem_partition puts the missing
+        // covariate eta into the *sampled* set (with the PK etas) and pins only
+        // the observed covariate eta at its data deviation.
+        let mut map = std::collections::HashMap::new();
+        map.insert(100u16, (0usize, 1usize)); // FREMTYPE 100 -> (theta 0, eta 1) OBSERVED
+        map.insert(300u16, (0usize, 3usize)); // FREMTYPE 300 -> (theta 0, eta 3) MISSING
+        let fc = FremConfig {
+            fremtype_to_indices: map,
+            covariate_sigma_index: 0,
+        };
+        let mut subj = make_test_population().subjects.remove(0);
+        subj.obs_times = vec![1.0, 1.0];
+        subj.obs_raw_times = vec![1.0, 1.0];
+        subj.observations = vec![5.0, 7.0]; // row1 = PK obs, row2 = FREMTYPE 100 cov obs
+        subj.obs_cmts = vec![1, 1];
+        subj.cens = vec![0, 0];
+        subj.fremtype = vec![0, 100]; // FREMTYPE 300 (eta 3) has NO row -> missing
+
+        let theta = vec![0.2, 10.0, 1.5];
+        let (sampled, observed, d) =
+            crate::estimation::importance_sampling::subject_frem_partition(
+                &subj,
+                &theta,
+                &fc,
+                &[0, 2], // pk etas
+                &[1, 3], // covariate etas
+            )
+            .expect("Some when at least one covariate observed");
+
+        assert_eq!(
+            sampled,
+            vec![0, 2, 3],
+            "missing cov eta 3 joins the sampled PK set"
+        );
+        assert_eq!(observed, vec![1], "only eta 1 (FREMTYPE 100) is observed");
+        assert_eq!(d.len(), 1);
+        assert!((d[0] - (7.0 - 0.2)).abs() < 1e-12, "d = cov_obs - TV");
+    }
+
+    #[test]
     fn obs_nll_does_not_clamp_negative_covariate_pseudo_obs() {
         // Regression (#406): a FREM covariate pseudo-observation predicts a
         // covariate *value* (TV+eta), which can be ≤ 0 for centered/standardized/

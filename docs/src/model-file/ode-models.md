@@ -204,6 +204,123 @@ RHS that is *not* bioavailability, give it a different name.
 
 See `examples/bioavailability_ode.ferx` for a complete worked model.
 
+### Compartment-indexed bioavailability and lag (`Fn` / `ALAGn`)
+
+When a model is dosed into **more than one compartment**, bioavailability and
+absorption lag can differ by route. Mirroring NONMEM's `F1`/`F2` and
+`ALAG1`/`ALAG2`, name an individual parameter `F{n}` or `ALAG{n}` (equivalently
+`LAGTIME{n}`), where `n` is the 1-based dose compartment:
+
+```text
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  F1    = inv_logit(THETA_F1)   # bioavailability for doses into compartment 1
+  F2    = inv_logit(THETA_F2)   # ... and into compartment 2
+  ALAG2 = TVLAG2                # absorption lag for compartment-2 doses only
+```
+
+- A dose into compartment `n` uses `F{n}` / `ALAG{n}` if declared.
+- A **bare** `F` / `lagtime` (no index) remains the all-compartment default, so
+  existing single-route models are unchanged. An indexed value overrides the
+  bare default for its compartment only; compartments without an indexed entry
+  fall back to the bare value (or to `F = 1`, `lag = 0`).
+- The index must refer to a compartment the model actually has — `F3` on a
+  two-state model is a parse error, not a silently-ignored parameter.
+- Each declared `Fn`/`ALAGn` occupies one of the seven spare slots in the
+  fixed 16-slot PK parameter layout (shared with other ODE structural
+  parameters). Declaring the full set for many compartments can exhaust them;
+  if so, `ode_param_slots` reports a clear "too many individual parameters"
+  error rather than failing silently.
+
+> ⚠️ **`F{n}` / `ALAG{n}` / `LAGTIME{n}` are reserved names** (just like the
+> bare `F` / `lagtime` above, and exactly as in NONMEM). On an ODE model,
+> declaring an individual parameter with one of these names binds it as
+> compartment `n`'s bioavailability / lag and applies it to **every** dose into
+> compartment `n` — even if you also reference the parameter in the `[odes]`
+> RHS. So don't reuse `F2`, `ALAG2`, … for an unrelated fraction or rate term;
+> give such a quantity a different (un-indexed-looking) name.
+
+This is an **ODE-engine** feature: the analytical PK functions have a single
+fixed dose route, so they take only the bare `f=`/`lagtime=` mapping. (The
+EKF/`[diffusion]` path applies per-compartment `F` but, as elsewhere, does not
+apply absorption lag.)
+
+> Per-compartment **observation scaling** (NONMEM's `Sn`, e.g. `S2 = V`) is a
+> separate, readout-side concept — it divides a compartment's amount to give the
+> observed concentration. It is configured in the [`[scaling]`](scaling.md)
+> block (`obs_scale[CMT=n] = …` or `y[CMT=n] = …`), not via a reserved `Sn`
+> individual parameter.
+
+### Modeled infusion duration (`Dn`, `RATE=-2`)
+
+NONMEM's `RATE = -2` makes a zero-order infusion's **duration** a model parameter
+rather than a data value. Mirror it by naming an individual parameter `D{n}` for
+the dose compartment `n`, and coding `RATE = -2` on the dose row (`AMT` is still
+the amount). ferx then infuses `AMT` over the modeled duration `D{n}` — i.e. at
+rate `AMT / D{n}` — resolved **per iteration and occasion** from the parameter,
+so the duration can carry covariate effects and between-occasion variability:
+
+```text
+[parameters]
+  theta TVD1(2.0, 0.1, 24.0)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  D1 = TVD1 * exp(ETA_D1)   # modeled duration for infusions into compartment 1
+```
+
+```text
+# dataset: a RATE=-2 dose of 100 units into compartment 1
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
+1,0,.,1,100,1,-2,1
+```
+
+- A `RATE=-2` dose into compartment `n` **requires** a `D{n}` parameter; without
+  one it is a loud error at the model+data join (`ferx check` / `fit`), never a
+  silent bolus.
+- `D{n}` composes with the dose attributes above: bioavailability `F{n}` scales
+  the delivered amount **once** (`F·AMT` over `D{n}`, matching NONMEM's `F·RATE`),
+  and absorption lag `ALAG{n}` shifts the infusion window's start while `D{n}`
+  sets its length.
+- A transient `D{n} ≤ 0` during estimation is clamped to a tiny positive floor
+  (so `AMT / D{n}` stays finite); the converged optimum is interior, so reported
+  estimates are unaffected — the same guard the built-in absorption models use.
+
+> ⚠️ Like `F{n}` / `ALAG{n}`, `D{n}` is a **reserved name** when a `RATE=-2` dose
+> targets compartment `n` (as in NONMEM). It then denotes that compartment's
+> infusion duration even if you also reference it in the `[odes]` RHS — so don't
+> reuse `D1`, `D2`, … for an unrelated decay constant or rate term.
+
+`RATE=-2` works on **both engines**. On an analytical model (`pk(...)`) declare
+the `D{n}` individual parameter and the closed-form infusion uses
+`rate = AMT / D{n}`. A `RATE=-2` dose still **requires** a matching `D{n}`
+parameter, or it is a loud error (never a silent bolus). The compartment index
+follows the analytical model's compartment numbering (e.g. `D1` for the central
+compartment of a `two_cpt_iv` model, `D2` for its peripheral compartment).
+
+The modeled duration just sets the *rate* of an otherwise ordinary infusion, so
+the **target compartment must be one the analytical engine can infuse into** —
+exactly the same set as for an explicit positive `RATE`: the central compartment
+for every model, the peripheral compartment(s) for the 2-/3-cpt IV models, and —
+since #400 — the **oral depot** (compartment 1) of `one_cpt_oral` /
+`two_cpt_oral` / `three_cpt_oral`. A `D1` into the oral depot is a **zero-order
+absorption** model: drug is released into the depot at a constant rate over the
+modeled duration, then absorbed first-order into central via `KA`. This stays on
+the closed-form engine — no `ode(...)` block needed. (Per-compartment amounts in
+`sdtab`/`[derived]` are not available for those subjects — the predictions are
+exact; use an `ode(...)` model if you need the compartment amounts.) Infusing
+into an oral **peripheral** compartment is still not modelled by the closed forms,
+so a `D{periph}` (or any other non-infusable compartment) is **rejected at parse
+time** — use an `ode(...)` model. `RATE=-1` (modeled *rate*, `R{n}`) is not yet
+supported on either engine.
+
+> One subtlety: when a subject has any `RATE=-2` dose on an **analytical** model,
+> that subject's inner-loop gradient falls back to finite differences even under
+> `gradient = ad`, because the autodiff kernels cannot carry the duration's
+> `∂/∂η`. Results are unchanged; only the gradient route differs.
+
 ## Stochastic ODE Models (SDE)
 
 To model within-subject system noise that accumulates between observations, add

@@ -17,7 +17,7 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 | `EVID` | integer | 0 | Event ID: 0 = observation, 1 = dose, 2 = other event, 3 = system reset, 4 = reset + dose. If the column is omitted, the record type is inferred from `AMT` — see [Inferring doses without an `EVID` column](#inferring-doses-without-an-evid-column). |
 | `AMT` | numeric | 0 | Dose amount (for `EVID=1`/`EVID=4`; also the dose-inference signal when `EVID` is absent) |
 | `CMT` | integer | 1 | Compartment number (1-indexed) |
-| `RATE` | numeric | 0 | Infusion rate. `0` = bolus, `>0` = constant-rate infusion (duration = `AMT/RATE`). NONMEM's coded values `-1` (modeled rate) and `-2` (modeled duration) are **not yet supported** and are rejected with an error — see [Infusion Doses](#infusion-doses). |
+| `RATE` | numeric | 0 | Infusion rate. `0` = bolus, `>0` = constant-rate infusion (duration = `AMT/RATE`). NONMEM's coded value `-2` (modeled duration via a `D{cmt}` `$PK` parameter) is supported on both analytical and ODE models; `-1` (modeled rate) is not yet supported — see [Infusion Doses](#infusion-doses). |
 | `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored (row excluded from the likelihood) |
 | `II` | numeric | 0 | Interdose interval for repeated dosing |
 | `SS` | integer | 0 | Steady-state flag. 1 = assume steady state |
@@ -229,16 +229,35 @@ NONMEM overloads the `RATE` column with negative codes that change its meaning:
 |--------|----------------|-----------|
 | `0`    | Bolus — route set by the dose compartment | ✅ supported |
 | `> 0`  | Constant-rate infusion (duration = `AMT/RATE`) | ✅ supported |
-| `-1`   | Infusion **rate** is *modeled* — defined by `R1` in `$PK` | ⛔ rejected (error) |
-| `-2`   | Infusion **duration** is *modeled* — defined by `D1` in `$PK` | ⛔ rejected (error) |
+| `-1`   | Infusion **rate** is *modeled* — defined by `R{cmt}` in `$PK` | ⛔ not yet supported (error) |
+| `-2`   | Infusion **duration** is *modeled* — defined by `D{cmt}` in `$PK` | ✅ supported on ODE and analytical models (#324, #394) |
 
-The coded forms `-1`/`-2` (and any other negative or non-finite `RATE`) on a
-dose row are rejected with an informative error. Earlier versions silently
-treated them as a bolus, producing wrong predictions with no warning (#324).
-Until modeled rate/duration support lands, convert such rows to an explicit
-positive `RATE` (= `AMT` ÷ infusion duration) before importing. Note that this
-is **not** a `DURATION` data column — NONMEM's `-1`/`-2` are driven by `$PK`
-parameters, not a separate column.
+`RATE = -2` makes the infusion **duration** a model parameter: declare an
+individual parameter `D{cmt}` (`D1` for a dose into compartment 1, etc.) and ferx
+infuses `AMT` over that duration — rate `AMT / D{cmt}`, evaluated per iteration
+and occasion. Supported on **both** the analytical `pk(...)` engine and `ode(...)`
+models; see
+[Modeled infusion duration](model-file/ode-models.md#modeled-infusion-duration-dn-rate-2)
+for the DSL and semantics. A `RATE=-2` dose with no matching `D{cmt}` parameter
+(on either engine) is a **loud error** — never a silent bolus.
+
+On an analytical **oral** model (`pk one_cpt_oral` / `two_cpt_oral` /
+`three_cpt_oral`), a `D1` into the **depot** (compartment 1) gives a **zero-order
+absorption** model: drug is released into the depot at a constant rate over `D1`,
+then absorbed first-order into central via `KA` (#400). `D2` into the same model
+is a depot-bypassing infusion straight into central. Both stay on the closed-form
+analytical engine — no `ode(...)` block needed. (Compartment amounts in
+`sdtab`/`[derived]` are not available for analytical depot-zero-order subjects;
+the predictions themselves are exact — use an `ode(...)` model if you need the
+per-compartment amounts.) Infusion into an oral **peripheral** compartment is
+still unsupported and needs an `ode(...)` model.
+
+`RATE = -1` (modeled rate, `R{cmt}`) is not yet supported; convert such rows to
+an explicit positive `RATE`, or model the duration with `-2` instead. Any other
+negative or non-finite `RATE` on a dose row is also rejected. Earlier versions
+silently treated all coded forms as a bolus, producing wrong predictions with no
+warning (#324). Note `-1`/`-2` are driven by `$PK` parameters — **not** a
+separate `DURATION` data column.
 
 A runnable demo of the supported forms — a bolus (`RATE=0`) and a constant-rate
 infusion (`RATE>0`) mixed in one dataset — is in `examples/dose_rate.ferx`

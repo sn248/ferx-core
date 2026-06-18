@@ -9,6 +9,7 @@ use crate::io::datareader::{
     ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
+use crate::propensity_match::MatchMethod;
 use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
 use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
 use crate::types::*;
@@ -59,7 +60,16 @@ pub(crate) fn model_preds(
     let mut preds = if let Some(ref ode_spec) = model.ode_spec {
         pk::compute_predictions_ode(ode_spec, subject, &pk_params.values, theta, eta)
     } else {
-        pk::compute_predictions(model.pk_model, subject, pk_params)
+        // Resolve any modeled-`RATE` doses (#324/#394, e.g. `RATE=-2` → `D{cmt}`)
+        // to a concrete duration/rate before the analytical closed form — mirrors
+        // the ODE `resolve_subject_doses` step inside `compute_predictions_ode`.
+        // Borrowed (no allocation) for the all-`Fixed` common case.
+        let resolved = crate::ode::resolve_subject_doses(
+            subject,
+            model.active_dose_attr_map(),
+            &pk_params.values,
+        );
+        pk::compute_predictions(model.pk_model, &resolved, pk_params)
     };
     pk::apply_scaling(model, subject, theta, eta, &mut preds);
     pk::apply_log_transform(model, &mut preds);
@@ -200,6 +210,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             cens: vec![0; sim_spec.obs_times.len()],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         })
@@ -569,6 +580,7 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_iov_occasions(model, population));
     diags.extend(check_absorption_dosing(model, population));
+    diags.extend(check_modeled_dose_rates(model, population));
     diags.extend(validate_output_columns(model, population));
     diags
 }
@@ -654,8 +666,9 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // ODE RHS wrapper, and again as `R_in(tad)` superposed by the input-rate
     // forcing — silently ~doubling exposure. A transit dose carries its mass
     // through `R_in` from the bolus amount; an infusion rate on that record is
-    // undefined, so reject it loudly. (Coded RATE=-1/-2 is already rejected at
-    // the datareader, so `is_infusion()` is the remaining case.)
+    // undefined, so reject it loudly. RATE=-2 (modeled duration) is also an
+    // infusion (`is_infusion()` is true for it), so it is caught here too;
+    // RATE=-1 is rejected at the datareader.
     let has_infusion = population.subjects.iter().any(|s| {
         s.doses
             .iter()
@@ -704,6 +717,86 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     }
 
     diags
+}
+
+/// NONMEM coded `RATE=-2` (modeled infusion duration → `D{cmt}`) needs a
+/// model-aware check the datareader cannot make (it has no model). It is fatal
+/// — never a silent fall-through to a bolus (the original #324 bug):
+///   - **Matching `D{cmt}` parameter.** A `RATE=-2` dose into compartment `n`
+///     requires a `D{n}` parameter (so `resolve_rate` has a slot to read);
+///     otherwise it is rejected. Supported on both engines: ODE models record
+///     the slot on `ode_spec.dose_attr_map`, analytical models (#394) on
+///     `model.dose_attr_map`.
+///
+/// Reported once per offending compartment (naming the first dose that hits it),
+/// so a dataset with many `RATE=-2` rows yields one actionable error per cause.
+/// (The `D{n}`-is-also-an-RHS-rate-constant name collision is handled the same
+/// way `F{n}` is — a documented reserved-name note in `docs/`, not a runtime
+/// check — see ode-models.md.)
+fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    use crate::types::{DoseAttr, RateMode};
+    let mut diags = Vec::new();
+    // De-dup by compartment so N identical RATE=-2 rows give one error, not N.
+    let mut reported: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for subject in &population.subjects {
+        for dose in &subject.doses {
+            if dose.rate_mode != RateMode::ModeledDuration || !reported.insert(dose.cmt) {
+                continue;
+            }
+            let cmt = dose.cmt;
+            // A `RATE=-2` dose into compartment `cmt` requires a matching `D{cmt}`
+            // parameter so `resolve_rate` has a slot to read — for BOTH engines.
+            // `active_dose_attr_map()` returns the engine-correct map (the
+            // `OdeSpec`'s for ODE models, the analytical field otherwise, #394), so
+            // an absent slot is the same actionable error on either engine.
+            let has_slot = model
+                .active_dose_attr_map()
+                .indexed_slot(DoseAttr::Duration, cmt)
+                .is_some();
+            if !has_slot {
+                diags.push(
+                    Diagnostic::error(
+                        "E_MODELED_DURATION_NO_PARAM",
+                        format!(
+                            "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
+                             compartment {cmt} requires a `D{cmt}` parameter in \
+                             [individual_parameters], but none is declared. Add \
+                             `D{cmt} = ...` (the modeled duration), or supply an explicit \
+                             positive RATE.",
+                            subject.id, dose.time
+                        ),
+                    )
+                    .with_block("individual_parameters"),
+                );
+            }
+        }
+    }
+    diags
+}
+
+/// Precondition shared by [`predict`] and the `simulate*` family: every
+/// modeled-`RATE` dose (#324, e.g. `RATE=-2` → `D{cmt}`) must be supported by
+/// the model (an ODE engine with the matching `D{cmt}` parameter).
+///
+/// `fit()` enforces this via [`first_error`] over the full [`check_model_data`],
+/// but `predict()` / `simulate()` deliberately skip that data-check (they assume
+/// a model the caller already validated, and run no other data validation). A
+/// modeled dose slipping through would otherwise hit one of two failure modes
+/// downstream that the per-path `debug_assert!` tripwires only catch in
+/// debug/test builds — silently in release: a 0-rate "infusion" on the
+/// analytical path, or [`DoseEvent::resolve_rate`]'s slot `.expect`. This gate
+/// turns both into a loud, actionable panic carrying the same diagnostic message
+/// `check_model_data` would have produced, reusing the single-source-of-truth
+/// [`check_modeled_dose_rates`]. It is O(doses) and runs once per public call
+/// (not in the inner loop), and is a no-op for the common all-`Fixed` dataset.
+pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: &Population) {
+    if let Err(msg) = first_error(&check_modeled_dose_rates(model, population)) {
+        panic!(
+            "predict()/simulate() received a dose the model cannot honour: {msg}\n\
+             (fit() reports this as an error rather than panicking; validate with \
+             `check_model_data` before predicting on untrusted input.)"
+        );
+    }
 }
 
 /// Model + estimation-option *compatibility* checks that don't depend on data:
@@ -802,11 +895,12 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // IMP is a likelihood evaluation, not an estimator: it may appear at most
-    // once and must be the terminal stage. It may run standalone (as the only
-    // stage), in which case the EBEs/Hessians it consumes are evaluated at the
-    // initial parameters — IMP then reports the −2 log L at those parameters
-    // without estimating them.
+    // `imp` may appear at most once in a chain. By default it is an MCEM
+    // estimator (NONMEM `METHOD=IMP`) and may sit anywhere in the chain. With
+    // `is_eval_only = true` (NONMEM `IMP EONLY=1`) it instead evaluates the
+    // marginal −2 log L at fixed parameters and must be the terminal stage —
+    // placing an evaluator mid-chain would leave `FitResult.importance_sampling`
+    // computed at parameters the following stage then overwrites.
     if chain.iter().any(|&m| m == EstimationMethod::Imp) {
         let n_imp = chain
             .iter()
@@ -821,14 +915,15 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-        if chain.last().copied() != Some(EstimationMethod::Imp) {
+        if options.is_eval_only && chain.last().copied() != Some(EstimationMethod::Imp) {
             diags.push(
                 Diagnostic::error(
                     "E_IMP_CHAIN",
-                    "method `imp` must be the final stage of the chain — placing it mid-chain \
-                     would leave `FitResult.importance_sampling` populated with a log-likelihood \
-                     computed at parameters that the following stage then overwrites. Move `imp` \
-                     to the end.",
+                    "method `imp` with `is_eval_only = true` must be the final stage of the chain \
+                     — placing the evaluator mid-chain would leave `FitResult.importance_sampling` \
+                     populated with a log-likelihood computed at parameters that the following \
+                     stage then overwrites. Move `imp` to the end, or drop `is_eval_only` to run \
+                     it as an estimator.",
                 )
                 .with_block("fit_options"),
             );
@@ -892,6 +987,44 @@ pub fn check_model_data_warnings(
     // these are handled exactly. Only ODE models — and subjects that route to the
     // event-driven walker (EVID 3/4 resets) — still skip SS pre-equilibration.
     let analytic_handles_overlap = model.ode_spec.is_none();
+    // The effective infusion length is
+    // `d.duration` for an ordinary infusion, but for a modeled-duration dose
+    // (RATE=-2 → `D{cmt}`; #324) it is unresolved here (`rate`/`duration` are 0
+    // until `resolve_rate`), so resolve `D{cmt}` at the typical-value point.
+    //
+    // Resolution goes through the single-source-of-truth `DoseEvent::resolve_rate`
+    // (the same rule + `DURATION_FLOOR` clamp the integrator applies at runtime),
+    // not a hand-rolled slot read, so the warning's notion of "duration" can't
+    // drift from the integrator's. It is a *typical-value* heuristic: it uses
+    // init theta, eta = 0, and this subject's covariates, whereas runtime uses
+    // per-occasion eta/IOV — a modeled SS infusion whose duration crosses `II`
+    // only on some occasions may not be flagged here (and conversely a typical
+    // overlap may not occur on every occasion). The runtime SS-skip is the
+    // backstop; this catches the common typical-value / covariate-driven overlap.
+    // (Analytical models reject modeled doses upstream, so the `ode_spec`-less
+    // branch only sees `Fixed` doses.)
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    let effective_duration = |s: &Subject, d: &DoseEvent| -> f64 {
+        if d.is_fixed() {
+            return d.duration;
+        }
+        match &model.ode_spec {
+            // Guard the `D{cmt}` slot's existence: a modeled dose with no matching
+            // parameter is an *error* (`E_MODELED_DURATION_NO_PARAM`), but this
+            // warnings pass must stay panic-free if run on such a model rather than
+            // hit `resolve_rate`'s slot `.expect`.
+            Some(ode)
+                if ode
+                    .dose_attr_map
+                    .indexed_slot(crate::types::DoseAttr::Duration, d.cmt)
+                    .is_some() =>
+            {
+                let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates);
+                d.resolve_rate(&ode.dose_attr_map, &pk.values).duration
+            }
+            _ => 0.0,
+        }
+    };
     let n_ss_overlapping_inf = population
         .subjects
         .iter()
@@ -899,7 +1032,7 @@ pub fn check_model_data_warnings(
             let overlapping = s
                 .doses
                 .iter()
-                .any(|d| d.ss && d.ii > 0.0 && d.rate > 0.0 && d.duration > d.ii);
+                .any(|d| d.ss && d.ii > 0.0 && d.is_infusion() && effective_duration(s, d) > d.ii);
             overlapping && (!analytic_handles_overlap || s.has_resets())
         })
         .count();
@@ -917,6 +1050,51 @@ pub fn check_model_data_warnings(
                 n_ss_overlapping_inf
             ),
         ));
+    }
+
+    // Modeled infusion duration `D{cmt}` (RATE=-2; #324) that is non-positive at
+    // the initial typical-value point (eta = 0). `resolve_rate` clamps a transient
+    // `D ≤ 0` to `DURATION_FLOOR` so `AMT/D` stays finite mid-search, but a
+    // non-positive `D` *at the initial estimate* signals a misspecified
+    // parameterisation: every iteration then delivers `AMT` over ~`DURATION_FLOOR`
+    // — a bolus-like spike, not an infusion — and the fit can converge wrong with
+    // no other diagnostic. Flag it (analogous to W_NEGATIVE_LAGTIME) and point at
+    // a positive-link parameterisation. De-duped per compartment.
+    if let Some(ode) = &model.ode_spec {
+        use crate::types::{DoseAttr, DoseEvent};
+        let mut nonpos_cmts: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for s in &population.subjects {
+            let mut pk_at_init: Option<crate::types::PkParams> = None;
+            for d in &s.doses {
+                if d.is_fixed() {
+                    continue;
+                }
+                if let Some(slot) = ode.dose_attr_map.indexed_slot(DoseAttr::Duration, d.cmt) {
+                    let pk = pk_at_init.get_or_insert_with(|| {
+                        (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates)
+                    });
+                    if pk.values[slot] <= DoseEvent::DURATION_FLOOR {
+                        nonpos_cmts.insert(d.cmt);
+                    }
+                }
+            }
+        }
+        for cmt in nonpos_cmts {
+            diags.push(Diagnostic::warning(
+                "W_MODELED_DURATION_NONPOSITIVE",
+                format!(
+                    "Modeled infusion duration D{cmt} (RATE=-2 into compartment \
+                     {cmt}) evaluates to ≤ 0 at the initial typical-value point \
+                     (eta = 0). A non-positive duration is clamped to {floor:e} to \
+                     keep AMT/D finite, which delivers the dose as a bolus-like \
+                     spike rather than an infusion — the fit may converge to a \
+                     wrong optimum. Use a positive-link parameterisation \
+                     (e.g. D{cmt} = exp(...)).",
+                    cmt = cmt,
+                    floor = DoseEvent::DURATION_FLOOR,
+                ),
+            ));
+        }
     }
 
     // EVID=3/4 resets are not honoured on the EKF/SDE path.
@@ -956,6 +1134,32 @@ pub fn check_model_data_warnings(
                         pk.lagtime()
                     ),
                 ));
+            }
+            // Compartment-indexed `ALAGn` lags (issue #369) live in their own
+            // spare slots, so the bare check above never sees them — flag each one
+            // that is negative at the typical-value point. Ordered by compartment
+            // for deterministic diagnostics.
+            if let Some(ode) = &model.ode_spec {
+                for cmt in 1..=ode.n_states {
+                    let Some(slot) = ode
+                        .dose_attr_map
+                        .indexed_slot(crate::types::DoseAttr::Lag, cmt)
+                    else {
+                        continue;
+                    };
+                    let lag = pk.values.get(slot).copied().unwrap_or(0.0);
+                    if lag < 0.0 {
+                        diags.push(Diagnostic::warning(
+                            "W_NEGATIVE_LAGTIME",
+                            format!(
+                                "ALAG{cmt} (compartment-{cmt} lag) evaluates to {lag:.4} (< 0) \
+                                 at the initial typical-value point (eta = 0). Negative lagtimes \
+                                 are physically nonsensical and are not clamped — consider an \
+                                 exp() or other positive-link parameterisation."
+                            ),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1348,6 +1552,7 @@ pub fn fit(
     // path above). Here we always use the global pool for the outer par_iter.
     let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
     let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
+    let base_bayes_seed: u64 = options.bayes_seed.unwrap_or(12345);
     let n = options.n_starts;
     let sigma = options.start_sigma;
 
@@ -1366,8 +1571,11 @@ pub fn fit(
         .map(|k| {
             let init_k = perturb_init(init_params, k, sigma, base_seed);
             // Per-start option overrides for k > 0:
-            // - saem_seed: derive from base so each start gets a different MH trajectory.
-            //   Start 0 keeps the user's seed for reproducibility of the unperturbed run.
+            // - saem_seed / bayes_seed: derive from base so each start gets a different
+            //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
+            //   perturbing it every start runs an identical RNG trajectory (differing
+            //   only by the perturbed init) — wasted compute and false multi-start
+            //   robustness. Start 0 keeps the user's seeds for reproducibility.
             // - global_search: CRS2-LM ignores the starting point and samples freely in
             //   [lower, upper], so running it on starts 1..n overrides the perturbation
             //   and makes multi-start a no-op for those starts. Only run it on start 0.
@@ -1377,6 +1585,7 @@ pub fn fit(
             } else {
                 opts_k_storage = FitOptions {
                     saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
+                    bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
                     global_search: false,
                     ..options.clone()
                 };
@@ -1477,8 +1686,8 @@ fn probe_nlopt_algorithms() -> Vec<String> {
 /// Mandatory sdtab column names that are always written — declaring them in
 /// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
 const OUTPUT_MANDATORY: &[&str] = &[
-    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV",
-    "N_OBS", "TAFD", "TAD",
+    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD",
+    "EBE_OFV", "N_OBS", "TAFD", "TAD",
 ];
 
 /// Validate `model.output_columns` against known quantities, emitting
@@ -1696,7 +1905,19 @@ pub(crate) fn compute_extra_output_columns(
                 .map(|d| {
                     let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
                     let eta_d = combined_for(occ);
-                    (model.pk_param_fn)(theta, &eta_d, subject.dose_cov(d)).lagtime()
+                    let pk_d = (model.pk_param_fn)(theta, &eta_d, subject.dose_cov(d));
+                    // On ODE models the lag is keyed by dose compartment (`ALAGn`;
+                    // issue #369), so resolve through `dose_attr_map` — the same
+                    // single source of truth the prediction paths use — rather than
+                    // the bare `PK_IDX_LAGTIME` slot, which a model declaring only
+                    // `ALAG2` leaves at 0 (TAD would then ignore that route's lag).
+                    // The analytical engine has one fixed route → the bare lag.
+                    match &model.ode_spec {
+                        Some(ode) => ode
+                            .dose_attr_map
+                            .lagtime(subject.doses[d].cmt, &pk_d.values),
+                        None => pk_d.lagtime(),
+                    }
                 })
                 .collect()
         } else {
@@ -2088,6 +2309,15 @@ pub(crate) fn compute_extra_output_columns(
                                 // (same as the per-obs path in compute_predictions_with_states)
                                 // so every grid point evaluates to NaN, consistent with
                                 // W_DERIVED_CMT_TV_ANALYTICAL warning.
+                                vec![]
+                            } else if crate::pk::has_oral_depot_infusion(model.pk_model, subject) {
+                                // Analytical oral model + zero-order input into the depot
+                                // (#400): the superposition state helper models an oral
+                                // infusion as a depot bypass and cannot express a depot
+                                // zero-order input, so it would return silently-wrong finite
+                                // amounts. Return empty so every grid point evaluates to NaN,
+                                // matching the per-obs path in compute_predictions_with_states
+                                // and the W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL warning.
                                 vec![]
                             } else {
                                 let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov);
@@ -2521,8 +2751,22 @@ fn fit_inner(
             EstimationMethod::Foce => stage_opts.interaction = false,
             _ => {}
         }
-        // Only run the covariance step on the final stage to avoid wasted work.
-        if !is_last {
+        // Run the covariance step on the last *estimating* stage. IMP is a
+        // likelihood evaluation (NONMEM EONLY=1 equivalent), not an estimator,
+        // so when IMP follows an estimator the preceding stage is effectively
+        // the final estimating stage and should compute covariance / SIR.
+        let is_last_estimating = is_last
+            || chain[stage_idx + 1..]
+                .iter()
+                .all(|&m| m == EstimationMethod::Imp);
+        if !is_last_estimating {
+            stage_opts.run_covariance_step = false;
+            stage_opts.sir = false;
+        }
+        // Bayesian estimation reports posterior credible intervals, not a
+        // Hessian-based covariance matrix; the FD covariance / SIR steps are
+        // meaningless (and wasteful) for it.
+        if matches!(method, EstimationMethod::Bayes) {
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
         }
@@ -2536,11 +2780,13 @@ fn fit_inner(
             );
         }
 
-        // IMP stage: not an estimator. Consumes the previous stage's params /
-        // EBEs / Hessians, writes its result to `is_result`, and skips the
-        // params/result update at the bottom of the loop so the preceding
-        // stage's `OuterResult` continues to be the canonical one.
-        if method == EstimationMethod::Imp {
+        // IMP evaluation-only stage (`is_eval_only`, NONMEM `IMP EONLY=1`): not an
+        // estimator. Consumes the previous stage's params / EBEs / Hessians,
+        // writes its result to `is_result`, and skips the params/result update at
+        // the bottom of the loop so the preceding stage's `OuterResult` continues
+        // to be the canonical one. The default estimating IMP path is handled by
+        // the `EstimationMethod::Imp` arm of the `match method` below.
+        if method == EstimationMethod::Imp && stage_opts.is_eval_only {
             // Standalone IMP (no preceding estimator): evaluate the EBEs/Hessians
             // at the initial parameters so IMP can report the −2 log L there.
             // This synthetic stage also becomes the canonical `OuterResult` so
@@ -2588,6 +2834,8 @@ fn fit_inner(
                     total_ebe_fallbacks: 0,
                     final_gradient: None,
                     sir_fallback_proposal: None,
+                    impmap_trace: None,
+                    bayes: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -2674,7 +2922,23 @@ fn fit_inner(
                     &stage_opts,
                 )
             }
-            EstimationMethod::Imp => unreachable!("handled by the IMP branch above"),
+            EstimationMethod::Imp => {
+                // Estimating IMP (NONMEM `METHOD=IMP`). The evaluation-only path
+                // (`is_eval_only`) is handled by the IMP branch above and never
+                // reaches here. Warm-start from the preceding stage's EBEs when
+                // chained (e.g. [saem, imp]).
+                let warm = result.as_ref().map(|r| r.eta_hats.as_slice());
+                crate::estimation::impmap::run_imp(
+                    model,
+                    population,
+                    &stage_params,
+                    warm,
+                    &stage_opts,
+                )?
+            }
+            EstimationMethod::Bayes => {
+                crate::estimation::bayes::run_bayes(model, population, &stage_params, &stage_opts)?
+            }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
 
@@ -2746,6 +3010,23 @@ fn fit_inner(
             &result.kappas,
             &mut subjects,
         );
+    }
+
+    // Post-fit: simulation-based NPDE / NPD diagnostics (issue #260). Opt-in via
+    // `[fit_options] npde_nsim`; skipped entirely when 0 so the common path pays
+    // nothing. Subjects are built in population order, so the zip aligns.
+    if options.npde_nsim > 0 {
+        let per_subj = crate::stats::npde::compute_npde_npd(
+            model,
+            population,
+            &result.params,
+            options.npde_nsim,
+            options.npde_seed,
+        );
+        for (sr, sn) in subjects.iter_mut().zip(per_subj) {
+            sr.npde = sn.npde;
+            sr.npd = sn.npd;
+        }
     }
 
     let n_obs = population.n_obs();
@@ -2832,6 +3113,27 @@ fn fit_inner(
                     .to_string(),
             );
         }
+        // Analytical oral model with a zero-order input into the depot (#400):
+        // the superposition state helper models an oral infusion as a depot
+        // bypass, so it cannot express a depot zero-order input. ipred is exact
+        // (event-driven path), but per-obs compartment states return empty (→ NaN)
+        // rather than report silently-wrong amounts.
+        if model.ode_spec.is_none()
+            && population
+                .subjects
+                .iter()
+                .any(|s| crate::pk::has_oral_depot_infusion(model.pk_model, s))
+        {
+            warnings.push(
+                "W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL: analytical oral model \
+                 with a zero-order input into the depot (RATE=-2 D1 / infusion into \
+                 compartment 1) — compartment states are not available for those \
+                 subjects (predictions are exact); [derived] expressions that \
+                 reference compartments[i] evaluate to NaN for them. Use an ODE model \
+                 if depot/central compartment amounts are required."
+                    .to_string(),
+            );
+        }
     }
 
     // Report detected mu-referencing relationships (only when feature is enabled)
@@ -2914,15 +3216,16 @@ fn fit_inner(
         &mut warnings,
     );
 
-    // `final_method` reports the last *estimating* stage — IMP is a likelihood
-    // evaluation and doesn't produce parameters, so a chain like `[saem, imp]`
-    // surfaces as `method = SAEM`. The full chain (including IMP) is preserved
-    // in `method_chain`.
+    // `final_method` reports the last *estimating* stage. An evaluation-only IMP
+    // (`is_eval_only`) doesn't produce parameters, so a chain like `[saem, imp]`
+    // surfaces as `method = SAEM`. Estimating IMP (the default) does produce
+    // parameters and is reported like any other estimator. The full chain is
+    // preserved in `method_chain`.
     let final_method = chain
         .iter()
         .rev()
         .copied()
-        .find(|&m| m != EstimationMethod::Imp)
+        .find(|&m| !(m == EstimationMethod::Imp && options.is_eval_only))
         .unwrap_or(*chain.last().expect("chain non-empty"));
     let grad_inner =
         crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, model);
@@ -2954,9 +3257,11 @@ fn fit_inner(
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
-    // Covariance status
+    // Covariance status. Bayesian fits report posterior credible intervals
+    // instead of a Hessian covariance, so the covariance step is never
+    // "requested" for them (reporting it as FAILED would be misleading).
     let covariance_status = resolve_covariance_status(
-        options.run_covariance_step,
+        options.run_covariance_step && result.bayes.is_none(),
         result.covariance_matrix.is_some(),
         sir_fallback_result.is_some(),
     );
@@ -3087,6 +3392,8 @@ fn fit_inner(
             .or(sir_fallback_result.as_ref())
             .and_then(|s| s.resamples_packed.clone()),
         importance_sampling: is_result,
+        impmap_trace: result.impmap_trace.clone(),
+        bayes: result.bayes.clone(),
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
@@ -3143,10 +3450,11 @@ fn fit_inner(
             EstimationMethod::Saem => "saem",
             EstimationMethod::FoceGn => "gn",
             EstimationMethod::FoceGnHybrid => "gn",
-            // IMPMAP never runs the outer optimizer — its M-step uses an internal
-            // BOBYQA regardless of `options.optimizer`, so report that rather than
-            // a setting that had no effect.
+            // IMP/IMPMAP never run the outer optimizer — their M-step uses an
+            // internal BOBYQA regardless of `options.optimizer`, so report that
+            // rather than a setting that had no effect.
             EstimationMethod::Impmap => "impmap-bobyqa",
+            EstimationMethod::Imp => "imp-bobyqa",
             _ => options.optimizer.label(),
         }
         .to_string(),
@@ -3155,6 +3463,13 @@ fn fit_inner(
         saem_seed: options.saem_seed,
         sir_seed: options.sir_seed,
         is_seed: options.is_seed,
+        // Record the *resolved* NPDE seed (default included) so the diagnostic
+        // is reproducible from the output; `None` when NPDE did not run.
+        npde_seed: if options.npde_nsim > 0 {
+            Some(crate::stats::npde::effective_seed(options.npde_seed))
+        } else {
+            None
+        },
         bloq_method: model.bloq_method.label().to_string(),
         outer_maxiter: options.outer_maxiter,
         outer_gtol: options.outer_gtol,
@@ -3559,6 +3874,9 @@ fn compute_subject_results(
                 pred,
                 iwres,
                 cwres,
+                // Filled post-fit (only when npde_nsim > 0); see compute_npde_npd.
+                npde: vec![],
+                npd: vec![],
                 ofv_contribution: 2.0 * ofv_i,
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
@@ -3746,6 +4064,8 @@ mod tests {
             pred: vec![0.0; n],
             iwres,
             cwres: vec![0.0; n],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n],
             n_obs: n,
@@ -3995,6 +4315,19 @@ mod tests {
     }
 }
 
+/// Index of L[i,j] (i ≥ j) in column-major lower-triangle packing.
+///
+/// Layout: for j in 0..n { for i in j..n { ... } }, so column j starts at
+/// offset Σ_{k<j}(n−k) = j·n − j·(j−1)/2.
+#[inline]
+fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
+    debug_assert!(i >= j && i < n);
+    // Column j starts at offset j*n - j*(j-1)/2.
+    // For j==0: offset = 0. For j==1: offset = n. For j==2: offset = 2n-1.
+    let col_offset = if j == 0 { 0 } else { j * n - j * (j - 1) / 2 };
+    col_offset + (i - j)
+}
+
 /// Extract standard errors from covariance matrix on the packed parameter scale,
 /// then transform back to the original scale via delta method.
 fn extract_standard_errors(
@@ -4034,30 +4367,73 @@ fn extract_standard_errors(
         .map(|i| template.theta[i] * se_packed[i])
         .collect();
 
-    // Omega: SE for diagonal variances
-    // omega_ii = L_ii^2, so SE(omega_ii) ≈ 2*L_ii * SE(L_ii)
-    // L_ii = exp(x_i), SE(L_ii) = L_ii * SE(x_i)
-    // SE(omega_ii) = 2 * L_ii^2 * SE(x_i) = 2 * omega_ii * SE(x_i)
+    // Omega: SE via multivariate delta method on Cholesky parameterization.
+    //
+    // Ω = L L^T, so omega_ij = Σ_{k≤min(i,j)} L_ik * L_jk.
+    // Packed params: x = log(L_ii) for diagonals, x = L_ij for off-diags.
+    // SE²(omega_ij) = g^T * C_omega * g, where g = ∂omega_ij/∂x.
+    //
+    // For diagonal omega the off-diagonal L elements are zero, so the formula
+    // simplifies to the original: SE(omega_ii) = 2 * omega_ii * SE(log L_ii).
+    // For block omega we compute the full lower triangle.
     let omega_start = n_theta;
-    let se_omega: Vec<f64> = (0..n_eta)
-        .map(|i| {
-            let idx = if template.omega.diagonal {
-                omega_start + i
-            } else {
-                // L[i,i] in column-major lower-triangle packing (see `pack_params`):
-                // packed entries before column j are sum_{k<j} (n_eta - k), so the
-                // i-th diagonal sits at i*n_eta - i*(i-1)/2.  The previous formula
-                // i*(i+1)/2 + i was row-major and gave the wrong index for n_eta ≥ 3
-                // (e.g. picked L[2,0] instead of L[1,1] for n_eta=3).
-                omega_start + i * n_eta - i * i.saturating_sub(1) / 2
-            };
-            if idx < n {
-                2.0 * template.omega.matrix[(i, i)] * se_packed[idx]
-            } else {
-                0.0
+    let se_omega: Vec<f64> = if template.omega.diagonal {
+        (0..n_eta)
+            .map(|i| {
+                let idx = omega_start + i;
+                if idx < n {
+                    2.0 * template.omega.matrix[(i, i)] * se_packed[idx]
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    } else {
+        let n_lt = n_eta * (n_eta + 1) / 2;
+        let l = &template.omega.chol;
+
+        // Extract omega sub-block of the full covariance matrix.
+        let cov_omega = cov.view((omega_start, omega_start), (n_lt, n_lt));
+
+        let mut se_vec = Vec::with_capacity(n_lt);
+        // Column-major lower-triangle: for j in 0..n, for i in j..n
+        for j in 0..n_eta {
+            for i in j..n_eta {
+                // Build gradient of omega_{ij} w.r.t. packed omega params.
+                // omega_{ij} = Σ_{k=0}^{j} L_{ik} * L_{jk}
+                let mut grad = vec![0.0f64; n_lt];
+                for k in 0..=j {
+                    let idx_ik = chol_lt_idx(i, k, n_eta);
+                    let idx_jk = chol_lt_idx(j, k, n_eta);
+                    // Chain rule: ∂L_{ab}/∂x_{ab} = L_{ab} if a==b (log), else 1.
+                    let chain_ik = if i == k { l[(i, k)] } else { 1.0 };
+                    let chain_jk = if j == k { l[(j, k)] } else { 1.0 };
+                    grad[idx_ik] += l[(j, k)] * chain_ik;
+                    if i != j {
+                        grad[idx_jk] += l[(i, k)] * chain_jk;
+                    } else {
+                        // i == j: both terms contribute to the same index
+                        grad[idx_ik] += l[(i, k)] * chain_ik;
+                    }
+                }
+                // SE²(omega_{ij}) = g^T * C_omega * g
+                let mut var = 0.0;
+                for a in 0..n_lt {
+                    if grad[a] == 0.0 {
+                        continue;
+                    }
+                    for b in 0..n_lt {
+                        if grad[b] == 0.0 {
+                            continue;
+                        }
+                        var += grad[a] * cov_omega[(a, b)] * grad[b];
+                    }
+                }
+                se_vec.push(if var > 0.0 { var.sqrt() } else { 0.0 });
             }
-        })
-        .collect();
+        }
+        se_vec
+    };
 
     // Sigma: SE via delta method (log-transformed)
     let sigma_start = omega_start
@@ -4139,26 +4515,28 @@ pub fn simulate_with_seed(
 pub struct SimulateOptions {
     /// Seed for reproducibility. `None` draws from entropy.
     pub seed: Option<u64>,
-    /// When `true`, reassign each replicate's drawn etas to subjects by
+    /// When `Some(method)`, reassign each replicate's drawn etas to subjects by
     /// **propensity-score matching** against the subjects' fitted (posthoc)
-    /// etas — optimal Mahalanobis matching under the model `Ω`. This restores
-    /// the design↔eta association present in adaptively-dosed real-world data
-    /// and corrects the resulting VPC bias (see [`crate::propensity_match`]).
+    /// etas — Mahalanobis matching under the model `Ω` via the chosen
+    /// [`MatchMethod`]. This restores the design↔eta association present in
+    /// adaptively-dosed real-world data and corrects the resulting VPC bias
+    /// (see [`crate::propensity_match`]). `None` disables matching.
     ///
     /// Requires `population` to be observed data: every subject must carry
     /// observations so its posthoc eta can be computed. Has no effect for the
     /// synthetic `[simulation]` block (no observed designs to match against).
-    pub propensity_match: bool,
+    pub match_method: Option<MatchMethod>,
 }
 
 /// Simulate observations, optionally with propensity-score matching.
 ///
-/// With `opts.propensity_match == false` this is identical to
-/// [`simulate_with_seed`] (or [`simulate`] when `opts.seed` is `None`). With it
-/// `true`, the freshly drawn etas of each replicate are reassigned to subjects
-/// so each subject's observed design is paired with a drawn eta close (under the
-/// model `Ω` Mahalanobis metric) to that subject's fitted eta. The fitted
-/// (posthoc) etas are computed once from `params` + the observed `population`.
+/// With `opts.match_method == None` this is identical to
+/// [`simulate_with_seed`] (or [`simulate`] when `opts.seed` is `None`). With a
+/// `Some(method)`, the freshly drawn etas of each replicate are reassigned to
+/// subjects so each subject's observed design is paired with a drawn eta close
+/// (under the model `Ω` Mahalanobis metric) to that subject's fitted eta. The
+/// fitted (posthoc) etas are computed once from `params` + the observed
+/// `population`.
 ///
 /// Returns `Err` if matching is requested but the population is empty or any
 /// subject has no observations.
@@ -4175,11 +4553,24 @@ pub fn simulate_with_options(
         None => rand::rngs::StdRng::from_entropy(),
     };
 
-    if !opts.propensity_match {
-        return Ok(simulate_inner_with_draw(
-            model, population, params, n_sim, 1, None, &mut rng,
-        ));
-    }
+    // Guard the modeled-`RATE` dose precondition up front (#324). The
+    // non-propensity branch reaches it via the `simulate_inner_with_draw`
+    // chokepoint, but the propensity branch first runs a full inner EBE pass
+    // (`run_inner_loop_warm` below) that integrates every subject — on an
+    // unsupported config that would hit the per-path tripwire (silently in
+    // release) or `resolve_rate`'s opaque `.expect` *before* the chokepoint
+    // guard. Asserting here makes both branches fail with the same actionable
+    // diagnostic; it is a no-op O(doses) scan on the common all-`Fixed` dataset.
+    assert_modeled_doses_supported(model, population);
+
+    let method = match opts.match_method {
+        Some(m) => m,
+        None => {
+            return Ok(simulate_inner_with_draw(
+                model, population, params, n_sim, 1, None, &mut rng,
+            ));
+        }
+    };
 
     if population.subjects.is_empty() {
         return Err(
@@ -4231,7 +4622,7 @@ pub fn simulate_with_options(
         params,
         n_sim,
         1,
-        Some((&eta_hats, omega_inv)),
+        Some((&eta_hats, omega_inv, method)),
         &mut rng,
     ))
 }
@@ -4304,11 +4695,12 @@ fn emit_subject_rows<R: rand::Rng>(
     );
 }
 
-/// `matched`, when `Some((fitted_etas, omega_inv))`, reassigns each replicate's
-/// drawn etas to subjects by propensity-score matching against `fitted_etas`
-/// (optimal Mahalanobis matching under `omega_inv`; see `crate::propensity_match`).
-/// `None` is the standard per-subject independent draw and reproduces the
-/// previous behaviour byte-for-byte (same RNG draw order).
+/// `matched`, when `Some((fitted_etas, omega_inv, method))`, reassigns each
+/// replicate's drawn etas to subjects by propensity-score matching against
+/// `fitted_etas` (Mahalanobis matching under `omega_inv` via `method`; see
+/// `crate::propensity_match`). `None` is the standard per-subject independent
+/// draw and reproduces the previous behaviour byte-for-byte (same RNG draw
+/// order).
 #[allow(clippy::too_many_arguments)]
 fn simulate_inner_with_draw<R: rand::Rng>(
     model: &CompiledModel,
@@ -4316,10 +4708,16 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     params: &ModelParameters,
     n_sim: usize,
     draw: usize,
-    matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>)>,
+    matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
+
+    // Single chokepoint for every `simulate*` variant (both `simulate_inner` and
+    // the propensity path funnel through here). Guard the modeled-`RATE` dose
+    // precondition once per call, as `predict()` does — `simulate()` runs no
+    // data-check otherwise. #324.
+    assert_modeled_doses_supported(model, population);
 
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
@@ -4329,7 +4727,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         match matched {
-            Some((fitted, omega_inv)) => {
+            Some((fitted, omega_inv, method)) => {
                 // Draw a pool of one eta per subject for this replicate, then
                 // reassign the draws to subjects by matching them to the fitted
                 // (posthoc) etas. Each subject keeps its own observed design.
@@ -4340,8 +4738,9 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         &params.omega.chol * DVector::from_column_slice(&z)
                     })
                     .collect();
-                let assign =
-                    crate::propensity_match::match_draws_to_fitted(&pool, fitted, omega_inv);
+                let assign = crate::propensity_match::match_draws_to_fitted(
+                    &pool, fitted, omega_inv, method,
+                );
                 for (i, subject) in population.subjects.iter().enumerate() {
                     let mut eta_slice: Vec<f64> = pool[assign[i]].iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
@@ -4489,6 +4888,11 @@ pub fn predict(
     population: &Population,
     params: &ModelParameters,
 ) -> Vec<PredictionResult> {
+    // `predict()` runs no data-check (unlike `fit()`); guard the one
+    // model-aware dose precondition so a modeled-`RATE` dose can't reach the
+    // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
+    assert_modeled_doses_supported(model, population);
+
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
 
@@ -4669,6 +5073,7 @@ mod iov_integration {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -4687,6 +5092,7 @@ mod iov_integration {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -4725,6 +5131,7 @@ mod iov_integration {
                 cens: vec![0; 6],
                 occasions: occasions.clone(),
                 dose_occasions: dose_occ.clone(),
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
@@ -4963,6 +5370,9 @@ mod iov_integration {
         opts.methods = vec![EstimationMethod::Foce, EstimationMethod::Imp];
         opts.is_samples = 200; // keep the per-subject sampling cheap
         opts.is_seed = Some(42); // deterministic proposal draws
+                                 // The IS IOV branch is the evaluation-only path; the estimating IMP
+                                 // M-step does not yet support IOV (refused up front).
+        opts.is_eval_only = true;
         let result = fit(&model, &pop, &model.default_params, &opts);
         assert!(
             result.is_ok(),
@@ -5167,6 +5577,104 @@ mod iov_integration {
             );
         }
     }
+
+    /// #400: an analytical oral model with a zero-order input into the depot
+    /// (an infusion into cmt 1) cannot have its compartment states expressed by
+    /// the superposition state helper (which models an oral infusion as a depot
+    /// bypass). So `compartment_states` is left empty (→ NaN compartments) and
+    /// `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` makes that explicit, just
+    /// like the reset/IOV/TV cases. Predictions themselves stay exact.
+    #[test]
+    fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
+        use crate::parser::model_parser::parse_full_model;
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let mut model = parse_full_model(src).expect("model parses").model;
+        assert!(model.ode_spec.is_none(), "model must be analytical");
+        // Inject a derived expression that references compartments[0] so the
+        // warning is gated on (mirrors a parsed `[derived] cmt0 = compartments[0]`).
+        model.derived_exprs.push(DerivedExprSpec {
+            name: "cmt0".into(),
+            kind: DerivedKind::PerRow {
+                eval: Box::new(|ctx| ctx.compartments.first().copied().unwrap_or(f64::NAN)),
+            },
+            uses_compartments: true,
+        });
+
+        // One subject with an explicit zero-order infusion into the depot (cmt 1):
+        // rate 25 over AMT/rate = 4 h, then first-order KA absorption.
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 4.0, 8.0, 12.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.8, 1.4, 1.6, 0.9, 0.4],
+            obs_cmts: vec![2; 5],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 5],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let pop = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        let result =
+            fit(&model, &pop, &model.default_params.clone(), &opts).expect("fit must succeed");
+
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL")),
+            "expected W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL warning; got: {:?}",
+            result.warnings
+        );
+        // Predictions must still be finite (the event-driven path computed them);
+        // only the compartment states degrade.
+        for sr in &result.subjects {
+            assert!(
+                sr.compartment_states.is_empty(),
+                "depot-infusion subject must have empty compartment_states (got {})",
+                sr.compartment_states.len()
+            );
+            assert!(
+                sr.ipred.iter().all(|p| p.is_finite()),
+                "predictions must be finite"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5200,19 +5708,16 @@ mod extract_se_tests {
 
     // ── BSV omega ────────────────────────────────────────────────────────────
 
-    /// Block omega with n_eta = 3.  The packed Cholesky layout is column-major
-    /// (see `pack_params`): L[0,0]=0, L[1,0]=1, L[2,0]=2, L[1,1]=3, L[2,1]=4,
-    /// L[2,2]=5.  The previous index formula `i*(i+1)/2 + i` was row-major and
-    /// returned offsets 0, 2, 5 — picking L[2,0] for the L[1,1] slot.
-    /// For n_eta ≤ 2 the row- and column-major formulas coincide, which is why
-    /// this regressed silently.
+    /// Block omega with n_eta = 3 (numerically diagonal).  se_omega is now the
+    /// full lower triangle (length 6), column-major.  The diagonal elements at
+    /// LT positions 0, 3, 5 should match the old formula; off-diagonals should
+    /// also be finite (non-NaN).
     #[test]
-    fn test_se_omega_block_n3_uses_column_major_indexing() {
+    fn test_se_omega_block_n3_full_lower_triangle() {
         let mut mat = DMatrix::<f64>::zeros(3, 3);
         mat[(0, 0)] = 0.04;
         mat[(1, 1)] = 0.09;
         mat[(2, 2)] = 0.16;
-        let _chol = mat.clone().cholesky().unwrap().l();
         let omega =
             OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into(), "E3".into()], false);
         let template = ModelParameters {
@@ -5232,23 +5737,83 @@ mod extract_se_tests {
             kappa_fixed: vec![],
         };
         // Packed layout: theta(1) + omega_block(6) + sigma(1) = 8.
-        // Within the omega block (start = 1): L[0,0] at idx 1, L[1,1] at idx 4,
-        // L[2,2] at idx 6.  Use distinct cov diagonals so we can tell which one
-        // each SE pulls from.
+        // Within the omega block (start = 1): L[0,0]=1, L[1,0]=2, L[2,0]=3,
+        // L[1,1]=4, L[2,1]=5, L[2,2]=6.
         let n = 8;
         let mut cov = DMatrix::<f64>::zeros(n, n);
         for i in 0..n {
-            cov[(i, i)] = ((i + 1) as f64).powi(2); // se_packed[i] = i + 1
+            cov[(i, i)] = ((i + 1) as f64).powi(2);
         }
         let (_, se_omega, _, _) = extract_standard_errors(&Some(cov), &template);
         let se = se_omega.unwrap();
-        // L[0,0] at packed idx 1 → se_packed = 2 → se_omega[0] = 2 * 0.04 * 2 = 0.16
-        assert!((se[0] - 2.0 * 0.04 * 2.0).abs() < 1e-12, "got {}", se[0]);
-        // L[1,1] at packed idx 4 → se_packed = 5 → se_omega[1] = 2 * 0.09 * 5 = 0.90
-        // Pre-fix this would have used idx 3 (= L[2,0]) → 2 * 0.09 * 4 = 0.72.
-        assert!((se[1] - 2.0 * 0.09 * 5.0).abs() < 1e-12, "got {}", se[1]);
-        // L[2,2] at packed idx 6 → se_packed = 7 → se_omega[2] = 2 * 0.16 * 7 = 2.24
-        assert!((se[2] - 2.0 * 0.16 * 7.0).abs() < 1e-12, "got {}", se[2]);
+        // Full LT: [omega(0,0), omega(1,0), omega(2,0), omega(1,1), omega(2,1), omega(2,2)]
+        assert_eq!(se.len(), 6);
+        // Diagonal SEs: same as before (omega is numerically diagonal → off-diag L=0).
+        // omega(0,0) at LT[0]: 2 * 0.04 * 2.0 = 0.16
+        assert!((se[0] - 0.16).abs() < 1e-12, "se(0,0) = {}", se[0]);
+        // omega(1,1) at LT[3]: 2 * 0.09 * 5.0 = 0.90
+        assert!((se[3] - 0.90).abs() < 1e-12, "se(1,1) = {}", se[3]);
+        // omega(2,2) at LT[5]: 2 * 0.16 * 7.0 = 2.24
+        assert!((se[5] - 2.24).abs() < 1e-12, "se(2,2) = {}", se[5]);
+        // Off-diagonals should be finite
+        for (idx, &v) in se.iter().enumerate() {
+            assert!(v.is_finite(), "se[{}] not finite", idx);
+        }
+
+        // Verify the omega_se_at helper
+        use crate::types::omega_se_at;
+        let se_opt = Some(se);
+        assert!((omega_se_at(&se_opt, 3, 0, 0).unwrap() - 0.16).abs() < 1e-12);
+        assert!((omega_se_at(&se_opt, 3, 1, 1).unwrap() - 0.90).abs() < 1e-12);
+        assert!((omega_se_at(&se_opt, 3, 2, 2).unwrap() - 2.24).abs() < 1e-12);
+        // Symmetric: omega_se_at(1,0) == omega_se_at(0,1)
+        assert_eq!(omega_se_at(&se_opt, 3, 1, 0), omega_se_at(&se_opt, 3, 0, 1));
+    }
+
+    /// Block omega with non-zero off-diagonals: verify off-diagonal SEs are
+    /// positive and that they differ from the (incorrect) zero that would
+    /// result from a diagonal-only implementation.
+    #[test]
+    fn test_se_omega_block_offdiag_positive() {
+        // Ω = [[0.09, 0.02], [0.02, 0.04]]  (corr ≈ 0.33)
+        let mut mat = DMatrix::<f64>::zeros(2, 2);
+        mat[(0, 0)] = 0.09;
+        mat[(1, 1)] = 0.04;
+        mat[(0, 1)] = 0.02;
+        mat[(1, 0)] = 0.02;
+        let omega = OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into()], false);
+        let template = ModelParameters {
+            theta: vec![5.0],
+            theta_names: vec!["TVCL".into()],
+            theta_lower: vec![0.1],
+            theta_upper: vec![50.0],
+            theta_fixed: vec![false],
+            omega,
+            omega_fixed: vec![false; 2],
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+        };
+        // Packed: theta(1) + omega_block(3) + sigma(1) = 5.  Identity cov.
+        let cov = Some(DMatrix::<f64>::identity(5, 5));
+        let (_, se_omega, _, _) = extract_standard_errors(&cov, &template);
+        let se = se_omega.unwrap();
+        // Full LT: [omega(0,0), omega(1,0), omega(1,1)]
+        assert_eq!(se.len(), 3);
+        assert!(se[0] > 0.0, "diagonal SE(0,0) should be positive");
+        assert!(se[1] > 0.0, "off-diagonal SE(1,0) should be positive");
+        assert!(se[2] > 0.0, "diagonal SE(1,1) should be positive");
+        // omega_se_at helper
+        use crate::types::omega_se_at;
+        let se_opt = Some(se);
+        assert!(omega_se_at(&se_opt, 2, 1, 0).unwrap() > 0.0);
+        // diagonal-only format returns None for off-diag
+        let diag_only = Some(vec![0.1, 0.2]);
+        assert!(omega_se_at(&diag_only, 2, 1, 0).is_none());
     }
 
     /// Diagonal omega path is unaffected by the fix; this guards the simple case.
@@ -5828,6 +6393,7 @@ mod simulate_with_uncertainty_tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -5846,6 +6412,7 @@ mod simulate_with_uncertainty_tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -5868,6 +6435,7 @@ mod simulate_with_uncertainty_tests {
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
@@ -5926,6 +6494,8 @@ mod simulate_with_uncertainty_tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            impmap_trace: None,
+            bayes: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],
@@ -5979,6 +6549,7 @@ mod simulate_with_uncertainty_tests {
             saem_seed: None,
             sir_seed: None,
             is_seed: None,
+            npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 0,
             outer_gtol: 0.0,
@@ -6028,6 +6599,44 @@ mod simulate_with_uncertainty_tests {
         let pop = tiny_population();
         let rows = simulate_with_seed(&model, &pop, &model.default_params, 2, 42);
         assert!(rows.iter().all(|r| r.draw == 1));
+    }
+
+    #[test]
+    fn compute_npde_npd_shapes_finite_and_reproducible() {
+        // Drives the full post-fit NPDE/NPD simulation path on a real (model,
+        // population, params). nsim > n_obs (3) so the decorrelated NPDE is
+        // non-NaN, and a fixed seed must reproduce bit-for-bit.
+        let model = tiny_model();
+        let pop = tiny_population();
+        let nsim = 200;
+
+        let a = crate::stats::npde::compute_npde_npd(
+            &model,
+            &pop,
+            &model.default_params,
+            nsim,
+            Some(7),
+        );
+        let b = crate::stats::npde::compute_npde_npd(
+            &model,
+            &pop,
+            &model.default_params,
+            nsim,
+            Some(7),
+        );
+
+        assert_eq!(a.len(), pop.subjects.len());
+        for (sn, subj) in a.iter().zip(pop.subjects.iter()) {
+            assert_eq!(sn.npd.len(), subj.observations.len());
+            assert_eq!(sn.npde.len(), subj.observations.len());
+            assert!(sn.npd.iter().all(|v| v.is_finite()), "NPD finite");
+            assert!(sn.npde.iter().all(|v| v.is_finite()), "NPDE finite");
+        }
+        // Reproducible across calls with the same seed.
+        for (sa, sb) in a.iter().zip(b.iter()) {
+            assert_eq!(sa.npd, sb.npd);
+            assert_eq!(sa.npde, sb.npde);
+        }
     }
 
     #[test]
@@ -6202,6 +6811,7 @@ mod sde_integration {
                 cens: vec![0; 3],
                 occasions: vec![1u32; 3],
                 dose_occasions: vec![1u32],
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
@@ -6332,6 +6942,7 @@ mod sde_integration {
                 cens: vec![0],
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             };
@@ -6592,6 +7203,7 @@ mod tests_sdtab_tv_cov {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -6610,6 +7222,7 @@ mod tests_sdtab_tv_cov {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -6644,6 +7257,7 @@ mod tests_sdtab_tv_cov {
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -6798,6 +7412,7 @@ mod tests_derived_session_clock {
             pk_idx_f64: Vec::new(),
             sel_flat: Vec::new(),
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -6816,6 +7431,7 @@ mod tests_derived_session_clock {
             output_columns: Vec::new(),
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -6844,6 +7460,7 @@ mod tests_derived_session_clock {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -6858,6 +7475,8 @@ mod tests_derived_session_clock {
             pred: vec![1.0; n_obs],
             iwres: vec![0.0; n_obs],
             cwres: vec![0.0; n_obs],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
@@ -7080,6 +7699,7 @@ mod tests_derived_session_clock {
             cens: vec![0; 3],
             occasions: vec![1, 1, 1],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -7127,6 +7747,7 @@ mod tests_derived_iov_kappa {
     /// for every observation, while the fix yields the per-occasion CL.
     fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         CompiledModel {
+            frem_config: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
@@ -7173,6 +7794,7 @@ mod tests_derived_iov_kappa {
             pk_idx_f64: Vec::new(),
             sel_flat: Vec::new(),
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -7197,6 +7819,7 @@ mod tests_derived_iov_kappa {
     /// Subject with two occasions: obs 0,1 on occasion 1; obs 2,3 on occasion 2.
     fn two_occasion_subject() -> Subject {
         Subject {
+            fremtype: Vec::new(),
             id: "S1".into(),
             doses: Vec::new(),
             obs_times: vec![0.0, 1.0, 2.0, 3.0],
@@ -7225,6 +7848,8 @@ mod tests_derived_iov_kappa {
             pred: vec![1.0; n_obs],
             iwres: vec![0.0; n_obs],
             cwres: vec![0.0; n_obs],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
@@ -7370,6 +7995,7 @@ mod tests_derived_iov_kappa {
         });
 
         let subject = Subject {
+            fremtype: Vec::new(),
             id: "S1".into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -7424,6 +8050,215 @@ mod tests_derived_iov_kappa {
         );
     }
 
+    /// Regression for the per-compartment TAD lag (issue #369). On an ODE model
+    /// declaring `ALAGn`, the TAD column must anchor each dose on *its own*
+    /// compartment's lag — resolved through `dose_attr_map`, the same single
+    /// source of truth the prediction paths use — not the bare `PK_IDX_LAGTIME`
+    /// slot, which a model declaring only `ALAG2` leaves at 0. A dose into
+    /// compartment 2 at t=0 with `ALAG2 = 2` effectively arrives at t=2, so an
+    /// observation at t=3 has TAD = 1.0. The pre-fix code read the bare lag (0)
+    /// and reported TAD = 3.0.
+    #[test]
+    fn tad_uses_per_compartment_alag_on_ode_models() {
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAG2(2.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  ALAG2 = TVLAG2
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("parse ok")
+            .model;
+        assert!(model.has_lagtime(), "ALAG2 must enable has_lagtime()");
+
+        // Dose into compartment 2 (central) at t=0; observe cmt 2 at t=3.
+        let subject = Subject {
+            fremtype: Vec::new(),
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
+            obs_times: vec![3.0],
+            obs_raw_times: vec![3.0],
+            observations: vec![1.0],
+            obs_cmts: vec![2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let theta = model.default_params.theta.clone();
+        let kappas: Vec<Vec<DVector<f64>>> = Vec::new(); // no IOV
+        let mut subjects_results = vec![sr_iov(1)];
+
+        compute_extra_output_columns(&model, &population, &theta, &kappas, &mut subjects_results);
+
+        let tad = &subjects_results[0].per_obs_tad;
+        // 3 − (dose@0 + ALAG2=2) = 1.0; the pre-fix bare-lag path gives 3.0.
+        assert!((tad[0] - 1.0).abs() < 1e-9, "tad: {}", tad[0]);
+    }
+
+    /// Regression for issue #369: a negative compartment-indexed `ALAGn` must
+    /// raise `W_NEGATIVE_LAGTIME`. The bare-slot check alone never sees the
+    /// `ALAG2` spare slot, so a bad per-route lag would otherwise slip through.
+    #[test]
+    fn negative_alag_emits_negative_lagtime_warning() {
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAG2(-1.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  ALAG2 = TVLAG2
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("parse ok")
+            .model;
+
+        let subject = Subject {
+            fremtype: Vec::new(),
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
+            obs_times: vec![3.0],
+            obs_raw_times: vec![3.0],
+            observations: vec![1.0],
+            obs_cmts: vec![2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        let neg = diags
+            .iter()
+            .find(|d| d.code == "W_NEGATIVE_LAGTIME")
+            .expect("a negative ALAG2 must raise W_NEGATIVE_LAGTIME");
+        assert!(
+            neg.message.contains("ALAG2") && neg.message.contains("compartment-2"),
+            "warning must name the offending compartment-indexed lag, got: {}",
+            neg.message
+        );
+    }
+
+    /// The per-compartment negative-lag scan is ODE-only. An analytical model can
+    /// still report `has_lagtime()` (lag bound via `pk_indices`), so
+    /// `check_model_data_warnings` must take the `ode_spec == None` path: the bare
+    /// negative lag still warns, but no compartment-indexed `ALAGn` is emitted.
+    #[test]
+    fn negative_lag_scan_skips_analytical_models() {
+        let mut model = minimal_iov_model(vec![]);
+        // Analytical (ode_spec stays None); has_lagtime() via pk_indices carrying
+        // PK_IDX_LAGTIME; bare lag evaluates negative.
+        model.indiv_param_names = vec!["CL".into(), "LAGTIME".into()];
+        model.pk_indices = vec![0, PK_IDX_LAGTIME];
+        model.pk_param_fn = Box::new(|_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| {
+            let mut p = PkParams::default();
+            p.values[PK_IDX_LAGTIME] = -1.0;
+            p
+        });
+        assert!(model.has_lagtime() && model.ode_spec.is_none());
+
+        let subject = Subject {
+            fremtype: Vec::new(),
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: vec![1.0],
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_NEGATIVE_LAGTIME"),
+            "bare negative lag must still warn on an analytical model"
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("ALAG")),
+            "no compartment-indexed ALAGn warning for an analytical (non-ODE) model"
+        );
+    }
+
     /// Caller-level regression: the per-dose lag uses each dose's *covariate*
     /// snapshot (`dose_cov`), not the observation's — so a lag depending on a
     /// time-varying covariate is shifted by conditions at dosing, matching
@@ -7447,6 +8282,7 @@ mod tests_derived_iov_kappa {
         let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
         let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
         let subject = Subject {
+            fremtype: Vec::new(),
             id: "S1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![3.0],

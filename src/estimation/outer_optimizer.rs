@@ -39,6 +39,13 @@ pub struct OuterResult {
     /// Hessian, inflated 4×, and embedded into the full packed parameter space.
     /// `None` when the Hessian succeeded or the covariance step was skipped.
     pub sir_fallback_proposal: Option<DMatrix<f64>>,
+    /// Per-iteration parameter trace from IMPMAP. `None` for all other methods.
+    pub impmap_trace: Option<crate::types::ImpmapTrace>,
+    /// Posterior summaries + diagnostics from a Bayesian (`method=bayes`) run.
+    /// `Some` only for `EstimationMethod::Bayes`; `None` for all point
+    /// estimators. Carried here so the chain dispatch can lift it onto
+    /// `FitResult.bayes` through the generic OuterResult → FitResult path.
+    pub bayes: Option<crate::types::BayesResult>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1329,6 +1336,8 @@ fn optimize_nlopt(
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
         final_gradient,
         sir_fallback_proposal,
+        impmap_trace: None,
+        bayes: None,
     }
 }
 
@@ -1745,6 +1754,8 @@ fn optimize_bfgs(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal,
+        impmap_trace: None,
+        bayes: None,
     }
 }
 
@@ -4100,6 +4111,7 @@ mod tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -4118,6 +4130,7 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -4139,6 +4152,7 @@ mod tests {
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
@@ -4297,6 +4311,7 @@ mod tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -4315,6 +4330,7 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         };
         check_gradient(&model, &make_population(3), 2);
     }
@@ -4729,6 +4745,7 @@ mod tests {
             kappa_fixed: vec![true],
         };
         let model = CompiledModel {
+            frem_config: None,
             name: "iov_cov_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
@@ -4760,6 +4777,7 @@ mod tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -4783,6 +4801,7 @@ mod tests {
         let n_subj = 6;
         let subjects = (0..n_subj)
             .map(|_| Subject {
+                fremtype: Vec::new(),
                 id: "S".into(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],

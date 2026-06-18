@@ -145,6 +145,103 @@ section of the SDLC for the versioning policy).
   scope (steady-state dosing, lagtime, built-in input-rate absorption, IOV, SDE,
   `obs_scale`/LTBS transforms, time-varying covariates) transparently fall back
   to the finite-difference gradient (#367).
+- `impmap_mceta` fit option: multi-start MAP for IMPMAP (NONMEM `MCETA` equivalent),
+  improving IS efficiency in high-dimensional models (e.g. FREM with ≥5 ETAs).
+- Analytical Jacobian for FREM pseudo-observations: covariate rows in the FD
+  Jacobian are overwritten with exact ∂Y/∂η values (0 or 1), eliminating noise
+  that corrupted the IS proposal in high-dimensional FREM models.
+- `iscale_min` / `iscale_max` fit options: adaptive IS proposal scaling (NONMEM
+  `ISCALE_MIN`/`ISCALE_MAX` equivalent). Per-subject pilot search over log-spaced
+  scale factors selects the proposal width that maximises ESS. Defaults: 0.1–10.0.
+- `impmap_sobol` fit option: use Sobol quasi-random sequences (with Cranley-Patterson
+  randomization) for IMPMAP IS draws instead of pseudo-random, giving more uniform
+  coverage of the posterior. MVN proposals only; Student-t falls back to pseudo-random.
+- Full off-diagonal omega standard errors for block omega via multivariate delta
+  method on the Cholesky parameterization. `se_omega` is now the full lower
+  triangle (length n_eta*(n_eta+1)/2) instead of diagonal-only. Added
+  `omega_se_at()` helper for indexed lookup.
+- Per-iteration IMPMAP parameter trace (`FitResult.impmap_trace`), analogous to
+  NONMEM `.ext` file output. Opt-in via `impmap_trace = true` in `[fit_options]`.
+- FREM (Full Random Effects Model) covariate analysis: `prepare_frem()` API
+  transforms a base model + dataset into a FREM model with extended block omega,
+  covariate pseudo-observations, and FREMTYPE dispatch in the likelihood. The
+  covariates (and their continuous/categorical kind) are taken from the model's
+  `[covariates]` block; the `covariates` argument is an optional subset filter
+  over them (#194).
+- **Zero-order absorption into the oral depot on analytical models** — a `RATE=-2`
+  modeled duration `D1` (or an explicit positive-`RATE` infusion) into compartment 1
+  of an analytical oral model (`one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`)
+  now models zero-order release into the depot followed by first-order `KA`
+  absorption into central, all on the closed-form engine — no `ode(...)` block
+  needed (previously rejected at parse time). Validated against NONMEM 7.5.1
+  `ADVAN2` (`$PK D1`) and against the ODE transcription across 1-/2-/3-cpt oral
+  models. Per-compartment amounts in
+  `sdtab`/`[derived]` are not available for those subjects (predictions are exact;
+  a `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` warning flags it) (#400).
+- `RATE=-2` (modeled infusion duration via a `D{cmt}` parameter) is now supported
+  on **analytical** PK models, not just ODE models — declare a `D{cmt}` individual
+  parameter and the closed-form infusion uses `rate = AMT / D{cmt}`, matching
+  NONMEM's `$PK D{n}` (#394, follow-up to #324).
+- **Full MCMC Bayesian estimation** (`method = bayes`, Gibbs-within-HMC, NONMEM
+  `METHOD=BAYES` parity). Draws from the joint posterior `p(θ, Ω, Σ, {ηᵢ} | y)`:
+  per-subject η block (block-MH, or gradient HMC on autodiff builds with
+  `n_leapfrog > 0`), conjugate inverse-Wishart Ω block, exact Gaussian
+  full-conditional draw for mu-referenced θ, and a random-walk block for the
+  remaining θ/σ. Reports posterior summaries (mean/sd/2.5%/median/97.5%) with
+  split-R̂, ESS, and MCSE per parameter on `FitResult.bayes` and in the
+  `.fit.yaml` `bayes:` section. Options: `bayes_warmup`, `bayes_iters`,
+  `bayes_chains`, `bayes_thin`, `bayes_seed`. Supports BSV and zero-mean IOV
+  (per-occasion `kappa`, with a conjugate inverse-Wishart `Omega_iov` draw).
+  Validated against FOCEI and NONMEM `METHOD=BAYES` on warfarin (#380).
+- **Modeled infusion duration (`RATE=-2` → `Dn`) for ODE models** — NONMEM's
+  `RATE=-2` makes a zero-order infusion's *duration* a modeled parameter: name an
+  individual parameter `D{n}` for the dose compartment `n` and ferx infuses `AMT`
+  over that duration (rate `AMT/Dn`), resolved per iteration and occasion (so it
+  can carry covariate effects and IOV). Composes with `F{n}` (applied exactly
+  once — `F·AMT` over `Dn`) and `ALAG{n}` (shifts the window; `Dn` sets its
+  length), and works with steady state, multi-dose, and system resets. A
+  `RATE=-2` dose with no matching `D{n}` parameter — or on an analytical model —
+  is now a loud error rather than a silent bolus (the original #324 bug), both at
+  the model+data join (`fit`/`ferx check`) and at the `predict()`/`simulate()`
+  entrypoints (which skip the full data-check). A modeled `D{n}` that is
+  non-positive at the initial estimate is flagged with a `W_MODELED_DURATION_NONPOSITIVE`
+  warning (use a positive link such as `exp`). `RATE=-1` (modeled *rate*, `Rn`)
+  and analytical-engine support remain tracked #324 follow-ups (#324).
+- **Simulation-based NPDE / NPD diagnostics** in the `sdtab` output. Set
+  `[fit_options] npde_nsim = 1000` (and optionally `npde_seed`) to add `NPDE`
+  (Normalized Prediction Distribution Errors, decorrelated within subject) and
+  `NPD` (Normalized Prediction Discrepancies) columns, computed post-fit by
+  Monte-Carlo simulation under the fitted model (Brendel et al. 2006; Comets et
+  al. 2008). Unlike CWRES, these are robust to model nonlinearity and non-Gaussian
+  random effects, and follow N(0,1) under a correctly specified model. Off by
+  default (`npde_nsim = 0`). The effective simulation seed (including the default
+  when `npde_seed` is unset) is recorded as `npde_seed` in `{model}-fit.yaml` and
+  the `.fitrx` archive, so the diagnostics are reproducible from the saved fit.
+  Validated against a NONMEM `$SIMULATION` + `npde` R-package reference on the
+  warfarin example. M3/BLQ censoring and IOV-kappa resampling are out of scope
+  (#260).
+- **Compartment-indexed bioavailability and lag for ODE models** — name an
+  individual parameter `F{n}` or `ALAG{n}`/`LAGTIME{n}` (e.g. `F2`, `ALAG2`) to
+  apply a per-route bioavailability/lag to doses into compartment `n`, mirroring
+  NONMEM's `F1`/`F2`/`ALAG1`/`ALAG2`. A bare `F`/`lagtime` stays the
+  all-compartment default (existing single-route models are unchanged); an
+  indexed value overrides only its compartment. Resolved uniformly across every
+  ODE dose-application path (event-driven, steady-state, and the EKF/diffusion
+  path — the latter applies `F` but not lag). An index past the model's
+  compartment count is a parse error rather than a silently-ignored parameter.
+  Foundation for the modeled-duration/rate (`Dn`/`Rn`) work in #324 (#369).
+- **`ode_template NAME(...)`** in `[structural_model]` generates the standard
+  disposition ODE for a named model (`one/two/three_cpt_iv|oral`) from the same
+  closed-form↔ODE transcription the analytical `pk NAME(...)` uses — so you get
+  the explicit, runnable ODE form without hand-writing the states, RHS, and
+  `obs_scale`. It takes the same parameters as `pk NAME(...)` (including `ka` for
+  oral routes). Re-declaring a `d/dt(X)` in `[odes]` **overrides** the generated
+  equation for compartment `X` (e.g. to add a `transit(...)` absorption input);
+  undeclared compartments keep their generated equations. Combining the ODE-only
+  `transit(...)` absorption with an analytical `pk NAME(...)` is now a clear error
+  pointing at `ode_template`, never a silent analytical→ODE conversion. (Future
+  ODE-only absorption functions join that error rule as each is implemented.)
+  (#322).
 - Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
   input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
   `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The
@@ -190,13 +287,17 @@ section of the SDLC for the versioning policy).
   wall-clock cost (both stencils parallelise over perturbation points). Default
   `true`; set `false` to force the faster analytical-gradient stencil (#335).
 - Propensity-score-matched simulation: `simulate_with_options()` with a new
-  `SimulateOptions { seed, propensity_match }`. When `propensity_match` is set,
-  each replicate's drawn etas are reassigned to subjects by optimal Mahalanobis
-  matching (under the model Ω) against the subjects' fitted (posthoc) etas, so a
-  subject's observed dosing/sampling design is paired with a similar drawn eta.
-  This corrects VPC bias from treatment adaptation in real-world data (longer
-  intervals for high-clearance patients, etc.). Operates on observed data;
-  returns the usual simulation rows for the caller to build the VPC (#288).
+  `SimulateOptions { seed, match_method }`. When `match_method` is `Some(..)`,
+  each replicate's drawn etas are reassigned to subjects by Mahalanobis matching
+  (under the model Ω) against the subjects' fitted (posthoc) etas, so a subject's
+  observed dosing/sampling design is paired with a similar drawn eta. This
+  corrects VPC bias from treatment adaptation in real-world data (longer
+  intervals for high-clearance patients, etc.). Three methods are offered via
+  `MatchMethod`: `Optimal` (global linear-assignment minimum; best on average in
+  simulation, recommended default), `Nearest` (greedy nearest-neighbour,
+  `MatchIt(method="nearest", distance="mahalanobis")`), and `Rank` (pair by the
+  rank of the Mahalanobis norm). Operates on observed data; returns the usual
+  simulation rows for the caller to build the VPC (#288, #396).
 - New `importance_sampling_map` (alias `impmap`) estimation method: a Monte-Carlo
   EM estimator equivalent to NONMEM `METHOD=IMPMAP`. Each iteration re-centers a
   per-subject importance-sampling proposal on the conditional mode (MAP) and
@@ -262,6 +363,24 @@ section of the SDLC for the versioning policy).
   warfarin BLOQ, FOCE TVKA ≈ 0.71 vs FOCEI ≈ 0.81, each matching the corresponding
   NONMEM `METHOD=1 LAPLACE` (with/without INTER) fit. M3 fits that relied on the
   old auto-promotion should set `method = focei` explicitly (#367).
+- **`imp` is now a Monte-Carlo EM estimator by default** (NONMEM `METHOD=IMP`
+  parity): `method = imp` updates θ/Ω/σ instead of only evaluating the marginal
+  `−2 log L`. **Breaking:** model files that used `imp` (e.g. `[focei, imp]`)
+  purely to *score* a fit now re-estimate. Add `is_eval_only = true` (NONMEM
+  `EONLY=1`) to recover the previous evaluation-at-fixed-parameters behaviour.
+  New options `is_iterations` (default 200) and `is_averaging` (default 50)
+  control the MCEM loop; `is_proposal_df` now also accepts `normal`/`mvn`. The
+  estimating `imp` may lead or sit mid-chain; the evaluation-only `imp` must
+  still be terminal. Plain `imp` re-centers its proposal from the previous
+  iteration's sample moments and so is fragile on rich data (warm-start with
+  `[focei, imp]`, or use `impmap`); validated against NONMEM 7.5.1 `METHOD=IMP`
+  on warfarin (#402).
+- The analytical `pk NAME(...)` parameter list is now parsed strictly: a malformed
+  `role=VAR` pair (no `=`, an empty side, or a stray extra `=`) or a duplicate role
+  is a clear parse error instead of being silently dropped or last-winning. The
+  `pk` and `ode_template NAME(...)` directives share one strict parser, so they
+  can't drift in strictness. Well-formed model files (including a tolerated
+  trailing comma) are unaffected (#363).
 - FOCEI gradient-based optimizers (SLSQP, L-BFGS, built-in BFGS, Gauss-Newton)
   now add the `log|H̃|` EBE-response term (the #274/#289 Δ) to the population
   gradient, so they reach the true marginal minimum instead of stalling above it
@@ -312,6 +431,26 @@ section of the SDLC for the versioning policy).
   M3 reference (TVCL 0.1328, TVV 7.731, TVKA 0.810, to ~4 significant figures). The
   `docs/src/examples/bloq.md` expected results, which showed the stalled point,
   are corrected (#367).
+- **Bayesian estimation** (`method = bayes`) now responds to a cooperative
+  cancellation (e.g. an R-session interrupt): the Gibbs sampler polls the cancel
+  flag at each sweep boundary and aborts within one sweep, returning
+  `cancelled by user` instead of running every chain to completion. Previously a
+  Bayes run could not be stopped once started (#393).
+- **IMPMAP** now responds to a cooperative cancellation (e.g. an R-session
+  interrupt) during an iteration's E-step, instead of only at iteration
+  boundaries. The importance-sampling pass — the dominant per-iteration cost on
+  large datasets — previously ran to completion before the cancel flag was
+  checked, so a kill request could appear to hang for minutes; the E-step now
+  polls per subject and the run aborts promptly (#273).
+- An individual parameter assigned only inside symmetric `if`/`else` branches in
+  `[individual_parameters]` (the NONMEM-style `IF (cond) CL = ...` /
+  `IF (!cond) CL = ...` construction) on an **ODE model** is no longer rejected
+  by the `[odes]` RHS validator as an undefined name. A name written on every
+  branch is now promoted to a real individual parameter — getting a PK slot,
+  being written back, and resolving in the ODE RHS — provided a downstream block
+  (`[odes]`, `[structural_model]`, `[scaling]`, `[derived]`) actually references
+  it. Purely internal branch helpers stay branch-local and never consume a PK
+  slot (#357).
 - The covariance-family fit options `covariance_method`, `covariance_fallback`,
   and `covariance_ofv_hessian` no longer emit a spurious "is not used by method
   `<method>` and will be ignored" warning. They are framework-wide covariance-step
@@ -321,6 +460,26 @@ section of the SDLC for the versioning policy).
   is no longer silently scored as `DV=0`. Such rows are now treated as `MDV=1`
   (skipped) and a single `W_MISSING_DV` warning reports how many rows were
   skipped, surfaced in fit warnings and `ferx check` (#258).
+- Bioavailability `F` is now applied to **IV bolus and infusion** doses on the
+  analytical path, not just oral depot doses. The analytical superposition path
+  (used for subjects with no time-varying covariates) previously dropped `F` for
+  IV/infusion dosing, so the same model gave `F`×-different predictions for a
+  no-TV subject versus a time-varying/IOV subject (the event-driven path applied
+  `F` correctly) — a silent inconsistency that biased fits and made an estimated
+  `F` a no-op on all-IV/infusion datasets. `F` now scales the bioavailable
+  amount/rate on every route, matching NONMEM's `F1`, the ODE engine, and the
+  event-driven path. Mapping `f=` on an IV model is no longer warned as unused
+  (#327).
+- Infusion (zero-order, `RATE>0`) doses into the central compartment of an
+  **oral** model are no longer silently dropped on the event-driven analytical
+  path. The oral propagators ignored the infusion input rate, so a depot-bypass
+  infusion produced ~0 concentration for any subject routed through the
+  event-driven path (time-varying covariates, EVID=3/4 resets, or IOV) — while
+  no-covariate subjects (superposition path) got the correct curve. The oral
+  propagators now carry the central zero-order input by linear superposition,
+  matching the superposition path and NONMEM. (Infusion into an oral *depot*
+  compartment, `cmt=1`, remains an explicit error rather than silently bypassing
+  the depot.)
 - NONMEM coded `RATE` values (`-1` = modeled rate, `-2` = modeled duration) — and
   any other negative or non-finite `RATE` on a dose row — are now rejected with an
   informative error naming the subject and time, instead of being silently treated
@@ -420,6 +579,20 @@ section of the SDLC for the versioning policy).
 - `sdtab` no longer emits stray ETA columns (regression from #185).
 - `warfarin --simulate` works again, and the docs `verify-build` step is fixed
   (#199, #200).
+- FREM with `log_additive` error model: covariate pseudo-observation predictions
+  are no longer log-transformed. The FREM override (θ + η) now runs after the
+  LTBS log-transform, producing raw covariate predictions as NONMEM does. Without
+  this fix the OFV was inflated by ~10 orders of magnitude.
+- FREM with IMPMAP/IMP: the IS posterior Hessian now applies the FREM R-diagonal
+  override (EPSCOV² variance) for covariate pseudo-observations, matching the
+  FOCEI and SAEM code paths.
+- `frem_predictions` and `frem_sigma` fit options are now registered as framework
+  keys, suppressing spurious "not used by method" warnings on non-FOCEI chains.
+- FREM data generation: missing covariate values (default -99) are now excluded
+  from mean/variance computation and their pseudo-observation rows are omitted,
+  matching PsN/NONMEM behavior.
+- FREM data generation: records within each subject are now sorted by (time,
+  event priority) to prevent backwards-in-time sequences that NONMEM rejects.
 
 ### Performance
 - The inner EBE optimizer now selects between dense BFGS and L-BFGS by the inner

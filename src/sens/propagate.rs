@@ -142,7 +142,15 @@ pub fn propagate_two_cpt_g<T: PkNum>(
 /// 2-cpt oral propagator: `state = [A_depot, A_central, A_periph]` (bolus only —
 /// the depot drains into central at `ka`). Generic mirror of
 /// [`crate::pk::event_driven::propagate_two_cpt_oral`].
-pub fn propagate_two_cpt_oral_g<T: PkNum>(state: &mut [T], dt: f64, cl: T, v1: T, q: T, v2: T, ka: T) {
+pub fn propagate_two_cpt_oral_g<T: PkNum>(
+    state: &mut [T],
+    dt: f64,
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    ka: T,
+) {
     if v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || q.val() <= 0.0 || ka.val() <= 0.0 {
         return;
     }
@@ -216,7 +224,13 @@ fn build_three_cpt_mode_g<T: PkNum>(mu: T, k12: T, k13: T, k21: T, k31: T) -> Th
 }
 
 #[inline]
-fn apply_three_cpt_mode_g<T: PkNum>(m: &ThreeCptModeG<T>, c: T, p1: T, p2: T, dt: f64) -> (T, T, T) {
+fn apply_three_cpt_mode_g<T: PkNum>(
+    m: &ThreeCptModeG<T>,
+    c: T,
+    p1: T,
+    p2: T,
+    dt: f64,
+) -> (T, T, T) {
     if m.norm.val().abs() < 1e-30 {
         return (T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0));
     }
@@ -269,10 +283,10 @@ pub fn propagate_three_cpt_g<T: PkNum>(
 
     let r_total = rate_central + rate_periph1 + rate_periph2;
     let a_ss_c = r_total * v1 / cl;
-    let a_ss_p1 = (rate_central + rate_periph2) * v2 / cl
-        + rate_periph1 * (cl + q2) * v2 / (cl * q2);
-    let a_ss_p2 = (rate_central + rate_periph1) * v3 / cl
-        + rate_periph2 * (cl + q3) * v3 / (cl * q3);
+    let a_ss_p1 =
+        (rate_central + rate_periph2) * v2 / cl + rate_periph1 * (cl + q2) * v2 / (cl * q2);
+    let a_ss_p2 =
+        (rate_central + rate_periph1) * v3 / cl + rate_periph2 * (cl + q3) * v3 / (cl * q3);
 
     let h_c = state[0] - a_ss_c;
     let h_p1 = state[1] - a_ss_p1;
@@ -520,9 +534,9 @@ fn propagate_bounds_g<T: PkNum>(
                 rate_periph1,
                 rate_periph2,
             ),
-            PkModel::ThreeCptOral => propagate_three_cpt_oral_g(
-                state, dt, pk.cl, pk.v, pk.q, pk.v2, pk.q3, pk.v3, pk.ka,
-            ),
+            PkModel::ThreeCptOral => {
+                propagate_three_cpt_oral_g(state, dt, pk.cl, pk.v, pk.q, pk.v2, pk.q3, pk.v3, pk.ka)
+            }
         }
     }
 }
@@ -547,7 +561,9 @@ fn equilibrate_ss_g<T: PkNum>(pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEven
         return state;
     }
     let synthetic_dose = if is_inf {
-        vec![DoseEvent::new(0.0, dose.amt, dose.cmt, dose.rate, false, 0.0)]
+        vec![DoseEvent::new(
+            0.0, dose.amt, dose.cmt, dose.rate, false, 0.0,
+        )]
     } else {
         Vec::new()
     };
@@ -733,7 +749,13 @@ mod tests {
             let mut s_g = [ad, ac];
             propagate_one_cpt_oral_g::<f64>(&mut s_g, dt, cl, v, ka);
             let mut s_p = [ad, ac];
-            crate::pk::event_driven::propagate_one_cpt_oral(&mut s_p, dt, &pk_of(cl, v, ka));
+            crate::pk::event_driven::propagate_one_cpt_oral(
+                &mut s_p,
+                dt,
+                &pk_of(cl, v, ka),
+                0.0,
+                0.0,
+            );
             approx::assert_relative_eq!(s_g[0], s_p[0], max_relative = 1e-12);
             approx::assert_relative_eq!(s_g[1], s_p[1], max_relative = 1e-12);
         }
@@ -825,6 +847,7 @@ mod tests {
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -911,13 +934,7 @@ mod tests {
         for (ci, c) in cases.iter().enumerate() {
             let subj = make_subject(vec![c.dose.clone()], obs.clone());
             let pk = pk_full(c.cl, c.v, c.ka);
-            let prod = event_driven_predictions(
-                c.model,
-                &subj,
-                &[pk],
-                &vec![pk; obs.len()],
-                &[],
-            );
+            let prod = event_driven_predictions(c.model, &subj, &[pk], &vec![pk; obs.len()], &[]);
             let schedule = EventSchedule::for_subject(&subj, c.model, &[pk.lagtime()]);
             let pk_g = one_cpt_pk_f64(&pk);
             let walk = event_driven_sens_one_cpt_g::<f64>(
@@ -1172,7 +1189,8 @@ mod tests {
                 v3,
                 f: 1.0,
             };
-            event_driven_sens_g::<f64>(PkModel::ThreeCptIv, &subj, &schedule, &[pkd], &[pkd], &[])[0]
+            event_driven_sens_g::<f64>(PkModel::ThreeCptIv, &subj, &schedule, &[pkd], &[pkd], &[])
+                [0]
         });
         for i in 0..2 {
             approx::assert_relative_eq!(out.grad[i], g[i], max_relative = 1e-5, epsilon = 1e-9);
@@ -1203,20 +1221,14 @@ mod tests {
 
         let pk_occ1 = pk_full(5.0, 50.0, 1.0);
         let pk_occ2 = pk_full(8.0, 50.0, 1.0); // faster clearance in occasion 2
-        // Per-event params: dose is occasion 1; obs before t=12 are occasion 1,
-        // after are occasion 2.
+                                               // Per-event params: dose is occasion 1; obs before t=12 are occasion 1,
+                                               // after are occasion 2.
         let pk_at_obs: Vec<PkParams> = obs
             .iter()
             .map(|&t| if t < 12.0 { pk_occ1 } else { pk_occ2 })
             .collect();
 
-        let prod = event_driven_predictions(
-            PkModel::OneCptIv,
-            &subj,
-            &[pk_occ1],
-            &pk_at_obs,
-            &[],
-        );
+        let prod = event_driven_predictions(PkModel::OneCptIv, &subj, &[pk_occ1], &pk_at_obs, &[]);
         let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &[0.0]);
         let pk_at_obs_g: Vec<OneCptPk<f64>> = pk_at_obs.iter().map(one_cpt_pk_f64).collect();
         let walk = event_driven_sens_one_cpt_g::<f64>(
@@ -1251,14 +1263,8 @@ mod tests {
         };
         let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &[0.0]);
         let pk_d = seed(Dual2::var(cl, 0), Dual2::var(v, 1));
-        let walk = event_driven_sens_one_cpt_g::<Dual2<2>>(
-            false,
-            &subj,
-            &schedule,
-            &[pk_d],
-            &[pk_d],
-            &[],
-        );
+        let walk =
+            event_driven_sens_one_cpt_g::<Dual2<2>>(false, &subj, &schedule, &[pk_d], &[pk_d], &[]);
         let out = walk[0];
 
         let (g, he) = fd2([cl, v], |p| {
@@ -1268,14 +1274,8 @@ mod tests {
                 ka,
                 f: 1.0,
             };
-            let w = event_driven_sens_one_cpt_g::<f64>(
-                false,
-                &subj,
-                &schedule,
-                &[pk_g],
-                &[pk_g],
-                &[],
-            );
+            let w =
+                event_driven_sens_one_cpt_g::<f64>(false, &subj, &schedule, &[pk_g], &[pk_g], &[]);
             w[0]
         });
         for i in 0..2 {

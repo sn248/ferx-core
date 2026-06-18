@@ -1744,6 +1744,7 @@ mod tests {
             cens: vec![0; n],
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -1855,6 +1856,7 @@ mod tests {
             &model.error_spec,
             model.bloq_method,
             &[],
+            None,
         )
     }
 
@@ -2228,6 +2230,7 @@ mod tests {
             cens: vec![0; n],
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -2386,6 +2389,7 @@ mod tests {
             cens: vec![0; n],
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -2575,6 +2579,7 @@ mod tests {
                 cens: vec![0; n],
                 occasions: vec![1; n],
                 dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             };
@@ -2939,6 +2944,7 @@ mod tests {
             cens: vec![0; n],
             occasions,
             dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -3337,6 +3343,7 @@ mod tests {
             cens: vec![0; n],
             occasions,
             dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };

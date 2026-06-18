@@ -31,6 +31,8 @@ The optional `[fit_options]` block configures the estimation method and optimize
 | `global_search` | `true`, `false` | `false` | Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a gradient-free global pre-search before the local optimizer. CRS2-LM samples within the parameter bounds; the local optimizer (e.g. `bobyqa`, `slsqp`) starts from the best point found. Useful for poorly-identified models — when the local optimizer can land in a degenerate basin (collapsed ETA, V/Q swap, parameters at bounds) from a far-from-truth start, the global pre-search usually escapes it. Adds the pre-search budget on top of the local optimisation, but typically more efficient than running multiple full fits from scratch. Requires a full NLopt build (e.g. `brew install nlopt` or `apt install libnlopt-dev`); a clear warning is emitted if CRS2-LM is unavailable. |
 | `global_maxeval` | integer | `200 * (n_params + 1)` | Maximum evaluations of the FOCE objective during the global pre-search. Each eval is a full inner-loop pass over all subjects, so this is the dominant cost of `global_search = true`. The default (`0` → auto) is empirically enough to escape bad basins on 10–20 parameter PK models without dominating the wall time of the subsequent local refine. |
 | `bloq_method` | `drop`, `m3` | `drop` | How to handle rows with `CENS=1`. `m3` enables Beal's M3 likelihood (see [BLOQ example](../examples/bloq.md)). |
+| `npde_nsim` | integer ≥ 0 | `0` | Number of Monte-Carlo replicates per subject used to compute the simulation-based [NPDE/NPD diagnostics](#simulation-based-diagnostics-npde--npd) after the fit. `0` (default) disables the computation — no `NPDE`/`NPD` columns are emitted. A typical value is `1000`. Cost scales linearly with the count. |
+| `npde_seed` | integer | — | RNG seed for the NPDE/NPD simulation, for reproducible diagnostics. Unset falls back to a fixed default. Only used when `npde_nsim > 0`. |
 | `mu_referencing` | `true`, `false` | `true` | Re-centre inner-loop ETA estimates on the current population mean (auto-detected from `[individual_parameters]`). See the [FAQ entry](../faq.md#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem--nlmixr2) for details. Set `false` to reproduce pre-automatic-mu behaviour. |
 | `iov_column` | string | — | Name of the occasion column in the dataset (e.g. `OCC`). Required when the model uses `kappa` or `block_kappa` declarations. The column must contain integer occasion indices. Case-insensitive. Only supported with `foce` / `focei` — not `saem`. See [IOV documentation](iov.md). |
 | `optimizer_trace` | `true`, `false` | `false` | Write a per-iteration CSV to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is stored in `FitResult::trace_path`. Useful for diagnosing convergence problems or comparing optimizers. See [Optimizer Trace](#optimizer-trace). |
@@ -55,6 +57,97 @@ a valid NCA estimate.
 
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.
+
+## Simulation-based diagnostics (NPDE / NPD)
+
+Setting `npde_nsim > 0` adds two simulation-based goodness-of-fit columns to the
+`sdtab` output: **NPD** (Normalized Prediction Discrepancies) and **NPDE**
+(Normalized Prediction Distribution Errors). Unlike CWRES — which linearises the
+model around the conditional mode and so inherits the bias of a first-order
+approximation — NPDE/NPD are built entirely from Monte-Carlo simulation under the
+fitted model, so they are robust to model nonlinearity and to non-Gaussian random
+effects (Brendel et al. 2006; Comets et al. 2008, the `npde` R package).
+
+```ini
+[fit_options]
+method = focei
+npde_nsim = 1000     # replicates per subject (off when 0, the default)
+npde_seed = 12345    # optional, for reproducibility
+```
+
+The **effective** seed actually used — the explicit `npde_seed` when given,
+otherwise the built-in default — is recorded as `model: npde_seed:` in the
+`{model}-fit.yaml` output (and round-trips through `.fitrx`), so the `NPDE`/`NPD`
+columns can always be regenerated from the saved fit, even when no seed was set
+in the model file. The line is omitted when NPDE did not run (`npde_nsim = 0`).
+
+For each observation `y_ij`, ferx simulates `K = npde_nsim` replicates under the
+fitted `θ/Ω/Σ` (sampling `η ~ N(0, Ω)` and the residual error), evaluated at the
+subject's own observation design:
+
+- **NPD** (no decorrelation): `pd_ij` is the empirical CDF of the simulated values
+  at observation `ij`, and `npd_ij = Φ⁻¹(pd_ij)`.
+- **NPDE** (decorrelated): within each subject the observed and simulated vectors
+  are decorrelated with the empirical mean and Cholesky factor of the simulated
+  covariance (the Brendel/Comets procedure) *before* the empirical CDF and inverse-
+  normal transform. This removes the within-subject correlation that NPD ignores.
+
+Empirical-CDF probabilities at 0 or 1 are clamped to `[1/(2K), 1 − 1/(2K)]` before
+`Φ⁻¹`, matching the `npde`-package convention, so the scores stay finite.
+
+**Under a correctly specified model, NPDE follows a standard normal distribution.**
+On the warfarin example (`examples/warfarin.ferx`, `data/warfarin.csv`), a converged
+FOCEI fit with `npde_nsim = 1000` gives the expected mean-zero, unit-variance
+distribution:
+
+| Diagnostic | mean | variance | reference |
+|------------|------|----------|-----------|
+| NPDE       | 0.006 | 1.02 | ≈ N(0, 1) |
+| NPD        | −0.002 | 0.88 | mean ≈ 0; variance < 1 because NPD retains within-subject correlation |
+
+This matches the `npde` R package's `autonpde()` (same Cholesky decorrelation and
+edge-clamping) to Monte-Carlo noise. See `tests/npde_validation.rs` for the
+engine-side check and an R reproduction recipe.
+
+### NONMEM cross-validation
+
+NONMEM has no native NPDE output; the reference pipeline is a NONMEM `$SIMULATION`
+post-processed by the `npde` R package. The same warfarin data was fit with NONMEM
+7.5.1 (`ADVAN2 TRANS2`, `METHOD=1 INTER`, proportional error) and the two fits
+agree, so any difference in the diagnostics is attributable to the NPDE
+computation rather than the fit:
+
+| Quantity | ferx (FOCEI) | NONMEM 7.5.1 |
+|----------|-------------|--------------|
+| TVCL     | 0.1328 | 0.1327 |
+| TVV      | 7.738  | 7.738  |
+| TVKA     | 0.817  | 0.811  |
+| OFV      | −286.0015 | −286.0042 |
+
+Feeding a 1000-replicate NONMEM `$SIMULATION` (under the NONMEM estimates) and the
+observed data to `npde::autonpde()` (Cholesky decorrelation, edge-clamping)
+reproduces ferx's NPDE/NPD on the same 110 observations:
+
+| Diagnostic | ferx mean | ferx var | npde-pkg mean | npde-pkg var |
+|------------|-----------|----------|---------------|--------------|
+| NPDE       |  0.005 | 1.09 |  0.036 | 1.04 |
+| NPD        | −0.009 | 0.91 | −0.004 | 0.91 |
+
+The NPD variance (the quantity that should sit below 1 because NPD retains the
+within-subject correlation) matches to three figures (0.91 vs 0.91); the small
+NPDE-variance gap is Monte-Carlo noise between two independent simulation draws.
+Both engines give NPDE ≈ N(0, 1) and a mean-zero NPD, as expected under this
+well-specified model.
+
+**Limitations.** M3/BLQ censored observations need the predictive-CDF variant and
+are out of scope: censored rows (`CENS != 0`) are emitted as empty/`NaN` (matching
+the CWRES/IWRES convention), and a subject's NPDE is `NaN` as a whole when it has
+any censored row, since the within-subject decorrelation would otherwise mix the
+LLOQ into the uncensored rows. NPDE also requires more replicates than a subject
+has observations (`npde_nsim > n_obs`) for a full-rank simulated covariance;
+otherwise that subject's NPDE is `NaN` (NPD is still computed). For IOV (`kappa`)
+models the simulation holds kappas at zero (the existing `simulate()` convention),
+so NPDE/NPD omit the inter-occasion component of the predictive variance.
 
 ## Estimation Methods
 
@@ -105,37 +198,58 @@ See [SIR documentation](../estimation/sir.md) for details.
 
 ## Importance Sampling (IMP)
 
-The `imp` stage estimates the marginal log-likelihood by Monte-Carlo
-importance sampling, giving a lower-bias `−2 log L` than the FOCE/Laplace
-OFV when subject posteriors of η are non-Gaussian (e.g. sparsely-sampled
-PK). Use it as a final chain stage:
+By **default** `imp` is a Monte-Carlo EM **estimator** (NONMEM `METHOD=IMP`):
+it maximises the importance-sampled marginal likelihood, updating θ/Ω/σ each
+iteration. Set `is_eval_only = true` (NONMEM `EONLY=1`) to instead *evaluate*
+the marginal `−2 log L` at the fixed input parameters — a lower-bias `−2 log L`
+than the FOCE/Laplace OFV when subject posteriors of η are non-Gaussian (e.g.
+sparsely-sampled PK).
+
+> **Behaviour change:** `imp` previously only *evaluated* `−2 log L`. It now
+> estimates by default. Add `is_eval_only = true` to recover the old behaviour.
 
 ```
 [fit_options]
-  method        = [focei, imp]
+  method        = imp            # estimate (NONMEM METHOD=IMP)
+  is_iterations = 200
   is_samples    = 1000
-  is_proposal_df = 5
+  is_averaging  = 50
+  is_proposal_df = 5             # or `normal` for a multivariate-normal proposal
   is_seed       = 12345
 ```
 
+```
+[fit_options]
+  method        = [focei, imp]   # evaluate FOCEI's fit (NONMEM EONLY=1)
+  is_eval_only  = true
+```
+
+> On **rich** data prefer [`impmap`](#impmap-importance_sampling_map) or
+> warm-start with `[focei, imp]`; plain `imp`'s one-iteration-lagged proposal
+> can collapse the ESS on a sharp posterior. See the
+> [IMP documentation](../estimation/importance-sampling.md#rich-data-prefer-impmap-or-warm-start).
+
 | Key | Default | Description |
 |-----|---------|-------------|
+| `is_eval_only` | `false` | `true` ⇒ evaluate `−2 log L` at fixed parameters (NONMEM `EONLY=1`); must be the terminal chain stage. `false` ⇒ estimate (NONMEM `METHOD=IMP`). |
+| `is_iterations` | `200` | MCEM iterations (estimator only). |
+| `is_averaging` | `50` | Terminal iterations averaged into the reported estimate (estimator only). |
 | `is_samples` | `1000` | Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE. |
-| `is_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1). Lower = heavier tails. |
-| `is_seed` | `42` | RNG seed. Same seed → identical `−2 log L`. |
+| `is_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1), or `normal`/`mvn` for a multivariate-normal proposal. Lower = heavier tails. |
+| `is_seed` | `12345` | RNG seed. Same seed → identical result. |
 | `is_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction get flagged in the result. Set `0` to silence. |
 
 See [Importance Sampling documentation](../estimation/importance-sampling.md)
-for the algorithm, IOV caveats, and tuning guidance.
+for the algorithm, the NONMEM mapping, IOV caveats, and tuning guidance.
 
 ## IMPMAP (`importance_sampling_map`)
 
-Unlike `imp` (which only *evaluates* the marginal likelihood), `impmap` is a
-full **estimator** — a Monte-Carlo EM loop equivalent to NONMEM
-`METHOD=IMPMAP`. Each iteration re-centers a per-subject importance-sampling
-proposal at the freshly-computed conditional mode (MAP) and updates θ/Ω/σ from
-the importance-weighted posterior moments. It runs standalone or as a chain
-stage:
+Like the estimating `imp`, `impmap` is a Monte-Carlo EM **estimator** —
+equivalent to NONMEM `METHOD=IMPMAP`. The difference is the proposal: `impmap`
+re-centers at the freshly-computed conditional mode (MAP) **every** iteration
+(robust on rich data), whereas `imp` re-centers from the previous iteration's
+sample moments (cheaper, but fragile on rich data). Both update θ/Ω/σ from the
+importance-weighted posterior moments. It runs standalone or as a chain stage:
 
 ```
 [fit_options]
@@ -154,6 +268,11 @@ stage:
 | `impmap_averaging` | `50` | Final iterations whose parameters are averaged into the reported estimate (Monte-Carlo variance reduction). |
 | `impmap_seed` | `12345` | RNG seed. Same seed → identical estimates. |
 | `impmap_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction are flagged as poorly sampled. |
+| `impmap_trace` | `false` | When `true`, collect per-iteration parameter values into `FitResult.impmap_trace` — analogous to NONMEM `.ext` output for traceplots. |
+| `impmap_mceta` | `0` | Number of additional random starting points for per-subject MAP optimization (analogous to NONMEM `MCETA`). Each start draws η from N(0, Ω). The start with the lowest individual NLL wins. `0` = single warm-start (default). `3` is a good choice for high-dimensional models (e.g. FREM with ≥ 5 ETAs). |
+| `impmap_sobol` | `false` | Use Sobol quasi-random sequences (with Cranley-Patterson randomization) for IS draws instead of pseudo-random. Gives more uniform posterior coverage with fewer samples. Only applies to MVN proposals (`impmap_proposal_df = normal`); Student-t falls back to pseudo-random. |
+| `iscale_min` | `0.1` | Minimum proposal scaling factor for adaptive IS (NONMEM `ISCALE_MIN`). The IS proposal covariance is multiplied by `s²` where `s` is chosen from `[iscale_min, iscale_max]` to maximise per-subject ESS. Set both to `1.0` to disable. |
+| `iscale_max` | `10.0` | Maximum proposal scaling factor (NONMEM `ISCALE_MAX`). |
 
 `impmap` reuses `inner_maxiter` / `inner_tol` for the per-iteration MAP step.
 Inter-occasion variability (`[iov]` / `kappa`) and SDE (`[diffusion]`) models

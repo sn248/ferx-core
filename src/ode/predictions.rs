@@ -9,7 +9,8 @@
 
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
 use crate::pk::absorption::PreparedInputRate;
-use crate::types::{DoseEvent, PkParams, Subject, PK_IDX_F, PK_IDX_LAGTIME};
+use crate::types::{DoseEvent, PkParams, Subject};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Epsilon used to decide whether an infusion fully spans a segment.
@@ -25,7 +26,68 @@ const INFUSION_EPS: f64 = 1e-12;
 /// break-time sort. Such rows fall back to the bolus branch instead
 /// (a zero/negative bolus update — visible, not silently dropped).
 pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
+    // Tripwire (#324): every ODE entrypoint resolves modeled-RATE doses to
+    // `Fixed` (via `resolve_subject_doses*`) before any infusion logic runs, so
+    // a non-`Fixed` dose here means a path forgot to resolve — panic in debug /
+    // tests rather than silently mis-handling it (an unresolved modeled dose has
+    // `duration == 0`, so it would quietly degrade to a bolus).
+    debug_assert!(d.is_fixed(), "is_real_infusion: unresolved modeled dose");
     d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
+}
+
+/// Resolve any modeled-`RATE` doses (#324, e.g. `RATE=-2` → modeled duration
+/// `D{cmt}`) in `subject` to concrete (`Fixed`) doses. `pk_for_dose(k)` supplies
+/// the per-dose `PkParams::values` slice used to evaluate dose `k`'s modeled
+/// parameter — pass a constant closure for the no-TV-covariate paths (see
+/// [`resolve_subject_doses`]) or `|k| &pk_at_dose[k].values` for the per-dose
+/// event-driven path. Returns the subject **borrowed** (no allocation) when every
+/// dose is already `Fixed` (the common case — see [`Subject::all_doses_fixed`]),
+/// and an owned copy with resolved `doses` otherwise.
+///
+/// Single source of truth: every ODE entrypoint funnels its subject through this
+/// (or the thin [`resolve_subject_doses`] wrapper) before building the dose
+/// timeline, so the integrator and SS helpers only ever see a concrete
+/// `rate`/`duration` and a coded `RATE=-2` cannot reach them unresolved.
+///
+/// The owned branch clones the whole `Subject`, not just `doses`, because the
+/// downstream machinery ([`crate::pk::event_driven::EventSchedule::for_subject`],
+/// the SS pre-equilibration, the break-time timeline) consumes a unified
+/// `&Subject` and reads `obs_times` / `pk_only_times` / `reset_times` alongside
+/// the resolved `doses`. Cloning only `doses` would force every one of those deep
+/// helpers to take the resolved doses as a separate argument — the
+/// "thread the resolved doses through every helper" design that was deliberately
+/// rejected in favour of resolving once at the entrypoint. The clone is paid
+/// only on the (uncommon) modeled-`RATE` path; the all-`Fixed` path is borrowed.
+pub(crate) fn resolve_subject_doses_with<'a>(
+    subject: &'a Subject,
+    attr_map: &crate::types::DoseAttrMap,
+    pk_for_dose: impl Fn(usize) -> &'a [f64],
+) -> Cow<'a, Subject> {
+    // Fast path: with no compartment-indexed attribute there can be no modeled
+    // dose to resolve, so skip the per-dose `all_doses_fixed()` scan entirely —
+    // the overwhelmingly common case (no `D{cmt}`). A modeled dose cannot reach
+    // here with an empty map: it would have been rejected by the data gate first.
+    if attr_map.is_empty() || subject.all_doses_fixed() {
+        return Cow::Borrowed(subject);
+    }
+    let mut owned = subject.clone();
+    for (k, d) in owned.doses.iter_mut().enumerate() {
+        *d = d.resolve_rate(attr_map, pk_for_dose(k));
+    }
+    Cow::Owned(owned)
+}
+
+/// Resolve modeled-`RATE` doses using `params` for **every** dose — the
+/// no-time-varying-covariate ODE paths, where the PK snapshot is constant across
+/// doses. The event-driven / TV-covariate path calls
+/// [`resolve_subject_doses_with`] directly with a per-dose closure. See
+/// [`resolve_subject_doses_with`].
+pub(crate) fn resolve_subject_doses<'a>(
+    subject: &'a Subject,
+    attr_map: &crate::types::DoseAttrMap,
+    params: &'a [f64],
+) -> Cow<'a, Subject> {
+    resolve_subject_doses_with(subject, attr_map, |_| params)
 }
 
 /// Number of dosing cycles to simulate when pre-equilibrating an SS=1
@@ -70,11 +132,12 @@ fn equilibrate_ss_state(
         return u;
     }
 
-    // Bioavailability F (slot PK_IDX_F, default 1.0) scales the amount that
-    // actually enters the dosing compartment — NONMEM's convention (F·AMT for
-    // a bolus, F·RATE for an infusion). Matches the analytical path
+    // Bioavailability F scales the amount that actually enters the dosing
+    // compartment — NONMEM's convention (F·AMT for a bolus, F·RATE for an
+    // infusion). Resolved per dose compartment (`Fn`; issue #369), falling back
+    // to the bare `PK_IDX_F` slot. Matches the analytical path
     // (`equilibrate_ss_state_event_driven`).
-    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
+    let f_bio = ode.dose_attr_map.f_bio(dose.cmt, pk_params_flat);
 
     let is_inf = is_real_infusion(dose);
     let t_inf = dose.duration;
@@ -172,9 +235,9 @@ fn ss_state_at_phase(
     if cmt_idx >= u.len() {
         return u;
     }
-    // Bioavailability scales the amount entering the dosing compartment
-    // (see `equilibrate_ss_state`).
-    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
+    // Bioavailability scales the amount entering the dosing compartment,
+    // resolved per dose compartment (`Fn`; see `equilibrate_ss_state`).
+    let f_bio = ode.dose_attr_map.f_bio(dose.cmt, pk_params_flat);
 
     if is_real_infusion(dose) {
         let rate = f_bio * dose.rate;
@@ -564,6 +627,14 @@ pub struct OdeSpec {
     /// Attached after `[individual_parameters]` is parsed; `None` for hand-built
     /// specs.
     pub indiv_param_program: Option<crate::parser::model_parser::IndivParamProgram>,
+    /// Compartment-indexed dose attributes (NONMEM `Fn`/`ALAGn`). Maps
+    /// `(attribute, 1-based compartment) -> PkParams slot` for any `F{c}` /
+    /// `ALAG{c}` / `LAGTIME{c}` individual parameter the model declares;
+    /// resolves bioavailability / lag **per dose compartment** instead of from
+    /// the single `PK_IDX_F` / `PK_IDX_LAGTIME` slot (issue #369). Empty for the
+    /// common bare-`F`/`lagtime` model, where every lookup falls through to the
+    /// reserved slot (i.e. the historical single-value behaviour).
+    pub dose_attr_map: crate::types::DoseAttrMap,
 }
 
 impl OdeSpec {
@@ -632,17 +703,31 @@ pub fn ode_predictions(
     let mut u = ode.initial_state(pk_params_flat);
     let mut predictions = vec![f64::NAN; n_obs];
 
-    // Lagtime shifts the effective start (and end) of every dose record.
-    // Default 0.0 when not declared, so existing models behave identically.
-    let lagtime = pk_params_flat.get(PK_IDX_LAGTIME).copied().unwrap_or(0.0);
-    // Per-dose lagtimes for `active_infusions` — uniform for the no-TV
-    // path (lagtime is constant across doses).
-    let dose_lagtimes: Vec<f64> = vec![lagtime; subject.doses.len()];
-    // Bioavailability F (slot PK_IDX_F, default 1.0) scales the amount that
-    // enters the dosing compartment — NONMEM's F·AMT (bolus) / F·RATE
-    // (infusion). Uniform across doses on the no-TV path.
-    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
-    let dose_f_bio: Vec<f64> = vec![f_bio; subject.doses.len()];
+    // Resolve modeled-RATE doses to concrete (`Fixed`) doses ONCE, before
+    // building the timeline/forcing: `resolve_subject_doses` is the single source
+    // of truth (#324), so every `subject.doses` read below sees a concrete
+    // rate/duration and a coded RATE=-2 (modeled duration `D{cmt}`) cannot reach
+    // the integrator unresolved. Borrowed (no clone) for the common all-`Fixed`
+    // dataset; parameters are constant across doses on this no-TV path.
+    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let subject: &Subject = &resolved;
+
+    // Lagtime shifts the effective start (and end) of every dose record; F
+    // scales the amount entering the compartment (NONMEM's F·AMT bolus / F·RATE
+    // infusion). Both default (lag 0.0, F 1.0) when not declared, so existing
+    // models behave identically. Resolved **per dose compartment** so a model
+    // with `Fn`/`ALAGn` (issue #369) applies the right value to each route; the
+    // common bare-`F`/`lagtime` model gets a uniform vector.
+    let dose_lagtimes: Vec<f64> = subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
+        .collect();
+    let dose_f_bio: Vec<f64> = subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
+        .collect();
 
     // Extended params: slots 0..MAX_PK_PARAMS hold the PK parameters; slots
     // MAX_PK_PARAMS and MAX_PK_PARAMS+1 carry TAFD/TAD anchors for the ODE RHS.
@@ -676,15 +761,16 @@ pub fn ode_predictions(
     // either fully inside or fully outside every infusion window.
     let t_last = subject.obs_times.iter().cloned().fold(0.0f64, f64::max);
     let mut break_times: Vec<f64> = vec![0.0];
-    for dose in &subject.doses {
-        break_times.push(dose.time + lagtime);
+    for (i, dose) in subject.doses.iter().enumerate() {
+        let lag = dose_lagtimes[i];
+        break_times.push(dose.time + lag);
         if is_real_infusion(dose) {
-            break_times.push(dose.time + lagtime + dose.duration);
+            break_times.push(dose.time + lag + dose.duration);
         }
         // SS + lagtime: break at the dose *record* time too, so we can seed
         // the previous-interval steady-state tail there before the lagged
         // pulse arrives (issue #15).
-        if lagtime > 0.0 && dose.ss && dose.ii > 0.0 {
+        if lag > 0.0 && dose.ss && dose.ii > 0.0 {
             break_times.push(dose.time);
         }
     }
@@ -710,16 +796,15 @@ pub fn ode_predictions(
         // arrival) seed the previous interval's steady-state tail so pre-lag
         // observations don't read the empty initial state. Phase II−lagtime
         // is where the prior pulse has decayed to by the record time.
-        if lagtime > 0.0 {
-            for dose in &subject.doses {
-                if dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
-                    u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lagtime, &opts);
-                }
+        for (i, dose) in subject.doses.iter().enumerate() {
+            let lag = dose_lagtimes[i];
+            if lag > 0.0 && dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
+                u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lag, &opts);
             }
         }
 
-        for dose in &subject.doses {
-            if (dose.time + lagtime - t_start).abs() >= 1e-12 {
+        for (i, dose) in subject.doses.iter().enumerate() {
+            if (dose.time + dose_lagtimes[i] - t_start).abs() >= 1e-12 {
                 continue;
             }
             if dose.ss && dose.ii > 0.0 {
@@ -732,7 +817,7 @@ pub fn ode_predictions(
                 // it's skipped here to avoid double-counting the dose.
                 let cmt_idx = dose.cmt - 1;
                 if cmt_idx < n {
-                    u[cmt_idx] += f_bio * dose.amt;
+                    u[cmt_idx] += dose_f_bio[i] * dose.amt;
                 }
             }
         }
@@ -777,13 +862,15 @@ pub fn ode_predictions(
             let last_dose_eff = subject
                 .doses
                 .iter()
-                .filter(|d| d.time + lagtime <= t_start + 1e-12)
-                .map(|d| {
+                .enumerate()
+                .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
+                .map(|(i, d)| {
+                    let lag = dose_lagtimes[i];
                     if d.ss && d.ii > 0.0 {
-                        let elapsed = t_start - (d.time + lagtime);
+                        let elapsed = t_start - (d.time + lag);
                         t_start - elapsed.rem_euclid(d.ii)
                     } else {
-                        d.time + lagtime
+                        d.time + lag
                     }
                 })
                 .fold(f64::NEG_INFINITY, f64::max);
@@ -898,6 +985,14 @@ pub fn ode_predictions_event_driven(
     assert_eq!(pk_at_obs.len(), subject.obs_times.len());
     assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
 
+    // Resolve modeled-RATE doses to concrete (`Fixed`) doses once (#324), each
+    // with its own per-dose PK snapshot `pk_at_dose[k]` (this is the event-driven
+    // / time-varying-covariate path). Borrowed (no clone) for the common
+    // all-`Fixed` dataset. Single source of truth — see `resolve_subject_doses`.
+    let resolved =
+        resolve_subject_doses_with(subject, &ode.dose_attr_map, |k| &pk_at_dose[k].values);
+    let subject: &Subject = &resolved;
+
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
     let opts = ode.solver_opts;
@@ -991,11 +1086,22 @@ pub fn ode_predictions_event_driven(
     for (r, &t) in subject.reset_times.iter().enumerate() {
         timeline.push((t, Kind::Reset, r));
     }
-    // Per-dose lagtimes from the per-event PK snapshot for the dose.
-    let dose_lagtimes: Vec<f64> = pk_at_dose.iter().map(|p| p.lagtime()).collect();
-    // Per-dose bioavailability F from the per-event PK snapshot — F may vary
-    // across doses when it depends on time-varying covariates.
-    let dose_f_bio: Vec<f64> = pk_at_dose.iter().map(|p| p.f_bio()).collect();
+    // Per-dose lagtime / bioavailability from each dose's PK snapshot, resolved
+    // per dose compartment (`Fn`/`ALAGn`; issue #369) with fallback to the bare
+    // `lagtime`/`F` slots. The per-event snapshot also captures variation from
+    // time-varying covariates.
+    let dose_lagtimes: Vec<f64> = subject
+        .doses
+        .iter()
+        .zip(pk_at_dose.iter())
+        .map(|(d, p)| ode.dose_attr_map.lagtime(d.cmt, &p.values))
+        .collect();
+    let dose_f_bio: Vec<f64> = subject
+        .doses
+        .iter()
+        .zip(pk_at_dose.iter())
+        .map(|(d, p)| ode.dose_attr_map.f_bio(d.cmt, &p.values))
+        .collect();
     for (k, d) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[k];
         timeline.push((d.time + lag, Kind::Dose, k));
@@ -1044,17 +1150,21 @@ pub fn ode_predictions_event_driven(
             // Build extended params for this segment: slots 0..MAX_PK_PARAMS
             // are pk_now.values; slots MAX_PK_PARAMS and MAX_PK_PARAMS+1 carry
             // the TAFD/TAD anchors for TIME/TAFD/TAD injection in the ODE RHS.
-            let lagtime_ed = pk_now.lagtime();
+            // TAD anchor: shift each dose by its own resolved lag (per dose
+            // compartment), consistent with the timeline above and the
+            // non-event-driven path.
             let last_dose_eff_ed = subject
                 .doses
                 .iter()
-                .filter(|d| d.time + lagtime_ed <= cur_t + 1e-12)
-                .map(|d| {
+                .enumerate()
+                .filter(|(i, d)| d.time + dose_lagtimes[*i] <= cur_t + 1e-12)
+                .map(|(i, d)| {
+                    let lag = dose_lagtimes[i];
                     if d.ss && d.ii > 0.0 {
-                        let elapsed = cur_t - (d.time + lagtime_ed);
+                        let elapsed = cur_t - (d.time + lag);
                         cur_t - elapsed.rem_euclid(d.ii)
                     } else {
-                        d.time + lagtime_ed
+                        d.time + lag
                     }
                 })
                 .fold(f64::NEG_INFINITY, f64::max);
@@ -1126,7 +1236,8 @@ pub fn ode_predictions_event_driven(
                 if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt) {
                     let cmt_idx = d.cmt.saturating_sub(1);
                     if cmt_idx < n {
-                        u[cmt_idx] += pk_now.f_bio() * d.amt;
+                        // Bioavailability resolved per dose compartment (`Fn`).
+                        u[cmt_idx] += ode.dose_attr_map.f_bio(d.cmt, &pk_now.values) * d.amt;
                     }
                 }
                 last_pk = pk_now;
@@ -1192,6 +1303,16 @@ pub fn ode_predictions_ekf_with_diffusion(
 ) -> (Vec<f64>, Vec<f64>) {
     use crate::ode::ekf::solve_ekf;
 
+    // Resolve modeled-RATE doses once (#324). This resolve is load-bearing for the
+    // `solve_ekf` call below, which reads `subject.doses` directly and so needs
+    // concrete rate/duration; it cannot be dropped in favour of the resolve inside
+    // `ode_predictions` (that one is internal and not visible here). The
+    // `ode_predictions` call then re-checks an already-`Fixed` subject — a cheap
+    // `all_doses_fixed()` scan that returns `Cow::Borrowed` (no second clone). The
+    // clone happens at most once, only on the modeled-`RATE` path.
+    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let subject: &Subject = &resolved;
+
     // EKF path: parser rejects SDE + Form C, so output_fn is always None
     // here and theta/eta would never be consulted. Pass empty slices.
     let ipred_plain = ode_predictions(ode, pk_params_flat, &[], &[], subject);
@@ -1217,6 +1338,7 @@ pub fn ode_predictions_ekf_with_diffusion(
             .expect("EKF requires obs_cmt_idx; SDE + [scaling] y = ... is not supported"),
         diffusion_var,
         pk_params_flat,
+        &ode.dose_attr_map,
         &ode.initial_state(pk_params_flat),
         &subject.doses,
         &subject.obs_times,
@@ -1252,6 +1374,13 @@ pub fn ode_predictions_ekf(
 ) -> (Vec<f64>, Vec<f64>) {
     use crate::ode::ekf::solve_ekf;
 
+    // Resolve modeled-RATE doses once (#324). Load-bearing for the `solve_ekf`
+    // call below (it reads `subject.doses` directly); the later `ode_predictions`
+    // call re-checks an already-`Fixed` subject (cheap scan, `Cow::Borrowed`, no
+    // second clone). See `ode_predictions_ekf_with_diffusion` for the rationale.
+    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let subject: &Subject = &resolved;
+
     // Compute per-observation R for the Kalman update from a standard ODE pass.
     // Using per-observation R is correct for proportional and combined error models.
     // EKF path: parser rejects SDE + Form C, so output_fn is always None
@@ -1276,6 +1405,7 @@ pub fn ode_predictions_ekf(
             .expect("EKF requires obs_cmt_idx; SDE + [scaling] y = ... is not supported"),
         &ode.diffusion_var,
         pk_params_flat,
+        &ode.dose_attr_map,
         &ode.initial_state(pk_params_flat),
         &subject.doses,
         &subject.obs_times,
@@ -1328,10 +1458,24 @@ pub fn ode_predictions_with_states(
     let mut predictions = vec![f64::NAN; n_obs];
     let mut states: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; n_obs];
 
-    let lagtime = pk_params_flat.get(PK_IDX_LAGTIME).copied().unwrap_or(0.0);
-    let dose_lagtimes: Vec<f64> = vec![lagtime; subject.doses.len()];
-    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
-    let dose_f_bio: Vec<f64> = vec![f_bio; subject.doses.len()];
+    // Resolve modeled-RATE doses once (#324) before building the timeline so the
+    // states pass sees concrete rate/duration; borrowed for all-`Fixed`.
+    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let subject: &Subject = &resolved;
+
+    // Per dose-compartment bioavailability / lag (`Fn`/`ALAGn`; issue #369),
+    // falling back to the bare `PK_IDX_F`/`PK_IDX_LAGTIME` slots. Uniform on
+    // this no-TV path, where every dose reads the same `pk_params_flat`.
+    let dose_lagtimes: Vec<f64> = subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
+        .collect();
+    let dose_f_bio: Vec<f64> = subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
+        .collect();
 
     let first_dose_time = subject
         .doses
@@ -1354,12 +1498,13 @@ pub fn ode_predictions_with_states(
 
     let t_last = subject.obs_times.iter().cloned().fold(0.0f64, f64::max);
     let mut break_times: Vec<f64> = vec![0.0];
-    for dose in &subject.doses {
-        break_times.push(dose.time + lagtime);
+    for (i, dose) in subject.doses.iter().enumerate() {
+        let lag = dose_lagtimes[i];
+        break_times.push(dose.time + lag);
         if is_real_infusion(dose) {
-            break_times.push(dose.time + lagtime + dose.duration);
+            break_times.push(dose.time + lag + dose.duration);
         }
-        if lagtime > 0.0 && dose.ss && dose.ii > 0.0 {
+        if lag > 0.0 && dose.ss && dose.ii > 0.0 {
             break_times.push(dose.time);
         }
     }
@@ -1378,11 +1523,10 @@ pub fn ode_predictions_with_states(
         // SS + lagtime: at the dose *record* time (strictly before the lagged pulse
         // arrives) seed the previous interval's steady-state tail, exactly mirroring
         // the separate pre-pass in `ode_predictions` (lines 479-485).
-        if lagtime > 0.0 {
-            for dose in &subject.doses {
-                if dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
-                    u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lagtime, &opts);
-                }
+        for (i, dose) in subject.doses.iter().enumerate() {
+            let lag = dose_lagtimes[i];
+            if lag > 0.0 && dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
+                u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lag, &opts);
             }
         }
 
@@ -1460,13 +1604,15 @@ pub fn ode_predictions_with_states(
             let last_dose_eff = subject
                 .doses
                 .iter()
-                .filter(|d| d.time + lagtime <= t_start + 1e-12)
-                .map(|d| {
+                .enumerate()
+                .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
+                .map(|(i, d)| {
+                    let lag = dose_lagtimes[i];
                     if d.ss && d.ii > 0.0 {
-                        let elapsed = t_start - (d.time + lagtime);
+                        let elapsed = t_start - (d.time + lag);
                         t_start - elapsed.rem_euclid(d.ii)
                     } else {
-                        d.time + lagtime
+                        d.time + lag
                     }
                 })
                 .fold(f64::NEG_INFINITY, f64::max);
@@ -1623,10 +1769,24 @@ pub fn ode_dense_solve_states(
     let mut u = ode.initial_state(pk_params_flat);
     let mut result: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; saveat.len()];
 
-    let lagtime = pk_params_flat.get(PK_IDX_LAGTIME).copied().unwrap_or(0.0);
-    let dose_lagtimes: Vec<f64> = vec![lagtime; subject.doses.len()];
-    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
-    let dose_f_bio: Vec<f64> = vec![f_bio; subject.doses.len()];
+    // Resolve modeled-RATE doses once (#324) before building the timeline so the
+    // states pass sees concrete rate/duration; borrowed for all-`Fixed`.
+    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let subject: &Subject = &resolved;
+
+    // Per dose-compartment bioavailability / lag (`Fn`/`ALAGn`; issue #369),
+    // falling back to the bare `PK_IDX_F`/`PK_IDX_LAGTIME` slots. Uniform on
+    // this no-TV path, where every dose reads the same `pk_params_flat`.
+    let dose_lagtimes: Vec<f64> = subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
+        .collect();
+    let dose_f_bio: Vec<f64> = subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
+        .collect();
 
     let first_dose_time = subject
         .doses
@@ -1650,12 +1810,13 @@ pub fn ode_dense_solve_states(
 
     let t_last = saveat.iter().cloned().fold(0.0f64, f64::max);
     let mut break_times: Vec<f64> = vec![0.0];
-    for dose in &subject.doses {
-        break_times.push(dose.time + lagtime);
+    for (i, dose) in subject.doses.iter().enumerate() {
+        let lag = dose_lagtimes[i];
+        break_times.push(dose.time + lag);
         if is_real_infusion(dose) {
-            break_times.push(dose.time + lagtime + dose.duration);
+            break_times.push(dose.time + lag + dose.duration);
         }
-        if lagtime > 0.0 && dose.ss && dose.ii > 0.0 {
+        if lag > 0.0 && dose.ss && dose.ii > 0.0 {
             break_times.push(dose.time);
         }
     }
@@ -1687,11 +1848,10 @@ pub fn ode_dense_solve_states(
 
         // SS + lagtime: at the dose *record* time (before the lagged pulse arrives)
         // seed the previous interval's steady-state tail, mirroring ode_predictions.
-        if lagtime > 0.0 {
-            for dose in &subject.doses {
-                if dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
-                    u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lagtime, &opts);
-                }
+        for (i, dose) in subject.doses.iter().enumerate() {
+            let lag = dose_lagtimes[i];
+            if lag > 0.0 && dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
+                u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lag, &opts);
             }
         }
 
@@ -1753,13 +1913,15 @@ pub fn ode_dense_solve_states(
             let last_dose_eff = subject
                 .doses
                 .iter()
-                .filter(|d| d.time + lagtime <= t_start + 1e-12)
-                .map(|d| {
+                .enumerate()
+                .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
+                .map(|(i, d)| {
+                    let lag = dose_lagtimes[i];
                     if d.ss && d.ii > 0.0 {
-                        let elapsed = t_start - (d.time + lagtime);
+                        let elapsed = t_start - (d.time + lag);
                         t_start - elapsed.rem_euclid(d.ii)
                     } else {
-                        d.time + lagtime
+                        d.time + lag
                     }
                 })
                 .fold(f64::NEG_INFINITY, f64::max);
@@ -1853,6 +2015,7 @@ mod tests {
             rhs_program: None,
             readout_program: None,
             indiv_param_program: None,
+            dose_attr_map: Default::default(),
             init_fn: None,
         }
     }
@@ -1882,9 +2045,201 @@ mod tests {
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
+    }
+
+    /// Two-compartment "accumulator": `d/dt = 0` for both states, so each state
+    /// holds exactly the bioavailable amount injected into it — letting a test
+    /// read `F·amt` (and lag timing) straight off the state. `readout_idx`
+    /// selects which compartment the observable reads.
+    fn two_cpt_accumulator(readout_idx: usize, map: crate::types::DoseAttrMap) -> OdeSpec {
+        OdeSpec {
+            rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+                dy[1] = 0.0;
+            }),
+            n_states: 2,
+            state_names: vec!["c1".into(), "c2".into()],
+            readout: OdeReadout::ObsCmt(readout_idx),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: map,
+            init_fn: None,
+        }
+    }
+
+    #[test]
+    fn ode_predictions_apply_per_compartment_bioavailability_and_lag() {
+        // Issue #369. Dose 100 into cmt 1 and 100 into cmt 2. Bare F = 0.5
+        // applies to every compartment; `F2` = 0.25 overrides compartment 2;
+        // `ALAG2` = 5 h delays only the compartment-2 dose. Reading each state
+        // off the accumulator must show the *per-compartment* attribute.
+        let mut map = crate::types::DoseAttrMap::default();
+        map.insert(crate::types::DoseAttr::F, 2, 9); // F2 -> spare slot 9
+        map.insert(crate::types::DoseAttr::Lag, 2, 10); // ALAG2 -> spare slot 10
+
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_F] = 0.5; // bare F (all compartments)
+        p.values[9] = 0.25; // F2 overrides cmt 2
+        p.values[10] = 5.0; // ALAG2 on cmt 2
+
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0),
+        ];
+        // Observe at t = 1 (before ALAG2 = 5) and t = 10 (after).
+        let subj = make_subject(doses, vec![1.0, 10.0]);
+
+        // Compartment 1: bare F = 0.5, no lag -> 50 at both times.
+        let c1 = ode_predictions(
+            &two_cpt_accumulator(0, map.clone()),
+            &p.values,
+            &[],
+            &[],
+            &subj,
+        );
+        assert!((c1[0] - 50.0).abs() < 1e-9, "cmt1 @t=1: {}", c1[0]);
+        assert!((c1[1] - 50.0).abs() < 1e-9, "cmt1 @t=10: {}", c1[1]);
+
+        // Compartment 2: F2 = 0.25 and ALAG2 = 5 -> 0 before lag, 25 after.
+        let c2 = ode_predictions(&two_cpt_accumulator(1, map), &p.values, &[], &[], &subj);
+        assert!(c2[0].abs() < 1e-9, "cmt2 pre-lag: {}", c2[0]);
+        assert!((c2[1] - 25.0).abs() < 1e-9, "cmt2 @t=10 (F2): {}", c2[1]);
+    }
+
+    #[test]
+    fn ode_predictions_event_driven_apply_per_compartment_bioavailability_and_lag() {
+        // #369 review #3: the event-driven path is the actual fit path and
+        // resolves F through a *distinct* inline form
+        // (`dose_attr_map.f_bio(d.cmt, &pk_now.values)`), so per-compartment
+        // correctness must be asserted here too — not only on `ode_predictions`.
+        // Same 2-compartment accumulator and expectations as the no-TV test.
+        let mut map = crate::types::DoseAttrMap::default();
+        map.insert(crate::types::DoseAttr::F, 2, 9);
+        map.insert(crate::types::DoseAttr::Lag, 2, 10);
+
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_F] = 0.5;
+        p.values[9] = 0.25; // F2
+        p.values[10] = 5.0; // ALAG2
+
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0),
+        ];
+        let subj = make_subject(doses, vec![1.0, 10.0]);
+        let dose_pk = vec![p; subj.doses.len()];
+        let obs_pk = vec![p; subj.obs_times.len()];
+
+        // Compartment 1: bare F = 0.5, no lag.
+        let c1 = ode_predictions_event_driven(
+            &two_cpt_accumulator(0, map.clone()),
+            &subj,
+            &[],
+            &[],
+            &dose_pk,
+            &obs_pk,
+            &[],
+        );
+        assert!((c1[0] - 50.0).abs() < 1e-9, "cmt1 @t=1: {}", c1[0]);
+        assert!((c1[1] - 50.0).abs() < 1e-9, "cmt1 @t=10: {}", c1[1]);
+
+        // Compartment 2: F2 = 0.25, ALAG2 = 5 -> 0 pre-lag, 25 after.
+        let c2 = ode_predictions_event_driven(
+            &two_cpt_accumulator(1, map),
+            &subj,
+            &[],
+            &[],
+            &dose_pk,
+            &obs_pk,
+            &[],
+        );
+        assert!(c2[0].abs() < 1e-9, "cmt2 pre-lag: {}", c2[0]);
+        assert!((c2[1] - 25.0).abs() < 1e-9, "cmt2 @t=10 (F2): {}", c2[1]);
+    }
+
+    /// Coverage: the steady-state branch of the event-driven TAD anchor in
+    /// `ode_predictions_event_driven` (`last_dose_eff` reckons from the most
+    /// recent SS cycle). Smoke-level — predictions must stay finite.
+    #[test]
+    fn event_driven_ss_dose_predictions_finite() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(5.0, 80.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)]; // SS bolus
+        let subj = make_subject(doses, vec![6.0, 18.0]);
+        let dose_pk = vec![pk; subj.doses.len()];
+        let obs_pk = vec![pk; subj.obs_times.len()];
+        let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &dose_pk, &obs_pk, &[]);
+        assert!(
+            preds.iter().all(|p| p.is_finite()),
+            "SS preds finite: {preds:?}"
+        );
+    }
+
+    /// Coverage: the infusion break-time branch of `ode_predictions_with_states`.
+    #[test]
+    fn with_states_infusion_dose_runs() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(5.0, 80.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0)]; // infusion, dur=10
+        assert!(is_real_infusion(&doses[0]));
+        let subj = make_subject(doses, vec![5.0, 20.0]);
+        let (preds, states) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subj);
+        assert_eq!(states.len(), 2);
+        assert!(preds.iter().all(|p| p.is_finite()));
+    }
+
+    /// Coverage: `ode_dense_solve_states` with a steady-state, *lagged* infusion —
+    /// exercises the infusion break, the SS pre-seed at the dose record time, and
+    /// the SS branch of the dense TAD anchor in a single pass.
+    #[test]
+    fn dense_solve_ss_lagged_infusion_runs() {
+        let ode = one_cpt_ode_spec();
+        let mut pk = pk_one(5.0, 80.0);
+        pk.values[crate::types::PK_IDX_LAGTIME] = 2.0; // lag > 0
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 10.0, true, 12.0)]; // SS infusion
+        let subj = make_subject(doses, vec![6.0]);
+        let states = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subj, &[6.0, 14.0]);
+        assert_eq!(states.len(), 2);
+        assert!(states.iter().all(|s| s.iter().all(|x| x.is_finite())));
+    }
+
+    /// Coverage: the `ode_predictions_ekf` wrapper (a 1-state `[diffusion]` spec);
+    /// elsewhere only `solve_ekf` is exercised directly.
+    #[test]
+    fn ode_predictions_ekf_wrapper_runs() {
+        let ode = OdeSpec {
+            rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ke * y[0];
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: vec![0.1],
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+            init_fn: None,
+        };
+        let pk = pk_one(5.0, 80.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let subj = make_subject(doses, vec![2.0, 8.0]);
+        let (ipreds, p_obs) = ode_predictions_ekf(&ode, &pk.values, &subj, |_| 1.0);
+        assert_eq!(ipreds.len(), 2);
+        assert!(ipreds.iter().chain(p_obs.iter()).all(|x| x.is_finite()));
     }
 
     /// Turnover model with a baseline initial condition:
@@ -1904,6 +2259,7 @@ mod tests {
             rhs_program: None,
             readout_program: None,
             indiv_param_program: None,
+            dose_attr_map: Default::default(),
             init_fn: Some(Box::new(|p: &[f64]| {
                 let (kin, kout) = (p[0], p[1]);
                 vec![if kout > 0.0 { kin / kout } else { 0.0 }]
@@ -1944,6 +2300,7 @@ mod tests {
             rhs_program: None,
             readout_program: None,
             indiv_param_program: None,
+            dose_attr_map: Default::default(),
         }
     }
 
@@ -2441,6 +2798,7 @@ mod tests {
             rhs_program: None,
             readout_program: None,
             indiv_param_program: None,
+            dose_attr_map: Default::default(),
             init_fn: None,
         }
     }
@@ -2662,7 +3020,7 @@ mod tests {
         let obs_times = vec![1.0, 3.0, 6.0];
         let subj = make_subject(doses, obs_times);
         let mut pk = pk_one(5.0, 80.0);
-        pk.values[PK_IDX_LAGTIME] = 2.0;
+        pk.values[crate::types::PK_IDX_LAGTIME] = 2.0;
         let ode = one_cpt_ode_spec();
 
         let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
@@ -2693,7 +3051,7 @@ mod tests {
         assert!(dose_lag.is_infusion() && dose_lag.duration > 0.0);
         let subj_lag = make_subject(vec![dose_lag], vec![2.0, 3.0, 4.0]);
         let mut pk_lag = pk_one(5.0, 80.0);
-        pk_lag.values[PK_IDX_LAGTIME] = 0.5;
+        pk_lag.values[crate::types::PK_IDX_LAGTIME] = 0.5;
 
         // Reference: dose shifted at the data level, no lagtime applied.
         let dose_ref = DoseEvent::new(2.5, 100.0, 1, 100.0, false, 0.0);
@@ -2884,6 +3242,7 @@ mod tests {
             rhs_program: None,
             readout_program: None,
             indiv_param_program: None,
+            dose_attr_map: Default::default(),
             init_fn: None,
         }
     }
@@ -3021,6 +3380,7 @@ mod tests {
             rhs_program: None,
             readout_program: None,
             indiv_param_program: None,
+            dose_attr_map: Default::default(),
             init_fn: None,
         };
         let pk = pk_one(1.0, 1.0);
@@ -3046,7 +3406,7 @@ mod tests {
         p.values[crate::types::PK_IDX_CL] = cl;
         p.values[crate::types::PK_IDX_V] = v;
         p.values[crate::types::PK_IDX_KA] = ka;
-        p.values[PK_IDX_F] = f;
+        p.values[crate::types::PK_IDX_F] = f;
         p
     }
 

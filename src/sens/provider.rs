@@ -456,6 +456,10 @@ pub fn subject_sensitivities_iov(
     if !iov_analytical_supported(model) {
         return None;
     }
+    // Oral infusion (#350/#400) is not yet mirrored in the sensitivity walk.
+    if oral_infusion_unsupported(model, subject) {
+        return None;
+    }
     // EVID=3/4 resets are honoured by the event-driven walk: it zeros the dual
     // state at each reset and rebuilds the post-reset occasion from the schedule,
     // exactly as production's `event_driven_predictions` does (the `f64` instance
@@ -894,6 +898,10 @@ pub fn subject_sensitivities_tvcov(
     if !tvcov_analytical_supported(model) || !subject.has_tv_covariates() {
         return None;
     }
+    // Oral infusion (#350/#400) is not yet mirrored in the sensitivity walk.
+    if oral_infusion_unsupported(model, subject) {
+        return None;
+    }
     // Steady-state doses equilibrate per-event in the walk (`equilibrate_ss_g`,
     // at each dose's covariate snapshot), exactly as production's event-driven
     // predictor does. A steady-state dose assumes an infinite periodic history,
@@ -1190,6 +1198,10 @@ fn subject_eta_grad_impl(
         return None;
     }
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
+        return None;
+    }
+    // Oral infusion (#350/#400) is not yet mirrored in the sensitivity kernels.
+    if oral_infusion_unsupported(model, subject) {
         return None;
     }
     // The light (first-order) provider doesn't carry the `ExpressionScale`
@@ -1522,6 +1534,23 @@ fn apply_expression_scale<const M: usize>(
     }
 }
 
+/// Oral models with an **infusion** dose (RATE>0 into the depot/central, or a
+/// modeled-duration `D{cmt}`) are not yet mirrored in the sensitivity path: main's
+/// #350 (depot-bypass infusion into oral central) and #400 (zero-order input into
+/// the oral depot) added the `rate_central`/`rate_depot` terms to the production
+/// f64 propagators / analytical kernels, but the `Dual2` walk's oral propagators
+/// (`propagate_*_oral_g`) and the superposition kernels drop them. Producing an
+/// analytic gradient here would be inconsistent with the (now infusion-correct)
+/// objective, so fall back to the finite-difference gradient. Bolus oral dosing —
+/// the overwhelmingly common case — is unaffected. Mirroring oral infusion into
+/// the dual walk is a tracked follow-up.
+pub(crate) fn oral_infusion_unsupported(model: &CompiledModel, subject: &Subject) -> bool {
+    matches!(
+        model.pk_model,
+        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+    ) && subject.doses.iter().any(|d| d.is_infusion())
+}
+
 fn subject_sensitivities_impl(
     model: &CompiledModel,
     subject: &Subject,
@@ -1542,6 +1571,10 @@ fn subject_sensitivities_impl(
         return None;
     }
     if !analytical_supported(model) {
+        return None;
+    }
+    // Oral infusion (#350/#400) is not yet mirrored in the sensitivity kernels.
+    if oral_infusion_unsupported(model, subject) {
         return None;
     }
     // Time-varying covariates make the PK parameters switch mid-decay, which dose
@@ -2220,6 +2253,7 @@ mod tests {
             cens: vec![0; n],
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -2360,6 +2394,7 @@ mod tests {
             cens: vec![0; n],
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -2684,6 +2719,7 @@ mod tests {
             cens: vec![0; n],
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -3254,6 +3290,7 @@ mod tests {
             cens: vec![0; n],
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -3452,6 +3489,7 @@ mod tests {
             cens: vec![0; n],
             occasions,
             dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -3633,6 +3671,7 @@ mod tests {
             cens: vec![0; n],
             occasions,
             dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -3871,6 +3910,7 @@ mod tests {
             cens: vec![0; n],
             occasions,
             dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }

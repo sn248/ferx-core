@@ -8,6 +8,52 @@ use std::collections::HashMap;
 // and the `Debug`/`Clone` derives are reachable from outside the crate.
 pub use crate::parser::model_parser::IndivParamPartials;
 
+/// How a dose's infusion `rate`/`duration` are determined.
+///
+/// NONMEM overloads the `RATE` column with negative codes that make the
+/// infusion **parameter-driven** rather than data-driven (see
+/// [`crate::io`] data-format docs):
+///   - `RATE = -2` → the infusion *duration* is the model parameter `D{cmt}`
+///     ([`RateMode::ModeledDuration`]); the rate is then `amt / duration`.
+///   - `RATE = -1` → the infusion *rate* is the model parameter `R{cmt}`
+///     (not yet supported — `#324` Phase B; rejected at data-read time).
+///
+/// The modeled values are not known at parse/read time (they depend on the
+/// per-iteration `theta`/`eta`/covariates), so a coded dose stores its mode
+/// here and is resolved to a concrete ([`RateMode::Fixed`]) dose per iteration
+/// by [`DoseEvent::resolve_rate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RateMode {
+    /// `RATE ≥ 0`: `rate`/`duration` are the literal stored values. The default
+    /// keeps every existing `DoseEvent` construction (and serialized data)
+    /// behaving exactly as before.
+    #[default]
+    Fixed,
+    /// `RATE = -2`: infusion duration is the modeled parameter `D{cmt}` resolved
+    /// from the dose compartment via the model's `DoseAttrMap`.
+    ModeledDuration,
+}
+
+/// Clamp `x` to a lower `floor`: returns `x` when `x > floor`, otherwise `floor`.
+///
+/// The single home for the "pull a transient mid-fit excursion back off the
+/// domain wall" clamp shared by [`DoseEvent::DURATION_FLOOR`] (modeled infusion
+/// duration `D ≤ 0`) and [`crate::pk::absorption::PreparedInputRate::MIN_MTT`]
+/// (transit mean-transit-time `mtt ≤ 0`). Both keep a downstream `amt/D` /
+/// `ktr.ln()` finite at the wall so the optimiser can climb back to the interior
+/// without perturbing a converged (interior) fit. Centralising it keeps the
+/// `NaN`-falls-to-floor subtlety in one place — every `>` is false for `NaN`, so
+/// a `NaN` input also returns `floor`. Explicit comparison (not `f64::max`) so it
+/// stays usable from the autodiff-instrumented paths (see CLAUDE.md).
+#[inline]
+pub(crate) fn clamp_above_floor(x: f64, floor: f64) -> f64 {
+    if x > floor {
+        x
+    } else {
+        floor
+    }
+}
+
 /// A single dose event (bolus, infusion, or oral)
 #[derive(Debug, Clone)]
 pub struct DoseEvent {
@@ -18,6 +64,10 @@ pub struct DoseEvent {
     pub duration: f64,
     pub ss: bool,
     pub ii: f64,
+    /// How `rate`/`duration` are determined. [`RateMode::Fixed`] for ordinary
+    /// (data-driven) doses; a modeled variant for a NONMEM coded `RATE`, which
+    /// is resolved per iteration by [`Self::resolve_rate`].
+    pub rate_mode: RateMode,
 }
 
 impl DoseEvent {
@@ -31,11 +81,96 @@ impl DoseEvent {
             duration,
             ss,
             ii,
+            rate_mode: RateMode::Fixed,
+        }
+    }
+
+    /// Construct a dose whose infusion `rate`/`duration` are *modeled* (a NONMEM
+    /// coded `RATE`). The concrete `rate`/`duration` are unknown until the
+    /// per-iteration parameters are available, so they are left at `0.0` and
+    /// filled in by [`Self::resolve_rate`]; until then [`Self::is_infusion`]
+    /// still reports `true` from the mode.
+    pub fn modeled(time: f64, amt: f64, cmt: usize, ss: bool, ii: f64, mode: RateMode) -> Self {
+        Self {
+            time,
+            amt,
+            cmt,
+            rate: 0.0,
+            duration: 0.0,
+            ss,
+            ii,
+            rate_mode: mode,
+        }
+    }
+
+    /// Domain floor for a modeled infusion `duration` when clamping a transient
+    /// mid-fit excursion (see [`Self::resolve_rate`]). Mirrors
+    /// [`crate::pk::absorption::PreparedInputRate::MIN_MTT`]: far below any
+    /// realistic duration, so it never perturbs a converged fit — it only keeps
+    /// a transient `D ≤ 0` (or `NaN`) from turning `amt / D` into a non-finite
+    /// rate. `NaN` falls to the floor (every `>` is false for `NaN`).
+    pub(crate) const DURATION_FLOOR: f64 = 1e-8;
+
+    /// Resolve a modeled-duration dose into a concrete ([`RateMode::Fixed`]) dose
+    /// for this iteration's per-dose `PkParams` (`params` = `PkParams::values`).
+    ///
+    /// **Single source of truth** for the modeled-`RATE` rule. Every prediction
+    /// entrypoint maps its doses through this *before* integrating, so all
+    /// downstream machinery (ODE forcing, SS equilibration, the break-time
+    /// timeline) sees only a concrete `rate`/`duration` and a new dose-application
+    /// path cannot silently diverge — the recurring failure mode that F (#327),
+    /// lag (#369), and now duration (#324) each had to thread through every path.
+    ///
+    /// It is **`F`-agnostic**: it derives `(rate, duration)` from the *raw*
+    /// `amt`, leaving bioavailability to the existing per-compartment `F`
+    /// machinery downstream (so `F` is applied exactly once — `F·amt` delivered
+    /// over `D`, matching NONMEM's `F·RATE` for an infusion).
+    ///
+    /// f64-only / FD-only by construction. The ODE engine has no autodiff path,
+    /// and the analytical engine routes any subject with a modeled dose to FD
+    /// (see `resolve_gradient_method`, #394) precisely because resolving a duration
+    /// here would drop its `∂duration/∂η`, so no `Dual` twin is ever needed. A
+    /// transient `D ≤ 0` mid-search is clamped to [`Self::DURATION_FLOOR`].
+    pub(crate) fn resolve_rate(&self, attr_map: &DoseAttrMap, params: &[f64]) -> DoseEvent {
+        match self.rate_mode {
+            RateMode::Fixed => self.clone(),
+            RateMode::ModeledDuration => {
+                // The slot's existence is an invariant enforced by
+                // `check_model_data` (a `RATE=-2` dose with no matching `D{cmt}`
+                // is rejected before any prediction runs).
+                let slot = attr_map
+                    .indexed_slot(DoseAttr::Duration, self.cmt)
+                    .expect("modeled-duration dose slot validated by check_model_data");
+                let d_raw = params.get(slot).copied().unwrap_or(0.0);
+                let duration = clamp_above_floor(d_raw, Self::DURATION_FLOOR);
+                DoseEvent {
+                    rate: self.amt / duration,
+                    duration,
+                    rate_mode: RateMode::Fixed,
+                    ..self.clone()
+                }
+            }
         }
     }
 
     pub fn is_infusion(&self) -> bool {
-        self.rate > 0.0
+        // A modeled-duration dose is an infusion even before `resolve_rate` fills
+        // in the concrete `rate` (which is `0.0` until then).
+        self.rate > 0.0 || !self.is_fixed()
+    }
+
+    /// True when this dose's `rate`/`duration` are concrete (data-driven), i.e.
+    /// [`RateMode::Fixed`] — either an ordinary dose or one already passed through
+    /// [`Self::resolve_rate`]. False for a still-modeled NONMEM coded `RATE`.
+    ///
+    /// **Single source of truth** for "is this dose resolved?". Every prediction
+    /// path that snapshots `rate`/`duration` (the ODE resolve shadows, and the
+    /// analytical / AD tripwires) tests this rather than re-spelling the
+    /// `matches!(rate_mode, Fixed)` predicate, so when a second modeled variant
+    /// lands (`RATE=-1` → `Rn`, #383) "resolved" changes in exactly one place
+    /// instead of across every dose-application site.
+    pub fn is_fixed(&self) -> bool {
+        matches!(self.rate_mode, RateMode::Fixed)
     }
 }
 
@@ -80,6 +215,152 @@ pub const PK_IDX_LAGTIME: usize = 8;
 /// parameters routed here. Single source of truth so those sites can't drift.
 pub(crate) const RESERVED_PK_SLOTS: [usize; 2] = [PK_IDX_F, PK_IDX_LAGTIME];
 
+/// A dose-modifying attribute that NONMEM keys by **compartment** — `Fn`
+/// (bioavailability), `ALAGn` (absorption lag), `Dn` (modeled infusion
+/// *duration*, `RATE=-2`), `Rn` (modeled infusion *rate*, `RATE=-1`). A dose
+/// into compartment `n` uses the attribute declared for `n`; ferx additionally
+/// honours a bare `F`/`lagtime` as the all-compartment default (see
+/// [`DoseAttrMap`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DoseAttr {
+    /// Bioavailability fraction (`Fn`); default 1.0.
+    F,
+    /// Absorption/dose lag time (`ALAGn`); default 0.0.
+    Lag,
+    /// Modeled infusion duration (`Dn`, `RATE=-2`). No bare default — a coded
+    /// `RATE=-2` row with no matching `Dn` is an error (as in NONMEM).
+    Duration,
+    /// Modeled infusion rate (`Rn`, `RATE=-1`). No bare default — see above.
+    Rate,
+}
+
+/// Resolves a dose's effective bioavailability / lag / modeled duration / rate
+/// from the per-dose [`PkParams`] vector, keyed by the dose's **compartment**.
+///
+/// NONMEM makes these dose attributes compartment-indexed (`F1`/`F2`,
+/// `ALAG1`/`ALAG2`, `D1`/`D2`, `R1`/`R2`); the single `PK_IDX_F`/`PK_IDX_LAGTIME`
+/// slots can only carry one value, which silently mis-applies when a subject is
+/// dosed into more than one compartment (the ODE-engine case; the analytical
+/// engine has a single fixed route, so this collapses to the bare slot there).
+/// This map is the **single source of truth** for "which slot holds attribute
+/// `a` for compartment `c`", so every dose-application path (ODE RHS, analytical
+/// infusion, FD gradient) resolves identically and a new path cannot drift.
+///
+/// Resolution order for a dose into 1-based compartment `cmt`:
+///   1. the indexed entry `(attr, cmt)` if the model declared one (`Fn`/`ALAGn`/…);
+///   2. for `F`/`Lag` only, the bare slot (`PK_IDX_F` = 1.0, `PK_IDX_LAGTIME` = 0.0)
+///      as the all-compartment default — preserving pre-existing bare-`F`/`lagtime`
+///      models unchanged;
+///   3. `Duration`/`Rate` have no bare fallback (a coded `RATE` with no matching
+///      `Dn`/`Rn` parameter is rejected upstream), so [`Self::indexed_slot`]
+///      returns `None` and the caller errors.
+#[derive(Debug, Clone, Default)]
+pub struct DoseAttrMap {
+    /// `(attribute, 1-based compartment) -> PkParams slot`. Empty for the common
+    /// single-route / bare-`F`/`lagtime` model, where every lookup falls through
+    /// to the reserved slot.
+    indexed: HashMap<(DoseAttr, usize), usize>,
+}
+
+impl DoseAttr {
+    /// Recognise a compartment-indexed dose-attribute parameter name, returning
+    /// `(attr, 1-based compartment)`. Case-insensitive; the numeric suffix must
+    /// be a positive integer (so `F0` is *not* an attribute, and bare `F` /
+    /// `lagtime` — handled by the reserved slots — return `None`).
+    ///
+    /// Recognised today: `F{n}` (bioavailability), `ALAG{n}` / `LAGTIME{n}`
+    /// (lag), and `D{n}` (modeled infusion *duration*, `RATE=-2`; #324). The
+    /// modeled-*rate* form `R{n}` (`RATE=-1`) is intentionally **not** recognised
+    /// yet — its `R` prefix collides with ordinary ODE rate constants and modeled
+    /// rate is a follow-up (#324 Phase B). `S{n}` is also excluded — that is the
+    /// `[scaling]` block's compartment scale, a separate concept.
+    ///
+    /// `D{n}` shares that collision risk (a `D`-prefixed rate constant), so it is
+    /// only *reserved* for the duration when a `RATE=-2` dose targets compartment
+    /// `n`: recognising the name merely makes the [`DoseAttrMap`] entry available
+    /// (harmless if never dosed against), and the data-driven gate + collision
+    /// warning live in `check_model_data`.
+    ///
+    /// Recognising a name does not by itself make it a dose attribute — the
+    /// caller still gates on engine (compartment-indexed `F`/`Lag`/`Duration` are
+    /// ODE-only) and on the compartment existing. `alag` and `lagtime` both map
+    /// to [`DoseAttr::Lag`], matching the existing bare `alag`/`lagtime` aliases.
+    pub fn from_indexed_name(name: &str) -> Option<(DoseAttr, usize)> {
+        let lower = name.to_ascii_lowercase();
+        // The prefixes are mutually exclusive — no name starts with two of them,
+        // and none is a prefix of another (`lagtime`/`alag`/`f`/`d` all differ in
+        // their first byte except the two lag aliases, which are disjoint) — so
+        // the iteration order does not affect the result.
+        for (prefix, attr) in [
+            ("lagtime", DoseAttr::Lag),
+            ("alag", DoseAttr::Lag),
+            ("f", DoseAttr::F),
+            ("d", DoseAttr::Duration),
+        ] {
+            if let Some(suffix) = lower.strip_prefix(prefix) {
+                // The suffix must be a pure positive integer; `f_bio`, `cl`, etc.
+                // (non-numeric or empty suffixes) are not attributes.
+                if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(cmt) = suffix.parse::<usize>() {
+                        if cmt >= 1 {
+                            return Some((attr, cmt));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+impl DoseAttrMap {
+    /// Record that compartment `cmt`'s `attr` is held in PkParams `slot`.
+    pub fn insert(&mut self, attr: DoseAttr, cmt: usize, slot: usize) {
+        self.indexed.insert((attr, cmt), slot);
+    }
+
+    /// `true` when no compartment-indexed attribute is recorded — the common
+    /// case (bare-`F`/`lagtime` model, no `D{cmt}`). Lets the dose-resolution
+    /// step short-circuit before scanning a subject's doses: with no indexed
+    /// slot there can be no modeled-`RATE` dose to resolve.
+    pub fn is_empty(&self) -> bool {
+        self.indexed.is_empty()
+    }
+
+    /// The PkParams slot holding `attr` for compartment `cmt`, if the model
+    /// declared a compartment-indexed parameter for it.
+    pub fn indexed_slot(&self, attr: DoseAttr, cmt: usize) -> Option<usize> {
+        self.indexed.get(&(attr, cmt)).copied()
+    }
+
+    /// Bioavailability for a dose into 1-based `cmt`: `F{cmt}` if declared, else
+    /// the bare `PK_IDX_F` slot (default 1.0 when the model has no `F` at all).
+    pub fn f_bio(&self, cmt: usize, params: &[f64]) -> f64 {
+        self.resolve_or(DoseAttr::F, cmt, PK_IDX_F, 1.0, params)
+    }
+
+    /// Lag time for a dose into 1-based `cmt`: `ALAG{cmt}` if declared, else the
+    /// bare `PK_IDX_LAGTIME` slot (default 0.0 when the model has no lag at all).
+    pub fn lagtime(&self, cmt: usize, params: &[f64]) -> f64 {
+        self.resolve_or(DoseAttr::Lag, cmt, PK_IDX_LAGTIME, 0.0, params)
+    }
+
+    /// Read `attr` for `cmt` from its indexed slot, else from `bare_slot`, else
+    /// `dflt` (both reads are bounds-checked so a short `params` slice — e.g. an
+    /// analytical model whose vector stops at slot 8 — cannot panic).
+    fn resolve_or(
+        &self,
+        attr: DoseAttr,
+        cmt: usize,
+        bare_slot: usize,
+        dflt: f64,
+        params: &[f64],
+    ) -> f64 {
+        let slot = self.indexed_slot(attr, cmt).unwrap_or(bare_slot);
+        params.get(slot).copied().unwrap_or(dflt)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PkParams {
     pub values: [f64; MAX_PK_PARAMS],
@@ -111,6 +392,30 @@ impl PkParams {
     }
     pub fn f_bio(&self) -> f64 {
         self.values[PK_IDX_F]
+    }
+
+    /// Bioavailable dose amount: `F · amount`. `F` scales the input on **every**
+    /// route — IV bolus, infusion, and oral depot alike — matching NONMEM's `F1`
+    /// (#327).
+    ///
+    /// This pair is the single source of truth for the F-on-dose rule. The three
+    /// prediction paths derive their `F` handling from it:
+    /// * event-driven (`pk/event_driven.rs`) calls these directly;
+    /// * the analytical superposition path (`pk/mod.rs`) applies the same rule as
+    ///   a post-multiply via `route_f_scale` — the oral-depot closed forms bake
+    ///   `F` in, so they take the `1.0` branch;
+    /// * the autodiff path (`ad/ad_gradients.rs`) inlines `f_bio * amt` /
+    ///   `f_bio * rate` once, because under `#[autodiff]` it works on flat scalars
+    ///   and cannot call `&self` methods.
+    ///
+    /// A change to the rule must be mirrored in those sites.
+    pub(crate) fn bioavailable_amount(&self, amount: f64) -> f64 {
+        self.f_bio() * amount
+    }
+
+    /// Bioavailable infusion rate: `F · rate`. See [`Self::bioavailable_amount`].
+    pub(crate) fn bioavailable_rate(&self, rate: f64) -> f64 {
+        self.f_bio() * rate
     }
     pub fn q3(&self) -> f64 {
         self.values[PK_IDX_Q3]
@@ -239,6 +544,10 @@ pub struct Subject {
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
+    /// FREM observation type per observation (parallel to `obs_times`).
+    /// 0 = PK observation, 100/200/300/... = covariate observation.
+    /// Empty when FREMTYPE column is absent from the data.
+    pub fremtype: Vec<u16>,
     /// Non-Gaussian observation records (TTE events, discrete states, counts).
     /// Empty for all-Gaussian subjects. Populated by the data reader when the
     /// model declares a non-Gaussian endpoint for the row's CMT.
@@ -274,6 +583,16 @@ impl Subject {
     /// SS warning in `api.rs`.
     pub fn has_ss_doses(&self) -> bool {
         self.doses.iter().any(|d| d.ss)
+    }
+
+    /// True when every dose carries concrete (`Fixed`) `rate`/`duration` — i.e.
+    /// no dose is still a modeled NONMEM coded `RATE` awaiting
+    /// [`DoseEvent::resolve_rate`]. The common case (no coded doses) is `true`,
+    /// so the ODE resolve shadows return `Cow::Borrowed` and the analytical / AD
+    /// tripwires pass. Single source of truth alongside [`DoseEvent::is_fixed`]
+    /// (#324 / #383): a future coded variant changes "resolved" in one place.
+    pub fn all_doses_fixed(&self) -> bool {
+        self.doses.iter().all(|d| d.is_fixed())
     }
 
     /// Time of the first dose of the reset-occasion containing `obs_time`,
@@ -771,8 +1090,56 @@ impl PkModel {
         }
     }
 
+    /// The (1-based) compartments the **analytical** engine can deliver a
+    /// zero-order infusion into — i.e. the only compartments a modeled infusion
+    /// *duration* `D{cmt}` (`RATE=-2`, #324/#394) may target. Single source of
+    /// truth, kept in lockstep with the infusion-routing `match (pk_model, d.cmt)`
+    /// in [`crate::pk::event_driven`] (and the equivalent superposition dispatch):
+    /// the **central** compartment for every model, plus the **peripheral**
+    /// compartment(s) for the 2-/3-cpt IV models, and — since #400 — the oral
+    /// **depot** (cmt 1), a zero-order release into the depot followed by
+    /// first-order `ka` absorption into central. Notably this still EXCLUDES oral
+    /// peripherals, which the closed forms cannot infuse into. A `D{cmt}` outside
+    /// this set is rejected at parse time rather than silently mis-routed (no-TV
+    /// path) or panicking (event-driven path).
+    pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
+        match self {
+            PkModel::OneCptIv => &[1],
+            // Oral: cmt 1 = depot (zero-order-into-depot, #400), cmt 2 = central
+            // (depot-bypassing infusion).
+            PkModel::OneCptOral => &[1, 2],
+            PkModel::TwoCptIv => &[1, 2],
+            PkModel::TwoCptOral => &[1, 2],
+            PkModel::ThreeCptIv => &[1, 2, 3],
+            PkModel::ThreeCptOral => &[1, 2],
+        }
+    }
+
+    /// Resolve a `[structural_model]` model name (canonical or long-form alias,
+    /// e.g. `one_cpt_iv` / `one_compartment_iv`) to its `PkModel`. `None` for any
+    /// unrecognised name (including the retired `*_bolus` / `*_infusion` spellings,
+    /// which the parser handles separately with a migration error).
+    ///
+    /// The single source of truth for name → model, shared by the analytical `pk`
+    /// parser (`parse_structural_model`) and the `ode_template` desugarer, so the
+    /// accepted aliases can't drift between the two paths. The inverse of
+    /// `canonical_name` (which omits the aliases); `from_name_round_trips_and_accepts_aliases`
+    /// and `canonical_name_round_trips_through_parser` pin them together.
+    pub(crate) fn from_name(name: &str) -> Option<PkModel> {
+        match name {
+            "one_cpt_iv" | "one_compartment_iv" => Some(PkModel::OneCptIv),
+            "one_cpt_oral" | "one_compartment_oral" => Some(PkModel::OneCptOral),
+            "two_cpt_iv" | "two_compartment_iv" => Some(PkModel::TwoCptIv),
+            "two_cpt_oral" | "two_compartment_oral" => Some(PkModel::TwoCptOral),
+            "three_cpt_iv" | "three_compartment_iv" => Some(PkModel::ThreeCptIv),
+            "three_cpt_oral" | "three_compartment_oral" => Some(PkModel::ThreeCptOral),
+            _ => None,
+        }
+    }
+
     /// Whether this is a first-order-absorption (oral) model. Oral models read
-    /// `ka` and `f`; IV models do not. The canonical home for this predicate.
+    /// `ka`; IV models do not. (`f` is read by every model since #327 — it scales
+    /// IV bolus/infusion doses too.) The canonical home for this predicate.
     ///
     /// The `#[cfg(feature = "autodiff")]` free fn `is_oral_model` in
     /// `estimation/inner_optimizer.rs` is a pre-existing identical copy; it should
@@ -793,11 +1160,13 @@ impl PkModel {
     ///   - every required structural slot (`required_pk_params`);
     ///   - `lagtime`, applied to *every* dose (`predict_concentration` shifts the
     ///     effective dose time for IV and oral alike);
-    ///   - `f` (bioavailability) **only** for oral models — the IV closed forms
-    ///     never read it, so `f` on an IV model is inert.
+    ///   - `f` (bioavailability), applied to *every* dose and route — IV bolus,
+    ///     infusion, and oral depot — scaling the bioavailable amount/rate
+    ///     (#327). Both the superposition and event-driven analytical paths read
+    ///     it for every model, IV included, so it is never inert.
     pub(crate) fn consumes_pk_slot(&self, slot: usize) -> bool {
         slot == PK_IDX_LAGTIME
-            || (slot == PK_IDX_F && self.is_oral())
+            || slot == PK_IDX_F
             || self.required_pk_params().iter().any(|(s, _)| *s == slot)
     }
 }
@@ -1568,6 +1937,16 @@ pub struct CompiledModel {
     /// analytical PK equations. The `pk_param_fn` output is flattened and passed
     /// to the ODE RHS function as the parameter vector.
     pub ode_spec: Option<crate::ode::OdeSpec>,
+    /// Compartment-indexed modeled-dose attributes (`D{cmt}` for `RATE=-2`) for
+    /// **analytical** PK models (#324, #394). ODE models carry their own map on
+    /// [`crate::ode::OdeSpec::dose_attr_map`] and leave this `Default` (empty) —
+    /// the analytical dispatch paths read this field, the ODE paths read the
+    /// `OdeSpec` one. Empty for the common analytical model with no `RATE=-2`
+    /// dosing; populated by the parser when a `D{cmt}` individual parameter is
+    /// declared. Used by [`crate::pk::compute_predictions`] callers to resolve
+    /// modeled-duration doses to a concrete `rate`/`duration` before the
+    /// closed-form math (mirrors the ODE `resolve_subject_doses` step).
+    pub dose_attr_map: DoseAttrMap,
     /// Index of the first diffusion theta in the theta vector, and the parallel
     /// mapping from diffusion-theta index to ODE state index.
     /// `None` when no `[diffusion]` block is present.
@@ -1653,6 +2032,25 @@ pub struct CompiledModel {
     /// Keyed by the CMT value declared in `[event_model]` / future blocks.
     #[cfg(feature = "survival")]
     pub endpoints: HashMap<usize, EndpointLikelihood>,
+    /// FREM configuration. When `Some`, the model uses FREMTYPE-based
+    /// observation dispatch: covariate pseudo-observations use individual
+    /// parameter values as predictions and a near-zero additive sigma.
+    pub frem_config: Option<FremConfig>,
+}
+
+/// FREM (Full Random Effects Model) configuration.
+///
+/// Maps FREMTYPE observation-type values to (theta_index, eta_index) pairs
+/// so the likelihood can compute covariate pseudo-observation predictions
+/// as `theta[theta_idx] + eta[eta_idx]` and use a near-zero additive sigma.
+#[derive(Debug, Clone)]
+pub struct FremConfig {
+    /// Maps FREMTYPE value (100, 200, ...) → (theta_index, eta_index).
+    /// For FREMTYPE observations, the prediction is
+    /// `theta[theta_idx] + eta[eta_idx]`.
+    pub fremtype_to_indices: HashMap<u16, (usize, usize)>,
+    /// Index into `sigma_values` for the covariate error sigma (EPSCOV).
+    pub covariate_sigma_index: usize,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -1712,6 +2110,18 @@ impl CompiledModel {
     /// Returns true when this model uses ODE integration; false for analytical PK.
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()
+    }
+
+    /// The compartment-indexed dose-attribute map (`D{cmt}` for `RATE=-2`, …) for
+    /// **this model's engine**: the `OdeSpec`'s map for ODE models, the analytical
+    /// `dose_attr_map` field otherwise. Single source of truth for "which map
+    /// applies", so a caller cannot accidentally read the empty analytical default
+    /// on an ODE model (or vice versa) and silently resolve nothing (#383/#394).
+    pub(crate) fn active_dose_attr_map(&self) -> &DoseAttrMap {
+        match &self.ode_spec {
+            Some(ode) => &ode.dose_attr_map,
+            None => &self.dose_attr_map,
+        }
     }
 
     /// Copy the configured ODE solver tolerances from `opts` onto this model's
@@ -1778,7 +2188,14 @@ impl CompiledModel {
         }
         self.indiv_param_names.iter().any(|n| {
             let u = n.to_uppercase();
-            u == "LAGTIME" || u == "ALAG"
+            // Bare `lagtime`/`alag` apply on any engine. A compartment-indexed
+            // `ALAGn`/`LAGTIMEn` (issue #369) only routes lag on the ODE engine
+            // — the analytical path has a single fixed dose route, where such a
+            // name lands in an unused spare slot — so gate it on `ode_spec`.
+            u == "LAGTIME"
+                || u == "ALAG"
+                || (self.ode_spec.is_some()
+                    && matches!(DoseAttr::from_indexed_name(n), Some((DoseAttr::Lag, _))))
         })
     }
 
@@ -1844,6 +2261,13 @@ pub struct SubjectResult {
     pub pred: Vec<f64>,
     pub iwres: Vec<f64>,
     pub cwres: Vec<f64>,
+    /// Normalized prediction distribution errors (simulation-based, decorrelated
+    /// within subject). Empty unless `[fit_options] npde_nsim > 0`. Populated
+    /// post-fit by [`crate::stats::npde`]; emitted as the `NPDE` sdtab column.
+    pub npde: Vec<f64>,
+    /// Normalized prediction discrepancies (simulation-based, no decorrelation).
+    /// Empty unless `[fit_options] npde_nsim > 0`. Emitted as the `NPD` column.
+    pub npd: Vec<f64>,
     pub ofv_contribution: f64,
     pub cens: Vec<u8>,
     /// Number of observations for this subject (MDV=0 rows).
@@ -2009,6 +2433,88 @@ pub struct ImportanceSamplingResult {
     pub ess_median: f64,
     /// Treatment of per-occasion kappa random effects.  See [`KappaTreatment`].
     pub kappa_treatment: KappaTreatment,
+}
+
+/// One row of the IMPMAP per-iteration parameter trace.
+///
+/// Analogous to one line in NONMEM's `.ext` file for `METHOD=IMPMAP`.
+/// Positive `iteration` values are EM iterations; special negative values
+/// mark the final (averaged) estimate and standard errors.
+#[derive(Debug, Clone)]
+pub struct ImpmapTraceRow {
+    /// EM iteration number (1-based). Special values:
+    /// `-1_000_000_000` = final averaged estimate,
+    /// `-1_000_000_001` = standard errors (when covariance step ran).
+    pub iteration: i64,
+    pub theta: Vec<f64>,
+    /// Lower triangle of the omega matrix, row-major: `(0,0), (1,0), (1,1), …`
+    pub omega_lower_tri: Vec<f64>,
+    pub sigma: Vec<f64>,
+    /// Objective function value (−2·log-likelihood from importance sampling).
+    pub ofv: f64,
+}
+
+/// Per-iteration parameter trace from IMPMAP, analogous to NONMEM `.ext`.
+///
+/// Surfaced on `FitResult.impmap_trace` when the final estimating stage is
+/// IMPMAP. Column names follow NONMEM convention (`THETA1`, `OMEGA(1,1)`, …).
+#[derive(Debug, Clone, Default)]
+pub struct ImpmapTrace {
+    pub rows: Vec<ImpmapTraceRow>,
+    pub theta_names: Vec<String>,
+    /// e.g. `"OMEGA(1,1)"`, `"OMEGA(2,1)"`, `"OMEGA(2,2)"`, …
+    pub omega_names: Vec<String>,
+    pub sigma_names: Vec<String>,
+}
+
+/// Posterior summary for a single scalar parameter, computed across all
+/// post-warmup, post-thinning draws from every chain.
+#[derive(Debug, Clone)]
+pub struct PosteriorSummary {
+    /// Parameter name (e.g. `TVCL`, `OMEGA(1,1)`, `SIGMA(1)`).
+    pub name: String,
+    pub mean: f64,
+    pub sd: f64,
+    /// 2.5% posterior quantile (lower 95% credible bound).
+    pub q025: f64,
+    pub median: f64,
+    /// 97.5% posterior quantile (upper 95% credible bound).
+    pub q975: f64,
+    /// Split-R̂ convergence diagnostic. Values near 1.0 indicate the chains
+    /// have mixed; `> 1.01` flags non-convergence.
+    pub rhat: f64,
+    /// Bulk effective sample size (mixing of the centre of the distribution).
+    pub ess_bulk: f64,
+    /// Tail effective sample size (mixing of the 5%/95% quantiles).
+    pub ess_tail: f64,
+    /// Monte-Carlo standard error of the posterior mean.
+    pub mcse: f64,
+}
+
+/// Result of a full MCMC Bayesian fit (`EstimationMethod::Bayes`). Surfaced on
+/// [`FitResult::bayes`]. Carries posterior summaries + convergence diagnostics
+/// instead of a single point estimate; the optimizer-style fields on
+/// `FitResult` (theta/omega/sigma) are populated with the posterior means so
+/// downstream consumers that expect a point estimate still work.
+#[derive(Debug, Clone)]
+pub struct BayesResult {
+    /// Per-parameter posterior summaries, ordered θ, then Ω entries, then Σ.
+    pub summaries: Vec<PosteriorSummary>,
+    /// Number of independent chains run.
+    pub n_chains: usize,
+    /// Warmup sweeps per chain (discarded from the posterior).
+    pub n_warmup: usize,
+    /// Retained sampling draws per chain (post-warmup, post-thinning).
+    pub n_draws_per_chain: usize,
+    /// Total divergent HMC transitions across all chains. Non-zero counts
+    /// indicate posterior geometry the sampler could not traverse reliably.
+    pub n_divergent: usize,
+    /// Worst (largest) split-R̂ across all parameters; convenience for a
+    /// single-number convergence check.
+    pub max_rhat: f64,
+    /// Raw posterior draws, row-major `[chain][draw][param]` flattened, retained
+    /// only when the caller requests them (large). `None` otherwise.
+    pub draws: Option<Vec<f64>>,
 }
 
 /// Outcome of the post-estimation covariance step.
@@ -2243,6 +2749,12 @@ pub struct FitResult {
     pub error_model: ErrorModel,
     pub covariance_matrix: Option<DMatrix<f64>>,
     pub se_theta: Option<Vec<f64>>,
+    /// Standard errors for omega elements.
+    ///
+    /// - **Diagonal omega**: length = n_eta, one SE per variance.
+    /// - **Block omega**: length = n_eta·(n_eta+1)/2, column-major lower
+    ///   triangle (same layout as the packed Cholesky). Use
+    ///   [`omega_se_at`] to index by (i, j).
     pub se_omega: Option<Vec<f64>>,
     pub se_sigma: Option<Vec<f64>>,
     /// FIX flags carried through from the model so the output layer can
@@ -2287,6 +2799,12 @@ pub struct FitResult {
     /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
     /// model comparison in those settings. See [`ImportanceSamplingResult`].
     pub importance_sampling: Option<ImportanceSamplingResult>,
+    /// Per-iteration IMPMAP parameter trace, analogous to NONMEM `.ext` file
+    /// output. `Some` when the final estimating stage was IMPMAP.
+    pub impmap_trace: Option<ImpmapTrace>,
+    /// Full MCMC Bayesian result. `Some` when `method = bayes` was run;
+    /// carries posterior summaries + convergence diagnostics. See [`BayesResult`].
+    pub bayes: Option<BayesResult>,
     // IOV results (present when kappa declarations exist in the model)
     pub omega_iov: Option<DMatrix<f64>>,
     pub kappa_names: Vec<String>,
@@ -2450,6 +2968,12 @@ pub struct FitResult {
     /// Seed used for the importance-sampling Monte Carlo step.  `None` when IS
     /// was not run or no explicit seed was set.
     pub is_seed: Option<u64>,
+    /// Effective RNG seed used for the simulation-based NPDE/NPD diagnostics —
+    /// the value actually fed to the simulator, including the built-in default
+    /// when `[fit_options] npde_seed` was left unset, so the diagnostic is
+    /// reproducible from this field alone. `None` when NPDE did not run
+    /// (`npde_nsim = 0`).
+    pub npde_seed: Option<u64>,
     /// BLOQ handling method: "drop" (observations below LOQ are excluded) or
     /// "m3" (M3 likelihood for censored observations).
     pub bloq_method: String,
@@ -2490,6 +3014,34 @@ pub struct FitResult {
     /// were active during the fit (or the caller supplied `ignore`/`accept`
     /// expressions).  `None` means no filtering was requested.
     pub exclusions: Option<ExclusionSummary>,
+}
+
+/// Look up the SE for omega element (i, j) from the `se_omega` vector.
+///
+/// `se_omega` may be diagonal-only (length = n_eta) or full lower-triangle
+/// (length = n_eta·(n_eta+1)/2, column-major).  Returns `None` when
+/// `se_omega` is `None`, the index is out of bounds, or the format is
+/// diagonal and an off-diagonal element is requested.
+pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize) -> Option<f64> {
+    let se = se_omega.as_ref()?;
+    let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
+    let n_lt = n_eta * (n_eta + 1) / 2;
+    if se.len() == n_lt && n_lt != n_eta {
+        // Full lower-triangle format (block omega).
+        let col_offset = if c == 0 {
+            0
+        } else {
+            c * n_eta - c * (c - 1) / 2
+        };
+        se.get(col_offset + (r - c)).copied()
+    } else {
+        // Diagonal-only format: only (i, i) is available.
+        if r == c {
+            se.get(r).copied()
+        } else {
+            None
+        }
+    }
 }
 
 /// Minimal per-NN metadata carried on `FitResult` so output writers can
@@ -2624,6 +3176,22 @@ pub struct FitOptions {
     /// A positive value (e.g. `3`) enables HMC; requires the `autodiff`
     /// feature and an analytical PK model — falls back to MH otherwise.
     pub saem_n_leapfrog: usize,
+    // Bayes (Gibbs-within-HMC) options — see EstimationMethod::Bayes.
+    /// Number of warmup (burn-in + adaptation) sweeps per chain, discarded from
+    /// the reported posterior. HMC step size / leapfrog count adapt during this
+    /// phase. Default 1000.
+    pub bayes_warmup: usize,
+    /// Number of post-warmup sampling sweeps retained per chain (before
+    /// thinning). Default 1000.
+    pub bayes_iters: usize,
+    /// Number of independent chains (run with distinct seeds; used for
+    /// split-R̂ / cross-chain diagnostics). Default 4.
+    pub bayes_chains: usize,
+    /// Keep every `bayes_thin`-th sampling draw. `1` (default) keeps all draws.
+    pub bayes_thin: usize,
+    /// Base RNG seed for the Bayes sampler. Chain `c` uses a seed derived from
+    /// this. `None` draws a nondeterministic seed.
+    pub bayes_seed: Option<u64>,
     /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
     pub gn_lambda: f64,
     // SIR options
@@ -2641,15 +3209,22 @@ pub struct FitOptions {
     /// (omega variances, constrained thetas). Default 5.0 follows Dosne (2017).
     /// Set to a large value (e.g. 100.0) to recover near-normal behaviour.
     pub sir_df: f64,
-    // Importance-sampling marginal log-likelihood options (consumed by the
-    // `Imp` chain stage; ignored otherwise). The Imp stage estimates
-    // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` by Monte Carlo with a
-    // Student-t proposal centred on each subject's EBE.
+    // Importance-sampling options (consumed by the `Imp` chain stage; ignored
+    // otherwise). By default `imp` is a Monte-Carlo EM **estimator** matching
+    // NONMEM `METHOD=IMP`: the conditional mode + first-order variance are found
+    // only on the first iteration, then the proposal is re-centered from the
+    // previous iteration's importance-sample mean/covariance, and θ/Ω/σ are
+    // updated from the importance-weighted posterior moments each iteration. Set
+    // `is_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
+    // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` at the fixed input parameters
+    // without updating them.
     /// Number of importance samples per subject. Default 1000. Recommended
     /// 2000–5000 for publication-quality MC SE (cost scales linearly).
     pub is_samples: usize,
     /// Degrees of freedom for the Student-t proposal. Default 5.0 (heavy-tailed
-    /// — robust to mild proposal misspecification). Must be ≥ 1.
+    /// — robust to mild proposal misspecification). Must be ≥ 1. The token
+    /// `normal` (parsed to `f64::INFINITY`) selects a multivariate-normal
+    /// proposal.
     pub is_proposal_df: f64,
     /// RNG seed for the IS sampling. `None` falls back to a fixed default so
     /// runs are reproducible across invocations.
@@ -2658,6 +3233,18 @@ pub struct FitOptions {
     /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
     /// the flag entirely.
     pub is_low_ess_threshold: f64,
+    /// Number of MCEM iterations for the estimating `imp` path (ignored when
+    /// `is_eval_only`). Default 200.
+    pub is_iterations: usize,
+    /// Number of terminal iterations whose parameters are averaged to form the
+    /// reported estimate (Monte-Carlo variance reduction). Default 50. Ignored
+    /// when `is_eval_only`.
+    pub is_averaging: usize,
+    /// When `true`, `imp` evaluates `−2 log L` at the fixed input parameters and
+    /// does not estimate (NONMEM `IMP EONLY=1`); it must then be the terminal
+    /// chain stage. When `false` (default), `imp` is an MCEM estimator
+    /// (NONMEM `METHOD=IMP`).
+    pub is_eval_only: bool,
     // IMPMAP (Importance Sampling assisted by Mode A Posteriori) options,
     // consumed by the `Impmap` estimating stage. IMPMAP runs a Monte-Carlo EM
     // loop: each iteration re-centers a per-subject importance-sampling proposal
@@ -2681,10 +3268,35 @@ pub struct FitOptions {
     /// Subjects whose normalized effective sample size (ESS / K) falls below
     /// this fraction are flagged as poorly-sampled. Default 0.1.
     pub impmap_low_ess_threshold: f64,
+    /// When `true`, IMPMAP collects per-iteration parameter values into
+    /// `FitResult.impmap_trace` (analogous to NONMEM `.ext` output). Default `false`.
+    pub impmap_trace: bool,
+    /// Number of additional random starting points for per-subject MAP
+    /// (analogous to NONMEM MCETA). 0 = single start (current behaviour).
+    pub impmap_mceta: usize,
+    /// Use Sobol quasi-random sequences for IS draws instead of pseudo-random.
+    /// Only applies to MVN proposals (impmap_proposal_df = normal). Default false.
+    pub impmap_sobol: bool,
+    /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
+    /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
+    /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
+    pub iscale_min: f64,
+    /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
+    /// Default 10.0.
+    pub iscale_max: f64,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
     pub bloq_method: BloqMethod,
+    /// Number of Monte-Carlo replicates per subject used to compute the
+    /// simulation-based NPDE/NPD diagnostics after the fit. `0` (default)
+    /// disables the computation entirely — no `NPDE`/`NPD` columns are emitted.
+    /// A typical value is `1000` (the `npde`-package default). Cost scales
+    /// linearly with the replicate count. See [`crate::stats::npde`].
+    pub npde_nsim: usize,
+    /// RNG seed for the NPDE/NPD simulation. `None` falls back to a fixed
+    /// default so the diagnostic is reproducible across invocations.
+    pub npde_seed: Option<u64>,
     /// Maximum CG iterations for the Steihaug subproblem solver (trust-region only).
     /// `None` (default) uses a size-adaptive budget of `ceil(sqrt(n_params)).clamp(5, n_params)`,
     /// which is 5 for typical NLME problems (n_params ≈ 7–15) and grows with model size.
@@ -2828,6 +3440,11 @@ pub struct FitOptions {
     /// Subject IDs to exclude wholesale (syntactic sugar for `ignore = ID == X`).
     /// Compared as strings against `Subject::id`.
     pub ignore_subjects: Vec<String>,
+    /// FREM prediction map: `"TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200"`.
+    /// Maps theta/eta pairs to FREMTYPE values.
+    pub frem_predictions: Option<String>,
+    /// FREM covariate sigma name (e.g. "EPSCOV").
+    pub frem_sigma: Option<String>,
 }
 
 impl Default for FitOptions {
@@ -2892,6 +3509,11 @@ impl Default for FitOptions {
             saem_omega_burnin: 20,
             saem_seed: None,
             saem_n_leapfrog: 0,
+            bayes_warmup: 1000,
+            bayes_iters: 1000,
+            bayes_chains: 4,
+            bayes_thin: 1,
+            bayes_seed: None,
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,
@@ -2903,13 +3525,23 @@ impl Default for FitOptions {
             is_proposal_df: 5.0,
             is_seed: None,
             is_low_ess_threshold: 0.1,
+            is_iterations: 200,
+            is_averaging: 50,
+            is_eval_only: false,
             impmap_iterations: 200,
             impmap_samples: 300,
             impmap_proposal_df: f64::INFINITY,
             impmap_seed: None,
             impmap_averaging: 50,
             impmap_low_ess_threshold: 0.1,
+            impmap_trace: false,
+            impmap_mceta: 0,
+            impmap_sobol: false,
+            iscale_min: 0.1,
+            iscale_max: 10.0,
             bloq_method: BloqMethod::Drop,
+            npde_nsim: 0,
+            npde_seed: None,
             steihaug_max_iters: None,
             mu_referencing: true,
             threads: None,
@@ -2931,6 +3563,8 @@ impl Default for FitOptions {
             ignore_exprs: Vec::new(),
             accept_exprs: Vec::new(),
             ignore_subjects: Vec::new(),
+            frem_predictions: None,
+            frem_sigma: None,
         }
     }
 }
@@ -3071,19 +3705,36 @@ pub enum EstimationMethod {
     FoceGn,
     FoceGnHybrid,
     Saem,
-    /// Importance-sampling marginal log-likelihood. Not an estimator — does not
-    /// update parameters. Must follow another stage in `methods` (consumes that
-    /// stage's params + EBEs + per-subject Hessians as the proposal centre /
-    /// scale) and is typically terminal. Reports `−2 log L_IS` on
-    /// `FitResult.importance_sampling`, distinct from the Laplace OFV on `ofv`.
+    /// Importance Sampling (NONMEM `METHOD=IMP`). By **default an estimator**: a
+    /// Monte-Carlo EM loop that finds each subject's conditional mode and
+    /// first-order variance only on the first iteration, then re-centers the
+    /// importance-sampling proposal from the previous iteration's
+    /// importance-sample mean/covariance, updating θ/Ω/σ from the
+    /// importance-weighted posterior moments each iteration. Reports the IS
+    /// `−2 log L` on `FitResult.importance_sampling` and a Laplace OFV on `ofv`.
+    ///
+    /// With `is_eval_only = true` (NONMEM `IMP EONLY=1`) it instead *evaluates*
+    /// `−2 log L_IS` at the fixed input parameters without updating them; in that
+    /// mode it must be the terminal chain stage (it consumes the prior stage's
+    /// params + EBEs + per-subject Hessians, or evaluates at the initial
+    /// parameters when standalone). Contrast [`Impmap`](Self::Impmap), which
+    /// re-evaluates the mode/variance *every* iteration (more robust, costlier).
     Imp,
     /// Importance Sampling assisted by Mode A Posteriori (NONMEM `METHOD=IMPMAP`).
-    /// Unlike [`Imp`](Self::Imp), this *is* an estimator: a Monte-Carlo EM loop
-    /// whose E-step re-evaluates each subject's conditional mode and first-order
-    /// variance every iteration (as in FOCE/ITS) to center a multivariate-normal
-    /// importance-sampling proposal, and whose M-step updates θ/Ω/σ from the
+    /// Like estimating [`Imp`](Self::Imp) this *is* an estimator, but its E-step
+    /// re-evaluates each subject's conditional mode and first-order variance
+    /// *every* iteration (as in FOCE/ITS) to center a multivariate-normal
+    /// importance-sampling proposal — more robust than `Imp` on high-dimensional,
+    /// rich-data problems — and its M-step updates θ/Ω/σ from the
     /// importance-weighted posterior moments.
     Impmap,
+    /// Full MCMC Bayesian estimation (Path A — Gibbs-within-HMC, NONMEM
+    /// `METHOD=BAYES` parity). Draws from the joint posterior
+    /// `p(θ, Ω, Σ, {ηᵢ} | y)` by alternating a per-subject η block (reusing the
+    /// SAEM HMC / MH kernel) with conjugate population draws (Ω: inverse-Wishart,
+    /// σ²: inverse-gamma, mu-referenced θ: normal). Reports posterior summaries +
+    /// convergence diagnostics on `FitResult.bayes`, not a point estimate.
+    Bayes,
 }
 
 impl EstimationMethod {
@@ -3096,6 +3747,7 @@ impl EstimationMethod {
             EstimationMethod::Saem => "SAEM",
             EstimationMethod::Imp => "IMP",
             EstimationMethod::Impmap => "IMPMAP",
+            EstimationMethod::Bayes => "BAYES",
         }
     }
 }
@@ -3197,6 +3849,8 @@ pub fn framework_keys() -> &'static [&'static str] {
         "sir_df",
         "bloq_method",
         "bloq",
+        "npde_nsim",
+        "npde_seed",
         "mu_referencing",
         "threads",
         "n_starts",
@@ -3211,6 +3865,8 @@ pub fn framework_keys() -> &'static [&'static str] {
         "max_unconverged_frac",
         "min_obs_for_convergence_check",
         "inits_from_nca",
+        "frem_predictions",
+        "frem_sigma",
     ]
 }
 
@@ -3271,6 +3927,13 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "is_proposal_df",
             "is_seed",
             "is_low_ess_threshold",
+            "is_iterations",
+            "is_averaging",
+            "is_eval_only",
+            "inner_maxiter",
+            "inner_tol",
+            "iscale_min",
+            "iscale_max",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -3282,6 +3945,22 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_seed",
             "impmap_averaging",
             "impmap_low_ess_threshold",
+            "impmap_trace",
+            "impmap_mceta",
+            "impmap_sobol",
+            "iscale_min",
+            "iscale_max",
+        ],
+        EstimationMethod::Bayes => &[
+            "inner_maxiter",
+            "inner_tol",
+            "n_mh_steps",
+            "n_leapfrog",
+            "bayes_warmup",
+            "bayes_iters",
+            "bayes_chains",
+            "bayes_thin",
+            "bayes_seed",
         ],
     }
 }
@@ -3397,10 +4076,12 @@ pub(crate) mod test_helpers {
                     rhs_program: None,
                     readout_program: None,
                     indiv_param_program: None,
+                    dose_attr_map: Default::default(),
                 })
             } else {
                 None
             },
+            dose_attr_map: Default::default(),
             bloq_method: BloqMethod::Drop,
             referenced_covariates: vec![],
             gradient_method,
@@ -3417,6 +4098,7 @@ pub(crate) mod test_helpers {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: HashMap::new(),
+            frem_config: None,
         }
     }
 }
@@ -3469,6 +4151,47 @@ mod tests {
         assert_eq!(TwoCptOral.canonical_name(), "two_cpt_oral");
         assert_eq!(ThreeCptIv.canonical_name(), "three_cpt_iv");
         assert_eq!(ThreeCptOral.canonical_name(), "three_cpt_oral");
+    }
+
+    #[test]
+    fn from_name_round_trips_and_accepts_aliases() {
+        use PkModel::*;
+        // `from_name` is the single source of name → model for both the `pk` parser
+        // and the `ode_template` desugarer (Ron #363). It must be the inverse of
+        // `canonical_name` on the canonical spelling and accept every long-form
+        // alias the parser historically accepted.
+        let cases: &[(PkModel, &str)] = &[
+            (OneCptIv, "one_compartment_iv"),
+            (OneCptOral, "one_compartment_oral"),
+            (TwoCptIv, "two_compartment_iv"),
+            (TwoCptOral, "two_compartment_oral"),
+            (ThreeCptIv, "three_compartment_iv"),
+            (ThreeCptOral, "three_compartment_oral"),
+        ];
+        for (model, alias) in cases {
+            assert_eq!(
+                PkModel::from_name(model.canonical_name()),
+                Some(*model),
+                "canonical name of {model:?} must round-trip"
+            );
+            assert_eq!(
+                PkModel::from_name(alias),
+                Some(*model),
+                "alias `{alias}` must resolve to {model:?}"
+            );
+        }
+        // Unknown names and the retired `*_bolus` / `*_infusion` spellings do NOT
+        // resolve — the parser maps the retired ones to a migration error itself,
+        // so `from_name` must return `None` for them (not a wrong variant).
+        for none in [
+            "four_cpt_oral",
+            "one_cpt_iv_bolus",
+            "two_cpt_infusion",
+            "",
+            "pk",
+        ] {
+            assert_eq!(PkModel::from_name(none), None, "`{none}` must not resolve");
+        }
     }
 
     #[test]
@@ -3986,6 +4709,170 @@ mod tests {
     }
 
     #[test]
+    fn dose_attr_map_resolves_indexed_then_bare_then_default() {
+        // params: slot 5 = bare F, slot 8 = bare lag, slots 9/10 = F2/ALAG2.
+        let mut params = [0.0f64; MAX_PK_PARAMS];
+        params[PK_IDX_F] = 0.8; // bare F
+        params[PK_IDX_LAGTIME] = 0.5; // bare lag
+        params[9] = 0.3; // F for compartment 2
+        params[10] = 1.25; // ALAG for compartment 2
+
+        let mut map = DoseAttrMap::default();
+        map.insert(DoseAttr::F, 2, 9);
+        map.insert(DoseAttr::Lag, 2, 10);
+
+        // Compartment 1 has no indexed entry -> falls through to the bare slot.
+        assert_eq!(map.f_bio(1, &params), 0.8);
+        assert_eq!(map.lagtime(1, &params), 0.5);
+        // Compartment 2 is overridden by its indexed slot.
+        assert_eq!(map.f_bio(2, &params), 0.3);
+        assert_eq!(map.lagtime(2, &params), 1.25);
+        // indexed_slot exposes the raw mapping (used by upstream validation).
+        assert_eq!(map.indexed_slot(DoseAttr::F, 2), Some(9));
+        assert_eq!(map.indexed_slot(DoseAttr::F, 1), None);
+    }
+
+    #[test]
+    fn dose_attr_from_indexed_name_recognizes_f_lag_and_duration() {
+        use DoseAttr::*;
+        // Bioavailability and both lag spellings, case-insensitive.
+        assert_eq!(DoseAttr::from_indexed_name("F1"), Some((F, 1)));
+        assert_eq!(DoseAttr::from_indexed_name("f2"), Some((F, 2)));
+        assert_eq!(DoseAttr::from_indexed_name("ALAG1"), Some((Lag, 1)));
+        assert_eq!(DoseAttr::from_indexed_name("alag3"), Some((Lag, 3)));
+        assert_eq!(DoseAttr::from_indexed_name("LAGTIME2"), Some((Lag, 2)));
+        // Modeled infusion duration D{n} (RATE=-2; #324), case-insensitive.
+        assert_eq!(DoseAttr::from_indexed_name("D1"), Some((Duration, 1)));
+        assert_eq!(DoseAttr::from_indexed_name("d2"), Some((Duration, 2)));
+
+        // Bare forms and zero index are not compartment-indexed attributes.
+        assert_eq!(DoseAttr::from_indexed_name("F"), None);
+        assert_eq!(DoseAttr::from_indexed_name("lagtime"), None);
+        assert_eq!(DoseAttr::from_indexed_name("alag"), None);
+        assert_eq!(DoseAttr::from_indexed_name("F0"), None);
+        assert_eq!(DoseAttr::from_indexed_name("D0"), None);
+        assert_eq!(DoseAttr::from_indexed_name("D"), None);
+
+        // Must not capture canonical PK names, the [scaling] `S{n}` names, or
+        // non-numeric suffixes — including `D`-prefixed words (`delta`, `decay`).
+        for n in [
+            "CL", "V1", "V2", "Q2", "Q3", "KA", "S1", "S2", "f_bio", "rate", "delta", "decay",
+        ] {
+            assert_eq!(DoseAttr::from_indexed_name(n), None, "{n} must not match");
+        }
+
+        // Modeled *rate* R{n} (RATE=-1) is still reserved for #324 Phase B — its
+        // `R` prefix collides with ODE rate constants, so it is not recognised.
+        assert_eq!(DoseAttr::from_indexed_name("R1"), None);
+
+        // An all-digit suffix that overflows usize fails to parse -> not an
+        // attribute (exercises the parse-error guard, not just the success path).
+        assert_eq!(
+            DoseAttr::from_indexed_name(&format!("F{}", "9".repeat(40))),
+            None
+        );
+    }
+
+    #[test]
+    fn dose_attr_map_empty_yields_engine_defaults() {
+        // An empty map (the common bare-/single-route model) must reproduce the
+        // pre-existing defaults: F = 1.0, lag = 0.0, even for a params slice too
+        // short to hold the reserved slots (cannot panic).
+        let map = DoseAttrMap::default();
+        let full = PkParams::default().values; // F slot already 1.0
+        assert_eq!(map.f_bio(1, &full), 1.0);
+        assert_eq!(map.lagtime(1, &full), 0.0);
+
+        let short: [f64; 3] = [2.0, 3.0, 4.0];
+        assert_eq!(map.f_bio(1, &short), 1.0);
+        assert_eq!(map.lagtime(1, &short), 0.0);
+        // Duration/Rate have no bare fallback -> no indexed slot means None.
+        assert_eq!(map.indexed_slot(DoseAttr::Duration, 1), None);
+        assert_eq!(map.indexed_slot(DoseAttr::Rate, 1), None);
+    }
+
+    #[test]
+    fn dose_event_resolve_rate_modeled_duration_matches_explicit_infusion() {
+        // RATE=-2 with D{1} in slot 9: a 100-unit dose over D = 5 must resolve to
+        // the same (rate, duration) as an explicit RATE = 100/5 = 20 infusion.
+        let mut map = DoseAttrMap::default();
+        map.insert(DoseAttr::Duration, 1, 9);
+        let mut params = [0.0; MAX_PK_PARAMS];
+        params[9] = 5.0; // D1
+
+        let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
+        assert!(
+            modeled.is_infusion(),
+            "modeled dose is an infusion pre-resolve"
+        );
+        let resolved = modeled.resolve_rate(&map, &params);
+
+        assert_eq!(resolved.rate_mode, RateMode::Fixed);
+        assert_eq!(resolved.duration, 5.0);
+        assert_eq!(resolved.rate, 20.0);
+        // Bit-equal to the hand-written explicit infusion (the #324 invariant).
+        let explicit = DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0);
+        assert_eq!(resolved.rate, explicit.rate);
+        assert_eq!(resolved.duration, explicit.duration);
+        // cmt/time/amt/ss/ii are preserved through resolution.
+        assert_eq!(resolved.cmt, 1);
+        assert_eq!(resolved.amt, 100.0);
+
+        // A Fixed dose is returned unchanged (the common, allocation-cheap path).
+        let same = explicit.resolve_rate(&map, &params);
+        assert_eq!(
+            (same.rate, same.duration, same.rate_mode),
+            (20.0, 5.0, RateMode::Fixed)
+        );
+    }
+
+    #[test]
+    fn dose_event_resolve_rate_clamps_nonpositive_duration() {
+        // A transient D <= 0 (or NaN) mid-search clamps to DURATION_FLOOR so
+        // rate = amt / D stays finite (mirrors PreparedInputRate::MIN_MTT).
+        let mut map = DoseAttrMap::default();
+        map.insert(DoseAttr::Duration, 1, 9);
+        let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
+
+        for bad in [0.0, -3.0, f64::NAN] {
+            let mut params = [0.0; MAX_PK_PARAMS];
+            params[9] = bad;
+            let r = modeled.resolve_rate(&map, &params);
+            assert_eq!(r.duration, DoseEvent::DURATION_FLOOR, "clamp at floor");
+            assert!(r.rate.is_finite() && r.rate > 0.0, "rate finite");
+        }
+    }
+
+    #[test]
+    fn clamp_above_floor_passes_through_or_clamps() {
+        // The shared clamp behind DURATION_FLOOR / MIN_MTT: > floor passes through,
+        // <= floor (and NaN — every `>` is false for NaN) returns the floor.
+        let floor = 1e-8;
+        assert_eq!(clamp_above_floor(5.0, floor), 5.0, "above floor passes");
+        assert_eq!(
+            clamp_above_floor(2e-8, floor),
+            2e-8,
+            "just above floor passes"
+        );
+        assert_eq!(
+            clamp_above_floor(floor, floor),
+            floor,
+            "at floor → floor (not >)"
+        );
+        assert_eq!(clamp_above_floor(0.0, floor), floor, "zero clamps to floor");
+        assert_eq!(
+            clamp_above_floor(-3.0, floor),
+            floor,
+            "negative clamps to floor"
+        );
+        assert_eq!(
+            clamp_above_floor(f64::NAN, floor),
+            floor,
+            "NaN clamps to floor"
+        );
+    }
+
+    #[test]
     fn test_lagtime_from_hashmap_primary_and_alias() {
         let mut m = HashMap::new();
         m.insert("lagtime".to_string(), 1.5);
@@ -4046,21 +4933,14 @@ mod tests {
             cens: Vec::new(),
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         }
     }
 
     fn dose(ss: bool) -> DoseEvent {
-        DoseEvent {
-            time: 0.0,
-            amt: 100.0,
-            cmt: 1,
-            rate: 0.0,
-            duration: 0.0,
-            ss,
-            ii: 0.0,
-        }
+        DoseEvent::new(0.0, 100.0, 1, 0.0, ss, 0.0)
     }
 
     #[test]

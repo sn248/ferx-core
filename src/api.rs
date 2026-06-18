@@ -9,6 +9,7 @@ use crate::io::datareader::{
     ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
+use crate::propensity_match::MatchMethod;
 use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
 use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
 use crate::types::*;
@@ -4388,26 +4389,28 @@ pub fn simulate_with_seed(
 pub struct SimulateOptions {
     /// Seed for reproducibility. `None` draws from entropy.
     pub seed: Option<u64>,
-    /// When `true`, reassign each replicate's drawn etas to subjects by
+    /// When `Some(method)`, reassign each replicate's drawn etas to subjects by
     /// **propensity-score matching** against the subjects' fitted (posthoc)
-    /// etas — optimal Mahalanobis matching under the model `Ω`. This restores
-    /// the design↔eta association present in adaptively-dosed real-world data
-    /// and corrects the resulting VPC bias (see [`crate::propensity_match`]).
+    /// etas — Mahalanobis matching under the model `Ω` via the chosen
+    /// [`MatchMethod`]. This restores the design↔eta association present in
+    /// adaptively-dosed real-world data and corrects the resulting VPC bias
+    /// (see [`crate::propensity_match`]). `None` disables matching.
     ///
     /// Requires `population` to be observed data: every subject must carry
     /// observations so its posthoc eta can be computed. Has no effect for the
     /// synthetic `[simulation]` block (no observed designs to match against).
-    pub propensity_match: bool,
+    pub match_method: Option<MatchMethod>,
 }
 
 /// Simulate observations, optionally with propensity-score matching.
 ///
-/// With `opts.propensity_match == false` this is identical to
-/// [`simulate_with_seed`] (or [`simulate`] when `opts.seed` is `None`). With it
-/// `true`, the freshly drawn etas of each replicate are reassigned to subjects
-/// so each subject's observed design is paired with a drawn eta close (under the
-/// model `Ω` Mahalanobis metric) to that subject's fitted eta. The fitted
-/// (posthoc) etas are computed once from `params` + the observed `population`.
+/// With `opts.match_method == None` this is identical to
+/// [`simulate_with_seed`] (or [`simulate`] when `opts.seed` is `None`). With a
+/// `Some(method)`, the freshly drawn etas of each replicate are reassigned to
+/// subjects so each subject's observed design is paired with a drawn eta close
+/// (under the model `Ω` Mahalanobis metric) to that subject's fitted eta. The
+/// fitted (posthoc) etas are computed once from `params` + the observed
+/// `population`.
 ///
 /// Returns `Err` if matching is requested but the population is empty or any
 /// subject has no observations.
@@ -4434,11 +4437,14 @@ pub fn simulate_with_options(
     // diagnostic; it is a no-op O(doses) scan on the common all-`Fixed` dataset.
     assert_modeled_doses_supported(model, population);
 
-    if !opts.propensity_match {
-        return Ok(simulate_inner_with_draw(
-            model, population, params, n_sim, 1, None, &mut rng,
-        ));
-    }
+    let method = match opts.match_method {
+        Some(m) => m,
+        None => {
+            return Ok(simulate_inner_with_draw(
+                model, population, params, n_sim, 1, None, &mut rng,
+            ));
+        }
+    };
 
     if population.subjects.is_empty() {
         return Err(
@@ -4490,7 +4496,7 @@ pub fn simulate_with_options(
         params,
         n_sim,
         1,
-        Some((&eta_hats, omega_inv)),
+        Some((&eta_hats, omega_inv, method)),
         &mut rng,
     ))
 }
@@ -4563,11 +4569,12 @@ fn emit_subject_rows<R: rand::Rng>(
     );
 }
 
-/// `matched`, when `Some((fitted_etas, omega_inv))`, reassigns each replicate's
-/// drawn etas to subjects by propensity-score matching against `fitted_etas`
-/// (optimal Mahalanobis matching under `omega_inv`; see `crate::propensity_match`).
-/// `None` is the standard per-subject independent draw and reproduces the
-/// previous behaviour byte-for-byte (same RNG draw order).
+/// `matched`, when `Some((fitted_etas, omega_inv, method))`, reassigns each
+/// replicate's drawn etas to subjects by propensity-score matching against
+/// `fitted_etas` (Mahalanobis matching under `omega_inv` via `method`; see
+/// `crate::propensity_match`). `None` is the standard per-subject independent
+/// draw and reproduces the previous behaviour byte-for-byte (same RNG draw
+/// order).
 #[allow(clippy::too_many_arguments)]
 fn simulate_inner_with_draw<R: rand::Rng>(
     model: &CompiledModel,
@@ -4575,7 +4582,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     params: &ModelParameters,
     n_sim: usize,
     draw: usize,
-    matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>)>,
+    matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
@@ -4594,7 +4601,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         match matched {
-            Some((fitted, omega_inv)) => {
+            Some((fitted, omega_inv, method)) => {
                 // Draw a pool of one eta per subject for this replicate, then
                 // reassign the draws to subjects by matching them to the fitted
                 // (posthoc) etas. Each subject keeps its own observed design.
@@ -4605,8 +4612,9 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         &params.omega.chol * DVector::from_column_slice(&z)
                     })
                     .collect();
-                let assign =
-                    crate::propensity_match::match_draws_to_fitted(&pool, fitted, omega_inv);
+                let assign = crate::propensity_match::match_draws_to_fitted(
+                    &pool, fitted, omega_inv, method,
+                );
                 for (i, subject) in population.subjects.iter().enumerate() {
                     let mut eta_slice: Vec<f64> = pool[assign[i]].iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);

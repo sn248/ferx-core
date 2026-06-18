@@ -79,8 +79,24 @@ section of the SDLC for the versioning policy).
   the only FD setting that also converges (`reconverge_gradient_interval = 1`:
   0.30 s vs 4.11 s). Validated against NONMEM on warfarin (FOCE OFV −280.36,
   FOCEI −286.00 — both matching to ~4–5 significant figures).
-  Models outside the analytical scope (time-varying covariates) transparently
+  Models outside the analytical scope (ODE models, steady-state edges) transparently
   fall back to the existing finite-difference gradient (#367).
+- **Analytic FOCE/FOCEI outer gradient for time-varying covariates** on the
+  analytical 1-/2-/3-compartment models. A covariate that changes within a subject
+  (e.g. an allometric `(WT/70)^θ` on CL with a time-varying weight) makes the PK
+  parameters switch mid-decay, which dose superposition cannot express; these
+  subjects now route through the second-order-dual event-driven walk, with each
+  event's PK-parameter derivatives evaluated at that event's covariate snapshot.
+  The walk handles covariate breakpoints carried by EVID=2 records between
+  observations and combined with EVID 3/4 resets. The result is the standard
+  `(η, θ)` jet, so the exact θ/Ω/σ packed gradient (incl. the covariate
+  coefficients and the EBE response) is assembled unchanged. Validated against
+  reconverged finite differences (~1e-6 on every packed parameter, FOCEI and FOCE)
+  and end-to-end on a simulated WT-on-CL dataset. Requires a gradient-based outer
+  optimizer (`lbfgs`/`bfgs`/`slsqp`); the analytic *inner* EBE gradient still uses
+  finite differences for these subjects, and time-varying covariates combined with
+  steady-state dosing, lagtime, output scaling, or IOV fall back to finite
+  differences (#367).
 - **Analytic FOCE/FOCEI outer gradient for inter-occasion variability (IOV)** on
   the analytical 1-/2-/3-compartment models. The exact closed-form marginal
   gradient now covers κ (kappa) random effects: the EBE response, inner Jacobian,

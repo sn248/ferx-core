@@ -1810,6 +1810,29 @@ mod tests {
         eta
     }
 
+    /// `∂f/∂η` Jacobian (row-major `n_obs × n_eta`) at `eta` via the light
+    /// provider, falling back to the full provider's `df_deta` for models the light
+    /// one doesn't cover (TV-covariates, `ExpressionScale`) so the reconverged-FD
+    /// marginal harness works there too. Test-only — the full provider's first
+    /// derivative is exact, so the FOCE linearization is identical.
+    fn eta_jacobian_any(
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        eta: &[f64],
+    ) -> Vec<f64> {
+        if let Some(j) = crate::sens::provider::subject_eta_jacobian(model, subject, theta, eta) {
+            return j;
+        }
+        let s = crate::sens::provider::subject_sensitivities(model, subject, theta, eta)
+            .expect("provider supports subject");
+        let mut j = Vec::with_capacity(s.obs.len() * model.n_eta);
+        for o in &s.obs {
+            j.extend_from_slice(&o.df_deta);
+        }
+        j
+    }
+
     /// Per-subject Laplace NLL Fᵢ at a *given* η̂ (no reconvergence).
     fn marginal_nll_at(
         model: &CompiledModel,
@@ -1819,8 +1842,7 @@ mod tests {
     ) -> f64 {
         let eta_v = nalgebra::DVector::from_column_slice(eta);
         let ipreds = crate::pk::compute_predictions_with_tv(model, subject, &params.theta, eta);
-        let jac = crate::sens::provider::subject_eta_jacobian(model, subject, &params.theta, eta)
-            .unwrap();
+        let jac = eta_jacobian_any(model, subject, &params.theta, eta);
         let h_matrix =
             nalgebra::DMatrix::from_row_slice(subject.obs_times.len(), model.n_eta, &jac);
         foce_subject_nll_interaction(
@@ -1851,8 +1873,7 @@ mod tests {
         eta: &[f64],
     ) -> f64 {
         let eta_v = nalgebra::DVector::from_column_slice(eta);
-        let jac = crate::sens::provider::subject_eta_jacobian(model, subject, &params.theta, eta)
-            .unwrap();
+        let jac = eta_jacobian_any(model, subject, &params.theta, eta);
         let h_matrix =
             nalgebra::DMatrix::from_row_slice(subject.obs_times.len(), model.n_eta, &jac);
         foce_subject_nll(
@@ -2261,6 +2282,183 @@ mod tests {
                 population_gradient_sens_foce(&model, &pop, &template, &x, &ehs)
             }
             .expect("reset subject supported by analytic gradient");
+
+            let ofv = |xv: &[f64]| -> f64 {
+                let p = unpack_params(xv, &template);
+                2.0 * pop
+                    .subjects
+                    .iter()
+                    .map(|s| {
+                        if interaction {
+                            marginal_nll(&model, s, &p)
+                        } else {
+                            marginal_nll_foce(&model, s, &p)
+                        }
+                    })
+                    .sum::<f64>()
+            };
+            let fd_at = |k: usize, h: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[k] += h;
+                let mut xm = x.clone();
+                xm[k] -= h;
+                (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+            };
+            for k in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[k].abs());
+                let f1 = fd_at(k, h);
+                let f2 = fd_at(k, h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0;
+                eprintln!(
+                    "interaction={interaction} x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                    analytic[k],
+                    fd,
+                    (analytic[k] - fd).abs() / fd.abs().max(1e-12)
+                );
+                approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
+            }
+        }
+    }
+
+    // 1-cpt oral with allometric WT-on-CL — the canonical time-varying covariate.
+    // WT changes across a subject's records, so `CL = TVCL·(WT/70)^THETA_WT·exp(ETA_CL)`
+    // switches mid-decay. The provider routes these to the event-driven Dual2 walk
+    // and returns the standard `(η, θ)` jet, so the θ/Ω/σ packed gradient —
+    // including the THETA_WT covariate coefficient and the EBE response — must match
+    // reconverged FD with no special-casing in the outer assembly.
+    const ONECPT_ORAL_TVCOV_OUTER: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// TV-cov subject: one oral dose with `WT` changing across observations (and an
+    /// optional EVID=2 covariate breakpoint at `pk_only_times`). Observations are
+    /// synthesised from the production predictor at a reference η so residuals are
+    /// realistic and nonzero.
+    #[allow(clippy::too_many_arguments)]
+    fn tvcov_subject_outer(
+        model: &CompiledModel,
+        theta: &[f64],
+        eta_ref: &[f64],
+        obs_times: &[f64],
+        obs_wts: &[f64],
+        pk_only_times: Vec<f64>,
+        pk_only_wts: &[f64],
+        id: &str,
+    ) -> Subject {
+        let n = obs_times.len();
+        let wt_map = |w: f64| {
+            let mut m = HashMap::new();
+            m.insert("WT".to_string(), w);
+            m
+        };
+        let mut subject = Subject {
+            id: id.to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: obs_times.to_vec(),
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: wt_map(obs_wts[0]),
+            dose_covariates: vec![wt_map(obs_wts[0])],
+            obs_covariates: obs_wts.iter().map(|&w| wt_map(w)).collect(),
+            pk_only_times,
+            pk_only_covariates: pk_only_wts.iter().map(|&w| wt_map(w)).collect(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        assert!(
+            subject.has_tv_covariates(),
+            "fixture must carry TV covariates"
+        );
+        let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, eta_ref);
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        subject
+    }
+
+    /// FOCEI and FOCE packed gradients for a population with a time-varying-covariate
+    /// subject must both match Richardson reconverged-FD of their marginal
+    /// objectives — the outer-assembly counterpart to the provider-vs-production
+    /// TV-cov tests in `sens::provider`. One subject carries the covariate change
+    /// across observations, the other carries an EVID=2 breakpoint between them, so
+    /// both the covariate-θ chain and the `pk_only` walk flow through the θ/Ω/σ
+    /// blocks (incl. the EBE response) for both estimation methods.
+    #[test]
+    fn population_packed_gradient_tvcov_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+
+        let model = parse_model_string(ONECPT_ORAL_TVCOV_OUTER).expect("parse tvcov");
+        let theta = [0.22, 11.0, 1.4, 0.7];
+        let eta_ref = [0.12, -0.08, 0.2];
+
+        let s_obs = tvcov_subject_outer(
+            &model,
+            &theta,
+            &eta_ref,
+            &[1.0, 2.0, 4.0, 8.0, 24.0],
+            &[70.0, 74.0, 82.0, 88.0, 95.0],
+            Vec::new(),
+            &[],
+            "tvcov_obs",
+        );
+        let s_brk = tvcov_subject_outer(
+            &model,
+            &theta,
+            &eta_ref,
+            &[1.0, 2.0, 6.0, 12.0],
+            &[70.0, 70.0, 95.0, 95.0],
+            vec![4.0],
+            &[95.0],
+            "tvcov_brk",
+        );
+        let pop = Population {
+            subjects: vec![s_obs, s_brk],
+            covariate_names: vec!["WT".into()],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+
+        for interaction in [true, false] {
+            let analytic = if interaction {
+                population_gradient_sens(&model, &pop, &template, &x, &ehs)
+            } else {
+                population_gradient_sens_foce(&model, &pop, &template, &x, &ehs)
+            }
+            .expect("TV-cov subject supported by analytic gradient");
 
             let ofv = |xv: &[f64]| -> f64 {
                 let p = unpack_params(xv, &template);

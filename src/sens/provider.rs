@@ -725,6 +725,234 @@ fn run_obs_iov<const M: usize>(
     Some(SubjectSens { obs: obs_out })
 }
 
+/// True when [`subject_sensitivities_tvcov`] can serve this model: an analytical
+/// 1-/2-/3-cpt model whose individual parameters carry **time-varying covariates**
+/// (the covariate enters the program, so the PK parameters switch mid-decay — the
+/// same shape as IOV, handled by the event-driven Dual2 walk rather than dose
+/// superposition).
+///
+/// First cut (the rest routes to FD until the per-event dual walk is extended):
+/// no IOV (the analytical gate already requires `n_kappa == 0`), no dose lagtime,
+/// no output scaling, no LTBS. Requires the compiled individual-parameter program
+/// with `(θ, η)` axis counts matching the model, so each event's `∂p/∂(θ, η)`
+/// (+ second order) can be evaluated at *that event's* covariate snapshot via
+/// [`pd_from_program`](crate::sens::ode_provider::pd_from_program).
+pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
+    if !analytical_supported(model) || model.has_lagtime() || model.log_transform {
+        return false;
+    }
+    // Output scaling on the TV-cov path would need a per-event scale jet (the
+    // scale program may itself reference the time-varying covariate); deferred.
+    if !matches!(model.scaling, ScalingSpec::None) {
+        return false;
+    }
+    match model.indiv_param_partials.indiv_param_program.as_ref() {
+        Some(prog) => {
+            prog.pk_slots().len() == model.pk_indices.len()
+                && prog.n_theta_axis() == model.n_theta
+                && prog.n_eta_axis() == model.n_eta
+                && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
+        }
+        None => false,
+    }
+}
+
+/// Exact analytic sensitivities for an analytical subject with **time-varying
+/// covariates**, over the ordinary `(η, θ)` blocks — the standard
+/// [`SubjectSens`] shape, identical to the non-TV provider, so the outer gradient
+/// and inner Jacobian consume it unchanged.
+///
+/// This is the IOV walk minus κ: each event's PK-param duals are seeded at *that
+/// event's* covariate snapshot (via [`pd_from_program`](crate::sens::ode_provider::pd_from_program),
+/// which evaluates `∂p/∂(θ, η)` + second order at an arbitrary covariate map), and
+/// the event-driven Dual2 walk carries the dual amounts across the covariate
+/// breakpoints — switching to each event's params, exactly as production's
+/// `compute_predictions_with_tv` does over `f64`. EVID=2 (`pk_only`) covariate
+/// breakpoints between observations are seeded and walked too. Returns `None`
+/// outside the supported scope (caller falls back to FD).
+pub fn subject_sensitivities_tvcov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<SubjectSens> {
+    if !tvcov_analytical_supported(model) || !subject.has_tv_covariates() {
+        return None;
+    }
+    // First cut: defer TV-cov + steady-state (a dual SS equilibration at the dose
+    // event's covariate snapshot is a separate follow-up). Resets ARE handled by
+    // the walk (it zeros the dual state at each `EventKind::Reset`).
+    if subject.doses.iter().any(|d| d.ss) {
+        return None;
+    }
+
+    let n_eta = model.n_eta;
+    let n_theta = model.n_theta;
+    let m_dim = n_theta + n_eta;
+
+    let prog = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("tvcov_analytical_supported guarantees the program");
+    let slots = prog.pk_slots();
+    // PK slot → differentiated-row index of `pd_from_program` (for seeding the
+    // dual axis). `pd` rows follow `pk_slots()` order, so row `i` ↔ slot `slots[i]`.
+    let mut slot_row: [Option<usize>; N_PK] = [None; N_PK];
+    for (i, &s) in slots.iter().enumerate() {
+        if s < N_PK {
+            slot_row[s] = Some(i);
+        }
+    }
+
+    macro_rules! disp {
+        ($($m:literal),+) => {
+            match m_dim {
+                $($m => run_obs_tvcov::<$m>(
+                    model, subject, theta, eta, prog, &slot_row, n_eta, n_theta,
+                ),)+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+}
+
+/// The dual-width-`M` inner of [`subject_sensitivities_tvcov`] (`M = n_theta +
+/// n_eta`). For each event, evaluates the individual-parameter program's
+/// `∂p/∂(θ, η)` at that event's covariate snapshot, seeds the PK-param duals on the
+/// `(θ, η)` axes (`θ_m → m`, `η_k → n_theta + k`), runs the event-driven
+/// sensitivity walk over `Dual2<M>`, and reads `∂conc/∂(θ, η)` straight off into
+/// the standard `(n_eta, n_theta)` [`SubjectSens`].
+#[allow(clippy::too_many_arguments)]
+fn run_obs_tvcov<const M: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    slot_row: &[Option<usize>; N_PK],
+    n_eta: usize,
+    n_theta: usize,
+) -> Option<SubjectSens> {
+    use crate::pk::event_driven::EventSchedule;
+    use crate::sens::ode_provider::pd_from_program;
+    use crate::sens::propagate::{event_driven_sens_g, PkDual};
+
+    // Build the per-event PK-param duals at a covariate snapshot: evaluate the
+    // program's `∂p/∂(θ, η)` (+ 2nd order) at `cov`, then seed each differentiated
+    // PK slot on its `(θ, η)` dual axis (`θ_m → m`, `η_k → n_theta + k`); constants
+    // otherwise. The θ-θ Hessian block is unused downstream (left zero), mirroring
+    // the IOV / scale seeders.
+    let mk = |cov: &std::collections::HashMap<String, f64>| -> PkDual<Dual2<M>> {
+        let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
+        let pk = (model.pk_param_fn)(theta, eta, cov);
+        let seed_row = |i: usize, val: f64| -> Dual2<M> {
+            let mut grad = [0.0; M];
+            let mut hess = [[0.0; M]; M];
+            for m in 0..n_theta.min(M) {
+                grad[m] = pd.dp_dtheta[i][m];
+            }
+            for k in 0..n_eta {
+                if n_theta + k < M {
+                    grad[n_theta + k] = pd.dp_deta[i][k];
+                }
+                for l in 0..n_eta {
+                    if n_theta + k < M && n_theta + l < M {
+                        hess[n_theta + k][n_theta + l] = pd.d2p_deta2[i][k][l];
+                    }
+                }
+                for m in 0..n_theta {
+                    if n_theta + k < M && m < M {
+                        let v = pd.d2p_detadtheta[i][k][m];
+                        hess[n_theta + k][m] = v;
+                        hess[m][n_theta + k] = v;
+                    }
+                }
+            }
+            Dual2 {
+                value: val,
+                grad,
+                hess,
+            }
+        };
+        let dv = |slot: usize, val: f64| -> Dual2<M> {
+            match slot_row[slot] {
+                Some(i) => seed_row(i, val),
+                None => Dual2::<M>::constant(val),
+            }
+        };
+        PkDual {
+            cl: dv(PK_IDX_CL, pk.cl()),
+            v: dv(PK_IDX_V, pk.v()),
+            q: dv(PK_IDX_Q, pk.q()),
+            v2: dv(PK_IDX_V2, pk.v2()),
+            ka: dv(PK_IDX_KA, pk.ka()),
+            q3: dv(PK_IDX_Q3, pk.q3()),
+            v3: dv(PK_IDX_V3, pk.v3()),
+            f: dv(PK_IDX_F, pk.f_bio()),
+        }
+    };
+
+    // Per-event params: doses / observations / EVID=2 breakpoints each at their own
+    // covariate snapshot (the `*_cov` accessors fall back to the static map when a
+    // particular event carries no snapshot).
+    let pk_at_dose: Vec<PkDual<Dual2<M>>> = (0..subject.doses.len())
+        .map(|k| mk(subject.dose_cov(k)))
+        .collect();
+    let pk_at_obs: Vec<PkDual<Dual2<M>>> = (0..subject.obs_times.len())
+        .map(|j| mk(subject.obs_cov(j)))
+        .collect();
+    let pk_at_pk_only: Vec<PkDual<Dual2<M>>> = (0..subject.pk_only_times.len())
+        .map(|m| mk(subject.pk_only_cov(m)))
+        .collect();
+
+    // No lagtime in TV-cov scope → zero dose lagtimes.
+    let dose_lagtimes = vec![0.0; subject.doses.len()];
+    let schedule = EventSchedule::for_subject(subject, model.pk_model, &dose_lagtimes);
+    let conc = event_driven_sens_g::<Dual2<M>>(
+        model.pk_model,
+        subject,
+        &schedule,
+        &pk_at_dose,
+        &pk_at_obs,
+        &pk_at_pk_only,
+    );
+
+    let mut obs_out = Vec::with_capacity(conc.len());
+    for c in &conc {
+        // Clamp parity with production `conc.max(0.0)`: a negative value's
+        // derivatives vanish (consistency with the OFV).
+        let neg = c.value < 0.0;
+        let mut df_deta = vec![0.0; n_eta];
+        let mut df_dtheta = vec![0.0; n_theta];
+        let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
+        let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
+        if !neg {
+            for k in 0..n_eta {
+                df_deta[k] = c.grad[n_theta + k];
+                for l in 0..n_eta {
+                    d2f_deta2[k * n_eta + l] = c.hess[n_theta + k][n_theta + l];
+                }
+                for m in 0..n_theta {
+                    d2f_deta_dtheta[k * n_theta + m] = c.hess[n_theta + k][m];
+                }
+            }
+            for m in 0..n_theta {
+                df_dtheta[m] = c.grad[m];
+            }
+        }
+        obs_out.push(ObsSens {
+            f: if neg { 0.0 } else { c.value },
+            df_deta,
+            d2f_deta2,
+            df_dtheta,
+            d2f_deta_dtheta,
+        });
+    }
+    Some(SubjectSens { obs: obs_out })
+}
+
 /// Accumulated `subject_sensitivities` call count and wall-time across a fit,
 /// for `FERX_PROFILE=1` (printed by the CLI via [`profile_report`]). No overhead
 /// when off (the `Instant` is only taken when profiling is enabled).
@@ -1171,8 +1399,15 @@ fn subject_sensitivities_impl(
         }
         return None;
     }
-    if !analytical_supported(model) || subject.has_tv_covariates() {
+    if !analytical_supported(model) {
         return None;
+    }
+    // Time-varying covariates make the PK parameters switch mid-decay, which dose
+    // superposition can't express — route them to the event-driven Dual2 walk
+    // (IOV-minus-κ). The returned `SubjectSens` has the same `(η, θ)` shape, so the
+    // outer gradient / inner Jacobian consume it identically.
+    if subject.has_tv_covariates() {
+        return subject_sensitivities_tvcov(model, subject, theta, eta);
     }
     // EVID=3/4 resets are handled by restricting dose superposition to the
     // current reset segment (see `reset_floor` in the obs loop): for linear PK a
@@ -2706,6 +2941,235 @@ mod tests {
         );
         let subject = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
         check_full_provider_vs_fd(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
+    }
+
+    // ── Time-varying covariate analytic sensitivities ─────────────────
+
+    // Allometric WT-on-CL, the canonical time-varying covariate: `WT` changes
+    // across a subject's records, so `CL = TVCL·(WT/70)^THETA_WT·exp(ETA_CL)`
+    // switches mid-decay. θ = [TVCL, TVV, TVKA, THETA_WT].
+    const ONECPT_ORAL_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    // 2-cpt IV with WT-on-CL. θ = [TVCL, TVV1, TVQ, TVV2, THETA_WT].
+    const TWOCPT_IV_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(15.0, 1.0, 100.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    // 3-cpt oral with WT-on-CL. θ = [TVCL, TVV1, TVQ2, TVV2, TVQ3, TVV3, TVKA,
+    // THETA_WT].
+    const THREECPT_ORAL_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.5, 50.0)
+  theta TVV1(10.0, 1.0, 100.0)
+  theta TVQ2(2.0, 0.1, 20.0)
+  theta TVV2(20.0, 2.0, 200.0)
+  theta TVQ3(1.5, 0.1, 20.0)
+  theta TVV3(30.0, 3.0, 300.0)
+  theta TVKA(1.5, 0.05, 20.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  omega ETA_KA ~ 0.10
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q2 = TVQ2
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    fn wt_map(wt: f64) -> HashMap<String, f64> {
+        let mut m = HashMap::new();
+        m.insert("WT".to_string(), wt);
+        m
+    }
+
+    /// Build a single-subject TV-covariate fixture with per-event `WT` snapshots.
+    /// `dose_wts`/`obs_wts`/`pk_only_wts` are parallel to `doses`/`obs_times`/
+    /// `pk_only_times`; populating `dose_covariates`/`obs_covariates` is what makes
+    /// `has_tv_covariates()` true (and routes production + provider through the
+    /// event-driven walk).
+    #[allow(clippy::too_many_arguments)]
+    fn tvcov_subject(
+        doses: Vec<DoseEvent>,
+        dose_wts: &[f64],
+        obs_times: &[f64],
+        obs_wts: &[f64],
+        reset_times: Vec<f64>,
+        pk_only_times: Vec<f64>,
+        pk_only_wts: &[f64],
+    ) -> Subject {
+        let n = obs_times.len();
+        Subject {
+            id: "1".to_string(),
+            doses,
+            obs_times: obs_times.to_vec(),
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; n],
+            obs_cmts: vec![1; n],
+            covariates: wt_map(obs_wts[0]),
+            dose_covariates: dose_wts.iter().map(|&w| wt_map(w)).collect(),
+            obs_covariates: obs_wts.iter().map(|&w| wt_map(w)).collect(),
+            pk_only_times,
+            pk_only_covariates: pk_only_wts.iter().map(|&w| wt_map(w)).collect(),
+            reset_times,
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    /// The TV-covariate provider's exact value/∂η/∂²η/∂θ/∂²η∂θ must match central
+    /// finite differences of the production predictor `compute_predictions_with_tv`
+    /// (the independent f64 event-driven path), across 1-/2-/3-cpt and the three
+    /// scenarios the walk must cover: (a) the covariate changing at observations,
+    /// (b) a covariate breakpoint carried by an EVID=2 (`pk_only`) record between
+    /// observations, and (c) a covariate change combined with an EVID=4 reset.
+    #[test]
+    fn tvcov_provider_matches_fd_of_production() {
+        let bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+        let cases: Vec<(CompiledModel, Subject, Vec<f64>, Vec<f64>)> = vec![
+            // (a) 1-cpt oral, WT changing at each observation.
+            {
+                let m = parse_model_string(ONECPT_ORAL_TVCOV).expect("parse 1cpt oral tvcov");
+                let s = tvcov_subject(
+                    vec![bolus(0.0)],
+                    &[70.0],
+                    &[1.0, 2.0, 4.0, 8.0, 24.0],
+                    &[70.0, 72.0, 80.0, 85.0, 90.0],
+                    Vec::new(),
+                    Vec::new(),
+                    &[],
+                );
+                (m, s, vec![0.2, 10.0, 1.5, 0.75], vec![0.15, -0.10, 0.25])
+            },
+            // (b) 1-cpt oral, covariate breakpoint at an EVID=2 record (t=3) that
+            // falls between observations — the WT jumps 70→95 there, switching CL
+            // mid-decay with no observation at the breakpoint.
+            {
+                let m =
+                    parse_model_string(ONECPT_ORAL_TVCOV).expect("parse 1cpt oral tvcov pkonly");
+                let s = tvcov_subject(
+                    vec![bolus(0.0)],
+                    &[70.0],
+                    &[1.0, 2.0, 4.0, 8.0],
+                    &[70.0, 70.0, 95.0, 95.0],
+                    Vec::new(),
+                    vec![3.0],
+                    &[95.0],
+                );
+                (m, s, vec![0.2, 10.0, 1.5, 0.75], vec![0.12, 0.08, -0.15])
+            },
+            // (c) 1-cpt oral, WT change combined with an EVID=4 reset at t=12.
+            {
+                let m = parse_model_string(ONECPT_ORAL_TVCOV).expect("parse 1cpt oral tvcov reset");
+                let s = tvcov_subject(
+                    vec![bolus(0.0), bolus(12.0)],
+                    &[70.0, 90.0],
+                    &[1.0, 3.0, 13.0, 15.0, 18.0],
+                    &[70.0, 70.0, 90.0, 90.0, 90.0],
+                    vec![12.0],
+                    Vec::new(),
+                    &[],
+                );
+                (m, s, vec![0.2, 10.0, 1.5, 0.75], vec![0.10, -0.05, 0.20])
+            },
+            // (d) 2-cpt IV bolus, WT changing at each observation.
+            {
+                let m = parse_model_string(TWOCPT_IV_TVCOV).expect("parse 2cpt iv tvcov");
+                let s = tvcov_subject(
+                    vec![bolus(0.0)],
+                    &[70.0],
+                    &[0.5, 2.0, 6.0, 12.0, 24.0],
+                    &[70.0, 75.0, 82.0, 88.0, 95.0],
+                    Vec::new(),
+                    Vec::new(),
+                    &[],
+                );
+                (m, s, vec![10.0, 50.0, 15.0, 100.0, 0.75], vec![0.12, -0.08])
+            },
+            // (e) 3-cpt oral, WT changing at each observation (widest dual, M=11).
+            {
+                let m = parse_model_string(THREECPT_ORAL_TVCOV).expect("parse 3cpt oral tvcov");
+                let s = tvcov_subject(
+                    vec![bolus(0.0)],
+                    &[70.0],
+                    &[1.0, 2.0, 6.0, 12.0, 24.0],
+                    &[70.0, 73.0, 80.0, 86.0, 92.0],
+                    Vec::new(),
+                    Vec::new(),
+                    &[],
+                );
+                (
+                    m,
+                    s,
+                    vec![5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 1.5, 0.75],
+                    vec![0.15, -0.10, 0.25],
+                )
+            },
+        ];
+        for (m, s, theta, eta) in &cases {
+            assert!(
+                tvcov_analytical_supported(m),
+                "TV-cov model must be provider-supported"
+            );
+            assert!(s.has_tv_covariates(), "fixture must carry TV covariates");
+            assert!(
+                subject_sensitivities(m, s, theta, eta).is_some(),
+                "TV-cov subject must take the analytic provider"
+            );
+            check_full_provider_vs_fd(m, s, theta, eta);
+        }
     }
 
     // ── IOV analytic sensitivities ───────────────────────────────────

@@ -538,6 +538,140 @@ fn omega_packed_block(prep: &Prep, params: &ModelParameters, eta_hat: &[f64]) ->
         .collect()
 }
 
+/// Symmetric per-entry natural Ω-gradient `M_{rc} = ∂Fᵢ/∂Ω_{rc}` (treating every
+/// entry independently), as a matrix. Built from the same closed form as
+/// [`omega_block`]: fixed `½(−z zᵀ + Ω⁻¹ − G)` plus EBE response `¼(v zᵀ + z vᵀ)`,
+/// with `z = Ω⁻¹η̂`, `G = Ω⁻¹H̃⁻¹Ω⁻¹`, `v = Ω⁻¹H⁻¹g_eta`. (The free-parameter
+/// gradient `omega_block` returns is `M_{rc}+M_{cr}` off-diagonal; this keeps the
+/// matrix form so it can be sub-blocked and Cholesky-mapped for IOV.)
+fn natural_omega_grad_matrix(prep: &Prep, eta_hat: &[f64]) -> DMatrix<f64> {
+    let n = prep.n_eta;
+    let eta = DVector::from_column_slice(eta_hat);
+    let z = &prep.omega_inv * &eta;
+    let g = &prep.omega_inv * &prep.htilde_inv * &prep.omega_inv;
+    let v = &prep.omega_inv * (&prep.h_inner_inv * DVector::from_column_slice(&prep.g_eta));
+    let mut m = DMatrix::zeros(n, n);
+    for r in 0..n {
+        for c in 0..n {
+            let fixed = 0.5 * (-z[r] * z[c] + prep.omega_inv[(r, c)] - g[(r, c)]);
+            let resp = 0.25 * (v[r] * z[c] + z[r] * v[c]);
+            m[(r, c)] = fixed + resp;
+        }
+    }
+    m
+}
+
+/// Map a sub-block's natural symmetric gradient `M_sub` (`∂F/∂Ω_sub`) to the
+/// packed Cholesky-space gradient for that block: `∂F/∂L = 2·M_sub·L` (L lower-
+/// triangular), with the diagonal log-chain (`x_ii = ln L_ii ⇒ ×L_ii`) and raw
+/// off-diagonals — the same convention/order as [`omega_packed_block`] /
+/// `pack_params`.
+fn chol_pack(m_sub: &DMatrix<f64>, l: &DMatrix<f64>, diagonal: bool) -> Vec<f64> {
+    let n = l.nrows();
+    let gl = (m_sub * l).scale(2.0);
+    let mut out = Vec::new();
+    if diagonal {
+        for i in 0..n {
+            out.push(gl[(i, i)] * l[(i, i)]);
+        }
+    } else {
+        for j in 0..n {
+            for i in j..n {
+                if i == j {
+                    out.push(gl[(i, i)] * l[(i, i)]);
+                } else {
+                    out.push(gl[(i, j)]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The exact per-subject FOCEI packed gradient `dFᵢ/dx` for an analytical **IOV**
+/// subject, in `pack_params` order `[θ, Ω_bsv, σ, Ω_iov]`. `stacked_eta_hat` is
+/// the joint EBE `[η_bsv, κ₁..κ_K]` for `unpack_params(x)`. `None` outside the
+/// IOV-analytical scope.
+///
+/// The θ and σ blocks reuse the stacked-η assembly unchanged. The Ω blocks split
+/// the **block-diagonal** `Σ_b = Ω_bsv ⊕ K·Ω_iov`: the BSV packed gradient is the
+/// top-left sub-block of the natural gradient mapped through `L_bsv`; the IOV
+/// packed gradient is the **sum** of the K diagonal IOV sub-blocks (the κ-variance
+/// is shared across occasions — `∂F/∂L_iov = Σ_k 2·M_{block_k}·L_iov`) mapped
+/// through `L_iov`.
+pub fn subject_packed_gradient_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    stacked_eta_hat: &[f64],
+) -> Option<Vec<f64>> {
+    let params = unpack_params(x, template);
+    let sens =
+        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, stacked_eta_hat)?;
+    let k = crate::stats::likelihood::split_obs_by_occasion(subject).len();
+    let n_eta_bsv = model.n_eta;
+    let n_iov = model.n_kappa;
+    let n_stacked = n_eta_bsv + k * n_iov;
+    if stacked_eta_hat.len() != n_stacked {
+        return None;
+    }
+    let omega_iov = params.omega_iov.as_ref()?;
+    let block = crate::stats::likelihood::build_block_diag_omega(
+        &params.omega.matrix,
+        &omega_iov.matrix,
+        k,
+    );
+    let omega_inv = block.cholesky()?.inverse();
+    let prep = prepare_stacked(model, subject, &params, &sens, n_stacked, omega_inv)?;
+
+    let n_theta = params.theta.len();
+    let n_sigma = params.sigma.values.len();
+    let mut g = vec![0.0f64; x.len()];
+
+    // θ (log/identity chain).
+    let g_theta = theta_block(&prep, &sens, n_theta);
+    for m in 0..n_theta {
+        let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
+            params.theta[m]
+        } else {
+            1.0
+        };
+        g[m] = g_theta[m] * dtheta_dx;
+    }
+
+    // Ω blocks from the natural symmetric gradient over the stacked Σ_b.
+    let m_mat = natural_omega_grad_matrix(&prep, stacked_eta_hat);
+    let m_bsv = m_mat.view((0, 0), (n_eta_bsv, n_eta_bsv)).into_owned();
+    let bsv_packed = chol_pack(&m_bsv, &params.omega.chol, params.omega.diagonal);
+    // Sum the K diagonal IOV sub-blocks (shared κ-variance / SAME).
+    let mut m_iov = DMatrix::<f64>::zeros(n_iov, n_iov);
+    for kk in 0..k {
+        let off = n_eta_bsv + kk * n_iov;
+        m_iov += m_mat.view((off, off), (n_iov, n_iov));
+    }
+    let iov_packed = chol_pack(&m_iov, &omega_iov.chol, omega_iov.diagonal);
+
+    // σ (log-σ chain).
+    let g_sigma = sigma_block(&prep, model, subject, &params, &sens);
+
+    // Place in pack_params order: θ, Ω_bsv, σ, Ω_iov.
+    let omega_start = n_theta;
+    for (i, &val) in bsv_packed.iter().enumerate() {
+        g[omega_start + i] = val;
+    }
+    let sigma_start = omega_start + bsv_packed.len();
+    for kk in 0..n_sigma {
+        g[sigma_start + kk] = g_sigma[kk] * params.sigma.values[kk];
+    }
+    let iov_start = sigma_start + n_sigma;
+    for (i, &val) in iov_packed.iter().enumerate() {
+        g[iov_start + i] = val;
+    }
+
+    Some(g)
+}
+
 /// The exact per-subject FOCEI gradient `dFᵢ/dx` in the **packed** optimizer
 /// space (log-θ / Cholesky-Ω / log-σ), or `None` when unsupported. `eta_hat`
 /// must be the EBE for `unpack_params(x)`.
@@ -2171,6 +2305,50 @@ mod tests {
                 (analytic[m] - fd).abs() / fd.abs().max(1e-12)
             );
             approx::assert_relative_eq!(analytic[m], fd, max_relative = 3e-3, epsilon = 1e-5);
+        }
+    }
+
+    /// The full analytic IOV **packed** gradient (`[θ, Ω_bsv, σ, Ω_iov]`, optimizer
+    /// space) must match the Richardson reconverged FD of the production IOV FOCEI
+    /// marginal over every packed coordinate — closing the Ω (incl. the shared
+    /// κ-variance) and σ blocks against the NONMEM-grounded objective.
+    #[test]
+    fn iov_packed_gradient_matches_reconverged_fd() {
+        let model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_subject_outer(&model, &theta);
+        let template = params.clone();
+        let x = crate::estimation::parameterization::pack_params(&params);
+
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+        let analytic = subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+            .expect("IOV packed gradient supported");
+
+        let f = |xx: &[f64]| -> f64 {
+            let p = unpack_params(xx, &template);
+            marginal_nll_iov(&model, &subject, &p)
+        };
+        for i in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[i].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[i] += hh;
+                let mut xm = x.clone();
+                xm[i] -= hh;
+                (f(&xp) - f(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "iov x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[i],
+                fd,
+                (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+            );
+            approx::assert_relative_eq!(analytic[i], fd, max_relative = 2e-3, epsilon = 2e-5);
         }
     }
 }

@@ -84,31 +84,21 @@ pub fn leapfrog(
 }
 
 // ---------------------------------------------------------------------------
-// HMC step (requires autodiff)
+// HMC step
 // ---------------------------------------------------------------------------
 
-/// One HMC proposal for a single SAEM subject.
+/// One HMC proposal for a single SAEM/Bayes subject, matching the interface of
+/// `mh_steps`. The leapfrog gradient is the exact `Dual2` analytic `∂NLL/∂η`
+/// ([`crate::estimation::inner_optimizer::analytic_eta_nll_gradient`]) — no autodiff.
 ///
-/// Builds all AD helpers internally from the current SAEM state
-/// `(model, theta, omega, sigma_values)`, matching the interface of
-/// `mh_steps`.
-///
-/// Returns `Some((new_eta, new_nll, accepted, divergent))` when the AD gradient path is
-/// available.  Returns `None` when HMC cannot be applied — caller must fall
-/// back to `mh_steps` in that case.  HMC is unavailable when:
-///   - the model uses an ODE (`model.ode_spec.is_some()`)
-///   - the model has no analytical PK path (`model.tv_fn.is_none()`)
-///   - `omega.log_det` is non-finite (degenerate variance matrix)
-///   - [`crate::estimation::inner_optimizer::resolve_gradient_method`] resolves
-///     the subject to `Fd` (no AD path consistent with the analytical
-///     objective): SS doses,
-///     an oral model with a zero-order infusion dose, eta-dependent lagtime, or
-///     a TV-covariate / reset subject on a PK model the event-driven AD path
-///     doesn't support.
-///
-/// Reset (EVID=3/4), TV-covariate, and lagtime subjects take the event-driven
-/// AD path; plain subjects take the single-snapshot path — the same routing as
-/// the FOCEI inner loop.
+/// Returns `Some((new_eta, new_nll, accepted, divergent))`, or `None` when HMC
+/// cannot be applied (caller falls back to `mh_steps`):
+///   - the model uses an ODE (`model.ode_spec.is_some()`),
+///   - it has no analytical PK path (`model.tv_fn.is_none()`),
+///   - `omega.log_det` is non-finite (degenerate variance matrix), or
+///   - the Dual2 light provider can't differentiate the subject (time-varying
+///     covariates, oral infusion, SS+reset, expression scaling) — then there is no
+///     gradient consistent with the analytical objective.
 #[allow(clippy::too_many_arguments)]
 pub fn hmc_step(
     subject: &crate::types::Subject,

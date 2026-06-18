@@ -37,8 +37,9 @@ pub const BUILD_INFO: BuildInfo = BuildInfo {
 /// this enum describes what actually runs and is used only for reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GradientMethodKind {
-    /// Enzyme automatic differentiation — exact, constant cost in n_eta.
-    EnzymeAD,
+    /// Exact analytic `Dual2` η-gradient from the sensitivity provider — one
+    /// provider evaluation per inner step, independent of n_eta.
+    Analytic,
     /// Central finite differences — cost scales as 2×n_eta per gradient call.
     FiniteDifferences,
     /// Not applicable: derivative-free optimizer or sampling-based step.
@@ -48,7 +49,7 @@ pub enum GradientMethodKind {
 impl GradientMethodKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::EnzymeAD => "Enzyme AD",
+            Self::Analytic => "analytic (Dual2)",
             Self::FiniteDifferences => "finite differences",
             Self::NotApplicable => "N/A",
         }
@@ -57,15 +58,24 @@ impl GradientMethodKind {
 
 /// Gradient method used in the inner (per-subject EBE) loop.
 ///
-/// Mirrors the runtime resolution in
-/// [`estimation::inner_optimizer::resolve_gradient_method`]: AD is used iff
-/// (a) the crate is compiled with the `autodiff` feature, (b) the model has
-/// an analytical PK path (`tv_fn` populated — ODE models have no AD path),
-/// and (c) the user did not force `gradient_method = Fd`. Otherwise FD.
-pub fn gradient_method_inner(build: &BuildInfo, model: &CompiledModel) -> GradientMethodKind {
+/// Coarse model-level mirror of the per-subject route in
+/// [`estimation::inner_optimizer::resolve_gradient_method`]: the analytic `Dual2`
+/// gradient runs when the model has an analytical PK path (`tv_fn` populated —
+/// ODE models have none) and is in the provider's scope (not LTBS / expression
+/// scaling / SDE), and the user did not force `gradient_method = Fd`. Otherwise
+/// FD. (The exact per-subject split is reported by `gradient_route_summary`.)
+pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> GradientMethodKind {
     let user_forces_fd = matches!(model.gradient_method, GradientMethod::Fd);
-    if build.has_autodiff && model.tv_fn.is_some() && !user_forces_fd {
-        GradientMethodKind::EnzymeAD
+    let analytic = model.tv_fn.is_some()
+        && !user_forces_fd
+        && !model.log_transform
+        && !matches!(
+            model.scaling,
+            crate::types::ScalingSpec::ExpressionScale { .. }
+        )
+        && !model.is_sde();
+    if analytic {
+        GradientMethodKind::Analytic
     } else {
         GradientMethodKind::FiniteDifferences
     }
@@ -137,17 +147,18 @@ mod tests {
     }
 
     #[test]
-    fn inner_ad_build_analytical_auto_returns_enzyme() {
+    fn inner_analytical_auto_returns_analytic() {
         let m = test_helpers::analytical_model(GradientMethod::Auto);
         assert_eq!(
-            gradient_method_inner(&ad_build(), &m),
-            GradientMethodKind::EnzymeAD
+            gradient_method_inner(&ci_build(), &m),
+            GradientMethodKind::Analytic
         );
     }
 
     #[test]
-    fn inner_ci_build_returns_fd() {
-        let m = test_helpers::analytical_model(GradientMethod::Auto);
+    fn inner_ltbs_model_returns_fd() {
+        let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+        m.log_transform = true; // LTBS keeps the FD inner gradient
         assert_eq!(
             gradient_method_inner(&ci_build(), &m),
             GradientMethodKind::FiniteDifferences
@@ -155,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn inner_ode_model_returns_fd_even_with_ad_build() {
+    fn inner_ode_model_returns_fd() {
         let m = test_helpers::ode_model(GradientMethod::Auto);
         assert_eq!(
             gradient_method_inner(&ad_build(), &m),
@@ -164,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn inner_user_forces_fd_returns_fd_even_with_ad_build() {
+    fn inner_user_forces_fd_returns_fd() {
         let m = test_helpers::analytical_model(GradientMethod::Fd);
         assert_eq!(
             gradient_method_inner(&ad_build(), &m),

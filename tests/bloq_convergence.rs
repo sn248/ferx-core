@@ -41,13 +41,12 @@
 //! the censored rows carries a different additive constant than ferx's M3 term
 //! (ferx −217.18 vs NONMEM −216.79), so the cross-check pins the MLE, not the OFV.
 //!
-//! Convergence note: a gradient-based optimizer must reconverge the EBEs on M3
-//! fits. The analytic outer gradient declines on censored subjects (it
-//! differentiates the Gaussian term, not `−logΦ`), and the fixed-EBE FD fallback
-//! is biased there — so M3-censored models automatically force the reconverged-FD
-//! outer gradient (`m3_censored_present`), exactly like IOV. Without that, a
-//! gradient optimizer stalls on this flat KA ridge at TVKA ≈ 1.10 / OFV ≈ −213.8
-//! (the stale `docs/src/examples/bloq.md` numbers); BOBYQA reconverges anyway.
+//! Convergence note: FOCEI-M3 now uses an exact closed-form censored outer
+//! gradient (`prepare`'s M3 branch), so a gradient optimizer reaches the true
+//! minimum directly. Plain FOCE-M3 forces the reconverged-FD gradient
+//! (`m3_censored_present && !interaction`). Without one of these a gradient
+//! optimizer stalled on this flat KA ridge at TVKA ≈ 1.10 / OFV ≈ −213.8 (the
+//! stale `docs/src/examples/bloq.md` numbers); BOBYQA reconverges anyway.
 
 use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, FitOptions, Optimizer};
@@ -78,11 +77,10 @@ fn bloq_m3_analytic_lbfgs_matches_nonmem() {
         "data must contain censored rows"
     );
 
-    // Gradient-based path: built-in L-BFGS outer + analytic inner (M3) gradient.
-    // M3 forces the reconverged outer gradient automatically (no manual
-    // reconverge). Inner solver stays at the default Auto/BFGS — the choice
-    // doesn't change the EBE/gradient, and pinning it mutates a process-global
-    // that races sibling tests under parallel execution.
+    // Gradient-based path: built-in L-BFGS outer on the analytic FOCEI-M3 outer
+    // gradient (+ analytic inner M3 gradient). Inner solver stays at the default
+    // Auto/BFGS — the choice doesn't change the EBE/gradient, and pinning it
+    // mutates a process-global that races sibling tests under parallel execution.
     let mut opts = FitOptions::default();
     opts.optimizer = Optimizer::Lbfgs;
     opts.inner_tol = 1e-8;

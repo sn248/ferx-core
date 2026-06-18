@@ -50,6 +50,35 @@ struct ErrTerms {
     beta: f64,    // βⱼ = dpⱼ/df
 }
 
+/// Inverse Mills ratio `h = φ(z)/Φ(z)`, evaluated through logs so it stays finite
+/// in the far tail (`Φ(z)→0` when the prediction sits well above the LLOQ).
+fn inv_mills(z: f64) -> f64 {
+    let ln_phi = -0.5 * z * z - 0.5 * std::f64::consts::TAU.ln();
+    (ln_phi - crate::stats::special::log_normal_cdf(z)).exp()
+}
+
+/// M3 censored-row scalars `(g1, g2) = (∂L/∂f, ∂²L/∂f²)` for the data term
+/// `L = −logΦ(z)`, `z = (y−f)/√R`, with `y` the LLOQ, `R(f)` the residual
+/// variance, `d = ∂R/∂f`, `d2 = ∂²R/∂f²`. Uses `∂z/∂f = −m` and
+/// `dh/dz = −h(h+z)`, where `m = 1/w + (y−f)d/(2w³)`, `w = √R`:
+/// ```text
+///   g1 = h·m
+///   g2 = h(h+z)·m² + h·∂m/∂f,
+///   ∂m/∂f = [−2d + (y−f)d2]/(2w³) − 3(y−f)d²/(4w⁵).
+/// ```
+fn m3_censored_scalars(y: f64, f: f64, r: f64, d: f64, d2: f64) -> (f64, f64) {
+    let w = r.sqrt();
+    let w3 = r * w; // w³
+    let w5 = r * r * w; // w⁵
+    let z = (y - f) / w;
+    let h = inv_mills(z);
+    let m = 1.0 / w + (y - f) * d / (2.0 * w3);
+    let g1 = h * m;
+    let dm_df = (-2.0 * d + (y - f) * d2) / (2.0 * w3) - 3.0 * (y - f) * d * d / (4.0 * w5);
+    let g2 = h * (h + z) * m * m + h * dm_df;
+    (g1, g2)
+}
+
 fn err_terms(r: f64, d: f64, d2: f64, eps: f64) -> ErrTerms {
     let inv_r = 1.0 / r;
     let inv_r2 = inv_r * inv_r;
@@ -92,6 +121,12 @@ struct Prep {
     q: Vec<f64>,
     /// Exact `∂log|H̃|/∂η` (a-fixed part + `∂²f/∂η²` curvature).
     g_eta: Vec<f64>,
+    /// Per-observation M3-censored flag. Censored rows enter `H` (true inner
+    /// Hessian) and the data gradient but carry `p = β = 0`, so they are excluded
+    /// from `H̃` / `log|H̃|` — matching `gaussian_foce_accum`, which accumulates
+    /// `hrh`/`ctc` over quantified rows only and adds the censored `−logΦ` to the
+    /// data term. Empty `Vec` (all-false) when the subject has no censoring.
+    censored: Vec<bool>,
 }
 
 fn prepare(
@@ -113,6 +148,9 @@ fn prepare(
     let mut h_inner = omega_inv.clone();
     let mut et: Vec<ErrTerms> = Vec::with_capacity(n_obs);
 
+    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
+    let mut censored = vec![false; n_obs];
+    let mut any_cens = false;
     for obs in sens.obs.iter() {
         let f = obs.f;
         // obs index → cmt: provider obs are parallel to subject.obs_times.
@@ -124,8 +162,27 @@ fn prepare(
         }
         let d = model.error_spec.dvar_df(cmt, f, sigma);
         let d2 = model.error_spec.d2var_df2(cmt, sigma);
-        let eps = subject.observations[j] - f;
-        let t = err_terms(r, d, d2, eps);
+        let y = subject.observations[j];
+        let is_cens = m3 && subject.cens.get(j).copied().unwrap_or(0) != 0;
+        // For a censored row the data term is `−logΦ(z)`: store its f-derivatives
+        // as `alpha = 2·g1`, `alpha_p = 2·g2` (so the assembly's `½α`, `½α'` recover
+        // `∂L/∂f`, `∂²L/∂f²`) and force `p = β = 0` (excluded from `H̃` / `log|H̃|`).
+        let t = if is_cens {
+            censored[j] = true;
+            any_cens = true;
+            let (g1, g2) = m3_censored_scalars(y, f, r, d, d2);
+            ErrTerms {
+                r,
+                d,
+                eps: y - f,
+                alpha: 2.0 * g1,
+                alpha_p: 2.0 * g2,
+                p: 0.0,
+                beta: 0.0,
+            }
+        } else {
+            err_terms(r, d, d2, y - f)
+        };
 
         let a = obs.df_deta.as_slice();
         for k in 0..n_eta {
@@ -137,6 +194,7 @@ fn prepare(
         }
         et.push(t);
     }
+    let censored = if any_cens { censored } else { Vec::new() };
 
     let htilde_inv = htilde.cholesky()?.inverse();
     let h_inner_inv = h_inner.cholesky()?.inverse();
@@ -175,6 +233,7 @@ fn prepare(
         w,
         q,
         g_eta,
+        censored,
     })
 }
 
@@ -320,6 +379,37 @@ fn sigma_block(
         for (j, obs) in sens.obs.iter().enumerate() {
             let cmt = subject.obs_cmts[j];
             let f = obs.f;
+            if prep.censored.get(j).copied().unwrap_or(false) {
+                // M3 censored row: data term `−logΦ((y−f)/√R(σ))` (not in `H̃`, so
+                // no `log|H̃|` σ-term). `∂L/∂σ` and `∂g1/∂σ = ½∂α/∂σ` by central FD
+                // of the closed-form censored scalars, mirroring the Gaussian path.
+                let y = subject.observations[j];
+                let l_sig = (-crate::stats::special::log_normal_cdf(
+                    (y - f) / model.error_spec.variance_at(cmt, f, &sp).sqrt(),
+                ) + crate::stats::special::log_normal_cdf(
+                    (y - f) / model.error_spec.variance_at(cmt, f, &sm).sqrt(),
+                )) / (2.0 * h);
+                fixed += l_sig;
+                let (g1p, _) = m3_censored_scalars(
+                    y,
+                    f,
+                    model.error_spec.variance_at(cmt, f, &sp),
+                    model.error_spec.dvar_df(cmt, f, &sp),
+                    model.error_spec.d2var_df2(cmt, &sp),
+                );
+                let (g1m, _) = m3_censored_scalars(
+                    y,
+                    f,
+                    model.error_spec.variance_at(cmt, f, &sm),
+                    model.error_spec.dvar_df(cmt, f, &sm),
+                    model.error_spec.d2var_df2(cmt, &sm),
+                );
+                let dg1 = (g1p - g1m) / (2.0 * h);
+                for m in 0..n_eta {
+                    m_vec[m] += dg1 * obs.df_deta[m];
+                }
+                continue;
+            }
             let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
             // ∂R/∂σ_k, ∂d/∂σ_k by central FD of the closed-form error functions.
             let r_sig = (model.error_spec.variance_at(cmt, f, &sp)
@@ -411,14 +501,10 @@ pub fn subject_packed_gradient(
     x: &[f64],
     eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
-    // Under M3/BLOQ the objective replaces a censored row with −logΦ((LLOQ−f)/√V),
-    // but this analytic path computes the Gaussian ½(ε²/R + lnR) for every row — so
-    // a censored subject would differentiate an objective the optimizer is not
-    // minimizing, stalling silently. Fall back to FD, mirroring the FOCE sibling
-    // (`subject_packed_gradient_foce`). PR #381 review finding #2.
-    if subject.cens.iter().any(|&c| c != 0) {
-        return None;
-    }
+    // M3/BLOQ: censored rows enter through `prepare` (data term `−logΦ`, true
+    // inner Hessian; excluded from `H̃`/`log|H̃|` — matching `gaussian_foce_accum`).
+    // This is the FOCEI (interaction) path that M3 always promotes to; plain FOCE
+    // with M3 still falls back to FD in `subject_packed_gradient_foce`.
     let params = unpack_params(x, template);
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
     let prep = prepare(model, subject, &params, &sens)?;
@@ -997,20 +1083,27 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
             let mut hess = omega_inv.clone();
+            let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
             for (j, obs) in sens.obs.iter().enumerate() {
                 let f = obs.f;
                 let cmt = subject.obs_cmts[j];
                 let r = model.error_spec.variance_at(cmt, f, sigma);
                 let d = model.error_spec.dvar_df(cmt, f, sigma);
                 let d2 = model.error_spec.d2var_df2(cmt, sigma);
-                let eps = subject.observations[j] - f;
-                let t = err_terms(r, d, d2, eps);
+                let y = subject.observations[j];
+                // (g1, g2) = (∂L/∂f, ∂²L/∂f²): the censored `−logΦ` scalars for an
+                // M3 BLOQ row, else the Gaussian `½α`, `½α'`.
+                let (g1, g2) = if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
+                    m3_censored_scalars(y, f, r, d, d2)
+                } else {
+                    let t = err_terms(r, d, d2, y - f);
+                    (0.5 * t.alpha, 0.5 * t.alpha_p)
+                };
                 let a = obs.df_deta.as_slice();
                 for k in 0..n_eta {
-                    grad[k] += 0.5 * t.alpha * a[k];
+                    grad[k] += g1 * a[k];
                     for l in 0..n_eta {
-                        hess[(k, l)] += 0.5
-                            * (t.alpha_p * a[k] * a[l] + t.alpha * obs.d2f_deta2[k * n_eta + l]);
+                        hess[(k, l)] += g2 * a[k] * a[l] + g1 * obs.d2f_deta2[k * n_eta + l];
                     }
                 }
             }
@@ -1368,6 +1461,85 @@ mod tests {
     fn population_packed_gradient_2cpt_matches_fd() {
         let model = parse_model_string(TWOCPT).expect("parse");
         run_population_packed_gradient_check(&model, &[5.0, 30.0, 2.0, 50.0, 1.0]);
+    }
+
+    /// The analytic FOCEI **M3** packed gradient (censored rows enter `prepare`'s
+    /// M3 branch: data `−logΦ` + true-inner-Hessian, excluded from `H̃`) must match
+    /// the reconverged-FD of ferx's M3 FOCEI objective (`foce_subject_nll_interaction`
+    /// with `bloq_term`). Each subject carries both quantified and censored rows.
+    #[test]
+    fn population_packed_gradient_m3_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::{BloqMethod, Population};
+
+        let mut model = parse_model_string(WARFARIN).expect("parse");
+        model.bloq_method = BloqMethod::M3;
+        let theta = [0.22, 11.0, 1.4];
+
+        // Build subjects, then mark the last two observations of each as censored
+        // (CENS=1, the obs cell carries the LLOQ) so every subject mixes quantified
+        // and BLOQ rows. Leaves z moderate (LLOQ ≈ 0.85·f_ref), away from the tail.
+        let mut s1 = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let mut s2 = subject_with_obs(&model, &theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0, 72.0]);
+        for s in [&mut s1, &mut s2] {
+            let n = s.observations.len();
+            s.cens[n - 1] = 1;
+            s.cens[n - 2] = 1;
+        }
+        assert!(s1.cens.iter().any(|&c| c != 0) && s2.cens.iter().any(|&c| c != 0));
+
+        let pop = Population {
+            subjects: vec![s1, s2],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+
+        let analytic =
+            population_gradient_sens(&model, &pop, &template, &x, &ehs).expect("M3 supported");
+
+        // marginal_nll uses foce_subject_nll_interaction with model.bloq_method = M3,
+        // so the OFV carries the censored −2logΦ term; precise_ebe is M3-aware.
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| marginal_nll(&model, s, &p))
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            eprintln!(
+                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[k],
+                fd,
+                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 5e-3, epsilon = 1e-5);
+        }
     }
 
     #[test]

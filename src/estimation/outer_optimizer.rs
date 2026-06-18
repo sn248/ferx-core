@@ -1990,10 +1990,13 @@ fn population_gradient(
 ) -> Vec<f64> {
     let reconverge = reconverge_this_eval(options, *grad_eval_idx);
     *grad_eval_idx += 1;
-    // M3-censored models force the reconverged path (see `m3_censored_present`):
-    // the analytic gradient declines on censored subjects and the fixed-EBE FD
-    // fallback is biased there, so a gradient optimizer would stall otherwise.
-    let force_reconverge = reconverge || m3_censored_present(model, population);
+    // FOCE-M3 forces the reconverged path: the plain-FOCE analytic gradient
+    // declines on censored subjects (`subject_packed_gradient_foce`) and the
+    // fixed-EBE FD fallback is biased there. FOCEI-M3 has an exact analytic
+    // censored gradient (`subject_packed_gradient` + `prepare`'s M3 branch), so it
+    // takes the analytic path like any other interaction fit.
+    let force_reconverge =
+        reconverge || (!options.interaction && m3_censored_present(model, population));
     // Analytic-sensitivity gradient (Almquist 2015 Eq. 23, closed form via the
     // `sens` provider): the exact marginal FOCEI gradient including the Eq. 46
     // EBE response on every θ/Ω/σ block — no fixed-EBE bias, no FD noise, so it

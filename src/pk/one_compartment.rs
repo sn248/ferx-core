@@ -1,57 +1,41 @@
+use crate::sens::one_cpt::{
+    one_cpt_infusion_g, one_cpt_infusion_ss_g, one_cpt_iv_bolus_g, one_cpt_iv_bolus_ss_g,
+    one_cpt_oral_g, one_cpt_oral_ss_g,
+};
 use crate::types::DoseEvent;
 
+// The closed forms below are the single source of truth: they live once, generic
+// over `PkNum`, in `crate::sens::one_cpt` (the "sens model"). These f64 entry
+// points delegate to the generic `*_g` at `T = f64`, so the prediction path and
+// the `Dual2` sensitivity path can never drift (issue #408 / Ron review #9). The
+// `#[inline]` delegators monomorphise to the same machine code the hand-written
+// f64 forms produced, so the hot superposition path is unchanged.
+
 /// One-compartment IV bolus: C(t) = (Dose/V) * exp(-k*t)
+#[inline]
 pub fn one_cpt_iv_bolus(dose: &DoseEvent, t: f64, cl: f64, v: f64) -> f64 {
-    if t < 0.0 || v <= 0.0 || cl <= 0.0 {
-        return 0.0;
-    }
-    let k = cl / v;
-    (dose.amt / v) * (-k * t).exp()
+    one_cpt_iv_bolus_g::<f64>(dose.amt, t, cl, v)
 }
 
 /// One-compartment infusion
 /// During infusion (t <= T): C(t) = (Rate/CL) * (1 - exp(-k*t))
 /// After infusion (t > T):   C(t) = (Rate/CL) * (1 - exp(-k*T)) * exp(-k*(t-T))
+#[inline]
 pub fn one_cpt_infusion(dose: &DoseEvent, t: f64, cl: f64, v: f64) -> f64 {
-    if t < 0.0 || v <= 0.0 || cl <= 0.0 {
-        return 0.0;
-    }
-    let k = cl / v;
-    let rate = dose.rate;
-    let dur = dose.duration;
-
-    if dur <= 0.0 {
-        // Fallback to bolus
-        return one_cpt_iv_bolus(dose, t, cl, v);
-    }
-
-    if t <= dur {
-        (rate / cl) * (1.0 - (-k * t).exp())
-    } else {
-        (rate / cl) * (1.0 - (-k * dur).exp()) * (-k * (t - dur)).exp()
-    }
+    one_cpt_infusion_g::<f64>(dose.rate, dose.duration, dose.amt, t, cl, v)
 }
 
 /// One-compartment oral absorption
 /// C(t) = (F*Dose*KA) / (V*(KA - k)) * [exp(-k*t) - exp(-KA*t)]
 /// Handles singularity when KA ≈ k via L'Hopital limit
+#[inline]
 pub fn one_cpt_oral(dose: &DoseEvent, t: f64, cl: f64, v: f64, ka: f64) -> f64 {
     one_cpt_oral_f(dose, t, cl, v, ka, 1.0)
 }
 
+#[inline]
 pub fn one_cpt_oral_f(dose: &DoseEvent, t: f64, cl: f64, v: f64, ka: f64, f_bio: f64) -> f64 {
-    if t < 0.0 || v <= 0.0 || cl <= 0.0 || ka <= 0.0 {
-        return 0.0;
-    }
-    let k = cl / v;
-    let d = f_bio * dose.amt;
-
-    if (ka - k).abs() < 1e-6 {
-        // L'Hopital limit: C(t) = (D*ka/V) * t * exp(-k*t)
-        (d * ka / v) * t * (-k * t).exp()
-    } else {
-        (d * ka / (v * (ka - k))) * ((-k * t).exp() - (-ka * t).exp())
-    }
+    one_cpt_oral_g::<f64>(dose.amt, t, cl, v, ka, f_bio)
 }
 
 /// Predict concentration from a single dose at elapsed time t using 1-cmt model.
@@ -90,49 +74,19 @@ pub fn one_cpt_predict(
 // rate `λ`, so the closed form is valid for all τ ≥ 0 (not just τ ∈ [0, II)).
 
 /// One-compartment IV bolus at steady state.
+#[inline]
 pub fn one_cpt_iv_bolus_ss(dose: &DoseEvent, t: f64, cl: f64, v: f64) -> f64 {
-    if t < 0.0 || v <= 0.0 || cl <= 0.0 || dose.ii <= 0.0 {
-        return 0.0;
-    }
-    let k = cl / v;
-    let denom = 1.0 - (-k * dose.ii).exp();
-    if denom <= 0.0 {
-        return 0.0;
-    }
-    (dose.amt / v) * (-k * t).exp() / denom
+    one_cpt_iv_bolus_ss_g::<f64>(dose.amt, t, dose.ii, cl, v)
 }
 
 /// One-compartment oral absorption at steady state (with bioavailability).
+#[inline]
 pub fn one_cpt_oral_f_ss(dose: &DoseEvent, t: f64, cl: f64, v: f64, ka: f64, f_bio: f64) -> f64 {
-    if t < 0.0 || v <= 0.0 || cl <= 0.0 || ka <= 0.0 || dose.ii <= 0.0 {
-        return 0.0;
-    }
-    let k = cl / v;
-    let d = f_bio * dose.amt;
-    let ii = dose.ii;
-
-    if (ka - k).abs() < 1e-6 {
-        // L'Hopital limit at the SS sum:
-        // Σ_{n=0}^∞ (τ + n·II) · exp(-k·(τ + n·II))
-        //   = exp(-k·τ) · [τ/(1-x) + II·x/(1-x)^2]   with x = exp(-k·II)
-        let x = (-k * ii).exp();
-        let one_minus_x = 1.0 - x;
-        if one_minus_x <= 0.0 {
-            return 0.0;
-        }
-        let s = t / one_minus_x + ii * x / (one_minus_x * one_minus_x);
-        (d * ka / v) * (-k * t).exp() * s
-    } else {
-        let denom_k = 1.0 - (-k * ii).exp();
-        let denom_ka = 1.0 - (-ka * ii).exp();
-        if denom_k <= 0.0 || denom_ka <= 0.0 {
-            return 0.0;
-        }
-        (d * ka / (v * (ka - k))) * ((-k * t).exp() / denom_k - (-ka * t).exp() / denom_ka)
-    }
+    one_cpt_oral_ss_g::<f64>(dose.amt, t, dose.ii, cl, v, ka, f_bio)
 }
 
 /// One-compartment oral absorption at steady state (F = 1).
+#[inline]
 pub fn one_cpt_oral_ss(dose: &DoseEvent, t: f64, cl: f64, v: f64, ka: f64) -> f64 {
     one_cpt_oral_f_ss(dose, t, cl, v, ka, 1.0)
 }
@@ -159,53 +113,9 @@ pub(crate) fn one_cpt_oral_depot(dose: &DoseEvent, tau: f64, ka: f64, f_bio: f64
 /// One-compartment infusion at steady state, for any `T_inf` — including
 /// overlapping pulses (`T_inf > II`), where several infusions are simultaneously
 /// active. Evaluated at phase `t ∈ [0, II)`.
+#[inline]
 pub fn one_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v: f64) -> f64 {
-    if t < 0.0 || v <= 0.0 || cl <= 0.0 || dose.ii <= 0.0 {
-        return 0.0;
-    }
-    let rate = dose.rate;
-    let t_inf = dose.duration;
-    if t_inf <= 0.0 {
-        return one_cpt_iv_bolus_ss(dose, t, cl, v);
-    }
-    let k = cl / v;
-    let ii = dose.ii;
-    let denom = 1.0 - (-k * ii).exp();
-    if denom <= 0.0 {
-        return 0.0;
-    }
-    let r_over_cl = rate / cl;
-    let one_minus_e_kt_inf = 1.0 - (-k * t_inf).exp();
-    if t_inf > ii {
-        // Overlapping infusions: superpose the infinite past pulse train
-        // C(τ) = (R/CL)·[A(τ) + D(τ)]. At phase τ, `N` pulses are still infusing
-        // (`τ + n·II < T_inf`, n = 0..N−1) and the rest have ended:
-        //   N = max(0, ⌊(T_inf − τ)/II⌋ + 1)
-        //   A = N − e^{−kτ}(1 − e^{−k·N·II})/(1 − x)                (still infusing)
-        //   D = (1 − e^{−k·T_inf})·e^{−k(τ − T_inf + N·II)}/(1 − x) (decayed tail)
-        // with x = e^{−k·II} (so `1 − x = denom`). This reduces algebraically to
-        // the non-overlapping branches below at N ∈ {0, 1}. The `D` exponent
-        // `τ − T_inf + N·II ≥ 0` is kept in a single `exp` to avoid `inf·0`.
-        let n_active = (((t_inf - t) / ii).floor() + 1.0).max(0.0);
-        let a = n_active - (-k * t).exp() * (1.0 - (-k * n_active * ii).exp()) / denom;
-        let d = one_minus_e_kt_inf * (-k * (t - t_inf + n_active * ii)).exp() / denom;
-        return r_over_cl * (a + d);
-    }
-    // Contribution from past pulses (n ≥ 1) is always "after-infusion"
-    // because τ + n·II ≥ II ≥ T_inf. The combined exponent
-    // `exp(-k·(t + II - t_inf))` is ≤ 1 for the in-range domain
-    // (t ≥ 0, t_inf ≤ II), so collapse the two `.exp()` calls into one
-    // to avoid an `inf * 0 = NaN` intermediate when k·(t_inf - t) is
-    // large and k·II is also large (would only arise outside realistic
-    // PK ranges, but cheaper to write defensively than to debug later).
-    let past_pulses = r_over_cl * one_minus_e_kt_inf * (-k * (t + ii - t_inf)).exp() / denom;
-    if t <= t_inf {
-        // n=0 is during the current infusion.
-        r_over_cl * (1.0 - (-k * t).exp()) + past_pulses
-    } else {
-        // n=0 is after the current infusion; all pulses are "after".
-        r_over_cl * one_minus_e_kt_inf * (-k * (t - t_inf)).exp() / denom
-    }
+    one_cpt_infusion_ss_g::<f64>(dose.rate, dose.duration, dose.amt, t, dose.ii, cl, v)
 }
 
 #[cfg(test)]

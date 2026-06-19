@@ -919,6 +919,7 @@ fn parse_subject(
     let mut excl_fired: Vec<String> = Vec::new();
     let mut parse_warnings: Vec<String> = Vec::new();
     let mut addl_missing_ii_warned = false;
+    let mut cens_invalid_warned = false;
     // Rows that survived the data-selection filter, carry a nonzero AMT, yet
     // were not classified as a dose (EVID not 1/4) — their AMT was silently
     // dropped. Reported as a population summary so a degenerate dose-free fit
@@ -1417,6 +1418,18 @@ fn parse_subject(
                 obs_raw_times.push(raw_time);
                 observations.push(dv);
                 obs_cmts.push(cmt);
+                // Only -1 (above ULOQ), 0 (quantified), and 1 (below LLOQ) are
+                // meaningful. Any other value is coerced to left-censored by the
+                // M3 likelihood (`m3_logcdf` treats every nonzero as a tail), so
+                // flag it rather than silently mis-scoring the row.
+                if !matches!(cens_flag, -1 | 0 | 1) && !cens_invalid_warned {
+                    parse_warnings.push(format!(
+                        "W_CENS_UNEXPECTED subject {}: CENS={} is not -1, 0, or 1; \
+                         treated as censored (left tail) under M3",
+                        id, cens_flag
+                    ));
+                    cens_invalid_warned = true;
+                }
                 cens.push(cens_flag);
                 if occ_col.is_some() {
                     occasions.push(occ);
@@ -2415,6 +2428,32 @@ mod tests {
         assert_eq!(subj.observations, vec![5.0, 7.0, 9.0]);
         assert_eq!(subj.cens, vec![-1, 0, 1]);
         assert!(subj.has_censored_observation());
+        assert!(
+            !pop.warnings
+                .iter()
+                .any(|w| w.starts_with("W_CENS_UNEXPECTED")),
+            "valid CENS values (-1/0/1) must not warn"
+        );
+    }
+
+    #[test]
+    fn test_cens_unexpected_value_warns_once() {
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+                   1,0,.,1,1,100,1,0\n\
+                   1,1,5.0,0,0,.,1,2\n\
+                   1,2,7.0,0,0,.,1,3\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+
+        // Value is preserved verbatim (no silent coercion in the reader)...
+        assert_eq!(pop.subjects[0].cens, vec![2, 3]);
+        // ...but the out-of-range flag is reported exactly once per subject.
+        let n = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+            .count();
+        assert_eq!(n, 1, "expected one W_CENS_UNEXPECTED per subject");
     }
 
     #[test]

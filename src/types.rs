@@ -560,10 +560,6 @@ impl Subject {
         self.cens.iter().any(|&c| c != 0)
     }
 
-    pub fn has_bloq(&self) -> bool {
-        self.has_censored_observation()
-    }
-
     /// True when the subject carries per-event covariate snapshots (i.e. at
     /// least one covariate was time-varying in the source data). When false,
     /// callers can use `covariates` directly and skip the per-event evaluation
@@ -2686,7 +2682,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // Experimental-feature notices (issue #175): SDE and neural-network
         // components emit a runtime warning so results are applied with caution.
         (WarningSeverity::Warning, "experimental")
-    } else if lower.contains("m3 bloq") || lower.contains("bloq handling") {
+    } else if lower.contains("m3 bloq")
+        || lower.contains("bloq handling")
+        || lower.contains("m3 censoring")
+        || lower.contains("censoring handling")
+    {
         (WarningSeverity::Warning, "bloq_method")
     } else if lower.contains("sir failed") || lower.contains("sir requested") {
         (WarningSeverity::Warning, "sir")
@@ -4935,12 +4935,14 @@ mod tests {
     }
 
     #[test]
-    fn subject_has_bloq_reflects_cens_flags() {
+    fn subject_has_censored_observation_reflects_cens_flags() {
         let mut s = bare_subject("1");
         s.cens = vec![0, 0];
-        assert!(!s.has_bloq());
+        assert!(!s.has_censored_observation());
         s.cens = vec![0, 1];
-        assert!(s.has_bloq());
+        assert!(s.has_censored_observation());
+        s.cens = vec![-1, 0];
+        assert!(s.has_censored_observation());
     }
 
     #[test]

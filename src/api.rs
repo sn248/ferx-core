@@ -3189,7 +3189,10 @@ fn fit_inner(
             EstimationMethod::Foce | EstimationMethod::FoceGn
         )
         && !options.interaction
-        && population.subjects.iter().any(|s| s.has_bloq())
+        && population
+            .subjects
+            .iter()
+            .any(|s| s.has_censored_observation())
     {
         warnings.push(
             "M3 censoring handling requires FOCEI semantics; subjects with CENS!=0 \

@@ -424,7 +424,8 @@ pub fn foce_subject_nll(
     let frem_r_override =
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
 
-    let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
+    let m3_active =
+        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
 
     // TTE Laplace correction: when the subject has TTE obs_records, we compute
     // the FD Hessian of the TTE data term w.r.t. η and add it to hrh inside
@@ -1077,7 +1078,8 @@ pub fn foce_subject_nll_iov(
     // The augmented system is now an ordinary FOCE/FOCEI marginal: κ is
     // integrated out through R̃ exactly like η, so no separate κ prior is
     // added (doing so would double-count the random-effect penalty).
-    let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
+    let m3_active =
+        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let p_obs_iov = if model.is_sde() {
         ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
     } else {

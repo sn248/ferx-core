@@ -281,6 +281,9 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- SAEM no longer automatically runs a FOCEI polish when a combined-error
+  additive sigma collapses; it now leaves the SAEM estimate unchanged and records
+  a warning that the additive component hit its lower bound (#420).
 - **IMPMAP default proposal is now a Student-t** (`impmap_proposal_df = 4`)
   instead of a multivariate normal. A Gaussian proposal's tails are lighter than
   the posterior of weakly-identified parameters, so importance weights blow up in
@@ -363,12 +366,6 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
-- SAEM combined-error fits now detect when the additive residual-error
-  component has collapsed onto its lower bound and apply a final
-  marginal-likelihood polish — kept only when it lowers the marginal OFV — so
-  the additive term is recovered when the marginal likelihood identifies a
-  non-zero value. Fits whose additive term converged normally are left
-  untouched (#267).
 - **IMPMAP warns instead of silently ignoring `impmap_sobol` under a Student-t
   proposal.** Sobol draws apply only to the multivariate-normal proposal; with
   the Student-t default `impmap_sobol = true` was a no-op. It now emits a warning

@@ -8,7 +8,7 @@
 ///   Phase 2 (convergence, k > K1):  γₖ = 1/(k−K1)   — almost-sure convergence to MLE
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{
-    compute_covariance, optimize_population, pop_nll, CovarianceStepResult, OuterResult,
+    compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
@@ -1093,60 +1093,6 @@ fn combined_additive_sigma_at_floor(model: &CompiledModel, params: &ModelParamet
         })
 }
 
-/// Apply the combined-error marginal polish (issue #267).
-///
-/// After SAEM, a final FOCEI marginal-likelihood optimization is run from the
-/// SAEM estimates. If the additive sigma stays pinned to its floor, the polish
-/// is retried from the model's initial parameters and the lower-OFV result is
-/// kept. The polish is adopted only when it strictly lowers the baseline
-/// marginal OFV `ofv`, so a polish that lands in a worse local optimum can
-/// never degrade the SAEM fit. On adoption, `final_params` and the EBE outputs
-/// are overwritten in place and the improved OFV is returned; otherwise `ofv`
-/// is returned unchanged.
-#[allow(clippy::too_many_arguments)]
-fn apply_combined_error_polish(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
-    options: &FitOptions,
-    ofv: f64,
-    final_params: &mut ModelParameters,
-    eta_hats: &mut Vec<DVector<f64>>,
-    h_matrices: &mut Vec<DMatrix<f64>>,
-    final_kappas: &mut Vec<Vec<DVector<f64>>>,
-    warnings: &mut Vec<String>,
-) -> f64 {
-    let mut polish_options = options.clone();
-    polish_options.run_covariance_step = false;
-    polish_options.verbose = false;
-    polish_options.optimizer = Optimizer::Bobyqa;
-    let mut polished = optimize_population(model, population, final_params, &polish_options);
-    if polished.ofv.is_finite() && combined_additive_sigma_at_floor(model, &polished.params) {
-        let restart = optimize_population(model, population, init_params, &polish_options);
-        if restart.ofv.is_finite() && restart.ofv < polished.ofv {
-            warnings.push(
-                "SAEM combined-error marginal polish restarted from initial parameters \
-                 because the additive sigma remained at its lower bound."
-                    .to_string(),
-            );
-            polished = restart;
-        }
-    }
-    // `OuterResult.ofv` is the marginal -2LL on the same scale as `ofv` (both
-    // `2 * pop_nll` under `options.interaction`), so adopt the polish only when
-    // it genuinely improves the marginal likelihood — never when it merely
-    // matches or lands in a worse local optimum.
-    if polished.ofv.is_finite() && polished.ofv < ofv {
-        warnings.extend(polished.warnings);
-        *final_params = polished.params;
-        *eta_hats = polished.eta_hats;
-        *h_matrices = polished.h_matrices;
-        *final_kappas = polished.kappas;
-        return polished.ofv;
-    }
-    ofv
-}
-
 /// Build (theta_idx, eta_idx) pairs for log-transformed mu-references only.
 ///
 /// Only `log_transformed = true` mu-refs (patterns `THETA*exp(ETA)` and
@@ -1564,7 +1510,6 @@ pub fn run_saem(
         } else {
             gamma
         };
-
         // Rebuild omega for this iteration
         let omega_k = OmegaMatrix::from_matrix(
             state.omega_mat.clone(),
@@ -2177,7 +2122,7 @@ pub fn run_saem(
         init_params.omega.eta_names.clone(),
         init_params.omega.diagonal,
     );
-    let mut final_params = ModelParameters {
+    let final_params = ModelParameters {
         theta: state.theta.clone(),
         theta_names: init_params.theta_names.clone(),
         theta_lower: init_params.theta_lower.clone(),
@@ -2210,20 +2155,10 @@ pub fn run_saem(
         kappa_fixed: init_params.kappa_fixed.clone(),
     };
 
-    // Only repair a combined-error fit when SAEM actually collapsed the additive
-    // component onto its lower bound. A fit that converged to a healthy non-zero
-    // ADD is left untouched — overriding it would pull the exact-marginal SAEM
-    // estimate back toward the (possibly Laplace-biased) FOCEI optimum for no
-    // reason.
-    //
-    // TODO: this polish is a safety net, not the root-cause fix. SAEM collapses
-    // ADD because the residual-error M-step uses point-η residuals instead of
-    // the spread of the sampled ηs, which systematically under-counts the
-    // low-concentration residual variance. The principled fix is to accumulate
-    // the residual sufficient statistic over the η samples; once that lands this
-    // gate can be removed. Tracked in #420.
-    let run_marginal_polish =
-        model.error_spec.has_combined() && combined_additive_sigma_at_floor(model, &final_params);
+    if combined_additive_sigma_at_floor(model, &final_params) {
+        warnings
+            .push("SAEM combined-error additive sigma collapsed to its lower bound.".to_string());
+    }
 
     // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----
     let warm_etas: Vec<DVector<f64>> = state
@@ -2232,7 +2167,7 @@ pub fn run_saem(
         .map(|e| DVector::from_column_slice(e))
         .collect();
     let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (mut eta_hats, mut h_matrices, _, mut final_kappas) = run_inner_loop_warm(
+    let (eta_hats, h_matrices, _, final_kappas) = run_inner_loop_warm(
         model,
         population,
         &final_params,
@@ -2244,10 +2179,7 @@ pub fn run_saem(
     );
 
     // ---- Final OFV via FOCE approximation (for AIC/BIC comparability) ----
-    // Baseline marginal -2LL from the SAEM warm-started EBEs. The combined-error
-    // polish below only replaces it when it strictly lowers this OFV, so a
-    // polish that lands in a worse local optimum can never degrade the SAEM fit.
-    let mut ofv = 2.0
+    let ofv = 2.0
         * pop_nll(
             model,
             population,
@@ -2257,21 +2189,6 @@ pub fn run_saem(
             &final_kappas,
             options.interaction,
         );
-
-    if run_marginal_polish {
-        ofv = apply_combined_error_polish(
-            model,
-            population,
-            init_params,
-            options,
-            ofv,
-            &mut final_params,
-            &mut eta_hats,
-            &mut h_matrices,
-            &mut final_kappas,
-            &mut warnings,
-        );
-    }
 
     // ---- Covariance step ----
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
@@ -2412,168 +2329,6 @@ mod tests {
         params.sigma_fixed[1] = false;
         model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
         assert!(!combined_additive_sigma_at_floor(&model, &params));
-    }
-
-    /// A tiny combined-error 1-cpt IV fixture (3 subjects, 3 obs each) used by
-    /// the combined-error polish tests below.
-    fn tiny_combined_fixture() -> (CompiledModel, Population) {
-        use crate::parser::model_parser::parse_model_string;
-        use std::collections::HashMap;
-
-        const COMBINED: &str = r#"
-[parameters]
-  theta TVCL(1.0, 0.1, 20.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.05
-  sigma PROP_ERR ~ 0.1 (sd)
-  sigma ADD_ERR  ~ 0.0005 (sd)
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ combined(PROP_ERR, ADD_ERR)
-"#;
-        let model = parse_model_string(COMBINED).expect("combined model parses");
-        let subjects = (0..3)
-            .map(|_| Subject {
-                id: "S1".into(),
-                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                obs_times: vec![1.0, 4.0, 8.0],
-                obs_raw_times: Vec::new(),
-                observations: vec![9.5, 6.4, 4.7],
-                obs_cmts: vec![1, 1, 1],
-                covariates: HashMap::new(),
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                cens: vec![0, 0, 0],
-                occasions: vec![1, 1, 1],
-                dose_occasions: vec![1],
-                fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
-                obs_records: vec![],
-            })
-            .collect();
-        let population = Population {
-            subjects,
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
-        (model, population)
-    }
-
-    /// Driving SAEM on the combined-error fixture (additive initialised at its
-    /// floor, proportional-dominated data) keeps `ADD` collapsed, so this
-    /// exercises the gated marginal-polish call site in `run_saem` end-to-end:
-    /// a finite OFV must come back and the model must report a combined error
-    /// spec (Tier-1: 2 SAEM iters/phase, no convergence loop).
-    #[test]
-    fn run_saem_combined_executes_marginal_polish() {
-        let (model, population) = tiny_combined_fixture();
-        assert!(model.error_spec.has_combined());
-
-        let opts = FitOptions {
-            method: EstimationMethod::Saem,
-            outer_maxiter: 3,
-            saem_n_exploration: 2,
-            saem_n_convergence: 2,
-            saem_seed: Some(267),
-            run_covariance_step: false,
-            verbose: false,
-            ..FitOptions::default()
-        };
-
-        let result = run_saem(&model, &population, &model.default_params, &opts)
-            .expect("SAEM run must succeed");
-        assert!(result.ofv.is_finite(), "SAEM produced a non-finite OFV");
-        assert_eq!(result.eta_hats.len(), population.subjects.len());
-        // Two free sigmas (PROP, ADD) survive the polish.
-        assert_eq!(result.params.sigma.values.len(), 2);
-    }
-
-    /// `apply_combined_error_polish` runs a fast FOCEI polish on a tiny
-    /// combined-error problem and adopts it only when it strictly lowers the
-    /// baseline marginal OFV. Drives both the adopt and reject branches
-    /// end-to-end (Tier-1: a handful of outer iterations, no convergence loop).
-    #[test]
-    fn apply_combined_error_polish_adopts_only_on_improvement() {
-        let (model, population) = tiny_combined_fixture();
-        assert!(model.error_spec.has_combined());
-
-        let opts = FitOptions {
-            method: EstimationMethod::Saem,
-            outer_maxiter: 5,
-            run_covariance_step: false,
-            verbose: false,
-            ..FitOptions::default()
-        };
-
-        let n = population.subjects.len();
-        let zero_eta = vec![DVector::<f64>::zeros(model.n_eta); n];
-        let zero_h = vec![DMatrix::<f64>::identity(model.n_eta, model.n_eta); n];
-        let zero_kappa: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n];
-
-        // Adopt branch: baseline OFV = +inf, so any finite polish strictly
-        // improves and overwrites the params/EBEs.
-        let mut params = model.default_params.clone();
-        let mut eta = zero_eta.clone();
-        let mut h = zero_h.clone();
-        let mut kappa = zero_kappa.clone();
-        let mut warnings = Vec::new();
-        let improved = apply_combined_error_polish(
-            &model,
-            &population,
-            &model.default_params,
-            &opts,
-            f64::INFINITY,
-            &mut params,
-            &mut eta,
-            &mut h,
-            &mut kappa,
-            &mut warnings,
-        );
-        assert!(improved.is_finite(), "polish must yield a finite OFV");
-        assert!(improved < f64::INFINITY);
-        assert_eq!(eta.len(), n, "EBEs replaced for every subject");
-
-        // Reject branch: baseline OFV = -inf can never be beaten, so the polish
-        // is discarded and the inputs are returned untouched.
-        let mut params2 = model.default_params.clone();
-        let mut eta2 = zero_eta.clone();
-        let mut h2 = zero_h.clone();
-        let mut kappa2 = zero_kappa.clone();
-        let mut warnings2 = Vec::new();
-        let unchanged = apply_combined_error_polish(
-            &model,
-            &population,
-            &model.default_params,
-            &opts,
-            f64::NEG_INFINITY,
-            &mut params2,
-            &mut eta2,
-            &mut h2,
-            &mut kappa2,
-            &mut warnings2,
-        );
-        assert_eq!(
-            unchanged,
-            f64::NEG_INFINITY,
-            "a worse polish must not be adopted"
-        );
-        assert_eq!(
-            params2.sigma.values, model.default_params.sigma.values,
-            "rejected polish must leave params untouched"
-        );
     }
 
     #[test]

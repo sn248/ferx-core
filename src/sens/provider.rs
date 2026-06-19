@@ -412,6 +412,14 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if model.n_kappa == 0 || model.ode_spec.is_some() {
         return false;
     }
+    // M3 BLOQ: the IOV objective promotes M3 to the interaction (censored) marginal
+    // (`foce_subject_nll_iov`), but the IOV analytic gradient assembly carries no
+    // censored-row term — it would differentiate a different function than it
+    // minimises. Route IOV+M3 to the FD/Laplace path until the censored IOV
+    // gradient lands. (Non-IOV M3 is fully analytic.)
+    if matches!(model.bloq_method, crate::types::BloqMethod::M3) {
+        return false;
+    }
     if !matches!(
         model.pk_model,
         PkModel::OneCptIv
@@ -463,6 +471,11 @@ pub fn subject_sensitivities_iov(
     // that a mid-record reset contradicts, so a subject mixing SS with resets
     // falls back to FD — mirroring the non-IOV provider.
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
+        return None;
+    }
+    // Modeled-duration doses (`RATE=-2`) are read unresolved here; route to FD
+    // (mirrors the non-IOV provider gate).
+    if !subject.all_doses_fixed() {
         return None;
     }
 
@@ -1196,6 +1209,13 @@ fn subject_eta_grad_impl(
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
+    // Modeled-duration doses (`RATE=-2` → `D{cmt}`) resolve `rate`/`duration` from
+    // the PK params in the prediction path; the provider iterates `subject.doses`
+    // directly, so the unresolved dose would be a bolus/zero-input surrogate. Route
+    // these to FD until the resolved-duration sensitivity lands.
+    if !subject.all_doses_fixed() {
+        return None;
+    }
     // The light first-order provider uses the superposition kernels, which don't
     // carry the oral-infusion forced responses (#350/#400); the full provider
     // routes those subjects through the walk, but here we fall back to the FD inner
@@ -1569,6 +1589,14 @@ fn subject_sensitivities_impl(
         return None;
     }
     if !analytical_supported(model) {
+        return None;
+    }
+    // Modeled-duration doses (`RATE=-2` → `D{cmt}`) resolve `rate`/`duration` from
+    // the PK params in the prediction path; the provider reads `subject.doses`
+    // directly, so the unresolved dose would be a bolus/zero-input surrogate. Route
+    // to FD (matches the early gate in `subject_eta_grad_impl`, so the inner
+    // gradient and Jacobian stay on the same scope).
+    if !subject.all_doses_fixed() {
         return None;
     }
     // Time-varying covariates make the PK parameters switch mid-decay, which dose
@@ -2614,6 +2642,27 @@ mod tests {
         let infusion = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0), &times);
         check_provider_vs_production(&m, &bolus, &theta, &eta);
         check_provider_vs_production(&m, &infusion, &theta, &eta);
+    }
+
+    /// Regression: a modeled-duration dose (`RATE=-2` → `D{cmt}`) is read with
+    /// unresolved `rate`/`duration` by the provider, so the analytic path must
+    /// decline (→ FD) rather than optimize a bolus/zero-input surrogate.
+    #[test]
+    fn provider_modeled_duration_dose_falls_back_to_fd() {
+        let iv = parse_model_string(TWOCPT_IV).expect("parse");
+        let mut dose = DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0);
+        dose.rate_mode = crate::types::RateMode::ModeledDuration;
+        let subj = subject_with_dose(dose, &[0.5, 2.0, 6.0]);
+        let theta = vec![10.0, 50.0, 15.0, 100.0];
+        let eta = vec![0.1, -0.05];
+        assert!(
+            subject_eta_grad(&iv, &subj, &theta, &eta).is_none(),
+            "modeled-duration dose must fall back to FD (light provider)"
+        );
+        assert!(
+            subject_sensitivities(&iv, &subj, &theta, &eta).is_none(),
+            "modeled-duration dose must fall back to FD (full provider)"
+        );
     }
 
     #[test]

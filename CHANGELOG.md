@@ -314,6 +314,14 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **IMP/IMPMAP no longer freeze the typical value of a mu-referenced parameter
+  with negligible IIV**: a log-mu-referenced θ (e.g. `KA = TVKA*exp(ETA_KA)`)
+  whose random effect has a tiny, often `FIX`ed ω was updated only through the
+  closed-form `log θ += mean(η)` shift — which is ≈ 0 when the η carries no
+  variance, leaving the typical value stuck at its initial value. Such
+  parameters are now routed to the weighted-likelihood M-step (the channel that
+  estimates σ and non-mu-ref θ), so the data can move them; a warning names any
+  parameter routed this way. Makes the estimate init-independent (#411).
 - **FREM IMP/IMPMAP marginal −2 log L over-counted by a 2π constant**: the
   Rao-Blackwellised covariate-data marginal included the covariate pseudo-obs
   `nc·ln(2π)` normalizer, which the rest of the objective (and NONMEM's

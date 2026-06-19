@@ -512,7 +512,37 @@ fn run_mcem(
     }
 
     let mu_ref_pairs = mu_ref_log_pairs(model);
-    let use_closed_form = !mu_ref_pairs.is_empty();
+    // A log-mu-referenced typical value is updated only through the closed-form
+    // `log θ += mean(η)` shift. When its paired η carries negligible IIV (a tiny,
+    // often `FIX`ed ω — e.g. a structural parameter given a dummy random effect
+    // so it can be mu-referenced), that population mean is ≈ 0 and the typical
+    // value would be frozen at its initial value (#411). Route those pairs to the
+    // weighted-likelihood M-step instead (the same channel that estimates σ and
+    // non-mu-ref θ), where the data can actually move them. Decided once from the
+    // initial Ω so a parameter never toggles channels between iterations.
+    const WEAK_IIV_VAR: f64 = 1e-3;
+    let weak_mu_ref: std::collections::HashSet<usize> = mu_ref_pairs
+        .iter()
+        .filter(|&&(_t, e)| init_params.omega.matrix[(e, e)] < WEAK_IIV_VAR)
+        .map(|&(t, _e)| t)
+        .collect();
+    if !weak_mu_ref.is_empty() {
+        let mut names: Vec<&str> = weak_mu_ref
+            .iter()
+            .map(|&t| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
+            .collect();
+        names.sort_unstable();
+        warnings.push(format!(
+            "{label}: typical value(s) {} are log-mu-referenced but their random effect has \
+             negligible variance (ω < {WEAK_IIV_VAR:.0e}); the mu-ref mean-shift carries no \
+             information, so they are estimated through the weighted M-step instead.",
+            names.join(", ")
+        ));
+    }
+    // Closed-form mu-ref shift is used as long as at least one pair has real IIV.
+    let use_closed_form = mu_ref_pairs
+        .iter()
+        .any(|&(t, _e)| !weak_mu_ref.contains(&t));
     if !use_closed_form {
         // No log-mu-ref parameter: every typical value goes through the weighted
         // M-step, which cannot resolve the θ/η-mean confounding on its own. Flag
@@ -809,6 +839,11 @@ fn run_mcem(
         let mut mstep_theta_upper = log_theta_upper.clone();
         if use_closed_form {
             for &(t, _e) in &mu_ref_pairs {
+                // Weak-IIV mu-ref θ are estimated by this M-step, not the shift,
+                // so leave their bounds free here.
+                if weak_mu_ref.contains(&t) {
+                    continue;
+                }
                 mstep_theta_lower[t] = log_theta[t];
                 mstep_theta_upper[t] = log_theta[t];
             }
@@ -844,6 +879,11 @@ fn run_mcem(
                 *acc /= n_subjects as f64;
             }
             for &(t, e) in &mu_ref_pairs {
+                // Weak-IIV mu-ref θ were already updated by the weighted M-step;
+                // their η-mean shift is ≈ 0 and uninformative — skip it.
+                if weak_mu_ref.contains(&t) {
+                    continue;
+                }
                 log_theta[t] =
                     (log_theta[t] + eta_bar[e]).clamp(log_theta_lower[t], log_theta_upper[t]);
             }

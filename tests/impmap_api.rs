@@ -7,6 +7,7 @@
 
 use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
+use std::io::Write;
 use std::path::Path;
 
 fn warfarin_setup() -> (
@@ -80,6 +81,77 @@ fn impmap_standalone_produces_finite_estimates() {
         "marginal MC SE must be finite & non-negative, got {}",
         is.mc_standard_error
     );
+}
+
+/// A log-mu-referenced typical value whose paired η has negligible IIV (tiny
+/// `FIX`ed ω) must still be estimated: IMPMAP routes it to the weighted M-step
+/// instead of the closed-form `log θ += mean(η)` shift, which would freeze it at
+/// its initial value (#411). Guards both that the routing warning fires and that
+/// the typical value actually moves off a deliberately-wrong init.
+#[test]
+fn impmap_estimates_mu_ref_param_with_negligible_iiv() {
+    // KA carries a near-zero FIXed ω, so without routing its typical value would
+    // be frozen at the (deliberately low) init of 0.5.
+    const KA_INIT: f64 = 0.5;
+    let model_src = format!(
+        r#"
+[parameters]
+  theta TVCL(0.13, 0.001, 10)
+  theta TVV(8.0, 0.1, 100)
+  theta TVKA({KA_INIT}, 0.01, 50)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 1e-8 FIX
+  sigma PROP ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  method = importance_sampling_map
+"#
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mpath = tmp.path().join("ka_weak.ferx");
+    std::fs::File::create(&mpath)
+        .unwrap()
+        .write_all(model_src.as_bytes())
+        .unwrap();
+    let model = parse_model_file(&mpath).expect("model must parse");
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::Impmap;
+    opts.run_covariance_step = false;
+    opts.impmap_iterations = 25;
+    opts.impmap_samples = 200;
+    opts.impmap_seed = Some(7);
+
+    let r = fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP fit must succeed");
+
+    // The routing warning must fire and name TVKA.
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("TVKA") && w.contains("negligible variance")),
+        "expected a negligible-IIV routing warning for TVKA, got {:?}",
+        r.warnings
+    );
+    // TVKA must have moved off its frozen init (warfarin's true KA ≈ 1+).
+    let tvka = r.theta[r
+        .theta_names
+        .iter()
+        .position(|n| n == "TVKA")
+        .expect("TVKA present")];
+    assert!(
+        (tvka - KA_INIT).abs() > 0.1,
+        "TVKA must be estimated off its init {KA_INIT} (was frozen?), got {tvka}"
+    );
+    assert!(tvka.is_finite() && tvka > 0.0);
 }
 
 #[test]

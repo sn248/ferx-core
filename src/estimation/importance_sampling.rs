@@ -12,7 +12,7 @@
 //! (sparse-data PK, strong nonlinearity).
 //!
 //! The kernel is rayon-parallel over subjects; per-subject RNGs are seeded
-//! from `options.is_seed.wrapping_add(i as u64)` so the result is
+//! from `options.imp_seed.wrapping_add(i as u64)` so the result is
 //! deterministic for a given seed.
 //!
 //! ## IOV (v2: joint sampling)
@@ -227,17 +227,17 @@ pub fn run_importance_sampling(
     }
 
     let n_eta = model.n_eta;
-    let k_samples = options.is_samples;
-    let nu = options.is_proposal_df;
-    let seed = options.is_seed.unwrap_or(42);
-    let threshold = options.is_low_ess_threshold;
+    let k_samples = options.imp_samples;
+    let nu = options.imp_proposal_df;
+    let seed = options.imp_seed.unwrap_or(42);
+    let threshold = options.imp_low_ess_threshold;
     let cancel = &options.cancel;
 
     if k_samples < 2 {
-        return Err(format!("IS: is_samples must be >= 2, got {}", k_samples));
+        return Err(format!("IS: imp_samples must be >= 2, got {}", k_samples));
     }
     if nu < 1.0 {
-        return Err(format!("IS: is_proposal_df must be >= 1.0, got {}", nu));
+        return Err(format!("IS: imp_proposal_df must be >= 1.0, got {}", nu));
     }
 
     let kappa_treatment = if model.n_kappa > 0 {

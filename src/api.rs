@@ -899,7 +899,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
 
     // `imp` may appear at most once in a chain. By default it is an MCEM
     // estimator (NONMEM `METHOD=IMP`) and may sit anywhere in the chain. With
-    // `is_eval_only = true` (NONMEM `IMP EONLY=1`) it instead evaluates the
+    // `imp_eval_only = true` (NONMEM `IMP EONLY=1`) it instead evaluates the
     // marginal −2 log L at fixed parameters and must be the terminal stage —
     // placing an evaluator mid-chain would leave `FitResult.importance_sampling`
     // computed at parameters the following stage then overwrites.
@@ -917,14 +917,14 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-        if options.is_eval_only && chain.last().copied() != Some(EstimationMethod::Imp) {
+        if options.imp_eval_only && chain.last().copied() != Some(EstimationMethod::Imp) {
             diags.push(
                 Diagnostic::error(
                     "E_IMP_CHAIN",
-                    "method `imp` with `is_eval_only = true` must be the final stage of the chain \
+                    "method `imp` with `imp_eval_only = true` must be the final stage of the chain \
                      — placing the evaluator mid-chain would leave `FitResult.importance_sampling` \
                      populated with a log-likelihood computed at parameters that the following \
-                     stage then overwrites. Move `imp` to the end, or drop `is_eval_only` to run \
+                     stage then overwrites. Move `imp` to the end, or drop `imp_eval_only` to run \
                      it as an estimator.",
                 )
                 .with_block("fit_options"),
@@ -2811,13 +2811,13 @@ fn fit_inner(
             );
         }
 
-        // IMP evaluation-only stage (`is_eval_only`, NONMEM `IMP EONLY=1`): not an
+        // IMP evaluation-only stage (`imp_eval_only`, NONMEM `IMP EONLY=1`): not an
         // estimator. Consumes the previous stage's params / EBEs / Hessians,
         // writes its result to `is_result`, and skips the params/result update at
         // the bottom of the loop so the preceding stage's `OuterResult` continues
         // to be the canonical one. The default estimating IMP path is handled by
         // the `EstimationMethod::Imp` arm of the `match method` below.
-        if method == EstimationMethod::Imp && stage_opts.is_eval_only {
+        if method == EstimationMethod::Imp && stage_opts.imp_eval_only {
             // Standalone IMP (no preceding estimator): evaluate the EBEs/Hessians
             // at the initial parameters so IMP can report the −2 log L there.
             // This synthetic stage also becomes the canonical `OuterResult` so
@@ -2905,7 +2905,7 @@ fn fit_inner(
                         let msg = format!(
                             "IMP: {} subject(s) had ESS = 0 (proposal collapse): {}. \
                              The reported MC SE is inflated by ~1 per collapsed subject; \
-                             consider raising `is_samples` or `is_proposal_df`, \
+                             consider raising `imp_samples` or `imp_proposal_df`, \
                              or check the EBE/Hessian quality of these subjects.",
                             collapsed.len(),
                             preview
@@ -2955,7 +2955,7 @@ fn fit_inner(
             }
             EstimationMethod::Imp => {
                 // Estimating IMP (NONMEM `METHOD=IMP`). The evaluation-only path
-                // (`is_eval_only`) is handled by the IMP branch above and never
+                // (`imp_eval_only`) is handled by the IMP branch above and never
                 // reaches here. Warm-start from the preceding stage's EBEs when
                 // chained (e.g. [saem, imp]).
                 let warm = result.as_ref().map(|r| r.eta_hats.as_slice());
@@ -2995,20 +2995,20 @@ fn fit_inner(
         if is_last && matches!(method, EstimationMethod::Imp | EstimationMethod::Impmap) {
             let r = result.as_ref().expect("stage result was just set");
             let mut marg_opts = stage_opts.clone();
-            // `run_importance_sampling` reads the `is_*` knobs; for IMPMAP map the
+            // `run_importance_sampling` reads the `imp_*` knobs; for IMPMAP map the
             // `impmap_*` knobs onto them so the final eval mirrors the method's
             // own sample count / proposal df / seed.
             if method == EstimationMethod::Impmap {
-                marg_opts.is_samples = stage_opts.impmap_samples;
-                marg_opts.is_seed = stage_opts.impmap_seed;
-                marg_opts.is_low_ess_threshold = stage_opts.impmap_low_ess_threshold;
+                marg_opts.imp_samples = stage_opts.impmap_samples;
+                marg_opts.imp_seed = stage_opts.impmap_seed;
+                marg_opts.imp_low_ess_threshold = stage_opts.impmap_low_ess_threshold;
                 // A Gaussian IMPMAP proposal (`impmap_proposal_df = ∞`, opt-in)
                 // cannot be sampled by the finite-t IS evaluator. The marginal is
                 // proposal-independent in expectation, so fall back to a finite-t
                 // eval proposal (heavier tails ⇒ bounded weights). The default
                 // `impmap_proposal_df = 4` passes through unchanged.
                 let df = stage_opts.impmap_proposal_df;
-                marg_opts.is_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
+                marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
             }
             match crate::estimation::importance_sampling::run_importance_sampling(
                 model,
@@ -3295,7 +3295,7 @@ fn fit_inner(
     );
 
     // `final_method` reports the last *estimating* stage. An evaluation-only IMP
-    // (`is_eval_only`) doesn't produce parameters, so a chain like `[saem, imp]`
+    // (`imp_eval_only`) doesn't produce parameters, so a chain like `[saem, imp]`
     // surfaces as `method = SAEM`. Estimating IMP (the default) does produce
     // parameters and is reported like any other estimator. The full chain is
     // preserved in `method_chain`.
@@ -3303,7 +3303,7 @@ fn fit_inner(
         .iter()
         .rev()
         .copied()
-        .find(|&m| !(m == EstimationMethod::Imp && options.is_eval_only))
+        .find(|&m| !(m == EstimationMethod::Imp && options.imp_eval_only))
         .unwrap_or(*chain.last().expect("chain non-empty"));
     let grad_inner =
         crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, model);
@@ -3540,7 +3540,7 @@ fn fit_inner(
         multi_start_seed: options.multi_start_seed,
         saem_seed: options.saem_seed,
         sir_seed: options.sir_seed,
-        is_seed: options.is_seed,
+        imp_seed: options.imp_seed,
         // Record the *resolved* NPDE seed (default included) so the diagnostic
         // is reproducible from the output; `None` when NPDE did not run.
         npde_seed: if options.npde_nsim > 0 {
@@ -5463,11 +5463,11 @@ mod iov_integration {
         let pop = make_iov_population();
         let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
         opts.methods = vec![EstimationMethod::Foce, EstimationMethod::Imp];
-        opts.is_samples = 200; // keep the per-subject sampling cheap
-        opts.is_seed = Some(42); // deterministic proposal draws
-                                 // The IS IOV branch is the evaluation-only path; the estimating IMP
-                                 // M-step does not yet support IOV (refused up front).
-        opts.is_eval_only = true;
+        opts.imp_samples = 200; // keep the per-subject sampling cheap
+        opts.imp_seed = Some(42); // deterministic proposal draws
+                                  // The IS IOV branch is the evaluation-only path; the estimating IMP
+                                  // M-step does not yet support IOV (refused up front).
+        opts.imp_eval_only = true;
         let result = fit(&model, &pop, &model.default_params, &opts);
         assert!(
             result.is_ok(),
@@ -6644,7 +6644,7 @@ mod simulate_with_uncertainty_tests {
             multi_start_seed: None,
             saem_seed: None,
             sir_seed: None,
-            is_seed: None,
+            imp_seed: None,
             npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 0,

@@ -199,28 +199,28 @@ See [SIR documentation](../estimation/sir.md) for details.
 
 By **default** `imp` is a Monte-Carlo EM **estimator** (NONMEM `METHOD=IMP`):
 it maximises the importance-sampled marginal likelihood, updating θ/Ω/σ each
-iteration. Set `is_eval_only = true` (NONMEM `EONLY=1`) to instead *evaluate*
+iteration. Set `imp_eval_only = true` (NONMEM `EONLY=1`) to instead *evaluate*
 the marginal `−2 log L` at the fixed input parameters — a lower-bias `−2 log L`
 than the FOCE/Laplace OFV when subject posteriors of η are non-Gaussian (e.g.
 sparsely-sampled PK).
 
 > **Behaviour change:** `imp` previously only *evaluated* `−2 log L`. It now
-> estimates by default. Add `is_eval_only = true` to recover the old behaviour.
+> estimates by default. Add `imp_eval_only = true` to recover the old behaviour.
 
 ```
 [fit_options]
   method        = imp            # estimate (NONMEM METHOD=IMP)
-  is_iterations = 200
-  is_samples    = 1000
-  is_averaging  = 50
-  is_proposal_df = 5             # or `normal` for a multivariate-normal proposal
-  is_seed       = 12345
+  imp_iterations = 200
+  imp_samples    = 1000
+  imp_averaging  = 50
+  imp_proposal_df = 5             # or `normal` for a multivariate-normal proposal
+  imp_seed       = 12345
 ```
 
 ```
 [fit_options]
   method        = [focei, imp]   # evaluate FOCEI's fit (NONMEM EONLY=1)
-  is_eval_only  = true
+  imp_eval_only  = true
 ```
 
 > On **rich** data prefer [`impmap`](#impmap-importance_sampling_map) or
@@ -230,14 +230,14 @@ sparsely-sampled PK).
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `is_eval_only` | `false` | `true` ⇒ evaluate `−2 log L` at fixed parameters (NONMEM `EONLY=1`); must be the terminal chain stage. `false` ⇒ estimate (NONMEM `METHOD=IMP`). |
-| `is_iterations` | `200` | MCEM iterations (estimator only). |
-| `is_averaging` | `50` | Terminal iterations averaged into the reported estimate (estimator only). |
-| `is_samples` | `1000` | Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE. |
-| `is_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1), or `normal`/`mvn` for a multivariate-normal proposal. Lower = heavier tails. |
-| `is_auto` | `true` | Adaptive sample count (NONMEM `AUTO`). When `true`, `is_samples` is the *starting* count and is ramped up (×2/iteration, cap 10000) while the objective's Monte-Carlo SE exceeds 1.0. Recommended for high-dimensional / FREM models, where a fixed count biases the M-step. |
-| `is_seed` | `12345` | RNG seed. Same seed → identical result. |
-| `is_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction get flagged in the result. Set `0` to silence. |
+| `imp_eval_only` | `false` | `true` ⇒ evaluate `−2 log L` at fixed parameters (NONMEM `EONLY=1`); must be the terminal chain stage. `false` ⇒ estimate (NONMEM `METHOD=IMP`). |
+| `imp_iterations` | `200` | MCEM iterations (estimator only). |
+| `imp_averaging` | `50` | Terminal iterations averaged into the reported estimate (estimator only). |
+| `imp_samples` | `1000` | Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE. |
+| `imp_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1), or `normal`/`mvn` for a multivariate-normal proposal. Lower = heavier tails. |
+| `imp_auto` | `true` | Adaptive sample count (NONMEM `AUTO`). When `true`, `imp_samples` is the *starting* count and is ramped up (×2/iteration, cap 10000) while the objective's Monte-Carlo SE exceeds 1.0. Recommended for high-dimensional / FREM models, where a fixed count biases the M-step. |
+| `imp_seed` | `12345` | RNG seed. Same seed → identical result. |
+| `imp_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction get flagged in the result. Set `0` to silence. |
 
 See [Importance Sampling documentation](../estimation/importance-sampling.md)
 for the algorithm, the NONMEM mapping, IOV caveats, and tuning guidance.

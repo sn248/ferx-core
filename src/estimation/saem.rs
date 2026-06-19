@@ -1106,9 +1106,15 @@ pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) 
     // HMC is BSV-only (`hmc_step` and the AD NLL/gradient are kappa-unaware), so
     // it is disabled for IOV models (`n_kappa > 0`); those subjects use the MH
     // kernels, whose acceptance targets the IOV conditional p(η | κ, θ, data).
+    // IIV on residual error (#409) also disables HMC: the autodiff kernel has no
+    // `exp(2·η_ruv)` variance-scaling rule, so these models fall back to MH (same
+    // gate as [`run_saem`]).
     #[cfg(feature = "autodiff")]
-    let using_hmc =
-        n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && model.n_kappa == 0;
+    let using_hmc = n_leapfrog > 0
+        && model.ode_spec.is_none()
+        && model.tv_fn.is_some()
+        && model.n_kappa == 0
+        && model.residual_error_eta.is_none();
     #[cfg(not(feature = "autodiff"))]
     let using_hmc = {
         let _ = model;
@@ -1166,10 +1172,21 @@ pub fn run_saem(
     // `n_leapfrog > 0` would propose eta against the kappa-free posterior and
     // hand a BSV-only NLL to the componentwise kernel as its (mismatched)
     // acceptance baseline.
+    //
+    // IIV on residual error (#409): the autodiff NLL/gradient kernels build the
+    // residual variance from σ alone and carry no `exp(2·η_ruv)` scaling rule,
+    // so an HMC E-step would sample η against the unscaled conditional — η_ruv
+    // sees no data curvature and collapses toward the prior. Disable HMC for
+    // these models so the (correctly-scaled) MH kernels run instead (mirrors
+    // `inner_optimizer::analytical_ad_unsupported`).
     let using_hmc: bool = {
         #[cfg(feature = "autodiff")]
         {
-            n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && n_kappa == 0
+            n_leapfrog > 0
+                && model.ode_spec.is_none()
+                && model.tv_fn.is_some()
+                && n_kappa == 0
+                && model.residual_error_eta.is_none()
         }
         #[cfg(not(feature = "autodiff"))]
         false
@@ -1194,6 +1211,9 @@ pub fn run_saem(
         // keys on it to tag this as an Info/gradient_fallback warning.
         let reason = if n_kappa > 0 {
             "HMC is unavailable for IOV models (it is kappa-unaware)"
+        } else if model.residual_error_eta.is_some() {
+            "HMC is unavailable with IIV on residual error (iiv_on_ruv) — the autodiff \
+             kernel has no exp(2·η_ruv) variance-scaling rule"
         } else {
             "HMC is unavailable (requires `autodiff` feature and analytical PK model)"
         };

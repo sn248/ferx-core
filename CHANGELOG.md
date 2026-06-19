@@ -347,6 +347,9 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- SAEM combined-error fits now apply a final marginal-likelihood polish so the
+  additive residual-error component no longer collapses to the lower bound when
+  FOCEI identifies a non-zero additive term (#267).
 - **IMPMAP warns instead of silently ignoring `impmap_sobol` under a Student-t
   proposal.** Sobol draws apply only to the multivariate-normal proposal; with
   the Student-t default `impmap_sobol = true` was a no-op. It now emits a warning

@@ -8,7 +8,7 @@
 ///   Phase 2 (convergence, k > K1):  γₖ = 1/(k−K1)   — almost-sure convergence to MLE
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{
-    compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
+    compute_covariance, optimize_population, pop_nll, CovarianceStepResult, OuterResult,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
@@ -1067,6 +1067,51 @@ fn obs_nll_sum_iov(
         .sum()
 }
 
+fn error_spec_has_combined(error_spec: &ErrorSpec) -> bool {
+    match error_spec {
+        ErrorSpec::Single(em) => matches!(em, ErrorModel::Combined),
+        ErrorSpec::PerCmt(map) => map
+            .values()
+            .any(|endpoint| matches!(endpoint.error_model, ErrorModel::Combined)),
+    }
+}
+
+fn combined_additive_sigma_indices(error_spec: &ErrorSpec) -> Vec<usize> {
+    match error_spec {
+        ErrorSpec::Single(ErrorModel::Combined) => vec![1],
+        ErrorSpec::Single(_) => Vec::new(),
+        ErrorSpec::PerCmt(map) => {
+            let mut out = Vec::new();
+            for endpoint in map.values() {
+                if matches!(endpoint.error_model, ErrorModel::Combined) {
+                    if let Some(&idx) = endpoint.sigma_idx.get(1) {
+                        if !out.contains(&idx) {
+                            out.push(idx);
+                        }
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+fn combined_additive_sigma_at_floor(model: &CompiledModel, params: &ModelParameters) -> bool {
+    const SIGMA_FLOOR_NEAR: f64 = 1.0e-3;
+    combined_additive_sigma_indices(&model.error_spec)
+        .into_iter()
+        .any(|idx| {
+            !params.sigma_fixed.get(idx).copied().unwrap_or(false)
+                && params
+                    .sigma
+                    .values
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(f64::INFINITY)
+                    <= SIGMA_FLOOR_NEAR
+        })
+}
+
 /// Build (theta_idx, eta_idx) pairs for log-transformed mu-references only.
 ///
 /// Only `log_transformed = true` mu-refs (patterns `THETA*exp(ETA)` and
@@ -2097,7 +2142,7 @@ pub fn run_saem(
         init_params.omega.eta_names.clone(),
         init_params.omega.diagonal,
     );
-    let final_params = ModelParameters {
+    let mut final_params = ModelParameters {
         theta: state.theta.clone(),
         theta_names: init_params.theta_names.clone(),
         theta_lower: init_params.theta_lower.clone(),
@@ -2130,6 +2175,8 @@ pub fn run_saem(
         kappa_fixed: init_params.kappa_fixed.clone(),
     };
 
+    let run_marginal_polish = error_spec_has_combined(&model.error_spec);
+
     // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----
     let warm_etas: Vec<DVector<f64>> = state
         .etas
@@ -2137,7 +2184,7 @@ pub fn run_saem(
         .map(|e| DVector::from_column_slice(e))
         .collect();
     let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _, final_kappas) = run_inner_loop_warm(
+    let (mut eta_hats, mut h_matrices, _, mut final_kappas) = run_inner_loop_warm(
         model,
         population,
         &final_params,
@@ -2147,6 +2194,32 @@ pub fn run_saem(
         Some(&saem_final_mu_k),
         0, // SAEM: no EBE convergence tracking
     );
+
+    if run_marginal_polish {
+        let mut polish_options = options.clone();
+        polish_options.run_covariance_step = false;
+        polish_options.verbose = false;
+        polish_options.optimizer = Optimizer::Bobyqa;
+        let mut polished = optimize_population(model, population, &final_params, &polish_options);
+        if polished.ofv.is_finite() && combined_additive_sigma_at_floor(model, &polished.params) {
+            let restart = optimize_population(model, population, init_params, &polish_options);
+            if restart.ofv.is_finite() && restart.ofv < polished.ofv {
+                warnings.push(
+                    "SAEM combined-error marginal polish restarted from initial parameters \
+                     because the additive sigma remained at its lower bound."
+                        .to_string(),
+                );
+                polished = restart;
+            }
+        }
+        if polished.ofv.is_finite() {
+            warnings.extend(polished.warnings);
+            final_params = polished.params;
+            eta_hats = polished.eta_hats;
+            h_matrices = polished.h_matrices;
+            final_kappas = polished.kappas;
+        }
+    }
 
     // ---- Final OFV via FOCE approximation (for AIC/BIC comparability) ----
     let ofv = 2.0

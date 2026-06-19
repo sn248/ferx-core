@@ -138,9 +138,16 @@ Target acceptance rates: 40% for the block MH kernel, 44% for the componentwise 
 After the SAEM iterations complete:
 
 1. **EBE Refinement**: Run the standard FOCE inner loop (BFGS optimization) warm-started from the SAEM ETAs to obtain final empirical Bayes estimates
-2. **FOCE OFV**: Compute the objective function using the FOCE/Laplace approximation, so AIC and BIC are directly comparable with FOCE results
-3. **Covariance Step**: Optionally compute standard errors via finite-difference Hessian (same method as FOCE)
-4. **Diagnostics**: Compute PRED, IPRED, CWRES, IWRES for each subject
+2. **Combined-error marginal polish**: for `combined(PROP, ADD)` residual-error
+   models, run a final FOCEI marginal-likelihood polish from the SAEM estimates.
+   If the additive component remains at its lower bound, ferx retries that
+   polish from the model's initial parameters and keeps the lower marginal OFV.
+   This prevents point-η SAEM M-steps from overfitting the low-concentration
+   tail and collapsing `ADD` when the marginal likelihood identifies a non-zero
+   additive term.
+3. **FOCE OFV**: Compute the objective function using the FOCE/Laplace approximation, so AIC and BIC are directly comparable with FOCE results
+4. **Covariance Step**: Optionally compute standard errors via finite-difference Hessian (same method as FOCE)
+5. **Diagnostics**: Compute PRED, IPRED, CWRES, IWRES for each subject
 
 For sparsely-sampled data where the Laplace OFV is biased, you can
 append an importance-sampling stage that estimates `−2 log L` by Monte

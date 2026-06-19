@@ -36,6 +36,17 @@ use super::three_cpt::{
     three_cpt_oral_g, three_cpt_oral_ss_g,
 };
 
+/// The three eigenvalue gaps `(α−β, α−γ, β−γ)` as jets — the `1/Δ` factors every
+/// 3-cpt coefficient formula divides by. Hoisted out of the per-kernel bodies.
+#[inline]
+fn eigen_gaps<const N: usize>(
+    alpha: Jet<N>,
+    beta: Jet<N>,
+    gamma: Jet<N>,
+) -> (Jet<N>, Jet<N>, Jet<N>) {
+    (alpha.sub(beta), alpha.sub(gamma), beta.sub(gamma))
+}
+
 /// First/second derivatives of the cubic root `λ` (given its value) by implicit
 /// differentiation of `p(λ)=λ³−e₁λ²+e₂λ−e₃=0`, over the `N`-axis layout
 /// `[CL,V1,Q2,V2,Q3,V3, …]` (oral uses `N=8` with `KA,F` on axes 6,7, which the
@@ -186,9 +197,7 @@ pub fn iv_bolus_explicit(
     // Coefficients: A = d(α−k21)(α−k31)/[(α−β)(α−γ)], etc., d = amt/V1.
     let d = over_v1(amt, v1);
 
-    let ab = alpha.sub(beta);
-    let ag = alpha.sub(gamma);
-    let bg = beta.sub(gamma);
+    let (ab, ag, bg) = eigen_gaps(alpha, beta, gamma);
 
     let a = d
         .mul(alpha.sub(k21))
@@ -260,9 +269,7 @@ pub fn infusion_explicit(
     }
 
     let rv = over_v1(rate, v1);
-    let ab = alpha.sub(beta);
-    let ag = alpha.sub(gamma);
-    let bg = beta.sub(gamma);
+    let (ab, ag, bg) = eigen_gaps(alpha, beta, gamma);
 
     // a = rv(α−k21)(α−k31)/[(α−β)(α−γ)·α], etc.; denom_b = −(α−β)(β−γ)·β.
     let a_coeff = rv
@@ -362,9 +369,7 @@ pub fn oral_explicit(
     // coeff = f_bio·amt·ka/V1.
     let coeff = over_v1::<8>(amt, v1).mul(f_j).mul(ka_j);
 
-    let ab = alpha.sub(beta);
-    let ag = alpha.sub(gamma);
-    let bg = beta.sub(gamma);
+    let (ab, ag, bg) = eigen_gaps(alpha, beta, gamma);
     let a = alpha.sub(k21).mul(alpha.sub(k31)).mul(ab.mul(ag).recip());
     let b = beta
         .sub(k21)
@@ -438,9 +443,7 @@ pub fn iv_bolus_ss_explicit(
         _ => return fallback(),
     };
     let d = over_v1::<6>(amt, v1);
-    let ab = alpha.sub(beta);
-    let ag = alpha.sub(gamma);
-    let bg = beta.sub(gamma);
+    let (ab, ag, bg) = eigen_gaps(alpha, beta, gamma);
     let a = d
         .mul(alpha.sub(k21))
         .mul(alpha.sub(k31))
@@ -525,9 +528,7 @@ pub fn oral_ss_explicit(
     };
     let f_j = Jet::<8>::var(f_bio, 7);
     let coeff = over_v1::<8>(amt, v1).mul(f_j).mul(ka_j);
-    let ab = alpha.sub(beta);
-    let ag = alpha.sub(gamma);
-    let bg = beta.sub(gamma);
+    let (ab, ag, bg) = eigen_gaps(alpha, beta, gamma);
     let a = alpha.sub(k21).mul(alpha.sub(k31)).mul(ab.mul(ag).recip());
     let b = beta
         .sub(k21)
@@ -618,9 +619,7 @@ pub fn infusion_ss_explicit(
         _ => return fallback(),
     };
     let rv = over_v1::<6>(rate, v1);
-    let ab = alpha.sub(beta);
-    let ag = alpha.sub(gamma);
-    let bg = beta.sub(gamma);
+    let (ab, ag, bg) = eigen_gaps(alpha, beta, gamma);
     let a_coeff = rv
         .mul(alpha.sub(k21))
         .mul(alpha.sub(k31))

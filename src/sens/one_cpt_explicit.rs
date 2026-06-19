@@ -16,101 +16,16 @@
 //! The steady-state forms add a geometric SS factor that is a transcendental
 //! function of the single disposition rate `k = CL/V` (and, for oral, also of
 //! `ka`). Rather than hand-differentiate those, we evaluate the `k`-dependence
-//! over a **1-D second-order jet** [`D1`] (value + `d/dk` + `d²/dk²`) and then
+//! over a **1-D second-order jet** [`Jet<1>`](super::jet::Jet) (value + `d/dk` +
+//! `d²/dk²`) and then
 //! chain `k(CL,V)` to the `[CL,V]` derivatives in closed form via [`chain1`].
 //! This stays scalar/cheap (a 1-D jet, not the `O(N²)` `Dual2<N>`) while letting
 //! the jet carry the messy `k`-calculus — so a kernel only transcribes the
 //! algebraic shape.
 
 use super::dual2::Dual2;
+use super::jet::Jet;
 use super::one_cpt::{one_cpt_infusion_ss_g, one_cpt_oral_g, one_cpt_oral_ss_g};
-
-/// A 1-D second-order jet over a single scalar variable (here the disposition
-/// rate `k`): `v` value, `d1 = d/dk`, `d2 = d²/dk²`. Cheap (3 `f64`s, scalar
-/// ops); used to obtain `G(k), G'(k), G''(k)` for the steady-state shapes
-/// without hand-differentiation, before [`chain1`] maps `k(CL,V)`.
-#[derive(Clone, Copy)]
-struct D1 {
-    v: f64,
-    d1: f64,
-    d2: f64,
-}
-
-impl D1 {
-    #[inline]
-    fn cst(v: f64) -> Self {
-        D1 {
-            v,
-            d1: 0.0,
-            d2: 0.0,
-        }
-    }
-    /// The variable itself (`d/dk = 1`).
-    #[inline]
-    fn var(v: f64) -> Self {
-        D1 {
-            v,
-            d1: 1.0,
-            d2: 0.0,
-        }
-    }
-    #[inline]
-    fn sub(self, o: Self) -> Self {
-        D1 {
-            v: self.v - o.v,
-            d1: self.d1 - o.d1,
-            d2: self.d2 - o.d2,
-        }
-    }
-    #[inline]
-    fn add(self, o: Self) -> Self {
-        D1 {
-            v: self.v + o.v,
-            d1: self.d1 + o.d1,
-            d2: self.d2 + o.d2,
-        }
-    }
-    #[inline]
-    fn mul(self, o: Self) -> Self {
-        D1 {
-            v: self.v * o.v,
-            d1: self.v * o.d1 + self.d1 * o.v,
-            d2: self.v * o.d2 + 2.0 * self.d1 * o.d1 + self.d2 * o.v,
-        }
-    }
-    /// `1/self`.
-    #[inline]
-    fn recip(self) -> Self {
-        let inv = 1.0 / self.v;
-        let inv2 = inv * inv;
-        D1 {
-            v: inv,
-            d1: -self.d1 * inv2,
-            d2: -self.d2 * inv2 + 2.0 * self.d1 * self.d1 * inv2 * inv,
-        }
-    }
-    /// `exp(self)`.
-    #[inline]
-    fn exp(self) -> Self {
-        let e = self.v.exp();
-        D1 {
-            v: e,
-            d1: e * self.d1,
-            d2: e * (self.d2 + self.d1 * self.d1),
-        }
-    }
-    /// Scale by a plain constant `c` applied to the jet's variable as `c·k`
-    /// (i.e. an affine reparam): returns the jet of `c·k`. Used to form `−t·k`,
-    /// `−II·k`, etc. before `exp`.
-    #[inline]
-    fn scale(self, c: f64) -> Self {
-        D1 {
-            v: self.v * c,
-            d1: self.d1 * c,
-            d2: self.d2 * c,
-        }
-    }
-}
 
 /// Chain a prefactor `A(CL,V)` and a shape `G(k)` (given as value/`G'`/`G''`,
 /// `k = CL/V`) into `(f, ∂f/∂[CL,V], ∂²f/∂[CL,V]²)` for `f = A·G(k)`. `A` is
@@ -341,9 +256,9 @@ pub fn oral_ss_explicit(
         return fallback();
     }
     // P(λ) = e^{−λt}/(1−e^{−λ·II}) over the 1-D jet; S = P(k) − Q(ka).
-    let one = D1::cst(1.0);
-    let ss_shape = |lambda: f64| -> D1 {
-        let lj = D1::var(lambda);
+    let one = Jet::<1>::cst(1.0);
+    let ss_shape = |lambda: f64| -> Jet<1> {
+        let lj = Jet::<1>::var(lambda, 0);
         lj.scale(-t).exp().mul(one.sub(lj.scale(-ii).exp()).recip())
     };
     let p = ss_shape(k);
@@ -352,7 +267,18 @@ pub fn oral_ss_explicit(
     if (1.0 - (-k * ii).exp()) <= 0.0 || (1.0 - (-ka * ii).exp()) <= 0.0 {
         return (0.0, [0.0; 4], [[0.0; 4]; 4]);
     }
-    oral_chain(amt, k, ka, v, f_bio, p.v - q.v, p.d1, -q.d1, p.d2, -q.d2)
+    oral_chain(
+        amt,
+        k,
+        ka,
+        v,
+        f_bio,
+        p.v - q.v,
+        p.g[0],
+        -q.g[0],
+        p.h[0][0],
+        -q.h[0][0],
+    )
 }
 
 /// `(f, ∂f/∂[CL,V], ∂²f/∂[CL,V]²)` for the 1-cpt infusion (rate `rate`, duration
@@ -421,15 +347,15 @@ pub fn iv_bolus_ss_explicit(
         return (0.0, [0.0; 2], [[0.0; 2]; 2]);
     }
     let k = cl / v;
-    let kj = D1::var(k);
-    let one = D1::cst(1.0);
+    let kj = Jet::<1>::var(k, 0);
+    let one = Jet::<1>::cst(1.0);
     let denom = one.sub(kj.scale(-ii).exp());
     if denom.v <= 0.0 {
         return (0.0, [0.0; 2], [[0.0; 2]; 2]);
     }
     let gg = kj.scale(-t).exp().mul(denom.recip());
     let (a, ac, av, acc, acv, avv) = amt_over_v(amt, v);
-    chain1(a, ac, av, acc, acv, avv, gg.v, gg.d1, gg.d2, cl, v)
+    chain1(a, ac, av, acc, acv, avv, gg.v, gg.g[0], gg.h[0][0], cl, v)
 }
 
 /// `(f, ∂f/∂[CL,V], ∂²f/∂[CL,V]²)` for the 1-cpt infusion at steady state
@@ -466,8 +392,8 @@ pub fn infusion_ss_explicit(
         return (d.value, d.grad, d.hess);
     }
     let k = cl / v;
-    let kj = D1::var(k);
-    let one = D1::cst(1.0);
+    let kj = Jet::<1>::var(k, 0);
+    let one = Jet::<1>::cst(1.0);
     let denom = one.sub(kj.scale(-ii).exp());
     if denom.v <= 0.0 {
         return (0.0, [0.0; 2], [[0.0; 2]; 2]);
@@ -484,7 +410,7 @@ pub fn infusion_ss_explicit(
         omekt_inf.mul(kj.scale(-(t - dur)).exp()).mul(inv_denom)
     };
     let (a, ac, av, acc, acv, avv) = rate_over_cl(rate, cl);
-    chain1(a, ac, av, acc, acv, avv, gg.v, gg.d1, gg.d2, cl, v)
+    chain1(a, ac, av, acc, acv, avv, gg.v, gg.g[0], gg.h[0][0], cl, v)
 }
 
 #[cfg(test)]

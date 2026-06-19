@@ -333,3 +333,52 @@ pub fn two_cpt_conc_g<T: PkNum>(
         raw * f_bio
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sens::dual2::Dual2;
+
+    /// Coverage + correctness for `two_cpt_conc_g` across every dose kind. Reached
+    /// only via the `Dual2` provider (the f64 production walk dispatches through
+    /// `single_dose_concentration`, not `conc_g`), so otherwise uncovered. Checks
+    /// the `Dual2` value against the f64 value (gradient finite), also exercising
+    /// the `F` post-multiply.
+    #[test]
+    fn conc_g_all_dose_kinds_dual_matches_f64() {
+        let (cl, v1, q, v2, ka, fb) = (1.2, 12.0, 2.0, 30.0, 1.5, 0.8);
+        let t = 2.0;
+        let mk = |rate: f64, ss: bool, ii: f64| DoseEvent::new(0.0, 100.0, 1, rate, ss, ii);
+        let cases: [(DoseEvent, bool); 6] = [
+            (mk(0.0, false, 0.0), false),
+            (mk(50.0, false, 0.0), false),
+            (mk(0.0, false, 0.0), true),
+            (mk(0.0, true, 12.0), false),
+            (mk(0.0, true, 12.0), true),
+            (mk(50.0, true, 24.0), false),
+        ];
+        for (dose, oral) in &cases {
+            let v64 = two_cpt_conc_g::<f64>(dose, t, cl, v1, q, v2, ka, fb, *oral);
+            let d = two_cpt_conc_g::<Dual2<6>>(
+                dose,
+                Dual2::constant(t),
+                Dual2::var(cl, 0),
+                Dual2::var(v1, 1),
+                Dual2::var(q, 2),
+                Dual2::var(v2, 3),
+                Dual2::var(ka, 4),
+                Dual2::var(fb, 5),
+                *oral,
+            );
+            assert!(
+                d.value.is_finite() && (d.value - v64).abs() <= 1e-9 * (1.0 + v64.abs()),
+                "value {} vs f64 {v64} for {dose:?}",
+                d.value
+            );
+            assert!(
+                d.grad.iter().all(|g| g.is_finite()),
+                "non-finite grad for {dose:?}"
+            );
+        }
+    }
+}

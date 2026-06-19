@@ -421,6 +421,55 @@ mod tests {
         );
     }
 
+    /// Coverage + correctness for the `one_cpt_conc_g` dispatcher across every
+    /// dose kind (bolus / infusion / oral and their SS variants, with `F`). This
+    /// path is reached only via the `Dual2` provider — the f64 production walk
+    /// dispatches through `single_dose_concentration`, not `conc_g` — so it is
+    /// otherwise uncovered. Checks the `Dual2` value/grad against the f64 value
+    /// and FD of the same f64 dispatcher (also exercises the `F` post-multiply).
+    #[test]
+    fn conc_g_all_dose_kinds_match_f64_and_fd() {
+        let (cl, v, ka, fb) = (1.2, 12.0, 1.5, 0.8);
+        let t = 2.0;
+        let mk = |rate: f64, ss: bool, ii: f64| DoseEvent::new(0.0, 100.0, 1, rate, ss, ii);
+        let cases: [(DoseEvent, bool); 6] = [
+            (mk(0.0, false, 0.0), false),  // IV bolus
+            (mk(50.0, false, 0.0), false), // IV infusion (dur = amt/rate = 2)
+            (mk(0.0, false, 0.0), true),   // oral bolus
+            (mk(0.0, true, 12.0), false),  // SS IV bolus
+            (mk(0.0, true, 12.0), true),   // SS oral
+            (mk(50.0, true, 24.0), false), // SS infusion (dur 2 < II)
+        ];
+        for (dose, oral) in &cases {
+            let v64 = one_cpt_conc_g::<f64>(dose, t, cl, v, ka, fb, *oral);
+            let d = one_cpt_conc_g::<Dual2<4>>(
+                dose,
+                Dual2::constant(t),
+                Dual2::var(cl, 0),
+                Dual2::var(v, 1),
+                Dual2::var(ka, 2),
+                Dual2::var(fb, 3),
+                *oral,
+            );
+            assert!(
+                (d.value - v64).abs() <= 1e-9 * (1.0 + v64.abs()),
+                "value {} vs f64 {v64} for {dose:?}",
+                d.value
+            );
+            let (g, _) = fd([cl, v, ka, fb], |p| {
+                one_cpt_conc_g::<f64>(dose, t, p[0], p[1], p[2], p[3], *oral)
+            });
+            for k in 0..4 {
+                assert!(
+                    (d.grad[k] - g[k]).abs() <= 1e-4 * (1.0 + g[k].abs()),
+                    "grad[{k}] {} vs FD {} for {dose:?}",
+                    d.grad[k],
+                    g[k]
+                );
+            }
+        }
+    }
+
     /// Overhead of value + gradient + Hessian (`Dual2`) vs the bare `f64` value.
     #[test]
     #[ignore = "bench: run with -- --ignored --nocapture"]

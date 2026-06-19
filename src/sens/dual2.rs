@@ -69,6 +69,25 @@ impl<const N: usize> Dual2<N> {
 
     /// `sqrt(self)`. With `u = √x`: `u' = x'/(2u)`, `u'' = x''/(2u) − x'⊗x'/(4u³)`.
     pub fn sqrt(self) -> Self {
+        // Non-positive argument: the `1/(2u)` and `1/(4u³)` factors are singular.
+        // Callers feed `sqrt` non-negative arguments, but a discriminant can round
+        // to exactly 0 (or slightly negative) at near-repeated eigenvalues during a
+        // line-search step. Return a zero-derivative value so `inf`/`NaN` never
+        // enters the chain. (The narrow positive-but-tiny band, where the
+        // derivative is large-but-finite, is left to the callers' eigenvalue-gap
+        // degeneracy guards.)
+        if !(self.value > 0.0) {
+            let v = if self.value > 0.0 {
+                self.value.sqrt()
+            } else {
+                0.0
+            };
+            return Dual2 {
+                value: v,
+                grad: [0.0; N],
+                hess: [[0.0; N]; N],
+            };
+        }
         let v = self.value.sqrt();
         let inv2u = 0.5 / v;
         let inv4u3 = 0.25 / (v * v * v);
@@ -383,6 +402,22 @@ pub fn scalar_div<const N: usize>(s: f64, d: Dual2<N>) -> Dual2<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sqrt` at a zero (or rounded-negative) argument with a seeded gradient must
+    /// return finite, zero derivatives — not `inf`/`NaN` from the singular
+    /// `1/(2√x)` / `1/(4x^{3/2})` factors.
+    #[test]
+    fn dual2_sqrt_zero_argument_is_finite() {
+        let x = Dual2::<2>::var(0.0, 0); // value 0, grad[0] = 1
+        let r = x.sqrt();
+        assert_eq!(r.value, 0.0);
+        assert!(r.grad.iter().all(|g| g.is_finite()));
+        assert!(r.hess.iter().flatten().all(|h| h.is_finite()));
+        assert!(r.grad.iter().all(|&g| g == 0.0));
+        // A slightly-negative discriminant (rounding) must also stay finite.
+        let neg = Dual2::<2>::var(-1e-18, 0).sqrt();
+        assert!(neg.value.is_finite() && neg.grad.iter().all(|g| g.is_finite()));
+    }
 
     /// `f(x,y) = (1/y)·exp(-x/y)` (the 1-cpt IV-bolus shape, amt=1) at a point,
     /// cross-checked against analytic derivatives.

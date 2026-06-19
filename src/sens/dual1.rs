@@ -63,6 +63,21 @@ impl<const N: usize> Dual1<N> {
 
     /// `sqrt(self)`: `u' = x'/(2√x)`.
     pub fn sqrt(self) -> Self {
+        // Non-positive argument: `1/(2√x)` is singular (and `inf·0 = NaN` when a
+        // seeded component is 0). Return a zero-derivative value so `inf`/`NaN`
+        // never enters the chain (callers guard the argument non-negative; this
+        // covers an exact-0 discriminant during a line-search step).
+        if !(self.value > 0.0) {
+            let v = if self.value > 0.0 {
+                self.value.sqrt()
+            } else {
+                0.0
+            };
+            return Dual1 {
+                value: v,
+                grad: [0.0; N],
+            };
+        }
         let v = self.value.sqrt();
         let inv2u = 0.5 / v;
         let mut grad = [0.0; N];

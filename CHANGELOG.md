@@ -232,6 +232,13 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- **IMPMAP default proposal is now a Student-t** (`impmap_proposal_df = 4`)
+  instead of a multivariate normal. A Gaussian proposal's tails are lighter than
+  the posterior of weakly-identified parameters, so importance weights blow up in
+  the tail and bias the M-step moments — drifting typical-value estimates (e.g.
+  the absorption `MAT`/`KA` on modeled-duration models). The heavier-tailed
+  default removes that bias and matches FOCEI/NONMEM. Set `impmap_proposal_df =
+  normal` for the previous behaviour (#411).
 - **IMP/IMPMAP now warn about estimated parameters with no random effect**: any
   non-fixed `theta` that has no associated `ETA` is estimated only through the
   importance-weighted M-step, which is biased for weakly-identified parameters and

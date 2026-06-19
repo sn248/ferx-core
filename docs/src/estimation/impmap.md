@@ -45,7 +45,7 @@ Standalone, or as a chain stage warm-started by a preceding estimator:
   method             = importance_sampling_map   # or: impmap
   impmap_iterations  = 200
   impmap_samples     = 300
-  impmap_proposal_df = normal      # multivariate normal (NONMEM default)
+  impmap_proposal_df = 4           # Student-t (default); `normal` for MVN
   impmap_seed        = 12345
 ```
 
@@ -66,8 +66,9 @@ Each MCEM iteration, at the current parameters θ⁽ᵗ⁾, Ω⁽ᵗ⁾, σ⁽�
    Hessian \\(H_i = J_i^\\top R_i^{-1} J_i + \\Omega^{-1}\\).
 
 2. **Importance sampling (E-step B).** Draw `K = impmap_samples` samples
-   \\(\\eta_{ik} \\sim q(\\hat\\eta_i, H_i^{-1})\\) — a multivariate normal by
-   default (`impmap_proposal_df = normal`), or a Student-t for heavier tails —
+   \\(\\eta_{ik} \\sim q(\\hat\\eta_i, H_i^{-1})\\) — a Student-t by default
+   (`impmap_proposal_df = 4`, heavier tails for robust importance weights), or a
+   multivariate normal (`= normal`) —
    with self-normalized weights
    \\(\\tilde w_{ik} \\propto p(y_i\\mid\\eta_{ik},\\theta)\\,p(\\eta_{ik}\\mid\\Omega)/q(\\eta_{ik})\\).
 
@@ -91,7 +92,7 @@ parameters for AIC/BIC comparability with FOCE/FOCEI/SAEM. The
 importance-sampling Monte-Carlo **marginal** `−2 log L` — the number NONMEM
 `METHOD=IMPMAP` reports as its `#OBJV` — is also evaluated at the final estimates
 and surfaced on `FitResult.importance_sampling.minus2_log_likelihood` (± its MC
-SE). Because IMPMAP defaults to a Gaussian proposal (`impmap_proposal_df =
+SE). If IMPMAP is configured with a Gaussian proposal (`impmap_proposal_df =
 normal`), this final marginal eval substitutes a finite-`t` proposal to keep the
 importance weights bounded. Use that field, not `ofv`, to compare against
 NONMEM's reported IMPMAP objective.

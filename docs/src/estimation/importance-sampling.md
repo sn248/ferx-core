@@ -62,9 +62,9 @@ a final FOCE Laplace pass for AIC/BIC comparability.
 > number is the marginal, evaluated at the final estimates and surfaced on
 > `FitResult.importance_sampling.minus2_log_likelihood` (with its Monte-Carlo SE
 > on `.mc_standard_error`) for **estimating** `imp`/`impmap` runs too — not only
-> the evaluation-only path. IMPMAP's Gaussian proposal (`impmap_proposal_df =
-> normal`) is replaced by a finite-`t` proposal for this final marginal eval, so
-> the heavier tails keep the importance weights bounded.
+> the evaluation-only path. If IMPMAP is configured with a Gaussian proposal
+> (`impmap_proposal_df = normal`), it is replaced by a finite-`t` proposal for
+> this final marginal eval, so the heavier tails keep the importance weights bounded.
 
 ### Rich data: prefer IMPMAP or warm-start
 

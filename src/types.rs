@@ -3246,8 +3246,11 @@ pub struct FitOptions {
     /// Larger K reduces Monte-Carlo noise in the M-step at linear cost.
     pub impmap_samples: usize,
     /// Proposal degrees of freedom. `f64::INFINITY` selects a multivariate
-    /// normal proposal (NONMEM's IMPMAP default; parsed from `normal`); a finite
-    /// value selects a heavier-tailed Student-t. Default `INFINITY` (MVN).
+    /// normal proposal (parsed from `normal`); a finite value selects a
+    /// heavier-tailed Student-t. Default `4.0` (Student-t). A Gaussian proposal
+    /// (`= normal`, NONMEM's IMPMAP default) has lighter tails than the posterior
+    /// of weakly-identified parameters, so importance weights blow up in the tail
+    /// and bias the M-step moments; the heavier-tailed t default avoids that.
     pub impmap_proposal_df: f64,
     /// RNG seed for the IMPMAP sampling. `None` falls back to a fixed default so
     /// runs are reproducible across invocations.
@@ -3525,7 +3528,7 @@ impl Default for FitOptions {
             is_eval_only: false,
             impmap_iterations: 200,
             impmap_samples: 300,
-            impmap_proposal_df: f64::INFINITY,
+            impmap_proposal_df: 4.0,
             impmap_seed: None,
             impmap_averaging: 50,
             impmap_low_ess_threshold: 0.1,
@@ -4876,6 +4879,17 @@ mod tests {
              for the basin-trap and block-Ω-collapse regression rationale \
              before adjusting."
         );
+    }
+
+    #[test]
+    fn impmap_proposal_df_default_is_finite_t() {
+        // IMPMAP defaults to a Student-t proposal (df = 4), not a Gaussian: the
+        // MVN tails are too light for weakly-identified posteriors and bias the
+        // M-step moments (absorption-param drift, #411). Do not revert to ∞
+        // without re-checking that regression.
+        let opts = FitOptions::default();
+        assert_eq!(opts.impmap_proposal_df, 4.0);
+        assert!(opts.impmap_proposal_df.is_finite());
     }
 
     // ── small pure helpers ───────────────────────────────────────────────────

@@ -34,6 +34,9 @@ fn warfarin_setup() -> (
 fn impmap_standalone_produces_finite_estimates() {
     let (model, population, mut opts) = warfarin_setup();
     opts.method = EstimationMethod::Impmap;
+    // Opt into the Gaussian proposal so the marginal-eval ∞-df → finite-t
+    // fallback below is still exercised (the default is now a Student-t).
+    opts.impmap_proposal_df = f64::INFINITY;
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("standalone impmap must produce a fit");
 
@@ -60,8 +63,8 @@ fn impmap_standalone_produces_finite_estimates() {
     }
 
     // IMPMAP surfaces the importance-sampling marginal −2 log L (NONMEM #OBJV)
-    // alongside the Laplace `ofv`. IMPMAP defaults to a Gaussian proposal
-    // (`impmap_proposal_df = ∞`); the final marginal eval must fall back to a
+    // alongside the Laplace `ofv`. With the Gaussian proposal opted in above
+    // (`impmap_proposal_df = ∞`), the final marginal eval must fall back to a
     // finite-t proposal rather than producing a non-finite value.
     let is = result
         .importance_sampling

@@ -3276,6 +3276,17 @@ pub struct FitOptions {
     /// covariate dimensions has very poor ESS. Set `false` only to diagnose the
     /// RB path against the full-dimensional sampler.
     pub frem_rao_blackwell: bool,
+    /// Adaptive importance-sample count for IMP (NONMEM `AUTO`/`STDOBJ`). When
+    /// `true` (the default), `is_samples` is the *starting* count and is ramped
+    /// up (×2 per iteration, capped at 10000) whenever the objective's Monte-Carlo
+    /// standard deviation exceeds 1.0, so high-dimensional / FREM fits reach a
+    /// low-noise objective automatically instead of carrying a sample-count-
+    /// dependent M-step bias. Low-dimensional, well-sampled fits never trip the
+    /// threshold, so there is no cost there. Set `false` to pin the sample count.
+    pub is_auto: bool,
+    /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
+    /// [`FitOptions::is_auto`] but ramps `impmap_samples`. Default `true`.
+    pub impmap_auto: bool,
     /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
     /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
     /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
@@ -3536,6 +3547,8 @@ impl Default for FitOptions {
             impmap_mceta: 0,
             impmap_sobol: false,
             frem_rao_blackwell: true,
+            is_auto: true,
+            impmap_auto: true,
             iscale_min: 0.1,
             iscale_max: 10.0,
             bloq_method: BloqMethod::Drop,
@@ -3906,6 +3919,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "iscale_min",
             "iscale_max",
             "frem_rao_blackwell",
+            "is_auto",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -3922,6 +3936,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "iscale_min",
             "iscale_max",
             "frem_rao_blackwell",
+            "impmap_auto",
         ],
         EstimationMethod::Bayes => &[
             "inner_maxiter",

@@ -93,6 +93,7 @@ fn impmap_warns_when_under_sampled_for_dimension() {
     let fires = |k: usize| -> bool {
         let mut opts = base.clone();
         opts.method = EstimationMethod::Impmap;
+        opts.impmap_auto = false; // test the fixed-count dimension heuristic
         opts.impmap_samples = k;
         opts.impmap_iterations = 3;
         fit(&model, &population, &model.default_params, &opts)
@@ -109,6 +110,34 @@ fn impmap_warns_when_under_sampled_for_dimension() {
         !fires(400),
         "no under-sampling warning expected at K=400 (> 100·3)"
     );
+}
+
+/// `impmap_auto` (NONMEM `AUTO`) ramps the per-subject sample count when the
+/// objective is Monte-Carlo-noisy. Here it must plumb through, run, and return
+/// finite estimates — and on a low-start-K noisy fit it must not produce a
+/// *worse* (less converged) objective than the same fixed-K run. (The full
+/// 300→10000 ramp is validated manually on the FREM workshop model; a fast
+/// fixture is not noisy enough to exercise the cap.)
+#[test]
+fn impmap_auto_runs_and_does_not_regress() {
+    let (model, population, base) = warfarin_setup();
+    let run = |auto: bool, k: usize| {
+        let mut opts = base.clone();
+        opts.method = EstimationMethod::Impmap;
+        opts.impmap_auto = auto;
+        opts.impmap_samples = k;
+        opts.impmap_iterations = 6;
+        fit(&model, &population, &model.default_params, &opts).expect("fit must succeed")
+    };
+    let r = run(true, 8);
+    assert_eq!(r.method, EstimationMethod::Impmap);
+    assert!(r.ofv.is_finite(), "auto OFV must be finite, got {}", r.ofv);
+    for (n, v) in r.theta_names.iter().zip(r.theta.iter()) {
+        assert!(v.is_finite() && *v > 0.0, "theta {n} finite > 0, got {v}");
+    }
+    for i in 0..model.n_eta {
+        assert!(r.omega[(i, i)].is_finite() && r.omega[(i, i)] > 0.0);
+    }
 }
 
 /// A log-mu-referenced typical value whose paired η has negligible IIV (tiny

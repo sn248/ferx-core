@@ -92,9 +92,13 @@ Each MCEM iteration, at the current parameters θ⁽ᵗ⁾, Ω⁽ᵗ⁾, σ⁽�
 > model — is badly under-sampled for a high-dimensional FREM model (often 10+
 > ETAs) and can bias the typical-value and Ω estimates (e.g. the absorption
 > parameter on a 13-ETA FREM model drifts at `K = 300` and recovers as `K` grows
-> into the thousands). IMPMAP warns when `K < 100·n_eta`; raise `impmap_samples`
-> accordingly (FREM models typically want several thousand). FOCEI is unaffected
-> and is a good cross-check for the typical values.
+> into the thousands). Two options address this: set **`impmap_auto = true`**
+> (NONMEM `AUTO`) to ramp the sample count automatically until the objective's
+> Monte-Carlo SE drops below 1.0 — on the 13-ETA FREM model this ramps
+> `300 → 10000` and brings the absorption typical value from ~4.6 to ~3.0
+> (matching NONMEM); or raise `impmap_samples` manually (several thousand for
+> FREM). IMPMAP also warns when the objective is left under-sampled. FOCEI is
+> unaffected and is a good cross-check for the typical values.
 
 The reported estimate is the running mean of the parameter vector over the final
 `impmap_averaging` iterations. A FOCE-Laplace `ofv` is computed at the final

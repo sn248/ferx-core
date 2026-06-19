@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- `is_auto` / `impmap_auto` fit options (NONMEM `AUTO`), **on by default**:
+  adaptive importance-sample count. `is_samples` / `impmap_samples` is the
+  *starting* count and is ramped up (×2 per iteration, capped at 10000) whenever
+  the objective's Monte-Carlo standard deviation exceeds 1.0 (NONMEM `STDOBJ`),
+  so high-dimensional / FREM fits reach a low-noise objective automatically
+  instead of carrying a sample-count-dependent M-step bias. On the FREM workshop
+  model (13 ETAs) this ramps 300→10000 and brings the absorption typical value
+  from ~4.6 (fixed K=300) to ~3.0, matching NONMEM. Low-dimensional, well-sampled
+  fits never trip the threshold, so there is no cost there; set `false` to pin
+  the sample count (#411).
 - IMP/IMPMAP now warn when the importance-sample count is low for the model
   dimension (`K < 100·n_eta`) or when a subject's proposal fully collapses
   (ESS ≈ 0). The self-normalized M-step moments carry a finite-sample bias that

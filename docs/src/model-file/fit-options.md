@@ -235,6 +235,7 @@ sparsely-sampled PK).
 | `is_averaging` | `50` | Terminal iterations averaged into the reported estimate (estimator only). |
 | `is_samples` | `1000` | Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE. |
 | `is_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1), or `normal`/`mvn` for a multivariate-normal proposal. Lower = heavier tails. |
+| `is_auto` | `true` | Adaptive sample count (NONMEM `AUTO`). When `true`, `is_samples` is the *starting* count and is ramped up (×2/iteration, cap 10000) while the objective's Monte-Carlo SE exceeds 1.0. Recommended for high-dimensional / FREM models, where a fixed count biases the M-step. |
 | `is_seed` | `12345` | RNG seed. Same seed → identical result. |
 | `is_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction get flagged in the result. Set `0` to silence. |
 
@@ -264,6 +265,7 @@ importance-weighted posterior moments. It runs standalone or as a chain stage:
 | `impmap_iterations` | `200` | Number of MCEM iterations (parameter updates). |
 | `impmap_samples` | `300` | Importance samples K per subject per iteration. Larger K reduces Monte-Carlo noise at linear cost. |
 | `impmap_proposal_df` | `4` | Proposal degrees of freedom. A finite value ≥ 1 gives a heavier-tailed Student-t (default `4`); `normal` (or `mvn`) gives a multivariate-normal proposal (NONMEM's default). The Gaussian's lighter tails under-cover the posterior of weakly-identified parameters and bias the M-step moments, so ferx defaults to a Student-t. |
+| `impmap_auto` | `true` | Adaptive sample count (NONMEM `AUTO`). When `true`, `impmap_samples` is the *starting* count and is ramped up (×2/iteration, cap 10000) while the objective's Monte-Carlo SE exceeds 1.0 (NONMEM `STDOBJ`). Strongly recommended for FREM / high-dimensional models — a fixed count leaves a sample-count-dependent bias in the typical-value and Ω estimates. |
 | `impmap_averaging` | `50` | Final iterations whose parameters are averaged into the reported estimate (Monte-Carlo variance reduction). |
 | `impmap_seed` | `12345` | RNG seed. Same seed → identical estimates. |
 | `impmap_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction are flagged as poorly sampled. |

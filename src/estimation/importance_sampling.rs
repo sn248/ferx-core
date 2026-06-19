@@ -282,12 +282,16 @@ pub fn run_importance_sampling(
 
     // FREM: Rao-Blackwellise (integrate covariate etas, sample only PK etas) when
     // a clean PK/cov partition exists. `None` → full-dimensional IS (unchanged).
-    let frem_rb: Option<(Vec<usize>, Vec<usize>)> = model
-        .frem_config
-        .as_ref()
-        .filter(|_| model.n_kappa == 0)
-        .map(|fc| frem_pk_cov_partition(fc, n_eta))
-        .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty());
+    let frem_rb: Option<(Vec<usize>, Vec<usize>)> = if !options.frem_rao_blackwell {
+        None
+    } else {
+        model
+            .frem_config
+            .as_ref()
+            .filter(|_| model.n_kappa == 0)
+            .map(|fc| frem_pk_cov_partition(fc, n_eta))
+            .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
+    };
 
     let per_subject: Vec<SubjectIsOutput> = population
         .subjects
@@ -873,7 +877,13 @@ pub(crate) fn subject_is_draws_frem_rb(
     let logdet_occ = 2.0 * (0..nc).map(|i| occ_chol.l()[(i, i)].ln()).sum::<f64>();
     let occ_inv_d = occ_chol.solve(&dvec);
     let quad_cov = dvec.dot(&occ_inv_d);
-    let log_p_d = -0.5 * (nc as f64 * TWO_PI.ln() + logdet_occ + quad_cov);
+    // Covariate data marginal log N(d; 0, Ω_cc + R). The covariate pseudo-obs
+    // are *observations*, so their 2π normalizer (nc·ln2π) must be dropped to
+    // match the rest of the OFV, which omits the per-obs 2π constant (see
+    // `obs_nll_subject_into`) — i.e. NONMEM's "OBJECTIVE FUNCTION WITHOUT
+    // CONSTANT" convention. Including it inflated the RB marginal by
+    // Σ nc·ln2π (≈ n_covariate_obs · ln2π).
+    let log_p_d = -0.5 * (logdet_occ + quad_cov);
 
     // Constants. The covariate observation rows contribute a fixed
     // 0.5·Σ ln(R) to obs_nll (their residual is ≈0 at η_c = d); subtract it so

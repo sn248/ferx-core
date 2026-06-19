@@ -20,6 +20,9 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- `frem_rao_blackwell` fit option (default `true`): toggle the Rao-Blackwellised
+  FREM covariate-ETA integration in IMP/IMPMAP. Set `false` only to diagnose the
+  RB path against the full-dimensional importance sampler (#406).
 - `impmap_mceta` fit option: multi-start MAP for IMPMAP (NONMEM `MCETA` equivalent),
   improving IS efficiency in high-dimensional models (e.g. FREM with ≥5 ETAs).
 - Analytical Jacobian for FREM pseudo-observations: covariate rows in the FD
@@ -229,6 +232,13 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- **IMPMAP default proposal is now a Student-t** (`impmap_proposal_df = 4`)
+  instead of a multivariate normal. A Gaussian proposal's tails are lighter than
+  the posterior of weakly-identified parameters, so importance weights blow up in
+  the tail and bias the M-step moments — drifting typical-value estimates (e.g.
+  the absorption `MAT`/`KA` on modeled-duration models). The heavier-tailed
+  default removes that bias and matches FOCEI/NONMEM. Set `impmap_proposal_df =
+  normal` for the previous behaviour (#411).
 - **IMP/IMPMAP now warn about estimated parameters with no random effect**: any
   non-fixed `theta` that has no associated `ETA` is estimated only through the
   importance-weighted M-step, which is biased for weakly-identified parameters and
@@ -304,6 +314,23 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **FREM IMP/IMPMAP marginal −2 log L over-counted by a 2π constant**: the
+  Rao-Blackwellised covariate-data marginal included the covariate pseudo-obs
+  `nc·ln(2π)` normalizer, which the rest of the objective (and NONMEM's
+  "OBJECTIVE FUNCTION WITHOUT CONSTANT") drops. This inflated the reported FREM
+  marginal by `Σ nc·ln(2π)` (≈ n_covariate_obs · ln2π) and made the
+  Rao-Blackwell and full-dimensional importance samplers disagree on the same
+  point. The constant is now dropped in both; the value is otherwise unchanged
+  (it lies outside the importance weights, so estimates were never affected) (#406).
+- **IMP/IMPMAP now report the NONMEM-comparable objective**: estimating `imp` and
+  `impmap` runs surface the importance-sampling Monte-Carlo *marginal* −2 log L —
+  the number NONMEM `METHOD=IMP`/`IMPMAP` reports as its `#OBJV` — evaluated at the
+  final estimates on `FitResult.importance_sampling.minus2_log_likelihood` (± MC
+  SE). Previously this was populated only by the evaluation-only path, so the only
+  available number was the FOCE-Laplace `ofv`, which matches NONMEM's *COND/FOCE*
+  OBJ rather than the IMP marginal and diverges from it on sparse / strongly
+  nonlinear data. `ofv` is unchanged (still a Laplace pass, for cross-method
+  AIC/BIC comparability) (#406).
 - **IMP/IMPMAP no longer diverge on FREM models with missing covariates**: the
   Rao-Blackwellised E-step previously bailed to the unstable full-dimensional
   importance sampler for any subject missing a covariate pseudo-observation row

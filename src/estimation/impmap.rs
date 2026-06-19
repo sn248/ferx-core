@@ -548,11 +548,15 @@ fn run_mcem(
     // ESS) instead of all n_eta etas (~1–2% ESS). Partition is model-static;
     // per-subject covariate deviations are computed inside the E-step. `None` for
     // non-FREM models → the full-dimensional path is used unchanged.
-    let frem_rb: Option<(Vec<usize>, Vec<usize>)> = model
-        .frem_config
-        .as_ref()
-        .map(|fc| crate::estimation::importance_sampling::frem_pk_cov_partition(fc, n_eta))
-        .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty());
+    let frem_rb: Option<(Vec<usize>, Vec<usize>)> = if !options.frem_rao_blackwell {
+        None
+    } else {
+        model
+            .frem_config
+            .as_ref()
+            .map(|fc| crate::estimation::importance_sampling::frem_pk_cov_partition(fc, n_eta))
+            .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
+    };
 
     // ---- Trace: collect per-iteration parameters (analogous to NONMEM .ext) ----
     let mut trace_rows: Vec<ImpmapTraceRow> = if collect_trace {

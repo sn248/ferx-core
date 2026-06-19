@@ -255,7 +255,7 @@ importance-weighted posterior moments. It runs standalone or as a chain stage:
   method             = importance_sampling_map   # alias: impmap
   impmap_iterations  = 200
   impmap_samples     = 300
-  impmap_proposal_df = normal     # multivariate normal (NONMEM default)
+  impmap_proposal_df = 4          # Student-t (default); `normal` for MVN
   impmap_seed        = 12345
 ```
 
@@ -263,7 +263,7 @@ importance-weighted posterior moments. It runs standalone or as a chain stage:
 |-----|---------|-------------|
 | `impmap_iterations` | `200` | Number of MCEM iterations (parameter updates). |
 | `impmap_samples` | `300` | Importance samples K per subject per iteration. Larger K reduces Monte-Carlo noise at linear cost. |
-| `impmap_proposal_df` | `normal` | Proposal degrees of freedom. `normal` (or `mvn`) gives a multivariate-normal proposal (NONMEM's default); a finite value ≥ 1 gives a heavier-tailed Student-t. |
+| `impmap_proposal_df` | `4` | Proposal degrees of freedom. A finite value ≥ 1 gives a heavier-tailed Student-t (default `4`); `normal` (or `mvn`) gives a multivariate-normal proposal (NONMEM's default). The Gaussian's lighter tails under-cover the posterior of weakly-identified parameters and bias the M-step moments, so ferx defaults to a Student-t. |
 | `impmap_averaging` | `50` | Final iterations whose parameters are averaged into the reported estimate (Monte-Carlo variance reduction). |
 | `impmap_seed` | `12345` | RNG seed. Same seed → identical estimates. |
 | `impmap_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction are flagged as poorly sampled. |
@@ -272,6 +272,7 @@ importance-weighted posterior moments. It runs standalone or as a chain stage:
 | `impmap_sobol` | `false` | Use Sobol quasi-random sequences (with Cranley-Patterson randomization) for IS draws instead of pseudo-random. Gives more uniform posterior coverage with fewer samples. Only applies to MVN proposals (`impmap_proposal_df = normal`); Student-t falls back to pseudo-random. |
 | `iscale_min` | `0.1` | Minimum proposal scaling factor for adaptive IS (NONMEM `ISCALE_MIN`). The IS proposal covariance is multiplied by `s²` where `s` is chosen from `[iscale_min, iscale_max]` to maximise per-subject ESS. Set both to `1.0` to disable. |
 | `iscale_max` | `10.0` | Maximum proposal scaling factor (NONMEM `ISCALE_MAX`). |
+| `frem_rao_blackwell` | `true` | FREM only: Rao-Blackwellise the covariate ETAs (integrate them analytically, importance-sample only the PK ETAs). Strongly recommended — brute-force sampling of the near-singular covariate dimensions has very poor ESS. Set `false` only to diagnose the RB path against the full-dimensional sampler. |
 
 `impmap` reuses `inner_maxiter` / `inner_tol` for the per-iteration MAP step.
 Inter-occasion variability (`[iov]` / `kappa`) and SDE (`[diffusion]`) models

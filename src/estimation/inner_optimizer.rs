@@ -136,6 +136,41 @@ pub(crate) fn gradient_route_summary(
     format!("{resolved}  [requested: {requested_label}]")
 }
 
+/// Warning when *some but not all* subjects fall back to the FD inner gradient
+/// (outside the analytic provider's scope — SS+reset, time-varying covariates,
+/// oral infusion, modeled-duration doses, …). Returns `None` for a uniform
+/// population: all-analytic needs no warning, and all-FD is a model-level property
+/// already obvious from the banner and the model itself. Surfaced into
+/// `FitResult.warnings` per the CLAUDE.md convention that non-fatal issues go
+/// through `warnings`, not the startup banner alone.
+///
+/// Uses the actual light provider at the prior mode (`η = 0`) so it catches the
+/// *per-point* fallbacks (modeled-duration, SS+reset, oral infusion) that the
+/// coarse model-level [`resolve_gradient_method`] does not.
+pub(crate) fn fd_fallback_warning(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Option<String> {
+    let zeros = vec![0.0; model.n_eta];
+    let n_total = population.subjects.len();
+    let n_fd = population
+        .subjects
+        .iter()
+        .filter(|s| crate::sens::provider::subject_eta_grad(model, s, theta, &zeros).is_none())
+        .count();
+    if n_fd > 0 && n_fd < n_total {
+        Some(format!(
+            "{n_fd} of {n_total} subjects use finite-difference inner gradients \
+             (outside the analytic provider's scope, e.g. steady-state + reset, \
+             time-varying covariates, or modeled-duration doses); their results \
+             are correct but slower."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Global per-fit timing counters for gradient/Jacobian calls. Printed by
 /// [`fit_inner`] when `FERX_TIME_GRADIENTS=1` in the environment. Atomics so
 /// multiple rayon workers can update concurrently without locking.
@@ -1792,6 +1827,40 @@ mod iov_tests {
             InnerGradientMethod::Fd,
             "gradient = fd must force the FD inner route"
         );
+    }
+
+    /// `fd_fallback_warning` fires only for a *mixed* population — some subjects
+    /// analytic, some on FD (here a modeled-duration `RATE=-2` subject, which the
+    /// provider declines per-point). Uniform populations return `None`.
+    #[test]
+    fn fd_fallback_warning_fires_only_for_mixed_population() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let theta = &model.default_params.theta;
+        let analytic = pop.subjects[0].clone();
+        let mut fd_subj = pop.subjects[0].clone();
+        let mut d = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        d.rate_mode = crate::types::RateMode::ModeledDuration;
+        fd_subj.doses.push(d);
+        let mk_pop = |subjects| Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mixed = mk_pop(vec![analytic.clone(), fd_subj]);
+        let w = fd_fallback_warning(&model, &mixed, theta).expect("mixed population warns");
+        assert!(w.contains("1 of 2"), "got: {w}");
+
+        // Uniform analytic → no warning.
+        assert!(fd_fallback_warning(&model, &mk_pop(vec![analytic]), theta).is_none());
     }
 
     fn make_iov_model() -> CompiledModel {

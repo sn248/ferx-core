@@ -2652,6 +2652,29 @@ fn fit_inner(
     // by read_nonmem_csv into population.warnings.
     accumulated_warnings.extend(population.warnings.iter().cloned());
 
+    // Inner-gradient FD-fallback notice for the gradient-driven methods: if some
+    // (but not all) subjects fall outside the analytic provider's scope, surface
+    // it through warnings (not just the startup banner) per the CLAUDE.md rule.
+    if chain.iter().any(|m| {
+        matches!(
+            m,
+            EstimationMethod::Foce
+                | EstimationMethod::FoceI
+                | EstimationMethod::FoceGn
+                | EstimationMethod::FoceGnHybrid
+                | EstimationMethod::Imp
+                | EstimationMethod::Impmap
+        )
+    }) {
+        if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning(
+            model,
+            population,
+            &init_params.theta,
+        ) {
+            accumulated_warnings.push(w);
+        }
+    }
+
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 

@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **IIV on residual error (`iiv_on_ruv`)** — a random effect can now scale the
+  residual error per subject (NONMEM `Y = IPRED + EPS*EXP(ETA)`). Declare an
+  `omega` and reference it from `[error_model]` with `iiv_on_ruv = NAME`; the
+  residual variance of every observation is multiplied by `exp(2*ETA_i)`.
+  Supported under FOCEI, IMP, IMPMAP, and SAEM (non-interaction FOCE is rejected
+  with a clear error). Previously such a random effect was silently dropped on
+  import (#409).
 - **Covariance step progress reporting** — under `verbose`, the covariance step
   now prints throttled per-loop progress (Hessian finite-difference points and
   the score cross-product) with a wall-clock ETA, e.g.

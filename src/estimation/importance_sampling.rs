@@ -922,6 +922,13 @@ fn compute_joint_posterior_hessian(
 
     // Compute residual variance with FREM overrides
     let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    // IIV on residual error (#409): scale PK residual variance by exp(2·η̂_ruv).
+    let ruv_scale = model.residual_var_scale(eta_hat.as_slice());
+    if ruv_scale != 1.0 {
+        for v in r_diag.iter_mut() {
+            *v *= ruv_scale;
+        }
+    }
     let frem_ov = crate::stats::likelihood::build_frem_r_override(
         model.frem_config.as_ref(),
         &subject.fremtype,
@@ -983,6 +990,11 @@ fn compute_joint_posterior_hessian(
             }
         }
     }
+
+    // IIV on residual error (#409): η_ruv is a BSV eta (index < n_eta) whose
+    // prediction-Jacobian column is zero; add its data curvature so the joint IS
+    // proposal tightens around η̂_ruv. See `add_ruv_posterior_curvature`.
+    add_ruv_posterior_curvature(&mut h_post, model, subject, &ipreds, &r_diag, n_eta);
 
     h_post
 }
@@ -1094,12 +1106,13 @@ fn subject_is_estimate_joint(
         let ipreds = predict_iov(model, subject, theta, eta_sample, &kappas_sampled);
 
         let m3 = matches!(model.bloq_method, BloqMethod::M3);
+        // IIV on residual error (#409): scale by exp(2·η_ruv) for this draw's eta.
+        let ruv_scale = model.residual_var_scale(eta_sample);
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
             let f = f.max(1e-12);
-            let v = model
-                .residual_variance_at(subject.obs_cmts[j], f, sigma)
-                .max(1e-12);
+            let v =
+                (model.residual_variance_at(subject.obs_cmts[j], f, sigma) * ruv_scale).max(1e-12);
             if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
                 let z = (y - f) / v.sqrt();
                 obs_nll += -log_normal_cdf(z);
@@ -1308,6 +1321,15 @@ pub(crate) fn compute_posterior_hessian(
     let ipreds =
         compute_predictions_with_tv_into(model, subject, theta, eta_hat.as_slice(), scratch);
     let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    // IIV on residual error (#409): scale the PK residual variance at the mode by
+    // exp(2·η̂_ruv) so the Laplace proposal precision reflects the per-subject
+    // residual SD. FREM rows are overwritten below with their own variance.
+    let ruv_scale = model.residual_var_scale(eta_hat.as_slice());
+    if ruv_scale != 1.0 {
+        for v in r_diag.iter_mut() {
+            *v *= ruv_scale;
+        }
+    }
     // Apply FREM R-diagonal overrides: covariate pseudo-observations use EPSCOV²
     // instead of the PK error model variance.
     let frem_ov = crate::stats::likelihood::build_frem_r_override(
@@ -1328,7 +1350,47 @@ pub(crate) fn compute_posterior_hessian(
             }
         }
     }
+    add_ruv_posterior_curvature(&mut h_post, model, subject, &ipreds, &r_diag, n_eta);
     h_post
+}
+
+/// IIV on residual error (#409): the prediction `f` does not depend on η_ruv, so
+/// its Jacobian column is identically zero and the `JᵀR⁻¹J` loop leaves the
+/// η_ruv diagonal of `H_post` at the prior precision `Ω⁻¹` alone. The IS
+/// proposal built from that Hessian would then sample η_ruv from its prior
+/// rather than the (much tighter) data-informed posterior, inflating the
+/// importance-weight variance on that axis.
+///
+/// Add the exact second derivative of the per-subject objective in η_ruv. With
+/// `R_j = R₀ⱼ·exp(2·η_ruv)`, the data term `0.5·Σⱼ[(y−f)²/Rⱼ + ln Rⱼ]` has
+/// `∂²/∂η_ruv² = Σⱼ 2·(y−f)²/Rⱼ` (the `ln Rⱼ` term is linear in η_ruv, so it
+/// drops). FREM covariate rows carry no PK residual and are excluded. Off-
+/// diagonal η_ruv couplings are left at the Gauss-Newton level (zero), matching
+/// how the structural-eta block already drops `∂R/∂η` cross terms.
+fn add_ruv_posterior_curvature(
+    h_post: &mut DMatrix<f64>,
+    model: &CompiledModel,
+    subject: &Subject,
+    ipreds: &[f64],
+    r_diag: &[f64],
+    n_eta: usize,
+) {
+    let Some(k) = model.residual_error_eta else {
+        return;
+    };
+    if k >= n_eta {
+        return;
+    }
+    let mut curv = 0.0;
+    for (j, &f) in ipreds.iter().enumerate() {
+        if subject.fremtype.get(j).copied().unwrap_or(0) != 0 {
+            continue; // FREM covariate pseudo-observation: no PK residual.
+        }
+        let rj = r_diag[j].max(1e-12);
+        let res = subject.observations[j] - f;
+        curv += 2.0 * res * res / rj;
+    }
+    h_post[(k, k)] += curv;
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,6 +1400,77 @@ pub(crate) fn compute_posterior_hessian(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// IIV on residual error (#409): `add_ruv_posterior_curvature` injects the
+    /// η_ruv data curvature `Σⱼ 2·res²/Rⱼ` into the proposal Hessian diagonal
+    /// (PK rows only — FREM covariate rows are skipped), and is a no-op when no
+    /// `residual_error_eta` is set. Without this the IS proposal samples η_ruv
+    /// from the prior, since its prediction-Jacobian column is identically zero.
+    #[test]
+    fn ruv_posterior_curvature_adds_data_term_and_skips_frem() {
+        use crate::types::{DoseEvent, GradientMethod, Subject};
+        use std::collections::HashMap;
+
+        let mut subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 3.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![10.0, 8.0, 0.0],
+            obs_cmts: vec![1; 3],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 3],
+            occasions: vec![1, 1, 1],
+            dose_occasions: Vec::new(),
+            // 3rd row is a FREM covariate pseudo-observation.
+            fremtype: vec![0, 0, 5],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let ipreds = vec![9.0, 7.0, 99.0];
+        let r_diag = vec![4.0, 2.0, 1.0];
+        let n_eta = 2;
+
+        let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Auto);
+
+        // No residual-error eta → no-op.
+        model.residual_error_eta = None;
+        let mut h = DMatrix::<f64>::zeros(n_eta, n_eta);
+        add_ruv_posterior_curvature(&mut h, &model, &subject, &ipreds, &r_diag, n_eta);
+        assert!(
+            h.iter().all(|&v| v == 0.0),
+            "no residual eta must be a no-op"
+        );
+
+        // η_ruv at index 1: diagonal gains Σ 2·res²/R over PK rows only.
+        // 2·(10−9)²/4 + 2·(8−7)²/2 = 0.5 + 1.0 = 1.5 (FREM row 3 excluded).
+        model.residual_error_eta = Some(1);
+        add_ruv_posterior_curvature(&mut h, &model, &subject, &ipreds, &r_diag, n_eta);
+        assert!((h[(1, 1)] - 1.5).abs() < 1e-12, "got {}", h[(1, 1)]);
+        assert_eq!(h[(0, 0)], 0.0, "structural diagonal untouched");
+        assert_eq!(h[(0, 1)], 0.0, "no off-diagonal coupling added");
+
+        // Out-of-range index is a safe no-op (defensive).
+        let mut h2 = DMatrix::<f64>::zeros(n_eta, n_eta);
+        model.residual_error_eta = Some(5);
+        add_ruv_posterior_curvature(&mut h2, &model, &subject, &ipreds, &r_diag, n_eta);
+        assert!(
+            h2.iter().all(|&v| v == 0.0),
+            "out-of-range k must be a no-op"
+        );
+
+        // Including a FREM row only (no PK rows) yields zero curvature.
+        subject.fremtype = vec![1, 1, 1];
+        let mut h3 = DMatrix::<f64>::zeros(n_eta, n_eta);
+        model.residual_error_eta = Some(1);
+        add_ruv_posterior_curvature(&mut h3, &model, &subject, &ipreds, &r_diag, n_eta);
+        assert_eq!(h3[(1, 1)], 0.0, "all-FREM subject adds no curvature");
+    }
 
     #[test]
     fn subject_draws_cancelled_is_benign_and_correctly_shaped() {

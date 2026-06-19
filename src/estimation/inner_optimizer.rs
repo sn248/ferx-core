@@ -740,6 +740,12 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     {
         return false;
     }
+    // The user explicitly requested finite differences. `build_info` reports the
+    // inner route off this same predicate, so honouring it here keeps the option
+    // functional and the reported `gradient_method_inner` truthful.
+    if matches!(model.gradient_method, GradientMethod::Fd) {
+        return false;
+    }
     if model.is_sde() {
         return false;
     }
@@ -1756,6 +1762,35 @@ mod iov_tests {
         assert!(
             fd_summary.contains("[requested: FD"),
             "bracket must echo the requested arg, got: {fd_summary}"
+        );
+    }
+
+    /// Regression: `gradient = fd` must force the FD inner route on an
+    /// analytic-supported model (previously the executor ignored
+    /// `model.gradient_method`, so the option silently ran the Dual2 path while
+    /// `build_info` reported FD). Uses the bundled warfarin model, which is in the
+    /// analytic provider's scope (1-cpt oral, no LTBS / TV-cov / SDE).
+    #[test]
+    fn gradient_fd_forces_fd_inner_route() {
+        use std::path::Path;
+        let mut model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let subj = &pop.subjects[0];
+
+        model.gradient_method = GradientMethod::Auto;
+        assert_eq!(
+            resolve_gradient_method(&model, subj),
+            InnerGradientMethod::Analytic,
+            "auto must resolve to the analytic route for the warfarin model"
+        );
+        model.gradient_method = GradientMethod::Fd;
+        assert_eq!(
+            resolve_gradient_method(&model, subj),
+            InnerGradientMethod::Fd,
+            "gradient = fd must force the FD inner route"
         );
     }
 

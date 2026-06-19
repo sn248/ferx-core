@@ -2010,7 +2010,14 @@ fn population_gradient(
     // needs the per-occasion κ̂ alongside the BSV EBEs, so it is dispatched
     // separately from the non-IOV `sens_supported` path.
     let iov_analytic = crate::sens::provider::iov_analytical_supported(model);
-    if !force_reconverge && (crate::sens::provider::sens_supported(model) || iov_analytic) {
+    // `gradient = fd` forces the numeric path for the outer gradient too (the inner
+    // EBE gradient honours it via `analytic_inner_grad_supported`), so the option
+    // fully disables the analytic sensitivities rather than only the inner half.
+    let user_forces_fd = matches!(model.gradient_method, GradientMethod::Fd);
+    if !force_reconverge
+        && !user_forces_fd
+        && (crate::sens::provider::sens_supported(model) || iov_analytic)
+    {
         let g = if iov_analytic {
             if options.interaction {
                 crate::estimation::sens_outer_gradient::population_gradient_sens_iov(

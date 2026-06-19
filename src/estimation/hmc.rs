@@ -133,6 +133,13 @@ pub fn hmc_step(
     // evaluation. NLL is computed by the same `individual_nll` the caller used for
     // `nll_current`, so the Metropolis ratio is exact.
     let last_nll = Cell::new(nll_current);
+    // The model-level scope probe above only settles `eta`; a leapfrog step can
+    // still reach a point the provider can't differentiate (e.g. a residual
+    // variance `v <= 0`). If that happens mid-trajectory, a zero gradient would
+    // turn the step into momentum-only free-flight and the frozen proposal could
+    // be accepted on a finite ΔH — so flag it and treat the whole transition as a
+    // failed/divergent move (reject, stay put) rather than silently biasing.
+    let grad_failed = Cell::new(false);
     let grad_fn = |q: &[f64]| -> Vec<f64> {
         last_nll.set(individual_nll(
             model,
@@ -142,12 +149,21 @@ pub fn hmc_step(
             omega,
             sigma_values,
         ));
-        analytic_eta_nll_gradient(model, subject, theta, q, omega, sigma_values)
-            .unwrap_or_else(|| vec![0.0; n_eta])
+        match analytic_eta_nll_gradient(model, subject, theta, q, omega, sigma_values) {
+            Some(g) => g,
+            None => {
+                grad_failed.set(true);
+                vec![0.0; n_eta]
+            }
+        }
     };
 
     let p_init: Vec<f64> = (0..n_eta).map(|_| rng.sample(StandardNormal)).collect();
     let (eta_prop, p_prop) = leapfrog(eta, &p_init, &grad_fn, step_size, n_leapfrog);
+    if grad_failed.get() {
+        // Trajectory left the differentiable region — reject and flag divergent.
+        return Some((eta.to_vec(), nll_current, false, true));
+    }
     let nll_prop = last_nll.get();
 
     // Metropolis accept/reject on ΔH = H_curr − H_prop.

@@ -1714,7 +1714,15 @@ mod tests {
     /// `hmc_step`, whose `∂NLL/∂η` is the Dual2 analytic gradient (no autodiff).
     /// Asserts the HMC path yields finite, well-ordered summaries and a sane
     /// warfarin fit — the end-to-end check that the Dual2 HMC gradient works.
+    ///
+    /// Tier-3 (runs to convergence over ~2000 MCMC sweeps): gated to the nightly
+    /// slow-tests job. The fast `run_bayes_warfarin_hmc_smoke` below keeps the
+    /// HMC-on-Dual2 wiring covered on every PR.
     #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn run_bayes_warfarin_hmc_eta_block() {
         use std::path::Path;
         let model =
@@ -1777,6 +1785,47 @@ mod tests {
         assert!(res.ofv.is_finite(), "OFV not finite");
         assert!(bayes.max_rhat.is_finite());
         assert_eq!(res.eta_hats.len(), pop.subjects.len());
+    }
+
+    /// Fast PR-tier smoke for the HMC-on-Dual2 η block: a handful of sweeps with
+    /// `saem_n_leapfrog > 0` must run the gradient-guided sampler end-to-end and
+    /// produce finite summaries (no convergence assertion — that is the gated
+    /// `run_bayes_warfarin_hmc_eta_block` above). Guards the wiring/crash surface.
+    #[test]
+    fn run_bayes_warfarin_hmc_smoke() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let params = model.default_params.clone();
+
+        let mut opts = FitOptions::default();
+        opts.bayes_warmup = 20;
+        opts.bayes_iters = 20;
+        opts.bayes_chains = 1;
+        opts.bayes_seed = Some(1);
+        opts.saem_n_leapfrog = 2; // > 0 ⇒ exercise the HMC η block
+
+        // The startup banner must report HMC (proves the Dual2 route is selected).
+        let summary = crate::estimation::saem::saem_sampler_summary(&model, &opts);
+        assert!(
+            summary.starts_with("HMC"),
+            "expected HMC sampler, got: {summary}"
+        );
+
+        let res = run_bayes(&model, &pop, &params, &opts).expect("HMC bayes runs");
+        let bayes = res.bayes.as_ref().expect("BayesResult present");
+        assert!(!bayes.summaries.is_empty());
+        for s in &bayes.summaries {
+            assert!(
+                s.mean.is_finite() && s.sd.is_finite(),
+                "{}: non-finite",
+                s.name
+            );
+        }
+        assert!(res.ofv.is_finite(), "OFV not finite");
     }
 
     #[test]

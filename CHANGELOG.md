@@ -303,6 +303,12 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **Bayesian estimation** (`method = bayes`) now samples the per-occasion IOV
+  `kappa` block when `OMEGA_IOV` is FIX-ed. Previously an all-FIX `OMEGA_IOV`
+  disabled kappa sampling entirely, so the kappas stayed pinned at their initial
+  values (IOV effectively ignored); a fixed `OMEGA_IOV` still defines the kappa
+  prior variance, so the block is now sampled while its conjugate covariance
+  draw remains correctly skipped (#415).
 - **Bayesian estimation** (`method = bayes`) now responds to a cooperative
   cancellation (e.g. an R-session interrupt): the Gibbs sampler polls the cancel
   flag at each sweep boundary and aborts within one sweep, returning

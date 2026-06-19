@@ -2210,7 +2210,20 @@ pub fn run_saem(
         kappa_fixed: init_params.kappa_fixed.clone(),
     };
 
-    let run_marginal_polish = model.error_spec.has_combined();
+    // Only repair a combined-error fit when SAEM actually collapsed the additive
+    // component onto its lower bound. A fit that converged to a healthy non-zero
+    // ADD is left untouched — overriding it would pull the exact-marginal SAEM
+    // estimate back toward the (possibly Laplace-biased) FOCEI optimum for no
+    // reason.
+    //
+    // TODO: this polish is a safety net, not the root-cause fix. SAEM collapses
+    // ADD because the residual-error M-step uses point-η residuals instead of
+    // the spread of the sampled ηs, which systematically under-counts the
+    // low-concentration residual variance. The principled fix is to accumulate
+    // the residual sufficient statistic over the η samples; once that lands this
+    // gate can be removed. Tracked in #420.
+    let run_marginal_polish =
+        model.error_spec.has_combined() && combined_additive_sigma_at_floor(model, &final_params);
 
     // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----
     let warm_etas: Vec<DVector<f64>> = state
@@ -2413,7 +2426,7 @@ mod tests {
   theta TVV(10.0, 1.0, 100.0)
   omega ETA_CL ~ 0.05
   sigma PROP_ERR ~ 0.1 (sd)
-  sigma ADD_ERR  ~ 1.0 (sd)
+  sigma ADD_ERR  ~ 0.0005 (sd)
 
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
@@ -2432,7 +2445,7 @@ mod tests {
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 4.0, 8.0],
                 obs_raw_times: Vec::new(),
-                observations: vec![9.0, 6.0, 4.0],
+                observations: vec![9.5, 6.4, 4.7],
                 obs_cmts: vec![1, 1, 1],
                 covariates: HashMap::new(),
                 dose_covariates: Vec::new(),
@@ -2459,10 +2472,11 @@ mod tests {
         (model, population)
     }
 
-    /// Driving SAEM on the combined-error fixture exercises the marginal-polish
-    /// call site in `run_saem` end-to-end: a finite OFV must come back and the
-    /// model must report a combined error spec (Tier-1: 2 SAEM iters/phase, no
-    /// convergence loop).
+    /// Driving SAEM on the combined-error fixture (additive initialised at its
+    /// floor, proportional-dominated data) keeps `ADD` collapsed, so this
+    /// exercises the gated marginal-polish call site in `run_saem` end-to-end:
+    /// a finite OFV must come back and the model must report a combined error
+    /// spec (Tier-1: 2 SAEM iters/phase, no convergence loop).
     #[test]
     fn run_saem_combined_executes_marginal_polish() {
         let (model, population) = tiny_combined_fixture();

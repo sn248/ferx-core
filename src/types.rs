@@ -1377,16 +1377,6 @@ impl ErrorSpec {
         }
     }
 
-    /// True when any endpoint uses a `combined(PROP, ADD)` residual-error model.
-    pub fn has_combined(&self) -> bool {
-        match self {
-            ErrorSpec::Single(em) => matches!(em, ErrorModel::Combined),
-            ErrorSpec::PerCmt(map) => map
-                .values()
-                .any(|ep| matches!(ep.error_model, ErrorModel::Combined)),
-        }
-    }
-
     /// Global `sigma.values` indices of the additive component of every
     /// `Combined` endpoint (the second sigma slot). De-duplicated; empty when
     /// no endpoint is combined.
@@ -4267,31 +4257,6 @@ mod tests {
         mixed.insert(1usize, ep(ErrorModel::Additive));
         mixed.insert(2usize, ep(ErrorModel::Proportional));
         assert!(ErrorSpec::PerCmt(mixed).has_f_dependent_variance());
-    }
-
-    #[test]
-    fn error_spec_has_combined_detects_combined_endpoints() {
-        use std::collections::HashMap;
-        // Single endpoint: only `Combined` is combined.
-        assert!(!ErrorSpec::Single(ErrorModel::Additive).has_combined());
-        assert!(!ErrorSpec::Single(ErrorModel::Proportional).has_combined());
-        assert!(ErrorSpec::Single(ErrorModel::Combined).has_combined());
-
-        let ep = |em: ErrorModel, idx: Vec<usize>| EndpointError {
-            error_model: em,
-            sigma_idx: idx,
-        };
-
-        // PerCmt: combined if ANY endpoint is combined.
-        let mut none = HashMap::new();
-        none.insert(1usize, ep(ErrorModel::Additive, vec![0]));
-        none.insert(2usize, ep(ErrorModel::Proportional, vec![1]));
-        assert!(!ErrorSpec::PerCmt(none).has_combined());
-
-        let mut some = HashMap::new();
-        some.insert(1usize, ep(ErrorModel::Proportional, vec![0]));
-        some.insert(2usize, ep(ErrorModel::Combined, vec![1, 2]));
-        assert!(ErrorSpec::PerCmt(some).has_combined());
     }
 
     #[test]

@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- IMP/IMPMAP now warn when the importance-sample count is low for the model
+  dimension (`K < 100·n_eta`) or when a subject's proposal fully collapses
+  (ESS ≈ 0). The self-normalized M-step moments carry a finite-sample bias that
+  grows with dimension, so high-dimensional / FREM fits at the default sample
+  count can converge to biased typical-value and Ω estimates; the warning
+  recommends raising `impmap_samples` / `is_samples` (#411).
 - `frem_rao_blackwell` fit option (default `true`): toggle the Rao-Blackwellised
   FREM covariate-ETA integration in IMP/IMPMAP. Set `false` only to diagnose the
   RB path against the full-dimensional importance sampler (#406).

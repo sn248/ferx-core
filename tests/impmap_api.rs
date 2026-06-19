@@ -83,6 +83,34 @@ fn impmap_standalone_produces_finite_estimates() {
     );
 }
 
+/// IMPMAP warns when the importance-sample count is low relative to the model
+/// dimension (`K < 100·n_eta`), since the self-normalized M-step moments then
+/// carry a dimension-amplified finite-sample bias (#411). The warning must fire
+/// when under-sampled and stay silent when the count is adequate.
+#[test]
+fn impmap_warns_when_under_sampled_for_dimension() {
+    let (model, population, base) = warfarin_setup(); // 3 ETAs → threshold K = 300
+    let fires = |k: usize| -> bool {
+        let mut opts = base.clone();
+        opts.method = EstimationMethod::Impmap;
+        opts.impmap_samples = k;
+        opts.impmap_iterations = 3;
+        fit(&model, &population, &model.default_params, &opts)
+            .expect("fit must succeed")
+            .warnings
+            .iter()
+            .any(|w| w.contains("importance samples for"))
+    };
+    assert!(
+        fires(50),
+        "expected an under-sampling warning at K=50 (< 100·3)"
+    );
+    assert!(
+        !fires(400),
+        "no under-sampling warning expected at K=400 (> 100·3)"
+    );
+}
+
 /// A log-mu-referenced typical value whose paired η has negligible IIV (tiny
 /// `FIX`ed ω) must still be estimated: IMPMAP routes it to the weighted M-step
 /// instead of the closed-form `log θ += mean(η)` shift, which would freeze it at

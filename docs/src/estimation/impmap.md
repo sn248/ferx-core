@@ -86,6 +86,16 @@ Each MCEM iteration, at the current parameters θ⁽ᵗ⁾, Ω⁽ᵗ⁾, σ⁽�
      likelihood \\(\\sum_i \\sum_k \\tilde w_{ik}\\log p(y_i\\mid\\eta_{ik},\\theta,\\sigma)\\)
      with a derivative-free NLopt BOBYQA step.
 
+> **High-dimensional models need more samples.** The self-normalized importance
+> weights make the M-step moments carry a finite-sample bias that grows with the
+> number of ETAs, so the default `impmap_samples = 300` — ample for a 3–4 ETA PK
+> model — is badly under-sampled for a high-dimensional FREM model (often 10+
+> ETAs) and can bias the typical-value and Ω estimates (e.g. the absorption
+> parameter on a 13-ETA FREM model drifts at `K = 300` and recovers as `K` grows
+> into the thousands). IMPMAP warns when `K < 100·n_eta`; raise `impmap_samples`
+> accordingly (FREM models typically want several thousand). FOCEI is unaffected
+> and is a good cross-check for the typical values.
+
 The reported estimate is the running mean of the parameter vector over the final
 `impmap_averaging` iterations. A FOCE-Laplace `ofv` is computed at the final
 parameters for AIC/BIC comparability with FOCE/FOCEI/SAEM. The

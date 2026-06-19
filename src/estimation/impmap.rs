@@ -595,6 +595,11 @@ fn run_mcem(
         Vec::new()
     };
 
+    // ESS state from the final completed E-step, used to flag importance-sampling
+    // moment bias (which scales as 1/(K·ESS) and is severe in high dimensions).
+    let mut final_ess_median = 1.0_f64;
+    let mut final_n_collapsed = 0usize;
+
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             if verbose {
@@ -792,13 +797,19 @@ fn run_mcem(
         // ESS diagnostics + marginal log-likelihood for the trace.
         let mut ll = 0.0f64;
         let mut n_low_ess = 0usize;
+        let mut ess_fracs: Vec<f64> = Vec::with_capacity(draws.len());
         for d in &draws {
             ll += d.log_marginal;
             if d.ess_fraction < threshold {
                 n_low_ess += 1;
             }
+            ess_fracs.push(d.ess_fraction);
         }
         let minus2ll = -2.0 * ll;
+        // Track the final E-step's ESS health for the post-fit bias warning.
+        final_n_collapsed = ess_fracs.iter().filter(|&&f| f <= 1e-6).count();
+        ess_fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        final_ess_median = ess_fracs.get(ess_fracs.len() / 2).copied().unwrap_or(1.0);
 
         // Record this iteration's parameters for the trace (opt-in).
         if collect_trace {
@@ -938,6 +949,51 @@ fn run_mcem(
 
     if crate::cancel::is_cancelled(cancel) {
         return Err("cancelled by user".to_string());
+    }
+
+    // ---- Importance-sampling bias warning ----
+    // Self-normalized IS moment estimates carry a finite-sample bias that drives
+    // the M-step. For a fixed proposal quality it scales as ≈ 1/K, but the
+    // constant grows with the sampling dimension, so a sample count that is ample
+    // in low dimensions becomes badly under-sampled for a high-dimensional (e.g.
+    // FREM) model. Empirically the absorption typical value on the FREM workshop
+    // model (13 ETAs) drifts from ~2.6 (FOCEI/NONMEM) to ~4.6 at K=300 and
+    // recovers toward ~2.8 at K=6000 — while the *median* ESS stays ~0.8 the
+    // whole time, so ESS alone does not flag it. Use the per-dimension sample
+    // density K / n_eta as the trigger (≥ ~100 keeps the bias small here), plus
+    // any fully-collapsed subjects. Skip for eval-only IS (no M-step to bias).
+    const MIN_SAMPLES_PER_ETA: usize = 100;
+    let under_sampled = n_eta > 0 && k_opt < MIN_SAMPLES_PER_ETA * n_eta;
+    if !options.is_eval_only && (under_sampled || final_n_collapsed > 0) {
+        let sample_opt = if recenter == ProposalRecenter::Map {
+            "impmap_samples"
+        } else {
+            "is_samples"
+        };
+        let collapse = if final_n_collapsed > 0 {
+            format!(
+                " {} subject(s) had a fully collapsed proposal (ESS ≈ 0), whose moments \
+                 are unreliable regardless of sample count — check their EBE/Hessian quality.",
+                final_n_collapsed
+            )
+        } else {
+            String::new()
+        };
+        let suggestion = (MIN_SAMPLES_PER_ETA * n_eta).max(k_opt);
+        warnings.push(format!(
+            "{label}: only {} importance samples for a {}-ETA model (≈ {} per ETA, median \
+             ESS/K = {:.2}). The weighted M-step moments carry a finite-sample bias that grows \
+             with dimension, so typical-value and Ω estimates may be off — and it shrinks only \
+             as the sample count grows, not as iterations proceed. Raise `{}` to ≳ {} (high-\
+             dimensional / FREM models typically need several thousand) and re-fit.{}",
+            k_opt,
+            n_eta,
+            k_opt / n_eta.max(1),
+            final_ess_median,
+            sample_opt,
+            suggestion,
+            collapse
+        ));
     }
 
     // ---- Final (averaged) parameters ----

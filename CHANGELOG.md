@@ -20,6 +20,25 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- `is_auto` / `impmap_auto` fit options (NONMEM `AUTO`), **on by default**:
+  adaptive importance-sample count. `is_samples` / `impmap_samples` is the
+  *starting* count and is ramped up (×2 per iteration, capped at 10000) whenever
+  the objective's Monte-Carlo standard deviation exceeds 1.0 (NONMEM `STDOBJ`),
+  so high-dimensional / FREM fits reach a low-noise objective automatically
+  instead of carrying a sample-count-dependent M-step bias. On the FREM workshop
+  model (13 ETAs) this ramps 300→10000 and brings the absorption typical value
+  from ~4.6 (fixed K=300) to ~3.0, matching NONMEM. Low-dimensional, well-sampled
+  fits never trip the threshold, so there is no cost there; set `false` to pin
+  the sample count (#411).
+- IMP/IMPMAP now warn when the importance-sample count is low for the model
+  dimension (`K < 100·n_eta`) or when a subject's proposal fully collapses
+  (ESS ≈ 0). The self-normalized M-step moments carry a finite-sample bias that
+  grows with dimension, so high-dimensional / FREM fits at the default sample
+  count can converge to biased typical-value and Ω estimates; the warning
+  recommends raising `impmap_samples` / `is_samples` (#411).
+- `frem_rao_blackwell` fit option (default `true`): toggle the Rao-Blackwellised
+  FREM covariate-ETA integration in IMP/IMPMAP. Set `false` only to diagnose the
+  RB path against the full-dimensional importance sampler (#406).
 - **IIV on residual error (`iiv_on_ruv`)** — a random effect can now scale the
   residual error per subject (NONMEM `Y = IPRED + EPS*EXP(ETA)`). Declare an
   `omega` and reference it from `[error_model]` with `iiv_on_ruv = NAME`; the
@@ -246,6 +265,31 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- **IMPMAP default proposal is now a Student-t** (`impmap_proposal_df = 4`)
+  instead of a multivariate normal. A Gaussian proposal's tails are lighter than
+  the posterior of weakly-identified parameters, so importance weights blow up in
+  the tail and bias the M-step moments — drifting typical-value estimates (e.g.
+  the absorption `MAT`/`KA` on modeled-duration models). The heavier-tailed
+  default removes that bias and matches FOCEI/NONMEM. Set `impmap_proposal_df =
+  normal` for the previous behaviour (#411).
+- **IMP/IMPMAP now warn about estimated parameters with no random effect**: any
+  non-fixed `theta` that has no associated `ETA` is estimated only through the
+  importance-weighted M-step, which is biased for weakly-identified parameters and
+  can converge to the wrong value (e.g. a FREM absorption fraction drifting to ~0.9
+  vs a FOCEI/NONMEM value of ~0.4). The estimator now emits a strong warning naming
+  such parameters and recommending an `ETA` be added (ferx mu-references
+  automatically), the parameter be held `FIX`, or FOCEI be used. `prepare_frem`
+  (`ferx_to_frem`) also surfaces this advisory at conversion time via a new
+  `FremPrepareResult.warnings` field, so it shows up before fitting. (#406)
+- **IMP/IMPMAP now Rao-Blackwellise FREM covariate ETAs**: the Gaussian covariate
+  pseudo-observation ETAs are integrated analytically (conditional PK prior from
+  the Ω precision blocks) and only the PK ETAs are importance-sampled. This turns
+  the high-dimensional, multi-scale IS (≈1–2% effective sample size, unstable
+  M-step) into a well-conditioned low-dimensional one: on the workshop 12-ETA FREM
+  the share of low-ESS subjects dropped from ~80% to ~23%, the −2logL trajectory
+  is smooth (no spikes), and estimates land near NONMEM (TVCL 6.7 vs 6.97, TVMAT
+  2.8 vs 2.75). Automatic for FREM models; falls back to full-dimensional IS if
+  the PK/covariate partition is degenerate. (#406)
 - **`imp` is now a Monte-Carlo EM estimator by default** (NONMEM `METHOD=IMP`
   parity): `method = imp` updates θ/Ω/σ instead of only evaluating the marginal
   `−2 log L`. **Breaking:** model files that used `imp` (e.g. `[focei, imp]`)
@@ -303,6 +347,79 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **IMPMAP warns instead of silently ignoring `impmap_sobol` under a Student-t
+  proposal.** Sobol draws apply only to the multivariate-normal proposal; with
+  the Student-t default `impmap_sobol = true` was a no-op. It now emits a warning
+  pointing to `impmap_proposal_df = normal` (#406).
+- **FREM Rao-Blackwell sampler falls back to full-dimensional IS for covariates
+  with more than one pseudo-obs row.** A time-varying or duplicated covariate
+  row broke the closed-form covariate-likelihood cancellation in the RB marginal;
+  such subjects now use the full-dimensional sampler, which scores every row
+  consistently (#406).
+- **Adaptive-sampling (`is_auto`/`impmap_auto`) trigger is now per-subject.** It
+  used the total-objective Monte-Carlo SE, which grows as √N, so a large but
+  well-sampled dataset could ramp the sample count to the cap purely from subject
+  count. The trigger now normalizes by √N (per-subject objective SE), making it
+  N-independent (#411).
+- **IMP/IMPMAP no longer freeze the typical value of a mu-referenced parameter
+  with negligible IIV**: a log-mu-referenced θ (e.g. `KA = TVKA*exp(ETA_KA)`)
+  whose random effect has a tiny, often `FIX`ed ω was updated only through the
+  closed-form `log θ += mean(η)` shift — which is ≈ 0 when the η carries no
+  variance, leaving the typical value stuck at its initial value. Such
+  parameters are now routed to the weighted-likelihood M-step (the channel that
+  estimates σ and non-mu-ref θ), so the data can move them; a warning names any
+  parameter routed this way. Makes the estimate init-independent (#411).
+- **FREM IMP/IMPMAP marginal −2 log L over-counted by a 2π constant**: the
+  Rao-Blackwellised covariate-data marginal included the covariate pseudo-obs
+  `nc·ln(2π)` normalizer, which the rest of the objective (and NONMEM's
+  "OBJECTIVE FUNCTION WITHOUT CONSTANT") drops. This inflated the reported FREM
+  marginal by `Σ nc·ln(2π)` (≈ n_covariate_obs · ln2π) and made the
+  Rao-Blackwell and full-dimensional importance samplers disagree on the same
+  point. The constant is now dropped in both; the value is otherwise unchanged
+  (it lies outside the importance weights, so estimates were never affected) (#406).
+- **IMP/IMPMAP now report the NONMEM-comparable objective**: estimating `imp` and
+  `impmap` runs surface the importance-sampling Monte-Carlo *marginal* −2 log L —
+  the number NONMEM `METHOD=IMP`/`IMPMAP` reports as its `#OBJV` — evaluated at the
+  final estimates on `FitResult.importance_sampling.minus2_log_likelihood` (± MC
+  SE). Previously this was populated only by the evaluation-only path, so the only
+  available number was the FOCE-Laplace `ofv`, which matches NONMEM's *COND/FOCE*
+  OBJ rather than the IMP marginal and diverges from it on sparse / strongly
+  nonlinear data. `ofv` is unchanged (still a Laplace pass, for cross-method
+  AIC/BIC comparability) (#406).
+- **IMP/IMPMAP no longer diverge on FREM models with missing covariates**: the
+  Rao-Blackwellised E-step previously bailed to the unstable full-dimensional
+  importance sampler for any subject missing a covariate pseudo-observation row
+  (the FREM data omits rows for missing covariate values — ~28% of subjects on
+  the workshop model). Those subjects then blew the −2logL up to ~1e14 within a
+  few iterations under `method = imp`. Missing-covariate etas (which have no data)
+  are now sampled together with the PK etas, conditioning only on the *observed*
+  covariates; both IMP and IMPMAP now converge with near-zero low-ESS subjects and
+  agree on the estimates. (#406)
+- **FREM covariate pseudo-observations are no longer clamped to a positive
+  prediction**: the observation likelihood clamped every prediction to `≥1e-12`,
+  but a FREM covariate pseudo-obs predicts a covariate *value* (centered,
+  standardized, or log-scale covariates are routinely `≤0`). Clamping a
+  non-positive covariate prediction fabricated a huge residual, which corrupted
+  the Rao-Blackwellised IS marginal/weights for affected subjects. Covariate rows
+  now keep their (possibly negative) prediction; ordinary PK rows keep the
+  positivity clamp. (#406)
+- **FREM model generation dropped the `[scaling]` / `[odes]` blocks**: `prepare_frem`
+  now carries the base model's `[scaling]` (e.g. `obs_scale`) and `[odes]` blocks
+  into the generated FREM model. Previously they were silently omitted, so a base
+  model with `obs_scale` (NONMEM `CP = A*1000/V`) produced a FREM model whose
+  predictions were mis-scaled; the estimator then compensated by collapsing a PK
+  typical value (TVCL → ~1e-2 instead of ~7 on the workshop FREM model, now ~6.6
+  vs NONMEM 6.97). (#406)
+- **IMP/IMPMAP on high-dimensional FREM**: the inner EBE/MAP solver no longer
+  returns a nonsensical joint mode on multi-scale FREM posteriors (3 PK + many
+  covariate ETAs). The inner BFGS is now FREM-preconditioned (per-dimension
+  initial inverse-Hessian ≈ posterior variance) and the covariate ETAs are
+  cold-started at their data-implied mode `cov_obs − TV`; the IS proposal jitter
+  is now per-dimension instead of a single global value. Previously the mode
+  collapsed (obs-NLL ~1e8) and standalone IMP/IMPMAP diverged (−2logL ~1e13) on
+  ≥8-covariate FREM models; the typical-value estimates for volume and absorption
+  now recover. (Full NONMEM parity still pending the mu-referencing θ M-step and
+  high-dimensional IS effective-sample-size work — see #406.) (#406)
 - **Bayesian estimation** (`method = bayes`) now samples the per-occasion IOV
   `kappa` block when `OMEGA_IOV` is FIX-ed. Previously an all-FIX `OMEGA_IOV`
   disabled kappa sampling entirely, so the kappas stayed pinned at their initial

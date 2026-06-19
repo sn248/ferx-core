@@ -3722,6 +3722,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "impmap_trace" => opts.impmap_trace = parse_bool("impmap_trace")?,
         "impmap_mceta" => opts.impmap_mceta = parse_usize("impmap_mceta")?,
         "impmap_sobol" => opts.impmap_sobol = parse_bool("impmap_sobol")?,
+        "frem_rao_blackwell" => opts.frem_rao_blackwell = parse_bool("frem_rao_blackwell")?,
+        "is_auto" => opts.is_auto = parse_bool("is_auto")?,
+        "impmap_auto" => opts.impmap_auto = parse_bool("impmap_auto")?,
         "iscale_min" => {
             let v = parse_f64("iscale_min")?;
             if v <= 0.0 {
@@ -11637,8 +11640,8 @@ mod tests {
         assert!(apply_fit_option(&mut o, "impmap_iterations", "0").is_err()); // < 1
         assert!(apply_fit_option(&mut o, "impmap_proposal_df", "0.5").is_err()); // < 1
         assert!(apply_fit_option(&mut o, "impmap_low_ess_threshold", "1.5").is_err()); // > 1
-                                                                                       // Default (MVN) preserved after the failed applies.
-        assert!(o.impmap_proposal_df.is_infinite());
+                                                                                       // Default (Student-t, df=4) preserved after the failed applies.
+        assert_eq!(o.impmap_proposal_df, 4.0);
     }
 
     #[test]
@@ -11664,6 +11667,16 @@ mod tests {
             assert_eq!(apply_fit_option(&mut opts, "sir", v), Ok(true));
             assert!(!opts.sir, "value `{v}` should parse as false");
         }
+    }
+
+    #[test]
+    fn test_apply_fit_option_adaptive_sampling_flags() {
+        let mut opts = FitOptions::default();
+        assert!(opts.is_auto && opts.impmap_auto, "default on");
+        assert_eq!(apply_fit_option(&mut opts, "is_auto", "false"), Ok(true));
+        assert!(!opts.is_auto);
+        assert_eq!(apply_fit_option(&mut opts, "impmap_auto", "no"), Ok(true));
+        assert!(!opts.impmap_auto);
     }
 
     #[test]

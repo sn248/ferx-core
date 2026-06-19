@@ -11640,8 +11640,8 @@ mod tests {
         assert!(apply_fit_option(&mut o, "impmap_iterations", "0").is_err()); // < 1
         assert!(apply_fit_option(&mut o, "impmap_proposal_df", "0.5").is_err()); // < 1
         assert!(apply_fit_option(&mut o, "impmap_low_ess_threshold", "1.5").is_err()); // > 1
-                                                                                       // Default (MVN) preserved after the failed applies.
-        assert!(o.impmap_proposal_df.is_infinite());
+                                                                                       // Default (Student-t, df=4) preserved after the failed applies.
+        assert_eq!(o.impmap_proposal_df, 4.0);
     }
 
     #[test]

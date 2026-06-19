@@ -203,3 +203,38 @@ impl<const N: usize> PkNum for Dual2<N> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sens::dual1::Dual1;
+    use crate::sens::dual2::Dual2;
+
+    /// Exercise every `PkNum` method on a value once, so the per-impl delegators
+    /// (and the underlying `Dual1`/`Dual2` ops they call) are covered. `0.7` is a
+    /// safe argument for all: positive (exp/ln/sqrt/pow), in `(0,1)` (logit/
+    /// inv_logit) and in `[-1,1]` (acos).
+    fn exercise<T: PkNum>(x: T) {
+        let _ = T::from_f64(1.0).val();
+        let _ = x.val();
+        let _ = x.exp().val();
+        let _ = x.ln().val();
+        let _ = x.sqrt().val();
+        let _ = x.pow(T::from_f64(2.0)).val();
+        let _ = x.abs().val();
+        let _ = (-x.abs()).abs().val(); // negative branch of abs
+        let _ = x.cos().val();
+        let _ = x.acos().val();
+        let _ = x.inv_logit().val();
+        let _ = x.logit().val();
+        let _ = x.guard_floor(1e-6).val();
+        let _ = x.guard_floor(10.0).val(); // floor-active branch
+    }
+
+    #[test]
+    fn pknum_all_methods_covered_for_each_impl() {
+        exercise::<f64>(0.7);
+        exercise::<Dual1<1>>(Dual1::var(0.7, 0));
+        exercise::<Dual2<1>>(Dual2::var(0.7, 0));
+    }
+}

@@ -248,6 +248,17 @@ impl<const N: usize> Div for Dual1<N> {
 mod tests {
     use super::*;
 
+    /// `sqrt` at a zero/rounded-negative argument with a seeded gradient must
+    /// return finite, zero derivatives (not `inf`/`NaN` from `1/(2√x)`).
+    #[test]
+    fn dual1_sqrt_zero_argument_is_finite() {
+        let r = Dual1::<2>::var(0.0, 0).sqrt();
+        assert_eq!(r.value, 0.0);
+        assert!(r.grad.iter().all(|g| g.is_finite() && *g == 0.0));
+        let neg = Dual1::<2>::var(-1e-18, 0).sqrt();
+        assert!(neg.value.is_finite() && neg.grad.iter().all(|g| g.is_finite()));
+    }
+
     /// Validate a `Dual1<2>` expression's gradient against central finite
     /// differences of its value, at `(x, y)`.
     fn fd_check<F>(f: F, x: f64, y: f64, gtol: f64)

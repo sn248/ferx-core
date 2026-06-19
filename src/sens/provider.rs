@@ -120,9 +120,10 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
 /// Master switch for the user-ODE sensitivity path (issue #367, Option A). The
 /// provider in [`crate::sens::ode_provider`] is complete and tested, but the
 /// analytic-sensitivity rollout ships scoped to the analytical PK models first;
-/// ODE-model sensitivities are a deferred follow-up. While `false`, ODE models
-/// take the prior path (gradient-free outer, AD/FD inner) and the infrastructure
-/// stays compiled and exercised by its own tests. Flip to `true` to re-arm.
+/// arming ODE-model sensitivities is the deferred follow-up tracked in **#410**
+/// (flip this flag, harden the `obs_map` time matching, NONMEM/perf validation).
+/// While `false`, ODE models take the prior path (gradient-free outer, FD inner)
+/// and the infrastructure stays compiled and exercised by its own tests.
 const ODE_SENS_ENABLED: bool = false;
 
 /// Escape hatch: `FERX_DISABLE_EXPLICIT_SENS=1` forces every subject onto the

@@ -30,7 +30,7 @@
 //! `pλ≈0`) and invalid cases fall back to the dual path.
 
 use super::dual2::Dual2;
-use super::jet::Jet;
+use super::jet::{over_v1, Jet};
 use super::three_cpt::{
     three_cpt_infusion_g, three_cpt_infusion_ss_g, three_cpt_iv_bolus_g, three_cpt_iv_bolus_ss_g,
     three_cpt_oral_g, three_cpt_oral_ss_g,
@@ -148,16 +148,6 @@ fn macro_rate_jets_3cpt<const N: usize>(
     let gamma = root_jet(gv, &e1, &e2, &e3)?;
     let beta = e1.sub(alpha).sub(gamma);
     Some((alpha, beta, gamma, k21, k31))
-}
-
-/// `num/V1` as a jet: depends on `V1` only (seed axis 1). Used for the `amt/V1`
-/// (bolus) and `rate/V1` (infusion) prefactors.
-#[inline]
-fn over_v1<const N: usize>(num: f64, v1: f64) -> Jet<N> {
-    let mut j = Jet::<N>::cst(num / v1);
-    j.g[1] = -num / (v1 * v1);
-    j.h[1][1] = 2.0 * num / (v1 * v1 * v1);
-    j
 }
 
 /// `(f, ∂f/∂[CL,V1,Q2,V2,Q3,V3], ∂²f/∂[CL,V1,Q2,V2,Q3,V3]²)` for the 3-cpt IV

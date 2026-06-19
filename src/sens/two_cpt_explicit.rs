@@ -20,7 +20,7 @@
 //! path.
 
 use super::dual2::Dual2;
-use super::jet::Jet;
+use super::jet::{over_v1, Jet};
 use super::two_cpt::{
     two_cpt_infusion_g, two_cpt_infusion_ss_g, two_cpt_iv_bolus_g, two_cpt_iv_bolus_ss_g,
     two_cpt_oral_g, two_cpt_oral_ss_g,
@@ -89,15 +89,6 @@ fn macro_rate_jets<const N: usize>(
     alpha.symmetrise();
     beta.symmetrise();
     Some((alpha, beta, k21))
-}
-
-/// `R/V1` (or `amt/V1`) as a jet: depends on `V1` only (axis 1).
-#[inline]
-fn over_v1<const N: usize>(num: f64, v1: f64) -> Jet<N> {
-    let mut j = Jet::<N>::cst(num / v1);
-    j.g[1] = -num / (v1 * v1);
-    j.h[1][1] = 2.0 * num / (v1 * v1 * v1);
-    j
 }
 
 /// `(f, ∂f/∂[CL,V1,Q,V2], ∂²f/∂[CL,V1,Q,V2]²)` for the 2-cpt IV bolus.

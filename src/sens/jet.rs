@@ -167,3 +167,14 @@ impl<const N: usize> Jet<N> {
         }
     }
 }
+
+/// `R/V1` (or `amt/V1`) as a jet of a constant numerator over the central
+/// volume `V1` (PK axis 1): `f = num/V1`, `∂f/∂V1 = −num/V1²`,
+/// `∂²f/∂V1² = 2·num/V1³`. Shared by the 2-/3-cpt explicit kernels, which seed
+/// `V1` on axis 1 (`CL=0, V1=1, …`).
+pub fn over_v1<const N: usize>(num: f64, v1: f64) -> Jet<N> {
+    let mut j = Jet::<N>::cst(num / v1);
+    j.g[1] = -num / (v1 * v1);
+    j.h[1][1] = 2.0 * num / (v1 * v1 * v1);
+    j
+}

@@ -106,6 +106,10 @@ pub fn three_cpt_iv_bolus_g<T: PkNum>(
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
+    // Confluent eigenvalues (any of α≈β, α≈γ, β≈γ): the spectral form carries
+    // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
+    // for physical PK params (distinct real eigenvalues); return 0 rather than the
+    // confluent limit form — a deliberate edge (PR #381, review #1).
     if ab.val().abs() < 1e-12 || ag.val().abs() < 1e-12 || bg.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }
@@ -197,6 +201,10 @@ pub fn three_cpt_oral_g<T: PkNum>(
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
+    // Confluent eigenvalues (any of α≈β, α≈γ, β≈γ): the spectral form carries
+    // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
+    // for physical PK params (distinct real eigenvalues); return 0 rather than the
+    // confluent limit form — a deliberate edge (PR #381, review #1).
     if ab.val().abs() < 1e-12 || ag.val().abs() < 1e-12 || bg.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }
@@ -254,6 +262,10 @@ pub fn three_cpt_iv_bolus_ss_g<T: PkNum>(
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
+    // Confluent eigenvalues (any of α≈β, α≈γ, β≈γ): the spectral form carries
+    // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
+    // for physical PK params (distinct real eigenvalues); return 0 rather than the
+    // confluent limit form — a deliberate edge (PR #381, review #1).
     if ab.val().abs() < 1e-12 || ag.val().abs() < 1e-12 || bg.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }
@@ -296,6 +308,10 @@ pub fn three_cpt_oral_ss_g<T: PkNum>(
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
+    // Confluent eigenvalues (any of α≈β, α≈γ, β≈γ): the spectral form carries
+    // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
+    // for physical PK params (distinct real eigenvalues); return 0 rather than the
+    // confluent limit form — a deliberate edge (PR #381, review #1).
     if ab.val().abs() < 1e-12 || ag.val().abs() < 1e-12 || bg.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }

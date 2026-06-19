@@ -43,6 +43,10 @@ pub fn two_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T) -
     }
     let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
     let diff = alpha - beta;
+    // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
+    // poles, undefined at exact root coalescence. Measure-zero for physical PK
+    // params (distinct real eigenvalues); return 0 rather than the confluent
+    // (A+B·t)·e^{−αt} limit — a deliberate edge (PR #381, review #1).
     if diff.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }
@@ -95,6 +99,10 @@ pub fn two_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T, ka: T
     }
     let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
     let diff = alpha - beta;
+    // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
+    // poles, undefined at exact root coalescence. Measure-zero for physical PK
+    // params (distinct real eigenvalues); return 0 rather than the confluent
+    // (A+B·t)·e^{−αt} limit — a deliberate edge (PR #381, review #1).
     if diff.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }
@@ -139,6 +147,10 @@ pub fn two_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v1: T, q:
     }
     let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
     let diff = alpha - beta;
+    // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
+    // poles, undefined at exact root coalescence. Measure-zero for physical PK
+    // params (distinct real eigenvalues); return 0 rather than the confluent
+    // (A+B·t)·e^{−αt} limit — a deliberate edge (PR #381, review #1).
     if diff.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }
@@ -173,6 +185,10 @@ pub fn two_cpt_oral_ss_g<T: PkNum>(
     }
     let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
     let diff = alpha - beta;
+    // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
+    // poles, undefined at exact root coalescence. Measure-zero for physical PK
+    // params (distinct real eigenvalues); return 0 rather than the confluent
+    // (A+B·t)·e^{−αt} limit — a deliberate edge (PR #381, review #1).
     if diff.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }

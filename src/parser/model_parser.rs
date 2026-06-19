@@ -3703,6 +3703,8 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "impmap_mceta" => opts.impmap_mceta = parse_usize("impmap_mceta")?,
         "impmap_sobol" => opts.impmap_sobol = parse_bool("impmap_sobol")?,
         "frem_rao_blackwell" => opts.frem_rao_blackwell = parse_bool("frem_rao_blackwell")?,
+        "is_auto" => opts.is_auto = parse_bool("is_auto")?,
+        "impmap_auto" => opts.impmap_auto = parse_bool("impmap_auto")?,
         "iscale_min" => {
             let v = parse_f64("iscale_min")?;
             if v <= 0.0 {
@@ -11620,6 +11622,16 @@ mod tests {
             assert_eq!(apply_fit_option(&mut opts, "sir", v), Ok(true));
             assert!(!opts.sir, "value `{v}` should parse as false");
         }
+    }
+
+    #[test]
+    fn test_apply_fit_option_adaptive_sampling_flags() {
+        let mut opts = FitOptions::default();
+        assert!(opts.is_auto && opts.impmap_auto, "default on");
+        assert_eq!(apply_fit_option(&mut opts, "is_auto", "false"), Ok(true));
+        assert!(!opts.is_auto);
+        assert_eq!(apply_fit_option(&mut opts, "impmap_auto", "no"), Ok(true));
+        assert!(!opts.impmap_auto);
     }
 
     #[test]

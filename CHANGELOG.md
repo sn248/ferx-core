@@ -20,6 +20,22 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- `is_auto` / `impmap_auto` fit options (NONMEM `AUTO`), **on by default**:
+  adaptive importance-sample count. `is_samples` / `impmap_samples` is the
+  *starting* count and is ramped up (×2 per iteration, capped at 10000) whenever
+  the objective's Monte-Carlo standard deviation exceeds 1.0 (NONMEM `STDOBJ`),
+  so high-dimensional / FREM fits reach a low-noise objective automatically
+  instead of carrying a sample-count-dependent M-step bias. On the FREM workshop
+  model (13 ETAs) this ramps 300→10000 and brings the absorption typical value
+  from ~4.6 (fixed K=300) to ~3.0, matching NONMEM. Low-dimensional, well-sampled
+  fits never trip the threshold, so there is no cost there; set `false` to pin
+  the sample count (#411).
+- IMP/IMPMAP now warn when the importance-sample count is low for the model
+  dimension (`K < 100·n_eta`) or when a subject's proposal fully collapses
+  (ESS ≈ 0). The self-normalized M-step moments carry a finite-sample bias that
+  grows with dimension, so high-dimensional / FREM fits at the default sample
+  count can converge to biased typical-value and Ω estimates; the warning
+  recommends raising `impmap_samples` / `is_samples` (#411).
 - `frem_rao_blackwell` fit option (default `true`): toggle the Rao-Blackwellised
   FREM covariate-ETA integration in IMP/IMPMAP. Set `false` only to diagnose the
   RB path against the full-dimensional importance sampler (#406).
@@ -314,6 +330,14 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **IMP/IMPMAP no longer freeze the typical value of a mu-referenced parameter
+  with negligible IIV**: a log-mu-referenced θ (e.g. `KA = TVKA*exp(ETA_KA)`)
+  whose random effect has a tiny, often `FIX`ed ω was updated only through the
+  closed-form `log θ += mean(η)` shift — which is ≈ 0 when the η carries no
+  variance, leaving the typical value stuck at its initial value. Such
+  parameters are now routed to the weighted-likelihood M-step (the channel that
+  estimates σ and non-mu-ref θ), so the data can move them; a warning names any
+  parameter routed this way. Makes the estimate init-independent (#411).
 - **FREM IMP/IMPMAP marginal −2 log L over-counted by a 2π constant**: the
   Rao-Blackwellised covariate-data marginal included the covariate pseudo-obs
   `nc·ln(2π)` normalizer, which the rest of the objective (and NONMEM's

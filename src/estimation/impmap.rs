@@ -64,6 +64,15 @@ fn floor_omega_diagonal(omega_mat: &mut DMatrix<f64>, omega_fixed: &[bool], floo
 /// Positive-definite floor for free Ω diagonals (matches the SAEM constant).
 const OMEGA_DIAG_FLOOR: f64 = 1e-6;
 
+/// Adaptive-sampling (`auto`) target for the objective's Monte-Carlo standard
+/// deviation, in −2 log L units. Mirrors NONMEM's `AUTO` default `STDOBJ = 1.0`:
+/// the per-subject sample count is ramped until the objective MC SE drops to
+/// this level, so the M-step is driven by signal, not sampling noise.
+const AUTO_STDOBJ_TARGET: f64 = 1.0;
+
+/// Hard cap on the adaptive per-subject sample count (NONMEM `ISAMPEND` default).
+const AUTO_SAMPLES_MAX: usize = 10_000;
+
 /// Absolute lower bound on the IMP proposal-covariance diagonal — a numerical
 /// guard against a literally-zero (degenerate-ESS) variance, NOT a statistical
 /// floor. It must stay well below any real conditional variance: with rich data
@@ -296,6 +305,7 @@ pub fn run_impmap(
         options.impmap_mceta,
         options.impmap_sobol && nu.is_infinite(),
         options.impmap_trace,
+        options.impmap_auto,
     )
 }
 
@@ -328,6 +338,7 @@ pub fn run_imp(
         0,     // mceta: no multi-start MAP for IMP
         false, // use_sobol: IMP has no Sobol option
         false, // collect_trace: IMP has no trace option
+        options.is_auto,
     )
 }
 
@@ -352,6 +363,7 @@ fn run_mcem(
     mceta: usize,
     use_sobol: bool,
     collect_trace: bool,
+    auto: bool,
 ) -> Result<OuterResult, String> {
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
@@ -386,7 +398,9 @@ fn run_mcem(
     }
 
     let n_iter = n_iter_opt.max(1);
-    let k_samples = k_opt.max(2);
+    // `k_samples` is mutable so the adaptive (`auto`) path can ramp it up between
+    // iterations when the objective is too Monte-Carlo-noisy (NONMEM `AUTO`).
+    let mut k_samples = k_opt.max(2);
     // `INFINITY` selects the multivariate-normal proposal; any finite value must
     // be a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
     // bypasses the parser's range check can't reach the `ChiSquared::new(nu)`
@@ -512,7 +526,37 @@ fn run_mcem(
     }
 
     let mu_ref_pairs = mu_ref_log_pairs(model);
-    let use_closed_form = !mu_ref_pairs.is_empty();
+    // A log-mu-referenced typical value is updated only through the closed-form
+    // `log θ += mean(η)` shift. When its paired η carries negligible IIV (a tiny,
+    // often `FIX`ed ω — e.g. a structural parameter given a dummy random effect
+    // so it can be mu-referenced), that population mean is ≈ 0 and the typical
+    // value would be frozen at its initial value (#411). Route those pairs to the
+    // weighted-likelihood M-step instead (the same channel that estimates σ and
+    // non-mu-ref θ), where the data can actually move them. Decided once from the
+    // initial Ω so a parameter never toggles channels between iterations.
+    const WEAK_IIV_VAR: f64 = 1e-3;
+    let weak_mu_ref: std::collections::HashSet<usize> = mu_ref_pairs
+        .iter()
+        .filter(|&&(_t, e)| init_params.omega.matrix[(e, e)] < WEAK_IIV_VAR)
+        .map(|&(t, _e)| t)
+        .collect();
+    if !weak_mu_ref.is_empty() {
+        let mut names: Vec<&str> = weak_mu_ref
+            .iter()
+            .map(|&t| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
+            .collect();
+        names.sort_unstable();
+        warnings.push(format!(
+            "{label}: typical value(s) {} are log-mu-referenced but their random effect has \
+             negligible variance (ω < {WEAK_IIV_VAR:.0e}); the mu-ref mean-shift carries no \
+             information, so they are estimated through the weighted M-step instead.",
+            names.join(", ")
+        ));
+    }
+    // Closed-form mu-ref shift is used as long as at least one pair has real IIV.
+    let use_closed_form = mu_ref_pairs
+        .iter()
+        .any(|&(t, _e)| !weak_mu_ref.contains(&t));
     if !use_closed_form {
         // No log-mu-ref parameter: every typical value goes through the weighted
         // M-step, which cannot resolve the θ/η-mean confounding on its own. Flag
@@ -564,6 +608,15 @@ fn run_mcem(
     } else {
         Vec::new()
     };
+
+    // ESS state from the final completed E-step, used to flag importance-sampling
+    // moment bias (which scales as 1/(K·ESS) and is severe in high dimensions).
+    let mut final_ess_median = 1.0_f64;
+    let mut final_n_collapsed = 0usize;
+    // Effective (possibly ramped) sample count and the final objective MC SE,
+    // for the post-fit under-sampling warning.
+    let mut final_k_samples = k_samples;
+    let mut final_mc_se = 0.0_f64;
 
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
@@ -762,13 +815,47 @@ fn run_mcem(
         // ESS diagnostics + marginal log-likelihood for the trace.
         let mut ll = 0.0f64;
         let mut n_low_ess = 0usize;
+        let mut ess_fracs: Vec<f64> = Vec::with_capacity(draws.len());
         for d in &draws {
             ll += d.log_marginal;
             if d.ess_fraction < threshold {
                 n_low_ess += 1;
             }
+            ess_fracs.push(d.ess_fraction);
         }
         let minus2ll = -2.0 * ll;
+        // Objective Monte-Carlo standard error from the self-normalized ESS
+        // (Geweke: Var(log p̂ᵢ) ≈ (1/ESS_frac − 1)/K; degenerate subjects get a
+        // finite fallback). −2 log L scales this by 2.
+        let var_ll: f64 = ess_fracs
+            .iter()
+            .map(|&f| {
+                if f > 1e-6 {
+                    ((1.0 / f) - 1.0).max(0.0) / k_samples as f64
+                } else {
+                    1.0
+                }
+            })
+            .sum();
+        let mc_se = 2.0 * var_ll.sqrt();
+        final_mc_se = mc_se;
+        final_k_samples = k_samples;
+        // Adaptive sampling (NONMEM `AUTO`): ramp K up (×2, capped) while the
+        // objective is too MC-noisy, so the M-step is driven by signal not noise.
+        if auto && mc_se > AUTO_STDOBJ_TARGET && k_samples < AUTO_SAMPLES_MAX {
+            let new_k = (k_samples.saturating_mul(2)).min(AUTO_SAMPLES_MAX);
+            if verbose {
+                eprintln!(
+                    "{label}: auto-sampling — objective MC SE {mc_se:.2} > {AUTO_STDOBJ_TARGET:.1}, \
+                     raising K {k_samples} → {new_k}"
+                );
+            }
+            k_samples = new_k;
+        }
+        // Track the final E-step's ESS health for the post-fit bias warning.
+        final_n_collapsed = ess_fracs.iter().filter(|&&f| f <= 1e-6).count();
+        ess_fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        final_ess_median = ess_fracs.get(ess_fracs.len() / 2).copied().unwrap_or(1.0);
 
         // Record this iteration's parameters for the trace (opt-in).
         if collect_trace {
@@ -809,6 +896,11 @@ fn run_mcem(
         let mut mstep_theta_upper = log_theta_upper.clone();
         if use_closed_form {
             for &(t, _e) in &mu_ref_pairs {
+                // Weak-IIV mu-ref θ are estimated by this M-step, not the shift,
+                // so leave their bounds free here.
+                if weak_mu_ref.contains(&t) {
+                    continue;
+                }
                 mstep_theta_lower[t] = log_theta[t];
                 mstep_theta_upper[t] = log_theta[t];
             }
@@ -844,6 +936,11 @@ fn run_mcem(
                 *acc /= n_subjects as f64;
             }
             for &(t, e) in &mu_ref_pairs {
+                // Weak-IIV mu-ref θ were already updated by the weighted M-step;
+                // their η-mean shift is ≈ 0 and uninformative — skip it.
+                if weak_mu_ref.contains(&t) {
+                    continue;
+                }
                 log_theta[t] =
                     (log_theta[t] + eta_bar[e]).clamp(log_theta_lower[t], log_theta_upper[t]);
             }
@@ -898,6 +995,71 @@ fn run_mcem(
 
     if crate::cancel::is_cancelled(cancel) {
         return Err("cancelled by user".to_string());
+    }
+
+    // ---- Importance-sampling bias warning ----
+    // Self-normalized IS moment estimates carry a finite-sample bias that drives
+    // the M-step. For a fixed proposal quality it scales as ≈ 1/K, but the
+    // constant grows with the sampling dimension, so a sample count that is ample
+    // in low dimensions becomes badly under-sampled for a high-dimensional (e.g.
+    // FREM) model. Empirically the absorption typical value on the FREM workshop
+    // model (13 ETAs) drifts from ~2.6 (FOCEI/NONMEM) to ~4.6 at K=300 and
+    // recovers toward ~2.8 at K=6000 — while the *median* ESS stays ~0.8 the
+    // whole time, so ESS alone does not flag it. Use the per-dimension sample
+    // density K / n_eta as the trigger (≥ ~100 keeps the bias small here), plus
+    // any fully-collapsed subjects. Skip for eval-only IS (no M-step to bias).
+    // Triggers, using the *effective* (possibly auto-ramped) sample count:
+    //  - too few samples for the dimension (a fast proxy that catches the common
+    //    case before the MC SE is even trustworthy), or
+    //  - the objective is still MC-noisy at the end (the direct measure — also
+    //    fires when `auto` ramped to the cap and could not reach the target), or
+    //  - a subject's proposal fully collapsed.
+    const MIN_SAMPLES_PER_ETA: usize = 100;
+    // The dimension heuristic only applies when `auto` is off — with `auto` on,
+    // a low starting count is fine because it ramps when (and only when) the
+    // objective is actually noisy, so the direct MC-SE check is the only trigger.
+    let under_sampled = !auto && n_eta > 0 && final_k_samples < MIN_SAMPLES_PER_ETA * n_eta;
+    let noisy = final_mc_se > 2.0 * AUTO_STDOBJ_TARGET;
+    if !options.is_eval_only && (under_sampled || noisy || final_n_collapsed > 0) {
+        let (sample_opt, auto_opt) = if recenter == ProposalRecenter::Map {
+            ("impmap_samples", "impmap_auto")
+        } else {
+            ("is_samples", "is_auto")
+        };
+        let collapse = if final_n_collapsed > 0 {
+            format!(
+                " {} subject(s) had a fully collapsed proposal (ESS ≈ 0), whose moments \
+                 are unreliable regardless of sample count — check their EBE/Hessian quality.",
+                final_n_collapsed
+            )
+        } else {
+            String::new()
+        };
+        let advice = if auto {
+            format!(
+                "`{auto_opt}` is enabled but the sample count {} (cap {AUTO_SAMPLES_MAX}) \
+                 was not enough to reach the MC-SE target.",
+                final_k_samples
+            )
+        } else {
+            format!(
+                "Raise `{sample_opt}` (high-dimensional / FREM models typically need several \
+                 thousand) or set `{auto_opt} = true` to ramp it automatically."
+            )
+        };
+        warnings.push(format!(
+            "{label}: {} importance samples for a {}-ETA model give a noisy objective \
+             (MC SE = {:.2}, target {:.1}; median ESS/K = {:.2}). The weighted M-step moments \
+             then carry a finite-sample bias — typical-value and Ω estimates may be off, and it \
+             shrinks only as the sample count grows. {}{}",
+            final_k_samples,
+            n_eta,
+            final_mc_se,
+            AUTO_STDOBJ_TARGET,
+            final_ess_median,
+            advice,
+            collapse
+        ));
     }
 
     // ---- Final (averaged) parameters ----

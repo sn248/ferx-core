@@ -349,7 +349,7 @@ fn equilibrate_ss_state_event_driven(
     };
 
     // Constant params across all SS-equilibration cycles → one eigendata solve.
-    let mut eigen = crate::sens::propagate::EigenCacheG::<f64>::default();
+    let mut eigen = crate::sens::propagate::EigenCacheG::default();
     for _ in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
         if !is_inf {
             // Bolus pulse: instantaneous amount jump (with F).
@@ -397,7 +397,7 @@ fn ss_state_at_phase_event_driven(
     }
 
     let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
-    let mut eigen = crate::sens::propagate::EigenCacheG::<f64>::default();
+    let mut eigen = crate::sens::propagate::EigenCacheG::default();
     if is_inf {
         let t_inf = dose.duration;
         let synthetic_dose = vec![DoseEvent::new(
@@ -557,7 +557,7 @@ fn event_driven_predictions_with_schedule_impl(
     // disposition params are constant across every interval, so the 2-/3-cpt
     // eigenvalue solve runs once and is reused (the Schnider speedup). A TV-cov
     // change is a cache miss that recomputes transparently.
-    let mut eigen = crate::sens::propagate::EigenCacheG::<f64>::default();
+    let mut eigen = crate::sens::propagate::EigenCacheG::default();
 
     for (i, ev) in schedule.events.iter().enumerate() {
         // EVID=3 / EVID=4 reset: zero every compartment. Any drug carried
@@ -738,7 +738,7 @@ fn propagate_with_bounds(
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
     reset_floor: f64,
-    eigen: &mut crate::sens::propagate::EigenCacheG<f64>,
+    eigen: &mut crate::sens::propagate::EigenCacheG,
 ) {
     for w in bounds.windows(2) {
         let s0 = w[0];

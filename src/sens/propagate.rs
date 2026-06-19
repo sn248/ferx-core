@@ -607,32 +607,30 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
     }
 }
 
-/// Per-walk eigendata memo, keyed on the disposition parameter **values**. For a
-/// constant-parameter walk every interval shares the same params, so the 2-/3-cpt
-/// eigenvalue solve (`sqrt` / `acos`) runs once and is reused across all intervals;
-/// a time-varying-covariate change is a cache miss that recomputes transparently,
-/// so results are bit-identical either way. Generic over `T` — the f64 prediction
-/// walk (the path the original per-walk cache sped up on Schnider) and any `Dual2`
-/// caller share one memo and, via the `*_core_g` propagators, one formula.
-pub struct EigenCacheG<T: PkNum> {
-    two: Option<([f64; 4], Option<TwoCptEigen<T>>)>,
-    three: Option<([f64; 6], Option<ThreeCptEigen<T>>)>,
+/// Per-walk eigendata memo for the **f64 prediction walk**, keyed on the
+/// disposition parameter values. For a constant-parameter walk every interval
+/// shares the same params, so the 2-/3-cpt eigenvalue solve (`sqrt` / `acos`)
+/// runs once and is reused across all intervals; a time-varying-covariate change
+/// is a cache miss that recomputes transparently, so results are bit-identical
+/// either way.
+///
+/// **`f64` only, by design.** The key is the parameter *value*, which uniquely
+/// determines the eigendata for plain `f64`. A `Dual2` caller must NOT memoise
+/// here: two events can share a primal value while carrying different derivative
+/// seeds (IOV occasions, TV covariates), so a value key would return the wrong
+/// grad/Hessian. The `Dual2` sensitivity walk recomputes eigendata inline for
+/// exactly that reason; the propagators still share one formula via `*_core_g`.
+#[derive(Default)]
+pub struct EigenCacheG {
+    two: Option<([f64; 4], Option<TwoCptEigen<f64>>)>,
+    three: Option<([f64; 6], Option<ThreeCptEigen<f64>>)>,
 }
 
-impl<T: PkNum> Default for EigenCacheG<T> {
-    fn default() -> Self {
-        Self {
-            two: None,
-            three: None,
-        }
-    }
-}
-
-impl<T: PkNum> EigenCacheG<T> {
+impl EigenCacheG {
     /// 2-cpt eigendata for these params, computed once and reused while the param
     /// values are unchanged. `None` for degenerate params.
-    pub fn two_cpt(&mut self, cl: T, v1: T, q: T, v2: T) -> Option<TwoCptEigen<T>> {
-        let key = [cl.val(), v1.val(), q.val(), v2.val()];
+    pub fn two_cpt(&mut self, cl: f64, v1: f64, q: f64, v2: f64) -> Option<TwoCptEigen<f64>> {
+        let key = [cl, v1, q, v2];
         if let Some((k, e)) = self.two {
             if k == key {
                 return e;
@@ -647,14 +645,14 @@ impl<T: PkNum> EigenCacheG<T> {
     /// values are unchanged. `None` for degenerate params.
     pub fn three_cpt(
         &mut self,
-        cl: T,
-        v1: T,
-        q2: T,
-        v2: T,
-        q3: T,
-        v3: T,
-    ) -> Option<ThreeCptEigen<T>> {
-        let key = [cl.val(), v1.val(), q2.val(), v2.val(), q3.val(), v3.val()];
+        cl: f64,
+        v1: f64,
+        q2: f64,
+        v2: f64,
+        q3: f64,
+        v3: f64,
+    ) -> Option<ThreeCptEigen<f64>> {
+        let key = [cl, v1, q2, v2, q3, v3];
         if let Some((k, e)) = self.three {
             if k == key {
                 return e;

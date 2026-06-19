@@ -7,11 +7,13 @@
 //! `∂²f/∂η²`, `∂²f/∂η∂θ` via closed-form chain rule (η enters only as
 //! `pk = tv·exp(sel·η)`; θ through `tv_fn`).
 //!
-//! Two implementation styles are being compared on the 1-cpt model before we
-//! commit to one for 2-/3-cpt — see [`one_cpt`]:
-//!   * hand-written closed-form derivatives, and
+//! Two implementation styles ship together and are kept in lockstep (a per-kernel
+//! parity test cross-checks them for every PK model / dose kind):
+//!   * hand-written closed-form derivatives (`*_explicit`) — the default fast path
+//!     the provider selects when a kernel covers every dose; and
 //!   * the same solution evaluated over the [`dual2::Dual2`] forward-2nd-order
-//!     dual number.
+//!     dual number — the general path, used for lagtime / oral-infusion / `F`-on-IV
+//!     and any dose the explicit kernels don't cover.
 
 pub mod dual1;
 pub mod dual2;

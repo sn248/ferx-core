@@ -699,8 +699,10 @@ pub fn subject_packed_gradient(
 ) -> Option<Vec<f64>> {
     // M3/BLOQ: censored rows enter through `prepare` (data term `−logΦ`, true
     // inner Hessian; excluded from `H̃`/`log|H̃|` — matching `gaussian_foce_accum`).
-    // This is the FOCEI (interaction) path that M3 always promotes to; plain FOCE
-    // with M3 still falls back to FD in `subject_packed_gradient_foce`.
+    // This is the FOCEI (interaction) path that non-IOV M3 promotes to; plain FOCE
+    // with M3 has its own analytic censored path in `subject_packed_gradient_foce`
+    // (guarded by `population_packed_gradient_m3_foce_matches_fd`). IOV+M3 routes to
+    // FD via `iov_analytical_supported`.
     let params = unpack_params(x, template);
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
     let prep = prepare(model, subject, &params, &sens)?;

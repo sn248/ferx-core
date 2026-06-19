@@ -1661,7 +1661,15 @@ fn subject_sensitivities_impl(
     // `Dual2<N>`). `FERX_DISABLE_EXPLICIT_SENS=1` forces the dual path everywhere.
     // Lagtime forces the generic path too: the explicit kernels read a plain `f64`
     // elapsed time and so can't carry the `∂elapsed/∂lagtime` sensitivity.
-    let explicit_kind = if explicit_sens_disabled() || model.has_lagtime() {
+    // The explicit IV-bolus / infusion kernels don't carry bioavailability `F`
+    // (it is only baked into the oral-depot bolus form). So when `F != 1` and the
+    // subject has any non-oral-bolus dose (IV bolus, or an infusion — which
+    // bypasses the depot even on oral models), route the whole subject to the
+    // `Dual2` path, whose `*_conc_g` applies the production `route_f_scale`
+    // post-multiply (#327). When `f_bio == 1` the explicit path is `F`-exact.
+    let f_affects_non_oral =
+        pk.f_bio() != 1.0 && subject.doses.iter().any(|d| !(oral && !d.is_infusion()));
+    let explicit_kind = if explicit_sens_disabled() || model.has_lagtime() || f_affects_non_oral {
         None
     } else {
         let kind = match model.pk_model {
@@ -2571,6 +2579,41 @@ mod tests {
         let eta_or = vec![0.12, -0.08, 0.2];
         let oral_s = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), &times);
         check_provider_vs_production(&oral_m, &oral_s, &theta_or, &eta_or);
+    }
+
+    /// Regression: bioavailability `F` on an IV bolus / infusion must be applied
+    /// in the sensitivity path too. Production scales non-oral routes by `F` since
+    /// #327 (`route_f_scale`); before the `*_conc_g` post-multiply fix the sens IV
+    /// branch ignored `F`, so the analytic gradient/Jacobian was computed for a
+    /// different (unscaled) prediction surface than the FOCEI objective.
+    #[test]
+    fn provider_iv_with_bioavailability_matches_production() {
+        const ONECPT_IV_F: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVF(0.7, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_F  ~ 0.05
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  F  = TVF  * exp(ETA_F)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let times = [0.25, 1.0, 2.0, 4.0, 8.0];
+        let m = parse_model_string(ONECPT_IV_F).expect("parse");
+        let theta = vec![10.0, 50.0, 0.7];
+        let eta = vec![0.1, -0.05, 0.2];
+        let bolus = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), &times);
+        let infusion = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0), &times);
+        check_provider_vs_production(&m, &bolus, &theta, &eta);
+        check_provider_vs_production(&m, &infusion, &theta, &eta);
     }
 
     #[test]

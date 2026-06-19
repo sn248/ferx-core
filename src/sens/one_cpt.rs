@@ -146,6 +146,13 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
 /// the generic counterpart to [`crate::pk::one_cpt_predict`]. `oral` selects the
 /// absorption route (the PK model is per-subject-static, so this is a flag, not
 /// per-dose). `cl`/`v`/`ka`/`f_bio` are the seeded PK params.
+///
+/// Bioavailability `F` follows the same `route_f_scale` rule as the production
+/// predictor ([`crate::pk::predict_concentration`]): the oral-depot bolus form
+/// bakes `F` in (so it takes the `1.0` branch), while IV bolus and every infusion
+/// (which bypass the depot even on oral models) use an `F`-agnostic closed form
+/// and get `F` by post-multiplying the linear-in-dose result — seeded through
+/// `f_bio` so `∂C/∂F` is exact (#327).
 pub fn one_cpt_conc_g<T: PkNum>(
     dose: &DoseEvent,
     t: T,
@@ -155,7 +162,8 @@ pub fn one_cpt_conc_g<T: PkNum>(
     f_bio: T,
     oral: bool,
 ) -> T {
-    if dose.ss && dose.ii > 0.0 {
+    let oral_bolus = oral && !dose.is_infusion();
+    let raw = if dose.ss && dose.ii > 0.0 {
         if dose.is_infusion() {
             one_cpt_infusion_ss_g(dose.rate, dose.duration, dose.amt, t, dose.ii, cl, v)
         } else if oral {
@@ -169,6 +177,11 @@ pub fn one_cpt_conc_g<T: PkNum>(
         one_cpt_oral_g(dose.amt, t, cl, v, ka, f_bio)
     } else {
         one_cpt_iv_bolus_g(dose.amt, t, cl, v)
+    };
+    if oral_bolus {
+        raw // `F` already baked into the oral-depot form
+    } else {
+        raw * f_bio // IV bolus / infusion: linear in dose, scale by `F`
     }
 }
 

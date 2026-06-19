@@ -299,7 +299,10 @@ pub fn two_cpt_conc_g<T: PkNum>(
     f_bio: T,
     oral: bool,
 ) -> T {
-    if dose.ss && dose.ii > 0.0 {
+    // `F` rule mirrors production `route_f_scale` (#327): oral-depot bolus bakes
+    // `F` in; IV bolus and every infusion are linear in dose → post-multiply.
+    let oral_bolus = oral && !dose.is_infusion();
+    let raw = if dose.ss && dose.ii > 0.0 {
         if dose.is_infusion() {
             two_cpt_infusion_ss_g(
                 dose.rate,
@@ -323,5 +326,10 @@ pub fn two_cpt_conc_g<T: PkNum>(
         two_cpt_oral_g(dose.amt, t, cl, v1, q, v2, ka, f_bio)
     } else {
         two_cpt_iv_bolus_g(dose.amt, t, cl, v1, q, v2)
+    };
+    if oral_bolus {
+        raw
+    } else {
+        raw * f_bio
     }
 }

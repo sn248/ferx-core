@@ -24,9 +24,9 @@
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
-use crate::stats::likelihood::{obs_nll_subject_into, split_obs_by_occasion};
+use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into, split_obs_by_occasion};
 use crate::stats::residual_error::compute_r_diag;
-use crate::stats::special::{ln_gamma, log_normal_cdf};
+use crate::stats::special::ln_gamma;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
@@ -1516,9 +1516,9 @@ fn subject_is_estimate_joint(
             let f = f.max(1e-12);
             let v =
                 (model.residual_variance_at(subject.obs_cmts[j], f, sigma) * ruv_scale).max(1e-12);
-            if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
-                let z = (y - f) / v.sqrt();
-                obs_nll += -log_normal_cdf(z);
+            let cens = subject.cens.get(j).copied().unwrap_or(0);
+            if m3 && cens != 0 {
+                obs_nll += -m3_logcdf(y, f, v.sqrt(), cens);
             } else {
                 obs_nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
             }

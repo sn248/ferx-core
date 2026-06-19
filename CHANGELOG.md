@@ -20,6 +20,10 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- M3 likelihood now supports above-LOQ/right-censored observations via `CENS=-1`,
+  with `DV` carrying the ULOQ value (#297). A `CENS` value other than `-1`, `0`,
+  or `1` now raises a `W_CENS_UNEXPECTED` data warning instead of being silently
+  scored as censored.
 - `is_auto` / `impmap_auto` fit options (NONMEM `AUTO`), **on by default**:
   adaptive importance-sample count. `is_samples` / `impmap_samples` is the
   *starting* count and is ramped up (×2 per iteration, capped at 10000) whenever

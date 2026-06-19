@@ -386,7 +386,7 @@ fn obs_nll_subject_into_iov(
     kappas: &[Vec<f64>],
     _pk_scratch: &mut crate::pk::EventPkParams,
 ) -> f64 {
-    use crate::stats::special::log_normal_cdf;
+    use crate::stats::likelihood::m3_logcdf;
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
     // Continuous per-occasion-aware prediction (issue #104) — same model the
     // E-step (`individual_nll_iov`) and FOCEI use, so E and M steps stay
@@ -415,9 +415,9 @@ fn obs_nll_subject_into_iov(
             None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale)
                 .max(1e-12),
         };
-        if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
-            let z = (subject.observations[j] - f) / v.sqrt();
-            total_nll += -log_normal_cdf(z);
+        let cens = subject.cens.get(j).copied().unwrap_or(0);
+        if m3 && cens != 0 {
+            total_nll += -m3_logcdf(subject.observations[j], f, v.sqrt(), cens);
         } else {
             total_nll += 0.5 * (v.ln() + (subject.observations[j] - f).powi(2) / v);
         }
@@ -1011,9 +1011,9 @@ fn obs_nll_subject_grad(
 
 /// Sum of observation log-likelihoods with ETAs held fixed.
 ///
-/// Under M3, CENS=1 rows contribute `-log Φ((LLOQ - f)/√V)` instead of the
-/// Gaussian residual term. Without this branch, the SAEM M-step would optimize
-/// θ/σ as if censored observations were exact Gaussians at the LLOQ value,
+/// Under M3, censored rows contribute the matching normal-tail likelihood
+/// instead of the Gaussian residual term. Without this branch, the SAEM M-step
+/// would optimize θ/σ as if censored observations were exact Gaussians at the limit,
 /// producing silently-biased population estimates.
 ///
 /// Uses rayon's `map_init` so each worker thread allocates one

@@ -3225,9 +3225,9 @@ fn fit_inner(
         ));
     }
 
-    // When M3 BLOQ is combined with non-interaction FOCE, mixing linearized
+    // When M3 censoring is combined with non-interaction FOCE, mixing linearized
     // Gaussian residuals with non-linearized log Φ terms gives inconsistent
-    // OFVs near the LLOQ boundary. The FOCE dispatcher routes affected
+    // OFVs near the LOQ boundary. The FOCE dispatcher routes affected
     // subjects through FOCEI internally — surface the promotion to the user.
     if matches!(model.bloq_method, BloqMethod::M3)
         && matches!(
@@ -3235,10 +3235,13 @@ fn fit_inner(
             EstimationMethod::Foce | EstimationMethod::FoceGn
         )
         && !options.interaction
-        && population.subjects.iter().any(|s| s.has_bloq())
+        && population
+            .subjects
+            .iter()
+            .any(|s| s.has_censored_observation())
     {
         warnings.push(
-            "M3 BLOQ handling requires FOCEI semantics; subjects with CENS=1 \
+            "M3 censoring handling requires FOCEI semantics; subjects with CENS!=0 \
              rows were evaluated with η-interaction. Set method=focei explicitly \
              to silence this notice."
                 .to_string(),
@@ -3886,7 +3889,7 @@ fn compute_subject_results(
             let pk_params_pop = (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
             let pred = model_preds(model, subject, &pk_params_pop, &params.theta, &zero_eta);
 
-            // IWRES (NaN on BLOQ rows — see compute_cwres for CWRES handling).
+            // IWRES (NaN on censored rows — see compute_cwres for CWRES handling).
             let mut iwres = compute_iwres(
                 &subject.observations,
                 &ipred,
@@ -4391,7 +4394,7 @@ mod tests {
 
     #[test]
     fn test_eps_shrinkage_ignores_nan_iwres() {
-        // BLOQ rows have NaN IWRES — they must be filtered out.
+        // Censored rows have NaN IWRES — they must be filtered out.
         // After filtering, two values with mean(IWRES^2)=1 remain => shrinkage = 0.
         let subjects = vec![
             make_subject(vec![0.0], vec![1.0, f64::NAN]),

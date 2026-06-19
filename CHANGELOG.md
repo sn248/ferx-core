@@ -20,6 +20,9 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- `frem_rao_blackwell` fit option (default `true`): toggle the Rao-Blackwellised
+  FREM covariate-ETA integration in IMP/IMPMAP. Set `false` only to diagnose the
+  RB path against the full-dimensional importance sampler (#406).
 - `impmap_mceta` fit option: multi-start MAP for IMPMAP (NONMEM `MCETA` equivalent),
   improving IS efficiency in high-dimensional models (e.g. FREM with ≥5 ETAs).
 - Analytical Jacobian for FREM pseudo-observations: covariate rows in the FD
@@ -304,6 +307,14 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **FREM IMP/IMPMAP marginal −2 log L over-counted by a 2π constant**: the
+  Rao-Blackwellised covariate-data marginal included the covariate pseudo-obs
+  `nc·ln(2π)` normalizer, which the rest of the objective (and NONMEM's
+  "OBJECTIVE FUNCTION WITHOUT CONSTANT") drops. This inflated the reported FREM
+  marginal by `Σ nc·ln(2π)` (≈ n_covariate_obs · ln2π) and made the
+  Rao-Blackwell and full-dimensional importance samplers disagree on the same
+  point. The constant is now dropped in both; the value is otherwise unchanged
+  (it lies outside the importance weights, so estimates were never affected) (#406).
 - **IMP/IMPMAP now report the NONMEM-comparable objective**: estimating `imp` and
   `impmap` runs surface the importance-sampling Monte-Carlo *marginal* −2 log L —
   the number NONMEM `METHOD=IMP`/`IMPMAP` reports as its `#OBJV` — evaluated at the

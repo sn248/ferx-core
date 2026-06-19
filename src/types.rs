@@ -3267,6 +3267,12 @@ pub struct FitOptions {
     /// Use Sobol quasi-random sequences for IS draws instead of pseudo-random.
     /// Only applies to MVN proposals (impmap_proposal_df = normal). Default false.
     pub impmap_sobol: bool,
+    /// FREM only: Rao-Blackwellise the covariate ETAs (integrate them analytically,
+    /// sample only the PK ETAs) in IMP/IMPMAP importance sampling. Default `true`
+    /// — strongly recommended, since brute-force sampling of the near-singular
+    /// covariate dimensions has very poor ESS. Set `false` only to diagnose the
+    /// RB path against the full-dimensional sampler.
+    pub frem_rao_blackwell: bool,
     /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
     /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
     /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
@@ -3526,6 +3532,7 @@ impl Default for FitOptions {
             impmap_trace: false,
             impmap_mceta: 0,
             impmap_sobol: false,
+            frem_rao_blackwell: true,
             iscale_min: 0.1,
             iscale_max: 10.0,
             bloq_method: BloqMethod::Drop,
@@ -3895,6 +3902,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "iscale_min",
             "iscale_max",
+            "frem_rao_blackwell",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -3910,6 +3918,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_sobol",
             "iscale_min",
             "iscale_max",
+            "frem_rao_blackwell",
         ],
         EstimationMethod::Bayes => &[
             "inner_maxiter",

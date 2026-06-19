@@ -272,6 +272,7 @@ importance-weighted posterior moments. It runs standalone or as a chain stage:
 | `impmap_sobol` | `false` | Use Sobol quasi-random sequences (with Cranley-Patterson randomization) for IS draws instead of pseudo-random. Gives more uniform posterior coverage with fewer samples. Only applies to MVN proposals (`impmap_proposal_df = normal`); Student-t falls back to pseudo-random. |
 | `iscale_min` | `0.1` | Minimum proposal scaling factor for adaptive IS (NONMEM `ISCALE_MIN`). The IS proposal covariance is multiplied by `s²` where `s` is chosen from `[iscale_min, iscale_max]` to maximise per-subject ESS. Set both to `1.0` to disable. |
 | `iscale_max` | `10.0` | Maximum proposal scaling factor (NONMEM `ISCALE_MAX`). |
+| `frem_rao_blackwell` | `true` | FREM only: Rao-Blackwellise the covariate ETAs (integrate them analytically, importance-sample only the PK ETAs). Strongly recommended — brute-force sampling of the near-singular covariate dimensions has very poor ESS. Set `false` only to diagnose the RB path against the full-dimensional sampler. |
 
 `impmap` reuses `inner_maxiter` / `inner_tol` for the per-iteration MAP step.
 Inter-occasion variability (`[iov]` / `kappa`) and SDE (`[diffusion]`) models

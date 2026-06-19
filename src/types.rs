@@ -38,8 +38,8 @@ pub enum RateMode {
 ///
 /// The single home for the "pull a transient mid-fit excursion back off the
 /// domain wall" clamp shared by [`DoseEvent::DURATION_FLOOR`] (modeled infusion
-/// duration `D ≤ 0`) and [`crate::pk::absorption::PreparedInputRate::MIN_MTT`]
-/// (transit mean-transit-time `mtt ≤ 0`). Both keep a downstream `amt/D` /
+/// duration `D ≤ 0`) and [`crate::pk::absorption::PreparedInputRate::MIN_PARAM`]
+/// (transit `mtt`, inverse-Gaussian `mat`/`cv2` ≤ 0). Both keep a downstream `amt/D` /
 /// `ktr.ln()` finite at the wall so the optimiser can climb back to the interior
 /// without perturbing a converged (interior) fit. Centralising it keeps the
 /// `NaN`-falls-to-floor subtlety in one place — every `>` is false for `NaN`, so
@@ -105,7 +105,7 @@ impl DoseEvent {
 
     /// Domain floor for a modeled infusion `duration` when clamping a transient
     /// mid-fit excursion (see [`Self::resolve_rate`]). Mirrors
-    /// [`crate::pk::absorption::PreparedInputRate::MIN_MTT`]: far below any
+    /// [`crate::pk::absorption::PreparedInputRate::MIN_PARAM`]: far below any
     /// realistic duration, so it never perturbs a converged fit — it only keeps
     /// a transient `D ≤ 0` (or `NaN`) from turning `amt / D` into a non-finite
     /// rate. `NaN` falls to the floor (every `>` is false for `NaN`).
@@ -4843,7 +4843,7 @@ mod tests {
     #[test]
     fn dose_event_resolve_rate_clamps_nonpositive_duration() {
         // A transient D <= 0 (or NaN) mid-search clamps to DURATION_FLOOR so
-        // rate = amt / D stays finite (mirrors PreparedInputRate::MIN_MTT).
+        // rate = amt / D stays finite (mirrors PreparedInputRate::MIN_PARAM).
         let mut map = DoseAttrMap::default();
         map.insert(DoseAttr::Duration, 1, 9);
         let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
@@ -4859,7 +4859,7 @@ mod tests {
 
     #[test]
     fn clamp_above_floor_passes_through_or_clamps() {
-        // The shared clamp behind DURATION_FLOOR / MIN_MTT: > floor passes through,
+        // The shared clamp behind DURATION_FLOOR / MIN_PARAM: > floor passes through,
         // <= floor (and NaN — every `>` is false for NaN) returns the floor.
         let floor = 1e-8;
         assert_eq!(clamp_above_floor(5.0, floor), 5.0, "above floor passes");

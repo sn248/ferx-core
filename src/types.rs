@@ -1377,6 +1377,39 @@ impl ErrorSpec {
         }
     }
 
+    /// True when any endpoint uses a `combined(PROP, ADD)` residual-error model.
+    pub fn has_combined(&self) -> bool {
+        match self {
+            ErrorSpec::Single(em) => matches!(em, ErrorModel::Combined),
+            ErrorSpec::PerCmt(map) => map
+                .values()
+                .any(|ep| matches!(ep.error_model, ErrorModel::Combined)),
+        }
+    }
+
+    /// Global `sigma.values` indices of the additive component of every
+    /// `Combined` endpoint (the second sigma slot). De-duplicated; empty when
+    /// no endpoint is combined.
+    pub fn combined_additive_sigma_indices(&self) -> Vec<usize> {
+        match self {
+            ErrorSpec::Single(ErrorModel::Combined) => vec![1],
+            ErrorSpec::Single(_) => Vec::new(),
+            ErrorSpec::PerCmt(map) => {
+                let mut out = Vec::new();
+                for endpoint in map.values() {
+                    if matches!(endpoint.error_model, ErrorModel::Combined) {
+                        if let Some(&idx) = endpoint.sigma_idx.get(1) {
+                            if !out.contains(&idx) {
+                                out.push(idx);
+                            }
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
     pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
         use crate::stats::residual_error::residual_variance;
         match self {
@@ -4230,6 +4263,73 @@ mod tests {
         mixed.insert(1usize, ep(ErrorModel::Additive));
         mixed.insert(2usize, ep(ErrorModel::Proportional));
         assert!(ErrorSpec::PerCmt(mixed).has_f_dependent_variance());
+    }
+
+    #[test]
+    fn error_spec_has_combined_detects_combined_endpoints() {
+        use std::collections::HashMap;
+        // Single endpoint: only `Combined` is combined.
+        assert!(!ErrorSpec::Single(ErrorModel::Additive).has_combined());
+        assert!(!ErrorSpec::Single(ErrorModel::Proportional).has_combined());
+        assert!(ErrorSpec::Single(ErrorModel::Combined).has_combined());
+
+        let ep = |em: ErrorModel, idx: Vec<usize>| EndpointError {
+            error_model: em,
+            sigma_idx: idx,
+        };
+
+        // PerCmt: combined if ANY endpoint is combined.
+        let mut none = HashMap::new();
+        none.insert(1usize, ep(ErrorModel::Additive, vec![0]));
+        none.insert(2usize, ep(ErrorModel::Proportional, vec![1]));
+        assert!(!ErrorSpec::PerCmt(none).has_combined());
+
+        let mut some = HashMap::new();
+        some.insert(1usize, ep(ErrorModel::Proportional, vec![0]));
+        some.insert(2usize, ep(ErrorModel::Combined, vec![1, 2]));
+        assert!(ErrorSpec::PerCmt(some).has_combined());
+    }
+
+    #[test]
+    fn combined_additive_sigma_indices_picks_second_slot() {
+        use std::collections::HashMap;
+        // Single combined: additive component is sigma index 1.
+        assert_eq!(
+            ErrorSpec::Single(ErrorModel::Combined).combined_additive_sigma_indices(),
+            vec![1]
+        );
+        // Non-combined single specs have no additive-combined slot.
+        assert!(ErrorSpec::Single(ErrorModel::Additive)
+            .combined_additive_sigma_indices()
+            .is_empty());
+        assert!(ErrorSpec::Single(ErrorModel::Proportional)
+            .combined_additive_sigma_indices()
+            .is_empty());
+
+        let ep = |em: ErrorModel, idx: Vec<usize>| EndpointError {
+            error_model: em,
+            sigma_idx: idx,
+        };
+
+        // PerCmt: returns the global index of each combined endpoint's
+        // second sigma slot, de-duplicated; non-combined endpoints contribute
+        // nothing.
+        let mut map = HashMap::new();
+        map.insert(1usize, ep(ErrorModel::Proportional, vec![0]));
+        map.insert(2usize, ep(ErrorModel::Combined, vec![1, 3]));
+        let mut got = ErrorSpec::PerCmt(map).combined_additive_sigma_indices();
+        got.sort_unstable();
+        assert_eq!(got, vec![3]);
+
+        // Two combined endpoints that share the same additive sigma index
+        // collapse to a single entry.
+        let mut shared = HashMap::new();
+        shared.insert(1usize, ep(ErrorModel::Combined, vec![0, 2]));
+        shared.insert(2usize, ep(ErrorModel::Combined, vec![1, 2]));
+        assert_eq!(
+            ErrorSpec::PerCmt(shared).combined_additive_sigma_indices(),
+            vec![2]
+        );
     }
 
     #[test]

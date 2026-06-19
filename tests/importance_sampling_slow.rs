@@ -75,9 +75,9 @@ fn warfarin_iov_joint_sampling_matches_nonmem() {
         EstimationMethod::FoceI,
         EstimationMethod::Imp,
     ];
-    opts.is_samples = 3000;
-    opts.is_seed = Some(2026);
-    opts.is_eval_only = true; // scoring the chain's −2 log L, not re-estimating
+    opts.imp_samples = 3000;
+    opts.imp_seed = Some(2026);
+    opts.imp_eval_only = true; // scoring the chain's −2 log L, not re-estimating
 
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("warfarin_iov SAEM → FOCEI → IMP must succeed");
@@ -127,9 +127,9 @@ fn sparse_warfarin_focei_imp_runs_and_reports_finite_ll() {
     opts.run_covariance_step = false;
     opts.outer_maxiter = 200;
     opts.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
-    opts.is_samples = 2000; // enough to drive MC SE well below the gap we expect
-    opts.is_seed = Some(2026);
-    opts.is_eval_only = true; // scoring FOCEI's fit, not re-estimating
+    opts.imp_samples = 2000; // enough to drive MC SE well below the gap we expect
+    opts.imp_seed = Some(2026);
+    opts.imp_eval_only = true; // scoring FOCEI's fit, not re-estimating
 
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("sparse-warfarin FOCEI → IMP must produce a fit");

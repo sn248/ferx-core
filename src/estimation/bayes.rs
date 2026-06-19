@@ -1301,18 +1301,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_omega_iov_still_samples_kappa_block() {
+    fn kappa_block_sampled_iff_iov_present() {
         let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
-        let omega_iov_all_fixed = true;
 
+        // The gate depends ONLY on (n_kappa > 0) and OMEGA_IOV being present —
+        // NOT on whether OMEGA_IOV is FIX-ed. A fixed OMEGA_IOV still defines the
+        // kappa prior variance, so kappas must keep being sampled (regression for
+        // the all-FIX case where the old `!omega_iov_all_fixed` gate wrongly
+        // skipped the whole block).
         assert!(
             should_sample_kappa_block(1, Some(&omega_iov)),
-            "fixed OMEGA_IOV defines the kappa prior variance; it must not disable kappa sampling"
+            "OMEGA_IOV present with n_kappa > 0 must enable kappa sampling, fixed or not"
         );
+
+        // No OMEGA_IOV → no kappa prior → nothing to sample.
         assert!(
-            omega_iov_all_fixed,
-            "this regression covers the all-FIX covariance-draw case"
+            !should_sample_kappa_block(1, None),
+            "without OMEGA_IOV there is no kappa prior, so the block must be skipped"
         );
+
+        // No kappas → block is irrelevant regardless of OMEGA_IOV.
+        assert!(
+            !should_sample_kappa_block(0, Some(&omega_iov)),
+            "with n_kappa == 0 there are no kappas to sample"
+        );
+        assert!(!should_sample_kappa_block(0, None));
     }
 
     /// InvGamma(a, b) has mean b/(a−1). Check the sample mean converges.

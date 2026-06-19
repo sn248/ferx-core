@@ -849,16 +849,8 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-        if options.gradient_method == crate::types::GradientMethod::Ad {
-            diags.push(
-                Diagnostic::error(
-                    "E_SDE_INCOMPATIBLE",
-                    "gradient_method = ad is not compatible with a [diffusion] block. \
-                     Set gradient_method = fd (or leave it unset — fd is selected automatically).",
-                )
-                .with_block("fit_options"),
-            );
-        }
+        // `gradient_method = ad` is rejected unconditionally below (E_AD_RETIRED),
+        // so it needs no SDE-specific case here.
     }
 
     // IMPMAP does not yet support inter-occasion variability (κ / [iov]); the κ

@@ -7,7 +7,6 @@ pub struct BuildInfo {
     pub ferx_version: &'static str,
     pub rustc_version: &'static str,
     pub build_timestamp: u64,
-    pub has_autodiff: bool,
 }
 
 pub const BUILD_INFO: BuildInfo = BuildInfo {
@@ -26,9 +25,6 @@ pub const BUILD_INFO: BuildInfo = BuildInfo {
         }
         n
     },
-    // The Enzyme autodiff path was retired; analytic Dual2 sensitivities serve the
-    // gradient solvers. Always false now (kept for build-metadata API stability).
-    has_autodiff: false,
 };
 
 /// Reported gradient method for a fit loop (inner or outer).
@@ -126,12 +122,11 @@ mod tests {
 
     fn ad_build() -> BuildInfo {
         BuildInfo {
-            variant: "autodiff",
+            variant: "default",
             profile: "debug",
             ferx_version: "0.1.0",
             rustc_version: "rustc 1.0.0",
             build_timestamp: 0,
-            has_autodiff: true,
         }
     }
 
@@ -142,7 +137,6 @@ mod tests {
             ferx_version: "0.1.0",
             rustc_version: "rustc 1.0.0",
             build_timestamp: 0,
-            has_autodiff: false,
         }
     }
 

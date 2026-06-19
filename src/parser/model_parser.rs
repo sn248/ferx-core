@@ -1893,26 +1893,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
         // AD compatibility check (Phase 2.5):
         //
-        // Form C readouts (`OdeReadout::Single` / `PerCmt`) only exist on ODE
-        // models, which have no analytical PK path (`tv_fn.is_none()`) and so
-        // always use FD. `gradient = ad` is itself retired (errors in
-        // `check_model_options`); this parse-time guard surfaces the same
-        // mismatch with a Form-C-specific message.
-        let ad_explicit = fit_options.gradient_method == GradientMethod::Ad;
-        let readout_needs_fd = output_fn.as_ref().map(|r| r.requires_fd()).unwrap_or(false);
-        if readout_needs_fd && ad_explicit {
-            let kind = match output_fn.as_ref() {
-                Some(crate::ode::OdeReadout::PerCmt(_)) => "per-CMT `y[CMT=N]` (Form C)",
-                Some(crate::ode::OdeReadout::Single(_)) => "`y = <expr>` (Form C)",
-                _ => unreachable!("readout_needs_fd implies output_fn is Some(Single | PerCmt)"),
-            };
-            return Err(format!(
-                "[scaling]: {} is not supported with AD gradients (Form C readouts only \
-                 exist on ODE models, and AD requires the analytical PK path). \
-                 Add `gradient = fd` to [fit_options].",
-                kind
-            ));
-        }
+        // (`gradient = ad` no longer needs a Form-C-specific guard here: it is
+        // retired and rejected unconditionally by `check_model_options`.)
 
         // Form C wiring: replace the ODE readout (which was set to the
         // `NEEDS_FORM_C = usize::MAX` sentinel by `build_ode_spec` if the
@@ -17763,35 +17745,28 @@ if (WT > 70) {
     }
 
     #[test]
-    fn test_parse_scaling_y_form_c_rejects_ad() {
-        // Regression for Copilot review on PR #84: the original guard only
-        // checked `ScalingSpec::requires_fd()`, missing Form C readouts
-        // (which live on `OdeSpec.readout`, not `model.scaling`). A Form C
-        // model with `gradient = ad` silently fell back to FD via
-        // `model.tv_fn.is_none()` at runtime; now the parser errors loudly.
+    fn test_parse_scaling_y_form_c_with_ad_parses() {
+        // `gradient = ad` is retired and now rejected uniformly by
+        // `check_model_options` (`E_AD_RETIRED`), so the old Form-C-specific
+        // *parse-time* guard was removed. A Form C model with `gradient = ad`
+        // therefore parses; the rejection happens at model-options validation
+        // (covered by `api::ad_requested_errors_now_that_ad_is_retired`).
         let src_per_cmt = ode_model_with_scaling(
             "ode(states=[depot, central])",
             Some("  y[CMT=1] = central / V\n  y[CMT=2] = central / V * 1000\n"),
         )
         .replace("gradient = fd", "gradient = ad");
-        let err = parse_model_string(&src_per_cmt)
-            .expect_err("per-CMT y + gradient = ad must be rejected");
         assert!(
-            err.contains("per-CMT `y[CMT=N]`") && err.contains("gradient = fd"),
-            "expected per-CMT Form C + AD rejection, got: {}",
-            err
+            parse_model_string(&src_per_cmt).is_ok(),
+            "Form C + gradient = ad should parse (rejected later at check_model_options)"
         );
 
-        // Single Form C (uniform `y = <expr>`) gets the same treatment.
         let src_single =
             ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V\n"))
                 .replace("gradient = fd", "gradient = ad");
-        let err = parse_model_string(&src_single)
-            .expect_err("single Form C + gradient = ad must be rejected");
         assert!(
-            err.contains("`y = <expr>` (Form C)") && err.contains("gradient = fd"),
-            "expected single Form C + AD rejection, got: {}",
-            err
+            parse_model_string(&src_single).is_ok(),
+            "single Form C + gradient = ad should parse (rejected later)"
         );
     }
 

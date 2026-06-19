@@ -211,6 +211,31 @@ fn impmap_estimates_mu_ref_param_with_negligible_iiv() {
     assert!(tvka.is_finite() && tvka > 0.0);
 }
 
+/// `impmap_sobol` only applies to the multivariate-normal proposal; with the
+/// Student-t default it is a silent no-op, so IMPMAP must warn rather than ignore
+/// the request. Setting `impmap_proposal_df = normal` clears the warning.
+#[test]
+fn impmap_warns_when_sobol_requested_with_t_proposal() {
+    let (model, population, base) = warfarin_setup();
+    let warns = |df: f64| -> bool {
+        let mut opts = base.clone();
+        opts.method = EstimationMethod::Impmap;
+        opts.impmap_sobol = true;
+        opts.impmap_proposal_df = df;
+        opts.impmap_iterations = 3;
+        fit(&model, &population, &model.default_params, &opts)
+            .expect("fit must succeed")
+            .warnings
+            .iter()
+            .any(|w| w.contains("impmap_sobol") && w.contains("ignored"))
+    };
+    assert!(warns(4.0), "Student-t proposal + sobol must warn");
+    assert!(
+        !warns(f64::INFINITY),
+        "MVN proposal + sobol must not warn (Sobol is used)"
+    );
+}
+
 #[test]
 fn focei_then_impmap_chain_runs() {
     let (model, population, mut opts) = warfarin_setup();

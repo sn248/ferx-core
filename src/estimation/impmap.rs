@@ -64,11 +64,17 @@ fn floor_omega_diagonal(omega_mat: &mut DMatrix<f64>, omega_fixed: &[bool], floo
 /// Positive-definite floor for free Ω diagonals (matches the SAEM constant).
 const OMEGA_DIAG_FLOOR: f64 = 1e-6;
 
-/// Adaptive-sampling (`auto`) target for the objective's Monte-Carlo standard
-/// deviation, in −2 log L units. Mirrors NONMEM's `AUTO` default `STDOBJ = 1.0`:
-/// the per-subject sample count is ramped until the objective MC SE drops to
-/// this level, so the M-step is driven by signal, not sampling noise.
-const AUTO_STDOBJ_TARGET: f64 = 1.0;
+/// Adaptive-sampling (`auto`) target for the **per-subject** objective Monte-Carlo
+/// standard error, in −2 log L units: `total_MC_SE / √N`. NONMEM's `AUTO` `STDOBJ`
+/// targets the *total* objective SE, which grows as √N, so a large but perfectly
+/// well-sampled dataset would ramp purely because it has more subjects. The
+/// per-subject normalization makes the criterion N-independent (it tracks the
+/// average per-subject sampling adequacy, which is what biases the M-step). The
+/// value `0.05` reproduces NONMEM's effective stopping point on the FREM workshop
+/// model (its `STDOBJ = 1.0` total target at N≈475 ⇒ 1.0/√475 ≈ 0.046): the count
+/// still ramps 300→~10000 there, while a rich low-dim fit (e.g. warfarin, total
+/// SE ≈ 0.07) never trips it.
+const AUTO_STDOBJ_TARGET: f64 = 0.05;
 
 /// Hard cap on the adaptive per-subject sample count (NONMEM `ISAMPEND` default).
 const AUTO_SAMPLES_MAX: usize = 10_000;
@@ -287,7 +293,11 @@ pub fn run_impmap(
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
     let nu = options.impmap_proposal_df;
-    run_mcem(
+    // Sobol quasi-random draws are only implemented for the multivariate-normal
+    // (`impmap_proposal_df = normal`) proposal; the Student-t default makes the
+    // option a silent no-op, so flag the mismatch rather than ignore it.
+    let use_sobol = options.impmap_sobol && nu.is_infinite();
+    let mut result = run_mcem(
         model,
         population,
         init_params,
@@ -303,10 +313,19 @@ pub fn run_impmap(
         options.impmap_seed.unwrap_or(12345),
         options.impmap_low_ess_threshold,
         options.impmap_mceta,
-        options.impmap_sobol && nu.is_infinite(),
+        use_sobol,
         options.impmap_trace,
         options.impmap_auto,
-    )
+    )?;
+    if options.impmap_sobol && !use_sobol {
+        result.warnings.push(
+            "IMPMAP: `impmap_sobol = true` is ignored because the proposal is a Student-t \
+             (`impmap_proposal_df` is finite). Sobol draws apply only to the multivariate-normal \
+             proposal — set `impmap_proposal_df = normal` to use them."
+                .to_string(),
+        );
+    }
+    Ok(result)
 }
 
 /// Run IMP as an estimator (NONMEM `METHOD=IMP`). Thin wrapper over the shared
@@ -838,16 +857,18 @@ fn run_mcem(
             })
             .sum();
         let mc_se = 2.0 * var_ll.sqrt();
-        final_mc_se = mc_se;
+        // Per-subject objective SE (N-independent): see AUTO_STDOBJ_TARGET.
+        let mc_se_per_subject = mc_se / (ess_fracs.len().max(1) as f64).sqrt();
+        final_mc_se = mc_se_per_subject;
         final_k_samples = k_samples;
         // Adaptive sampling (NONMEM `AUTO`): ramp K up (×2, capped) while the
         // objective is too MC-noisy, so the M-step is driven by signal not noise.
-        if auto && mc_se > AUTO_STDOBJ_TARGET && k_samples < AUTO_SAMPLES_MAX {
+        if auto && mc_se_per_subject > AUTO_STDOBJ_TARGET && k_samples < AUTO_SAMPLES_MAX {
             let new_k = (k_samples.saturating_mul(2)).min(AUTO_SAMPLES_MAX);
             if verbose {
                 eprintln!(
-                    "{label}: auto-sampling — objective MC SE {mc_se:.2} > {AUTO_STDOBJ_TARGET:.1}, \
-                     raising K {k_samples} → {new_k}"
+                    "{label}: auto-sampling — per-subject objective MC SE {mc_se_per_subject:.3} \
+                     > {AUTO_STDOBJ_TARGET:.2}, raising K {k_samples} → {new_k}"
                 );
             }
             k_samples = new_k;
@@ -1049,9 +1070,9 @@ fn run_mcem(
         };
         warnings.push(format!(
             "{label}: {} importance samples for a {}-ETA model give a noisy objective \
-             (MC SE = {:.2}, target {:.1}; median ESS/K = {:.2}). The weighted M-step moments \
-             then carry a finite-sample bias — typical-value and Ω estimates may be off, and it \
-             shrinks only as the sample count grows. {}{}",
+             (per-subject MC SE = {:.3}, target {:.2}; median ESS/K = {:.2}). The weighted M-step \
+             moments then carry a finite-sample bias — typical-value and Ω estimates may be off, \
+             and it shrinks only as the sample count grows. {}{}",
             final_k_samples,
             n_eta,
             final_mc_se,

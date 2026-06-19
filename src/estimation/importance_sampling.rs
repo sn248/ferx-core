@@ -760,8 +760,9 @@ pub(crate) fn frem_pk_cov_partition(fc: &FremConfig, n_eta: usize) -> (Vec<usize
 /// missing-covariate etas` (ascending) and `observed_idx` / `d` are aligned. The
 /// precision-form conditional prior in [`subject_is_draws_frem_rb`] is exact for
 /// this split because *all* of `observed_idx` is conditioned on and *everything
-/// else* is sampled. Returns `None` only when no covariate is observed for the
-/// subject (→ caller falls back to full-dimensional IS).
+/// else* is sampled. Returns `None` when no covariate is observed for the
+/// subject, or when any covariate has more than one pseudo-obs row (→ caller
+/// falls back to full-dimensional IS).
 pub(crate) fn subject_frem_partition(
     subject: &Subject,
     theta: &[f64],
@@ -780,16 +781,29 @@ pub(crate) fn subject_frem_partition(
     let mut missing = Vec::new();
     for &e in cov_idx {
         match eta_to_ft.get(&e) {
-            Some(&(ft, t)) => match subject.fremtype.iter().position(|&x| x == ft) {
-                Some(row) => match subject.observations.get(row) {
-                    Some(&obs) => {
-                        observed.push(e);
-                        d.push(obs - theta.get(t).copied().unwrap_or(0.0));
-                    }
+            Some(&(ft, t)) => {
+                // The Rao-Blackwell marginal pins this covariate eta at a single
+                // deviation `d` and subtracts a single `0.5·ln(R)` constant per
+                // covariate. A covariate with >1 pseudo-obs row (a time-varying
+                // covariate, or a duplicate) would have its extra rows scored by
+                // `obs_nll` at the pinned eta with a non-zero residual that the
+                // constant does not cancel, silently corrupting the weights. The
+                // RB split is only exact for one row per FREMTYPE — bail to the
+                // full-dimensional sampler (which scores every row consistently).
+                if subject.fremtype.iter().filter(|&&x| x == ft).count() > 1 {
+                    return None;
+                }
+                match subject.fremtype.iter().position(|&x| x == ft) {
+                    Some(row) => match subject.observations.get(row) {
+                        Some(&obs) => {
+                            observed.push(e);
+                            d.push(obs - theta.get(t).copied().unwrap_or(0.0));
+                        }
+                        None => missing.push(e),
+                    },
                     None => missing.push(e),
-                },
-                None => missing.push(e),
-            },
+                }
+            }
             None => missing.push(e),
         }
     }
@@ -1905,6 +1919,52 @@ mod tests {
         let (pk, cov) = frem_pk_cov_partition(&fc, 4);
         assert_eq!(pk, vec![0, 2]);
         assert_eq!(cov, vec![1, 3]);
+    }
+
+    /// Build a Subject carrying only the fields `subject_frem_partition` reads.
+    fn frem_subject(fremtype: Vec<u16>, observations: Vec<f64>) -> Subject {
+        Subject {
+            id: "t".into(),
+            doses: Vec::new(),
+            obs_times: Vec::new(),
+            obs_raw_times: Vec::new(),
+            observations,
+            obs_cmts: Vec::new(),
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: Vec::new(),
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype,
+            #[cfg(feature = "survival")]
+            obs_records: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn frem_partition_bails_on_duplicate_covariate_rows() {
+        // One eta (idx 1) mapped to FREMTYPE 100; pk = {0}, cov = {1}.
+        let mut map = std::collections::HashMap::new();
+        map.insert(100u16, (0usize, 1usize)); // (theta_idx, eta_idx)
+        let fc = FremConfig {
+            fremtype_to_indices: map,
+            covariate_sigma_index: 0,
+        };
+        let theta = [0.0_f64];
+        // Single covariate row → RB split is exact → Some.
+        let single = frem_subject(vec![0, 100], vec![5.0, 1.2]);
+        assert!(subject_frem_partition(&single, &theta, &fc, &[0], &[1]).is_some());
+        // Two rows of the same FREMTYPE (time-varying / duplicate) → the
+        // cov_obs_const cancellation breaks → must bail to full-dim IS (None).
+        let dup = frem_subject(vec![100, 0, 100], vec![1.2, 5.0, 1.3]);
+        assert!(
+            subject_frem_partition(&dup, &theta, &fc, &[0], &[1]).is_none(),
+            "duplicate covariate rows must disable the RB partition"
+        );
     }
 
     #[test]

@@ -330,6 +330,20 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **IMPMAP warns instead of silently ignoring `impmap_sobol` under a Student-t
+  proposal.** Sobol draws apply only to the multivariate-normal proposal; with
+  the Student-t default `impmap_sobol = true` was a no-op. It now emits a warning
+  pointing to `impmap_proposal_df = normal` (#406).
+- **FREM Rao-Blackwell sampler falls back to full-dimensional IS for covariates
+  with more than one pseudo-obs row.** A time-varying or duplicated covariate
+  row broke the closed-form covariate-likelihood cancellation in the RB marginal;
+  such subjects now use the full-dimensional sampler, which scores every row
+  consistently (#406).
+- **Adaptive-sampling (`is_auto`/`impmap_auto`) trigger is now per-subject.** It
+  used the total-objective Monte-Carlo SE, which grows as √N, so a large but
+  well-sampled dataset could ramp the sample count to the cap purely from subject
+  count. The trigger now normalizes by √N (per-subject objective SE), making it
+  N-independent (#411).
 - **IMP/IMPMAP no longer freeze the typical value of a mu-referenced parameter
   with negligible IIV**: a log-mu-referenced θ (e.g. `KA = TVKA*exp(ETA_KA)`)
   whose random effect has a tiny, often `FIX`ed ω was updated only through the

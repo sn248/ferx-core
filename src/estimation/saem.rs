@@ -401,6 +401,9 @@ fn obs_nll_subject_into_iov(
         &subject.fremtype,
         sigma_values,
     );
+    // IIV on residual error (#409): scale the PK residual variance by
+    // exp(2·η_ruv); FREM rows keep their own variance.
+    let ruv_scale = model.residual_var_scale(eta);
     let mut total_nll = 0.0_f64;
     for j in 0..subject.observations.len() {
         // Floors protect log(0) in the M-step objective. individual_nll_iov
@@ -409,8 +412,7 @@ fn obs_nll_subject_into_iov(
         let f = preds[j].max(1e-12);
         let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
             Some(vv) => vv.max(1e-12),
-            None => model
-                .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
+            None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale)
                 .max(1e-12),
         };
         if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
@@ -530,19 +532,28 @@ fn obs_nll_subject_grad_iov(
         &subject.fremtype,
         sigma_values,
     );
+    // IIV on residual error (#409): per-subject `exp(2·η_ruv)` scale on the PK
+    // residual variance (FREM rows excluded). η_ruv is a BSV eta, indexed into
+    // `eta`.  See the non-IOV `obs_nll_subject_grad` for the score-consistency
+    // argument behind scaling V, dV/df, and dV/dlogσ together.
+    let ruv_scale = model.residual_var_scale(eta);
+
     let mut nll_base = 0.0_f64;
     let mut all_preds_base = vec![0.0f64; n_obs];
     let mut residuals = vec![0.0f64; n_obs];
     let mut variances = vec![0.0f64; n_obs];
     let mut d_nll_d_f = vec![0.0f64; n_obs];
+    let mut obs_var_scale = vec![1.0f64; n_obs];
 
     for j in 0..n_obs {
         let cmt = subject.obs_cmts[j];
         let f = preds[j].max(1e-12);
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+        let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
+        obs_var_scale[j] = s;
         let v = match frem_vj {
             Some(vv) => vv.max(1e-12),
-            None => model.residual_variance_at(cmt, f, sigma_values).max(1e-12),
+            None => (model.residual_variance_at(cmt, f, sigma_values) * s).max(1e-12),
         };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
@@ -552,7 +563,7 @@ fn obs_nll_subject_grad_iov(
         let dv_df = if frem_vj.is_some() {
             0.0
         } else {
-            model.error_spec.dvar_df(cmt, f, sigma_values)
+            model.error_spec.dvar_df(cmt, f, sigma_values) * s
         };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
@@ -599,7 +610,8 @@ fn obs_nll_subject_grad_iov(
                 let ratio =
                     model
                         .error_spec
-                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values);
+                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values)
+                        * obs_var_scale[j];
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
@@ -904,18 +916,27 @@ fn obs_nll_subject_grad(
         sigma_values,
     );
 
-    // per-obs residual, variance, d(obs_nll)/d(f_j)
+    // IIV on residual error (#409): per-subject scale on the PK residual
+    // variance (`exp(2·η_ruv)`). FREM covariate rows are not scaled, so we hold
+    // a per-obs scale and apply it consistently to V, dV/df, and dV/dlogσ so the
+    // analytical score stays exact.
+    let ruv_scale = model.residual_var_scale(eta);
+
+    // per-obs residual, variance, d(obs_nll)/d(f_j), and the variance scale used.
     let mut residuals = vec![0.0f64; n_obs];
     let mut variances = vec![0.0f64; n_obs];
     let mut d_nll_d_f = vec![0.0f64; n_obs];
+    let mut obs_var_scale = vec![1.0f64; n_obs];
 
     for j in 0..n_obs {
         let cmt = subject.obs_cmts[j];
         let f = preds_base[j].max(1e-12);
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+        let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
+        obs_var_scale[j] = s;
         let v = match frem_vj {
             Some(vv) => vv.max(1e-12),
-            None => model.residual_variance_at(cmt, f, sigma_values).max(1e-12),
+            None => (model.residual_variance_at(cmt, f, sigma_values) * s).max(1e-12),
         };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
@@ -925,7 +946,7 @@ fn obs_nll_subject_grad(
         let dv_df = if frem_vj.is_some() {
             0.0
         } else {
-            model.error_spec.dvar_df(cmt, f, sigma_values)
+            model.error_spec.dvar_df(cmt, f, sigma_values) * s
         };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
@@ -977,7 +998,8 @@ fn obs_nll_subject_grad(
                 let ratio =
                     model
                         .error_spec
-                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values);
+                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values)
+                        * obs_var_scale[j];
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
@@ -1084,9 +1106,15 @@ pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) 
     // HMC is BSV-only (`hmc_step` and the AD NLL/gradient are kappa-unaware), so
     // it is disabled for IOV models (`n_kappa > 0`); those subjects use the MH
     // kernels, whose acceptance targets the IOV conditional p(η | κ, θ, data).
+    // IIV on residual error (#409) also disables HMC: the autodiff kernel has no
+    // `exp(2·η_ruv)` variance-scaling rule, so these models fall back to MH (same
+    // gate as [`run_saem`]).
     #[cfg(feature = "autodiff")]
-    let using_hmc =
-        n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && model.n_kappa == 0;
+    let using_hmc = n_leapfrog > 0
+        && model.ode_spec.is_none()
+        && model.tv_fn.is_some()
+        && model.n_kappa == 0
+        && model.residual_error_eta.is_none();
     #[cfg(not(feature = "autodiff"))]
     let using_hmc = {
         let _ = model;
@@ -1144,10 +1172,21 @@ pub fn run_saem(
     // `n_leapfrog > 0` would propose eta against the kappa-free posterior and
     // hand a BSV-only NLL to the componentwise kernel as its (mismatched)
     // acceptance baseline.
+    //
+    // IIV on residual error (#409): the autodiff NLL/gradient kernels build the
+    // residual variance from σ alone and carry no `exp(2·η_ruv)` scaling rule,
+    // so an HMC E-step would sample η against the unscaled conditional — η_ruv
+    // sees no data curvature and collapses toward the prior. Disable HMC for
+    // these models so the (correctly-scaled) MH kernels run instead (mirrors
+    // `inner_optimizer::analytical_ad_unsupported`).
     let using_hmc: bool = {
         #[cfg(feature = "autodiff")]
         {
-            n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && n_kappa == 0
+            n_leapfrog > 0
+                && model.ode_spec.is_none()
+                && model.tv_fn.is_some()
+                && n_kappa == 0
+                && model.residual_error_eta.is_none()
         }
         #[cfg(not(feature = "autodiff"))]
         false
@@ -1172,6 +1211,9 @@ pub fn run_saem(
         // keys on it to tag this as an Info/gradient_fallback warning.
         let reason = if n_kappa > 0 {
             "HMC is unavailable for IOV models (it is kappa-unaware)"
+        } else if model.residual_error_eta.is_some() {
+            "HMC is unavailable with IIV on residual error (iiv_on_ruv) — the autodiff \
+             kernel has no exp(2·η_ruv) variance-scaling rule"
         } else {
             "HMC is unavailable (requires `autodiff` feature and analytical PK model)"
         };
@@ -2834,6 +2876,7 @@ mod tests {
             #[cfg(feature = "survival")]
             endpoints: HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         };
 
         // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.

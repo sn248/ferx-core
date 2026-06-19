@@ -216,6 +216,14 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     if model.has_tte() {
         return Some("time-to-event ([event_model]) hazard likelihood");
     }
+    // IIV on residual error (`Y = IPRED + EPS*EXP(ETA)`). The analytical AD
+    // kernels build the residual variance from σ alone and have no rule for the
+    // per-subject `exp(2·η_ruv)` scaling; the EBE search must see the scaled
+    // variance, so route these models to FD (which differences the real
+    // `individual_nll`, where the scale is applied). See #409.
+    if model.residual_error_eta.is_some() {
+        return Some("IIV on residual error (iiv_on_ruv)");
+    }
     None
 }
 
@@ -1850,6 +1858,7 @@ mod tests {
                 },
                 covariate_sigma_index: 0,
             }),
+            residual_error_eta: None,
         };
 
         // Subject: 2 PK obs + 1 FREM obs
@@ -2039,6 +2048,7 @@ mod iov_tests {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -2160,6 +2170,7 @@ mod iov_tests {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         };
         let subject = Subject {
             id: "1".into(),
@@ -2213,6 +2224,7 @@ mod iov_tests {
         };
         let model = CompiledModel {
             frem_config: None,
+            residual_error_eta: None,
             name: "noniov_mu".into(),
             has_conditional_eta_params: false,
             pk_model: PkModel::OneCptIv,
@@ -2550,6 +2562,16 @@ mod iov_tests {
         };
         assert!(analytical_ad_unsupported(&model).is_some());
         model.scaling = crate::types::ScalingSpec::ScalarScale(1000.0);
+        assert!(analytical_ad_unsupported(&model).is_none());
+
+        // IIV on residual error (#409): forces FD (AD kernels lack the variance
+        // scaling rule).
+        model.residual_error_eta = Some(0);
+        assert_eq!(
+            analytical_ad_unsupported(&model),
+            Some("IIV on residual error (iiv_on_ruv)")
+        );
+        model.residual_error_eta = None;
         assert!(analytical_ad_unsupported(&model).is_none());
     }
 }

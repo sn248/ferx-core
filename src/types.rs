@@ -2029,6 +2029,14 @@ pub struct CompiledModel {
     /// observation dispatch: covariate pseudo-observations use individual
     /// parameter values as predictions and a near-zero additive sigma.
     pub frem_config: Option<FremConfig>,
+    /// IIV on residual error (NONMEM `Y = IPRED + EPS*EXP(ETA)`). When `Some(k)`,
+    /// eta index `k` is a random effect that scales the residual standard
+    /// deviation per subject: the residual variance for every observation is
+    /// multiplied by `exp(2*eta[k])`. The eta is declared as an ordinary
+    /// `omega` in `[parameters]` and wired here via `iiv_on_ruv = NAME` in
+    /// `[error_model]`; it is NOT referenced by any individual parameter, so it
+    /// carries no `EtaParamInfo` entry and the PK closure ignores it. See #409.
+    pub residual_error_eta: Option<usize>,
 }
 
 /// FREM (Full Random Effects Model) configuration.
@@ -2197,6 +2205,27 @@ impl CompiledModel {
     /// that already hold the `&CompiledModel`.
     pub fn residual_variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
         self.error_spec.variance_at(cmt, f_pred, sigma)
+    }
+
+    /// Multiplicative factor applied to the residual *variance* for a subject
+    /// whose random-effect vector is `eta`, from the IIV-on-RUV term
+    /// (`Y = IPRED + EPS*EXP(ETA)`). Returns `exp(2*eta[k])` when
+    /// `residual_error_eta == Some(k)` and `k` is in range, else `1.0`.
+    ///
+    /// Because every residual-error model writes the variance as
+    /// `(scale·σ)²` terms summed, multiplying the whole variance by
+    /// `exp(2*eta_k)` is exactly equivalent to scaling the residual SD by
+    /// `exp(eta_k)` — i.e. `EPS·EXP(ETA)` — for additive, proportional, and
+    /// combined alike.
+    #[inline]
+    pub fn residual_var_scale(&self, eta: &[f64]) -> f64 {
+        match self.residual_error_eta {
+            Some(k) => match eta.get(k) {
+                Some(&e) => (2.0 * e).exp(),
+                None => 1.0,
+            },
+            None => 1.0,
+        }
     }
 
     /// Canonical compartment names for analytical models, used in `[derived]` expressions.
@@ -4083,6 +4112,7 @@ pub(crate) mod test_helpers {
             #[cfg(feature = "survival")]
             endpoints: HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 }

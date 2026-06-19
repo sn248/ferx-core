@@ -996,6 +996,7 @@ mod tests {
             #[cfg(feature = "survival")]
             endpoints: HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 

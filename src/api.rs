@@ -1462,6 +1462,46 @@ pub fn fit(
             );
         }
     }
+    // IIV on residual error (`iiv_on_ruv`, #409) validation.
+    if let Some(k) = model.residual_error_eta {
+        // The residual-error eta must be a dedicated random effect: the FOCEI
+        // `c̃` column assumes its prediction-Jacobian column is zero (it is not a
+        // structural/individual-parameter eta). Reject a dual-use eta.
+        if let Some(name) = model.eta_names.get(k) {
+            if model.eta_param_info.iter().any(|e| &e.eta_name == name) {
+                return Err(format!(
+                    "[error_model] iiv_on_ruv = {name}: this eta is also used in \
+                     [individual_parameters]; the residual-error random effect must be a \
+                     dedicated omega not shared with a structural parameter"
+                ));
+            }
+        }
+        // IIV-on-RUV is inherently an interaction model (`Y = IPRED + EPS·EXP(ETA)`
+        // makes the residual variance η-dependent). Non-interaction FOCE/GN cannot
+        // represent it — its marginal integrates the residual eta out through a
+        // sensitivity column that is identically zero. Require FOCEI or a
+        // Monte-Carlo estimator (IMP/IMPMAP/SAEM).
+        let methods: Vec<EstimationMethod> = if options.methods.is_empty() {
+            vec![options.method]
+        } else {
+            options.methods.clone()
+        };
+        for m in &methods {
+            let non_interaction = match m {
+                EstimationMethod::Foce => true,
+                EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => !options.interaction,
+                _ => false,
+            };
+            if non_interaction {
+                return Err(format!(
+                    "IIV on residual error (iiv_on_ruv) requires an interaction or \
+                     Monte-Carlo method: use method = focei, imp, impmap, or saem (got {m:?} \
+                     with interaction = false). NONMEM `Y = IPRED + EPS*EXP(ETA)` is an \
+                     INTERACTION model."
+                ));
+            }
+        }
+    }
     // Data-dependent fatal checks (covariates present, per-CMT scaling and
     // per-CMT error-model coverage). These can't run in the parser — it doesn't
     // see the data. `ferx check` runs the same `check_model_data` to report
@@ -3852,6 +3892,17 @@ fn compute_subject_results(
                 &model.error_spec,
                 &params.sigma.values,
             );
+            // IIV on residual error (#409): the individual residual SD is scaled
+            // by exp(η̂_ruv), so IWRES = (y−f)/(SD·exp(η̂_ruv)) = base / exp(η̂_ruv).
+            // FREM covariate rows have no PK residual; their IWRES is left as-is.
+            let ruv_sd = model.residual_var_scale(eta.as_slice()).sqrt();
+            if ruv_sd != 1.0 {
+                for (j, w) in iwres.iter_mut().enumerate() {
+                    if subject.fremtype.get(j).copied().unwrap_or(0) == 0 {
+                        *w /= ruv_sd;
+                    }
+                }
+            }
             for (j, c) in subject.cens.iter().enumerate() {
                 if *c != 0 {
                     iwres[j] = f64::NAN;
@@ -3867,6 +3918,7 @@ fn compute_subject_results(
                 &params.omega,
                 &params.sigma.values,
                 &model.error_spec,
+                model.residual_error_eta,
             );
 
             // OFV contribution
@@ -4691,9 +4743,13 @@ fn emit_subject_rows<R: rand::Rng>(
     // Predict concentrations
     let ipreds = model_preds(model, subject, &pk_params, &params.theta, eta_slice);
 
-    // Add residual error (Gaussian path)
+    // Add residual error (Gaussian path). IIV on residual error (#409): the
+    // drawn `eta_slice` includes η_ruv, so scale the residual variance by
+    // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
+    let ruv_scale = model.residual_var_scale(eta_slice);
     for (j, &ipred) in ipreds.iter().enumerate() {
-        let var = model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
+        let var = model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values)
+            * ruv_scale;
         let eps: f64 = rng.sample(normal);
         let value = ipred + var.sqrt() * eps;
 
@@ -5126,6 +5182,7 @@ mod iov_integration {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -6446,6 +6503,7 @@ mod simulate_with_uncertainty_tests {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -7256,6 +7314,7 @@ mod tests_sdtab_tv_cov {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -7465,6 +7524,7 @@ mod tests_derived_session_clock {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -7781,6 +7841,7 @@ mod tests_derived_iov_kappa {
     fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         CompiledModel {
             frem_config: None,
+            residual_error_eta: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,

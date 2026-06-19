@@ -922,6 +922,13 @@ fn compute_joint_posterior_hessian(
 
     // Compute residual variance with FREM overrides
     let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    // IIV on residual error (#409): scale PK residual variance by exp(2·η̂_ruv).
+    let ruv_scale = model.residual_var_scale(eta_hat.as_slice());
+    if ruv_scale != 1.0 {
+        for v in r_diag.iter_mut() {
+            *v *= ruv_scale;
+        }
+    }
     let frem_ov = crate::stats::likelihood::build_frem_r_override(
         model.frem_config.as_ref(),
         &subject.fremtype,
@@ -1094,12 +1101,13 @@ fn subject_is_estimate_joint(
         let ipreds = predict_iov(model, subject, theta, eta_sample, &kappas_sampled);
 
         let m3 = matches!(model.bloq_method, BloqMethod::M3);
+        // IIV on residual error (#409): scale by exp(2·η_ruv) for this draw's eta.
+        let ruv_scale = model.residual_var_scale(eta_sample);
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
             let f = f.max(1e-12);
-            let v = model
-                .residual_variance_at(subject.obs_cmts[j], f, sigma)
-                .max(1e-12);
+            let v =
+                (model.residual_variance_at(subject.obs_cmts[j], f, sigma) * ruv_scale).max(1e-12);
             if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
                 let z = (y - f) / v.sqrt();
                 obs_nll += -log_normal_cdf(z);
@@ -1308,6 +1316,15 @@ pub(crate) fn compute_posterior_hessian(
     let ipreds =
         compute_predictions_with_tv_into(model, subject, theta, eta_hat.as_slice(), scratch);
     let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    // IIV on residual error (#409): scale the PK residual variance at the mode by
+    // exp(2·η̂_ruv) so the Laplace proposal precision reflects the per-subject
+    // residual SD. FREM rows are overwritten below with their own variance.
+    let ruv_scale = model.residual_var_scale(eta_hat.as_slice());
+    if ruv_scale != 1.0 {
+        for v in r_diag.iter_mut() {
+            *v *= ruv_scale;
+        }
+    }
     // Apply FREM R-diagonal overrides: covariate pseudo-observations use EPSCOV²
     // instead of the PK error model variance.
     let frem_ov = crate::stats::likelihood::build_frem_r_override(

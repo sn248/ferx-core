@@ -992,12 +992,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     if error_lines_opt.is_none() && !is_tte_only {
         return Err("Missing [error_model] block".to_string());
     }
-    let (parsed_error_model, ltbs_flags) = if let Some(error_lines) = error_lines_opt {
-        parse_error_model(error_lines)?
-    } else {
-        // TTE-only model: no Gaussian error model — empty per-CMT spec.
-        (ParsedErrorModel::PerCmt(vec![]), LtbsFlags::default())
-    };
+    let (parsed_error_model, ltbs_flags, iiv_on_ruv_name) =
+        if let Some(error_lines) = error_lines_opt {
+            parse_error_model(error_lines)?
+        } else {
+            // TTE-only model: no Gaussian error model — empty per-CMT spec.
+            (ParsedErrorModel::PerCmt(vec![]), LtbsFlags::default(), None)
+        };
     // LTBS log-transforms the structural prediction, which is incompatible with
     // the SDE/EKF measurement model (the extended Kalman filter assumes a
     // natural-scale additive/proportional observation). Reject the combination.
@@ -1025,6 +1026,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let n_eta = eta_names_bsv.len(); // BSV-only count
     let n_kappa = kappa_info.names_ordered.len();
     let n_epsilon = sigma_names.len();
+
+    // Resolve `iiv_on_ruv = NAME` to a BSV eta index. The named eta must be a
+    // declared `omega` (BSV), not a kappa (IOV residual scaling is out of scope).
+    let residual_error_eta: Option<usize> = match &iiv_on_ruv_name {
+        Some(name) => {
+            let idx = eta_names_bsv
+                .iter()
+                .position(|e| e == name)
+                .ok_or_else(|| {
+                    format!(
+                        "[error_model] iiv_on_ruv = {name}: no `omega {name} ~ ...` declared in \
+                     [parameters] (the residual-error random effect must be a declared omega)"
+                    )
+                })?;
+            Some(idx)
+        }
+        None => None,
+    };
 
     // Extended eta context: BSV etas followed by kappa names.
     // This lets [individual_parameters] expressions like `ETA_CL + KAPPA_CL`
@@ -1730,6 +1749,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         #[cfg(feature = "survival")]
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
+        residual_error_eta,
     };
 
     // ── Optional blocks ──
@@ -6497,7 +6517,9 @@ struct LtbsFlags {
     dv_pre_logged: bool,
 }
 
-fn parse_error_model(lines: &[String]) -> Result<(ParsedErrorModel, LtbsFlags), String> {
+fn parse_error_model(
+    lines: &[String],
+) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
     // Single-endpoint:
     //   DV ~ proportional(SIGMA_NAME)
     //   DV ~ additive(SIGMA_NAME)
@@ -6517,10 +6539,22 @@ fn parse_error_model(lines: &[String]) -> Result<(ParsedErrorModel, LtbsFlags), 
     // singles carry the per-line LTBS flags so the chosen single can stamp them.
     let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
+    // IIV on residual error: `iiv_on_ruv = ETA_NAME` (NONMEM `Y=IPRED+EPS*EXP(ETA)`).
+    let iiv_re = Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap();
+    let mut iiv_on_ruv: Option<String> = None;
 
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // `iiv_on_ruv = ETA_NAME` declares a random effect on the residual error.
+        if let Some(c) = iiv_re.captures(trimmed) {
+            if iiv_on_ruv.is_some() {
+                return Err("[error_model] has more than one `iiv_on_ruv = ...` entry".to_string());
+            }
+            iiv_on_ruv = Some(c[1].to_string());
             continue;
         }
 
@@ -6629,11 +6663,22 @@ fn parse_error_model(lines: &[String]) -> Result<(ParsedErrorModel, LtbsFlags), 
                 ));
             }
         }
-        return Ok((ParsedErrorModel::PerCmt(per_cmt), LtbsFlags::default()));
+        if iiv_on_ruv.is_some() {
+            return Err("[error_model] `iiv_on_ruv` is not supported with per-CMT \
+                        (multi-endpoint) error models"
+                .to_string());
+        }
+        return Ok((
+            ParsedErrorModel::PerCmt(per_cmt),
+            LtbsFlags::default(),
+            None,
+        ));
     }
 
     match singles.into_iter().next() {
-        Some((model, names, flags)) => Ok((ParsedErrorModel::Single(model, names), flags)),
+        Some((model, names, flags)) => {
+            Ok((ParsedErrorModel::Single(model, names), flags, iiv_on_ruv))
+        }
         None => Err("No error model found in [error_model] block".to_string()),
     }
 }
@@ -14847,6 +14892,86 @@ if (WT > 70) {
             model.error_spec,
             ErrorSpec::Single(ErrorModel::Proportional)
         ));
+    }
+
+    // ── IIV on residual error (`iiv_on_ruv`, #409) ──────────────────────────
+    fn iiv_ruv_model_str(error_block: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_RUV ~ 0.05
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+{}
+",
+            error_block
+        )
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_resolves_eta_index() {
+        let model = parse_full_model(&iiv_ruv_model_str(
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV",
+        ))
+        .unwrap()
+        .model;
+        // ETA_RUV is the 2nd declared omega → eta index 1.
+        assert_eq!(model.residual_error_eta, Some(1));
+        // The residual-error eta is NOT a structural/individual-parameter eta.
+        assert!(
+            !model.eta_param_info.iter().any(|e| e.eta_name == "ETA_RUV"),
+            "ETA_RUV must not carry an EtaParamInfo entry"
+        );
+        // The scale factor is exp(2·η) at that index, 1.0 elsewhere.
+        assert!((model.residual_var_scale(&[0.0, 0.0]) - 1.0).abs() < 1e-12);
+        assert!((model.residual_var_scale(&[0.3, 0.5]) - (2.0_f64 * 0.5).exp()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_absent_is_none() {
+        let model = parse_full_model(&iiv_ruv_model_str("  DV ~ proportional(PROP_ERR)"))
+            .unwrap()
+            .model;
+        assert_eq!(model.residual_error_eta, None);
+        assert!((model.residual_var_scale(&[0.7, 0.9]) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_unknown_eta_rejected() {
+        let err = expect_parse_err(&iiv_ruv_model_str(
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = NOPE",
+        ));
+        assert!(
+            err.contains("iiv_on_ruv") && err.contains("NOPE"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_duplicate_rejected() {
+        let err = expect_parse_err(&iiv_ruv_model_str(
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n  iiv_on_ruv = ETA_CL",
+        ));
+        assert!(err.contains("more than one"), "got: {err}");
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_rejected_with_per_cmt() {
+        let err = expect_parse_err(&pkpd_model_str(
+            "  CMT=1: DV ~ proportional(PROP_ERR_PK)\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n  iiv_on_ruv = ETA_CL",
+        ));
+        assert!(err.contains("per-CMT"), "got: {err}");
     }
 
     #[test]

@@ -304,6 +304,15 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **IMP/IMPMAP now report the NONMEM-comparable objective**: estimating `imp` and
+  `impmap` runs surface the importance-sampling Monte-Carlo *marginal* −2 log L —
+  the number NONMEM `METHOD=IMP`/`IMPMAP` reports as its `#OBJV` — evaluated at the
+  final estimates on `FitResult.importance_sampling.minus2_log_likelihood` (± MC
+  SE). Previously this was populated only by the evaluation-only path, so the only
+  available number was the FOCE-Laplace `ofv`, which matches NONMEM's *COND/FOCE*
+  OBJ rather than the IMP marginal and diverges from it on sparse / strongly
+  nonlinear data. `ofv` is unchanged (still a Laplace pass, for cross-method
+  AIC/BIC comparability) (#406).
 - **IMP/IMPMAP no longer diverge on FREM models with missing covariates**: the
   Rao-Blackwellised E-step previously bailed to the unstable full-dimensional
   importance sampler for any subject missing a covariate pseudo-observation row

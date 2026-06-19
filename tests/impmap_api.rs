@@ -58,6 +58,25 @@ fn impmap_standalone_produces_finite_estimates() {
             "omega[{i},{i}] must be finite > 0, got {w}"
         );
     }
+
+    // IMPMAP surfaces the importance-sampling marginal −2 log L (NONMEM #OBJV)
+    // alongside the Laplace `ofv`. IMPMAP defaults to a Gaussian proposal
+    // (`impmap_proposal_df = ∞`); the final marginal eval must fall back to a
+    // finite-t proposal rather than producing a non-finite value.
+    let is = result
+        .importance_sampling
+        .as_ref()
+        .expect("standalone impmap must surface the marginal −2 log L on importance_sampling");
+    assert!(
+        is.minus2_log_likelihood.is_finite(),
+        "marginal −2 log L must be finite (finite-t eval fallback), got {}",
+        is.minus2_log_likelihood
+    );
+    assert!(
+        is.mc_standard_error.is_finite() && is.mc_standard_error >= 0.0,
+        "marginal MC SE must be finite & non-negative, got {}",
+        is.mc_standard_error
+    );
 }
 
 #[test]

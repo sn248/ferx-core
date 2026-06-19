@@ -2941,6 +2941,49 @@ fn fit_inner(
             });
         }
         result = Some(stage_result);
+
+        // NONMEM-comparable IMP / IMPMAP objective. The reported `OuterResult.ofv`
+        // is a final FOCE *Laplace* pass (kept for cross-method AIC/BIC
+        // comparability, like SAEM). NONMEM `METHOD=IMP` instead reports the
+        // importance-sampling Monte-Carlo *marginal* −2 log L (the `.ext` #OBJV).
+        // Evaluate that marginal at the final estimates and surface it alongside
+        // on `FitResult.importance_sampling`, so callers comparing to NONMEM read
+        // the matching number. Best-effort: a failure (e.g. SDE, IOV without
+        // Ω_iov, n_eta = 0) leaves the field unset with a warning, never aborts.
+        if is_last && matches!(method, EstimationMethod::Imp | EstimationMethod::Impmap) {
+            let r = result.as_ref().expect("stage result was just set");
+            let mut marg_opts = stage_opts.clone();
+            // `run_importance_sampling` reads the `is_*` knobs; for IMPMAP map the
+            // `impmap_*` knobs onto them so the final eval mirrors the method's
+            // own sample count / proposal df / seed.
+            if method == EstimationMethod::Impmap {
+                marg_opts.is_samples = stage_opts.impmap_samples;
+                marg_opts.is_seed = stage_opts.impmap_seed;
+                marg_opts.is_low_ess_threshold = stage_opts.impmap_low_ess_threshold;
+                // IMPMAP defaults to a Gaussian proposal (`impmap_proposal_df =
+                // ∞`), which the finite-t IS evaluator cannot sample. The
+                // marginal is proposal-independent in expectation, so fall back
+                // to a finite-t eval proposal (heavier tails ⇒ bounded weights).
+                let df = stage_opts.impmap_proposal_df;
+                marg_opts.is_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
+            }
+            match crate::estimation::importance_sampling::run_importance_sampling(
+                model,
+                population,
+                &r.params,
+                &r.eta_hats,
+                &r.h_matrices,
+                &r.kappas,
+                &marg_opts,
+            ) {
+                Ok(is) => is_result = Some(is),
+                Err(e) => accumulated_warnings.push(if n_stages > 1 {
+                    format!("[{}] marginal −2 log L eval skipped: {}", method.label(), e)
+                } else {
+                    format!("marginal −2 log L eval skipped: {}", e)
+                }),
+            }
+        }
     }
 
     if crate::cancel::is_cancelled(&options.cancel) {

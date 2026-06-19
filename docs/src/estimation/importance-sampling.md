@@ -54,6 +54,18 @@ non-mu-ref θ), exactly as in IMPMAP. The reported estimate is the running mean
 of the parameter vector over the final `is_averaging` iterations, and `ofv` is
 a final FOCE Laplace pass for AIC/BIC comparability.
 
+> **Which number matches NONMEM's reported OFV?** NONMEM `METHOD=IMP` reports the
+> importance-sampling Monte-Carlo **marginal** `−2 log L` (the `.ext`/`.lst`
+> `#OBJV`), *not* a Laplace value. ferx's `ofv` is a Laplace pass, so it will
+> **not** equal NONMEM's IMP `#OBJV` on data where the Laplace approximation and
+> the true marginal diverge (sparse / strongly nonlinear). The NONMEM-comparable
+> number is the marginal, evaluated at the final estimates and surfaced on
+> `FitResult.importance_sampling.minus2_log_likelihood` (with its Monte-Carlo SE
+> on `.mc_standard_error`) for **estimating** `imp`/`impmap` runs too — not only
+> the evaluation-only path. IMPMAP's Gaussian proposal (`impmap_proposal_df =
+> normal`) is replaced by a finite-`t` proposal for this final marginal eval, so
+> the heavier tails keep the importance weights bounded.
+
 ### Rich data: prefer IMPMAP or warm-start
 
 Because IMP's proposal lags one iteration behind the parameters, it is
@@ -308,7 +320,8 @@ ISAMPLE=1000 SEED=12345`, control stream `tests/nonmem/warfarin_imp.ctl`).
 | ω²(V)     | 0.0096              | 0.0096              |
 | ω²(KA)    | 0.3405              | 0.336               |
 | σ (SD)    | 0.0105              | 0.0106              |
-| OFV       | −285.69             | −286.00             |
+| IMP marginal `−2 log L` | −285.69 | −285.93 ± 0.07 |
+| Laplace `ofv`           | (−286.00 at COND) | −286.00 |
 
 Both engines start from the same FOCEI basin (NONMEM `METHOD=COND` OFV −286.00,
 identical to ferx's FOCEI). NONMEM's IMP MCEM then drifts slightly off it toward
@@ -316,9 +329,16 @@ the importance-sampled marginal optimum (TVKA up to 0.886), while ferx's
 warm-started IMP holds near the FOCEI optimum — both stable and agreeing within
 the cross-engine + Monte-Carlo margin. TVKA is the least-identified parameter on
 this small extract (ETA_KA variance ≈ 0.34, high shrinkage); CL/V and the
-variance components agree to a few percent. The two OFVs are different objectives
-(NONMEM's IMP MC objective vs ferx's final Laplace pass) and agree to well within
-a cross-engine unit. The cross-check lives in `tests/warfarin_imp_nonmem.rs`.
+variance components agree to a few percent.
+
+Compare like with like: NONMEM's reported IMP `#OBJV` (−285.69) is the
+importance-sampling **marginal** `−2 log L`, so the matching ferx number is
+`importance_sampling.minus2_log_likelihood` (−285.93 ± 0.07), *not* ferx's
+Laplace `ofv` (−286.00, which instead coincides with NONMEM's COND OBJ). The
+small residual gap is the parameter-estimate difference (ferx's TVKA sits a
+little below NONMEM's), not an OFV-definition difference — both objectives drop
+the same `Nobs·log(2π)` constant (NONMEM "WITHOUT CONSTANT"). The cross-check
+lives in `tests/warfarin_imp_nonmem.rs`.
 
 ## See also
 

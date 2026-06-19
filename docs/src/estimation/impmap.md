@@ -87,7 +87,14 @@ Each MCEM iteration, at the current parameters θ⁽ᵗ⁾, Ω⁽ᵗ⁾, σ⁽�
 
 The reported estimate is the running mean of the parameter vector over the final
 `impmap_averaging` iterations. A FOCE-Laplace `ofv` is computed at the final
-parameters for AIC/BIC comparability with FOCE/FOCEI/SAEM.
+parameters for AIC/BIC comparability with FOCE/FOCEI/SAEM. The
+importance-sampling Monte-Carlo **marginal** `−2 log L` — the number NONMEM
+`METHOD=IMPMAP` reports as its `#OBJV` — is also evaluated at the final estimates
+and surfaced on `FitResult.importance_sampling.minus2_log_likelihood` (± its MC
+SE). Because IMPMAP defaults to a Gaussian proposal (`impmap_proposal_df =
+normal`), this final marginal eval substitutes a finite-`t` proposal to keep the
+importance weights bounded. Use that field, not `ofv`, to compare against
+NONMEM's reported IMPMAP objective.
 
 > **Mu-referencing is required.** The closed-form `log θ += mean(η)` shift is the
 > EM-correct typical-value update for log-normal random effects, so it is always
@@ -119,9 +126,12 @@ model/data (`tests/nonmem/warfarin_impmap.ctl`):
 
 The well-determined CL/V structure and all three variance components agree to a
 few percent; TVKA is the least-identified parameter on this 10-subject extract
-(ETA_KA variance ≈ 0.34, high shrinkage) and carries the loosest band. The OFVs
-(NONMEM "without constant" vs ferx's Laplace OFV) agree to ~1 unit, the usual
-cross-engine margin. This comparison is asserted by the gated
+(ETA_KA variance ≈ 0.34, high shrinkage) and carries the loosest band. NONMEM's
+−284.92 is its IMPMAP **marginal** `#OBJV` ("without constant"); the matching
+ferx number is `importance_sampling.minus2_log_likelihood`, not the Laplace `ofv`
+(−286.00) shown in the table. Both objectives drop the same `Nobs·log(2π)`
+constant, so the residual difference is the parameter-estimate gap, within the
+usual cross-engine + Monte-Carlo margin. This comparison is asserted by the gated
 `ferx_impmap_matches_nonmem_impmap_on_warfarin` test (nightly, `slow-tests`); a
 companion `impmap_converges_to_focei_on_warfarin` test checks agreement with
 ferx's own FOCEI.

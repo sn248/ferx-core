@@ -35,7 +35,7 @@ fn downsample_population(population: &mut ferx_core::types::Population, keep_per
         let obs_times: Vec<f64> = keep_idx.iter().map(|&i| subj.obs_times[i]).collect();
         let observations: Vec<f64> = keep_idx.iter().map(|&i| subj.observations[i]).collect();
         let obs_cmts: Vec<usize> = keep_idx.iter().map(|&i| subj.obs_cmts[i]).collect();
-        let cens: Vec<u8> = keep_idx
+        let cens: Vec<i8> = keep_idx
             .iter()
             .map(|&i| subj.cens.get(i).copied().unwrap_or(0))
             .collect();

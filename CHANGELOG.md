@@ -20,6 +20,8 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- M3 likelihood now supports above-LOQ/right-censored observations via `CENS=-1`,
+  with `DV` carrying the ULOQ value (#297).
 - **IIV on residual error (`iiv_on_ruv`)** — a random effect can now scale the
   residual error per subject (NONMEM `Y = IPRED + EPS*EXP(ETA)`). Declare an
   `omega` and reference it from `[error_model]` with `iiv_on_ruv = NAME`; the

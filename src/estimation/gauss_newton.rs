@@ -61,14 +61,14 @@ pub fn run_foce_gn(
     let mut warnings = Vec::new();
 
     // BHHH Information-matrix approximation degrades as the censoring fraction
-    // grows — each BLOQ row contributes less Fisher information than its
+    // grows — each censored row contributes less Fisher information than its
     // Gaussian counterpart, biasing the outer-product Hessian small-sample.
     if matches!(model.bloq_method, BloqMethod::M3)
         && population.subjects.iter().any(|s| s.has_bloq())
     {
         warnings.push(
-            "Gauss-Newton (BHHH) approximation may be inaccurate with M3 BLOQ handling; \
-             consider method=foce_i for heavy BLOQ fractions (>20%)."
+            "Gauss-Newton (BHHH) approximation may be inaccurate with M3 censoring; \
+             consider method=foce_i for heavy censoring fractions (>20%)."
                 .to_string(),
         );
     }

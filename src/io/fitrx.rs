@@ -1174,7 +1174,7 @@ fn parse_subjects(
         let c = match cens_i {
             Some(j) => fields
                 .get(j)
-                .and_then(|v| v.parse::<u8>().ok())
+                .and_then(|v| v.parse::<i8>().ok())
                 .unwrap_or(0),
             None => 0,
         };

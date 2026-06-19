@@ -535,9 +535,9 @@ pub struct Subject {
     /// state-propagating path. Resets break dose superposition, so a subject
     /// with any reset is forced onto the event-driven analytical / ODE path.
     pub reset_times: Vec<f64>,
-    /// Censoring flag per observation (0 = quantified, 1 = below LLOQ).
-    /// When `cens[j] == 1`, `observations[j]` holds the LLOQ value (NONMEM convention).
-    pub cens: Vec<u8>,
+    /// Censoring flag per observation (0 = quantified, 1 = below LLOQ, -1 = above ULOQ).
+    /// On censored rows, `observations[j]` holds the corresponding LOQ limit.
+    pub cens: Vec<i8>,
     /// Occasion index per observation row (parallel to `obs_times`).
     /// Empty when no IOV column is present in the data.
     pub occasions: Vec<u32>,
@@ -556,8 +556,12 @@ pub struct Subject {
 }
 
 impl Subject {
-    pub fn has_bloq(&self) -> bool {
+    pub fn has_censored_observation(&self) -> bool {
         self.cens.iter().any(|&c| c != 0)
+    }
+
+    pub fn has_bloq(&self) -> bool {
+        self.has_censored_observation()
     }
 
     /// True when the subject carries per-event covariate snapshots (i.e. at
@@ -2291,7 +2295,7 @@ pub struct SubjectResult {
     /// Empty unless `[fit_options] npde_nsim > 0`. Emitted as the `NPD` column.
     pub npd: Vec<f64>,
     pub ofv_contribution: f64,
-    pub cens: Vec<u8>,
+    pub cens: Vec<i8>,
     /// Number of observations for this subject (MDV=0 rows).
     pub n_obs: usize,
     /// Extra sdtab columns from [derived] and [output] blocks, computed
@@ -2996,7 +3000,7 @@ pub struct FitResult {
     /// reproducible from this field alone. `None` when NPDE did not run
     /// (`npde_nsim = 0`).
     pub npde_seed: Option<u64>,
-    /// BLOQ handling method: "drop" (observations below LOQ are excluded) or
+    /// LOQ censoring handling method: "drop" (treat CENS rows as ordinary) or
     /// "m3" (M3 likelihood for censored observations).
     pub bloq_method: String,
     /// Maximum number of outer optimizer iterations allowed.
@@ -3303,7 +3307,7 @@ pub struct FitOptions {
     /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
     /// Default 10.0.
     pub iscale_max: f64,
-    /// How BLOQ (Below Limit of Quantification) observations are handled.
+    /// How LOQ-censored observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
     pub bloq_method: BloqMethod,
@@ -3587,15 +3591,15 @@ impl Default for FitOptions {
     }
 }
 
-/// BLOQ (Below Limit of Quantification) handling.
+/// LOQ censoring handling.
 ///
 /// `Drop` — CENS rows are kept as ordinary observations (no special treatment). If
 /// the dataset has no CENS column, every row is treated as quantified and this is
 /// equivalent to the pre-M3 behavior.
 ///
-/// `M3` — Beal's M3 method: each BLOQ observation contributes
-/// `P(y < LLOQ | θ,η) = Φ((LLOQ - f)/√V)` to the likelihood instead of a
-/// Gaussian residual term. LLOQ is read from DV on CENS=1 rows (NONMEM convention).
+/// `M3` — Beal's M3 method: each censored observation contributes a normal-tail
+/// probability instead of a Gaussian residual term. LLOQ is read from DV on
+/// CENS=1 rows; ULOQ is read from DV on CENS=-1 rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BloqMethod {
     Drop,
@@ -4328,7 +4332,7 @@ mod tests {
                 "dw_autocorrelation",
             ),
             (
-                "M3 BLOQ handling requires FOCEI semantics",
+                "M3 censoring handling requires FOCEI semantics",
                 Warning,
                 "bloq_method",
             ),

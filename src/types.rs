@@ -75,8 +75,8 @@ pub enum InfusionDef {
 /// `ktr.ln()` finite at the wall so the optimiser can climb back to the interior
 /// without perturbing a converged (interior) fit. Centralising it keeps the
 /// `NaN`-falls-to-floor subtlety in one place — every `>` is false for `NaN`, so
-/// a `NaN` input also returns `floor`. Explicit comparison (not `f64::max`) so it
-/// stays usable from the autodiff-instrumented paths (see CLAUDE.md).
+/// a `NaN` input also returns `floor`. The explicit comparison (not `f64::max`)
+/// is what makes the `NaN`-to-`floor` behaviour deliberate rather than incidental.
 #[inline]
 pub(crate) fn clamp_above_floor(x: f64, floor: f64) -> f64 {
     if x > floor {
@@ -182,8 +182,8 @@ impl DoseEvent {
     /// machinery downstream (so `F` is applied exactly once — `F·amt` delivered
     /// over `D`, matching NONMEM's `F·RATE` for an infusion).
     ///
-    /// f64-only / FD-only by construction. The ODE engine has no autodiff path,
-    /// and the analytical engine routes any subject with a modeled dose to FD
+    /// f64-only / FD-only by construction. The ODE engine has no analytic-
+    /// sensitivity path, and the analytical engine routes any subject with a modeled dose to FD
     /// (see `resolve_gradient_method`, #394) precisely because resolving a duration
     /// or rate here would drop its `∂/∂η`, so no `Dual` twin is ever needed. A
     /// transient `D ≤ 0` is clamped to [`Self::DURATION_FLOOR`]; a transient
@@ -2211,41 +2211,23 @@ pub struct FremConfig {
 /// The inner optimizer is BFGS; what differs across variants is how the
 /// gradient of the individual NLL w.r.t. ETA is computed.
 ///
-/// - `Ad`: reverse-mode automatic differentiation via Enzyme. One forward
-///   pass + one reverse pass per gradient, regardless of `n_eta`. Requires
-///   the crate to be compiled with the `autodiff` feature and the model to
-///   have an analytical PK path (`tv_fn` populated). Falls back to `Fd`
-///   automatically when either condition isn't met (e.g. ODE models, which
-///   currently have no AD path).
+/// - `Auto` (default): use the exact analytic `Dual2` sensitivities whenever
+///   the model is in scope for them (analytical PK path: `tv_fn` populated,
+///   no LTBS / expression-scale inner / SDE), else fall back to `Fd`. The
+///   resolved per-subject route is reported in the startup banner.
 /// - `Fd`: central finite differences on the forward NLL. Performs `2·n_eta`
 ///   forward evaluations per gradient, so cost scales linearly with the
-///   number of random effects.
-/// - `Auto` (default): pick `Ad` whenever it is available, else `Fd`.
-///
-/// ## When each wins
-///
-/// AD's relative advantage over FD grows with:
-/// 1. **Number of etas.** FD cost scales as `O(n_eta)`; AD stays roughly
-///    flat. For `n_eta ≥ 3` AD is already faster per gradient call on every
-///    analytical PK model tested.
-/// 2. **Forward-pass cost.** Many observations per subject, many doses per
-///    subject, 2- or 3-compartment analytical formulas, and (when
-///    implemented) ODE-based models all amortize AD's fixed reverse-pass
-///    overhead and make the per-gradient gap wider.
-///
-/// On small analytical problems (`n_eta ≈ 3`, few observations, 1-cpt PK)
-/// the wall-clock difference can be small because gradient work is only a
-/// fraction of total fit time — NLopt, population NLL reduction, and
-/// parallel scheduling dominate. Relative gradient-call speedups we have
-/// measured range from ~1.5× (3-cpt infusion) to ~5× (1-cpt oral).
+///   number of random effects. Always available, including for ODE models.
+/// - `Ad`: retired. The Enzyme automatic-differentiation path was removed in
+///   favour of the analytic `Dual2` provider; requesting it errors with
+///   `E_AD_RETIRED`. Retained as a parse-then-error alias so old model files
+///   surface a clear migration message. Use `Auto` or `Fd` instead.
 ///
 /// ## Numerical equivalence
 ///
-/// For well-conditioned problems both methods converge to the same OFV
-/// within line-search tolerance. FD introduces `O(1e-9)` noise per
-/// component; AD is exact up to floating-point roundoff. Rare disagreements
-/// at the 2nd-decimal level of OFV usually reflect different trajectories
-/// to the same optimum rather than a correctness gap.
+/// The analytic `Dual2` gradient is exact up to floating-point roundoff; FD
+/// introduces `O(1e-9)` noise per component. For well-conditioned problems
+/// both converge to the same OFV within line-search tolerance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GradientMethod {
     Auto,
@@ -3371,8 +3353,9 @@ pub struct FitOptions {
     pub saem_seed: Option<u64>,
     /// Number of leapfrog steps per HMC proposal in the SAEM E-step.
     /// `0` (default) uses the Metropolis-Hastings random-walk sampler.
-    /// A positive value (e.g. `3`) enables HMC; requires the `autodiff`
-    /// feature and an analytical PK model — falls back to MH otherwise.
+    /// A positive value (e.g. `3`) enables HMC; requires an analytical PK
+    /// model (the HMC `∂NLL/∂η` is the `Dual2` analytic gradient) — falls
+    /// back to MH otherwise.
     pub saem_n_leapfrog: usize,
     // Bayes (Gibbs-within-HMC) options — see EstimationMethod::Bayes.
     /// Number of warmup (burn-in + adaptation) sweeps per chain, discarded from
@@ -3563,9 +3546,9 @@ pub struct FitOptions {
     /// by `parse_fit_options` / `apply_fit_option`. Used by `fit()` to warn
     /// when a key is set that the selected estimation method does not consume.
     pub user_set_keys: Vec<String>,
-    /// Inner-loop gradient method. Default [`GradientMethod::Auto`] prefers
-    /// AD whenever the crate was built with the `autodiff` feature and the
-    /// model has an analytical PK path (`tv_fn` populated); otherwise falls
+    /// Inner-loop gradient method. Default [`GradientMethod::Auto`] uses the
+    /// exact analytic `Dual2` sensitivities whenever the model has an
+    /// analytical PK path (`tv_fn` populated) and is in scope; otherwise falls
     /// back to FD. See [`GradientMethod`] for the full contract.
     pub gradient_method: GradientMethod,
     /// How often, in gradient evaluations, to re-solve each subject's inner
@@ -3573,7 +3556,7 @@ pub struct FitOptions {
     /// instead of holding it fixed.
     ///
     /// - `0` (default) — never reconverge on non-IOV models: use the cheap
-    ///   fixed-EBE analytical/AD gradient.
+    ///   fixed-EBE analytic gradient.
     /// - `1` — reconverge on every gradient evaluation.
     /// - `N` — reconverge on evals `0, N, 2N, …` and use the cheap fixed-EBE
     ///   gradient in between.
@@ -4587,7 +4570,8 @@ mod tests {
                 "covariance_step",
             ),
             (
-                "saem_n_leapfrog > 0 but HMC is unavailable (requires `autodiff` feature)",
+                "saem_n_leapfrog > 0 but HMC is unavailable (requires an analytical PK model \
+                 the Dual2 gradient supports); falling back to Metropolis-Hastings",
                 Info,
                 "gradient_fallback",
             ),

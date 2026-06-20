@@ -110,11 +110,6 @@ comment:
 #       exits) is user-facing logic -> refactored into a lib run() and
 #       unit-tested, not excluded (#286).
 #
-# Handled at the source, not here:
-#   src/ad/dual.rs            -> autodiff-only infra. `pub mod dual` is gated
-#       behind feature="autodiff" (like the rest of ad/), so the FD-only `ci`
-#       coverage build no longer compiles or reports it. Re-enters measurement
-#       when the Enzyme coverage job lands (#281).
 ignore:
   - "tests/**"
   - "**/build.rs"

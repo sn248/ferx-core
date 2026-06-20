@@ -2,10 +2,9 @@
 //! ln Γ (Lanczos) — the latter for the transit-compartment absorption model.
 //!
 //! These are implemented from polynomial/rational approximations (Abramowitz &
-//! Stegun 7.1.26 for erf) so that they are differentiable by Enzyme without
-//! relying on LLVM intrinsics (`llvm.maximumnum`, `llvm.minimumnum`) that the
-//! current Enzyme release cannot differentiate — see CLAUDE.md for context.
-//! The implementations use only `+`, `-`, `*`, `/`, and `.exp()`.
+//! Stegun 7.1.26 for erf) using only `+`, `-`, `*`, `/`, and `.exp()`, so a
+//! generic `PkNum`/`Dual2` instantiation differentiates them cleanly (no
+//! `f64::max`/`min` branch ambiguity).
 
 /// 1 / sqrt(2)
 const INV_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
@@ -18,7 +17,7 @@ const MIN_PROB: f64 = 1e-300;
 const HALF_LN_2PI: f64 = 0.918_938_533_204_672_74;
 
 /// Abramowitz & Stegun 7.1.26 — max error ~1.5e-7 over the whole real line.
-/// Entirely polynomial in t = 1/(1 + p*|x|) and exp(-x²), so Enzyme-safe.
+/// Entirely polynomial in t = 1/(1 + p*|x|) and exp(-x²), so cleanly differentiable.
 pub fn erf(x: f64) -> f64 {
     let a1 = 0.254_829_592;
     let a2 = -0.284_496_736;
@@ -83,8 +82,8 @@ pub fn log_normal_cdf(z: f64) -> f64 {
 /// ~1.5e-7, so refining against it degrades rather than improves the result.)
 ///
 /// Used by the simulation-based NPDE/NPD diagnostics ([`crate::stats::npde`]) to
-/// inverse-normal-transform empirical CDF probabilities. Not on any AD path, so
-/// it is free to use `.ln()`/`.sqrt()` without the Enzyme-intrinsic caveat.
+/// inverse-normal-transform empirical CDF probabilities. `f64`-only — not on any
+/// gradient path.
 pub fn normal_inv_cdf(p: f64) -> f64 {
     if p <= 0.0 {
         return f64::NEG_INFINITY;
@@ -155,8 +154,8 @@ pub fn normal_inv_cdf(p: f64) -> f64 {
 /// transit compartments `n`, where `n!` is undefined. Bare Stirling errs ~8% at
 /// n = 1 — enough to bias the absorption peak — so Lanczos is used instead.
 ///
-/// AD/Enzyme-safe: only `+`, `-`, `*`, `/`, `.ln()`, and (on the reflection
-/// branch) `.sin()` — no `f64::max`/`min` intrinsics (see CLAUDE.md). The
+/// Cleanly differentiable: only `+`, `-`, `*`, `/`, `.ln()`, and (on the
+/// reflection branch) `.sin()` — no `f64::max`/`min` branch ambiguity. The
 /// reflection branch (x < 0.5) is never exercised by the transit path
 /// (n ≥ 0 ⇒ argument ≥ 1) but keeps the function correct over the whole
 /// domain x > 0.

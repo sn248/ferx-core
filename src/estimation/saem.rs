@@ -1224,8 +1224,8 @@ pub fn run_saem(
         let reason = if n_kappa > 0 {
             "HMC is unavailable for IOV models (it is kappa-unaware)"
         } else if model.residual_error_eta.is_some() {
-            "HMC is unavailable with IIV on residual error (iiv_on_ruv) — the autodiff \
-             kernel has no exp(2·η_ruv) variance-scaling rule"
+            "HMC is unavailable with IIV on residual error (iiv_on_ruv) — the Dual2 \
+             gradient kernel has no exp(2·η_ruv) variance-scaling rule"
         } else {
             "HMC is unavailable (requires an analytical PK model the Dual2 gradient supports)"
         };

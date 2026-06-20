@@ -12,7 +12,7 @@
 # class of model.
 #
 # Run with:
-#   RUSTFLAGS="-Z autodiff=Enable" cargo run --release --features nn \
+#   cargo run --release --features nn \
 #     -- examples/warfarin_dcm.ferx --data data/two_cpt_oral_cov.csv
 #
 # Requires the `nn` cargo feature. The `[covariate_nn]` block syntax is

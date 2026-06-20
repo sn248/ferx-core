@@ -243,7 +243,7 @@ Notes and constraints:
   individual parameter.
 - Not supported with per-CMT (multi-endpoint) error models.
 - Models with `iiv_on_ruv` are routed to finite-difference gradients (the
-  analytical autodiff/Laplace kernels do not carry the variance-scaling rule).
+  analytic `Dual2` gradient kernel does not carry the variance-scaling rule).
 
 **Identifiability.** A residual-error random effect is a *variance-of-variance*
 term and is only weakly identified when the data carry little per-subject

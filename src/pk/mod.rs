@@ -286,8 +286,8 @@ pub(crate) const LTBS_FLOOR: f64 = 1e-12;
 /// (LTBS); a no-op otherwise. Applied at every prediction sink so the effective
 /// prediction is `log(f)` everywhere — FOCE linearization, residuals, IWRES/CWRES,
 /// IPRED/PRED, and simulated DV all end up on the log scale (matching NONMEM's
-/// `Y = LOG(F) + EPS`). The mirror transform in the autodiff paths
-/// (`ad::ad_gradients`, `ad::event_driven_ad`) must stay in sync.
+/// `Y = LOG(F) + EPS`). The mirror transform in the analytic-sensitivity paths
+/// (`sens::provider`, `sens::ode_provider`) must stay in sync.
 #[inline]
 pub(crate) fn apply_log_transform(model: &CompiledModel, preds: &mut [f64]) {
     if model.log_transform {

@@ -1174,11 +1174,6 @@ impl PkModel {
     /// Whether this is a first-order-absorption (oral) model. Oral models read
     /// `ka`; IV models do not. (`f` is read by every model since #327 — it scales
     /// IV bolus/infusion doses too.) The canonical home for this predicate.
-    ///
-    /// The `#[cfg(feature = "autodiff")]` free fn `is_oral_model` in
-    /// `estimation/inner_optimizer.rs` is a pre-existing identical copy; it should
-    /// delegate here, but that path isn't compiled in the default/CI build, so the
-    /// change can't be verified yet — fold it in when autodiff runs in CI (#281).
     pub(crate) fn is_oral(&self) -> bool {
         matches!(
             self,
@@ -1541,8 +1536,15 @@ pub enum ScalingSpec {
     /// Constant divisor applied to every prediction.
     ScalarScale(f64),
     /// Per-subject divisor evaluated from `(theta, eta, covariates, pk)`.
-    /// Used for expressions like `obs_scale = 1000 / V`.
-    ExpressionScale { scale_fn: ScaleFn },
+    /// Used for expressions like `obs_scale = 1000 / V`. `deriv` is the same
+    /// expression compiled to a `Dual2`-differentiable program (issue #367), so
+    /// the analytic sensitivity provider can differentiate `f / scale` exactly;
+    /// `None` for hand-constructed specs / closures with no parsed expression
+    /// (those fall back to finite differences).
+    ExpressionScale {
+        scale_fn: ScaleFn,
+        deriv: Option<crate::parser::model_parser::ScaleDerivProgram>,
+    },
     /// Per-CMT dispatch for multi-analyte models (parent+metabolite,
     /// sum-of-moieties, free vs total, ...). Key is the 1-based CMT
     /// index from the data file's CMT column (matches
@@ -1608,7 +1610,7 @@ impl ScalingSpec {
                 };
                 vec![v; n]
             }
-            Self::ExpressionScale { scale_fn } => {
+            Self::ExpressionScale { scale_fn, .. } => {
                 let s = scale_fn(theta, eta, covariates, pk);
                 let v = if s > 0.0 && s.is_finite() {
                     s
@@ -1624,7 +1626,7 @@ impl ScalingSpec {
                         let s = match inner {
                             Self::None => 1.0,
                             Self::ScalarScale(k) => *k,
-                            Self::ExpressionScale { scale_fn } => {
+                            Self::ExpressionScale { scale_fn, .. } => {
                                 scale_fn(theta, eta, covariates, pk)
                             }
                             Self::PerCmt(_) => {
@@ -3221,6 +3223,9 @@ pub struct FitOptions {
     pub interaction: bool,
     pub verbose: bool,
     pub optimizer: Optimizer,
+    /// Inner-loop (EBE) optimizer. `Auto` keeps the size-based default; any other
+    /// value pins the inner solver with no dimension-based switching.
+    pub inner_optimizer: InnerOptimizer,
     pub lbfgs_memory: usize,
     /// Run a gradient-free global pre-search (NLopt GN_CRS2_LM) before local optimization.
     pub global_search: bool,
@@ -3598,6 +3603,7 @@ impl Default for FitOptions {
             // `docs/src/estimation/optimizers.md` for the cefepime and Emax
             // PKPD validations and guidance on when to switch back to SLSQP.
             optimizer: Optimizer::Bobyqa,
+            inner_optimizer: InnerOptimizer::Auto,
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,
@@ -3724,6 +3730,25 @@ pub enum Optimizer {
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
     TrustRegion,
+}
+
+/// Inner-loop (EBE) optimizer, set via `[fit_options] inner_optimizer`. Lets the
+/// user pin the per-subject solver explicitly instead of the size-based default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InnerOptimizer {
+    /// Size-based selection (the historical behaviour): dense BFGS below
+    /// [`crate::estimation::inner_optimizer::INNER_LBFGS_MIN_DIM`], limited-memory
+    /// L-BFGS at/above it. Dense BFGS Newton-converges in a few steps and wins for
+    /// the typical small `n_eta`; L-BFGS wins for high-dimensional inner problems
+    /// (large IOV). Nelder–Mead remains the on-failure fallback in every mode.
+    #[default]
+    Auto,
+    /// Always dense BFGS, regardless of inner dimension.
+    Bfgs,
+    /// Always limited-memory L-BFGS, regardless of inner dimension.
+    Lbfgs,
+    /// Always Nelder–Mead (derivative-free).
+    NelderMead,
 }
 
 /// Parameter-scaling strategy for the outer optimizer. Maps the packed
@@ -3963,6 +3988,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "maxiter",
             "inner_maxiter",
             "inner_tol",
+            "inner_optimizer",
             "optimizer",
             "steihaug_max_iters",
             "global_search",
@@ -3970,11 +3996,18 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "stagnation_guard",
             "reconverge_gradient_interval",
         ],
-        EstimationMethod::FoceGn => &["maxiter", "inner_maxiter", "inner_tol", "gn_lambda"],
+        EstimationMethod::FoceGn => &[
+            "maxiter",
+            "inner_maxiter",
+            "inner_tol",
+            "inner_optimizer",
+            "gn_lambda",
+        ],
         EstimationMethod::FoceGnHybrid => &[
             "maxiter",
             "inner_maxiter",
             "inner_tol",
+            "inner_optimizer",
             "optimizer",
             "steihaug_max_iters",
             "global_search",
@@ -3986,6 +4019,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
         EstimationMethod::Saem => &[
             "inner_maxiter",
             "inner_tol",
+            "inner_optimizer",
             "n_exploration",
             "n_convergence",
             "n_mh_steps",
@@ -4014,6 +4048,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
         EstimationMethod::Impmap => &[
             "inner_maxiter",
             "inner_tol",
+            "inner_optimizer",
             "impmap_iterations",
             "impmap_samples",
             "impmap_proposal_df",
@@ -4150,6 +4185,9 @@ pub(crate) mod test_helpers {
                     init_fn: None,
                     solver_opts: crate::ode::OdeSolverOptions::default(),
                     input_rate: Vec::new(),
+                    rhs_program: None,
+                    readout_program: None,
+                    indiv_param_program: None,
                     dose_attr_map: Default::default(),
                 })
             } else {

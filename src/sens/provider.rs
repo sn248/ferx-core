@@ -456,6 +456,14 @@ pub fn subject_sensitivities_iov(
     if !iov_analytical_supported(model) {
         return None;
     }
+    // #419: decline a rate-defined infusion under `F ≠ 1` to the FD gradient — the
+    // Dual2 walk applies `F` as an inline magnitude scale on the rate
+    // (`propagate.rs`: `pk.f * rate`) over the unscaled window, so it can't
+    // represent the `F`-scaled window (see `subject_sensitivities_impl` for the
+    // full rationale).
+    if model.has_bioavailability() && subject.has_rate_defined_infusion() {
+        return None;
+    }
     // EVID=3/4 resets are honoured by the event-driven walk: it zeros the dual
     // state at each reset and rebuilds the post-reset occasion from the schedule,
     // exactly as production's `event_driven_predictions` does (the `f64` instance
@@ -793,7 +801,8 @@ fn run_obs_iov<const M: usize>(
 
     // No lagtime in IOV scope → zero dose lagtimes.
     let dose_lagtimes = vec![0.0; subject.doses.len()];
-    let schedule = EventSchedule::for_subject(subject, model.pk_model, &dose_lagtimes);
+    let schedule =
+        EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
     let conc = event_driven_sens_g::<Dual2<M>>(
         model.pk_model,
         subject,
@@ -1060,7 +1069,8 @@ fn run_obs_tvcov<const M: usize>(
 
     // No lagtime in TV-cov scope → zero dose lagtimes.
     let dose_lagtimes = vec![0.0; subject.doses.len()];
-    let schedule = EventSchedule::for_subject(subject, model.pk_model, &dose_lagtimes);
+    let schedule =
+        EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
     let conc = event_driven_sens_g::<Dual2<M>>(
         model.pk_model,
         subject,
@@ -1206,6 +1216,12 @@ fn subject_eta_grad_impl(
     // directly, so the unresolved dose would be a bolus/zero-input surrogate. Route
     // these to FD until the resolved-duration sensitivity lands.
     if !subject.all_doses_fixed() {
+        return None;
+    }
+    // #419: a rate-defined infusion under `F ≠ 1` reshapes (rate held, window
+    // `F·dur`); the superposition kernels here apply `F` as a magnitude scale, so
+    // decline to the FD inner Jacobian (matches the full provider's #419 gate).
+    if model.has_bioavailability() && subject.has_rate_defined_infusion() {
         return None;
     }
     // The light first-order provider uses the superposition kernels, which don't
@@ -1585,6 +1601,18 @@ fn subject_sensitivities_impl(
         return None;
     }
     if !analytical_supported(model) {
+        return None;
+    }
+    // #419: a rate-defined infusion (`RATE>0`, `RATE=-1`) under bioavailability
+    // `F ≠ 1` *reshapes* the infusion — the rate is held and the window is scaled
+    // to `F·dur` — rather than scaling its magnitude. The analytic paths apply `F`
+    // only as a magnitude scale (the superposition kernels via `route_f_scale`, the
+    // Dual2 walk via an inline `pk.f * rate`), which is exact only when the
+    // concentration is linear in `F`; neither can represent the reshaped window.
+    // Route such subjects to the FD gradient, whose `event_driven_predictions`
+    // already applies the #419 rule. (A duration-defined `RATE=-2` infusion is
+    // unaffected: `F` scales its rate, a magnitude both mechanisms handle.)
+    if model.has_bioavailability() && subject.has_rate_defined_infusion() {
         return None;
     }
     // Modeled-duration doses (`RATE=-2` → `D{cmt}`) resolve `rate`/`duration` from
@@ -2635,10 +2663,23 @@ mod tests {
         let m = parse_model_string(ONECPT_IV_F).expect("parse");
         let theta = vec![10.0, 50.0, 0.7];
         let eta = vec![0.1, -0.05, 0.2];
+        // F on an IV *bolus* is a magnitude scale, so the analytic post-multiply
+        // still matches production.
         let bolus = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), &times);
-        let infusion = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0), &times);
         check_provider_vs_production(&m, &bolus, &theta, &eta);
-        check_provider_vs_production(&m, &infusion, &theta, &eta);
+        // #419: an IV *infusion* under F ≠ 1 reshapes (rate held, window F·dur)
+        // rather than scaling its magnitude, so the analytic `route_f_scale`
+        // post-multiply no longer matches production — both providers decline it to
+        // the FD gradient (whose `event_driven_predictions` applies the #419 rule).
+        let infusion = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0), &times);
+        assert!(
+            subject_sensitivities(&m, &infusion, &theta, &eta).is_none(),
+            "F≠1 rate-defined infusion must decline to FD (full provider, #419)"
+        );
+        assert!(
+            subject_eta_grad(&m, &infusion, &theta, &eta).is_none(),
+            "F≠1 rate-defined infusion must decline to FD (light provider, #419)"
+        );
     }
 
     /// Regression: a modeled-duration dose (`RATE=-2` → `D{cmt}`) is read with

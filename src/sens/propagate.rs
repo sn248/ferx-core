@@ -1256,7 +1256,7 @@ mod tests {
             let subj = make_subject(vec![c.dose.clone()], obs.clone());
             let pk = pk_full(c.cl, c.v, c.ka);
             let prod = event_driven_predictions(c.model, &subj, &[pk], &vec![pk; obs.len()], &[]);
-            let schedule = EventSchedule::for_subject(&subj, c.model, &[pk.lagtime()]);
+            let schedule = EventSchedule::for_subject(&subj, c.model, &subj.doses, &[pk.lagtime()]);
             let pk_g = one_cpt_pk_f64(&pk);
             let walk = event_driven_sens_one_cpt_g::<f64>(
                 c.oral,
@@ -1326,7 +1326,7 @@ mod tests {
             let subj = make_subject(vec![c.dose.clone()], obs.clone());
             let pk = pk_2cpt(cl, v1, q, v2, ka);
             let prod = event_driven_predictions(c.model, &subj, &[pk], &vec![pk; obs.len()], &[]);
-            let schedule = EventSchedule::for_subject(&subj, c.model, &[0.0]);
+            let schedule = EventSchedule::for_subject(&subj, c.model, &subj.doses, &[0.0]);
             let pkd = pk_dual_2cpt_f64(&pk);
             let walk = event_driven_sens_g::<f64>(
                 c.model,
@@ -1351,7 +1351,7 @@ mod tests {
         let obs = vec![4.0];
         let subj = make_subject(vec![dose], obs.clone());
         let (cl, v1, q, v2) = (3.0, 30.0, 1.5, 40.0);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::TwoCptIv, &[0.0]);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::TwoCptIv, &subj.doses, &[0.0]);
         let seed = |cl: Dual2<2>, v1: Dual2<2>| PkDual {
             cl,
             v: v1,
@@ -1463,7 +1463,7 @@ mod tests {
             let subj = make_subject(vec![c.dose.clone()], obs.clone());
             let pk = pk_3cpt(cl, v1, q2, v2, q3, v3, ka);
             let prod = event_driven_predictions(c.model, &subj, &[pk], &vec![pk; obs.len()], &[]);
-            let schedule = EventSchedule::for_subject(&subj, c.model, &[0.0]);
+            let schedule = EventSchedule::for_subject(&subj, c.model, &subj.doses, &[0.0]);
             let pkd = pk_dual_3cpt_f64(&pk);
             let walk = event_driven_sens_g::<f64>(
                 c.model,
@@ -1488,7 +1488,7 @@ mod tests {
         let obs = vec![6.0];
         let subj = make_subject(vec![dose], obs.clone());
         let (cl, v1, q2, v2, q3, v3) = (3.0, 30.0, 2.0, 40.0, 0.8, 120.0);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::ThreeCptIv, &[0.0]);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::ThreeCptIv, &subj.doses, &[0.0]);
         let seed = |cl: Dual2<2>, v1: Dual2<2>| PkDual {
             cl,
             v: v1,
@@ -1560,7 +1560,7 @@ mod tests {
             .collect();
 
         let prod = event_driven_predictions(PkModel::OneCptIv, &subj, &[pk_occ1], &pk_at_obs, &[]);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &[0.0]);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &subj.doses, &[0.0]);
         let pk_at_obs_g: Vec<OneCptPk<f64>> = pk_at_obs.iter().map(one_cpt_pk_f64).collect();
         let walk = event_driven_sens_one_cpt_g::<f64>(
             false,
@@ -1592,7 +1592,7 @@ mod tests {
             ka: Dual2::<2>::constant(ka),
             f: Dual2::<2>::constant(1.0),
         };
-        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &[0.0]);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &subj.doses, &[0.0]);
         let pk_d = seed(Dual2::var(cl, 0), Dual2::var(v, 1));
         let walk =
             event_driven_sens_one_cpt_g::<Dual2<2>>(false, &subj, &schedule, &[pk_d], &[pk_d], &[]);

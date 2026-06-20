@@ -44,9 +44,13 @@
 //! near the FOCEI optimum — both are stable and agree within the cross-engine +
 //! Monte-Carlo margin. TVKA is the least-identified parameter on this 10-subject
 //! extract (ETA_KA variance ≈ 0.34, high shrinkage), so it carries the loosest
-//! band; CL/V and the variance components agree to a few percent. The two OFVs
-//! are different objectives (NONMEM's IMP MC objective vs ferx's final Laplace
-//! pass) and agree to well within a cross-engine unit.
+//! band; CL/V and the variance components agree to a few percent.
+//!
+//! Two OFVs are compared. ferx's reported `ofv` is a final FOCE *Laplace* pass
+//! (kept for cross-method AIC/BIC comparability) and lands on NONMEM's COND OBJ
+//! (−286.004). The NONMEM-comparable IMP number is the importance-sampling
+//! Monte-Carlo *marginal* −2 log L (`METHOD=IMP` #OBJV = −285.685), surfaced on
+//! `FitResult.importance_sampling.minus2_log_likelihood`; both are asserted.
 
 use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
@@ -81,10 +85,10 @@ fn ferx_imp_matches_nonmem_on_warfarin() {
     opts.run_covariance_step = false;
     opts.outer_maxiter = 300;
     opts.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
-    opts.is_iterations = 100;
-    opts.is_samples = 1000;
-    opts.is_averaging = 30;
-    opts.is_seed = Some(12345);
+    opts.imp_iterations = 100;
+    opts.imp_samples = 1000;
+    opts.imp_averaging = 30;
+    opts.imp_seed = Some(12345);
     let r = fit(&model, &population, &model.default_params, &opts)
         .expect("FOCEI → estimating IMP fit must succeed");
 
@@ -136,10 +140,28 @@ fn ferx_imp_matches_nonmem_on_warfarin() {
         r.sigma[0]
     );
 
-    // OFV within the cross-engine margin (different objectives — see docstring).
+    // ferx's reported `ofv` is a final FOCE *Laplace* pass (kept for cross-method
+    // AIC/BIC comparability). On this rich extract it lands on NONMEM's COND/FOCE
+    // OBJ (−286.004), close to but distinct from the IMP marginal.
     assert!(
         (r.ofv - NM_OFV).abs() < 3.0,
-        "OFV {} vs NONMEM {NM_OFV}",
+        "Laplace OFV {} vs NONMEM IMP {NM_OFV}",
         r.ofv
+    );
+
+    // The NONMEM-comparable number is the importance-sampling Monte-Carlo
+    // *marginal* −2 log L (NONMEM `METHOD=IMP` #OBJV = −285.685), now surfaced on
+    // `importance_sampling`. Evaluated at ferx's final estimates (which sit a
+    // little off NONMEM's basin — TVKA 0.811 vs 0.886), so allow the same
+    // cross-engine + Monte-Carlo margin.
+    let is = r
+        .importance_sampling
+        .as_ref()
+        .expect("estimating IMP must surface the marginal −2 log L");
+    assert!(
+        (is.minus2_log_likelihood - NM_OFV).abs() < 3.0,
+        "IMP marginal −2 log L {} ± {} vs NONMEM IMP #OBJV {NM_OFV}",
+        is.minus2_log_likelihood,
+        is.mc_standard_error,
     );
 }

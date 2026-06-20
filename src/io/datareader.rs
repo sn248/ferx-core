@@ -132,7 +132,7 @@ fn is_missing_cell(s: &str) -> bool {
 /// EVID: 0=observation, 1=dose, 2=other event (covariate change),
 ///       3=system reset (zero all compartments), 4=reset + dose
 /// MDV: 1=missing dependent variable
-/// CENS: 1=observation is below LLOQ (DV carries the LLOQ value); 0 otherwise
+/// CENS: 1=observation is below LLOQ (DV carries LLOQ), -1=above ULOQ (DV carries ULOQ); 0 otherwise
 ///
 /// `iov_column`: when `Some(name)`, that column is read as the occasion index
 /// (integer) and stored in `Subject::occasions` / `Subject::dose_occasions`.
@@ -741,6 +741,15 @@ fn parse_usize(s: &str) -> usize {
     s.parse::<usize>().unwrap_or(0)
 }
 
+fn parse_cens(s: &str) -> i8 {
+    let t = s.trim();
+    if is_missing_cell(t) {
+        0
+    } else {
+        t.parse::<i8>().unwrap_or(0)
+    }
+}
+
 /// Parse an EVID cell. A missing / blank / unparseable value maps to 0
 /// (observation) — NONMEM's documented default. (`parse_usize` defaults to 1,
 /// which would mislabel a blank-EVID observation row as a dose.)
@@ -778,18 +787,20 @@ fn is_dosing_amt(amt: f64) -> bool {
 ///   - `-1` → infusion **rate** is *modeled* (a `$PK` `R{n}` parameter)
 ///   - `-2` → infusion **duration** is *modeled* (a `$PK` `D{n}` parameter)
 ///
-/// `-2` is accepted as [`RateMode::ModeledDuration`] (#324). The datareader has
-/// no model, so it cannot yet know whether a matching `D{cmt}` parameter exists
-/// or whether the model is an ODE model — those checks move to the model+data
-/// join ([`crate::api::check_model_data`]). `-1` (modeled rate, #324 Phase B),
-/// any other negative, and non-finite values are rejected here: they are
-/// unconditionally invalid regardless of the model. (Previously `-1`/`-2` fell
-/// through to `rate > 0.0` and were silently treated as boluses — #324.)
+/// `-1` is accepted as [`RateMode::ModeledRate`] and `-2` as
+/// [`RateMode::ModeledDuration`] (#324). The datareader has no model, so it
+/// cannot yet know whether a matching `R{cmt}`/`D{cmt}` parameter exists or
+/// whether the model can infuse into that compartment — those checks move to the
+/// model+data join ([`crate::api::check_model_data`]). Any other negative and
+/// non-finite values are rejected here: they are unconditionally invalid
+/// regardless of the model. (Previously `-1`/`-2` fell through to `rate > 0.0`
+/// and were silently treated as boluses — #324.)
 fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String> {
     if !rate.is_finite() {
         return Err(format!(
             "subject {id}, time {time}: RATE={rate} is not finite; expected 0 \
-             (bolus), a positive infusion rate, or -2 (modeled duration)"
+             (bolus), a positive infusion rate, -1 (modeled rate), or -2 \
+             (modeled duration)"
         ));
     }
     if rate >= 0.0 {
@@ -809,15 +820,13 @@ fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String
     };
     let detail = match code {
         Some(-2) => return Ok(RateMode::ModeledDuration),
-        Some(-1) => "RATE=-1 (NONMEM: infusion RATE modeled via R1 in $PK) is not yet \
-             supported (tracked in #324); use RATE=-2 (modeled duration) or an \
-             explicit positive RATE"
-            .to_string(),
+        Some(-1) => return Ok(RateMode::ModeledRate),
         _ => format!("RATE={rate} is a negative value that is not a recognised NONMEM code"),
     };
     Err(format!(
         "subject {id}, time {time}: {detail}. Recognised RATE values are 0 \
-         (bolus), >0 (infusion rate), and -2 (modeled infusion duration)."
+         (bolus), >0 (infusion rate), -1 (modeled infusion rate), and -2 \
+         (modeled infusion duration)."
     ))
 }
 
@@ -910,6 +919,7 @@ fn parse_subject(
     let mut excl_fired: Vec<String> = Vec::new();
     let mut parse_warnings: Vec<String> = Vec::new();
     let mut addl_missing_ii_warned = false;
+    let mut cens_invalid_warned = false;
     // Rows that survived the data-selection filter, carry a nonzero AMT, yet
     // were not classified as a dose (EVID not 1/4) — their AMT was silently
     // dropped. Reported as a population summary so a degenerate dose-free fit
@@ -1079,7 +1089,7 @@ fn parse_subject(
                 .unwrap_or(false);
             let cens_for_ctx = cens_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
+                .map(|s| parse_cens(s))
                 .unwrap_or(0);
             let ctx = RowContext {
                 id,
@@ -1090,7 +1100,7 @@ fn parse_subject(
                 cmt: cmt_for_ctx,
                 rate: rate_for_ctx,
                 mdv: mdv as u32,
-                cens: if cens_for_ctx > 0 { 1u8 } else { 0u8 },
+                cens: cens_for_ctx,
                 ii: ii_for_ctx,
                 ss: ss_for_ctx,
                 covariates: &locf_state,
@@ -1183,11 +1193,11 @@ fn parse_subject(
                 .map(|s| parse_f64(s))
                 .unwrap_or(0.0);
             // Classify the RATE cell (#324): >=0 -> Fixed (data-driven rate),
-            // -2 -> ModeledDuration (the duration is a `D{cmt}` parameter,
-            // resolved at the model+data join); -1 / other negative / non-finite
-            // are rejected. Uses `raw_time` so the message names the value the
-            // user wrote, not the occasion-shifted engine time. `?` bubbles up
-            // through `parse_subject`.
+            // -2 -> ModeledDuration (duration is a `D{cmt}` parameter), -1 ->
+            // ModeledRate (rate is an `R{cmt}` parameter) — both resolved at the
+            // model+data join; other negative / non-finite are rejected. Uses
+            // `raw_time` so the message names the value the user wrote, not the
+            // occasion-shifted engine time. `?` bubbles up through `parse_subject`.
             let rate_mode = validate_dose_rate(rate, id, raw_time)?;
             let ii = ii_col
                 .and_then(|c| row.get(c))
@@ -1200,7 +1210,9 @@ fn parse_subject(
 
             doses.push(match rate_mode {
                 RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
-                RateMode::ModeledDuration => DoseEvent::modeled(time, amt, cmt, ss, ii, rate_mode),
+                RateMode::ModeledDuration | RateMode::ModeledRate => {
+                    DoseEvent::modeled(time, amt, cmt, ss, ii, rate_mode)
+                }
             });
             if occ_col.is_some() {
                 dose_occasions.push(occ);
@@ -1402,13 +1414,25 @@ fn parse_subject(
                 }
                 let cens_flag = cens_col
                     .and_then(|c| row.get(c))
-                    .map(|s| parse_usize(s))
+                    .map(|s| parse_cens(s))
                     .unwrap_or(0);
                 obs_times.push(time);
                 obs_raw_times.push(raw_time);
                 observations.push(dv);
                 obs_cmts.push(cmt);
-                cens.push(if cens_flag > 0 { 1u8 } else { 0u8 });
+                // Only -1 (above ULOQ), 0 (quantified), and 1 (below LLOQ) are
+                // meaningful. Any other value is coerced to left-censored by the
+                // M3 likelihood (`m3_logcdf` treats every nonzero as a tail), so
+                // flag it rather than silently mis-scoring the row.
+                if !matches!(cens_flag, -1 | 0 | 1) && !cens_invalid_warned {
+                    parse_warnings.push(format!(
+                        "W_CENS_UNEXPECTED subject {}: CENS={} is not -1, 0, or 1; \
+                         treated as censored (left tail) under M3",
+                        id, cens_flag
+                    ));
+                    cens_invalid_warned = true;
+                }
+                cens.push(cens_flag);
                 if occ_col.is_some() {
                     occasions.push(occ);
                 }
@@ -1850,25 +1874,24 @@ mod tests {
 
     // ── NONMEM coded RATE values (#324) ──────────────────────────────────────
     // `RATE` is overloaded: 0 = bolus, >0 = infusion rate, -1 = modeled rate
-    // (R{n} in $PK), -2 = modeled duration (D{n} in $PK). `-2` is accepted as
-    // `ModeledDuration` (the D{cmt}/engine check happens later at the model+data
-    // join); `-1` and malformed values are still rejected loudly.
-    // `validate_dose_rate` is the unit under test.
+    // (R{n} in $PK), -2 = modeled duration (D{n} in $PK). `-1`/`-2` are accepted
+    // as `ModeledRate`/`ModeledDuration` (the R{cmt}/D{cmt} existence + engine
+    // check happens later at the model+data join); other negatives and malformed
+    // values are still rejected loudly. `validate_dose_rate` is the unit under test.
 
     #[test]
     fn validate_dose_rate_classifies_coded_and_malformed_values() {
-        // -2 → modeled duration: accepted here; the D{cmt} existence / ODE-engine
-        // check happens later at the model+data join, where the model is known.
+        // -2 → modeled duration, -1 → modeled rate: both accepted here; the
+        // R{cmt}/D{cmt} existence + engine check happens later at the model+data
+        // join, where the model is known.
         assert_eq!(
             validate_dose_rate(-2.0, "7", 0.0).unwrap(),
             RateMode::ModeledDuration
         );
-
-        // -1 → modeled rate: not yet supported (#324 Phase B). The message names
-        // RATE=-1 and R1 so a NONMEM user recognises it, plus subject/time.
-        let e = validate_dose_rate(-1.0, "1", 2.5).unwrap_err();
-        assert!(e.contains("RATE=-1") && e.contains("R1"), "{e}");
-        assert!(e.contains("subject 1") && e.contains("time 2.5"), "{e}");
+        assert_eq!(
+            validate_dose_rate(-1.0, "7", 0.0).unwrap(),
+            RateMode::ModeledRate
+        );
 
         // Other negatives are not recognised NONMEM codes; the message echoes
         // the offending value so the bad row is identifiable. `-1.5`/`-2.5` are
@@ -1895,17 +1918,23 @@ mod tests {
     }
 
     #[test]
-    fn coded_rate_minus_one_on_dose_row_is_rejected() {
-        // End-to-end regression for the silent-bolus bug: a RATE=-1 dose must
-        // error at read time, naming the subject/time, not load as a bolus.
+    fn coded_rate_minus_one_on_dose_row_loads_as_modeled_rate() {
+        // A RATE=-1 dose loads as a modeled-rate dose (the R{cmt} existence +
+        // engine check happens later at the model+data join, where the model is
+        // known). It must NOT be silently treated as a bolus — `is_infusion()`
+        // reports true from the mode even before `resolve_rate` fills the rate.
         let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
                    1,0,.,1,100,1,-1,1\n\
                    1,1,5.0,0,.,.,.,0\n";
         let f = write_csv(csv);
-        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let dose = &pop.subjects[0].doses[0];
+        assert_eq!(dose.rate_mode, RateMode::ModeledRate);
+        assert_eq!(dose.amt, 100.0);
+        assert_eq!(dose.cmt, 1);
         assert!(
-            err.contains("RATE=-1") && err.contains("subject 1"),
-            "{err}"
+            dose.is_infusion() && !dose.is_fixed(),
+            "modeled, not a bolus"
         );
     }
 
@@ -2390,6 +2419,48 @@ mod tests {
             !pop.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
             "MDV=1 missing-DV row should not warn"
         );
+    }
+
+    #[test]
+    fn test_cens_negative_one_preserved_and_missing_defaults_zero() {
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+                   1,0,.,1,1,100,1,.\n\
+                   1,1,5.0,0,0,.,1,-1\n\
+                   1,2,7.0,0,0,.,1,\n\
+                   1,3,9.0,0,0,.,1,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        assert_eq!(subj.observations, vec![5.0, 7.0, 9.0]);
+        assert_eq!(subj.cens, vec![-1, 0, 1]);
+        assert!(subj.has_censored_observation());
+        assert!(
+            !pop.warnings
+                .iter()
+                .any(|w| w.starts_with("W_CENS_UNEXPECTED")),
+            "valid CENS values (-1/0/1) must not warn"
+        );
+    }
+
+    #[test]
+    fn test_cens_unexpected_value_warns_once() {
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+                   1,0,.,1,1,100,1,0\n\
+                   1,1,5.0,0,0,.,1,2\n\
+                   1,2,7.0,0,0,.,1,3\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+
+        // Value is preserved verbatim (no silent coercion in the reader)...
+        assert_eq!(pop.subjects[0].cens, vec![2, 3]);
+        // ...but the out-of-range flag is reported exactly once per subject.
+        let n = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+            .count();
+        assert_eq!(n, 1, "expected one W_CENS_UNEXPECTED per subject");
     }
 
     #[test]

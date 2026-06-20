@@ -386,7 +386,7 @@ fn obs_nll_subject_into_iov(
     kappas: &[Vec<f64>],
     _pk_scratch: &mut crate::pk::EventPkParams,
 ) -> f64 {
-    use crate::stats::special::log_normal_cdf;
+    use crate::stats::likelihood::m3_logcdf;
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
     // Continuous per-occasion-aware prediction (issue #104) — same model the
     // E-step (`individual_nll_iov`) and FOCEI use, so E and M steps stay
@@ -401,6 +401,9 @@ fn obs_nll_subject_into_iov(
         &subject.fremtype,
         sigma_values,
     );
+    // IIV on residual error (#409): scale the PK residual variance by
+    // exp(2·η_ruv); FREM rows keep their own variance.
+    let ruv_scale = model.residual_var_scale(eta);
     let mut total_nll = 0.0_f64;
     for j in 0..subject.observations.len() {
         // Floors protect log(0) in the M-step objective. individual_nll_iov
@@ -409,13 +412,12 @@ fn obs_nll_subject_into_iov(
         let f = preds[j].max(1e-12);
         let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
             Some(vv) => vv.max(1e-12),
-            None => model
-                .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
+            None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale)
                 .max(1e-12),
         };
-        if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
-            let z = (subject.observations[j] - f) / v.sqrt();
-            total_nll += -log_normal_cdf(z);
+        let cens = subject.cens.get(j).copied().unwrap_or(0);
+        if m3 && cens != 0 {
+            total_nll += -m3_logcdf(subject.observations[j], f, v.sqrt(), cens);
         } else {
             total_nll += 0.5 * (v.ln() + (subject.observations[j] - f).powi(2) / v);
         }
@@ -530,19 +532,28 @@ fn obs_nll_subject_grad_iov(
         &subject.fremtype,
         sigma_values,
     );
+    // IIV on residual error (#409): per-subject `exp(2·η_ruv)` scale on the PK
+    // residual variance (FREM rows excluded). η_ruv is a BSV eta, indexed into
+    // `eta`.  See the non-IOV `obs_nll_subject_grad` for the score-consistency
+    // argument behind scaling V, dV/df, and dV/dlogσ together.
+    let ruv_scale = model.residual_var_scale(eta);
+
     let mut nll_base = 0.0_f64;
     let mut all_preds_base = vec![0.0f64; n_obs];
     let mut residuals = vec![0.0f64; n_obs];
     let mut variances = vec![0.0f64; n_obs];
     let mut d_nll_d_f = vec![0.0f64; n_obs];
+    let mut obs_var_scale = vec![1.0f64; n_obs];
 
     for j in 0..n_obs {
         let cmt = subject.obs_cmts[j];
         let f = preds[j].max(1e-12);
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+        let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
+        obs_var_scale[j] = s;
         let v = match frem_vj {
             Some(vv) => vv.max(1e-12),
-            None => model.residual_variance_at(cmt, f, sigma_values).max(1e-12),
+            None => (model.residual_variance_at(cmt, f, sigma_values) * s).max(1e-12),
         };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
@@ -552,7 +563,7 @@ fn obs_nll_subject_grad_iov(
         let dv_df = if frem_vj.is_some() {
             0.0
         } else {
-            model.error_spec.dvar_df(cmt, f, sigma_values)
+            model.error_spec.dvar_df(cmt, f, sigma_values) * s
         };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
@@ -599,7 +610,8 @@ fn obs_nll_subject_grad_iov(
                 let ratio =
                     model
                         .error_spec
-                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values);
+                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values)
+                        * obs_var_scale[j];
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
@@ -904,18 +916,27 @@ fn obs_nll_subject_grad(
         sigma_values,
     );
 
-    // per-obs residual, variance, d(obs_nll)/d(f_j)
+    // IIV on residual error (#409): per-subject scale on the PK residual
+    // variance (`exp(2·η_ruv)`). FREM covariate rows are not scaled, so we hold
+    // a per-obs scale and apply it consistently to V, dV/df, and dV/dlogσ so the
+    // analytical score stays exact.
+    let ruv_scale = model.residual_var_scale(eta);
+
+    // per-obs residual, variance, d(obs_nll)/d(f_j), and the variance scale used.
     let mut residuals = vec![0.0f64; n_obs];
     let mut variances = vec![0.0f64; n_obs];
     let mut d_nll_d_f = vec![0.0f64; n_obs];
+    let mut obs_var_scale = vec![1.0f64; n_obs];
 
     for j in 0..n_obs {
         let cmt = subject.obs_cmts[j];
         let f = preds_base[j].max(1e-12);
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+        let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
+        obs_var_scale[j] = s;
         let v = match frem_vj {
             Some(vv) => vv.max(1e-12),
-            None => model.residual_variance_at(cmt, f, sigma_values).max(1e-12),
+            None => (model.residual_variance_at(cmt, f, sigma_values) * s).max(1e-12),
         };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
@@ -925,7 +946,7 @@ fn obs_nll_subject_grad(
         let dv_df = if frem_vj.is_some() {
             0.0
         } else {
-            model.error_spec.dvar_df(cmt, f, sigma_values)
+            model.error_spec.dvar_df(cmt, f, sigma_values) * s
         };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
@@ -977,7 +998,8 @@ fn obs_nll_subject_grad(
                 let ratio =
                     model
                         .error_spec
-                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values);
+                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values)
+                        * obs_var_scale[j];
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
@@ -989,9 +1011,9 @@ fn obs_nll_subject_grad(
 
 /// Sum of observation log-likelihoods with ETAs held fixed.
 ///
-/// Under M3, CENS=1 rows contribute `-log Φ((LLOQ - f)/√V)` instead of the
-/// Gaussian residual term. Without this branch, the SAEM M-step would optimize
-/// θ/σ as if censored observations were exact Gaussians at the LLOQ value,
+/// Under M3, censored rows contribute the matching normal-tail likelihood
+/// instead of the Gaussian residual term. Without this branch, the SAEM M-step
+/// would optimize θ/σ as if censored observations were exact Gaussians at the limit,
 /// producing silently-biased population estimates.
 ///
 /// Uses rayon's `map_init` so each worker thread allocates one
@@ -1045,6 +1067,32 @@ fn obs_nll_sum_iov(
         .sum()
 }
 
+/// True when a free (non-`FIX`) additive component of a `Combined` endpoint has
+/// collapsed onto its optimizer lower bound.
+///
+/// Sigma is optimized in log space with a lower bound of `exp(-8) ≈ 3.35e-4`
+/// (see `parameterization.rs`) and is carried here on the standard-deviation
+/// scale. `SIGMA_FLOOR_NEAR = 1e-3` is the detection band just above that hard
+/// bound: a value at or below it means the additive term pinned to the floor
+/// rather than identifying a genuine non-zero additive error.
+fn combined_additive_sigma_at_floor(model: &CompiledModel, params: &ModelParameters) -> bool {
+    const SIGMA_FLOOR_NEAR: f64 = 1.0e-3;
+    model
+        .error_spec
+        .combined_additive_sigma_indices()
+        .into_iter()
+        .any(|idx| {
+            !params.sigma_fixed.get(idx).copied().unwrap_or(false)
+                && params
+                    .sigma
+                    .values
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(f64::INFINITY)
+                    <= SIGMA_FLOOR_NEAR
+        })
+}
+
 /// Build (theta_idx, eta_idx) pairs for log-transformed mu-references only.
 ///
 /// Only `log_transformed = true` mu-refs (patterns `THETA*exp(ETA)` and
@@ -1084,8 +1132,14 @@ pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) 
     // HMC is BSV-only (`hmc_step` and the AD NLL/gradient are kappa-unaware), so
     // it is disabled for IOV models (`n_kappa > 0`); those subjects use the MH
     // kernels, whose acceptance targets the IOV conditional p(η | κ, θ, data).
-    let using_hmc =
-        n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && model.n_kappa == 0;
+    // IIV on residual error (#409) also disables HMC: the Dual2 gradient kernel
+    // carries no `exp(2·η_ruv)` variance-scaling rule, so these models fall back
+    // to MH (same gate as [`run_saem`]).
+    let using_hmc = n_leapfrog > 0
+        && model.ode_spec.is_none()
+        && model.tv_fn.is_some()
+        && model.n_kappa == 0
+        && model.residual_error_eta.is_none();
     if using_hmc {
         format!("HMC ({n_leapfrog} leapfrog steps, Dual2 analytic gradients)")
     } else if n_leapfrog > 0 {
@@ -1138,8 +1192,17 @@ pub fn run_saem(
     // `n_leapfrog > 0` would propose eta against the kappa-free posterior and
     // hand a BSV-only NLL to the componentwise kernel as its (mismatched)
     // acceptance baseline.
-    let using_hmc: bool =
-        n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && n_kappa == 0;
+    //
+    // IIV on residual error (#409): the Dual2 NLL/gradient kernels build the
+    // residual variance from σ alone and carry no `exp(2·η_ruv)` scaling rule,
+    // so an HMC E-step would sample η against the unscaled conditional — η_ruv
+    // sees no data curvature and collapses toward the prior. Disable HMC for
+    // these models so the (correctly-scaled) MH kernels run instead.
+    let using_hmc: bool = n_leapfrog > 0
+        && model.ode_spec.is_none()
+        && model.tv_fn.is_some()
+        && n_kappa == 0
+        && model.residual_error_eta.is_none();
 
     let n_theta = init_params.theta.len();
     let n_sigma = init_params.sigma.values.len();
@@ -1160,6 +1223,9 @@ pub fn run_saem(
         // keys on it to tag this as an Info/gradient_fallback warning.
         let reason = if n_kappa > 0 {
             "HMC is unavailable for IOV models (it is kappa-unaware)"
+        } else if model.residual_error_eta.is_some() {
+            "HMC is unavailable with IIV on residual error (iiv_on_ruv) — the autodiff \
+             kernel has no exp(2·η_ruv) variance-scaling rule"
         } else {
             "HMC is unavailable (requires an analytical PK model the Dual2 gradient supports)"
         };
@@ -1430,7 +1496,6 @@ pub fn run_saem(
         } else {
             gamma
         };
-
         // Rebuild omega for this iteration
         let omega_k = OmegaMatrix::from_matrix(
             state.omega_mat.clone(),
@@ -2073,6 +2138,11 @@ pub fn run_saem(
         kappa_fixed: init_params.kappa_fixed.clone(),
     };
 
+    if combined_additive_sigma_at_floor(model, &final_params) {
+        warnings
+            .push("SAEM combined-error additive sigma collapsed to its lower bound.".to_string());
+    }
+
     // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----
     let warm_etas: Vec<DVector<f64>> = state
         .etas
@@ -2210,6 +2280,38 @@ mod tests {
             "MSTEP_NLOPT_ALGORITHM changed — see comment above this test \
              for the Emax-Hill identifiability rationale before adjusting."
         );
+    }
+
+    /// `combined_additive_sigma_at_floor` flags only a free additive component
+    /// (sigma index 1) sitting at/below the near-floor band, and ignores
+    /// non-combined specs and FIXed sigmas.
+    #[test]
+    fn combined_additive_sigma_at_floor_detects_collapsed_free_additive() {
+        let mut model = analytical_model(GradientMethod::Fd);
+        model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+
+        let mut params = model.default_params.clone();
+        params.sigma = SigmaVector {
+            values: vec![0.1, 0.5],
+            names: vec!["PROP".into(), "ADD".into()],
+        };
+        params.sigma_fixed = vec![false, false];
+
+        // Healthy additive term well above the floor band.
+        assert!(!combined_additive_sigma_at_floor(&model, &params));
+
+        // Additive term collapsed onto the floor → flagged.
+        params.sigma.values[1] = 5.0e-4;
+        assert!(combined_additive_sigma_at_floor(&model, &params));
+
+        // A FIXed additive at the floor is intentional, not a collapse.
+        params.sigma_fixed[1] = true;
+        assert!(!combined_additive_sigma_at_floor(&model, &params));
+
+        // Non-combined specs never flag, even with a tiny second sigma.
+        params.sigma_fixed[1] = false;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        assert!(!combined_additive_sigma_at_floor(&model, &params));
     }
 
     #[test]
@@ -2813,6 +2915,7 @@ mod tests {
             #[cfg(feature = "survival")]
             endpoints: HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         };
 
         // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.

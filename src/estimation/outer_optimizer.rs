@@ -2909,8 +2909,13 @@ pub(crate) fn compute_covariance(
     // `∂a/∂θ` curvature the analytical stencil drops — which removes the
     // weakly-identified-θ SE bias (e.g. warfarin TVKA ~9% high vs a Richardson
     // FD-of-OFV ground truth).
+    // IIV on residual error (#409): the analytical point-grad stencil has no
+    // rule for the per-subject `exp(2·η_ruv)` variance scaling or its θ/σ/η
+    // curvature, so take the OFV second-difference Hessian (it FD-differences
+    // the real scaled marginal end-to-end).
     let force_ofv_hessian = (!options.interaction && model.error_spec.has_f_dependent_variance())
-        || options.covariance_ofv_hessian;
+        || options.covariance_ofv_hessian
+        || model.residual_error_eta.is_some();
     let use_analytical = !is_iov && !force_ofv_hessian;
 
     // Track FD failures at source so diagnostics name the right cause (a NaN/Inf
@@ -4489,6 +4494,7 @@ mod tests {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -4689,6 +4695,7 @@ mod tests {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         };
         check_gradient(&model, &make_population(3), 2);
     }
@@ -5104,6 +5111,7 @@ mod tests {
         };
         let model = CompiledModel {
             frem_config: None,
+            residual_error_eta: None,
             name: "iov_cov_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,

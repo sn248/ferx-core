@@ -12,7 +12,7 @@ differ only in how the proposal is re-centered. `impmap` re-derives each
 subject's conditional mode and first-order variance **every** iteration (robust
 on rich data), whereas `imp` re-centers from the previous iteration's sample
 moments after the first iteration (cheaper, but can stall on rich data).
-`imp` can also run in evaluation-only mode (`is_eval_only = true`), which
+`imp` can also run in evaluation-only mode (`imp_eval_only = true`), which
 `impmap` has no equivalent of.
 
 > **NONMEM's description.** *"Sometimes for highly dimensioned PK/PD problems
@@ -45,7 +45,7 @@ Standalone, or as a chain stage warm-started by a preceding estimator:
   method             = importance_sampling_map   # or: impmap
   impmap_iterations  = 200
   impmap_samples     = 300
-  impmap_proposal_df = normal      # multivariate normal (NONMEM default)
+  impmap_proposal_df = 4           # Student-t (default); `normal` for MVN
   impmap_seed        = 12345
 ```
 
@@ -66,8 +66,9 @@ Each MCEM iteration, at the current parameters θ⁽ᵗ⁾, Ω⁽ᵗ⁾, σ⁽�
    Hessian \\(H_i = J_i^\\top R_i^{-1} J_i + \\Omega^{-1}\\).
 
 2. **Importance sampling (E-step B).** Draw `K = impmap_samples` samples
-   \\(\\eta_{ik} \\sim q(\\hat\\eta_i, H_i^{-1})\\) — a multivariate normal by
-   default (`impmap_proposal_df = normal`), or a Student-t for heavier tails —
+   \\(\\eta_{ik} \\sim q(\\hat\\eta_i, H_i^{-1})\\) — a Student-t by default
+   (`impmap_proposal_df = 4`, heavier tails for robust importance weights), or a
+   multivariate normal (`= normal`) —
    with self-normalized weights
    \\(\\tilde w_{ik} \\propto p(y_i\\mid\\eta_{ik},\\theta)\\,p(\\eta_{ik}\\mid\\Omega)/q(\\eta_{ik})\\).
 
@@ -85,9 +86,30 @@ Each MCEM iteration, at the current parameters θ⁽ᵗ⁾, Ω⁽ᵗ⁾, σ⁽�
      likelihood \\(\\sum_i \\sum_k \\tilde w_{ik}\\log p(y_i\\mid\\eta_{ik},\\theta,\\sigma)\\)
      with a derivative-free NLopt BOBYQA step.
 
+> **High-dimensional models need more samples.** The self-normalized importance
+> weights make the M-step moments carry a finite-sample bias that grows with the
+> number of ETAs, so the default `impmap_samples = 300` — ample for a 3–4 ETA PK
+> model — is badly under-sampled for a high-dimensional FREM model (often 10+
+> ETAs) and can bias the typical-value and Ω estimates (e.g. the absorption
+> parameter on a 13-ETA FREM model drifts at `K = 300` and recovers as `K` grows
+> into the thousands). Two options address this: set **`impmap_auto = true`**
+> (NONMEM `AUTO`) to ramp the sample count automatically until the objective's
+> Monte-Carlo SE drops below 1.0 — on the 13-ETA FREM model this ramps
+> `300 → 10000` and brings the absorption typical value from ~4.6 to ~3.0
+> (matching NONMEM); or raise `impmap_samples` manually (several thousand for
+> FREM). IMPMAP also warns when the objective is left under-sampled. FOCEI is
+> unaffected and is a good cross-check for the typical values.
+
 The reported estimate is the running mean of the parameter vector over the final
 `impmap_averaging` iterations. A FOCE-Laplace `ofv` is computed at the final
-parameters for AIC/BIC comparability with FOCE/FOCEI/SAEM.
+parameters for AIC/BIC comparability with FOCE/FOCEI/SAEM. The
+importance-sampling Monte-Carlo **marginal** `−2 log L` — the number NONMEM
+`METHOD=IMPMAP` reports as its `#OBJV` — is also evaluated at the final estimates
+and surfaced on `FitResult.importance_sampling.minus2_log_likelihood` (± its MC
+SE). If IMPMAP is configured with a Gaussian proposal (`impmap_proposal_df =
+normal`), this final marginal eval substitutes a finite-`t` proposal to keep the
+importance weights bounded. Use that field, not `ofv`, to compare against
+NONMEM's reported IMPMAP objective.
 
 > **Mu-referencing is required.** The closed-form `log θ += mean(η)` shift is the
 > EM-correct typical-value update for log-normal random effects, so it is always
@@ -119,9 +141,12 @@ model/data (`tests/nonmem/warfarin_impmap.ctl`):
 
 The well-determined CL/V structure and all three variance components agree to a
 few percent; TVKA is the least-identified parameter on this 10-subject extract
-(ETA_KA variance ≈ 0.34, high shrinkage) and carries the loosest band. The OFVs
-(NONMEM "without constant" vs ferx's Laplace OFV) agree to ~1 unit, the usual
-cross-engine margin. This comparison is asserted by the gated
+(ETA_KA variance ≈ 0.34, high shrinkage) and carries the loosest band. NONMEM's
+−284.92 is its IMPMAP **marginal** `#OBJV` ("without constant"); the matching
+ferx number is `importance_sampling.minus2_log_likelihood`, not the Laplace `ofv`
+(−286.00) shown in the table. Both objectives drop the same `Nobs·log(2π)`
+constant, so the residual difference is the parameter-estimate gap, within the
+usual cross-engine + Monte-Carlo margin. This comparison is asserted by the gated
 `ferx_impmap_matches_nonmem_impmap_on_warfarin` test (nightly, `slow-tests`); a
 companion `impmap_converges_to_focei_on_warfarin` test checks agreement with
 ferx's own FOCEI.

@@ -245,6 +245,7 @@ fn build_warfarin_model() -> CompiledModel {
         #[cfg(feature = "survival")]
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
+        residual_error_eta: None,
     }
 }
 
@@ -367,6 +368,7 @@ fn generate_two_cpt_iv() {
         #[cfg(feature = "survival")]
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
+        residual_error_eta: None,
     };
     let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0];
     let subjects = simulate_subjects(&model, &params, 15, 100.0, 1, &obs_times, 123, None);
@@ -494,6 +496,7 @@ fn generate_two_cpt_oral_cov() {
         #[cfg(feature = "survival")]
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
+        residual_error_eta: None,
     };
 
     // Generate random covariates (matching Julia seed 456)
@@ -679,6 +682,7 @@ fn generate_mm_oral() {
         #[cfg(feature = "survival")]
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
+        residual_error_eta: None,
     };
     let obs_times = vec![
         0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0,

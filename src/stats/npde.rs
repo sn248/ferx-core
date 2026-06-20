@@ -110,9 +110,14 @@ pub fn compute_npde_npd(
                 let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
                 let ipreds = model_preds(model, subject, &pk, &params.theta, &eta_slice);
 
+                // IIV on residual error (#409): the simulated eta draw includes
+                // the residual-error eta, so scale the residual variance by
+                // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
+                let ruv_scale = model.residual_var_scale(&eta_slice);
                 for (j, &ip) in ipreds.iter().enumerate() {
                     let var =
-                        model.residual_variance_at(subject.obs_cmts[j], ip, &params.sigma.values);
+                        model.residual_variance_at(subject.obs_cmts[j], ip, &params.sigma.values)
+                            * ruv_scale;
                     let eps: f64 = normal.sample(&mut rng);
                     sims[(j, k)] = ip + var.sqrt() * eps;
                 }
@@ -127,7 +132,7 @@ pub fn compute_npde_npd(
 
 /// Per-observation empirical-CDF normal scores, without decorrelation. Censored
 /// rows and rows with a non-finite observed value yield `NaN`.
-fn npd_scores(observed: &[f64], cens: &[u8], sims: &DMatrix<f64>) -> Vec<f64> {
+fn npd_scores(observed: &[f64], cens: &[i8], sims: &DMatrix<f64>) -> Vec<f64> {
     (0..observed.len())
         .map(|j| {
             if cens.get(j).copied().unwrap_or(0) != 0 {
@@ -144,7 +149,7 @@ fn npd_scores(observed: &[f64], cens: &[u8], sims: &DMatrix<f64>) -> Vec<f64> {
 /// rank-deficient (`K <= n_obs`), when it stays non-PD after jitter, or when the
 /// subject has any censored observation (decorrelation would mix the LLOQ into
 /// the uncensored rows).
-fn npde_scores(observed: &[f64], cens: &[u8], sims: &DMatrix<f64>) -> Vec<f64> {
+fn npde_scores(observed: &[f64], cens: &[i8], sims: &DMatrix<f64>) -> Vec<f64> {
     let n = observed.len();
     let k = sims.ncols();
     if n == 0 {

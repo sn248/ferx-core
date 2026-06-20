@@ -969,6 +969,7 @@ mod tests {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 

@@ -70,6 +70,14 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     if model.has_tte() {
         return Some("time-to-event ([event_model]) hazard likelihood");
     }
+    // IIV on residual error (`Y = IPRED + EPS*EXP(ETA)`). The analytical kernels
+    // build the residual variance from σ alone and have no rule for the
+    // per-subject `exp(2·η_ruv)` scaling; the EBE search must see the scaled
+    // variance, so route these models to FD (which differences the real
+    // `individual_nll`, where the scale is applied). See #409.
+    if model.residual_error_eta.is_some() {
+        return Some("IIV on residual error (iiv_on_ruv)");
+    }
     None
 }
 
@@ -320,6 +328,47 @@ pub fn find_ebe(
         None => vec![0.0; n_eta],
     };
 
+    // FREM-aware cold-start: initialise each covariate pseudo-obs eta at its
+    // data-implied mode `cov_obs − TV`. These etas are pinned by their
+    // pseudo-observations (precision ≫ prior), so this is essentially their
+    // exact posterior mode. Starting them at 0 instead leaves them ~±40 off,
+    // and the block-Ω⁻¹ PK↔covariate coupling turns that error into a large
+    // spurious force on the PK etas — which is what sent a handful of subjects'
+    // PK etas running away (V≈e⁻⁹, MAT≈e¹¹) and produced modes with obs-NLL
+    // ~1e7–1e8 that wrecked the IMP proposal (issue #406). Only on a cold start;
+    // a warm start already carries good covariate etas.
+    if eta_init.is_none() {
+        if let Some(fc) = model.frem_config.as_ref() {
+            for (j, &ft) in subject.fremtype.iter().enumerate() {
+                if ft == 0 {
+                    continue;
+                }
+                if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
+                    if eta_idx < n_eta
+                        && theta_idx < params.theta.len()
+                        && j < subject.observations.len()
+                    {
+                        eta[eta_idx] = subject.observations[j] - params.theta[theta_idx];
+                    }
+                }
+            }
+        }
+    }
+
+    // Diagonal preconditioner for the inner BFGS. FREM posteriors are extremely
+    // multi-scale: PK etas have curvature ~1e2 and scale ~0.1, covariate
+    // pseudo-obs etas have curvature ~1e6 (EPSCOV variance) and scale ~±40, and
+    // near-fixed etas reach ~1e10. With the default H0 = I the search direction
+    // is mis-scaled by up to ~1e8 per dimension and BFGS never reaches the true
+    // joint mode — the returned η̂ then has an absurd obs-NLL, which makes the
+    // IMP/IMPMAP importance proposal (centred on that mode) collapse to ~0 ESS
+    // and diverge (issue #406). The preconditioner sets H0 = diag(precondᵢ) with
+    // precondᵢ ≈ posterior variance of etaᵢ = 1/(Ω⁻¹ᵢᵢ + dataᵢ), where dataᵢ is
+    // the analytic FREM pseudo-obs precision (J=1, R=EPSCOV²); covariate dims
+    // get a near-Newton step in one iteration, PK dims fall back to the prior
+    // conditional scale. `None` for non-FREM models → identity H0 (unchanged).
+    let precond: Option<Vec<f64>> = build_inner_preconditioner(model, subject, params, n_eta);
+
     // Per-subject scratch buffers, built once and reused across every
     // BFGS line-search obj call and every Jacobian perturbation. The
     // EventSchedule pre-computes the merged event timeline + per-interval
@@ -405,9 +454,17 @@ pub fn find_ebe(
                     }
                 }
             };
-            inner_minimize_with_grad(&obj, &agrad, &mut eta, n_eta, max_iter, tol)
+            inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                &mut eta,
+                n_eta,
+                max_iter,
+                tol,
+                precond.as_deref(),
+            )
         } else {
-            inner_minimize(&obj, &mut eta, n_eta, max_iter, tol)
+            inner_minimize(&obj, &mut eta, n_eta, max_iter, tol, precond.as_deref())
         }
     };
 
@@ -542,7 +599,8 @@ fn find_ebe_iov(
         )
     };
 
-    let bfgs_converged = inner_minimize(&obj, &mut x, n_flat, max_iter, tol);
+    // IOV models are not FREM, so no inner preconditioner (identity H0).
+    let bfgs_converged = inner_minimize(&obj, &mut x, n_flat, max_iter, tol, None);
     let (nm_converged, used_fallback) = if !bfgs_converged {
         // Reset to prior mode: bsv_psi = mu (eta_true = 0), kappas = 0.
         x = vec![0.0; n_flat];
@@ -639,13 +697,16 @@ fn compute_jacobian_fd_iov(
 /// `(s, y, ρ)` history, with implicit initial Hessian `H₀ = γI`,
 /// `γ = sᵀy / yᵀy` of the most recent pair (Nocedal & Wright, Alg. 7.4). With an
 /// empty history this returns `−g` (steepest descent), so the first step matches
-/// the old dense-BFGS start.
+/// the old dense-BFGS start. A diagonal `precond` (FREM, issue #406) replaces the
+/// scalar `γ` initial Hessian with `H₀ = diag(precond)`, so the central scaling
+/// step is per-dimension instead of a single ill-scaled `γ`.
 fn lbfgs_direction(
     g: &[f64],
     s_hist: &[Vec<f64>],
     y_hist: &[Vec<f64>],
     rho_hist: &[f64],
     n: usize,
+    precond: Option<&[f64]>,
 ) -> Vec<f64> {
     let dotp = |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
     let m = s_hist.len();
@@ -669,7 +730,12 @@ fn lbfgs_direction(
     } else {
         1.0
     };
-    let mut z: Vec<f64> = q.iter().map(|qi| gamma * qi).collect();
+    // Central H₀·q: a diagonal preconditioner (`H₀ = diag(precond)`) when supplied,
+    // else the scalar `γI` of standard L-BFGS.
+    let mut z: Vec<f64> = match precond {
+        Some(p) => q.iter().zip(p).map(|(qi, pi)| pi * qi).collect(),
+        None => q.iter().map(|qi| gamma * qi).collect(),
+    };
     for i in 0..m {
         let b = rho_hist[i] * dotp(&y_hist[i], &z);
         for j in 0..n {
@@ -804,6 +870,13 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     ) {
         return false;
     }
+    // IIV on residual error (#409): the Dual2 kernels build the residual variance
+    // from σ alone and carry no `exp(2·η_ruv)` scaling rule, so the EBE search
+    // must reconverge against the scaled `individual_nll` under FD (same reason as
+    // `analytical_ad_unsupported`).
+    if model.residual_error_eta.is_some() {
+        return false;
+    }
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
         return false;
@@ -889,6 +962,99 @@ pub(crate) fn analytic_eta_nll_gradient(
     Some(grad)
 }
 
+/// Build the diagonal BFGS preconditioner for FREM inner loops (issue #406).
+///
+/// Returns `Some(diag)` where `diag[i]` ≈ the posterior variance of `etaᵢ`,
+/// `1 / (Ω⁻¹ᵢᵢ + dataᵢ)`. `dataᵢ` accumulates the analytic precision of each
+/// FREM covariate pseudo-observation that maps to `etaᵢ` (prediction = TV+eta,
+/// so the Jacobian is 1 and the row contributes `1/R` with `R = EPSCOV²`).
+/// PK / non-covariate dims have `dataᵢ = 0` and fall back to the prior
+/// conditional scale `1/Ω⁻¹ᵢᵢ`. Returns `None` for non-FREM models so the
+/// existing identity-`H0` path is used unchanged.
+fn build_inner_preconditioner(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    n_eta: usize,
+) -> Option<Vec<f64>> {
+    let fc = model.frem_config.as_ref()?;
+    preconditioner_from_parts(
+        fc,
+        &subject.fremtype,
+        &params.omega.inv,
+        &params.sigma.values,
+        n_eta,
+    )
+}
+
+/// Pure core of [`build_inner_preconditioner`] (no `CompiledModel`/`Subject`
+/// dependency, so it is unit-testable in isolation). See that function for the
+/// rationale; `omega_inv` is Ω⁻¹ and `sigma` the σ values.
+fn preconditioner_from_parts(
+    fc: &FremConfig,
+    fremtype: &[u16],
+    omega_inv: &DMatrix<f64>,
+    sigma: &[f64],
+    n_eta: usize,
+) -> Option<Vec<f64>> {
+    if n_eta == 0 {
+        return None;
+    }
+    let r_cov = {
+        let s = sigma[fc.covariate_sigma_index];
+        let v = s * s;
+        if v > 1e-12 {
+            v
+        } else {
+            1e-12
+        }
+    };
+    let inv_r = 1.0 / r_cov;
+    let mut data_prec = vec![0.0_f64; n_eta];
+    for &ft in fremtype.iter() {
+        if ft > 0 {
+            if let Some(&(_theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
+                if eta_idx < n_eta {
+                    data_prec[eta_idx] += inv_r;
+                }
+            }
+        }
+    }
+    let mut precond = vec![1.0_f64; n_eta];
+    for (i, p) in precond.iter_mut().enumerate() {
+        let prec = omega_inv[(i, i)].max(0.0) + data_prec[i];
+        if prec > 0.0 {
+            *p = 1.0 / prec;
+        }
+    }
+    Some(precond)
+}
+
+/// Initial inverse-Hessian for the inner BFGS: `diag(precond)` when a
+/// preconditioner is supplied, else identity.
+fn init_h_inv(n: usize, precond: Option<&[f64]>) -> DMatrix<f64> {
+    match precond {
+        Some(p) => DMatrix::from_diagonal(&DVector::from_column_slice(p)),
+        None => DMatrix::identity(n, n),
+    }
+}
+
+/// Convergence metric. With a preconditioner the natural stopping test is the
+/// preconditioned (≈ Newton-decrement) norm `√(Σ gᵢ²·precondᵢ)`, which is
+/// commensurate across the multi-scale dimensions; the raw L2 norm would be
+/// dominated by the sharp covariate dims and never fall below `tol`.
+fn grad_norm_metric(g: &[f64], precond: Option<&[f64]>) -> f64 {
+    match precond {
+        Some(p) => g
+            .iter()
+            .zip(p.iter())
+            .map(|(&gi, &pi)| gi * gi * pi)
+            .sum::<f64>()
+            .sqrt(),
+        None => g.iter().map(|&gi| gi * gi).sum::<f64>().sqrt(),
+    }
+}
+
 /// Whether to take the L-BFGS path for inner dimension `n` under the current
 /// [`inner_optimizer_mode`]. `Auto` consults the [`INNER_LBFGS_MIN_DIM`] threshold;
 /// an explicit `Bfgs`/`Lbfgs` pins it; `NelderMead` is handled by the callers
@@ -915,6 +1081,7 @@ fn inner_minimize(
     n: usize,
     max_iter: usize,
     tol: f64,
+    precond: Option<&[f64]>,
 ) -> bool {
     if matches!(
         inner_optimizer_mode(),
@@ -924,9 +1091,9 @@ fn inner_minimize(
     }
     let grad = |p: &[f64]| gradient_fd(obj, p, n);
     if inner_use_lbfgs(n) {
-        lbfgs_core(obj, &grad, x, n, max_iter, tol)
+        lbfgs_core(obj, &grad, x, n, max_iter, tol, precond)
     } else {
-        dense_bfgs_core(obj, &grad, x, n, max_iter, tol)
+        dense_bfgs_core(obj, &grad, x, n, max_iter, tol, precond)
     }
 }
 
@@ -940,6 +1107,7 @@ fn inner_minimize_with_grad(
     n: usize,
     max_iter: usize,
     tol: f64,
+    precond: Option<&[f64]>,
 ) -> bool {
     if matches!(
         inner_optimizer_mode(),
@@ -948,9 +1116,9 @@ fn inner_minimize_with_grad(
         return nelder_mead_minimize(obj, x, n, max_iter, tol);
     }
     if inner_use_lbfgs(n) {
-        lbfgs_core(obj, grad, x, n, max_iter, tol)
+        lbfgs_core(obj, grad, x, n, max_iter, tol, precond)
     } else {
-        dense_bfgs_core(obj, grad, x, n, max_iter, tol)
+        dense_bfgs_core(obj, grad, x, n, max_iter, tol, precond)
     }
 }
 
@@ -963,6 +1131,7 @@ fn lbfgs_core(
     n: usize,
     max_iter: usize,
     tol: f64,
+    precond: Option<&[f64]>,
 ) -> bool {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
@@ -970,17 +1139,23 @@ fn lbfgs_core(
     let mut g = grad(x);
 
     for _iter in 0..max_iter {
-        let gnorm: f64 = g.iter().map(|&gi| gi * gi).sum::<f64>().sqrt();
+        // Preconditioned stopping metric (≈ Newton decrement), commensurate
+        // across multi-scale FREM dimensions; raw L2 would be dominated by the
+        // sharp covariate dims and never fall below `tol` (issue #406).
+        let gnorm = grad_norm_metric(&g, precond);
         if gnorm < tol {
             return true;
         }
 
-        let mut d = lbfgs_direction(&g, &s_hist, &y_hist, &rho_hist, n);
+        let mut d = lbfgs_direction(&g, &s_hist, &y_hist, &rho_hist, n, precond);
         // Guard against a non-descent direction (e.g. after a bad curvature
-        // pair) by falling back to steepest descent.
+        // pair) by falling back to (preconditioned) steepest descent.
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
         if dg >= 0.0 {
-            d = g.iter().map(|gi| -gi).collect();
+            d = match precond {
+                Some(p) => g.iter().zip(p).map(|(gi, pi)| -gi * pi).collect(),
+                None => g.iter().map(|gi| -gi).collect(),
+            };
         }
 
         let alpha = backtracking_line_search(obj, x, &d, &g, n);
@@ -1024,14 +1199,18 @@ fn dense_bfgs_core(
     n: usize,
     max_iter: usize,
     tol: f64,
+    precond: Option<&[f64]>,
 ) -> bool {
-    let mut h_inv = DMatrix::identity(n, n);
+    let mut h_inv = init_h_inv(n, precond);
     let mut g = grad(x);
     let mut first_step = true;
 
     for _iter in 0..max_iter {
-        let gnorm: f64 = g.iter().map(|&gi| gi * gi).sum::<f64>().sqrt();
-        if first_step && gnorm > 1.0 {
+        let gnorm = grad_norm_metric(&g, precond);
+
+        // Scale initial Hessian so first step is O(1) not O(gnorm). Only for the
+        // identity-H0 path; the diagonal preconditioner already sets per-dim scale.
+        if precond.is_none() && first_step && gnorm > 1.0 {
             h_inv *= 1.0 / gnorm;
             first_step = false;
         }
@@ -1045,8 +1224,11 @@ fn dense_bfgs_core(
 
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
         if dg >= 0.0 {
-            h_inv = DMatrix::identity(n, n);
-            let d: Vec<f64> = g.iter().map(|gi| -gi).collect();
+            // Reset to the (preconditioned) steepest-descent metric, not raw
+            // identity — for FREM the preconditioner is what keeps the descent
+            // direction commensurate across the multi-scale dimensions.
+            h_inv = init_h_inv(n, precond);
+            let d: Vec<f64> = (-&h_inv * &g_vec).iter().copied().collect();
             let alpha = backtracking_line_search(obj, x, &d, &g, n);
             for i in 0..n {
                 x[i] += alpha * d[i];
@@ -1524,8 +1706,8 @@ mod tests {
                 }
                 t0.elapsed().as_secs_f64() * 1e3 / runs as f64
             };
-            let t_dense = time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8));
-            let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8));
+            let t_dense = time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None));
+            let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None));
             eprintln!(
                 "  n={n:4}  dense={t_dense:8.3} ms  lbfgs={t_lbfgs:8.3} ms  dense/lbfgs={:.2}x",
                 t_dense / t_lbfgs
@@ -1538,6 +1720,53 @@ mod tests {
         let s = InnerLoopStats::default();
         assert_eq!(s.n_unconverged, 0);
         assert_eq!(s.n_fallback, 0);
+    }
+
+    // ── FREM inner-loop preconditioner (issue #406) ──────────────────────────
+
+    #[test]
+    fn preconditioner_scales_each_dim_by_its_own_curvature() {
+        // 4 etas: 2 PK (dims 0,1; no FREM pseudo-obs) and 2 covariate (dims 2,3;
+        // FREMTYPE 100→eta2, 200→eta3). The covariate pseudo-obs precision is
+        // 1/R = 1/(EPSCOV²) = 1e6; PK dims have no data term and fall back to the
+        // prior conditional scale 1/Ω⁻¹ᵢᵢ.
+        let mut fremtype_to_indices = std::collections::HashMap::new();
+        fremtype_to_indices.insert(100u16, (5usize, 2usize));
+        fremtype_to_indices.insert(200u16, (6usize, 3usize));
+        let fc = FremConfig {
+            fremtype_to_indices,
+            covariate_sigma_index: 1,
+        };
+        // Ω⁻¹: PK precisions 10 and 4; covariate prior precisions tiny (0.01).
+        let omega_inv =
+            DMatrix::from_diagonal(&DVector::from_column_slice(&[10.0, 4.0, 0.01, 0.01]));
+        // sigma[1] = EPSCOV = 1e-3 (SD) → R = 1e-6 → data precision 1e6.
+        let sigma = [0.3, 1e-3];
+        // One PK obs row (ft=0) plus one pseudo-obs row per covariate.
+        let fremtype = [0u16, 100, 200];
+
+        let p = preconditioner_from_parts(&fc, &fremtype, &omega_inv, &sigma, 4)
+            .expect("Some for n_eta > 0");
+
+        // PK dims: 1/Ω⁻¹ᵢᵢ.
+        assert!((p[0] - 0.1).abs() < 1e-9, "p0 = {}", p[0]);
+        assert!((p[1] - 0.25).abs() < 1e-9, "p1 = {}", p[1]);
+        // Covariate dims: 1/(0.01 + 1e6) ≈ 1e-6 — sharply smaller than PK.
+        assert!(p[2] < 1.1e-6 && p[2] > 0.9e-6, "p2 = {}", p[2]);
+        assert!(p[3] < 1.1e-6 && p[3] > 0.9e-6, "p3 = {}", p[3]);
+        // The whole point: covariate dims get a step scale ~1e5× tighter than PK,
+        // so a single preconditioned BFGS step is near-Newton for them.
+        assert!(p[0] / p[2] > 1e4);
+    }
+
+    #[test]
+    fn preconditioner_is_none_for_zero_eta() {
+        let fc = FremConfig {
+            fremtype_to_indices: std::collections::HashMap::new(),
+            covariate_sigma_index: 0,
+        };
+        let omega_inv = DMatrix::<f64>::zeros(0, 0);
+        assert!(preconditioner_from_parts(&fc, &[], &omega_inv, &[1e-3], 0).is_none());
     }
 
     #[test]
@@ -1684,6 +1913,7 @@ mod tests {
                 },
                 covariate_sigma_index: 0,
             }),
+            residual_error_eta: None,
         };
 
         // Subject: 2 PK obs + 1 FREM obs
@@ -1935,6 +2165,7 @@ mod iov_tests {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -2107,6 +2338,7 @@ mod iov_tests {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         };
         let subject = Subject {
             id: "1".into(),
@@ -2160,6 +2392,7 @@ mod iov_tests {
         };
         let model = CompiledModel {
             frem_config: None,
+            residual_error_eta: None,
             name: "noniov_mu".into(),
             has_conditional_eta_params: false,
             pk_model: PkModel::OneCptIv,

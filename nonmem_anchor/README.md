@@ -107,12 +107,45 @@ For Savic, also check parameter **recovery** vs the truths above (the data were
 simulated from this model). For IG, recovery is not meaningful (mis-specified vs
 the transit DGP); the test there is **NONMEM-igd ≈ ferx-igd**, not recovery.
 
-### Freijer & Post IG — PENDING
+### Freijer & Post IG — RESULT (FOCEI, 20 subj / 240 obs)
 
-NONMEM run is done (`results/freijer_ig.*`), but `igd()` is not yet implemented
-in ferx ([#347](https://github.com/FeRx-NLME/ferx-core/issues/347)), so there is
-no ferx side to compare. Fill this table in once #347 lands and a
-`freijer_igd_fit.ferx` exists.
+NONMEM run: `results/freijer_ig.*` (ferx `nmfe75`; final estimates in
+`results/freijer_ig.ext`, MINIMIZATION SUCCESSFUL, `#OBJV = −899.38`). ferx anchor:
+`tests/igd_nonmem_anchor.rs` on `data/igd_oral.csv` (the shared dataset re-keyed to
+a 1-compartment layout — every record on CMT 1 — so the dose feeds the `igd()`
+compartment directly; see the dose-routing note below).
+
+**The check is NONMEM-igd ≈ ferx-igd at the same parameters.** Recovery is *not*
+meaningful here: the data were simulated from the Savic transit model, so the IG
+fit is mildly mis-specified (both engines fit the same approximate shape). On that
+mis-specified objective the likelihood surface has a long flat ridge — NONMEM's
+gradient FOCEI climbs it from `MAT≈2` to `MAT≈6.07` over ~30 iterations, while
+ferx's default derivative-free outer optimiser (BOBYQA) takes small steps and
+stalls partway up (full-fit OFV ≈ −881). The optimiser *path* on a flat surface is
+not the implementation check; the **objective at the optimum** is. (The stall is
+the ODE analogue of the fixed-EBE gradient bias the analytic FOCE/FOCEI gradient
+work — ferx-core #367 / #381 — removes for analytical models; an exact ODE
+gradient via sensitivity equations is the path to converging such fits.) Evaluating
+ferx's full FOCEI objective (inner EBEs + Laplace + ODE integration of the `igd`
+forcing) at NONMEM's reported optimum, at NONMEM-equivalent ODE accuracy
+(`ode_reltol = ode_abstol = 1e-9`, matching `TOL=9`):
+
+| Quantity | NONMEM | ferx (at NONMEM's optimum) |
+|----------|--------|----------------------------|
+| FOCEI objective | −899.38 | **−899.39** (Δ 0.02) |
+
+evaluated at `CL 5.612`, `V 33.95`, `MAT 6.071`, `CV2 1.868`, `ω²(CL) 0.0401`,
+`ω²(V) 0.0484`, `σ²(prop) 0.0583`. Agreement to **0.02 units** confirms the `igd()`
+density and its ODE machinery (forcing, dose routing, bolus suppression,
+superposition) reproduce the NONMEM `$DES` inverse-Gaussian input.
+
+**Dose routing.** NONMEM doses CMT 1 (an inert depot, `F1=0`) and drives `R_in`
+into central (CMT 2) from `PODO`. ferx instead keys the dose to the `igd()`
+compartment (the plan's dose-routing rule: the dose feeds the function on its
+`d/dt` line), so `data/igd_oral.csv` re-keys the central observations to CMT 1 —
+a single central compartment carrying both the IG-driven dose and the
+observations. The two are likelihood-identical (NONMEM's depot is inert), so they
+share the same objective.
 
 ## Implementation notes (why the streams look the way they do)
 
@@ -148,3 +181,63 @@ no ferx side to compare. Fill this table in once #347 lands and a
 
 These files are validation tooling run locally; they are **not** wired into CI
 (NONMEM isn't available there).
+
+---
+
+# IIV on residual error (`iiv_on_ruv`, #409)
+
+Cross-engine anchor for the residual-error random effect
+(NONMEM `Y = IPRED + EPS*EXP(ETA)`): each subject gets a log-normally scaled
+residual SD.
+
+| File | Role |
+|------|------|
+| `iiv_on_ruv.csv` | 50-subject 1-cpt oral dataset, simulated with **true ω²(ETA_RUV) = 0.30** |
+| `iiv_on_ruv.ctl` | NONMEM FOCEI INTER control stream (ADVAN2 TRANS2; `Y = IPRED + IPRED*EPS(1)*EXP(ETA(4))`) |
+| `iiv_on_ruv.lst` | NONMEM 7.5.1 reference output |
+| `iiv_on_ruv_fit.ferx` | ferx model |
+| `../tests/gen_iiv_anchor.rs` | deterministic regenerator (seed 409409) + the ferx fit |
+
+## The dataset
+
+Simulated from `iiv_on_ruv_fit.ferx` over a 5×-replicated warfarin design
+(50 subjects, ~11 obs each). Truths: `TVCL=0.13`, `TVV=8`, `TVKA=1`; IIV on
+CL/V/KA (ω² = 0.09 / 0.04 / 0.30); proportional residual SD 0.1 **with
+ω²(ETA_RUV)=0.30 scaling the residual variance**. NONMEM ADVAN2 convention:
+depot = CMT 1, central = CMT 2 (observations are labelled CMT 2 on disk; ferx's
+`one_cpt_oral` observes its own central CMT 1 — same DV values).
+
+## Run it
+
+```bash
+nmfe75 iiv_on_ruv.ctl iiv_on_ruv.lst                          # NONMEM
+cargo test --test gen_iiv_anchor --no-default-features \
+  --features ci,slow-tests -- --nocapture                     # ferx (FOCEI) + regenerate CSV
+```
+
+## RESULT — FOCEI, 50 subj / ~550 obs
+
+| Quantity | Truth | NONMEM 7.5.1 | ferx v0.1.6 | Δ (ferx vs NM) |
+|----------|-------|--------------|-------------|----------------|
+| OFV (no constant) | — | 567.372 | 567.389 | **+0.017** |
+| TVCL | 0.13 | 0.12627 | 0.12639 | +0.1% |
+| TVV  | 8.0  | 7.7440  | 7.74376 | −0.0% |
+| TVKA | 1.0  | 0.85956 | 0.86131 | +0.2% |
+| ω²(ETA_CL) | 0.09 | 0.09643 | 0.09689 | +0.5% |
+| ω²(ETA_V)  | 0.04 | 0.03173 | 0.03119 | −1.7% |
+| ω²(ETA_KA) | 0.30 | 0.22737 | 0.22937 | +0.9% |
+| **ω²(ETA_RUV)** | **0.30** | **0.19018** | **0.18563** | **−2.4%** |
+| σ²(prop) | 0.01 | 0.008056 | 0.008049 | −0.1% |
+
+**Verdict.** ferx FOCEI with IIV-on-RUV reproduces NONMEM to **ΔOFV = 0.017**;
+every fixed effect, variance component, and the residual sigma agree within
+~2.5%. Critically, **both engines recover the same ETA_RUV variance (~0.19)** —
+each shrinks the true 0.30 by the same amount (the FOCEI Laplace marginal's
+known shrinkage of a variance-of-variance term, identical across engines). This
+validates the `c̃_{j,ruv}=2` interaction-curvature column and the `exp(2·η_ruv)`
+variance scaling. NONMEM soft-terminated on rounding errors (ERROR=134, near-zero
+gradients) — a converged result.
+
+(The issue-#409 acceptance also names a FREM-workshop run6 IMPMAP −2LL ≈ 6869
+cross-check. That dataset is not in this repo; this self-contained FOCEI anchor
+is the in-repo NONMEM comparison.)

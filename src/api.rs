@@ -631,8 +631,8 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
         diags.push(
             Diagnostic::error(
                 "E_ABSORPTION_DIFFUSION",
-                "A built-in absorption input-rate model (e.g. transit()) cannot yet be \
-                 combined with a [diffusion] block (the SDE/EKF path): the EKF \
+                "A built-in absorption input-rate model (e.g. transit() or igd()) cannot yet \
+                 be combined with a [diffusion] block (the SDE/EKF path): the EKF \
                  propagation does not carry the input-rate forcing. Remove the \
                  [diffusion] block or the absorption term.",
             )
@@ -654,8 +654,8 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             Diagnostic::error(
                 "E_ABSORPTION_SS",
                 "Steady-state dosing (SS=1) into a built-in absorption input-rate \
-                 compartment (e.g. transit()) is not yet supported. Expand the run-in \
-                 with explicit dosing records, or remove the absorption term.",
+                 compartment (e.g. transit() or igd()) is not yet supported. Expand the \
+                 run-in with explicit dosing records, or remove the absorption term.",
             )
             .with_block("odes"),
         );
@@ -666,9 +666,9 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // ODE RHS wrapper, and again as `R_in(tad)` superposed by the input-rate
     // forcing — silently ~doubling exposure. A transit dose carries its mass
     // through `R_in` from the bolus amount; an infusion rate on that record is
-    // undefined, so reject it loudly. RATE=-2 (modeled duration) is also an
-    // infusion (`is_infusion()` is true for it), so it is caught here too;
-    // RATE=-1 is rejected at the datareader.
+    // undefined, so reject it loudly. Both modeled coded-RATE forms (RATE=-2
+    // duration, RATE=-1 rate) are also infusions (`is_infusion()` is true for
+    // them), so they are caught here too.
     let has_infusion = population.subjects.iter().any(|s| {
         s.doses
             .iter()
@@ -679,7 +679,7 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             Diagnostic::error(
                 "E_ABSORPTION_RATE",
                 "An infusion (RATE>0) into a built-in absorption input-rate \
-                 compartment (e.g. transit()) is not supported: the dose mass is \
+                 compartment (e.g. transit() or igd()) is not supported: the dose mass is \
                  delivered through the input-rate function R_in computed from the dose \
                  amount, so an infusion rate would double-count it. Use a plain bolus \
                  dose record (RATE=0) into the absorption compartment.",
@@ -689,11 +689,12 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     }
 
     // Parameter-domain validation (data-level): an out-of-domain or non-finite
-    // input-rate parameter (e.g. transit `mtt ≤ 0` or `n < 0`) would otherwise
-    // propagate as a NaN through the ODE RHS and surface only as an opaque fit
-    // failure. Evaluated on typical values (η = 0) per subject, so a covariate
-    // relationship that pushes a subject's typical `mtt`/`n` out of range is
-    // caught too. Reported once — a single fatal error already halts the fit.
+    // input-rate parameter (e.g. transit `mtt ≤ 0` / `n < 0`, or igd `mat`/`cv2
+    // ≤ 0`) would otherwise propagate as a NaN through the ODE RHS and surface
+    // only as an opaque fit failure. Evaluated on typical values (η = 0) per
+    // subject, so a covariate relationship that pushes a subject's typical
+    // parameter out of range is caught too. Reported once — a single fatal
+    // error already halts the fit.
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     'subjects: for subject in &population.subjects {
         let pk = (model.pk_param_fn)(&model.default_params.theta, &zero_eta, &subject.covariates);
@@ -704,8 +705,9 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
                         "E_ABSORPTION_DOMAIN",
                         format!(
                             "Built-in absorption input-rate parameter out of domain at typical \
-                             values (subject {}): {msg}. Constrain the parameter so it stays in \
-                             range (e.g. `MTT = TVMTT * exp(ETA_MTT)` keeps MTT > 0).",
+                             values (subject {}): {msg}. Constrain the parameter so it stays \
+                             positive (e.g. a log-normal `P = TVP * exp(ETA_P)` \
+                             parameterisation).",
                             subject.id
                         ),
                     )
@@ -736,32 +738,51 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
 fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     use crate::types::{DoseAttr, RateMode};
     let mut diags = Vec::new();
-    // De-dup by compartment so N identical RATE=-2 rows give one error, not N.
-    let mut reported: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    // De-dup by (attribute, compartment) so N identical coded-RATE rows give one
+    // error, not N — and a `D{cmt}` and an `R{cmt}` dose into the same compartment
+    // are reported independently rather than masking each other.
+    let mut reported: std::collections::HashSet<(DoseAttr, usize)> =
+        std::collections::HashSet::new();
     for subject in &population.subjects {
         for dose in &subject.doses {
-            if dose.rate_mode != RateMode::ModeledDuration || !reported.insert(dose.cmt) {
+            // Map the modeled mode to its dose attribute + NONMEM-faithful naming
+            // (the `RATE` code, the noun, the `$PK` parameter letter, and the
+            // engine-agnostic error code). `Fixed` doses need no slot.
+            let (attr, code, kind, err_code, param) = match dose.rate_mode {
+                RateMode::Fixed => continue,
+                RateMode::ModeledDuration => (
+                    DoseAttr::Duration,
+                    "-2",
+                    "duration",
+                    "E_MODELED_DURATION_NO_PARAM",
+                    "D",
+                ),
+                RateMode::ModeledRate => {
+                    (DoseAttr::Rate, "-1", "rate", "E_MODELED_RATE_NO_PARAM", "R")
+                }
+            };
+            if !reported.insert((attr, dose.cmt)) {
                 continue;
             }
             let cmt = dose.cmt;
-            // A `RATE=-2` dose into compartment `cmt` requires a matching `D{cmt}`
-            // parameter so `resolve_rate` has a slot to read — for BOTH engines.
-            // `active_dose_attr_map()` returns the engine-correct map (the
-            // `OdeSpec`'s for ODE models, the analytical field otherwise, #394), so
-            // an absent slot is the same actionable error on either engine.
+            // A coded-`RATE` dose into compartment `cmt` requires a matching
+            // `D{cmt}`/`R{cmt}` parameter so `resolve_rate` has a slot to read — for
+            // BOTH engines. `active_dose_attr_map()` returns the engine-correct map
+            // (the `OdeSpec`'s for ODE models, the analytical field otherwise,
+            // #324), so an absent slot is the same actionable error on either engine.
             let has_slot = model
                 .active_dose_attr_map()
-                .indexed_slot(DoseAttr::Duration, cmt)
+                .indexed_slot(attr, cmt)
                 .is_some();
             if !has_slot {
                 diags.push(
                     Diagnostic::error(
-                        "E_MODELED_DURATION_NO_PARAM",
+                        err_code,
                         format!(
-                            "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
-                             compartment {cmt} requires a `D{cmt}` parameter in \
+                            "subject {}, time {}: RATE={code} (modeled infusion {kind}) into \
+                             compartment {cmt} requires a `{param}{cmt}` parameter in \
                              [individual_parameters], but none is declared. Add \
-                             `D{cmt} = ...` (the modeled duration), or supply an explicit \
+                             `{param}{cmt} = ...` (the modeled {kind}), or supply an explicit \
                              positive RATE.",
                             subject.id, dose.time
                         ),
@@ -775,8 +796,9 @@ fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> V
 }
 
 /// Precondition shared by [`predict`] and the `simulate*` family: every
-/// modeled-`RATE` dose (#324, e.g. `RATE=-2` → `D{cmt}`) must be supported by
-/// the model (an ODE engine with the matching `D{cmt}` parameter).
+/// modeled-`RATE` dose (#324: `RATE=-2` → `D{cmt}` duration, `RATE=-1` → `R{cmt}`
+/// rate) must be supported by the model — the matching `D{cmt}`/`R{cmt}`
+/// parameter exists and infuses an infusable compartment, on either engine.
 ///
 /// `fit()` enforces this via [`first_error`] over the full [`check_model_data`],
 /// but `predict()` / `simulate()` deliberately skip that data-check (they assume
@@ -887,7 +909,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
 
     // `imp` may appear at most once in a chain. By default it is an MCEM
     // estimator (NONMEM `METHOD=IMP`) and may sit anywhere in the chain. With
-    // `is_eval_only = true` (NONMEM `IMP EONLY=1`) it instead evaluates the
+    // `imp_eval_only = true` (NONMEM `IMP EONLY=1`) it instead evaluates the
     // marginal −2 log L at fixed parameters and must be the terminal stage —
     // placing an evaluator mid-chain would leave `FitResult.importance_sampling`
     // computed at parameters the following stage then overwrites.
@@ -905,14 +927,14 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-        if options.is_eval_only && chain.last().copied() != Some(EstimationMethod::Imp) {
+        if options.imp_eval_only && chain.last().copied() != Some(EstimationMethod::Imp) {
             diags.push(
                 Diagnostic::error(
                     "E_IMP_CHAIN",
-                    "method `imp` with `is_eval_only = true` must be the final stage of the chain \
+                    "method `imp` with `imp_eval_only = true` must be the final stage of the chain \
                      — placing the evaluator mid-chain would leave `FitResult.importance_sampling` \
                      populated with a log-likelihood computed at parameters that the following \
-                     stage then overwrites. Move `imp` to the end, or drop `is_eval_only` to run \
+                     stage then overwrites. Move `imp` to the end, or drop `imp_eval_only` to run \
                      it as an estimator.",
                 )
                 .with_block("fit_options"),
@@ -978,41 +1000,39 @@ pub fn check_model_data_warnings(
     // event-driven walker (EVID 3/4 resets) — still skip SS pre-equilibration.
     let analytic_handles_overlap = model.ode_spec.is_none();
     // The effective infusion length is
-    // `d.duration` for an ordinary infusion, but for a modeled-duration dose
-    // (RATE=-2 → `D{cmt}`; #324) it is unresolved here (`rate`/`duration` are 0
-    // until `resolve_rate`), so resolve `D{cmt}` at the typical-value point.
+    // `d.duration` for an ordinary infusion, but for a modeled dose (RATE=-2 →
+    // `D{cmt}` duration, or RATE=-1 → `R{cmt}` rate; #324) it is unresolved here
+    // (`rate`/`duration` are 0 until `resolve_rate`), so resolve it at the
+    // typical-value point through the engine-correct `active_dose_attr_map()`.
     //
     // Resolution goes through the single-source-of-truth `DoseEvent::resolve_rate`
-    // (the same rule + `DURATION_FLOOR` clamp the integrator applies at runtime),
-    // not a hand-rolled slot read, so the warning's notion of "duration" can't
-    // drift from the integrator's. It is a *typical-value* heuristic: it uses
-    // init theta, eta = 0, and this subject's covariates, whereas runtime uses
+    // (the same rule + floor clamps the integrator applies at runtime), not a
+    // hand-rolled slot read, so the warning's notion of "duration" can't drift
+    // from the integrator's. It is a *typical-value* heuristic: it uses init
+    // theta, eta = 0, and this subject's covariates, whereas runtime uses
     // per-occasion eta/IOV — a modeled SS infusion whose duration crosses `II`
     // only on some occasions may not be flagged here (and conversely a typical
     // overlap may not occur on every occasion). The runtime SS-skip is the
     // backstop; this catches the common typical-value / covariate-driven overlap.
-    // (Analytical models reject modeled doses upstream, so the `ode_spec`-less
-    // branch only sees `Fixed` doses.)
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let effective_duration = |s: &Subject, d: &DoseEvent| -> f64 {
-        if d.is_fixed() {
-            return d.duration;
-        }
-        match &model.ode_spec {
-            // Guard the `D{cmt}` slot's existence: a modeled dose with no matching
-            // parameter is an *error* (`E_MODELED_DURATION_NO_PARAM`), but this
-            // warnings pass must stay panic-free if run on such a model rather than
-            // hit `resolve_rate`'s slot `.expect`.
-            Some(ode)
-                if ode
-                    .dose_attr_map
-                    .indexed_slot(crate::types::DoseAttr::Duration, d.cmt)
-                    .is_some() =>
-            {
-                let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates);
-                d.resolve_rate(&ode.dose_attr_map, &pk.values).duration
-            }
-            _ => 0.0,
+        use crate::types::{DoseAttr, RateMode};
+        // The dose attribute whose slot holds this modeled dose's value.
+        let attr = match d.rate_mode {
+            RateMode::Fixed => return d.duration,
+            RateMode::ModeledDuration => DoseAttr::Duration,
+            RateMode::ModeledRate => DoseAttr::Rate,
+        };
+        // Guard the slot's existence: a modeled dose with no matching parameter is
+        // an upstream *error* (`E_MODELED_DURATION_NO_PARAM` / `E_MODELED_RATE_NO_PARAM`),
+        // but this warnings pass must stay panic-free if run on such a model rather
+        // than hit `resolve_rate`'s slot `.expect`.
+        let attr_map = model.active_dose_attr_map();
+        if attr_map.indexed_slot(attr, d.cmt).is_some() {
+            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates);
+            d.resolve_rate(attr_map, &pk.values).duration
+        } else {
+            0.0
         }
     };
     let n_ss_overlapping_inf = population
@@ -1042,34 +1062,44 @@ pub fn check_model_data_warnings(
         ));
     }
 
-    // Modeled infusion duration `D{cmt}` (RATE=-2; #324) that is non-positive at
-    // the initial typical-value point (eta = 0). `resolve_rate` clamps a transient
-    // `D ≤ 0` to `DURATION_FLOOR` so `AMT/D` stays finite mid-search, but a
-    // non-positive `D` *at the initial estimate* signals a misspecified
-    // parameterisation: every iteration then delivers `AMT` over ~`DURATION_FLOOR`
-    // — a bolus-like spike, not an infusion — and the fit can converge wrong with
-    // no other diagnostic. Flag it (analogous to W_NEGATIVE_LAGTIME) and point at
-    // a positive-link parameterisation. De-duped per compartment.
-    if let Some(ode) = &model.ode_spec {
-        use crate::types::{DoseAttr, DoseEvent};
-        let mut nonpos_cmts: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    // Modeled coded-RATE parameters (`D{cmt}` for RATE=-2 duration, `R{cmt}` for
+    // RATE=-1 rate; #324) that are non-positive at the initial typical-value point
+    // (eta = 0). `resolve_rate` clamps a transient `D ≤ 0` / `R ≤ 0` to its floor
+    // so `AMT/D` / `AMT/R` stays finite mid-search, but a non-positive value *at
+    // the initial estimate* signals a misspecified parameterisation — a `D ≤ 0`
+    // delivers the dose as a bolus-like spike, an `R ≤ 0` as a near-zero trickle
+    // over a near-infinite duration — and the fit can converge wrong with no other
+    // diagnostic. Flag it (analogous to W_NEGATIVE_LAGTIME) and point at a
+    // positive-link parameterisation. Engine-agnostic via `active_dose_attr_map()`
+    // (covers analytical models too, #394/#395). De-duped per compartment per kind.
+    {
+        use crate::types::{DoseAttr, DoseEvent, RateMode};
+        let attr_map = model.active_dose_attr_map();
+        let mut nonpos_dur: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let mut nonpos_rate: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for s in &population.subjects {
             let mut pk_at_init: Option<crate::types::PkParams> = None;
             for d in &s.doses {
-                if d.is_fixed() {
-                    continue;
-                }
-                if let Some(slot) = ode.dose_attr_map.indexed_slot(DoseAttr::Duration, d.cmt) {
+                let (attr, floor) = match d.rate_mode {
+                    RateMode::Fixed => continue,
+                    RateMode::ModeledDuration => (DoseAttr::Duration, DoseEvent::DURATION_FLOOR),
+                    RateMode::ModeledRate => (DoseAttr::Rate, DoseEvent::RATE_FLOOR),
+                };
+                if let Some(slot) = attr_map.indexed_slot(attr, d.cmt) {
                     let pk = pk_at_init.get_or_insert_with(|| {
                         (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates)
                     });
-                    if pk.values[slot] <= DoseEvent::DURATION_FLOOR {
-                        nonpos_cmts.insert(d.cmt);
+                    if pk.values[slot] <= floor {
+                        match attr {
+                            DoseAttr::Duration => nonpos_dur.insert(d.cmt),
+                            DoseAttr::Rate => nonpos_rate.insert(d.cmt),
+                            DoseAttr::F | DoseAttr::Lag => unreachable!("only D/R reach here"),
+                        };
                     }
                 }
             }
         }
-        for cmt in nonpos_cmts {
+        for cmt in nonpos_dur {
             diags.push(Diagnostic::warning(
                 "W_MODELED_DURATION_NONPOSITIVE",
                 format!(
@@ -1082,6 +1112,22 @@ pub fn check_model_data_warnings(
                      (e.g. D{cmt} = exp(...)).",
                     cmt = cmt,
                     floor = DoseEvent::DURATION_FLOOR,
+                ),
+            ));
+        }
+        for cmt in nonpos_rate {
+            diags.push(Diagnostic::warning(
+                "W_MODELED_RATE_NONPOSITIVE",
+                format!(
+                    "Modeled infusion rate R{cmt} (RATE=-1 into compartment \
+                     {cmt}) evaluates to ≤ 0 at the initial typical-value point \
+                     (eta = 0). A non-positive rate is clamped to {floor:e} to keep \
+                     the implied duration AMT/R finite, which delivers the dose as a \
+                     near-zero trickle over a near-infinite duration — the fit may \
+                     converge to a wrong optimum. Use a positive-link \
+                     parameterisation (e.g. R{cmt} = exp(...)).",
+                    cmt = cmt,
+                    floor = DoseEvent::RATE_FLOOR,
                 ),
             ));
         }
@@ -1461,6 +1507,46 @@ pub fn fit(
                  model (`diffusion_theta_start = Some(_)`)"
                     .to_string(),
             );
+        }
+    }
+    // IIV on residual error (`iiv_on_ruv`, #409) validation.
+    if let Some(k) = model.residual_error_eta {
+        // The residual-error eta must be a dedicated random effect: the FOCEI
+        // `c̃` column assumes its prediction-Jacobian column is zero (it is not a
+        // structural/individual-parameter eta). Reject a dual-use eta.
+        if let Some(name) = model.eta_names.get(k) {
+            if model.eta_param_info.iter().any(|e| &e.eta_name == name) {
+                return Err(format!(
+                    "[error_model] iiv_on_ruv = {name}: this eta is also used in \
+                     [individual_parameters]; the residual-error random effect must be a \
+                     dedicated omega not shared with a structural parameter"
+                ));
+            }
+        }
+        // IIV-on-RUV is inherently an interaction model (`Y = IPRED + EPS·EXP(ETA)`
+        // makes the residual variance η-dependent). Non-interaction FOCE/GN cannot
+        // represent it — its marginal integrates the residual eta out through a
+        // sensitivity column that is identically zero. Require FOCEI or a
+        // Monte-Carlo estimator (IMP/IMPMAP/SAEM).
+        let methods: Vec<EstimationMethod> = if options.methods.is_empty() {
+            vec![options.method]
+        } else {
+            options.methods.clone()
+        };
+        for m in &methods {
+            let non_interaction = match m {
+                EstimationMethod::Foce => true,
+                EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => !options.interaction,
+                _ => false,
+            };
+            if non_interaction {
+                return Err(format!(
+                    "IIV on residual error (iiv_on_ruv) requires an interaction or \
+                     Monte-Carlo method: use method = focei, imp, impmap, or saem (got {m:?} \
+                     with interaction = false). NONMEM `Y = IPRED + EPS*EXP(ETA)` is an \
+                     INTERACTION model."
+                ));
+            }
         }
     }
     // Data-dependent fatal checks (covariates present, per-CMT scaling and
@@ -2793,13 +2879,13 @@ fn fit_inner(
             );
         }
 
-        // IMP evaluation-only stage (`is_eval_only`, NONMEM `IMP EONLY=1`): not an
+        // IMP evaluation-only stage (`imp_eval_only`, NONMEM `IMP EONLY=1`): not an
         // estimator. Consumes the previous stage's params / EBEs / Hessians,
         // writes its result to `is_result`, and skips the params/result update at
         // the bottom of the loop so the preceding stage's `OuterResult` continues
         // to be the canonical one. The default estimating IMP path is handled by
         // the `EstimationMethod::Imp` arm of the `match method` below.
-        if method == EstimationMethod::Imp && stage_opts.is_eval_only {
+        if method == EstimationMethod::Imp && stage_opts.imp_eval_only {
             // Standalone IMP (no preceding estimator): evaluate the EBEs/Hessians
             // at the initial parameters so IMP can report the −2 log L there.
             // This synthetic stage also becomes the canonical `OuterResult` so
@@ -2887,7 +2973,7 @@ fn fit_inner(
                         let msg = format!(
                             "IMP: {} subject(s) had ESS = 0 (proposal collapse): {}. \
                              The reported MC SE is inflated by ~1 per collapsed subject; \
-                             consider raising `is_samples` or `is_proposal_df`, \
+                             consider raising `imp_samples` or `imp_proposal_df`, \
                              or check the EBE/Hessian quality of these subjects.",
                             collapsed.len(),
                             preview
@@ -2937,7 +3023,7 @@ fn fit_inner(
             }
             EstimationMethod::Imp => {
                 // Estimating IMP (NONMEM `METHOD=IMP`). The evaluation-only path
-                // (`is_eval_only`) is handled by the IMP branch above and never
+                // (`imp_eval_only`) is handled by the IMP branch above and never
                 // reaches here. Warm-start from the preceding stage's EBEs when
                 // chained (e.g. [saem, imp]).
                 let warm = result.as_ref().map(|r| r.eta_hats.as_slice());
@@ -2965,6 +3051,50 @@ fn fit_inner(
             });
         }
         result = Some(stage_result);
+
+        // NONMEM-comparable IMP / IMPMAP objective. The reported `OuterResult.ofv`
+        // is a final FOCE *Laplace* pass (kept for cross-method AIC/BIC
+        // comparability, like SAEM). NONMEM `METHOD=IMP` instead reports the
+        // importance-sampling Monte-Carlo *marginal* −2 log L (the `.ext` #OBJV).
+        // Evaluate that marginal at the final estimates and surface it alongside
+        // on `FitResult.importance_sampling`, so callers comparing to NONMEM read
+        // the matching number. Best-effort: a failure (e.g. SDE, IOV without
+        // Ω_iov, n_eta = 0) leaves the field unset with a warning, never aborts.
+        if is_last && matches!(method, EstimationMethod::Imp | EstimationMethod::Impmap) {
+            let r = result.as_ref().expect("stage result was just set");
+            let mut marg_opts = stage_opts.clone();
+            // `run_importance_sampling` reads the `imp_*` knobs; for IMPMAP map the
+            // `impmap_*` knobs onto them so the final eval mirrors the method's
+            // own sample count / proposal df / seed.
+            if method == EstimationMethod::Impmap {
+                marg_opts.imp_samples = stage_opts.impmap_samples;
+                marg_opts.imp_seed = stage_opts.impmap_seed;
+                marg_opts.imp_low_ess_threshold = stage_opts.impmap_low_ess_threshold;
+                // A Gaussian IMPMAP proposal (`impmap_proposal_df = ∞`, opt-in)
+                // cannot be sampled by the finite-t IS evaluator. The marginal is
+                // proposal-independent in expectation, so fall back to a finite-t
+                // eval proposal (heavier tails ⇒ bounded weights). The default
+                // `impmap_proposal_df = 4` passes through unchanged.
+                let df = stage_opts.impmap_proposal_df;
+                marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
+            }
+            match crate::estimation::importance_sampling::run_importance_sampling(
+                model,
+                population,
+                &r.params,
+                &r.eta_hats,
+                &r.h_matrices,
+                &r.kappas,
+                &marg_opts,
+            ) {
+                Ok(is) => is_result = Some(is),
+                Err(e) => accumulated_warnings.push(if n_stages > 1 {
+                    format!("[{}] marginal −2 log L eval skipped: {}", method.label(), e)
+                } else {
+                    format!("marginal −2 log L eval skipped: {}", e)
+                }),
+            }
+        }
     }
 
     if crate::cancel::is_cancelled(&options.cancel) {
@@ -3163,9 +3293,9 @@ fn fit_inner(
         ));
     }
 
-    // When M3 BLOQ is combined with non-interaction FOCE, mixing linearized
+    // When M3 censoring is combined with non-interaction FOCE, mixing linearized
     // Gaussian residuals with non-linearized log Φ terms gives inconsistent
-    // OFVs near the LLOQ boundary. The FOCE dispatcher routes affected
+    // OFVs near the LOQ boundary. The FOCE dispatcher routes affected
     // subjects through FOCEI internally — surface the promotion to the user.
     if matches!(model.bloq_method, BloqMethod::M3)
         && matches!(
@@ -3173,10 +3303,13 @@ fn fit_inner(
             EstimationMethod::Foce | EstimationMethod::FoceGn
         )
         && !options.interaction
-        && population.subjects.iter().any(|s| s.has_bloq())
+        && population
+            .subjects
+            .iter()
+            .any(|s| s.has_censored_observation())
     {
         warnings.push(
-            "M3 BLOQ handling requires FOCEI semantics; subjects with CENS=1 \
+            "M3 censoring handling requires FOCEI semantics; subjects with CENS!=0 \
              rows were evaluated with η-interaction. Set method=focei explicitly \
              to silence this notice."
                 .to_string(),
@@ -3230,7 +3363,7 @@ fn fit_inner(
     );
 
     // `final_method` reports the last *estimating* stage. An evaluation-only IMP
-    // (`is_eval_only`) doesn't produce parameters, so a chain like `[saem, imp]`
+    // (`imp_eval_only`) doesn't produce parameters, so a chain like `[saem, imp]`
     // surfaces as `method = SAEM`. Estimating IMP (the default) does produce
     // parameters and is reported like any other estimator. The full chain is
     // preserved in `method_chain`.
@@ -3238,7 +3371,7 @@ fn fit_inner(
         .iter()
         .rev()
         .copied()
-        .find(|&m| !(m == EstimationMethod::Imp && options.is_eval_only))
+        .find(|&m| !(m == EstimationMethod::Imp && options.imp_eval_only))
         .unwrap_or(*chain.last().expect("chain non-empty"));
     let grad_inner =
         crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, model);
@@ -3475,7 +3608,7 @@ fn fit_inner(
         multi_start_seed: options.multi_start_seed,
         saem_seed: options.saem_seed,
         sir_seed: options.sir_seed,
-        is_seed: options.is_seed,
+        imp_seed: options.imp_seed,
         // Record the *resolved* NPDE seed (default included) so the diagnostic
         // is reproducible from the output; `None` when NPDE did not run.
         npde_seed: if options.npde_nsim > 0 {
@@ -3824,7 +3957,7 @@ fn compute_subject_results(
             let pk_params_pop = (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
             let pred = model_preds(model, subject, &pk_params_pop, &params.theta, &zero_eta);
 
-            // IWRES (NaN on BLOQ rows — see compute_cwres for CWRES handling).
+            // IWRES (NaN on censored rows — see compute_cwres for CWRES handling).
             let mut iwres = compute_iwres(
                 &subject.observations,
                 &ipred,
@@ -3832,6 +3965,17 @@ fn compute_subject_results(
                 &model.error_spec,
                 &params.sigma.values,
             );
+            // IIV on residual error (#409): the individual residual SD is scaled
+            // by exp(η̂_ruv), so IWRES = (y−f)/(SD·exp(η̂_ruv)) = base / exp(η̂_ruv).
+            // FREM covariate rows have no PK residual; their IWRES is left as-is.
+            let ruv_sd = model.residual_var_scale(eta.as_slice()).sqrt();
+            if ruv_sd != 1.0 {
+                for (j, w) in iwres.iter_mut().enumerate() {
+                    if subject.fremtype.get(j).copied().unwrap_or(0) == 0 {
+                        *w /= ruv_sd;
+                    }
+                }
+            }
             for (j, c) in subject.cens.iter().enumerate() {
                 if *c != 0 {
                     iwres[j] = f64::NAN;
@@ -3847,6 +3991,7 @@ fn compute_subject_results(
                 &params.omega,
                 &params.sigma.values,
                 &model.error_spec,
+                model.residual_error_eta,
             );
 
             // OFV contribution
@@ -4317,7 +4462,7 @@ mod tests {
 
     #[test]
     fn test_eps_shrinkage_ignores_nan_iwres() {
-        // BLOQ rows have NaN IWRES — they must be filtered out.
+        // Censored rows have NaN IWRES — they must be filtered out.
         // After filtering, two values with mean(IWRES^2)=1 remain => shrinkage = 0.
         let subjects = vec![
             make_subject(vec![0.0], vec![1.0, f64::NAN]),
@@ -4671,9 +4816,13 @@ fn emit_subject_rows<R: rand::Rng>(
     // Predict concentrations
     let ipreds = model_preds(model, subject, &pk_params, &params.theta, eta_slice);
 
-    // Add residual error (Gaussian path)
+    // Add residual error (Gaussian path). IIV on residual error (#409): the
+    // drawn `eta_slice` includes η_ruv, so scale the residual variance by
+    // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
+    let ruv_scale = model.residual_var_scale(eta_slice);
     for (j, &ipred) in ipreds.iter().enumerate() {
-        let var = model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
+        let var = model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values)
+            * ruv_scale;
         let eps: f64 = rng.sample(normal);
         let value = ipred + var.sqrt() * eps;
 
@@ -5106,6 +5255,7 @@ mod iov_integration {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -5381,11 +5531,11 @@ mod iov_integration {
         let pop = make_iov_population();
         let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
         opts.methods = vec![EstimationMethod::Foce, EstimationMethod::Imp];
-        opts.is_samples = 200; // keep the per-subject sampling cheap
-        opts.is_seed = Some(42); // deterministic proposal draws
-                                 // The IS IOV branch is the evaluation-only path; the estimating IMP
-                                 // M-step does not yet support IOV (refused up front).
-        opts.is_eval_only = true;
+        opts.imp_samples = 200; // keep the per-subject sampling cheap
+        opts.imp_seed = Some(42); // deterministic proposal draws
+                                  // The IS IOV branch is the evaluation-only path; the estimating IMP
+                                  // M-step does not yet support IOV (refused up front).
+        opts.imp_eval_only = true;
         let result = fit(&model, &pop, &model.default_params, &opts);
         assert!(
             result.is_ok(),
@@ -6425,6 +6575,7 @@ mod simulate_with_uncertainty_tests {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -6560,7 +6711,7 @@ mod simulate_with_uncertainty_tests {
             multi_start_seed: None,
             saem_seed: None,
             sir_seed: None,
-            is_seed: None,
+            imp_seed: None,
             npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 0,
@@ -7235,6 +7386,7 @@ mod tests_sdtab_tv_cov {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -7444,6 +7596,7 @@ mod tests_derived_session_clock {
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -7760,6 +7913,7 @@ mod tests_derived_iov_kappa {
     fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         CompiledModel {
             frem_config: None,
+            residual_error_eta: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,

@@ -992,12 +992,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     if error_lines_opt.is_none() && !is_tte_only {
         return Err("Missing [error_model] block".to_string());
     }
-    let (parsed_error_model, ltbs_flags) = if let Some(error_lines) = error_lines_opt {
-        parse_error_model(error_lines)?
-    } else {
-        // TTE-only model: no Gaussian error model — empty per-CMT spec.
-        (ParsedErrorModel::PerCmt(vec![]), LtbsFlags::default())
-    };
+    let (parsed_error_model, ltbs_flags, iiv_on_ruv_name) =
+        if let Some(error_lines) = error_lines_opt {
+            parse_error_model(error_lines)?
+        } else {
+            // TTE-only model: no Gaussian error model — empty per-CMT spec.
+            (ParsedErrorModel::PerCmt(vec![]), LtbsFlags::default(), None)
+        };
     // LTBS log-transforms the structural prediction, which is incompatible with
     // the SDE/EKF measurement model (the extended Kalman filter assumes a
     // natural-scale additive/proportional observation). Reject the combination.
@@ -1025,6 +1026,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let n_eta = eta_names_bsv.len(); // BSV-only count
     let n_kappa = kappa_info.names_ordered.len();
     let n_epsilon = sigma_names.len();
+
+    // Resolve `iiv_on_ruv = NAME` to a BSV eta index. The named eta must be a
+    // declared `omega` (BSV), not a kappa (IOV residual scaling is out of scope).
+    let residual_error_eta: Option<usize> = match &iiv_on_ruv_name {
+        Some(name) => {
+            let idx = eta_names_bsv
+                .iter()
+                .position(|e| e == name)
+                .ok_or_else(|| {
+                    format!(
+                        "[error_model] iiv_on_ruv = {name}: no `omega {name} ~ ...` declared in \
+                     [parameters] (the residual-error random effect must be a declared omega)"
+                    )
+                })?;
+            Some(idx)
+        }
+        None => None,
+    };
 
     // Extended eta context: BSV etas followed by kappa names.
     // This lets [individual_parameters] expressions like `ETA_CL + KAPPA_CL`
@@ -1249,74 +1268,82 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // `eta` slice the closure consumes (BSV η + kappa). Both feed the
     // Tier 4a milestone-2 partial-derivative builder.
     let n_eta_extended_for_partials = eta_names.len();
-    // Compartment-indexed modeled-dose duration (`D{cmt}` for `RATE=-2`; #324/#394)
-    // for ANALYTICAL models. ODE models build their `dose_attr_map` inside
-    // `build_ode_spec` (routing `D{cmt}` through `ode_param_slots`); analytical
-    // models route only canonical PK names into `PkParams`, so a `D{cmt}`
-    // individual parameter would otherwise be evaluated and discarded. Route each
-    // into a free `PkParams` slot — the spare region above the canonical PK slots
+    // Compartment-indexed modeled-dose attributes (`D{cmt}` for `RATE=-2`
+    // duration, `R{cmt}` for `RATE=-1` rate; #324/#394) for ANALYTICAL models. ODE
+    // models build their `dose_attr_map` inside `build_ode_spec` (routing
+    // `D{cmt}`/`R{cmt}` through `ode_param_slots`); analytical models route only
+    // canonical PK names into `PkParams`, so a `D{cmt}`/`R{cmt}` individual
+    // parameter would otherwise be evaluated and discarded. Route each into a
+    // free `PkParams` slot — the spare region above the canonical PK slots
     // (`PK_IDX_LAGTIME + 1 ..= MAX_PK_PARAMS - 1`), which analytical models never
-    // touch — and record `(Duration, cmt) -> slot` so the analytical predictor can
-    // resolve the modeled duration via `DoseEvent::resolve_rate`, exactly as the
-    // ODE path does. `analytical_dur_slots` carries `(var_name, slot)` into
+    // touch — and record `(attr, cmt) -> slot` so the analytical predictor can
+    // resolve the modeled dose via `DoseEvent::resolve_rate`, exactly as the ODE
+    // path does. `analytical_modeled_slots` carries `(var_name, slot)` into
     // `build_pk_param_fn` so its closure writes the value alongside the canonical
     // PK assignments. Empty (and the map stays `Default`) for ODE models and for
-    // the common analytical model with no `RATE=-2` dosing.
+    // the common analytical model with no `RATE=-1`/`-2` dosing.
     let mut analytical_dose_attr_map = crate::types::DoseAttrMap::default();
-    let mut analytical_dur_slots: Vec<(String, usize)> = Vec::new();
+    let mut analytical_modeled_slots: Vec<(String, usize)> = Vec::new();
     if !is_ode {
         let mut next_slot = crate::types::PK_IDX_LAGTIME + 1;
         for name in &indiv_var_names {
-            // Only modeled *duration* (`D{cmt}`) is routed here. `F{cmt}`/`ALAG{cmt}`
-            // collapse to the single analytical dose route (the bare `PK_IDX_F` /
-            // `PK_IDX_LAGTIME` slots), so although `from_indexed_name` recognises
-            // them they are not routed for analytical models. `R{cmt}` (RATE=-1) is
-            // not recognised at all yet (Phase B).
+            // Only the modeled-`RATE` attributes (`D{cmt}` duration, `R{cmt}`
+            // rate) are routed here. `F{cmt}`/`ALAG{cmt}` collapse to the single
+            // analytical dose route (the bare `PK_IDX_F` / `PK_IDX_LAGTIME`
+            // slots), so although `from_indexed_name` recognises them they are not
+            // routed for analytical models.
             let Some((attr, cmt)) = crate::types::DoseAttr::from_indexed_name(name) else {
                 continue;
             };
-            if attr != crate::types::DoseAttr::Duration {
-                continue;
-            }
-            // Reject a `D{cmt}` whose compartment the analytical engine cannot
-            // infuse into — the central compartment for every model, plus the
-            // peripheral compartment(s) of the 2-/3-cpt IV models, but NOT an oral
-            // depot or oral peripheral (see `PkModel::infusable_compartments`). A
-            // looser bound (e.g. raw compartment count) would let a `RATE=-2` into
-            // an oral depot pass parse + the data gate, then either silently route
-            // into central (no-TV superposition) or panic in the event-driven
-            // walker — the silent/abrupt failure class this feature exists to
-            // prevent. Caught here at parse time with an actionable message.
+            // NONMEM-faithful display of the attribute for diagnostics: the DSL
+            // parameter prefix, the RATE code that drives it, and the noun. `F`/
+            // `Lag` are not modeled-dose attributes on the analytical engine.
+            let (param_prefix, rate_code, kind) = match attr {
+                crate::types::DoseAttr::Duration => ("D", "-2", "duration"),
+                crate::types::DoseAttr::Rate => ("R", "-1", "rate"),
+                crate::types::DoseAttr::F | crate::types::DoseAttr::Lag => continue,
+            };
+            // Reject a `D{cmt}`/`R{cmt}` whose compartment the analytical engine
+            // cannot infuse into — the central compartment for every model, plus
+            // the peripheral compartment(s) of the 2-/3-cpt IV models, but NOT an
+            // oral depot or oral peripheral (see `PkModel::infusable_compartments`).
+            // A looser bound (e.g. raw compartment count) would let a coded `RATE`
+            // into an oral depot pass parse + the data gate, then either silently
+            // route into central (no-TV superposition) or panic in the
+            // event-driven walker — the silent/abrupt failure class this feature
+            // exists to prevent. Caught here at parse time with an actionable
+            // message.
             let infusable = pk_model.infusable_compartments();
             if !infusable.contains(&cmt) {
                 let supported = infusable
                     .iter()
-                    .map(|c| format!("`D{c}`"))
+                    .map(|c| format!("`{param_prefix}{c}`"))
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(format!(
-                    "[individual_parameters]: `{name}` is a modeled infusion duration \
-                     (RATE=-2) for compartment {cmt}, but the analytical `{}` model can \
-                     only infuse into compartment(s) {:?} ({supported}). A zero-order \
+                    "[individual_parameters]: `{name}` is a modeled infusion {kind} \
+                     (RATE={rate_code}) for compartment {cmt}, but the analytical `{}` model \
+                     can only infuse into compartment(s) {:?} ({supported}). A zero-order \
                      input into another compartment (e.g. an oral depot) needs an \
                      `ode(...)` model.",
                     pk_model.canonical_name(),
                     infusable,
                 ));
             }
-            // `infusable_compartments()` has ≤ 3 entries, so at most 3 distinct
-            // `D{cmt}` parameters are routed — comfortably inside the 9..16 spare
+            // `infusable_compartments()` has ≤ 3 entries and at most one `D` and
+            // one `R` per compartment, so at most 6 distinct modeled-dose
+            // parameters are routed — comfortably inside the 9..16 (7-slot) spare
             // region. A debug assertion documents that invariant without a
             // permanently-dead user-facing error arm.
             debug_assert!(
                 next_slot < crate::types::MAX_PK_PARAMS,
-                "modeled-duration slot {next_slot} exceeds MAX_PK_PARAMS; \
-                 infusable_compartments() should have bounded the D{{cmt}} count"
+                "modeled-dose slot {next_slot} exceeds MAX_PK_PARAMS; \
+                 infusable_compartments() should have bounded the D{{cmt}}/R{{cmt}} count"
             );
             let slot = next_slot;
             next_slot += 1;
             analytical_dose_attr_map.insert(attr, cmt, slot);
-            analytical_dur_slots.push((name.clone(), slot));
+            analytical_modeled_slots.push((name.clone(), slot));
         }
     }
 
@@ -1326,7 +1353,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &pk_param_map,
             &indiv_var_names,
             &ode_slot_map,
-            &analytical_dur_slots,
+            &analytical_modeled_slots,
             thetas.len(),
             n_eta_extended_for_partials,
             #[cfg(feature = "nn")]
@@ -1739,6 +1766,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         #[cfg(feature = "survival")]
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
+        residual_error_eta,
     };
 
     // ── Optional blocks ──
@@ -2225,22 +2253,37 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .iter()
             .enumerate()
             .filter(|(_, name)| token_counts.get(name.as_str()).copied().unwrap_or(0) <= 1)
-            // Exempt engine-applied slots on ODE models: bare `f`/`lagtime`/`alag`
-            // (routed to RESERVED_PK_SLOTS) and the compartment-indexed dose
-            // attributes `Fn`/`ALAGn` (issue #369) are applied to the dose by the
-            // engine without a textual RHS reference, so absence from `[odes]` does
-            // not make them dead. The bare case reuses `ode_param_slots`' own routing
-            // (`ode_slot_map`, parallel to `indiv_param_names`) so the exemption can't
-            // drift; the indexed case matches the same `from_indexed_name` predicate
-            // that built `dose_attr_map`. No-op for analytical models (`is_ode` false;
-            // their F/lagtime are bound via an explicit `pk(...)` mapping the census
-            // already counts).
+            // Exempt parameters the *engine* applies to a dose without a textual
+            // reference, so their absence from the RHS / `pk(...)` mapping does not
+            // make them dead:
+            //  * ODE models: bare `f`/`lagtime`/`alag` (routed to RESERVED_PK_SLOTS)
+            //    and every compartment-indexed dose attribute `Fn`/`ALAGn`/`Dn`/`Rn`
+            //    (#369/#324) — the bare case reuses `ode_param_slots`' own routing
+            //    (`ode_slot_map`) so the exemption can't drift; the indexed case
+            //    matches the same `from_indexed_name` predicate that built
+            //    `dose_attr_map`.
+            //  * analytical models: only `Dn`/`Rn` (modeled duration / rate,
+            //    RATE=-2/-1), which the parser routes to spare `PkParams` slots and
+            //    which are consulted solely via coded-`RATE` *data* — they have no
+            //    textual reference, so the census would otherwise tell the user to
+            //    delete a load-bearing modeled-infusion parameter. `Fn`/`ALAGn` are
+            //    NOT exempt here: the analytical engine binds F/lag only via an
+            //    explicit `pk(...)` mapping (which the census counts), so an
+            //    unmapped `F1` really is dead.
             .filter(|(i, name)| {
-                !(is_ode
-                    && (ode_slot_map
+                use crate::types::DoseAttr;
+                let exempt = if is_ode {
+                    ode_slot_map
                         .get(*i)
                         .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot))
-                        || crate::types::DoseAttr::from_indexed_name(name).is_some()))
+                        || DoseAttr::from_indexed_name(name).is_some()
+                } else {
+                    matches!(
+                        DoseAttr::from_indexed_name(name),
+                        Some((DoseAttr::Duration | DoseAttr::Rate, _))
+                    )
+                };
+                !exempt
             })
             .map(|(_, name)| name.clone())
             .collect();
@@ -3612,46 +3655,46 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.sir_df = v;
         }
-        "is_samples" => {
-            let v = parse_usize("is_samples")?;
+        "imp_samples" => {
+            let v = parse_usize("imp_samples")?;
             if v < 2 {
-                return Err(format!("is_samples must be >= 2, got {v}"));
+                return Err(format!("imp_samples must be >= 2, got {v}"));
             }
-            opts.is_samples = v;
+            opts.imp_samples = v;
         }
-        "is_proposal_df" => {
+        "imp_proposal_df" => {
             let tok = value.trim();
             if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
-                opts.is_proposal_df = f64::INFINITY;
+                opts.imp_proposal_df = f64::INFINITY;
             } else {
-                let v = parse_f64("is_proposal_df")?;
+                let v = parse_f64("imp_proposal_df")?;
                 if v < 1.0 {
                     return Err(format!(
-                        "is_proposal_df must be >= 1.0 or `normal`, got {v}"
+                        "imp_proposal_df must be >= 1.0 or `normal`, got {v}"
                     ));
                 }
-                opts.is_proposal_df = v;
+                opts.imp_proposal_df = v;
             }
         }
-        "is_seed" => opts.is_seed = parse_u64_opt("is_seed")?,
-        "is_low_ess_threshold" => {
-            let v = parse_f64("is_low_ess_threshold")?;
+        "imp_seed" => opts.imp_seed = parse_u64_opt("imp_seed")?,
+        "imp_low_ess_threshold" => {
+            let v = parse_f64("imp_low_ess_threshold")?;
             if !(0.0..=1.0).contains(&v) {
                 return Err(format!(
-                    "is_low_ess_threshold must be in [0.0, 1.0], got {v}"
+                    "imp_low_ess_threshold must be in [0.0, 1.0], got {v}"
                 ));
             }
-            opts.is_low_ess_threshold = v;
+            opts.imp_low_ess_threshold = v;
         }
-        "is_iterations" => {
-            let v = parse_usize("is_iterations")?;
+        "imp_iterations" => {
+            let v = parse_usize("imp_iterations")?;
             if v < 1 {
-                return Err(format!("is_iterations must be >= 1, got {v}"));
+                return Err(format!("imp_iterations must be >= 1, got {v}"));
             }
-            opts.is_iterations = v;
+            opts.imp_iterations = v;
         }
-        "is_averaging" => opts.is_averaging = parse_usize("is_averaging")?,
-        "is_eval_only" => opts.is_eval_only = parse_bool("is_eval_only")?,
+        "imp_averaging" => opts.imp_averaging = parse_usize("imp_averaging")?,
+        "imp_eval_only" => opts.imp_eval_only = parse_bool("imp_eval_only")?,
         "impmap_iterations" => {
             let v = parse_usize("impmap_iterations")?;
             if v < 1 {
@@ -3696,6 +3739,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "impmap_trace" => opts.impmap_trace = parse_bool("impmap_trace")?,
         "impmap_mceta" => opts.impmap_mceta = parse_usize("impmap_mceta")?,
         "impmap_sobol" => opts.impmap_sobol = parse_bool("impmap_sobol")?,
+        "frem_rao_blackwell" => opts.frem_rao_blackwell = parse_bool("frem_rao_blackwell")?,
+        "imp_auto" => opts.imp_auto = parse_bool("imp_auto")?,
+        "impmap_auto" => opts.impmap_auto = parse_bool("impmap_auto")?,
         "iscale_min" => {
             let v = parse_f64("iscale_min")?;
             if v <= 0.0 {
@@ -4421,11 +4467,13 @@ fn parse_scaling_block(
 /// excluded — they can ride on an analytical `pk` model.
 ///
 /// This lists only the functions that are **actually implemented** as input
-/// rates today (`transit`, #343). Each later absorption function adds its own
-/// name here in the same PR that implements it — Phase 1 `igd` (#347), Phase 2
-/// `weibull` — so the error rule never advertises a function the engine can't yet
-/// run (which would send the user to `ode_template` for a dead end, Ron #363).
-const ODE_ONLY_ABSORPTION_FNS: [&str; 1] = ["transit"];
+/// rates today (`transit`, #343; `igd`, #347). Each later absorption function
+/// adds its own name here in the same PR that implements it — Phase 2 `weibull` —
+/// so the error rule never advertises a function the engine can't yet run (which
+/// would send the user to `ode_template` for a dead end, Ron #363). A slice (not
+/// a fixed-size array) so a new entry needs no length-annotation bump, matching
+/// [`INPUT_RATE_FNS`].
+const ODE_ONLY_ABSORPTION_FNS: &[&str] = &["transit", "igd"];
 
 /// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
 /// the first such function name found. Drives the error rule that rejects an
@@ -5066,46 +5114,79 @@ fn split_args_on_commas(s: &str) -> Vec<&str> {
     parts
 }
 
-/// Extract built-in absorption input-rate calls (currently `transit(...)`,
-/// design A) from the `[odes]` RHS lines. For each
-/// `d/dt(STATE) = … transit(n=P, mtt=Q) …`, records an [`InputRateForcing`]
-/// (`cmt` ← STATE index; `n`/`mtt` resolved to individual-parameter slots) and
-/// rewrites the call to `0` so the remaining RHS parses as a normal expression.
-/// Returns the cleaned lines and the collected forcing terms.
+/// Built-in absorption input-rate functions recognised in `[odes]` RHS lines
+/// (design A), each with its [`InputRateKind`] and the **ordered** named
+/// arguments it requires. Arguments are resolved to individual-parameter slots
+/// and stored in `arg_slots` in this order, so `src/pk/absorption.rs` reads them
+/// positionally. Each new model adds one row here in the PR that implements it
+/// (`transit`, #343; `igd`, #347).
+const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] = &[
+    (
+        "transit",
+        crate::pk::absorption::InputRateKind::Transit,
+        &["n", "mtt"],
+    ),
+    (
+        "igd",
+        crate::pk::absorption::InputRateKind::InverseGaussian,
+        &["mat", "cv2"],
+    ),
+];
+
+/// Extract built-in absorption input-rate calls ([`INPUT_RATE_FNS`] —
+/// `transit(...)`, `igd(...)`) from the `[odes]` RHS lines. For each
+/// `d/dt(STATE) = … fn(arg=P, …) …`, records an [`InputRateForcing`] (`cmt` ←
+/// STATE index; named args resolved to individual-parameter slots, in the
+/// function's declared order) and rewrites the call to `0` so the remaining RHS
+/// parses as a normal expression. Returns the cleaned lines and the forcings.
 ///
-/// Validation (negative-tested): `transit(...)` must be the input rate of a
-/// top-level `d/dt(...)` equation; args are exactly `n` and `mtt`, each a
-/// declared individual parameter; a scaled call (`FR*transit(...)`) and more than
-/// one call per equation are rejected (parallel/biphasic comes with later models).
+/// Validation (negative-tested): the call must be the input rate of a top-level
+/// `d/dt(...)` equation; its args are exactly the function's declared names, each
+/// a declared individual parameter; a scaled call (`FR*fn(...)`) and more than
+/// one input-rate call per equation are rejected (parallel/biphasic comes with
+/// later models).
 fn extract_input_rate_terms(
     rhs_lines: &[String],
     state_names: &[String],
     indiv_param_names: &[String],
     indiv_param_slots: &[usize],
 ) -> Result<(Vec<String>, Vec<crate::pk::absorption::InputRateForcing>), String> {
-    use crate::pk::absorption::{InputRateForcing, InputRateKind};
-    let resolve_slot = |val: &str, arg: &str| -> Result<usize, String> {
+    use crate::pk::absorption::InputRateForcing;
+    let resolve_slot = |fname: &str, val: &str, arg: &str| -> Result<usize, String> {
         indiv_param_names
             .iter()
             .position(|p| p == val)
             .map(|i| indiv_param_slots[i])
             .ok_or_else(|| {
                 format!(
-                    "[odes]: transit({arg}={val}): `{val}` is not a declared individual parameter"
+                    "[odes]: {fname}({arg}={val}): `{val}` is not a declared individual parameter"
                 )
             })
+    };
+    // "`a` and `b`" — for the unknown-/expected-argument error messages.
+    let arg_list = |args: &[&str]| -> String {
+        args.iter()
+            .map(|a| format!("`{a}`"))
+            .collect::<Vec<_>>()
+            .join(" and ")
     };
 
     let mut forcings = Vec::new();
     let mut cleaned = Vec::with_capacity(rhs_lines.len());
     for raw in rhs_lines {
-        let Some(start) = find_word_call(raw, "transit") else {
+        // Which built-in (if any) does this line call, and where? Table order
+        // breaks ties when a line names more than one (rejected just below).
+        let Some((fname, kind, arg_names, start)) = INPUT_RATE_FNS
+            .iter()
+            .find_map(|&(f, k, a)| find_word_call(raw, f).map(|s| (f, k, a, s)))
+        else {
             cleaned.push(raw.clone());
             continue;
         };
+
         let state = diffeq_state(raw).ok_or_else(|| {
             format!(
-                "[odes]: transit(...) may only be the input rate of a `d/dt(...)` equation — \
+                "[odes]: {fname}(...) may only be the input rate of a `d/dt(...)` equation — \
                  found it in `{}`",
                 raw.trim()
             )
@@ -5115,56 +5196,70 @@ fn extract_input_rate_terms(
             .position(|s| s == &state)
             .ok_or_else(|| format!("[odes]: d/dt({state}): undeclared state"))?;
 
-        let open = start + "transit".len();
+        let open = start + fname.len();
         let (inner, end) = balanced_parens(raw, open).ok_or_else(|| {
             format!(
-                "[odes]: transit(...): unbalanced parentheses in `{}`",
+                "[odes]: {fname}(...): unbalanced parentheses in `{}`",
                 raw.trim()
             )
         })?;
         if call_is_scaled_or_signed(raw, start, end) {
-            return Err(
-                "[odes]: transit(...) must be a standalone, positively-signed additive input \
+            return Err(format!(
+                "[odes]: {fname}(...) must be a standalone, positively-signed additive input \
                  rate — it cannot be scaled (`* / ^`), negated (a leading `-`), or wrapped in \
-                 parentheses (e.g. `FR*transit(...)`, `-transit(...)`, `(transit(...))/V`), \
-                 since these silently drop the sign/scale. Write it as a bare `+ transit(...)` \
+                 parentheses (e.g. `FR*{fname}(...)`, `-{fname}(...)`, `({fname}(...))/V`), \
+                 since these silently drop the sign/scale. Write it as a bare `+ {fname}(...)` \
                  term."
-                    .to_string(),
-            );
+            ));
         }
 
-        let mut n_slot = None;
-        let mut mtt_slot = None;
+        // Resolve each named arg into its declared slot position.
+        let mut slots: Vec<Option<usize>> = vec![None; arg_names.len()];
         for part in split_args_on_commas(&inner) {
             let (name, val) = part.split_once('=').ok_or_else(|| {
                 format!(
-                    "[odes]: transit(...) arguments must be `name=parameter`, got `{}`",
+                    "[odes]: {fname}(...) arguments must be `name=parameter`, got `{}`",
                     part.trim()
                 )
             })?;
             let (name, val) = (name.trim(), val.trim());
-            match name {
-                "n" => n_slot = Some(resolve_slot(val, "n")?),
-                "mtt" => mtt_slot = Some(resolve_slot(val, "mtt")?),
-                other => {
+            match arg_names.iter().position(|a| *a == name) {
+                Some(i) => slots[i] = Some(resolve_slot(fname, val, name)?),
+                None => {
                     return Err(format!(
-                        "[odes]: transit(...) has no argument `{other}` (expected `n` and `mtt`)"
+                        "[odes]: {fname}(...) has no argument `{name}` (expected {})",
+                        arg_list(arg_names)
                     ))
                 }
             }
         }
-        let n_slot = n_slot.ok_or("[odes]: transit(...) missing required argument `n`")?;
-        let mtt_slot = mtt_slot.ok_or("[odes]: transit(...) missing required argument `mtt`")?;
+        let mut arg_slots = Vec::with_capacity(arg_names.len());
+        for (i, slot) in slots.into_iter().enumerate() {
+            arg_slots.push(slot.ok_or_else(|| {
+                format!(
+                    "[odes]: {fname}(...) missing required argument `{}`",
+                    arg_names[i]
+                )
+            })?);
+        }
 
         forcings.push(InputRateForcing {
             cmt,
-            kind: InputRateKind::Transit,
-            arg_slots: vec![n_slot, mtt_slot],
+            kind,
+            arg_slots,
         });
 
         let new_line = format!("{}0{}", &raw[..start], &raw[end..]);
-        if find_word_call(&new_line, "transit").is_some() {
-            return Err("[odes]: at most one transit(...) per d/dt equation (Phase 0)".to_string());
+        if INPUT_RATE_FNS
+            .iter()
+            .any(|&(f, _, _)| find_word_call(&new_line, f).is_some())
+        {
+            return Err(
+                "[odes]: at most one absorption input-rate function per d/dt equation — \
+                 parallel/biphasic absorption (two input-rate terms on one compartment) is \
+                 not yet supported"
+                    .to_string(),
+            );
         }
         cleaned.push(new_line);
     }
@@ -6579,7 +6674,9 @@ struct LtbsFlags {
     dv_pre_logged: bool,
 }
 
-fn parse_error_model(lines: &[String]) -> Result<(ParsedErrorModel, LtbsFlags), String> {
+fn parse_error_model(
+    lines: &[String],
+) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
     // Single-endpoint:
     //   DV ~ proportional(SIGMA_NAME)
     //   DV ~ additive(SIGMA_NAME)
@@ -6599,10 +6696,22 @@ fn parse_error_model(lines: &[String]) -> Result<(ParsedErrorModel, LtbsFlags), 
     // singles carry the per-line LTBS flags so the chosen single can stamp them.
     let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
+    // IIV on residual error: `iiv_on_ruv = ETA_NAME` (NONMEM `Y=IPRED+EPS*EXP(ETA)`).
+    let iiv_re = Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap();
+    let mut iiv_on_ruv: Option<String> = None;
 
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // `iiv_on_ruv = ETA_NAME` declares a random effect on the residual error.
+        if let Some(c) = iiv_re.captures(trimmed) {
+            if iiv_on_ruv.is_some() {
+                return Err("[error_model] has more than one `iiv_on_ruv = ...` entry".to_string());
+            }
+            iiv_on_ruv = Some(c[1].to_string());
             continue;
         }
 
@@ -6711,11 +6820,22 @@ fn parse_error_model(lines: &[String]) -> Result<(ParsedErrorModel, LtbsFlags), 
                 ));
             }
         }
-        return Ok((ParsedErrorModel::PerCmt(per_cmt), LtbsFlags::default()));
+        if iiv_on_ruv.is_some() {
+            return Err("[error_model] `iiv_on_ruv` is not supported with per-CMT \
+                        (multi-endpoint) error models"
+                .to_string());
+        }
+        return Ok((
+            ParsedErrorModel::PerCmt(per_cmt),
+            LtbsFlags::default(),
+            None,
+        ));
     }
 
     match singles.into_iter().next() {
-        Some((model, names, flags)) => Ok((ParsedErrorModel::Single(model, names), flags)),
+        Some((model, names, flags)) => {
+            Ok((ParsedErrorModel::Single(model, names), flags, iiv_on_ruv))
+        }
         None => Err("No error model found in [error_model] block".to_string()),
     }
 }
@@ -6810,11 +6930,11 @@ fn build_pk_param_fn(
     pk_param_map: &HashMap<String, String>,
     var_names: &[String],
     ode_slot_map: &[usize],
-    // Analytical modeled-duration (`D{cmt}`, RATE=-2) parameters as
-    // `(var_name, PkParams slot)`; the closure writes each value into its
-    // reserved spare slot in the analytical arm. Empty for ODE models and for
-    // analytical models with no `RATE=-2` dosing. See #324/#394.
-    analytical_dur_slots: &[(String, usize)],
+    // Analytical modeled-dose (`D{cmt}` RATE=-2 duration, `R{cmt}` RATE=-1 rate)
+    // parameters as `(var_name, PkParams slot)`; the closure writes each value
+    // into its reserved spare slot in the analytical arm. Empty for ODE models
+    // and for analytical models with no `RATE=-1`/`-2` dosing. See #324.
+    analytical_modeled_slots: &[(String, usize)],
     n_theta_base: usize,
     n_eta_extended: usize,
     #[cfg(feature = "nn")] covariate_nns: &[crate::nn::CovariateNn],
@@ -6934,12 +7054,12 @@ fn build_pk_param_fn(
     }
     let is_analytical_pk = !pk_param_map.is_empty();
 
-    // Resolve each analytical modeled-duration parameter's value slot once, to
+    // Resolve each analytical modeled-dose parameter's value slot once, to
     // `(PkParams write slot, var slot)`, so the hot closure is two array reads.
-    // Empty unless this is an analytical model with `D{cmt}` (RATE=-2) declared.
-    // A name with no matching var slot is dropped (defensive — it would have
-    // errored earlier as an undefined reference).
-    let analytical_extra_mapping: Vec<(usize, usize)> = analytical_dur_slots
+    // Empty unless this is an analytical model with `D{cmt}`/`R{cmt}` (RATE=-2/-1)
+    // declared. A name with no matching var slot is dropped (defensive — it would
+    // have errored earlier as an undefined reference).
+    let analytical_extra_mapping: Vec<(usize, usize)> = analytical_modeled_slots
         .iter()
         .filter_map(|(var_name, pk_slot)| {
             let var_slot = var_idx
@@ -10915,12 +11035,14 @@ mod tests {
             ode_only_absorption_fn_in_odes(Some(&transit)),
             Some("transit")
         );
+        // `igd` is implemented as of #347, so the error rule now recognises it
+        // (routing an analytical `pk` + `igd()` to `ode_template`).
+        let igd = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central".to_string()];
+        assert_eq!(ode_only_absorption_fn_in_odes(Some(&igd)), Some("igd"));
         // The error rule only recognises functions that are actually implemented
-        // (Ron #363): `igd`/`weibull` are not yet input rates, so they must NOT be
+        // (Ron #363): `weibull` is not yet an input rate, so it must NOT be
         // detected — otherwise the rule would point the user at `ode_template` for a
         // function the engine can't run. Each phase adds its name here when it lands.
-        let igd = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central".to_string()];
-        assert_eq!(ode_only_absorption_fn_in_odes(Some(&igd)), None);
         let weibull = vec!["d/dt(central) = weibull(td=TD, beta=B) - (CL/V)*central".to_string()];
         assert_eq!(ode_only_absorption_fn_in_odes(Some(&weibull)), None);
         // A plain disposition ODE has no ODE-only absorption call.
@@ -11118,6 +11240,96 @@ mod tests {
         assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT)").is_ok());
         assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot").is_ok());
         assert!(go("d/dt(depot) = -KA*depot + transit(n=NTR, mtt=MTT)").is_ok());
+    }
+
+    // ── igd() input-rate parse-split (#347, design A) ─────────────────────────
+    #[test]
+    fn extract_igd_input_rate_basic() {
+        // igd(mat, cv2) straight into central: forcing on the central cmt, args
+        // resolved to the [mat, cv2] slots in order; the rest of the RHS untouched.
+        let lines = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central".to_string()];
+        let states = vec!["depot".to_string(), "central".to_string()];
+        let names = vec![
+            "MAT".to_string(),
+            "CV2".to_string(),
+            "CL".to_string(),
+            "V".to_string(),
+        ];
+        let slots = vec![4, 5, 0, 1];
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
+        assert_eq!(cleaned[0], "d/dt(central) = 0 - CL/V*central");
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(forcings[0].cmt, 1); // central
+        assert!(matches!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::InverseGaussian
+        ));
+        assert_eq!(forcings[0].arg_slots, vec![4, 5]); // [mat=MAT slot, cv2=CV2 slot]
+    }
+
+    #[test]
+    fn extract_igd_input_rate_rejects_bad_specs() {
+        let states = vec!["central".to_string()];
+        let names = vec!["MAT".to_string(), "CV2".to_string()];
+        let slots = vec![4, 5];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        assert!(go("d/dt(central) = igd(mat=MAT, cv2=ZZZ)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        assert!(go("d/dt(central) = igd(mat=MAT, foo=CV2)")
+            .unwrap_err()
+            .contains("no argument `foo`"));
+        // Missing arg names the offender and lists the expected names generically.
+        let err = go("d/dt(central) = igd(mat=MAT)").unwrap_err();
+        assert!(
+            err.contains("missing required argument `cv2`"),
+            "got: {err}"
+        );
+        // Biphasic `FR*igd(...)` is a scaled call — rejected in Phase 1 (the shared
+        // fraction mechanism is a follow-up); the message names `igd`, not `transit`.
+        let scaled = go("d/dt(central) = FR*igd(mat=MAT, cv2=CV2)").unwrap_err();
+        assert!(
+            scaled.contains("scaled") && scaled.contains("igd"),
+            "got: {scaled}"
+        );
+        assert!(go("d/dt(central) = igd(mat=MAT, cv2=CV2")
+            .unwrap_err()
+            .contains("unbalanced"));
+        assert!(go("d/dt(central) = igd(MAT, cv2=CV2)")
+            .unwrap_err()
+            .contains("name=parameter"));
+        // Two input-rate calls on one equation (biphasic sum) rejected for now.
+        assert!(
+            go("d/dt(central) = igd(mat=MAT, cv2=CV2) + igd(mat=MAT, cv2=CV2)")
+                .unwrap_err()
+                .contains("at most one")
+        );
+        // A word *ending* in `igd` (e.g. `xigd(`) is not an igd() call.
+        let (kept, none) = go("d/dt(central) = xigd(mat=MAT, cv2=CV2) - central").unwrap();
+        assert_eq!(kept[0], "d/dt(central) = xigd(mat=MAT, cv2=CV2) - central");
+        assert!(none.is_empty());
+        // Positive control: a bare additive igd() is accepted.
+        assert!(go("d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central").is_ok());
+    }
+
+    #[test]
+    fn extract_rejects_two_different_input_rate_fns_on_one_equation() {
+        // transit + igd on a single d/dt is rejected by the same one-call guard
+        // (mixed/parallel composition is a later phase).
+        let states = vec!["central".to_string()];
+        let names = vec![
+            "NTR".to_string(),
+            "MTT".to_string(),
+            "MAT".to_string(),
+            "CV2".to_string(),
+        ];
+        let slots = vec![10, 11, 4, 5];
+        let line = "d/dt(central) = transit(n=NTR, mtt=MTT) + igd(mat=MAT, cv2=CV2)".to_string();
+        let err = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap_err();
+        assert!(err.contains("at most one"), "got: {err}");
     }
 
     #[test]
@@ -12201,15 +12413,15 @@ mod tests {
     }
 
     #[test]
-    fn test_imp_method_and_is_options_parse() {
-        // `methods = [focei, imp]` plus the four `is_*` keys must apply
+    fn test_imp_method_and_imp_options_parse() {
+        // `methods = [focei, imp]` plus the `imp_*` keys must apply
         // cleanly and produce no `unsupported_keys_warnings`.
         let opts = parse_fit_options(&[
             "method = [focei, imp]".to_string(),
-            "is_samples = 500".to_string(),
-            "is_proposal_df = 4.0".to_string(),
-            "is_seed = 99".to_string(),
-            "is_low_ess_threshold = 0.2".to_string(),
+            "imp_samples = 500".to_string(),
+            "imp_proposal_df = 4.0".to_string(),
+            "imp_seed = 99".to_string(),
+            "imp_low_ess_threshold = 0.2".to_string(),
             "covariance = false".to_string(),
             "verbose = false".to_string(),
         ])
@@ -12218,25 +12430,25 @@ mod tests {
             opts.methods,
             vec![EstimationMethod::FoceI, EstimationMethod::Imp]
         );
-        assert_eq!(opts.is_samples, 500);
-        assert_eq!(opts.is_proposal_df, 4.0);
-        assert_eq!(opts.is_seed, Some(99));
-        assert_eq!(opts.is_low_ess_threshold, 0.2);
+        assert_eq!(opts.imp_samples, 500);
+        assert_eq!(opts.imp_proposal_df, 4.0);
+        assert_eq!(opts.imp_seed, Some(99));
+        assert_eq!(opts.imp_low_ess_threshold, 0.2);
         // No "ignored option" warnings — keys are method-specific to Imp,
         // and Imp is in the chain.
         assert!(opts.unsupported_keys_warnings().is_empty());
     }
 
     #[test]
-    fn test_is_options_validate_ranges() {
+    fn test_imp_options_validate_ranges() {
         let mut opts = FitOptions::default();
-        assert!(apply_fit_option(&mut opts, "is_samples", "1").is_err()); // < 2
-        assert!(apply_fit_option(&mut opts, "is_proposal_df", "0.5").is_err()); // < 1
-        assert!(apply_fit_option(&mut opts, "is_low_ess_threshold", "1.5").is_err()); // > 1
-        assert!(apply_fit_option(&mut opts, "is_low_ess_threshold", "-0.1").is_err()); // < 0
-        assert!(apply_fit_option(&mut opts, "is_iterations", "0").is_err()); // < 1
-                                                                             // Defaults preserved after a failed apply.
-        assert_eq!(opts.is_samples, 1000);
+        assert!(apply_fit_option(&mut opts, "imp_samples", "1").is_err()); // < 2
+        assert!(apply_fit_option(&mut opts, "imp_proposal_df", "0.5").is_err()); // < 1
+        assert!(apply_fit_option(&mut opts, "imp_low_ess_threshold", "1.5").is_err()); // > 1
+        assert!(apply_fit_option(&mut opts, "imp_low_ess_threshold", "-0.1").is_err()); // < 0
+        assert!(apply_fit_option(&mut opts, "imp_iterations", "0").is_err()); // < 1
+                                                                              // Defaults preserved after a failed apply.
+        assert_eq!(opts.imp_samples, 1000);
     }
 
     #[test]
@@ -12244,26 +12456,26 @@ mod tests {
         // The estimating-IMP controls and the eval-only switch apply cleanly.
         let opts = parse_fit_options(&[
             "method = imp".to_string(),
-            "is_iterations = 80".to_string(),
-            "is_averaging = 20".to_string(),
-            "is_eval_only = true".to_string(),
-            "is_proposal_df = normal".to_string(),
+            "imp_iterations = 80".to_string(),
+            "imp_averaging = 20".to_string(),
+            "imp_eval_only = true".to_string(),
+            "imp_proposal_df = normal".to_string(),
         ])
         .expect("parse must succeed");
         assert_eq!(opts.method, EstimationMethod::Imp);
-        assert_eq!(opts.is_iterations, 80);
-        assert_eq!(opts.is_averaging, 20);
-        assert!(opts.is_eval_only);
-        assert!(opts.is_proposal_df.is_infinite());
+        assert_eq!(opts.imp_iterations, 80);
+        assert_eq!(opts.imp_averaging, 20);
+        assert!(opts.imp_eval_only);
+        assert!(opts.imp_proposal_df.is_infinite());
         assert!(opts.unsupported_keys_warnings().is_empty());
     }
 
     #[test]
-    fn test_is_proposal_df_accepts_normal_token() {
+    fn test_imp_proposal_df_accepts_normal_token() {
         for kw in ["normal", "mvn", "NORMAL"] {
             let mut o = FitOptions::default();
-            assert!(apply_fit_option(&mut o, "is_proposal_df", kw).is_ok());
-            assert!(o.is_proposal_df.is_infinite(), "`{kw}` must select MVN");
+            assert!(apply_fit_option(&mut o, "imp_proposal_df", kw).is_ok());
+            assert!(o.imp_proposal_df.is_infinite(), "`{kw}` must select MVN");
         }
     }
 
@@ -12273,7 +12485,28 @@ mod tests {
         // NONMEM METHOD=IMP estimator.
         let opts = parse_fit_options(&["method = imp".to_string()]).expect("parse must succeed");
         assert_eq!(opts.method, EstimationMethod::Imp);
-        assert!(!opts.is_eval_only);
+        assert!(!opts.imp_eval_only);
+    }
+
+    #[test]
+    fn test_legacy_is_prefixed_imp_options_are_not_accepted() {
+        for key in [
+            "is_samples",
+            "is_proposal_df",
+            "is_seed",
+            "is_low_ess_threshold",
+            "is_iterations",
+            "is_averaging",
+            "is_eval_only",
+            "is_auto",
+        ] {
+            let mut opts = FitOptions::default();
+            assert_eq!(
+                apply_fit_option(&mut opts, key, "1"),
+                Ok(false),
+                "`{key}` must not remain a parser alias for the renamed `imp_*` options"
+            );
+        }
     }
 
     #[test]
@@ -12333,8 +12566,8 @@ mod tests {
         assert!(apply_fit_option(&mut o, "impmap_iterations", "0").is_err()); // < 1
         assert!(apply_fit_option(&mut o, "impmap_proposal_df", "0.5").is_err()); // < 1
         assert!(apply_fit_option(&mut o, "impmap_low_ess_threshold", "1.5").is_err()); // > 1
-                                                                                       // Default (MVN) preserved after the failed applies.
-        assert!(o.impmap_proposal_df.is_infinite());
+                                                                                       // Default (Student-t, df=4) preserved after the failed applies.
+        assert_eq!(o.impmap_proposal_df, 4.0);
     }
 
     #[test]
@@ -12360,6 +12593,16 @@ mod tests {
             assert_eq!(apply_fit_option(&mut opts, "sir", v), Ok(true));
             assert!(!opts.sir, "value `{v}` should parse as false");
         }
+    }
+
+    #[test]
+    fn test_apply_fit_option_adaptive_sampling_flags() {
+        let mut opts = FitOptions::default();
+        assert!(opts.imp_auto && opts.impmap_auto, "default on");
+        assert_eq!(apply_fit_option(&mut opts, "imp_auto", "false"), Ok(true));
+        assert!(!opts.imp_auto);
+        assert_eq!(apply_fit_option(&mut opts, "impmap_auto", "no"), Ok(true));
+        assert!(!opts.impmap_auto);
     }
 
     #[test]
@@ -15631,6 +15874,86 @@ if (WT > 70) {
             model.error_spec,
             ErrorSpec::Single(ErrorModel::Proportional)
         ));
+    }
+
+    // ── IIV on residual error (`iiv_on_ruv`, #409) ──────────────────────────
+    fn iiv_ruv_model_str(error_block: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_RUV ~ 0.05
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+{}
+",
+            error_block
+        )
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_resolves_eta_index() {
+        let model = parse_full_model(&iiv_ruv_model_str(
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV",
+        ))
+        .unwrap()
+        .model;
+        // ETA_RUV is the 2nd declared omega → eta index 1.
+        assert_eq!(model.residual_error_eta, Some(1));
+        // The residual-error eta is NOT a structural/individual-parameter eta.
+        assert!(
+            !model.eta_param_info.iter().any(|e| e.eta_name == "ETA_RUV"),
+            "ETA_RUV must not carry an EtaParamInfo entry"
+        );
+        // The scale factor is exp(2·η) at that index, 1.0 elsewhere.
+        assert!((model.residual_var_scale(&[0.0, 0.0]) - 1.0).abs() < 1e-12);
+        assert!((model.residual_var_scale(&[0.3, 0.5]) - (2.0_f64 * 0.5).exp()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_absent_is_none() {
+        let model = parse_full_model(&iiv_ruv_model_str("  DV ~ proportional(PROP_ERR)"))
+            .unwrap()
+            .model;
+        assert_eq!(model.residual_error_eta, None);
+        assert!((model.residual_var_scale(&[0.7, 0.9]) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_unknown_eta_rejected() {
+        let err = expect_parse_err(&iiv_ruv_model_str(
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = NOPE",
+        ));
+        assert!(
+            err.contains("iiv_on_ruv") && err.contains("NOPE"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_duplicate_rejected() {
+        let err = expect_parse_err(&iiv_ruv_model_str(
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n  iiv_on_ruv = ETA_CL",
+        ));
+        assert!(err.contains("more than one"), "got: {err}");
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_rejected_with_per_cmt() {
+        let err = expect_parse_err(&pkpd_model_str(
+            "  CMT=1: DV ~ proportional(PROP_ERR_PK)\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n  iiv_on_ruv = ETA_CL",
+        ));
+        assert!(err.contains("per-CMT"), "got: {err}");
     }
 
     #[test]
@@ -20172,6 +20495,197 @@ CL V KA WT
         assert!(
             err.contains("compartment 3") && err.contains("D3") && err.contains("ode("),
             "error must name the compartment, the param, and point to ode(...): {err}"
+        );
+    }
+
+    #[test]
+    fn analytical_modeled_rate_param_populates_map() {
+        // Mirror of `analytical_modeled_duration_param_populates_map` for the
+        // modeled-*rate* form: an `R1` parameter (RATE=-1) in an ANALYTICAL model
+        // (#324) must parse and bind `(Rate, 1)` in `CompiledModel.dose_attr_map`,
+        // routed to a spare PkParams slot above the canonical slots.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVR1(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  R1 = TVR1
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(src).expect("R1 parses on analytical model");
+        assert!(
+            parsed.model.ode_spec.is_none(),
+            "model must be analytical (no ode_spec)"
+        );
+        let slot = parsed
+            .model
+            .dose_attr_map
+            .indexed_slot(crate::types::DoseAttr::Rate, 1)
+            .expect("R1 must map as modeled rate for compartment 1");
+        assert!(
+            slot > crate::types::PK_IDX_LAGTIME && slot < crate::types::MAX_PK_PARAMS,
+            "R1 must land in a spare slot ({} < slot < {}), got {slot}",
+            crate::types::PK_IDX_LAGTIME,
+            crate::types::MAX_PK_PARAMS
+        );
+        // It is a Rate, not a Duration.
+        assert!(parsed
+            .model
+            .dose_attr_map
+            .indexed_slot(crate::types::DoseAttr::Duration, 1)
+            .is_none());
+    }
+
+    #[test]
+    fn analytical_modeled_rate_out_of_range_compartment_errors() {
+        // `R2` on a 1-cpt IV analytical model is not an infusable compartment
+        // (infusable = {1}) — a loud parse error naming the rate attribute and
+        // RATE=-1, never a silently-ignored slot (#324). Mirrors the duration case.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVR2(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  R2 = TVR2
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(src)
+            .err()
+            .expect("R2 on a 1-compartment analytical model must error");
+        assert!(
+            err.contains("compartment 2")
+                && err.contains("R2")
+                && err.contains("rate")
+                && err.contains("-1"),
+            "error must name the attribute, compartment, and RATE=-1, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_modeled_rate_param_populates_map() {
+        // The ODE engine routes `R{cmt}` through the same `from_indexed_name`
+        // gate as `D{cmt}` (no engine-specific code), so an `R1` parameter on an
+        // ODE model must bind `(Rate, 1)` in the `ode_spec`'s `dose_attr_map`.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVR1(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  R1 = TVR1
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V)*central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(src).expect("R1 parses on ODE model");
+        let ode = parsed
+            .model
+            .ode_spec
+            .as_ref()
+            .expect("model must be an ODE model");
+        ode.dose_attr_map
+            .indexed_slot(crate::types::DoseAttr::Rate, 1)
+            .expect("R1 must map as modeled rate for compartment 1 in the ode_spec");
+    }
+
+    #[test]
+    fn analytical_modeled_dose_param_not_flagged_as_dead() {
+        // Regression: an ANALYTICAL `R{n}` (RATE=-1) / `D{n}` (RATE=-2) parameter
+        // is routed to a spare `PkParams` slot and consulted only via coded-`RATE`
+        // *data*, so it has no textual reference. The dead-parameter census must
+        // NOT flag it as "computed but never used" — that message tells the user
+        // to delete a load-bearing modeled-infusion parameter. (R1 was newly
+        // recognised in #324; D1 was the same latent miss from #395.)
+        let rate_src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVR1(20.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  R1 = TVR1
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(rate_src).expect("R1 parses");
+        assert!(
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("never used") && w.contains("R1")),
+            "analytical R1 must not be flagged as dead: {:?}",
+            parsed.model.parse_warnings
+        );
+
+        // Same for the duration form `D1`.
+        let dur_src = rate_src.replace("TVR1", "TVD1").replace("R1 =", "D1 =");
+        let parsed = parse_full_model(&dur_src).expect("D1 parses");
+        assert!(
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("never used") && w.contains("D1")),
+            "analytical D1 must not be flagged as dead: {:?}",
+            parsed.model.parse_warnings
+        );
+
+        // Guard against over-exemption: a genuinely unused analytical parameter
+        // (here `JUNK`, neither mapped into `pk(...)` nor referenced elsewhere)
+        // must STILL be flagged. This proves the new analytical exemption is
+        // scoped to `Dn`/`Rn` and did not silence the census wholesale.
+        let dead_src = rate_src.replace("  R1 = TVR1\n", "  R1 = TVR1\n  JUNK = TVCL * 2.0\n");
+        let parsed = parse_full_model(&dead_src).expect("parses");
+        assert!(
+            parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("never used") && w.contains("JUNK")),
+            "a genuinely unused analytical param must still be flagged: {:?}",
+            parsed.model.parse_warnings
         );
     }
 

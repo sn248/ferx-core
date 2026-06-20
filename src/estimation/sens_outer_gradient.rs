@@ -1859,6 +1859,7 @@ mod tests {
             model.bloq_method,
             &[],
             None,
+            model.residual_error_eta,
         )
     }
 

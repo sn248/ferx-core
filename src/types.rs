@@ -16,7 +16,7 @@ pub use crate::parser::model_parser::IndivParamPartials;
 ///   - `RATE = -2` → the infusion *duration* is the model parameter `D{cmt}`
 ///     ([`RateMode::ModeledDuration`]); the rate is then `amt / duration`.
 ///   - `RATE = -1` → the infusion *rate* is the model parameter `R{cmt}`
-///     (not yet supported — `#324` Phase B; rejected at data-read time).
+///     ([`RateMode::ModeledRate`]); the duration is then `amt / rate`.
 ///
 /// The modeled values are not known at parse/read time (they depend on the
 /// per-iteration `theta`/`eta`/covariates), so a coded dose stores its mode
@@ -32,14 +32,18 @@ pub enum RateMode {
     /// `RATE = -2`: infusion duration is the modeled parameter `D{cmt}` resolved
     /// from the dose compartment via the model's `DoseAttrMap`.
     ModeledDuration,
+    /// `RATE = -1`: infusion *rate* is the modeled parameter `R{cmt}` resolved
+    /// from the dose compartment via the model's `DoseAttrMap`. The duration is
+    /// then `amt / rate` (the NONMEM-faithful mirror of [`Self::ModeledDuration`]).
+    ModeledRate,
 }
 
 /// Clamp `x` to a lower `floor`: returns `x` when `x > floor`, otherwise `floor`.
 ///
 /// The single home for the "pull a transient mid-fit excursion back off the
 /// domain wall" clamp shared by [`DoseEvent::DURATION_FLOOR`] (modeled infusion
-/// duration `D ≤ 0`) and [`crate::pk::absorption::PreparedInputRate::MIN_MTT`]
-/// (transit mean-transit-time `mtt ≤ 0`). Both keep a downstream `amt/D` /
+/// duration `D ≤ 0`) and [`crate::pk::absorption::PreparedInputRate::MIN_PARAM`]
+/// (transit `mtt`, inverse-Gaussian `mat`/`cv2` ≤ 0). Both keep a downstream `amt/D` /
 /// `ktr.ln()` finite at the wall so the optimiser can climb back to the interior
 /// without perturbing a converged (interior) fit. Centralising it keeps the
 /// `NaN`-falls-to-floor subtlety in one place — every `>` is false for `NaN`, so
@@ -105,13 +109,22 @@ impl DoseEvent {
 
     /// Domain floor for a modeled infusion `duration` when clamping a transient
     /// mid-fit excursion (see [`Self::resolve_rate`]). Mirrors
-    /// [`crate::pk::absorption::PreparedInputRate::MIN_MTT`]: far below any
+    /// [`crate::pk::absorption::PreparedInputRate::MIN_PARAM`]: far below any
     /// realistic duration, so it never perturbs a converged fit — it only keeps
     /// a transient `D ≤ 0` (or `NaN`) from turning `amt / D` into a non-finite
     /// rate. `NaN` falls to the floor (every `>` is false for `NaN`).
     pub(crate) const DURATION_FLOOR: f64 = 1e-8;
 
-    /// Resolve a modeled-duration dose into a concrete ([`RateMode::Fixed`]) dose
+    /// Domain floor for a modeled infusion `rate` (`RATE = -1` → `R{cmt}`), the
+    /// mirror of [`Self::DURATION_FLOOR`]. A transient `R ≤ 0` (or `NaN`)
+    /// mid-search would otherwise make `amt / R` (the implied duration)
+    /// non-finite; clamping `R` to this floor keeps it finite (delivering the
+    /// dose over a very long duration) without perturbing a converged fit, whose
+    /// optimum is interior. `NaN` falls to the floor (every `>` is false for
+    /// `NaN`).
+    pub(crate) const RATE_FLOOR: f64 = 1e-8;
+
+    /// Resolve a modeled-`RATE` dose into a concrete ([`RateMode::Fixed`]) dose
     /// for this iteration's per-dose `PkParams` (`params` = `PkParams::values`).
     ///
     /// **Single source of truth** for the modeled-`RATE` rule. Every prediction
@@ -119,7 +132,7 @@ impl DoseEvent {
     /// downstream machinery (ODE forcing, SS equilibration, the break-time
     /// timeline) sees only a concrete `rate`/`duration` and a new dose-application
     /// path cannot silently diverge — the recurring failure mode that F (#327),
-    /// lag (#369), and now duration (#324) each had to thread through every path.
+    /// lag (#369), and duration/rate (#324) each had to thread through every path.
     ///
     /// It is **`F`-agnostic**: it derives `(rate, duration)` from the *raw*
     /// `amt`, leaving bioavailability to the existing per-compartment `F`
@@ -129,8 +142,9 @@ impl DoseEvent {
     /// f64-only / FD-only by construction. The ODE engine has no autodiff path,
     /// and the analytical engine routes any subject with a modeled dose to FD
     /// (see `resolve_gradient_method`, #394) precisely because resolving a duration
-    /// here would drop its `∂duration/∂η`, so no `Dual` twin is ever needed. A
-    /// transient `D ≤ 0` mid-search is clamped to [`Self::DURATION_FLOOR`].
+    /// or rate here would drop its `∂/∂η`, so no `Dual` twin is ever needed. A
+    /// transient `D ≤ 0` is clamped to [`Self::DURATION_FLOOR`]; a transient
+    /// `R ≤ 0` to [`Self::RATE_FLOOR`].
     pub(crate) fn resolve_rate(&self, attr_map: &DoseAttrMap, params: &[f64]) -> DoseEvent {
         match self.rate_mode {
             RateMode::Fixed => self.clone(),
@@ -146,6 +160,22 @@ impl DoseEvent {
                 DoseEvent {
                     rate: self.amt / duration,
                     duration,
+                    rate_mode: RateMode::Fixed,
+                    ..self.clone()
+                }
+            }
+            RateMode::ModeledRate => {
+                // Mirror of `ModeledDuration`: the `R{cmt}` slot's existence is an
+                // invariant enforced by `check_model_data` (a `RATE=-1` dose with
+                // no matching `R{cmt}` is rejected before any prediction runs).
+                let slot = attr_map
+                    .indexed_slot(DoseAttr::Rate, self.cmt)
+                    .expect("modeled-rate dose slot validated by check_model_data");
+                let r_raw = params.get(slot).copied().unwrap_or(0.0);
+                let rate = clamp_above_floor(r_raw, Self::RATE_FLOOR);
+                DoseEvent {
+                    rate,
+                    duration: self.amt / rate,
                     rate_mode: RateMode::Fixed,
                     ..self.clone()
                 }
@@ -166,9 +196,9 @@ impl DoseEvent {
     /// **Single source of truth** for "is this dose resolved?". Every prediction
     /// path that snapshots `rate`/`duration` (the ODE resolve shadows, and the
     /// analytical / AD tripwires) tests this rather than re-spelling the
-    /// `matches!(rate_mode, Fixed)` predicate, so when a second modeled variant
-    /// lands (`RATE=-1` → `Rn`, #383) "resolved" changes in exactly one place
-    /// instead of across every dose-application site.
+    /// `matches!(rate_mode, Fixed)` predicate, so the second modeled variant
+    /// (`RATE=-1` → `Rn`, #324) changed "resolved" in exactly one place instead
+    /// of across every dose-application site.
     pub fn is_fixed(&self) -> bool {
         matches!(self.rate_mode, RateMode::Fixed)
     }
@@ -268,18 +298,21 @@ impl DoseAttr {
     /// be a positive integer (so `F0` is *not* an attribute, and bare `F` /
     /// `lagtime` — handled by the reserved slots — return `None`).
     ///
-    /// Recognised today: `F{n}` (bioavailability), `ALAG{n}` / `LAGTIME{n}`
-    /// (lag), and `D{n}` (modeled infusion *duration*, `RATE=-2`; #324). The
-    /// modeled-*rate* form `R{n}` (`RATE=-1`) is intentionally **not** recognised
-    /// yet — its `R` prefix collides with ordinary ODE rate constants and modeled
-    /// rate is a follow-up (#324 Phase B). `S{n}` is also excluded — that is the
+    /// Recognised: `F{n}` (bioavailability), `ALAG{n}` / `LAGTIME{n}` (lag),
+    /// `D{n}` (modeled infusion *duration*, `RATE=-2`; #324), and `R{n}` (modeled
+    /// infusion *rate*, `RATE=-1`; #324). `S{n}` is excluded — that is the
     /// `[scaling]` block's compartment scale, a separate concept.
     ///
-    /// `D{n}` shares that collision risk (a `D`-prefixed rate constant), so it is
-    /// only *reserved* for the duration when a `RATE=-2` dose targets compartment
-    /// `n`: recognising the name merely makes the [`DoseAttrMap`] entry available
-    /// (harmless if never dosed against), and the data-driven gate + collision
-    /// warning live in `check_model_data`.
+    /// Both `D{n}` and `R{n}` carry a collision risk (a `D`- or `R`-prefixed name
+    /// could be an ordinary ODE rate constant), so neither is forcibly *reserved*
+    /// here: recognising the name merely makes the [`DoseAttrMap`] entry available
+    /// (harmless if never dosed against — the entry is consulted only by
+    /// [`DoseEvent::resolve_rate`] when a `RATE=-2`/`-1` dose targets compartment
+    /// `n`), and the data-driven gate (`E_MODELED_DURATION_NO_PARAM` /
+    /// `E_MODELED_RATE_NO_PARAM`) lives in `check_model_data`. NONMEM treats `D{n}`
+    /// / `R{n}` as reserved `$PK` names the same way, so a model that names a
+    /// non-dose parameter `R1` while also dosing `RATE=-1` into compartment 1 is
+    /// the user's collision to resolve, not ours.
     ///
     /// Recognising a name does not by itself make it a dose attribute — the
     /// caller still gates on engine (compartment-indexed `F`/`Lag`/`Duration` are
@@ -288,14 +321,15 @@ impl DoseAttr {
     pub fn from_indexed_name(name: &str) -> Option<(DoseAttr, usize)> {
         let lower = name.to_ascii_lowercase();
         // The prefixes are mutually exclusive — no name starts with two of them,
-        // and none is a prefix of another (`lagtime`/`alag`/`f`/`d` all differ in
-        // their first byte except the two lag aliases, which are disjoint) — so
+        // and none is a prefix of another (`lagtime`/`alag`/`f`/`d`/`r` all differ
+        // in their first byte except the two lag aliases, which are disjoint) — so
         // the iteration order does not affect the result.
         for (prefix, attr) in [
             ("lagtime", DoseAttr::Lag),
             ("alag", DoseAttr::Lag),
             ("f", DoseAttr::F),
             ("d", DoseAttr::Duration),
+            ("r", DoseAttr::Rate),
         ] {
             if let Some(suffix) = lower.strip_prefix(prefix) {
                 // The suffix must be a pure positive integer; `f_bio`, `cl`, etc.
@@ -535,9 +569,9 @@ pub struct Subject {
     /// state-propagating path. Resets break dose superposition, so a subject
     /// with any reset is forced onto the event-driven analytical / ODE path.
     pub reset_times: Vec<f64>,
-    /// Censoring flag per observation (0 = quantified, 1 = below LLOQ).
-    /// When `cens[j] == 1`, `observations[j]` holds the LLOQ value (NONMEM convention).
-    pub cens: Vec<u8>,
+    /// Censoring flag per observation (0 = quantified, 1 = below LLOQ, -1 = above ULOQ).
+    /// On censored rows, `observations[j]` holds the corresponding LOQ limit.
+    pub cens: Vec<i8>,
     /// Occasion index per observation row (parallel to `obs_times`).
     /// Empty when no IOV column is present in the data.
     pub occasions: Vec<u32>,
@@ -556,7 +590,7 @@ pub struct Subject {
 }
 
 impl Subject {
-    pub fn has_bloq(&self) -> bool {
+    pub fn has_censored_observation(&self) -> bool {
         self.cens.iter().any(|&c| c != 0)
     }
 
@@ -1372,6 +1406,29 @@ impl ErrorSpec {
         }
     }
 
+    /// Global `sigma.values` indices of the additive component of every
+    /// `Combined` endpoint (the second sigma slot). De-duplicated; empty when
+    /// no endpoint is combined.
+    pub fn combined_additive_sigma_indices(&self) -> Vec<usize> {
+        match self {
+            ErrorSpec::Single(ErrorModel::Combined) => vec![1],
+            ErrorSpec::Single(_) => Vec::new(),
+            ErrorSpec::PerCmt(map) => {
+                let mut out = Vec::new();
+                for endpoint in map.values() {
+                    if matches!(endpoint.error_model, ErrorModel::Combined) {
+                        if let Some(&idx) = endpoint.sigma_idx.get(1) {
+                            if !out.contains(&idx) {
+                                out.push(idx);
+                            }
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
     pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
         use crate::stats::residual_error::residual_variance;
         match self {
@@ -2031,6 +2088,14 @@ pub struct CompiledModel {
     /// observation dispatch: covariate pseudo-observations use individual
     /// parameter values as predictions and a near-zero additive sigma.
     pub frem_config: Option<FremConfig>,
+    /// IIV on residual error (NONMEM `Y = IPRED + EPS*EXP(ETA)`). When `Some(k)`,
+    /// eta index `k` is a random effect that scales the residual standard
+    /// deviation per subject: the residual variance for every observation is
+    /// multiplied by `exp(2*eta[k])`. The eta is declared as an ordinary
+    /// `omega` in `[parameters]` and wired here via `iiv_on_ruv = NAME` in
+    /// `[error_model]`; it is NOT referenced by any individual parameter, so it
+    /// carries no `EtaParamInfo` entry and the PK closure ignores it. See #409.
+    pub residual_error_eta: Option<usize>,
 }
 
 /// FREM (Full Random Effects Model) configuration.
@@ -2201,6 +2266,27 @@ impl CompiledModel {
         self.error_spec.variance_at(cmt, f_pred, sigma)
     }
 
+    /// Multiplicative factor applied to the residual *variance* for a subject
+    /// whose random-effect vector is `eta`, from the IIV-on-RUV term
+    /// (`Y = IPRED + EPS*EXP(ETA)`). Returns `exp(2*eta[k])` when
+    /// `residual_error_eta == Some(k)` and `k` is in range, else `1.0`.
+    ///
+    /// Because every residual-error model writes the variance as
+    /// `(scale·σ)²` terms summed, multiplying the whole variance by
+    /// `exp(2*eta_k)` is exactly equivalent to scaling the residual SD by
+    /// `exp(eta_k)` — i.e. `EPS·EXP(ETA)` — for additive, proportional, and
+    /// combined alike.
+    #[inline]
+    pub fn residual_var_scale(&self, eta: &[f64]) -> f64 {
+        match self.residual_error_eta {
+            Some(k) => match eta.get(k) {
+                Some(&e) => (2.0 * e).exp(),
+                None => 1.0,
+            },
+            None => 1.0,
+        }
+    }
+
     /// Canonical compartment names for analytical models, used in `[derived]` expressions.
     /// For ODE models use `ode_spec.state_names` instead.
     /// Returns a `'static` slice so it can be used in `DerivedContext` without lifetime issues.
@@ -2264,7 +2350,7 @@ pub struct SubjectResult {
     /// Empty unless `[fit_options] npde_nsim > 0`. Emitted as the `NPD` column.
     pub npd: Vec<f64>,
     pub ofv_contribution: f64,
-    pub cens: Vec<u8>,
+    pub cens: Vec<i8>,
     /// Number of observations for this subject (MDV=0 rows).
     pub n_obs: usize,
     /// Extra sdtab columns from [derived] and [output] blocks, computed
@@ -2411,15 +2497,15 @@ pub struct ImportanceSamplingResult {
     /// to the FOCE OFV.
     pub minus2_log_likelihood: f64,
     /// Monte-Carlo standard error on `minus2_log_likelihood`. Scales with
-    /// `1/sqrt(n_samples)`; halve by quadrupling `is_samples`.
+    /// `1/sqrt(n_samples)`; halve by quadrupling `imp_samples`.
     pub mc_standard_error: f64,
     /// `(subject_id, ESS/K)` for every subject whose normalized effective sample
-    /// size fraction fell below `FitOptions::is_low_ess_threshold`. Empty list
+    /// size fraction fell below `FitOptions::imp_low_ess_threshold`. Empty list
     /// means every subject's proposal matched its posterior well.
     pub low_ess_subjects: Vec<(String, f64)>,
-    /// Number of importance samples drawn per subject (`FitOptions::is_samples`).
+    /// Number of importance samples drawn per subject (`FitOptions::imp_samples`).
     pub n_samples: usize,
-    /// Student-t proposal degrees of freedom (`FitOptions::is_proposal_df`).
+    /// Student-t proposal degrees of freedom (`FitOptions::imp_proposal_df`).
     pub proposal_df: f64,
     /// Minimum across-subject normalized ESS fraction (ESS / K). 1.0 = ideal,
     /// near 0 = degenerate proposal for at least one subject.
@@ -2655,7 +2741,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // Experimental-feature notices (issue #175): SDE and neural-network
         // components emit a runtime warning so results are applied with caution.
         (WarningSeverity::Warning, "experimental")
-    } else if lower.contains("m3 bloq") || lower.contains("bloq handling") {
+    } else if lower.contains("m3 bloq")
+        || lower.contains("bloq handling")
+        || lower.contains("m3 censoring")
+        || lower.contains("censoring handling")
+    {
         (WarningSeverity::Warning, "bloq_method")
     } else if lower.contains("sir failed") || lower.contains("sir requested") {
         (WarningSeverity::Warning, "sir")
@@ -2962,14 +3052,14 @@ pub struct FitResult {
     pub sir_seed: Option<u64>,
     /// Seed used for the importance-sampling Monte Carlo step.  `None` when IS
     /// was not run or no explicit seed was set.
-    pub is_seed: Option<u64>,
+    pub imp_seed: Option<u64>,
     /// Effective RNG seed used for the simulation-based NPDE/NPD diagnostics —
     /// the value actually fed to the simulator, including the built-in default
     /// when `[fit_options] npde_seed` was left unset, so the diagnostic is
     /// reproducible from this field alone. `None` when NPDE did not run
     /// (`npde_nsim = 0`).
     pub npde_seed: Option<u64>,
-    /// BLOQ handling method: "drop" (observations below LOQ are excluded) or
+    /// LOQ censoring handling method: "drop" (treat CENS rows as ordinary) or
     /// "m3" (M3 likelihood for censored observations).
     pub bloq_method: String,
     /// Maximum number of outer optimizer iterations allowed.
@@ -3210,36 +3300,36 @@ pub struct FitOptions {
     // only on the first iteration, then the proposal is re-centered from the
     // previous iteration's importance-sample mean/covariance, and θ/Ω/σ are
     // updated from the importance-weighted posterior moments each iteration. Set
-    // `is_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
+    // `imp_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
     // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` at the fixed input parameters
     // without updating them.
     /// Number of importance samples per subject. Default 1000. Recommended
     /// 2000–5000 for publication-quality MC SE (cost scales linearly).
-    pub is_samples: usize,
+    pub imp_samples: usize,
     /// Degrees of freedom for the Student-t proposal. Default 5.0 (heavy-tailed
     /// — robust to mild proposal misspecification). Must be ≥ 1. The token
     /// `normal` (parsed to `f64::INFINITY`) selects a multivariate-normal
     /// proposal.
-    pub is_proposal_df: f64,
+    pub imp_proposal_df: f64,
     /// RNG seed for the IS sampling. `None` falls back to a fixed default so
     /// runs are reproducible across invocations.
-    pub is_seed: Option<u64>,
+    pub imp_seed: Option<u64>,
     /// Subjects with normalized effective sample size below this fraction
     /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
     /// the flag entirely.
-    pub is_low_ess_threshold: f64,
+    pub imp_low_ess_threshold: f64,
     /// Number of MCEM iterations for the estimating `imp` path (ignored when
-    /// `is_eval_only`). Default 200.
-    pub is_iterations: usize,
+    /// `imp_eval_only`). Default 200.
+    pub imp_iterations: usize,
     /// Number of terminal iterations whose parameters are averaged to form the
     /// reported estimate (Monte-Carlo variance reduction). Default 50. Ignored
-    /// when `is_eval_only`.
-    pub is_averaging: usize,
+    /// when `imp_eval_only`.
+    pub imp_averaging: usize,
     /// When `true`, `imp` evaluates `−2 log L` at the fixed input parameters and
     /// does not estimate (NONMEM `IMP EONLY=1`); it must then be the terminal
     /// chain stage. When `false` (default), `imp` is an MCEM estimator
     /// (NONMEM `METHOD=IMP`).
-    pub is_eval_only: bool,
+    pub imp_eval_only: bool,
     // IMPMAP (Importance Sampling assisted by Mode A Posteriori) options,
     // consumed by the `Impmap` estimating stage. IMPMAP runs a Monte-Carlo EM
     // loop: each iteration re-centers a per-subject importance-sampling proposal
@@ -3251,8 +3341,11 @@ pub struct FitOptions {
     /// Larger K reduces Monte-Carlo noise in the M-step at linear cost.
     pub impmap_samples: usize,
     /// Proposal degrees of freedom. `f64::INFINITY` selects a multivariate
-    /// normal proposal (NONMEM's IMPMAP default; parsed from `normal`); a finite
-    /// value selects a heavier-tailed Student-t. Default `INFINITY` (MVN).
+    /// normal proposal (parsed from `normal`); a finite value selects a
+    /// heavier-tailed Student-t. Default `4.0` (Student-t). A Gaussian proposal
+    /// (`= normal`, NONMEM's IMPMAP default) has lighter tails than the posterior
+    /// of weakly-identified parameters, so importance weights blow up in the tail
+    /// and bias the M-step moments; the heavier-tailed t default avoids that.
     pub impmap_proposal_df: f64,
     /// RNG seed for the IMPMAP sampling. `None` falls back to a fixed default so
     /// runs are reproducible across invocations.
@@ -3272,6 +3365,23 @@ pub struct FitOptions {
     /// Use Sobol quasi-random sequences for IS draws instead of pseudo-random.
     /// Only applies to MVN proposals (impmap_proposal_df = normal). Default false.
     pub impmap_sobol: bool,
+    /// FREM only: Rao-Blackwellise the covariate ETAs (integrate them analytically,
+    /// sample only the PK ETAs) in IMP/IMPMAP importance sampling. Default `true`
+    /// — strongly recommended, since brute-force sampling of the near-singular
+    /// covariate dimensions has very poor ESS. Set `false` only to diagnose the
+    /// RB path against the full-dimensional sampler.
+    pub frem_rao_blackwell: bool,
+    /// Adaptive importance-sample count for IMP (NONMEM `AUTO`/`STDOBJ`). When
+    /// `true` (the default), `imp_samples` is the *starting* count and is ramped
+    /// up (×2 per iteration, capped at 10000) whenever the objective's Monte-Carlo
+    /// standard deviation exceeds 1.0, so high-dimensional / FREM fits reach a
+    /// low-noise objective automatically instead of carrying a sample-count-
+    /// dependent M-step bias. Low-dimensional, well-sampled fits never trip the
+    /// threshold, so there is no cost there. Set `false` to pin the sample count.
+    pub imp_auto: bool,
+    /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
+    /// [`FitOptions::imp_auto`] but ramps `impmap_samples`. Default `true`.
+    pub impmap_auto: bool,
     /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
     /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
     /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
@@ -3279,7 +3389,7 @@ pub struct FitOptions {
     /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
     /// Default 10.0.
     pub iscale_max: f64,
-    /// How BLOQ (Below Limit of Quantification) observations are handled.
+    /// How LOQ-censored observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
     pub bloq_method: BloqMethod,
@@ -3516,22 +3626,25 @@ impl Default for FitOptions {
             sir_seed: None,
             sir_keep_samples: false,
             sir_df: 5.0,
-            is_samples: 1000,
-            is_proposal_df: 5.0,
-            is_seed: None,
-            is_low_ess_threshold: 0.1,
-            is_iterations: 200,
-            is_averaging: 50,
-            is_eval_only: false,
+            imp_samples: 1000,
+            imp_proposal_df: 5.0,
+            imp_seed: None,
+            imp_low_ess_threshold: 0.1,
+            imp_iterations: 200,
+            imp_averaging: 50,
+            imp_eval_only: false,
             impmap_iterations: 200,
             impmap_samples: 300,
-            impmap_proposal_df: f64::INFINITY,
+            impmap_proposal_df: 4.0,
             impmap_seed: None,
             impmap_averaging: 50,
             impmap_low_ess_threshold: 0.1,
             impmap_trace: false,
             impmap_mceta: 0,
             impmap_sobol: false,
+            frem_rao_blackwell: true,
+            imp_auto: true,
+            impmap_auto: true,
             iscale_min: 0.1,
             iscale_max: 10.0,
             bloq_method: BloqMethod::Drop,
@@ -3564,15 +3677,15 @@ impl Default for FitOptions {
     }
 }
 
-/// BLOQ (Below Limit of Quantification) handling.
+/// LOQ censoring handling.
 ///
 /// `Drop` — CENS rows are kept as ordinary observations (no special treatment). If
 /// the dataset has no CENS column, every row is treated as quantified and this is
 /// equivalent to the pre-M3 behavior.
 ///
-/// `M3` — Beal's M3 method: each BLOQ observation contributes
-/// `P(y < LLOQ | θ,η) = Φ((LLOQ - f)/√V)` to the likelihood instead of a
-/// Gaussian residual term. LLOQ is read from DV on CENS=1 rows (NONMEM convention).
+/// `M3` — Beal's M3 method: each censored observation contributes a normal-tail
+/// probability instead of a Gaussian residual term. LLOQ is read from DV on
+/// CENS=1 rows; ULOQ is read from DV on CENS=-1 rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BloqMethod {
     Drop,
@@ -3708,7 +3821,7 @@ pub enum EstimationMethod {
     /// importance-weighted posterior moments each iteration. Reports the IS
     /// `−2 log L` on `FitResult.importance_sampling` and a Laplace OFV on `ofv`.
     ///
-    /// With `is_eval_only = true` (NONMEM `IMP EONLY=1`) it instead *evaluates*
+    /// With `imp_eval_only = true` (NONMEM `IMP EONLY=1`) it instead *evaluates*
     /// `−2 log L_IS` at the fixed input parameters without updating them; in that
     /// mode it must be the terminal chain stage (it consumes the prior stage's
     /// params + EBEs + per-subject Hessians, or evaluates at the initial
@@ -3918,17 +4031,19 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "saem_seed",
         ],
         EstimationMethod::Imp => &[
-            "is_samples",
-            "is_proposal_df",
-            "is_seed",
-            "is_low_ess_threshold",
-            "is_iterations",
-            "is_averaging",
-            "is_eval_only",
+            "imp_samples",
+            "imp_proposal_df",
+            "imp_seed",
+            "imp_low_ess_threshold",
+            "imp_iterations",
+            "imp_averaging",
+            "imp_eval_only",
             "inner_maxiter",
             "inner_tol",
             "iscale_min",
             "iscale_max",
+            "frem_rao_blackwell",
+            "imp_auto",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -3945,6 +4060,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_sobol",
             "iscale_min",
             "iscale_max",
+            "frem_rao_blackwell",
+            "impmap_auto",
         ],
         EstimationMethod::Bayes => &[
             "inner_maxiter",
@@ -4094,6 +4211,7 @@ pub(crate) mod test_helpers {
             #[cfg(feature = "survival")]
             endpoints: HashMap::new(),
             frem_config: None,
+            residual_error_eta: None,
         }
     }
 }
@@ -4211,6 +4329,48 @@ mod tests {
         mixed.insert(1usize, ep(ErrorModel::Additive));
         mixed.insert(2usize, ep(ErrorModel::Proportional));
         assert!(ErrorSpec::PerCmt(mixed).has_f_dependent_variance());
+    }
+
+    #[test]
+    fn combined_additive_sigma_indices_picks_second_slot() {
+        use std::collections::HashMap;
+        // Single combined: additive component is sigma index 1.
+        assert_eq!(
+            ErrorSpec::Single(ErrorModel::Combined).combined_additive_sigma_indices(),
+            vec![1]
+        );
+        // Non-combined single specs have no additive-combined slot.
+        assert!(ErrorSpec::Single(ErrorModel::Additive)
+            .combined_additive_sigma_indices()
+            .is_empty());
+        assert!(ErrorSpec::Single(ErrorModel::Proportional)
+            .combined_additive_sigma_indices()
+            .is_empty());
+
+        let ep = |em: ErrorModel, idx: Vec<usize>| EndpointError {
+            error_model: em,
+            sigma_idx: idx,
+        };
+
+        // PerCmt: returns the global index of each combined endpoint's
+        // second sigma slot, de-duplicated; non-combined endpoints contribute
+        // nothing.
+        let mut map = HashMap::new();
+        map.insert(1usize, ep(ErrorModel::Proportional, vec![0]));
+        map.insert(2usize, ep(ErrorModel::Combined, vec![1, 3]));
+        let mut got = ErrorSpec::PerCmt(map).combined_additive_sigma_indices();
+        got.sort_unstable();
+        assert_eq!(got, vec![3]);
+
+        // Two combined endpoints that share the same additive sigma index
+        // collapse to a single entry.
+        let mut shared = HashMap::new();
+        shared.insert(1usize, ep(ErrorModel::Combined, vec![0, 2]));
+        shared.insert(2usize, ep(ErrorModel::Combined, vec![1, 2]));
+        assert_eq!(
+            ErrorSpec::PerCmt(shared).combined_additive_sigma_indices(),
+            vec![2]
+        );
     }
 
     #[test]
@@ -4336,7 +4496,7 @@ mod tests {
                 "dw_autocorrelation",
             ),
             (
-                "M3 BLOQ handling requires FOCEI semantics",
+                "M3 censoring handling requires FOCEI semantics",
                 Warning,
                 "bloq_method",
             ),
@@ -4728,7 +4888,7 @@ mod tests {
     }
 
     #[test]
-    fn dose_attr_from_indexed_name_recognizes_f_lag_and_duration() {
+    fn dose_attr_from_indexed_name_recognizes_f_lag_duration_and_rate() {
         use DoseAttr::*;
         // Bioavailability and both lag spellings, case-insensitive.
         assert_eq!(DoseAttr::from_indexed_name("F1"), Some((F, 1)));
@@ -4739,6 +4899,9 @@ mod tests {
         // Modeled infusion duration D{n} (RATE=-2; #324), case-insensitive.
         assert_eq!(DoseAttr::from_indexed_name("D1"), Some((Duration, 1)));
         assert_eq!(DoseAttr::from_indexed_name("d2"), Some((Duration, 2)));
+        // Modeled infusion rate R{n} (RATE=-1; #324), case-insensitive.
+        assert_eq!(DoseAttr::from_indexed_name("R1"), Some((Rate, 1)));
+        assert_eq!(DoseAttr::from_indexed_name("r2"), Some((Rate, 2)));
 
         // Bare forms and zero index are not compartment-indexed attributes.
         assert_eq!(DoseAttr::from_indexed_name("F"), None);
@@ -4747,23 +4910,23 @@ mod tests {
         assert_eq!(DoseAttr::from_indexed_name("F0"), None);
         assert_eq!(DoseAttr::from_indexed_name("D0"), None);
         assert_eq!(DoseAttr::from_indexed_name("D"), None);
+        assert_eq!(DoseAttr::from_indexed_name("R0"), None);
+        assert_eq!(DoseAttr::from_indexed_name("R"), None);
 
         // Must not capture canonical PK names, the [scaling] `S{n}` names, or
-        // non-numeric suffixes — including `D`-prefixed words (`delta`, `decay`).
+        // non-numeric suffixes — including `D`/`R`-prefixed words (`delta`,
+        // `rate`, `RUV`, `R2D2`).
         for n in [
             "CL", "V1", "V2", "Q2", "Q3", "KA", "S1", "S2", "f_bio", "rate", "delta", "decay",
+            "RUV", "R2D2",
         ] {
             assert_eq!(DoseAttr::from_indexed_name(n), None, "{n} must not match");
         }
 
-        // Modeled *rate* R{n} (RATE=-1) is still reserved for #324 Phase B — its
-        // `R` prefix collides with ODE rate constants, so it is not recognised.
-        assert_eq!(DoseAttr::from_indexed_name("R1"), None);
-
         // An all-digit suffix that overflows usize fails to parse -> not an
         // attribute (exercises the parse-error guard, not just the success path).
         assert_eq!(
-            DoseAttr::from_indexed_name(&format!("F{}", "9".repeat(40))),
+            DoseAttr::from_indexed_name(&format!("R{}", "9".repeat(40))),
             None
         );
     }
@@ -4824,7 +4987,7 @@ mod tests {
     #[test]
     fn dose_event_resolve_rate_clamps_nonpositive_duration() {
         // A transient D <= 0 (or NaN) mid-search clamps to DURATION_FLOOR so
-        // rate = amt / D stays finite (mirrors PreparedInputRate::MIN_MTT).
+        // rate = amt / D stays finite (mirrors PreparedInputRate::MIN_PARAM).
         let mut map = DoseAttrMap::default();
         map.insert(DoseAttr::Duration, 1, 9);
         let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
@@ -4839,8 +5002,56 @@ mod tests {
     }
 
     #[test]
+    fn dose_event_resolve_rate_modeled_rate_matches_explicit_infusion() {
+        // RATE=-1 with R{1} in slot 9: a 100-unit dose at R = 20 must resolve to
+        // the same (rate, duration) as an explicit RATE = 20 infusion (the
+        // #324 invariant, mirror of the modeled-duration case).
+        let mut map = DoseAttrMap::default();
+        map.insert(DoseAttr::Rate, 1, 9);
+        let mut params = [0.0; MAX_PK_PARAMS];
+        params[9] = 20.0; // R1
+
+        let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledRate);
+        assert!(
+            modeled.is_infusion(),
+            "modeled-rate dose is an infusion pre-resolve"
+        );
+        let resolved = modeled.resolve_rate(&map, &params);
+
+        assert_eq!(resolved.rate_mode, RateMode::Fixed);
+        assert_eq!(resolved.rate, 20.0);
+        // amt / rate = 100 / 20; bit-equal to the hand-written explicit infusion.
+        assert_eq!(resolved.duration, 5.0);
+        let explicit = DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0);
+        assert_eq!(resolved.rate, explicit.rate);
+        assert_eq!(resolved.duration, explicit.duration);
+        assert_eq!(resolved.cmt, 1);
+        assert_eq!(resolved.amt, 100.0);
+    }
+
+    #[test]
+    fn dose_event_resolve_rate_clamps_nonpositive_rate() {
+        // A transient R <= 0 (or NaN) mid-search clamps to RATE_FLOOR so the
+        // implied duration = amt / R stays finite (mirror of the duration clamp).
+        let mut map = DoseAttrMap::default();
+        map.insert(DoseAttr::Rate, 1, 9);
+        let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledRate);
+
+        for bad in [0.0, -3.0, f64::NAN] {
+            let mut params = [0.0; MAX_PK_PARAMS];
+            params[9] = bad;
+            let r = modeled.resolve_rate(&map, &params);
+            assert_eq!(r.rate, DoseEvent::RATE_FLOOR, "clamp at floor");
+            assert!(
+                r.duration.is_finite() && r.duration > 0.0,
+                "duration finite"
+            );
+        }
+    }
+
+    #[test]
     fn clamp_above_floor_passes_through_or_clamps() {
-        // The shared clamp behind DURATION_FLOOR / MIN_MTT: > floor passes through,
+        // The shared clamp behind DURATION_FLOOR / MIN_PARAM: > floor passes through,
         // <= floor (and NaN — every `>` is false for NaN) returns the floor.
         let floor = 1e-8;
         assert_eq!(clamp_above_floor(5.0, floor), 5.0, "above floor passes");
@@ -4907,6 +5118,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn impmap_proposal_df_default_is_finite_t() {
+        // IMPMAP defaults to a Student-t proposal (df = 4), not a Gaussian: the
+        // MVN tails are too light for weakly-identified posteriors and bias the
+        // M-step moments (absorption-param drift, #411). Do not revert to ∞
+        // without re-checking that regression.
+        let opts = FitOptions::default();
+        assert_eq!(opts.impmap_proposal_df, 4.0);
+        assert!(opts.impmap_proposal_df.is_finite());
+    }
+
     // ── small pure helpers ───────────────────────────────────────────────────
 
     /// Bare subject with no doses/observations; tests mutate the fields they
@@ -4939,12 +5161,14 @@ mod tests {
     }
 
     #[test]
-    fn subject_has_bloq_reflects_cens_flags() {
+    fn subject_has_censored_observation_reflects_cens_flags() {
         let mut s = bare_subject("1");
         s.cens = vec![0, 0];
-        assert!(!s.has_bloq());
+        assert!(!s.has_censored_observation());
         s.cens = vec![0, 1];
-        assert!(s.has_bloq());
+        assert!(s.has_censored_observation());
+        s.cens = vec![-1, 0];
+        assert!(s.has_censored_observation());
     }
 
     #[test]

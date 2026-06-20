@@ -293,6 +293,11 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- Bumped `nalgebra` to 0.35 (from 0.34). The `argmin-math` dependency now uses
+  its `vec` feature instead of `nalgebra_latest`, since the argmin trust-region
+  path operates on `Vec` params and never on `nalgebra` types — this avoids
+  pulling a second, conflicting `nalgebra` version into the graph. Downstream
+  Rust consumers (e.g. `ferx-r`) must move to `nalgebra` 0.35 in lockstep.
 - IMP fit options now use the `imp_*` prefix (`imp_samples`,
   `imp_eval_only`, `imp_auto`, etc.) instead of the older `is_*` names. The
   old names are not retained as aliases because IMP support is still new.

@@ -31,8 +31,9 @@ use super::dual1::Dual1;
 use super::dual2::Dual2;
 use super::dual_mixed::DualMixed;
 use super::provider::{ObsGrad, ObsSens, SubjectSens};
-use crate::ode::predictions::OdeReadout;
+use crate::ode::predictions::{input_rate_consumes_cmt, OdeReadout, OdeSpec};
 use crate::ode::solver::solve_ode_g;
+use crate::pk::absorption::PreparedInputRate;
 use crate::types::{CompiledModel, ScalingSpec, Subject, PK_IDX_F, PK_IDX_LAGTIME};
 use std::cell::RefCell;
 
@@ -86,7 +87,14 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if !readout_ok {
         return false;
     }
-    if !ode.input_rate.is_empty() || !ode.diffusion_var.is_empty() {
+    if !ode.diffusion_var.is_empty() {
+        return false;
+    }
+    // Built-in absorption input-rate forcing is evaluated over Dual2 only for
+    // kinds lifted to PkNum (#430: inverse-Gaussian). Other kinds — transit
+    // until its `ln_gamma` dual rule, Weibull until Phase 2 — keep the FD
+    // fallback, so a model using one is not "supported" here.
+    if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
         return false;
     }
     if model.n_kappa != 0 {
@@ -204,6 +212,12 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };
+    // Built-in absorption input-rate forcing (igd, #430): the TV-cov event-driven
+    // walk (`integrate_tvcov_g`) does not carry the `R_in` forcing, so a TV-cov igd
+    // model must route to the static / FD path instead of silently dropping it.
+    if !ode.input_rate.is_empty() {
+        return false;
+    }
     // The bolus walk seeds compartments at zero; `init(...)` needs the seeded
     // initial-state machinery the static path uses, so route those to FD.
     if ode.init_fn.is_some() {
@@ -262,6 +276,14 @@ pub fn ode_subject_sensitivities(
     // evaluated once and threaded into the drivers, so neither recomputes them.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
     if pk.values[PK_IDX_LAGTIME].abs() > 1e-12 {
+        return None;
+    }
+    // Built-in absorption forcing + EVID 3/4 resets: the f64 path turns off pre-reset
+    // dose tails via a `reset_floor`; rather than replicate that subtle bookkeeping in
+    // the dual loop (slice 1 of #430), keep reset+absorption subjects on the FD
+    // fallback. Non-absorption reset subjects are unaffected and still served here.
+    let ode = model.ode_spec.as_ref()?;
+    if !ode.input_rate.is_empty() && !subject.reset_times.is_empty() {
         return None;
     }
     // Individual-parameter η/θ derivatives (cheap: one dual eval, no integration).
@@ -768,12 +790,24 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
         .map(|d| d.time)
         .fold(f64::INFINITY, f64::min);
 
-    // Integrate the dual state through bolus + infusion events, capturing the full
-    // state at each observation time.
+    // Built-in absorption input-rate forcings (#430), parallel to `ode.input_rate`,
+    // built over the dual type `T` (so they thread through `Dual2`/`Dual1`/`DualMixed`
+    // alike). The gate (`ode_analytical_supported`) admits only kinds lifted to
+    // `PkNum`, so `prepare_dual` returns `Some` for each; `?` bails to FD otherwise.
+    let mut prepared_forcings: Vec<PreparedInputRate<T>> =
+        Vec::with_capacity(ode.input_rate.len());
+    for f in &ode.input_rate {
+        prepared_forcings.push(f.prepare_dual::<T>(&params_dual)?);
+    }
+
+    // Integrate the dual state through bolus + infusion + absorption-forcing events,
+    // capturing the full state at each observation time.
     let states = integrate_g::<T>(
         program,
         ode.n_states,
         subject,
+        ode,
+        &prepared_forcings,
         &params_dual,
         f_bio,
         init_state,
@@ -1500,10 +1534,13 @@ fn obs_time_matches(ot: f64, t: f64) -> bool {
 /// the full outer gradient (value + grad + Hessian), `Dual1<N>` for the light inner
 /// η-gradient (value + grad only) — issue #410.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn integrate_g<T: crate::sens::num::PkNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
     subject: &Subject,
+    ode: &OdeSpec,
+    prepared_forcings: &[PreparedInputRate<T>],
     params_dual: &[T],
     f_bio: T,
     init_state: &[T],
@@ -1583,8 +1620,15 @@ fn integrate_g<T: crate::sens::num::PkNum>(
 
         // Apply bolus doses (non-infusions) at t_start: u[cmt] += F·amt. CMT is
         // 1-based; a malformed `CMT=0` must not silently dose compartment 0 (#449 #8).
+        // A compartment fed by a built-in absorption input rate is skipped here — the
+        // dose feeds R_in (the forcing in the RHS below), not a bolus (#430, mirroring
+        // production's `input_rate_consumes_cmt` routing).
         for dose in &subject.doses {
-            if !dose.is_infusion() && (dose.time - t_start).abs() < 1e-12 && dose.cmt >= 1 {
+            if !dose.is_infusion()
+                && (dose.time - t_start).abs() < 1e-12
+                && dose.cmt >= 1
+                && !input_rate_consumes_cmt(ode, dose.cmt)
+            {
                 let cmt_idx = dose.cmt - 1;
                 if cmt_idx < n_states {
                     u[cmt_idx] = u[cmt_idx] + f_bio * T::from_f64(dose.amt);
@@ -1652,6 +1696,30 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 if cmt < du.len() {
                     du[cmt] = du[cmt] + f_bio * T::from_f64(rate);
                 }
+            }
+            // Built-in absorption input-rate forcing R_in(tad), summed over the
+            // doses feeding each forcing's compartment — the Dual2 analogue of
+            // `add_prepared_input_rate_forcing` (#430). Lagtime is excluded from
+            // this provider, so tad = t − dose.time is parameter-independent (a
+            // constant dual); only the prepared constants and F·amt carry
+            // derivatives. Reset subjects are excluded (FD fallback), so there is
+            // no `reset_floor` to apply here.
+            for (forcing, prep) in ode.input_rate.iter().zip(prepared_forcings) {
+                if forcing.cmt >= du.len() {
+                    continue;
+                }
+                let mut acc = T::from_f64(0.0);
+                for d in &subject.doses {
+                    if d.cmt.saturating_sub(1) != forcing.cmt {
+                        continue;
+                    }
+                    let tad_f = t - d.time;
+                    if tad_f <= 0.0 {
+                        continue;
+                    }
+                    acc = acc + prep.rate(T::from_f64(tad_f), f_bio * T::from_f64(d.amt));
+                }
+                du[forcing.cmt] = du[forcing.cmt] + acc;
             }
         };
 
@@ -2788,5 +2856,123 @@ mod tests {
         inf.doses[0].rate = inf.doses[0].amt;
         assert!(crate::ode::predictions::is_real_infusion(&inf.doses[0]));
         assert!(!ode_tvcov_supported(&model, &inf));
+    }
+
+    // ---- #430 slice 1: built-in inverse-Gaussian absorption forcing over Dual2 ----
+
+    // 1-cpt oral disposition with Freijer & Post inverse-Gaussian absorption via
+    // the built-in `igd()` input rate (mirrors examples/igd_inverse_gaussian.ferx).
+    // MAT/CV2 are θ-only and appear *only* inside `igd()`, so `∂f/∂(TVMAT,TVCV2)`
+    // flows entirely through the forcing — the parity check fails if the Dual2
+    // forcing is wrong. Tight ODE tolerances so analytic ≡ FD is clean.
+    const IGD_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0,  0.1, 100.0)
+  theta TVV(50.0,  5.0, 500.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.3, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  MAT = TVMAT
+  CV2 = TVCV2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    // Same disposition shape but with a `transit()` forcing — *not* lifted to
+    // Dual2 in slice 1, so it must stay on the FD fallback.
+    const TRANSIT_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.1, 20.0)
+  theta TVKA(1.0, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  MTT = TVMTT
+  N   = TVN
+  KA  = TVKA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = transit(n=N, mtt=MTT) - KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// The kind gate: only inverse-Gaussian is lifted to Dual2 in slice 1 of
+    /// #430; transit (and, later, Weibull) stay on the FD fallback.
+    #[test]
+    fn input_rate_kind_supported_over_dual_gates_kinds() {
+        use crate::pk::absorption::InputRateKind;
+        assert!(InputRateKind::InverseGaussian.supported_over_dual());
+        assert!(!InputRateKind::Transit.supported_over_dual());
+    }
+
+    /// With the IG forcing lifted to Dual2, an `igd()` model is served by the
+    /// analytic provider, and its `f`/`∂f/∂η`/`∂f/∂θ` match the production
+    /// predictor + central FD — including `∂f/∂(TVMAT,TVCV2)`, which flow only
+    /// through the forcing.
+    #[test]
+    fn ode_provider_igd_absorption_matches_production() {
+        let model = parse_model_string(IGD_ODE).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "igd() model should be supported once the IG forcing is lifted to Dual2"
+        );
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = vec![5.0, 50.0, 2.0, 0.3];
+        let eta = vec![0.1, -0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+    }
+
+    /// Slice 1 lifts only IG: a `transit()` model is still *not* served by the
+    /// analytic provider (it differentiates by FD until transit's `ln_gamma`
+    /// Dual2 rule lands in slice 2).
+    #[test]
+    fn ode_provider_transit_absorption_stays_on_fd_fallback() {
+        let model = parse_model_string(TRANSIT_ODE).expect("parse");
+        assert!(
+            !ode_analytical_supported(&model),
+            "transit() must stay on the FD fallback in slice 1 of #430"
+        );
+    }
+
+    /// Built-in absorption + an EVID 3/4 reset is kept on the FD fallback in
+    /// slice 1: the dual loop doesn't yet apply the `reset_floor` that turns off
+    /// pre-reset dose tails, so `ode_subject_sensitivities` declines the subject.
+    #[test]
+    fn ode_provider_igd_with_reset_falls_back_to_fd() {
+        let model = parse_model_string(IGD_ODE).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 11.0, 13.0, 16.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.reset_times = vec![10.0];
+        assert!(
+            ode_subject_sensitivities(&model, &subject, &[5.0, 50.0, 2.0, 0.3], &[0.1, -0.05])
+                .is_none(),
+            "IG + reset must fall back to FD in slice 1 of #430"
+        );
     }
 }

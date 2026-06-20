@@ -78,6 +78,14 @@ section of the SDLC for the versioning policy).
   gradient differentiates the scaled prediction `f / scale` exactly (quotient
   rule) instead of falling back to finite differences. Validated against finite
   differences of the production predictor and against a NONMEM reference (#367).
+- **Analytic sensitivities for inverse-Gaussian (`igd()`) absorption** on ODE
+  models: the built-in input-rate forcing is now evaluated over `Dual2` by the
+  analytic ODE sensitivity provider, so an `igd()` model drives exact FOCE/FOCEI/
+  Bayes gradients instead of falling back to finite differences (estimates
+  unchanged; gradients exact and cheaper). The forcing was lifted to a
+  `PkNum`-generic form; transit (`transit()`) still uses FD pending its own
+  `ln_gamma` `Dual2` rule. Validated by an analytic≡central-FD gradient parity
+  test in the default build (#430).
 
 ### Changed
 - **Documentation now builds as a Quarto website** using the shared ferx site

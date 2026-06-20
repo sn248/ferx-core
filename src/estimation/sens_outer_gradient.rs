@@ -1841,6 +1841,26 @@ mod tests {
         assert!(subject_eta_dx(&model, &subject, &template, &x, &eta_hat).is_none());
     }
 
+    /// `sigma_fd_step` keeps the central-difference minus side `σ − h` strictly
+    /// positive: an ordinary σ uses the full `1e-6·(1+|σ|)` step, but a σ at/below
+    /// that step shrinks to `0.5·σ` so the minus evaluation never underflows the
+    /// `variance_at` floor (PR #381 review #6).
+    #[test]
+    fn sigma_fd_step_keeps_minus_side_positive() {
+        // Ordinary σ: unchanged full step (h ≪ σ).
+        let sig = 0.2;
+        let h = sigma_fd_step(sig);
+        assert!((h - 1e-6 * (1.0 + sig)).abs() < 1e-18);
+        assert!(sig - h > 0.0);
+        // Near-zero σ: step shrinks to 0.5·σ, minus side stays positive.
+        let tiny = 5e-7;
+        let h_tiny = sigma_fd_step(tiny);
+        assert_eq!(h_tiny, 0.5 * tiny);
+        assert!(tiny - h_tiny > 0.0);
+        // σ = 0 leaves the base step (degenerate; no positive side to protect).
+        assert_eq!(sigma_fd_step(0.0), 1e-6);
+    }
+
     /// Precisely locate η̂ via analytic Newton on the inner objective (exact
     /// gradient ½Σαⱼaⱼ + Ω⁻¹η and true Hessian H from the provider), so the
     /// marginal-NLL finite difference is not contaminated by inner-solver

@@ -1448,6 +1448,16 @@ mod tests {
                 model: PkModel::ThreeCptOral,
                 dose: DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             },
+            // Steady-state doses exercise the 3-cpt `equilibrate_ss_g` per-event
+            // equilibration and the SS branches of the disposition/oral propagators.
+            Case {
+                model: PkModel::ThreeCptIv,
+                dose: DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0),
+            },
+            Case {
+                model: PkModel::ThreeCptOral,
+                dose: DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0),
+            },
         ];
         for (ci, c) in cases.iter().enumerate() {
             let subj = make_subject(vec![c.dose.clone()], obs.clone());

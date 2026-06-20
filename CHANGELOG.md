@@ -459,6 +459,11 @@ section of the SDLC for the versioning policy).
   warfarin BLOQ, FOCE TVKA ≈ 0.71 vs FOCEI ≈ 0.81, each matching the corresponding
   NONMEM `METHOD=1 LAPLACE` (with/without INTER) fit. M3 fits that relied on the
   old auto-promotion should set `method = focei` explicitly (#367).
+- Bumped `nalgebra` to 0.35 (from 0.34). The `argmin-math` dependency now uses
+  its `vec` feature instead of `nalgebra_latest`, since the argmin trust-region
+  path operates on `Vec` params and never on `nalgebra` types — this avoids
+  pulling a second, conflicting `nalgebra` version into the graph. Downstream
+  Rust consumers (e.g. `ferx-r`) must move to `nalgebra` 0.35 in lockstep.
 - IMP fit options now use the `imp_*` prefix (`imp_samples`,
   `imp_eval_only`, `imp_auto`, etc.) instead of the older `is_*` names. The
   old names are not retained as aliases because IMP support is still new.

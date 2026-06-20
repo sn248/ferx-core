@@ -38,6 +38,7 @@ use crate::estimation::parameterization::{packed_fixed_mask, theta_packs_log, un
 use crate::sens::provider::{subject_sensitivities, ObsSens, SubjectSens};
 use crate::types::{CompiledModel, ModelParameters, Population, Subject};
 use nalgebra::{DMatrix, DVector};
+use rayon::prelude::*;
 
 /// Per-observation error-model scalars used throughout the assembly.
 struct ErrTerms {
@@ -159,6 +160,15 @@ fn prepare_stacked(
     omega_inv: DMatrix<f64>,
 ) -> Option<Prep> {
     let n_obs = subject.observations.len();
+    // A dosing-only subject (dose rows, no DV) contributes no data term to the
+    // marginal gradient; with no observations `H̃ = Ω⁻¹` is still PD so the
+    // FOCEI blocks (`theta_block`, `mixed_eta_theta`) would proceed and then
+    // index `obs[0]`, panicking and aborting the fit. Decline like the FOCE
+    // siblings (`subject_packed_gradient_foce`) so the caller falls back to FD,
+    // which handles the empty subject correctly (PR #381 review #1).
+    if n_obs == 0 {
+        return None;
+    }
     if sens.obs.len() != n_obs {
         return None;
     }
@@ -751,9 +761,20 @@ pub fn population_gradient_sens(
     eta_hats: &[DVector<f64>],
 ) -> Option<Vec<f64>> {
     let n = x.len();
+    // Per-subject gradients in parallel (the FD path this replaces was already
+    // subject-parallel; PR #381 review #7). `collect::<Option<_>>` short-circuits
+    // to `None` if any subject is out of analytic scope, and preserves subject
+    // order so the accumulation below is bit-reproducible across runs.
+    let per_subject: Vec<Vec<f64>> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            subject_packed_gradient(model, subject, template, x, eta_hats[i].as_slice())
+        })
+        .collect::<Option<Vec<_>>>()?;
     let mut grad = vec![0.0f64; n];
-    for (i, subject) in population.subjects.iter().enumerate() {
-        let gi = subject_packed_gradient(model, subject, template, x, eta_hats[i].as_slice())?;
+    for gi in &per_subject {
         for k in 0..n {
             grad[k] += 2.0 * gi[k];
         }
@@ -780,13 +801,21 @@ pub fn population_gradient_sens_iov(
     kappas: &[Vec<DVector<f64>>],
 ) -> Option<Vec<f64>> {
     let n = x.len();
+    // Subject-parallel; see `population_gradient_sens` (PR #381 review #7).
+    let per_subject: Vec<Vec<f64>> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let mut stacked: Vec<f64> = eta_hats[i].iter().copied().collect();
+            for kap in &kappas[i] {
+                stacked.extend(kap.iter().copied());
+            }
+            subject_packed_gradient_iov(model, subject, template, x, &stacked)
+        })
+        .collect::<Option<Vec<_>>>()?;
     let mut grad = vec![0.0f64; n];
-    for (i, subject) in population.subjects.iter().enumerate() {
-        let mut stacked: Vec<f64> = eta_hats[i].iter().copied().collect();
-        for kap in &kappas[i] {
-            stacked.extend(kap.iter().copied());
-        }
-        let gi = subject_packed_gradient_iov(model, subject, template, x, &stacked)?;
+    for gi in &per_subject {
         for k in 0..n {
             grad[k] += 2.0 * gi[k];
         }
@@ -1064,9 +1093,17 @@ pub fn population_gradient_sens_foce(
     eta_hats: &[DVector<f64>],
 ) -> Option<Vec<f64>> {
     let n = x.len();
+    // Subject-parallel; see `population_gradient_sens` (PR #381 review #7).
+    let per_subject: Vec<Vec<f64>> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            subject_packed_gradient_foce(model, subject, template, x, eta_hats[i].as_slice())
+        })
+        .collect::<Option<Vec<_>>>()?;
     let mut grad = vec![0.0f64; n];
-    for (i, subject) in population.subjects.iter().enumerate() {
-        let gi = subject_packed_gradient_foce(model, subject, template, x, eta_hats[i].as_slice())?;
+    for gi in &per_subject {
         for k in 0..n {
             grad[k] += 2.0 * gi[k];
         }
@@ -1436,13 +1473,21 @@ pub fn population_gradient_sens_foce_iov(
     kappas: &[Vec<DVector<f64>>],
 ) -> Option<Vec<f64>> {
     let n = x.len();
+    // Subject-parallel; see `population_gradient_sens` (PR #381 review #7).
+    let per_subject: Vec<Vec<f64>> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let mut stacked: Vec<f64> = eta_hats[i].iter().copied().collect();
+            for kap in &kappas[i] {
+                stacked.extend(kap.iter().copied());
+            }
+            subject_packed_gradient_foce_iov(model, subject, template, x, &stacked)
+        })
+        .collect::<Option<Vec<_>>>()?;
     let mut grad = vec![0.0f64; n];
-    for (i, subject) in population.subjects.iter().enumerate() {
-        let mut stacked: Vec<f64> = eta_hats[i].iter().copied().collect();
-        for kap in &kappas[i] {
-            stacked.extend(kap.iter().copied());
-        }
-        let gi = subject_packed_gradient_foce_iov(model, subject, template, x, &stacked)?;
+    for gi in &per_subject {
         for kk in 0..n {
             grad[kk] += 2.0 * gi[kk];
         }
@@ -1645,6 +1690,7 @@ fn mixed_eta_theta(
 mod tests {
     use super::*;
     use crate::estimation::inner_optimizer::find_ebe;
+    use crate::estimation::parameterization::pack_params;
     use crate::parser::model_parser::parse_model_string;
     use crate::stats::likelihood::{foce_subject_nll, foce_subject_nll_interaction};
     use crate::types::{DoseEvent, OmegaMatrix, Subject};
@@ -1755,6 +1801,29 @@ mod tests {
         // Perturb by a fixed multiplicative factor so ε ≠ 0.
         subject.observations = preds.iter().map(|p| p * 0.85).collect();
         subject
+    }
+
+    /// A dosing-only subject (dose rows, no DV) must not panic the FOCEI analytic
+    /// gradient. All three entry points decline (→ FD fallback) rather than
+    /// indexing `obs[0]` on an empty observation list (PR #381 review #1).
+    #[test]
+    fn zero_observation_subject_declines_without_panic() {
+        let model = parse_model_string(TWOCPT).expect("parse");
+        let template = model.default_params.clone();
+        let theta = template.theta.clone();
+        let mut subject = subject_with_obs(&model, &theta, &[2.0]); // build then empty out
+        subject.obs_times.clear();
+        subject.observations.clear();
+        subject.obs_cmts.clear();
+        subject.cens.clear();
+        subject.occasions.clear();
+        assert!(subject.observations.is_empty());
+
+        let x = pack_params(&template);
+        let eta_hat = vec![0.0; model.n_eta];
+        assert!(subject_packed_gradient(&model, &subject, &template, &x, &eta_hat).is_none());
+        assert!(subject_theta_gradient(&model, &subject, &template, &eta_hat).is_none());
+        assert!(subject_eta_dx(&model, &subject, &template, &x, &eta_hat).is_none());
     }
 
     /// Precisely locate η̂ via analytic Newton on the inner objective (exact

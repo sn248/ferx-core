@@ -142,7 +142,17 @@ fn ss_coeff_g<T: PkNum>(lambda: T, ii: f64) -> T {
 
 /// 2-cpt IV bolus at steady state.
 pub fn two_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v1: T, q: T, v2: T) -> T {
-    if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || ii <= 0.0 {
+    // `q < 0` (e.g. a step or additive IIV driving Q negative) makes a disposition
+    // eigenvalue negative, so the SS geometric `1/(1−e^{−λΙΙ})` flips sign and the
+    // closed form returns a non-physical (or NaN, via a negative discriminant)
+    // concentration. The production SS path returned 0 here; mirror it (PR #381 #3).
+    if t.val() < 0.0
+        || v1.val() <= 0.0
+        || cl.val() <= 0.0
+        || v2.val() <= 0.0
+        || q.val() < 0.0
+        || ii <= 0.0
+    {
         return T::from_f64(0.0);
     }
     let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
@@ -179,6 +189,7 @@ pub fn two_cpt_oral_ss_g<T: PkNum>(
         || cl.val() <= 0.0
         || ka.val() <= 0.0
         || v2.val() <= 0.0
+        || q.val() < 0.0
         || ii <= 0.0
     {
         return T::from_f64(0.0);
@@ -246,7 +257,14 @@ pub fn two_cpt_infusion_ss_g<T: PkNum>(
     q: T,
     v2: T,
 ) -> T {
-    if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 || v2.val() <= 0.0 || ii <= 0.0 {
+    // See `two_cpt_iv_bolus_ss_g` for why SS guards `q < 0` (PR #381 #3).
+    if t.val() < 0.0
+        || v1.val() <= 0.0
+        || cl.val() <= 0.0
+        || v2.val() <= 0.0
+        || q.val() < 0.0
+        || ii <= 0.0
+    {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
@@ -354,6 +372,24 @@ pub fn two_cpt_conc_g<T: PkNum>(
 mod tests {
     use super::*;
     use crate::sens::dual2::Dual2;
+
+    /// A negative inter-compartmental clearance `Q` (reachable via a step or
+    /// additive IIV) must yield 0 from the SS forms — not a non-physical or NaN
+    /// concentration — matching the production SS guard (PR #381 review #3).
+    #[test]
+    fn ss_forms_return_zero_and_finite_for_negative_q() {
+        let (cl, v1, v2, ka) = (1.2f64, 12.0, 30.0, 1.5);
+        let q = -0.5f64; // negative inter-compartmental clearance
+        let ii = 12.0;
+        let bolus = two_cpt_iv_bolus_ss_g::<f64>(100.0, 2.0, ii, cl, v1, q, v2);
+        let oral = two_cpt_oral_ss_g::<f64>(100.0, 2.0, ii, cl, v1, q, v2, ka, 1.0);
+        let inf = two_cpt_infusion_ss_g::<f64>(50.0, 2.0, 100.0, 2.0, ii, cl, v1, q, v2);
+        for (name, v) in [("bolus", bolus), ("oral", oral), ("infusion", inf)] {
+            assert!(v.is_finite() && v == 0.0, "{name} SS with q<0 = {v}");
+        }
+        // Sanity: a physical q>0 still produces a positive SS concentration.
+        assert!(two_cpt_iv_bolus_ss_g::<f64>(100.0, 2.0, ii, cl, v1, 2.0, v2) > 0.0);
+    }
 
     /// Coverage + correctness for `two_cpt_conc_g` across every dose kind. Reached
     /// only via the `Dual2` provider (the f64 production walk dispatches through

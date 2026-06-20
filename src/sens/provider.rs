@@ -1378,7 +1378,11 @@ fn run_obs_grad<const N: usize>(
 
         let mut fd = Dual1::<N>::constant(0.0);
         for dose in &subject.doses {
-            if dose.time < reset_floor {
+            // Exclude doses washed out by a reset — keyed on the *lagged arrival*
+            // `dose.time + lag`, not the record time: a dose recorded before a
+            // reset but arriving after it (via lagtime) contributes to the new
+            // segment, exactly as the event-driven walk applies it (PR #381 #2).
+            if dose.time + lag_val < reset_floor {
                 continue;
             }
             let Some(elapsed) = lagged_elapsed(dose, t_obs, lag_val, lag_d) else {
@@ -1907,7 +1911,8 @@ fn run_obs<const N: usize>(
             // carries the lagtime shift and the SS pre-arrival tail wrap.
             let mut fd = Dual2::<N>::constant(0.0);
             for dose in &subject.doses {
-                if dose.time < reset_floor {
+                // Lagged-arrival reset exclusion — see the value path above (#2).
+                if dose.time + lag_val < reset_floor {
                     continue;
                 }
                 let Some(elapsed) = lagged_elapsed(dose, t_obs, lag_val, lag_d) else {
@@ -3293,6 +3298,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Reset + lagtime: a dose recorded *before* a reset but *arriving after* it
+    /// (via lagtime) must contribute to the post-reset segment, exactly as the
+    /// production event-driven walk applies it. The reset exclusion keys on the
+    /// lagged arrival `dose.time + lag`, not the record time (PR #381 review #2).
+    /// Dose at t=4 with lag≈0.75 arrives ≈4.75, past the reset at t=4.5; the
+    /// earlier t=0 dose (arrives ≈0.75) is correctly washed out. Validated against
+    /// `compute_predictions_with_tv` via `check_full_provider_vs_fd` (value 1e-9).
+    #[test]
+    fn provider_reset_with_lagged_post_reset_dose_matches_production() {
+        let m = parse_model_string(ONECPT_ORAL_LAG).expect("parse 1cpt oral lag");
+        let s = subject_with_doses_and_resets(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(4.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &[5.0, 6.0, 8.0, 12.0],
+            vec![4.5],
+        );
+        // eta_lag = 0 → LAGTIME = TVLAG = 0.75; arrival of the t=4 dose is 4.75 > 4.5.
+        let theta = vec![0.2, 10.0, 1.5, 0.75];
+        let eta = vec![0.1, -0.05, 0.2, 0.0];
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
     }
 
     /// `[scaling] obs_scale = 1000 / V` with `V = TVV·exp(ETA_V)`: an

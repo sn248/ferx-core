@@ -330,9 +330,9 @@ mod tests {
 
     /// Run a fit and skip the test body with a logged message when the
     /// covariance step doesn't converge. SIR requires a non-None
-    /// covariance matrix; without autodiff (`--features ci`) the warfarin
-    /// FD cov step is flaky. This helper centralises the skip pattern so
-    /// the SIR happy-path tests don't fail spuriously on no-autodiff CI.
+    /// covariance matrix; the warfarin FD cov step is flaky. This helper
+    /// centralises the skip pattern so the SIR happy-path tests don't fail
+    /// spuriously.
     fn fit_with_cov_or_skip(
         model_path: &str,
         data_path: &str,
@@ -343,7 +343,7 @@ mod tests {
         if fit.covariance_matrix.is_none() {
             eprintln!(
                 "[skip] covariance step did not produce a matrix (likely FD \
-                 instability without autodiff); skipping SIR happy-path assertions"
+                 instability); skipping SIR happy-path assertions"
             );
             return None;
         }

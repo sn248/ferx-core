@@ -17,13 +17,12 @@
 //! today via direct construction in Rust, which is what the integration
 //! tests exercise.
 //!
-//! ## AD safety
+//! ## Differentiability
 //!
 //! All activation functions and their derivatives use explicit `if`/`else`
-//! comparisons instead of `f64::max`/`f64::min`. This keeps the module
-//! reachable from `#[autodiff_forward]` / `#[autodiff_reverse]` code paths
-//! in Phase A M2 (mixed-effects DCM via FOCEI). See `CLAUDE.md` →
-//! "Autodiff-Safe Code in `ad/` Module" for the underlying constraint.
+//! comparisons instead of `f64::max`/`f64::min`, so a future generic
+//! `PkNum`/`Dual2` instantiation (mixed-effects DCM via FOCEI, Phase A M2)
+//! differentiates cleanly without branch-on-`max` ambiguity.
 
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;

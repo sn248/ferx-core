@@ -32,8 +32,7 @@ surface is:
 
 - **Native / FFI code** — the Rust engine is consumed from R (ferx-r) through
   the extendr FFI boundary; memory-safety bugs there can crash the host process.
-- **Dependencies** — Rust crates (monitored by `cargo audit` and Dependabot) and
-  the Enzyme toolchain used for autodiff builds.
+- **Dependencies** — Rust crates (monitored by `cargo audit` and Dependabot).
 - **Untrusted input** — parsing `.ferx` model files and NONMEM-format CSV data.
 
 See the [Security & dependencies](https://ferx-nlme.github.io/ferx-core/development/sdlc.html#14-security--dependencies)

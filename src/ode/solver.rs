@@ -130,7 +130,7 @@ pub fn solve_ode(
     // the dense-Emax PKPD benchmark vs the true -1747 with the I-controller.
     // The pure I-controller below is memoryless and gives a clean FD signal.
     // Any future revisit should condition PI on a non-FD gradient route
-    // (analytical / sensitivity / autodiff).
+    // (analytical / analytic-sensitivity).
     const I_EXP: f64 = 1.0 / 5.0; // 0.20 — I-controller exponent for order p=5
 
     for _step in 0..opts.max_steps {

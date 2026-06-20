@@ -834,8 +834,8 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     let mut diags = Vec::new();
 
     // SDE ([diffusion]) is incompatible with SAEM, with the Gauss-Newton
-    // methods, and with the autodiff gradient path (EKF estimation requires
-    // FD-FOCE/FOCEI).
+    // methods, and with the analytic-sensitivity gradient path (EKF estimation
+    // requires FD-FOCE/FOCEI).
     if model.is_sde() {
         if chain.iter().any(|&m| m == EstimationMethod::Saem) {
             diags.push(
@@ -1403,7 +1403,7 @@ pub fn fit_from_files(
         sel_filter_fit.as_ref(),
     )?;
     model.bloq_method = opts.bloq_method;
-    // SDE models cannot use autodiff — force FD.
+    // SDE models have no analytic-sensitivity path — force FD.
     model.gradient_method =
         if model.is_sde() && opts.gradient_method != crate::types::GradientMethod::Fd {
             crate::types::GradientMethod::Fd
@@ -5173,7 +5173,7 @@ pub fn predict_survival(
 //  Each test builds a minimal warfarin-like 1-cpt IV model with a single kappa
 //  for CL, simulates a small population (4 subjects × 2 occasions × 3 obs),
 //  and verifies that `fit()` completes without panicking and returns meaningful
-//  IOV estimates.  Tests run under `--features ci` (no autodiff required).
+//  IOV estimates.  Tests run under `--features ci`.
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod iov_integration {

@@ -30,10 +30,9 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
-    # rust-toolchain.toml pins the custom `enzyme` channel, which this job
-    # never installs (only the build jobs set up Enzyme). Override it so the
-    # action's `cargo install cargo-audit` / `cargo audit` run on stable,
-    # which is preinstalled on ubuntu-latest. Audit doesn't need Enzyme.
+    # rust-toolchain.toml pins nightly, but cargo-audit doesn't need it.
+    # Override to stable so the action's `cargo install cargo-audit` /
+    # `cargo audit` run on the stable toolchain preinstalled on ubuntu-latest.
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:

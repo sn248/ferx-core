@@ -6,11 +6,11 @@
 //! dose); per-dose contributions are superposed by the caller.
 //!
 //! These are the inherently-numerical absorption models that feed an explicit
-//! ODE disposition (see `plans/absorption-models.md`). They are AD/Enzyme-safe
-//! (only `+ − * /`, `.ln()`, `.exp()`; no `f64::max`/`min` intrinsics — see
-//! CLAUDE.md). Written for `f64` for now; a shared numeric trait for the
-//! `Dual`/Enzyme paths follows when these are wired into the autodiff ODE
-//! gradient (the roadmap's escape hatch — duplicate-free generics later).
+//! ODE disposition (see `plans/absorption-models.md`). They are written with
+//! only `+ − * /`, `.ln()`, `.exp()` (no `f64::max`/`min`), so a future generic
+//! `PkNum`/`Dual2` version differentiates cleanly. Written for `f64` for now; a
+//! shared numeric-trait version follows when these are wired into the
+//! analytic-sensitivity ODE gradient (duplicate-free generics later).
 
 use crate::stats::special::ln_gamma;
 

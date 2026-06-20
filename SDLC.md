@@ -10,13 +10,13 @@
 | Current version | 0.1.0 (active development) |
 | Binary name | `ferx` |
 | Repository | GitHub (FeRx-NLME/ferx-core) |
-| Toolchain | Enzyme (custom Rust toolchain for automatic differentiation) |
+| Toolchain | Stock Rust nightly (pinned in `rust-toolchain.toml`) |
 
 ## 2. Development Environment Setup
 
 ### Prerequisites
 
-- Rust via the [Enzyme](https://enzyme.mit.edu/) toolchain (pinned in `rust-toolchain.toml`)
+- Stock Rust nightly (pinned in `rust-toolchain.toml`)
 - Standard system C linker
 
 ### Build commands
@@ -27,9 +27,6 @@ cargo build
 
 # Release build (with fat LTO)
 cargo build --release
-
-# Build with autodiff feature (default)
-cargo build --release --features autodiff
 
 # Compilation check (no artifact output)
 cargo check
@@ -85,8 +82,8 @@ cargo run --release -- examples/warfarin.ferx --simulate
 The project has 57 unit tests covering core computational modules. Tests use the `approx` crate for floating-point comparisons.
 
 ```bash
-# Run all unit tests (requires RUSTFLAGS for Enzyme autodiff)
-RUSTFLAGS="-Z autodiff=Enable" cargo test --lib
+# Run all unit tests
+cargo test --lib
 ```
 
 **Tested modules:**
@@ -176,7 +173,7 @@ A GitHub Actions CI pipeline runs on every push to `main` and on pull requests (
 | **Clippy** | `cargo clippy -- -D warnings` | Lint with warnings-as-errors |
 | **Format** | `cargo fmt -- --check` | Enforce consistent formatting |
 
-All jobs use the Enzyme Rust toolchain with `RUSTFLAGS="-Z autodiff=Enable"`.
+All jobs use the stock Rust nightly toolchain pinned in `rust-toolchain.toml`.
 
 ### Future CI additions
 
@@ -200,7 +197,7 @@ An R package (`ferx`) wraps the Rust engine via the [extendr](https://extendr.gi
 ### Future packaging considerations
 
 - Pre-built binaries for Linux, macOS, and Windows via GitHub Releases
-- Docker image for reproducible environments (especially for the Enzyme toolchain)
+- Docker image for reproducible environments
 - Homebrew formula or cargo-binstall support for easier installation
 
 ## 10. Security & Compliance
@@ -218,7 +215,7 @@ A license should be added to the repository root (`LICENSE` file) to clarify usa
 ### Contributing
 
 A `CONTRIBUTING.md` file should be created to document:
-- How to set up the development environment (Enzyme toolchain)
+- How to set up the development environment (stock Rust nightly)
 - Code style expectations
 - Pull request process
 - How to run validation models

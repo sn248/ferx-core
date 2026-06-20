@@ -86,10 +86,14 @@ fn focei_covariance_se_matches_nonmem_at_its_own_minimum() {
         result.omega[(2, 2)]
     );
 
-    assert!(result.covariance_matrix.is_some(), "covariance step must succeed");
+    assert!(
+        result.covariance_matrix.is_some(),
+        "covariance step must succeed"
+    );
     let se_theta = result.se_theta.as_ref().expect("theta SEs present");
     let se_sigma = result.se_sigma.as_ref().expect("sigma SEs present");
-    let omega_se = |i: usize| omega_se_at(&result.se_omega, 3, i, i).expect("omega diag SE present");
+    let omega_se =
+        |i: usize| omega_se_at(&result.se_omega, 3, i, i).expect("omega diag SE present");
 
     // NONMEM 7.5.1 FOCEI MATRIX=R SE row (.ext, ITER=-1000000001) at this minimum.
     // At the identical point ferx reproduces these to <1%; a 6% band absorbs any

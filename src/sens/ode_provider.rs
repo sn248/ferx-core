@@ -466,7 +466,10 @@ fn integrate_dual<const N: usize>(
         break_times.push(rt);
     }
     break_times.push(t_last);
-    break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // NaN-safe sort: a malformed dose/reset time (e.g. `duration = amt/rate = NaN`)
+    // must not panic on the `None` `partial_cmp` returns — mirrors the production
+    // f64 walk (`pk::event_driven`) (PR #381 review #13).
+    break_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
     // Reusable scratch for the RHS evaluation across all stages.
@@ -524,7 +527,7 @@ fn integrate_dual<const N: usize>(
         if saveat.last().map_or(true, |&l| (l - t_end).abs() > 1e-12) {
             saveat.push(t_end);
         }
-        saveat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        saveat.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
         // Infusions spanning this whole segment add a constant rate forcing

@@ -138,11 +138,13 @@ fn explicit_sens_disabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Which explicit-kernel model class serves a subject. A class covers a subset of
-/// dose kinds ([`ExKind::covers`]); a subject whose doses are *all* covered takes
-/// the explicit path, otherwise the whole subject falls back to `Dual2<N>` (the
-/// per-observation chain is identical either way — only `(f, ∂f/∂pk, ∂²f/∂pk²)`
-/// is sourced differently).
+/// Which explicit-kernel model class serves a subject. Every dose kind — bolus /
+/// infusion / oral and their steady-state variants — has a hand-written kernel,
+/// so the explicit path covers any in-scope subject; the genuinely unsupported SS
+/// edges (overlapping SS infusion, SS mixed with resets) are screened earlier in
+/// [`subject_sensitivities`] and never reach the kernels. The per-observation
+/// chain is identical to the `Dual2<N>` path — only `(f, ∂f/∂pk, ∂²f/∂pk²)` is
+/// sourced differently.
 #[derive(Clone, Copy)]
 enum ExKind {
     /// 1-cpt IV: bolus + infusion.
@@ -157,17 +159,6 @@ enum ExKind {
     ThreeCptIv,
     /// 3-cpt oral: first-order absorption + infusion-into-central.
     ThreeCptOral,
-}
-
-impl ExKind {
-    /// True when a hand-written kernel covers this dose. Every dose kind —
-    /// bolus / infusion / oral and their steady-state variants — now has an
-    /// explicit kernel, so this is unconditional; the genuinely unsupported SS
-    /// edges (overlapping SS infusion, SS mixed with resets) are screened earlier
-    /// in [`subject_sensitivities`] and never reach here.
-    fn covers(self, _dose: &DoseEvent) -> bool {
-        true
-    }
 }
 
 /// True when [`subject_sensitivities`] can serve this model: any analytical
@@ -1713,7 +1704,7 @@ fn subject_sensitivities_impl(
             PkModel::ThreeCptIv => ExKind::ThreeCptIv,
             PkModel::ThreeCptOral => ExKind::ThreeCptOral,
         };
-        Some(kind).filter(|kind| subject.doses.iter().all(|d| kind.covers(d)))
+        Some(kind)
     };
 
     // Dispatch on the differentiated-parameter count so the dual width is

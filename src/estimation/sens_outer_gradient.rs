@@ -423,6 +423,21 @@ pub fn subject_sigma_gradient(
     Some(sigma_block(&prep, model, subject, params, &sens))
 }
 
+/// Central-difference half-step for a σ finite difference that keeps the minus
+/// side `σ − h` strictly positive. The error models build the variance from `σ²`
+/// and `variance_at` floors it at `MIN_VARIANCE`, so once the minus-side variance
+/// underflows the floor (near a near-zero residual error) the central difference
+/// is corrupted; shrinking the step near `σ = 0` keeps `∂/∂σ` well-defined
+/// (PR #381 review #6). For an ordinary σ the `1e-6·(1+|σ|)` step is unchanged.
+fn sigma_fd_step(sigma_k: f64) -> f64 {
+    let h = 1e-6 * (1.0 + sigma_k.abs());
+    if sigma_k > 0.0 && h >= sigma_k {
+        0.5 * sigma_k
+    } else {
+        h
+    }
+}
+
 fn sigma_block(
     prep: &Prep,
     model: &CompiledModel,
@@ -436,7 +451,7 @@ fn sigma_block(
     let mut grad = vec![0.0f64; n_sigma];
 
     for k in 0..n_sigma {
-        let h = 1e-6 * (1.0 + sigma[k].abs());
+        let h = sigma_fd_step(sigma[k]);
         let mut sp = sigma.clone();
         sp[k] += h;
         let mut sm = sigma.clone();
@@ -1024,7 +1039,7 @@ pub fn subject_packed_gradient_foce(
     //   censored: h·(LLOQ−f̂)·∂R⁰/∂σ /(2w³).
     let sigma_start = omega_start + entries.len();
     for k in 0..n_sigma {
-        let hsig = 1e-6 * (1.0 + sigma[k].abs());
+        let hsig = sigma_fd_step(sigma[k]);
         let mut sp = sigma.clone();
         sp[k] += hsig;
         let mut sm = sigma.clone();
@@ -1243,7 +1258,7 @@ pub fn subject_eta_dx_iov(
     // σ coords (no M3 in IOV scope).
     let sigma = &params.sigma.values;
     for kk in 0..n_sigma {
-        let h = 1e-6 * (1.0 + sigma[kk].abs());
+        let h = sigma_fd_step(sigma[kk]);
         let mut sp = sigma.clone();
         sp[kk] += h;
         let mut sm = sigma.clone();
@@ -1406,7 +1421,7 @@ pub fn subject_packed_gradient_foce_iov(
 
     // σ (fixed η̂).
     for kk in 0..n_sigma {
-        let hsig = 1e-6 * (1.0 + sigma[kk].abs());
+        let hsig = sigma_fd_step(sigma[kk]);
         let mut sp = sigma.clone();
         sp[kk] += hsig;
         let mut sm = sigma.clone();
@@ -1559,7 +1574,7 @@ pub fn subject_eta_dx(
     let sigma_start = omega_start + entries.len();
     let sigma = &params.sigma.values;
     for k in 0..n_sigma {
-        let h = 1e-6 * (1.0 + sigma[k].abs());
+        let h = sigma_fd_step(sigma[k]);
         let mut sp = sigma.clone();
         sp[k] += h;
         let mut sm = sigma.clone();

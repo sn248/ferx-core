@@ -828,12 +828,11 @@ pub fn profile_report() {
     }
 }
 
-/// Whether the exact analytic η-gradient of the individual NLL
-/// ([`analytic_eta_nll_gradient`]) applies to this model/subject: the analytic
-/// sensitivity provider must serve it, and the likelihood must be one the closed
-/// form below covers — the Gaussian data term or the M3 censored term
-/// (`−logΦ((LLOQ−f)/√V)`), but not the SDE EKF or TTE terms.
-fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
+/// Model-level half of [`analytic_inner_grad_supported`]: every gate that does
+/// not depend on the subject. `build_info::gradient_method_inner` reports the
+/// inner route off **this same** predicate, so the reported `gradient_method_inner`
+/// cannot drift from what `find_ebe` actually runs (PR #381 review #9).
+pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool {
     // Escape hatch / A-B toggle: force the FD inner gradient everywhere.
     if std::env::var("FERX_NO_ANALYTIC_INNER")
         .map(|v| v == "1")
@@ -841,9 +840,7 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     {
         return false;
     }
-    // The user explicitly requested finite differences. `build_info` reports the
-    // inner route off this same predicate, so honouring it here keeps the option
-    // functional and the reported `gradient_method_inner` truthful.
+    // The user explicitly requested finite differences.
     if matches!(model.gradient_method, GradientMethod::Fd) {
         return false;
     }
@@ -877,11 +874,23 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     if model.residual_error_eta.is_some() {
         return false;
     }
+    crate::sens::provider::analytical_supported(model)
+}
+
+/// Whether the exact analytic η-gradient of the individual NLL
+/// ([`analytic_eta_nll_gradient`]) applies to this model/subject: the model must
+/// be in scope ([`analytic_inner_grad_supported_model`]) and the *subject* must
+/// not carry features the light inner provider can't serve (survival obs records,
+/// time-varying covariates).
+fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    if !analytic_inner_grad_supported_model(model) {
+        return false;
+    }
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
         return false;
     }
-    crate::sens::provider::analytical_supported(model) && !subject.has_tv_covariates()
+    !subject.has_tv_covariates()
 }
 
 /// Exact η-gradient of the individual NLL `½(η'Ω⁻¹η + ln|Ω| + Σ_j[ε_j²/v_j + ln v_j])`

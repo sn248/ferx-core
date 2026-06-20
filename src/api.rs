@@ -3379,6 +3379,7 @@ fn fit_inner(
         &crate::build_info::BUILD_INFO,
         final_method,
         options.optimizer,
+        model,
     );
 
     // Flush and close the trace file; capture path for FitResult.

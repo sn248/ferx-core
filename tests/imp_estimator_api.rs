@@ -18,7 +18,7 @@
 //! in `importance_sampling_api.rs`.
 
 use ferx_core::parser::model_parser::parse_model_file;
-use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
+use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
 use std::path::Path;
 
 fn warfarin() -> (
@@ -250,9 +250,14 @@ fn imp_estimator_rejects_invalid_proposal_df() {
 fn imp_estimator_refines_focei_on_warfarin() {
     let (model, population) = warfarin();
 
-    // Reference: FOCEI.
+    // Reference: FOCEI. Use the gradient outer optimizer (analytic Dual2
+    // gradient) rather than the derivative-free BOBYQA default: on the weakly
+    // identified KA direction BOBYQA stalls early and leaves ω²(KA) inflated
+    // (~0.46 vs NONMEM 0.34, see #423), which is not a faithful FOCEI anchor for
+    // the "IMP refines FOCEI" comparison below.
     let mut focei = FitOptions::default();
     focei.method = EstimationMethod::FoceI;
+    focei.optimizer = Optimizer::Lbfgs;
     focei.run_covariance_step = false;
     focei.outer_maxiter = 300;
     let r_focei = fit(&model, &population, &model.default_params, &focei)
@@ -260,6 +265,7 @@ fn imp_estimator_refines_focei_on_warfarin() {
 
     // FOCEI → estimating IMP.
     let mut imp = FitOptions::default();
+    imp.optimizer = Optimizer::Lbfgs; // FOCEI warm-start stage, same as the reference
     imp.run_covariance_step = false;
     imp.outer_maxiter = 300;
     imp.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp];

@@ -218,6 +218,14 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model))
 }
 
+/// Whether the light **ODE inner** η-gradient (`Dual1`) serves this model+subject:
+/// the master switch is armed and the subject is in the per-subject ODE scope
+/// ([`crate::sens::ode_provider::ode_subject_supported`]). Used by the inner loop
+/// to pick the analytic η-gradient over FD for in-scope ODE subjects (#410).
+pub(crate) fn ode_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    ODE_SENS_ENABLED && crate::sens::ode_provider::ode_subject_supported(model, subject)
+}
+
 /// The per-observation `∂f/∂η` Jacobian (`n_obs × n_eta`, row-major) as a flat
 /// vector, or `None` when unsupported. Convenience for the inner loop, whose
 /// `h_matrix` is exactly this Jacobian at the converged η̂. Uses the light
@@ -1209,8 +1217,17 @@ fn subject_eta_grad_impl(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
+    // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
+    // scope the outer provider uses, so inner and outer stay on the same route.
+    if model.ode_spec.is_some() {
+        if ODE_SENS_ENABLED {
+            return crate::sens::ode_provider::ode_subject_eta_grad(model, subject, theta, eta);
+        }
+        return None;
+    }
     // Same model/subject scope as the full provider …
-    if model.ode_spec.is_some() || !analytical_supported(model) || subject.has_tv_covariates() {
+    if !analytical_supported(model) || subject.has_tv_covariates() {
         return None;
     }
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {

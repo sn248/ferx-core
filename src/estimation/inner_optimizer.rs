@@ -891,6 +891,21 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
 /// not carry features the light inner provider can't serve (survival obs records,
 /// time-varying covariates).
 fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    // ODE models use the light `Dual1` inner provider (#410) with their own scope —
+    // independent of the analytical-path LTBS/ExpressionScale exclusions in
+    // `analytic_inner_grad_supported_model`, since the `Dual1` walk evaluates
+    // `ln(f)` and the readout exactly. The global escape hatches still apply.
+    if model.ode_spec.is_some() {
+        if std::env::var("FERX_NO_ANALYTIC_INNER")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            || matches!(model.gradient_method, GradientMethod::Fd)
+            || model.is_sde()
+        {
+            return false;
+        }
+        return crate::sens::provider::ode_inner_grad_supported(model, subject);
+    }
     if !analytic_inner_grad_supported_model(model) {
         return false;
     }

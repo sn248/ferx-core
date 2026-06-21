@@ -8970,9 +8970,27 @@ impl OdeRhsProgram {
         vars: &mut Vec<crate::sens::dual2::Dual2<N>>,
         stack: &mut Vec<crate::sens::dual2::Dual2<N>>,
     ) {
-        use crate::sens::dual2::Dual2;
+        self.eval_rhs_g::<crate::sens::dual2::Dual2<N>>(u, params, t, tafd, tad, du, vars, stack)
+    }
+
+    /// Generic-over-[`PkNum`] form of [`Self::eval_rhs_dual`]: evaluate the ODE RHS
+    /// over any dual width/order (`Dual1<N>` for the light inner η-gradient,
+    /// `Dual2<N>` for the full outer gradient). Mechanically identical to the
+    /// `Dual2` form — only the numeric type changes (issue #410, inner η-gradient).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn eval_rhs_g<T: crate::sens::num::PkNum>(
+        &self,
+        u: &[T],
+        params: &[T],
+        t: f64,
+        tafd: f64,
+        tad: f64,
+        du: &mut [T],
+        vars: &mut Vec<T>,
+        stack: &mut Vec<T>,
+    ) {
         vars.clear();
-        vars.resize(self.n_vars_total, Dual2::<N>::constant(0.0));
+        vars.resize(self.n_vars_total, T::from_f64(0.0));
         let copy_n = self.state_count.min(u.len());
         vars[..copy_n].copy_from_slice(&u[..copy_n]);
         for (i, &slot) in self.indiv_to_params_slot.iter().enumerate() {
@@ -8982,23 +9000,23 @@ impl OdeRhsProgram {
             }
         }
         if let Some(d) = vars.get_mut(self.time_slot) {
-            *d = Dual2::constant(t);
+            *d = T::from_f64(t);
         }
         if let Some(d) = vars.get_mut(self.tafd_slot) {
-            *d = Dual2::constant(tafd);
+            *d = T::from_f64(tafd);
         }
         if let Some(d) = vars.get_mut(self.tad_slot) {
-            *d = Dual2::constant(tad);
+            *d = T::from_f64(tad);
         }
         if let Some(d) = vars.get_mut(self.macheps_slot) {
-            *d = Dual2::constant(f64::EPSILON);
+            *d = T::from_f64(f64::EPSILON);
         }
         for d in du.iter_mut() {
-            *d = Dual2::constant(0.0);
+            *d = T::from_f64(0.0);
         }
         // The ODE RHS references states/indiv-params (in `vars`) only, not
         // θ/η/cov directly — so those are empty here.
-        eval_statements_g::<Dual2<N>>(&self.stmts, &[], &[], &[], vars, Some(du), stack);
+        eval_statements_g::<T>(&self.stmts, &[], &[], &[], vars, Some(du), stack);
     }
 }
 
@@ -9139,9 +9157,20 @@ impl OdeOutputProgram {
         vars: &mut Vec<crate::sens::dual2::Dual2<N>>,
         stack: &mut Vec<crate::sens::dual2::Dual2<N>>,
     ) -> crate::sens::dual2::Dual2<N> {
-        use crate::sens::dual2::Dual2;
+        self.eval_output_g::<crate::sens::dual2::Dual2<N>>(state, params, vars, stack)
+    }
+
+    /// Generic-over-[`PkNum`] form of [`Self::eval_output_dual`] — the Form-C readout
+    /// over any dual width/order (`Dual1` light inner / `Dual2` full outer; #410).
+    pub(crate) fn eval_output_g<T: crate::sens::num::PkNum>(
+        &self,
+        state: &[T],
+        params: &[T],
+        vars: &mut Vec<T>,
+        stack: &mut Vec<T>,
+    ) -> T {
         vars.clear();
-        vars.resize(self.n_states + self.n_indiv, Dual2::<N>::constant(0.0));
+        vars.resize(self.n_states + self.n_indiv, T::from_f64(0.0));
         let copy_n = self.n_states.min(state.len());
         vars[..copy_n].copy_from_slice(&state[..copy_n]);
         for (i, &slot) in self.indiv_to_pk.iter().enumerate() {
@@ -9150,7 +9179,7 @@ impl OdeOutputProgram {
             }
         }
         let empty_nn: Vec<Vec<f64>> = Vec::new();
-        eval_bytecode_g::<Dual2<N>>(&self.bc, &[], &[], &[], vars, &empty_nn, stack)
+        eval_bytecode_g::<T>(&self.bc, &[], &[], &[], vars, &empty_nn, stack)
     }
 }
 

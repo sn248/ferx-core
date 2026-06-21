@@ -600,6 +600,77 @@ mod survival_smoke {
         );
     }
 
+    /// `[event_model]` expressions may reference names defined in
+    /// `[individual_parameters]`; the hazard `param_fn` resolves them per subject at
+    /// eval time. Regression: before this was wired, such references silently
+    /// evaluated to 0.0. Here `scale = SCALE_I`, where `SCALE_I = LAMBDA0 * TVEFF`
+    /// and `LAMBDA0 = TVBASE * exp(ETA_BASE)` — a two-level individual reference that
+    /// also threads an η through to the hazard.
+    #[test]
+    fn event_model_references_individual_parameters() {
+        // `[individual_parameters]` present ⇒ structural/error blocks are required
+        // (the realistic joint PK + TTE shape). The hazard references SCALE_I, which is
+        // not a PK parameter — it exists only to drive the hazard.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVBASE(0.05, 0.001, 10.0)
+  theta TVEFF(2.0, 0.1, 10.0)
+  omega ETA_BASE ~ 0.09
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  CL      = TVCL
+  V       = TVV
+  LAMBDA0 = TVBASE * exp(ETA_BASE)
+  SCALE_I = LAMBDA0 * TVEFF
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = SCALE_I
+";
+        let model =
+            parse_model_string(src).expect("model referencing individual params must parse");
+        let ep = model
+            .endpoints
+            .get(&2)
+            .expect("CMT=2 must be a TTE endpoint");
+        let EndpointLikelihood::Tte { hazard } = ep else {
+            panic!("expected Tte endpoint");
+        };
+        let param_fn = match hazard {
+            ferx_core::HazardSpec::Analytic { param_fn, .. } => param_fn,
+        };
+
+        let covariates = std::collections::HashMap::new();
+        // theta = [TVCL=1, TVV=10, TVBASE=0.05, TVEFF=2.0]; eta = [0.0]
+        //   LAMBDA0 = 0.05·e^0 = 0.05 ; SCALE_I = 0.05·2.0 = 0.10  (lambda).
+        let theta = [1.0, 10.0, 0.05, 2.0];
+        let p0 = param_fn(&theta, &[0.0], &covariates);
+        assert!(
+            (p0[0] - 0.10).abs() < 1e-9,
+            "hazard lambda must resolve the individual parameter to 0.10; got {} \
+             (0.0 would mean the [individual_parameters] reference was not threaded)",
+            p0[0]
+        );
+        // eta = [0.5] → LAMBDA0 = 0.05·e^0.5 ; SCALE_I = that · 2.0 — η flows through.
+        let expected = 0.05 * 0.5_f64.exp() * 2.0;
+        let p1 = param_fn(&theta, &[0.5], &covariates);
+        assert!(
+            (p1[0] - expected).abs() < 1e-9,
+            "hazard lambda must track eta via the individual parameter; got {}, expected {expected}",
+            p1[0]
+        );
+    }
+
     // ── Phase 1 follow-up: median/mean survival in predict_survival ───────────
 
     #[test]

@@ -34,10 +34,10 @@ Add one `[event_model]` block per TTE endpoint.
 ```
 
 > **Note:** `[event_model]` parameter expressions are evaluated in the
-> theta / eta / covariate namespace. Names defined in `[individual_parameters]`
-> (e.g. `LAMBDA`) are **not** available here — write the full expression in
-> terms of `theta` and `eta` names directly. This restriction will be lifted
-> in a future release.
+> theta / eta / covariate namespace, and may also reference names defined in
+> `[individual_parameters]` (e.g. `LAMBDA`); those are resolved per subject at
+> evaluation time. Writing the full expression in terms of `theta` and `eta`
+> names directly also works.
 
 For Weibull, a `shape` parameter is also required:
 
@@ -101,7 +101,7 @@ dummy 1-cpt block with fixed parameters:
 [event_model]
   cmt    = 2
   family = exponential
-  scale  = TVLAMBDA * exp(ETA_LAMBDA)  # must use theta/eta names directly
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)  # theta/eta directly, or an [individual_parameters] name
 ```
 
 This restriction will be lifted in a future release.

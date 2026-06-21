@@ -20,6 +20,11 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`[event_model]` hazard expressions can reference `[individual_parameters]`** names
+  (and their intermediate variables) — e.g. a hazard driven by an individual `CL` — resolved
+  per subject at evaluation time, in addition to the existing theta/eta/covariate namespace.
+  Only the individual parameters the hazard actually references are computed (so PK parameters
+  that reference IOV kappas are not pulled into the hazard). Behind the `survival` feature (#440).
 - **Analytic sensitivities for oral infusion** on the analytical 1-/2-/3-cpt
   models: a depot-bypass infusion into the central compartment (RATE>0 into cmt 2,
   #350) and a zero-order input into the oral depot (RATE>0 into cmt 1, #400) are

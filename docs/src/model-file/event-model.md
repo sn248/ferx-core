@@ -24,9 +24,12 @@ including data format, hazard families, and comparison with nlmixr2 / NONMEM.
                         #   multiplies the full hazard by exp(loghr)
 ```
 
-> **Expression namespace:** all expressions are evaluated in the theta / eta / covariate
-> namespace. Names from `[individual_parameters]` are **not** in scope — write the full
-> theta/eta expression directly (e.g. `TVLAMBDA * exp(ETA_LAMBDA)`, not `LAMBDA`).
+> **Expression namespace:** expressions are evaluated in the theta / eta / covariate
+> namespace, and may also reference names defined in `[individual_parameters]` (e.g. a
+> hazard driven by an individual `CL`). Those references are resolved per subject at
+> evaluation time; only the individual parameters the hazard actually uses are computed.
+> Writing the full theta/eta expression directly (e.g. `TVLAMBDA * exp(ETA_LAMBDA)`) also
+> works.
 
 Named blocks allow multiple TTE endpoints:
 

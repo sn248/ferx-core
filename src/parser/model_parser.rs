@@ -2128,6 +2128,16 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     {
         let theta_names = model.theta_names.clone();
         let eta_names = model.eta_names.clone();
+        // Names assigned in [individual_parameters] (including intermediate variables),
+        // so [event_model] expressions may reference them; resolved per subject at eval
+        // time from `indiv_stmts` via `eval_indiv_param_vars`.
+        let indiv_param_names: Vec<String> = indiv_stmts
+            .iter()
+            .filter_map(|s| match s {
+                Statement::Assign(name, _) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
 
         // Collect all [event_model] line-sets: unnamed (at most one) + named (any number).
         let mut event_blocks: Vec<&Vec<String>> = Vec::new();
@@ -2141,8 +2151,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
 
         for lines in event_blocks {
-            let (cmt, endpoint, event_covs, blk_thetas, blk_etas) =
-                parse_event_model_block(lines, &theta_names, &eta_names, &model.error_spec)?;
+            let (cmt, endpoint, event_covs, blk_thetas, blk_etas) = parse_event_model_block(
+                lines,
+                &theta_names,
+                &eta_names,
+                &indiv_param_names,
+                &indiv_stmts,
+                &model.error_spec,
+            )?;
             if model.endpoints.contains_key(&cmt) {
                 return Err(format!("[event_model]: CMT={cmt} declared more than once"));
             }
@@ -3082,6 +3098,46 @@ fn parse_covariates_block(lines: &[String]) -> Result<Vec<CovariateDecl>, String
 
 // ── [event_model] block parser ─────────────────────────────────────────────
 
+/// Collect the names referenced as `Expression::Variable` in `expr` (i.e.
+/// `[individual_parameters]` names an `[event_model]` expression depends on).
+#[cfg(feature = "survival")]
+fn collect_variable_names(expr: &Expression, out: &mut std::collections::HashSet<String>) {
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if let Expression::Variable(name) = e {
+            out.insert(name.clone());
+        }
+    });
+}
+
+/// Evaluate the parsed `[individual_parameters]` statements into a name→value map
+/// for the given `(θ, η, covariates)`. Lets `[event_model]` hazard expressions
+/// reference individual-parameter names (e.g. a hazard driven by an individual `CL`).
+/// Empty for TTE-only models with no `[individual_parameters]` block, in which case
+/// the hazard expressions reference only θ/η/covariates.
+#[cfg(feature = "survival")]
+fn eval_indiv_param_vars(
+    stmts: &[Statement],
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> HashMap<String, f64> {
+    // Evaluate each `name = expr` assignment in order with `eval_expression`, which —
+    // unlike `eval_statements` — does NOT borrow the `FERX_SCRATCH` thread-local. The
+    // hazard `param_fn` runs inside the likelihood's own statement evaluation (where
+    // that scratch is already held), so re-entering it would abort the process. Later
+    // assignments see earlier ones via the growing `vars` map (matching declaration
+    // order). Only plain assignments are resolved — the overwhelming majority of
+    // `[individual_parameters]`; control-flow statements are skipped.
+    let mut vars = HashMap::new();
+    for s in stmts {
+        if let Statement::Assign(name, expr) = s {
+            let v = eval_expression(expr, theta, eta, covariates, &vars, &[]);
+            vars.insert(name.clone(), v);
+        }
+    }
+    vars
+}
+
 /// Parse one `[event_model]` (or `[event_model NAME]`) block.
 ///
 /// Returns `(cmt, EndpointLikelihood::Tte { hazard })` ready to insert into
@@ -3101,6 +3157,8 @@ fn parse_event_model_block(
     lines: &[String],
     theta_names: &[String],
     eta_names: &[String],
+    indiv_param_names: &[String],
+    indiv_stmts: &[Statement],
     error_spec: &ErrorSpec,
 ) -> Result<
     (
@@ -3114,7 +3172,13 @@ fn parse_event_model_block(
 > {
     use crate::types::{EndpointLikelihood, HazardFamily, HazardSpec};
 
-    let ctx = ParseCtx::new(theta_names, eta_names, &[]);
+    // `[event_model]` hazard expressions may reference names defined in
+    // `[individual_parameters]`. Passing those names as `defined_vars` makes them
+    // parse as `Expression::Variable`; the param_fn closures below evaluate the
+    // individual-parameter statements into a `vars` map at call time (`eval_statements`)
+    // so the references resolve to the per-subject individual values. Names that are
+    // neither θ/η nor an individual parameter still fall back to covariates.
+    let ctx = ParseCtx::new(theta_names, eta_names, indiv_param_names);
 
     let mut cmt_opt: Option<usize> = None;
     let mut family_opt: Option<HazardFamily> = None;
@@ -3279,6 +3343,39 @@ fn parse_event_model_block(
         event_model_etas = eta_set;
     }
 
+    // Restrict the individual-parameter statements the hazard closures evaluate to
+    // just those the hazard references, transitively. Evaluating *all* of them would
+    // also evaluate unrelated parameters — notably PK parameters that reference IOV
+    // kappas at η-indices outside the slice the hazard `param_fn` receives, which would
+    // index out of bounds. Walking declarations in reverse lets a needed parameter pull
+    // in the (earlier-declared) parameters it depends on.
+    let needed_indiv_stmts: Vec<Statement> = {
+        let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for expr in [
+            &scale_expr,
+            &shape_expr,
+            &alpha_expr,
+            &gamma_expr,
+            &loghr_expr,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            collect_variable_names(expr, &mut needed);
+        }
+        let mut keep: Vec<Statement> = Vec::new();
+        for s in indiv_stmts.iter().rev() {
+            if let Statement::Assign(name, expr) = s {
+                if needed.contains(name) {
+                    collect_variable_names(expr, &mut needed);
+                    keep.push(s.clone());
+                }
+            }
+        }
+        keep.reverse();
+        keep
+    };
+
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
     // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
@@ -3286,12 +3383,13 @@ fn parse_event_model_block(
         HazardFamily::Exponential => {
             let scale = scale_expr
                 .ok_or("[event_model] family=exponential requires `scale` (or `rate`)")?;
+            let indiv = needed_indiv_stmts.clone();
             Box::new(
                 move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-                    let lambda =
-                        eval_expression(&scale, theta, eta, covariates, &HashMap::new(), &[]);
+                    let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+                    let lambda = eval_expression(&scale, theta, eta, covariates, &vars, &[]);
                     let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
-                        eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
+                        eval_expression(e, theta, eta, covariates, &vars, &[])
                     });
                     vec![lambda, lhr]
                 },
@@ -3300,12 +3398,14 @@ fn parse_event_model_block(
         HazardFamily::Weibull => {
             let scale = scale_expr.ok_or("[event_model] family=weibull requires `scale`")?;
             let shape = shape_expr.ok_or("[event_model] family=weibull requires `shape`")?;
+            let indiv = needed_indiv_stmts.clone();
             Box::new(
                 move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-                    let s = eval_expression(&scale, theta, eta, covariates, &HashMap::new(), &[]);
-                    let p = eval_expression(&shape, theta, eta, covariates, &HashMap::new(), &[]);
+                    let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+                    let s = eval_expression(&scale, theta, eta, covariates, &vars, &[]);
+                    let p = eval_expression(&shape, theta, eta, covariates, &vars, &[]);
                     let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
-                        eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
+                        eval_expression(e, theta, eta, covariates, &vars, &[])
                     });
                     vec![s, p, lhr]
                 },
@@ -3314,12 +3414,14 @@ fn parse_event_model_block(
         HazardFamily::Gompertz => {
             let alpha = alpha_expr.ok_or("[event_model] family=gompertz requires `alpha`")?;
             let gamma = gamma_expr.ok_or("[event_model] family=gompertz requires `gamma`")?;
+            let indiv = needed_indiv_stmts.clone();
             Box::new(
                 move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-                    let a = eval_expression(&alpha, theta, eta, covariates, &HashMap::new(), &[]);
-                    let g = eval_expression(&gamma, theta, eta, covariates, &HashMap::new(), &[]);
+                    let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+                    let a = eval_expression(&alpha, theta, eta, covariates, &vars, &[]);
+                    let g = eval_expression(&gamma, theta, eta, covariates, &vars, &[]);
                     let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
-                        eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
+                        eval_expression(e, theta, eta, covariates, &vars, &[])
                     });
                     vec![a, g, lhr]
                 },

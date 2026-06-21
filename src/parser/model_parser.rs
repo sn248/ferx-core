@@ -3636,6 +3636,12 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "n_leapfrog" | "saem_n_leapfrog" => opts.saem_n_leapfrog = parse_usize("n_leapfrog")?,
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
+        "conddist" | "saem_conddist" => opts.saem_conddist = parse_bool("conddist")?,
+        "conddist_nsamp" => opts.saem_conddist_nsamp = parse_usize("conddist_nsamp")?,
+        "conddist_burnin" => opts.saem_conddist_burnin = parse_usize("conddist_burnin")?,
+        "conddist_keep_samples" => {
+            opts.saem_conddist_keep_samples = parse_bool("conddist_keep_samples")?
+        }
         "seed" | "saem_seed" => opts.saem_seed = parse_u64_opt("seed")?,
         "bayes_warmup" => opts.bayes_warmup = parse_usize("bayes_warmup")?,
         "bayes_iters" => opts.bayes_iters = parse_usize("bayes_iters")?,
@@ -12311,6 +12317,43 @@ mod tests {
 
         assert_eq!(apply_fit_option(&mut opts, "omega_burnin", "30"), Ok(true));
         assert_eq!(opts.saem_omega_burnin, 30);
+    }
+
+    /// Conditional-distribution keys (#257) round-trip into FitOptions, both the
+    /// bare and `saem_`-prefixed spellings of the master switch.
+    #[test]
+    fn test_apply_fit_option_conddist_keys() {
+        let mut opts = FitOptions::default();
+        assert!(!opts.saem_conddist);
+
+        assert_eq!(apply_fit_option(&mut opts, "conddist", "true"), Ok(true));
+        assert!(opts.saem_conddist);
+
+        // The `saem_conddist` alias sets the same field.
+        opts.saem_conddist = false;
+        assert_eq!(
+            apply_fit_option(&mut opts, "saem_conddist", "true"),
+            Ok(true)
+        );
+        assert!(opts.saem_conddist);
+
+        assert_eq!(
+            apply_fit_option(&mut opts, "conddist_nsamp", "500"),
+            Ok(true)
+        );
+        assert_eq!(opts.saem_conddist_nsamp, 500);
+
+        assert_eq!(
+            apply_fit_option(&mut opts, "conddist_burnin", "75"),
+            Ok(true)
+        );
+        assert_eq!(opts.saem_conddist_burnin, 75);
+
+        assert_eq!(
+            apply_fit_option(&mut opts, "conddist_keep_samples", "true"),
+            Ok(true)
+        );
+        assert!(opts.saem_conddist_keep_samples);
     }
 
     #[test]

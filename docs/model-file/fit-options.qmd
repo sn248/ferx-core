@@ -180,6 +180,10 @@ Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP op
 | `adapt_interval` | `50` | Iterations between step-size adaptation |
 | `omega_burnin` | `20` | Initial exploration iterations during which Ω (and Ω<sub>IOV</sub>) are held at their starting values while the MH chain warms up. Clamped to `n_exploration`; set `0` to disable. Prevents the Ω collapse described in the SAEM page. |
 | `seed` | `12345` | RNG seed for reproducibility |
+| `conddist` | `false` | Run a post-fit conditional-distribution pass estimating each subject's `p(η_i \| y_i)` by MCMC. Reports per-subject conditional mean/SD and distribution-based η-shrinkage (the shrinkage-unbiased basis for η diagnostics). See the [SAEM page](../estimation/saem.qmd#conditional-distribution-conditional-mode-vs-distribution). |
+| `conddist_nsamp` | `200` | Retained MCMC draws per subject in the conditional-distribution pass. Larger tightens the mean/SD estimates at linear cost. Production diagnostics want values in the thousands. Only used when `conddist = true`. |
+| `conddist_burnin` | `20` | Burn-in draws discarded before accumulation, to forget the EBE-mode warm start. Only used when `conddist = true`. |
+| `conddist_keep_samples` | `false` | Retain the raw per-subject draws (written to `{model}-conddist-samples.csv`), not just the mean/SD. Only used when `conddist = true`. |
 
 ## SIR (Sampling Importance Resampling)
 

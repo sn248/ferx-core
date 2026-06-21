@@ -7,6 +7,9 @@ target
 *-fit.yaml
 *-sdtab.csv
 *-timing.txt
+*-conddist.csv
+*-conddist-samples.csv
+*-covtab.csv
 
 # Rust compiler crash dumps
 rustc-ice-*.txt
@@ -16,3 +19,4 @@ rustc-ice-*.txt
 # Built documentation output — generated and deployed by CI (.github/workflows/docs.yml)
 docs/book/
 docs/_site/
+bench_*.csv

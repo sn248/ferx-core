@@ -46,7 +46,7 @@ pub(crate) const MSTEP_NLOPT_ALGORITHM: nlopt::Algorithm = nlopt::Algorithm::Bob
 /// that η collapses and the chain can no longer move it, so Ω must stay large
 /// enough to keep the random walk alive. 1e-6 keeps a free η explorable while
 /// being far below any plausible estimated variance.
-const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
+pub(crate) const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
 
 /// Target acceptance rate for the componentwise (1-D) eta kernel. The optimal
 /// scaling result for single-coordinate random-walk Metropolis is ≈0.44
@@ -233,7 +233,7 @@ pub(crate) fn mh_steps(
 /// sufficient statistic recovers the true correlation. See the
 /// `saem-block-omega-rank1-collapse` investigation.
 #[allow(clippy::too_many_arguments)]
-fn mh_steps_componentwise(
+pub(crate) fn mh_steps_componentwise(
     eta: &mut [f64],
     nll_current: f64,
     subject: &Subject,
@@ -2228,6 +2228,30 @@ pub fn run_saem(
         None
     };
 
+    // ---- Post-fit conditional-distribution pass (opt-in, #257) ----
+    // Characterise each subject's p(η_i | y_i; θ̂) by MCMC at the fixed
+    // population parameters, warm-started from the EBE mode (`eta_hats`).
+    let cond_dist = if options.saem_conddist {
+        if verbose {
+            eprintln!(
+                "Running SAEM conditional-distribution pass ({} samples/subject, {} burn-in)...",
+                options.saem_conddist_nsamp, options.saem_conddist_burnin
+            );
+        }
+        Some(
+            crate::estimation::saem_conddist::run_conditional_distribution(
+                model,
+                population,
+                &final_params,
+                &eta_hats,
+                &final_kappas,
+                options,
+            ),
+        )
+    } else {
+        None
+    };
+
     Ok(OuterResult {
         params: final_params,
         ofv,
@@ -2247,6 +2271,7 @@ pub fn run_saem(
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
+        cond_dist,
     })
 }
 

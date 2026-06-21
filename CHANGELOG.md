@@ -411,6 +411,15 @@ section of the SDLC for the versioning policy).
   needs via a FOCE inner loop at those parameters instead of requiring a
   preceding estimator. Useful for scoring imported/fixed parameter sets. IMP
   still may appear at most once and must be the terminal stage of a chain.
+- SAEM conditional-distribution pass: set `conddist = true` in `[fit_options]`
+  to estimate each subject's conditional distribution of the random effects
+  `p(η_i | y_i)` by MCMC after the fit — reporting per-subject conditional mean,
+  SD, distribution-based η-shrinkage, and (with `conddist_keep_samples = true`)
+  the raw draws. Surfaced on `FitResult.cond_dist` and written to
+  `{model}-conddist.csv` (+ `-conddist-samples.csv`). This is the SAEM analogue
+  of saemix `conddist.saemix` / Monolix's "Conditional Distribution" task and is
+  the shrinkage-unbiased basis for η diagnostics; validated against saemix on
+  warfarin (#257).
 - Feature maturity labels (`stable` / `beta` / `experimental`) documented for
   every major feature: a new *Feature Maturity* docs page with definitions and a
   per-feature table, plus a maturity banner on each feature reference page.

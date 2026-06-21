@@ -1,8 +1,8 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Status:** Phase 1 complete — ferx-core PRs #190, #192, #206 merged; ferx-r PRs #134 & #142 merged; only Tier 3 tests, NONMEM comparison, and `predict_survival` R wrapper remain  
+**Status:** Phase 1 complete — ferx-core PRs #190, #192, #206 merged; ferx-r PRs #134 & #142 merged; open: Tier 3 slow-tests, NONMEM/nlmixr2 comparison table, `predict_survival` R wrapper, `[event_model]`→`[individual_parameters]` name threading  
 **Scope:** Active implementation — Phase 1b next  
-**Revised:** 2026-06-10 (Phase 1 fully landed across ferx-core and ferx-r)
+**Revised:** 2026-06-21 (no new TTE PRs since 2026-06-10; adjacent SAEM conditional-distribution pass #265 merged → §5.9; Enzyme/autodiff retired → §16 D8)
 
 ---
 
@@ -927,9 +927,15 @@ SAEM M-step now adds the TTE data term for TTE subjects. Sigma update is Gaussia
 
 ### 5.9 f-SAEM proposal *(open — improvement opportunity)*
 
-Current SAEM uses random-walk MH proposal. Replacing with Laplace-based independent
-proposal (f-SAEM) would accelerate convergence for all non-Gaussian models (§9.1). PR #265
-(open, "SAEM conditional-distribution pass") is a related incremental improvement.
+Current SAEM uses a random-walk MH proposal. Replacing it with a Laplace-based independent
+proposal (f-SAEM) would accelerate convergence for all non-Gaussian models (§9.1); this is
+Phase 3b and remains **open**. A related but distinct increment has landed: PR #265 ("SAEM
+conditional-distribution pass", merged 2026-06-21) characterises each subject's post-fit
+`p(η|y)` — conditional mean/SD/draws, the saemix `conddist` / Monolix analog — by
+*accumulating* the existing random-walk MH draws after the fit. It does **not** change the
+E-step proposal, so it does not implement f-SAEM; but its MH kernels (`mh_steps`,
+`mh_steps_componentwise`, `mh_kappa_steps`, now crate-visible in
+`src/estimation/saem_conddist.rs`) are reusable as Phase 3b scaffolding.
 
 ---
 
@@ -2581,7 +2587,7 @@ runtime enum; experimental or toolchain-bound extension → Cargo feature*:
 | TTE / survival / RTTE / PH / logistic / ordinal / count | **Runtime** `EndpointLikelihood` enum, **default build** | Core NLME, no new deps; one binary, model chosen in the `.ferx` file (like `EstimationMethod` / `ErrorSpec` today); ferx-r gets it with zero feature coordination |
 | Markov (CTMM/DTMM/mCTMM/HMM) | `#[cfg(feature = "markov")]` → promote to default after CAV validation (D5) | Specialized (matrix exp, Van Loan); opt-in while maturing — the existing `nn` precedent |
 | AGQ | `#[cfg(feature = "agq")]` (D6) | Optional accuracy mode |
-| autodiff | existing feature (Enzyme toolchain) | Unchanged |
+| autodiff | retired | Enzyme `autodiff` was retired (#367/#381, 2026-06-20); `gradient = ad` now errors |
 
 **Why not a blanket feature:** model selection is a *runtime / model-file* concern, not a
 build concern (nobody should pick a binary to fit Weibull vs. logistic); `#[cfg]`-ing enum

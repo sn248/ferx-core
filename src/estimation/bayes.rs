@@ -1295,6 +1295,7 @@ pub fn run_bayes(
         sir_fallback_proposal: None,
         impmap_trace: None,
         bayes: Some(bayes),
+        cond_dist: None,
     })
 }
 

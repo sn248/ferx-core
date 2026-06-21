@@ -165,6 +165,67 @@ method = [saem, imp]
 
 See [Importance Sampling (IMP)](importance-sampling.qmd).
 
+## Conditional Distribution (conditional mode vs. distribution)
+
+The post-SAEM finalization above produces the conditional **mode** of each
+subject's random effects — the empirical Bayes estimate (EBE), the single most
+probable \\( \eta_i \\). That is a point estimate. SAEM's MCMC E-step is, however,
+already sampling each subject's full **conditional distribution**
+\\( p(\eta_i \mid y_i; \hat\theta) \\); the mode discards everything but its peak.
+
+Set `conddist = true` to run an opt-in post-fit pass that characterises that
+distribution. With the population parameters fixed at their converged values, the
+same MH kernels (block, componentwise, and the per-occasion kappa kernel for IOV)
+are re-run per subject — warm-started at the EBE mode — and the draws are
+*accumulated* rather than discarded. The pass reports, per subject:
+
+- the **conditional mean** \\( \mathbb{E}[\eta_i \mid y_i] \\),
+- the **conditional SD** \\( \mathrm{sd}(\eta_i \mid y_i) \\),
+- optionally the raw draws (`conddist_keep_samples = true`), and
+- a distribution-based **η-shrinkage**, \\( 1 - \mathrm{sd}_i(\bar\eta_i)/\omega \\),
+  reported alongside the usual mode-based `shrinkage_eta`.
+
+This mirrors the conditional-mode vs. conditional-distribution distinction in
+**saemix** (`map.saemix` vs `conddist.saemix`; Comets, Lavenu & Lavielle, *J. Stat.
+Soft.* 80(3), 2017) and **Monolix** (the "Conditional Mode" vs "Conditional
+Distribution" tasks). Why prefer the distribution for diagnostics: EBEs and
+conditional means are shrunk toward the population, so η–covariate and η–η
+relationships built on them can be hidden or fabricated; samples from the
+conditional distribution are not shrinkage-biased.
+
+Results are exposed on `FitResult.cond_dist` and written by the CLI to
+`{model}-conddist.csv` (`ID, ETA, COND_MEAN, COND_SD, COND_MODE`), with the raw
+draws in `{model}-conddist-samples.csv` when retained.
+
+### Validation against saemix and NONMEM
+
+On the bundled warfarin data (10 subjects, 1-cpt oral, log-normal CL/V/KA,
+proportional error), all three engines converge to identical population
+parameters (TVCL 0.1327, TVV 7.737, TVKA 0.811), and ferx's per-subject
+conditional distribution agrees with both references to within Monte-Carlo
+noise.
+
+**vs saemix** (`conddist.saemix`):
+
+| Quantity (per-subject η) | corr | max&#124;diff&#124; | RMSE |
+|---|---|---|---|
+| conditional mean | 1.0000 | 0.0029 | 0.0011 |
+| conditional SD   | 0.9913 | 0.0024 | 0.0009 |
+| mode / MAP       | 1.0000 | 0.0002 | 0.0001 |
+
+**vs NONMEM** (`$EST METHOD=SAEM` then `METHOD=IMP EONLY=1`; conditional moments
+read from the `.phi` file — `PHI(k) − log θ_k` is the η conditional mean,
+`sqrt(PHC(k,k))` the conditional SD):
+
+| Quantity (per-subject η) | corr | max&#124;diff&#124; | RMSE |
+|---|---|---|---|
+| conditional mean | 1.0000 | 0.0012 | 0.0004 |
+| conditional SD   | 0.9987 | 0.0017 | 0.0004 |
+
+(ferx `conddist_nsamp = 2000`. Comparison scripts:
+`tests/reference/saem_conddist/bench_saemix_conddist.R`,
+`tests/reference/saem_conddist/parse_nm_conddist.R`.)
+
 ## Inter-Occasion Variability (IOV)
 
 `method = saem` supports models with `kappa` declarations (`n_kappa > 0`). IOV is handled with a per-occasion Gibbs Metropolis-Hastings step interleaved with the standard eta MH:
@@ -188,6 +249,12 @@ No additional configuration is required; `method = saem` works for both BSV-only
   omega_burnin  = 20       # Iterations to hold Ω fixed while the chain warms up
   seed          = 12345    # RNG seed for reproducibility
   covariance    = true     # Compute standard errors
+
+  # Conditional-distribution pass (opt-in; off by default)
+  conddist              = true    # Estimate p(η_i | y_i) per subject after the fit
+  conddist_nsamp        = 2000    # Retained MCMC draws per subject
+  conddist_burnin       = 500     # Burn-in draws discarded before accumulation
+  conddist_keep_samples = false   # Retain the raw draws (writes -conddist-samples.csv)
 ```
 
 ## Tuning Guide

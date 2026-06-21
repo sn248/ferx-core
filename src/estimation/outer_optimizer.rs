@@ -46,6 +46,11 @@ pub struct OuterResult {
     /// estimators. Carried here so the chain dispatch can lift it onto
     /// `FitResult.bayes` through the generic OuterResult → FitResult path.
     pub bayes: Option<crate::types::BayesResult>,
+    /// Per-subject conditional distribution of the random effects, estimated by
+    /// the post-fit SAEM conditional-distribution pass. `Some` only when
+    /// `method = saem` and `saem_conddist = true`; `None` for every other
+    /// estimator and for SAEM runs that did not request the pass (#257).
+    pub cond_dist: Option<CondDist>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1338,6 +1343,7 @@ fn optimize_nlopt(
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
+        cond_dist: None,
     }
 }
 
@@ -1756,6 +1762,7 @@ fn optimize_bfgs(
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
+        cond_dist: None,
     }
 }
 

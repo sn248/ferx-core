@@ -1120,28 +1120,58 @@ mod tests {
     /// outer provider's `f` / `df_deta` exactly — both are exact analytic, only the
     /// dual order differs (and `solve_ode_g` uses value-based step control, so the
     /// trajectories match). This is what makes the inner EBE loop's analytic
-    /// η-gradient correct (#410).
+    /// η-gradient correct (#410). Run across the readout/dose variants so the light
+    /// driver's branches are exercised: Form-C readout (`TWOCPT_ODE`), an `ObsCmt`
+    /// model with non-zero `init(...)` (exercises `dual1_init_state`), estimated
+    /// bioavailability `F` (`BIOAV_ODE` — the `f_bio` path + `ObsCmt` arm), and LTBS.
     #[test]
     fn ode_light_inner_eta_grad_matches_full_provider() {
-        let model = parse_model_string(TWOCPT_ODE).expect("parse");
-        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-        let theta = vec![4.0, 12.0, 2.0, 25.0];
-        let eta = vec![0.12, -0.08];
-
-        let full = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("full");
-        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("light");
-        assert_eq!(full.obs.len(), light.len());
-        for (a, b) in full.obs.iter().zip(light.iter()) {
-            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
-            for k in 0..model.n_eta {
-                approx::assert_relative_eq!(
-                    a.df_deta[k],
-                    b.df_deta[k],
-                    max_relative = 1e-9,
-                    epsilon = 1e-10
-                );
+        fn check(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
+            let full = ode_subject_sensitivities(model, subject, theta, eta).expect("full");
+            let light = ode_subject_eta_grad(model, subject, theta, eta).expect("light");
+            assert_eq!(full.obs.len(), light.len());
+            for (a, b) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
+                for k in 0..model.n_eta {
+                    approx::assert_relative_eq!(
+                        a.df_deta[k],
+                        b.df_deta[k],
+                        max_relative = 1e-9,
+                        epsilon = 1e-10
+                    );
+                }
             }
         }
+
+        // Form-C readout, IV bolus.
+        let m = parse_model_string(TWOCPT_ODE).expect("parse");
+        check(
+            &m,
+            &bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
+            &[4.0, 12.0, 2.0, 25.0],
+            &[0.12, -0.08],
+        );
+
+        // ObsCmt readout + non-zero init(...) → exercises `dual1_init_state`.
+        let m = parse_model_string(INIT_ODE).expect("parse");
+        let mut s = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        s.doses = vec![];
+        check(&m, &s, &[1.0, 20.0], &[0.1, -0.05]);
+
+        // Estimated bioavailability F + ObsCmt readout, oral depot → `f_bio` path.
+        let m = parse_model_string(BIOAV_ODE).expect("parse");
+        let mut s = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        check(&m, &s, &[5.0, 50.0, 1.5, 0.70], &[0.15, 0.2]);
+
+        // LTBS output transform over the Dual1 readout.
+        let m = parse_model_string(TWOCPT_ODE_LTBS).expect("parse");
+        check(
+            &m,
+            &bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
+            &[4.0, 12.0, 2.0, 25.0],
+            &[0.12, -0.08],
+        );
     }
 
     /// The inner EBE loop must actually *resolve* to the analytic η-gradient for an
@@ -1156,6 +1186,18 @@ mod tests {
             resolve_gradient_method(&model, &subject),
             InnerGradientMethod::Analytic,
             "in-scope ODE subject must use the analytic inner η-gradient (#410)"
+        );
+        // The provider entry the inner loop actually calls (`subject_eta_grad`) must
+        // route the ODE model to the light Dual1 provider, not decline.
+        let g = crate::sens::provider::subject_eta_grad(
+            &model,
+            &subject,
+            &[4.0, 12.0, 2.0, 25.0],
+            &[0.1, -0.05],
+        );
+        assert!(
+            g.is_some_and(|v| v.len() == subject.obs_times.len()),
+            "subject_eta_grad must serve an in-scope ODE subject via the light provider"
         );
     }
 

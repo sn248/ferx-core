@@ -7,12 +7,10 @@ NONMEM `$EST METHOD=IMP`. It maximises the importance-sampled marginal
 likelihood, updating θ/Ω/σ each iteration. Set `imp_eval_only = true`
 (NONMEM `EONLY=1`) to instead *evaluate* the marginal log-likelihood
 
-<div>
-\[
--2 \\log L(\\theta) \\;=\\; -2 \\sum_i \\log p(y_i \\mid \\theta)
-\\;=\\; -2 \\sum_i \\log \\int p(y_i \\mid \\eta, \\theta)\\, p(\\eta \\mid \\theta)\\, d\\eta
-\]
-</div>
+$$
+-2 \log L(\theta) \;=\; -2 \sum_i \log p(y_i \mid \theta)
+\;=\; -2 \sum_i \log \int p(y_i \mid \eta, \theta)\, p(\eta \mid \theta)\, d\eta
+$$
 
 at the **fixed** input parameters without estimating them.
 
@@ -153,55 +151,47 @@ iteration / in evaluation-only mode) and inner-loop Jacobian Jᵢ = ∂f/∂η a
 
 1. **Build proposal scale Σᵢ:**
    - Compute Sheiner–Beal posterior Hessian
-     \\(H_i = J_i^\\top R_i^{-1} J_i + \\Omega^{-1}\\) at η̂ᵢ
-     (\\(R_i\\) = diagonal residual variance at the EBE).
-   - Add a small ridge \\(\\lambda I\\) for numerical safety
+     $H_i = J_i^\top R_i^{-1} J_i + \Omega^{-1}$ at η̂ᵢ
+     ($R_i$ = diagonal residual variance at the EBE).
+   - Add a small ridge $\lambda I$ for numerical safety
      (λ = max(10⁻⁶ · trace(H)/d, 10⁻¹⁰)).
    - Cholesky-factor; on failure fall back to Σᵢ = Ω (broad prior-scale
      proposal — gives a valid but noisy LL estimate).
 
-2. **Draw K samples** \\(\\eta_{ik} \\sim t_\\nu(\\hat\\eta_i, \\Sigma_i)\\)
+2. **Draw K samples** $\eta_{ik} \sim t_\nu(\hat\eta_i, \Sigma_i)$
    (multivariate Student-t).
 
 3. **Compute log importance weights:**
-<div>
-   \[
-   \\log w_{ik} = \\log p(y_i \\mid \\eta_{ik}, \\theta)
-                + \\log p(\\eta_{ik} \\mid \\theta)
-                - \\log q(\\eta_{ik}).
-   \]
-</div>
+$$
+\log w_{ik} = \log p(y_i \mid \eta_{ik}, \theta)
+                + \log p(\eta_{ik} \mid \theta)
+                - \log q(\eta_{ik}).
+$$
 
 4. **Subject marginal LL** via log-sum-exp:
-<div>
-   \[
-   \\log \\hat p(y_i \\mid \\theta)
-   \\;=\\; \\operatorname{lse}_k \\log w_{ik} - \\log K.
-   \]
-</div>
+$$
+\log \hat p(y_i \mid \theta)
+   \;=\; \operatorname{lse}_k \log w_{ik} - \log K.
+$$
 
 5. **Per-subject effective sample size:**
-   \\(\\mathrm{ESS}\_i = 1 / \\sum\_k \\tilde w\_{ik}^2\\) (normalised weights).
+   $\mathrm{ESS}_i = 1 / \sum_k \tilde w_{ik}^2$ (normalised weights).
    The result reports the across-subject min and median of ESS/K, plus
    any subjects below `imp_low_ess_threshold` (default 10%).
 
 6. **Monte-Carlo standard error.** For a self-normalised IS estimator the
    asymptotic per-subject variance (Geweke 1989) is
-<div>
-   \[
-   \\operatorname{Var}\\bigl(\\log \\hat p(y_i \\mid \\theta)\\bigr)
-   \\;\\approx\\; \\frac{1}{K}\\left(\\frac{1}{\\mathrm{ESS}_i / K} - 1\\right).
-   \]
-</div>
+$$
+\operatorname{Var}\bigl(\log \hat p(y_i \mid \theta)\bigr)
+   \;\approx\; \frac{1}{K}\left(\frac{1}{\mathrm{ESS}_i / K} - 1\right).
+$$
    Aggregating across subjects (LL is a sum of independent per-subject
    log-marginals) and converting to the `−2 log L` scale,
-<div>
-   \[
-   \\operatorname{SE}(-2 \\log L_{IS})
-   \\;=\\; 2 \\sqrt{\\sum_i \\operatorname{Var}\\bigl(\\log \\hat p(y_i \\mid \\theta)\\bigr)}.
-   \]
-</div>
-   Subjects with degenerate ESS (\\(\\mathrm{ESS}_i / K = 0\\) — complete
+$$
+\operatorname{SE}(-2 \log L_{IS})
+   \;=\; 2 \sqrt{\sum_i \operatorname{Var}\bigl(\log \hat p(y_i \mid \theta)\bigr)}.
+$$
+   Subjects with degenerate ESS ($\mathrm{ESS}_i / K = 0$ — complete
    proposal collapse) fall back to a per-subject variance of `1.0`, which
    produces a *finite* but inflated SE rather than a NaN. A separate
    warning is emitted on `FitResult.warnings` listing the collapsed
@@ -218,7 +208,7 @@ iteration / in evaluation-only mode) and inner-loop Jacobian Jᵢ = ∂f/∂η a
   estimate. Defaults 200 / 50. Under-running shows up as estimates still drifting
   with the MC noise; raise `imp_iterations` if the trace hasn't stabilised.
 - **K = `imp_samples`** controls accuracy. The MC SE scales as
-  \\(1/\\sqrt{K}\\); halve it by quadrupling K.
+  $1/\sqrt{K}$; halve it by quadrupling K.
   Default 1000 is fine for a smoke test; bump to 2000–5000 for any
   reported LL.
 - **ν = `imp_proposal_df`** controls the proposal tails. The default of 5

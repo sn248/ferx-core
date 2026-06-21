@@ -19,13 +19,17 @@ This approach mirrors NONMEM's modified Gauss-Newton algorithm.
 
 The FOCE objective has the form:
 
-\\[ \text{OFV} = 2 \sum_{i=1}^{N} \text{NLL}_i \\]
+$$
+\text{OFV} = 2 \sum_{i=1}^{N} \text{NLL}_i
+$$
 
 The BHHH approximation uses the outer product of per-subject gradients as an approximate Hessian:
 
-\\[ H_{\text{BHHH}} = 4 \sum_{i=1}^{N} g_i \, g_i^T \\]
+$$
+H_{\text{BHHH}} = 4 \sum_{i=1}^{N} g_i \, g_i^T
+$$
 
-where \\( g_i = \nabla_x \text{NLL}_i \\) is the gradient of the negative log-likelihood for subject \\( i \\) with respect to the packed parameter vector. Per-subject gradients are computed via central finite differences.
+where $g_i = \nabla_x \text{NLL}_i$ is the gradient of the negative log-likelihood for subject $i$ with respect to the packed parameter vector. Per-subject gradients are computed via central finite differences.
 
 This approximation is equivalent to the Gauss-Newton Hessian for log-likelihood objectives and is guaranteed positive semi-definite.
 
@@ -33,18 +37,22 @@ This approximation is equivalent to the Gauss-Newton Hessian for log-likelihood 
 
 To improve stability away from the minimum, the Hessian is regularized:
 
-\\[ H_{\text{LM}} = H_{\text{BHHH}} + \lambda \, \text{diag}(H_{\text{BHHH}}) \\]
+$$
+H_{\text{LM}} = H_{\text{BHHH}} + \lambda \, \text{diag}(H_{\text{BHHH}})
+$$
 
-The damping factor \\( \lambda \\) is adapted during optimization:
-- **On successful step** (OFV decreases): \\( \lambda \leftarrow 0.3 \, \lambda \\) (minimum \\( 10^{-6} \\))
-- **On rejected step** (OFV increases): \\( \lambda \leftarrow 10 \, \lambda \\)
-- If \\( \lambda > 10^6 \\), the algorithm stops
+The damping factor $\lambda$ is adapted during optimization:
+- **On successful step** (OFV decreases): $\lambda \leftarrow 0.3 \, \lambda$ (minimum $10^{-6}$)
+- **On rejected step** (OFV increases): $\lambda \leftarrow 10 \, \lambda$
+- If $\lambda > 10^6$, the algorithm stops
 
 The Newton step is obtained by solving:
 
-\\[ H_{\text{LM}} \, \delta = -\nabla \text{OFV} \\]
+$$
+H_{\text{LM}} \, \delta = -\nabla \text{OFV}
+$$
 
-via Cholesky decomposition. If the Cholesky fails (singular Hessian), \\( \lambda \\) is increased and the iteration is retried.
+via Cholesky decomposition. If the Cholesky fails (singular Hessian), $\lambda$ is increased and the iteration is retried.
 
 ### Line Search
 
@@ -53,7 +61,7 @@ Each step uses backtracking line search (up to 15 halvings). At each trial point
 ### Convergence
 
 The algorithm converges when:
-- Relative OFV change \\( < 10^{-6} \\) for at least 3 iterations, or
+- Relative OFV change $< 10^{-6}$ for at least 3 iterations, or
 - Maximum iterations are reached
 
 ## Hybrid Mode (GN + FOCEI)

@@ -88,11 +88,11 @@ can show spurious model misspecification even when the model is correct.
 
 Propensity-score matching restores the association. For each replicate:
 
-1. Draw a pool of `N` etas from \\( N(0, \Omega) \\) (`N` = number of subjects).
+1. Draw a pool of `N` etas from $N(0, \Omega)$ (`N` = number of subjects).
 2. Match the `N` drawn etas 1:1 (without replacement) to the `N` subjects'
    **fitted (posthoc) etas** under the **Mahalanobis** distance over the model
-   \\( \Omega \\):
-   \\( d^2(a,b) = (a-b)^\top \Omega^{-1} (a-b) \\)
+   $\Omega$:
+   $d^2(a,b) = (a-b)^\top \Omega^{-1} (a-b)$
    using the chosen `MatchMethod`:
    - **`Optimal`** — global minimum of the total matched distance (the linear
      assignment problem); mirrors `MatchIt(method = "optimal", distance =
@@ -100,7 +100,7 @@ Propensity-score matching restores the association. For each replicate:
    - **`Nearest`** — greedy nearest-neighbour in subject order; mirrors
      `MatchIt(method = "nearest", distance = "mahalanobis")`.
    - **`Rank`** — pair subjects and draws by the rank of their Mahalanobis norm
-     \\( \lVert \eta \rVert = \sqrt{\eta^\top \Omega^{-1} \eta} \\) (k-th order
+     $\lVert \eta \rVert = \sqrt{\eta^\top \Omega^{-1} \eta}$ (k-th order
      statistic to k-th).
 3. Each subject keeps its own observed design but is simulated with the drawn
    eta that matched its fitted eta — so a high-clearance draw lands on a subject
@@ -261,10 +261,10 @@ pub struct PredictionResult {
 
 For each replicate and each subject:
 
-1. Sample random effects: \\( \eta_i \sim N(0, \Omega) \\) using the Cholesky factor \\( L \\): \\( \eta = L \cdot z \\), where \\( z \sim N(0, I) \\)
+1. Sample random effects: $\eta_i \sim N(0, \Omega)$ using the Cholesky factor $L$: $\eta = L \cdot z$, where $z \sim N(0, I)$
 2. Compute individual PK parameters via `pk_param_fn(theta, eta, covariates)`
 3. Generate predictions using the structural model
-4. Add residual error: \\( DV = IPRED + \sqrt{V} \cdot \epsilon \\), where \\( \epsilon \sim N(0, 1) \\) and \\( V \\) is the residual variance from the error model
+4. Add residual error: $DV = IPRED + \sqrt{V} \cdot \epsilon$, where $\epsilon \sim N(0, 1)$ and $V$ is the residual variance from the error model
 
 ## Simulation with Uncertainty Process
 
@@ -272,9 +272,9 @@ For each replicate and each subject:
 parameter draws:
 
 1. **Outer loop** — for each of `n_uncertainty_draws`, draw a population
-   parameter set \\( (\theta_k, \Omega_k, \Sigma_k) \\) from the uncertainty
+   parameter set $(\theta_k, \Omega_k, \Sigma_k)$ from the uncertainty
    distribution.
-   - **Asymptotic**: \\( x_k = \hat{x} + L_\text{cov} z \\) in packed log-space
+   - **Asymptotic**: $x_k = \hat{x} + L_\text{cov} z$ in packed log-space
      (theta, Cholesky-omega, sigma share one packed vector), then unpack —
      theta, Omega, and Sigma are perturbed coherently from a single MVN draw.
    - **SIR**: pick a parameter vector at random from
@@ -284,10 +284,10 @@ parameter draws:
    theta/omega/sigma are rejected and resampled (up to `10 ×
    n_uncertainty_draws` attempts).
 
-2. **Inner loop** — for the drawn \\( (\theta_k, \Omega_k, \Sigma_k) \\), run
+2. **Inner loop** — for the drawn $(\theta_k, \Omega_k, \Sigma_k)$, run
    `n_sim_per_draw` replicates of the standard simulation process above.
-   Etas are drawn from \\( N(0, \Omega_k) \\) and epsilons from the drawn
-   \\( \Sigma_k \\).
+   Etas are drawn from $N(0, \Omega_k)$ and epsilons from the drawn
+   $\Sigma_k$.
 
 The resulting `SimulationResult` rows are tagged with both `draw` and `sim`
 so downstream code can compute either marginal bands (over all draws and

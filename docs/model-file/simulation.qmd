@@ -52,10 +52,10 @@ This will:
 
 ## Simulation Process
 
-1. For each subject, random effects are sampled from \\( \eta_i \sim N(0, \Omega) \\)
+1. For each subject, random effects are sampled from $\eta_i \sim N(0, \Omega)$
 2. Individual parameters are computed using the `[individual_parameters]` equations
 3. Predictions are generated using the structural model
-4. Residual error is added: \\( DV = IPRED + \epsilon \\), where \\( \epsilon \sim N(0, V) \\)
+4. Residual error is added: $DV = IPRED + \epsilon$, where $\epsilon \sim N(0, V)$
 5. Observations below 0.001 are clipped to 0.001
 
 ## Covariates in Simulation

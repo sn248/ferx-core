@@ -63,27 +63,27 @@ Each MCEM iteration, at the current parameters θ⁽ᵗ⁾, Ω⁽ᵗ⁾, σ⁽�
 
 1. **MAP re-center (E-step A).** Run the FOCE inner loop for every subject to get
    the conditional mode η̂ᵢ and Jacobian Jᵢ, and form the first-order-variance
-   Hessian \\(H_i = J_i^\\top R_i^{-1} J_i + \\Omega^{-1}\\).
+   Hessian $H_i = J_i^\top R_i^{-1} J_i + \Omega^{-1}$.
 
 2. **Importance sampling (E-step B).** Draw `K = impmap_samples` samples
-   \\(\\eta_{ik} \\sim q(\\hat\\eta_i, H_i^{-1})\\) — a Student-t by default
+   $\eta_{ik} \sim q(\hat\eta_i, H_i^{-1})$ — a Student-t by default
    (`impmap_proposal_df = 4`, heavier tails for robust importance weights), or a
    multivariate normal (`= normal`) —
    with self-normalized weights
-   \\(\\tilde w_{ik} \\propto p(y_i\\mid\\eta_{ik},\\theta)\\,p(\\eta_{ik}\\mid\\Omega)/q(\\eta_{ik})\\).
+   $\tilde w_{ik} \propto p(y_i\mid\eta_{ik},\theta)\,p(\eta_{ik}\mid\Omega)/q(\eta_{ik})$.
 
 3. **M-step.**
-   - **Ω** (closed form): \\(\\Omega = \\tfrac1N \\sum_i \\sum_k \\tilde w_{ik}\\,\\eta_{ik}\\eta_{ik}^\\top\\),
+   - **Ω** (closed form): $\Omega = \tfrac1N \sum_i \sum_k \tilde w_{ik}\,\eta_{ik}\eta_{ik}^\top$,
      then structural off-diagonals zeroed, FIX entries restored, free diagonals
      floored to stay positive-definite.
    - **θ** (mu-referenced): the log-typical value is shifted by the
      importance-weighted population mean random effect,
-     \\(\\log\\theta \\mathrel{+}= \\tfrac1N\\sum_i \\sum_k \\tilde w_{ik}\\,\\eta_{ik}\\).
+     $\log\theta \mathrel{+}= \tfrac1N\sum_i \sum_k \tilde w_{ik}\,\eta_{ik}$.
      Re-MAPing at the new θ drives the mean random effect toward zero, so this
      fixed-point iteration resolves the θ–η confounding that would otherwise
      inflate Ω.
    - **θ** (non-mu-ref) and **σ**: maximize the importance-weighted observation
-     likelihood \\(\\sum_i \\sum_k \\tilde w_{ik}\\log p(y_i\\mid\\eta_{ik},\\theta,\\sigma)\\)
+     likelihood $\sum_i \sum_k \tilde w_{ik}\log p(y_i\mid\eta_{ik},\theta,\sigma)$
      with a derivative-free NLopt BOBYQA step.
 
 > **High-dimensional models need more samples.** The self-normalized importance

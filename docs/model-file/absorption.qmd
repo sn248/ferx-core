@@ -16,11 +16,11 @@ zero-order families) are planned — see `plans/absorption-models.md`.
 The Savic et al. (2007) transit-compartment model with a **continuous** number
 of compartments `n`:
 
-\\[
+$$
 R_\text{in}(t_\text{ad}) = F\cdot\text{Dose}\;\cdot\;
 \text{KTR}\;\frac{(\text{KTR}\cdot t_\text{ad})^{n}\,e^{-\text{KTR}\cdot t_\text{ad}}}{\Gamma(n+1)},
 \qquad \text{KTR}=\frac{n+1}{\text{MTT}}
-\\]
+$$
 
 where `tad` is time after the dose, `MTT` is the mean transit time, and `KTR` is
 the transit rate constant. The input integrates to the full dose
@@ -140,10 +140,10 @@ time follows an **inverse-Gaussian distribution**, and the input rate is that
 density scaled by the dose, fed **straight into the central compartment** (no
 separate first-order `ka` step — the IG models the entire absorption delay):
 
-\\[
+$$
 R_\text{in}(t_\text{ad}) = \text{Dose}\;\sqrt{\frac{\text{MAT}}{2\pi\,\text{CV2}\,t_\text{ad}^{3}}}\;
 \exp\!\left(-\frac{(t_\text{ad}-\text{MAT})^2}{2\,\text{CV2}\,\text{MAT}\,t_\text{ad}}\right)
-\\]
+$$
 
 with mean absorption time `MAT` (the distribution mean μ) and relative dispersion
 `CV2` (= Var/mean², equivalently shape λ = MAT/CV2). Like `transit`, the input

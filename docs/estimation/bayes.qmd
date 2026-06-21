@@ -3,11 +3,11 @@
 `method = bayes` runs full MCMC Bayesian estimation — it draws from the joint
 posterior
 
-\\[
+$$
 p(\theta, \Omega, \Sigma, \{\eta_i\} \mid y) \propto
 \Big[\prod_i p(y_i \mid \theta, \eta_i, \Sigma)\,\mathcal{N}(\eta_i \mid 0, \Omega)\Big]\;
 p(\theta)\,p(\Omega)\,p(\Sigma)
-\\]
+$$
 
 rather than returning a single point estimate. It targets parity with NONMEM
 `METHOD=BAYES`. This is a **Gibbs-within-HMC** sampler (the "Path A" design): it
@@ -23,34 +23,34 @@ the other estimators already build, so it needs no population-level gradient.
 
 Each sweep, for each chain, cycles these blocks:
 
-1. **η block** — samples \\( \eta_i \mid \theta, \Omega, \Sigma, \kappa, y \\) for
-   every subject with a \\( \mathrm{chol}(\Omega) \\)-preconditioned block
+1. **η block** — samples $\eta_i \mid \theta, \Omega, \Sigma, \kappa, y$ for
+   every subject with a $\mathrm{chol}(\Omega)$-preconditioned block
    Metropolis kernel, or gradient-guided **HMC** when available (`n_leapfrog > 0`,
    an analytical-PK subject, no IOV). The HMC gradient is the exact analytic
    `Dual2` η-gradient — the same one FOCEI uses.
 
 1b. **κ block** (IOV models) — samples each per-occasion
-   \\( \kappa_{ik} \mid \eta, \theta, \Omega, \Omega_{iov}, y \\) holding η fixed.
+   $\kappa_{ik} \mid \eta, \theta, \Omega, \Omega_{iov}, y$ holding η fixed.
 
 2. **Ω block** — a conjugate **inverse-Wishart** draw
-   \\( \Omega \mid \{\eta_i\} \sim \mathcal{W}^{-1}(\nu_0 + N,\ \Lambda_0 + \textstyle\sum_i \eta_i\eta_i^\top) \\),
+   $\Omega \mid \{\eta_i\} \sim \mathcal{W}^{-1}(\nu_0 + N,\ \Lambda_0 + \textstyle\sum_i \eta_i\eta_i^\top)$,
    with structural zeros / fixed entries re-imposed and the diagonal floored.
 
 2c. **Ω_iov block** (IOV) — the same conjugate inverse-Wishart draw from the
-   per-occasion kappa scatter \\( \textstyle\sum_i\sum_k \kappa_{ik}\kappa_{ik}^\top \\).
+   per-occasion kappa scatter $\textstyle\sum_i\sum_k \kappa_{ik}\kappa_{ik}^\top$.
    The posterior `OMEGA_IOV(i,j)` entries appear in the summaries.
 
 3. **mu-referenced θ block** — for `P_i = θ·exp(η_i)` the population mean
-   \\( \mu = \log\theta \\) has the exact Gaussian full conditional
-   \\( \mu \sim \mathcal{N}(\mu_{\text{old}} + \bar\eta,\ \Omega/N) \\). The draw
-   is applied as a shift \\( s \\): \\( \theta \leftarrow \theta\,e^{s} \\) and
-   \\( \eta_i \leftarrow \eta_i - s \\), which leaves each individual parameter
-   \\( \log\varphi_i = \mu + \eta_i \\) unchanged (only the η-prior moves). This
+   $\mu = \log\theta$ has the exact Gaussian full conditional
+   $\mu \sim \mathcal{N}(\mu_{\text{old}} + \bar\eta,\ \Omega/N)$. The draw
+   is applied as a shift $s$: $\theta \leftarrow \theta\,e^{s}$ and
+   $\eta_i \leftarrow \eta_i - s$, which leaves each individual parameter
+   $\log\varphi_i = \mu + \eta_i$ unchanged (only the η-prior moves). This
    always-accepted Gibbs move is what gives the sampler good mixing.
 
 4. **(remaining θ, σ) block** — a random-walk Metropolis step in unconstrained
    space (log where the lower bound is ≥ 0) for any non-mu-referenced θ and for
-   σ, with objective \\( \sum_i \mathrm{nll}_i \\) (η and Ω fixed, so the η-prior
+   σ, with objective $\sum_i \mathrm{nll}_i$ (η and Ω fixed, so the η-prior
    term cancels in the acceptance ratio).
 
 Step sizes adapt during warmup toward a ~0.234 acceptance rate. Post-warmup
@@ -105,9 +105,9 @@ evidence; a single-chain run is warned about for this reason.
 
 ## Priors
 
-Defaults are weakly-informative (≈ flat given typical data): \\( \Omega \sim
-\mathcal{W}^{-1}(n_\eta + 2,\ \Omega_0) \\) centred at the initial Ω, and
-\\( \theta,\ \log\sigma \sim \mathcal{N}(\text{init},\ \mathrm{sd}=10) \\) on the
+Defaults are weakly-informative (≈ flat given typical data): $\Omega \sim
+\mathcal{W}^{-1}(n_\eta + 2,\ \Omega_0)$ centred at the initial Ω, and
+$\theta,\ \log\sigma \sim \mathcal{N}(\text{init},\ \mathrm{sd}=10)$ on the
 unconstrained scale. User-specifiable priors in the `.ferx` DSL are planned.
 
 ## Validation
@@ -118,5 +118,5 @@ and NONMEM `METHOD=BAYES` (TVCL ≈ 0.133, TVV ≈ 7.74, TVKA ≈ 0.83), with
 inverse-Wishart posterior-mean bias at small subject counts.
 
 > NONMEM reports `SIGMA` as the variance of `EPS`; ferx parameterises
-> proportional error as \\( \mathrm{Var} = (f\sigma)^2 \\) and reports σ as the
+> proportional error as $\mathrm{Var} = (f\sigma)^2$ and reports σ as the
 > SD, so compare `ferx σ ≈ √(NONMEM SIGMA)`.

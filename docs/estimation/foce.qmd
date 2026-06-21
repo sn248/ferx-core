@@ -8,9 +8,11 @@ First-Order Conditional Estimation (FOCE) and its interaction variant (FOCEI) ar
 
 ### Outer Loop (Population Parameters)
 
-The outer loop optimizes the population parameters \\( \theta \\), \\( \Omega \\), and \\( \sigma \\) by minimizing the population objective function value (OFV):
+The outer loop optimizes the population parameters $\theta$, $\Omega$, and $\sigma$ by minimizing the population objective function value (OFV):
 
-\\[ \text{OFV} = -2 \log L = \sum_{i=1}^{N} \text{OFV}_i \\]
+$$
+\text{OFV} = -2 \log L = \sum_{i=1}^{N} \text{OFV}_i
+$$
 
 Parameters are internally transformed for unconstrained optimization:
 - **Theta**: Log-transformed (ensures positivity)
@@ -19,9 +21,11 @@ Parameters are internally transformed for unconstrained optimization:
 
 ### Inner Loop (Empirical Bayes Estimates)
 
-For each subject, the inner loop finds the empirical Bayes estimate (EBE) of the random effects \\( \hat{\eta}_i \\) by minimizing the individual negative log-likelihood:
+For each subject, the inner loop finds the empirical Bayes estimate (EBE) of the random effects $\hat{\eta}_i$ by minimizing the individual negative log-likelihood:
 
-\\[ -\log p(\eta_i | y_i, \theta, \Omega, \sigma) = \frac{1}{2} \left[ \eta_i^T \Omega^{-1} \eta_i + \log|\Omega| + \sum_j \left( \frac{(y_{ij} - f_{ij})^2}{V_{ij}} + \log V_{ij} \right) \right] \\]
+$$
+-\log p(\eta_i | y_i, \theta, \Omega, \sigma) = \frac{1}{2} \left[ \eta_i^T \Omega^{-1} \eta_i + \log|\Omega| + \sum_j \left( \frac{(y_{ij} - f_{ij})^2}{V_{ij}} + \log V_{ij} \right) \right]
+$$
 
 The inner loop uses BFGS, falling back to Nelder-Mead simplex if BFGS fails.
 
@@ -39,11 +43,11 @@ When the population splits across routes, the banner shows per-route subject cou
 
 This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and for `imp`, which reuses the EBE Hessian built via the same route. SAEM is sampling-based and reports its E-step kernel on a `sampler:` line instead — see [SAEM](saem.qmd).
 
-If the EBE search wanders into a region where the individual NLL evaluates to a non-finite value (for example, an ODE model whose integration blows up at extreme \\( \eta \\)), that point is treated as the worst possible objective rather than aborting the fit. The subject is reported as non-converged and estimation continues for the remaining subjects.
+If the EBE search wanders into a region where the individual NLL evaluates to a non-finite value (for example, an ODE model whose integration blows up at extreme $\eta$), that point is treated as the worst possible objective rather than aborting the fit. The subject is reported as non-converged and estimation continues for the remaining subjects.
 
 ### Gradient accuracy vs cost (reconverged EBEs)
 
-By default the population gradient holds each subject's EBEs (\\( \hat\eta \\)) and FOCE Hessian fixed while perturbing the population parameters — the *fixed-EBE* gradient. This is cheap, but it omits the response of the inner solution to \\( \theta \\) and \\( \Omega \\). On well-conditioned problems that omitted term is negligible and a gradient optimizer matches the derivative-free `bobyqa` (the default; see [Outer Optimizers](optimizers.qmd)). On **ill-conditioned** problems it is not: the omitted term is what separates a true descent direction from a flat-looking plateau, and `slsqp` can report `converged` at an OFV far above the `bobyqa` optimum — which is exactly why `bobyqa` is the default.
+By default the population gradient holds each subject's EBEs ($\hat\eta$) and FOCE Hessian fixed while perturbing the population parameters — the *fixed-EBE* gradient. This is cheap, but it omits the response of the inner solution to $\theta$ and $\Omega$. On well-conditioned problems that omitted term is negligible and a gradient optimizer matches the derivative-free `bobyqa` (the default; see [Outer Optimizers](optimizers.qmd)). On **ill-conditioned** problems it is not: the omitted term is what separates a true descent direction from a flat-looking plateau, and `slsqp` can report `converged` at an OFV far above the `bobyqa` optimum — which is exactly why `bobyqa` is the default.
 
 Set `reconverge_gradient_interval = 1` (in `[fit_options]`) to re-solve the inner EBE loop at every finite-difference perturbation, recovering the full surface. This costs roughly **5–6×** per gradient — reserve it for fits whose OFV looks suspiciously high. IOV models (`kappa`/`block_kappa`) always reconverge, so the setting is a no-op there; it only changes non-IOV fits.
 
@@ -70,27 +74,33 @@ A larger `reconverge_gradient_interval` trades that accuracy back for speed: rec
 
 Uses linearized predictions around the EBEs:
 
-\\[ f_0 = f(\hat{\eta}) - H \hat{\eta} \\]
+$$
+f_0 = f(\hat{\eta}) - H \hat{\eta}
+$$
 
-where \\( H \\) is the Jacobian matrix \\( \partial f / \partial \eta \\). The per-subject objective is:
+where $H$ is the Jacobian matrix $\partial f / \partial \eta$. The per-subject objective is:
 
-\\[ \text{OFV}_i = (y - f_0)^T \tilde{R}^{-1} (y - f_0) + \log|\tilde{R}| \\]
+$$
+\text{OFV}_i = (y - f_0)^T \tilde{R}^{-1} (y - f_0) + \log|\tilde{R}|
+$$
 
-where \\( \tilde{R} = H \Omega H^T + R(f(\eta{=}0)) \\). The residual variance \\( R \\)
-is evaluated at the **population prediction** \\( f(\eta{=}0) \\) — matching NONMEM's
-`METHOD=1` (no `INTER`) semantics — not at the linearized point \\( f_0 \\). On a
-nonlinear model (e.g. oral absorption) the linearization \\( f_0 = f(\hat\eta) - H\hat\eta \\)
+where $\tilde{R} = H \Omega H^T + R(f(\eta{=}0))$. The residual variance $R$
+is evaluated at the **population prediction** $f(\eta{=}0)$ — matching NONMEM's
+`METHOD=1` (no `INTER`) semantics — not at the linearized point $f_0$. On a
+nonlinear model (e.g. oral absorption) the linearization $f_0 = f(\hat\eta) - H\hat\eta$
 can extrapolate to a near-zero or negative concentration where the true typical-individual
-prediction is healthy; evaluating a proportional variance \\( (f\sigma)^2 \\) there collapses
-the weight and makes the objective multimodal with an indefinite covariance. \\( f(\eta{=}0) \\)
+prediction is healthy; evaluating a proportional variance $(f\sigma)^2$ there collapses
+the weight and makes the objective multimodal with an indefinite covariance. $f(\eta{=}0)$
 is always physically sensible, so FOCE+proportional converges deterministically and matches
-NONMEM FOCE. Additive error is unaffected (\\( R \\) does not depend on \\( f \\)).
+NONMEM FOCE. Additive error is unaffected ($R$ does not depend on $f$).
 
 ### FOCEI (Interaction)
 
 Uses individual predictions directly without linearization. ferx-core implements the Laplace approximation form from Almquist et al. (2015):
 
-\\[ \text{OFV}_i = (y - \hat{f})^T V^{-1} (y - \hat{f}) + \hat{\eta}^T \Omega^{-1} \hat{\eta} + \log|\tilde{R}| \\]
+$$
+\text{OFV}_i = (y - \hat{f})^T V^{-1} (y - \hat{f}) + \hat{\eta}^T \Omega^{-1} \hat{\eta} + \log|\tilde{R}|
+$$
 
 FOCEI is more accurate when the residual variance depends on the predicted value (proportional or combined error models), because it captures the interaction between random effects and residual error.
 

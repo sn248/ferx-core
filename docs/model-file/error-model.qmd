@@ -20,7 +20,9 @@ DV ~ additive(SIGMA_NAME)
 
 The residual variance is constant across all predictions:
 
-\\[ \text{Var}(DV) = \sigma^2 \\]
+$$
+\text{Var}(DV) = \sigma^2
+$$
 
 Use when measurement error is independent of concentration (e.g., assay with fixed precision).
 
@@ -32,9 +34,11 @@ DV ~ proportional(SIGMA_NAME)
 
 The residual variance scales with the predicted value:
 
-\\[ \text{Var}(DV) = (\sigma \cdot f)^2 \\]
+$$
+\text{Var}(DV) = (\sigma \cdot f)^2
+$$
 
-where \\( f \\) is the model prediction. Use when measurement error increases with concentration (most common in PK).
+where $f$ is the model prediction. Use when measurement error increases with concentration (most common in PK).
 
 ### Combined
 
@@ -44,7 +48,9 @@ DV ~ combined(SIGMA_PROP, SIGMA_ADD)
 
 Combines proportional and additive components:
 
-\\[ \text{Var}(DV) = (\sigma_1 \cdot f)^2 + \sigma_2^2 \\]
+$$
+\text{Var}(DV) = (\sigma_1 \cdot f)^2 + \sigma_2^2
+$$
 
 Use when both proportional and additive error sources are present. Requires two sigma parameters defined in `[parameters]`.
 
@@ -94,7 +100,9 @@ Back-transform with `exp()` if you need natural-scale values.
 
 The likelihood term is the additive form on the log scale:
 
-\\[ \text{Var}(\log DV) = \sigma^2, \qquad \text{IWRES} = \frac{\log DV - \log f}{\sigma} \\]
+$$
+\text{Var}(\log DV) = \sigma^2, \qquad \text{IWRES} = \frac{\log DV - \log f}{\sigma}
+$$
 
 ### Restrictions
 

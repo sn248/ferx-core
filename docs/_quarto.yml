@@ -36,6 +36,7 @@ website:
 
   sidebar:
     style: floating
+    collapse-level: 1
     search: true
     contents:
       - text: "Introduction"

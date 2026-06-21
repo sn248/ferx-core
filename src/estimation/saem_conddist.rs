@@ -145,8 +145,11 @@ pub fn run_conditional_distribution(
 
             // Per-subject adaptive step scales (block / componentwise / kappa).
             // Block init matches the main SAEM loop (0.3, not the block target 0.40).
+            // The componentwise kernel adapts a *per-eta* scale (one coordinate at
+            // a time), mirroring the main loop's `cw_step_scales[i]` — each eta can
+            // reach its own optimal acceptance independently.
             let mut step_block = 0.3_f64;
-            let mut step_cw = 1.0_f64;
+            let mut step_cw = vec![1.0_f64; n_eta];
             let mut step_kappa = 0.3_f64;
 
             // Welford online mean/variance accumulators over retained draws.
@@ -159,9 +162,13 @@ pub fn run_conditional_distribution(
                 Vec::new()
             };
 
-            // Acceptance counters within the current adaptation window.
+            // Acceptance counters within the current adaptation window. The
+            // componentwise kernel tracks per-eta acceptance (each eta adapts
+            // independently); `prop_c` counts proposals *per eta* (every sweep
+            // proposes each eta exactly once).
             let (mut acc_b, mut prop_b) = (0usize, 0usize);
-            let (mut acc_c, mut prop_c) = (0usize, 0usize);
+            let mut acc_c = vec![0usize; n_eta];
+            let mut prop_c = 0usize;
             let (mut acc_k, mut prop_k) = (0usize, 0usize);
 
             let total_sweeps = burnin + nsamp;
@@ -187,9 +194,11 @@ pub fn run_conditional_distribution(
                 acc_b += nb;
                 prop_b += n_mh_steps;
 
-                // Kernel 2: componentwise decorrelating sweep.
+                // Kernel 2: componentwise decorrelating sweep. Returns per-eta
+                // acceptance counts; the total-proposal count is ignored in favour
+                // of the per-eta `n_cw_sweeps` so each eta adapts on its own rate.
                 if n_cw_sweeps > 0 {
-                    let (nc, pc, nll_c) = mh_steps_componentwise(
+                    let (per_eta_nc, _n_prop_cw, nll_c) = mh_steps_componentwise(
                         &mut eta,
                         nll,
                         subject,
@@ -197,7 +206,7 @@ pub fn run_conditional_distribution(
                         theta,
                         omega,
                         sigma,
-                        step_cw,
+                        &step_cw,
                         &cw_sd,
                         &mut rng,
                         n_cw_sweeps,
@@ -205,8 +214,10 @@ pub fn run_conditional_distribution(
                         omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
                     );
                     nll = nll_c;
-                    acc_c += nc;
-                    prop_c += pc;
+                    for j in 0..n_eta {
+                        acc_c[j] += per_eta_nc[j];
+                    }
+                    prop_c += n_cw_sweeps;
                 }
 
                 // Kernel 3: per-occasion kappa move (IOV only).
@@ -238,8 +249,19 @@ pub fn run_conditional_distribution(
                     acc_b = 0;
                     prop_b = 0;
                     if n_cw_sweeps > 0 {
-                        adapt_scale(&mut step_cw, acc_c, prop_c, 0.44);
-                        acc_c = 0;
+                        // Per-eta adaptation toward the 1-D optimum (~0.44; Roberts
+                        // & Rosenthal 2001), mirroring the main loop's componentwise
+                        // adaptation including its 1e-6 floor (vs 0.01 for the block
+                        // kernel) so near-deterministic etas aren't over-stepped.
+                        for j in 0..n_eta {
+                            let rate = acc_c[j] as f64 / prop_c.max(1) as f64;
+                            if rate > 0.44 {
+                                step_cw[j] = (step_cw[j] * 1.1).min(5.0);
+                            } else {
+                                step_cw[j] = (step_cw[j] * 0.9).max(1e-6);
+                            }
+                            acc_c[j] = 0;
+                        }
                         prop_c = 0;
                     }
                     if n_kappa > 0 {
@@ -336,6 +358,7 @@ mod tests {
             cens: vec![0, 0, 0],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }

@@ -2935,6 +2935,7 @@ fn fit_inner(
                     sir_fallback_proposal: None,
                     impmap_trace: None,
                     bayes: None,
+                    cond_dist: None,
                 });
             }
             let prev = result.as_ref().expect(

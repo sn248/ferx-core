@@ -1823,6 +1823,84 @@ mod tests {
         }
     }
 
+    /// Round-trip the conditional-distribution CSV writers (#257): a populated
+    /// `cond_dist` produces the documented `-conddist.csv` / `-conddist-samples.csv`
+    /// layouts, and the two error paths (no `cond_dist`, no retained samples)
+    /// return `Err` without creating a file.
+    #[test]
+    fn write_conddist_csv_and_samples_roundtrip() {
+        let mut s0 = sdtab_subject_result("1", 2);
+        s0.eta = nalgebra::DVector::from_vec(vec![0.10, -0.20]);
+        let mut s1 = sdtab_subject_result("2", 2);
+        s1.eta = nalgebra::DVector::from_vec(vec![0.30, 0.40]);
+        let mut r = minimal_sdtab_result(vec![s0, s1]);
+        r.eta_names = vec!["ETA_CL".to_string(), "ETA_V".to_string()];
+        r.cond_dist = Some(CondDist {
+            cond_mean: vec![vec![0.11, -0.19], vec![0.29, 0.41]],
+            cond_sd: vec![vec![0.05, 0.06], vec![0.07, 0.08]],
+            samples: vec![
+                vec![vec![0.10, -0.20], vec![0.12, -0.18]],
+                vec![vec![0.28, 0.40], vec![0.30, 0.42]],
+            ],
+            shrinkage: vec![0.2, 0.3],
+            nsamp: 2,
+            burnin: 1,
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // --- conditional mean/SD/mode CSV ---
+        let cd_path = dir.path().join("m-conddist.csv");
+        write_conddist_csv(&r, cd_path.to_str().unwrap()).expect("write conddist csv");
+        let lines: Vec<String> = std::fs::read_to_string(&cd_path)
+            .unwrap()
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(lines[0], "ID,ETA,COND_MEAN,COND_SD,COND_MODE");
+        // header + 2 subjects × 2 eta
+        assert_eq!(lines.len(), 5);
+        // subject 1, ETA_CL: mean 0.11, sd 0.05, mode = eta[0] = 0.10
+        assert_eq!(lines[1], "1,ETA_CL,0.110000,0.050000,0.100000");
+        // subject 2, ETA_V: mean 0.41, sd 0.08, mode = eta[1] = 0.40
+        assert_eq!(lines[4], "2,ETA_V,0.410000,0.080000,0.400000");
+
+        // --- raw draws CSV ---
+        let sp = dir.path().join("m-conddist-samples.csv");
+        write_conddist_samples_csv(&r, sp.to_str().unwrap()).expect("write samples csv");
+        let slines: Vec<String> = std::fs::read_to_string(&sp)
+            .unwrap()
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(slines[0], "ID,SAMPLE,ETA_CL,ETA_V");
+        // header + 2 subjects × 2 draws
+        assert_eq!(slines.len(), 5);
+        assert_eq!(slines[1], "1,1,0.100000,-0.200000");
+        assert_eq!(slines[4], "2,2,0.300000,0.420000");
+
+        // --- error path: no conditional-distribution results ---
+        let mut r_none = minimal_sdtab_result(vec![]);
+        r_none.cond_dist = None;
+        assert!(write_conddist_csv(&r_none, "unused").is_err());
+        assert!(write_conddist_samples_csv(&r_none, "unused").is_err());
+
+        // --- error path: cond_dist present but no draws retained ---
+        let mut s = sdtab_subject_result("1", 1);
+        s.eta = nalgebra::DVector::from_vec(vec![0.0]);
+        let mut r_nodraws = minimal_sdtab_result(vec![s]);
+        r_nodraws.eta_names = vec!["ETA_CL".to_string()];
+        r_nodraws.cond_dist = Some(CondDist {
+            cond_mean: vec![vec![0.0]],
+            cond_sd: vec![vec![0.1]],
+            samples: vec![vec![]],
+            shrinkage: vec![f64::NAN],
+            nsamp: 0,
+            burnin: 0,
+        });
+        assert!(write_conddist_samples_csv(&r_nodraws, "unused").is_err());
+    }
+
     fn sdtab_subject(id: &str, n_obs: usize, obs_cmts: Vec<usize>) -> Subject {
         use std::collections::HashMap;
         Subject {

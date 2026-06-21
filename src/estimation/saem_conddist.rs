@@ -457,7 +457,7 @@ mod tests {
         opts.saem_conddist = true;
         opts.saem_conddist_nsamp = 200;
         opts.saem_conddist_burnin = 20; // adapt_interval now = max(1, 20/10) = 2
-        opts.saem_adapt_interval = 50;  // must NOT gate adaptation (old bug)
+        opts.saem_adapt_interval = 50; // must NOT gate adaptation (old bug)
         opts.saem_seed = Some(3);
 
         let cd = run_conditional_distribution(

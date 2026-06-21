@@ -129,10 +129,7 @@ fn main() {
                         &samples_path,
                     ) {
                         Ok(()) => {
-                            eprintln!(
-                                "Conditional-distribution draws written to {}",
-                                samples_path
-                            )
+                            eprintln!("Conditional-distribution draws written to {}", samples_path)
                         }
                         Err(e) => eprintln!("Warning: failed to write conddist draws: {}", e),
                     }

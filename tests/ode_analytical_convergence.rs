@@ -111,6 +111,53 @@ fn ode_fit_converges_to_analytical_estimates_and_se() {
     let se_ode = ode.se_theta.as_ref().expect("ODE SEs");
     let names = ["TVCL", "TVV", "TVKA"];
 
+    // Side-by-side numbers: analytical (NONMEM-validated) vs armed ODE.
+    eprintln!("\n=== warfarin 1-cpt-oral FOCEI: analytical vs user-ODE (#410) ===");
+    eprintln!(
+        "OFV       analytical={:.4}   ODE={:.4}   Δ={:+.4}",
+        an.ofv,
+        ode.ofv,
+        ode.ofv - an.ofv
+    );
+    eprintln!(
+        "{:<10} {:>14} {:>14} {:>10}",
+        "param", "analytical", "ODE", "rel"
+    );
+    for i in 0..3 {
+        let rel = (an.theta[i] - ode.theta[i]).abs() / an.theta[i].abs();
+        eprintln!(
+            "{:<10} {:>14.6} {:>14.6} {:>9.1e}",
+            names[i], an.theta[i], ode.theta[i], rel
+        );
+    }
+    for k in 0..3 {
+        let rel = (an.omega[(k, k)] - ode.omega[(k, k)]).abs() / an.omega[(k, k)].abs();
+        eprintln!(
+            "{:<10} {:>14.6} {:>14.6} {:>9.1e}",
+            format!("om2[{k}]"),
+            an.omega[(k, k)],
+            ode.omega[(k, k)],
+            rel
+        );
+    }
+    let rel_sig = (an.sigma[0] - ode.sigma[0]).abs() / an.sigma[0].abs();
+    eprintln!(
+        "{:<10} {:>14.6} {:>14.6} {:>9.1e}",
+        "sigma", an.sigma[0], ode.sigma[0], rel_sig
+    );
+    eprintln!("-- standard errors --");
+    for i in 0..3 {
+        let rel = (se_an[i] - se_ode[i]).abs() / se_an[i].abs();
+        eprintln!(
+            "{:<10} {:>14.6} {:>14.6} {:>9.1e}",
+            format!("SE({})", names[i]),
+            se_an[i],
+            se_ode[i],
+            rel
+        );
+    }
+    eprintln!();
+
     // Estimates agree tightly (same objective; only ODE-solver truncation differs).
     for i in 0..3 {
         let rel = (an.theta[i] - ode.theta[i]).abs() / an.theta[i].abs();

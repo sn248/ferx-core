@@ -111,6 +111,25 @@ pub fn ode_subject_sensitivities(
     if subject.doses.iter().any(|d| d.ss && d.ii > 0.0) {
         return None;
     }
+    // Modeled-`RATE` doses (`RATE=-1`→`R{cmt}` rate, `RATE=-2`→`D{cmt}` duration)
+    // arrive *unresolved* — the production ODE path resolves them from the PK params
+    // per evaluation (`resolve_modeled_doses`, #324), but the dual walk reads
+    // `subject.doses` directly. An unresolved infusion would integrate with the raw
+    // coded rate/duration (a bolus/zero-input surrogate), so route these subjects to
+    // FD, mirroring the analytical provider's `all_doses_fixed` gate (#410 fallback
+    // hardening).
+    if !subject.all_doses_fixed() {
+        return None;
+    }
+    // #419: a *rate-defined* infusion under bioavailability `F ≠ 1` reshapes the
+    // infusion window (NONMEM holds the rate and scales the duration to `F·amt/rate`)
+    // rather than scaling the magnitude. The dual walk applies `F` as a rate
+    // magnitude scale (`f_bio · rate` over the original window), which diverges from
+    // the production predictor for these subjects — route them to FD so the analytic
+    // gradient stays the gradient of the actual objective.
+    if model.has_bioavailability() && subject.has_rate_defined_infusion() {
+        return None;
+    }
 
     // Dispatch on the individual-parameter count so the dual width is right-sized.
     macro_rules! dispatch {

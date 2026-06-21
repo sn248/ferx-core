@@ -208,8 +208,8 @@ noise.
 
 | Quantity (per-subject η) | corr | max&#124;diff&#124; | RMSE |
 |---|---|---|---|
-| conditional mean | 1.0000 | 0.0038 | 0.0011 |
-| conditional SD   | 0.9909 | 0.0023 | 0.0009 |
+| conditional mean | 1.0000 | 0.0029 | 0.0011 |
+| conditional SD   | 0.9913 | 0.0024 | 0.0009 |
 | mode / MAP       | 1.0000 | 0.0002 | 0.0001 |
 
 **vs NONMEM** (`$EST METHOD=SAEM` then `METHOD=IMP EONLY=1`; conditional moments
@@ -218,8 +218,8 @@ read from the `.phi` file — `PHI(k) − log θ_k` is the η conditional mean,
 
 | Quantity (per-subject η) | corr | max&#124;diff&#124; | RMSE |
 |---|---|---|---|
-| conditional mean | 1.0000 | 0.0018 | 0.0006 |
-| conditional SD   | 0.9964 | 0.0015 | 0.0005 |
+| conditional mean | 1.0000 | 0.0012 | 0.0004 |
+| conditional SD   | 0.9987 | 0.0017 | 0.0004 |
 
 (ferx `conddist_nsamp = 2000`. Comparison scripts:
 `tests/reference/saem_conddist/bench_saemix_conddist.R`,

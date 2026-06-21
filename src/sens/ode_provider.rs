@@ -115,22 +115,26 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // (ODE models have no `tv_fn` — typical values come from `pk_param_fn` at
     // η = 0 instead; see `run_subject`.)
     // Lagtime shifts the dosing timeline; supporting an estimated lagtime needs
-    // ∂(timeline)/∂θ, which is not yet wired — exclude models that estimate it. This
-    // catches the bare `PK_IDX_LAGTIME` slot; the compartment-indexed `ALAG{n}` form
-    // lands in the dose-attr map instead (never at `PK_IDX_LAGTIME`) and is declined
-    // alongside `F` just below.
-    if model.pk_indices.iter().any(|&s| s == PK_IDX_LAGTIME) {
+    // ∂(timeline)/∂θ, which is not yet wired — exclude models that estimate it.
+    // Use `has_lagtime()`, not a raw `pk_indices`/`PK_IDX_LAGTIME` scan: an ODE
+    // model wires lagtime by name (bare `LAGTIME`/`ALAG`, or a compartment-indexed
+    // `ALAG{n}` routed through the `DoseAttrMap`), and neither a named bare lag nor
+    // an `ALAG{n}` lands in `pk_indices` (see `CompiledModel::has_lagtime`). The
+    // dual loop never applies the dose-attr lag, so a missed `ALAG{n}` would yield a
+    // no-lag gradient that diverges from the f64 predictor (#430 / #449 review #1).
+    // Bioavailability F *is* supported (it scales the dose amount/rate as a dual).
+    if model.has_lagtime() {
         return false;
     }
-    // Per-compartment bioavailability / lag time (`F1`/`F2`, `ALAG{n}`, #369):
-    // production resolves `f_bio(d.cmt)` per dose compartment and shifts the dose to
-    // `d.time + lagtime(d.cmt)`, but both the static `integrate_g` and the TV-cov
-    // walk apply the single bare `PK_IDX_F` slot and dose at the bare `d.time`. A
-    // compartment-indexed `F` or lag would give the wrong analytic gradient, so
-    // decline to FD (the bare / no-`F` case is unaffected) (#449 review #7, #1).
-    let attrs = model.active_dose_attr_map();
-    if attrs.has_indexed_attr(crate::types::DoseAttr::F)
-        || attrs.has_indexed_attr(crate::types::DoseAttr::Lag)
+    // Per-compartment bioavailability (`F1`/`F2`, #369): production resolves
+    // `f_bio(d.cmt)` per dose compartment, but both the static `integrate_g` and the
+    // TV-cov walk apply the single bare `PK_IDX_F` slot, so a compartment-indexed `F`
+    // would give the wrong analytic gradient — decline to FD (the bare / no-`F` case
+    // is unaffected). (Per-compartment lag is already covered by `has_lagtime()`
+    // above.) (#449 review #7, #1)
+    if model
+        .active_dose_attr_map()
+        .has_indexed_attr(crate::types::DoseAttr::F)
     {
         return false;
     }
@@ -2893,6 +2897,71 @@ mod tests {
   ode_abstol = 1e-11
 "#;
 
+    // Same as IGD_ODE but with an estimated bioavailability F. The dose into the
+    // igd() compartment is suppressed as a bolus and fed to `R_in` as `F·amt`, so
+    // F appears *only* inside the forcing — `∂f/∂THETA_F` exercises the F
+    // derivative carried by the Dual2 forcing's `f_bio` (uncovered by IGD_ODE,
+    // which has no F; #430 review finding 2).
+    const IGD_ODE_F: &str = r#"
+[parameters]
+  theta TVCL(5.0,  0.1, 100.0)
+  theta TVV(50.0,  5.0, 500.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.3, 0.001, 10.0)
+  theta THETA_F(0.7, 0.001, 0.999)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  MAT = TVMAT
+  CV2 = TVCV2
+  F   = THETA_F
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    // Same as IGD_ODE but with a compartment-indexed absorption lag `ALAG1` on
+    // the igd() compartment. The lag is wired through the `DoseAttrMap`, *not*
+    // `pk_indices` (and not the bare `PK_IDX_LAGTIME` slot), so the provider gate
+    // must consult `has_lagtime()` to exclude it (#430 review finding 1).
+    const IGD_ALAG_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0,  0.1, 100.0)
+  theta TVV(50.0,  5.0, 500.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.3, 0.001, 10.0)
+  theta TVLAG(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV  * exp(ETA_V)
+  MAT   = TVMAT
+  CV2   = TVCV2
+  ALAG1 = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
     // Same disposition shape but with a `transit()` forcing — *not* lifted to
     // Dual2 in slice 1, so it must stay on the FD fallback.
     const TRANSIT_ODE: &str = r#"
@@ -2973,6 +3042,43 @@ mod tests {
             ode_subject_sensitivities(&model, &subject, &[5.0, 50.0, 2.0, 0.3], &[0.1, -0.05])
                 .is_none(),
             "IG + reset must fall back to FD in slice 1 of #430"
+        );
+    }
+
+    /// Bioavailability F on an igd() model flows *only* through the input-rate
+    /// forcing (the dose into the absorption compartment is suppressed as a bolus
+    /// and fed to `R_in` as `F·amt`), so the analytic `∂f/∂THETA_F` here exercises
+    /// the F derivative carried by the Dual2 forcing — the path IGD_ODE (no F)
+    /// leaves untested (#430 review finding 2).
+    #[test]
+    fn ode_provider_igd_absorption_with_f_matches_production() {
+        let model = parse_model_string(IGD_ODE_F).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "igd()+F should be supported (F scales the dose as a dual)"
+        );
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = vec![5.0, 50.0, 2.0, 0.3, 0.7];
+        let eta = vec![0.1, -0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+    }
+
+    /// Regression for #430 review finding 1: an igd() model that also declares a
+    /// compartment-indexed `ALAG{n}` lag must stay on the FD fallback. The lag is
+    /// wired through the `DoseAttrMap`, so it lands in neither `pk_indices` nor the
+    /// bare `PK_IDX_LAGTIME` slot — the gate must consult `has_lagtime()`, or it
+    /// would serve the model and the dual loop would compute a no-lag gradient
+    /// that diverges from the f64 predictor (which shifts the forcing by the lag).
+    #[test]
+    fn ode_provider_igd_with_alag_stays_on_fd_fallback() {
+        let model = parse_model_string(IGD_ALAG_ODE).expect("parse");
+        assert!(
+            model.has_lagtime(),
+            "ALAG1 must enable has_lagtime() (precondition for the gate)"
+        );
+        assert!(
+            !ode_analytical_supported(&model),
+            "igd()+ALAG1 must stay on the FD fallback (#430 finding 1)"
         );
     }
 }

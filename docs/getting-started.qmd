@@ -1,0 +1,6 @@
+# Getting Started
+
+This section covers installing ferx-core and running your first model.
+
+- [Installation](installation.qmd) -- Setting up the Rust toolchain and building ferx-core
+- [Quick Start](quick-start.qmd) -- Running a complete PopPK analysis in under 5 minutes

@@ -84,8 +84,8 @@
 </details>
 
 ## Docs
-- [ ] `docs/src/` updated for user-visible changes
-- [ ] New pages linked in `docs/src/SUMMARY.md` (do **not** commit `docs/book/` — it is git-ignored; CI builds & deploys it)
+- [ ] `docs/` updated for user-visible changes
+- [ ] New pages linked in `docs/_quarto.yml` (do **not** commit `docs/_site/` — it is git-ignored; CI builds & deploys it)
 - [ ] `CHANGELOG.md` `[Unreleased]` entry added (user-facing change), or N/A (internal/refactor/CI)
 - [ ] No user-visible change
 

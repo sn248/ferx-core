@@ -3063,6 +3063,84 @@ mod tests {
         check_vs_production(&model, &subject, &theta, &eta);
     }
 
+    /// Multi-dose superposition through the IG dual forcing: with two doses the
+    /// forcing loop sums `R_in(tad)` over both, and the analytic ∂f/∂(η,θ) must
+    /// still match the production predictor + FD. The single-dose IGD_ODE parity
+    /// test never exercises the superposition sum.
+    #[test]
+    fn ode_provider_igd_multidose_matches_production() {
+        let model = parse_model_string(IGD_ODE).expect("parse");
+        let mut subject = bolus_subject(&[0.5, 1.5, 4.0, 8.0, 13.0, 16.0, 25.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 80.0, 1, 0.0, false, 0.0),
+        ];
+        let theta = vec![5.0, 50.0, 2.0, 0.3];
+        let eta = vec![0.1, -0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+    }
+
+    /// Second-order blocks of the IG forcing: `check_vs_production` only checks
+    /// first order, but FOCEI consumes `d2f_deta2` and `d2f_deta_dtheta`. Validate
+    /// both against central FD of the analytic (already FD-checked) `df_deta` — if
+    /// the forcing's Dual2 second-order content were wrong, this fails while the
+    /// first-order parity still passes. TVMAT/TVCV2 are θ-only and live solely in
+    /// the forcing, so the θ-cross block exercises the forcing's curvature.
+    #[test]
+    fn ode_provider_igd_second_order_matches_fd_of_gradient() {
+        let model = parse_model_string(IGD_ODE).expect("parse");
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = vec![5.0, 50.0, 2.0, 0.3];
+        let eta = vec![0.1, -0.05];
+        let n_eta = model.n_eta;
+        let n_theta = model.n_theta;
+        let base = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+
+        // η-η block: FD of df_deta over η.
+        let he = 1e-5;
+        for l in 0..n_eta {
+            let mut ep = eta.clone();
+            ep[l] += he;
+            let mut em = eta.clone();
+            em[l] -= he;
+            let sp = ode_subject_sensitivities(&model, &subject, &theta, &ep).expect("supported");
+            let sm = ode_subject_sensitivities(&model, &subject, &theta, &em).expect("supported");
+            for (j, obs) in base.obs.iter().enumerate() {
+                for k in 0..n_eta {
+                    let fd = (sp.obs[j].df_deta[k] - sm.obs[j].df_deta[k]) / (2.0 * he);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta2[k * n_eta + l],
+                        fd,
+                        max_relative = 2e-3,
+                        epsilon = 1e-6
+                    );
+                }
+            }
+        }
+
+        // η-θ cross block: FD of df_deta over θ.
+        for m in 0..n_theta {
+            let s = 1e-5 * (1.0 + theta[m].abs());
+            let mut tp = theta.clone();
+            tp[m] += s;
+            let mut tm = theta.clone();
+            tm[m] -= s;
+            let sp = ode_subject_sensitivities(&model, &subject, &tp, &eta).expect("supported");
+            let sm = ode_subject_sensitivities(&model, &subject, &tm, &eta).expect("supported");
+            for (j, obs) in base.obs.iter().enumerate() {
+                for k in 0..n_eta {
+                    let fd = (sp.obs[j].df_deta[k] - sm.obs[j].df_deta[k]) / (2.0 * s);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta_dtheta[k * n_theta + m],
+                        fd,
+                        max_relative = 2e-3,
+                        epsilon = 1e-6
+                    );
+                }
+            }
+        }
+    }
+
     /// Regression for #430 review finding 1: an igd() model that also declares a
     /// compartment-indexed `ALAG{n}` lag must stay on the FD fallback. The lag is
     /// wired through the `DoseAttrMap`, so it lands in neither `pk_indices` nor the

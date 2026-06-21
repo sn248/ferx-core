@@ -115,25 +115,8 @@ fn main() {
             }
 
             // SAEM conditional-distribution outputs (only when the pass ran).
-            if let Some(cd) = &fit_result.cond_dist {
-                let cd_path = format!("{}-conddist.csv", model_name);
-                match ferx_core::io::output::write_conddist_csv(&fit_result, &cd_path) {
-                    Ok(()) => eprintln!("Conditional distribution written to {}", cd_path),
-                    Err(e) => eprintln!("Warning: failed to write conddist: {}", e),
-                }
-                // Raw draws — only write when samples were retained; skip quietly otherwise.
-                if !cd.samples.iter().all(|s| s.is_empty()) {
-                    let samples_path = format!("{}-conddist-samples.csv", model_name);
-                    match ferx_core::io::output::write_conddist_samples_csv(
-                        &fit_result,
-                        &samples_path,
-                    ) {
-                        Ok(()) => {
-                            eprintln!("Conditional-distribution draws written to {}", samples_path)
-                        }
-                        Err(e) => eprintln!("Warning: failed to write conddist draws: {}", e),
-                    }
-                }
+            for msg in ferx_core::io::output::write_conddist_outputs(&fit_result, &model_name) {
+                eprintln!("{}", msg);
             }
 
             let yaml_path = format!("{}-fit.yaml", model_name);

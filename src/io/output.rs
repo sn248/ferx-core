@@ -868,6 +868,41 @@ pub fn write_conddist_samples_csv(result: &FitResult, path: &str) -> Result<(), 
     Ok(())
 }
 
+/// Emit the conditional-distribution CSV outputs (#257) for a completed fit,
+/// returning the human-facing status/warning lines for the caller to print.
+///
+/// Returns an empty `Vec` when the fit carries no conditional-distribution
+/// results (the pass was not enabled). Otherwise it always attempts
+/// `{model}-conddist.csv`, and writes `{model}-conddist-samples.csv` only when
+/// draws were retained — surfacing any real write error rather than swallowing
+/// it. Pulling this out of the CLI `main()` keeps the dispatch unit-testable.
+pub fn write_conddist_outputs(result: &FitResult, model_name: &str) -> Vec<String> {
+    let mut messages = Vec::new();
+    let Some(cd) = result.cond_dist.as_ref() else {
+        return messages;
+    };
+
+    let cd_path = format!("{}-conddist.csv", model_name);
+    match write_conddist_csv(result, &cd_path) {
+        Ok(()) => messages.push(format!("Conditional distribution written to {}", cd_path)),
+        Err(e) => messages.push(format!("Warning: failed to write conddist: {}", e)),
+    }
+
+    // Raw draws — only write when samples were retained; skip quietly otherwise.
+    if !cd.samples.iter().all(|s| s.is_empty()) {
+        let samples_path = format!("{}-conddist-samples.csv", model_name);
+        match write_conddist_samples_csv(result, &samples_path) {
+            Ok(()) => messages.push(format!(
+                "Conditional-distribution draws written to {}",
+                samples_path
+            )),
+            Err(e) => messages.push(format!("Warning: failed to write conddist draws: {}", e)),
+        }
+    }
+
+    messages
+}
+
 /// Format a numeric cell for CSV output: NaN → empty (missing), else 6 dp.
 fn fmt_num(v: f64) -> String {
     if v.is_nan() {
@@ -1848,11 +1883,22 @@ mod tests {
         });
 
         let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("m");
+        let model_name = model.to_str().unwrap();
+
+        // Drive the CLI dispatch helper: with retained draws it writes both files
+        // and reports both.
+        let msgs = write_conddist_outputs(&r, model_name);
+        assert_eq!(
+            msgs.len(),
+            2,
+            "expected conddist + samples messages: {msgs:?}"
+        );
+        assert!(msgs[0].starts_with("Conditional distribution written to"));
+        assert!(msgs[1].starts_with("Conditional-distribution draws written to"));
 
         // --- conditional mean/SD/mode CSV ---
-        let cd_path = dir.path().join("m-conddist.csv");
-        write_conddist_csv(&r, cd_path.to_str().unwrap()).expect("write conddist csv");
-        let lines: Vec<String> = std::fs::read_to_string(&cd_path)
+        let lines: Vec<String> = std::fs::read_to_string(format!("{model_name}-conddist.csv"))
             .unwrap()
             .lines()
             .map(|l| l.to_string())
@@ -1866,26 +1912,28 @@ mod tests {
         assert_eq!(lines[4], "2,ETA_V,0.410000,0.080000,0.400000");
 
         // --- raw draws CSV ---
-        let sp = dir.path().join("m-conddist-samples.csv");
-        write_conddist_samples_csv(&r, sp.to_str().unwrap()).expect("write samples csv");
-        let slines: Vec<String> = std::fs::read_to_string(&sp)
-            .unwrap()
-            .lines()
-            .map(|l| l.to_string())
-            .collect();
+        let slines: Vec<String> =
+            std::fs::read_to_string(format!("{model_name}-conddist-samples.csv"))
+                .unwrap()
+                .lines()
+                .map(|l| l.to_string())
+                .collect();
         assert_eq!(slines[0], "ID,SAMPLE,ETA_CL,ETA_V");
         // header + 2 subjects × 2 draws
         assert_eq!(slines.len(), 5);
         assert_eq!(slines[1], "1,1,0.100000,-0.200000");
         assert_eq!(slines[4], "2,2,0.300000,0.420000");
 
-        // --- error path: no conditional-distribution results ---
+        // --- dispatch: no conditional-distribution results → no files, no messages ---
         let mut r_none = minimal_sdtab_result(vec![]);
         r_none.cond_dist = None;
+        assert!(write_conddist_outputs(&r_none, model_name).is_empty());
+        // The writers themselves return Err on a missing cond_dist.
         assert!(write_conddist_csv(&r_none, "unused").is_err());
         assert!(write_conddist_samples_csv(&r_none, "unused").is_err());
 
-        // --- error path: cond_dist present but no draws retained ---
+        // --- dispatch: cond_dist present but no draws retained → only the mean/SD
+        // file is written (one message); the samples writer is skipped quietly. ---
         let mut s = sdtab_subject_result("1", 1);
         s.eta = nalgebra::DVector::from_vec(vec![0.0]);
         let mut r_nodraws = minimal_sdtab_result(vec![s]);
@@ -1898,6 +1946,10 @@ mod tests {
             nsamp: 0,
             burnin: 0,
         });
+        let model2 = dir.path().join("n");
+        let msgs2 = write_conddist_outputs(&r_nodraws, model2.to_str().unwrap());
+        assert_eq!(msgs2.len(), 1, "samples skipped when no draws: {msgs2:?}");
+        // And the samples writer returns Err directly for the no-draws case.
         assert!(write_conddist_samples_csv(&r_nodraws, "unused").is_err());
     }
 

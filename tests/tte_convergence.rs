@@ -280,3 +280,340 @@ fn tte_convergence_exponential_fixed_matches_survreg() {
     );
     assert!(r.ofv.is_finite(), "OFV must be finite");
 }
+
+// ═══════════════════════════ Weibull ═══════════════════════════════════════════
+//
+// Validation dataset puts between-subject variability on the *shape* (scale fixed):
+// scale_pop = 20, shape_pop = 2, omega^2(log shape) = 0.20, censored at t = 30.
+
+const WEIBULL_TRUTH: &str = r"
+[parameters]
+  theta TVSCALE(20.0, 0.1, 500.0)
+  theta TVSHAPE(2.0,  0.1, 10.0)
+  omega ETA_SHAPE ~ 0.20
+
+[event_model]
+  cmt    = 2
+  family = weibull
+  scale  = TVSCALE
+  shape  = TVSHAPE * exp(ETA_SHAPE)
+";
+
+const WEIBULL_FIT: &str = r"
+[parameters]
+  theta TVSCALE(15.0, 0.1, 500.0)
+  theta TVSHAPE(1.2,  0.1, 10.0)
+  omega ETA_SHAPE ~ 0.05
+
+[event_model]
+  cmt    = 2
+  family = weibull
+  scale  = TVSCALE
+  shape  = TVSHAPE * exp(ETA_SHAPE)
+";
+
+const WEIBULL_FIT_FIXED: &str = r"
+[parameters]
+  theta TVSCALE(15.0, 0.1, 500.0)
+  theta TVSHAPE(1.2,  0.1, 10.0)
+
+[event_model]
+  cmt    = 2
+  family = weibull
+  scale  = TVSCALE
+  shape  = TVSHAPE
+";
+
+const WEIBULL_REF_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/reference/tte_weibull/tte_weibull.csv"
+);
+
+// survreg(Surv(TIME,DV)~1, dist="weibull") on tte_weibull.csv, mapped to ferx's
+// (scale, shape) via shape = 1/scale_sr, scale = exp(intercept). See survreg.R.
+const SURVREG_WEIBULL_SHAPE: f64 = 2.119250;
+const SURVREG_WEIBULL_SCALE: f64 = 22.176599;
+
+/// SSE: recover (scale=20, shape=2, omega^2=0.20) from a large simulated dataset.
+#[test]
+fn tte_sse_weibull_recovers_truth() {
+    const N: usize = 2000;
+    const T_CENSOR: f64 = 30.0;
+    const SEED: u64 = 20260622;
+
+    let truth = parse_model_string(WEIBULL_TRUTH).expect("truth model must parse");
+    let sims = simulate_with_seed(&truth, &tte_sim_template(N), &truth.default_params, 1, SEED);
+
+    let pairs: Vec<(f64, u8)> = sims
+        .iter()
+        .map(|r| match r.outcome {
+            SimOutcome::Event { time, .. } => {
+                if time <= T_CENSOR {
+                    (time, 1)
+                } else {
+                    (T_CENSOR, 0)
+                }
+            }
+            _ => panic!("expected an Event outcome"),
+        })
+        .collect();
+
+    let model = parse_model_string(WEIBULL_FIT).expect("fit model must parse");
+    let r = fit(
+        &model,
+        &tte_pop_from_pairs(&pairs),
+        &model.default_params,
+        &fit_opts(),
+    )
+    .expect("SSE fit must succeed");
+
+    let scale = r.theta[0];
+    let shape = r.theta[1];
+    let omega2 = r.omega[(0, 0)];
+    eprintln!(
+        "[SSE weibull] scale = {scale:.4} (truth 20), shape = {shape:.4} (truth 2), omega^2 = {omega2:.4} (truth 0.20)"
+    );
+
+    // Structural parameters recover tightly under FOCEI.
+    assert!(
+        (18.5..21.5).contains(&scale),
+        "scale not recovered: got {scale:.4}, expected ~20"
+    );
+    assert!(
+        (1.85..2.15).contains(&shape),
+        "shape not recovered: got {shape:.4}, expected ~2"
+    );
+    // omega^2 (frailty on the *shape* — a nonlinear hazard parameter) is materially
+    // OVER-estimated by FOCEI-Laplace: observed ~0.35 vs truth 0.20 (+~75%), and it
+    // does NOT vanish as the true omega^2 shrinks (truth 0.05 → ~0.16). A SAEM fit of
+    // the same data gives ~0.13 — i.e. the estimators straddle the truth, confirming
+    // a FOCEI approximation limitation for nonlinear-parameter frailty (plan §3.3/§13:
+    // SAEM/IMP preferred for TTE), not a likelihood bug (fixed-effects matches survreg
+    // exactly). Tracked in #440. The assertion is therefore only a sane-range guard
+    // (omega^2 neither collapsed to ~0 nor exploded), wide enough to also pass once the
+    // estimator is improved — see expected.md for the documented numbers.
+    assert!(
+        (0.12..0.55).contains(&omega2),
+        "omega^2 out of sane range: got {omega2:.4} (FOCEI over-estimates nonlinear-frailty omega^2; truth 0.20, see #440)"
+    );
+    assert!(r.ofv.is_finite(), "OFV must be finite");
+}
+
+/// Cross-tool, exact: fixed-effects (n_eta=0) Weibull MLE must match `survreg`
+/// (both scale and shape) on the same dataset.
+#[test]
+fn tte_convergence_weibull_fixed_matches_survreg() {
+    let model = parse_model_string(WEIBULL_FIT_FIXED).expect("fixed-effects model must parse");
+    assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
+
+    let (pop, _cov) = read_population_for(&model, &None, WEIBULL_REF_CSV, None, None, None)
+        .expect("reference CSV reads");
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
+
+    let scale = r.theta[0];
+    let shape = r.theta[1];
+    eprintln!(
+        "[fixed weibull] scale = {scale:.4} (survreg {SURVREG_WEIBULL_SCALE:.4}), shape = {shape:.4} (survreg {SURVREG_WEIBULL_SHAPE:.4}), OFV = {:.4}",
+        r.ofv
+    );
+
+    let scale_err = (scale - SURVREG_WEIBULL_SCALE).abs() / SURVREG_WEIBULL_SCALE;
+    let shape_err = (shape - SURVREG_WEIBULL_SHAPE).abs() / SURVREG_WEIBULL_SHAPE;
+    assert!(
+        scale_err < 0.01,
+        "scale {scale:.4} must match survreg {SURVREG_WEIBULL_SCALE:.4} within 1% (rel_err {scale_err:.4})"
+    );
+    assert!(
+        shape_err < 0.01,
+        "shape {shape:.4} must match survreg {SURVREG_WEIBULL_SHAPE:.4} within 1% (rel_err {shape_err:.4})"
+    );
+    assert!(r.ofv.is_finite(), "OFV must be finite");
+}
+
+/// Cross-tool: mixed-effects (frailty-on-shape) FOCEI fit of the committed Weibull
+/// dataset — the row NONMEM/nlmixr2 fill. Records ferx's estimates; the FOCEI
+/// over-estimation of the shape-frailty omega^2 (#440) shows up here on real data too.
+#[test]
+fn tte_convergence_weibull_mixed() {
+    let model = parse_model_string(WEIBULL_FIT).expect("fit model must parse");
+    let (pop, _cov) = read_population_for(&model, &None, WEIBULL_REF_CSV, None, None, None)
+        .expect("reference CSV reads");
+    assert_eq!(pop.subjects.len(), 100, "reference dataset is 100 subjects");
+
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
+    let scale = r.theta[0];
+    let shape = r.theta[1];
+    let omega2 = r.omega[(0, 0)];
+    eprintln!(
+        "[weibull mixed] scale = {scale:.4} (truth 20), shape = {shape:.4} (truth 2), omega^2 = {omega2:.4} (truth 0.20), OFV = {:.4}",
+        r.ofv
+    );
+
+    // Gross-failure guard; exact estimates are tabulated in expected.md.
+    assert!(
+        (15.0..26.0).contains(&scale),
+        "scale off: got {scale:.4}, expected ~20"
+    );
+    assert!(
+        (1.5..2.8).contains(&shape),
+        "shape off: got {shape:.4}, expected ~2"
+    );
+    assert!(
+        (0.05..0.70).contains(&omega2),
+        "omega^2 off: got {omega2:.4}, expected ~0.20 (FOCEI over-estimates; see #440)"
+    );
+    assert!(r.ofv.is_finite(), "OFV must be finite");
+}
+
+// ═══════════════════════════ Gompertz ══════════════════════════════════════════
+//
+// Validation dataset is a fixed-effects 2-arm RCT: h = alpha*exp(gamma*t)*exp(loghr*TRT),
+// alpha = exp(-6) ≈ 0.00248, gamma = exp(-5.4) ≈ 0.00450, loghr = -0.8, censored at 365.
+// No survreg/base-R anchor exists for Gompertz, so recovery is the guard (NONMEM/nlmixr2
+// are the cross-tool hand-off). The fit exercises the [event_model] covariate + loghr path.
+
+const GOMPERTZ_FIT: &str = r"
+[parameters]
+  theta TVALPHA(0.001, 1e-6, 1.0)
+  theta TVGAMMA(0.003, 1e-5, 5.0)
+  theta LHR(-0.3, -5.0, 5.0)
+
+[event_model]
+  cmt    = 2
+  family = gompertz
+  alpha  = TVALPHA
+  gamma  = TVGAMMA
+  loghr  = LHR * TRT
+";
+
+const GOMPERTZ_REF_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/reference/tte_gompertz/tte_gompertz.csv"
+);
+
+/// Frailty-Gompertz SSE truth (BSV on gamma) — recover alpha, gamma, omega^2.
+const GOMPERTZ_TRUTH_FRAILTY: &str = r"
+[parameters]
+  theta TVALPHA(0.002, 1e-6, 1.0)
+  theta TVGAMMA(0.05,  1e-5, 5.0)
+  omega ETA_GAMMA ~ 0.05
+
+[event_model]
+  cmt    = 2
+  family = gompertz
+  alpha  = TVALPHA
+  gamma  = TVGAMMA * exp(ETA_GAMMA)
+";
+
+const GOMPERTZ_FIT_FRAILTY: &str = r"
+[parameters]
+  theta TVALPHA(0.001, 1e-6, 1.0)
+  theta TVGAMMA(0.03,  1e-5, 5.0)
+  omega ETA_GAMMA ~ 0.02
+
+[event_model]
+  cmt    = 2
+  family = gompertz
+  alpha  = TVALPHA
+  gamma  = TVGAMMA * exp(ETA_GAMMA)
+";
+
+/// Cross-tool: fixed-effects Gompertz RCT fit on the committed dataset. Recovers
+/// the data-generating alpha/gamma/loghr and exercises the TRT covariate path.
+/// (NONMEM/nlmixr2 columns are the hand-off.)
+#[test]
+fn tte_convergence_gompertz_rct_recovers() {
+    let model = parse_model_string(GOMPERTZ_FIT).expect("gompertz model must parse");
+    assert_eq!(model.n_eta, 0, "RCT model is fixed-effects");
+    assert!(
+        model.referenced_covariates.contains(&"TRT".to_string()),
+        "TRT must be picked up from the loghr expression"
+    );
+
+    let (pop, _cov) = read_population_for(&model, &None, GOMPERTZ_REF_CSV, None, None, None)
+        .expect("reference CSV reads");
+    assert_eq!(pop.subjects.len(), 300, "reference dataset is 300 subjects");
+
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
+    let alpha = r.theta[0];
+    let gamma = r.theta[1];
+    let loghr = r.theta[2];
+    eprintln!(
+        "[gompertz RCT] alpha = {alpha:.6} (truth 0.00248), gamma = {gamma:.6} (truth 0.00450), loghr = {loghr:.4} (truth -0.8), OFV = {:.4}",
+        r.ofv
+    );
+
+    assert!(
+        (0.0012..0.0045).contains(&alpha),
+        "alpha off: got {alpha:.6}, expected ~0.00248"
+    );
+    assert!(
+        (0.0025..0.0070).contains(&gamma),
+        "gamma off: got {gamma:.6}, expected ~0.00450"
+    );
+    assert!(
+        (-1.3..-0.3).contains(&loghr),
+        "loghr off: got {loghr:.4}, expected ~-0.8"
+    );
+    assert!(r.ofv.is_finite(), "OFV must be finite");
+}
+
+/// SSE: frailty-Gompertz (BSV on gamma) recovery of alpha/gamma/omega^2.
+#[test]
+fn tte_sse_gompertz_recovers_truth() {
+    const N: usize = 2000;
+    const T_CENSOR: f64 = 80.0;
+    const SEED: u64 = 20260623;
+
+    let truth = parse_model_string(GOMPERTZ_TRUTH_FRAILTY).expect("truth model must parse");
+    let sims = simulate_with_seed(&truth, &tte_sim_template(N), &truth.default_params, 1, SEED);
+
+    let pairs: Vec<(f64, u8)> = sims
+        .iter()
+        .map(|r| match r.outcome {
+            SimOutcome::Event { time, .. } => {
+                if time <= T_CENSOR {
+                    (time, 1)
+                } else {
+                    (T_CENSOR, 0)
+                }
+            }
+            _ => panic!("expected an Event outcome"),
+        })
+        .collect();
+
+    let model = parse_model_string(GOMPERTZ_FIT_FRAILTY).expect("fit model must parse");
+    let r = fit(
+        &model,
+        &tte_pop_from_pairs(&pairs),
+        &model.default_params,
+        &fit_opts(),
+    )
+    .expect("SSE fit must succeed");
+
+    let alpha = r.theta[0];
+    let gamma = r.theta[1];
+    let omega2 = r.omega[(0, 0)];
+    eprintln!(
+        "[SSE gompertz] alpha = {alpha:.5} (truth 0.002), gamma = {gamma:.5} (truth 0.05), omega^2 = {omega2:.4} (truth 0.05)"
+    );
+
+    // alpha and gamma trade off (the Gompertz baseline/growth collinearity), so
+    // allow a wider alpha band; gamma is the better-determined of the two.
+    assert!(
+        (0.0012..0.0028).contains(&alpha),
+        "alpha not recovered: got {alpha:.5}, expected ~0.002"
+    );
+    assert!(
+        (0.043..0.060).contains(&gamma),
+        "gamma not recovered: got {gamma:.5}, expected ~0.05"
+    );
+    // omega^2 (frailty on *gamma*, a nonlinear hazard parameter) is over-estimated by
+    // FOCEI-Laplace (~0.08 vs truth 0.05), the same nonlinear-frailty limitation seen
+    // for the Weibull shape (#440). Sane-range guard only; documented in expected.md.
+    assert!(
+        (0.03..0.13).contains(&omega2),
+        "omega^2 out of sane range: got {omega2:.4} (FOCEI over-estimates nonlinear-frailty omega^2; truth 0.05, see #440)"
+    );
+    assert!(r.ofv.is_finite(), "OFV must be finite");
+}

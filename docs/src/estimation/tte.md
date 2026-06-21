@@ -243,6 +243,25 @@ $THETA (0.001, 0.05, 10)
 $OMEGA 0.09
 ```
 
+### Weibull and Gompertz
+
+The same validation kit exists for Weibull (`tests/reference/tte_weibull/`) and Gompertz
+(`tests/reference/tte_gompertz/`). Highlights:
+
+- **Weibull** fixed-effects fit matches `survreg` exactly (scale 22.18, shape 2.12); the
+  300-subject **Gompertz** RCT fixed-effects fit recovers `log_alpha`, `log_gamma` and the
+  treatment `log_hr` essentially exactly, exercising the `[event_model]` covariate + `loghr`
+  term.
+
+> **Choosing an estimator for frailty TTE.** When a random effect sits on a *nonlinear* hazard
+> parameter (e.g. the Weibull **shape** or Gompertz **growth rate**, not the exponential rate),
+> FOCEI-Laplace **over-estimates** the frailty variance `omega^2` — a clean large-N
+> simulation–estimation check recovers the structural parameters but inflates `omega^2`
+> (Weibull shape: 0.34 vs a true 0.20), while a SAEM fit of the same data reads lower (~0.13).
+> This is an approximation limitation, not a likelihood error (fixed-effects fits match
+> `survreg` exactly). Prefer **SAEM/IMP** for frailty TTE on nonlinear parameters, as in the
+> standard pharmacometric guidance; FOCEI on a *linear* rate (exponential) is near-unbiased.
+
 ## See also
 
 - `examples/tte_exponential.ferx` — minimal worked example

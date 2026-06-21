@@ -2213,16 +2213,22 @@ and the `predict_survival` R wrapper remain.
 #### Remaining — deferred from Phase 1
 
 **Estimation:**
-- 🟡 Tier 3 convergence tests (`tests/tte_convergence.rs`, gated `survival,slow-tests`) — **Exponential
-  done** (branch `test/tte-phase1-validation`): `tte_sse_exponential_recovers_truth` (N=2000 SSE →
-  λ −1%, ω² −7%), `tte_convergence_exponential_mixed`, and `tte_convergence_exponential_fixed_matches_survreg`
-  (ferx n_eta=0 rate **exactly** matches base-R `survreg`: 0.074506, OFV 589.888). slow-tests.yml now
-  passes `survival` so these run nightly. **Weibull + Gompertz Tier-3 still ❌.**
-- 🟡 NONMEM/nlmixr2 reference comparison — Exponential: dataset regenerated (canonical 100-subj
-  `tte_exp.csv`, 82 events/18% cens), license-free columns (ferx FOCEI + `survreg`) filled in
-  `expected.md` and `docs/src/estimation/tte.md`; **NONMEM/nlmixr2 columns are a hand-off**
-  (`tests/reference/tte_exponential/README.md` — needs a NONMEM licence + nlmixr2 install).
-  Weibull + Gompertz comparison still ❌.
+- ✅ Tier 3 convergence + SSE tests (`tests/tte_convergence.rs`, gated `survival,slow-tests`) — **all
+  three families done** (branch `test/tte-phase1-validation`, 8 tests): Exponential SSE (N=2000 →
+  λ −1%, ω² −7%) + mixed + fixed-vs-`survreg` (**exact**: 0.074506, OFV 589.888); Weibull SSE +
+  mixed + fixed-vs-`survreg` (**exact**: scale 22.177, shape 2.119, OFV 640.261); Gompertz fixed-effects
+  RCT recovery (alpha/gamma/**loghr** ≈ exact, exercises the `[event_model]` covariate path) + frailty SSE.
+  `slow-tests.yml` now passes `survival` so these run nightly.
+- ✅ NONMEM/nlmixr2 reference comparison — datasets regenerated (canonical `tte_exp.csv` 100-subj,
+  `tte_weibull.csv` 100-subj, `tte_gompertz.csv` 300-subj RCT); license-free columns (ferx FOCEI +
+  `survreg` where applicable) filled in each `expected.md` + `docs/src/estimation/tte.md`;
+  **NONMEM/nlmixr2 columns are a hand-off** (per-family `README.md` + zips — need a NONMEM licence /
+  nlmixr2 install). Tracked in **#440**.
+- ⚠️ **Finding (#440): FOCEI-Laplace over-estimates frailty ω² on *nonlinear* hazard parameters**
+  (Weibull shape +72%, Gompertz gamma +62% at N=2000; does not vanish as ω²→0; SAEM of the same data
+  reads ~0.13 vs FOCEI 0.34). Likelihood is exact (fixed-effects matches `survreg`); structural params
+  recover. Confirms §3.3/§13 (SAEM/IMP preferred for TTE). FOCEI on a *linear* rate (Exponential) is
+  near-unbiased (−7%). Candidate Phase 3/3b follow-up: SAEM/IMP comparison + Shi FD-step audit (§9.3).
 
 **Parser / DSL:**
 - ❌ `[event_model]` expressions cannot reference `[individual_parameters]` names — `param_fn`

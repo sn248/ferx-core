@@ -27,7 +27,7 @@ Each sweep, for each chain, cycles these blocks:
    every subject with a \\( \mathrm{chol}(\Omega) \\)-preconditioned block
    Metropolis kernel, or gradient-guided **HMC** when available (`n_leapfrog > 0`,
    an analytical-PK subject, no IOV). The HMC gradient is the exact analytic
-   `Dual2` η-gradient — the same one FOCEI uses — so no autodiff is required.
+   `Dual2` η-gradient — the same one FOCEI uses.
 
 1b. **κ block** (IOV models) — samples each per-occasion
    \\( \kappa_{ik} \mid \eta, \theta, \Omega, \Omega_{iov}, y \\) holding η fixed.

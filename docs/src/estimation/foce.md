@@ -27,7 +27,7 @@ The inner loop uses BFGS, falling back to Nelder-Mead simplex if BFGS fails.
 
 ### Gradient route (analytic vs FD)
 
-The BFGS gradient is the **exact analytic η-gradient** computed from hand-rolled forward sensitivities (the `Dual2` type over the closed-form PK solutions) when the model is in scope, and central **finite differences (FD)** otherwise. The analytic route requires an analytical PK model and is resolved **per subject**, so individual subjects fall back to FD for ODE models, log-transform-both-sides (LTBS), expression-based scaling, or time-varying covariates. It is the default (`gradient_method = auto`); one provider evaluation replaces FD's `~2·n_eta+1` predictions per inner step, so it is exact and faster as the parameter count grows. (`gradient = ad` — the retired Enzyme path — now errors; use `auto` or `fd`.)
+The BFGS gradient is the **exact analytic η-gradient** computed from hand-rolled forward sensitivities (the `Dual2` type over the closed-form PK solutions) when the model is in scope, and central **finite differences (FD)** otherwise. The analytic route requires an analytical PK model and is resolved **per subject**, so individual subjects fall back to FD for ODE models, log-transform-both-sides (LTBS), expression-based scaling, or time-varying covariates. It is the default (`gradient_method = auto`); one provider evaluation replaces FD's `~2·n_eta+1` predictions per inner step, so it is exact and faster as the parameter count grows. Use `gradient_method = fd` only when you want to force finite differences.
 
 The startup banner reports the route **actually resolved** across the population — not just the requested setting — so a silent analytic→FD fallback is visible:
 

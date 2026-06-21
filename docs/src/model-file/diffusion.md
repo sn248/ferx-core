@@ -132,7 +132,7 @@ the ODE alone explains the data; a large value suggests model misspecification.
 |---|---|
 | `[diffusion]` on an analytical PK model (`pk ...`) | Parse-time error |
 | `method = saem` with `[diffusion]` | Hard error at fit time |
-| `gradient_method = ad` with `[diffusion]` | Warning emitted; automatically switched to `fd` |
+| Analytic gradients with `[diffusion]` | Not supported; use `gradient_method = fd` |
 | State name not in `states = [...]` | Parse-time error |
 | Negative initial value | Parse-time error |
 

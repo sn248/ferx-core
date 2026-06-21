@@ -63,7 +63,7 @@ When `n_leapfrog` is set to a positive integer (e.g. `3`), one HMC proposal repl
 
 with momentum \\( p \sim N(0, I) \\) and a standard velocity Störmer-Verlet (leapfrog) integrator. Acceptance is on \\( \Delta H \\), targeting ~65% acceptance.
 
-**Requirements**: an analytical PK model (no ODE). The HMC gradient is the exact analytic `Dual2` η-gradient (the same one FOCEI uses) — no autodiff. A warning is emitted if `n_leapfrog > 0` but the model is out of the analytic provider's scope.
+**Requirements**: an analytical PK model (no ODE). The HMC gradient is the exact analytic `Dual2` η-gradient (the same one FOCEI uses). A warning is emitted if `n_leapfrog > 0` but the model is out of the analytic provider's scope.
 
 **Per-subject fallback to MH**: `hmc_step` silently falls back to MH for a subject when any of the following conditions hold:
 - The model uses an ODE (`[odes]` block present)

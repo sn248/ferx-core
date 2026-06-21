@@ -18,7 +18,7 @@ pub struct CompiledModel {
     pub theta_names: Vec<String>,
     pub eta_names: Vec<String>,
     pub default_params: ModelParameters,
-    pub tv_fn: Option<...>,          // Typical values function (for AD)
+    pub tv_fn: Option<...>,          // Typical values function for analytical PK
     pub pk_indices: Vec<usize>,      // Maps eta index -> PK parameter index
     pub ode_spec: Option<OdeSpec>,   // ODE specification (if ODE model)
 }

@@ -56,6 +56,9 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- **Documentation no longer references the retired Enzyme/autodiff installation or
+  usage path**, and now describes `gradient = auto` / `gradient = fd` with the
+  analytic `Dual2` sensitivity provider (#381).
 - **SAEM/Bayes HMC step-size adaptation** targeted the random-walk acceptance rate
   (≈0.234) for the gradient-guided HMC η-kernel, which over-inflated the leapfrog
   step until trajectories diverged — over-dispersing η and biasing the residual

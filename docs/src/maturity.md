@@ -78,7 +78,6 @@ visible at the point of use:
 | Importance sampling (IMP) | **beta** | [Importance Sampling](estimation/importance-sampling.md) |
 | Outer optimizers (BOBYQA, SLSQP, L-BFGS, MMA, trust-region) | **beta** | [Outer Optimizers](estimation/optimizers.md) |
 | Time-to-event estimation (TTE) | **beta** | [Time-to-Event](estimation/tte.md) |
-| Automatic differentiation (`gradient_method = ad`) | **beta** | [Fit Options](model-file/fit-options.md) |
 
 > The label reflects the engine's overall confidence in a feature, not the
 > presence or absence of tests — a beta feature may still have extensive

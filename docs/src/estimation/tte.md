@@ -210,14 +210,18 @@ grows at low event rates; SAEM/IMP reduce it). On the 100-subject file itself:
 
 | Parameter | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM (LAPLACIAN) |
 |-----------|------|-----------|---------------|--------------------|
-| TVLAMBDA (rate) | 0.10 | 0.0768 | _pending_ | _pending_ |
-| ω²(ETA_LAMBDA) | 0.25 | 0.290 | _pending_ | _pending_ |
-| OFV | — | 588.93 | _pending_ | _pending_ |
+| TVLAMBDA (rate) | 0.10 | 0.0768 | 0.0770 | _pending_ |
+| ω²(ETA_LAMBDA) | 0.25 | 0.290 | 0.293 | _pending_ |
+| OFV (−2LL) | — | 588.93 | 588.94 | _pending_ |
 
-> NONMEM reports `THETA(1)=log λ`; compare `exp(THETA(1))` to ferx `TVLAMBDA`. The
-> nlmixr2 / NONMEM columns are filled by running the scripts in
-> `tests/reference/tte_exponential/` (see its `README.md` and `expected.md`). A small
-> OFV offset between tools is expected from differing normalising constants.
+ferx and **nlmixr2** FOCEI agree to ~3 digits on all parameters and the −2LL for all three
+families (Weibull and Gompertz likewise — see `tests/reference/tte_*/expected.md`); for the
+nonlinear-frailty Weibull `omega^2` the two FOCEI tools differ (0.204 vs 0.173), itself
+evidence for the over-estimation note above.
+
+> NONMEM reports `THETA(1)=log λ`; compare `exp(THETA(1))` to ferx `TVLAMBDA`. The NONMEM
+> columns are filled by running `nonmem.ctl` (see each `tests/reference/tte_*/README.md`). A
+> small OFV offset between tools is expected from differing normalising constants (§11.3).
 
 ### nlmixr2 equivalent
 

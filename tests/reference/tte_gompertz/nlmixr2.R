@@ -12,10 +12,9 @@
 library(nlmixr2)
 
 dat <- read.csv("tte_gompertz.csv")
-names(dat)[names(dat) == "ID"]   <- "id"
-names(dat)[names(dat) == "DV"]   <- "event"
-names(dat)[names(dat) == "TIME"] <- "time"
-# TRT column is a covariate — keep as-is; nlmixr2 will find it in the data.
+# Keep the standard DV/TIME columns (nlmixr2 requires them); the ll(tte) model
+# references an `event` column, so mirror DV into it. TRT stays as a covariate.
+dat$event <- dat$DV
 
 gompertz_model <- function() {
   ini({
@@ -32,8 +31,10 @@ gompertz_model <- function() {
   })
 }
 
-fit <- nlmixr(gompertz_model, dat, est = "bobyqa",
-              control = bobyqaControl(print = 5))
+# NB: `est = "bobyqa"` (as in the nlmixr2 blog) fails to fit this TTE model in
+# nlmixr2 5.x; FOCEI is used instead (fixed-effects, so FOCEI == plain ML here).
+fit <- nlmixr(gompertz_model, dat, est = "focei",
+              control = foceiControl(print = 5))
 
 print(fit)
 cat("\n--- Key values for expected.md ---\n")

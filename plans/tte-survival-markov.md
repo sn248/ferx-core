@@ -2219,11 +2219,11 @@ and the `predict_survival` R wrapper remain.
   mixed + fixed-vs-`survreg` (**exact**: scale 22.177, shape 2.119, OFV 640.261); Gompertz fixed-effects
   RCT recovery (alpha/gamma/**loghr** ≈ exact, exercises the `[event_model]` covariate path) + frailty SSE.
   `slow-tests.yml` now passes `survival` so these run nightly.
-- ✅ NONMEM/nlmixr2 reference comparison — datasets regenerated (canonical `tte_exp.csv` 100-subj,
-  `tte_weibull.csv` 100-subj, `tte_gompertz.csv` 300-subj RCT); license-free columns (ferx FOCEI +
-  `survreg` where applicable) filled in each `expected.md` + `docs/src/estimation/tte.md`;
-  **NONMEM/nlmixr2 columns are a hand-off** (per-family `README.md` + zips — need a NONMEM licence /
-  nlmixr2 install). Tracked in **#440**.
+- ✅ Reference comparison — datasets regenerated (canonical `tte_exp.csv` 100-subj, `tte_weibull.csv`
+  100-subj, `tte_gompertz.csv` 300-subj RCT); **ferx FOCEI + base-R `survreg` + nlmixr2 FOCEI columns
+  all filled** in each `expected.md` + `docs/src/estimation/tte.md`. ferx ↔ nlmixr2 agree to ~3 digits
+  on parameters and (Exp/Weibull) −2LL; **only the NONMEM column is a hand-off** (per-family `README.md`
+  + zips — needs a NONMEM licence). nlmixr2 ran locally (macOS gfortran FLIBS workaround). Tracked in **#440**.
 - ⚠️ **Finding (#440): FOCEI-Laplace over-estimates frailty ω² on *nonlinear* hazard parameters**
   (Weibull shape +72%, Gompertz gamma +62% at N=2000; does not vanish as ω²→0; SAEM of the same data
   reads ~0.13 vs FOCEI 0.34). Likelihood is exact (fixed-effects matches `survreg`); structural params

@@ -14,8 +14,12 @@ effect, censored at t=365 (231 events, 77%). Data-generating `log_alpha=−6.0`,
 |---|---|---|
 | `tte_gompertz.csv` | dataset (`ID,TIME,DV,TRT,EVID,CMT,MDV`) | — |
 | `simulate.R` | regenerates the dataset (base R, seed 42) | done |
-| `nlmixr2.R` | fixed-effects Gompertz fit (needs `nlmixr2`) | **hand-off** |
+| `nlmixr2.R` | fixed-effects Gompertz fit (needs `nlmixr2`; uses FOCEI — `bobyqa` fails in 5.x) | ✅ done (column filled) |
 | `nonmem.ctl` | fixed-effects `LAPLACIAN` fit with TRT covariate (needs NONMEM) | **hand-off** |
+
+> **nlmixr2 done** — log_alpha/gamma/hr agree with ferx within ~3%; OFV not cross-tool
+> comparable for Gompertz (constants, see `expected.md`). Only NONMEM remains. macOS link
+> gotcha: see the FLIBS note in `../tte_exponential/README.md`.
 | `expected.md` | filled comparison + nlmixr2 blog cross-reference | paste results |
 
 ## Run the hand-off pieces

@@ -20,14 +20,17 @@ recovery of the *truth*.
 
 | Parameter | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM LAPLACIAN |
 |---|---|---|---|---|
-| lambda_pop (rate) | 0.100 | **0.0768** | TODO | TODO |
-| log(lambda_pop) | −2.303 | **−2.567** | TODO | TODO |
-| omega^2 (var log-rate) | 0.250 | **0.290** | TODO | TODO |
-| OFV (−2LL) | — | **588.93** | TODO | TODO |
+| lambda_pop (rate) | 0.100 | **0.0768** | **0.0770** | TODO |
+| log(lambda_pop) | −2.303 | **−2.567** | **−2.5626** | TODO |
+| omega^2 (var log-rate) | 0.250 | **0.290** | **0.293** | TODO |
+| OFV (−2LL) | — | **588.93** | **588.94** | TODO |
 
-ferx values: `cargo test --features survival,slow-tests --test tte_convergence`
-(`tte_convergence_exponential_mixed`). Fill the nlmixr2 / NONMEM columns by running
-`nlmixr2.R` / `nonmem.ctl` — see `README.md`.
+ferx ↔ nlmixr2 FOCEI **agree to ~3 digits on every parameter and the −2LL** — strong
+license-free cross-tool validation. (nlmixr2's raw "OBJF" 405.15 omits the data normalizing
+constants; the comparable −2LL is `AIC − 2·npar = 592.94 − 4 = 588.94`, §11.3.) ferx values:
+`cargo test --features survival,slow-tests --test tte_convergence`
+(`tte_convergence_exponential_mixed`); nlmixr2 from `nlmixr2.R`. Fill the NONMEM column from
+`nonmem.ctl` — see `README.md`.
 
 ## Fixed-effects (n_eta = 0) — exact, license-free anchor
 
@@ -64,7 +67,8 @@ The ~7% `omega^2` shortfall is the expected **mild FOCEI-Laplace bias for TTE**
 | ferx fixed-effects OFV vs survreg −2logLik | ≤ 1e-3 | ✅ exact |
 | SSE lambda_pop recovery (N=2000) | ±10% | ✅ −1% |
 | SSE omega^2 recovery (N=2000) | ±15% | ✅ −7% |
-| ferx vs nlmixr2/NONMEM on tte_exp.csv | lambda ±5%; OFV offset by constants only (§11.3) | ⏳ pending hand-off run |
+| ferx vs **nlmixr2** FOCEI on tte_exp.csv | lambda ±5%; −2LL match | ✅ agree to ~3 digits |
+| ferx vs **NONMEM** on tte_exp.csv | point estimates; OFV mod. constants (§11.3) | ⏳ pending hand-off run |
 
 ## Notes
 

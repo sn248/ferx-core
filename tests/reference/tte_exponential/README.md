@@ -12,8 +12,13 @@ licence) — that is the hand-off.
 | `tte_exp.csv` | The dataset everything fits — 100 subjects, λ=0.1, ω²=0.25, censored at t=24 (82 events, 18% censored). Columns `ID,TIME,DV,EVID,CMT,MDV`; `DV` 1=event 0=censored. | — |
 | `simulate.R` | Regenerates `tte_exp.csv` (base R only, `set.seed(42)`). | done |
 | `survreg.R` | Fixed-effects exponential MLE via base-R `survival::survreg`. | ✅ done |
-| `nlmixr2.R` | Mixed-effects FOCEI fit. Needs `nlmixr2` + `rxode2`. | **hand-off** |
+| `nlmixr2.R` | Mixed-effects FOCEI fit. Needs `nlmixr2` + `rxode2`. | ✅ done (column filled) |
 | `nonmem.ctl` | Mixed-effects `LAPLACIAN INTERACTION` fit. Needs NONMEM (licence). | **hand-off** |
+
+> **nlmixr2 done** — ferx ↔ nlmixr2 FOCEI agree to ~3 digits (see `expected.md`). Only the
+> NONMEM column remains. macOS re-run gotcha: if rxode2 fails to link with
+> `ld: ... /opt/gfortran ... not found`, point `FLIBS` at your actual gfortran, e.g.
+> `R_MAKEVARS_USER=<(echo 'FLIBS=-L/usr/local/gfortran/lib -lgfortran -lquadmath') Rscript nlmixr2.R`.
 | `expected.md` | Filled comparison table + acceptance status. | paste results here |
 
 ## How to run the hand-off pieces

@@ -31,13 +31,17 @@ shape variability — that is what the SSE checks separately.)
 
 | Parameter | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM LAPLACIAN |
 |---|---|---|---|---|
-| scale | 20.0 | **21.87** | TODO | TODO |
-| shape | 2.0 | **2.21** | TODO | TODO |
-| omega^2 (var log-shape) | 0.20 | **0.204** | TODO | TODO |
-| OFV (−2LL) | — | **639.99** | TODO | TODO |
+| scale | 20.0 | **21.87** | **21.87** | TODO |
+| shape | 2.0 | **2.21** | **2.20** | TODO |
+| omega^2 (var log-shape) | 0.20 | **0.204** | **0.173** | TODO |
+| OFV (−2LL) | — | **639.99** | **639.99** | TODO |
 
-> On this particular n=100 realisation the FOCEI `omega^2` (0.204) happens to land on the
-> truth — sampling luck. The clean large-N SSE below exposes the real estimator behaviour.
+> ferx ↔ nlmixr2 FOCEI agree to ~3 digits on `scale`, `shape` and the −2LL — but the
+> shape-frailty `omega^2` differs (0.204 vs 0.173) **between two FOCEI implementations**.
+> That spread is itself evidence for the nonlinear-frailty `omega^2` sensitivity in #440
+> (different FD-Hessian step strategies land differently on the hard variance). On this n=100
+> realisation ferx's value happens to land on the truth — the clean large-N SSE below exposes
+> the systematic FOCEI over-estimation. (nlmixr2 −2LL = AIC − 2·npar = 645.99 − 6.)
 
 ## Simulation–estimation (SSE) recovery — truth check, N = 2000
 
@@ -64,6 +68,7 @@ structural parameters (`scale`, `shape`) recover well under both estimators.
 | ferx fixed-effects scale & shape vs survreg | < 1% | ✅ exact |
 | SSE scale & shape recovery (N=2000) | ±5% | ✅ ±2% |
 | SSE omega^2 (nonlinear frailty) | — | ⚠️ FOCEI over-estimates (+72%); SAEM ~0.13; see #440 |
-| ferx vs nlmixr2/NONMEM on tte_weibull.csv | point estimates; OFV mod. constants | ⏳ pending hand-off run |
+| ferx vs **nlmixr2** FOCEI on tte_weibull.csv | scale/shape + −2LL match (ω² differs, see #440) | ✅ scale/shape/−2LL agree |
+| ferx vs **NONMEM** on tte_weibull.csv | point estimates; OFV mod. constants | ⏳ pending hand-off run |
 
 Run NONMEM (`nonmem.ctl`) / nlmixr2 (`nlmixr2.R`) to fill the remaining columns — see `README.md`.

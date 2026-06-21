@@ -13,8 +13,12 @@ Dataset `tte_weibull.csv`: 100 subjects, data-generating `scale=20`, `shape=2`, 
 | `tte_weibull.csv` | dataset everything fits (`ID,TIME,DV,EVID,CMT,MDV`) | — |
 | `simulate.R` | regenerates the dataset (base R, seed 42) | done |
 | `survreg.R` | fixed-effects Weibull MLE, mapped to ferx (scale, shape) | ✅ done |
-| `nlmixr2.R` | mixed-effects FOCEI fit (needs `nlmixr2`) | **hand-off** |
+| `nlmixr2.R` | mixed-effects FOCEI fit (needs `nlmixr2`) | ✅ done (column filled) |
 | `nonmem.ctl` | mixed-effects `LAPLACIAN INTERACTION` fit (needs NONMEM) | **hand-off** |
+
+> **nlmixr2 done** — agrees with ferx on scale/shape/−2LL; the shape-frailty ω² differs between
+> the two FOCEI tools (0.204 vs 0.173, see #440 in `expected.md`). Only NONMEM remains. macOS
+> link gotcha: see the FLIBS note in `../tte_exponential/README.md`.
 | `expected.md` | filled comparison + the nonlinear-frailty omega^2 finding | paste results |
 
 ## Run the hand-off pieces

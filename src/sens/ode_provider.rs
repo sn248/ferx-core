@@ -16,11 +16,14 @@
 //! readout; **bolus and infusion** doses; **bioavailability F** (incl. estimated,
 //! any parameterization — log-normal, logit-normal, additive); **EVID 3/4 resets
 //! / multi-occasion**; **non-zero `init(...)` initial conditions**; static
-//! covariates; up to [`MAX_ODE_SENS_DIM`] individual parameters.
+//! covariates; a constant `obs_scale` divisor and **LTBS** (`log(DV) ~ …`) output
+//! transforms; up to [`MAX_ODE_SENS_DIM`] individual parameters. Both the full
+//! `Dual2` **outer** gradient and a light `Dual1` **inner** η-gradient
+//! ([`ode_subject_eta_grad`]) are served (#410).
 //!
-//! **Not yet supported** (falls back to the gradient-free path): steady-state
-//! dosing, lagtime, built-in input-rate absorption, IOV, SDE/diffusion,
-//! `obs_scale`/LTBS output transforms, time-varying covariates, per-CMT Form C.
+//! **Not yet supported** (falls back to the gradient-free / FD path): steady-state
+//! dosing, lagtime, built-in input-rate absorption, IOV, SDE/diffusion, expression
+//! `obs_scale`, time-varying covariates, per-CMT Form C.
 #![allow(clippy::needless_range_loop)]
 
 use super::dual1::Dual1;

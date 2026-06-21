@@ -26,12 +26,14 @@ section of the SDLC for the versioning policy).
   analytic outer gradient (and the Eq. 48 EBE predictor) instead of the prior
   gradient-free path. Scope: RHS-program models with an `ObsCmt` or simple Form-C
   (`y = central/V1`) readout, bolus + finite infusion, bioavailability `F`, EVID
-  3/4 resets, `init(...)`, and static covariates. Out-of-scope features (steady
-  state, estimated lagtime, IOV, `input_rate`, SDE, time-varying covariates,
-  `obs_scale`/LTBS transforms) fall back to the existing path unchanged. Validated
-  against finite differences of the production predictor, reconverged FD of the
-  FOCEI marginal, and a full-convergence cross-check that an ODE fit reproduces the
-  analytical (NONMEM-validated) twin's estimates and standard errors.
+  3/4 resets, `init(...)`, static covariates, a constant `obs_scale` divisor, and
+  LTBS (`log(DV) ~ …`) output transforms. Out-of-scope features (steady state,
+  estimated lagtime, IOV, `input_rate`, SDE, time-varying covariates, expression
+  `obs_scale`, modeled-`RATE` doses, `F` on a rate-defined infusion) fall back to
+  the existing path unchanged. Validated against finite differences of the
+  production predictor, reconverged FD of the FOCEI marginal, and a full-convergence
+  cross-check that an ODE fit reproduces the analytical (NONMEM-validated) twin's
+  estimates and standard errors.
 - **Analytic sensitivities for oral infusion** on the analytical 1-/2-/3-cpt
   models: a depot-bypass infusion into the central compartment (RATE>0 into cmt 2,
   #350) and a zero-order input into the oral depot (RATE>0 into cmt 1, #400) are

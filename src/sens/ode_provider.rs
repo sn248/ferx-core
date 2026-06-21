@@ -63,9 +63,19 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if !ode.input_rate.is_empty() || !ode.diffusion_var.is_empty() {
         return false;
     }
-    // The divisor (`obs_scale`) scaling form is not yet handled over Dual2; Form C
-    // (`y = central/V1`) is handled via the readout program instead.
-    if model.n_kappa != 0 || !matches!(model.scaling, ScalingSpec::None) || model.log_transform {
+    if model.n_kappa != 0 {
+        return false;
+    }
+    // Output transforms: `None` and a constant `ScalarScale` divisor (`f/k`) are
+    // applied over the dual prediction in `run_subject`, as is the LTBS log
+    // (`ln f`). The `ExpressionScale` divisor form (`obs_scale = expr`) is not yet
+    // handled over Dual2 — the equivalent Form-C readout (`y = state/V`) is the
+    // supported route. Allowlist (not denylist) so a future scaling variant can
+    // only *narrow* the analytic scope, never silently admit an unhandled one.
+    if !matches!(
+        model.scaling,
+        ScalingSpec::None | ScalingSpec::ScalarScale(_)
+    ) {
         return false;
     }
     // (ODE models have no `tv_fn` — typical values come from `pk_param_fn` at
@@ -298,6 +308,30 @@ fn dual_init_state<const N: usize>(
     out
 }
 
+/// Apply the model's output transforms to a dual prediction, in PK-parameter dual
+/// space (before the η/θ chain): a constant `ScalarScale` divisor `f/k` and/or the
+/// LTBS log `ln(max(f, floor))`. Both are smooth functions of the prediction, so the
+/// `Dual2` ops carry `∂f/∂pk` and `∂²f/∂pk²` exactly — the η/θ chain that follows is
+/// unchanged. `ExpressionScale` is gated out upstream (use a Form-C readout). Mirrors
+/// `pk::apply_scaling` (`pred /= k`) and `pk::apply_log_transform`
+/// (`p = max(p, LTBS_FLOOR).ln()`; below the floor the value is clamped to a
+/// constant, so the jet vanishes).
+fn apply_output_transform_dual<const N: usize>(model: &CompiledModel, p: Dual2<N>) -> Dual2<N> {
+    let p = match model.scaling {
+        ScalingSpec::ScalarScale(k) if k != 1.0 => p * (1.0 / k),
+        _ => p,
+    };
+    if model.log_transform {
+        if p.value > crate::pk::LTBS_FLOOR {
+            p.ln()
+        } else {
+            Dual2::constant(crate::pk::LTBS_FLOOR.ln())
+        }
+    } else {
+        p
+    }
+}
+
 fn run_subject<const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
@@ -363,19 +397,23 @@ fn run_subject<const N: usize>(
     )?;
 
     // Apply the readout per observation: the state directly (`ObsCmt`) or the
-    // Form C output program (`y = central/V1`) evaluated over the dual state.
+    // Form C output program (`y = central/V1`) evaluated over the dual state, then
+    // the model's output transforms (`ScalarScale` divisor / LTBS log) over the dual.
     let mut ro_vars: Vec<Dual2<N>> = Vec::new();
     let mut ro_stack: Vec<Dual2<N>> = Vec::new();
     let preds: Vec<Dual2<N>> = states
         .iter()
-        .map(|st| match &ode.readout {
-            OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(Dual2::constant(0.0)),
-            OdeReadout::Single(_) => ode
-                .readout_program
-                .as_ref()
-                .map(|p| p.eval_output_dual::<N>(st, &params_dual, &mut ro_vars, &mut ro_stack))
-                .unwrap_or(Dual2::constant(0.0)),
-            OdeReadout::PerCmt(_) => Dual2::constant(0.0),
+        .map(|st| {
+            let raw = match &ode.readout {
+                OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(Dual2::constant(0.0)),
+                OdeReadout::Single(_) => ode
+                    .readout_program
+                    .as_ref()
+                    .map(|p| p.eval_output_dual::<N>(st, &params_dual, &mut ro_vars, &mut ro_stack))
+                    .unwrap_or(Dual2::constant(0.0)),
+                OdeReadout::PerCmt(_) => Dual2::constant(0.0),
+            };
+            apply_output_transform_dual::<N>(model, raw)
         })
         .collect();
 
@@ -841,6 +879,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    // 2-cpt IV ODE under LTBS (`log(DV) ~ additive`): the readout is log-transformed
+    // (`p = ln f`), so the provider's f/∂f/∂η/∂f/∂θ must match the (also
+    // log-transformed) production predictor. Tier 1 output transform (#410).
+    const TWOCPT_ODE_LTBS: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma ADD_LOG ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  log(DV) ~ additive(ADD_LOG)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    #[test]
+    fn ode_provider_ltbs_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE_LTBS).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "LTBS ODE should be supported (Tier 1)"
+        );
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
+    }
+
+    // 2-cpt IV ODE with a constant `ScalarScale` output divisor (`obs_scale = 50`)
+    // over the central-amount readout: `f = central / 50`. Tier 1 output transform.
+    const TWOCPT_ODE_SCALARSCALE: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(obs_cmt=central, states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  obs_scale = 50
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    #[test]
+    fn ode_provider_scalar_scale_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE_SCALARSCALE).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "constant ScalarScale ODE should be supported (Tier 1)"
+        );
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
     }
 
     // 1-cpt oral ODE with estimated, logit-normal bioavailability F — the dose

@@ -213,20 +213,26 @@ const ODE_LTBS: &str = r"
 ";
 
 #[test]
-fn obs_scale_divisor_model_is_not_armed() {
-    // `obs_scale = V1` (divisor form) is not handled over Dual2 — model-level decline.
+fn expression_obs_scale_is_not_armed() {
+    // `obs_scale = V1` references a parameter → `ExpressionScale`, not handled over
+    // Dual2 (the equivalent Form-C readout is). Model-level decline.
     let model = parse(ODE_OBS_SCALE);
     assert!(
         !sens_supported(&model),
-        "obs_scale divisor scaling must not be on the analytic path"
+        "ExpressionScale obs_scale must not be on the analytic path"
     );
 }
 
 #[test]
-fn ltbs_model_is_not_armed() {
+fn ltbs_model_is_armed() {
+    // LTBS (`log(DV) ~ additive`) is a smooth output transform — armed in Tier 1.
     let model = parse(ODE_LTBS);
     assert!(
-        !sens_supported(&model),
-        "LTBS log-transform must not be on the analytic path"
+        sens_supported(&model),
+        "LTBS ODE model must be armed (Tier 1)"
+    );
+    assert!(
+        !declines(&model, vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)]),
+        "LTBS bolus subject must get analytic sensitivities"
     );
 }

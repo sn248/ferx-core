@@ -118,13 +118,18 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
 }
 
 /// Master switch for the user-ODE sensitivity path (issue #367, Option A). The
-/// provider in [`crate::sens::ode_provider`] is complete and tested, but the
-/// analytic-sensitivity rollout ships scoped to the analytical PK models first;
-/// arming ODE-model sensitivities is the deferred follow-up tracked in **#410**
-/// (flip this flag, harden the `obs_map` time matching, NONMEM/perf validation).
-/// While `false`, ODE models take the prior path (gradient-free outer, FD inner)
-/// and the infrastructure stays compiled and exercised by its own tests.
-const ODE_SENS_ENABLED: bool = false;
+/// provider in [`crate::sens::ode_provider`] supplies the analytic `∂f/∂θ` and
+/// `∂f/∂η` for RHS-program ODE models via an augmented `Dual2` RK45, feeding the
+/// same FOCE/FOCEI outer-gradient assembly the analytical PK models use.
+///
+/// Armed in **#410** after hardening the observation/break-time matching
+/// (`obs_time_matches`, tolerance instead of bit-exact keying). The scope is
+/// limited by [`crate::sens::ode_provider::ode_analytical_supported`] (RHS-program
+/// models, simple readout, bolus + finite infusion, `F`, resets, covariates,
+/// within the dual-axis cap); anything outside it falls back to the prior path
+/// (gradient-free outer, FD inner). The inner EBE loop likewise stays on FD for
+/// now — only the **outer** η/θ gradient is armed here.
+const ODE_SENS_ENABLED: bool = true;
 
 /// Escape hatch: `FERX_DISABLE_EXPLICIT_SENS=1` forces every subject onto the
 /// generic `Dual2<N>` provider path instead of the hand-written explicit-
@@ -1587,11 +1592,10 @@ fn subject_sensitivities_impl(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
-    // ODE models: the ODE sensitivity provider (issue #367, Option A) is complete
-    // and tested in `ode_provider`, but the analytic-sensitivity rollout is scoped
-    // to the *analytical* PK models for now — user-ODE sensitivities land in a
-    // follow-up. Gated off here (not deleted): ODE models fall back to the prior
-    // path (gradient-free outer, AD/FD inner). Flip `ODE_SENS_ENABLED` to re-arm.
+    // ODE models route to the ODE sensitivity provider (issue #367, Option A;
+    // armed in #410) when in its supported scope; out-of-scope ODE subjects return
+    // `None` and fall back to the prior path (gradient-free outer, FD inner). The
+    // `ODE_SENS_ENABLED` master switch stays as a single kill-switch for the path.
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
             return crate::sens::ode_provider::ode_subject_sensitivities(

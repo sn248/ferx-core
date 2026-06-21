@@ -421,6 +421,19 @@ fn run_subject<const N: usize>(
     Some(SubjectSens { obs: out })
 }
 
+/// True when an observation time `ot` coincides with a segment break / solver
+/// save time `t`. Both are produced by arithmetic on the same CSV time values
+/// (`dose.time`, `t_end`, the solver's interpolated save points), so value-equal
+/// times can differ by a few ULPs; matching on `f64::to_bits` would silently miss
+/// them and leave the observation's state (hence its sensitivity) at zero — the
+/// hardening called for in issue #410. The tolerance is scaled to the time
+/// magnitude and is many orders of magnitude tighter than any real
+/// inter-observation spacing, so it never conflates distinct observations.
+#[inline]
+fn obs_time_matches(ot: f64, t: f64) -> bool {
+    (ot - t).abs() <= 1e-9 * (1.0 + ot.abs().max(t.abs()))
+}
+
 /// Integrate the `Dual2<N>` state through the subject's bolus + infusion events,
 /// capturing the full state vector at every observation time. Returns one state
 /// vector per observation (parallel to `subject.obs_times`); the caller applies
@@ -441,13 +454,6 @@ fn integrate_dual<const N: usize>(
     let mut states: Vec<Vec<Dual2<N>>> = vec![vec![Dual2::<N>::constant(0.0); n_states]; n_obs];
     let mut recorded = vec![false; n_obs];
     let mut u = init_state.to_vec();
-
-    // obs time → all indices sharing it.
-    use std::collections::HashMap;
-    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in subject.obs_times.iter().enumerate() {
-        obs_map.entry(t.to_bits()).or_default().push(i);
-    }
 
     // Break the timeline at every dose time and — for infusions — the
     // infusion-end time, so each segment is fully inside or outside every
@@ -502,13 +508,14 @@ fn integrate_dual<const N: usize>(
             }
         }
 
-        // Record any observation exactly at t_start (after the dose).
-        if let Some(idxs) = obs_map.get(&t_start.to_bits()) {
-            for &j in idxs {
-                if !recorded[j] {
-                    states[j].copy_from_slice(&u);
-                    recorded[j] = true;
-                }
+        // Record any observation at t_start (after the dose). `t_start` is a break
+        // time built by arithmetic on dose/reset times, so an observation that
+        // coincides with it can be value-equal but bit-different — match by
+        // tolerance, not bit pattern (issue #410).
+        for (j, &ot) in subject.obs_times.iter().enumerate() {
+            if !recorded[j] && obs_time_matches(ot, t_start) {
+                states[j].copy_from_slice(&u);
+                recorded[j] = true;
             }
         }
 
@@ -580,13 +587,13 @@ fn integrate_dual<const N: usize>(
         let sol = solve_ode_g(&rhs, &u, (t_start, t_end), params_dual, &saveat, opts);
 
         // Capture state at the requested observation times; advance u to t_end.
+        // `pt.t` is the solver's reported save time — match observations by
+        // tolerance rather than bit pattern (issue #410).
         for pt in &sol {
-            if let Some(idxs) = obs_map.get(&pt.t.to_bits()) {
-                for &j in idxs {
-                    if !recorded[j] {
-                        states[j].copy_from_slice(&pt.u);
-                        recorded[j] = true;
-                    }
+            for (j, &ot) in subject.obs_times.iter().enumerate() {
+                if !recorded[j] && obs_time_matches(ot, pt.t) {
+                    states[j].copy_from_slice(&pt.u);
+                    recorded[j] = true;
                 }
             }
             if (pt.t - t_end).abs() < 1e-12 {
@@ -603,6 +610,30 @@ mod tests {
     use super::*;
     use crate::parser::model_parser::parse_model_string;
     use crate::pk::compute_predictions_with_tv;
+
+    /// Hardening for issue #410: an observation time and the segment break / solver
+    /// save time it coincides with are produced by different arithmetic, so they can
+    /// be value-equal yet bit-different. `0.1 + 0.2 ≠ 0.3` (IEEE-754) is the canonical
+    /// case the old `f64::to_bits` keying would silently miss — leaving the
+    /// observation's state (and its sensitivity) at zero. `obs_time_matches` must
+    /// match these while still separating genuinely distinct observation times.
+    #[test]
+    fn obs_time_matches_tolerates_ulp_differences_not_distinct_times() {
+        let a = 0.3_f64;
+        let b = 0.1_f64 + 0.2; // 0.30000000000000004
+        assert_ne!(a.to_bits(), b.to_bits(), "precondition: bit-different");
+        assert!(
+            obs_time_matches(a, b),
+            "ULP-apart times must match — bit-exact keying would drop this observation"
+        );
+        // Tolerance scales with magnitude (a late, large dosing time).
+        let big = 168.0_f64;
+        assert!(obs_time_matches(big, big + big * 1e-12));
+        // Genuinely distinct observation times must NOT be conflated.
+        assert!(!obs_time_matches(24.0, 24.001));
+        assert!(!obs_time_matches(0.0, 0.5));
+        assert!(!obs_time_matches(big, big + 0.01));
+    }
     use crate::types::DoseEvent;
     use std::collections::HashMap;
 

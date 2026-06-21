@@ -2285,6 +2285,55 @@ mod tests {
         run_population_packed_gradient_check(&model, &[5.0, 30.0, 2.0, 50.0, 1.0]);
     }
 
+    // 2-cpt IV **user-ODE** model (Form C readout `y = central/V1`), IIV on CL+V1.
+    // Exercises the armed ODE sensitivity provider (#410) through the *full* outer
+    // assembly: the Dual2 augmented-RK45 jet must flow through the θ/Ω/σ blocks
+    // (incl. the EBE response) and match reconverged FD exactly as the analytical
+    // PK models do. Tight ODE tolerances so the propagated derivative agrees with a
+    // finite difference of the (separately integrated) f64 objective.
+    const TWOCPT_ODE_OUTER: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// The armed ODE outer gradient (#410) must match reconverged Richardson FD of
+    /// the FOCEI marginal — the end-to-end proof that flipping `ODE_SENS_ENABLED`
+    /// feeds a *correct* θ/Ω/σ gradient through the shared assembly, not just that
+    /// the per-observation provider matches production (the `ode_provider` tests).
+    #[test]
+    fn population_packed_gradient_ode_2cpt_matches_fd() {
+        let model = parse_model_string(TWOCPT_ODE_OUTER).expect("parse ODE");
+        assert!(
+            crate::sens::provider::sens_supported(&model),
+            "2-cpt IV ODE must be armed for the analytic outer gradient (#410)"
+        );
+        run_population_packed_gradient_check(&model, &[4.0, 12.0, 2.0, 25.0]);
+    }
+
     // 1-cpt IV (log-normal CL/V) used by the EVID=3/4 reset gradient checks: the
     // provider rebuilds each observation from the doses in its current reset
     // segment, so a reset subject's `∂f/∂η`, `∂²f/∂η²`, `∂f/∂θ`, `∂²f/∂η∂θ` jet —

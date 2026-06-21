@@ -124,9 +124,9 @@ name. It shows up in `FitResult.mu_refs` as:
 ```
 
 and in `eta_param_info[ETA_CL].param_type` as `LogNormal`. The
-AD-aware re-centering fast path (`compute_mu_k`) currently silently
+mu-ref re-centering fast path (`compute_mu_k`) currently silently
 skips structured-name mu-refs and FOCEI falls back to its standard
-inner-loop path — correct, just slower than a true mu-ref-aware AD
+inner-loop path — correct, just slower than a structured-name-aware
 inner loop. That perf improvement lives on the Phase A M2 roadmap in
 [`plans/dcm-and-low-dim-node.md`].
 
@@ -169,8 +169,8 @@ These items are tracked against Phase A M2 / future PRs in the
 
 - `method = nn_mse` — Janssen 2022's original fixed-effects MSE objective
   (FOCEI works as the default today).
-- AD-aware mu-ref re-centering for NN-anchored etas — fits work today
-  but the inner-loop AD fast path skips NN-anchored etas; performance
+- Mu-ref re-centering for NN-anchored etas — fits work today
+  but the inner-loop fast path skips NN-anchored etas; performance
   improvement, not correctness.
 - Phase B `[dynamics_nn]` block for neural-ODE-style RHS terms (Bräm
   et al. 2025).

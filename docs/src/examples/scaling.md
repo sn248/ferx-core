@@ -56,7 +56,7 @@ This is the contents of [`examples/warfarin_scaled.ferx`](https://github.com/FeR
   method     = foce
   maxiter    = 300
   covariance = true
-  gradient   = ad
+  gradient   = auto
 ```
 
 The `[scaling]` block sits between `[error_model]` and `[fit_options]`. The `obs_scale` value is applied to every prediction before the residual is formed:

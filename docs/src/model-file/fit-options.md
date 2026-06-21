@@ -299,7 +299,7 @@ Notes:
 - `bobyqa` does not use gradients, so it is robust to small discontinuities in
   the FOCE surface caused by EBE re-estimation, but it converges more slowly
   than gradient-based methods on smooth problems.
-- `trust_region` uses an AD-based gradient (same `subject_nll_pop_grad` as the
+- `trust_region` uses the analytic outer gradient (same `subject_nll_pop_grad` as the
   outer FOCE optimizer) and a BHHH approximate Hessian (`H ≈ 4 Σ gᵢgᵢᵀ`).
   The BHHH matrix is always positive semi-definite, so the Steihaug subproblem
   is well-conditioned even near constraints. The Steihaug CG budget defaults to

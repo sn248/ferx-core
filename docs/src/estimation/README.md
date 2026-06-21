@@ -37,7 +37,7 @@ The outer loop optimizer is selected independently of the method. See **[Outer O
 | Random effect estimation | MAP (optimization) | MAP (optimization) | MCMC (sampling) |
 | Convergence speed | Medium (~50–100 evals) | Fast (~10–30 iters) | Slower (~400 iters) |
 | Local minima robustness | Can get stuck | Can get stuck | More robust |
-| Gradient required | Yes (AD or FD) | Yes (FD, per-subject) | No (E-step) |
+| Gradient required | Yes (analytic or FD) | Yes (FD, per-subject) | No (E-step) |
 | Stochastic | No | No | Yes |
 | OFV comparable to FOCE | — | Yes (post-GN Laplace) | Yes (post-SAEM Laplace) |
 | Best for | General use | Fast model development | Complex models, many ETAs |

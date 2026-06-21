@@ -99,17 +99,17 @@ fit.
 The ferx form is divisive by convention, so an `obs_scale = V/1000`
 reads as "divide raw by V/1000" — matching NONMEM's `S2`.
 
-## Interaction with gradients (AD vs FD)
+## Interaction with gradients
 
-All `[scaling]` variants on the **analytical PK path** support both
-`gradient = ad` and `gradient = fd`:
+All `[scaling]` variants on the **analytical PK path** support the default
+`gradient = auto` setting and forced finite differences (`gradient = fd`):
 
-| Form | AD | FD | Notes |
+| Form | `auto` | `fd` | Notes |
 |---|---|---|---|
-| Scalar `obs_scale = K` | ✓ exact | ✓ exact | The constant threads as a `Const` slice (one entry per obs). |
-| Expression `obs_scale = <expr>` | ✓ subject-static | ✓ exact | See subject-static caveat below. |
-| Per-CMT `obs_scale[CMT=N]` | ✓ subject-static | ✓ exact | One per-obs scale entry per observation, dispatched by `subject.obs_cmts[i]`. |
-| Form C `y[…] = <expr>` (ODE only) | ✗ — forces `gradient = fd` | ✓ | Form C only exists on ODE models, where the analytic gradient is not available regardless of scaling. |
+| Scalar `obs_scale = K` | exact analytic | exact FD | The constant threads as one entry per observation. |
+| Expression `obs_scale = <expr>` | subject-static analytic | exact FD | See subject-static caveat below. |
+| Per-CMT `obs_scale[CMT=N]` | subject-static analytic | exact FD | One per-observation scale entry per observation, dispatched by `subject.obs_cmts[i]`. |
+| Form C `y[…] = <expr>` (ODE only) | finite differences | exact FD | Form C only exists on ODE models, where the analytic gradient is not available regardless of scaling. |
 
 **Analytic outer gradient handles expression scaling exactly.** The analytic
 sensitivity provider that drives the gradient-based outer optimizers (`bfgs`,
@@ -180,15 +180,12 @@ group. The parser rejects mixing them so the user is explicit about
 intent. The same rule applies to `y` and `y[CMT=N]`.
 
 **Gradients** — per-CMT `obs_scale[CMT=N]` works with both
-`gradient = ad` and `gradient = fd`. The AD path materialises a
-per-observation scale array (one entry per obs in the subject) from a
-subject-static `pk_param_fn` evaluation and passes it to the AD entry
-points as a `Const` slice. See [AD interaction](#interaction-with-gradients-ad-vs-fd)
-below for the subject-static caveat that applies to all expression-form
-scales.
+`gradient = auto` and `gradient = fd`. The analytic route materialises a
+per-observation scale array (one entry per observation in the subject) from a
+subject-static `pk_param_fn` evaluation. See
+[Interaction with gradients](#interaction-with-gradients) for the subject-static
+caveat that applies to all expression-form scales.
 
 Form C per-CMT (`y[CMT=N] = <expr>`) still requires `gradient = fd` —
 not because of the per-CMT dispatch but because Form C only exists on
-ODE models, and the AD path requires the analytical PK path
-(`tv_fn.is_some()`). The parser rejects `Form C + gradient = ad` with a
-clear hint.
+ODE models, where the analytic route is not available.

@@ -113,7 +113,7 @@ slow PK (`λ·II = 0.1`, ~14 half-lives total over the 50 cycles),
 `exp(-5) ≈ 7e-3` — the slowest realistic case. ferx uses fixed
 `N = 50` rather than adaptive convergence checking because (a) the
 bound is conservative and (b) skipping the convergence check keeps
-the hot path branch-free for AD compatibility.
+the hot path branch-free.
 
 If you need tighter accuracy for an unusually slow PK, the constant
 lives at `SS_EQUILIBRATION_CYCLES` in `src/ode/predictions.rs` and

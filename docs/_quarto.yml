@@ -1,0 +1,162 @@
+project:
+  type: website
+  output-dir: _site
+
+brand: _brand.yml
+
+website:
+  title: "ferx-core"
+  description: "Rust nonlinear mixed effects modeling engine for ferx"
+  favicon: assets/ferx-favicon.svg
+  site-url: https://ferx-nlme.github.io/ferx-core/
+  repo-url: https://github.com/FeRx-NLME/ferx-core
+  repo-actions: [edit, issue]
+
+  navbar:
+    logo: assets/ferx-dsl-brackets.svg
+    logo-dark: assets/ferx-dsl-brackets-dark.svg
+    logo-alt: "ferx"
+    left:
+      - text: "Get started"
+        href: getting-started.qmd
+      - text: "Features"
+        href: https://ferx-nlme.github.io/features.html
+      - text: "Changelog"
+        href: https://ferx-nlme.github.io/changelog.html
+      - text: "Roadmap"
+        href: https://ferx-nlme.github.io/roadmap.html
+    right:
+      - text: "ferx site"
+        href: https://ferx-nlme.github.io
+      - text: "ferx-r"
+        href: https://ferx-nlme.github.io/ferx-book/
+      - icon: github
+        href: https://github.com/FeRx-NLME
+        aria-label: GitHub
+
+  sidebar:
+    style: floating
+    collapse-level: 1
+    search: true
+    contents:
+      - text: "Introduction"
+        href: index.qmd
+      - text: "Feature Maturity"
+        href: maturity.qmd
+      - text: "Getting Started"
+        href: getting-started.qmd
+        contents:
+          - installation.qmd
+          - quick-start.qmd
+      - text: "Model File Reference"
+        href: model-file/index.qmd
+        contents:
+          - model-file/parameters.qmd
+          - model-file/iov.qmd
+          - model-file/individual-parameters.qmd
+          - model-file/covariates.qmd
+          - model-file/structural-model.qmd
+          - model-file/lagtime.qmd
+          - model-file/steady-state.qmd
+          - model-file/error-model.qmd
+          - model-file/bloq.qmd
+          - model-file/ode-models.qmd
+          - model-file/absorption.qmd
+          - model-file/scaling.qmd
+          - model-file/diffusion.qmd
+          - model-file/neural-networks.qmd
+          - model-file/covariate-nn.qmd
+          - model-file/data-selection.qmd
+          - model-file/derived.qmd
+          - model-file/output.qmd
+          - model-file/fit-options.qmd
+          - model-file/simulation.qmd
+          - model-file/event-model.qmd
+      - text: "Estimation Methods"
+        href: estimation/index.qmd
+        contents:
+          - estimation/foce.qmd
+          - estimation/gauss-newton.qmd
+          - estimation/saem.qmd
+          - estimation/sir.qmd
+          - estimation/importance-sampling.qmd
+          - estimation/frem.qmd
+          - estimation/impmap.qmd
+          - estimation/bayes.qmd
+          - estimation/optimizers.qmd
+          - estimation/tte.qmd
+      - text: "Data Format"
+        href: data-format.qmd
+      - text: "CLI Reference"
+        href: cli.qmd
+      - text: "Output Files"
+        href: output.qmd
+      - text: "File Formats"
+        href: file-formats/index.qmd
+        contents:
+          - file-formats/fitrx.qmd
+          - file-formats/check-report.qmd
+      - text: "Examples"
+        href: examples/index.qmd
+        contents:
+          - examples/one-cpt-oral.qmd
+          - examples/two-cpt-iv.qmd
+          - examples/covariates.qmd
+          - examples/ode-model.qmd
+          - examples/bloq.qmd
+          - examples/iov.qmd
+          - examples/iov-saem.qmd
+          - examples/multiple-dosing.qmd
+          - examples/steady-state.qmd
+          - examples/scaling.qmd
+          - examples/derived-output.qmd
+          - examples/data-selection.qmd
+          - examples/ode-lagtime.qmd
+          - examples/transit-absorption.qmd
+          - examples/sde.qmd
+          - examples/frem.qmd
+          - examples/multistart.qmd
+      - text: "Rust API"
+        href: api/index.qmd
+        contents:
+          - api/types.qmd
+          - api/fitting.qmd
+          - api/simulation.qmd
+          - api/parsing.qmd
+      - text: "FAQ"
+        href: faq.qmd
+      - text: "Development"
+        href: development/index.qmd
+        contents:
+          - development/contributing.qmd
+          - development/sdlc.qmd
+
+
+  page-footer:
+    background: light
+    border: true
+    left: "© 2026 FeRx-NLME · MIT licensed"
+    right: "Fe · 26 · Rx · 2026"
+
+format:
+  html:
+    theme:
+      light: [cosmo, assets/ferx.scss]
+      dark: [cosmo, assets/ferx-dark.scss]
+    css: styles.css
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    code-link: true
+    code-copy: true
+    code-overflow: wrap
+    highlight-style:
+      light: github
+      dark: github-dark
+    mainfont: "IBM Plex Sans"
+    monofont: "JetBrains Mono"
+    include-after-body:
+      - includes/dark-code-panels.html
+
+execute:
+  freeze: false

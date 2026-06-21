@@ -37,6 +37,9 @@ section of the SDLC for the versioning policy).
   differences of the production predictor and against a NONMEM reference (#367).
 
 ### Changed
+- **Documentation now builds as a Quarto website** using the shared ferx site
+  branding and styling instead of mdBook. Source pages now live under
+  `docs/**/*.qmd`, with navigation in `docs/_quarto.yml` (#443).
 - **FOCE/FOCEI and SAEM/Bayes HMC gradients now come from hand-rolled analytic
   `Dual2` sensitivities** rather than Enzyme automatic differentiation. The inner
   EBE gradient, the outer θ/Ω/Σ gradient, and the SAEM/Bayes HMC η-sampler all use

@@ -426,6 +426,7 @@ pub fn run_foce_gn(
             sir_fallback_proposal,
             impmap_trace: None,
             bayes: None,
+            cond_dist: None,
         };
     }
 
@@ -542,6 +543,7 @@ pub fn run_foce_gn(
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
+        cond_dist: None,
     }
 }
 

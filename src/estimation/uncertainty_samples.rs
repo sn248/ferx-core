@@ -389,6 +389,7 @@ mod tests {
             total_ebe_fallbacks: 0,
             covariance_status: crate::types::CovarianceStatus::Computed,
             shrinkage_eta: vec![],
+            cond_dist: None,
             shrinkage_eps: f64::NAN,
             iwres_lag1_r: f64::NAN,
             dw_statistic: f64::NAN,

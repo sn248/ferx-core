@@ -312,7 +312,6 @@ Docs are an [mdBook](https://rust-lang.github.io/mdBook/) under `docs/`.
 ferx-core builds on a **stock nightly** toolchain — no custom compiler. The exact
 FOCE/FOCEI and HMC gradients come from hand-rolled analytic `Dual2` sensitivities
 (`sens/`), and models outside the provider's scope fall back to finite differences.
-The Enzyme autodiff path that used to require a from-source toolchain was retired.
 
 - **Keep the build toolchain-light.** Standard-Rust users (Mac / Linux / Windows)
   and CI install ferx with `cargo build` alone. Do not reintroduce a dependency on

@@ -2469,6 +2469,32 @@ pub struct SubjectResult {
     pub compartment_states: Vec<Vec<f64>>,
 }
 
+/// Per-subject conditional distribution of the random effects, produced by the
+/// opt-in SAEM conditional-distribution pass (`saem_conddist = true`, #257).
+///
+/// All per-subject vectors are indexed in the same order as the fit's subjects.
+/// This is the SAEM analogue of saemix `conddist.saemix` / Monolix's
+/// "Conditional Distribution" task — the distribution `p(η_i | y_i; θ̂)` rather
+/// than just its mode (the EBE on `SubjectResult.eta`).
+#[derive(Debug, Clone)]
+pub struct CondDist {
+    /// Conditional mean of η per subject: `cond_mean[i]` has length `n_eta`.
+    pub cond_mean: Vec<Vec<f64>>,
+    /// Conditional SD of η per subject (sample SD over the retained draws).
+    pub cond_sd: Vec<Vec<f64>>,
+    /// Retained draws per subject: `samples[i]` is `nsamp × n_eta`. Empty for
+    /// every subject unless `saem_conddist_keep_samples` was set.
+    pub samples: Vec<Vec<Vec<f64>>>,
+    /// Distribution-based η-shrinkage per eta:
+    /// `1 - SD_over_subjects(cond_mean[·][j]) / sqrt(Ω_jj)`. `NaN` when there
+    /// are fewer than two subjects.
+    pub shrinkage: Vec<f64>,
+    /// Number of retained draws per subject (after burn-in).
+    pub nsamp: usize,
+    /// Burn-in sweeps discarded before accumulation.
+    pub burnin: usize,
+}
+
 // ── Derived expression types ──────────────────────────────────────────────────
 
 /// Context threaded into every [derived] expression evaluation.
@@ -3044,8 +3070,14 @@ pub struct FitResult {
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,
     /// ETA shrinkage per random effect: `1 - SD(eta_hat_k) / sqrt(omega_kk)`.
-    /// `NaN` when `omega_kk` is zero.
+    /// `NaN` when `omega_kk` is zero. Computed from the conditional **mode**
+    /// (EBE); for the distribution-based counterpart see
+    /// `cond_dist.shrinkage`.
     pub shrinkage_eta: Vec<f64>,
+    /// Per-subject conditional distribution of the random effects from the
+    /// opt-in SAEM conditional-distribution pass. `Some` only when
+    /// `method = saem` and `saem_conddist = true`; `None` otherwise (#257).
+    pub cond_dist: Option<CondDist>,
     /// EPS shrinkage: `1 - SD(IWRES)`.  `NaN` when fewer than 2 valid residuals.
     pub shrinkage_eps: f64,
     /// Pooled lag-1 Pearson correlation of IWRES across subjects.
@@ -3351,6 +3383,27 @@ pub struct FitOptions {
     /// Clamped to `saem_n_exploration` at use. `0` disables the burn-in.
     pub saem_omega_burnin: usize,
     pub saem_seed: Option<u64>,
+    /// Run a post-fit conditional-distribution pass after SAEM converges.
+    ///
+    /// When `true`, after the population parameters are fixed the existing MH
+    /// kernels are re-run per subject (warm-started at the EBE mode) and the
+    /// draws are *accumulated* to estimate each subject's conditional mean and
+    /// SD of η — the analogue of saemix `conddist.saemix` / Monolix's
+    /// "Conditional Distribution" task. Default `false` (mode-only output,
+    /// unchanged behaviour). See `docs/src/estimation/saem.md` (#257).
+    pub saem_conddist: bool,
+    /// Number of retained MH sweeps per subject in the conditional-distribution
+    /// pass (after burn-in). Larger values tighten the conditional mean/SD
+    /// estimates at linear wall cost. Only used when `saem_conddist = true`.
+    pub saem_conddist_nsamp: usize,
+    /// Burn-in sweeps discarded before accumulation in the conditional-
+    /// distribution pass, to forget the EBE-mode warm start. Only used when
+    /// `saem_conddist = true`.
+    pub saem_conddist_burnin: usize,
+    /// Retain the raw per-subject draws (not just mean/SD) from the
+    /// conditional-distribution pass on the result. Adds
+    /// `n_subjects * nsamp * n_eta * 8` bytes; default `false`.
+    pub saem_conddist_keep_samples: bool,
     /// Number of leapfrog steps per HMC proposal in the SAEM E-step.
     /// `0` (default) uses the Metropolis-Hastings random-walk sampler.
     /// A positive value (e.g. `3`) enables HMC; requires an analytical PK
@@ -3709,6 +3762,10 @@ impl Default for FitOptions {
             saem_adapt_interval: 50,
             saem_omega_burnin: 20,
             saem_seed: None,
+            saem_conddist: false,
+            saem_conddist_nsamp: 200,
+            saem_conddist_burnin: 20,
+            saem_conddist_keep_samples: false,
             saem_n_leapfrog: 0,
             bayes_warmup: 1000,
             bayes_iters: 1000,
@@ -4123,6 +4180,11 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "saem_n_leapfrog",
             "adapt_interval",
             "omega_burnin",
+            "conddist",
+            "saem_conddist",
+            "conddist_nsamp",
+            "conddist_burnin",
+            "conddist_keep_samples",
             "seed",
             "saem_seed",
         ],

@@ -47,7 +47,7 @@ Set via `[fit_options]`:
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `trust_region` | Newton trust-region with Steihaug CG | Uses the AD-based outer gradient and a BHHH approximate Hessian `H ≈ 4 Σ gᵢgᵢᵀ` (always positive semi-definite). The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)`; pin it with `steihaug_max_iters`. Best combined with `inits_from_nca` since it benefits from good starting values. |
+| `trust_region` | Newton trust-region with Steihaug CG | Uses the analytic outer gradient and a BHHH approximate Hessian `H ≈ 4 Σ gᵢgᵢᵀ` (always positive semi-definite). The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)`; pin it with `steihaug_max_iters`. Best combined with `inits_from_nca` since it benefits from good starting values. |
 
 ---
 

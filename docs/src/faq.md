@@ -125,8 +125,8 @@ Reach for a different optimizer when the default misbehaves:
   analytical PK models with many parameters. Can stall above the true minimum
   on ill-conditioned fits unless paired with `reconverge_gradient_interval = 1`
   (5–6× cost per gradient).
-- **`trust_region`** — second-order Newton trust-region with an AD-based
-  gradient and BHHH approximate Hessian. Can be faster near convergence
+- **`trust_region`** — second-order Newton trust-region with the analytic
+  outer gradient and BHHH approximate Hessian. Can be faster near convergence
   because it uses curvature information; the CG budget defaults to
   `ceil(sqrt(n_params))` (~5 for standard NLME models), but you can pin
   it with `steihaug_max_iters` if you have many packed parameters and
@@ -365,4 +365,3 @@ Control file and data: `tests/nonmem/oral_depot_d1.ctl` / `.csv`.
 ferx matches NONMEM to the 5 significant figures tabulated (the
 `analytical_oral_depot_modeled_duration_matches_nonmem` regression test asserts
 this).
-

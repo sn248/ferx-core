@@ -124,7 +124,7 @@ enforce a few rules to keep the difference visible:
 | Mu-ref composition `TYPICAL_PK.X * exp(ETA_X)` | Pending (Phase A M2) |
 | `[dynamics_nn]` block + NN-in-ODE-expression syntax | Pending (Phase B) |
 | Activation-aware Bräm-style initializer | Pending (Phase B) |
-| Outer-loop AD through NN weights (production speed) | Deferred (Phase A M3) |
+| Outer-loop gradients through NN weights (production speed) | Deferred (Phase A M3) |
 
 The Rust-level API (the `CovariateMapper` trait and `MlpMapper`) is
 already callable today — see `tests/nn_dcm_smoke.rs` for an end-to-end

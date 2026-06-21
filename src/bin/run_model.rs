@@ -114,6 +114,11 @@ fn main() {
                 }
             }
 
+            // SAEM conditional-distribution outputs (only when the pass ran).
+            for msg in ferx_core::io::output::write_conddist_outputs(&fit_result, &model_name) {
+                eprintln!("{}", msg);
+            }
+
             let yaml_path = format!("{}-fit.yaml", model_name);
             match ferx_core::io::output::write_estimates_yaml(&fit_result, &yaml_path) {
                 Ok(()) => eprintln!("Estimates written to {}", yaml_path),

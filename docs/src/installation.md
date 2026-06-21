@@ -1,14 +1,9 @@
 # Installation
 
 ferx-core builds with a recent **nightly** Rust toolchain (pinned in
-`rust-toolchain.toml`) — `cargo build` is all you need. There is no longer any
-custom compiler or autodiff toolchain to set up: the exact FOCE/FOCEI and HMC
-gradients now come from hand-rolled analytic `Dual2` sensitivities, so the old
-Enzyme/`--features autodiff` path has been **retired**.
-
-> **Upgrading from an older setup?** If you previously built a custom `enzyme`
-> nightly from source, you can remove it (`rustup toolchain uninstall enzyme`) —
-> it is no longer used. A stock nightly suffices.
+`rust-toolchain.toml`) — `cargo build` is all you need. The exact FOCE/FOCEI
+and HMC gradients come from hand-rolled analytic `Dual2` sensitivities where
+available, with finite differences used elsewhere. A stock nightly suffices.
 
 Pick your platform:
 
@@ -174,6 +169,7 @@ builds on the nightly toolchain pinned in `rust-toolchain.toml`.
 ### The build fails on NLopt
 Install the NLopt C library for your platform (see [Dependencies](#dependencies)).
 
-### `gradient = ad` errors with `E_AD_RETIRED`
-The Enzyme autodiff path was retired. Use `gradient = auto` (the exact analytic
-gradient where it is in scope, finite differences otherwise) or `gradient = fd`.
+### Choosing a gradient method
+Use `gradient = auto` for the default analytic `Dual2` route where it is in
+scope, with finite differences elsewhere. Use `gradient = fd` to force finite
+differences.

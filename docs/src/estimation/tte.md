@@ -186,18 +186,38 @@ stencil (Shi 2021 step-size selection).
 Set `method = focei` in `[fit_options]`. The `gradient = fd` setting is
 the default and the only supported path for TTE objectives.
 
-## Comparison with nlmixr2 and NONMEM
+## Comparison with reference software
 
-Reference exponential fit (30 subjects, λ=0.05 h⁻¹, ω²=0.09, 30% censored):
+The exponential validation dataset is `tests/reference/tte_exponential/tte_exp.csv`
+(100 subjects; data-generating λ=0.1 h⁻¹, ω²=0.25 on log-rate; right-censored at
+t=24 → 82 events, 18% censored). All tools fit the same file.
 
-| Parameter | True | ferx | nlmixr2 | NONMEM (LAPLACIAN) |
-|-----------|------|------|---------|------------------|
-| TVLAMBDA  | 0.050 | — | — | — |
-| ω²(ETA_LAMBDA) | 0.09 | — | — | — |
-| OFV | — | — | — | — |
+**Fixed-effects (no random effect) — exact, license-free anchor.** A censored
+exponential MLE is the closed form λ = events/Σtime, so a ferx `n_eta=0` fit must
+match base-R `survival::survreg` exactly:
 
-*Reference values will be filled after running the nlmixr2 and NONMEM scripts
-in `tests/reference/tte_exponential/`.*
+| Quantity | ferx (fixed) | `survreg` | agreement |
+|----------|-------------|-----------|-----------|
+| λ (rate) | 0.074506 | 0.074506 | exact (<1e‑4) |
+| OFV / −2logLik | 589.888 | 589.888 | exact |
+
+This confirms ferx's TTE hazard, censoring, and likelihood **constants** are correct.
+
+**Mixed-effects (frailty) — FOCEI.** ferx recovers the data-generating truth under a
+clean large-N simulation–estimation check (N=2000): λ_pop = 0.099 (−1%), ω² = 0.232
+(−7%). The small ω² shortfall is the expected mild FOCEI-Laplace bias for TTE (it
+grows at low event rates; SAEM/IMP reduce it). On the 100-subject file itself:
+
+| Parameter | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM (LAPLACIAN) |
+|-----------|------|-----------|---------------|--------------------|
+| TVLAMBDA (rate) | 0.10 | 0.0768 | _pending_ | _pending_ |
+| ω²(ETA_LAMBDA) | 0.25 | 0.290 | _pending_ | _pending_ |
+| OFV | — | 588.93 | _pending_ | _pending_ |
+
+> NONMEM reports `THETA(1)=log λ`; compare `exp(THETA(1))` to ferx `TVLAMBDA`. The
+> nlmixr2 / NONMEM columns are filled by running the scripts in
+> `tests/reference/tte_exponential/` (see its `README.md` and `expected.md`). A small
+> OFV offset between tools is expected from differing normalising constants.
 
 ### nlmixr2 equivalent
 
@@ -226,6 +246,10 @@ $OMEGA 0.09
 ## See also
 
 - `examples/tte_exponential.ferx` — minimal worked example
-- `data/tte_exponential.csv` — simulated dataset (30 subjects)
+- `data/tte_exponential.csv` — small dataset (30 subjects) used by the smoke tests
+- `tests/reference/tte_exponential/` — 100-subject validation dataset (`tte_exp.csv`),
+  reference scripts (`simulate.R`, `survreg.R`, `nlmixr2.R`, `nonmem.ctl`), `README.md`
+  (NONMEM/nlmixr2 hand-off) and `expected.md` (filled comparison)
 - `tests/tte_smoke.rs` — Tier-2 parse and short-run smoke tests
+- `tests/tte_convergence.rs` — Tier-3 convergence + SSE tests (`--features survival,slow-tests`)
 - `plans/tte-survival-markov.md` — full multi-phase roadmap

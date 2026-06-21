@@ -2213,9 +2213,16 @@ and the `predict_survival` R wrapper remain.
 #### Remaining — deferred from Phase 1
 
 **Estimation:**
-- ❌ Tier 3 convergence tests (`tests/tte_convergence.rs`, gated `slow-tests`)
-- ❌ NONMEM/nlmixr2 reference comparison — run `tests/reference/tte_exponential/` scripts;
-  fill the comparison table in `docs/src/estimation/tte.md`
+- 🟡 Tier 3 convergence tests (`tests/tte_convergence.rs`, gated `survival,slow-tests`) — **Exponential
+  done** (branch `test/tte-phase1-validation`): `tte_sse_exponential_recovers_truth` (N=2000 SSE →
+  λ −1%, ω² −7%), `tte_convergence_exponential_mixed`, and `tte_convergence_exponential_fixed_matches_survreg`
+  (ferx n_eta=0 rate **exactly** matches base-R `survreg`: 0.074506, OFV 589.888). slow-tests.yml now
+  passes `survival` so these run nightly. **Weibull + Gompertz Tier-3 still ❌.**
+- 🟡 NONMEM/nlmixr2 reference comparison — Exponential: dataset regenerated (canonical 100-subj
+  `tte_exp.csv`, 82 events/18% cens), license-free columns (ferx FOCEI + `survreg`) filled in
+  `expected.md` and `docs/src/estimation/tte.md`; **NONMEM/nlmixr2 columns are a hand-off**
+  (`tests/reference/tte_exponential/README.md` — needs a NONMEM licence + nlmixr2 install).
+  Weibull + Gompertz comparison still ❌.
 
 **Parser / DSL:**
 - ❌ `[event_model]` expressions cannot reference `[individual_parameters]` names — `param_fn`

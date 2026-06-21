@@ -37,7 +37,7 @@ website:
         aria-label: GitHub
 
   sidebar:
-    style: docked
+    style: floating
     search: true
     contents:
       - text: "Introduction"

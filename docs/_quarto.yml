@@ -26,10 +26,12 @@ website:
       - text: "Roadmap"
         href: https://ferx-nlme.github.io/roadmap.html
     right:
-      - text: "ferx site"
-        href: https://ferx-nlme.github.io
+      - text: "ferx-core"
+        href: https://ferx-nlme.github.io/ferx-core/
       - text: "ferx-r"
         href: https://ferx-nlme.github.io/ferx-book/
+      - text: "Reference"
+        href: https://ferx-nlme.github.io/reference/
       - icon: github
         href: https://github.com/FeRx-NLME
         aria-label: GitHub
@@ -130,7 +132,6 @@ website:
         contents:
           - development/contributing.qmd
           - development/sdlc.qmd
-
 
   page-footer:
     background: light

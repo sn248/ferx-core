@@ -1274,6 +1274,7 @@ fn run_mcem(
         sir_fallback_proposal,
         impmap_trace,
         bayes: None,
+        cond_dist: None,
     })
 }
 

@@ -2935,6 +2935,7 @@ fn fit_inner(
                     sir_fallback_proposal: None,
                     impmap_trace: None,
                     bayes: None,
+                    cond_dist: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -3564,6 +3565,7 @@ fn fit_inner(
         total_ebe_fallbacks: result.total_ebe_fallbacks,
         covariance_status,
         shrinkage_eta,
+        cond_dist: result.cond_dist.clone(),
         shrinkage_eps,
         iwres_lag1_r,
         dw_statistic,
@@ -6683,6 +6685,7 @@ mod simulate_with_uncertainty_tests {
             total_ebe_fallbacks: 0,
             covariance_status: CovarianceStatus::Computed,
             shrinkage_eta: vec![],
+            cond_dist: None,
             shrinkage_eps: f64::NAN,
             iwres_lag1_r: f64::NAN,
             dw_statistic: f64::NAN,

@@ -783,6 +783,126 @@ pub fn write_covtab_csv(table: &crate::types::CovariateTable, path: &str) -> Res
     Ok(())
 }
 
+/// Write the SAEM conditional-distribution summary (`saem_conddist = true`,
+/// #257) as a long-format CSV: one row per subject per random effect.
+///
+/// Columns: `ID, ETA, COND_MEAN, COND_SD, COND_MODE` — the conditional mean and
+/// SD from the MCMC pass (`p(η_i | y_i; θ̂)`) alongside the conditional **mode**
+/// (the EBE, `SubjectResult.eta`) for direct comparison. This is the ferx
+/// analogue of saemix's `cond.mean.phi` / `cond.sd` and Monolix's
+/// `*_mean` / `*_sd` columns. Returns `Err` if the fit carries no
+/// conditional-distribution results.
+pub fn write_conddist_csv(result: &FitResult, path: &str) -> Result<(), String> {
+    let cd = result
+        .cond_dist
+        .as_ref()
+        .ok_or("fit has no conditional-distribution results (saem_conddist was not enabled)")?;
+
+    let mut wtr = csv::WriterBuilder::new()
+        .from_path(path)
+        .map_err(|e| format!("Failed to create {}: {}", path, e))?;
+    wtr.write_record(["ID", "ETA", "COND_MEAN", "COND_SD", "COND_MODE"])
+        .map_err(|e| e.to_string())?;
+
+    for (i, subj) in result.subjects.iter().enumerate() {
+        let mean_i = cd.cond_mean.get(i);
+        let sd_i = cd.cond_sd.get(i);
+        for (j, eta_name) in result.eta_names.iter().enumerate() {
+            let mean = mean_i.and_then(|m| m.get(j)).copied().unwrap_or(f64::NAN);
+            let sd = sd_i.and_then(|s| s.get(j)).copied().unwrap_or(f64::NAN);
+            // The conditional mode is the EBE already on the subject result.
+            let mode = subj.eta.get(j).copied().unwrap_or(f64::NAN);
+            wtr.write_record([
+                subj.id.clone(),
+                eta_name.clone(),
+                fmt_num(mean),
+                fmt_num(sd),
+                fmt_num(mode),
+            ])
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    wtr.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Write the retained per-subject conditional-distribution draws
+/// (`saem_conddist_keep_samples = true`) as a wide CSV: one row per draw.
+///
+/// Columns: `ID, SAMPLE, <eta_names...>`. The analogue of Monolix's
+/// `simulatedRandomEffects.txt`. Returns `Err` if no samples were retained.
+pub fn write_conddist_samples_csv(result: &FitResult, path: &str) -> Result<(), String> {
+    let cd = result
+        .cond_dist
+        .as_ref()
+        .ok_or("fit has no conditional-distribution results (saem_conddist was not enabled)")?;
+    if cd.samples.iter().all(|s| s.is_empty()) {
+        return Err(
+            "no conditional-distribution draws retained (saem_conddist_keep_samples was false)"
+                .to_string(),
+        );
+    }
+
+    let mut wtr = csv::WriterBuilder::new()
+        .from_path(path)
+        .map_err(|e| format!("Failed to create {}: {}", path, e))?;
+    let mut header: Vec<String> = vec!["ID".into(), "SAMPLE".into()];
+    header.extend(result.eta_names.iter().cloned());
+    wtr.write_record(&header).map_err(|e| e.to_string())?;
+
+    for (i, subj) in result.subjects.iter().enumerate() {
+        let Some(draws) = cd.samples.get(i) else {
+            continue;
+        };
+        for (s, draw) in draws.iter().enumerate() {
+            let mut rec: Vec<String> = Vec::with_capacity(2 + draw.len());
+            rec.push(subj.id.clone());
+            rec.push((s + 1).to_string());
+            rec.extend(draw.iter().map(|&v| fmt_num(v)));
+            wtr.write_record(&rec).map_err(|e| e.to_string())?;
+        }
+    }
+
+    wtr.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Emit the conditional-distribution CSV outputs (#257) for a completed fit,
+/// returning the human-facing status/warning lines for the caller to print.
+///
+/// Returns an empty `Vec` when the fit carries no conditional-distribution
+/// results (the pass was not enabled). Otherwise it always attempts
+/// `{model}-conddist.csv`, and writes `{model}-conddist-samples.csv` only when
+/// draws were retained — surfacing any real write error rather than swallowing
+/// it. Pulling this out of the CLI `main()` keeps the dispatch unit-testable.
+pub fn write_conddist_outputs(result: &FitResult, model_name: &str) -> Vec<String> {
+    let mut messages = Vec::new();
+    let Some(cd) = result.cond_dist.as_ref() else {
+        return messages;
+    };
+
+    let cd_path = format!("{}-conddist.csv", model_name);
+    match write_conddist_csv(result, &cd_path) {
+        Ok(()) => messages.push(format!("Conditional distribution written to {}", cd_path)),
+        Err(e) => messages.push(format!("Warning: failed to write conddist: {}", e)),
+    }
+
+    // Raw draws — only write when samples were retained; skip quietly otherwise.
+    if !cd.samples.iter().all(|s| s.is_empty()) {
+        let samples_path = format!("{}-conddist-samples.csv", model_name);
+        match write_conddist_samples_csv(result, &samples_path) {
+            Ok(()) => messages.push(format!(
+                "Conditional-distribution draws written to {}",
+                samples_path
+            )),
+            Err(e) => messages.push(format!("Warning: failed to write conddist draws: {}", e)),
+        }
+    }
+
+    messages
+}
+
 /// Format a numeric cell for CSV output: NaN → empty (missing), else 6 dp.
 fn fmt_num(v: f64) -> String {
     if v.is_nan() {
@@ -1491,6 +1611,7 @@ mod tests {
             total_ebe_fallbacks: 0,
             covariance_status: CovarianceStatus::NotRequested,
             shrinkage_eta: Vec::new(),
+            cond_dist: None,
             shrinkage_eps: f64::NAN,
             iwres_lag1_r: f64::NAN,
             dw_statistic: f64::NAN,
@@ -1737,6 +1858,101 @@ mod tests {
         }
     }
 
+    /// Round-trip the conditional-distribution CSV writers (#257): a populated
+    /// `cond_dist` produces the documented `-conddist.csv` / `-conddist-samples.csv`
+    /// layouts, and the two error paths (no `cond_dist`, no retained samples)
+    /// return `Err` without creating a file.
+    #[test]
+    fn write_conddist_csv_and_samples_roundtrip() {
+        let mut s0 = sdtab_subject_result("1", 2);
+        s0.eta = nalgebra::DVector::from_vec(vec![0.10, -0.20]);
+        let mut s1 = sdtab_subject_result("2", 2);
+        s1.eta = nalgebra::DVector::from_vec(vec![0.30, 0.40]);
+        let mut r = minimal_sdtab_result(vec![s0, s1]);
+        r.eta_names = vec!["ETA_CL".to_string(), "ETA_V".to_string()];
+        r.cond_dist = Some(CondDist {
+            cond_mean: vec![vec![0.11, -0.19], vec![0.29, 0.41]],
+            cond_sd: vec![vec![0.05, 0.06], vec![0.07, 0.08]],
+            samples: vec![
+                vec![vec![0.10, -0.20], vec![0.12, -0.18]],
+                vec![vec![0.28, 0.40], vec![0.30, 0.42]],
+            ],
+            shrinkage: vec![0.2, 0.3],
+            nsamp: 2,
+            burnin: 1,
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("m");
+        let model_name = model.to_str().unwrap();
+
+        // Drive the CLI dispatch helper: with retained draws it writes both files
+        // and reports both.
+        let msgs = write_conddist_outputs(&r, model_name);
+        assert_eq!(
+            msgs.len(),
+            2,
+            "expected conddist + samples messages: {msgs:?}"
+        );
+        assert!(msgs[0].starts_with("Conditional distribution written to"));
+        assert!(msgs[1].starts_with("Conditional-distribution draws written to"));
+
+        // --- conditional mean/SD/mode CSV ---
+        let lines: Vec<String> = std::fs::read_to_string(format!("{model_name}-conddist.csv"))
+            .unwrap()
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(lines[0], "ID,ETA,COND_MEAN,COND_SD,COND_MODE");
+        // header + 2 subjects × 2 eta
+        assert_eq!(lines.len(), 5);
+        // subject 1, ETA_CL: mean 0.11, sd 0.05, mode = eta[0] = 0.10
+        assert_eq!(lines[1], "1,ETA_CL,0.110000,0.050000,0.100000");
+        // subject 2, ETA_V: mean 0.41, sd 0.08, mode = eta[1] = 0.40
+        assert_eq!(lines[4], "2,ETA_V,0.410000,0.080000,0.400000");
+
+        // --- raw draws CSV ---
+        let slines: Vec<String> =
+            std::fs::read_to_string(format!("{model_name}-conddist-samples.csv"))
+                .unwrap()
+                .lines()
+                .map(|l| l.to_string())
+                .collect();
+        assert_eq!(slines[0], "ID,SAMPLE,ETA_CL,ETA_V");
+        // header + 2 subjects × 2 draws
+        assert_eq!(slines.len(), 5);
+        assert_eq!(slines[1], "1,1,0.100000,-0.200000");
+        assert_eq!(slines[4], "2,2,0.300000,0.420000");
+
+        // --- dispatch: no conditional-distribution results → no files, no messages ---
+        let mut r_none = minimal_sdtab_result(vec![]);
+        r_none.cond_dist = None;
+        assert!(write_conddist_outputs(&r_none, model_name).is_empty());
+        // The writers themselves return Err on a missing cond_dist.
+        assert!(write_conddist_csv(&r_none, "unused").is_err());
+        assert!(write_conddist_samples_csv(&r_none, "unused").is_err());
+
+        // --- dispatch: cond_dist present but no draws retained → only the mean/SD
+        // file is written (one message); the samples writer is skipped quietly. ---
+        let mut s = sdtab_subject_result("1", 1);
+        s.eta = nalgebra::DVector::from_vec(vec![0.0]);
+        let mut r_nodraws = minimal_sdtab_result(vec![s]);
+        r_nodraws.eta_names = vec!["ETA_CL".to_string()];
+        r_nodraws.cond_dist = Some(CondDist {
+            cond_mean: vec![vec![0.0]],
+            cond_sd: vec![vec![0.1]],
+            samples: vec![vec![]],
+            shrinkage: vec![f64::NAN],
+            nsamp: 0,
+            burnin: 0,
+        });
+        let model2 = dir.path().join("n");
+        let msgs2 = write_conddist_outputs(&r_nodraws, model2.to_str().unwrap());
+        assert_eq!(msgs2.len(), 1, "samples skipped when no draws: {msgs2:?}");
+        // And the samples writer returns Err directly for the no-draws case.
+        assert!(write_conddist_samples_csv(&r_nodraws, "unused").is_err());
+    }
+
     fn sdtab_subject(id: &str, n_obs: usize, obs_cmts: Vec<usize>) -> Subject {
         use std::collections::HashMap;
         Subject {
@@ -1825,6 +2041,7 @@ mod tests {
             total_ebe_fallbacks: 0,
             covariance_status: CovarianceStatus::NotRequested,
             shrinkage_eta: Vec::new(),
+            cond_dist: None,
             shrinkage_eps: f64::NAN,
             iwres_lag1_r: f64::NAN,
             dw_statistic: f64::NAN,

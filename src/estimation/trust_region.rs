@@ -453,6 +453,7 @@ pub fn optimize_trust_region(
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
+        cond_dist: None,
     }
 }
 

@@ -17,16 +17,14 @@ website:
     logo-dark: assets/ferx-dsl-brackets-dark.svg
     logo-alt: "ferx"
     left:
-      - text: "Docs"
-        href: index.qmd
-      - text: "Model DSL"
-        href: model-file/index.qmd
-      - text: "Estimation"
-        href: estimation/index.qmd
-      - text: "Examples"
-        href: examples/index.qmd
-      - text: "API"
-        href: api/index.qmd
+      - text: "Get started"
+        href: getting-started.qmd
+      - text: "Features"
+        href: https://ferx-nlme.github.io/features.html
+      - text: "Changelog"
+        href: https://ferx-nlme.github.io/changelog.html
+      - text: "Roadmap"
+        href: https://ferx-nlme.github.io/roadmap.html
     right:
       - text: "ferx site"
         href: https://ferx-nlme.github.io

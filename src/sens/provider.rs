@@ -914,10 +914,14 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     }
     match model.indiv_param_partials.indiv_param_program.as_ref() {
         Some(prog) => {
-            prog.pk_slots().len() == model.pk_indices.len()
+            let prog_slots = prog.pk_slots();
+            model
+                .pk_model
+                .required_pk_params()
+                .iter()
+                .all(|(slot, _)| prog_slots.contains(slot) && slot_to_dim(*slot).is_some())
                 && prog.n_theta_axis() == model.n_theta
                 && prog.n_eta_axis() == model.n_eta
-                && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
         }
         None => false,
     }
@@ -3692,6 +3696,38 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
 
+    // 2-cpt IV with WT-on-CL through intermediate individual-parameter assignments.
+    // Regression for #455: the TV-cov Dual2 gate must look at the compiled PK
+    // outputs (`prog.pk_slots()`), not `model.pk_indices`, because `pk_indices` is
+    // parallel to all unconditional assignments and contains intermediate rows.
+    const TWOCPT_IV_TVCOV_INTERMEDIATE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(15.0, 1.0, 100.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  WTREL = WT / 70
+  WTCL  = WTREL ^ THETA_WT
+  BASECL = TVCL * WTCL
+  CL = BASECL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  QBASE = TVQ
+  Q  = QBASE
+  V2BASE = TVV2
+  V2 = V2BASE
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
     // 3-cpt oral with WT-on-CL. θ = [TVCL, TVV1, TVQ2, TVV2, TVQ3, TVV3, TVKA,
     // THETA_WT].
     const THREECPT_ORAL_TVCOV: &str = r#"
@@ -3837,7 +3873,35 @@ mod tests {
                 );
                 (m, s, vec![10.0, 50.0, 15.0, 100.0, 0.75], vec![0.12, -0.08])
             },
-            // (e) 3-cpt oral, WT changing at each observation (widest dual, M=11).
+            // (e) 2-cpt IV with intermediate individual-parameter assignments and
+            // an EVID=2-style covariate breakpoint. `model.pk_indices` contains
+            // extra intermediate rows here; the TV-cov path must use
+            // `prog.pk_slots()` to seed/scatter the four structural PK outputs.
+            {
+                let m = parse_model_string(TWOCPT_IV_TVCOV_INTERMEDIATE)
+                    .expect("parse 2cpt iv tvcov intermediate");
+                let s = tvcov_subject(
+                    vec![bolus(0.0)],
+                    &[70.0],
+                    &[0.5, 2.0, 6.0, 12.0],
+                    &[70.0, 70.0, 95.0, 95.0],
+                    Vec::new(),
+                    vec![3.0],
+                    &[95.0],
+                );
+                assert!(
+                    m.pk_indices.len()
+                        > m.indiv_param_partials
+                            .indiv_param_program
+                            .as_ref()
+                            .expect("compiled individual program")
+                            .pk_slots()
+                            .len(),
+                    "fixture must expose intermediate individual-parameter rows"
+                );
+                (m, s, vec![10.0, 50.0, 15.0, 100.0, 0.75], vec![0.12, -0.08])
+            },
+            // (f) 3-cpt oral, WT changing at each observation (widest dual, M=11).
             {
                 let m = parse_model_string(THREECPT_ORAL_TVCOV).expect("parse 3cpt oral tvcov");
                 let s = tvcov_subject(
@@ -3856,7 +3920,7 @@ mod tests {
                     vec![0.15, -0.10, 0.25],
                 )
             },
-            // (f) 1-cpt oral with a constant `obs_scale = 1000` divisor — the whole
+            // (g) 1-cpt oral with a constant `obs_scale = 1000` divisor — the whole
             // jet divides by the (covariate-independent) scale.
             {
                 let m = parse_model_string(ONECPT_ORAL_TVCOV_SCALED)
@@ -3876,7 +3940,7 @@ mod tests {
                 );
                 (m, s, vec![0.2, 10.0, 1.5, 0.75], vec![0.15, -0.10, 0.25])
             },
-            // (g) 1-cpt IV **steady-state** bolus (II=24) with WT changing across
+            // (h) 1-cpt IV **steady-state** bolus (II=24) with WT changing across
             // observations: the walk equilibrates the SS state per-event at the
             // dose's covariate snapshot, then the covariate switches the decay.
             {
@@ -3942,6 +4006,20 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     &[],
+                );
+                (m, s, vec![10.0, 50.0, 15.0, 100.0, 0.75], vec![0.12, -0.08])
+            },
+            {
+                let m = parse_model_string(TWOCPT_IV_TVCOV_INTERMEDIATE)
+                    .expect("parse 2cpt iv tvcov intermediate");
+                let s = tvcov_subject(
+                    vec![bolus(0.0)],
+                    &[70.0],
+                    &[0.5, 2.0, 6.0, 12.0],
+                    &[70.0, 70.0, 95.0, 95.0],
+                    Vec::new(),
+                    vec![3.0],
+                    &[95.0],
                 );
                 (m, s, vec![10.0, 50.0, 15.0, 100.0, 0.75], vec![0.12, -0.08])
             },

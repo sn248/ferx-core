@@ -5062,8 +5062,7 @@ pub fn predict(
     let mut results = Vec::new();
 
     for subject in &population.subjects {
-        let pk_params = (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
-        let preds = model_preds(model, subject, &pk_params, &params.theta, &zero_eta);
+        let preds = pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta);
 
         for (j, &pred) in preds.iter().enumerate() {
             results.push(PredictionResult {

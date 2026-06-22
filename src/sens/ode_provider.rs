@@ -447,7 +447,7 @@ fn param_eta_derivatives(
         return None;
     }
     let ne = model.n_eta;
-    let ni = model.pk_indices.len();
+    let ni = prog.pk_slots().len();
     macro_rules! disp {
         ($($mm:literal),+) => {
             match ne {
@@ -498,7 +498,7 @@ pub(crate) fn pd_from_program<const M: usize>(
     let p = prog.eval_param_duals::<M>(theta, eta, cov);
     let nt = model.n_theta;
     let ne = model.n_eta;
-    let ni = model.pk_indices.len();
+    let ni = p.len();
     let mut dp_deta = vec![vec![0.0; ne]; ni];
     let mut dp_dtheta = vec![vec![0.0; nt]; ni];
     let mut d2p_deta2 = vec![vec![vec![0.0; ne]; ne]; ni];

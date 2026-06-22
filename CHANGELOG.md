@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Performance
+- **Faster analytic time-varying-covariate inner η-gradient + ODE-sensitivity path
+  consolidation** (#451). The per-subject event schedule is now reused across inner
+  BFGS steps instead of rebuilt each step, identical per-event covariate snapshots are
+  seeded once, and the time-after-dose anchor advances incrementally — cutting
+  redundant work in the inner EBE loop for TV-covariate analytical fits. Internally,
+  the production `f64` and dual ODE-sensitivity paths now share single generic helpers
+  for the built-in absorption input-rate forcing and the LTBS log transform, so the
+  predictor and the analytic gradient can't silently drift; no change to results.
 - **Analytic inner η-gradient for time-varying covariates / oral infusion on
   analytical PK models** (#447). The light `Dual1` inner EBE gradient previously
   declined these subjects and reverted to finite differences even though the

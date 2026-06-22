@@ -109,7 +109,7 @@ All `[scaling]` variants on the **analytical PK path** support the default
 | Scalar `obs_scale = K` | exact analytic | exact FD | The constant threads as one entry per observation. |
 | Expression `obs_scale = <expr>` | subject-static analytic | exact FD | See subject-static caveat below. |
 | Per-CMT `obs_scale[CMT=N]` | subject-static analytic | exact FD | One per-observation scale entry per observation, dispatched by `subject.obs_cmts[i]`. |
-| Form C `y[…] = <expr>` (ODE only) | finite differences | exact FD | Form C only exists on ODE models, where the analytic gradient is not available regardless of scaling. |
+| Form C `y[…] = <expr>` (ODE only) | exact analytic (in-scope ODE) | exact FD | Since #410/#439 the ODE sensitivity provider differentiates the Form C readout — uniform `y = <expr>` and per-CMT `y[CMT=N] = <expr>` — over `Dual2`/`Dual1` (outer and inner). Out-of-scope ODE features (steady state, IOV, …) fall back to FD. |
 
 **Analytic outer gradient handles expression scaling exactly.** The analytic
 sensitivity provider that drives the gradient-based outer optimizers (`bfgs`,
@@ -186,6 +186,10 @@ subject-static `pk_param_fn` evaluation. See
 [Interaction with gradients](#interaction-with-gradients) for the subject-static
 caveat that applies to all expression-form scales.
 
-Form C per-CMT (`y[CMT=N] = <expr>`) still requires `gradient = fd` —
-not because of the per-CMT dispatch but because Form C only exists on
-ODE models, where the analytic route is not available.
+Since #439, Form C per-CMT (`y[CMT=N] = <expr>`) is differentiated
+analytically by the ODE sensitivity provider — each endpoint's compiled
+output program is evaluated over `Dual2` (outer gradient) and `Dual1`
+(inner EBE η-gradient), dispatched per observation by `subject.obs_cmts[i]`.
+So `gradient = auto` serves it; `gradient = fd` is no longer required (the
+fit falls back to FD only for out-of-scope ODE features such as steady
+state, IOV, or time-varying covariates).

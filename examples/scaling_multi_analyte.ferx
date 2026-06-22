@@ -8,11 +8,12 @@
 # but fit() validates coverage at startup and errors with a clear
 # message naming any missing CMTs.
 #
-# `gradient = fd` is required because this example uses Form C (the
-# `y[CMT=N] = ...` readout — ODE-only, no AD path). Per-CMT
-# `obs_scale[CMT=N] = K` (Forms A/B post-multiply) DOES support AD via
+# Since #439 the `y[CMT=N] = ...` per-CMT Form C readout is differentiated
+# analytically over `Dual2`/`Dual1` (each endpoint's program), so the default
+# `gradient = auto` route serves it — `gradient = fd` is no longer required.
+# Per-CMT `obs_scale[CMT=N] = K` (Forms A/B post-multiply) also supports AD via
 # the per-observation scale array — see `scaling_expression.ferx` and
-# `docs/src/model-file/scaling.md` for the gradient-method matrix.
+# `docs/model-file/scaling.qmd` for the gradient-method matrix.
 
 [parameters]
   theta TVCL(5.0,  0.1,  50.0)
@@ -51,4 +52,4 @@
   method     = focei
   maxiter    = 500
   covariance = true
-  gradient   = fd                     # required for per-CMT scaling
+  gradient   = auto                   # per-CMT Form C is analytic since #439

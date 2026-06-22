@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic gradients for per-CMT (multi-endpoint) ODE readouts** (#439). The
+  `[scaling] y[CMT=N] = <expr>` Form-C readout is now differentiated by the ODE
+  sensitivity provider — each endpoint's compiled output program is evaluated over
+  `Dual2` (outer) and `Dual1` (inner), dispatched per observation by its CMT — so
+  multi-analyte / PK-PD models (e.g. parent + metabolite, or PK + effect) get the
+  exact analytic FOCE/FOCEI gradient instead of falling back to finite differences;
+  `gradient = fd` is no longer required for these models. Validated against finite
+  differences of the production predictor.
 - **Analytic FOCE/FOCEI gradients for user-`[odes]` models** (#410). The ODE
   sensitivity engine — an augmented `Dual2` RK45 that propagates `∂state/∂(θ,η)`
   alongside the state — is now armed, so in-scope ODE models drive the exact

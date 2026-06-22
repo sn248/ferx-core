@@ -12,10 +12,11 @@
 //! via the **general** individual-parameter derivatives `∂p/∂η, ∂p/∂θ` (FD of
 //! `pk_param_fn` — see [`param_derivatives`]; no log-normal assumption).
 //!
-//! **Supported:** single-endpoint `ObsCmt` or simple Form C (`y = central/V1`)
-//! readout; **bolus and infusion** doses; **bioavailability F** (incl. estimated,
-//! any parameterization — log-normal, logit-normal, additive); **EVID 3/4 resets
-//! / multi-occasion**; **non-zero `init(...)` initial conditions**; static
+//! **Supported:** single-endpoint `ObsCmt`, uniform Form C (`y = central/V1`), or
+//! per-CMT Form C (`y[CMT=N] = <expr>` — each endpoint differentiated over the dual,
+//! #439) readout; **bolus and infusion** doses; **bioavailability F** (incl.
+//! estimated, any parameterization — log-normal, logit-normal, additive); **EVID 3/4
+//! resets / multi-occasion**; **non-zero `init(...)` initial conditions**; static
 //! covariates; a constant `obs_scale` divisor and **LTBS** (`log(DV) ~ …`) output
 //! transforms; up to [`MAX_ODE_SENS_DIM`] individual parameters. Both the full
 //! `Dual2` **outer** gradient and a light `Dual1` **inner** η-gradient
@@ -23,7 +24,7 @@
 //!
 //! **Not yet supported** (falls back to the gradient-free / FD path): steady-state
 //! dosing, lagtime, built-in input-rate absorption, IOV, SDE/diffusion, expression
-//! `obs_scale`, time-varying covariates, per-CMT Form C.
+//! `obs_scale`, time-varying covariates.
 #![allow(clippy::needless_range_loop)]
 
 use super::dual1::Dual1;
@@ -67,12 +68,19 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if ode.rhs_program.is_none() {
         return false;
     }
-    // Readout: either the state directly (`ObsCmt`) or a simple Form C output
-    // program (`y = <expr>` over states/indiv params, e.g. `central / V1`).
+    // Readout: the state directly (`ObsCmt`), a simple Form C output program
+    // (`y = <expr>` over states/indiv params, e.g. `central / V1`), or a per-CMT
+    // Form C (`y[CMT=N] = <expr>`) where every endpoint carries a simple program
+    // (#439 — each observation reads its CMT's program over the dual state).
     let readout_ok = match &ode.readout {
         OdeReadout::ObsCmt(_) => true,
         OdeReadout::Single(_) => ode.readout_program.as_ref().is_some_and(|p| p.is_simple()),
-        OdeReadout::PerCmt(_) => false,
+        OdeReadout::PerCmt(map) => {
+            !map.is_empty()
+                && map
+                    .values()
+                    .all(|r| r.program.as_ref().is_some_and(|p| p.is_simple()))
+        }
     };
     if !readout_ok {
         return false;
@@ -519,7 +527,8 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
     let mut ro_stack: Vec<T> = Vec::new();
     let preds: Vec<T> = states
         .iter()
-        .map(|st| {
+        .enumerate()
+        .map(|(j, st)| {
             let raw = match &ode.readout {
                 OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(T::from_f64(0.0)),
                 OdeReadout::Single(_) => ode
@@ -527,7 +536,14 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
                     .as_ref()
                     .map(|p| p.eval_output_g::<T>(st, &params_dual, &mut ro_vars, &mut ro_stack))
                     .unwrap_or(T::from_f64(0.0)),
-                OdeReadout::PerCmt(_) => T::from_f64(0.0),
+                // Per-CMT (#439): observation j reads its own CMT's output program.
+                OdeReadout::PerCmt(cmt_map) => subject
+                    .obs_cmts
+                    .get(j)
+                    .and_then(|cmt| cmt_map.get(cmt))
+                    .and_then(|r| r.program.as_ref())
+                    .map(|p| p.eval_output_g::<T>(st, &params_dual, &mut ro_vars, &mut ro_stack))
+                    .unwrap_or(T::from_f64(f64::NAN)),
             };
             apply_output_transform::<T>(model, raw)
         })
@@ -1421,6 +1437,83 @@ mod tests {
                     g,
                     max_relative = 1e-3,
                     epsilon = 1e-6
+                );
+            }
+        }
+    }
+
+    // Per-CMT Form-C readout (#439): a 2-cpt model observed at two endpoints —
+    // central concentration at CMT 1 (`central/V1`) and peripheral concentration
+    // at CMT 2 (`peripheral/V2`). Each observation reads its own CMT's output
+    // program over the dual state, selected by `subject.obs_cmts`.
+    const TWOCPT_ODE_PERCMT: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y[CMT=1] = central / V1
+  y[CMT=2] = peripheral / V2
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    fn percmt_subject(times: &[f64], cmts: &[usize]) -> Subject {
+        let mut s = bolus_subject(times);
+        s.obs_cmts = cmts.to_vec();
+        s
+    }
+
+    /// The per-CMT provider's `f`/`∂f/∂η`/`∂f/∂θ` must match the production predictor
+    /// + FD, with each observation routed through its CMT's output program.
+    #[test]
+    fn ode_provider_percmt_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE_PERCMT).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "per-CMT Form-C ODE readout should be supported (#439)"
+        );
+        // Observations alternate between the two endpoints.
+        let subject = percmt_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0], &[1, 2, 1, 2, 1, 2]);
+        check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
+    }
+
+    /// The light `Dual1` inner η-gradient must equal the full `Dual2` outer
+    /// `df_deta` for a per-CMT model too (each endpoint's program over both duals).
+    #[test]
+    fn ode_provider_percmt_light_matches_full() {
+        let model = parse_model_string(TWOCPT_ODE_PERCMT).expect("parse");
+        let subject = percmt_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0], &[1, 2, 1, 2, 1, 2]);
+        let theta = vec![4.0, 12.0, 2.0, 25.0];
+        let eta = vec![0.12, -0.08];
+        let full = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("full");
+        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("light");
+        assert_eq!(full.obs.len(), light.len());
+        for (a, b) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    a.df_deta[k],
+                    b.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-10
                 );
             }
         }

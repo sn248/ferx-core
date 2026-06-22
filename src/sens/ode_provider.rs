@@ -550,6 +550,51 @@ fn apply_output_transform<T: crate::sens::num::PkNum>(model: &CompiledModel, p: 
     }
 }
 
+/// Resolve the ODE readout for observation `j` over the dual state `st`, then apply
+/// the negative-readout clamp and the output transform — the single readout site
+/// shared by the static [`integrate_subject_duals`] and the TV-cov
+/// [`integrate_tvcov_readout`] walks (#449 re-review #7). `params` is the flat
+/// PK-param dual vector the Form-C / per-CMT program reads: `params_dual` for the
+/// static walk, the per-event `pk_at_obs[j]` snapshot for the TV-cov walk. The
+/// `ObsCmt` arm ignores it (reads the state compartment directly).
+fn resolve_obs_readout<T: crate::sens::num::PkNum>(
+    model: &CompiledModel,
+    ode: &crate::ode::OdeSpec,
+    subject: &Subject,
+    st: &[T],
+    j: usize,
+    params: &[T],
+    ro_vars: &mut Vec<T>,
+    ro_stack: &mut Vec<T>,
+) -> T {
+    let raw = match &ode.readout {
+        OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(T::from_f64(0.0)),
+        OdeReadout::Single(_) => ode
+            .readout_program
+            .as_ref()
+            .map(|p| p.eval_output_g::<T>(st, params, ro_vars, ro_stack))
+            .unwrap_or(T::from_f64(0.0)),
+        // Per-CMT (#439): observation j reads its own CMT's output program.
+        OdeReadout::PerCmt(cmt_map) => subject
+            .obs_cmts
+            .get(j)
+            .and_then(|cmt| cmt_map.get(cmt))
+            .and_then(|r| r.program.as_ref())
+            .map(|p| p.eval_output_g::<T>(st, params, ro_vars, ro_stack))
+            .unwrap_or(T::from_f64(f64::NAN)),
+    };
+    // Negative-readout clamp (ODE overshoot guard), parity with production's
+    // `conc.max(0)` (predictions.rs) and the dual walks: a clamped value carries zero
+    // derivatives. A NaN readout is `< 0.0` → false, so it passes through and
+    // `apply_output_transform` preserves it as a tripwire (#449 review).
+    let raw = if raw.val() < 0.0 {
+        T::from_f64(0.0)
+    } else {
+        raw
+    };
+    apply_output_transform::<T>(model, raw)
+}
+
 /// Shared setup for both ODE drivers, generic over the dual type `T` (`Dual2<N>`
 /// for the full outer walk, `Dual1<N>` for the light inner η-gradient): seed the
 /// flat PK-parameter vector (individual parameter `i` → dual dimension `i`),
@@ -610,41 +655,25 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
         &opts,
     )?;
 
-    // Apply the readout per observation: the state directly (`ObsCmt`) or the Form
-    // C output program (`y = central/V1`) evaluated over the dual state, then the
-    // model's output transforms (`ScalarScale` divisor / LTBS log) over the dual.
+    // Apply the readout per observation, then the output transforms (`ScalarScale`
+    // divisor / LTBS log). The static walk reads every observation against the same
+    // `params_dual`.
     let mut ro_vars: Vec<T> = Vec::new();
     let mut ro_stack: Vec<T> = Vec::new();
     let preds: Vec<T> = states
         .iter()
         .enumerate()
         .map(|(j, st)| {
-            let raw = match &ode.readout {
-                OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(T::from_f64(0.0)),
-                OdeReadout::Single(_) => ode
-                    .readout_program
-                    .as_ref()
-                    .map(|p| p.eval_output_g::<T>(st, &params_dual, &mut ro_vars, &mut ro_stack))
-                    .unwrap_or(T::from_f64(0.0)),
-                // Per-CMT (#439): observation j reads its own CMT's output program.
-                OdeReadout::PerCmt(cmt_map) => subject
-                    .obs_cmts
-                    .get(j)
-                    .and_then(|cmt| cmt_map.get(cmt))
-                    .and_then(|r| r.program.as_ref())
-                    .map(|p| p.eval_output_g::<T>(st, &params_dual, &mut ro_vars, &mut ro_stack))
-                    .unwrap_or(T::from_f64(f64::NAN)),
-            };
-            // Negative-readout clamp (ODE overshoot guard), parity with production's
-            // `conc.max(0)` (predictions.rs) and the TV-cov walks: a clamped value
-            // carries zero derivatives. A NaN readout is `< 0.0` → false, so it passes
-            // through and `apply_output_transform` preserves it as a tripwire (#449 review).
-            let raw = if raw.val() < 0.0 {
-                T::from_f64(0.0)
-            } else {
-                raw
-            };
-            apply_output_transform::<T>(model, raw)
+            resolve_obs_readout::<T>(
+                model,
+                ode,
+                subject,
+                st,
+                j,
+                &params_dual,
+                &mut ro_vars,
+                &mut ro_stack,
+            )
         })
         .collect();
     Some(preds)
@@ -879,37 +908,23 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         &opts,
     );
 
+    // Each observation reads against its own per-event covariate snapshot `pk_at_obs[j]`.
     let mut ro_vars: Vec<T> = Vec::new();
     let mut ro_stack: Vec<T> = Vec::new();
     let preds = states
         .iter()
         .enumerate()
         .map(|(j, st)| {
-            let params = &pk_at_obs[j];
-            let raw = match &ode.readout {
-                OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(T::from_f64(0.0)),
-                OdeReadout::Single(_) => ode
-                    .readout_program
-                    .as_ref()
-                    .map(|p| p.eval_output_g::<T>(st, params, &mut ro_vars, &mut ro_stack))
-                    .unwrap_or(T::from_f64(0.0)),
-                OdeReadout::PerCmt(cmt_map) => subject
-                    .obs_cmts
-                    .get(j)
-                    .and_then(|c| cmt_map.get(c))
-                    .and_then(|r| r.program.as_ref())
-                    .map(|p| p.eval_output_g::<T>(st, params, &mut ro_vars, &mut ro_stack))
-                    .unwrap_or(T::from_f64(f64::NAN)),
-            };
-            // Negative-readout clamp (ODE overshoot guard), parity with production's
-            // `conc.max(0)`: a clamped value carries zero derivatives. A NaN passes
-            // through and `apply_output_transform` preserves it as a tripwire.
-            let raw = if raw.val() < 0.0 {
-                T::from_f64(0.0)
-            } else {
-                raw
-            };
-            apply_output_transform::<T>(model, raw)
+            resolve_obs_readout::<T>(
+                model,
+                ode,
+                subject,
+                st,
+                j,
+                &pk_at_obs[j],
+                &mut ro_vars,
+                &mut ro_stack,
+            )
         })
         .collect();
     Some(preds)

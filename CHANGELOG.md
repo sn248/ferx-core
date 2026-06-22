@@ -128,8 +128,10 @@ section of the SDLC for the versioning policy).
   block among the IIV-free (θ-only) parameters — which the FOCEI gradient never
   reads, since it uses no `∂²f/∂θ²`. On a 2-compartment ODE with 2 of 4
   individual parameters fixed, the per-subject sensitivity cost falls ≈2.2×; the
-  gradient is unchanged (bit-for-bit on every retained derivative). Models whose
-  individual parameters all carry IIV are unaffected.
+  retained dual entries and the first-order chain (`df_deta`, `df_dtheta`) are
+  bit-for-bit, and the chained second-order outputs (`d2f_deta2`,
+  `d2f_deta_dtheta`) agree to ~1e-9 (the terms are identical but summed in a
+  different order). Models whose individual parameters all carry IIV are unaffected.
 
 ### Added
 - **Analytic sensitivities for dose lagtime (ALAG)** on analytical PK models: a

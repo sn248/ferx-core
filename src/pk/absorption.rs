@@ -124,7 +124,16 @@ impl InputRateKind {
     /// fallback. #430 lifts inverse-Gaussian first (no new special function);
     /// transit follows once `ln_gamma` has a `Dual2` rule, Weibull with Phase 2.
     pub fn supported_over_dual(self) -> bool {
-        matches!(self, InputRateKind::InverseGaussian)
+        // Exhaustive (no `_` arm) so adding a kind forces a decision here, and must
+        // stay consistent with [`InputRateForcing::prepare_dual`] — a kind marked
+        // supported here but returning `None` there would let the ODE provider admit
+        // the model and then silently bail the whole subject to FD. The
+        // `supported_over_dual_agrees_with_prepare_dual` test pins that consistency
+        // (#430 review #5 / #451).
+        match self {
+            InputRateKind::InverseGaussian => true,
+            InputRateKind::Transit => false,
+        }
     }
 }
 
@@ -694,5 +703,30 @@ mod tests {
             arg_slots: vec![6, 7],
         };
         assert!(transit.prepare_dual::<f64>(&params).is_none());
+    }
+
+    /// Drift tripwire: `InputRateKind::supported_over_dual` (the gate the ODE
+    /// provider reads) must agree with whether `prepare_dual` actually lifts the
+    /// kind. A kind marked supported but returning `None` would let
+    /// `ode_analytical_supported` admit the model, then the `?` in
+    /// `integrate_subject_duals` silently bails the whole subject to FD with no
+    /// error. Adding a kind: extend `ALL_KINDS` here too (#430 review #5 / #451).
+    #[test]
+    fn supported_over_dual_agrees_with_prepare_dual() {
+        const ALL_KINDS: &[InputRateKind] =
+            &[InputRateKind::InverseGaussian, InputRateKind::Transit];
+        let params = vec![1.0; crate::types::MAX_PK_PARAMS];
+        for &kind in ALL_KINDS {
+            let forcing = InputRateForcing {
+                cmt: 1,
+                kind,
+                arg_slots: vec![4, 5],
+            };
+            assert_eq!(
+                kind.supported_over_dual(),
+                forcing.prepare_dual::<f64>(&params).is_some(),
+                "supported_over_dual must match prepare_dual liftability for {kind:?}"
+            );
+        }
     }
 }

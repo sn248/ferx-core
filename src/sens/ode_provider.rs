@@ -785,13 +785,13 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
         return None;
     }
     // Bioavailability F scales the dosed amount/rate (NONMEM F·AMT / F·RATE). F
-    // lives at PK_IDX_F (pk_param_fn defaults it to 1 when undeclared); when F is
-    // an estimated individual parameter, its derivative flows via `params_dual`.
-    let f_bio = if pk_values[PK_IDX_F] > 0.0 {
-        params_dual[PK_IDX_F]
-    } else {
-        T::from_f64(1.0)
-    };
+    // lives at PK_IDX_F (pk_param_fn defaults it to 1 when undeclared); when F is an
+    // estimated individual parameter, its derivative flows via `params_dual`. Use the
+    // raw slot — mirroring production's `DoseAttrMap::f_bio` (raw `params[PK_IDX_F]`,
+    // with the 1.0 default baked into the slot at construction) — so a transient
+    // F ≤ 0 mid-fit scales the dose by F exactly as the f64 predictor does, rather
+    // than substituting 1.0 and dropping ∂/∂F (#451 / #433 review #3).
+    let f_bio = params_dual[PK_IDX_F];
 
     // Dose-time anchors for TAFD/TAD (constants w.r.t. the parameters).
     let first_dose_time = subject
@@ -1167,21 +1167,25 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
     subject: &Subject,
     pk_at_dose: &[Vec<T>],
     pk_at_obs: &[Vec<T>],
-) -> Option<Vec<T>> {
-    let ode = model.ode_spec.as_ref()?;
-    let program = ode.rhs_program.as_ref()?;
+) -> Vec<T> {
+    // `ode_tvcov_supported` (checked by both TV-cov entry points before reaching
+    // here) calls `ode_analytical_supported`, which declines a model whose `ode_spec`
+    // or `rhs_program` is `None` — so both are guaranteed present and this readout is
+    // infallible (the former `Option` return was dead) (#451 re-review #12).
+    let ode = model
+        .ode_spec
+        .as_ref()
+        .expect("ode_tvcov_supported guarantees ode_spec");
+    let program = ode
+        .rhs_program
+        .as_ref()
+        .expect("ode_analytical_supported guarantees rhs_program");
     let opts = ode.solver_opts;
 
-    let f_bio_at_dose: Vec<T> = pk_at_dose
-        .iter()
-        .map(|p| {
-            if p[PK_IDX_F].val() > 0.0 {
-                p[PK_IDX_F]
-            } else {
-                T::from_f64(1.0)
-            }
-        })
-        .collect();
+    // Raw slot, mirroring production's `DoseAttrMap::f_bio` (1.0 default baked in at
+    // construction) — a transient F ≤ 0 scales the dose by F like the f64 predictor,
+    // not 1.0 (#451 / #433 review #3).
+    let f_bio_at_dose: Vec<T> = pk_at_dose.iter().map(|p| p[PK_IDX_F]).collect();
     let first_dose_time = subject
         .doses
         .iter()
@@ -1220,7 +1224,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
             )
         })
         .collect();
-    Some(preds)
+    preds
 }
 
 /// Time-varying-covariate outer (`Dual2<M>`, `M = n_theta + n_eta`) sensitivities
@@ -1245,7 +1249,7 @@ fn run_subject_tvcov<const M: usize>(
         .map(|j| seed_pk_dual2::<M>(model, prog, theta, eta, subject.obs_cov(j)))
         .collect();
 
-    let preds = integrate_tvcov_readout::<Dual2<M>>(model, subject, &pk_at_dose, &pk_at_obs)?;
+    let preds = integrate_tvcov_readout::<Dual2<M>>(model, subject, &pk_at_dose, &pk_at_obs);
 
     let mut out = Vec::with_capacity(preds.len());
     for fd in &preds {
@@ -1354,7 +1358,7 @@ fn run_subject_tvcov_eta<const N: usize>(
         .map(|j| seed_pk_dual1::<N>(model, prog, theta, eta, subject.obs_cov(j)))
         .collect::<Option<_>>()?;
 
-    let preds = integrate_tvcov_readout::<Dual1<N>>(model, subject, &pk_at_dose, &pk_at_obs)?;
+    let preds = integrate_tvcov_readout::<Dual1<N>>(model, subject, &pk_at_dose, &pk_at_obs);
 
     let mut out = Vec::with_capacity(preds.len());
     for fd in &preds {

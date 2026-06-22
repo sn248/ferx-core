@@ -98,7 +98,7 @@ Triggers only if users hit FD-gradient cost limits.
 | [src/api.rs](src/api.rs) | `method = nn_mse` shortcut for fixed-effects sanity check |
 | `examples/warfarin_nn.ferx` | new example, M2 deliverable |
 | `docs/src/model-file/covariate-nn.md` + `docs/src/model-file/neural-networks.md` (landing) + `docs/src/SUMMARY.md` | docs (CLAUDE.md requirement) |
-| `docs/book/` | rebuild via `cd docs && mdbook build` |
+| `docs/_site/` | rebuilt via `quarto render docs` (git-ignored, never committed) |
 
 ## Reusing what's already there
 
@@ -117,7 +117,7 @@ End-to-end checks, in order:
 3. **Sanity reproduction** (M1 deliverable): `cargo run --release --features nn -- examples/warfarin_nn_fixed.ferx --data data/warfarin.csv` with `method = nn_mse` produces NN weights whose forward pass on the training covariates matches the analytical typical values from `examples/two_cpt_oral_cov.ferx` within 5% RMSE.
 4. **Mixed-effects reproduction** (M2 deliverable): the same `warfarin_nn.ferx` with `method = focei` reaches an OFV within 1 unit of the analytical model. The fit YAML's eta shrinkage and omega estimates should match the analytical fit to within numerical noise — strong evidence the NN layer is the only thing changed.
 5. **Roundtrip**: simulate 100 subjects from a known NN+omega+sigma, fit, recover NN weights within 5% and omega within 10%.
-6. **Docs build**: `cd docs && mdbook build` succeeds and the new page renders.
+6. **Docs build**: `quarto render docs` succeeds and the new page renders.
 
 ## Open questions worth flagging during M1 implementation
 

@@ -51,7 +51,7 @@ cargo run --release -- examples/warfarin.ferx --simulate
 |--------|---------|
 | `main` | Primary development branch; must always build cleanly |
 | `feature/*` | Feature branches for new estimation methods, model types, or major changes |
-| `gh-pages` | Auto-generated documentation site (mdBook output) |
+| `gh-pages` | Auto-generated documentation site (Quarto output) |
 
 ### Workflow
 
@@ -144,16 +144,15 @@ A `CHANGELOG.md` file should be maintained following [Keep a Changelog](https://
 
 | Resource | Location | Purpose |
 |----------|----------|---------|
-| mdBook site | `docs/src/` | User-facing documentation, model DSL reference, estimation methods |
+| Quarto site | `docs/**/*.qmd` | User-facing documentation, model DSL reference, estimation methods |
 | README.md | Project root | Quick start, overview, model syntax examples |
 | CLAUDE.md | Project root | Developer guidance, architecture, build commands |
 
 ### Building documentation
 
 ```bash
-cd docs
-mdbook build    # Output to docs/book/
-mdbook serve    # Local preview at http://localhost:3000
+quarto render docs    # Output to docs/_site/ (git-ignored, never committed)
+quarto preview docs   # Local preview with live reload
 ```
 
 ### Deployment
@@ -178,7 +177,7 @@ All jobs use the stock Rust nightly toolchain pinned in `rust-toolchain.toml`.
 ### Future CI additions
 
 - **Validation**: Run example models and compare output to baselines
-- **Docs**: Build mdBook and deploy to gh-pages on main branch pushes
+- **Docs**: Build the Quarto site and deploy to gh-pages on main branch pushes
 - **Security**: `cargo audit` for dependency vulnerabilities
 - **Release**: Tag push (`v*`) builds release binaries and creates a GitHub Release
 
@@ -245,4 +244,4 @@ A `CONTRIBUTING.md` file should be created to document:
 5. **Review**: Open PR, get code review, address feedback.
 6. **Merge**: Squash-merge or merge into `main`.
 7. **Release** (when ready): Tag, update changelog, build release artifacts.
-8. **Document**: Update mdBook docs and README as needed.
+8. **Document**: Update Quarto docs and README as needed.

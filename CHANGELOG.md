@@ -30,6 +30,14 @@ section of the SDLC for the versioning policy).
   steady state).
 
 ### Added
+- **`[event_model]` hazard expressions can reference `[individual_parameters]`** names —
+  e.g. a hazard driven by an individual `CL` — resolved per subject at evaluation time, in
+  addition to the existing theta/eta/covariate namespace. Intermediate variables and names
+  defined with a NONMEM-style `if (...) { ... } else { ... }` block are supported; only the
+  individual parameters the hazard actually references are computed. A hazard reference to an
+  individual parameter that depends on an inter-occasion (IOV/kappa) random effect — or on a
+  `[covariate_nn]` output — is rejected with a clear error, since the per-subject hazard
+  cannot evaluate either. Behind the `survival` feature (#440).
 - **Analytic FOCE/FOCEI gradients for time-varying covariates on ODE models** (#439).
   An ODE model whose covariates change over time (per-event `WT`, `CRCL`, …) with
   **bolus** dosing now gets the exact analytic outer gradient and the light `Dual1`

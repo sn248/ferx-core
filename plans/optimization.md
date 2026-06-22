@@ -209,10 +209,10 @@ and re-verify before opening the PR.
 
 ### Phase F — Documentation and PR
 
-1. Update `docs/src/` markdown sources for any user-visible change
-   (new `[fit_options]` key, new optimizer variant, new estimation method
-   behaviour). Rebuild the mdBook (`cd docs && mdbook build`) and commit
-   both source and built output in the same commit.
+1. Update the Quarto sources under `docs/` (`docs/**/*.qmd`) for any
+   user-visible change (new `[fit_options]` key, new optimizer variant, new
+   estimation method behaviour). Render locally to preview with `quarto render
+   docs`; the rendered `docs/_site/` is git-ignored, so commit only the sources.
 2. Fill in every section of `.github/PULL_REQUEST_TEMPLATE.md`.
 3. In the PR description, include the Phase B updated plan (the actual plan
    followed, not the one originally written below) and the Phase E benchmark

@@ -254,7 +254,9 @@ fn imp_estimator_refines_focei_on_warfarin() {
     // gradient) rather than the derivative-free BOBYQA default: on the weakly
     // identified KA direction BOBYQA stalls early and leaves ω²(KA) inflated
     // (~0.46 vs NONMEM 0.34, see #423), which is not a faithful FOCEI anchor for
-    // the "IMP refines FOCEI" comparison below.
+    // the "IMP refines FOCEI" comparison below. Do NOT revert to the BOBYQA
+    // default here (#423): the inflated anchor would make IMP's refinement
+    // assertions read against a wrong reference.
     let mut focei = FitOptions::default();
     focei.method = EstimationMethod::FoceI;
     focei.optimizer = Optimizer::Lbfgs;

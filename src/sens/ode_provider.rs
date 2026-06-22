@@ -166,6 +166,46 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
     true
 }
 
+/// True when the time-varying-covariate ODE walk ([`run_subject_tvcov`] /
+/// [`run_subject_tvcov_eta`]) can serve this `(model, subject)`: an in-scope analytic
+/// ODE model whose subject carries TV covariates and uses the **bolus** dose subset.
+/// Infusion / steady-state / reset / EVID=2 / `init(...)` route to the FD fallback —
+/// production's TV-cov walk (`ode_predictions_event_driven`) handles those via
+/// forcing/SS machinery the dual walk does not yet mirror. Checked by *both* the
+/// outer and inner entry points so the analytic scope stays matched (#439).
+pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    if !ode_analytical_supported(model) || !subject.has_tv_covariates() {
+        return false;
+    }
+    let Some(ode) = model.ode_spec.as_ref() else {
+        return false;
+    };
+    // The bolus walk seeds compartments at zero; `init(...)` needs the seeded
+    // initial-state machinery the static path uses, so route those to FD.
+    if ode.init_fn.is_some() {
+        return false;
+    }
+    // Bolus subset only. `all_doses_fixed` first — `is_real_infusion` debug-asserts
+    // every dose is already resolved to `Fixed`.
+    if !subject.all_doses_fixed() {
+        return false;
+    }
+    if subject
+        .doses
+        .iter()
+        .any(crate::ode::predictions::is_real_infusion)
+    {
+        return false;
+    }
+    if subject.doses.iter().any(|d| d.ss && d.ii > 0.0) {
+        return false;
+    }
+    if subject.has_resets() || !subject.pk_only_times.is_empty() {
+        return false;
+    }
+    true
+}
+
 /// Compute per-observation analytic sensitivities for an ODE model, or `None` if
 /// it is outside the supported scope (caller falls back to the gradient-free
 /// path).
@@ -175,6 +215,19 @@ pub fn ode_subject_sensitivities(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
+    // Time-varying covariates: the `(θ,η)`-seeded event-driven walk (dual width
+    // `M = n_theta + n_eta ≤ MAX_ODE_AXES`), mirroring the analytical TV-cov path.
+    if ode_tvcov_supported(model, subject) {
+        macro_rules! dispatch_tv {
+            ($($m:literal),+) => {
+                match model.n_theta + model.n_eta {
+                    $($m => run_subject_tvcov::<$m>(model, subject, theta, eta),)+
+                    _ => None,
+                }
+            };
+        }
+        return dispatch_tv!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+    }
     if !ode_subject_supported(model, subject) {
         return None;
     }
@@ -203,6 +256,19 @@ pub fn ode_subject_eta_grad(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    // Time-varying covariates: the light η-only walk (`Dual1<n_eta>`), mirroring the
+    // outer TV-cov dispatch so the inner/outer analytic scope stays matched.
+    if ode_tvcov_supported(model, subject) {
+        macro_rules! dispatch_tv {
+            ($($n:literal),+) => {
+                match model.n_eta {
+                    $($n => run_subject_tvcov_eta::<$n>(model, subject, theta, eta),)+
+                    _ => None,
+                }
+            };
+        }
+        return dispatch_tv!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+    }
     if !ode_subject_supported(model, subject) {
         return None;
     }
@@ -683,6 +749,412 @@ fn run_subject_eta<const N: usize>(
         });
     }
     Some(out)
+}
+
+/// Per-event flat PK-slot duals seeded on `(θ,η)` at a covariate snapshot — the ODE
+/// analogue of the analytical `run_obs_tvcov`'s `mk`/`seed_row`. The PK slot for
+/// individual parameter `i` carries `∂p/∂θ_m` on axis `m` and `∂p/∂η_k` on axis
+/// `n_theta+k` (plus the η-η / η-θ 2nd-order blocks); every other slot is a
+/// constant. The returned `Vec` is indexed by PK slot (what the ODE RHS reads).
+fn seed_pk_dual2<const M: usize>(
+    model: &CompiledModel,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    theta: &[f64],
+    eta: &[f64],
+    cov: &std::collections::HashMap<String, f64>,
+) -> Vec<Dual2<M>> {
+    let n_theta = model.n_theta;
+    let n_eta = model.n_eta;
+    let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
+    let pk = (model.pk_param_fn)(theta, eta, cov);
+    let mut out: Vec<Dual2<M>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();
+    for (i, &slot) in model.pk_indices.iter().enumerate() {
+        let mut grad = [0.0; M];
+        let mut hess = [[0.0; M]; M];
+        for m in 0..n_theta.min(M) {
+            grad[m] = pd.dp_dtheta[i][m];
+        }
+        for k in 0..n_eta {
+            if n_theta + k < M {
+                grad[n_theta + k] = pd.dp_deta[i][k];
+                for l in 0..n_eta {
+                    if n_theta + l < M {
+                        hess[n_theta + k][n_theta + l] = pd.d2p_deta2[i][k][l];
+                    }
+                }
+                for m in 0..n_theta {
+                    if m < M {
+                        let v = pd.d2p_detadtheta[i][k][m];
+                        hess[n_theta + k][m] = v;
+                        hess[m][n_theta + k] = v;
+                    }
+                }
+            }
+        }
+        out[slot] = Dual2 {
+            value: pk.values[slot],
+            grad,
+            hess,
+        };
+    }
+    out
+}
+
+/// Time-varying-covariate outer (`Dual2<M>`, `M = n_theta + n_eta`) sensitivities
+/// for an ODE model — the ODE counterpart of `run_obs_tvcov`. Seeds the per-event
+/// PK params on `(θ,η)`, runs the bolus event-driven walk, applies the readout +
+/// output transforms, and reads `∂f/∂(θ,η)` straight off the dual (#439).
+fn run_subject_tvcov<const M: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<SubjectSens> {
+    let ode = model.ode_spec.as_ref()?;
+    let program = ode.rhs_program.as_ref()?;
+    let prog = ode.indiv_param_program.as_ref()?;
+    let n_eta = model.n_eta;
+    let n_theta = model.n_theta;
+    let opts = ode.solver_opts;
+
+    let pk_at_dose: Vec<Vec<Dual2<M>>> = (0..subject.doses.len())
+        .map(|k| seed_pk_dual2::<M>(model, prog, theta, eta, subject.dose_cov(k)))
+        .collect();
+    let pk_at_obs: Vec<Vec<Dual2<M>>> = (0..subject.obs_times.len())
+        .map(|j| seed_pk_dual2::<M>(model, prog, theta, eta, subject.obs_cov(j)))
+        .collect();
+    let f_bio_at_dose: Vec<Dual2<M>> = pk_at_dose
+        .iter()
+        .map(|p| {
+            if p[PK_IDX_F].value > 0.0 {
+                p[PK_IDX_F]
+            } else {
+                Dual2::constant(1.0)
+            }
+        })
+        .collect();
+    let first_dose_time = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
+    let init_state: Vec<Dual2<M>> = vec![Dual2::constant(0.0); ode.n_states];
+
+    let states = integrate_tvcov_g::<Dual2<M>>(
+        program,
+        ode.n_states,
+        subject,
+        &pk_at_dose,
+        &pk_at_obs,
+        &f_bio_at_dose,
+        &init_state,
+        first_dose_time,
+        &opts,
+    );
+
+    let mut ro_vars: Vec<Dual2<M>> = Vec::new();
+    let mut ro_stack: Vec<Dual2<M>> = Vec::new();
+    let mut out = Vec::with_capacity(subject.obs_times.len());
+    for (j, st) in states.iter().enumerate() {
+        let params = &pk_at_obs[j];
+        let raw = match &ode.readout {
+            OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(Dual2::constant(0.0)),
+            OdeReadout::Single(_) => ode
+                .readout_program
+                .as_ref()
+                .map(|p| p.eval_output_g::<Dual2<M>>(st, params, &mut ro_vars, &mut ro_stack))
+                .unwrap_or(Dual2::constant(0.0)),
+            OdeReadout::PerCmt(cmt_map) => subject
+                .obs_cmts
+                .get(j)
+                .and_then(|c| cmt_map.get(c))
+                .and_then(|r| r.program.as_ref())
+                .map(|p| p.eval_output_g::<Dual2<M>>(st, params, &mut ro_vars, &mut ro_stack))
+                .unwrap_or(Dual2::constant(f64::NAN)),
+        };
+        // Negative-readout clamp (ODE overshoot guard), parity with production's
+        // `conc.max(0)`: a clamped value carries zero derivatives.
+        let raw = if raw.value < 0.0 {
+            Dual2::constant(0.0)
+        } else {
+            raw
+        };
+        let fd = apply_output_transform::<Dual2<M>>(model, raw);
+        let g = &fd.grad;
+        let h = &fd.hess;
+        let mut df_deta = vec![0.0; n_eta];
+        let mut df_dtheta = vec![0.0; n_theta];
+        let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
+        let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
+        for k in 0..n_eta {
+            df_deta[k] = g[n_theta + k];
+            for l in 0..n_eta {
+                d2f_deta2[k * n_eta + l] = h[n_theta + k][n_theta + l];
+            }
+            for m in 0..n_theta {
+                d2f_deta_dtheta[k * n_theta + m] = h[n_theta + k][m];
+            }
+        }
+        for m in 0..n_theta {
+            df_dtheta[m] = g[m];
+        }
+        out.push(ObsSens {
+            f: fd.value,
+            df_deta,
+            d2f_deta2,
+            df_dtheta,
+            d2f_deta_dtheta,
+        });
+    }
+    Some(SubjectSens { obs: out })
+}
+
+/// `ParamDerivs` (`∂p/∂(θ,η)` + 2nd order) at an explicit covariate snapshot,
+/// dispatching on the program's axis count — the cov-taking sibling of
+/// [`param_derivatives`] (which reads `subject.covariates`), needed for per-event
+/// TV-cov snapshots (#439).
+fn param_derivatives_at_cov(
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    model: &CompiledModel,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<ParamDerivs> {
+    if prog.n_theta_axis() != model.n_theta || prog.n_eta_axis() != model.n_eta {
+        return None;
+    }
+    macro_rules! disp {
+        ($($m:literal),+) => {
+            match prog.n_axes() {
+                $($m => Some(pd_from_program::<$m>(prog, model, cov, theta, eta)),)+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+}
+
+/// Per-event flat PK-slot duals seeded on **η only** (`Dual1<N>`, `N = n_eta`) at a
+/// covariate snapshot — the light-inner counterpart of [`seed_pk_dual2`]. Slot for
+/// individual parameter `i` carries `∂p/∂η_k` on axis `k`; other slots are constant.
+fn seed_pk_dual1<const N: usize>(
+    model: &CompiledModel,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    theta: &[f64],
+    eta: &[f64],
+    cov: &std::collections::HashMap<String, f64>,
+) -> Option<Vec<Dual1<N>>> {
+    let n_eta = model.n_eta;
+    let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
+    let pk = (model.pk_param_fn)(theta, eta, cov);
+    let mut out: Vec<Dual1<N>> = pk.values.iter().map(|&v| Dual1::constant(v)).collect();
+    for (i, &slot) in model.pk_indices.iter().enumerate() {
+        let mut grad = [0.0; N];
+        for k in 0..n_eta.min(N) {
+            grad[k] = pd.dp_deta[i][k];
+        }
+        out[slot] = Dual1 {
+            value: pk.values[slot],
+            grad,
+        };
+    }
+    Some(out)
+}
+
+/// Time-varying-covariate **inner** η-gradient for an ODE model (light `Dual1<N>`,
+/// `N = n_eta`) — the TV-cov counterpart of [`run_subject_eta`]. Seeds the per-event
+/// PK params on η, runs the bolus event-driven walk, and reads `∂f/∂η` off the dual
+/// (#439).
+fn run_subject_tvcov_eta<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
+    let ode = model.ode_spec.as_ref()?;
+    let program = ode.rhs_program.as_ref()?;
+    let prog = ode.indiv_param_program.as_ref()?;
+    let n_eta = model.n_eta;
+    let opts = ode.solver_opts;
+
+    let pk_at_dose: Vec<Vec<Dual1<N>>> = (0..subject.doses.len())
+        .map(|k| seed_pk_dual1::<N>(model, prog, theta, eta, subject.dose_cov(k)))
+        .collect::<Option<_>>()?;
+    let pk_at_obs: Vec<Vec<Dual1<N>>> = (0..subject.obs_times.len())
+        .map(|j| seed_pk_dual1::<N>(model, prog, theta, eta, subject.obs_cov(j)))
+        .collect::<Option<_>>()?;
+    let f_bio_at_dose: Vec<Dual1<N>> = pk_at_dose
+        .iter()
+        .map(|p| {
+            if p[PK_IDX_F].value > 0.0 {
+                p[PK_IDX_F]
+            } else {
+                Dual1::constant(1.0)
+            }
+        })
+        .collect();
+    let first_dose_time = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
+    let init_state: Vec<Dual1<N>> = vec![Dual1::constant(0.0); ode.n_states];
+
+    let states = integrate_tvcov_g::<Dual1<N>>(
+        program,
+        ode.n_states,
+        subject,
+        &pk_at_dose,
+        &pk_at_obs,
+        &f_bio_at_dose,
+        &init_state,
+        first_dose_time,
+        &opts,
+    );
+
+    let mut ro_vars: Vec<Dual1<N>> = Vec::new();
+    let mut ro_stack: Vec<Dual1<N>> = Vec::new();
+    let mut out = Vec::with_capacity(subject.obs_times.len());
+    for (j, st) in states.iter().enumerate() {
+        let params = &pk_at_obs[j];
+        let raw = match &ode.readout {
+            OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(Dual1::constant(0.0)),
+            OdeReadout::Single(_) => ode
+                .readout_program
+                .as_ref()
+                .map(|p| p.eval_output_g::<Dual1<N>>(st, params, &mut ro_vars, &mut ro_stack))
+                .unwrap_or(Dual1::constant(0.0)),
+            OdeReadout::PerCmt(cmt_map) => subject
+                .obs_cmts
+                .get(j)
+                .and_then(|c| cmt_map.get(c))
+                .and_then(|r| r.program.as_ref())
+                .map(|p| p.eval_output_g::<Dual1<N>>(st, params, &mut ro_vars, &mut ro_stack))
+                .unwrap_or(Dual1::constant(f64::NAN)),
+        };
+        let raw = if raw.value < 0.0 {
+            Dual1::constant(0.0)
+        } else {
+            raw
+        };
+        let fd = apply_output_transform::<Dual1<N>>(model, raw);
+        let mut df_deta = vec![0.0; n_eta];
+        for (k, slot) in df_deta.iter_mut().enumerate() {
+            if k < N {
+                *slot = fd.grad[k];
+            }
+        }
+        out.push(ObsGrad {
+            f: fd.value,
+            df_deta,
+        });
+    }
+    Some(out)
+}
+
+/// Time-varying-covariate event-driven walk over the dual state (#439), the ODE
+/// mirror of the analytical [`super::provider::subject_sensitivities_tvcov`] /
+/// `event_driven_sens_g`. For the **bolus** subset it reproduces production's
+/// `ode_predictions_event_driven`: a merged dose+obs timeline (dose sorts before a
+/// co-timed obs), each segment `[cur_t, t_event]` integrated with the params
+/// evaluated **at** `t_event` (NONMEM end-of-interval), boluses applied after the
+/// segment, and the state captured at each observation. `pk_at_dose` / `pk_at_obs`
+/// are the per-event flat PK-slot duals pre-seeded by the caller on `(θ,η)` (outer)
+/// or `η` (inner); `f_bio_at_dose[k]` is dose `k`'s bioavailability dual. Returns
+/// one state vector per observation (parallel to `subject.obs_times`).
+#[allow(clippy::too_many_arguments)]
+fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
+    program: &crate::parser::model_parser::OdeRhsProgram,
+    n_states: usize,
+    subject: &Subject,
+    pk_at_dose: &[Vec<T>],
+    pk_at_obs: &[Vec<T>],
+    f_bio_at_dose: &[T],
+    init_state: &[T],
+    first_dose_time: f64,
+    opts: &crate::ode::solver::OdeSolverOptions,
+) -> Vec<Vec<T>> {
+    let n_obs = subject.obs_times.len();
+    let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
+
+    // Merged timeline: (time, sort-order, is_dose, idx). Bolus-only — the gate
+    // excludes infusion / reset / pk-only + TV-cov — so order is just Dose(1) <
+    // Obs(3) (matching production's `kind_order`) to break time ties dose-first.
+    let mut tl: Vec<(f64, u8, bool, usize)> = Vec::with_capacity(subject.doses.len() + n_obs);
+    for (k, d) in subject.doses.iter().enumerate() {
+        tl.push((d.time, 1, true, k));
+    }
+    for (j, &t) in subject.obs_times.iter().enumerate() {
+        tl.push((t, 3, false, j));
+    }
+    tl.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    if tl.is_empty() {
+        return states;
+    }
+
+    let mut cur_t = tl[0].0;
+    let mut u = init_state.to_vec();
+    let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
+    let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
+
+    for &(t_event, _order, is_dose, idx) in &tl {
+        // Segment `[cur_t, t_event]` uses the params evaluated at `t_event`.
+        let params: &[T] = if is_dose {
+            &pk_at_dose[idx]
+        } else {
+            &pk_at_obs[idx]
+        };
+        if t_event > cur_t {
+            let last_dose_eff = subject
+                .doses
+                .iter()
+                .map(|d| d.time)
+                .filter(|&dt| dt <= cur_t + 1e-12)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+                let tafd = if first_dose_time.is_finite() {
+                    t - first_dose_time
+                } else {
+                    f64::NAN
+                };
+                let tad = if last_dose_eff.is_finite() {
+                    t - last_dose_eff
+                } else {
+                    f64::NAN
+                };
+                program.eval_rhs_g::<T>(
+                    us,
+                    ps,
+                    t,
+                    tafd,
+                    tad,
+                    du,
+                    &mut vars_cell.borrow_mut(),
+                    &mut stack_cell.borrow_mut(),
+                );
+            };
+            let saveat = vec![t_event];
+            let sol = solve_ode_g(&rhs, &u, (cur_t, t_event), params, &saveat, opts);
+            if let Some(last) = sol.last() {
+                u.copy_from_slice(&last.u);
+            }
+            cur_t = t_event;
+        }
+        if is_dose {
+            let d = &subject.doses[idx];
+            let cmt_idx = d.cmt.saturating_sub(1);
+            if cmt_idx < n_states {
+                u[cmt_idx] = u[cmt_idx] + f_bio_at_dose[idx] * T::from_f64(d.amt);
+            }
+        } else {
+            states[idx].copy_from_slice(&u);
+        }
+    }
+    states
 }
 
 /// True when an observation time `ot` coincides with a segment break / solver
@@ -1573,5 +2045,133 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Time-varying covariate (#439): WT on CL changes across observations, so the
+    // PK params vary along the trajectory. The (θ,η)-seeded TV-cov walk must match
+    // production's event-driven predictor (`ode_predictions_event_driven`) + FD.
+    const ONECPT_ODE_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -CL/V * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    #[test]
+    fn ode_provider_tvcov_matches_production() {
+        let model = parse_model_string(ONECPT_ODE_TVCOV).expect("parse");
+        assert_eq!(model.n_theta, 3);
+        assert_eq!(model.n_eta, 1); // M = n_theta + n_eta = 4
+        let mut subject = bolus_subject(&[1.0, 2.0, 4.0, 8.0]);
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        subject.dose_covariates = vec![wt(60.0)];
+        subject.obs_covariates = vec![wt(60.0), wt(70.0), wt(80.0), wt(90.0)];
+        assert!(subject.has_tv_covariates());
+        let theta = vec![1.0, 20.0, 0.75];
+        let eta = vec![0.1];
+
+        let sens = run_subject_tvcov::<4>(&model, &subject, &theta, &eta).expect("tvcov supported");
+        let pred = |e: &[f64], th: &[f64], j: usize| -> f64 {
+            compute_predictions_with_tv(&model, &subject, th, e)[j]
+        };
+        let he = 1e-6;
+        for (j, obs) in sens.obs.iter().enumerate() {
+            // Value matches production's event-driven (per-event-cov) predictor.
+            approx::assert_relative_eq!(
+                obs.f,
+                pred(&eta, &theta, j),
+                max_relative = 1e-6,
+                epsilon = 1e-9
+            );
+            for k in 0..model.n_eta {
+                let mut ep = eta.clone();
+                ep[k] += he;
+                let mut em = eta.clone();
+                em[k] -= he;
+                let g = (pred(&ep, &theta, j) - pred(&em, &theta, j)) / (2.0 * he);
+                approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 1e-3, epsilon = 1e-6);
+            }
+            for m in 0..model.n_theta {
+                let s = he * (1.0 + theta[m].abs());
+                let mut tp = theta.clone();
+                tp[m] += s;
+                let mut tm = theta.clone();
+                tm[m] -= s;
+                let g = (pred(&eta, &tp, j) - pred(&eta, &tm, j)) / (2.0 * s);
+                approx::assert_relative_eq!(
+                    obs.df_dtheta[m],
+                    g,
+                    max_relative = 1e-3,
+                    epsilon = 1e-6
+                );
+            }
+        }
+    }
+
+    fn tvcov_subject() -> Subject {
+        let mut subject = bolus_subject(&[1.0, 2.0, 4.0, 8.0]);
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        subject.dose_covariates = vec![wt(60.0)];
+        subject.obs_covariates = vec![wt(60.0), wt(70.0), wt(80.0), wt(90.0)];
+        subject
+    }
+
+    /// The light `Dual1` inner η-gradient must equal the full `Dual2` outer
+    /// `df_deta` for a TV-cov subject too — exercised through the dispatch, so this
+    /// also covers `ode_tvcov_supported` routing both entry points (#439).
+    #[test]
+    fn ode_provider_tvcov_light_matches_full() {
+        let model = parse_model_string(ONECPT_ODE_TVCOV).expect("parse");
+        let subject = tvcov_subject();
+        let theta = vec![1.0, 20.0, 0.75];
+        let eta = vec![0.1];
+        let full = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("outer tvcov");
+        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("inner tvcov");
+        assert_eq!(full.obs.len(), light.len());
+        for (a, b) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    a.df_deta[k],
+                    b.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-10
+                );
+            }
+        }
+    }
+
+    /// The TV-cov gate admits a bolus TV-cov subject and declines a static-covariate
+    /// subject (which the normal pk-seeded path serves) and an infusion (FD fallback).
+    #[test]
+    fn ode_tvcov_gate_scope() {
+        let model = parse_model_string(ONECPT_ODE_TVCOV).expect("parse");
+        // Static covariates → not the TV-cov path.
+        assert!(!ode_tvcov_supported(&model, &bolus_subject(&[1.0, 2.0])));
+        // Bolus TV-cov → supported.
+        let tv = tvcov_subject();
+        assert!(ode_tvcov_supported(&model, &tv));
+        // TV-cov + a real infusion → FD fallback (out of the bolus subset).
+        let mut inf = tv.clone();
+        inf.doses[0].duration = 1.0;
+        inf.doses[0].rate = inf.doses[0].amt;
+        assert!(crate::ode::predictions::is_real_infusion(&inf.doses[0]));
+        assert!(!ode_tvcov_supported(&model, &inf));
     }
 }

@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic FOCE/FOCEI gradients for time-varying covariates on ODE models** (#439).
+  An ODE model whose covariates change over time (per-event `WT`, `CRCL`, …) with
+  **bolus** dosing now gets the exact analytic outer gradient and the light `Dual1`
+  inner η-gradient instead of falling back to finite differences. The dual is seeded
+  on `(θ,η)` (`M = n_theta + n_eta`) and walked over a per-event event-driven
+  integration, mirroring the analytical TV-cov path and matching production's
+  `ode_predictions_event_driven` predictor bit-for-bit (validated against it + FD).
+  Combined with infusion / steady-state / reset / `init(...)`, TV-cov still falls
+  back to FD.
 - **Analytic gradients for per-CMT (multi-endpoint) ODE readouts** (#439). The
   `[scaling] y[CMT=N] = <expr>` Form-C readout is now differentiated by the ODE
   sensitivity provider — each endpoint's compiled output program is evaluated over

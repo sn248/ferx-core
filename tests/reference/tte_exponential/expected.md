@@ -26,12 +26,14 @@ recovery of the *truth*.
 | OFV (−2LL) | — | **588.93** | **588.94** | ⏳ pending |
 
 > **NONMEM status (2026-06-22):** the hand-off `nonmem.ctl` was run as **fixed-effects**
-> (`$OMEGA 0 FIX`, `$ESTIMATION METHOD=0`), so it fills the fixed-effects anchor below — **not**
-> this frailty column. The earlier frailty attempts failed only at NM-TRAN *translation* (reserved
-> `$PRED` name `H`; `$TABLE IPRED PRED` undefined for an `F_FLAG=1` likelihood model), never at
-> estimation — sample size was not the cause. **`nonmem_frailty.ctl`** restores the estimated
-> `$OMEGA` + `CONDITIONAL LAPLACIAN INTERACTION` (FO is invalid for a likelihood model with random
-> effects); run it on a licensed machine to fill this column.
+> (`$OMEGA 0 FIX`, `METHOD=0`), so it fills the fixed-effects anchor below — **not** this frailty
+> column. Two things blocked the frailty fit, neither sample size: (1) NM-TRAN *translation* errors
+> (reserved `$PRED` name `H`; `$TABLE IPRED PRED` undefined for `F_FLAG=1`); (2) NONMEM forbids
+> `CONDITIONAL`/`LAPLACIAN` on **single-subject** data, which 1 record/subject is inferred to be
+> (`350 METHOD=CONDITIONAL INVALID WITH SINGLE-SUBJECT DATA`). **`nonmem_frailty.ctl`** fixes both:
+> estimated `$OMEGA` + `CONDITIONAL LAPLACIAN INTERACTION`, reading **`tte_exp_nm.csv`** (a `TIME=0`
+> at-risk entry record per subject → 2 records/subject → population data; the entry row contributes
+> `S(0)=1` → 0, so the estimates are unchanged). Run it on a licensed machine to fill this column.
 
 ferx ↔ nlmixr2 FOCEI **agree to ~3 digits on every parameter and the −2LL** — strong
 license-free cross-tool validation. (nlmixr2's raw "OBJF" 405.15 omits the data normalizing

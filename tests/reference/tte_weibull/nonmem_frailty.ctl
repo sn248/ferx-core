@@ -1,27 +1,31 @@
 $PROBLEM TTE Weibull (FRAILTY on shape) – Phase 1 ferx validation
-; Corrected mixed-effects (frailty) control file: estimates var(eta.shape) via
-; CONDITIONAL LAPLACIAN INTERACTION. This is the model the hand-off intended (it
-; fills the "NONMEM LAPLACIAN" column of the frailty table in expected.md) and is
-; the cross-tool check for the #440 nonlinear-frailty omega^2 finding (ferx 0.204
-; vs nlmixr2 0.173).
+; Mixed-effects (frailty on shape) fit via CONDITIONAL LAPLACIAN INTERACTION. Fills
+; the "NONMEM LAPLACIAN" column / the #440 nonlinear-frailty omega^2 cross-check
+; (ferx 0.204 vs nlmixr2 0.173).
 ;
-; Differences vs the fixed-effects nonmem.ctl that was actually run:
-;   * $OMEGA is ESTIMATED (0.20 init), NOT `0 FIX`.
-;   * $ESTIMATION uses CONDITIONAL LAPLACIAN INTERACTION, NOT METHOD=0 (FO).
-; The earlier frailty attempts only failed NM-TRAN translation (reserved name `H`,
-; and `$TABLE IPRED PRED` undefined in an F_FLAG=1 likelihood model) — both avoided
-; here. Sample size was never the issue: NONMEM never reached the estimator.
+; DATA LAYOUT (the fix for error 350): NONMEM forbids CONDITIONAL/LAPLACIAN on
+; "single-subject" data, which 1 record/subject is inferred to be. So this reads
+; tte_weibull_nm.csv, which adds a TIME=0 "at-risk entry" record per subject (2
+; records/subject => population data). The entry record contributes S(0)=1 -> 0 to
+; the -2LL, so the estimates are IDENTICAL to the 1-record file the other tools fit.
+;
+; HAZNOW is computed ONLY for event rows (DV=1, TIME>0): at TIME=0 the term
+; (TIME/SCALE)**(SHAPE-1) is 0**(negative) if a trial SHAPE<1 during the eta search
+; -> Inf/NaN. CHZ=(TIME/SCALE)**SHAPE is safe at TIME=0 (SHAPE>0 -> 0**positive = 0).
+; HAZNOW (not the reserved name H); IGNORE=@; clean $TABLE — all kept.
 $INPUT ID TIME DV EVID CMT MDV
-$DATA tte_weibull.csv IGNORE=@
+$DATA tte_weibull_nm.csv IGNORE=@
 
 $PRED
   SCALE  = EXP(THETA(1))           ; scale (time units): H=(t/scale)^shape
   SHAPE  = EXP(THETA(2) + ETA(1))  ; shape (dimensionless), frailty on shape
-  CHZ    = (TIME/SCALE)**SHAPE      ; H(t)
-  HAZNOW = (SHAPE/SCALE)*(TIME/SCALE)**(SHAPE-1)  ; h(t)  (NOT H — reserved $PRED arg)
+  CHZ    = (TIME/SCALE)**SHAPE      ; H(t)  (= 0 at the TIME=0 entry record)
   F_FLAG = 1
-  IF (DV.EQ.0) Y = EXP(-CHZ)
-  IF (DV.EQ.1) Y = HAZNOW * EXP(-CHZ)
+  IF (DV.EQ.0) Y = EXP(-CHZ)                        ; entry/censored -> S(T)
+  IF (DV.EQ.1) THEN
+     HAZNOW = (SHAPE/SCALE)*(TIME/SCALE)**(SHAPE-1) ; h(t); event rows only (TIME>0)
+     Y = HAZNOW * EXP(-CHZ)
+  ENDIF
 
 $THETA (0.001, 3.0, 10)   ; log(scale): init log(20) = 2.996
 $THETA (0.001, 0.693, 5)  ; log(shape): init log(2.0) = 0.693

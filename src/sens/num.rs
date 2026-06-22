@@ -17,6 +17,9 @@ pub trait PkNum:
 {
     /// Lift a constant into the numeric type (zero derivatives for duals).
     fn from_f64(x: f64) -> Self;
+    /// Seed dual dimension `dim` as an independent variable at value `x`. `f64`
+    /// carries no derivatives, so it ignores `dim` and behaves like `from_f64`.
+    fn var(x: f64, dim: usize) -> Self;
     /// The underlying value — for guards / branch conditions only.
     fn val(self) -> f64;
     /// `exp`.
@@ -46,6 +49,10 @@ pub trait PkNum:
 impl PkNum for f64 {
     #[inline]
     fn from_f64(x: f64) -> Self {
+        x
+    }
+    #[inline]
+    fn var(x: f64, _dim: usize) -> Self {
         x
     }
     #[inline]
@@ -98,6 +105,10 @@ impl<const N: usize> PkNum for Dual1<N> {
     #[inline]
     fn from_f64(x: f64) -> Self {
         Dual1::constant(x)
+    }
+    #[inline]
+    fn var(x: f64, dim: usize) -> Self {
+        Dual1::var(x, dim)
     }
     #[inline]
     fn val(self) -> f64 {
@@ -153,6 +164,10 @@ impl<const N: usize> PkNum for Dual2<N> {
     #[inline]
     fn from_f64(x: f64) -> Self {
         Dual2::constant(x)
+    }
+    #[inline]
+    fn var(x: f64, dim: usize) -> Self {
+        Dual2::var(x, dim)
     }
     #[inline]
     fn val(self) -> f64 {

@@ -891,6 +891,14 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
 /// not carry features the light inner provider can't serve (survival obs records,
 /// time-varying covariates).
 fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    // Survival/TTE observation records carry a likelihood term that neither inner
+    // provider models — the analytical path declines below, and the light ODE walk
+    // (`run_subject_eta`) iterates only `subject.obs_times`, so it would silently
+    // omit the survival term. Guard both routes up front.
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        return false;
+    }
     // ODE models use the light `Dual1` inner provider (#410) with their own scope —
     // independent of the analytical-path LTBS/ExpressionScale exclusions in
     // `analytic_inner_grad_supported_model`, since the `Dual1` walk evaluates
@@ -907,10 +915,6 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
         return crate::sens::provider::ode_inner_grad_supported(model, subject);
     }
     if !analytic_inner_grad_supported_model(model) {
-        return false;
-    }
-    #[cfg(feature = "survival")]
-    if !subject.obs_records.is_empty() {
         return false;
     }
     !subject.has_tv_covariates()

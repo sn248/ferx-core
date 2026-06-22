@@ -127,8 +127,10 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
 /// limited by [`crate::sens::ode_provider::ode_analytical_supported`] (RHS-program
 /// models, simple readout, bolus + finite infusion, `F`, resets, covariates,
 /// within the dual-axis cap); anything outside it falls back to the prior path
-/// (gradient-free outer, FD inner). The inner EBE loop likewise stays on FD for
-/// now — only the **outer** η/θ gradient is armed here.
+/// (gradient-free outer, FD inner). Both routes are armed: the **outer** η/θ
+/// gradient via the `Dual2` walk, and the **inner** EBE η-gradient via the light
+/// `Dual1` walk (`subject_eta_grad_impl` → `ode_subject_eta_grad`, gated by
+/// `ode_inner_grad_supported`); out-of-scope subjects still fall back to FD.
 const ODE_SENS_ENABLED: bool = true;
 
 /// Escape hatch: `FERX_DISABLE_EXPLICIT_SENS=1` forces every subject onto the

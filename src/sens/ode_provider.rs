@@ -222,6 +222,43 @@ fn param_derivatives(
     param_derivatives_from_prog(prog, model, subject, theta, eta)
 }
 
+/// First-order `∂p/∂η` only (the η-block of [`ParamDerivs::dp_deta`]) over a
+/// `Dual1<M>` seeded on η, `M = n_eta` — the light inner counterpart of
+/// [`param_derivatives`]. Skips the θ-axes and the second-order Hessian the full
+/// `Dual2` path computes, since the inner η-gradient consumes only `dp_deta`
+/// (#410). Returns `None` on the same axis-count mismatch as the full path.
+fn param_eta_derivatives(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<Vec<f64>>> {
+    let prog = model.ode_spec.as_ref()?.indiv_param_program.as_ref()?;
+    if prog.n_theta_axis() != model.n_theta || prog.n_eta_axis() != model.n_eta {
+        return None;
+    }
+    let ne = model.n_eta;
+    let ni = model.pk_indices.len();
+    macro_rules! disp {
+        ($($mm:literal),+) => {
+            match ne {
+                $($mm => {
+                    let p = prog.eval_param_eta_grad::<$mm>(theta, eta, &subject.covariates);
+                    let mut dp_deta = vec![vec![0.0; ne]; ni];
+                    for i in 0..ni {
+                        for k in 0..ne {
+                            dp_deta[i][k] = p[i].grad[k];
+                        }
+                    }
+                    Some(dp_deta)
+                })+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+}
+
 /// Analytical `∂p/∂(θ,η)` (+ second order) from an explicit individual-parameter
 /// program, shared by the ODE provider (program on `ode_spec`) and the analytical
 /// PK provider (program on `indiv_param_partials`). Returns `None` — caller falls
@@ -402,48 +439,44 @@ fn apply_output_transform<T: crate::sens::num::PkNum>(model: &CompiledModel, p: 
     }
 }
 
-fn run_subject<const N: usize>(
+/// Shared setup for both ODE drivers, generic over the dual type `T` (`Dual2<N>`
+/// for the full outer walk, `Dual1<N>` for the light inner η-gradient): seed the
+/// flat PK-parameter vector (individual parameter `i` → dual dimension `i`),
+/// resolve bioavailability `F`, integrate the augmented state through the subject's
+/// events, and apply the readout + output transforms per observation. `init_state`
+/// is supplied by the caller (its FD seeding is order-specific:
+/// [`dual_init_state`] carries the Hessian, [`dual1_init_state`] only the gradient).
+/// Returns one transformed prediction `T` per observation — the caller reads its
+/// `grad`/`hess` and chains with `∂p/∂(η[,θ])`. `None` on lagtime (not yet supported
+/// over the dual loop) or an integration that fails to record every observation.
+fn integrate_subject_duals<T: crate::sens::num::PkNum>(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-) -> Option<SubjectSens> {
+    pk_values: &[f64],
+    init_state: &[T],
+) -> Option<Vec<T>> {
     let ode = model.ode_spec.as_ref()?;
     let program = ode.rhs_program.as_ref()?;
-    let n_eta = model.n_eta;
-    let n_theta = model.n_theta;
     let opts = ode.solver_opts;
-
-    // PK parameter values at (θ, η).
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
 
     // Seed the flat PK-parameter vector: individual parameter i (PK slot
     // `pk_indices[i]`) carries dual dimension i; everything else is constant.
-    let mut params_dual: Vec<Dual2<N>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();
+    let mut params_dual: Vec<T> = pk_values.iter().map(|&v| T::from_f64(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
-        params_dual[slot] = Dual2::var(pk.values[slot], i);
+        params_dual[slot] = T::var(pk_values[slot], i);
     }
-    // Individual-parameter η/θ derivatives (analytical, over Dual2 seeded on θ/η).
-    let pd = param_derivatives(model, subject, theta, eta)?;
 
     // Lagtime (a nonzero dose-time shift) is not yet supported over the dual loop.
-    if pk.values[PK_IDX_LAGTIME].abs() > 1e-12 {
+    if pk_values[PK_IDX_LAGTIME].abs() > 1e-12 {
         return None;
     }
     // Bioavailability F scales the dosed amount/rate (NONMEM F·AMT / F·RATE). F
     // lives at PK_IDX_F (pk_param_fn defaults it to 1 when undeclared); when F is
     // an estimated individual parameter, its derivative flows via `params_dual`.
-    let f_bio = if pk.values[PK_IDX_F] > 0.0 {
+    let f_bio = if pk_values[PK_IDX_F] > 0.0 {
         params_dual[PK_IDX_F]
     } else {
-        Dual2::constant(1.0)
-    };
-
-    // Initial state from `init(...)` (dual-seeded by FD of init_fn); zeros when
-    // none is declared. Re-applied at every EVID 3/4 reset.
-    let init_state: Vec<Dual2<N>> = match ode.init_fn.as_ref() {
-        Some(f) => dual_init_state::<N>(f.as_ref(), &pk.values, &model.pk_indices, ode.n_states),
-        None => vec![Dual2::constant(0.0); ode.n_states],
+        T::from_f64(1.0)
     };
 
     // Dose-time anchors for TAFD/TAD (constants w.r.t. the parameters).
@@ -453,39 +486,67 @@ fn run_subject<const N: usize>(
         .map(|d| d.time)
         .fold(f64::INFINITY, f64::min);
 
-    // Integrate the Dual2 state through bolus + infusion events, capturing the
-    // full state at each observation time.
-    let states = integrate_g::<Dual2<N>>(
+    // Integrate the dual state through bolus + infusion events, capturing the full
+    // state at each observation time.
+    let states = integrate_g::<T>(
         program,
         ode.n_states,
         subject,
         &params_dual,
         f_bio,
-        &init_state,
+        init_state,
         first_dose_time,
         &opts,
     )?;
 
-    // Apply the readout per observation: the state directly (`ObsCmt`) or the
-    // Form C output program (`y = central/V1`) evaluated over the dual state, then
-    // the model's output transforms (`ScalarScale` divisor / LTBS log) over the dual.
-    let mut ro_vars: Vec<Dual2<N>> = Vec::new();
-    let mut ro_stack: Vec<Dual2<N>> = Vec::new();
-    let preds: Vec<Dual2<N>> = states
+    // Apply the readout per observation: the state directly (`ObsCmt`) or the Form
+    // C output program (`y = central/V1`) evaluated over the dual state, then the
+    // model's output transforms (`ScalarScale` divisor / LTBS log) over the dual.
+    let mut ro_vars: Vec<T> = Vec::new();
+    let mut ro_stack: Vec<T> = Vec::new();
+    let preds: Vec<T> = states
         .iter()
         .map(|st| {
             let raw = match &ode.readout {
-                OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(Dual2::constant(0.0)),
+                OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(T::from_f64(0.0)),
                 OdeReadout::Single(_) => ode
                     .readout_program
                     .as_ref()
-                    .map(|p| p.eval_output_dual::<N>(st, &params_dual, &mut ro_vars, &mut ro_stack))
-                    .unwrap_or(Dual2::constant(0.0)),
-                OdeReadout::PerCmt(_) => Dual2::constant(0.0),
+                    .map(|p| p.eval_output_g::<T>(st, &params_dual, &mut ro_vars, &mut ro_stack))
+                    .unwrap_or(T::from_f64(0.0)),
+                OdeReadout::PerCmt(_) => T::from_f64(0.0),
             };
-            apply_output_transform::<Dual2<N>>(model, raw)
+            apply_output_transform::<T>(model, raw)
         })
         .collect();
+    Some(preds)
+}
+
+fn run_subject<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<SubjectSens> {
+    let ode = model.ode_spec.as_ref()?;
+    let n_eta = model.n_eta;
+    let n_theta = model.n_theta;
+
+    // PK parameter values at (θ, η).
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+
+    // Individual-parameter η/θ derivatives (analytical, over Dual2 seeded on θ/η).
+    let pd = param_derivatives(model, subject, theta, eta)?;
+
+    // Initial state from `init(...)` (dual-seeded by FD of init_fn, value + grad +
+    // Hessian); zeros when none is declared. Re-applied at every EVID 3/4 reset.
+    let init_state: Vec<Dual2<N>> = match ode.init_fn.as_ref() {
+        Some(f) => dual_init_state::<N>(f.as_ref(), &pk.values, &model.pk_indices, ode.n_states),
+        None => vec![Dual2::constant(0.0); ode.n_states],
+    };
+
+    // Seed + integrate the Dual2 state and apply the readout/transforms.
+    let preds = integrate_subject_duals::<Dual2<N>>(model, subject, &pk.values, &init_state)?;
 
     // Chain ∂f/∂p, ∂²f/∂p² (exact, from the dual) with ∂p/∂η, ∂p/∂θ (general,
     // from `param_derivatives`) → ∂f/∂η, ∂²f/∂η², ∂f/∂θ, ∂²f/∂η∂θ:
@@ -559,68 +620,32 @@ fn run_subject_eta<const N: usize>(
     eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
     let ode = model.ode_spec.as_ref()?;
-    let program = ode.rhs_program.as_ref()?;
     let n_eta = model.n_eta;
-    let opts = ode.solver_opts;
 
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-    let mut params_dual: Vec<Dual1<N>> = pk.values.iter().map(|&v| Dual1::constant(v)).collect();
-    for (i, &slot) in model.pk_indices.iter().enumerate() {
-        params_dual[slot] = Dual1::var(pk.values[slot], i);
-    }
-    let pd = param_derivatives(model, subject, theta, eta)?;
 
-    // Lagtime not yet supported over the dual loop (same as the full provider).
-    if pk.values[PK_IDX_LAGTIME].abs() > 1e-12 {
-        return None;
-    }
-    let f_bio = if pk.values[PK_IDX_F] > 0.0 {
-        params_dual[PK_IDX_F]
-    } else {
-        Dual1::constant(1.0)
-    };
+    // First-order `∂p/∂η` only — the η-block, over a `Dual1` (no θ-axes, no Hessian).
+    let dp_deta = param_eta_derivatives(model, subject, theta, eta)?;
+
+    // Initial state from `init(...)` (dual-seeded by FD of init_fn, value + grad);
+    // zeros when none is declared. Re-applied at every EVID 3/4 reset.
     let init_state: Vec<Dual1<N>> = match ode.init_fn.as_ref() {
         Some(f) => dual1_init_state::<N>(f.as_ref(), &pk.values, &model.pk_indices, ode.n_states),
         None => vec![Dual1::constant(0.0); ode.n_states],
     };
-    let first_dose_time = subject
-        .doses
-        .iter()
-        .map(|d| d.time)
-        .fold(f64::INFINITY, f64::min);
 
-    let states = integrate_g::<Dual1<N>>(
-        program,
-        ode.n_states,
-        subject,
-        &params_dual,
-        f_bio,
-        &init_state,
-        first_dose_time,
-        &opts,
-    )?;
+    // Seed + integrate the Dual1 state and apply the readout/transforms.
+    let preds = integrate_subject_duals::<Dual1<N>>(model, subject, &pk.values, &init_state)?;
 
-    let mut ro_vars: Vec<Dual1<N>> = Vec::new();
-    let mut ro_stack: Vec<Dual1<N>> = Vec::new();
     let n_indiv = model.pk_indices.len();
-    let mut out = Vec::with_capacity(subject.obs_times.len());
-    for st in &states {
-        let raw = match &ode.readout {
-            OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(Dual1::constant(0.0)),
-            OdeReadout::Single(_) => ode
-                .readout_program
-                .as_ref()
-                .map(|p| p.eval_output_g::<Dual1<N>>(st, &params_dual, &mut ro_vars, &mut ro_stack))
-                .unwrap_or(Dual1::constant(0.0)),
-            OdeReadout::PerCmt(_) => Dual1::constant(0.0),
-        };
-        let fd = apply_output_transform::<Dual1<N>>(model, raw);
+    let mut out = Vec::with_capacity(preds.len());
+    for fd in &preds {
         // ∂f/∂η_k = Σ_i (∂f/∂pk_i)·(∂pk_i/∂η_k) — first order, η only.
         let g = &fd.grad;
         let mut df_deta = vec![0.0; n_eta];
         for i in 0..n_indiv {
             for k in 0..n_eta {
-                df_deta[k] += g[i] * pd.dp_deta[i][k];
+                df_deta[k] += g[i] * dp_deta[i][k];
             }
         }
         out.push(ObsGrad {
@@ -666,6 +691,29 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
     let mut recorded = vec![false; n_obs];
     let mut u = init_state.to_vec();
+
+    // Sorted `(obs_time, index)` for O(log n) tolerance lookup at each break time
+    // and solver save point, replacing the per-query linear scan over all
+    // observations (PR #438 review). The precise `obs_time_matches` test still
+    // gates each candidate; the sort only narrows the search window.
+    let mut sorted_obs: Vec<(f64, usize)> = subject.obs_times.iter().copied().zip(0..).collect();
+    sorted_obs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Record `src` at every not-yet-recorded observation whose time matches `q`.
+    let record_at = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
+        // Candidates lie within the relative tolerance band; widen slightly for the
+        // binary-search bounds, then confirm each with the exact `obs_time_matches`.
+        let slack = 2e-9 * (1.0 + q.abs());
+        let lo = sorted_obs.partition_point(|&(t, _)| t < q - slack);
+        for &(t, j) in &sorted_obs[lo..] {
+            if t > q + slack {
+                break;
+            }
+            if !recorded[j] && obs_time_matches(t, q) {
+                states[j].copy_from_slice(src);
+                recorded[j] = true;
+            }
+        }
+    };
 
     // Break the timeline at every dose time and — for infusions — the
     // infusion-end time, so each segment is fully inside or outside every
@@ -724,12 +772,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         // time built by arithmetic on dose/reset times, so an observation that
         // coincides with it can be value-equal but bit-different — match by
         // tolerance, not bit pattern (issue #410).
-        for (j, &ot) in subject.obs_times.iter().enumerate() {
-            if !recorded[j] && obs_time_matches(ot, t_start) {
-                states[j].copy_from_slice(&u);
-                recorded[j] = true;
-            }
-        }
+        record_at(t_start, &u, &mut states, &mut recorded);
 
         if (t_end - t_start).abs() < 1e-15 {
             continue;
@@ -802,16 +845,21 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         // `pt.t` is the solver's reported save time — match observations by
         // tolerance rather than bit pattern (issue #410).
         for pt in &sol {
-            for (j, &ot) in subject.obs_times.iter().enumerate() {
-                if !recorded[j] && obs_time_matches(ot, pt.t) {
-                    states[j].copy_from_slice(&pt.u);
-                    recorded[j] = true;
-                }
-            }
+            record_at(pt.t, &pt.u, &mut states, &mut recorded);
             if (pt.t - t_end).abs() < 1e-12 {
                 u.copy_from_slice(&pt.u);
             }
         }
+    }
+
+    // Every observation must have been captured at a break time or a solver save
+    // point. An unmatched one — e.g. a negative observation time below the timeline
+    // floor (`t_last` clamps to 0, so it lies in no segment), or a save point the
+    // solver dropped/realigned — would keep its zero-initialised state and feed a
+    // silent `f = 0`, `∂f = 0` into the gradient. Decline so the caller falls back
+    // to FD for this subject rather than return a wrong `Some`.
+    if recorded.iter().any(|&r| !r) {
+        return None;
     }
 
     Some(states)

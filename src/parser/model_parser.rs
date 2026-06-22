@@ -5698,7 +5698,7 @@ fn build_ode_spec(
     // still read 0 just like the old per-call `vec![0.0; n]` path.
     // Snapshot the resolved RHS program for the analytic-sensitivity path
     // (issue #367) before the f64 closure moves `stmts_owned`. Same statements,
-    // same var layout — evaluated over `Dual2<N>` by `eval_rhs_dual`.
+    // same var layout — evaluated over a dual type by `eval_rhs_g`.
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -8934,11 +8934,11 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
 }
 
 /// Compiled ODE RHS program + var layout, exposed so the analytic-sensitivity
-/// provider can evaluate the same RHS over `Dual2<N>` (issue #367, Option A).
-/// Carries exactly what the f64 `rhs` closure binds, so [`eval_rhs_dual`]
+/// provider can evaluate the same RHS over a dual type (issue #367, Option A).
+/// Carries exactly what the f64 `rhs` closure binds, so [`eval_rhs_g`]
 /// reproduces that binding but seeds the individual parameters as dual variables.
 ///
-/// [`eval_rhs_dual`]: OdeRhsProgram::eval_rhs_dual
+/// [`eval_rhs_g`]: OdeRhsProgram::eval_rhs_g
 ///
 /// `pub` only so it can appear in the (public) [`OdeSpec`](crate::ode::OdeSpec)
 /// field; all fields are private, so it is opaque outside the crate and can be
@@ -8957,32 +8957,16 @@ pub struct OdeRhsProgram {
 }
 
 impl OdeRhsProgram {
-    /// Evaluate `du = f(u, p, t)` over `Dual2<N>`. `u` is the current state;
-    /// `params` is the flat PK-parameter vector with the differentiated slots
-    /// already seeded as dual variables (so individual parameter `i`, read from
-    /// `params[indiv_to_params_slot[i]]`, carries its derivative); `tafd`/`tad`
-    /// are the time-after-first/last-dose anchors (constants w.r.t. the
-    /// parameters, lifted as such). `vars`/`stack` are caller-owned scratch
-    /// reused across RK stages. Writes `du` (length `state_count`). Mirrors the
-    /// f64 binding in the `rhs` closure statement-for-statement.
-    pub(crate) fn eval_rhs_dual<const N: usize>(
-        &self,
-        u: &[crate::sens::dual2::Dual2<N>],
-        params: &[crate::sens::dual2::Dual2<N>],
-        t: f64,
-        tafd: f64,
-        tad: f64,
-        du: &mut [crate::sens::dual2::Dual2<N>],
-        vars: &mut Vec<crate::sens::dual2::Dual2<N>>,
-        stack: &mut Vec<crate::sens::dual2::Dual2<N>>,
-    ) {
-        self.eval_rhs_g::<crate::sens::dual2::Dual2<N>>(u, params, t, tafd, tad, du, vars, stack)
-    }
-
-    /// Generic-over-[`PkNum`] form of [`Self::eval_rhs_dual`]: evaluate the ODE RHS
-    /// over any dual width/order (`Dual1<N>` for the light inner η-gradient,
-    /// `Dual2<N>` for the full outer gradient). Mechanically identical to the
-    /// `Dual2` form — only the numeric type changes (issue #410, inner η-gradient).
+    /// Evaluate `du = f(u, p, t)` over a dual type, generic over [`PkNum`]
+    /// (`Dual1<N>` for the light inner η-gradient, `Dual2<N>` for the full outer
+    /// gradient). `u` is the current state; `params` is the flat PK-parameter vector
+    /// with the differentiated slots already seeded as dual variables (so individual
+    /// parameter `i`, read from `params[indiv_to_params_slot[i]]`, carries its
+    /// derivative); `tafd`/`tad` are the time-after-first/last-dose anchors
+    /// (constants w.r.t. the parameters, lifted as such). `vars`/`stack` are
+    /// caller-owned scratch reused across RK stages. Writes `du` (length
+    /// `state_count`). Mirrors the f64 binding in the `rhs` closure
+    /// statement-for-statement (issue #410, inner η-gradient).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn eval_rhs_g<T: crate::sens::num::PkNum>(
         &self,
@@ -9126,6 +9110,53 @@ impl IndivParamProgram {
             .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual2::constant(0.0)))
             .collect()
     }
+
+    /// Evaluate the individual parameters over `Dual1<M>` seeded on **η only**
+    /// (`η_k → var(·, k)`, θ held constant): the light first-order counterpart of
+    /// [`eval_param_duals`](Self::eval_param_duals) for the inner η-gradient (#410).
+    /// Returns one `Dual1<M>` per individual parameter (declaration order); its
+    /// `grad` is the exact `∂p/∂η`. Avoids the θ-axes and the second-order Hessian
+    /// the `Dual2` path computes. Requires `M ≥ n_eta_axis()`.
+    pub(crate) fn eval_param_eta_grad<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Vec<crate::sens::dual1::Dual1<M>> {
+        use crate::sens::dual1::Dual1;
+        let theta_d: Vec<Dual1<M>> = theta.iter().map(|&v| Dual1::constant(v)).collect();
+        let eta_d: Vec<Dual1<M>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                if k < M {
+                    Dual1::var(v, k)
+                } else {
+                    Dual1::constant(v)
+                }
+            })
+            .collect();
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![Dual1::<M>::constant(0.0); self.n_vars];
+        let mut stack: Vec<Dual1<M>> = Vec::new();
+        eval_statements_g::<Dual1<M>>(
+            &self.stmts,
+            &theta_d,
+            &eta_d,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+        );
+        self.pk_var_slots
+            .iter()
+            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual1::constant(0.0)))
+            .collect()
+    }
 }
 
 /// Compiled Form C ODE output expression (`[scaling] y = <expr>`) + var layout,
@@ -9151,23 +9182,12 @@ impl OdeOutputProgram {
         self.simple
     }
 
-    /// Evaluate the output expression over `Dual2<N>`. `state` is the integrated
-    /// dual state; `params` is the flat PK-parameter vector with the
-    /// differentiated slots seeded as dual variables (so `V1`'s derivative flows
-    /// into `central / V1`). `vars`/`stack` are caller-owned scratch. Only valid
-    /// when [`is_simple`](Self::is_simple) holds.
-    pub(crate) fn eval_output_dual<const N: usize>(
-        &self,
-        state: &[crate::sens::dual2::Dual2<N>],
-        params: &[crate::sens::dual2::Dual2<N>],
-        vars: &mut Vec<crate::sens::dual2::Dual2<N>>,
-        stack: &mut Vec<crate::sens::dual2::Dual2<N>>,
-    ) -> crate::sens::dual2::Dual2<N> {
-        self.eval_output_g::<crate::sens::dual2::Dual2<N>>(state, params, vars, stack)
-    }
-
-    /// Generic-over-[`PkNum`] form of [`Self::eval_output_dual`] — the Form-C readout
-    /// over any dual width/order (`Dual1` light inner / `Dual2` full outer; #410).
+    /// Evaluate the output expression over a dual type, generic over [`PkNum`]
+    /// (`Dual1` light inner / `Dual2` full outer; #410) — the Form-C readout.
+    /// `state` is the integrated dual state; `params` is the flat PK-parameter
+    /// vector with the differentiated slots seeded as dual variables (so `V1`'s
+    /// derivative flows into `central / V1`). `vars`/`stack` are caller-owned
+    /// scratch. Only valid when [`is_simple`](Self::is_simple) holds.
     pub(crate) fn eval_output_g<T: crate::sens::num::PkNum>(
         &self,
         state: &[T],

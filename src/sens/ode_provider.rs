@@ -828,36 +828,32 @@ fn seed_pk_dual2<const M: usize>(
     out
 }
 
-/// Time-varying-covariate outer (`Dual2<M>`, `M = n_theta + n_eta`) sensitivities
-/// for an ODE model — the ODE counterpart of `run_obs_tvcov`. Seeds the per-event
-/// PK params on `(θ,η)`, runs the bolus event-driven walk, applies the readout +
-/// output transforms, and reads `∂f/∂(θ,η)` straight off the dual (#439).
-fn run_subject_tvcov<const M: usize>(
+/// Shared TV-cov walk + readout for both ODE drivers, generic over the dual type
+/// `T` (`Dual2<M>` outer, `Dual1<N>` inner): resolve per-dose bioavailability, run
+/// the bolus event-driven walk over the per-event-seeded params, then per
+/// observation apply the readout (`ObsCmt` / `Single` / per-CMT), the
+/// negative-readout clamp, and the output transform. Returns one transformed
+/// prediction per observation; the caller reads its `grad`/`hess` and chains. The
+/// per-event PK-param duals are built by the caller, since the seeding differs by
+/// order (`seed_pk_dual2` carries the Hessian, `seed_pk_dual1` only the gradient) —
+/// the TV-cov analogue of [`integrate_subject_duals`] (#449 review #13).
+fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-) -> Option<SubjectSens> {
+    pk_at_dose: &[Vec<T>],
+    pk_at_obs: &[Vec<T>],
+) -> Option<Vec<T>> {
     let ode = model.ode_spec.as_ref()?;
     let program = ode.rhs_program.as_ref()?;
-    let prog = ode.indiv_param_program.as_ref()?;
-    let n_eta = model.n_eta;
-    let n_theta = model.n_theta;
     let opts = ode.solver_opts;
 
-    let pk_at_dose: Vec<Vec<Dual2<M>>> = (0..subject.doses.len())
-        .map(|k| seed_pk_dual2::<M>(model, prog, theta, eta, subject.dose_cov(k)))
-        .collect();
-    let pk_at_obs: Vec<Vec<Dual2<M>>> = (0..subject.obs_times.len())
-        .map(|j| seed_pk_dual2::<M>(model, prog, theta, eta, subject.obs_cov(j)))
-        .collect();
-    let f_bio_at_dose: Vec<Dual2<M>> = pk_at_dose
+    let f_bio_at_dose: Vec<T> = pk_at_dose
         .iter()
         .map(|p| {
-            if p[PK_IDX_F].value > 0.0 {
+            if p[PK_IDX_F].val() > 0.0 {
                 p[PK_IDX_F]
             } else {
-                Dual2::constant(1.0)
+                T::from_f64(1.0)
             }
         })
         .collect();
@@ -866,48 +862,82 @@ fn run_subject_tvcov<const M: usize>(
         .iter()
         .map(|d| d.time)
         .fold(f64::INFINITY, f64::min);
-    let init_state: Vec<Dual2<M>> = vec![Dual2::constant(0.0); ode.n_states];
+    let init_state: Vec<T> = vec![T::from_f64(0.0); ode.n_states];
 
-    let states = integrate_tvcov_g::<Dual2<M>>(
+    let states = integrate_tvcov_g::<T>(
         program,
         ode.n_states,
         subject,
-        &pk_at_dose,
-        &pk_at_obs,
+        pk_at_dose,
+        pk_at_obs,
         &f_bio_at_dose,
         &init_state,
         first_dose_time,
         &opts,
     );
 
-    let mut ro_vars: Vec<Dual2<M>> = Vec::new();
-    let mut ro_stack: Vec<Dual2<M>> = Vec::new();
-    let mut out = Vec::with_capacity(subject.obs_times.len());
-    for (j, st) in states.iter().enumerate() {
-        let params = &pk_at_obs[j];
-        let raw = match &ode.readout {
-            OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(Dual2::constant(0.0)),
-            OdeReadout::Single(_) => ode
-                .readout_program
-                .as_ref()
-                .map(|p| p.eval_output_g::<Dual2<M>>(st, params, &mut ro_vars, &mut ro_stack))
-                .unwrap_or(Dual2::constant(0.0)),
-            OdeReadout::PerCmt(cmt_map) => subject
-                .obs_cmts
-                .get(j)
-                .and_then(|c| cmt_map.get(c))
-                .and_then(|r| r.program.as_ref())
-                .map(|p| p.eval_output_g::<Dual2<M>>(st, params, &mut ro_vars, &mut ro_stack))
-                .unwrap_or(Dual2::constant(f64::NAN)),
-        };
-        // Negative-readout clamp (ODE overshoot guard), parity with production's
-        // `conc.max(0)`: a clamped value carries zero derivatives.
-        let raw = if raw.value < 0.0 {
-            Dual2::constant(0.0)
-        } else {
-            raw
-        };
-        let fd = apply_output_transform::<Dual2<M>>(model, raw);
+    let mut ro_vars: Vec<T> = Vec::new();
+    let mut ro_stack: Vec<T> = Vec::new();
+    let preds = states
+        .iter()
+        .enumerate()
+        .map(|(j, st)| {
+            let params = &pk_at_obs[j];
+            let raw = match &ode.readout {
+                OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(T::from_f64(0.0)),
+                OdeReadout::Single(_) => ode
+                    .readout_program
+                    .as_ref()
+                    .map(|p| p.eval_output_g::<T>(st, params, &mut ro_vars, &mut ro_stack))
+                    .unwrap_or(T::from_f64(0.0)),
+                OdeReadout::PerCmt(cmt_map) => subject
+                    .obs_cmts
+                    .get(j)
+                    .and_then(|c| cmt_map.get(c))
+                    .and_then(|r| r.program.as_ref())
+                    .map(|p| p.eval_output_g::<T>(st, params, &mut ro_vars, &mut ro_stack))
+                    .unwrap_or(T::from_f64(f64::NAN)),
+            };
+            // Negative-readout clamp (ODE overshoot guard), parity with production's
+            // `conc.max(0)`: a clamped value carries zero derivatives. A NaN passes
+            // through and `apply_output_transform` preserves it as a tripwire.
+            let raw = if raw.val() < 0.0 {
+                T::from_f64(0.0)
+            } else {
+                raw
+            };
+            apply_output_transform::<T>(model, raw)
+        })
+        .collect();
+    Some(preds)
+}
+
+/// Time-varying-covariate outer (`Dual2<M>`, `M = n_theta + n_eta`) sensitivities
+/// for an ODE model — the ODE counterpart of `run_obs_tvcov`. Seeds the per-event
+/// PK params on `(θ,η)`, runs the shared TV-cov walk + readout, and reads
+/// `∂f/∂(θ,η)` (+ 2nd order) straight off the dual (#439).
+fn run_subject_tvcov<const M: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<SubjectSens> {
+    let ode = model.ode_spec.as_ref()?;
+    let prog = ode.indiv_param_program.as_ref()?;
+    let n_eta = model.n_eta;
+    let n_theta = model.n_theta;
+
+    let pk_at_dose: Vec<Vec<Dual2<M>>> = (0..subject.doses.len())
+        .map(|k| seed_pk_dual2::<M>(model, prog, theta, eta, subject.dose_cov(k)))
+        .collect();
+    let pk_at_obs: Vec<Vec<Dual2<M>>> = (0..subject.obs_times.len())
+        .map(|j| seed_pk_dual2::<M>(model, prog, theta, eta, subject.obs_cov(j)))
+        .collect();
+
+    let preds = integrate_tvcov_readout::<Dual2<M>>(model, subject, &pk_at_dose, &pk_at_obs)?;
+
+    let mut out = Vec::with_capacity(preds.len());
+    for fd in &preds {
         let g = &fd.grad;
         let h = &fd.hess;
         let mut df_deta = vec![0.0; n_eta];
@@ -1003,10 +1033,8 @@ fn run_subject_tvcov_eta<const N: usize>(
     eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
     let ode = model.ode_spec.as_ref()?;
-    let program = ode.rhs_program.as_ref()?;
     let prog = ode.indiv_param_program.as_ref()?;
     let n_eta = model.n_eta;
-    let opts = ode.solver_opts;
 
     let pk_at_dose: Vec<Vec<Dual1<N>>> = (0..subject.doses.len())
         .map(|k| seed_pk_dual1::<N>(model, prog, theta, eta, subject.dose_cov(k)))
@@ -1014,66 +1042,16 @@ fn run_subject_tvcov_eta<const N: usize>(
     let pk_at_obs: Vec<Vec<Dual1<N>>> = (0..subject.obs_times.len())
         .map(|j| seed_pk_dual1::<N>(model, prog, theta, eta, subject.obs_cov(j)))
         .collect::<Option<_>>()?;
-    let f_bio_at_dose: Vec<Dual1<N>> = pk_at_dose
-        .iter()
-        .map(|p| {
-            if p[PK_IDX_F].value > 0.0 {
-                p[PK_IDX_F]
-            } else {
-                Dual1::constant(1.0)
-            }
-        })
-        .collect();
-    let first_dose_time = subject
-        .doses
-        .iter()
-        .map(|d| d.time)
-        .fold(f64::INFINITY, f64::min);
-    let init_state: Vec<Dual1<N>> = vec![Dual1::constant(0.0); ode.n_states];
 
-    let states = integrate_tvcov_g::<Dual1<N>>(
-        program,
-        ode.n_states,
-        subject,
-        &pk_at_dose,
-        &pk_at_obs,
-        &f_bio_at_dose,
-        &init_state,
-        first_dose_time,
-        &opts,
-    );
+    let preds = integrate_tvcov_readout::<Dual1<N>>(model, subject, &pk_at_dose, &pk_at_obs)?;
 
-    let mut ro_vars: Vec<Dual1<N>> = Vec::new();
-    let mut ro_stack: Vec<Dual1<N>> = Vec::new();
-    let mut out = Vec::with_capacity(subject.obs_times.len());
-    for (j, st) in states.iter().enumerate() {
-        let params = &pk_at_obs[j];
-        let raw = match &ode.readout {
-            OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(Dual1::constant(0.0)),
-            OdeReadout::Single(_) => ode
-                .readout_program
-                .as_ref()
-                .map(|p| p.eval_output_g::<Dual1<N>>(st, params, &mut ro_vars, &mut ro_stack))
-                .unwrap_or(Dual1::constant(0.0)),
-            OdeReadout::PerCmt(cmt_map) => subject
-                .obs_cmts
-                .get(j)
-                .and_then(|c| cmt_map.get(c))
-                .and_then(|r| r.program.as_ref())
-                .map(|p| p.eval_output_g::<Dual1<N>>(st, params, &mut ro_vars, &mut ro_stack))
-                .unwrap_or(Dual1::constant(f64::NAN)),
-        };
-        let raw = if raw.value < 0.0 {
-            Dual1::constant(0.0)
-        } else {
-            raw
-        };
-        let fd = apply_output_transform::<Dual1<N>>(model, raw);
+    let mut out = Vec::with_capacity(preds.len());
+    for fd in &preds {
+        // `seed_pk_dual1` seeds η on axes `0..n_eta`, so `grad[k] = ∂f/∂η_k` directly.
+        let g = &fd.grad;
         let mut df_deta = vec![0.0; n_eta];
-        for (k, slot) in df_deta.iter_mut().enumerate() {
-            if k < N {
-                *slot = fd.grad[k];
-            }
+        for k in 0..n_eta {
+            df_deta[k] = g[k];
         }
         out.push(ObsGrad {
             f: fd.value,
@@ -1081,6 +1059,38 @@ fn run_subject_tvcov_eta<const N: usize>(
         });
     }
     Some(out)
+}
+
+/// Evaluate the ODE RHS at `t` with the time-after-first-dose / time-after-last-dose
+/// anchors lifted as parameter-independent constants — the shared inner of the
+/// static ([`integrate_g`]) and TV-cov ([`integrate_tvcov_g`]) walk RHS closures, so
+/// the anchor-and-evaluate body is written once (#449 review #11). The static walk's
+/// infusion rate forcing is applied by its caller after this returns (the TV-cov
+/// subset is bolus-only, so it has none).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn eval_rhs_anchored<T: crate::sens::num::PkNum>(
+    program: &crate::parser::model_parser::OdeRhsProgram,
+    us: &[T],
+    ps: &[T],
+    t: f64,
+    first_dose_time: f64,
+    last_dose_eff: f64,
+    du: &mut [T],
+    vars: &mut Vec<T>,
+    stack: &mut Vec<T>,
+) {
+    let tafd = if first_dose_time.is_finite() {
+        t - first_dose_time
+    } else {
+        f64::NAN
+    };
+    let tad = if last_dose_eff.is_finite() {
+        t - last_dose_eff
+    } else {
+        f64::NAN
+    };
+    program.eval_rhs_g::<T>(us, ps, t, tafd, tad, du, vars, stack);
 }
 
 /// Time-varying-covariate event-driven walk over the dual state (#439), the ODE
@@ -1107,6 +1117,22 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
 ) -> Vec<Vec<T>> {
     let n_obs = subject.obs_times.len();
     let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
+
+    // This walk is the bolus-only subset of production's event-driven predictor — it
+    // omits infusion forcing, EVID 3/4 resets, EVID=2 pk-only breakpoints, and
+    // lagtime, all of which `ode_tvcov_supported` already excludes. Assert the
+    // invariant so a future gate change can't silently feed an unsupported subject to
+    // this simplified walk (the divergence would otherwise surface only as a wrong
+    // gradient) (#449 review #11).
+    debug_assert!(
+        !subject
+            .doses
+            .iter()
+            .any(crate::ode::predictions::is_real_infusion)
+            && !subject.has_resets()
+            && subject.pk_only_times.is_empty(),
+        "integrate_tvcov_g is bolus-only; ode_tvcov_supported must exclude infusion/reset/pk-only"
+    );
 
     // Merged timeline: (time, sort-order, is_dose, idx). Bolus-only — the gate
     // excludes infusion / reset / pk-only + TV-cov — so order is just Dose(1) <
@@ -1147,28 +1173,21 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 .filter(|&dt| dt <= cur_t + 1e-12)
                 .fold(f64::NEG_INFINITY, f64::max);
             let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
-                let tafd = if first_dose_time.is_finite() {
-                    t - first_dose_time
-                } else {
-                    f64::NAN
-                };
-                let tad = if last_dose_eff.is_finite() {
-                    t - last_dose_eff
-                } else {
-                    f64::NAN
-                };
-                program.eval_rhs_g::<T>(
+                eval_rhs_anchored::<T>(
+                    program,
                     us,
                     ps,
                     t,
-                    tafd,
-                    tad,
+                    first_dose_time,
+                    last_dose_eff,
                     du,
                     &mut vars_cell.borrow_mut(),
                     &mut stack_cell.borrow_mut(),
                 );
             };
-            let saveat = vec![t_event];
+            // Single save point per segment — a stack array avoids the per-segment
+            // heap allocation of `vec![t_event]` (#449 review #14).
+            let saveat = [t_event];
             let sol = solve_ode_g(&rhs, &u, (cur_t, t_event), params, &saveat, opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
@@ -1349,26 +1368,18 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             .fold(f64::NEG_INFINITY, f64::max);
 
         let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
-            let tafd = if first_dose_time.is_finite() {
-                t - first_dose_time
-            } else {
-                f64::NAN
-            };
-            let tad = if last_dose_eff.is_finite() {
-                t - last_dose_eff
-            } else {
-                f64::NAN
-            };
-            program.eval_rhs_g::<T>(
+            eval_rhs_anchored::<T>(
+                program,
                 us,
                 ps,
                 t,
-                tafd,
-                tad,
+                first_dose_time,
+                last_dose_eff,
                 du,
                 &mut vars_cell.borrow_mut(),
                 &mut stack_cell.borrow_mut(),
             );
+            // Infusion rate forcing (static walk only; the TV-cov subset is bolus-only).
             for &(cmt, rate) in &active_inf {
                 if cmt < du.len() {
                     du[cmt] = du[cmt] + f_bio * T::from_f64(rate);

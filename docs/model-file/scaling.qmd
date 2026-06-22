@@ -193,3 +193,16 @@ output program is evaluated over `Dual2` (outer gradient) and `Dual1`
 So `gradient = auto` serves it; `gradient = fd` is no longer required (the
 fit falls back to FD only for out-of-scope ODE features such as steady
 state, IOV, or time-varying covariates).
+
+**Numerical validation.** The per-CMT analytic gradient inherits the NONMEM
+validation of the user-ODE sensitivity engine (#410): the gradient machinery —
+the augmented `Dual2`/`Dual1` RK45 and the η/θ chain — is unchanged, and per-CMT
+only selects, per observation, which CMT's compiled Form-C output program to
+evaluate. Each such program is the same readout already validated for the uniform
+`y = <expr>` case. The per-observation routing itself is verified by the
+`ode_provider_percmt_matches_production` test (analytic `f`, `∂f/∂η`, `∂f/∂θ` vs
+the production predictor + finite differences on a two-endpoint model) and the
+`ode_provider_percmt_light_matches_full` test (the `Dual1` inner η-gradient
+equals the `Dual2` outer to 1e-9). A dedicated NONMEM cross-check on a
+multi-endpoint model is therefore not re-run here; it is covered transitively by
+#410's validation plus these routing tests.

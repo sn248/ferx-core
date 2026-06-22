@@ -1495,6 +1495,62 @@ mod tests {
         check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
     }
 
+    /// The `PerCmt` gate's negative branches must drop the model out of analytic
+    /// scope (→ FD), not silently admit it: an empty endpoint map, or an endpoint
+    /// whose `program` is `None` (hand-constructed / non-`is_simple`, which the dual
+    /// provider can't evaluate) (#446 review — patch coverage on the reject path).
+    #[test]
+    fn ode_provider_percmt_gate_rejects_incomplete_map() {
+        // Empty per-CMT map → declined.
+        let mut empty = parse_model_string(TWOCPT_ODE_PERCMT).expect("parse");
+        empty.ode_spec.as_mut().expect("ode").readout =
+            OdeReadout::PerCmt(std::collections::HashMap::new());
+        assert!(
+            !ode_analytical_supported(&empty),
+            "empty per-CMT map must decline to FD"
+        );
+
+        // One endpoint with `program: None` (keeps its f64 `out_fn`) → declined,
+        // since the dual provider has no differentiable program to evaluate.
+        let mut no_prog = parse_model_string(TWOCPT_ODE_PERCMT).expect("parse");
+        match &mut no_prog.ode_spec.as_mut().expect("ode").readout {
+            OdeReadout::PerCmt(map) => {
+                let any_cmt = *map.keys().next().expect("at least one endpoint");
+                map.get_mut(&any_cmt).expect("entry").program = None;
+            }
+            _ => panic!("expected PerCmt readout"),
+        }
+        assert!(
+            !ode_analytical_supported(&no_prog),
+            "per-CMT endpoint with no differentiable program must decline to FD"
+        );
+    }
+
+    /// An observation whose CMT is absent from the per-CMT map hits the defensive
+    /// NaN fallback in the readout (fit-time `validate_per_cmt_scaling` rejects this
+    /// upstream, so it is unreachable in a real fit — but the provider must produce
+    /// NaN, not panic or silently zero it) (#446 review — patch coverage on the
+    /// fallback arm, shared by the Dual2 and Dual1 walks via `integrate_subject_duals`).
+    #[test]
+    fn ode_provider_percmt_missing_cmt_yields_nan() {
+        let model = parse_model_string(TWOCPT_ODE_PERCMT).expect("parse");
+        // CMT 3 has no readout entry (the map covers 1 and 2); the gate still passes
+        // (map non-empty, every present program simple).
+        let subject = percmt_subject(&[0.5, 1.0, 2.0], &[1, 3, 2]);
+        let theta = [4.0, 12.0, 2.0, 25.0];
+        let eta = [0.12, -0.08];
+        let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta)
+            .expect("gate passes: map non-empty, programs simple");
+        assert!(
+            sens.obs[1].f.is_nan(),
+            "obs on uncovered CMT 3 → NaN readout"
+        );
+        assert!(
+            sens.obs[0].f.is_finite() && sens.obs[2].f.is_finite(),
+            "covered CMTs stay finite"
+        );
+    }
+
     /// The light `Dual1` inner η-gradient must equal the full `Dual2` outer
     /// `df_deta` for a per-CMT model too (each endpoint's program over both duals).
     #[test]

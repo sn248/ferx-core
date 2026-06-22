@@ -29,8 +29,8 @@ mod common;
 
 use ferx_core::api::read_population_for;
 use ferx_core::parser::model_parser::parse_model_string;
-use ferx_core::types::{EventType, ObsRecord, Population};
-use ferx_core::{fit, simulate_with_seed, FitOptions, SimOutcome};
+use ferx_core::types::Population;
+use ferx_core::{fit, simulate_with_seed, FitOptions, SimOutcome, SimulationResult};
 
 // ── Model strings ────────────────────────────────────────────────────────────
 
@@ -85,62 +85,31 @@ fn fit_opts() -> FitOptions {
     }
 }
 
-/// Build a TTE-only population from `(time, dv)` pairs. `dv`: 1 = exact event,
-/// 0 = right-censored. All rows route to CMT 2.
-fn tte_pop_from_pairs(data: &[(f64, u8)]) -> Population {
-    let subjects = data
-        .iter()
-        .enumerate()
-        .map(|(i, &(t, dv))| {
-            let event_type = if dv == 1 {
-                EventType::Exact
-            } else {
-                EventType::RightCensored
-            };
-            let mut s = common::subject(&format!("{}", i + 1), vec![], vec![], vec![], vec![]);
-            s.obs_records = vec![ObsRecord::Event {
-                time: t,
-                event_type,
-                entry_time: 0.0,
-                cmt: 2,
-            }];
-            s
-        })
-        .collect();
-
-    Population {
-        covariate_names: vec![],
-        dv_column: "DV".to_string(),
-        input_columns: vec![],
-        exclusions: None,
-        warnings: vec![],
-        subjects,
-    }
+/// `n` bare TTE subjects (one placeholder Event each on CMT 2) used only as a
+/// `simulate()` template — the drawn event time replaces the placeholder. This is
+/// exactly [`common::tte_pop_from_pairs`] over `n` exact-event rows at `t = 0`.
+fn tte_sim_template(n: usize) -> Population {
+    common::tte_pop_from_pairs(&vec![(0.0, 1); n])
 }
 
-/// One bare TTE subject (a single Event record on CMT 2) used only as a template
-/// for `simulate()` — the drawn event time replaces the placeholder.
-fn tte_sim_template(n: usize) -> Population {
-    let subjects = (0..n)
-        .map(|i| {
-            let mut s = common::subject(&format!("{}", i + 1), vec![], vec![], vec![], vec![]);
-            s.obs_records = vec![ObsRecord::Event {
-                time: 0.0,
-                event_type: EventType::Exact,
-                entry_time: 0.0,
-                cmt: 2,
-            }];
-            s
+/// Map ferx `simulate()` outcomes to `(time, dv)` pairs, applying administrative
+/// right-censoring at `t_censor` exactly as `simulate.R` does: `simulate_tte`
+/// draws *uncensored* event times (every draw is observed), so a draw past
+/// `t_censor` becomes a right-censored row at `t_censor`. Panics on any non-`Event`
+/// outcome — that would mean a Gaussian model/template was simulated by mistake.
+fn sims_to_pairs(sims: &[SimulationResult], t_censor: f64) -> Vec<(f64, u8)> {
+    sims.iter()
+        .map(|r| match r.outcome {
+            SimOutcome::Event { time, .. } => {
+                if time <= t_censor {
+                    (time, 1)
+                } else {
+                    (t_censor, 0)
+                }
+            }
+            _ => panic!("expected an Event outcome for a TTE simulation"),
         })
-        .collect();
-    Population {
-        covariate_names: vec![],
-        dv_column: "DV".to_string(),
-        input_columns: vec![],
-        exclusions: None,
-        warnings: vec![],
-        subjects,
-    }
+        .collect()
 }
 
 const REF_CSV: &str = concat!(
@@ -152,6 +121,13 @@ const REF_CSV: &str = concat!(
 /// Closed form `lambda = events / sum(time) = 82 / 1100.6`. Regenerate via
 /// `tests/reference/tte_exponential/survreg.R`.
 const SURVREG_LAMBDA: f64 = 0.074506;
+
+/// `-2 logLik` reported by that same `survreg` exponential fit (printed by
+/// `survreg.R`, tabulated in `expected.md`). The MLE argmax is invariant to a
+/// dropped or doubled censored-likelihood normalizing constant, so matching
+/// `lambda` alone cannot catch such a regression — the OFV must be anchored too
+/// (the headline "likelihood constants are correct" rests on this number).
+const SURVREG_LAMBDA_M2LL: f64 = 589.888;
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -171,32 +147,23 @@ fn tte_sse_exponential_recovers_truth() {
     let sims = simulate_with_seed(&truth, &template, &truth.default_params, 1, SEED);
     assert_eq!(sims.len(), N, "one simulated event per template subject");
 
-    // simulate_tte draws *uncensored* event times (observed=true for every draw);
-    // apply the administrative censoring ourselves, exactly as simulate.R does.
-    let pairs: Vec<(f64, u8)> = sims
-        .iter()
-        .map(|r| match r.outcome {
-            SimOutcome::Event { time, .. } => {
-                if time <= T_CENSOR {
-                    (time, 1)
-                } else {
-                    (T_CENSOR, 0)
-                }
-            }
-            _ => panic!("expected an Event outcome for a TTE simulation"),
-        })
-        .collect();
+    let pairs = sims_to_pairs(&sims, T_CENSOR);
 
-    let n_events = pairs.iter().filter(|(_, dv)| *dv == 1).count();
+    let event_frac = pairs.iter().filter(|(_, dv)| *dv == 1).count() as f64 / N as f64;
+    eprintln!("[SSE] event fraction = {event_frac:.4} (expected ~0.88 at lambda_pop=0.1, omega^2=0.25, censor t=24)");
+    // At the truth (lambda_pop=0.1, omega^2=0.25, censor t=24) this N=2000 draw yields
+    // ~0.88 events (the noisier 100-subject reference file lands at 0.82). The band
+    // brackets that yet *excludes* a factor-of-2 sampler error, which the old
+    // (0.5..0.98) did not: halving the rate (lambda~0.05) drops the fraction to ~0.66
+    // (below 0.82) and doubling it pushes ~0.97 (above 0.93). The simulated data is
+    // RNG-seed-deterministic, so this stays tight without being flaky.
     assert!(
-        (0.5..0.98).contains(&(n_events as f64 / N as f64)),
-        "sanity: simulated event fraction {}/{} should be neither ~0 nor ~1",
-        n_events,
-        N
+        (0.82..0.93).contains(&event_frac),
+        "simulated event fraction {event_frac:.4} off the expected ~0.88 — a 2x sampler error (rate halved → ~0.66, doubled → ~0.97) lands outside this band"
     );
 
     let model = parse_model_string(EXP_FIT).expect("fit model must parse");
-    let pop = tte_pop_from_pairs(&pairs);
+    let pop = common::tte_pop_from_pairs(&pairs);
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("SSE fit must succeed");
 
     let lambda = r.theta[0];
@@ -278,7 +245,13 @@ fn tte_convergence_exponential_fixed_matches_survreg() {
         rel_err < 0.01,
         "fixed-effects rate {lambda:.6} must match survreg {SURVREG_LAMBDA:.6} within 1% (rel_err {rel_err:.4})"
     );
-    assert!(r.ofv.is_finite(), "OFV must be finite");
+    // Anchor the OFV to survreg's -2logLik too (not just `is_finite`): this is the
+    // number that pins the likelihood *constants*, which `lambda` cannot (#441 #2).
+    assert!(
+        (r.ofv - SURVREG_LAMBDA_M2LL).abs() < 1e-3,
+        "fixed-effects OFV {:.4} must match survreg -2logLik {SURVREG_LAMBDA_M2LL} within 1e-3",
+        r.ofv
+    );
 }
 
 // ═══════════════════════════ Weibull ═══════════════════════════════════════════
@@ -333,6 +306,10 @@ const WEIBULL_REF_CSV: &str = concat!(
 // (scale, shape) via shape = 1/scale_sr, scale = exp(intercept). See survreg.R.
 const SURVREG_WEIBULL_SHAPE: f64 = 2.119250;
 const SURVREG_WEIBULL_SCALE: f64 = 22.176599;
+/// `-2 logLik` of the same `survreg` weibull fit (see `survreg.R` / `expected.md`).
+/// Anchors the fixed-effects OFV so the likelihood constants are pinned, not just
+/// the (scale, shape) argmax.
+const SURVREG_WEIBULL_M2LL: f64 = 640.261;
 
 /// SSE: recover (scale=20, shape=2, omega^2=0.20) from a large simulated dataset.
 #[test]
@@ -344,24 +321,12 @@ fn tte_sse_weibull_recovers_truth() {
     let truth = parse_model_string(WEIBULL_TRUTH).expect("truth model must parse");
     let sims = simulate_with_seed(&truth, &tte_sim_template(N), &truth.default_params, 1, SEED);
 
-    let pairs: Vec<(f64, u8)> = sims
-        .iter()
-        .map(|r| match r.outcome {
-            SimOutcome::Event { time, .. } => {
-                if time <= T_CENSOR {
-                    (time, 1)
-                } else {
-                    (T_CENSOR, 0)
-                }
-            }
-            _ => panic!("expected an Event outcome"),
-        })
-        .collect();
+    let pairs = sims_to_pairs(&sims, T_CENSOR);
 
     let model = parse_model_string(WEIBULL_FIT).expect("fit model must parse");
     let r = fit(
         &model,
-        &tte_pop_from_pairs(&pairs),
+        &common::tte_pop_from_pairs(&pairs),
         &model.default_params,
         &fit_opts(),
     )
@@ -384,17 +349,25 @@ fn tte_sse_weibull_recovers_truth() {
         "shape not recovered: got {shape:.4}, expected ~2"
     );
     // omega^2 (frailty on the *shape* — a nonlinear hazard parameter) is materially
-    // OVER-estimated by FOCEI-Laplace: observed ~0.35 vs truth 0.20 (+~75%), and it
-    // does NOT vanish as the true omega^2 shrinks (truth 0.05 → ~0.16). A SAEM fit of
-    // the same data gives ~0.13 — i.e. the estimators straddle the truth, confirming
-    // a FOCEI approximation limitation for nonlinear-parameter frailty (plan §3.3/§13:
-    // SAEM/IMP preferred for TTE), not a likelihood bug (fixed-effects matches survreg
-    // exactly). Tracked in #440. The assertion is therefore only a sane-range guard
-    // (omega^2 neither collapsed to ~0 nor exploded), wide enough to also pass once the
-    // estimator is improved — see expected.md for the documented numbers.
+    // OVER-estimated by FOCEI-Laplace: this seed deterministically gives ~0.344 vs a
+    // true 0.20 (+72%), and the bias does NOT vanish as the true omega^2 shrinks
+    // (truth 0.05 → ~0.16). A SAEM fit of the same data reads ~0.13 — the estimators
+    // straddle the truth, confirming a FOCEI *approximation* limitation for
+    // nonlinear-parameter frailty (plan §3.3/§13: SAEM/IMP preferred for TTE), NOT a
+    // likelihood bug (the fixed-effects fit matches survreg exactly). Tracked in #440.
+    //
+    // This band CHARACTERIZES that bias on purpose: it brackets the current biased
+    // value (~0.344) with platform margin but EXCLUDES both the truth (0.20) and the
+    // SAEM value (0.13). So when #440 is resolved and FOCEI recovers omega^2 ~ 0.20,
+    // this assertion will FAIL — the intended signal to revisit it (assert recovery to
+    // the truth and drop the over-estimation note). A wide "sane-range" band that
+    // admitted both the broken and the fixed value could never flip, letting #440 close
+    // by attrition with no test ever signalling (#441 review #4).
     assert!(
-        (0.12..0.55).contains(&omega2),
-        "omega^2 out of sane range: got {omega2:.4} (FOCEI over-estimates nonlinear-frailty omega^2; truth 0.20, see #440)"
+        (0.29..0.40).contains(&omega2),
+        "omega^2 {omega2:.4}: expected the documented FOCEI over-estimate ~0.34 (truth 0.20). \
+         Below 0.29 likely means #440 is fixed (FOCEI now recovers ~0.20) — update this test; \
+         above 0.40 means the shape frailty exploded."
     );
     assert!(r.ofv.is_finite(), "OFV must be finite");
 }
@@ -427,7 +400,12 @@ fn tte_convergence_weibull_fixed_matches_survreg() {
         shape_err < 0.01,
         "shape {shape:.4} must match survreg {SURVREG_WEIBULL_SHAPE:.4} within 1% (rel_err {shape_err:.4})"
     );
-    assert!(r.ofv.is_finite(), "OFV must be finite");
+    // Pin the OFV to survreg's -2logLik (the likelihood-constants anchor, #441 #2).
+    assert!(
+        (r.ofv - SURVREG_WEIBULL_M2LL).abs() < 1e-3,
+        "fixed-effects OFV {:.4} must match survreg -2logLik {SURVREG_WEIBULL_M2LL} within 1e-3",
+        r.ofv
+    );
 }
 
 /// Cross-tool: mixed-effects (frailty-on-shape) FOCEI fit of the committed Weibull
@@ -458,9 +436,16 @@ fn tte_convergence_weibull_mixed() {
         (1.5..2.8).contains(&shape),
         "shape off: got {shape:.4}, expected ~2"
     );
+    // On this single n=100 realisation ferx's shape-frailty omega^2 is ~0.204 — at the
+    // truth, because the FOCEI over-estimation that the large-N SSE isolates (~0.34) is
+    // masked by single-realisation noise here; nlmixr2 reads 0.173 on the same file
+    // (the cross-tool spread is itself #440 evidence). Narrow characterization band
+    // around ferx's deterministic value — the previous (0.05..0.70) was far too wide to
+    // catch a regression (#441 review #4). The bias itself is tracked by the SSE test
+    // above, not here.
     assert!(
-        (0.05..0.70).contains(&omega2),
-        "omega^2 off: got {omega2:.4}, expected ~0.20 (FOCEI over-estimates; see #440)"
+        (0.17..0.24).contains(&omega2),
+        "omega^2 {omega2:.4} off ferx's documented ~0.204 on this file (truth 0.20, nlmixr2 0.173); see expected.md / #440"
     );
     assert!(r.ofv.is_finite(), "OFV must be finite");
 }
@@ -568,24 +553,12 @@ fn tte_sse_gompertz_recovers_truth() {
     let truth = parse_model_string(GOMPERTZ_TRUTH_FRAILTY).expect("truth model must parse");
     let sims = simulate_with_seed(&truth, &tte_sim_template(N), &truth.default_params, 1, SEED);
 
-    let pairs: Vec<(f64, u8)> = sims
-        .iter()
-        .map(|r| match r.outcome {
-            SimOutcome::Event { time, .. } => {
-                if time <= T_CENSOR {
-                    (time, 1)
-                } else {
-                    (T_CENSOR, 0)
-                }
-            }
-            _ => panic!("expected an Event outcome"),
-        })
-        .collect();
+    let pairs = sims_to_pairs(&sims, T_CENSOR);
 
     let model = parse_model_string(GOMPERTZ_FIT_FRAILTY).expect("fit model must parse");
     let r = fit(
         &model,
-        &tte_pop_from_pairs(&pairs),
+        &common::tte_pop_from_pairs(&pairs),
         &model.default_params,
         &fit_opts(),
     )
@@ -609,11 +582,16 @@ fn tte_sse_gompertz_recovers_truth() {
         "gamma not recovered: got {gamma:.5}, expected ~0.05"
     );
     // omega^2 (frailty on *gamma*, a nonlinear hazard parameter) is over-estimated by
-    // FOCEI-Laplace (~0.08 vs truth 0.05), the same nonlinear-frailty limitation seen
-    // for the Weibull shape (#440). Sane-range guard only; documented in expected.md.
+    // FOCEI-Laplace — this seed deterministically gives ~0.081 vs truth 0.05 (+62%),
+    // the same nonlinear-frailty limitation seen for the Weibull shape (#440). As for
+    // the Weibull SSE, this is a CHARACTERIZATION band: it brackets the biased value
+    // but EXCLUDES the truth (0.05), so it flips (fails) once #440 lets FOCEI recover
+    // ~0.05 — the signal to revisit. Documented in expected.md.
     assert!(
-        (0.03..0.13).contains(&omega2),
-        "omega^2 out of sane range: got {omega2:.4} (FOCEI over-estimates nonlinear-frailty omega^2; truth 0.05, see #440)"
+        (0.065..0.105).contains(&omega2),
+        "omega^2 {omega2:.4}: expected the documented FOCEI over-estimate ~0.08 (truth 0.05). \
+         Below 0.065 likely means #440 is fixed (recovers ~0.05) — update this test; \
+         above 0.105 means the gamma frailty exploded."
     );
     assert!(r.ofv.is_finite(), "OFV must be finite");
 }

@@ -20,6 +20,22 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic FOCE/FOCEI gradients for user-`[odes]` models** (#410). The ODE
+  sensitivity engine — an augmented `Dual2` RK45 that propagates `∂state/∂(θ,η)`
+  alongside the state — is now armed, so in-scope ODE models drive the exact
+  analytic outer gradient (and the Eq. 48 EBE predictor) instead of the prior
+  gradient-free path. The inner EBE loop likewise gets an exact η-gradient from a
+  lighter `Dual1` (gradient-only) walk — one integration per inner step in place of
+  finite differences' `2·n_eta+1`, so the EBE search is exact and faster. Scope: RHS-program models with an `ObsCmt` or simple Form-C
+  (`y = central/V1`) readout, bolus + finite infusion, bioavailability `F`, EVID
+  3/4 resets, `init(...)`, static covariates, a constant `obs_scale` divisor, and
+  LTBS (`log(DV) ~ …`) output transforms. Out-of-scope features (steady state,
+  estimated lagtime, IOV, `input_rate`, SDE, time-varying covariates, expression
+  `obs_scale`, modeled-`RATE` doses, `F` on a rate-defined infusion) fall back to
+  the existing path unchanged. Validated against finite differences of the
+  production predictor, reconverged FD of the FOCEI marginal, and a full-convergence
+  cross-check that an ODE fit reproduces the analytical (NONMEM-validated) twin's
+  estimates and standard errors.
 - **Analytic sensitivities for oral infusion** on the analytical 1-/2-/3-cpt
   models: a depot-bypass infusion into the central compartment (RATE>0 into cmt 2,
   #350) and a zero-order input into the oral depot (RATE>0 into cmt 1, #400) are

@@ -16,15 +16,19 @@
 //! readout; **bolus and infusion** doses; **bioavailability F** (incl. estimated,
 //! any parameterization — log-normal, logit-normal, additive); **EVID 3/4 resets
 //! / multi-occasion**; **non-zero `init(...)` initial conditions**; static
-//! covariates; up to [`MAX_ODE_SENS_DIM`] individual parameters.
+//! covariates; a constant `obs_scale` divisor and **LTBS** (`log(DV) ~ …`) output
+//! transforms; up to [`MAX_ODE_SENS_DIM`] individual parameters. Both the full
+//! `Dual2` **outer** gradient and a light `Dual1` **inner** η-gradient
+//! ([`ode_subject_eta_grad`]) are served (#410).
 //!
-//! **Not yet supported** (falls back to the gradient-free path): steady-state
-//! dosing, lagtime, built-in input-rate absorption, IOV, SDE/diffusion,
-//! `obs_scale`/LTBS output transforms, time-varying covariates, per-CMT Form C.
+//! **Not yet supported** (falls back to the gradient-free / FD path): steady-state
+//! dosing, lagtime, built-in input-rate absorption, IOV, SDE/diffusion, expression
+//! `obs_scale`, time-varying covariates, per-CMT Form C.
 #![allow(clippy::needless_range_loop)]
 
+use super::dual1::Dual1;
 use super::dual2::Dual2;
-use super::provider::{ObsSens, SubjectSens};
+use super::provider::{ObsGrad, ObsSens, SubjectSens};
 use crate::ode::predictions::OdeReadout;
 use crate::ode::solver::solve_ode_g;
 use crate::types::{CompiledModel, ScalingSpec, Subject, PK_IDX_F, PK_IDX_LAGTIME};
@@ -33,6 +37,19 @@ use std::cell::RefCell;
 /// Largest individual-parameter count for which the `Dual2<N>` path is
 /// monomorphised; models wider than this fall back to the gradient-free path.
 const MAX_ODE_SENS_DIM: usize = 12;
+
+// The `pk_indices.len()` dispatch tables in `ode_subject_sensitivities` and
+// `ode_subject_eta_grad` enumerate `1..=12` explicitly with a silent `_ => None`
+// fallback. Keep that table in lockstep with `MAX_ODE_SENS_DIM`: bumping the const
+// without extending both `dispatch!` arms would let an in-scope wider model pass
+// the gate, hit `_ => None`, and silently fall back to FD with no error. This
+// compile-time tripwire forces an edit here — and a look at the tables — before the
+// const can change (#438 review).
+const _: () = assert!(
+    MAX_ODE_SENS_DIM == 12,
+    "MAX_ODE_SENS_DIM changed: extend the pk_indices.len() dispatch tables in \
+     ode_subject_sensitivities and ode_subject_eta_grad to match, then update this assert"
+);
 
 /// Largest (θ + η) axis count for which the analytical η/θ chain (the
 /// individual-parameter program over `Dual2<M>`) is monomorphised.
@@ -63,9 +80,19 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if !ode.input_rate.is_empty() || !ode.diffusion_var.is_empty() {
         return false;
     }
-    // The divisor (`obs_scale`) scaling form is not yet handled over Dual2; Form C
-    // (`y = central/V1`) is handled via the readout program instead.
-    if model.n_kappa != 0 || !matches!(model.scaling, ScalingSpec::None) || model.log_transform {
+    if model.n_kappa != 0 {
+        return false;
+    }
+    // Output transforms: `None` and a constant `ScalarScale` divisor (`f/k`) are
+    // applied over the dual prediction in `run_subject`, as is the LTBS log
+    // (`ln f`). The `ExpressionScale` divisor form (`obs_scale = expr`) is not yet
+    // handled over Dual2 — the equivalent Form-C readout (`y = state/V`) is the
+    // supported route. Allowlist (not denylist) so a future scaling variant can
+    // only *narrow* the analytic scope, never silently admit an unhandled one.
+    if !matches!(
+        model.scaling,
+        ScalingSpec::None | ScalingSpec::ScalarScale(_)
+    ) {
         return false;
     }
     // (ODE models have no `tv_fn` — typical values come from `pk_param_fn` at
@@ -94,6 +121,43 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     (1..=MAX_ODE_SENS_DIM).contains(&n)
 }
 
+/// Per-subject scope gate, shared by the full (outer `Dual2`) and light (inner
+/// `Dual1`) ODE providers so a subject is served analytically for **both** the
+/// outer gradient and the inner EBE loop, or neither (the inner/outer scope must
+/// match — a split would mix an analytic gradient with an FD Jacobian).
+pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    // Model-level scope + time-varying covariates (the dual walk holds the PK
+    // params constant across the integration).
+    if !ode_analytical_supported(model) || subject.has_tv_covariates() {
+        return false;
+    }
+    // Steady-state dosing is not yet supported over the dual loop (needs dual
+    // SS-equilibration); bolus and (finite-duration) infusion doses are handled.
+    if subject.doses.iter().any(|d| d.ss && d.ii > 0.0) {
+        return false;
+    }
+    // Modeled-`RATE` doses (`RATE=-1`→`R{cmt}` rate, `RATE=-2`→`D{cmt}` duration)
+    // arrive *unresolved* — the production ODE path resolves them from the PK params
+    // per evaluation (`resolve_modeled_doses`, #324), but the dual walk reads
+    // `subject.doses` directly. An unresolved infusion would integrate with the raw
+    // coded rate/duration (a bolus/zero-input surrogate), so route these subjects to
+    // FD, mirroring the analytical provider's `all_doses_fixed` gate (#410 fallback
+    // hardening).
+    if !subject.all_doses_fixed() {
+        return false;
+    }
+    // #419: a *rate-defined* infusion under bioavailability `F ≠ 1` reshapes the
+    // infusion window (NONMEM holds the rate and scales the duration to `F·amt/rate`)
+    // rather than scaling the magnitude. The dual walk applies `F` as a rate
+    // magnitude scale (`f_bio · rate` over the original window), which diverges from
+    // the production predictor for these subjects — route them to FD so the analytic
+    // gradient stays the gradient of the actual objective.
+    if model.has_bioavailability() && subject.has_rate_defined_infusion() {
+        return false;
+    }
+    true
+}
+
 /// Compute per-observation analytic sensitivities for an ODE model, or `None` if
 /// it is outside the supported scope (caller falls back to the gradient-free
 /// path).
@@ -103,20 +167,41 @@ pub fn ode_subject_sensitivities(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
-    if !ode_analytical_supported(model) || subject.has_tv_covariates() {
+    if !ode_subject_supported(model, subject) {
         return None;
     }
-    // Steady-state dosing is not yet supported over the dual loop (needs dual
-    // SS-equilibration); bolus and (finite-duration) infusion doses are handled.
-    if subject.doses.iter().any(|d| d.ss && d.ii > 0.0) {
-        return None;
-    }
-
     // Dispatch on the individual-parameter count so the dual width is right-sized.
     macro_rules! dispatch {
         ($($n:literal),+) => {
             match model.pk_indices.len() {
                 $($n => run_subject::<$n>(model, subject, theta, eta),)+
+                _ => None,
+            }
+        };
+    }
+    dispatch!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+}
+
+/// Light **inner** η-gradient for an ODE model: per-observation `(f, ∂f/∂η)` via a
+/// `Dual1` (gradient-only) augmented RK45 — the ODE counterpart of the analytical
+/// light provider ([`super::provider::subject_eta_grad`]). The inner EBE loop needs
+/// only `∂f/∂η`, so this skips the `Dual2` Hessian *and* the θ-chain: one `Dual1`
+/// integration (≈`N`-cost) replaces FD's `2·n_eta+1` plain integrations. Same scope
+/// as [`ode_subject_sensitivities`]; `None` falls back to the FD inner gradient
+/// (issue #410).
+pub fn ode_subject_eta_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
+    if !ode_subject_supported(model, subject) {
+        return None;
+    }
+    macro_rules! dispatch {
+        ($($n:literal),+) => {
+            match model.pk_indices.len() {
+                $($n => run_subject_eta::<$n>(model, subject, theta, eta),)+
                 _ => None,
             }
         };
@@ -148,6 +233,43 @@ fn param_derivatives(
 ) -> Option<ParamDerivs> {
     let prog = model.ode_spec.as_ref()?.indiv_param_program.as_ref()?;
     param_derivatives_from_prog(prog, model, subject, theta, eta)
+}
+
+/// First-order `∂p/∂η` only (the η-block of [`ParamDerivs::dp_deta`]) over a
+/// `Dual1<M>` seeded on η, `M = n_eta` — the light inner counterpart of
+/// [`param_derivatives`]. Skips the θ-axes and the second-order Hessian the full
+/// `Dual2` path computes, since the inner η-gradient consumes only `dp_deta`
+/// (#410). Returns `None` on the same axis-count mismatch as the full path.
+fn param_eta_derivatives(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<Vec<f64>>> {
+    let prog = model.ode_spec.as_ref()?.indiv_param_program.as_ref()?;
+    if prog.n_theta_axis() != model.n_theta || prog.n_eta_axis() != model.n_eta {
+        return None;
+    }
+    let ne = model.n_eta;
+    let ni = model.pk_indices.len();
+    macro_rules! disp {
+        ($($mm:literal),+) => {
+            match ne {
+                $($mm => {
+                    let p = prog.eval_param_eta_grad::<$mm>(theta, eta, &subject.covariates);
+                    let mut dp_deta = vec![vec![0.0; ne]; ni];
+                    for i in 0..ni {
+                        for k in 0..ne {
+                            dp_deta[i][k] = p[i].grad[k];
+                        }
+                    }
+                    Some(dp_deta)
+                })+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
 }
 
 /// Analytical `∂p/∂(θ,η)` (+ second order) from an explicit individual-parameter
@@ -279,48 +401,95 @@ fn dual_init_state<const N: usize>(
     out
 }
 
-fn run_subject<const N: usize>(
+/// `Dual1<N>` initial state from a model's `init(...)` directives (gradient only) —
+/// the light counterpart of [`dual_init_state`]: seeds each compartment's value and
+/// its first-order PK-parameter derivatives by central FD of the f64 `init_fn`.
+fn dual1_init_state<const N: usize>(
+    init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
+    pk: &[f64],
+    pk_indices: &[usize],
+    n_states: usize,
+) -> Vec<Dual1<N>> {
+    let base = init_fn(pk);
+    let he = 1e-6;
+    let mut out: Vec<Dual1<N>> = (0..n_states)
+        .map(|s| Dual1::constant(base.get(s).copied().unwrap_or(0.0)))
+        .collect();
+    for (i, &si) in pk_indices.iter().enumerate() {
+        let mut pp = pk.to_vec();
+        pp[si] += he;
+        let mut pm = pk.to_vec();
+        pm[si] -= he;
+        let (up, dn) = (init_fn(&pp), init_fn(&pm));
+        for s in 0..n_states {
+            out[s].grad[i] = (up[s] - dn[s]) / (2.0 * he);
+        }
+    }
+    out
+}
+
+/// Apply the model's output transforms to a dual prediction, in PK-parameter dual
+/// space (before the η/θ chain): a constant `ScalarScale` divisor `f/k` and/or the
+/// LTBS log `ln(max(f, floor))`. Both are smooth functions of the prediction, so the
+/// `Dual2` ops carry `∂f/∂pk` and `∂²f/∂pk²` exactly — the η/θ chain that follows is
+/// unchanged. `ExpressionScale` is gated out upstream (use a Form-C readout). Mirrors
+/// `pk::apply_scaling` (`pred /= k`) and `pk::apply_log_transform`
+/// (`p = max(p, LTBS_FLOOR).ln()`; below the floor the value is clamped to a
+/// constant, so the jet vanishes).
+fn apply_output_transform<T: crate::sens::num::PkNum>(model: &CompiledModel, p: T) -> T {
+    let p = match model.scaling {
+        ScalingSpec::ScalarScale(k) if k != 1.0 => p * T::from_f64(1.0 / k),
+        _ => p,
+    };
+    if model.log_transform {
+        if p.val() > crate::pk::LTBS_FLOOR {
+            p.ln()
+        } else {
+            T::from_f64(crate::pk::LTBS_FLOOR.ln())
+        }
+    } else {
+        p
+    }
+}
+
+/// Shared setup for both ODE drivers, generic over the dual type `T` (`Dual2<N>`
+/// for the full outer walk, `Dual1<N>` for the light inner η-gradient): seed the
+/// flat PK-parameter vector (individual parameter `i` → dual dimension `i`),
+/// resolve bioavailability `F`, integrate the augmented state through the subject's
+/// events, and apply the readout + output transforms per observation. `init_state`
+/// is supplied by the caller (its FD seeding is order-specific:
+/// [`dual_init_state`] carries the Hessian, [`dual1_init_state`] only the gradient).
+/// Returns one transformed prediction `T` per observation — the caller reads its
+/// `grad`/`hess` and chains with `∂p/∂(η[,θ])`. `None` on lagtime (not yet supported
+/// over the dual loop) or an integration that fails to record every observation.
+fn integrate_subject_duals<T: crate::sens::num::PkNum>(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-) -> Option<SubjectSens> {
+    pk_values: &[f64],
+    init_state: &[T],
+) -> Option<Vec<T>> {
     let ode = model.ode_spec.as_ref()?;
     let program = ode.rhs_program.as_ref()?;
-    let n_eta = model.n_eta;
-    let n_theta = model.n_theta;
     let opts = ode.solver_opts;
-
-    // PK parameter values at (θ, η).
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
 
     // Seed the flat PK-parameter vector: individual parameter i (PK slot
     // `pk_indices[i]`) carries dual dimension i; everything else is constant.
-    let mut params_dual: Vec<Dual2<N>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();
+    let mut params_dual: Vec<T> = pk_values.iter().map(|&v| T::from_f64(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
-        params_dual[slot] = Dual2::var(pk.values[slot], i);
+        params_dual[slot] = T::var(pk_values[slot], i);
     }
-    // Individual-parameter η/θ derivatives (analytical, over Dual2 seeded on θ/η).
-    let pd = param_derivatives(model, subject, theta, eta)?;
 
     // Lagtime (a nonzero dose-time shift) is not yet supported over the dual loop.
-    if pk.values[PK_IDX_LAGTIME].abs() > 1e-12 {
+    if pk_values[PK_IDX_LAGTIME].abs() > 1e-12 {
         return None;
     }
     // Bioavailability F scales the dosed amount/rate (NONMEM F·AMT / F·RATE). F
     // lives at PK_IDX_F (pk_param_fn defaults it to 1 when undeclared); when F is
     // an estimated individual parameter, its derivative flows via `params_dual`.
-    let f_bio = if pk.values[PK_IDX_F] > 0.0 {
+    let f_bio = if pk_values[PK_IDX_F] > 0.0 {
         params_dual[PK_IDX_F]
     } else {
-        Dual2::constant(1.0)
-    };
-
-    // Initial state from `init(...)` (dual-seeded by FD of init_fn); zeros when
-    // none is declared. Re-applied at every EVID 3/4 reset.
-    let init_state: Vec<Dual2<N>> = match ode.init_fn.as_ref() {
-        Some(f) => dual_init_state::<N>(f.as_ref(), &pk.values, &model.pk_indices, ode.n_states),
-        None => vec![Dual2::constant(0.0); ode.n_states],
+        T::from_f64(1.0)
     };
 
     // Dose-time anchors for TAFD/TAD (constants w.r.t. the parameters).
@@ -330,35 +499,67 @@ fn run_subject<const N: usize>(
         .map(|d| d.time)
         .fold(f64::INFINITY, f64::min);
 
-    // Integrate the Dual2 state through bolus + infusion events, capturing the
-    // full state at each observation time.
-    let states = integrate_dual::<N>(
+    // Integrate the dual state through bolus + infusion events, capturing the full
+    // state at each observation time.
+    let states = integrate_g::<T>(
         program,
         ode.n_states,
         subject,
         &params_dual,
         f_bio,
-        &init_state,
+        init_state,
         first_dose_time,
         &opts,
     )?;
 
-    // Apply the readout per observation: the state directly (`ObsCmt`) or the
-    // Form C output program (`y = central/V1`) evaluated over the dual state.
-    let mut ro_vars: Vec<Dual2<N>> = Vec::new();
-    let mut ro_stack: Vec<Dual2<N>> = Vec::new();
-    let preds: Vec<Dual2<N>> = states
+    // Apply the readout per observation: the state directly (`ObsCmt`) or the Form
+    // C output program (`y = central/V1`) evaluated over the dual state, then the
+    // model's output transforms (`ScalarScale` divisor / LTBS log) over the dual.
+    let mut ro_vars: Vec<T> = Vec::new();
+    let mut ro_stack: Vec<T> = Vec::new();
+    let preds: Vec<T> = states
         .iter()
-        .map(|st| match &ode.readout {
-            OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(Dual2::constant(0.0)),
-            OdeReadout::Single(_) => ode
-                .readout_program
-                .as_ref()
-                .map(|p| p.eval_output_dual::<N>(st, &params_dual, &mut ro_vars, &mut ro_stack))
-                .unwrap_or(Dual2::constant(0.0)),
-            OdeReadout::PerCmt(_) => Dual2::constant(0.0),
+        .map(|st| {
+            let raw = match &ode.readout {
+                OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(T::from_f64(0.0)),
+                OdeReadout::Single(_) => ode
+                    .readout_program
+                    .as_ref()
+                    .map(|p| p.eval_output_g::<T>(st, &params_dual, &mut ro_vars, &mut ro_stack))
+                    .unwrap_or(T::from_f64(0.0)),
+                OdeReadout::PerCmt(_) => T::from_f64(0.0),
+            };
+            apply_output_transform::<T>(model, raw)
         })
         .collect();
+    Some(preds)
+}
+
+fn run_subject<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<SubjectSens> {
+    let ode = model.ode_spec.as_ref()?;
+    let n_eta = model.n_eta;
+    let n_theta = model.n_theta;
+
+    // PK parameter values at (θ, η).
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+
+    // Individual-parameter η/θ derivatives (analytical, over Dual2 seeded on θ/η).
+    let pd = param_derivatives(model, subject, theta, eta)?;
+
+    // Initial state from `init(...)` (dual-seeded by FD of init_fn, value + grad +
+    // Hessian); zeros when none is declared. Re-applied at every EVID 3/4 reset.
+    let init_state: Vec<Dual2<N>> = match ode.init_fn.as_ref() {
+        Some(f) => dual_init_state::<N>(f.as_ref(), &pk.values, &model.pk_indices, ode.n_states),
+        None => vec![Dual2::constant(0.0); ode.n_states],
+    };
+
+    // Seed + integrate the Dual2 state and apply the readout/transforms.
+    let preds = integrate_subject_duals::<Dual2<N>>(model, subject, &pk.values, &init_state)?;
 
     // Chain ∂f/∂p, ∂²f/∂p² (exact, from the dual) with ∂p/∂η, ∂p/∂θ (general,
     // from `param_derivatives`) → ∂f/∂η, ∂²f/∂η², ∂f/∂θ, ∂²f/∂η∂θ:
@@ -421,33 +622,111 @@ fn run_subject<const N: usize>(
     Some(SubjectSens { obs: out })
 }
 
-/// Integrate the `Dual2<N>` state through the subject's bolus + infusion events,
+/// Light `Dual1<N>` driver: integrate the state carrying only first-order
+/// `∂state/∂pk`, apply the readout + output transforms, and chain `∂f/∂pk · ∂pk/∂η`
+/// → `∂f/∂η` (η only — no θ, no Hessian). The ODE counterpart of
+/// [`super::provider`]'s `run_obs_grad`.
+fn run_subject_eta<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
+    let ode = model.ode_spec.as_ref()?;
+    let n_eta = model.n_eta;
+
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+
+    // First-order `∂p/∂η` only — the η-block, over a `Dual1` (no θ-axes, no Hessian).
+    let dp_deta = param_eta_derivatives(model, subject, theta, eta)?;
+
+    // Initial state from `init(...)` (dual-seeded by FD of init_fn, value + grad);
+    // zeros when none is declared. Re-applied at every EVID 3/4 reset.
+    let init_state: Vec<Dual1<N>> = match ode.init_fn.as_ref() {
+        Some(f) => dual1_init_state::<N>(f.as_ref(), &pk.values, &model.pk_indices, ode.n_states),
+        None => vec![Dual1::constant(0.0); ode.n_states],
+    };
+
+    // Seed + integrate the Dual1 state and apply the readout/transforms.
+    let preds = integrate_subject_duals::<Dual1<N>>(model, subject, &pk.values, &init_state)?;
+
+    let n_indiv = model.pk_indices.len();
+    let mut out = Vec::with_capacity(preds.len());
+    for fd in &preds {
+        // ∂f/∂η_k = Σ_i (∂f/∂pk_i)·(∂pk_i/∂η_k) — first order, η only.
+        let g = &fd.grad;
+        let mut df_deta = vec![0.0; n_eta];
+        for i in 0..n_indiv {
+            for k in 0..n_eta {
+                df_deta[k] += g[i] * dp_deta[i][k];
+            }
+        }
+        out.push(ObsGrad {
+            f: fd.value,
+            df_deta,
+        });
+    }
+    Some(out)
+}
+
+/// True when an observation time `ot` coincides with a segment break / solver
+/// save time `t`. Both are produced by arithmetic on the same CSV time values
+/// (`dose.time`, `t_end`, the solver's interpolated save points), so value-equal
+/// times can differ by a few ULPs; matching on `f64::to_bits` would silently miss
+/// them and leave the observation's state (hence its sensitivity) at zero — the
+/// hardening called for in issue #410. The tolerance is scaled to the time
+/// magnitude and is many orders of magnitude tighter than any real
+/// inter-observation spacing, so it never conflates distinct observations.
+#[inline]
+fn obs_time_matches(ot: f64, t: f64) -> bool {
+    (ot - t).abs() <= 1e-9 * (1.0 + ot.abs().max(t.abs()))
+}
+
+/// Integrate the dual state through the subject's bolus + infusion events,
 /// capturing the full state vector at every observation time. Returns one state
 /// vector per observation (parallel to `subject.obs_times`); the caller applies
 /// the readout. `f_bio` is the bioavailability (scales bolus amount and infusion
-/// rate, carrying its derivative).
+/// rate, carrying its derivative). Generic over the dual type `T`: `Dual2<N>` for
+/// the full outer gradient (value + grad + Hessian), `Dual1<N>` for the light inner
+/// η-gradient (value + grad only) — issue #410.
 #[allow(clippy::too_many_arguments)]
-fn integrate_dual<const N: usize>(
+fn integrate_g<T: crate::sens::num::PkNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
     subject: &Subject,
-    params_dual: &[Dual2<N>],
-    f_bio: Dual2<N>,
-    init_state: &[Dual2<N>],
+    params_dual: &[T],
+    f_bio: T,
+    init_state: &[T],
     first_dose_time: f64,
     opts: &crate::ode::solver::OdeSolverOptions,
-) -> Option<Vec<Vec<Dual2<N>>>> {
+) -> Option<Vec<Vec<T>>> {
     let n_obs = subject.obs_times.len();
-    let mut states: Vec<Vec<Dual2<N>>> = vec![vec![Dual2::<N>::constant(0.0); n_states]; n_obs];
+    let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
     let mut recorded = vec![false; n_obs];
     let mut u = init_state.to_vec();
 
-    // obs time → all indices sharing it.
-    use std::collections::HashMap;
-    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in subject.obs_times.iter().enumerate() {
-        obs_map.entry(t.to_bits()).or_default().push(i);
-    }
+    // Sorted `(obs_time, index)` for O(log n) tolerance lookup at each break time
+    // and solver save point, replacing the per-query linear scan over all
+    // observations (PR #438 review). The precise `obs_time_matches` test still
+    // gates each candidate; the sort only narrows the search window.
+    let mut sorted_obs: Vec<(f64, usize)> = subject.obs_times.iter().copied().zip(0..).collect();
+    sorted_obs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Record `src` at every not-yet-recorded observation whose time matches `q`.
+    let record_at = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
+        // Candidates lie within the relative tolerance band; widen slightly for the
+        // binary-search bounds, then confirm each with the exact `obs_time_matches`.
+        let slack = 2e-9 * (1.0 + q.abs());
+        let lo = sorted_obs.partition_point(|&(t, _)| t < q - slack);
+        for &(t, j) in &sorted_obs[lo..] {
+            if t > q + slack {
+                break;
+            }
+            if !recorded[j] && obs_time_matches(t, q) {
+                states[j].copy_from_slice(src);
+                recorded[j] = true;
+            }
+        }
+    };
 
     // Break the timeline at every dose time and — for infusions — the
     // infusion-end time, so each segment is fully inside or outside every
@@ -473,8 +752,8 @@ fn integrate_dual<const N: usize>(
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
     // Reusable scratch for the RHS evaluation across all stages.
-    let vars_cell: RefCell<Vec<Dual2<N>>> = RefCell::new(Vec::new());
-    let stack_cell: RefCell<Vec<Dual2<N>>> = RefCell::new(Vec::new());
+    let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
+    let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
 
     for w in 0..(break_times.len() - 1) {
         let t_start = break_times[w];
@@ -497,20 +776,16 @@ fn integrate_dual<const N: usize>(
             if !dose.is_infusion() && (dose.time - t_start).abs() < 1e-12 {
                 let cmt_idx = dose.cmt.saturating_sub(1);
                 if cmt_idx < n_states {
-                    u[cmt_idx] = u[cmt_idx] + f_bio * dose.amt;
+                    u[cmt_idx] = u[cmt_idx] + f_bio * T::from_f64(dose.amt);
                 }
             }
         }
 
-        // Record any observation exactly at t_start (after the dose).
-        if let Some(idxs) = obs_map.get(&t_start.to_bits()) {
-            for &j in idxs {
-                if !recorded[j] {
-                    states[j].copy_from_slice(&u);
-                    recorded[j] = true;
-                }
-            }
-        }
+        // Record any observation at t_start (after the dose). `t_start` is a break
+        // time built by arithmetic on dose/reset times, so an observation that
+        // coincides with it can be value-equal but bit-different — match by
+        // tolerance, not bit pattern (issue #410).
+        record_at(t_start, &u, &mut states, &mut recorded);
 
         if (t_end - t_start).abs() < 1e-15 {
             continue;
@@ -549,7 +824,7 @@ fn integrate_dual<const N: usize>(
             .filter(|&dt| dt <= t_start + 1e-12)
             .fold(f64::NEG_INFINITY, f64::max);
 
-        let rhs = |us: &[Dual2<N>], ps: &[Dual2<N>], t: f64, du: &mut [Dual2<N>]| {
+        let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
             let tafd = if first_dose_time.is_finite() {
                 t - first_dose_time
             } else {
@@ -560,7 +835,7 @@ fn integrate_dual<const N: usize>(
             } else {
                 f64::NAN
             };
-            program.eval_rhs_dual::<N>(
+            program.eval_rhs_g::<T>(
                 us,
                 ps,
                 t,
@@ -572,7 +847,7 @@ fn integrate_dual<const N: usize>(
             );
             for &(cmt, rate) in &active_inf {
                 if cmt < du.len() {
-                    du[cmt] = du[cmt] + f_bio * rate;
+                    du[cmt] = du[cmt] + f_bio * T::from_f64(rate);
                 }
             }
         };
@@ -580,19 +855,24 @@ fn integrate_dual<const N: usize>(
         let sol = solve_ode_g(&rhs, &u, (t_start, t_end), params_dual, &saveat, opts);
 
         // Capture state at the requested observation times; advance u to t_end.
+        // `pt.t` is the solver's reported save time — match observations by
+        // tolerance rather than bit pattern (issue #410).
         for pt in &sol {
-            if let Some(idxs) = obs_map.get(&pt.t.to_bits()) {
-                for &j in idxs {
-                    if !recorded[j] {
-                        states[j].copy_from_slice(&pt.u);
-                        recorded[j] = true;
-                    }
-                }
-            }
+            record_at(pt.t, &pt.u, &mut states, &mut recorded);
             if (pt.t - t_end).abs() < 1e-12 {
                 u.copy_from_slice(&pt.u);
             }
         }
+    }
+
+    // Every observation must have been captured at a break time or a solver save
+    // point. An unmatched one — e.g. a negative observation time below the timeline
+    // floor (`t_last` clamps to 0, so it lies in no segment), or a save point the
+    // solver dropped/realigned — would keep its zero-initialised state and feed a
+    // silent `f = 0`, `∂f = 0` into the gradient. Decline so the caller falls back
+    // to FD for this subject rather than return a wrong `Some`.
+    if recorded.iter().any(|&r| !r) {
+        return None;
     }
 
     Some(states)
@@ -603,6 +883,30 @@ mod tests {
     use super::*;
     use crate::parser::model_parser::parse_model_string;
     use crate::pk::compute_predictions_with_tv;
+
+    /// Hardening for issue #410: an observation time and the segment break / solver
+    /// save time it coincides with are produced by different arithmetic, so they can
+    /// be value-equal yet bit-different. `0.1 + 0.2 ≠ 0.3` (IEEE-754) is the canonical
+    /// case the old `f64::to_bits` keying would silently miss — leaving the
+    /// observation's state (and its sensitivity) at zero. `obs_time_matches` must
+    /// match these while still separating genuinely distinct observation times.
+    #[test]
+    fn obs_time_matches_tolerates_ulp_differences_not_distinct_times() {
+        let a = 0.3_f64;
+        let b = 0.1_f64 + 0.2; // 0.30000000000000004
+        assert_ne!(a.to_bits(), b.to_bits(), "precondition: bit-different");
+        assert!(
+            obs_time_matches(a, b),
+            "ULP-apart times must match — bit-exact keying would drop this observation"
+        );
+        // Tolerance scales with magnitude (a late, large dosing time).
+        let big = 168.0_f64;
+        assert!(obs_time_matches(big, big + big * 1e-12));
+        // Genuinely distinct observation times must NOT be conflated.
+        assert!(!obs_time_matches(24.0, 24.001));
+        assert!(!obs_time_matches(0.0, 0.5));
+        assert!(!obs_time_matches(big, big + 0.01));
+    }
     use crate::types::DoseEvent;
     use std::collections::HashMap;
 
@@ -791,6 +1095,174 @@ mod tests {
                 );
             }
         }
+    }
+
+    // 2-cpt IV ODE under LTBS (`log(DV) ~ additive`): the readout is log-transformed
+    // (`p = ln f`), so the provider's f/∂f/∂η/∂f/∂θ must match the (also
+    // log-transformed) production predictor. Tier 1 output transform (#410).
+    const TWOCPT_ODE_LTBS: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma ADD_LOG ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  log(DV) ~ additive(ADD_LOG)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    #[test]
+    fn ode_provider_ltbs_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE_LTBS).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "LTBS ODE should be supported (Tier 1)"
+        );
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
+    }
+
+    // 2-cpt IV ODE with a constant `ScalarScale` output divisor (`obs_scale = 50`)
+    // over the central-amount readout: `f = central / 50`. Tier 1 output transform.
+    const TWOCPT_ODE_SCALARSCALE: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(obs_cmt=central, states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  obs_scale = 50
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    #[test]
+    fn ode_provider_scalar_scale_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE_SCALARSCALE).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "constant ScalarScale ODE should be supported (Tier 1)"
+        );
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
+    }
+
+    /// The light `Dual1` inner provider's `f` / `∂f/∂η` must equal the full `Dual2`
+    /// outer provider's `f` / `df_deta` exactly — both are exact analytic, only the
+    /// dual order differs (and `solve_ode_g` uses value-based step control, so the
+    /// trajectories match). This is what makes the inner EBE loop's analytic
+    /// η-gradient correct (#410). Run across the readout/dose variants so the light
+    /// driver's branches are exercised: Form-C readout (`TWOCPT_ODE`), an `ObsCmt`
+    /// model with non-zero `init(...)` (exercises `dual1_init_state`), estimated
+    /// bioavailability `F` (`BIOAV_ODE` — the `f_bio` path + `ObsCmt` arm), and LTBS.
+    #[test]
+    fn ode_light_inner_eta_grad_matches_full_provider() {
+        fn check(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
+            let full = ode_subject_sensitivities(model, subject, theta, eta).expect("full");
+            let light = ode_subject_eta_grad(model, subject, theta, eta).expect("light");
+            assert_eq!(full.obs.len(), light.len());
+            for (a, b) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
+                for k in 0..model.n_eta {
+                    approx::assert_relative_eq!(
+                        a.df_deta[k],
+                        b.df_deta[k],
+                        max_relative = 1e-9,
+                        epsilon = 1e-10
+                    );
+                }
+            }
+        }
+
+        // Form-C readout, IV bolus.
+        let m = parse_model_string(TWOCPT_ODE).expect("parse");
+        check(
+            &m,
+            &bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
+            &[4.0, 12.0, 2.0, 25.0],
+            &[0.12, -0.08],
+        );
+
+        // ObsCmt readout + non-zero init(...) → exercises `dual1_init_state`.
+        let m = parse_model_string(INIT_ODE).expect("parse");
+        let mut s = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        s.doses = vec![];
+        check(&m, &s, &[1.0, 20.0], &[0.1, -0.05]);
+
+        // Estimated bioavailability F + ObsCmt readout, oral depot → `f_bio` path.
+        let m = parse_model_string(BIOAV_ODE).expect("parse");
+        let mut s = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        check(&m, &s, &[5.0, 50.0, 1.5, 0.70], &[0.15, 0.2]);
+
+        // LTBS output transform over the Dual1 readout.
+        let m = parse_model_string(TWOCPT_ODE_LTBS).expect("parse");
+        check(
+            &m,
+            &bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
+            &[4.0, 12.0, 2.0, 25.0],
+            &[0.12, -0.08],
+        );
+    }
+
+    /// The inner EBE loop must actually *resolve* to the analytic η-gradient for an
+    /// in-scope ODE subject (not merely be correct when called) — i.e. the wiring in
+    /// `analytic_inner_grad_supported` / `resolve_gradient_method` engages (#410).
+    #[test]
+    fn ode_inner_gradient_route_resolves_analytic() {
+        use crate::estimation::inner_optimizer::{resolve_gradient_method, InnerGradientMethod};
+        let model = parse_model_string(TWOCPT_ODE).expect("parse");
+        let subject = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0]);
+        assert_eq!(
+            resolve_gradient_method(&model, &subject),
+            InnerGradientMethod::Analytic,
+            "in-scope ODE subject must use the analytic inner η-gradient (#410)"
+        );
+        // The provider entry the inner loop actually calls (`subject_eta_grad`) must
+        // route the ODE model to the light Dual1 provider, not decline.
+        let g = crate::sens::provider::subject_eta_grad(
+            &model,
+            &subject,
+            &[4.0, 12.0, 2.0, 25.0],
+            &[0.1, -0.05],
+        );
+        assert!(
+            g.is_some_and(|v| v.len() == subject.obs_times.len()),
+            "subject_eta_grad must serve an in-scope ODE subject via the light provider"
+        );
     }
 
     // 1-cpt oral ODE with estimated, logit-normal bioavailability F — the dose

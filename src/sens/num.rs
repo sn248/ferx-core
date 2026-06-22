@@ -4,7 +4,6 @@
 //! source is monomorphised for each numeric type.
 
 use super::dual1::Dual1;
-use super::dual2::Dual2;
 use super::dual_mixed::DualMixed;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
@@ -155,65 +154,6 @@ impl<const N: usize> PkNum for Dual1<N> {
     fn guard_floor(self, lo: f64) -> Self {
         if self.value < lo {
             Dual1::constant(lo)
-        } else {
-            self
-        }
-    }
-}
-
-impl<const N: usize> PkNum for Dual2<N> {
-    #[inline]
-    fn from_f64(x: f64) -> Self {
-        Dual2::constant(x)
-    }
-    #[inline]
-    fn var(x: f64, dim: usize) -> Self {
-        Dual2::var(x, dim)
-    }
-    #[inline]
-    fn val(self) -> f64 {
-        self.value
-    }
-    #[inline]
-    fn exp(self) -> Self {
-        Dual2::exp(self)
-    }
-    #[inline]
-    fn ln(self) -> Self {
-        Dual2::ln(self)
-    }
-    #[inline]
-    fn sqrt(self) -> Self {
-        Dual2::sqrt(self)
-    }
-    #[inline]
-    fn pow(self, e: Self) -> Self {
-        Dual2::powd(self, e)
-    }
-    #[inline]
-    fn abs(self) -> Self {
-        Dual2::abs(self)
-    }
-    #[inline]
-    fn inv_logit(self) -> Self {
-        Dual2::inv_logit(self)
-    }
-    #[inline]
-    fn logit(self) -> Self {
-        Dual2::logit(self)
-    }
-    #[inline]
-    fn cos(self) -> Self {
-        Dual2::cos(self)
-    }
-    #[inline]
-    fn acos(self) -> Self {
-        Dual2::acos(self)
-    }
-    #[inline]
-    fn guard_floor(self, lo: f64) -> Self {
-        if self.value < lo {
-            Dual2::constant(lo)
         } else {
             self
         }

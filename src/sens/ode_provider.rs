@@ -1614,6 +1614,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
     let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
 
+    // Per-dose bioavailability for the shared absorption-forcing helper. The static
+    // walk applies one `f_bio` to every dose (per-compartment F is gated off), built
+    // once per subject rather than per RK45 stage (#451 / #433 review #6).
+    let dose_f_bio_all: Vec<T> = vec![f_bio; subject.doses.len()];
+
     for w in 0..(break_times.len() - 1) {
         let t_start = break_times[w];
         let t_end = break_times[w + 1];
@@ -1709,32 +1714,22 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                     du[cmt] = du[cmt] + f_bio * T::from_f64(rate);
                 }
             }
-            // Built-in absorption input-rate forcing R_in(tad), summed over the
-            // doses feeding each forcing's compartment — the Dual2 analogue of
-            // `add_prepared_input_rate_forcing` (#430). Lagtime is excluded from
-            // this provider, so tad = t − dose.time is parameter-independent (a
-            // constant dual); only the prepared constants and F·amt carry
-            // derivatives. Reset subjects are excluded (FD fallback), so there is
-            // no `reset_floor` to apply here.
-            for (forcing, prep) in ode.input_rate.iter().zip(prepared_forcings) {
-                if forcing.cmt >= du.len() {
-                    continue;
-                }
-                let mut acc = T::from_f64(0.0);
-                for d in &subject.doses {
-                    if d.cmt.saturating_sub(1) != forcing.cmt {
-                        continue;
-                    }
-                    let tad_f = t - d.time;
-                    // Pre-dose skip: `tad ≤ 0` contributes nothing. `rate` re-checks
-                    // this same wall (`tad.val() <= 0`), so this is an optimization
-                    // (skip the dual `rate` call), not the source of truth (#430 review).
-                    if tad_f <= 0.0 {
-                        continue;
-                    }
-                    acc = acc + prep.rate(T::from_f64(tad_f), f_bio * T::from_f64(d.amt));
-                }
-                du[forcing.cmt] = du[forcing.cmt] + acc;
+            // Built-in absorption input-rate forcing R_in(tad), via the shared
+            // generic helper — the same superposition loop production runs on `f64`,
+            // now monomorphised on the dual type `T`. Lagtime is excluded from this
+            // provider (`&[]` → tad = t − dose.time), and reset+absorption is gated to
+            // FD (`NEG_INFINITY` floor → no pre-reset skip) (#430 review #4 / #451).
+            if !prepared_forcings.is_empty() {
+                crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
+                    ode,
+                    prepared_forcings,
+                    &subject.doses,
+                    &[],
+                    &dose_f_bio_all,
+                    f64::NEG_INFINITY,
+                    t,
+                    du,
+                );
             }
         };
 

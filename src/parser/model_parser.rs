@@ -2128,16 +2128,6 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     {
         let theta_names = model.theta_names.clone();
         let eta_names = model.eta_names.clone();
-        // Names assigned in [individual_parameters] (including intermediate variables),
-        // so [event_model] expressions may reference them; resolved per subject at eval
-        // time from `indiv_stmts` via `eval_indiv_param_vars`.
-        let indiv_param_names: Vec<String> = indiv_stmts
-            .iter()
-            .filter_map(|s| match s {
-                Statement::Assign(name, _) => Some(name.clone()),
-                _ => None,
-            })
-            .collect();
 
         // Collect all [event_model] line-sets: unnamed (at most one) + named (any number).
         let mut event_blocks: Vec<&Vec<String>> = Vec::new();
@@ -2155,8 +2145,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 lines,
                 &theta_names,
                 &eta_names,
-                &indiv_param_names,
                 &indiv_stmts,
+                &model.kappa_names,
                 &model.error_spec,
             )?;
             if model.endpoints.contains_key(&cmt) {
@@ -3109,11 +3099,24 @@ fn collect_variable_names(expr: &Expression, out: &mut std::collections::HashSet
     });
 }
 
-/// Evaluate the parsed `[individual_parameters]` statements into a name→value map
-/// for the given `(θ, η, covariates)`. Lets `[event_model]` hazard expressions
-/// reference individual-parameter names (e.g. a hazard driven by an individual `CL`).
-/// Empty for TTE-only models with no `[individual_parameters]` block, in which case
-/// the hazard expressions reference only θ/η/covariates.
+/// Evaluate the hazard-reachable `[individual_parameters]` statements into a
+/// name→value map for the given `(θ, η, covariates)`, so `[event_model]` hazard
+/// expressions can reference individual-parameter names (e.g. a hazard driven by
+/// an individual `CL`).
+///
+/// `stmts` is the reachability-filtered subset (`needed_indiv_stmts`) built in
+/// `parse_event_model_block`. It is **empty** for a hazard that references no
+/// individual parameter — the common TTE-only case — and this then returns an
+/// empty map without allocating, so such hazards pay nothing for the feature.
+///
+/// Evaluation uses the tree-walking `eval_statements`, NOT the bytecode
+/// `eval_statements_indexed`: only the latter borrows the `FERX_SCRATCH`
+/// thread-local, so this is safe to call from inside the likelihood's hazard
+/// `param_fn`, and it transparently handles NONMEM-style `if (...) CL = ...`
+/// conditional parameters. Kappa (IOV) and `[covariate_nn]`-output references in
+/// these statements are rejected up front (see `needed_indiv_stmts`), so the
+/// BSV-only `eta` slice never indexes out of bounds and the empty `nn_outputs`
+/// here is never read.
 #[cfg(feature = "survival")]
 fn eval_indiv_param_vars(
     stmts: &[Statement],
@@ -3121,20 +3124,11 @@ fn eval_indiv_param_vars(
     eta: &[f64],
     covariates: &HashMap<String, f64>,
 ) -> HashMap<String, f64> {
-    // Evaluate each `name = expr` assignment in order with `eval_expression`, which —
-    // unlike `eval_statements` — does NOT borrow the `FERX_SCRATCH` thread-local. The
-    // hazard `param_fn` runs inside the likelihood's own statement evaluation (where
-    // that scratch is already held), so re-entering it would abort the process. Later
-    // assignments see earlier ones via the growing `vars` map (matching declaration
-    // order). Only plain assignments are resolved — the overwhelming majority of
-    // `[individual_parameters]`; control-flow statements are skipped.
-    let mut vars = HashMap::new();
-    for s in stmts {
-        if let Statement::Assign(name, expr) = s {
-            let v = eval_expression(expr, theta, eta, covariates, &vars, &[]);
-            vars.insert(name.clone(), v);
-        }
+    if stmts.is_empty() {
+        return HashMap::new();
     }
+    let mut vars = HashMap::with_capacity(stmts.len());
+    eval_statements(stmts, theta, eta, covariates, &mut vars, None, None, &[]);
     vars
 }
 
@@ -3157,8 +3151,8 @@ fn parse_event_model_block(
     lines: &[String],
     theta_names: &[String],
     eta_names: &[String],
-    indiv_param_names: &[String],
     indiv_stmts: &[Statement],
+    kappa_names: &[String],
     error_spec: &ErrorSpec,
 ) -> Result<
     (
@@ -3173,12 +3167,16 @@ fn parse_event_model_block(
     use crate::types::{EndpointLikelihood, HazardFamily, HazardSpec};
 
     // `[event_model]` hazard expressions may reference names defined in
-    // `[individual_parameters]`. Passing those names as `defined_vars` makes them
-    // parse as `Expression::Variable`; the param_fn closures below evaluate the
-    // individual-parameter statements into a `vars` map at call time (`eval_statements`)
-    // so the references resolve to the per-subject individual values. Names that are
-    // neither θ/η nor an individual parameter still fall back to covariates.
-    let ctx = ParseCtx::new(theta_names, eta_names, indiv_param_names);
+    // `[individual_parameters]`. Register every assigned name — including those
+    // inside `if (...) { ... }` branches (NONMEM-style conditional parameters) and
+    // intermediate helpers — as `defined_vars`, so such a reference parses as
+    // `Expression::Variable` and is resolved per subject from `needed_indiv_stmts`
+    // (below) rather than silently falling back to a covariate, which would read
+    // 0.0. Names that are neither θ/η nor an individual parameter still fall back
+    // to covariates. `kappa_names` is used below to reject IOV references that the
+    // per-subject hazard cannot evaluate.
+    let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+    let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
 
     let mut cmt_opt: Option<usize> = None;
     let mut family_opt: Option<HazardFamily> = None;
@@ -3344,11 +3342,15 @@ fn parse_event_model_block(
     }
 
     // Restrict the individual-parameter statements the hazard closures evaluate to
-    // just those the hazard references, transitively. Evaluating *all* of them would
-    // also evaluate unrelated parameters — notably PK parameters that reference IOV
-    // kappas at η-indices outside the slice the hazard `param_fn` receives, which would
-    // index out of bounds. Walking declarations in reverse lets a needed parameter pull
-    // in the (earlier-declared) parameters it depends on.
+    // just those the hazard references, transitively. This bounds the per-eval work
+    // and scopes the IOV/NN checks below to what the hazard actually depends on (an
+    // unrelated PK parameter that uses an IOV kappa or an NN output must not make a
+    // kappa-free hazard fail). Walking declarations in reverse lets a needed
+    // parameter pull in the (earlier-declared) parameters it depends on. NONMEM-style
+    // `if (...) CL = ...` conditional parameters are handled by keying on every name
+    // the statement assigns (across branches, via `assigned_vars_in_order`) and
+    // pulling in every name it references (RHS, conditions, and both branches, via
+    // `visit_stmt_nodes`).
     let needed_indiv_stmts: Vec<Statement> = {
         let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for expr in [
@@ -3365,16 +3367,82 @@ fn parse_event_model_block(
         }
         let mut keep: Vec<Statement> = Vec::new();
         for s in indiv_stmts.iter().rev() {
-            if let Statement::Assign(name, expr) = s {
-                if needed.contains(name) {
-                    collect_variable_names(expr, &mut needed);
-                    keep.push(s.clone());
-                }
+            let stmt = std::slice::from_ref(s);
+            if assigned_vars_in_order(stmt)
+                .iter()
+                .any(|n| needed.contains(n))
+            {
+                visit_stmt_nodes(stmt, &mut |e: &Expression| {
+                    if let Expression::Variable(name) = e {
+                        needed.insert(name.clone());
+                    }
+                });
+                keep.push(s.clone());
             }
         }
         keep.reverse();
         keep
     };
+
+    // The hazard `param_fn` evaluates the kept statements with the BSV-only η it is
+    // handed (kappas are PK/occasion-level, not part of a per-subject hazard), so a
+    // kept statement referencing an IOV kappa would index η out of bounds and abort
+    // the fit (issue #442). Reject it here with a clear error instead. `eta_names` is
+    // BSV-only (it is `model.eta_names`), so any `Eta(i)` with `i >= eta_names.len()`
+    // is the kappa at position `i - n_eta` in `kappa_names`.
+    {
+        let n_eta = eta_names.len();
+        let mut kappa_hit: Option<String> = None;
+        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
+            if let Expression::Eta(i) = e {
+                if *i >= n_eta && kappa_hit.is_none() {
+                    kappa_hit = Some(
+                        kappa_names
+                            .get(*i - n_eta)
+                            .cloned()
+                            .unwrap_or_else(|| "<kappa>".to_string()),
+                    );
+                }
+            }
+        });
+        if let Some(k) = kappa_hit {
+            return Err(format!(
+                "[event_model]: a hazard expression references an [individual_parameters] \
+                 value that depends on the inter-occasion (IOV) random effect `{k}`. The \
+                 hazard is evaluated once per subject, with no occasion context, so an IOV \
+                 parameter has no well-defined value here — reference an IOV-free parameter, \
+                 or write the hazard in terms of θ/η directly."
+            ));
+        }
+    }
+
+    // An `[individual_parameters]` value whose definition reads a `[covariate_nn]`
+    // output would silently resolve to 0.0 in the hazard, because the hazard
+    // `param_fn` evaluates these statements without the network forward pass. Reject
+    // such a reference. `Expression::NnOutput` nodes only exist under the `nn`
+    // feature (they come from `[covariate_nn]` dot-access), so this guard is gated to
+    // it: the survival coverage build (`--features ci,survival`, no `nn`) does not
+    // compile it — a measurement gap, not missed coverage (#293) — and it is
+    // unreachable in any build without `nn`.
+    #[cfg(feature = "nn")]
+    {
+        let mut nn_hit = false;
+        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
+            if matches!(e, Expression::NnOutput { .. }) {
+                nn_hit = true;
+            }
+        });
+        if nn_hit {
+            return Err(
+                "[event_model]: a hazard expression references an [individual_parameters] \
+                 value whose definition uses a [covariate_nn] output. Neural-network-driven \
+                 individual parameters are not available to hazard expressions (the hazard is \
+                 evaluated without the network forward pass) — reference an NN-free parameter \
+                 instead."
+                    .to_string(),
+            );
+        }
+    }
 
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.

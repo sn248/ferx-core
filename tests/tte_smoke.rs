@@ -671,6 +671,161 @@ mod survival_smoke {
         );
     }
 
+    /// Issue #442 (review #1): a hazard that references an `[individual_parameters]`
+    /// value whose definition uses an IOV **kappa** must be rejected at parse time,
+    /// not crash the fit. The hazard `param_fn` is handed the BSV-only η, but a kappa
+    /// compiles to an η-index *past* that slice (`Eta(n_eta + k)`), so evaluating the
+    /// kept statement would index out of bounds and abort. Here `scale = CL` with
+    /// `CL = TVCL * exp(ETA_CL + KAPPA_CL)`.
+    #[test]
+    fn event_model_referencing_kappa_indiv_param_is_rejected() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma SIGMA_ADD ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_ADD)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = CL
+";
+        let err = parse_model_string(src).expect_err(
+            "a hazard referencing a kappa-bearing individual parameter must be rejected, \
+             not OOB-panic",
+        );
+        assert!(
+            err.contains("inter-occasion") && err.contains("KAPPA_CL"),
+            "the error should name the offending IOV random effect; got: {err}"
+        );
+    }
+
+    /// Issue #442 (review #2): a hazard may reference an `[individual_parameters]`
+    /// value defined by a NONMEM-style `if (...) { ... } else { ... }` block. Before
+    /// the fix, such a name was classified as a covariate and silently resolved to
+    /// 0.0 (a degenerate hazard). `HAZ` is assigned on both branches; the `param_fn`
+    /// must select the subject's branch and thread η through.
+    #[test]
+    fn event_model_references_conditional_individual_parameter() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVBASE(0.05, 0.001, 10.0)
+  omega ETA_BASE ~ 0.09
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+  if (WT > 70) {
+    HAZ = TVBASE * 2.0 * exp(ETA_BASE)
+  } else {
+    HAZ = TVBASE * exp(ETA_BASE)
+  }
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = HAZ
+";
+        let model = parse_model_string(src)
+            .expect("hazard referencing a conditionally-defined individual parameter must parse");
+        let ep = model
+            .endpoints
+            .get(&2)
+            .expect("CMT=2 must be a TTE endpoint");
+        let EndpointLikelihood::Tte { hazard } = ep else {
+            panic!("expected Tte endpoint");
+        };
+        let param_fn = match hazard {
+            ferx_core::HazardSpec::Analytic { param_fn, .. } => param_fn,
+        };
+        let theta = [1.0, 10.0, 0.05]; // TVCL, TVV, TVBASE
+
+        // WT = 80 (> 70) takes the *2.0 branch: HAZ = 0.05·2·e^0 = 0.10.
+        let mut hi = std::collections::HashMap::new();
+        hi.insert("WT".to_string(), 80.0);
+        let p_hi = param_fn(&theta, &[0.0], &hi);
+        assert!(
+            (p_hi[0] - 0.10).abs() < 1e-9,
+            "WT>70 branch must resolve HAZ to 0.10 (0.0 = unresolved conditional param); got {}",
+            p_hi[0]
+        );
+
+        // WT = 60 takes the else branch: HAZ = 0.05·e^0.5, so η also flows through.
+        let mut lo = std::collections::HashMap::new();
+        lo.insert("WT".to_string(), 60.0);
+        let p_lo = param_fn(&theta, &[0.5], &lo);
+        let expected = 0.05 * 0.5_f64.exp();
+        assert!(
+            (p_lo[0] - expected).abs() < 1e-9,
+            "else branch must resolve HAZ to {expected} and track η; got {}",
+            p_lo[0]
+        );
+    }
+
+    /// Issue #442 (review #3): a hazard that references an `[individual_parameters]`
+    /// value driven by a `[covariate_nn]` output must be rejected — the hazard
+    /// `param_fn` runs without the network forward pass, so the reference would
+    /// silently resolve to 0.0. Gated on `nn` (NnOutput nodes only exist there).
+    #[cfg(feature = "nn")]
+    #[test]
+    fn event_model_referencing_nn_driven_indiv_param_is_rejected() {
+        let src = r"
+[parameters]
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT]
+  outputs = [CL]
+  layers = [3]
+  activation = tanh
+  output = softplus
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = CL
+";
+        let err = parse_model_string(src)
+            .expect_err("a hazard referencing an NN-driven individual parameter must be rejected");
+        assert!(
+            err.contains("covariate_nn") || err.contains("network"),
+            "the error should explain the NN-output limitation; got: {err}"
+        );
+    }
+
     // ── Phase 1 follow-up: median/mean survival in predict_survival ───────────
 
     #[test]

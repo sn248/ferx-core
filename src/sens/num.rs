@@ -4,7 +4,7 @@
 //! source is monomorphised for each numeric type.
 
 use super::dual1::Dual1;
-use super::dual2::Dual2;
+use super::dual_mixed::DualMixed;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 pub trait PkNum:
@@ -17,6 +17,9 @@ pub trait PkNum:
 {
     /// Lift a constant into the numeric type (zero derivatives for duals).
     fn from_f64(x: f64) -> Self;
+    /// Seed dual dimension `dim` as an independent variable at value `x`. `f64`
+    /// carries no derivatives, so it ignores `dim` and behaves like `from_f64`.
+    fn var(x: f64, dim: usize) -> Self;
     /// The underlying value — for guards / branch conditions only.
     fn val(self) -> f64;
     /// `exp`.
@@ -46,6 +49,10 @@ pub trait PkNum:
 impl PkNum for f64 {
     #[inline]
     fn from_f64(x: f64) -> Self {
+        x
+    }
+    #[inline]
+    fn var(x: f64, _dim: usize) -> Self {
         x
     }
     #[inline]
@@ -100,6 +107,10 @@ impl<const N: usize> PkNum for Dual1<N> {
         Dual1::constant(x)
     }
     #[inline]
+    fn var(x: f64, dim: usize) -> Self {
+        Dual1::var(x, dim)
+    }
+    #[inline]
     fn val(self) -> f64 {
         self.value
     }
@@ -141,7 +152,11 @@ impl<const N: usize> PkNum for Dual1<N> {
     }
     #[inline]
     fn guard_floor(self, lo: f64) -> Self {
-        if self.value < lo {
+        // `!(value >= lo)` (not `value < lo`) so a `NaN` value floors too, matching
+        // `f64::max(lo)` on the scalar path (`NaN.max(lo) == lo`) — otherwise a
+        // transient `NaN` would give a finite f64 prediction but a `NaN` dual
+        // gradient (the clamped region is flat, so the floored jet is zero) (#430).
+        if !(self.value >= lo) {
             Dual1::constant(lo)
         } else {
             self
@@ -149,10 +164,14 @@ impl<const N: usize> PkNum for Dual1<N> {
     }
 }
 
-impl<const N: usize> PkNum for Dual2<N> {
+impl<const NA: usize, const N: usize> PkNum for DualMixed<NA, N> {
     #[inline]
     fn from_f64(x: f64) -> Self {
-        Dual2::constant(x)
+        DualMixed::constant(x)
+    }
+    #[inline]
+    fn var(x: f64, dim: usize) -> Self {
+        DualMixed::var(x, dim)
     }
     #[inline]
     fn val(self) -> f64 {
@@ -160,44 +179,46 @@ impl<const N: usize> PkNum for Dual2<N> {
     }
     #[inline]
     fn exp(self) -> Self {
-        Dual2::exp(self)
+        DualMixed::exp(self)
     }
     #[inline]
     fn ln(self) -> Self {
-        Dual2::ln(self)
+        DualMixed::ln(self)
     }
     #[inline]
     fn sqrt(self) -> Self {
-        Dual2::sqrt(self)
+        DualMixed::sqrt(self)
     }
     #[inline]
     fn pow(self, e: Self) -> Self {
-        Dual2::powd(self, e)
+        DualMixed::powd(self, e)
     }
     #[inline]
     fn abs(self) -> Self {
-        Dual2::abs(self)
+        DualMixed::abs(self)
     }
     #[inline]
     fn inv_logit(self) -> Self {
-        Dual2::inv_logit(self)
+        DualMixed::inv_logit(self)
     }
     #[inline]
     fn logit(self) -> Self {
-        Dual2::logit(self)
+        DualMixed::logit(self)
     }
     #[inline]
     fn cos(self) -> Self {
-        Dual2::cos(self)
+        DualMixed::cos(self)
     }
     #[inline]
     fn acos(self) -> Self {
-        Dual2::acos(self)
+        DualMixed::acos(self)
     }
     #[inline]
     fn guard_floor(self, lo: f64) -> Self {
-        if self.value < lo {
-            Dual2::constant(lo)
+        // `!(value >= lo)` floors `NaN` too, matching `f64::max(lo)` — see the
+        // `Dual1` impl above (#430).
+        if !(self.value >= lo) {
+            DualMixed::constant(lo)
         } else {
             self
         }
@@ -209,6 +230,7 @@ mod tests {
     use super::*;
     use crate::sens::dual1::Dual1;
     use crate::sens::dual2::Dual2;
+    use crate::sens::dual_mixed::DualMixed;
 
     /// Exercise every `PkNum` method on a value once, so the per-impl delegators
     /// (and the underlying `Dual1`/`Dual2` ops they call) are covered. `0.7` is a
@@ -236,5 +258,28 @@ mod tests {
         exercise::<f64>(0.7);
         exercise::<Dual1<1>>(Dual1::var(0.7, 0));
         exercise::<Dual2<1>>(Dual2::var(0.7, 0));
+        exercise::<DualMixed<1, 2>>(DualMixed::var(0.7, 0));
+    }
+
+    /// `guard_floor(NaN)` must floor (return `lo`) on the duals exactly as it does on
+    /// `f64` (`NaN.max(lo) == lo`) — a sub-floor / `NaN` value lands in the flat
+    /// clamped region, so the dual's value is `lo` and its jet is zero. Without this,
+    /// a transient `NaN` would give a finite f64 prediction but a `NaN` dual gradient
+    /// (#430 review #2).
+    #[test]
+    fn guard_floor_floors_nan_consistently_across_impls() {
+        let lo = 1e-6;
+        assert_eq!(f64::NAN.guard_floor(lo), lo);
+        assert_eq!(Dual1::<1>::var(f64::NAN, 0).guard_floor(lo).value, lo);
+        assert_eq!(Dual2::<1>::var(f64::NAN, 0).guard_floor(lo).value, lo);
+        assert_eq!(
+            DualMixed::<1, 2>::var(f64::NAN, 0).guard_floor(lo).value,
+            lo
+        );
+        // The floored dual carries a zero jet (flat clamped region).
+        let g = Dual1::<1>::var(f64::NAN, 0).guard_floor(lo);
+        assert_eq!(g.grad[0], 0.0);
+        // A value already above the floor is untouched.
+        assert_eq!(Dual1::<1>::var(5.0, 0).guard_floor(lo).value, 5.0);
     }
 }

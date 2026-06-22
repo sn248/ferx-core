@@ -19,6 +19,16 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Performance
+- **Analytic inner η-gradient for time-varying covariates / oral infusion on
+  analytical PK models** (#447). The light `Dual1` inner EBE gradient previously
+  declined these subjects and reverted to finite differences even though the
+  **outer** gradient already served them; it now uses a first-order event-driven
+  walk (`subject_eta_grad_tvcov`, the light mirror of `subject_sensitivities_tvcov`),
+  so the inner EBE loop is exact and replaces FD's `~2·n_eta+1` predictions per step
+  with one. Validated against the FD-validated outer `df_deta` (1-/2-/3-cpt, IV/oral,
+  steady state).
+
 ### Added
 - **`[event_model]` hazard expressions can reference `[individual_parameters]`** names —
   e.g. a hazard driven by an individual `CL` — resolved per subject at evaluation time, in
@@ -28,6 +38,39 @@ section of the SDLC for the versioning policy).
   individual parameter that depends on an inter-occasion (IOV/kappa) random effect — or on a
   `[covariate_nn]` output — is rejected with a clear error, since the per-subject hazard
   cannot evaluate either. Behind the `survival` feature (#440).
+- **Analytic FOCE/FOCEI gradients for time-varying covariates on ODE models** (#439).
+  An ODE model whose covariates change over time (per-event `WT`, `CRCL`, …) with
+  **bolus** dosing now gets the exact analytic outer gradient and the light `Dual1`
+  inner η-gradient instead of falling back to finite differences. The dual is seeded
+  on `(θ,η)` (`M = n_theta + n_eta`) and walked over a per-event event-driven
+  integration, mirroring the analytical TV-cov path and matching production's
+  `ode_predictions_event_driven` predictor bit-for-bit (validated against it + FD).
+  Combined with infusion / steady-state / reset / `init(...)`, TV-cov still falls
+  back to FD.
+- **Analytic gradients for per-CMT (multi-endpoint) ODE readouts** (#439). The
+  `[scaling] y[CMT=N] = <expr>` Form-C readout is now differentiated by the ODE
+  sensitivity provider — each endpoint's compiled output program is evaluated over
+  `Dual2` (outer) and `Dual1` (inner), dispatched per observation by its CMT — so
+  multi-analyte / PK-PD models (e.g. parent + metabolite, or PK + effect) get the
+  exact analytic FOCE/FOCEI gradient instead of falling back to finite differences;
+  `gradient = fd` is no longer required for these models. Validated against finite
+  differences of the production predictor.
+- **Analytic FOCE/FOCEI gradients for user-`[odes]` models** (#410). The ODE
+  sensitivity engine — an augmented `Dual2` RK45 that propagates `∂state/∂(θ,η)`
+  alongside the state — is now armed, so in-scope ODE models drive the exact
+  analytic outer gradient (and the Eq. 48 EBE predictor) instead of the prior
+  gradient-free path. The inner EBE loop likewise gets an exact η-gradient from a
+  lighter `Dual1` (gradient-only) walk — one integration per inner step in place of
+  finite differences' `2·n_eta+1`, so the EBE search is exact and faster. Scope: RHS-program models with an `ObsCmt` or simple Form-C
+  (`y = central/V1`) readout, bolus + finite infusion, bioavailability `F`, EVID
+  3/4 resets, `init(...)`, static covariates, a constant `obs_scale` divisor, and
+  LTBS (`log(DV) ~ …`) output transforms. Out-of-scope features (steady state,
+  estimated lagtime, IOV, `input_rate`, SDE, time-varying covariates, expression
+  `obs_scale`, modeled-`RATE` doses, `F` on a rate-defined infusion) fall back to
+  the existing path unchanged. Validated against finite differences of the
+  production predictor, reconverged FD of the FOCEI marginal, and a full-convergence
+  cross-check that an ODE fit reproduces the analytical (NONMEM-validated) twin's
+  estimates and standard errors.
 - **Analytic sensitivities for oral infusion** on the analytical 1-/2-/3-cpt
   models: a depot-bypass infusion into the central compartment (RATE>0 into cmt 2,
   #350) and a zero-order input into the oral depot (RATE>0 into cmt 1, #400) are
@@ -43,6 +86,14 @@ section of the SDLC for the versioning policy).
   gradient differentiates the scaled prediction `f / scale` exactly (quotient
   rule) instead of falling back to finite differences. Validated against finite
   differences of the production predictor and against a NONMEM reference (#367).
+- **Analytic sensitivities for inverse-Gaussian (`igd()`) absorption** on ODE
+  models: the built-in input-rate forcing is now evaluated over `Dual2` by the
+  analytic ODE sensitivity provider, so an `igd()` model drives exact FOCE/FOCEI/
+  Bayes gradients instead of falling back to finite differences (estimates
+  unchanged; gradients exact and cheaper). The forcing was lifted to a
+  `PkNum`-generic form; transit (`transit()`) still uses FD pending its own
+  `ln_gamma` `Dual2` rule. Validated by an analytic≡central-FD gradient parity
+  test in the default build (#430).
 
 ### Changed
 - **Documentation now builds as a Quarto website** using the shared ferx site
@@ -85,6 +136,18 @@ section of the SDLC for the versioning policy).
   no longer fall back to finite differences. The warning now fires only for model
   paths that still skip SS pre-equilibration (ODE models, or EVID=3/4 resets)
   (#379).
+
+### Performance
+- **Faster outer-gradient sensitivities for user-`[odes]` models with IIV-free
+  parameters** (#445). The augmented-`Dual2` RK45 now carries a second-order
+  Hessian only over the individual parameters that bear IIV (η), dropping the
+  block among the IIV-free (θ-only) parameters — which the FOCEI gradient never
+  reads, since it uses no `∂²f/∂θ²`. On a 2-compartment ODE with 2 of 4
+  individual parameters fixed, the per-subject sensitivity cost falls ≈2.2×; the
+  retained dual entries and the first-order chain (`df_deta`, `df_dtheta`) are
+  bit-for-bit, and the chained second-order outputs (`d2f_deta2`,
+  `d2f_deta_dtheta`) agree to ~1e-9 (the terms are identical but summed in a
+  different order). Models whose individual parameters all carry IIV are unaffected.
 
 ### Added
 - **Analytic sensitivities for dose lagtime (ALAG)** on analytical PK models: a

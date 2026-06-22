@@ -1,0 +1,141 @@
+# Sampling Importance Resampling (SIR)
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+SIR is an optional post-estimation step that provides non-parametric parameter uncertainty estimates. It produces 95% confidence intervals that are more robust than the asymptotic covariance matrix, particularly for models with:
+
+- Non-normal parameter distributions
+- Boundary estimates (parameters near constraints)
+- Small datasets where asymptotic assumptions may not hold
+
+## How It Works
+
+SIR uses the maximum likelihood estimates and their covariance matrix as a proposal distribution, then reweights samples based on the actual likelihood:
+
+1. **Sample**: Draw M parameter vectors from a multivariate Student-t distribution (default ν=5) centered on the ML estimates, using the estimation covariance matrix as the scale
+2. **Importance weighting**: For each sample, compute the objective function value (OFV) and calculate an importance weight based on the ratio of the true likelihood to the proposal density
+3. **Resample**: Draw m vectors (with replacement) proportional to the importance weights
+
+The resampled vectors approximate the true parameter uncertainty distribution. Confidence intervals are derived from their empirical percentiles.
+
+## Enabling SIR
+
+Add `sir = true` to the `[fit_options]` block. The covariance step must also be enabled (it provides the proposal distribution):
+
+```
+[fit_options]
+  method     = focei
+  covariance = true
+  sir        = true
+```
+
+## Options
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `sir` | `false` | Enable/disable SIR |
+| `sir_samples` | `1000` | Number of proposal samples (M). Higher values give more reliable weights but take longer |
+| `sir_resamples` | `250` | Number of resampled vectors (m). Must be less than `sir_samples` |
+| `sir_seed` | `12345` | RNG seed for reproducibility |
+| `sir_keep_samples` | `false` | Retain the resampled parameter vectors on `FitResult.sir_resamples_packed`. Required for `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`. Adds `n_resamples × n_packed × 8` bytes to the result |
+| `sir_df` | `5.0` | Degrees of freedom ν for the Student-t proposal. Heavier tails (small ν) improve ESS for parameters near boundaries such as omega variances. Set to a large value (e.g. 100) for near-normal behaviour. Dosne (2017) recommends ν=5. |
+
+## Output
+
+SIR adds the following to the estimation output:
+
+- **95% CI** for each theta, omega, and sigma parameter (2.5th and 97.5th percentiles)
+- **Effective sample size (ESS)**: a diagnostic indicating how well the proposal distribution matches the true uncertainty. ESS close to M indicates a good match; ESS much less than m suggests the proposal is a poor fit
+
+## Diagnostics
+
+The effective sample size (ESS) is the primary diagnostic:
+
+- **ESS > m** (resamples): excellent — the proposal distribution is well-matched
+- **ESS between 100 and m**: adequate for most purposes
+- **ESS < 100**: the proposal may be a poor fit; consider a different estimation method or increasing `sir_samples`
+
+A well-behaved proposal has an ESS that **scales linearly with `sir_samples`** at a roughly constant efficiency, and **confidence intervals that are stable as `sir_samples` grows**. Degenerate SIR shows the opposite: ESS plateaus or collapses toward a handful of dominant weights, and CIs jump between runs.
+
+### Benchmark: warfarin (bundled `data/warfarin.csv`, 10 subjects)
+
+FOCE fit, proposal = ML covariance matrix, default Student-t (ν=5). ESS scales linearly at ~28–31% efficiency, and the theta CIs are essentially size-invariant — the signature of a healthy proposal:
+
+| `sir_samples` | ESS | efficiency |
+|---|---|---|
+| 1000 | 310 | 31% |
+| 2000 | 587 | 29% |
+| 4000 | 1097 | 27% |
+
+95% CIs (2000-sample run) bracket the point estimates:
+
+| Param | Estimate | SIR 95% CI |
+|---|---|---|
+| TVCL | 0.133 | [0.118, 0.149] |
+| TVV | 7.69 | [7.18, 8.37] |
+| TVKA | 0.758 | [0.52, 1.14] |
+| PROP_ERR | 0.0106 | [0.0091, 0.0125] |
+
+The full fit + SIR runs in ~0.1s.
+
+## Computational Cost
+
+SIR evaluates the inner loop (EBE optimization) for each of the M proposal samples. With the default M=1000, this is roughly 3-10x the cost of the estimation step itself. The computation is parallelized across samples and warm-started from the ML EBEs to minimize runtime.
+
+The resampling step itself is negligible.
+
+## Example
+
+```
+[fit_options]
+  method        = focei
+  covariance    = true
+  sir           = true
+  sir_samples   = 1000
+  sir_resamples = 250
+  sir_seed      = 42
+```
+
+## Running SIR after a fit (`run_sir`)
+
+SIR can also be run as a standalone step against a `FitResult` that was produced earlier — useful when the original fit was expensive and you want to add SIR without re-estimating, or when working with a fit loaded from a `.fitrx` bundle.
+
+```rust
+use ferx_core::{fit_from_files, run_sir, FitOptions};
+
+let mut opts = FitOptions::default();
+opts.run_covariance_step = true;          // SIR needs the cov matrix
+let fit = fit_from_files("model.ferx", "data.csv", None, Some(opts.clone()))?;
+
+opts.sir_samples   = 2000;
+opts.sir_resamples = 500;
+let fit_with_sir = run_sir(&fit, None, None, &opts)?;
+```
+
+`run_sir` re-uses the fit's covariance matrix as the SIR proposal and the per-subject EBEs from `fit.subjects` to warm-start the inner loop. The returned `FitResult` is a clone of `fit` with `sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ess`, and (when `sir_keep_samples = true`) `sir_resamples_packed` populated.
+
+### Caller-supplied vs. re-read inputs
+
+The second and third arguments to `run_sir` are `Option<&CompiledModel>` and `Option<&Population>`:
+
+- **Supplied (`Some(...)`)**: used as-is. No hash check happens — caller owns verification.
+- **`None`**: `run_sir` re-reads from `fit.model_path` / `fit.data_path` (set automatically by `fit_from_files`). If `fit.model_hash` / `fit.data_hash` is set, the file is hashed and compared against the stored digest. **A mismatch is a hard error** — the whole point of `run_sir` is to refuse SIR against stale source.
+
+This means `run_sir(&fit, None, None, &opts)` "just works" after `fit_from_files`, with built-in integrity checking. For in-memory workflows where `fit()` was called directly (no paths recorded), pass the model and population explicitly.
+
+### Hash storage on `FitResult`
+
+When you go through `fit_from_files` or `run_model_with_data`, the resulting `FitResult` carries:
+
+| Field | Description |
+|-------|-------------|
+| `model_path: Option<String>` | The `.ferx` path as supplied (no canonicalisation) |
+| `data_path:  Option<String>` | The data CSV path as supplied |
+| `model_hash: Option<String>` | SHA-256 hex digest of the model file at fit time |
+| `data_hash:  Option<String>` | SHA-256 hex digest of the data file at fit time |
+
+These fields round-trip through `.fitrx` save/load, so a loaded fit can still be SIR'd against the original files (provided they're still on disk and unchanged).
+
+## Reference
+
+Dosne A-G, Bergstrand M, Karlsson MO. "Improving the estimation of parameter uncertainty distributions in nonlinear mixed effects models using sampling importance resampling." *J Pharmacokinet Pharmacodyn*. 2017;44(6):539-562. doi:10.1007/s10928-017-9542-0

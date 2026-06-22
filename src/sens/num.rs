@@ -4,7 +4,7 @@
 //! source is monomorphised for each numeric type.
 
 use super::dual1::Dual1;
-use super::dual2::Dual2;
+use super::dual_mixed::DualMixed;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 pub trait PkNum:
@@ -160,14 +160,14 @@ impl<const N: usize> PkNum for Dual1<N> {
     }
 }
 
-impl<const N: usize> PkNum for Dual2<N> {
+impl<const NA: usize, const N: usize> PkNum for DualMixed<NA, N> {
     #[inline]
     fn from_f64(x: f64) -> Self {
-        Dual2::constant(x)
+        DualMixed::constant(x)
     }
     #[inline]
     fn var(x: f64, dim: usize) -> Self {
-        Dual2::var(x, dim)
+        DualMixed::var(x, dim)
     }
     #[inline]
     fn val(self) -> f64 {
@@ -175,44 +175,44 @@ impl<const N: usize> PkNum for Dual2<N> {
     }
     #[inline]
     fn exp(self) -> Self {
-        Dual2::exp(self)
+        DualMixed::exp(self)
     }
     #[inline]
     fn ln(self) -> Self {
-        Dual2::ln(self)
+        DualMixed::ln(self)
     }
     #[inline]
     fn sqrt(self) -> Self {
-        Dual2::sqrt(self)
+        DualMixed::sqrt(self)
     }
     #[inline]
     fn pow(self, e: Self) -> Self {
-        Dual2::powd(self, e)
+        DualMixed::powd(self, e)
     }
     #[inline]
     fn abs(self) -> Self {
-        Dual2::abs(self)
+        DualMixed::abs(self)
     }
     #[inline]
     fn inv_logit(self) -> Self {
-        Dual2::inv_logit(self)
+        DualMixed::inv_logit(self)
     }
     #[inline]
     fn logit(self) -> Self {
-        Dual2::logit(self)
+        DualMixed::logit(self)
     }
     #[inline]
     fn cos(self) -> Self {
-        Dual2::cos(self)
+        DualMixed::cos(self)
     }
     #[inline]
     fn acos(self) -> Self {
-        Dual2::acos(self)
+        DualMixed::acos(self)
     }
     #[inline]
     fn guard_floor(self, lo: f64) -> Self {
         if self.value < lo {
-            Dual2::constant(lo)
+            DualMixed::constant(lo)
         } else {
             self
         }
@@ -224,6 +224,7 @@ mod tests {
     use super::*;
     use crate::sens::dual1::Dual1;
     use crate::sens::dual2::Dual2;
+    use crate::sens::dual_mixed::DualMixed;
 
     /// Exercise every `PkNum` method on a value once, so the per-impl delegators
     /// (and the underlying `Dual1`/`Dual2` ops they call) are covered. `0.7` is a
@@ -251,5 +252,6 @@ mod tests {
         exercise::<f64>(0.7);
         exercise::<Dual1<1>>(Dual1::var(0.7, 0));
         exercise::<Dual2<1>>(Dual2::var(0.7, 0));
+        exercise::<DualMixed<1, 2>>(DualMixed::var(0.7, 0));
     }
 }

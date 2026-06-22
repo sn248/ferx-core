@@ -29,6 +29,7 @@
 
 use super::dual1::Dual1;
 use super::dual2::Dual2;
+use super::dual_mixed::DualMixed;
 use super::provider::{ObsGrad, ObsSens, SubjectSens};
 use crate::ode::predictions::OdeReadout;
 use crate::ode::solver::solve_ode_g;
@@ -254,17 +255,113 @@ pub fn ode_subject_sensitivities(
     if !ode_subject_supported(model, subject) {
         return None;
     }
-    // Dispatch on the individual-parameter count so the dual width is right-sized.
-    macro_rules! dispatch {
-        ($($n:literal),+) => {
-            match model.pk_indices.len() {
-                $($n => run_subject::<$n>(model, subject, theta, eta),)+
-                _ => None,
+    // PK params at (θ, η). The runtime lagtime short-circuit runs *before* the
+    // (more expensive) param-derivative eval: a nonzero lagtime isn't supported over
+    // the dual loop, so a lagtime-bearing subject declines here instead of computing
+    // `pd` only to discard it downstream (#445 review #8). `pk` and `pd` are each
+    // evaluated once and threaded into the drivers, so neither recomputes them.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    if pk.values[PK_IDX_LAGTIME].abs() > 1e-12 {
+        return None;
+    }
+    // Individual-parameter η/θ derivatives (cheap: one dual eval, no integration).
+    // Besides feeding the chain, the `∂p/∂η` rows tell us which individual parameters
+    // carry IIV, which decides the dual's Hessian width.
+    let pd = param_derivatives(model, subject, theta, eta)?;
+    let n_indiv = model.pk_indices.len();
+
+    // IIV-bearing parameters: those with any nonzero `∂p/∂η`. The η/θ chain reads
+    // `∂²f/∂p_i∂p_j` only when at least one of `i, j` is IIV-bearing (FOCEI never
+    // uses `∂²f/∂θ²`), so seeding the IIV-bearing parameters as the leading `na`
+    // dual axes lets the second-order block among the IIV-free axes be dropped —
+    // the per-step Hessian work falls from `n²` to `na·n` (issue #445). All buffers
+    // are stack arrays bounded by `MAX_ODE_SENS_DIM` (`n_indiv ≤ 12`, enforced by
+    // `ode_subject_supported`) — no per-subject heap allocation (#448 review #6).
+    let mut iiv_buf = [0usize; MAX_ODE_SENS_DIM];
+    let mut is_iiv = [false; MAX_ODE_SENS_DIM];
+    let mut na = 0usize;
+    for i in 0..n_indiv {
+        if pd.dp_deta[i].iter().any(|&v| v != 0.0) {
+            iiv_buf[na] = i;
+            is_iiv[i] = true;
+            na += 1;
+        }
+    }
+    let iiv = &iiv_buf[..na];
+
+    // Axis permutation: IIV-bearing parameters take axes `0..na` (full Hessian rows);
+    // the IIV-free parameters take `na..n_indiv` (gradient only).
+    let mut axis_buf = [0usize; MAX_ODE_SENS_DIM];
+    let mut next = 0usize;
+    for &i in iiv {
+        axis_buf[i] = next;
+        next += 1;
+    }
+    for i in 0..n_indiv {
+        if !is_iiv[i] {
+            axis_buf[i] = next;
+            next += 1;
+        }
+    }
+    let axis_of = &axis_buf[..n_indiv];
+
+    macro_rules! full {
+        ($n:literal) => {
+            run_subject::<$n>(model, subject, theta, eta, &pk.values, &pd)
+        };
+    }
+    macro_rules! mixed {
+        ($na:literal, $n:literal) => {
+            run_subject_mixed::<$na, $n>(model, subject, theta, eta, &pk.values, &pd, axis_of, iiv)
+        };
+    }
+    // For each individual-parameter count `n`, route to the mixed-order dual for
+    // every `0 < na < n` (the arm lists below enumerate `na` up to `MIXED_NA_CAP =
+    // n_max − 1`, so all are covered); the full `Dual2<n>` path handles only
+    // `na == n` (no IIV-free block to drop) and `na == 0` (no IIV) via the `_` arm.
+    macro_rules! by_n {
+        ($n:literal; $($na:literal),*) => {
+            match na {
+                $( $na => mixed!($na, $n), )*
+                _ => full!($n),
             }
         };
     }
-    dispatch!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+    match n_indiv {
+        1 => full!(1),
+        2 => by_n!(2; 1),
+        3 => by_n!(3; 1, 2),
+        4 => by_n!(4; 1, 2, 3),
+        5 => by_n!(5; 1, 2, 3, 4),
+        6 => by_n!(6; 1, 2, 3, 4, 5),
+        7 => by_n!(7; 1, 2, 3, 4, 5, 6),
+        8 => by_n!(8; 1, 2, 3, 4, 5, 6, 7),
+        9 => by_n!(9; 1, 2, 3, 4, 5, 6, 7, 8),
+        10 => by_n!(10; 1, 2, 3, 4, 5, 6, 7, 8, 9),
+        11 => by_n!(11; 1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+        12 => by_n!(12; 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11),
+        _ => None,
+    }
 }
+
+/// Largest IIV-bearing-parameter count (`na`) for which the mixed-order dual
+/// ([`DualMixed`](crate::sens::dual_mixed::DualMixed)) is monomorphised. Subjects
+/// whose model has more than this many IIV-bearing individual parameters fall back
+/// to the full `Dual2` path — correct, just not accelerated. Bounds the `(na, n)`
+/// monomorphisation count; raise it only if models with many IIV parameters become
+/// a measured bottleneck. Set to `MAX_ODE_SENS_DIM - 1` so that **every** `0 < na <
+/// n` is specialised (the largest possible `na` is `n - 1 ≤ 11`): no in-scope model
+/// silently falls back to the full `Dual2` path for being over the cap — only `na ==
+/// n` (no IIV-free block to drop) and `na == 0` (no IIV) take the full path, both
+/// correctly (#445 review #6). The cost is the `(na, n)` monomorphisation count
+/// (`Σ min(n-1, cap)` over `n ≤ MAX_ODE_SENS_DIM`); lower it if compile time bites.
+pub const MIXED_NA_CAP: usize = MAX_ODE_SENS_DIM - 1;
+
+// The `by_n!` arm lists in `ode_subject_sensitivities` enumerate `na` up to
+// `MIXED_NA_CAP` explicitly (a macro can't iterate a const). This tripwire fails the
+// build if the const is changed without the arms being updated to match — the cap
+// was previously `#[cfg(doc)]`-only and could silently drift (#445 review #4).
+const _: () = assert!(MIXED_NA_CAP == 11);
 
 /// Light **inner** η-gradient for an ODE model: per-observation `(f, ∂f/∂η)` via a
 /// `Dual1` (gradient-only) augmented RK45 — the ODE counterpart of the analytical
@@ -432,43 +529,64 @@ pub(crate) fn pd_from_program<const M: usize>(
     }
 }
 
-/// The `Dual2<N>` initial state from a model's `init(...)` directives, seeding
-/// each compartment's value **and its PK-parameter derivatives** by central FD of
-/// the f64 `init_fn` over the differentiated PK slots. `init_fn` is a cheap
+/// The `DualMixed<NA, N>` initial state from a model's `init(...)` directives,
+/// seeding each compartment's value **and its PK-parameter derivatives** by central
+/// FD of the f64 `init_fn` over the differentiated PK slots. `init_fn` is a cheap
 /// HashMap eval (no integration), so the FD cost is negligible.
-fn dual_init_state<const N: usize>(
+///
+/// Individual parameter `i` seeds dual axis `axis_of[i]` — identity (`= i`) for the
+/// full `Dual2<N>` path (`NA == N`, `axis_of == None`), or the IIV-leading
+/// permutation for the mixed path (#445). The first-order block fills the gradient
+/// at every axis; the second-order block fills only the retained Hessian rows
+/// (axis `< NA`), and skips the FD evaluations whose result would be dropped.
+fn dual_init_state<const NA: usize, const N: usize>(
     init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
     pk: &[f64],
     pk_indices: &[usize],
     n_states: usize,
-) -> Vec<Dual2<N>> {
+    axis_of: Option<&[usize]>,
+) -> Vec<DualMixed<NA, N>> {
+    let ax = |i: usize| axis_of.map_or(i, |p| p[i]);
     let base = init_fn(pk);
     let he = 1e-6;
     let h2 = 1e-4;
-    let mut out: Vec<Dual2<N>> = (0..n_states)
-        .map(|s| Dual2::constant(base.get(s).copied().unwrap_or(0.0)))
+    let mut out: Vec<DualMixed<NA, N>> = (0..n_states)
+        .map(|s| DualMixed::constant(base.get(s).copied().unwrap_or(0.0)))
         .collect();
 
+    // First order: gradient at every parameter's axis.
     for (i, &si) in pk_indices.iter().enumerate() {
+        let ai = ax(i);
         let mut pp = pk.to_vec();
         pp[si] += he;
         let mut pm = pk.to_vec();
         pm[si] -= he;
         let (up, dn) = (init_fn(&pp), init_fn(&pm));
         for s in 0..n_states {
-            out[s].grad[i] = (up[s] - dn[s]) / (2.0 * he);
+            out[s].grad[ai] = (up[s] - dn[s]) / (2.0 * he);
         }
     }
+    // Second order: only the retained Hessian rows (axis < NA).
     for (i, &si) in pk_indices.iter().enumerate() {
-        let mut pp = pk.to_vec();
-        pp[si] += h2;
-        let mut pm = pk.to_vec();
-        pm[si] -= h2;
-        let (up, dn) = (init_fn(&pp), init_fn(&pm));
-        for s in 0..n_states {
-            out[s].hess[i][i] = (up[s] - 2.0 * base[s] + dn[s]) / (h2 * h2);
+        let ai = ax(i);
+        // Diagonal — skip the FD evaluation entirely when this axis carries no
+        // Hessian row (an IIV-free parameter in the mixed path) (#448 review #8).
+        if ai < NA {
+            let mut pp = pk.to_vec();
+            pp[si] += h2;
+            let mut pm = pk.to_vec();
+            pm[si] -= h2;
+            let (up, dn) = (init_fn(&pp), init_fn(&pm));
+            for s in 0..n_states {
+                out[s].hess[ai][ai] = (up[s] - 2.0 * base[s] + dn[s]) / (h2 * h2);
+            }
         }
         for (j, &sj) in pk_indices.iter().enumerate().skip(i + 1) {
+            let aj = ax(j);
+            // Both axes in the dropped block — no Hessian row to fill.
+            if ai >= NA && aj >= NA {
+                continue;
+            }
             let mut a = pk.to_vec();
             a[si] += h2;
             a[sj] += h2;
@@ -484,8 +602,12 @@ fn dual_init_state<const N: usize>(
             let (va, vb, vc, vd) = (init_fn(&a), init_fn(&b), init_fn(&c), init_fn(&d));
             for s in 0..n_states {
                 let v = (va[s] - vb[s] - vc[s] + vd[s]) / (4.0 * h2 * h2);
-                out[s].hess[i][j] = v;
-                out[s].hess[j][i] = v;
+                if ai < NA {
+                    out[s].hess[ai][aj] = v;
+                }
+                if aj < NA {
+                    out[s].hess[aj][ai] = v;
+                }
             }
         }
     }
@@ -610,16 +732,20 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
     subject: &Subject,
     pk_values: &[f64],
     init_state: &[T],
+    axis_of: Option<&[usize]>,
 ) -> Option<Vec<T>> {
     let ode = model.ode_spec.as_ref()?;
     let program = ode.rhs_program.as_ref()?;
     let opts = ode.solver_opts;
 
-    // Seed the flat PK-parameter vector: individual parameter i (PK slot
-    // `pk_indices[i]`) carries dual dimension i; everything else is constant.
+    // Seed the flat PK-parameter vector: individual parameter `i` (PK slot
+    // `pk_indices[i]`) carries dual axis `axis_of[i]` — identity (`= i`) for the full
+    // `Dual2`/`Dual1` paths, or the IIV-leading permutation for the mixed-order
+    // `DualMixed` path (#445); everything else is constant.
     let mut params_dual: Vec<T> = pk_values.iter().map(|&v| T::from_f64(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
-        params_dual[slot] = T::var(pk_values[slot], i);
+        let ax = axis_of.map_or(i, |p| p[i]);
+        params_dual[slot] = T::var(pk_values[slot], ax);
     }
 
     // Lagtime (a nonzero dose-time shift) is not yet supported over the dual loop.
@@ -684,26 +810,28 @@ fn run_subject<const N: usize>(
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
+    pk_values: &[f64],
+    pd: &ParamDerivs,
 ) -> Option<SubjectSens> {
     let ode = model.ode_spec.as_ref()?;
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
 
-    // PK parameter values at (θ, η).
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-
-    // Individual-parameter η/θ derivatives (analytical, over Dual2 seeded on θ/η).
-    let pd = param_derivatives(model, subject, theta, eta)?;
+    // `pk_values` (PK params at (θ, η)) and `pd` (∂p/∂(θ,η) + 2nd order) are both
+    // supplied by the dispatcher — already evaluated there for the lagtime check and
+    // the IIV-axis classification — so neither is recomputed here (#445 review #8).
 
     // Initial state from `init(...)` (dual-seeded by FD of init_fn, value + grad +
     // Hessian); zeros when none is declared. Re-applied at every EVID 3/4 reset.
     let init_state: Vec<Dual2<N>> = match ode.init_fn.as_ref() {
-        Some(f) => dual_init_state::<N>(f.as_ref(), &pk.values, &model.pk_indices, ode.n_states),
+        Some(f) => {
+            dual_init_state::<N, N>(f.as_ref(), pk_values, &model.pk_indices, ode.n_states, None)
+        }
         None => vec![Dual2::constant(0.0); ode.n_states],
     };
 
     // Seed + integrate the Dual2 state and apply the readout/transforms.
-    let preds = integrate_subject_duals::<Dual2<N>>(model, subject, &pk.values, &init_state)?;
+    let preds = integrate_subject_duals::<Dual2<N>>(model, subject, pk_values, &init_state, None)?;
 
     // Chain ∂f/∂p, ∂²f/∂p² (exact, from the dual) with ∂p/∂η, ∂p/∂θ (general,
     // from `param_derivatives`) → ∂f/∂η, ∂²f/∂η², ∂f/∂θ, ∂²f/∂η∂θ:
@@ -766,6 +894,128 @@ fn run_subject<const N: usize>(
     Some(SubjectSens { obs: out })
 }
 
+/// Mixed-order variant of [`run_subject`] for models with IIV-free individual
+/// parameters (issue #445). The integrated dual carries a full `N`-gradient but a
+/// Hessian only over the `NA` IIV-bearing parameters, which are seeded as the
+/// leading dual axes — `axis_of[i]` is the dual axis of individual parameter `i`
+/// (IIV-bearing parameters occupy `0..NA`), and `iiv` lists the IIV-bearing `i`
+/// (`iiv.len() == NA`). The result is numerically identical to `run_subject`: the
+/// only entries skipped are the `∂²f/∂p_i∂p_j` with both `i, j` IIV-free, which the
+/// η/θ chain never reads (FOCEI uses no `∂²f/∂θ²`).
+#[allow(clippy::too_many_arguments)]
+fn run_subject_mixed<const NA: usize, const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    pk_values: &[f64],
+    pd: &ParamDerivs,
+    axis_of: &[usize],
+    iiv: &[usize],
+) -> Option<SubjectSens> {
+    let ode = model.ode_spec.as_ref()?;
+    let n_eta = model.n_eta;
+    let n_theta = model.n_theta;
+
+    // Contract from the dispatcher: the `NA` IIV-bearing parameters occupy dual axes
+    // `0..NA` (`iiv.len() == NA`, `axis_of[i] < NA` for `i` in `iiv`). The chain's
+    // `h[axis_of[i]][..]` access relies on it (#448 review #5).
+    debug_assert!(
+        iiv.len() == NA && iiv.iter().all(|&i| axis_of[i] < NA),
+        "run_subject_mixed: the NA IIV-bearing parameters must occupy dual axes 0..NA"
+    );
+
+    // `pk_values` / `pd` are supplied by the dispatcher (already evaluated there for
+    // the lagtime check + IIV classification). Initial state with the axis-mapped
+    // seeding (IIV params on the leading Hessian rows).
+    let init_state: Vec<DualMixed<NA, N>> = match ode.init_fn.as_ref() {
+        Some(f) => dual_init_state::<NA, N>(
+            f.as_ref(),
+            pk_values,
+            &model.pk_indices,
+            ode.n_states,
+            Some(axis_of),
+        ),
+        None => vec![DualMixed::constant(0.0); ode.n_states],
+    };
+
+    // Same shared seed → integrate → readout driver as `run_subject`/`run_subject_eta`,
+    // with the IIV-leading axis permutation — no forked copy (#448 review #1).
+    let preds = integrate_subject_duals::<DualMixed<NA, N>>(
+        model,
+        subject,
+        pk_values,
+        &init_state,
+        Some(axis_of),
+    )?;
+
+    let n_indiv = model.pk_indices.len();
+    let mut out = Vec::with_capacity(subject.obs_times.len());
+    for fd in &preds {
+        let g = &fd.grad; // ∂f/∂p_a, indexed by dual axis
+        let h = &fd.hess; // ∂²f/∂p_a∂p_b: rows = IIV axes (0..NA), cols = all axes
+
+        let mut df_deta = vec![0.0; n_eta];
+        let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
+        let mut df_dtheta = vec![0.0; n_theta];
+        let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
+
+        // First order — every parameter contributes (the gradient spans all axes):
+        //   ∂f/∂η_k = Σ_i g[axis_i]·(∂p_i/∂η_k),  ∂f/∂θ_m likewise.
+        for i in 0..n_indiv {
+            let ai = axis_of[i];
+            for k in 0..n_eta {
+                df_deta[k] += g[ai] * pd.dp_deta[i][k];
+            }
+            for m in 0..n_theta {
+                df_dtheta[m] += g[ai] * pd.dp_dtheta[i][m];
+            }
+        }
+        // Second-order `g·∂²p` terms — all parameters (these read only the gradient,
+        // never a Hessian row, so they are safe for IIV-free parameters too).
+        for i in 0..n_indiv {
+            let ai = axis_of[i];
+            for k in 0..n_eta {
+                for l in 0..n_eta {
+                    d2f_deta2[k * n_eta + l] += g[ai] * pd.d2p_deta2[i][k][l];
+                }
+                for m in 0..n_theta {
+                    d2f_deta_dtheta[k * n_theta + m] += g[ai] * pd.d2p_detadtheta[i][k][m];
+                }
+            }
+        }
+        // Second-order `h·∂p·∂p` terms — the row index `i` always carries a `∂p/∂η`
+        // factor, so it ranges only over the IIV-bearing parameters (`iiv`), whose
+        // axes are `< NA` and therefore have a Hessian row in `h`. The column index
+        // `j` ranges over all parameters (`h` has all `N` columns).
+        for &i in iiv {
+            let ai = axis_of[i];
+            for j in 0..n_indiv {
+                let hij = h[ai][axis_of[j]];
+                for k in 0..n_eta {
+                    for l in 0..n_eta {
+                        d2f_deta2[k * n_eta + l] += hij * pd.dp_deta[i][k] * pd.dp_deta[j][l];
+                    }
+                    for m in 0..n_theta {
+                        d2f_deta_dtheta[k * n_theta + m] +=
+                            hij * pd.dp_deta[i][k] * pd.dp_dtheta[j][m];
+                    }
+                }
+            }
+        }
+
+        out.push(ObsSens {
+            f: fd.value,
+            df_deta,
+            d2f_deta2,
+            df_dtheta,
+            d2f_deta_dtheta,
+        });
+    }
+
+    Some(SubjectSens { obs: out })
+}
+
 /// Light `Dual1<N>` driver: integrate the state carrying only first-order
 /// `∂state/∂pk`, apply the readout + output transforms, and chain `∂f/∂pk · ∂pk/∂η`
 /// → `∂f/∂η` (η only — no θ, no Hessian). The ODE counterpart of
@@ -792,7 +1042,7 @@ fn run_subject_eta<const N: usize>(
     };
 
     // Seed + integrate the Dual1 state and apply the readout/transforms.
-    let preds = integrate_subject_duals::<Dual1<N>>(model, subject, &pk.values, &init_state)?;
+    let preds = integrate_subject_duals::<Dual1<N>>(model, subject, &pk.values, &init_state, None)?;
 
     let n_indiv = model.pk_indices.len();
     let mut out = Vec::with_capacity(preds.len());
@@ -1994,6 +2244,194 @@ mod tests {
     /// Covariate models: the provider must fold the subject's covariate-adjusted
     /// typical values (here WT on CL/V1) into both `f` and `∂f/∂θ`. Validated
     /// against the production predictor, which folds WT the same way.
+    // Same 2-cpt ODE as `TWOCPT_ODE`, but the individual parameters are declared
+    // with an IIV-free parameter *first* (Q, then CL, then V2, then V1). This forces
+    // the mixed-order axis permutation to be non-trivial (`axis_of != identity`):
+    // the IIV-bearing CL/V1 must be relocated to the leading dual axes 0/1.
+    const TWOCPT_ODE_REORDER: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  Q  = TVQ
+  CL = TVCL * exp(ETA_CL)
+  V2 = TVV2
+  V1 = TVV1 * exp(ETA_V1)
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// The mixed-order dual (`run_subject_mixed`, dropping the IIV-free Hessian
+    /// block) must reproduce the full `Dual2` provider (`run_subject`) on every
+    /// `ObsSens` field. Covers both the identity-permutation case (`TWOCPT_ODE`:
+    /// CL/V1 declared first) and a non-trivial permutation (`TWOCPT_ODE_REORDER`:
+    /// CL/V1 relocated to the leading axes). Issue #445.
+    #[test]
+    fn ode_mixed_matches_full_dual2() {
+        for src in [TWOCPT_ODE, TWOCPT_ODE_REORDER] {
+            let model = parse_model_string(src).expect("parse");
+            let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+            let theta = vec![4.0, 12.0, 2.0, 25.0];
+            let eta = vec![0.12, -0.08];
+
+            // Full reference: force the 4-axis `Dual2` path directly.
+            let pd = param_derivatives(&model, &subject, &theta, &eta).expect("pd");
+            let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates);
+            let full =
+                run_subject::<4>(&model, &subject, &theta, &eta, &pk.values, &pd).expect("full");
+            // Mixed path via the dispatcher: na = 2 (CL, V1) < n = 4 routes to
+            // `run_subject_mixed::<2, 4>`, dropping the Q/V2 Hessian block.
+            let mixed = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("mixed");
+
+            assert_eq!(full.obs.len(), mixed.obs.len());
+            let close = |a: &[f64], b: &[f64], what: &str| {
+                assert_eq!(a.len(), b.len(), "{what} length");
+                for (x, y) in a.iter().zip(b) {
+                    approx::assert_relative_eq!(x, y, max_relative = 1e-9, epsilon = 1e-12);
+                }
+            };
+            for (fo, mo) in full.obs.iter().zip(&mixed.obs) {
+                approx::assert_relative_eq!(fo.f, mo.f, max_relative = 1e-12);
+                close(&fo.df_deta, &mo.df_deta, "df_deta");
+                close(&fo.d2f_deta2, &mo.d2f_deta2, "d2f_deta2");
+                close(&fo.df_dtheta, &mo.df_dtheta, "df_dtheta");
+                close(&fo.d2f_deta_dtheta, &mo.d2f_deta_dtheta, "d2f_deta_dtheta");
+            }
+        }
+    }
+
+    /// The mixed-order dual must reproduce the full `Dual2` provider for an
+    /// **`init(...)`-bearing** model routed through the mixed path (`na < n`), which
+    /// exercises the axis-mapped FD initial-state seeding in `dual_init_state` — the
+    /// one new numerical path the identity/reorder parity test above never hits (its
+    /// models have no `init` block) (#445 review #1). Here only `CL` carries IIV, so
+    /// `na = 1 < n = 3` (`V` and `KA` are IIV-free): `init(central) = 1000/V` seeds an
+    /// IIV-free gradient-only axis, and the two IIV-free parameters exercise both the
+    /// skipped diagonal (#448 review #8) and the both-axes-dropped cross-term
+    /// `continue` in the second-order FD seeding (#448 review #4).
+    #[test]
+    fn ode_mixed_init_matches_full_dual2() {
+        const INIT_ODE_MIXED: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVKA(1.0, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  init(central) = 1000.0 / V
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - CL/V * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(INIT_ODE_MIXED).expect("parse");
+        assert_eq!(model.n_eta, 1);
+        assert_eq!(model.pk_indices.len(), 3);
+        let mut subject = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        subject.doses = vec![]; // no dose; the `init(...)` baseline is the sole input.
+        let theta = vec![1.0, 20.0, 1.0];
+        let eta = vec![0.1];
+
+        let pd = param_derivatives(&model, &subject, &theta, &eta).expect("pd");
+        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates);
+        let full = run_subject::<3>(&model, &subject, &theta, &eta, &pk.values, &pd).expect("full");
+        // na = 1 (CL) < n = 3 → run_subject_mixed::<1, 3> (2 IIV-free params).
+        let mixed = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("mixed");
+
+        assert_eq!(full.obs.len(), mixed.obs.len());
+        for (fo, mo) in full.obs.iter().zip(&mixed.obs) {
+            approx::assert_relative_eq!(fo.f, mo.f, max_relative = 1e-12, epsilon = 1e-12);
+            for (a, b) in fo.df_deta.iter().zip(&mo.df_deta) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-12);
+            }
+            for (a, b) in fo.d2f_deta2.iter().zip(&mo.d2f_deta2) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-12);
+            }
+            for (a, b) in fo.df_dtheta.iter().zip(&mo.df_dtheta) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-12);
+            }
+            for (a, b) in fo.d2f_deta_dtheta.iter().zip(&mo.d2f_deta_dtheta) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-12);
+            }
+        }
+    }
+
+    /// Micro-benchmark: outer-gradient sensitivities via the full `Dual2<4>` path
+    /// vs the mixed `DualMixed<2, 4>` path (Q/V2 Hessian block dropped) on the
+    /// 2-cpt ODE. Reports ns/call and the speedup. Run with
+    /// `cargo test --release -- --ignored --nocapture bench_mixed_vs_full`.
+    #[test]
+    #[ignore = "micro-benchmark; run with --release --ignored --nocapture"]
+    fn bench_mixed_vs_full() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let model = parse_model_string(TWOCPT_ODE).expect("parse");
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = vec![4.0, 12.0, 2.0, 25.0];
+        let eta = vec![0.12, -0.08];
+        let pd = param_derivatives(&model, &subject, &theta, &eta).expect("pd");
+        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates);
+        let iiv = vec![0usize, 1]; // CL, V1
+        let axis_of = vec![0usize, 1, 2, 3]; // identity (IIV declared first)
+
+        let iters = 50_000;
+        // Warm up.
+        for _ in 0..1000 {
+            black_box(run_subject::<4>(
+                &model, &subject, &theta, &eta, &pk.values, &pd,
+            ));
+        }
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            black_box(run_subject::<4>(
+                &model, &subject, &theta, &eta, &pk.values, &pd,
+            ));
+        }
+        let full = t0.elapsed();
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            black_box(run_subject_mixed::<2, 4>(
+                &model, &subject, &theta, &eta, &pk.values, &pd, &axis_of, &iiv,
+            ));
+        }
+        let mixed = t1.elapsed();
+        let fns = full.as_nanos() as f64 / iters as f64;
+        let mns = mixed.as_nanos() as f64 / iters as f64;
+        eprintln!("full  Dual2<4>      = {fns:8.1} ns/call");
+        eprintln!("mixed DualMixed<2,4> = {mns:8.1} ns/call");
+        eprintln!(
+            "speedup = {:.2}x  ({:.0}% faster)",
+            fns / mns,
+            100.0 * (fns - mns) / fns
+        );
+    }
+
     #[test]
     fn ode_provider_2cpt_covariate_matches_production() {
         let model = parse_model_string(TWOCPT_ODE_COV).expect("parse");

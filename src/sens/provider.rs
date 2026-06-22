@@ -1267,7 +1267,6 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
 /// PK-param `Dual1` seeded on η (`∂p/∂η_k` on axis `k`), the event-driven walk over
 /// `Dual1<N>`, and `∂conc/∂η` read straight into `ObsGrad`.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn run_obs_grad_tvcov<const N: usize>(
     model: &CompiledModel,
     subject: &Subject,

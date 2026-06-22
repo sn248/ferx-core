@@ -255,9 +255,18 @@ pub fn ode_subject_sensitivities(
     if !ode_subject_supported(model, subject) {
         return None;
     }
-    // Individual-parameter η/θ derivatives — computed once here (cheap: one dual
-    // eval, no integration). Besides feeding the chain, the `∂p/∂η` rows tell us
-    // which individual parameters carry IIV, which decides the dual's Hessian width.
+    // PK params at (θ, η). The runtime lagtime short-circuit runs *before* the
+    // (more expensive) param-derivative eval: a nonzero lagtime isn't supported over
+    // the dual loop, so a lagtime-bearing subject declines here instead of computing
+    // `pd` only to discard it downstream (#445 review #8). `pk` and `pd` are each
+    // evaluated once and threaded into the drivers, so neither recomputes them.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    if pk.values[PK_IDX_LAGTIME].abs() > 1e-12 {
+        return None;
+    }
+    // Individual-parameter η/θ derivatives (cheap: one dual eval, no integration).
+    // Besides feeding the chain, the `∂p/∂η` rows tell us which individual parameters
+    // carry IIV, which decides the dual's Hessian width.
     let pd = param_derivatives(model, subject, theta, eta)?;
     let n_indiv = model.pk_indices.len();
 
@@ -293,18 +302,20 @@ pub fn ode_subject_sensitivities(
 
     macro_rules! full {
         ($n:literal) => {
-            run_subject::<$n>(model, subject, theta, eta, &pd)
+            run_subject::<$n>(model, subject, theta, eta, &pk.values, &pd)
         };
     }
     macro_rules! mixed {
         ($na:literal, $n:literal) => {
-            run_subject_mixed::<$na, $n>(model, subject, theta, eta, &pd, &axis_of, &iiv)
+            run_subject_mixed::<$na, $n>(
+                model, subject, theta, eta, &pk.values, &pd, &axis_of, &iiv,
+            )
         };
     }
-    // For each individual-parameter count `n`, route to the mixed-order dual when
-    // `0 < na < n` and `na` is within the monomorphised cap (`MIXED_NA_CAP`, baked
-    // into the arm lists below); otherwise the full `Dual2<n>` path handles it
-    // (`na == n`: no block to drop; `na == 0`: no IIV; `na > cap`: not specialised).
+    // For each individual-parameter count `n`, route to the mixed-order dual for
+    // every `0 < na < n` (the arm lists below enumerate `na` up to `MIXED_NA_CAP =
+    // n_max − 1`, so all are covered); the full `Dual2<n>` path handles only
+    // `na == n` (no IIV-free block to drop) and `na == 0` (no IIV) via the `_` arm.
     macro_rules! by_n {
         ($n:literal; $($na:literal),*) => {
             match na {
@@ -321,11 +332,11 @@ pub fn ode_subject_sensitivities(
         5 => by_n!(5; 1, 2, 3, 4),
         6 => by_n!(6; 1, 2, 3, 4, 5),
         7 => by_n!(7; 1, 2, 3, 4, 5, 6),
-        8 => by_n!(8; 1, 2, 3, 4, 5, 6),
-        9 => by_n!(9; 1, 2, 3, 4, 5, 6),
-        10 => by_n!(10; 1, 2, 3, 4, 5, 6),
-        11 => by_n!(11; 1, 2, 3, 4, 5, 6),
-        12 => by_n!(12; 1, 2, 3, 4, 5, 6),
+        8 => by_n!(8; 1, 2, 3, 4, 5, 6, 7),
+        9 => by_n!(9; 1, 2, 3, 4, 5, 6, 7, 8),
+        10 => by_n!(10; 1, 2, 3, 4, 5, 6, 7, 8, 9),
+        11 => by_n!(11; 1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+        12 => by_n!(12; 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11),
         _ => None,
     }
 }
@@ -335,14 +346,19 @@ pub fn ode_subject_sensitivities(
 /// whose model has more than this many IIV-bearing individual parameters fall back
 /// to the full `Dual2` path — correct, just not accelerated. Bounds the `(na, n)`
 /// monomorphisation count; raise it only if models with many IIV parameters become
-/// a measured bottleneck.
-pub const MIXED_NA_CAP: usize = 6;
+/// a measured bottleneck. Set to `MAX_ODE_SENS_DIM - 1` so that **every** `0 < na <
+/// n` is specialised (the largest possible `na` is `n - 1 ≤ 11`): no in-scope model
+/// silently falls back to the full `Dual2` path for being over the cap — only `na ==
+/// n` (no IIV-free block to drop) and `na == 0` (no IIV) take the full path, both
+/// correctly (#445 review #6). The cost is the `(na, n)` monomorphisation count
+/// (`Σ min(n-1, cap)` over `n ≤ MAX_ODE_SENS_DIM`); lower it if compile time bites.
+pub const MIXED_NA_CAP: usize = MAX_ODE_SENS_DIM - 1;
 
 // The `by_n!` arm lists in `ode_subject_sensitivities` enumerate `na` up to
 // `MIXED_NA_CAP` explicitly (a macro can't iterate a const). This tripwire fails the
 // build if the const is changed without the arms being updated to match — the cap
 // was previously `#[cfg(doc)]`-only and could silently drift (#445 review #4).
-const _: () = assert!(MIXED_NA_CAP == 6);
+const _: () = assert!(MIXED_NA_CAP == 11);
 
 /// Light **inner** η-gradient for an ODE model: per-observation `(f, ∂f/∂η)` via a
 /// `Dual1` (gradient-only) augmented RK45 — the ODE counterpart of the analytical
@@ -762,25 +778,26 @@ fn run_subject<const N: usize>(
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
+    pk_values: &[f64],
     pd: &ParamDerivs,
 ) -> Option<SubjectSens> {
     let ode = model.ode_spec.as_ref()?;
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
 
-    // PK parameter values at (θ, η). `pd` (∂p/∂(θ,η) + 2nd order) is supplied by the
-    // dispatcher, which already evaluated it to classify the IIV axes (#445).
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // `pk_values` (PK params at (θ, η)) and `pd` (∂p/∂(θ,η) + 2nd order) are both
+    // supplied by the dispatcher — already evaluated there for the lagtime check and
+    // the IIV-axis classification — so neither is recomputed here (#445 review #8).
 
     // Initial state from `init(...)` (dual-seeded by FD of init_fn, value + grad +
     // Hessian); zeros when none is declared. Re-applied at every EVID 3/4 reset.
     let init_state: Vec<Dual2<N>> = match ode.init_fn.as_ref() {
-        Some(f) => dual_init_state::<N>(f.as_ref(), &pk.values, &model.pk_indices, ode.n_states),
+        Some(f) => dual_init_state::<N>(f.as_ref(), pk_values, &model.pk_indices, ode.n_states),
         None => vec![Dual2::constant(0.0); ode.n_states],
     };
 
     // Seed + integrate the Dual2 state and apply the readout/transforms.
-    let preds = integrate_subject_duals::<Dual2<N>>(model, subject, &pk.values, &init_state)?;
+    let preds = integrate_subject_duals::<Dual2<N>>(model, subject, pk_values, &init_state)?;
 
     // Chain ∂f/∂p, ∂²f/∂p² (exact, from the dual) with ∂p/∂η, ∂p/∂θ (general,
     // from `param_derivatives`) → ∂f/∂η, ∂²f/∂η², ∂f/∂θ, ∂²f/∂η∂θ:
@@ -857,6 +874,7 @@ fn run_subject_mixed<const NA: usize, const N: usize>(
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
+    pk_values: &[f64],
     pd: &ParamDerivs,
     axis_of: &[usize],
     iiv: &[usize],
@@ -867,20 +885,17 @@ fn run_subject_mixed<const NA: usize, const N: usize>(
     let n_theta = model.n_theta;
     let opts = ode.solver_opts;
 
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-
+    // `pk_values` and `pd` are supplied by the dispatcher (which already evaluated
+    // them for the lagtime check and IIV classification); not recomputed (#445 #8).
     // Seed: individual parameter `i` carries dual axis `axis_of[i]`. IIV-bearing
     // parameters land in axes `0..NA`, so only those get second-order Hessian rows.
     let mut params_dual: Vec<DualMixed<NA, N>> =
-        pk.values.iter().map(|&v| DualMixed::constant(v)).collect();
+        pk_values.iter().map(|&v| DualMixed::constant(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
-        params_dual[slot] = DualMixed::var(pk.values[slot], axis_of[i]);
+        params_dual[slot] = DualMixed::var(pk_values[slot], axis_of[i]);
     }
 
-    if pk.values[PK_IDX_LAGTIME].abs() > 1e-12 {
-        return None;
-    }
-    let f_bio = if pk.values[PK_IDX_F] > 0.0 {
+    let f_bio = if pk_values[PK_IDX_F] > 0.0 {
         params_dual[PK_IDX_F]
     } else {
         DualMixed::constant(1.0)
@@ -889,7 +904,7 @@ fn run_subject_mixed<const NA: usize, const N: usize>(
     let init_state: Vec<DualMixed<NA, N>> = match ode.init_fn.as_ref() {
         Some(f) => dual_init_state_mixed::<NA, N>(
             f.as_ref(),
-            &pk.values,
+            pk_values,
             &model.pk_indices,
             ode.n_states,
             axis_of,
@@ -2353,7 +2368,9 @@ mod tests {
 
             // Full reference: force the 4-axis `Dual2` path directly.
             let pd = param_derivatives(&model, &subject, &theta, &eta).expect("pd");
-            let full = run_subject::<4>(&model, &subject, &theta, &eta, &pd).expect("full");
+            let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates);
+            let full =
+                run_subject::<4>(&model, &subject, &theta, &eta, &pk.values, &pd).expect("full");
             // Mixed path via the dispatcher: na = 2 (CL, V1) < n = 4 routes to
             // `run_subject_mixed::<2, 4>`, dropping the Q/V2 Hessian block.
             let mixed = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("mixed");
@@ -2413,7 +2430,8 @@ mod tests {
         let eta = vec![0.1];
 
         let pd = param_derivatives(&model, &subject, &theta, &eta).expect("pd");
-        let full = run_subject::<2>(&model, &subject, &theta, &eta, &pd).expect("full");
+        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates);
+        let full = run_subject::<2>(&model, &subject, &theta, &eta, &pk.values, &pd).expect("full");
         // na = 1 (CL) < n = 2 → run_subject_mixed::<1, 2>, exercising dual_init_state_mixed.
         let mixed = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("mixed");
 
@@ -2449,23 +2467,28 @@ mod tests {
         let theta = vec![4.0, 12.0, 2.0, 25.0];
         let eta = vec![0.12, -0.08];
         let pd = param_derivatives(&model, &subject, &theta, &eta).expect("pd");
+        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates);
         let iiv = vec![0usize, 1]; // CL, V1
         let axis_of = vec![0usize, 1, 2, 3]; // identity (IIV declared first)
 
         let iters = 50_000;
         // Warm up.
         for _ in 0..1000 {
-            black_box(run_subject::<4>(&model, &subject, &theta, &eta, &pd));
+            black_box(run_subject::<4>(
+                &model, &subject, &theta, &eta, &pk.values, &pd,
+            ));
         }
         let t0 = Instant::now();
         for _ in 0..iters {
-            black_box(run_subject::<4>(&model, &subject, &theta, &eta, &pd));
+            black_box(run_subject::<4>(
+                &model, &subject, &theta, &eta, &pk.values, &pd,
+            ));
         }
         let full = t0.elapsed();
         let t1 = Instant::now();
         for _ in 0..iters {
             black_box(run_subject_mixed::<2, 4>(
-                &model, &subject, &theta, &eta, &pd, &axis_of, &iiv,
+                &model, &subject, &theta, &eta, &pk.values, &pd, &axis_of, &iiv,
             ));
         }
         let mixed = t1.elapsed();

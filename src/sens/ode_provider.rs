@@ -38,6 +38,19 @@ use std::cell::RefCell;
 /// monomorphised; models wider than this fall back to the gradient-free path.
 const MAX_ODE_SENS_DIM: usize = 12;
 
+// The `pk_indices.len()` dispatch tables in `ode_subject_sensitivities` and
+// `ode_subject_eta_grad` enumerate `1..=12` explicitly with a silent `_ => None`
+// fallback. Keep that table in lockstep with `MAX_ODE_SENS_DIM`: bumping the const
+// without extending both `dispatch!` arms would let an in-scope wider model pass
+// the gate, hit `_ => None`, and silently fall back to FD with no error. This
+// compile-time tripwire forces an edit here — and a look at the tables — before the
+// const can change (#438 review).
+const _: () = assert!(
+    MAX_ODE_SENS_DIM == 12,
+    "MAX_ODE_SENS_DIM changed: extend the pk_indices.len() dispatch tables in \
+     ode_subject_sensitivities and ode_subject_eta_grad to match, then update this assert"
+);
+
 /// Largest (θ + η) axis count for which the analytical η/θ chain (the
 /// individual-parameter program over `Dual2<M>`) is monomorphised.
 const MAX_ODE_AXES: usize = 16;

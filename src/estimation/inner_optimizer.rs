@@ -815,6 +815,18 @@ fn inner_profile_enabled() -> bool {
     })
 }
 
+/// `FERX_NO_ANALYTIC_INNER=1` forces the FD inner gradient everywhere (A-B toggle).
+/// Cached in a `OnceLock`: the value cannot change mid-run, and this is queried per
+/// subject on every inner-loop entry (issue #438 review).
+fn no_analytic_inner_forced() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("FERX_NO_ANALYTIC_INNER")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Print the accumulated inner-loop attribution profile (no-op unless `FERX_PROFILE=1`).
 pub fn profile_report() {
     if !inner_profile_enabled() {
@@ -842,10 +854,7 @@ pub fn profile_report() {
 /// cannot drift from what `find_ebe` actually runs (PR #381 review #9).
 pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool {
     // Escape hatch / A-B toggle: force the FD inner gradient everywhere.
-    if std::env::var("FERX_NO_ANALYTIC_INNER")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    if no_analytic_inner_forced() {
         return false;
     }
     // The user explicitly requested finite differences.
@@ -899,16 +908,24 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     if !subject.obs_records.is_empty() {
         return false;
     }
-    // ODE models use the light `Dual1` inner provider (#410) with their own scope —
-    // independent of the analytical-path LTBS/ExpressionScale exclusions in
-    // `analytic_inner_grad_supported_model`, since the `Dual1` walk evaluates
-    // `ln(f)` and the readout exactly. The global escape hatches still apply.
+    // ODE models use the light `Dual1` inner provider (#410) with their own
+    // per-subject scope ([`ode_inner_grad_supported`]). The global escape hatches
+    // plus the model-level exclusions the analytical path applies in
+    // `analytic_inner_grad_supported_model` still hold here:
+    //   - IIV on residual error (#409): the dual kernels build the residual
+    //     variance from σ alone, with no `exp(2·η_ruv)` scaling, so the EBE must
+    //     reconverge against the scaled `individual_nll` under FD.
+    //   - LTBS: the analytic-EBE minimum can sit off the objective's own EBE and
+    //     corrupt the covariance Hessian / SEs (~5× on the analytical path). The
+    //     ODE `Dual1` walk shares `solve_ode_g` with the objective so the mismatch
+    //     is likely benign, but that is unmeasured — decline until a cov-SE test on
+    //     an LTBS ODE model validates it (#438 review).
     if model.ode_spec.is_some() {
-        if std::env::var("FERX_NO_ANALYTIC_INNER")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        if no_analytic_inner_forced()
             || matches!(model.gradient_method, GradientMethod::Fd)
             || model.is_sde()
+            || model.residual_error_eta.is_some()
+            || model.log_transform
         {
             return false;
         }

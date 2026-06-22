@@ -1189,6 +1189,19 @@ pub fn subject_eta_grad_tvcov(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    subject_eta_grad_tvcov_with_schedule(model, subject, theta, eta, None)
+}
+
+/// As [`subject_eta_grad_tvcov`], but reusing a per-subject `EventSchedule` the inner
+/// optimizer cached once (η-invariant) instead of rebuilding it every inner BFGS step
+/// (#449 re-review #6). `None` rebuilds locally (identical result).
+pub(crate) fn subject_eta_grad_tvcov_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
+) -> Option<Vec<ObsGrad>> {
     if !tvcov_analytical_supported(model)
         || !(subject.has_tv_covariates() || subject_has_oral_infusion(model, subject))
     {
@@ -1221,7 +1234,7 @@ pub fn subject_eta_grad_tvcov(
     macro_rules! disp {
         ($($n:literal),+) => {
             match n_eta {
-                $($n => run_obs_grad_tvcov::<$n>(model, subject, theta, eta, prog, &slot_row, n_eta),)+
+                $($n => run_obs_grad_tvcov::<$n>(model, subject, theta, eta, prog, &slot_row, n_eta, cached_schedule),)+
                 _ => None,
             }
         };
@@ -1254,6 +1267,7 @@ pub fn subject_eta_grad_tvcov(
 /// PK-param `Dual1` seeded on η (`∂p/∂η_k` on axis `k`), the event-driven walk over
 /// `Dual1<N>`, and `∂conc/∂η` read straight into `ObsGrad`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_obs_grad_tvcov<const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
@@ -1262,6 +1276,7 @@ fn run_obs_grad_tvcov<const N: usize>(
     prog: &crate::parser::model_parser::IndivParamProgram,
     slot_row: &[Option<usize>; N_PK],
     n_eta: usize,
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::ode_provider::param_derivatives_at_cov;
@@ -1311,13 +1326,24 @@ fn run_obs_grad_tvcov<const N: usize>(
         .map(|m| mk(subject.pk_only_cov(m)))
         .collect::<Option<Vec<_>>>()?;
 
-    let dose_lagtimes = vec![0.0; subject.doses.len()];
-    let schedule =
-        EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
+    // The event schedule is invariant across inner BFGS steps (it depends only on the
+    // subject + doses + zero lagtimes, not on η). Reuse the schedule the inner
+    // optimizer cached once per subject when available, instead of rebuilding it every
+    // gradient step; fall back to building it locally otherwise (#449 re-review #6).
+    let owned_schedule;
+    let schedule: &EventSchedule = match cached_schedule {
+        Some(s) => s,
+        None => {
+            let dose_lagtimes = vec![0.0; subject.doses.len()];
+            owned_schedule =
+                EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
+            &owned_schedule
+        }
+    };
     let conc = event_driven_sens_g::<Dual1<N>>(
         model.pk_model,
         subject,
-        &schedule,
+        schedule,
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
@@ -1411,11 +1437,25 @@ pub fn subject_eta_grad(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    subject_eta_grad_with_schedule(model, subject, theta, eta, None)
+}
+
+/// As [`subject_eta_grad`], but threading a per-subject cached `EventSchedule` (built
+/// once by the inner optimizer) into the TV-cov walk so it isn't rebuilt every inner
+/// BFGS step (#449 re-review #6). `None` (and every non-TV-cov / ODE route) rebuilds
+/// locally — identical result.
+pub(crate) fn subject_eta_grad_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
+) -> Option<Vec<ObsGrad>> {
     if !sens_profile_enabled() {
-        return subject_eta_grad_impl(model, subject, theta, eta);
+        return subject_eta_grad_impl(model, subject, theta, eta, cached_schedule);
     }
     let t0 = std::time::Instant::now();
-    let r = subject_eta_grad_impl(model, subject, theta, eta);
+    let r = subject_eta_grad_impl(model, subject, theta, eta, cached_schedule);
     PROFILE_ETA_NANOS.fetch_add(
         t0.elapsed().as_nanos() as u64,
         std::sync::atomic::Ordering::Relaxed,
@@ -1429,6 +1469,7 @@ fn subject_eta_grad_impl(
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
     // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
     // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
@@ -1443,7 +1484,7 @@ fn subject_eta_grad_impl(
     // already serves these via `subject_sensitivities_tvcov`; route the inner to the
     // matching `Dual1` walk (out-of-scope cases return `None` → FD per point).
     if subject.has_tv_covariates() || subject_has_oral_infusion(model, subject) {
-        return subject_eta_grad_tvcov(model, subject, theta, eta);
+        return subject_eta_grad_tvcov_with_schedule(model, subject, theta, eta, cached_schedule);
     }
     // Same model/subject scope as the full provider …
     if !analytical_supported(model) {

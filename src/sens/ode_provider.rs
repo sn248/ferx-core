@@ -1127,6 +1127,15 @@ fn seed_pk_dual2<const M: usize>(
     // `n_theta..M`), so the index guards are always satisfied — flat loops, no `< M`
     // / `.min(M)` (#449 review #15). The assert pins the invariant.
     debug_assert_eq!(M, n_theta + n_eta);
+    // `pd` (the dual program eval) carries the individual-parameter *values* too, so
+    // the separate `pk_param_fn` call below looks redundant (#451 re-review #9). It is
+    // retained deliberately: `pk_param_fn` returns the **full** slot vector including
+    // the non-individual-parameter slots (reserved `F`/lag defaults, etc.) that the
+    // indiv-param program — hence `pd` — never produces. Reconstructing those from a
+    // defaults base would re-encode `pk_param_fn`'s slot semantics here and risk silent
+    // gradient divergence for any model that fills a non-indiv slot non-trivially,
+    // while saving only the cheap f64 eval (the M²-Hessian dual eval dominates, and the
+    // covariate-snapshot dedup already elides repeats). Not worth that trade.
     let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
     let pk = (model.pk_param_fn)(theta, eta, cov);
     let mut out: Vec<Dual2<M>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();

@@ -689,16 +689,19 @@ fn apply_output_transform<T: crate::sens::num::PkNum>(model: &CompiledModel, p: 
     if p.val().is_nan() {
         return p;
     }
+    // `ScalarScale` is the only scaling the gate (`ode_analytical_supported`) admits
+    // over duals — `ExpressionScale`/`PerCmt` scaling route to the Form-C `y = state/V`
+    // readout instead, so production's full `build_obs_scale_array` need not be lifted
+    // here. Divide (not multiply by `1/k`) to match production's `pred /= s` exactly.
     let p = match model.scaling {
-        ScalingSpec::ScalarScale(k) if k != 1.0 => p * T::from_f64(1.0 / k),
+        ScalingSpec::ScalarScale(k) if k != 1.0 => p / T::from_f64(k),
         _ => p,
     };
+    // LTBS log via the shared generic transform — same floor-then-log production runs
+    // on f64 (#451). The `NaN` pre-check above keeps a `NaN` readout visible rather
+    // than letting the floor convert it to `ln(LTBS_FLOOR)`.
     if model.log_transform {
-        if p.val() > crate::pk::LTBS_FLOOR {
-            p.ln()
-        } else {
-            T::from_f64(crate::pk::LTBS_FLOOR.ln())
-        }
+        crate::pk::ltbs_log_g(p)
     } else {
         p
     }

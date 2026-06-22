@@ -292,9 +292,22 @@ pub(crate) const LTBS_FLOOR: f64 = 1e-12;
 pub(crate) fn apply_log_transform(model: &CompiledModel, preds: &mut [f64]) {
     if model.log_transform {
         for p in preds.iter_mut() {
-            *p = p.max(LTBS_FLOOR).ln();
+            *p = ltbs_log_g(*p);
         }
     }
+}
+
+/// The LTBS log transform, generic over `T: PkNum`, so the production `f64`
+/// predictor and the analytic ODE/analytical sensitivity dual walks apply the
+/// *same* floor-then-log (`p.max(LTBS_FLOOR).ln()` for `T = f64`, byte-identical to
+/// the original) instead of each re-deriving it — the consistency the
+/// `apply_log_transform` doc demands (#438 review #4 / #451). `guard_floor` also
+/// floors `NaN` to the floor (matching `f64::max`), so a transient `NaN` maps to
+/// `ln(LTBS_FLOOR)` on every path; the dual callers keep their own pre-check when a
+/// `NaN` readout must instead stay visible (e.g. a per-CMT miss).
+#[inline]
+pub(crate) fn ltbs_log_g<T: crate::sens::num::PkNum>(p: T) -> T {
+    p.guard_floor(LTBS_FLOOR).ln()
 }
 
 pub fn predict_iov(

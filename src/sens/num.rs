@@ -5,6 +5,7 @@
 
 use super::dual1::Dual1;
 use super::dual2::Dual2;
+use super::dual_mixed::DualMixed;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 pub trait PkNum:
@@ -219,11 +220,71 @@ impl<const N: usize> PkNum for Dual2<N> {
     }
 }
 
+impl<const NA: usize, const N: usize> PkNum for DualMixed<NA, N> {
+    #[inline]
+    fn from_f64(x: f64) -> Self {
+        DualMixed::constant(x)
+    }
+    #[inline]
+    fn var(x: f64, dim: usize) -> Self {
+        DualMixed::var(x, dim)
+    }
+    #[inline]
+    fn val(self) -> f64 {
+        self.value
+    }
+    #[inline]
+    fn exp(self) -> Self {
+        DualMixed::exp(self)
+    }
+    #[inline]
+    fn ln(self) -> Self {
+        DualMixed::ln(self)
+    }
+    #[inline]
+    fn sqrt(self) -> Self {
+        DualMixed::sqrt(self)
+    }
+    #[inline]
+    fn pow(self, e: Self) -> Self {
+        DualMixed::powd(self, e)
+    }
+    #[inline]
+    fn abs(self) -> Self {
+        DualMixed::abs(self)
+    }
+    #[inline]
+    fn inv_logit(self) -> Self {
+        DualMixed::inv_logit(self)
+    }
+    #[inline]
+    fn logit(self) -> Self {
+        DualMixed::logit(self)
+    }
+    #[inline]
+    fn cos(self) -> Self {
+        DualMixed::cos(self)
+    }
+    #[inline]
+    fn acos(self) -> Self {
+        DualMixed::acos(self)
+    }
+    #[inline]
+    fn guard_floor(self, lo: f64) -> Self {
+        if self.value < lo {
+            DualMixed::constant(lo)
+        } else {
+            self
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sens::dual1::Dual1;
     use crate::sens::dual2::Dual2;
+    use crate::sens::dual_mixed::DualMixed;
 
     /// Exercise every `PkNum` method on a value once, so the per-impl delegators
     /// (and the underlying `Dual1`/`Dual2` ops they call) are covered. `0.7` is a
@@ -251,5 +312,6 @@ mod tests {
         exercise::<f64>(0.7);
         exercise::<Dual1<1>>(Dual1::var(0.7, 0));
         exercise::<Dual2<1>>(Dual2::var(0.7, 0));
+        exercise::<DualMixed<1, 2>>(DualMixed::var(0.7, 0));
     }
 }

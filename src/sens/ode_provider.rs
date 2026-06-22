@@ -2810,6 +2810,44 @@ mod tests {
         subject
     }
 
+    /// A TV-cov model whose RHS references the `TAD` (time-after-dose) builtin, so
+    /// the event-driven TV-cov walk's `last_dose_eff` / time-anchoring is exercised
+    /// — the other TV-cov parity tests use a `t`-independent RHS, leaving the
+    /// anchoring covered only through a constant (#451 / #449 review #10). Same
+    /// parameter shape as `ONECPT_ODE_TVCOV`, so `tvcov_subject` + the same θ/η apply.
+    #[test]
+    fn ode_provider_tvcov_tad_dependent_rhs_matches_production() {
+        const TVCOV_TAD_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.02 * TAD)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(TVCOV_TAD_ODE).expect("parse");
+        assert!(model.ode_spec.as_ref().unwrap().input_rate.is_empty());
+        let subject = tvcov_subject();
+        assert!(ode_tvcov_supported(&model, &subject));
+        // Analytic TV-cov walk (f / ∂η / ∂θ) must match the production predictor + FD
+        // with the TAD-dependent RHS.
+        check_vs_production(&model, &subject, &[1.0, 20.0, 0.75], &[0.1]);
+    }
+
     /// The light `Dual1` inner η-gradient must equal the full `Dual2` outer
     /// `df_deta` for a TV-cov subject too — exercised through the dispatch, so this
     /// also covers `ode_tvcov_supported` routing both entry points (#439).

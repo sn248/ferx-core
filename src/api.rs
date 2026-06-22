@@ -3955,10 +3955,14 @@ fn compute_subject_results(
                 )
             };
 
-            // Population predictions: f(eta = 0, kappa = 0).
+            // Population predictions: f(eta = 0, kappa = 0). Routes through the
+            // TV-cov-aware predictor (the same path `predict()` uses), so the sdtab
+            // PRED column honours time-varying covariates, EVID=3/4 resets, and the
+            // FREM prediction override — and stays consistent with the public
+            // `predict()` output (#456).
             let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
-            let pk_params_pop = (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
-            let pred = model_preds(model, subject, &pk_params_pop, &params.theta, &zero_eta);
+            let pred =
+                crate::pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta);
 
             // IWRES (NaN on censored rows — see compute_cwres for CWRES handling).
             let mut iwres = compute_iwres(
@@ -7506,6 +7510,48 @@ mod tests_sdtab_tv_cov {
                 (got - expected).abs() < 1e-12,
                 "sdtab IPRED at obs {j} = {got}, expected (TV-aware) {expected} \
                  — `compute_subject_results` must route IPRED through \
+                 `compute_predictions_with_tv` for TV-covariate subjects"
+            );
+        }
+
+        // Regression for #456: the sdtab population PRED column (f at η = 0) must
+        // ALSO route through the TV-aware predictor, so it honours the per-event
+        // covariate snapshot and agrees with the public `predict()` output. Before
+        // the fix it used `model_preds`, which reads the single `subject.covariates`
+        // snapshot for every observation and so silently ignored the TV breakpoints.
+        let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+        let pred_reference = crate::pk::compute_predictions_with_tv(
+            &model,
+            &subject,
+            &default_params.theta,
+            &zero_eta,
+        );
+        let pk_pred_no_tv =
+            (model.pk_param_fn)(&default_params.theta, &zero_eta, &subject.covariates);
+        let pred_no_tv = model_preds(
+            &model,
+            &subject,
+            &pk_pred_no_tv,
+            &default_params.theta,
+            &zero_eta,
+        );
+        let pred_gap: f64 = pred_reference
+            .iter()
+            .zip(pred_no_tv.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            pred_gap > 1e-3,
+            "test setup wrong: TV and no-TV PRED paths must differ noticeably; \
+             got gap = {pred_gap}"
+        );
+        let sdtab_pred = &results[0].pred;
+        assert_eq!(sdtab_pred.len(), 3);
+        for (j, (&got, &expected)) in sdtab_pred.iter().zip(pred_reference.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "sdtab PRED at obs {j} = {got}, expected (TV-aware) {expected} \
+                 — `compute_subject_results` must route PRED through \
                  `compute_predictions_with_tv` for TV-covariate subjects"
             );
         }

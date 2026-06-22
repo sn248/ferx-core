@@ -102,6 +102,18 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- **Analytic sensitivities and predictions for time-varying covariates with
+  intermediate `[individual_parameters]` assignments** (#455, #456). A model whose
+  individual-parameter block computes intermediate quantities (e.g.
+  `WTREL = WT / 70`) before the structural PK outputs now gets the exact analytic
+  `Dual2` gradient on every path — the TV-cov gate plus the previously-overlooked
+  non-TV (`subject_sensitivities` / `subject_eta_grad`) and IOV gates all key on the
+  required structural PK slots instead of the assignment count, so these models no
+  longer silently fall back to a fallback that mis-seeded `∂f/∂η`. Additionally,
+  the public `predict()` and the sdtab `PRED` column now both route through the
+  TV-covariate-aware predictor, so they honour per-event covariate breakpoints
+  (and EVID=3/4 resets) and agree with each other. Cross-checked against NONMEM
+  7.5.1 (ADVAN3 TRANS4, EVID=2 covariate update).
 - **Documentation no longer references the retired Enzyme/autodiff installation or
   usage path**, and now describes `gradient = auto` / `gradient = fd` with the
   analytic `Dual2` sensitivity provider (#381).

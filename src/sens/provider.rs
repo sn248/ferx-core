@@ -87,6 +87,32 @@ fn slot_to_dim(slot: usize) -> Option<usize> {
 /// Number of seeded dimensions (`CL, V1, Q2, V2, KA, F, Q3, V3, LAGTIME`).
 const N_PK: usize = 9;
 
+/// True when the compiled `[individual_parameters]` program emits a differentiable
+/// row for every structural PK output `model` requires — the precondition for
+/// driving the analytic sensitivity chain (`param_derivatives_from_prog` /
+/// `pd_from_program`) over its `pk_slots()`-ordered rows.
+///
+/// Checks the model's *required* PK slots, NOT `pk_indices.len()`. `pk_indices`
+/// is parallel to every `[individual_parameters]` assignment, so it also counts
+/// intermediate rows (e.g. `WTREL = WT/70` before `CL = ...`); comparing its
+/// length against `pk_slots().len()` (structural outputs only) wrongly rejected
+/// any model with intermediate assignments and routed it to a fallback that
+/// mis-seeds the structural slots (#455/#456). Every non-literal structural
+/// parameter is bound as an individual parameter and therefore present in
+/// `pk_slots()`; a literal-constant slot is correctly absent and seeded as a
+/// constant downstream.
+fn prog_covers_required_pk_slots(
+    model: &CompiledModel,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+) -> bool {
+    let prog_slots = prog.pk_slots();
+    model
+        .pk_model
+        .required_pk_params()
+        .iter()
+        .all(|(slot, _)| prog_slots.contains(slot) && slot_to_dim(*slot).is_some())
+}
+
 /// Elapsed time since a dose's *lagged* arrival, as a dual carrying the lagtime
 /// sensitivity (`∂elapsed/∂lagtime = −1`). Mirrors [`crate::pk::predict_concentration`]:
 /// the dose contributes from `dose.time + lagtime` onward, and a steady-state
@@ -460,10 +486,9 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     let n_eff = model.n_eta + model.n_kappa;
     match model.indiv_param_partials.indiv_param_program.as_ref() {
         Some(prog) => {
-            prog.pk_slots().len() == model.pk_indices.len()
+            prog_covers_required_pk_slots(model, prog)
                 && prog.n_theta_axis() == model.n_theta
                 && prog.n_eta_axis() == n_eff
-                && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
         }
         None => false,
     }
@@ -914,12 +939,7 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     }
     match model.indiv_param_partials.indiv_param_program.as_ref() {
         Some(prog) => {
-            let prog_slots = prog.pk_slots();
-            model
-                .pk_model
-                .required_pk_params()
-                .iter()
-                .all(|(slot, _)| prog_slots.contains(slot) && slot_to_dim(*slot).is_some())
+            prog_covers_required_pk_slots(model, prog)
                 && prog.n_theta_axis() == model.n_theta
                 && prog.n_eta_axis() == model.n_eta
         }
@@ -1475,7 +1495,7 @@ fn subject_eta_grad_impl(
         .indiv_param_partials
         .indiv_param_program
         .as_ref()
-        .filter(|prog| prog.pk_slots().len() == model.pk_indices.len())
+        .filter(|prog| prog_covers_required_pk_slots(model, prog))
         .and_then(|prog| {
             crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
                 .map(|pd| (pd.dp_deta, prog.pk_slots()))
@@ -1885,7 +1905,7 @@ fn subject_sensitivities_impl(
         .indiv_param_partials
         .indiv_param_program
         .as_ref()
-        .filter(|prog| prog.pk_slots().len() == model.pk_indices.len())
+        .filter(|prog| prog_covers_required_pk_slots(model, prog))
         .and_then(|prog| {
             crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
                 .map(|pd| (pd, prog.pk_slots()))
@@ -3331,6 +3351,83 @@ mod tests {
         let model = parse_model_string(WARFARIN).expect("parse");
         let subject = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         check_full_provider_vs_fd(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
+    }
+
+    /// Regression for #455/#456: an analytical model whose `[individual_parameters]`
+    /// block has **intermediate** assignments before the structural PK outputs must
+    /// drive the exact program-based sensitivity path even on a **static-covariate**
+    /// subject (the non-TV `subject_sensitivities` provider). Before the fix, those
+    /// gates compared `prog.pk_slots().len() == model.pk_indices.len()`; the
+    /// intermediate rows make `pk_indices` longer, so the gate rejected the program
+    /// path and fell back to the log-normal closed form keyed by `pk_indices`, whose
+    /// slot-0-aliased intermediate rows overwrote CL's seed and silently zeroed
+    /// `∂f/∂η_CL`. With the gate keyed on the required structural slots, the program
+    /// path runs and matches FD exactly.
+    #[test]
+    fn static_cov_intermediate_params_uses_program_path_and_matches_fd() {
+        let bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+        let m = parse_model_string(TWOCPT_IV_TVCOV_INTERMEDIATE)
+            .expect("parse 2cpt iv tvcov intermediate");
+
+        // Static WT (a single `subject.covariates` snapshot, no per-event covariate
+        // vectors) → NOT a TV-covariate subject, so this routes through the non-TV
+        // `subject_sensitivities` / `subject_eta_grad` gates that the fix repaired.
+        let mut s = subject_with_dose(bolus(0.0), &[0.5, 2.0, 6.0, 12.0]);
+        s.covariates = wt_map(70.0);
+        assert!(
+            !s.has_tv_covariates(),
+            "fixture must be a static-covariate subject so the non-TV provider runs"
+        );
+
+        // The fixture genuinely exposes intermediate rows (the precondition that the
+        // old `len == len` gate tripped on), and the repaired gate admits it.
+        let prog = m
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("compiled individual program");
+        assert!(
+            m.pk_indices.len() > prog.pk_slots().len(),
+            "fixture must expose intermediate individual-parameter rows"
+        );
+        assert!(
+            prog_covers_required_pk_slots(&m, prog),
+            "repaired gate must admit the intermediate-parameter program path"
+        );
+
+        let theta = vec![10.0, 50.0, 15.0, 100.0, 0.75];
+        let eta = vec![0.12, -0.08];
+
+        // Sanity: the η_CL gradient must be non-zero — the exact symptom the old
+        // mis-seeded fallback produced was a zeroed CL gradient.
+        let sens = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+        let max_cl_grad = sens
+            .obs
+            .iter()
+            .map(|o| o.df_deta[0].abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_cl_grad > 1e-6,
+            "∂f/∂η_CL must be non-zero (was silently zeroed by the mis-seeded fallback)"
+        );
+
+        // Full provider (and, via the harness's reference, the production predictor)
+        // must match central finite differences exactly.
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
+
+        // The light inner η-gradient provider must agree with the full provider too.
+        let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light supported");
+        assert_eq!(light.len(), sens.obs.len());
+        for (lo, fo) in light.iter().zip(sens.obs.iter()) {
+            for k in 0..m.n_eta {
+                approx::assert_relative_eq!(
+                    lo.df_deta[k],
+                    fo.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-12
+                );
+            }
+        }
     }
 
     /// LTBS (`log(DV) ~ additive(...)`): the production predictor returns `ln(f)`,

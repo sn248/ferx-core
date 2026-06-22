@@ -245,7 +245,8 @@ Assign `model.scaling` and, for Form C, `ode_spec.output_fn`.
   - `examples/scaling_scalar.ferx` (Form A on warfarin)
   - `examples/scaling_expression.ferx` (Form B on 1-cpt)
   - `examples/scaling_ode_amounts.ferx` (Form C: amount-based ODE)
-- Run `cd docs && mdbook build`; commit both source and `docs/book/`.
+- Render locally with `quarto render docs` to preview; commit only the `.qmd`
+  sources (the rendered `docs/_site/` is git-ignored).
 
 ---
 

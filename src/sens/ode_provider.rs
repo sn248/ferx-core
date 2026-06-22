@@ -1245,11 +1245,25 @@ fn run_subject_tvcov<const M: usize>(
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
 
+    // Seed each event's per-snapshot PK duals, deduplicating identical covariate
+    // snapshots: with TV covariates that change at only a few breakpoints, most
+    // dose/obs events share a snapshot, so a full dual eval per event re-does
+    // identical work. Memoise by snapshot (the result is deterministic in the
+    // snapshot, so a cache hit is bit-identical to re-seeding) (#451 re-review #8).
+    let mut snap_cache: Vec<(std::collections::HashMap<String, f64>, Vec<Dual2<M>>)> = Vec::new();
+    let mut seed_for = |cov: &std::collections::HashMap<String, f64>| -> Vec<Dual2<M>> {
+        if let Some((_, v)) = snap_cache.iter().find(|(c, _)| c == cov) {
+            return v.clone();
+        }
+        let v = seed_pk_dual2::<M>(model, prog, theta, eta, cov);
+        snap_cache.push((cov.clone(), v.clone()));
+        v
+    };
     let pk_at_dose: Vec<Vec<Dual2<M>>> = (0..subject.doses.len())
-        .map(|k| seed_pk_dual2::<M>(model, prog, theta, eta, subject.dose_cov(k)))
+        .map(|k| seed_for(subject.dose_cov(k)))
         .collect();
     let pk_at_obs: Vec<Vec<Dual2<M>>> = (0..subject.obs_times.len())
-        .map(|j| seed_pk_dual2::<M>(model, prog, theta, eta, subject.obs_cov(j)))
+        .map(|j| seed_for(subject.obs_cov(j)))
         .collect();
 
     let preds = integrate_tvcov_readout::<Dual2<M>>(model, subject, &pk_at_dose, &pk_at_obs);
@@ -1354,11 +1368,21 @@ fn run_subject_tvcov_eta<const N: usize>(
     let prog = ode.indiv_param_program.as_ref()?;
     let n_eta = model.n_eta;
 
+    // Dedup identical covariate snapshots — see `run_subject_tvcov` (#451 re-review #8).
+    let mut snap_cache: Vec<(std::collections::HashMap<String, f64>, Vec<Dual1<N>>)> = Vec::new();
+    let mut seed_for = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual1<N>>> {
+        if let Some((_, v)) = snap_cache.iter().find(|(c, _)| c == cov) {
+            return Some(v.clone());
+        }
+        let v = seed_pk_dual1::<N>(model, prog, theta, eta, cov)?;
+        snap_cache.push((cov.clone(), v.clone()));
+        Some(v)
+    };
     let pk_at_dose: Vec<Vec<Dual1<N>>> = (0..subject.doses.len())
-        .map(|k| seed_pk_dual1::<N>(model, prog, theta, eta, subject.dose_cov(k)))
+        .map(|k| seed_for(subject.dose_cov(k)))
         .collect::<Option<_>>()?;
     let pk_at_obs: Vec<Vec<Dual1<N>>> = (0..subject.obs_times.len())
-        .map(|j| seed_pk_dual1::<N>(model, prog, theta, eta, subject.obs_cov(j)))
+        .map(|j| seed_for(subject.obs_cov(j)))
         .collect::<Option<_>>()?;
 
     let preds = integrate_tvcov_readout::<Dual1<N>>(model, subject, &pk_at_dose, &pk_at_obs);

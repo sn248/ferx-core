@@ -41,7 +41,7 @@ Rscript nlmixr2.R              # prints OFV, AIC, log_lambda (+SE), omega
 ```
 
 Paste both into the **Mixed-effects** table in `expected.md` (and, optionally, the
-matching table in `docs/src/estimation/tte.md`).
+matching table in `docs/estimation/tte.qmd`).
 
 ## What ferx + survreg already give (the targets to compare against)
 

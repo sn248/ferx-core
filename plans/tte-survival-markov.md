@@ -2158,12 +2158,12 @@ and the `predict_survival` R wrapper remain.
   `event_model_covariate_names_tracked`, `predict_survival_has_median_and_mean`
 
 **Docs:**
-- ✅ `docs/src/estimation/tte.md` — overview, syntax, DV coding, TENTRY, hazard families
+- ✅ `docs/estimation/tte.qmd` — overview, syntax, DV coding, TENTRY, hazard families
   table (with `exp(loghr)` multiplier), loghr examples, estimation notes, placeholder
   NONMEM/nlmixr2 comparison table
-- ✅ `docs/src/model-file/event-model.md` — `[event_model]` key reference including
+- ✅ `docs/model-file/event-model.qmd` — `[event_model]` key reference including
   `loghr` and `rate`; expression namespace Note callout
-- ✅ `docs/src/SUMMARY.md` updated
+- ✅ `docs/_quarto.yml` sidebar updated
 
 **Examples + data:**
 - ✅ `examples/tte_exponential.ferx` (using correct theta/eta expressions)
@@ -2221,7 +2221,7 @@ and the `predict_survival` R wrapper remain.
   `slow-tests.yml` now passes `survival` so these run nightly.
 - ✅ Reference comparison — datasets regenerated (canonical `tte_exp.csv` 100-subj, `tte_weibull.csv`
   100-subj, `tte_gompertz.csv` 300-subj RCT); **ferx FOCEI + base-R `survreg` + nlmixr2 FOCEI columns
-  all filled** in each `expected.md` + `docs/src/estimation/tte.md`. ferx ↔ nlmixr2 agree to ~3 digits
+  all filled** in each `expected.md` + `docs/estimation/tte.qmd`. ferx ↔ nlmixr2 agree to ~3 digits
   on parameters and (Exp/Weibull) −2LL; **only the NONMEM column is a hand-off** (per-family `README.md`
   + zips — needs a NONMEM licence). nlmixr2 ran locally (macOS gfortran FLIBS workaround). Tracked in **#440**.
 - ⚠️ **Finding (#440): FOCEI-Laplace over-estimates frailty ω² on *nonlinear* hazard parameters**
@@ -2255,7 +2255,7 @@ No new infrastructure beyond Phase 1 — this is multiple TTE endpoints with per
 - **Prediction**: per-cause `Prediction::Survival`; cause-specific cumulative incidence
   function (CIF) `∫₀ᵗ h_k(u)·S_all(u) du` reported as a derived output
 - Reference: NONMEM cause-specific hazard; `survival::survfit` CIF (R, free)
-- Docs + comparison table in `docs/src/estimation/tte.md`; **Tier 3 SSE** (two competing causes)
+- Docs + comparison table in `docs/estimation/tte.qmd`; **Tier 3 SSE** (two competing causes)
 
 **Note (Fine–Gray):** subdistribution-hazard / Fine–Gray CIF modeling is **deferred** (§10.2)
 — it needs IPCW weighting and is numerically unstable for sparse data. Cause-specific hazard
@@ -2290,7 +2290,7 @@ covers the standard pharmacometric use case.
 - **Simulation** (§8.8.4): repeated event sampling to `[simulation] horizon`; for `clock=reset`
   restart the hazard clock per event; final administrative censoring at `horizon`
 - SAEM validation vs. nlmixr2 SAEM (primary), NONMEM IMP (secondary)
-- Docs: `docs/src/estimation/rtte.md` with estimation method guidance
+- Docs: `docs/estimation/rtte.qmd` with estimation method guidance
 - Tests: Tier 3 SAEM convergence; **Tier 3 SSE** (simulate RTTE → fit → recover)
 
 ### Phase 3b — SAEM proposal option (can happen alongside Phase 3)
@@ -2309,7 +2309,7 @@ not an approximation. Low regression risk: `random_walk` path is unchanged code.
 - Fallback: if Laplace Cholesky fails (non-PD Hessian), silently fall back to random-walk
   for that subject
 - Benchmark: convergence iterations (warfarin SAEM + RTTE dataset) for all three modes
-- Docs: `docs/src/model-file/fit-options.md` — `saem_proposal` entry with guidance table
+- Docs: `docs/model-file/fit-options.qmd` — `saem_proposal` entry with guidance table
 
 ### Phase 4 — Categorical and Count Models
 
@@ -2362,7 +2362,7 @@ full CTMM. Validates state-observation data reader and CTMM NLL before matrix ex
 - Tier 1 unit test: `matrix_exp` vs. series expansion for 2×2 and 3×3 Q
 - Tier 3 convergence test: 3-state CTMM vs. R `msm` (CAV dataset)
 - **Tier 3 SSE**: simulate path → fit Q → recover rates
-- Docs: `docs/src/estimation/ctmm.md` with NONMEM infeasibility rationale
+- Docs: `docs/estimation/ctmm.qmd` with NONMEM infeasibility rationale
 
 Gate: `#[cfg(feature = "markov")]` initially.
 

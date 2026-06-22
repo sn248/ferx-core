@@ -111,6 +111,17 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if model.pk_indices.iter().any(|&s| s == PK_IDX_LAGTIME) {
         return false;
     }
+    // Per-compartment bioavailability (`F1`/`F2`, #369): production resolves
+    // `f_bio(d.cmt)` per dose compartment, but both the static `integrate_g` and the
+    // TV-cov walk apply the single bare `PK_IDX_F` slot to every dose. A model with a
+    // compartment-indexed `F` would get the wrong analytic gradient, so decline it to
+    // FD (the bare-`F` / no-`F` case is unaffected) (#449 review #7).
+    if model
+        .active_dose_attr_map()
+        .has_indexed_attr(crate::types::DoseAttr::F)
+    {
+        return false;
+    }
     // The η/θ chain evaluates the individual-parameter program over `Dual2`
     // seeded on (θ, η); require it present, with matching axis counts (no NN-θ /
     // IOV), and within the analytic-chain dual-width cap.
@@ -175,6 +186,15 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
 /// outer and inner entry points so the analytic scope stays matched (#439).
 pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> bool {
     if !ode_analytical_supported(model) || !subject.has_tv_covariates() {
+        return false;
+    }
+    // Bound total axes so BOTH TV-cov dispatch tables resolve: the outer
+    // `run_subject_tvcov` dispatches `M = n_theta + n_eta` and the inner
+    // `run_subject_tvcov_eta` dispatches `n_eta`, each over `1..=MAX_ODE_AXES`. With
+    // `n_eta ≤ n_theta + n_eta ≤ MAX_ODE_AXES`, both succeed — so the inner and outer
+    // analytic scope stay matched (never an analytic outer with an FD inner, and no
+    // silent `_ => None` downgrade) (#449 review #4).
+    if model.n_theta + model.n_eta > MAX_ODE_AXES {
         return false;
     }
     let Some(ode) = model.ode_spec.as_ref() else {
@@ -267,7 +287,9 @@ pub fn ode_subject_eta_grad(
                 }
             };
         }
-        return dispatch_tv!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+        // Up to MAX_ODE_AXES (matches the outer `run_subject_tvcov` M-dispatch and
+        // the `ode_tvcov_supported` axis bound), so inner/outer stay matched (#449 #4).
+        return dispatch_tv!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
     }
     if !ode_subject_supported(model, subject) {
         return None;
@@ -511,6 +533,13 @@ fn dual1_init_state<const N: usize>(
 /// (`p = max(p, LTBS_FLOOR).ln()`; below the floor the value is clamped to a
 /// constant, so the jet vanishes).
 fn apply_output_transform<T: crate::sens::num::PkNum>(model: &CompiledModel, p: T) -> T {
+    // A NaN readout (e.g. a per-CMT map miss — rejected upstream by fit-time
+    // `validate_per_cmt_scaling`, so unreachable in a real fit) must stay NaN as a
+    // visible tripwire: neither the `ScalarScale` divisor nor the LTBS floor below
+    // may silently convert it to a finite value with zero derivatives (#449 review).
+    if p.val().is_nan() {
+        return p;
+    }
     let p = match model.scaling {
         ScalingSpec::ScalarScale(k) if k != 1.0 => p * T::from_f64(1.0 / k),
         _ => p,
@@ -610,6 +639,15 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
                     .and_then(|r| r.program.as_ref())
                     .map(|p| p.eval_output_g::<T>(st, &params_dual, &mut ro_vars, &mut ro_stack))
                     .unwrap_or(T::from_f64(f64::NAN)),
+            };
+            // Negative-readout clamp (ODE overshoot guard), parity with production's
+            // `conc.max(0)` (predictions.rs) and the TV-cov walks: a clamped value
+            // carries zero derivatives. A NaN readout is `< 0.0` → false, so it passes
+            // through and `apply_output_transform` preserves it as a tripwire (#449 review).
+            let raw = if raw.val() < 0.0 {
+                T::from_f64(0.0)
+            } else {
+                raw
             };
             apply_output_transform::<T>(model, raw)
         })
@@ -1146,9 +1184,13 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         }
         if is_dose {
             let d = &subject.doses[idx];
-            let cmt_idx = d.cmt.saturating_sub(1);
-            if cmt_idx < n_states {
-                u[cmt_idx] = u[cmt_idx] + f_bio_at_dose[idx] * T::from_f64(d.amt);
+            // CMT is 1-based; a malformed `CMT=0` must not silently dose compartment
+            // 0 (the datareader rejects it upstream) (#449 review #8).
+            if d.cmt >= 1 {
+                let cmt_idx = d.cmt - 1;
+                if cmt_idx < n_states {
+                    u[cmt_idx] = u[cmt_idx] + f_bio_at_dose[idx] * T::from_f64(d.amt);
+                }
             }
         } else {
             states[idx].copy_from_slice(&u);
@@ -1259,10 +1301,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             u.copy_from_slice(init_state);
         }
 
-        // Apply bolus doses (non-infusions) at t_start: u[cmt] += F·amt.
+        // Apply bolus doses (non-infusions) at t_start: u[cmt] += F·amt. CMT is
+        // 1-based; a malformed `CMT=0` must not silently dose compartment 0 (#449 #8).
         for dose in &subject.doses {
-            if !dose.is_infusion() && (dose.time - t_start).abs() < 1e-12 {
-                let cmt_idx = dose.cmt.saturating_sub(1);
+            if !dose.is_infusion() && (dose.time - t_start).abs() < 1e-12 && dose.cmt >= 1 {
+                let cmt_idx = dose.cmt - 1;
                 if cmt_idx < n_states {
                     u[cmt_idx] = u[cmt_idx] + f_bio * T::from_f64(dose.amt);
                 }
@@ -2120,6 +2163,40 @@ mod tests {
                     max_relative = 1e-3,
                     epsilon = 1e-6
                 );
+            }
+            // Second order (#449 review #3): the Hessian blocks `d2f_deta2` /
+            // `d2f_deta_dtheta` feed FOCEI's `log|H̃|` gradient and covariance, but
+            // were untested. Validate them by central-differencing the analytic
+            // first-order `df_deta` / `df_dtheta` (themselves checked above) w.r.t. η.
+            let grad_at = |e: &[f64]| -> (Vec<f64>, Vec<f64>) {
+                let s = run_subject_tvcov::<4>(&model, &subject, &theta, e).expect("tvcov");
+                (s.obs[j].df_deta.clone(), s.obs[j].df_dtheta.clone())
+            };
+            for k in 0..model.n_eta {
+                let mut ep = eta.clone();
+                ep[k] += he;
+                let mut em = eta.clone();
+                em[k] -= he;
+                let (de_p, dt_p) = grad_at(&ep);
+                let (de_m, dt_m) = grad_at(&em);
+                for l in 0..model.n_eta {
+                    let d2 = (de_p[l] - de_m[l]) / (2.0 * he);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta2[k * model.n_eta + l],
+                        d2,
+                        max_relative = 2e-3,
+                        epsilon = 1e-6
+                    );
+                }
+                for m in 0..model.n_theta {
+                    let d2 = (dt_p[m] - dt_m[m]) / (2.0 * he);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta_dtheta[k * model.n_theta + m],
+                        d2,
+                        max_relative = 2e-3,
+                        epsilon = 1e-6
+                    );
+                }
             }
         }
     }

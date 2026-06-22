@@ -221,11 +221,20 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 }
 
 /// Whether the light **ODE inner** η-gradient (`Dual1`) serves this model+subject:
-/// the master switch is armed and the subject is in the per-subject ODE scope
-/// ([`crate::sens::ode_provider::ode_subject_supported`]). Used by the inner loop
-/// to pick the analytic η-gradient over FD for in-scope ODE subjects (#410).
+/// the master switch is armed and the subject is in the per-subject ODE scope —
+/// either the static superposition walk ([`ode_subject_supported`]) or the
+/// event-driven TV-cov walk ([`ode_tvcov_supported`]). Both are wired in
+/// [`ode_subject_eta_grad`], so the inner EBE loop takes the analytic η-gradient
+/// for TV-cov subjects too, matching the outer scope rather than splitting to an
+/// FD inner (#410; #449 review — the TV-cov inner gate was previously missing).
+///
+/// [`ode_subject_supported`]: crate::sens::ode_provider::ode_subject_supported
+/// [`ode_tvcov_supported`]: crate::sens::ode_provider::ode_tvcov_supported
+/// [`ode_subject_eta_grad`]: crate::sens::ode_provider::ode_subject_eta_grad
 pub(crate) fn ode_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
-    ODE_SENS_ENABLED && crate::sens::ode_provider::ode_subject_supported(model, subject)
+    ODE_SENS_ENABLED
+        && (crate::sens::ode_provider::ode_subject_supported(model, subject)
+            || crate::sens::ode_provider::ode_tvcov_supported(model, subject))
 }
 
 /// The per-observation `∂f/∂η` Jacobian (`n_obs × n_eta`, row-major) as a flat
@@ -1215,9 +1224,10 @@ fn run_obs_grad_tvcov<const N: usize>(
     use crate::sens::ode_provider::param_derivatives_at_cov;
     use crate::sens::propagate::{event_driven_sens_g, PkDual};
 
-    let mk = |cov: &std::collections::HashMap<String, f64>| -> PkDual<Dual1<N>> {
-        let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)
-            .expect("tvcov gate guarantees the program axes match");
+    let mk = |cov: &std::collections::HashMap<String, f64>| -> Option<PkDual<Dual1<N>>> {
+        // `None` above the param-derivative dispatch cap (n_axes > 16): decline so
+        // the inner loop falls back to FD rather than panicking (#449 review #1).
+        let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
         let pk = (model.pk_param_fn)(theta, eta, cov);
         let seed_row = |i: usize, val: f64| -> Dual1<N> {
             let mut grad = [0.0; N];
@@ -1232,7 +1242,7 @@ fn run_obs_grad_tvcov<const N: usize>(
                 None => Dual1::<N>::constant(val),
             }
         };
-        PkDual {
+        Some(PkDual {
             cl: dv(PK_IDX_CL, pk.cl()),
             v: dv(PK_IDX_V, pk.v()),
             q: dv(PK_IDX_Q, pk.q()),
@@ -1241,18 +1251,18 @@ fn run_obs_grad_tvcov<const N: usize>(
             q3: dv(PK_IDX_Q3, pk.q3()),
             v3: dv(PK_IDX_V3, pk.v3()),
             f: dv(PK_IDX_F, pk.f_bio()),
-        }
+        })
     };
 
     let pk_at_dose: Vec<PkDual<Dual1<N>>> = (0..subject.doses.len())
         .map(|k| mk(subject.dose_cov(k)))
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     let pk_at_obs: Vec<PkDual<Dual1<N>>> = (0..subject.obs_times.len())
         .map(|j| mk(subject.obs_cov(j)))
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     let pk_at_pk_only: Vec<PkDual<Dual1<N>>> = (0..subject.pk_only_times.len())
         .map(|m| mk(subject.pk_only_cov(m)))
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
 
     let dose_lagtimes = vec![0.0; subject.doses.len()];
     let schedule =

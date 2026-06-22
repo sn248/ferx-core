@@ -20,17 +20,24 @@ recovery of the *truth*.
 
 | Parameter | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM LAPLACIAN |
 |---|---|---|---|---|
-| lambda_pop (rate) | 0.100 | **0.0768** | **0.0770** | TODO |
-| log(lambda_pop) | −2.303 | **−2.567** | **−2.5626** | TODO |
-| omega^2 (var log-rate) | 0.250 | **0.290** | **0.293** | TODO |
-| OFV (−2LL) | — | **588.93** | **588.94** | TODO |
+| lambda_pop (rate) | 0.100 | **0.0768** | **0.0770** | ⏳ run `nonmem_frailty.ctl` |
+| log(lambda_pop) | −2.303 | **−2.567** | **−2.5626** | ⏳ pending |
+| omega^2 (var log-rate) | 0.250 | **0.290** | **0.293** | ⏳ pending |
+| OFV (−2LL) | — | **588.93** | **588.94** | ⏳ pending |
+
+> **NONMEM status (2026-06-22):** the hand-off `nonmem.ctl` was run as **fixed-effects**
+> (`$OMEGA 0 FIX`, `$ESTIMATION METHOD=0`), so it fills the fixed-effects anchor below — **not**
+> this frailty column. The earlier frailty attempts failed only at NM-TRAN *translation* (reserved
+> `$PRED` name `H`; `$TABLE IPRED PRED` undefined for an `F_FLAG=1` likelihood model), never at
+> estimation — sample size was not the cause. **`nonmem_frailty.ctl`** restores the estimated
+> `$OMEGA` + `CONDITIONAL LAPLACIAN INTERACTION` (FO is invalid for a likelihood model with random
+> effects); run it on a licensed machine to fill this column.
 
 ferx ↔ nlmixr2 FOCEI **agree to ~3 digits on every parameter and the −2LL** — strong
 license-free cross-tool validation. (nlmixr2's raw "OBJF" 405.15 omits the data normalizing
 constants; the comparable −2LL is `AIC − 2·npar = 592.94 − 4 = 588.94`, §11.3.) ferx values:
 `cargo test --features survival,slow-tests --test tte_convergence`
-(`tte_convergence_exponential_mixed`); nlmixr2 from `nlmixr2.R`. Fill the NONMEM column from
-`nonmem.ctl` — see `README.md`.
+(`tte_convergence_exponential_mixed`); nlmixr2 from `nlmixr2.R`.
 
 ## Fixed-effects (n_eta = 0) — exact, license-free anchor
 
@@ -38,12 +45,17 @@ For a censored Exponential the MLE is the closed form `lambda = events / sum(tim
 82 / 1100.6`. This is exactly what the ferx fixed-effects (`n_eta = 0`) fit maximises,
 so it must match base-R `survival::survreg` to numerical tolerance.
 
-| Quantity | ferx (fixed) | survival::survreg | agreement |
-|---|---|---|---|
-| lambda (rate) | 0.074506 | 0.074506 | exact (rel err < 1e-4) |
-| OFV / −2logLik | 589.888 | 589.888 | exact (≤ 1e-3) |
+This is exactly the model the hand-off **`nonmem.ctl`** ran (`$OMEGA 0 FIX`), so all four tools
+line up here:
 
-Reproduce survreg: `Rscript survreg.R` (uses only base-R `survival`).
+| Quantity | ferx (n_eta=0) | survreg | nlmixr2 (no η) | NONMEM (ω²=0 FIX) |
+|---|---|---|---|---|
+| lambda (rate) | 0.074506 | 0.074506 | 0.074506 | 0.07449 (θ₁ −2.59709) |
+| OFV / −2logLik | 589.888 | 589.888 | (OBJF n/c) | 589.888 |
+
+λ agrees across all four to **<0.03%**; ferx / survreg / NONMEM −2logLik are **identical**
+(589.888). nlmixr2's raw OBJF omits normalizing constants → compare parameters, not OFV.
+Reproduce: `Rscript survreg.R` (base-R), `Rscript nlmixr2_fixed.R` (nlmixr2 no-η).
 
 ## Simulation–estimation (SSE) recovery — truth check, N = 2000
 
@@ -68,7 +80,8 @@ The ~7% `omega^2` shortfall is the expected **mild FOCEI-Laplace bias for TTE**
 | SSE lambda_pop recovery (N=2000) | ±10% | ✅ −1% |
 | SSE omega^2 recovery (N=2000) | ±15% | ✅ −7% |
 | ferx vs **nlmixr2** FOCEI on tte_exp.csv | lambda ±5%; −2LL match | ✅ agree to ~3 digits |
-| ferx vs **NONMEM** on tte_exp.csv | point estimates; OFV mod. constants (§11.3) | ⏳ pending hand-off run |
+| **NONMEM** fixed-effects (ω²=0 FIX) vs ferx/survreg | λ ±5%; −2LL match | ✅ λ <0.03%, −2LL 589.888 identical |
+| **NONMEM** frailty (LAPLACIAN) vs ferx/nlmixr2 | point estimates | ⏳ run `nonmem_frailty.ctl` |
 
 ## Notes
 

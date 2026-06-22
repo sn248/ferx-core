@@ -21,15 +21,21 @@ This is the `n_eta = 0` path (plan §16 D7) and exercises the `[event_model]` co
 `loghr` term. There is no base-R/`survreg` anchor for Gompertz, so recovery of the
 data-generating parameters is the guard; NONMEM / nlmixr2 are the cross-tool hand-off.
 
-| Parameter | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM LAPLACIAN |
+| Parameter | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM (fixed-effects) |
 |---|---|---|---|---|
-| alpha (≙ log_alpha) | 0.00248 (−6.00) | **0.002471 (−6.003)** | **0.00239 (−6.037)** | TODO |
-| gamma (≙ log_gamma) | 0.00450 (−5.40) | **0.004525 (−5.398)** | **0.00462 (−5.376)** | TODO |
-| log_hr | −0.800 | **−0.803** | **−0.781** | TODO |
-| OFV | — | 3011.12 | OBJF 3562.5 † | TODO |
+| alpha (≙ log_alpha) | 0.00248 (−6.00) | **0.002471 (−6.003)** | **0.00239 (−6.037)** | **0.002463 (−6.006)** |
+| gamma (≙ log_gamma) | 0.00450 (−5.40) | **0.004525 (−5.398)** | **0.00462 (−5.376)** | **0.004529 (−5.397)** |
+| log_hr | −0.800 | **−0.803** | **−0.781** | **−0.797** |
+| OFV | — | 3011.12 | OBJF 3562.5 † | **3011.121** |
 
 ferx and nlmixr2 FOCEI recover all three parameters within ~3% on the log scale — strong
 license-free agreement (`tte_convergence_gompertz_rct_recovers` / `nlmixr2.R`).
+
+> **The NONMEM column is genuine here.** Gompertz is intended as fixed-effects, so the hand-off
+> `nonmem.ctl` (`$OMEGA 0 FIX`, `METHOD=0`) *is* the right model — no `nonmem_frailty.ctl` needed.
+> NONMEM lands within **0.06% of ferx on the log scale** and its **OFV is identical (3011.12)**,
+> confirming ferx's Gompertz hazard *and* likelihood constants match NONMEM. (NONMEM `H`→`HAZ`
+> rename + `DUMMY=ETA(1)`/`$OMEGA 0 FIX` were the required NM-TRAN fixes.)
 
 > † **OFV is not cross-tool comparable for Gompertz.** ferx's OFV (3011) is the true −2LL
 > (its convention matches `survreg` exactly for Exponential/Weibull); nlmixr2's objective uses
@@ -67,6 +73,7 @@ parameters recover; SAEM/IMP are the recommended estimators for these (plan §3.
 | Frailty-SSE gamma recovery | ±10% | ✅ +8% |
 | Frailty-SSE omega^2 | — | ⚠️ FOCEI over-estimates (+62%); see #440 |
 | ferx vs **nlmixr2** FOCEI on tte_gompertz.csv | log_alpha/gamma/hr within ~3% | ✅ params agree (OFV not comparable) |
-| ferx vs **NONMEM** on tte_gompertz.csv | point estimates; OFV mod. constants | ⏳ pending hand-off run |
+| ferx vs **NONMEM** (fixed-effects) on tte_gompertz.csv | log params ±5%; OFV | ✅ ≤0.06% on logs, OFV 3011.12 identical |
 
-Run NONMEM (`nonmem.ctl`) / nlmixr2 (`nlmixr2.R`) to fill the remaining columns — see `README.md`.
+All three tools now filled — Gompertz is fully cross-validated (NONMEM = intended fixed-effects
+model). nlmixr2 from `nlmixr2.R`; NONMEM from `nonmem.ctl`.

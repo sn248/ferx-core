@@ -210,7 +210,7 @@ grows at low event rates; SAEM/IMP reduce it). On the 100-subject file itself:
 
 | Parameter | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM (LAPLACIAN) |
 |-----------|------|-----------|---------------|--------------------|
-| TVLAMBDA (rate) | 0.10 | 0.0768 | 0.0770 | _pending_ |
+| TVLAMBDA (rate) | 0.10 | 0.0768 | 0.0770 | _run `nonmem_frailty.ctl`_ |
 | ω²(ETA_LAMBDA) | 0.25 | 0.290 | 0.293 | _pending_ |
 | OFV (−2LL) | — | 588.93 | 588.94 | _pending_ |
 
@@ -219,9 +219,13 @@ families (Weibull and Gompertz likewise — see `tests/reference/tte_*/expected.
 nonlinear-frailty Weibull `omega^2` the two FOCEI tools differ (0.204 vs 0.173), itself
 evidence for the over-estimation note above.
 
-> NONMEM reports `THETA(1)=log λ`; compare `exp(THETA(1))` to ferx `TVLAMBDA`. The NONMEM
-> columns are filled by running `nonmem.ctl` (see each `tests/reference/tte_*/README.md`). A
-> small OFV offset between tools is expected from differing normalising constants (§11.3).
+> NONMEM reports `THETA(1)=log λ`; compare `exp(THETA(1))` to ferx `TVLAMBDA`. The hand-off
+> `nonmem.ctl` was run as **fixed-effects** (`$OMEGA 0 FIX`, FO) and matches ferx/`survreg`
+> exactly (λ 0.0745, −2LL 589.888); filling this **frailty** column needs the corrected
+> `nonmem_frailty.ctl` (estimated ω² + `LAPLACIAN` — FO is invalid for a likelihood model with
+> random effects). **Gompertz** (intended fixed-effects) is already fully cross-validated: NONMEM
+> matches ferx to OFV 3011.12. A small OFV offset from differing normalising constants is
+> expected for nlmixr2 (§11.3).
 
 ### nlmixr2 equivalent
 

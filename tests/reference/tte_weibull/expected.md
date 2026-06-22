@@ -18,11 +18,16 @@ censored (16%)**. Scale parameterisation: `H(t) = (t/scale)^shape`.
 `shape = 1/scale_sr`, `scale = exp(intercept)` (see `survreg.R`). A ferx fixed-effects
 Weibull fit must match it:
 
-| Quantity | ferx (fixed) | survival::survreg | agreement |
-|---|---|---|---|
-| scale | 22.1766 | 22.1766 | exact (< 1e-3) |
-| shape | 2.1192 | 2.1193 | exact (< 1e-3) |
-| OFV / −2logLik | 640.261 | 640.261 | exact |
+This is exactly the model the hand-off **`nonmem.ctl`** ran (`$OMEGA 0 FIX`, `METHOD=0`):
+
+| Quantity | ferx (n_eta=0) | survreg | nlmixr2 (no η) | NONMEM (ω²=0 FIX) |
+|---|---|---|---|---|
+| scale | 22.1766 | 22.1766 | 22.2064 | 22.173 (θ₁ 3.09887) |
+| shape | 2.1192 | 2.1193 | 2.1151 | 2.119 (θ₂ 0.750983) |
+| OFV / −2logLik | 640.261 | 640.261 | (OBJF n/c) | 640.261 |
+
+scale agrees to **~0.13%**, shape to **~0.2%**; ferx / survreg / NONMEM −2logLik **identical**
+(640.261). Reproduce: `Rscript survreg.R`, `Rscript nlmixr2_fixed.R`.
 
 (The pooled fixed-effects shape 2.12 ≠ the data-generating 2.0 because it collapses the
 shape variability — that is what the SSE checks separately.)
@@ -31,10 +36,15 @@ shape variability — that is what the SSE checks separately.)
 
 | Parameter | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM LAPLACIAN |
 |---|---|---|---|---|
-| scale | 20.0 | **21.87** | **21.87** | TODO |
-| shape | 2.0 | **2.21** | **2.20** | TODO |
-| omega^2 (var log-shape) | 0.20 | **0.204** | **0.173** | TODO |
-| OFV (−2LL) | — | **639.99** | **639.99** | TODO |
+| scale | 20.0 | **21.87** | **21.87** | ⏳ run `nonmem_frailty.ctl` |
+| shape | 2.0 | **2.21** | **2.20** | ⏳ pending |
+| omega^2 (var log-shape) | 0.20 | **0.204** | **0.173** | ⏳ pending ← value to arbitrate |
+| OFV (−2LL) | — | **639.99** | **639.99** | ⏳ pending |
+
+> **NONMEM status (2026-06-22):** the hand-off `nonmem.ctl` was run as **fixed-effects**
+> (`$OMEGA 0 FIX`, `METHOD=0`) — it fills the fixed-effects anchor above, not this frailty column.
+> The frailty attempts failed only at NM-TRAN translation (reserved `H`; `$TABLE IPRED`), never at
+> estimation. Run **`nonmem_frailty.ctl`** (estimated ω² + LAPLACIAN) to get the third ω² for #440.
 
 > ferx ↔ nlmixr2 FOCEI agree to ~3 digits on `scale`, `shape` and the −2LL — but the
 > shape-frailty `omega^2` differs (0.204 vs 0.173) **between two FOCEI implementations**.
@@ -69,6 +79,8 @@ structural parameters (`scale`, `shape`) recover well under both estimators.
 | SSE scale & shape recovery (N=2000) | ±5% | ✅ ±2% |
 | SSE omega^2 (nonlinear frailty) | — | ⚠️ FOCEI over-estimates (+72%); SAEM ~0.13; see #440 |
 | ferx vs **nlmixr2** FOCEI on tte_weibull.csv | scale/shape + −2LL match (ω² differs, see #440) | ✅ scale/shape/−2LL agree |
-| ferx vs **NONMEM** on tte_weibull.csv | point estimates; OFV mod. constants | ⏳ pending hand-off run |
+| **NONMEM** fixed-effects (ω²=0 FIX) vs ferx/survreg | scale/shape ±1%; −2LL match | ✅ ≤0.2%, −2LL 640.261 identical |
+| **NONMEM** frailty (LAPLACIAN) vs ferx/nlmixr2 | point estimates; the #440 ω² | ⏳ run `nonmem_frailty.ctl` |
 
-Run NONMEM (`nonmem.ctl`) / nlmixr2 (`nlmixr2.R`) to fill the remaining columns — see `README.md`.
+Fixed-effects nlmixr2 from `nlmixr2_fixed.R`; the frailty NONMEM column needs `nonmem_frailty.ctl`
+(corrected estimated-ω² + LAPLACIAN file) run on a licensed machine — see `README.md`.

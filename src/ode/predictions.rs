@@ -555,7 +555,17 @@ pub enum OdeReadout {
     /// `subject.obs_cmts[i]`, which is `usize`). Fit-time validation
     /// enforces that every observed CMT has an entry; missing entries
     /// fall through to NaN at runtime as a defensive guard.
-    PerCmt(HashMap<usize, OdeOutputFn>),
+    PerCmt(HashMap<usize, PerCmtReadout>),
+}
+
+/// One per-CMT Form-C readout (`y[CMT=N] = <expr>`): the f64 closure the production
+/// predictor calls, plus the optional `PkNum`-differentiable program the analytic
+/// sensitivity provider evaluates over `Dual2`/`Dual1` (issue #439). `program` is
+/// `None` for hand-constructed readouts that bypass the parser — those keep the f64
+/// FD path (the dual provider declines them).
+pub struct PerCmtReadout {
+    pub out_fn: OdeOutputFn,
+    pub program: Option<crate::parser::model_parser::OdeOutputProgram>,
 }
 
 /// Read the observable value at observation `obs_idx`.
@@ -576,7 +586,7 @@ fn read_observable(
         OdeReadout::ObsCmt(idx) => u[*idx],
         OdeReadout::Single(out_fn) => out_fn(u, pk_params_flat, theta, eta, covariates),
         OdeReadout::PerCmt(map) => match map.get(&obs_cmt) {
-            Some(out_fn) => out_fn(u, pk_params_flat, theta, eta, covariates),
+            Some(r) => (r.out_fn)(u, pk_params_flat, theta, eta, covariates),
             // Parser + fit-time validation guarantee every observed CMT
             // has an entry. NaN here is a defensive guard against
             // hand-constructed CompiledModels that bypassed validation —
@@ -3351,9 +3361,21 @@ mod tests {
         // distinct, finite readouts of the same single-state system, so we can
         // confirm each observation got its own value (not one overwriting the
         // other).
-        let mut map: HashMap<usize, OdeOutputFn> = HashMap::new();
-        map.insert(1, Box::new(|s: &[f64], _pk: &[f64], _t, _e, _c| s[0]));
-        map.insert(2, Box::new(|s: &[f64], _pk: &[f64], _t, _e, _c| 2.0 * s[0]));
+        let mut map: HashMap<usize, PerCmtReadout> = HashMap::new();
+        map.insert(
+            1,
+            PerCmtReadout {
+                out_fn: Box::new(|s: &[f64], _pk: &[f64], _t, _e, _c| s[0]),
+                program: None,
+            },
+        );
+        map.insert(
+            2,
+            PerCmtReadout {
+                out_fn: Box::new(|s: &[f64], _pk: &[f64], _t, _e, _c| 2.0 * s[0]),
+                program: None,
+            },
+        );
         let mut ode = one_cpt_ode_spec();
         ode.readout = OdeReadout::PerCmt(map);
 
@@ -3385,10 +3407,13 @@ mod tests {
         // Build an OdeReadout::PerCmt that DELIBERATELY returns NaN for
         // CMT=1 — emulating a missing-CMT lookup that bypassed pre-fit
         // validation. The resulting prediction must be NaN, not 0.
-        let mut map: HashMap<usize, OdeOutputFn> = HashMap::new();
+        let mut map: HashMap<usize, PerCmtReadout> = HashMap::new();
         map.insert(
             1,
-            Box::new(|_state: &[f64], _pk: &[f64], _theta, _eta, _cov| f64::NAN),
+            PerCmtReadout {
+                out_fn: Box::new(|_state: &[f64], _pk: &[f64], _theta, _eta, _cov| f64::NAN),
+                program: None,
+            },
         );
         let mut ode = one_cpt_ode_spec();
         ode.readout = OdeReadout::PerCmt(map);

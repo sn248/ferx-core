@@ -4318,9 +4318,10 @@ fn parse_scaling_block(
     let mut obs_scale_uniform: Option<ScalingSpec> = None;
     let mut obs_scale_per_cmt: HashMap<usize, ScalingSpec> = HashMap::new();
     let mut y_uniform: Option<crate::ode::OdeOutputFn> = None;
-    let mut y_per_cmt: HashMap<usize, crate::ode::OdeOutputFn> = HashMap::new();
-    // Sensitivity program for the uniform `y = <expr>` readout (issue #367); the
-    // per-CMT form is out of the analytic-sensitivity scope, so it carries none.
+    let mut y_per_cmt: HashMap<usize, crate::ode::PerCmtReadout> = HashMap::new();
+    // Sensitivity program for the uniform `y = <expr>` readout (issue #367). The
+    // per-CMT readouts carry their own program inside each `PerCmtReadout` (#439),
+    // so the analytic-sensitivity provider can differentiate each endpoint.
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
 
     for line in lines {
@@ -4432,7 +4433,13 @@ fn parse_scaling_block(
                         if y_per_cmt.contains_key(&cmt) {
                             return Err(format!("[scaling]: duplicate `y[CMT={}]` key", cmt));
                         }
-                        y_per_cmt.insert(cmt, out_fn);
+                        y_per_cmt.insert(
+                            cmt,
+                            crate::ode::PerCmtReadout {
+                                out_fn,
+                                program: Some(out_program),
+                            },
+                        );
                     }
                 }
             }

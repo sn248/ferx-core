@@ -1421,6 +1421,19 @@ fn eval_rhs_anchored<T: crate::sens::num::PkNum>(
 /// are the per-event flat PK-slot duals pre-seeded by the caller on `(θ,η)` (outer)
 /// or `η` (inner); `f_bio_at_dose[k]` is dose `k`'s bioavailability dual. Returns
 /// one state vector per observation (parallel to `subject.obs_times`).
+///
+/// **Deliberately kept separate from [`integrate_g`]** (the #451 fold was assessed
+/// and declined): the two have divergent control flow that can't merge without
+/// either a regression or a net complexity *increase*. Production's static walk
+/// (`ode_predictions`) — which the static dual `integrate_g` must match to 1e-9 —
+/// integrates each break-time segment under **constant** params and records
+/// observations as **in-segment solver save points**. This TV-cov walk instead
+/// switches params at **every event** (NONMEM end-of-interval), so observations
+/// must be **segment boundaries**, not interior save points. Forcing one
+/// obs-handling form onto both would make the static dual diverge from production
+/// (the 1e-9 risk); keeping both behind a mode branch is just two control flows
+/// glued together. The genuinely shareable pieces — `eval_rhs_anchored`,
+/// `resolve_obs_readout`, `solve_ode_g` — are already factored out and used by both.
 #[allow(clippy::too_many_arguments)]
 fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
@@ -1476,6 +1489,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
     let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
 
+    // TAD anchor: the most recent dose at or before the current segment start. The
+    // timeline is sorted and doses sort before a co-timed obs, so this only advances
+    // as dose events pass — track it incrementally instead of re-scanning all doses
+    // per segment (#451 re-review #6). A dose at the segment start is applied *after*
+    // that segment integrates, so it anchors the *next* segment — matching the prior
+    // `dt <= cur_t` scan.
+    let mut last_dose_eff = f64::NEG_INFINITY;
+
     for &(t_event, _order, is_dose, idx) in &tl {
         // Segment `[cur_t, t_event]` uses the params evaluated at `t_event`.
         let params: &[T] = if is_dose {
@@ -1484,12 +1505,6 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             &pk_at_obs[idx]
         };
         if t_event > cur_t {
-            let last_dose_eff = subject
-                .doses
-                .iter()
-                .map(|d| d.time)
-                .filter(|&dt| dt <= cur_t + 1e-12)
-                .fold(f64::NEG_INFINITY, f64::max);
             let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                 eval_rhs_anchored::<T>(
                     program,
@@ -1522,6 +1537,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     u[cmt_idx] = u[cmt_idx] + f_bio_at_dose[idx] * T::from_f64(d.amt);
                 }
             }
+            // This dose now anchors TAD for every later segment (all dose times count,
+            // matching the prior all-doses scan, regardless of compartment validity).
+            last_dose_eff = last_dose_eff.max(d.time);
         } else {
             states[idx].copy_from_slice(&u);
         }

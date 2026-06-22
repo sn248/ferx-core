@@ -897,8 +897,9 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
 /// Whether the exact analytic η-gradient of the individual NLL
 /// ([`analytic_eta_nll_gradient`]) applies to this model/subject: the model must
 /// be in scope ([`analytic_inner_grad_supported_model`]) and the *subject* must
-/// not carry features the light inner provider can't serve (survival obs records,
-/// time-varying covariates).
+/// not carry features the light inner provider can't serve. Survival obs records
+/// decline; time-varying covariates / oral infusion are served by the event-driven
+/// inner walk (`subject_eta_grad_tvcov`, #447) when `tvcov_analytical_supported`.
 fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bool {
     // Survival/TTE observation records carry a likelihood term that neither inner
     // provider models — the analytical path declines below, and the light ODE walk
@@ -934,7 +935,17 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     if !analytic_inner_grad_supported_model(model) {
         return false;
     }
-    !subject.has_tv_covariates()
+    // TV-cov / oral-infusion subjects now get the light event-driven inner gradient
+    // (`subject_eta_grad_tvcov`, #447); trust the provider's `None` for the residual
+    // out-of-scope cases (it matches the outer TV-cov scope). Other subjects keep the
+    // static superposition inner. (The survival guard is hoisted to the top of this
+    // function, so it covers this path too.)
+    if subject.has_tv_covariates()
+        || crate::sens::provider::subject_has_oral_infusion(model, subject)
+    {
+        return crate::sens::provider::tvcov_analytical_supported(model);
+    }
+    true
 }
 
 /// Exact η-gradient of the individual NLL `½(η'Ω⁻¹η + ln|Ω| + Σ_j[ε_j²/v_j + ln v_j])`

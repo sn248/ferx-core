@@ -19,7 +19,26 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Performance
+- **Analytic inner η-gradient for time-varying covariates / oral infusion on
+  analytical PK models** (#447). The light `Dual1` inner EBE gradient previously
+  declined these subjects and reverted to finite differences even though the
+  **outer** gradient already served them; it now uses a first-order event-driven
+  walk (`subject_eta_grad_tvcov`, the light mirror of `subject_sensitivities_tvcov`),
+  so the inner EBE loop is exact and replaces FD's `~2·n_eta+1` predictions per step
+  with one. Validated against the FD-validated outer `df_deta` (1-/2-/3-cpt, IV/oral,
+  steady state).
+
 ### Added
+- **Analytic FOCE/FOCEI gradients for time-varying covariates on ODE models** (#439).
+  An ODE model whose covariates change over time (per-event `WT`, `CRCL`, …) with
+  **bolus** dosing now gets the exact analytic outer gradient and the light `Dual1`
+  inner η-gradient instead of falling back to finite differences. The dual is seeded
+  on `(θ,η)` (`M = n_theta + n_eta`) and walked over a per-event event-driven
+  integration, mirroring the analytical TV-cov path and matching production's
+  `ode_predictions_event_driven` predictor bit-for-bit (validated against it + FD).
+  Combined with infusion / steady-state / reset / `init(...)`, TV-cov still falls
+  back to FD.
 - **Analytic gradients for per-CMT (multi-endpoint) ODE readouts** (#439). The
   `[scaling] y[CMT=N] = <expr>` Form-C readout is now differentiated by the ODE
   sensitivity provider — each endpoint's compiled output program is evaluated over

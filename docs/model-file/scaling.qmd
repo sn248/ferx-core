@@ -206,3 +206,14 @@ the production predictor + finite differences on a two-endpoint model) and the
 equals the `Dual2` outer to 1e-9). A dedicated NONMEM cross-check on a
 multi-endpoint model is therefore not re-run here; it is covered transitively by
 #410's validation plus these routing tests.
+
+The **time-varying-covariate** analytic gradient (#439) inherits #410's NONMEM
+validation on the same basis: it switches the per-event PK parameters at each
+covariate breakpoint (the event-driven `Dual2`/`Dual1` walk) but the underlying
+integrator and η/θ chain are unchanged, exactly mirroring how production's
+`compute_predictions_with_tv` switches parameters over `f64`. The walk is verified
+against that production predictor + finite differences — first order by
+`ode_provider_tvcov_matches_production` and the second-order Hessian blocks
+(`d2f_deta2`, `d2f_deta_dtheta`) by central-differencing the validated first-order
+gradient — and the `Dual1` inner equals the `Dual2` outer
+(`ode_provider_tvcov_light_matches_full`).

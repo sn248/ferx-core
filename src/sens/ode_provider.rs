@@ -2911,6 +2911,49 @@ mod tests {
         assert!(!ode_tvcov_supported(&model, &inf));
     }
 
+    /// A model whose individual-parameter program carries more than `MAX_ODE_AXES`
+    /// (16) axes must make `param_derivatives_at_cov` return `None` gracefully (its
+    /// dispatch only specializes `1..=16`, hitting the `_ => None` arm) rather than
+    /// panic — the seeders propagate that `None` via `?`, so the caller falls back to
+    /// FD. (The gate caps `n_theta + n_eta ≤ 16`, so this `_ => None` is otherwise
+    /// reachable only through intermediate-axis inflation — see #455.) (#451 re-review #10)
+    #[test]
+    fn param_derivatives_at_cov_declines_over_max_axes_gracefully() {
+        // 16 thetas + 1 eta = 17 axes (> MAX_ODE_AXES). All thetas feed CL so the
+        // program carries every θ-axis.
+        let n_th = MAX_ODE_AXES;
+        let mut src = String::from("[parameters]\n");
+        for i in 1..=n_th {
+            src += &format!("  theta T{i}(1.0, 0.1, 10.0)\n");
+        }
+        src += "  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04 (sd)\n\
+                [individual_parameters]\n  CL = exp(ETA_CL) * (";
+        src += &(1..=n_th)
+            .map(|i| format!("T{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        src += ")\n  V = T2\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+                [odes]\n  d/dt(central) = -CL/V * central\n[error_model]\n  \
+                DV ~ proportional(PROP_ERR)\n";
+        let model = parse_model_string(&src).expect("parse");
+        assert_eq!(model.n_theta, n_th);
+        assert_eq!(model.n_eta, 1);
+        let prog = model
+            .ode_spec
+            .as_ref()
+            .expect("ode")
+            .indiv_param_program
+            .as_ref()
+            .expect("prog");
+        assert!(prog.n_axes() > MAX_ODE_AXES, "fixture must exceed the cap");
+        let theta = vec![1.0; n_th];
+        let pd = param_derivatives_at_cov(prog, &model, &HashMap::new(), &theta, &[0.1]);
+        assert!(
+            pd.is_none(),
+            "> MAX_ODE_AXES axes must decline to FD, not panic"
+        );
+    }
+
     // ---- #430 slice 1: built-in inverse-Gaussian absorption forcing over Dual2 ----
 
     // 1-cpt oral disposition with Freijer & Post inverse-Gaussian absorption via

@@ -4133,6 +4133,24 @@ mod tests {
                 );
                 (m, s, vec![0.2, 10.0, 0.75], vec![0.12, -0.09])
             },
+            {
+                // Constant `ScalarScale` (`obs_scale = 1000`) on the TV-cov **inner**:
+                // exercises `run_obs_grad_tvcov`'s `∂(f/k)/∂η = (∂f/∂η)/k` division,
+                // which the other inner cases (no output scaling) leave uncovered
+                // (#451 / #449 review #10).
+                let m = parse_model_string(ONECPT_ORAL_TVCOV_SCALED)
+                    .expect("parse 1cpt oral tvcov scaled");
+                let s = tvcov_subject(
+                    vec![bolus(0.0)],
+                    &[70.0],
+                    &[1.0, 2.0, 4.0, 8.0, 24.0],
+                    &[70.0, 72.0, 80.0, 85.0, 90.0],
+                    Vec::new(),
+                    Vec::new(),
+                    &[],
+                );
+                (m, s, vec![0.2, 10.0, 1.5, 0.75], vec![0.15, -0.10, 0.25])
+            },
         ];
         for (model, subject, theta, eta) in &cases {
             let full =

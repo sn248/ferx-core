@@ -380,18 +380,10 @@ pub(crate) fn param_derivatives_from_prog(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<ParamDerivs> {
-    if prog.n_theta_axis() != model.n_theta || prog.n_eta_axis() != model.n_eta {
-        return None;
-    }
-    macro_rules! disp {
-        ($($mm:literal),+) => {
-            match prog.n_axes() {
-                $($mm => Some(pd_from_program::<$mm>(prog, model, &subject.covariates, theta, eta)),)+
-                _ => None,
-            }
-        };
-    }
-    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    // Thin wrapper over the cov-taking [`param_derivatives_at_cov`] at the subject's
+    // static covariates — single dispatch table, no second `1..=16` copy to widen in
+    // lockstep (#449 review #12).
+    param_derivatives_at_cov(prog, model, &subject.covariates, theta, eta)
 }
 
 /// Pack `∂p/∂(θ,η)` and `∂²p/∂(θ,η)²` from the `Dual2<M>` individual parameters,
@@ -803,30 +795,28 @@ fn seed_pk_dual2<const M: usize>(
 ) -> Vec<Dual2<M>> {
     let n_theta = model.n_theta;
     let n_eta = model.n_eta;
+    // The dispatch sizes `M = n_theta + n_eta` exactly (θ on axes `0..n_theta`, η on
+    // `n_theta..M`), so the index guards are always satisfied — flat loops, no `< M`
+    // / `.min(M)` (#449 review #15). The assert pins the invariant.
+    debug_assert_eq!(M, n_theta + n_eta);
     let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
     let pk = (model.pk_param_fn)(theta, eta, cov);
     let mut out: Vec<Dual2<M>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
         let mut grad = [0.0; M];
         let mut hess = [[0.0; M]; M];
-        for m in 0..n_theta.min(M) {
+        for m in 0..n_theta {
             grad[m] = pd.dp_dtheta[i][m];
         }
         for k in 0..n_eta {
-            if n_theta + k < M {
-                grad[n_theta + k] = pd.dp_deta[i][k];
-                for l in 0..n_eta {
-                    if n_theta + l < M {
-                        hess[n_theta + k][n_theta + l] = pd.d2p_deta2[i][k][l];
-                    }
-                }
-                for m in 0..n_theta {
-                    if m < M {
-                        let v = pd.d2p_detadtheta[i][k][m];
-                        hess[n_theta + k][m] = v;
-                        hess[m][n_theta + k] = v;
-                    }
-                }
+            grad[n_theta + k] = pd.dp_deta[i][k];
+            for l in 0..n_eta {
+                hess[n_theta + k][n_theta + l] = pd.d2p_deta2[i][k][l];
+            }
+            for m in 0..n_theta {
+                let v = pd.d2p_detadtheta[i][k][m];
+                hess[n_theta + k][m] = v;
+                hess[m][n_theta + k] = v;
             }
         }
         out[slot] = Dual2 {
@@ -983,12 +973,15 @@ fn seed_pk_dual1<const N: usize>(
     cov: &std::collections::HashMap<String, f64>,
 ) -> Option<Vec<Dual1<N>>> {
     let n_eta = model.n_eta;
+    // The dispatch sizes `N = n_eta` exactly, so the `.min(N)` guard is always a no-op
+    // — flat loop (#449 review #15).
+    debug_assert_eq!(N, n_eta);
     let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
     let pk = (model.pk_param_fn)(theta, eta, cov);
     let mut out: Vec<Dual1<N>> = pk.values.iter().map(|&v| Dual1::constant(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
         let mut grad = [0.0; N];
-        for k in 0..n_eta.min(N) {
+        for k in 0..n_eta {
             grad[k] = pd.dp_deta[i][k];
         }
         out[slot] = Dual1 {
@@ -2232,6 +2225,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The **inner EBE gate** admits a TV-cov bolus subject (#449 review #2): before
+    /// the fix, `ode_inner_grad_supported` → `ode_subject_supported` returned false
+    /// for `has_tv_covariates`, so the inner loop silently ran on FD while the outer
+    /// was analytic. It must now be on, so the analytic `Dual1` TV-cov walk drives
+    /// EBE convergence — matching the outer analytic scope.
+    #[test]
+    fn ode_tvcov_inner_gate_wired() {
+        let model = parse_model_string(ONECPT_ODE_TVCOV).expect("parse");
+        let s = tvcov_subject();
+        assert!(ode_tvcov_supported(&model, &s));
+        assert!(
+            crate::sens::provider::ode_inner_grad_supported(&model, &s),
+            "TV-cov bolus subject must take the analytic inner gradient, not FD"
+        );
     }
 
     /// The TV-cov gate admits a bolus TV-cov subject and declines a static-covariate

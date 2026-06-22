@@ -114,6 +114,26 @@ section of the SDLC for the versioning policy).
   TV-covariate-aware predictor, so they honour per-event covariate breakpoints
   (and EVID=3/4 resets) and agree with each other. Cross-checked against NONMEM
   7.5.1 (ADVAN3 TRANS4, EVID=2 covariate update).
+- **FOCE/FOCEI analytic outer gradients stay enabled for populations that include
+  dosing-only subjects**. Such subjects contribute zero to the marginal objective,
+  so they now return a zero analytic gradient instead of forcing SLSQP/L-BFGS onto
+  the slower fixed-EBE fallback path (#455).
+- **Gradient-based optimizers no longer stall when a few subjects are declined by
+  the analytic outer gradient** (#455). The exact analytic outer gradient was
+  assembled all-or-nothing: a single declined subject — whether structurally out
+  of scope (steady-state + reset, modeled-duration dose, oral infusion under F≠1)
+  or numerically declined (an indefinite per-subject inner Hessian that fails the
+  Cholesky factor in the gradient assembly) — forced the whole population onto the
+  θ-only fixed-EBE fallback, whose biased Ω/σ block left the variance components
+  pinned at their start and stalled `slsqp` / `nlopt_lbfgs` / `mma` / `lbfgs` well
+  above the derivative-free (`bobyqa`) optimum. The non-IOV outer gradient is now
+  assembled per subject — exact analytic for in-scope subjects, a reconverged
+  per-subject finite-difference (carrying the full η̂/Ω/σ EBE response, no PD
+  Hessian required) for the declined ones — so one declined subject no longer
+  disables the exact gradient for the other thousands. On a 5937-subject pediatric
+  vancomycin fit (one subject with an indefinite inner Hessian) this moves `slsqp`
+  from a stalled 73468 OFV to 66570 — past `bobyqa` (68456) and SAEM (67477), ~31
+  above the NONMEM reference (66539).
 - **Documentation no longer references the retired Enzyme/autodiff installation or
   usage path**, and now describes `gradient = auto` / `gradient = fd` with the
   analytic `Dual2` sensitivity provider (#381).

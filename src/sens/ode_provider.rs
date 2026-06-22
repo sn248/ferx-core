@@ -798,8 +798,7 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
     // built over the dual type `T` (so they thread through `Dual2`/`Dual1`/`DualMixed`
     // alike). The gate (`ode_analytical_supported`) admits only kinds lifted to
     // `PkNum`, so `prepare_dual` returns `Some` for each; `?` bails to FD otherwise.
-    let mut prepared_forcings: Vec<PreparedInputRate<T>> =
-        Vec::with_capacity(ode.input_rate.len());
+    let mut prepared_forcings: Vec<PreparedInputRate<T>> = Vec::with_capacity(ode.input_rate.len());
     for f in &ode.input_rate {
         prepared_forcings.push(f.prepare_dual::<T>(&params_dual)?);
     }

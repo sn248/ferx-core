@@ -1129,6 +1129,160 @@ fn run_obs_tvcov<const M: usize>(
     Some(SubjectSens { obs: obs_out })
 }
 
+/// Light (`Dual1`, `N = n_eta`) inner η-gradient for time-varying-covariate /
+/// oral-infusion subjects — the first-order mirror of [`subject_sensitivities_tvcov`]
+/// (`run_obs_grad_tvcov` is to `run_obs_tvcov` as `run_obs_grad` is to `run_obs`).
+/// The outer θ/Ω/σ gradient already serves these via the `Dual2` event-driven walk;
+/// this gives the inner EBE loop the matching exact η-gradient instead of FD,
+/// closing the inner half of #447. Same gate as the outer TV-cov path; declines
+/// (→ FD inner) the #419 `F`+rate-infusion and modeled-duration cases the walk
+/// can't serve.
+pub fn subject_eta_grad_tvcov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
+    if !tvcov_analytical_supported(model)
+        || !(subject.has_tv_covariates() || subject_has_oral_infusion(model, subject))
+    {
+        return None;
+    }
+    if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
+        return None;
+    }
+    if !subject.all_doses_fixed() {
+        return None;
+    }
+    if model.has_bioavailability() && subject.has_rate_defined_infusion() {
+        return None;
+    }
+
+    let n_eta = model.n_eta;
+    let prog = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("tvcov_analytical_supported guarantees the program");
+    let slots = prog.pk_slots();
+    let mut slot_row: [Option<usize>; N_PK] = [None; N_PK];
+    for (i, &s) in slots.iter().enumerate() {
+        if s < N_PK {
+            slot_row[s] = Some(i);
+        }
+    }
+
+    macro_rules! disp {
+        ($($n:literal),+) => {
+            match n_eta {
+                $($n => run_obs_grad_tvcov::<$n>(model, subject, theta, eta, prog, &slot_row, n_eta),)+
+                _ => None,
+            }
+        };
+    }
+    let mut out = disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)?;
+
+    // Constant `ScalarScale` divisor: `∂(f/k)/∂η = (∂f/∂η)/k` (η-independent `k`),
+    // matching the outer TV-cov path and `pk::apply_scaling`. (LTBS / ExpressionScale
+    // keep the FD inner — gated upstream in `analytic_inner_grad_supported_model`.)
+    if let ScalingSpec::ScalarScale(k) = model.scaling {
+        if k != 1.0 {
+            for o in out.iter_mut() {
+                o.f /= k;
+                for g in o.df_deta.iter_mut() {
+                    *g /= k;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Light dual-width-`N` (`= n_eta`) inner of [`subject_eta_grad_tvcov`]: per-event
+/// PK-param `Dual1` seeded on η (`∂p/∂η_k` on axis `k`), the event-driven walk over
+/// `Dual1<N>`, and `∂conc/∂η` read straight into `ObsGrad`.
+#[allow(clippy::too_many_arguments)]
+fn run_obs_grad_tvcov<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    slot_row: &[Option<usize>; N_PK],
+    n_eta: usize,
+) -> Option<Vec<ObsGrad>> {
+    use crate::pk::event_driven::EventSchedule;
+    use crate::sens::ode_provider::param_derivatives_at_cov;
+    use crate::sens::propagate::{event_driven_sens_g, PkDual};
+
+    let mk = |cov: &std::collections::HashMap<String, f64>| -> PkDual<Dual1<N>> {
+        let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)
+            .expect("tvcov gate guarantees the program axes match");
+        let pk = (model.pk_param_fn)(theta, eta, cov);
+        let seed_row = |i: usize, val: f64| -> Dual1<N> {
+            let mut grad = [0.0; N];
+            for k in 0..n_eta.min(N) {
+                grad[k] = pd.dp_deta[i][k];
+            }
+            Dual1 { value: val, grad }
+        };
+        let dv = |slot: usize, val: f64| -> Dual1<N> {
+            match slot_row[slot] {
+                Some(i) => seed_row(i, val),
+                None => Dual1::<N>::constant(val),
+            }
+        };
+        PkDual {
+            cl: dv(PK_IDX_CL, pk.cl()),
+            v: dv(PK_IDX_V, pk.v()),
+            q: dv(PK_IDX_Q, pk.q()),
+            v2: dv(PK_IDX_V2, pk.v2()),
+            ka: dv(PK_IDX_KA, pk.ka()),
+            q3: dv(PK_IDX_Q3, pk.q3()),
+            v3: dv(PK_IDX_V3, pk.v3()),
+            f: dv(PK_IDX_F, pk.f_bio()),
+        }
+    };
+
+    let pk_at_dose: Vec<PkDual<Dual1<N>>> = (0..subject.doses.len())
+        .map(|k| mk(subject.dose_cov(k)))
+        .collect();
+    let pk_at_obs: Vec<PkDual<Dual1<N>>> = (0..subject.obs_times.len())
+        .map(|j| mk(subject.obs_cov(j)))
+        .collect();
+    let pk_at_pk_only: Vec<PkDual<Dual1<N>>> = (0..subject.pk_only_times.len())
+        .map(|m| mk(subject.pk_only_cov(m)))
+        .collect();
+
+    let dose_lagtimes = vec![0.0; subject.doses.len()];
+    let schedule =
+        EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
+    let conc = event_driven_sens_g::<Dual1<N>>(
+        model.pk_model,
+        subject,
+        &schedule,
+        &pk_at_dose,
+        &pk_at_obs,
+        &pk_at_pk_only,
+    );
+
+    let mut out = Vec::with_capacity(conc.len());
+    for c in &conc {
+        let neg = c.value < 0.0;
+        let mut df_deta = vec![0.0; n_eta];
+        if !neg {
+            for k in 0..n_eta.min(N) {
+                df_deta[k] = c.grad[k];
+            }
+        }
+        out.push(ObsGrad {
+            f: if neg { 0.0 } else { c.value },
+            df_deta,
+        });
+    }
+    Some(out)
+}
+
 /// Accumulated `subject_sensitivities` call count and wall-time across a fit,
 /// for `FERX_PROFILE=1` (printed by the CLI via [`profile_report`]). No overhead
 /// when off (the `Instant` is only taken when profiling is enabled).
@@ -1228,8 +1382,14 @@ fn subject_eta_grad_impl(
         }
         return None;
     }
+    // TV-cov / oral infusion: the light event-driven walk (#447). The outer gradient
+    // already serves these via `subject_sensitivities_tvcov`; route the inner to the
+    // matching `Dual1` walk (out-of-scope cases return `None` → FD per point).
+    if subject.has_tv_covariates() || subject_has_oral_infusion(model, subject) {
+        return subject_eta_grad_tvcov(model, subject, theta, eta);
+    }
     // Same model/subject scope as the full provider …
-    if !analytical_supported(model) || subject.has_tv_covariates() {
+    if !analytical_supported(model) {
         return None;
     }
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
@@ -1248,13 +1408,7 @@ fn subject_eta_grad_impl(
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
         return None;
     }
-    // The light first-order provider uses the superposition kernels, which don't
-    // carry the oral-infusion forced responses (#350/#400); the full provider
-    // routes those subjects through the walk, but here we fall back to the FD inner
-    // Jacobian for them.
-    if subject_has_oral_infusion(model, subject) {
-        return None;
-    }
+    // (Oral infusion is handled by the TV-cov event-driven walk above, #447.)
     // The light (first-order) provider doesn't carry the `ExpressionScale`
     // quotient-rule, so the inner EBE loop reverts to FD there (the analytic
     // *outer* gradient still serves these models). Mirrors the LTBS inner choice.
@@ -3721,6 +3875,74 @@ mod tests {
                 "TV-cov subject must take the analytic provider"
             );
             check_full_provider_vs_fd(m, s, theta, eta);
+        }
+    }
+
+    /// #447: the light `Dual1` inner η-gradient ([`subject_eta_grad_tvcov`]) must
+    /// equal the full `Dual2` outer `df_deta` (η-block) for TV-cov subjects — both
+    /// run the same event-driven walk, and the outer is FD-validated above. Covers
+    /// 1-cpt oral, 2-cpt IV, and a steady-state bolus.
+    #[test]
+    fn tvcov_eta_grad_matches_full() {
+        let bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+        let cases: Vec<(CompiledModel, Subject, Vec<f64>, Vec<f64>)> = vec![
+            {
+                let m = parse_model_string(ONECPT_ORAL_TVCOV).expect("parse 1cpt oral tvcov");
+                let s = tvcov_subject(
+                    vec![bolus(0.0)],
+                    &[70.0],
+                    &[1.0, 2.0, 4.0, 8.0, 24.0],
+                    &[70.0, 72.0, 80.0, 85.0, 90.0],
+                    Vec::new(),
+                    Vec::new(),
+                    &[],
+                );
+                (m, s, vec![0.2, 10.0, 1.5, 0.75], vec![0.15, -0.10, 0.25])
+            },
+            {
+                let m = parse_model_string(TWOCPT_IV_TVCOV).expect("parse 2cpt iv tvcov");
+                let s = tvcov_subject(
+                    vec![bolus(0.0)],
+                    &[70.0],
+                    &[0.5, 2.0, 6.0, 12.0, 24.0],
+                    &[70.0, 75.0, 82.0, 88.0, 95.0],
+                    Vec::new(),
+                    Vec::new(),
+                    &[],
+                );
+                (m, s, vec![10.0, 50.0, 15.0, 100.0, 0.75], vec![0.12, -0.08])
+            },
+            {
+                let m = parse_model_string(ONECPT_IV_TVCOV).expect("parse 1cpt iv tvcov ss");
+                let s = tvcov_subject(
+                    vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
+                    &[70.0],
+                    &[1.0, 6.0, 12.0, 18.0, 23.0],
+                    &[70.0, 78.0, 86.0, 92.0, 98.0],
+                    Vec::new(),
+                    Vec::new(),
+                    &[],
+                );
+                (m, s, vec![0.2, 10.0, 0.75], vec![0.12, -0.09])
+            },
+        ];
+        for (model, subject, theta, eta) in &cases {
+            let full =
+                subject_sensitivities_tvcov(model, subject, theta, eta).expect("outer tvcov");
+            let light =
+                subject_eta_grad_tvcov(model, subject, theta, eta).expect("light tvcov inner");
+            assert_eq!(full.obs.len(), light.len());
+            for (a, b) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
+                for k in 0..model.n_eta {
+                    approx::assert_relative_eq!(
+                        a.df_deta[k],
+                        b.df_deta[k],
+                        max_relative = 1e-10,
+                        epsilon = 1e-11
+                    );
+                }
+            }
         }
     }
 

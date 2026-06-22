@@ -912,8 +912,8 @@ fn run_subject_tvcov<const M: usize>(
 /// `ParamDerivs` (`∂p/∂(θ,η)` + 2nd order) at an explicit covariate snapshot,
 /// dispatching on the program's axis count — the cov-taking sibling of
 /// [`param_derivatives`] (which reads `subject.covariates`), needed for per-event
-/// TV-cov snapshots (#439).
-fn param_derivatives_at_cov(
+/// TV-cov snapshots (#439). Also used by the analytical light TV-cov inner (#447).
+pub(crate) fn param_derivatives_at_cov(
     prog: &crate::parser::model_parser::IndivParamProgram,
     model: &CompiledModel,
     cov: &std::collections::HashMap<String, f64>,

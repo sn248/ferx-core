@@ -19,6 +19,16 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Performance
+- **Analytic inner η-gradient for time-varying covariates / oral infusion on
+  analytical PK models** (#447). The light `Dual1` inner EBE gradient previously
+  declined these subjects and reverted to finite differences even though the
+  **outer** gradient already served them; it now uses a first-order event-driven
+  walk (`subject_eta_grad_tvcov`, the light mirror of `subject_sensitivities_tvcov`),
+  so the inner EBE loop is exact and replaces FD's `~2·n_eta+1` predictions per step
+  with one. Validated against the FD-validated outer `df_deta` (1-/2-/3-cpt, IV/oral,
+  steady state).
+
 ### Added
 - **Analytic FOCE/FOCEI gradients for time-varying covariates on ODE models** (#439).
   An ODE model whose covariates change over time (per-event `WT`, `CRCL`, …) with

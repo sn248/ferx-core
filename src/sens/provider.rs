@@ -194,6 +194,13 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
 /// (the `Dual2<M>` dispatch table). Beyond this the scale falls back to FD.
 const MAX_SCALE_AXES: usize = 16;
 
+/// Maximum `(θ, η)` axis count (`n_theta + n_eta`) for the TV-cov event-driven dual
+/// walk. The outer `run_obs_tvcov` (`m_dim`) and inner `run_obs_grad_tvcov` (`n_eta
+/// ≤ m_dim`) dispatch tables both enumerate `1..=MAX_TVCOV_AXES`, and
+/// `tvcov_analytical_supported` bounds the model here, so both resolve and the
+/// inner/outer analytic scope stays matched (#449 re-review #2).
+const MAX_TVCOV_AXES: usize = 24;
+
 /// Whether the model's output scaling is one the provider differentiates exactly:
 /// `None` / constant `ScalarScale` (a per-jet divisor, `∂k/∂η = ∂k/∂θ = 0`), or an
 /// `ExpressionScale` carrying a `Dual2`-differentiable program whose axis counts
@@ -890,6 +897,12 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     if !analytical_supported(model) || model.has_lagtime() || model.log_transform {
         return false;
     }
+    // Bound total axes to the dual-walk dispatch cap so the outer (`m_dim`) and inner
+    // (`n_eta`) TV-cov tables both resolve — matched analytic scope, no fixed-EBE FD
+    // inner split (#449 re-review #2).
+    if model.n_theta + model.n_eta > MAX_TVCOV_AXES {
+        return false;
+    }
     // Constant `ScalarScale` is a covariate-independent divisor (applied to the
     // whole jet below); `ExpressionScale` / `PerCmt` need a per-event scale jet
     // and route to FD for now.
@@ -1189,7 +1202,13 @@ pub fn subject_eta_grad_tvcov(
             }
         };
     }
-    let mut out = disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)?;
+    // Match the outer `run_obs_tvcov` cap (`m_dim = n_theta + n_eta` over `1..=24`):
+    // since `n_eta ≤ m_dim`, bounding the gate at 24 (below) makes both dispatch
+    // tables resolve, so the inner and outer analytic scope stay matched rather than
+    // splitting to a fixed-EBE FD inner (#449 re-review #2).
+    let mut out = disp!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    )?;
 
     // Constant `ScalarScale` divisor: `∂(f/k)/∂η = (∂f/∂η)/k` (η-independent `k`),
     // matching the outer TV-cov path and `pk::apply_scaling`. (LTBS / ExpressionScale
@@ -1224,6 +1243,10 @@ fn run_obs_grad_tvcov<const N: usize>(
     use crate::sens::ode_provider::param_derivatives_at_cov;
     use crate::sens::propagate::{event_driven_sens_g, PkDual};
 
+    // The dispatch sizes `N = n_eta` exactly, so the `.min(N)` clamps below are
+    // no-ops — flat `0..n_eta` loops (#449 re-review #5, mirroring #15).
+    debug_assert_eq!(N, n_eta);
+
     let mk = |cov: &std::collections::HashMap<String, f64>| -> Option<PkDual<Dual1<N>>> {
         // `None` above the param-derivative dispatch cap (n_axes > 16): decline so
         // the inner loop falls back to FD rather than panicking (#449 review #1).
@@ -1231,7 +1254,7 @@ fn run_obs_grad_tvcov<const N: usize>(
         let pk = (model.pk_param_fn)(theta, eta, cov);
         let seed_row = |i: usize, val: f64| -> Dual1<N> {
             let mut grad = [0.0; N];
-            for k in 0..n_eta.min(N) {
+            for k in 0..n_eta {
                 grad[k] = pd.dp_deta[i][k];
             }
             Dual1 { value: val, grad }
@@ -1281,7 +1304,7 @@ fn run_obs_grad_tvcov<const N: usize>(
         let neg = c.value < 0.0;
         let mut df_deta = vec![0.0; n_eta];
         if !neg {
-            for k in 0..n_eta.min(N) {
+            for k in 0..n_eta {
                 df_deta[k] = c.grad[k];
             }
         }

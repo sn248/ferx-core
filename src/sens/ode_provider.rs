@@ -106,19 +106,22 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // (ODE models have no `tv_fn` — typical values come from `pk_param_fn` at
     // η = 0 instead; see `run_subject`.)
     // Lagtime shifts the dosing timeline; supporting an estimated lagtime needs
-    // ∂(timeline)/∂θ, which is not yet wired — exclude models that estimate it.
-    // Bioavailability F *is* supported (it scales the dose amount/rate as a dual).
+    // ∂(timeline)/∂θ, which is not yet wired — exclude models that estimate it. This
+    // catches the bare `PK_IDX_LAGTIME` slot; the compartment-indexed `ALAG{n}` form
+    // lands in the dose-attr map instead (never at `PK_IDX_LAGTIME`) and is declined
+    // alongside `F` just below.
     if model.pk_indices.iter().any(|&s| s == PK_IDX_LAGTIME) {
         return false;
     }
-    // Per-compartment bioavailability (`F1`/`F2`, #369): production resolves
-    // `f_bio(d.cmt)` per dose compartment, but both the static `integrate_g` and the
-    // TV-cov walk apply the single bare `PK_IDX_F` slot to every dose. A model with a
-    // compartment-indexed `F` would get the wrong analytic gradient, so decline it to
-    // FD (the bare-`F` / no-`F` case is unaffected) (#449 review #7).
-    if model
-        .active_dose_attr_map()
-        .has_indexed_attr(crate::types::DoseAttr::F)
+    // Per-compartment bioavailability / lag time (`F1`/`F2`, `ALAG{n}`, #369):
+    // production resolves `f_bio(d.cmt)` per dose compartment and shifts the dose to
+    // `d.time + lagtime(d.cmt)`, but both the static `integrate_g` and the TV-cov
+    // walk apply the single bare `PK_IDX_F` slot and dose at the bare `d.time`. A
+    // compartment-indexed `F` or lag would give the wrong analytic gradient, so
+    // decline to FD (the bare / no-`F` case is unaffected) (#449 review #7, #1).
+    let attrs = model.active_dose_attr_map();
+    if attrs.has_indexed_attr(crate::types::DoseAttr::F)
+        || attrs.has_indexed_attr(crate::types::DoseAttr::Lag)
     {
         return false;
     }
@@ -1843,6 +1846,68 @@ mod tests {
         let mut subject = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
         check_vs_production(&model, &subject, &[5.0, 50.0, 1.5, 0.70], &[0.15, 0.2]);
+    }
+
+    /// Compartment-indexed bioavailability (`F1`) and lag time (`ALAG1`) land in the
+    /// dose-attr map, not the bare `PK_IDX_F` / `PK_IDX_LAGTIME` slots — the dual
+    /// walks apply only the bare `F` and dose at the bare `d.time`, so the analytic
+    /// gradient would diverge from production's per-compartment `f_bio(cmt)` /
+    /// `d.time + lagtime(cmt)`. The gate must decline both to FD (#449 re-review #1, #3).
+    #[test]
+    fn ode_analytical_declines_per_compartment_f_and_lag() {
+        const F1_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.5, 0.05, 20.0)
+  theta THETA_F1(0.70, 0.001, 0.999)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F1 = THETA_F1
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot / V - CL/V * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(F1_ODE).expect("parse F1");
+        assert!(
+            !ode_analytical_supported(&m),
+            "compartment-indexed F1 must decline to FD"
+        );
+
+        const ALAG1_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.5, 0.05, 20.0)
+  theta THETA_ALAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  ALAG1 = THETA_ALAG
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot / V - CL/V * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(ALAG1_ODE).expect("parse ALAG1");
+        assert!(
+            !ode_analytical_supported(&m),
+            "compartment-indexed ALAG1 must decline to FD"
+        );
     }
 
     /// Infusion doses (RATE>0): the dual loop must add the rate forcing over the

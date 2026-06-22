@@ -12,7 +12,7 @@
 # `y[CMT=N] = ...` readout — ODE-only, no AD path). Per-CMT
 # `obs_scale[CMT=N] = K` (Forms A/B post-multiply) DOES support AD via
 # the per-observation scale array — see `scaling_expression.ferx` and
-# `docs/src/model-file/scaling.md` for the gradient-method matrix.
+# `docs/model-file/scaling.qmd` for the gradient-method matrix.
 
 [parameters]
   theta TVCL(5.0,  0.1,  50.0)

@@ -17,6 +17,5 @@ rustc-ice-*.txt
 .archive/
 
 # Built documentation output — generated and deployed by CI (.github/workflows/docs.yml)
-docs/book/
 docs/_site/
 bench_*.csv

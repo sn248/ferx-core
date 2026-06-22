@@ -272,7 +272,12 @@ pub fn ode_subject_sensitivities(
     let na = iiv.len();
 
     // Axis permutation: IIV-bearing parameters take axes `0..na` (full Hessian
-    // rows); the IIV-free parameters take `na..n_indiv` (gradient only).
+    // rows); the IIV-free parameters take `na..n_indiv` (gradient only). A stack
+    // bool mask avoids the O(n²) `iiv.contains` (#445 review #7).
+    let mut is_iiv = [false; MAX_ODE_SENS_DIM];
+    for &i in &iiv {
+        is_iiv[i] = true;
+    }
     let mut axis_of = vec![0usize; n_indiv];
     let mut next = 0usize;
     for &i in &iiv {
@@ -280,7 +285,7 @@ pub fn ode_subject_sensitivities(
         next += 1;
     }
     for (i, ax) in axis_of.iter_mut().enumerate() {
-        if !iiv.contains(&i) {
+        if !is_iiv[i] {
             *ax = next;
             next += 1;
         }
@@ -330,10 +335,14 @@ pub fn ode_subject_sensitivities(
 /// whose model has more than this many IIV-bearing individual parameters fall back
 /// to the full `Dual2` path — correct, just not accelerated. Bounds the `(na, n)`
 /// monomorphisation count; raise it only if models with many IIV parameters become
-/// a measured bottleneck. (Documented here; the value is baked into the `by_n!`
-/// arm lists in [`ode_subject_sensitivities`].)
-#[cfg(doc)]
+/// a measured bottleneck.
 pub const MIXED_NA_CAP: usize = 6;
+
+// The `by_n!` arm lists in `ode_subject_sensitivities` enumerate `na` up to
+// `MIXED_NA_CAP` explicitly (a macro can't iterate a const). This tripwire fails the
+// build if the const is changed without the arms being updated to match — the cap
+// was previously `#[cfg(doc)]`-only and could silently drift (#445 review #4).
+const _: () = assert!(MIXED_NA_CAP == 6);
 
 /// Light **inner** η-gradient for an ODE model: per-observation `(f, ∂f/∂η)` via a
 /// `Dual1` (gradient-only) augmented RK45 — the ODE counterpart of the analytical
@@ -2362,6 +2371,66 @@ mod tests {
                 close(&fo.d2f_deta2, &mo.d2f_deta2, "d2f_deta2");
                 close(&fo.df_dtheta, &mo.df_dtheta, "df_dtheta");
                 close(&fo.d2f_deta_dtheta, &mo.d2f_deta_dtheta, "d2f_deta_dtheta");
+            }
+        }
+    }
+
+    /// The mixed-order dual must reproduce the full `Dual2` provider for an
+    /// **`init(...)`-bearing** model routed through the mixed path (`na < n`), which
+    /// exercises `dual_init_state_mixed` (the axis-mapped FD initial-state seeding) —
+    /// the one new numerical path the identity/reorder parity test above never hits
+    /// (its models have no `init` block) (#445 review #1). Here `V` is IIV-free, so
+    /// `na = 1 < n = 2`, and `init(central) = 1000/V` seeds the IIV-free (gradient-
+    /// only) axis.
+    #[test]
+    fn ode_mixed_init_matches_full_dual2() {
+        const INIT_ODE_MIXED: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = 1000.0 / V
+  d/dt(central) = -CL/V * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(INIT_ODE_MIXED).expect("parse");
+        assert_eq!(model.n_eta, 1);
+        assert_eq!(model.pk_indices.len(), 2);
+        let mut subject = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        subject.doses = vec![]; // no dose; the `init(...)` baseline is the sole input.
+        let theta = vec![1.0, 20.0];
+        let eta = vec![0.1];
+
+        let pd = param_derivatives(&model, &subject, &theta, &eta).expect("pd");
+        let full = run_subject::<2>(&model, &subject, &theta, &eta, &pd).expect("full");
+        // na = 1 (CL) < n = 2 → run_subject_mixed::<1, 2>, exercising dual_init_state_mixed.
+        let mixed = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("mixed");
+
+        assert_eq!(full.obs.len(), mixed.obs.len());
+        for (fo, mo) in full.obs.iter().zip(&mixed.obs) {
+            approx::assert_relative_eq!(fo.f, mo.f, max_relative = 1e-12, epsilon = 1e-12);
+            for (a, b) in fo.df_deta.iter().zip(&mo.df_deta) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-12);
+            }
+            for (a, b) in fo.d2f_deta2.iter().zip(&mo.d2f_deta2) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-12);
+            }
+            for (a, b) in fo.df_dtheta.iter().zip(&mo.df_dtheta) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-12);
+            }
+            for (a, b) in fo.d2f_deta_dtheta.iter().zip(&mo.d2f_deta_dtheta) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-12);
             }
         }
     }

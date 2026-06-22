@@ -152,7 +152,11 @@ impl<const N: usize> PkNum for Dual1<N> {
     }
     #[inline]
     fn guard_floor(self, lo: f64) -> Self {
-        if self.value < lo {
+        // `!(value >= lo)` (not `value < lo`) so a `NaN` value floors too, matching
+        // `f64::max(lo)` on the scalar path (`NaN.max(lo) == lo`) — otherwise a
+        // transient `NaN` would give a finite f64 prediction but a `NaN` dual
+        // gradient (the clamped region is flat, so the floored jet is zero) (#430).
+        if !(self.value >= lo) {
             Dual1::constant(lo)
         } else {
             self
@@ -211,7 +215,9 @@ impl<const NA: usize, const N: usize> PkNum for DualMixed<NA, N> {
     }
     #[inline]
     fn guard_floor(self, lo: f64) -> Self {
-        if self.value < lo {
+        // `!(value >= lo)` floors `NaN` too, matching `f64::max(lo)` — see the
+        // `Dual1` impl above (#430).
+        if !(self.value >= lo) {
             DualMixed::constant(lo)
         } else {
             self
@@ -253,5 +259,27 @@ mod tests {
         exercise::<Dual1<1>>(Dual1::var(0.7, 0));
         exercise::<Dual2<1>>(Dual2::var(0.7, 0));
         exercise::<DualMixed<1, 2>>(DualMixed::var(0.7, 0));
+    }
+
+    /// `guard_floor(NaN)` must floor (return `lo`) on the duals exactly as it does on
+    /// `f64` (`NaN.max(lo) == lo`) — a sub-floor / `NaN` value lands in the flat
+    /// clamped region, so the dual's value is `lo` and its jet is zero. Without this,
+    /// a transient `NaN` would give a finite f64 prediction but a `NaN` dual gradient
+    /// (#430 review #2).
+    #[test]
+    fn guard_floor_floors_nan_consistently_across_impls() {
+        let lo = 1e-6;
+        assert_eq!(f64::NAN.guard_floor(lo), lo);
+        assert_eq!(Dual1::<1>::var(f64::NAN, 0).guard_floor(lo).value, lo);
+        assert_eq!(Dual2::<1>::var(f64::NAN, 0).guard_floor(lo).value, lo);
+        assert_eq!(
+            DualMixed::<1, 2>::var(f64::NAN, 0).guard_floor(lo).value,
+            lo
+        );
+        // The floored dual carries a zero jet (flat clamped region).
+        let g = Dual1::<1>::var(f64::NAN, 0).guard_floor(lo);
+        assert_eq!(g.grad[0], 0.0);
+        // A value already above the floor is untouched.
+        assert_eq!(Dual1::<1>::var(5.0, 0).guard_floor(lo).value, 5.0);
     }
 }

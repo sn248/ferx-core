@@ -190,6 +190,18 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
         return false;
     }
+    // Built-in absorption forcing (igd, #430) + EVID 3/4 resets: the f64 path turns
+    // off pre-reset dose tails via a `reset_floor`, which the dual forcing loop in
+    // `integrate_g` doesn't yet replicate (it sums `R_in` over every dose with
+    // `tad > 0`). Keep reset+absorption subjects on the FD fallback. This is the
+    // SHARED scope gate for both the outer θ-sensitivities and the inner η-gradient,
+    // so the inner EBE loop can't silently run an analytic no-`reset_floor` gradient
+    // while the outer correctly falls back to FD (#430 review #1).
+    if let Some(ode) = model.ode_spec.as_ref() {
+        if !ode.input_rate.is_empty() && !subject.reset_times.is_empty() {
+            return false;
+        }
+    }
     true
 }
 
@@ -282,14 +294,8 @@ pub fn ode_subject_sensitivities(
     if pk.values[PK_IDX_LAGTIME].abs() > 1e-12 {
         return None;
     }
-    // Built-in absorption forcing + EVID 3/4 resets: the f64 path turns off pre-reset
-    // dose tails via a `reset_floor`; rather than replicate that subtle bookkeeping in
-    // the dual loop (slice 1 of #430), keep reset+absorption subjects on the FD
-    // fallback. Non-absorption reset subjects are unaffected and still served here.
-    let ode = model.ode_spec.as_ref()?;
-    if !ode.input_rate.is_empty() && !subject.reset_times.is_empty() {
-        return None;
-    }
+    // (reset+absorption FD fallback is enforced by the shared `ode_subject_supported`
+    // gate above, so both the outer and inner paths decline it together — #430 review #1.)
     // Individual-parameter η/θ derivatives (cheap: one dual eval, no integration).
     // Besides feeding the chain, the `∂p/∂η` rows tell us which individual parameters
     // carry IIV, which decides the dual's Hessian width.
@@ -1537,7 +1543,6 @@ fn obs_time_matches(ot: f64, t: f64) -> bool {
 /// the full outer gradient (value + grad + Hessian), `Dual1<N>` for the light inner
 /// η-gradient (value + grad only) — issue #410.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn integrate_g<T: crate::sens::num::PkNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
@@ -1717,6 +1722,9 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                         continue;
                     }
                     let tad_f = t - d.time;
+                    // Pre-dose skip: `tad ≤ 0` contributes nothing. `rate` re-checks
+                    // this same wall (`tad.val() <= 0`), so this is an optimization
+                    // (skip the dual `rate` call), not the source of truth (#430 review).
                     if tad_f <= 0.0 {
                         continue;
                     }
@@ -3037,10 +3045,22 @@ mod tests {
             DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0),
         ];
         subject.reset_times = vec![10.0];
+        let theta = [5.0, 50.0, 2.0, 0.3];
+        let eta = [0.1, -0.05];
         assert!(
-            ode_subject_sensitivities(&model, &subject, &[5.0, 50.0, 2.0, 0.3], &[0.1, -0.05])
-                .is_none(),
-            "IG + reset must fall back to FD in slice 1 of #430"
+            ode_subject_sensitivities(&model, &subject, &theta, &eta).is_none(),
+            "IG + reset must fall back to FD on the outer θ-sensitivity path (#430)"
+        );
+        // The inner η-gradient shares the scope gate, so it must decline too — else
+        // the EBE loop would run an analytic no-`reset_floor` gradient while the outer
+        // falls back to FD (#430 review #1). Guarded by `ode_subject_supported`.
+        assert!(
+            !ode_subject_supported(&model, &subject),
+            "IG + reset must be out of shared scope (covers the inner η-gradient)"
+        );
+        assert!(
+            ode_subject_eta_grad(&model, &subject, &theta, &eta).is_none(),
+            "IG + reset must fall back to FD on the inner η-gradient path too (#430 review #1)"
         );
     }
 

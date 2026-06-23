@@ -21,15 +21,18 @@ section of the SDLC for the versioning policy).
 
 ### Added
 - **Exact analytic FOCE/FOCEI gradients for steady-state (SS=1) ODE dosing** (#439). User-
-  `[odes]` models with a steady-state **bolus** dose now get exact analytic gradients
-  instead of finite differences. NONMEM SS=1 loads the compartments with an infinite-past
-  pulse train's trough; there is no closed form for a general ODE, so production expands it
-  as a *finite* `(apply dose; integrate II)` loop — running that same loop over the dual
-  type propagates `∂(steady state)/∂(θ,η)` directly (no implicit fixed-point
-  differentiation). Composes with time-varying covariates, IOV, and EVID 3/4 resets via the
-  event-driven walk. SS infusions and SS + estimated lagtime route to FD for now (each
-  needs an additional parameter-dependent-window / train-shift term). Result-neutral
-  (validated against the production predictor and `predict_iov`).
+  `[odes]` models with a steady-state dose now get exact analytic gradients instead of
+  finite differences. NONMEM SS=1 loads the compartments with an infinite-past pulse
+  train's trough; there is no closed form for a general ODE, so production expands it as a
+  *finite* `(apply dose; integrate II)` loop — running that same loop over the dual type
+  propagates `∂(steady state)/∂(θ,η)` directly (no implicit fixed-point differentiation).
+  Both SS **boluses** and SS **infusions** are supported (an SS infusion equilibrates with
+  an active-rate window + quiet window per cycle), and SS composes with time-varying
+  covariates, IOV, EVID 3/4 resets, and **estimated lagtime** (shifting the lag shifts the
+  whole infinite train, handled exactly via the obs-side time-shift) — all via the
+  event-driven walk. Still on FD: rate-defined SS infusion under `F ≠ 1` (#419 window
+  scaling) and SS infusion combined with lagtime (needs the train-shift term on the rate
+  boundary). Result-neutral (validated against the production predictor and `predict_iov`).
 - **Exact analytic FOCE/FOCEI gradients for IOV `[odes]` models** (#439). User-ODE
   models with inter-occasion variability (`iov_column`, `kappa`) now get the exact
   analytic outer (θ/Ω/σ) gradient over the stacked `[η_bsv, κ₁..κ_K]` random effects,

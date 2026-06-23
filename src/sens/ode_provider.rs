@@ -697,11 +697,20 @@ fn apply_output_transform<T: crate::sens::num::PkNum>(model: &CompiledModel, p: 
         ScalingSpec::ScalarScale(k) if k != 1.0 => p / T::from_f64(k),
         _ => p,
     };
-    // LTBS log via the shared generic transform — same floor-then-log production runs
-    // on f64 (#451). The `NaN` pre-check above keeps a `NaN` readout visible rather
-    // than letting the floor convert it to `ln(LTBS_FLOOR)`.
+    // LTBS log. The value goes through the shared generic transform — the same
+    // floor-then-log production runs on f64 (#451); the `NaN` pre-check above keeps a
+    // `NaN` readout visible rather than letting the floor convert it to `ln(LTBS_FLOOR)`.
+    // The gradient keys on the strict `> LTBS_FLOOR` boundary, matching the analytical
+    // path (`provider.rs`) and `apply_log_transform`'s clamp semantics: at or below the
+    // floor the readout is clamped to a constant so its derivatives vanish, rather than
+    // `guard_floor` retaining the jet exactly at the floor (#460 review). Above the
+    // floor the dual `ln` carries the jet (and `ltbs_log_g` is then just `p.ln()`).
     if model.log_transform {
-        crate::pk::ltbs_log_g(p)
+        if p.val() > crate::pk::LTBS_FLOOR {
+            crate::pk::ltbs_log_g(p)
+        } else {
+            T::from_f64(crate::pk::ltbs_log_g(p.val()))
+        }
     } else {
         p
     }
@@ -1250,21 +1259,35 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
 ///
 /// One generic home for both the outer (`Dual2`) and inner (`Dual1`) TV-cov walks,
 /// so the memoisation policy isn't maintained as two near-identical closures
-/// (#451 re-review #8 / #451 review #3). The cache is a linear-scanned `Vec` keyed on
-/// `HashMap<String, f64>` value-equality — fine for the few-snapshot common case;
-/// note a snapshot with a missing (`NaN`) covariate value never compares equal to
-/// itself, so it isn't deduplicated (a re-seed, identical result, never a wrong one).
+/// (#451 re-review #8 / #451 review #3). The cache is a `HashMap` keyed on the
+/// snapshot's canonical bit form — names sorted, values as `f64::to_bits` — giving
+/// O(1) amortised lookup (not a linear scan) and, because `to_bits` is total, making a
+/// snapshot with a missing (`NaN`) covariate deduplicate correctly: the seed is
+/// deterministic in the snapshot, so sharing one bit-identical result is exactly a
+/// re-seed (#460 review).
 fn seed_tvcov_snapshots<T: Clone>(
     subject: &Subject,
     mut seed: impl FnMut(&std::collections::HashMap<String, f64>) -> Option<Vec<T>>,
 ) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>)> {
-    let mut snap_cache: Vec<(std::collections::HashMap<String, f64>, Vec<T>)> = Vec::new();
-    let mut seed_for = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<T>> {
-        if let Some((_, v)) = snap_cache.iter().find(|(c, _)| c == cov) {
+    use std::collections::HashMap;
+    // Canonical, hashable key for a covariate snapshot. `f64` is neither `Hash` nor
+    // `Eq`, so key on `to_bits` (name-sorted); `to_bits` is total, so `NaN` keys are
+    // well-defined and equal NaNs collapse — unlike `f64` `==`, which never matches a
+    // `NaN` to itself (which left the old `Vec` cache scanning dead, unmatchable entries).
+    fn snapshot_key(cov: &HashMap<String, f64>) -> Vec<(String, u64)> {
+        let mut kv: Vec<(String, u64)> =
+            cov.iter().map(|(k, v)| (k.clone(), v.to_bits())).collect();
+        kv.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        kv
+    }
+    let mut cache: HashMap<Vec<(String, u64)>, Vec<T>> = HashMap::new();
+    let mut seed_for = |cov: &HashMap<String, f64>| -> Option<Vec<T>> {
+        let key = snapshot_key(cov);
+        if let Some(v) = cache.get(&key) {
             return Some(v.clone());
         }
         let v = seed(cov)?;
-        snap_cache.push((cov.clone(), v.clone()));
+        cache.insert(key, v.clone());
         Some(v)
     };
     let pk_at_dose: Vec<Vec<T>> = (0..subject.doses.len())

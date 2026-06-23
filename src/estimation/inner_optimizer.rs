@@ -368,6 +368,17 @@ pub fn find_ebe(
     // get a near-Newton step in one iteration, PK dims fall back to the prior
     // conditional scale. `None` for non-FREM models → identity H0 (unchanged).
     let precond: Option<Vec<f64>> = build_inner_preconditioner(model, subject, params, n_eta);
+    // The preconditioner accelerates the inner search (it is the BFGS H0), but it
+    // drives the convergence *test* only for FREM, where the raw L2 gradient norm
+    // is dominated by the sharp covariate pseudo-obs dims and never reaches `tol`
+    // (issue #406). For general FOCE/FOCEI fits the stop test stays raw L2, so the
+    // converged EBE — and the estimates — are independent of H0: preconditioning
+    // changes only the path to the mode, not the mode itself.
+    let stop_precond: Option<&[f64]> = if model.frem_config.is_some() {
+        precond.as_deref()
+    } else {
+        None
+    };
 
     // Per-subject scratch buffers, built once and reused across every
     // BFGS line-search obj call and every Jacobian perturbation. The
@@ -470,9 +481,18 @@ pub fn find_ebe(
                 max_iter,
                 tol,
                 precond.as_deref(),
+                stop_precond,
             )
         } else {
-            inner_minimize(&obj, &mut eta, n_eta, max_iter, tol, precond.as_deref())
+            inner_minimize(
+                &obj,
+                &mut eta,
+                n_eta,
+                max_iter,
+                tol,
+                precond.as_deref(),
+                stop_precond,
+            )
         }
     };
 
@@ -608,7 +628,7 @@ fn find_ebe_iov(
     };
 
     // IOV models are not FREM, so no inner preconditioner (identity H0).
-    let bfgs_converged = inner_minimize(&obj, &mut x, n_flat, max_iter, tol, None);
+    let bfgs_converged = inner_minimize(&obj, &mut x, n_flat, max_iter, tol, None, None);
     let (nm_converged, used_fallback) = if !bfgs_converged {
         // Reset to prior mode: bsv_psi = mu (eta_true = 0), kappas = 0.
         x = vec![0.0; n_flat];
@@ -1026,29 +1046,71 @@ pub(crate) fn analytic_eta_nll_gradient(
     Some(grad)
 }
 
-/// Build the diagonal BFGS preconditioner for FREM inner loops (issue #406).
+/// Build the diagonal inner-BFGS preconditioner (the search `H0`) for a subject.
 ///
-/// Returns `Some(diag)` where `diag[i]` ≈ the posterior variance of `etaᵢ`,
-/// `1 / (Ω⁻¹ᵢᵢ + dataᵢ)`. `dataᵢ` accumulates the analytic precision of each
-/// FREM covariate pseudo-observation that maps to `etaᵢ` (prediction = TV+eta,
-/// so the Jacobian is 1 and the row contributes `1/R` with `R = EPSCOV²`).
-/// PK / non-covariate dims have `dataᵢ = 0` and fall back to the prior
-/// conditional scale `1/Ω⁻¹ᵢᵢ`. Returns `None` for non-FREM models so the
-/// existing identity-`H0` path is used unchanged.
+/// FREM models (issue #406): `Some(diag)` with `diag[i]` ≈ the posterior variance
+/// of `etaᵢ`, `1 / (Ω⁻¹ᵢᵢ + dataᵢ)`. `dataᵢ` accumulates the analytic precision of
+/// each FREM covariate pseudo-observation that maps to `etaᵢ` (prediction = TV+eta,
+/// so the Jacobian is 1 and the row contributes `1/R` with `R = EPSCOV²`); PK /
+/// non-covariate dims have `dataᵢ = 0` and fall back to `1/Ω⁻¹ᵢᵢ`.
+///
+/// General FOCE/FOCEI models: `Some(1/Ω⁻¹ᵢᵢ)` — the prior conditional scale per η,
+/// so a correlated or multi-scale Ω does not mis-scale the search. `None` only when
+/// Ω⁻¹ has no usable diagonal (→ identity `H0`).
+///
+/// This preconditioner is the BFGS `H0` only. Whether it also drives the
+/// convergence *test* is decided by the caller (`find_ebe`): FREM uses it for both
+/// (raw L2 never reaches `tol` there); general fits stop on raw L2, so `H0` changes
+/// only the path to the mode, not the converged EBE.
 fn build_inner_preconditioner(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
     n_eta: usize,
 ) -> Option<Vec<f64>> {
-    let fc = model.frem_config.as_ref()?;
-    preconditioner_from_parts(
-        fc,
-        &subject.fremtype,
-        &params.omega.inv,
-        &params.sigma.values,
-        n_eta,
-    )
+    if let Some(fc) = model.frem_config.as_ref() {
+        return preconditioner_from_parts(
+            fc,
+            &subject.fremtype,
+            &params.omega.inv,
+            &params.sigma.values,
+            n_eta,
+        );
+    }
+    // General FOCE/FOCEI: scale each inner BFGS dimension by its prior conditional
+    // variance `1/Ω⁻¹ᵢᵢ`, so a correlated or multi-scale Ω does not mis-scale the
+    // identity-H0 search. UVM's block Ω, for example, gives η_V2 ≈ 8× the scale of
+    // η_CL; with H0 = I that direction is mis-stepped and BFGS spends extra
+    // iterations learning the curvature. Same diagonal mechanism the FREM path
+    // uses, minus the covariate pseudo-obs precision (not cheaply available per-η
+    // here). `find_ebe` keeps the raw-L2 stop test for this path, so the H0 only
+    // changes the path to the mode — the converged EBE is unchanged.
+    inner_preconditioner_from_omega(&params.omega.inv, n_eta)
+}
+
+/// Diagonal inner-BFGS preconditioner `precondᵢ = 1/Ω⁻¹ᵢᵢ` for general
+/// (non-FREM) FOCE/FOCEI fits. Split out for unit testing.
+fn inner_preconditioner_from_omega(omega_inv: &DMatrix<f64>, n_eta: usize) -> Option<Vec<f64>> {
+    if n_eta == 0 {
+        return None;
+    }
+    // Ω⁻¹ is the n_eta×n_eta BSV inverse; the loop indexes its diagonal to n_eta.
+    debug_assert!(
+        omega_inv.nrows() >= n_eta,
+        "Ω⁻¹ ({}×{}) smaller than n_eta ({n_eta})",
+        omega_inv.nrows(),
+        omega_inv.ncols()
+    );
+    let mut precond = vec![1.0_f64; n_eta];
+    let mut usable = false;
+    for (i, p) in precond.iter_mut().enumerate() {
+        let d = omega_inv[(i, i)];
+        if d.is_finite() && d > 0.0 {
+            *p = 1.0 / d;
+            usable = true;
+        }
+    }
+    usable.then_some(precond)
 }
 
 /// Pure core of [`build_inner_preconditioner`] (no `CompiledModel`/`Subject`
@@ -1146,6 +1208,7 @@ fn inner_minimize(
     max_iter: usize,
     tol: f64,
     precond: Option<&[f64]>,
+    stop_precond: Option<&[f64]>,
 ) -> bool {
     if matches!(
         inner_optimizer_mode(),
@@ -1155,15 +1218,16 @@ fn inner_minimize(
     }
     let grad = |p: &[f64]| gradient_fd(obj, p, n);
     if inner_use_lbfgs(n) {
-        lbfgs_core(obj, &grad, x, n, max_iter, tol, precond)
+        lbfgs_core(obj, &grad, x, n, max_iter, tol, precond, stop_precond)
     } else {
-        dense_bfgs_core(obj, &grad, x, n, max_iter, tol, precond)
+        dense_bfgs_core(obj, &grad, x, n, max_iter, tol, precond, stop_precond)
     }
 }
 
 /// Inner EBE minimization with an externally-provided gradient (analytic
 /// sensitivities or AD). Same fit-scoped dispatch as [`inner_minimize`]; the
 /// `NelderMead` mode ignores the supplied gradient.
+#[allow(clippy::too_many_arguments)]
 fn inner_minimize_with_grad(
     obj: &dyn Fn(&[f64]) -> f64,
     grad: &dyn Fn(&[f64]) -> Vec<f64>,
@@ -1172,6 +1236,7 @@ fn inner_minimize_with_grad(
     max_iter: usize,
     tol: f64,
     precond: Option<&[f64]>,
+    stop_precond: Option<&[f64]>,
 ) -> bool {
     if matches!(
         inner_optimizer_mode(),
@@ -1180,14 +1245,15 @@ fn inner_minimize_with_grad(
         return nelder_mead_minimize(obj, x, n, max_iter, tol);
     }
     if inner_use_lbfgs(n) {
-        lbfgs_core(obj, grad, x, n, max_iter, tol, precond)
+        lbfgs_core(obj, grad, x, n, max_iter, tol, precond, stop_precond)
     } else {
-        dense_bfgs_core(obj, grad, x, n, max_iter, tol, precond)
+        dense_bfgs_core(obj, grad, x, n, max_iter, tol, precond, stop_precond)
     }
 }
 
 /// Shared L-BFGS driver: two-loop direction + backtracking line search, bounded
 /// `(s, y, ρ)` history. `grad` supplies the gradient (FD or AD).
+#[allow(clippy::too_many_arguments)]
 fn lbfgs_core(
     obj: &dyn Fn(&[f64]) -> f64,
     grad: &dyn Fn(&[f64]) -> Vec<f64>,
@@ -1196,6 +1262,7 @@ fn lbfgs_core(
     max_iter: usize,
     tol: f64,
     precond: Option<&[f64]>,
+    stop_precond: Option<&[f64]>,
 ) -> bool {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
@@ -1204,10 +1271,13 @@ fn lbfgs_core(
     let mut f_cur = obj(x);
 
     for _iter in 0..max_iter {
-        // Preconditioned stopping metric (≈ Newton decrement), commensurate
-        // across multi-scale FREM dimensions; raw L2 would be dominated by the
-        // sharp covariate dims and never fall below `tol` (issue #406).
-        let gnorm = grad_norm_metric(&g, precond);
+        // Stopping metric. `stop_precond` is `Some` only for FREM, where the raw
+        // L2 norm would be dominated by the sharp covariate pseudo-obs dims and
+        // never fall below `tol` (issue #406), so the preconditioned (≈ Newton-
+        // decrement) norm is required. For general fits `stop_precond` is `None`
+        // → raw L2, so the converged EBE is independent of the `precond` H0 used
+        // to accelerate the search above.
+        let gnorm = grad_norm_metric(&g, stop_precond);
         if gnorm < tol {
             return true;
         }
@@ -1260,6 +1330,7 @@ fn lbfgs_core(
 /// Dense (`n×n` inverse-Hessian) BFGS driver, retained for low-dimensional inner
 /// problems where it beats L-BFGS (no two-loop bookkeeping) and for the
 /// solver-scaling benchmark. `grad` supplies the gradient (FD or analytic).
+#[allow(clippy::too_many_arguments)]
 fn dense_bfgs_core(
     obj: &dyn Fn(&[f64]) -> f64,
     grad: &dyn Fn(&[f64]) -> Vec<f64>,
@@ -1268,6 +1339,7 @@ fn dense_bfgs_core(
     max_iter: usize,
     tol: f64,
     precond: Option<&[f64]>,
+    stop_precond: Option<&[f64]>,
 ) -> bool {
     let mut h_inv = init_h_inv(n, precond);
     let mut g = grad(x);
@@ -1277,10 +1349,15 @@ fn dense_bfgs_core(
     let mut first_step = true;
 
     for _iter in 0..max_iter {
-        let gnorm = grad_norm_metric(&g, precond);
+        // `stop_precond` is `Some` only for FREM (issue #406); general fits stop
+        // on the raw L2 norm so the converged EBE is independent of the `precond`
+        // H0 that accelerates the search.
+        let gnorm = grad_norm_metric(&g, stop_precond);
 
         // Scale initial Hessian so first step is O(1) not O(gnorm). Only for the
-        // identity-H0 path; the diagonal preconditioner already sets per-dim scale.
+        // identity-H0 path (`precond.is_none()`), where `stop_precond` is also
+        // `None`, so `gnorm` here is the raw L2 norm; a diagonal preconditioner
+        // already sets the per-dim scale.
         if precond.is_none() && first_step && gnorm > 1.0 {
             h_inv *= 1.0 / gnorm;
             first_step = false;
@@ -1826,8 +1903,8 @@ mod tests {
                 }
                 t0.elapsed().as_secs_f64() * 1e3 / runs as f64
             };
-            let t_dense = time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None));
-            let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None));
+            let t_dense = time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None));
+            let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None));
             eprintln!(
                 "  n={n:4}  dense={t_dense:8.3} ms  lbfgs={t_lbfgs:8.3} ms  dense/lbfgs={:.2}x",
                 t_dense / t_lbfgs
@@ -1893,7 +1970,7 @@ mod tests {
             |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
         let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
         let mut x = vec![0.0, 0.0];
-        let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None);
+        let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None);
         assert!(ok, "BFGS should report convergence");
         assert!((x[0] - 1.0).abs() < 1e-6, "x0 = {}", x[0]);
         assert!((x[1] + 2.0).abs() < 1e-6, "x1 = {}", x[1]);
@@ -1951,6 +2028,26 @@ mod tests {
         };
         let omega_inv = DMatrix::<f64>::zeros(0, 0);
         assert!(preconditioner_from_parts(&fc, &[], &omega_inv, &[1e-3], 0).is_none());
+    }
+
+    /// The general (non-FREM) inner preconditioner inverts the Ω⁻¹ diagonal so
+    /// each BFGS dimension is scaled by its prior conditional variance, giving a
+    /// well-scaled H0 for multi-scale / correlated Ω.
+    #[test]
+    fn inner_precond_from_omega_inverts_diagonal() {
+        // Diagonal Ω⁻¹ = diag(10, 2, 0.5) → precond = diag(0.1, 0.5, 2.0).
+        let omega_inv = DMatrix::from_diagonal(&DVector::from_column_slice(&[10.0, 2.0, 0.5]));
+        let p = inner_preconditioner_from_omega(&omega_inv, 3).expect("usable diagonal");
+        assert!((p[0] - 0.1).abs() < 1e-12);
+        assert!((p[1] - 0.5).abs() < 1e-12);
+        assert!((p[2] - 2.0).abs() < 1e-12);
+        // n_eta == 0 → None (identity H0).
+        assert!(inner_preconditioner_from_omega(&DMatrix::<f64>::zeros(0, 0), 0).is_none());
+        // A non-positive diagonal entry is skipped but a usable one still yields Some.
+        let mixed = DMatrix::from_diagonal(&DVector::from_column_slice(&[0.0, 4.0]));
+        let pm = inner_preconditioner_from_omega(&mixed, 2).expect("one usable entry");
+        assert_eq!(pm[0], 1.0); // untouched default for the zero diagonal
+        assert!((pm[1] - 0.25).abs() < 1e-12);
     }
 
     #[test]

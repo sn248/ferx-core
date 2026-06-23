@@ -4868,6 +4868,35 @@ mod tests {
         );
     }
 
+    /// **ODE IOV + EVID 3/4 reset.** A two-occasion ODE IOV subject with a washout reset
+    /// (+ re-dose) at the occasion boundary. The event-driven walk zeros the dual state at
+    /// the reset (no cross-occasion carryover) and the per-occasion κ seeding continues on
+    /// the post-reset occasion. Validated vs FD of `predict_iov` (#439 IOV × reset).
+    #[test]
+    fn ode_iov_reset_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        let subject = iov_reset_subject();
+        assert!(subject.has_resets());
+        check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
+    }
+
+    /// **ODE IOV + infusion.** Two-occasion IOV with finite-duration infusions; the
+    /// event-driven walk applies the per-occasion `F·rate` forcing over each window.
+    /// Validated vs FD of `predict_iov` (#439 IOV × infusion).
+    #[test]
+    fn ode_iov_infusion_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 50.0, false, 0.0),
+        ];
+        assert!(subject.doses[0].is_infusion());
+        check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
+    }
+
     /// **IOV × estimated lagtime.** 1-cpt IV IOV `[odes]` model (κ on CL) with a bare
     /// `LAGTIME`. The dose arrives per occasion at `t_dose + lag`; the lag sensitivity is
     /// the event-time saltation injected at each dose and propagated through the

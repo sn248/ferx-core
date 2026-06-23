@@ -54,11 +54,19 @@ section of the SDLC for the versioning policy).
   the per-event parameters, so it is **exact across occasion / covariate boundaries and
   for per-compartment (non-uniform) lags** — and **fully analytic, with no finite
   differences** (the one non-parameter-dual piece, the trajectory curvature `J·ẋ`, comes
-  from a directional RHS evaluation). Composes with **time-varying covariates and IOV**.
-  Lagtime combined with infusion, steady state, or EVID 3/4 reset routes to FD as before.
-  Result-neutral — validated against the closed-form analytical twin (full Hessian), the
-  production predictor (incl. TV-cov and per-compartment `ALAG1`), finite differences of
-  `predict_iov`, and finite differences of the population objective.
+  from a directional RHS evaluation). Composes with **time-varying covariates, IOV, EVID
+  3/4 resets, and finite-duration infusions** (for an infusion the window `[t+lag, t+lag+
+  dur]` shifts, so the saltation is applied at both rate boundaries). Lagtime + steady-
+  state dosing routes to FD (pending the separate SS feature). Result-neutral — validated
+  against the closed-form analytical twin (full Hessian), the production predictor (incl.
+  TV-cov, `ALAG1`, reset, infusion), and finite differences of `predict_iov` / the
+  population objective.
+- **Event-driven analytic ODE sensitivities now cover EVID 3/4 resets and finite-duration
+  infusions** (#439). The TV-covariate / IOV event-driven sensitivity walk previously
+  declined subjects with a reset or an infusion (→ finite differences); it now zeros the
+  dual state at each reset (EVID=4 = reset + dose) and applies the per-event `F·rate`
+  forcing over each infusion window, so TV-cov and IOV models with resets or infusions get
+  exact analytic gradients. Result-neutral.
 
 ### Performance
 - **Faster analytic time-varying-covariate inner η-gradient + ODE-sensitivity path

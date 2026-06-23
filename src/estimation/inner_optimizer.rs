@@ -496,8 +496,8 @@ pub fn find_ebe(
         }
     };
 
-    // If BFGS failed, fall back to Nelder-Mead. With `ebe_warm_start` (the default)
-    // seed the simplex from the BFGS partial η̂ — a weakly-identified η that BFGS
+    // If BFGS failed, fall back to Nelder-Mead. With `ebe_warm_start` (opt-in, off
+    // by default) seed the simplex from the BFGS partial η̂ — a weakly-identified η that BFGS
     // ran far out sits on the steep prior slope, so NM slides to the mode in far
     // fewer iterations than refining from η=0 in the flat basin. A non-finite
     // partial is unusable, so cold-start from η=0 there. With the flag off, always
@@ -2573,7 +2573,7 @@ mod iov_tests {
     }
 
     /// `set_ebe_warm_start` round-trips through the fit-scoped global the EBE
-    /// fallback reads, and defaults to `true` (matching `FitOptions::default`).
+    /// fallback reads, and defaults to `false` (matching `FitOptions::default`).
     #[test]
     fn ebe_warm_start_flag_round_trips() {
         assert!(!ebe_warm_start_enabled(), "default must be off");

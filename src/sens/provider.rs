@@ -3814,6 +3814,101 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
 
+    /// The exact ODE twin of [`ONECPT_ORAL_LAG`] (depot → central, `LAGTIME` on the
+    /// depot bolus). Same θ/Ω/σ and parameterization, so the ODE provider's full
+    /// `SubjectSens` (value, `∂f/∂η`, `∂f/∂θ`, and the **2nd-order** blocks) must equal
+    /// the closed-form analytical provider's to RK45 accuracy — validating the
+    /// event-time (saltation) sensitivity, including its Hessian, against an independent
+    /// path (#439 lagtime).
+    const ONECPT_ORAL_LAG_ODE_TWIN: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVLAG(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_LAG ~ 0.05
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+
+    #[test]
+    fn ode_lagtime_full_sens_matches_analytical_twin() {
+        use crate::types::DoseEvent;
+        let ana = parse_model_string(ONECPT_ORAL_LAG).expect("parse analytical oral lag");
+        let ode = parse_model_string(ONECPT_ORAL_LAG_ODE_TWIN).expect("parse ODE oral lag");
+        assert!(
+            analytical_supported(&ana),
+            "analytical lag must be supported"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_analytical_supported(&ode),
+            "ODE bare-lag must be supported"
+        );
+        let n = 6usize;
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 4.0, 6.0, 9.0, 12.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        // θ = [TVCL, TVV, TVKA, TVLAG]; η = [ETA_CL, ETA_V, ETA_KA, ETA_LAG] (lag carries IIV).
+        let theta = [0.2, 10.0, 1.5, 0.75];
+        let eta = [0.1, -0.05, 0.15, 0.08];
+        let a =
+            subject_sensitivities(&ana, &subject, &theta, &eta).expect("analytical sens supported");
+        let o = crate::sens::ode_provider::ode_subject_sensitivities(&ode, &subject, &theta, &eta)
+            .expect("ODE sens supported");
+        assert_eq!(a.obs.len(), o.obs.len());
+        for (oa, oo) in a.obs.iter().zip(o.obs.iter()) {
+            approx::assert_relative_eq!(oa.f, oo.f, max_relative = 1e-6, epsilon = 1e-9);
+            for (x, y) in oa.df_deta.iter().zip(oo.df_deta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-8);
+            }
+            for (x, y) in oa.df_dtheta.iter().zip(oo.df_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-8);
+            }
+            for (x, y) in oa.d2f_deta2.iter().zip(oo.d2f_deta2.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-4, epsilon = 1e-7);
+            }
+            for (x, y) in oa.d2f_deta_dtheta.iter().zip(oo.d2f_deta_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-4, epsilon = 1e-7);
+            }
+        }
+    }
+
     // 1-cpt IV bolus with a log-normal lagtime (`alag=` alias, IV route).
     const ONECPT_IV_LAG: &str = r#"
 [parameters]
@@ -4770,6 +4865,60 @@ mod tests {
             )
             .is_none(),
             "dose in an obs-free occasion must decline (→ FD), not abort mid-walk"
+        );
+    }
+
+    /// **IOV × estimated lagtime.** 1-cpt IV IOV `[odes]` model (κ on CL) with a bare
+    /// `LAGTIME`. The dose arrives per occasion at `t_dose + lag`; the lag sensitivity is
+    /// the event-time saltation injected at each dose and propagated through the
+    /// occasion-switching event-driven walk (`integrate_tvcov_g`, shared with the TV-cov
+    /// path). Validates the full stacked-η + θ (incl. the `TVLAG` column) gradient and
+    /// Hessian against FD of `predict_iov`, which handles IOV + lagtime in production
+    /// (#439 lagtime × IOV).
+    const WARFARIN_IOV_LAG_ODE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVLAG(0.5, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  LAGTIME = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    #[test]
+    fn ode_iov_lagtime_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_LAG_ODE).expect("parse ODE IOV+lag");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.has_lagtime());
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + bare lagtime must be supported"
+        );
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, κ_g0, κ_g1]; θ = [TVCL, TVV, TVLAG].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.5],
+            &[0.12, -0.08, 0.05, -0.10],
         );
     }
 

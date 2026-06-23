@@ -321,4 +321,30 @@ mod tests {
             approx::assert_relative_eq!(d.hess[0][0], fd2, max_relative = 1e-4, epsilon = 1e-6);
         }
     }
+
+    /// The dual `ln_gamma` chain rule has two second-order terms — `ψ′·x′⊗x′`
+    /// **and** `ψ·x″`. `ln_gamma_dual2_matches_central_fd` seeds a bare `var`
+    /// (x″ = 0), so it exercises only the first. Feed a dual with a NONZERO input
+    /// Hessian via `x ↦ ln Γ(eˣ)` (the inner `exp` carries x′ and x″) so the
+    /// `ψ·x″` term is exercised too — the path real transit fits hit when an
+    /// absorption param is composite (e.g. `MTT = TVMTT·exp(ETA_MTT)`). Negative
+    /// `x` (eˣ < 0.5) additionally drives the **reflection** branch of the dual
+    /// rule (#458 review #1/#2). Without `ψ·x″`, the main-branch points fail; with
+    /// a wrong reflection rule, the negative points fail.
+    #[test]
+    fn ln_gamma_dual2_chain_rule_nonzero_input_hessian_and_reflection() {
+        use crate::stats::special::ln_gamma;
+        let f = |x: f64| ln_gamma(x.exp());
+        // x = −1.5, −1.0 → eˣ = 0.22, 0.37 < 0.5 (reflection); the rest main branch.
+        for &x in &[-1.5_f64, -1.0, 0.1, 0.5, 1.2, 2.0] {
+            let u = Dual2::<1>::var(x, 0).exp().ln_gamma();
+            approx::assert_relative_eq!(u.value, f(x), max_relative = 1e-12);
+            let h = 1e-5;
+            let fd1 = (f(x + h) - f(x - h)) / (2.0 * h);
+            approx::assert_relative_eq!(u.grad[0], fd1, max_relative = 1e-6, epsilon = 1e-9);
+            let h2 = 1e-4;
+            let fd2 = (f(x + h2) - 2.0 * f(x) + f(x - h2)) / (h2 * h2);
+            approx::assert_relative_eq!(u.hess[0][0], fd2, max_relative = 1e-4, epsilon = 1e-6);
+        }
+    }
 }

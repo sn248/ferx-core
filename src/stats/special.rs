@@ -465,7 +465,7 @@ mod tests {
     /// form — the branch the transit path never hits but correctness still demands.
     #[test]
     fn digamma_trigamma_match_fd_of_ln_gamma_incl_reflection() {
-        for &x in &[0.2, 0.35, 0.8, 1.0, 2.5, 5.0] {
+        for &x in &[0.2, 0.35, 0.8, 1.0, 2.5, 5.0, 12.0, 15.0] {
             let h1 = 1e-6;
             let fd1 = (ln_gamma(x + h1) - ln_gamma(x - h1)) / (2.0 * h1);
             assert_relative_eq!(digamma(x), fd1, max_relative = 1e-5, epsilon = 1e-8);
@@ -473,5 +473,16 @@ mod tests {
             let fd2 = (digamma(x + h2) - digamma(x - h2)) / (2.0 * h2);
             assert_relative_eq!(trigamma(x), fd2, max_relative = 1e-5, epsilon = 1e-8);
         }
+    }
+
+    /// digamma/trigamma must be continuous across the `x = 0.5` branch seam
+    /// (reflection below, Lanczos at/above) — a wrong reflection constant or sign
+    /// surfaces as a jump here, which neither side's anchor alone catches. The two
+    /// sides differ only by `O(ψ′)·2ε` / `O(ψ″)·2ε`; a real discontinuity is O(1).
+    #[test]
+    fn digamma_trigamma_continuous_across_reflection_seam() {
+        let eps = 1e-7;
+        assert_relative_eq!(digamma(0.5 - eps), digamma(0.5 + eps), epsilon = 1e-5);
+        assert_relative_eq!(trigamma(0.5 - eps), trigamma(0.5 + eps), epsilon = 1e-4);
     }
 }

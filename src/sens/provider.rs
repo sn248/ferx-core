@@ -1189,6 +1189,19 @@ pub fn subject_eta_grad_tvcov(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    subject_eta_grad_tvcov_with_schedule(model, subject, theta, eta, None)
+}
+
+/// As [`subject_eta_grad_tvcov`], but reusing a per-subject `EventSchedule` the inner
+/// optimizer cached once (η-invariant) instead of rebuilding it every inner BFGS step
+/// (#449 re-review #6). `None` rebuilds locally (identical result).
+pub(crate) fn subject_eta_grad_tvcov_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
+) -> Option<Vec<ObsGrad>> {
     if !tvcov_analytical_supported(model)
         || !(subject.has_tv_covariates() || subject_has_oral_infusion(model, subject))
     {
@@ -1221,7 +1234,7 @@ pub fn subject_eta_grad_tvcov(
     macro_rules! disp {
         ($($n:literal),+) => {
             match n_eta {
-                $($n => run_obs_grad_tvcov::<$n>(model, subject, theta, eta, prog, &slot_row, n_eta),)+
+                $($n => run_obs_grad_tvcov::<$n>(model, subject, theta, eta, prog, &slot_row, n_eta, cached_schedule),)+
                 _ => None,
             }
         };
@@ -1262,6 +1275,7 @@ fn run_obs_grad_tvcov<const N: usize>(
     prog: &crate::parser::model_parser::IndivParamProgram,
     slot_row: &[Option<usize>; N_PK],
     n_eta: usize,
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::ode_provider::param_derivatives_at_cov;
@@ -1311,13 +1325,24 @@ fn run_obs_grad_tvcov<const N: usize>(
         .map(|m| mk(subject.pk_only_cov(m)))
         .collect::<Option<Vec<_>>>()?;
 
-    let dose_lagtimes = vec![0.0; subject.doses.len()];
-    let schedule =
-        EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
+    // The event schedule is invariant across inner BFGS steps (it depends only on the
+    // subject + doses + zero lagtimes, not on η). Reuse the schedule the inner
+    // optimizer cached once per subject when available, instead of rebuilding it every
+    // gradient step; fall back to building it locally otherwise (#449 re-review #6).
+    let owned_schedule;
+    let schedule: &EventSchedule = match cached_schedule {
+        Some(s) => s,
+        None => {
+            let dose_lagtimes = vec![0.0; subject.doses.len()];
+            owned_schedule =
+                EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
+            &owned_schedule
+        }
+    };
     let conc = event_driven_sens_g::<Dual1<N>>(
         model.pk_model,
         subject,
-        &schedule,
+        schedule,
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
@@ -1411,11 +1436,25 @@ pub fn subject_eta_grad(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    subject_eta_grad_with_schedule(model, subject, theta, eta, None)
+}
+
+/// As [`subject_eta_grad`], but threading a per-subject cached `EventSchedule` (built
+/// once by the inner optimizer) into the TV-cov walk so it isn't rebuilt every inner
+/// BFGS step (#449 re-review #6). `None` (and every non-TV-cov / ODE route) rebuilds
+/// locally — identical result.
+pub(crate) fn subject_eta_grad_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
+) -> Option<Vec<ObsGrad>> {
     if !sens_profile_enabled() {
-        return subject_eta_grad_impl(model, subject, theta, eta);
+        return subject_eta_grad_impl(model, subject, theta, eta, cached_schedule);
     }
     let t0 = std::time::Instant::now();
-    let r = subject_eta_grad_impl(model, subject, theta, eta);
+    let r = subject_eta_grad_impl(model, subject, theta, eta, cached_schedule);
     PROFILE_ETA_NANOS.fetch_add(
         t0.elapsed().as_nanos() as u64,
         std::sync::atomic::Ordering::Relaxed,
@@ -1429,6 +1468,7 @@ fn subject_eta_grad_impl(
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
     // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
     // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
@@ -1443,7 +1483,7 @@ fn subject_eta_grad_impl(
     // already serves these via `subject_sensitivities_tvcov`; route the inner to the
     // matching `Dual1` walk (out-of-scope cases return `None` → FD per point).
     if subject.has_tv_covariates() || subject_has_oral_infusion(model, subject) {
-        return subject_eta_grad_tvcov(model, subject, theta, eta);
+        return subject_eta_grad_tvcov_with_schedule(model, subject, theta, eta, cached_schedule);
     }
     // Same model/subject scope as the full provider …
     if !analytical_supported(model) {
@@ -1544,9 +1584,12 @@ fn subject_eta_grad_impl(
             }
         }
     }
-    // LTBS: `g = ln(f)`, so `∂g/∂η = ∂f/∂η / f`. Applied after scaling, mirroring
-    // `pk::apply_log_transform` (`p = p.max(LTBS_FLOOR).ln()`). Below the floor the
-    // production transform clamps to a constant, so the gradient vanishes.
+    // LTBS: `g = ln(f)`, so `∂g/∂η = ∂f/∂η / f`. Applied after scaling. The value
+    // half goes through the shared `pk::ltbs_log_g` — the same floor-then-log the f64
+    // predictor and the ODE dual walk use — so the analytical gradient can't silently
+    // drift from production either (#451 review #5). The gradient still keys on the
+    // strict `> LTBS_FLOOR` boundary: below the floor the transform clamps to a
+    // constant, so the gradient vanishes.
     if model.log_transform {
         for o in out.iter_mut() {
             if o.f > crate::pk::LTBS_FLOOR {
@@ -1554,13 +1597,12 @@ fn subject_eta_grad_impl(
                 for g in o.df_deta.iter_mut() {
                     *g *= inv;
                 }
-                o.f = o.f.ln();
             } else {
                 for g in o.df_deta.iter_mut() {
                     *g = 0.0;
                 }
-                o.f = crate::pk::LTBS_FLOOR.ln();
             }
+            o.f = crate::pk::ltbs_log_g(o.f);
         }
     }
     Some(out)
@@ -2032,8 +2074,11 @@ fn subject_sensitivities_impl(
     //   ∂g/∂x      = inv · ∂f/∂x
     //   ∂²g/∂x∂y   = inv · ∂²f/∂x∂y − inv² · ∂f/∂x · ∂f/∂y     (x,y ∈ {η,θ})
     // Second derivatives are computed from the *original* first derivatives, so
-    // those are read before `df_deta`/`df_dtheta` are overwritten. Below the floor
-    // the production transform clamps to a constant ⇒ all derivatives vanish.
+    // those are read before `df_deta`/`df_dtheta` are overwritten. The value half
+    // goes through the shared `pk::ltbs_log_g` (same floor-then-log as the f64
+    // predictor and the ODE dual walk), applied after the jet is transformed
+    // (#451 review #5). Below the floor the transform clamps to a constant ⇒ all
+    // derivatives vanish.
     if model.log_transform {
         let n_eta = sens.obs.first().map_or(0, |o| o.df_deta.len());
         let n_theta = sens.obs.first().map_or(0, |o| o.df_dtheta.len());
@@ -2060,7 +2105,6 @@ fn subject_sensitivities_impl(
                 for g in o.df_deta.iter_mut().chain(o.df_dtheta.iter_mut()) {
                     *g *= inv;
                 }
-                o.f = o.f.ln();
             } else {
                 for v in o
                     .df_deta
@@ -2071,8 +2115,8 @@ fn subject_sensitivities_impl(
                 {
                     *v = 0.0;
                 }
-                o.f = crate::pk::LTBS_FLOOR.ln();
             }
+            o.f = crate::pk::ltbs_log_g(o.f);
         }
     }
     Some(sens)
@@ -4132,6 +4176,24 @@ mod tests {
                     &[],
                 );
                 (m, s, vec![0.2, 10.0, 0.75], vec![0.12, -0.09])
+            },
+            {
+                // Constant `ScalarScale` (`obs_scale = 1000`) on the TV-cov **inner**:
+                // exercises `run_obs_grad_tvcov`'s `∂(f/k)/∂η = (∂f/∂η)/k` division,
+                // which the other inner cases (no output scaling) leave uncovered
+                // (#451 / #449 review #10).
+                let m = parse_model_string(ONECPT_ORAL_TVCOV_SCALED)
+                    .expect("parse 1cpt oral tvcov scaled");
+                let s = tvcov_subject(
+                    vec![bolus(0.0)],
+                    &[70.0],
+                    &[1.0, 2.0, 4.0, 8.0, 24.0],
+                    &[70.0, 72.0, 80.0, 85.0, 90.0],
+                    Vec::new(),
+                    Vec::new(),
+                    &[],
+                );
+                (m, s, vec![0.2, 10.0, 1.5, 0.75], vec![0.15, -0.10, 0.25])
             },
         ];
         for (model, subject, theta, eta) in &cases {

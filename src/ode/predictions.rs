@@ -425,23 +425,30 @@ fn prepare_input_rates(ode: &OdeSpec, params: &[f64]) -> Vec<PreparedInputRate> 
 /// tail uses the *current* occasion's `n`/`mtt`. This is exact for IIV and when
 /// `II` exceeds the absorption window; only overlapping-occasion tails are
 /// approximated.
+///
+/// Generic over the numeric type `T: PkNum` so the **single** superposition loop
+/// serves both the production `f64` predictor (`T = f64`, byte-identical to the
+/// original) and the analytic ODE sensitivity provider's dual walk (`T = Dual*`),
+/// instead of `sens/ode_provider.rs` hand-maintaining a second copy (#430 review
+/// #4 / #451). The dual caller passes `dose_lagtimes = &[]` (lagtime gated off) and
+/// `reset_floor = NEG_INFINITY` (reset gated off), so those branches are inert there.
 #[inline]
 #[allow(clippy::too_many_arguments)] // mirrors the dose context threaded into the RHS wrappers
-fn add_prepared_input_rate_forcing(
+pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
     ode: &OdeSpec,
-    prepared: &[PreparedInputRate],
+    prepared: &[PreparedInputRate<T>],
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
-    dose_f_bio: &[f64],
+    dose_f_bio: &[T],
     reset_floor: f64,
     t: f64,
-    dy: &mut [f64],
+    dy: &mut [T],
 ) {
     for (forcing, prep) in ode.input_rate.iter().zip(prepared) {
         if forcing.cmt >= dy.len() {
             continue;
         }
-        let mut acc = 0.0;
+        let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
             if d.cmt.saturating_sub(1) != forcing.cmt {
                 continue;
@@ -457,10 +464,11 @@ fn add_prepared_input_rate_forcing(
             if tad <= 0.0 {
                 continue;
             }
-            let dose_mass = dose_f_bio.get(k).copied().unwrap_or(1.0) * d.amt;
-            acc += prep.rate(tad, dose_mass);
+            let dose_mass =
+                dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
+            acc = acc + prep.rate(T::from_f64(tad), dose_mass);
         }
-        dy[forcing.cmt] += acc;
+        dy[forcing.cmt] = dy[forcing.cmt] + acc;
     }
 }
 

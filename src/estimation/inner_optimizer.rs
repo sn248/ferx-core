@@ -435,13 +435,14 @@ pub fn find_ebe(
             let profile = inner_profile_enabled();
             let agrad = |e: &[f64]| -> Vec<f64> {
                 let t0 = std::time::Instant::now();
-                match analytic_eta_nll_gradient(
+                match analytic_eta_nll_gradient_with_schedule(
                     model,
                     subject,
                     &params.theta,
                     e,
                     &params.omega,
                     &params.sigma.values,
+                    schedule.as_ref(),
                 ) {
                     Some(g) => {
                         GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
@@ -992,9 +993,31 @@ pub(crate) fn analytic_eta_nll_gradient(
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
 ) -> Option<Vec<f64>> {
+    analytic_eta_nll_gradient_with_schedule(model, subject, theta, eta, omega, sigma, None)
+}
+
+/// As [`analytic_eta_nll_gradient`], but reusing the per-subject `EventSchedule` the
+/// inner optimizer cached once, so the TV-cov provider doesn't rebuild it every inner
+/// BFGS step (#449 re-review #6). `None` rebuilds locally.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analytic_eta_nll_gradient_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &crate::types::OmegaMatrix,
+    sigma: &[f64],
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
+) -> Option<Vec<f64>> {
     // Light first-order provider (value + ∂f/∂η only); the inner gradient never
     // needs the second-order / θ blocks the full `subject_sensitivities` carries.
-    let sens = crate::sens::provider::subject_eta_grad(model, subject, theta, eta)?;
+    let sens = crate::sens::provider::subject_eta_grad_with_schedule(
+        model,
+        subject,
+        theta,
+        eta,
+        cached_schedule,
+    )?;
     let n_eta = model.n_eta;
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
     let mut grad = vec![0.0_f64; n_eta];

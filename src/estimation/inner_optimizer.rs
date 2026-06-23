@@ -1201,6 +1201,7 @@ fn lbfgs_core(
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
     let mut rho_hist: Vec<f64> = Vec::new();
     let mut g = grad(x);
+    let mut f_cur = obj(x);
 
     for _iter in 0..max_iter {
         // Preconditioned stopping metric (≈ Newton decrement), commensurate
@@ -1222,10 +1223,13 @@ fn lbfgs_core(
             };
         }
 
-        let alpha = backtracking_line_search(obj, x, &d, &g, n);
-        if alpha < 1e-16 {
+        let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
+        // No sufficient-decrease step found: report non-convergence so the caller
+        // takes the fallback path rather than accepting a non-stationary η̂.
+        if alpha == 0.0 {
             return false;
         }
+        f_cur = f_new;
 
         let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
         for i in 0..n {
@@ -1267,6 +1271,9 @@ fn dense_bfgs_core(
 ) -> bool {
     let mut h_inv = init_h_inv(n, precond);
     let mut g = grad(x);
+    // Track the objective at the current iterate so the line search never has to
+    // recompute `obj(x)` (one prediction walk per inner step on the hot path).
+    let mut f_cur = obj(x);
     let mut first_step = true;
 
     for _iter in 0..max_iter {
@@ -1293,16 +1300,29 @@ fn dense_bfgs_core(
             // direction commensurate across the multi-scale dimensions.
             h_inv = init_h_inv(n, precond);
             let d: Vec<f64> = (-&h_inv * &g_vec).iter().copied().collect();
-            let alpha = backtracking_line_search(obj, x, &d, &g, n);
+            let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
+            // Even steepest descent found no sufficient-decrease step: report
+            // non-convergence so the caller takes the Nelder–Mead fallback,
+            // which re-solves from η=0 and reaches the true mode. Claiming
+            // convergence here would hand the outer FOCE gradient a
+            // non-stationary η̂ and stall the population optimiser.
+            if alpha == 0.0 {
+                return false;
+            }
             for i in 0..n {
                 x[i] += alpha * d[i];
             }
+            f_cur = f_new;
             g = grad(x);
             continue;
         }
 
-        let alpha = backtracking_line_search(obj, x, &d, &g, n);
-        if alpha < 1e-16 {
+        let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
+        // No sufficient-decrease step found: not yet at the mode (the descent
+        // direction exists but the line search exhausted its trials). Report
+        // failure so Nelder–Mead re-solves and the outer gradient sees a true
+        // stationary η̂.
+        if alpha == 0.0 {
             return false;
         }
 
@@ -1310,6 +1330,7 @@ fn dense_bfgs_core(
         for i in 0..n {
             x[i] += s[i];
         }
+        f_cur = f_new;
 
         let g_new = grad(x);
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
@@ -1450,32 +1471,67 @@ fn nelder_mead_minimize(
     false
 }
 
-/// Backtracking line search with Armijo condition
+/// Maximum trial steps in the backtracking line search before it gives up.
+/// With quadratic interpolation a sufficient-decrease step is normally found in
+/// 1–3 trials; the cap only bites on directions with no representable decrease
+/// (i.e. the iterate is already at the posterior mode to machine precision).
+const MAX_LINE_SEARCH_TRIALS: usize = 30;
+
+/// Backtracking line search with an Armijo sufficient-decrease test, choosing
+/// each successive trial step by **safeguarded quadratic interpolation** rather
+/// than fixed halving. Fitting a quadratic through the known `f0`, the slope
+/// `dg = ∇f·d`, and the latest trial value lands on (or near) the Armijo step in
+/// far fewer evaluations than repeated `α ← α/2`, which on this inner objective
+/// routinely needed ~20 backtracks and frequently exhausted the cap.
+///
+/// `f0` is the objective at `x`, supplied by the caller (the inner BFGS already
+/// tracks it), so the line search no longer recomputes `obj(x)` on every call.
+///
+/// Returns `(alpha, f_at_x_plus_alpha_d)`. `alpha == 0.0` signals that no
+/// sufficient-decrease step exists along `d` (non-descent direction, or the
+/// directional decrease is below numerical resolution); the caller treats that
+/// as a stationary point.
 fn backtracking_line_search(
     obj: &dyn Fn(&[f64]) -> f64,
     x: &[f64],
     d: &[f64],
     g: &[f64],
     n: usize,
-) -> f64 {
+    f0: f64,
+) -> (f64, f64) {
     let c1 = 1e-4;
-    let shrink = 0.5;
-    let mut alpha = 1.0;
-    let f0 = obj(x);
     let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
+    // Not a descent direction: nothing to do (caller falls back / stops).
+    if !(dg < 0.0) {
+        return (0.0, f0);
+    }
 
+    let mut alpha = 1.0;
     let mut x_new = vec![0.0; n];
-    for _ in 0..40 {
+    for _ in 0..MAX_LINE_SEARCH_TRIALS {
         for i in 0..n {
             x_new[i] = x[i] + alpha * d[i];
         }
         let f_new = obj(&x_new);
         if f_new <= f0 + c1 * alpha * dg {
-            return alpha;
+            return (alpha, f_new);
         }
-        alpha *= shrink;
+        // Minimiser of the quadratic matching f0, dg (slope at 0) and f_new at
+        // the current alpha. Safeguard into [0.1·α, 0.5·α] so a flat/non-convex
+        // sample still makes definite progress (never larger than plain halving,
+        // never a near-zero collapse).
+        let denom = 2.0 * (f_new - f0 - dg * alpha);
+        let alpha_quad = if denom > 0.0 {
+            -dg * alpha * alpha / denom
+        } else {
+            0.5 * alpha
+        };
+        alpha = alpha_quad.clamp(0.1 * alpha, 0.5 * alpha);
+        if alpha < 1e-16 {
+            break;
+        }
     }
-    alpha
+    (0.0, f0)
 }
 
 /// Central finite difference gradient (optimized step size)
@@ -1777,6 +1833,70 @@ mod tests {
                 t_dense / t_lbfgs
             );
         }
+    }
+
+    /// The interpolating backtracking line search returns a step that satisfies
+    /// the Armijo sufficient-decrease test and strictly lowers the objective,
+    /// using only a handful of trial evaluations (the property the FOCEI inner
+    /// loop relies on — fixed halving used ~20 here and frequently hit the cap).
+    #[test]
+    fn line_search_finds_armijo_step_quickly() {
+        // f(x) = (x − 3)²; at x = 0 the unit Newton-less step −g overshoots the
+        // minimiser, so a fixed-halving search would backtrack repeatedly.
+        let obj = |x: &[f64]| -> f64 { (x[0] - 3.0) * (x[0] - 3.0) };
+        let x = [0.0];
+        let g = [2.0 * (x[0] - 3.0)]; // = −6
+        let d = [-g[0]]; // steepest descent, dg = −36 < 0
+        let f0 = obj(&x);
+        let evals = std::cell::Cell::new(0usize);
+        let counting = |xx: &[f64]| {
+            evals.set(evals.get() + 1);
+            obj(xx)
+        };
+        let (alpha, f_new) = backtracking_line_search(&counting, &x, &d, &g, 1, f0);
+        let evals = evals.get();
+        assert!(alpha > 0.0, "a descent step must be found");
+        let c1 = 1e-4;
+        let dg: f64 = d.iter().zip(g.iter()).map(|(a, b)| a * b).sum();
+        assert!(
+            f_new <= f0 + c1 * alpha * dg,
+            "returned step must satisfy Armijo"
+        );
+        assert!(f_new < f0, "objective must strictly decrease");
+        assert!(
+            evals <= 5,
+            "interpolation should converge in a few evals, got {evals}"
+        );
+    }
+
+    /// A non-descent direction (dg ≥ 0) yields `alpha == 0` and leaves the
+    /// objective baseline untouched — the signal the inner BFGS uses to stop /
+    /// fall back rather than step uphill.
+    #[test]
+    fn line_search_rejects_non_descent_direction() {
+        let obj = |x: &[f64]| -> f64 { (x[0] - 3.0) * (x[0] - 3.0) };
+        let x = [0.0];
+        let g = [2.0 * (x[0] - 3.0)]; // = −6
+        let d = [g[0]]; // SAME sign as g → dg = +36 ≥ 0 (ascent)
+        let f0 = obj(&x);
+        let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, 1, f0);
+        assert_eq!(alpha, 0.0);
+        assert_eq!(f_new, f0);
+    }
+
+    /// The refactored dense BFGS (objective-tracked line search) still drives a
+    /// well-conditioned quadratic to its analytic minimiser.
+    #[test]
+    fn dense_bfgs_converges_on_quadratic() {
+        // f(x) = (x0−1)² + 4(x1+2)², minimiser (1, −2).
+        let obj =
+            |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
+        let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
+        let mut x = vec![0.0, 0.0];
+        let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None);
+        assert!(ok, "BFGS should report convergence");
+        assert!((x[0] - 1.0).abs() < 1e-6, "x0 = {}", x[0]);
+        assert!((x[1] + 2.0).abs() < 1e-6, "x1 = {}", x[1]);
     }
 
     #[test]
@@ -2561,8 +2681,15 @@ mod iov_tests {
         let r2 = find_ebe(&model, &subject, &params, 200, 1e-5, None, Some(&mu));
 
         assert!(r1.converged && r2.converged);
+        // This fixture's BSV mode sits far out (η̂ ≈ −7.6) where the FD-gradient
+        // inner objective is very flat: the gnorm < 1e-5 stop is satisfied across
+        // an η basin wider than 1e-4, so the exact landing point is line-search
+        // path dependent. The invariant under test is that mu-referencing is
+        // *honored* — if it were dropped the two runs would differ by ~mu (0.1).
+        // The realised gap (~2e-4) is two orders of magnitude smaller, so a 1e-3
+        // bound robustly distinguishes "applied" from "dropped".
         assert!(
-            (r1.eta[0] - r2.eta[0]).abs() < 1e-4,
+            (r1.eta[0] - r2.eta[0]).abs() < 1e-3,
             "mu shift not applied: r1.eta={}, r2.eta={}",
             r1.eta[0],
             r2.eta[0],

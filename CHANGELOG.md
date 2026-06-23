@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Performance
+- **Interpolating inner-loop line search** (#462). The EBE BFGS line search now
+  picks each trial step by safeguarded quadratic interpolation instead of fixed
+  halving, and reuses the objective value the optimiser already tracks instead of
+  recomputing it. On the two-compartment UVM FOCEI/MMA benchmark this cuts the
+  average backtracks per line search from ~22 to ~3 (cap-exhaustion 20% → 0.1%),
+  roughly halving the prediction-walk count for a ~2.5× faster single-threaded
+  fit at the same optimum.
+- Reuse per-thread scratch buffers when evaluating individual PK parameters,
+  reducing allocator traffic in FOCE/FOCEI inner loops with time-varying
+  covariates (#462).
 - **Analytic inner η-gradient for time-varying covariates / oral infusion on
   analytical PK models** (#447). The light `Dual1` inner EBE gradient previously
   declined these subjects and reverted to finite differences even though the

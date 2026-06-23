@@ -689,15 +689,27 @@ fn apply_output_transform<T: crate::sens::num::PkNum>(model: &CompiledModel, p: 
     if p.val().is_nan() {
         return p;
     }
+    // `ScalarScale` is the only scaling the gate (`ode_analytical_supported`) admits
+    // over duals — `ExpressionScale`/`PerCmt` scaling route to the Form-C `y = state/V`
+    // readout instead, so production's full `build_obs_scale_array` need not be lifted
+    // here. Divide (not multiply by `1/k`) to match production's `pred /= s` exactly.
     let p = match model.scaling {
-        ScalingSpec::ScalarScale(k) if k != 1.0 => p * T::from_f64(1.0 / k),
+        ScalingSpec::ScalarScale(k) if k != 1.0 => p / T::from_f64(k),
         _ => p,
     };
+    // LTBS log. The value goes through the shared generic transform — the same
+    // floor-then-log production runs on f64 (#451); the `NaN` pre-check above keeps a
+    // `NaN` readout visible rather than letting the floor convert it to `ln(LTBS_FLOOR)`.
+    // The gradient keys on the strict `> LTBS_FLOOR` boundary, matching the analytical
+    // path (`provider.rs`) and `apply_log_transform`'s clamp semantics: at or below the
+    // floor the readout is clamped to a constant so its derivatives vanish, rather than
+    // `guard_floor` retaining the jet exactly at the floor (#460 review). Above the
+    // floor the dual `ln` carries the jet (and `ltbs_log_g` is then just `p.ln()`).
     if model.log_transform {
         if p.val() > crate::pk::LTBS_FLOOR {
-            p.ln()
+            crate::pk::ltbs_log_g(p)
         } else {
-            T::from_f64(crate::pk::LTBS_FLOOR.ln())
+            T::from_f64(crate::pk::ltbs_log_g(p.val()))
         }
     } else {
         p
@@ -785,13 +797,13 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
         return None;
     }
     // Bioavailability F scales the dosed amount/rate (NONMEM F·AMT / F·RATE). F
-    // lives at PK_IDX_F (pk_param_fn defaults it to 1 when undeclared); when F is
-    // an estimated individual parameter, its derivative flows via `params_dual`.
-    let f_bio = if pk_values[PK_IDX_F] > 0.0 {
-        params_dual[PK_IDX_F]
-    } else {
-        T::from_f64(1.0)
-    };
+    // lives at PK_IDX_F (pk_param_fn defaults it to 1 when undeclared); when F is an
+    // estimated individual parameter, its derivative flows via `params_dual`. Use the
+    // raw slot — mirroring production's `DoseAttrMap::f_bio` (raw `params[PK_IDX_F]`,
+    // with the 1.0 default baked into the slot at construction) — so a transient
+    // F ≤ 0 mid-fit scales the dose by F exactly as the f64 predictor does, rather
+    // than substituting 1.0 and dropping ∂/∂F (#451 / #433 review #3).
+    let f_bio = params_dual[PK_IDX_F];
 
     // Dose-time anchors for TAFD/TAD (constants w.r.t. the parameters).
     let first_dose_time = subject
@@ -1124,6 +1136,15 @@ fn seed_pk_dual2<const M: usize>(
     // `n_theta..M`), so the index guards are always satisfied — flat loops, no `< M`
     // / `.min(M)` (#449 review #15). The assert pins the invariant.
     debug_assert_eq!(M, n_theta + n_eta);
+    // `pd` (the dual program eval) carries the individual-parameter *values* too, so
+    // the separate `pk_param_fn` call below looks redundant (#451 re-review #9). It is
+    // retained deliberately: `pk_param_fn` returns the **full** slot vector including
+    // the non-individual-parameter slots (reserved `F`/lag defaults, etc.) that the
+    // indiv-param program — hence `pd` — never produces. Reconstructing those from a
+    // defaults base would re-encode `pk_param_fn`'s slot semantics here and risk silent
+    // gradient divergence for any model that fills a non-indiv slot non-trivially,
+    // while saving only the cheap f64 eval (the M²-Hessian dual eval dominates, and the
+    // covariate-snapshot dedup already elides repeats). Not worth that trade.
     let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
     let pk = (model.pk_param_fn)(theta, eta, cov);
     let mut out: Vec<Dual2<M>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();
@@ -1167,21 +1188,25 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
     subject: &Subject,
     pk_at_dose: &[Vec<T>],
     pk_at_obs: &[Vec<T>],
-) -> Option<Vec<T>> {
-    let ode = model.ode_spec.as_ref()?;
-    let program = ode.rhs_program.as_ref()?;
+) -> Vec<T> {
+    // `ode_tvcov_supported` (checked by both TV-cov entry points before reaching
+    // here) calls `ode_analytical_supported`, which declines a model whose `ode_spec`
+    // or `rhs_program` is `None` — so both are guaranteed present and this readout is
+    // infallible (the former `Option` return was dead) (#451 re-review #12).
+    let ode = model
+        .ode_spec
+        .as_ref()
+        .expect("ode_analytical_supported (via ode_tvcov_supported) guarantees ode_spec");
+    let program = ode
+        .rhs_program
+        .as_ref()
+        .expect("ode_analytical_supported (via ode_tvcov_supported) guarantees rhs_program");
     let opts = ode.solver_opts;
 
-    let f_bio_at_dose: Vec<T> = pk_at_dose
-        .iter()
-        .map(|p| {
-            if p[PK_IDX_F].val() > 0.0 {
-                p[PK_IDX_F]
-            } else {
-                T::from_f64(1.0)
-            }
-        })
-        .collect();
+    // Raw slot, mirroring production's `DoseAttrMap::f_bio` (1.0 default baked in at
+    // construction) — a transient F ≤ 0 scales the dose by F like the f64 predictor,
+    // not 1.0 (#451 / #433 review #3).
+    let f_bio_at_dose: Vec<T> = pk_at_dose.iter().map(|p| p[PK_IDX_F]).collect();
     let first_dose_time = subject
         .doses
         .iter()
@@ -1220,7 +1245,58 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
             )
         })
         .collect();
-    Some(preds)
+    preds
+}
+
+/// Seed the per-event PK duals for a TV-cov subject's doses and observations,
+/// deduplicating identical covariate snapshots. With TV covariates that change at
+/// only a few breakpoints, most dose/obs events share a snapshot, so a full dual
+/// eval per event re-does identical work; memoising by snapshot collapses that. The
+/// seed is deterministic in the snapshot, so a cache hit is bit-identical to
+/// re-seeding. The dose and obs vectors share one cache, so a snapshot common to
+/// both is evaluated once. `seed` is fallible (`None` aborts the whole subject →
+/// FD fallback); an infallible seeder wraps its result in `Some`.
+///
+/// One generic home for both the outer (`Dual2`) and inner (`Dual1`) TV-cov walks,
+/// so the memoisation policy isn't maintained as two near-identical closures
+/// (#451 re-review #8 / #451 review #3). The cache is a `HashMap` keyed on the
+/// snapshot's canonical bit form — names sorted, values as `f64::to_bits` — giving
+/// O(1) amortised lookup (not a linear scan) and, because `to_bits` is total, making a
+/// snapshot with a missing (`NaN`) covariate deduplicate correctly: the seed is
+/// deterministic in the snapshot, so sharing one bit-identical result is exactly a
+/// re-seed (#460 review).
+fn seed_tvcov_snapshots<T: Clone>(
+    subject: &Subject,
+    mut seed: impl FnMut(&std::collections::HashMap<String, f64>) -> Option<Vec<T>>,
+) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>)> {
+    use std::collections::HashMap;
+    // Canonical, hashable key for a covariate snapshot. `f64` is neither `Hash` nor
+    // `Eq`, so key on `to_bits` (name-sorted); `to_bits` is total, so `NaN` keys are
+    // well-defined and equal NaNs collapse — unlike `f64` `==`, which never matches a
+    // `NaN` to itself (which left the old `Vec` cache scanning dead, unmatchable entries).
+    fn snapshot_key(cov: &HashMap<String, f64>) -> Vec<(String, u64)> {
+        let mut kv: Vec<(String, u64)> =
+            cov.iter().map(|(k, v)| (k.clone(), v.to_bits())).collect();
+        kv.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        kv
+    }
+    let mut cache: HashMap<Vec<(String, u64)>, Vec<T>> = HashMap::new();
+    let mut seed_for = |cov: &HashMap<String, f64>| -> Option<Vec<T>> {
+        let key = snapshot_key(cov);
+        if let Some(v) = cache.get(&key) {
+            return Some(v.clone());
+        }
+        let v = seed(cov)?;
+        cache.insert(key, v.clone());
+        Some(v)
+    };
+    let pk_at_dose: Vec<Vec<T>> = (0..subject.doses.len())
+        .map(|k| seed_for(subject.dose_cov(k)))
+        .collect::<Option<_>>()?;
+    let pk_at_obs: Vec<Vec<T>> = (0..subject.obs_times.len())
+        .map(|j| seed_for(subject.obs_cov(j)))
+        .collect::<Option<_>>()?;
+    Some((pk_at_dose, pk_at_obs))
 }
 
 /// Time-varying-covariate outer (`Dual2<M>`, `M = n_theta + n_eta`) sensitivities
@@ -1238,14 +1314,13 @@ fn run_subject_tvcov<const M: usize>(
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
 
-    let pk_at_dose: Vec<Vec<Dual2<M>>> = (0..subject.doses.len())
-        .map(|k| seed_pk_dual2::<M>(model, prog, theta, eta, subject.dose_cov(k)))
-        .collect();
-    let pk_at_obs: Vec<Vec<Dual2<M>>> = (0..subject.obs_times.len())
-        .map(|j| seed_pk_dual2::<M>(model, prog, theta, eta, subject.obs_cov(j)))
-        .collect();
+    // Seed each event's per-snapshot PK duals via the shared dedup helper.
+    // `seed_pk_dual2` is infallible, so wrap it in `Some`; the `?` never fires here.
+    let (pk_at_dose, pk_at_obs) = seed_tvcov_snapshots::<Dual2<M>>(subject, |cov| {
+        Some(seed_pk_dual2::<M>(model, prog, theta, eta, cov))
+    })?;
 
-    let preds = integrate_tvcov_readout::<Dual2<M>>(model, subject, &pk_at_dose, &pk_at_obs)?;
+    let preds = integrate_tvcov_readout::<Dual2<M>>(model, subject, &pk_at_dose, &pk_at_obs);
 
     let mut out = Vec::with_capacity(preds.len());
     for fd in &preds {
@@ -1347,14 +1422,12 @@ fn run_subject_tvcov_eta<const N: usize>(
     let prog = ode.indiv_param_program.as_ref()?;
     let n_eta = model.n_eta;
 
-    let pk_at_dose: Vec<Vec<Dual1<N>>> = (0..subject.doses.len())
-        .map(|k| seed_pk_dual1::<N>(model, prog, theta, eta, subject.dose_cov(k)))
-        .collect::<Option<_>>()?;
-    let pk_at_obs: Vec<Vec<Dual1<N>>> = (0..subject.obs_times.len())
-        .map(|j| seed_pk_dual1::<N>(model, prog, theta, eta, subject.obs_cov(j)))
-        .collect::<Option<_>>()?;
+    // Dedup identical covariate snapshots via the shared helper (#451 re-review #8).
+    let (pk_at_dose, pk_at_obs) = seed_tvcov_snapshots::<Dual1<N>>(subject, |cov| {
+        seed_pk_dual1::<N>(model, prog, theta, eta, cov)
+    })?;
 
-    let preds = integrate_tvcov_readout::<Dual1<N>>(model, subject, &pk_at_dose, &pk_at_obs)?;
+    let preds = integrate_tvcov_readout::<Dual1<N>>(model, subject, &pk_at_dose, &pk_at_obs);
 
     let mut out = Vec::with_capacity(preds.len());
     for fd in &preds {
@@ -1414,6 +1487,19 @@ fn eval_rhs_anchored<T: crate::sens::num::PkNum>(
 /// are the per-event flat PK-slot duals pre-seeded by the caller on `(θ,η)` (outer)
 /// or `η` (inner); `f_bio_at_dose[k]` is dose `k`'s bioavailability dual. Returns
 /// one state vector per observation (parallel to `subject.obs_times`).
+///
+/// **Deliberately kept separate from [`integrate_g`]** (the #451 fold was assessed
+/// and declined): the two have divergent control flow that can't merge without
+/// either a regression or a net complexity *increase*. Production's static walk
+/// (`ode_predictions`) — which the static dual `integrate_g` must match to 1e-9 —
+/// integrates each break-time segment under **constant** params and records
+/// observations as **in-segment solver save points**. This TV-cov walk instead
+/// switches params at **every event** (NONMEM end-of-interval), so observations
+/// must be **segment boundaries**, not interior save points. Forcing one
+/// obs-handling form onto both would make the static dual diverge from production
+/// (the 1e-9 risk); keeping both behind a mode branch is just two control flows
+/// glued together. The genuinely shareable pieces — `eval_rhs_anchored`,
+/// `resolve_obs_readout`, `solve_ode_g` — are already factored out and used by both.
 #[allow(clippy::too_many_arguments)]
 fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
@@ -1469,6 +1555,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
     let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
 
+    // TAD anchor: the most recent dose at or before the current segment start. The
+    // timeline is sorted and doses sort before a co-timed obs, so this only advances
+    // as dose events pass — track it incrementally instead of re-scanning all doses
+    // per segment (#451 re-review #6). A dose at the segment start is applied *after*
+    // that segment integrates, so it anchors the *next* segment — matching the prior
+    // `dt <= cur_t` scan.
+    let mut last_dose_eff = f64::NEG_INFINITY;
+
     for &(t_event, _order, is_dose, idx) in &tl {
         // Segment `[cur_t, t_event]` uses the params evaluated at `t_event`.
         let params: &[T] = if is_dose {
@@ -1477,12 +1571,6 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             &pk_at_obs[idx]
         };
         if t_event > cur_t {
-            let last_dose_eff = subject
-                .doses
-                .iter()
-                .map(|d| d.time)
-                .filter(|&dt| dt <= cur_t + 1e-12)
-                .fold(f64::NEG_INFINITY, f64::max);
             let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                 eval_rhs_anchored::<T>(
                     program,
@@ -1515,6 +1603,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     u[cmt_idx] = u[cmt_idx] + f_bio_at_dose[idx] * T::from_f64(d.amt);
                 }
             }
+            // This dose now anchors TAD for every later segment (all dose times count,
+            // matching the prior all-doses scan, regardless of compartment validity).
+            last_dose_eff = last_dose_eff.max(d.time);
         } else {
             states[idx].copy_from_slice(&u);
         }
@@ -1609,6 +1700,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // Reusable scratch for the RHS evaluation across all stages.
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
     let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
+
+    // Per-dose bioavailability for the shared absorption-forcing helper. The static
+    // walk applies one `f_bio` to every dose (per-compartment F is gated off), built
+    // once per subject rather than per RK45 stage (#451 / #433 review #6).
+    let dose_f_bio_all: Vec<T> = vec![f_bio; subject.doses.len()];
 
     for w in 0..(break_times.len() - 1) {
         let t_start = break_times[w];
@@ -1705,32 +1801,22 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                     du[cmt] = du[cmt] + f_bio * T::from_f64(rate);
                 }
             }
-            // Built-in absorption input-rate forcing R_in(tad), summed over the
-            // doses feeding each forcing's compartment — the Dual2 analogue of
-            // `add_prepared_input_rate_forcing` (#430). Lagtime is excluded from
-            // this provider, so tad = t − dose.time is parameter-independent (a
-            // constant dual); only the prepared constants and F·amt carry
-            // derivatives. Reset subjects are excluded (FD fallback), so there is
-            // no `reset_floor` to apply here.
-            for (forcing, prep) in ode.input_rate.iter().zip(prepared_forcings) {
-                if forcing.cmt >= du.len() {
-                    continue;
-                }
-                let mut acc = T::from_f64(0.0);
-                for d in &subject.doses {
-                    if d.cmt.saturating_sub(1) != forcing.cmt {
-                        continue;
-                    }
-                    let tad_f = t - d.time;
-                    // Pre-dose skip: `tad ≤ 0` contributes nothing. `rate` re-checks
-                    // this same wall (`tad.val() <= 0`), so this is an optimization
-                    // (skip the dual `rate` call), not the source of truth (#430 review).
-                    if tad_f <= 0.0 {
-                        continue;
-                    }
-                    acc = acc + prep.rate(T::from_f64(tad_f), f_bio * T::from_f64(d.amt));
-                }
-                du[forcing.cmt] = du[forcing.cmt] + acc;
+            // Built-in absorption input-rate forcing R_in(tad), via the shared
+            // generic helper — the same superposition loop production runs on `f64`,
+            // now monomorphised on the dual type `T`. Lagtime is excluded from this
+            // provider (`&[]` → tad = t − dose.time), and reset+absorption is gated to
+            // FD (`NEG_INFINITY` floor → no pre-reset skip) (#430 review #4 / #451).
+            if !prepared_forcings.is_empty() {
+                crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
+                    ode,
+                    prepared_forcings,
+                    &subject.doses,
+                    &[],
+                    &dose_f_bio_all,
+                    f64::NEG_INFINITY,
+                    t,
+                    du,
+                );
             }
         };
 
@@ -2810,6 +2896,44 @@ mod tests {
         subject
     }
 
+    /// A TV-cov model whose RHS references the `TAD` (time-after-dose) builtin, so
+    /// the event-driven TV-cov walk's `last_dose_eff` / time-anchoring is exercised
+    /// — the other TV-cov parity tests use a `t`-independent RHS, leaving the
+    /// anchoring covered only through a constant (#451 / #449 review #10). Same
+    /// parameter shape as `ONECPT_ODE_TVCOV`, so `tvcov_subject` + the same θ/η apply.
+    #[test]
+    fn ode_provider_tvcov_tad_dependent_rhs_matches_production() {
+        const TVCOV_TAD_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.02 * TAD)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(TVCOV_TAD_ODE).expect("parse");
+        assert!(model.ode_spec.as_ref().unwrap().input_rate.is_empty());
+        let subject = tvcov_subject();
+        assert!(ode_tvcov_supported(&model, &subject));
+        // Analytic TV-cov walk (f / ∂η / ∂θ) must match the production predictor + FD
+        // with the TAD-dependent RHS.
+        check_vs_production(&model, &subject, &[1.0, 20.0, 0.75], &[0.1]);
+    }
+
     /// The light `Dual1` inner η-gradient must equal the full `Dual2` outer
     /// `df_deta` for a TV-cov subject too — exercised through the dispatch, so this
     /// also covers `ode_tvcov_supported` routing both entry points (#439).
@@ -2867,6 +2991,49 @@ mod tests {
         inf.doses[0].rate = inf.doses[0].amt;
         assert!(crate::ode::predictions::is_real_infusion(&inf.doses[0]));
         assert!(!ode_tvcov_supported(&model, &inf));
+    }
+
+    /// A model whose individual-parameter program carries more than `MAX_ODE_AXES`
+    /// (16) axes must make `param_derivatives_at_cov` return `None` gracefully (its
+    /// dispatch only specializes `1..=16`, hitting the `_ => None` arm) rather than
+    /// panic — the seeders propagate that `None` via `?`, so the caller falls back to
+    /// FD. (The gate caps `n_theta + n_eta ≤ 16`, so this `_ => None` is otherwise
+    /// reachable only through intermediate-axis inflation — see #455.) (#451 re-review #10)
+    #[test]
+    fn param_derivatives_at_cov_declines_over_max_axes_gracefully() {
+        // 16 thetas + 1 eta = 17 axes (> MAX_ODE_AXES). All thetas feed CL so the
+        // program carries every θ-axis.
+        let n_th = MAX_ODE_AXES;
+        let mut src = String::from("[parameters]\n");
+        for i in 1..=n_th {
+            src += &format!("  theta T{i}(1.0, 0.1, 10.0)\n");
+        }
+        src += "  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04 (sd)\n\
+                [individual_parameters]\n  CL = exp(ETA_CL) * (";
+        src += &(1..=n_th)
+            .map(|i| format!("T{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        src += ")\n  V = T2\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+                [odes]\n  d/dt(central) = -CL/V * central\n[error_model]\n  \
+                DV ~ proportional(PROP_ERR)\n";
+        let model = parse_model_string(&src).expect("parse");
+        assert_eq!(model.n_theta, n_th);
+        assert_eq!(model.n_eta, 1);
+        let prog = model
+            .ode_spec
+            .as_ref()
+            .expect("ode")
+            .indiv_param_program
+            .as_ref()
+            .expect("prog");
+        assert!(prog.n_axes() > MAX_ODE_AXES, "fixture must exceed the cap");
+        let theta = vec![1.0; n_th];
+        let pd = param_derivatives_at_cov(prog, &model, &HashMap::new(), &theta, &[0.1]);
+        assert!(
+            pd.is_none(),
+            "> MAX_ODE_AXES axes must decline to FD, not panic"
+        );
     }
 
     // ---- #430 slice 1: built-in inverse-Gaussian absorption forcing over Dual2 ----

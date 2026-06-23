@@ -1187,11 +1187,11 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
     let ode = model
         .ode_spec
         .as_ref()
-        .expect("ode_tvcov_supported guarantees ode_spec");
+        .expect("ode_analytical_supported (via ode_tvcov_supported) guarantees ode_spec");
     let program = ode
         .rhs_program
         .as_ref()
-        .expect("ode_analytical_supported guarantees rhs_program");
+        .expect("ode_analytical_supported (via ode_tvcov_supported) guarantees rhs_program");
     let opts = ode.solver_opts;
 
     // Raw slot, mirroring production's `DoseAttrMap::f_bio` (1.0 default baked in at
@@ -1239,6 +1239,43 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
     preds
 }
 
+/// Seed the per-event PK duals for a TV-cov subject's doses and observations,
+/// deduplicating identical covariate snapshots. With TV covariates that change at
+/// only a few breakpoints, most dose/obs events share a snapshot, so a full dual
+/// eval per event re-does identical work; memoising by snapshot collapses that. The
+/// seed is deterministic in the snapshot, so a cache hit is bit-identical to
+/// re-seeding. The dose and obs vectors share one cache, so a snapshot common to
+/// both is evaluated once. `seed` is fallible (`None` aborts the whole subject →
+/// FD fallback); an infallible seeder wraps its result in `Some`.
+///
+/// One generic home for both the outer (`Dual2`) and inner (`Dual1`) TV-cov walks,
+/// so the memoisation policy isn't maintained as two near-identical closures
+/// (#451 re-review #8 / #451 review #3). The cache is a linear-scanned `Vec` keyed on
+/// `HashMap<String, f64>` value-equality — fine for the few-snapshot common case;
+/// note a snapshot with a missing (`NaN`) covariate value never compares equal to
+/// itself, so it isn't deduplicated (a re-seed, identical result, never a wrong one).
+fn seed_tvcov_snapshots<T: Clone>(
+    subject: &Subject,
+    mut seed: impl FnMut(&std::collections::HashMap<String, f64>) -> Option<Vec<T>>,
+) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>)> {
+    let mut snap_cache: Vec<(std::collections::HashMap<String, f64>, Vec<T>)> = Vec::new();
+    let mut seed_for = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<T>> {
+        if let Some((_, v)) = snap_cache.iter().find(|(c, _)| c == cov) {
+            return Some(v.clone());
+        }
+        let v = seed(cov)?;
+        snap_cache.push((cov.clone(), v.clone()));
+        Some(v)
+    };
+    let pk_at_dose: Vec<Vec<T>> = (0..subject.doses.len())
+        .map(|k| seed_for(subject.dose_cov(k)))
+        .collect::<Option<_>>()?;
+    let pk_at_obs: Vec<Vec<T>> = (0..subject.obs_times.len())
+        .map(|j| seed_for(subject.obs_cov(j)))
+        .collect::<Option<_>>()?;
+    Some((pk_at_dose, pk_at_obs))
+}
+
 /// Time-varying-covariate outer (`Dual2<M>`, `M = n_theta + n_eta`) sensitivities
 /// for an ODE model — the ODE counterpart of `run_obs_tvcov`. Seeds the per-event
 /// PK params on `(θ,η)`, runs the shared TV-cov walk + readout, and reads
@@ -1254,26 +1291,11 @@ fn run_subject_tvcov<const M: usize>(
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
 
-    // Seed each event's per-snapshot PK duals, deduplicating identical covariate
-    // snapshots: with TV covariates that change at only a few breakpoints, most
-    // dose/obs events share a snapshot, so a full dual eval per event re-does
-    // identical work. Memoise by snapshot (the result is deterministic in the
-    // snapshot, so a cache hit is bit-identical to re-seeding) (#451 re-review #8).
-    let mut snap_cache: Vec<(std::collections::HashMap<String, f64>, Vec<Dual2<M>>)> = Vec::new();
-    let mut seed_for = |cov: &std::collections::HashMap<String, f64>| -> Vec<Dual2<M>> {
-        if let Some((_, v)) = snap_cache.iter().find(|(c, _)| c == cov) {
-            return v.clone();
-        }
-        let v = seed_pk_dual2::<M>(model, prog, theta, eta, cov);
-        snap_cache.push((cov.clone(), v.clone()));
-        v
-    };
-    let pk_at_dose: Vec<Vec<Dual2<M>>> = (0..subject.doses.len())
-        .map(|k| seed_for(subject.dose_cov(k)))
-        .collect();
-    let pk_at_obs: Vec<Vec<Dual2<M>>> = (0..subject.obs_times.len())
-        .map(|j| seed_for(subject.obs_cov(j)))
-        .collect();
+    // Seed each event's per-snapshot PK duals via the shared dedup helper.
+    // `seed_pk_dual2` is infallible, so wrap it in `Some`; the `?` never fires here.
+    let (pk_at_dose, pk_at_obs) = seed_tvcov_snapshots::<Dual2<M>>(subject, |cov| {
+        Some(seed_pk_dual2::<M>(model, prog, theta, eta, cov))
+    })?;
 
     let preds = integrate_tvcov_readout::<Dual2<M>>(model, subject, &pk_at_dose, &pk_at_obs);
 
@@ -1377,22 +1399,10 @@ fn run_subject_tvcov_eta<const N: usize>(
     let prog = ode.indiv_param_program.as_ref()?;
     let n_eta = model.n_eta;
 
-    // Dedup identical covariate snapshots — see `run_subject_tvcov` (#451 re-review #8).
-    let mut snap_cache: Vec<(std::collections::HashMap<String, f64>, Vec<Dual1<N>>)> = Vec::new();
-    let mut seed_for = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual1<N>>> {
-        if let Some((_, v)) = snap_cache.iter().find(|(c, _)| c == cov) {
-            return Some(v.clone());
-        }
-        let v = seed_pk_dual1::<N>(model, prog, theta, eta, cov)?;
-        snap_cache.push((cov.clone(), v.clone()));
-        Some(v)
-    };
-    let pk_at_dose: Vec<Vec<Dual1<N>>> = (0..subject.doses.len())
-        .map(|k| seed_for(subject.dose_cov(k)))
-        .collect::<Option<_>>()?;
-    let pk_at_obs: Vec<Vec<Dual1<N>>> = (0..subject.obs_times.len())
-        .map(|j| seed_for(subject.obs_cov(j)))
-        .collect::<Option<_>>()?;
+    // Dedup identical covariate snapshots via the shared helper (#451 re-review #8).
+    let (pk_at_dose, pk_at_obs) = seed_tvcov_snapshots::<Dual1<N>>(subject, |cov| {
+        seed_pk_dual1::<N>(model, prog, theta, eta, cov)
+    })?;
 
     let preds = integrate_tvcov_readout::<Dual1<N>>(model, subject, &pk_at_dose, &pk_at_obs);
 

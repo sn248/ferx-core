@@ -1584,9 +1584,12 @@ fn subject_eta_grad_impl(
             }
         }
     }
-    // LTBS: `g = ln(f)`, so `∂g/∂η = ∂f/∂η / f`. Applied after scaling, mirroring
-    // `pk::apply_log_transform` (`p = p.max(LTBS_FLOOR).ln()`). Below the floor the
-    // production transform clamps to a constant, so the gradient vanishes.
+    // LTBS: `g = ln(f)`, so `∂g/∂η = ∂f/∂η / f`. Applied after scaling. The value
+    // half goes through the shared `pk::ltbs_log_g` — the same floor-then-log the f64
+    // predictor and the ODE dual walk use — so the analytical gradient can't silently
+    // drift from production either (#451 review #5). The gradient still keys on the
+    // strict `> LTBS_FLOOR` boundary: below the floor the transform clamps to a
+    // constant, so the gradient vanishes.
     if model.log_transform {
         for o in out.iter_mut() {
             if o.f > crate::pk::LTBS_FLOOR {
@@ -1594,13 +1597,12 @@ fn subject_eta_grad_impl(
                 for g in o.df_deta.iter_mut() {
                     *g *= inv;
                 }
-                o.f = o.f.ln();
             } else {
                 for g in o.df_deta.iter_mut() {
                     *g = 0.0;
                 }
-                o.f = crate::pk::LTBS_FLOOR.ln();
             }
+            o.f = crate::pk::ltbs_log_g(o.f);
         }
     }
     Some(out)
@@ -2072,8 +2074,11 @@ fn subject_sensitivities_impl(
     //   ∂g/∂x      = inv · ∂f/∂x
     //   ∂²g/∂x∂y   = inv · ∂²f/∂x∂y − inv² · ∂f/∂x · ∂f/∂y     (x,y ∈ {η,θ})
     // Second derivatives are computed from the *original* first derivatives, so
-    // those are read before `df_deta`/`df_dtheta` are overwritten. Below the floor
-    // the production transform clamps to a constant ⇒ all derivatives vanish.
+    // those are read before `df_deta`/`df_dtheta` are overwritten. The value half
+    // goes through the shared `pk::ltbs_log_g` (same floor-then-log as the f64
+    // predictor and the ODE dual walk), applied after the jet is transformed
+    // (#451 review #5). Below the floor the transform clamps to a constant ⇒ all
+    // derivatives vanish.
     if model.log_transform {
         let n_eta = sens.obs.first().map_or(0, |o| o.df_deta.len());
         let n_theta = sens.obs.first().map_or(0, |o| o.df_dtheta.len());
@@ -2100,7 +2105,6 @@ fn subject_sensitivities_impl(
                 for g in o.df_deta.iter_mut().chain(o.df_dtheta.iter_mut()) {
                     *g *= inv;
                 }
-                o.f = o.f.ln();
             } else {
                 for v in o
                     .df_deta
@@ -2111,8 +2115,8 @@ fn subject_sensitivities_impl(
                 {
                     *v = 0.0;
                 }
-                o.f = crate::pk::LTBS_FLOOR.ln();
             }
+            o.f = crate::pk::ltbs_log_g(o.f);
         }
     }
     Some(sens)

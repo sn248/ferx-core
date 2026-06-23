@@ -496,10 +496,18 @@ pub fn find_ebe(
         }
     };
 
-    // If BFGS failed, try Nelder-Mead from the prior mode (eta_true = 0).
+    // If BFGS failed, fall back to Nelder-Mead. With `ebe_warm_start` (the default)
+    // seed the simplex from the BFGS partial η̂ — a weakly-identified η that BFGS
+    // ran far out sits on the steep prior slope, so NM slides to the mode in far
+    // fewer iterations than refining from η=0 in the flat basin. A non-finite
+    // partial is unusable, so cold-start from η=0 there. With the flag off, always
+    // cold-start from η=0 (bit-identical to the historical behaviour).
     let bfgs_converged = result;
     let (nm_converged, used_fallback) = if !bfgs_converged {
-        eta = vec![0.0; n_eta];
+        let warm = ebe_warm_start_enabled() && eta.iter().all(|v| v.is_finite());
+        if !warm {
+            eta = vec![0.0; n_eta];
+        }
         let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
         (nm_ok, true)
     } else {
@@ -813,6 +821,23 @@ fn inner_optimizer_mode() -> crate::types::InnerOptimizer {
         3 => NelderMead,
         _ => Auto,
     }
+}
+
+/// Fit-scoped flag for [`FitOptions::ebe_warm_start`](crate::types::FitOptions),
+/// set via [`set_ebe_warm_start`] and read in the EBE Nelder–Mead fallback. Defaults
+/// to `false` to match `FitOptions::default()` (the historical cold-restart
+/// behaviour); a plain process-global for the same reason as [`INNER_OPT_MODE`]
+/// (the inner loop fans out over subjects via rayon).
+static EBE_WARM_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set whether the inner NM fallback warm-starts from the BFGS partial. Call once
+/// at fit start.
+pub fn set_ebe_warm_start(on: bool) {
+    EBE_WARM_START.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn ebe_warm_start_enabled() -> bool {
+    EBE_WARM_START.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// `FERX_PROFILE=1` attribution counters for the inner loop: how many EBE solves
@@ -2545,6 +2570,17 @@ mod iov_tests {
                 epsilon = 1e-7
             );
         }
+    }
+
+    /// `set_ebe_warm_start` round-trips through the fit-scoped global the EBE
+    /// fallback reads, and defaults to `true` (matching `FitOptions::default`).
+    #[test]
+    fn ebe_warm_start_flag_round_trips() {
+        assert!(!ebe_warm_start_enabled(), "default must be off");
+        set_ebe_warm_start(true);
+        assert!(ebe_warm_start_enabled());
+        set_ebe_warm_start(false);
+        assert!(!ebe_warm_start_enabled());
     }
 
     #[test]

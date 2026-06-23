@@ -52,6 +52,16 @@ section of the SDLC for the versioning policy).
   steady state).
 
 ### Added
+- **`ebe_warm_start` fit option** (default `false`, opt-in). When a per-subject
+  inner BFGS solve fails and falls back to Nelder–Mead, seed the simplex from the
+  BFGS partial η̂ instead of cold-starting from the prior mode η=0. On
+  fallback-heavy fits (e.g. an unidentifiable peripheral volume that drives BFGS
+  far onto the steep prior slope) NM then converges in a fraction of the
+  iterations — ≈1.7× faster on a 2-cpt unidentifiable-V2 benchmark. Off by
+  default because warm-starting moves the fallback subjects' EBEs, which perturbs
+  the outer optimiser's trajectory: harmless for the BOBYQA default but can derail
+  a gradient-based outer optimiser (e.g. `mma`) into a worse basin on some models.
+  Validate OFV/estimates on your model + `optimizer` before enabling.
 - **`[event_model]` hazard expressions can reference `[individual_parameters]`** names —
   e.g. a hazard driven by an individual `CL` — resolved per subject at evaluation time, in
   addition to the existing theta/eta/covariate namespace. Intermediate variables and names

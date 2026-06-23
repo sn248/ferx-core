@@ -130,10 +130,11 @@ section of the SDLC for the versioning policy).
   assembled per subject — exact analytic for in-scope subjects, a reconverged
   per-subject finite-difference (carrying the full η̂/Ω/σ EBE response, no PD
   Hessian required) for the declined ones — so one declined subject no longer
-  disables the exact gradient for the other thousands. On a 5937-subject pediatric
-  vancomycin fit (one subject with an indefinite inner Hessian) this moves `slsqp`
-  from a stalled 73468 OFV to 66570 — past `bobyqa` (68456) and SAEM (67477), ~31
-  above the NONMEM reference (66539).
+  disables the exact gradient for the other thousands. On the 5937-subject
+  pediatric Jasmine fit (one subject with an indefinite inner Hessian), default-
+  start FOCEI `slsqp` improves from the previous stalled best OFV 73468 to 66593,
+  while `mma` reaches 66560.68 best-seen — about 21 OFV above the NONMEM reference
+  (66539.38) and below both `bobyqa` (68456 best-seen) and SAEM 500/500 (67377).
 - **Documentation no longer references the retired Enzyme/autodiff installation or
   usage path**, and now describes `gradient = auto` / `gradient = fd` with the
   analytic `Dual2` sensitivity provider (#381).

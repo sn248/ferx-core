@@ -43,11 +43,10 @@ shape variability — that is what the SSE checks separately.)
 
 > **NONMEM status (2026-06-22):** the hand-off `nonmem.ctl` was run as **fixed-effects**
 > (`$OMEGA 0 FIX`, `METHOD=0`) — it fills the fixed-effects anchor above, not this frailty column.
-> Two things blocked the frailty fit, neither sample size: NM-TRAN translation (reserved `H`;
-> `$TABLE IPRED`) **and** NONMEM forbidding `CONDITIONAL`/`LAPLACIAN` on **single-subject** data
-> (1 record/subject → error 350). **`nonmem_frailty.ctl`** fixes both — estimated ω² + `LAPLACIAN`,
-> reading **`tte_weibull_nm.csv`** (a `TIME=0` entry record per subject → population data; it
-> contributes `S(0)=1` → 0, estimates unchanged) — to get the third ω² for #440.
+> The real blocker (not sample size): an `F_FLAG=1` model with **no `$SIGMA`** makes NM-TRAN infer
+> **single-subject** data, which rejects `CONDITIONAL`/`LAPLACIAN` (error 350). **`nonmem_frailty.ctl`**
+> adds estimated ω² + `LAPLACIAN INTERACTION NUMERICAL SLOW` + a dummy **`$SIGMA 1 FIX`** (fixed,
+> unreferenced → population data, likelihood unchanged) — run it to get the third ω² for #440.
 
 > ferx ↔ nlmixr2 FOCEI agree to ~3 digits on `scale`, `shape` and the −2LL — but the
 > shape-frailty `omega^2` differs (0.204 vs 0.173) **between two FOCEI implementations**.

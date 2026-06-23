@@ -5,7 +5,8 @@ $PROBLEM TTE Weibull (FRAILTY on shape) – Phase 1 ferx validation
 ;
 ; KEY for F_FLAG=1 likelihood models: a dummy **$SIGMA 1 FIX is REQUIRED**. Without an
 ; EPS, NM-TRAN infers the data are single-subject and rejects CONDITIONAL/LAPLACIAN
-; (error 350). The dummy is fixed and unreferenced, so it does NOT affect the likelihood.
+; (error 350). The dummy must ALSO be REFERENCED in $PRED (DUMMY = EPS(1) below) —
+; declaring $SIGMA alone is not enough. DUMMY is unused, so the likelihood is unchanged.
 ; (Records-per-subject was NOT the trigger — the plain 1-row/subject file is used.)
 ;
 ; Also: HAZNOW (not the reserved name H); IGNORE=@; clean $TABLE; NUMERICAL SLOW on $EST
@@ -21,7 +22,7 @@ $PRED
   F_FLAG = 1
   IF (DV.EQ.0) Y = EXP(-CHZ)
   IF (DV.EQ.1) Y = HAZNOW * EXP(-CHZ)
-
+  DUMMY = EPS(1)
 $THETA (0.001, 3.0, 10)   ; log(scale): init log(20) = 2.996
 $THETA (0.001, 0.693, 5)  ; log(shape): init log(2.0) = 0.693
 $OMEGA 0.20               ; var(eta.shape): ESTIMATED frailty, init 0.20

@@ -20,20 +20,20 @@ recovery of the *truth*.
 
 | Parameter | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM LAPLACIAN |
 |---|---|---|---|---|
-| lambda_pop (rate) | 0.100 | **0.0768** | **0.0770** | ⏳ run `nonmem_frailty.ctl` |
-| log(lambda_pop) | −2.303 | **−2.567** | **−2.5626** | ⏳ pending |
-| omega^2 (var log-rate) | 0.250 | **0.290** | **0.293** | ⏳ pending |
-| OFV (−2LL) | — | **588.93** | **588.94** | ⏳ pending |
+| lambda_pop (rate) | 0.100 | **0.0768** | **0.0770** | **0.0771** |
+| log(lambda_pop) | −2.303 | **−2.567** | **−2.5626** | **−2.5622** |
+| omega^2 (var log-rate) | 0.250 | **0.290** | **0.293** | **0.286** |
+| OFV (−2LL) | — | **588.93** | **588.94** | **588.93** |
 
-> **NONMEM status (2026-06-22):** the hand-off `nonmem.ctl` was run as **fixed-effects**
-> (`$OMEGA 0 FIX`, `METHOD=0`), so it fills the fixed-effects anchor below — **not** this frailty
-> column. Blockers (none sample size): NM-TRAN *translation* (reserved `$PRED` name `H`; `$TABLE
-> IPRED PRED` undefined for `F_FLAG=1`); and — the real one — an `F_FLAG=1` model with **no
-> `$SIGMA`** makes NM-TRAN infer the data are **single-subject**, which rejects
-> `CONDITIONAL`/`LAPLACIAN` (`350 METHOD=CONDITIONAL INVALID WITH SINGLE-SUBJECT DATA`); adding a
-> `TIME=0` record does *not* clear it. **`nonmem_frailty.ctl`** fixes all of it: estimated `$OMEGA`
-> + `CONDITIONAL LAPLACIAN INTERACTION NUMERICAL SLOW` + a dummy **`$SIGMA 1 FIX`** (fixed and
-> unreferenced → run treated as population data, likelihood unchanged, plain 1-row/subject data).
+> **NONMEM status (2026-06-23): DONE — `nonmem_frailty.ctl` converged (MINIMIZATION SUCCESSFUL,
+> SEs computed).** The hand-off `nonmem.ctl` had been run as fixed-effects (`$OMEGA 0 FIX`, `METHOD=0`)
+> — that fills the fixed-effects anchor below. Getting the frailty fit to run needed: estimated
+> `$OMEGA` + `CONDITIONAL LAPLACIAN INTERACTION NUMERICAL SLOW`; `HAZNOW` (not reserved `H`); clean
+> `$TABLE`; and the key for an `F_FLAG=1` likelihood model — a dummy **`$SIGMA 1 FIX` that is
+> REFERENCED in `$PRED` via `DUMMY = EPS(1)`**. Declaring `$SIGMA` alone is *not* enough; an
+> *unreferenced* EPS still leaves NM-TRAN inferring single-subject data and rejecting `CONDITIONAL`
+> (error 350). Records-per-subject was never the trigger. The fit lands right on the other two:
+> λ 0.0771, ω² 0.286, −2LL 588.93.
 
 ferx ↔ nlmixr2 FOCEI **agree to ~3 digits on every parameter and the −2LL** — strong
 license-free cross-tool validation. (nlmixr2's raw "OBJF" 405.15 omits the data normalizing
@@ -83,7 +83,7 @@ The ~7% `omega^2` shortfall is the expected **mild FOCEI-Laplace bias for TTE**
 | SSE omega^2 recovery (N=2000) | ±15% | ✅ −7% |
 | ferx vs **nlmixr2** FOCEI on tte_exp.csv | lambda ±5%; −2LL match | ✅ agree to ~3 digits |
 | **NONMEM** fixed-effects (ω²=0 FIX) vs ferx/survreg | λ ±5%; −2LL match | ✅ λ <0.03%, −2LL 589.888 identical |
-| **NONMEM** frailty (LAPLACIAN) vs ferx/nlmixr2 | point estimates | ⏳ run `nonmem_frailty.ctl` |
+| **NONMEM** frailty (LAPLACIAN) vs ferx/nlmixr2 | λ, ω², −2LL | ✅ λ 0.0771 / ω² 0.286 / −2LL 588.93 — 3 tools agree |
 
 ## Notes
 

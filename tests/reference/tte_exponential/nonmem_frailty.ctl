@@ -5,10 +5,10 @@ $PROBLEM TTE Exponential (FRAILTY) – Phase 1 ferx validation
 ; KEY for F_FLAG=1 likelihood models: a dummy **$SIGMA 1 FIX is REQUIRED**. Without an
 ; EPS/residual level, NM-TRAN infers the data are single-subject and rejects
 ; CONDITIONAL/LAPLACIAN ("350 METHOD=CONDITIONAL INVALID WITH SINGLE-SUBJECT DATA").
-; The dummy gives NONMEM a residual-error level so the run is treated as population
-; data; it is fixed and unreferenced, so it does NOT affect the likelihood. (This —
-; not records-per-subject — was the real blocker; the data is the plain 1-row/subject
-; file the other tools fit.)
+; The dummy must ALSO be REFERENCED in $PRED (DUMMY = EPS(1) below) — declaring $SIGMA
+; alone is not enough; an *unreferenced* EPS still triggers the single-subject inference.
+; DUMMY is itself unused, so the likelihood is unchanged. (Records-per-subject was NOT
+; the trigger; the data is the plain 1-row/subject file the other tools fit.)
 ;
 ; Also: HAZNOW (not the reserved $PRED name H); $TABLE without IPRED/PRED (undefined for
 ; F_FLAG=1); IGNORE=@ (skip the header); NUMERICAL SLOW on $EST + SLOW on $COV (NONMEM
@@ -23,6 +23,7 @@ $PRED
   F_FLAG = 1
   IF (DV.EQ.0) Y = EXP(-CHZ)            ; right-censored: S(T)
   IF (DV.EQ.1) Y = HAZNOW * EXP(-CHZ)   ; exact event:    h(T)*S(T)
+  DUMMY = EPS(1)
 
 $THETA (-10, -2.3, 5)   ; log(lambda): init log(0.1) = -2.303
 $OMEGA 0.25             ; var(eta.lambda): ESTIMATED frailty, init 0.25

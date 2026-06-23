@@ -608,8 +608,44 @@ fn find_ebe_iov(
         )
     };
 
-    // IOV models are not FREM, so no inner preconditioner (identity H0).
-    let bfgs_converged = inner_minimize(&obj, &mut x, n_flat, max_iter, tol, None);
+    // IOV models are not FREM, so no inner preconditioner (identity H0). Use the exact
+    // analytic stacked-η gradient when the ODE IOV provider serves this model (one
+    // provider eval per inner step vs ~2·n_flat+1 predictions for FD, and exact → fewer
+    // steps); per-step FD fallback if a given (θ, stacked-η) is out of provider scope.
+    // Covers both the ODE IOV provider (RHS-program models) and the closed-form
+    // analytical IOV provider — both now expose an analytic stacked-η inner gradient
+    // via `subject_eta_grad_iov`.
+    let analytic_iov_inner =
+        crate::sens::provider::iov_sens_supported(model) && omega_iov_ref.is_some();
+    let bfgs_converged = if analytic_iov_inner {
+        let omega_iov = omega_iov_ref.expect("analytic_iov_inner requires omega_iov");
+        let agrad = |p: &[f64]| -> Vec<f64> {
+            // Recover stacked_true = [η_true (= psi − mu), κ…] from the psi-space `p`;
+            // the gradient is identical in psi- and η_true-space (constant `mu` shift).
+            let mut stacked_true = p.to_vec();
+            for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
+                *st = p[k] - mu[k];
+            }
+            match analytic_eta_nll_gradient_iov(
+                model,
+                subject,
+                &params.theta,
+                &stacked_true,
+                &params.omega,
+                omega_iov,
+                &params.sigma.values,
+                n_eta,
+                n_kappa,
+                k_occasions,
+            ) {
+                Some(g) => g,
+                None => gradient_fd(&obj, p, n_flat),
+            }
+        };
+        inner_minimize_with_grad(&obj, &agrad, &mut x, n_flat, max_iter, tol, None)
+    } else {
+        inner_minimize(&obj, &mut x, n_flat, max_iter, tol, None)
+    };
     let (nm_converged, used_fallback) = if !bfgs_converged {
         // Reset to prior mode: bsv_psi = mu (eta_true = 0), kappas = 0.
         x = vec![0.0; n_flat];
@@ -631,9 +667,37 @@ fn find_ebe_iov(
         .map(|k| DVector::from_column_slice(&x[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa]))
         .collect();
 
-    // H-matrix: BSV columns only, perturbing eta with kappas fixed at EBE values
-    let kappas_slices: Vec<Vec<f64>> = kappas_vec.iter().map(|k| k.as_slice().to_vec()).collect();
-    let h_matrix = compute_jacobian_fd_iov(model, subject, &params.theta, &bsv_eta, &kappas_slices);
+    // H-matrix: BSV columns only (∂f/∂η_bsv with κ fixed at the EBE). The BSV block of
+    // the analytic stacked-η Jacobian is exactly this, so reuse the provider when it
+    // serves this subject; else the FD Jacobian.
+    let h_matrix = {
+        let analytic = if analytic_iov_inner {
+            let mut stacked_hat = bsv_eta.clone();
+            for k in &kappas_vec {
+                stacked_hat.extend(k.iter().copied());
+            }
+            crate::sens::provider::subject_eta_grad_iov(model, subject, &params.theta, &stacked_hat)
+        } else {
+            None
+        };
+        match analytic {
+            Some(sens) => {
+                let n_obs = subject.obs_times.len();
+                let mut h = DMatrix::zeros(n_obs, n_eta);
+                for (j, obs) in sens.iter().enumerate() {
+                    for k in 0..n_eta {
+                        h[(j, k)] = obs.df_deta[k];
+                    }
+                }
+                h
+            }
+            None => {
+                let kappas_slices: Vec<Vec<f64>> =
+                    kappas_vec.iter().map(|k| k.as_slice().to_vec()).collect();
+                compute_jacobian_fd_iov(model, subject, &params.theta, &bsv_eta, &kappas_slices)
+            }
+        }
+    };
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
@@ -1045,6 +1109,66 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     let prior = &omega.inv * &eta_v;
     for (k, g) in grad.iter_mut().enumerate() {
         *g += prior[k];
+    }
+    Some(grad)
+}
+
+/// Analytic gradient of the IOV conditional NLL (`individual_nll_iov`) w.r.t. the
+/// stacked random-effects vector `[η_bsv, κ₁..κ_K]` (in `eta_true` space, i.e. the κ
+/// and BSV-η values, not the psi-shifted optimiser variable). `None` when the analytic
+/// inner provider can't serve this `(model, subject)` — the caller falls back to FD.
+///
+/// Data term: `Σ_obs coef·∂f/∂(stacked-η)` with the same `coef` as the non-IOV
+/// [`analytic_eta_nll_gradient`]. Prior term: the **block-diagonal** `Σ_b⁻¹·stacked`
+/// (`Σ_b = Ω_bsv ⊕ K·Ω_iov`) — `Ω_bsv⁻¹·η_bsv` on the BSV block and `Ω_iov⁻¹·κ_g` on
+/// each occasion block. The BSV-η gradient equals the gradient w.r.t. the psi-space
+/// optimiser variable (a constant `mu` shift drops out), and κ is unshifted, so the
+/// returned vector is directly the optimiser gradient (#439 ODE IOV).
+#[allow(clippy::too_many_arguments)]
+fn analytic_eta_nll_gradient_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_true: &[f64],
+    omega_bsv: &crate::types::OmegaMatrix,
+    omega_iov: &crate::types::OmegaMatrix,
+    sigma: &[f64],
+    n_eta: usize,
+    n_kappa: usize,
+    k_occasions: usize,
+) -> Option<Vec<f64>> {
+    let sens = crate::sens::provider::subject_eta_grad_iov(model, subject, theta, stacked_true)?;
+    let n_stacked = n_eta + k_occasions * n_kappa;
+    let mut grad = vec![0.0_f64; n_stacked];
+    for (j, obs) in sens.iter().enumerate() {
+        let y = subject.observations[j];
+        let cmt = subject.obs_cmts[j];
+        let f = obs.f;
+        let v = model.residual_variance_at(cmt, f, sigma);
+        if !(v > 0.0) {
+            return None;
+        }
+        let dv_df = model.error_spec.dvar_df(cmt, f, sigma);
+        let eps = y - f;
+        let coef = -eps / v + 0.5 * dv_df * (1.0 / v - eps * eps / (v * v));
+        for (p, g) in grad.iter_mut().enumerate() {
+            *g += coef * obs.df_deta[p];
+        }
+    }
+    // Prior: block-diagonal Σ_b⁻¹·stacked. BSV block Ω_bsv⁻¹·η_bsv, each occasion κ
+    // block Ω_iov⁻¹·κ_g (the κ-variance is shared across occasions — SAME).
+    let eta_bsv = DVector::from_column_slice(&stacked_true[..n_eta]);
+    let prior_bsv = &omega_bsv.inv * &eta_bsv;
+    for (k, g) in grad.iter_mut().take(n_eta).enumerate() {
+        *g += prior_bsv[k];
+    }
+    for occ in 0..k_occasions {
+        let base = n_eta + occ * n_kappa;
+        let kappa_g = DVector::from_column_slice(&stacked_true[base..base + n_kappa]);
+        let prior_kg = &omega_iov.inv * &kappa_g;
+        for c in 0..n_kappa {
+            grad[base + c] += prior_kg[c];
+        }
     }
     Some(grad)
 }
@@ -2300,6 +2424,92 @@ mod iov_tests {
         // H-matrix: n_obs × n_eta (BSV only, kappas fixed)
         assert_eq!(result.h_matrix.nrows(), subject.obs_times.len());
         assert_eq!(result.h_matrix.ncols(), model.n_eta);
+    }
+
+    /// The analytic ODE IOV inner gradient (`analytic_eta_nll_gradient_iov`) must match
+    /// central finite differences of the inner objective `individual_nll_iov` over the
+    /// stacked `[η_bsv, κ₁..κ_K]` vector — the gradient that now drives `find_ebe_iov`
+    /// for ODE IOV models (#439 ODE IOV inner).
+    #[test]
+    fn analytic_iov_inner_grad_matches_fd_of_nll() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+        )
+        .expect("parse ODE IOV");
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 4.0, 7.0, 5.0, 3.0],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 6],
+            occasions: vec![1, 1, 1, 2, 2, 2],
+            dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let params = model.default_params.clone();
+        let n_eta = model.n_eta;
+        let n_kappa = model.n_kappa;
+        let k = split_obs_by_occasion(&subject).len();
+        let n_stacked = n_eta + k * n_kappa;
+        let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+        let stacked = vec![0.10, -0.05, 0.08, -0.12];
+        assert_eq!(stacked.len(), n_stacked);
+
+        let g = analytic_eta_nll_gradient_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &stacked,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            n_eta,
+            n_kappa,
+            k,
+        )
+        .expect("analytic IOV inner gradient");
+
+        // Central FD of the inner objective (same NLL `find_ebe_iov` minimises).
+        let nll = |s: &[f64]| -> f64 {
+            let eta_t = &s[..n_eta];
+            let kappas: Vec<Vec<f64>> = (0..k)
+                .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+                .collect();
+            individual_nll_iov(
+                &model,
+                &subject,
+                &params.theta,
+                eta_t,
+                &kappas,
+                &params.omega,
+                Some(omega_iov),
+                &params.sigma.values,
+            )
+        };
+        for p in 0..n_stacked {
+            let h = 1e-6 * (1.0 + stacked[p].abs());
+            let mut sp = stacked.clone();
+            sp[p] += h;
+            let mut sm = stacked.clone();
+            sm[p] -= h;
+            let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
+            approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
+        }
     }
 
     /// Pinning `inner_optimizer` to dense BFGS vs L-BFGS must reach the *same* EBE

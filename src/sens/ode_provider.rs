@@ -260,6 +260,92 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     true
 }
 
+/// True when the ODE **IOV** outer gradient ([`ode_subject_sensitivities_iov`]) can
+/// serve this model — the ODE counterpart of
+/// [`crate::sens::provider::iov_analytical_supported`]. A model-level gate; the
+/// per-subject scope (bolus-only, occasion split, axis cap with `K`) is checked in
+/// [`ode_subject_sensitivities_iov`].
+///
+/// Deliberately a *parallel* gate to [`ode_analytical_supported`] rather than lifting
+/// its `n_kappa == 0` bail: the non-IOV inner η-gradient and outer walk seed `n_eta`
+/// axes from a program whose `n_eta_axis()` would be `n_eta + n_kappa` under IOV, so
+/// admitting IOV there would mis-seed κ at zero. IOV is its own analytic-outer-only
+/// path (the inner EBE loop stays FD, exactly as the analytical IOV path leaves it —
+/// `analytical_supported` requires `n_kappa == 0`). First cut: bolus-only (time-varying
+/// covariates supported), no scaling/LTBS/lagtime/absorption/init — mirroring the narrow
+/// TV-cov scope; anything outside routes to FD (#439 ODE IOV).
+pub fn ode_iov_supported(model: &CompiledModel) -> bool {
+    if model.n_kappa == 0 {
+        return false;
+    }
+    let Some(ode) = model.ode_spec.as_ref() else {
+        return false;
+    };
+    if ode.rhs_program.is_none() {
+        return false;
+    }
+    // M3 BLOQ: the IOV objective promotes M3 to the censored marginal, but the IOV
+    // analytic gradient assembly carries no censored-row term — it would differentiate
+    // a different function than it minimises. Route IOV+M3 to FD (mirrors
+    // `iov_analytical_supported`).
+    if matches!(model.bloq_method, crate::types::BloqMethod::M3) {
+        return false;
+    }
+    // Readout: state directly, simple Form-C, or per-CMT — same set as the non-IOV gate.
+    let readout_ok = match &ode.readout {
+        OdeReadout::ObsCmt(_) => true,
+        OdeReadout::Single(_) => ode.readout_program.as_ref().is_some_and(|p| p.is_simple()),
+        OdeReadout::PerCmt(map) => {
+            !map.is_empty()
+                && map
+                    .values()
+                    .all(|r| r.program.as_ref().is_some_and(|p| p.is_simple()))
+        }
+    };
+    if !readout_ok {
+        return false;
+    }
+    if !ode.diffusion_var.is_empty() {
+        return false;
+    }
+    // The IOV walk reuses `integrate_tvcov_g`, which carries no input-rate (`R_in`)
+    // forcing, so any built-in absorption model routes to FD.
+    if !ode.input_rate.is_empty() {
+        return false;
+    }
+    // First cut: no output scaling/LTBS, no lagtime, no per-cmt/indexed F, no
+    // seeded initial state (the bolus walk seeds compartments at zero).
+    if !matches!(model.scaling, ScalingSpec::None) || model.log_transform || model.has_lagtime() {
+        return false;
+    }
+    if model
+        .active_dose_attr_map()
+        .has_indexed_attr(crate::types::DoseAttr::F)
+    {
+        return false;
+    }
+    if ode.init_fn.is_some() {
+        return false;
+    }
+    // The η/θ/κ chain evaluates the individual-parameter program over the **combined**
+    // `(θ, η_bsv, κ)` axes (`n_eff = n_eta + n_kappa`); require it present with matching
+    // axes and a program-eval width within the dispatch table. (The per-subject stacked
+    // walk width `n_theta + n_eta + K·n_kappa` is bounded separately, per subject.)
+    let n_eff = model.n_eta + model.n_kappa;
+    match ode.indiv_param_program.as_ref() {
+        Some(p) => {
+            if p.n_theta_axis() != model.n_theta
+                || p.n_eta_axis() != n_eff
+                || model.n_theta + n_eff > MAX_ODE_AXES
+            {
+                return false;
+            }
+        }
+        None => return false,
+    }
+    (1..=MAX_ODE_SENS_DIM).contains(&model.pk_indices.len())
+}
+
 /// Compute per-observation analytic sensitivities for an ODE model, or `None` if
 /// it is outside the supported scope (caller falls back to the gradient-free
 /// path).
@@ -1351,6 +1437,415 @@ fn run_subject_tvcov<const M: usize>(
         });
     }
     Some(SubjectSens { obs: out })
+}
+
+/// Per-subject IOV scope + dimensions, shared by the outer (`Dual2`) and inner
+/// (`Dual1`) ODE IOV walks so their analytic scope stays matched (a subject is served
+/// analytically for both, or neither). Mirrors `ode_tvcov_supported`'s bolus-only
+/// screen; time-varying covariates ARE supported (each event is seeded at its own
+/// covariate snapshot). Returns `(occasion groups, n_stacked = n_eta + K·n_kappa,
+/// m_dim = n_theta + n_stacked)`, or `None` out of scope.
+///
+/// The cap is on `m_dim` (the *outer* dual width); since `n_stacked ≤ m_dim`, the
+/// inner walk's `Dual1<n_stacked>` always resolves too — so capping here keeps the
+/// inner and outer on the same route (#439 ODE IOV).
+fn ode_iov_subject_supported(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> Option<(Vec<(u32, Vec<usize>)>, usize, usize)> {
+    if !ode_iov_supported(model) {
+        return None;
+    }
+    if !subject.all_doses_fixed() {
+        return None;
+    }
+    if subject
+        .doses
+        .iter()
+        .any(crate::ode::predictions::is_real_infusion)
+    {
+        return None;
+    }
+    if subject.doses.iter().any(|d| d.ss && d.ii > 0.0) {
+        return None;
+    }
+    if subject.has_resets() || !subject.pk_only_times.is_empty() {
+        return None;
+    }
+    let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
+    let k_groups = occ_groups.len();
+    if k_groups == 0 {
+        return None;
+    }
+    let n_stacked = model.n_eta + k_groups * model.n_kappa;
+    // Stacked dual width `M = n_theta + n_eta + K·n_kappa`. Bounded here (per subject,
+    // since `K` is per subject) so a many-occasion subject routes to FD rather than a
+    // silent `_ => None` downgrade — the whole population then falls back, matching the
+    // analytical IOV `disp!` cap behaviour.
+    let m_dim = model.n_theta + n_stacked;
+    if !(1..=MAX_ODE_AXES).contains(&m_dim) {
+        return None;
+    }
+    Some((occ_groups, n_stacked, m_dim))
+}
+
+/// Exact analytic sensitivities for an ODE **IOV** subject over the stacked
+/// random-effects vector `[η_bsv, κ_group0, …, κ_group(K−1)]` (plus the θ block), or
+/// `None` outside the supported scope (caller falls back to FD). The ODE counterpart
+/// of [`crate::sens::provider::subject_sensitivities_iov`]; the returned [`SubjectSens`]
+/// has the identical stacked layout, so the block-Ω (`Ω_bsv ⊕ K·Ω_iov`) assembly
+/// consumes it unchanged. The inner EBE η-gradient is served analytically too
+/// ([`ode_subject_eta_grad_iov`]), on the matched per-subject scope.
+///
+/// `stacked_eta` must have length `n_eta + K·n_kappa` with
+/// `K = split_obs_by_occasion(subject).len()` (#439 ODE IOV).
+pub fn ode_subject_sensitivities_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<SubjectSens> {
+    let (occ_groups, n_stacked, m_dim) = ode_iov_subject_supported(model, subject)?;
+    if stacked_eta.len() != n_stacked {
+        return None;
+    }
+    macro_rules! disp {
+        ($($m:literal),+) => {
+            match m_dim {
+                $($m => run_subject_iov::<$m>(model, subject, theta, stacked_eta, &occ_groups),)+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+}
+
+/// Light **inner** η-gradient (`Dual1<N>`, `N = n_stacked = n_eta + K·n_kappa`) for an
+/// ODE IOV subject — the IOV counterpart of [`run_subject_tvcov_eta`] and the inner
+/// sibling of [`ode_subject_sensitivities_iov`]. Returns `∂f/∂(stacked-η)` per
+/// observation (no θ block, no Hessian), or `None` outside the matched IOV scope. The
+/// caller (`analytic_eta_nll_gradient_iov`) assembles the conditional-NLL gradient over
+/// the stacked vector; the BSV columns also give the analytic FOCE H-matrix (#439 ODE IOV).
+pub fn ode_subject_eta_grad_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
+    let (occ_groups, n_stacked, _m_dim) = ode_iov_subject_supported(model, subject)?;
+    if stacked_eta.len() != n_stacked {
+        return None;
+    }
+    macro_rules! disp {
+        ($($n:literal),+) => {
+            match n_stacked {
+                $($n => run_subject_iov_eta::<$n>(model, subject, theta, stacked_eta, &occ_groups),)+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+}
+
+/// Seed an occasion group's per-event PK-slot duals on the **stacked**
+/// `(θ, η_bsv, κ)` axes from its [`CombinedDerivs`] — the IOV analogue of
+/// [`seed_pk_dual2`]. The combined column `c` of the program maps to a stacked dual
+/// axis: η_bsv (`c < n_eta`) → shared `n_theta + c`; κ (`c ≥ n_eta`) → group `g`'s
+/// block `n_theta + n_eta + g·n_kappa + (c − n_eta)`. Non-individual-parameter slots
+/// are seeded as constants (`pk.values`), exactly as the non-IOV seeder does. `cd`
+/// rows are parallel to `model.pk_indices` (the program-eval row order shared with
+/// [`pd_from_program`]).
+fn seed_pk_dual2_iov<const M: usize>(
+    model: &CompiledModel,
+    pk: &crate::types::PkParams,
+    cd: &crate::sens::provider::CombinedDerivs,
+    group: usize,
+    n_eta: usize,
+    n_kappa: usize,
+    n_theta: usize,
+) -> Vec<Dual2<M>> {
+    let n_eff = n_eta + n_kappa;
+    let kappa_base = n_theta + n_eta + group * n_kappa;
+    let stacked_axis = |c: usize| -> usize {
+        if c < n_eta {
+            n_theta + c
+        } else {
+            kappa_base + (c - n_eta)
+        }
+    };
+    let mut out: Vec<Dual2<M>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();
+    for (i, &slot) in model.pk_indices.iter().enumerate() {
+        let mut grad = [0.0; M];
+        let mut hess = [[0.0; M]; M];
+        for m in 0..n_theta.min(M) {
+            grad[m] = cd.dtheta[i][m];
+        }
+        for c in 0..n_eff {
+            let ax = stacked_axis(c);
+            if ax >= M {
+                continue;
+            }
+            grad[ax] = cd.deta[i][c];
+            for d in 0..n_eff {
+                let bx = stacked_axis(d);
+                if bx < M {
+                    hess[ax][bx] = cd.d2eta[i][c][d];
+                }
+            }
+            for m in 0..n_theta.min(M) {
+                let v = cd.d2eta_theta[i][c][m];
+                hess[ax][m] = v;
+                hess[m][ax] = v;
+            }
+        }
+        out[slot] = Dual2 {
+            value: pk.values[slot],
+            grad,
+            hess,
+        };
+    }
+    out
+}
+
+/// IOV outer (`Dual2<M>`, `M = n_theta + n_eta + K·n_kappa`) sensitivities for an ODE
+/// model — the IOV counterpart of [`run_subject_tvcov`]. Seeds each event's stacked
+/// PK duals at its (occasion, covariate-snapshot) — one source per occasion group when
+/// covariates are static — maps each dose/observation to its source, runs the shared
+/// event-driven walk +
+/// readout ([`integrate_tvcov_readout`], which production's `predict_iov` mirrors by
+/// feeding per-occasion params to the same `ode_predictions_event_driven`), and reads
+/// `∂f/∂(θ, stacked-η)` (+ 2nd order) straight off the dual.
+fn run_subject_iov<const M: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+    occ_groups: &[(u32, Vec<usize>)],
+) -> Option<SubjectSens> {
+    use std::collections::HashMap;
+    let ode = model.ode_spec.as_ref()?;
+    let prog = ode.indiv_param_program.as_ref()?;
+    let n_eta = model.n_eta;
+    let n_kappa = model.n_kappa;
+    let n_theta = model.n_theta;
+    let n_eff = n_eta + n_kappa;
+    let k_groups = occ_groups.len();
+    let n_stacked = n_eta + k_groups * n_kappa;
+    let cov = &subject.covariates;
+
+    let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(k_groups);
+    for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
+        occ_to_k.insert(*occ_id, k);
+    }
+    let eta_bsv = &stacked_eta[..n_eta];
+    let combined_for = |g: usize| -> Vec<f64> {
+        let mut c = Vec::with_capacity(n_eff);
+        c.extend_from_slice(eta_bsv);
+        let base = n_eta + g * n_kappa;
+        c.extend_from_slice(&stacked_eta[base..base + n_kappa]);
+        c
+    };
+
+    // Seed an occasion group's stacked PK duals at a covariate snapshot. `n_rows`
+    // matches the program eval's `model.pk_indices`-parallel rows (the convention
+    // `seed_pk_dual2` uses).
+    let n_rows = model.pk_indices.len();
+    let seed_group_cov =
+        |g: usize, cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual2<M>>> {
+            let combined = combined_for(g);
+            let pk = (model.pk_param_fn)(theta, &combined, cov);
+            let cd = crate::sens::provider::iov_combined_derivs_dyn(
+                prog, n_theta, n_eff, n_rows, cov, theta, &combined,
+            )?;
+            Some(seed_pk_dual2_iov::<M>(
+                model, &pk, &cd, g, n_eta, n_kappa, n_theta,
+            ))
+        };
+
+    let (pk_at_dose, pk_at_obs) =
+        seed_iov_events::<Dual2<M>>(subject, &occ_to_k, k_groups, cov, seed_group_cov)?;
+
+    let preds = integrate_tvcov_readout::<Dual2<M>>(model, subject, &pk_at_dose, &pk_at_obs);
+
+    // Read `∂f/∂(θ, stacked-η)` (+ 2nd order) off the dual — the negative-readout clamp
+    // and output transform are already applied inside `integrate_tvcov_readout`.
+    let mut out = Vec::with_capacity(preds.len());
+    for fd in &preds {
+        let g = &fd.grad;
+        let h = &fd.hess;
+        let mut df_deta = vec![0.0; n_stacked];
+        let mut df_dtheta = vec![0.0; n_theta];
+        let mut d2f_deta2 = vec![0.0; n_stacked * n_stacked];
+        let mut d2f_deta_dtheta = vec![0.0; n_stacked * n_theta];
+        for p in 0..n_stacked {
+            df_deta[p] = g[n_theta + p];
+            for q in 0..n_stacked {
+                d2f_deta2[p * n_stacked + q] = h[n_theta + p][n_theta + q];
+            }
+            for m in 0..n_theta {
+                d2f_deta_dtheta[p * n_theta + m] = h[n_theta + p][m];
+            }
+        }
+        for m in 0..n_theta {
+            df_dtheta[m] = g[m];
+        }
+        out.push(ObsSens {
+            f: fd.value,
+            df_deta,
+            d2f_deta2,
+            df_dtheta,
+            d2f_deta_dtheta,
+        });
+    }
+    Some(SubjectSens { obs: out })
+}
+
+/// Map each dose/observation to its occasion group's seeded PK duals, generic over the
+/// dual type `T` so the outer (`Dual2`) and inner (`Dual1`) IOV walks share one policy.
+/// With time-varying covariates each event is seeded at its own (occasion, snapshot) —
+/// the individual parameter switches both by κ (occasion) and by covariate; when
+/// covariates are subject-static, one source per occasion group is built and shared,
+/// preserving the non-TV cost (mirrors the analytical IOV provider). `seed_group_cov`
+/// is fallible (`None` aborts the subject → FD fallback).
+fn seed_iov_events<T: Clone>(
+    subject: &Subject,
+    occ_to_k: &std::collections::HashMap<u32, usize>,
+    k_groups: usize,
+    static_cov: &std::collections::HashMap<String, f64>,
+    mut seed_group_cov: impl FnMut(usize, &std::collections::HashMap<String, f64>) -> Option<Vec<T>>,
+) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>)> {
+    if subject.has_tv_covariates() {
+        let pk_at_dose = (0..subject.doses.len())
+            .map(|d| {
+                let g = *occ_to_k.get(&subject.dose_occasions.get(d).copied()?)?;
+                seed_group_cov(g, subject.dose_cov(d))
+            })
+            .collect::<Option<_>>()?;
+        let pk_at_obs = (0..subject.obs_times.len())
+            .map(|j| {
+                let g = *occ_to_k.get(&subject.occasions.get(j).copied()?)?;
+                seed_group_cov(g, subject.obs_cov(j))
+            })
+            .collect::<Option<_>>()?;
+        Some((pk_at_dose, pk_at_obs))
+    } else {
+        let group_dual: Vec<Vec<T>> = (0..k_groups)
+            .map(|g| seed_group_cov(g, static_cov))
+            .collect::<Option<_>>()?;
+        let pk_at_dose = (0..subject.doses.len())
+            .map(|d| {
+                Some(group_dual[*occ_to_k.get(&subject.dose_occasions.get(d).copied()?)?].clone())
+            })
+            .collect::<Option<_>>()?;
+        let pk_at_obs = (0..subject.obs_times.len())
+            .map(|j| Some(group_dual[*occ_to_k.get(&subject.occasions.get(j).copied()?)?].clone()))
+            .collect::<Option<_>>()?;
+        Some((pk_at_dose, pk_at_obs))
+    }
+}
+
+/// First-order (`Dual1<N>`, `N = n_stacked`) IOV seeder — the light counterpart of
+/// [`seed_pk_dual2_iov`]. Seeds only `∂p/∂(stacked-η)` (no θ axes, no Hessian): the
+/// combined column `c` maps to stacked axis `c` (η_bsv, `c < n_eta`) or
+/// `n_eta + group·n_kappa + (c − n_eta)` (κ). Reuses [`CombinedDerivs::deta`].
+fn seed_pk_dual1_iov<const N: usize>(
+    model: &CompiledModel,
+    pk: &crate::types::PkParams,
+    cd: &crate::sens::provider::CombinedDerivs,
+    group: usize,
+    n_eta: usize,
+    n_kappa: usize,
+) -> Vec<Dual1<N>> {
+    let n_eff = n_eta + n_kappa;
+    let kappa_base = n_eta + group * n_kappa;
+    let stacked_axis = |c: usize| -> usize {
+        if c < n_eta {
+            c
+        } else {
+            kappa_base + (c - n_eta)
+        }
+    };
+    let mut out: Vec<Dual1<N>> = pk.values.iter().map(|&v| Dual1::constant(v)).collect();
+    for (i, &slot) in model.pk_indices.iter().enumerate() {
+        let mut grad = [0.0; N];
+        for c in 0..n_eff {
+            let ax = stacked_axis(c);
+            if ax < N {
+                grad[ax] = cd.deta[i][c];
+            }
+        }
+        out[slot] = Dual1 {
+            value: pk.values[slot],
+            grad,
+        };
+    }
+    out
+}
+
+/// Light **inner** IOV walk (`Dual1<N>`, `N = n_stacked`) — the first-order, η-only
+/// counterpart of [`run_subject_iov`]. Seeds each event's stacked PK duals (per
+/// occasion×snapshot, or one per group when static), runs the shared event-driven
+/// walk + readout, and reads `∂f/∂(stacked-η)` straight off the dual (#439 ODE IOV).
+fn run_subject_iov_eta<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+    occ_groups: &[(u32, Vec<usize>)],
+) -> Option<Vec<ObsGrad>> {
+    use std::collections::HashMap;
+    let ode = model.ode_spec.as_ref()?;
+    let prog = ode.indiv_param_program.as_ref()?;
+    let n_eta = model.n_eta;
+    let n_kappa = model.n_kappa;
+    let n_theta = model.n_theta;
+    let n_eff = n_eta + n_kappa;
+    let k_groups = occ_groups.len();
+    let n_stacked = n_eta + k_groups * n_kappa;
+    let cov = &subject.covariates;
+
+    let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(k_groups);
+    for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
+        occ_to_k.insert(*occ_id, k);
+    }
+    let eta_bsv = &stacked_eta[..n_eta];
+    let combined_for = |g: usize| -> Vec<f64> {
+        let mut c = Vec::with_capacity(n_eff);
+        c.extend_from_slice(eta_bsv);
+        let base = n_eta + g * n_kappa;
+        c.extend_from_slice(&stacked_eta[base..base + n_kappa]);
+        c
+    };
+
+    let n_rows = model.pk_indices.len();
+    let seed_group_cov =
+        |g: usize, cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual1<N>>> {
+            let combined = combined_for(g);
+            let pk = (model.pk_param_fn)(theta, &combined, cov);
+            let cd = crate::sens::provider::iov_combined_derivs_dyn(
+                prog, n_theta, n_eff, n_rows, cov, theta, &combined,
+            )?;
+            Some(seed_pk_dual1_iov::<N>(model, &pk, &cd, g, n_eta, n_kappa))
+        };
+
+    let (pk_at_dose, pk_at_obs) =
+        seed_iov_events::<Dual1<N>>(subject, &occ_to_k, k_groups, cov, seed_group_cov)?;
+
+    let preds = integrate_tvcov_readout::<Dual1<N>>(model, subject, &pk_at_dose, &pk_at_obs);
+
+    let mut out = Vec::with_capacity(preds.len());
+    for fd in &preds {
+        let g = &fd.grad;
+        let mut df_deta = vec![0.0; n_stacked];
+        for (p, df) in df_deta.iter_mut().enumerate() {
+            *df = g[p];
+        }
+        out.push(ObsGrad {
+            f: fd.value,
+            df_deta,
+        });
+    }
+    Some(out)
 }
 
 /// `ParamDerivs` (`∂p/∂(θ,η)` + 2nd order) at an explicit covariate snapshot,

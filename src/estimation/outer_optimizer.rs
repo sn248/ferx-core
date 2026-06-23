@@ -2156,7 +2156,10 @@ fn population_gradient(
     // (both FOCEI and FOCE — see the interaction branch below). Their gradient
     // needs the per-occasion κ̂ alongside the BSV EBEs, so it is dispatched
     // separately from the non-IOV `sens_supported` path.
-    let iov_analytic = crate::sens::provider::iov_analytical_supported(model);
+    // Covers both the closed-form analytical IOV provider and the ODE IOV provider
+    // (RHS-program models); both produce the stacked-η / block-Ω assembly the IOV
+    // gradient entry points consume (#439 ODE IOV).
+    let iov_analytic = crate::sens::provider::iov_sens_supported(model);
     // `gradient = fd` forces the numeric path for the outer gradient too (the inner
     // EBE gradient honours it via `analytic_inner_grad_supported`), so the option
     // fully disables the analytic sensitivities rather than only the inner half.

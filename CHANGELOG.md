@@ -19,6 +19,26 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **Exact analytic FOCE/FOCEI gradients for IOV `[odes]` models** (#439). User-ODE
+  models with inter-occasion variability (`iov_column`, `kappa`) now get the exact
+  analytic outer (θ/Ω/σ) gradient over the stacked `[η_bsv, κ₁..κ_K]` random effects,
+  via the event-driven `Dual2` walk seeded with per-occasion κ axes (the same walk the
+  time-varying-covariate path uses, fed per-occasion parameters). Previously these fell
+  back to finite differences. First cut covers bolus dosing with static covariates;
+  out-of-scope subjects (infusion, steady state, resets, lagtime, scaling/LTBS, or
+  `n_θ + n_η + K·n_κ > 16`) route to FD as before. Time-varying covariates are
+  supported (each event is seeded at its own occasion × covariate snapshot). The inner
+  EBE loop also uses an exact analytic stacked-η gradient (a light first-order walk).
+  Result-neutral (validated against finite differences of the production predictor and
+  inner objective).
+- **Exact analytic inner EBE gradient for closed-form IOV models** (#439). The inner
+  EBE optimisation for analytical 1-/2-/3-cpt IOV models now uses an exact analytic
+  stacked-`[η_bsv, κ₁..κ_K]` gradient (a light first-order event-driven walk) instead of
+  finite differences, matching the ODE IOV inner. Both IOV paths — closed-form and ODE
+  — now have analytic gradients on the inner and outer loops. Result-neutral (validated
+  against the second-order outer walk and finite differences of the inner objective).
+
 ### Performance
 - **Faster analytic time-varying-covariate inner η-gradient + ODE-sensitivity path
   consolidation** (#451). The per-subject event schedule is now reused across inner

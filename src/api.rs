@@ -5409,6 +5409,91 @@ mod iov_integration {
         assert_iov_fit_ok(&result);
     }
 
+    /// End-to-end: the **same IOV model written two ways** — closed-form `one_cpt_iv`
+    /// vs a user `[odes]` twin (`d/dt central = -(CL/V)·central`, `y = central/V`) —
+    /// must converge to the **same optimum** (OFV + θ) on the same data. This exercises
+    /// the full ODE IOV pipeline (analytic inner stacked-η gradient + analytic outer
+    /// block-Ω gradient) through a real fit, not just per-evaluation gradient parity
+    /// (#439 ODE IOV).
+    #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow (~1 min: two full IOV fits, one over RK45); opt in with --features slow-tests"
+    )]
+    fn test_iov_ode_fit_matches_analytical_twin() {
+        use crate::parser::model_parser::parse_model_string;
+        const ANALYTICAL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+        const ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let ana = parse_model_string(ANALYTICAL).expect("parse analytical IOV");
+        let ode = parse_model_string(ODE).expect("parse ODE IOV");
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&ode),
+            "ODE twin must be ODE-IOV-provider supported (analytic inner+outer)"
+        );
+        let pop = make_iov_population();
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bfgs, false);
+
+        let ra = fit(&ana, &pop, &ana.default_params, &opts).expect("analytical fit");
+        let ro = fit(&ode, &pop, &ode.default_params, &opts).expect("ODE fit");
+        assert_iov_fit_ok(&ra);
+        assert_iov_fit_ok(&ro);
+
+        // Same structural model → same minimum (small slack for ODE integration vs
+        // closed form, and the differing inner gradient routes).
+        approx::assert_relative_eq!(ra.ofv, ro.ofv, max_relative = 1e-3, epsilon = 0.5);
+        for k in 0..2 {
+            approx::assert_relative_eq!(
+                ra.theta[k],
+                ro.theta[k],
+                max_relative = 0.02,
+                epsilon = 1e-2
+            );
+        }
+        let iov_a = ra.omega_iov.as_ref().unwrap()[(0, 0)];
+        let iov_o = ro.omega_iov.as_ref().unwrap()[(0, 0)];
+        approx::assert_relative_eq!(iov_a, iov_o, max_relative = 0.10, epsilon = 1e-3);
+    }
+
     // ── Tests: FOCEI ─────────────────────────────────────────────────────────
 
     #[test]

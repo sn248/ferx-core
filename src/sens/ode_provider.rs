@@ -251,10 +251,14 @@ fn infusion_spans_segment(
 /// forcing/SS machinery the dual walk does not yet mirror. Checked by *both* the
 /// outer and inner entry points so the analytic scope stays matched (#439).
 pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> bool {
-    // The event-driven walk serves a subject when it has time-varying covariates **or**
-    // an estimated lagtime (which needs the per-dose event-time saltation the static
-    // superposition walk can't do). A subject with neither uses the cheaper static walk.
-    if !ode_analytical_supported(model) || !(subject.has_tv_covariates() || model.has_lagtime()) {
+    // The event-driven walk serves a subject with time-varying covariates, an estimated
+    // lagtime (per-dose event-time saltation), **or** a steady-state dose (dual SS
+    // equilibration) — anything the static superposition walk can't do. A subject with
+    // none of those uses the cheaper static walk.
+    let has_ss = subject.doses.iter().any(|d| d.ss && d.ii > 0.0);
+    if !ode_analytical_supported(model)
+        || !(subject.has_tv_covariates() || model.has_lagtime() || has_ss)
+    {
         return false;
     }
     // Estimated lagtime IS supported here (bare or per-compartment `ALAGn`):
@@ -294,7 +298,20 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
         return false;
     }
-    if subject.doses.iter().any(|d| d.ss && d.ii > 0.0) {
+    // Steady-state: **bolus** SS (`SS=1`, `II>0`) is handled via the dual equilibration.
+    // SS *infusions* are not yet (the `F`-scaled active window is parameter-dependent —
+    // a separate moving-boundary term), so route an SS infusion to FD.
+    if subject
+        .doses
+        .iter()
+        .any(|d| d.ss && d.ii > 0.0 && crate::ode::predictions::is_real_infusion(d))
+    {
+        return false;
+    }
+    // SS + estimated lagtime: shifting `lag` shifts the *entire* infinite pulse train, so
+    // the equilibration trough's contribution also time-shifts — an extra term beyond the
+    // single-pulse saltation. Route SS+lagtime to FD until that lands.
+    if has_ss && model.has_lagtime() {
         return false;
     }
     // EVID 3/4 resets and finite-duration infusions ARE handled (resets zero the state;
@@ -1547,7 +1564,11 @@ fn ode_iov_subject_supported(
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
         return None;
     }
-    if subject.doses.iter().any(|d| d.ss && d.ii > 0.0) {
+    // Bolus SS (`SS=1`, `II>0`) is handled via the dual equilibration; SS *infusions* and
+    // SS + estimated lagtime route to FD (see `ode_tvcov_supported`).
+    if subject.doses.iter().any(|d| {
+        d.ss && d.ii > 0.0 && (crate::ode::predictions::is_real_infusion(d) || model.has_lagtime())
+    }) {
         return None;
     }
     // EVID 3/4 resets and finite-duration infusions ARE handled by the event-driven walk;
@@ -2146,6 +2167,68 @@ fn inject_rate_saltation<T: crate::sens::num::PkNum>(
     }
 }
 
+/// Number of dosing cycles to expand when pre-equilibrating an SS=1 dose — mirrors the
+/// production `SS_EQUILIBRATION_CYCLES` (the truncation tail is ≪1e-6 for any reasonable
+/// PK by 50 cycles).
+const SS_EQUILIBRATION_CYCLES: usize = 50;
+
+/// Dual steady-state equilibration: the analytic-sensitivity counterpart of production's
+/// `equilibrate_ss_state`. NONMEM SS=1 loads the compartments with the steady-state
+/// amounts of an infinite-past pulse train of interval `II`. There is no closed form for
+/// a general ODE, so production expands the train as a **finite** `SS_EQUILIBRATION_CYCLES`
+/// loop of `(apply dose; integrate II)` from a zero state, returning the pre-pulse trough.
+/// Because the loop is finite and explicit, running it over the dual type `T` propagates
+/// `∂(SS state)/∂(θ,η)` directly — no implicit fixed-point differentiation. The caller
+/// then applies the SS dose's own pulse through the normal flow.
+///
+/// First cut: **bolus** SS doses (the common case). SS infusions are gated to FD (the
+/// `F`-scaled active window is itself parameter-dependent — a separate moving-boundary
+/// term). `eval_rhs_anchored` uses cycle-relative time (anchor 0), matching production for
+/// the TAD-independent RHS (#439 SS).
+fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
+    program: &crate::parser::model_parser::OdeRhsProgram,
+    n_states: usize,
+    dose: &crate::types::DoseEvent,
+    f_bio: T,
+    params: &[T],
+    opts: &crate::ode::solver::OdeSolverOptions,
+) -> Vec<T> {
+    let mut u = vec![T::from_f64(0.0); n_states];
+    if dose.ii <= 0.0 || dose.cmt == 0 {
+        return u;
+    }
+    let cmt_idx = dose.cmt - 1;
+    if cmt_idx >= n_states {
+        return u;
+    }
+    let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
+    let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
+    let amt = T::from_f64(dose.amt);
+    let saveat = [dose.ii];
+    for _ in 0..SS_EQUILIBRATION_CYCLES {
+        // Apply the pulse (F·amt), then decay over one interval.
+        u[cmt_idx] = u[cmt_idx] + f_bio * amt;
+        let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+            eval_rhs_anchored::<T>(
+                program,
+                us,
+                ps,
+                t,
+                0.0,
+                0.0,
+                du,
+                &mut vars_cell.borrow_mut(),
+                &mut stack_cell.borrow_mut(),
+            );
+        };
+        let sol = solve_ode_g(&rhs, &u, (0.0, dose.ii), params, &saveat, opts);
+        if let Some(last) = sol.last() {
+            u.copy_from_slice(&last.u);
+        }
+    }
+    u
+}
+
 /// Time-varying-covariate event-driven walk over the dual state (#439), the ODE
 /// mirror of the analytical [`super::provider::subject_sensitivities_tvcov`] /
 /// `event_driven_sens_g`. For the **bolus** subset it reproduces production's
@@ -2369,6 +2452,20 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         }
         if kind == K_DOSE {
             let d = &subject.doses[idx];
+            // Steady-state (SS=1) dose: load the compartments with the infinite-past
+            // pulse train's trough (dual equilibration carries `∂SS/∂(θ,η)`), replacing
+            // the running state, *before* the SS dose's own pulse is applied below
+            // (mirrors production). Gated to bolus SS (`equilibrate_ss_state_g`).
+            if d.ss && d.ii > 0.0 {
+                u = equilibrate_ss_state_g::<T>(
+                    program,
+                    n_states,
+                    d,
+                    f_bio_at_dose[idx],
+                    &pk_at_dose[idx],
+                    opts,
+                );
+            }
             // CMT is 1-based; a malformed `CMT=0` must not silently dose compartment
             // 0 (the datareader rejects it upstream) (#449 review #8).
             if d.cmt >= 1 {
@@ -3819,6 +3916,78 @@ mod tests {
   ode_reltol = 1e-10
   ode_abstol = 1e-12
 "#;
+
+    /// **Steady-state (SS=1) bolus dose.** The dual SS-equilibration loads the
+    /// infinite-past pulse-train trough (carrying `∂SS/∂(θ,η)`) at the SS dose, then the
+    /// dose's own pulse applies. Validated `f`/`∂f/∂η`/`∂f/∂θ` vs the production predictor
+    /// (which equilibrates the same way) + FD (#439 Tier 2 steady state).
+    const ONECPT_IV_SS_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    #[test]
+    fn ode_provider_ss_bolus_matches_production() {
+        let model = parse_model_string(ONECPT_IV_SS_ODE).expect("parse SS ODE");
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 9.0]);
+        // SS=1 bolus into central, II = 12 h.
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+        assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "SS bolus → event-driven walk"
+        );
+        check_vs_production(&model, &subject, &[1.0, 10.0], &[0.1]);
+    }
+
+    /// **SS × time-varying covariates.** The SS equilibration uses the SS dose's covariate
+    /// snapshot, and the post-dose obs read per-event params — both via the event-driven
+    /// walk. Validated vs production FD (#439 SS composing with TV-cov).
+    #[test]
+    fn ode_provider_ss_tvcov_matches_production() {
+        let model = parse_model_string(ONECPT_ODE_TVCOV).expect("parse");
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 9.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+        subject.dose_covariates = vec![wt(70.0)];
+        subject.obs_covariates = vec![wt(60.0), wt(70.0), wt(80.0), wt(90.0)];
+        assert!(subject.doses[0].ss && subject.has_tv_covariates());
+        assert!(ode_tvcov_supported(&model, &subject));
+        check_vs_production(&model, &subject, &[1.0, 20.0, 0.75], &[0.1]);
+    }
+
+    /// **SS × estimated lagtime routes to FD** (for now). Shifting `lag` shifts the whole
+    /// infinite SS train, so the equilibration trough's contribution time-shifts too — an
+    /// extra term the single-pulse saltation does not yet carry. The gate declines it so
+    /// the (correct) FD path serves it, rather than an incomplete analytic gradient (#439).
+    #[test]
+    fn ode_provider_ss_lagtime_routes_to_fd() {
+        let model = parse_model_string(ONECPT_ORAL_LAG_ODE).expect("parse oral lag ODE");
+        let mut subject = bolus_subject(&[2.0, 4.0, 6.0, 10.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+        assert!(subject.doses[0].ss && model.has_lagtime());
+        assert!(
+            !ode_tvcov_supported(&model, &subject),
+            "SS + lagtime declines to FD until the train-shift term lands"
+        );
+    }
 
     #[test]
     fn ode_provider_lagtime_infusion_matches_production() {

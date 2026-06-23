@@ -4897,6 +4897,22 @@ mod tests {
         check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
     }
 
+    /// **ODE IOV + steady-state bolus.** Each occasion's SS dose equilibrates with that
+    /// occasion's κ-seeded params (dual SS-equilibration), then the per-occasion walk
+    /// continues. Validated vs FD of `predict_iov` (#439 IOV × SS).
+    #[test]
+    fn ode_iov_ss_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, true, 12.0),
+        ];
+        assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
+        check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
+    }
+
     /// **IOV × estimated lagtime.** 1-cpt IV IOV `[odes]` model (κ on CL) with a bare
     /// `LAGTIME`. The dose arrives per occasion at `t_dose + lag`; the lag sensitivity is
     /// the event-time saltation injected at each dose and propagated through the

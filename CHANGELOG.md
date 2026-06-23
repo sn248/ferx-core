@@ -20,6 +20,18 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Performance
+- **Ω-preconditioned inner EBE loop for all FOCE/FOCEI fits.** The inner BFGS
+  now initialises its inverse-Hessian (the search `H0`) to the prior conditional
+  scale `diag(1/Ω⁻¹ᵢᵢ)` for every model, not just FREM. A correlated or
+  multi-scale Ω (e.g. a block-Ω where one η has several× the variance of another)
+  otherwise mis-scales the identity-`H0` search, costing extra inner iterations.
+  The convergence *test* stays the raw L2 gradient norm for general fits (only
+  FREM needs the preconditioned norm, issue #406), so `H0` changes only the path
+  to the mode — the converged EBE and the estimates are unchanged. On the
+  two-compartment UVM FOCEI/MMA benchmark this cuts inner BFGS steps per EBE
+  solve ~25→16 and total predictions ~17M→6.2M for a **~1.23× faster fit**
+  (single- and 8-thread) at the same optimum (OFV within 4e-5 of the prior
+  result; matches NONMEM `run18`).
 - **Interpolating inner-loop line search** (#462). The EBE BFGS line search now
   picks each trial step by safeguarded quadratic interpolation instead of fixed
   halving, and reuses the objective value the optimiser already tracks instead of

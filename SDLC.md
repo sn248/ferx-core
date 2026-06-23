@@ -144,16 +144,15 @@ A `CHANGELOG.md` file should be maintained following [Keep a Changelog](https://
 
 | Resource | Location | Purpose |
 |----------|----------|---------|
-| Quarto site | `docs/` | User-facing documentation, model DSL reference, estimation methods |
+| Quarto site | `docs/**/*.qmd` | User-facing documentation, model DSL reference, estimation methods |
 | README.md | Project root | Quick start, overview, model syntax examples |
 | CLAUDE.md | Project root | Developer guidance, architecture, build commands |
 
 ### Building documentation
 
 ```bash
-cd docs
-quarto render     # Output to docs/_site/
-quarto preview    # Local preview (opens in browser)
+quarto render docs    # Output to docs/_site/ (git-ignored, never committed)
+quarto preview docs   # Local preview with live reload
 ```
 
 ### Deployment
@@ -178,7 +177,7 @@ All jobs use the stock Rust nightly toolchain pinned in `rust-toolchain.toml`.
 ### Future CI additions
 
 - **Validation**: Run example models and compare output to baselines
-- **Docs**: Build Quarto and deploy to gh-pages on main branch pushes
+- **Docs**: Build the Quarto site and deploy to gh-pages on main branch pushes
 - **Security**: `cargo audit` for dependency vulnerabilities
 - **Release**: Tag push (`v*`) builds release binaries and creates a GitHub Release
 

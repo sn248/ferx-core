@@ -55,7 +55,7 @@ Goal: match the paper end-to-end on a published dataset; prove the plumbing.
    - Unit: parser rejects mismatched output count between `[covariate_nn]` outputs and `[structural_model]` PK params.
    - Unit: parser rejects a `[covariate_nn]` reference from inside `[odes]` with an error suggesting `[dynamics_nn]` (and the reverse).
    - Regression: a NN with zero hidden weights and a learned bias reproduces a flat typical-value fit on warfarin.
-9. **Docs**: add `docs/model-file/covariate-nn.qmd` and a shared landing page `docs/model-file/neural-networks.qmd` (decision tree: "known PK + uncertain covariate model → covariate_nn; uncertain dynamics → dynamics_nn"). Link both from `docs/_quarto.yml`; rebuild `docs/_site/` per CLAUDE.md.
+9. **Docs**: add `docs/src/model-file/covariate-nn.md` and a shared landing page `docs/src/model-file/neural-networks.md` (decision tree: "known PK + uncertain covariate model → covariate_nn; uncertain dynamics → dynamics_nn"). Link both from `docs/src/SUMMARY.md`; rebuild `docs/book/` per CLAUDE.md.
 
 ### M2 — Mixed-effects DCM (the production target, ≈ 1–2 weeks on top of M1)
 
@@ -97,8 +97,8 @@ Triggers only if users hit FD-gradient cost limits.
 | [src/estimation/parameterization.rs](src/estimation/parameterization.rs) | pack/unpack NN weights after thetas; unscaled bounds-free block |
 | [src/api.rs](src/api.rs) | `method = nn_mse` shortcut for fixed-effects sanity check |
 | `examples/warfarin_nn.ferx` | new example, M2 deliverable |
-| `docs/model-file/covariate-nn.qmd` + `docs/model-file/neural-networks.qmd` (landing) + `docs/_quarto.yml` | docs (CLAUDE.md requirement) |
-| `docs/_site/` | rebuild via `cd docs && quarto render` |
+| `docs/src/model-file/covariate-nn.md` + `docs/src/model-file/neural-networks.md` (landing) + `docs/src/SUMMARY.md` | docs (CLAUDE.md requirement) |
+| `docs/_site/` | rebuilt via `quarto render docs` (git-ignored, never committed) |
 
 ## Reusing what's already there
 
@@ -117,7 +117,7 @@ End-to-end checks, in order:
 3. **Sanity reproduction** (M1 deliverable): `cargo run --release --features nn -- examples/warfarin_nn_fixed.ferx --data data/warfarin.csv` with `method = nn_mse` produces NN weights whose forward pass on the training covariates matches the analytical typical values from `examples/two_cpt_oral_cov.ferx` within 5% RMSE.
 4. **Mixed-effects reproduction** (M2 deliverable): the same `warfarin_nn.ferx` with `method = focei` reaches an OFV within 1 unit of the analytical model. The fit YAML's eta shrinkage and omega estimates should match the analytical fit to within numerical noise — strong evidence the NN layer is the only thing changed.
 5. **Roundtrip**: simulate 100 subjects from a known NN+omega+sigma, fit, recover NN weights within 5% and omega within 10%.
-6. **Docs build**: `cd docs && quarto render` succeeds and the new page renders.
+6. **Docs build**: `quarto render docs` succeeds and the new page renders.
 
 ## Open questions worth flagging during M1 implementation
 
@@ -225,7 +225,7 @@ CLAUDE.md mandates one test per feature.
 - Unit: initializer produces activation points uniformly in the data range across multiple seeds.
 - Regression: theophylline (`data/theophylline.csv` — add if missing) fit with a Bräm-style 2-cpt NODE recovers concentrations with MSE within 20% of the analytical two-cpt PO fit.
 - New example: `examples/theophylline_node.ferx` mirroring the paper's first demo dataset.
-- Docs: `docs/model-file/dynamics-nn.qmd` + add to the landing page `docs/model-file/neural-networks.qmd` introduced in Phase A and to `docs/_quarto.yml`; rebuild `docs/_site/`.
+- Docs: `docs/src/model-file/dynamics-nn.md` + add to the landing page `docs/src/model-file/neural-networks.md` introduced in Phase A and to `docs/src/SUMMARY.md`; rebuild `docs/book/`.
 
 ## Critical files
 
@@ -238,8 +238,8 @@ CLAUDE.md mandates one test per feature.
 | [src/api.rs](src/api.rs) | implement `two_step_nodes` orchestration |
 | [src/types.rs](src/types.rs) | extend `FitOptions` with `two_step_nodes: bool` |
 | `examples/theophylline_node.ferx` | new example |
-| `docs/model-file/dynamics-nn.qmd` (+ extend landing page from Phase A) + `docs/_quarto.yml` | docs |
-| `docs/_site/` | rebuild |
+| `docs/src/model-file/dynamics-nn.md` (+ extend landing page from Phase A) + `docs/src/SUMMARY.md` | docs |
+| `docs/book/` | rebuild |
 
 ## Reusing what's already there
 
@@ -323,7 +323,7 @@ When `[dynamics_nn]` blocks are present and `covariance = true` in `[fit_options
 
 ### Decision-tree docs landing page
 
-`docs/model-file/neural-networks.qmd` (introduced in Phase A M1, extended in Phase B B4) is the canonical starting point. Required content:
+`docs/src/model-file/neural-networks.md` (introduced in Phase A M1, extended in Phase B B4) is the canonical starting point. Required content:
 
 - One-paragraph orientation contrasting DCM and low-dim NODE.
 - A 6-row table answering "I have X, my dynamics are Y → use Z":
@@ -336,7 +336,7 @@ When `[dynamics_nn]` blocks are present and `covariance = true` in `[fit_options
   | No | No | Both — they coexist |
 
 - A two-line example of each block side-by-side.
-- Links to the per-block reference pages (`covariate-nn.qmd`, `dynamics-nn.qmd`).
+- Links to the per-block reference pages (`covariate-nn.md`, `dynamics-nn.md`).
 
 ### Shared `nn` cargo feature, single MlpMapper
 

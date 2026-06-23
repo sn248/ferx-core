@@ -425,23 +425,30 @@ fn prepare_input_rates(ode: &OdeSpec, params: &[f64]) -> Vec<PreparedInputRate> 
 /// tail uses the *current* occasion's `n`/`mtt`. This is exact for IIV and when
 /// `II` exceeds the absorption window; only overlapping-occasion tails are
 /// approximated.
+///
+/// Generic over the numeric type `T: PkNum` so the **single** superposition loop
+/// serves both the production `f64` predictor (`T = f64`, byte-identical to the
+/// original) and the analytic ODE sensitivity provider's dual walk (`T = Dual*`),
+/// instead of `sens/ode_provider.rs` hand-maintaining a second copy (#430 review
+/// #4 / #451). The dual caller passes `dose_lagtimes = &[]` (lagtime gated off) and
+/// `reset_floor = NEG_INFINITY` (reset gated off), so those branches are inert there.
 #[inline]
 #[allow(clippy::too_many_arguments)] // mirrors the dose context threaded into the RHS wrappers
-fn add_prepared_input_rate_forcing(
+pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
     ode: &OdeSpec,
-    prepared: &[PreparedInputRate],
+    prepared: &[PreparedInputRate<T>],
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
-    dose_f_bio: &[f64],
+    dose_f_bio: &[T],
     reset_floor: f64,
     t: f64,
-    dy: &mut [f64],
+    dy: &mut [T],
 ) {
     for (forcing, prep) in ode.input_rate.iter().zip(prepared) {
         if forcing.cmt >= dy.len() {
             continue;
         }
-        let mut acc = 0.0;
+        let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
             if d.cmt.saturating_sub(1) != forcing.cmt {
                 continue;
@@ -457,10 +464,11 @@ fn add_prepared_input_rate_forcing(
             if tad <= 0.0 {
                 continue;
             }
-            let dose_mass = dose_f_bio.get(k).copied().unwrap_or(1.0) * d.amt;
-            acc += prep.rate(tad, dose_mass);
+            let dose_mass =
+                dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
+            acc = acc + prep.rate(T::from_f64(tad), dose_mass);
         }
-        dy[forcing.cmt] += acc;
+        dy[forcing.cmt] = dy[forcing.cmt] + acc;
     }
 }
 
@@ -555,7 +563,17 @@ pub enum OdeReadout {
     /// `subject.obs_cmts[i]`, which is `usize`). Fit-time validation
     /// enforces that every observed CMT has an entry; missing entries
     /// fall through to NaN at runtime as a defensive guard.
-    PerCmt(HashMap<usize, OdeOutputFn>),
+    PerCmt(HashMap<usize, PerCmtReadout>),
+}
+
+/// One per-CMT Form-C readout (`y[CMT=N] = <expr>`): the f64 closure the production
+/// predictor calls, plus the optional `PkNum`-differentiable program the analytic
+/// sensitivity provider evaluates over `Dual2`/`Dual1` (issue #439). `program` is
+/// `None` for hand-constructed readouts that bypass the parser — those keep the f64
+/// FD path (the dual provider declines them).
+pub struct PerCmtReadout {
+    pub out_fn: OdeOutputFn,
+    pub program: Option<crate::parser::model_parser::OdeOutputProgram>,
 }
 
 /// Read the observable value at observation `obs_idx`.
@@ -576,7 +594,7 @@ fn read_observable(
         OdeReadout::ObsCmt(idx) => u[*idx],
         OdeReadout::Single(out_fn) => out_fn(u, pk_params_flat, theta, eta, covariates),
         OdeReadout::PerCmt(map) => match map.get(&obs_cmt) {
-            Some(out_fn) => out_fn(u, pk_params_flat, theta, eta, covariates),
+            Some(r) => (r.out_fn)(u, pk_params_flat, theta, eta, covariates),
             // Parser + fit-time validation guarantee every observed CMT
             // has an entry. NaN here is a defensive guard against
             // hand-constructed CompiledModels that bypassed validation —
@@ -3351,9 +3369,21 @@ mod tests {
         // distinct, finite readouts of the same single-state system, so we can
         // confirm each observation got its own value (not one overwriting the
         // other).
-        let mut map: HashMap<usize, OdeOutputFn> = HashMap::new();
-        map.insert(1, Box::new(|s: &[f64], _pk: &[f64], _t, _e, _c| s[0]));
-        map.insert(2, Box::new(|s: &[f64], _pk: &[f64], _t, _e, _c| 2.0 * s[0]));
+        let mut map: HashMap<usize, PerCmtReadout> = HashMap::new();
+        map.insert(
+            1,
+            PerCmtReadout {
+                out_fn: Box::new(|s: &[f64], _pk: &[f64], _t, _e, _c| s[0]),
+                program: None,
+            },
+        );
+        map.insert(
+            2,
+            PerCmtReadout {
+                out_fn: Box::new(|s: &[f64], _pk: &[f64], _t, _e, _c| 2.0 * s[0]),
+                program: None,
+            },
+        );
         let mut ode = one_cpt_ode_spec();
         ode.readout = OdeReadout::PerCmt(map);
 
@@ -3385,10 +3415,13 @@ mod tests {
         // Build an OdeReadout::PerCmt that DELIBERATELY returns NaN for
         // CMT=1 — emulating a missing-CMT lookup that bypassed pre-fit
         // validation. The resulting prediction must be NaN, not 0.
-        let mut map: HashMap<usize, OdeOutputFn> = HashMap::new();
+        let mut map: HashMap<usize, PerCmtReadout> = HashMap::new();
         map.insert(
             1,
-            Box::new(|_state: &[f64], _pk: &[f64], _theta, _eta, _cov| f64::NAN),
+            PerCmtReadout {
+                out_fn: Box::new(|_state: &[f64], _pk: &[f64], _theta, _eta, _cov| f64::NAN),
+                program: None,
+            },
         );
         let mut ode = one_cpt_ode_spec();
         ode.readout = OdeReadout::PerCmt(map);

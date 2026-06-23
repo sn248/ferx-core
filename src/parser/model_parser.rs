@@ -2141,8 +2141,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
 
         for lines in event_blocks {
-            let (cmt, endpoint, event_covs, blk_thetas, blk_etas) =
-                parse_event_model_block(lines, &theta_names, &eta_names, &model.error_spec)?;
+            let (cmt, endpoint, event_covs, blk_thetas, blk_etas) = parse_event_model_block(
+                lines,
+                &theta_names,
+                &eta_names,
+                &indiv_stmts,
+                &model.kappa_names,
+                &model.error_spec,
+            )?;
             if model.endpoints.contains_key(&cmt) {
                 return Err(format!("[event_model]: CMT={cmt} declared more than once"));
             }
@@ -3082,6 +3088,50 @@ fn parse_covariates_block(lines: &[String]) -> Result<Vec<CovariateDecl>, String
 
 // ── [event_model] block parser ─────────────────────────────────────────────
 
+/// Collect the names referenced as `Expression::Variable` in `expr` (i.e.
+/// `[individual_parameters]` names an `[event_model]` expression depends on).
+#[cfg(feature = "survival")]
+fn collect_variable_names(expr: &Expression, out: &mut std::collections::HashSet<String>) {
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if let Expression::Variable(name) = e {
+            out.insert(name.clone());
+        }
+    });
+}
+
+/// Evaluate the hazard-reachable `[individual_parameters]` statements into a
+/// name→value map for the given `(θ, η, covariates)`, so `[event_model]` hazard
+/// expressions can reference individual-parameter names (e.g. a hazard driven by
+/// an individual `CL`).
+///
+/// `stmts` is the reachability-filtered subset (`needed_indiv_stmts`) built in
+/// `parse_event_model_block`. It is **empty** for a hazard that references no
+/// individual parameter — the common TTE-only case — and this then returns an
+/// empty map without allocating, so such hazards pay nothing for the feature.
+///
+/// Evaluation uses the tree-walking `eval_statements`, NOT the bytecode
+/// `eval_statements_indexed`: only the latter borrows the `FERX_SCRATCH`
+/// thread-local, so this is safe to call from inside the likelihood's hazard
+/// `param_fn`, and it transparently handles NONMEM-style `if (...) CL = ...`
+/// conditional parameters. Kappa (IOV) and `[covariate_nn]`-output references in
+/// these statements are rejected up front (see `needed_indiv_stmts`), so the
+/// BSV-only `eta` slice never indexes out of bounds and the empty `nn_outputs`
+/// here is never read.
+#[cfg(feature = "survival")]
+fn eval_indiv_param_vars(
+    stmts: &[Statement],
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> HashMap<String, f64> {
+    if stmts.is_empty() {
+        return HashMap::new();
+    }
+    let mut vars = HashMap::with_capacity(stmts.len());
+    eval_statements(stmts, theta, eta, covariates, &mut vars, None, None, &[]);
+    vars
+}
+
 /// Parse one `[event_model]` (or `[event_model NAME]`) block.
 ///
 /// Returns `(cmt, EndpointLikelihood::Tte { hazard })` ready to insert into
@@ -3101,6 +3151,8 @@ fn parse_event_model_block(
     lines: &[String],
     theta_names: &[String],
     eta_names: &[String],
+    indiv_stmts: &[Statement],
+    kappa_names: &[String],
     error_spec: &ErrorSpec,
 ) -> Result<
     (
@@ -3114,7 +3166,17 @@ fn parse_event_model_block(
 > {
     use crate::types::{EndpointLikelihood, HazardFamily, HazardSpec};
 
-    let ctx = ParseCtx::new(theta_names, eta_names, &[]);
+    // `[event_model]` hazard expressions may reference names defined in
+    // `[individual_parameters]`. Register every assigned name — including those
+    // inside `if (...) { ... }` branches (NONMEM-style conditional parameters) and
+    // intermediate helpers — as `defined_vars`, so such a reference parses as
+    // `Expression::Variable` and is resolved per subject from `needed_indiv_stmts`
+    // (below) rather than silently falling back to a covariate, which would read
+    // 0.0. Names that are neither θ/η nor an individual parameter still fall back
+    // to covariates. `kappa_names` is used below to reject IOV references that the
+    // per-subject hazard cannot evaluate.
+    let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+    let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
 
     let mut cmt_opt: Option<usize> = None;
     let mut family_opt: Option<HazardFamily> = None;
@@ -3279,6 +3341,109 @@ fn parse_event_model_block(
         event_model_etas = eta_set;
     }
 
+    // Restrict the individual-parameter statements the hazard closures evaluate to
+    // just those the hazard references, transitively. This bounds the per-eval work
+    // and scopes the IOV/NN checks below to what the hazard actually depends on (an
+    // unrelated PK parameter that uses an IOV kappa or an NN output must not make a
+    // kappa-free hazard fail). Walking declarations in reverse lets a needed
+    // parameter pull in the (earlier-declared) parameters it depends on. NONMEM-style
+    // `if (...) CL = ...` conditional parameters are handled by keying on every name
+    // the statement assigns (across branches, via `assigned_vars_in_order`) and
+    // pulling in every name it references (RHS, conditions, and both branches, via
+    // `visit_stmt_nodes`).
+    let needed_indiv_stmts: Vec<Statement> = {
+        let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for expr in [
+            &scale_expr,
+            &shape_expr,
+            &alpha_expr,
+            &gamma_expr,
+            &loghr_expr,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            collect_variable_names(expr, &mut needed);
+        }
+        let mut keep: Vec<Statement> = Vec::new();
+        for s in indiv_stmts.iter().rev() {
+            let stmt = std::slice::from_ref(s);
+            if assigned_vars_in_order(stmt)
+                .iter()
+                .any(|n| needed.contains(n))
+            {
+                visit_stmt_nodes(stmt, &mut |e: &Expression| {
+                    if let Expression::Variable(name) = e {
+                        needed.insert(name.clone());
+                    }
+                });
+                keep.push(s.clone());
+            }
+        }
+        keep.reverse();
+        keep
+    };
+
+    // The hazard `param_fn` evaluates the kept statements with the BSV-only η it is
+    // handed (kappas are PK/occasion-level, not part of a per-subject hazard), so a
+    // kept statement referencing an IOV kappa would index η out of bounds and abort
+    // the fit (issue #442). Reject it here with a clear error instead. `eta_names` is
+    // BSV-only (it is `model.eta_names`), so any `Eta(i)` with `i >= eta_names.len()`
+    // is the kappa at position `i - n_eta` in `kappa_names`.
+    {
+        let n_eta = eta_names.len();
+        let mut kappa_hit: Option<String> = None;
+        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
+            if let Expression::Eta(i) = e {
+                if *i >= n_eta && kappa_hit.is_none() {
+                    kappa_hit = Some(
+                        kappa_names
+                            .get(*i - n_eta)
+                            .cloned()
+                            .unwrap_or_else(|| "<kappa>".to_string()),
+                    );
+                }
+            }
+        });
+        if let Some(k) = kappa_hit {
+            return Err(format!(
+                "[event_model]: a hazard expression references an [individual_parameters] \
+                 value that depends on the inter-occasion (IOV) random effect `{k}`. The \
+                 hazard is evaluated once per subject, with no occasion context, so an IOV \
+                 parameter has no well-defined value here — reference an IOV-free parameter, \
+                 or write the hazard in terms of θ/η directly."
+            ));
+        }
+    }
+
+    // An `[individual_parameters]` value whose definition reads a `[covariate_nn]`
+    // output would silently resolve to 0.0 in the hazard, because the hazard
+    // `param_fn` evaluates these statements without the network forward pass. Reject
+    // such a reference. `Expression::NnOutput` nodes only exist under the `nn`
+    // feature (they come from `[covariate_nn]` dot-access), so this guard is gated to
+    // it: the survival coverage build (`--features ci,survival`, no `nn`) does not
+    // compile it — a measurement gap, not missed coverage (#293) — and it is
+    // unreachable in any build without `nn`.
+    #[cfg(feature = "nn")]
+    {
+        let mut nn_hit = false;
+        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
+            if matches!(e, Expression::NnOutput { .. }) {
+                nn_hit = true;
+            }
+        });
+        if nn_hit {
+            return Err(
+                "[event_model]: a hazard expression references an [individual_parameters] \
+                 value whose definition uses a [covariate_nn] output. Neural-network-driven \
+                 individual parameters are not available to hazard expressions (the hazard is \
+                 evaluated without the network forward pass) — reference an NN-free parameter \
+                 instead."
+                    .to_string(),
+            );
+        }
+    }
+
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
     // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
@@ -3286,12 +3451,13 @@ fn parse_event_model_block(
         HazardFamily::Exponential => {
             let scale = scale_expr
                 .ok_or("[event_model] family=exponential requires `scale` (or `rate`)")?;
+            let indiv = needed_indiv_stmts.clone();
             Box::new(
                 move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-                    let lambda =
-                        eval_expression(&scale, theta, eta, covariates, &HashMap::new(), &[]);
+                    let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+                    let lambda = eval_expression(&scale, theta, eta, covariates, &vars, &[]);
                     let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
-                        eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
+                        eval_expression(e, theta, eta, covariates, &vars, &[])
                     });
                     vec![lambda, lhr]
                 },
@@ -3300,12 +3466,14 @@ fn parse_event_model_block(
         HazardFamily::Weibull => {
             let scale = scale_expr.ok_or("[event_model] family=weibull requires `scale`")?;
             let shape = shape_expr.ok_or("[event_model] family=weibull requires `shape`")?;
+            let indiv = needed_indiv_stmts.clone();
             Box::new(
                 move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-                    let s = eval_expression(&scale, theta, eta, covariates, &HashMap::new(), &[]);
-                    let p = eval_expression(&shape, theta, eta, covariates, &HashMap::new(), &[]);
+                    let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+                    let s = eval_expression(&scale, theta, eta, covariates, &vars, &[]);
+                    let p = eval_expression(&shape, theta, eta, covariates, &vars, &[]);
                     let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
-                        eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
+                        eval_expression(e, theta, eta, covariates, &vars, &[])
                     });
                     vec![s, p, lhr]
                 },
@@ -3314,12 +3482,14 @@ fn parse_event_model_block(
         HazardFamily::Gompertz => {
             let alpha = alpha_expr.ok_or("[event_model] family=gompertz requires `alpha`")?;
             let gamma = gamma_expr.ok_or("[event_model] family=gompertz requires `gamma`")?;
+            let indiv = needed_indiv_stmts.clone();
             Box::new(
                 move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-                    let a = eval_expression(&alpha, theta, eta, covariates, &HashMap::new(), &[]);
-                    let g = eval_expression(&gamma, theta, eta, covariates, &HashMap::new(), &[]);
+                    let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+                    let a = eval_expression(&alpha, theta, eta, covariates, &vars, &[]);
+                    let g = eval_expression(&gamma, theta, eta, covariates, &vars, &[]);
                     let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
-                        eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
+                        eval_expression(e, theta, eta, covariates, &vars, &[])
                     });
                     vec![a, g, lhr]
                 },
@@ -4318,9 +4488,10 @@ fn parse_scaling_block(
     let mut obs_scale_uniform: Option<ScalingSpec> = None;
     let mut obs_scale_per_cmt: HashMap<usize, ScalingSpec> = HashMap::new();
     let mut y_uniform: Option<crate::ode::OdeOutputFn> = None;
-    let mut y_per_cmt: HashMap<usize, crate::ode::OdeOutputFn> = HashMap::new();
-    // Sensitivity program for the uniform `y = <expr>` readout (issue #367); the
-    // per-CMT form is out of the analytic-sensitivity scope, so it carries none.
+    let mut y_per_cmt: HashMap<usize, crate::ode::PerCmtReadout> = HashMap::new();
+    // Sensitivity program for the uniform `y = <expr>` readout (issue #367). The
+    // per-CMT readouts carry their own program inside each `PerCmtReadout` (#439),
+    // so the analytic-sensitivity provider can differentiate each endpoint.
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
 
     for line in lines {
@@ -4432,7 +4603,13 @@ fn parse_scaling_block(
                         if y_per_cmt.contains_key(&cmt) {
                             return Err(format!("[scaling]: duplicate `y[CMT={}]` key", cmt));
                         }
-                        y_per_cmt.insert(cmt, out_fn);
+                        y_per_cmt.insert(
+                            cmt,
+                            crate::ode::PerCmtReadout {
+                                out_fn,
+                                program: Some(out_program),
+                            },
+                        );
                     }
                 }
             }
@@ -5698,7 +5875,7 @@ fn build_ode_spec(
     // still read 0 just like the old per-call `vec![0.0; n]` path.
     // Snapshot the resolved RHS program for the analytic-sensitivity path
     // (issue #367) before the f64 closure moves `stmts_owned`. Same statements,
-    // same var layout — evaluated over `Dual2<N>` by `eval_rhs_dual`.
+    // same var layout — evaluated over a dual type by `eval_rhs_g`.
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -8934,11 +9111,11 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
 }
 
 /// Compiled ODE RHS program + var layout, exposed so the analytic-sensitivity
-/// provider can evaluate the same RHS over `Dual2<N>` (issue #367, Option A).
-/// Carries exactly what the f64 `rhs` closure binds, so [`eval_rhs_dual`]
+/// provider can evaluate the same RHS over a dual type (issue #367, Option A).
+/// Carries exactly what the f64 `rhs` closure binds, so [`eval_rhs_g`]
 /// reproduces that binding but seeds the individual parameters as dual variables.
 ///
-/// [`eval_rhs_dual`]: OdeRhsProgram::eval_rhs_dual
+/// [`eval_rhs_g`]: OdeRhsProgram::eval_rhs_g
 ///
 /// `pub` only so it can appear in the (public) [`OdeSpec`](crate::ode::OdeSpec)
 /// field; all fields are private, so it is opaque outside the crate and can be
@@ -8957,28 +9134,30 @@ pub struct OdeRhsProgram {
 }
 
 impl OdeRhsProgram {
-    /// Evaluate `du = f(u, p, t)` over `Dual2<N>`. `u` is the current state;
-    /// `params` is the flat PK-parameter vector with the differentiated slots
-    /// already seeded as dual variables (so individual parameter `i`, read from
-    /// `params[indiv_to_params_slot[i]]`, carries its derivative); `tafd`/`tad`
-    /// are the time-after-first/last-dose anchors (constants w.r.t. the
-    /// parameters, lifted as such). `vars`/`stack` are caller-owned scratch
-    /// reused across RK stages. Writes `du` (length `state_count`). Mirrors the
-    /// f64 binding in the `rhs` closure statement-for-statement.
-    pub(crate) fn eval_rhs_dual<const N: usize>(
+    /// Evaluate `du = f(u, p, t)` over a dual type, generic over [`PkNum`]
+    /// (`Dual1<N>` for the light inner η-gradient, `Dual2<N>` for the full outer
+    /// gradient). `u` is the current state; `params` is the flat PK-parameter vector
+    /// with the differentiated slots already seeded as dual variables (so individual
+    /// parameter `i`, read from `params[indiv_to_params_slot[i]]`, carries its
+    /// derivative); `tafd`/`tad` are the time-after-first/last-dose anchors
+    /// (constants w.r.t. the parameters, lifted as such). `vars`/`stack` are
+    /// caller-owned scratch reused across RK stages. Writes `du` (length
+    /// `state_count`). Mirrors the f64 binding in the `rhs` closure
+    /// statement-for-statement (issue #410, inner η-gradient).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn eval_rhs_g<T: crate::sens::num::PkNum>(
         &self,
-        u: &[crate::sens::dual2::Dual2<N>],
-        params: &[crate::sens::dual2::Dual2<N>],
+        u: &[T],
+        params: &[T],
         t: f64,
         tafd: f64,
         tad: f64,
-        du: &mut [crate::sens::dual2::Dual2<N>],
-        vars: &mut Vec<crate::sens::dual2::Dual2<N>>,
-        stack: &mut Vec<crate::sens::dual2::Dual2<N>>,
+        du: &mut [T],
+        vars: &mut Vec<T>,
+        stack: &mut Vec<T>,
     ) {
-        use crate::sens::dual2::Dual2;
         vars.clear();
-        vars.resize(self.n_vars_total, Dual2::<N>::constant(0.0));
+        vars.resize(self.n_vars_total, T::from_f64(0.0));
         let copy_n = self.state_count.min(u.len());
         vars[..copy_n].copy_from_slice(&u[..copy_n]);
         for (i, &slot) in self.indiv_to_params_slot.iter().enumerate() {
@@ -8988,23 +9167,23 @@ impl OdeRhsProgram {
             }
         }
         if let Some(d) = vars.get_mut(self.time_slot) {
-            *d = Dual2::constant(t);
+            *d = T::from_f64(t);
         }
         if let Some(d) = vars.get_mut(self.tafd_slot) {
-            *d = Dual2::constant(tafd);
+            *d = T::from_f64(tafd);
         }
         if let Some(d) = vars.get_mut(self.tad_slot) {
-            *d = Dual2::constant(tad);
+            *d = T::from_f64(tad);
         }
         if let Some(d) = vars.get_mut(self.macheps_slot) {
-            *d = Dual2::constant(f64::EPSILON);
+            *d = T::from_f64(f64::EPSILON);
         }
         for d in du.iter_mut() {
-            *d = Dual2::constant(0.0);
+            *d = T::from_f64(0.0);
         }
         // The ODE RHS references states/indiv-params (in `vars`) only, not
         // θ/η/cov directly — so those are empty here.
-        eval_statements_g::<Dual2<N>>(&self.stmts, &[], &[], &[], vars, Some(du), stack);
+        eval_statements_g::<T>(&self.stmts, &[], &[], &[], vars, Some(du), stack);
     }
 }
 
@@ -9108,6 +9287,53 @@ impl IndivParamProgram {
             .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual2::constant(0.0)))
             .collect()
     }
+
+    /// Evaluate the individual parameters over `Dual1<M>` seeded on **η only**
+    /// (`η_k → var(·, k)`, θ held constant): the light first-order counterpart of
+    /// [`eval_param_duals`](Self::eval_param_duals) for the inner η-gradient (#410).
+    /// Returns one `Dual1<M>` per individual parameter (declaration order); its
+    /// `grad` is the exact `∂p/∂η`. Avoids the θ-axes and the second-order Hessian
+    /// the `Dual2` path computes. Requires `M ≥ n_eta_axis()`.
+    pub(crate) fn eval_param_eta_grad<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Vec<crate::sens::dual1::Dual1<M>> {
+        use crate::sens::dual1::Dual1;
+        let theta_d: Vec<Dual1<M>> = theta.iter().map(|&v| Dual1::constant(v)).collect();
+        let eta_d: Vec<Dual1<M>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                if k < M {
+                    Dual1::var(v, k)
+                } else {
+                    Dual1::constant(v)
+                }
+            })
+            .collect();
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![Dual1::<M>::constant(0.0); self.n_vars];
+        let mut stack: Vec<Dual1<M>> = Vec::new();
+        eval_statements_g::<Dual1<M>>(
+            &self.stmts,
+            &theta_d,
+            &eta_d,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+        );
+        self.pk_var_slots
+            .iter()
+            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual1::constant(0.0)))
+            .collect()
+    }
 }
 
 /// Compiled Form C ODE output expression (`[scaling] y = <expr>`) + var layout,
@@ -9133,21 +9359,21 @@ impl OdeOutputProgram {
         self.simple
     }
 
-    /// Evaluate the output expression over `Dual2<N>`. `state` is the integrated
-    /// dual state; `params` is the flat PK-parameter vector with the
-    /// differentiated slots seeded as dual variables (so `V1`'s derivative flows
-    /// into `central / V1`). `vars`/`stack` are caller-owned scratch. Only valid
-    /// when [`is_simple`](Self::is_simple) holds.
-    pub(crate) fn eval_output_dual<const N: usize>(
+    /// Evaluate the output expression over a dual type, generic over [`PkNum`]
+    /// (`Dual1` light inner / `Dual2` full outer; #410) — the Form-C readout.
+    /// `state` is the integrated dual state; `params` is the flat PK-parameter
+    /// vector with the differentiated slots seeded as dual variables (so `V1`'s
+    /// derivative flows into `central / V1`). `vars`/`stack` are caller-owned
+    /// scratch. Only valid when [`is_simple`](Self::is_simple) holds.
+    pub(crate) fn eval_output_g<T: crate::sens::num::PkNum>(
         &self,
-        state: &[crate::sens::dual2::Dual2<N>],
-        params: &[crate::sens::dual2::Dual2<N>],
-        vars: &mut Vec<crate::sens::dual2::Dual2<N>>,
-        stack: &mut Vec<crate::sens::dual2::Dual2<N>>,
-    ) -> crate::sens::dual2::Dual2<N> {
-        use crate::sens::dual2::Dual2;
+        state: &[T],
+        params: &[T],
+        vars: &mut Vec<T>,
+        stack: &mut Vec<T>,
+    ) -> T {
         vars.clear();
-        vars.resize(self.n_states + self.n_indiv, Dual2::<N>::constant(0.0));
+        vars.resize(self.n_states + self.n_indiv, T::from_f64(0.0));
         let copy_n = self.n_states.min(state.len());
         vars[..copy_n].copy_from_slice(&state[..copy_n]);
         for (i, &slot) in self.indiv_to_pk.iter().enumerate() {
@@ -9156,7 +9382,7 @@ impl OdeOutputProgram {
             }
         }
         let empty_nn: Vec<Vec<f64>> = Vec::new();
-        eval_bytecode_g::<Dual2<N>>(&self.bc, &[], &[], &[], vars, &empty_nn, stack)
+        eval_bytecode_g::<T>(&self.bc, &[], &[], &[], vars, &empty_nn, stack)
     }
 }
 

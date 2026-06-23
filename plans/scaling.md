@@ -236,16 +236,17 @@ Assign `model.scaling` and, for Form C, `ode_spec.output_fn`.
 
 ## Step 7 — Documentation & examples
 
-- `docs/model-file/scaling.qmd` (new page): Forms A/B/C with worked examples,
+- `docs/src/model-file/scaling.md` (new page): Forms A/B/C with worked examples,
   divisive convention explained, AD limitation noted.
-- Add entry to `docs/_quarto.yml`.
-- Cross-reference from `docs/model-file/structural-model.qmd` (ODE section).
-- `docs/faq.qmd`: entry comparing to NONMEM `S1`/`S2` and nlmixr2's `cmt(central)` convention.
+- Add entry to `docs/src/SUMMARY.md`.
+- Cross-reference from `docs/src/model-file/structural-model.md` (ODE section).
+- `docs/src/faq.md`: entry comparing to NONMEM `S1`/`S2` and nlmixr2's `cmt(central)` convention.
 - New example files:
   - `examples/scaling_scalar.ferx` (Form A on warfarin)
   - `examples/scaling_expression.ferx` (Form B on 1-cpt)
   - `examples/scaling_ode_amounts.ferx` (Form C: amount-based ODE)
-- Run `cd docs && quarto render` to preview; commit only the source — CI renders and deploys `docs/_site/`.
+- Render locally with `quarto render docs` to preview; commit only the `.qmd`
+  sources (the rendered `docs/_site/` is git-ignored).
 
 ---
 

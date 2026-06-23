@@ -448,6 +448,14 @@ impl DoseAttrMap {
         self.indexed.get(&(attr, cmt)).copied()
     }
 
+    /// Whether any compartment-indexed entry for `attr` is declared (e.g. `F1`/`F2`
+    /// for [`DoseAttr::F`]). The bare slot (`PK_IDX_F`/`PK_IDX_LAGTIME`) is the
+    /// fallback and is *not* recorded here, so this is true only for the
+    /// per-compartment form.
+    pub fn has_indexed_attr(&self, attr: DoseAttr) -> bool {
+        self.indexed.keys().any(|&(a, _)| a == attr)
+    }
+
     /// Bioavailability for a dose into 1-based `cmt`: `F{cmt}` if declared, else
     /// the bare `PK_IDX_F` slot (default 1.0 when the model has no `F` at all).
     pub fn f_bio(&self, cmt: usize, params: &[f64]) -> f64 {

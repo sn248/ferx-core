@@ -280,6 +280,9 @@ pub fn subject_theta_gradient(
     params: &ModelParameters,
     eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
+    if subject.observations.is_empty() {
+        return Some(vec![0.0; params.theta.len()]);
+    }
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
     let prep = prepare(model, subject, params, &sens)?;
     Some(theta_block(&prep, &sens, params.theta.len()))
@@ -362,6 +365,14 @@ pub fn subject_omega_gradient(
     params: &ModelParameters,
     eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
+    if subject.observations.is_empty() {
+        let n = if params.omega.diagonal {
+            model.n_eta
+        } else {
+            model.n_eta * (model.n_eta + 1) / 2
+        };
+        return Some(vec![0.0; n]);
+    }
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
     let prep = prepare(model, subject, params, &sens)?;
     Some(omega_block(&prep, params, eta_hat))
@@ -418,6 +429,9 @@ pub fn subject_sigma_gradient(
     params: &ModelParameters,
     eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
+    if subject.observations.is_empty() {
+        return Some(vec![0.0; params.sigma.values.len()]);
+    }
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
     let prep = prepare(model, subject, params, &sens)?;
     Some(sigma_block(&prep, model, subject, params, &sens))
@@ -722,6 +736,9 @@ pub fn subject_packed_gradient(
     x: &[f64],
     eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
+    if subject.observations.is_empty() {
+        return Some(vec![0.0; x.len()]);
+    }
     // M3/BLOQ: censored rows enter through `prepare` (data term `−logΦ`, true
     // inner Hessian; excluded from `H̃`/`log|H̃|` — matching `gaussian_foce_accum`).
     // This is the FOCEI (interaction) path that non-IOV M3 promotes to; plain FOCE
@@ -803,6 +820,41 @@ pub fn population_gradient_sens(
     Some(grad)
 }
 
+/// Per-subject analytic packed gradients `dᵢ = d(nllᵢ)/dx` (FOCEI when
+/// `interaction`, plain FOCE otherwise), with `None` for any subject the
+/// analytic provider can't handle (SS+reset, time-varying covariates,
+/// modeled-duration doses, EVID=2 reset). Unlike [`population_gradient_sens`],
+/// which short-circuits the *whole* population to `None` on the first
+/// out-of-scope subject, this exposes the per-subject result so the caller can
+/// keep the exact analytic gradient for the in-scope subjects and fill only the
+/// out-of-scope ones with a reconverged-FD gradient. One out-of-scope subject no
+/// longer disables the exact gradient for the other thousands — the all-or-
+/// nothing fallback dropped to the θ-only fixed-EBE gradient, whose biased Ω/σ
+/// block stalled SLSQP/L-BFGS/MMA well above the derivative-free optimum
+/// (focei-slsqp-fixed-ebe-gradient-bias). Caller scales each entry by 2 and
+/// zeroes fixed coordinates when assembling the population sum.
+pub fn per_subject_packed_gradients(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[DVector<f64>],
+    interaction: bool,
+) -> Vec<Option<Vec<f64>>> {
+    population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            if interaction {
+                subject_packed_gradient(model, subject, template, x, eta_hats[i].as_slice())
+            } else {
+                subject_packed_gradient_foce(model, subject, template, x, eta_hats[i].as_slice())
+            }
+        })
+        .collect()
+}
+
 /// The exact analytic population gradient for an **IOV** model (FOCEI), packed
 /// space, or `None` if any subject is outside the IOV-analytical scope. `eta_hats`
 /// are the per-subject **BSV** EBEs and `kappas[i]` the per-occasion κ̂ for subject
@@ -870,7 +922,7 @@ pub fn subject_packed_gradient_foce(
     let n_eta = model.n_eta;
     let n_obs = subject.observations.len();
     if n_obs == 0 {
-        return None;
+        return Some(vec![0.0; x.len()]);
     }
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
     // Residual variance R⁰ is frozen at the η=0 (typical-individual) prediction —
@@ -1526,6 +1578,9 @@ pub fn subject_eta_dx(
     x: &[f64],
     eta_hat: &[f64],
 ) -> Option<Vec<DVector<f64>>> {
+    if subject.observations.is_empty() {
+        return Some(vec![DVector::zeros(model.n_eta); x.len()]);
+    }
     let params = unpack_params(x, template);
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
     let prep = prepare(model, subject, &params, &sens)?;
@@ -1818,11 +1873,12 @@ mod tests {
         subject
     }
 
-    /// A dosing-only subject (dose rows, no DV) must not panic the FOCEI analytic
-    /// gradient. All three entry points decline (→ FD fallback) rather than
-    /// indexing `obs[0]` on an empty observation list (PR #381 review #1).
+    /// A dosing-only subject (dose rows, no DV) contributes zero to the FOCE/FOCEI
+    /// marginal objective: with no data rows, `log|Ω| + log|Ω⁻¹|` cancels at
+    /// `η̂ = 0`. It should therefore return a zero analytic gradient instead of
+    /// forcing the whole population gradient onto the FD fallback.
     #[test]
-    fn zero_observation_subject_declines_without_panic() {
+    fn zero_observation_subject_returns_zero_gradient() {
         let model = parse_model_string(TWOCPT).expect("parse");
         let template = model.default_params.clone();
         let theta = template.theta.clone();
@@ -1836,9 +1892,25 @@ mod tests {
 
         let x = pack_params(&template);
         let eta_hat = vec![0.0; model.n_eta];
-        assert!(subject_packed_gradient(&model, &subject, &template, &x, &eta_hat).is_none());
-        assert!(subject_theta_gradient(&model, &subject, &template, &eta_hat).is_none());
-        assert!(subject_eta_dx(&model, &subject, &template, &x, &eta_hat).is_none());
+        let packed = subject_packed_gradient(&model, &subject, &template, &x, &eta_hat)
+            .expect("dosing-only subject has zero packed gradient");
+        assert_eq!(packed, vec![0.0; x.len()]);
+
+        let theta_grad = subject_theta_gradient(&model, &subject, &template, &eta_hat)
+            .expect("dosing-only subject has zero theta gradient");
+        assert_eq!(theta_grad, vec![0.0; model.n_theta]);
+
+        let omega_grad = subject_omega_gradient(&model, &subject, &template, &eta_hat)
+            .expect("dosing-only subject has zero omega gradient");
+        assert_eq!(omega_grad, vec![0.0; model.n_eta]);
+
+        let sigma_grad = subject_sigma_gradient(&model, &subject, &template, &eta_hat)
+            .expect("dosing-only subject has zero sigma gradient");
+        assert_eq!(sigma_grad, vec![0.0; template.sigma.values.len()]);
+
+        let eta_dx = subject_eta_dx(&model, &subject, &template, &x, &eta_hat)
+            .expect("dosing-only subject has zero EBE predictor");
+        assert_eq!(eta_dx, vec![DVector::zeros(model.n_eta); x.len()]);
     }
 
     /// `sigma_fd_step` keeps the central-difference minus side `σ − h` strictly
@@ -2285,6 +2357,55 @@ mod tests {
         run_population_packed_gradient_check(&model, &[5.0, 30.0, 2.0, 50.0, 1.0]);
     }
 
+    // 2-cpt IV **user-ODE** model (Form C readout `y = central/V1`), IIV on CL+V1.
+    // Exercises the armed ODE sensitivity provider (#410) through the *full* outer
+    // assembly: the Dual2 augmented-RK45 jet must flow through the θ/Ω/σ blocks
+    // (incl. the EBE response) and match reconverged FD exactly as the analytical
+    // PK models do. Tight ODE tolerances so the propagated derivative agrees with a
+    // finite difference of the (separately integrated) f64 objective.
+    const TWOCPT_ODE_OUTER: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// The armed ODE outer gradient (#410) must match reconverged Richardson FD of
+    /// the FOCEI marginal — the end-to-end proof that flipping `ODE_SENS_ENABLED`
+    /// feeds a *correct* θ/Ω/σ gradient through the shared assembly, not just that
+    /// the per-observation provider matches production (the `ode_provider` tests).
+    #[test]
+    fn population_packed_gradient_ode_2cpt_matches_fd() {
+        let model = parse_model_string(TWOCPT_ODE_OUTER).expect("parse ODE");
+        assert!(
+            crate::sens::provider::sens_supported(&model),
+            "2-cpt IV ODE must be armed for the analytic outer gradient (#410)"
+        );
+        run_population_packed_gradient_check(&model, &[4.0, 12.0, 2.0, 25.0]);
+    }
+
     // 1-cpt IV (log-normal CL/V) used by the EVID=3/4 reset gradient checks: the
     // provider rebuilds each observation from the doses in its current reset
     // segment, so a reset subject's `∂f/∂η`, `∂²f/∂η²`, `∂f/∂θ`, `∂²f/∂η∂θ` jet —
@@ -2427,6 +2548,158 @@ mod tests {
                 );
                 approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
             }
+        }
+    }
+
+    /// Out-of-scope sibling of [`reset_subject_outer`]: same two IV-infusion
+    /// occasions split by an EVID=4 reset, but the doses are **steady-state**.
+    /// SS + reset is outside the analytic provider's scope (SS assumes an infinite
+    /// periodic history a mid-record reset contradicts), so it returns `None` from
+    /// `subject_sensitivities` while production still predicts it via the
+    /// event-driven `f64` walk.
+    fn ss_reset_subject_outer(
+        model: &CompiledModel,
+        theta: &[f64],
+        eta_ref: &[f64],
+        id: &str,
+    ) -> Subject {
+        let mut subject = reset_subject_outer(model, theta, eta_ref, id);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 200.0, true, 24.0),
+            DoseEvent::new(120.0, 1000.0, 1, 200.0, true, 24.0),
+        ];
+        assert!(
+            subject.doses.iter().any(|d| d.ss) && subject.has_resets(),
+            "fixture must be steady-state + reset"
+        );
+        let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, eta_ref);
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        subject
+    }
+
+    /// Regression for focei-slsqp-fixed-ebe-gradient-bias: a population mixing
+    /// in-scope subjects with a single out-of-scope (SS+reset) subject must still
+    /// yield the exact analytic gradient for the in-scope subjects, filling only
+    /// the out-of-scope one with a reconverged per-subject FD. Before the fix one
+    /// such subject forced `population_gradient_sens` to `None`, dropping the
+    /// whole population onto the θ-only fixed-EBE gradient whose biased Ω/σ block
+    /// left the variance components pinned at their start and stalled SLSQP/
+    /// L-BFGS/MMA. The assembled `population_gradient_sens_mixed` must match
+    /// reconverged-FD of the FOCEI OFV across every packed coordinate.
+    #[test]
+    fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
+        use crate::estimation::outer_optimizer::population_gradient_sens_mixed;
+        use crate::estimation::parameterization::{compute_bounds, pack_params};
+        use crate::types::{FitOptions, Population};
+
+        let model = parse_model_string(ONECPT_IV_RESET).expect("parse");
+        let theta = [0.22, 11.0];
+        let eta_ref = [0.12, -0.08];
+
+        // In-scope plain subject + an out-of-scope SS+reset subject.
+        let s_plain = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let s_oos = ss_reset_subject_outer(&model, &theta, &eta_ref, "ss_reset");
+        let pop = Population {
+            subjects: vec![s_plain, s_oos],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+
+        // EBE per subject: in-scope subjects use the analytic Newton polish
+        // (`precise_ebe`); the out-of-scope SS+reset subject uses the production
+        // inner solver (`find_ebe`), which `precise_ebe` can't because it unwraps
+        // the analytic provider.
+        let zeros = vec![0.0; model.n_eta];
+        let in_scope = |s: &Subject| {
+            crate::sens::provider::subject_sensitivities(&model, s, &params.theta, &zeros).is_some()
+        };
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| {
+                if in_scope(s) {
+                    DVector::from_vec(precise_ebe(&model, s, &params))
+                } else {
+                    find_ebe(&model, s, &params, 200, 1e-12, None, None).eta
+                }
+            })
+            .collect();
+
+        // Pre-fix behaviour: the all-or-nothing analytic gradient declines the
+        // whole population because subject 1 (SS+reset) is out of scope.
+        assert!(
+            population_gradient_sens(&model, &pop, &template, &x, &ehs).is_none(),
+            "SS+reset subject must take the whole population out of the all-or-nothing path"
+        );
+        // The per-subject view keeps the in-scope subject analytic, only the
+        // out-of-scope one `None`.
+        let per_sub = per_subject_packed_gradients(&model, &pop, &template, &x, &ehs, true);
+        assert!(per_sub[0].is_some(), "plain subject is in analytic scope");
+        assert!(
+            per_sub[1].is_none(),
+            "SS+reset subject is out of analytic scope"
+        );
+
+        // The assembled mixed gradient (analytic in-scope + per-subject FD for the
+        // out-of-scope subject) must match reconverged-FD of the FOCEI OFV.
+        let options = FitOptions {
+            interaction: true,
+            ..Default::default()
+        };
+        let bounds = compute_bounds(&template);
+        let mixed =
+            population_gradient_sens_mixed(&x, &template, &model, &pop, &ehs, &bounds, &options);
+
+        // FD reference, per subject mirroring the mixed assembly: in-scope
+        // subjects via the analytic-EBE `marginal_nll`, the out-of-scope one via
+        // the production reconverged EBE + `foce_subject_nll` (exactly what the
+        // mixed FD fallback computes internally).
+        let subj_marginal = |s: &Subject, p: &ModelParameters| -> f64 {
+            if in_scope(s) {
+                marginal_nll(&model, s, p)
+            } else {
+                let ebe = find_ebe(&model, s, p, 200, 1e-12, None, None);
+                foce_subject_nll(
+                    &model,
+                    s,
+                    &p.theta,
+                    &ebe.eta,
+                    &ebe.h_matrix,
+                    &p.omega,
+                    &p.sigma.values,
+                    true,
+                )
+            }
+        };
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| subj_marginal(s, &p))
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(mixed[k], fd, max_relative = 3e-3, epsilon = 1e-5);
         }
     }
 

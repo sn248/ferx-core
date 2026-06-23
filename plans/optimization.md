@@ -209,10 +209,10 @@ and re-verify before opening the PR.
 
 ### Phase F — Documentation and PR
 
-1. Update `docs/` markdown sources for any user-visible change
-   (new `[fit_options]` key, new optimizer variant, new estimation method
-   behaviour). Render the Quarto site locally to preview (`cd docs && quarto
-   render`); commit only the source — CI renders and deploys the built output.
+1. Update the Quarto sources under `docs/` (`docs/**/*.qmd`) for any
+   user-visible change (new `[fit_options]` key, new optimizer variant, new
+   estimation method behaviour). Render locally to preview with `quarto render
+   docs`; the rendered `docs/_site/` is git-ignored, so commit only the sources.
 2. Fill in every section of `.github/PULL_REQUEST_TEMPLATE.md`.
 3. In the PR description, include the Phase B updated plan (the actual plan
    followed, not the one originally written below) and the Phase E benchmark
@@ -532,7 +532,7 @@ model evaluations.
 `TrustRegion` is already present in the `Optimizer` enum in `src/types.rs`
 (line 1043) and is already wired in `outer_optimizer.rs` — it routes to
 `src/estimation/trust_region.rs`. Users can set `optimizer = trust_region`
-today. Documentation in `docs/model-file/fit-options.qmd` should be
+today. Documentation in `docs/src/model-file/fit-options.md` should be
 verified/updated to include `trust_region`.
 
 ### What remains
@@ -568,7 +568,7 @@ receive the AD gradient if applicable — check that path and update it.
 
 ### Files to touch
 - `src/estimation/outer_optimizer.rs` (replace `gradient_cd` calls with AD)
-- `docs/model-file/fit-options.qmd` (verify `trust_region` is documented)
+- `docs/src/model-file/fit-options.md` (verify `trust_region` is documented)
 
 ### Test
 
@@ -840,8 +840,8 @@ When `Some(n)`, use the fixed value `n`. When `None`, use the adaptive budget.
 ### Files to touch
 - `src/estimation/trust_region.rs` (sub-tasks 6a, 6b, 6c)
 - `src/types.rs` (change `steihaug_max_iters: usize` → `Option<usize>`, update default and parse)
-- `docs/estimation/foce.qmd` (document trust region, BHHH Hessian, adaptive CG)
-- `docs/model-file/fit-options.qmd` (update `steihaug_max_iters` entry for `Option<usize>`)
+- `docs/src/estimation/foce.md` (document trust region, BHHH Hessian, adaptive CG)
+- `docs/src/model-file/fit-options.md` (update `steihaug_max_iters` entry for `Option<usize>`)
 
 ### Test
 
@@ -1375,8 +1375,8 @@ pub(crate) mod hmc;
 - `src/estimation/saem.rs` (replace `mh_steps` dispatch; update adaptation target)
 - `src/types.rs` (add `saem_n_leapfrog: usize`)
 - `src/parser/model_parser.rs` (parse `saem_n_leapfrog`)
-- `docs/estimation/saem.qmd` (document HMC path, `saem_n_leapfrog`, fallback behaviour)
-- `docs/model-file/fit-options.qmd` (add `saem_n_leapfrog` entry)
+- `docs/src/estimation/saem.md` (document HMC path, `saem_n_leapfrog`, fallback behaviour)
+- `docs/src/model-file/fit-options.md` (add `saem_n_leapfrog` entry)
 
 ### Tests
 
@@ -1475,8 +1475,8 @@ Add `sir_df: f64` to `FitOptions` (default: 5.0, following Dosne 2017).
 ### Files to touch
 - `src/estimation/sir.rs`
 - `src/types.rs` (add `sir_df: f64`)
-- `docs/estimation/sir.qmd`
-- `docs/model-file/fit-options.qmd`
+- `docs/src/estimation/sir.md`
+- `docs/src/model-file/fit-options.md`
 
 ### Test
 Fit warfarin with `covariance = true`. Compare ESS with normal vs Student-t
@@ -1564,8 +1564,8 @@ Rayon's work-stealing thread pool handles nested `par_iter` safely.
 ### Files to touch
 - `src/api.rs` (wrap `fit()` call in multi-start parallel loop)
 - `src/types.rs` (add `n_starts`, `start_sigma` to `FitOptions`)
-- `docs/model-file/fit-options.qmd`
-- `docs/estimation/foce.qmd` (add multi-start section)
+- `docs/src/model-file/fit-options.md`
+- `docs/src/estimation/foce.md` (add multi-start section)
 
 ### Test
 Fit `mm_oral.ferx` with deliberately poor initial estimates (TVCL = 10× true).
@@ -1730,7 +1730,7 @@ Benchmark wall-clock time for the same four examples, before and after:
 ```bash
 time cargo run --release -- examples/warfarin.ferx --data data/warfarin.csv
 ```
-Record times in a benchmark table committed to `docs/benchmarks.qmd`.
+Record times in a benchmark table committed to `docs/src/benchmarks.md`.
 Expected improvement: 3–10× on FOCE/FOCEI models with ODE structure,
 2–5× on analytical models, 3–5× on SAEM models.
 
@@ -1755,7 +1755,7 @@ For each, confirm:
 
 ### Documentation
 
-Update `docs/estimation/index.qmd` with a summary table covering, per method:
+Update `docs/src/estimation/index.md` with a summary table covering, per method:
 - Gradient source (AD or FD)
 - Optimizer (NLopt SLSQP, trust region, etc.)
 - Steihaug-CG budget policy (fixed or adaptive)

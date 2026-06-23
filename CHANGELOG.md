@@ -28,11 +28,20 @@ section of the SDLC for the versioning policy).
   propagates `∂(steady state)/∂(θ,η)` directly (no implicit fixed-point differentiation).
   Both SS **boluses** and SS **infusions** are supported (an SS infusion equilibrates with
   an active-rate window + quiet window per cycle), and SS composes with time-varying
-  covariates, IOV, EVID 3/4 resets, and **estimated lagtime** (shifting the lag shifts the
-  whole infinite train, handled exactly via the obs-side time-shift) — all via the
-  event-driven walk. Still on FD: rate-defined SS infusion under `F ≠ 1` (#419 window
-  scaling) and SS infusion combined with lagtime (needs the train-shift term on the rate
-  boundary). Result-neutral (validated against the production predictor and `predict_iov`).
+  covariates, IOV, EVID 3/4 resets, and **estimated lagtime** — including SS infusion ×
+  lagtime, where the infinite past train (the equilibration trough) time-shifts via the
+  obs-side time-shift and the current window's boundaries shift via the rate-boundary
+  saltations. Only a rate-defined SS infusion under `F ≠ 1` still routes to FD (its
+  equilibration cycles would each need the `F`-scaled active window). Result-neutral
+  (validated against the production predictor and `predict_iov`).
+- **Analytic gradients for rate-defined infusion under bioavailability `F ≠ 1`** in
+  `[odes]` models (#419). NONMEM holds a rate-defined infusion's rate and scales its
+  *duration* to `F·amt/rate`, so `F`'s sensitivity is a moving window boundary rather than
+  a rate-magnitude scale — previously this routed to finite differences. The event-driven
+  walk now carries it: the bioavailable window length `F·amt/rate` is the rate-off
+  saltation boundary (combined with any lagtime shift), with the rate held. Such subjects
+  route to the event-driven walk automatically. (A *steady-state* rate-defined infusion
+  under `F ≠ 1` still uses FD.) Result-neutral.
 - **Exact analytic FOCE/FOCEI gradients for IOV `[odes]` models** (#439). User-ODE
   models with inter-occasion variability (`iov_column`, `kappa`) now get the exact
   analytic outer (θ/Ω/σ) gradient over the stacked `[η_bsv, κ₁..κ_K]` random effects,

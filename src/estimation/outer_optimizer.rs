@@ -1862,6 +1862,146 @@ fn reconverged_fd_gradient(
     grad
 }
 
+/// Central-FD per-subject packed gradient `dᵢ = d(nllᵢ)/dx` that **re-converges
+/// that one subject's EBE** (warm-started) at every perturbed point. The single-
+/// subject analog of [`reconverged_fd_gradient`], used to fill the handful of
+/// subjects the analytic provider can't handle (SS+reset, time-varying
+/// covariates, modeled-duration doses, EVID=2 reset) inside the otherwise-exact
+/// analytic population gradient. Because the EBEs are re-solved at each ±h, the
+/// Ω/σ EBE-response is included — the term the θ-only fixed-EBE fallback drops,
+/// whose absence stalled the gradient optimizers (focei-slsqp-fixed-ebe-gradient-bias).
+/// Returns `d(nllᵢ)/dx` (length `x.len()`); the caller scales by 2 and zeroes
+/// fixed coordinates, matching the analytic per-subject convention.
+#[allow(clippy::too_many_arguments)]
+fn subject_reconverged_fd_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    subject: &Subject,
+    warm_eta: &DVector<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let n = x.len();
+    let fixed = packed_fixed_mask(init_params);
+    let eps = 1e-4;
+    // Subject marginal NLL at a packed point, re-solving this subject's EBE
+    // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
+    // (`foce_subject_nll`, summed by `pop_nll`); non-finite → NaN so the central
+    // difference below is dropped to zero for that coordinate.
+    let eval = |xv: &[f64]| -> f64 {
+        let params = unpack_params(xv, init_params);
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+        let ebe = find_ebe(
+            model,
+            subject,
+            &params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(warm_eta.as_slice()),
+            Some(&mu_k),
+        );
+        crate::stats::likelihood::foce_subject_nll(
+            model,
+            subject,
+            &params.theta,
+            &ebe.eta,
+            &ebe.h_matrix,
+            &params.omega,
+            &params.sigma.values,
+            options.interaction,
+        )
+    };
+
+    let mut grad = vec![0.0_f64; n];
+    let mut xw = x.to_vec();
+    for k in 0..n {
+        if fixed[k] {
+            continue;
+        }
+        let h = eps * (1.0 + x[k].abs());
+        let xp = (x[k] + h).min(bounds.upper[k]);
+        let xm = (x[k] - h).max(bounds.lower[k]);
+        let denom = xp - xm;
+        if denom.abs() < 1e-16 {
+            continue;
+        }
+        xw[k] = xp;
+        let fp = eval(&xw);
+        xw[k] = xm;
+        let fm = eval(&xw);
+        xw[k] = x[k];
+        let d = (fp - fm) / denom;
+        if d.is_finite() {
+            grad[k] = d;
+        }
+    }
+    grad
+}
+
+/// Non-IOV population gradient assembled **per subject**: the exact analytic
+/// (Almquist) gradient — including the EBE response on every θ/Ω/σ block — for
+/// every subject inside the provider's scope, and a per-subject
+/// [`subject_reconverged_fd_gradient`] for each subject outside it (or whose
+/// analytic gradient came back non-finite). This replaces the all-or-nothing
+/// [`population_gradient_sens`]: previously a single out-of-scope subject forced
+/// the whole population onto the θ-only fixed-EBE gradient, whose biased Ω/σ
+/// block left the variance components pinned at their start and stalled
+/// SLSQP/L-BFGS/MMA above the derivative-free optimum
+/// (focei-slsqp-fixed-ebe-gradient-bias). Returns the packed `2·Σᵢ dᵢ` with
+/// fixed coordinates zeroed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn population_gradient_sens_mixed(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    ehs: &[DVector<f64>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let np = x.len();
+    let per_sub = crate::estimation::sens_outer_gradient::per_subject_packed_gradients(
+        model,
+        population,
+        init_params,
+        x,
+        ehs,
+        options.interaction,
+    );
+    let filled: Vec<Vec<f64>> = per_sub
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, gi)| match gi {
+            // Keep the exact analytic gradient for in-scope, finite subjects.
+            Some(g) if g.iter().all(|v| v.is_finite()) => g,
+            // Out-of-scope (or non-finite analytic) → reconverged per-subject FD.
+            _ => subject_reconverged_fd_gradient(
+                x,
+                init_params,
+                model,
+                &population.subjects[i],
+                &ehs[i],
+                bounds,
+                options,
+            ),
+        })
+        .collect();
+    let mut grad = vec![0.0f64; np];
+    for gi in &filled {
+        for k in 0..np {
+            grad[k] += 2.0 * gi[k];
+        }
+    }
+    let fixed = packed_fixed_mask(init_params);
+    for k in 0..np {
+        if fixed[k] {
+            grad[k] = 0.0;
+        }
+    }
+    grad
+}
+
 /// Compute `d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x)` by summing per-subject
 /// gradients in parallel.  ETAs are fixed at their current EBE values.
 ///
@@ -2045,22 +2185,22 @@ fn population_gradient(
                     kappas,
                 )
             }
-        } else if options.interaction {
-            crate::estimation::sens_outer_gradient::population_gradient_sens(
-                model,
-                population,
-                init_params,
-                x,
-                ehs,
-            )
         } else {
-            crate::estimation::sens_outer_gradient::population_gradient_sens_foce(
+            // Non-IOV: assemble per subject — exact analytic for in-scope
+            // subjects, per-subject reconverged-FD for the few out-of-scope ones.
+            // Always `Some`; the finiteness backstop below still guards it. This
+            // is the fix for focei-slsqp-fixed-ebe-gradient-bias: one out-of-scope
+            // subject no longer drops the whole population to the biased θ-only
+            // fixed-EBE fallback (`ad_population_gradient`).
+            Some(population_gradient_sens_mixed(
+                x,
+                init_params,
                 model,
                 population,
-                init_params,
-                x,
                 ehs,
-            )
+                bounds,
+                options,
+            ))
         };
         if let Some(g) = g {
             // Always-on finiteness backstop: a non-finite analytic component (the

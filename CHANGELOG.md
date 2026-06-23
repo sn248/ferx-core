@@ -118,6 +118,39 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- **Analytic sensitivities and predictions for time-varying covariates with
+  intermediate `[individual_parameters]` assignments** (#455, #456). A model whose
+  individual-parameter block computes intermediate quantities (e.g.
+  `WTREL = WT / 70`) before the structural PK outputs now gets the exact analytic
+  `Dual2` gradient on every path — the TV-cov gate plus the previously-overlooked
+  non-TV (`subject_sensitivities` / `subject_eta_grad`) and IOV gates all key on the
+  required structural PK slots instead of the assignment count, so these models no
+  longer silently fall back to a fallback that mis-seeded `∂f/∂η`. Additionally,
+  the public `predict()` and the sdtab `PRED` column now both route through the
+  TV-covariate-aware predictor, so they honour per-event covariate breakpoints
+  (and EVID=3/4 resets) and agree with each other. Cross-checked against NONMEM
+  7.5.1 (ADVAN3 TRANS4, EVID=2 covariate update).
+- **FOCE/FOCEI analytic outer gradients stay enabled for populations that include
+  dosing-only subjects**. Such subjects contribute zero to the marginal objective,
+  so they now return a zero analytic gradient instead of forcing SLSQP/L-BFGS onto
+  the slower fixed-EBE fallback path (#455).
+- **Gradient-based optimizers no longer stall when a few subjects are declined by
+  the analytic outer gradient** (#455). The exact analytic outer gradient was
+  assembled all-or-nothing: a single declined subject — whether structurally out
+  of scope (steady-state + reset, modeled-duration dose, oral infusion under F≠1)
+  or numerically declined (an indefinite per-subject inner Hessian that fails the
+  Cholesky factor in the gradient assembly) — forced the whole population onto the
+  θ-only fixed-EBE fallback, whose biased Ω/σ block left the variance components
+  pinned at their start and stalled `slsqp` / `nlopt_lbfgs` / `mma` / `lbfgs` well
+  above the derivative-free (`bobyqa`) optimum. The non-IOV outer gradient is now
+  assembled per subject — exact analytic for in-scope subjects, a reconverged
+  per-subject finite-difference (carrying the full η̂/Ω/σ EBE response, no PD
+  Hessian required) for the declined ones — so one declined subject no longer
+  disables the exact gradient for the other thousands. On the 5937-subject
+  pediatric Jasmine fit (one subject with an indefinite inner Hessian), default-
+  start FOCEI `slsqp` improves from the previous stalled best OFV 73468 to 66593,
+  while `mma` reaches 66560.68 best-seen — about 21 OFV above the NONMEM reference
+  (66539.38) and below both `bobyqa` (68456 best-seen) and SAEM 500/500 (67377).
 - **Documentation no longer references the retired Enzyme/autodiff installation or
   usage path**, and now describes `gradient = auto` / `gradient = fd` with the
   analytic `Dual2` sensitivity provider (#381).

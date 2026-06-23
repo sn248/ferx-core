@@ -46,20 +46,19 @@ section of the SDLC for the versioning policy).
   — now have analytic gradients on the inner and outer loops. Result-neutral (validated
   against the second-order outer walk and finite differences of the inner objective).
 - **Exact analytic FOCE/FOCEI gradients for ODE models with an estimated lagtime**
-  (#439). User-`[odes]` models with a bare estimated `LAGTIME`/`ALAG` now get the exact
-  analytic outer (θ/Ω/σ) gradient and inner EBE η-gradient instead of finite
-  differences. Lagtime is an *event-time* sensitivity (the dose arrives at
-  `t_dose + lagtime`); it is handled via the time-shift identity
-  `pred(t) = pred₀(t − lag)` ⇒ `∂pred/∂lag = −d(pred)/dt`, applied as an exact
-  per-observation correction (value, gradient, and Hessian) to the dual prediction.
-  Computed **fully analytically — no finite differences** (the one non-parameter-dual
-  piece, the trajectory curvature `J·ẋ`, comes from a directional RHS evaluation). Covers
-  bolus dosing **with and without time-varying covariates** — under TV covariates the
-  equivalent event-time saltation is injected at the dose and propagated through the per-
-  event parameters. Per-compartment `ALAGn`, lagtime + infusion / steady state / reset
-  route to FD as before. Result-neutral — validated against the closed-form analytical
-  twin (full Hessian), the production predictor (incl. TV-cov), and finite differences of
-  the population objective.
+  (#439). User-`[odes]` models with an estimated lagtime — bare `LAGTIME`/`ALAG` **or**
+  compartment-indexed `ALAG{n}` — now get the exact analytic outer (θ/Ω/σ) gradient and
+  inner EBE η-gradient instead of finite differences. Lagtime is an *event-time*
+  sensitivity (the dose arrives at `t_dose + lagtime`); it is handled on the event-driven
+  walk via a per-dose event-time saltation injected at each dose and propagated through
+  the per-event parameters, so it is **exact across occasion / covariate boundaries and
+  for per-compartment (non-uniform) lags** — and **fully analytic, with no finite
+  differences** (the one non-parameter-dual piece, the trajectory curvature `J·ẋ`, comes
+  from a directional RHS evaluation). Composes with **time-varying covariates and IOV**.
+  Lagtime combined with infusion, steady state, or EVID 3/4 reset routes to FD as before.
+  Result-neutral — validated against the closed-form analytical twin (full Hessian), the
+  production predictor (incl. TV-cov and per-compartment `ALAG1`), finite differences of
+  `predict_iov`, and finite differences of the population objective.
 
 ### Performance
 - **Faster analytic time-varying-covariate inner η-gradient + ODE-sensitivity path

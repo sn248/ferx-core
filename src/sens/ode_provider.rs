@@ -135,21 +135,12 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     }
     // (ODE models have no `tv_fn` — typical values come from `pk_param_fn` at
     // η = 0 instead; see `run_subject`.)
-    // Estimated lagtime: a **bare** `LAGTIME`/`ALAG` (one uniform shift for every dose)
-    // IS supported. The dual walk applies each dose at `t_dose + lag.val()`; the
-    // `∂pred/∂lag` sensitivity (value, gradient, and FOCEI Hessian) is added by the
-    // readout time-shift correction (`pred(t) = pred₀(t − lag)` ⇒ `∂pred/∂lag = −dpred/dt`)
-    // in `integrate_subject_duals` — exact for the time-translation-invariant case
-    // enforced per-subject (bolus, no TV covariates / forcing) in `ode_subject_supported`
-    // (#439). A **compartment-indexed** `ALAG{n}` (#369) gives different shifts per dose
-    // compartment, which the single bare `PK_IDX_LAGTIME` shift cannot represent, so it
-    // routes to FD — same handling as indexed `F` below.
-    if model
-        .active_dose_attr_map()
-        .has_indexed_attr(crate::types::DoseAttr::Lag)
-    {
-        return false;
-    }
+    // Estimated lagtime — both **bare** `LAGTIME`/`ALAG` and **compartment-indexed**
+    // `ALAG{n}` (#369) — IS supported. Lagtime is an *event-time* sensitivity (the dose
+    // arrives at `t_dose + lag`); it is handled on the event-driven walk, which applies
+    // the per-dose shift and injects the event-time saltation per dose (so per-compartment
+    // / non-uniform lags are exact). `ode_subject_supported` routes any lagtime subject to
+    // that walk rather than the static superposition walk (#439).
     // Per-compartment bioavailability (`F1`/`F2`, #369): production resolves
     // `f_bio(d.cmt)` per dose compartment, but both the static `integrate_g` and the
     // TV-cov walk apply the single bare `PK_IDX_F` slot, so a compartment-indexed `F`
@@ -226,24 +217,12 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
             return false;
         }
     }
-    // Estimated lagtime is handled only at **bolus** events (the saltation is injected
-    // when the dose is added to a compartment). Lagtime combined with an infusion (the
-    // window start *and* end would shift), steady state, a reset, or built-in absorption
-    // forcing is not yet wired — route those subjects to FD. The common oral-absorption
-    // lag (bolus into a depot) is covered.
+    // Estimated lagtime always routes to the **event-driven** walk (`ode_tvcov_supported`
+    // / `run_subject_tvcov`), where the per-dose event-time saltation handles it exactly
+    // (uniform or per-compartment lags). The static superposition walk here assumes a
+    // single param set with no event-time shift, so it never serves a lagtime subject.
     if model.has_lagtime() {
-        let bolus_only = !subject
-            .doses
-            .iter()
-            .any(crate::ode::predictions::is_real_infusion);
-        let ode_forcing = model
-            .ode_spec
-            .as_ref()
-            .is_some_and(|ode| !ode.input_rate.is_empty());
-        if !bolus_only || subject.has_resets() || subject.doses.iter().any(|d| d.ss) || ode_forcing
-        {
-            return false;
-        }
+        return false;
     }
     true
 }
@@ -256,13 +235,15 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
 /// forcing/SS machinery the dual walk does not yet mirror. Checked by *both* the
 /// outer and inner entry points so the analytic scope stays matched (#439).
 pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> bool {
-    if !ode_analytical_supported(model) || !subject.has_tv_covariates() {
+    // The event-driven walk serves a subject when it has time-varying covariates **or**
+    // an estimated lagtime (which needs the per-dose event-time saltation the static
+    // superposition walk can't do). A subject with neither uses the cheaper static walk.
+    if !ode_analytical_supported(model) || !(subject.has_tv_covariates() || model.has_lagtime()) {
         return false;
     }
-    // Estimated lagtime IS supported here: `integrate_tvcov_g` shifts each dose to
-    // `t_dose + lag` and injects the event-time (saltation) sensitivity, propagated
-    // exactly through the per-event params (#439). (Bare lagtime only — `ode_analytical_supported`
-    // already excludes indexed `ALAGn`; infusion is excluded below.)
+    // Estimated lagtime IS supported here (bare or per-compartment `ALAGn`):
+    // `integrate_tvcov_g` shifts each dose to `t_dose + lag` and injects the event-time
+    // (saltation) sensitivity, propagated exactly through the per-event params (#439).
     // Bound total axes so BOTH TV-cov dispatch tables resolve: the outer
     // `run_subject_tvcov` dispatches `M = n_theta + n_eta` and the inner
     // `run_subject_tvcov_eta` dispatches `n_eta`, each over `1..=MAX_ODE_AXES`. With
@@ -945,16 +926,9 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
         params_dual[slot] = T::var(pk_values[slot], ax);
     }
 
-    // Estimated lagtime: a bare `LAGTIME` shifts every dose to `t_dose + lagtime`. The
-    // gate (`ode_subject_supported`) admits only the bare slot (per-compartment `ALAGn`
-    // and lagtime+infusion/SS/reset are excluded), so a single uniform lagtime dual per
-    // dose carries the value (for the time shift) and `∂lag/∂(θ,η)` (for the saltation
-    // in `integrate_g`). Empty when the model has no lagtime (byte-identical walk).
-    let dose_lag: Vec<T> = if model.has_lagtime() {
-        vec![params_dual[PK_IDX_LAGTIME]; subject.doses.len()]
-    } else {
-        Vec::new()
-    };
+    // (Estimated lagtime never reaches this static superposition walk —
+    // `ode_subject_supported` routes every lagtime subject to the event-driven walk,
+    // where the per-dose event-time saltation handles it.)
     // Bioavailability F scales the dosed amount/rate (NONMEM F·AMT / F·RATE). F
     // lives at PK_IDX_F (pk_param_fn defaults it to 1 when undeclared); when F is an
     // estimated individual parameter, its derivative flows via `params_dual`. Use the
@@ -992,7 +966,6 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
         f_bio,
         init_state,
         first_dose_time,
-        &dose_lag,
         &opts,
     )?;
 
@@ -1001,7 +974,7 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
     // `params_dual`.
     let mut ro_vars: Vec<T> = Vec::new();
     let mut ro_stack: Vec<T> = Vec::new();
-    let mut preds: Vec<T> = states
+    let preds: Vec<T> = states
         .iter()
         .enumerate()
         .map(|(j, st)| {
@@ -1018,98 +991,6 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
         })
         .collect();
 
-    // Estimated-lagtime sensitivity — **fully analytic, no finite differences**. With a
-    // shared bare lagtime and time-translation-invariant dynamics (bolus, no TV
-    // covariates / input-rate forcing — enforced by `ode_subject_supported`), the
-    // trajectory obeys `x(t; p) = x₀(t − lag(p))`, so as a function of the parameter
-    // perturbation `δlag = lag − lag.val()` (value 0),
-    //   `x_corrected = x − ẋ·δlag + ½·ẍ·δlag²`   (`ẋ = g(x)`, `ẍ = dġ/dt = J·g`).
-    // Reading `x_corrected` out through the usual transform (`resolve_obs_readout`) then
-    // gives the full prediction jet **including** `∂pred/∂lag` and its Hessian — the
-    // readout's own nonlinearity (LTBS / scaling / Form-C) is carried by the dual, so no
-    // per-readout derivative is needed. `ẋ` is the exact `Dual2` RHS; the only piece that
-    // is not already a dual over the parameters, `ẍ`, is obtained **exactly** (not by FD)
-    // from one directional RHS evaluation over `Dual1<1>` seeded with the tangent `g`
-    // (`∂/∂ε` of `g(x + εg) = J·g`). `ẍ` enters only through `δlag²` (value 0, zero grad),
-    // so only its value is needed. (Lag-free models skip this entirely.)
-    if model.has_lagtime() {
-        use crate::sens::dual1::Dual1;
-        let lag = params_dual[PK_IDX_LAGTIME];
-        let dlag = lag - T::from_f64(lag.val()); // δlag: value 0, carries ∂lag/∂(θ,η)
-        let half = T::from_f64(0.5);
-        let mut g: Vec<T> = vec![T::from_f64(0.0); ode.n_states];
-        // f64 params as `Dual1<1>` constants for the exact `ẍ = J·g` directional eval.
-        let params_d1: Vec<Dual1<1>> = params_dual
-            .iter()
-            .map(|p| Dual1::constant(p.val()))
-            .collect();
-        let mut d1_vars: Vec<Dual1<1>> = Vec::new();
-        let mut d1_stack: Vec<Dual1<1>> = Vec::new();
-        for (j, st) in states.iter().enumerate() {
-            let t_obs = subject.obs_times[j];
-            // TAD anchor: the latest lagged dose arrival at or before this observation.
-            let anchor = subject
-                .doses
-                .iter()
-                .enumerate()
-                .map(|(k, d)| d.time + dose_lag.get(k).map_or(0.0, |l| l.val()))
-                .filter(|&dt| dt <= t_obs + 1e-12)
-                .fold(f64::NEG_INFINITY, f64::max);
-            // ẋ = g(x) at the observation (exact `Dual2` RHS).
-            eval_rhs_anchored::<T>(
-                program,
-                st,
-                &params_dual,
-                t_obs,
-                first_dose_time,
-                anchor,
-                &mut g,
-                &mut ro_vars,
-                &mut ro_stack,
-            );
-            // ẍ = J·g (value) — exact directional derivative of the RHS along `g`, via a
-            // `Dual1<1>` whose state seed is `x.val` with tangent `g.val` (`∂state/∂ε = g`).
-            let x_tan: Vec<Dual1<1>> = st
-                .iter()
-                .zip(g.iter())
-                .map(|(s, gi)| Dual1 {
-                    value: s.val(),
-                    grad: [gi.val()],
-                })
-                .collect();
-            let mut g_tan: Vec<Dual1<1>> = vec![Dual1::constant(0.0); ode.n_states];
-            eval_rhs_anchored::<Dual1<1>>(
-                program,
-                &x_tan,
-                &params_d1,
-                t_obs,
-                first_dose_time,
-                anchor,
-                &mut g_tan,
-                &mut d1_vars,
-                &mut d1_stack,
-            );
-            // x_corrected = x − ẋ·δlag + ½·ẍ·δlag²  (δlag.value = 0 → value/`∂p_rhs` of
-            // `x` are unchanged; the lag levels are added).
-            let dlag2 = dlag * dlag;
-            let x_corr: Vec<T> = (0..ode.n_states)
-                .map(|c| {
-                    let xddot = T::from_f64(g_tan[c].grad[0]);
-                    st[c] - g[c] * dlag + half * xddot * dlag2
-                })
-                .collect();
-            preds[j] = resolve_obs_readout::<T>(
-                model,
-                ode,
-                subject,
-                &x_corr,
-                j,
-                &params_dual,
-                &mut ro_vars,
-                &mut ro_stack,
-            );
-        }
-    }
     Some(preds)
 }
 
@@ -1467,6 +1348,24 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         .fold(f64::INFINITY, f64::min);
     let init_state: Vec<T> = vec![T::from_f64(0.0); ode.n_states];
 
+    // Per-dose lagtime slot: the bare `PK_IDX_LAGTIME`, or a compartment-indexed
+    // `ALAG{cmt}` slot when declared (#369). Empty when the model has no lagtime (the
+    // walk then skips the dose-time shift / saltation entirely).
+    let dose_lag_slot: Vec<usize> = if model.has_lagtime() {
+        let attr_map = model.active_dose_attr_map();
+        subject
+            .doses
+            .iter()
+            .map(|d| {
+                attr_map
+                    .indexed_slot(crate::types::DoseAttr::Lag, d.cmt)
+                    .unwrap_or(PK_IDX_LAGTIME)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let states = integrate_tvcov_g::<T>(
         program,
         ode.n_states,
@@ -1476,7 +1375,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         &f_bio_at_dose,
         &init_state,
         first_dose_time,
-        model.has_lagtime(),
+        &dose_lag_slot,
         &opts,
     );
 
@@ -2215,7 +2114,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     f_bio_at_dose: &[T],
     init_state: &[T],
     first_dose_time: f64,
-    has_lagtime: bool,
+    dose_lag_slot: &[usize],
     opts: &crate::ode::solver::OdeSolverOptions,
 ) -> Vec<Vec<T>> {
     let n_obs = subject.obs_times.len();
@@ -2236,11 +2135,15 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         "integrate_tvcov_g is bolus-only; the gate must exclude infusion/reset/pk-only"
     );
 
-    // Per-dose lagtime value: dose `k` arrives at `d.time + lag_val(k)`. Empty/zero when
-    // the model has no lagtime (byte-identical to the pre-lag walk).
+    // Per-dose lagtime: dose `k` arrives at `d.time + lag_val(k)`, with its lag read from
+    // `pk_at_dose[k][dose_lag_slot[k]]` — the bare `PK_IDX_LAGTIME` slot or, for a
+    // compartment-indexed `ALAG{cmt}`, that compartment's slot (so per-dose differing lags
+    // are exact). `dose_lag_slot` is empty when the model has no lagtime (byte-identical to
+    // the pre-lag walk).
+    let has_lagtime = !dose_lag_slot.is_empty();
     let lag_val = |k: usize| -> f64 {
         if has_lagtime {
-            pk_at_dose[k][PK_IDX_LAGTIME].val()
+            pk_at_dose[k][dose_lag_slot[k]].val()
         } else {
             0.0
         }
@@ -2321,16 +2224,21 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 let cmt_idx = d.cmt - 1;
                 if cmt_idx < n_states {
                     if has_lagtime {
-                        // Estimated-lagtime event-time saltation. The dose arrives at
-                        // `τ = t_dose + lag`; the sensitivity of the downstream trajectory
-                        // to `lag` is injected here and propagated by the event-driven
-                        // integrator (exact across occasion / covariate boundaries, where
-                        // the static time-shift identity fails):
-                        //   x⁺ += D·δlag + ½·(dD/dt)·δlag²,
-                        // D = g(x⁻) − g(x⁺), dD/dt = J·g(x⁻) − J·g(x⁺). `δlag` has value 0,
-                        // so the f64 value (dose at `t_event`) is unchanged.
+                        // Estimated-lagtime event-time injection. The dose arrives at
+                        // `τ = t_dose + lag`; the corrected post-dose state, as a function
+                        // of `δlag = lag − lag.val()` (value 0), is the pre-dose state time-
+                        // shifted to the true arrival and then flowed back over the fixed
+                        // integration step (`x_inject = Ψ_{−δlag}(x⁻(τ) + Δ)`):
+                        //   x⁺ += D·δlag + (½ẋ̇⁻ + ½ẋ̇⁺ − J⁺·ẋ⁻)·δlag²,
+                        // D = g(x⁻) − g(x⁺), ẋ̇± = J(x±)·g(x±), and the cross term J⁺·ẋ⁻ is
+                        // the post-dose Jacobian applied to the *pre*-dose velocity. The
+                        // integrator then propagates this exactly (across occasion /
+                        // covariate boundaries, where the static time-shift identity fails).
+                        // `δlag` has value 0, so the f64 value (dose at `t_event`) is
+                        // unchanged. (For the first dose `x⁻ = 0`, `g(x⁻) = 0`, so this
+                        // reduces to `−g(x⁺)·δlag + ½ẋ̇⁺·δlag²` — the single-dose time-shift.)
                         let params = &pk_at_dose[idx];
-                        let lag = params[PK_IDX_LAGTIME];
+                        let lag = params[dose_lag_slot[idx]];
                         let dlag = lag - T::from_f64(lag.val());
                         let mut g_minus = vec![T::from_f64(0.0); n_states];
                         eval_rhs_anchored::<T>(
@@ -2385,11 +2293,25 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             &mut d1_vars,
                             &mut d1_stack,
                         );
-                        let half = T::from_f64(0.5);
+                        // Cross term J⁺·ẋ⁻: the post-dose Jacobian applied to the pre-dose
+                        // velocity (directional eval at the post-dose state `u` along `g_minus`).
+                        let jg_cross = jdotg_value::<T>(
+                            program,
+                            n_states,
+                            &u,
+                            &g_minus,
+                            &params_d1,
+                            t_event,
+                            first_dose_time,
+                            t_event,
+                            &mut d1_vars,
+                            &mut d1_stack,
+                        );
                         let dlag2 = dlag * dlag;
                         for c in 0..n_states {
-                            let dd_dt = T::from_f64(jg_minus[c] - jg_plus[c]);
-                            u[c] = u[c] + (g_minus[c] - g_plus[c]) * dlag + half * dd_dt * dlag2;
+                            // δlag² coefficient = ½ẋ̇⁻ + ½ẋ̇⁺ − J⁺·ẋ⁻.
+                            let coef2 = T::from_f64(0.5 * (jg_minus[c] + jg_plus[c]) - jg_cross[c]);
+                            u[c] = u[c] + (g_minus[c] - g_plus[c]) * dlag + coef2 * dlag2;
                         }
                     } else {
                         u[cmt_idx] = u[cmt_idx] + f_bio_at_dose[idx] * T::from_f64(d.amt);
@@ -2427,7 +2349,6 @@ fn obs_time_matches(ot: f64, t: f64) -> bool {
 /// the full outer gradient (value + grad + Hessian), `Dual1<N>` for the light inner
 /// η-gradient (value + grad only) — issue #410.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn integrate_g<T: crate::sens::num::PkNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
@@ -2438,20 +2359,14 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     f_bio: T,
     init_state: &[T],
     first_dose_time: f64,
-    dose_lag: &[T],
     opts: &crate::ode::solver::OdeSolverOptions,
 ) -> Option<Vec<Vec<T>>> {
     let n_obs = subject.obs_times.len();
     let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
     let mut recorded = vec![false; n_obs];
     let mut u = init_state.to_vec();
-
-    // Estimated lagtime shifts each bolus dose's arrival to `t_dose + lag.val()`.
-    // `dose_lag` is the per-dose lagtime dual (empty = no lag → byte-identical to the
-    // pre-lag walk). Only the dose *time* moves here (the value and smooth `∂/∂p_rhs`);
-    // the `∂pred/∂lag` levels are added by the readout time-shift correction in
-    // `integrate_subject_duals` (`PkNum::apply_lag_correction`) (#439 lagtime).
-    let lag_val = |k: usize| -> f64 { dose_lag.get(k).map_or(0.0, |l| l.val()) };
+    // (Estimated lagtime is handled on the event-driven walk, not here — see
+    // `ode_subject_supported`. This static walk applies doses at their record times.)
 
     // Sorted `(obs_time, index)` for O(log n) tolerance lookup at each break time
     // and solver save point, replacing the per-query linear scan over all
@@ -2481,10 +2396,10 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // infusion window (the rate forcing is then constant over a segment).
     let t_last = subject.obs_times.iter().cloned().fold(0.0_f64, f64::max);
     let mut break_times: Vec<f64> = vec![0.0];
-    for (k, dose) in subject.doses.iter().enumerate() {
-        break_times.push(dose.time + lag_val(k));
+    for dose in &subject.doses {
+        break_times.push(dose.time);
         if dose.is_infusion() {
-            break_times.push(dose.time + lag_val(k) + dose.duration);
+            break_times.push(dose.time + dose.duration);
         }
     }
     // EVID 3/4 reset times also break the timeline so the state can be zeroed
@@ -2524,24 +2439,19 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             u.copy_from_slice(init_state);
         }
 
-        // Apply bolus doses (non-infusions) at their (lagged) arrival t_start:
-        // u[cmt] += F·amt. CMT is 1-based; a malformed `CMT=0` must not silently dose
-        // compartment 0 (#449 #8). A compartment fed by a built-in absorption input
-        // rate is skipped here — the dose feeds R_in (the forcing in the RHS below),
-        // not a bolus (#430, mirroring production's `input_rate_consumes_cmt` routing).
-        for (k, dose) in subject.doses.iter().enumerate() {
+        // Apply bolus doses (non-infusions) at t_start: u[cmt] += F·amt. CMT is 1-based;
+        // a malformed `CMT=0` must not silently dose compartment 0 (#449 #8). A compartment
+        // fed by a built-in absorption input rate is skipped here — the dose feeds R_in
+        // (the forcing in the RHS below), not a bolus (#430, mirroring production's
+        // `input_rate_consumes_cmt` routing).
+        for dose in &subject.doses {
             if !dose.is_infusion()
-                && (dose.time + lag_val(k) - t_start).abs() < 1e-12
+                && (dose.time - t_start).abs() < 1e-12
                 && dose.cmt >= 1
                 && !input_rate_consumes_cmt(ode, dose.cmt)
             {
                 let cmt_idx = dose.cmt - 1;
                 if cmt_idx < n_states {
-                    // Estimated lagtime shifts only the dose's *arrival time* here (the
-                    // break/application time is `t_dose + lag.val()`), so the value and
-                    // the smooth `∂/∂p_rhs` are correct. The `∂pred/∂lag` levels are
-                    // added once per observation by the readout time-shift correction in
-                    // `integrate_subject_duals` (`PkNum::apply_lag_correction`).
                     u[cmt_idx] = u[cmt_idx] + f_bio * T::from_f64(dose.amt);
                 }
             }
@@ -2582,13 +2492,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             .map(|d| (d.cmt.saturating_sub(1), d.rate))
             .collect();
 
-        // Last effective dose at or before the segment start, for TAD. Uses the lagged
-        // arrival time `t_dose + lagtime` so TAD = t − (t_dose + lag), matching production.
+        // Last effective dose at or before the segment start, for TAD.
         let last_dose_eff = subject
             .doses
             .iter()
-            .enumerate()
-            .map(|(k, d)| d.time + lag_val(k))
+            .map(|d| d.time)
             .filter(|&dt| dt <= t_start + 1e-12)
             .fold(f64::NEG_INFINITY, f64::max);
 
@@ -2906,6 +2814,54 @@ mod tests {
   ode_abstol = 1e-12
 "#;
 
+    /// **Per-compartment lagtime `ALAG1`.** Lagtime declared as a compartment-indexed
+    /// `ALAG1` (not the bare `LAGTIME` slot) — each dose reads its lag from its own
+    /// compartment's slot (`indexed_slot(Lag, cmt)`), so per-dose differing lags are
+    /// exact. Validates `f`/`∂f/∂η`/`∂f/∂θ` (incl. the `θ_ALAG` column) against the
+    /// production predictor + FD (#439 / #369).
+    const ONECPT_ORAL_ALAG1_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 200.0)
+  theta TVKA(1.2, 0.01, 50.0)
+  theta TVALAG(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  ALAG1 = TVALAG
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    #[test]
+    fn ode_provider_alag1_matches_production() {
+        let model = parse_model_string(ONECPT_ORAL_ALAG1_ODE).expect("parse ALAG1 ODE");
+        assert!(model.has_lagtime());
+        assert!(
+            model
+                .active_dose_attr_map()
+                .has_indexed_attr(crate::types::DoseAttr::Lag),
+            "ALAG1 must be a compartment-indexed lag"
+        );
+        assert!(ode_analytical_supported(&model));
+        let subject = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0]);
+        // θ = [TVCL, TVV, TVKA, TVALAG]; the TVALAG column is the per-compartment lag.
+        check_vs_production(&model, &subject, &[1.0, 10.0, 1.2, 0.4], &[0.1]);
+    }
+
     #[test]
     fn ode_provider_lagtime_matches_production() {
         let model = parse_model_string(ONECPT_ORAL_LAG_ODE).expect("parse oral lag ODE");
@@ -3140,7 +3096,7 @@ mod tests {
     /// gradient would diverge from production's per-compartment `f_bio(cmt)` /
     /// `d.time + lagtime(cmt)`. The gate must decline both to FD (#449 re-review #1, #3).
     #[test]
-    fn ode_analytical_declines_per_compartment_f_and_lag() {
+    fn ode_analytical_declines_per_compartment_f_supports_indexed_lag() {
         const F1_ODE: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -3190,9 +3146,19 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
         let m = parse_model_string(ALAG1_ODE).expect("parse ALAG1");
+        // Compartment-indexed `ALAG1` IS supported now: lagtime is handled on the
+        // event-driven saltation walk, which reads each dose's lag from its own slot
+        // (`indexed_slot(Lag, cmt)`), so per-compartment / per-dose lags are exact (#439).
         assert!(
-            !ode_analytical_supported(&m),
-            "compartment-indexed ALAG1 must decline to FD"
+            ode_analytical_supported(&m),
+            "compartment-indexed ALAG1 is supported (event-time saltation, per-dose lag slot)"
+        );
+        // It routes to the event-driven walk, not the static superposition walk.
+        let subj = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0]);
+        assert!(ode_tvcov_supported(&m, &subj), "ALAG1 → event-driven walk");
+        assert!(
+            !ode_subject_supported(&m, &subj),
+            "ALAG1 not on the static walk"
         );
     }
 
@@ -3769,12 +3735,13 @@ mod tests {
   theta TVLAG(0.5, 0.01, 5.0)
   theta THETA_WT(0.75, 0.01, 5.0)
   omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.05
   sigma PROP_ERR ~ 0.04 (sd)
 [individual_parameters]
   CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
   V  = TVV
   KA = TVKA
-  LAGTIME = TVLAG
+  LAGTIME = TVLAG * exp(ETA_LAG)
 [structural_model]
   ode(states=[depot, central])
 [odes]
@@ -3799,7 +3766,9 @@ mod tests {
             "TV-cov + lagtime supported"
         );
         let theta = vec![1.0, 20.0, 1.2, 0.5, 0.75];
-        let eta = vec![0.1];
+        // η = [ETA_CL, ETA_LAG] — lag carries IIV, so this exercises the ∂²/∂η_LAG²
+        // (event-time saltation 2nd-order) × TV-cov boundary interaction.
+        let eta = vec![0.1, 0.05];
         let sens =
             ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("tvcov+lag supported");
         let pred = |e: &[f64], th: &[f64], j: usize| -> f64 {
@@ -4313,9 +4282,23 @@ mod tests {
             model.has_lagtime(),
             "ALAG1 must enable has_lagtime() (precondition for the gate)"
         );
+        // igd() + lagtime stays on FD: lagtime routes to the event-driven walk, which
+        // carries no `R_in` forcing, while the static walk (which handles igd) declines
+        // lagtime — so neither serves it (#430 finding 1; #439). Both per-subject gates
+        // decline, so `ode_subject_sensitivities` returns `None` → FD.
+        let subj = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0]);
         assert!(
-            !ode_analytical_supported(&model),
-            "igd()+ALAG1 must stay on the FD fallback (#430 finding 1)"
+            !ode_subject_supported(&model, &subj),
+            "igd()+lagtime: static walk declines (lagtime)"
+        );
+        assert!(
+            !ode_tvcov_supported(&model, &subj),
+            "igd()+lagtime: event-driven walk declines (input-rate forcing)"
+        );
+        assert!(
+            ode_subject_sensitivities(&model, &subj, &[5.0, 50.0, 2.0, 0.3, 0.3], &[0.1, -0.05])
+                .is_none(),
+            "igd()+ALAG1 must route to FD"
         );
     }
 }

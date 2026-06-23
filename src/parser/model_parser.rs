@@ -4025,6 +4025,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 parse_usize("min_obs_for_convergence_check")? as u32
         }
         "stagnation_guard" => opts.stagnation_guard = parse_bool("stagnation_guard")?,
+        "ebe_warm_start" => opts.ebe_warm_start = parse_bool("ebe_warm_start")?,
         "inits_from_nca" => {
             use crate::suggest_start::NcaInit;
             opts.inits_from_nca = match value.to_lowercase().as_str() {
@@ -13110,6 +13111,31 @@ mod tests {
                 warnings
             );
             assert!(warnings[0].contains("stagnation_guard"));
+        }
+    }
+
+    #[test]
+    fn test_ebe_warm_start_parses_and_is_framework_key() {
+        // Parses to the bool, defaults to false (opt-in).
+        let opts = parse_fit_options(&[
+            "method = focei".to_string(),
+            "ebe_warm_start = true".to_string(),
+        ])
+        .unwrap();
+        assert!(opts.ebe_warm_start);
+        assert!(!FitOptions::default().ebe_warm_start, "default is off");
+        // Framework key: the inner NM fallback exists under every method, so it
+        // must not warn as unsupported for any of them.
+        for method in ["foce", "focei", "gn", "saem"] {
+            let opts = parse_fit_options(&[
+                format!("method = {method}"),
+                "ebe_warm_start = true".to_string(),
+            ])
+            .unwrap();
+            assert!(
+                opts.unsupported_keys_warnings().is_empty(),
+                "method={method} should accept the framework key ebe_warm_start"
+            );
         }
     }
 

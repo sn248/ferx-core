@@ -65,8 +65,29 @@ section of the SDLC for the versioning policy).
   so the inner EBE loop is exact and replaces FD's `~2·n_eta+1` predictions per step
   with one. Validated against the FD-validated outer `df_deta` (1-/2-/3-cpt, IV/oral,
   steady state).
+- **Light `Dual1` inner η-gradient for analytical PK models** (#491). The inner
+  EBE loop's `∂p/∂η` for analytical 1-/2-/3-cpt models was computed over the full
+  `Dual2<n_theta + n_eta>` (carrying the θ-axes gradient and the second-order
+  Hessian) and then all but the η-block discarded. It now uses the light
+  `Dual1<n_eta>` walk the ODE inner loop already used (#410), seeding η only — so
+  e.g. a 10-θ / 4-η fit drops a `Dual2<14>` (14-vector grad + 14×14 Hessian per
+  op) to a `Dual1<4>`. Converged EBEs and OFV are unchanged (the inner gradient
+  method only affects the path to the mode); validated by the existing
+  analytic-vs-FD inner-gradient tests. Also serves models whose combined
+  `n_theta + n_eta` exceeds the dual dispatch ceiling but whose `n_eta` does not
+  (previously an FD fall-back).
 
 ### Added
+- **Analytic FOCE/FOCEI gradients for compartment-indexed bioavailability
+  (`F1`/`F2`, …) on ODE models** (#486). An ODE model that sets a per-compartment
+  bioavailability now drives the exact analytic outer gradient and light `Dual1`
+  inner η-gradient instead of finite differences: both the static and
+  time-varying-covariate dual walks resolve `F` per dose compartment (the indexed
+  `F{cmt}` slot, else the bare `F`), matching production's `DoseAttrMap::f_bio` and
+  carrying `∂/∂F{cmt}` exactly. Estimates are unchanged; the gradient is exact and
+  cheaper. Validated by an analytic≡production+central-FD parity test (single
+  indexed `F1` with IIV, and distinct `F1`≠`F2` dosed into two compartments).
+  Per-compartment *lag* (`ALAG{cmt}`) stays on FD for now (→ #472).
 - **`ebe_warm_start` fit option** (default `false`, opt-in). When a per-subject
   inner BFGS solve fails and falls back to Nelder–Mead, seed the simplex from the
   BFGS partial η̂ instead of cold-starting from the prior mode η=0. On
@@ -152,6 +173,16 @@ section of the SDLC for the versioning policy).
   the best-seen point instead. The genuine-failure fallback (`Failure` /
   `RoundoffLimited`) is unchanged. Found during the jasmine FOCEI slowness
   investigation.
+- **`optimizer = lbfgs` and `optimizer = bfgs` now select the NLopt L-BFGS**
+  (`nlopt_lbfgs`) instead of the hand-rolled built-in BFGS / limited-memory L-BFGS
+  (#483). Across analytic-gradient FOCEI benchmarks (jasmine, infliximab, uvm) the
+  NLopt path reaches the best OFV and is 3–5× faster than the built-in, which on
+  harder fits diverged (infliximab) or hung with no outer progress (busulfan
+  ODE+IOV). The two keys are now deprecated aliases; the built-in implementation is
+  slated for removal. The NLopt path's accuracy is validated against NONMEM/nlmixr2
+  reference fits on the [Outer Optimizers](docs/estimation/optimizers.qmd) page
+  (e.g. warfarin LTBS OFV −675.302, recovering NONMEM's MLE; `two_cpt_oral_cov`
+  OFV −1197.23 ≈ nlmixr2's −1199.24).
 - **Documentation now builds as a Quarto website** using the shared ferx site
   branding and styling instead of mdBook. Source pages now live under
   `docs/**/*.qmd`, with navigation in `docs/_quarto.yml` (#443).
@@ -174,6 +205,23 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- Simulation, NPDE/NPD diagnostics, and the NCA-init grid sweep now honour
+  time-varying covariate snapshots on dose, observation, and EVID=2 rows instead
+  of using only each subject's baseline covariates (#506). FREM covariate
+  pseudo-observations keep their additive `EPSCOV` error in simulation/NPDE
+  rather than being fed through the PK residual-error model.
+- **TTE simulation now applies administrative right-censoring** (#440). `simulate()`
+  for a `[event_model]` (TTE) endpoint previously emitted *every* drawn event time as
+  an uncensored event, so simulated data could not reproduce a study's censoring
+  pattern (which broke simulation-estimation validation). A subject's administrative
+  observation horizon is now honoured: a draw that reaches it is recorded as
+  right-censored at the horizon (`observed = false`). The horizon is the
+  `ObsRecord::Event` time of a *right-censored* record; an exact-event (or
+  interval-censored) record carries no horizon — its `time` is the event time, not a
+  censoring window — so it draws uncensored rather than being truncated at the
+  realized event time (which would bias re-simulation / VPC). Left-truncated
+  (delayed-entry) subjects draw conditional on survival past entry. Behind the
+  `survival` feature.
 - **Analytic sensitivities and predictions for time-varying covariates with
   intermediate `[individual_parameters]` assignments** (#455, #456). A model whose
   individual-parameter block computes intermediate quantities (e.g.

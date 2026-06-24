@@ -900,8 +900,8 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
 fn run_subject<const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    _theta: &[f64],
+    _eta: &[f64],
     pk_values: &[f64],
     pd: &ParamDerivs,
 ) -> Option<SubjectSens> {
@@ -998,8 +998,8 @@ fn run_subject<const N: usize>(
 fn run_subject_mixed<const NA: usize, const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    _theta: &[f64],
+    _eta: &[f64],
     pk_values: &[f64],
     pd: &ParamDerivs,
     axis_of: &[usize],

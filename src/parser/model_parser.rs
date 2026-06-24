@@ -2120,8 +2120,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Theta/eta indices used in event_model expressions are collected here so
     // that check_unused_parameters (below) can suppress false "not referenced"
     // warnings for parameters that only appear in [event_model].
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut event_model_used_thetas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut event_model_used_etas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
     #[cfg(feature = "survival")]

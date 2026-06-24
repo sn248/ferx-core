@@ -65,6 +65,17 @@ section of the SDLC for the versioning policy).
   so the inner EBE loop is exact and replaces FD's `~2·n_eta+1` predictions per step
   with one. Validated against the FD-validated outer `df_deta` (1-/2-/3-cpt, IV/oral,
   steady state).
+- **Light `Dual1` inner η-gradient for analytical PK models** (#491). The inner
+  EBE loop's `∂p/∂η` for analytical 1-/2-/3-cpt models was computed over the full
+  `Dual2<n_theta + n_eta>` (carrying the θ-axes gradient and the second-order
+  Hessian) and then all but the η-block discarded. It now uses the light
+  `Dual1<n_eta>` walk the ODE inner loop already used (#410), seeding η only — so
+  e.g. a 10-θ / 4-η fit drops a `Dual2<14>` (14-vector grad + 14×14 Hessian per
+  op) to a `Dual1<4>`. Converged EBEs and OFV are unchanged (the inner gradient
+  method only affects the path to the mode); validated by the existing
+  analytic-vs-FD inner-gradient tests. Also serves models whose combined
+  `n_theta + n_eta` exceeds the dual dispatch ceiling but whose `n_eta` does not
+  (previously an FD fall-back).
 
 ### Added
 - **Analytic FOCE/FOCEI gradients for compartment-indexed bioavailability

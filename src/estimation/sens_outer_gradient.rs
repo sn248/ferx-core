@@ -855,6 +855,39 @@ pub fn per_subject_packed_gradients(
         .collect()
 }
 
+/// Per-subject analytic packed gradients for an **IOV** model — the IOV analogue of
+/// [`per_subject_packed_gradients`], exposing `None` per out-of-scope subject (rather than
+/// short-circuiting the whole population like [`population_gradient_sens_iov`]) so the
+/// caller can keep the exact gradient for in-scope subjects and fill the rest with a
+/// per-subject reconverged FD (#466 review round 2). `eta_hats[i]` are the BSV EBEs and
+/// `kappas[i]` the per-occasion κ̂; both are stacked into `[η_bsv, κ₁..κ_K]` per subject.
+pub fn per_subject_packed_gradients_iov(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    interaction: bool,
+) -> Vec<Option<Vec<f64>>> {
+    population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let mut stacked: Vec<f64> = eta_hats[i].iter().copied().collect();
+            for kap in &kappas[i] {
+                stacked.extend(kap.iter().copied());
+            }
+            if interaction {
+                subject_packed_gradient_iov(model, subject, template, x, &stacked)
+            } else {
+                subject_packed_gradient_foce_iov(model, subject, template, x, &stacked)
+            }
+        })
+        .collect()
+}
+
 /// The exact analytic population gradient for an **IOV** model (FOCEI), packed
 /// space, or `None` if any subject is outside the IOV-analytical scope. `eta_hats`
 /// are the per-subject **BSV** EBEs and `kappas[i]` the per-occasion κ̂ for subject

@@ -31,9 +31,14 @@ section of the SDLC for the versioning policy).
   IIV-on-residual-error, survival/TTE, or `n_θ + n_η + K·n_κ > 16`) route to FD as before.
   The inner EBE loop also uses an exact analytic stacked-η gradient (a light first-order
   walk), under the same model-level exclusions as the outer (it shares the
-  `gradient = fd` / escape-hatch / `iiv_on_ruv` / TTE bails).
-  Result-neutral (validated against finite differences of the production predictor and
-  inner objective).
+  `gradient = fd` / escape-hatch / `iiv_on_ruv` / FREM / TTE bails); the IOV outer is
+  assembled per subject (exact analytic where in scope, per-subject reconverged-FD
+  elsewhere), so one out-of-scope subject no longer forces the whole fit onto FD.
+  **NONMEM comparison:** this is a gradient swap on the IOV FOCEI objective that is itself
+  NONMEM-validated — `tests/warfarin_iov_nonmem.rs` (`iov_objective_matches_nonmem`,
+  `iov_individual_cl_matches_nonmem`; OFV within ~0.6 units, all (ID,OCC) CL within 6.6%)
+  and `docs/model-file/iov.qmd`. The analytic gradient is result-neutral against finite
+  differences of that same objective / the production predictor and `predict_iov`.
 - **Exact analytic inner EBE gradient for closed-form IOV models** (#439). The inner
   EBE optimisation for analytical 1-/2-/3-cpt IOV models now uses an exact analytic
   stacked-`[η_bsv, κ₁..κ_K]` gradient (a light first-order event-driven walk) instead of

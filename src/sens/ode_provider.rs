@@ -58,18 +58,25 @@ const _: () = assert!(
 /// individual-parameter program over `Dual2<M>`) is monomorphised.
 const MAX_ODE_AXES: usize = 16;
 
-// The four `disp!(1, 2, …, 16)` dispatch tables keyed on `MAX_ODE_AXES` — the TV-cov
-// `run_subject_tvcov` / `run_subject_tvcov_eta` and the IOV `run_subject_iov` /
-// `run_subject_iov_eta` — enumerate `1..=16` explicitly with a silent `_ => None`. Keep
-// them in lockstep with the const: bumping `MAX_ODE_AXES` without widening all four arms
-// would let an in-scope wider (TV-cov or IOV) model pass the gate, hit `_ => None`, and
-// silently fall back to FD with no error. This compile-time tripwire forces an edit here —
-// and a look at the tables — before the const can change (#438 / #466 review #13).
+// SIX `disp!`/`dispatch_tv!(1, 2, …, 16)` dispatch tables are keyed on `MAX_ODE_AXES` and
+// enumerate `1..=16` explicitly with a silent `_ => None` — they live in the **entry-point
+// callers** (the `run_subject_*<const M>` workers are const-generic and carry no table):
+//   1. `ode_subject_sensitivities`     (TV-cov outer, `dispatch_tv!`)
+//   2. `ode_subject_eta_grad`          (TV-cov inner, `dispatch_tv!`)
+//   3. `param_eta_derivatives`         (`disp!`)
+//   4. `ode_subject_sensitivities_iov` (IOV outer, `disp!`)
+//   5. `ode_subject_eta_grad_iov`      (IOV inner, `disp!`)
+//   6. `param_derivatives_at_cov`      (`disp!`)
+// Keep all six in lockstep with the const: bumping `MAX_ODE_AXES` without widening every
+// arm would let an in-scope wider model pass the gate, hit `_ => None`, and silently fall
+// back to FD with no error. This compile-time tripwire forces an edit here — and a look at
+// all six tables — before the const can change (#438 / #466 review round 1 #13 + round 2).
 const _: () = assert!(
     MAX_ODE_AXES == 16,
-    "MAX_ODE_AXES changed: widen the disp!(1..=16) tables in run_subject_tvcov, \
-     run_subject_tvcov_eta, run_subject_iov, and run_subject_iov_eta to match, then \
-     update this assert"
+    "MAX_ODE_AXES changed: widen the disp!(1..=16) / dispatch_tv!(1..=16) tables in \
+     ode_subject_sensitivities, ode_subject_eta_grad, param_eta_derivatives, \
+     ode_subject_sensitivities_iov, ode_subject_eta_grad_iov, and param_derivatives_at_cov \
+     to match, then update this assert"
 );
 
 /// True when [`ode_subject_sensitivities`] can serve this model: an ODE model
@@ -303,6 +310,20 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // a different function than it minimises. Route IOV+M3 to FD (mirrors
     // `iov_analytical_supported`).
     if matches!(model.bloq_method, crate::types::BloqMethod::M3) {
+        return false;
+    }
+    // IIV on residual error (`iiv_on_ruv`): `η_ruv` scales the variance by `exp(2·η_ruv)`,
+    // which the analytic IOV outer gradient (`subject_packed_gradient_iov`) does not apply —
+    // it would differentiate an unscaled residual variance while the inner loop bails to FD
+    // (`analytic_inner_common_bail`), an inner/outer mismatch. Route to FD until the
+    // variance-scaling analytic gradient lands (#474). (#466 review round 2.)
+    if model.residual_error_eta.is_some() {
+        return false;
+    }
+    // FREM + IOV: the analytic IOV inner gradient never substitutes the FREM covariate
+    // pseudo-obs variance, and the IOV objective returns a `1e18` sentinel for FREM+IOV.
+    // Route to FD. (#466 review round 2.)
+    if model.frem_config.is_some() {
         return false;
     }
     // Readout: state directly, simple Form-C, or per-CMT — same set as the non-IOV gate.
@@ -1636,7 +1657,6 @@ fn run_subject_iov<const M: usize>(
     stacked_eta: &[f64],
     occ_groups: &[(u32, Vec<usize>)],
 ) -> Option<SubjectSens> {
-    use std::collections::HashMap;
     let ode = model.ode_spec.as_ref()?;
     let prog = ode.indiv_param_program.as_ref()?;
     let n_eta = model.n_eta;
@@ -1647,18 +1667,9 @@ fn run_subject_iov<const M: usize>(
     let n_stacked = n_eta + k_groups * n_kappa;
     let cov = &subject.covariates;
 
-    let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(k_groups);
-    for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
-        occ_to_k.insert(*occ_id, k);
-    }
-    let eta_bsv = &stacked_eta[..n_eta];
-    let combined_for = |g: usize| -> Vec<f64> {
-        let mut c = Vec::with_capacity(n_eff);
-        c.extend_from_slice(eta_bsv);
-        let base = n_eta + g * n_kappa;
-        c.extend_from_slice(&stacked_eta[base..base + n_kappa]);
-        c
-    };
+    let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
+    let combined_for =
+        |g: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, g);
 
     // Seed an occasion group's stacked PK duals at a covariate snapshot. `n_rows`
     // matches the program eval's `model.pk_indices`-parallel rows (the convention
@@ -1807,7 +1818,6 @@ fn run_subject_iov_eta<const N: usize>(
     stacked_eta: &[f64],
     occ_groups: &[(u32, Vec<usize>)],
 ) -> Option<Vec<ObsGrad>> {
-    use std::collections::HashMap;
     let ode = model.ode_spec.as_ref()?;
     let prog = ode.indiv_param_program.as_ref()?;
     let n_eta = model.n_eta;
@@ -1818,18 +1828,9 @@ fn run_subject_iov_eta<const N: usize>(
     let n_stacked = n_eta + k_groups * n_kappa;
     let cov = &subject.covariates;
 
-    let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(k_groups);
-    for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
-        occ_to_k.insert(*occ_id, k);
-    }
-    let eta_bsv = &stacked_eta[..n_eta];
-    let combined_for = |g: usize| -> Vec<f64> {
-        let mut c = Vec::with_capacity(n_eff);
-        c.extend_from_slice(eta_bsv);
-        let base = n_eta + g * n_kappa;
-        c.extend_from_slice(&stacked_eta[base..base + n_kappa]);
-        c
-    };
+    let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
+    let combined_for =
+        |g: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, g);
 
     let n_rows = model.pk_indices.len();
     let seed_group_cov =

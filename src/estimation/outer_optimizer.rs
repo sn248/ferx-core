@@ -1873,46 +1873,17 @@ fn reconverged_fd_gradient(
 /// Returns `d(nllᵢ)/dx` (length `x.len()`); the caller scales by 2 and zeroes
 /// fixed coordinates, matching the analytic per-subject convention.
 #[allow(clippy::too_many_arguments)]
-fn subject_reconverged_fd_gradient(
+/// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
+/// coordinates and dropping non-finite differences to zero. Shared by the non-IOV and
+/// IOV per-subject reconverged-FD gradients so the two cannot drift (#466 review round 2).
+fn central_diff_packed(
     x: &[f64],
-    init_params: &ModelParameters,
-    model: &CompiledModel,
-    subject: &Subject,
-    warm_eta: &DVector<f64>,
+    fixed: &[bool],
     bounds: &PackedBounds,
-    options: &FitOptions,
+    eval: impl Fn(&[f64]) -> f64,
 ) -> Vec<f64> {
     let n = x.len();
-    let fixed = packed_fixed_mask(init_params);
     let eps = 1e-4;
-    // Subject marginal NLL at a packed point, re-solving this subject's EBE
-    // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
-    // (`foce_subject_nll`, summed by `pop_nll`); non-finite → NaN so the central
-    // difference below is dropped to zero for that coordinate.
-    let eval = |xv: &[f64]| -> f64 {
-        let params = unpack_params(xv, init_params);
-        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let ebe = find_ebe(
-            model,
-            subject,
-            &params,
-            options.inner_maxiter,
-            options.inner_tol,
-            Some(warm_eta.as_slice()),
-            Some(&mu_k),
-        );
-        crate::stats::likelihood::foce_subject_nll(
-            model,
-            subject,
-            &params.theta,
-            &ebe.eta,
-            &ebe.h_matrix,
-            &params.omega,
-            &params.sigma.values,
-            options.interaction,
-        )
-    };
-
     let mut grad = vec![0.0_f64; n];
     let mut xw = x.to_vec();
     for k in 0..n {
@@ -1937,6 +1908,92 @@ fn subject_reconverged_fd_gradient(
         }
     }
     grad
+}
+
+fn subject_reconverged_fd_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    subject: &Subject,
+    warm_eta: &DVector<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let fixed = packed_fixed_mask(init_params);
+    // Subject marginal NLL at a packed point, re-solving this subject's EBE
+    // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
+    // (`foce_subject_nll`, summed by `pop_nll`); non-finite → NaN so the central
+    // difference drops to zero for that coordinate.
+    let eval = |xv: &[f64]| -> f64 {
+        let params = unpack_params(xv, init_params);
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+        let ebe = find_ebe(
+            model,
+            subject,
+            &params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(warm_eta.as_slice()),
+            Some(&mu_k),
+        );
+        crate::stats::likelihood::foce_subject_nll(
+            model,
+            subject,
+            &params.theta,
+            &ebe.eta,
+            &ebe.h_matrix,
+            &params.omega,
+            &params.sigma.values,
+            options.interaction,
+        )
+    };
+    central_diff_packed(x, &fixed, bounds, eval)
+}
+
+/// Per-subject reconverged-FD packed gradient for an **IOV** subject — the IOV analogue of
+/// [`subject_reconverged_fd_gradient`], used to salvage subjects outside the analytic IOV
+/// scope without dropping the whole population to FD (#466 review round 2). `find_ebe`
+/// dispatches to the IOV joint (η_bsv, κ) EBE for `n_kappa > 0`, and the marginal uses the
+/// IOV objective `foce_subject_nll_iov` (the same one `pop_nll` sums).
+fn subject_reconverged_fd_gradient_iov(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    subject: &Subject,
+    warm_eta: &DVector<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let fixed = packed_fixed_mask(init_params);
+    let eval = |xv: &[f64]| -> f64 {
+        let params = unpack_params(xv, init_params);
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+        let ebe = find_ebe(
+            model,
+            subject,
+            &params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(warm_eta.as_slice()),
+            Some(&mu_k),
+        );
+        crate::stats::likelihood::foce_subject_nll_iov(
+            model,
+            subject,
+            &params.theta,
+            &ebe.eta,
+            &ebe.h_matrix,
+            &params.omega,
+            &params.sigma.values,
+            options.interaction,
+            &ebe.kappas,
+            params
+                .omega_iov
+                .as_ref()
+                .expect("IOV model (n_kappa > 0) has omega_iov"),
+        )
+    };
+    central_diff_packed(x, &fixed, bounds, eval)
 }
 
 /// Non-IOV population gradient assembled **per subject**: the exact analytic
@@ -1977,6 +2034,66 @@ pub(crate) fn population_gradient_sens_mixed(
             Some(g) if g.iter().all(|v| v.is_finite()) => g,
             // Out-of-scope (or non-finite analytic) → reconverged per-subject FD.
             _ => subject_reconverged_fd_gradient(
+                x,
+                init_params,
+                model,
+                &population.subjects[i],
+                &ehs[i],
+                bounds,
+                options,
+            ),
+        })
+        .collect();
+    let mut grad = vec![0.0f64; np];
+    for gi in &filled {
+        for k in 0..np {
+            grad[k] += 2.0 * gi[k];
+        }
+    }
+    let fixed = packed_fixed_mask(init_params);
+    for k in 0..np {
+        if fixed[k] {
+            grad[k] = 0.0;
+        }
+    }
+    grad
+}
+
+/// **IOV** population gradient assembled **per subject** — the IOV analogue of
+/// [`population_gradient_sens_mixed`]: the exact analytic stacked-η / block-Ω gradient for
+/// every in-scope subject, and a per-subject reconverged-FD gradient
+/// ([`subject_reconverged_fd_gradient_iov`]) for any out-of-scope (or non-finite) one.
+/// Replaces the all-or-nothing [`population_gradient_sens_iov`], which dropped the *whole*
+/// population to FD on the first out-of-scope subject — so a single infusion / steady-state
+/// / wide-axis subject no longer forces the entire fit onto FD (#466 review round 2).
+/// Returns the packed `2·Σᵢ dᵢ` with fixed coordinates zeroed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn population_gradient_sens_iov_mixed(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let np = x.len();
+    let per_sub = crate::estimation::sens_outer_gradient::per_subject_packed_gradients_iov(
+        model,
+        population,
+        init_params,
+        x,
+        ehs,
+        kappas,
+        options.interaction,
+    );
+    let filled: Vec<Vec<f64>> = per_sub
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, gi)| match gi {
+            Some(g) if g.iter().all(|v| v.is_finite()) => g,
+            _ => subject_reconverged_fd_gradient_iov(
                 x,
                 init_params,
                 model,
@@ -2169,25 +2286,20 @@ fn population_gradient(
         && (crate::sens::provider::sens_supported(model) || iov_analytic)
     {
         let g = if iov_analytic {
-            if options.interaction {
-                crate::estimation::sens_outer_gradient::population_gradient_sens_iov(
-                    model,
-                    population,
-                    init_params,
-                    x,
-                    ehs,
-                    kappas,
-                )
-            } else {
-                crate::estimation::sens_outer_gradient::population_gradient_sens_foce_iov(
-                    model,
-                    population,
-                    init_params,
-                    x,
-                    ehs,
-                    kappas,
-                )
-            }
+            // Per-subject: exact analytic for in-scope subjects, per-subject reconverged-FD
+            // for out-of-scope ones — always `Some`, mirroring the non-IOV mixed path. A
+            // single out-of-scope subject no longer drops the whole population to FD (and
+            // so the reported `gradient_method` stays accurate) (#466 review round 2).
+            Some(population_gradient_sens_iov_mixed(
+                x,
+                init_params,
+                model,
+                population,
+                ehs,
+                kappas,
+                bounds,
+                options,
+            ))
         } else {
             // Non-IOV: assemble per subject — exact analytic for in-scope
             // subjects, per-subject reconverged-FD for the few out-of-scope ones.

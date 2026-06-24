@@ -622,14 +622,10 @@ fn find_ebe_iov(
     // term the analytic IOV gradient omits). Without these guards a joint IOV +
     // `iiv_on_ruv` / IOV + TTE / `gradient = fd` fit would converge EBEs against an
     // incomplete gradient.
-    #[cfg(feature = "survival")]
-    let subject_has_tte = !subject.obs_records.is_empty();
-    #[cfg(not(feature = "survival"))]
-    let subject_has_tte = false;
     let analytic_iov_inner = crate::sens::provider::iov_sens_supported(model)
         && omega_iov_ref.is_some()
         && !analytic_inner_common_bail(model)
-        && !subject_has_tte;
+        && !subject_has_survival_records(subject);
     let bfgs_converged = if analytic_iov_inner {
         let omega_iov = omega_iov_ref.expect("analytic_iov_inner requires omega_iov");
         let agrad = |p: &[f64]| -> Vec<f64> {
@@ -967,6 +963,23 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
         || model.residual_error_eta.is_some()
 }
 
+/// True when the subject carries survival/TTE observation records, whose hazard-likelihood
+/// term neither analytic inner provider models — both the non-IOV and IOV inner gradients
+/// decline such subjects (a single source so the two cannot drift; #466 review round 2).
+/// Always `false` without the `survival` feature.
+#[inline]
+pub(crate) fn subject_has_survival_records(subject: &Subject) -> bool {
+    #[cfg(feature = "survival")]
+    {
+        !subject.obs_records.is_empty()
+    }
+    #[cfg(not(feature = "survival"))]
+    {
+        let _ = subject;
+        false
+    }
+}
+
 /// Model-level half of [`analytic_inner_grad_supported`]: every gate that does
 /// not depend on the subject. `build_info::gradient_method_inner` reports the
 /// inner route off **this same** predicate, so the reported `gradient_method_inner`
@@ -994,8 +1007,7 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // provider models — the analytical path declines below, and the light ODE walk
     // (`run_subject_eta`) iterates only `subject.obs_times`, so it would silently
     // omit the survival term. Guard both routes up front.
-    #[cfg(feature = "survival")]
-    if !subject.obs_records.is_empty() {
+    if subject_has_survival_records(subject) {
         return false;
     }
     // ODE models use the light `Dual1` inner provider (#410) with their own
@@ -2572,6 +2584,20 @@ mod iov_tests {
         // LTBS forces FD.
         model.log_transform = true;
         assert!(analytic_inner_common_bail(&model));
+        model.log_transform = false;
+
+        // The *outer* IOV gate (`iov_sens_supported`, used by both the outer dispatch and
+        // the inner gate) must also exclude `iiv_on_ruv` and FREM so inner and outer stay
+        // matched — neither runs the analytic gradient on an unscaled / wrong-variance
+        // model (#466 review round 2 #1/#2). A clean IOV model is in scope.
+        assert!(crate::sens::provider::iov_sens_supported(&model));
+        model.residual_error_eta = Some(0);
+        assert!(
+            !crate::sens::provider::iov_sens_supported(&model),
+            "iiv_on_ruv must drop IOV out of analytic scope (inner + outer)"
+        );
+        model.residual_error_eta = None;
+        assert!(crate::sens::provider::iov_sens_supported(&model));
     }
 
     /// Pinning `inner_optimizer` to dense BFGS vs L-BFGS must reach the *same* EBE

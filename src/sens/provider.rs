@@ -502,6 +502,21 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if matches!(model.bloq_method, crate::types::BloqMethod::M3) {
         return false;
     }
+    // IIV on residual error (`iiv_on_ruv`): `η_ruv` enters through the variance
+    // (`v = R(f)·exp(2·η_ruv)`, `∂f/∂η_ruv = 0`), which the analytic IOV gradient assembly
+    // does not scale — it would differentiate an unscaled residual variance, an inner/outer
+    // mismatch (the inner already bails via `analytic_inner_common_bail`). Route to FD until
+    // the variance-scaling analytic gradient lands (#474). (#466 review round 2.)
+    if model.residual_error_eta.is_some() {
+        return false;
+    }
+    // FREM + IOV: the analytic IOV inner gradient uses the ordinary residual variance for
+    // every observation row, never the FREM covariate pseudo-obs variance the objective
+    // (`individual_nll_iov`) uses for those rows; and the IOV objective returns a `1e18`
+    // sentinel for FREM+IOV anyway. Route to FD. (#466 review round 2.)
+    if model.frem_config.is_some() {
+        return false;
+    }
     if !matches!(
         model.pk_model,
         PkModel::OneCptIv
@@ -681,20 +696,11 @@ fn build_iov_sources(
     if stacked_eta.len() != n_stacked {
         return None;
     }
-    let mut occ_to_k: std::collections::HashMap<u32, usize> =
-        std::collections::HashMap::with_capacity(k_groups);
-    for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
-        occ_to_k.insert(*occ_id, k);
-    }
-    // Combined effect vector for group `k`: `[η_bsv, κ_k]`.
+    let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
+    // Combined effect vector for group `k`: `[η_bsv, κ_k]` (shared κ-axis layout).
     let eta_bsv = &stacked_eta[..n_eta];
-    let combined_for = |k: usize| -> Vec<f64> {
-        let mut c = Vec::with_capacity(n_eff);
-        c.extend_from_slice(eta_bsv);
-        let base = n_eta + k * n_kappa;
-        c.extend_from_slice(&stacked_eta[base..base + n_kappa]);
-        c
-    };
+    let combined_for =
+        |k: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, k);
     // EVID=2 (`pk_only`) rows carry no occasion label → BSV η with zero κ (matches
     // production `predict_iov`). Their κ derivatives are dropped from the stacked
     // axes (group `None` below), so the prediction holds κ fixed at 0.

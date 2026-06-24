@@ -9428,13 +9428,25 @@ impl IndivParamProgram {
     /// only ever governed by cov-static conditions, so the decisions — and hence
     /// the returned values — are independent of the η seed used here (#485).
     fn eval_cov_static_f64(&self, theta: &[f64], cov_vec: &[f64]) -> Vec<f64> {
+        use crate::sens::dual2::Dual2;
         let dynamic: Vec<bool> = self.cov_static_mask.iter().map(|&s| !s).collect();
-        let eta_zero = vec![0.0_f64; self.n_eta];
-        let mut vars = vec![0.0_f64; self.n_vars];
-        let mut stack: Vec<f64> = Vec::new();
-        eval_statements_g::<f64>(
+        // Evaluated over a zero-width `Dual2<0>` (no gradient/Hessian axes), NOT
+        // native `f64`: the dual divides via `× recip` and raises powers via the
+        // dual `powd`, both of which differ from `f64::/` / `f64::powf` by up to
+        // 1 ULP. A division-bearing covariate kernel (CKD-EPI, Schwartz
+        // `0.413·HEIGHT/CREAT`, FFM) would otherwise make a folded slot drift ~1
+        // ULP from the unfolded walk. Both `Dual1<M>` and `Dual2<M>` share the
+        // `× recip` division and the same `powd`/`exp`/`ln` value arithmetic, and
+        // the `.value` field is computed independently of the axis count, so a
+        // `Dual2<0>` `.value` is bit-for-bit equal to what either unfolded path
+        // computes for the same slot — keeping the fold exactly identical (#485).
+        let theta_d: Vec<Dual2<0>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
+        let eta_zero = vec![Dual2::<0>::constant(0.0); self.n_eta];
+        let mut vars = vec![Dual2::<0>::constant(0.0); self.n_vars];
+        let mut stack: Vec<Dual2<0>> = Vec::new();
+        eval_statements_g::<Dual2<0>>(
             &self.stmts,
-            theta,
+            &theta_d,
             &eta_zero,
             cov_vec,
             &mut vars,
@@ -9442,7 +9454,7 @@ impl IndivParamProgram {
             &mut stack,
             &dynamic,
         );
-        vars
+        vars.iter().map(|d| d.value).collect()
     }
 
     /// Evaluate the individual parameters over `Dual1<M>` seeded on **η only**
@@ -21330,25 +21342,38 @@ CL V KA WT
   DV ~ proportional(PROP)
 "#;
 
-    /// Deterministic per-call microbenchmark of the cov-static fold on the
-    /// covariate-heavy kernel above. Not a correctness gate — `#[ignore]`d; run:
-    ///   `cargo test --release -p ferx-core cov_static_fold_bench -- --ignored --nocapture`
+    /// #485: bit-identity of the cov-static fold on a covariate-heavy kernel
+    /// (the jasmine-style [`COV_STATIC_BENCH_MODEL`]: a `SEX` branch, an inline
+    /// `if (AGE < 13) … else …` conditional, FFM forward-references, and
+    /// pow/exp/log throughout). A far richer block than `cov_static_fold_fixture`:
+    /// it asserts the fold is bit-for-bit identical to the unfolded walk on every
+    /// dual axis, for both branches of the `SEX` split.
+    ///
+    /// The per-call timing microbenchmark these numbers came from is dev-only
+    /// scaffolding (its figures live in PR #489), so it is not committed as a test.
     #[test]
-    #[ignore = "manual microbenchmark; prints timing"]
-    fn cov_static_fold_bench() {
-        use std::time::Instant;
+    fn cov_static_fold_matches_unfolded_bench_kernel() {
         let model = parse_model_string(COV_STATIC_BENCH_MODEL).expect("bench model compiles");
         let prog = model
             .indiv_param_partials
             .indiv_param_program
             .as_ref()
             .expect("indiv param program");
-        let n_static = prog.cov_static_mask.iter().filter(|&&b| b).count();
-        let n_total = prog.cov_static_mask.len();
+        // The covariate kernel (BMI/FFM/CKDEPI/SCH/EGFR/FCOV/A1/KK) folds; the
+        // free-θ × exp(η) CL/V1 tail does not.
+        assert!(
+            prog.cov_static_mask.iter().any(|&b| b),
+            "expected cov-static slots in the kernel"
+        );
+        assert!(
+            prog.cov_static_mask.iter().any(|&b| !b),
+            "expected the CL/V1 tail to stay dynamic"
+        );
         let theta: Vec<f64> = vec![5.0, 30.0, 0.2];
         assert_eq!(theta.len(), model.n_theta);
-        let eta = vec![0.05_f64; model.n_eta];
-        let cov: HashMap<String, f64> = [
+        let eta = vec![0.05_f64, -0.1_f64];
+        assert_eq!(eta.len(), model.n_eta);
+        let base_cov: HashMap<String, f64> = [
             ("AGE", 4.0),
             ("CREAT", 0.4),
             ("SEX", 1.0),
@@ -21359,42 +21384,39 @@ CL V KA WT
         .map(|(k, v)| (k.to_string(), v))
         .collect();
 
-        const N: usize = 500_000;
-        // n_theta + n_eta = 3 + 2 = 5.
-        let folded_prog = prog.clone();
         let mut unfolded_prog = prog.clone();
         unfolded_prog.cov_static_mask = Vec::new();
 
-        // warm up
-        let _ = folded_prog.eval_param_duals::<5>(&theta, &eta, &cov);
-        let _ = unfolded_prog.eval_param_duals::<5>(&theta, &eta, &cov);
+        // Both arms of the `if (SEX == 0)` split, to fold each FFM branch.
+        for sex in [1.0_f64, 0.0_f64] {
+            let mut cov = base_cov.clone();
+            cov.insert("SEX".to_string(), sex);
 
-        let t0 = Instant::now();
-        let mut acc = 0.0;
-        for _ in 0..N {
-            let p = unfolded_prog.eval_param_duals::<5>(&theta, &eta, &cov);
-            acc += p[0].value;
+            // Dual2 (outer θ,η): n_theta + n_eta = 3 + 2 = 5.
+            let folded2 = prog.eval_param_duals::<5>(&theta, &eta, &cov);
+            let unfolded2 = unfolded_prog.eval_param_duals::<5>(&theta, &eta, &cov);
+            assert_eq!(folded2.len(), unfolded2.len());
+            for (i, (a, b)) in folded2.iter().zip(unfolded2.iter()).enumerate() {
+                assert_eq!(
+                    a.value, b.value,
+                    "SEX={sex} dual2 value mismatch at row {i}"
+                );
+                assert_eq!(a.grad, b.grad, "SEX={sex} dual2 grad mismatch at row {i}");
+                assert_eq!(a.hess, b.hess, "SEX={sex} dual2 hess mismatch at row {i}");
+            }
+
+            // Dual1 (inner η): n_eta = 2.
+            let folded1 = prog.eval_param_eta_grad::<2>(&theta, &eta, &cov);
+            let unfolded1 = unfolded_prog.eval_param_eta_grad::<2>(&theta, &eta, &cov);
+            assert_eq!(folded1.len(), unfolded1.len());
+            for (i, (a, b)) in folded1.iter().zip(unfolded1.iter()).enumerate() {
+                assert_eq!(
+                    a.value, b.value,
+                    "SEX={sex} dual1 value mismatch at row {i}"
+                );
+                assert_eq!(a.grad, b.grad, "SEX={sex} dual1 grad mismatch at row {i}");
+            }
         }
-        let t_unfolded = t0.elapsed();
-
-        let t1 = Instant::now();
-        for _ in 0..N {
-            let p = folded_prog.eval_param_duals::<5>(&theta, &eta, &cov);
-            acc += p[0].value;
-        }
-        let t_folded = t1.elapsed();
-
-        eprintln!(
-            "cov_static_fold_bench: {n_static}/{n_total} slots folded\n  \
-             unfolded: {:?} ({:.3} µs/call)\n  \
-             folded:   {:?} ({:.3} µs/call)\n  \
-             speedup:  {:.2}x   (acc={acc})",
-            t_unfolded,
-            t_unfolded.as_secs_f64() * 1e6 / N as f64,
-            t_folded,
-            t_folded.as_secs_f64() * 1e6 / N as f64,
-            t_unfolded.as_secs_f64() / t_folded.as_secs_f64(),
-        );
     }
 
     #[test]
@@ -21416,5 +21438,206 @@ CL V KA WT
             assert_eq!(a.value, b.value, "value mismatch at row {i}");
             assert_eq!(a.grad, b.grad, "grad mismatch at row {i}");
         }
+    }
+
+    /// #485: exhaustively exercise the cov-static classifier helpers on every
+    /// AST / bytecode arm. The model-driven tests only reach the arms a parsed
+    /// `[individual_parameters]` block happens to emit; hand-built nodes hit the
+    /// rest (NN outputs, `&&`/`||`/`!`, inline conditionals, dynamic var refs).
+    #[test]
+    fn cov_static_classifier_helpers_cover_all_arms() {
+        // dual-axis state: slot 0 dynamic, slot 1 cov-static.
+        let dv = [true, false];
+
+        // ── bytecode_is_dynamic ──
+        let bc = |ops: Vec<Op>| Bytecode {
+            ops,
+            constants: vec![0.0],
+            max_stack: 2,
+        };
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushEta(0)]), &dv));
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushTheta(0)]), &dv));
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushNnOutput(0, 0)]), &dv));
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushVar(0)]), &dv)); // slot 0 dynamic
+        assert!(!bytecode_is_dynamic(&bc(vec![Op::PushVar(1)]), &dv)); // slot 1 static
+        assert!(!bytecode_is_dynamic(
+            &bc(vec![Op::PushCov(0), Op::PushConst(0), Op::Add]),
+            &dv
+        ));
+
+        // ── expr_is_dynamic ──
+        let lit = || Expression::Literal(1.0);
+        assert!(expr_is_dynamic(&Expression::Eta(0), &dv));
+        assert!(expr_is_dynamic(&Expression::Theta(0), &dv));
+        assert!(expr_is_dynamic(
+            &Expression::NnOutput {
+                nn_idx: 0,
+                output_idx: 0
+            },
+            &dv
+        ));
+        assert!(expr_is_dynamic(&Expression::Variable("x".into()), &dv));
+        assert!(expr_is_dynamic(&Expression::VariableIdx(0), &dv)); // dynamic slot
+        assert!(!expr_is_dynamic(&Expression::VariableIdx(1), &dv)); // static slot
+        assert!(!expr_is_dynamic(&lit(), &dv));
+        assert!(!expr_is_dynamic(&Expression::Covariate("WT".into()), &dv));
+        assert!(!expr_is_dynamic(&Expression::CovariateIdx(0), &dv));
+        // BinOp / Power recurse into both operands.
+        assert!(expr_is_dynamic(
+            &Expression::BinOp(Box::new(Expression::Theta(0)), BinOp::Add, Box::new(lit())),
+            &dv
+        ));
+        assert!(!expr_is_dynamic(
+            &Expression::Power(
+                Box::new(Expression::Covariate("WT".into())),
+                Box::new(lit())
+            ),
+            &dv
+        ));
+        // UnaryFn recurses into its argument.
+        assert!(expr_is_dynamic(
+            &Expression::UnaryFn("exp".into(), Box::new(Expression::Eta(0))),
+            &dv
+        ));
+        assert!(!expr_is_dynamic(
+            &Expression::UnaryFn("log".into(), Box::new(lit())),
+            &dv
+        ));
+
+        // ── cond_is_dynamic ──
+        let static_cmp = Condition::Compare(Expression::Covariate("AGE".into()), CmpOp::Lt, lit());
+        let dyn_cmp = Condition::Compare(Expression::Theta(0), CmpOp::Gt, lit());
+        assert!(!cond_is_dynamic(&static_cmp, &dv));
+        assert!(cond_is_dynamic(&dyn_cmp, &dv));
+        assert!(cond_is_dynamic(
+            &Condition::And(Box::new(static_cmp.clone()), Box::new(dyn_cmp.clone())),
+            &dv
+        ));
+        assert!(!cond_is_dynamic(
+            &Condition::Or(Box::new(static_cmp.clone()), Box::new(static_cmp.clone())),
+            &dv
+        ));
+        assert!(cond_is_dynamic(
+            &Condition::Not(Box::new(dyn_cmp.clone())),
+            &dv
+        ));
+        assert!(!cond_is_dynamic(
+            &Condition::Not(Box::new(static_cmp.clone())),
+            &dv
+        ));
+
+        // ── inline conditional (expr_is_dynamic::Conditional) ──
+        assert!(expr_is_dynamic(
+            &Expression::Conditional(
+                Box::new(static_cmp.clone()),
+                Box::new(Expression::Eta(0)), // dynamic `then`
+                Box::new(lit())
+            ),
+            &dv
+        ));
+        assert!(expr_is_dynamic(
+            &Expression::Conditional(
+                Box::new(dyn_cmp.clone()), // dynamic condition
+                Box::new(Expression::Covariate("WT".into())),
+                Box::new(lit())
+            ),
+            &dv
+        ));
+        assert!(!expr_is_dynamic(
+            &Expression::Conditional(
+                Box::new(static_cmp),
+                Box::new(Expression::Covariate("WT".into())),
+                Box::new(lit())
+            ),
+            &dv
+        ));
+    }
+
+    /// #485: `compute_cov_static_mask` corner cases the parsed fixtures don't
+    /// reach — a forward reference (a single pass is insufficient, so the
+    /// monotone fixpoint must re-iterate) and a slot assigned under a dynamic
+    /// `if` condition (covariate-only body, θ-dependent governing condition).
+    #[test]
+    fn cov_static_mask_fixpoint_and_dynamic_if_context() {
+        // slot0 = slot1 + 1   (forward ref — slot1 is assigned *after* slot0)
+        // slot1 = θ0          (dynamic)
+        // A single forward pass marks slot0 static; the fixpoint re-pass flips it.
+        let fwd = vec![
+            // A non-`AssignBc`/`If` statement is ignored by the classifier (the
+            // `_ => {}` arm) — `[individual_parameters]` never emits one, so cover
+            // it here.
+            Statement::Assign("ignored".into(), Expression::Literal(0.0)),
+            Statement::AssignBc(
+                0,
+                Bytecode {
+                    ops: vec![Op::PushVar(1), Op::PushConst(0), Op::Add],
+                    constants: vec![1.0],
+                    max_stack: 2,
+                },
+            ),
+            Statement::AssignBc(
+                1,
+                Bytecode {
+                    ops: vec![Op::PushTheta(0)],
+                    constants: vec![],
+                    max_stack: 1,
+                },
+            ),
+        ];
+        assert_eq!(compute_cov_static_mask(&fwd, 2), vec![false, false]);
+
+        // if (θ0 > 5) { X = WT } else { X = 0 } — covariate/literal bodies, but the
+        // governing condition is dynamic, so X must not fold.
+        let dyn_if = vec![Statement::If {
+            branches: vec![(
+                Condition::Compare(Expression::Theta(0), CmpOp::Gt, Expression::Literal(5.0)),
+                vec![Statement::AssignBc(
+                    0,
+                    Bytecode {
+                        ops: vec![Op::PushCov(0)],
+                        constants: vec![],
+                        max_stack: 1,
+                    },
+                )],
+            )],
+            else_body: Some(vec![Statement::AssignBc(
+                0,
+                Bytecode {
+                    ops: vec![Op::PushConst(0)],
+                    constants: vec![0.0],
+                    max_stack: 1,
+                },
+            )]),
+        }];
+        assert_eq!(compute_cov_static_mask(&dyn_if, 1), vec![false]);
+
+        // Pure-covariate `if`: the slot stays static (static branch of the If arm
+        // + the else_body walk under a non-dynamic governing condition).
+        let stat_if = vec![Statement::If {
+            branches: vec![(
+                Condition::Compare(
+                    Expression::Covariate("AGE".into()),
+                    CmpOp::Lt,
+                    Expression::Literal(13.0),
+                ),
+                vec![Statement::AssignBc(
+                    0,
+                    Bytecode {
+                        ops: vec![Op::PushCov(0)],
+                        constants: vec![],
+                        max_stack: 1,
+                    },
+                )],
+            )],
+            else_body: Some(vec![Statement::AssignBc(
+                0,
+                Bytecode {
+                    ops: vec![Op::PushConst(0)],
+                    constants: vec![1.0],
+                    max_stack: 1,
+                },
+            )]),
+        }];
+        assert_eq!(compute_cov_static_mask(&stat_if, 1), vec![true]);
     }
 }

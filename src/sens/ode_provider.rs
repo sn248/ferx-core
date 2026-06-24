@@ -2033,30 +2033,6 @@ fn eval_rhs_anchored<T: crate::sens::num::PkNum>(
     program.eval_rhs_g::<T>(us, ps, t, tafd, tad, du, vars, stack);
 }
 
-/// Time-varying-covariate event-driven walk over the dual state (#439), the ODE
-/// mirror of the analytical [`super::provider::subject_sensitivities_tvcov`] /
-/// `event_driven_sens_g`. For the **bolus** subset it reproduces production's
-/// `ode_predictions_event_driven`: a merged dose+obs timeline (dose sorts before a
-/// co-timed obs), each segment `[cur_t, t_event]` integrated with the params
-/// evaluated **at** `t_event` (NONMEM end-of-interval), boluses applied after the
-/// segment, and the state captured at each observation. `pk_at_dose` / `pk_at_obs`
-/// are the per-event flat PK-slot duals pre-seeded by the caller on `(θ,η)` (outer)
-/// or `η` (inner); `f_bio_at_dose[k]` is dose `k`'s bioavailability dual. Returns
-/// one state vector per observation (parallel to `subject.obs_times`).
-///
-/// **Deliberately kept separate from [`integrate_g`]** (the #451 fold was assessed
-/// and declined): the two have divergent control flow that can't merge without
-/// either a regression or a net complexity *increase*. Production's static walk
-/// (`ode_predictions`) — which the static dual `integrate_g` must match to 1e-9 —
-/// integrates each break-time segment under **constant** params and records
-/// observations as **in-segment solver save points**. This TV-cov walk instead
-/// switches params at **every event** (NONMEM end-of-interval), so observations
-/// must be **segment boundaries**, not interior save points. Forcing one
-/// obs-handling form onto both would make the static dual diverge from production
-/// (the 1e-9 risk); keeping both behind a mode branch is just two control flows
-/// glued together. The genuinely shareable pieces — `eval_rhs_anchored`,
-/// `resolve_obs_readout`, `solve_ode_g` — are already factored out and used by both.
-#[allow(clippy::too_many_arguments)]
 /// Exact `J·g` (the time-derivative of the velocity, `ẍ = dẋ/dt`) at a state, **value
 /// only**, with no finite differences: one directional RHS evaluation over `Dual1<1>`
 /// whose state seed is `x.val` with tangent `g.val` (so `∂RHS/∂ε|_{x+εg} = J·g`). The
@@ -2129,36 +2105,56 @@ fn inject_rate_saltation<T: crate::sens::num::PkNum>(
     }
     // First-order (D term): u[cmt] += s·Δr·δlag.
     u[cmt_idx] = u[cmt_idx] + T::from_f64(s) * dr * dlag;
-    // Second-order: J·(Δr·e_cmt) — directional RHS derivative along the rate vector.
+    // Second-order: `J·(Δr·e_cmt)` — the exact directional RHS derivative along the rate
+    // vector, via the shared `jdotg_value` primitive (the rate vector has `Δr` in `cmt`,
+    // zero elsewhere). Single-sourced with the bolus-saltation `J·g` evals (#472 review #6).
+    let mut rate_dir = vec![T::from_f64(0.0); n];
+    rate_dir[cmt_idx] = dr;
     let params_d1: Vec<Dual1<1>> = params.iter().map(|p| Dual1::constant(p.val())).collect();
-    let mut x_tan: Vec<Dual1<1>> = u
-        .iter()
-        .map(|x| Dual1 {
-            value: x.val(),
-            grad: [0.0],
-        })
-        .collect();
-    x_tan[cmt_idx].grad[0] = dr.val();
-    let mut out = vec![Dual1::<1>::constant(0.0); n];
-    eval_rhs_anchored::<Dual1<1>>(
+    let jg = jdotg_value::<T>(
         program,
-        &x_tan,
+        n,
+        u,
+        &rate_dir,
         &params_d1,
         t_event,
         first_dose_time,
         anchor,
-        &mut out,
         d1_vars,
         d1_stack,
     );
     let dlag2 = dlag * dlag;
     for (c, uc) in u.iter_mut().enumerate() {
         // δlag² coefficient = −s·½·(J·(Δr·e_cmt))[c].
-        let coef2 = T::from_f64(-s * 0.5 * out[c].grad[0]);
+        let coef2 = T::from_f64(-s * 0.5 * jg[c]);
         *uc = *uc + coef2 * dlag2;
     }
 }
 
+/// Time-varying-covariate event-driven walk over the dual state (#439), the ODE
+/// mirror of the analytical [`super::provider::subject_sensitivities_tvcov`] /
+/// `event_driven_sens_g`. For the **bolus** subset it reproduces production's
+/// `ode_predictions_event_driven`: a merged dose+obs timeline (dose sorts before a
+/// co-timed obs), each segment `[cur_t, t_event]` integrated with the params
+/// evaluated **at** `t_event` (NONMEM end-of-interval), boluses applied after the
+/// segment, and the state captured at each observation. `pk_at_dose` / `pk_at_obs`
+/// are the per-event flat PK-slot duals pre-seeded by the caller on `(θ,η)` (outer)
+/// or `η` (inner); `f_bio_at_dose[k]` is dose `k`'s bioavailability dual. Returns
+/// one state vector per observation (parallel to `subject.obs_times`).
+///
+/// **Deliberately kept separate from [`integrate_g`]** (the #451 fold was assessed
+/// and declined): the two have divergent control flow that can't merge without
+/// either a regression or a net complexity *increase*. Production's static walk
+/// (`ode_predictions`) — which the static dual `integrate_g` must match to 1e-9 —
+/// integrates each break-time segment under **constant** params and records
+/// observations as **in-segment solver save points**. This TV-cov walk instead
+/// switches params at **every event** (NONMEM end-of-interval), so observations
+/// must be **segment boundaries**, not interior save points. Forcing one
+/// obs-handling form onto both would make the static dual diverge from production
+/// (the 1e-9 risk); keeping both behind a mode branch is just two control flows
+/// glued together. The genuinely shareable pieces — `eval_rhs_anchored`,
+/// `resolve_obs_readout`, `solve_ode_g` — are already factored out and used by both.
+///
 /// `has_lagtime`: when true, each dose `k` arrives at `t_dose + pk_at_dose[k][LAGTIME]`
 /// and carries the event-time (saltation) lagtime sensitivity. The time-shift identity
 /// the static walk uses is invalid here (params switch on an absolute occasion/covariate
@@ -2215,8 +2211,16 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     const K_DOSE: u8 = 1;
     const K_OBS: u8 = 3;
     const K_INF_END: u8 = 4;
-    let mut tl: Vec<(f64, u8, usize)> =
-        Vec::with_capacity(subject.doses.len() + n_obs + subject.reset_times.len());
+    // Capacity includes one `K_INF_END` slot per infusion (each dose adds its window-end
+    // event below), matching production's timeline reservation.
+    let n_infusion_ends = subject
+        .doses
+        .iter()
+        .filter(|d| crate::ode::predictions::is_real_infusion(d))
+        .count();
+    let mut tl: Vec<(f64, u8, usize)> = Vec::with_capacity(
+        subject.doses.len() + n_obs + subject.reset_times.len() + n_infusion_ends,
+    );
     for &rt in &subject.reset_times {
         tl.push((rt, K_RESET, 0));
     }
@@ -2255,6 +2259,21 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // `dt <= cur_t` scan.
     let mut last_dose_eff = f64::NEG_INFINITY;
 
+    // Most-recent EVID 3/4 reset time (`NEG_INFINITY` until the first reset). Infusions
+    // whose window started before it are turned off — the reset zeroed the compartments,
+    // and production drops them from the active set the same way (`active_infusions(...
+    // reset_floor)`, predictions.rs). Without this an infusion straddling a reset would
+    // keep adding `F·rate` to the post-reset segments, corrupting `f` and the gradient
+    // (#472 review #1).
+    let mut reset_floor = f64::NEG_INFINITY;
+
+    // Computed once per subject: skip the per-segment active-infusion scan entirely for the
+    // common bolus-only / oral case (#472 review #7).
+    let has_any_infusion = subject
+        .doses
+        .iter()
+        .any(crate::ode::predictions::is_real_infusion);
+
     // Most-recent record's params, used to integrate a segment ending at a **reset**
     // (which carries no PK record — mirrors production's `last_pk`). The first event's
     // segment is empty (`cur_t == tl[0].0`), so this initial value is never read before a
@@ -2278,22 +2297,32 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // forcing `F·rate` to their compartment (the timeline breaks at every window
             // start/end, so a segment is fully inside or outside each window). `F` carries
             // its derivative jet (`f_bio_at_dose[k]`).
-            let active_inf: Vec<(usize, T)> = subject
-                .doses
-                .iter()
-                .enumerate()
-                .filter(|(_, d)| crate::ode::predictions::is_real_infusion(d))
-                .filter(|(k, d)| {
-                    let start = d.time + lag_val(*k);
-                    start <= cur_t + 1e-9 && start + d.duration >= t_event - 1e-9
-                })
-                .map(|(k, d)| {
-                    (
-                        d.cmt.saturating_sub(1),
-                        f_bio_at_dose[k] * T::from_f64(d.rate),
-                    )
-                })
-                .collect();
+            let active_inf: Vec<(usize, T)> = if !has_any_infusion {
+                Vec::new()
+            } else {
+                subject
+                    .doses
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| crate::ode::predictions::is_real_infusion(d))
+                    .filter(|(k, d)| {
+                        let start = d.time + lag_val(*k);
+                        // `start >= reset_floor`: an infusion started before the most recent
+                        // reset is off (#472 review #1) — exact comparison, matching
+                        // production's `active_infusions`. The window epsilon matches
+                        // production's `INFUSION_EPS = 1e-12` (was a looser 1e-9) (#472 #5).
+                        start >= reset_floor
+                            && start <= cur_t + 1e-12
+                            && start + d.duration >= t_event - 1e-12
+                    })
+                    .map(|(k, d)| {
+                        (
+                            d.cmt.saturating_sub(1),
+                            f_bio_at_dose[k] * T::from_f64(d.rate),
+                        )
+                    })
+                    .collect()
+            };
             let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                 eval_rhs_anchored::<T>(
                     program,
@@ -2337,6 +2366,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             let dr = f_bio_at_dose[idx] * T::from_f64(d.rate);
                             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
                             let dlag = lag - T::from_f64(lag.val());
+                            // Anchor the rate-on saltation's `J·g` eval at `t_event`, not
+                            // `last_dose_eff`: this dose has just arrived, so its post-dose
+                            // TAD is 0 (the stale previous-dose anchor gave the wrong TAD to
+                            // a TAD-referencing RHS) (#472 review #4).
                             inject_rate_saltation::<T>(
                                 &mut u,
                                 cmt_idx,
@@ -2347,7 +2380,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 &pk_at_dose[idx],
                                 t_event,
                                 first_dose_time,
-                                last_dose_eff,
+                                t_event,
                                 &mut d1_vars,
                                 &mut d1_stack,
                             );
@@ -2369,6 +2402,17 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         let params = &pk_at_dose[idx];
                         let lag = params[dose_lag_slot[idx]];
                         let dlag = lag - T::from_f64(lag.val());
+                        // TAD anchor for the *pre*-dose velocity `g(x⁻)`: the most recent
+                        // earlier dose. On the first dose `last_dose_eff` is `NEG_INFINITY`,
+                        // which `eval_rhs_anchored` turns into `TAD = NaN` — fine for a
+                        // TAD-independent RHS (the comment's `g(x⁻)=0`), but it poisons the
+                        // saltation for an RHS that references the `TAD` builtin. Fall back
+                        // to `t_event` (TAD=0) so `g_minus` stays finite (#472 review #3).
+                        let pre_anchor = if last_dose_eff.is_finite() {
+                            last_dose_eff
+                        } else {
+                            t_event
+                        };
                         let mut g_minus = vec![T::from_f64(0.0); n_states];
                         eval_rhs_anchored::<T>(
                             program,
@@ -2376,7 +2420,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             params,
                             t_event,
                             first_dose_time,
-                            last_dose_eff,
+                            pre_anchor,
                             &mut g_minus,
                             &mut vars_cell.borrow_mut(),
                             &mut stack_cell.borrow_mut(),
@@ -2406,7 +2450,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             &params_d1,
                             t_event,
                             first_dose_time,
-                            last_dose_eff,
+                            pre_anchor,
                             &mut d1_vars,
                             &mut d1_stack,
                         );
@@ -2457,8 +2501,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         } else if kind == K_INF_END {
             // Infusion window end: the rate turns off (the next segment's `active_inf`
             // excludes it). Not a record — no state change, no `last_params` update. With
-            // lagtime the window's *end* shifts, so inject the rate-off saltation (`s = +1`).
-            if has_lagtime {
+            // lagtime the window's *end* shifts, so inject the rate-off saltation (`s = +1`)
+            // — but only if the infusion is still active: an infusion whose window was cut
+            // off by an intervening EVID 3/4 reset (`start < reset_floor`) was already
+            // turned off, so its rate-off correction must not fire (#472 review #2).
+            if has_lagtime && subject.doses[idx].time + lag_val(idx) >= reset_floor {
                 let d = &subject.doses[idx];
                 if d.cmt >= 1 && d.cmt - 1 < n_states {
                     let dr = f_bio_at_dose[idx] * T::from_f64(d.rate);
@@ -2489,6 +2536,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             for x in u.iter_mut() {
                 *x = T::from_f64(0.0);
             }
+            // Turn off any infusion that started before this reset (matches production's
+            // `reset_floor`) — the active-set filter and the rate-off saltation below both
+            // consult it (#472 review #1/#2).
+            reset_floor = t_event;
         }
     }
     states
@@ -3447,6 +3498,51 @@ mod tests {
         assert!(subject.doses[0].is_infusion() && subject.has_tv_covariates());
         assert!(ode_tvcov_supported(&model, &subject));
         check_vs_production(&model, &subject, &[1.0, 20.0, 0.75], &[0.1]);
+    }
+
+    /// **Infusion straddling an EVID 3/4 reset.** An infusion window `[0, 4]` crossing a
+    /// reset at `t=2` must stop contributing after the reset (the reset zeroes the state and
+    /// turns the infusion off — production's `reset_floor`). If the dual walk kept adding
+    /// `F·rate` to the post-reset segments, the *prediction* (not just the gradient) would
+    /// diverge — the dominant defect this guards (#472 review #1). Post-reset obs (3, 6, 9)
+    /// are the ones that catch it; validated vs production FD.
+    #[test]
+    fn ode_provider_tvcov_infusion_reset_matches_production() {
+        let model = parse_model_string(ONECPT_ODE_TVCOV).expect("parse");
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 9.0]);
+        subject.doses = vec![
+            // Infusion rate 50, amt 200 → 4 h window [0, 4], straddling the reset at t=2.
+            DoseEvent::new(0.0, 200.0, 1, 50.0, false, 0.0),
+            // EVID=4 re-dose (bolus) at the reset.
+            DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.reset_times = vec![2.0];
+        subject.dose_covariates = vec![wt(70.0), wt(70.0)];
+        subject.obs_covariates = vec![wt(60.0), wt(75.0), wt(80.0), wt(85.0)];
+        assert!(subject.doses[0].is_infusion() && subject.has_resets());
+        assert!(ode_tvcov_supported(&model, &subject));
+        check_vs_production(&model, &subject, &[1.0, 20.0, 0.75], &[0.1]);
+    }
+
+    /// **Estimated lagtime + infusion + reset.** Combines the moving infusion window with a
+    /// reset that cuts it off: after the reset the rate-off saltation at the window end must
+    /// *not* fire (the infusion was already stopped), and a post-reset re-dose infusion has
+    /// its own (lagged) window. Full `SubjectSens` vs production FD (#472 review #2).
+    #[test]
+    fn ode_provider_lagtime_infusion_reset_matches_production() {
+        let model = parse_model_string(ONECPT_IV_LAG_INF_ODE).expect("parse lag+inf ODE");
+        let mut subject = bolus_subject(&[2.0, 4.0, 8.0, 12.0]);
+        subject.doses = vec![
+            // Lagged infusion (rate 50, amt 200 → 4 h window) straddling the reset at 5.
+            DoseEvent::new(0.0, 200.0, 1, 50.0, false, 0.0),
+            // Post-reset re-dose infusion.
+            DoseEvent::new(5.0, 100.0, 1, 40.0, false, 0.0),
+        ];
+        subject.reset_times = vec![5.0];
+        assert!(subject.doses[0].is_infusion() && subject.has_resets() && model.has_lagtime());
+        assert!(ode_tvcov_supported(&model, &subject));
+        check_vs_production(&model, &subject, &[1.0, 10.0, 0.5], &[0.1, 0.05]);
     }
 
     /// **Estimated lagtime + infusion.** The infusion *window* `[t+lag, t+lag+dur]` shifts

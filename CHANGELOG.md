@@ -60,7 +60,10 @@ section of the SDLC for the versioning policy).
   state dosing routes to FD (pending the separate SS feature). Result-neutral — validated
   against the closed-form analytical twin (full Hessian), the production predictor (incl.
   TV-cov, `ALAG1`, reset, infusion), and finite differences of `predict_iov` / the
-  population objective.
+  population objective. **NONMEM comparison:** the lagtime semantics this differentiates
+  (dose/absorption shifted to `t_dose + ALAG`) are the production predictor's, validated
+  against NONMEM in `docs/model-file/lagtime.qmd` (NONMEM equivalence); the analytic
+  gradient is the exact derivative of that NONMEM-matching prediction (FD-confirmed).
 - **Event-driven analytic ODE sensitivities now cover EVID 3/4 resets and finite-duration
   infusions** (#439). The TV-covariate / IOV event-driven sensitivity walk previously
   declined subjects with a reset or an infusion (→ finite differences); it now zeros the

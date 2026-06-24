@@ -65,6 +65,20 @@ section of the SDLC for the versioning policy).
   so the inner EBE loop is exact and replaces FD's `~2·n_eta+1` predictions per step
   with one. Validated against the FD-validated outer `df_deta` (1-/2-/3-cpt, IV/oral,
   steady state).
+- **Constant-fold covariate-only individual-parameter sub-expressions in the
+  analytic sensitivity walks** (#485). The `[individual_parameters]` block is
+  re-evaluated on every inner-EBE and outer-gradient step; for covariate-heavy
+  models its covariate-only prefix (e.g. CKD-EPI / Schwartz / FFM / maturation —
+  often the bulk of the `pow`/`exp`/`log` work) does not depend on θ or η, yet was
+  carried through `Dual2`/`Dual1` arithmetic (gradient + Hessian per operation)
+  every call. The parser now classifies those slots once at compile time and the
+  `Dual2`/`Dual1` providers evaluate them once in plain `f64` and seed them as
+  dual constants, skipping the redundant dual re-derivation. Numerically identical
+  (bit-for-bit gradients and Hessians); only θ/η-free slots are folded, so all
+  dual axes — including `∂/∂θ_fixed` — are preserved. On a jasmine-style
+  covariate kernel (8/10 slots foldable) this is ~1.7× faster per `Dual2`
+  individual-parameter evaluation. Found while profiling the jasmine
+  vancomycin-pediatrics FOCEI fit.
 - **Light `Dual1` inner η-gradient for analytical PK models** (#491). The inner
   EBE loop's `∂p/∂η` for analytical 1-/2-/3-cpt models was computed over the full
   `Dual2<n_theta + n_eta>` (carrying the θ-axes gradient and the second-order

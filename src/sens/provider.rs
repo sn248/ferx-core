@@ -1537,8 +1537,14 @@ fn subject_eta_grad_impl(
         .as_ref()
         .filter(|prog| prog_covers_required_pk_slots(model, prog))
         .and_then(|prog| {
-            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
-                .map(|pd| (pd.dp_deta, prog.pk_slots()))
+            // Light `Dual1<n_eta>` η-gradient: the inner EBE loop consumes only
+            // `∂p/∂η`, so seeding η alone avoids the θ-axes and second-order
+            // Hessian the full `Dual2` `param_derivatives_from_prog` carries (#485
+            // follow-up).
+            crate::sens::ode_provider::param_eta_derivatives_from_prog(
+                prog, model, subject, theta, eta,
+            )
+            .map(|dp_deta| (dp_deta, prog.pk_slots()))
         }) {
         Some(v) => v,
         None => {

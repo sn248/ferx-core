@@ -58,6 +58,20 @@ const _: () = assert!(
 /// individual-parameter program over `Dual2<M>`) is monomorphised.
 const MAX_ODE_AXES: usize = 16;
 
+// The four `disp!(1, 2, …, 16)` dispatch tables keyed on `MAX_ODE_AXES` — the TV-cov
+// `run_subject_tvcov` / `run_subject_tvcov_eta` and the IOV `run_subject_iov` /
+// `run_subject_iov_eta` — enumerate `1..=16` explicitly with a silent `_ => None`. Keep
+// them in lockstep with the const: bumping `MAX_ODE_AXES` without widening all four arms
+// would let an in-scope wider (TV-cov or IOV) model pass the gate, hit `_ => None`, and
+// silently fall back to FD with no error. This compile-time tripwire forces an edit here —
+// and a look at the tables — before the const can change (#438 / #466 review #13).
+const _: () = assert!(
+    MAX_ODE_AXES == 16,
+    "MAX_ODE_AXES changed: widen the disp!(1..=16) tables in run_subject_tvcov, \
+     run_subject_tvcov_eta, run_subject_iov, and run_subject_iov_eta to match, then \
+     update this assert"
+);
+
 /// True when [`ode_subject_sensitivities`] can serve this model: an ODE model
 /// with a compiled RHS program, single `ObsCmt` readout, no built-in absorption,
 /// no `init(...)`, no IOV/SDE, no output transform, and an individual-parameter

@@ -25,11 +25,13 @@ section of the SDLC for the versioning policy).
   analytic outer (θ/Ω/σ) gradient over the stacked `[η_bsv, κ₁..κ_K]` random effects,
   via the event-driven `Dual2` walk seeded with per-occasion κ axes (the same walk the
   time-varying-covariate path uses, fed per-occasion parameters). Previously these fell
-  back to finite differences. First cut covers bolus dosing with static covariates;
-  out-of-scope subjects (infusion, steady state, resets, lagtime, scaling/LTBS, or
-  `n_θ + n_η + K·n_κ > 16`) route to FD as before. Time-varying covariates are
-  supported (each event is seeded at its own occasion × covariate snapshot). The inner
-  EBE loop also uses an exact analytic stacked-η gradient (a light first-order walk).
+  back to finite differences. First cut covers bolus dosing, **with or without
+  time-varying covariates** (each event is seeded at its own occasion × covariate
+  snapshot); out-of-scope subjects (infusion, steady state, resets, lagtime, scaling/LTBS,
+  IIV-on-residual-error, survival/TTE, or `n_θ + n_η + K·n_κ > 16`) route to FD as before.
+  The inner EBE loop also uses an exact analytic stacked-η gradient (a light first-order
+  walk), under the same model-level exclusions as the outer (it shares the
+  `gradient = fd` / escape-hatch / `iiv_on_ruv` / TTE bails).
   Result-neutral (validated against finite differences of the production predictor and
   inner objective).
 - **Exact analytic inner EBE gradient for closed-form IOV models** (#439). The inner

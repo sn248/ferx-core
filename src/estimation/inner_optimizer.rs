@@ -615,8 +615,21 @@ fn find_ebe_iov(
     // Covers both the ODE IOV provider (RHS-program models) and the closed-form
     // analytical IOV provider — both now expose an analytic stacked-η inner gradient
     // via `subject_eta_grad_iov`.
-    let analytic_iov_inner =
-        crate::sens::provider::iov_sens_supported(model) && omega_iov_ref.is_some();
+    // Mirror the non-IOV inner bails (#466 review #1/#2/#3): the IOV `Dual2`/`Dual1`
+    // kernels share the same limitations, so route to the FD inner loop when the model
+    // hits a common bail (escape hatch, `gradient = fd`, SDE, LTBS, ExpressionScale, or
+    // IIV on residual error) or the subject carries survival/TTE records (whose hazard
+    // term the analytic IOV gradient omits). Without these guards a joint IOV +
+    // `iiv_on_ruv` / IOV + TTE / `gradient = fd` fit would converge EBEs against an
+    // incomplete gradient.
+    #[cfg(feature = "survival")]
+    let subject_has_tte = !subject.obs_records.is_empty();
+    #[cfg(not(feature = "survival"))]
+    let subject_has_tte = false;
+    let analytic_iov_inner = crate::sens::provider::iov_sens_supported(model)
+        && omega_iov_ref.is_some()
+        && !analytic_inner_common_bail(model)
+        && !subject_has_tte;
     let bfgs_converged = if analytic_iov_inner {
         let omega_iov = omega_iov_ref.expect("analytic_iov_inner requires omega_iov");
         let agrad = |p: &[f64]| -> Vec<f64> {
@@ -689,6 +702,10 @@ fn find_ebe_iov(
                         h[(j, k)] = obs.df_deta[k];
                     }
                 }
+                // Match the FD path: FREM covariate pseudo-obs rows carry the exact {0,1}
+                // Jacobian, which the provider's PK-prediction sensitivity does not emit
+                // (#466 review #9).
+                overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
                 h
             }
             None => {
@@ -747,21 +764,37 @@ fn compute_jacobian_fd_iov(
     }
 
     // Overwrite FREM pseudo-observation rows with exact analytical Jacobian.
-    if let Some(ref fc) = model.frem_config {
-        if !subject.fremtype.is_empty() {
-            for (i, &ft) in subject.fremtype.iter().enumerate() {
-                if ft > 0 {
-                    if let Some(&(_theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
-                        for j in 0..n_eta {
-                            h[(i, j)] = if j == eta_idx { 1.0 } else { 0.0 };
-                        }
-                    }
+    overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
+
+    h
+}
+
+/// Overwrite FREM covariate pseudo-observation rows of an `n_obs × n_eta` BSV H-matrix
+/// with their exact `{0, 1}` Jacobian (`∂(pseudo-obs)/∂η_k = δ_{k, eta_idx}`). Applied to
+/// both the FD and the analytic IOV H-matrix so the analytic branch does not silently drop
+/// the correction the FD path performs (#466 review #9). No-op when the model isn't FREM
+/// or the subject carries no pseudo-obs rows.
+fn overwrite_frem_pseudo_obs_rows(
+    h: &mut DMatrix<f64>,
+    model: &CompiledModel,
+    subject: &Subject,
+    n_eta: usize,
+) {
+    let Some(ref fc) = model.frem_config else {
+        return;
+    };
+    if subject.fremtype.is_empty() {
+        return;
+    }
+    for (i, &ft) in subject.fremtype.iter().enumerate() {
+        if ft > 0 {
+            if let Some(&(_theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
+                for j in 0..n_eta {
+                    h[(i, j)] = if j == eta_idx { 1.0 } else { 0.0 };
                 }
             }
         }
     }
-
-    h
 }
 
 /// BFGS minimization with backtracking line search.
@@ -913,47 +946,38 @@ pub fn profile_report() {
     }
 }
 
+/// The model-level inner-gradient bails that are independent of which analytic inner
+/// provider (non-IOV analytical, non-IOV ODE `Dual1`, or IOV) will serve the model.
+/// Returns `true` when the model must use the **FD** inner gradient regardless: the
+/// escape hatch / A-B toggle, an explicit `gradient = fd`, SDE diffusion, LTBS, an
+/// eta-dependent `ExpressionScale` obs_scale, or IIV on residual error (`iiv_on_ruv`,
+/// whose `exp(2·η_ruv)` variance scaling none of the `Dual2`/`Dual1` kernels carry).
+/// Every analytic inner path consults this so none of them can run on a model that one
+/// of these reasons routes to FD — including the IOV inner loop, which previously dropped
+/// these exclusions (#466 review #1/#3).
+pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
+    no_analytic_inner_forced()
+        || matches!(model.gradient_method, GradientMethod::Fd)
+        || model.is_sde()
+        || model.log_transform
+        || matches!(
+            model.scaling,
+            crate::types::ScalingSpec::ExpressionScale { .. }
+        )
+        || model.residual_error_eta.is_some()
+}
+
 /// Model-level half of [`analytic_inner_grad_supported`]: every gate that does
 /// not depend on the subject. `build_info::gradient_method_inner` reports the
 /// inner route off **this same** predicate, so the reported `gradient_method_inner`
 /// cannot drift from what `find_ebe` actually runs (PR #381 review #9).
 pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool {
-    // Escape hatch / A-B toggle: force the FD inner gradient everywhere.
-    if no_analytic_inner_forced() {
-        return false;
-    }
-    // The user explicitly requested finite differences.
-    if matches!(model.gradient_method, GradientMethod::Fd) {
-        return false;
-    }
-    if model.is_sde() {
-        return false;
-    }
-    // LTBS keeps the FD inner gradient. The provider's generic closed forms and
-    // the objective's `compute_predictions` agree only to ~1e-9, and the LTBS
-    // `g = ln(f)` wrap with a small additive-on-log σ amplifies that mismatch in
-    // the covariance OFV second-difference Hessian (the analytic-EBE minimum sits
-    // ~1e-9 off the objective's, enough to corrupt the curvature and inflate the
-    // SEs ~5×). FD reconverges the *objective's* own EBE, so the Hessian stays
-    // clean. The analytic *outer* gradient still serves LTBS (the fit matches
-    // NONMEM); only the inner EBE finder reverts here.
-    if model.log_transform {
-        return false;
-    }
-    // `ExpressionScale` keeps the FD inner gradient (the light provider doesn't
-    // carry the scale quotient-rule); the analytic *outer* gradient still serves
-    // it. Mirrors the LTBS choice above.
-    if matches!(
-        model.scaling,
-        crate::types::ScalingSpec::ExpressionScale { .. }
-    ) {
-        return false;
-    }
-    // IIV on residual error (#409): the Dual2 kernels build the residual variance
-    // from σ alone and carry no `exp(2·η_ruv)` scaling rule, so the EBE search
-    // must reconverge against the scaled `individual_nll` under FD (same reason as
-    // `analytical_ad_unsupported`).
-    if model.residual_error_eta.is_some() {
+    // Escape hatch, explicit `gradient = fd`, SDE, LTBS, `ExpressionScale` obs_scale,
+    // and IIV on residual error all force the FD inner gradient (see
+    // `analytic_inner_common_bail` for the per-reason rationale). LTBS and
+    // `ExpressionScale` still get the analytic *outer* gradient; only the inner EBE
+    // finder reverts.
+    if analytic_inner_common_bail(model) {
         return false;
     }
     crate::sens::provider::analytical_supported(model)
@@ -987,12 +1011,7 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     //     is likely benign, but that is unmeasured — decline until a cov-SE test on
     //     an LTBS ODE model validates it (#438 review).
     if model.ode_spec.is_some() {
-        if no_analytic_inner_forced()
-            || matches!(model.gradient_method, GradientMethod::Fd)
-            || model.is_sde()
-            || model.residual_error_eta.is_some()
-            || model.log_transform
-        {
+        if analytic_inner_common_bail(model) {
             return false;
         }
         return crate::sens::provider::ode_inner_grad_supported(model, subject);
@@ -1035,6 +1054,18 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
 /// row's contribution to `∂nll/∂η_k`. `h = φ(z)/Φ(z)` is the inverse Mills ratio,
 /// evaluated through logs so it stays finite in the far tail (`Φ(z)→0` when the
 /// prediction sits well above the LLOQ).
+/// `∂/∂f` of the (uncensored) Gaussian per-observation data term `½ log v + ½ ε²/v`
+/// (`ε = y − f`, `v` the residual variance, `dv_df = ∂v/∂f`). Multiplying by `∂f/∂η`
+/// gives that observation's contribution to the conditional-NLL η-gradient. Shared by the
+/// non-IOV ([`analytic_eta_nll_gradient_with_schedule`]) and IOV
+/// ([`analytic_eta_nll_gradient_iov`]) inner gradients so the two cannot silently diverge
+/// (#466 review #10).
+#[inline]
+fn obs_gaussian_dterm_coef(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
+    let eps = y - f;
+    -eps / v + 0.5 * dv_df * (1.0 / v - eps * eps / (v * v))
+}
+
 #[inline]
 fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
     let sqrt_v = v.sqrt();
@@ -1097,8 +1128,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         let coef = if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
             m3_censored_dterm_df(y, f, v, dv_df)
         } else {
-            let eps = y - f;
-            -eps / v + 0.5 * dv_df * (1.0 / v - eps * eps / (v * v))
+            obs_gaussian_dterm_coef(y, f, v, dv_df)
         };
         for k in 0..n_eta {
             grad[k] += coef * obs.df_deta[k];
@@ -1149,8 +1179,10 @@ fn analytic_eta_nll_gradient_iov(
             return None;
         }
         let dv_df = model.error_spec.dvar_df(cmt, f, sigma);
-        let eps = y - f;
-        let coef = -eps / v + 0.5 * dv_df * (1.0 / v - eps * eps / (v * v));
+        // NOTE: IOV currently has no M3 censored branch here (the IOV objective promotes
+        // M3 to the marginal elsewhere); the uncensored Gaussian coefficient is shared
+        // with the non-IOV inner via `obs_gaussian_dterm_coef` so they cannot drift.
+        let coef = obs_gaussian_dterm_coef(y, f, v, dv_df);
         for (p, g) in grad.iter_mut().enumerate() {
             *g += coef * obs.df_deta[p];
         }
@@ -2510,6 +2542,36 @@ mod iov_tests {
             let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
             approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
         }
+    }
+
+    /// The IOV inner loop must honour the same model-level FD bails as the non-IOV inner
+    /// (#466 review #1/#3): `gradient = fd` / escape hatch, IIV-on-residual-error
+    /// (`iiv_on_ruv`), LTBS, and `ExpressionScale` all force the FD inner gradient — the
+    /// shared `analytic_inner_common_bail` gate `find_ebe_iov` now consults. Without it an
+    /// IOV + `iiv_on_ruv` fit would build the inner gradient on an unscaled residual
+    /// variance, and `gradient = fd` would silently fail to disable the analytic inner.
+    #[test]
+    fn iov_inner_honours_common_bails() {
+        use crate::parser::model_parser::parse_model_string;
+        let mut model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+        // Clean IOV model: no common bail → analytic inner runs.
+        assert!(!analytic_inner_common_bail(&model));
+        // `gradient = fd` (and the escape hatch) force FD (#466 review #3).
+        model.gradient_method = GradientMethod::Fd;
+        assert!(analytic_inner_common_bail(&model));
+        model.gradient_method = GradientMethod::default();
+        assert!(!analytic_inner_common_bail(&model));
+        // IIV on residual error forces FD — the kernels carry no `exp(2·η_ruv)` scaling
+        // (#466 review #1).
+        model.residual_error_eta = Some(0);
+        assert!(analytic_inner_common_bail(&model));
+        model.residual_error_eta = None;
+        // LTBS forces FD.
+        model.log_transform = true;
+        assert!(analytic_inner_common_bail(&model));
     }
 
     /// Pinning `inner_optimizer` to dense BFGS vs L-BFGS must reach the *same* EBE

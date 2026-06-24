@@ -76,7 +76,7 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 ///
 /// For a gradient-driven FOCE/FOCEI fit the outer optimiser uses the **exact
 /// analytic** packed gradient when the model is in the sensitivity provider's
-/// scope (`sens_supported` / `iov_analytical_supported`) and the user did not
+/// scope (`sens_supported` / `iov_sens_supported`) and the user did not
 /// force FD — mirroring the live dispatch in `outer_optimizer` (PR #381 review
 /// #4), so the report tracks the headline feature instead of always reading
 /// "finite differences". Otherwise:
@@ -110,9 +110,13 @@ pub fn gradient_method_outer(
             | Optimizer::Mma
             | Optimizer::TrustRegion => {
                 let user_forces_fd = matches!(model.gradient_method, GradientMethod::Fd);
+                // Mirror the live outer dispatch (`outer_optimizer.rs`), which gates the
+                // analytic IOV outer gradient on `iov_sens_supported` (it admits ODE IOV
+                // models too, not just the closed-form `iov_analytical_supported`); so the
+                // reported `gradient_method` tracks what the fit actually runs (#466 review #4).
                 let analytic = !user_forces_fd
                     && (crate::sens::provider::sens_supported(model)
-                        || crate::sens::provider::iov_analytical_supported(model));
+                        || crate::sens::provider::iov_sens_supported(model));
                 if analytic {
                     GradientMethodKind::Analytic
                 } else {

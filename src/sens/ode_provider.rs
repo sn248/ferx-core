@@ -1512,6 +1512,19 @@ fn ode_iov_subject_supported(
     if k_groups == 0 {
         return None;
     }
+    // Every dose's occasion must have a κ group, i.e. appear among the observation
+    // occasions. The stacked vector is `[η_bsv, κ₁..κ_K]` with `K = obs-occasions`, so a
+    // dose in an occasion with no sampled observations has no κ axis — `seed_iov_events`
+    // would `occ_to_k.get(dose_occ) == None` and abort the subject mid-walk. Decline up
+    // front so the subject routes to FD *explicitly* (honest scope, accurate
+    // `gradient_method`) rather than via a silent inner `?` (#466 review round 3 #1).
+    if subject
+        .dose_occasions
+        .iter()
+        .any(|d_occ| !occ_groups.iter().any(|(occ, _)| occ == d_occ))
+    {
+        return None;
+    }
     let n_stacked = model.n_eta + k_groups * model.n_kappa;
     // Stacked dual width `M = n_theta + n_eta + K·n_kappa`. Bounded here (per subject,
     // since `K` is per subject) so a many-occasion subject routes to FD rather than a

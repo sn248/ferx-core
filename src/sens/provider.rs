@@ -545,9 +545,9 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
 /// True when the exact analytic IOV outer gradient applies to this model: either the
 /// closed-form analytical IOV provider ([`iov_analytical_supported`]) or the ODE IOV
 /// provider ([`crate::sens::ode_provider::ode_iov_supported`]). Gates the IOV branch
-/// of the outer-gradient dispatch (`population_gradient_sens_iov` /
-/// `population_gradient_sens_foce_iov`), the IOV analogue of [`sens_supported`]
-/// (#439 ODE IOV).
+/// of the outer-gradient dispatch (`population_gradient_sens_iov_mixed`, which assembles
+/// per subject with per-subject reconverged-FD salvage), the IOV analogue of
+/// [`sens_supported`] (#439 ODE IOV).
 pub fn iov_sens_supported(model: &CompiledModel) -> bool {
     iov_analytical_supported(model)
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_iov_supported(model))
@@ -4721,6 +4721,31 @@ mod tests {
         let subject = iov_subject();
         // stacked = [η_cl, η_v, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
         check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
+    }
+
+    /// A dose in an occasion that carries no sampled observations has no κ axis in the
+    /// stacked `[η_bsv, κ₁..κ_K]` vector (`K` counts observation occasions), so the ODE IOV
+    /// provider must decline the subject **up front** — routing it to FD explicitly rather
+    /// than aborting mid-walk on `occ_to_k.get(dose_occ) == None` (#466 review round 3 #1).
+    #[test]
+    fn ode_iov_dose_in_obs_free_occasion_declines_to_fd() {
+        let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        let mut subject = iov_subject();
+        // Add a dose in occasion 3, which has no observations (obs occasions are {1, 2}).
+        subject
+            .doses
+            .push(DoseEvent::new(48.0, 100.0, 1, 0.0, false, 0.0));
+        subject.dose_occasions.push(3);
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model,
+                &subject,
+                &[0.2, 10.0],
+                &[0.12, -0.08, 0.05, -0.10]
+            )
+            .is_none(),
+            "dose in an obs-free occasion must decline (→ FD), not abort mid-walk"
+        );
     }
 
     /// 1-cpt IV IOV `[odes]` model with a WT covariate on CL (`(WT/70)^θ_WT`) under

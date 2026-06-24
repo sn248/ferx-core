@@ -1862,17 +1862,6 @@ fn reconverged_fd_gradient(
     grad
 }
 
-/// Central-FD per-subject packed gradient `dᵢ = d(nllᵢ)/dx` that **re-converges
-/// that one subject's EBE** (warm-started) at every perturbed point. The single-
-/// subject analog of [`reconverged_fd_gradient`], used to fill the handful of
-/// subjects the analytic provider can't handle (SS+reset, time-varying
-/// covariates, modeled-duration doses, EVID=2 reset) inside the otherwise-exact
-/// analytic population gradient. Because the EBEs are re-solved at each ±h, the
-/// Ω/σ EBE-response is included — the term the θ-only fixed-EBE fallback drops,
-/// whose absence stalled the gradient optimizers (focei-slsqp-fixed-ebe-gradient-bias).
-/// Returns `d(nllᵢ)/dx` (length `x.len()`); the caller scales by 2 and zeroes
-/// fixed coordinates, matching the analytic per-subject convention.
-#[allow(clippy::too_many_arguments)]
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
 /// coordinates and dropping non-finite differences to zero. Shared by the non-IOV and
 /// IOV per-subject reconverged-FD gradients so the two cannot drift (#466 review round 2).
@@ -1910,6 +1899,17 @@ fn central_diff_packed(
     grad
 }
 
+/// Central-FD per-subject packed gradient `dᵢ = d(nllᵢ)/dx` that **re-converges
+/// that one subject's EBE** (warm-started) at every perturbed point. The single-
+/// subject analog of [`reconverged_fd_gradient`], used to fill the handful of
+/// subjects the analytic provider can't handle (SS+reset, time-varying
+/// covariates, modeled-duration doses, EVID=2 reset) inside the otherwise-exact
+/// analytic population gradient. Because the EBEs are re-solved at each ±h, the
+/// Ω/σ EBE-response is included — the term the θ-only fixed-EBE fallback drops,
+/// whose absence stalled the gradient optimizers (focei-slsqp-fixed-ebe-gradient-bias).
+/// Returns `d(nllᵢ)/dx` (length `x.len()`); the caller scales by 2 and zeroes
+/// fixed coordinates, matching the analytic per-subject convention.
+#[allow(clippy::too_many_arguments)]
 fn subject_reconverged_fd_gradient(
     x: &[f64],
     init_params: &ModelParameters,
@@ -2063,7 +2063,7 @@ pub(crate) fn population_gradient_sens_mixed(
 /// [`population_gradient_sens_mixed`]: the exact analytic stacked-η / block-Ω gradient for
 /// every in-scope subject, and a per-subject reconverged-FD gradient
 /// ([`subject_reconverged_fd_gradient_iov`]) for any out-of-scope (or non-finite) one.
-/// Replaces the all-or-nothing [`population_gradient_sens_iov`], which dropped the *whole*
+/// Replaces the former all-or-nothing IOV outer gradient, which dropped the *whole*
 /// population to FD on the first out-of-scope subject — so a single infusion / steady-state
 /// / wide-axis subject no longer forces the entire fit onto FD (#466 review round 2).
 /// Returns the packed `2·Σᵢ dᵢ` with fixed coordinates zeroed.

@@ -164,6 +164,15 @@ section of the SDLC for the versioning policy).
   test in the default build (#430).
 
 ### Changed
+- **The SLSQP fallback no longer triggers on `MaxEvalReached`** (#499). After the
+  primary NLopt run (`nlopt_lbfgs`/`slsqp`/`mma`), ferx retried from the current
+  point with a fresh, full-budget SLSQP optimization whenever the primary didn't
+  report a clean convergence code — including when it simply hit the evaluation
+  budget. A spent budget is not a failure a second optimizer can fix (it just
+  doubles the cost); ferx now emits an "increase `maxiter`" warning and returns
+  the best-seen point instead. The genuine-failure fallback (`Failure` /
+  `RoundoffLimited`) is unchanged. Found during the jasmine FOCEI slowness
+  investigation.
 - **`optimizer = lbfgs` and `optimizer = bfgs` now select the NLopt L-BFGS**
   (`nlopt_lbfgs`) instead of the hand-rolled built-in BFGS / limited-memory L-BFGS
   (#483). Across analytic-gradient FOCEI benchmarks (jasmine, infliximab, uvm) the

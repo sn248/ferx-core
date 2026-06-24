@@ -143,6 +143,13 @@ section of the SDLC for the versioning policy).
   test in the default build (#430).
 
 ### Changed
+- **`optimizer = lbfgs` and `optimizer = bfgs` now select the NLopt L-BFGS**
+  (`nlopt_lbfgs`) instead of the hand-rolled built-in BFGS / limited-memory L-BFGS
+  (#483). Across analytic-gradient FOCEI benchmarks (jasmine, infliximab, uvm) the
+  NLopt path reaches the best OFV and is 3–5× faster than the built-in, which on
+  harder fits diverged (infliximab) or hung with no outer progress (busulfan
+  ODE+IOV). The two keys are now deprecated aliases; the built-in implementation is
+  slated for removal.
 - **Documentation now builds as a Quarto website** using the shared ferx site
   branding and styling instead of mdBook. Source pages now live under
   `docs/**/*.qmd`, with navigation in `docs/_quarto.yml` (#443).

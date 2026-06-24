@@ -50,6 +50,11 @@ use std::time::Instant;
 /// `theta` and `eta` are required so that `ScalingSpec::ExpressionScale`
 /// can evaluate its `scale_fn(theta, eta, covariates)`. Callers that don't
 /// have a separate eta vector (population predictions) pass an all-zero eta.
+///
+/// Production code routes through [`pk::compute_predictions_with_tv`] (the
+/// TV-covariate-aware dispatcher) instead; this baseline-only helper now only
+/// backs the TV-vs-no-TV gap assertions in the regression tests.
+#[cfg(test)]
 pub(crate) fn model_preds(
     model: &CompiledModel,
     subject: &Subject,
@@ -4827,8 +4832,10 @@ fn emit_subject_rows<R: rand::Rng>(
     // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
     let ruv_scale = model.residual_var_scale(eta_slice);
     for (j, &ipred) in ipreds.iter().enumerate() {
-        let var = model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values)
-            * ruv_scale;
+        // FREM covariate pseudo-observations (FREMTYPE>0) use the additive
+        // covariate sigma, not the PK error model applied to the θ+η override
+        // that `compute_predictions_with_tv` now writes into FREM rows.
+        let var = model.sim_residual_variance(subject, j, ipred, &params.sigma.values, ruv_scale);
         let eps: f64 = rng.sample(normal);
         let value = ipred + var.sqrt() * eps;
 

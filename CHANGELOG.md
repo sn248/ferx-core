@@ -165,8 +165,11 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
-- Simulation now honours time-varying covariate snapshots on dose, observation,
-  and EVID=2 rows instead of using only each subject's baseline covariates (#506).
+- Simulation, NPDE/NPD diagnostics, and the NCA-init grid sweep now honour
+  time-varying covariate snapshots on dose, observation, and EVID=2 rows instead
+  of using only each subject's baseline covariates (#506). FREM covariate
+  pseudo-observations keep their additive `EPSCOV` error in simulation/NPDE
+  rather than being fed through the PK residual-error model.
 - **Analytic sensitivities and predictions for time-varying covariates with
   intermediate `[individual_parameters]` assignments** (#455, #456). A model whose
   individual-parameter block computes intermediate quantities (e.g.

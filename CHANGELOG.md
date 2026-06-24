@@ -149,7 +149,10 @@ section of the SDLC for the versioning policy).
   NLopt path reaches the best OFV and is 3–5× faster than the built-in, which on
   harder fits diverged (infliximab) or hung with no outer progress (busulfan
   ODE+IOV). The two keys are now deprecated aliases; the built-in implementation is
-  slated for removal.
+  slated for removal. The NLopt path's accuracy is validated against NONMEM/nlmixr2
+  reference fits on the [Outer Optimizers](docs/estimation/optimizers.qmd) page
+  (e.g. warfarin LTBS OFV −675.302, recovering NONMEM's MLE; `two_cpt_oral_cov`
+  OFV −1197.23 ≈ nlmixr2's −1199.24).
 - **Documentation now builds as a Quarto website** using the shared ferx site
   branding and styling instead of mdBook. Source pages now live under
   `docs/**/*.qmd`, with navigation in `docs/_quarto.yml` (#443).

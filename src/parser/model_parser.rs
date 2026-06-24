@@ -3780,7 +3780,8 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 other => {
                     return Err(format!(
                         "fit option `optimizer`: unknown value `{other}` — expected \
-                         slsqp/lbfgs/nlopt_lbfgs/mma/bfgs/bobyqa/trust_region"
+                         bobyqa/slsqp/nlopt_lbfgs/mma/trust_region (`lbfgs` and `bfgs` \
+                         are accepted as deprecated aliases for `nlopt_lbfgs`)"
                     ));
                 }
             };

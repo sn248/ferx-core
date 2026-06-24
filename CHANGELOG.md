@@ -143,6 +143,15 @@ section of the SDLC for the versioning policy).
   test in the default build (#430).
 
 ### Changed
+- **The SLSQP fallback no longer triggers on `MaxEvalReached`** (#499). After the
+  primary NLopt run (`nlopt_lbfgs`/`slsqp`/`mma`), ferx retried from the current
+  point with a fresh, full-budget SLSQP optimization whenever the primary didn't
+  report a clean convergence code — including when it simply hit the evaluation
+  budget. A spent budget is not a failure a second optimizer can fix (it just
+  doubles the cost); ferx now emits an "increase `maxiter`" warning and returns
+  the best-seen point instead. The genuine-failure fallback (`Failure` /
+  `RoundoffLimited`) is unchanged. Found during the jasmine FOCEI slowness
+  investigation.
 - **Documentation now builds as a Quarto website** using the shared ferx site
   branding and styling instead of mdBook. Source pages now live under
   `docs/**/*.qmd`, with navigation in `docs/_quarto.yml` (#443).

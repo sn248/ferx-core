@@ -245,6 +245,23 @@ fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
     }
 }
 
+/// Decide whether to run the SLSQP fallback after the primary NLopt run.
+///
+/// The fallback retries from the current point with SLSQP when the primary
+/// optimizer did not report a clean convergence code. It is suppressed when the
+/// stop was `MaxEvalReached` (#499): a spent evaluation budget is not a failure a
+/// second optimizer can fix — the user needs a larger `maxiter` — so re-running a
+/// fresh full-budget SLSQP would just double the cost. It is also suppressed when
+/// the run already used SLSQP (nothing to switch to) or the user cancelled.
+fn should_run_slsqp_fallback(
+    converged: bool,
+    already_slsqp: bool,
+    cancelled: bool,
+    max_eval_reached: bool,
+) -> bool {
+    !converged && !already_slsqp && !cancelled && !max_eval_reached
+}
+
 fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
     NloptState {
         cached_etas: vec![DVector::zeros(n_eta); n_subj],
@@ -956,11 +973,16 @@ fn optimize_nlopt(
     // Run optimization
     let result = opt.optimize(&mut x0);
 
+    // `max_eval_reached` is tracked separately from `converged` (#499): hitting
+    // the eval budget is not a failure that a fresh SLSQP run can fix — the user
+    // simply needs a larger `maxiter` — so it must not trigger the fallback.
+    let mut max_eval_reached = false;
     let (mut converged, first_algo) = match &result {
         Ok((status, _)) => {
             if options.verbose {
                 eprintln!("NLopt finished: {:?}", status);
             }
+            max_eval_reached = matches!(status, nlopt::SuccessState::MaxEvalReached);
             (
                 matches!(
                     status,
@@ -982,11 +1004,27 @@ fn optimize_nlopt(
 
     drop(opt);
 
-    // Fallback: if L-BFGS failed, retry with SLSQP from current best point.
-    // Skip the fallback if the user cancelled — no point burning more cycles.
+    // Fallback: retry with SLSQP from the current point when the primary
+    // optimizer did not converge cleanly — except on `MaxEvalReached`, which is a
+    // spent eval budget, not a failure a second optimizer can fix (#499).
     let already_slsqp = matches!(first_algo, nlopt::Algorithm::Slsqp);
     let cancelled = crate::cancel::is_cancelled(&options.cancel);
-    if !converged && !already_slsqp && !cancelled {
+    if max_eval_reached {
+        warnings.push(format!(
+            "Outer optimization hit the evaluation budget (maxiter = {}) before \
+             converging; increase maxiter for a tighter fit.",
+            options.outer_maxiter,
+        ));
+        if options.verbose {
+            eprintln!(
+                "NLopt hit the evaluation budget (maxiter = {}) without converging — \
+                 increase maxiter for a tighter fit. Skipping the SLSQP fallback \
+                 (it cannot fix a spent budget).",
+                options.outer_maxiter,
+            );
+        }
+    }
+    if should_run_slsqp_fallback(converged, already_slsqp, cancelled, max_eval_reached) {
         if options.verbose {
             eprintln!("Retrying with NLopt SLSQP from current point...");
         }
@@ -3678,6 +3716,23 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 mod tests {
     use super::*;
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    /// SLSQP-fallback gate (#499): fall back only when the primary run did not
+    /// converge and did not exhaust its eval budget, is not already SLSQP, and was
+    /// not cancelled. `MaxEvalReached` (budget spent) must suppress it.
+    #[test]
+    fn slsqp_fallback_gate() {
+        // Genuine non-convergence (not MaxEvalReached) → fall back.
+        assert!(should_run_slsqp_fallback(false, false, false, false));
+
+        // Hit the eval budget → skip (needs larger maxiter, not another optimizer).
+        assert!(!should_run_slsqp_fallback(false, false, false, true));
+
+        // Already converged, already SLSQP, or cancelled → never fall back.
+        assert!(!should_run_slsqp_fallback(true, false, false, false));
+        assert!(!should_run_slsqp_fallback(false, true, false, false));
+        assert!(!should_run_slsqp_fallback(false, false, true, false));
+    }
 
     /// Covariance progress reporter math (the pure pieces behind `cov_progress`).
     /// Stride caps output at ~20 lines but never zero; the print predicate fires

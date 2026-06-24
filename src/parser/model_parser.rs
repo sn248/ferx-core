@@ -3766,19 +3766,22 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
                 "slsqp" => Optimizer::Slsqp,
-                // `lbfgs` is the built-in limited-memory L-BFGS (analytic gradient,
-                // Eq. 48 warm EBEs, no SLSQP polish). The NLopt L-BFGS + SLSQP-polish
-                // path is still reachable explicitly via `nlopt_lbfgs`.
-                "lbfgs" => Optimizer::Lbfgs,
-                "nlopt_lbfgs" => Optimizer::NloptLbfgs,
+                // `lbfgs` and `bfgs` are deprecated aliases for `nlopt_lbfgs`: they now
+                // select the NLopt L-BFGS (+ SLSQP polish) path. The hand-rolled
+                // built-in BFGS/L-BFGS is strictly worse — 3–5× slower on
+                // analytic-gradient models and prone to diverging or hanging on harder
+                // problems (see #483) — so the keyword no longer reaches it. The
+                // `Optimizer::Bfgs`/`Lbfgs` variants remain for a Rust caller that
+                // constructs them directly, pending removal.
+                "lbfgs" | "bfgs" | "nlopt_lbfgs" => Optimizer::NloptLbfgs,
                 "mma" => Optimizer::Mma,
-                "bfgs" => Optimizer::Bfgs,
                 "bobyqa" => Optimizer::Bobyqa,
                 "trust_region" | "newton_tr" => Optimizer::TrustRegion,
                 other => {
                     return Err(format!(
                         "fit option `optimizer`: unknown value `{other}` — expected \
-                         slsqp/lbfgs/nlopt_lbfgs/mma/bfgs/bobyqa/trust_region"
+                         bobyqa/slsqp/nlopt_lbfgs/mma/trust_region (`lbfgs` and `bfgs` \
+                         are accepted as deprecated aliases for `nlopt_lbfgs`)"
                     ));
                 }
             };
@@ -13101,10 +13104,12 @@ mod tests {
     #[test]
     fn test_apply_fit_option_optimizer_and_bloq() {
         let mut opts = FitOptions::default();
-        // `lbfgs` resolves to the built-in limited-memory L-BFGS; the NLopt
-        // L-BFGS + SLSQP-polish path keeps the explicit `nlopt_lbfgs` keyword.
+        // `lbfgs` and `bfgs` are deprecated aliases for `nlopt_lbfgs` — all three
+        // resolve to the NLopt L-BFGS (+ SLSQP polish) path. See #483.
         assert_eq!(apply_fit_option(&mut opts, "optimizer", "lbfgs"), Ok(true));
-        assert_eq!(opts.optimizer, Optimizer::Lbfgs);
+        assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
+        assert_eq!(apply_fit_option(&mut opts, "optimizer", "bfgs"), Ok(true));
+        assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
         assert_eq!(
             apply_fit_option(&mut opts, "optimizer", "nlopt_lbfgs"),
             Ok(true)
@@ -14778,6 +14783,22 @@ mod tests {
         let content = minimal_model_with_fit_options("  optimizer = newton_tr");
         let parsed = parse_full_model(&content).unwrap();
         assert_eq!(parsed.fit_options.optimizer, Optimizer::TrustRegion);
+    }
+
+    #[test]
+    fn test_parse_optimizer_lbfgs_bfgs_alias_nlopt() {
+        // `lbfgs` and `bfgs` are deprecated aliases for `nlopt_lbfgs`: all three
+        // select the NLopt L-BFGS path. The hand-rolled built-in is no longer
+        // reachable by keyword. See #483.
+        for key in ["lbfgs", "bfgs", "nlopt_lbfgs"] {
+            let content = minimal_model_with_fit_options(&format!("  optimizer = {key}"));
+            let parsed = parse_full_model(&content).unwrap();
+            assert_eq!(
+                parsed.fit_options.optimizer,
+                Optimizer::NloptLbfgs,
+                "optimizer = {key} should resolve to NLopt L-BFGS"
+            );
+        }
     }
 
     #[test]

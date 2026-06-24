@@ -4818,11 +4818,9 @@ fn emit_subject_rows<R: rand::Rng>(
     rng: &mut R,
     results: &mut Vec<SimulationResult>,
 ) {
-    // Compute individual parameters
-    let pk_params = (model.pk_param_fn)(&params.theta, eta_slice, &subject.covariates);
-
-    // Predict concentrations
-    let ipreds = model_preds(model, subject, &pk_params, &params.theta, eta_slice);
+    // Use the same TV-covariate-aware dispatcher as estimation and post-fit
+    // diagnostics. For no-TV subjects this stays on the one-pk-param fast path.
+    let ipreds = pk::compute_predictions_with_tv(model, subject, &params.theta, eta_slice);
 
     // Add residual error (Gaussian path). IIV on residual error (#409): the
     // drawn `eta_slice` includes η_ruv, so scale the residual variance by
@@ -7554,6 +7552,149 @@ mod tests_sdtab_tv_cov {
                 "sdtab PRED at obs {j} = {got}, expected (TV-aware) {expected} \
                  — `compute_subject_results` must route PRED through \
                  `compute_predictions_with_tv` for TV-covariate subjects"
+            );
+        }
+    }
+
+    /// Regression for #506: simulation must honour time-varying covariate
+    /// snapshots on observation rows. The pre-fix simulation path evaluated
+    /// `pk_param_fn` once with `subject.covariates`, so changing `WT` on obs rows
+    /// had no effect on emitted IPRED/DV unless the baseline dose row changed.
+    #[test]
+    fn test_simulate_honours_tv_covariates() {
+        let default_params = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.1, 5.0],
+            theta_upper: vec![50.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega: OmegaMatrix::from_diagonal(&[], vec![]),
+            omega_fixed: Vec::new(),
+            sigma: SigmaVector {
+                values: vec![0.0],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        let model = CompiledModel {
+            name: "tv_cov_sim_regression".into(),
+            pk_model: PkModel::OneCptIv,
+            error_model: ErrorModel::Proportional,
+            error_spec: ErrorSpec::Single(ErrorModel::Proportional),
+            pk_param_fn: Box::new(|theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                let wt = cov.get("WT").copied().unwrap_or(70.0);
+                p.values[0] = theta[0] * (wt / 70.0);
+                p.values[1] = theta[1];
+                p
+            }),
+            n_theta: 2,
+            n_eta: 0,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: Vec::new(),
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: Vec::new(),
+            indiv_param_names: vec!["CL".into(), "V".into()],
+            indiv_param_partials: crate::types::IndivParamPartials::empty(),
+            default_params: default_params.clone(),
+            omega_init_as_sd: Vec::new(),
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: Vec::new(),
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: Vec::new(),
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: Vec::new(),
+            ode_spec: None,
+            dose_attr_map: Default::default(),
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: vec!["WT".into()],
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
+            frem_config: None,
+            residual_error_eta: None,
+        };
+
+        let mut baseline_cov = HashMap::new();
+        baseline_cov.insert("WT".to_string(), 70.0);
+
+        let dose_covariates = vec![HashMap::from([("WT".to_string(), 70.0)])];
+        let obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 140.0)]),
+            HashMap::from([("WT".to_string(), 210.0)]),
+        ];
+        let subject = Subject {
+            id: "SIMTV".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 3.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0, 0.0, 0.0],
+            obs_cmts: vec![1, 1, 1],
+            covariates: baseline_cov,
+            dose_covariates,
+            obs_covariates,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0, 0],
+            occasions: vec![1, 1, 1],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        assert!(subject.has_tv_covariates());
+
+        let reference =
+            crate::pk::compute_predictions_with_tv(&model, &subject, &default_params.theta, &[]);
+        let pk_no_tv = (model.pk_param_fn)(&default_params.theta, &[], &subject.covariates);
+        let no_tv = model_preds(&model, &subject, &pk_no_tv, &default_params.theta, &[]);
+        let gap: f64 = reference
+            .iter()
+            .zip(no_tv.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            gap > 1e-3,
+            "test setup wrong: TV and baseline-only simulation paths must differ; \
+             got gap={gap}, tv={reference:?}, no_tv={no_tv:?}"
+        );
+
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: vec!["WT".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let rows = simulate_with_seed(&model, &population, &default_params, 1, 506);
+        assert_eq!(rows.len(), reference.len());
+        for (j, (row, &expected)) in rows.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (row.ipred - expected).abs() < 1e-12,
+                "simulation IPRED at obs {j} = {}, expected TV-aware {expected}",
+                row.ipred
             );
         }
     }

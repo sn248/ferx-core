@@ -165,6 +165,8 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- Simulation now honours time-varying covariate snapshots on dose, observation,
+  and EVID=2 rows instead of using only each subject's baseline covariates (#506).
 - **Analytic sensitivities and predictions for time-varying covariates with
   intermediate `[individual_parameters]` assignments** (#455, #456). A model whose
   individual-parameter block computes intermediate quantities (e.g.

@@ -60,10 +60,28 @@ pub fn optimize_population(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
-    match options.optimizer {
-        Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma | Optimizer::Bobyqa => {
-            optimize_nlopt(model, population, init_params, options)
-        }
+    // Resolve `auto` once, here, so the concrete optimizer flows through the rest
+    // of the outer loop (optimize_nlopt re-reads `options.optimizer` for its own
+    // branching). Every other variant is returned unchanged, so this is a no-op
+    // unless the user left the default `auto` in place.
+    let resolved = options.optimizer.resolve_auto(model);
+    let owned_opts;
+    let options = if resolved == options.optimizer {
+        options
+    } else {
+        owned_opts = FitOptions {
+            optimizer: resolved,
+            ..options.clone()
+        };
+        &owned_opts
+    };
+    match resolved {
+        // `Auto` is resolved away above; group it with the NLopt path defensively.
+        Optimizer::Slsqp
+        | Optimizer::NloptLbfgs
+        | Optimizer::Mma
+        | Optimizer::Bobyqa
+        | Optimizer::Auto => optimize_nlopt(model, population, init_params, options),
         Optimizer::Bfgs | Optimizer::Lbfgs => {
             optimize_bfgs(model, population, init_params, options)
         }

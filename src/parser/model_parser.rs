@@ -3767,6 +3767,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
+                // `auto` (the default) picks nlopt_lbfgs when the analytic
+                // FOCE/FOCEI gradient is available, bobyqa otherwise (#490).
+                "auto" => Optimizer::Auto,
                 "slsqp" => Optimizer::Slsqp,
                 // `lbfgs` and `bfgs` are deprecated aliases for `nlopt_lbfgs`: they now
                 // select the NLopt L-BFGS (+ SLSQP polish) path. The hand-rolled
@@ -3782,8 +3785,8 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 other => {
                     return Err(format!(
                         "fit option `optimizer`: unknown value `{other}` — expected \
-                         bobyqa/slsqp/nlopt_lbfgs/mma/trust_region (`lbfgs` and `bfgs` \
-                         are accepted as deprecated aliases for `nlopt_lbfgs`)"
+                         auto/bobyqa/slsqp/nlopt_lbfgs/mma/trust_region (`lbfgs` and \
+                         `bfgs` are accepted as deprecated aliases for `nlopt_lbfgs`)"
                     ));
                 }
             };
@@ -14773,6 +14776,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_optimizer_auto() {
+        let content = minimal_model_with_fit_options("  optimizer = auto");
+        let parsed = parse_full_model(&content).unwrap();
+        assert_eq!(parsed.fit_options.optimizer, Optimizer::Auto);
+    }
+
+    #[test]
     fn test_parse_optimizer_trust_region() {
         let content = minimal_model_with_fit_options("  optimizer = trust_region");
         let parsed = parse_full_model(&content).unwrap();
@@ -14816,13 +14826,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_optimizer_defaults_to_bobyqa() {
+    fn test_parse_optimizer_defaults_to_auto() {
         // `[fit_options]` block present but `optimizer` omitted → default is
-        // BOBYQA (derivative-free trust-region). See `FitOptions::default` for
-        // the rationale.
+        // `auto`, which resolves per-model to nlopt_lbfgs (analytic gradient) or
+        // bobyqa (FD only). See `FitOptions::default` and #490.
         let content = minimal_model_with_fit_options("  maxiter = 100");
         let parsed = parse_full_model(&content).unwrap();
-        assert_eq!(parsed.fit_options.optimizer, Optimizer::Bobyqa);
+        assert_eq!(parsed.fit_options.optimizer, Optimizer::Auto);
     }
 
     #[test]
@@ -14853,10 +14863,10 @@ mod tests {
     #[test]
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
-        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-5,
+        //   optimizer = auto, inner_maxiter = 200, inner_tol = 1e-5,
         //   steihaug_max_iters = None (adaptive).
         let opts = FitOptions::default();
-        assert_eq!(opts.optimizer, Optimizer::Bobyqa);
+        assert_eq!(opts.optimizer, Optimizer::Auto);
         assert_eq!(opts.inner_maxiter, 200);
         assert!((opts.inner_tol - 1e-5).abs() < 1e-20);
         assert_eq!(opts.steihaug_max_iters, None);

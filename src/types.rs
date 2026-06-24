@@ -3388,6 +3388,9 @@ pub struct FitOptions {
     pub covariance_ofv_hessian: bool,
     pub interaction: bool,
     pub verbose: bool,
+    /// Outer-loop (population parameter) optimizer. Defaults to
+    /// [`Optimizer::Auto`], which picks `nlopt_lbfgs` when the analytic FOCE/FOCEI
+    /// gradient is available and `bobyqa` when only finite differences are (#490).
     pub optimizer: Optimizer,
     /// Inner-loop (EBE) optimizer. `Auto` keeps the size-based default; any other
     /// value pins the inner solver with no dimension-based switching.
@@ -3805,7 +3808,7 @@ impl Default for FitOptions {
             // without the cost of `reconverge_gradient_interval = 1`. See
             // `docs/estimation/optimizers.qmd` for the cefepime and Emax
             // PKPD validations and guidance on when to switch back to SLSQP.
-            optimizer: Optimizer::Bobyqa,
+            optimizer: Optimizer::Auto,
             inner_optimizer: InnerOptimizer::Auto,
             lbfgs_memory: 5,
             global_search: false,
@@ -3911,6 +3914,17 @@ impl BloqMethod {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Optimizer {
+    /// Pick the outer optimizer automatically from the model (the default).
+    /// Resolves to [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI
+    /// gradient is available (the model is in the sensitivity provider's scope
+    /// and the user did not force `gradient_method = fd`), and to
+    /// [`Optimizer::Bobyqa`] otherwise (ODE/PD models, LTBS, SDE, or
+    /// `gradient_method = fd`, where the outer loop must fall back to finite
+    /// differences). Benchmarking across ~10 real FOCEI datasets (#490) found
+    /// NLopt L-BFGS fastest-to-optimum on every analytic-gradient problem, while
+    /// BOBYQA was both fastest and most reliable when only finite differences
+    /// are available. See [`Optimizer::resolve_auto`].
+    Auto,
     Bfgs,
     Lbfgs,
     /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based;
@@ -4007,6 +4021,7 @@ impl Optimizer {
         // only a Rust caller that constructs `Optimizer::Bfgs`/`Lbfgs` directly can
         // produce them, and those variants are slated for removal.
         match self {
+            Optimizer::Auto => "auto",
             Optimizer::Bfgs => "bfgs",
             Optimizer::Lbfgs => "lbfgs",
             Optimizer::Slsqp => "slsqp",
@@ -4014,6 +4029,30 @@ impl Optimizer {
             Optimizer::Mma => "mma",
             Optimizer::Bobyqa => "bobyqa",
             Optimizer::TrustRegion => "trust_region",
+        }
+    }
+
+    /// Resolve [`Optimizer::Auto`] to a concrete optimizer for `model`; every
+    /// other variant is returned unchanged (idempotent). `auto` picks
+    /// [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI gradient is
+    /// available — the model is in the sensitivity provider's scope and the user
+    /// did not force `gradient_method = fd` — and [`Optimizer::Bobyqa`]
+    /// otherwise. This mirrors the analytic-vs-FD predicate the outer loop uses
+    /// (see `build_info::gradient_method_outer`), so `auto` lands on the
+    /// gradient-based optimizer exactly when there is an exact gradient to feed
+    /// it (#490).
+    pub fn resolve_auto(self, model: &CompiledModel) -> Optimizer {
+        if self != Optimizer::Auto {
+            return self;
+        }
+        let user_forces_fd = matches!(model.gradient_method, GradientMethod::Fd);
+        let analytic = !user_forces_fd
+            && (crate::sens::provider::sens_supported(model)
+                || crate::sens::provider::iov_analytical_supported(model));
+        if analytic {
+            Optimizer::NloptLbfgs
+        } else {
+            Optimizer::Bobyqa
         }
     }
 }
@@ -4605,6 +4644,50 @@ mod tests {
         model.frem_config = None;
         let pk_only = model.sim_residual_variance(&subject, 1, f, &sigma, 1.0);
         assert!((pk_only - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resolve_auto_picks_nlopt_lbfgs_when_analytic() {
+        // Analytical PK model with `gradient = auto` → exact FOCE gradient is
+        // available, so `auto` resolves to the gradient-based NLopt L-BFGS (#490).
+        let m = test_helpers::analytical_model(GradientMethod::Auto);
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m),
+            Optimizer::NloptLbfgs,
+            "analytic-gradient model should resolve auto → nlopt_lbfgs"
+        );
+    }
+
+    #[test]
+    fn resolve_auto_picks_bobyqa_when_fd_only() {
+        // ODE model (no analytic scope) and an analytical model with
+        // `gradient = fd` both fall back to finite differences → bobyqa.
+        let ode = test_helpers::ode_model(GradientMethod::Auto);
+        let forced_fd = test_helpers::analytical_model(GradientMethod::Fd);
+        for m in [&ode, &forced_fd] {
+            assert_eq!(
+                Optimizer::Auto.resolve_auto(m),
+                Optimizer::Bobyqa,
+                "FD-only model should resolve auto → bobyqa"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_auto_is_identity_for_concrete_optimizers() {
+        // Every non-`Auto` optimizer is returned unchanged, regardless of model.
+        let m = test_helpers::analytical_model(GradientMethod::Auto);
+        for opt in [
+            Optimizer::Bfgs,
+            Optimizer::Lbfgs,
+            Optimizer::Slsqp,
+            Optimizer::NloptLbfgs,
+            Optimizer::Mma,
+            Optimizer::Bobyqa,
+            Optimizer::TrustRegion,
+        ] {
+            assert_eq!(opt.resolve_auto(&m), opt);
+        }
     }
 
     #[test]

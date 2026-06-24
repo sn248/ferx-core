@@ -3493,6 +3493,27 @@ fn fit_inner(
         }
     }
 
+    // Reported outer optimizer. For the FOCE/FOCEI path with the default `auto`,
+    // surface the concrete optimizer `auto` resolved to (e.g. `auto (nlopt_lbfgs)`)
+    // so the output records what actually ran (#490).
+    let optimizer_label: String = match final_method {
+        EstimationMethod::Saem => "saem".to_string(),
+        EstimationMethod::FoceGn => "gn".to_string(),
+        EstimationMethod::FoceGnHybrid => "gn".to_string(),
+        // IMP/IMPMAP never run the outer optimizer — their M-step uses an
+        // internal BOBYQA regardless of `options.optimizer`, so report that
+        // rather than a setting that had no effect.
+        EstimationMethod::Impmap => "impmap-bobyqa".to_string(),
+        EstimationMethod::Imp => "imp-bobyqa".to_string(),
+        _ => {
+            if options.optimizer == Optimizer::Auto {
+                format!("auto ({})", options.optimizer.resolve_auto(model).label())
+            } else {
+                options.optimizer.label().to_string()
+            }
+        }
+    };
+
     let fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
@@ -3601,18 +3622,7 @@ fn fit_inner(
         sigma_init,
         obs_time_range,
         final_gradient: result.final_gradient.clone(),
-        optimizer: match final_method {
-            EstimationMethod::Saem => "saem",
-            EstimationMethod::FoceGn => "gn",
-            EstimationMethod::FoceGnHybrid => "gn",
-            // IMP/IMPMAP never run the outer optimizer — their M-step uses an
-            // internal BOBYQA regardless of `options.optimizer`, so report that
-            // rather than a setting that had no effect.
-            EstimationMethod::Impmap => "impmap-bobyqa",
-            EstimationMethod::Imp => "imp-bobyqa",
-            _ => options.optimizer.label(),
-        }
-        .to_string(),
+        optimizer: optimizer_label,
         n_starts: options.n_starts,
         multi_start_seed: options.multi_start_seed,
         saem_seed: options.saem_seed,
@@ -5368,6 +5378,22 @@ mod iov_integration {
         let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
         let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
         assert_iov_fit_ok(&result);
+    }
+
+    #[test]
+    fn test_iov_foce_auto_reports_resolved_optimizer() {
+        // `optimizer = auto` (the default) must resolve per-model and the
+        // FitResult must report the concrete pick so the output records what
+        // actually ran (#490). This IOV model is outside the analytic-gradient
+        // scope, so `auto` lands on bobyqa.
+        let model = make_iov_model();
+        let pop = make_iov_population();
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Auto, false);
+        let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
+        assert_iov_fit_ok(&result);
+        let resolved = Optimizer::Auto.resolve_auto(&model);
+        assert_eq!(result.optimizer, format!("auto ({})", resolved.label()));
+        assert_eq!(resolved, Optimizer::Bobyqa);
     }
 
     #[test]

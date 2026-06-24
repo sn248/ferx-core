@@ -101,9 +101,11 @@ pub fn gradient_method_outer(
         EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
             GradientMethodKind::FiniteDifferences
         }
-        EstimationMethod::Foce | EstimationMethod::FoceI => match optimizer {
+        EstimationMethod::Foce | EstimationMethod::FoceI => match optimizer.resolve_auto(model) {
             Optimizer::Bobyqa => GradientMethodKind::NotApplicable,
-            Optimizer::Bfgs
+            // `Auto` is resolved above; only its concrete results reach here.
+            Optimizer::Auto
+            | Optimizer::Bfgs
             | Optimizer::Lbfgs
             | Optimizer::Slsqp
             | Optimizer::NloptLbfgs

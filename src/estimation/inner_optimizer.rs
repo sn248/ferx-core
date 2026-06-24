@@ -690,7 +690,12 @@ fn find_ebe_iov(
             None
         };
         match analytic {
-            Some(sens) => {
+            // Require one sensitivity row per observation — the indexed writes below would
+            // otherwise panic and abort the fit. The provider's scope gates hold this
+            // invariant today; guard it so a future mismatch degrades to FD instead of
+            // crashing, mirroring the outer `subject_packed_gradient_foce_iov` check (#466
+            // review round 4 #7).
+            Some(sens) if sens.len() == subject.obs_times.len() => {
                 let n_obs = subject.obs_times.len();
                 let mut h = DMatrix::zeros(n_obs, n_eta);
                 for (j, obs) in sens.iter().enumerate() {
@@ -704,7 +709,7 @@ fn find_ebe_iov(
                 overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
                 h
             }
-            None => {
+            _ => {
                 let kappas_slices: Vec<Vec<f64>> =
                     kappas_vec.iter().map(|k| k.as_slice().to_vec()).collect();
                 compute_jacobian_fd_iov(model, subject, &params.theta, &bsv_eta, &kappas_slices)

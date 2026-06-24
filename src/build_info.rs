@@ -61,11 +61,18 @@ impl GradientMethodKind {
 /// scaling / SDE), and the user did not force `gradient_method = Fd`. Otherwise
 /// FD. (The exact per-subject split is reported by `gradient_route_summary`.)
 pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> GradientMethodKind {
-    // Report off the *same* model-level predicate `find_ebe` consults, so the two
-    // can't diverge as scope grows (PR #381 review #9). Per-subject FD fallbacks
+    // Report off the *same* model-level predicates `find_ebe` / `find_ebe_iov` consult, so
+    // the two can't diverge as scope grows (PR #381 review #9). Per-subject FD fallbacks
     // (time-varying covariates, survival obs) are reported separately by
-    // `gradient_route_summary` / `fd_fallback_warning`.
-    if crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(model) {
+    // `gradient_route_summary` / `fd_fallback_warning`. The IOV inner loop runs the exact
+    // analytic stacked-η gradient when the model is in IOV scope and clears the shared
+    // model-level bails (`find_ebe_iov`'s `analytic_iov_inner` gate) — `analytic_inner_grad
+    // _supported_model` returns `false` for every IOV model (it requires `n_kappa == 0`),
+    // so the IOV branch must be reported explicitly (#466 review round 4 #1).
+    let analytic = crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(model)
+        || (crate::sens::provider::iov_sens_supported(model)
+            && !crate::estimation::inner_optimizer::analytic_inner_common_bail(model));
+    if analytic {
         GradientMethodKind::Analytic
     } else {
         GradientMethodKind::FiniteDifferences

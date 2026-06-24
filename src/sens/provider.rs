@@ -227,6 +227,20 @@ const MAX_SCALE_AXES: usize = 16;
 /// inner/outer analytic scope stays matched (#449 re-review #2).
 const MAX_TVCOV_AXES: usize = 24;
 
+// Five `disp!(1..=24)` dispatch tables key on `MAX_TVCOV_AXES` with a silent `_ => None`:
+// `lognormal_param_derivatives`, `subject_sensitivities_iov`,
+// `subject_eta_grad_iov_analytical`, `subject_sensitivities_tvcov`, and
+// `subject_eta_grad_tvcov`. Keep all five in lockstep with the const — bumping it without
+// widening every arm would let an in-scope wider model hit `_ => None` and silently fall
+// back to FD. The mirror of the `MAX_ODE_AXES` tripwire in `ode_provider.rs` (#466 review
+// round 4 #12).
+const _: () = assert!(
+    MAX_TVCOV_AXES == 24,
+    "MAX_TVCOV_AXES changed: widen the disp!(1..=24) tables in lognormal_param_derivatives, \
+     subject_sensitivities_iov, subject_eta_grad_iov_analytical, subject_sensitivities_tvcov, \
+     and subject_eta_grad_tvcov to match, then update this assert"
+);
+
 /// Whether the model's output scaling is one the provider differentiates exactly:
 /// `None` / constant `ScalarScale` (a per-jet divisor, `∂k/∂η = ∂k/∂θ = 0`), or an
 /// `ExpressionScale` carrying a `Dual2`-differentiable program whose axis counts
@@ -697,6 +711,17 @@ fn build_iov_sources(
         return None;
     }
     let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
+    // A dose in an occasion with no sampled observations has no κ group in the stacked
+    // `[η_bsv, κ₁..κ_K]` vector (`K` = obs-occasions), so its source build would `?`-abort
+    // mid-routine. Decline up front for an explicit FD route — symmetric with the ODE
+    // path's `ode_iov_subject_supported` (#466 review round 3 #1 / round-4 sweep).
+    if subject
+        .dose_occasions
+        .iter()
+        .any(|d_occ| !occ_to_k.contains_key(d_occ))
+    {
+        return None;
+    }
     // Combined effect vector for group `k`: `[η_bsv, κ_k]` (shared κ-axis layout).
     let eta_bsv = &stacked_eta[..n_eta];
     let combined_for =

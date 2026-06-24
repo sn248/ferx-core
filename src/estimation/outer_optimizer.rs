@@ -1795,10 +1795,8 @@ fn reconverged_fd_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let n = x.len();
     let n_subj = population.subjects.len();
     let fixed = packed_fixed_mask(init_params);
-    let eps = 1e-4;
 
     // OFV at a packed point, re-solving the inner loop (warm-started). Matches
     // the objective closure's definition: 2·pop_nll, guarded to 1e20 on
@@ -1835,31 +1833,9 @@ fn reconverged_fd_gradient(
             raw
         }
     };
-
-    let mut grad = vec![0.0_f64; n];
-    let mut xw = x.to_vec();
-    for k in 0..n {
-        if fixed[k] {
-            continue;
-        }
-        let h = eps * (1.0 + x[k].abs());
-        let xp = (x[k] + h).min(bounds.upper[k]);
-        let xm = (x[k] - h).max(bounds.lower[k]);
-        let denom = xp - xm;
-        if denom.abs() < 1e-16 {
-            continue;
-        }
-        xw[k] = xp;
-        let fp = eval(&xw);
-        xw[k] = xm;
-        let fm = eval(&xw);
-        xw[k] = x[k];
-        let d = (fp - fm) / denom;
-        if d.is_finite() {
-            grad[k] = d;
-        }
-    }
-    grad
+    // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
+    // shared so the `eps`/clamp/`is_finite`-drop convention can't drift (#466 review round 4 #8).
+    central_diff_packed(x, &fixed, bounds, eval)
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed

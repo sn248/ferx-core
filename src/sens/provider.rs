@@ -4951,6 +4951,31 @@ mod tests {
         );
     }
 
+    /// **IOV × lagtime × infusion × reset** — the combined path through `integrate_tvcov_g`
+    /// (both rate-on/off saltations, the `reset_floor` guard, and per-occasion κ seeding) is
+    /// otherwise covered only piecewise. Full stacked-η + θ gradient and Hessian vs FD of
+    /// `predict_iov` (#472 review round 2 #5).
+    #[test]
+    fn ode_iov_lagtime_infusion_reset_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_LAG_ODE).expect("parse ODE IOV+lag");
+        assert!(model.has_lagtime());
+        let mut subject = iov_reset_subject(); // 2 occasions, EVID=4 reset at t=24
+                                               // Per-occasion infusions (rate>0): occ-1 window starts at 0, occ-2 re-dose at the
+                                               // reset; the lagtime shifts both windows.
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 50.0, false, 0.0),
+        ];
+        assert!(subject.has_resets() && subject.doses[0].is_infusion());
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.5],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
     /// 1-cpt IV IOV `[odes]` model with a WT covariate on CL (`(WT/70)^θ_WT`) under
     /// **time-varying covariates**: each event's PK params are seeded at its own
     /// (occasion, WT-snapshot), so the individual CL switches both by κ and by WT.

@@ -37,7 +37,7 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
         })
         .collect()
 }
-use rand::SeedableRng;
+use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
 use std::path::Path;
@@ -4664,8 +4664,8 @@ pub fn simulate(
     params: &ModelParameters,
     n_sim: usize,
 ) -> Vec<SimulationResult> {
-    use rand::prelude::*;
-    simulate_inner(model, population, params, n_sim, &mut thread_rng())
+    let mut rng = rand::rng();
+    simulate_inner(model, population, params, n_sim, &mut rng)
 }
 
 /// Simulate with a fixed seed for reproducibility.
@@ -4721,7 +4721,7 @@ pub fn simulate_with_options(
     use rand::SeedableRng;
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
-        None => rand::rngs::StdRng::from_entropy(),
+        None => rand::make_rng(),
     };
 
     // Guard the modeled-`RATE` dose precondition up front (#324). The
@@ -4968,7 +4968,7 @@ pub struct SimulateUncertaintyOptions {
     pub n_sim_per_draw: usize,
     /// How to draw the parameter sets — asymptotic MVN or SIR resamples.
     pub method: crate::estimation::uncertainty_samples::UncertaintyMethod,
-    /// Optional seed for reproducibility. `None` uses `thread_rng`.
+    /// Optional seed for reproducibility. `None` draws from entropy.
     pub seed: Option<u64>,
 }
 
@@ -4994,7 +4994,7 @@ pub fn simulate_with_uncertainty(
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
         // Re-seed StdRng from entropy so simulate-without-seed is still
         // independent across calls but uses a uniform RNG type internally.
-        None => rand::rngs::StdRng::from_entropy(),
+        None => rand::make_rng(),
     };
 
     let template =

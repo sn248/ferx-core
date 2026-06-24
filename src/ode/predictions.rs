@@ -96,8 +96,10 @@ pub(crate) fn resolve_subject_doses<'a>(
 /// dose. With a typical t₁/₂/II ratio under 2 (the common clinical range)
 /// this is comfortably past saturation — each additional cycle adds
 /// `exp(-k·II)` of the prior decay, so by N=50 the truncation tail is
-/// well below 1e-6 for any reasonable PK.
-const SS_EQUILIBRATION_CYCLES: usize = 50;
+/// well below 1e-6 for any reasonable PK. The analytic-sensitivity SS
+/// equilibration (`sens::ode_provider::equilibrate_ss_state_g`) reuses this
+/// same constant so its trough can't drift from this f64 predictor (#473 review #11).
+pub(crate) const SS_EQUILIBRATION_CYCLES: usize = 50;
 
 /// Pre-equilibrate the ODE state to its steady-state value for an SS=1
 /// dose with interval `dose.ii`. NONMEM SS=1 semantics: at the time of

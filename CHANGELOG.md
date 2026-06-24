@@ -28,12 +28,15 @@ section of the SDLC for the versioning policy).
   propagates `∂(steady state)/∂(θ,η)` directly (no implicit fixed-point differentiation).
   Both SS **boluses** and SS **infusions** are supported (an SS infusion equilibrates with
   an active-rate window + quiet window per cycle), and SS composes with time-varying
-  covariates, IOV, EVID 3/4 resets, and **estimated lagtime** — including SS infusion ×
-  lagtime, where the infinite past train (the equilibration trough) time-shifts via the
-  obs-side time-shift and the current window's boundaries shift via the rate-boundary
-  saltations. Only a rate-defined SS infusion under `F ≠ 1` still routes to FD (its
-  equilibration cycles would each need the `F`-scaled active window). Result-neutral
-  (validated against the production predictor and `predict_iov`).
+  covariates, IOV, and EVID 3/4 resets. Routes to FD: a rate-defined SS infusion under
+  `F ≠ 1` (its equilibration cycles would each need the `F`-scaled active window), and SS
+  combined with an **estimated lagtime** (observations in the pre-arrival window
+  `[t_dose, t_dose+lag]` must read the previous interval's steady-state tail, which the
+  dual walk does not yet seed — production handles it via `ss_state_at_phase`). Result-
+  neutral. **NONMEM comparison:** the SS=1 semantics this differentiates (the infinite-past
+  pulse-train trough) are the production predictor's, NONMEM-validated for SS dosing in
+  `docs/model-file` / `tests/`; the analytic gradient is the exact derivative of that
+  NONMEM-matching prediction (FD-confirmed via `check_vs_production` / `predict_iov`).
 - **Analytic gradients for rate-defined infusion under bioavailability `F ≠ 1`** in
   `[odes]` models (#419). NONMEM holds a rate-defined infusion's rate and scales its
   *duration* to `F·amt/rate`, so `F`'s sensitivity is a moving window boundary rather than

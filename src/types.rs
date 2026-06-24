@@ -468,6 +468,15 @@ impl DoseAttrMap {
         self.resolve_or(DoseAttr::Lag, cmt, PK_IDX_LAGTIME, 0.0, params)
     }
 
+    /// The PkParams slot holding the lag time for a dose into 1-based `cmt`:
+    /// `ALAG{cmt}` if compartment-indexed, else the bare `PK_IDX_LAGTIME`. Single-
+    /// sources the slot-resolution fallback that callers (e.g. the ODE sensitivity
+    /// walk's `dose_lag_slot`) would otherwise re-implement.
+    pub fn lag_slot(&self, cmt: usize) -> usize {
+        self.indexed_slot(DoseAttr::Lag, cmt)
+            .unwrap_or(PK_IDX_LAGTIME)
+    }
+
     /// Read `attr` for `cmt` from its indexed slot, else from `bare_slot`, else
     /// `dflt` (both reads are bounds-checked so a short `params` slice — e.g. an
     /// analytical model whose vector stops at slot 8 — cannot panic).

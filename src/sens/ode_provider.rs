@@ -34,7 +34,7 @@ use super::provider::{ObsGrad, ObsSens, SubjectSens};
 use crate::ode::predictions::{input_rate_consumes_cmt, OdeReadout, OdeSpec};
 use crate::ode::solver::solve_ode_g;
 use crate::pk::absorption::PreparedInputRate;
-use crate::types::{CompiledModel, ScalingSpec, Subject, PK_IDX_F, PK_IDX_LAGTIME};
+use crate::types::{CompiledModel, ScalingSpec, Subject, PK_IDX_F};
 use std::cell::RefCell;
 
 /// Largest individual-parameter count for which the `Dual2<N>` path is
@@ -361,8 +361,11 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // walk seeds compartments at zero). Estimated **lagtime IS supported**: the IOV walk
     // runs through `integrate_tvcov_readout`/`integrate_tvcov_g`, which applies the dose-
     // time shift + event-time saltation per occasion-seeded dose (#439 lagtime × IOV).
-    // (`ode_analytical_supported` excludes indexed `ALAGn`; the per-subject gate excludes
-    // infusion/SS/reset, so lagtime here is bare + bolus.)
+    // (`ode_analytical_supported` excludes indexed `ALAGn`. The per-subject gate
+    // `ode_iov_subject_supported` now ADMITS finite-duration infusions and EVID 3/4 resets
+    // — the shared `integrate_tvcov_g` walk carries the rate-boundary saltation and the
+    // `reset_floor` per occasion — and declines only SS+ii>0, rate-defined-under-F, and
+    // pk-only breakpoints (#472 review round 2 follow-up #2).)
     if !matches!(model.scaling, ScalingSpec::None) || model.log_transform {
         return false;
     }
@@ -1358,11 +1361,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         subject
             .doses
             .iter()
-            .map(|d| {
-                attr_map
-                    .indexed_slot(crate::types::DoseAttr::Lag, d.cmt)
-                    .unwrap_or(PK_IDX_LAGTIME)
-            })
+            .map(|d| attr_map.lag_slot(d.cmt))
             .collect()
     } else {
         Vec::new()
@@ -2640,6 +2639,14 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // once per subject rather than per RK45 stage (#451 / #433 review #6).
     let dose_f_bio_all: Vec<T> = vec![f_bio; subject.doses.len()];
 
+    // Skip the per-segment active-infusion scan/alloc entirely for the common bolus-only /
+    // oral subject (no infusion → empty active set every segment) — mirrors the
+    // `integrate_tvcov_g` short-circuit (#472 review round 2 #7).
+    let has_any_infusion = subject
+        .doses
+        .iter()
+        .any(crate::ode::predictions::is_real_infusion);
+
     // Most-recent EVID 3/4 reset time (`NEG_INFINITY` until the first reset). An infusion
     // whose window *straddles* a reset must stop contributing afterward — the reset zeroed
     // the state, and production drops such infusions from the active set via `reset_floor`
@@ -2708,22 +2715,29 @@ fn integrate_g<T: crate::sens::num::PkNum>(
 
         // Infusions spanning this whole segment add a constant rate forcing
         // F·rate to their compartment (the break times guarantee a segment is
-        // fully inside or outside each infusion window).
-        let active_inf: Vec<(usize, f64)> = subject
-            .doses
-            .iter()
-            // `d.cmt >= 1`: a malformed `CMT=0` infusion must not saturate to compartment 0
-            // (matches the bolus path above) (#472 review round 2 #6).
-            .filter(|d| d.is_infusion() && d.cmt >= 1)
-            // `d.time >= reset_floor`: an infusion started before the most recent reset is
-            // off — its window may straddle the reset (#472 review round 2 #1).
-            .filter(|d| {
-                d.time >= reset_floor
-                    && d.time <= t_start + 1e-9
-                    && d.time + d.duration >= t_end - 1e-9
-            })
-            .map(|d| (d.cmt.saturating_sub(1), d.rate))
-            .collect();
+        // fully inside or outside each infusion window). Skipped for bolus-only subjects.
+        let active_inf: Vec<(usize, f64)> = if !has_any_infusion {
+            Vec::new()
+        } else {
+            subject
+                .doses
+                .iter()
+                // `d.cmt >= 1`: a malformed `CMT=0` infusion must not saturate to compartment
+                // 0 (matches the bolus path above) (#472 review round 2 #6).
+                .filter(|d| d.is_infusion() && d.cmt >= 1)
+                // `d.time >= reset_floor`: an infusion started before the most recent reset is
+                // off — its window may straddle the reset (#472 review round 2 #1). Window
+                // epsilon = production's `INFUSION_EPS = 1e-12` (was a looser 1e-9), so the
+                // static walk includes/excludes a boundary infusion identically to production
+                // (#472 review round 2 #6).
+                .filter(|d| {
+                    d.time >= reset_floor
+                        && d.time <= t_start + 1e-12
+                        && d.time + d.duration >= t_end - 1e-12
+                })
+                .map(|d| (d.cmt.saturating_sub(1), d.rate))
+                .collect()
+        };
 
         // Last effective dose at or before the segment start, for TAD.
         let last_dose_eff = subject
@@ -3569,6 +3583,33 @@ mod tests {
             DoseEvent::new(10.0, 1000.0, 1, 0.0, false, 0.0),
         ];
         subject.reset_times = vec![10.0];
+        check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
+    }
+
+    /// **Static walk: infusion straddling an EVID 3/4 reset.** A plain subject (no TV-cov,
+    /// no lagtime) with an infusion window straddling a reset routes to the *static*
+    /// `integrate_g` walk via `ode_subject_supported` — whose `active_inf` must drop the
+    /// pre-reset infusion afterward (`reset_floor`), else `F·rate` leaks into the post-reset
+    /// segments. The PR fixed the event-driven twin; this guards the static path so a future
+    /// edit can't silently reintroduce the pre-PR leak (#472 review round 2 #1). The
+    /// post-reset observations (3, 4, 8) are the ones that catch it.
+    #[test]
+    fn ode_provider_static_infusion_reset_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 3.0, 4.0, 8.0]);
+        subject.doses = vec![
+            // Infusion rate 200, amt 1000 → 5 h window [0, 5], straddling the reset at t=2.
+            DoseEvent::new(0.0, 1000.0, 1, 200.0, false, 0.0),
+            // EVID=4 re-dose (bolus) at the reset.
+            DoseEvent::new(2.0, 1000.0, 1, 0.0, false, 0.0),
+        ];
+        subject.reset_times = vec![2.0];
+        assert!(subject.doses[0].is_infusion() && subject.has_resets());
+        // Plain subject → the static `integrate_g` path, NOT the event-driven walk.
+        assert!(
+            !ode_tvcov_supported(&model, &subject) && ode_subject_supported(&model, &subject),
+            "infusion+reset with no TV-cov/lagtime must route to the static integrate_g walk"
+        );
         check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
     }
 

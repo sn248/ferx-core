@@ -72,6 +72,35 @@ NONMEM's per-compartment `ALAG1`, `ALAG2`, ... are mapped to a single
 For typical PK models (one absorption compartment, doses into the depot)
 this is equivalent to setting `ALAG1` on the depot compartment.
 
+### Numeric cross-check against NONMEM 7.5.1
+
+The analytic FOCE/FOCEI lagtime gradient is the exact derivative (verified
+result-neutral against finite differences) of the lagtime *prediction* — and that
+prediction is validated numerically against NONMEM. For a 1-cpt oral `SS=1` model
+(`II=24`, `AMT=100`, `CL=2`, `V=20`, `KA=1.5`, `ALAG1=1.5`), ferx's population
+`PRED` matches NONMEM 7.5.1 (`$ESTIMATION MAXEVAL=0`) to `<1e-4` relative across
+the dosing interval — including the two pre-lag samples that fall in the previous
+interval's steady-state tail (the case that historically regressed):
+
+| TIME | ferx `PRED` | NONMEM 7.5.1 `PRED` |
+|-----:|------------:|--------------------:|
+|  0.5 |     0.59069 |             0.59069 |
+|  1.0 |     0.56188 |             0.56188 |
+|  2.0 |     3.07370 |             3.07370 |
+|  4.0 |     4.46240 |             4.46240 |
+|  8.0 |     3.07540 |             3.07540 |
+| 12.0 |     2.06170 |             2.06170 |
+| 18.0 |     1.13150 |             1.13150 |
+| 23.0 |     0.68628 |             0.68628 |
+| 25.0 |     0.56188 |             0.56188 |
+| 30.0 |     0.34080 |             0.34080 |
+
+The reference (NONMEM control stream + data) and the assertion live in
+`tests/ss_lagtime_nonmem.rs`; per-path coverage (analytical / event-driven / ODE)
+is in the `*_with_lagtime_matches_nonmem` unit tests. Because the gradient is the
+exact derivative of this NONMEM-matching prediction, a FOCE/FOCEI fit driven by it
+descends the same objective surface NONMEM's `ALAG`-shifted prediction defines.
+
 If both `lagtime=` and `alag=` are supplied on the same `[structural_model]`
 line (or if both keys appear in a programmatically constructed PK
 parameter map), `lagtime` wins. This is intentional but unlikely to be

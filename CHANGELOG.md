@@ -196,6 +196,11 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- Simulation, NPDE/NPD diagnostics, and the NCA-init grid sweep now honour
+  time-varying covariate snapshots on dose, observation, and EVID=2 rows instead
+  of using only each subject's baseline covariates (#506). FREM covariate
+  pseudo-observations keep their additive `EPSCOV` error in simulation/NPDE
+  rather than being fed through the PK residual-error model.
 - **TTE simulation now applies administrative right-censoring** (#440). `simulate()`
   for a `[event_model]` (TTE) endpoint previously emitted *every* drawn event time as
   an uncensored event, so simulated data could not reproduce a study's censoring

@@ -3970,6 +3970,11 @@ pub enum ParameterScaling {
 
 impl Optimizer {
     pub fn label(self) -> &'static str {
+        // NB: the `bfgs`/`lbfgs` labels no longer round-trip through the parser —
+        // `apply_fit_option` resolves both keywords to `NloptLbfgs` (see #483).
+        // The labels stay as the variant's own name for truthful run provenance;
+        // only a Rust caller that constructs `Optimizer::Bfgs`/`Lbfgs` directly can
+        // produce them, and those variants are slated for removal.
         match self {
             Optimizer::Bfgs => "bfgs",
             Optimizer::Lbfgs => "lbfgs",

@@ -962,18 +962,20 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     //     `analytic_eta_nll_gradient_with_schedule` (provider-agnostic), so the
     //     light Dual1 ODE walk serves these models too. M3 BLOQ + `iiv_on_ruv`
     //     keeps FD (the censored residual-eta second derivatives are not assembled).
-    //   - LTBS: the analytic-EBE minimum can sit off the objective's own EBE and
-    //     corrupt the covariance Hessian / SEs (~5× on the analytical path). The
-    //     ODE `Dual1` walk shares `solve_ode_g` with the objective so the mismatch
-    //     is likely benign, but that is unmeasured — decline until a cov-SE test on
-    //     an LTBS ODE model validates it (#438 review).
+    //   - LTBS: unlike the closed-form path (whose provider closed forms agree with
+    //     `compute_predictions` only to ~1e-9, amplified into the covariance Hessian
+    //     under the `g = ln(f)` wrap), the ODE `Dual1` walk shares `solve_ode_g`
+    //     with the objective, so the analytic-EBE *is* the objective's own minimum —
+    //     the gradient matches FD of `individual_nll` and the analytic/FD EBEs agree
+    //     to integrator tolerance, leaving the covariance Hessian clean. Validated
+    //     by `ode_ltbs_inner_grad_matches_fd` / `ode_ltbs_inner_ebe_matches_fd`
+    //     (#474). So ODE-LTBS takes the analytic inner gradient.
     if model.ode_spec.is_some() {
         if no_analytic_inner_forced()
             || matches!(model.gradient_method, GradientMethod::Fd)
             || model.is_sde()
             || (model.residual_error_eta.is_some()
                 && matches!(model.bloq_method, crate::types::BloqMethod::M3))
-            || model.log_transform
         {
             return false;
         }
@@ -2735,6 +2737,92 @@ mod iov_tests {
             em[k] -= h;
             let fd = (nll(&ep) - nll(&em)) / (2.0 * h);
             approx::assert_relative_eq!(analytic[k], fd, max_relative = 1e-5, epsilon = 1e-6);
+        }
+    }
+
+    /// Parse an ODE + LTBS (`log_additive`) + `iiv_on_ruv` model and build a
+    /// subject with log-scale observations, shared by the two ODE-LTBS inner tests.
+    fn ode_ltbs_ruv_model_and_subject() -> (CompiledModel, Subject) {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(4.0,0.1,100.0)\n  theta TVV(30.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_RUV ~ 0.10\n  sigma ADD_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ log_additive(ADD_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+        )
+        .expect("parse");
+        assert!(model.log_transform, "log_additive must set LTBS");
+        assert_eq!(model.residual_error_eta, Some(2));
+        // Predictions for an LTBS model are on the log scale; perturb them so the
+        // residual is nonzero.
+        let mut subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 7],
+            obs_cmts: vec![1; 7],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 7],
+            occasions: vec![1; 7],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let preds = crate::pk::compute_predictions_with_tv(
+            &model,
+            &subject,
+            &model.default_params.theta,
+            &[0.1, -0.1, 0.0],
+        );
+        subject.observations = preds.iter().map(|p| p + 0.2).collect();
+        (model, subject)
+    }
+
+    /// ODE + LTBS + `iiv_on_ruv`: the analytic inner η-gradient must match a central
+    /// FD of the production `individual_nll` (which applies the `g = ln(f)` wrap and
+    /// the `exp(2·η_ruv)` scale). Confirms the residual-eta column and the log chain
+    /// compose correctly (#474).
+    #[test]
+    fn ode_ltbs_inner_grad_matches_fd() {
+        let (model, subject) = ode_ltbs_ruv_model_and_subject();
+        check_inner_ruv_grad(&model, &subject, &[0.15, -0.10, 0.20]);
+    }
+
+    /// The covariance concern that kept LTBS on the FD inner (#438): the analytic
+    /// EBE must coincide with the FD (objective's-own) EBE. For ODE the Dual1 walk
+    /// shares `solve_ode_g` with `individual_nll`, so they agree to integrator
+    /// tolerance — leaving the covariance Hessian clean (#474).
+    #[test]
+    fn ode_ltbs_inner_ebe_matches_fd() {
+        let (mut model, subject) = ode_ltbs_ruv_model_and_subject();
+        let params = model.default_params.clone();
+
+        model.gradient_method = GradientMethod::Auto; // analytic inner
+        assert!(
+            analytic_inner_grad_supported(&model, &subject),
+            "ODE-LTBS subject should now take the analytic inner gradient"
+        );
+        let analytic = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+
+        model.gradient_method = GradientMethod::Fd; // force FD inner
+        assert!(!analytic_inner_grad_supported(&model, &subject));
+        let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+
+        assert!(
+            analytic.converged && fd.converged,
+            "both EBE solves converge"
+        );
+        for k in 0..model.n_eta {
+            approx::assert_relative_eq!(
+                analytic.eta[k],
+                fd.eta[k],
+                max_relative = 1e-5,
+                epsilon = 1e-7
+            );
         }
     }
 

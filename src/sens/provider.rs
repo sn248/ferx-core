@@ -275,9 +275,7 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
         // gradient on BOTH loops — the IOV inner gradient does not carry the
         // variance scaling, and the residual-eta censored second derivatives are
         // not assembled.
-        && !(model.residual_error_eta.is_some()
-            && (model.n_kappa > 0
-                || matches!(model.bloq_method, crate::types::BloqMethod::M3)))
+        && !model.iiv_on_ruv_forces_fd()
 }
 
 /// Whether the light **ODE inner** η-gradient (`Dual1`) serves this model+subject:

@@ -148,6 +148,15 @@ struct Prep {
     ruv_scale: f64,
 }
 
+/// Residual-eta coupling `κⱼ = ∂(1−ε²/R)/∂f = 2ε/R + ε²d/R²` — the `f`-derivative
+/// of the residual-eta data gradient, used in the mixed η-θ block and the true
+/// inner Hessian's residual-eta row (#474). Single source so the two assemblies
+/// can't diverge.
+#[inline]
+fn ruv_kappa(eps: f64, r: f64, d: f64) -> f64 {
+    2.0 * eps / r + eps * eps * d / (r * r)
+}
+
 fn prepare(
     model: &CompiledModel,
     subject: &Subject,
@@ -204,9 +213,13 @@ fn prepare_stacked(
     // `∂²lᵢ/∂η_ruv² = Σ 2ε²/R`, `∂²lᵢ/∂η_ruv∂η_l = Σ κⱼ a_{jl}`, and the matching
     // `log|H̃|` derivatives. (M3 BLOQ + `iiv_on_ruv` routes to FD upstream, so no
     // censored residual-eta second derivatives are needed here.)
-    let ruv_scale = match ruv {
-        Some(k) => (2.0 * eta_hat[k]).exp(),
-        None => 1.0,
+    // Reuse the canonical `exp(2·η_ruv)` link (the IOV path forces `ruv = None`
+    // to keep its residual variance unscaled, so gate on the local `ruv`, not on
+    // `model.residual_error_eta`).
+    let ruv_scale = if ruv.is_some() {
+        model.residual_var_scale(eta_hat)
+    } else {
+        1.0
     };
 
     // H̃ = Σ pⱼ aⱼaⱼᵀ + Ω⁻¹ ; true inner Hessian H = ½Σ(α'ⱼ aⱼaⱼᵀ + αⱼ Aⱼ) + Ω⁻¹.
@@ -241,6 +254,12 @@ fn prepare_stacked(
         let t = if is_cens {
             // M3 + `iiv_on_ruv` routes to FD upstream (`analytic_outer_gradient_
             // available`), so `is_cens` and `ruv` never co-occur on a reachable call.
+            // `r`/`d`/`d2` here carry `ruv_scale`; if a future caller bypassed the
+            // gate, the censored scalars would get a doubly-applied scale — pin it.
+            debug_assert!(
+                ruv.is_none(),
+                "M3 censoring with iiv_on_ruv must route to FD (gate bypassed)"
+            );
             censored[j] = true;
             any_cens = true;
             let (g1, g2) = m3_censored_scalars(y, f, r, d, d2);
@@ -274,7 +293,7 @@ fn prepare_stacked(
             let g = t.d / t.r;
             g_ruv[j] = g;
             gp_ruv[j] = d2 / t.r - g * g;
-            let kappa = 2.0 * eps / t.r + eps * eps * t.d / (t.r * t.r);
+            let kappa = ruv_kappa(eps, t.r, t.d);
             htilde[(rr, rr)] += 2.0;
             h_inner[(rr, rr)] += 2.0 * eps * eps / t.r;
             for l in 0..n_eta {
@@ -322,7 +341,6 @@ fn prepare_stacked(
     //   ordinary l: 2( g'ⱼ wⱼ[ruv] a_{jl} + gⱼ Σₖ H̃⁻¹_{ruv,k} A_{jkl} )
     //   l = ruv:    −2 qⱼ/Rⱼ  (`∂p/∂η_ruv = −2/R`; the `c̃[ruv,ruv]=2` is constant)
     if let Some(rr) = ruv {
-        let htinv_r: Vec<f64> = (0..n_eta).map(|k| htilde_inv[(rr, k)]).collect();
         for (j, obs) in sens.obs.iter().enumerate() {
             let wjr = w[j][rr];
             let (g, gp) = (g_ruv[j], gp_ruv[j]);
@@ -332,7 +350,7 @@ fn prepare_stacked(
                 }
                 let mut sa = 0.0;
                 for k in 0..n_eta {
-                    sa += htinv_r[k] * obs.d2f_deta2[k * n_eta + l];
+                    sa += htilde_inv[(rr, k)] * obs.d2f_deta2[k * n_eta + l];
                 }
                 g_eta[l] += 2.0 * (gp * wjr * obs.df_deta[l] + g * sa);
             }
@@ -618,15 +636,16 @@ fn sigma_block(
                 continue;
             }
             let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
-            // ∂R/∂σ_k, ∂d/∂σ_k by central FD of the closed-form error functions.
-            // `et.r`/`et.d` carry the `exp(2·η_ruv)` scale, so lift these too.
-            let r_sig = prep.ruv_scale
-                * (model.error_spec.variance_at(cmt, f, &sp)
-                    - model.error_spec.variance_at(cmt, f, &sm))
-                / (2.0 * h);
-            let d_sig = prep.ruv_scale
-                * (model.error_spec.dvar_df(cmt, f, &sp) - model.error_spec.dvar_df(cmt, f, &sm))
-                / (2.0 * h);
+            // Evaluate the four closed-form error functions once at σ±h and reuse
+            // them for `r_sig`/`d_sig` and the residual-eta `g_sig` below.
+            let vp = model.error_spec.variance_at(cmt, f, &sp);
+            let vm = model.error_spec.variance_at(cmt, f, &sm);
+            let dp_var = model.error_spec.dvar_df(cmt, f, &sp);
+            let dm_var = model.error_spec.dvar_df(cmt, f, &sm);
+            // ∂R/∂σ_k, ∂d/∂σ_k by central FD. `et.r`/`et.d` carry the `exp(2·η_ruv)`
+            // scale, so lift these too.
+            let r_sig = prep.ruv_scale * (vp - vm) / (2.0 * h);
+            let d_sig = prep.ruv_scale * (dp_var - dm_var) / (2.0 * h);
 
             let inv_r = 1.0 / r;
             let inv_r2 = inv_r * inv_r;
@@ -650,11 +669,8 @@ fn sigma_block(
             //     so FD the unscaled quotient directly).
             if let Some(rr) = prep.ruv {
                 m_vec[rr] += eps * eps * inv_r2 * r_sig;
-                let g_sig = (model.error_spec.dvar_df(cmt, f, &sp)
-                    / model.error_spec.variance_at(cmt, f, &sp)
-                    - model.error_spec.dvar_df(cmt, f, &sm)
-                        / model.error_spec.variance_at(cmt, f, &sm))
-                    / (2.0 * h);
+                // `gⱼ = d/R` is scale-free, so FD the unscaled quotient directly.
+                let g_sig = (dp_var / vp - dm_var / vm) / (2.0 * h);
                 fixed += g_sig * prep.w[j][rr];
             }
         }
@@ -1806,11 +1822,14 @@ pub fn subject_eta_dx(
                 continue;
             }
             let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
-            let r_sig = (model.error_spec.variance_at(cmt, f, &sp)
-                - model.error_spec.variance_at(cmt, f, &sm))
+            // `et.r`/`et.d` carry the `exp(2·η_ruv)` scale, so lift `∂R/∂σ`,`∂d/∂σ`
+            // too (mirrors `sigma_block`); `ruv_scale == 1` when there is no ruv.
+            let r_sig = prep.ruv_scale
+                * (model.error_spec.variance_at(cmt, f, &sp)
+                    - model.error_spec.variance_at(cmt, f, &sm))
                 / (2.0 * h);
-            let d_sig = (model.error_spec.dvar_df(cmt, f, &sp)
-                - model.error_spec.dvar_df(cmt, f, &sm))
+            let d_sig = prep.ruv_scale
+                * (model.error_spec.dvar_df(cmt, f, &sp) - model.error_spec.dvar_df(cmt, f, &sm))
                 / (2.0 * h);
             let inv_r = 1.0 / r;
             let inv_r2 = inv_r * inv_r;
@@ -1819,6 +1838,10 @@ pub fn subject_eta_dx(
                 + ((r - eps * eps) * inv_r2) * d_sig;
             for m in 0..n_eta {
                 mvec[m] += 0.5 * dalpha * obs.df_deta[m];
+            }
+            // Residual-eta row of M (#474): `M[ruv] = ∂(1−ε²/R)/∂σ = ε²/R²·Rσ`.
+            if let Some(rr) = prep.ruv {
+                mvec[rr] += eps * eps * inv_r2 * r_sig;
             }
         }
         out[sigma_start + k] = -(&prep.h_inner_inv * mvec) * sigma[k];
@@ -1896,8 +1919,7 @@ fn mixed_eta_theta(
     for j in 0..n_obs {
         let bjm = obs[j].df_dtheta[m];
         if let Some(rr) = ruv {
-            let (r, d, eps) = (et[j].r, et[j].d, et[j].eps);
-            mk[rr] += (2.0 * eps / r + eps * eps * d / (r * r)) * bjm;
+            mk[rr] += ruv_kappa(et[j].eps, et[j].r, et[j].d) * bjm;
         }
         for k in 0..n_eta {
             let b2 = obs[j].d2f_deta_dtheta[k * n_theta_stride + m];
@@ -2718,6 +2740,40 @@ mod tests {
             xm[k] -= h;
             let ep = precise_ebe(&model, &subject, &unpack_params(&xp, &template));
             let em = precise_ebe(&model, &subject, &unpack_params(&xm, &template));
+            for l in 0..n_eta {
+                let fd = (ep[l] - em[l]) / (2.0 * h);
+                approx::assert_relative_eq!(jac[k][l], fd, max_relative = 2e-3, epsilon = 1e-6);
+            }
+        }
+    }
+
+    /// #474 regression: `subject_eta_dx` for an `iiv_on_ruv` model. The σ columns
+    /// of `dη̂/dx` must carry the `exp(2·η_ruv)` scale and the residual-eta row of
+    /// `M_σ`, matching FD of the (scaled) EBE — this guards the parity with
+    /// `sigma_block` that an earlier revision broke (dropped `ruv_scale` + the
+    /// residual row, silently wrong σ columns).
+    #[test]
+    fn eta_dx_matches_fd_iiv_on_ruv() {
+        use crate::estimation::parameterization::pack_params;
+        let model = parse_model_string(WARFARIN_RUV).expect("parse");
+        let theta = vec![0.22, 11.0, 1.4];
+        let subject = ruv_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let mut template = model.default_params.clone();
+        template.theta = theta.clone();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let eta_hat = precise_ebe_ruv(&model, &subject, &params);
+
+        let jac = subject_eta_dx(&model, &subject, &template, &x, &eta_hat).expect("supported");
+        let n_eta = model.n_eta;
+        for k in 0..x.len() {
+            let h = 1e-5 * (1.0 + x[k].abs());
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            let ep = precise_ebe_ruv(&model, &subject, &unpack_params(&xp, &template));
+            let em = precise_ebe_ruv(&model, &subject, &unpack_params(&xm, &template));
             for l in 0..n_eta {
                 let fd = (ep[l] - em[l]) / (2.0 * h);
                 approx::assert_relative_eq!(jac[k][l], fd, max_relative = 2e-3, epsilon = 1e-6);

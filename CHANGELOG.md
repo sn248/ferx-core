@@ -34,6 +34,28 @@ section of the SDLC for the versioning policy).
   combination with a steady-state dose (`W_STEADY_STATE_INIT`) or a compartment
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
+### Fixed
+- **Exact analytic FOCE/FOCEI gradient for `iiv_on_ruv` (IIV on residual error).**
+  Models with a residual-error eta (`Y = IPRED + EPS·EXP(η_ruv)`) now use the
+  exact closed-form gradient on both the inner EBE and outer θ/Ω/σ loops, where
+  the residual-eta column previously fell back to (and, with the `auto`/L-BFGS
+  optimiser, silently mis-computed) a gradient that omitted the `exp(2·η_ruv)`
+  variance scaling. The inner η-gradient scales `v`/`dv_df` and adds the
+  `Σ(1−ε²/v)` residual-eta column; the outer assembly adds the Almquist `c̃=2`
+  interaction column to `H̃`, the true-Hessian `2ε²/R` / `κⱼaⱼ` terms, and their
+  `log|H̃|` θ/Ω/σ derivatives. Validated to ~1e-11 against reconverged finite
+  differences of ferx's own FOCEI marginal (whose value is NONMEM-validated, #413).
+  The assembly is provider-agnostic, so it covers the closed-form (analytical
+  1-/2-/3-cpt), **ODE** (`[odes]`), and **LTBS** (`log_additive`) paths — for LTBS
+  the outer gradient is analytic while the inner EBE keeps finite differences (the
+  existing LTBS choice, #438). IOV and M3-BLOQ `iiv_on_ruv` keep the
+  finite-difference gradient. (#474)
+- **Spurious "not referenced" warning for the `iiv_on_ruv` eta.** A residual-error
+  random effect is referenced from `[error_model]` (not an individual-parameter
+  expression), so it was falsely warned as "declared but not referenced … will not
+  affect predictions or be meaningfully estimated" even though it scales the
+  residual variance and is estimated. The warning is now suppressed for that eta.
+  (#474)
 
 ### Performance
 - **Ω-preconditioned inner EBE loop for all FOCE/FOCEI fits.** The inner BFGS
@@ -142,6 +164,14 @@ section of the SDLC for the versioning policy).
   the outer optimiser's trajectory: harmless for the BOBYQA default but can derail
   a gradient-based outer optimiser (e.g. `mma`) into a worse basin on some models.
   Validate OFV/estimates on your model + `optimizer` before enabling.
+- **Competing-risks TTE (cause-specific hazards)** (#440). Multiple `[event_model NAME]`
+  blocks on distinct compartments now model mutually-exclusive event types that share the
+  model's random effects (a common frailty). `simulate()` draws the competing causes
+  correctly — the earliest latent event is observed and the others are right-censored at
+  that time — and `predict_survival()` gains a cause-specific cumulative incidence `cif`
+  plus the all-cause survival `survival_all` (with `Σ_k cif_k(t) + survival_all(t) = 1`),
+  the correct competing-risks quantities. Example `examples/tte_competing_risks.ferx`.
+  Behind the `survival` feature.
 - **`[event_model]` hazard expressions can reference `[individual_parameters]`** names —
   e.g. a hazard driven by an individual `CL` — resolved per subject at evaluation time, in
   addition to the existing theta/eta/covariate namespace. Intermediate variables and names
@@ -258,6 +288,12 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- The `auto` optimizer now selects the derivative-free Bobyqa for time-to-event
+  (`[event_model]`) objectives, which are finite-difference-only. The shared
+  analytic-outer-gradient predicate previously reported a gradient for TTE (and
+  mixed PK+TTE) models that the sensitivity provider cannot supply, so `auto`
+  resolved to a gradient-based optimizer that stalled at the initial estimates;
+  TTE fits with the default optimizer now converge (#490).
 - **`[simulation]` block now honours the documented `n_subjects` / `dose_amt` /
   `dose_cmt` keys.** The parser previously only recognised the short
   `subjects` / `dose` / `cmt` spellings and **silently ignored** every other key,

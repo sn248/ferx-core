@@ -70,14 +70,6 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     if model.has_tte() {
         return Some("time-to-event ([event_model]) hazard likelihood");
     }
-    // IIV on residual error (`Y = IPRED + EPS*EXP(ETA)`). The analytical kernels
-    // build the residual variance from σ alone and have no rule for the
-    // per-subject `exp(2·η_ruv)` scaling; the EBE search must see the scaled
-    // variance, so route these models to FD (which differences the real
-    // `individual_nll`, where the scale is applied). See #409.
-    if model.residual_error_eta.is_some() {
-        return Some("IIV on residual error (iiv_on_ruv)");
-    }
     None
 }
 
@@ -930,11 +922,15 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     ) {
         return false;
     }
-    // IIV on residual error (#409): the Dual2 kernels build the residual variance
-    // from σ alone and carry no `exp(2·η_ruv)` scaling rule, so the EBE search
-    // must reconverge against the scaled `individual_nll` under FD (same reason as
-    // `analytical_ad_unsupported`).
-    if model.residual_error_eta.is_some() {
+    // IIV on residual error (#409/#474): the closed-form inner η-gradient
+    // (`analytic_eta_nll_gradient_with_schedule`) scales `v`/`dv_df` by
+    // `exp(2·η_ruv)` and carries the `η_ruv` variance column, so the closed-form
+    // path serves these models analytically — as does the ODE `Dual1` walk (the
+    // scaling lives in the shared, provider-agnostic gradient; see the ODE branch
+    // of `analytic_inner_grad_supported`). IOV + `iiv_on_ruv` and M3-BLOQ +
+    // `iiv_on_ruv` keep FD on both loops, matching the outer predicate
+    // (`analytic_outer_gradient_available`) via the shared `iiv_on_ruv_forces_fd`.
+    if model.iiv_on_ruv_forces_fd() {
         return false;
     }
     crate::sens::provider::analytical_supported(model)
@@ -959,20 +955,24 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // per-subject scope ([`ode_inner_grad_supported`]). The global escape hatches
     // plus the model-level exclusions the analytical path applies in
     // `analytic_inner_grad_supported_model` still hold here:
-    //   - IIV on residual error (#409): the dual kernels build the residual
-    //     variance from σ alone, with no `exp(2·η_ruv)` scaling, so the EBE must
-    //     reconverge against the scaled `individual_nll` under FD.
-    //   - LTBS: the analytic-EBE minimum can sit off the objective's own EBE and
-    //     corrupt the covariance Hessian / SEs (~5× on the analytical path). The
-    //     ODE `Dual1` walk shares `solve_ode_g` with the objective so the mismatch
-    //     is likely benign, but that is unmeasured — decline until a cov-SE test on
-    //     an LTBS ODE model validates it (#438 review).
+    //   - IIV on residual error (#409/#474): the residual-variance scaling
+    //     `exp(2·η_ruv)` and the `η_ruv` variance column live in the shared
+    //     `analytic_eta_nll_gradient_with_schedule` (provider-agnostic), so the
+    //     light Dual1 ODE walk serves these models too. M3 BLOQ + `iiv_on_ruv`
+    //     keeps FD (the censored residual-eta second derivatives are not assembled).
+    //   - LTBS: unlike the closed-form path (whose provider closed forms agree with
+    //     `compute_predictions` only to ~1e-9, amplified into the covariance Hessian
+    //     under the `g = ln(f)` wrap), the ODE `Dual1` walk shares `solve_ode_g`
+    //     with the objective, so the analytic-EBE *is* the objective's own minimum —
+    //     the gradient matches FD of `individual_nll` and the analytic/FD EBEs agree
+    //     to integrator tolerance, leaving the covariance Hessian clean. Validated
+    //     by `ode_ltbs_inner_grad_matches_fd` / `ode_ltbs_inner_ebe_matches_fd`
+    //     (#474). So ODE-LTBS takes the analytic inner gradient.
     if model.ode_spec.is_some() {
         if no_analytic_inner_forced()
             || matches!(model.gradient_method, GradientMethod::Fd)
             || model.is_sde()
-            || model.residual_error_eta.is_some()
-            || model.log_transform
+            || model.iiv_on_ruv_forces_fd()
         {
             return false;
         }
@@ -1065,16 +1065,26 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     )?;
     let n_eta = model.n_eta;
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
+    // IIV on residual error (`Y = IPRED + EPS·EXP(η_ruv)`, #409/#474): the residual
+    // variance of every observation scales by `s = exp(2·η_ruv)`, so `v` and
+    // `dv_df` carry that factor. `η_ruv` enters the likelihood only through the
+    // variance (`∂f/∂η_ruv = 0`), so its gradient column is the variance term
+    // `Σ_j (1 − ε²/v)`, plus the `Ω⁻¹η` prior added below — not the shared
+    // `coef·∂f/∂η` loop. (M3 censoring + `iiv_on_ruv` routes to FD upstream, so the
+    // residual-eta column is only ever formed on quantified rows here.)
+    let ruv_idx = model.residual_error_eta;
+    let ruv_scale = model.residual_var_scale(eta);
     let mut grad = vec![0.0_f64; n_eta];
+    let mut ruv_grad = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
         let y = subject.observations[j];
         let cmt = subject.obs_cmts[j];
         let f = obs.f;
-        let v = model.residual_variance_at(cmt, f, sigma);
+        let v = model.residual_variance_at(cmt, f, sigma) * ruv_scale;
         if !(v > 0.0) {
             return None;
         }
-        let dv_df = model.error_spec.dvar_df(cmt, f, sigma);
+        let dv_df = model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale;
         let coef = if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
             m3_censored_dterm_df(y, f, v, dv_df)
         } else {
@@ -1084,6 +1094,15 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         for k in 0..n_eta {
             grad[k] += coef * obs.df_deta[k];
         }
+        if ruv_idx.is_some() {
+            // ∂/∂η_ruv of the per-obs data term: `1 − ε²/v` (the `∂v/∂η_ruv = 2v`
+            // factor cancels the ½).
+            let eps = y - f;
+            ruv_grad += 1.0 - eps * eps / v;
+        }
+    }
+    if let Some(r) = ruv_idx {
+        grad[r] += ruv_grad;
     }
     // Prior: ∂/∂η ½ η'Ω⁻¹η = Ω⁻¹η.
     let eta_v = nalgebra::DVector::from_column_slice(eta);
@@ -2594,6 +2613,366 @@ mod iov_tests {
                 max_relative = 1e-5,
                 epsilon = 1e-7
             );
+        }
+    }
+
+    /// IIV on residual error (#474): the closed-form inner η-gradient must match a
+    /// The inner-gradient model gate accepts a closed-form `iiv_on_ruv` model but
+    /// declines M3 BLOQ + `iiv_on_ruv` (those keep FD on both loops, #474).
+    #[test]
+    fn analytic_inner_grad_gate_iiv_on_ruv() {
+        use crate::parser::model_parser::parse_model_string;
+        let mut model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.13,0.001,10.0)\n  theta TVV(8.0,0.1,500.0)\n  theta TVKA(1.0,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.10\n  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n",
+        )
+        .expect("parse");
+        assert!(analytic_inner_grad_supported_model(&model));
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(!analytic_inner_grad_supported_model(&model));
+    }
+
+    /// central finite difference of the production `individual_nll` (which applies
+    /// the `exp(2·η_ruv)` variance scaling) at a non-zero η — including the `η_ruv`
+    /// column, which the shared `coef·∂f/∂η` loop never touches (`∂f/∂η_ruv = 0`).
+    #[test]
+    fn analytic_eta_gradient_matches_fd_iiv_on_ruv() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.13,0.001,10.0)\n  theta TVV(8.0,0.1,500.0)\n  theta TVKA(1.0,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.10\n  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n",
+        )
+        .expect("parse");
+        assert_eq!(model.residual_error_eta, Some(3));
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![2.1, 3.4, 4.0, 3.1, 1.8, 1.1, 0.4],
+            obs_cmts: vec![1; 7],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 7],
+            occasions: vec![1; 7],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        // A genuinely non-zero η, including the residual-error component.
+        check_inner_ruv_grad(&model, &subject, &[0.20, -0.15, 0.30, 0.25]);
+    }
+
+    /// ODE counterpart of [`analytic_eta_gradient_matches_fd_iiv_on_ruv`]: the
+    /// residual-variance scaling and `η_ruv` column live in the shared, provider-
+    /// agnostic `analytic_eta_nll_gradient`, so the light ODE `Dual1` walk serves
+    /// `iiv_on_ruv` too (#474). Verified against FD of the production `individual_nll`.
+    #[test]
+    fn analytic_eta_gradient_matches_fd_iiv_on_ruv_ode() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(4.0,0.1,100.0)\n  theta TVV(30.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_RUV ~ 0.10\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+        )
+        .expect("parse");
+        assert_eq!(model.residual_error_eta, Some(2));
+        assert!(model.ode_spec.is_some());
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![28.0, 25.0, 20.0, 13.0, 5.5, 2.4, 0.5],
+            obs_cmts: vec![1; 7],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 7],
+            occasions: vec![1; 7],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        check_inner_ruv_grad(&model, &subject, &[0.15, -0.10, 0.25]);
+    }
+
+    /// Compare the analytic inner η-gradient to a central FD of the production
+    /// `individual_nll` (which scales the residual variance by `exp(2·η_ruv)`) at a
+    /// non-zero η — including the `η_ruv` column that `∂f/∂η = 0` leaves to the
+    /// variance term.
+    fn check_inner_ruv_grad(model: &CompiledModel, subject: &Subject, eta: &[f64]) {
+        let params = model.default_params.clone();
+        let analytic = analytic_eta_nll_gradient(
+            model,
+            subject,
+            &params.theta,
+            eta,
+            &params.omega,
+            &params.sigma.values,
+        )
+        .expect("ruv model is in analytic inner scope");
+
+        let nll = |e: &[f64]| {
+            crate::stats::likelihood::individual_nll(
+                model,
+                subject,
+                &params.theta,
+                e,
+                &params.omega,
+                &params.sigma.values,
+            )
+        };
+        for k in 0..model.n_eta {
+            let h = 1e-6 * (1.0 + eta[k].abs());
+            let mut ep = eta.to_vec();
+            ep[k] += h;
+            let mut em = eta.to_vec();
+            em[k] -= h;
+            let fd = (nll(&ep) - nll(&em)) / (2.0 * h);
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 1e-5, epsilon = 1e-6);
+        }
+    }
+
+    /// Parse an ODE + LTBS (`log_additive`) + `iiv_on_ruv` model and build a
+    /// subject with log-scale observations, shared by the two ODE-LTBS inner tests.
+    fn ode_ltbs_ruv_model_and_subject() -> (CompiledModel, Subject) {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(4.0,0.1,100.0)\n  theta TVV(30.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_RUV ~ 0.10\n  sigma ADD_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ log_additive(ADD_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+        )
+        .expect("parse");
+        assert!(model.log_transform, "log_additive must set LTBS");
+        assert_eq!(model.residual_error_eta, Some(2));
+        // Predictions for an LTBS model are on the log scale; perturb them so the
+        // residual is nonzero.
+        let mut subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 7],
+            obs_cmts: vec![1; 7],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 7],
+            occasions: vec![1; 7],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let preds = crate::pk::compute_predictions_with_tv(
+            &model,
+            &subject,
+            &model.default_params.theta,
+            &[0.1, -0.1, 0.0],
+        );
+        subject.observations = preds.iter().map(|p| p + 0.2).collect();
+        (model, subject)
+    }
+
+    /// ODE + LTBS + `iiv_on_ruv`: the analytic inner η-gradient must match a central
+    /// FD of the production `individual_nll` (which applies the `g = ln(f)` wrap and
+    /// the `exp(2·η_ruv)` scale). Confirms the residual-eta column and the log chain
+    /// compose correctly (#474).
+    #[test]
+    fn ode_ltbs_inner_grad_matches_fd() {
+        let (model, subject) = ode_ltbs_ruv_model_and_subject();
+        check_inner_ruv_grad(&model, &subject, &[0.15, -0.10, 0.20]);
+    }
+
+    /// The covariance concern that kept LTBS on the FD inner (#438): the analytic
+    /// EBE must coincide with the FD (objective's-own) EBE. For ODE the Dual1 walk
+    /// shares `solve_ode_g` with `individual_nll`, so they agree to integrator
+    /// tolerance — leaving the covariance Hessian clean (#474).
+    #[test]
+    fn ode_ltbs_inner_ebe_matches_fd() {
+        let (mut model, subject) = ode_ltbs_ruv_model_and_subject();
+        let params = model.default_params.clone();
+
+        model.gradient_method = GradientMethod::Auto; // analytic inner
+        assert!(
+            analytic_inner_grad_supported(&model, &subject),
+            "ODE-LTBS subject should now take the analytic inner gradient"
+        );
+        let analytic = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+
+        model.gradient_method = GradientMethod::Fd; // force FD inner
+        assert!(!analytic_inner_grad_supported(&model, &subject));
+        let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+
+        assert!(
+            analytic.converged && fd.converged,
+            "both EBE solves converge"
+        );
+        for k in 0..model.n_eta {
+            approx::assert_relative_eq!(
+                analytic.eta[k],
+                fd.eta[k],
+                max_relative = 1e-5,
+                epsilon = 1e-7
+            );
+        }
+    }
+
+    /// Parse a plain ODE + LTBS (`log_additive`) model with **no** `iiv_on_ruv`
+    /// — the exact #438 case — and a subject with log-scale observations.
+    fn ode_ltbs_no_ruv_model_and_subject() -> (CompiledModel, Subject) {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(4.0,0.1,100.0)\n  theta TVV(30.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma ADD_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ log_additive(ADD_ERR)\n[fit_options]\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+        )
+        .expect("parse");
+        assert!(model.log_transform, "log_additive must set LTBS");
+        assert_eq!(model.residual_error_eta, None, "no iiv_on_ruv");
+        let mut subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 7],
+            obs_cmts: vec![1; 7],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 7],
+            occasions: vec![1; 7],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let preds = crate::pk::compute_predictions_with_tv(
+            &model,
+            &subject,
+            &model.default_params.theta,
+            &[0.1, -0.1],
+        );
+        subject.observations = preds.iter().map(|p| p + 0.2).collect();
+        (model, subject)
+    }
+
+    /// #438 regression: PR #474 flipped plain ODE + LTBS (no `iiv_on_ruv`) onto the
+    /// analytic inner. The #438 concern was that the analytic EBE could drift off the
+    /// objective's own EBE and inflate the covariance Hessian (~5× SEs). For the ODE
+    /// `Dual1` walk that shares `solve_ode_g` with `individual_nll` this must NOT
+    /// happen — the analytic and FD EBEs must coincide to integrator tolerance.
+    #[test]
+    fn ode_ltbs_no_ruv_inner_ebe_matches_fd() {
+        let (mut model, subject) = ode_ltbs_no_ruv_model_and_subject();
+        let params = model.default_params.clone();
+
+        model.gradient_method = GradientMethod::Auto; // analytic inner
+        assert!(
+            analytic_inner_grad_supported(&model, &subject),
+            "plain ODE-LTBS subject should take the analytic inner gradient"
+        );
+        let analytic = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+
+        model.gradient_method = GradientMethod::Fd; // force FD inner
+        assert!(!analytic_inner_grad_supported(&model, &subject));
+        let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+
+        assert!(
+            analytic.converged && fd.converged,
+            "both EBE solves converge"
+        );
+        for k in 0..model.n_eta {
+            // Two independently-converged EBE solves; agreement to ~1e-4 confirms
+            // no #438-style drift (which inflated SEs ~5×, i.e. ~400% off).
+            approx::assert_relative_eq!(
+                analytic.eta[k],
+                fd.eta[k],
+                max_relative = 1e-4,
+                epsilon = 1e-6
+            );
+        }
+    }
+
+    /// ODE + LTBS + `iiv_on_ruv` with an **eta-dependent initial condition**
+    /// (`init(central) = C0·V`, as in the thioguanine `run14` model). The analytic
+    /// inner gradient must still match FD of `individual_nll` — confirms the init-
+    /// condition η-derivative composes with the log wrap and residual-eta column.
+    #[test]
+    fn ode_ltbs_init_cond_inner_grad_matches_fd() {
+        use crate::parser::model_parser::parse_model_string;
+        let src = "[parameters]\n  theta TVCL(4.0,0.1,100.0)\n  theta TVV(30.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_RUV ~ 0.10\n  sigma ADD_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  C0 = 5.0\n[structural_model]\n  ode(states=[central])\n[odes]\n  init(central) = C0 * V\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ log_additive(ADD_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  ode_reltol = 1e-11\n  ode_abstol = 1e-13\n";
+        let model = parse_model_string(src).expect("parse");
+        let mut subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 7],
+            obs_cmts: vec![1; 7],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 7],
+            occasions: vec![1; 7],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let preds = crate::pk::compute_predictions_with_tv(
+            &model,
+            &subject,
+            &model.default_params.theta,
+            &[0.1, -0.1, 0.0],
+        );
+        subject.observations = preds.iter().map(|p| p + 0.2).collect();
+        let params = model.default_params.clone();
+        let eta = [0.15_f64, -0.10, 0.20];
+        let analytic = analytic_eta_nll_gradient(
+            &model,
+            &subject,
+            &params.theta,
+            &eta,
+            &params.omega,
+            &params.sigma.values,
+        )
+        .expect("scope");
+        for k in 0..model.n_eta {
+            let h = 1e-6 * (1.0 + eta[k].abs());
+            let mut ep = eta;
+            ep[k] += h;
+            let mut em = eta;
+            em[k] -= h;
+            let nllp = crate::stats::likelihood::individual_nll(
+                &model,
+                &subject,
+                &params.theta,
+                &ep,
+                &params.omega,
+                &params.sigma.values,
+            );
+            let nllm = crate::stats::likelihood::individual_nll(
+                &model,
+                &subject,
+                &params.theta,
+                &em,
+                &params.omega,
+                &params.sigma.values,
+            );
+            let fd = (nllp - nllm) / (2.0 * h);
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 1e-5, epsilon = 1e-6);
         }
     }
 

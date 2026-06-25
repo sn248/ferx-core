@@ -182,37 +182,72 @@ fn analytical_init_concentration(
     t: f64,
     p: &PkParams,
 ) -> f64 {
-    use crate::sens::one_cpt::{one_cpt_iv_bolus_g, one_cpt_oral_g};
-    use crate::sens::three_cpt::{three_cpt_iv_bolus_g, three_cpt_oral_g};
-    use crate::sens::two_cpt::{two_cpt_iv_bolus_g, two_cpt_oral_g};
+    // Delegate to the generic form at `T = f64`; the single formula dispatch
+    // lives there so the Dual2/Dual1 sensitivity path (#524) cannot drift from
+    // the f64 prediction.
+    analytical_init_concentration_g::<f64>(
+        pk_model,
+        cmt,
+        a0,
+        t,
+        p.cl(),
+        p.v(),
+        p.q(),
+        p.v2(),
+        p.ka(),
+        p.q3(),
+        p.v3(),
+    )
+}
 
-    let (cl, v) = (p.cl(), p.v());
+/// Generic form of [`analytical_init_concentration`] over [`PkNum`]: evaluating
+/// in `f64` gives the prediction; evaluating in `Dual2<N>`/`Dual1<N>` (with the
+/// amount `a0` and the PK params seeded as duals) gives the exact `∂C/∂A₀`,
+/// `∂C/∂(CL,V,…)` the analytic FOCE/FOCEI provider needs (#524). The amount is a
+/// pre-loaded compartment quantity, so `F = 1` everywhere — an initial condition
+/// is not an absorbed dose. Returns 0 for unsupported compartments defensively
+/// (peripheral inits are rejected at parse time).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analytical_init_concentration_g<T: crate::sens::num::PkNum>(
+    pk_model: PkModel,
+    cmt: usize,
+    a0: T,
+    t: T,
+    cl: T,
+    v: T,
+    q: T,
+    v2: T,
+    ka: T,
+    q3: T,
+    v3: T,
+) -> T {
+    use crate::sens::one_cpt::{one_cpt_iv_bolus_amt_g, one_cpt_oral_amt_g};
+    use crate::sens::three_cpt::{three_cpt_iv_bolus_amt_g, three_cpt_oral_amt_g};
+    use crate::sens::two_cpt::{two_cpt_iv_bolus_amt_g, two_cpt_oral_amt_g};
+
+    let one = T::from_f64(1.0);
     // Central is cmt 2 for oral models (depot is cmt 1), cmt 1 for IV models.
     let central = if pk_model.is_oral() { 2 } else { 1 };
 
     if cmt == central {
         // IV-bolus impulse directly into the central compartment.
         match pk_model {
-            PkModel::OneCptIv | PkModel::OneCptOral => one_cpt_iv_bolus_g::<f64>(a0, t, cl, v),
-            PkModel::TwoCptIv | PkModel::TwoCptOral => {
-                two_cpt_iv_bolus_g::<f64>(a0, t, cl, v, p.q(), p.v2())
-            }
+            PkModel::OneCptIv | PkModel::OneCptOral => one_cpt_iv_bolus_amt_g(a0, t, cl, v),
+            PkModel::TwoCptIv | PkModel::TwoCptOral => two_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2),
             PkModel::ThreeCptIv | PkModel::ThreeCptOral => {
-                three_cpt_iv_bolus_g::<f64>(a0, t, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+                three_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2, q3, v3)
             }
         }
     } else if pk_model.is_oral() && cmt == 1 {
         // Pre-loaded depot amount: first-order absorption into central, F=1.
         match pk_model {
-            PkModel::OneCptOral => one_cpt_oral_g::<f64>(a0, t, cl, v, p.ka(), 1.0),
-            PkModel::TwoCptOral => two_cpt_oral_g::<f64>(a0, t, cl, v, p.q(), p.v2(), p.ka(), 1.0),
-            PkModel::ThreeCptOral => {
-                three_cpt_oral_g::<f64>(a0, t, cl, v, p.q(), p.v2(), p.q3(), p.v3(), p.ka(), 1.0)
-            }
-            _ => 0.0,
+            PkModel::OneCptOral => one_cpt_oral_amt_g(a0, t, cl, v, ka, one),
+            PkModel::TwoCptOral => two_cpt_oral_amt_g(a0, t, cl, v, q, v2, ka, one),
+            PkModel::ThreeCptOral => three_cpt_oral_amt_g(a0, t, cl, v, q, v2, q3, v3, ka, one),
+            _ => T::from_f64(0.0),
         }
     } else {
-        0.0
+        T::from_f64(0.0)
     }
 }
 

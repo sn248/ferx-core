@@ -4364,6 +4364,7 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
 /// Mirrors the Form-B `obs_scale` expression closure in [`build_obs_scale_spec`]:
 /// individual-parameter names resolve from the subject-static `pk_params`, so
 /// `init(central) = CONC0 * V` reads `V` from its PK slot.
+#[allow(clippy::type_complexity)]
 fn build_init_amount_fn(
     value: &str,
     theta_names: &[String],
@@ -4371,12 +4372,49 @@ fn build_init_amount_fn(
     indiv_var_names: &[String],
     pk_indices: &[usize],
     kappa_names: &[String],
-) -> Result<ScaleFn, String> {
-    // Constant fast path (e.g. `init(central) = 0.0`).
+) -> Result<(ScaleFn, Option<ScaleDerivProgram>), String> {
+    // Build the differentiable `A₀` program from a (possibly resolved) expression
+    // AST, mirroring the `obs_scale` deriv block in `build_obs_scale_spec`: a
+    // `Variable(name)` (an individual parameter) → var slot `i` (flat PK slot
+    // `pk_indices[i]`); covariates → cov slots; θ/η are read from the seed duals.
+    // This lets the analytic sensitivity provider differentiate the init impulse
+    // exactly (issue #524) instead of finite-differencing `amount_fn`.
+    let build_deriv = |expr: &Expression| -> ScaleDerivProgram {
+        let mut e = expr.clone();
+        let var_idx: HashMap<String, usize> = indiv_var_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i))
+            .collect();
+        let var_to_pk_slot: Vec<usize> = (0..indiv_var_names.len())
+            .map(|i| pk_indices.get(i).copied().unwrap_or(i))
+            .collect();
+        let mut cov_set = std::collections::HashSet::new();
+        collect_covariates(&e, &mut cov_set);
+        let mut cov_names: Vec<String> = cov_set.into_iter().collect();
+        cov_names.sort();
+        let cov_idx: HashMap<String, usize> = cov_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+        resolve_expr_indices(&mut e, &var_idx, &cov_idx);
+        ScaleDerivProgram {
+            bc: compile_bytecode(&e),
+            n_theta: theta_names.len(),
+            n_eta: eta_names.len(),
+            var_to_pk_slot,
+            cov_names,
+        }
+    };
+
+    // Constant fast path (e.g. `init(central) = 0.0`). Still build a (constant)
+    // deriv program so a constant baseline keeps `gradient = auto` support.
     if let Ok(k) = value.parse::<f64>() {
-        return Ok(Box::new(
-            move |_: &[f64], _: &[f64], _: &HashMap<String, f64>, _: &PkParams| k,
-        ));
+        let deriv = build_deriv(&Expression::Literal(k));
+        let scale_fn: ScaleFn =
+            Box::new(move |_: &[f64], _: &[f64], _: &HashMap<String, f64>, _: &PkParams| k);
+        return Ok((scale_fn, Some(deriv)));
     }
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
     let expr = parse_scalar_expression(value, ctx)
@@ -4397,12 +4435,13 @@ fn build_init_amount_fn(
              structural parameter (e.g. CL) instead."
         ));
     }
+    let deriv = build_deriv(&expr);
     let indiv_to_pk_slot: HashMap<String, usize> = indiv_var_names
         .iter()
         .enumerate()
         .map(|(i, name)| (name.clone(), pk_indices.get(i).copied().unwrap_or(i)))
         .collect();
-    Ok(Box::new(
+    let scale_fn: ScaleFn = Box::new(
         move |theta: &[f64],
               eta: &[f64],
               covariates: &HashMap<String, f64>,
@@ -4417,7 +4456,8 @@ fn build_init_amount_fn(
             let empty_nn: Vec<Vec<f64>> = Vec::new();
             eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
         },
-    ))
+    );
+    Ok((scale_fn, Some(deriv)))
 }
 
 /// Parse the `[initial_conditions]` block (issue #521) into the analytical
@@ -4457,7 +4497,7 @@ fn parse_initial_conditions_block(
                 name
             ));
         }
-        let amount_fn = build_init_amount_fn(
+        let (amount_fn, amount_deriv) = build_init_amount_fn(
             &expr,
             theta_names,
             eta_names,
@@ -4465,7 +4505,11 @@ fn parse_initial_conditions_block(
             pk_indices,
             kappa_names,
         )?;
-        out.push(crate::types::AnalyticalInit { cmt, amount_fn });
+        out.push(crate::types::AnalyticalInit {
+            cmt,
+            amount_fn,
+            amount_deriv,
+        });
     }
     Ok(out)
 }

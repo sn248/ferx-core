@@ -26,9 +26,9 @@ section of the SDLC for the versioning policy).
   equivalent of NONMEM's `A_0(cmt)` and of the ODE-path `init(...)` in `[odes]`.
   A pre-dose baseline (e.g. `init(central) = CONC0 * V`) no longer forces the
   numerical ODE solver: on the 6-thioguanine `run14` model this cuts FOCEI wall
-  time ~13× (27 s → ~2 s) at matching estimates. Models with an initial
-  condition use `gradient = fd` for now (exact-analytic gradients are a
-  follow-up). Edge cases are handled explicitly: the baseline is wiped by a
+  time ~13× (27 s → ~2 s) at matching estimates. Non-IOV init models use exact
+  analytic FOCE/FOCEI gradients under `gradient = auto` (#524); IOV init models
+  use `gradient = fd` for now. Edge cases are handled explicitly: the baseline is wiped by a
   system reset (`EVID = 3/4`), its decay uses each occasion's PK parameters under
   IOV, a `KAPPA_*` reference in the init expression is rejected, and the
   combination with a steady-state dose (`W_STEADY_STATE_INIT`) or a compartment
@@ -58,6 +58,15 @@ section of the SDLC for the versioning policy).
   (#474)
 
 ### Performance
+- **Exact analytic gradients for `[initial_conditions]` models** (#524). A non-IOV
+  closed-form model with an `[initial_conditions]` baseline now runs FOCE/FOCEI
+  on exact analytic `Dual2`/`Dual1` sensitivities under `gradient = auto` instead
+  of falling back to finite differences: the init impulse `A₀ · kernel(t, pk)`
+  and its θ/η dependence thread through the analytic provider (outer θ/η jet and
+  inner η-gradient). Faster (no per-parameter FD probe) and exact, and it
+  re-enables the HMC SAEM E-step (`n_leapfrog > 0`) for baseline models. The
+  analytic gradient matches Richardson finite differences of the (NONMEM-validated)
+  FOCEI marginal to ~1e-3. IOV init models keep the FD fallback (follow-up).
 - **Ω-preconditioned inner EBE loop for all FOCE/FOCEI fits.** The inner BFGS
   now initialises its inverse-Hessian (the search `H0`) to the prior conditional
   scale `diag(1/Ω⁻¹ᵢᵢ)` for every model, not just FREM. A correlated or

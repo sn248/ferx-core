@@ -211,15 +211,25 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
         && model.tv_fn.is_some()
         && model.n_kappa == 0
         && scaling_supported(model)
-        // Initial-compartment amounts (`[initial_conditions]`, #521) are added to
-        // the prediction by `pk::add_analytical_init` but the Dual2 sensitivity
-        // kernels here do not yet carry the init impulse or its θ/η dependence, so
-        // a model with one falls back to FD (correct, just slower). Phase 2 lifts
-        // this once the `*_init_g` differentiable forms land.
-        && model.analytical_init.is_empty()
+        && init_supported(model)
         // Every individual-parameter slot must be one we differentiate. A
         // LAGTIME (slot 8) routes to fall back.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
+}
+
+/// Whether the model's `[initial_conditions]` baseline (#521) is one the Dual2
+/// provider differentiates exactly (#524): every init carries a compiled
+/// `amount_deriv` program and the `(θ, η)` axis count fits the init dispatch
+/// table (`1..=MAX_SCALE_AXES`, shared with the scale program). An init-free
+/// model is trivially supported; a hand-built init with no program, or a model
+/// with more axes than the table covers, routes to FD (correct, just slower).
+fn init_supported(model: &CompiledModel) -> bool {
+    model.analytical_init.is_empty()
+        || (model
+            .analytical_init
+            .iter()
+            .all(|i| i.amount_deriv.is_some())
+            && (1..=MAX_SCALE_AXES).contains(&(model.n_theta + model.n_eta)))
 }
 
 /// Maximum `(θ, η)` axis count for the differentiable `ExpressionScale` program
@@ -1622,6 +1632,26 @@ fn subject_eta_grad_impl(
         };
     }
     let mut out = disp!(1, 2, 3, 4, 5, 6, 7, 8, 9)?;
+    // Analytic `[initial_conditions]` impulse (#524): η-gradient only, layered on
+    // BEFORE scaling — same insertion order as the f64 `pk::add_analytical_init`.
+    // `analytical_supported` (`init_supported`) bounds `n_theta + n_eta` to the
+    // dispatch table, and the inner path declines `ExpressionScale` above, so the
+    // `_ => {}` arm is unreachable for an init model that gets here.
+    if !model.analytical_init.is_empty() {
+        let n_theta = model.n_theta;
+        macro_rules! disp_init {
+            ($($mm:literal),+) => {
+                match n_theta + n_eta {
+                    $($mm => apply_analytical_init_inner::<$mm>(
+                        &mut out, model, subject, &pk, &dp_deta, &slots, theta, eta,
+                        &subject.covariates, n_theta, n_eta,
+                    ),)+
+                    _ => {}
+                }
+            };
+        }
+        disp_init!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+    }
     // Constant `ScalarScale` output divisor: `f_scaled = f/k`, and `∂f/∂η` is
     // linear in `f` so it divides by the same `k` (η-independent). Matches
     // `pk::apply_scaling` (`pred /= s`). Other scaling variants are gated out.
@@ -1801,46 +1831,21 @@ fn apply_expression_scale<const M: usize>(
     n_theta: usize,
     n_eta: usize,
 ) {
-    // Build the dual for each PK slot the scale references: value + ∂p/∂(θ,η),
-    // with the unused θ-θ Hessian block left zero (the quotient rule only reads
-    // η-η and η-θ). PK params not in `slots` (literal constants / undifferentiated)
-    // enter as constants.
+    // Build the dual for each PK slot the scale references: value + ∂p/∂(θ,η) +
+    // η-η / η-θ Hessian (the quotient rule only reads those). PK params not in
+    // `slots` enter as constants. Shared with the analytic init impulse (#524).
     let var_duals: Vec<Dual2<M>> = prog
         .var_to_pk_slot()
         .iter()
-        .map(|&s| match slots.iter().position(|&x| x == s) {
-            Some(j) => {
-                let mut grad = [0.0; M];
-                let mut hess = [[0.0; M]; M];
-                for m in 0..n_theta.min(M) {
-                    grad[m] = pd.dp_dtheta[j][m];
-                }
-                for k in 0..n_eta {
-                    if n_theta + k < M {
-                        grad[n_theta + k] = pd.dp_deta[j][k];
-                    }
-                }
-                for k in 0..n_eta {
-                    for l in 0..n_eta {
-                        if n_theta + k < M && n_theta + l < M {
-                            hess[n_theta + k][n_theta + l] = pd.d2p_deta2[j][k][l];
-                        }
-                    }
-                    for m in 0..n_theta {
-                        if n_theta + k < M && m < M {
-                            let v = pd.d2p_detadtheta[j][k][m];
-                            hess[n_theta + k][m] = v;
-                            hess[m][n_theta + k] = v;
-                        }
-                    }
-                }
-                Dual2 {
-                    value: pk.values.get(s).copied().unwrap_or(0.0),
-                    grad,
-                    hess,
-                }
-            }
-            None => Dual2::constant(pk.values.get(s).copied().unwrap_or(0.0)),
+        .map(|&s| {
+            pk_slot_dual_outer::<M>(
+                s,
+                pk.values.get(s).copied().unwrap_or(0.0),
+                pd,
+                slots,
+                n_theta,
+                n_eta,
+            )
         })
         .collect();
 
@@ -1891,6 +1896,265 @@ fn apply_expression_scale<const M: usize>(
         }
         o.f = f * inv;
     }
+}
+
+/// Build the `Dual2<M>` for PK slot `slot` in `(θ, η)`-axis layout (axes
+/// `0..n_theta` are θ, `n_theta + k` is `η_k`), carrying value + `∂p/∂(θ,η)` +
+/// the η-η / η-θ Hessian blocks from the outer `ParamDerivs`. A slot the program
+/// references but the provider does not differentiate (`slots` miss) enters as a
+/// constant. Shared by the `ExpressionScale` quotient path and the analytic init
+/// impulse (#524) so both seed PK params identically.
+fn pk_slot_dual_outer<const M: usize>(
+    slot: usize,
+    value: f64,
+    pd: &crate::sens::ode_provider::ParamDerivs,
+    slots: &[usize],
+    n_theta: usize,
+    n_eta: usize,
+) -> Dual2<M> {
+    match slots.iter().position(|&x| x == slot) {
+        Some(j) => {
+            let mut grad = [0.0; M];
+            let mut hess = [[0.0; M]; M];
+            for m in 0..n_theta.min(M) {
+                grad[m] = pd.dp_dtheta[j][m];
+            }
+            for k in 0..n_eta {
+                if n_theta + k < M {
+                    grad[n_theta + k] = pd.dp_deta[j][k];
+                }
+            }
+            for k in 0..n_eta {
+                for l in 0..n_eta {
+                    if n_theta + k < M && n_theta + l < M {
+                        hess[n_theta + k][n_theta + l] = pd.d2p_deta2[j][k][l];
+                    }
+                }
+                for m in 0..n_theta {
+                    if n_theta + k < M && m < M {
+                        let v = pd.d2p_detadtheta[j][k][m];
+                        hess[n_theta + k][m] = v;
+                        hess[m][n_theta + k] = v;
+                    }
+                }
+            }
+            Dual2 { value, grad, hess }
+        }
+        None => Dual2::constant(value),
+    }
+}
+
+/// First-order counterpart of [`pk_slot_dual_outer`] for the inner η-gradient:
+/// only the η axes carry derivatives (from `dp_deta`); θ axes and the Hessian
+/// stay zero (the inner path consumes neither). Still a `Dual2<M>` so the same
+/// `eval_scale_dual` / init-impulse code differentiates it; the unused blocks are
+/// just zero.
+fn pk_slot_dual_inner<const M: usize>(
+    slot: usize,
+    value: f64,
+    dp_deta: &[Vec<f64>],
+    slots: &[usize],
+    n_theta: usize,
+    n_eta: usize,
+) -> Dual2<M> {
+    match slots.iter().position(|&x| x == slot) {
+        Some(j) => {
+            let mut grad = [0.0; M];
+            for k in 0..n_eta {
+                if n_theta + k < M {
+                    grad[n_theta + k] = dp_deta[j][k];
+                }
+            }
+            Dual2 {
+                value,
+                grad,
+                hess: [[0.0; M]; M],
+            }
+        }
+        None => Dual2::constant(value),
+    }
+}
+
+/// The seven PK-param duals the init impulse reads, built from a per-slot dual
+/// constructor. Order matches [`crate::pk::analytical_init_concentration_g`].
+struct InitPkDuals<const M: usize> {
+    cl: Dual2<M>,
+    v: Dual2<M>,
+    q: Dual2<M>,
+    v2: Dual2<M>,
+    ka: Dual2<M>,
+    q3: Dual2<M>,
+    v3: Dual2<M>,
+}
+
+/// Add the analytic `[initial_conditions]` impulse to an already-computed jet
+/// (#524). The init contributes `A₀ · kernel(t, pk)` to the prediction *before*
+/// scaling — the same insertion point as the f64 `pk::add_analytical_init` — so
+/// this runs after `run_obs`/`run_obs_grad` and before the scale/LTBS transforms.
+///
+/// `a0_dual(prog)` evaluates the baseline amount `A₀` and its `(θ, η)` jet from
+/// the init program; `pk` supplies the seven PK-param duals. The impulse jet
+/// comes from [`crate::pk::analytical_init_concentration_g`] over `Dual2<M>`, so
+/// `∂C/∂A₀` and `∂C/∂(CL,V,…)` are exact. `add(j, &c)` folds observation `j`'s
+/// impulse into the caller's jet (full Hessian for the outer path, value+grad for
+/// the inner). A reset (EVID=3/4) wipes the baseline, so observations at/after the
+/// first reset get none — matching `add_analytical_init_with`.
+fn add_init_impulse<const M: usize, FA, FAdd>(
+    model: &CompiledModel,
+    subject: &Subject,
+    pk: &InitPkDuals<M>,
+    mut a0_dual: FA,
+    mut add: FAdd,
+) where
+    FA: FnMut(&crate::parser::model_parser::ScaleDerivProgram) -> Dual2<M>,
+    FAdd: FnMut(usize, &Dual2<M>),
+{
+    let first_reset = subject
+        .reset_times
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    for init in &model.analytical_init {
+        let Some(prog) = &init.amount_deriv else {
+            continue;
+        };
+        let a0 = a0_dual(prog);
+        if a0.value == 0.0 || !a0.value.is_finite() {
+            continue;
+        }
+        for (j, &t) in subject.obs_times.iter().enumerate() {
+            if t < 0.0 || t >= first_reset {
+                continue;
+            }
+            let c = crate::pk::analytical_init_concentration_g::<Dual2<M>>(
+                model.pk_model,
+                init.cmt,
+                a0,
+                Dual2::constant(t),
+                pk.cl,
+                pk.v,
+                pk.q,
+                pk.v2,
+                pk.ka,
+                pk.q3,
+                pk.v3,
+            );
+            add(j, &c);
+        }
+    }
+}
+
+/// Outer (Dual2) analytic init impulse: builds PK-param + amount duals from the
+/// full `ParamDerivs` and folds value + `∂/∂(θ,η)` + η-η / η-θ Hessian into `sens`.
+#[allow(clippy::too_many_arguments)]
+fn apply_analytical_init_outer<const M: usize>(
+    sens: &mut SubjectSens,
+    model: &CompiledModel,
+    subject: &Subject,
+    pk: &crate::types::PkParams,
+    pd: &crate::sens::ode_provider::ParamDerivs,
+    slots: &[usize],
+    theta: &[f64],
+    eta: &[f64],
+    cov: &std::collections::HashMap<String, f64>,
+    n_theta: usize,
+    n_eta: usize,
+) {
+    let dual =
+        |slot: usize, val: f64| pk_slot_dual_outer::<M>(slot, val, pd, slots, n_theta, n_eta);
+    let pkd = InitPkDuals {
+        cl: dual(PK_IDX_CL, pk.cl()),
+        v: dual(PK_IDX_V, pk.v()),
+        q: dual(PK_IDX_Q, pk.q()),
+        v2: dual(PK_IDX_V2, pk.v2()),
+        ka: dual(PK_IDX_KA, pk.ka()),
+        q3: dual(PK_IDX_Q3, pk.q3()),
+        v3: dual(PK_IDX_V3, pk.v3()),
+    };
+    add_init_impulse::<M, _, _>(
+        model,
+        subject,
+        &pkd,
+        |prog| {
+            let var_duals: Vec<Dual2<M>> = prog
+                .var_to_pk_slot()
+                .iter()
+                .map(|&s| dual(s, pk.values.get(s).copied().unwrap_or(0.0)))
+                .collect();
+            prog.eval_scale_dual::<M>(theta, eta, cov, &var_duals)
+        },
+        |j, c| {
+            if let Some(o) = sens.obs.get_mut(j) {
+                o.f += c.value;
+                for k in 0..n_eta {
+                    o.df_deta[k] += c.grad[n_theta + k];
+                }
+                for m in 0..n_theta {
+                    o.df_dtheta[m] += c.grad[m];
+                }
+                for k in 0..n_eta {
+                    for l in 0..n_eta {
+                        o.d2f_deta2[k * n_eta + l] += c.hess[n_theta + k][n_theta + l];
+                    }
+                }
+                for k in 0..n_eta {
+                    for m in 0..n_theta {
+                        o.d2f_deta_dtheta[k * n_theta + m] += c.hess[n_theta + k][m];
+                    }
+                }
+            }
+        },
+    );
+}
+
+/// Inner (Dual1-equivalent) analytic init impulse: η-gradient only, folded into
+/// `out`. Uses [`pk_slot_dual_inner`] (η axes carry derivatives, θ/Hessian zero).
+#[allow(clippy::too_many_arguments)]
+fn apply_analytical_init_inner<const M: usize>(
+    out: &mut [ObsGrad],
+    model: &CompiledModel,
+    subject: &Subject,
+    pk: &crate::types::PkParams,
+    dp_deta: &[Vec<f64>],
+    slots: &[usize],
+    theta: &[f64],
+    eta: &[f64],
+    cov: &std::collections::HashMap<String, f64>,
+    n_theta: usize,
+    n_eta: usize,
+) {
+    let dual =
+        |slot: usize, val: f64| pk_slot_dual_inner::<M>(slot, val, dp_deta, slots, n_theta, n_eta);
+    let pkd = InitPkDuals {
+        cl: dual(PK_IDX_CL, pk.cl()),
+        v: dual(PK_IDX_V, pk.v()),
+        q: dual(PK_IDX_Q, pk.q()),
+        v2: dual(PK_IDX_V2, pk.v2()),
+        ka: dual(PK_IDX_KA, pk.ka()),
+        q3: dual(PK_IDX_Q3, pk.q3()),
+        v3: dual(PK_IDX_V3, pk.v3()),
+    };
+    add_init_impulse::<M, _, _>(
+        model,
+        subject,
+        &pkd,
+        |prog| {
+            let var_duals: Vec<Dual2<M>> = prog
+                .var_to_pk_slot()
+                .iter()
+                .map(|&s| dual(s, pk.values.get(s).copied().unwrap_or(0.0)))
+                .collect();
+            prog.eval_scale_dual::<M>(theta, eta, cov, &var_duals)
+        },
+        |j, c| {
+            if let Some(o) = out.get_mut(j) {
+                o.f += c.value;
+                for k in 0..n_eta {
+                    o.df_deta[k] += c.grad[n_theta + k];
+                }
+            }
+        },
+    );
 }
 
 /// True when an **oral** model carries an **infusion** dose (RATE>0 into the
@@ -2078,6 +2342,25 @@ fn subject_sensitivities_impl(
         };
     }
     let mut sens = disp!(1, 2, 3, 4, 5, 6, 7, 8, 9)?;
+    // Analytic `[initial_conditions]` impulse (#524): layer `A₀ · kernel(t, pk)`
+    // and its exact `(θ, η)` jet onto every observation BEFORE scaling — the same
+    // insertion order as the f64 `pk::add_analytical_init`. Dispatched on the
+    // `(θ, η)` axis count `n_theta + n_eta` (init programs use the same layout as
+    // the scale program); `init_supported` bounds it to the table.
+    if !model.analytical_init.is_empty() {
+        macro_rules! disp_init {
+            ($($mm:literal),+) => {
+                match n_theta + n_eta {
+                    $($mm => apply_analytical_init_outer::<$mm>(
+                        &mut sens, model, subject, &pk, &pd, &slots, theta, eta,
+                        &subject.covariates, n_theta, n_eta,
+                    ),)+
+                    _ => {}
+                }
+            };
+        }
+        disp_init!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+    }
     // Constant `ScalarScale` output divisor: `f_scaled = f/k`. Every derivative is
     // linear in `f` and `k` is constant (`∂k/∂η = ∂k/∂θ = 0`), so the whole jet
     // divides by `k`. Matches `pk::apply_scaling` (`pred /= s`).
@@ -2771,6 +3054,168 @@ mod tests {
 [error_model]
   DV ~ proportional(PROP_ERR)
 "#;
+
+    // ── [initial_conditions] analytic gradient fixtures (#524) ──────────────
+    // 1-cpt oral with a parameter-dependent CENTRAL baseline `A₀ = TVC0 · V`
+    // (IV-bolus impulse kernel). A₀ depends on θ_TVC0, θ_TVV, and η_V, so the
+    // analytic ∂C/∂A₀ · ∂A₀/∂(θ,η) chain is exercised.
+    const ONECPT_ORAL_INIT_CENTRAL: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVC0(5.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[initial_conditions]
+  init(central) = TVC0 * V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    // 1-cpt oral with a pre-loaded DEPOT baseline (oral first-order kernel, F=1).
+    const ONECPT_ORAL_INIT_DEPOT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVD0(80.0, 0.01, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[initial_conditions]
+  init(depot) = TVD0
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    // 2-cpt IV with a central baseline (2-cpt IV-bolus impulse kernel).
+    const TWOCPT_IV_INIT_CENTRAL: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(15.0, 1.0, 100.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  theta TVC0(3.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[initial_conditions]
+  init(central) = TVC0 * V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    // 3-cpt IV with a central baseline (3-cpt IV-bolus impulse kernel).
+    const THREECPT_IV_INIT_CENTRAL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.5, 50.0)
+  theta TVV1(10.0, 1.0, 100.0)
+  theta TVQ2(2.0, 0.1, 20.0)
+  theta TVV2(20.0, 2.0, 200.0)
+  theta TVQ3(1.5, 0.1, 20.0)
+  theta TVV3(30.0, 3.0, 300.0)
+  theta TVC0(4.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q2 = TVQ2
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+[structural_model]
+  pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
+[initial_conditions]
+  init(central) = TVC0 * V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// The analytic `[initial_conditions]` impulse (#524) and its `(θ, η)` jet
+    /// must match central finite differences of the production predictor
+    /// `compute_predictions_with_tv` (which layers the f64 init), across the
+    /// 1-/2-/3-cpt central kernels and the oral-depot kernel. The light inner
+    /// η-gradient provider must agree with the full outer one too.
+    #[test]
+    fn analytical_init_provider_matches_fd() {
+        let cases: &[(&str, &str, Vec<f64>, Vec<f64>)] = &[
+            (
+                "1cpt oral central",
+                ONECPT_ORAL_INIT_CENTRAL,
+                vec![0.2, 10.0, 1.5, 5.0],
+                vec![0.15, -0.10, 0.25],
+            ),
+            (
+                "1cpt oral depot",
+                ONECPT_ORAL_INIT_DEPOT,
+                vec![0.2, 10.0, 1.5, 80.0],
+                vec![0.15, -0.10, 0.25],
+            ),
+            (
+                "2cpt iv central",
+                TWOCPT_IV_INIT_CENTRAL,
+                vec![10.0, 50.0, 15.0, 100.0, 3.0],
+                vec![0.12, -0.08],
+            ),
+            (
+                "3cpt iv central",
+                THREECPT_IV_INIT_CENTRAL,
+                vec![5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 4.0],
+                vec![0.12, -0.08],
+            ),
+        ];
+        for (label, src, theta, eta) in cases {
+            let m = parse_model_string(src).unwrap_or_else(|e| panic!("{label}: parse: {e}"));
+            assert_eq!(m.analytical_init.len(), 1, "{label}: init parsed");
+            assert!(
+                analytical_supported(&m),
+                "{label}: init model must use the analytic provider, not FD"
+            );
+            let s = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+            // Full outer jet (value, ∂η, ∂²η², ∂θ, ∂²η∂θ) vs central FD of the
+            // init-aware production predictor.
+            check_full_provider_vs_fd(&m, &s, theta, eta);
+            // Light inner η-gradient must agree with the full provider.
+            let full = subject_sensitivities(&m, &s, theta, eta).expect("full supported");
+            let light = subject_eta_grad(&m, &s, theta, eta).expect("light supported");
+            assert_eq!(light.len(), full.obs.len());
+            for (lo, fo) in light.iter().zip(full.obs.iter()) {
+                for k in 0..m.n_eta {
+                    approx::assert_relative_eq!(
+                        lo.df_deta[k],
+                        fo.df_deta[k],
+                        max_relative = 1e-9,
+                        epsilon = 1e-12
+                    );
+                }
+            }
+        }
+    }
 
     // 2-cpt IV with an *additive* η on V1 (`V1 = TVV1 + ETA_V1`): a non-log-normal
     // parameterization, so `∂V1/∂η = 1` (not `V1·sel`). Forces both providers down

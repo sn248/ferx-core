@@ -1637,6 +1637,14 @@ pub struct AnalyticalInit {
     pub cmt: usize,
     /// Evaluates the initial amount `A₀` for a subject. See type docs.
     pub amount_fn: ScaleFn,
+    /// The same `A₀` expression compiled to a `Dual2`-differentiable program
+    /// (issue #524), so the analytic FOCE/FOCEI provider can differentiate the
+    /// init impulse `A₀ · kernel(t, pk)` exactly instead of falling back to
+    /// finite differences. Reuses [`ScaleDerivProgram`] — the init amount has the
+    /// same `(θ, η, individual-param, covariate)` shape as an `obs_scale`
+    /// expression. `None` only for hand-constructed inits with no parsed
+    /// expression (those keep the FD fallback).
+    pub amount_deriv: Option<crate::parser::model_parser::ScaleDerivProgram>,
 }
 
 /// How the structural model's raw output is mapped to the observed `DV`.

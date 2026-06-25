@@ -15,20 +15,34 @@ use crate::types::DoseEvent;
 /// generic so the caller can seed it as a dual carrying the lagtime sensitivity
 /// (`∂t/∂lagtime = −1`); pass an `f64` for the plain prediction.
 pub fn one_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: T, cl: T, v: T) -> T {
+    one_cpt_iv_bolus_amt_g(T::from_f64(amt), t, cl, v)
+}
+
+/// As [`one_cpt_iv_bolus_g`] but the amount `amt` is itself generic over
+/// [`PkNum`], so an analytical initial condition `A₀(θ,η)` (issue #524) threads
+/// its parameter sensitivity through the impulse. The single-dose path passes a
+/// constant `amt` via [`one_cpt_iv_bolus_g`]; the only formula lives here.
+pub fn one_cpt_iv_bolus_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T) -> T {
     if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let k = cl / v;
-    (T::from_f64(amt) / v) * (-(k * t)).exp()
+    (amt / v) * (-(k * t)).exp()
 }
 
 /// 1-cpt oral (first-order absorption), with the `KA ≈ k` L'Hôpital limit.
 pub fn one_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, ka: T, f_bio: T) -> T {
+    one_cpt_oral_amt_g(T::from_f64(amt), t, cl, v, ka, f_bio)
+}
+
+/// As [`one_cpt_oral_g`] but with a generic amount `amt` (issue #524). The
+/// initial-condition path passes `A₀` as a dual with `F = 1`.
+pub fn one_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, ka: T, f_bio: T) -> T {
     if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || ka.val() <= 0.0 {
         return T::from_f64(0.0);
     }
     let k = cl / v;
-    let d = f_bio * T::from_f64(amt);
+    let d = f_bio * amt;
     if (ka.val() - k.val()).abs() < 1e-6 {
         (d * ka / v) * t * (-(k * t)).exp()
     } else {

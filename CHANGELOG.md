@@ -126,6 +126,14 @@ section of the SDLC for the versioning policy).
   the outer optimiser's trajectory: harmless for the BOBYQA default but can derail
   a gradient-based outer optimiser (e.g. `mma`) into a worse basin on some models.
   Validate OFV/estimates on your model + `optimizer` before enabling.
+- **Competing-risks TTE (cause-specific hazards)** (#440). Multiple `[event_model NAME]`
+  blocks on distinct compartments now model mutually-exclusive event types that share the
+  model's random effects (a common frailty). `simulate()` draws the competing causes
+  correctly — the earliest latent event is observed and the others are right-censored at
+  that time — and `predict_survival()` gains a cause-specific cumulative incidence `cif`
+  plus the all-cause survival `survival_all` (with `Σ_k cif_k(t) + survival_all(t) = 1`),
+  the correct competing-risks quantities. Example `examples/tte_competing_risks.ferx`.
+  Behind the `survival` feature.
 - **`[event_model]` hazard expressions can reference `[individual_parameters]`** names —
   e.g. a hazard driven by an individual `CL` — resolved per subject at evaluation time, in
   addition to the existing theta/eta/covariate namespace. Intermediate variables and names
@@ -242,6 +250,12 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- The `auto` optimizer now selects the derivative-free Bobyqa for time-to-event
+  (`[event_model]`) objectives, which are finite-difference-only. The shared
+  analytic-outer-gradient predicate previously reported a gradient for TTE (and
+  mixed PK+TTE) models that the sensitivity provider cannot supply, so `auto`
+  resolved to a gradient-based optimizer that stalled at the initial estimates;
+  TTE fits with the default optimizer now converge (#490).
 - **`[simulation]` block now honours the documented `n_subjects` / `dose_amt` /
   `dose_cmt` keys.** The parser previously only recognised the short
   `subjects` / `dose` / `cmt` spellings and **silently ignored** every other key,

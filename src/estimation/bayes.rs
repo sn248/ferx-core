@@ -31,7 +31,7 @@ use crate::types::{
 };
 use nalgebra::{Cholesky, DMatrix, DVector};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rand_distr::{ChiSquared, Distribution, Gamma, StandardNormal};
 
 /// Draw from an inverse-gamma distribution `InvGamma(shape, scale)` with the
@@ -168,7 +168,7 @@ const OMEGA_DIAG_FLOOR: f64 = 1e-6;
 /// looser than BSV because per-occasion variances are smaller).
 const OMEGA_IOV_DIAG_FLOOR: f64 = 1e-8;
 /// Max split-R̂ at or below which the fit is reported converged. Matches the
-/// guidance in `docs/src/estimation/bayes.md` (Vehtari et al. 2021); used for
+/// guidance in `docs/estimation/bayes.qmd` (Vehtari et al. 2021); used for
 /// both the `converged` flag and the non-convergence warning.
 const RHAT_CONVERGENCE_THRESHOLD: f64 = 1.01;
 
@@ -906,7 +906,7 @@ pub fn run_bayes(
                     let sum_prop: f64 = nll_prop.iter().sum();
                     let d_nlp = 0.5 * ((u_new - u0[c]).powi(2) - (u_old - u0[c]).powi(2)) * inv_var;
                     prop_pop[c] += 1;
-                    if rng.gen::<f64>().ln() < (sum_cur - sum_prop) - d_nlp {
+                    if rng.random::<f64>().ln() < (sum_cur - sum_prop) - d_nlp {
                         nll = nll_prop;
                         acc_pop[c] += 1;
                     } else if is_theta {
@@ -964,7 +964,7 @@ pub fn run_bayes(
                             * inv_var;
                     }
                     joint_prop += 1;
-                    if rng.gen::<f64>().ln() < (sum_cur - sum_prop) - d_nlp {
+                    if rng.random::<f64>().ln() < (sum_cur - sum_prop) - d_nlp {
                         theta = theta_prop;
                         sigma = sigma_prop;
                         nll = nll_prop;

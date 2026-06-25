@@ -95,8 +95,73 @@ section of the SDLC for the versioning policy).
   dual state at each reset (EVID=4 = reset + dose) and applies the per-event `F·rate`
   forcing over each infusion window, so TV-cov and IOV models with resets or infusions get
   exact analytic gradients. Result-neutral.
+- **`[initial_conditions]` block for analytical PK models** (#521). Declare a
+  non-zero starting compartment amount with `init(central) = <expr>` (or
+  `init(depot) = ...`) on a closed-form 1-/2-/3-cpt model — the analytical
+  equivalent of NONMEM's `A_0(cmt)` and of the ODE-path `init(...)` in `[odes]`.
+  A pre-dose baseline (e.g. `init(central) = CONC0 * V`) no longer forces the
+  numerical ODE solver: on the 6-thioguanine `run14` model this cuts FOCEI wall
+  time ~13× (27 s → ~2 s) at matching estimates. Models with an initial
+  condition use `gradient = fd` for now (exact-analytic gradients are a
+  follow-up). Edge cases are handled explicitly: the baseline is wiped by a
+  system reset (`EVID = 3/4`), its decay uses each occasion's PK parameters under
+  IOV, a `KAPPA_*` reference in the init expression is rejected, and the
+  combination with a steady-state dose (`W_STEADY_STATE_INIT`) or a compartment
+  `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
+  mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
+### Fixed
+- **Exact analytic FOCE/FOCEI gradient for `iiv_on_ruv` (IIV on residual error).**
+  Models with a residual-error eta (`Y = IPRED + EPS·EXP(η_ruv)`) now use the
+  exact closed-form gradient on both the inner EBE and outer θ/Ω/σ loops, where
+  the residual-eta column previously fell back to (and, with the `auto`/L-BFGS
+  optimiser, silently mis-computed) a gradient that omitted the `exp(2·η_ruv)`
+  variance scaling. The inner η-gradient scales `v`/`dv_df` and adds the
+  `Σ(1−ε²/v)` residual-eta column; the outer assembly adds the Almquist `c̃=2`
+  interaction column to `H̃`, the true-Hessian `2ε²/R` / `κⱼaⱼ` terms, and their
+  `log|H̃|` θ/Ω/σ derivatives. Validated to ~1e-11 against reconverged finite
+  differences of ferx's own FOCEI marginal (whose value is NONMEM-validated, #413).
+  The assembly is provider-agnostic, so it covers the closed-form (analytical
+  1-/2-/3-cpt), **ODE** (`[odes]`), and **LTBS** (`log_additive`) paths — for LTBS
+  the outer gradient is analytic while the inner EBE keeps finite differences (the
+  existing LTBS choice, #438). IOV and M3-BLOQ `iiv_on_ruv` keep the
+  finite-difference gradient. (#474)
+- **Spurious "not referenced" warning for the `iiv_on_ruv` eta.** A residual-error
+  random effect is referenced from `[error_model]` (not an individual-parameter
+  expression), so it was falsely warned as "declared but not referenced … will not
+  affect predictions or be meaningfully estimated" even though it scales the
+  residual variance and is estimated. The warning is now suppressed for that eta.
+  (#474)
 
 ### Performance
+- **Ω-preconditioned inner EBE loop for all FOCE/FOCEI fits.** The inner BFGS
+  now initialises its inverse-Hessian (the search `H0`) to the prior conditional
+  scale `diag(1/Ω⁻¹ᵢᵢ)` for every model, not just FREM. A correlated or
+  multi-scale Ω (e.g. a block-Ω where one η has several× the variance of another)
+  otherwise mis-scales the identity-`H0` search, costing extra inner iterations.
+  The convergence *test* stays the raw L2 gradient norm for general fits (only
+  FREM needs the preconditioned norm, issue #406), so `H0` changes only the path
+  to the mode — the converged EBE and the estimates are unchanged. On the
+  two-compartment UVM FOCEI/MMA benchmark this cuts inner BFGS steps per EBE
+  solve ~25→16 and total predictions ~17M→6.2M for a **~1.23× faster fit**
+  (single- and 8-thread) at the same optimum (OFV within 4e-5 of the prior
+  result; matches NONMEM `run18`).
+- **Interpolating inner-loop line search** (#462). The EBE BFGS line search now
+  picks each trial step by safeguarded quadratic interpolation instead of fixed
+  halving, and reuses the objective value the optimiser already tracks instead of
+  recomputing it. On the two-compartment UVM FOCEI/MMA benchmark this cuts the
+  average backtracks per line search from ~22 to ~3 (cap-exhaustion 20% → 0.1%),
+  roughly halving the prediction-walk count for a ~2.5× faster single-threaded
+  fit at the same optimum.
+- Reuse per-thread scratch buffers when evaluating individual PK parameters,
+  reducing allocator traffic in FOCE/FOCEI inner loops with time-varying
+  covariates (#462).
+- **Exact analytic gradients for `transit()` absorption ODE models** (#430). The
+  built-in transit input-rate forcing's `ln Γ(n+1)` constant now has a `Dual2` rule
+  (analytic digamma/trigamma derivatives of the shared Lanczos `ln_gamma`), so a
+  `transit()` model is evaluated over `Dual2` by the ODE sensitivity provider and
+  drives exact analytic FOCE/FOCEI/Bayes gradients instead of finite differences —
+  joining `igd()` on the analytic path. Estimates are unchanged; gradients are exact
+  and drop the `(n_params+1)×` FD multiplier on transit fits.
 - **Faster analytic time-varying-covariate inner η-gradient + ODE-sensitivity path
   consolidation** (#451). The per-subject event schedule is now reused across inner
   BFGS steps instead of rebuilt each step, identical per-event covariate snapshots are
@@ -113,8 +178,75 @@ section of the SDLC for the versioning policy).
   so the inner EBE loop is exact and replaces FD's `~2·n_eta+1` predictions per step
   with one. Validated against the FD-validated outer `df_deta` (1-/2-/3-cpt, IV/oral,
   steady state).
+- **Constant-fold covariate-only individual-parameter sub-expressions in the
+  analytic sensitivity walks** (#485). The `[individual_parameters]` block is
+  re-evaluated on every inner-EBE and outer-gradient step; for covariate-heavy
+  models its covariate-only prefix (e.g. CKD-EPI / Schwartz / FFM / maturation —
+  often the bulk of the `pow`/`exp`/`log` work) does not depend on θ or η, yet was
+  carried through `Dual2`/`Dual1` arithmetic (gradient + Hessian per operation)
+  every call. The parser now classifies those slots once at compile time and the
+  `Dual2`/`Dual1` providers evaluate them once in plain `f64` and seed them as
+  dual constants, skipping the redundant dual re-derivation. Numerically identical
+  (bit-for-bit gradients and Hessians); only θ/η-free slots are folded, so all
+  dual axes — including `∂/∂θ_fixed` — are preserved. On a jasmine-style
+  covariate kernel (8/10 slots foldable) this is ~1.7× faster per `Dual2`
+  individual-parameter evaluation. Found while profiling the jasmine
+  vancomycin-pediatrics FOCEI fit.
+- **Light `Dual1` inner η-gradient for analytical PK models** (#491). The inner
+  EBE loop's `∂p/∂η` for analytical 1-/2-/3-cpt models was computed over the full
+  `Dual2<n_theta + n_eta>` (carrying the θ-axes gradient and the second-order
+  Hessian) and then all but the η-block discarded. It now uses the light
+  `Dual1<n_eta>` walk the ODE inner loop already used (#410), seeding η only — so
+  e.g. a 10-θ / 4-η fit drops a `Dual2<14>` (14-vector grad + 14×14 Hessian per
+  op) to a `Dual1<4>`. Converged EBEs and OFV are unchanged (the inner gradient
+  method only affects the path to the mode); validated by the existing
+  analytic-vs-FD inner-gradient tests. Also serves models whose combined
+  `n_theta + n_eta` exceeds the dual dispatch ceiling but whose `n_eta` does not
+  (previously an FD fall-back).
 
 ### Added
+- **Built-in Weibull absorption — the `weibull(td, beta)` input-rate function** (#322, Phase 2).
+  Use it inside an `[odes]` RHS, with `td` (scale) and `beta` (shape) bound to
+  `[individual_parameters]` (so they carry IIV / covariates for free):
+  `d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central`. The dose is delivered as the
+  Weibull density over time (`∫R_in dt = F·Dose`) and its bolus is suppressed — the same
+  dose-into-the-input-rate-compartment convention as `transit()` / `igd()`. Shape `beta`
+  selects the profile: `>1` a delayed interior peak, `=1` first-order absorption with
+  `ka = 1/Td`, `<1` fast early uptake (an integrable spike at the dose). Weibull has no
+  elementary closed form, so it always runs on the numerical ODE path and **requires an
+  explicit ODE disposition** — combining it with an analytical `pk ...` is a clear error
+  pointing at `ode_template`. Because the forcing is evaluated over `Dual2`, a `weibull()`
+  model drives **exact analytic** FOCE/FOCEI/Bayes gradients (no finite-difference fallback),
+  validated against NONMEM. See `examples/weibull_absorption.ferx` and
+  `docs/model-file/absorption.qmd`.
+- **Analytic FOCE/FOCEI gradients for compartment-indexed bioavailability
+  (`F1`/`F2`, …) on ODE models** (#486). An ODE model that sets a per-compartment
+  bioavailability now drives the exact analytic outer gradient and light `Dual1`
+  inner η-gradient instead of finite differences: both the static and
+  time-varying-covariate dual walks resolve `F` per dose compartment (the indexed
+  `F{cmt}` slot, else the bare `F`), matching production's `DoseAttrMap::f_bio` and
+  carrying `∂/∂F{cmt}` exactly. Estimates are unchanged; the gradient is exact and
+  cheaper. Validated by an analytic≡production+central-FD parity test (single
+  indexed `F1` with IIV, and distinct `F1`≠`F2` dosed into two compartments).
+  Per-compartment *lag* (`ALAG{cmt}`) stays on FD for now (→ #472).
+- **`ebe_warm_start` fit option** (default `false`, opt-in). When a per-subject
+  inner BFGS solve fails and falls back to Nelder–Mead, seed the simplex from the
+  BFGS partial η̂ instead of cold-starting from the prior mode η=0. On
+  fallback-heavy fits (e.g. an unidentifiable peripheral volume that drives BFGS
+  far onto the steep prior slope) NM then converges in a fraction of the
+  iterations — ≈1.7× faster on a 2-cpt unidentifiable-V2 benchmark. Off by
+  default because warm-starting moves the fallback subjects' EBEs, which perturbs
+  the outer optimiser's trajectory: harmless for the BOBYQA default but can derail
+  a gradient-based outer optimiser (e.g. `mma`) into a worse basin on some models.
+  Validate OFV/estimates on your model + `optimizer` before enabling.
+- **Competing-risks TTE (cause-specific hazards)** (#440). Multiple `[event_model NAME]`
+  blocks on distinct compartments now model mutually-exclusive event types that share the
+  model's random effects (a common frailty). `simulate()` draws the competing causes
+  correctly — the earliest latent event is observed and the others are right-censored at
+  that time — and `predict_survival()` gains a cause-specific cumulative incidence `cif`
+  plus the all-cause survival `survival_all` (with `Σ_k cif_k(t) + survival_all(t) = 1`),
+  the correct competing-risks quantities. Example `examples/tte_competing_risks.ferx`.
+  Behind the `survival` feature.
 - **`[event_model]` hazard expressions can reference `[individual_parameters]`** names —
   e.g. a hazard driven by an individual `CL` — resolved per subject at evaluation time, in
   addition to the existing theta/eta/covariate namespace. Intermediate variables and names
@@ -181,6 +313,34 @@ section of the SDLC for the versioning policy).
   test in the default build (#430).
 
 ### Changed
+- **`optimizer` now defaults to `auto`** (#490). The new `auto` choice picks the
+  outer optimizer per model: `nlopt_lbfgs` when the exact analytic FOCE/FOCEI
+  gradient is available, and `bobyqa` when only finite differences are (ODE/PD
+  models, LTBS/SDE, or `gradient = fd`). Limited benchmarking across ~10 real
+  FOCEI datasets found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient
+  problem and `bobyqa` fastest and most reliable on the finite-difference ones, so
+  `auto` gives most users a good default without tuning. The fit output reports
+  the resolved pick as `auto (<resolved>)`; set `optimizer` explicitly (e.g.
+  `optimizer = bobyqa`) to keep the previous fixed default.
+- **The SLSQP fallback no longer triggers on `MaxEvalReached`** (#499). After the
+  primary NLopt run (`nlopt_lbfgs`/`slsqp`/`mma`), ferx retried from the current
+  point with a fresh, full-budget SLSQP optimization whenever the primary didn't
+  report a clean convergence code — including when it simply hit the evaluation
+  budget. A spent budget is not a failure a second optimizer can fix (it just
+  doubles the cost); ferx now emits an "increase `maxiter`" warning and returns
+  the best-seen point instead. The genuine-failure fallback (`Failure` /
+  `RoundoffLimited`) is unchanged. Found during the jasmine FOCEI slowness
+  investigation.
+- **`optimizer = lbfgs` and `optimizer = bfgs` now select the NLopt L-BFGS**
+  (`nlopt_lbfgs`) instead of the hand-rolled built-in BFGS / limited-memory L-BFGS
+  (#483). Across analytic-gradient FOCEI benchmarks (jasmine, infliximab, uvm) the
+  NLopt path reaches the best OFV and is 3–5× faster than the built-in, which on
+  harder fits diverged (infliximab) or hung with no outer progress (busulfan
+  ODE+IOV). The two keys are now deprecated aliases; the built-in implementation is
+  slated for removal. The NLopt path's accuracy is validated against NONMEM/nlmixr2
+  reference fits on the [Outer Optimizers](docs/estimation/optimizers.qmd) page
+  (e.g. warfarin LTBS OFV −675.302, recovering NONMEM's MLE; `two_cpt_oral_cov`
+  OFV −1197.23 ≈ nlmixr2's −1199.24).
 - **Documentation now builds as a Quarto website** using the shared ferx site
   branding and styling instead of mdBook. Source pages now live under
   `docs/**/*.qmd`, with navigation in `docs/_quarto.yml` (#443).
@@ -203,6 +363,43 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- The `auto` optimizer now selects the derivative-free Bobyqa for time-to-event
+  (`[event_model]`) objectives, which are finite-difference-only. The shared
+  analytic-outer-gradient predicate previously reported a gradient for TTE (and
+  mixed PK+TTE) models that the sensitivity provider cannot supply, so `auto`
+  resolved to a gradient-based optimizer that stalled at the initial estimates;
+  TTE fits with the default optimizer now converge (#490).
+- **`[simulation]` block now honours the documented `n_subjects` / `dose_amt` /
+  `dose_cmt` keys.** The parser previously only recognised the short
+  `subjects` / `dose` / `cmt` spellings and **silently ignored** every other key,
+  so all `examples/*.ferx` (which use the long forms) fell back to the defaults
+  (10 subjects, dose 100, compartment 1) — e.g. `n_subjects = 12` simulated 10.
+  Both spellings are now accepted (long forms canonical, short forms as aliases),
+  and an **unknown or malformed key in `[simulation]` is now a hard parse error**
+  instead of a silent default, matching `[fit_options]`.
+- The ODE-solver fit options `ode_reltol`, `ode_abstol`, and `ode_max_steps` no
+  longer emit a spurious "is not used by method … and will be ignored" warning
+  (#516). They configure the RK45 integrator and *are* applied to any ODE model
+  under every estimation method; they were simply missing from the warning's
+  framework-key allowlist. Behaviour is unchanged — only the misleading warning
+  is removed.
+- Simulation, NPDE/NPD diagnostics, and the NCA-init grid sweep now honour
+  time-varying covariate snapshots on dose, observation, and EVID=2 rows instead
+  of using only each subject's baseline covariates (#506). FREM covariate
+  pseudo-observations keep their additive `EPSCOV` error in simulation/NPDE
+  rather than being fed through the PK residual-error model.
+- **TTE simulation now applies administrative right-censoring** (#440). `simulate()`
+  for a `[event_model]` (TTE) endpoint previously emitted *every* drawn event time as
+  an uncensored event, so simulated data could not reproduce a study's censoring
+  pattern (which broke simulation-estimation validation). A subject's administrative
+  observation horizon is now honoured: a draw that reaches it is recorded as
+  right-censored at the horizon (`observed = false`). The horizon is the
+  `ObsRecord::Event` time of a *right-censored* record; an exact-event (or
+  interval-censored) record carries no horizon — its `time` is the event time, not a
+  censoring window — so it draws uncensored rather than being truncated at the
+  realized event time (which would bias re-simulation / VPC). Left-truncated
+  (delayed-entry) subjects draw conditional on survival past entry. Behind the
+  `survival` feature.
 - **Analytic sensitivities and predictions for time-varying covariates with
   intermediate `[individual_parameters]` assignments** (#455, #456). A model whose
   individual-parameter block computes intermediate quantities (e.g.

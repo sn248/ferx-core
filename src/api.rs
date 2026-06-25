@@ -37,7 +37,7 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
         })
         .collect()
 }
-use rand::SeedableRng;
+use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
 use std::path::Path;
@@ -50,6 +50,11 @@ use std::time::Instant;
 /// `theta` and `eta` are required so that `ScalingSpec::ExpressionScale`
 /// can evaluate its `scale_fn(theta, eta, covariates)`. Callers that don't
 /// have a separate eta vector (population predictions) pass an all-zero eta.
+///
+/// Production code routes through [`pk::compute_predictions_with_tv`] (the
+/// TV-covariate-aware dispatcher) instead; this baseline-only helper now only
+/// backs the TV-vs-no-TV gap assertions in the regression tests.
+#[cfg(test)]
 pub(crate) fn model_preds(
     model: &CompiledModel,
     subject: &Subject,
@@ -1062,6 +1067,36 @@ pub fn check_model_data_warnings(
         ));
     }
 
+    // SS=1 dose combined with an [initial_conditions] baseline (#521). The SS
+    // closed form already assumes an infinite periodic dose history (the system
+    // is pre-equilibrated at the dose time), while the analytical init lays down a
+    // separate transient baseline that decays from t=0. Superposing the two is a
+    // valid linear combination but rarely what a user intends — an SS dose and an
+    // explicit starting amount usually express the same idea twice, double-counting
+    // the baseline. Surface it rather than silently combine them.
+    if !model.analytical_init.is_empty() {
+        let n_ss_init = population
+            .subjects
+            .iter()
+            .filter(|s| s.has_ss_doses())
+            .count();
+        if n_ss_init > 0 {
+            diags.push(Diagnostic::warning(
+                "W_STEADY_STATE_INIT",
+                format!(
+                    "{} subject(s) have SS=1 doses while the model declares an \
+                     [initial_conditions] baseline. The steady-state closed form \
+                     already pre-equilibrates an infinite dose history; the init \
+                     baseline is superposed on top as a separate decaying transient, \
+                     which double-counts the starting amount. Remove the SS flag or \
+                     the [initial_conditions] block unless this superposition is \
+                     intended.",
+                    n_ss_init
+                ),
+            ));
+        }
+    }
+
     // Modeled coded-RATE parameters (`D{cmt}` for RATE=-2 duration, `R{cmt}` for
     // RATE=-1 rate; #324) that are non-positive at the initial typical-value point
     // (eta = 0). `resolve_rate` clamps a transient `D ≤ 0` / `R ≤ 0` to its floor
@@ -1481,6 +1516,7 @@ pub fn fit(
     // `Auto` (the default) reproduces the historical size-based dispatch, so this
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
+    crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
     // enforces these for `.ferx` models, but a Rust caller could otherwise set
     // `log_transform = true` together with a proportional/combined error or a
@@ -2370,6 +2406,15 @@ pub(crate) fn compute_extra_output_columns(
                                     subject,
                                     &grid_times,
                                 )
+                            } else if !model.analytical_init.is_empty() {
+                                // Analytical model + [initial_conditions] baseline (#521):
+                                // the superposition state reconstruction does not seed the
+                                // baseline amount, so states would disagree with the
+                                // init-aware ipred. Return empty so every grid point
+                                // evaluates to NaN, consistent with per-obs compartment_states
+                                // being empty for baseline models. W_DERIVED_INIT_ANALYTICAL
+                                // in fit_inner tells the user why.
+                                vec![]
                             } else if subject.has_resets() {
                                 // Analytical model + EVID=3/4 reset: superposition is invalid
                                 // across reset boundaries. Return empty so every grid point
@@ -3257,6 +3302,21 @@ fn fit_inner(
                     .to_string(),
             );
         }
+        // Analytical model with an [initial_conditions] baseline (#521): ipred is
+        // init-aware, but the superposition state reconstruction does not seed the
+        // baseline amount into the compartment vectors, so per-obs states (and the
+        // grid-integral path) return empty (→ NaN) rather than report amounts that
+        // disagree with ipred.
+        if model.ode_spec.is_none() && !model.analytical_init.is_empty() {
+            warnings.push(
+                "W_DERIVED_INIT_ANALYTICAL: analytical model with an \
+                 [initial_conditions] baseline — compartment states are not \
+                 available for baseline models (predictions are exact); [derived] \
+                 expressions that reference compartments[i] evaluate to NaN. Use an \
+                 ODE model with init(...) in [odes] if compartment amounts are required."
+                    .to_string(),
+            );
+        }
         // Analytical oral model with a zero-order input into the depot (#400):
         // the superposition state helper models an oral infusion as a depot
         // bypass, so it cannot express a depot zero-order input. ipred is exact
@@ -3487,6 +3547,27 @@ fn fit_inner(
         }
     }
 
+    // Reported outer optimizer. For the FOCE/FOCEI path with the default `auto`,
+    // surface the concrete optimizer `auto` resolved to (e.g. `auto (nlopt_lbfgs)`)
+    // so the output records what actually ran (#490).
+    let optimizer_label: String = match final_method {
+        EstimationMethod::Saem => "saem".to_string(),
+        EstimationMethod::FoceGn => "gn".to_string(),
+        EstimationMethod::FoceGnHybrid => "gn".to_string(),
+        // IMP/IMPMAP never run the outer optimizer — their M-step uses an
+        // internal BOBYQA regardless of `options.optimizer`, so report that
+        // rather than a setting that had no effect.
+        EstimationMethod::Impmap => "impmap-bobyqa".to_string(),
+        EstimationMethod::Imp => "imp-bobyqa".to_string(),
+        _ => {
+            if options.optimizer == Optimizer::Auto {
+                format!("auto ({})", options.optimizer.resolve_auto(model).label())
+            } else {
+                options.optimizer.label().to_string()
+            }
+        }
+    };
+
     let fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
@@ -3595,18 +3676,7 @@ fn fit_inner(
         sigma_init,
         obs_time_range,
         final_gradient: result.final_gradient.clone(),
-        optimizer: match final_method {
-            EstimationMethod::Saem => "saem",
-            EstimationMethod::FoceGn => "gn",
-            EstimationMethod::FoceGnHybrid => "gn",
-            // IMP/IMPMAP never run the outer optimizer — their M-step uses an
-            // internal BOBYQA regardless of `options.optimizer`, so report that
-            // rather than a setting that had no effect.
-            EstimationMethod::Impmap => "impmap-bobyqa",
-            EstimationMethod::Imp => "imp-bobyqa",
-            _ => options.optimizer.label(),
-        }
-        .to_string(),
+        optimizer: optimizer_label,
         n_starts: options.n_starts,
         multi_start_seed: options.multi_start_seed,
         saem_seed: options.saem_seed,
@@ -4658,8 +4728,8 @@ pub fn simulate(
     params: &ModelParameters,
     n_sim: usize,
 ) -> Vec<SimulationResult> {
-    use rand::prelude::*;
-    simulate_inner(model, population, params, n_sim, &mut thread_rng())
+    let mut rng = rand::rng();
+    simulate_inner(model, population, params, n_sim, &mut rng)
 }
 
 /// Simulate with a fixed seed for reproducibility.
@@ -4715,7 +4785,7 @@ pub fn simulate_with_options(
     use rand::SeedableRng;
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
-        None => rand::rngs::StdRng::from_entropy(),
+        None => rand::make_rng(),
     };
 
     // Guard the modeled-`RATE` dose precondition up front (#324). The
@@ -4817,19 +4887,19 @@ fn emit_subject_rows<R: rand::Rng>(
     rng: &mut R,
     results: &mut Vec<SimulationResult>,
 ) {
-    // Compute individual parameters
-    let pk_params = (model.pk_param_fn)(&params.theta, eta_slice, &subject.covariates);
-
-    // Predict concentrations
-    let ipreds = model_preds(model, subject, &pk_params, &params.theta, eta_slice);
+    // Use the same TV-covariate-aware dispatcher as estimation and post-fit
+    // diagnostics. For no-TV subjects this stays on the one-pk-param fast path.
+    let ipreds = pk::compute_predictions_with_tv(model, subject, &params.theta, eta_slice);
 
     // Add residual error (Gaussian path). IIV on residual error (#409): the
     // drawn `eta_slice` includes η_ruv, so scale the residual variance by
     // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
     let ruv_scale = model.residual_var_scale(eta_slice);
     for (j, &ipred) in ipreds.iter().enumerate() {
-        let var = model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values)
-            * ruv_scale;
+        // FREM covariate pseudo-observations (FREMTYPE>0) use the additive
+        // covariate sigma, not the PK error model applied to the θ+η override
+        // that `compute_predictions_with_tv` now writes into FREM rows.
+        let var = model.sim_residual_variance(subject, j, ipred, &params.sigma.values, ruv_scale);
         let eps: f64 = rng.sample(normal);
         let value = ipred + var.sqrt() * eps;
 
@@ -4962,7 +5032,7 @@ pub struct SimulateUncertaintyOptions {
     pub n_sim_per_draw: usize,
     /// How to draw the parameter sets — asymptotic MVN or SIR resamples.
     pub method: crate::estimation::uncertainty_samples::UncertaintyMethod,
-    /// Optional seed for reproducibility. `None` uses `thread_rng`.
+    /// Optional seed for reproducibility. `None` draws from entropy.
     pub seed: Option<u64>,
 }
 
@@ -4988,7 +5058,7 @@ pub fn simulate_with_uncertainty(
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
         // Re-seed StdRng from entropy so simulate-without-seed is still
         // independent across calls but uses a uniform RNG type internally.
-        None => rand::rngs::StdRng::from_entropy(),
+        None => rand::make_rng(),
     };
 
     let template =
@@ -5106,12 +5176,21 @@ pub struct SurvivalPredictionResult {
     pub cmt: usize,
     /// Time at which S(t), H(t), h(t) are evaluated.
     pub time: f64,
-    /// Survival probability S(t) = exp(−H(t)).
+    /// Cause-specific survival probability S(t) = exp(−H(t)) (this CMT alone).
     pub survival: f64,
-    /// Cumulative hazard H(t).
+    /// Cumulative hazard H(t) for this CMT.
     pub cum_hazard: f64,
-    /// Instantaneous hazard h(t).
+    /// Instantaneous hazard h(t) for this CMT.
     pub hazard: f64,
+    /// Cause-specific cumulative incidence F(t) = ∫₀ᵗ h(u)·S_all(u) du — the
+    /// probability of having had *this* event type by t in the presence of the
+    /// other (competing) causes. Equals 1 − survival when there is a single
+    /// endpoint. Across all TTE CMTs, Σ cif + survival_all = 1.
+    pub cif: f64,
+    /// All-cause survival S_all(t) = exp(−Σ_j H_j(t)) over every TTE CMT — the
+    /// probability of no event of any type by t. Equals `survival` when there is
+    /// a single endpoint.
+    pub survival_all: f64,
     /// Median survival time T₅₀ (where S(T₅₀) = 0.5); analytic closed form.
     pub median_survival: f64,
     /// Mean survival time E[T] = ∫₀^∞ S(t) dt; analytic for Exponential,
@@ -5121,9 +5200,13 @@ pub struct SurvivalPredictionResult {
 
 /// Compute survival function predictions for TTE endpoints.
 ///
-/// For each subject and each TTE CMT in `model.endpoints`, evaluates
-/// `S(t) = exp(−H(t))`, `H(t)`, and `h(t)` at every point in `time_grid`
-/// using population typical values (η = 0).
+/// For each subject and each TTE CMT in `model.endpoints`, evaluates the
+/// cause-specific `S(t) = exp(−H(t))`, `H(t)`, and `h(t)` at every point in
+/// `time_grid` using population typical values (η = 0). When the model has
+/// multiple TTE CMTs (competing risks) it also reports, per CMT, the
+/// cause-specific cumulative incidence `F(t)` and the all-cause survival
+/// `S_all(t) = exp(−Σ_j H_j(t))`, computed together so that
+/// `Σ_k F_k(t) + S_all(t) = 1` holds at every grid point (see [`cif_curves`]).
 ///
 /// Returns an empty Vec when the model has no TTE endpoints.
 #[cfg(feature = "survival")]
@@ -5133,37 +5216,70 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
-    use crate::survival::{hazard_and_cum_hazard, mean_survival, median_survival};
+    use crate::survival::{cif_curves, hazard_and_cum_hazard, mean_survival, median_survival};
     use crate::types::EndpointLikelihood;
+
+    // The competing-risks CIF telescopes the all-cause survival drop, which
+    // requires the grid in ascending time order; sort a local copy so the
+    // per-cause `cif` and the `Σ_k F_k + S_all = 1` invariant are correct for any
+    // caller-supplied grid. A no-op for the already-sorted common case.
+    let mut sorted_grid: Vec<f64> = time_grid.to_vec();
+    sorted_grid.sort_by(f64::total_cmp);
+    let time_grid: &[f64] = &sorted_grid;
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
 
     for subject in &population.subjects {
+        // Gather this subject's TTE causes at the typical values (η = 0). The
+        // all-cause survival and CIF need *every* cause's cumulative hazard at
+        // each grid point, so collect the per-cause parameters up front.
+        let mut causes: Vec<(usize, crate::types::HazardFamily, Vec<f64>, f64, f64)> = Vec::new();
         for (&cmt, endpoint) in &model.endpoints {
             let EndpointLikelihood::Tte { hazard } = endpoint else {
                 continue;
             };
             let crate::types::HazardSpec::Analytic { family, param_fn } = hazard;
             let params_vec = param_fn(&params.theta, &zero_eta, &subject.covariates);
-
-            // Distributional summaries are parameter-dependent, not time-dependent —
-            // compute once per (subject, cmt) pair and repeat across the time grid.
+            // Distributional summaries are parameter-dependent, not time-dependent.
             let t_median = median_survival(*family, &params_vec);
             let t_mean = mean_survival(*family, &params_vec);
+            causes.push((cmt, *family, params_vec, t_median, t_mean));
+        }
+        if causes.is_empty() {
+            continue;
+        }
 
+        // Per-cause hazard and cumulative hazard over the grid.
+        let mut hz = Vec::with_capacity(causes.len());
+        let mut chz = Vec::with_capacity(causes.len());
+        for (_, family, params_vec, _, _) in &causes {
+            let mut h_row = Vec::with_capacity(time_grid.len());
+            let mut cum_row = Vec::with_capacity(time_grid.len());
             for &t in time_grid {
-                let (h_val, cum_h) = hazard_and_cum_hazard(*family, t, &params_vec);
-                let s = (-cum_h).exp();
+                let (h_val, cum_h) = hazard_and_cum_hazard(*family, t, params_vec);
+                h_row.push(h_val);
+                cum_row.push(cum_h);
+            }
+            hz.push(h_row);
+            chz.push(cum_row);
+        }
+
+        let (cif, s_all) = cif_curves(&chz);
+
+        for (k, (cmt, _, _, t_median, t_mean)) in causes.iter().enumerate() {
+            for (i, &t) in time_grid.iter().enumerate() {
                 results.push(SurvivalPredictionResult {
                     id: subject.id.clone(),
-                    cmt,
+                    cmt: *cmt,
                     time: t,
-                    survival: s,
-                    cum_hazard: cum_h,
-                    hazard: h_val,
-                    median_survival: t_median,
-                    mean_survival: t_mean,
+                    survival: (-chz[k][i]).exp(),
+                    cum_hazard: chz[k][i],
+                    hazard: hz[k][i],
+                    cif: cif[k][i],
+                    survival_all: s_all[i],
+                    median_survival: *t_median,
+                    mean_survival: *t_mean,
                 });
             }
         }
@@ -5262,6 +5378,7 @@ mod iov_integration {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         }
     }
 
@@ -5362,6 +5479,22 @@ mod iov_integration {
         let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
         let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
         assert_iov_fit_ok(&result);
+    }
+
+    #[test]
+    fn test_iov_foce_auto_reports_resolved_optimizer() {
+        // `optimizer = auto` (the default) must resolve per-model and the
+        // FitResult must report the concrete pick so the output records what
+        // actually ran (#490). This IOV model is outside the analytic-gradient
+        // scope, so `auto` lands on bobyqa.
+        let model = make_iov_model();
+        let pop = make_iov_population();
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Auto, false);
+        let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
+        assert_iov_fit_ok(&result);
+        let resolved = Optimizer::Auto.resolve_auto(&model);
+        assert_eq!(result.optimizer, format!("auto ({})", resolved.label()));
+        assert_eq!(resolved, Optimizer::Bobyqa);
     }
 
     #[test]
@@ -6667,6 +6800,7 @@ mod simulate_with_uncertainty_tests {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         }
     }
 
@@ -7479,6 +7613,7 @@ mod tests_sdtab_tv_cov {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -7641,6 +7776,150 @@ mod tests_sdtab_tv_cov {
             );
         }
     }
+
+    /// Regression for #506: simulation must honour time-varying covariate
+    /// snapshots on observation rows. The pre-fix simulation path evaluated
+    /// `pk_param_fn` once with `subject.covariates`, so changing `WT` on obs rows
+    /// had no effect on emitted IPRED/DV unless the baseline dose row changed.
+    #[test]
+    fn test_simulate_honours_tv_covariates() {
+        let default_params = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.1, 5.0],
+            theta_upper: vec![50.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega: OmegaMatrix::from_diagonal(&[], vec![]),
+            omega_fixed: Vec::new(),
+            sigma: SigmaVector {
+                values: vec![0.0],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        let model = CompiledModel {
+            name: "tv_cov_sim_regression".into(),
+            pk_model: PkModel::OneCptIv,
+            error_model: ErrorModel::Proportional,
+            error_spec: ErrorSpec::Single(ErrorModel::Proportional),
+            pk_param_fn: Box::new(|theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                let wt = cov.get("WT").copied().unwrap_or(70.0);
+                p.values[0] = theta[0] * (wt / 70.0);
+                p.values[1] = theta[1];
+                p
+            }),
+            n_theta: 2,
+            n_eta: 0,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: Vec::new(),
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: Vec::new(),
+            indiv_param_names: vec!["CL".into(), "V".into()],
+            indiv_param_partials: crate::types::IndivParamPartials::empty(),
+            default_params: default_params.clone(),
+            omega_init_as_sd: Vec::new(),
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: Vec::new(),
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: Vec::new(),
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: Vec::new(),
+            ode_spec: None,
+            dose_attr_map: Default::default(),
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: vec!["WT".into()],
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
+            frem_config: None,
+            residual_error_eta: None,
+            analytical_init: Vec::new(),
+        };
+
+        let mut baseline_cov = HashMap::new();
+        baseline_cov.insert("WT".to_string(), 70.0);
+
+        let dose_covariates = vec![HashMap::from([("WT".to_string(), 70.0)])];
+        let obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 140.0)]),
+            HashMap::from([("WT".to_string(), 210.0)]),
+        ];
+        let subject = Subject {
+            id: "SIMTV".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 3.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0, 0.0, 0.0],
+            obs_cmts: vec![1, 1, 1],
+            covariates: baseline_cov,
+            dose_covariates,
+            obs_covariates,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0, 0],
+            occasions: vec![1, 1, 1],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        assert!(subject.has_tv_covariates());
+
+        let reference =
+            crate::pk::compute_predictions_with_tv(&model, &subject, &default_params.theta, &[]);
+        let pk_no_tv = (model.pk_param_fn)(&default_params.theta, &[], &subject.covariates);
+        let no_tv = model_preds(&model, &subject, &pk_no_tv, &default_params.theta, &[]);
+        let gap: f64 = reference
+            .iter()
+            .zip(no_tv.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            gap > 1e-3,
+            "test setup wrong: TV and baseline-only simulation paths must differ; \
+             got gap={gap}, tv={reference:?}, no_tv={no_tv:?}"
+        );
+
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: vec!["WT".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let rows = simulate_with_seed(&model, &population, &default_params, 1, 506);
+        assert_eq!(rows.len(), reference.len());
+        for (j, (row, &expected)) in rows.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (row.ipred - expected).abs() < 1e-12,
+                "simulation IPRED at obs {j} = {}, expected TV-aware {expected}",
+                row.ipred
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7731,6 +8010,7 @@ mod tests_derived_session_clock {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         }
     }
 
@@ -8048,6 +8328,7 @@ mod tests_derived_iov_kappa {
         CompiledModel {
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
@@ -8556,6 +8837,136 @@ mod tests_derived_iov_kappa {
         assert!(
             !diags.iter().any(|d| d.message.contains("ALAG")),
             "no compartment-indexed ALAGn warning for an analytical (non-ODE) model"
+        );
+    }
+
+    /// An SS=1 dose combined with an [initial_conditions] baseline double-counts
+    /// the starting amount (the SS closed form already pre-equilibrates an
+    /// infinite dose history). `check_model_data_warnings` must surface it
+    /// (W_STEADY_STATE_INIT) rather than silently superpose the two (#521 review).
+    #[test]
+    fn ss_dose_with_analytical_init_warns() {
+        let src = r#"
+[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[initial_conditions]
+  init(central) = 30 * V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("parse ok")
+            .model;
+        assert_eq!(model.analytical_init.len(), 1);
+
+        // Subject with a steady-state dose (ss=true, ii=24).
+        let subject = Subject {
+            fremtype: Vec::new(),
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
+            obs_times: vec![1.0, 6.0],
+            obs_raw_times: vec![1.0, 6.0],
+            observations: vec![1.0, 1.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_STEADY_STATE_INIT"),
+            "SS dose + [initial_conditions] must raise W_STEADY_STATE_INIT; got: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// No SS dose → no W_STEADY_STATE_INIT, even with an init baseline present.
+    #[test]
+    fn non_ss_dose_with_analytical_init_does_not_warn() {
+        let src = r#"
+[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[initial_conditions]
+  init(central) = 30 * V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("parse ok")
+            .model;
+        let subject = Subject {
+            fremtype: Vec::new(),
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: vec![1.0],
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        assert!(
+            !diags.iter().any(|d| d.code == "W_STEADY_STATE_INIT"),
+            "no SS dose → no W_STEADY_STATE_INIT"
         );
     }
 

@@ -67,7 +67,7 @@ impl SelectionFilter {
     /// Checks short-circuit on the first match, so a record is attributed to the
     /// first rule that excludes it. A rule that only ever matches records already
     /// removed by an earlier rule therefore never appears in the fired-condition
-    /// summary — see `docs/src/model-file/data-selection.md`.
+    /// summary — see `docs/model-file/data-selection.qmd`.
     pub fn should_exclude(&self, ctx: &RowContext<'_>) -> (bool, Option<String>) {
         // 1. ignore_subjects shorthand.
         if self.ignore_subject_ids.iter().any(|id| id == ctx.id) {
@@ -899,7 +899,7 @@ fn parse_subject(
     // runs inside `#[cfg(feature = "survival")]` blocks.
     tte_cmts: &HashSet<usize>,
     // Column index of the TENTRY (left-truncation time) column, if present.
-    tentry_col: Option<usize>,
+    _tentry_col: Option<usize>,
 ) -> Result<(Subject, usize, usize, SubjectExclusion, Vec<String>, usize), String> {
     let mut doses = Vec::new();
     let mut obs_times = Vec::new();
@@ -1308,7 +1308,7 @@ fn parse_subject(
                 #[cfg(feature = "survival")]
                 {
                     use crate::types::{EventType, ObsRecord};
-                    let raw_entry = tentry_col
+                    let raw_entry = _tentry_col
                         .and_then(|c| row.get(c))
                         .map(|s| parse_f64(s))
                         .unwrap_or(0.0)

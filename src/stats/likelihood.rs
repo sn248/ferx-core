@@ -1601,6 +1601,7 @@ mod tests {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         }
     }
 

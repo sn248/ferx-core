@@ -85,40 +85,30 @@ mod survival_smoke {
   maxiter = 3
 ";
 
+    /// Two-cause competing-risks TTE (cause-specific hazards on CMT 2 and CMT 3),
+    /// linked by a shared frailty `ETA_F`. TTE-only (no PK blocks).
+    const COMPETING_RISKS_MODEL: &str = r"
+[parameters]
+  theta TVLAMBDA_A(0.05, 0.001, 10.0)
+  theta TVLAMBDA_B(0.03, 0.001, 10.0)
+  omega ETA_F ~ 0.09
+
+[event_model cause_a]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA_A * exp(ETA_F)
+
+[event_model cause_b]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA_B * exp(ETA_F)
+";
+
     // ── Population helpers ───────────────────────────────────────────────────
 
-    /// Build a TTE-only population from (time, dv) pairs.
-    /// `dv`: 0 = right-censored, 1 = exact event.
-    fn tte_population(data: &[(f64, u8)]) -> Population {
-        let subjects = data
-            .iter()
-            .enumerate()
-            .map(|(i, &(t, dv))| {
-                let event_type = if dv == 1 {
-                    EventType::Exact
-                } else {
-                    EventType::RightCensored
-                };
-                let mut s = common::subject(&format!("{}", i + 1), vec![], vec![], vec![], vec![]);
-                s.obs_records = vec![ObsRecord::Event {
-                    time: t,
-                    event_type,
-                    entry_time: 0.0,
-                    cmt: 2,
-                }];
-                s
-            })
-            .collect();
-
-        Population {
-            covariate_names: vec![],
-            dv_column: "DV".to_string(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-            subjects,
-        }
-    }
+    // The one-record-per-subject `(time, dv)` TTE builder lives in the shared
+    // `tests/common/mod.rs` as `common::tte_pop_from_pairs` (also used by
+    // `tte_convergence.rs`) — call that instead of duplicating it here.
 
     // Synthetic data: 20 subjects, ~75% events, ~25% censored at t=30.
     const TTE_DATA: &[(f64, u8)] = &[
@@ -271,7 +261,7 @@ mod survival_smoke {
     #[test]
     fn tte_fit_exponential_3iter() {
         let model = parse_model_string(EXP_TTE_MODEL).expect("model must parse");
-        let pop = tte_population(TTE_DATA);
+        let pop = common::tte_pop_from_pairs(TTE_DATA);
 
         let mut opts = FitOptions::default();
         opts.verbose = false;
@@ -289,12 +279,278 @@ mod survival_smoke {
         }
     }
 
+    /// `simulate()` must administratively right-censor TTE draws at each subject's
+    /// observation window (the `ObsRecord::Event.time`) rather than emit every draw
+    /// as an uncensored event. Drives the full `simulate_tte` wiring; the draw/censor
+    /// logic itself is unit-tested in `survival/mod.rs` (`draw_tte_*`).
+    #[test]
+    fn simulate_tte_censors_at_observation_window() {
+        use ferx_core::{simulate_with_seed, SimOutcome};
+        // 300 subjects sharing a τ=20 window. λ≈0.05 ⇒ S(20)=exp(−1)≈0.37 censored,
+        // so the run must contain both observed events and administrative censors.
+        const TAU: f64 = 20.0;
+        let model = parse_model_string(EXP_TTE_MODEL).expect("model must parse");
+        let template = common::tte_pop_from_pairs(&vec![(TAU, 0); 300]);
+
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 4242);
+        assert_eq!(sims.len(), 300, "one TTE outcome per template subject");
+
+        let (mut events, mut censored) = (0usize, 0usize);
+        for r in &sims {
+            match r.outcome {
+                SimOutcome::Event { time, observed } => {
+                    assert!(time <= TAU, "no outcome may exceed the window: {time}");
+                    if observed {
+                        assert!(
+                            time < TAU,
+                            "an observed event must precede the window: {time}"
+                        );
+                        events += 1;
+                    } else {
+                        assert_eq!(time, TAU, "a censored outcome sits exactly at the window");
+                        censored += 1;
+                    }
+                }
+                ref other => panic!("expected an Event outcome, got {other:?}"),
+            }
+        }
+        assert!(events > 0, "expected some observed events (got {events})");
+        assert!(
+            censored > 0,
+            "expected some administratively censored subjects (got {censored})"
+        );
+    }
+
+    /// An **exact-event** template (`dv = 1`) carries no administrative horizon —
+    /// its record `time` is the realized event time, not a censoring window — so
+    /// `simulate()` must draw every outcome uncensored from the model's full
+    /// predictive distribution rather than truncate at that event time. Guards
+    /// against re-introducing the re-simulation / VPC truncation bias.
+    #[test]
+    fn simulate_tte_exact_event_template_draws_uncensored() {
+        use ferx_core::{simulate_with_seed, SimOutcome};
+        // 300 exact-event rows at t=5. The (old, buggy) behaviour would have
+        // censored every draw past t=5 at the event time; the correct behaviour
+        // ignores it as a horizon and draws fresh, finite event times.
+        let model = parse_model_string(EXP_TTE_MODEL).expect("model must parse");
+        let template = common::tte_pop_from_pairs(&vec![(5.0, 1); 300]);
+
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 1234);
+        assert_eq!(sims.len(), 300, "one TTE outcome per template subject");
+
+        let mut beyond_event_time = 0usize;
+        for r in &sims {
+            match r.outcome {
+                SimOutcome::Event { time, observed } => {
+                    assert!(
+                        observed,
+                        "an exact-event template carries no horizon → every draw is observed"
+                    );
+                    assert!(
+                        time.is_finite() && time > 0.0,
+                        "event time must be finite positive: {time}"
+                    );
+                    if time > 5.0 {
+                        beyond_event_time += 1;
+                    }
+                }
+                ref other => panic!("expected an Event outcome, got {other:?}"),
+            }
+        }
+        // With λ≈0.05 the median event time is ~14, so the bulk of draws land
+        // past t=5 — impossible under the old truncate-at-event-time behaviour.
+        assert!(
+            beyond_event_time > 0,
+            "expected draws beyond the record's event time (got {beyond_event_time})"
+        );
+    }
+
+    /// Competing risks (two cause-specific hazards on CMT 2 and CMT 3, shared
+    /// frailty): the model fits to a finite OFV and `predict_survival` reports a
+    /// cause-specific cumulative incidence with `Σ_k CIF_k(t) + S_all(t) = 1`.
+    #[test]
+    fn competing_risks_fits_and_predicts_cif() {
+        use ferx_core::predict_survival;
+        use std::collections::HashMap;
+        let model =
+            parse_model_string(COMPETING_RISKS_MODEL).expect("competing-risks model must parse");
+        assert!(
+            model.endpoints.contains_key(&2) && model.endpoints.contains_key(&3),
+            "both cause CMTs must be registered as TTE endpoints"
+        );
+
+        // 24 subjects: a mix of cause-2 events, cause-3 events, and censored.
+        let rows: Vec<(f64, u8)> = (0..24)
+            .map(|i| match i % 3 {
+                0 => (5.0 + i as f64 * 0.3, 2),
+                1 => (7.0 + i as f64 * 0.2, 3),
+                _ => (30.0, 0),
+            })
+            .collect();
+        let pop = common::tte_competing_pop(&rows);
+
+        let mut opts = FitOptions::default();
+        opts.verbose = false;
+        let r = fit(&model, &pop, &model.default_params, &opts)
+            .expect("competing-risks fit must not error");
+        assert!(r.ofv.is_finite(), "OFV must be finite; got {}", r.ofv);
+
+        // CIF invariant: the two CMT rows at the same (subject, time) must
+        // partition 1 with the all-cause survival.
+        let grid = [0.0, 2.0, 6.0, 15.0, 40.0];
+        let preds = predict_survival(&model, &pop, &model.default_params, &grid);
+        assert!(!preds.is_empty(), "predict_survival must return rows");
+        let mut by_key: HashMap<(String, u64), (f64, f64)> = HashMap::new();
+        for p in &preds {
+            assert!(
+                (0.0..=1.0).contains(&p.cif),
+                "CIF must be in [0,1]: {}",
+                p.cif
+            );
+            let entry = by_key
+                .entry((p.id.clone(), p.time.to_bits()))
+                .or_insert((0.0, p.survival_all));
+            entry.0 += p.cif;
+        }
+        for (_, (sum_cif, s_all)) in by_key {
+            assert!(
+                (sum_cif + s_all - 1.0).abs() < 1e-9,
+                "Σ CIF + S_all must equal 1: {sum_cif} + {s_all}"
+            );
+        }
+    }
+
+    /// Competing-risks simulation: each subject yields one row per cause CMT with
+    /// a shared outcome time; at most one cause is observed (the earliest), the
+    /// rest right-censored at that time. Over many subjects all three outcomes
+    /// (cause-2 event, cause-3 event, censored) appear.
+    #[test]
+    fn simulate_competing_risks_earliest_cause_wins() {
+        use ferx_core::{simulate_with_seed, SimOutcome};
+        use std::collections::HashMap;
+        const TAU: f64 = 25.0;
+        let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model must parse");
+        // Template: 400 subjects censored at τ on both causes; the draw overwrites.
+        let template = common::tte_competing_pop(&vec![(TAU, 0u8); 400]);
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 7);
+
+        let mut by_id: HashMap<String, Vec<&ferx_core::SimulationResult>> = HashMap::new();
+        for s in &sims {
+            by_id.entry(s.id.clone()).or_default().push(s);
+        }
+        assert_eq!(by_id.len(), 400, "one group per subject");
+
+        let (mut ev2, mut ev3, mut cens) = (0usize, 0usize, 0usize);
+        for rowset in by_id.values() {
+            assert_eq!(rowset.len(), 2, "one row per cause CMT");
+            let t0 = match &rowset[0].outcome {
+                SimOutcome::Event { time, .. } => *time,
+                _ => panic!("expected an Event outcome"),
+            };
+            let (mut observed_count, mut observed_cmt) = (0usize, 0usize);
+            for s in rowset {
+                let (time, observed) = match &s.outcome {
+                    SimOutcome::Event { time, observed } => (*time, *observed),
+                    _ => panic!("expected an Event outcome"),
+                };
+                assert!(
+                    (time - t0).abs() < 1e-12,
+                    "both rows share the outcome time"
+                );
+                assert!(time <= TAU + 1e-12, "outcome time within the window");
+                if observed {
+                    observed_count += 1;
+                    observed_cmt = s.cmt;
+                }
+            }
+            assert!(
+                observed_count <= 1,
+                "at most one cause observed per subject"
+            );
+            match observed_cmt {
+                2 => ev2 += 1,
+                3 => ev3 += 1,
+                _ => cens += 1,
+            }
+        }
+        assert!(
+            ev2 > 0 && ev3 > 0 && cens > 0,
+            "expected cause-2, cause-3, and censored subjects (got {ev2}/{ev3}/{cens})"
+        );
+    }
+
+    /// Re-simulating a competing-risks subject that already has an observed event
+    /// (an `Exact` record, the sibling cause `RightCensored` at the same time)
+    /// must NOT truncate the fresh draw at that original event time: an event
+    /// record carries no administrative horizon (+∞ from `observation_window`,
+    /// #494), so a simulated outcome can fall after it. Guards against the
+    /// per-cause window collapsing to the earliest (`min`) horizon.
+    #[test]
+    fn simulate_competing_risks_event_record_draws_uncensored() {
+        use ferx_core::{simulate_with_seed, SimOutcome};
+        let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model must parse");
+        // 300 subjects, each with cause A (CMT 2) observed at t=0.5 and cause B
+        // (CMT 3) censored at 0.5 — the cause-specific layout of an early event.
+        let template = common::tte_competing_pop(&vec![(0.5_f64, 2u8); 300]);
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 99);
+
+        let max_t = sims
+            .iter()
+            .filter_map(|s| match s.outcome {
+                SimOutcome::Event { time, .. } => Some(time),
+                _ => None,
+            })
+            .fold(0.0_f64, f64::max);
+        // With the #494-consistent horizon (Exact ⇒ +∞) the redraw is unbounded,
+        // so outcomes land well after the original 0.5; the buggy `min` horizon
+        // clamped every outcome to 0.5.
+        assert!(
+            max_t > 0.5 + 1e-6,
+            "event-bearing competing subjects must redraw uncensored, not clamp to \
+             the original event time (max outcome {max_t})"
+        );
+    }
+
+    /// `predict_survival` must keep the partition invariant `Σ_k CIF_k + S_all = 1`
+    /// even when the caller supplies an out-of-order time grid: the CIF telescopes
+    /// the all-cause survival drop, so the grid is sorted internally. Guards the
+    /// public-API robustness of the invariant.
+    #[test]
+    fn predict_survival_cif_invariant_holds_for_unsorted_grid() {
+        use ferx_core::predict_survival;
+        use std::collections::HashMap;
+        let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model must parse");
+        let pop = common::tte_competing_pop(&[(5.0, 2u8), (8.0, 3u8), (30.0, 0u8)]);
+        // Deliberately unsorted.
+        let grid = [15.0, 0.0, 6.0, 2.0, 40.0];
+        let preds = predict_survival(&model, &pop, &model.default_params, &grid);
+        assert!(!preds.is_empty(), "predict_survival must return rows");
+        let mut by_key: HashMap<(String, u64), (f64, f64)> = HashMap::new();
+        for p in &preds {
+            assert!(
+                (0.0..=1.0).contains(&p.cif),
+                "CIF must be in [0,1]: {}",
+                p.cif
+            );
+            let entry = by_key
+                .entry((p.id.clone(), p.time.to_bits()))
+                .or_insert((0.0, p.survival_all));
+            entry.0 += p.cif;
+        }
+        for (_, (sum_cif, s_all)) in by_key {
+            assert!(
+                (sum_cif + s_all - 1.0).abs() < 1e-9,
+                "Σ CIF + S_all must equal 1 on an unsorted grid: {sum_cif} + {s_all}"
+            );
+        }
+    }
+
     /// `fit()` on a fixed-effects TTE model (n_eta=0, no inner loop) must
     /// return Ok immediately (single outer-loop evaluation per iteration).
     #[test]
     fn tte_fit_fixed_effects_n_eta_0() {
         let model = parse_model_string(EXP_TTE_FIXED).expect("model must parse");
-        let pop = tte_population(TTE_DATA);
+        let pop = common::tte_pop_from_pairs(TTE_DATA);
 
         let mut opts = FitOptions::default();
         opts.verbose = false;
@@ -381,7 +637,7 @@ mod survival_smoke {
         let model_no_lhr = parse_model_string(src_no_lhr).expect("baseline model must parse");
         let model_with_lhr = parse_model_string(src_with_lhr).expect("model with loghr must parse");
 
-        let pop = tte_population(TTE_DATA);
+        let pop = common::tte_pop_from_pairs(TTE_DATA);
         let mut opts = FitOptions::default();
         opts.verbose = false;
 
@@ -578,7 +834,7 @@ mod survival_smoke {
     #[test]
     fn tte_only_fit_completes_without_pk_blocks() {
         let model = parse_model_string(EXP_TTE_ONLY).expect("must parse");
-        let pop = tte_population(TTE_DATA);
+        let pop = common::tte_pop_from_pairs(TTE_DATA);
         let mut opts = ferx_core::FitOptions::default();
         opts.verbose = false;
         let result = ferx_core::fit(&model, &pop, &model.default_params, &opts);
@@ -833,7 +1089,7 @@ mod survival_smoke {
         use ferx_core::predict_survival;
 
         let model = parse_model_string(EXP_TTE_MODEL).expect("must parse");
-        let pop = tte_population(&TTE_DATA[..3]);
+        let pop = common::tte_pop_from_pairs(&TTE_DATA[..3]);
         let grid = vec![1.0, 5.0, 10.0, 20.0];
         let rows = predict_survival(&model, &pop, &model.default_params, &grid);
         assert!(
@@ -1067,7 +1323,7 @@ mod survival_smoke {
     #[test]
     fn tte_weibull_fit_completes() {
         let model = parse_model_string(WEIBULL_TTE_ONLY).expect("WEIBULL_TTE_ONLY must parse");
-        let pop = tte_population(WEIBULL_DATA);
+        let pop = common::tte_pop_from_pairs(WEIBULL_DATA);
         let mut opts = FitOptions::default();
         opts.verbose = false;
         match fit(&model, &pop, &model.default_params, &opts) {
@@ -1084,7 +1340,7 @@ mod survival_smoke {
     #[test]
     fn tte_gompertz_fit_completes() {
         let model = parse_model_string(GOMPERTZ_TTE_ONLY).expect("GOMPERTZ_TTE_ONLY must parse");
-        let pop = tte_population(GOMPERTZ_DATA);
+        let pop = common::tte_pop_from_pairs(GOMPERTZ_DATA);
         let mut opts = FitOptions::default();
         opts.verbose = false;
         match fit(&model, &pop, &model.default_params, &opts) {
@@ -1102,7 +1358,7 @@ mod survival_smoke {
     #[test]
     fn tte_saem_fit_completes() {
         let model = parse_model_string(EXP_TTE_SAEM).expect("EXP_TTE_SAEM must parse");
-        let pop = tte_population(TTE_DATA);
+        let pop = common::tte_pop_from_pairs(TTE_DATA);
         let mut opts = FitOptions::default();
         opts.verbose = false;
         match fit(&model, &pop, &model.default_params, &opts) {

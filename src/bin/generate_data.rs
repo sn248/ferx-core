@@ -246,6 +246,7 @@ fn build_warfarin_model() -> CompiledModel {
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
         residual_error_eta: None,
+        analytical_init: Vec::new(),
     }
 }
 
@@ -369,6 +370,7 @@ fn generate_two_cpt_iv() {
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
         residual_error_eta: None,
+        analytical_init: Vec::new(),
     };
     let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0];
     let subjects = simulate_subjects(&model, &params, 15, 100.0, 1, &obs_times, 123, None);
@@ -497,6 +499,7 @@ fn generate_two_cpt_oral_cov() {
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
         residual_error_eta: None,
+        analytical_init: Vec::new(),
     };
 
     // Generate random covariates (matching Julia seed 456)
@@ -683,6 +686,7 @@ fn generate_mm_oral() {
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
         residual_error_eta: None,
+        analytical_init: Vec::new(),
     };
     let obs_times = vec![
         0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0,

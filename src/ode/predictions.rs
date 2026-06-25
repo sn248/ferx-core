@@ -9,6 +9,10 @@
 
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
 use crate::pk::absorption::PreparedInputRate;
+use crate::sim::adaptive::{
+    AdaptiveRun, ControllerCtx, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry,
+    MonitorSpec, ObserveMode, ObservedSignal,
+};
 use crate::types::{DoseEvent, PkParams, Subject};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -728,6 +732,139 @@ impl OdeReadout {
 /// `pk_params_flat` is a flat array of PK parameters passed to the RHS function.
 /// `theta` and `eta` are forwarded to `OdeSpec::output_fn` for Form C
 /// (`[scaling] y = <expr>`); pass empty slices when no Form C is configured.
+/// Integrate one timeline segment `(t_start, t_end]` of the plain ODE path.
+///
+/// Builds the segment's `saveat`, sets the per-segment TAD anchor on
+/// `ext_params`, integrates the forcing-wrapped RHS from the carried state `u`,
+/// records every observation landing in the half-open interval, and advances
+/// `u` in place to `t_end` so the caller can continue with the next segment.
+///
+/// The left-boundary discontinuities (SS pre-seed, bolus jumps) and the
+/// observation recorded exactly at `t_start` are applied by the caller *before*
+/// this call — this function owns only the integration of the open interval,
+/// which is the piece a reactive (state-dependent) driver reuses unchanged
+/// (#391 S1.2). Behaviour is identical to the inline segment body it replaced.
+#[allow(clippy::too_many_arguments)]
+fn integrate_segment(
+    ode: &OdeSpec,
+    u: &mut [f64],
+    t_start: f64,
+    t_end: f64,
+    subject: &Subject,
+    dose_lagtimes: &[f64],
+    dose_f_bio: &[f64],
+    ext_params: &mut [f64],
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    obs_map: &HashMap<u64, Vec<usize>>,
+    predictions: &mut [f64],
+) {
+    let opts = ode.solver_opts;
+
+    // Observation times in this segment (t_start < t <= t_end)
+    let mut saveat: Vec<f64> = subject
+        .obs_times
+        .iter()
+        .filter(|&&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+        .cloned()
+        .collect();
+    // Always include t_end so u is updated for next segment
+    if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
+        saveat.push(t_end);
+    }
+    saveat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+
+    if (t_end - t_start).abs() < 1e-15 {
+        return;
+    }
+
+    // Update TAD anchor (slot MAX_PK_PARAMS+1): last effective dose time
+    // before this segment, SS-aware (gives TAD = t - last_dose_eff).
+    {
+        let last_dose_eff = subject
+            .doses
+            .iter()
+            .enumerate()
+            .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
+            .map(|(i, d)| {
+                let lag = dose_lagtimes[i];
+                if d.ss && d.ii > 0.0 {
+                    let elapsed = t_start - (d.time + lag);
+                    t_start - elapsed.rem_euclid(d.ii)
+                } else {
+                    d.time + lag
+                }
+            })
+            .fold(f64::NEG_INFINITY, f64::max);
+        // Store NaN when no effective prior dose exists so the ODE RHS injects
+        // NaN for TAD (consistent with sdtab) rather than +∞ (t - NEG_INFINITY).
+        ext_params[crate::types::MAX_PK_PARAMS + 1] = if last_dose_eff.is_finite() {
+            last_dose_eff
+        } else {
+            f64::NAN
+        };
+    }
+
+    // Integrate. If any infusions are active in this segment, wrap
+    // the user RHS so it adds `+rate` to each infusion's compartment.
+    // The plain (non-event-driven) ODE path never sees reset subjects —
+    // the dispatcher routes those to `ode_predictions_event_driven` — so
+    // no reset floor applies here.
+    let active = active_infusions(
+        &subject.doses,
+        t_start,
+        t_end,
+        dose_lagtimes,
+        dose_f_bio,
+        f64::NEG_INFINITY,
+    );
+    // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
+    // snapshot `ext_params` is constant across the integration (#322 #7).
+    let prepared = prepare_input_rates(ode, ext_params);
+    let wrapped_rhs = wrap_rhs_with_forcings(
+        ode,
+        &subject.doses,
+        dose_lagtimes,
+        dose_f_bio,
+        f64::NEG_INFINITY,
+        &prepared,
+        InfusionInput::Spanning(active),
+    );
+    let sol = solve_ode(
+        &wrapped_rhs,
+        u,
+        (t_start, t_end),
+        ext_params,
+        &saveat,
+        &opts,
+    );
+
+    // Extract predictions and update state
+    for pt in &sol {
+        if let Some(obs_idxs) = obs_map.get(&pt.t.to_bits()) {
+            for &obs_idx in obs_idxs {
+                let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+                predictions[obs_idx] = read_observable(
+                    ode,
+                    &pt.u,
+                    pk_params_flat,
+                    theta,
+                    eta,
+                    &subject.covariates,
+                    cmt,
+                );
+            }
+        }
+    }
+
+    // State at end of segment
+    if let Some(last) = sol.last() {
+        u.copy_from_slice(&last.u);
+    }
+}
+
 /// Dose events are handled as state discontinuities between integration segments.
 pub fn ode_predictions(
     ode: &OdeSpec,
@@ -883,107 +1020,26 @@ pub fn ode_predictions(
             }
         }
 
-        // Observation times in this segment (t_start < t <= t_end)
-        let mut saveat: Vec<f64> = subject
-            .obs_times
-            .iter()
-            .filter(|&&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
-            .cloned()
-            .collect();
-        // Always include t_end so u is updated for next segment
-        if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
-            saveat.push(t_end);
-        }
-        saveat.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
-
-        if (t_end - t_start).abs() < 1e-15 {
-            continue;
-        }
-
-        // Update TAD anchor (slot MAX_PK_PARAMS+1): last effective dose time
-        // before this segment, SS-aware (gives TAD = t - last_dose_eff).
-        {
-            let last_dose_eff = subject
-                .doses
-                .iter()
-                .enumerate()
-                .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
-                .map(|(i, d)| {
-                    let lag = dose_lagtimes[i];
-                    if d.ss && d.ii > 0.0 {
-                        let elapsed = t_start - (d.time + lag);
-                        t_start - elapsed.rem_euclid(d.ii)
-                    } else {
-                        d.time + lag
-                    }
-                })
-                .fold(f64::NEG_INFINITY, f64::max);
-            // Store NaN when no effective prior dose exists so the ODE RHS injects
-            // NaN for TAD (consistent with sdtab) rather than +∞ (t - NEG_INFINITY).
-            ext_params[crate::types::MAX_PK_PARAMS + 1] = if last_dose_eff.is_finite() {
-                last_dose_eff
-            } else {
-                f64::NAN
-            };
-        }
-
-        // Integrate. If any infusions are active in this segment, wrap
-        // the user RHS so it adds `+rate` to each infusion's compartment.
-        // The plain (non-event-driven) ODE path never sees reset subjects —
-        // the dispatcher routes those to `ode_predictions_event_driven` — so
-        // no reset floor applies here.
-        let active = active_infusions(
-            &subject.doses,
+        // Integrate the open interval `(t_start, t_end]` from the carried state,
+        // recording observations inside it and advancing `u` to `t_end`. The
+        // left-boundary discontinuities and the `t_start` observation were applied
+        // above; `integrate_segment` owns only the integration — the piece a
+        // reactive (state-dependent) driver reuses unchanged (#391 S1.2).
+        integrate_segment(
+            ode,
+            &mut u,
             t_start,
             t_end,
+            subject,
             &dose_lagtimes,
             &dose_f_bio,
-            f64::NEG_INFINITY,
+            &mut ext_params,
+            pk_params_flat,
+            theta,
+            eta,
+            &obs_map,
+            &mut predictions,
         );
-        // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
-        // snapshot `ext_params` is constant across the integration (#322 #7).
-        let prepared = prepare_input_rates(ode, &ext_params);
-        let wrapped_rhs = wrap_rhs_with_forcings(
-            ode,
-            &subject.doses,
-            &dose_lagtimes,
-            &dose_f_bio,
-            f64::NEG_INFINITY,
-            &prepared,
-            InfusionInput::Spanning(active),
-        );
-        let sol = solve_ode(
-            &wrapped_rhs,
-            &u,
-            (t_start, t_end),
-            &ext_params,
-            &saveat,
-            &opts,
-        );
-
-        // Extract predictions and update state
-        for pt in &sol {
-            if let Some(obs_idxs) = obs_map.get(&pt.t.to_bits()) {
-                for &obs_idx in obs_idxs {
-                    let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-                    predictions[obs_idx] = read_observable(
-                        ode,
-                        &pt.u,
-                        pk_params_flat,
-                        theta,
-                        eta,
-                        &subject.covariates,
-                        cmt,
-                    );
-                }
-            }
-        }
-
-        // State at end of segment
-        if let Some(last) = sol.last() {
-            u.copy_from_slice(&last.u);
-        }
     }
 
     // Clamp negative predictions to zero (ODE solver overshoot guard).
@@ -1000,6 +1056,480 @@ pub fn ode_predictions(
     }
 
     predictions
+}
+
+/// Insert a dynamically-discovered break time — an infusion end the reactive
+/// driver only learns once the controller issues the infusion — into the sorted
+/// `breaks` timeline, collapsing near-duplicates within the **same** `1e-15`
+/// tolerance the static timeline uses (see [`ode_predictions`]).
+///
+/// A break within `1e-15` of an existing one is dropped, so two cases match the
+/// static engine's deduped segmentation rather than spuriously re-segmenting:
+///  - an infusion that ends *exactly* at a later decision time, and
+///  - a degenerate sub-`1e-15`-duration infusion that ends at its own start
+///    (collapsing with the decision break — a no-op, mirroring the static
+///    engine's `is_real_infusion` `duration > 0` guard).
+///
+/// Because an infusion end is always strictly after the decision that issued it,
+/// the insertion point is always *after* the driver's current position, so a
+/// just-issued end never disturbs an already-processed break.
+fn insert_break(breaks: &mut Vec<f64>, t: f64) {
+    let pos = breaks.partition_point(|&b| b < t);
+    if pos < breaks.len() && (breaks[pos] - t).abs() < 1e-15 {
+        return;
+    }
+    if pos > 0 && (t - breaks[pos - 1]).abs() < 1e-15 {
+        return;
+    }
+    breaks.insert(pos, t);
+}
+
+/// Out-of-scope-compartment guards shared by the bolus and infusion decision
+/// branches of [`ode_predictions_adaptive`]. A controller dose into compartment
+/// `cmt` (1-based) is a typed error — never a silent wrong answer — when the
+/// compartment is:
+///  - **out of range** (`cmt > n_states`);
+///  - **fed by a built-in input-rate (absorption) function** — the dose would be
+///    double-counted: the trusted static engine delivers it as `R_in` through the
+///    wrapped RHS (`input_rate_consumes_cmt`), yet the same forcing is rebuilt
+///    from `shadow.doses` here; or
+///  - **lagged** — a lag time would be applied with zero delay yet excluded from
+///    its own TAD anchor inside `integrate_segment` (whose filter is
+///    `d.time + lag <= t_start`).
+///
+/// On success returns the per-compartment bioavailability `F`, which both
+/// branches need (the bolus to scale its state jump, the infusion its window).
+/// Single source of truth so the two branches cannot drift the eligibility
+/// contract apart.
+fn reject_unsupported_dose_compartment(
+    ode: &OdeSpec,
+    cmt: usize,
+    n_states: usize,
+    pk_params_flat: &[f64],
+    decision_index: usize,
+) -> Result<f64, String> {
+    if cmt > n_states {
+        return Err(format!(
+            "decision {decision_index}: dose into compartment {cmt} but the model has \
+             {n_states} state(s)"
+        ));
+    }
+    if input_rate_consumes_cmt(ode, cmt) {
+        return Err(format!(
+            "decision {decision_index}: compartment {cmt} is fed by a built-in input-rate \
+             (absorption) function; controller dosing into an input-rate compartment is not \
+             supported"
+        ));
+    }
+    let lag = ode.dose_attr_map.lagtime(cmt, pk_params_flat);
+    if lag != 0.0 {
+        return Err(format!(
+            "decision {decision_index}: compartment {cmt} declares a dose lag time ({lag}); \
+             lagged controller dosing is not supported"
+        ));
+    }
+    Ok(ode.dose_attr_map.f_bio(cmt, pk_params_flat))
+}
+
+/// Reactive ("adaptive" / feedback) ODE prediction over a single subject (#391
+/// S1.3). Walks a fixed `decision_times` schedule, and at each decision lets
+/// `controller` read the current state (through the declared `monitors`) and
+/// return the [`DoseAction`]s to apply, then carries on integrating with the
+/// **same** trusted per-segment engine ([`integrate_segment`]) the static
+/// predictor uses.
+///
+/// Scope of this cut — everything outside it is a typed error, never a silent
+/// wrong answer:
+/// - **Bolus / Infuse / Hold / Stop** are handled. A zero-amount bolus or
+///   infusion is treated as `Hold` (no realized dose recorded). An `Infuse`
+///   injects `+rate` over its F-scaled window: its end is inserted as a break
+///   (via [`insert_break`]) so each segment is fully inside or outside the
+///   window — the invariant [`active_infusions`] relies on (S1.3b). `Stop`
+///   discontinues *future* decisions only; an infusion already in flight
+///   completes its delivery (a committed dose is not retracted — a true safety
+///   halt is a separate, explicit action, tracked as a follow-up).
+/// - **`ObserveMode::Ipred` only.** A `Dv` (assay-noised) monitor errors until
+///   S1.5 adds the per-subject RNG substreams that keep assay draws verifier-safe.
+/// - **Dose-free base subject** — the regimen is entirely controller-driven
+///   (augmenting pre-scheduled doses is a later step).
+/// - **No lagged or input-rate (absorption) dosing.** Controller dosing into a
+///   compartment with a dose lag time, or one fed by a built-in input-rate
+///   function, is a typed error (the TAD-anchor and double-count subtleties are
+///   deferred, as for the bolus path).
+/// - `max_decisions` bounds the schedule (runaway guard); every action is run
+///   through [`DoseAction::validate`] before it can reach the integrator.
+///
+/// The observe-then-dose order is pre-dose (the controller sees the trough at the
+/// decision time, then doses). The TAFD anchor is set at the first realized dose,
+/// so a TAFD-using model integrated over a segment strictly *before* its first
+/// dose would see `NaN` rather than the static predictor's first-dose anchor —
+/// immaterial for a controller-driven regimen (no dose ⇒ TAFD undefined).
+///
+/// Verified contract (see tests): a *state-independent* controller reproduces
+/// [`ode_predictions`] on the same realized doses exactly — for boluses *and*
+/// infusions — anchoring the reactive bookkeeping to the trusted static engine.
+/// The bit-exactness holds when the realized schedule keeps the two engines'
+/// segment structure aligned: a dose is realized at every decision (so a held
+/// decision does not introduce a break the static dose-list lacks) and the last
+/// observation is the global maximum (so neither engine breaks at an interior
+/// observation, and the adaptive `t_last = max(obs ∪ decisions)` coincides with
+/// the static `t_last = max(obs)`). Outside those conditions a phantom decision
+/// break only restarts the integrator on a no-event segment, so predictions are
+/// unaffected on the smooth models tested; genuinely reactive/hold regimens are
+/// therefore pinned against the closed form instead.
+// `dead_code`: this is `pub(crate)` and exercised by tests; the public
+// `simulate_adaptive()` entry point that consumes it lands in S1.4 (#391).
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn ode_predictions_adaptive(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+    decision_times: &[f64],
+    monitors: &[MonitorSpec],
+    controller: &mut dyn FnMut(&ControllerCtx) -> Vec<DoseAction>,
+    max_decisions: usize,
+) -> Result<AdaptiveRun, String> {
+    let n = ode.n_states;
+
+    // --- Preconditions (typed errors, never silent) ----------------------
+    if !subject.doses.is_empty() {
+        return Err(
+            "ode_predictions_adaptive (S1.3a) requires a dose-free base subject; the regimen is \
+             controller-driven (augmenting pre-scheduled doses is a later step)"
+                .to_string(),
+        );
+    }
+    if decision_times.len() > max_decisions {
+        return Err(format!(
+            "decision schedule has {} points, exceeding max_decisions = {} (runaway guard)",
+            decision_times.len(),
+            max_decisions
+        ));
+    }
+    for m in monitors {
+        if m.mode == ObserveMode::Dv {
+            return Err(format!(
+                "monitor '{}' requests DV (assay-noised) observation, which needs the per-subject \
+                 RNG substreams added in S1.5; the S1.3a driver serves Ipred monitors only",
+                m.name
+            ));
+        }
+        if m.cmt == 0 || m.cmt > n {
+            return Err(format!(
+                "monitor '{}' observes compartment {} but the model has {} state(s)",
+                m.name, m.cmt, n
+            ));
+        }
+    }
+
+    // --- Running state ---------------------------------------------------
+    let n_obs = subject.obs_times.len();
+    let mut u = ode.initial_state(pk_params_flat);
+    let mut predictions = vec![f64::NAN; n_obs];
+    let mut ledger: Vec<DoseLedgerEntry> = Vec::new();
+    let mut decisions: Vec<DecisionLogEntry> = Vec::new();
+
+    // Shadow subject accumulates the controller's realized doses (the #324
+    // pattern); `integrate_segment` reads `shadow.doses` for the TAD anchor.
+    let mut shadow = subject.clone();
+
+    // Extended params: PK params + TAFD/TAD anchors. TAFD (slot MAX_PK_PARAMS)
+    // stays NaN until the first dose arrives; TAD is set per segment inside
+    // `integrate_segment`.
+    let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
+    ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
+    ext_params[crate::types::MAX_PK_PARAMS] = f64::NAN;
+
+    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, &t) in shadow.obs_times.iter().enumerate() {
+        obs_map.entry(t.to_bits()).or_default().push(i);
+    }
+
+    // Decision time -> 0-based index, for the in-loop hook.
+    let mut decision_index_of: HashMap<u64, usize> = HashMap::new();
+    for (i, &t) in decision_times.iter().enumerate() {
+        decision_index_of.entry(t.to_bits()).or_insert(i);
+    }
+
+    // Break timeline, seeded with the points known up front: 0, every decision,
+    // and the last time. Infusion ends are *not* known here — the controller
+    // discovers them as it issues infusions — so they are inserted into this
+    // (sorted) list dynamically inside the loop (see `insert_break`), which is why
+    // the walk below is a `while` over a growing `Vec` rather than a fixed range.
+    // With no infusions issued the timeline never grows, so the bolus-only path is
+    // byte-identical to before. Observations are deliberately NOT break points —
+    // they are recorded via `saveat` *inside* a segment, exactly as
+    // `ode_predictions` does. Breaking at observations too would reinitialize the
+    // adaptive integrator at each one and perturb the step sequence, so the segment
+    // structure (and the result) would no longer match the static engine on the
+    // same realized doses.
+    let t_last = shadow
+        .obs_times
+        .iter()
+        .chain(decision_times.iter())
+        .cloned()
+        .fold(0.0_f64, f64::max);
+    let mut break_times: Vec<f64> = vec![0.0, t_last];
+    break_times.extend(decision_times.iter().cloned());
+    break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+
+    let mut stopped = false;
+
+    let mut k = 0;
+    while k < break_times.len() {
+        let t_start = break_times[k];
+
+        // --- Decision hook: observe (pre-dose trough) -> decide -> dose. ---
+        if !stopped {
+            if let Some(&decision_index) = decision_index_of.get(&t_start.to_bits()) {
+                // Resolve each monitored signal at the current (pre-dose) state.
+                let mut signals: HashMap<String, f64> = HashMap::new();
+                let mut observed: Vec<ObservedSignal> = Vec::with_capacity(monitors.len());
+                for m in monitors {
+                    let value = read_observable(
+                        ode,
+                        &u,
+                        pk_params_flat,
+                        theta,
+                        eta,
+                        &shadow.covariates,
+                        m.cmt,
+                    );
+                    signals.insert(m.name.clone(), value);
+                    observed.push(ObservedSignal {
+                        name: m.name.clone(),
+                        value,
+                        mode: m.mode,
+                    });
+                }
+
+                let actions = {
+                    let ctx = ControllerCtx {
+                        t: t_start,
+                        state: &u,
+                        covariates: &shadow.covariates,
+                        history: &shadow.doses,
+                        decision_index,
+                        signals: &signals,
+                    };
+                    controller(&ctx)
+                };
+
+                // Validate the whole action list up front — before any action is
+                // applied — and require `Stop` to be the final action. A malformed
+                // action anywhere (not only one before the first `Stop`) is a typed
+                // error, and a controller that issues actions *after* discontinuing
+                // (`[Stop, …]`) is rejected rather than silently truncated, so the
+                // decision log can never disagree with the ledger about what ran.
+                for (j, action) in actions.iter().enumerate() {
+                    action
+                        .validate()
+                        .map_err(|e| format!("decision {decision_index} at t={t_start}: {e}"))?;
+                    if action.is_stop() && j + 1 < actions.len() {
+                        return Err(format!(
+                            "decision {decision_index} at t={t_start}: Stop must be the final \
+                             action, but {} action(s) follow it",
+                            actions.len() - j - 1
+                        ));
+                    }
+                }
+
+                // Count realized doses this decision so the log can categorize the
+                // outcome (a held / zero-amount decision leaves no ledger row).
+                let mut n_dosed = 0usize;
+                for action in actions {
+                    match action {
+                        DoseAction::Bolus { amt, cmt } => {
+                            // A zero-amount bolus is a no-op; don't record an empty dose.
+                            if amt == 0.0 {
+                                continue;
+                            }
+                            // Out-of-range / input-rate / lagged compartments are typed errors
+                            // (never a silent wrong answer) — see the shared guard for why.
+                            let f = reject_unsupported_dose_compartment(
+                                ode,
+                                cmt,
+                                n,
+                                pk_params_flat,
+                                decision_index,
+                            )?;
+                            u[cmt - 1] += f * amt;
+                            if !ext_params[crate::types::MAX_PK_PARAMS].is_finite() {
+                                ext_params[crate::types::MAX_PK_PARAMS] = t_start;
+                            }
+                            shadow
+                                .doses
+                                .push(DoseEvent::new(t_start, amt, cmt, 0.0, false, 0.0));
+                            ledger.push(DoseLedgerEntry {
+                                subject: shadow.id.clone(),
+                                draw: 0,
+                                sim: 0,
+                                dose_idx: ledger.len(),
+                                time: t_start,
+                                amt,
+                                cmt,
+                                rate: 0.0,
+                                decision_idx: decision_index,
+                                rule_fired: "bolus".to_string(),
+                                observed_signals: observed.clone(),
+                                pre_state: None,
+                                post_state: None,
+                                f_applied: f,
+                            });
+                            n_dosed += 1;
+                        }
+                        DoseAction::Infuse { amt, cmt, rate } => {
+                            // A zero-amount infusion is a no-op; don't record an empty dose.
+                            if amt == 0.0 {
+                                continue;
+                            }
+                            // Same out-of-scope guards as the bolus path (and for the same
+                            // reasons) — see the shared guard. A lagged compartment additionally
+                            // shifts the infusion window out of step with its own TAD anchor.
+                            let f = reject_unsupported_dose_compartment(
+                                ode,
+                                cmt,
+                                n,
+                                pk_params_flat,
+                                decision_index,
+                            )?;
+                            // Unlike a bolus, an infusion adds nothing to `u` here: it is injected
+                            // as a `+rate` derivative term over its window by the next
+                            // `integrate_segment` (which reads `shadow.doses` via
+                            // `active_infusions`). All this branch must do is make every infusion
+                            // *edge* a break so each segment is fully inside or outside the window.
+                            // The start (this decision) is already a break; insert the F-scaled
+                            // end. `bioavailable_infusion` is the SAME mode-aware window (#419) the
+                            // static engine and `active_infusions` use, so the adaptive timeline
+                            // reproduces the static segmentation exactly (the degenerate oracle).
+                            let dose = DoseEvent::new(t_start, amt, cmt, rate, false, 0.0);
+                            let (_, dur_eff) = dose.bioavailable_infusion(f);
+                            insert_break(&mut break_times, t_start + dur_eff);
+                            if !ext_params[crate::types::MAX_PK_PARAMS].is_finite() {
+                                ext_params[crate::types::MAX_PK_PARAMS] = t_start;
+                            }
+                            shadow.doses.push(dose);
+                            ledger.push(DoseLedgerEntry {
+                                subject: shadow.id.clone(),
+                                draw: 0,
+                                sim: 0,
+                                dose_idx: ledger.len(),
+                                time: t_start,
+                                amt,
+                                cmt,
+                                rate,
+                                decision_idx: decision_index,
+                                rule_fired: "infuse".to_string(),
+                                observed_signals: observed.clone(),
+                                pre_state: None,
+                                post_state: None,
+                                f_applied: f,
+                            });
+                            n_dosed += 1;
+                        }
+                        DoseAction::Hold => {}
+                        DoseAction::Stop => {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Log every decision — including holds and no-change, which leave
+                // no ledger row. `stopped` was false on entry to this hook (it gates
+                // the hook), so its truth here means the `Stop` fired this decision.
+                // `observed` is moved in (the ledger rows above already cloned it).
+                let outcome = if stopped {
+                    DecisionOutcome::Stop { dosed: n_dosed }
+                } else if n_dosed > 0 {
+                    DecisionOutcome::Dosed { n: n_dosed }
+                } else {
+                    DecisionOutcome::Hold
+                };
+                decisions.push(DecisionLogEntry {
+                    subject: shadow.id.clone(),
+                    draw: 0,
+                    sim: 0,
+                    decision_idx: decision_index,
+                    time: t_start,
+                    observed_signals: observed,
+                    outcome,
+                });
+            }
+        }
+
+        // Record the observation exactly at t_start (post-dose), mirroring
+        // `ode_predictions`' left-boundary recording.
+        if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
+            for &obs_idx in obs_idxs {
+                let cmt = shadow.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+                predictions[obs_idx] =
+                    read_observable(ode, &u, pk_params_flat, theta, eta, &shadow.covariates, cmt);
+            }
+        }
+
+        // Integrate the open interval `(t_start, t_end]` to the next break, if
+        // there is one. The final break time (== `t_last`) has no successor: its
+        // decision hook and left-boundary observation were applied above, but
+        // there is nothing left to integrate. Processing that last break — rather
+        // than stopping the loop one short of it — is what lets a decision
+        // scheduled at the maximum time still fire: its dose reaches the `ledger`
+        // and any coincident observation is recorded post-dose.
+        if k + 1 < break_times.len() {
+            let t_end = break_times[k + 1];
+
+            // Per-segment lag/F for the realized doses (boluses and infusions):
+            // lag 0 — a nonzero lag is rejected at the decision hook for either
+            // — and F per cmt. Infusions are delivered by `integrate_segment`'s
+            // `active_infusions` over any segment they fully span, which the
+            // dynamic infusion-end breaks guarantee.
+            let dose_lagtimes: Vec<f64> = shadow
+                .doses
+                .iter()
+                .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
+                .collect();
+            let dose_f_bio: Vec<f64> = shadow
+                .doses
+                .iter()
+                .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
+                .collect();
+
+            integrate_segment(
+                ode,
+                &mut u,
+                t_start,
+                t_end,
+                &shadow,
+                &dose_lagtimes,
+                &dose_f_bio,
+                &mut ext_params,
+                pk_params_flat,
+                theta,
+                eta,
+                &obs_map,
+                &mut predictions,
+            );
+        }
+
+        k += 1;
+    }
+
+    // Clamp negative predictions to zero, matching the static predictor.
+    for p in &mut predictions {
+        if *p < 0.0 {
+            *p = 0.0;
+        }
+    }
+
+    Ok(AdaptiveRun {
+        predictions,
+        ledger,
+        decisions,
+    })
 }
 
 /// ODE-based predictions with per-event PK parameters (time-varying-covariate
@@ -2104,6 +2634,1301 @@ mod tests {
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
+    }
+
+    /// Build the per-segment `obs_time -> indices` map the integrator uses.
+    fn obs_index_map(obs_times: &[f64]) -> HashMap<u64, Vec<usize>> {
+        let mut m: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, &t) in obs_times.iter().enumerate() {
+            m.entry(t.to_bits()).or_default().push(i);
+        }
+        m
+    }
+
+    #[test]
+    fn integrate_segment_zero_length_is_a_noop() {
+        // A degenerate `[t, t]` segment must skip integration and leave the carried
+        // state and predictions untouched — the guard a reactive driver relies on
+        // when a decision time coincides with another break (#391 S1.2).
+        // `ode_predictions` never reaches it (break_times are deduped at the same
+        // 1e-15), so it has to be exercised directly here.
+        let ode = one_cpt_ode_spec();
+        let subject = make_subject(vec![], vec![5.0]);
+        let pk = pk_one(1.0, 10.0);
+        let mut ext_params = [0.0f64; crate::types::MAX_PK_PARAMS + 2];
+        let mut u = vec![10.0];
+        let mut predictions = vec![f64::NAN; subject.obs_times.len()];
+        let obs_map = obs_index_map(&subject.obs_times);
+
+        integrate_segment(
+            &ode,
+            &mut u,
+            5.0,
+            5.0,
+            &subject,
+            &[],
+            &[],
+            &mut ext_params,
+            &pk.values,
+            &[],
+            &[],
+            &obs_map,
+            &mut predictions,
+        );
+
+        assert_eq!(u, vec![10.0], "zero-length segment must not change state");
+        assert!(
+            predictions[0].is_nan(),
+            "zero-length segment must record no observation"
+        );
+    }
+
+    #[test]
+    fn integrate_segment_advances_state_and_records_obs() {
+        // A normal segment integrates 1-cpt decay (ke = CL/V = 0.1) over [0, 10]
+        // and writes the observation at t_end, advancing `u` in place.
+        let ode = one_cpt_ode_spec();
+        let subject = make_subject(vec![], vec![10.0]);
+        let pk = pk_one(1.0, 10.0);
+        let mut ext_params = [0.0f64; crate::types::MAX_PK_PARAMS + 2];
+        ext_params[crate::types::PK_IDX_CL] = 1.0;
+        ext_params[crate::types::PK_IDX_V] = 10.0;
+        let mut u = vec![10.0];
+        let mut predictions = vec![f64::NAN; subject.obs_times.len()];
+        let obs_map = obs_index_map(&subject.obs_times);
+
+        integrate_segment(
+            &ode,
+            &mut u,
+            0.0,
+            10.0,
+            &subject,
+            &[],
+            &[],
+            &mut ext_params,
+            &pk.values,
+            &[],
+            &[],
+            &obs_map,
+            &mut predictions,
+        );
+
+        let expected = 10.0 * (-1.0f64).exp(); // 10·e^{-ke·10}, ke = 0.1
+        assert_relative_eq!(u[0], expected, max_relative = 1e-4);
+        assert_relative_eq!(predictions[0], expected, max_relative = 1e-4);
+    }
+
+    // ----- S1.3a reactive driver (#391) ---------------------------------
+
+    #[test]
+    fn adaptive_state_independent_controller_matches_static_ode() {
+        // Certainty anchor (degenerate oracle): a controller that ignores state
+        // and gives a fixed 100 mg bolus at every decision must reproduce
+        // `ode_predictions` on the same realized doses — pinning the reactive
+        // bookkeeping to the trusted static engine.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0); // ke = CL/V = 0.1
+        let decisions = [0.0, 24.0, 48.0];
+        let obs = vec![6.0, 30.0, 54.0];
+
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let base = make_subject(vec![], obs.clone());
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        let static_doses: Vec<DoseEvent> = decisions
+            .iter()
+            .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        let static_subject = make_subject(static_doses, obs);
+        let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+
+        assert_eq!(run.predictions.len(), static_preds.len());
+        for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+            assert_relative_eq!(*got, *want, max_relative = 1e-9);
+        }
+        assert_eq!(run.ledger.len(), 3);
+        for (i, &t) in decisions.iter().enumerate() {
+            assert_eq!(run.ledger[i].time, t);
+            assert_eq!(run.ledger[i].amt, 100.0);
+            assert_eq!(run.ledger[i].cmt, 1);
+            assert_eq!(run.ledger[i].decision_idx, i);
+            assert_eq!(run.ledger[i].dose_idx, i);
+        }
+    }
+
+    #[test]
+    fn adaptive_feedback_doses_only_below_threshold() {
+        // State-dependent: dose 100 only when the monitored amount is below 50.
+        // At t=0 amount is 0 (<50) -> dose; by t=2 it decayed to 100·e^{-0.2}
+        // ≈ 81.9 (>50) -> hold. Exactly one realized dose.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
+        let decisions = [0.0, 2.0];
+        let obs = vec![1.0, 3.0];
+
+        let mut controller = |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("monitor A is declared") < 50.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        };
+        let base = make_subject(vec![], obs.clone());
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &monitors,
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        assert_eq!(run.ledger.len(), 1, "dose at t=0, hold at t=2");
+        assert_eq!(run.ledger[0].time, 0.0);
+        assert_eq!(run.ledger[0].decision_idx, 0);
+        assert_eq!(run.ledger[0].observed_signals[0].name, "A");
+        assert_eq!(run.ledger[0].observed_signals[0].value, 0.0);
+
+        // Trajectory vs the exact 1-cpt closed form A(t) = 100·e^{-ke·t}, ke=0.1.
+        // (An analytical oracle, not `ode_predictions`: with a hold at t=2 the
+        // driver breaks there while the static engine wouldn't, so a static
+        // comparison would confound the integrator restart with the dosing logic.)
+        let ke = 0.1;
+        for (i, t) in [1.0_f64, 3.0].into_iter().enumerate() {
+            let exact = 100.0 * (-ke * t).exp();
+            assert_relative_eq!(run.predictions[i], exact, max_relative = 1e-5);
+        }
+    }
+
+    #[test]
+    fn adaptive_stop_discontinues_further_dosing() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Stop];
+        let base = make_subject(vec![], vec![12.0, 36.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0, 24.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert!(
+            run.ledger.is_empty(),
+            "Stop at decision 0 prevents all doses"
+        );
+        assert!(
+            run.predictions.iter().all(|&p| p == 0.0),
+            "no dose -> zero state"
+        );
+    }
+
+    #[test]
+    fn adaptive_zero_amount_bolus_is_treated_as_hold() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 0.0, cmt: 1 }];
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert!(run.ledger.is_empty(), "zero-amount bolus records no dose");
+        assert_eq!(run.predictions[0], 0.0);
+    }
+
+    #[test]
+    fn adaptive_infusion_state_independent_matches_static_ode() {
+        // Degenerate oracle (infusion edition): a controller that ignores state
+        // and issues the same fixed infusion at every decision must reproduce
+        // `ode_predictions` on the equivalent static infusion schedule, bit-exact.
+        // This pins the dynamic infusion-end timeline (every F-scaled end inserted
+        // as a break) to the trusted static segmentation. The last observation is
+        // the global maximum so neither engine breaks at an interior observation
+        // (which would restart the integrator on only one side and diverge).
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0); // ke = 0.1
+        let decisions = [0.0, 24.0, 48.0];
+        // Each infusion: 100 mg at rate 25 -> 4 h. Ends 4, 28, 52 (between
+        // decisions). Observations span during/post-infusion; the last (60) is
+        // past every infusion end so it is the global maximum.
+        let obs = vec![2.0, 6.0, 26.0, 30.0, 50.0, 60.0];
+
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![DoseAction::Infuse {
+                amt: 100.0,
+                cmt: 1,
+                rate: 25.0,
+            }]
+        };
+        let base = make_subject(vec![], obs.clone());
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        let static_doses: Vec<DoseEvent> = decisions
+            .iter()
+            .map(|&t| DoseEvent::new(t, 100.0, 1, 25.0, false, 0.0))
+            .collect();
+        let static_subject = make_subject(static_doses, obs);
+        let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+
+        assert_eq!(run.predictions.len(), static_preds.len());
+        for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+            assert_relative_eq!(*got, *want, max_relative = 1e-9);
+        }
+        assert_eq!(run.ledger.len(), 3);
+        for (i, &t) in decisions.iter().enumerate() {
+            assert_eq!(run.ledger[i].time, t);
+            assert_eq!(run.ledger[i].rate, 25.0);
+            assert_eq!(run.ledger[i].rule_fired, "infuse");
+        }
+    }
+
+    #[test]
+    fn adaptive_rejects_dv_monitor() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Dv)];
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &monitors,
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("DV") || err.contains("S1.5"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_rejects_nonempty_base_subject() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let base = make_subject(
+            vec![DoseEvent::new(0.0, 50.0, 1, 0.0, false, 0.0)],
+            vec![1.0],
+        );
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("dose-free"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_max_decisions_runaway_guard() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0, 24.0, 48.0],
+            &[],
+            &mut controller,
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("max_decisions"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_rejects_zero_compartment_via_validate() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 0 }];
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("compartment"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_final_decision_at_max_time_still_fires() {
+        // Regression: the last decision must fire even when it lands on the
+        // schedule's maximum time (i.e. at or after the last observation). Here
+        // the second decision (t=24) coincides with the last observation, so it
+        // is the maximum break time; it must still dose, reach the ledger, and
+        // make the t=24 observation read the *post*-dose state.
+        //
+        // Checked against the exact 1-cpt closed form (ke = CL/V = 0.1), not
+        // `ode_predictions`: the static engine likewise never applies a dose on
+        // its terminal break, so a static comparison would mask the bug.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0); // ke = 0.1
+        let decisions = [0.0, 24.0];
+        let obs = vec![6.0, 24.0]; // last obs coincides with the last decision
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let base = make_subject(vec![], obs);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        // Both decisions dosed — including the one at the maximum time.
+        assert_eq!(run.ledger.len(), 2, "final decision at t_max must dose");
+        assert_eq!(run.ledger[1].time, 24.0);
+        assert_eq!(run.ledger[1].decision_idx, 1);
+
+        let ke = 0.1_f64;
+        // t=6: only the t=0 dose has been given.
+        assert_relative_eq!(
+            run.predictions[0],
+            100.0 * (-ke * 6.0).exp(),
+            max_relative = 1e-5
+        );
+        // t=24: first dose decayed to 24 h, plus the fresh 100 mg bolus (post-dose).
+        let expected_24 = 100.0 * (-ke * 24.0).exp() + 100.0;
+        assert_relative_eq!(run.predictions[1], expected_24, max_relative = 1e-5);
+    }
+
+    #[test]
+    fn adaptive_rejects_out_of_range_bolus_compartment() {
+        // `validate()` only catches cmt == 0; an out-of-range cmt (> n_states) is
+        // caught by the driver's own guard. 1-state model, bolus into cmt 2.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 2 }];
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("state"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_rejects_out_of_range_monitor_compartment() {
+        // A monitor on a compartment beyond the model is a precondition error.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let monitors = [MonitorSpec::new("A", 2, ObserveMode::Ipred)]; // n_states = 1
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &monitors,
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("state"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_rejects_dosing_into_input_rate_compartment() {
+        // A bolus into a compartment fed by a built-in input-rate function would
+        // be double-counted (state jump *and* `R_in` forcing). Must be a typed
+        // error, not a silent wrong answer.
+        let mut ode = one_cpt_ode_spec();
+        ode.input_rate = vec![crate::pk::absorption::InputRateForcing {
+            cmt: 0, // 0-based -> consumes 1-based compartment 1
+            kind: crate::pk::absorption::InputRateKind::Transit,
+            arg_slots: vec![],
+        }];
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("input-rate"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_rejects_lagged_dose_compartment() {
+        // A lag time on the dosed compartment would be applied with zero delay
+        // here yet dropped from its own TAD anchor in `integrate_segment`. Reject.
+        let ode = one_cpt_ode_spec();
+        let mut pk = pk_one(1.0, 10.0);
+        pk.values[crate::types::PK_IDX_LAGTIME] = 2.0; // bare-slot lag on cmt 1
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("lag time"), "got: {err}");
+    }
+
+    // ----- S1.3b reactive infusions (#391) ------------------------------
+
+    #[test]
+    fn insert_break_keeps_sorted_and_dedups_within_tolerance() {
+        let mut breaks = vec![0.0, 10.0, 20.0];
+        insert_break(&mut breaks, 5.0); // strictly between -> inserted
+        assert_eq!(breaks, vec![0.0, 5.0, 10.0, 20.0]);
+        insert_break(&mut breaks, 10.0 + 1e-16); // within 1e-15 of existing -> dropped
+        assert_eq!(breaks, vec![0.0, 5.0, 10.0, 20.0]);
+        insert_break(&mut breaks, 25.0); // past the end -> appended
+        assert_eq!(breaks, vec![0.0, 5.0, 10.0, 20.0, 25.0]);
+        insert_break(&mut breaks, 0.0); // duplicate of the first -> dropped
+        assert_eq!(breaks, vec![0.0, 5.0, 10.0, 20.0, 25.0]);
+    }
+
+    #[test]
+    fn adaptive_infusion_matches_closed_form() {
+        // Absolute oracle: a single zero-order infusion into a 1-cpt linear model
+        // has the closed form A(t) = (R/ke)(1 - e^{-ke t}) while infusing and
+        // A(t_inf)·e^{-ke (t - t_inf)} afterward. Pins magnitude against
+        // mathematics, not just against the static engine.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0); // ke = 0.1
+        let ke = 0.1;
+        let (rate, amt) = (10.0_f64, 100.0_f64);
+        let t_inf = amt / rate; // 10 h (F = 1)
+        let obs = vec![5.0, 10.0, 20.0]; // during, at end, after
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Infuse { amt, cmt: 1, rate }];
+        let base = make_subject(vec![], obs.clone());
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        let a_inf = (rate / ke) * (1.0 - (-ke * t_inf).exp());
+        let expected = [
+            (rate / ke) * (1.0 - (-ke * 5.0_f64).exp()), // during
+            a_inf,                                       // at end
+            a_inf * (-ke * (20.0 - t_inf)).exp(),        // after
+        ];
+        // RK45-vs-analytical tolerance (the established 1e-4 in this file): the
+        // bit-exact 1e-9 oracle below pins the integrator to the static engine;
+        // this test pins *magnitude* against mathematics, where 0.01% is ample.
+        for (i, e) in expected.iter().enumerate() {
+            assert_relative_eq!(run.predictions[i], *e, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn adaptive_overlapping_infusions_match_static() {
+        // The hard case: an infusion whose end falls *after* the next decision, so
+        // two controller infusions overlap. `active_infusions` must sum both rates
+        // over the overlap window, and the timeline must carry both ends as breaks.
+        // Compared bit-exact to the equivalent two-infusion static schedule (dosing
+        // at every decision, so there is no phantom break).
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let decisions = [0.0, 5.0];
+        // 100 mg @ rate 10 -> 10 h each: windows [0,10] and [5,15] overlap on [5,10].
+        let obs = vec![2.0, 7.0, 12.0, 20.0]; // last (20) past both ends
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![DoseAction::Infuse {
+                amt: 100.0,
+                cmt: 1,
+                rate: 10.0,
+            }]
+        };
+        let base = make_subject(vec![], obs.clone());
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        let static_doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0),
+            DoseEvent::new(5.0, 100.0, 1, 10.0, false, 0.0),
+        ];
+        let static_subject = make_subject(static_doses, obs);
+        let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+        for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+            assert_relative_eq!(*got, *want, max_relative = 1e-9);
+        }
+        assert_eq!(run.ledger.len(), 2);
+    }
+
+    #[test]
+    fn adaptive_infusion_end_coincident_with_decision_dedups() {
+        // An infusion that ends *exactly* at the next decision must not create a
+        // second break: the end coincides with the decision break (which the static
+        // engine also has, as the infusion end), so the timelines match bit-exact.
+        // A hold at that decision is therefore safe to compare to the
+        // single-infusion static schedule (no phantom break).
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let decisions = [0.0, 4.0]; // 100@25 -> 4 h, ends exactly at decision 1
+        let obs = vec![2.0, 4.0, 8.0];
+        let mut controller = |ctx: &ControllerCtx| {
+            if ctx.decision_index == 0 {
+                vec![DoseAction::Infuse {
+                    amt: 100.0,
+                    cmt: 1,
+                    rate: 25.0,
+                }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        };
+        let base = make_subject(vec![], obs.clone());
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.ledger.len(), 1, "only the first decision infuses");
+
+        let static_subject =
+            make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)], obs);
+        let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+        for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+            assert_relative_eq!(*got, *want, max_relative = 1e-9);
+        }
+    }
+
+    #[test]
+    fn adaptive_infusion_f_scaling_matches_static() {
+        // The S1.3b invariant *under F != 1*: the F-scaled infusion end inserted as
+        // a break (`t_start + dur_eff`, from `bioavailable_infusion`) must coincide
+        // with the F-scaled window `active_infusions` re-derives inside
+        // `integrate_segment`. At F = 1 the two are trivially equal (`dur_eff ==
+        // amt/rate`), so every other oracle test leaves this seam unexercised. Here
+        // a bare-slot F = 0.5 halves a rate-defined infusion's window to F·amt/rate;
+        // the degenerate oracle must still reproduce the equivalent static infusion
+        // schedule (carrying the same F) bit-exact.
+        let ode = one_cpt_ode_spec();
+        let mut pk = pk_one(1.0, 10.0); // ke = 0.1
+        pk.values[crate::types::PK_IDX_F] = 0.5; // bare-slot F on all compartments
+        let decisions = [0.0, 24.0, 48.0];
+        // 100 mg @ rate 25 -> nominal 4 h window, F-scaled to 0.5*4 = 2 h. Ends at
+        // 2, 26, 50 (between decisions). The last obs (60) is past every end, so it
+        // is the global maximum and neither engine breaks at an interior obs.
+        let obs = vec![1.0, 3.0, 25.0, 27.0, 49.0, 60.0];
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![DoseAction::Infuse {
+                amt: 100.0,
+                cmt: 1,
+                rate: 25.0,
+            }]
+        };
+        let base = make_subject(vec![], obs.clone());
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        let static_doses: Vec<DoseEvent> = decisions
+            .iter()
+            .map(|&t| DoseEvent::new(t, 100.0, 1, 25.0, false, 0.0))
+            .collect();
+        let static_subject = make_subject(static_doses, obs);
+        let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+
+        assert_eq!(run.predictions.len(), static_preds.len());
+        for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+            assert_relative_eq!(*got, *want, max_relative = 1e-9);
+        }
+        // F is actually applied (window halved), recorded as f_applied on each row.
+        assert_eq!(run.ledger.len(), 3);
+        for entry in &run.ledger {
+            assert_eq!(entry.f_applied, 0.5);
+        }
+    }
+
+    #[test]
+    fn adaptive_reactive_infusion_titrates_against_closed_form() {
+        // Genuine state-reactive infusion: infuse 100 mg @ 25 (4 h) only when the
+        // monitored amount is below 50, else hold. Checked against the exact 1-cpt
+        // infusion closed form — NOT the static engine: the hold at the second
+        // decision makes the driver break where a dose-list replay would not, so a
+        // static comparison would confound the integrator restart with the logic
+        // (same reason as the bolus feedback test).
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0); // ke = 0.1
+        let ke = 0.1;
+        let (rate, amt) = (25.0_f64, 100.0_f64);
+        let t_inf = amt / rate; // 4 h
+        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
+        let decisions = [0.0, 6.0];
+        let obs = vec![2.0, 5.0, 8.0];
+        let mut controller = |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("A declared") < 50.0 {
+                vec![DoseAction::Infuse { amt, cmt: 1, rate }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        };
+        let base = make_subject(vec![], obs.clone());
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &monitors,
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        // t=0: A=0 (<50) -> infuse [0,4]. By t=6 the amount has decayed back above
+        // 50 (A(6) = a_inf·e^{-0.2} ≈ 67.5) -> hold. Exactly one realized dose.
+        assert_eq!(run.ledger.len(), 1, "infuse once, then hold");
+        assert_eq!(run.ledger[0].rule_fired, "infuse");
+
+        let a_inf = (rate / ke) * (1.0 - (-ke * t_inf).exp()); // amount at end of infusion
+        let expected = [
+            (rate / ke) * (1.0 - (-ke * 2.0_f64).exp()), // t=2 during infusion
+            a_inf * (-ke * (5.0 - t_inf)).exp(),         // t=5 post infusion
+            a_inf * (-ke * (8.0 - t_inf)).exp(),         // t=8 post infusion
+        ];
+        for (i, e) in expected.iter().enumerate() {
+            assert_relative_eq!(run.predictions[i], *e, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn adaptive_stop_lets_in_flight_infusion_complete() {
+        // Contract: `Stop` discontinues *future* decisions, but an infusion already
+        // issued is a committed dose and keeps delivering to its end. Infuse at t=0
+        // over [0,20]; Stop at t=5. The infusion must still be active at t=10 (well
+        // past the Stop) and finish at t=20 — verified against the closed form. A
+        // true safety-halt that truncates delivery is a separate action (tracked as
+        // a follow-up), deliberately not conflated with `Stop`.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0); // ke = 0.1
+        let ke = 0.1;
+        let (rate, amt) = (5.0_f64, 100.0_f64);
+        let t_inf = amt / rate; // 20 h
+        let decisions = [0.0, 5.0];
+        let obs = vec![10.0, 25.0];
+        let mut controller = |ctx: &ControllerCtx| {
+            if ctx.decision_index == 0 {
+                vec![DoseAction::Infuse { amt, cmt: 1, rate }]
+            } else {
+                vec![DoseAction::Stop]
+            }
+        };
+        let base = make_subject(vec![], obs.clone());
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        assert_eq!(run.ledger.len(), 1, "Stop adds no dose; the infusion stays");
+        let a_inf = (rate / ke) * (1.0 - (-ke * t_inf).exp());
+        let expected = [
+            (rate / ke) * (1.0 - (-ke * 10.0_f64).exp()), // t=10: still infusing despite Stop@5
+            a_inf * (-ke * (25.0 - t_inf)).exp(),         // t=25: after the infusion finished @20
+        ];
+        for (i, e) in expected.iter().enumerate() {
+            assert_relative_eq!(run.predictions[i], *e, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn adaptive_zero_amount_infusion_is_treated_as_hold() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![DoseAction::Infuse {
+                amt: 0.0,
+                cmt: 1,
+                rate: 10.0,
+            }]
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert!(
+            run.ledger.is_empty(),
+            "zero-amount infusion records no dose"
+        );
+        assert_eq!(run.predictions[0], 0.0);
+    }
+
+    #[test]
+    fn adaptive_rejects_nonpositive_infusion_rate() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![DoseAction::Infuse {
+                amt: 100.0,
+                cmt: 1,
+                rate: 0.0,
+            }]
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("rate"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_rejects_out_of_range_infusion_compartment() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![DoseAction::Infuse {
+                amt: 100.0,
+                cmt: 2,
+                rate: 10.0,
+            }]
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("state"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_rejects_infusion_into_input_rate_compartment() {
+        let mut ode = one_cpt_ode_spec();
+        ode.input_rate = vec![crate::pk::absorption::InputRateForcing {
+            cmt: 0, // 0-based -> consumes 1-based compartment 1
+            kind: crate::pk::absorption::InputRateKind::Transit,
+            arg_slots: vec![],
+        }];
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![DoseAction::Infuse {
+                amt: 100.0,
+                cmt: 1,
+                rate: 10.0,
+            }]
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("input-rate"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_rejects_lagged_infusion_compartment() {
+        let ode = one_cpt_ode_spec();
+        let mut pk = pk_one(1.0, 10.0);
+        pk.values[crate::types::PK_IDX_LAGTIME] = 2.0; // bare-slot lag on cmt 1
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![DoseAction::Infuse {
+                amt: 100.0,
+                cmt: 1,
+                rate: 10.0,
+            }]
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("lag time"), "got: {err}");
+    }
+
+    // ----- S1.4a decision log (#391) ------------------------------------
+
+    #[test]
+    fn adaptive_decision_log_records_dose_hold_and_stop() {
+        // Every decision is logged — including the hold, which leaves no ledger
+        // row — with the signal the controller observed and the outcome it chose.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
+        let decisions = [0.0, 24.0, 48.0];
+        let mut controller = |ctx: &ControllerCtx| match ctx.decision_index {
+            0 => vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+            1 => vec![DoseAction::Hold],
+            _ => vec![DoseAction::Stop],
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &monitors,
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        assert_eq!(run.decisions.len(), 3, "one log entry per decision");
+        for (i, d) in run.decisions.iter().enumerate() {
+            assert_eq!(d.decision_idx, i);
+            assert_eq!(d.time, decisions[i]);
+            assert_eq!(d.observed_signals.len(), 1);
+            assert_eq!(d.observed_signals[0].name, "A");
+        }
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Dosed { n: 1 });
+        assert_eq!(run.decisions[1].outcome, DecisionOutcome::Hold);
+        assert_eq!(run.decisions[2].outcome, DecisionOutcome::Stop { dosed: 0 });
+        // The pre-dose signal at the first decision is the empty initial state.
+        assert_eq!(run.decisions[0].observed_signals[0].value, 0.0);
+    }
+
+    #[test]
+    fn adaptive_decision_log_omits_decisions_after_stop() {
+        // Once the controller stops, the driver issues no further decisions, so
+        // the Stop entry is the last record (no phantom post-stop log rows).
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |ctx: &ControllerCtx| {
+            if ctx.decision_index == 0 {
+                vec![DoseAction::Stop]
+            } else {
+                // The driver must never call the controller again after a Stop;
+                // reaching here would be the bug this test guards against.
+                unreachable!(
+                    "driver issued a decision after Stop (idx {})",
+                    ctx.decision_index
+                )
+            }
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0, 10.0, 20.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1, "only the stop decision is logged");
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Stop { dosed: 0 });
+        assert!(run.ledger.is_empty());
+    }
+
+    #[test]
+    fn adaptive_decision_log_dose_then_stop_in_one_action_list() {
+        // `[Bolus, Stop]` — a final dose, then discontinue — is logged as
+        // `Stop { dosed: 1 }`, not a bare stop, and the dose reaches the ledger.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller =
+            |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }, DoseAction::Stop];
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0, 24.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1, "stop ends the schedule after one");
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Stop { dosed: 1 });
+        assert_eq!(run.ledger.len(), 1);
+    }
+
+    #[test]
+    fn adaptive_decision_log_counts_multiple_doses_in_one_decision() {
+        // A decision can issue more than one dose (e.g. a loading split); the log
+        // records `Dosed { n }` with the realized count, and a zero-amount action
+        // in the same list is excluded (it leaves no ledger row).
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![
+                DoseAction::Bolus { amt: 50.0, cmt: 1 },
+                DoseAction::Bolus { amt: 0.0, cmt: 1 }, // normalized to Hold, not counted
+                DoseAction::Bolus { amt: 50.0, cmt: 1 },
+            ]
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1);
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Dosed { n: 2 });
+        assert_eq!(
+            run.ledger.len(),
+            2,
+            "two realized doses, the zero-amt excluded"
+        );
+    }
+
+    #[test]
+    fn adaptive_decision_log_records_infusion_as_dosed() {
+        // An infusion is a realized dose: its decision categorizes to `Dosed { n }`
+        // exactly as a bolus does (the outcome doesn't distinguish route), and it
+        // reaches the ledger.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![DoseAction::Infuse {
+                amt: 100.0,
+                cmt: 1,
+                rate: 50.0,
+            }]
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1);
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Dosed { n: 1 });
+        assert_eq!(run.ledger.len(), 1);
+    }
+
+    #[test]
+    fn adaptive_decision_log_infusion_then_stop() {
+        // `[Infuse, Stop]` mirrors the bolus dose-then-stop: a final infusion, then
+        // discontinue, logged as `Stop { dosed: 1 }` with the infusion in the ledger.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![
+                DoseAction::Infuse {
+                    amt: 100.0,
+                    cmt: 1,
+                    rate: 50.0,
+                },
+                DoseAction::Stop,
+            ]
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0, 24.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1, "stop ends the schedule after one");
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Stop { dosed: 1 });
+        assert_eq!(run.ledger.len(), 1);
+    }
+
+    #[test]
+    fn adaptive_decision_log_empty_action_list_is_hold() {
+        // An empty action list is a no-change decision: it categorizes to `Hold`
+        // (no dose, not stopped) and leaves no ledger row — same as `[Hold]`.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| Vec::<DoseAction>::new();
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1);
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Hold);
+        assert!(run.ledger.is_empty());
+    }
+
+    #[test]
+    fn adaptive_driver_rejects_malformed_or_post_stop_actions() {
+        // The whole action list is validated up front, before anything is applied:
+        // a malformed action is a typed error wherever it sits, and `Stop` must be
+        // the final action — a controller that issues actions after discontinuing is
+        // rejected, not silently truncated, so the log can't disagree with the
+        // ledger. Nothing is applied when the list is rejected (the ledger would be
+        // discarded with the `Err` regardless).
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let base = make_subject(vec![], vec![1.0]);
+
+        let cases: [(Vec<DoseAction>, &str); 3] = [
+            // Malformed action (compartment 0) -> the up-front validate() error.
+            (
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 0 }],
+                "compartment is 0",
+            ),
+            // A well-formed action after a Stop -> Stop-must-be-final error.
+            (
+                vec![DoseAction::Stop, DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+                "Stop must be the final action",
+            ),
+            // A Stop in the middle of the list -> same rejection (not a silent drop
+            // of the trailing dose).
+            (
+                vec![
+                    DoseAction::Bolus { amt: 50.0, cmt: 1 },
+                    DoseAction::Stop,
+                    DoseAction::Bolus { amt: 50.0, cmt: 1 },
+                ],
+                "Stop must be the final action",
+            ),
+        ];
+
+        for (actions, needle) in cases {
+            let mut controller = |_ctx: &ControllerCtx| actions.clone();
+            let err = ode_predictions_adaptive(
+                &ode,
+                &pk.values,
+                &[],
+                &[],
+                &base,
+                &[0.0],
+                &[],
+                &mut controller,
+                100,
+            )
+            .expect_err("malformed / post-stop action list is rejected");
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        }
+    }
+
+    #[test]
+    fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
+        // Covers the `last_dose_eff.is_finite()` branch: when a dose precedes the
+        // segment the TAD anchor slot must hold that dose time (not NaN).
+        let ode = one_cpt_ode_spec();
+        let dose = crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        let subject = make_subject(vec![dose], vec![10.0]);
+        let pk = pk_one(1.0, 10.0);
+        let mut ext_params = [0.0f64; crate::types::MAX_PK_PARAMS + 2];
+        ext_params[crate::types::PK_IDX_CL] = 1.0;
+        ext_params[crate::types::PK_IDX_V] = 10.0;
+        let mut u = vec![100.0]; // pre-loaded with the bolus amount
+        let mut predictions = vec![f64::NAN; subject.obs_times.len()];
+        let obs_map = obs_index_map(&subject.obs_times);
+
+        integrate_segment(
+            &ode,
+            &mut u,
+            0.0,
+            10.0,
+            &subject,
+            &[0.0],
+            &[1.0],
+            &mut ext_params,
+            &pk.values,
+            &[],
+            &[],
+            &obs_map,
+            &mut predictions,
+        );
+
+        // TAD anchor must be the dose time (0.0), not NaN.
+        assert_eq!(
+            ext_params[crate::types::MAX_PK_PARAMS + 1],
+            0.0,
+            "TAD anchor must equal the prior dose time"
+        );
+        let expected = 100.0 * (-1.0f64).exp();
+        assert_relative_eq!(predictions[0], expected, max_relative = 1e-4);
     }
 
     /// Two-compartment "accumulator": `d/dt = 0` for both states, so each state

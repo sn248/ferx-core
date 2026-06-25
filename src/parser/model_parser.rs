@@ -1767,6 +1767,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
         residual_error_eta,
+        // Populated below from the optional [initial_conditions] block (#521).
+        analytical_init: Vec::new(),
     };
 
     // ── Optional blocks ──
@@ -1935,6 +1937,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
 
         model.scaling = scaling;
+    }
+
+    // ── [initial_conditions] block (issue #521) ──
+    // Non-zero starting compartment amounts for analytical PK models. The ODE
+    // path seeds state via `init(...)` in [odes]; here we record closed-form
+    // init impulses layered onto the dose-driven prediction by
+    // `pk::add_analytical_init`.
+    if let Some(ic_lines) = blocks.get("initial_conditions") {
+        model.analytical_init = parse_initial_conditions_block(
+            ic_lines,
+            model.pk_model,
+            model.ode_spec.is_some(),
+            &model.theta_names,
+            &model.eta_names,
+            &model.indiv_param_names,
+            &model.pk_indices,
+            &model.kappa_names,
+        )?;
     }
 
     // ODE validation: the `NEEDS_FORM_C = usize::MAX` sentinel from
@@ -2120,8 +2140,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Theta/eta indices used in event_model expressions are collected here so
     // that check_unused_parameters (below) can suppress false "not referenced"
     // warnings for parameters that only appear in [event_model].
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut event_model_used_thetas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut event_model_used_etas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
     #[cfg(feature = "survival")]
@@ -2179,6 +2201,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &used_sigmas_in_error,
         &event_model_used_thetas,
         &event_model_used_etas,
+        model.residual_error_eta,
     ));
 
     // Warn about analytical PK parameters that are mapped but unused by the
@@ -3110,13 +3133,13 @@ fn collect_variable_names(expr: &Expression, out: &mut std::collections::HashSet
 /// empty map without allocating, so such hazards pay nothing for the feature.
 ///
 /// Evaluation uses the tree-walking `eval_statements`, NOT the bytecode
-/// `eval_statements_indexed`: only the latter borrows the `FERX_SCRATCH`
-/// thread-local, so this is safe to call from inside the likelihood's hazard
-/// `param_fn`, and it transparently handles NONMEM-style `if (...) CL = ...`
-/// conditional parameters. Kappa (IOV) and `[covariate_nn]`-output references in
-/// these statements are rejected up front (see `needed_indiv_stmts`), so the
-/// BSV-only `eta` slice never indexes out of bounds and the empty `nn_outputs`
-/// here is never read.
+/// bytecode indexed evaluators: those borrow the `FERX_SCRATCH` thread-local,
+/// so this is safe to call from inside the likelihood's hazard `param_fn`, and
+/// it transparently handles NONMEM-style `if (...) CL = ...` conditional
+/// parameters. Kappa (IOV) and `[covariate_nn]`-output references in these
+/// statements are rejected up front (see `needed_indiv_stmts`), so the BSV-only
+/// `eta` slice never indexes out of bounds and the empty `nn_outputs` here is
+/// never read.
 #[cfg(feature = "survival")]
 fn eval_indiv_param_vars(
     stmts: &[Statement],
@@ -3520,27 +3543,46 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
     for line in lines {
         let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
         if parts.len() != 2 {
-            continue;
+            // No `=` on a non-blank, non-comment line (comments/blanks are already
+            // stripped by `extract_blocks`). Treat it as a hard error rather than
+            // silently skipping — e.g. `n_subjects 5` must not fall back to the
+            // default, which is the whole point of this block's strict parsing.
+            return Err(format!(
+                "[simulation]: malformed line (expected `key = value`): {}",
+                line.trim()
+            ));
         }
         match parts[0] {
-            "subjects" => {
+            // `n_subjects` / `dose_amt` / `dose_cmt` are the canonical spellings
+            // (they match the `SimulationSpec` fields and every `examples/*.ferx`);
+            // the short `subjects` / `dose` / `cmt` forms are kept as back-compat
+            // aliases. An unknown key is a hard error (mirrors [fit_options]) so a
+            // typo like `n_subject` no longer silently falls back to the default.
+            "subjects" | "n_subjects" => {
                 n_subjects = parts[1]
                     .parse()
-                    .map_err(|_| format!("Bad subjects: {}", line))?
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
             }
-            "dose" => {
+            "dose" | "dose_amt" => {
                 dose_amt = parts[1]
                     .parse()
-                    .map_err(|_| format!("Bad dose: {}", line))?
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
             }
-            "cmt" => dose_cmt = parts[1].parse().map_err(|_| format!("Bad cmt: {}", line))?,
+            "cmt" | "dose_cmt" => {
+                dose_cmt = parts[1]
+                    .parse()
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
+            }
             "seed" => {
                 seed = parts[1]
                     .parse()
-                    .map_err(|_| format!("Bad seed: {}", line))?
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
             }
-            "times" => obs_times = parse_float_array(parts[1])?,
-            _ => {}
+            "times" => {
+                obs_times = parse_float_array(parts[1])
+                    .map_err(|e| format!("[simulation]: bad times: {e}"))?
+            }
+            other => return Err(format!("[simulation]: unknown key `{}`", other)),
         }
     }
     if obs_times.is_empty() {
@@ -3765,20 +3807,26 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
+                // `auto` (the default) picks nlopt_lbfgs when the analytic
+                // FOCE/FOCEI gradient is available, bobyqa otherwise (#490).
+                "auto" => Optimizer::Auto,
                 "slsqp" => Optimizer::Slsqp,
-                // `lbfgs` is the built-in limited-memory L-BFGS (analytic gradient,
-                // Eq. 48 warm EBEs, no SLSQP polish). The NLopt L-BFGS + SLSQP-polish
-                // path is still reachable explicitly via `nlopt_lbfgs`.
-                "lbfgs" => Optimizer::Lbfgs,
-                "nlopt_lbfgs" => Optimizer::NloptLbfgs,
+                // `lbfgs` and `bfgs` are deprecated aliases for `nlopt_lbfgs`: they now
+                // select the NLopt L-BFGS (+ SLSQP polish) path. The hand-rolled
+                // built-in BFGS/L-BFGS is strictly worse — 3–5× slower on
+                // analytic-gradient models and prone to diverging or hanging on harder
+                // problems (see #483) — so the keyword no longer reaches it. The
+                // `Optimizer::Bfgs`/`Lbfgs` variants remain for a Rust caller that
+                // constructs them directly, pending removal.
+                "lbfgs" | "bfgs" | "nlopt_lbfgs" => Optimizer::NloptLbfgs,
                 "mma" => Optimizer::Mma,
-                "bfgs" => Optimizer::Bfgs,
                 "bobyqa" => Optimizer::Bobyqa,
                 "trust_region" | "newton_tr" => Optimizer::TrustRegion,
                 other => {
                     return Err(format!(
                         "fit option `optimizer`: unknown value `{other}` — expected \
-                         slsqp/lbfgs/nlopt_lbfgs/mma/bfgs/bobyqa/trust_region"
+                         auto/bobyqa/slsqp/nlopt_lbfgs/mma/trust_region (`lbfgs` and \
+                         `bfgs` are accepted as deprecated aliases for `nlopt_lbfgs`)"
                     ));
                 }
             };
@@ -4025,6 +4073,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 parse_usize("min_obs_for_convergence_check")? as u32
         }
         "stagnation_guard" => opts.stagnation_guard = parse_bool("stagnation_guard")?,
+        "ebe_warm_start" => opts.ebe_warm_start = parse_bool("ebe_warm_start")?,
         "inits_from_nca" => {
             use crate::suggest_start::NcaInit;
             opts.inits_from_nca = match value.to_lowercase().as_str() {
@@ -4257,6 +4306,168 @@ fn build_obs_scale_spec(
         },
     );
     Ok(ScalingSpec::ExpressionScale { scale_fn, deriv })
+}
+
+/// Resolve a `[initial_conditions] init(NAME)` compartment name to a 1-based
+/// compartment index for an **analytical** `pk_model`, validating that an
+/// initial amount in that compartment is supported (issue #521).
+///
+/// Accepted names: `central` (every model), `depot` (oral models, cmt 1), or a
+/// 1-based integer index. Peripheral compartments are rejected — seeding a
+/// peripheral needs the cross-compartment Green's function, which the closed
+/// forms don't expose; use an ODE model for that.
+fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
+    let is_oral = pk_model.is_oral();
+    let central = if is_oral { 2 } else { 1 };
+    let lname = name.trim().to_lowercase();
+
+    let cmt = if let Ok(n) = lname.parse::<usize>() {
+        n
+    } else {
+        match lname.as_str() {
+            "central" => central,
+            "depot" if is_oral => 1,
+            "depot" => {
+                return Err(format!(
+                    "[initial_conditions]: `depot` is only valid for oral models; \
+                     `{}` has no depot compartment.",
+                    pk_model.canonical_name()
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "[initial_conditions]: unknown compartment `{}`. Use `central`{}, \
+                     or a 1-based CMT index.",
+                    name,
+                    if is_oral { " or `depot`" } else { "" }
+                ));
+            }
+        }
+    };
+
+    if cmt == central || (is_oral && cmt == 1) {
+        Ok(cmt)
+    } else {
+        Err(format!(
+            "[initial_conditions]: initial amounts are only supported in the central \
+             compartment{} (got compartment {}). A peripheral-compartment initial amount \
+             needs the cross-compartment impulse response, which the analytical closed \
+             forms don't expose — use an ODE model with `init(...)` in [odes] (issue #521).",
+            if is_oral { " or the oral depot" } else { "" },
+            cmt
+        ))
+    }
+}
+
+/// Compile one `init(NAME) = <expr>` right-hand side into a [`ScaleFn`] that
+/// evaluates the initial amount `A₀` from `(theta, eta, covariates, pk_params)`.
+/// Mirrors the Form-B `obs_scale` expression closure in [`build_obs_scale_spec`]:
+/// individual-parameter names resolve from the subject-static `pk_params`, so
+/// `init(central) = CONC0 * V` reads `V` from its PK slot.
+fn build_init_amount_fn(
+    value: &str,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    pk_indices: &[usize],
+    kappa_names: &[String],
+) -> Result<ScaleFn, String> {
+    // Constant fast path (e.g. `init(central) = 0.0`).
+    if let Ok(k) = value.parse::<f64>() {
+        return Ok(Box::new(
+            move |_: &[f64], _: &[f64], _: &HashMap<String, f64>, _: &PkParams| k,
+        ));
+    }
+    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
+    let expr = parse_scalar_expression(value, ctx)
+        .map_err(|e| format!("[initial_conditions] init: {}", e))?;
+
+    // Reject KAPPA_* (IOV) references, mirroring the Form C ODE readout guard
+    // (`build_y_output_fn`, issue #107). The init expression's eta scope is
+    // BSV-only, so a kappa name parses as an unresolved identifier and would
+    // silently evaluate to 0 — giving a wrong baseline with no error. The
+    // baseline amount is a t=0 quantity built from BSV parameters; reference the
+    // occasion-dependent structural parameter (e.g. CL) if a κ-driven starting
+    // amount is needed (issue #521 review).
+    if let Some(name) = expr_references_kappa(&expr, kappa_names) {
+        return Err(format!(
+            "[initial_conditions] init: expression cannot reference the IOV \
+             parameter `{name}` — the baseline amount is evaluated once with the \
+             BSV eta and would see kappa = 0. Reference the occasion-dependent \
+             structural parameter (e.g. CL) instead."
+        ));
+    }
+    let indiv_to_pk_slot: HashMap<String, usize> = indiv_var_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.clone(), pk_indices.get(i).copied().unwrap_or(i)))
+        .collect();
+    Ok(Box::new(
+        move |theta: &[f64],
+              eta: &[f64],
+              covariates: &HashMap<String, f64>,
+              pk: &PkParams|
+              -> f64 {
+            let mut vars: HashMap<String, f64> = HashMap::with_capacity(indiv_to_pk_slot.len());
+            for (name, &slot) in &indiv_to_pk_slot {
+                if slot < pk.values.len() {
+                    vars.insert(name.clone(), pk.values[slot]);
+                }
+            }
+            let empty_nn: Vec<Vec<f64>> = Vec::new();
+            eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
+        },
+    ))
+}
+
+/// Parse the `[initial_conditions]` block (issue #521) into the analytical
+/// model's [`AnalyticalInit`] list. Each `init(NAME) = <expr>` declares a
+/// non-zero starting amount in compartment `NAME`. Analytical models only —
+/// ODE models seed state via `init(...)` inside `[odes]`.
+fn parse_initial_conditions_block(
+    lines: &[String],
+    pk_model: PkModel,
+    is_ode: bool,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    pk_indices: &[usize],
+    kappa_names: &[String],
+) -> Result<Vec<crate::types::AnalyticalInit>, String> {
+    if is_ode {
+        return Err(
+            "[initial_conditions]: this block is for analytical PK models; for an \
+                    ODE model declare `init(state) = <expr>` inside the [odes] block instead."
+                .into(),
+        );
+    }
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in lines {
+        let (name, expr) = parse_init_line(line).ok_or_else(|| {
+            format!(
+                "[initial_conditions]: expected `init(NAME) = <expr>`, got: `{}`",
+                line.trim()
+            )
+        })?;
+        let cmt = analytical_init_cmt(pk_model, &name)?;
+        if !seen.insert(cmt) {
+            return Err(format!(
+                "[initial_conditions]: duplicate init for compartment `{}`",
+                name
+            ));
+        }
+        let amount_fn = build_init_amount_fn(
+            &expr,
+            theta_names,
+            eta_names,
+            indiv_var_names,
+            pk_indices,
+            kappa_names,
+        )?;
+        out.push(crate::types::AnalyticalInit { cmt, amount_fn });
+    }
+    Ok(out)
 }
 
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
@@ -4650,13 +4861,17 @@ fn parse_scaling_block(
 /// excluded — they can ride on an analytical `pk` model.
 ///
 /// This lists only the functions that are **actually implemented** as input
-/// rates today (`transit`, #343; `igd`, #347). Each later absorption function
-/// adds its own name here in the same PR that implements it — Phase 2 `weibull` —
+/// rates today (`transit`, #343; `igd`, #347; `weibull`, Phase 2). Each later
+/// absorption function adds its own name here in the same PR that implements it,
 /// so the error rule never advertises a function the engine can't yet run (which
 /// would send the user to `ode_template` for a dead end, Ron #363). A slice (not
 /// a fixed-size array) so a new entry needs no length-annotation bump, matching
 /// [`INPUT_RATE_FNS`].
-const ODE_ONLY_ABSORPTION_FNS: &[&str] = &["transit", "igd"];
+///
+/// `weibull` stays on this list **permanently** — unlike `transit`/`igd`, it has
+/// no elementary closed form with linear disposition, so it can never route to an
+/// analytical `pk` and always requires an explicit ODE disposition.
+const ODE_ONLY_ABSORPTION_FNS: &[&str] = &["transit", "igd", "weibull"];
 
 /// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
 /// the first such function name found. Drives the error rule that rejects an
@@ -5302,7 +5517,7 @@ fn split_args_on_commas(s: &str) -> Vec<&str> {
 /// arguments it requires. Arguments are resolved to individual-parameter slots
 /// and stored in `arg_slots` in this order, so `src/pk/absorption.rs` reads them
 /// positionally. Each new model adds one row here in the PR that implements it
-/// (`transit`, #343; `igd`, #347).
+/// (`transit`, #343; `igd`, #347; `weibull`, Phase 2).
 const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] = &[
     (
         "transit",
@@ -5313,6 +5528,11 @@ const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] =
         "igd",
         crate::pk::absorption::InputRateKind::InverseGaussian,
         &["mat", "cv2"],
+    ),
+    (
+        "weibull",
+        crate::pk::absorption::InputRateKind::Weibull,
+        &["td", "beta"],
     ),
 ];
 
@@ -5683,7 +5903,7 @@ fn build_ode_spec(
     // FOCEI fit on the Emax PK/PD model in the experiment, billions of
     // hash-map ops across the whole run.
     //
-    // Switch to the indexed AST evaluator (`eval_statements_indexed`) that
+    // Switch to the indexed AST evaluator (`eval_statements_indexed_with_stack`) that
     // the existing `pk_param_fn` already uses. Layout:
     //   vars[0..n_states]                                  → state values (read from u)
     //   vars[n_states..n_states+n_indiv]                   → indiv params  (read from params via indiv_slots)
@@ -7279,9 +7499,23 @@ fn build_pk_param_fn(
     // `stmts_owned` / the mappings. `pk_var_slots` is `(pk_slot, var_slot)` per
     // individual parameter; ODE models use `ode_assignment_mapping`, analytical
     // models `pk_assignment_mapping` (both are `(pk_slot, var_slot)`).
+    // Classify cov-static var slots once (#485): the analytic η/θ sensitivity
+    // walks fold these to `f64` constants instead of re-deriving the covariate
+    // kernel under dual arithmetic on every inner/outer evaluation. Drop the mask
+    // when nothing is foldable so the eval paths stay on the original branch.
+    let cov_static_mask = {
+        let m = compute_cov_static_mask(&stmts_owned, n_vars);
+        if m.iter().any(|&b| b) {
+            m
+        } else {
+            Vec::new()
+        }
+    };
+
     let indiv_param_program = IndivParamProgram {
         stmts: stmts_owned.clone(),
         n_vars,
+        cov_static_mask,
         pk_var_slots: if is_analytical_pk {
             pk_assignment_mapping.clone()
         } else {
@@ -7301,17 +7535,6 @@ fn build_pk_param_fn(
 
     let pk_param_fn: PkParamFn = Box::new(
         move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-            // Materialise covariates into a Vec<f64> aligned with
-            // `referenced_covariates`. For the typical 3-5 covariates
-            // this is ~3-5 HashMap probes + one short alloc; cheaper
-            // than the 10-20 probes the previous unresolved AST was
-            // paying for both variables AND covariates.
-            let mut cov_vec = vec![0.0_f64; n_cov];
-            for (i, name) in cov_names_for_lookup.iter().enumerate() {
-                cov_vec[i] = covariates.get(name).copied().unwrap_or(0.0);
-            }
-            let mut vars = vec![0.0_f64; n_vars];
-
             // Pre-compute each NN's forward output once per call. The
             // indexed evaluator reads `nn_outputs[nn_idx][output_idx]` for
             // every `Expression::NnOutput` it visits, so multiple `.CL`,
@@ -7333,41 +7556,65 @@ fn build_pk_param_fn(
             #[cfg(not(feature = "nn"))]
             let nn_outputs: Vec<Vec<f64>> = Vec::new();
 
-            // pk_param_fn doesn't compute derivatives — no `du` to pass.
-            eval_statements_indexed(
-                &stmts_owned,
-                theta,
-                eta,
-                &cov_vec,
-                &mut vars,
-                None,
-                &nn_outputs,
-            );
-
             let mut p = PkParams::default();
-            if is_analytical_pk {
-                for &(pk_slot, var_slot) in &pk_assignment_mapping {
-                    p.values[pk_slot] = vars[var_slot];
+            FERX_SCRATCH.with(|cell| {
+                let mut scratch = cell.borrow_mut();
+                let FerxThreadScratch {
+                    pk_cov,
+                    pk_vars,
+                    bc_stack,
+                    ..
+                } = &mut *scratch;
+
+                // Materialise covariates into thread-local scratch aligned with
+                // `referenced_covariates`. This runs millions of times in FOCE
+                // inner loops, so keeping the buffers hot avoids short heap
+                // allocations per event/line-search evaluation.
+                pk_cov.resize(n_cov, 0.0);
+                for (i, name) in cov_names_for_lookup.iter().enumerate() {
+                    pk_cov[i] = covariates.get(name).copied().unwrap_or(0.0);
                 }
-                // Literal-valued slots (e.g. `ka=1.0`) are constants — no
-                // per-call evaluation, just write the parsed value.
-                for &(pk_slot, c) in &pk_const_mapping {
-                    p.values[pk_slot] = c;
+                pk_vars.resize(n_vars, 0.0);
+                pk_vars.fill(0.0);
+
+                // pk_param_fn doesn't compute derivatives — no `du` to pass.
+                // Call the stack-threaded evaluator directly while this scratch
+                // borrow is live; the wrapper would re-enter FERX_SCRATCH.
+                eval_statements_indexed_with_stack(
+                    &stmts_owned,
+                    theta,
+                    eta,
+                    pk_cov,
+                    pk_vars,
+                    None,
+                    &nn_outputs,
+                    bc_stack,
+                );
+
+                if is_analytical_pk {
+                    for &(pk_slot, var_slot) in &pk_assignment_mapping {
+                        p.values[pk_slot] = pk_vars[var_slot];
+                    }
+                    // Literal-valued slots (e.g. `ka=1.0`) are constants — no
+                    // per-call evaluation, just write the parsed value.
+                    for &(pk_slot, c) in &pk_const_mapping {
+                        p.values[pk_slot] = c;
+                    }
+                    // Modeled infusion duration (`D{cmt}`, RATE=-2; #394): write
+                    // each duration parameter into its reserved spare slot so the
+                    // analytical dose-resolution step can read it.
+                    for &(pk_slot, var_slot) in &analytical_extra_mapping {
+                        p.values[pk_slot] = pk_vars[var_slot];
+                    }
+                } else {
+                    // ODE model: store each individual parameter at its
+                    // `ode_param_slots` slot (canonical names at their PK slot, F at
+                    // PK_IDX_F, lagtime at PK_IDX_LAGTIME, others at free slots).
+                    for &(slot, var_slot) in &ode_assignment_mapping {
+                        p.values[slot] = pk_vars[var_slot];
+                    }
                 }
-                // Modeled infusion duration (`D{cmt}`, RATE=-2; #394): write each
-                // duration parameter into its reserved spare slot so the analytical
-                // dose-resolution step (`DoseEvent::resolve_rate`) can read it.
-                for &(pk_slot, var_slot) in &analytical_extra_mapping {
-                    p.values[pk_slot] = vars[var_slot];
-                }
-            } else {
-                // ODE model: store each individual parameter at its
-                // `ode_param_slots` slot (canonical names at their PK slot, F at
-                // PK_IDX_F, lagtime at PK_IDX_LAGTIME, others at free slots).
-                for &(slot, var_slot) in &ode_assignment_mapping {
-                    p.values[slot] = vars[var_slot];
-                }
-            }
+            });
             p
         },
     );
@@ -7747,6 +7994,7 @@ fn check_unused_parameters(
     used_sigmas: &std::collections::HashSet<String>,
     event_model_thetas: &std::collections::HashSet<usize>,
     event_model_etas: &std::collections::HashSet<usize>,
+    residual_error_eta: Option<usize>,
 ) -> Vec<String> {
     let mut used_thetas = std::collections::HashSet::new();
     let mut used_etas = std::collections::HashSet::new();
@@ -7769,6 +8017,12 @@ fn check_unused_parameters(
         }
     }
     for (i, name) in eta_names_bsv.iter().enumerate() {
+        // The `iiv_on_ruv` residual-error eta is referenced from [error_model], not
+        // any individual-parameter / [event_model] expression, but it *is* used (it
+        // scales the residual variance) and *is* estimated — so don't flag it.
+        if Some(i) == residual_error_eta {
+            continue;
+        }
         if !used_etas.contains(&i) {
             warnings.push(format!(
                 "omega '{}' is declared in [parameters] but not referenced in any \
@@ -8009,8 +8263,9 @@ enum Op {
 //
 // All hot-path closures in this module need their own `Vec<f64>` scratch:
 //   - `build_ode_rhs_fn`        : `rhs_vars` (state ‖ indiv params ‖ inters)
+//   - `build_pk_param_fn`       : `pk_cov` + `pk_vars` (individual params)
 //   - `build_y_output_fn`       : `y_vars` + `y_cov` (Form C readout)
-//   - `eval_statements_indexed` : `bc_stack` (bytecode f64 stack)
+//   - indexed statement eval    : `bc_stack` (bytecode f64 stack)
 //   - `build_y_output_fn`       : also needs the bc_stack for its readout eval
 //
 // Each was originally its own `thread_local!`. A samply profile of the
@@ -8023,6 +8278,8 @@ enum Op {
 #[derive(Debug)]
 struct FerxThreadScratch {
     rhs_vars: Vec<f64>,
+    pk_cov: Vec<f64>,
+    pk_vars: Vec<f64>,
     y_vars: Vec<f64>,
     y_cov: Vec<f64>,
     bc_stack: Vec<f64>,
@@ -8032,6 +8289,8 @@ impl FerxThreadScratch {
     const fn new_empty() -> Self {
         Self {
             rhs_vars: Vec::new(),
+            pk_cov: Vec::new(),
+            pk_vars: Vec::new(),
             y_vars: Vec::new(),
             y_cov: Vec::new(),
             bc_stack: Vec::new(),
@@ -8895,49 +9154,9 @@ fn eval_condition_indexed(
     }
 }
 
-/// Indexed-form statement executor; mirror of `eval_statements`. Handles
-/// `AssignIdx`, `DiffEqIdx`, and `If`; if any non-indexed `Assign` or
-/// `DiffEq` slips through, it falls back to a no-op (defensive — caller
-/// should ensure the AST has been run through `resolve_variable_indices`).
-///
-/// `du` carries the derivative buffer the `DiffEqIdx` arm writes into. ODE
-/// RHS callers (`build_ode_rhs_fn`) pass `Some(du)`; non-derivative callers
-/// (`pk_param_fn`) pass `None` and never construct a `DiffEqIdx`.
-fn eval_statements_indexed(
-    stmts: &[Statement],
-    theta: &[f64],
-    eta: &[f64],
-    covariates: &[f64],
-    vars: &mut [f64],
-    du: Option<&mut [f64]>,
-    nn_outputs: &[Vec<f64>],
-) {
-    // Acquire the bytecode-stack scratch ONCE per call from the shared
-    // FERX_SCRATCH; the borrow is held for the lifetime of this statement
-    // loop and threaded into recursive `If` arms. Callers that already
-    // hold FERX_SCRATCH (`build_ode_rhs_fn` does, for the rhs_vars setup)
-    // should bypass this wrapper and call eval_statements_indexed_with_stack
-    // directly with the bc_stack field — re-entering the borrow_mut here
-    // would panic.
-    FERX_SCRATCH.with(|cell| {
-        let mut s = cell.borrow_mut();
-        eval_statements_indexed_with_stack(
-            stmts,
-            theta,
-            eta,
-            covariates,
-            vars,
-            du,
-            nn_outputs,
-            &mut s.bc_stack,
-        );
-    });
-}
-
 /// Inner statement evaluator threaded with a caller-owned bytecode stack.
-/// Split from `eval_statements_indexed` so recursive `If` evaluation reuses
-/// the same `Vec<f64>` scratch instead of re-acquiring the TLS borrow per
-/// nested call.
+/// Recursive `If` evaluation reuses the same `Vec<f64>` scratch instead of
+/// re-acquiring the TLS borrow per nested call.
 #[allow(clippy::too_many_arguments)]
 fn eval_statements_indexed_with_stack(
     stmts: &[Statement],
@@ -9044,12 +9263,21 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
     vars: &mut [T],
     du: Option<&mut [T]>,
     bc_stack: &mut Vec<T>,
+    // Per var-slot mask: when `skip[idx]` is `true`, the `AssignBc(idx, _)` for
+    // that slot is NOT re-evaluated — its value is assumed already present in
+    // `vars` (the cov-static constant-folding pre-seed, #485). Empty slice =
+    // skip nothing (every other caller passes `&[]`). Conditions are still
+    // evaluated and branches still descended, so control flow is identical.
+    skip: &[bool],
 ) {
     let empty_nn: Vec<Vec<f64>> = Vec::new();
     let mut du_opt = du;
     for s in stmts {
         match s {
             Statement::AssignBc(idx, bc) => {
+                if skip.get(*idx).copied().unwrap_or(false) {
+                    continue;
+                }
                 let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
                 if let Some(slot) = vars.get_mut(*idx) {
                     *slot = v;
@@ -9083,6 +9311,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                             vars,
                             du_opt.as_deref_mut(),
                             bc_stack,
+                            skip,
                         );
                         taken = true;
                         break;
@@ -9098,6 +9327,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                             vars,
                             du_opt.as_deref_mut(),
                             bc_stack,
+                            skip,
                         );
                     }
                 }
@@ -9183,8 +9413,116 @@ impl OdeRhsProgram {
         }
         // The ODE RHS references states/indiv-params (in `vars`) only, not
         // θ/η/cov directly — so those are empty here.
-        eval_statements_g::<T>(&self.stmts, &[], &[], &[], vars, Some(du), stack);
+        eval_statements_g::<T>(&self.stmts, &[], &[], &[], vars, Some(du), stack, &[]);
     }
+}
+
+/// Does this compiled expression's value vary across the dual axes the
+/// sensitivity providers differentiate — i.e. does it read η, *any* θ, an NN
+/// output, or a variable already known to be dynamic? Reading only covariates,
+/// literals, and other cov-static variables makes it cov-static (foldable to a
+/// constant). See [`compute_cov_static_mask`] (#485).
+///
+/// θ is treated as dynamic even when FIXED: the `Dual2` path seeds *every* θ
+/// (FIXED included) as a variable, so a FIXED-θ-dependent slot still carries a
+/// non-zero `∂/∂θ_fixed` column that folding to a constant would silently zero.
+/// Restricting the fold to genuinely θ-free slots keeps it bit-identical to the
+/// unfolded walk on all axes.
+fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
+    bc.ops.iter().any(|op| match op {
+        Op::PushEta(_) | Op::PushTheta(_) | Op::PushNnOutput(_, _) => true,
+        Op::PushVar(i) => dyn_vars.get(*i as usize).copied().unwrap_or(false),
+        _ => false,
+    })
+}
+
+/// Condition counterpart of [`bytecode_is_dynamic`], over the (resolved) AST a
+/// branch condition still carries. An unresolved `Variable` is treated as
+/// dynamic (conservative — it never appears in a resolved program).
+fn expr_is_dynamic(e: &Expression, dyn_vars: &[bool]) -> bool {
+    match e {
+        Expression::Eta(_) | Expression::Theta(_) | Expression::NnOutput { .. } => true,
+        Expression::Variable(_) => true,
+        Expression::VariableIdx(i) => dyn_vars.get(*i).copied().unwrap_or(false),
+        Expression::Literal(_) | Expression::Covariate(_) | Expression::CovariateIdx(_) => false,
+        Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+            expr_is_dynamic(a, dyn_vars) || expr_is_dynamic(b, dyn_vars)
+        }
+        Expression::UnaryFn(_, a) => expr_is_dynamic(a, dyn_vars),
+        Expression::Conditional(c, a, b) => {
+            cond_is_dynamic(c, dyn_vars)
+                || expr_is_dynamic(a, dyn_vars)
+                || expr_is_dynamic(b, dyn_vars)
+        }
+    }
+}
+
+fn cond_is_dynamic(c: &Condition, dyn_vars: &[bool]) -> bool {
+    match c {
+        Condition::Compare(l, _, r) => expr_is_dynamic(l, dyn_vars) || expr_is_dynamic(r, dyn_vars),
+        Condition::And(a, b) | Condition::Or(a, b) => {
+            cond_is_dynamic(a, dyn_vars) || cond_is_dynamic(b, dyn_vars)
+        }
+        Condition::Not(c) => cond_is_dynamic(c, dyn_vars),
+    }
+}
+
+/// Classify each individual-parameter var slot as **cov-static** (`true`): its
+/// value is constant across every (θ, η) axis the analytic sensitivity providers
+/// differentiate, so the `Dual2`/`Dual1` walks can pre-seed it as a constant
+/// computed once in plain `f64` instead of carrying it through dual arithmetic
+/// (#485). A slot is cov-static iff every assignment to it reads only covariates,
+/// literals, and other cov-static slots, AND it is never assigned under an `if`
+/// whose governing condition is itself dynamic.
+///
+/// Computed by monotone fixpoint over the `dynamic` complement: a pass marks a
+/// slot dynamic when its bytecode, an enclosing condition, or a referenced slot
+/// is dynamic; passes repeat until no slot flips (var refs can be forward, so a
+/// single pass is not enough). `n_vars` is small (tens), so this is cheap and
+/// runs once at compile time. The returned mask has length `n_vars`.
+fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
+    fn walk(stmts: &[Statement], ctx_dynamic: bool, dyn_vars: &mut [bool], changed: &mut bool) {
+        for s in stmts {
+            match s {
+                Statement::AssignBc(idx, bc) => {
+                    let already = dyn_vars.get(*idx).copied().unwrap_or(true);
+                    if !already && (ctx_dynamic || bytecode_is_dynamic(bc, dyn_vars)) {
+                        if let Some(slot) = dyn_vars.get_mut(*idx) {
+                            *slot = true;
+                            *changed = true;
+                        }
+                    }
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    // The `else` arm fires only when *every* branch condition was
+                    // false, so it is governed by all of them: dynamic if any is.
+                    let mut any_cond_dynamic = ctx_dynamic;
+                    for (cond, body) in branches {
+                        let branch_dynamic = ctx_dynamic || cond_is_dynamic(cond, dyn_vars);
+                        any_cond_dynamic |= branch_dynamic;
+                        walk(body, branch_dynamic, dyn_vars, changed);
+                    }
+                    if let Some(eb) = else_body {
+                        walk(eb, any_cond_dynamic, dyn_vars, changed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut dyn_vars = vec![false; n_vars];
+    loop {
+        let mut changed = false;
+        walk(stmts, false, &mut dyn_vars, &mut changed);
+        if !changed {
+            break;
+        }
+    }
+    dyn_vars.iter().map(|&d| !d).collect()
 }
 
 /// Compiled `[individual_parameters]` block + var layout, exposed so the
@@ -9196,6 +9534,13 @@ impl OdeRhsProgram {
 pub struct IndivParamProgram {
     stmts: Vec<Statement>,
     n_vars: usize,
+    /// Per var-slot mask: `true` = the slot is cov-static (constant across every
+    /// θ / η dual axis), so [`eval_param_duals`](Self::eval_param_duals) and
+    /// [`eval_param_eta_grad`](Self::eval_param_eta_grad) compute it once in `f64`
+    /// and seed it as a dual constant instead of re-running the (often pow/exp/log
+    /// heavy) covariate kernel under dual arithmetic every call (#485). Empty when
+    /// no slot is foldable, in which case both paths run exactly as before.
+    cov_static_mask: Vec<bool>,
     /// `(pk_slot, var_slot)` per individual parameter, in declaration order
     /// (parallel to `CompiledModel.pk_indices`).
     pk_var_slots: Vec<(usize, usize)>,
@@ -9273,6 +9618,19 @@ impl IndivParamProgram {
             .collect();
         let mut vars = vec![Dual2::<M>::constant(0.0); self.n_vars];
         let mut stack: Vec<Dual2<M>> = Vec::new();
+        // Cov-static fold (#485): evaluate the constant-across-(θ,η) slots once in
+        // plain f64, seed them as dual constants (zero gradient/Hessian — exactly
+        // what they carry), and skip their (pow/exp/log heavy) re-derivation in the
+        // Dual2 walk. `skip` empty ⇒ original full-dual path.
+        let skip: &[bool] = &self.cov_static_mask;
+        if !skip.is_empty() {
+            let static_vals = self.eval_cov_static_f64(theta, &cov_vec);
+            for (v, &is_static) in skip.iter().enumerate() {
+                if is_static {
+                    vars[v] = Dual2::constant(static_vals[v]);
+                }
+            }
+        }
         eval_statements_g::<Dual2<M>>(
             &self.stmts,
             &theta_d,
@@ -9281,11 +9639,48 @@ impl IndivParamProgram {
             &mut vars,
             None,
             &mut stack,
+            skip,
         );
         self.pk_var_slots
             .iter()
             .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual2::constant(0.0)))
             .collect()
+    }
+
+    /// Compute the f64 values of the cov-static var slots (the slots flagged in
+    /// `cov_static_mask`), evaluating only those assignments — the dynamic ones
+    /// are skipped, so their slots stay `0.0` and must not be read. Branch
+    /// conditions are still evaluated (cheap comparisons); cov-static slots are
+    /// only ever governed by cov-static conditions, so the decisions — and hence
+    /// the returned values — are independent of the η seed used here (#485).
+    fn eval_cov_static_f64(&self, theta: &[f64], cov_vec: &[f64]) -> Vec<f64> {
+        use crate::sens::dual2::Dual2;
+        let dynamic: Vec<bool> = self.cov_static_mask.iter().map(|&s| !s).collect();
+        // Evaluated over a zero-width `Dual2<0>` (no gradient/Hessian axes), NOT
+        // native `f64`: the dual divides via `× recip` and raises powers via the
+        // dual `powd`, both of which differ from `f64::/` / `f64::powf` by up to
+        // 1 ULP. A division-bearing covariate kernel (CKD-EPI, Schwartz
+        // `0.413·HEIGHT/CREAT`, FFM) would otherwise make a folded slot drift ~1
+        // ULP from the unfolded walk. Both `Dual1<M>` and `Dual2<M>` share the
+        // `× recip` division and the same `powd`/`exp`/`ln` value arithmetic, and
+        // the `.value` field is computed independently of the axis count, so a
+        // `Dual2<0>` `.value` is bit-for-bit equal to what either unfolded path
+        // computes for the same slot — keeping the fold exactly identical (#485).
+        let theta_d: Vec<Dual2<0>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
+        let eta_zero = vec![Dual2::<0>::constant(0.0); self.n_eta];
+        let mut vars = vec![Dual2::<0>::constant(0.0); self.n_vars];
+        let mut stack: Vec<Dual2<0>> = Vec::new();
+        eval_statements_g::<Dual2<0>>(
+            &self.stmts,
+            &theta_d,
+            &eta_zero,
+            cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            &dynamic,
+        );
+        vars.iter().map(|d| d.value).collect()
     }
 
     /// Evaluate the individual parameters over `Dual1<M>` seeded on **η only**
@@ -9320,6 +9715,17 @@ impl IndivParamProgram {
             .collect();
         let mut vars = vec![Dual1::<M>::constant(0.0); self.n_vars];
         let mut stack: Vec<Dual1<M>> = Vec::new();
+        // Cov-static fold (#485): same as the Dual2 path — cov-static slots are a
+        // fortiori η-independent, so seeding them as Dual1 constants is exact.
+        let skip: &[bool] = &self.cov_static_mask;
+        if !skip.is_empty() {
+            let static_vals = self.eval_cov_static_f64(theta, &cov_vec);
+            for (v, &is_static) in skip.iter().enumerate() {
+                if is_static {
+                    vars[v] = Dual1::constant(static_vals[v]);
+                }
+            }
+        }
         eval_statements_g::<Dual1<M>>(
             &self.stmts,
             &theta_d,
@@ -9328,6 +9734,7 @@ impl IndivParamProgram {
             &mut vars,
             None,
             &mut stack,
+            skip,
         );
         self.pk_var_slots
             .iter()
@@ -11261,6 +11668,24 @@ mod tests {
     }
 
     #[test]
+    fn error_rule_analytical_pk_plus_weibull() {
+        // Weibull has no closed form, so analytical `pk` + `weibull()` is a hard
+        // error pointing at ode_template — and stays one permanently (unlike
+        // transit/igd, it can never route to the analytical path).
+        let src = two_cpt_oral_model(
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  TD = 2.0\n  BETA = 1.5\n",
+            "[odes]\n  d/dt(depot) = weibull(td=TD, beta=BETA) - KA*depot\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("ode_template"),
+            "should point at ode_template: {err}"
+        );
+        assert!(err.contains("weibull"), "should name the function: {err}");
+    }
+
+    #[test]
     fn ode_only_absorption_fn_detection() {
         let transit = vec!["d/dt(depot) = transit(n=N, mtt=M) - KA*depot".to_string()];
         assert_eq!(
@@ -11271,12 +11696,14 @@ mod tests {
         // (routing an analytical `pk` + `igd()` to `ode_template`).
         let igd = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central".to_string()];
         assert_eq!(ode_only_absorption_fn_in_odes(Some(&igd)), Some("igd"));
-        // The error rule only recognises functions that are actually implemented
-        // (Ron #363): `weibull` is not yet an input rate, so it must NOT be
-        // detected — otherwise the rule would point the user at `ode_template` for a
-        // function the engine can't run. Each phase adds its name here when it lands.
+        // `weibull` is implemented as of Phase 2, so the error rule now recognises
+        // it. Unlike `transit`/`igd`, it has no closed form, so it stays on the
+        // ODE-only list permanently (it can never route to an analytical `pk`).
         let weibull = vec!["d/dt(central) = weibull(td=TD, beta=B) - (CL/V)*central".to_string()];
-        assert_eq!(ode_only_absorption_fn_in_odes(Some(&weibull)), None);
+        assert_eq!(
+            ode_only_absorption_fn_in_odes(Some(&weibull)),
+            Some("weibull")
+        );
         // A plain disposition ODE has no ODE-only absorption call.
         let plain = vec!["d/dt(central) = -(CL/V)*central".to_string()];
         assert_eq!(ode_only_absorption_fn_in_odes(Some(&plain)), None);
@@ -11545,6 +11972,62 @@ mod tests {
         assert!(none.is_empty());
         // Positive control: a bare additive igd() is accepted.
         assert!(go("d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central").is_ok());
+    }
+
+    // ── weibull() input-rate parse-split (#322 Phase 2, design A) ─────────────
+    #[test]
+    fn extract_weibull_input_rate_basic() {
+        // weibull(td, beta) straight into central: forcing on the central cmt,
+        // args resolved to the [td, beta] slots in order; the rest of the RHS
+        // untouched.
+        let lines = vec!["d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central".to_string()];
+        let states = vec!["depot".to_string(), "central".to_string()];
+        let names = vec![
+            "TD".to_string(),
+            "BETA".to_string(),
+            "CL".to_string(),
+            "V".to_string(),
+        ];
+        let slots = vec![4, 5, 0, 1];
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
+        assert_eq!(cleaned[0], "d/dt(central) = 0 - CL/V*central");
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(forcings[0].cmt, 1); // central
+        assert!(matches!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::Weibull
+        ));
+        assert_eq!(forcings[0].arg_slots, vec![4, 5]); // [td=TD slot, beta=BETA slot]
+    }
+
+    #[test]
+    fn extract_weibull_input_rate_rejects_bad_specs() {
+        let states = vec!["central".to_string()];
+        let names = vec!["TD".to_string(), "BETA".to_string()];
+        let slots = vec![4, 5];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        assert!(go("d/dt(central) = weibull(td=TD, beta=ZZZ)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        assert!(go("d/dt(central) = weibull(td=TD, foo=BETA)")
+            .unwrap_err()
+            .contains("no argument `foo`"));
+        let err = go("d/dt(central) = weibull(td=TD)").unwrap_err();
+        assert!(
+            err.contains("missing required argument `beta`"),
+            "got: {err}"
+        );
+        // A scaled call is rejected and the message names `weibull`.
+        let scaled = go("d/dt(central) = FR*weibull(td=TD, beta=BETA)").unwrap_err();
+        assert!(
+            scaled.contains("scaled") && scaled.contains("weibull"),
+            "got: {scaled}"
+        );
+        // Positive control: a bare additive weibull() is accepted.
+        assert!(go("d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central").is_ok());
     }
 
     #[test]
@@ -12920,10 +13403,12 @@ mod tests {
     #[test]
     fn test_apply_fit_option_optimizer_and_bloq() {
         let mut opts = FitOptions::default();
-        // `lbfgs` resolves to the built-in limited-memory L-BFGS; the NLopt
-        // L-BFGS + SLSQP-polish path keeps the explicit `nlopt_lbfgs` keyword.
+        // `lbfgs` and `bfgs` are deprecated aliases for `nlopt_lbfgs` — all three
+        // resolve to the NLopt L-BFGS (+ SLSQP polish) path. See #483.
         assert_eq!(apply_fit_option(&mut opts, "optimizer", "lbfgs"), Ok(true));
-        assert_eq!(opts.optimizer, Optimizer::Lbfgs);
+        assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
+        assert_eq!(apply_fit_option(&mut opts, "optimizer", "bfgs"), Ok(true));
+        assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
         assert_eq!(
             apply_fit_option(&mut opts, "optimizer", "nlopt_lbfgs"),
             Ok(true)
@@ -13066,6 +13551,29 @@ mod tests {
     }
 
     #[test]
+    fn test_ode_solver_keys_do_not_warn() {
+        // ode_reltol/ode_abstol/ode_max_steps configure the RK45 integrator (any
+        // ODE model, any estimation method) — they are framework-level, not
+        // method-specific. Regression for the spurious "is not used by method
+        // FOCEI and will be ignored" warning these once produced even though
+        // `sync_ode_solver_opts` does apply them.
+        for method in ["focei", "foce", "saem", "imp", "bayes"] {
+            let opts = parse_fit_options(&[
+                format!("method = {method}"),
+                "ode_reltol = 1e-9".to_string(),
+                "ode_abstol = 1e-11".to_string(),
+                "ode_max_steps = 1000000".to_string(),
+            ])
+            .unwrap();
+            assert!(
+                opts.unsupported_keys_warnings().is_empty(),
+                "method={method} spuriously warned on ODE-solver keys: {:?}",
+                opts.unsupported_keys_warnings()
+            );
+        }
+    }
+
+    #[test]
     fn test_inner_optimizer_under_focei_does_not_warn() {
         // `inner_optimizer` drives the per-subject EBE loop, which FOCEI uses —
         // it must be in the method's recognized keys and not flagged "ignored".
@@ -13132,6 +13640,31 @@ mod tests {
                 warnings
             );
             assert!(warnings[0].contains("stagnation_guard"));
+        }
+    }
+
+    #[test]
+    fn test_ebe_warm_start_parses_and_is_framework_key() {
+        // Parses to the bool, defaults to false (opt-in).
+        let opts = parse_fit_options(&[
+            "method = focei".to_string(),
+            "ebe_warm_start = true".to_string(),
+        ])
+        .unwrap();
+        assert!(opts.ebe_warm_start);
+        assert!(!FitOptions::default().ebe_warm_start, "default is off");
+        // Framework key: the inner NM fallback exists under every method, so it
+        // must not warn as unsupported for any of them.
+        for method in ["foce", "focei", "gn", "saem"] {
+            let opts = parse_fit_options(&[
+                format!("method = {method}"),
+                "ebe_warm_start = true".to_string(),
+            ])
+            .unwrap();
+            assert!(
+                opts.unsupported_keys_warnings().is_empty(),
+                "method={method} should accept the framework key ebe_warm_start"
+            );
         }
     }
 
@@ -14560,6 +15093,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_optimizer_auto() {
+        let content = minimal_model_with_fit_options("  optimizer = auto");
+        let parsed = parse_full_model(&content).unwrap();
+        assert_eq!(parsed.fit_options.optimizer, Optimizer::Auto);
+    }
+
+    #[test]
     fn test_parse_optimizer_trust_region() {
         let content = minimal_model_with_fit_options("  optimizer = trust_region");
         let parsed = parse_full_model(&content).unwrap();
@@ -14575,6 +15115,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_optimizer_lbfgs_bfgs_alias_nlopt() {
+        // `lbfgs` and `bfgs` are deprecated aliases for `nlopt_lbfgs`: all three
+        // select the NLopt L-BFGS path. The hand-rolled built-in is no longer
+        // reachable by keyword. See #483.
+        for key in ["lbfgs", "bfgs", "nlopt_lbfgs"] {
+            let content = minimal_model_with_fit_options(&format!("  optimizer = {key}"));
+            let parsed = parse_full_model(&content).unwrap();
+            assert_eq!(
+                parsed.fit_options.optimizer,
+                Optimizer::NloptLbfgs,
+                "optimizer = {key} should resolve to NLopt L-BFGS"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_optimizer_case_insensitive() {
         // Parser lowercases the value, so mixed-case should map the same way.
         let content = minimal_model_with_fit_options("  optimizer = BOBYQA");
@@ -14587,13 +15143,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_optimizer_defaults_to_bobyqa() {
+    fn test_parse_optimizer_defaults_to_auto() {
         // `[fit_options]` block present but `optimizer` omitted → default is
-        // BOBYQA (derivative-free trust-region). See `FitOptions::default` for
-        // the rationale.
+        // `auto`, which resolves per-model to nlopt_lbfgs (analytic gradient) or
+        // bobyqa (FD only). See `FitOptions::default` and #490.
         let content = minimal_model_with_fit_options("  maxiter = 100");
         let parsed = parse_full_model(&content).unwrap();
-        assert_eq!(parsed.fit_options.optimizer, Optimizer::Bobyqa);
+        assert_eq!(parsed.fit_options.optimizer, Optimizer::Auto);
     }
 
     #[test]
@@ -14624,10 +15180,10 @@ mod tests {
     #[test]
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
-        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-5,
+        //   optimizer = auto, inner_maxiter = 200, inner_tol = 1e-5,
         //   steihaug_max_iters = None (adaptive).
         let opts = FitOptions::default();
-        assert_eq!(opts.optimizer, Optimizer::Bobyqa);
+        assert_eq!(opts.optimizer, Optimizer::Auto);
         assert_eq!(opts.inner_maxiter, 200);
         assert!((opts.inner_tol - 1e-5).abs() < 1e-20);
         assert_eq!(opts.steihaug_max_iters, None);
@@ -16190,6 +16746,26 @@ if (WT > 70) {
     }
 
     #[test]
+    fn test_iiv_on_ruv_eta_not_flagged_unused() {
+        // The residual-error eta is referenced from [error_model] (not any
+        // individual-parameter expression), but it scales the residual variance and
+        // is estimated — it must NOT trigger the "not referenced" unused warning.
+        let model = parse_full_model(&iiv_ruv_model_str(
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV",
+        ))
+        .unwrap()
+        .model;
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("ETA_RUV") && w.contains("not referenced")),
+            "iiv_on_ruv eta must not be flagged unused; got: {:?}",
+            model.parse_warnings
+        );
+    }
+
+    #[test]
     fn test_iiv_on_ruv_absent_is_none() {
         let model = parse_full_model(&iiv_ruv_model_str("  DV ~ proportional(PROP_ERR)"))
             .unwrap()
@@ -17000,6 +17576,165 @@ if (WT > 70) {
             (u0[0] - 5.0).abs() < 1e-9,
             "init(response) = KIN/KOUT = 5, got {}",
             u0[0]
+        );
+    }
+
+    // ── [initial_conditions] on analytical models (issue #521) ──
+
+    /// A minimal analytical 1-cpt oral model, with an optional
+    /// `[initial_conditions]` body spliced in.
+    fn analytical_oral_with_init(init_block: &str) -> String {
+        format!(
+            "[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+{init_block}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        )
+    }
+
+    #[test]
+    fn initial_conditions_populates_analytical_init_central() {
+        let src = analytical_oral_with_init(
+            "
+[initial_conditions]
+  init(central) = CONC0 * V
+",
+        );
+        let model = parse_full_model(&src).expect("parses").model;
+        assert_eq!(model.analytical_init.len(), 1);
+        let init = &model.analytical_init[0];
+        // `central` is cmt 2 for an oral model.
+        assert_eq!(init.cmt, 2);
+
+        // amount_fn = CONC0 * V. With CONC0=7 (covariate) and V=20 (PK slot 1),
+        // the amount is 140. eta=0, theta unused by the expression.
+        let mut pk = crate::types::PkParams::default();
+        pk.values[crate::types::PK_IDX_V] = 20.0;
+        let mut cov = std::collections::HashMap::new();
+        cov.insert("CONC0".to_string(), 7.0);
+        let a0 = (init.amount_fn)(&[3.0, 20.0, 1.0], &[0.0], &cov, &pk);
+        assert!((a0 - 140.0).abs() < 1e-9, "CONC0*V = 140, got {a0}");
+    }
+
+    #[test]
+    fn initial_conditions_depot_maps_to_cmt1() {
+        let src = analytical_oral_with_init(
+            "
+[initial_conditions]
+  init(depot) = 50
+",
+        );
+        let model = parse_full_model(&src).expect("parses").model;
+        assert_eq!(model.analytical_init.len(), 1);
+        assert_eq!(model.analytical_init[0].cmt, 1);
+    }
+
+    #[test]
+    fn initial_conditions_rejected_on_ode_model() {
+        // An ODE model must use `init(...)` inside [odes], not this block.
+        let src = "[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL / V * central
+
+[scaling]
+  obs_scale = V
+
+[initial_conditions]
+  init(central) = 10
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+        let err = match parse_full_model(src) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("[initial_conditions]") && err.contains("[odes]"),
+            "error should point ODE users to [odes]: {err}"
+        );
+    }
+
+    #[test]
+    fn initial_conditions_peripheral_rejected() {
+        // two_cpt_oral: cmt 3 is the peripheral — not supported on the analytical
+        // path (needs the cross-compartment Green's function).
+        let src = "[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVQ(2.0, 0.01, 50.0)
+  theta TVV2(40.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v=V, q=Q, v2=V2, ka=KA)
+
+[initial_conditions]
+  init(3) = 10
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+        let err = match parse_full_model(src) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("peripheral") || err.contains("central"),
+            "error should explain the central/depot restriction: {err}"
+        );
+    }
+
+    #[test]
+    fn initial_conditions_unknown_compartment_errors() {
+        let src = analytical_oral_with_init(
+            "
+[initial_conditions]
+  init(gut) = 10
+",
+        );
+        let err = match parse_full_model(&src) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("unknown compartment"),
+            "error should name the unknown compartment: {err}"
         );
     }
 
@@ -18116,6 +18851,74 @@ if (WT > 70) {
     }
 
     #[test]
+    fn init_amount_referencing_kappa_is_rejected_under_iov() {
+        // [initial_conditions] mirrors the Form C guard (#107/#521 review): the
+        // init expression's eta scope is BSV-only, so a KAPPA_* reference would
+        // silently evaluate to 0 and give a wrong baseline. Reject it instead.
+        let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVC0(5.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV
+  CONC0 = TVC0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[initial_conditions]
+  init(central) = CONC0 * V * exp(KAPPA_CL)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let err = parse_model_string(src)
+            .expect_err("init expression referencing KAPPA_* must be rejected under IOV");
+        assert!(
+            err.contains("KAPPA") && err.contains("IOV"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn init_amount_without_kappa_ref_is_allowed_under_iov() {
+        // The baseline reads only BSV/structural params; it must parse even when
+        // the model carries IOV elsewhere.
+        let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVC0(5.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV
+  CONC0 = TVC0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[initial_conditions]
+  init(central) = CONC0 * V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(src)
+            .expect("init expression without a KAPPA_* reference must parse under IOV");
+        assert_eq!(m.analytical_init.len(), 1);
+    }
+
+    #[test]
     fn test_parse_scaling_rejected_on_sde_model() {
         // Regression for Copilot review: EKF p_obs / r_obs run in unscaled
         // observation space, so Forms A/B Phase 1 scaling on SDE models
@@ -18563,7 +19366,7 @@ if (WT > 70) {
         ];
         let mut dud = vec![Dual2::<1>::constant(0.0)];
         let mut sd: Vec<Dual2<1>> = Vec::new();
-        eval_statements_g::<Dual2<1>>(&stmts, &[], &[], &[], &mut vd, Some(&mut dud), &mut sd);
+        eval_statements_g::<Dual2<1>>(&stmts, &[], &[], &[], &mut vd, Some(&mut dud), &mut sd, &[]);
 
         assert!(close(dud[0].value, duf[0], 1e-12, 1e-12), "value vs f64");
         // du[0] = −k·u = −0.6; ∂/∂k = −u = −2; ∂²/∂k² = 0.
@@ -21022,5 +21825,514 @@ CL V KA WT
             Ok(true)
         );
         assert_eq!(opts.frem_sigma.as_deref(), Some("EPSCOV"));
+    }
+
+    /// #485: the cov-static constant fold in `eval_param_duals` /
+    /// `eval_param_eta_grad` must be bit-identical to the unfolded path. The
+    /// model below has a covariate + FIXED-θ kernel (`FMAT`, `FAC` — foldable)
+    /// and a dynamic tail (`CL = free-θ × … × exp(η)` — not foldable).
+    const COV_STATIC_FOLD_MODEL: &str = r#"
+[parameters]
+  theta TVCL (5, 0.001, 100.0)
+  theta GAM (2.0, FIX)
+  omega ETA_CL ~ 0.1
+  sigma PROP ~ 0.2 (sd)
+[individual_parameters]
+  FMAT = WT ^ GAM / (WT ^ GAM + 3 ^ GAM)
+  if (AGE < 13) {
+    FAC = AGE * 0.1
+  } else {
+    FAC = 1.0
+  }
+  CL = TVCL * FMAT * FAC * exp(ETA_CL)
+  V1 = 10
+[structural_model]
+  pk one_cpt_iv(cl=CL, v1=V1)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    fn cov_static_fold_fixture() -> (CompiledModel, Vec<f64>, Vec<f64>, HashMap<String, f64>) {
+        let model = parse_model_string(COV_STATIC_FOLD_MODEL).expect("model compiles");
+        let theta = vec![5.0, 2.0];
+        let eta = vec![0.3_f64];
+        let cov: HashMap<String, f64> = [("WT".to_string(), 70.0), ("AGE".to_string(), 5.0)]
+            .into_iter()
+            .collect();
+        (model, theta, eta, cov)
+    }
+
+    #[test]
+    fn cov_static_mask_classifies_kernel_and_dynamic_tail() {
+        let (model, ..) = cov_static_fold_fixture();
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("indiv param program present");
+        // Some slots fold (the covariate/FIXED-θ kernel) …
+        assert!(
+            prog.cov_static_mask.iter().any(|&b| b),
+            "expected some cov-static slots"
+        );
+        // … and at least one does not (the free-θ × exp(η) CL slot).
+        assert!(
+            prog.cov_static_mask.iter().any(|&b| !b),
+            "expected the dynamic CL slot to stay unfolded"
+        );
+    }
+
+    #[test]
+    fn cov_static_fold_matches_unfolded_dual2() {
+        let (model, theta, eta, cov) = cov_static_fold_fixture();
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("indiv param program present");
+        // n_theta + n_eta = 2 + 1 = 3.
+        let folded = prog.eval_param_duals::<3>(&theta, &eta, &cov);
+        let mut unfolded_prog = prog.clone();
+        unfolded_prog.cov_static_mask = Vec::new();
+        let unfolded = unfolded_prog.eval_param_duals::<3>(&theta, &eta, &cov);
+
+        assert_eq!(folded.len(), unfolded.len());
+        for (i, (a, b)) in folded.iter().zip(unfolded.iter()).enumerate() {
+            assert_eq!(a.value, b.value, "value mismatch at row {i}");
+            assert_eq!(a.grad, b.grad, "grad mismatch at row {i}");
+            assert_eq!(a.hess, b.hess, "hess mismatch at row {i}");
+        }
+    }
+
+    /// A covariate-heavy individual-parameters block modelled on the jasmine
+    /// vancomycin-pediatrics run60 kernel: a large covariate-only prefix
+    /// (CKD-EPI-/FFM-style pow/exp/log + sex/age branches — all cov-static) feeding
+    /// a small free-θ × exp(η) tail. Used by the fold microbenchmark.
+    const COV_STATIC_BENCH_MODEL: &str = r#"
+[parameters]
+  theta TVCL (5, 0.001, 100.0)
+  theta TVV1 (30, 0.001, 500.0)
+  theta THCR (0.2, -5.0, 5.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V1 ~ 0.1
+  sigma PROP ~ 0.2 (sd)
+[individual_parameters]
+  BMI = WEIGHT / ((HEIGHT / 100.0) ^ 2)
+  if (SEX == 0) {
+    FFM = 9270.0 * WEIGHT / (8780.0 + 244.0 * BMI)
+    A1  = -0.241
+    KK  = 0.7
+  } else {
+    FFM = 9270.0 * WEIGHT / (6680.0 + 216.0 * BMI)
+    A1  = -0.302
+    KK  = 0.9
+  }
+  CKDEPI = 142 * (CREAT / KK) ^ A1 * 0.9938 ^ AGE
+  SCH    = 0.413 * HEIGHT / CREAT
+  EGFR   = if (AGE < 13) SCH else CKDEPI
+  FCOV   = (EGFR / 100) ^ 0.75 * exp(-log(2) / 0.6 * AGE) * (FFM / 34) ^ 0.75
+  CL = TVCL * FCOV * exp(ETA_CL)
+  V1 = TVV1 * (FFM / 34) * exp(ETA_V1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v1=V1)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    /// #485: bit-identity of the cov-static fold on a covariate-heavy kernel
+    /// (the jasmine-style [`COV_STATIC_BENCH_MODEL`]: a `SEX` branch, an inline
+    /// `if (AGE < 13) … else …` conditional, FFM forward-references, and
+    /// pow/exp/log throughout). A far richer block than `cov_static_fold_fixture`:
+    /// it asserts the fold is bit-for-bit identical to the unfolded walk on every
+    /// dual axis, for both branches of the `SEX` split.
+    ///
+    /// The per-call timing microbenchmark these numbers came from is dev-only
+    /// scaffolding (its figures live in PR #489), so it is not committed as a test.
+    #[test]
+    fn cov_static_fold_matches_unfolded_bench_kernel() {
+        let model = parse_model_string(COV_STATIC_BENCH_MODEL).expect("bench model compiles");
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("indiv param program");
+        // The covariate kernel (BMI/FFM/CKDEPI/SCH/EGFR/FCOV/A1/KK) folds; the
+        // free-θ × exp(η) CL/V1 tail does not.
+        assert!(
+            prog.cov_static_mask.iter().any(|&b| b),
+            "expected cov-static slots in the kernel"
+        );
+        assert!(
+            prog.cov_static_mask.iter().any(|&b| !b),
+            "expected the CL/V1 tail to stay dynamic"
+        );
+        let theta: Vec<f64> = vec![5.0, 30.0, 0.2];
+        assert_eq!(theta.len(), model.n_theta);
+        let eta = vec![0.05_f64, -0.1_f64];
+        assert_eq!(eta.len(), model.n_eta);
+        let base_cov: HashMap<String, f64> = [
+            ("AGE", 4.0),
+            ("CREAT", 0.4),
+            ("SEX", 1.0),
+            ("HEIGHT", 100.0),
+            ("WEIGHT", 16.0),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        let mut unfolded_prog = prog.clone();
+        unfolded_prog.cov_static_mask = Vec::new();
+
+        // Both arms of the `if (SEX == 0)` split, to fold each FFM branch.
+        for sex in [1.0_f64, 0.0_f64] {
+            let mut cov = base_cov.clone();
+            cov.insert("SEX".to_string(), sex);
+
+            // Dual2 (outer θ,η): n_theta + n_eta = 3 + 2 = 5.
+            let folded2 = prog.eval_param_duals::<5>(&theta, &eta, &cov);
+            let unfolded2 = unfolded_prog.eval_param_duals::<5>(&theta, &eta, &cov);
+            assert_eq!(folded2.len(), unfolded2.len());
+            for (i, (a, b)) in folded2.iter().zip(unfolded2.iter()).enumerate() {
+                assert_eq!(
+                    a.value, b.value,
+                    "SEX={sex} dual2 value mismatch at row {i}"
+                );
+                assert_eq!(a.grad, b.grad, "SEX={sex} dual2 grad mismatch at row {i}");
+                assert_eq!(a.hess, b.hess, "SEX={sex} dual2 hess mismatch at row {i}");
+            }
+
+            // Dual1 (inner η): n_eta = 2.
+            let folded1 = prog.eval_param_eta_grad::<2>(&theta, &eta, &cov);
+            let unfolded1 = unfolded_prog.eval_param_eta_grad::<2>(&theta, &eta, &cov);
+            assert_eq!(folded1.len(), unfolded1.len());
+            for (i, (a, b)) in folded1.iter().zip(unfolded1.iter()).enumerate() {
+                assert_eq!(
+                    a.value, b.value,
+                    "SEX={sex} dual1 value mismatch at row {i}"
+                );
+                assert_eq!(a.grad, b.grad, "SEX={sex} dual1 grad mismatch at row {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn cov_static_fold_matches_unfolded_dual1() {
+        let (model, theta, eta, cov) = cov_static_fold_fixture();
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("indiv param program present");
+        // n_eta = 1.
+        let folded = prog.eval_param_eta_grad::<1>(&theta, &eta, &cov);
+        let mut unfolded_prog = prog.clone();
+        unfolded_prog.cov_static_mask = Vec::new();
+        let unfolded = unfolded_prog.eval_param_eta_grad::<1>(&theta, &eta, &cov);
+
+        assert_eq!(folded.len(), unfolded.len());
+        for (i, (a, b)) in folded.iter().zip(unfolded.iter()).enumerate() {
+            assert_eq!(a.value, b.value, "value mismatch at row {i}");
+            assert_eq!(a.grad, b.grad, "grad mismatch at row {i}");
+        }
+    }
+
+    /// #485: exhaustively exercise the cov-static classifier helpers on every
+    /// AST / bytecode arm. The model-driven tests only reach the arms a parsed
+    /// `[individual_parameters]` block happens to emit; hand-built nodes hit the
+    /// rest (NN outputs, `&&`/`||`/`!`, inline conditionals, dynamic var refs).
+    #[test]
+    fn cov_static_classifier_helpers_cover_all_arms() {
+        // dual-axis state: slot 0 dynamic, slot 1 cov-static.
+        let dv = [true, false];
+
+        // ── bytecode_is_dynamic ──
+        let bc = |ops: Vec<Op>| Bytecode {
+            ops,
+            constants: vec![0.0],
+            max_stack: 2,
+        };
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushEta(0)]), &dv));
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushTheta(0)]), &dv));
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushNnOutput(0, 0)]), &dv));
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushVar(0)]), &dv)); // slot 0 dynamic
+        assert!(!bytecode_is_dynamic(&bc(vec![Op::PushVar(1)]), &dv)); // slot 1 static
+        assert!(!bytecode_is_dynamic(
+            &bc(vec![Op::PushCov(0), Op::PushConst(0), Op::Add]),
+            &dv
+        ));
+
+        // ── expr_is_dynamic ──
+        let lit = || Expression::Literal(1.0);
+        assert!(expr_is_dynamic(&Expression::Eta(0), &dv));
+        assert!(expr_is_dynamic(&Expression::Theta(0), &dv));
+        assert!(expr_is_dynamic(
+            &Expression::NnOutput {
+                nn_idx: 0,
+                output_idx: 0
+            },
+            &dv
+        ));
+        assert!(expr_is_dynamic(&Expression::Variable("x".into()), &dv));
+        assert!(expr_is_dynamic(&Expression::VariableIdx(0), &dv)); // dynamic slot
+        assert!(!expr_is_dynamic(&Expression::VariableIdx(1), &dv)); // static slot
+        assert!(!expr_is_dynamic(&lit(), &dv));
+        assert!(!expr_is_dynamic(&Expression::Covariate("WT".into()), &dv));
+        assert!(!expr_is_dynamic(&Expression::CovariateIdx(0), &dv));
+        // BinOp / Power recurse into both operands.
+        assert!(expr_is_dynamic(
+            &Expression::BinOp(Box::new(Expression::Theta(0)), BinOp::Add, Box::new(lit())),
+            &dv
+        ));
+        assert!(!expr_is_dynamic(
+            &Expression::Power(
+                Box::new(Expression::Covariate("WT".into())),
+                Box::new(lit())
+            ),
+            &dv
+        ));
+        // UnaryFn recurses into its argument.
+        assert!(expr_is_dynamic(
+            &Expression::UnaryFn("exp".into(), Box::new(Expression::Eta(0))),
+            &dv
+        ));
+        assert!(!expr_is_dynamic(
+            &Expression::UnaryFn("log".into(), Box::new(lit())),
+            &dv
+        ));
+
+        // ── cond_is_dynamic ──
+        let static_cmp = Condition::Compare(Expression::Covariate("AGE".into()), CmpOp::Lt, lit());
+        let dyn_cmp = Condition::Compare(Expression::Theta(0), CmpOp::Gt, lit());
+        assert!(!cond_is_dynamic(&static_cmp, &dv));
+        assert!(cond_is_dynamic(&dyn_cmp, &dv));
+        assert!(cond_is_dynamic(
+            &Condition::And(Box::new(static_cmp.clone()), Box::new(dyn_cmp.clone())),
+            &dv
+        ));
+        assert!(!cond_is_dynamic(
+            &Condition::Or(Box::new(static_cmp.clone()), Box::new(static_cmp.clone())),
+            &dv
+        ));
+        assert!(cond_is_dynamic(
+            &Condition::Not(Box::new(dyn_cmp.clone())),
+            &dv
+        ));
+        assert!(!cond_is_dynamic(
+            &Condition::Not(Box::new(static_cmp.clone())),
+            &dv
+        ));
+
+        // ── inline conditional (expr_is_dynamic::Conditional) ──
+        assert!(expr_is_dynamic(
+            &Expression::Conditional(
+                Box::new(static_cmp.clone()),
+                Box::new(Expression::Eta(0)), // dynamic `then`
+                Box::new(lit())
+            ),
+            &dv
+        ));
+        assert!(expr_is_dynamic(
+            &Expression::Conditional(
+                Box::new(dyn_cmp.clone()), // dynamic condition
+                Box::new(Expression::Covariate("WT".into())),
+                Box::new(lit())
+            ),
+            &dv
+        ));
+        assert!(!expr_is_dynamic(
+            &Expression::Conditional(
+                Box::new(static_cmp),
+                Box::new(Expression::Covariate("WT".into())),
+                Box::new(lit())
+            ),
+            &dv
+        ));
+    }
+
+    /// #485: `compute_cov_static_mask` corner cases the parsed fixtures don't
+    /// reach — a forward reference (a single pass is insufficient, so the
+    /// monotone fixpoint must re-iterate) and a slot assigned under a dynamic
+    /// `if` condition (covariate-only body, θ-dependent governing condition).
+    #[test]
+    fn cov_static_mask_fixpoint_and_dynamic_if_context() {
+        // slot0 = slot1 + 1   (forward ref — slot1 is assigned *after* slot0)
+        // slot1 = θ0          (dynamic)
+        // A single forward pass marks slot0 static; the fixpoint re-pass flips it.
+        let fwd = vec![
+            // A non-`AssignBc`/`If` statement is ignored by the classifier (the
+            // `_ => {}` arm) — `[individual_parameters]` never emits one, so cover
+            // it here.
+            Statement::Assign("ignored".into(), Expression::Literal(0.0)),
+            Statement::AssignBc(
+                0,
+                Bytecode {
+                    ops: vec![Op::PushVar(1), Op::PushConst(0), Op::Add],
+                    constants: vec![1.0],
+                    max_stack: 2,
+                },
+            ),
+            Statement::AssignBc(
+                1,
+                Bytecode {
+                    ops: vec![Op::PushTheta(0)],
+                    constants: vec![],
+                    max_stack: 1,
+                },
+            ),
+        ];
+        assert_eq!(compute_cov_static_mask(&fwd, 2), vec![false, false]);
+
+        // if (θ0 > 5) { X = WT } else { X = 0 } — covariate/literal bodies, but the
+        // governing condition is dynamic, so X must not fold.
+        let dyn_if = vec![Statement::If {
+            branches: vec![(
+                Condition::Compare(Expression::Theta(0), CmpOp::Gt, Expression::Literal(5.0)),
+                vec![Statement::AssignBc(
+                    0,
+                    Bytecode {
+                        ops: vec![Op::PushCov(0)],
+                        constants: vec![],
+                        max_stack: 1,
+                    },
+                )],
+            )],
+            else_body: Some(vec![Statement::AssignBc(
+                0,
+                Bytecode {
+                    ops: vec![Op::PushConst(0)],
+                    constants: vec![0.0],
+                    max_stack: 1,
+                },
+            )]),
+        }];
+        assert_eq!(compute_cov_static_mask(&dyn_if, 1), vec![false]);
+
+        // Pure-covariate `if`: the slot stays static (static branch of the If arm
+        // + the else_body walk under a non-dynamic governing condition).
+        let stat_if = vec![Statement::If {
+            branches: vec![(
+                Condition::Compare(
+                    Expression::Covariate("AGE".into()),
+                    CmpOp::Lt,
+                    Expression::Literal(13.0),
+                ),
+                vec![Statement::AssignBc(
+                    0,
+                    Bytecode {
+                        ops: vec![Op::PushCov(0)],
+                        constants: vec![],
+                        max_stack: 1,
+                    },
+                )],
+            )],
+            else_body: Some(vec![Statement::AssignBc(
+                0,
+                Bytecode {
+                    ops: vec![Op::PushConst(0)],
+                    constants: vec![1.0],
+                    max_stack: 1,
+                },
+            )]),
+        }];
+        assert_eq!(compute_cov_static_mask(&stat_if, 1), vec![true]);
+    }
+
+    // ── [simulation] block key handling ──────────────────────────────────────
+    fn sim_lines(body: &[&str]) -> Vec<String> {
+        body.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn simulation_long_form_keys_apply() {
+        // The canonical (and example-file) spellings must actually be honored —
+        // the bug was that `n_subjects`/`dose_amt`/`dose_cmt` were silently ignored
+        // and fell back to the defaults (10 / 100 / 1).
+        let spec = parse_simulation_block(&sim_lines(&[
+            "n_subjects = 7",
+            "dose_amt = 50",
+            "dose_cmt = 2",
+            "seed = 99",
+            "times = [0.5, 1.0, 2.0]",
+        ]))
+        .expect("long-form keys parse");
+        assert_eq!(spec.n_subjects, 7);
+        assert_eq!(spec.dose_amt, 50.0);
+        assert_eq!(spec.dose_cmt, 2);
+        assert_eq!(spec.seed, 99);
+        assert_eq!(spec.obs_times, vec![0.5, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn simulation_short_form_aliases_apply() {
+        // Back-compat: the short `subjects`/`dose`/`cmt` forms (the previously
+        // documented spelling) remain valid aliases for the same fields, and the
+        // defaults hold for the keys we omit (seed = 42).
+        let spec = parse_simulation_block(&sim_lines(&[
+            "subjects = 3",
+            "dose = 25",
+            "cmt = 4",
+            "times = [1.0]",
+        ]))
+        .expect("short-form aliases parse");
+        assert_eq!(spec.n_subjects, 3);
+        assert_eq!(spec.dose_amt, 25.0);
+        assert_eq!(spec.dose_cmt, 4);
+        assert_eq!(spec.seed, 42, "untouched seed keeps its default");
+    }
+
+    #[test]
+    fn simulation_unknown_key_errors() {
+        // A typo (e.g. `n_subject`) must be a hard error, not a silent default —
+        // this is the silent-failure class the fix closes.
+        let err = parse_simulation_block(&sim_lines(&[
+            "n_subject = 5", // typo: missing the trailing 's'
+            "times = [1.0]",
+        ]))
+        .unwrap_err();
+        assert!(
+            err.starts_with("[simulation]:")
+                && err.contains("unknown key")
+                && err.contains("n_subject"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn simulation_malformed_line_errors() {
+        // A non-blank line with no `=` (e.g. a forgotten `=`) is malformed and must
+        // error rather than being silently skipped into the default.
+        let err =
+            parse_simulation_block(&sim_lines(&["n_subjects 5", "times = [1.0]"])).unwrap_err();
+        assert!(
+            err.starts_with("[simulation]:") && err.contains("malformed line"),
+            "got: {err}"
+        );
+    }
+
+    // Every value-parsing arm must report a clear, prefixed error on a bad value —
+    // not just `n_subjects`. This pins the error branch of each `map_err`/`?` so the
+    // diff isn't covered by happy paths alone.
+    #[test]
+    fn simulation_bad_value_errors_per_key() {
+        for (line, key) in [
+            ("n_subjects = abc", "n_subjects"),
+            ("dose_amt = abc", "dose_amt"),
+            ("dose_cmt = 1.5", "dose_cmt"), // non-integer compartment
+            ("seed = -1", "seed"),          // seed is u64
+            ("times = [1.0, oops]", "times"),
+        ] {
+            let err = parse_simulation_block(&sim_lines(&[line, "times = [1.0]"])).unwrap_err();
+            assert!(
+                err.starts_with("[simulation]:") && err.contains(key),
+                "key `{key}` on `{line}` gave: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn simulation_requires_times() {
+        let err = parse_simulation_block(&sim_lines(&["n_subjects = 5"])).unwrap_err();
+        assert!(err.contains("times"), "got: {err}");
     }
 }

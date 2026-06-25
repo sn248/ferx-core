@@ -2,7 +2,7 @@
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
-**Status:** approved roadmap, in progress (updated 2026-06-20).
+**Status:** approved roadmap, in progress (updated 2026-06-23).
 - **Prerequisite #324:** safety net (PR #326), **modeled infusion duration `Dn` /
   `RATE=-2`** (PR #384), and **modeled rate `Rn` / `RATE=-1` on both engines**
   (PR #418) **merged**; see #383 for any residual analytical-engine items.
@@ -11,9 +11,28 @@
 - **Phase 0b — `ode_template` generation + the analytical-`pk`-plus-absorption
   error rule** (PR #363) **merged**.
 - **Phase 1 — inverse-Gaussian `igd()`** (PR #389) **merged**.
-- **Phases 2–3 not yet implemented** — Phase 2 (Weibull + zero-order family);
-  Phase 3 (analytical incomplete-gamma / exponential tilting, tracked in #386).
-  Biphasic IG + the shared input-rate fraction mechanism tracked in #388.
+- **Analytic `Dual2` ODE forcing (#430)** — `igd` (slice 1), `transit` (slice 2),
+  and (with Phase 2) `weibull` are all lifted off the FD fallback; **#430 closed**.
+- **Phase 2 — `weibull()`** (#497) — log-domain forcing, exact analytic `Dual2`
+  gradients, permanent ODE-only error rule, AUC-mass invariant; NONMEM anchor kit
+  committed, run pending. **Remaining in Phase 2** (the zero-order family, now
+  tracked):
+  - **#504 — `zero_order(dur)` + `sequential`**: single-input (no fraction), reuses
+    the merged `RATE=-2`/`Dn` forcing (#384/#395). The smallest, first slice.
+  - **#505 — `parallel` / `mixed` + `first_order()` composition**: dual-pathway,
+    **blocked on the shared fraction multiplier in #388** (the parser rejects scaled
+    input-rate calls today).
+- **#388 — biphasic IG + the shared input-rate fraction mechanism.** Build the
+  `FR*fn(...) + (1-FR)*fn(...)` multiplier once; consumed by both biphasic IG and
+  #505's `parallel`/`mixed`.
+- **Phase 3 — #386 — analytical incomplete-gamma / exponential tilting** for
+  transit + IG. Now *speed-only* (#430 already gave transit/IG exact gradients on
+  the ODE path), so this only removes the ODE solve. Lowest urgency. Weibull never
+  reaches Phase 3 (no closed form) — its only exact-gradient route is the #430
+  generic forcing.
+
+Recommended sequence after #497: **#504** (single-input, no new mechanism) →
+**#388** fraction mechanism + **#505** (`parallel`/`mixed`) → **#386** (speed pass).
 
 Multi-PR / phased.
 
@@ -426,7 +445,7 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 - `src/ode/predictions.rs` — synthesized-disposition + `R_in` forcing; SS reuse.
 - prediction dispatcher / `src/estimation/inner_optimizer.rs` — route oral+absorption to the
   forced path; `src/diagnostics.rs` — new `W_ABSORPTION_*`.
-- Docs: new `docs/src/model-file/absorption.md` + `SUMMARY.md`; cross-link
+- Docs: new `docs/model-file/absorption.qmd` + `_quarto.yml`; cross-link
   `structural-model.md`; new `examples/*.ferx`; `CHANGELOG.md` (`[Unreleased] → Added`).
 - `../ferx-r` follow-up PR per user-facing phase — pin bump (`tools/update-ferx-core-lock.sh`)
   + an R example/test/`NEWS.md`; the input-rate functions need no new R glue. See the
@@ -475,11 +494,17 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   biphasic NONMEM run yet → would be an unanchored happy path; its fraction-multiplier mechanism
   is shared with the planned parallel/mixed `first_order`, so design it once).
 - **Phase 2 — Weibull + zero-order + sequential + parallel + mixed.** Round out the
-  catalogue; each with a NONMEM anchor. **Closed-form** for zero-order/sequential/parallel/
-  mixed (superpose existing solvers; the zero-order family reuses #324's estimated-duration
-  forcing); **numerical** for Weibull (warned on an analytical disposition). Weibull has no closed
-  form, so its exact gradients come *only* via the `PkNum`-generic forcing route (see §"Analytic
-  sensitivities for the ODE forcing"), never Phase 3.
+  catalogue; each with a NONMEM anchor. Split into tracked slices:
+  - **Weibull (#497)** — **numerical** (no closed form); errors on an analytical
+    disposition (pointing at `ode_template`). Exact gradients come *only* via the
+    `PkNum`-generic forcing route (see §"Analytic sensitivities for the ODE forcing"),
+    never Phase 3. **Shipped as a PR.**
+  - **`zero_order` + `sequential` (#504)** — single-input; reuses #324's merged
+    `RATE=-2`/`Dn` estimated-duration forcing. **Closed-form** (superpose existing
+    solvers / piecewise), shipped on the ODE path first then optionally accelerated.
+  - **`parallel` / `mixed` + `first_order()` composition (#505)** — dual-pathway,
+    **blocked on the #388 shared fraction multiplier** (the parser rejects scaled
+    input-rate calls today). **Closed-form** (superpose `*_oral` solvers by `frac`).
 - **Phase 3 — analytical closed forms for transit and IG** (1/2-cpt). Both are implemented
   via the **`TiltedAbsorption` trait** in a new `src/pk/analytical_absorption.rs`:
 

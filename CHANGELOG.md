@@ -19,6 +19,17 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **`[initial_conditions]` block for analytical PK models** (#521). Declare a
+  non-zero starting compartment amount with `init(central) = <expr>` (or
+  `init(depot) = ...`) on a closed-form 1-/2-/3-cpt model — the analytical
+  equivalent of NONMEM's `A_0(cmt)` and of the ODE-path `init(...)` in `[odes]`.
+  A pre-dose baseline (e.g. `init(central) = CONC0 * V`) no longer forces the
+  numerical ODE solver: on the 6-thioguanine `run14` model this cuts FOCEI wall
+  time ~13× (27 s → ~2 s) at matching estimates. Models with an initial
+  condition use `gradient = fd` for now (exact-analytic gradients are a
+  follow-up). See [Initial Conditions](model-file/initial-conditions.qmd).
+
 ### Performance
 - **Ω-preconditioned inner EBE loop for all FOCE/FOCEI fits.** The inner BFGS
   now initialises its inverse-Hessian (the search `H0`) to the prior conditional

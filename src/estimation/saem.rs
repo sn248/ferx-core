@@ -2941,6 +2941,7 @@ mod tests {
             endpoints: HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         };
 
         // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.

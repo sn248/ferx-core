@@ -4718,6 +4718,7 @@ mod tests {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         }
     }
 
@@ -4919,6 +4920,7 @@ mod tests {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         };
         check_gradient(&model, &make_population(3), 2);
     }
@@ -5335,6 +5337,7 @@ mod tests {
         let model = CompiledModel {
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
             name: "iov_cov_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,

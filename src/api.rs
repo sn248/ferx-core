@@ -5278,6 +5278,7 @@ mod iov_integration {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         }
     }
 
@@ -6614,6 +6615,7 @@ mod simulate_with_uncertainty_tests {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         }
     }
 
@@ -7426,6 +7428,7 @@ mod tests_sdtab_tv_cov {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -7665,6 +7668,7 @@ mod tests_sdtab_tv_cov {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         };
 
         let mut baseline_cov = HashMap::new();
@@ -7821,6 +7825,7 @@ mod tests_derived_session_clock {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         }
     }
 
@@ -8138,6 +8143,7 @@ mod tests_derived_iov_kappa {
         CompiledModel {
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,

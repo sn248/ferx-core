@@ -1619,6 +1619,26 @@ pub type PkParamFn = Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> PkPara
 pub type ScaleFn =
     Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>, &PkParams) -> f64 + Send + Sync>;
 
+/// A non-zero initial compartment amount on an **analytical** PK model
+/// (`[initial_conditions] init(NAME) = <expr>`; issue #521). The analytical
+/// engine has no state vector to seed, so an initial amount `A₀` in
+/// compartment `cmt` is layered onto the dose-driven prediction as the
+/// closed-form impulse response of an `F`-bypassed bolus of `A₀` into `cmt`
+/// at t=0 — exact for the linear superposition models. This mirrors NONMEM's
+/// `A_0(cmt)` and the ODE path's `init(...)` directive, which seeds the
+/// integrator state instead.
+///
+/// `amount_fn` shares the [`ScaleFn`] signature: it receives
+/// `(theta, eta, covariates, pk_params)` and returns `A₀`, so the expression
+/// may reference thetas, etas, covariates, and individual parameters (e.g.
+/// `init(central) = CONC0 * V`).
+pub struct AnalyticalInit {
+    /// 1-based compartment index the initial amount is deposited into.
+    pub cmt: usize,
+    /// Evaluates the initial amount `A₀` for a subject. See type docs.
+    pub amount_fn: ScaleFn,
+}
+
 /// How the structural model's raw output is mapped to the observed `DV`.
 ///
 /// Set by the `[scaling]` block in `.ferx` model files. The convention is
@@ -2197,6 +2217,13 @@ pub struct CompiledModel {
     /// `[error_model]`; it is NOT referenced by any individual parameter, so it
     /// carries no `EtaParamInfo` entry and the PK closure ignores it. See #409.
     pub residual_error_eta: Option<usize>,
+    /// Non-zero initial compartment amounts for **analytical** PK models, from
+    /// the `[initial_conditions]` block (issue #521). Empty for the common case
+    /// (zero initial state) and for ODE models (which seed state via
+    /// `ode_spec.init_fn` instead). Each entry layers a closed-form
+    /// `F`-bypassed bolus impulse onto the dose-driven prediction; see
+    /// [`AnalyticalInit`] and `pk::add_analytical_init`.
+    pub analytical_init: Vec<AnalyticalInit>,
 }
 
 /// FREM (Full Random Effects Model) configuration.
@@ -4482,6 +4509,7 @@ pub(crate) mod test_helpers {
             endpoints: HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         }
     }
 
@@ -4564,6 +4592,7 @@ pub(crate) mod test_helpers {
             endpoints: HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         };
 
         let mut baseline_cov = HashMap::new();

@@ -1767,6 +1767,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         endpoints: std::collections::HashMap::new(),
         frem_config: None,
         residual_error_eta,
+        // Populated below from the optional [initial_conditions] block (#521).
+        analytical_init: Vec::new(),
     };
 
     // ── Optional blocks ──
@@ -1935,6 +1937,23 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
 
         model.scaling = scaling;
+    }
+
+    // ── [initial_conditions] block (issue #521) ──
+    // Non-zero starting compartment amounts for analytical PK models. The ODE
+    // path seeds state via `init(...)` in [odes]; here we record closed-form
+    // init impulses layered onto the dose-driven prediction by
+    // `pk::add_analytical_init`.
+    if let Some(ic_lines) = blocks.get("initial_conditions") {
+        model.analytical_init = parse_initial_conditions_block(
+            ic_lines,
+            model.pk_model,
+            model.ode_spec.is_some(),
+            &model.theta_names,
+            &model.eta_names,
+            &model.indiv_param_names,
+            &model.pk_indices,
+        )?;
     }
 
     // ODE validation: the `NEEDS_FORM_C = usize::MAX` sentinel from
@@ -4285,6 +4304,144 @@ fn build_obs_scale_spec(
         },
     );
     Ok(ScalingSpec::ExpressionScale { scale_fn, deriv })
+}
+
+/// Resolve a `[initial_conditions] init(NAME)` compartment name to a 1-based
+/// compartment index for an **analytical** `pk_model`, validating that an
+/// initial amount in that compartment is supported (issue #521).
+///
+/// Accepted names: `central` (every model), `depot` (oral models, cmt 1), or a
+/// 1-based integer index. Peripheral compartments are rejected — seeding a
+/// peripheral needs the cross-compartment Green's function, which the closed
+/// forms don't expose; use an ODE model for that.
+fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
+    let is_oral = pk_model.is_oral();
+    let central = if is_oral { 2 } else { 1 };
+    let lname = name.trim().to_lowercase();
+
+    let cmt = if let Ok(n) = lname.parse::<usize>() {
+        n
+    } else {
+        match lname.as_str() {
+            "central" => central,
+            "depot" if is_oral => 1,
+            "depot" => {
+                return Err(format!(
+                    "[initial_conditions]: `depot` is only valid for oral models; \
+                     `{}` has no depot compartment.",
+                    pk_model.canonical_name()
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "[initial_conditions]: unknown compartment `{}`. Use `central`{}, \
+                     or a 1-based CMT index.",
+                    name,
+                    if is_oral { " or `depot`" } else { "" }
+                ));
+            }
+        }
+    };
+
+    if cmt == central || (is_oral && cmt == 1) {
+        Ok(cmt)
+    } else {
+        Err(format!(
+            "[initial_conditions]: initial amounts are only supported in the central \
+             compartment{} (got compartment {}). A peripheral-compartment initial amount \
+             needs the cross-compartment impulse response, which the analytical closed \
+             forms don't expose — use an ODE model with `init(...)` in [odes] (issue #521).",
+            if is_oral { " or the oral depot" } else { "" },
+            cmt
+        ))
+    }
+}
+
+/// Compile one `init(NAME) = <expr>` right-hand side into a [`ScaleFn`] that
+/// evaluates the initial amount `A₀` from `(theta, eta, covariates, pk_params)`.
+/// Mirrors the Form-B `obs_scale` expression closure in [`build_obs_scale_spec`]:
+/// individual-parameter names resolve from the subject-static `pk_params`, so
+/// `init(central) = CONC0 * V` reads `V` from its PK slot.
+fn build_init_amount_fn(
+    value: &str,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    pk_indices: &[usize],
+) -> Result<ScaleFn, String> {
+    // Constant fast path (e.g. `init(central) = 0.0`).
+    if let Ok(k) = value.parse::<f64>() {
+        return Ok(Box::new(
+            move |_: &[f64], _: &[f64], _: &HashMap<String, f64>, _: &PkParams| k,
+        ));
+    }
+    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
+    let expr = parse_scalar_expression(value, ctx)
+        .map_err(|e| format!("[initial_conditions] init: {}", e))?;
+    let indiv_to_pk_slot: HashMap<String, usize> = indiv_var_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.clone(), pk_indices.get(i).copied().unwrap_or(i)))
+        .collect();
+    Ok(Box::new(
+        move |theta: &[f64],
+              eta: &[f64],
+              covariates: &HashMap<String, f64>,
+              pk: &PkParams|
+              -> f64 {
+            let mut vars: HashMap<String, f64> = HashMap::with_capacity(indiv_to_pk_slot.len());
+            for (name, &slot) in &indiv_to_pk_slot {
+                if slot < pk.values.len() {
+                    vars.insert(name.clone(), pk.values[slot]);
+                }
+            }
+            let empty_nn: Vec<Vec<f64>> = Vec::new();
+            eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
+        },
+    ))
+}
+
+/// Parse the `[initial_conditions]` block (issue #521) into the analytical
+/// model's [`AnalyticalInit`] list. Each `init(NAME) = <expr>` declares a
+/// non-zero starting amount in compartment `NAME`. Analytical models only —
+/// ODE models seed state via `init(...)` inside `[odes]`.
+fn parse_initial_conditions_block(
+    lines: &[String],
+    pk_model: PkModel,
+    is_ode: bool,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    pk_indices: &[usize],
+) -> Result<Vec<crate::types::AnalyticalInit>, String> {
+    if is_ode {
+        return Err(
+            "[initial_conditions]: this block is for analytical PK models; for an \
+                    ODE model declare `init(state) = <expr>` inside the [odes] block instead."
+                .into(),
+        );
+    }
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in lines {
+        let (name, expr) = parse_init_line(line).ok_or_else(|| {
+            format!(
+                "[initial_conditions]: expected `init(NAME) = <expr>`, got: `{}`",
+                line.trim()
+            )
+        })?;
+        let cmt = analytical_init_cmt(pk_model, &name)?;
+        if !seen.insert(cmt) {
+            return Err(format!(
+                "[initial_conditions]: duplicate init for compartment `{}`",
+                name
+            ));
+        }
+        let amount_fn =
+            build_init_amount_fn(&expr, theta_names, eta_names, indiv_var_names, pk_indices)?;
+        out.push(crate::types::AnalyticalInit { cmt, amount_fn });
+    }
+    Ok(out)
 }
 
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
@@ -17366,6 +17523,165 @@ if (WT > 70) {
             (u0[0] - 5.0).abs() < 1e-9,
             "init(response) = KIN/KOUT = 5, got {}",
             u0[0]
+        );
+    }
+
+    // ── [initial_conditions] on analytical models (issue #521) ──
+
+    /// A minimal analytical 1-cpt oral model, with an optional
+    /// `[initial_conditions]` body spliced in.
+    fn analytical_oral_with_init(init_block: &str) -> String {
+        format!(
+            "[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+{init_block}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        )
+    }
+
+    #[test]
+    fn initial_conditions_populates_analytical_init_central() {
+        let src = analytical_oral_with_init(
+            "
+[initial_conditions]
+  init(central) = CONC0 * V
+",
+        );
+        let model = parse_full_model(&src).expect("parses").model;
+        assert_eq!(model.analytical_init.len(), 1);
+        let init = &model.analytical_init[0];
+        // `central` is cmt 2 for an oral model.
+        assert_eq!(init.cmt, 2);
+
+        // amount_fn = CONC0 * V. With CONC0=7 (covariate) and V=20 (PK slot 1),
+        // the amount is 140. eta=0, theta unused by the expression.
+        let mut pk = crate::types::PkParams::default();
+        pk.values[crate::types::PK_IDX_V] = 20.0;
+        let mut cov = std::collections::HashMap::new();
+        cov.insert("CONC0".to_string(), 7.0);
+        let a0 = (init.amount_fn)(&[3.0, 20.0, 1.0], &[0.0], &cov, &pk);
+        assert!((a0 - 140.0).abs() < 1e-9, "CONC0*V = 140, got {a0}");
+    }
+
+    #[test]
+    fn initial_conditions_depot_maps_to_cmt1() {
+        let src = analytical_oral_with_init(
+            "
+[initial_conditions]
+  init(depot) = 50
+",
+        );
+        let model = parse_full_model(&src).expect("parses").model;
+        assert_eq!(model.analytical_init.len(), 1);
+        assert_eq!(model.analytical_init[0].cmt, 1);
+    }
+
+    #[test]
+    fn initial_conditions_rejected_on_ode_model() {
+        // An ODE model must use `init(...)` inside [odes], not this block.
+        let src = "[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL / V * central
+
+[scaling]
+  obs_scale = V
+
+[initial_conditions]
+  init(central) = 10
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+        let err = match parse_full_model(src) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("[initial_conditions]") && err.contains("[odes]"),
+            "error should point ODE users to [odes]: {err}"
+        );
+    }
+
+    #[test]
+    fn initial_conditions_peripheral_rejected() {
+        // two_cpt_oral: cmt 3 is the peripheral — not supported on the analytical
+        // path (needs the cross-compartment Green's function).
+        let src = "[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVQ(2.0, 0.01, 50.0)
+  theta TVV2(40.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v=V, q=Q, v2=V2, ka=KA)
+
+[initial_conditions]
+  init(3) = 10
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+        let err = match parse_full_model(src) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("peripheral") || err.contains("central"),
+            "error should explain the central/depot restriction: {err}"
+        );
+    }
+
+    #[test]
+    fn initial_conditions_unknown_compartment_errors() {
+        let src = analytical_oral_with_init(
+            "
+[initial_conditions]
+  init(gut) = 10
+",
+        );
+        let err = match parse_full_model(&src) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("unknown compartment"),
+            "error should name the unknown compartment: {err}"
         );
     }
 

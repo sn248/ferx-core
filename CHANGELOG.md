@@ -31,6 +31,12 @@ section of the SDLC for the versioning policy).
   `log|H̃|` θ/Ω/σ derivatives. Validated to ~1e-11 against reconverged finite
   differences of ferx's own FOCEI marginal (whose value is NONMEM-validated, #413).
   ODE, IOV, and M3-BLOQ `iiv_on_ruv` keep the finite-difference gradient. (#474)
+- **Spurious "not referenced" warning for the `iiv_on_ruv` eta.** A residual-error
+  random effect is referenced from `[error_model]` (not an individual-parameter
+  expression), so it was falsely warned as "declared but not referenced … will not
+  affect predictions or be meaningfully estimated" even though it scales the
+  residual variance and is estimated. The warning is now suppressed for that eta.
+  (#474)
 
 ### Performance
 - **Ω-preconditioned inner EBE loop for all FOCE/FOCEI fits.** The inner BFGS

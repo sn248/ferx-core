@@ -3522,27 +3522,46 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
     for line in lines {
         let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
         if parts.len() != 2 {
-            continue;
+            // No `=` on a non-blank, non-comment line (comments/blanks are already
+            // stripped by `extract_blocks`). Treat it as a hard error rather than
+            // silently skipping — e.g. `n_subjects 5` must not fall back to the
+            // default, which is the whole point of this block's strict parsing.
+            return Err(format!(
+                "[simulation]: malformed line (expected `key = value`): {}",
+                line.trim()
+            ));
         }
         match parts[0] {
-            "subjects" => {
+            // `n_subjects` / `dose_amt` / `dose_cmt` are the canonical spellings
+            // (they match the `SimulationSpec` fields and every `examples/*.ferx`);
+            // the short `subjects` / `dose` / `cmt` forms are kept as back-compat
+            // aliases. An unknown key is a hard error (mirrors [fit_options]) so a
+            // typo like `n_subject` no longer silently falls back to the default.
+            "subjects" | "n_subjects" => {
                 n_subjects = parts[1]
                     .parse()
-                    .map_err(|_| format!("Bad subjects: {}", line))?
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
             }
-            "dose" => {
+            "dose" | "dose_amt" => {
                 dose_amt = parts[1]
                     .parse()
-                    .map_err(|_| format!("Bad dose: {}", line))?
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
             }
-            "cmt" => dose_cmt = parts[1].parse().map_err(|_| format!("Bad cmt: {}", line))?,
+            "cmt" | "dose_cmt" => {
+                dose_cmt = parts[1]
+                    .parse()
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
+            }
             "seed" => {
                 seed = parts[1]
                     .parse()
-                    .map_err(|_| format!("Bad seed: {}", line))?
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
             }
-            "times" => obs_times = parse_float_array(parts[1])?,
-            _ => {}
+            "times" => {
+                obs_times = parse_float_array(parts[1])
+                    .map_err(|e| format!("[simulation]: bad times: {e}"))?
+            }
+            other => return Err(format!("[simulation]: unknown key `{}`", other)),
         }
     }
     if obs_times.is_empty() {
@@ -21780,5 +21799,103 @@ CL V KA WT
             )]),
         }];
         assert_eq!(compute_cov_static_mask(&stat_if, 1), vec![true]);
+    }
+
+    // ── [simulation] block key handling ──────────────────────────────────────
+    fn sim_lines(body: &[&str]) -> Vec<String> {
+        body.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn simulation_long_form_keys_apply() {
+        // The canonical (and example-file) spellings must actually be honored —
+        // the bug was that `n_subjects`/`dose_amt`/`dose_cmt` were silently ignored
+        // and fell back to the defaults (10 / 100 / 1).
+        let spec = parse_simulation_block(&sim_lines(&[
+            "n_subjects = 7",
+            "dose_amt = 50",
+            "dose_cmt = 2",
+            "seed = 99",
+            "times = [0.5, 1.0, 2.0]",
+        ]))
+        .expect("long-form keys parse");
+        assert_eq!(spec.n_subjects, 7);
+        assert_eq!(spec.dose_amt, 50.0);
+        assert_eq!(spec.dose_cmt, 2);
+        assert_eq!(spec.seed, 99);
+        assert_eq!(spec.obs_times, vec![0.5, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn simulation_short_form_aliases_apply() {
+        // Back-compat: the short `subjects`/`dose`/`cmt` forms (the previously
+        // documented spelling) remain valid aliases for the same fields, and the
+        // defaults hold for the keys we omit (seed = 42).
+        let spec = parse_simulation_block(&sim_lines(&[
+            "subjects = 3",
+            "dose = 25",
+            "cmt = 4",
+            "times = [1.0]",
+        ]))
+        .expect("short-form aliases parse");
+        assert_eq!(spec.n_subjects, 3);
+        assert_eq!(spec.dose_amt, 25.0);
+        assert_eq!(spec.dose_cmt, 4);
+        assert_eq!(spec.seed, 42, "untouched seed keeps its default");
+    }
+
+    #[test]
+    fn simulation_unknown_key_errors() {
+        // A typo (e.g. `n_subject`) must be a hard error, not a silent default —
+        // this is the silent-failure class the fix closes.
+        let err = parse_simulation_block(&sim_lines(&[
+            "n_subject = 5", // typo: missing the trailing 's'
+            "times = [1.0]",
+        ]))
+        .unwrap_err();
+        assert!(
+            err.starts_with("[simulation]:")
+                && err.contains("unknown key")
+                && err.contains("n_subject"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn simulation_malformed_line_errors() {
+        // A non-blank line with no `=` (e.g. a forgotten `=`) is malformed and must
+        // error rather than being silently skipped into the default.
+        let err =
+            parse_simulation_block(&sim_lines(&["n_subjects 5", "times = [1.0]"])).unwrap_err();
+        assert!(
+            err.starts_with("[simulation]:") && err.contains("malformed line"),
+            "got: {err}"
+        );
+    }
+
+    // Every value-parsing arm must report a clear, prefixed error on a bad value —
+    // not just `n_subjects`. This pins the error branch of each `map_err`/`?` so the
+    // diff isn't covered by happy paths alone.
+    #[test]
+    fn simulation_bad_value_errors_per_key() {
+        for (line, key) in [
+            ("n_subjects = abc", "n_subjects"),
+            ("dose_amt = abc", "dose_amt"),
+            ("dose_cmt = 1.5", "dose_cmt"), // non-integer compartment
+            ("seed = -1", "seed"),          // seed is u64
+            ("times = [1.0, oops]", "times"),
+        ] {
+            let err = parse_simulation_block(&sim_lines(&[line, "times = [1.0]"])).unwrap_err();
+            assert!(
+                err.starts_with("[simulation]:") && err.contains(key),
+                "key `{key}` on `{line}` gave: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn simulation_requires_times() {
+        let err = parse_simulation_block(&sim_lines(&["n_subjects = 5"])).unwrap_err();
+        assert!(err.contains("times"), "got: {err}");
     }
 }

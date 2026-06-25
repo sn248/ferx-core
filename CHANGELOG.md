@@ -242,6 +242,14 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- **`[simulation]` block now honours the documented `n_subjects` / `dose_amt` /
+  `dose_cmt` keys.** The parser previously only recognised the short
+  `subjects` / `dose` / `cmt` spellings and **silently ignored** every other key,
+  so all `examples/*.ferx` (which use the long forms) fell back to the defaults
+  (10 subjects, dose 100, compartment 1) — e.g. `n_subjects = 12` simulated 10.
+  Both spellings are now accepted (long forms canonical, short forms as aliases),
+  and an **unknown or malformed key in `[simulation]` is now a hard parse error**
+  instead of a silent default, matching `[fit_options]`.
 - The ODE-solver fit options `ode_reltol`, `ode_abstol`, and `ode_max_steps` no
   longer emit a spurious "is not used by method … and will be ignored" warning
   (#516). They configure the RK45 integrator and *are* applied to any ODE model

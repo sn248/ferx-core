@@ -79,6 +79,143 @@ pub fn apply_scaling(
     }
 }
 
+/// Layer analytical initial-compartment amounts onto `preds` (issue #521).
+///
+/// For an analytical (closed-form) PK model the disposition is linear, so a
+/// non-zero initial amount `A₀` in compartment `c` at t=0 is exactly the
+/// impulse response of a bioavailability-bypassed bolus of `A₀` into `c`,
+/// superimposed on the dose-driven prediction. `A₀` is evaluated once per
+/// subject (it may depend on θ/η/covariates/individual parameters, e.g.
+/// `init(central) = CONC0 * V`) and its decaying concentration contribution is
+/// added at each observation time.
+///
+/// Called **before** `[scaling]` and the log-transform so scaling divides the
+/// dose+init total — matching the ODE path, where `init(...)` seeds the state
+/// that the same readout/scaling later sees.
+///
+/// No-op for ODE models (state seeded via `ode_spec.init_fn`) and for the
+/// common case of no `[initial_conditions]` block. `preds` is parallel to
+/// `subject.obs_times`.
+pub fn add_analytical_init(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    preds: &mut [f64],
+) {
+    if model.analytical_init.is_empty() || model.ode_spec.is_some() {
+        return;
+    }
+    // Non-IOV path: one subject-static PK snapshot drives both the baseline
+    // amount and its decay kernel.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    add_analytical_init_with(model, subject, theta, eta, &pk, None, preds);
+}
+
+/// Core of [`add_analytical_init`], parameterised by the PK snapshot(s) used.
+///
+/// `amount_pk` evaluates the baseline amount `A₀` from the init expression
+/// (it references BSV individual parameters, so callers pass the BSV-only PK
+/// snapshot). `obs_decay_pk`, when `Some`, supplies the per-observation PK
+/// params that drive the *decay kernel* (CL/V/KA over time) — used by the IOV
+/// path so the baseline decays at each observation's occasion-specific
+/// clearance instead of the population/BSV rate (issue #521 review). When
+/// `None`, `amount_pk` drives the decay too (the non-IOV case).
+///
+/// A system reset (EVID=3/4) zeros every compartment, including the residual
+/// baseline; nothing re-deposits the t=0 init afterwards. So the baseline only
+/// contributes to observations strictly before the first reset — observations
+/// at or after it see none of it. `obs_times` is the internal monotonic clock
+/// (shared with `reset_times`), so the comparison is on the same timeline.
+fn add_analytical_init_with(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    amount_pk: &PkParams,
+    obs_decay_pk: Option<&[PkParams]>,
+    preds: &mut [f64],
+) {
+    let first_reset = subject
+        .reset_times
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    for init in &model.analytical_init {
+        let a0 = (init.amount_fn)(theta, eta, &subject.covariates, amount_pk);
+        if a0 == 0.0 || !a0.is_finite() {
+            continue;
+        }
+        for (i, &t) in subject.obs_times.iter().enumerate() {
+            // The initial amount is laid down at the subject's time origin
+            // (t=0); a pre-origin observation sees none of it, and a reset
+            // wipes it for every observation at/after the reset time.
+            if t < 0.0 || t >= first_reset {
+                continue;
+            }
+            let decay_pk = match obs_decay_pk {
+                Some(ps) => ps.get(i).unwrap_or(amount_pk),
+                None => amount_pk,
+            };
+            if let Some(pred) = preds.get_mut(i) {
+                *pred += analytical_init_concentration(model.pk_model, init.cmt, a0, t, decay_pk);
+            }
+        }
+    }
+}
+
+/// Closed-form central-compartment concentration at elapsed time `t` from an
+/// initial amount `a0` deposited in compartment `cmt` (1-based) at t=0, for an
+/// analytical model. Reuses the generic single-dose closed forms with
+/// `T = f64` and `F = 1` (an initial condition is not an absorbed dose, so
+/// bioavailability does not apply).
+///
+/// Supported compartments are the **central** compartment (IV-bolus impulse)
+/// and, for oral models, the **depot** (first-order absorption of the
+/// pre-loaded amount). Peripheral-compartment initial amounts need the
+/// cross-compartment Green's function and are rejected at parse time, so this
+/// returns 0 for any other `cmt` defensively.
+fn analytical_init_concentration(
+    pk_model: PkModel,
+    cmt: usize,
+    a0: f64,
+    t: f64,
+    p: &PkParams,
+) -> f64 {
+    use crate::sens::one_cpt::{one_cpt_iv_bolus_g, one_cpt_oral_g};
+    use crate::sens::three_cpt::{three_cpt_iv_bolus_g, three_cpt_oral_g};
+    use crate::sens::two_cpt::{two_cpt_iv_bolus_g, two_cpt_oral_g};
+
+    let (cl, v) = (p.cl(), p.v());
+    // Central is cmt 2 for oral models (depot is cmt 1), cmt 1 for IV models.
+    let central = if pk_model.is_oral() { 2 } else { 1 };
+
+    if cmt == central {
+        // IV-bolus impulse directly into the central compartment.
+        match pk_model {
+            PkModel::OneCptIv | PkModel::OneCptOral => one_cpt_iv_bolus_g::<f64>(a0, t, cl, v),
+            PkModel::TwoCptIv | PkModel::TwoCptOral => {
+                two_cpt_iv_bolus_g::<f64>(a0, t, cl, v, p.q(), p.v2())
+            }
+            PkModel::ThreeCptIv | PkModel::ThreeCptOral => {
+                three_cpt_iv_bolus_g::<f64>(a0, t, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+            }
+        }
+    } else if pk_model.is_oral() && cmt == 1 {
+        // Pre-loaded depot amount: first-order absorption into central, F=1.
+        match pk_model {
+            PkModel::OneCptOral => one_cpt_oral_g::<f64>(a0, t, cl, v, p.ka(), 1.0),
+            PkModel::TwoCptOral => two_cpt_oral_g::<f64>(a0, t, cl, v, p.q(), p.v2(), p.ka(), 1.0),
+            PkModel::ThreeCptOral => {
+                three_cpt_oral_g::<f64>(a0, t, cl, v, p.q(), p.v2(), p.q3(), p.v3(), p.ka(), 1.0)
+            }
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    }
+}
+
 /// Validate that every observed CMT in the population has an entry in
 /// the model's `ScalingSpec::PerCmt` map (or any nested `OdeReadout::PerCmt`
 /// readout for ODE models). Called once at the top of `fit()` so missing
@@ -395,6 +532,29 @@ pub fn predict_iov(
             model.pk_model
         )
     };
+
+    // Analytical initial-compartment amounts (#521), layered on before scaling —
+    // same insertion point as the non-IOV `compute_predictions_with_tv_*` path.
+    // Needed here too because IMP (and any IOV-aware likelihood) predicts through
+    // `predict_iov`; without it the baseline subjects would be mispredicted and
+    // their importance weights collapse. No-op for ODE models and init-free
+    // models. Init expressions reference BSV parameters, so `eta_bsv` drives the
+    // baseline *amount*; the *decay* kernel uses the per-occasion `obs_params`
+    // (which carry each observation's occasion kappa + TV covariates), so an
+    // IOV-on-disposition baseline decays at the occasion-correct rate rather than
+    // the kappa-less BSV rate (issue #521 review).
+    if !model.analytical_init.is_empty() && model.ode_spec.is_none() {
+        let amount_pk = (model.pk_param_fn)(theta, eta_bsv, &subject.covariates);
+        add_analytical_init_with(
+            model,
+            subject,
+            theta,
+            eta_bsv,
+            &amount_pk,
+            Some(&obs_params),
+            &mut preds,
+        );
+    }
 
     // `[scaling]` post-multiply, applied **per occasion** so a κ-dependent scale
     // (or a scale referencing a κ-dependent individual parameter) uses that
@@ -1018,7 +1178,16 @@ pub fn compute_predictions_with_states(
         // TV covariates); states via predict_all_states (superposition only — valid
         // for the no-reset, no-TV case).
         let ipred = compute_predictions_with_tv(model, subject, theta, eta);
-        let states = if subject.has_resets() {
+        let states = if !model.analytical_init.is_empty() {
+            // [initial_conditions] baseline (#521): ipred is init-aware (the
+            // closed-form baseline is layered onto the central readout), but the
+            // superposition state reconstruction does not yet seed the baseline
+            // amount into the compartment vectors. Reporting states without the
+            // baseline would disagree with ipred. Return outer-empty → NaN
+            // compartments, matching the reset/TV/IOV convention.
+            // W_DERIVED_INIT_ANALYTICAL explains why.
+            vec![]
+        } else if subject.has_resets() {
             // Superposition is invalid across resets; return outer-empty vec so
             // compartments[i] → NaN via the .unwrap_or(&[]) fallback. Consistent
             // with the IOV convention. W_DERIVED_CMT_RESET_ANALYTICAL explains why.
@@ -1334,6 +1503,12 @@ pub fn compute_predictions_with_tv_into_with_schedule(
         compute_predictions(model.pk_model, &resolved, &pk)
     };
 
+    // Analytical initial-compartment amounts (issue #521): layer the closed-form
+    // init impulse onto the dose-driven prediction BEFORE scaling, so a
+    // `[scaling]` divisor applies to the dose+init total. No-op for ODE models
+    // (seeded via `init_fn`) and when no `[initial_conditions]` block is present.
+    add_analytical_init(model, subject, theta, eta, &mut preds);
+
     // `[scaling]` post-multiply. Single insertion point covers FOCE/FOCEI,
     // GN, trust-region, SAEM, and IOV — they all route through here.
     // Form C (ODE `y = <expr>`) is already applied inside `ode_predictions*`
@@ -1364,6 +1539,56 @@ mod tests {
         p.values[0] = cl;
         p.values[1] = v;
         p
+    }
+
+    // ── analytical [initial_conditions] (issue #521) ──
+
+    #[test]
+    fn analytical_init_central_one_cpt_iv_is_bolus_decay() {
+        // An initial amount A₀ in the central compartment of a 1-cpt model
+        // decays as the IV-bolus impulse: C(t) = (A₀/V)·exp(-(CL/V)·t).
+        let (cl, v, a0) = (2.0_f64, 10.0_f64, 500.0_f64);
+        let p = make_pk_params(cl, v);
+        for &t in &[0.0_f64, 1.0, 5.0, 24.0] {
+            let got = analytical_init_concentration(PkModel::OneCptIv, 1, a0, t, &p);
+            let expected = (a0 / v) * (-(cl / v) * t).exp();
+            assert_relative_eq!(got, expected, max_relative = 1e-12);
+        }
+    }
+
+    #[test]
+    fn analytical_init_central_oral_uses_cmt2_and_ignores_ka() {
+        // For an oral model, `central` is cmt 2 and the init is a direct IV
+        // bolus into central — KA must not enter (the amount is already there,
+        // not absorbed through the depot). So it matches the 1-cpt decay and is
+        // independent of KA.
+        let (cl, v, a0) = (3.0_f64, 20.0_f64, 250.0_f64);
+        let mut p = make_pk_params(cl, v);
+        p.values[crate::types::PK_IDX_KA] = 1.7;
+        let mut p_other_ka = p;
+        p_other_ka.values[crate::types::PK_IDX_KA] = 0.3;
+        let t = 4.0;
+        let got = analytical_init_concentration(PkModel::OneCptOral, 2, a0, t, &p);
+        let got_other = analytical_init_concentration(PkModel::OneCptOral, 2, a0, t, &p_other_ka);
+        let expected = (a0 / v) * (-(cl / v) * t).exp();
+        assert_relative_eq!(got, expected, max_relative = 1e-12);
+        assert_relative_eq!(got, got_other, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn analytical_init_depot_oral_absorbs_through_ka() {
+        // An init amount pre-loaded in the depot (cmt 1) of an oral model is
+        // absorbed first-order with F=1, i.e. the oral closed form with D=A₀.
+        let (cl, v, ka, a0) = (3.0_f64, 20.0_f64, 1.1_f64, 100.0_f64);
+        let mut p = make_pk_params(cl, v);
+        p.values[crate::types::PK_IDX_KA] = ka;
+        let t = 2.0;
+        let got = analytical_init_concentration(PkModel::OneCptOral, 1, a0, t, &p);
+        let expected = crate::sens::one_cpt::one_cpt_oral_g::<f64>(a0, t, cl, v, ka, 1.0);
+        assert_relative_eq!(got, expected, max_relative = 1e-12);
+        // At t=0 nothing has absorbed yet → zero central concentration.
+        let at0 = analytical_init_concentration(PkModel::OneCptOral, 1, a0, 0.0, &p);
+        assert_relative_eq!(at0, 0.0, epsilon = 1e-12);
     }
 
     #[test]
@@ -1673,6 +1898,7 @@ mod tests {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         }
     }
 

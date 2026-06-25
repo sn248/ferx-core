@@ -1,4 +1,4 @@
-use crate::types::{CompiledModel, EstimationMethod, GradientMethod, Optimizer};
+use crate::types::{CompiledModel, EstimationMethod, Optimizer};
 
 /// Compile-time build metadata embedded by `build.rs`.
 pub struct BuildInfo {
@@ -108,23 +108,20 @@ pub fn gradient_method_outer(
         EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
             GradientMethodKind::FiniteDifferences
         }
-        EstimationMethod::Foce | EstimationMethod::FoceI => match optimizer {
+        EstimationMethod::Foce | EstimationMethod::FoceI => match optimizer.resolve_auto(model) {
             Optimizer::Bobyqa => GradientMethodKind::NotApplicable,
-            Optimizer::Bfgs
+            // `Auto` is resolved above; only its concrete results reach here.
+            Optimizer::Auto
+            | Optimizer::Bfgs
             | Optimizer::Lbfgs
             | Optimizer::Slsqp
             | Optimizer::NloptLbfgs
             | Optimizer::Mma
             | Optimizer::TrustRegion => {
-                let user_forces_fd = matches!(model.gradient_method, GradientMethod::Fd);
-                // Mirror the live outer dispatch (`outer_optimizer.rs`), which gates the
-                // analytic IOV outer gradient on `iov_sens_supported` (it admits ODE IOV
-                // models too, not just the closed-form `iov_analytical_supported`); so the
-                // reported `gradient_method` tracks what the fit actually runs (#466 review #4).
-                let analytic = !user_forces_fd
-                    && (crate::sens::provider::sens_supported(model)
-                        || crate::sens::provider::iov_sens_supported(model));
-                if analytic {
+                // Shared predicate (#490) — now IOV-aware via `iov_sens_supported`, which
+                // admits ODE IOV models too, so the reported method tracks the live outer
+                // dispatch (`outer_optimizer.rs`) for IOV as well (#466 review #4 / #439 IOV).
+                if crate::sens::provider::analytic_outer_gradient_available(model) {
                     GradientMethodKind::Analytic
                 } else {
                     GradientMethodKind::FiniteDifferences
@@ -138,6 +135,7 @@ pub fn gradient_method_outer(
 mod tests {
     use super::*;
     use crate::types::test_helpers;
+    use crate::types::GradientMethod;
 
     fn ad_build() -> BuildInfo {
         BuildInfo {

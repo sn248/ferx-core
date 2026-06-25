@@ -250,8 +250,13 @@ Notes and constraints:
 - The named eta must be a dedicated `omega` not shared with a structural
   individual parameter.
 - Not supported with per-CMT (multi-endpoint) error models.
-- Models with `iiv_on_ruv` are routed to finite-difference gradients (the
-  analytic `Dual2` gradient kernel does not carry the variance-scaling rule).
+- **Exact analytic FOCE/FOCEI gradient.** For analytical 1-/2-/3-cpt, **ODE
+  (`[odes]`)**, and **LTBS (`log_additive`)** models, `iiv_on_ruv` fits use the
+  exact outer θ/Ω/σ gradient — the residual-eta enters through the variance scale
+  `exp(2·ETA_RUV)`, contributing the Almquist interaction column to `H̃` and the
+  matching `∂NLL/∂η_ruv = Σ(1−ε²/v)` data term. The inner EBE gradient is analytic
+  too except under LTBS, where it keeps finite differences (the established LTBS
+  choice). IOV and M3-BLOQ `iiv_on_ruv` models keep the finite-difference gradient.
 
 **Identifiability.** A residual-error random effect is a *variance-of-variance*
 term and is only weakly identified when the data carry little per-subject

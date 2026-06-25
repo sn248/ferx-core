@@ -38,8 +38,8 @@ use super::one_cpt::one_cpt_conc_g;
 use super::three_cpt::three_cpt_conc_g;
 use super::two_cpt::two_cpt_conc_g;
 use crate::types::{
-    CompiledModel, DoseEvent, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_F, PK_IDX_KA,
-    PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
+    CompiledModel, DoseEvent, GradientMethod, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_F,
+    PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
 };
 
 /// Exact sensitivities of one observation w.r.t. η and θ. Hessian-shaped fields
@@ -211,6 +211,12 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
         && model.tv_fn.is_some()
         && model.n_kappa == 0
         && scaling_supported(model)
+        // Initial-compartment amounts (`[initial_conditions]`, #521) are added to
+        // the prediction by `pk::add_analytical_init` but the Dual2 sensitivity
+        // kernels here do not yet carry the init impulse or its θ/η dependence, so
+        // a model with one falls back to FD (correct, just slower). Phase 2 lifts
+        // this once the `*_init_g` differentiable forms land.
+        && model.analytical_init.is_empty()
         // Every individual-parameter slot must be one we differentiate. A
         // LAGTIME (slot 8) routes to fall back.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
@@ -265,6 +271,42 @@ fn scaling_supported(model: &CompiledModel) -> bool {
 pub fn sens_supported(model: &CompiledModel) -> bool {
     analytical_supported(model)
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model))
+}
+
+/// Whether the exact analytic **outer** (population) FOCE/FOCEI gradient is
+/// available for `model`: it is in the sensitivity provider's scope (non-IOV
+/// [`sens_supported`] or [`iov_analytical_supported`]) and the user did not
+/// force finite differences via `gradient_method = fd`.
+///
+/// Single source of truth for the analytic-vs-FD outer-gradient decision. The
+/// outer-loop gradient dispatch (`outer_optimizer::population_gradient`),
+/// [`Optimizer::resolve_auto`](crate::types::Optimizer::resolve_auto), and
+/// `build_info::gradient_method_outer` all consult this so the `auto` optimizer
+/// can never resolve to a gradient-based optimizer while the loop actually
+/// computes an FD gradient (a drift that would run a gradient optimizer on a
+/// noisy FD gradient). The per-eval `reconverge_gradient_interval` override is
+/// orthogonal and handled at the dispatch site, not here.
+///
+/// TTE (`[event_model]`) endpoints are excluded: the hazard log-likelihood has no
+/// analytic outer gradient (the sensitivity provider only covers the structural
+/// PK/PD model), so a TTE — or mixed PK+TTE — objective must be differentiated by
+/// finite differences. Without this guard a TTE model would report an analytic
+/// gradient it cannot supply, so `resolve_auto` would pick a gradient-based
+/// optimizer that then stalls on a meaningless gradient (TTE is FD-only — see
+/// `docs/estimation/tte.qmd`).
+pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
+    !matches!(model.gradient_method, GradientMethod::Fd)
+        && !model.has_tte()
+        // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
+        // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
+        && (sens_supported(model) || iov_sens_supported(model))
+        // IIV on residual error (#474): the analytic gradient (inner η-column +
+        // outer θ/Ω/σ variance terms) is provider-agnostic, so it serves the
+        // closed-form AND ODE paths. IOV and M3-BLOQ `iiv_on_ruv` keep the FD
+        // gradient on BOTH loops — the IOV inner gradient does not carry the
+        // variance scaling, and the residual-eta censored second derivatives are
+        // not assembled.
+        && !model.iiv_on_ruv_forces_fd()
 }
 
 /// Whether the light **ODE inner** η-gradient (`Dual1`) serves this model+subject:
@@ -543,6 +585,11 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
         return false;
     }
     if !matches!(model.scaling, ScalingSpec::None) || model.log_transform || model.has_lagtime() {
+        return false;
+    }
+    // Initial-compartment amounts (#521) are not yet differentiated by the
+    // analytic kernels — fall back to FD (see `analytical_supported`).
+    if !model.analytical_init.is_empty() {
         return false;
     }
     let n_eff = model.n_eta + model.n_kappa;
@@ -1787,8 +1834,14 @@ fn subject_eta_grad_impl(
         .as_ref()
         .filter(|prog| prog_covers_required_pk_slots(model, prog))
         .and_then(|prog| {
-            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
-                .map(|pd| (pd.dp_deta, prog.pk_slots()))
+            // Light `Dual1<n_eta>` η-gradient: the inner EBE loop consumes only
+            // `∂p/∂η`, so seeding η alone avoids the θ-axes and second-order
+            // Hessian the full `Dual2` `param_derivatives_from_prog` carries (#485
+            // follow-up).
+            crate::sens::ode_provider::param_eta_derivatives_from_prog(
+                prog, model, subject, theta, eta,
+            )
+            .map(|dp_deta| (dp_deta, prog.pk_slots()))
         }) {
         Some(v) => v,
         None => {
@@ -2800,8 +2853,66 @@ mod tests {
     use super::*;
     use crate::parser::model_parser::parse_model_string;
     use crate::pk::compute_predictions_with_tv;
-    use crate::types::{DoseEvent, Subject};
+    use crate::types::{test_helpers, DoseEvent, Subject};
     use std::collections::HashMap;
+
+    #[test]
+    fn analytic_outer_gradient_available_tracks_scope_and_fd() {
+        // Analytical PK model with `gradient = auto` → analytic outer gradient.
+        assert!(analytic_outer_gradient_available(
+            &test_helpers::analytical_model(GradientMethod::Auto)
+        ));
+        // `gradient = fd` forces FD even for an analytical model.
+        assert!(!analytic_outer_gradient_available(
+            &test_helpers::analytical_model(GradientMethod::Fd)
+        ));
+        // An ODE model is outside the analytic scope.
+        assert!(!analytic_outer_gradient_available(
+            &test_helpers::ode_model(GradientMethod::Auto)
+        ));
+        // A closed-form `iiv_on_ruv` model is analytic (#474)…
+        let mut ruv = test_helpers::analytical_model(GradientMethod::Auto);
+        ruv.residual_error_eta = Some(0);
+        assert!(analytic_outer_gradient_available(&ruv));
+        // …but M3 BLOQ + `iiv_on_ruv` falls back to FD (no censored residual-eta
+        // second derivatives are assembled).
+        let mut ruv_m3 = test_helpers::analytical_model(GradientMethod::Auto);
+        ruv_m3.residual_error_eta = Some(0);
+        ruv_m3.bloq_method = crate::types::BloqMethod::M3;
+        assert!(!analytic_outer_gradient_available(&ruv_m3));
+    }
+
+    /// A TTE (`[event_model]`) objective has no analytic outer gradient (the
+    /// provider only covers the structural PK/PD model), so the predicate must be
+    /// `false` even with `gradient = auto` — and `resolve_auto` must therefore
+    /// pick the derivative-free Bobyqa, not a gradient-based optimizer that would
+    /// stall on a gradient TTE cannot supply (#490 auto-optimizer × TTE).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn analytic_outer_gradient_unavailable_for_tte() {
+        use crate::types::Optimizer;
+        const TTE: &str = r"
+[parameters]
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  omega ETA ~ 0.09
+
+[event_model e]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA)
+";
+        let m = parse_model_string(TTE).expect("TTE model must parse");
+        assert!(m.has_tte(), "model must register a TTE endpoint");
+        assert!(
+            !analytic_outer_gradient_available(&m),
+            "TTE objective is FD-only: no analytic outer gradient"
+        );
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m),
+            Optimizer::Bobyqa,
+            "auto must resolve to derivative-free Bobyqa for a TTE model"
+        );
+    }
 
     const WARFARIN: &str = r#"
 [parameters]

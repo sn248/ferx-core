@@ -128,6 +128,33 @@ struct Prep {
     /// `hrh`/`ctc` over quantified rows only and adds the censored `−logΦ` to the
     /// data term. Empty `Vec` (all-false) when the subject has no censoring.
     censored: Vec<bool>,
+    /// IIV-on-RUV (`Y = IPRED + EPS·EXP(η_ruv)`, #474): the random-effect index
+    /// that scales the residual variance by `exp(2·η_ruv)`, or `None`. When set,
+    /// the variance terms `r`/`d` in `et` already carry that factor, and the
+    /// `η_ruv` row/col of `H̃`/`H` plus its `log|H̃|` derivatives are assembled
+    /// from the per-observation `g_ruv`/`gp_ruv` scalars below.
+    ruv: Option<usize>,
+    /// `gⱼ = (∂Rⱼ/∂fⱼ)/Rⱼ = dⱼ/Rⱼ` per observation (scale-invariant) — the
+    /// residual-eta `c̃` cross coupling `H̃[ruv,l] = Σⱼ gⱼ a_{jl}`. Empty when no
+    /// `ruv`.
+    g_ruv: Vec<f64>,
+    /// `g'ⱼ = ∂gⱼ/∂fⱼ = d2ⱼ/Rⱼ − (dⱼ/Rⱼ)²` per observation (scale-invariant) — the
+    /// `f`-derivative of the `c̃` coupling, needed for `∂log|H̃|/∂θ` and `/∂η`.
+    /// Empty when no `ruv`.
+    gp_ruv: Vec<f64>,
+    /// `exp(2·η̂_ruv)` (1.0 when no `ruv`) — the residual-variance scale, used to
+    /// lift the σ-block's central-FD `∂R/∂σ` / `∂d/∂σ` (taken on the *unscaled*
+    /// error functions) onto the scaled variance.
+    ruv_scale: f64,
+}
+
+/// Residual-eta coupling `κⱼ = ∂(1−ε²/R)/∂f = 2ε/R + ε²d/R²` — the `f`-derivative
+/// of the residual-eta data gradient, used in the mixed η-θ block and the true
+/// inner Hessian's residual-eta row (#474). Single source so the two assemblies
+/// can't diverge.
+#[inline]
+fn ruv_kappa(eps: f64, r: f64, d: f64) -> f64 {
+    2.0 * eps / r + eps * eps * d / (r * r)
 }
 
 fn prepare(
@@ -135,6 +162,7 @@ fn prepare(
     subject: &Subject,
     params: &ModelParameters,
     sens: &SubjectSens,
+    eta_hat: &[f64],
 ) -> Option<Prep> {
     prepare_stacked(
         model,
@@ -143,6 +171,8 @@ fn prepare(
         sens,
         model.n_eta,
         params.omega.inv.clone(),
+        eta_hat,
+        model.residual_error_eta,
     )
 }
 
@@ -151,6 +181,7 @@ fn prepare(
 /// and the **IOV** path, where the random effects are the stacked
 /// `[η_bsv, κ₁..κ_K]` and `omega_inv` is the inverse of the block-diagonal
 /// `Ω_bsv ⊕ K·Ω_iov`. Everything else (error model, σ, censoring) is shared.
+#[allow(clippy::too_many_arguments)]
 fn prepare_stacked(
     model: &CompiledModel,
     subject: &Subject,
@@ -158,6 +189,8 @@ fn prepare_stacked(
     sens: &SubjectSens,
     n_eta: usize,
     omega_inv: DMatrix<f64>,
+    eta_hat: &[f64],
+    ruv: Option<usize>,
 ) -> Option<Prep> {
     let n_obs = subject.observations.len();
     // A dosing-only subject (dose rows, no DV) contributes no data term to the
@@ -173,11 +206,31 @@ fn prepare_stacked(
         return None;
     }
     let sigma = &params.sigma.values;
+    // IIV-on-RUV (#474): every residual variance scales by `s = exp(2·η̂_ruv)`, so
+    // `r`/`d`/`d2` carry that factor below. `η_ruv` enters the likelihood only
+    // through the variance (`∂f/∂η_ruv = 0`), contributing the `c̃` interaction
+    // column `c̃_{j,ruv} = 2` to `H̃` (Almquist), the true-Hessian terms
+    // `∂²lᵢ/∂η_ruv² = Σ 2ε²/R`, `∂²lᵢ/∂η_ruv∂η_l = Σ κⱼ a_{jl}`, and the matching
+    // `log|H̃|` derivatives. (M3 BLOQ + `iiv_on_ruv` routes to FD upstream, so no
+    // censored residual-eta second derivatives are needed here.)
+    // Reuse the canonical `exp(2·η_ruv)` link (the IOV path forces `ruv = None`
+    // to keep its residual variance unscaled, so gate on the local `ruv`, not on
+    // `model.residual_error_eta`).
+    let ruv_scale = if ruv.is_some() {
+        model.residual_var_scale(eta_hat)
+    } else {
+        1.0
+    };
 
     // H̃ = Σ pⱼ aⱼaⱼᵀ + Ω⁻¹ ; true inner Hessian H = ½Σ(α'ⱼ aⱼaⱼᵀ + αⱼ Aⱼ) + Ω⁻¹.
     let mut htilde = omega_inv.clone();
     let mut h_inner = omega_inv.clone();
     let mut et: Vec<ErrTerms> = Vec::with_capacity(n_obs);
+    let (mut g_ruv, mut gp_ruv) = if ruv.is_some() {
+        (vec![0.0f64; n_obs], vec![0.0f64; n_obs])
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
     let mut censored = vec![false; n_obs];
@@ -187,18 +240,26 @@ fn prepare_stacked(
         // obs index → cmt: provider obs are parallel to subject.obs_times.
         let j = et.len();
         let cmt = subject.obs_cmts[j];
-        let r = model.error_spec.variance_at(cmt, f, sigma);
+        let r = model.error_spec.variance_at(cmt, f, sigma) * ruv_scale;
         if !(r.is_finite() && r > 0.0) {
             return None;
         }
-        let d = model.error_spec.dvar_df(cmt, f, sigma);
-        let d2 = model.error_spec.d2var_df2(cmt, sigma);
+        let d = model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale;
+        let d2 = model.error_spec.d2var_df2(cmt, sigma) * ruv_scale;
         let y = subject.observations[j];
         let is_cens = m3 && subject.cens.get(j).copied().unwrap_or(0) != 0;
         // For a censored row the data term is `−logΦ(z)`: store its f-derivatives
         // as `alpha = 2·g1`, `alpha_p = 2·g2` (so the assembly's `½α`, `½α'` recover
         // `∂L/∂f`, `∂²L/∂f²`) and force `p = β = 0` (excluded from `H̃` / `log|H̃|`).
         let t = if is_cens {
+            // M3 + `iiv_on_ruv` routes to FD upstream (`analytic_outer_gradient_
+            // available`), so `is_cens` and `ruv` never co-occur on a reachable call.
+            // `r`/`d`/`d2` here carry `ruv_scale`; if a future caller bypassed the
+            // gate, the censored scalars would get a doubly-applied scale — pin it.
+            debug_assert!(
+                ruv.is_none(),
+                "M3 censoring with iiv_on_ruv must route to FD (gate bypassed)"
+            );
             censored[j] = true;
             any_cens = true;
             let (g1, g2) = m3_censored_scalars(y, f, r, d, d2);
@@ -221,6 +282,28 @@ fn prepare_stacked(
                 htilde[(k, l)] += t.p * a[k] * a[l];
                 h_inner[(k, l)] +=
                     0.5 * (t.alpha_p * a[k] * a[l] + t.alpha * obs.d2f_deta2[k * n_eta + l]);
+            }
+        }
+        // Residual-eta rows/cols (`a_{j,ruv} = 0`, so the loop above left them at
+        // their `Ω⁻¹` value). `c̃_{j,ruv} = 2` ⇒ `½ c̃ c̃ᵀ` gives `H̃[ruv,ruv] += 2`
+        // and `H̃[ruv,l] += gⱼ a_{jl}` (`gⱼ = dⱼ/Rⱼ`); the true Hessian gets
+        // `H[ruv,ruv] += 2ε²/R` and `H[ruv,l] += κⱼ a_{jl}`.
+        if let Some(rr) = ruv {
+            let eps = t.eps;
+            let g = t.d / t.r;
+            g_ruv[j] = g;
+            gp_ruv[j] = d2 / t.r - g * g;
+            let kappa = ruv_kappa(eps, t.r, t.d);
+            htilde[(rr, rr)] += 2.0;
+            h_inner[(rr, rr)] += 2.0 * eps * eps / t.r;
+            for l in 0..n_eta {
+                if l == rr {
+                    continue;
+                }
+                htilde[(rr, l)] += g * a[l];
+                htilde[(l, rr)] += g * a[l];
+                h_inner[(rr, l)] += kappa * a[l];
+                h_inner[(l, rr)] += kappa * a[l];
             }
         }
         et.push(t);
@@ -253,6 +336,27 @@ fn prepare_stacked(
         }
         g_eta[l] = s;
     }
+    // Residual-eta `log|H̃|` derivative. The loop above (using `∂p/∂f` and `a_{ruv}
+    // = A_{·,ruv} = 0`) left the `c̃`-column contribution out. Add, per quant obs:
+    //   ordinary l: 2( g'ⱼ wⱼ[ruv] a_{jl} + gⱼ Σₖ H̃⁻¹_{ruv,k} A_{jkl} )
+    //   l = ruv:    −2 qⱼ/Rⱼ  (`∂p/∂η_ruv = −2/R`; the `c̃[ruv,ruv]=2` is constant)
+    if let Some(rr) = ruv {
+        for (j, obs) in sens.obs.iter().enumerate() {
+            let wjr = w[j][rr];
+            let (g, gp) = (g_ruv[j], gp_ruv[j]);
+            for l in 0..n_eta {
+                if l == rr {
+                    continue;
+                }
+                let mut sa = 0.0;
+                for k in 0..n_eta {
+                    sa += htilde_inv[(rr, k)] * obs.d2f_deta2[k * n_eta + l];
+                }
+                g_eta[l] += 2.0 * (gp * wjr * obs.df_deta[l] + g * sa);
+            }
+            g_eta[rr] += -2.0 * q[j] / et[j].r;
+        }
+    }
 
     Some(Prep {
         n_eta,
@@ -265,6 +369,10 @@ fn prepare_stacked(
         q,
         g_eta,
         censored,
+        ruv,
+        g_ruv,
+        gp_ruv,
+        ruv_scale,
     })
 }
 
@@ -284,7 +392,7 @@ pub fn subject_theta_gradient(
         return Some(vec![0.0; params.theta.len()]);
     }
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
-    let prep = prepare(model, subject, params, &sens)?;
+    let prep = prepare(model, subject, params, &sens, eta_hat)?;
     Some(theta_block(&prep, &sens, params.theta.len()))
 }
 
@@ -303,8 +411,19 @@ fn theta_block(prep: &Prep, sens: &SubjectSens, n_theta: usize) -> Vec<f64> {
             }
             g += prep.et[j].p * curv;
         }
+        // Residual-eta `log|H̃|` θ-derivative (`∂(c̃-column)/∂θ`), per quant obs:
+        //   gⱼ' bⱼₘ wⱼ[ruv] + gⱼ Σ_l H̃⁻¹_{ruv,l} B_{jlm}   (B = ∂²f/∂η∂θ).
+        if let Some(rr) = prep.ruv {
+            for (j, obs) in sens.obs.iter().enumerate() {
+                let mut sb = 0.0;
+                for l in 0..n_eta {
+                    sb += prep.htilde_inv[(rr, l)] * obs.d2f_deta_dtheta[l * n_theta + m];
+                }
+                g += prep.gp_ruv[j] * obs.df_dtheta[m] * prep.w[j][rr] + prep.g_ruv[j] * sb;
+            }
+        }
         // EBE response: ½ g_eta · dη̂/dθₘ,  dη̂/dθₘ = −H⁻¹ M[:,m].
-        let m_vec = mixed_eta_theta(&sens.obs, &prep.et, n_eta, n_obs, m);
+        let m_vec = mixed_eta_theta(&sens.obs, &prep.et, n_eta, n_obs, m, prep.ruv);
         let deta = -(&prep.h_inner_inv * m_vec);
         let mut resp = 0.0;
         for l in 0..n_eta {
@@ -348,7 +467,16 @@ pub fn subject_theta_gradient_iov(
         k_groups,
     );
     let omega_inv = block.cholesky()?.inverse();
-    let prep = prepare_stacked(model, subject, params, &sens, n_stacked, omega_inv)?;
+    let prep = prepare_stacked(
+        model,
+        subject,
+        params,
+        &sens,
+        n_stacked,
+        omega_inv,
+        stacked_eta_hat,
+        None,
+    )?;
     Some(theta_block(&prep, &sens, params.theta.len()))
 }
 
@@ -374,7 +502,7 @@ pub fn subject_omega_gradient(
         return Some(vec![0.0; n]);
     }
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
-    let prep = prepare(model, subject, params, &sens)?;
+    let prep = prepare(model, subject, params, &sens, eta_hat)?;
     Some(omega_block(&prep, params, eta_hat))
 }
 
@@ -433,7 +561,7 @@ pub fn subject_sigma_gradient(
         return Some(vec![0.0; params.sigma.values.len()]);
     }
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
-    let prep = prepare(model, subject, params, &sens)?;
+    let prep = prepare(model, subject, params, &sens, eta_hat)?;
     Some(sigma_block(&prep, model, subject, params, &sens))
 }
 
@@ -508,13 +636,16 @@ fn sigma_block(
                 continue;
             }
             let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
-            // ∂R/∂σ_k, ∂d/∂σ_k by central FD of the closed-form error functions.
-            let r_sig = (model.error_spec.variance_at(cmt, f, &sp)
-                - model.error_spec.variance_at(cmt, f, &sm))
-                / (2.0 * h);
-            let d_sig = (model.error_spec.dvar_df(cmt, f, &sp)
-                - model.error_spec.dvar_df(cmt, f, &sm))
-                / (2.0 * h);
+            // Evaluate the four closed-form error functions once at σ±h and reuse
+            // them for `r_sig`/`d_sig` and the residual-eta `g_sig` below.
+            let vp = model.error_spec.variance_at(cmt, f, &sp);
+            let vm = model.error_spec.variance_at(cmt, f, &sm);
+            let dp_var = model.error_spec.dvar_df(cmt, f, &sp);
+            let dm_var = model.error_spec.dvar_df(cmt, f, &sm);
+            // ∂R/∂σ_k, ∂d/∂σ_k by central FD. `et.r`/`et.d` carry the `exp(2·η_ruv)`
+            // scale, so lift these too.
+            let r_sig = prep.ruv_scale * (vp - vm) / (2.0 * h);
+            let d_sig = prep.ruv_scale * (dp_var - dm_var) / (2.0 * h);
 
             let inv_r = 1.0 / r;
             let inv_r2 = inv_r * inv_r;
@@ -531,6 +662,16 @@ fn sigma_block(
                 + ((r - eps * eps) * inv_r2) * d_sig;
             for m in 0..n_eta {
                 m_vec[m] += 0.5 * dalpha * obs.df_deta[m];
+            }
+            // Residual-eta terms (#474). `∂R/∂σ` scales `R`, so:
+            //   M[ruv] = ∂(1−ε²/R)/∂σ = ε²/R² · Rσ   (the residual-eta row of M)
+            //   ∂log|H̃|/∂σ gains  (∂gⱼ/∂σ)·wⱼ[ruv]  with `gⱼ = d/R` (scale-free,
+            //     so FD the unscaled quotient directly).
+            if let Some(rr) = prep.ruv {
+                m_vec[rr] += eps * eps * inv_r2 * r_sig;
+                // `gⱼ = d/R` is scale-free, so FD the unscaled quotient directly.
+                let g_sig = (dp_var / vp - dm_var / vm) / (2.0 * h);
+                fixed += g_sig * prep.w[j][rr];
             }
         }
 
@@ -677,7 +818,16 @@ pub fn subject_packed_gradient_iov(
         k,
     );
     let omega_inv = block.cholesky()?.inverse();
-    let prep = prepare_stacked(model, subject, &params, &sens, n_stacked, omega_inv)?;
+    let prep = prepare_stacked(
+        model,
+        subject,
+        &params,
+        &sens,
+        n_stacked,
+        omega_inv,
+        stacked_eta_hat,
+        None,
+    )?;
 
     let n_theta = params.theta.len();
     let n_sigma = params.sigma.values.len();
@@ -747,7 +897,7 @@ pub fn subject_packed_gradient(
     // FD via `iov_analytical_supported`.
     let params = unpack_params(x, template);
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
-    let prep = prepare(model, subject, &params, &sens)?;
+    let prep = prepare(model, subject, &params, &sens, eta_hat)?;
 
     let n_theta = params.theta.len();
     let n_sigma = params.sigma.values.len();
@@ -1252,7 +1402,16 @@ pub fn subject_eta_dx_iov(
         k,
     );
     let omega_inv = block.cholesky()?.inverse();
-    let prep = prepare_stacked(model, subject, &params, &sens, n_st, omega_inv)?;
+    let prep = prepare_stacked(
+        model,
+        subject,
+        &params,
+        &sens,
+        n_st,
+        omega_inv,
+        stacked_eta_hat,
+        None,
+    )?;
     let n_theta = params.theta.len();
     let n_sigma = params.sigma.values.len();
     let mut out: Vec<DVector<f64>> = vec![DVector::zeros(n_st); x.len()];
@@ -1264,7 +1423,7 @@ pub fn subject_eta_dx_iov(
         } else {
             1.0
         };
-        let mvec = mixed_eta_theta(&sens.obs, &prep.et, n_st, prep.n_obs, m);
+        let mvec = mixed_eta_theta(&sens.obs, &prep.et, n_st, prep.n_obs, m, prep.ruv);
         out[m] = -(&prep.h_inner_inv * mvec) * dtheta_dx;
     }
 
@@ -1536,7 +1695,7 @@ pub fn subject_eta_dx(
     }
     let params = unpack_params(x, template);
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
-    let prep = prepare(model, subject, &params, &sens)?;
+    let prep = prepare(model, subject, &params, &sens, eta_hat)?;
     let n_eta = prep.n_eta;
     let n_theta = params.theta.len();
     let n_sigma = params.sigma.values.len();
@@ -1549,7 +1708,7 @@ pub fn subject_eta_dx(
         } else {
             1.0
         };
-        let mvec = mixed_eta_theta(&sens.obs, &prep.et, n_eta, prep.n_obs, m);
+        let mvec = mixed_eta_theta(&sens.obs, &prep.et, n_eta, prep.n_obs, m, prep.ruv);
         out[m] = -(&prep.h_inner_inv * mvec) * dtheta_dx;
     }
 
@@ -1616,11 +1775,14 @@ pub fn subject_eta_dx(
                 continue;
             }
             let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
-            let r_sig = (model.error_spec.variance_at(cmt, f, &sp)
-                - model.error_spec.variance_at(cmt, f, &sm))
+            // `et.r`/`et.d` carry the `exp(2·η_ruv)` scale, so lift `∂R/∂σ`,`∂d/∂σ`
+            // too (mirrors `sigma_block`); `ruv_scale == 1` when there is no ruv.
+            let r_sig = prep.ruv_scale
+                * (model.error_spec.variance_at(cmt, f, &sp)
+                    - model.error_spec.variance_at(cmt, f, &sm))
                 / (2.0 * h);
-            let d_sig = (model.error_spec.dvar_df(cmt, f, &sp)
-                - model.error_spec.dvar_df(cmt, f, &sm))
+            let d_sig = prep.ruv_scale
+                * (model.error_spec.dvar_df(cmt, f, &sp) - model.error_spec.dvar_df(cmt, f, &sm))
                 / (2.0 * h);
             let inv_r = 1.0 / r;
             let inv_r2 = inv_r * inv_r;
@@ -1629,6 +1791,10 @@ pub fn subject_eta_dx(
                 + ((r - eps * eps) * inv_r2) * d_sig;
             for m in 0..n_eta {
                 mvec[m] += 0.5 * dalpha * obs.df_deta[m];
+            }
+            // Residual-eta row of M (#474): `M[ruv] = ∂(1−ε²/R)/∂σ = ε²/R²·Rσ`.
+            if let Some(rr) = prep.ruv {
+                mvec[rr] += eps * eps * inv_r2 * r_sig;
             }
         }
         out[sigma_start + k] = -(&prep.h_inner_inv * mvec) * sigma[k];
@@ -1689,18 +1855,25 @@ pub fn predict_warm_etas(
         .collect()
 }
 
-/// `M[:,m] = ∂²lᵢ/∂η∂θₘ = ½ Σⱼ (α'ⱼ bⱼₘ aⱼ + αⱼ Bⱼ[:,m])`.
+/// `M[:,m] = ∂²lᵢ/∂η∂θₘ = ½ Σⱼ (α'ⱼ bⱼₘ aⱼ + αⱼ Bⱼ[:,m])`. With IIV-on-RUV the
+/// residual-eta row is `M[ruv,m] = Σⱼ κⱼ bⱼₘ`, `κⱼ = ∂(1−ε²/R)/∂f = 2ε/R + ε²d/R²`
+/// (the `f`-derivative of the residual-eta data gradient; `a_{ruv}=B_{ruv}=0`, so
+/// the main loop leaves that row at zero).
 fn mixed_eta_theta(
     obs: &[ObsSens],
     et: &[ErrTerms],
     n_eta: usize,
     n_obs: usize,
     m: usize,
+    ruv: Option<usize>,
 ) -> DVector<f64> {
     let n_theta_stride = obs[0].df_dtheta.len();
     let mut mk = DVector::zeros(n_eta);
     for j in 0..n_obs {
         let bjm = obs[j].df_dtheta[m];
+        if let Some(rr) = ruv {
+            mk[rr] += ruv_kappa(et[j].eps, et[j].r, et[j].d) * bjm;
+        }
         for k in 0..n_eta {
             let b2 = obs[j].d2f_deta_dtheta[k * n_theta_stride + m];
             mk[k] += 0.5 * (et[j].alpha_p * bjm * obs[j].df_deta[k] + et[j].alpha * b2);
@@ -2210,6 +2383,294 @@ mod tests {
         }
     }
 
+    /// Warfarin oral with a dedicated residual-error eta (`iiv_on_ruv`, #474).
+    /// `ETA_RUV` is the 4th declared omega (index 3) and is not used in any
+    /// individual parameter.
+    const WARFARIN_RUV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.10
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+"#;
+
+    /// Subject for an `iiv_on_ruv` model: predictions are independent of η_ruv, so
+    /// build realistic nonzero residuals from the structural etas and pad the eta
+    /// vector for the (prediction-irrelevant) residual eta.
+    fn ruv_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
+        let n = times.len();
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: times.to_vec(),
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let eta_ref = [0.12, -0.08, 0.2, 0.0];
+        let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, &eta_ref);
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        subject
+    }
+
+    /// Precise EBE for an `iiv_on_ruv` model: Newton on the *scaled* inner
+    /// objective (residual variance × `exp(2·η_ruv)`, plus the residual-eta
+    /// gradient `1−ε²/R` and Hessian `2ε²/R` / `κ a` terms), mirroring `prepare`'s
+    /// `H` so the marginal FD is not contaminated by inner-solver noise.
+    fn precise_ebe_ruv(
+        model: &CompiledModel,
+        subject: &Subject,
+        params: &ModelParameters,
+    ) -> Vec<f64> {
+        let warm = find_ebe(model, subject, params, 80, 1e-10, None, None);
+        let mut eta: Vec<f64> = warm.eta.iter().copied().collect();
+        let n_eta = model.n_eta;
+        let rr = model.residual_error_eta.expect("ruv model");
+        let sigma = &params.sigma.values;
+        let omega_inv = &params.omega.inv;
+        for _ in 0..50 {
+            let s = (2.0 * eta[rr]).exp();
+            let sens =
+                crate::sens::provider::subject_sensitivities(model, subject, &params.theta, &eta)
+                    .unwrap();
+            let mut grad = omega_inv * DVector::from_column_slice(&eta);
+            let mut hess = omega_inv.clone();
+            for (j, obs) in sens.obs.iter().enumerate() {
+                let f = obs.f;
+                let cmt = subject.obs_cmts[j];
+                let r = model.error_spec.variance_at(cmt, f, sigma) * s;
+                let d = model.error_spec.dvar_df(cmt, f, sigma) * s;
+                let d2 = model.error_spec.d2var_df2(cmt, sigma) * s;
+                let y = subject.observations[j];
+                let eps = y - f;
+                let t = err_terms(r, d, d2, eps);
+                let (g1, g2) = (0.5 * t.alpha, 0.5 * t.alpha_p);
+                let a = obs.df_deta.as_slice();
+                for k in 0..n_eta {
+                    grad[k] += g1 * a[k];
+                    for l in 0..n_eta {
+                        hess[(k, l)] += g2 * a[k] * a[l] + g1 * obs.d2f_deta2[k * n_eta + l];
+                    }
+                }
+                // Residual-eta gradient / Hessian (a_{ruv} = A_{·,ruv} = 0).
+                grad[rr] += 1.0 - eps * eps / r;
+                hess[(rr, rr)] += 2.0 * eps * eps / r;
+                let kappa = 2.0 * eps / r + eps * eps * d / (r * r);
+                for l in 0..n_eta {
+                    if l == rr {
+                        continue;
+                    }
+                    hess[(rr, l)] += kappa * a[l];
+                    hess[(l, rr)] += kappa * a[l];
+                }
+            }
+            let step = hess.cholesky().unwrap().solve(&grad);
+            for k in 0..n_eta {
+                eta[k] -= step[k];
+            }
+            if step.norm() < 1e-13 {
+                break;
+            }
+        }
+        eta
+    }
+
+    /// 2-cpt IV **user-ODE** model with IIV on residual error (`iiv_on_ruv`). Same
+    /// structure as `TWOCPT_ODE_OUTER` plus a dedicated `ETA_RUV` omega — exercises
+    /// the residual-eta assembly through the ODE Dual2 sensitivity provider (#474).
+    const TWOCPT_ODE_RUV: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  omega ETA_RUV ~ 0.10
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// Shared FD check for an `iiv_on_ruv` model: the analytic FOCEI population
+    /// packed gradient must match the Richardson-extrapolated reconverged-FD of
+    /// ferx's own scaled FOCEI marginal across every θ/Ω/σ coordinate — including
+    /// the residual eta's Ω entry (#474). The OFV *value* it differentiates is
+    /// independently NONMEM-validated (#413).
+    fn run_ruv_packed_check(model: &CompiledModel, theta: &[f64]) {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+
+        let s1 = ruv_subject(model, theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let s2 = ruv_subject(model, theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0, 72.0]);
+        let pop = Population {
+            subjects: vec![s1, s2],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe_ruv(model, s, &params)))
+            .collect();
+
+        let analytic =
+            population_gradient_sens(model, &pop, &template, &x, &ehs).expect("ruv is analytic");
+
+        // 2·Σᵢ Fᵢ at the reconverged (scaled) EBE — the production FOCEI OFV.
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    let eta = precise_ebe_ruv(model, s, &p);
+                    marginal_nll_at(model, s, &p, &eta)
+                })
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[k],
+                fd,
+                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    fn population_packed_gradient_iiv_on_ruv_matches_fd() {
+        let model = parse_model_string(WARFARIN_RUV).expect("parse");
+        assert_eq!(model.residual_error_eta, Some(3));
+        run_ruv_packed_check(&model, &[0.22, 11.0, 1.4]);
+    }
+
+    /// The same residual-eta gradient must be exact on an **ODE** model: the
+    /// assembly is provider-agnostic, so the ODE `Dual2` sensitivities feed the
+    /// residual-eta `H̃`/`H`/`log|H̃|` terms exactly as the closed-form ones do
+    /// (#474). Confirms ODE + `iiv_on_ruv` is analytic, not FD.
+    #[test]
+    fn population_packed_gradient_ode_iiv_on_ruv_matches_fd() {
+        let model = parse_model_string(TWOCPT_ODE_RUV).expect("parse ODE ruv");
+        assert_eq!(model.residual_error_eta, Some(2));
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(&model),
+            "ODE + iiv_on_ruv must route to the analytic outer gradient (#474)"
+        );
+        run_ruv_packed_check(&model, &[4.0, 12.0, 2.0, 25.0]);
+    }
+
+    /// LTBS (`log_additive`) + `iiv_on_ruv` on an ODE model. The provider applies
+    /// the `g = ln(f)` chain to the sensitivities, so the residual-eta variance
+    /// terms (additive `R = σ²` on the log scale, `d = 0`) feed the same provider-
+    /// agnostic assembly — the analytic outer gradient must still match FD (#474).
+    /// (The inner EBE keeps FD for LTBS by design; the outer gradient is analytic.)
+    const TWOCPT_ODE_LTBS_RUV: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  omega ETA_RUV ~ 0.10
+  sigma ADD_ERR ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ log_additive(ADD_ERR)
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    #[test]
+    fn population_packed_gradient_ode_ltbs_iiv_on_ruv_matches_fd() {
+        let model = parse_model_string(TWOCPT_ODE_LTBS_RUV).expect("parse ODE LTBS ruv");
+        assert!(model.log_transform, "log_additive must set LTBS");
+        assert_eq!(model.residual_error_eta, Some(2));
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(&model),
+            "ODE + LTBS + iiv_on_ruv must route to the analytic outer gradient (#474)"
+        );
+        run_ruv_packed_check(&model, &[4.0, 12.0, 2.0, 25.0]);
+    }
+
     #[test]
     fn eta_dx_matches_fd() {
         use crate::estimation::parameterization::pack_params;
@@ -2232,6 +2693,40 @@ mod tests {
             xm[k] -= h;
             let ep = precise_ebe(&model, &subject, &unpack_params(&xp, &template));
             let em = precise_ebe(&model, &subject, &unpack_params(&xm, &template));
+            for l in 0..n_eta {
+                let fd = (ep[l] - em[l]) / (2.0 * h);
+                approx::assert_relative_eq!(jac[k][l], fd, max_relative = 2e-3, epsilon = 1e-6);
+            }
+        }
+    }
+
+    /// #474 regression: `subject_eta_dx` for an `iiv_on_ruv` model. The σ columns
+    /// of `dη̂/dx` must carry the `exp(2·η_ruv)` scale and the residual-eta row of
+    /// `M_σ`, matching FD of the (scaled) EBE — this guards the parity with
+    /// `sigma_block` that an earlier revision broke (dropped `ruv_scale` + the
+    /// residual row, silently wrong σ columns).
+    #[test]
+    fn eta_dx_matches_fd_iiv_on_ruv() {
+        use crate::estimation::parameterization::pack_params;
+        let model = parse_model_string(WARFARIN_RUV).expect("parse");
+        let theta = vec![0.22, 11.0, 1.4];
+        let subject = ruv_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let mut template = model.default_params.clone();
+        template.theta = theta.clone();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let eta_hat = precise_ebe_ruv(&model, &subject, &params);
+
+        let jac = subject_eta_dx(&model, &subject, &template, &x, &eta_hat).expect("supported");
+        let n_eta = model.n_eta;
+        for k in 0..x.len() {
+            let h = 1e-5 * (1.0 + x[k].abs());
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            let ep = precise_ebe_ruv(&model, &subject, &unpack_params(&xp, &template));
+            let em = precise_ebe_ruv(&model, &subject, &unpack_params(&xm, &template));
             for l in 0..n_eta {
                 let fd = (ep[l] - em[l]) / (2.0 * h);
                 approx::assert_relative_eq!(jac[k][l], fd, max_relative = 2e-3, epsilon = 1e-6);

@@ -60,10 +60,28 @@ pub fn optimize_population(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
-    match options.optimizer {
-        Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma | Optimizer::Bobyqa => {
-            optimize_nlopt(model, population, init_params, options)
-        }
+    // Resolve `auto` once, here, so the concrete optimizer flows through the rest
+    // of the outer loop (optimize_nlopt re-reads `options.optimizer` for its own
+    // branching). Every other variant is returned unchanged, so this is a no-op
+    // unless the user left the default `auto` in place.
+    let resolved = options.optimizer.resolve_auto(model);
+    let owned_opts;
+    let options = if resolved == options.optimizer {
+        options
+    } else {
+        owned_opts = FitOptions {
+            optimizer: resolved,
+            ..options.clone()
+        };
+        &owned_opts
+    };
+    match resolved {
+        // `Auto` is resolved away above; group it with the NLopt path defensively.
+        Optimizer::Slsqp
+        | Optimizer::NloptLbfgs
+        | Optimizer::Mma
+        | Optimizer::Bobyqa
+        | Optimizer::Auto => optimize_nlopt(model, population, init_params, options),
         Optimizer::Bfgs | Optimizer::Lbfgs => {
             optimize_bfgs(model, population, init_params, options)
         }
@@ -690,12 +708,15 @@ fn optimize_nlopt(
     let ebe_accum: Arc<Mutex<EbeAccum>> = Arc::new(Mutex::new(EbeAccum::default()));
     let ebe_accum_cl = Arc::clone(&ebe_accum);
 
-    // Select NLopt algorithm
+    // Select NLopt algorithm. `optimize_population` resolves `Auto` to a concrete
+    // optimizer before dispatching here, so `Auto` should never reach this match;
+    // map it to BOBYQA (auto's FD fallback) rather than the catch-all SLSQP so a
+    // future bypass degrades to the safe derivative-free path, not a silent SLSQP.
     let algo = match options.optimizer {
         Optimizer::Slsqp => nlopt::Algorithm::Slsqp,
         Optimizer::NloptLbfgs => nlopt::Algorithm::Lbfgs,
         Optimizer::Mma => nlopt::Algorithm::Mma,
-        Optimizer::Bobyqa => nlopt::Algorithm::Bobyqa,
+        Optimizer::Bobyqa | Optimizer::Auto => nlopt::Algorithm::Bobyqa,
         _ => nlopt::Algorithm::Slsqp,
     };
 
@@ -2198,11 +2219,11 @@ fn population_gradient(
     // `gradient = fd` forces the numeric path for the outer gradient too (the inner
     // EBE gradient honours it via `analytic_inner_grad_supported`), so the option
     // fully disables the analytic sensitivities rather than only the inner half.
-    let user_forces_fd = matches!(model.gradient_method, GradientMethod::Fd);
-    if !force_reconverge
-        && !user_forces_fd
-        && (crate::sens::provider::sens_supported(model) || iov_analytic)
-    {
+    // `analytic_outer_gradient_available` is the shared predicate that
+    // `Optimizer::resolve_auto` and `build_info::gradient_method_outer` also use,
+    // so the `auto` optimizer cannot pick a gradient-based optimizer while this
+    // gate falls through to FD (#490 review).
+    if !force_reconverge && crate::sens::provider::analytic_outer_gradient_available(model) {
         let g = if iov_analytic {
             if options.interaction {
                 crate::estimation::sens_outer_gradient::population_gradient_sens_iov(

@@ -178,6 +178,15 @@ section of the SDLC for the versioning policy).
   test in the default build (#430).
 
 ### Changed
+- **`optimizer` now defaults to `auto`** (#490). The new `auto` choice picks the
+  outer optimizer per model: `nlopt_lbfgs` when the exact analytic FOCE/FOCEI
+  gradient is available, and `bobyqa` when only finite differences are (ODE/PD
+  models, LTBS/SDE, or `gradient = fd`). Limited benchmarking across ~10 real
+  FOCEI datasets found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient
+  problem and `bobyqa` fastest and most reliable on the finite-difference ones, so
+  `auto` gives most users a good default without tuning. The fit output reports
+  the resolved pick as `auto (<resolved>)`; set `optimizer` explicitly (e.g.
+  `optimizer = bobyqa`) to keep the previous fixed default.
 - **The SLSQP fallback no longer triggers on `MaxEvalReached`** (#499). After the
   primary NLopt run (`nlopt_lbfgs`/`slsqp`/`mma`), ferx retried from the current
   point with a fresh, full-budget SLSQP optimization whenever the primary didn't

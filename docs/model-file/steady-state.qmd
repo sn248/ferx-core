@@ -103,6 +103,27 @@ periodic steady state (e.g. zero-order elimination at saturation),
 the iteration may not converge to anything meaningful and SS=1 isn't
 really applicable.
 
+### Analytic gradient during `fit()`
+
+During estimation, SS=1 `[odes]` dosing gets an **exact analytic FOCE/FOCEI gradient**
+(outer θ/Ω/σ and inner EBE), not finite differences. Because the `N`-cycle expansion above
+is *finite and explicit*, running it over the dual type propagates `∂(steady state)/∂(θ,η)`
+directly — `equilibrate_ss_state_g` is the dual counterpart of `equilibrate_ss_state` and
+the analytic trough is the exact derivative of the predictor's trough (result-neutral,
+validated against the production predictor + finite differences, including the 2nd-order
+Hessian blocks used for covariance/SEs). Both SS **bolus** and SS **infusion** are covered,
+and SS composes with time-varying covariates, IOV, and EVID 3/4 resets.
+
+A few SS sub-cases still route to the finite-difference fallback (correct, just slower):
+
+- **SS + estimated lagtime** — the pre-arrival window `[t_dose, t_dose+lag]` must read the
+  previous interval's steady-state tail, not yet seeded by the dual walk.
+- **SS + a rate-defined infusion under `F ≠ 1`** — the equilibration window would need to
+  scale with `F` (a moving boundary not yet carried per cycle).
+- **SS + a non-autonomous RHS** (one that reads the `TIME`/`TAFD`/`TAD` builtins) — the
+  equilibration expands a *time-invariant* pulse train, so a time/`TAD`-dependent RHS breaks
+  the steady-state cycle recurrence; such models stay on FD.
+
 ### Why `N = 50`?
 
 The truncation tail after `N` cycles is bounded by `exp(-N·λ·II)` for

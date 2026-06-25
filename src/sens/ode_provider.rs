@@ -336,6 +336,14 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     if has_ss && model.has_lagtime() {
         return false;
     }
+    // SS combined with a **non-autonomous RHS** (one that reads `TIME`/`TAFD`/`TAD`) routes
+    // to FD: the SS dual equilibration expands a time-*invariant* pulse train (cycle-relative
+    // time, anchor 0), so a time/TAD-dependent RHS breaks the steady-state cycle recurrence —
+    // the dual walk's monotonic TAD diverges from production's per-interval anchor, giving a
+    // wrong prediction *and* gradient (#473 review #1, verified vs the production predictor).
+    if has_ss && ode.rhs_program.as_ref().is_some_and(|p| p.uses_time_vars()) {
+        return false;
+    }
     // EVID 3/4 resets and finite-duration infusions ARE handled (resets zero the state;
     // infusions add `F·rate` forcing over their lagged window, with rate-boundary lagtime
     // saltation). EVID=2 pk-only breakpoints are not (no seeded-PK record), so decline.
@@ -1644,6 +1652,18 @@ fn ode_iov_subject_supported(
     if subject.doses.iter().any(|d| d.ss && d.ii > 0.0) && model.has_lagtime() {
         return None;
     }
+    // SS combined with a non-autonomous RHS (reads `TIME`/`TAFD`/`TAD`) → FD: the SS
+    // equilibration assumes a time-invariant pulse train, so the cycle recurrence breaks
+    // (mirrors `ode_tvcov_supported`, #473 review #1).
+    if subject.doses.iter().any(|d| d.ss && d.ii > 0.0)
+        && model
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .is_some_and(|p| p.uses_time_vars())
+    {
+        return None;
+    }
     // EVID 3/4 resets and finite-duration infusions ARE handled by the event-driven walk;
     // EVID=2 pk-only breakpoints are not.
     if !subject.pk_only_times.is_empty() {
@@ -2604,7 +2624,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // Steady-state (SS=1) dose: load the compartments with the infinite-past
             // pulse train's trough (dual equilibration carries `∂SS/∂(θ,η)`), replacing
             // the running state, *before* the SS dose's own pulse is applied below
-            // (mirrors production). Gated to bolus SS (`equilibrate_ss_state_g`).
+            // (mirrors production). `equilibrate_ss_state_g` handles **both** SS bolus and
+            // SS infusion (active-rate + quiet window per cycle); only a rate-defined SS
+            // infusion under `F ≠ 1`, SS + lagtime, and SS + a non-autonomous RHS route to
+            // FD upstream (#473 review #7).
             if d.ss && d.ii > 0.0 {
                 u = equilibrate_ss_state_g::<T>(
                     program,
@@ -4248,6 +4271,9 @@ mod tests {
         );
         // η = [ETA_CL, ETA_F]; θ = [TVCL, TVV, TVF].
         check_vs_production(&model, &subject, &[1.0, 10.0, 0.7], &[0.1, 0.05]);
+        // 2nd order: the rate-off-under-F `coef2 = -s·½·J·(Δr·e_cmt)` saltation block (#473
+        // review #2 — the F-window-shift Hessian was previously unvalidated).
+        check_hessian_vs_fd_of_grad(&model, &subject, &[1.0, 10.0, 0.7], &[0.1, 0.05]);
     }
 
     /// Rate-defined infusion under `F` combined with **estimated lagtime**: the rate-on
@@ -4356,6 +4382,60 @@ mod tests {
             "SS bolus → event-driven walk"
         );
         check_vs_production(&model, &subject, &[1.0, 10.0], &[0.1]);
+        // 2nd order: the SS equilibration's `∂²(SS state)/∂(θ,η)²` (#473 review #2 — the SS
+        // dual-equilibration Hessian was previously unvalidated).
+        check_hessian_vs_fd_of_grad(&model, &subject, &[1.0, 10.0], &[0.1]);
+    }
+
+    // 1-cpt IV with a **TAD-dependent RHS** (`-(CL/V)·central·(1+0.02·TAD)`). Used to
+    // verify the #473 review (13:22) finding #1: does an SS dose + a `TAD`-referencing RHS
+    // diverge from production for observations beyond one `II`?
+    const TAD_SS_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.02 * TAD)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **SS=1 dose with a `TAD`-dependent (non-autonomous) RHS routes to FD** (#473 review #1).
+    /// The SS dual equilibration expands a *time-invariant* pulse train (cycle-relative time),
+    /// so a `TAD`/`TIME`-dependent RHS breaks the steady-state cycle recurrence — the analytic
+    /// walk was verified to diverge ~40× from the production predictor on this model — so the
+    /// gate must decline it. (A non-SS `TAD` RHS is fine — the TV-cov/static walks anchor TAD
+    /// correctly; see `ode_provider_tvcov_tad_dependent_rhs_matches_production`.)
+    #[test]
+    fn ode_provider_ss_tad_dependent_rhs_routes_to_fd() {
+        let model = parse_model_string(TAD_SS_ODE).expect("parse TAD SS ODE");
+        let mut subject = bolus_subject(&[2.0, 8.0, 20.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+        assert!(subject.doses[0].ss);
+        assert!(
+            model
+                .ode_spec
+                .as_ref()
+                .and_then(|o| o.rhs_program.as_ref())
+                .is_some_and(|p| p.uses_time_vars()),
+            "TAD_SS_ODE's RHS must read TAD (precondition for the gate)"
+        );
+        assert!(
+            !ode_tvcov_supported(&model, &subject),
+            "SS + TAD-dependent RHS must route to FD (#473 review #1)"
+        );
     }
 
     /// **Steady-state (SS=1) infusion.** Each equilibration cycle runs an active-rate

@@ -6096,6 +6096,7 @@ fn build_ode_spec(
     // Snapshot the resolved RHS program for the analytic-sensitivity path
     // (issue #367) before the f64 closure moves `stmts_owned`. Same statements,
     // same var layout — evaluated over a dual type by `eval_rhs_g`.
+    let uses_time_vars = stmts_read_slots(&stmts_owned, &[time_slot, tafd_slot, tad_slot]);
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -6105,6 +6106,7 @@ fn build_ode_spec(
         tafd_slot,
         tad_slot,
         macheps_slot,
+        uses_time_vars,
     };
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
@@ -9350,6 +9352,59 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
 /// `pub` only so it can appear in the (public) [`OdeSpec`](crate::ode::OdeSpec)
 /// field; all fields are private, so it is opaque outside the crate and can be
 /// produced only by the parser.
+/// Recursively test whether an expression reads any of `slots` (post-resolution, time/TAD
+/// anchors appear as `VariableIdx`). Conservative — used to detect a non-autonomous RHS.
+fn expr_reads_slots(e: &Expression, slots: &[usize]) -> bool {
+    match e {
+        Expression::VariableIdx(i) => slots.contains(i),
+        Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+            expr_reads_slots(a, slots) || expr_reads_slots(b, slots)
+        }
+        Expression::UnaryFn(_, a) => expr_reads_slots(a, slots),
+        Expression::Conditional(c, t, f) => {
+            cond_reads_slots(c, slots) || expr_reads_slots(t, slots) || expr_reads_slots(f, slots)
+        }
+        _ => false,
+    }
+}
+
+fn cond_reads_slots(c: &Condition, slots: &[usize]) -> bool {
+    match c {
+        Condition::Compare(a, _, b) => expr_reads_slots(a, slots) || expr_reads_slots(b, slots),
+        Condition::And(a, b) | Condition::Or(a, b) => {
+            cond_reads_slots(a, slots) || cond_reads_slots(b, slots)
+        }
+        Condition::Not(a) => cond_reads_slots(a, slots),
+    }
+}
+
+/// Whether the RHS statements read any of `slots` — scans both the compiled bytecode
+/// (`PushVar`) and any `if`-condition / fallback expressions. Used at construction to set
+/// [`OdeRhsProgram::uses_time_vars`].
+fn stmts_read_slots(stmts: &[Statement], slots: &[usize]) -> bool {
+    stmts.iter().any(|s| match s {
+        Statement::AssignBc(_, bc) | Statement::DiffEqBc(_, bc) => bc
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::PushVar(i) if slots.contains(&(*i as usize)))),
+        Statement::Assign(_, e)
+        | Statement::AssignIdx(_, e)
+        | Statement::DiffEq(_, e)
+        | Statement::DiffEqIdx(_, e) => expr_reads_slots(e, slots),
+        Statement::If {
+            branches,
+            else_body,
+        } => {
+            branches
+                .iter()
+                .any(|(c, b)| cond_reads_slots(c, slots) || stmts_read_slots(b, slots))
+                || else_body
+                    .as_deref()
+                    .is_some_and(|b| stmts_read_slots(b, slots))
+        }
+    })
+}
+
 pub struct OdeRhsProgram {
     stmts: Vec<Statement>,
     n_vars_total: usize,
@@ -9361,9 +9416,19 @@ pub struct OdeRhsProgram {
     tafd_slot: usize,
     tad_slot: usize,
     macheps_slot: usize,
+    /// True when the RHS reads any of the `TIME`/`TAFD`/`TAD` time-anchor slots — i.e. the
+    /// system is **non-autonomous**. A steady-state (`SS=1`) dose assumes a time-invariant
+    /// pulse train, so the SS dual equilibration's cycle recurrence breaks for such an RHS;
+    /// the gate routes SS subjects on a non-autonomous RHS to FD (#473 review #1).
+    uses_time_vars: bool,
 }
 
 impl OdeRhsProgram {
+    /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
+    pub(crate) fn uses_time_vars(&self) -> bool {
+        self.uses_time_vars
+    }
+
     /// Evaluate `du = f(u, p, t)` over a dual type, generic over [`PkNum`]
     /// (`Dual1<N>` for the light inner η-gradient, `Dual2<N>` for the full outer
     /// gradient). `u` is the current state; `params` is the flat PK-parameter vector

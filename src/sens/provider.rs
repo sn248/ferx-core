@@ -278,6 +278,13 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
         && !model.has_tte()
         && (sens_supported(model) || iov_analytical_supported(model))
+        // IIV on residual error (#474): the analytic gradient (inner η-column +
+        // outer θ/Ω/σ variance terms) is provider-agnostic, so it serves the
+        // closed-form AND ODE paths. IOV and M3-BLOQ `iiv_on_ruv` keep the FD
+        // gradient on BOTH loops — the IOV inner gradient does not carry the
+        // variance scaling, and the residual-eta censored second derivatives are
+        // not assembled.
+        && !model.iiv_on_ruv_forces_fd()
 }
 
 /// Whether the light **ODE inner** η-gradient (`Dual1`) serves this model+subject:
@@ -2600,6 +2607,16 @@ mod tests {
         assert!(!analytic_outer_gradient_available(
             &test_helpers::ode_model(GradientMethod::Auto)
         ));
+        // A closed-form `iiv_on_ruv` model is analytic (#474)…
+        let mut ruv = test_helpers::analytical_model(GradientMethod::Auto);
+        ruv.residual_error_eta = Some(0);
+        assert!(analytic_outer_gradient_available(&ruv));
+        // …but M3 BLOQ + `iiv_on_ruv` falls back to FD (no censored residual-eta
+        // second derivatives are assembled).
+        let mut ruv_m3 = test_helpers::analytical_model(GradientMethod::Auto);
+        ruv_m3.residual_error_eta = Some(0);
+        ruv_m3.bloq_method = crate::types::BloqMethod::M3;
+        assert!(!analytic_outer_gradient_available(&ruv_m3));
     }
 
     /// A TTE (`[event_model]`) objective has no analytic outer gradient (the

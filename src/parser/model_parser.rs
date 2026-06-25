@@ -2181,6 +2181,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &used_sigmas_in_error,
         &event_model_used_thetas,
         &event_model_used_etas,
+        model.residual_error_eta,
     ));
 
     // Warn about analytical PK parameters that are mapped but unused by the
@@ -7811,6 +7812,7 @@ fn check_unused_parameters(
     used_sigmas: &std::collections::HashSet<String>,
     event_model_thetas: &std::collections::HashSet<usize>,
     event_model_etas: &std::collections::HashSet<usize>,
+    residual_error_eta: Option<usize>,
 ) -> Vec<String> {
     let mut used_thetas = std::collections::HashSet::new();
     let mut used_etas = std::collections::HashSet::new();
@@ -7833,6 +7835,12 @@ fn check_unused_parameters(
         }
     }
     for (i, name) in eta_names_bsv.iter().enumerate() {
+        // The `iiv_on_ruv` residual-error eta is referenced from [error_model], not
+        // any individual-parameter / [event_model] expression, but it *is* used (it
+        // scales the residual variance) and *is* estimated — so don't flag it.
+        if Some(i) == residual_error_eta {
+            continue;
+        }
         if !used_etas.contains(&i) {
             warnings.push(format!(
                 "omega '{}' is declared in [parameters] but not referenced in any \
@@ -16553,6 +16561,26 @@ if (WT > 70) {
         // The scale factor is exp(2·η) at that index, 1.0 elsewhere.
         assert!((model.residual_var_scale(&[0.0, 0.0]) - 1.0).abs() < 1e-12);
         assert!((model.residual_var_scale(&[0.3, 0.5]) - (2.0_f64 * 0.5).exp()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_eta_not_flagged_unused() {
+        // The residual-error eta is referenced from [error_model] (not any
+        // individual-parameter expression), but it scales the residual variance and
+        // is estimated — it must NOT trigger the "not referenced" unused warning.
+        let model = parse_full_model(&iiv_ruv_model_str(
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV",
+        ))
+        .unwrap()
+        .model;
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("ETA_RUV") && w.contains("not referenced")),
+            "iiv_on_ruv eta must not be flagged unused; got: {:?}",
+            model.parse_warnings
+        );
     }
 
     #[test]

@@ -19,6 +19,29 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+- **Exact analytic FOCE/FOCEI gradient for `iiv_on_ruv` (IIV on residual error).**
+  Models with a residual-error eta (`Y = IPRED + EPS·EXP(η_ruv)`) now use the
+  exact closed-form gradient on both the inner EBE and outer θ/Ω/σ loops, where
+  the residual-eta column previously fell back to (and, with the `auto`/L-BFGS
+  optimiser, silently mis-computed) a gradient that omitted the `exp(2·η_ruv)`
+  variance scaling. The inner η-gradient scales `v`/`dv_df` and adds the
+  `Σ(1−ε²/v)` residual-eta column; the outer assembly adds the Almquist `c̃=2`
+  interaction column to `H̃`, the true-Hessian `2ε²/R` / `κⱼaⱼ` terms, and their
+  `log|H̃|` θ/Ω/σ derivatives. Validated to ~1e-11 against reconverged finite
+  differences of ferx's own FOCEI marginal (whose value is NONMEM-validated, #413).
+  The assembly is provider-agnostic, so it covers the closed-form (analytical
+  1-/2-/3-cpt), **ODE** (`[odes]`), and **LTBS** (`log_additive`) paths — for LTBS
+  the outer gradient is analytic while the inner EBE keeps finite differences (the
+  existing LTBS choice, #438). IOV and M3-BLOQ `iiv_on_ruv` keep the
+  finite-difference gradient. (#474)
+- **Spurious "not referenced" warning for the `iiv_on_ruv` eta.** A residual-error
+  random effect is referenced from `[error_model]` (not an individual-parameter
+  expression), so it was falsely warned as "declared but not referenced … will not
+  affect predictions or be meaningfully estimated" even though it scales the
+  residual variance and is estimated. The warning is now suppressed for that eta.
+  (#474)
+
 ### Performance
 - **Ω-preconditioned inner EBE loop for all FOCE/FOCEI fits.** The inner BFGS
   now initialises its inverse-Hessian (the search `H0`) to the prior conditional

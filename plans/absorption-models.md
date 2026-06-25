@@ -2,7 +2,7 @@
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
-**Status:** approved roadmap, in progress (updated 2026-06-23).
+**Status:** approved roadmap, in progress (updated 2026-06-25).
 - **Prerequisite #324:** safety net (PR #326), **modeled infusion duration `Dn` /
   `RATE=-2`** (PR #384), and **modeled rate `Rn` / `RATE=-1` on both engines**
   (PR #418) **merged**; see #383 for any residual analytical-engine items.
@@ -13,12 +13,21 @@
 - **Phase 1 — inverse-Gaussian `igd()`** (PR #389) **merged**.
 - **Analytic `Dual2` ODE forcing (#430)** — `igd` (slice 1), `transit` (slice 2),
   and (with Phase 2) `weibull` are all lifted off the FD fallback; **#430 closed**.
-- **Phase 2 — `weibull()`** (#497) — log-domain forcing, exact analytic `Dual2`
-  gradients, permanent ODE-only error rule, AUC-mass invariant; NONMEM anchor kit
-  committed, run pending. **Remaining in Phase 2** (the zero-order family, now
-  tracked):
-  - **#504 — `zero_order(dur)` + `sequential`**: single-input (no fraction), reuses
-    the merged `RATE=-2`/`Dn` forcing (#384/#395). The smallest, first slice.
+- **Phase 2 — `weibull()`** (#497) **✅ MERGED — PR #498** (`6252946a`) — log-domain
+  forcing, exact analytic `Dual2` gradients, permanent ODE-only error rule, AUC-mass
+  invariant; **NONMEM `$DES` anchor ran** (slow-tests-gated `tests/weibull_nonmem_anchor.rs`:
+  ferx FOCEI marginal OFV vs NONMEM `#OBJV` −943.833 at NONMEM's optimum, ~1.5 OFV apart).
+  **Remaining in Phase 2** (the zero-order family, now tracked):
+  - **#504 — `zero_order(dur)` + `sequential`**: single-input (no fraction). **Smallest
+    on the parser axis** (no new mechanism), but **its `∂/∂dur` is the hardest sensitivity
+    so far** — a *moving boundary* (`R_in` cuts off hard at `tad=dur`), unlike the smooth
+    `transit`/`igd`/`weibull`. The merged `RATE=-2`/`Dn` forcing (#384/#395) is reused for
+    the **value path only**; #384's `dur` sensitivity is **FD** (the `all_doses_fixed` gate
+    routes every modeled-`RATE` dose to FD). So #504 ships `zero_order`/`sequential` with
+    `dur` on **FD** first (`InputRateKind::supported_over_dual()=false`, reusing the existing
+    input-rate FD-fallback gate); the analytic moving-boundary `∂/∂dur` — a dual-channel
+    impulse at `tad=dur` that *also* lifts #384's `Dn` infusion off FD — is a cross-cutting
+    **follow-up (#530)**, not a `zero_order` rider.
   - **#505 — `parallel` / `mixed` + `first_order()` composition**: dual-pathway,
     **blocked on the shared fraction multiplier in #388** (the parser rejects scaled
     input-rate calls today).
@@ -31,8 +40,9 @@
   reaches Phase 3 (no closed form) — its only exact-gradient route is the #430
   generic forcing.
 
-Recommended sequence after #497: **#504** (single-input, no new mechanism) →
-**#388** fraction mechanism + **#505** (`parallel`/`mixed`) → **#386** (speed pass).
+Recommended sequence after Weibull (#498): **#504** (single-input, no new parser
+mechanism) → **#388** fraction mechanism + **#505** (`parallel`/`mixed`) → **#386**
+(speed pass).
 
 Multi-PR / phased.
 
@@ -345,19 +355,20 @@ Decouple **input function** from **disposition**, reusing existing machinery:
    - **Sensitivities (post-Enzyme):** the shared-numeric-trait idea is now realised by the
      `PkNum` trait in `src/sens/` — the closed-form PK solutions and ODE RHS are written once as
      `*_g<T: PkNum>` generics (`T = f64` → predictions, `T = Dual2<M>` → exact 1st/2nd-order
-     sensitivities); there is no second `_ad` copy to keep in sync. The absorption input
-     functions are **not yet** `PkNum`-generic, so a model that uses `transit()`/`igd()` falls
-     back to FD (see the Phase 0a finding). Lifting `PreparedInputRate::rate` (and the `ln_gamma`
-     it calls) to `PkNum` is the concrete way to give the ODE forcing exact sensitivities — see
-     "Analytic sensitivities for the ODE forcing" below.
-   - **Phase 0a finding (updated):** transit shipped `f64`-only, and a `transit()` model
-     differentiates via **finite differences** — but the *reason* has changed. An **analytic ODE
-     sensitivity path now exists** (`src/sens/ode_provider.rs`: state integrated as `Dual2<N>`
-     through the generic RK45, yielding `∂f/∂p`, `∂²f/∂p²`), so it is no longer true that ODE
-     models "always differentiate via FD". Built-in input-rate absorption is on that provider's
-     explicit *not-yet-supported → FD fallback* list, so transit/igd are currently the lone ODE
-     holdouts dropping to FD. The `f64`-only forcing is thus an FD **fallback**, not an
-     impossibility; making it `PkNum`-generic (above) removes it.
+     sensitivities); there is no second `_ad` copy to keep in sync. The **smooth** absorption
+     input functions are now `PkNum`-generic — `PreparedInputRate::rate`/`prepare_dual` (and the
+     `ln_gamma` transit calls) evaluate over `Dual2`, so `transit()`/`igd()`/`weibull()` get
+     **exact analytic** ODE forcing sensitivities (#468/#430/#498), gated by
+     `InputRateKind::supported_over_dual()`.
+   - **Phase 0a finding (resolved, with one designed exception):** transit originally shipped
+     `f64`-only and differentiated via **finite differences**; #430 (`igd`) / #468 (`transit`) /
+     #498 (`weibull`) lifted all three onto the analytic `Dual2` path (`src/sens/ode_provider.rs`:
+     state integrated as `Dual2<N>` through the generic RK45), so they are no longer FD holdouts.
+     The remaining FD case is **by design**: `zero_order` (#504) has a *moving boundary* (`R_in`
+     cuts off at `tad=dur`), whose `∂/∂dur` is not a `PkNum`-generic expression but a dual-channel
+     impulse at `tad=dur` (a Leibniz boundary term). It ships with `dur` on FD
+     (`supported_over_dual()=false`) until that impulse is built — the same gap that keeps #384's
+     modeled-duration `Dn` infusion on FD; see "Analytic sensitivities for the ODE forcing".
 2. **Forcing into the user's ODE.** `R_in(tad)` is added into the dosing compartment of the
    disposition the user supplied (`ode(...)` or the `ode_template`-generated states) via the
    **same RHS-wrapper mechanism that already injects `+rate` for infusions**
@@ -394,23 +405,30 @@ Decouple **input function** from **disposition**, reusing existing machinery:
    ship each model on the numerical ODE path first (Phases 0/1) to prove the pipeline, then add
    the closed form in Phase 3 and assert they agree under the equivalence harness.
 
-### Analytic sensitivities for the ODE forcing (post-Enzyme follow-up)
+### Analytic sensitivities for the ODE forcing
 
-**Roadmap item — [#430](https://github.com/FeRx-NLME/ferx-core/issues/430).** With the Enzyme retirement, ODE models now get **analytic**
-`Dual2` sensitivities through `src/sens/ode_provider.rs` (state integrated as `Dual2<N>` over the
-generic RK45). Built-in input-rate absorption is on that provider's explicit *not-yet-supported →
-FD fallback* list, so `transit()`/`igd()`/`weibull()` are currently the only ODE models that still
-differentiate by FD. The fix: make `PreparedInputRate::rate` generic over `PkNum` (the `sens/`
-`*_g<T>` convention) **plus** `Dual2` 1st/2nd-order rules for the special functions each model calls
-(`ln_gamma` for transit, `exp`/`sqrt` for IG, `powf` for Weibull) — then the compiled RHS evaluates
-over the dual numbers the provider already propagates, and absorption comes off the FD-fallback list.
+**[#430](https://github.com/FeRx-NLME/ferx-core/issues/430) — ✅ DONE for the smooth functions.**
+With the Enzyme retirement, ODE models get **analytic** `Dual2` sensitivities through
+`src/sens/ode_provider.rs` (state integrated as `Dual2<N>` over the generic RK45). `transit()`,
+`igd()` and `weibull()` were each lifted off the FD fallback by making `PreparedInputRate::rate`
+(and `prepare_dual`) generic over `PkNum`, with the `Dual2` 1st/2nd-order rules for the special
+functions each calls — exact analytic forcing sensitivities, gated by
+`InputRateKind::supported_over_dual()` (#468 transit, #430 igd, #498 weibull). For Weibull this is
+the **only** analytic-gradient route (no closed form, permanently on the numerical ODE path); for
+transit/IG it gives exact gradients independent of the Phase 3 closed forms (#386), which replace
+the ODE *disposition* rather than the *forcing*.
 
-This is **not just a transit/IG interim:** it is the **only** analytic-gradient route for **Weibull**,
-which has no closed form (see the closed-form table and Phase 2) and so is *permanently* on the
-numerical ODE path. For transit/IG it gives exact gradients in the interim before the Phase 3
-analytical closed forms (#386) land, and is **independent of** Phase 3 (which replaces the ODE
-*disposition*; this makes the ODE *forcing* differentiable). Scope/feasibility to be confirmed against
-the provider's `MAX_ODE_SENS_DIM` monomorphisation budget.
+**Open ([#530](https://github.com/FeRx-NLME/ferx-core/issues/530)) — the moving-boundary forcing (`zero_order` #504 + modeled-duration `Dn` #384).** The
+smooth-function recipe does **not** cover a forcing with a hard cutoff at a parameter-dependent
+time. `zero_order(dur)` cuts `R_in` off at `tad=dur`, so the true `∂/∂dur` carries a Leibniz
+boundary term — a dual-channel impulse of magnitude `R_in(boundary)·∂dur/∂p` injected at `tad=dur`
+— that a pointwise `rate(tad)→Dual2` cannot express (the variational walk misses it and the
+analytic gradient diverges from FD for any observation after the window closes). This is the *same*
+gap that keeps #384's modeled-duration `Dn` infusion on FD (`ode_provider.rs` routes every
+modeled-`RATE` dose to FD via `all_doses_fixed`). It is therefore a **cross-cutting follow-up**, not
+a `zero_order` rider: #504 ships `dur` on FD (`supported_over_dual()=false`), and **#530**
+builds the boundary-impulse mechanism that lifts both `zero_order` and `Dn` off FD. Scope/feasibility
+against the provider's `MAX_ODE_SENS_DIM` monomorphisation budget.
 
 ## Robustness ("no happy paths") — explicit requirements
 
@@ -482,9 +500,10 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   analytical `pk` disposition combined with an ODE-only absorption model (`transit`) is a hard
   error pointing at `ode_template`. Equivalence-tested (`ode_template` ≡ `pk` for all 6 models).
   ferx-r follow-up merged (PR #169).
-- **Phase 1 — inverse-Gaussian (Freijer & Post). ✅ IMPLEMENTED — PR #389 (open, this PR).**
+- **Phase 1 — inverse-Gaussian (Freijer & Post). ✅ MERGED — PR #389 (`5b257208`, closes #347).**
   Single IG via the `igd(mat, cv2)` input-rate function (log-domain density, essential
-  singularity `tad→0 ⇒ R→0` for free, `f64`/FD-only like `transit`); ships as **numerical** (ODE
+  singularity `tad→0 ⇒ R→0` for free; shipped `f64`/FD-only like `transit`, since lifted to
+  analytic `Dual2` by #430); ships as **numerical** (ODE
   forcing), even though a closed form exists (the `TiltedAbsorption` route, Phase 3 below) — the
   ODE path is the same pipeline as transit and validates the forcing end-to-end before the
   analytical fast path is added. Anchored vs a NONMEM `$DES` IG run
@@ -495,13 +514,17 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   is shared with the planned parallel/mixed `first_order`, so design it once).
 - **Phase 2 — Weibull + zero-order + sequential + parallel + mixed.** Round out the
   catalogue; each with a NONMEM anchor. Split into tracked slices:
-  - **Weibull (#497)** — **numerical** (no closed form); errors on an analytical
-    disposition (pointing at `ode_template`). Exact gradients come *only* via the
-    `PkNum`-generic forcing route (see §"Analytic sensitivities for the ODE forcing"),
-    never Phase 3. **Shipped as a PR.**
+  - **Weibull (#497) ✅ MERGED — PR #498 (`6252946a`)** — **numerical** (no closed
+    form); errors on an analytical disposition (pointing at `ode_template`). Exact
+    gradients come *only* via the `PkNum`-generic forcing route (see §"Analytic
+    sensitivities for the ODE forcing"), never Phase 3. NONMEM `$DES` anchor ran
+    (`tests/weibull_nonmem_anchor.rs`, slow-tests-gated, OFV −943.833).
   - **`zero_order` + `sequential` (#504)** — single-input; reuses #324's merged
-    `RATE=-2`/`Dn` estimated-duration forcing. **Closed-form** (superpose existing
-    solvers / piecewise), shipped on the ODE path first then optionally accelerated.
+    `RATE=-2`/`Dn` estimated-duration forcing **for the value path**. **Closed-form**
+    (superpose existing solvers / piecewise). Ships on the ODE path with `dur` on **FD**
+    first — its `∂/∂dur` is a *moving boundary* (the one hard part), and the analytic
+    boundary-term impulse (shared with #384's `Dn` infusion) is a cross-cutting follow-up
+    (#530), not bundled here. Then optionally accelerated via the closed form.
   - **`parallel` / `mixed` + `first_order()` composition (#505)** — dual-pathway,
     **blocked on the #388 shared fraction multiplier** (the parser rejects scaled
     input-rate calls today). **Closed-form** (superpose `*_oral` solvers by `frac`).

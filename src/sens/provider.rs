@@ -236,6 +236,45 @@ fn init_supported(model: &CompiledModel) -> bool {
 /// (the `Dual2<M>` dispatch table). Beyond this the scale falls back to FD.
 const MAX_SCALE_AXES: usize = 16;
 
+/// Monomorphize the analytic `[initial_conditions]` impulse on a runtime axis
+/// count, dispatching `$apply::<K>(args…)` over the `1..=MAX_SCALE_AXES` table.
+/// Written **once** so the inner ([`apply_analytical_init_inner`], dispatched on
+/// `n_eta`) and outer ([`apply_analytical_init_outer`], dispatched on
+/// `n_theta + n_eta`) paths can never drift to different axis tables. The `_` arm is
+/// unreachable for a supported init model: `init_supported` bounds `n_theta + n_eta`
+/// to `1..=MAX_SCALE_AXES`, and each path's axis count is `≤ n_theta + n_eta`.
+macro_rules! dispatch_init_impulse {
+    ($axes:expr, $apply:ident, $($arg:expr),+ $(,)?) => {
+        match $axes {
+            1 => $apply::<1>($($arg),+),
+            2 => $apply::<2>($($arg),+),
+            3 => $apply::<3>($($arg),+),
+            4 => $apply::<4>($($arg),+),
+            5 => $apply::<5>($($arg),+),
+            6 => $apply::<6>($($arg),+),
+            7 => $apply::<7>($($arg),+),
+            8 => $apply::<8>($($arg),+),
+            9 => $apply::<9>($($arg),+),
+            10 => $apply::<10>($($arg),+),
+            11 => $apply::<11>($($arg),+),
+            12 => $apply::<12>($($arg),+),
+            13 => $apply::<13>($($arg),+),
+            14 => $apply::<14>($($arg),+),
+            15 => $apply::<15>($($arg),+),
+            16 => $apply::<16>($($arg),+),
+            _ => {}
+        }
+    };
+}
+
+// The `dispatch_init_impulse!` table is hand-written for `1..=16`. If the axis cap
+// changes, the table (and the scale-program dispatch tables) must change with it —
+// fail to compile rather than silently drop the init impulse on the `_` arm.
+const _: () = assert!(
+    MAX_SCALE_AXES == 16,
+    "dispatch_init_impulse! enumerates 1..=16; update it when MAX_SCALE_AXES changes",
+);
+
 /// Maximum `(θ, η)` axis count (`n_theta + n_eta`) for the TV-cov event-driven dual
 /// walk. The outer `run_obs_tvcov` (`m_dim`) and inner `run_obs_grad_tvcov` (`n_eta
 /// ≤ m_dim`) dispatch tables both enumerate `1..=MAX_TVCOV_AXES`, and
@@ -533,8 +572,12 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if !matches!(model.scaling, ScalingSpec::None) || model.log_transform || model.has_lagtime() {
         return false;
     }
-    // Initial-compartment amounts (#521) are not yet differentiated by the
-    // analytic kernels — fall back to FD (see `analytical_supported`).
+    // Initial-compartment amounts (#521) ARE differentiable by the analytic kernels
+    // now (#524), but only on the dose-superposition path: the init impulse is
+    // layered per-subject in `subject_sensitivities` / `subject_eta_grad`, not in the
+    // IOV event-driven walk, which would have to re-seed the `A₀·kernel` baseline into
+    // each occasion block. Until that occasion-block seeding lands, an IOV + init
+    // model falls back to FD (see `analytical_supported` for the non-IOV exact path).
     if !model.analytical_init.is_empty() {
         return false;
     }
@@ -975,6 +1018,19 @@ fn run_obs_iov<const M: usize>(
 /// [`pd_from_program`](crate::sens::ode_provider::pd_from_program).
 pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     if !analytical_supported(model) || model.has_lagtime() || model.log_transform {
+        return false;
+    }
+    // The TV-cov event-driven walk does not yet layer the analytic
+    // `[initial_conditions]` impulse — #524 added exact init gradients only to the
+    // dose-superposition path (`subject_sensitivities` / `subject_eta_grad`), not to
+    // `run_obs_tvcov`. Production's `compute_predictions_with_tv`, however, always
+    // adds the `A₀·kernel` baseline. Admitting an init model here would walk a
+    // gradient that omits the init while the objective keeps it — a silent mismatch
+    // that biases the FOCE/FOCEI gradient (outer and inner). Decline init models so
+    // their TV-cov / oral-infusion subjects fall back to FD (which differentiates the
+    // true objective); their non-TV-cov subjects still take the exact init path. Lift
+    // this once the walk carries the init impulse (#524 follow-up).
+    if !model.analytical_init.is_empty() {
         return false;
     }
     // Bound total axes to the dual-walk dispatch cap so the outer (`m_dim`) and inner
@@ -1634,23 +1690,24 @@ fn subject_eta_grad_impl(
     let mut out = disp!(1, 2, 3, 4, 5, 6, 7, 8, 9)?;
     // Analytic `[initial_conditions]` impulse (#524): η-gradient only, layered on
     // BEFORE scaling — same insertion order as the f64 `pk::add_analytical_init`.
-    // `analytical_supported` (`init_supported`) bounds `n_theta + n_eta` to the
-    // dispatch table, and the inner path declines `ExpressionScale` above, so the
-    // `_ => {}` arm is unreachable for an init model that gets here.
+    // The inner path runs on `Dual1<n_eta>`, so it dispatches on `n_eta` (≤ the
+    // `n_theta + n_eta` that `init_supported` bounds to the table). The inner path
+    // declines `ExpressionScale` above, so the `_` arm is unreachable here.
     if !model.analytical_init.is_empty() {
-        let n_theta = model.n_theta;
-        macro_rules! disp_init {
-            ($($mm:literal),+) => {
-                match n_theta + n_eta {
-                    $($mm => apply_analytical_init_inner::<$mm>(
-                        &mut out, model, subject, &pk, &dp_deta, &slots, theta, eta,
-                        &subject.covariates, n_theta, n_eta,
-                    ),)+
-                    _ => {}
-                }
-            };
-        }
-        disp_init!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+        dispatch_init_impulse!(
+            n_eta,
+            apply_analytical_init_inner,
+            &mut out,
+            model,
+            subject,
+            &pk,
+            &dp_deta,
+            &slots,
+            theta,
+            eta,
+            &subject.covariates,
+            n_eta
+        );
     }
     // Constant `ScalarScale` output divisor: `f_scaled = f/k`, and `∂f/∂η` is
     // linear in `f` so it divides by the same `k` (η-independent). Matches
@@ -1945,46 +2002,43 @@ fn pk_slot_dual_outer<const M: usize>(
 }
 
 /// First-order counterpart of [`pk_slot_dual_outer`] for the inner η-gradient:
-/// only the η axes carry derivatives (from `dp_deta`); θ axes and the Hessian
-/// stay zero (the inner path consumes neither). Still a `Dual2<M>` so the same
-/// `eval_scale_dual` / init-impulse code differentiates it; the unused blocks are
-/// just zero.
-fn pk_slot_dual_inner<const M: usize>(
+/// a `Dual1<N>` (`N = n_eta`) seeded with `∂p/∂η_k` on axis `k` (from `dp_deta`).
+/// The inner EBE loop consumes only `∂f/∂η`, so this drops the θ axes and the
+/// `Dual2` Hessian the outer path carries — the η axes alone (no `n_theta` offset).
+/// A slot the program references but the provider does not differentiate
+/// (`slots` miss) enters as a constant.
+fn pk_slot_dual_inner<const N: usize>(
     slot: usize,
     value: f64,
     dp_deta: &[Vec<f64>],
     slots: &[usize],
-    n_theta: usize,
     n_eta: usize,
-) -> Dual2<M> {
+) -> Dual1<N> {
     match slots.iter().position(|&x| x == slot) {
         Some(j) => {
-            let mut grad = [0.0; M];
-            for k in 0..n_eta {
-                if n_theta + k < M {
-                    grad[n_theta + k] = dp_deta[j][k];
-                }
+            let mut grad = [0.0; N];
+            for k in 0..n_eta.min(N) {
+                grad[k] = dp_deta[j][k];
             }
-            Dual2 {
-                value,
-                grad,
-                hess: [[0.0; M]; M],
-            }
+            Dual1 { value, grad }
         }
-        None => Dual2::constant(value),
+        None => Dual1::constant(value),
     }
 }
 
 /// The seven PK-param duals the init impulse reads, built from a per-slot dual
 /// constructor. Order matches [`crate::pk::analytical_init_concentration_g`].
-struct InitPkDuals<const M: usize> {
-    cl: Dual2<M>,
-    v: Dual2<M>,
-    q: Dual2<M>,
-    v2: Dual2<M>,
-    ka: Dual2<M>,
-    q3: Dual2<M>,
-    v3: Dual2<M>,
+/// Generic over the seeded number type `T` so the outer path runs it as
+/// `Dual2<M>` (full `(θ,η)` jet + Hessian) and the inner path as `Dual1<n_eta>`
+/// (η-gradient only, no θ axes, no Hessian).
+struct InitPkDuals<T: crate::sens::num::PkNum> {
+    cl: T,
+    v: T,
+    q: T,
+    v2: T,
+    ka: T,
+    q3: T,
+    v3: T,
 }
 
 /// Add the analytic `[initial_conditions]` impulse to an already-computed jet
@@ -1992,22 +2046,23 @@ struct InitPkDuals<const M: usize> {
 /// scaling — the same insertion point as the f64 `pk::add_analytical_init` — so
 /// this runs after `run_obs`/`run_obs_grad` and before the scale/LTBS transforms.
 ///
-/// `a0_dual(prog)` evaluates the baseline amount `A₀` and its `(θ, η)` jet from
-/// the init program; `pk` supplies the seven PK-param duals. The impulse jet
-/// comes from [`crate::pk::analytical_init_concentration_g`] over `Dual2<M>`, so
+/// `a0_dual(prog)` evaluates the baseline amount `A₀` and its jet from the init
+/// program; `pk` supplies the seven PK-param duals. The impulse jet comes from
+/// [`crate::pk::analytical_init_concentration_g`] over the seeded type `T`, so
 /// `∂C/∂A₀` and `∂C/∂(CL,V,…)` are exact. `add(j, &c)` folds observation `j`'s
-/// impulse into the caller's jet (full Hessian for the outer path, value+grad for
-/// the inner). A reset (EVID=3/4) wipes the baseline, so observations at/after the
-/// first reset get none — matching `add_analytical_init_with`.
-fn add_init_impulse<const M: usize, FA, FAdd>(
+/// impulse into the caller's jet (full `Dual2` Hessian for the outer path, the
+/// `Dual1` η-gradient for the inner). A reset (EVID=3/4) wipes the baseline, so
+/// observations at/after the first reset get none — matching `add_analytical_init_with`.
+fn add_init_impulse<T, FA, FAdd>(
     model: &CompiledModel,
     subject: &Subject,
-    pk: &InitPkDuals<M>,
+    pk: &InitPkDuals<T>,
     mut a0_dual: FA,
     mut add: FAdd,
 ) where
-    FA: FnMut(&crate::parser::model_parser::ScaleDerivProgram) -> Dual2<M>,
-    FAdd: FnMut(usize, &Dual2<M>),
+    T: crate::sens::num::PkNum,
+    FA: FnMut(&crate::parser::model_parser::ScaleDerivProgram) -> T,
+    FAdd: FnMut(usize, &T),
 {
     let first_reset = subject
         .reset_times
@@ -2019,18 +2074,26 @@ fn add_init_impulse<const M: usize, FA, FAdd>(
             continue;
         };
         let a0 = a0_dual(prog);
-        if a0.value == 0.0 || !a0.value.is_finite() {
+        // Skip only a non-finite amount. Unlike the f64 value path
+        // (`add_analytical_init_with`), which drops `A₀ == 0` because it adds zero
+        // concentration, the gradient must NOT be dropped at `A₀ == 0`: the impulse
+        // is `C = A₀·kernel(t, pk)`, so `∂C/∂(θ,η) = kernel·∂A₀/∂(θ,η)` is nonzero
+        // wherever the amount has nonzero parameter sensitivity (e.g. an additive
+        // form passing through zero). Skipping there would zero a gradient component
+        // an FD of the objective still sees. With `A₀.val() == 0` the kernel jet
+        // folds value 0 and the correct `kernel·∂A₀/∂(θ,η)` gradient.
+        if !a0.val().is_finite() {
             continue;
         }
         for (j, &t) in subject.obs_times.iter().enumerate() {
             if t < 0.0 || t >= first_reset {
                 continue;
             }
-            let c = crate::pk::analytical_init_concentration_g::<Dual2<M>>(
+            let c = crate::pk::analytical_init_concentration_g::<T>(
                 model.pk_model,
                 init.cmt,
                 a0,
-                Dual2::constant(t),
+                T::from_f64(t),
                 pk.cl,
                 pk.v,
                 pk.q,
@@ -2071,7 +2134,7 @@ fn apply_analytical_init_outer<const M: usize>(
         q3: dual(PK_IDX_Q3, pk.q3()),
         v3: dual(PK_IDX_V3, pk.v3()),
     };
-    add_init_impulse::<M, _, _>(
+    add_init_impulse::<Dual2<M>, _, _>(
         model,
         subject,
         &pkd,
@@ -2107,10 +2170,13 @@ fn apply_analytical_init_outer<const M: usize>(
     );
 }
 
-/// Inner (Dual1-equivalent) analytic init impulse: η-gradient only, folded into
-/// `out`. Uses [`pk_slot_dual_inner`] (η axes carry derivatives, θ/Hessian zero).
+/// Inner analytic init impulse: η-gradient only, folded into `out`. Runs on
+/// `Dual1<N>` (`N = n_eta`) via [`pk_slot_dual_inner`] and
+/// [`ScaleDerivProgram::eval_scale_dual1`] — no θ axes, no Hessian, so the dual
+/// width is `n_eta` rather than the outer path's `n_theta + n_eta`, and `c.grad[k]`
+/// is `∂C/∂η_k` directly (no `n_theta` offset).
 #[allow(clippy::too_many_arguments)]
-fn apply_analytical_init_inner<const M: usize>(
+fn apply_analytical_init_inner<const N: usize>(
     out: &mut [ObsGrad],
     model: &CompiledModel,
     subject: &Subject,
@@ -2120,11 +2186,9 @@ fn apply_analytical_init_inner<const M: usize>(
     theta: &[f64],
     eta: &[f64],
     cov: &std::collections::HashMap<String, f64>,
-    n_theta: usize,
     n_eta: usize,
 ) {
-    let dual =
-        |slot: usize, val: f64| pk_slot_dual_inner::<M>(slot, val, dp_deta, slots, n_theta, n_eta);
+    let dual = |slot: usize, val: f64| pk_slot_dual_inner::<N>(slot, val, dp_deta, slots, n_eta);
     let pkd = InitPkDuals {
         cl: dual(PK_IDX_CL, pk.cl()),
         v: dual(PK_IDX_V, pk.v()),
@@ -2134,23 +2198,23 @@ fn apply_analytical_init_inner<const M: usize>(
         q3: dual(PK_IDX_Q3, pk.q3()),
         v3: dual(PK_IDX_V3, pk.v3()),
     };
-    add_init_impulse::<M, _, _>(
+    add_init_impulse::<Dual1<N>, _, _>(
         model,
         subject,
         &pkd,
         |prog| {
-            let var_duals: Vec<Dual2<M>> = prog
+            let var_duals: Vec<Dual1<N>> = prog
                 .var_to_pk_slot()
                 .iter()
                 .map(|&s| dual(s, pk.values.get(s).copied().unwrap_or(0.0)))
                 .collect();
-            prog.eval_scale_dual::<M>(theta, eta, cov, &var_duals)
+            prog.eval_scale_dual1::<N>(theta, eta, cov, &var_duals)
         },
         |j, c| {
             if let Some(o) = out.get_mut(j) {
                 o.f += c.value;
-                for k in 0..n_eta {
-                    o.df_deta[k] += c.grad[n_theta + k];
+                for k in 0..n_eta.min(N) {
+                    o.df_deta[k] += c.grad[k];
                 }
             }
         },
@@ -2348,18 +2412,21 @@ fn subject_sensitivities_impl(
     // `(θ, η)` axis count `n_theta + n_eta` (init programs use the same layout as
     // the scale program); `init_supported` bounds it to the table.
     if !model.analytical_init.is_empty() {
-        macro_rules! disp_init {
-            ($($mm:literal),+) => {
-                match n_theta + n_eta {
-                    $($mm => apply_analytical_init_outer::<$mm>(
-                        &mut sens, model, subject, &pk, &pd, &slots, theta, eta,
-                        &subject.covariates, n_theta, n_eta,
-                    ),)+
-                    _ => {}
-                }
-            };
-        }
-        disp_init!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+        dispatch_init_impulse!(
+            n_theta + n_eta,
+            apply_analytical_init_outer,
+            &mut sens,
+            model,
+            subject,
+            &pk,
+            &pd,
+            &slots,
+            theta,
+            eta,
+            &subject.covariates,
+            n_theta,
+            n_eta
+        );
     }
     // Constant `ScalarScale` output divisor: `f_scaled = f/k`. Every derivative is
     // linear in `f` and `k` is constant (`∂k/∂η = ∂k/∂θ = 0`), so the whole jet
@@ -3215,6 +3282,127 @@ mod tests {
                 }
             }
         }
+    }
+
+    // 1-cpt IV with WT-on-CL *and* an `[initial_conditions]` baseline. Regression
+    // for the #527/#524 review: the TV-cov event-driven walk does not layer the init
+    // impulse, so an init model must decline TV-cov analytic support and route its
+    // TV-cov subjects to FD — otherwise the analytic gradient omits the init baseline
+    // while the objective keeps it.
+    const ONECPT_IV_TVCOV_INIT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVC0(4.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[initial_conditions]
+  init(central) = TVC0 * V
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// #527/#524 review (finding #1): an `[initial_conditions]` model whose subject
+    /// has time-varying covariates must fall back to FD, because the TV-cov walk
+    /// never layers the init impulse. Before the fix `tvcov_analytical_supported`
+    /// returned `true` for the model and the walk silently dropped the `A₀·kernel`
+    /// baseline from the FOCE/FOCEI gradient (outer and inner) while the objective —
+    /// which uses the init-aware f64 predictor — kept it, biasing the estimates. The
+    /// non-TV-cov subjects of the same model must still take the exact init path.
+    #[test]
+    fn analytical_init_tvcov_subject_falls_back_to_fd() {
+        let m = parse_model_string(ONECPT_IV_TVCOV_INIT).expect("parse");
+        assert_eq!(m.analytical_init.len(), 1, "init parsed");
+        assert!(
+            !tvcov_analytical_supported(&m),
+            "init model must decline TV-cov analytic support (walk omits the init)"
+        );
+
+        let theta = vec![0.2, 10.0, 0.75, 4.0];
+        let eta = vec![0.15, -0.10];
+
+        // TV-cov subject (WT changes across records): outer full provider AND inner
+        // η-gradient must decline so the caller falls back to FD.
+        let tv = tvcov_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[70.0],
+            &[1.0, 2.0, 4.0, 8.0],
+            &[70.0, 80.0, 90.0, 100.0],
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        assert!(tv.has_tv_covariates(), "fixture must carry TV covariates");
+        assert!(
+            subject_sensitivities(&m, &tv, &theta, &eta).is_none(),
+            "TV-cov init subject must fall back to FD, not the init-less walk"
+        );
+        assert!(
+            subject_eta_grad(&m, &tv, &theta, &eta).is_none(),
+            "inner η-gradient must fall back to FD too"
+        );
+
+        // A static-covariate subject of the SAME model still takes the exact analytic
+        // init path (dose superposition + layered impulse).
+        let mut stat = oral_subject(&[1.0, 2.0, 4.0, 8.0]);
+        stat.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        stat.covariates = wt_map(70.0);
+        assert!(!stat.has_tv_covariates(), "static-covariate subject");
+        assert!(
+            subject_sensitivities(&m, &stat, &theta, &eta).is_some(),
+            "static-covariate init subject keeps the exact analytic init path"
+        );
+    }
+
+    // 1-cpt IV with `init(central) = TVC0 * V` and a `TVC0` bound that admits zero.
+    // At `TVC0 = 0` the baseline amount `A₀` is exactly 0 but `∂A₀/∂TVC0 = V ≠ 0`.
+    const ONECPT_IV_INIT_ZERO: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVC0(0.0, -50.0, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[initial_conditions]
+  init(central) = TVC0 * V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// #527/#524 review (finding #2): when the init amount evaluates to exactly 0 but
+    /// has nonzero parameter sensitivity, the gradient must NOT be dropped. Evaluated
+    /// at `TVC0 = 0`, `A₀ = 0` yet `∂A₀/∂TVC0 = V`, so the init contributes 0 to the
+    /// value but `V·kernel` to `∂f/∂TVC0` (and the mixed `∂²f/∂η∂TVC0`). Before the
+    /// fix `add_init_impulse` skipped the whole impulse on `A₀ == 0`, zeroing those
+    /// derivatives; the FD of the objective sees the nonzero slope, so the full
+    /// provider jet (checked here) diverged from FD on the `TVC0` axis.
+    #[test]
+    fn analytical_init_zero_amount_keeps_gradient() {
+        let m = parse_model_string(ONECPT_IV_INIT_ZERO).expect("parse");
+        assert_eq!(m.analytical_init.len(), 1, "init parsed");
+        assert!(
+            analytical_supported(&m),
+            "model must use the analytic provider"
+        );
+        let mut s = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        // TVC0 = 0 → A₀ = 0 exactly, the boundary the dropped-gradient bug lived on.
+        check_full_provider_vs_fd(&m, &s, &[0.2, 10.0, 0.0], &[0.1, -0.1]);
     }
 
     // 2-cpt IV with an *additive* η on V1 (`V1 = TVV1 + ETA_V1`): a non-log-normal

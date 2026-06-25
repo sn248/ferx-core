@@ -4223,6 +4223,51 @@ fn parse_scaling_key(key: &str) -> Result<(&str, Option<usize>), String> {
     }
 }
 
+/// Lower a parsed scalar expression to a `Dual2`-differentiable
+/// [`ScaleDerivProgram`] over `(θ, η, individual-parameter vars, covariates)`.
+///
+/// Single source of truth for the `obs_scale` (issue #367) and `init` amount
+/// (issue #524) programs — they share the same axis layout, so they must lower
+/// identically or the analytic provider would differentiate the two on
+/// inconsistent ABIs. A `Variable(name)` (an individual parameter) → var slot `i`
+/// (flat PK slot `pk_indices[i]`); covariates → sorted cov slots; θ/η are read
+/// directly from the seed duals. The input `expr` is cloned, so the caller keeps
+/// its AST for the runtime closure.
+fn compile_scale_deriv_program(
+    expr: &Expression,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    pk_indices: &[usize],
+) -> ScaleDerivProgram {
+    let mut e = expr.clone();
+    let var_idx: HashMap<String, usize> = indiv_var_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.clone(), i))
+        .collect();
+    let var_to_pk_slot: Vec<usize> = (0..indiv_var_names.len())
+        .map(|i| pk_indices.get(i).copied().unwrap_or(i))
+        .collect();
+    let mut cov_set = std::collections::HashSet::new();
+    collect_covariates(&e, &mut cov_set);
+    let mut cov_names: Vec<String> = cov_set.into_iter().collect();
+    cov_names.sort();
+    let cov_idx: HashMap<String, usize> = cov_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    resolve_expr_indices(&mut e, &var_idx, &cov_idx);
+    ScaleDerivProgram {
+        bc: compile_bytecode(&e),
+        n_theta: theta_names.len(),
+        n_eta: eta_names.len(),
+        var_to_pk_slot,
+        cov_names,
+    }
+}
+
 /// Build a `ScalingSpec` (None / ScalarScale / ExpressionScale) from one
 /// `obs_scale[…] = value` line. Shared between the uniform and per-CMT paths.
 fn build_obs_scale_spec(
@@ -4256,39 +4301,16 @@ fn build_obs_scale_spec(
         .map(|(i, name)| (name.clone(), pk_indices.get(i).copied().unwrap_or(i)))
         .collect();
     // Differentiable scale program (issue #367): compile the same expression to
-    // bytecode over (θ, η, individual-parameter vars, covariates) so the analytic
-    // sensitivity provider can differentiate `f / scale` exactly instead of
-    // finite-differencing the opaque closure. `Variable(name)` (an individual
-    // parameter) → var slot `i` (flat PK slot `pk_indices[i]`); covariates → cov
-    // slots; θ/η are read directly from the seed duals.
-    let deriv = {
-        let mut e = expr.clone();
-        let var_idx: HashMap<String, usize> = indiv_var_names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (name.clone(), i))
-            .collect();
-        let var_to_pk_slot: Vec<usize> = (0..indiv_var_names.len())
-            .map(|i| pk_indices.get(i).copied().unwrap_or(i))
-            .collect();
-        let mut cov_set = std::collections::HashSet::new();
-        collect_covariates(&e, &mut cov_set);
-        let mut cov_names: Vec<String> = cov_set.into_iter().collect();
-        cov_names.sort();
-        let cov_idx: HashMap<String, usize> = cov_names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.clone(), i))
-            .collect();
-        resolve_expr_indices(&mut e, &var_idx, &cov_idx);
-        Some(ScaleDerivProgram {
-            bc: compile_bytecode(&e),
-            n_theta: theta_names.len(),
-            n_eta: eta_names.len(),
-            var_to_pk_slot,
-            cov_names,
-        })
-    };
+    // bytecode so the analytic sensitivity provider can differentiate `f / scale`
+    // exactly instead of finite-differencing the opaque closure. Shared lowering
+    // with the `init` amount program (issue #524) — see `compile_scale_deriv_program`.
+    let deriv = Some(compile_scale_deriv_program(
+        &expr,
+        theta_names,
+        eta_names,
+        indiv_var_names,
+        pk_indices,
+    ));
     let scale_fn: ScaleFn = Box::new(
         move |theta: &[f64],
               eta: &[f64],
@@ -4374,38 +4396,12 @@ fn build_init_amount_fn(
     kappa_names: &[String],
 ) -> Result<(ScaleFn, Option<ScaleDerivProgram>), String> {
     // Build the differentiable `A₀` program from a (possibly resolved) expression
-    // AST, mirroring the `obs_scale` deriv block in `build_obs_scale_spec`: a
-    // `Variable(name)` (an individual parameter) → var slot `i` (flat PK slot
-    // `pk_indices[i]`); covariates → cov slots; θ/η are read from the seed duals.
-    // This lets the analytic sensitivity provider differentiate the init impulse
-    // exactly (issue #524) instead of finite-differencing `amount_fn`.
+    // AST. Shares the `obs_scale` lowering (`compile_scale_deriv_program`) so the
+    // init impulse and the scale divisor differentiate on the same ABI; this lets
+    // the analytic sensitivity provider differentiate the init impulse exactly
+    // (issue #524) instead of finite-differencing `amount_fn`.
     let build_deriv = |expr: &Expression| -> ScaleDerivProgram {
-        let mut e = expr.clone();
-        let var_idx: HashMap<String, usize> = indiv_var_names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (name.clone(), i))
-            .collect();
-        let var_to_pk_slot: Vec<usize> = (0..indiv_var_names.len())
-            .map(|i| pk_indices.get(i).copied().unwrap_or(i))
-            .collect();
-        let mut cov_set = std::collections::HashSet::new();
-        collect_covariates(&e, &mut cov_set);
-        let mut cov_names: Vec<String> = cov_set.into_iter().collect();
-        cov_names.sort();
-        let cov_idx: HashMap<String, usize> = cov_names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.clone(), i))
-            .collect();
-        resolve_expr_indices(&mut e, &var_idx, &cov_idx);
-        ScaleDerivProgram {
-            bc: compile_bytecode(&e),
-            n_theta: theta_names.len(),
-            n_eta: eta_names.len(),
-            var_to_pk_slot,
-            cov_names,
-        }
+        compile_scale_deriv_program(expr, theta_names, eta_names, indiv_var_names, pk_indices)
     };
 
     // Constant fast path (e.g. `init(central) = 0.0`). Still build a (constant)
@@ -9915,6 +9911,45 @@ impl ScaleDerivProgram {
         let empty_nn: Vec<Vec<f64>> = Vec::new();
         let mut stack: Vec<Dual2<M>> = Vec::new();
         eval_bytecode_g::<Dual2<M>>(
+            &self.bc, &theta_d, &eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
+        )
+    }
+
+    /// First-order η-only evaluation: returns `value` and `∂/∂η_k` on axis `k` over
+    /// `Dual1<N>` (`N = n_eta`). θ and individual-param vars enter as constants
+    /// except the seeded η axes, so this drops the θ axes and the `Dual2` Hessian
+    /// that [`eval_scale_dual`](Self::eval_scale_dual) carries. Used by the inner
+    /// init-amount gradient, whose EBE loop consumes only `∂A₀/∂η` (#524 follow-up).
+    pub(crate) fn eval_scale_dual1<const N: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        cov: &HashMap<String, f64>,
+        var_duals: &[crate::sens::dual1::Dual1<N>],
+    ) -> crate::sens::dual1::Dual1<N> {
+        use crate::sens::dual1::Dual1;
+        // θ and individual-param vars are constants on the inner path (no θ axes);
+        // η_k seeds axis k directly (no `n_theta` offset).
+        let theta_d: Vec<Dual1<N>> = theta.iter().map(|&v| Dual1::constant(v)).collect();
+        let eta_d: Vec<Dual1<N>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                if k < N {
+                    Dual1::var(v, k)
+                } else {
+                    Dual1::constant(v)
+                }
+            })
+            .collect();
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| cov.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let empty_nn: Vec<Vec<f64>> = Vec::new();
+        let mut stack: Vec<Dual1<N>> = Vec::new();
+        eval_bytecode_g::<Dual1<N>>(
             &self.bc, &theta_d, &eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
         )
     }

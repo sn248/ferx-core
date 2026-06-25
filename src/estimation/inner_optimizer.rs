@@ -2262,6 +2262,7 @@ mod tests {
                 covariate_sigma_index: 0,
             }),
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         };
 
         // Subject: 2 PK obs + 1 FREM obs
@@ -2514,6 +2515,7 @@ mod iov_tests {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         }
     }
 
@@ -3058,6 +3060,7 @@ mod iov_tests {
             endpoints: std::collections::HashMap::new(),
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
         };
         let subject = Subject {
             id: "1".into(),
@@ -3112,6 +3115,7 @@ mod iov_tests {
         let model = CompiledModel {
             frem_config: None,
             residual_error_eta: None,
+            analytical_init: Vec::new(),
             name: "noniov_mu".into(),
             has_conditional_eta_params: false,
             pk_model: PkModel::OneCptIv,

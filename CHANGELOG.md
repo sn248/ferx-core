@@ -19,6 +19,21 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **`[initial_conditions]` block for analytical PK models** (#521). Declare a
+  non-zero starting compartment amount with `init(central) = <expr>` (or
+  `init(depot) = ...`) on a closed-form 1-/2-/3-cpt model — the analytical
+  equivalent of NONMEM's `A_0(cmt)` and of the ODE-path `init(...)` in `[odes]`.
+  A pre-dose baseline (e.g. `init(central) = CONC0 * V`) no longer forces the
+  numerical ODE solver: on the 6-thioguanine `run14` model this cuts FOCEI wall
+  time ~13× (27 s → ~2 s) at matching estimates. Models with an initial
+  condition use `gradient = fd` for now (exact-analytic gradients are a
+  follow-up). Edge cases are handled explicitly: the baseline is wiped by a
+  system reset (`EVID = 3/4`), its decay uses each occasion's PK parameters under
+  IOV, a `KAPPA_*` reference in the init expression is rejected, and the
+  combination with a steady-state dose (`W_STEADY_STATE_INIT`) or a compartment
+  `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
+  mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
 - **Exact analytic FOCE/FOCEI gradient for `iiv_on_ruv` (IIV on residual error).**
   Models with a residual-error eta (`Y = IPRED + EPS·EXP(η_ruv)`) now use the

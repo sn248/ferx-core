@@ -65,6 +65,7 @@ website:
           - model-file/ode-models.qmd
           - model-file/absorption.qmd
           - model-file/scaling.qmd
+          - model-file/initial-conditions.qmd
           - model-file/diffusion.qmd
           - model-file/neural-networks.qmd
           - model-file/covariate-nn.qmd

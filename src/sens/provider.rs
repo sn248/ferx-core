@@ -211,6 +211,12 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
         && model.tv_fn.is_some()
         && model.n_kappa == 0
         && scaling_supported(model)
+        // Initial-compartment amounts (`[initial_conditions]`, #521) are added to
+        // the prediction by `pk::add_analytical_init` but the Dual2 sensitivity
+        // kernels here do not yet carry the init impulse or its θ/η dependence, so
+        // a model with one falls back to FD (correct, just slower). Phase 2 lifts
+        // this once the `*_init_g` differentiable forms land.
+        && model.analytical_init.is_empty()
         // Every individual-parameter slot must be one we differentiate. A
         // LAGTIME (slot 8) routes to fall back.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
@@ -515,6 +521,11 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
         return false;
     }
     if !matches!(model.scaling, ScalingSpec::None) || model.log_transform || model.has_lagtime() {
+        return false;
+    }
+    // Initial-compartment amounts (#521) are not yet differentiated by the
+    // analytic kernels — fall back to FD (see `analytical_supported`).
+    if !model.analytical_init.is_empty() {
         return false;
     }
     let n_eff = model.n_eta + model.n_kappa;

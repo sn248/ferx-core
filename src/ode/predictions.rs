@@ -17,7 +17,9 @@ use std::collections::HashMap;
 /// Break times are constructed to coincide with infusion start/end so any
 /// non-degenerate segment is either fully inside or fully outside each
 /// infusion window — this tolerance only guards float-equality on the bound.
-const INFUSION_EPS: f64 = 1e-12;
+/// `pub(crate)` so the analytic-sensitivity walks reuse the same value rather
+/// than hard-coding a parallel literal (#472 review [7]).
+pub(crate) const INFUSION_EPS: f64 = 1e-12;
 
 /// `is_infusion()` only checks `rate > 0`, but a degenerate row with
 /// `rate > 0 && amt <= 0` (or NaN) yields `duration = amt/rate <= 0`

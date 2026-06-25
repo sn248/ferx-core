@@ -227,6 +227,22 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
     true
 }
 
+/// True when an infusion with (lagged) window start `start` and length `duration` fully
+/// spans the integration segment `[seg_start, seg_end]` and has not been turned off by an
+/// intervening EVID 3/4 reset (`start >= reset_floor`). The boolean predicate shared by both
+/// analytic-sensitivity walks (`integrate_tvcov_g`, `integrate_g`) so the `reset_floor` guard
+/// and the production `INFUSION_EPS` window tolerance stay single-sourced (#472 review [7]).
+fn infusion_spans_segment(
+    start: f64,
+    duration: f64,
+    seg_start: f64,
+    seg_end: f64,
+    reset_floor: f64,
+) -> bool {
+    let eps = crate::ode::predictions::INFUSION_EPS;
+    start >= reset_floor && start <= seg_start + eps && start + duration >= seg_end - eps
+}
+
 /// True when the time-varying-covariate ODE walk ([`run_subject_tvcov`] /
 /// [`run_subject_tvcov_eta`]) can serve this `(model, subject)`: an in-scope analytic
 /// ODE model whose subject carries TV covariates and uses the **bolus** dose subset.
@@ -2305,14 +2321,16 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     // compartment 0, matching the dose-application path (#472 review #6).
                     .filter(|(_, d)| crate::ode::predictions::is_real_infusion(d) && d.cmt >= 1)
                     .filter(|(k, d)| {
-                        let start = d.time + lag_val(*k);
-                        // `start >= reset_floor`: an infusion started before the most recent
-                        // reset is off (#472 review #1) — exact comparison, matching
-                        // production's `active_infusions`. The window epsilon matches
-                        // production's `INFUSION_EPS = 1e-12` (was a looser 1e-9) (#472 #5).
-                        start >= reset_floor
-                            && start <= cur_t + 1e-12
-                            && start + d.duration >= t_event - 1e-12
+                        // The (lagged) window start; an infusion before the most recent reset
+                        // is off (#472 review #1), and the window tolerance is production's
+                        // `INFUSION_EPS` — both via the shared predicate (#472 review #5/[7]).
+                        infusion_spans_segment(
+                            d.time + lag_val(*k),
+                            d.duration,
+                            cur_t,
+                            t_event,
+                            reset_floor,
+                        )
                     })
                     .map(|(k, d)| {
                         (
@@ -2725,16 +2743,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 // `d.cmt >= 1`: a malformed `CMT=0` infusion must not saturate to compartment
                 // 0 (matches the bolus path above) (#472 review round 2 #6).
                 .filter(|d| d.is_infusion() && d.cmt >= 1)
-                // `d.time >= reset_floor`: an infusion started before the most recent reset is
-                // off — its window may straddle the reset (#472 review round 2 #1). Window
-                // epsilon = production's `INFUSION_EPS = 1e-12` (was a looser 1e-9), so the
-                // static walk includes/excludes a boundary infusion identically to production
-                // (#472 review round 2 #6).
-                .filter(|d| {
-                    d.time >= reset_floor
-                        && d.time <= t_start + 1e-12
-                        && d.time + d.duration >= t_end - 1e-12
-                })
+                // An infusion before the most recent reset is off — its window may straddle
+                // the reset (#472 review round 2 #1) — and the window tolerance is production's
+                // `INFUSION_EPS`; both via the shared predicate (the static walk has no lag, so
+                // the window start is `d.time`) (#472 review round 2 #6 / review [7]).
+                .filter(|d| infusion_spans_segment(d.time, d.duration, t_start, t_end, reset_floor))
                 .map(|d| (d.cmt.saturating_sub(1), d.rate))
                 .collect()
         };
@@ -3127,6 +3140,71 @@ mod tests {
         ];
         subject.reset_times = vec![8.0];
         check_hessian_vs_fd_of_grad(&model, &subject, &[1.0, 10.0, 0.5], &[0.1, 0.05]);
+    }
+
+    // 1-cpt **Michaelis–Menten (strongly nonlinear)** elimination with an estimated lagtime
+    // carrying IIV. The MM curvature `∂(ẋ)/∂central = −VM·KM/(KM+central)²` is large when
+    // `central ~ KM`, so a concurrent high-rate infusion forcing into the same compartment
+    // contributes a dominant `J·(rate·e_central)` to the bolus saltation's δlag² term — the
+    // term the bare-user-RHS velocity drops (#472 review [1]).
+    const MM_LAG_INF_ODE: &str = r#"
+[parameters]
+  theta TVVM(30.0, 1.0, 300.0)
+  theta TVKM(10.0, 0.5, 100.0)
+  theta TVV(10.0,  1.0, 200.0)
+  theta TVLAG(0.5, 0.01,  5.0)
+
+  omega ETA_VM  ~ 0.09
+  omega ETA_LAG ~ 0.04
+
+  sigma PROP_ERR ~ 0.05 (sd)
+[individual_parameters]
+  VM      = TVVM * exp(ETA_VM)
+  KM      = TVKM
+  V       = TVV
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -VM * central / (KM + central)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+
+    /// **Concurrent bolus + infusion under lagtime, nonlinear RHS** (the coverage gap from
+    /// #472 review [2]). A bolus co-timed with a finite-duration infusion into the same
+    /// MM-eliminated compartment, both shifted by an estimated lagtime with IIV. Exercises the
+    /// bolus saltation's full δlag² Hessian (`d²f/dη_LAG²`, `d²f/dη_LAG dθ`) in the presence of
+    /// a concurrent infusion forcing on a strongly nonlinear RHS — validated vs FD of the
+    /// analytic gradient. (Review finding [1] proposed adding the infusion forcing to the
+    /// saltation velocity `J·ẋ`; this test refutes it — the forcing is continuous across the
+    /// bolus event and does not shift with the bolus lag, so adding it to the event-time
+    /// saltation makes `d²f/dη_LAG²` diverge from FD here. The bare user-RHS velocity is
+    /// correct.)
+    #[test]
+    fn ode_provider_bolus_concurrent_infusion_lagtime_hessian_matches_fd() {
+        let model = parse_model_string(MM_LAG_INF_ODE).expect("parse MM lag+inf ODE");
+        assert!(model.has_lagtime());
+        let mut subject = bolus_subject(&[0.75, 1.0, 1.5, 2.0, 3.0, 4.5]);
+        // Co-timed bolus + high-rate finite-duration infusion into the MM compartment, both
+        // shifted by LAGTIME. Infusion rate 60, amt 240 → 4 h window; obs sit in the steep
+        // MM region just after the lagged arrival.
+        subject.doses = vec![
+            DoseEvent::new(0.0, 30.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(0.0, 240.0, 1, 60.0, false, 0.0),
+        ];
+        assert!(subject.doses[1].is_infusion() && model.has_lagtime());
+        assert!(ode_tvcov_supported(&model, &subject));
+        // η = [ETA_VM, ETA_LAG]; θ = [TVVM, TVKM, TVV, TVLAG].
+        // First validate the 1st-order gradient vs FD of the predictions (independent of the
+        // analytic Hessian internals): if df is correct, FD-of-df is the true d²f.
+        check_vs_production(&model, &subject, &[30.0, 10.0, 10.0, 0.5], &[0.1, 0.05]);
+        check_hessian_vs_fd_of_grad(&model, &subject, &[30.0, 10.0, 10.0, 0.5], &[0.1, 0.05]);
     }
 
     // 1-cpt oral ODE with an **estimated lagtime** on the depot dose. The dose arrives

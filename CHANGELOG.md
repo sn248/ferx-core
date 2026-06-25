@@ -30,7 +30,9 @@ section of the SDLC for the versioning policy).
   interaction column to `H̃`, the true-Hessian `2ε²/R` / `κⱼaⱼ` terms, and their
   `log|H̃|` θ/Ω/σ derivatives. Validated to ~1e-11 against reconverged finite
   differences of ferx's own FOCEI marginal (whose value is NONMEM-validated, #413).
-  ODE, IOV, and M3-BLOQ `iiv_on_ruv` keep the finite-difference gradient. (#474)
+  The assembly is provider-agnostic, so it covers both the closed-form (analytical
+  1-/2-/3-cpt) and **ODE** (`[odes]`) paths. IOV and M3-BLOQ `iiv_on_ruv` keep the
+  finite-difference gradient. (#474)
 - **Spurious "not referenced" warning for the `iiv_on_ruv` eta.** A residual-error
   random effect is referenced from `[error_model]` (not an individual-parameter
   expression), so it was falsely warned as "declared but not referenced … will not

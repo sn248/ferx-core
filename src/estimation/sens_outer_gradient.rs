@@ -2525,22 +2525,51 @@ mod tests {
         eta
     }
 
-    /// The exact analytic FOCEI population packed gradient for an `iiv_on_ruv`
-    /// model must match the Richardson-extrapolated reconverged-FD of ferx's own
-    /// scaled FOCEI marginal across every θ/Ω/σ coordinate — including the residual
-    /// eta's Ω entry (#474). This is the in-repo proof the analytic gradient with
-    /// the `exp(2·η_ruv)` variance terms is correct; the OFV *value* it
-    /// differentiates is independently NONMEM-validated (#413).
-    #[test]
-    fn population_packed_gradient_iiv_on_ruv_matches_fd() {
+    /// 2-cpt IV **user-ODE** model with IIV on residual error (`iiv_on_ruv`). Same
+    /// structure as `TWOCPT_ODE_OUTER` plus a dedicated `ETA_RUV` omega — exercises
+    /// the residual-eta assembly through the ODE Dual2 sensitivity provider (#474).
+    const TWOCPT_ODE_RUV: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  omega ETA_RUV ~ 0.10
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// Shared FD check for an `iiv_on_ruv` model: the analytic FOCEI population
+    /// packed gradient must match the Richardson-extrapolated reconverged-FD of
+    /// ferx's own scaled FOCEI marginal across every θ/Ω/σ coordinate — including
+    /// the residual eta's Ω entry (#474). The OFV *value* it differentiates is
+    /// independently NONMEM-validated (#413).
+    fn run_ruv_packed_check(model: &CompiledModel, theta: &[f64]) {
         use crate::estimation::parameterization::pack_params;
         use crate::types::Population;
 
-        let model = parse_model_string(WARFARIN_RUV).expect("parse");
-        assert_eq!(model.residual_error_eta, Some(3));
-        let theta = vec![0.22, 11.0, 1.4];
-        let s1 = ruv_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-        let s2 = ruv_subject(&model, &theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0, 72.0]);
+        let s1 = ruv_subject(model, theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let s2 = ruv_subject(model, theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0, 72.0]);
         let pop = Population {
             subjects: vec![s1, s2],
             covariate_names: vec![],
@@ -2551,17 +2580,17 @@ mod tests {
         };
 
         let mut template = model.default_params.clone();
-        template.theta = theta.clone();
+        template.theta = theta.to_vec();
         let x = pack_params(&template);
         let params = unpack_params(&x, &template);
         let ehs: Vec<DVector<f64>> = pop
             .subjects
             .iter()
-            .map(|s| DVector::from_vec(precise_ebe_ruv(&model, s, &params)))
+            .map(|s| DVector::from_vec(precise_ebe_ruv(model, s, &params)))
             .collect();
 
         let analytic =
-            population_gradient_sens(&model, &pop, &template, &x, &ehs).expect("ruv is analytic");
+            population_gradient_sens(model, &pop, &template, &x, &ehs).expect("ruv is analytic");
 
         // 2·Σᵢ Fᵢ at the reconverged (scaled) EBE — the production FOCEI OFV.
         let ofv = |xv: &[f64]| -> f64 {
@@ -2570,8 +2599,8 @@ mod tests {
                 .subjects
                 .iter()
                 .map(|s| {
-                    let eta = precise_ebe_ruv(&model, s, &p);
-                    marginal_nll_at(&model, s, &p, &eta)
+                    let eta = precise_ebe_ruv(model, s, &p);
+                    marginal_nll_at(model, s, &p, &eta)
                 })
                 .sum::<f64>()
         };
@@ -2595,6 +2624,28 @@ mod tests {
             );
             approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
         }
+    }
+
+    #[test]
+    fn population_packed_gradient_iiv_on_ruv_matches_fd() {
+        let model = parse_model_string(WARFARIN_RUV).expect("parse");
+        assert_eq!(model.residual_error_eta, Some(3));
+        run_ruv_packed_check(&model, &[0.22, 11.0, 1.4]);
+    }
+
+    /// The same residual-eta gradient must be exact on an **ODE** model: the
+    /// assembly is provider-agnostic, so the ODE `Dual2` sensitivities feed the
+    /// residual-eta `H̃`/`H`/`log|H̃|` terms exactly as the closed-form ones do
+    /// (#474). Confirms ODE + `iiv_on_ruv` is analytic, not FD.
+    #[test]
+    fn population_packed_gradient_ode_iiv_on_ruv_matches_fd() {
+        let model = parse_model_string(TWOCPT_ODE_RUV).expect("parse ODE ruv");
+        assert_eq!(model.residual_error_eta, Some(2));
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(&model),
+            "ODE + iiv_on_ruv must route to the analytic outer gradient (#474)"
+        );
+        run_ruv_packed_check(&model, &[4.0, 12.0, 2.0, 25.0]);
     }
 
     #[test]

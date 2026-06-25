@@ -270,13 +270,13 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
         && (sens_supported(model) || iov_analytical_supported(model))
         // IIV on residual error (#474): the analytic gradient (inner η-column +
-        // outer θ/Ω/σ variance terms) is implemented for the closed-form
-        // (non-ODE, non-IOV), non-M3 path only. ODE/IOV/M3 `iiv_on_ruv` keep the FD
-        // gradient on BOTH loops so the inner Jacobian and outer gradient stay
-        // matched (the residual-eta censored second derivatives are not assembled).
+        // outer θ/Ω/σ variance terms) is provider-agnostic, so it serves the
+        // closed-form AND ODE paths. IOV and M3-BLOQ `iiv_on_ruv` keep the FD
+        // gradient on BOTH loops — the IOV inner gradient does not carry the
+        // variance scaling, and the residual-eta censored second derivatives are
+        // not assembled.
         && !(model.residual_error_eta.is_some()
-            && (model.ode_spec.is_some()
-                || model.n_kappa > 0
+            && (model.n_kappa > 0
                 || matches!(model.bloq_method, crate::types::BloqMethod::M3)))
 }
 

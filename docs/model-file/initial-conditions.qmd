@@ -78,6 +78,24 @@ above — numerically equivalent, and still allocation-free.
 - **Central or depot only.** A peripheral-compartment initial amount needs the
   cross-compartment impulse response, which the analytical closed forms do not
   expose. Use an ODE model for that.
+- **No `KAPPA_*` (IOV) in the init expression.** The baseline amount is a single
+  t = 0 quantity evaluated with the between-subject η only, so a per-occasion
+  kappa reference would silently see `kappa = 0`. The parser rejects it (the same
+  guard as a Form C ODE readout, issue #107); reference the occasion-dependent
+  structural parameter (e.g. `CL`) instead. The baseline's *decay* over time does
+  use each observation's occasion-specific PK parameters on the IOV path.
+- **System resets wipe the baseline.** A reset record (NONMEM `EVID = 3/4`) zeros
+  every compartment, including the residual init baseline; nothing re-deposits
+  it. Observations at or after a reset therefore carry no baseline contribution.
+- **Steady-state doses warn.** A steady-state dose (`SS = 1`) already
+  pre-equilibrates an infinite dose history, so superposing an init baseline
+  double-counts the starting amount. The combination raises
+  `W_STEADY_STATE_INIT` rather than being silently combined.
+- **Compartment states / `[derived]` are not init-aware.** Predictions (PRED /
+  IPRED) include the baseline, but the analytical compartment-state
+  reconstruction does not seed it, so `[derived]` expressions referencing
+  `compartments[i]` evaluate to `NaN` for baseline models (`W_DERIVED_INIT_ANALYTICAL`).
+  Use an ODE model if compartment amounts are required.
 - **Gradient falls back to finite differences.** A model with
   `[initial_conditions]` uses `gradient = fd` automatically (the analytic
   `Dual2` sensitivity kernels do not yet carry the init impulse's θ/η

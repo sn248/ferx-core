@@ -1067,6 +1067,36 @@ pub fn check_model_data_warnings(
         ));
     }
 
+    // SS=1 dose combined with an [initial_conditions] baseline (#521). The SS
+    // closed form already assumes an infinite periodic dose history (the system
+    // is pre-equilibrated at the dose time), while the analytical init lays down a
+    // separate transient baseline that decays from t=0. Superposing the two is a
+    // valid linear combination but rarely what a user intends — an SS dose and an
+    // explicit starting amount usually express the same idea twice, double-counting
+    // the baseline. Surface it rather than silently combine them.
+    if !model.analytical_init.is_empty() {
+        let n_ss_init = population
+            .subjects
+            .iter()
+            .filter(|s| s.has_ss_doses())
+            .count();
+        if n_ss_init > 0 {
+            diags.push(Diagnostic::warning(
+                "W_STEADY_STATE_INIT",
+                format!(
+                    "{} subject(s) have SS=1 doses while the model declares an \
+                     [initial_conditions] baseline. The steady-state closed form \
+                     already pre-equilibrates an infinite dose history; the init \
+                     baseline is superposed on top as a separate decaying transient, \
+                     which double-counts the starting amount. Remove the SS flag or \
+                     the [initial_conditions] block unless this superposition is \
+                     intended.",
+                    n_ss_init
+                ),
+            ));
+        }
+    }
+
     // Modeled coded-RATE parameters (`D{cmt}` for RATE=-2 duration, `R{cmt}` for
     // RATE=-1 rate; #324) that are non-positive at the initial typical-value point
     // (eta = 0). `resolve_rate` clamps a transient `D ≤ 0` / `R ≤ 0` to its floor
@@ -2376,6 +2406,15 @@ pub(crate) fn compute_extra_output_columns(
                                     subject,
                                     &grid_times,
                                 )
+                            } else if !model.analytical_init.is_empty() {
+                                // Analytical model + [initial_conditions] baseline (#521):
+                                // the superposition state reconstruction does not seed the
+                                // baseline amount, so states would disagree with the
+                                // init-aware ipred. Return empty so every grid point
+                                // evaluates to NaN, consistent with per-obs compartment_states
+                                // being empty for baseline models. W_DERIVED_INIT_ANALYTICAL
+                                // in fit_inner tells the user why.
+                                vec![]
                             } else if subject.has_resets() {
                                 // Analytical model + EVID=3/4 reset: superposition is invalid
                                 // across reset boundaries. Return empty so every grid point
@@ -3260,6 +3299,21 @@ fn fit_inner(
                  are not available for subjects with resets; [derived] expressions \
                  that reference compartments[i] evaluate to NaN for those subjects. \
                  Use an ODE model if compartment states across resets are required."
+                    .to_string(),
+            );
+        }
+        // Analytical model with an [initial_conditions] baseline (#521): ipred is
+        // init-aware, but the superposition state reconstruction does not seed the
+        // baseline amount into the compartment vectors, so per-obs states (and the
+        // grid-integral path) return empty (→ NaN) rather than report amounts that
+        // disagree with ipred.
+        if model.ode_spec.is_none() && !model.analytical_init.is_empty() {
+            warnings.push(
+                "W_DERIVED_INIT_ANALYTICAL: analytical model with an \
+                 [initial_conditions] baseline — compartment states are not \
+                 available for baseline models (predictions are exact); [derived] \
+                 expressions that reference compartments[i] evaluate to NaN. Use an \
+                 ODE model with init(...) in [odes] if compartment amounts are required."
                     .to_string(),
             );
         }
@@ -8652,6 +8706,136 @@ mod tests_derived_iov_kappa {
         assert!(
             !diags.iter().any(|d| d.message.contains("ALAG")),
             "no compartment-indexed ALAGn warning for an analytical (non-ODE) model"
+        );
+    }
+
+    /// An SS=1 dose combined with an [initial_conditions] baseline double-counts
+    /// the starting amount (the SS closed form already pre-equilibrates an
+    /// infinite dose history). `check_model_data_warnings` must surface it
+    /// (W_STEADY_STATE_INIT) rather than silently superpose the two (#521 review).
+    #[test]
+    fn ss_dose_with_analytical_init_warns() {
+        let src = r#"
+[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[initial_conditions]
+  init(central) = 30 * V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("parse ok")
+            .model;
+        assert_eq!(model.analytical_init.len(), 1);
+
+        // Subject with a steady-state dose (ss=true, ii=24).
+        let subject = Subject {
+            fremtype: Vec::new(),
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
+            obs_times: vec![1.0, 6.0],
+            obs_raw_times: vec![1.0, 6.0],
+            observations: vec![1.0, 1.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_STEADY_STATE_INIT"),
+            "SS dose + [initial_conditions] must raise W_STEADY_STATE_INIT; got: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// No SS dose → no W_STEADY_STATE_INIT, even with an init baseline present.
+    #[test]
+    fn non_ss_dose_with_analytical_init_does_not_warn() {
+        let src = r#"
+[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[initial_conditions]
+  init(central) = 30 * V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("parse ok")
+            .model;
+        let subject = Subject {
+            fremtype: Vec::new(),
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: vec![1.0],
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        assert!(
+            !diags.iter().any(|d| d.code == "W_STEADY_STATE_INIT"),
+            "no SS dose → no W_STEADY_STATE_INIT"
         );
     }
 

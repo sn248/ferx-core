@@ -1953,6 +1953,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.eta_names,
             &model.indiv_param_names,
             &model.pk_indices,
+            &model.kappa_names,
         )?;
     }
 
@@ -4368,6 +4369,7 @@ fn build_init_amount_fn(
     eta_names: &[String],
     indiv_var_names: &[String],
     pk_indices: &[usize],
+    kappa_names: &[String],
 ) -> Result<ScaleFn, String> {
     // Constant fast path (e.g. `init(central) = 0.0`).
     if let Ok(k) = value.parse::<f64>() {
@@ -4378,6 +4380,22 @@ fn build_init_amount_fn(
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
     let expr = parse_scalar_expression(value, ctx)
         .map_err(|e| format!("[initial_conditions] init: {}", e))?;
+
+    // Reject KAPPA_* (IOV) references, mirroring the Form C ODE readout guard
+    // (`build_y_output_fn`, issue #107). The init expression's eta scope is
+    // BSV-only, so a kappa name parses as an unresolved identifier and would
+    // silently evaluate to 0 — giving a wrong baseline with no error. The
+    // baseline amount is a t=0 quantity built from BSV parameters; reference the
+    // occasion-dependent structural parameter (e.g. CL) if a κ-driven starting
+    // amount is needed (issue #521 review).
+    if let Some(name) = expr_references_kappa(&expr, kappa_names) {
+        return Err(format!(
+            "[initial_conditions] init: expression cannot reference the IOV \
+             parameter `{name}` — the baseline amount is evaluated once with the \
+             BSV eta and would see kappa = 0. Reference the occasion-dependent \
+             structural parameter (e.g. CL) instead."
+        ));
+    }
     let indiv_to_pk_slot: HashMap<String, usize> = indiv_var_names
         .iter()
         .enumerate()
@@ -4413,6 +4431,7 @@ fn parse_initial_conditions_block(
     eta_names: &[String],
     indiv_var_names: &[String],
     pk_indices: &[usize],
+    kappa_names: &[String],
 ) -> Result<Vec<crate::types::AnalyticalInit>, String> {
     if is_ode {
         return Err(
@@ -4437,8 +4456,14 @@ fn parse_initial_conditions_block(
                 name
             ));
         }
-        let amount_fn =
-            build_init_amount_fn(&expr, theta_names, eta_names, indiv_var_names, pk_indices)?;
+        let amount_fn = build_init_amount_fn(
+            &expr,
+            theta_names,
+            eta_names,
+            indiv_var_names,
+            pk_indices,
+            kappa_names,
+        )?;
         out.push(crate::types::AnalyticalInit { cmt, amount_fn });
     }
     Ok(out)
@@ -18795,6 +18820,74 @@ if (WT > 70) {
             err.contains("KAPPA") && err.contains("#107"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn init_amount_referencing_kappa_is_rejected_under_iov() {
+        // [initial_conditions] mirrors the Form C guard (#107/#521 review): the
+        // init expression's eta scope is BSV-only, so a KAPPA_* reference would
+        // silently evaluate to 0 and give a wrong baseline. Reject it instead.
+        let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVC0(5.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV
+  CONC0 = TVC0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[initial_conditions]
+  init(central) = CONC0 * V * exp(KAPPA_CL)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let err = parse_model_string(src)
+            .expect_err("init expression referencing KAPPA_* must be rejected under IOV");
+        assert!(
+            err.contains("KAPPA") && err.contains("IOV"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn init_amount_without_kappa_ref_is_allowed_under_iov() {
+        // The baseline reads only BSV/structural params; it must parse even when
+        // the model carries IOV elsewhere.
+        let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVC0(5.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV
+  CONC0 = TVC0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[initial_conditions]
+  init(central) = CONC0 * V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(src)
+            .expect("init expression without a KAPPA_* reference must parse under IOV");
+        assert_eq!(m.analytical_init.len(), 1);
     }
 
     #[test]

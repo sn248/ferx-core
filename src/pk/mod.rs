@@ -106,20 +106,59 @@ pub fn add_analytical_init(
     if model.analytical_init.is_empty() || model.ode_spec.is_some() {
         return;
     }
+    // Non-IOV path: one subject-static PK snapshot drives both the baseline
+    // amount and its decay kernel.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    add_analytical_init_with(model, subject, theta, eta, &pk, None, preds);
+}
+
+/// Core of [`add_analytical_init`], parameterised by the PK snapshot(s) used.
+///
+/// `amount_pk` evaluates the baseline amount `A₀` from the init expression
+/// (it references BSV individual parameters, so callers pass the BSV-only PK
+/// snapshot). `obs_decay_pk`, when `Some`, supplies the per-observation PK
+/// params that drive the *decay kernel* (CL/V/KA over time) — used by the IOV
+/// path so the baseline decays at each observation's occasion-specific
+/// clearance instead of the population/BSV rate (issue #521 review). When
+/// `None`, `amount_pk` drives the decay too (the non-IOV case).
+///
+/// A system reset (EVID=3/4) zeros every compartment, including the residual
+/// baseline; nothing re-deposits the t=0 init afterwards. So the baseline only
+/// contributes to observations strictly before the first reset — observations
+/// at or after it see none of it. `obs_times` is the internal monotonic clock
+/// (shared with `reset_times`), so the comparison is on the same timeline.
+fn add_analytical_init_with(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    amount_pk: &PkParams,
+    obs_decay_pk: Option<&[PkParams]>,
+    preds: &mut [f64],
+) {
+    let first_reset = subject
+        .reset_times
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
     for init in &model.analytical_init {
-        let a0 = (init.amount_fn)(theta, eta, &subject.covariates, &pk);
+        let a0 = (init.amount_fn)(theta, eta, &subject.covariates, amount_pk);
         if a0 == 0.0 || !a0.is_finite() {
             continue;
         }
         for (i, &t) in subject.obs_times.iter().enumerate() {
             // The initial amount is laid down at the subject's time origin
-            // (t=0); a pre-origin observation sees none of it.
-            if t < 0.0 {
+            // (t=0); a pre-origin observation sees none of it, and a reset
+            // wipes it for every observation at/after the reset time.
+            if t < 0.0 || t >= first_reset {
                 continue;
             }
+            let decay_pk = match obs_decay_pk {
+                Some(ps) => ps.get(i).unwrap_or(amount_pk),
+                None => amount_pk,
+            };
             if let Some(pred) = preds.get_mut(i) {
-                *pred += analytical_init_concentration(model.pk_model, init.cmt, a0, t, &pk);
+                *pred += analytical_init_concentration(model.pk_model, init.cmt, a0, t, decay_pk);
             }
         }
     }
@@ -499,9 +538,23 @@ pub fn predict_iov(
     // Needed here too because IMP (and any IOV-aware likelihood) predicts through
     // `predict_iov`; without it the baseline subjects would be mispredicted and
     // their importance weights collapse. No-op for ODE models and init-free
-    // models. Init expressions reference BSV parameters, so `eta_bsv` is the
-    // correct eta.
-    add_analytical_init(model, subject, theta, eta_bsv, &mut preds);
+    // models. Init expressions reference BSV parameters, so `eta_bsv` drives the
+    // baseline *amount*; the *decay* kernel uses the per-occasion `obs_params`
+    // (which carry each observation's occasion kappa + TV covariates), so an
+    // IOV-on-disposition baseline decays at the occasion-correct rate rather than
+    // the kappa-less BSV rate (issue #521 review).
+    if !model.analytical_init.is_empty() && model.ode_spec.is_none() {
+        let amount_pk = (model.pk_param_fn)(theta, eta_bsv, &subject.covariates);
+        add_analytical_init_with(
+            model,
+            subject,
+            theta,
+            eta_bsv,
+            &amount_pk,
+            Some(&obs_params),
+            &mut preds,
+        );
+    }
 
     // `[scaling]` post-multiply, applied **per occasion** so a κ-dependent scale
     // (or a scale referencing a κ-dependent individual parameter) uses that
@@ -1125,7 +1178,16 @@ pub fn compute_predictions_with_states(
         // TV covariates); states via predict_all_states (superposition only — valid
         // for the no-reset, no-TV case).
         let ipred = compute_predictions_with_tv(model, subject, theta, eta);
-        let states = if subject.has_resets() {
+        let states = if !model.analytical_init.is_empty() {
+            // [initial_conditions] baseline (#521): ipred is init-aware (the
+            // closed-form baseline is layered onto the central readout), but the
+            // superposition state reconstruction does not yet seed the baseline
+            // amount into the compartment vectors. Reporting states without the
+            // baseline would disagree with ipred. Return outer-empty → NaN
+            // compartments, matching the reset/TV/IOV convention.
+            // W_DERIVED_INIT_ANALYTICAL explains why.
+            vec![]
+        } else if subject.has_resets() {
             // Superposition is invalid across resets; return outer-empty vec so
             // compartments[i] → NaN via the .unwrap_or(&[]) fallback. Consistent
             // with the IOV convention. W_DERIVED_CMT_RESET_ANALYTICAL explains why.

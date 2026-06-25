@@ -28,7 +28,12 @@ section of the SDLC for the versioning policy).
   numerical ODE solver: on the 6-thioguanine `run14` model this cuts FOCEI wall
   time ~13× (27 s → ~2 s) at matching estimates. Models with an initial
   condition use `gradient = fd` for now (exact-analytic gradients are a
-  follow-up). See [Initial Conditions](model-file/initial-conditions.qmd).
+  follow-up). Edge cases are handled explicitly: the baseline is wiped by a
+  system reset (`EVID = 3/4`), its decay uses each occasion's PK parameters under
+  IOV, a `KAPPA_*` reference in the init expression is rejected, and the
+  combination with a steady-state dose (`W_STEADY_STATE_INIT`) or a compartment
+  `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
+  mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 
 ### Performance
 - **Ω-preconditioned inner EBE loop for all FOCE/FOCEI fits.** The inner BFGS

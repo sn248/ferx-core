@@ -1324,6 +1324,36 @@ pub fn split_obs_by_occasion(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
         .collect()
 }
 
+/// Map each occasion id to its group index `k` (the order [`split_obs_by_occasion`]
+/// returns). Shared by the closed-form (`build_iov_sources`) and ODE (`run_subject_iov` /
+/// `run_subject_iov_eta`) IOV providers so the occasion→group mapping is defined once
+/// (#466 review round 2).
+pub fn iov_occ_to_k(occ_groups: &[(u32, Vec<usize>)]) -> std::collections::HashMap<u32, usize> {
+    occ_groups
+        .iter()
+        .enumerate()
+        .map(|(k, (occ, _))| (*occ, k))
+        .collect()
+}
+
+/// The combined effect vector `[η_bsv, κ_g]` for occasion group `g`, sliced from a
+/// subject's stacked `[η_bsv, κ₁..κ_K]` vector. The **single source** of the κ-axis offset
+/// (`base = n_eta + g·n_kappa`) so the closed-form and ODE IOV providers cannot seed κ onto
+/// different axes — a change to the stacked layout now touches one place (#466 review
+/// round 2).
+pub fn iov_combined_effect(
+    stacked_eta: &[f64],
+    n_eta: usize,
+    n_kappa: usize,
+    g: usize,
+) -> Vec<f64> {
+    let mut c = Vec::with_capacity(n_eta + n_kappa);
+    c.extend_from_slice(&stacked_eta[..n_eta]);
+    let base = n_eta + g * n_kappa;
+    c.extend_from_slice(&stacked_eta[base..base + n_kappa]);
+    c
+}
+
 /// Build a block-diagonal omega from BSV omega and K copies of IOV omega.
 /// Used for the extended H-matrix in the FOCE outer loop with IOV.
 pub fn build_block_diag_omega(

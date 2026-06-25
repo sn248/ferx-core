@@ -1005,21 +1005,22 @@ pub fn per_subject_packed_gradients(
         .collect()
 }
 
-/// The exact analytic population gradient for an **IOV** model (FOCEI), packed
-/// space, or `None` if any subject is outside the IOV-analytical scope. `eta_hats`
-/// are the per-subject **BSV** EBEs and `kappas[i]` the per-occasion κ̂ for subject
-/// `i`; the two are stacked into `[η_bsv, κ₁..κ_K]` per subject before assembly.
-pub fn population_gradient_sens_iov(
+/// Per-subject analytic packed gradients for an **IOV** model — the IOV analogue of
+/// [`per_subject_packed_gradients`], exposing `None` per out-of-scope subject (rather than
+/// short-circuiting the whole population to FD) so the
+/// caller can keep the exact gradient for in-scope subjects and fill the rest with a
+/// per-subject reconverged FD (#466 review round 2). `eta_hats[i]` are the BSV EBEs and
+/// `kappas[i]` the per-occasion κ̂; both are stacked into `[η_bsv, κ₁..κ_K]` per subject.
+pub fn per_subject_packed_gradients_iov(
     model: &CompiledModel,
     population: &Population,
     template: &ModelParameters,
     x: &[f64],
     eta_hats: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
-) -> Option<Vec<f64>> {
-    let n = x.len();
-    // Subject-parallel; see `population_gradient_sens` (PR #381 review #7).
-    let per_subject: Vec<Vec<f64>> = population
+    interaction: bool,
+) -> Vec<Option<Vec<f64>>> {
+    population
         .subjects
         .par_iter()
         .enumerate()
@@ -1028,22 +1029,13 @@ pub fn population_gradient_sens_iov(
             for kap in &kappas[i] {
                 stacked.extend(kap.iter().copied());
             }
-            subject_packed_gradient_iov(model, subject, template, x, &stacked)
+            if interaction {
+                subject_packed_gradient_iov(model, subject, template, x, &stacked)
+            } else {
+                subject_packed_gradient_foce_iov(model, subject, template, x, &stacked)
+            }
         })
-        .collect::<Option<Vec<_>>>()?;
-    let mut grad = vec![0.0f64; n];
-    for gi in &per_subject {
-        for k in 0..n {
-            grad[k] += 2.0 * gi[k];
-        }
-    }
-    let fixed = packed_fixed_mask(template);
-    for k in 0..n {
-        if fixed[k] {
-            grad[k] = 0.0;
-        }
-    }
-    Some(grad)
+        .collect()
 }
 
 /// The exact per-subject **FOCE** (non-interaction) packed gradient `dFᵢ/dx`, or
@@ -1686,45 +1678,6 @@ pub fn subject_packed_gradient_foce_iov(
         g[kk] = fixed[kk] + coupling.dot(&eta_dx[kk]);
     }
     Some(g)
-}
-
-/// The exact analytic **FOCE** population gradient for an IOV model, packed space.
-/// `eta_hats[i]` are BSV EBEs, `kappas[i]` the per-occasion κ̂; stacked per subject.
-pub fn population_gradient_sens_foce_iov(
-    model: &CompiledModel,
-    population: &Population,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hats: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
-) -> Option<Vec<f64>> {
-    let n = x.len();
-    // Subject-parallel; see `population_gradient_sens` (PR #381 review #7).
-    let per_subject: Vec<Vec<f64>> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            let mut stacked: Vec<f64> = eta_hats[i].iter().copied().collect();
-            for kap in &kappas[i] {
-                stacked.extend(kap.iter().copied());
-            }
-            subject_packed_gradient_foce_iov(model, subject, template, x, &stacked)
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let mut grad = vec![0.0f64; n];
-    for gi in &per_subject {
-        for kk in 0..n {
-            grad[kk] += 2.0 * gi[kk];
-        }
-    }
-    let fixed = packed_fixed_mask(template);
-    for kk in 0..n {
-        if fixed[kk] {
-            grad[kk] = 0.0;
-        }
-    }
-    Some(grad)
 }
 
 /// Per-packed-coordinate EBE response `dη̂/dx_k` (each a length-`n_eta` vector),

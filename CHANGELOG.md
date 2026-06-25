@@ -20,6 +20,56 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Exact analytic FOCE/FOCEI gradients for IOV `[odes]` models** (#439). User-ODE
+  models with inter-occasion variability (`iov_column`, `kappa`) now get the exact
+  analytic outer (θ/Ω/σ) gradient over the stacked `[η_bsv, κ₁..κ_K]` random effects,
+  via the event-driven `Dual2` walk seeded with per-occasion κ axes (the same walk the
+  time-varying-covariate path uses, fed per-occasion parameters). Previously these fell
+  back to finite differences. First cut covers bolus dosing, **with or without
+  time-varying covariates** (each event is seeded at its own occasion × covariate
+  snapshot); out-of-scope subjects (infusion, steady state, resets, lagtime, scaling/LTBS,
+  IIV-on-residual-error, survival/TTE, or `n_θ + n_η + K·n_κ > 16`) route to FD as before.
+  The inner EBE loop also uses an exact analytic stacked-η gradient (a light first-order
+  walk), under the same model-level exclusions as the outer (it shares the
+  `gradient = fd` / escape-hatch / `iiv_on_ruv` / FREM / TTE bails); the IOV outer is
+  assembled per subject (exact analytic where in scope, per-subject reconverged-FD
+  elsewhere), so one out-of-scope subject no longer forces the whole fit onto FD.
+  **NONMEM comparison:** this is a gradient swap on the IOV FOCEI objective that is itself
+  NONMEM-validated — `tests/warfarin_iov_nonmem.rs` (`iov_objective_matches_nonmem`,
+  `iov_individual_cl_matches_nonmem`; OFV within ~0.6 units, all (ID,OCC) CL within 6.6%)
+  and `docs/model-file/iov.qmd`. The analytic gradient is result-neutral against finite
+  differences of that same objective / the production predictor and `predict_iov`.
+- **Exact analytic inner EBE gradient for closed-form IOV models** (#439). The inner
+  EBE optimisation for analytical 1-/2-/3-cpt IOV models now uses an exact analytic
+  stacked-`[η_bsv, κ₁..κ_K]` gradient (a light first-order event-driven walk) instead of
+  finite differences, matching the ODE IOV inner. Both IOV paths — closed-form and ODE
+  — now have analytic gradients on the inner and outer loops. Result-neutral (validated
+  against the second-order outer walk and finite differences of the inner objective).
+- **Exact analytic FOCE/FOCEI gradients for ODE models with an estimated lagtime**
+  (#439). User-`[odes]` models with an estimated lagtime — bare `LAGTIME`/`ALAG` **or**
+  compartment-indexed `ALAG{n}` — now get the exact analytic outer (θ/Ω/σ) gradient and
+  inner EBE η-gradient instead of finite differences. Lagtime is an *event-time*
+  sensitivity (the dose arrives at `t_dose + lagtime`); it is handled on the event-driven
+  walk via a per-dose event-time saltation injected at each dose and propagated through
+  the per-event parameters, so it is **exact across occasion / covariate boundaries and
+  for per-compartment (non-uniform) lags** — and **fully analytic, with no finite
+  differences** (the one non-parameter-dual piece, the trajectory curvature `J·ẋ`, comes
+  from a directional RHS evaluation). Composes with **time-varying covariates, IOV, EVID
+  3/4 resets, and finite-duration infusions** (for an infusion the window `[t+lag, t+lag+
+  dur]` shifts, so the saltation is applied at both rate boundaries). Lagtime + steady-
+  state dosing routes to FD (pending the separate SS feature). Result-neutral — validated
+  against the closed-form analytical twin (full Hessian), the production predictor (incl.
+  TV-cov, `ALAG1`, reset, infusion), and finite differences of `predict_iov` / the
+  population objective. **NONMEM comparison:** the lagtime semantics this differentiates
+  (dose/absorption shifted to `t_dose + ALAG`) are the production predictor's, validated
+  against NONMEM in `docs/model-file/lagtime.qmd` (NONMEM equivalence); the analytic
+  gradient is the exact derivative of that NONMEM-matching prediction (FD-confirmed).
+- **Event-driven analytic ODE sensitivities now cover EVID 3/4 resets and finite-duration
+  infusions** (#439). The TV-covariate / IOV event-driven sensitivity walk previously
+  declined subjects with a reset or an infusion (→ finite differences); it now zeros the
+  dual state at each reset (EVID=4 = reset + dose) and applies the per-event `F·rate`
+  forcing over each infusion window, so TV-cov and IOV models with resets or infusions get
+  exact analytic gradients. Result-neutral.
 - **`[initial_conditions]` block for analytical PK models** (#521). Declare a
   non-zero starting compartment amount with `init(central) = <expr>` (or
   `init(depot) = ...`) on a closed-form 1-/2-/3-cpt model — the analytical

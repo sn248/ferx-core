@@ -58,9 +58,12 @@ behave identically to the pre-feature path.
 - the analytic `Dual2` sensitivity gradient used during `fit()`,
 - the ODE path.
 
-In the niche case of a time-varying-covariate subject combined with a
-lagtime-bearing model, ferx-core silently falls back from the analytic gradient
-to finite differences — correctness is preserved at a small performance cost.
+On the ODE path the estimated lagtime gets the **exact analytic gradient** (outer
+θ/Ω/σ and inner EBE), including in combination with time-varying covariates, IOV,
+finite-duration infusions, and EVID 3/4 resets — the dose's event time is shifted
+to `t_dose + lagtime` and its sensitivity injected as an event-time saltation. A
+lagtime combined with steady-state dosing still falls back to finite differences;
+correctness is preserved at a small performance cost.
 
 ## NONMEM equivalence
 
@@ -68,6 +71,73 @@ NONMEM's per-compartment `ALAG1`, `ALAG2`, ... are mapped to a single
 `lagtime` slot in ferx-core, applied to all dose records of the model.
 For typical PK models (one absorption compartment, doses into the depot)
 this is equivalent to setting `ALAG1` on the depot compartment.
+
+### Numeric cross-check against NONMEM 7.5.1
+
+The analytic FOCE/FOCEI lagtime gradient is the exact derivative (verified
+result-neutral against finite differences) of the lagtime *prediction* — and that
+prediction is validated numerically against NONMEM. For a 1-cpt oral `SS=1` model
+(`II=24`, `AMT=100`, `CL=2`, `V=20`, `KA=1.5`, `ALAG1=1.5`), ferx's population
+`PRED` matches NONMEM 7.5.1 (`$ESTIMATION MAXEVAL=0`) to `<1e-4` relative across
+the dosing interval — including the two pre-lag samples that fall in the previous
+interval's steady-state tail (the case that historically regressed):
+
+| TIME | ferx `PRED` | NONMEM 7.5.1 `PRED` |
+|-----:|------------:|--------------------:|
+|  0.5 |     0.59069 |             0.59069 |
+|  1.0 |     0.56188 |             0.56188 |
+|  2.0 |     3.07370 |             3.07370 |
+|  4.0 |     4.46240 |             4.46240 |
+|  8.0 |     3.07540 |             3.07540 |
+| 12.0 |     2.06170 |             2.06170 |
+| 18.0 |     1.13150 |             1.13150 |
+| 23.0 |     0.68628 |             0.68628 |
+| 25.0 |     0.56188 |             0.56188 |
+| 30.0 |     0.34080 |             0.34080 |
+
+The reference (NONMEM control stream + data) and the assertion live in
+`tests/ss_lagtime_nonmem.rs`; per-path coverage (analytical / event-driven / ODE)
+is in the `*_with_lagtime_matches_nonmem` unit tests. Because the gradient is the
+exact derivative of this NONMEM-matching prediction, a FOCE/FOCEI fit driven by it
+descends the same objective surface NONMEM's `ALAG`-shifted prediction defines.
+
+### End-to-end estimation cross-check (FOCEI)
+
+To confirm the analytic lagtime gradient drives a full FOCEI estimation to the same
+optimum NONMEM reaches, a 1-cpt oral ODE model with an estimated `ALAG1` was fit to a
+simulated dataset (60 subjects, dense early sampling, IIV on CL/V/KA) in **both** ferx
+(`ode(states=[depot, central])` with the analytic lagtime gradient) and NONMEM 7.5.1
+(`ADVAN2 TRANS2`, `$ESTIMATION METHOD=1 INTER`, `$COVARIANCE`). NONMEM's `ADVAN2` is the
+**analytical** 1-cpt solution, so ferx is run with tight ODE tolerances
+(`ode_reltol = 1e-12`, `ode_abstol = 1e-14`) for an apples-to-apples comparison of the
+numerical integrator against the closed form:
+
+| Parameter      | True  | ferx FOCEI (± SE)      | NONMEM 7.5.1 FOCEI (± SE) |
+|----------------|------:|-----------------------:|--------------------------:|
+| OFV (−2LL)     |   —   | 176.6706               | 176.6706                  |
+| TVCL           | 0.134 | 0.142859 ± 0.00600     | 0.142859 ± 0.00592        |
+| TVV            | 8.1   | 8.35241 ± 0.1476       | 8.35241 ± 0.1457          |
+| TVKA           | 1.0   | 1.01212 ± 0.0435       | 1.01212 ± 0.0436          |
+| **TVLAG (h)**  | **0.5** | **0.492148 ± 0.0109** | **0.492148 ± 0.0125**    |
+| ω²CL           | 0.09  | 0.09662 ± 0.0195       | 0.09662 ± 0.0232          |
+| ω²V            | 0.02  | 0.01759 ± 0.0034       | 0.01759 ± 0.0033          |
+| ω²KA           | 0.09  | 0.08576 ± 0.0167       | 0.08576 ± 0.0150          |
+| σ (prop, SD)   | 0.05  | 0.049772 ± 0.0017      | 0.049772                  |
+
+The objective functions agree to `1e-4`, **every** point estimate to 5–6 significant
+figures, and the standard errors to within ~1 % (θ) / ~16 % (ω, the usual
+delta-method variance↔SD spread) — i.e. the analytic lagtime gradient lands the FOCEI
+optimiser on NONMEM's exact solution. The cross-check was confirmed at the objective
+level too: evaluated at NONMEM's final estimates, ferx's FOCEI objective is `176.6706`
+versus NONMEM's `176.6706`.
+
+::: callout-note
+For ODE models the FOCEI objective and its FD-Hessian covariance are only as accurate
+as the ODE integration. At loose tolerances the integration noise both perturbs the
+optimum and can render the covariance FD-Hessian indefinite (regularised SEs); use tight
+`ode_reltol`/`ode_abstol` when comparing against an analytical reference or when SEs look
+ill-conditioned.
+:::
 
 If both `lagtime=` and `alag=` are supplied on the same `[structural_model]`
 line (or if both keys appear in a programmatically constructed PK

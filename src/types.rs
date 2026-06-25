@@ -1641,11 +1641,24 @@ pub type ScaleFn =
 /// `(theta, eta, covariates, pk_params)` and returns `A₀`, so the expression
 /// may reference thetas, etas, covariates, and individual parameters (e.g.
 /// `init(central) = CONC0 * V`).
+///
+/// `#[non_exhaustive]`: constructed only inside the crate (the parser), and the
+/// field set grew once already (`amount_deriv`, #524). The marker keeps adding
+/// further compiled-program fields a non-breaking change for external callers.
+#[non_exhaustive]
 pub struct AnalyticalInit {
     /// 1-based compartment index the initial amount is deposited into.
     pub cmt: usize,
     /// Evaluates the initial amount `A₀` for a subject. See type docs.
     pub amount_fn: ScaleFn,
+    /// The same `A₀` expression compiled to a `Dual2`-differentiable program
+    /// (issue #524), so the analytic FOCE/FOCEI provider can differentiate the
+    /// init impulse `A₀ · kernel(t, pk)` exactly instead of falling back to
+    /// finite differences. Reuses [`ScaleDerivProgram`] — the init amount has the
+    /// same `(θ, η, individual-param, covariate)` shape as an `obs_scale`
+    /// expression. `None` only for hand-constructed inits with no parsed
+    /// expression (those keep the FD fallback).
+    pub amount_deriv: Option<crate::parser::model_parser::ScaleDerivProgram>,
 }
 
 /// How the structural model's raw output is mapped to the observed `DV`.

@@ -3350,6 +3350,136 @@ mod tests {
         }
     }
 
+    // 1-cpt oral with a parameter-dependent central baseline (#524). The analytic
+    // init impulse and its θ/η jet must flow through the packed FOCEI/FOCE
+    // population gradient — i.e. the gradient that `gradient = auto` uses must
+    // match Richardson FD of the marginal objective (`gradient = fd`), the
+    // population-level analogue of the per-subject provider-vs-FD init test.
+    const ONECPT_ORAL_INIT_OUTER: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVC0(5.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[initial_conditions]
+  init(central) = TVC0 * V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    #[test]
+    fn population_packed_gradient_init_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+
+        let model = parse_model_string(ONECPT_ORAL_INIT_OUTER).expect("parse init outer");
+        assert_eq!(model.analytical_init.len(), 1);
+        assert!(
+            crate::sens::provider::analytical_supported(&model),
+            "init model must use the analytic outer gradient, not FD"
+        );
+        let theta = [0.22, 11.0, 1.4, 6.0];
+        let eta_ref = [0.12, -0.08, 0.2];
+
+        // Two plain (non-TV) subjects with a baseline-bearing oral dose; obs are
+        // the init-aware prediction at eta_ref scaled down so EBEs are non-trivial.
+        let make = |id: &str, times: &[f64]| -> Subject {
+            let n = times.len();
+            let mut s = Subject {
+                id: id.to_string(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: times.to_vec(),
+                obs_raw_times: Vec::new(),
+                observations: vec![0.0; n],
+                obs_cmts: vec![1; n],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; n],
+                occasions: vec![1; n],
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            };
+            let preds = crate::pk::compute_predictions_with_tv(&model, &s, &theta, &eta_ref);
+            s.observations = preds.iter().map(|p| p * 0.85).collect();
+            s
+        };
+        let pop = Population {
+            subjects: vec![
+                make("init_a", &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
+                make("init_b", &[1.0, 3.0, 6.0, 12.0]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+
+        for interaction in [true, false] {
+            let analytic = if interaction {
+                population_gradient_sens(&model, &pop, &template, &x, &ehs)
+            } else {
+                population_gradient_sens_foce(&model, &pop, &template, &x, &ehs)
+            }
+            .expect("init subject supported by analytic gradient");
+
+            let ofv = |xv: &[f64]| -> f64 {
+                let p = unpack_params(xv, &template);
+                2.0 * pop
+                    .subjects
+                    .iter()
+                    .map(|s| {
+                        if interaction {
+                            marginal_nll(&model, s, &p)
+                        } else {
+                            marginal_nll_foce(&model, s, &p)
+                        }
+                    })
+                    .sum::<f64>()
+            };
+            let fd_at = |k: usize, h: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[k] += h;
+                let mut xm = x.clone();
+                xm[k] -= h;
+                (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+            };
+            for k in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[k].abs());
+                let f1 = fd_at(k, h);
+                let f2 = fd_at(k, h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0;
+                approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
+            }
+        }
+    }
+
     // 1-cpt oral with a log-normal dose lagtime (`LAGTIME = TVLAG·exp(ETA_LAG)`):
     // the lagtime θ (`TVLAG`) and ω (`ETA_LAG`) enter the packed gradient through
     // the provider's `∂f/∂θ` / `∂²f/∂η∂θ` for the lag slot, with no special-casing.

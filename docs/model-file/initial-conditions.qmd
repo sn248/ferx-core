@@ -96,11 +96,14 @@ above — numerically equivalent, and still allocation-free.
   reconstruction does not seed it, so `[derived]` expressions referencing
   `compartments[i]` evaluate to `NaN` for baseline models (`W_DERIVED_INIT_ANALYTICAL`).
   Use an ODE model if compartment amounts are required.
-- **Gradient falls back to finite differences.** A model with
-  `[initial_conditions]` uses `gradient = fd` automatically (the analytic
-  `Dual2` sensitivity kernels do not yet carry the init impulse's θ/η
-  dependence). Results are correct; the exact-analytic outer/inner gradient is a
-  planned follow-up. The startup banner reports `gradient: FD [requested: auto]`.
+- **IOV models fall back to finite differences.** A non-IOV
+  `[initial_conditions]` model uses exact analytic FOCE/FOCEI gradients under
+  `gradient = auto` (issue #524): the `Dual2`/`Dual1` sensitivity kernels carry
+  the init impulse and its θ/η dependence, so the baseline no longer forces FD.
+  An **IOV** model (kappa) with an init baseline still uses `gradient = fd`
+  automatically — the per-occasion analytic init gradient is a planned follow-up.
+  Results are correct in both cases; for an IOV init model the startup banner
+  reports `gradient: FD [requested: auto]`.
 
 ## NONMEM comparison
 

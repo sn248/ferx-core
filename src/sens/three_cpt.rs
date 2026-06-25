@@ -99,6 +99,23 @@ pub fn three_cpt_iv_bolus_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> T {
+    three_cpt_iv_bolus_amt_g(T::from_f64(amt), t, cl, v1, q2, v2, q3, v3)
+}
+
+/// As [`three_cpt_iv_bolus_g`] but with a generic amount `amt` (issue #524), so
+/// an analytical initial condition `A₀(θ,η)` threads its sensitivity through the
+/// central impulse. The single-dose path delegates here with a constant `amt`.
+#[allow(clippy::too_many_arguments)]
+pub fn three_cpt_iv_bolus_amt_g<T: PkNum>(
+    amt: T,
+    t: T,
+    cl: T,
+    v1: T,
+    q2: T,
+    v2: T,
+    q3: T,
+    v3: T,
+) -> T {
     if t.val() < 0.0 || v1.val() <= 0.0 || v2.val() <= 0.0 || v3.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
@@ -113,7 +130,7 @@ pub fn three_cpt_iv_bolus_g<T: PkNum>(
     if ab.val().abs() < 1e-12 || ag.val().abs() < 1e-12 || bg.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }
-    let d = T::from_f64(amt) / v1;
+    let d = amt / v1;
     let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
     let b = d * (beta - k21) * (beta - k31) / (-(ab) * bg);
     let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
@@ -188,6 +205,24 @@ pub fn three_cpt_oral_g<T: PkNum>(
     ka: T,
     f_bio: T,
 ) -> T {
+    three_cpt_oral_amt_g(T::from_f64(amt), t, cl, v1, q2, v2, q3, v3, ka, f_bio)
+}
+
+/// As [`three_cpt_oral_g`] but with a generic amount `amt` (issue #524); the
+/// initial-condition path passes a pre-loaded depot `A₀` as a dual with `F = 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn three_cpt_oral_amt_g<T: PkNum>(
+    amt: T,
+    t: T,
+    cl: T,
+    v1: T,
+    q2: T,
+    v2: T,
+    q3: T,
+    v3: T,
+    ka: T,
+    f_bio: T,
+) -> T {
     if t.val() < 0.0
         || v1.val() <= 0.0
         || v2.val() <= 0.0
@@ -208,7 +243,7 @@ pub fn three_cpt_oral_g<T: PkNum>(
     if ab.val().abs() < 1e-12 || ag.val().abs() < 1e-12 || bg.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }
-    let coeff = f_bio * T::from_f64(amt) * ka / v1;
+    let coeff = f_bio * amt * ka / v1;
     let a = (alpha - k21) * (alpha - k31) / (ab * ag);
     let b = (beta - k21) * (beta - k31) / (-(ab) * bg);
     let c = (gamma - k21) * (gamma - k31) / (ag * bg);

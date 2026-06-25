@@ -38,6 +38,13 @@ pub(crate) fn macro_rates_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> (T, T, T) {
 /// 2-cpt IV bolus: `C = A·e^{−αt} + B·e^{−βt}`. `t` is generic so the caller can
 /// seed it as a dual carrying the lagtime sensitivity (`∂t/∂lagtime = −1`).
 pub fn two_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T) -> T {
+    two_cpt_iv_bolus_amt_g(T::from_f64(amt), t, cl, v1, q, v2)
+}
+
+/// As [`two_cpt_iv_bolus_g`] but with a generic amount `amt` (issue #524), so an
+/// analytical initial condition `A₀(θ,η)` threads its sensitivity through the
+/// central impulse. The single-dose path delegates here with a constant `amt`.
+pub fn two_cpt_iv_bolus_amt_g<T: PkNum>(amt: T, t: T, cl: T, v1: T, q: T, v2: T) -> T {
     if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 {
         return T::from_f64(0.0);
     }
@@ -50,7 +57,7 @@ pub fn two_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T) -
     if diff.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }
-    let amt_v1 = T::from_f64(amt) / v1;
+    let amt_v1 = amt / v1;
     let a = amt_v1 * (alpha - k21) / diff;
     let b = amt_v1 * (k21 - beta) / diff;
     a * (-(alpha * t)).exp() + b * (-(beta * t)).exp()
@@ -94,6 +101,13 @@ pub fn two_cpt_infusion_g<T: PkNum>(
 
 /// 2-cpt oral (first-order absorption), with `ka ≈ α`/`ka ≈ β` L'Hôpital limits.
 pub fn two_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T) -> T {
+    two_cpt_oral_amt_g(T::from_f64(amt), t, cl, v1, q, v2, ka, f_bio)
+}
+
+/// As [`two_cpt_oral_g`] but with a generic amount `amt` (issue #524); the
+/// initial-condition path passes a pre-loaded depot `A₀` as a dual with `F = 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn two_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T) -> T {
     if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 || ka.val() <= 0.0 {
         return T::from_f64(0.0);
     }
@@ -106,7 +120,7 @@ pub fn two_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T, ka: T
     if diff.val().abs() < 1e-12 {
         return T::from_f64(0.0);
     }
-    let d = f_bio * T::from_f64(amt) * ka / v1;
+    let d = f_bio * amt * ka / v1;
     let tt = t;
 
     // Combined ka→α (or ka→β) L'Hôpital limit: the e^{-ka·t} term shares the

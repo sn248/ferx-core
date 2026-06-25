@@ -3198,10 +3198,14 @@ pub struct FitResult {
     /// BOBYQA (derivative-free), built-in BFGS, GN, and SAEM.
     pub final_gradient: Option<Vec<f64>>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
-    /// Outer optimizer used for this fit, as a short lowercase label
-    /// ("bobyqa", "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs",
-    /// "trust_region").  Always populated; the label is the same regardless of
-    /// method chain length.
+    /// Outer optimizer used for this fit, as a lowercase label ("bobyqa",
+    /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
+    /// `optimizer = auto` default resolved the choice, the label is the compound
+    /// form `"auto (<resolved>)"` — e.g. `"auto (nlopt_lbfgs)"` — recording both
+    /// the setting and what actually ran. SAEM/GN/IMP report their own fixed
+    /// labels ("saem", "gn", "imp-bobyqa", "impmap-bobyqa"). Always populated;
+    /// the label is the same regardless of method chain length. Consumers that
+    /// match on the label should accept the `auto (...)` prefix (#490).
     pub optimizer: String,
     /// Number of random multi-starts attempted. 1 means a single fit from
     /// the model-file initial values (no multi-start).
@@ -3799,15 +3803,15 @@ impl Default for FitOptions {
             covariance_ofv_hessian: true,
             interaction: true,
             verbose: true,
-            // BOBYQA — derivative-free quadratic trust-region. Chosen as the
-            // default because the fixed-EBE FD gradient that SLSQP/L-BFGS rely
-            // on is biased on ill-conditioned fits (ODE/PD models, sparse data,
-            // Hill-ridge identifiability), and SLSQP can declare convergence
-            // hundreds of OFV units above the true minimum. BOBYQA re-evaluates
-            // EBEs at every trial point and routinely reaches a lower OFV
-            // without the cost of `reconverge_gradient_interval = 1`. See
-            // `docs/estimation/optimizers.qmd` for the cefepime and Emax
-            // PKPD validations and guidance on when to switch back to SLSQP.
+            // `Auto` resolves per model (see `Optimizer::resolve_auto`): the
+            // gradient-based NLopt L-BFGS when the exact analytic FOCE/FOCEI
+            // gradient is available, and the derivative-free BOBYQA otherwise.
+            // BOBYQA is the fallback because the fixed-EBE FD gradient that the
+            // gradient-based optimizers rely on is biased on ill-conditioned fits
+            // (ODE/PD models, sparse data, Hill-ridge identifiability), where
+            // SLSQP can declare convergence hundreds of OFV units above the true
+            // minimum. See `docs/estimation/optimizers.qmd` for the benchmarking
+            // (#490) behind these defaults and how to pin an optimizer explicitly.
             optimizer: Optimizer::Auto,
             inner_optimizer: InnerOptimizer::Auto,
             lbfgs_memory: 5,
@@ -4045,11 +4049,11 @@ impl Optimizer {
         if self != Optimizer::Auto {
             return self;
         }
-        let user_forces_fd = matches!(model.gradient_method, GradientMethod::Fd);
-        let analytic = !user_forces_fd
-            && (crate::sens::provider::sens_supported(model)
-                || crate::sens::provider::iov_analytical_supported(model));
-        if analytic {
+        // Use the single shared predicate so `auto` can never disagree with the
+        // outer loop's actual gradient dispatch (#490 review): resolving to a
+        // gradient-based optimizer while the loop ran FD would feed it a noisy
+        // gradient.
+        if crate::sens::provider::analytic_outer_gradient_available(model) {
             Optimizer::NloptLbfgs
         } else {
             Optimizer::Bobyqa

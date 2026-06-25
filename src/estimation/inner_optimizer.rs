@@ -70,14 +70,6 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     if model.has_tte() {
         return Some("time-to-event ([event_model]) hazard likelihood");
     }
-    // IIV on residual error (`Y = IPRED + EPS*EXP(ETA)`). The analytical kernels
-    // build the residual variance from σ alone and have no rule for the
-    // per-subject `exp(2·η_ruv)` scaling; the EBE search must see the scaled
-    // variance, so route these models to FD (which differences the real
-    // `individual_nll`, where the scale is applied). See #409.
-    if model.residual_error_eta.is_some() {
-        return Some("IIV on residual error (iiv_on_ruv)");
-    }
     None
 }
 
@@ -930,11 +922,17 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     ) {
         return false;
     }
-    // IIV on residual error (#409): the Dual2 kernels build the residual variance
-    // from σ alone and carry no `exp(2·η_ruv)` scaling rule, so the EBE search
-    // must reconverge against the scaled `individual_nll` under FD (same reason as
-    // `analytical_ad_unsupported`).
-    if model.residual_error_eta.is_some() {
+    // IIV on residual error (#409/#474): the closed-form inner η-gradient
+    // (`analytic_eta_nll_gradient_with_schedule`) scales `v`/`dv_df` by
+    // `exp(2·η_ruv)` and carries the `η_ruv` variance column, so the closed-form
+    // path serves these models analytically. (The ODE inner kernel still lacks the
+    // scaling and bails below; the outer predicate keeps ODE/IOV ruv on FD so the
+    // two halves stay matched.) M3 BLOQ + `iiv_on_ruv` keeps FD on both loops — the
+    // residual-eta censored second derivatives are not assembled (matching the
+    // conservative IOV+M3 choice).
+    if model.residual_error_eta.is_some()
+        && matches!(model.bloq_method, crate::types::BloqMethod::M3)
+    {
         return false;
     }
     crate::sens::provider::analytical_supported(model)
@@ -1065,16 +1063,26 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     )?;
     let n_eta = model.n_eta;
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
+    // IIV on residual error (`Y = IPRED + EPS·EXP(η_ruv)`, #409/#474): the residual
+    // variance of every observation scales by `s = exp(2·η_ruv)`, so `v` and
+    // `dv_df` carry that factor. `η_ruv` enters the likelihood only through the
+    // variance (`∂f/∂η_ruv = 0`), so its gradient column is the variance term
+    // `Σ_j (1 − ε²/v)`, plus the `Ω⁻¹η` prior added below — not the shared
+    // `coef·∂f/∂η` loop. (M3 censoring + `iiv_on_ruv` routes to FD upstream, so the
+    // residual-eta column is only ever formed on quantified rows here.)
+    let ruv_idx = model.residual_error_eta;
+    let ruv_scale = model.residual_var_scale(eta);
     let mut grad = vec![0.0_f64; n_eta];
+    let mut ruv_grad = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
         let y = subject.observations[j];
         let cmt = subject.obs_cmts[j];
         let f = obs.f;
-        let v = model.residual_variance_at(cmt, f, sigma);
+        let v = model.residual_variance_at(cmt, f, sigma) * ruv_scale;
         if !(v > 0.0) {
             return None;
         }
-        let dv_df = model.error_spec.dvar_df(cmt, f, sigma);
+        let dv_df = model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale;
         let coef = if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
             m3_censored_dterm_df(y, f, v, dv_df)
         } else {
@@ -1084,6 +1092,15 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         for k in 0..n_eta {
             grad[k] += coef * obs.df_deta[k];
         }
+        if ruv_idx.is_some() {
+            // ∂/∂η_ruv of the per-obs data term: `1 − ε²/v` (the `∂v/∂η_ruv = 2v`
+            // factor cancels the ½).
+            let eps = y - f;
+            ruv_grad += 1.0 - eps * eps / v;
+        }
+    }
+    if let Some(r) = ruv_idx {
+        grad[r] += ruv_grad;
     }
     // Prior: ∂/∂η ½ η'Ω⁻¹η = Ω⁻¹η.
     let eta_v = nalgebra::DVector::from_column_slice(eta);
@@ -2592,6 +2609,87 @@ mod iov_tests {
                 max_relative = 1e-5,
                 epsilon = 1e-7
             );
+        }
+    }
+
+    /// IIV on residual error (#474): the closed-form inner η-gradient must match a
+    /// The inner-gradient model gate accepts a closed-form `iiv_on_ruv` model but
+    /// declines M3 BLOQ + `iiv_on_ruv` (those keep FD on both loops, #474).
+    #[test]
+    fn analytic_inner_grad_gate_iiv_on_ruv() {
+        use crate::parser::model_parser::parse_model_string;
+        let mut model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.13,0.001,10.0)\n  theta TVV(8.0,0.1,500.0)\n  theta TVKA(1.0,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.10\n  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n",
+        )
+        .expect("parse");
+        assert!(analytic_inner_grad_supported_model(&model));
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(!analytic_inner_grad_supported_model(&model));
+    }
+
+    /// central finite difference of the production `individual_nll` (which applies
+    /// the `exp(2·η_ruv)` variance scaling) at a non-zero η — including the `η_ruv`
+    /// column, which the shared `coef·∂f/∂η` loop never touches (`∂f/∂η_ruv = 0`).
+    #[test]
+    fn analytic_eta_gradient_matches_fd_iiv_on_ruv() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.13,0.001,10.0)\n  theta TVV(8.0,0.1,500.0)\n  theta TVKA(1.0,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.10\n  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n",
+        )
+        .expect("parse");
+        assert_eq!(model.residual_error_eta, Some(3));
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![2.1, 3.4, 4.0, 3.1, 1.8, 1.1, 0.4],
+            obs_cmts: vec![1; 7],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 7],
+            occasions: vec![1; 7],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let params = model.default_params.clone();
+        // A genuinely non-zero η, including the residual-error component.
+        let eta = [0.20_f64, -0.15, 0.30, 0.25];
+
+        let analytic = analytic_eta_nll_gradient(
+            &model,
+            &subject,
+            &params.theta,
+            &eta,
+            &params.omega,
+            &params.sigma.values,
+        )
+        .expect("closed-form ruv model is in analytic inner scope");
+
+        let nll = |e: &[f64]| {
+            crate::stats::likelihood::individual_nll(
+                &model,
+                &subject,
+                &params.theta,
+                e,
+                &params.omega,
+                &params.sigma.values,
+            )
+        };
+        for k in 0..model.n_eta {
+            let h = 1e-6 * (1.0 + eta[k].abs());
+            let mut ep = eta;
+            ep[k] += h;
+            let mut em = eta;
+            em[k] -= h;
+            let fd = (nll(&ep) - nll(&em)) / (2.0 * h);
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 1e-5, epsilon = 1e-6);
         }
     }
 

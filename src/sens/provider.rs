@@ -269,6 +269,15 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
         && (sens_supported(model) || iov_analytical_supported(model))
+        // IIV on residual error (#474): the analytic gradient (inner η-column +
+        // outer θ/Ω/σ variance terms) is implemented for the closed-form
+        // (non-ODE, non-IOV), non-M3 path only. ODE/IOV/M3 `iiv_on_ruv` keep the FD
+        // gradient on BOTH loops so the inner Jacobian and outer gradient stay
+        // matched (the residual-eta censored second derivatives are not assembled).
+        && !(model.residual_error_eta.is_some()
+            && (model.ode_spec.is_some()
+                || model.n_kappa > 0
+                || matches!(model.bloq_method, crate::types::BloqMethod::M3)))
 }
 
 /// Whether the light **ODE inner** η-gradient (`Dual1`) serves this model+subject:
@@ -2591,6 +2600,16 @@ mod tests {
         assert!(!analytic_outer_gradient_available(
             &test_helpers::ode_model(GradientMethod::Auto)
         ));
+        // A closed-form `iiv_on_ruv` model is analytic (#474)…
+        let mut ruv = test_helpers::analytical_model(GradientMethod::Auto);
+        ruv.residual_error_eta = Some(0);
+        assert!(analytic_outer_gradient_available(&ruv));
+        // …but M3 BLOQ + `iiv_on_ruv` falls back to FD (no censored residual-eta
+        // second derivatives are assembled).
+        let mut ruv_m3 = test_helpers::analytical_model(GradientMethod::Auto);
+        ruv_m3.residual_error_eta = Some(0);
+        ruv_m3.bloq_method = crate::types::BloqMethod::M3;
+        assert!(!analytic_outer_gradient_available(&ruv_m3));
     }
 
     const WARFARIN: &str = r#"

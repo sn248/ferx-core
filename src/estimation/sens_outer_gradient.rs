@@ -2648,6 +2648,54 @@ mod tests {
         run_ruv_packed_check(&model, &[4.0, 12.0, 2.0, 25.0]);
     }
 
+    /// LTBS (`log_additive`) + `iiv_on_ruv` on an ODE model. The provider applies
+    /// the `g = ln(f)` chain to the sensitivities, so the residual-eta variance
+    /// terms (additive `R = σ²` on the log scale, `d = 0`) feed the same provider-
+    /// agnostic assembly — the analytic outer gradient must still match FD (#474).
+    /// (The inner EBE keeps FD for LTBS by design; the outer gradient is analytic.)
+    const TWOCPT_ODE_LTBS_RUV: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  omega ETA_RUV ~ 0.10
+  sigma ADD_ERR ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ log_additive(ADD_ERR)
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    #[test]
+    fn population_packed_gradient_ode_ltbs_iiv_on_ruv_matches_fd() {
+        let model = parse_model_string(TWOCPT_ODE_LTBS_RUV).expect("parse ODE LTBS ruv");
+        assert!(model.log_transform, "log_additive must set LTBS");
+        assert_eq!(model.residual_error_eta, Some(2));
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(&model),
+            "ODE + LTBS + iiv_on_ruv must route to the analytic outer gradient (#474)"
+        );
+        run_ruv_packed_check(&model, &[4.0, 12.0, 2.0, 25.0]);
+    }
+
     #[test]
     fn eta_dx_matches_fd() {
         use crate::estimation::parameterization::pack_params;

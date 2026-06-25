@@ -2826,6 +2826,80 @@ mod iov_tests {
         }
     }
 
+    /// ODE + LTBS + `iiv_on_ruv` with an **eta-dependent initial condition**
+    /// (`init(central) = C0·V`, as in the thioguanine `run14` model). The analytic
+    /// inner gradient must still match FD of `individual_nll` — confirms the init-
+    /// condition η-derivative composes with the log wrap and residual-eta column.
+    #[test]
+    fn ode_ltbs_init_cond_inner_grad_matches_fd() {
+        use crate::parser::model_parser::parse_model_string;
+        let src = "[parameters]\n  theta TVCL(4.0,0.1,100.0)\n  theta TVV(30.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_RUV ~ 0.10\n  sigma ADD_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  C0 = 5.0\n[structural_model]\n  ode(states=[central])\n[odes]\n  init(central) = C0 * V\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ log_additive(ADD_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  ode_reltol = 1e-11\n  ode_abstol = 1e-13\n";
+        let model = parse_model_string(src).expect("parse");
+        let mut subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 7],
+            obs_cmts: vec![1; 7],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 7],
+            occasions: vec![1; 7],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let preds = crate::pk::compute_predictions_with_tv(
+            &model,
+            &subject,
+            &model.default_params.theta,
+            &[0.1, -0.1, 0.0],
+        );
+        subject.observations = preds.iter().map(|p| p + 0.2).collect();
+        let params = model.default_params.clone();
+        let eta = [0.15_f64, -0.10, 0.20];
+        let analytic = analytic_eta_nll_gradient(
+            &model,
+            &subject,
+            &params.theta,
+            &eta,
+            &params.omega,
+            &params.sigma.values,
+        )
+        .expect("scope");
+        for k in 0..model.n_eta {
+            let h = 1e-6 * (1.0 + eta[k].abs());
+            let mut ep = eta;
+            ep[k] += h;
+            let mut em = eta;
+            em[k] -= h;
+            let nllp = crate::stats::likelihood::individual_nll(
+                &model,
+                &subject,
+                &params.theta,
+                &ep,
+                &params.omega,
+                &params.sigma.values,
+            );
+            let nllm = crate::stats::likelihood::individual_nll(
+                &model,
+                &subject,
+                &params.theta,
+                &em,
+                &params.omega,
+                &params.sigma.values,
+            );
+            let fd = (nllp - nllm) / (2.0 * h);
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 1e-5, epsilon = 1e-6);
+        }
+    }
+
     /// `set_ebe_warm_start` round-trips through the fit-scoped global the EBE
     /// fallback reads, and defaults to `false` (matching `FitOptions::default`).
     #[test]

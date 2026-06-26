@@ -192,6 +192,71 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
 
     eprintln!("Model: {}", parsed.model.name);
 
+    // TTE endpoints (survival only): a synthetic subject must carry one
+    // right-censored template row per cause CMT — otherwise `--simulate` emits
+    // zero TTE rows (the synthetic `obs_records` are empty). The administrative
+    // `[simulation] horizon` is the censoring time for those rows; the per-subject
+    // draw then overwrites each template with its realised outcome (#522). Compute
+    // the cause-CMT list once, outside the per-subject loop.
+    #[cfg(feature = "survival")]
+    let tte_cmts: Vec<usize> = {
+        let mut c: Vec<usize> = parsed
+            .model
+            .endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| {
+                matches!(ep, crate::types::EndpointLikelihood::Tte { .. }).then_some(*cmt)
+            })
+            .collect();
+        c.sort_unstable();
+        c
+    };
+    #[cfg(feature = "survival")]
+    if !tte_cmts.is_empty() && sim_spec.horizon.is_none() {
+        return Err("[simulation] with a TTE endpoint requires `horizon = <t>` \
+             (the administrative censoring time at which event-free subjects are \
+             right-censored)"
+            .to_string());
+    }
+
+    // A synthetic design must have something to observe. The parser's
+    // `times`-or-`horizon` rule is deliberately permissive (a pure-TTE model has
+    // no continuous `times`), so enforce the model-specific requirement here, once
+    // the endpoints are known (#522 review):
+    //   - a model with a residual-error (continuous) endpoint needs `times` — this
+    //     keeps the pre-#522 contract and closes the gap where a Gaussian, or a
+    //     joint PK+TTE, model given only `horizon` would silently build
+    //     zero-`observation` subjects and fit on empty continuous data;
+    //   - a pure-TTE model (no error model, hence no sigma) instead needs a
+    //     `horizon`, already enforced above.
+    // A declared `[error_model]` is the signal for "produces continuous
+    // observations": it is the only thing that allocates sigma, and every model
+    // otherwise carries a default `pk_model`, so the structural model alone can't
+    // distinguish intent.
+    let model_has_continuous = !parsed.model.default_params.sigma.values.is_empty();
+    #[cfg(feature = "survival")]
+    let model_has_tte = !tte_cmts.is_empty();
+    #[cfg(not(feature = "survival"))]
+    let model_has_tte = false;
+    if sim_spec.obs_times.is_empty() {
+        if model_has_continuous {
+            return Err(
+                "[simulation] has no `times`, but the model has a continuous \
+                 (residual-error) endpoint that needs observation times — add \
+                 `times = [...]` (a joint PK + TTE design needs both `times` and a \
+                 `horizon`)"
+                    .to_string(),
+            );
+        }
+        if !model_has_tte {
+            return Err(
+                "[simulation] has no `times` and the model has no TTE endpoint \
+                 to observe at a `horizon` — nothing to simulate"
+                    .to_string(),
+            );
+        }
+    }
+
     // Build template population
     let subjects: Vec<Subject> = (1..=sim_spec.n_subjects)
         .map(|i| Subject {
@@ -218,8 +283,23 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
+            // One right-censored template row per cause CMT, at the administrative
+            // horizon (overwritten by the draw). Empty when the model has no TTE
+            // endpoint, reproducing the previous all-Gaussian behaviour. The
+            // `expect` cannot fire: a non-empty `tte_cmts` guarantees `horizon` is
+            // `Some` (the TTE-requires-horizon check above returns early). (#522)
             #[cfg(feature = "survival")]
-            obs_records: vec![],
+            obs_records: tte_cmts
+                .iter()
+                .map(|&cmt| crate::types::ObsRecord::Event {
+                    time: sim_spec
+                        .horizon
+                        .expect("TTE endpoints require a horizon (checked above)"),
+                    event_type: crate::types::EventType::RightCensored,
+                    entry_time: 0.0,
+                    cmt,
+                })
+                .collect(),
         })
         .collect();
     let template = Population {
@@ -236,17 +316,35 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         "Simulating {} subjects (seed={})...",
         sim_spec.n_subjects, sim_spec.seed
     );
-    let sim_results = simulate_with_seed(
+    // Pass the administrative `horizon` through so TTE causes censor at the
+    // planned study end (#522). `match_method = None` makes this identical to
+    // `simulate_with_seed` for the Gaussian path (same seeded RNG, no matching),
+    // and the `None`-matching branch cannot error.
+    let sim_results = simulate_with_options(
         &parsed.model,
         &template,
         &parsed.model.default_params,
         1,
-        sim_spec.seed,
-    );
+        &SimulateOptions {
+            seed: Some(sim_spec.seed),
+            match_method: None,
+            horizon: sim_spec.horizon,
+        },
+    )
+    .map_err(|e| format!("simulation failed: {e}"))?;
 
     let mut population = template;
     for subject in &mut population.subjects {
-        let sims: Vec<_> = sim_results.iter().filter(|s| s.id == subject.id).collect();
+        // Gaussian write-back: only continuous outcomes map onto `observations`.
+        // A TTE `Event` row would trip `continuous_value()`'s debug-assert, so
+        // filter it out here; the TTE outcomes are written into `obs_records` below.
+        let sims: Vec<_> = sim_results
+            .iter()
+            .filter(|s| {
+                s.id == subject.id
+                    && matches!(s.outcome, crate::types::SimOutcome::Continuous { .. })
+            })
+            .collect();
         for (j, s) in sims.iter().enumerate() {
             if j < subject.observations.len() {
                 // Under LTBS the simulated DV is on the log scale and may be
@@ -262,10 +360,55 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         }
     }
 
+    // TTE write-back (#522): replace each subject's template rows with the
+    // realised simulated outcomes — `Exact` at the drawn event time, or
+    // `RightCensored` at the horizon when no cause fired — so the fitted dataset
+    // (and any output) carries the simulated events rather than the placeholders.
+    #[cfg(feature = "survival")]
+    for subject in &mut population.subjects {
+        let events: Vec<crate::types::ObsRecord> = sim_results
+            .iter()
+            .filter(|s| s.id == subject.id)
+            .filter_map(|s| match s.outcome {
+                crate::types::SimOutcome::Event { time, observed } => {
+                    Some(crate::types::ObsRecord::Event {
+                        time,
+                        event_type: if observed {
+                            crate::types::EventType::Exact
+                        } else {
+                            crate::types::EventType::RightCensored
+                        },
+                        // Synthetic `[simulation]` subjects always enter at 0 (no
+                        // left truncation), matching the template row above; keep
+                        // the two in sync if this path ever gains delayed entry.
+                        entry_time: 0.0,
+                        cmt: s.cmt,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        if !events.is_empty() {
+            subject.obs_records = events;
+        }
+    }
+
+    // `n_obs()` counts only Gaussian observations; add the simulated TTE event
+    // rows so a TTE-only `--simulate` run doesn't misleadingly report "0
+    // observations" (#522 review).
+    #[cfg(feature = "survival")]
+    let n_records = population.n_obs()
+        + population
+            .subjects
+            .iter()
+            .map(|s| s.obs_records.len())
+            .sum::<usize>();
+    #[cfg(not(feature = "survival"))]
+    let n_records = population.n_obs();
     eprintln!(
         "Loaded {} subjects, {} observations",
         population.subjects.len(),
-        population.n_obs()
+        n_records
     );
 
     let init_params = build_init_params(&parsed);
@@ -4829,6 +4972,12 @@ pub struct SimulateOptions {
     /// observations so its posthoc eta can be computed. Has no effect for the
     /// synthetic `[simulation]` block (no observed designs to match against).
     pub match_method: Option<MatchMethod>,
+    /// Administrative censoring horizon for TTE endpoints (#522). When `Some(t)`,
+    /// `t` overrides every TTE record's per-record `observation_window` so a
+    /// re-simulated event-bearing subject censors at the planned study end `t`
+    /// rather than drawing unbounded — the decoupled horizon a competing-risks VPC
+    /// needs. `None` keeps the per-record window. No effect on Gaussian endpoints.
+    pub horizon: Option<f64>,
 }
 
 /// Simulate observations, optionally with propensity-score matching.
@@ -4851,6 +5000,38 @@ pub fn simulate_with_options(
     opts: &SimulateOptions,
 ) -> Result<Vec<SimulationResult>, String> {
     use rand::SeedableRng;
+
+    // Validate the TTE horizon on the library path too — the `.ferx` parser
+    // already rejects a non-finite / non-positive horizon, but a direct caller of
+    // this API must get the same guard: a NaN window makes every `t_event < window`
+    // test false (silent NaN event times), and a `<= 0` horizon censors every
+    // subject at or before entry (#522 review).
+    if let Some(h) = opts.horizon {
+        if !h.is_finite() || h <= 0.0 {
+            return Err(format!(
+                "SimulateOptions.horizon must be finite and > 0 (got {h})"
+            ));
+        }
+        // A horizon below a subject's TTE entry_time would censor it before it
+        // entered observation (a row with time = h < entry_time). The
+        // `[simulation]`-block path always enters at 0, but a left-truncated
+        // population passed to this API must be rejected (#522 review).
+        #[cfg(feature = "survival")]
+        for subject in &population.subjects {
+            for record in &subject.obs_records {
+                let crate::types::ObsRecord::Event { entry_time, .. } = record;
+                if *entry_time > h {
+                    return Err(format!(
+                        "SimulateOptions.horizon ({h}) is below subject '{}' entry_time \
+                         ({entry_time}); the administrative horizon must be ≥ every \
+                         subject's entry time",
+                        subject.id
+                    ));
+                }
+            }
+        }
+    }
+
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
         None => rand::make_rng(),
@@ -4870,7 +5051,14 @@ pub fn simulate_with_options(
         Some(m) => m,
         None => {
             return Ok(simulate_inner_with_draw(
-                model, population, params, n_sim, 1, None, &mut rng,
+                model,
+                population,
+                params,
+                n_sim,
+                1,
+                None,
+                opts.horizon,
+                &mut rng,
             ));
         }
     };
@@ -4926,6 +5114,7 @@ pub fn simulate_with_options(
         n_sim,
         1,
         Some((&eta_hats, omega_inv, method)),
+        opts.horizon,
         &mut rng,
     ))
 }
@@ -4937,7 +5126,9 @@ fn simulate_inner<R: rand::Rng>(
     n_sim: usize,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
-    simulate_inner_with_draw(model, population, params, n_sim, 1, None, rng)
+    // `simulate` / `simulate_with_seed` carry no horizon; the per-record window
+    // applies. An explicit `[simulation] horizon` enters via `simulate_with_options`.
+    simulate_inner_with_draw(model, population, params, n_sim, 1, None, None, rng)
 }
 
 /// Emit all observation rows for one subject given a fully-formed `eta_slice`
@@ -4952,9 +5143,15 @@ fn emit_subject_rows<R: rand::Rng>(
     draw: usize,
     sim: usize,
     normal: rand_distr::Normal<f64>,
+    horizon: Option<f64>,
     rng: &mut R,
     results: &mut Vec<SimulationResult>,
 ) {
+    // `horizon` is consumed only by the TTE path below; without the `survival`
+    // feature there are no TTE endpoints, so discard it to avoid an unused-arg warn.
+    #[cfg(not(feature = "survival"))]
+    let _ = horizon;
+
     // Use the same TV-covariate-aware dispatcher as estimation and post-fit
     // diagnostics. For no-TV subjects this stays on the one-pk-param fast path.
     let ipreds = pk::compute_predictions_with_tv(model, subject, &params.theta, eta_slice);
@@ -4997,6 +5194,7 @@ fn emit_subject_rows<R: rand::Rng>(
         eta_slice,
         draw,
         sim,
+        horizon,
         rng,
         results,
     );
@@ -5016,6 +5214,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     n_sim: usize,
     draw: usize,
     matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
+    horizon: Option<f64>,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
@@ -5059,6 +5258,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         draw,
                         sim,
                         normal,
+                        horizon,
                         rng,
                         &mut results,
                     );
@@ -5080,6 +5280,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         draw,
                         sim,
                         normal,
+                        horizon,
                         rng,
                         &mut results,
                     );
@@ -5151,6 +5352,7 @@ pub fn simulate_with_uncertainty(
             params,
             opts.n_sim_per_draw,
             k + 1,
+            None,
             None,
             &mut rng,
         );

@@ -1908,9 +1908,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     model.sync_ode_solver_opts(&fit_options);
 
     // ── [scaling] block ──
-    // Parsed after `parse_fit_options` so we can validate the
-    // `ExpressionScale + gradient = ad` combination (which is rejected for
-    // Phase 1 — AD's `obs_scale` Const input is only wired to ScalarScale).
+    // Parsed after `parse_fit_options` so option-dependent wiring (Form-C ODE readout,
+    // estimator/gradient context) is available. (`gradient = ad` is retired and rejected
+    // unconditionally by `check_model_options` — see the sibling note below; there is no
+    // longer an `ExpressionScale + ad` combination to validate here.)
     if let Some(scaling_lines) = blocks.get("scaling") {
         let theta_names_for_scaling = model.theta_names.clone();
         let eta_names_for_scaling = model.eta_names.clone();
@@ -2093,9 +2094,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             }
         }
         if !mu_ref_disabled.is_empty() {
-            // The analytical AD inner-gradient kernels can't represent an
-            // if-branch that assigns an eta-bearing parameter, so flag the model
-            // for `inner_optimizer::analytical_ad_unsupported` to route it to FD.
+            // The analytic inner-gradient kernels can't represent an if-branch that
+            // assigns an eta-bearing parameter, so flag the model
+            // (`has_conditional_eta_params`); the live inner gate
+            // (`analytic_inner_grad_supported_model`) routes such models to FD.
             model.has_conditional_eta_params = true;
             model.parse_warnings.push(format!(
                 "Mu-referencing disabled for conditional parameter(s): {}. \
@@ -7804,15 +7806,18 @@ fn build_pk_param_fn(
         }
     };
 
+    let pk_var_slots = if is_analytical_pk {
+        pk_assignment_mapping.clone()
+    } else {
+        ode_assignment_mapping.clone()
+    };
+    let pk_slot_indices = pk_var_slots.iter().map(|&(slot, _)| slot).collect();
     let indiv_param_program = IndivParamProgram {
         stmts: stmts_owned.clone(),
         n_vars,
         cov_static_mask,
-        pk_var_slots: if is_analytical_pk {
-            pk_assignment_mapping.clone()
-        } else {
-            ode_assignment_mapping.clone()
-        },
+        pk_var_slots,
+        pk_slot_indices,
         n_theta: n_theta_base,
         n_eta: n_eta_extended,
         cov_names: cov_names_for_lookup.clone(),
@@ -9899,6 +9904,11 @@ pub struct IndivParamProgram {
     /// `(pk_slot, var_slot)` per individual parameter, in declaration order
     /// (parallel to `CompiledModel.pk_indices`).
     pk_var_slots: Vec<(usize, usize)>,
+    /// `pk_var_slots` projected to just the PK slots — the [`pk_slots`](Self::pk_slots)
+    /// value, cached at construction so the hot analytic paths borrow it via
+    /// [`pk_slots_ref`](Self::pk_slots_ref) instead of re-collecting a `Vec` on every
+    /// per-gradient evaluation (#534 review #2).
+    pk_slot_indices: Vec<usize>,
     /// User-declared θ count the individual parameters can reference.
     n_theta: usize,
     /// η count the `pk_param_fn` consumes (BSV + IOV kappa).
@@ -9930,6 +9940,13 @@ impl IndivParamProgram {
     /// NOT `CompiledModel.pk_indices` (declaration) order.
     pub(crate) fn pk_slots(&self) -> Vec<usize> {
         self.pk_var_slots.iter().map(|&(slot, _)| slot).collect()
+    }
+
+    /// Borrowing form of [`pk_slots`](Self::pk_slots): the PK-slot list cached at
+    /// construction, for hot paths that only read it (no per-call `Vec`). Identical
+    /// contents to `pk_slots()` (#534 review #2).
+    pub(crate) fn pk_slots_ref(&self) -> &[usize] {
+        &self.pk_slot_indices
     }
 
     /// Evaluate the individual parameters over `Dual2<M>` seeded on (θ, η):
@@ -10261,19 +10278,30 @@ impl ScaleDerivProgram {
     ) -> crate::sens::dual1::Dual1<N> {
         use crate::sens::dual1::Dual1;
         // θ and individual-param vars are constants on the inner path (no θ axes);
-        // η_k seeds axis k directly (no `n_theta` offset).
-        let theta_d: Vec<Dual1<N>> = theta.iter().map(|&v| Dual1::constant(v)).collect();
-        let eta_d: Vec<Dual1<N>> = eta
-            .iter()
-            .enumerate()
-            .map(|(k, &v)| {
-                if k < N {
-                    Dual1::var(v, k)
-                } else {
-                    Dual1::constant(v)
-                }
-            })
-            .collect();
+        // η_k seeds axis k directly (no `n_theta` offset). For any in-scope
+        // `ExpressionScale` model the provider gate caps `n_theta + n_eta` at
+        // `MAX_SCALE_AXES`, so both `theta` and `eta` fit a stack buffer — build them
+        // there instead of per-call heap `Vec`s (#534 review #4). (`cov_vec` /
+        // bytecode `stack` lengths are not axis-bounded, so they stay on the heap.)
+        const CAP: usize = crate::sens::provider::MAX_SCALE_AXES;
+        debug_assert!(
+            theta.len() <= CAP && eta.len() <= CAP,
+            "scale eval θ/η exceed MAX_SCALE_AXES; caller must be gate-checked"
+        );
+        let mut theta_buf = [Dual1::<N>::constant(0.0); CAP];
+        for (d, &v) in theta_buf.iter_mut().zip(theta.iter()) {
+            *d = Dual1::constant(v);
+        }
+        let theta_d = &theta_buf[..theta.len()];
+        let mut eta_buf = [Dual1::<N>::constant(0.0); CAP];
+        for (k, (d, &v)) in eta_buf.iter_mut().zip(eta.iter()).enumerate() {
+            *d = if k < N {
+                Dual1::var(v, k)
+            } else {
+                Dual1::constant(v)
+            };
+        }
+        let eta_d = &eta_buf[..eta.len()];
         let cov_vec: Vec<f64> = self
             .cov_names
             .iter()
@@ -10282,7 +10310,7 @@ impl ScaleDerivProgram {
         let empty_nn: Vec<Vec<f64>> = Vec::new();
         let mut stack: Vec<Dual1<N>> = Vec::new();
         eval_bytecode_g::<Dual1<N>>(
-            &self.bc, &theta_d, &eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
+            &self.bc, theta_d, eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
         )
     }
 }
@@ -19604,12 +19632,11 @@ if (WT > 70) {
 
     #[test]
     fn test_parse_scaling_expression_accepts_ad_gradient() {
-        // Phase 2.5: Form B (`obs_scale = <expr>`) + `gradient = ad` is
-        // now allowed. The AD path receives a per-observation scale
-        // array materialised from a subject-static `pk_param_fn`
-        // evaluation; the gradient treats the scale as constant w.r.t.
-        // eta, which is exact for eta-independent scales (the common
-        // case) and a documented approximation otherwise.
+        // Form B (`obs_scale = <expr>`) + `gradient = ad` parses (the retired `ad`
+        // request is normalised away by `check_model_options`, not rejected at parse).
+        // The live FOCE/FOCEI gradient applies the exact η/θ quotient rule to a
+        // differentiable `obs_scale` (#486), so it is exact for both η-independent and
+        // η-dependent scales within analytic scope — not the old frozen-scale approximation.
         let base = analytical_model_with_scaling(Some("  obs_scale = TVV / 10\n"));
         let src = base.replace("gradient = fd", "gradient = ad");
         parse_model_string(&src).expect("ExpressionScale + gradient = ad now parses");

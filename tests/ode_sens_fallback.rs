@@ -220,13 +220,20 @@ const ODE_LTBS: &str = r"
 ";
 
 #[test]
-fn expression_obs_scale_is_not_armed() {
-    // `obs_scale = V1` references a parameter → `ExpressionScale`, not handled over
-    // Dual2 (the equivalent Form-C readout is). Model-level decline.
+fn expression_obs_scale_is_armed_on_static_walk() {
+    // `obs_scale = V1` references a parameter carrying IIV → η-dependent
+    // `ExpressionScale`. As of #486 the divisor scale's quotient rule is applied
+    // post-walk on the `(θ,η)` jet, so a non-LTBS, non-TV-cov model IS on the
+    // analytic path (the static walk only — TV cov / LTBS still decline; see
+    // `ode_provider_expression_scale_combos_fall_back_to_fd`).
     let model = parse(ODE_OBS_SCALE);
     assert!(
-        !sens_supported(&model),
-        "ExpressionScale obs_scale must not be on the analytic path"
+        sens_supported(&model),
+        "η-dependent ExpressionScale obs_scale must be on the analytic path (#486)"
+    );
+    assert!(
+        !declines(&model, vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)]),
+        "ExpressionScale bolus subject must get analytic sensitivities on the static walk"
     );
 }
 

@@ -19,8 +19,8 @@ pub(crate) enum InnerGradientMethod {
     /// provider evaluation per inner step (vs FD's `~2·n_eta+1` predictions).
     Analytic,
     /// Central finite differences. Used when the provider can't serve the model
-    /// (ODE, LTBS, expression scaling, time-varying covariates, SDE) or the
-    /// `FERX_NO_ANALYTIC_INNER` escape hatch is set.
+    /// (ODE, LTBS, time-varying covariates, SDE) or the `FERX_NO_ANALYTIC_INNER`
+    /// escape hatch is set. (η-dependent `ExpressionScale` is now analytic, #486.)
     Fd,
 }
 
@@ -59,11 +59,17 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     if model.has_conditional_eta_params {
         return Some("conditional (if-branch) individual-parameter expression");
     }
-    // Eta-dependent `[scaling] obs_scale` expression. `build_obs_scale_array`
-    // freezes the scale subject-static, so the AD Jacobian drops
-    // `d obs_scale / d eta` (see `ScalingSpec::breaks_ad_inner_gradient`).
+    // Eta-dependent `[scaling] obs_scale`. VESTIGIAL: the retired Enzyme-AD path froze the
+    // scale subject-static and dropped `d obs_scale / d eta`, so it routed here to FD. The
+    // LIVE inner path now serves a differentiable `ExpressionScale` analytically via the
+    // η-quotient rule (#486, `provider::apply_expression_scale_inner`), and
+    // `analytic_inner_grad_supported_model` does NOT bail on it. This branch is retained
+    // only as the historical named reason (this whole fn is dead — see the header); it no
+    // longer reflects routing. The divergence is pinned by `analytical_ad_unsupported_flags_each_class`.
     if model.scaling.breaks_ad_inner_gradient() {
-        return Some("eta-dependent obs_scale (ExpressionScale)");
+        return Some(
+            "eta-dependent obs_scale (ExpressionScale) [vestigial: served analytically since #486]",
+        );
     }
     // Time-to-event (`[event_model]`) endpoint. The analytical single-snapshot
     // AD kernel computes the PK-observation NLL, not the hazard/survival
@@ -90,8 +96,8 @@ pub(crate) fn resolve_gradient_method(
 /// One-line summary of the inner-loop gradient route **actually resolved**
 /// across the population, for the startup banner. Reflects the per-subject
 /// resolution in [`resolve_gradient_method`] — the analytic `Dual2` η-gradient
-/// where it is in scope, central FD elsewhere (ODE / LTBS / expression scaling /
-/// TV-covariate / SDE models, or `gradient = fd`).
+/// where it is in scope, central FD elsewhere (ODE / LTBS / TV-covariate / SDE
+/// models, or `gradient = fd`; η-dependent `ExpressionScale` is analytic, #486).
 ///
 /// `requested` is the user's [`FitOptions::gradient_method`], appended in
 /// brackets so a fallback is visible. It is taken as a parameter rather than
@@ -640,11 +646,14 @@ fn find_ebe_iov(
     // via `subject_eta_grad_iov`.
     // Mirror the non-IOV inner bails (#466 review #1/#2/#3): the IOV `Dual2`/`Dual1`
     // kernels share the same limitations, so route to the FD inner loop when the model
-    // hits a common bail (escape hatch, `gradient = fd`, SDE, LTBS, ExpressionScale, or
-    // IIV on residual error) or the subject carries survival/TTE records (whose hazard
-    // term the analytic IOV gradient omits). Without these guards a joint IOV +
-    // `iiv_on_ruv` / IOV + TTE / `gradient = fd` fit would converge EBEs against an
-    // incomplete gradient.
+    // hits a common bail (escape hatch, `gradient = fd`, SDE, LTBS, or IIV on residual
+    // error) or the subject carries survival/TTE records (whose hazard term the analytic
+    // IOV gradient omits). An η-dependent `ExpressionScale` `obs_scale` is no longer a
+    // common bail (#486 made the non-IOV inner serve it analytically), but IOV still
+    // declines it: `iov_sens_supported` is `false` for any non-`None` scaling, so the
+    // `analytic_iov_inner` guard below already routes IOV + `ExpressionScale` to FD.
+    // Without these guards a joint IOV + `iiv_on_ruv` / IOV + TTE / `gradient = fd` fit
+    // would converge EBEs against an incomplete gradient.
     let analytic_iov_inner = crate::sens::provider::iov_sens_supported(model)
         && omega_iov_ref.is_some()
         && !analytic_inner_common_bail(model)
@@ -990,21 +999,32 @@ pub fn profile_report() {
 /// The model-level inner-gradient bails that are independent of which analytic inner
 /// provider (non-IOV analytical, non-IOV ODE `Dual1`, or IOV) will serve the model.
 /// Returns `true` when the model must use the **FD** inner gradient regardless: the
-/// escape hatch / A-B toggle, an explicit `gradient = fd`, SDE diffusion, LTBS, an
-/// eta-dependent `ExpressionScale` obs_scale, or IIV on residual error (`iiv_on_ruv`,
-/// whose `exp(2·η_ruv)` variance scaling none of the `Dual2`/`Dual1` kernels carry).
+/// escape hatch / A-B toggle, an explicit `gradient = fd`, SDE diffusion, LTBS, or
+/// IIV on residual error (`iiv_on_ruv`, whose `exp(2·η_ruv)` variance scaling none of
+/// the `Dual2`/`Dual1` kernels carry).
 /// Every analytic inner path consults this so none of them can run on a model that one
 /// of these reasons routes to FD — including the IOV inner loop, which previously dropped
 /// these exclusions (#466 review #1/#3).
+///
+/// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the non-IOV
+/// analytical inner provider now carries the η-only quotient rule (`subject_eta_grad`
+/// → `apply_expression_scale_inner`), and the ODE inner provider serves it on the static
+/// walk (#534/#486), so both run analytically. Two things keep this safe rather than
+/// re-introducing an analytic-inner-vs-FD-outer split: the **IOV** inner path still
+/// declines `ExpressionScale` through its own gate (`iov_analytical_supported` requires
+/// `ScalingSpec::None`), and the **ODE** inner path does not consult this common bail at
+/// all — it has its own inline bail list in [`analytic_inner_grad_supported`] and its own
+/// per-subject scope (`ode_inner_grad_supported`, which only admits the static-walk
+/// `ExpressionScale` that the ODE provider actually applies). So dropping it here affects
+/// only the non-IOV closed-form route — exactly the one that now serves it.
 pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
         || matches!(model.gradient_method, GradientMethod::Fd)
         || model.is_sde()
         || model.log_transform
-        || matches!(
-            model.scaling,
-            crate::types::ScalingSpec::ExpressionScale { .. }
-        )
+        // Correlated residual error (#main feature) is not carried by the analytic
+        // inner kernels yet — route to FD. (An eta-dependent `ExpressionScale` is NOT a
+        // bail here; see the doc above.)
         || !model.residual_correlations.is_empty()
         // `iiv_on_ruv`: plain residual-η is now served analytically on both loops
         // (#474, the scaling lives in the shared gradient); only the cases that force
@@ -1036,11 +1056,12 @@ pub(crate) fn subject_has_survival_records(subject: &Subject) -> bool {
 /// inner route off **this same** predicate, so the reported `gradient_method_inner`
 /// cannot drift from what `find_ebe` actually runs (PR #381 review #9).
 pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool {
-    // Escape hatch, explicit `gradient = fd`, SDE, LTBS, `ExpressionScale` obs_scale,
-    // and the `iiv_on_ruv` cases that force FD all revert the inner EBE gradient to FD
-    // (see `analytic_inner_common_bail` for the per-reason rationale). LTBS and
-    // `ExpressionScale` still get the analytic *outer* gradient; only the inner finder
-    // reverts.
+    // Escape hatch, explicit `gradient = fd`, SDE, LTBS, and the `iiv_on_ruv` cases that
+    // force FD all revert the inner EBE gradient to FD (see `analytic_inner_common_bail`
+    // for the per-reason rationale). LTBS still gets the analytic *outer* gradient; only
+    // the inner finder reverts. (An eta-dependent `ExpressionScale` obs_scale is now
+    // served analytically on *both* loops — #534/#486 — so it is no longer a bail here;
+    // see `analytic_inner_common_bail`.)
     if analytic_inner_common_bail(model) {
         return false;
     }
@@ -1155,7 +1176,9 @@ fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
 /// Exact analytic `∂NLL_i/∂η` from the light first-order sensitivity provider:
 /// `Σ_j (∂nll/∂f_j)·(∂f_j/∂η) + Ω⁻¹η`. `Some` only when the model is in the
 /// provider's scope (returns `None` for ODE / TV-cov / oral-infusion / SS+reset /
-/// expression-scale subjects). Shared by the inner EBE loop and the HMC sampler so
+/// LTBS subjects). A η-dependent `ExpressionScale` `obs_scale` is in scope as of
+/// #486 (the quotient rule is applied to the η-block), except when combined with
+/// LTBS, which still declines. Shared by the inner EBE loop and the HMC sampler so
 /// both estimators use the same Dual2 gradient (replacing the retired Enzyme path).
 pub(crate) fn analytic_eta_nll_gradient(
     model: &CompiledModel,
@@ -2843,10 +2866,15 @@ mod iov_tests {
 
     /// The IOV inner loop must honour the same model-level FD bails as the non-IOV inner
     /// (#466 review #1/#3): `gradient = fd` / escape hatch, IIV-on-residual-error
-    /// (`iiv_on_ruv`), LTBS, and `ExpressionScale` all force the FD inner gradient — the
-    /// shared `analytic_inner_common_bail` gate `find_ebe_iov` now consults. Without it an
+    /// (`iiv_on_ruv`), and LTBS all force the FD inner gradient — the shared
+    /// `analytic_inner_common_bail` gate `find_ebe_iov` now consults. Without it an
     /// IOV + `iiv_on_ruv` fit would build the inner gradient on an unscaled residual
     /// variance, and `gradient = fd` would silently fail to disable the analytic inner.
+    /// (`ExpressionScale` is no longer a common bail — the non-IOV analytical inner serves
+    /// it via the quotient rule; IOV keeps declining an η-dependent `obs_scale` through its
+    /// own gate — `ScalingSpec::None` required by `ode_iov_supported` here, and by
+    /// `iov_analytical_supported` for the closed-form path — pinned by the final
+    /// `iov_sens_supported` assertion below.)
     #[test]
     fn iov_inner_honours_common_bails() {
         use crate::parser::model_parser::parse_model_string;
@@ -2883,6 +2911,43 @@ mod iov_tests {
         );
         model.residual_error_eta = None;
         assert!(crate::sens::provider::iov_sens_supported(&model));
+
+        // IOV + η-dependent `ExpressionScale` `obs_scale` must route to FD: neither IOV
+        // provider applies the `d(obs_scale)/d(stacked-η)` quotient term, so both gates
+        // require `ScalingSpec::None` (`iov_analytical_supported` / `ode_iov_supported`).
+        // Pin it here so a later loosening of either requirement can't silently run the
+        // analytic IOV inner gradient with the scale derivative dropped (#534 review #5).
+        let iov_scaled = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV + obs_scale");
+        assert!(
+            matches!(
+                iov_scaled.scaling,
+                crate::types::ScalingSpec::ExpressionScale { .. }
+            ),
+            "obs_scale = 1000/V must parse as an η-dependent ExpressionScale"
+        );
+        assert!(
+            !crate::sens::provider::iov_sens_supported(&iov_scaled),
+            "IOV + η-dependent obs_scale must route to FD (neither IOV provider carries the scale derivative)"
+        );
+
+        // Same for the CLOSED-FORM IOV path (`iov_analytical_supported`, provider.rs:638,
+        // which requires `ScalingSpec::None`) — the ODE case above only exercises
+        // `ode_iov_supported`. A `pk one_cpt_iv` IOV model + obs_scale must also decline.
+        let iov_scaled_cf = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse closed-form IOV + obs_scale");
+        assert!(matches!(
+            iov_scaled_cf.scaling,
+            crate::types::ScalingSpec::ExpressionScale { .. }
+        ));
+        assert!(
+            !crate::sens::provider::iov_sens_supported(&iov_scaled_cf),
+            "closed-form IOV + η-dependent obs_scale must route to FD (iov_analytical_supported requires ScalingSpec::None)"
+        );
     }
 
     /// Pinning `inner_optimizer` to dense BFGS vs L-BFGS must reach the *same* EBE
@@ -3557,13 +3622,62 @@ mod iov_tests {
         );
     }
 
-    // The model classes below (non-log-normal ETA, LTBS, conditional params,
-    // eta-dependent obs_scale, TTE) sit outside the closed-form inner-gradient
-    // scope. This tests the named-reason predicate directly; the live routing
-    // gate is `analytic_inner_grad_supported`. It is build-independent and runs
-    // in the FD-only `ci` CI build, guarding the classification logic (#278).
+    /// Interaction of the #486 analytic `ExpressionScale` path with main's correlated
+    /// residual error (`block_sigma`): correlated residuals are not carried by the analytic
+    /// kernels, so a model with BOTH an η-dependent `obs_scale` and a residual correlation
+    /// must route to FD on BOTH loops (`analytic_inner_common_bail` true,
+    /// `analytic_outer_gradient_available` false) — the scale never bypasses the correlation
+    /// bail. The uncorrelated control proves it is the correlation, not the scale, forcing FD.
+    /// Pins the rebase merge of the two features.
+    #[test]
+    fn expression_scale_with_correlated_residual_routes_to_fd_both_loops() {
+        use crate::parser::model_parser::parse_model_string;
+        let corr = parse_model_string(
+            "[parameters]\n  theta TVCL(5.0,0.5,50.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n",
+        )
+        .expect("parse ExpressionScale + correlated residual");
+        assert!(
+            matches!(
+                corr.scaling,
+                crate::types::ScalingSpec::ExpressionScale { .. }
+            ) && !corr.residual_correlations.is_empty(),
+            "fixture must carry both an ExpressionScale obs_scale and a residual correlation"
+        );
+        assert!(
+            analytic_inner_common_bail(&corr),
+            "correlated residual must force the inner gradient to FD (not bypassed by obs_scale)"
+        );
+        assert!(
+            !crate::sens::provider::analytic_outer_gradient_available(&corr),
+            "correlated residual must force the outer gradient to FD"
+        );
+
+        // Control: same obs_scale, diagonal (uncorrelated) residual → analytic on both loops.
+        let diag = parse_model_string(
+            "[parameters]\n  theta TVCL(5.0,0.5,50.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.04\n  sigma ADD_ERR ~ 0.10\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n",
+        )
+        .expect("parse ExpressionScale + diagonal residual");
+        assert!(diag.residual_correlations.is_empty());
+        assert!(
+            !analytic_inner_common_bail(&diag),
+            "uncorrelated ExpressionScale must stay analytic inner (the scale alone is fine)"
+        );
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(&diag),
+            "uncorrelated ExpressionScale must stay analytic outer"
+        );
+    }
+
+    // `analytical_ad_unsupported` is the VESTIGIAL retired-AD classifier (not consulted by
+    // live routing; the live gate is `analytic_inner_grad_supported[_model]`). It still flags
+    // four genuinely out-of-scope classes (non-log-normal ETA, LTBS, conditional params, TTE)
+    // and — historically — any `ExpressionScale`. The final case below pins the deliberate
+    // DIVERGENCE for a differentiable `ExpressionScale`: the classifier flags it, but the live
+    // gate serves it analytically (#486). This guards against a regression that re-wires the
+    // classifier into routing. Build-independent; runs in the FD-only `ci` build (#278).
     #[test]
     fn analytical_ad_unsupported_flags_each_class() {
+        use crate::parser::model_parser::parse_model_string;
         let mut model = make_iov_model();
         // Plain log-normal fixture -> supported.
         assert!(analytical_ad_unsupported(&model).is_none());
@@ -3591,7 +3705,7 @@ mod iov_tests {
         model.has_conditional_eta_params = false;
         assert!(analytical_ad_unsupported(&model).is_none());
 
-        // Expression-scale obs_scale (conservatively AD-unsafe; could read eta).
+        // Expression-scale obs_scale: the vestigial classifier flags any `ExpressionScale`.
         model.scaling = crate::types::ScalingSpec::ExpressionScale {
             scale_fn: Box::new(|_, _, _, _| 1.0),
             deriv: None,
@@ -3599,5 +3713,27 @@ mod iov_tests {
         assert!(analytical_ad_unsupported(&model).is_some());
         model.scaling = crate::types::ScalingSpec::ScalarScale(1000.0);
         assert!(analytical_ad_unsupported(&model).is_none());
+
+        // DIVERGENCE pin (#486 / #534 audit): a *differentiable* η-dependent `ExpressionScale`
+        // is still flagged by the vestigial classifier, but the LIVE inner gate serves it
+        // analytically. If a future change re-wired `analytical_ad_unsupported` into routing,
+        // it would silently send analytic ExpressionScale fits back to FD — assert both here so
+        // that regression is caught.
+        let scaled = parse_model_string(
+            "[parameters]\n  theta TVCL(5.0,0.5,50.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        )
+        .expect("parse differentiable ExpressionScale");
+        assert!(matches!(
+            scaled.scaling,
+            crate::types::ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+        ));
+        assert!(
+            analytical_ad_unsupported(&scaled).is_some(),
+            "vestigial classifier still flags any ExpressionScale"
+        );
+        assert!(
+            analytic_inner_grad_supported_model(&scaled),
+            "but the LIVE inner gate serves a differentiable ExpressionScale analytically (#486)"
+        );
     }
 }

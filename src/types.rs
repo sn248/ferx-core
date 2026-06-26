@@ -1842,13 +1842,16 @@ impl ScalingSpec {
     /// All variants are subject-static: the closure (`ExpressionScale`)
     /// is evaluated at most once per subject. AD therefore treats the
     /// scale as a constant w.r.t. eta. For a genuinely eta-independent
-    /// scale (`WT/70`, `TVV/1000` — covariates/thetas only) AD and FD give
-    /// identical gradients. For a scale that depends on eta (e.g.
-    /// `obs_scale = V` with `V = TVV*exp(ETA_V)`, or `1000/V`) the frozen
-    /// scale drops `d obs_scale / d eta`, so the inner loop is routed to FD
-    /// by `inner_optimizer::analytical_ad_unsupported`
-    /// (`ScalingSpec::breaks_ad_inner_gradient`) rather than silently
-    /// producing a wrong AD gradient. See `docs/model-file/scaling.qmd`.
+    /// scale (`WT/70`, `TVV/1000` — covariates/thetas only) this materialised
+    /// value is the whole story. For a scale that depends on eta (e.g.
+    /// `obs_scale = V` with `V = TVV*exp(ETA_V)`, or `1000/V`) this frozen
+    /// materialisation drops `d obs_scale / d eta`, which is why the live
+    /// FOCE/FOCEI gradient does NOT take the η/θ derivative from it: since #486
+    /// the inner and outer gradients apply the exact quotient rule analytically
+    /// (`provider::apply_expression_scale[_inner]`), with FD kept only for
+    /// LTBS / TV-cov / IOV combinations. See `docs/model-file/scaling.qmd`.
+    /// (The retired-AD-era classifier `inner_optimizer::analytical_ad_unsupported`
+    /// / `ScalingSpec::breaks_ad_inner_gradient` is vestigial and routes nothing.)
     ///
     /// Invalid scale values (0, negative, NaN, inf — e.g. from a covariate
     /// that's missing, or from a `1/(TVV-x)` near a singularity) propagate
@@ -1953,23 +1956,18 @@ impl ScalingSpec {
         }
     }
 
-    /// Returns true when an `ExpressionScale` makes the analytical AD inner
-    /// gradient unsafe, so the inner loop must use finite differences.
+    /// **VESTIGIAL** (retained for the retired Enzyme-AD inner path; not consulted
+    /// by any live routing — its only caller, `inner_optimizer::analytical_ad_unsupported`,
+    /// is itself dead). Historically returned `true` when an `ExpressionScale` made the
+    /// frozen-materialisation AD inner gradient unsafe, so the inner loop fell back to FD.
     ///
-    /// `build_obs_scale_array` materialises the scale **subject-static** (once
-    /// per gradient call), so the AD Jacobian treats `obs_scale` as constant
-    /// w.r.t. eta. When the scale expression actually depends on eta (e.g.
-    /// `obs_scale = V` with `V = TVV*exp(ETA_V)`, or `1000/V`), that drops
-    /// `d obs_scale / d eta` and the AD gradient disagrees with the objective -
-    /// observed as a ~12 OFV gap on the bundled `scaling_expression` example
-    /// (issue #278 follow-up).
-    ///
-    /// This is **conservative**: it returns true for *any* `ExpressionScale`,
-    /// including the eta-independent ones (`WT/70`, `TVV/1000`) that are AD-exact
-    /// - routing those to FD costs a little speed but never correctness. A
-    /// precise eta-dependence check would need the parser to record whether the
-    /// scale expression reads an eta-bearing quantity; tracked as a follow-up.
-    /// `None` / `ScalarScale` are always eta-independent and stay on AD.
+    /// Post-#486 this is **no longer how an η-dependent `obs_scale` is handled**: the live
+    /// FOCE/FOCEI inner and outer gradients apply the exact η/θ quotient rule analytically
+    /// (`provider::apply_expression_scale[_inner]`); only LTBS / TV-cov / IOV combinations
+    /// route to FD, via their own gates — not this predicate. The historical ~12 OFV gap
+    /// referenced the frozen-scale AD approximation, which is no longer used. Kept solely
+    /// so the dead classifier compiles; do not re-wire it into routing without first
+    /// removing the analytic `ExpressionScale` handling.
     #[inline]
     pub fn breaks_ad_inner_gradient(&self) -> bool {
         match self {
@@ -2477,7 +2475,9 @@ impl CompiledModel {
     /// PK-observation NLL, not the hazard/survival likelihood, so its
     /// eta-gradient through the hazard (especially the shape parameters) is
     /// wrong - `tte_weibull` / `tte_gompertz` diverged ~2-5 OFV from FD under
-    /// AD. `inner_optimizer::analytical_ad_unsupported` routes these to FD.
+    /// AD, so TTE models take the FD inner gradient (via the live gates
+    /// `analytic_inner_grad_supported` / `subject_has_survival_records`, not the
+    /// vestigial `analytical_ad_unsupported`).
     #[cfg(feature = "survival")]
     pub fn has_tte(&self) -> bool {
         self.endpoints

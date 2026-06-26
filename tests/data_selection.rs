@@ -56,6 +56,17 @@ fn parser_populates_ignore_exprs() {
 }
 
 #[test]
+fn parser_accepts_c_eq_c_and_bare_shorthand() {
+    // NONMEM `IGNORE(C.EQ.C)` spellings must parse at the block level.
+    let src = format!(
+        "{}\n[data_selection]\n  ignore = C == C\n  ignore = C\n",
+        MODEL_SRC
+    );
+    let parsed = parse_full_model(&src).expect("parse ok");
+    assert_eq!(parsed.fit_options.ignore_exprs, vec!["C == C", "C"]);
+}
+
+#[test]
 fn parser_populates_accept_exprs() {
     let src = format!("{}\n[data_selection]\n  accept = DV >= 1.0\n", MODEL_SRC);
     let parsed = parse_full_model(&src).expect("parse ok");
@@ -111,6 +122,11 @@ fn empty_cov() -> HashMap<String, f64> {
     HashMap::new()
 }
 
+fn empty_str_cov() -> &'static HashMap<String, String> {
+    static M: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    M.get_or_init(HashMap::new)
+}
+
 fn obs_ctx<'a>(id: &'a str, dv: f64, cov: &'a HashMap<String, f64>) -> RowContext<'a> {
     RowContext {
         id,
@@ -125,6 +141,7 @@ fn obs_ctx<'a>(id: &'a str, dv: f64, cov: &'a HashMap<String, f64>) -> RowContex
         ii: 0.0,
         ss: false,
         covariates: cov,
+        str_covariates: empty_str_cov(),
     }
 }
 
@@ -217,6 +234,44 @@ fn read_filtered_population_excludes_low_dv_obs() {
         excl.fired_ignore.iter().any(|s| s.contains("DV < 1.0")),
         "fired_ignore must record the matching clause"
     );
+}
+
+#[test]
+fn ignore_c_eq_c_drops_comment_rows() {
+    // Mirror NONMEM's `$DATA data.csv IGNORE(C.EQ.C)`: a `C` label column whose
+    // value is the literal "C" marks a comment row that must be dropped, while
+    // numeric "0" rows are kept. Two equivalent spellings are exercised:
+    // `ignore = C == C` and the bare shorthand `ignore = C`.
+    let mut path = std::env::temp_dir();
+    path.push("ferx_ignore_c_eq_c.csv");
+    let csv = "C,ID,TIME,DV,EVID,AMT\n\
+               0,1,0,.,1,100\n\
+               0,1,1,5.0,0,.\n\
+               C,1,2,999,0,.\n\
+               0,1,3,2.0,0,.\n";
+    std::fs::write(&path, csv).expect("write temp csv");
+
+    // Baseline: no filter → 3 observation rows (incl. the comment row).
+    let all = read_nonmem_csv(&path, None, None).expect("read ok");
+    assert_eq!(all.n_obs(), 3);
+
+    for clause in ["C == C", "C"] {
+        let filter =
+            SelectionFilter::from_opts(&[clause.to_string()], &[], &[]).expect("filter ok");
+        let filtered = read_nonmem_csv_filtered(&path, None, None, &filter).expect("read ok");
+        assert_eq!(
+            filtered.n_obs(),
+            2,
+            "clause `{clause}` must drop exactly the C-labelled comment row"
+        );
+        let excl = filtered.exclusions.as_ref().expect("exclusions present");
+        assert_eq!(
+            excl.n_obs_excluded, 1,
+            "clause `{clause}`: one obs excluded"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]

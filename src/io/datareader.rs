@@ -1091,6 +1091,16 @@ fn parse_subject(
                 .and_then(|c| row.get(c))
                 .map(|s| parse_cens(s))
                 .unwrap_or(0);
+            // Raw (unparsed) covariate cell strings for this row, keyed
+            // lowercased. Lets string filters compare a non-numeric label column
+            // (NONMEM's `IGNORE(C.EQ.C)`) that the numeric `locf_state` map drops.
+            let str_covariates: HashMap<String, String> = cov_indices
+                .iter()
+                .filter_map(|(name, idx)| {
+                    row.get(*idx)
+                        .map(|cell| (name.to_lowercase(), cell.trim().to_string()))
+                })
+                .collect();
             let ctx = RowContext {
                 id,
                 time,
@@ -1104,6 +1114,7 @@ fn parse_subject(
                 ii: ii_for_ctx,
                 ss: ss_for_ctx,
                 covariates: &locf_state,
+                str_covariates: &str_covariates,
             };
             let (excluded, which) = sel.should_exclude(&ctx);
             if excluded {

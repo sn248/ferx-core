@@ -71,16 +71,40 @@ impl FilterExpr {
                     FilterValue::Str(rhs_raw.to_string())
                 } else if let Ok(n) = rhs_raw.parse::<f64>() {
                     FilterValue::Num(n)
+                } else if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                    // Bare (unquoted) string label compared for equality, e.g.
+                    // NONMEM's `IGNORE(C.EQ.C)` (drop rows whose `C` column holds
+                    // the literal label `C`). Case is preserved so it matches the
+                    // raw CSV cell. Ordered comparisons (<, <=, >, >=) against a
+                    // non-numeric RHS remain an error (handled below).
+                    FilterValue::Str(rhs_raw.to_string())
                 } else {
                     return Err(format!(
                         "malformed filter expression '{}': right-hand side '{}' is not a \
-                         number or quoted string",
+                         number (ordered comparisons <, <=, >, >= require a numeric value)",
                         s.trim(),
                         rhs_raw
                     ));
                 };
                 return Ok(FilterExpr { col, op: *op, rhs });
             }
+        }
+        // No operator. Accept a lone column name as shorthand for the NONMEM
+        // `IGNORE=C` comment-flag idiom: `ignore = C` means "drop rows whose `C`
+        // column holds the literal label `C`", i.e. it expands to `C == C`. Only a
+        // single bare identifier qualifies; anything else is a malformed clause.
+        let t = s.trim();
+        if !t.is_empty()
+            && t.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Ok(FilterExpr {
+                col: t.to_lowercase(),
+                op: CmpOp::Eq,
+                rhs: FilterValue::Str(t.to_string()),
+            });
         }
         Err(format!(
             "malformed filter expression '{}': no comparison operator found (==, !=, >=, <=, >, <)",
@@ -123,8 +147,19 @@ impl FilterExpr {
             FilterValue::Str(rhs) => {
                 let lhs: &str = match col {
                     "id" => ctx.id,
-                    // String comparison against numeric columns is not meaningful.
-                    _ => return false,
+                    // Other standard NONMEM columns are numeric; a string compare
+                    // against them is not meaningful.
+                    c if is_standard_column(c) => return false,
+                    // Covariate column: compare the raw (possibly non-numeric) CSV
+                    // cell as a string. This is what lets `IGNORE(C.EQ.C)` drop a
+                    // comment row whose label column holds a literal `C`, which the
+                    // numeric covariate map cannot represent. `col` is lowercased;
+                    // `str_covariates` is keyed lowercased to match.
+                    _ => match ctx.str_covariates.get(col) {
+                        Some(v) => v.as_str(),
+                        // Column absent for this row: never fires (safe default).
+                        None => return false,
+                    },
                 };
                 match self.op {
                     CmpOp::Eq => lhs == rhs,
@@ -284,6 +319,11 @@ pub struct RowContext<'a> {
     /// (NOT case-folded). `FilterExpr::eval` matches case-insensitively via
     /// `eq_ignore_ascii_case`, so callers must not assume lowercased keys.
     pub covariates: &'a HashMap<String, f64>,
+    /// Raw (unparsed, trimmed) covariate cell values for this row, keyed by the
+    /// **lowercased** header name. Used by string-valued filters (e.g. NONMEM's
+    /// `IGNORE(C.EQ.C)`) to compare a non-numeric label column the numeric
+    /// `covariates` map cannot hold. Built only when a filter is active.
+    pub str_covariates: &'a HashMap<String, String>,
 }
 
 #[cfg(test)]
@@ -298,6 +338,17 @@ mod tests {
     }
 
     fn eval(expr: &str, id: &str, dv: f64, evid: u32, bw: f64) -> bool {
+        eval_with_str(expr, id, dv, evid, bw, &HashMap::new())
+    }
+
+    fn eval_with_str(
+        expr: &str,
+        id: &str,
+        dv: f64,
+        evid: u32,
+        bw: f64,
+        str_cov: &HashMap<String, String>,
+    ) -> bool {
         let (_, cov) = ctx(id, dv, evid, bw);
         let clause = FilterClause::parse(expr).expect("parse ok");
         clause.eval(&RowContext {
@@ -313,6 +364,7 @@ mod tests {
             ii: 0.0,
             ss: false,
             covariates: &cov,
+            str_covariates: str_cov,
         })
     }
 
@@ -481,6 +533,67 @@ mod tests {
         // == / != still allowed.
         assert!(FilterClause::parse("ID == 3").is_ok());
         assert!(FilterClause::parse("ID != 3").is_ok());
+    }
+
+    // ── NONMEM IGNORE(C.EQ.C): string label column ───────────────────────────
+
+    #[test]
+    fn test_string_covariate_eq_drops_comment_row() {
+        // Comment row: column C holds the literal "C" → `C == C` fires.
+        let mut s = HashMap::new();
+        s.insert("c".to_string(), "C".to_string());
+        assert!(eval_with_str("C == C", "1", 0.0, 0, 70.0, &s));
+        // Data row: column C holds "0" → does not fire.
+        let mut s0 = HashMap::new();
+        s0.insert("c".to_string(), "0".to_string());
+        assert!(!eval_with_str("C == C", "1", 0.0, 0, 70.0, &s0));
+    }
+
+    #[test]
+    fn test_string_covariate_ne() {
+        let mut s = HashMap::new();
+        s.insert("flag".to_string(), "X".to_string());
+        assert!(eval_with_str("FLAG != C", "1", 0.0, 0, 70.0, &s));
+        assert!(!eval_with_str("FLAG == C", "1", 0.0, 0, 70.0, &s));
+    }
+
+    #[test]
+    fn test_bare_identifier_shorthand() {
+        // `ignore = C` is shorthand for `C == C`.
+        let clause = FilterClause::parse("C").expect("bare identifier parses");
+        let mut s = HashMap::new();
+        s.insert("c".to_string(), "C".to_string());
+        assert!(clause.eval(&RowContext {
+            id: "1",
+            time: 0.0,
+            dv: 0.0,
+            evid: 0,
+            amt: 0.0,
+            cmt: 1,
+            rate: 0.0,
+            mdv: 0,
+            cens: 0,
+            ii: 0.0,
+            ss: false,
+            covariates: &HashMap::new(),
+            str_covariates: &s,
+        }));
+        // The bare column is reported as a referenced covariate column so the
+        // reader knows to read it.
+        assert_eq!(clause.covariate_columns().collect::<Vec<_>>(), vec!["c"]);
+    }
+
+    #[test]
+    fn test_string_covariate_absent_never_fires() {
+        // Column not present for this row: safe no-op (does not exclude).
+        assert!(!eval_with_str("C == C", "1", 0.0, 0, 70.0, &HashMap::new()));
+    }
+
+    #[test]
+    fn test_ordered_op_with_string_rhs_rejected() {
+        // A non-numeric RHS is only valid with == / !=; ordered ops still error.
+        assert!(FilterClause::parse("BW >= abc").is_err());
+        assert!(FilterClause::parse("BW < abc").is_err());
     }
 
     #[test]

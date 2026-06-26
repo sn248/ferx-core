@@ -640,11 +640,14 @@ fn find_ebe_iov(
     // via `subject_eta_grad_iov`.
     // Mirror the non-IOV inner bails (#466 review #1/#2/#3): the IOV `Dual2`/`Dual1`
     // kernels share the same limitations, so route to the FD inner loop when the model
-    // hits a common bail (escape hatch, `gradient = fd`, SDE, LTBS, ExpressionScale, or
-    // IIV on residual error) or the subject carries survival/TTE records (whose hazard
-    // term the analytic IOV gradient omits). Without these guards a joint IOV +
-    // `iiv_on_ruv` / IOV + TTE / `gradient = fd` fit would converge EBEs against an
-    // incomplete gradient.
+    // hits a common bail (escape hatch, `gradient = fd`, SDE, LTBS, or IIV on residual
+    // error) or the subject carries survival/TTE records (whose hazard term the analytic
+    // IOV gradient omits). An η-dependent `ExpressionScale` `obs_scale` is no longer a
+    // common bail (#486 made the non-IOV inner serve it analytically), but IOV still
+    // declines it: `iov_sens_supported` is `false` for any non-`None` scaling, so the
+    // `analytic_iov_inner` guard below already routes IOV + `ExpressionScale` to FD.
+    // Without these guards a joint IOV + `iiv_on_ruv` / IOV + TTE / `gradient = fd` fit
+    // would converge EBEs against an incomplete gradient.
     let analytic_iov_inner = crate::sens::provider::iov_sens_supported(model)
         && omega_iov_ref.is_some()
         && !analytic_inner_common_bail(model)

@@ -57,7 +57,9 @@ section of the SDLC for the versioning policy).
   ODE providers. Result-neutral (estimates and SEs unchanged; this removes FD steps, so the
   affected fits are faster and report the gradient method as "analytic"). On the ODE path the
   scale is served on the static walk only — combined with **LTBS** or **time-varying
-  covariates** it still routes to FD, as does IOV + `ExpressionScale`. Validated analytic ≡
+  covariates** it still routes to FD, as does IOV + `ExpressionScale`. As a consequence the
+  SAEM/Bayes HMC sampler now takes its gradient-based path (rather than the gradient-free
+  Metropolis fallback) for closed-form `ExpressionScale` models. Validated analytic ≡
   production + finite differences (ODE outer), and light ≡ full provider (both inner loops).
 - **Exact analytic FOCE/FOCEI gradients for steady-state (SS=1) ODE dosing** (#439). User-
   `[odes]` models with a steady-state dose now get exact analytic gradients instead of

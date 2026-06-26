@@ -1908,9 +1908,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     model.sync_ode_solver_opts(&fit_options);
 
     // ── [scaling] block ──
-    // Parsed after `parse_fit_options` so we can validate the
-    // `ExpressionScale + gradient = ad` combination (which is rejected for
-    // Phase 1 — AD's `obs_scale` Const input is only wired to ScalarScale).
+    // Parsed after `parse_fit_options` so option-dependent wiring (Form-C ODE readout,
+    // estimator/gradient context) is available. (`gradient = ad` is retired and rejected
+    // unconditionally by `check_model_options` — see the sibling note below; there is no
+    // longer an `ExpressionScale + ad` combination to validate here.)
     if let Some(scaling_lines) = blocks.get("scaling") {
         let theta_names_for_scaling = model.theta_names.clone();
         let eta_names_for_scaling = model.eta_names.clone();
@@ -2093,9 +2094,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             }
         }
         if !mu_ref_disabled.is_empty() {
-            // The analytical AD inner-gradient kernels can't represent an
-            // if-branch that assigns an eta-bearing parameter, so flag the model
-            // for `inner_optimizer::analytical_ad_unsupported` to route it to FD.
+            // The analytic inner-gradient kernels can't represent an if-branch that
+            // assigns an eta-bearing parameter, so flag the model
+            // (`has_conditional_eta_params`); the live inner gate
+            // (`analytic_inner_grad_supported_model`) routes such models to FD.
             model.has_conditional_eta_params = true;
             model.parse_warnings.push(format!(
                 "Mu-referencing disabled for conditional parameter(s): {}. \
@@ -19630,12 +19632,11 @@ if (WT > 70) {
 
     #[test]
     fn test_parse_scaling_expression_accepts_ad_gradient() {
-        // Phase 2.5: Form B (`obs_scale = <expr>`) + `gradient = ad` is
-        // now allowed. The AD path receives a per-observation scale
-        // array materialised from a subject-static `pk_param_fn`
-        // evaluation; the gradient treats the scale as constant w.r.t.
-        // eta, which is exact for eta-independent scales (the common
-        // case) and a documented approximation otherwise.
+        // Form B (`obs_scale = <expr>`) + `gradient = ad` parses (the retired `ad`
+        // request is normalised away by `check_model_options`, not rejected at parse).
+        // The live FOCE/FOCEI gradient applies the exact η/θ quotient rule to a
+        // differentiable `obs_scale` (#486), so it is exact for both η-independent and
+        // η-dependent scales within analytic scope — not the old frozen-scale approximation.
         let base = analytical_model_with_scaling(Some("  obs_scale = TVV / 10\n"));
         let src = base.replace("gradient = fd", "gradient = ad");
         parse_model_string(&src).expect("ExpressionScale + gradient = ad now parses");

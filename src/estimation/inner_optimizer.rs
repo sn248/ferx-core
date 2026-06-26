@@ -59,11 +59,17 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     if model.has_conditional_eta_params {
         return Some("conditional (if-branch) individual-parameter expression");
     }
-    // Eta-dependent `[scaling] obs_scale` expression. `build_obs_scale_array`
-    // freezes the scale subject-static, so the AD Jacobian drops
-    // `d obs_scale / d eta` (see `ScalingSpec::breaks_ad_inner_gradient`).
+    // Eta-dependent `[scaling] obs_scale`. VESTIGIAL: the retired Enzyme-AD path froze the
+    // scale subject-static and dropped `d obs_scale / d eta`, so it routed here to FD. The
+    // LIVE inner path now serves a differentiable `ExpressionScale` analytically via the
+    // η-quotient rule (#486, `provider::apply_expression_scale_inner`), and
+    // `analytic_inner_grad_supported_model` does NOT bail on it. This branch is retained
+    // only as the historical named reason (this whole fn is dead — see the header); it no
+    // longer reflects routing. The divergence is pinned by `analytical_ad_unsupported_flags_each_class`.
     if model.scaling.breaks_ad_inner_gradient() {
-        return Some("eta-dependent obs_scale (ExpressionScale)");
+        return Some(
+            "eta-dependent obs_scale (ExpressionScale) [vestigial: served analytically since #486]",
+        );
     }
     // Time-to-event (`[event_model]`) endpoint. The analytical single-snapshot
     // AD kernel computes the PK-observation NLL, not the hazard/survival
@@ -2926,6 +2932,22 @@ mod iov_tests {
             !crate::sens::provider::iov_sens_supported(&iov_scaled),
             "IOV + η-dependent obs_scale must route to FD (neither IOV provider carries the scale derivative)"
         );
+
+        // Same for the CLOSED-FORM IOV path (`iov_analytical_supported`, provider.rs:638,
+        // which requires `ScalingSpec::None`) — the ODE case above only exercises
+        // `ode_iov_supported`. A `pk one_cpt_iv` IOV model + obs_scale must also decline.
+        let iov_scaled_cf = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse closed-form IOV + obs_scale");
+        assert!(matches!(
+            iov_scaled_cf.scaling,
+            crate::types::ScalingSpec::ExpressionScale { .. }
+        ));
+        assert!(
+            !crate::sens::provider::iov_sens_supported(&iov_scaled_cf),
+            "closed-form IOV + η-dependent obs_scale must route to FD (iov_analytical_supported requires ScalingSpec::None)"
+        );
     }
 
     /// Pinning `inner_optimizer` to dense BFGS vs L-BFGS must reach the *same* EBE
@@ -3600,13 +3622,16 @@ mod iov_tests {
         );
     }
 
-    // The model classes below (non-log-normal ETA, LTBS, conditional params,
-    // eta-dependent obs_scale, TTE) sit outside the closed-form inner-gradient
-    // scope. This tests the named-reason predicate directly; the live routing
-    // gate is `analytic_inner_grad_supported`. It is build-independent and runs
-    // in the FD-only `ci` CI build, guarding the classification logic (#278).
+    // `analytical_ad_unsupported` is the VESTIGIAL retired-AD classifier (not consulted by
+    // live routing; the live gate is `analytic_inner_grad_supported[_model]`). It still flags
+    // four genuinely out-of-scope classes (non-log-normal ETA, LTBS, conditional params, TTE)
+    // and — historically — any `ExpressionScale`. The final case below pins the deliberate
+    // DIVERGENCE for a differentiable `ExpressionScale`: the classifier flags it, but the live
+    // gate serves it analytically (#486). This guards against a regression that re-wires the
+    // classifier into routing. Build-independent; runs in the FD-only `ci` build (#278).
     #[test]
     fn analytical_ad_unsupported_flags_each_class() {
+        use crate::parser::model_parser::parse_model_string;
         let mut model = make_iov_model();
         // Plain log-normal fixture -> supported.
         assert!(analytical_ad_unsupported(&model).is_none());
@@ -3634,7 +3659,7 @@ mod iov_tests {
         model.has_conditional_eta_params = false;
         assert!(analytical_ad_unsupported(&model).is_none());
 
-        // Expression-scale obs_scale (conservatively AD-unsafe; could read eta).
+        // Expression-scale obs_scale: the vestigial classifier flags any `ExpressionScale`.
         model.scaling = crate::types::ScalingSpec::ExpressionScale {
             scale_fn: Box::new(|_, _, _, _| 1.0),
             deriv: None,
@@ -3642,5 +3667,27 @@ mod iov_tests {
         assert!(analytical_ad_unsupported(&model).is_some());
         model.scaling = crate::types::ScalingSpec::ScalarScale(1000.0);
         assert!(analytical_ad_unsupported(&model).is_none());
+
+        // DIVERGENCE pin (#486 / #534 audit): a *differentiable* η-dependent `ExpressionScale`
+        // is still flagged by the vestigial classifier, but the LIVE inner gate serves it
+        // analytically. If a future change re-wired `analytical_ad_unsupported` into routing,
+        // it would silently send analytic ExpressionScale fits back to FD — assert both here so
+        // that regression is caught.
+        let scaled = parse_model_string(
+            "[parameters]\n  theta TVCL(5.0,0.5,50.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        )
+        .expect("parse differentiable ExpressionScale");
+        assert!(matches!(
+            scaled.scaling,
+            crate::types::ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+        ));
+        assert!(
+            analytical_ad_unsupported(&scaled).is_some(),
+            "vestigial classifier still flags any ExpressionScale"
+        );
+        assert!(
+            analytic_inner_grad_supported_model(&scaled),
+            "but the LIVE inner gate serves a differentiable ExpressionScale analytically (#486)"
+        );
     }
 }

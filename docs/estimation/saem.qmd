@@ -69,7 +69,7 @@ with momentum $p \sim N(0, I)$ and a standard velocity Störmer-Verlet (leapfrog
 - The model uses an ODE (`[odes]` block present)
 - The model has no analytical PK path (no `tv_fn` — pure ODE-only models)
 - The Ω matrix has a non-finite log-determinant (degenerate variance)
-- The model is outside the analytic gradient's scope (time-varying covariates, oral infusion, SS+reset, expression scaling)
+- The model is outside the analytic gradient's scope (time-varying covariates, oral infusion, SS+reset, or LTBS). A η-dependent expression `obs_scale` is served analytically (since #486), so on a closed-form model it takes the HMC path — only LTBS combined with it falls back to MH.
 
 In a single run with `n_leapfrog > 0`, different subjects can therefore use different samplers. The acceptance rate reported in verbose output and the optimizer trace is an aggregate across all subjects; in mixed HMC/MH runs the target (65% for HMC, 40% for MH) may not be meaningful for the aggregate. The `n_mh_steps` option governs the number of proposals for MH-fallback subjects even when `n_leapfrog > 0`.
 

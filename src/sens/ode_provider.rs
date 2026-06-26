@@ -21,17 +21,20 @@
 //! estimated, any parameterization — log-normal, logit-normal, additive — and the
 //! compartment-indexed `F{cmt}` form, #486); **EVID 3/4 resets / multi-occasion**;
 //! **non-zero `init(...)` initial conditions**; static covariates; a constant
-//! `obs_scale` divisor and **LTBS** (`log(DV) ~ …`) output transforms; the built-in
-//! igd/transit input-rate forcings (#430/#468); up to [`MAX_ODE_SENS_DIM`] individual
-//! parameters. Both the full `Dual2` **outer** gradient and a light `Dual1` **inner**
-//! η-gradient ([`ode_subject_eta_grad`]) are served (#410).
+//! `obs_scale` divisor, an **η-dependent expression `obs_scale`** divisor (`obs_scale =
+//! expr(θ,η)`, applied as the subject-static quotient on the static walk, #486), and
+//! **LTBS** (`log(DV) ~ …`) output transforms; the built-in igd/transit input-rate
+//! forcings (#430/#468); up to [`MAX_ODE_SENS_DIM`] individual parameters. Both the full
+//! `Dual2` **outer** gradient and a light `Dual1` **inner** η-gradient
+//! ([`ode_subject_eta_grad`]) are served (#410).
 //!
 //! **Not yet supported** (falls back to the gradient-free / FD path): steady-state
 //! dosing, lagtime (incl. compartment-indexed `ALAG{cmt}`), `weibull()` and other
-//! input-rate forcings beyond igd/transit, IOV, SDE/diffusion, expression
-//! `obs_scale`, time-varying covariates, and **θ/η referenced *directly* in a Form C
-//! readout** (these need extra direct readout-gradient terms beyond the
-//! individual-parameter chain; reference them via `[individual_parameters]` instead).
+//! input-rate forcings beyond igd/transit, IOV, SDE/diffusion, expression `obs_scale`
+//! **combined with LTBS or time-varying covariates**, time-varying covariates, and
+//! **θ/η referenced *directly* in a Form C readout** (these need extra direct
+//! readout-gradient terms beyond the individual-parameter chain; reference them via
+//! `[individual_parameters]` instead).
 #![allow(clippy::needless_range_loop)]
 
 use super::dual1::Dual1;
@@ -133,17 +136,26 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if model.n_kappa != 0 {
         return false;
     }
-    // Output transforms: `None` and a constant `ScalarScale` divisor (`f/k`) are
-    // applied over the dual prediction in `run_subject`, as is the LTBS log
-    // (`ln f`). The `ExpressionScale` divisor form (`obs_scale = expr`) is not yet
-    // handled over Dual2 — the equivalent Form-C readout (`y = state/V`) is the
-    // supported route. Allowlist (not denylist) so a future scaling variant can
-    // only *narrow* the analytic scope, never silently admit an unhandled one.
-    if !matches!(
-        model.scaling,
-        ScalingSpec::None | ScalingSpec::ScalarScale(_)
-    ) {
-        return false;
+    // Output transforms applied over the dual prediction in `run_subject`: `None`, a
+    // constant `ScalarScale` divisor (`f/k`), and the LTBS log (`ln f`). An η-dependent
+    // `ExpressionScale` divisor (`obs_scale = expr(θ,η)`) is ALSO analytic now (#486):
+    // it is applied on the final `(θ,η)`-space `SubjectSens` via the shared
+    // `apply_expression_scale_outer` (the closed-form provider's quotient rule), but
+    // only on the **static** walk — `ode_tvcov_supported` declines it (a TV-cov scale
+    // would be per-event, which the subject-static quotient does not carry) and it
+    // requires `!log_transform` (the walk applies LTBS in PK-param space *before* the
+    // η/θ chain, so the production scale-then-log order can't be reproduced by a
+    // post-walk quotient). Both compose with a Form-C readout (`y = state/V`), the other
+    // supported route. Allowlist (not denylist) so a future scaling variant can only
+    // *narrow* the analytic scope, never silently admit an unhandled one.
+    match &model.scaling {
+        ScalingSpec::None | ScalingSpec::ScalarScale(_) => {}
+        ScalingSpec::ExpressionScale { deriv: Some(p), .. }
+            if !model.log_transform
+                && p.n_theta_axis() == model.n_theta
+                && p.n_eta_axis() == model.n_eta
+                && (1..=MAX_ODE_AXES).contains(&p.n_axes()) => {}
+        _ => return false,
     }
     // (ODE models have no `tv_fn` — typical values come from `pk_param_fn` at
     // η = 0 instead; see `run_subject`.)
@@ -293,6 +305,17 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
             || has_ss
             || has_rate_defined_under_f)
     {
+        return false;
+    }
+    // An `ExpressionScale` divisor is served only on the **static** walk (the
+    // subject-static quotient via `apply_expression_scale_outer`, #486); a TV-cov scale
+    // would be per-event, which that quotient does not carry. Decline here so an
+    // `ExpressionScale` subject that would otherwise route to the event-driven walk
+    // (TV cov / lagtime / SS / rate-defined-under-`F`) falls back to FD rather than
+    // running the walk *without* applying the scale. (`ode_subject_supported` already
+    // excludes those subjects from the static walk too, so the net effect is FD for the
+    // combination — matching the analytical path's "TV + `ExpressionScale` → FD".)
+    if matches!(model.scaling, ScalingSpec::ExpressionScale { .. }) {
         return false;
     }
     // Estimated lagtime IS supported here (bare or per-compartment `ALAGn`):
@@ -572,7 +595,7 @@ pub fn ode_subject_sensitivities(
             }
         };
     }
-    match n_indiv {
+    let mut sens = match n_indiv {
         1 => full!(1),
         2 => by_n!(2; 1),
         3 => by_n!(3; 1, 2),
@@ -586,7 +609,37 @@ pub fn ode_subject_sensitivities(
         11 => by_n!(11; 1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
         12 => by_n!(12; 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11),
         _ => None,
+    }?;
+    // η-dependent `ExpressionScale` divisor (#486): apply the subject-static quotient
+    // on the final `(θ,η)`-space jet — the SAME `apply_expression_scale_outer` the
+    // closed-form provider uses, since both produce an identical `SubjectSens`. Only the
+    // static walk reaches here for an `ExpressionScale` model (`ode_tvcov_supported`
+    // declines it; `!log_transform` is gated), and `pd`/`pk.values` are already on hand.
+    // `slots = prog.pk_slots()` pairs with `pd` (built by `param_derivatives_from_prog`).
+    if let ScalingSpec::ExpressionScale {
+        deriv: Some(prog), ..
+    } = &model.scaling
+    {
+        let slots = model
+            .ode_spec
+            .as_ref()?
+            .indiv_param_program
+            .as_ref()?
+            .pk_slots();
+        crate::sens::provider::apply_expression_scale_outer(
+            &mut sens,
+            prog,
+            &pk,
+            &pd,
+            &slots,
+            theta,
+            eta,
+            &subject.covariates,
+            model.n_theta,
+            model.n_eta,
+        );
     }
+    Some(sens)
 }
 
 /// Largest IIV-bearing-parameter count (`na`) for which the mixed-order dual
@@ -647,7 +700,37 @@ pub fn ode_subject_eta_grad(
             }
         };
     }
-    dispatch!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+    let mut out = dispatch!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)?;
+    // η-dependent `ExpressionScale` divisor (#486): apply the η-only quotient on the
+    // light gradient, via the SAME `apply_expression_scale_inner_dispatch` the
+    // closed-form inner provider uses (the η-block of `apply_expression_scale_outer`).
+    // `param_eta_derivatives` gives `∂p/∂η` in `prog.pk_slots()` order, paired with
+    // `slots = prog.pk_slots()`; `pk` supplies the referenced PK-param values.
+    if let ScalingSpec::ExpressionScale {
+        deriv: Some(prog), ..
+    } = &model.scaling
+    {
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        let dp_deta = param_eta_derivatives(model, subject, theta, eta)?;
+        let slots = model
+            .ode_spec
+            .as_ref()?
+            .indiv_param_program
+            .as_ref()?
+            .pk_slots();
+        crate::sens::provider::apply_expression_scale_inner_dispatch(
+            &mut out,
+            prog,
+            &pk,
+            &dp_deta,
+            &slots,
+            theta,
+            eta,
+            &subject.covariates,
+            model.n_eta,
+        );
+    }
+    Some(out)
 }
 
 /// Exact `∂p/∂η`, `∂p/∂θ` (and second order) of the individual parameters,
@@ -910,7 +993,9 @@ fn dual1_init_state<const N: usize>(
 /// space (before the η/θ chain): a constant `ScalarScale` divisor `f/k` and/or the
 /// LTBS log `ln(max(f, floor))`. Both are smooth functions of the prediction, so the
 /// `Dual2` ops carry `∂f/∂pk` and `∂²f/∂pk²` exactly — the η/θ chain that follows is
-/// unchanged. `ExpressionScale` is gated out upstream (use a Form-C readout). Mirrors
+/// unchanged. An η-dependent `ExpressionScale` divisor is NOT applied here — it can
+/// reference θ/η directly (not only PK params), so it is applied on the final
+/// `(θ,η)`-space jet after the chain (`apply_expression_scale_outer`, #486). Mirrors
 /// `pk::apply_scaling` (`pred /= k`) and `pk::apply_log_transform`
 /// (`p = max(p, LTBS_FLOOR).ln()`; below the floor the value is clamped to a
 /// constant, so the jet vanishes).
@@ -3797,6 +3882,100 @@ mod tests {
         check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
     }
 
+    // 2-cpt IV ODE with an η-dependent `ExpressionScale` divisor `obs_scale = 1000 / V1`
+    // (`V1` carries `ETA_V1`) over the central-amount (`ObsCmt`) readout. The scale is
+    // applied as the subject-static quotient on the final `(θ,η)`-space jet (#486),
+    // reusing the closed-form provider's `apply_expression_scale_outer`.
+    const TWOCPT_ODE_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(obs_cmt=central, states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  obs_scale = 1000 / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// η-dependent `ExpressionScale` `obs_scale = 1000 / V1` on the ODE path (#486): the
+    /// outer provider's scaled `f` / `∂f/∂η` / `∂f/∂θ` must match FD of the production
+    /// predictor (which divides by the same scale through `apply_scaling`), and the
+    /// 2nd-order blocks must match FD of the analytic gradient — exercising the
+    /// `apply_expression_scale_outer` quotient rule layered onto the ODE jet.
+    #[test]
+    fn ode_provider_expression_scale_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE_EXPRSCALE).expect("parse");
+        assert!(
+            matches!(
+                model.scaling,
+                ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+            ),
+            "model must carry a differentiable scale program"
+        );
+        assert!(
+            ode_analytical_supported(&model),
+            "η-dependent ExpressionScale ODE must be supported (#486)"
+        );
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_vs_production(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
+        check_hessian_vs_fd_of_grad(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
+    }
+
+    /// `ExpressionScale` on the ODE path is served only on the **static** walk: combined
+    /// with **LTBS** or **time-varying covariates** it must route to FD (`None`), so the
+    /// post-walk subject-static quotient never runs where it would be wrong (#486).
+    #[test]
+    fn ode_provider_expression_scale_combos_fall_back_to_fd() {
+        // + LTBS → out of analytic scope (the walk applies LTBS pre-chain).
+        let mut ltbs = parse_model_string(TWOCPT_ODE_EXPRSCALE).expect("parse");
+        ltbs.log_transform = true;
+        assert!(
+            !ode_analytical_supported(&ltbs),
+            "ExpressionScale + LTBS must fall back to FD"
+        );
+        // + time-varying covariate → the scale would be per-event; decline both walks.
+        let tvcov = parse_model_string(
+            &TWOCPT_ODE_EXPRSCALE
+                .replace(
+                    "V1 = TVV1 * exp(ETA_V1)",
+                    "V1 = TVV1 * (WT/70) * exp(ETA_V1)",
+                )
+                .replace(
+                    "[error_model]",
+                    "[covariates]\n  WT continuous\n[error_model]",
+                ),
+        )
+        .expect("parse tvcov");
+        let mut subj = bolus_subject(&[1.0, 4.0, 12.0]);
+        subj.obs_covariates = vec![
+            std::iter::once(("WT".to_string(), 60.0)).collect(),
+            std::iter::once(("WT".to_string(), 70.0)).collect(),
+            std::iter::once(("WT".to_string(), 80.0)).collect(),
+        ];
+        assert!(
+            ode_subject_sensitivities(&tvcov, &subj, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08])
+                .is_none(),
+            "ExpressionScale + TV covariate must fall back to FD (None)"
+        );
+    }
+
     /// The light `Dual1` inner provider's `f` / `∂f/∂η` must equal the full `Dual2`
     /// outer provider's `f` / `df_deta` exactly — both are exact analytic, only the
     /// dual order differs (and `solve_ode_g` uses value-based step control, so the
@@ -3853,6 +4032,17 @@ mod tests {
 
         // LTBS output transform over the Dual1 readout.
         let m = parse_model_string(TWOCPT_ODE_LTBS).expect("parse");
+        check(
+            &m,
+            &bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
+            &[4.0, 12.0, 2.0, 25.0],
+            &[0.12, -0.08],
+        );
+
+        // η-dependent `ExpressionScale` divisor (#486) → the inner η-only quotient
+        // (`apply_expression_scale_inner_dispatch`) must equal the full provider's
+        // scaled `df_deta`.
+        let m = parse_model_string(TWOCPT_ODE_EXPRSCALE).expect("parse");
         check(
             &m,
             &bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),

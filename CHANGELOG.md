@@ -44,6 +44,21 @@ section of the SDLC for the versioning policy).
   parse error rather than a silent never-matching no-op, and a clause referencing a column
   absent from the data emits a `W_FILTER_COLUMN_ABSENT` warning instead of fitting
   unfiltered data silently.
+- **Exact analytic FOCE/FOCEI gradients for η-dependent `ExpressionScale` `obs_scale`** (#486),
+  on **both** the analytical 1-/2-/3-cpt path (inner EBE gradient) and the user-`[odes]` path
+  (outer θ/Ω/σ gradient **and** inner EBE gradient). A divisor scale such as `obs_scale =
+  1000 / V` (with `V` carrying IIV) previously routed parts of the gradient to finite
+  differences: on the analytical path the per-subject inner EBE loop reverted to FD (the outer
+  was already analytic), and on the ODE path *both* loops did. The provider now applies the
+  scale's quotient rule `∂(f/s)/∂x = (∂f/∂x)·s⁻¹ − f·(∂s/∂x)·s⁻²` (`x ∈ {η, θ}`) over the
+  differentiable scale program — the η-block for the inner loop, the full `(θ, η)` jet
+  (including second-order blocks) for the outer — applied once per subject on the final
+  prediction jet. The same `apply_expression_scale_*` routines now serve the closed-form and
+  ODE providers. Result-neutral (estimates and SEs unchanged; this removes FD steps, so the
+  affected fits are faster and report the gradient method as "analytic"). On the ODE path the
+  scale is served on the static walk only — combined with **LTBS** or **time-varying
+  covariates** it still routes to FD, as does IOV + `ExpressionScale`. Validated analytic ≡
+  production + finite differences (ODE outer), and light ≡ full provider (both inner loops).
 - **Exact analytic FOCE/FOCEI gradients for steady-state (SS=1) ODE dosing** (#439). User-
   `[odes]` models with a steady-state dose now get exact analytic gradients instead of
   finite differences. NONMEM SS=1 loads the compartments with an infinite-past pulse

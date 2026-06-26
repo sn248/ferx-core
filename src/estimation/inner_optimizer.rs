@@ -990,21 +990,28 @@ pub fn profile_report() {
 /// The model-level inner-gradient bails that are independent of which analytic inner
 /// provider (non-IOV analytical, non-IOV ODE `Dual1`, or IOV) will serve the model.
 /// Returns `true` when the model must use the **FD** inner gradient regardless: the
-/// escape hatch / A-B toggle, an explicit `gradient = fd`, SDE diffusion, LTBS, an
-/// eta-dependent `ExpressionScale` obs_scale, or IIV on residual error (`iiv_on_ruv`,
-/// whose `exp(2·η_ruv)` variance scaling none of the `Dual2`/`Dual1` kernels carry).
+/// escape hatch / A-B toggle, an explicit `gradient = fd`, SDE diffusion, LTBS, or
+/// IIV on residual error (`iiv_on_ruv`, whose `exp(2·η_ruv)` variance scaling none of
+/// the `Dual2`/`Dual1` kernels carry).
 /// Every analytic inner path consults this so none of them can run on a model that one
 /// of these reasons routes to FD — including the IOV inner loop, which previously dropped
 /// these exclusions (#466 review #1/#3).
+///
+/// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the non-IOV
+/// analytical inner provider now carries the η-only quotient rule (`subject_eta_grad`
+/// → `apply_expression_scale_inner`), so it serves these models analytically. The IOV
+/// and ODE inner paths keep declining `ExpressionScale` through their own gates
+/// (`iov_analytical_supported` requires `ScalingSpec::None`; `ode_analytical_supported`
+/// declines the divisor scale), so dropping it here only enables the non-IOV closed-form
+/// route that can actually serve it.
 pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
         || matches!(model.gradient_method, GradientMethod::Fd)
         || model.is_sde()
         || model.log_transform
-        || matches!(
-            model.scaling,
-            crate::types::ScalingSpec::ExpressionScale { .. }
-        )
+        // Correlated residual error (#main feature) is not carried by the analytic
+        // inner kernels yet — route to FD. (An eta-dependent `ExpressionScale` is NOT a
+        // bail here; see the doc above.)
         || !model.residual_correlations.is_empty()
         // `iiv_on_ruv`: plain residual-η is now served analytically on both loops
         // (#474, the scaling lives in the shared gradient); only the cases that force
@@ -2843,10 +2850,13 @@ mod iov_tests {
 
     /// The IOV inner loop must honour the same model-level FD bails as the non-IOV inner
     /// (#466 review #1/#3): `gradient = fd` / escape hatch, IIV-on-residual-error
-    /// (`iiv_on_ruv`), LTBS, and `ExpressionScale` all force the FD inner gradient — the
-    /// shared `analytic_inner_common_bail` gate `find_ebe_iov` now consults. Without it an
+    /// (`iiv_on_ruv`), and LTBS all force the FD inner gradient — the shared
+    /// `analytic_inner_common_bail` gate `find_ebe_iov` now consults. Without it an
     /// IOV + `iiv_on_ruv` fit would build the inner gradient on an unscaled residual
     /// variance, and `gradient = fd` would silently fail to disable the analytic inner.
+    /// (`ExpressionScale` is no longer a common bail — the non-IOV analytical inner serves
+    /// it via the quotient rule; IOV keeps declining it through `iov_analytical_supported`,
+    /// asserted by the `iov_sens_supported` checks below.)
     #[test]
     fn iov_inner_honours_common_bails() {
         use crate::parser::model_parser::parse_model_string;

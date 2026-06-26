@@ -2597,28 +2597,37 @@ fn apply_expression_scale_inner<const N: usize>(
     cov: &std::collections::HashMap<String, f64>,
     n_eta: usize,
 ) {
-    // The PK params the scale references, as `Dual1<N>` carrying value + ∂p/∂η (a slot
-    // the program references but the provider does not differentiate enters constant —
-    // the same per-slot constructor the inner init impulse uses). A scale references at
-    // most the 8 PK slots, so the var count is `<= MAX_SCALE_AXES`; build into a stack
-    // buffer instead of a per-call heap `Vec` (#534 review #3).
+    // One `Dual1<N>` per individual-parameter var the scale program can reference
+    // (value + ∂p/∂η; a slot the program references but the provider does not
+    // differentiate enters constant — the same per-slot constructor the inner init
+    // impulse uses). The count is `var_to_pk_slot().len()` = the number of
+    // `[individual_parameters]` vars, which is NOT axis-bounded (a model may declare
+    // many intermediates). Use a stack buffer on the common `<= MAX_SCALE_AXES` path
+    // and fall back to a heap `Vec` for models with more individual parameters
+    // (#534 review #3; the fixed-size buffer alone would panic on the `[..nvar]` slice).
     let var_slots = prog.var_to_pk_slot();
     let nvar = var_slots.len();
-    debug_assert!(
-        nvar <= MAX_SCALE_AXES,
-        "scale references more PK slots than MAX_SCALE_AXES"
-    );
-    let mut var_duals = [Dual1::<N>::constant(0.0); MAX_SCALE_AXES];
-    for (d, &s) in var_duals.iter_mut().zip(var_slots.iter()) {
-        *d = pk_slot_dual_inner::<N>(
+    let mk = |s: usize| {
+        pk_slot_dual_inner::<N>(
             s,
             pk.values.get(s).copied().unwrap_or(0.0),
             dp_deta,
             slots,
             n_eta,
-        );
-    }
-    let s = prog.eval_scale_dual1::<N>(theta, eta, cov, &var_duals[..nvar]);
+        )
+    };
+    let mut buf = [Dual1::<N>::constant(0.0); MAX_SCALE_AXES];
+    let heap: Vec<Dual1<N>>;
+    let var_duals: &[Dual1<N>] = if nvar <= MAX_SCALE_AXES {
+        for (d, &s) in buf.iter_mut().zip(var_slots.iter()) {
+            *d = mk(s);
+        }
+        &buf[..nvar]
+    } else {
+        heap = var_slots.iter().map(|&s| mk(s)).collect();
+        &heap
+    };
+    let s = prog.eval_scale_dual1::<N>(theta, eta, cov, var_duals);
     let inv = 1.0 / s.value;
     let inv2 = inv * inv;
     for o in out.iter_mut() {
@@ -5049,6 +5058,53 @@ mod tests {
         let subject = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
         let theta = [0.2, 10.0, 1.5];
         let eta = [0.15, -0.10, 0.25];
+        let full = subject_sensitivities(&model, &subject, &theta, &eta).expect("full");
+        let light = subject_eta_grad(&model, &subject, &theta, &eta).expect("light supported");
+        assert_eq!(full.obs.len(), light.len());
+        for (fo, lo) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-14);
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    fo.df_deta[k],
+                    lo.df_deta[k],
+                    max_relative = 1e-12,
+                    epsilon = 1e-14
+                );
+            }
+        }
+    }
+
+    /// Regression for the finding-3 stack-buffer bound (#534 audit): a scale program's
+    /// `var_to_pk_slot().len()` is the number of `[individual_parameters]` vars, NOT the
+    /// axis count — a model may declare more than `MAX_SCALE_AXES` individual parameters.
+    /// `apply_expression_scale_inner` must not panic on the fixed-size buffer there (it
+    /// falls back to a heap `Vec`). Build a chain of 18 vars (> 16) and confirm the light
+    /// inner gradient runs and still matches the full provider.
+    #[test]
+    fn light_provider_expression_scale_many_indiv_params_no_panic() {
+        let mut ip = String::from("[individual_parameters]\n  A0 = 1.0\n");
+        for i in 1..16 {
+            ip.push_str(&format!("  A{i} = A{}\n", i - 1));
+        }
+        // 16 A-vars (A0..A15) + CL + V = 18 individual-parameter vars > MAX_SCALE_AXES.
+        ip.push_str("  CL = TVCL * exp(ETA_CL) * A15\n  V = TVV * exp(ETA_V)\n");
+        let src = format!(
+            "[parameters]\n  theta TVCL(0.13,0.01,1.0)\n  theta TVV(8.0,1.0,50.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.05\n{ip}\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+        );
+        let model = parse_model_string(&src).expect("parse many-param scaling model");
+        assert!(
+            matches!(
+                model.scaling,
+                ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+            ),
+            "model must carry a differentiable scale program"
+        );
+        let subject = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0]);
+        let theta = [0.13, 8.0];
+        let eta = [0.1, -0.05];
         let full = subject_sensitivities(&model, &subject, &theta, &eta).expect("full");
         let light = subject_eta_grad(&model, &subject, &theta, &eta).expect("light supported");
         assert_eq!(full.obs.len(), light.len());

@@ -692,10 +692,17 @@ pub fn ode_subject_eta_grad(
     if !ode_subject_supported(model, subject) {
         return None;
     }
+    // `pk` and the η-block `∂p/∂η` are evaluated once here and threaded into the driver
+    // (mirroring the outer `ode_subject_sensitivities`, which threads `pk`/`pd`), so the
+    // light walk doesn't recompute them — and the `ExpressionScale` quotient below reuses
+    // the same `dp_deta` rather than running the individual-parameter Dual1 program a
+    // second time in the inner BFGS hot loop (#534 review #3).
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let dp_deta = param_eta_derivatives(model, subject, theta, eta)?;
     macro_rules! dispatch {
         ($($n:literal),+) => {
             match model.pk_indices.len() {
-                $($n => run_subject_eta::<$n>(model, subject, theta, eta),)+
+                $($n => run_subject_eta::<$n>(model, subject, &pk, &dp_deta),)+
                 _ => None,
             }
         };
@@ -704,14 +711,12 @@ pub fn ode_subject_eta_grad(
     // η-dependent `ExpressionScale` divisor (#486): apply the η-only quotient on the
     // light gradient, via the SAME `apply_expression_scale_inner_dispatch` the
     // closed-form inner provider uses (the η-block of `apply_expression_scale_outer`).
-    // `param_eta_derivatives` gives `∂p/∂η` in `prog.pk_slots()` order, paired with
-    // `slots = prog.pk_slots()`; `pk` supplies the referenced PK-param values.
+    // `dp_deta` is `∂p/∂η` in `prog.pk_slots()` order, paired with `slots =
+    // prog.pk_slots()`; `pk` supplies the referenced PK-param values.
     if let ScalingSpec::ExpressionScale {
         deriv: Some(prog), ..
     } = &model.scaling
     {
-        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-        let dp_deta = param_eta_derivatives(model, subject, theta, eta)?;
         let slots = model
             .ode_spec
             .as_ref()?
@@ -1422,16 +1427,15 @@ fn run_subject_mixed<const NA: usize, const N: usize>(
 fn run_subject_eta<const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    pk: &crate::types::PkParams,
+    dp_deta: &[Vec<f64>],
 ) -> Option<Vec<ObsGrad>> {
     let ode = model.ode_spec.as_ref()?;
     let n_eta = model.n_eta;
 
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-
-    // First-order `∂p/∂η` only — the η-block, over a `Dual1` (no θ-axes, no Hessian).
-    let dp_deta = param_eta_derivatives(model, subject, theta, eta)?;
+    // `pk` and the η-block `∂p/∂η` are evaluated once by the caller
+    // (`ode_subject_eta_grad`) and threaded in, so the inner BFGS hot loop doesn't
+    // recompute them per gradient evaluation (#534 review #3).
 
     // Initial state from `init(...)` (dual-seeded by FD of init_fn, value + grad);
     // zeros when none is declared. Re-applied at every EVID 3/4 reset.

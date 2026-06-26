@@ -999,11 +999,15 @@ pub fn profile_report() {
 ///
 /// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the non-IOV
 /// analytical inner provider now carries the η-only quotient rule (`subject_eta_grad`
-/// → `apply_expression_scale_inner`), so it serves these models analytically. The IOV
-/// and ODE inner paths keep declining `ExpressionScale` through their own gates
-/// (`iov_analytical_supported` requires `ScalingSpec::None`; `ode_analytical_supported`
-/// declines the divisor scale), so dropping it here only enables the non-IOV closed-form
-/// route that can actually serve it.
+/// → `apply_expression_scale_inner`), and the ODE inner provider serves it on the static
+/// walk (#534/#486), so both run analytically. Two things keep this safe rather than
+/// re-introducing an analytic-inner-vs-FD-outer split: the **IOV** inner path still
+/// declines `ExpressionScale` through its own gate (`iov_analytical_supported` requires
+/// `ScalingSpec::None`), and the **ODE** inner path does not consult this common bail at
+/// all — it has its own inline bail list in [`analytic_inner_grad_supported`] and its own
+/// per-subject scope (`ode_inner_grad_supported`, which only admits the static-walk
+/// `ExpressionScale` that the ODE provider actually applies). So dropping it here affects
+/// only the non-IOV closed-form route — exactly the one that now serves it.
 pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
         || matches!(model.gradient_method, GradientMethod::Fd)
@@ -1043,11 +1047,12 @@ pub(crate) fn subject_has_survival_records(subject: &Subject) -> bool {
 /// inner route off **this same** predicate, so the reported `gradient_method_inner`
 /// cannot drift from what `find_ebe` actually runs (PR #381 review #9).
 pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool {
-    // Escape hatch, explicit `gradient = fd`, SDE, LTBS, `ExpressionScale` obs_scale,
-    // and the `iiv_on_ruv` cases that force FD all revert the inner EBE gradient to FD
-    // (see `analytic_inner_common_bail` for the per-reason rationale). LTBS and
-    // `ExpressionScale` still get the analytic *outer* gradient; only the inner finder
-    // reverts.
+    // Escape hatch, explicit `gradient = fd`, SDE, LTBS, and the `iiv_on_ruv` cases that
+    // force FD all revert the inner EBE gradient to FD (see `analytic_inner_common_bail`
+    // for the per-reason rationale). LTBS still gets the analytic *outer* gradient; only
+    // the inner finder reverts. (An eta-dependent `ExpressionScale` obs_scale is now
+    // served analytically on *both* loops — #534/#486 — so it is no longer a bail here;
+    // see `analytic_inner_common_bail`.)
     if analytic_inner_common_bail(model) {
         return false;
     }

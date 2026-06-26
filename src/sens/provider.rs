@@ -1876,6 +1876,21 @@ fn subject_eta_grad_impl(
     // (`apply_expression_scale_inner`) — the light counterpart of the outer
     // `apply_expression_scale`. `scaling_supported` (checked inside
     // `analytical_supported`) already bounded the scale program to the dispatch table.
+    //
+    // EXCEPT LTBS + η-dependent `ExpressionScale`: route that combination to the FD inner
+    // Jacobian (#534 review #5). The EBE itself already converges on FD for any LTBS model
+    // (`analytic_inner_common_bail` includes `log_transform`); `find_ebe` then builds the
+    // covariance H-matrix from this provider's Jacobian (`subject_eta_jacobian`, gated only
+    // on `Some`/`None`). Returning the analytic scale+log Jacobian here would pair it with
+    // that FD-converged EBE — and under the `g = ln(f)` wrap the closed-form EBE's ~1e-9
+    // offset is exactly what corrupts the covariance Hessian (the reason LTBS reverts the
+    // inner gradient at all). Declining restores the pre-#486 behaviour for this combo and
+    // matches the ODE path's `!log_transform` gate for `ExpressionScale`. (Plain LTBS and
+    // plain `ExpressionScale` are unaffected; the analytic *outer* gradient still serves
+    // LTBS + `ExpressionScale`.)
+    if model.log_transform && matches!(model.scaling, ScalingSpec::ExpressionScale { .. }) {
+        return None;
+    }
 
     let n_eta = model.n_eta;
     let oral = matches!(
@@ -2152,6 +2167,12 @@ pub fn subject_sensitivities(
 /// gradient consumes). `s` is subject-static, so it is evaluated once and reused
 /// for every observation. Dual dimension `m < n_theta` is `θ_m`; `n_theta + k` is
 /// `η_k`.
+///
+/// The first-order **η** value/gradient here (`f/s`, `f_k/s − f·s_k/s²`) is the same
+/// formula [`apply_expression_scale_inner`] applies for the light inner provider; the two
+/// are kept in sync by the `light_provider_expression_scale_matches_full` /
+/// `ode_light_inner_eta_grad_matches_full_provider` parity tests (mirroring the
+/// `apply_analytical_init` / `_inner` split, #534 review #6). Edit both together.
 #[allow(clippy::too_many_arguments)]
 fn apply_expression_scale<const M: usize>(
     sens: &mut SubjectSens,
@@ -2234,13 +2255,16 @@ fn apply_expression_scale<const M: usize>(
 
 /// Apply an `ExpressionScale` divisor to a subject's `(θ, η)`-space [`SubjectSens`],
 /// monomorphising [`apply_expression_scale`] on the scale program's axis count
-/// `prog.n_axes()` (`= n_theta + n_eta`) over the `1..=MAX_SCALE_AXES` dispatch table.
-/// Shared by the closed-form provider ([`subject_sensitivities`]) and the ODE provider
-/// ([`crate::sens::ode_provider::ode_subject_sensitivities`], #486) — both produce the
-/// same `SubjectSens` shape, so the quotient-rule application is provider-agnostic.
-/// `slots`/`pd` must be the paired `(prog.pk_slots(), param_derivatives_from_prog(prog))`
-/// the caller already built for the η/θ chain. A scale wider than the table is a no-op
-/// (`scaling_supported` bounds `n_axes ≤ MAX_SCALE_AXES`, so unreachable in scope).
+/// `prog.n_axes()` (`= n_theta + n_eta`) over the shared `1..=MAX_SCALE_AXES` dispatch
+/// table ([`dispatch_init_impulse!`], so it stays coupled to the axis cap and can't
+/// silently drop the scale through a `_` arm if the cap is later widened — #534 review
+/// #4). Shared by the closed-form provider ([`subject_sensitivities`]) and the ODE
+/// provider ([`crate::sens::ode_provider::ode_subject_sensitivities`], #486) — both
+/// produce the same `SubjectSens` shape, so the quotient-rule application is
+/// provider-agnostic. `slots`/`pd` must be the paired `(prog.pk_slots(),
+/// param_derivatives_from_prog(prog))` the caller already built for the η/θ chain. A
+/// scale wider than the table is a no-op (`scaling_supported` bounds `n_axes ≤
+/// MAX_SCALE_AXES`, so unreachable in scope).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_expression_scale_outer(
     sens: &mut SubjectSens,
@@ -2254,17 +2278,20 @@ pub(crate) fn apply_expression_scale_outer(
     n_theta: usize,
     n_eta: usize,
 ) {
-    macro_rules! disp_scale {
-        ($($mm:literal),+) => {
-            match prog.n_axes() {
-                $($mm => apply_expression_scale::<$mm>(
-                    sens, prog, pk, pd, slots, theta, eta, cov, n_theta, n_eta,
-                ),)+
-                _ => {}
-            }
-        };
-    }
-    disp_scale!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+    dispatch_init_impulse!(
+        prog.n_axes(),
+        apply_expression_scale,
+        sens,
+        prog,
+        pk,
+        pd,
+        slots,
+        theta,
+        eta,
+        cov,
+        n_theta,
+        n_eta
+    );
 }
 
 /// Build the `Dual2<M>` for PK slot `slot` in `(θ, η)`-axis layout (axes
@@ -2543,6 +2570,12 @@ fn apply_analytical_init_inner<const N: usize>(
 /// only, via [`pk_slot_dual_inner`]) and the scale is evaluated once over
 /// [`ScaleDerivProgram::eval_scale_dual1`]. `s` is subject-static, so it is evaluated
 /// once and reused for every observation, matching the outer path.
+///
+/// This is the same first-order η quotient [`apply_expression_scale`] applies for the
+/// `Dual2` outer provider; the two hand-written copies are kept in sync by the
+/// `light_provider_expression_scale_matches_full` /
+/// `ode_light_inner_eta_grad_matches_full_provider` parity tests (#534 review #6). Edit
+/// both together.
 #[allow(clippy::too_many_arguments)]
 fn apply_expression_scale_inner<const N: usize>(
     out: &mut [ObsGrad],
@@ -5016,6 +5049,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// LTBS combined with an η-dependent `ExpressionScale` routes the **inner** gradient to
+    /// FD (#534 review #5): the analytic outer still serves it, but the light provider
+    /// declines so the covariance H-matrix Jacobian (`subject_eta_jacobian`, gated only on
+    /// `Some`/`None`) isn't built from an analytic scale+log jet paired with the
+    /// FD-converged LTBS EBE. Restores the pre-#486 behaviour for this combo and matches the
+    /// ODE path's `!log_transform` gate.
+    #[test]
+    fn ltbs_plus_expression_scale_inner_falls_back_to_fd() {
+        let src = WARFARIN.replace(
+            "[error_model]\n  DV ~ proportional(PROP_ERR)",
+            "[error_model]\n  DV ~ proportional(PROP_ERR)\n[scaling]\n  obs_scale = 1000 / V",
+        );
+        let mut model = parse_model_string(&src).expect("parse");
+        model.log_transform = true;
+        let subject = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = [0.2, 10.0, 1.5];
+        let eta = [0.15, -0.10, 0.25];
+        // Inner declines → FD H-matrix, matching the model-level gate.
+        assert!(
+            subject_eta_grad(&model, &subject, &theta, &eta).is_none(),
+            "LTBS + ExpressionScale inner gradient must fall back to FD"
+        );
+        assert!(
+            !crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(&model),
+            "LTBS keeps the model out of analytic inner scope"
+        );
+        // The analytic OUTER gradient still serves LTBS + ExpressionScale.
+        assert!(
+            subject_sensitivities(&model, &subject, &theta, &eta).is_some(),
+            "analytic outer gradient still serves LTBS + ExpressionScale"
+        );
     }
 
     // ── Time-varying covariate analytic sensitivities ─────────────────

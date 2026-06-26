@@ -132,29 +132,36 @@ fn modeled_rate_dose_declines() {
 }
 
 #[test]
-fn steady_state_dose_declines() {
+fn steady_state_dose_now_analytic() {
+    // Steady-state dosing on a plain ODE now gets the analytic dual equilibration (#439 SS).
+    // Only SS + estimated lagtime and SS rate-defined-infusion-under-F still fall back — see
+    // the `ode_provider` unit tests `ode_provider_ss_lagtime_routes_to_fd` /
+    // `ode_provider_ss_rate_defined_infusion_under_f_routes_to_fd`. (ARMED has no `TAD`-
+    // dependent RHS, so it is not affected by the SS+`TAD` FD gate.)
     let model = parse(ARMED);
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0); // SS, II=24
     assert!(
-        declines(&model, vec![dose]),
-        "steady-state dosing must fall back to FD"
+        !declines(&model, vec![dose]),
+        "steady-state dosing is now analytic (#439 SS equilibration)"
     );
 }
 
 #[test]
-fn bioavailability_with_rate_defined_infusion_declines() {
-    // #419: F reshapes a rate-defined infusion's window in production, but the dual
-    // walk scales the magnitude — must fall back to stay consistent.
+fn bioavailability_with_rate_defined_infusion_now_analytic() {
+    // #419: F reshapes a rate-defined infusion's window length (`F·amt/rate`); the dual walk
+    // now carries that moving rate-off boundary via the event-time saltation, so it is
+    // analytic. (A *steady-state* rate-defined infusion under F still falls back — see the
+    // unit test `ode_provider_ss_rate_defined_infusion_under_f_routes_to_fd`.)
     let model = parse(ODE_WITH_F);
     let infusion = DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0); // RATE>0 = rate-defined
     assert!(
-        declines(&model, vec![infusion]),
-        "F + rate-defined infusion must fall back to FD (#419)"
+        !declines(&model, vec![infusion]),
+        "F + rate-defined infusion is now analytic (#419 moving window boundary)"
     );
-    // But the same F model with a *bolus* (no infusion window to reshape) stays armed.
+    // F + bolus (no infusion window) was already in scope.
     assert!(
         !declines(&model, vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)]),
-        "F + bolus is in scope (no window reshape)"
+        "F + bolus is in scope"
     );
 }
 

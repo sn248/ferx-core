@@ -5641,6 +5641,70 @@ mod tests {
         check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
     }
 
+    /// **ODE IOV + steady-state bolus.** Each occasion's SS dose equilibrates with that
+    /// occasion's κ-seeded params (dual SS-equilibration), then the per-occasion walk
+    /// continues. Validated vs FD of `predict_iov` (#439 IOV × SS).
+    #[test]
+    fn ode_iov_ss_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, true, 12.0),
+        ];
+        assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
+        check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
+    }
+
+    /// **ODE IOV + rate-defined infusion under bioavailability `F ≠ 1`** (#419 × IOV). The
+    /// bioavailable window length `F·amt/rate` is a moving rate-off boundary per occasion;
+    /// the event-driven walk carries it with the rate held. Validated vs FD of `predict_iov`.
+    #[test]
+    fn ode_iov_rate_defined_infusion_under_f_matches_fd_of_predict_iov() {
+        // WARFARIN IOV ODE with a bioavailability parameter `F`.
+        const WARFARIN_IOV_F_ODE: &str = r#"
+[parameters]
+  theta TVCL(0.13, 0.01, 1.0)
+  theta TVV(8.0, 1.0, 50.0)
+  theta TVF(0.7, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  iov_column OCC
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV * exp(ETA_V)
+  F  = TVF
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(WARFARIN_IOV_F_ODE).expect("parse IOV+F ODE");
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 50.0, false, 0.0),
+        ];
+        assert!(subject.has_rate_defined_infusion());
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.13, 8.0, 0.7],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
     /// **IOV × estimated lagtime.** 1-cpt IV IOV `[odes]` model (κ on CL) with a bare
     /// `LAGTIME`. The dose arrives per occasion at `t_dose + lag`; the lag sensitivity is
     /// the event-time saltation injected at each dose and propagated through the

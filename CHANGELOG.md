@@ -20,6 +20,31 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Exact analytic FOCE/FOCEI gradients for steady-state (SS=1) ODE dosing** (#439). User-
+  `[odes]` models with a steady-state dose now get exact analytic gradients instead of
+  finite differences. NONMEM SS=1 loads the compartments with an infinite-past pulse
+  train's trough; there is no closed form for a general ODE, so production expands it as a
+  *finite* `(apply dose; integrate II)` loop — running that same loop over the dual type
+  propagates `∂(steady state)/∂(θ,η)` directly (no implicit fixed-point differentiation).
+  Both SS **boluses** and SS **infusions** are supported (an SS infusion equilibrates with
+  an active-rate window + quiet window per cycle), and SS composes with time-varying
+  covariates, IOV, and EVID 3/4 resets. Routes to FD: a rate-defined SS infusion under
+  `F ≠ 1` (its equilibration cycles would each need the `F`-scaled active window), and SS
+  combined with an **estimated lagtime** (observations in the pre-arrival window
+  `[t_dose, t_dose+lag]` must read the previous interval's steady-state tail, which the
+  dual walk does not yet seed — production handles it via `ss_state_at_phase`). Result-
+  neutral. **NONMEM comparison:** the SS=1 semantics this differentiates (the infinite-past
+  pulse-train trough) are the production predictor's, NONMEM-validated for SS dosing in
+  `docs/model-file` / `tests/`; the analytic gradient is the exact derivative of that
+  NONMEM-matching prediction (FD-confirmed via `check_vs_production` / `predict_iov`).
+- **Analytic gradients for rate-defined infusion under bioavailability `F ≠ 1`** in
+  `[odes]` models (#419). NONMEM holds a rate-defined infusion's rate and scales its
+  *duration* to `F·amt/rate`, so `F`'s sensitivity is a moving window boundary rather than
+  a rate-magnitude scale — previously this routed to finite differences. The event-driven
+  walk now carries it: the bioavailable window length `F·amt/rate` is the rate-off
+  saltation boundary (combined with any lagtime shift), with the rate held. Such subjects
+  route to the event-driven walk automatically. (A *steady-state* rate-defined infusion
+  under `F ≠ 1` still uses FD.) Result-neutral.
 - **Exact analytic FOCE/FOCEI gradients for IOV `[odes]` models** (#439). User-ODE
   models with inter-occasion variability (`iov_column`, `kappa`) now get the exact
   analytic outer (θ/Ω/σ) gradient over the stacked `[η_bsv, κ₁..κ_K]` random effects,

@@ -565,20 +565,38 @@ fn compute_rescale2_scale(bounds: &PackedBounds) -> Vec<f64> {
 }
 
 /// Resolve [`ParameterScaling::Auto`] to a concrete strategy. `Auto` applies
-/// `Rescale2` to the gradient-based optimizers that benefit (`Bfgs`, `Lbfgs`,
-/// `NloptLbfgs`, `Slsqp`) and `None` otherwise — critically, the derivative-free
-/// default `Bobyqa` is left unscaled because `Rescale2` distorts its trust-region
-/// quadratic model and regresses multi-cpt / PD fits (e.g. emax_pkpd −36.8→−13.5,
-/// three_cpt_iv −730.6→−715.9). `Slsqp` is included because the bound-half-width
-/// rescaling fixes its cold-start convergence — e.g. pure FOCEI/SLSQP on
-/// warfarin_iov reaches OFV 307.84 from the cold default start instead of
-/// stalling at 343.5 (#335). `Mma`/`TrustRegion` are left to the unscaled (legacy
-/// `scale_params` / IOV-auto) branch. Non-`Auto` values pass through unchanged.
+/// `Abs` (per-coordinate magnitude scaling, normalise by |packed value|) to the
+/// gradient-based optimizers (`Bfgs`, `Lbfgs`, `NloptLbfgs`, `Slsqp`) and `None`
+/// otherwise. `Abs` is the correct preconditioner for a quasi-Newton / SQP step:
+/// it presents O(1) coordinates so the optimizer's first move is well-scaled.
+///
+/// This replaces the earlier `Rescale2` (bound-half-width) scaling, which is the
+/// *wrong* preconditioner for gradient optimizers — bound width is unrelated to
+/// curvature, so it drove L-BFGS into a parameter bound on ill-conditioned fits
+/// (warfarin FOCEI −286→−243; tvcov to a +166 local min with TVV pinned at its
+/// lower bound) and froze SLSQP's first step on two_cpt_oral_cov (−1026, no move
+/// from init). `Abs` recovers the correct optimum in every one of those cases
+/// (warfarin −286, tvcov −188.6 at truth, two_cpt_oral_cov −1165) and preserves
+/// SLSQP's warfarin_iov cold-start win (OFV 307.8, the #335 case).
+///
+/// The derivative-free default `Bobyqa` is left unscaled — any per-coordinate
+/// scaling distorts its trust-region quadratic model and regresses multi-cpt / PD
+/// fits (e.g. emax_pkpd −36.8→−13.5, three_cpt_iv −730.6→−715.9). `Mma` /
+/// `TrustRegion` are left to the unscaled (legacy `scale_params` / IOV-auto)
+/// branch. Non-`Auto` values pass through unchanged.
 fn resolve_scaling(ps: ParameterScaling, opt: Optimizer) -> ParameterScaling {
     match ps {
         ParameterScaling::Auto => match opt {
+            // Gradient-based optimizers condition best with magnitude scaling
+            // (`Abs` = normalise by |packed value|). `Rescale2` (bound-half-width)
+            // is the wrong preconditioner: it drives L-BFGS into a bound on
+            // ill-conditioned fits (warfarin −286→−243, tvcov to a local min) and
+            // freezes SLSQP's first step on two_cpt_oral_cov (−1026, no move).
+            // `Abs` recovers the correct optimum for both (warfarin −286, tvcov
+            // −188.6 at truth, two_cpt_oral_cov −1165) while preserving SLSQP's
+            // warfarin_iov cold-start win (OFV 307.8, the #335 case).
             Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::NloptLbfgs | Optimizer::Slsqp => {
-                ParameterScaling::Rescale2
+                ParameterScaling::Abs
             }
             _ => ParameterScaling::None,
         },
@@ -636,7 +654,19 @@ fn optimize_nlopt(
     let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
     let scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
         ParameterScaling::Rescale2 => compute_rescale2_scale(&bounds),
-        ParameterScaling::Abs => compute_scale(&x0),
+        // Magnitude scaling, but disabled when an identity-packed theta is present
+        // (covariate effects with `theta_lower < 0`): `compute_scale` leaves those
+        // small coordinates near their raw value while log-packed θ become O(1), and
+        // the resulting wildly-mixed scaled magnitudes hurt the quasi-Newton/SQP
+        // Hessian estimate (observed: SAD_SCEN1 FOCEI 510+ evals vs ~90 unscaled).
+        // Falling back to the natural mixed space keeps that protection.
+        ParameterScaling::Abs => {
+            if has_identity_theta {
+                vec![1.0; n]
+            } else {
+                compute_scale(&x0)
+            }
+        }
         // `Auto` is resolved away by `resolve_scaling`; group with `None`.
         ParameterScaling::None | ParameterScaling::Auto => {
             if (options.scale_params || auto_scale_iov) && !has_identity_theta {
@@ -3876,11 +3906,12 @@ mod tests {
         assert_eq!(cov_progress_eta(40, 40, 8.0), 0.0); // done → 0 remaining
     }
 
-    /// `resolve_scaling` maps `Auto` to `Rescale2` for the gradient-based
-    /// optimizers that benefit (incl. `Slsqp` — the #335 cold-start fix) and to
-    /// `None` for the derivative-free `Bobyqa` default (and `Mma`/`TrustRegion`);
-    /// explicit non-`Auto` values pass through unchanged. Guards the #341/#335
-    /// default-scaling routing.
+    /// `resolve_scaling` maps `Auto` to `Abs` (magnitude scaling) for the
+    /// gradient-based optimizers (incl. `Slsqp`) and to `None` for the
+    /// derivative-free `Bobyqa` default (and `Mma`/`TrustRegion`); explicit
+    /// non-`Auto` values pass through unchanged. Guards the gradient-optimizer
+    /// preconditioner routing (Rescale2 → Abs, the fix that recovers warfarin /
+    /// tvcov / two_cpt_oral_cov convergence while preserving #335).
     #[test]
     fn resolve_scaling_routes_auto_by_optimizer() {
         use crate::types::ParameterScaling::{Abs, Auto, None as PsNone, Rescale2};
@@ -3892,8 +3923,8 @@ mod tests {
         ] {
             assert_eq!(
                 resolve_scaling(Auto, opt),
-                Rescale2,
-                "{opt:?} should be Rescale2 under Auto"
+                Abs,
+                "{opt:?} should be Abs under Auto"
             );
         }
         for opt in [Optimizer::Bobyqa, Optimizer::Mma, Optimizer::TrustRegion] {

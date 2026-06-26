@@ -110,6 +110,20 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- **Gradient-based outer optimizers now precondition with magnitude scaling
+  (`Abs`) instead of bound-half-width (`Rescale2`).** Under the default
+  `optimizer = auto` (which resolves to NLopt L-BFGS when an analytic gradient is
+  available), `Rescale2` was the wrong preconditioner and made FOCE/FOCEI
+  converge to a parameter bound or a local minimum on several models — warfarin
+  FOCEI stalled at OFV −243 (TVV 6.08) instead of −286 (TVV 7.74); a
+  time-varying-covariate fit landed at a +166 local minimum with TVV pinned at
+  its lower bound; SLSQP froze at its start on a 2-cpt covariate model. Switching
+  the gradient-based optimizers (`bfgs`/`lbfgs`/`nlopt_lbfgs`/`slsqp`) to `Abs`
+  scaling recovers the correct optimum in every case while preserving the SLSQP
+  cold-start fix (#335). This fixes the downstream IMP/IMPMAP warm-start collapse
+  and the simulation-based NPDE/NPD diagnostic, which inherited the bad fit.
+  (Scaling is disabled automatically when an identity-packed covariate θ is
+  present, as before.)
 - **Exact analytic FOCE/FOCEI gradient for `iiv_on_ruv` (IIV on residual error).**
   Models with a residual-error eta (`Y = IPRED + EPS·EXP(η_ruv)`) now use the
   exact closed-form gradient on both the inner EBE and outer θ/Ω/σ loops, where

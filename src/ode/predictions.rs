@@ -116,48 +116,115 @@ pub(crate) const SS_EQUILIBRATION_CYCLES: usize = 50;
 pub(crate) const SS_EQUILIBRATION_TOL: f64 = 1e-12;
 
 /// Whether the SS-equilibration trough has converged between two successive cycles. Shared
-/// by the f64 predictor and the dual gradient path so both truncate on the *same* criterion
-/// — the dual feeds the value parts (`PkNum::val`) of its state (#519).
+/// by the f64 predictor, the event-driven f64 loop, and the dual gradient path so every path
+/// truncates on the *same* criterion — the dual feeds the value parts (`PkNum::val`) of its
+/// state (#519), which keeps its stop cycle identical to the f64 path's, so the truncated
+/// gradient is the exact derivative of the truncated value (see [`crate::sens::propagate::ss_dual_cycle_should_stop`]).
 ///
-/// **Per-compartment** relative test (#532 review #1): each compartment must stop moving
-/// relative to *itself* (`|Δ| ≤ tol·|cur|`), so in a scale-separated model a small
-/// compartment (effect-site / metabolite many orders below central) is not held only to the
-/// dominant compartment's scale. Compartments negligible versus the overall state
-/// (`|cur| ≤ tol·max_mag`) can't affect any prediction, so they don't block the stop.
+/// **Mixed `atol`/`rtol` test on the per-cycle *increment*** (#532 review #1): a compartment
+/// is converged when its movement since the previous cycle is below `tol·|cur| + tol·max_mag`
+/// — negligible both relative to itself and relative to the dominant compartment. Testing the
+/// *increment* (not the magnitude) is what makes this safe in a scale-separated model: a small
+/// compartment still in transit (effect-site / metabolite many orders below central) keeps the
+/// loop running until it too stops moving, rather than being declared converged merely for
+/// being small. The `tol·max_mag` term is the absolute floor that lets a genuinely-settled
+/// near-zero compartment — where the pure relative test is ill-conditioned — pass; without it
+/// the loop could never stop. Because the stop only fires once every compartment's increment
+/// is below f64-relative precision, the value has reached its fixed point and the elided cycles
+/// do not move it — predictions are unchanged to f64 precision, and gradients match a full
+/// budget to `< 1e-6` (see `ode_provider_ss_early_stop_matches_full_budget`).
 ///
 /// A **non-finite** (`NaN`/`Inf`) compartment means the integration blew up: never report
 /// convergence — don't early-exit and silently return a poisoned state; run the full cycle
 /// budget exactly as the pre-#519 code did so the failure surfaces identically (#532 review
 /// #4). Required because `f64::max` would otherwise *drop* a `NaN` and mask it.
 pub(crate) fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
+    // Test-only escape hatch: force every path to run the full cycle budget so a test can
+    // compare the early-stopped result against the fully-equilibrated one (#532 review #4).
+    #[cfg(test)]
+    if FORCE_FULL_SS_EQUILIBRATION.with(|c| c.get()) {
+        return false;
+    }
     if cur.iter().any(|x| !x.is_finite()) {
         return false;
     }
     let max_mag = cur.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
-    let floor = tol * max_mag;
+    let atol = tol * max_mag;
     cur.iter()
         .zip(prev)
-        .all(|(&a, &b)| (a - b).abs() <= tol * a.abs() || a.abs() <= floor)
+        .all(|(&a, &b)| (a - b).abs() <= tol * a.abs() + atol)
+}
+
+/// Rolling prev-state tracker for the f64 SS-equilibration early stop. Owns the previous
+/// cycle's state so the f64 predictor and the event-driven f64 loop share one scaffold instead
+/// of each re-implementing the `cycle > 0` + `copy_from_slice` dance — a later tweak missed in
+/// one site would reintroduce cross-path trough drift (#532 review #6). The dual paths use the
+/// generic [`crate::sens::propagate::ss_dual_cycle_should_stop`], which applies the same
+/// [`ss_cycle_converged`] criterion to the value parts of the dual state.
+#[derive(Default)]
+pub(crate) struct SsStopTracker {
+    prev: Vec<f64>,
+}
+
+impl SsStopTracker {
+    /// Record `cur` and report whether the trough has converged (from cycle 1 on). Returns
+    /// `true` to break the equilibration loop.
+    pub(crate) fn should_stop(&mut self, cycle: usize, cur: &[f64]) -> bool {
+        if cycle > 0 && ss_cycle_converged(cur, &self.prev, SS_EQUILIBRATION_TOL) {
+            return true;
+        }
+        self.prev.clear();
+        self.prev.extend_from_slice(cur);
+        false
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Cycles the most recent [`equilibrate_ss_state`] call ran — a **test-only** observation
-    /// of the #519 early stop, so a test can assert it fired for fast PK and ran the full
-    /// budget for slow PK (#532 review #6 — otherwise the stop logic ships unverified, since
-    /// the loose end-value tolerances absorb a too-early exit).
+    /// Cycles the most recent SS-equilibration call ran — a **test-only** observation of the
+    /// #519 early stop, so a test can assert it fired for fast PK and ran the full budget for
+    /// slow PK (#532 review #5/#6 — otherwise the stop logic ships unverified, since the loose
+    /// end-value tolerances absorb a too-early exit). Set by the f64 predictor, the dual ODE /
+    /// closed-form loops, and the event-driven loop.
     static LAST_SS_EQUILIBRATION_CYCLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// When set, [`ss_cycle_converged`] always reports "not converged" so every path runs the
+    /// full cycle budget — lets a test pin that early-stop is value-preserving vs full
+    /// equilibration (#532 review #4).
+    static FORCE_FULL_SS_EQUILIBRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
-fn record_ss_equilibration_cycles(n: usize) {
+pub(crate) fn record_ss_equilibration_cycles(n: usize) {
     LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.set(n));
+}
+
+/// Cycles the most recent SS-equilibration call ran (test observation; see above).
+#[cfg(test)]
+pub(crate) fn last_ss_equilibration_cycles() -> usize {
+    LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.get())
+}
+
+/// Run `f` with every SS-equilibration path forced to the full cycle budget (#532 review #4).
+/// The reset rides a drop guard so a panic in `f` cannot leave the flag set and poison a later
+/// test sharing the harness thread.
+#[cfg(test)]
+pub(crate) fn with_full_ss_equilibration<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_FULL_SS_EQUILIBRATION.with(|c| c.set(false));
+        }
+    }
+    FORCE_FULL_SS_EQUILIBRATION.with(|c| c.set(true));
+    let _reset = Reset;
+    f()
 }
 
 /// No-op in non-test builds (zero cost on the hot path).
 #[cfg(not(test))]
 #[inline(always)]
-fn record_ss_equilibration_cycles(_n: usize) {}
+pub(crate) fn record_ss_equilibration_cycles(_n: usize) {}
 
 /// Pre-equilibrate the ODE state to its steady-state value for an SS=1
 /// dose with interval `dose.ii`. NONMEM SS=1 semantics: at the time of
@@ -211,9 +278,10 @@ fn equilibrate_ss_state(
         return u;
     }
 
-    // Early stop once the trough stops moving (#519): `prev` holds the previous cycle's
-    // state; from cycle 1 on, break when the relative change is below `SS_EQUILIBRATION_TOL`.
-    let mut prev = vec![0.0; n];
+    // Early stop once the trough stops moving (#519): the shared tracker holds the previous
+    // cycle's state and, from cycle 1 on, breaks when the increment is below the mixed
+    // atol/rtol criterion (#532 review #6 — one scaffold across the f64 paths).
+    let mut tracker = SsStopTracker::default();
     let mut cycles_run = 0usize;
     for cycle in 0..SS_EQUILIBRATION_CYCLES {
         if is_inf {
@@ -270,10 +338,9 @@ fn equilibrate_ss_state(
             }
         }
         cycles_run = cycle + 1;
-        if cycle > 0 && ss_cycle_converged(&u, &prev, SS_EQUILIBRATION_TOL) {
+        if tracker.should_stop(cycle, &u) {
             break;
         }
-        prev.copy_from_slice(&u);
     }
     record_ss_equilibration_cycles(cycles_run);
 
@@ -5048,21 +5115,21 @@ mod tests {
     // equilibration loop in `equilibrate_ss_state`.
 
     #[test]
-    fn ss_cycle_converged_is_relative_linf() {
-        // Below tol (relative L∞): a 1e-13 absolute change on a magnitude-100 state is
-        // 1e-15 relative ≪ 1e-12 → converged.
+    fn ss_cycle_converged_is_mixed_atol_rtol_on_increment() {
+        // Increment below tol: a 1e-13 move on a magnitude-100 state is ≪ tol·(|a| + max) →
+        // converged.
         assert!(ss_cycle_converged(
             &[100.0, 50.0],
             &[100.0 + 1e-13, 50.0],
             SS_EQUILIBRATION_TOL
         ));
-        // Above tol: a 1e-4 absolute change is 1e-6 relative ≫ 1e-12 → not converged.
+        // Increment above tol: a 1e-4 move ≫ tol·(|a| + max) → not converged.
         assert!(!ss_cycle_converged(
             &[100.0, 50.0],
             &[100.0001, 50.0],
             SS_EQUILIBRATION_TOL
         ));
-        // Scale-invariant: the same *relative* change at a tiny magnitude → same verdict.
+        // Scale-invariant: the same *relative* increment at a tiny magnitude → same verdict.
         assert!(ss_cycle_converged(
             &[1e-6],
             &[1e-6 + 1e-19],
@@ -5090,11 +5157,21 @@ mod tests {
             &[1.0],
             SS_EQUILIBRATION_TOL
         ));
-        // Per-compartment: a small compartment moving 1% (relative to itself) blocks the stop
-        // even though the dominant compartment is steady — global-max normalization would miss it.
+        // Per-compartment: a small compartment moving 1% (relative to itself), by an amount well
+        // above the system-scale atol, blocks the stop even though the dominant compartment is
+        // steady.
         assert!(!ss_cycle_converged(
             &[100.0, 1e-3],
             &[100.0, 1e-3 * 1.01],
+            SS_EQUILIBRATION_TOL
+        ));
+        // #532 review #1 — the footgun the increment test fixes: a compartment whose *magnitude*
+        // (5e-11) is below the old `tol·max_mag` floor (1e-10) but which is still *moving* by
+        // more than that floor (Δ = 1.5e-10). The old magnitude-floor declared it converged; the
+        // increment test correctly keeps the loop running.
+        assert!(!ss_cycle_converged(
+            &[100.0, 5e-11],
+            &[100.0, 2e-10],
             SS_EQUILIBRATION_TOL
         ));
     }

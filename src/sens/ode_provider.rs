@@ -2321,10 +2321,12 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
         let quiet = dose.ii - t_inf;
         let saveat_inf = [t_inf];
         let saveat_q = [quiet];
-        // Shared early stop (#519): break once the trough converges, on the same relative-L∞
-        // criterion the f64 predictor uses (driver shared with `equilibrate_ss_g`, #532 #9/#10).
+        // Shared early stop (#519): break once the trough converges, on the same mixed
+        // atol/rtol criterion the f64 predictor uses (driver shared with `equilibrate_ss_g`,
+        // #532 #9/#10).
         let mut prev = vec![0.0_f64; n_states];
         let mut cur = vec![0.0_f64; n_states];
+        let mut cycles_run = 0usize;
         for cycle in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
             let rhs_active = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                 bare_rhs(us, ps, t, du);
@@ -2342,10 +2344,12 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
                     u.copy_from_slice(&last.u);
                 }
             }
+            cycles_run = cycle + 1;
             if crate::sens::propagate::ss_dual_cycle_should_stop(cycle, &u, &mut cur, &mut prev) {
                 break;
             }
         }
+        crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
         return u;
     }
     // Bolus SS: each cycle applies the pulse `F·amt`, then decays over one interval.
@@ -2353,16 +2357,19 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     let saveat = [dose.ii];
     let mut prev = vec![0.0_f64; n_states];
     let mut cur = vec![0.0_f64; n_states];
+    let mut cycles_run = 0usize;
     for cycle in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
         u[cmt_idx] = u[cmt_idx] + f_bio * amt;
         let sol = solve_ode_g(&bare_rhs, &u, (0.0, dose.ii), params, &saveat, opts);
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
         }
+        cycles_run = cycle + 1;
         if crate::sens::propagate::ss_dual_cycle_should_stop(cycle, &u, &mut cur, &mut prev) {
             break;
         }
     }
+    crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
     u
 }
 
@@ -4397,6 +4404,76 @@ mod tests {
         // 2nd order: the SS equilibration's `∂²(SS state)/∂(θ,η)²` (#473 review #2 — the SS
         // dual-equilibration Hessian was previously unvalidated).
         check_hessian_vs_fd_of_grad(&model, &subject, &[1.0, 10.0], &[0.1]);
+    }
+
+    /// **Early-stop is value-preserving and gradient-faithful to well within validation
+    /// precision** (#532 review #1/#2/#4). On a scale-separated 2-cpt SS=1 fit — small `V2` puts
+    /// the peripheral compartment ~50× below central, the regime where a magnitude-only floor
+    /// could short-circuit the stop — the early-stopped analytic sensitivities are compared
+    /// against a *forced-full-budget* equilibration. The dual decides convergence on the value
+    /// parts, so:
+    ///
+    /// - **Predictions** match to f64 precision: the value has reached its fixed point, so the
+    ///   elided cycles do not move it.
+    /// - **Gradients / Hessian blocks** match to `< 1e-6` relative (measured `~1e-8` on this
+    ///   stressed model). The derivative tails contract at the value's geometric rate but lag by
+    ///   a constant few cycles, so a small tail survives the value stop (#532 review #2). That
+    ///   tail is 3–4 orders below the `1e-3` FD gradient-validation tolerance, the `1e-9` ODE
+    ///   solver `reltol`, and NONMEM's ~`1e-5` SE-matching precision — i.e. invisible to every
+    ///   reported number, which is the precise sense in which SEs are "unchanged".
+    ///
+    /// Running here also exercises the dual stop end-to-end (#532 review #5).
+    #[test]
+    fn ode_provider_ss_early_stop_matches_full_budget() {
+        let model = parse_model_string(TWOCPT_ODE).expect("parse 2-cpt SS ODE");
+        let mut subject = bolus_subject(&[1.0, 4.0, 8.0, 11.0, 20.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "SS bolus → analytic walk"
+        );
+        // CL/V1 fast central; small V2 → a peripheral compartment ~50× below central (scale
+        // separation) whose slow mode still equilibrates inside the cycle budget.
+        let theta = [4.0, 50.0, 8.0, 1.0];
+        let eta = [0.1, 0.05];
+
+        let early = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+        let early_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
+        let full = crate::ode::predictions::with_full_ss_equilibration(|| {
+            ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported")
+        });
+        let full_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
+
+        // The dual stop must actually fire on this model, or the comparison is vacuous (#532 #5).
+        assert_eq!(
+            full_cycles,
+            crate::ode::predictions::SS_EQUILIBRATION_CYCLES,
+            "forced-full must run the whole budget"
+        );
+        assert!(
+            early_cycles < full_cycles,
+            "early stop should run fewer cycles ({early_cycles}) than the full budget ({full_cycles})"
+        );
+
+        // Predictions: value reached its fixed point → preserved tightly.
+        for (e, f) in early.obs.iter().zip(&full.obs) {
+            approx::assert_relative_eq!(e.f, f.f, max_relative = 1e-9, epsilon = 1e-12);
+        }
+        // Gradients / Hessian blocks: the dropped derivative tail is below validation precision.
+        for (e, f) in early.obs.iter().zip(&full.obs) {
+            for (a, b) in e.df_deta.iter().zip(&f.df_deta) {
+                approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
+            }
+            for (a, b) in e.df_dtheta.iter().zip(&f.df_dtheta) {
+                approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
+            }
+            for (a, b) in e.d2f_deta2.iter().zip(&f.d2f_deta2) {
+                approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
+            }
+            for (a, b) in e.d2f_deta_dtheta.iter().zip(&f.d2f_deta_dtheta) {
+                approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
+            }
+        }
     }
 
     // 1-cpt IV with a **TAD-dependent RHS** (`-(CL/V)·central·(1+0.02·TAD)`). Used to

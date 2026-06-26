@@ -864,10 +864,25 @@ fn propagate_bounds_g<T: PkNum>(
 
 /// Shared early-stop driver for the **dual** SS-equilibration loops (#519; #532 review #9/#10):
 /// refresh `cur` from the value parts (`PkNum::val`) of the dual state `u`, decide the stop on
-/// the *same* relative-`L∞` criterion the f64 predictor uses (from cycle 1 on), and roll
-/// `cur`→`prev` by swap — no per-cycle `O(n_states)` copy. Returns `true` to break. Used by
-/// both `equilibrate_ss_g` (here) and `equilibrate_ss_state_g` (the ODE provider) so the dual
-/// convergence logic lives in **one** place.
+/// the *same* [`crate::ode::predictions::ss_cycle_converged`] criterion the f64 predictor uses
+/// (from cycle 1 on), and roll `cur`→`prev` by swap — no per-cycle `O(n_states)` copy. Returns
+/// `true` to break. Used by both `equilibrate_ss_g` (here) and `equilibrate_ss_state_g` (the
+/// ODE provider) so the dual convergence logic lives in **one** place.
+///
+/// **Why decide on the value parts, not the derivative tails** (#532 review #2/#3): the goal is
+/// not a fully-converged sensitivity — it is a gradient *consistent with the value the optimizer
+/// is handed*. Stopping on the value parts makes the dual break on the *same cycle* the f64
+/// predictor would, so the returned dual state is exactly the AD derivative of the truncated f64
+/// value: `grad = ∂(truncated value)/∂θ`, with no value/gradient mismatch to stall the outer
+/// line search. The variational recursion shares the value iteration's monodromy, so the
+/// derivative tails contract at the same geometric rate — but they lag the value by a constant
+/// few cycles, so a small tail (~`1e-8` on a stressed scale-separated model, see
+/// `ode_provider_ss_early_stop_matches_full_budget`) survives the value stop. That residual is
+/// 3–4 orders below the `1e-3` gradient-validation tolerance and NONMEM's SE-matching precision,
+/// so the surviving gradient is faithful for every reported purpose; chasing it to zero would
+/// add a constant per-evaluation cost on the gradient hot path for no observable benefit. A
+/// ULP-level disagreement between the separate f64 and dual value arithmetics can at most shift
+/// the stop by ±1 cycle, i.e. by the converged increment (≤ `1e-12` relative).
 pub(crate) fn ss_dual_cycle_should_stop<T: PkNum>(
     cycle: usize,
     u: &[T],
@@ -923,9 +938,10 @@ fn equilibrate_ss_g<T: PkNum>(pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEven
         vec![0.0, dose.ii]
     };
     // Shared early stop (#519, #532 review #11): the closed-form propagator equilibrates the
-    // same geometric train, so the same relative-L∞ stop applies here too.
+    // same geometric train, so the same mixed atol/rtol stop applies here too.
     let mut prev = vec![0.0_f64; n_states];
     let mut cur = vec![0.0_f64; n_states];
+    let mut cycles_run = 0usize;
     for cycle in 0..SS_EQUILIBRATION_CYCLES {
         if !is_inf {
             state[cmt_idx] = state[cmt_idx] + pk.f * T::from_f64(dose.amt);
@@ -939,10 +955,12 @@ fn equilibrate_ss_g<T: PkNum>(pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEven
             &synthetic_lag,
             f64::NEG_INFINITY,
         );
+        cycles_run = cycle + 1;
         if ss_dual_cycle_should_stop(cycle, &state, &mut cur, &mut prev) {
             break;
         }
     }
+    crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
     state
 }
 

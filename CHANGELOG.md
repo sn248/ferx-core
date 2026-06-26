@@ -137,11 +137,19 @@ section of the SDLC for the versioning policy).
   pre-equilibration (both the f64 predictor and the `Dual1`/`Dual2` gradient path,
   and the closed-form/event-driven SS loops) previously always expanded a fixed
   50-cycle `(apply dose; integrate II)` train. It now stops once the trough stops
-  moving — a shared per-compartment relative-`L∞` criterion (`SS_EQUILIBRATION_TOL
-  = 1e-12`) applied identically across all paths, driven by the value parts so the
-  dual truncation matches the f64 one. Fast disposition converges in ~14 cycles
-  (~3.5× fewer); slow PK still runs the full budget, so SS predictions, gradients,
-  and covariance SEs are unchanged. The dominant cost of analytic-gradient SS fits.
+  moving — a shared mixed `atol`/`rtol` test on the per-cycle increment
+  (`|Δ| ≤ tol·|cur| + tol·max`, `SS_EQUILIBRATION_TOL = 1e-12`) applied identically
+  across all paths, driven by the value parts so the dual truncates on the same
+  cycle as the f64 path (making the gradient the exact derivative of the value the
+  optimizer sees). The stop fires only after the value reaches its fixed point to f64
+  precision: fast disposition converges in ~14 cycles (~3.5× fewer), slow PK still
+  runs the full budget. **SS predictions are unchanged to f64 precision**; gradients
+  and covariance SEs match a full-budget run to `< 1e-6` relative (a small derivative
+  tail, ~`1e-8` even on a deliberately scale-separated 2-compartment model, contracts
+  a constant few cycles behind the value) — 3–4 orders below the `1e-3` gradient
+  validation tolerance, the `1e-9` ODE solver `reltol`, and NONMEM's ~`1e-5`
+  SE-matching precision, i.e. invisible to every reported number. This was the
+  dominant cost of analytic-gradient SS fits.
 - **Exact analytic gradients for `[initial_conditions]` models** (#524). A non-IOV
   closed-form model with an `[initial_conditions]` baseline now runs FOCE/FOCEI
   on exact analytic `Dual2`/`Dual1` sensitivities under `gradient = auto` instead

@@ -118,7 +118,7 @@ All `[scaling]` variants on the **analytical PK path** support the default
 | Scalar `obs_scale = K` | exact analytic | exact FD | The constant threads as one entry per observation. |
 | Expression `obs_scale = <expr>` | subject-static analytic | exact FD | See subject-static caveat below. |
 | Per-CMT `obs_scale[CMT=N]` | subject-static analytic | exact FD | One per-observation scale entry per observation, dispatched by `subject.obs_cmts[i]`. |
-| Form C `y[…] = <expr>` (ODE only) | exact analytic (in-scope ODE) | exact FD | Since #410/#439 the ODE sensitivity provider differentiates the Form C readout — uniform `y = <expr>` and per-CMT `y[CMT=N] = <expr>` — over `Dual2`/`Dual1` (outer and inner). Out-of-scope ODE features (steady state, IOV, …) fall back to FD. |
+| Form C `y[…] = <expr>` (ODE only) | exact analytic (in-scope ODE) | exact FD | Since #410/#439 the ODE sensitivity provider differentiates the Form C readout — uniform `y = <expr>` and per-CMT `y[CMT=N] = <expr>` — over `Dual2`/`Dual1` (outer and inner), including **covariate references** in the readout (#540): a covariate threads in as a constant from the per-observation snapshot, so a free→total protein-binding readout gated on a `FREE` flag stays analytic. A θ or η referenced *directly* in the readout (rather than via an `[individual_parameters]` entry) falls back to FD, as do out-of-scope ODE features (steady state, IOV, …). |
 
 **Analytic outer gradient handles expression scaling exactly.** The analytic
 sensitivity provider that drives the gradient-based outer optimizers (`bfgs`,

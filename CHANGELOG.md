@@ -20,6 +20,19 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic FOCE/FOCEI gradients for Form C readouts that reference covariates** (#540).
+  An ODE Form C readout (`[scaling] y = <expr>`) that branches on or scales by a covariate
+  — e.g. a free→total protein-binding readout gated on a `FREE` assay flag — now gets the
+  exact analytic `Dual2`/`Dual1` gradient instead of falling back to finite differences.
+  Covariates carry no parameter derivative in the individual-parameter dual basis the ODE
+  sensitivity provider seeds, so they thread into the dual readout as constants from the
+  per-observation covariate snapshot (consistent with #535/#538), for both the static and
+  time-varying-covariate walks. θ or η referenced *directly* in a Form C readout (rather
+  than via an `[individual_parameters]` entry) still falls back to FD. Validated on the
+  `fluconazole_radboudumc` readout shape (free/total fluconazole with saturable
+  albumin-dependent protein binding): the analytic `∂f/∂η`/`∂f/∂θ` match the production
+  predictor and its central finite differences to ~1e-6 for both subject-static and
+  per-observation `FREE` snapshots (`ode_provider_form_c_*` tests).
 - **Exact analytic FOCE/FOCEI gradients for steady-state (SS=1) ODE dosing** (#439). User-
   `[odes]` models with a steady-state dose now get exact analytic gradients instead of
   finite differences. NONMEM SS=1 loads the compartments with an infinite-past pulse

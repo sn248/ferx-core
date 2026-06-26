@@ -4615,12 +4615,14 @@ fn build_y_output_fn(
 
     // Snapshot the readout as an `OdeOutputProgram` for the analytic-sensitivity
     // path (issue #367): same bytecode + layout, evaluated over `Dual2<N>`. It is
-    // `simple` (dual-evaluable with empty θ/η/cov) when the expression references
-    // only states / individual parameters / constants.
-    let output_simple = !bc.ops.iter().any(|op| {
+    // dual-evaluable when the expression references only states / individual
+    // parameters / covariates / constants — covariates thread in as constants
+    // from the per-observation snapshot (#540), so only a direct θ/η/NN reference
+    // (which would need extra chain terms) disqualifies the analytic readout.
+    let output_dual_evaluable = !bc.ops.iter().any(|op| {
         matches!(
             op,
-            Op::PushTheta(_) | Op::PushEta(_) | Op::PushCov(_) | Op::PushNnOutput(_, _)
+            Op::PushTheta(_) | Op::PushEta(_) | Op::PushNnOutput(_, _)
         )
     });
     let output_program = OdeOutputProgram {
@@ -4628,7 +4630,8 @@ fn build_y_output_fn(
         n_states,
         n_indiv,
         indiv_to_pk: indiv_to_pk.clone(),
-        simple: output_simple,
+        cov_names: cov_names.clone(),
+        dual_evaluable: output_dual_evaluable,
     };
 
     // Per-thread scratch for the y readout vars + covariate slice + bytecode
@@ -9874,28 +9877,38 @@ pub struct OdeOutputProgram {
     n_indiv: usize,
     /// Per individual parameter `i`, its slot in the flat PK-parameter vector.
     indiv_to_pk: Vec<usize>,
+    /// Covariate names the bytecode's `PushCov(i)` reads, in index order. The
+    /// dual readout resolves these from the per-observation covariate snapshot
+    /// and feeds them as constants — a covariate carries no parameter derivative
+    /// in the individual-parameter dual basis the ODE provider seeds (#540).
+    cov_names: Vec<String>,
     /// True when the expression references only states / individual parameters /
-    /// constants (no θ/η/covariate/NN terms) — the case the dual readout can
-    /// evaluate with empty θ/η/cov inputs.
-    simple: bool,
+    /// covariates / constants (no θ/η/NN terms) — the case the dual readout can
+    /// evaluate, threading the covariate snapshot in while leaving θ/η empty.
+    /// θ/η referenced *directly* in the readout would need extra chain terms the
+    /// ODE provider does not yet assemble, so those stay on the FD fallback.
+    dual_evaluable: bool,
 }
 
 impl OdeOutputProgram {
-    /// See [`OdeOutputProgram::simple`].
-    pub(crate) fn is_simple(&self) -> bool {
-        self.simple
+    /// See [`OdeOutputProgram::dual_evaluable`].
+    pub(crate) fn is_dual_evaluable(&self) -> bool {
+        self.dual_evaluable
     }
 
     /// Evaluate the output expression over a dual type, generic over [`PkNum`]
     /// (`Dual1` light inner / `Dual2` full outer; #410) — the Form-C readout.
     /// `state` is the integrated dual state; `params` is the flat PK-parameter
     /// vector with the differentiated slots seeded as dual variables (so `V1`'s
-    /// derivative flows into `central / V1`). `vars`/`stack` are caller-owned
-    /// scratch. Only valid when [`is_simple`](Self::is_simple) holds.
+    /// derivative flows into `central / V1`); `cov` is the per-observation
+    /// covariate snapshot, whose values thread in as constants (#540). `vars`/
+    /// `stack` are caller-owned scratch. Only valid when
+    /// [`is_dual_evaluable`](Self::is_dual_evaluable) holds.
     pub(crate) fn eval_output_g<T: crate::sens::num::PkNum>(
         &self,
         state: &[T],
         params: &[T],
+        cov: &HashMap<String, f64>,
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
     ) -> T {
@@ -9908,8 +9921,15 @@ impl OdeOutputProgram {
                 *dst = v;
             }
         }
+        // Covariate values in `PushCov` index order (== `cov_names` order); a
+        // missing covariate reads 0.0, mirroring the f64 readout `out_fn`.
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| cov.get(n).copied().unwrap_or(0.0))
+            .collect();
         let empty_nn: Vec<Vec<f64>> = Vec::new();
-        eval_bytecode_g::<T>(&self.bc, &[], &[], &[], vars, &empty_nn, stack)
+        eval_bytecode_g::<T>(&self.bc, &[], &[], &cov_vec, vars, &empty_nn, stack)
     }
 }
 

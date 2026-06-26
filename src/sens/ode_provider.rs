@@ -14,7 +14,10 @@
 //!
 //! **Supported:** single-endpoint `ObsCmt`, uniform Form C (`y = central/V1`), or
 //! per-CMT Form C (`y[CMT=N] = <expr>` — each endpoint differentiated over the dual,
-//! #439) readout; **bolus and infusion** doses; **bioavailability F** (incl.
+//! #439) readout, including **covariate references** in the Form C expression
+//! (e.g. a free→total protein-binding readout that branches on a `FREE` flag, #540)
+//! — covariates thread in as constants from the per-observation snapshot; **bolus
+//! and infusion** doses; **bioavailability F** (incl.
 //! estimated, any parameterization — log-normal, logit-normal, additive — and the
 //! compartment-indexed `F{cmt}` form, #486); **EVID 3/4 resets / multi-occasion**;
 //! **non-zero `init(...)` initial conditions**; static covariates; a constant
@@ -26,7 +29,9 @@
 //! **Not yet supported** (falls back to the gradient-free / FD path): steady-state
 //! dosing, lagtime (incl. compartment-indexed `ALAG{cmt}`), `weibull()` and other
 //! input-rate forcings beyond igd/transit, IOV, SDE/diffusion, expression
-//! `obs_scale`, time-varying covariates.
+//! `obs_scale`, time-varying covariates, and **θ/η referenced *directly* in a Form C
+//! readout** (these need extra direct readout-gradient terms beyond the
+//! individual-parameter chain; reference them via `[individual_parameters]` instead).
 #![allow(clippy::needless_range_loop)]
 
 use super::dual1::Dual1;
@@ -99,12 +104,15 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // (#439 — each observation reads its CMT's program over the dual state).
     let readout_ok = match &ode.readout {
         OdeReadout::ObsCmt(_) => true,
-        OdeReadout::Single(_) => ode.readout_program.as_ref().is_some_and(|p| p.is_simple()),
+        OdeReadout::Single(_) => ode
+            .readout_program
+            .as_ref()
+            .is_some_and(|p| p.is_dual_evaluable()),
         OdeReadout::PerCmt(map) => {
             !map.is_empty()
                 && map
                     .values()
-                    .all(|r| r.program.as_ref().is_some_and(|p| p.is_simple()))
+                    .all(|r| r.program.as_ref().is_some_and(|p| p.is_dual_evaluable()))
         }
     };
     if !readout_ok {
@@ -401,12 +409,15 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // Readout: state directly, simple Form-C, or per-CMT — same set as the non-IOV gate.
     let readout_ok = match &ode.readout {
         OdeReadout::ObsCmt(_) => true,
-        OdeReadout::Single(_) => ode.readout_program.as_ref().is_some_and(|p| p.is_simple()),
+        OdeReadout::Single(_) => ode
+            .readout_program
+            .as_ref()
+            .is_some_and(|p| p.is_dual_evaluable()),
         OdeReadout::PerCmt(map) => {
             !map.is_empty()
                 && map
                     .values()
-                    .all(|r| r.program.as_ref().is_some_and(|p| p.is_simple()))
+                    .all(|r| r.program.as_ref().is_some_and(|p| p.is_dual_evaluable()))
         }
     };
     if !readout_ok {
@@ -955,12 +966,16 @@ fn resolve_obs_readout<T: crate::sens::num::PkNum>(
     ro_vars: &mut Vec<T>,
     ro_stack: &mut Vec<T>,
 ) -> T {
+    // Per-observation covariate snapshot the readout's covariate references read
+    // (#540); for static covariates this is the subject map. Threaded as constants
+    // — a covariate carries no derivative in the individual-parameter dual basis.
+    let obs_cov = subject.obs_cov(j);
     let raw = match &ode.readout {
         OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(T::from_f64(0.0)),
         OdeReadout::Single(_) => ode
             .readout_program
             .as_ref()
-            .map(|p| p.eval_output_g::<T>(st, params, ro_vars, ro_stack))
+            .map(|p| p.eval_output_g::<T>(st, params, obs_cov, ro_vars, ro_stack))
             .unwrap_or(T::from_f64(0.0)),
         // Per-CMT (#439): observation j reads its own CMT's output program.
         OdeReadout::PerCmt(cmt_map) => subject
@@ -968,7 +983,7 @@ fn resolve_obs_readout<T: crate::sens::num::PkNum>(
             .get(j)
             .and_then(|cmt| cmt_map.get(cmt))
             .and_then(|r| r.program.as_ref())
-            .map(|p| p.eval_output_g::<T>(st, params, ro_vars, ro_stack))
+            .map(|p| p.eval_output_g::<T>(st, params, obs_cov, ro_vars, ro_stack))
             .unwrap_or(T::from_f64(f64::NAN)),
     };
     // Negative-readout clamp (ODE overshoot guard), parity with production's
@@ -3311,6 +3326,95 @@ mod tests {
         }
     }
 
+    // 2-cpt ODE whose Form C readout references a **covariate** (`FREE`) — a
+    // free/total protein-binding readout (#540, the fluconazole_radboudumc shape).
+    // The saturable bound term is gated off for free assays (FREE==1) and on for
+    // total assays (FREE==0). `BMAX`/`KD` are individual parameters; the covariate
+    // threads into the dual readout as a constant from the per-observation snapshot,
+    // so the analytic gradient must still match production + FD.
+    const TWOCPT_ODE_READOUT_COV: &str = r#"
+[parameters]
+  theta TVCL(4.0,   0.1, 100.0)
+  theta TVV1(12.0,  1.0, 500.0)
+  theta TVQ(2.0,    0.01, 100.0)
+  theta TVV2(25.0,  1.0, 500.0)
+  theta TVBMAX(3.0, 0.0, 100.0)
+  theta TVKD(5.0,   0.01, 100.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V1   = TVV1 * exp(ETA_V1)
+  Q    = TVQ
+  V2   = TVV2
+  BMAX = TVBMAX
+  KD   = TVKD
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1 + (1.0 - FREE) * BMAX * (central / V1) / (KD + central / V1)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// #540: a Form C readout referencing a covariate is now analytic. With the
+    /// covariate held constant per subject (`obs_covariates` empty → the static
+    /// walk), the provider gradient must match production + FD for both the total
+    /// assay (bound term active) and the free assay (bound term zeroed).
+    #[test]
+    fn ode_provider_form_c_static_covariate_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE_READOUT_COV).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "Form C readout referencing a covariate should be analytic (#540)"
+        );
+        let theta = vec![4.0, 12.0, 2.0, 25.0, 3.0, 5.0];
+        let eta = vec![0.12, -0.08];
+        let times = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0];
+
+        let mut total = bolus_subject(&times);
+        total.covariates.insert("FREE".to_string(), 0.0);
+        check_vs_production(&model, &total, &theta, &eta);
+
+        let mut free = bolus_subject(&times);
+        free.covariates.insert("FREE".to_string(), 1.0);
+        check_vs_production(&model, &free, &theta, &eta);
+    }
+
+    /// #540: the readout covariate read per observation. `FREE` alternates row to
+    /// row (paired free/total assays on one subject), so the bound term switches on
+    /// and off per observation — the TV-cov walk's `obs_cov(j)` snapshot path. The
+    /// analytic gradient must still match the production predictor + FD.
+    #[test]
+    fn ode_provider_form_c_per_obs_covariate_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE_READOUT_COV).expect("parse");
+        let theta = vec![4.0, 12.0, 2.0, 25.0, 3.0, 5.0];
+        let eta = vec![0.12, -0.08];
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0];
+
+        let mut subj = bolus_subject(&times);
+        subj.obs_covariates = (0..times.len())
+            .map(|i| HashMap::from([("FREE".to_string(), (i % 2) as f64)]))
+            .collect();
+        assert!(
+            subj.has_tv_covariates(),
+            "alternating FREE must register as time-varying"
+        );
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "TV-cov Form C readout referencing a covariate should be analytic (#540)"
+        );
+        check_vs_production(&model, &subj, &theta, &eta);
+    }
+
     /// Shared check: provider `f`/`∂f/∂η`/`∂f/∂θ` vs production predictor + FD.
     fn check_vs_production(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
         let sens = ode_subject_sensitivities(model, subject, theta, eta).expect("supported");
@@ -4915,7 +5019,7 @@ mod tests {
 
     /// The `PerCmt` gate's negative branches must drop the model out of analytic
     /// scope (→ FD), not silently admit it: an empty endpoint map, or an endpoint
-    /// whose `program` is `None` (hand-constructed / non-`is_simple`, which the dual
+    /// whose `program` is `None` (hand-constructed / non-`is_dual_evaluable`, which the dual
     /// provider can't evaluate) (#446 review — patch coverage on the reject path).
     #[test]
     fn ode_provider_percmt_gate_rejects_incomplete_map() {

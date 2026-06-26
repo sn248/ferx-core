@@ -110,6 +110,27 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- **Form C (`[scaling] y = <expr>`) ODE readouts now use per-observation covariate
+  snapshots** (#535, #538). The explicit-output readout is evaluated against the
+  covariate values on each observation's own data row rather than the subject's
+  first-row values, so time-varying covariates referenced in a Form C expression
+  now drive predictions, diagnostics, and the adaptive-trial decision monitors at
+  the correct time. As a consequence, covariates referenced **only** from a Form C
+  expression are now treated as required data columns: a model whose readout
+  references a covariate absent from the dataset now fails loudly with
+  `E_MISSING_COVARIATE` (and undeclared-but-present covariates raise the usual
+  warning), where previously the missing value silently read as `0.0`. **NONMEM
+  comparison:** validated against the `fluconazole_radboudumc` model (ADVAN3 TRANS4
+  with a free/total protein-binding `$ERROR` that selects `CTOT` when `FREE==0` and
+  `CU` when `FREE==1` — paired assay rows at the same time). Evaluated at identical
+  parameters, ferx's per-record population predictions match NONMEM's `PRED` to
+  ~1e-4 relative on **both** the total-assay and free-assay rows (e.g. subject 1 at
+  t=1: ferx 21.5105 / 2.9070 vs NONMEM 21.511 / 2.907), confirming the readout reads
+  each observation's own `FREE` value rather than the subject's first row. (The two
+  rows at a given time differ only by that per-record covariate.) For time-constant
+  covariates the readout is byte-identical to the prior behaviour; the
+  `ode_event_driven_form_c_uses_observation_covariates` unit test pins the
+  per-observation path.
 - **Gradient-based outer optimizers now precondition with magnitude scaling
   (`Abs`) instead of bound-half-width (`Rescale2`).** Under the default
   `optimizer = auto` (which resolves to NLopt L-BFGS when an analytic gradient is

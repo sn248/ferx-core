@@ -97,8 +97,13 @@ pub fn leapfrog(
 ///   - it has no analytical PK path (`model.tv_fn.is_none()`),
 ///   - `omega.log_det` is non-finite (degenerate variance matrix), or
 ///   - the Dual2 light provider can't differentiate the subject (time-varying
-///     covariates, oral infusion, SS+reset, expression scaling) — then there is no
-///     gradient consistent with the analytical objective.
+///     covariates, oral infusion, SS+reset, LTBS) — then there is no gradient
+///     consistent with the analytical objective.
+///
+/// A η-dependent `ExpressionScale` `obs_scale` is now differentiated (the quotient
+/// rule, #486), so closed-form `ExpressionScale` models take the gradient-based HMC
+/// path rather than the gradient-free MH fallback (LTBS + `ExpressionScale` still
+/// declines, like plain LTBS).
 #[allow(clippy::too_many_arguments)]
 pub fn hmc_step(
     subject: &crate::types::Subject,
@@ -120,11 +125,11 @@ pub fn hmc_step(
         return None;
     }
     // HMC needs the exact `∂NLL/∂η`. The Dual2 light provider supplies it for the
-    // analytical models in scope; for anything it can't differentiate (TV
-    // covariates, oral infusion, SS+reset, expression scaling) there is no
-    // consistent gradient, so return `None` and let the caller fall back to its
-    // gradient-free MH sampler. Scope is model-level, so one probe at `eta`
-    // settles it for the whole trajectory.
+    // analytical models in scope (including η-dependent `ExpressionScale` `obs_scale`
+    // since #486); for anything it can't differentiate (TV covariates, oral infusion,
+    // SS+reset, LTBS) there is no consistent gradient, so return `None` and let the
+    // caller fall back to its gradient-free MH sampler. Scope is model-level, so one
+    // probe at `eta` settles it for the whole trajectory.
     analytic_eta_nll_gradient(model, subject, theta, eta, omega, sigma_values)?;
 
     let n_eta = eta.len();
@@ -256,6 +261,87 @@ mod tests {
 
         assert!((q1[0] - q0[0]).abs() < 1e-14, "q changed with step_size=0");
         assert!((p1[0] - p0[0]).abs() < 1e-14, "p changed with step_size=0");
+    }
+
+    const EXPR_SCALE_MODEL: &str = "[parameters]\n  theta TVCL(5.0,0.5,50.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n";
+
+    fn iv_subject() -> crate::types::Subject {
+        use std::collections::HashMap;
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0];
+        crate::types::Subject {
+            id: "1".to_string(),
+            doses: vec![crate::types::DoseEvent::new(
+                0.0, 1000.0, 1, 0.0, false, 0.0,
+            )],
+            obs_times: times.to_vec(),
+            obs_raw_times: Vec::new(),
+            observations: vec![5.0; times.len()],
+            obs_cmts: vec![1; times.len()],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; times.len()],
+            occasions: vec![1; times.len()],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    /// HMC routing contract for η-dependent `ExpressionScale` (#486 / #534 review #1):
+    /// the divisor scale is now differentiated, so `hmc_step` takes the gradient-based
+    /// path (`Some`) for a closed-form `ExpressionScale` model rather than declining to
+    /// the gradient-free MH fallback (`None`). Combined with LTBS it still declines, like
+    /// plain LTBS. Guards the `hmc.rs` ↔ `analytic_eta_nll_gradient` contract against a
+    /// silent regression as the provider's scope changes.
+    #[test]
+    fn hmc_engages_for_expression_scale_and_declines_under_ltbs() {
+        use crate::parser::model_parser::parse_model_string;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let mut model = parse_model_string(EXPR_SCALE_MODEL).expect("parse ExpressionScale");
+        assert!(
+            matches!(
+                model.scaling,
+                crate::types::ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+            ),
+            "obs_scale = 1000/V must parse as a differentiable ExpressionScale"
+        );
+        let subject = iv_subject();
+        let theta = &model.default_params.theta.clone();
+        let omega = crate::types::OmegaMatrix::from_diagonal(
+            &[0.09, 0.09],
+            vec!["ETA_CL".into(), "ETA_V".into()],
+        );
+        let sigma = model.default_params.sigma.values.clone();
+        let eta = vec![0.0; model.n_eta];
+        let nll =
+            crate::stats::likelihood::individual_nll(&model, &subject, theta, &eta, &omega, &sigma);
+
+        let mut rng = StdRng::seed_from_u64(1);
+        let stepped = hmc_step(
+            &subject, &eta, nll, &model, theta, &omega, &sigma, 0.05, 5, &mut rng,
+        );
+        assert!(
+            stepped.is_some(),
+            "closed-form ExpressionScale must take the gradient-based HMC path (#486)"
+        );
+
+        // LTBS + ExpressionScale: no consistent analytic gradient → MH fallback (`None`).
+        model.log_transform = true;
+        let mut rng = StdRng::seed_from_u64(1);
+        let stepped_ltbs = hmc_step(
+            &subject, &eta, nll, &model, theta, &omega, &sigma, 0.05, 5, &mut rng,
+        );
+        assert!(
+            stepped_ltbs.is_none(),
+            "LTBS + ExpressionScale must decline HMC and fall back to MH"
+        );
     }
 
     /// Quadratic NLL: f(q) = ½ aᵢ qᵢ².  Leapfrog must decrease the quadratic

@@ -19,8 +19,8 @@ pub(crate) enum InnerGradientMethod {
     /// provider evaluation per inner step (vs FD's `~2·n_eta+1` predictions).
     Analytic,
     /// Central finite differences. Used when the provider can't serve the model
-    /// (ODE, LTBS, expression scaling, time-varying covariates, SDE) or the
-    /// `FERX_NO_ANALYTIC_INNER` escape hatch is set.
+    /// (ODE, LTBS, time-varying covariates, SDE) or the `FERX_NO_ANALYTIC_INNER`
+    /// escape hatch is set. (η-dependent `ExpressionScale` is now analytic, #486.)
     Fd,
 }
 
@@ -90,8 +90,8 @@ pub(crate) fn resolve_gradient_method(
 /// One-line summary of the inner-loop gradient route **actually resolved**
 /// across the population, for the startup banner. Reflects the per-subject
 /// resolution in [`resolve_gradient_method`] — the analytic `Dual2` η-gradient
-/// where it is in scope, central FD elsewhere (ODE / LTBS / expression scaling /
-/// TV-covariate / SDE models, or `gradient = fd`).
+/// where it is in scope, central FD elsewhere (ODE / LTBS / TV-covariate / SDE
+/// models, or `gradient = fd`; η-dependent `ExpressionScale` is analytic, #486).
 ///
 /// `requested` is the user's [`FitOptions::gradient_method`], appended in
 /// brackets so a fallback is visible. It is taken as a parameter rather than
@@ -1170,7 +1170,9 @@ fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
 /// Exact analytic `∂NLL_i/∂η` from the light first-order sensitivity provider:
 /// `Σ_j (∂nll/∂f_j)·(∂f_j/∂η) + Ω⁻¹η`. `Some` only when the model is in the
 /// provider's scope (returns `None` for ODE / TV-cov / oral-infusion / SS+reset /
-/// expression-scale subjects). Shared by the inner EBE loop and the HMC sampler so
+/// LTBS subjects). A η-dependent `ExpressionScale` `obs_scale` is in scope as of
+/// #486 (the quotient rule is applied to the η-block), except when combined with
+/// LTBS, which still declines. Shared by the inner EBE loop and the HMC sampler so
 /// both estimators use the same Dual2 gradient (replacing the retired Enzyme path).
 pub(crate) fn analytic_eta_nll_gradient(
     model: &CompiledModel,

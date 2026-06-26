@@ -20,6 +20,8 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Support NONMEM-style `block_sigma` residual covariance under SAEM for ordinary
+  Gaussian paired-endpoint models (#548).
 - Support NONMEM-style `block_sigma` residual covariance across paired same-time
   multi-endpoint observations under FOCE (#546).
 - Support fixed residual-error correlations via `block_sigma` for FOCE combined-error

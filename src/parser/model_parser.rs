@@ -10276,19 +10276,30 @@ impl ScaleDerivProgram {
     ) -> crate::sens::dual1::Dual1<N> {
         use crate::sens::dual1::Dual1;
         // θ and individual-param vars are constants on the inner path (no θ axes);
-        // η_k seeds axis k directly (no `n_theta` offset).
-        let theta_d: Vec<Dual1<N>> = theta.iter().map(|&v| Dual1::constant(v)).collect();
-        let eta_d: Vec<Dual1<N>> = eta
-            .iter()
-            .enumerate()
-            .map(|(k, &v)| {
-                if k < N {
-                    Dual1::var(v, k)
-                } else {
-                    Dual1::constant(v)
-                }
-            })
-            .collect();
+        // η_k seeds axis k directly (no `n_theta` offset). For any in-scope
+        // `ExpressionScale` model the provider gate caps `n_theta + n_eta` at
+        // `MAX_SCALE_AXES`, so both `theta` and `eta` fit a stack buffer — build them
+        // there instead of per-call heap `Vec`s (#534 review #4). (`cov_vec` /
+        // bytecode `stack` lengths are not axis-bounded, so they stay on the heap.)
+        const CAP: usize = crate::sens::provider::MAX_SCALE_AXES;
+        debug_assert!(
+            theta.len() <= CAP && eta.len() <= CAP,
+            "scale eval θ/η exceed MAX_SCALE_AXES; caller must be gate-checked"
+        );
+        let mut theta_buf = [Dual1::<N>::constant(0.0); CAP];
+        for (d, &v) in theta_buf.iter_mut().zip(theta.iter()) {
+            *d = Dual1::constant(v);
+        }
+        let theta_d = &theta_buf[..theta.len()];
+        let mut eta_buf = [Dual1::<N>::constant(0.0); CAP];
+        for (k, (d, &v)) in eta_buf.iter_mut().zip(eta.iter()).enumerate() {
+            *d = if k < N {
+                Dual1::var(v, k)
+            } else {
+                Dual1::constant(v)
+            };
+        }
+        let eta_d = &eta_buf[..eta.len()];
         let cov_vec: Vec<f64> = self
             .cov_names
             .iter()
@@ -10297,7 +10308,7 @@ impl ScaleDerivProgram {
         let empty_nn: Vec<Vec<f64>> = Vec::new();
         let mut stack: Vec<Dual1<N>> = Vec::new();
         eval_bytecode_g::<Dual1<N>>(
-            &self.bc, &theta_d, &eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
+            &self.bc, theta_d, eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
         )
     }
 }

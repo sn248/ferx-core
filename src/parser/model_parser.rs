@@ -7222,10 +7222,13 @@ fn validate_residual_correlations(
     };
 
     for corr in correlations {
-        let co_loaded = endpoint_loadings
+        let left_used = endpoint_loadings
             .iter()
-            .any(|loadings| loadings.contains(&corr.sigma_i) && loadings.contains(&corr.sigma_j));
-        if !co_loaded {
+            .any(|loadings| loadings.contains(&corr.sigma_i));
+        let right_used = endpoint_loadings
+            .iter()
+            .any(|loadings| loadings.contains(&corr.sigma_j));
+        if !(left_used && right_used) {
             let left = sigma_names
                 .get(corr.sigma_i)
                 .map(String::as_str)
@@ -7235,9 +7238,8 @@ fn validate_residual_correlations(
                 .map(String::as_str)
                 .unwrap_or("<unknown>");
             return Err(format!(
-                "block_sigma covariance between '{}' and '{}' is not used by any \
-                 single observation in [error_model]; correlated residual sigmas \
-                 must belong to the same combined endpoint",
+                "block_sigma covariance between '{}' and '{}' references a sigma \
+                 that is not used by [error_model]",
                 left, right
             ));
         }
@@ -15292,11 +15294,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_full_model_block_sigma_cross_endpoint_covariance_errs() {
-        // A covariance between sigmas that never co-load on the same
-        // observation would be skipped by the variance helper. Reject it at
-        // parse time so users do not think a cross-endpoint covariance is in
-        // the likelihood.
+    fn test_parse_full_model_block_sigma_cross_endpoint_covariance_builds_correlation() {
+        // Cross-endpoint covariances are carried by the subject-level residual
+        // covariance matrix for paired observations.
         let content = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -15324,11 +15324,8 @@ mod tests {
   CMT=1: DV ~ combined(S_PROP, S_ADD)
   CMT=2: DV ~ additive(S_PD)
 "#;
-        let err = expect_parse_err(content);
-        assert!(
-            err.contains("block_sigma") && err.contains("same combined endpoint"),
-            "got: {err}"
-        );
+        let parsed = parse_full_model(content).expect("cross-endpoint block_sigma should parse");
+        assert_eq!(parsed.model.residual_correlations.len(), 1);
     }
 
     #[test]

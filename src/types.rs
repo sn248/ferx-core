@@ -2140,11 +2140,12 @@ pub struct CompiledModel {
     pub error_spec: ErrorSpec,
     /// Fixed residual-error correlations declared by `block_sigma`.
     ///
-    /// Empty for ordinary diagonal `$SIGMA` models. When non-empty, each
-    /// observation's residual variance gains the within-observation covariance
-    /// cross term `2·cᵢ·cⱼ·ρ·σᵢ·σⱼ` (from the observation's sigma loadings) on
-    /// the R diagonal; distinct observations stay independent, so R remains
-    /// diagonal. This covers NONMEM `$SIGMA BLOCK(2)` combined-error models.
+    /// Empty for ordinary diagonal `$SIGMA` models. When non-empty, the
+    /// residual-error helpers use each observation's sigma loadings to add both
+    /// within-observation covariance terms (for `combined(...)` endpoints) and
+    /// cross-observation covariance terms for paired same-time/same-occasion
+    /// endpoint rows. This covers NONMEM `$SIGMA BLOCK` combined-error models
+    /// and paired multi-endpoint records such as total/unbound assays.
     pub residual_correlations: Vec<ResidualCorrelation>,
     pub pk_param_fn: PkParamFn,
     pub n_theta: usize,

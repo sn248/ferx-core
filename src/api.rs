@@ -927,6 +927,36 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 break;
             }
         }
+        if matches!(model.bloq_method, BloqMethod::M3) {
+            diags.push(
+                Diagnostic::error(
+                    "E_BLOCK_SIGMA_M3_UNSUPPORTED",
+                    "block_sigma correlated residual errors are not yet supported with \
+                     M3 censored-observation likelihoods.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if model.frem_config.is_some() {
+            diags.push(
+                Diagnostic::error(
+                    "E_BLOCK_SIGMA_FREM_UNSUPPORTED",
+                    "block_sigma correlated residual errors are not yet supported with \
+                     FREM covariate pseudo-observations.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if model.residual_error_eta.is_some() {
+            diags.push(
+                Diagnostic::error(
+                    "E_BLOCK_SIGMA_IIV_ON_RUV_UNSUPPORTED",
+                    "block_sigma correlated residual errors are not yet supported with \
+                     iiv_on_ruv residual-error scaling.",
+                )
+                .with_block("fit_options"),
+            );
+        }
     }
 
     // `imp` may appear at most once in a chain. By default it is an MCEM

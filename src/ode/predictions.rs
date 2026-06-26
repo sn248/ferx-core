@@ -105,6 +105,30 @@ pub(crate) fn resolve_subject_doses<'a>(
 /// same constant so its trough can't drift from this f64 predictor (#473 review #11).
 pub(crate) const SS_EQUILIBRATION_CYCLES: usize = 50;
 
+/// Relative-`L∞` tolerance for the steady-state equilibration **early stop** (#519). The
+/// `(apply dose; integrate II)` cycle is a geometric contraction with ratio `≈ exp(−λ·II)`;
+/// once the cycle-to-cycle state change falls below this *relative* threshold, every
+/// remaining cycle would move the trough by less still, so the truncation is already at f64
+/// precision and we stop. Conservative (`1e-12`): the dropped tail is far below the
+/// `provider`-vs-production parity tolerance, so the value is unchanged for any realistic
+/// PK. Fast disposition (`λ·II ≈ 2`) converges in ~14 cycles; slow PK (`λ·II ≈ 0.1`) never
+/// trips it and runs the full [`SS_EQUILIBRATION_CYCLES`] — identical to the old behaviour.
+pub(crate) const SS_EQUILIBRATION_TOL: f64 = 1e-12;
+
+/// Whether the SS-equilibration trough has converged between two successive cycles, by
+/// **relative `L∞`** change (scale-invariant across dose magnitudes / compartment scales).
+/// Shared by the f64 predictor and the dual gradient path so both truncate on the *same*
+/// criterion — the dual feeds the value parts (`PkNum::val`) of its state (#519).
+pub(crate) fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
+    let mut max_delta = 0.0_f64;
+    let mut max_mag = 0.0_f64;
+    for (&a, &b) in cur.iter().zip(prev) {
+        max_delta = max_delta.max((a - b).abs());
+        max_mag = max_mag.max(a.abs());
+    }
+    max_delta <= tol * max_mag
+}
+
 /// Pre-equilibrate the ODE state to its steady-state value for an SS=1
 /// dose with interval `dose.ii`. NONMEM SS=1 semantics: at the time of
 /// the SS dose, the compartments are loaded with the steady-state
@@ -157,7 +181,10 @@ fn equilibrate_ss_state(
         return u;
     }
 
-    for _ in 0..SS_EQUILIBRATION_CYCLES {
+    // Early stop once the trough stops moving (#519): `prev` holds the previous cycle's
+    // state; from cycle 1 on, break when the relative change is below `SS_EQUILIBRATION_TOL`.
+    let mut prev = vec![0.0; n];
+    for cycle in 0..SS_EQUILIBRATION_CYCLES {
         if is_inf {
             // Active-infusion window: wrapped RHS injects rate into the
             // dosing compartment.
@@ -211,6 +238,10 @@ fn equilibrate_ss_state(
                 u.copy_from_slice(&last.u);
             }
         }
+        if cycle > 0 && ss_cycle_converged(&u, &prev, SS_EQUILIBRATION_TOL) {
+            break;
+        }
+        prev.copy_from_slice(&u);
     }
 
     u
@@ -4982,6 +5013,40 @@ mod tests {
     // must match `one_cpt_iv_bolus_ss` to RK45 tolerance, and similarly
     // for infusion. This cross-checks the per-cycle pulse-expansion
     // equilibration loop in `equilibrate_ss_state`.
+
+    #[test]
+    fn ss_cycle_converged_is_relative_linf() {
+        // Below tol (relative L∞): a 1e-13 absolute change on a magnitude-100 state is
+        // 1e-15 relative ≪ 1e-12 → converged.
+        assert!(ss_cycle_converged(
+            &[100.0, 50.0],
+            &[100.0 + 1e-13, 50.0],
+            SS_EQUILIBRATION_TOL
+        ));
+        // Above tol: a 1e-4 absolute change is 1e-6 relative ≫ 1e-12 → not converged.
+        assert!(!ss_cycle_converged(
+            &[100.0, 50.0],
+            &[100.0001, 50.0],
+            SS_EQUILIBRATION_TOL
+        ));
+        // Scale-invariant: the same *relative* change at a tiny magnitude → same verdict.
+        assert!(ss_cycle_converged(
+            &[1e-6],
+            &[1e-6 + 1e-19],
+            SS_EQUILIBRATION_TOL
+        ));
+        assert!(!ss_cycle_converged(
+            &[1e-6],
+            &[1e-6 + 1e-15],
+            SS_EQUILIBRATION_TOL
+        ));
+        // A genuinely zero state (no dose effect) is trivially converged.
+        assert!(ss_cycle_converged(
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+            SS_EQUILIBRATION_TOL
+        ));
+    }
 
     #[test]
     fn ode_ss_iv_bolus_matches_analytical_ss() {

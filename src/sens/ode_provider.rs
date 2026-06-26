@@ -2321,7 +2321,11 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
         let quiet = dose.ii - t_inf;
         let saveat_inf = [t_inf];
         let saveat_q = [quiet];
-        for _ in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
+        // Shared early stop (#519): break on the value parts once the trough converges, on
+        // the *same* relative-L∞ criterion the f64 predictor uses, so both truncate alike.
+        let mut prev = vec![0.0_f64; n_states];
+        let mut cur = vec![0.0_f64; n_states];
+        for cycle in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
             let rhs_active = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                 bare_rhs(us, ps, t, du);
                 if cmt_idx < du.len() {
@@ -2338,18 +2342,46 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
                     u.copy_from_slice(&last.u);
                 }
             }
+            for (c, x) in cur.iter_mut().zip(u.iter()) {
+                *c = x.val();
+            }
+            if cycle > 0
+                && crate::ode::predictions::ss_cycle_converged(
+                    &cur,
+                    &prev,
+                    crate::ode::predictions::SS_EQUILIBRATION_TOL,
+                )
+            {
+                break;
+            }
+            prev.copy_from_slice(&cur);
         }
         return u;
     }
     // Bolus SS: each cycle applies the pulse `F·amt`, then decays over one interval.
     let amt = T::from_f64(dose.amt);
     let saveat = [dose.ii];
-    for _ in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
+    let mut prev = vec![0.0_f64; n_states];
+    let mut cur = vec![0.0_f64; n_states];
+    for cycle in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
         u[cmt_idx] = u[cmt_idx] + f_bio * amt;
         let sol = solve_ode_g(&bare_rhs, &u, (0.0, dose.ii), params, &saveat, opts);
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
         }
+        for (c, x) in cur.iter_mut().zip(u.iter()) {
+            *c = x.val();
+        }
+        if cycle > 0
+            && crate::ode::predictions::ss_cycle_converged(
+                &cur,
+                &prev,
+                crate::ode::predictions::SS_EQUILIBRATION_TOL,
+            )
+        {
+            break;
+        }
+        prev.copy_from_slice(&cur);
     }
     u
 }

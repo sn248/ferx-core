@@ -2916,6 +2916,133 @@ mod tests {
         subject
     }
 
+    // 1-cpt IV user-ODE for the SS+reset regression: SS bolus (II=24) establishes
+    // steady state, an EVID 3/4 reset at t=60 zeros the carryover, and a re-dose
+    // restarts. Tight tolerances so the dual jet agrees with FD of the f64 objective.
+    const ONECPT_IV_ODE_SS_RESET: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// Steady-state dosing **combined with an EVID 3/4 reset** is served analytically
+    /// on the ODE path: the static walk declines SS, so the subject routes to the
+    /// event-driven walk (`ode_tvcov_supported`), which admits SS + reset with no joint
+    /// exclusion. The analytic outer gradient must match Richardson FD of the FOCEI
+    /// marginal. (The closed-form path keeps this combination on FD — the analytical
+    /// superposition gates SS+reset. Pins the 2026-06-26 audit finding for #486.)
+    #[test]
+    fn population_packed_gradient_ode_ss_reset_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::{DoseEvent, Population};
+
+        let model = parse_model_string(ONECPT_IV_ODE_SS_RESET).expect("parse ODE SS+reset");
+        assert!(model.is_ode_based(), "must be on the ODE path");
+        let theta = [0.2, 10.0];
+        let eta_ref = [0.1, -0.1];
+        let obs_times = vec![2.0, 8.0, 20.0, 62.0, 70.0, 90.0];
+        let n = obs_times.len();
+        let mut s = Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 1000.0, 1, 0.0, true, 24.0),
+                DoseEvent::new(60.0, 1000.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: vec![60.0],
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        assert!(
+            s.has_resets() && s.doses.iter().any(|d| d.ss),
+            "fixture is SS + reset"
+        );
+        // Routes to the event-driven walk (static walk declines SS), and that walk
+        // admits SS + reset — the precondition for the analytic gradient below.
+        assert!(
+            crate::sens::ode_provider::ode_tvcov_supported(&model, &s),
+            "ODE event-driven walk must admit SS + reset"
+        );
+        assert!(
+            !crate::sens::ode_provider::ode_subject_supported(&model, &s),
+            "static walk declines SS, so SS + reset must route to the event-driven walk"
+        );
+
+        let preds = crate::pk::compute_predictions_with_tv(&model, &s, &theta, &eta_ref);
+        s.observations = preds.iter().map(|p| p * 0.85).collect();
+
+        let pop = Population {
+            subjects: vec![s],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+        let analytic = population_gradient_sens(&model, &pop, &template, &x, &ehs)
+            .expect("ODE SS + reset must be served analytically");
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| marginal_nll(&model, s, &p))
+                .sum::<f64>()
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            let f1 = (ofv(&xp) - ofv(&xm)) / (2.0 * h);
+            let mut xp2 = x.clone();
+            xp2[k] += h / 2.0;
+            let mut xm2 = x.clone();
+            xm2[k] -= h / 2.0;
+            let f2 = (ofv(&xp2) - ofv(&xm2)) / (2.0 * (h / 2.0));
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 5e-3, epsilon = 1e-5);
+        }
+    }
+
     /// FOCEI and FOCE packed gradients for a population containing a reset-bearing
     /// subject must both match Richardson reconverged-FD of their respective
     /// marginal objectives. This is the outer-assembly counterpart to the

@@ -642,13 +642,13 @@ pub fn ode_subject_sensitivities(
             .as_ref()?
             .indiv_param_program
             .as_ref()?
-            .pk_slots();
+            .pk_slots_ref();
         crate::sens::provider::apply_expression_scale_outer(
             &mut sens,
             prog,
             &pk,
             &pd,
-            &slots,
+            slots,
             theta,
             eta,
             &subject.covariates,
@@ -739,13 +739,13 @@ pub fn ode_subject_eta_grad(
             .as_ref()?
             .indiv_param_program
             .as_ref()?
-            .pk_slots();
+            .pk_slots_ref();
         crate::sens::provider::apply_expression_scale_inner_dispatch(
             &mut out,
             prog,
             &pk,
             &dp_deta,
-            &slots,
+            slots,
             theta,
             eta,
             &subject.covariates,
@@ -817,7 +817,7 @@ pub(crate) fn param_eta_derivatives_from_prog(
         return None;
     }
     let ne = model.n_eta;
-    let ni = prog.pk_slots().len();
+    let ni = prog.pk_slots_ref().len();
     macro_rules! disp {
         ($($mm:literal),+) => {
             match ne {

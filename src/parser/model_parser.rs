@@ -7804,15 +7804,18 @@ fn build_pk_param_fn(
         }
     };
 
+    let pk_var_slots = if is_analytical_pk {
+        pk_assignment_mapping.clone()
+    } else {
+        ode_assignment_mapping.clone()
+    };
+    let pk_slot_indices = pk_var_slots.iter().map(|&(slot, _)| slot).collect();
     let indiv_param_program = IndivParamProgram {
         stmts: stmts_owned.clone(),
         n_vars,
         cov_static_mask,
-        pk_var_slots: if is_analytical_pk {
-            pk_assignment_mapping.clone()
-        } else {
-            ode_assignment_mapping.clone()
-        },
+        pk_var_slots,
+        pk_slot_indices,
         n_theta: n_theta_base,
         n_eta: n_eta_extended,
         cov_names: cov_names_for_lookup.clone(),
@@ -9899,6 +9902,11 @@ pub struct IndivParamProgram {
     /// `(pk_slot, var_slot)` per individual parameter, in declaration order
     /// (parallel to `CompiledModel.pk_indices`).
     pk_var_slots: Vec<(usize, usize)>,
+    /// `pk_var_slots` projected to just the PK slots — the [`pk_slots`](Self::pk_slots)
+    /// value, cached at construction so the hot analytic paths borrow it via
+    /// [`pk_slots_ref`](Self::pk_slots_ref) instead of re-collecting a `Vec` on every
+    /// per-gradient evaluation (#534 review #2).
+    pk_slot_indices: Vec<usize>,
     /// User-declared θ count the individual parameters can reference.
     n_theta: usize,
     /// η count the `pk_param_fn` consumes (BSV + IOV kappa).
@@ -9930,6 +9938,13 @@ impl IndivParamProgram {
     /// NOT `CompiledModel.pk_indices` (declaration) order.
     pub(crate) fn pk_slots(&self) -> Vec<usize> {
         self.pk_var_slots.iter().map(|&(slot, _)| slot).collect()
+    }
+
+    /// Borrowing form of [`pk_slots`](Self::pk_slots): the PK-slot list cached at
+    /// construction, for hot paths that only read it (no per-call `Vec`). Identical
+    /// contents to `pk_slots()` (#534 review #2).
+    pub(crate) fn pk_slots_ref(&self) -> &[usize] {
+        &self.pk_slot_indices
     }
 
     /// Evaluate the individual parameters over `Dual2<M>` seeded on (θ, η):

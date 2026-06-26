@@ -105,7 +105,7 @@ fn prog_covers_required_pk_slots(
     model: &CompiledModel,
     prog: &crate::parser::model_parser::IndivParamProgram,
 ) -> bool {
-    let prog_slots = prog.pk_slots();
+    let prog_slots = prog.pk_slots_ref();
     model
         .pk_model
         .required_pk_params()
@@ -844,7 +844,7 @@ fn build_iov_sources(
         .indiv_param_program
         .as_ref()
         .expect("iov_analytical_supported guarantees the program");
-    let slots = prog.pk_slots();
+    let slots = prog.pk_slots_ref();
     let n_diff = slots.len();
     // PK slot → differentiated-row index (for seeding the dual axis).
     let mut slot_row: [Option<usize>; N_PK] = [None; N_PK];
@@ -1357,7 +1357,7 @@ pub fn subject_sensitivities_tvcov(
         .indiv_param_program
         .as_ref()
         .expect("tvcov_analytical_supported guarantees the program");
-    let slots = prog.pk_slots();
+    let slots = prog.pk_slots_ref();
     // PK slot → differentiated-row index of `pd_from_program` (for seeding the
     // dual axis). `pd` rows follow `pk_slots()` order, so row `i` ↔ slot `slots[i]`.
     let mut slot_row: [Option<usize>; N_PK] = [None; N_PK];
@@ -1589,7 +1589,7 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
         .indiv_param_program
         .as_ref()
         .expect("tvcov_analytical_supported guarantees the program");
-    let slots = prog.pk_slots();
+    let slots = prog.pk_slots_ref();
     let mut slot_row: [Option<usize>; N_PK] = [None; N_PK];
     for (i, &s) in slots.iter().enumerate() {
         if s < N_PK {
@@ -2599,21 +2599,26 @@ fn apply_expression_scale_inner<const N: usize>(
 ) {
     // The PK params the scale references, as `Dual1<N>` carrying value + ∂p/∂η (a slot
     // the program references but the provider does not differentiate enters constant —
-    // the same per-slot constructor the inner init impulse uses).
-    let var_duals: Vec<Dual1<N>> = prog
-        .var_to_pk_slot()
-        .iter()
-        .map(|&s| {
-            pk_slot_dual_inner::<N>(
-                s,
-                pk.values.get(s).copied().unwrap_or(0.0),
-                dp_deta,
-                slots,
-                n_eta,
-            )
-        })
-        .collect();
-    let s = prog.eval_scale_dual1::<N>(theta, eta, cov, &var_duals);
+    // the same per-slot constructor the inner init impulse uses). A scale references at
+    // most the 8 PK slots, so the var count is `<= MAX_SCALE_AXES`; build into a stack
+    // buffer instead of a per-call heap `Vec` (#534 review #3).
+    let var_slots = prog.var_to_pk_slot();
+    let nvar = var_slots.len();
+    debug_assert!(
+        nvar <= MAX_SCALE_AXES,
+        "scale references more PK slots than MAX_SCALE_AXES"
+    );
+    let mut var_duals = [Dual1::<N>::constant(0.0); MAX_SCALE_AXES];
+    for (d, &s) in var_duals.iter_mut().zip(var_slots.iter()) {
+        *d = pk_slot_dual_inner::<N>(
+            s,
+            pk.values.get(s).copied().unwrap_or(0.0),
+            dp_deta,
+            slots,
+            n_eta,
+        );
+    }
+    let s = prog.eval_scale_dual1::<N>(theta, eta, cov, &var_duals[..nvar]);
     let inv = 1.0 / s.value;
     let inv2 = inv * inv;
     for o in out.iter_mut() {

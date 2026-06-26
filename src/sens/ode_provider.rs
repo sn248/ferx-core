@@ -2321,8 +2321,8 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
         let quiet = dose.ii - t_inf;
         let saveat_inf = [t_inf];
         let saveat_q = [quiet];
-        // Shared early stop (#519): break on the value parts once the trough converges, on
-        // the *same* relative-L∞ criterion the f64 predictor uses, so both truncate alike.
+        // Shared early stop (#519): break once the trough converges, on the same relative-L∞
+        // criterion the f64 predictor uses (driver shared with `equilibrate_ss_g`, #532 #9/#10).
         let mut prev = vec![0.0_f64; n_states];
         let mut cur = vec![0.0_f64; n_states];
         for cycle in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
@@ -2342,19 +2342,9 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
                     u.copy_from_slice(&last.u);
                 }
             }
-            for (c, x) in cur.iter_mut().zip(u.iter()) {
-                *c = x.val();
-            }
-            if cycle > 0
-                && crate::ode::predictions::ss_cycle_converged(
-                    &cur,
-                    &prev,
-                    crate::ode::predictions::SS_EQUILIBRATION_TOL,
-                )
-            {
+            if crate::sens::propagate::ss_dual_cycle_should_stop(cycle, &u, &mut cur, &mut prev) {
                 break;
             }
-            prev.copy_from_slice(&cur);
         }
         return u;
     }
@@ -2369,19 +2359,9 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
         }
-        for (c, x) in cur.iter_mut().zip(u.iter()) {
-            *c = x.val();
-        }
-        if cycle > 0
-            && crate::ode::predictions::ss_cycle_converged(
-                &cur,
-                &prev,
-                crate::ode::predictions::SS_EQUILIBRATION_TOL,
-            )
-        {
+        if crate::sens::propagate::ss_dual_cycle_should_stop(cycle, &u, &mut cur, &mut prev) {
             break;
         }
-        prev.copy_from_slice(&cur);
     }
     u
 }

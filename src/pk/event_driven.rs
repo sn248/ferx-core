@@ -375,7 +375,9 @@ fn equilibrate_ss_state_event_driven(
 
     // Constant params across all SS-equilibration cycles → one eigendata solve.
     let mut eigen = crate::sens::propagate::EigenCacheG::default();
-    for _ in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
+    // Shared early stop (#519, #532 review #11): same relative-L∞ criterion as the ODE path.
+    let mut prev = vec![0.0_f64; state.len()];
+    for cycle in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
         if !is_inf {
             // Bolus pulse: instantaneous amount jump (with F).
             state[cmt_idx] += pk.bioavailable_amount(dose.amt);
@@ -390,6 +392,16 @@ fn equilibrate_ss_state_event_driven(
             f64::NEG_INFINITY,
             &mut eigen,
         );
+        if cycle > 0
+            && crate::ode::predictions::ss_cycle_converged(
+                &state,
+                &prev,
+                crate::ode::predictions::SS_EQUILIBRATION_TOL,
+            )
+        {
+            break;
+        }
+        prev.copy_from_slice(&state);
     }
 
     state

@@ -912,6 +912,23 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    if !model.residual_correlations.is_empty() {
+        for &m in &chain {
+            if m != EstimationMethod::Foce {
+                diags.push(
+                    Diagnostic::error(
+                        "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
+                        "block_sigma correlated residual errors are currently supported for \
+                         method = foce only. FOCEI, GN, SAEM, and importance-sampling paths \
+                         still use diagonal residual-error derivatives.",
+                    )
+                    .with_block("fit_options"),
+                );
+                break;
+            }
+        }
+    }
+
     // `imp` may appear at most once in a chain. By default it is an MCEM
     // estimator (NONMEM `METHOD=IMP`) and may sit anywhere in the chain. With
     // `imp_eval_only = true` (NONMEM `IMP EONLY=1`) it instead evaluates the
@@ -4068,6 +4085,7 @@ fn compute_subject_results(
                 &params.omega,
                 &params.sigma.values,
                 &model.error_spec,
+                &model.residual_correlations,
                 model.residual_error_eta,
             );
 
@@ -5328,6 +5346,7 @@ mod iov_integration {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             // pk_param_fn: eta[0]=BSV for CL, eta[1]=KAPPA_CL (appended by IOV path)
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
@@ -6752,6 +6771,7 @@ mod simulate_with_uncertainty_tests {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp();
@@ -7559,6 +7579,7 @@ mod tests_sdtab_tv_cov {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             // CL = TVCL · exp(η_CL) · (WT/70) — reads WT from the covariate map
             // that `compute_predictions_with_tv` substitutes per-event from
             // `obs_covariates` / `dose_covariates`. With WT changing per obs
@@ -7804,6 +7825,7 @@ mod tests_sdtab_tv_cov {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 let wt = cov.get("WT").copied().unwrap_or(70.0);
@@ -7952,6 +7974,7 @@ mod tests_derived_session_clock {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
             error_spec: ErrorSpec::Single(ErrorModel::Additive),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|_, _, _| PkParams::default()),
             n_theta: 0,
             n_eta: 0,
@@ -8333,6 +8356,7 @@ mod tests_derived_iov_kappa {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
             error_spec: ErrorSpec::Single(ErrorModel::Additive),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| {
                 let kappa = eta.get(1).copied().unwrap_or(0.0);
                 let mut p = PkParams::default();

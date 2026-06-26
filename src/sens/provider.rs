@@ -345,6 +345,7 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 /// `docs/estimation/tte.qmd`).
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
+        && model.residual_correlations.is_empty()
         && !model.has_tte()
         // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
         // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).

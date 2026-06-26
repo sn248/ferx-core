@@ -30,6 +30,9 @@ pub(crate) enum InnerGradientMethod {
 /// classifier (the live scope check is [`analytic_inner_grad_supported`]).
 #[allow(dead_code)]
 pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'static str> {
+    if !model.residual_correlations.is_empty() {
+        return Some("correlated residual error");
+    }
     // Non-log-normal ETA: additive (`tv + eta`), logit (`inv_logit(... + eta)`),
     // logit-probability, or custom/unrecognised. The kernels apply `exp(eta)`
     // unconditionally and ignore `EtaParamType`.
@@ -1002,6 +1005,7 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
             model.scaling,
             crate::types::ScalingSpec::ExpressionScale { .. }
         )
+        || !model.residual_correlations.is_empty()
         // `iiv_on_ruv`: plain residual-η is now served analytically on both loops
         // (#474, the scaling lives in the shared gradient); only the cases that force
         // FD — IOV + `iiv_on_ruv` and M3-BLOQ + `iiv_on_ruv` — bail here, matching the
@@ -2392,6 +2396,7 @@ mod tests {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Additive),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp(); // CL
@@ -2650,6 +2655,7 @@ mod iov_tests {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 // eta[0] = bsv, eta[1] = kappa (combined)
@@ -3326,6 +3332,7 @@ mod iov_tests {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp();
@@ -3435,6 +3442,7 @@ mod iov_tests {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp();

@@ -1113,6 +1113,19 @@ pub struct SigmaVector {
     pub names: Vec<String>,
 }
 
+/// Fixed correlation between two named residual-error terms.
+///
+/// `sigma_i` and `sigma_j` index [`SigmaVector::values`]. The covariance used
+/// at runtime is `rho * sigma_i * sigma_j`, so the existing positive SD
+/// parameterization remains unchanged while off-diagonal residual covariance is
+/// carried into subject-level R matrices.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResidualCorrelation {
+    pub sigma_i: usize,
+    pub sigma_j: usize,
+    pub rho: f64,
+}
+
 /// Full set of model parameters
 #[derive(Debug, Clone)]
 pub struct ModelParameters {
@@ -1368,6 +1381,114 @@ impl Default for ErrorSpec {
 }
 
 impl ErrorSpec {
+    /// Observation-level loadings onto the flat residual-error vector.
+    ///
+    /// For an observation with prediction `f`, additive error contributes a
+    /// coefficient of `1`, proportional error contributes `f`, and combined
+    /// error contributes both. Multiplying these loadings by the residual
+    /// sigma covariance matrix yields the scalar variance on the diagonal and
+    /// the cross-observation covariance off diagonal.
+    pub fn sigma_loadings(&self, cmt: usize, f: f64, n_sigma: usize) -> Vec<(usize, f64)> {
+        match self {
+            ErrorSpec::Single(em) => match em {
+                ErrorModel::Additive => {
+                    if n_sigma > 0 {
+                        vec![(0, 1.0)]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                ErrorModel::Proportional => {
+                    if n_sigma > 0 {
+                        vec![(0, f)]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                ErrorModel::Combined => {
+                    let mut out = Vec::with_capacity(2);
+                    if n_sigma > 0 {
+                        out.push((0, f));
+                    }
+                    if n_sigma > 1 {
+                        out.push((1, 1.0));
+                    }
+                    out
+                }
+            },
+            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
+                Some(ep) => match ep.error_model {
+                    ErrorModel::Additive => ep
+                        .sigma_idx
+                        .first()
+                        .copied()
+                        .map(|i| vec![(i, 1.0)])
+                        .unwrap_or_default(),
+                    ErrorModel::Proportional => ep
+                        .sigma_idx
+                        .first()
+                        .copied()
+                        .map(|i| vec![(i, f)])
+                        .unwrap_or_default(),
+                    ErrorModel::Combined => {
+                        let mut out = Vec::with_capacity(2);
+                        if let Some(&i) = ep.sigma_idx.first() {
+                            out.push((i, f));
+                        }
+                        if let Some(&i) = ep.sigma_idx.get(1) {
+                            out.push((i, 1.0));
+                        }
+                        out
+                    }
+                },
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// Residual variance including fixed residual correlations from
+    /// `block_sigma`.
+    pub fn variance_at_with_correlations(
+        &self,
+        cmt: usize,
+        f_pred: f64,
+        sigma: &[f64],
+        correlations: &[ResidualCorrelation],
+    ) -> f64 {
+        if correlations.is_empty() {
+            return self.variance_at(cmt, f_pred, sigma);
+        }
+        let loadings = self.sigma_loadings(cmt, f_pred, sigma.len());
+        if loadings.is_empty() {
+            return f64::NAN;
+        }
+        let mut v = 0.0;
+        for &(idx, coeff) in &loadings {
+            let Some(&s) = sigma.get(idx) else {
+                return f64::NAN;
+            };
+            v += coeff * coeff * s * s;
+        }
+        for corr in correlations {
+            let ci = loadings
+                .iter()
+                .find(|(idx, _)| *idx == corr.sigma_i)
+                .map(|(_, coeff)| *coeff);
+            let cj = loadings
+                .iter()
+                .find(|(idx, _)| *idx == corr.sigma_j)
+                .map(|(_, coeff)| *coeff);
+            let (Some(ci), Some(cj)) = (ci, cj) else {
+                continue;
+            };
+            let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
+                return f64::NAN;
+            };
+            v += 2.0 * ci * cj * corr.rho * si * sj;
+        }
+        v.max(1e-12)
+    }
+
     /// `SigmaType` for each entry of the flat global sigma vector, as a `Vec`
     /// of length `n_sigma`, so `FitResult` can label/scale every sigma.
     ///
@@ -2019,6 +2140,12 @@ pub struct CompiledModel {
     /// `ErrorSpec::Single(error_model)`; for multi-endpoint models it carries
     /// the per-CMT dispatch and `error_model` holds a representative endpoint.
     pub error_spec: ErrorSpec,
+    /// Fixed residual-error correlations declared by `block_sigma`.
+    ///
+    /// Empty for ordinary diagonal `$SIGMA` models. When non-empty, likelihood
+    /// paths build a full per-subject residual covariance matrix from the
+    /// observation-specific sigma loadings instead of using only an R diagonal.
+    pub residual_correlations: Vec<ResidualCorrelation>,
     pub pk_param_fn: PkParamFn,
     pub n_theta: usize,
     /// Number of between-subject variability (BSV) ETAs.
@@ -2415,7 +2542,12 @@ impl CompiledModel {
     /// Thin convenience wrapper over [`ErrorSpec::variance_at`] for call sites
     /// that already hold the `&CompiledModel`.
     pub fn residual_variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
-        self.error_spec.variance_at(cmt, f_pred, sigma)
+        self.error_spec.variance_at_with_correlations(
+            cmt,
+            f_pred,
+            sigma,
+            &self.residual_correlations,
+        )
     }
 
     /// Multiplicative factor applied to the residual *variance* for a subject
@@ -4464,6 +4596,7 @@ pub(crate) mod test_helpers {
             pk_model: PkModel::OneCptOral,
             error_model: ErrorModel::Additive,
             error_spec: ErrorSpec::Single(ErrorModel::Additive),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|_, _, _| PkParams::default()),
             n_theta: 1,
             n_eta: 1,
@@ -4578,6 +4711,7 @@ pub(crate) mod test_helpers {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 let wt = cov.get("WT").copied().unwrap_or(70.0);

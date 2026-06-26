@@ -1,4 +1,4 @@
-use crate::types::{ErrorModel, ErrorSpec, SubjectResult};
+use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SubjectResult};
 
 const MIN_VARIANCE: f64 = 1e-12;
 
@@ -38,6 +38,27 @@ pub fn compute_r_diag(
         .iter()
         .zip(obs_cmts.iter())
         .map(|(&f, &cmt)| error_spec.variance_at(cmt, f, sigma_values))
+        .collect()
+}
+
+/// Compute residual variances including fixed residual correlations from
+/// `block_sigma`.
+pub fn compute_r_diag_with_correlations(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+) -> Vec<f64> {
+    if correlations.is_empty() {
+        return compute_r_diag(error_spec, ipreds, obs_cmts, sigma_values);
+    }
+    ipreds
+        .iter()
+        .zip(obs_cmts.iter())
+        .map(|(&f, &cmt)| {
+            error_spec.variance_at_with_correlations(cmt, f, sigma_values, correlations)
+        })
         .collect()
 }
 
@@ -176,6 +197,19 @@ mod tests {
         // V = (f * sigma1)^2 + sigma2^2 = (10 * 0.1)^2 + 0.5^2 = 1.0 + 0.25 = 1.25
         let v = residual_variance(ErrorModel::Combined, 10.0, &[0.1, 0.5]);
         assert_relative_eq!(v, 1.25, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_combined_variance_with_residual_correlation() {
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        // V = (10 * 0.2)^2 + 1^2 + 2 * 10 * 0.5 * 0.2 * 1 = 7.
+        let v = spec.variance_at_with_correlations(1, 10.0, &[0.2, 1.0], &[corr]);
+        assert_relative_eq!(v, 7.0, epsilon = 1e-12);
     }
 
     #[test]

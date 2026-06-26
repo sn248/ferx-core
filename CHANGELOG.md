@@ -20,6 +20,8 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Support fixed residual-error correlations via `block_sigma` for FOCE combined-error
+  models, with a NONMEM `$SIGMA BLOCK(2) FIX` validation example (#537).
 - **Exact analytic FOCE/FOCEI gradients for steady-state (SS=1) ODE dosing** (#439). User-
   `[odes]` models with a steady-state dose now get exact analytic gradients instead of
   finite differences. NONMEM SS=1 loads the compartments with an infinite-past pulse

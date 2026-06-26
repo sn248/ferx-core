@@ -1,0 +1,21 @@
+$PROBLEM correlated combined residual error, fixed sigma block
+$DATA correlated_residual_combined.csv IGNORE=@
+$INPUT ID TIME DV EVID AMT CMT RATE MDV
+$SUBROUTINES ADVAN1 TRANS2
+$PK
+  CL = THETA(1) * EXP(ETA(1))
+  V  = THETA(2)
+  S1 = V
+$ERROR
+  IPRED = F
+  Y = IPRED + IPRED*EPS(1) + EPS(2)
+$THETA
+  (0.01, 1.0, 10.0) FIX
+  (0.1, 10.0, 100.0) FIX
+$OMEGA 0.04 FIX
+$SIGMA BLOCK(2) FIX
+  0.04
+  0.10
+  1.00
+$ESTIMATION METHOD=1 MAXEVAL=0 NOABORT
+$TABLE ID TIME DV PRED IPRED CWRES NOPRINT NOAPPEND ONEHEADER FORMAT=,1PE20.10 FILE=correlated_residual_combined.tab

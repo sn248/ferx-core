@@ -209,6 +209,37 @@ Combined error:
   DV ~ combined(PROP_ERR, ADD_ERR)
 ```
 
+Correlated combined error:
+```
+[parameters]
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+```
+
+`block_sigma` uses NONMEM-style lower-triangle covariance values:
+`[Var(PROP_ERR), Cov(PROP_ERR, ADD_ERR), Var(ADD_ERR)]`. Diagonal entries
+initialize the named sigma SDs (`sqrt(variance)`) and the off-diagonal entries
+define fixed residual correlations. For the example above, `PROP_ERR = 0.2`,
+`ADD_ERR = 1.0`, and `Corr(PROP_ERR, ADD_ERR) = 0.5`, so the residual variance
+for a combined-error observation is:
+
+$$
+V = (f \sigma_\mathrm{prop})^2 + \sigma_\mathrm{add}^2
+    + 2 f \rho \sigma_\mathrm{prop}\sigma_\mathrm{add}
+$$
+
+Current scope: `block_sigma` is supported for `method = foce`. FOCEI/GN,
+SAEM, and importance-sampling paths reject correlated residual sigma blocks
+until their residual-error derivative code is extended beyond diagonal RUV.
+
+Validation: `examples/correlated_residual_combined.ferx` and
+`nonmem_anchor/correlated_residual_combined.ctl` run the same fixed-parameter
+one-compartment IV model with `$SIGMA BLOCK(2) FIX`. On
+`data/correlated_residual_combined.csv`, NONMEM 7.5.1 (`METHOD=1 MAXEVAL=0`)
+reports OFV 18.715849 and ferx FOCE reports OFV 18.727365 (difference 0.0115).
+
 ## IIV on residual error (`iiv_on_ruv`)
 
 NONMEM models often place an **inter-individual random scaling on the residual

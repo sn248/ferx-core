@@ -1869,6 +1869,7 @@ mod tests {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Additive),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta, _eta, cov| {
                 let mut p = PkParams::default();
                 let cr = cov.get("CR").copied().unwrap_or(1.0);

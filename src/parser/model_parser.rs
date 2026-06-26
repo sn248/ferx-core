@@ -1921,7 +1921,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .unwrap_or_default();
         let is_ode_model = model.ode_spec.is_some();
 
-        let (scaling, output_fn, output_program) = parse_scaling_block(
+        let (scaling, output_fn, output_program, scaling_covariates) = parse_scaling_block(
             scaling_lines,
             &theta_names_for_scaling,
             &eta_names_for_scaling,
@@ -1947,6 +1947,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             ode_spec.readout_program = output_program;
         }
 
+        for cov in scaling_covariates {
+            if !model.referenced_covariates.contains(&cov) {
+                model.referenced_covariates.push(cov);
+            }
+        }
+        model.referenced_covariates.sort();
         model.scaling = scaling;
     }
 
@@ -4531,7 +4537,7 @@ fn build_y_output_fn(
     pk_indices: &[usize],
     state_names: &[String],
     kappa_names: &[String],
-) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram), String> {
+) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram, Vec<String>), String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
     let mut defined: Vec<String> = state_names.to_vec();
@@ -4620,12 +4626,14 @@ fn build_y_output_fn(
 
     // Snapshot the readout as an `OdeOutputProgram` for the analytic-sensitivity
     // path (issue #367): same bytecode + layout, evaluated over `Dual2<N>`. It is
-    // `simple` (dual-evaluable with empty θ/η/cov) when the expression references
-    // only states / individual parameters / constants.
-    let output_simple = !bc.ops.iter().any(|op| {
+    // dual-evaluable when the expression references only states / individual
+    // parameters / covariates / constants — covariates thread in as constants
+    // from the per-observation snapshot (#540), so only a direct θ/η/NN reference
+    // (which would need extra chain terms) disqualifies the analytic readout.
+    let output_dual_evaluable = !bc.ops.iter().any(|op| {
         matches!(
             op,
-            Op::PushTheta(_) | Op::PushEta(_) | Op::PushCov(_) | Op::PushNnOutput(_, _)
+            Op::PushTheta(_) | Op::PushEta(_) | Op::PushNnOutput(_, _)
         )
     });
     let output_program = OdeOutputProgram {
@@ -4633,7 +4641,8 @@ fn build_y_output_fn(
         n_states,
         n_indiv,
         indiv_to_pk: indiv_to_pk.clone(),
-        simple: output_simple,
+        cov_names: cov_names.clone(),
+        dual_evaluable: output_dual_evaluable,
     };
 
     // Per-thread scratch for the y readout vars + covariate slice + bytecode
@@ -4643,6 +4652,7 @@ fn build_y_output_fn(
     // and ODE RHS never interleave on a single thread (readout runs
     // post-integration).
     let n_cov = cov_names.len();
+    let cov_names_for_fn = cov_names.clone();
 
     let out_fn: crate::ode::OdeOutputFn = Box::new(
         move |state: &[f64],
@@ -4677,7 +4687,7 @@ fn build_y_output_fn(
                 scratch.y_cov.clear();
                 if n_cov > 0 {
                     scratch.y_cov.resize(n_cov, 0.0);
-                    for (i, name) in cov_names.iter().enumerate() {
+                    for (i, name) in cov_names_for_fn.iter().enumerate() {
                         if let Some(&v) = covariates.get(name) {
                             scratch.y_cov[i] = v;
                         }
@@ -4697,7 +4707,7 @@ fn build_y_output_fn(
             })
         },
     );
-    Ok((out_fn, output_program))
+    Ok((out_fn, output_program, cov_names))
 }
 
 /// Parsed contents of a `[scaling]` block.
@@ -4740,6 +4750,7 @@ fn parse_scaling_block(
         ScalingSpec,
         Option<crate::ode::OdeReadout>,
         Option<OdeOutputProgram>,
+        Vec<String>,
     ),
     String,
 > {
@@ -4755,6 +4766,7 @@ fn parse_scaling_block(
     // per-CMT readouts carry their own program inside each `PerCmtReadout` (#439),
     // so the analytic-sensitivity provider can differentiate each endpoint.
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
+    let mut y_covariates: Vec<String> = Vec::new();
 
     for line in lines {
         let trimmed = line.trim();
@@ -4834,7 +4846,7 @@ fn parse_scaling_block(
                          use `obs_scale = <expr>` for analytical PK"
                         .into());
                 }
-                let (out_fn, out_program) = build_y_output_fn(
+                let (out_fn, out_program, cov_names) = build_y_output_fn(
                     value,
                     theta_names,
                     eta_names,
@@ -4843,6 +4855,11 @@ fn parse_scaling_block(
                     state_names,
                     kappa_names,
                 )?;
+                for cov in cov_names {
+                    if !y_covariates.contains(&cov) {
+                        y_covariates.push(cov);
+                    }
+                }
                 match cmt_opt {
                     None => {
                         if y_uniform.is_some() {
@@ -4901,7 +4918,8 @@ fn parse_scaling_block(
     } else {
         None
     };
-    Ok((scaling, readout, readout_program))
+    y_covariates.sort();
+    Ok((scaling, readout, readout_program, y_covariates))
 }
 
 // ── ode_template desugaring + the analytical+ODE-only-absorption error rule ──
@@ -10009,28 +10027,38 @@ pub struct OdeOutputProgram {
     n_indiv: usize,
     /// Per individual parameter `i`, its slot in the flat PK-parameter vector.
     indiv_to_pk: Vec<usize>,
+    /// Covariate names the bytecode's `PushCov(i)` reads, in index order. The
+    /// dual readout resolves these from the per-observation covariate snapshot
+    /// and feeds them as constants — a covariate carries no parameter derivative
+    /// in the individual-parameter dual basis the ODE provider seeds (#540).
+    cov_names: Vec<String>,
     /// True when the expression references only states / individual parameters /
-    /// constants (no θ/η/covariate/NN terms) — the case the dual readout can
-    /// evaluate with empty θ/η/cov inputs.
-    simple: bool,
+    /// covariates / constants (no θ/η/NN terms) — the case the dual readout can
+    /// evaluate, threading the covariate snapshot in while leaving θ/η empty.
+    /// θ/η referenced *directly* in the readout would need extra chain terms the
+    /// ODE provider does not yet assemble, so those stay on the FD fallback.
+    dual_evaluable: bool,
 }
 
 impl OdeOutputProgram {
-    /// See [`OdeOutputProgram::simple`].
-    pub(crate) fn is_simple(&self) -> bool {
-        self.simple
+    /// See [`OdeOutputProgram::dual_evaluable`].
+    pub(crate) fn is_dual_evaluable(&self) -> bool {
+        self.dual_evaluable
     }
 
     /// Evaluate the output expression over a dual type, generic over [`PkNum`]
     /// (`Dual1` light inner / `Dual2` full outer; #410) — the Form-C readout.
     /// `state` is the integrated dual state; `params` is the flat PK-parameter
     /// vector with the differentiated slots seeded as dual variables (so `V1`'s
-    /// derivative flows into `central / V1`). `vars`/`stack` are caller-owned
-    /// scratch. Only valid when [`is_simple`](Self::is_simple) holds.
+    /// derivative flows into `central / V1`); `cov` is the per-observation
+    /// covariate snapshot, whose values thread in as constants (#540). `vars`/
+    /// `stack` are caller-owned scratch. Only valid when
+    /// [`is_dual_evaluable`](Self::is_dual_evaluable) holds.
     pub(crate) fn eval_output_g<T: crate::sens::num::PkNum>(
         &self,
         state: &[T],
         params: &[T],
+        cov: &HashMap<String, f64>,
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
     ) -> T {
@@ -10043,8 +10071,15 @@ impl OdeOutputProgram {
                 *dst = v;
             }
         }
+        // Covariate values in `PushCov` index order (== `cov_names` order); a
+        // missing covariate reads 0.0, mirroring the f64 readout `out_fn`.
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| cov.get(n).copied().unwrap_or(0.0))
+            .collect();
         let empty_nn: Vec<Vec<f64>> = Vec::new();
-        eval_bytecode_g::<T>(&self.bc, &[], &[], &[], vars, &empty_nn, stack)
+        eval_bytecode_g::<T>(&self.bc, &[], &[], &cov_vec, vars, &empty_nn, stack)
     }
 }
 
@@ -19166,6 +19201,10 @@ if (WT > 70) {
             Some("  y = central / V * WT\n"),
         );
         let model = parse_model_string(&src).expect("Form C with covariate parses");
+        assert!(
+            model.referenced_covariates.contains(&"WT".to_string()),
+            "Form C covariates must be retained for data loading and TV pruning"
+        );
         let ode = model.ode_spec.as_ref().unwrap();
         let out_fn = match &ode.readout {
             crate::ode::OdeReadout::Single(f) => f,

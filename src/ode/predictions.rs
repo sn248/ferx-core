@@ -983,7 +983,7 @@ fn integrate_segment(
                     pk_params_flat,
                     theta,
                     eta,
-                    &subject.covariates,
+                    subject.obs_cov(obs_idx),
                     cmt,
                 );
             }
@@ -1145,7 +1145,7 @@ pub fn ode_predictions(
                     pk_params_flat,
                     theta,
                     eta,
-                    &subject.covariates,
+                    subject.obs_cov(obs_idx),
                     cmt,
                 );
             }
@@ -1417,19 +1417,22 @@ pub(crate) fn ode_predictions_adaptive(
         // --- Decision hook: observe (pre-dose trough) -> decide -> dose. ---
         if !stopped {
             if let Some(&decision_index) = decision_index_of.get(&t_start.to_bits()) {
+                // Covariate snapshot in effect at the decision time. When the
+                // decision coincides with an observation row, use that row's
+                // per-observation snapshot (so time-varying covariates drive the
+                // monitored readouts and the controller's view); otherwise fall
+                // back to the subject-static map.
+                let decision_cov = obs_map
+                    .get(&t_start.to_bits())
+                    .and_then(|idxs| idxs.first())
+                    .map(|&i| shadow.obs_cov(i))
+                    .unwrap_or(&shadow.covariates);
                 // Resolve each monitored signal at the current (pre-dose) state.
                 let mut signals: HashMap<String, f64> = HashMap::new();
                 let mut observed: Vec<ObservedSignal> = Vec::with_capacity(monitors.len());
                 for m in monitors {
-                    let value = read_observable(
-                        ode,
-                        &u,
-                        pk_params_flat,
-                        theta,
-                        eta,
-                        &shadow.covariates,
-                        m.cmt,
-                    );
+                    let value =
+                        read_observable(ode, &u, pk_params_flat, theta, eta, decision_cov, m.cmt);
                     signals.insert(m.name.clone(), value);
                     observed.push(ObservedSignal {
                         name: m.name.clone(),
@@ -1442,7 +1445,7 @@ pub(crate) fn ode_predictions_adaptive(
                     let ctx = ControllerCtx {
                         t: t_start,
                         state: &u,
-                        covariates: &shadow.covariates,
+                        covariates: decision_cov,
                         history: &shadow.doses,
                         decision_index,
                         signals: &signals,
@@ -1598,8 +1601,15 @@ pub(crate) fn ode_predictions_adaptive(
         if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
             for &obs_idx in obs_idxs {
                 let cmt = shadow.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-                predictions[obs_idx] =
-                    read_observable(ode, &u, pk_params_flat, theta, eta, &shadow.covariates, cmt);
+                predictions[obs_idx] = read_observable(
+                    ode,
+                    &u,
+                    pk_params_flat,
+                    theta,
+                    eta,
+                    shadow.obs_cov(obs_idx),
+                    cmt,
+                );
             }
         }
 
@@ -1958,7 +1968,7 @@ pub fn ode_predictions_event_driven(
                     &pk_now.values,
                     theta,
                     eta,
-                    &subject.covariates,
+                    subject.obs_cov(idx),
                     cmt,
                 );
                 // Clamp negative readouts (ODE solver overshoot guard);
@@ -2283,7 +2293,7 @@ pub fn ode_predictions_with_states(
                     pk_params_flat,
                     theta,
                     eta,
-                    &subject.covariates,
+                    subject.obs_cov(obs_idx),
                     cmt,
                 );
                 states[obs_idx] = u.clone();
@@ -2370,7 +2380,7 @@ pub fn ode_predictions_with_states(
                         pk_params_flat,
                         theta,
                         eta,
-                        &subject.covariates,
+                        subject.obs_cov(obs_idx),
                         cmt,
                     );
                     states[obs_idx] = pt.u.clone();
@@ -2945,6 +2955,81 @@ mod tests {
             let exact = 100.0 * (-ke * t).exp();
             assert_relative_eq!(run.predictions[i], exact, max_relative = 1e-5);
         }
+    }
+
+    #[test]
+    fn adaptive_decision_monitor_uses_observation_covariates() {
+        // Regression (#538): at a decision time the monitored Form-C readout
+        // must see the covariate snapshot in effect at that time (the coincident
+        // observation row), not the subject-level first-row covariate. The
+        // readout is `state * FREE`; with no decay the state stays at the dose
+        // amount, so the monitored signal is driven purely by FREE.
+        let ode = OdeSpec {
+            rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::Single(Box::new(|state, _pk, _theta, _eta, covariates| {
+                state[0] * covariates.get("FREE").copied().unwrap_or(0.0)
+            })),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+            init_fn: None,
+        };
+        let pk = pk_one(0.0, 1.0); // ke = 0 -> state holds at the dose amount
+        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
+        let decisions = [0.0, 10.0];
+
+        // Single observation at the second decision time, carrying FREE=2.0;
+        // the subject-static map carries the stale FREE=1.0.
+        let mut base = make_subject(vec![], vec![10.0]);
+        base.covariates.insert("FREE".into(), 1.0);
+        base.obs_covariates = vec![HashMap::from([("FREE".to_string(), 2.0)])];
+
+        // Dose 100 at t=0 (signal 0 < 150). At t=10 the pre-dose state is 100,
+        // so the monitored signal is 100*FREE. With the observation snapshot
+        // (FREE=2) the signal is 200 >= 150 -> hold; with the stale static
+        // value (FREE=1) it would be 100 < 150 -> a second (wrong) dose.
+        let mut controller = |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("monitor A is declared") < 150.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        };
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &monitors,
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        assert_eq!(
+            run.ledger.len(),
+            1,
+            "dose only at t=0; the t=10 monitor must read FREE=2 (signal 200) and hold"
+        );
+        assert_eq!(run.ledger[0].time, 0.0);
+        // The decision at t=10 logged the monitored signal computed with the
+        // observation-row covariate: 100 * 2.0 = 200.
+        let d10 = run
+            .decisions
+            .iter()
+            .find(|d| d.time == 10.0)
+            .expect("decision logged at t=10");
+        assert_relative_eq!(d10.observed_signals[0].value, 200.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -4879,6 +4964,47 @@ mod tests {
         for (b, e) in baseline.iter().zip(event_driven.iter()) {
             assert_relative_eq!(*b, *e, epsilon = 1e-3, max_relative = 1e-4);
         }
+    }
+
+    #[test]
+    fn ode_event_driven_form_c_uses_observation_covariates() {
+        // Regression for a NONMEM translation with paired total/free assays:
+        // the dose row carried FREE=3, while same-time observation rows carried
+        // FREE=0 and FREE=1. Form C must see the observation snapshot, not the
+        // subject-level first-row covariate.
+        let ode = OdeSpec {
+            rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::Single(Box::new(|state, _pk, _theta, _eta, covariates| {
+                state[0] * covariates.get("FREE").copied().unwrap_or(0.0)
+            })),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+            init_fn: None,
+        };
+        let mut subj = make_subject(
+            vec![DoseEvent::new(0.0, 10.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 1.0],
+        );
+        subj.covariates.insert("FREE".into(), 3.0);
+        subj.dose_covariates = vec![HashMap::from([("FREE".to_string(), 3.0)])];
+        subj.obs_covariates = vec![
+            HashMap::from([("FREE".to_string(), 0.0)]),
+            HashMap::from([("FREE".to_string(), 1.0)]),
+        ];
+        let pk = pk_one(0.0, 1.0);
+        let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &[pk], &[pk, pk], &[]);
+
+        assert_relative_eq!(preds[0], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(preds[1], 10.0, epsilon = 1e-12);
     }
 
     #[test]

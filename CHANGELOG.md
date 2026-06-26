@@ -22,6 +22,28 @@ section of the SDLC for the versioning policy).
 ### Added
 - Support fixed residual-error correlations via `block_sigma` for FOCE combined-error
   models, with a NONMEM `$SIGMA BLOCK(2) FIX` validation example (#537).
+- **Analytic FOCE/FOCEI gradients for Form C readouts that reference covariates** (#540).
+  An ODE Form C readout (`[scaling] y = <expr>`) that branches on or scales by a covariate
+  — e.g. a free→total protein-binding readout gated on a `FREE` assay flag — now gets the
+  exact analytic `Dual2`/`Dual1` gradient instead of falling back to finite differences.
+  Covariates carry no parameter derivative in the individual-parameter dual basis the ODE
+  sensitivity provider seeds, so they thread into the dual readout as constants from the
+  per-observation covariate snapshot (consistent with #535/#538), for both the static and
+  time-varying-covariate walks. θ or η referenced *directly* in a Form C readout (rather
+  than via an `[individual_parameters]` entry) still falls back to FD. Validated on the
+  `fluconazole_radboudumc` readout shape (free/total fluconazole with saturable
+  albumin-dependent protein binding): the analytic `∂f/∂η`/`∂f/∂θ` match the production
+  predictor and its central finite differences to ~1e-6 for both subject-static and
+  per-observation `FREE` snapshots (`ode_provider_form_c_*` tests).
+- **`[data_selection]` string equality on label columns, mirroring NONMEM `IGNORE(C.EQ.C)`**
+  (#536). A `==`/`!=` condition may now compare a covariate column against an unquoted
+  label, matched against the raw cell value — so a non-numeric comment-flag column (the
+  NONMEM convention of a `C` column holding the literal `C`) is dropped correctly:
+  `ignore = C == C`. The bare shorthand `ignore = C` expands to `C == C`. A non-numeric
+  value against a *standard* numeric column (e.g. `DV == 0.O01` with a letter O) is now a
+  parse error rather than a silent never-matching no-op, and a clause referencing a column
+  absent from the data emits a `W_FILTER_COLUMN_ABSENT` warning instead of fitting
+  unfiltered data silently.
 - **Exact analytic FOCE/FOCEI gradients for steady-state (SS=1) ODE dosing** (#439). User-
   `[odes]` models with a steady-state dose now get exact analytic gradients instead of
   finite differences. NONMEM SS=1 loads the compartments with an infinite-past pulse
@@ -112,6 +134,27 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- **Form C (`[scaling] y = <expr>`) ODE readouts now use per-observation covariate
+  snapshots** (#535, #538). The explicit-output readout is evaluated against the
+  covariate values on each observation's own data row rather than the subject's
+  first-row values, so time-varying covariates referenced in a Form C expression
+  now drive predictions, diagnostics, and the adaptive-trial decision monitors at
+  the correct time. As a consequence, covariates referenced **only** from a Form C
+  expression are now treated as required data columns: a model whose readout
+  references a covariate absent from the dataset now fails loudly with
+  `E_MISSING_COVARIATE` (and undeclared-but-present covariates raise the usual
+  warning), where previously the missing value silently read as `0.0`. **NONMEM
+  comparison:** validated against the `fluconazole_radboudumc` model (ADVAN3 TRANS4
+  with a free/total protein-binding `$ERROR` that selects `CTOT` when `FREE==0` and
+  `CU` when `FREE==1` — paired assay rows at the same time). Evaluated at identical
+  parameters, ferx's per-record population predictions match NONMEM's `PRED` to
+  ~1e-4 relative on **both** the total-assay and free-assay rows (e.g. subject 1 at
+  t=1: ferx 21.5105 / 2.9070 vs NONMEM 21.511 / 2.907), confirming the readout reads
+  each observation's own `FREE` value rather than the subject's first row. (The two
+  rows at a given time differ only by that per-record covariate.) For time-constant
+  covariates the readout is byte-identical to the prior behaviour; the
+  `ode_event_driven_form_c_uses_observation_covariates` unit test pins the
+  per-observation path.
 - **Gradient-based outer optimizers now precondition with magnitude scaling
   (`Abs`) instead of bound-half-width (`Rescale2`).** Under the default
   `optimizer = auto` (which resolves to NLopt L-BFGS when an analytic gradient is

@@ -20,6 +20,18 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Built-in zero-order absorption — `zero_order(dur)`** (#504). A new `[odes]`
+  input-rate function delivering the dose at a constant rate `F·Dose/dur` over the
+  window `(0, dur]` (a zero-order infusion whose duration is an estimated
+  parameter, reusing the `RATE=−2`/`D1` modeled-duration machinery). Compose it
+  with a hand-written `- KA*depot` for *sequential* (zero-then-first-order)
+  absorption. Like the other absorption inputs it routes the dose through the
+  forcing (bolus suppressed), supports `F`/lagtime/superposition, and requires an
+  explicit ODE disposition (a `pk ... + zero_order(...)` model errors, pointing at
+  `ode_template`). The hard cutoff at `tad = dur` is delivered exactly as a
+  per-segment constant; `dur`'s gradient is finite-difference for now (the analytic
+  boundary impulse is follow-up #530). Examples
+  `examples/zero_order_absorption.ferx` and `examples/sequential_absorption.ferx`.
 - Support NONMEM-style `block_sigma` residual covariance across paired same-time
   multi-endpoint observations under FOCE (#546).
 - Support fixed residual-error correlations via `block_sigma` for FOCE combined-error

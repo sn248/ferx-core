@@ -10,9 +10,9 @@ intrinsic in the `[odes]` block, rather than hand-coding a chain of physical
 transit compartments.
 
 ferx ships the **transit-compartment** model (`transit`), the **Freijer & Post
-inverse-Gaussian** model (`igd`), and the **Weibull** model (`weibull`); more
-input-rate models (the zero-order families) are planned — see
-`plans/absorption-models.md`.
+inverse-Gaussian** model (`igd`), the **Weibull** model (`weibull`), and the
+**zero-order** model (`zero_order`); more input-rate models (the dual-pathway
+`parallel`/`mixed` families) are planned — see `plans/absorption-models.md`.
 
 ## Transit-compartment absorption — `transit(n, mtt)`
 
@@ -304,6 +304,100 @@ simulated data:
 cargo run --release -- examples/weibull_absorption.ferx --simulate
 ```
 
+## Zero-order absorption — `zero_order(dur)`
+
+The dose enters at a **constant rate** over a modeled duration `dur` — a
+zero-order input (an infusion whose duration is an estimated parameter):
+
+$$
+R_\text{in}(t_\text{ad}) = \frac{\text{Dose}}{\text{dur}}\quad\text{for } 0 < t_\text{ad} \le \text{dur},\qquad 0 \text{ otherwise}
+$$
+
+The input integrates to the full dose (`∫₀^∞ R_in dt = F·Dose`) and `R_in = 0`
+for `tad ≤ 0` and `tad > dur`. This is the same constant-rate input as a NONMEM
+modeled-duration infusion (`RATE=−2` / `D1`, #324), exposed as an `[odes]`
+input-rate function so it can drive any compartment.
+
+### Syntax
+
+`zero_order` takes a **single** named argument `dur`. Add it to the compartment
+the dose feeds — central directly, or a depot for a *sequential* (zero-then-first-order)
+model:
+
+```text
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  DUR = TVDUR          # zero-order input duration (h)
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+```
+
+For **sequential** absorption — a zero-order fill of a depot followed by
+first-order `ka` to central — compose `zero_order` with a hand-written transfer
+term (there is no separate `sequential` keyword):
+
+```text
+[odes]
+  d/dt(depot)   = zero_order(dur=DUR) - KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+```
+
+- The argument is named: `dur=<param>`, declared in `[individual_parameters]`.
+- As with the other input rates, `zero_order(...)` is a standalone,
+  positively-signed term: it may appear **once** per `d/dt` line and must not be
+  scaled, negated, or parenthesised. (The fraction-weighted `parallel`/`mixed`
+  compositions are a planned follow-up.)
+
+### Shared behaviour
+
+`zero_order` reuses the same dose machinery as `transit`/`igd`/`weibull`:
+
+- **Dose routing** — the dose feeds `zero_order` over its window and is **not**
+  also added as a bolus; the depot/central state stays an amount.
+- **Bioavailability `F`, lagtime, multiple-dose superposition, and IOV** behave
+  exactly as for the other input rates (`F` scales the rate `F·Dose/dur`; the
+  window stays `dur`). Do not multiply `zero_order(...)` by `F`.
+- **Parameter domain** `dur > 0` is validated at typical values
+  (`E_ABSORPTION_DOMAIN`) and clamped for transient mid-fit excursions.
+- The same **not-yet-supported** combinations (an infusion `RATE>0`, `SS=1`, or a
+  `[diffusion]` block into the input-rate compartment) are rejected with a clear
+  error.
+
+The hard cutoff at `tad = dur` is handled exactly: ferx breaks the integration
+timeline at the window end and delivers the input as a per-segment constant (the
+way an infusion is injected), so the absorbed mass is exact — not smeared across
+the step.
+
+::: {.callout-note}
+## Sensitivity of `dur` is finite-difference
+
+The other input-rate models carry **exact analytic** (`Dual2`) FOCE/FOCEI
+gradients. `zero_order` is the exception: the derivative with respect to `dur`
+crosses the moving boundary at `tad = dur` (a Leibniz boundary term), which the
+pointwise dual walk cannot express, so `dur`'s gradient is computed by **finite
+differences**. This is correct — just slightly slower and less precise than the
+analytic route. The analytic boundary-impulse mechanism (shared with the
+modeled-duration `Dn` infusion) is tracked as a follow-up
+([#530](https://github.com/FeRx-NLME/ferx-core/issues/530)).
+:::
+
+### Worked examples
+
+[`examples/zero_order_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/zero_order_absorption.ferx)
+is a one-compartment model with zero-order input, and
+[`examples/sequential_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/sequential_absorption.ferx)
+is the sequential (zero-then-first-order) variant. Run either on simulated data:
+
+```bash
+cargo run --release -- examples/zero_order_absorption.ferx --simulate
+cargo run --release -- examples/sequential_absorption.ferx --simulate
+```
+
 ## Numerical note
 
 The transit input is integrated numerically through the ODE solver (the same
@@ -429,6 +523,22 @@ that out at 0.01 units). This run doubles as an end-to-end verification that `au
 plus the analytic `Dual2` ODE-forcing gradient resolve and converge on a `weibull()`
 model.
 
+### Zero-order (`zero_order`)
+
+`zero_order(dur)` is, by definition, a zero-order infusion of duration `dur`, so
+it is anchored **in-engine** against an explicit infusion rather than a separate
+NONMEM run: a `zero_order(dur=DUR)` model fed by a bolus must predict identically
+to the *same disposition* fed by an explicit infusion of duration `DUR` (rate
+`Dose/DUR`). `tests/zero_order_absorption.rs` asserts this equivalence across the
+whole curve — the in-window ramp, the window-end kink, and the post-window decay —
+to `1e-6`, which pins the value path exactly (the constant-rate input reuses the
+same modeled-duration forcing as NONMEM's `RATE=−2`/`D1`). The forcing is
+additionally validated by the absorption-independent **mass-balance invariant**
+`∫A dt = F·Dose/ke` and by an end-to-end **duration-recovery fit** (gated behind
+`--features slow-tests`). `dur`'s sensitivity is finite-difference (see the note
+above), so this model uses the FD gradient path rather than the analytic `Dual2`
+route.
+
 ## Generating the disposition — `ode_template`
 
 The transit example above hand-writes the disposition ODE
@@ -477,9 +587,10 @@ need a different compartment structure.
 
 ## The error rule — ODE-only absorption needs an ODE disposition
 
-`transit(...)`, `igd(...)`, and `weibull(...)` are currently served by numerical
-ODE integration, so they can only feed an ODE disposition. Combining one with an
-analytical `pk NAME(...)` is a **hard error**, not a silent conversion:
+`transit(...)`, `igd(...)`, `weibull(...)`, and `zero_order(...)` are currently
+served by numerical ODE integration, so they can only feed an ODE disposition.
+Combining one with an analytical `pk NAME(...)` is a **hard error**, not a silent
+conversion:
 
 ```text
 [structural_model]
@@ -497,6 +608,9 @@ be a surprise.
 
 `transit` and `igd` both have closed-form convolutions with 1-/2-compartment
 disposition (planned via the analytical incomplete-gamma / inverse-Gaussian forms,
-`plans/absorption-models.md`), so this restriction is interim for them. **Weibull
-has no elementary closed form, so its error rule is permanent** — `weibull(...)`
-will always require an explicit ODE disposition.
+`plans/absorption-models.md`), so this restriction is interim for them.
+`zero_order` is also closed-form-able (it is a zero-order infusion), so its rule
+is likewise interim — it ships on the ODE path first and leaves the list when the
+closed-form acceleration lands. **Weibull has no elementary closed form, so its
+error rule is permanent** — `weibull(...)` will always require an explicit ODE
+disposition.

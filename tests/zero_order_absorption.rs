@@ -1,0 +1,399 @@
+//! End-to-end tests for built-in **zero-order absorption** (#322 Phase 2, #504).
+//! Exercises the `zero_order(dur)` input-rate forcing through the *public* API —
+//! parse → `predict()` → ODE integration → readout — the zero-order counterpart
+//! of `tests/weibull_absorption.rs` / `tests/igd_absorption.rs`.
+//!
+//! Two anchors:
+//!  - the model-independent **mass-balance invariant** `∫A dt = F·Dose/ke` (a
+//!    missing forcing → AUC 0, a double-counted bolus → 2×, a mis-normalised rate
+//!    → wrong total); and
+//!  - an **explicit-infusion equivalence** anchor: `zero_order(dur)` is, by
+//!    definition, a constant `Dose/dur` over `(0, dur]` — i.e. a zero-order
+//!    infusion — so a `zero_order(dur=DUR)` model fed by a bolus must predict
+//!    *identically* to the same disposition fed by an explicit infusion of
+//!    duration `DUR`. This is the issue's "analytical infusion anchor" and needs
+//!    no licensed NONMEM run (the value path reuses #324's modeled-duration `Dn`
+//!    forcing).
+
+mod common;
+
+use ferx_core::parser::model_parser::parse_full_model;
+use ferx_core::{predict, DoseEvent, Population};
+
+/// One-compartment model with built-in zero-order absorption straight into
+/// central (no first-order `ka`). central (CMT 1) holds the drug AMOUNT (mg) and
+/// receives `R_in(tad) = Dose/DUR` over `(0, DUR]`. η fixed at 0 so `predict()`
+/// returns the typical-value curve. CL = 5, V = 50 ⇒ ke = 0.1 ⇒ amount
+/// AUC∞ = Dose/ke = 100/0.1 = 1000 mg·h. F defaults to 1.0. DUR = 4 h.
+const ZERO_ORDER_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta TVDUR(4.0, 0.05,  24.0)
+
+  omega ETA_CL ~ 0.0
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+"#;
+
+/// Same one-compartment disposition, but **no** absorption term — central is fed
+/// by an explicit infusion supplied in the data (rate column). Used as the
+/// equivalence reference for `ZERO_ORDER_MODEL`.
+const PLAIN_1CPT_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+
+  omega ETA_CL ~ 0.0
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V*central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+"#;
+
+/// Single dose of 100 mg into CMT 1 over `obs_times`. `rate = 0` ⇒ bolus (fed to
+/// `R_in` for the zero-order model); `rate > 0` ⇒ explicit infusion.
+fn pop_single(obs_times: Vec<f64>, rate: f64) -> Population {
+    let n = obs_times.len();
+    let dose = DoseEvent::new(0.0, 100.0, 1, rate, false, 0.0);
+    Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![common::subject(
+            "1",
+            vec![dose],
+            obs_times,
+            vec![0.0; n],
+            vec![1; n],
+        )],
+    }
+}
+
+#[test]
+fn zero_order_curve_recovers_dose_auc_and_has_flat_input_onset() {
+    let model = parse_full_model(ZERO_ORDER_MODEL)
+        .expect("zero_order model parses")
+        .model;
+
+    // 0, 0.25, …, 72.0 — fine enough for trapezoidal AUC, long enough that the
+    // truncated tail is negligible (ke = CL/V = 0.1 ⇒ t½ ≈ 6.9 h).
+    let obs_times: Vec<f64> = (0..=288).map(|i| i as f64 * 0.25).collect();
+    let pop = pop_single(obs_times, 0.0);
+    let preds = predict(&model, &pop, &model.default_params);
+
+    // (1) No instantaneous bolus jump: the dose enters as a constant rate over
+    //     (0, DUR], so central starts at 0.
+    assert_eq!(preds[0].time, 0.0);
+    assert!(
+        preds[0].pred.abs() < 1e-12,
+        "zero_order dose leaked in as a bolus: central(0) = {}",
+        preds[0].pred
+    );
+
+    // (2) The peak is at the end of the input window (DUR = 4 h): while R_in is on,
+    //     input (25 mg/h) exceeds elimination, so the amount rises to a maximum at
+    //     t = DUR, then falls. The max sample is the one nearest t = 4.
+    let max_idx = (0..preds.len())
+        .max_by(|&a, &b| preds[a].pred.partial_cmp(&preds[b].pred).unwrap())
+        .unwrap();
+    assert!(
+        (preds[max_idx].time - 4.0).abs() <= 0.25,
+        "expected Tmax at the window end (DUR = 4 h), got t = {}",
+        preds[max_idx].time
+    );
+
+    // (3) Mass balance via the absorption-independent invariant ∫A dt = Dose/ke.
+    let auc: f64 = preds
+        .windows(2)
+        .map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time))
+        .sum();
+    let auc_inf = 100.0 * 50.0 / 5.0; // F·Dose/ke = Dose·V/CL with F = 1
+    let rel = (auc - auc_inf).abs() / auc_inf;
+    assert!(
+        rel < 0.02,
+        "zero_order amount AUC {auc:.4} vs Dose·V/CL {auc_inf:.4} (rel err {rel:.2e})"
+    );
+}
+
+#[test]
+fn zero_order_equals_explicit_infusion_of_the_same_duration() {
+    // The defining identity: `zero_order(dur=DUR)` fed by a 100 mg bolus is a
+    // zero-order infusion of 100 mg over DUR = 4 h, i.e. rate = 25 mg/h. The same
+    // disposition fed by that explicit infusion must predict identically — across
+    // the whole curve, including the in-window ramp, the window-end kink, and the
+    // post-window decay. This pins the value path (not just the total mass) and is
+    // the in-engine analogue of a NONMEM zero-order-infusion anchor.
+    let zo = parse_full_model(ZERO_ORDER_MODEL)
+        .expect("zero_order model parses")
+        .model;
+    let plain = parse_full_model(PLAIN_1CPT_MODEL)
+        .expect("plain 1-cpt model parses")
+        .model;
+
+    let obs_times: Vec<f64> = (0..=120).map(|i| i as f64 * 0.25).collect();
+    let zo_preds = predict(&zo, &pop_single(obs_times.clone(), 0.0), &zo.default_params);
+    // rate = Dose/DUR = 100/4 = 25 mg/h ⇒ infusion duration = amt/rate = 4 h.
+    let inf_preds = predict(&plain, &pop_single(obs_times, 25.0), &plain.default_params);
+
+    assert_eq!(zo_preds.len(), inf_preds.len());
+    for (a, b) in zo_preds.iter().zip(inf_preds.iter()) {
+        assert!(
+            (a.pred - b.pred).abs() <= 1e-6 * (1.0 + b.pred.abs()),
+            "zero_order vs explicit infusion diverge at t = {}: {} vs {}",
+            a.time,
+            a.pred,
+            b.pred
+        );
+    }
+}
+
+/// `sequential` absorption: `zero_order(dur)` fills a depot, emptied to central by
+/// a hand-written first-order `- KA*depot` (no new intrinsic). central (CMT 2)
+/// holds the amount; the depot is CMT 1 and receives the zero-order input.
+const SEQUENTIAL_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta TVKA(1.0,  0.05,  24.0)
+  theta TVDUR(3.0, 0.05,  24.0)
+
+  omega ETA_CL ~ 0.0
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+  DUR = TVDUR
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = zero_order(dur=DUR) - KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+"#;
+
+#[test]
+fn sequential_model_parses_and_delivers_full_mass_to_central() {
+    let model = parse_full_model(SEQUENTIAL_MODEL)
+        .expect("sequential model parses")
+        .model;
+
+    // Dose into the depot (CMT 1); observe central (CMT 2).
+    let obs_times: Vec<f64> = (0..=288).map(|i| i as f64 * 0.25).collect();
+    let n = obs_times.len();
+    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+    let pop = Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![common::subject(
+            "1",
+            vec![dose],
+            obs_times,
+            vec![0.0; n],
+            vec![2; n], // observe central
+        )],
+    };
+    let preds = predict(&model, &pop, &model.default_params);
+
+    // central starts empty (the zero-order input fills the depot first, then ka
+    // transfers) and the full dose still reaches central: ∫central dt = Dose/ke.
+    assert!(preds[0].pred.abs() < 1e-12, "central(0) should be 0");
+    let auc: f64 = preds
+        .windows(2)
+        .map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time))
+        .sum();
+    let auc_inf = 100.0 * 50.0 / 5.0;
+    let rel = (auc - auc_inf).abs() / auc_inf;
+    assert!(
+        rel < 0.02,
+        "sequential central AUC {auc:.4} vs Dose·V/CL {auc_inf:.4} (rel err {rel:.2e})"
+    );
+}
+
+#[test]
+fn zero_order_on_analytical_pk_is_rejected_pointing_at_ode_template() {
+    // The error rule end-to-end: a `zero_order()` input rate on an analytical `pk`
+    // disposition is a hard error pointing at `ode_template`, never a silent
+    // analytical→ODE swap. (`zero_order` ships ODE-only in #504; it leaves the
+    // ODE-only list when its closed-form acceleration lands.)
+    let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVDUR(3.0, 0.05, 24.0)
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL
+  V   = TVV
+  KA  = TVKA
+  DUR = TVDUR
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[odes]
+  d/dt(depot) = zero_order(dur=DUR) - KA*depot
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let err = match parse_full_model(src) {
+        Ok(_) => panic!("pk + zero_order() must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("ode_template"),
+        "error should point at ode_template, got: {err}"
+    );
+    assert!(
+        err.contains("zero_order"),
+        "error should name the zero_order function, got: {err}"
+    );
+}
+
+#[test]
+fn zero_order_normal_dosing_passes_data_checks() {
+    // Positive control: ordinary (non-SS, bolus) dosing into the zero_order
+    // compartment raises no absorption diagnostic.
+    use ferx_core::check_model_data;
+    let model = parse_full_model(ZERO_ORDER_MODEL)
+        .expect("zero_order model parses")
+        .model;
+    let pop = pop_single(vec![0.5, 1.0, 2.0, 4.0, 8.0], 0.0);
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        !diags.iter().any(|d| d.code.starts_with("E_ABSORPTION")),
+        "unexpected absorption diagnostic: {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn zero_order_steady_state_dosing_is_rejected() {
+    // SS=1 into a zero_order compartment is rejected (E_ABSORPTION_SS): the
+    // steady-state equilibration applies the dose as a bolus pulse, not as the
+    // zero-order input over the cycle. Kind-agnostic, inherited from transit/igd.
+    use ferx_core::check_model_data;
+    let model = parse_full_model(ZERO_ORDER_MODEL)
+        .expect("zero_order model parses")
+        .model;
+    let mut ss_dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+    ss_dose.ii = 12.0;
+    let pop = Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![common::subject(
+            "1",
+            vec![ss_dose],
+            vec![1.0, 4.0, 8.0],
+            vec![0.0; 3],
+            vec![1; 3],
+        )],
+    };
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags.iter().any(|d| d.code == "E_ABSORPTION_SS"),
+        "SS into a zero_order compartment must raise E_ABSORPTION_SS, got: {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+/// Tier-3 (slow): full FOCEI fit recovering the zero-order **duration**. Gated out
+/// of the default PR job; runs nightly / on estimation-touching pushes.
+///
+/// Generates a noise-free single-dose curve at the truth (`DUR = 4 h`), then fits
+/// it back from a **perturbed** start (`DUR = 2 h`) — so the optimiser must climb
+/// the duration, not merely sit at the truth — and asserts it recovers `DUR ≈ 4`.
+/// This exercises the FD sensitivity of the moving-boundary `dur` end-to-end (the
+/// gradient path #504 ships, ahead of the analytic boundary impulse in #530).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn zero_order_fit_recovers_duration() {
+    use ferx_core::{fit, FitOptions};
+
+    let model = parse_full_model(ZERO_ORDER_MODEL)
+        .expect("zero_order model parses")
+        .model;
+
+    // Noise-free data at the truth: predictions at the typical values become the
+    // observations, so the likelihood optimum sits at the data-generating params.
+    let obs_times: Vec<f64> = (1..=40).map(|i| i as f64 * 0.5).collect();
+    let truth = predict(
+        &model,
+        &pop_single(obs_times.clone(), 0.0),
+        &model.default_params,
+    );
+    let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
+    let n = obs_times.len();
+    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+    let pop = Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![common::subject("1", vec![dose], obs_times, obs, vec![1; n])],
+    };
+
+    // Perturb the initial duration (theta[2]) to 2 h so the fit has to move it.
+    let mut init = model.default_params.clone();
+    init.theta[2] = 2.0;
+    let fitted = fit(&model, &pop, &init, &FitOptions::default()).expect("fit converges");
+
+    assert!(fitted.converged, "zero_order fit should converge");
+    let dur = fitted.theta[2];
+    assert!(
+        (dur - 4.0).abs() / 4.0 < 0.10,
+        "recovered DUR {dur:.4} should be within 10% of the truth (4.0)"
+    );
+}

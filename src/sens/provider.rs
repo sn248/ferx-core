@@ -2210,11 +2210,20 @@ fn apply_expression_scale<const M: usize>(
     let inv2 = inv * inv;
     let inv3 = inv2 * inv;
 
+    // The Hessian update reads the *original* `∂f/∂η` / `∂f/∂θ` across the whole k/l
+    // double loop, so they must be snapshotted before `o.df_deta` / `o.df_dtheta` are
+    // overwritten in place. Reuse two scratch buffers across observations rather than
+    // cloning per row — `2` allocations per call instead of `2·n_obs` on subjects with
+    // many observations (#534 review #2).
+    let mut fk: Vec<f64> = Vec::with_capacity(n_eta);
+    let mut fm: Vec<f64> = Vec::with_capacity(n_theta);
     for o in sens.obs.iter_mut() {
         let f = o.f;
-        let fk = o.df_deta.clone(); // original ∂f/∂η
-        let fm = o.df_dtheta.clone(); // original ∂f/∂θ
-                                      // η-η Hessian.
+        fk.clear();
+        fk.extend_from_slice(&o.df_deta); // original ∂f/∂η
+        fm.clear();
+        fm.extend_from_slice(&o.df_dtheta); // original ∂f/∂θ
+                                            // η-η Hessian.
         for k in 0..n_eta {
             for l in 0..n_eta {
                 let idx = k * n_eta + l;

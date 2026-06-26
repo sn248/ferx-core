@@ -2860,8 +2860,10 @@ mod iov_tests {
     /// IOV + `iiv_on_ruv` fit would build the inner gradient on an unscaled residual
     /// variance, and `gradient = fd` would silently fail to disable the analytic inner.
     /// (`ExpressionScale` is no longer a common bail — the non-IOV analytical inner serves
-    /// it via the quotient rule; IOV keeps declining it through `iov_analytical_supported`,
-    /// asserted by the `iov_sens_supported` checks below.)
+    /// it via the quotient rule; IOV keeps declining an η-dependent `obs_scale` through its
+    /// own gate — `ScalingSpec::None` required by `ode_iov_supported` here, and by
+    /// `iov_analytical_supported` for the closed-form path — pinned by the final
+    /// `iov_sens_supported` assertion below.)
     #[test]
     fn iov_inner_honours_common_bails() {
         use crate::parser::model_parser::parse_model_string;
@@ -2898,6 +2900,27 @@ mod iov_tests {
         );
         model.residual_error_eta = None;
         assert!(crate::sens::provider::iov_sens_supported(&model));
+
+        // IOV + η-dependent `ExpressionScale` `obs_scale` must route to FD: neither IOV
+        // provider applies the `d(obs_scale)/d(stacked-η)` quotient term, so both gates
+        // require `ScalingSpec::None` (`iov_analytical_supported` / `ode_iov_supported`).
+        // Pin it here so a later loosening of either requirement can't silently run the
+        // analytic IOV inner gradient with the scale derivative dropped (#534 review #5).
+        let iov_scaled = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV + obs_scale");
+        assert!(
+            matches!(
+                iov_scaled.scaling,
+                crate::types::ScalingSpec::ExpressionScale { .. }
+            ),
+            "obs_scale = 1000/V must parse as an η-dependent ExpressionScale"
+        );
+        assert!(
+            !crate::sens::provider::iov_sens_supported(&iov_scaled),
+            "IOV + η-dependent obs_scale must route to FD (neither IOV provider carries the scale derivative)"
+        );
     }
 
     /// Pinning `inner_optimizer` to dense BFGS vs L-BFGS must reach the *same* EBE

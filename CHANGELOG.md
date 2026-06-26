@@ -120,10 +120,17 @@ section of the SDLC for the versioning policy).
   references a covariate absent from the dataset now fails loudly with
   `E_MISSING_COVARIATE` (and undeclared-but-present covariates raise the usual
   warning), where previously the missing value silently read as `0.0`. **NONMEM
-  comparison:** for time-constant covariates the readout is byte-identical to the
-  prior behaviour; the paired total/free-assay regression
-  (`ode_event_driven_form_c_uses_observation_covariates`) pins the time-varying
-  case.
+  comparison:** validated against the `fluconazole_radboudumc` model (ADVAN3 TRANS4
+  with a free/total protein-binding `$ERROR` that selects `CTOT` when `FREE==0` and
+  `CU` when `FREE==1` — paired assay rows at the same time). Evaluated at identical
+  parameters, ferx's per-record population predictions match NONMEM's `PRED` to
+  ~1e-4 relative on **both** the total-assay and free-assay rows (e.g. subject 1 at
+  t=1: ferx 21.5105 / 2.9070 vs NONMEM 21.511 / 2.907), confirming the readout reads
+  each observation's own `FREE` value rather than the subject's first row. (The two
+  rows at a given time differ only by that per-record covariate.) For time-constant
+  covariates the readout is byte-identical to the prior behaviour; the
+  `ode_event_driven_form_c_uses_observation_covariates` unit test pins the
+  per-observation path.
 - **Gradient-based outer optimizers now precondition with magnitude scaling
   (`Abs`) instead of bound-half-width (`Rescale2`).** Under the default
   `optimizer = auto` (which resolves to NLopt L-BFGS when an analytic gradient is

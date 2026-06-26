@@ -181,6 +181,57 @@ fn zero_order_equals_explicit_infusion_of_the_same_duration() {
     }
 }
 
+#[test]
+fn zero_order_restarts_after_reset_event_driven_path() {
+    // A system reset (EVID=3/4) routes the subject through the event-driven walker
+    // (not the dense `ode_predictions` loop), exercising the zero-order delivery on
+    // that path — its per-dose-snapshot windows and reset-floor handling. Dose at
+    // t=0 (window [0,4]); reset at t=12 zeros the state; re-dose at t=12 (window
+    // [12,16]). From a freshly-zeroed system the second cycle reproduces the first,
+    // so the concentration at matched offsets after each dose must coincide.
+    let model = parse_full_model(ZERO_ORDER_MODEL)
+        .expect("zero_order model parses")
+        .model;
+
+    let obs_times = vec![2.0, 4.0, 8.0, 14.0, 16.0, 20.0]; // offsets 2/4/8 in each cycle
+    let n = obs_times.len();
+    let mut subject = common::subject(
+        "1",
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times,
+        vec![0.0; n],
+        vec![1; n],
+    );
+    subject.reset_times = vec![12.0]; // EVID=3 reset at t=12 → event-driven path
+    let pop = Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![subject],
+    };
+    let preds = predict(&model, &pop, &model.default_params);
+
+    // pred(12 + x) == pred(x) for x ∈ {2, 4, 8}: the reset + re-dose reproduce the
+    // first cycle's zero-order absorption exactly.
+    for (first, second) in [(0, 3), (1, 4), (2, 5)] {
+        assert!(
+            (preds[first].pred - preds[second].pred).abs()
+                <= 1e-6 * (1.0 + preds[first].pred.abs()),
+            "post-reset cycle should mirror the first at offset {}: {} vs {}",
+            preds[first].time,
+            preds[first].pred,
+            preds[second].pred
+        );
+    }
+    // Sanity: the curve is non-trivial (not all zero).
+    assert!(preds[1].pred > 1.0, "expected a real concentration at t=4");
+}
+
 /// `sequential` absorption: `zero_order(dur)` fills a depot, emptied to central by
 /// a hand-written first-order `- KA*depot` (no new intrinsic). central (CMT 2)
 /// holds the amount; the depot is CMT 1 and receives the zero-order input.

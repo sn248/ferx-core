@@ -472,59 +472,86 @@ pub(crate) fn active_infusions(
         .collect()
 }
 
-/// Per-segment **constant** zero-order absorption rates active over the closed
-/// segment `[t_start, t_end]` — the artifact-free analogue of [`active_infusions`]
-/// for `zero_order(dur)` forcings (#504).
+/// One dose's zero-order absorption window, precomputed **once per subject** as
+/// `(cmt_idx, rate, w_start, w_end)` — the constant `rate = F·amt/dur` delivered
+/// over `[w_start, w_end] = [time+lag, time+lag+dur]`. The precompute-once shape
+/// mirrors [`gated_infusions`].
 ///
-/// A zero-order input delivers a constant `F·amt/dur` over its window
-/// `(dose.time+lag, dose.time+lag+dur]`. Evaluating the hard `tad ≤ dur` cutoff
-/// **pointwise** inside RK45 mis-resolves the step: the post-cutoff segment's
-/// left endpoint (`t = dur`) still reads the in-window rate, so the adaptive
-/// solver's first stage there over-counts a sliver of mass. Delivering it as a
-/// per-segment constant — like an infusion — sidesteps that entirely: a segment is
-/// included **only if it lies fully inside** the window (`w_start ≤ t_start` and
-/// `w_end ≥ t_end`), so the post-cutoff segment (whose right end is past `w_end`)
-/// is correctly excluded. The break-time list splits at `dose.time+lag+dur` (see
-/// [`push_zero_order_break_times`]) so every segment is fully inside or outside
-/// each window — the invariant this full-containment test relies on, exactly as
-/// [`active_infusions`] relies on it for infusion windows. `reset_floor` turns off
-/// windows opened before the most recent reset (EVID=3/4).
-#[allow(clippy::too_many_arguments)] // mirrors `active_infusions` + the dose context
-fn active_zero_order_inputs(
-    ode: &OdeSpec,
+/// `dur`/`F`/`lag` are **dose-time** attributes (fixed when the dose is given), so
+/// computing the window and its rate once — from the dose's own PK snapshot — and
+/// reusing them across every segment is what keeps `∫R_in = F·amt` exact even
+/// under time-varying covariates: recomputing the rate per segment from the
+/// running snapshot would let it drift mid-window and silently break mass balance.
+type ZeroOrderWindow = (usize, f64, f64, f64);
+
+/// Build the per-dose [`ZeroOrderWindow`]s for a subject. `dur_for_dose` yields the
+/// floored `dur` for dose `k` from *its* PK snapshot — a single subject snapshot on
+/// the dense paths, the per-dose `pk_at_dose[k]` on the time-varying / event-driven
+/// path — so the window edges and rate stay consistent with that snapshot wherever
+/// it is also read (the break placement and the per-segment filter share this one
+/// source). Doses not feeding a `zero_order` forcing contribute no window.
+fn zero_order_windows(
     doses: &[DoseEvent],
-    t_start: f64,
-    t_end: f64,
     dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
-    pk_params: &[f64],
-    reset_floor: f64,
-) -> Vec<(usize, f64)> {
+    dur_for_dose: impl Fn(usize, &DoseEvent) -> Option<f64>,
+) -> Vec<ZeroOrderWindow> {
     let mut out = Vec::new();
     for (k, d) in doses.iter().enumerate() {
-        let Some(dur) = zero_order_dur_for_dose(ode, d, pk_params) else {
+        let Some(dur) = dur_for_dose(k, d) else {
             continue;
         };
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+        let f_bio = dose_f_bio.get(k).copied().unwrap_or(1.0);
         let w_start = d.time + lag;
-        let w_end = w_start + dur;
-        if w_start >= reset_floor
-            && w_start <= t_start + INFUSION_EPS
-            && w_end >= t_end - INFUSION_EPS
-        {
-            let f_bio = dose_f_bio.get(k).copied().unwrap_or(1.0);
-            out.push((d.cmt.saturating_sub(1), f_bio * d.amt / dur));
-        }
+        out.push((
+            d.cmt.saturating_sub(1),
+            f_bio * d.amt / dur,
+            w_start,
+            w_start + dur,
+        ));
     }
     out
 }
 
+/// The per-segment **constant** zero-order rates whose window fully contains the
+/// closed segment `[t_start, t_end]` — the artifact-free analogue of
+/// [`active_infusions`] for `zero_order(dur)` forcings (#504).
+///
+/// A zero-order input delivers a constant `F·amt/dur` over its window. Evaluating
+/// the hard `tad ≤ dur` cutoff **pointwise** inside RK45 mis-resolves the step: the
+/// post-cutoff segment's left endpoint (`t = dur`) still reads the in-window rate,
+/// so the adaptive solver's first stage there over-counts a sliver of mass.
+/// Delivering it as a per-segment constant — like an infusion — sidesteps that: a
+/// window is included **only if it fully contains the segment** (`w_start ≤ t_start`
+/// and `w_end ≥ t_end`), so the post-cutoff segment (whose right end is past
+/// `w_end`) is correctly excluded. The break-time list splits at `w_end` (see
+/// [`push_zero_order_break_times`]) so every segment is fully inside or outside each
+/// window — the invariant this test relies on, exactly as [`active_infusions`]
+/// relies on it for infusion windows. `reset_floor` turns off windows opened before
+/// the most recent reset (EVID=3/4).
+fn active_zero_order_inputs(
+    windows: &[ZeroOrderWindow],
+    t_start: f64,
+    t_end: f64,
+    reset_floor: f64,
+) -> Vec<(usize, f64)> {
+    windows
+        .iter()
+        .filter(|&&(_, _, w_start, w_end)| {
+            w_start >= reset_floor
+                && w_start <= t_start + INFUSION_EPS
+                && w_end >= t_end - INFUSION_EPS
+        })
+        .map(|&(cmt, rate, _, _)| (cmt, rate))
+        .collect()
+}
+
 /// The floored zero-order duration `dur` for `dose`, if `dose` feeds a
 /// `zero_order(dur)` forcing (positive amount into that forcing's compartment);
-/// else `None`. Single source of the window length `dur` shared by the break /
-/// timeline placement ([`push_zero_order_break_times`], the event-driven timeline)
-/// and the per-segment constant ([`active_zero_order_inputs`]) — read through
-/// [`PreparedInputRate`] so it is floored identically to the `R_in` evaluation.
+/// else `None`. The window length read through [`PreparedInputRate`] (so it is
+/// floored identically to the `R_in` evaluation); used by the [`zero_order_windows`]
+/// `dur_for_dose` closures and the event-driven timeline's cutoff break.
 fn zero_order_dur_for_dose(ode: &OdeSpec, dose: &DoseEvent, pk_params: &[f64]) -> Option<f64> {
     if dose.amt <= 0.0 {
         return None;
@@ -556,32 +583,22 @@ pub(crate) fn input_rate_consumes_cmt(ode: &OdeSpec, cmt_1based: usize) -> bool 
             .any(|f| f.cmt == cmt_1based.saturating_sub(1))
 }
 
-/// Push the hard-cutoff break times contributed by `zero_order(dur)` forcings
-/// (#504) onto a dense-path `break_times` list.
+/// Push the hard-cutoff break times — each window's end `w_end` — for the
+/// subject's precomputed zero-order windows (#504) onto a dense-path `break_times`
+/// list.
 ///
-/// A zero-order input delivers a constant `dose/dur` over `(0, dur]` then stops —
-/// a step discontinuity at `tad = dur` that the smooth densities
-/// (transit/igd/weibull) don't have. Without a break there, the adaptive RK45
-/// steps across the cutoff and mis-resolves the absorbed mass, so the integration
-/// timeline must break at `dose.time + lag + dur` for every dose feeding a
-/// zero-order compartment — exactly mirroring the infusion-end break at
-/// `dose.time + lag + dur_eff`. `dur` is read from the forcing's argument slot via
-/// [`PreparedInputRate`], so it is floored identically to the `R_in` evaluation
-/// (no domain-wall drift between the break and the rate). Doses turned off by a
-/// later reset still get a harmless extra break (over-segmentation only). Smooth
-/// forcings contribute nothing. No-op for the common model with no input rate.
-fn push_zero_order_break_times(
-    break_times: &mut Vec<f64>,
-    ode: &OdeSpec,
-    doses: &[DoseEvent],
-    dose_lagtimes: &[f64],
-    pk_params: &[f64],
-) {
-    for (i, dose) in doses.iter().enumerate() {
-        if let Some(dur) = zero_order_dur_for_dose(ode, dose, pk_params) {
-            break_times.push(dose.time + dose_lagtimes[i] + dur);
-        }
-    }
+/// A zero-order input delivers a constant rate over `[w_start, w_end]` then stops —
+/// a step discontinuity at `w_end` that the smooth densities (transit/igd/weibull)
+/// don't have. Without a break there, the adaptive RK45 steps across the cutoff and
+/// mis-resolves the absorbed mass, so the timeline must break at `w_end` for every
+/// zero-order window — exactly mirroring the infusion-end break. Because the break
+/// reads `w_end` from the same [`ZeroOrderWindow`] the per-segment filter uses
+/// ([`active_zero_order_inputs`]), the segment edge and the containment boundary
+/// can't drift apart. Doses turned off by a later reset still get a harmless extra
+/// break (over-segmentation only). No-op for the common model with no zero-order
+/// window.
+fn push_zero_order_break_times(break_times: &mut Vec<f64>, windows: &[ZeroOrderWindow]) {
+    break_times.extend(windows.iter().map(|&(_, _, _, w_end)| w_end));
 }
 
 /// How a segment's infusions are injected as a `+rate` derivative term in the
@@ -1068,17 +1085,14 @@ fn integrate_segment(
         f64::NEG_INFINITY,
     );
     // Zero-order absorption windows fully covering this segment (#504): constant
-    // `F·amt/dur` injected like a spanning infusion. (Empty for the common model.)
-    let zero_order = active_zero_order_inputs(
-        ode,
-        &subject.doses,
-        t_start,
-        t_end,
-        dose_lagtimes,
-        dose_f_bio,
-        ext_params,
-        f64::NEG_INFINITY,
-    );
+    // `F·amt/dur` injected like a spanning infusion. The dense path has a single
+    // subject snapshot (`pk_params_flat`), so the windows are the same every
+    // segment and consistent with `ode_predictions`' break placement. (Empty for
+    // the common model / a non-zero_order subject — e.g. the adaptive caller.)
+    let zo_windows = zero_order_windows(&subject.doses, dose_lagtimes, dose_f_bio, |_, d| {
+        zero_order_dur_for_dose(ode, d, pk_params_flat)
+    });
+    let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, f64::NEG_INFINITY);
     // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
     // snapshot `ext_params` is constant across the integration (#322 #7).
     let prepared = prepare_input_rates(ode, ext_params);
@@ -1216,13 +1230,14 @@ pub fn ode_predictions(
             break_times.push(dose.time);
         }
     }
-    push_zero_order_break_times(
-        &mut break_times,
-        ode,
-        &subject.doses,
-        &dose_lagtimes,
-        pk_params_flat,
-    );
+    // Zero-order windows for this subject (#504): the dense paths have a single
+    // PK snapshot, so the per-dose `dur`/`F`/`lag` come from `pk_params_flat`.
+    // Break at each window end so segments align with the cutoff, and reuse the
+    // same windows for the per-segment constant-rate injection below.
+    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
+        zero_order_dur_for_dose(ode, d, pk_params_flat)
+    });
+    push_zero_order_break_times(&mut break_times, &zo_windows);
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
@@ -1983,6 +1998,16 @@ pub fn ode_predictions_event_driven(
             .then_with(|| kind_order(a.1).cmp(&kind_order(b.1)))
     });
 
+    // Zero-order windows (#504) read from each dose's **own** PK snapshot
+    // (`pk_at_dose[k]`) — the same per-dose source as the timeline cutoff above, so
+    // the window edge `w_end` and the per-segment containment test below agree, and
+    // the constant rate `F·amt/dur` is fixed at dose time (mass-exact even when
+    // `dur` rides a time-varying covariate, where a per-segment recompute would
+    // drift). Precomputed once here, then filtered per segment in the loop.
+    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |k, d| {
+        zero_order_dur_for_dose(ode, d, &pk_at_dose[k].values)
+    });
+
     let mut cur_t = timeline[0].0;
     // Most-recent NONMEM record's PK params, used to integrate segments
     // ending at an infusion-end (which is not a record and carries no PK).
@@ -2056,16 +2081,12 @@ pub fn ode_predictions_event_driven(
             // Zero-order absorption windows covering [cur_t, t_event] (#504),
             // reset-aware via the same `reset_floor` (a window opened pre-reset
             // is off). Constant `F·amt/dur`, injected like a spanning infusion.
-            let zero_order = active_zero_order_inputs(
-                ode,
-                &subject.doses,
-                cur_t,
-                t_event,
-                &dose_lagtimes,
-                &dose_f_bio,
-                &ext_params_ed,
-                reset_floor,
-            );
+            // `zo_windows` is precomputed once from the per-dose `pk_at_dose`
+            // snapshots (below), the same source as the timeline's cutoff break —
+            // so the window edge and the containment boundary can't drift apart,
+            // and the constant rate is fixed at dose time (mass-exact under
+            // time-varying covariates).
+            let zero_order = active_zero_order_inputs(&zo_windows, cur_t, t_event, reset_floor);
             // Hoist the input-rate constants once per segment (#322 #7); the
             // segment PK snapshot `ext_params_ed` is constant for the integration.
             let prepared = prepare_input_rates(ode, &ext_params_ed);
@@ -2386,13 +2407,14 @@ pub fn ode_predictions_with_states(
             break_times.push(dose.time);
         }
     }
-    push_zero_order_break_times(
-        &mut break_times,
-        ode,
-        &subject.doses,
-        &dose_lagtimes,
-        pk_params_flat,
-    );
+    // Zero-order windows for this subject (#504): the dense paths have a single
+    // PK snapshot, so the per-dose `dur`/`F`/`lag` come from `pk_params_flat`.
+    // Break at each window end so segments align with the cutoff, and reuse the
+    // same windows for the per-segment constant-rate injection below.
+    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
+        zero_order_dur_for_dose(ode, d, pk_params_flat)
+    });
+    push_zero_order_break_times(&mut break_times, &zo_windows);
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
@@ -2516,16 +2538,7 @@ pub fn ode_predictions_with_states(
         let gated = gated_infusions(&active_infusions, &subject.doses, &dose_f_bio, n);
         // Zero-order absorption windows covering this segment (#504): constant
         // `F·amt/dur` injected alongside the gated infusions (empty otherwise).
-        let zero_order = active_zero_order_inputs(
-            ode,
-            &subject.doses,
-            t_start,
-            t_end,
-            &dose_lagtimes,
-            &dose_f_bio,
-            &ext_params,
-            f64::NEG_INFINITY,
-        );
+        let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, f64::NEG_INFINITY);
         // Hoist the input-rate constants once per segment (#322 #7).
         let prepared = prepare_input_rates(ode, &ext_params);
         let wrapped_rhs = wrap_rhs_with_forcings(
@@ -2726,13 +2739,14 @@ pub fn ode_dense_solve_states(
     for &rt in &subject.reset_times {
         break_times.push(rt);
     }
-    push_zero_order_break_times(
-        &mut break_times,
-        ode,
-        &subject.doses,
-        &dose_lagtimes,
-        pk_params_flat,
-    );
+    // Zero-order windows for this subject (#504): the dense paths have a single
+    // PK snapshot, so the per-dose `dur`/`F`/`lag` come from `pk_params_flat`.
+    // Break at each window end so segments align with the cutoff, and reuse the
+    // same windows for the per-segment constant-rate injection below.
+    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
+        zero_order_dur_for_dose(ode, d, pk_params_flat)
+    });
+    push_zero_order_break_times(&mut break_times, &zo_windows);
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
@@ -2861,16 +2875,7 @@ pub fn ode_dense_solve_states(
         // Zero-order absorption windows covering this segment (#504): constant
         // `F·amt/dur`, reset-aware via the same `reset_floor` (a window opened
         // pre-reset is off), injected alongside the gated infusions.
-        let zero_order = active_zero_order_inputs(
-            ode,
-            &subject.doses,
-            t_start,
-            t_end,
-            &dose_lagtimes,
-            &dose_f_bio,
-            &ext_params,
-            reset_floor,
-        );
+        let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, reset_floor);
         // Hoist the input-rate constants once per segment (#322 #7).
         let prepared = prepare_input_rates(ode, &ext_params);
         let wrapped_rhs = wrap_rhs_with_forcings(
@@ -4659,34 +4664,69 @@ mod tests {
         v
     }
 
+    /// Build the per-dose windows from a single subject snapshot (the dense-path
+    /// shape) — the test analogue of the `|_, d| zero_order_dur_for_dose(...)`
+    /// closure the production callers pass.
+    fn zo_windows_for(
+        ode: &OdeSpec,
+        doses: &[DoseEvent],
+        lags: &[f64],
+        pk: &[f64],
+    ) -> Vec<ZeroOrderWindow> {
+        let f_bio: Vec<f64> = doses.iter().map(|_| 1.0).collect();
+        zero_order_windows(doses, lags, &f_bio, |_, d| {
+            zero_order_dur_for_dose(ode, d, pk)
+        })
+    }
+
     #[test]
-    fn push_zero_order_break_times_emits_cutoff_at_dose_plus_lag_plus_dur() {
-        // A dose at t=2 into the zero-order compartment, lag 0.5, dur 4 ⇒ a break
-        // at 2 + 0.5 + 4 = 6.5. A dose into a *different* compartment, and a
-        // zero-amount dose, contribute no cutoff.
+    fn zero_order_window_edges_rate_and_cutoff_break() {
+        // A dose at t=2 into the zero-order compartment, lag 0.5, dur 4 ⇒ a window
+        // [2.5, 6.5] with rate F·amt/dur = 100/4 = 25, and a cutoff break at 6.5. A
+        // dose into a *different* compartment, and a zero-amount dose, contribute no
+        // window (so no break).
         let ode = zero_order_accumulator_spec(); // cmt 0 ≡ 1-based CMT 1
         let pk = pk_zero_order_vec(4.0, 1.0);
         let doses = vec![
             DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0), // feeds R_in
-            DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0), // other cmt → no cutoff
-            DoseEvent::new(1.0, 0.0, 1, 0.0, false, 0.0),   // zero amt → no cutoff
+            DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0), // other cmt → no window
+            DoseEvent::new(1.0, 0.0, 1, 0.0, false, 0.0),   // zero amt → no window
         ];
-        let lags = vec![0.5, 0.0, 0.0];
+        let windows = zo_windows_for(&ode, &doses, &[0.5, 0.0, 0.0], &pk);
+        assert_eq!(windows, vec![(0, 25.0, 2.5, 6.5)]);
+
         let mut breaks = Vec::new();
-        push_zero_order_break_times(&mut breaks, &ode, &doses, &lags, &pk);
+        push_zero_order_break_times(&mut breaks, &windows);
         assert_eq!(breaks, vec![6.5]);
     }
 
     #[test]
-    fn smooth_forcing_contributes_no_zero_order_break() {
-        // transit/igd/weibull are smooth (no cutoff) — the helper must emit nothing
-        // for them, so they keep their existing break structure.
+    fn active_zero_order_includes_only_fully_contained_segments() {
+        // Window [2.5, 6.5], rate 25. A segment strictly inside is active; a segment
+        // straddling the cutoff (right end past w_end) is excluded — the
+        // full-containment rule that makes the post-cutoff mass exact. A reset_floor
+        // after the window start turns it off.
+        let windows: Vec<ZeroOrderWindow> = vec![(0, 25.0, 2.5, 6.5)];
+        assert_eq!(
+            active_zero_order_inputs(&windows, 3.0, 5.0, f64::NEG_INFINITY),
+            vec![(0, 25.0)]
+        );
+        // [5, 7] ends past w_end=6.5 ⇒ not fully contained ⇒ excluded.
+        assert!(active_zero_order_inputs(&windows, 5.0, 7.0, f64::NEG_INFINITY).is_empty());
+        // [1, 2] precedes the window start ⇒ excluded.
+        assert!(active_zero_order_inputs(&windows, 1.0, 2.0, f64::NEG_INFINITY).is_empty());
+        // reset_floor past the window start (e.g. 3.0) turns the window off.
+        assert!(active_zero_order_inputs(&windows, 3.0, 5.0, 3.0).is_empty());
+    }
+
+    #[test]
+    fn smooth_forcing_contributes_no_zero_order_window() {
+        // transit/igd/weibull are smooth (no cutoff) — they yield no zero-order
+        // window, so they keep their existing break structure and pointwise forcing.
         let ode = transit_accumulator_spec();
         let pk = pk_transit_vec(3.0, 2.0, 1.0);
         let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
-        let mut breaks = Vec::new();
-        push_zero_order_break_times(&mut breaks, &ode, &doses, &[0.0], &pk);
-        assert!(breaks.is_empty());
+        assert!(zo_windows_for(&ode, &doses, &[0.0], &pk).is_empty());
     }
 
     #[test]

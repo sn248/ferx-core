@@ -75,6 +75,15 @@ at evaluation time — states from the ODE solver, individual parameters
 from the subject-static `pk_param_fn`, and thetas/etas/covariates from
 the values supplied by the caller.
 
+Covariates in a Form C expression are read from the **per-observation
+covariate snapshot** — the values on each observation's own data row — so
+a time-varying covariate drives the readout at the time it is observed
+(since #535/#538). Because a Form C covariate is therefore an input the
+prediction depends on, it is a **required data column**: if the readout
+references a covariate that is absent from the dataset the fit fails with
+`E_MISSING_COVARIATE` rather than silently reading the missing value as
+`0.0`. For time-constant covariates the readout is unchanged.
+
 Form C is only valid for ODE models. The parser rejects `y = ...` on
 analytical models with a clear error.
 

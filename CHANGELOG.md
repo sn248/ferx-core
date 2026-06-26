@@ -110,6 +110,20 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- **Form C (`[scaling] y = <expr>`) ODE readouts now use per-observation covariate
+  snapshots** (#535, #538). The explicit-output readout is evaluated against the
+  covariate values on each observation's own data row rather than the subject's
+  first-row values, so time-varying covariates referenced in a Form C expression
+  now drive predictions, diagnostics, and the adaptive-trial decision monitors at
+  the correct time. As a consequence, covariates referenced **only** from a Form C
+  expression are now treated as required data columns: a model whose readout
+  references a covariate absent from the dataset now fails loudly with
+  `E_MISSING_COVARIATE` (and undeclared-but-present covariates raise the usual
+  warning), where previously the missing value silently read as `0.0`. **NONMEM
+  comparison:** for time-constant covariates the readout is byte-identical to the
+  prior behaviour; the paired total/free-assay regression
+  (`ode_event_driven_form_c_uses_observation_covariates`) pins the time-varying
+  case.
 - **Exact analytic FOCE/FOCEI gradient for `iiv_on_ruv` (IIV on residual error).**
   Models with a residual-error eta (`Y = IPRED + EPS·EXP(η_ruv)`) now use the
   exact closed-form gradient on both the inner EBE and outer θ/Ω/σ loops, where

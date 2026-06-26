@@ -3622,6 +3622,52 @@ mod iov_tests {
         );
     }
 
+    /// Interaction of the #486 analytic `ExpressionScale` path with main's correlated
+    /// residual error (`block_sigma`): correlated residuals are not carried by the analytic
+    /// kernels, so a model with BOTH an η-dependent `obs_scale` and a residual correlation
+    /// must route to FD on BOTH loops (`analytic_inner_common_bail` true,
+    /// `analytic_outer_gradient_available` false) — the scale never bypasses the correlation
+    /// bail. The uncorrelated control proves it is the correlation, not the scale, forcing FD.
+    /// Pins the rebase merge of the two features.
+    #[test]
+    fn expression_scale_with_correlated_residual_routes_to_fd_both_loops() {
+        use crate::parser::model_parser::parse_model_string;
+        let corr = parse_model_string(
+            "[parameters]\n  theta TVCL(5.0,0.5,50.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n",
+        )
+        .expect("parse ExpressionScale + correlated residual");
+        assert!(
+            matches!(
+                corr.scaling,
+                crate::types::ScalingSpec::ExpressionScale { .. }
+            ) && !corr.residual_correlations.is_empty(),
+            "fixture must carry both an ExpressionScale obs_scale and a residual correlation"
+        );
+        assert!(
+            analytic_inner_common_bail(&corr),
+            "correlated residual must force the inner gradient to FD (not bypassed by obs_scale)"
+        );
+        assert!(
+            !crate::sens::provider::analytic_outer_gradient_available(&corr),
+            "correlated residual must force the outer gradient to FD"
+        );
+
+        // Control: same obs_scale, diagonal (uncorrelated) residual → analytic on both loops.
+        let diag = parse_model_string(
+            "[parameters]\n  theta TVCL(5.0,0.5,50.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.04\n  sigma ADD_ERR ~ 0.10\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n",
+        )
+        .expect("parse ExpressionScale + diagonal residual");
+        assert!(diag.residual_correlations.is_empty());
+        assert!(
+            !analytic_inner_common_bail(&diag),
+            "uncorrelated ExpressionScale must stay analytic inner (the scale alone is fine)"
+        );
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(&diag),
+            "uncorrelated ExpressionScale must stay analytic outer"
+        );
+    }
+
     // `analytical_ad_unsupported` is the VESTIGIAL retired-AD classifier (not consulted by
     // live routing; the live gate is `analytic_inner_grad_supported[_model]`). It still flags
     // four genuinely out-of-scope classes (non-log-normal ETA, LTBS, conditional params, TTE)

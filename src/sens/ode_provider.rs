@@ -89,6 +89,23 @@ const _: () = assert!(
      to match, then update this assert"
 );
 
+// An η-dependent `ExpressionScale` admitted by `ode_analytical_supported` (bounded by
+// `MAX_ODE_AXES` above) has its quotient applied *post-walk* through
+// `provider::apply_expression_scale_outer` / `_inner_dispatch`, whose `dispatch_init_impulse!`
+// tables are bounded by `MAX_SCALE_AXES` with a **silent `_ => {}`** (no-op, not `None`/FD).
+// The static walk itself dispatches on the PK-param count (`n_indiv ≤ 12`), independent of
+// `n_axes = n_theta + n_eta`, so a many-θ model can build the walk while `n_axes` exceeds the
+// scale table — and the scale would be silently dropped, yielding an *unscaled* analytic
+// gradient rather than an FD fallback. Couple the two caps so widening the ODE axis cap
+// without widening the scale dispatch fails to compile (#534 adversarial audit).
+const _: () = assert!(
+    MAX_ODE_AXES <= crate::sens::provider::MAX_SCALE_AXES,
+    "MAX_ODE_AXES exceeds MAX_SCALE_AXES: an ODE ExpressionScale model with n_axes in \
+     (MAX_SCALE_AXES, MAX_ODE_AXES] passes ode_analytical_supported but hits the silent `_` \
+     arm of dispatch_init_impulse! and silently drops the obs_scale quotient. Widen \
+     MAX_SCALE_AXES (and its dispatch_init_impulse! table) to at least MAX_ODE_AXES."
+);
+
 /// True when [`ode_subject_sensitivities`] can serve this model: an ODE model
 /// with a compiled RHS program, single `ObsCmt` readout, no built-in absorption,
 /// no `init(...)`, no IOV/SDE, no output transform, and an individual-parameter

@@ -234,7 +234,7 @@ fn init_supported(model: &CompiledModel) -> bool {
 
 /// Maximum `(θ, η)` axis count for the differentiable `ExpressionScale` program
 /// (the `Dual2<M>` dispatch table). Beyond this the scale falls back to FD.
-const MAX_SCALE_AXES: usize = 16;
+pub(crate) const MAX_SCALE_AXES: usize = 16;
 
 /// Monomorphize an axis-parametrized helper on a runtime axis count, dispatching
 /// `$apply::<K>(args…)` over the `1..=MAX_SCALE_AXES` table. Written **once** and

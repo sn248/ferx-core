@@ -1059,13 +1059,13 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
 
     if !model.residual_correlations.is_empty() {
         for &m in &chain {
-            if m != EstimationMethod::Foce {
+            if !matches!(m, EstimationMethod::Foce | EstimationMethod::Saem) {
                 diags.push(
                     Diagnostic::error(
                         "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
                         "block_sigma correlated residual errors are currently supported for \
-                         method = foce only. FOCEI, GN, SAEM, and importance-sampling paths \
-                         still use diagonal residual-error derivatives.",
+                         method = foce and method = saem only. FOCEI, GN, and \
+                         importance-sampling paths still use diagonal residual-error derivatives.",
                     )
                     .with_block("fit_options"),
                 );
@@ -1109,6 +1109,26 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     "block_sigma correlated residual errors are not yet supported with \
                      inter-occasion variability (κ / [iov]) because the IOV inner \
                      objective does not yet use the full residual covariance matrix.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if model.is_sde() {
+            diags.push(
+                Diagnostic::error(
+                    "E_BLOCK_SIGMA_SDE_UNSUPPORTED",
+                    "block_sigma correlated residual errors are not yet supported with \
+                     SDE / EKF process-noise likelihoods.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if model.has_tte() {
+            diags.push(
+                Diagnostic::error(
+                    "E_BLOCK_SIGMA_TTE_UNSUPPORTED",
+                    "block_sigma correlated residual errors are not yet supported with \
+                     time-to-event endpoints.",
                 )
                 .with_block("fit_options"),
             );
@@ -6142,10 +6162,10 @@ mod iov_integration {
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
     }
 
-    // block_sigma correlated residual errors are only wired into FOCE; every
-    // other method in the chain must be rejected up front (PR #545).
+    // block_sigma correlated residual errors are wired into ordinary Gaussian
+    // FOCE and SAEM; every other method in the chain must be rejected up front.
     #[test]
-    fn test_check_model_options_block_sigma_rejects_non_foce() {
+    fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
         let mut model =
             crate::types::test_helpers::analytical_model(crate::types::GradientMethod::Fd);
         model.residual_correlations = vec![crate::types::ResidualCorrelation {
@@ -6161,11 +6181,11 @@ mod iov_integration {
             .iter()
             .find(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED")
             .expect("expected E_BLOCK_SIGMA_METHOD_UNSUPPORTED for FOCEI");
-        assert!(d.is_error() && d.message.contains("method = foce"));
+        assert!(d.is_error() && d.message.contains("method = foce") && d.message.contains("saem"));
 
-        // SAEM is rejected too.
+        // SAEM is accepted for the ordinary Gaussian subset.
         let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
-        assert!(super::check_model_options(&model, &saem)
+        assert!(!super::check_model_options(&model, &saem)
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
 
@@ -6174,6 +6194,96 @@ mod iov_integration {
         assert!(!super::check_model_options(&model, &foce)
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+
+        model.n_kappa = 1;
+        assert!(super::check_model_options(&model, &saem)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_IOV_UNSUPPORTED"));
+    }
+
+    #[test]
+    fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
+    0.04,
+    0.01, 0.09
+  ]
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y[CMT=1] = 2.0 * central / V
+  y[CMT=2] = central / V
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
+  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
+",
+        )
+        .expect("cross-endpoint block_sigma ODE model parses");
+
+        let mut subjects = Vec::new();
+        for (id, dose_amt, obs) in [
+            ("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]),
+            ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
+        ] {
+            subjects.push(Subject {
+                id: id.into(),
+                doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 1.0, 2.0, 2.0],
+                obs_raw_times: Vec::new(),
+                observations: obs,
+                obs_cmts: vec![1, 2, 1, 2],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 4],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            });
+        }
+        let population = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut opts = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        opts.saem_n_exploration = 1;
+        opts.saem_n_convergence = 0;
+        opts.saem_n_mh_steps = 1;
+        opts.saem_adapt_interval = 10;
+        opts.saem_omega_burnin = 0;
+        opts.saem_seed = Some(548);
+
+        let result = fit(&model, &population, &model.default_params, &opts)
+            .expect("SAEM fit with cross-endpoint block_sigma should succeed");
+        assert!(result.ofv.is_finite(), "SAEM OFV must be finite");
     }
 
     #[test]

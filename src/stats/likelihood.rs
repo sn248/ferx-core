@@ -294,25 +294,58 @@ pub(crate) fn obs_nll_subject_into(
     // FREM covariate rows keep their own (unscaled) EPSCOV variance.
     let ruv_scale = model.residual_var_scale(eta);
     let mut nll = 0.0;
-    for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-        let frem_var = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
-        // FREM covariate pseudo-observations predict a covariate *value* (any
-        // real: centered/standardized/log-scale covariates are routinely ≤ 0),
-        // not a concentration — do NOT clamp them to 1e-12. Clamping a negative
-        // covariate prediction up to 1e-12 fabricates a huge residual and, on the
-        // Rao-Blackwellised path, breaks the `obs_nll(η_c=d) ≈ const` assumption
-        // (#406). Ordinary PK rows keep the positivity clamp.
-        let f = if frem_var.is_some() { f } else { f.max(1e-12) };
-        let v = match frem_var {
-            Some(vv) => vv.max(1e-12),
-            None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale)
-                .max(1e-12),
+    let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
+    if !model.residual_correlations.is_empty() && !m3 && !has_frem_rows {
+        let preds_eval: Vec<f64> = preds.iter().map(|&f| f.max(1e-12)).collect();
+        let mut r = compute_r_matrix_with_correlations(
+            &model.error_spec,
+            &preds_eval,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            &model.residual_correlations,
+        );
+        if ruv_scale != 1.0 {
+            r *= ruv_scale;
+        }
+        let chol = match r.cholesky() {
+            Some(c) => c,
+            None => return 1e20,
         };
-        let cens = subject.cens.get(j).copied().unwrap_or(0);
-        if m3 && cens != 0 {
-            nll += -m3_logcdf(y, f, v.sqrt(), cens);
-        } else {
-            nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
+        let residuals = DVector::from_iterator(
+            subject.observations.len(),
+            subject
+                .observations
+                .iter()
+                .zip(preds_eval.iter())
+                .map(|(&y, &f)| y - f),
+        );
+        let solved = chol.solve(&residuals);
+        nll += 0.5 * (residuals.dot(&solved) + chol_log_det(&chol.l()));
+    } else {
+        for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
+            let frem_var = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+            // FREM covariate pseudo-observations predict a covariate *value* (any
+            // real: centered/standardized/log-scale covariates are routinely ≤ 0),
+            // not a concentration — do NOT clamp them to 1e-12. Clamping a negative
+            // covariate prediction up to 1e-12 fabricates a huge residual and, on the
+            // Rao-Blackwellised path, breaks the `obs_nll(η_c=d) ≈ const` assumption
+            // (#406). Ordinary PK rows keep the positivity clamp.
+            let f = if frem_var.is_some() { f } else { f.max(1e-12) };
+            let v = match frem_var {
+                Some(vv) => vv.max(1e-12),
+                None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values)
+                    * ruv_scale)
+                    .max(1e-12),
+            };
+            let cens = subject.cens.get(j).copied().unwrap_or(0);
+            if m3 && cens != 0 {
+                nll += -m3_logcdf(y, f, v.sqrt(), cens);
+            } else {
+                nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
+            }
         }
     }
 
@@ -1609,7 +1642,8 @@ pub fn individual_nll_iov(
 mod tests {
     use super::*;
     use crate::types::{
-        BloqMethod, DoseEvent, ErrorModel, ErrorSpec, GradientMethod, PkModel, PkParams,
+        BloqMethod, DoseEvent, EndpointError, ErrorModel, ErrorSpec, GradientMethod, PkModel,
+        PkParams, ResidualCorrelation,
     };
     use approx::assert_relative_eq;
     use std::collections::HashMap;
@@ -1713,6 +1747,56 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
         }
+    }
+
+    #[test]
+    fn obs_nll_subject_into_uses_cross_endpoint_residual_covariance() {
+        let mut model = make_model();
+        model.error_spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        model.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+
+        let mut subj = make_simple_subject();
+        subj.obs_times = vec![1.0, 1.0];
+        subj.obs_raw_times = Vec::new();
+        subj.observations = vec![1.8, 2.4];
+        subj.obs_cmts = vec![1, 2];
+        subj.cens = vec![0, 0];
+        subj.occasions = vec![1, 1];
+        subj.fremtype = Vec::new();
+        let theta = vec![5.0, 50.0];
+        let eta = vec![0.0];
+        let sigma = vec![0.2, 0.3];
+        let mut scratch = pk::EventPkParams::default();
+
+        let dense = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+        model.residual_correlations.clear();
+        let diagonal = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+
+        assert!(dense.is_finite());
+        assert!(diagonal.is_finite());
+        assert!(
+            (dense - diagonal).abs() > 1e-6,
+            "cross-endpoint residual covariance must contribute to SAEM obs NLL"
+        );
     }
 
     #[test]

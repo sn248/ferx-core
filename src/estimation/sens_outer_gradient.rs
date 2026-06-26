@@ -3673,6 +3673,114 @@ mod tests {
         }
     }
 
+    // 1-cpt oral **user-ODE** model with M3 BLOQ, tight tolerances. ODE counterpart
+    // of the closed-form `population_packed_gradient_m3_matches_fd`: the censored
+    // `−logΦ` term enters `prepare`'s M3 branch on top of the ODE walk's `ObsSens`
+    // (the same provider-agnostic assembly), proving non-IOV ODE+M3 is analytic on
+    // the outer loop.
+    const ONECPT_ODE_M3_OUTER: &str = r#"
+[parameters]
+  theta TVCL(0.2,  0.001, 10.0)
+  theta TVV(10.0,  0.1,  500.0)
+  theta TVKA(1.5,  0.01,  50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method      = focei
+  bloq_method = m3
+  ode_reltol  = 1e-9
+  ode_abstol  = 1e-11
+"#;
+
+    /// ODE counterpart of [`population_packed_gradient_m3_matches_fd`]: the analytic
+    /// FOCEI M3 packed gradient assembled from the **event-driven ODE sensitivity
+    /// walk** (censored rows enter `prepare`'s M3 branch) must match reconverged FD
+    /// of the M3 FOCEI objective. Proves non-IOV ODE+M3 is analytic on the outer
+    /// loop (the inner counterpart lives in `inner_optimizer.rs`).
+    #[test]
+    fn population_packed_gradient_ode_m3_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::{BloqMethod, Population};
+
+        let model = parse_model_string(ONECPT_ODE_M3_OUTER).expect("parse ODE M3");
+        assert!(matches!(model.bloq_method, BloqMethod::M3), "must be M3");
+        assert!(model.is_ode_based(), "must be on the ODE path");
+        let theta = [0.22, 11.0, 1.4];
+
+        let mut s1 = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 8.0]);
+        let mut s2 = subject_with_obs(&model, &theta, &[0.25, 1.5, 6.0, 12.0, 36.0]);
+        for s in [&mut s1, &mut s2] {
+            let n = s.observations.len();
+            s.cens[n - 1] = 1;
+            s.cens[n - 2] = 1;
+        }
+        assert!(s1.cens.iter().any(|&c| c != 0) && s2.cens.iter().any(|&c| c != 0));
+
+        let pop = Population {
+            subjects: vec![s1, s2],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+
+        let analytic =
+            population_gradient_sens(&model, &pop, &template, &x, &ehs).expect("ODE M3 supported");
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| marginal_nll(&model, s, &p))
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            eprintln!(
+                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[k],
+                fd,
+                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 5e-3, epsilon = 1e-5);
+        }
+    }
+
     /// The analytic **FOCE** (Sheiner–Beal, non-interaction) M3 packed gradient
     /// (censored rows excluded from R̃, added as `−logΦ((LLOQ−f̂)/√R⁰)` with the
     /// population variance) must match the reconverged-FD of ferx's FOCE-M3

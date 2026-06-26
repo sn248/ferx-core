@@ -2135,6 +2135,62 @@ mod tests {
         }
     }
 
+    /// ODE counterpart of [`analytic_inner_gradient_m3_matches_fd_on_warfarin_bloq`]:
+    /// the analytic M3 inner η-gradient produced via the **event-driven ODE
+    /// sensitivity walk** (not the closed-form provider) must match a central FD of
+    /// the inner objective on the warfarin BLOQ data — confirming non-IOV ODE+M3 is
+    /// served analytically on the inner loop (the censored `−logΦ` coefficient rides
+    /// the same provider-agnostic `apply_*_inner` path as the closed-form engine).
+    #[test]
+    fn analytic_inner_gradient_m3_matches_fd_on_warfarin_ode_bloq() {
+        use std::cell::RefCell;
+        use std::path::Path;
+        let model = crate::parser::model_parser::parse_model_file(Path::new(
+            "examples/warfarin_ode_bloq.ferx",
+        ))
+        .expect("warfarin ODE BLOQ model parses");
+        assert!(
+            matches!(model.bloq_method, crate::types::BloqMethod::M3),
+            "model must be M3"
+        );
+        assert!(
+            model.is_ode_based(),
+            "model must be on the ODE path for this probe"
+        );
+        let pop =
+            crate::io::datareader::read_nonmem_csv(Path::new("data/warfarin_bloq.csv"), None, None)
+                .expect("warfarin BLOQ data loads");
+        let subject = pop
+            .subjects
+            .iter()
+            .find(|s| s.cens.iter().any(|&c| c != 0))
+            .expect("at least one subject with a censored row");
+
+        let theta = &model.default_params.theta;
+        let omega = &model.default_params.omega;
+        let sigma = &model.default_params.sigma.values;
+        let eta = vec![0.12, -0.05, 0.2];
+
+        let analytic = analytic_eta_nll_gradient(&model, subject, theta, &eta, omega, sigma)
+            .expect("analytic M3 inner gradient must be supported on ODE path");
+
+        let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
+        let obj = |e: &[f64]| -> f64 {
+            let mut s = scratch.borrow_mut();
+            individual_nll_into_with_schedule(&model, subject, theta, e, omega, sigma, &mut s, None)
+        };
+        let fd = gradient_fd(&obj, &eta, model.n_eta);
+
+        for k in 0..model.n_eta {
+            assert!(
+                (analytic[k] - fd[k]).abs() < 1e-4 * (1.0 + fd[k].abs()),
+                "η[{k}]: analytic {} vs FD {}",
+                analytic[k],
+                fd[k]
+            );
+        }
+    }
+
     /// Dense BFGS vs L-BFGS scaling with inner dimension `n`, on an
     /// ill-conditioned 1-D-Laplacian quadratic `½xᵀLx − 1ᵀx` (cond ≈ (n/π)², so
     /// the solve needs ~O(n) curvature updates — representative of a curved inner

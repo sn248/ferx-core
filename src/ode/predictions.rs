@@ -613,6 +613,14 @@ fn read_observable(
     }
 }
 
+#[inline]
+fn observation_covariates<'a>(subject: &'a Subject, obs_idx: usize) -> &'a HashMap<String, f64> {
+    subject
+        .obs_covariates
+        .get(obs_idx)
+        .unwrap_or(&subject.covariates)
+}
+
 /// ODE specification for a model
 pub struct OdeSpec {
     /// RHS function: (u, pk_params_flat, t, du) — writes derivatives into du
@@ -852,7 +860,7 @@ fn integrate_segment(
                     pk_params_flat,
                     theta,
                     eta,
-                    &subject.covariates,
+                    observation_covariates(subject, obs_idx),
                     cmt,
                 );
             }
@@ -1014,7 +1022,7 @@ pub fn ode_predictions(
                     pk_params_flat,
                     theta,
                     eta,
-                    &subject.covariates,
+                    observation_covariates(subject, obs_idx),
                     cmt,
                 );
             }
@@ -1467,8 +1475,15 @@ pub(crate) fn ode_predictions_adaptive(
         if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
             for &obs_idx in obs_idxs {
                 let cmt = shadow.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-                predictions[obs_idx] =
-                    read_observable(ode, &u, pk_params_flat, theta, eta, &shadow.covariates, cmt);
+                predictions[obs_idx] = read_observable(
+                    ode,
+                    &u,
+                    pk_params_flat,
+                    theta,
+                    eta,
+                    observation_covariates(&shadow, obs_idx),
+                    cmt,
+                );
             }
         }
 
@@ -1827,7 +1842,7 @@ pub fn ode_predictions_event_driven(
                     &pk_now.values,
                     theta,
                     eta,
-                    &subject.covariates,
+                    observation_covariates(subject, idx),
                     cmt,
                 );
                 // Clamp negative readouts (ODE solver overshoot guard);
@@ -2152,7 +2167,7 @@ pub fn ode_predictions_with_states(
                     pk_params_flat,
                     theta,
                     eta,
-                    &subject.covariates,
+                    observation_covariates(subject, obs_idx),
                     cmt,
                 );
                 states[obs_idx] = u.clone();
@@ -2239,7 +2254,7 @@ pub fn ode_predictions_with_states(
                         pk_params_flat,
                         theta,
                         eta,
-                        &subject.covariates,
+                        observation_covariates(subject, obs_idx),
                         cmt,
                     );
                     states[obs_idx] = pt.u.clone();
@@ -4748,6 +4763,47 @@ mod tests {
         for (b, e) in baseline.iter().zip(event_driven.iter()) {
             assert_relative_eq!(*b, *e, epsilon = 1e-3, max_relative = 1e-4);
         }
+    }
+
+    #[test]
+    fn ode_event_driven_form_c_uses_observation_covariates() {
+        // Regression for a NONMEM translation with paired total/free assays:
+        // the dose row carried FREE=3, while same-time observation rows carried
+        // FREE=0 and FREE=1. Form C must see the observation snapshot, not the
+        // subject-level first-row covariate.
+        let ode = OdeSpec {
+            rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::Single(Box::new(|state, _pk, _theta, _eta, covariates| {
+                state[0] * covariates.get("FREE").copied().unwrap_or(0.0)
+            })),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+            init_fn: None,
+        };
+        let mut subj = make_subject(
+            vec![DoseEvent::new(0.0, 10.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 1.0],
+        );
+        subj.covariates.insert("FREE".into(), 3.0);
+        subj.dose_covariates = vec![HashMap::from([("FREE".to_string(), 3.0)])];
+        subj.obs_covariates = vec![
+            HashMap::from([("FREE".to_string(), 0.0)]),
+            HashMap::from([("FREE".to_string(), 1.0)]),
+        ];
+        let pk = pk_one(0.0, 1.0);
+        let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &[pk], &[pk, pk], &[]);
+
+        assert_relative_eq!(preds[0], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(preds[1], 10.0, epsilon = 1e-12);
     }
 
     #[test]

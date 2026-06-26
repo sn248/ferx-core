@@ -1910,7 +1910,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .unwrap_or_default();
         let is_ode_model = model.ode_spec.is_some();
 
-        let (scaling, output_fn, output_program) = parse_scaling_block(
+        let (scaling, output_fn, output_program, scaling_covariates) = parse_scaling_block(
             scaling_lines,
             &theta_names_for_scaling,
             &eta_names_for_scaling,
@@ -1936,6 +1936,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             ode_spec.readout_program = output_program;
         }
 
+        for cov in scaling_covariates {
+            if !model.referenced_covariates.contains(&cov) {
+                model.referenced_covariates.push(cov);
+            }
+        }
+        model.referenced_covariates.sort();
         model.scaling = scaling;
     }
 
@@ -4520,7 +4526,7 @@ fn build_y_output_fn(
     pk_indices: &[usize],
     state_names: &[String],
     kappa_names: &[String],
-) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram), String> {
+) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram, Vec<String>), String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
     let mut defined: Vec<String> = state_names.to_vec();
@@ -4632,6 +4638,7 @@ fn build_y_output_fn(
     // and ODE RHS never interleave on a single thread (readout runs
     // post-integration).
     let n_cov = cov_names.len();
+    let cov_names_for_fn = cov_names.clone();
 
     let out_fn: crate::ode::OdeOutputFn = Box::new(
         move |state: &[f64],
@@ -4666,7 +4673,7 @@ fn build_y_output_fn(
                 scratch.y_cov.clear();
                 if n_cov > 0 {
                     scratch.y_cov.resize(n_cov, 0.0);
-                    for (i, name) in cov_names.iter().enumerate() {
+                    for (i, name) in cov_names_for_fn.iter().enumerate() {
                         if let Some(&v) = covariates.get(name) {
                             scratch.y_cov[i] = v;
                         }
@@ -4686,7 +4693,7 @@ fn build_y_output_fn(
             })
         },
     );
-    Ok((out_fn, output_program))
+    Ok((out_fn, output_program, cov_names))
 }
 
 /// Parsed contents of a `[scaling]` block.
@@ -4729,6 +4736,7 @@ fn parse_scaling_block(
         ScalingSpec,
         Option<crate::ode::OdeReadout>,
         Option<OdeOutputProgram>,
+        Vec<String>,
     ),
     String,
 > {
@@ -4744,6 +4752,7 @@ fn parse_scaling_block(
     // per-CMT readouts carry their own program inside each `PerCmtReadout` (#439),
     // so the analytic-sensitivity provider can differentiate each endpoint.
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
+    let mut y_covariates: Vec<String> = Vec::new();
 
     for line in lines {
         let trimmed = line.trim();
@@ -4823,7 +4832,7 @@ fn parse_scaling_block(
                          use `obs_scale = <expr>` for analytical PK"
                         .into());
                 }
-                let (out_fn, out_program) = build_y_output_fn(
+                let (out_fn, out_program, cov_names) = build_y_output_fn(
                     value,
                     theta_names,
                     eta_names,
@@ -4832,6 +4841,11 @@ fn parse_scaling_block(
                     state_names,
                     kappa_names,
                 )?;
+                for cov in cov_names {
+                    if !y_covariates.contains(&cov) {
+                        y_covariates.push(cov);
+                    }
+                }
                 match cmt_opt {
                     None => {
                         if y_uniform.is_some() {
@@ -4890,7 +4904,8 @@ fn parse_scaling_block(
     } else {
         None
     };
-    Ok((scaling, readout, readout_program))
+    y_covariates.sort();
+    Ok((scaling, readout, readout_program, y_covariates))
 }
 
 // ── ode_template desugaring + the analytical+ODE-only-absorption error rule ──
@@ -18861,6 +18876,10 @@ if (WT > 70) {
             Some("  y = central / V * WT\n"),
         );
         let model = parse_model_string(&src).expect("Form C with covariate parses");
+        assert!(
+            model.referenced_covariates.contains(&"WT".to_string()),
+            "Form C covariates must be retained for data loading and TV pruning"
+        );
         let ode = model.ode_spec.as_ref().unwrap();
         let out_fn = match &ode.readout {
             crate::ode::OdeReadout::Single(f) => f,

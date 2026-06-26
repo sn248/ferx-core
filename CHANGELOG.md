@@ -151,6 +151,9 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- FOCEI now falls back to finite-difference h-matrices when an ODE analytic
+  Jacobian is unavailable or non-finite, avoiding sentinel-inflated OFVs on sparse
+  subjects such as the pembrolizumab RadboudUMC model (#551).
 - **Form C (`[scaling] y = <expr>`) ODE readouts now use per-observation covariate
   snapshots** (#535, #538). The explicit-output readout is evaluated against the
   covariate values on each observation's own data row rather than the subject's

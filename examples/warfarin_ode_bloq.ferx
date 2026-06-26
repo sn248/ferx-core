@@ -1,0 +1,41 @@
+# One-compartment oral PK model (ODE) with M3 BLOQ likelihood.
+#
+# ODE counterpart of warfarin_bloq.ferx — same data (data/warfarin_bloq.csv),
+# same true parameters, observations below LLOQ=2.0 flagged via CENS. Exercises
+# the M3 censored likelihood gradient on the event-driven ODE sensitivity walk.
+# States:
+#   CMT=1  depot   — oral dose (mg)
+#   CMT=2  central — concentration (mg/L)
+
+[parameters]
+  theta TVCL(0.2,  0.001, 10.0)
+  theta TVV(10.0,  0.1,  500.0)
+  theta TVKA(1.5,  0.01,  50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method       = focei
+  maxiter      = 300
+  bloq_method  = m3
+  ode_reltol   = 1e-10
+  ode_abstol   = 1e-12

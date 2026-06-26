@@ -213,6 +213,34 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_r_diag_with_correlations_empty_matches_diagonal() {
+        // With no correlations the helper must be identical to compute_r_diag.
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let ipreds = [10.0, 20.0];
+        let cmts = [0usize, 0];
+        let sigma = [0.2, 1.0];
+        let plain = compute_r_diag(&spec, &ipreds, &cmts, &sigma);
+        let with = compute_r_diag_with_correlations(&spec, &ipreds, &cmts, &sigma, &[]);
+        assert_eq!(plain, with);
+    }
+
+    #[test]
+    fn test_compute_r_diag_with_correlations_applies_cross_term() {
+        // Each observation's diagonal variance gains the 2·f·ρ·σ₁·σ₂ cross term.
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let ipreds = [10.0];
+        let cmts = [0usize];
+        let sigma = [0.2, 1.0];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        let with = compute_r_diag_with_correlations(&spec, &ipreds, &cmts, &sigma, &[corr]);
+        assert_relative_eq!(with[0], 7.0, epsilon = 1e-12);
+    }
+
+    #[test]
     fn test_min_variance_floor() {
         // Proportional with f=0 gives V=0, should be floored to MIN_VARIANCE
         let v = residual_variance(ErrorModel::Proportional, 0.0, &[0.1]);

@@ -2142,9 +2142,11 @@ pub struct CompiledModel {
     pub error_spec: ErrorSpec,
     /// Fixed residual-error correlations declared by `block_sigma`.
     ///
-    /// Empty for ordinary diagonal `$SIGMA` models. When non-empty, likelihood
-    /// paths build a full per-subject residual covariance matrix from the
-    /// observation-specific sigma loadings instead of using only an R diagonal.
+    /// Empty for ordinary diagonal `$SIGMA` models. When non-empty, each
+    /// observation's residual variance gains the within-observation covariance
+    /// cross term `2·cᵢ·cⱼ·ρ·σᵢ·σⱼ` (from the observation's sigma loadings) on
+    /// the R diagonal; distinct observations stay independent, so R remains
+    /// diagonal. This covers NONMEM `$SIGMA BLOCK(2)` combined-error models.
     pub residual_correlations: Vec<ResidualCorrelation>,
     pub pk_param_fn: PkParamFn,
     pub n_theta: usize,
@@ -4797,6 +4799,7 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_relative_eq;
 
     /// `sim_residual_variance` must split FREM covariate pseudo-observations
     /// (FREMTYPE>0) off the PK error model: they use the additive covariate
@@ -6029,5 +6032,173 @@ mod tests {
         assert_eq!(p.values[PK_IDX_F], 0.8);
         assert_eq!(p.values[PK_IDX_Q3], 0.5);
         assert_eq!(p.values[PK_IDX_V3], 100.0);
+    }
+
+    // ── block_sigma / correlated residual error (PR #545) ──────────────────
+
+    #[test]
+    fn sigma_loadings_single_matches_error_model_shape() {
+        // Additive loads only the additive sigma (coeff 1); proportional loads
+        // the proportional sigma (coeff f); combined loads both, in the
+        // (prop, add) order that `residual_variance` assumes positionally.
+        let add = ErrorSpec::Single(ErrorModel::Additive);
+        assert_eq!(add.sigma_loadings(0, 5.0, 1), vec![(0, 1.0)]);
+
+        let prop = ErrorSpec::Single(ErrorModel::Proportional);
+        assert_eq!(prop.sigma_loadings(0, 5.0, 1), vec![(0, 5.0)]);
+
+        let comb = ErrorSpec::Single(ErrorModel::Combined);
+        assert_eq!(comb.sigma_loadings(0, 5.0, 2), vec![(0, 5.0), (1, 1.0)]);
+    }
+
+    #[test]
+    fn sigma_loadings_single_respects_n_sigma_guards() {
+        // With no sigmas available the loadings are empty; a 1-sigma combined
+        // model exposes only the proportional loading.
+        let add = ErrorSpec::Single(ErrorModel::Additive);
+        assert!(add.sigma_loadings(0, 5.0, 0).is_empty());
+        let prop = ErrorSpec::Single(ErrorModel::Proportional);
+        assert!(prop.sigma_loadings(0, 5.0, 0).is_empty());
+        let comb = ErrorSpec::Single(ErrorModel::Combined);
+        assert_eq!(comb.sigma_loadings(0, 5.0, 1), vec![(0, 5.0)]);
+    }
+
+    #[test]
+    fn sigma_loadings_per_cmt_dispatches_by_endpoint() {
+        // Endpoint in cmt 1 is combined over global sigma indices (2, 3);
+        // cmt 2 is additive over index 0. Loadings must use those global
+        // indices, and an unmapped compartment yields no loadings.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            1usize,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![2, 3],
+            },
+        );
+        map.insert(
+            2usize,
+            EndpointError {
+                error_model: ErrorModel::Additive,
+                sigma_idx: vec![0],
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        assert_eq!(spec.sigma_loadings(1, 7.0, 4), vec![(2, 7.0), (3, 1.0)]);
+        assert_eq!(spec.sigma_loadings(2, 7.0, 4), vec![(0, 1.0)]);
+        assert!(spec.sigma_loadings(9, 7.0, 4).is_empty());
+    }
+
+    #[test]
+    fn variance_at_with_correlations_empty_delegates_to_variance_at() {
+        // No correlations ⇒ identical to the plain diagonal variance.
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.2, 1.0];
+        let plain = spec.variance_at(0, 10.0, &sigma);
+        let corr = spec.variance_at_with_correlations(0, 10.0, &sigma, &[]);
+        assert_relative_eq!(plain, corr, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn variance_at_with_correlations_combined_adds_cross_term() {
+        // V = (10·0.2)² + 1² + 2·10·0.5·0.2·1 = 4 + 1 + 2 = 7.
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let corr = ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        let v = spec.variance_at_with_correlations(1, 10.0, &[0.2, 1.0], &[corr]);
+        assert_relative_eq!(v, 7.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn variance_at_with_correlations_per_cmt_combined() {
+        // Same combined cross term, but reached through a PerCmt endpoint whose
+        // sigmas live at global indices (0, 1).
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            1usize,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![0, 1],
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        let corr = ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        let v = spec.variance_at_with_correlations(1, 10.0, &[0.2, 1.0], &[corr]);
+        assert_relative_eq!(v, 7.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn variance_at_with_correlations_nan_when_no_loadings() {
+        // An observation in an unmapped compartment has no loadings ⇒ NaN.
+        let map = std::collections::HashMap::new();
+        let spec = ErrorSpec::PerCmt(map);
+        let corr = ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        let v = spec.variance_at_with_correlations(1, 10.0, &[0.2, 1.0], &[corr]);
+        assert!(v.is_nan());
+    }
+
+    #[test]
+    fn variance_at_with_correlations_nan_when_sigma_index_missing() {
+        // A PerCmt combined endpoint whose sigma_idx (0, 1) points past a
+        // length-1 sigma slice: the diagonal accumulation hits a missing sigma
+        // and returns NaN rather than silently dropping a term.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            1usize,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![0, 1],
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        let corr = ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        let v = spec.variance_at_with_correlations(1, 10.0, &[0.2], &[corr]);
+        assert!(v.is_nan());
+    }
+
+    #[test]
+    fn variance_at_with_correlations_skips_unloaded_correlation() {
+        // The correlation names sigma index 2, which the combined endpoint
+        // never loads, so the cross term is skipped and V is the plain
+        // diagonal (10·0.2)² + 1² = 5.
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let corr = ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 2,
+            rho: 0.5,
+        };
+        let v = spec.variance_at_with_correlations(0, 10.0, &[0.2, 1.0, 0.3], &[corr]);
+        assert_relative_eq!(v, 5.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn residual_variance_at_threads_correlations_from_model() {
+        // The `CompiledModel` convenience wrapper must apply its own
+        // `residual_correlations`, not just the diagonal.
+        let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+        model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+        model.error_model = ErrorModel::Combined;
+        model.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        let v = model.residual_variance_at(0, 10.0, &[0.2, 1.0]);
+        assert_relative_eq!(v, 7.0, epsilon = 1e-12);
     }
 }

@@ -5890,6 +5890,40 @@ mod iov_integration {
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
     }
 
+    // block_sigma correlated residual errors are only wired into FOCE; every
+    // other method in the chain must be rejected up front (PR #545).
+    #[test]
+    fn test_check_model_options_block_sigma_rejects_non_foce() {
+        let mut model =
+            crate::types::test_helpers::analytical_model(crate::types::GradientMethod::Fd);
+        model.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+
+        // FOCEI is rejected.
+        let opts = fast_opts(EstimationMethod::FoceI, Optimizer::Bobyqa, true);
+        let diags = super::check_model_options(&model, &opts);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED")
+            .expect("expected E_BLOCK_SIGMA_METHOD_UNSUPPORTED for FOCEI");
+        assert!(d.is_error() && d.message.contains("method = foce"));
+
+        // SAEM is rejected too.
+        let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        assert!(super::check_model_options(&model, &saem)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+
+        // Plain FOCE is accepted (no block_sigma diagnostic).
+        let foce = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        assert!(!super::check_model_options(&model, &foce)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+    }
+
     // IMPMAP does not yet support IOV; `ferx check` must flag it up front rather
     // than letting the fit fail at runtime (review finding #3).
     #[test]

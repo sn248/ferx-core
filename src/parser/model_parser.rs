@@ -14721,6 +14721,94 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_block_sigma_fix_marks_sigmas_fixed() {
+        let lines = vec!["block_sigma (PROP, ADD) = [0.04, 0.10, 1.0] FIX".to_string()];
+        let (_, _, _, sigmas, block_sigmas, _, _) = parse_parameters(&lines).unwrap();
+        assert!(sigmas.iter().all(|s| s.fixed));
+        assert!(block_sigmas[0].fixed);
+    }
+
+    #[test]
+    fn test_parse_block_sigma_wrong_triangle_count_errs() {
+        // (PROP, ADD) needs 3 lower-triangle values; only 2 supplied.
+        let lines = vec!["block_sigma (PROP, ADD) = [0.04, 1.0]".to_string()];
+        let Err(err) = parse_parameters(&lines) else {
+            panic!("expected an error for a short lower triangle");
+        };
+        assert!(err.contains("lower-triangle"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_block_sigma_negative_variance_errs() {
+        let lines = vec!["block_sigma (PROP, ADD) = [-0.04, 0.10, 1.0]".to_string()];
+        let Err(err) = parse_parameters(&lines) else {
+            panic!("expected an error for a negative variance");
+        };
+        assert!(err.contains("negative initial variance"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_block_sigma_non_finite_covariance_errs() {
+        let lines = vec!["block_sigma (PROP, ADD) = [0.04, inf, 1.0]".to_string()];
+        let Err(err) = parse_parameters(&lines) else {
+            panic!("expected an error for a non-finite covariance");
+        };
+        assert!(err.contains("non-finite"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_residual_correlations_zero_diagonal_errs() {
+        // A non-zero covariance against a zero diagonal variance is rejected.
+        let block = BlockSigmaSpec {
+            names: vec!["A".to_string(), "B".to_string()],
+            lower_triangle: vec![0.0, 0.1, 1.0],
+            fixed: true,
+        };
+        let names = vec!["A".to_string(), "B".to_string()];
+        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        assert!(err.contains("positive diagonal variances"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_residual_correlations_invalid_rho_errs() {
+        // cov 0.10 with both variances 0.04 implies ρ = 0.10/(0.2·0.2) = 2.5 > 1.
+        let block = BlockSigmaSpec {
+            names: vec!["A".to_string(), "B".to_string()],
+            lower_triangle: vec![0.04, 0.10, 0.04],
+            fixed: true,
+        };
+        let names = vec!["A".to_string(), "B".to_string()];
+        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        assert!(err.contains("invalid correlation"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_residual_correlations_unknown_name_errs() {
+        // Valid covariance, but the block names are absent from `sigma_names`.
+        let block = BlockSigmaSpec {
+            names: vec!["X".to_string(), "Y".to_string()],
+            lower_triangle: vec![1.0, 0.5, 1.0],
+            fixed: true,
+        };
+        let names = vec!["A".to_string(), "B".to_string()];
+        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        assert!(err.contains("unknown sigma"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_residual_correlations_zero_covariance_omitted() {
+        // A zero off-diagonal entry carries no correlation, so no entry is built.
+        let block = BlockSigmaSpec {
+            names: vec!["A".to_string(), "B".to_string()],
+            lower_triangle: vec![0.04, 0.0, 1.0],
+            fixed: true,
+        };
+        let names = vec!["A".to_string(), "B".to_string()];
+        let corrs = build_residual_correlations(&[block], &names).unwrap();
+        assert!(corrs.is_empty());
+    }
+
+    #[test]
     fn test_parse_block_omega_fix() {
         let lines = vec!["block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04] FIX".to_string()];
         let (_, _, blocks, _, _, _, _) = parse_parameters(&lines).unwrap();
@@ -15005,6 +15093,55 @@ mod tests {
         assert!(!omegas[0].fixed);
         assert!(!sigmas[0].fixed);
         assert!(!blocks[0].fixed);
+    }
+
+    #[test]
+    fn test_parse_full_model_block_sigma_combined_builds_correlation() {
+        // End-to-end: a combined-error model whose two sigmas are declared via
+        // block_sigma must carry one residual correlation into CompiledModel.
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.0] FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+"#;
+        let parsed = parse_full_model(content).unwrap();
+        assert_eq!(parsed.model.residual_correlations.len(), 1);
+        let c = parsed.model.residual_correlations[0];
+        // cov 0.10 / (sqrt(0.04)·sqrt(1.0)) = 0.10 / 0.2 = 0.5.
+        assert!((c.rho - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_full_model_duplicate_sigma_name_errs() {
+        // A plain sigma colliding with a block_sigma entry is rejected.
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.0] FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+"#;
+        let Err(err) = parse_full_model(content) else {
+            panic!("expected a duplicate-sigma-name error");
+        };
+        assert!(err.contains("more than once"), "got: {err}");
     }
 
     #[test]

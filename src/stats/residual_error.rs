@@ -1,4 +1,4 @@
-use crate::types::{ErrorModel, ErrorSpec, SubjectResult};
+use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SubjectResult};
 
 const MIN_VARIANCE: f64 = 1e-12;
 
@@ -41,6 +41,27 @@ pub fn compute_r_diag(
         .collect()
 }
 
+/// Compute residual variances including fixed residual correlations from
+/// `block_sigma`.
+pub fn compute_r_diag_with_correlations(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+) -> Vec<f64> {
+    if correlations.is_empty() {
+        return compute_r_diag(error_spec, ipreds, obs_cmts, sigma_values);
+    }
+    ipreds
+        .iter()
+        .zip(obs_cmts.iter())
+        .map(|(&f, &cmt)| {
+            error_spec.variance_at_with_correlations(cmt, f, sigma_values, correlations)
+        })
+        .collect()
+}
+
 /// Individual weighted residual: IWRES_j = (y_j - f_j) / sqrt(V_j)
 pub fn iwres(obs: f64, ipred: f64, error_model: ErrorModel, sigma_values: &[f64]) -> f64 {
     let v = residual_variance(error_model, ipred, sigma_values);
@@ -62,6 +83,30 @@ pub fn compute_iwres(
         .zip(obs_cmts.iter())
         .map(|((&y, &f), &cmt)| {
             let v = error_spec.variance_at(cmt, f, sigma_values);
+            (y - f) / v.sqrt()
+        })
+        .collect()
+}
+
+/// Compute IWRES using residual variances that include fixed `block_sigma`
+/// correlations. With no correlations this is exactly [`compute_iwres`].
+pub fn compute_iwres_with_correlations(
+    observations: &[f64],
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    error_spec: &ErrorSpec,
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+) -> Vec<f64> {
+    if correlations.is_empty() {
+        return compute_iwres(observations, ipreds, obs_cmts, error_spec, sigma_values);
+    }
+    observations
+        .iter()
+        .zip(ipreds.iter())
+        .zip(obs_cmts.iter())
+        .map(|((&y, &f), &cmt)| {
+            let v = error_spec.variance_at_with_correlations(cmt, f, sigma_values, correlations);
             (y - f) / v.sqrt()
         })
         .collect()
@@ -179,6 +224,47 @@ mod tests {
     }
 
     #[test]
+    fn test_combined_variance_with_residual_correlation() {
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        // V = (10 * 0.2)^2 + 1^2 + 2 * 10 * 0.5 * 0.2 * 1 = 7.
+        let v = spec.variance_at_with_correlations(1, 10.0, &[0.2, 1.0], &[corr]);
+        assert_relative_eq!(v, 7.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_compute_r_diag_with_correlations_empty_matches_diagonal() {
+        // With no correlations the helper must be identical to compute_r_diag.
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let ipreds = [10.0, 20.0];
+        let cmts = [0usize, 0];
+        let sigma = [0.2, 1.0];
+        let plain = compute_r_diag(&spec, &ipreds, &cmts, &sigma);
+        let with = compute_r_diag_with_correlations(&spec, &ipreds, &cmts, &sigma, &[]);
+        assert_eq!(plain, with);
+    }
+
+    #[test]
+    fn test_compute_r_diag_with_correlations_applies_cross_term() {
+        // Each observation's diagonal variance gains the 2·f·ρ·σ₁·σ₂ cross term.
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let ipreds = [10.0];
+        let cmts = [0usize];
+        let sigma = [0.2, 1.0];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        let with = compute_r_diag_with_correlations(&spec, &ipreds, &cmts, &sigma, &[corr]);
+        assert_relative_eq!(with[0], 7.0, epsilon = 1e-12);
+    }
+
+    #[test]
     fn test_min_variance_floor() {
         // Proportional with f=0 gives V=0, should be floored to MIN_VARIANCE
         let v = residual_variance(ErrorModel::Proportional, 0.0, &[0.1]);
@@ -222,6 +308,31 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_relative_eq!(result[0], 2.0, epsilon = 1e-12);
         assert_relative_eq!(result[1], 2.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_compute_iwres_with_correlations_applies_cross_term() {
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        // V = (10 * 0.2)^2 + 1^2 + 2 * 10 * 0.5 * 0.2 * 1 = 7.
+        let result =
+            compute_iwres_with_correlations(&[12.0], &[10.0], &[1], &spec, &[0.2, 1.0], &[corr]);
+        assert_relative_eq!(result[0], 2.0 / 7.0_f64.sqrt(), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_compute_iwres_with_correlations_empty_matches_diagonal() {
+        let spec = ErrorSpec::Single(ErrorModel::Additive);
+        let obs = [12.0, 22.0];
+        let ipreds = [10.0, 20.0];
+        let obs_cmts = [1, 1];
+        let plain = compute_iwres(&obs, &ipreds, &obs_cmts, &spec, &[1.0]);
+        let with = compute_iwres_with_correlations(&obs, &ipreds, &obs_cmts, &spec, &[1.0], &[]);
+        assert_eq!(plain, with);
     }
 
     fn make_subject(iwres: Vec<f64>) -> SubjectResult {

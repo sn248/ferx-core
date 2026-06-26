@@ -937,6 +937,7 @@ mod tests {
             pk_model: PkModel::OneCptOral,
             error_model: ErrorModel::Proportional,
             error_spec: ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|_, _, _| PkParams::default()),
             n_theta: 3,
             n_eta: 3,

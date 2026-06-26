@@ -20,6 +20,8 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Support fixed residual-error correlations via `block_sigma` for FOCE combined-error
+  models, with a NONMEM `$SIGMA BLOCK(2) FIX` validation example (#537).
 - **Analytic FOCE/FOCEI gradients for Form C readouts that reference covariates** (#540).
   An ODE Form C readout (`[scaling] y = <expr>`) that branches on or scales by a covariate
   — e.g. a free→total protein-binding readout gated on a `FREE` assay flag — now gets the

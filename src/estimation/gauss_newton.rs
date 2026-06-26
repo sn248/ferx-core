@@ -1973,6 +1973,7 @@ fn subject_nll_at(
             &params.omega,
             &params.sigma.values,
             &model.error_spec,
+            &model.residual_correlations,
             model.bloq_method,
             &[],
             frem_r_override.as_deref(),
@@ -2015,6 +2016,7 @@ mod tests {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp(); // CL
@@ -2980,6 +2982,7 @@ mod tests {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp(); // CL · exp(ETA_CL)
@@ -3261,6 +3264,7 @@ mod tests {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 // eta[0] = bsv_eta, eta[1] = kappa (combined vector from inner optimizer)

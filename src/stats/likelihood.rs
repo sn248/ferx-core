@@ -1,5 +1,5 @@
 use crate::pk;
-use crate::stats::residual_error::compute_r_diag;
+use crate::stats::residual_error::compute_r_diag_with_correlations;
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -539,6 +539,7 @@ pub fn foce_subject_nll(
             omega,
             sigma_values,
             &model.error_spec,
+            &model.residual_correlations,
             model.bloq_method,
             &p_obs,
             frem_r_override.as_deref(),
@@ -597,6 +598,7 @@ pub fn foce_subject_nll_standard(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
     error_spec: &ErrorSpec,
+    residual_correlations: &[ResidualCorrelation],
     bloq_method: BloqMethod,
     p_obs: &[f64],
     frem_r_override: Option<&[Option<f64>]>,
@@ -620,7 +622,13 @@ pub fn foce_subject_nll_standard(
     // overwrite FREM covariate rows with their EPSCOV² overrides. The override
     // must come last so it survives the r_pred_override re-evaluation of R.
     let r_eval: &[f64] = r_pred_override.unwrap_or(&f0);
-    let mut r_diag = compute_r_diag(error_spec, r_eval, &subject.obs_cmts, sigma_values);
+    let mut r_diag = compute_r_diag_with_correlations(
+        error_spec,
+        r_eval,
+        &subject.obs_cmts,
+        sigma_values,
+        residual_correlations,
+    );
     for (j, r) in r_diag.iter_mut().enumerate() {
         *r += p_obs.get(j).copied().unwrap_or(0.0);
     }
@@ -1175,6 +1183,7 @@ pub fn foce_subject_nll_iov(
             &sigma_b,
             sigma_values,
             &model.error_spec,
+            &model.residual_correlations,
             model.bloq_method,
             &p_obs_iov,
             None,
@@ -1265,6 +1274,7 @@ pub fn compute_cwres(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
     error_spec: &ErrorSpec,
+    residual_correlations: &[ResidualCorrelation],
     // IIV-on-RUV eta index (or None). Scales the residual diagonal `R` by
     // exp(2·η̂_ruv) so CWRES uses the subject's actual residual SD (#409).
     residual_error_eta: Option<usize>,
@@ -1280,7 +1290,13 @@ pub fn compute_cwres(
         .collect();
 
     // R_tilde
-    let mut r_diag = compute_r_diag(error_spec, &f0, &subject.obs_cmts, sigma_values);
+    let mut r_diag = compute_r_diag_with_correlations(
+        error_spec,
+        &f0,
+        &subject.obs_cmts,
+        sigma_values,
+        residual_correlations,
+    );
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
     if ruv_scale != 1.0 {
         for (j, v) in r_diag.iter_mut().enumerate() {
@@ -1538,6 +1554,7 @@ mod tests {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp(); // CL uses combined eta[0]
@@ -1883,6 +1900,7 @@ mod tests {
             &omega,
             &sigma,
             &error_spec,
+            &[],
             BloqMethod::Drop,
             &[],
             None,
@@ -1896,6 +1914,7 @@ mod tests {
             &omega,
             &sigma,
             &error_spec,
+            &[],
             BloqMethod::Drop,
             &[],
             None,
@@ -1941,6 +1960,7 @@ mod tests {
                 &omega,
                 &sigma,
                 &error_spec,
+                &[],
                 BloqMethod::Drop,
                 &[],
                 frem,

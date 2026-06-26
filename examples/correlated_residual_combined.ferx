@@ -1,0 +1,28 @@
+# One-compartment IV model with correlated combined residual error.
+#
+# The block_sigma lower triangle is variance-scale, mirroring NONMEM
+# `$SIGMA BLOCK(2)`: Var(PROP), Cov(PROP, ADD), Var(ADD). The current
+# implementation estimates/fixes the diagonal sigma SDs normally and treats the
+# implied correlation as fixed.
+
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0) FIX
+  theta TVV(10.0, 0.1, 100.0) FIX
+
+  omega ETA_CL ~ 0.04 FIX
+
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+
+[fit_options]
+  method = foce
+  maxiter = 0

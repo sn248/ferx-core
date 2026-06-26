@@ -11,7 +11,7 @@ use crate::io::datareader::{
 use crate::pk;
 use crate::propensity_match::MatchMethod;
 use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
-use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
+use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
@@ -910,6 +910,23 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
             )
             .with_block("fit_options"),
         );
+    }
+
+    if !model.residual_correlations.is_empty() {
+        for &m in &chain {
+            if m != EstimationMethod::Foce {
+                diags.push(
+                    Diagnostic::error(
+                        "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
+                        "block_sigma correlated residual errors are currently supported for \
+                         method = foce only. FOCEI, GN, SAEM, and importance-sampling paths \
+                         still use diagonal residual-error derivatives.",
+                    )
+                    .with_block("fit_options"),
+                );
+                break;
+            }
+        }
     }
 
     // `imp` may appear at most once in a chain. By default it is an MCEM
@@ -4035,12 +4052,13 @@ fn compute_subject_results(
                 crate::pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta);
 
             // IWRES (NaN on censored rows — see compute_cwres for CWRES handling).
-            let mut iwres = compute_iwres(
+            let mut iwres = compute_iwres_with_correlations(
                 &subject.observations,
                 &ipred,
                 &subject.obs_cmts,
                 &model.error_spec,
                 &params.sigma.values,
+                &model.residual_correlations,
             );
             // IIV on residual error (#409): the individual residual SD is scaled
             // by exp(η̂_ruv), so IWRES = (y−f)/(SD·exp(η̂_ruv)) = base / exp(η̂_ruv).
@@ -4068,6 +4086,7 @@ fn compute_subject_results(
                 &params.omega,
                 &params.sigma.values,
                 &model.error_spec,
+                &model.residual_correlations,
                 model.residual_error_eta,
             );
 
@@ -5328,6 +5347,7 @@ mod iov_integration {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             // pk_param_fn: eta[0]=BSV for CL, eta[1]=KAPPA_CL (appended by IOV path)
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
@@ -5869,6 +5889,40 @@ mod iov_integration {
         // A compatible optimizer produces no compatibility diagnostics.
         let ok_opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
+    }
+
+    // block_sigma correlated residual errors are only wired into FOCE; every
+    // other method in the chain must be rejected up front (PR #545).
+    #[test]
+    fn test_check_model_options_block_sigma_rejects_non_foce() {
+        let mut model =
+            crate::types::test_helpers::analytical_model(crate::types::GradientMethod::Fd);
+        model.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+
+        // FOCEI is rejected.
+        let opts = fast_opts(EstimationMethod::FoceI, Optimizer::Bobyqa, true);
+        let diags = super::check_model_options(&model, &opts);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED")
+            .expect("expected E_BLOCK_SIGMA_METHOD_UNSUPPORTED for FOCEI");
+        assert!(d.is_error() && d.message.contains("method = foce"));
+
+        // SAEM is rejected too.
+        let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        assert!(super::check_model_options(&model, &saem)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+
+        // Plain FOCE is accepted (no block_sigma diagnostic).
+        let foce = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        assert!(!super::check_model_options(&model, &foce)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
     }
 
     // IMPMAP does not yet support IOV; `ferx check` must flag it up front rather
@@ -6752,6 +6806,7 @@ mod simulate_with_uncertainty_tests {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 p.values[0] = theta[0] * eta[0].exp();
@@ -7559,6 +7614,7 @@ mod tests_sdtab_tv_cov {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             // CL = TVCL · exp(η_CL) · (WT/70) — reads WT from the covariate map
             // that `compute_predictions_with_tv` substitutes per-event from
             // `obs_covariates` / `dose_covariates`. With WT changing per obs
@@ -7777,6 +7833,92 @@ mod tests_sdtab_tv_cov {
         }
     }
 
+    #[test]
+    fn test_sdtab_iwres_uses_block_sigma_correlation() {
+        use crate::parser::model_parser::parse_full_model;
+
+        let src = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.0] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+"#;
+        let model = parse_full_model(src).expect("model parses").model;
+        assert_eq!(model.residual_correlations.len(), 1);
+
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let eta = DVector::from_vec(vec![0.0]);
+        let ipred = crate::pk::compute_predictions_with_tv(
+            &model,
+            &subject,
+            &model.default_params.theta,
+            eta.as_slice(),
+        );
+        subject.observations[0] = ipred[0] + 2.0;
+
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let eta_hats = vec![eta];
+        let h_matrices = vec![DMatrix::zeros(1, 1)];
+        let kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new()];
+
+        let results = compute_subject_results(
+            &model,
+            &population,
+            &model.default_params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            false,
+        );
+
+        let f = ipred[0];
+        let expected_v = (f * 0.2).powi(2) + 1.0 + 2.0 * f * 0.5 * 0.2;
+        let expected_iwres = 2.0 / expected_v.sqrt();
+        assert!(
+            (results[0].iwres[0] - expected_iwres).abs() < 1e-12,
+            "sdtab IWRES must include block_sigma cross term; got {}, expected {}",
+            results[0].iwres[0],
+            expected_iwres
+        );
+    }
+
     /// Regression for #506: simulation must honour time-varying covariate
     /// snapshots on observation rows. The pre-fix simulation path evaluated
     /// `pk_param_fn` once with `subject.covariates`, so changing `WT` on obs rows
@@ -7804,6 +7946,7 @@ mod tests_sdtab_tv_cov {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: ErrorSpec::Single(ErrorModel::Proportional),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
                 let mut p = PkParams::default();
                 let wt = cov.get("WT").copied().unwrap_or(70.0);
@@ -7952,6 +8095,7 @@ mod tests_derived_session_clock {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
             error_spec: ErrorSpec::Single(ErrorModel::Additive),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|_, _, _| PkParams::default()),
             n_theta: 0,
             n_eta: 0,
@@ -8333,6 +8477,7 @@ mod tests_derived_iov_kappa {
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
             error_spec: ErrorSpec::Single(ErrorModel::Additive),
+            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| {
                 let kappa = eta.get(1).copied().unwrap_or(0.0);
                 let mut p = PkParams::default();

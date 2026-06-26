@@ -934,7 +934,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let param_lines = blocks
         .get("parameters")
         .ok_or("Missing [parameters] block")?;
-    let (thetas, omegas, block_omegas, sigmas, eta_names_bsv, kappa_info) =
+    let (thetas, omegas, block_omegas, sigmas, block_sigmas, eta_names_bsv, kappa_info) =
         parse_parameters(param_lines)?;
 
     // ── Optional [covariate_nn NAME] blocks (Phase A M1, behind `--features nn`)
@@ -1022,6 +1022,15 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         theta_names.extend(spec.theta_names.iter().cloned());
     }
     let sigma_names: Vec<String> = sigmas.iter().map(|s| s.name.clone()).collect();
+    let mut seen_sigma_names = std::collections::HashSet::new();
+    for name in &sigma_names {
+        if !seen_sigma_names.insert(name.as_str()) {
+            return Err(format!(
+                "sigma '{}' is declared more than once (including block_sigma entries)",
+                name
+            ));
+        }
+    }
     let n_theta;
     let n_eta = eta_names_bsv.len(); // BSV-only count
     let n_kappa = kappa_info.names_ordered.len();
@@ -1495,7 +1504,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // restriction.
     // Capture referenced sigma names before `parsed_error_model` is consumed.
     let used_sigmas_in_error = used_sigma_names(&parsed_error_model);
+    validate_block_sigma_single_error_order(&parsed_error_model, &block_sigmas, &sigma_names)?;
     let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
+    let residual_correlations = build_residual_correlations(&block_sigmas, &sigma_names)?;
+    validate_residual_correlations(&error_spec, &residual_correlations, &sigma_names)?;
     let sigma = SigmaVector {
         values: sigma_values,
         names: sigma_names,
@@ -1718,6 +1730,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         pk_model,
         error_model,
         error_spec,
+        residual_correlations,
         pk_param_fn,
         n_theta,
         n_eta,
@@ -6419,6 +6432,16 @@ struct SigmaSpec {
     init_as_sd: bool,
 }
 
+/// Specifies a correlated residual-error block.
+///
+/// Values are lower-triangle covariance-scale entries, matching NONMEM
+/// `$SIGMA BLOCK(n)`: `[var1, cov21, var2, cov31, cov32, var3, ...]`.
+struct BlockSigmaSpec {
+    names: Vec<String>,
+    lower_triangle: Vec<f64>,
+    fixed: bool,
+}
+
 /// Diagonal inter-occasion variability (kappa) specification.
 struct KappaSpec {
     name: String,
@@ -6602,6 +6625,7 @@ fn parse_parameters(
         Vec<OmegaSpec>,
         Vec<BlockOmegaSpec>,
         Vec<SigmaSpec>,
+        Vec<BlockSigmaSpec>,
         Vec<String>,  // BSV eta names in declaration order
         ParsedKappas, // IOV kappa specs (diagonal and/or block)
     ),
@@ -6611,6 +6635,7 @@ fn parse_parameters(
     let mut omegas = Vec::new();
     let mut block_omegas = Vec::new();
     let mut sigmas = Vec::new();
+    let mut block_sigmas = Vec::new();
     let mut eta_names_ordered = Vec::new();
     let mut kappas: Vec<KappaSpec> = Vec::new();
     let mut block_kappas: Vec<BlockKappaSpec> = Vec::new();
@@ -6667,6 +6692,14 @@ fn parse_parameters(
     let block_omega_re =
         Regex::new(r"(?i)block_omega\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?").unwrap();
 
+    // block_sigma (NAME1, NAME2, ...) = [lower_triangle_covariances] | ... FIX
+    //
+    // Diagonal entries initialise the named sigma SDs; off-diagonal entries are
+    // converted to fixed correlations so the existing positive sigma
+    // parameterization remains intact.
+    let block_sigma_re =
+        Regex::new(r"(?i)block_sigma\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?").unwrap();
+
     // sigma NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
     // As of issue #56, sigma defaults to the variance scale (matching omega).
@@ -6691,7 +6724,7 @@ fn parse_parameters(
     let block_kappa_re =
         Regex::new(r"(?i)block_kappa\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?").unwrap();
 
-    // Rejoin multi-line `block_omega`/`block_kappa` declarations before matching.
+    // Rejoin multi-line `block_*` declarations before matching.
     let lines = join_bracketed_lines(lines);
     for line in &lines {
         if let Some(caps) = theta_re.captures(line) {
@@ -6741,6 +6774,56 @@ fn parse_parameters(
             }
             let fixed = caps.get(3).is_some();
             block_omegas.push(BlockOmegaSpec {
+                names,
+                lower_triangle: values,
+                fixed,
+            });
+        } else if let Some(caps) = block_sigma_re.captures(line) {
+            let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
+            let values: Vec<f64> = caps[2]
+                .split(',')
+                .map(|s| {
+                    s.trim()
+                        .parse::<f64>()
+                        .map_err(|_| format!("Bad block_sigma value in: {}", line))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let n = names.len();
+            let expected = n * (n + 1) / 2;
+            if values.len() != expected {
+                return Err(format!(
+                    "block_sigma with {} sigmas expects {} lower-triangle values, got {}: {}",
+                    n,
+                    expected,
+                    values.len(),
+                    line
+                ));
+            }
+            let fixed = caps.get(3).is_some();
+            let mut val_idx = 0;
+            for row in 0..n {
+                for col in 0..=row {
+                    let value = values[val_idx];
+                    if row == col {
+                        if value < 0.0 {
+                            return Err(format!(
+                                "block_sigma '{}' has a negative initial variance ({value}); variances must be non-negative",
+                                names[row]
+                            ));
+                        }
+                        sigmas.push(SigmaSpec {
+                            name: names[row].clone(),
+                            value: value.sqrt(),
+                            fixed,
+                            init_as_sd: false,
+                        });
+                    } else if !value.is_finite() {
+                        return Err(format!("block_sigma covariance is non-finite in: {}", line));
+                    }
+                    val_idx += 1;
+                }
+            }
+            block_sigmas.push(BlockSigmaSpec {
                 names,
                 lower_triangle: values,
                 fixed,
@@ -6880,6 +6963,7 @@ fn parse_parameters(
         omegas,
         block_omegas,
         sigmas,
+        block_sigmas,
         eta_names_ordered,
         ParsedKappas {
             diagonal: kappas,
@@ -7009,6 +7093,154 @@ fn build_omega_fixed(
     }
 
     Ok(fixed)
+}
+
+fn build_residual_correlations(
+    block_sigmas: &[BlockSigmaSpec],
+    sigma_names: &[String],
+) -> Result<Vec<ResidualCorrelation>, String> {
+    let name_to_idx: std::collections::HashMap<&str, usize> = sigma_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    let mut out = Vec::new();
+    for block in block_sigmas {
+        let n = block.names.len();
+        let mut variances = vec![0.0; n];
+        let mut pos = 0;
+        for row in 0..n {
+            for col in 0..=row {
+                if row == col {
+                    variances[row] = block.lower_triangle[pos];
+                }
+                pos += 1;
+            }
+        }
+        pos = 0;
+        for row in 0..n {
+            for col in 0..=row {
+                let value = block.lower_triangle[pos];
+                if row != col && value != 0.0 {
+                    let vi = variances[row];
+                    let vj = variances[col];
+                    if vi <= 0.0 || vj <= 0.0 {
+                        return Err(format!(
+                            "block_sigma covariance between '{}' and '{}' requires positive diagonal variances",
+                            block.names[row], block.names[col]
+                        ));
+                    }
+                    let rho = value / (vi.sqrt() * vj.sqrt());
+                    if !(rho.is_finite() && (-1.0..=1.0).contains(&rho)) {
+                        return Err(format!(
+                            "block_sigma covariance between '{}' and '{}' implies invalid correlation {}",
+                            block.names[row], block.names[col], rho
+                        ));
+                    }
+                    let i = *name_to_idx.get(block.names[row].as_str()).ok_or_else(|| {
+                        format!(
+                            "block_sigma references unknown sigma '{}'",
+                            block.names[row]
+                        )
+                    })?;
+                    let j = *name_to_idx.get(block.names[col].as_str()).ok_or_else(|| {
+                        format!(
+                            "block_sigma references unknown sigma '{}'",
+                            block.names[col]
+                        )
+                    })?;
+                    out.push(ResidualCorrelation {
+                        sigma_i: i,
+                        sigma_j: j,
+                        rho,
+                    });
+                }
+                pos += 1;
+            }
+        }
+        let _fixed = block.fixed;
+    }
+    Ok(out)
+}
+
+fn validate_block_sigma_single_error_order(
+    parsed_error_model: &ParsedErrorModel,
+    block_sigmas: &[BlockSigmaSpec],
+    sigma_names: &[String],
+) -> Result<(), String> {
+    if block_sigmas.is_empty() {
+        return Ok(());
+    }
+    let ParsedErrorModel::Single(_, error_sigma_names) = parsed_error_model else {
+        return Ok(());
+    };
+    for (idx, expected) in error_sigma_names.iter().enumerate() {
+        if sigma_names.get(idx) != Some(expected) {
+            return Err(format!(
+                "block_sigma with a single-endpoint [error_model] requires the \
+                 error-model sigma order to match the leading sigma slots; expected \
+                 '{}' at position {}, got '{}'",
+                sigma_names
+                    .get(idx)
+                    .map(String::as_str)
+                    .unwrap_or("<missing>"),
+                idx + 1,
+                expected
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_residual_correlations(
+    error_spec: &ErrorSpec,
+    correlations: &[ResidualCorrelation],
+    sigma_names: &[String],
+) -> Result<(), String> {
+    if correlations.is_empty() {
+        return Ok(());
+    }
+
+    let endpoint_loadings: Vec<Vec<usize>> = match error_spec {
+        ErrorSpec::Single(_) => vec![error_spec
+            .sigma_loadings(0, 1.0, sigma_names.len())
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect()],
+        ErrorSpec::PerCmt(map) => map
+            .keys()
+            .map(|&cmt| {
+                error_spec
+                    .sigma_loadings(cmt, 1.0, sigma_names.len())
+                    .into_iter()
+                    .map(|(idx, _)| idx)
+                    .collect()
+            })
+            .collect(),
+    };
+
+    for corr in correlations {
+        let co_loaded = endpoint_loadings
+            .iter()
+            .any(|loadings| loadings.contains(&corr.sigma_i) && loadings.contains(&corr.sigma_j));
+        if !co_loaded {
+            let left = sigma_names
+                .get(corr.sigma_i)
+                .map(String::as_str)
+                .unwrap_or("<unknown>");
+            let right = sigma_names
+                .get(corr.sigma_j)
+                .map(String::as_str)
+                .unwrap_or("<unknown>");
+            return Err(format!(
+                "block_sigma covariance between '{}' and '{}' is not used by any \
+                 single observation in [error_model]; correlated residual sigmas \
+                 must belong to the same combined endpoint",
+                left, right
+            ));
+        }
+    }
+    Ok(())
 }
 
 // --- Structural model parsing ---
@@ -14235,7 +14467,7 @@ mod tests {
             "omega ETA_CL ~ 0.07".to_string(),
             "omega ETA_V  ~ 0.02".to_string(),
         ];
-        let (_, omegas, block_omegas, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, block_omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(omegas.len(), 2);
         assert_eq!(block_omegas.len(), 0);
         assert_eq!(omegas[0].name, "ETA_CL");
@@ -14245,7 +14477,7 @@ mod tests {
     #[test]
     fn test_parse_block_omega() {
         let lines = vec!["block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string()];
-        let (_, omegas, block_omegas, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, block_omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(omegas.len(), 0);
         assert_eq!(block_omegas.len(), 1);
         assert_eq!(block_omegas[0].names, vec!["ETA_CL", "ETA_V"]);
@@ -14262,7 +14494,7 @@ mod tests {
             "0.02, 0.04".to_string(),
             "]".to_string(),
         ];
-        let (_, omegas, block_omegas, _, eta_names, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, block_omegas, _, _, eta_names, _) = parse_parameters(&lines).unwrap();
         assert_eq!(omegas.len(), 0);
         assert_eq!(block_omegas.len(), 1);
         assert_eq!(block_omegas[0].names, vec!["ETA_CL", "ETA_V"]);
@@ -14278,7 +14510,7 @@ mod tests {
             "block_omega (ETA_CL, ETA_V) = [0.09,".to_string(),
             "0.02, 0.04] FIX".to_string(),
         ];
-        let (_, _, block_omegas, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, _, block_omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(block_omegas.len(), 1);
         assert!(block_omegas[0].fixed);
     }
@@ -14293,7 +14525,7 @@ mod tests {
             "]".to_string(),
             "FIX".to_string(),
         ];
-        let (_, _, block_omegas, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, _, block_omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(block_omegas.len(), 1);
         assert!(block_omegas[0].fixed);
     }
@@ -14305,7 +14537,7 @@ mod tests {
             "0.05, 0.01, 0.03".to_string(),
             "]".to_string(),
         ];
-        let (_, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
+        let (_, _, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
         assert_eq!(kappas.block.len(), 1);
         assert_eq!(kappas.block[0].names, vec!["KAPPA_CL", "KAPPA_V"]);
         assert_eq!(kappas.block[0].lower_triangle, vec![0.05, 0.01, 0.03]);
@@ -14321,7 +14553,7 @@ mod tests {
             "]".to_string(),
             "FIX".to_string(),
         ];
-        let (_, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
+        let (_, _, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
         assert_eq!(kappas.block.len(), 1);
         assert!(kappas.block[0].fixed);
     }
@@ -14332,7 +14564,7 @@ mod tests {
             "block_omega (ETA_CL, ETA_V, ETA_KA) = [0.09, 0.01, 0.04, 0.005, 0.002, 0.16]"
                 .to_string(),
         ];
-        let (_, _, block_omegas, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, _, block_omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(block_omegas[0].names.len(), 3);
         assert_eq!(block_omegas[0].lower_triangle.len(), 6); // 3*(3+1)/2
     }
@@ -14352,7 +14584,7 @@ mod tests {
             "omega ETA_KA ~ 0.40".to_string(),
             "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string(),
         ];
-        let (_, omegas, block_omegas, _, eta_names, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, block_omegas, _, _, eta_names, _) = parse_parameters(&lines).unwrap();
         assert_eq!(omegas.len(), 1);
         assert_eq!(block_omegas.len(), 1);
         // Declaration order preserved: ETA_KA first, then block (ETA_CL, ETA_V)
@@ -14365,7 +14597,7 @@ mod tests {
             "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string(),
             "omega ETA_KA ~ 0.40".to_string(),
         ];
-        let (_, _, _, _, eta_names, _) = parse_parameters(&lines).unwrap();
+        let (_, _, _, _, _, eta_names, _) = parse_parameters(&lines).unwrap();
         // block_omega declared first, so ETA_CL, ETA_V come before ETA_KA
         assert_eq!(eta_names, vec!["ETA_CL", "ETA_V", "ETA_KA"]);
     }
@@ -14438,7 +14670,7 @@ mod tests {
     #[test]
     fn test_parse_theta_fix_without_bounds() {
         let lines = vec!["theta TVCL(0.1, FIX)".to_string()];
-        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(thetas.len(), 1);
         assert!(thetas[0].fixed);
         assert!((thetas[0].init - 0.1).abs() < 1e-12);
@@ -14447,7 +14679,7 @@ mod tests {
     #[test]
     fn test_parse_theta_fix_with_bounds() {
         let lines = vec!["theta TVCL(0.1, 0.01, 1.0, FIX)".to_string()];
-        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(thetas[0].fixed);
         assert!((thetas[0].lower - 0.01).abs() < 1e-12);
         assert!((thetas[0].upper - 1.0).abs() < 1e-12);
@@ -14457,7 +14689,7 @@ mod tests {
     fn test_parse_theta_fix_no_comma_inside_parens() {
         // theta NAME(init FIX) — no comma before FIX
         let lines = vec!["theta TVCL(0.75 FIX)".to_string()];
-        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(thetas.len(), 1);
         assert!(thetas[0].fixed);
         assert!((thetas[0].init - 0.75).abs() < 1e-12);
@@ -14467,7 +14699,7 @@ mod tests {
     fn test_parse_theta_fix_after_paren() {
         // theta NAME(init) FIX — FIX outside closing paren
         let lines = vec!["theta TVCL(0.75) FIX".to_string()];
-        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(thetas.len(), 1);
         assert!(thetas[0].fixed);
         assert!((thetas[0].init - 0.75).abs() < 1e-12);
@@ -14477,7 +14709,7 @@ mod tests {
     fn test_parse_theta_fix_after_paren_with_bounds() {
         // theta NAME(init, lower, upper) FIX — bounds + FIX outside paren
         let lines = vec!["theta TVKA(1.0, 0.01, 10.0) FIX".to_string()];
-        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(thetas.len(), 1);
         assert!(thetas[0].fixed);
         assert!((thetas[0].init - 1.0).abs() < 1e-12);
@@ -14489,7 +14721,7 @@ mod tests {
     fn test_parse_theta_lower_bound_only() {
         // theta NAME(init, lower) — upper defaults to 1e9
         let lines = vec!["theta TVCL(1.0, 0.01)".to_string()];
-        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(thetas.len(), 1);
         assert!(!thetas[0].fixed);
         assert!((thetas[0].init - 1.0).abs() < 1e-12);
@@ -14501,7 +14733,7 @@ mod tests {
     fn test_parse_theta_lower_bound_fix_inside() {
         // theta NAME(init, lower, FIX) — lower only + FIX inside parens
         let lines = vec!["theta TVCL(1.0, 0.01, FIX)".to_string()];
-        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(thetas.len(), 1);
         assert!(thetas[0].fixed);
         assert!((thetas[0].lower - 0.01).abs() < 1e-12);
@@ -14512,7 +14744,7 @@ mod tests {
     fn test_parse_theta_lower_bound_fix_outside() {
         // theta NAME(init, lower) FIX — lower only + FIX after paren
         let lines = vec!["theta TVCL(1.0, 0.01) FIX".to_string()];
-        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(thetas.len(), 1);
         assert!(thetas[0].fixed);
         assert!((thetas[0].lower - 0.01).abs() < 1e-12);
@@ -14522,7 +14754,7 @@ mod tests {
     #[test]
     fn test_parse_theta_unfixed_by_default() {
         let lines = vec!["theta TVCL(0.1, 0.01, 1.0)".to_string()];
-        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(!thetas[0].fixed);
     }
 
@@ -14536,7 +14768,7 @@ mod tests {
             "theta TVV  ( 10 )".to_string(),
             "theta TVKA\t(0.5, FIX)".to_string(),
         ];
-        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(thetas.len(), 3);
         assert_eq!(thetas[0].name, "TVCL");
         assert!((thetas[0].init - 5.0).abs() < 1e-12);
@@ -14552,7 +14784,7 @@ mod tests {
     #[test]
     fn test_parse_omega_fix() {
         let lines = vec!["omega ETA_CL ~ 0.09 FIX".to_string()];
-        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(omegas[0].fixed);
     }
 
@@ -14562,7 +14794,7 @@ mod tests {
         // group-numbering shift (annotation moved 3→4) didn't regress the
         // common case.
         let lines = vec!["omega ETA_CL ~ 0.09".to_string()];
-        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(!omegas[0].fixed);
         assert!(!omegas[0].init_as_sd);
         assert!((omegas[0].variance - 0.09).abs() < 1e-12);
@@ -14573,7 +14805,7 @@ mod tests {
         // `FIX (sd) FIX` — both FIX groups fire; result must still be fixed
         // with SD squaring applied.
         let lines = vec!["omega ETA_CL ~ 0.30 FIX (sd) FIX".to_string()];
-        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         let expected = 0.30 * 0.30;
         assert!((omegas[0].variance - expected).abs() < 1e-12);
         assert!(omegas[0].fixed);
@@ -14583,14 +14815,120 @@ mod tests {
     #[test]
     fn test_parse_sigma_fix() {
         let lines = vec!["sigma PROP ~ 0.05 FIX".to_string()];
-        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(sigmas[0].fixed);
+    }
+
+    #[test]
+    fn test_parse_block_sigma_builds_sigmas_and_correlation() {
+        let lines = vec!["block_sigma (PROP, ADD) = [0.04, 0.10, 1.0]".to_string()];
+        let (_, _, _, sigmas, block_sigmas, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(sigmas.len(), 2);
+        assert_eq!(sigmas[0].name, "PROP");
+        assert_eq!(sigmas[1].name, "ADD");
+        assert!((sigmas[0].value - 0.2).abs() < 1e-12);
+        assert!((sigmas[1].value - 1.0).abs() < 1e-12);
+
+        let sigma_names: Vec<String> = sigmas.iter().map(|s| s.name.clone()).collect();
+        let corrs = build_residual_correlations(&block_sigmas, &sigma_names).unwrap();
+        assert_eq!(corrs.len(), 1);
+        assert_eq!(corrs[0].sigma_i, 1);
+        assert_eq!(corrs[0].sigma_j, 0);
+        assert!((corrs[0].rho - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_block_sigma_fix_marks_sigmas_fixed() {
+        let lines = vec!["block_sigma (PROP, ADD) = [0.04, 0.10, 1.0] FIX".to_string()];
+        let (_, _, _, sigmas, block_sigmas, _, _) = parse_parameters(&lines).unwrap();
+        assert!(sigmas.iter().all(|s| s.fixed));
+        assert!(block_sigmas[0].fixed);
+    }
+
+    #[test]
+    fn test_parse_block_sigma_wrong_triangle_count_errs() {
+        // (PROP, ADD) needs 3 lower-triangle values; only 2 supplied.
+        let lines = vec!["block_sigma (PROP, ADD) = [0.04, 1.0]".to_string()];
+        let Err(err) = parse_parameters(&lines) else {
+            panic!("expected an error for a short lower triangle");
+        };
+        assert!(err.contains("lower-triangle"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_block_sigma_negative_variance_errs() {
+        let lines = vec!["block_sigma (PROP, ADD) = [-0.04, 0.10, 1.0]".to_string()];
+        let Err(err) = parse_parameters(&lines) else {
+            panic!("expected an error for a negative variance");
+        };
+        assert!(err.contains("negative initial variance"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_block_sigma_non_finite_covariance_errs() {
+        let lines = vec!["block_sigma (PROP, ADD) = [0.04, inf, 1.0]".to_string()];
+        let Err(err) = parse_parameters(&lines) else {
+            panic!("expected an error for a non-finite covariance");
+        };
+        assert!(err.contains("non-finite"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_residual_correlations_zero_diagonal_errs() {
+        // A non-zero covariance against a zero diagonal variance is rejected.
+        let block = BlockSigmaSpec {
+            names: vec!["A".to_string(), "B".to_string()],
+            lower_triangle: vec![0.0, 0.1, 1.0],
+            fixed: true,
+        };
+        let names = vec!["A".to_string(), "B".to_string()];
+        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        assert!(err.contains("positive diagonal variances"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_residual_correlations_invalid_rho_errs() {
+        // cov 0.10 with both variances 0.04 implies ρ = 0.10/(0.2·0.2) = 2.5 > 1.
+        let block = BlockSigmaSpec {
+            names: vec!["A".to_string(), "B".to_string()],
+            lower_triangle: vec![0.04, 0.10, 0.04],
+            fixed: true,
+        };
+        let names = vec!["A".to_string(), "B".to_string()];
+        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        assert!(err.contains("invalid correlation"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_residual_correlations_unknown_name_errs() {
+        // Valid covariance, but the block names are absent from `sigma_names`.
+        let block = BlockSigmaSpec {
+            names: vec!["X".to_string(), "Y".to_string()],
+            lower_triangle: vec![1.0, 0.5, 1.0],
+            fixed: true,
+        };
+        let names = vec!["A".to_string(), "B".to_string()];
+        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        assert!(err.contains("unknown sigma"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_residual_correlations_zero_covariance_omitted() {
+        // A zero off-diagonal entry carries no correlation, so no entry is built.
+        let block = BlockSigmaSpec {
+            names: vec!["A".to_string(), "B".to_string()],
+            lower_triangle: vec![0.04, 0.0, 1.0],
+            fixed: true,
+        };
+        let names = vec!["A".to_string(), "B".to_string()];
+        let corrs = build_residual_correlations(&[block], &names).unwrap();
+        assert!(corrs.is_empty());
     }
 
     #[test]
     fn test_parse_block_omega_fix() {
         let lines = vec!["block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04] FIX".to_string()];
-        let (_, _, blocks, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, _, blocks, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(blocks[0].fixed);
     }
 
@@ -14601,7 +14939,7 @@ mod tests {
             "omega ETA ~ 0.05 Fix".to_string(),
             "sigma S ~ 0.02 FIX".to_string(),
         ];
-        let (thetas, omegas, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        let (thetas, omegas, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(thetas[0].fixed);
         assert!(omegas[0].fixed);
         assert!(sigmas[0].fixed);
@@ -14613,7 +14951,7 @@ mod tests {
     fn test_omega_default_is_variance() {
         // No annotation: value is stored verbatim as variance.
         let lines = vec!["omega ETA_CL ~ 0.07".to_string()];
-        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert!((omegas[0].variance - 0.07).abs() < 1e-12);
         assert!(!omegas[0].init_as_sd);
     }
@@ -14622,7 +14960,7 @@ mod tests {
     fn test_omega_sd_annotation_squares_value() {
         // `(sd)` → variance is the square of the raw value.
         let lines = vec!["omega ETA_CL ~ 0.265 (sd)".to_string()];
-        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         let expected = 0.265 * 0.265;
         assert!((omegas[0].variance - expected).abs() < 1e-12);
         assert!(omegas[0].init_as_sd);
@@ -14635,7 +14973,7 @@ mod tests {
             "omega ETA_CL ~ 0.07 (variance)".to_string(),
             "omega ETA_V  ~ 0.04 (var)".to_string(),
         ];
-        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert!((omegas[0].variance - 0.07).abs() < 1e-12);
         assert!(!omegas[0].init_as_sd);
         assert!((omegas[1].variance - 0.04).abs() < 1e-12);
@@ -14646,7 +14984,7 @@ mod tests {
     fn test_omega_sd_annotation_with_fix() {
         // `(sd) FIX` — both annotations must be honored together.
         let lines = vec!["omega ETA_CL ~ 0.30 (sd) FIX".to_string()];
-        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         let expected = 0.30 * 0.30;
         assert!((omegas[0].variance - expected).abs() < 1e-12);
         assert!(omegas[0].fixed);
@@ -14657,7 +14995,7 @@ mod tests {
     fn test_omega_fix_before_sd_annotation() {
         // `FIX (sd)` — FIX before the scale annotation.
         let lines = vec!["omega ETA_CL ~ 0.30 FIX (sd)".to_string()];
-        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         let expected = 0.30 * 0.30;
         assert!((omegas[0].variance - expected).abs() < 1e-12);
         assert!(omegas[0].fixed);
@@ -14668,7 +15006,7 @@ mod tests {
     fn test_omega_fix_before_annotation_no_sd() {
         // `FIX` before a no-op annotation — fixed and variance-scale.
         let lines = vec!["omega ETA_CL ~ 0.09 FIX (variance)".to_string()];
-        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert!((omegas[0].variance - 0.09).abs() < 1e-12);
         assert!(omegas[0].fixed);
         assert!(!omegas[0].init_as_sd);
@@ -14678,7 +15016,7 @@ mod tests {
     fn test_sigma_fix_before_sd_annotation() {
         // `FIX (sd)` — FIX before the scale annotation for sigma.
         let lines = vec!["sigma PROP ~ 0.30 FIX (sd)".to_string()];
-        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(sigmas[0].fixed);
         assert!(sigmas[0].init_as_sd);
         assert!((sigmas[0].value - 0.30).abs() < 1e-12);
@@ -14688,7 +15026,7 @@ mod tests {
     fn test_sigma_fix_after_sd_annotation() {
         // `(sd) FIX` — existing form still works.
         let lines = vec!["sigma PROP ~ 0.30 (sd) FIX".to_string()];
-        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(sigmas[0].fixed);
         assert!(sigmas[0].init_as_sd);
     }
@@ -14698,7 +15036,7 @@ mod tests {
         // Baseline: plain sigma with no FIX and no annotation — confirms the
         // group-numbering shift didn't regress the common case.
         let lines = vec!["sigma PROP ~ 0.04".to_string()];
-        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(!sigmas[0].fixed);
         assert!(!sigmas[0].init_as_sd);
         // Stored as SD internally: sqrt(0.04) = 0.2
@@ -14710,7 +15048,7 @@ mod tests {
         // Since #56, the default sigma input is variance — the parser sqrt's
         // it into the internal SD representation that the likelihood uses.
         let lines = vec!["sigma PROP ~ 0.04".to_string()];
-        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
         // Stored value is SD = sqrt(variance) = sqrt(0.04) = 0.2.
         assert!((sigmas[0].value - 0.2).abs() < 1e-12);
         assert!(!sigmas[0].init_as_sd);
@@ -14720,7 +15058,7 @@ mod tests {
     fn test_sigma_sd_annotation_stores_value_as_is() {
         // `(sd)` → the value is already on the SD scale, no transform.
         let lines = vec!["sigma PROP ~ 0.2 (sd)".to_string()];
-        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
         assert!((sigmas[0].value - 0.2).abs() < 1e-12);
         assert!(sigmas[0].init_as_sd);
     }
@@ -14733,7 +15071,7 @@ mod tests {
             "sigma A ~ 0.0004".to_string(),    // variance 0.0004
             "sigma B ~ 0.02 (sd)".to_string(), // SD 0.02
         ];
-        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
         assert!((sigmas[0].value - sigmas[1].value).abs() < 1e-12);
     }
 
@@ -14781,7 +15119,7 @@ mod tests {
     #[test]
     fn test_kappa_sd_annotation_squares_value() {
         let lines = vec!["kappa KAPPA_CL ~ 0.25 (sd)".to_string()];
-        let (_, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
+        let (_, _, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
         let k = &kappas.diagonal[0];
         let expected = 0.25 * 0.25;
         assert!((k.variance - expected).abs() < 1e-12);
@@ -14796,7 +15134,7 @@ mod tests {
             "omega ETA_B ~ 0.2 (Sd)".to_string(),
             "omega ETA_C ~ 0.3 (sd)".to_string(),
         ];
-        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(omegas.iter().all(|o| o.init_as_sd));
     }
 
@@ -14811,7 +15149,7 @@ mod tests {
         // behavior; anything else is silently ignored, consistent with the
         // parser's existing FIXED-vs-FIX handling.)
         let lines = vec!["omega ETA_CL ~ 0.07 (foo)".to_string()];
-        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert_eq!(omegas.len(), 1);
         assert!((omegas[0].variance - 0.07).abs() < 1e-12);
         assert!(!omegas[0].init_as_sd);
@@ -14866,12 +15204,127 @@ mod tests {
             "sigma PROP ~ 0.02 FIXED".to_string(),
             "block_omega (A, B) = [1.0, 0.0, 1.0] FIXED".to_string(),
         ];
-        let (_, omegas, blocks, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        let (_, omegas, blocks, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
         // omega/sigma still parse (trailing `FIXED` is ignored) but must NOT
         // be marked fixed.
         assert!(!omegas[0].fixed);
         assert!(!sigmas[0].fixed);
         assert!(!blocks[0].fixed);
+    }
+
+    #[test]
+    fn test_parse_full_model_block_sigma_combined_builds_correlation() {
+        // End-to-end: a combined-error model whose two sigmas are declared via
+        // block_sigma must carry one residual correlation into CompiledModel.
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.0] FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+"#;
+        let parsed = parse_full_model(content).unwrap();
+        assert_eq!(parsed.model.residual_correlations.len(), 1);
+        let c = parsed.model.residual_correlations[0];
+        // cov 0.10 / (sqrt(0.04)·sqrt(1.0)) = 0.10 / 0.2 = 0.5.
+        assert!((c.rho - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_full_model_block_sigma_single_endpoint_order_mismatch_errs() {
+        // Single-endpoint error models use the leading sigma slots
+        // positionally; with block_sigma present, reject a name order that
+        // would silently bind the proportional/additive components backwards.
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (ADD_ERR, PROP_ERR) = [1.0, 0.10, 0.04] FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+"#;
+        let err = expect_parse_err(content);
+        assert!(
+            err.contains("block_sigma") && err.contains("sigma order"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_full_model_block_sigma_cross_endpoint_covariance_errs() {
+        // A covariance between sigmas that never co-load on the same
+        // observation would be skipped by the variance helper. Reject it at
+        // parse time so users do not think a cross-endpoint covariance is in
+        // the likelihood.
+        let content = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (S_PROP, S_PD) = [0.04, 0.10, 1.0] FIX
+  sigma S_ADD ~ 1.0 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central, effect])
+
+[odes]
+  d/dt(central) = -CL/V * central
+  d/dt(effect)  =  central/V - effect
+
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = effect
+
+[error_model]
+  CMT=1: DV ~ combined(S_PROP, S_ADD)
+  CMT=2: DV ~ additive(S_PD)
+"#;
+        let err = expect_parse_err(content);
+        assert!(
+            err.contains("block_sigma") && err.contains("same combined endpoint"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_full_model_duplicate_sigma_name_errs() {
+        // A plain sigma colliding with a block_sigma entry is rejected.
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.0] FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+"#;
+        let Err(err) = parse_full_model(content) else {
+            panic!("expected a duplicate-sigma-name error");
+        };
+        assert!(err.contains("more than once"), "got: {err}");
     }
 
     #[test]
@@ -15510,7 +15963,7 @@ mod tests {
     #[test]
     fn test_parse_kappa_keyword() {
         let lines = vec!["kappa KAPPA_CL ~ 0.01".to_string()];
-        let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+        let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
         assert_eq!(ki.diagonal.len(), 1);
         assert_eq!(ki.diagonal[0].name, "KAPPA_CL");
         assert!((ki.diagonal[0].variance - 0.01).abs() < 1e-12);
@@ -15520,7 +15973,7 @@ mod tests {
     #[test]
     fn test_parse_kappa_fix() {
         let lines = vec!["kappa KAPPA_V ~ 0.05 FIX".to_string()];
-        let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+        let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
         assert!(ki.diagonal[0].fixed);
     }
 
@@ -15529,7 +15982,7 @@ mod tests {
         // Baseline: plain kappa with no FIX and no annotation — confirms the
         // group-numbering shift didn't regress the common case.
         let lines = vec!["kappa KAPPA_V ~ 0.05".to_string()];
-        let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+        let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
         assert!(!ki.diagonal[0].fixed);
         assert!(!ki.diagonal[0].init_as_sd);
         assert!((ki.diagonal[0].variance - 0.05).abs() < 1e-12);
@@ -15539,7 +15992,7 @@ mod tests {
     fn test_kappa_fix_before_sd_annotation() {
         // `FIX (sd)` — FIX before the scale annotation for kappa.
         let lines = vec!["kappa KAPPA_V ~ 0.30 FIX (sd)".to_string()];
-        let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+        let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
         let expected = 0.30 * 0.30;
         assert!((ki.diagonal[0].variance - expected).abs() < 1e-12);
         assert!(ki.diagonal[0].fixed);
@@ -15554,7 +16007,7 @@ mod tests {
             "omega ETA_CL ~ 0.09".to_string(),
             "kappa KAPPA_CL ~ 0.01".to_string(),
         ];
-        let (_, _, _, _, bsv_etas, ki) = parse_parameters(&lines).unwrap();
+        let (_, _, _, _, _, bsv_etas, ki) = parse_parameters(&lines).unwrap();
         assert_eq!(bsv_etas, vec!["ETA_CL"]);
         assert_eq!(ki.diagonal.len(), 1);
         assert_eq!(ki.diagonal[0].name, "KAPPA_CL");
@@ -15619,7 +16072,7 @@ mod tests {
     #[test]
     fn test_parse_block_kappa_syntax() {
         let lines = vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002, 0.005]".to_string()];
-        let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+        let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
         assert_eq!(ki.diagonal.len(), 0);
         assert_eq!(ki.block.len(), 1);
         assert_eq!(ki.block[0].names, vec!["KAPPA_CL", "KAPPA_V"]);
@@ -15631,7 +16084,7 @@ mod tests {
     #[test]
     fn test_parse_block_kappa_fix() {
         let lines = vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002, 0.005] FIX".to_string()];
-        let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+        let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
         assert!(ki.block[0].fixed);
     }
 

@@ -626,6 +626,18 @@ pub fn build_frem_r_override(
     )
 }
 
+fn apply_frem_r_matrix_overrides(r_matrix: &mut DMatrix<f64>, overrides: &[Option<f64>]) {
+    for (j, ov) in overrides.iter().enumerate() {
+        if let (Some(v), true) = (ov, j < r_matrix.nrows()) {
+            for k in 0..r_matrix.ncols() {
+                r_matrix[(j, k)] = 0.0;
+                r_matrix[(k, j)] = 0.0;
+            }
+            r_matrix[(j, j)] = *v;
+        }
+    }
+}
+
 /// path — so inside this function the only case we need to handle is
 /// `bloq_method == Drop` (treat CENS rows as ordinary obs) or no CENS at all.
 pub fn foce_subject_nll_standard(
@@ -677,15 +689,7 @@ pub fn foce_subject_nll_standard(
         }
     }
     if let Some(overrides) = frem_r_override {
-        for (j, ov) in overrides.iter().enumerate() {
-            if let (Some(v), true) = (ov, j < r_matrix.nrows()) {
-                for k in 0..r_matrix.ncols() {
-                    r_matrix[(j, k)] = 0.0;
-                    r_matrix[(k, j)] = 0.0;
-                }
-                r_matrix[(j, j)] = *v;
-            }
-        }
+        apply_frem_r_matrix_overrides(&mut r_matrix, overrides);
     }
     let r_diag: Vec<f64> = (0..r_matrix.nrows()).map(|j| r_matrix[(j, j)]).collect();
 
@@ -1349,6 +1353,7 @@ pub fn compute_cwres(
     sigma_values: &[f64],
     error_spec: &ErrorSpec,
     residual_correlations: &[ResidualCorrelation],
+    frem_r_override: Option<&[Option<f64>]>,
     // IIV-on-RUV eta index (or None). Scales the residual diagonal `R` by
     // exp(2·η̂_ruv) so CWRES uses the subject's actual residual SD (#409).
     residual_error_eta: Option<usize>,
@@ -1374,9 +1379,24 @@ pub fn compute_cwres(
         sigma_values,
         residual_correlations,
     );
+    if let Some(overrides) = frem_r_override {
+        apply_frem_r_matrix_overrides(&mut r_matrix, overrides);
+    }
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
     if ruv_scale != 1.0 {
-        r_matrix *= ruv_scale;
+        if let Some(overrides) = frem_r_override {
+            for j in 0..r_matrix.nrows() {
+                let j_is_frem = overrides.get(j).and_then(|x| *x).is_some();
+                for k in 0..r_matrix.ncols() {
+                    let k_is_frem = overrides.get(k).and_then(|x| *x).is_some();
+                    if !j_is_frem && !k_is_frem {
+                        r_matrix[(j, k)] *= ruv_scale;
+                    }
+                }
+            }
+        } else {
+            r_matrix *= ruv_scale;
+        }
     }
     let r_tilde = compute_r_tilde_with_r(h_matrix, &omega.matrix, &r_matrix);
 
@@ -1591,6 +1611,7 @@ mod tests {
     use crate::types::{
         BloqMethod, DoseEvent, ErrorModel, ErrorSpec, GradientMethod, PkModel, PkParams,
     };
+    use approx::assert_relative_eq;
     use std::collections::HashMap;
 
     fn make_simple_subject() -> Subject {
@@ -2219,6 +2240,54 @@ mod tests {
             (focei - focei_none).abs() > 1e-6,
             "residual-eta marginal must differ from the no-RUV-eta marginal"
         );
+    }
+
+    #[test]
+    fn compute_cwres_does_not_scale_frem_rows_by_iiv_on_ruv() {
+        let subject = Subject {
+            id: "1".to_string(),
+            doses: Vec::new(),
+            obs_times: vec![1.0, 2.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![11.0, 21.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: vec![0, 100],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let ipreds = vec![10.0, 20.0];
+        let eta_hat = DVector::from_vec(vec![0.5]);
+        let h = DMatrix::<f64>::zeros(2, 1);
+        let omega = OmegaMatrix::from_diagonal(&[0.1], vec!["ETA_RUV".into()]);
+        let sigma = vec![2.0, 0.5];
+        let overrides = vec![None, Some(0.25)];
+
+        let cwres = compute_cwres(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h,
+            &omega,
+            &sigma,
+            &ErrorSpec::Single(ErrorModel::Additive),
+            &[],
+            Some(&overrides),
+            Some(0),
+        );
+
+        let pk_expected = 1.0 / (sigma[0] * eta_hat[0].exp());
+        let frem_expected = 1.0 / sigma[1];
+        assert_relative_eq!(cwres[0], pk_expected, epsilon = 1e-12);
+        assert_relative_eq!(cwres[1], frem_expected, epsilon = 1e-12);
     }
 
     /// IIV on residual error (#409): `individual_nll` must multiply the residual

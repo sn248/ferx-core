@@ -534,9 +534,13 @@ pub fn find_ebe(
     // and then overridden, which keeps the diff minimal and trivially
     // revertible while the values come from the exact sensitivities.
     let t_jac = std::time::Instant::now();
-    let analytic_jac: Option<DMatrix<f64>> =
+    let analytic_jac: Option<DMatrix<f64>> = if analytic_inner_grad_supported(model, subject) {
         crate::sens::provider::subject_eta_jacobian(model, subject, &params.theta, &eta_true)
-            .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j));
+            .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j))
+            .filter(|j| j.iter().all(|v| v.is_finite()))
+    } else {
+        None
+    };
     if analytic_jac.is_some() {
         GRADIENT_TIMINGS.record_jac_analytic(t_jac.elapsed().as_nanos() as u64);
     }
@@ -2045,6 +2049,7 @@ pub fn run_inner_loop_warm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     /// The M3 censored coefficient `∂/∂f[−logΦ((y−f)/√v)]` must equal a central
     /// finite difference of that data term — across additive (`dv_df = 0`) and
@@ -2084,6 +2089,86 @@ mod tests {
                 "f={f}, sig_add={sig_add}, sig_prop={sig_prop}: analytic {analytic} vs FD {fd}"
             );
         }
+    }
+
+    #[test]
+    fn find_ebe_uses_fd_h_matrix_when_inner_gradient_forced_fd() {
+        use crate::parser::model_parser::parse_model_string;
+
+        let mut model = parse_model_string(
+            r#"
+[parameters]
+  theta TVCL(0.15, 0.01, 10.0)
+  theta TVV(5.0, 0.1, 100.0)
+  theta TVIMAX(-0.3, -10.0, 10.0)
+  theta TVTI50(100.0, 1.0, 700.0)
+  theta TVHILL(3.0, 0.1, 10.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.01
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  IMAX = TVIMAX
+  TI50 = TVTI50
+  HILL = TVHILL
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL * exp(IMAX * TIME^HILL / (TI50^HILL + TIME^HILL)) / V) * central
+
+[scaling]
+  obs_scale = V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  gradient = fd
+"#,
+        )
+        .expect("parse");
+        model.gradient_method = GradientMethod::Fd;
+
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 200.0, 1, 9600.0, false, 0.0)],
+            obs_times: vec![20.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![12.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+
+        let result = find_ebe(
+            &model,
+            &subject,
+            &model.default_params,
+            50,
+            1e-5,
+            None,
+            None,
+        );
+
+        assert!(
+            result.h_matrix.iter().all(|v| v.is_finite()),
+            "forced-FD inner route must not consume a non-finite analytic h_matrix: {:?}",
+            result.h_matrix
+        );
     }
 
     /// End-to-end: the analytic M3 inner η-gradient must match a central finite

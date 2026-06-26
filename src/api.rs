@@ -10,7 +10,9 @@ use crate::io::datareader::{
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
-use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
+use crate::stats::likelihood::{
+    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
+};
 use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -953,6 +955,17 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     "E_BLOCK_SIGMA_IIV_ON_RUV_UNSUPPORTED",
                     "block_sigma correlated residual errors are not yet supported with \
                      iiv_on_ruv residual-error scaling.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if model.n_kappa > 0 {
+            diags.push(
+                Diagnostic::error(
+                    "E_BLOCK_SIGMA_IOV_UNSUPPORTED",
+                    "block_sigma correlated residual errors are not yet supported with \
+                     inter-occasion variability (κ / [iov]) because the IOV inner \
+                     objective does not yet use the full residual covariance matrix.",
                 )
                 .with_block("fit_options"),
             );
@@ -4108,6 +4121,11 @@ fn compute_subject_results(
             }
 
             // CWRES
+            let frem_r_override = build_frem_r_override(
+                model.frem_config.as_ref(),
+                &subject.fremtype,
+                &params.sigma.values,
+            );
             let cwres = compute_cwres(
                 subject,
                 &ipred,
@@ -4117,6 +4135,7 @@ fn compute_subject_results(
                 &params.sigma.values,
                 &model.error_spec,
                 &model.residual_correlations,
+                frem_r_override.as_deref(),
                 model.residual_error_eta,
             );
 
@@ -5953,6 +5972,27 @@ mod iov_integration {
         assert!(!super::check_model_options(&model, &foce)
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+    }
+
+    #[test]
+    fn test_check_model_options_block_sigma_rejects_iov() {
+        let mut model = make_iov_model();
+        model.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        let diags = super::check_model_options(&model, &opts);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_BLOCK_SIGMA_IOV_UNSUPPORTED")
+            .expect("expected E_BLOCK_SIGMA_IOV_UNSUPPORTED for block_sigma + IOV");
+
+        assert!(d.is_error());
+        assert!(d.message.contains("inter-occasion"));
+        assert_eq!(d.block.as_deref(), Some("fit_options"));
     }
 
     // IMPMAP does not yet support IOV; `ferx check` must flag it up front rather

@@ -63,13 +63,8 @@ pub fn compute_r_diag_with_correlations(
         .collect()
 }
 
-fn observation_time_key(obs_times: &[f64], obs_raw_times: &[f64], j: usize) -> u64 {
-    obs_raw_times
-        .get(j)
-        .or_else(|| obs_times.get(j))
-        .copied()
-        .unwrap_or(0.0)
-        .to_bits()
+fn observation_time_key(obs_times: &[f64], j: usize) -> u64 {
+    obs_times.get(j).copied().unwrap_or(0.0).to_bits()
 }
 
 fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
@@ -78,13 +73,12 @@ fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
 
 fn same_residual_block(
     obs_times: &[f64],
-    obs_raw_times: &[f64],
+    _obs_raw_times: &[f64],
     occasions: &[u32],
     j: usize,
     k: usize,
 ) -> bool {
-    observation_time_key(obs_times, obs_raw_times, j)
-        == observation_time_key(obs_times, obs_raw_times, k)
+    observation_time_key(obs_times, j) == observation_time_key(obs_times, k)
         && observation_occasion_key(occasions, j) == observation_occasion_key(occasions, k)
 }
 
@@ -442,6 +436,52 @@ mod tests {
         assert_relative_eq!(r[(0, 1)], 50.0 * 5.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
         assert_relative_eq!(r[(1, 0)], r[(0, 1)], epsilon = 1e-12);
         assert_eq!(r[(0, 2)], 0.0);
+    }
+
+    #[test]
+    fn test_compute_r_matrix_with_correlations_uses_shifted_time_after_reset() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let ipreds = [50.0, 5.0, 40.0, 4.0];
+        let cmts = [1usize, 2, 1, 2];
+        let shifted_times = [1.0, 1.0, 101.0, 101.0];
+        let raw_times = [1.0, 1.0, 1.0, 1.0];
+        let sigma = [0.2, 0.3];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+
+        let r = compute_r_matrix_with_correlations(
+            &spec,
+            &ipreds,
+            &cmts,
+            &shifted_times,
+            &raw_times,
+            &[],
+            &sigma,
+            &[corr],
+        );
+
+        assert_relative_eq!(r[(0, 1)], 50.0 * 5.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
+        assert_relative_eq!(r[(2, 3)], 40.0 * 4.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
+        assert_eq!(r[(0, 3)], 0.0);
+        assert_eq!(r[(1, 2)], 0.0);
     }
 
     #[test]

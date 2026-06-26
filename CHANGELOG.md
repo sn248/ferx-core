@@ -153,6 +153,10 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- Reject `block_sigma` with IOV until the IOV inner objective supports the full
+  residual covariance matrix, use shifted times when pairing reset-segment
+  residual blocks, and keep FREM CWRES variances unscaled by `iiv_on_ruv`
+  (#549).
 - **Form C (`[scaling] y = <expr>`) ODE readouts now use per-observation covariate
   snapshots** (#535, #538). The explicit-output readout is evaluated against the
   covariate values on each observation's own data row rather than the subject's

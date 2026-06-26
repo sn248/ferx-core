@@ -24,7 +24,11 @@ section of the SDLC for the versioning policy).
   (#536). A `==`/`!=` condition may now compare a covariate column against an unquoted
   label, matched against the raw cell value — so a non-numeric comment-flag column (the
   NONMEM convention of a `C` column holding the literal `C`) is dropped correctly:
-  `ignore = C == C`. The bare shorthand `ignore = C` expands to `C == C`.
+  `ignore = C == C`. The bare shorthand `ignore = C` expands to `C == C`. A non-numeric
+  value against a *standard* numeric column (e.g. `DV == 0.O01` with a letter O) is now a
+  parse error rather than a silent never-matching no-op, and a clause referencing a column
+  absent from the data emits a `W_FILTER_COLUMN_ABSENT` warning instead of fitting
+  unfiltered data silently.
 - **Exact analytic FOCE/FOCEI gradients for steady-state (SS=1) ODE dosing** (#439). User-
   `[odes]` models with a steady-state dose now get exact analytic gradients instead of
   finite differences. NONMEM SS=1 loads the compartments with an infinite-past pulse

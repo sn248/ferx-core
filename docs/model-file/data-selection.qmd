@@ -99,7 +99,7 @@ of the CSV).  An entirely excluded subject does not appear in any output.
 | `CENS` | numeric | |
 | `II`   | numeric | |
 | `SS`   | numeric | |
-| any covariate column | numeric | case-insensitive (`BW`, `bw`, `Bw` all match) |
+| any covariate column | numeric, or string via `==`/`!=` | case-insensitive (`BW`, `bw`, `Bw` all match); a non-numeric label column (e.g. NONMEM's comment flag `C`) is compared as a raw string — see [Comment-flag column](#comment-flag-column-ignorec) |
 
 Column names in expressions are case-insensitive.
 
@@ -165,9 +165,9 @@ by an earlier rule will not appear in the fired list.
   instead — each line is already an independent "any of these reasons"
   condition.
 - `AND` / `OR` keywords are not supported; use `&&` within a line.
-- String comparisons are limited to `==` and `!=`. Ordered comparisons
-  (`<`, `<=`, `>`, `>=`) on `ID` are rejected at parse time, since `ID` is a
-  string label — use `==`/`!=` or `ignore_subjects`.
+- String comparisons (`ID` or a non-numeric label column) are limited to `==`
+  and `!=`. Ordered comparisons (`<`, `<=`, `>`, `>=`) on a string value are
+  rejected at parse time — use `==`/`!=` or `ignore_subjects`.
 - `ADDL` and the occasion / IOV column are **not** filter targets; a condition
   referencing them is an inert no-op. Filter on the columns in the table above
   (or expand `ADDL` rows beforehand if you must select on dose number).
@@ -176,10 +176,16 @@ by an earlier rule will not appear in the fired list.
   which records the filter removes. This matters only when filtering on a
   time-varying covariate whose value differs on the rows being excluded.
 - A column name that is not present in the dataset always evaluates to false
-  (never fires), so a typo silently has no effect — check the exclusion summary
-  if a condition is not being applied. (Covariate columns referenced by a
-  condition are read even when a `[covariates]` block does not declare them, so
-  filtering on an undeclared covariate works as expected.)
+  (never fires). This is surfaced as a `W_FILTER_COLUMN_ABSENT` warning naming
+  the missing column(s), so a typo (e.g. `ignore = Coment`) no longer silently
+  has no effect. (Covariate columns referenced by a condition are read even when
+  a `[covariates]` block does not declare them, so filtering on an undeclared
+  covariate works as expected.)
+- A non-numeric value against a **standard** numeric column (the columns in the
+  table above, e.g. `DV == 0.O01` with a letter O, or `EVID == abc`) is rejected
+  at parse time. Such a comparison could never match, so it is treated as a typo
+  rather than a silent no-op. Unquoted string labels are only meaningful against
+  a covariate/label column (the `IGNORE(C.EQ.C)` case).
 - The covariate table echo (`*-covtab.csv`, written only when a `[covariates]`
   block is declared) is a faithful echo of the **raw input file** and therefore
   still lists records that `[data_selection]` excluded from the fit. The fit
@@ -203,10 +209,33 @@ See the ferx-r documentation for `ferx_selection()` and `ferx_fit()`.
 
 | NONMEM | ferx |
 |--------|------|
-| `$DATA IGNORE=C` | `[data_selection]  ignore = C == 1` |
+| `$DATA IGNORE=C` | `[data_selection]  ignore = C` |
+| `$DATA IGNORE=(C.EQ.C)` | `[data_selection]  ignore = C == C` |
 | `$DATA IGNORE=(BW.GT.80)` | `[data_selection]  ignore = BW > 80` |
 | `$DATA ACCEPT=(DV.GE.0.001)` | `[data_selection]  accept = DV >= 0.001` |
 | `$DATA IGNORE=(ID.EQ.3) IGNORE=(ID.EQ.17)` | `[data_selection]  ignore_subjects = [3, 17]` |
 
 ferx uses standard inequality operators (`>`, `>=`, `<`, `<=`, `==`, `!=`)
 instead of NONMEM's Fortran-style `.GT.`, `.GE.`, etc.
+
+### Comment-flag column (`IGNORE=C`)
+
+NONMEM commonly drops comment rows with a label column — conventionally named
+`C` — that holds the literal character `C` on rows to skip and a numeric value
+(e.g. `0`) on real records. ferx mirrors both spellings:
+
+```toml
+[data_selection]
+  ignore = C == C    # drop rows whose C column equals the literal "C"
+```
+
+```toml
+[data_selection]
+  ignore = C         # shorthand: expands to `C == C`
+```
+
+The right-hand side of `==` / `!=` may be an unquoted label (compared as a
+string against the **raw** cell value), so a non-numeric flag column the numeric
+covariate machinery would otherwise drop is matched correctly. The bare form
+`ignore = X` is shorthand for `X == X` — it ignores rows whose `X` column holds
+the literal text `X`.

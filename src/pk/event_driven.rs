@@ -375,7 +375,11 @@ fn equilibrate_ss_state_event_driven(
 
     // Constant params across all SS-equilibration cycles → one eigendata solve.
     let mut eigen = crate::sens::propagate::EigenCacheG::default();
-    for _ in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
+    // Shared early stop (#519, #532 review #6/#11): same mixed atol/rtol criterion and scaffold
+    // (`SsStopTracker`) as the ODE f64 path.
+    let mut tracker = crate::ode::predictions::SsStopTracker::default();
+    let mut cycles_run = 0usize;
+    for cycle in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
         if !is_inf {
             // Bolus pulse: instantaneous amount jump (with F).
             state[cmt_idx] += pk.bioavailable_amount(dose.amt);
@@ -390,7 +394,12 @@ fn equilibrate_ss_state_event_driven(
             f64::NEG_INFINITY,
             &mut eigen,
         );
+        cycles_run = cycle + 1;
+        if tracker.should_stop(cycle, &state) {
+            break;
+        }
     }
+    crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
 
     state
 }

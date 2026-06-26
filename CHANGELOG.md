@@ -33,6 +33,15 @@ section of the SDLC for the versioning policy).
   albumin-dependent protein binding): the analytic `∂f/∂η`/`∂f/∂θ` match the production
   predictor and its central finite differences to ~1e-6 for both subject-static and
   per-observation `FREE` snapshots (`ode_provider_form_c_*` tests).
+- **`[data_selection]` string equality on label columns, mirroring NONMEM `IGNORE(C.EQ.C)`**
+  (#536). A `==`/`!=` condition may now compare a covariate column against an unquoted
+  label, matched against the raw cell value — so a non-numeric comment-flag column (the
+  NONMEM convention of a `C` column holding the literal `C`) is dropped correctly:
+  `ignore = C == C`. The bare shorthand `ignore = C` expands to `C == C`. A non-numeric
+  value against a *standard* numeric column (e.g. `DV == 0.O01` with a letter O) is now a
+  parse error rather than a silent never-matching no-op, and a clause referencing a column
+  absent from the data emits a `W_FILTER_COLUMN_ABSENT` warning instead of fitting
+  unfiltered data silently.
 - **Exact analytic FOCE/FOCEI gradients for steady-state (SS=1) ODE dosing** (#439). User-
   `[odes]` models with a steady-state dose now get exact analytic gradients instead of
   finite differences. NONMEM SS=1 loads the compartments with an infinite-past pulse
@@ -133,10 +142,31 @@ section of the SDLC for the versioning policy).
   references a covariate absent from the dataset now fails loudly with
   `E_MISSING_COVARIATE` (and undeclared-but-present covariates raise the usual
   warning), where previously the missing value silently read as `0.0`. **NONMEM
-  comparison:** for time-constant covariates the readout is byte-identical to the
-  prior behaviour; the paired total/free-assay regression
-  (`ode_event_driven_form_c_uses_observation_covariates`) pins the time-varying
-  case.
+  comparison:** validated against the `fluconazole_radboudumc` model (ADVAN3 TRANS4
+  with a free/total protein-binding `$ERROR` that selects `CTOT` when `FREE==0` and
+  `CU` when `FREE==1` — paired assay rows at the same time). Evaluated at identical
+  parameters, ferx's per-record population predictions match NONMEM's `PRED` to
+  ~1e-4 relative on **both** the total-assay and free-assay rows (e.g. subject 1 at
+  t=1: ferx 21.5105 / 2.9070 vs NONMEM 21.511 / 2.907), confirming the readout reads
+  each observation's own `FREE` value rather than the subject's first row. (The two
+  rows at a given time differ only by that per-record covariate.) For time-constant
+  covariates the readout is byte-identical to the prior behaviour; the
+  `ode_event_driven_form_c_uses_observation_covariates` unit test pins the
+  per-observation path.
+- **Gradient-based outer optimizers now precondition with magnitude scaling
+  (`Abs`) instead of bound-half-width (`Rescale2`).** Under the default
+  `optimizer = auto` (which resolves to NLopt L-BFGS when an analytic gradient is
+  available), `Rescale2` was the wrong preconditioner and made FOCE/FOCEI
+  converge to a parameter bound or a local minimum on several models — warfarin
+  FOCEI stalled at OFV −243 (TVV 6.08) instead of −286 (TVV 7.74); a
+  time-varying-covariate fit landed at a +166 local minimum with TVV pinned at
+  its lower bound; SLSQP froze at its start on a 2-cpt covariate model. Switching
+  the gradient-based optimizers (`bfgs`/`lbfgs`/`nlopt_lbfgs`/`slsqp`) to `Abs`
+  scaling recovers the correct optimum in every case while preserving the SLSQP
+  cold-start fix (#335). This fixes the downstream IMP/IMPMAP warm-start collapse
+  and the simulation-based NPDE/NPD diagnostic, which inherited the bad fit.
+  (Scaling is disabled automatically when an identity-packed covariate θ is
+  present, as before.)
 - **Exact analytic FOCE/FOCEI gradient for `iiv_on_ruv` (IIV on residual error).**
   Models with a residual-error eta (`Y = IPRED + EPS·EXP(η_ruv)`) now use the
   exact closed-form gradient on both the inner EBE and outer θ/Ω/σ loops, where
@@ -160,6 +190,23 @@ section of the SDLC for the versioning policy).
   (#474)
 
 ### Performance
+- **Convergence-based early stop for steady-state equilibration** (#519). The SS=1
+  pre-equilibration (both the f64 predictor and the `Dual1`/`Dual2` gradient path,
+  and the closed-form/event-driven SS loops) previously always expanded a fixed
+  50-cycle `(apply dose; integrate II)` train. It now stops once the trough stops
+  moving — a shared mixed `atol`/`rtol` test on the per-cycle increment
+  (`|Δ| ≤ tol·|cur| + tol·max`, `SS_EQUILIBRATION_TOL = 1e-12`) applied identically
+  across all paths, driven by the value parts so the dual truncates on the same
+  cycle as the f64 path (making the gradient the exact derivative of the value the
+  optimizer sees). The stop fires only after the value reaches its fixed point to f64
+  precision: fast disposition converges in ~14 cycles (~3.5× fewer), slow PK still
+  runs the full budget. **SS predictions are unchanged to f64 precision**; gradients
+  and covariance SEs match a full-budget run to `< 1e-6` relative (a small derivative
+  tail, ~`1e-8` even on a deliberately scale-separated 2-compartment model, contracts
+  a constant few cycles behind the value) — 3–4 orders below the `1e-3` gradient
+  validation tolerance, the `1e-9` ODE solver `reltol`, and NONMEM's ~`1e-5`
+  SE-matching precision, i.e. invisible to every reported number. This was the
+  dominant cost of analytic-gradient SS fits.
 - **Exact analytic gradients for `[initial_conditions]` models** (#524). A non-IOV
   closed-form model with an `[initial_conditions]` baseline now runs FOCE/FOCEI
   on exact analytic `Dual2`/`Dual1` sensitivities under `gradient = auto` instead

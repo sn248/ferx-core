@@ -232,12 +232,17 @@ $$
 
 The diagonal sigma SDs are estimated unless marked `FIX`; the off-diagonal
 covariance is always converted to a fixed correlation. A nonzero `block_sigma`
-covariance must connect sigmas that co-load on the same `combined(...)`
-endpoint; cross-endpoint residual covariances are rejected.
+covariance can connect sigmas that co-load on the same `combined(...)` endpoint,
+or sigmas used by different CMT endpoints measured at the same subject time and
+occasion. In the cross-endpoint case ferx builds a subject-level residual
+covariance matrix, so paired rows such as total/unbound assays receive the
+NONMEM-style covariance term `f_total * f_unbound * Cov(EPS_total, EPS_unbound)`.
 
-Current scope: `block_sigma` is supported for `method = foce`. FOCEI/GN,
-SAEM, and importance-sampling paths reject correlated residual sigma blocks
-until their residual-error derivative code is extended beyond diagonal RUV.
+Current scope: `block_sigma` is supported for ordinary Gaussian `method = foce`
+fits. FOCEI/GN, SAEM, importance-sampling paths, M3 censored-observation
+likelihoods, FREM covariate pseudo-observations, and `iiv_on_ruv` reject
+correlated residual sigma blocks until their residual-error derivative code is
+extended beyond diagonal RUV.
 
 Validation: `examples/correlated_residual_combined.ferx` and
 `nonmem_anchor/correlated_residual_combined.ctl` run the same fixed-parameter

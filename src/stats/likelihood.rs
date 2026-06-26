@@ -1,5 +1,5 @@
 use crate::pk;
-use crate::stats::residual_error::compute_r_diag_with_correlations;
+use crate::stats::residual_error::compute_r_matrix_with_correlations;
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -160,31 +160,69 @@ pub fn individual_nll_into_with_schedule(
     // this factor is applied) or the EKF process noise `p_obs`.
     let ruv_scale = model.residual_var_scale(eta);
     let mut data_ll = 0.0;
-    for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-        // FREM dispatch: covariate pseudo-observations use theta+eta as
-        // prediction and a near-zero additive sigma.
-        let fremtype_val = subject.fremtype.get(j).copied().unwrap_or(0);
-        if fremtype_val > 0 {
-            if let Some(ref fc) = model.frem_config {
-                if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&fremtype_val) {
-                    let frem_pred = theta[theta_idx] + eta[eta_idx];
-                    let frem_sigma = sigma_values[fc.covariate_sigma_index];
-                    let frem_v = (frem_sigma * frem_sigma).max(1e-12);
-                    let resid = y - frem_pred;
-                    data_ll += resid * resid / frem_v + frem_v.ln();
-                    continue;
-                }
+    let has_censored_m3 =
+        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
+    let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
+    if !model.residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
+        let mut r = compute_r_matrix_with_correlations(
+            &model.error_spec,
+            &preds,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            &model.residual_correlations,
+        );
+        if ruv_scale != 1.0 {
+            r *= ruv_scale;
+        }
+        for (j, v) in p_obs.iter().enumerate() {
+            if j < r.nrows() {
+                r[(j, j)] += *v;
             }
         }
-        let v_resid =
-            model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values) * ruv_scale;
-        let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
-        let cens = subject.cens.get(j).copied().unwrap_or(0);
-        if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
-            data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
-        } else {
-            let resid = y - f_pred;
-            data_ll += resid * resid / v + v.ln();
+        let chol = match r.cholesky() {
+            Some(c) => c,
+            None => return 1e20,
+        };
+        let residuals = DVector::from_iterator(
+            subject.observations.len(),
+            subject
+                .observations
+                .iter()
+                .zip(preds.iter())
+                .map(|(&y, &f)| y - f),
+        );
+        let solved = chol.solve(&residuals);
+        data_ll += residuals.dot(&solved) + chol_log_det(&chol.l());
+    } else {
+        for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
+            // FREM dispatch: covariate pseudo-observations use theta+eta as
+            // prediction and a near-zero additive sigma.
+            let fremtype_val = subject.fremtype.get(j).copied().unwrap_or(0);
+            if fremtype_val > 0 {
+                if let Some(ref fc) = model.frem_config {
+                    if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&fremtype_val) {
+                        let frem_pred = theta[theta_idx] + eta[eta_idx];
+                        let frem_sigma = sigma_values[fc.covariate_sigma_index];
+                        let frem_v = (frem_sigma * frem_sigma).max(1e-12);
+                        let resid = y - frem_pred;
+                        data_ll += resid * resid / frem_v + frem_v.ln();
+                        continue;
+                    }
+                }
+            }
+            let v_resid =
+                model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values) * ruv_scale;
+            let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
+            let cens = subject.cens.get(j).copied().unwrap_or(0);
+            if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
+                data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
+            } else {
+                let resid = y - f_pred;
+                data_ll += resid * resid / v + v.ln();
+            }
         }
     }
 
@@ -588,6 +626,18 @@ pub fn build_frem_r_override(
     )
 }
 
+fn apply_frem_r_matrix_overrides(r_matrix: &mut DMatrix<f64>, overrides: &[Option<f64>]) {
+    for (j, ov) in overrides.iter().enumerate() {
+        if let (Some(v), true) = (ov, j < r_matrix.nrows()) {
+            for k in 0..r_matrix.ncols() {
+                r_matrix[(j, k)] = 0.0;
+                r_matrix[(k, j)] = 0.0;
+            }
+            r_matrix[(j, j)] = *v;
+        }
+    }
+}
+
 /// path — so inside this function the only case we need to handle is
 /// `bloq_method == Drop` (treat CENS rows as ordinary obs) or no CENS at all.
 pub fn foce_subject_nll_standard(
@@ -618,23 +668,30 @@ pub fn foce_subject_nll_standard(
         .map(|(j, &ip)| ip - h_eta[j])
         .collect();
 
-    // R diagonal; inflate with EKF process-noise variance for SDE models, then
-    // overwrite FREM covariate rows with their EPSCOV² overrides. The override
-    // must come last so it survives the r_pred_override re-evaluation of R.
+    // R; inflate the diagonal with EKF process-noise variance for SDE models,
+    // then overwrite FREM covariate rows with their EPSCOV² overrides. The
+    // override must come last so it survives the r_pred_override re-evaluation
+    // of R.
     let r_eval: &[f64] = r_pred_override.unwrap_or(&f0);
-    let mut r_diag = compute_r_diag_with_correlations(
+    let mut r_matrix = compute_r_matrix_with_correlations(
         error_spec,
         r_eval,
         &subject.obs_cmts,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
         sigma_values,
         residual_correlations,
     );
-    for (j, r) in r_diag.iter_mut().enumerate() {
-        *r += p_obs.get(j).copied().unwrap_or(0.0);
+    for (j, v) in p_obs.iter().enumerate() {
+        if j < r_matrix.nrows() {
+            r_matrix[(j, j)] += *v;
+        }
     }
     if let Some(overrides) = frem_r_override {
-        apply_frem_r_overrides(&mut r_diag, overrides);
+        apply_frem_r_matrix_overrides(&mut r_matrix, overrides);
     }
+    let r_diag: Vec<f64> = (0..r_matrix.nrows()).map(|j| r_matrix[(j, j)]).collect();
 
     // M3 BLOQ under FOCE: the censored rows leave the Sheiner–Beal marginal (R̃ and
     // the quadratic form are built over the quantified rows only) and re-enter as
@@ -660,7 +717,7 @@ pub fn foce_subject_nll_standard(
         }
     }
 
-    // R_tilde = H_q * Omega * H_q' + diag(R_q) over the quantified rows; quad form
+    // R_tilde = H_q * Omega * H_q' + R_q over the quantified rows; quad form
     // and log|R̃| over the same submatrix. (Non-M3: quant = all rows, unchanged.)
     let nq = quant.len();
     let h_q = if m3 {
@@ -668,8 +725,12 @@ pub fn foce_subject_nll_standard(
     } else {
         h_matrix.clone()
     };
-    let r_diag_q: Vec<f64> = quant.iter().map(|&j| r_diag[j]).collect();
-    let r_tilde = compute_r_tilde(&h_q, &omega.matrix, &r_diag_q);
+    let r_q = if m3 {
+        select_symmetric_submatrix(&r_matrix, &quant)
+    } else {
+        r_matrix
+    };
+    let r_tilde = compute_r_tilde_with_r(&h_q, &omega.matrix, &r_q);
 
     let chol = match r_tilde.clone().cholesky() {
         Some(c) => c,
@@ -984,6 +1045,23 @@ pub(crate) fn compute_r_tilde(
     r_tilde
 }
 
+/// R_tilde = H * Omega * H' + R for models with a non-diagonal residual
+/// covariance matrix.
+pub(crate) fn compute_r_tilde_with_r(
+    h: &DMatrix<f64>,
+    omega: &DMatrix<f64>,
+    r: &DMatrix<f64>,
+) -> DMatrix<f64> {
+    let h_omega = h * omega;
+    &h_omega * h.transpose() + r
+}
+
+fn select_symmetric_submatrix(matrix: &DMatrix<f64>, indices: &[usize]) -> DMatrix<f64> {
+    DMatrix::from_fn(indices.len(), indices.len(), |row, col| {
+        matrix[(indices[row], indices[col])]
+    })
+}
+
 /// log-determinant from Cholesky factor L: 2 * sum(log(L_ii))
 pub(crate) fn chol_log_det(l: &DMatrix<f64>) -> f64 {
     let n = l.nrows();
@@ -1275,6 +1353,7 @@ pub fn compute_cwres(
     sigma_values: &[f64],
     error_spec: &ErrorSpec,
     residual_correlations: &[ResidualCorrelation],
+    frem_r_override: Option<&[Option<f64>]>,
     // IIV-on-RUV eta index (or None). Scales the residual diagonal `R` by
     // exp(2·η̂_ruv) so CWRES uses the subject's actual residual SD (#409).
     residual_error_eta: Option<usize>,
@@ -1290,23 +1369,36 @@ pub fn compute_cwres(
         .collect();
 
     // R_tilde
-    let mut r_diag = compute_r_diag_with_correlations(
+    let mut r_matrix = compute_r_matrix_with_correlations(
         error_spec,
         &f0,
         &subject.obs_cmts,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
         sigma_values,
         residual_correlations,
     );
+    if let Some(overrides) = frem_r_override {
+        apply_frem_r_matrix_overrides(&mut r_matrix, overrides);
+    }
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
     if ruv_scale != 1.0 {
-        for (j, v) in r_diag.iter_mut().enumerate() {
-            // FREM covariate pseudo-obs carry no PK residual error; leave them.
-            if subject.fremtype.get(j).copied().unwrap_or(0) == 0 {
-                *v *= ruv_scale;
+        if let Some(overrides) = frem_r_override {
+            for j in 0..r_matrix.nrows() {
+                let j_is_frem = overrides.get(j).and_then(|x| *x).is_some();
+                for k in 0..r_matrix.ncols() {
+                    let k_is_frem = overrides.get(k).and_then(|x| *x).is_some();
+                    if !j_is_frem && !k_is_frem {
+                        r_matrix[(j, k)] *= ruv_scale;
+                    }
+                }
             }
+        } else {
+            r_matrix *= ruv_scale;
         }
     }
-    let r_tilde = compute_r_tilde(h_matrix, &omega.matrix, &r_diag);
+    let r_tilde = compute_r_tilde_with_r(h_matrix, &omega.matrix, &r_matrix);
 
     // CWRES_j = (y_j - f0_j) / sqrt(R_tilde_jj), or NaN if censored.
     (0..n_obs)
@@ -1519,6 +1611,7 @@ mod tests {
     use crate::types::{
         BloqMethod, DoseEvent, ErrorModel, ErrorSpec, GradientMethod, PkModel, PkParams,
     };
+    use approx::assert_relative_eq;
     use std::collections::HashMap;
 
     fn make_simple_subject() -> Subject {
@@ -2147,6 +2240,54 @@ mod tests {
             (focei - focei_none).abs() > 1e-6,
             "residual-eta marginal must differ from the no-RUV-eta marginal"
         );
+    }
+
+    #[test]
+    fn compute_cwres_does_not_scale_frem_rows_by_iiv_on_ruv() {
+        let subject = Subject {
+            id: "1".to_string(),
+            doses: Vec::new(),
+            obs_times: vec![1.0, 2.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![11.0, 21.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: vec![0, 100],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let ipreds = vec![10.0, 20.0];
+        let eta_hat = DVector::from_vec(vec![0.5]);
+        let h = DMatrix::<f64>::zeros(2, 1);
+        let omega = OmegaMatrix::from_diagonal(&[0.1], vec!["ETA_RUV".into()]);
+        let sigma = vec![2.0, 0.5];
+        let overrides = vec![None, Some(0.25)];
+
+        let cwres = compute_cwres(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h,
+            &omega,
+            &sigma,
+            &ErrorSpec::Single(ErrorModel::Additive),
+            &[],
+            Some(&overrides),
+            Some(0),
+        );
+
+        let pk_expected = 1.0 / (sigma[0] * eta_hat[0].exp());
+        let frem_expected = 1.0 / sigma[1];
+        assert_relative_eq!(cwres[0], pk_expected, epsilon = 1e-12);
+        assert_relative_eq!(cwres[1], frem_expected, epsilon = 1e-12);
     }
 
     /// IIV on residual error (#409): `individual_nll` must multiply the residual

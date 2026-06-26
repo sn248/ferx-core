@@ -2321,7 +2321,11 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
         let quiet = dose.ii - t_inf;
         let saveat_inf = [t_inf];
         let saveat_q = [quiet];
-        for _ in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
+        // Shared early stop (#519): break once the trough converges, on the same relative-L∞
+        // criterion the f64 predictor uses (driver shared with `equilibrate_ss_g`, #532 #9/#10).
+        let mut prev = vec![0.0_f64; n_states];
+        let mut cur = vec![0.0_f64; n_states];
+        for cycle in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
             let rhs_active = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                 bare_rhs(us, ps, t, du);
                 if cmt_idx < du.len() {
@@ -2338,17 +2342,25 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
                     u.copy_from_slice(&last.u);
                 }
             }
+            if crate::sens::propagate::ss_dual_cycle_should_stop(cycle, &u, &mut cur, &mut prev) {
+                break;
+            }
         }
         return u;
     }
     // Bolus SS: each cycle applies the pulse `F·amt`, then decays over one interval.
     let amt = T::from_f64(dose.amt);
     let saveat = [dose.ii];
-    for _ in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
+    let mut prev = vec![0.0_f64; n_states];
+    let mut cur = vec![0.0_f64; n_states];
+    for cycle in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
         u[cmt_idx] = u[cmt_idx] + f_bio * amt;
         let sol = solve_ode_g(&bare_rhs, &u, (0.0, dose.ii), params, &saveat, opts);
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
+        }
+        if crate::sens::propagate::ss_dual_cycle_should_stop(cycle, &u, &mut cur, &mut prev) {
+            break;
         }
     }
     u

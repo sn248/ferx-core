@@ -60,6 +60,16 @@ impl SelectionFilter {
         cols
     }
 
+    /// True when any ignore/accept clause compares a covariate column as a raw
+    /// string, so the reader must build the per-row `str_covariates` map. Lets a
+    /// purely numeric filter (the common case) skip that per-row allocation.
+    pub fn needs_str_covariates(&self) -> bool {
+        self.ignore
+            .iter()
+            .chain(self.accept.iter())
+            .any(|c| c.needs_str_covariates())
+    }
+
     /// Returns `(excluded, which)`:
     /// - `excluded = true` when the row should be dropped.
     /// - `which` is the source string of the first clause that fired (for logging).
@@ -443,6 +453,22 @@ fn read_nonmem_csv_impl(
         })
         .collect();
 
+    // A filter that references a covariate column absent from the data can never
+    // fire (the column is missing from every row's covariate map, so the clause
+    // is a silent no-op). This commonly means a typo in the column name — e.g.
+    // `ignore = Coment` instead of `Comment`, or the bare `ignore = C` shorthand
+    // naming a column the file does not have. Collect those names here and warn
+    // once below so the user is not left with an unfiltered fit. ID is handled
+    // separately and is never a covariate, so exclude it.
+    let filter_absent_cols: Vec<String> = filter
+        .map(|f| {
+            f.referenced_covariate_columns()
+                .into_iter()
+                .filter(|c| c != "id" && col_idx_cs(c).is_none() && col_idx_ci(c).is_none())
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Optional covariate table over the *declared* covariates. Every declared
     // column must exist — otherwise it would silently vanish and evaluate to
     // nothing — so resolve indices up front and fail loudly on any miss.
@@ -533,6 +559,15 @@ fn read_nonmem_csv_impl(
     let mut total_amt_ignored: usize = 0;
     let mut subjects_with_amt_ignored: usize = 0;
     let mut population_warnings: Vec<String> = Vec::new();
+    if !filter_absent_cols.is_empty() {
+        population_warnings.push(format!(
+            "W_FILTER_COLUMN_ABSENT: data-selection filter references column(s) not found in the \
+             data: {}. These conditions never match, so no rows are excluded for them — check for \
+             a typo in the column name. Available columns: {}.",
+            filter_absent_cols.join(", "),
+            headers.join(", ")
+        ));
+    }
     let n_records_total: usize = rows_by_id.iter().map(|(_, rows)| rows.len()).sum();
     let mut excl_summary = ExclusionSummary {
         n_records_total,
@@ -1020,6 +1055,10 @@ fn parse_subject(
     let mut time_offset = 0.0f64;
     let mut max_eff_time = f64::NEG_INFINITY;
 
+    // Only string-valued covariate filters (IGNORE(C.EQ.C)) read the raw-cell
+    // map; numeric-only filters never touch it, so skip the per-row allocation.
+    let needs_str_cov = filter.is_some_and(|f| f.needs_str_covariates());
+
     for row in rows {
         // Update LOCF state from this row's TV-covariate values *before*
         // classifying the event, matching NONMEM's "$PK runs at the record
@@ -1091,6 +1130,22 @@ fn parse_subject(
                 .and_then(|c| row.get(c))
                 .map(|s| parse_cens(s))
                 .unwrap_or(0);
+            // Raw (unparsed) covariate cell strings for this row, keyed
+            // lowercased. Lets string filters compare a non-numeric label column
+            // (NONMEM's `IGNORE(C.EQ.C)`) that the numeric `locf_state` map drops.
+            // Built only when a string-covariate filter is active; an empty
+            // `HashMap` does not allocate, so numeric-only filters pay nothing.
+            let str_covariates: HashMap<String, String> = if needs_str_cov {
+                cov_indices
+                    .iter()
+                    .filter_map(|(name, idx)| {
+                        row.get(*idx)
+                            .map(|cell| (name.to_lowercase(), cell.trim().to_string()))
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            };
             let ctx = RowContext {
                 id,
                 time,
@@ -1104,6 +1159,7 @@ fn parse_subject(
                 ii: ii_for_ctx,
                 ss: ss_for_ctx,
                 covariates: &locf_state,
+                str_covariates: &str_covariates,
             };
             let (excluded, which) = sel.should_exclude(&ctx);
             if excluded {
@@ -1982,6 +2038,47 @@ mod tests {
         // The coded-RATE dose row was filtered out; the normal dose survives.
         assert_eq!(pop.subjects[0].doses.len(), 1);
         assert!(!pop.subjects[0].doses[0].is_infusion());
+    }
+
+    #[test]
+    fn filter_referencing_absent_column_warns() {
+        // A filter on a column the data does not have (typo / bare-shorthand on a
+        // missing column) can never match. It must surface a W_FILTER_COLUMN_ABSENT
+        // warning rather than silently fitting unfiltered data.
+        let csv = "ID,TIME,DV,EVID,AMT,FLAG\n\
+                   1,0,.,1,100,1\n\
+                   1,1,5.0,0,.,1\n";
+        let f = write_csv(csv);
+        // `COMENT` (typo of a non-existent column) — no such column in the data.
+        let filter = SelectionFilter::from_opts(&["COMENT == X".to_string()], &[], &[]).unwrap();
+        let pop = read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap();
+        assert!(
+            pop.warnings
+                .iter()
+                .any(|w| w.contains("W_FILTER_COLUMN_ABSENT") && w.contains("coment")),
+            "absent filter column must warn, got {:?}",
+            pop.warnings
+        );
+        // No rows excluded (the clause never fires): both records survive.
+        assert_eq!(pop.subjects[0].observations, vec![5.0]);
+    }
+
+    #[test]
+    fn filter_on_present_column_does_not_warn_absent() {
+        // Control: a filter naming a real column must NOT emit the absent warning.
+        let csv = "ID,TIME,DV,EVID,AMT,FLAG\n\
+                   1,0,.,1,100,1\n\
+                   1,1,5.0,0,.,9\n";
+        let f = write_csv(csv);
+        let filter = SelectionFilter::from_opts(&["FLAG == 9".to_string()], &[], &[]).unwrap();
+        let pop = read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap();
+        assert!(
+            !pop.warnings
+                .iter()
+                .any(|w| w.contains("W_FILTER_COLUMN_ABSENT")),
+            "a present filter column must not warn, got {:?}",
+            pop.warnings
+        );
     }
 
     #[test]

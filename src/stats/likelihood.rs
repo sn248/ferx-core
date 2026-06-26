@@ -164,38 +164,10 @@ pub fn individual_nll_into_with_schedule(
         matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if !model.residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
-        let mut r = compute_r_matrix_with_correlations(
-            &model.error_spec,
-            &preds,
-            &subject.obs_cmts,
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            sigma_values,
-            &model.residual_correlations,
-        );
-        if ruv_scale != 1.0 {
-            r *= ruv_scale;
-        }
-        for (j, v) in p_obs.iter().enumerate() {
-            if j < r.nrows() {
-                r[(j, j)] += *v;
-            }
-        }
-        let chol = match r.cholesky() {
-            Some(c) => c,
+        match dense_residual_data_term(model, subject, &preds, sigma_values, ruv_scale, &p_obs) {
+            Some(term) => data_ll += term,
             None => return 1e20,
-        };
-        let residuals = DVector::from_iterator(
-            subject.observations.len(),
-            subject
-                .observations
-                .iter()
-                .zip(preds.iter())
-                .map(|(&y, &f)| y - f),
-        );
-        let solved = chol.solve(&residuals);
-        data_ll += residuals.dot(&solved) + chol_log_det(&chol.l());
+        }
     } else {
         for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
             // FREM dispatch: covariate pseudo-observations use theta+eta as
@@ -269,6 +241,59 @@ pub fn individual_nll_into_with_schedule(
     }
 }
 
+/// Dense correlated-residual (block_sigma) Gaussian data term for one subject.
+///
+/// Builds the residual covariance `R` from [`compute_r_matrix_with_correlations`],
+/// scales it by `ruv_scale`, adds the per-observation EKF process-noise `p_obs`
+/// to the diagonal (`&[]` on the SAEM / non-SDE paths), then returns the
+/// un-halved quadratic form plus log-determinant `rᵀ R⁻¹ r + log|R|`. Returns
+/// `None` when `R` is not positive-definite so the caller can emit its `1e20`
+/// sentinel.
+///
+/// Shared by the FOCE/E-step ([`individual_nll_into_with_schedule`]) and the
+/// SAEM M-step ([`obs_nll_subject_into`]) so both evaluate an identical
+/// conditional likelihood — the two previously carried divergent copies, one of
+/// which floored predictions while the other did not, biasing SAEM σ/θ when a
+/// prediction reached ≤ 0 (#557).
+fn dense_residual_data_term(
+    model: &CompiledModel,
+    subject: &Subject,
+    preds: &[f64],
+    sigma_values: &[f64],
+    ruv_scale: f64,
+    p_obs: &[f64],
+) -> Option<f64> {
+    let mut r = compute_r_matrix_with_correlations(
+        &model.error_spec,
+        preds,
+        &subject.obs_cmts,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        sigma_values,
+        &model.residual_correlations,
+    );
+    if ruv_scale != 1.0 {
+        r *= ruv_scale;
+    }
+    for (j, v) in p_obs.iter().enumerate() {
+        if j < r.nrows() {
+            r[(j, j)] += *v;
+        }
+    }
+    let chol = r.cholesky()?;
+    let residuals = DVector::from_iterator(
+        subject.observations.len(),
+        subject
+            .observations
+            .iter()
+            .zip(preds.iter())
+            .map(|(&y, &f)| y - f),
+    );
+    let solved = chol.solve(&residuals);
+    Some(residuals.dot(&solved) + chol_log_det(&chol.l()))
+}
+
 /// Observation-only NLL for a single subject with ETAs held fixed.
 ///
 /// Returns the data term `−log p(y_i | η, θ, σ)` (no prior, no |Ω| term) — the
@@ -284,8 +309,26 @@ pub(crate) fn obs_nll_subject_into(
     eta: &[f64],
     pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
-    let m3 = matches!(model.bloq_method, BloqMethod::M3);
     let preds = pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+    obs_nll_subject_from_preds(model, subject, &preds, theta, sigma_values, eta)
+}
+
+/// Observation-only NLL from *precomputed* predictions.
+///
+/// Identical to [`obs_nll_subject_into`] except the caller supplies `preds`
+/// (predictions are independent of `σ`), letting the SAEM M-step σ-gradient FD
+/// loop reuse one ODE solve across all σ perturbations instead of re-solving per
+/// element (#557). `theta` is only consumed by the TTE hazard term.
+#[cfg_attr(not(feature = "survival"), allow(unused_variables))]
+pub(crate) fn obs_nll_subject_from_preds(
+    model: &CompiledModel,
+    subject: &Subject,
+    preds: &[f64],
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+) -> f64 {
+    let m3 = matches!(model.bloq_method, BloqMethod::M3);
     // FREM covariate rows use EPSCOV, not the PK residual error (see
     // build_frem_r_override); FREM covariate rows are never BLOQ.
     let frem_ov =
@@ -296,34 +339,12 @@ pub(crate) fn obs_nll_subject_into(
     let mut nll = 0.0;
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if !model.residual_correlations.is_empty() && !m3 && !has_frem_rows {
-        let preds_eval: Vec<f64> = preds.iter().map(|&f| f.max(1e-12)).collect();
-        let mut r = compute_r_matrix_with_correlations(
-            &model.error_spec,
-            &preds_eval,
-            &subject.obs_cmts,
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            sigma_values,
-            &model.residual_correlations,
-        );
-        if ruv_scale != 1.0 {
-            r *= ruv_scale;
-        }
-        let chol = match r.cholesky() {
-            Some(c) => c,
+        // block_sigma + SDE is rejected up front (E_BLOCK_SIGMA_SDE_UNSUPPORTED)
+        // for the SAEM M-step, so no EKF process noise enters here.
+        match dense_residual_data_term(model, subject, preds, sigma_values, ruv_scale, &[]) {
+            Some(term) => nll += 0.5 * term,
             None => return 1e20,
-        };
-        let residuals = DVector::from_iterator(
-            subject.observations.len(),
-            subject
-                .observations
-                .iter()
-                .zip(preds_eval.iter())
-                .map(|(&y, &f)| y - f),
-        );
-        let solved = chol.solve(&residuals);
-        nll += 0.5 * (residuals.dot(&solved) + chol_log_det(&chol.l()));
+        }
     } else {
         for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
             let frem_var = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
@@ -573,7 +594,15 @@ pub fn foce_subject_nll(
     // takes the interaction path. This matches NONMEM `METHOD=1 LAPLACE` with vs
     // without INTER (FOCE-M3 and FOCEI-M3 are genuinely different optima).
     let _ = m3_active;
-    if interaction {
+    // block_sigma cross-endpoint residual covariance is only carried by the
+    // non-interaction (Sheiner–Beal) path via `compute_r_matrix_with_correlations`;
+    // the interaction accumulator builds R diagonally and would silently drop the
+    // off-diagonal covariance. FOCEI + block_sigma is rejected up front
+    // (E_BLOCK_SIGMA_METHOD_UNSUPPORTED), and SAEM — which evaluates this OFV with
+    // `interaction = true` for AIC/BIC comparability — has no interaction-aware
+    // correlated objective to match, so route any correlated model through the
+    // FOCE objective instead of returning a correlation-free OFV (#557).
+    if interaction && model.residual_correlations.is_empty() {
         foce_subject_nll_interaction(
             subject,
             &ipreds,

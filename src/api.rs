@@ -1113,16 +1113,27 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-        if model.is_sde() {
+        // SDE is unsupported for SAEM only: the FOCE non-interaction path adds the
+        // EKF process-noise `p_obs` into the dense R (foce_subject_nll_standard),
+        // so FOCE + block_sigma + SDE works, but SAEM's M-step data term
+        // (`obs_nll_subject_into`) carries no `p_obs`, so its E-step sampler and
+        // M-step objective would optimize different likelihoods. FOCE keeps the
+        // combination it supported before this PR added SAEM support.
+        let chain_has_saem = chain.iter().any(|&m| m == EstimationMethod::Saem);
+        if chain_has_saem && model.is_sde() {
             diags.push(
                 Diagnostic::error(
                     "E_BLOCK_SIGMA_SDE_UNSUPPORTED",
                     "block_sigma correlated residual errors are not yet supported with \
-                     SDE / EKF process-noise likelihoods.",
+                     method = saem and SDE / EKF process-noise likelihoods.",
                 )
                 .with_block("fit_options"),
             );
         }
+        // TTE is unsupported for every method: the TTE Laplace path
+        // (foce_subject_nll_interaction_with_tte) accumulates R diagonally and
+        // cannot represent the cross-endpoint covariance, so it would silently
+        // drop the correlation for FOCE as well as SAEM.
         if model.has_tte() {
             diags.push(
                 Diagnostic::error(
@@ -6201,6 +6212,68 @@ mod iov_integration {
             .any(|d| d.code == "E_BLOCK_SIGMA_IOV_UNSUPPORTED"));
     }
 
+    // The block_sigma + SDE rejection is scoped to SAEM: the FOCE dense path adds
+    // the EKF process-noise `p_obs` into R and worked before SAEM support was
+    // added, so a FOCE-only chain must stay accepted. Regression guard against
+    // the over-broad method-agnostic rejection (PR #557 review).
+    #[test]
+    fn test_check_model_options_block_sigma_sde_rejected_for_saem_not_foce() {
+        let mut model =
+            crate::types::test_helpers::analytical_model(crate::types::GradientMethod::Fd);
+        model.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        // is_sde() reads diffusion_theta_start; flag the model as an SDE/EKF model.
+        model.diffusion_theta_start = Some(0);
+
+        let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        assert!(super::check_model_options(&model, &saem)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_SDE_UNSUPPORTED"));
+
+        let foce = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        assert!(!super::check_model_options(&model, &foce)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_SDE_UNSUPPORTED"));
+    }
+
+    // The block_sigma + TTE rejection is blanket (every method): the TTE Laplace
+    // path accumulates R diagonally and cannot carry the cross-endpoint
+    // covariance, so it must be rejected for FOCE as well as SAEM (PR #557).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn test_check_model_options_block_sigma_tte_rejected_all_methods() {
+        let mut model =
+            crate::types::test_helpers::analytical_model(crate::types::GradientMethod::Fd);
+        model.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        // has_tte() scans endpoints for a Tte variant; attach a trivial one.
+        model.endpoints.insert(
+            2,
+            crate::types::EndpointLikelihood::Tte {
+                hazard: crate::types::HazardSpec::Analytic {
+                    family: crate::types::HazardFamily::Exponential,
+                    param_fn: Box::new(|_theta, _eta, _cov| vec![0.1]),
+                },
+            },
+        );
+
+        for method in [EstimationMethod::Saem, EstimationMethod::Foce] {
+            let opts = fast_opts(method, Optimizer::Bobyqa, false);
+            assert!(
+                super::check_model_options(&model, &opts)
+                    .iter()
+                    .any(|d| d.code == "E_BLOCK_SIGMA_TTE_UNSUPPORTED"),
+                "TTE + block_sigma must be rejected for {method:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
         use crate::parser::model_parser::parse_model_string;
@@ -6284,6 +6357,104 @@ mod iov_integration {
         let result = fit(&model, &population, &model.default_params, &opts)
             .expect("SAEM fit with cross-endpoint block_sigma should succeed");
         assert!(result.ofv.is_finite(), "SAEM OFV must be finite");
+    }
+
+    // Regression: the SAEM final OFV (computed via `2·pop_nll` with
+    // `interaction = true`) must include the block_sigma cross-endpoint
+    // covariance. The interaction Laplace accumulator builds R diagonally, so
+    // before #557 SAEM silently dropped the correlation and reported the
+    // diagonal OFV (~4 units low here) instead of the FOCE/NONMEM value. At
+    // fully-fixed parameters both estimators evaluate the same conditional
+    // likelihood, so their OFVs must agree.
+    #[test]
+    fn test_saem_block_sigma_ofv_matches_foce() {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        // Single-endpoint combined error with a fixed correlated $SIGMA block —
+        // the docs validation model (NONMEM FOCE OFV 18.7158, ferx FOCE 18.7274).
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0) FIX
+  theta TVV(10.0, 0.1, 100.0) FIX
+  omega ETA_CL ~ 0.04 FIX
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+",
+        )
+        .expect("fixed-param block_sigma combined model parses");
+
+        let mut subjects = Vec::new();
+        for (id, obs) in [
+            ("1", vec![9.5, 8.0, 6.2]),
+            ("2", vec![10.5, 7.4, 5.6]),
+            ("3", vec![8.8, 7.9, 6.7]),
+        ] {
+            subjects.push(Subject {
+                id: id.into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 2.0, 4.0],
+                obs_raw_times: Vec::new(),
+                observations: obs,
+                obs_cmts: vec![1, 1, 1],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 3],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            });
+        }
+        let population = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        // FOCE evaluation (all params fixed → maxiter 0 just evaluates the OFV).
+        let mut foce_opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        foce_opts.outer_maxiter = 0;
+        let foce_ofv = fit(&model, &population, &model.default_params, &foce_opts)
+            .expect("FOCE block_sigma evaluation succeeds")
+            .ofv;
+
+        // SAEM evaluation at the same fixed params.
+        let mut saem_opts = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        saem_opts.saem_n_exploration = 2;
+        saem_opts.saem_n_convergence = 0;
+        saem_opts.saem_n_mh_steps = 1;
+        saem_opts.saem_adapt_interval = 10;
+        saem_opts.saem_omega_burnin = 0;
+        saem_opts.saem_seed = Some(12345);
+        let saem_ofv = fit(&model, &population, &model.default_params, &saem_opts)
+            .expect("SAEM block_sigma evaluation succeeds")
+            .ofv;
+
+        // Params are fixed, so the EBEs (hence the conditional OFV) are identical
+        // regardless of estimator; the dense covariance must be carried by both.
+        assert!(
+            (saem_ofv - foce_ofv).abs() < 1e-3,
+            "SAEM OFV {saem_ofv} must match FOCE OFV {foce_ofv} (block_sigma correlation dropped?)"
+        );
     }
 
     #[test]

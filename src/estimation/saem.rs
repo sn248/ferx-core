@@ -13,8 +13,8 @@ use crate::estimation::outer_optimizer::{
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
-    individual_nll, individual_nll_into, individual_nll_iov, obs_nll_subject_into,
-    split_obs_by_occasion,
+    individual_nll, individual_nll_into, individual_nll_iov, obs_nll_subject_from_preds,
+    obs_nll_subject_into, split_obs_by_occasion,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -473,16 +473,17 @@ fn obs_nll_subject_grad_iov(
     pk_scratch: &mut crate::pk::EventPkParams,
 ) -> (f64, Vec<f64>) {
     let n = n_theta + n_sigma;
-    let fd_all =
-        matches!(model.bloq_method, BloqMethod::M3) || !model.residual_correlations.is_empty();
+    // IOV + block_sigma is rejected up front (E_BLOCK_SIGMA_IOV_UNSUPPORTED), so
+    // `residual_correlations` is never set on this IOV path — only M3 (and TTE,
+    // under the `survival` feature) need the full-FD fallback here.
+    let fd_all = matches!(model.bloq_method, BloqMethod::M3);
     // Fall back to full FD when TTE endpoints are present: the analytic non-M3
     // path is Gaussian-only and would silently zero hazard-parameter gradients.
     #[cfg(feature = "survival")]
     let fd_all = fd_all || !model.endpoints.is_empty();
 
     if fd_all {
-        // M3 / TTE / dense residual-covariance path: forward-FD of
-        // obs_nll_subject_into_iov.
+        // M3 / TTE path: forward-FD of obs_nll_subject_into_iov.
         let nll_base =
             obs_nll_subject_into_iov(model, subject, theta, sigma_values, eta, kappas, pk_scratch);
         let mut grad = vec![0.0f64; n];
@@ -872,8 +873,13 @@ fn obs_nll_subject_grad(
 
     if fd_all {
         // M3 / TTE / dense residual-covariance path: forward-FD of
-        // obs_nll_subject_into for all parameters.
-        let nll_base = obs_nll_subject_into(model, subject, theta, sigma_values, eta, pk_scratch);
+        // obs_nll_subject_into for all parameters. Predictions are σ-independent,
+        // so solve the model once and reuse the base predictions across every σ
+        // perturbation — only θ perturbations need a fresh solve (#557).
+        let preds_base =
+            crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+        let nll_base =
+            obs_nll_subject_from_preds(model, subject, &preds_base, theta, sigma_values, eta);
         let mut grad = vec![0.0f64; n];
         let h = 1e-5;
         for i in 0..n {
@@ -897,7 +903,8 @@ fn obs_nll_subject_grad(
                 let mut sigma_p = sigma_values.to_vec();
                 let delta = h * (1.0 + sigma_values[k].abs());
                 sigma_p[k] += delta;
-                let nll_p = obs_nll_subject_into(model, subject, theta, &sigma_p, eta, pk_scratch);
+                let nll_p =
+                    obs_nll_subject_from_preds(model, subject, &preds_base, theta, &sigma_p, eta);
                 // log-packing for sigma: d/d(log_sigma_k) = sigma_k * d/d(sigma_k)
                 grad[i] = sigma_values[k] * (nll_p - nll_base) / delta;
             }

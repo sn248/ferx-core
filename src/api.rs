@@ -11,7 +11,7 @@ use crate::io::datareader::{
 use crate::pk;
 use crate::propensity_match::MatchMethod;
 use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
-use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
+use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
@@ -4052,12 +4052,13 @@ fn compute_subject_results(
                 crate::pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta);
 
             // IWRES (NaN on censored rows — see compute_cwres for CWRES handling).
-            let mut iwres = compute_iwres(
+            let mut iwres = compute_iwres_with_correlations(
                 &subject.observations,
                 &ipred,
                 &subject.obs_cmts,
                 &model.error_spec,
                 &params.sigma.values,
+                &model.residual_correlations,
             );
             // IIV on residual error (#409): the individual residual SD is scaled
             // by exp(η̂_ruv), so IWRES = (y−f)/(SD·exp(η̂_ruv)) = base / exp(η̂_ruv).
@@ -7830,6 +7831,92 @@ mod tests_sdtab_tv_cov {
                  `compute_predictions_with_tv` for TV-covariate subjects"
             );
         }
+    }
+
+    #[test]
+    fn test_sdtab_iwres_uses_block_sigma_correlation() {
+        use crate::parser::model_parser::parse_full_model;
+
+        let src = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.0] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+"#;
+        let model = parse_full_model(src).expect("model parses").model;
+        assert_eq!(model.residual_correlations.len(), 1);
+
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let eta = DVector::from_vec(vec![0.0]);
+        let ipred = crate::pk::compute_predictions_with_tv(
+            &model,
+            &subject,
+            &model.default_params.theta,
+            eta.as_slice(),
+        );
+        subject.observations[0] = ipred[0] + 2.0;
+
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let eta_hats = vec![eta];
+        let h_matrices = vec![DMatrix::zeros(1, 1)];
+        let kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new()];
+
+        let results = compute_subject_results(
+            &model,
+            &population,
+            &model.default_params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            false,
+        );
+
+        let f = ipred[0];
+        let expected_v = (f * 0.2).powi(2) + 1.0 + 2.0 * f * 0.5 * 0.2;
+        let expected_iwres = 2.0 / expected_v.sqrt();
+        assert!(
+            (results[0].iwres[0] - expected_iwres).abs() < 1e-12,
+            "sdtab IWRES must include block_sigma cross term; got {}, expected {}",
+            results[0].iwres[0],
+            expected_iwres
+        );
     }
 
     /// Regression for #506: simulation must honour time-varying covariate

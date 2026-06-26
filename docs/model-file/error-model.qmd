@@ -230,6 +230,11 @@ V = (f \sigma_\mathrm{prop})^2 + \sigma_\mathrm{add}^2
     + 2 f \rho \sigma_\mathrm{prop}\sigma_\mathrm{add}
 $$
 
+The diagonal sigma SDs are estimated unless marked `FIX`; the off-diagonal
+covariance is always converted to a fixed correlation. A nonzero `block_sigma`
+covariance must connect sigmas that co-load on the same `combined(...)`
+endpoint; cross-endpoint residual covariances are rejected.
+
 Current scope: `block_sigma` is supported for `method = foce`. FOCEI/GN,
 SAEM, and importance-sampling paths reject correlated residual sigma blocks
 until their residual-error derivative code is extended beyond diagonal RUV.

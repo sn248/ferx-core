@@ -88,6 +88,30 @@ pub fn compute_iwres(
         .collect()
 }
 
+/// Compute IWRES using residual variances that include fixed `block_sigma`
+/// correlations. With no correlations this is exactly [`compute_iwres`].
+pub fn compute_iwres_with_correlations(
+    observations: &[f64],
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    error_spec: &ErrorSpec,
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+) -> Vec<f64> {
+    if correlations.is_empty() {
+        return compute_iwres(observations, ipreds, obs_cmts, error_spec, sigma_values);
+    }
+    observations
+        .iter()
+        .zip(ipreds.iter())
+        .zip(obs_cmts.iter())
+        .map(|((&y, &f), &cmt)| {
+            let v = error_spec.variance_at_with_correlations(cmt, f, sigma_values, correlations);
+            (y - f) / v.sqrt()
+        })
+        .collect()
+}
+
 /// Compute pooled lag-1 autocorrelation diagnostics on IWRES across subjects.
 ///
 /// Subjects with fewer than 2 finite IWRES values are skipped.
@@ -284,6 +308,31 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_relative_eq!(result[0], 2.0, epsilon = 1e-12);
         assert_relative_eq!(result[1], 2.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_compute_iwres_with_correlations_applies_cross_term() {
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        // V = (10 * 0.2)^2 + 1^2 + 2 * 10 * 0.5 * 0.2 * 1 = 7.
+        let result =
+            compute_iwres_with_correlations(&[12.0], &[10.0], &[1], &spec, &[0.2, 1.0], &[corr]);
+        assert_relative_eq!(result[0], 2.0 / 7.0_f64.sqrt(), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_compute_iwres_with_correlations_empty_matches_diagonal() {
+        let spec = ErrorSpec::Single(ErrorModel::Additive);
+        let obs = [12.0, 22.0];
+        let ipreds = [10.0, 20.0];
+        let obs_cmts = [1, 1];
+        let plain = compute_iwres(&obs, &ipreds, &obs_cmts, &spec, &[1.0]);
+        let with = compute_iwres_with_correlations(&obs, &ipreds, &obs_cmts, &spec, &[1.0], &[]);
+        assert_eq!(plain, with);
     }
 
     fn make_subject(iwres: Vec<f64>) -> SubjectResult {

@@ -1504,8 +1504,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // restriction.
     // Capture referenced sigma names before `parsed_error_model` is consumed.
     let used_sigmas_in_error = used_sigma_names(&parsed_error_model);
+    validate_block_sigma_single_error_order(&parsed_error_model, &block_sigmas, &sigma_names)?;
     let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
     let residual_correlations = build_residual_correlations(&block_sigmas, &sigma_names)?;
+    validate_residual_correlations(&error_spec, &residual_correlations, &sigma_names)?;
     let sigma = SigmaVector {
         values: sigma_values,
         names: sigma_names,
@@ -7159,6 +7161,86 @@ fn build_residual_correlations(
         let _fixed = block.fixed;
     }
     Ok(out)
+}
+
+fn validate_block_sigma_single_error_order(
+    parsed_error_model: &ParsedErrorModel,
+    block_sigmas: &[BlockSigmaSpec],
+    sigma_names: &[String],
+) -> Result<(), String> {
+    if block_sigmas.is_empty() {
+        return Ok(());
+    }
+    let ParsedErrorModel::Single(_, error_sigma_names) = parsed_error_model else {
+        return Ok(());
+    };
+    for (idx, expected) in error_sigma_names.iter().enumerate() {
+        if sigma_names.get(idx) != Some(expected) {
+            return Err(format!(
+                "block_sigma with a single-endpoint [error_model] requires the \
+                 error-model sigma order to match the leading sigma slots; expected \
+                 '{}' at position {}, got '{}'",
+                sigma_names
+                    .get(idx)
+                    .map(String::as_str)
+                    .unwrap_or("<missing>"),
+                idx + 1,
+                expected
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_residual_correlations(
+    error_spec: &ErrorSpec,
+    correlations: &[ResidualCorrelation],
+    sigma_names: &[String],
+) -> Result<(), String> {
+    if correlations.is_empty() {
+        return Ok(());
+    }
+
+    let endpoint_loadings: Vec<Vec<usize>> = match error_spec {
+        ErrorSpec::Single(_) => vec![error_spec
+            .sigma_loadings(0, 1.0, sigma_names.len())
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect()],
+        ErrorSpec::PerCmt(map) => map
+            .keys()
+            .map(|&cmt| {
+                error_spec
+                    .sigma_loadings(cmt, 1.0, sigma_names.len())
+                    .into_iter()
+                    .map(|(idx, _)| idx)
+                    .collect()
+            })
+            .collect(),
+    };
+
+    for corr in correlations {
+        let co_loaded = endpoint_loadings
+            .iter()
+            .any(|loadings| loadings.contains(&corr.sigma_i) && loadings.contains(&corr.sigma_j));
+        if !co_loaded {
+            let left = sigma_names
+                .get(corr.sigma_i)
+                .map(String::as_str)
+                .unwrap_or("<unknown>");
+            let right = sigma_names
+                .get(corr.sigma_j)
+                .map(String::as_str)
+                .unwrap_or("<unknown>");
+            return Err(format!(
+                "block_sigma covariance between '{}' and '{}' is not used by any \
+                 single observation in [error_model]; correlated residual sigmas \
+                 must belong to the same combined endpoint",
+                left, right
+            ));
+        }
+    }
+    Ok(())
 }
 
 // --- Structural model parsing ---
@@ -15153,6 +15235,72 @@ mod tests {
         let c = parsed.model.residual_correlations[0];
         // cov 0.10 / (sqrt(0.04)·sqrt(1.0)) = 0.10 / 0.2 = 0.5.
         assert!((c.rho - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_full_model_block_sigma_single_endpoint_order_mismatch_errs() {
+        // Single-endpoint error models use the leading sigma slots
+        // positionally; with block_sigma present, reject a name order that
+        // would silently bind the proportional/additive components backwards.
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (ADD_ERR, PROP_ERR) = [1.0, 0.10, 0.04] FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+"#;
+        let err = expect_parse_err(content);
+        assert!(
+            err.contains("block_sigma") && err.contains("sigma order"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_full_model_block_sigma_cross_endpoint_covariance_errs() {
+        // A covariance between sigmas that never co-load on the same
+        // observation would be skipped by the variance helper. Reject it at
+        // parse time so users do not think a cross-endpoint covariance is in
+        // the likelihood.
+        let content = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (S_PROP, S_PD) = [0.04, 0.10, 1.0] FIX
+  sigma S_ADD ~ 1.0 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central, effect])
+
+[odes]
+  d/dt(central) = -CL/V * central
+  d/dt(effect)  =  central/V - effect
+
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = effect
+
+[error_model]
+  CMT=1: DV ~ combined(S_PROP, S_ADD)
+  CMT=2: DV ~ additive(S_PD)
+"#;
+        let err = expect_parse_err(content);
+        assert!(
+            err.contains("block_sigma") && err.contains("same combined endpoint"),
+            "got: {err}"
+        );
     }
 
     #[test]

@@ -3560,6 +3560,7 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
     let mut dose_cmt = 1;
     let mut obs_times = Vec::new();
     let mut seed = 42u64;
+    let mut horizon: Option<f64> = None;
 
     for line in lines {
         let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
@@ -3603,11 +3604,34 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
                 obs_times = parse_float_array(parts[1])
                     .map_err(|e| format!("[simulation]: bad times: {e}"))?
             }
+            // Administrative censoring horizon for TTE endpoints (#522). Must be a
+            // finite, strictly-positive time: it is the right-censoring window for
+            // every simulated TTE cause and a non-positive / non-finite horizon
+            // would censor every subject at or before entry (no events possible).
+            "horizon" => {
+                let t: f64 = parts[1]
+                    .parse()
+                    .map_err(|_| format!("[simulation]: bad horizon: {}", line))?;
+                if !t.is_finite() || t <= 0.0 {
+                    return Err(format!(
+                        "[simulation]: horizon must be finite and > 0: {}",
+                        line
+                    ));
+                }
+                horizon = Some(t);
+            }
             other => return Err(format!("[simulation]: unknown key `{}`", other)),
         }
     }
-    if obs_times.is_empty() {
-        return Err("[simulation] block requires 'times = [...]'".to_string());
+    // A synthetic design needs *something* to observe: continuous `times` for a
+    // Gaussian model, or a `horizon` for a TTE model (#522). Require at least one;
+    // the model-vs-spec check (e.g. "TTE endpoint needs a horizon") happens once
+    // the endpoints are known, in `api::run_model_simulate`.
+    if obs_times.is_empty() && horizon.is_none() {
+        return Err(
+            "[simulation] block requires 'times = [...]' (Gaussian) or 'horizon = <t>' (TTE)"
+                .to_string(),
+        );
     }
 
     Ok(SimulationSpec {
@@ -3616,6 +3640,7 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
         dose_cmt,
         obs_times,
         seed,
+        horizon,
         covariates: vec![],
     })
 }
@@ -7222,10 +7247,13 @@ fn validate_residual_correlations(
     };
 
     for corr in correlations {
-        let co_loaded = endpoint_loadings
+        let left_used = endpoint_loadings
             .iter()
-            .any(|loadings| loadings.contains(&corr.sigma_i) && loadings.contains(&corr.sigma_j));
-        if !co_loaded {
+            .any(|loadings| loadings.contains(&corr.sigma_i));
+        let right_used = endpoint_loadings
+            .iter()
+            .any(|loadings| loadings.contains(&corr.sigma_j));
+        if !(left_used && right_used) {
             let left = sigma_names
                 .get(corr.sigma_i)
                 .map(String::as_str)
@@ -7235,9 +7263,8 @@ fn validate_residual_correlations(
                 .map(String::as_str)
                 .unwrap_or("<unknown>");
             return Err(format!(
-                "block_sigma covariance between '{}' and '{}' is not used by any \
-                 single observation in [error_model]; correlated residual sigmas \
-                 must belong to the same combined endpoint",
+                "block_sigma covariance between '{}' and '{}' references a sigma \
+                 that is not used by [error_model]",
                 left, right
             ));
         }
@@ -15292,11 +15319,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_full_model_block_sigma_cross_endpoint_covariance_errs() {
-        // A covariance between sigmas that never co-load on the same
-        // observation would be skipped by the variance helper. Reject it at
-        // parse time so users do not think a cross-endpoint covariance is in
-        // the likelihood.
+    fn test_parse_full_model_block_sigma_cross_endpoint_covariance_builds_correlation() {
+        // Cross-endpoint covariances are carried by the subject-level residual
+        // covariance matrix for paired observations.
         let content = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -15324,11 +15349,8 @@ mod tests {
   CMT=1: DV ~ combined(S_PROP, S_ADD)
   CMT=2: DV ~ additive(S_PD)
 "#;
-        let err = expect_parse_err(content);
-        assert!(
-            err.contains("block_sigma") && err.contains("same combined endpoint"),
-            "got: {err}"
-        );
+        let parsed = parse_full_model(content).expect("cross-endpoint block_sigma should parse");
+        assert_eq!(parsed.model.residual_correlations.len(), 1);
     }
 
     #[test]
@@ -22997,5 +23019,52 @@ CL V KA WT
     fn simulation_requires_times() {
         let err = parse_simulation_block(&sim_lines(&["n_subjects = 5"])).unwrap_err();
         assert!(err.contains("times"), "got: {err}");
+    }
+
+    #[test]
+    fn simulation_horizon_parses() {
+        // `horizon = <t>` is captured as the administrative censoring window (#522).
+        let spec = parse_simulation_block(&sim_lines(&["horizon = 14", "times = [1.0]"]))
+            .expect("horizon parses");
+        assert_eq!(spec.horizon, Some(14.0));
+        // Absent ⇒ None (the per-record window path).
+        let spec = parse_simulation_block(&sim_lines(&["times = [1.0]"])).expect("no horizon");
+        assert_eq!(spec.horizon, None);
+    }
+
+    #[test]
+    fn simulation_horizon_satisfies_observe_requirement() {
+        // A TTE-only design has no continuous `times`; a `horizon` alone is enough
+        // to make the block valid (the relaxed times-OR-horizon rule).
+        let spec = parse_simulation_block(&sim_lines(&["n_subjects = 5", "horizon = 14"]))
+            .expect("horizon alone is a valid design");
+        assert_eq!(spec.horizon, Some(14.0));
+        assert!(spec.obs_times.is_empty());
+    }
+
+    #[test]
+    fn simulation_horizon_rejects_nonpositive_and_nonfinite() {
+        for bad in [
+            "horizon = 0",
+            "horizon = -3",
+            "horizon = inf",
+            "horizon = nan",
+        ] {
+            let err = parse_simulation_block(&sim_lines(&[bad, "times = [1.0]"])).unwrap_err();
+            assert!(
+                err.starts_with("[simulation]:") && err.contains("horizon"),
+                "`{bad}` gave: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn simulation_horizon_bad_value_errors() {
+        let err =
+            parse_simulation_block(&sim_lines(&["horizon = abc", "times = [1.0]"])).unwrap_err();
+        assert!(
+            err.starts_with("[simulation]:") && err.contains("horizon"),
+            "got: {err}"
+        );
     }
 }

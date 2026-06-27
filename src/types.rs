@@ -2140,11 +2140,12 @@ pub struct CompiledModel {
     pub error_spec: ErrorSpec,
     /// Fixed residual-error correlations declared by `block_sigma`.
     ///
-    /// Empty for ordinary diagonal `$SIGMA` models. When non-empty, each
-    /// observation's residual variance gains the within-observation covariance
-    /// cross term `2·cᵢ·cⱼ·ρ·σᵢ·σⱼ` (from the observation's sigma loadings) on
-    /// the R diagonal; distinct observations stay independent, so R remains
-    /// diagonal. This covers NONMEM `$SIGMA BLOCK(2)` combined-error models.
+    /// Empty for ordinary diagonal `$SIGMA` models. When non-empty, the
+    /// residual-error helpers use each observation's sigma loadings to add both
+    /// within-observation covariance terms (for `combined(...)` endpoints) and
+    /// cross-observation covariance terms for paired same-time/same-occasion
+    /// endpoint rows. This covers NONMEM `$SIGMA BLOCK` combined-error models
+    /// and paired multi-endpoint records such as total/unbound assays.
     pub residual_correlations: Vec<ResidualCorrelation>,
     pub pk_param_fn: PkParamFn,
     pub n_theta: usize,
@@ -4551,6 +4552,14 @@ pub struct SimulationSpec {
     pub dose_cmt: usize,
     pub obs_times: Vec<f64>,
     pub seed: u64,
+    /// Administrative censoring horizon for TTE endpoints (`[simulation] horizon`).
+    /// `Some(t)` makes `t` the right-censoring window for **every** simulated TTE
+    /// cause, overriding the per-record `observation_window` so a re-simulated
+    /// event-bearing subject censors at the planned study end rather than drawing
+    /// unbounded (the competing-risks VPC fix — see `survival::simulate_tte`).
+    /// `None` falls back to the per-record window. Required when the model has a
+    /// TTE endpoint and synthetic subjects are generated.
+    pub horizon: Option<f64>,
     /// Optional per-subject covariates: (name, values) — length must equal n_subjects
     pub covariates: Vec<(String, Vec<f64>)>,
 }

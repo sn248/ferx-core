@@ -20,6 +20,10 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Support NONMEM-style `block_sigma` residual covariance under SAEM for ordinary
+  Gaussian paired-endpoint models (#548).
+- Support NONMEM-style `block_sigma` residual covariance across paired same-time
+  multi-endpoint observations under FOCE (#546).
 - Support fixed residual-error correlations via `block_sigma` for FOCE combined-error
   models, with a NONMEM `$SIGMA BLOCK(2) FIX` validation example (#537).
 - **Analytic FOCE/FOCEI gradients for Form C readouts that reference covariates** (#540).
@@ -154,6 +158,10 @@ section of the SDLC for the versioning policy).
 - FOCEI now falls back to finite-difference h-matrices when an ODE analytic
   Jacobian is unavailable or non-finite, avoiding sentinel-inflated OFVs on sparse
   subjects such as the pembrolizumab RadboudUMC model (#551).
+- Reject `block_sigma` with IOV until the IOV inner objective supports the full
+  residual covariance matrix, use shifted times when pairing reset-segment
+  residual blocks, and keep FREM CWRES variances unscaled by `iiv_on_ruv`
+  (#549).
 - **Form C (`[scaling] y = <expr>`) ODE readouts now use per-observation covariate
   snapshots** (#535, #538). The explicit-output readout is evaluated against the
   covariate values on each observation's own data row rather than the subject's
@@ -351,6 +359,16 @@ section of the SDLC for the versioning policy).
   that time — and `predict_survival()` gains a cause-specific cumulative incidence `cif`
   plus the all-cause survival `survival_all` (with `Σ_k cif_k(t) + survival_all(t) = 1`),
   the correct competing-risks quantities. Example `examples/tte_competing_risks.ferx`.
+  Behind the `survival` feature.
+- **`[simulation] horizon` for TTE / competing-risks VPC** (#522). A new
+  `horizon = <t>` key sets an administrative censoring time that is *decoupled
+  from the observed event times*: when present it overrides each TTE record's
+  per-record observation window, so re-simulating event-bearing data (a VPC)
+  censors every cause at the planned study end `t` instead of drawing unbounded.
+  It is also honoured by the `[simulation]`-block `--simulate` path, which now
+  generates one right-censored TTE row per cause compartment per synthetic subject
+  (a TTE model under `[simulation]` therefore requires `horizon`); previously that
+  path emitted zero TTE rows. Exposed on the library `SimulateOptions { horizon }`.
   Behind the `survival` feature.
 - **`[event_model]` hazard expressions can reference `[individual_parameters]`** names —
   e.g. a hazard driven by an individual `CL` — resolved per subject at evaluation time, in

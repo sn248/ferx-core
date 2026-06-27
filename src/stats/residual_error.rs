@@ -1,4 +1,5 @@
 use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SubjectResult};
+use nalgebra::DMatrix;
 
 const MIN_VARIANCE: f64 = 1e-12;
 
@@ -60,6 +61,134 @@ pub fn compute_r_diag_with_correlations(
             error_spec.variance_at_with_correlations(cmt, f, sigma_values, correlations)
         })
         .collect()
+}
+
+fn observation_time_key(obs_times: &[f64], j: usize) -> u64 {
+    obs_times.get(j).copied().unwrap_or(0.0).to_bits()
+}
+
+fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
+    occasions.get(j).copied().unwrap_or(0)
+}
+
+fn same_residual_block(
+    obs_times: &[f64],
+    _obs_raw_times: &[f64],
+    occasions: &[u32],
+    j: usize,
+    k: usize,
+) -> bool {
+    observation_time_key(obs_times, j) == observation_time_key(obs_times, k)
+        && observation_occasion_key(occasions, j) == observation_occasion_key(occasions, k)
+}
+
+fn cross_observation_covariance(
+    load_j: &[(usize, f64)],
+    load_k: &[(usize, f64)],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+) -> f64 {
+    let mut cov = 0.0;
+    for corr in correlations {
+        let j_has_i = load_j.iter().any(|(idx, _)| *idx == corr.sigma_i);
+        let j_has_j = load_j.iter().any(|(idx, _)| *idx == corr.sigma_j);
+        let k_has_i = load_k.iter().any(|(idx, _)| *idx == corr.sigma_i);
+        let k_has_j = load_k.iter().any(|(idx, _)| *idx == corr.sigma_j);
+        if (j_has_i && j_has_j) || (k_has_i && k_has_j) {
+            continue;
+        }
+        let Some(&si) = sigma_values.get(corr.sigma_i) else {
+            return f64::NAN;
+        };
+        let Some(&sj) = sigma_values.get(corr.sigma_j) else {
+            return f64::NAN;
+        };
+        let cov_ij = corr.rho * si * sj;
+        let ci_j = load_j
+            .iter()
+            .find(|(idx, _)| *idx == corr.sigma_i)
+            .map(|(_, coeff)| *coeff);
+        let cj_k = load_k
+            .iter()
+            .find(|(idx, _)| *idx == corr.sigma_j)
+            .map(|(_, coeff)| *coeff);
+        if let (Some(ci), Some(cj)) = (ci_j, cj_k) {
+            cov += ci * cj * cov_ij;
+        }
+
+        let cj_j = load_j
+            .iter()
+            .find(|(idx, _)| *idx == corr.sigma_j)
+            .map(|(_, coeff)| *coeff);
+        let ci_k = load_k
+            .iter()
+            .find(|(idx, _)| *idx == corr.sigma_i)
+            .map(|(_, coeff)| *coeff);
+        if let (Some(cj), Some(ci)) = (cj_j, ci_k) {
+            cov += cj * ci * cov_ij;
+        }
+    }
+    cov
+}
+
+/// Build the subject-level residual covariance matrix `R`.
+///
+/// The diagonal is the existing per-observation residual variance, including
+/// within-observation `block_sigma` terms for `combined(...)` endpoints. When a
+/// `block_sigma` off-diagonal connects sigmas used by different endpoint rows,
+/// rows at the same subject time and occasion receive the corresponding
+/// cross-observation covariance. This mirrors NONMEM-style paired endpoint
+/// records such as total/unbound assays written as separate rows.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_r_matrix_with_correlations(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+) -> DMatrix<f64> {
+    let n = ipreds.len();
+    let mut r = DMatrix::<f64>::zeros(n, n);
+    let r_diag =
+        compute_r_diag_with_correlations(error_spec, ipreds, obs_cmts, sigma_values, correlations);
+    for (j, &v) in r_diag.iter().enumerate() {
+        r[(j, j)] = v;
+    }
+    if correlations.is_empty() {
+        return r;
+    }
+
+    let loadings: Vec<Vec<(usize, f64)>> = ipreds
+        .iter()
+        .zip(obs_cmts.iter())
+        .map(|(&f, &cmt)| error_spec.sigma_loadings(cmt, f, sigma_values.len()))
+        .collect();
+    for j in 0..n {
+        if loadings[j].is_empty() {
+            continue;
+        }
+        for k in (j + 1)..n {
+            if loadings[k].is_empty()
+                || !same_residual_block(obs_times, obs_raw_times, occasions, j, k)
+            {
+                continue;
+            }
+            let cov = cross_observation_covariance(
+                &loadings[j],
+                &loadings[k],
+                sigma_values,
+                correlations,
+            );
+            if cov != 0.0 {
+                r[(j, k)] = cov;
+                r[(k, j)] = cov;
+            }
+        }
+    }
+    r
 }
 
 /// Individual weighted residual: IWRES_j = (y_j - f_j) / sqrt(V_j)
@@ -186,8 +315,9 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::GradientMethod;
+    use crate::types::{EndpointError, GradientMethod};
     use approx::assert_relative_eq;
+    use std::collections::HashMap;
 
     #[test]
     fn test_additive_variance() {
@@ -262,6 +392,96 @@ mod tests {
         };
         let with = compute_r_diag_with_correlations(&spec, &ipreds, &cmts, &sigma, &[corr]);
         assert_relative_eq!(with[0], 7.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_compute_r_matrix_with_correlations_links_paired_endpoints() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let ipreds = [50.0, 5.0, 40.0];
+        let cmts = [1usize, 2, 2];
+        let times = [1.0, 1.0, 2.0];
+        let sigma = [0.2, 0.3];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        let r = compute_r_matrix_with_correlations(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+        );
+        assert_relative_eq!(r[(0, 0)], (50.0_f64 * 0.3).powi(2), epsilon = 1e-12);
+        assert_relative_eq!(r[(1, 1)], (5.0_f64 * 0.2).powi(2), epsilon = 1e-12);
+        assert_relative_eq!(r[(0, 1)], 50.0 * 5.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
+        assert_relative_eq!(r[(1, 0)], r[(0, 1)], epsilon = 1e-12);
+        assert_eq!(r[(0, 2)], 0.0);
+    }
+
+    #[test]
+    fn test_compute_r_matrix_with_correlations_uses_shifted_time_after_reset() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let ipreds = [50.0, 5.0, 40.0, 4.0];
+        let cmts = [1usize, 2, 1, 2];
+        let shifted_times = [1.0, 1.0, 101.0, 101.0];
+        let raw_times = [1.0, 1.0, 1.0, 1.0];
+        let sigma = [0.2, 0.3];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+
+        let r = compute_r_matrix_with_correlations(
+            &spec,
+            &ipreds,
+            &cmts,
+            &shifted_times,
+            &raw_times,
+            &[],
+            &sigma,
+            &[corr],
+        );
+
+        assert_relative_eq!(r[(0, 1)], 50.0 * 5.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
+        assert_relative_eq!(r[(2, 3)], 40.0 * 4.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
+        assert_eq!(r[(0, 3)], 0.0);
+        assert_eq!(r[(1, 2)], 0.0);
     }
 
     #[test]

@@ -1112,6 +1112,7 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
         if no_analytic_inner_forced()
             || matches!(model.gradient_method, GradientMethod::Fd)
             || model.is_sde()
+            || !model.residual_correlations.is_empty()
             || model.iiv_on_ruv_forces_fd()
         {
             return false;

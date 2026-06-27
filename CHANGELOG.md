@@ -155,6 +155,9 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- FOCEI now falls back to finite-difference h-matrices when an ODE analytic
+  Jacobian is unavailable or non-finite, avoiding sentinel-inflated OFVs on sparse
+  subjects such as the pembrolizumab RadboudUMC model (#551).
 - Reject `block_sigma` with IOV until the IOV inner objective supports the full
   residual covariance matrix, use shifted times when pairing reset-segment
   residual blocks, and keep FREM CWRES variances unscaled by `iiv_on_ruv`

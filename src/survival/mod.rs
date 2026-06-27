@@ -279,6 +279,29 @@ fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
     (win_idx, if event { t_star } else { window }, event)
 }
 
+/// Destructure a TTE endpoint and evaluate its hazard parameters at the given
+/// `(theta, eta, covariates)`. Returns `None` for any non-`Tte` endpoint so
+/// callers can `filter_map`/`?` over `model.endpoints` or a looked-up CMT.
+///
+/// This centralises the `EndpointLikelihood::Tte { HazardSpec::Analytic {
+/// family, param_fn } }` destructure and `param_fn` evaluation shared by
+/// `simulate_tte` (per `obs_record`) and `predict_survival` (per endpoint), so a
+/// new `HazardSpec`/`HazardFamily` variant only has to be handled here. Callers
+/// supply their own trailing per-cause fields (window/entry time vs. summary
+/// statistics).
+pub(crate) fn tte_cause_params(
+    endpoint: &EndpointLikelihood,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<(HazardFamily, Vec<f64>)> {
+    let EndpointLikelihood::Tte { hazard } = endpoint else {
+        return None;
+    };
+    let HazardSpec::Analytic { family, param_fn } = hazard;
+    Some((*family, param_fn(theta, eta, covariates)))
+}
+
 /// Draw TTE event/censoring outcomes for a subject and append them to `results`.
 ///
 /// Called from `api::simulate_inner_with_draw` after the Gaussian path. Each
@@ -306,29 +329,6 @@ fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
 /// `None` keeps the per-record window. The override changes only the censoring
 /// comparison, never the number of uniforms drawn, so the RNG sequence (and the
 /// SSE characterization tests) are unaffected.
-/// Destructure a TTE endpoint and evaluate its hazard parameters at the given
-/// `(theta, eta, covariates)`. Returns `None` for any non-`Tte` endpoint so
-/// callers can `filter_map`/`?` over `model.endpoints` or a looked-up CMT.
-///
-/// This centralises the `EndpointLikelihood::Tte { HazardSpec::Analytic {
-/// family, param_fn } }` destructure and `param_fn` evaluation shared by
-/// `simulate_tte` (per `obs_record`) and `predict_survival` (per endpoint), so a
-/// new `HazardSpec`/`HazardFamily` variant only has to be handled here. Callers
-/// supply their own trailing per-cause fields (window/entry time vs. summary
-/// statistics).
-pub(crate) fn tte_cause_params(
-    endpoint: &EndpointLikelihood,
-    theta: &[f64],
-    eta: &[f64],
-    covariates: &HashMap<String, f64>,
-) -> Option<(HazardFamily, Vec<f64>)> {
-    let EndpointLikelihood::Tte { hazard } = endpoint else {
-        return None;
-    };
-    let HazardSpec::Analytic { family, param_fn } = hazard;
-    Some((*family, param_fn(theta, eta, covariates)))
-}
-
 // Same flat (model, subject, params, replicate indices, RNG, output sink) shape
 // as the sole caller `emit_subject_rows`, which carries this same allow: the args
 // are heterogeneous with no cohesive struct to bundle, and splitting them would

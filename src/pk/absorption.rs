@@ -151,6 +151,38 @@ pub fn validate_weibull(td: f64, beta: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// Zero-order absorption input rate into the compartment it feeds, for a modeled
+/// duration `dur` (> 0):
+///
+/// ```text
+/// R_in(tad) = dose / dur   for 0 < tad ≤ dur,   0 otherwise,   dose = F · amt.
+/// ```
+///
+/// A constant rate over `(0, dur]` — the zero-order (`D1`-style, #324) input
+/// reused as an absorption term. `∫₀^∞ R_in dt = (dose/dur)·dur = dose` exactly.
+/// Returns `0` for `tad ≤ 0` and for a non-positive `dose`.
+///
+/// Domain: `dur > 0` (enforce upstream with [`validate_zero_order`]). Unlike the
+/// smooth densities, the rate has a **hard cutoff at `tad = dur`**: callers on the
+/// ODE path must break the integration timeline there, and the `∂R_in/∂dur`
+/// boundary impulse is FD-only until #530 (see [`InputRateKind::supported_over_dual`]).
+///
+/// This is the readable reference form (used by tests and one-shot callers); the
+/// ODE hot path goes through [`InputRateForcing::prepare`] +
+/// [`PreparedInputRate::rate`], which hoist `1/dur` out of the per-dose loop.
+pub fn zero_order_input_rate(tad: f64, dur: f64, dose: f64) -> f64 {
+    PreparedInputRate::zero_order(dur).rate(tad, dose)
+}
+
+/// Validate the zero-order parameter: `dur` (duration) strictly positive. The
+/// negated comparison also rejects `NaN`.
+pub fn validate_zero_order(dur: f64) -> Result<(), String> {
+    if !(dur > 0.0) {
+        return Err(format!("zero_order: dur (duration) must be > 0, got {dur}"));
+    }
+    Ok(())
+}
+
 /// Which built-in absorption input-rate model a forcing term uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputRateKind {
@@ -160,6 +192,14 @@ pub enum InputRateKind {
     InverseGaussian,
     /// Weibull density absorption — `weibull(td, beta)`.
     Weibull,
+    /// Zero-order (constant-rate) absorption over a modeled duration —
+    /// `zero_order(dur)`. `R_in = dose/dur` on `(0, dur]`, else 0 (#504). Unlike
+    /// the smooth densities above, this has a **hard cutoff at `tad = dur`**: the
+    /// ODE timeline must place a break there (see `predictions.rs`), and its
+    /// `∂R_in/∂dur` is a moving boundary that the pointwise `Dual2` walk cannot
+    /// express, so it stays on the FD fallback ([`Self::supported_over_dual`])
+    /// until the boundary-impulse mechanism lands (#530).
+    ZeroOrder,
 }
 
 impl InputRateKind {
@@ -180,6 +220,14 @@ impl InputRateKind {
             InputRateKind::InverseGaussian => true,
             InputRateKind::Transit => true,
             InputRateKind::Weibull => true,
+            // Zero-order has a hard cutoff at `tad = dur`; `∂R_in/∂dur` carries a
+            // Leibniz boundary term (a dual-channel impulse at the cutoff) that the
+            // smooth pointwise `rate(tad) → Dual2` walk misses. Until that impulse
+            // is built (#530, shared with #384's modeled-duration `Dn` infusion),
+            // `dur` is differentiated by FD — so this kind is *not* lifted, and
+            // `prepare_dual` returns `None` for it (pinned by
+            // `supported_over_dual_agrees_with_prepare_dual`).
+            InputRateKind::ZeroOrder => false,
         }
     }
 }
@@ -192,7 +240,8 @@ impl InputRateKind {
 /// machinery. `arg_slots` index the flat individual-parameter vector for this
 /// model's parameters — for [`InputRateKind::Transit`], `[n, mtt]`; for
 /// [`InputRateKind::InverseGaussian`], `[mat, cv2]`; for
-/// [`InputRateKind::Weibull`], `[td, beta]`.
+/// [`InputRateKind::Weibull`], `[td, beta]`; for [`InputRateKind::ZeroOrder`],
+/// the single `[dur]`.
 #[derive(Debug, Clone)]
 pub struct InputRateForcing {
     /// 0-based ODE compartment that receives `R_in`.
@@ -234,6 +283,7 @@ impl InputRateForcing {
             InputRateKind::Weibull => {
                 PreparedInputRate::weibull(self.arg(params, 0, 1.0), self.arg(params, 1, 1.0))
             }
+            InputRateKind::ZeroOrder => PreparedInputRate::zero_order(self.arg(params, 0, 1.0)),
         }
     }
 
@@ -253,6 +303,7 @@ impl InputRateForcing {
             InputRateKind::Weibull => {
                 validate_weibull(self.arg(params, 0, 1.0), self.arg(params, 1, 1.0))
             }
+            InputRateKind::ZeroOrder => validate_zero_order(self.arg(params, 0, 1.0)),
         }
     }
 
@@ -261,11 +312,12 @@ impl InputRateForcing {
     /// individual-parameter vector `params` — laid out identically to the `f64`
     /// [`Self::prepare`] input, so `arg_slots` index the same way (and the
     /// per-kind argument defaults match `prepare`, so the lifted constants
-    /// reproduce the scalar ones for `T = f64`). All current kinds
-    /// (inverse-Gaussian, transit, Weibull) are lifted and return `Some`; a future
-    /// unlifted kind would return `None`, keeping that model on the FD fallback.
-    /// [`InputRateKind::supported_over_dual`] gates which kinds reach here and is
-    /// pinned consistent with this `match` by
+    /// reproduce the scalar ones for `T = f64`). The smooth kinds
+    /// (inverse-Gaussian, transit, Weibull) are lifted and return `Some`;
+    /// [`InputRateKind::ZeroOrder`] returns `None` (its moving-boundary `∂/∂dur`
+    /// is not a pointwise `Dual2` expression — see #530), keeping that model on
+    /// the FD fallback. [`InputRateKind::supported_over_dual`] gates which kinds
+    /// reach here and is pinned consistent with this `match` by
     /// `supported_over_dual_agrees_with_prepare_dual`.
     pub fn prepare_dual<T: PkNum>(&self, params: &[T]) -> Option<PreparedInputRate<T>> {
         match self.kind {
@@ -281,6 +333,9 @@ impl InputRateForcing {
                 self.arg(params, 0, 1.0),
                 self.arg(params, 1, 1.0),
             )),
+            // Not lifted: the cutoff at `tad = dur` makes `∂/∂dur` a boundary
+            // impulse the pointwise dual walk can't carry (#530). FD fallback.
+            InputRateKind::ZeroOrder => None,
         }
     }
 }
@@ -309,6 +364,10 @@ pub enum PreparedInputRate<T = f64> {
     /// prefactor `c0 = ln β − ln Td`. (`Td` itself is folded into `ln_td`/`c0`, so
     /// it is not stored separately.)
     Weibull { beta: T, ln_td: T, c0: T },
+    /// Zero-order constants: the duration `dur` (kept for the `tad ≤ dur` cutoff)
+    /// and its reciprocal `inv_dur = 1/dur` (the constant rate factor, so the
+    /// per-dose `rate` is one multiply: `dose · inv_dur`).
+    ZeroOrder { dur: T, inv_dur: T },
 }
 
 impl<T: PkNum> PreparedInputRate<T> {
@@ -407,6 +466,32 @@ impl<T: PkNum> PreparedInputRate<T> {
         }
     }
 
+    /// Precompute the zero-order constants for `dur`.
+    ///
+    /// `dur` is **clamped to the valid domain** (`dur > 0`, floor
+    /// [`Self::MIN_PARAM`]) for the same reason as the other constructors: a
+    /// transient mid-search excursion (additive `eta`, wide FD step) could drive
+    /// `dur ≤ 0`, turning `1/dur` into `±∞`/`NaN` that would poison the ODE RHS.
+    /// The fit-time guard ([`validate_zero_order`]) rejects an out-of-domain
+    /// *typical* value loudly; the clamp keeps `R_in` finite at the domain wall so
+    /// the optimiser can climb back to the interior, and the converged optimum is
+    /// interior so reported estimates are unaffected. `NaN` falls to the floor.
+    ///
+    /// Generic over `T` for uniformity with the other constructors, but unlike
+    /// them the `dur` parameter's gradient is **not** exact here: the cutoff at
+    /// `tad = dur` ([`Self::rate`]) is a moving boundary whose `∂/∂dur` impulse the
+    /// pointwise dual walk misses, so a `zero_order()` model is gated to the FD
+    /// fallback ([`InputRateKind::supported_over_dual`] = `false`) and this is
+    /// reached only for `T = f64` (and the consistency test's `T = f64` probe).
+    #[inline]
+    fn zero_order(dur: T) -> Self {
+        let dur = dur.guard_floor(Self::MIN_PARAM);
+        PreparedInputRate::ZeroOrder {
+            dur,
+            inv_dur: T::from_f64(1.0) / dur,
+        }
+    }
+
     /// Appearance rate `R_in(tad)` for one dose (`dose = F · amt`). Per-dose
     /// contributions are summed by the caller; `tad ≤ 0` or `dose ≤ 0 ⇒ 0` (the
     /// guard branches on `.val()`, so for a `Dual2` it returns a flat zero). The
@@ -453,6 +538,20 @@ impl<T: PkNum> PreparedInputRate<T> {
             PreparedInputRate::Weibull { beta, ln_td, c0 } => {
                 let u = tad.ln() - ln_td;
                 (dose.ln() + c0 + (beta - T::from_f64(1.0)) * u - (beta * u).exp()).exp()
+            }
+            // Constant rate `dose/dur` over the window `(0, dur]`, else 0 — a
+            // rectangle, so `∫R_in = dose` exactly. `tad > 0` is already ensured by
+            // the guard above; the cutoff branches on `.val()`, so for a `Dual2`
+            // the inactive side is a flat zero (the boundary jump in `∂/∂dur` is
+            // *not* captured — hence the FD gate, #530). The ODE timeline places a
+            // break at `tad = dur` so the adaptive solver resolves the step rather
+            // than smearing it across one RK45 step.
+            PreparedInputRate::ZeroOrder { dur, inv_dur } => {
+                if tad.val() <= dur.val() {
+                    dose * inv_dur
+                } else {
+                    T::from_f64(0.0)
+                }
             }
         }
     }
@@ -1183,6 +1282,121 @@ mod tests {
         assert!(forcing.validate(&bad_beta).unwrap_err().contains("beta"));
     }
 
+    // ── Zero-order `zero_order(dur)` ─────────────────────────────────────────
+
+    #[test]
+    fn zero_order_is_constant_over_window_then_zero() {
+        // R_in = dose/dur on (0, dur], 0 after — a rectangle.
+        let (dur, dose) = (4.0_f64, 100.0_f64);
+        let rate = dose / dur;
+        for &tad in &[0.001, 1.0, 2.0, dur - 1e-9, dur] {
+            assert_relative_eq!(
+                zero_order_input_rate(tad, dur, dose),
+                rate,
+                max_relative = 1e-12
+            );
+        }
+        // Strictly past the cutoff the input has stopped.
+        for &tad in &[dur + 1e-9, dur + 1.0, 100.0] {
+            assert_eq!(zero_order_input_rate(tad, dur, dose), 0.0);
+        }
+    }
+
+    #[test]
+    fn zero_order_mass_balance_is_exact() {
+        // ∫₀^∞ R_in dt = (dose/dur)·dur = dose, exactly (it's a rectangle, no
+        // quadrature error). Catches a wrong normalisation/window.
+        for &(dur, dose) in &[(1.0, 50.0), (4.0, 100.0), (0.25, 10.0), (12.0, 250.0)] {
+            assert_relative_eq!(zero_order_input_rate(1e-9, dur, dose) * dur, dose);
+        }
+    }
+
+    #[test]
+    fn zero_order_zero_before_dose_and_for_zero_dose() {
+        assert_eq!(zero_order_input_rate(0.0, 4.0, 100.0), 0.0);
+        assert_eq!(zero_order_input_rate(-1.0, 4.0, 100.0), 0.0);
+        assert_eq!(zero_order_input_rate(1.0, 4.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn validate_zero_order_domain() {
+        assert!(validate_zero_order(4.0).is_ok());
+        assert!(validate_zero_order(0.0).is_err());
+        assert!(validate_zero_order(-1.0).is_err());
+        assert!(validate_zero_order(f64::NAN).is_err());
+    }
+
+    /// A transient domain excursion (`dur ≤ 0` or `NaN`) — reachable mid-fit via an
+    /// additive `eta` / wide FD step — must yield a finite, non-negative `R_in` (the
+    /// clamp in `PreparedInputRate::zero_order`), never the `1/0 = ∞` / `NaN` that
+    /// would poison the ODE RHS.
+    #[test]
+    fn zero_order_rate_is_finite_for_domain_excursions() {
+        for &dur in &[0.0, -1.0, f64::NAN] {
+            for &tad in &[0.5, 2.0, 10.0] {
+                let r = zero_order_input_rate(tad, dur, 100.0);
+                assert!(
+                    r.is_finite() && r >= 0.0,
+                    "R_in must be finite & non-negative at dur={dur}, tad={tad}, got {r}"
+                );
+            }
+        }
+    }
+
+    /// `prepare(...).rate(...)` (the hoisted ODE-hot-path form) must agree
+    /// bit-for-bit with the reference `zero_order_input_rate`, reading `dur` from
+    /// the right (single) slot.
+    #[test]
+    fn prepared_zero_order_rate_matches_reference_and_reads_slot() {
+        let forcing = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::ZeroOrder,
+            arg_slots: vec![4], // dur @ 4
+        };
+        let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
+        params[4] = 4.0; // dur
+        let prepared = forcing.prepare(&params);
+        for &tad in &[0.0, 0.1, 1.0, 4.0, 4.5, 12.0] {
+            assert_eq!(
+                prepared.rate(tad, 100.0),
+                zero_order_input_rate(tad, 4.0, 100.0)
+            );
+        }
+    }
+
+    /// `InputRateForcing::validate` reads `dur` from the right slot for the
+    /// zero-order kind and surfaces the domain error.
+    #[test]
+    fn forcing_validate_zero_order_reads_slot_and_flags_domain() {
+        let forcing = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::ZeroOrder,
+            arg_slots: vec![4],
+        };
+        let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
+        ok[4] = 4.0;
+        assert!(forcing.validate(&ok).is_ok());
+
+        let mut bad = ok.clone();
+        bad[4] = -1.0;
+        assert!(forcing.validate(&bad).unwrap_err().contains("dur"));
+    }
+
+    /// Zero-order is **not** lifted over `Dual2` (its moving-boundary `∂/∂dur` is
+    /// FD-only, #530): the gate must say so and `prepare_dual` must return `None`,
+    /// so the ODE provider keeps a `zero_order()` subject on the FD fallback.
+    #[test]
+    fn zero_order_is_not_lifted_over_dual() {
+        assert!(!InputRateKind::ZeroOrder.supported_over_dual());
+        let forcing = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::ZeroOrder,
+            arg_slots: vec![4],
+        };
+        let params = vec![1.0; crate::types::MAX_PK_PARAMS];
+        assert!(forcing.prepare_dual::<f64>(&params).is_none());
+    }
+
     /// `prepare_dual` lifts **all three** forcings (IG, transit, Weibull) to a
     /// `PkNum` type (here `T = f64`), reproducing the scalar `prepare` exactly — the
     /// `T = f64` byte-identity that lets the analytic ODE provider evaluate them over
@@ -1234,6 +1448,7 @@ mod tests {
             InputRateKind::InverseGaussian,
             InputRateKind::Transit,
             InputRateKind::Weibull,
+            InputRateKind::ZeroOrder,
         ];
         let params = vec![1.0; crate::types::MAX_PK_PARAMS];
         for &kind in ALL_KINDS {

@@ -4953,23 +4953,27 @@ fn parse_scaling_block(
 
 // ── ode_template desugaring + the analytical+ODE-only-absorption error rule ──
 
-/// Built-in absorption input-rate functions with **no closed form**, which
-/// therefore require an ODE disposition (the error rule, #322 Phase 0b). The
-/// closed-form-capable functions (`first_order`, `zero_order`) are intentionally
-/// excluded — they can ride on an analytical `pk` model.
-///
-/// This lists only the functions that are **actually implemented** as input
-/// rates today (`transit`, #343; `igd`, #347; `weibull`, Phase 2). Each later
-/// absorption function adds its own name here in the same PR that implements it,
-/// so the error rule never advertises a function the engine can't yet run (which
-/// would send the user to `ode_template` for a dead end, Ron #363). A slice (not
-/// a fixed-size array) so a new entry needs no length-annotation bump, matching
+/// Built-in absorption input-rate functions that — **as currently implemented** —
+/// require an ODE disposition, so combining them with an analytical `pk ...` is a
+/// hard error pointing at `ode_template` (the error rule, #322 Phase 0b). This is
+/// about what the engine can run *today*, not which models are closed-form-capable
+/// in principle: it lists only the functions actually implemented as input rates
+/// (`transit`, #343; `igd`, #347; `weibull`, Phase 2; `zero_order`, #504), so the
+/// error rule never advertises a function the engine can't yet run nor silently
+/// drops an `[odes]` absorption term on an analytical model. A slice (not a
+/// fixed-size array) so a new entry needs no length-annotation bump, matching
 /// [`INPUT_RATE_FNS`].
 ///
-/// `weibull` stays on this list **permanently** — unlike `transit`/`igd`, it has
-/// no elementary closed form with linear disposition, so it can never route to an
-/// analytical `pk` and always requires an explicit ODE disposition.
-const ODE_ONLY_ABSORPTION_FNS: &[&str] = &["transit", "igd", "weibull"];
+/// `weibull` stays here **permanently** — it has no elementary closed form with
+/// linear disposition, so it always requires an explicit ODE disposition.
+/// `transit`/`igd` will leave the list once their analytical (incomplete-gamma /
+/// tilted-IG) closed forms land (#386 / Phase 3). `zero_order` is closed-form-able
+/// (it is an infusion into the depot/central), but #504 ships it on the **ODE
+/// forcing path only**; it leaves the list when that closed-form acceleration is
+/// added under the equivalence harness. Until then, listing it keeps the
+/// no-surprises contract (a `pk ... + zero_order(...)` model errors loudly instead
+/// of dropping the absorption).
+const ODE_ONLY_ABSORPTION_FNS: &[&str] = &["transit", "igd", "weibull", "zero_order"];
 
 /// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
 /// the first such function name found. Drives the error rule that rejects an
@@ -5615,7 +5619,7 @@ fn split_args_on_commas(s: &str) -> Vec<&str> {
 /// arguments it requires. Arguments are resolved to individual-parameter slots
 /// and stored in `arg_slots` in this order, so `src/pk/absorption.rs` reads them
 /// positionally. Each new model adds one row here in the PR that implements it
-/// (`transit`, #343; `igd`, #347; `weibull`, Phase 2).
+/// (`transit`, #343; `igd`, #347; `weibull`, Phase 2; `zero_order`, #504).
 const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] = &[
     (
         "transit",
@@ -5631,6 +5635,11 @@ const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] =
         "weibull",
         crate::pk::absorption::InputRateKind::Weibull,
         &["td", "beta"],
+    ),
+    (
+        "zero_order",
+        crate::pk::absorption::InputRateKind::ZeroOrder,
+        &["dur"],
     ),
 ];
 
@@ -12170,6 +12179,15 @@ mod tests {
             ode_only_absorption_fn_in_odes(Some(&weibull)),
             Some("weibull")
         );
+        // `zero_order` is implemented as of #504. It has a closed form (an
+        // infusion), but #504 ships it ODE-only, so the error rule lists it until
+        // the analytical acceleration lands (keeps `pk ... + zero_order(...)` from
+        // silently dropping the absorption).
+        let zero_order = vec!["d/dt(central) = zero_order(dur=DUR) - (CL/V)*central".to_string()];
+        assert_eq!(
+            ode_only_absorption_fn_in_odes(Some(&zero_order)),
+            Some("zero_order")
+        );
         // A plain disposition ODE has no ODE-only absorption call.
         let plain = vec!["d/dt(central) = -(CL/V)*central".to_string()];
         assert_eq!(ode_only_absorption_fn_in_odes(Some(&plain)), None);
@@ -12494,6 +12512,84 @@ mod tests {
         );
         // Positive control: a bare additive weibull() is accepted.
         assert!(go("d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central").is_ok());
+    }
+
+    // ── zero_order() input-rate parse-split (#504) ────────────────────────────
+    #[test]
+    fn extract_zero_order_input_rate_basic() {
+        // zero_order(dur) straight into central: forcing on the central cmt, the
+        // single `dur` arg resolved to its slot; the rest of the RHS untouched.
+        let lines = vec!["d/dt(central) = zero_order(dur=DUR) - CL/V*central".to_string()];
+        let states = vec!["depot".to_string(), "central".to_string()];
+        let names = vec!["DUR".to_string(), "CL".to_string(), "V".to_string()];
+        let slots = vec![4, 0, 1];
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
+        assert_eq!(cleaned[0], "d/dt(central) = 0 - CL/V*central");
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(forcings[0].cmt, 1); // central
+        assert!(matches!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::ZeroOrder
+        ));
+        assert_eq!(forcings[0].arg_slots, vec![4]); // single [dur=DUR slot]
+    }
+
+    #[test]
+    fn extract_zero_order_into_depot_for_sequential() {
+        // `sequential` is zero_order into a depot, emptied to central by a
+        // hand-written `- KA*depot` (no new intrinsic): the forcing lands on the
+        // depot, the transfer term is preserved.
+        let lines = vec![
+            "d/dt(depot) = zero_order(dur=DUR) - KA*depot".to_string(),
+            "d/dt(central) = KA*depot - CL/V*central".to_string(),
+        ];
+        let states = vec!["depot".to_string(), "central".to_string()];
+        let names = vec![
+            "DUR".to_string(),
+            "KA".to_string(),
+            "CL".to_string(),
+            "V".to_string(),
+        ];
+        let slots = vec![4, 5, 0, 1];
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
+        assert_eq!(cleaned[0], "d/dt(depot) = 0 - KA*depot");
+        assert_eq!(cleaned[1], "d/dt(central) = KA*depot - CL/V*central");
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(forcings[0].cmt, 0); // depot
+        assert_eq!(forcings[0].arg_slots, vec![4]);
+    }
+
+    #[test]
+    fn extract_zero_order_input_rate_rejects_bad_specs() {
+        let states = vec!["central".to_string()];
+        let names = vec!["DUR".to_string()];
+        let slots = vec![4];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        assert!(go("d/dt(central) = zero_order(dur=ZZZ)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        assert!(go("d/dt(central) = zero_order(foo=DUR)")
+            .unwrap_err()
+            .contains("no argument `foo`"));
+        // Empty parens: the single (empty) argument is rejected as not a
+        // `name=parameter` pair — `dur` is required, so the call cannot be bare.
+        assert!(go("d/dt(central) = zero_order()")
+            .unwrap_err()
+            .contains("name=parameter"));
+        // A scaled call is rejected and the message names `zero_order` (the
+        // fraction-multiplier composition `mixed`/`parallel` is #505).
+        let scaled = go("d/dt(central) = FZO*zero_order(dur=DUR)").unwrap_err();
+        assert!(
+            scaled.contains("scaled") && scaled.contains("zero_order"),
+            "got: {scaled}"
+        );
+        assert!(go("x = zero_order(dur=DUR)").unwrap_err().contains("d/dt"));
+        // Positive control: a bare additive zero_order() is accepted.
+        assert!(go("d/dt(central) = zero_order(dur=DUR) - CL/V*central").is_ok());
     }
 
     #[test]

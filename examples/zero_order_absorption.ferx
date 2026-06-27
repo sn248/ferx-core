@@ -1,0 +1,71 @@
+# Zero-order absorption — built-in `zero_order()` input rate
+#
+# One-compartment disposition with zero-order (constant-rate) input over a
+# modeled duration, expressed with the built-in `zero_order()` input-rate
+# function. The dose enters the central compartment at a constant rate over the
+# window (0, DUR]:
+#
+#   R_in(tad) = F·Dose / DUR   for 0 < tad <= DUR,   0 otherwise
+#
+# i.e. a zero-order infusion whose duration DUR is an estimated model parameter
+# (the `D1`-style modeled-duration case, #324). The whole dose is delivered
+# through `zero_order()` over time (∫ R_in dt = F·Dose) and is NOT also added as a
+# bolus — the same dose-into-the-input-rate-compartment convention as `transit()`
+# / `igd()` / `weibull()`.
+#
+# `zero_order()` has a hard cutoff at tad = DUR. Its value is closed-form (it is a
+# zero-order infusion), but it ships on the explicit ODE path here; it cannot be
+# combined with an analytical `pk ...` (which errors, pointing at `ode_template`).
+# The `∂/∂DUR` sensitivity is a moving boundary, so it is computed by finite
+# differences (the analytic boundary-impulse route is follow-up #530).
+#
+# ── Unit convention (Form C: amount ODE + [scaling]) ─────────────────────────
+#   CMT=1  central  — drug AMOUNT (mg); receives R_in(tad), elimination CL/V
+#   observation y   — concentration (mg/L) = central / V, via the [scaling] block
+#
+# Self-contained: run it with no data file
+#   cargo run --release -- examples/zero_order_absorption.ferx --simulate
+# which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
+# fits it back. True simulation parameters: TVCL=5, TVV=50, TVDUR=4,
+#   omega_CL=omega_V=0.09, sigma_prop=0.15.
+
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)    # typical clearance (L/h)
+  theta TVV(50.0,   5.0, 500.0)    # typical central volume (L)
+  theta TVDUR(4.0, 0.05,  24.0)    # zero-order input duration (h)
+
+  omega ETA_CL ~ 0.09              # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09              # IIV on V  (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)       # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  DUR = TVDUR
+
+[structural_model]
+  ode(states=[central])            # no obs_cmt — Form C provides the observable
+
+[odes]
+  # central holds drug AMOUNT (mg); zero_order() delivers F·Dose at a constant
+  # rate over (0, DUR], then first-order elimination CL/V.
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+
+[scaling]
+  y = central / V                  # observable = concentration (mg/L)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7

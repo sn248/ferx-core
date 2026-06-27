@@ -13377,6 +13377,21 @@ mod tests {
     }
 
     #[test]
+    fn test_method_default_warning() {
+        // A model file with no `method` key leaves `user_set_keys` without
+        // "method", so the engine warns it defaulted to FOCEI.
+        let opts = parse_fit_options(&["covariance = false".to_string()]).unwrap();
+        let w = opts.method_default_warning();
+        assert!(w.is_some());
+        assert!(w.unwrap().contains("FOCEI"));
+        // An explicit `method` key suppresses the warning.
+        let opts = parse_fit_options(&["method = saem".to_string()]).unwrap();
+        assert!(opts.method_default_warning().is_none());
+        // Bare default (constructed directly) also warns.
+        assert!(FitOptions::default().method_default_warning().is_some());
+    }
+
+    #[test]
     fn test_parse_method_chain_empty_rejected() {
         assert!(parse_fit_options(&["method = []".to_string()]).is_err());
     }

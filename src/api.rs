@@ -2862,7 +2862,12 @@ fn fit_inner(
     // Compute up-front so we can both surface the warnings before the fit
     // starts (a long-running fit shouldn't bury a "this option is unused"
     // notice at the end) and carry them through into FitResult.warnings.
-    let unsupported_warnings = options.unsupported_keys_warnings();
+    let mut unsupported_warnings = options.unsupported_keys_warnings();
+    // Surface a "no method specified, defaulting to FOCEI" notice through the
+    // same channel so it reaches both stderr and FitResult.warnings.
+    if let Some(w) = options.method_default_warning() {
+        unsupported_warnings.push(w);
+    }
 
     // Capture thread count before chain runs (current_num_threads() reports
     // whichever Rayon pool is active — scoped pool when threads=Some, else global).

@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Experimental `simulate_adaptive()` — state-reactive ("feedback") dosing simulation**
+  (#553, epic #391). A programmatic entry point that simulates regimens where each dose is
+  chosen at run time by a controller reading the simulated state (TDM target attainment,
+  oncology dose reduction, biomarker titration). ODE models only; the controller is supplied
+  as a per-subject factory; every realized dose and every decision (including holds) is
+  returned alongside the trajectories, and a frozen-schedule replay verifier checks the dose
+  bookkeeping by default. Ipred monitors only for now (assay-noised `Dv` monitoring follows).
+  See [Adaptive dosing](model-file/adaptive-dosing.qmd).
 - Warn when no estimation method is set in the model file's `[fit_options]` or by
   the caller, making the implicit fallback to FOCEI visible instead of silent (#558).
 - Support NONMEM-style `block_sigma` residual covariance under SAEM for ordinary

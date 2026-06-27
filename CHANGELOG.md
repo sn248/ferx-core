@@ -20,6 +20,8 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Warn when no estimation method is set in the model file's `[fit_options]` or by
+  the caller, making the implicit fallback to FOCEI visible instead of silent (#558).
 - Support NONMEM-style `block_sigma` residual covariance under SAEM for ordinary
   Gaussian paired-endpoint models (#548).
 - Support NONMEM-style `block_sigma` residual covariance across paired same-time

@@ -4387,6 +4387,26 @@ impl FitOptions {
         }
         warnings
     }
+
+    /// Warn when no estimation method was set anywhere — neither in the model
+    /// file's `[fit_options]` nor by the caller (CLI / R / Python wrapper).
+    /// In that case `method` carries its `FOCEI` default, and the user may not
+    /// realise the engine picked it for them. Wrappers mark an explicit method
+    /// by pushing `"method"` onto `user_set_keys` (the parser does the same for
+    /// a model-file `method = ...` line), so the absence of that key is the
+    /// reliable signal that the value defaulted. Returns `None` once a method
+    /// has been specified anywhere.
+    pub fn method_default_warning(&self) -> Option<String> {
+        if self.user_set_keys.iter().any(|k| k == "method") {
+            return None;
+        }
+        Some(format!(
+            "No estimation method was specified in the model file or the call; \
+             defaulting to `{}`. Set `method` in [fit_options] or pass it \
+             explicitly to silence this warning.",
+            self.method.label()
+        ))
+    }
 }
 
 /// Framework-level fit-option keys: consumed by every method and typically

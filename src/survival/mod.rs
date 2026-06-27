@@ -540,6 +540,36 @@ mod tests {
     }
 
     #[test]
+    fn tte_cause_params_evaluates_tte_and_skips_non_tte() {
+        use crate::types::{EndpointError, ErrorModel, HazardFamily, HazardParamFn};
+        let theta = [0.1_f64];
+        let eta = [0.0_f64];
+        let cov = HashMap::new();
+
+        // A `Tte` endpoint yields `Some((family, evaluated params))`.
+        let param_fn: HazardParamFn =
+            Box::new(|theta: &[f64], _eta: &[f64], _cov: &HashMap<String, f64>| vec![theta[0]]);
+        let tte = EndpointLikelihood::Tte {
+            hazard: HazardSpec::Analytic {
+                family: HazardFamily::Exponential,
+                param_fn,
+            },
+        };
+        let (family, params) =
+            tte_cause_params(&tte, &theta, &eta, &cov).expect("Tte endpoint must yield Some");
+        assert_eq!(family, HazardFamily::Exponential);
+        assert_eq!(params, vec![0.1]);
+
+        // A non-`Tte` (Gaussian) endpoint takes the `None` branch, letting callers
+        // `filter_map`/`continue` over a mixed endpoint map.
+        let gaussian = EndpointLikelihood::Gaussian(EndpointError {
+            error_model: ErrorModel::Additive,
+            sigma_idx: vec![],
+        });
+        assert!(tte_cause_params(&gaussian, &theta, &eta, &cov).is_none());
+    }
+
+    #[test]
     fn tte_data_term_exact_event_exponential() {
         use crate::types::HazardFamily;
         // lambda=0.1, T=10, exact event → -log L = H(T) - log h(T) = 1.0 - log(0.1) = 1.0 + 2.303

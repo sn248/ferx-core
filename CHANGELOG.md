@@ -157,6 +157,15 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- `outer_maxiter = 0` (NONMEM `MAXEVAL=0`) now means *evaluation only* on every
+  optimizer (#562). The gradient NLopt path (`nlopt_lbfgs`/`slsqp`/`mma`) passed
+  `maxiter = 0` straight to NLopt's `set_maxeval`, where `0` means **no limit** —
+  so a `maxiter = 0` request silently ran a *full* fit and reported a converged,
+  optimizer- and platform-dependent OFV instead of the objective at the initial
+  parameters. All optimizers now route through a single eval-only path that runs
+  one inner EBE solve at θ₀ and reports `2·NLL` there (covariance step still
+  honoured). This is what surfaced as the `two_cpt_oral_cov_ode` ODE-vs-analytical
+  "init OFV" diverging ~534 on x86 Linux in the ferx-r equivalence tests.
 - FOCEI now falls back to finite-difference h-matrices when an ODE analytic
   Jacobian is unavailable or non-finite, avoiding sentinel-inflated OFVs on sparse
   subjects such as the pembrolizumab RadboudUMC model (#551).

@@ -306,6 +306,34 @@ fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
 /// `None` keeps the per-record window. The override changes only the censoring
 /// comparison, never the number of uniforms drawn, so the RNG sequence (and the
 /// SSE characterization tests) are unaffected.
+/// Destructure a TTE endpoint and evaluate its hazard parameters at the given
+/// `(theta, eta, covariates)`. Returns `None` for any non-`Tte` endpoint so
+/// callers can `filter_map`/`?` over `model.endpoints` or a looked-up CMT.
+///
+/// This centralises the `EndpointLikelihood::Tte { HazardSpec::Analytic {
+/// family, param_fn } }` destructure and `param_fn` evaluation shared by
+/// `simulate_tte` (per `obs_record`) and `predict_survival` (per endpoint), so a
+/// new `HazardSpec`/`HazardFamily` variant only has to be handled here. Callers
+/// supply their own trailing per-cause fields (window/entry time vs. summary
+/// statistics).
+pub(crate) fn tte_cause_params(
+    endpoint: &EndpointLikelihood,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<(HazardFamily, Vec<f64>)> {
+    let EndpointLikelihood::Tte { hazard } = endpoint else {
+        return None;
+    };
+    let HazardSpec::Analytic { family, param_fn } = hazard;
+    Some((*family, param_fn(theta, eta, covariates)))
+}
+
+// Same flat (model, subject, params, replicate indices, RNG, output sink) shape
+// as the sole caller `emit_subject_rows`, which carries this same allow: the args
+// are heterogeneous with no cohesive struct to bundle, and splitting them would
+// only diverge from that sibling.
+#[allow(clippy::too_many_arguments)]
 pub fn simulate_tte<R: rand::Rng>(
     model: &crate::types::CompiledModel,
     subject: &crate::types::Subject,
@@ -328,16 +356,18 @@ pub fn simulate_tte<R: rand::Rng>(
             time,
             event_type,
         } = record;
-        let Some(EndpointLikelihood::Tte { hazard }) = model.endpoints.get(cmt) else {
+        let Some(endpoint) = model.endpoints.get(cmt) else {
             continue;
         };
-        let HazardSpec::Analytic { family, param_fn } = hazard;
-        let params = param_fn(theta, eta, &subject.covariates);
+        let Some((family, params)) = tte_cause_params(endpoint, theta, eta, &subject.covariates)
+        else {
+            continue;
+        };
         // With an explicit `horizon`, every cause shares it as the administrative
         // window (#522); otherwise only a right-censored record marks a horizon and
         // an event record draws uncensored (+∞) — see `observation_window`.
         let window = horizon.unwrap_or_else(|| observation_window(event_type, *time));
-        causes.push((*cmt, *family, params, *entry_time, window));
+        causes.push((*cmt, family, params, *entry_time, window));
     }
 
     let push = |cmt: usize, time: f64, observed: bool, results: &mut Vec<_>| {

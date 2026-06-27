@@ -199,18 +199,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // draw then overwrites each template with its realised outcome (#522). Compute
     // the cause-CMT list once, outside the per-subject loop.
     #[cfg(feature = "survival")]
-    let tte_cmts: Vec<usize> = {
-        let mut c: Vec<usize> = parsed
-            .model
-            .endpoints
-            .iter()
-            .filter_map(|(cmt, ep)| {
-                matches!(ep, crate::types::EndpointLikelihood::Tte { .. }).then_some(*cmt)
-            })
-            .collect();
-        c.sort_unstable();
-        c
-    };
+    let tte_cmts: Vec<usize> = parsed.model.tte_cmts();
     #[cfg(feature = "survival")]
     if !tte_cmts.is_empty() && sim_spec.horizon.is_none() {
         return Err("[simulation] with a TTE endpoint requires `horizon = <t>` \
@@ -234,10 +223,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // otherwise carries a default `pk_model`, so the structural model alone can't
     // distinguish intent.
     let model_has_continuous = !parsed.model.default_params.sigma.values.is_empty();
-    #[cfg(feature = "survival")]
-    let model_has_tte = !tte_cmts.is_empty();
-    #[cfg(not(feature = "survival"))]
-    let model_has_tte = false;
+    let model_has_tte = parsed.model.has_tte();
     if sim_spec.obs_times.is_empty() {
         if model_has_continuous {
             return Err(
@@ -333,19 +319,31 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     )
     .map_err(|e| format!("simulation failed: {e}"))?;
 
+    // Group the simulation results by subject id once (they are emitted in
+    // subject order, but a map keeps the write-back independent of that), then
+    // write each subject's outcomes back in a single pass instead of re-scanning
+    // all of `sim_results` per subject twice (Gaussian, then TTE).
+    let mut sims_by_id: HashMap<&str, Vec<&SimulationResult>> = HashMap::new();
+    for s in &sim_results {
+        sims_by_id.entry(s.id.as_str()).or_default().push(s);
+    }
+
     let mut population = template;
     for subject in &mut population.subjects {
+        let Some(sims) = sims_by_id.get(subject.id.as_str()) else {
+            continue;
+        };
+
         // Gaussian write-back: only continuous outcomes map onto `observations`.
         // A TTE `Event` row would trip `continuous_value()`'s debug-assert, so
-        // filter it out here; the TTE outcomes are written into `obs_records` below.
-        let sims: Vec<_> = sim_results
+        // skip it here (the TTE outcomes go into `obs_records` below). Enumerating
+        // *after* the filter makes `j` index the continuous subsequence, matching
+        // the per-subject observation grid.
+        for (j, s) in sims
             .iter()
-            .filter(|s| {
-                s.id == subject.id
-                    && matches!(s.outcome, crate::types::SimOutcome::Continuous { .. })
-            })
-            .collect();
-        for (j, s) in sims.iter().enumerate() {
+            .filter(|s| matches!(s.outcome, crate::types::SimOutcome::Continuous { .. }))
+            .enumerate()
+        {
             if j < subject.observations.len() {
                 // Under LTBS the simulated DV is on the log scale and may be
                 // negative, so the positivity floor only applies to natural-scale
@@ -358,38 +356,39 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                 };
             }
         }
-    }
 
-    // TTE write-back (#522): replace each subject's template rows with the
-    // realised simulated outcomes — `Exact` at the drawn event time, or
-    // `RightCensored` at the horizon when no cause fired — so the fitted dataset
-    // (and any output) carries the simulated events rather than the placeholders.
-    #[cfg(feature = "survival")]
-    for subject in &mut population.subjects {
-        let events: Vec<crate::types::ObsRecord> = sim_results
-            .iter()
-            .filter(|s| s.id == subject.id)
-            .filter_map(|s| match s.outcome {
-                crate::types::SimOutcome::Event { time, observed } => {
-                    Some(crate::types::ObsRecord::Event {
-                        time,
-                        event_type: if observed {
-                            crate::types::EventType::Exact
-                        } else {
-                            crate::types::EventType::RightCensored
-                        },
-                        // Synthetic `[simulation]` subjects always enter at 0 (no
-                        // left truncation), matching the template row above; keep
-                        // the two in sync if this path ever gains delayed entry.
-                        entry_time: 0.0,
-                        cmt: s.cmt,
-                    })
-                }
-                _ => None,
-            })
-            .collect();
-        if !events.is_empty() {
-            subject.obs_records = events;
+        // TTE write-back (#522): replace the subject's template rows with the
+        // realised simulated outcomes — `Exact` at the drawn event time, or
+        // `RightCensored` at the horizon when no cause fired — so the fitted
+        // dataset (and any output) carries the simulated events rather than the
+        // placeholders.
+        #[cfg(feature = "survival")]
+        {
+            let events: Vec<crate::types::ObsRecord> = sims
+                .iter()
+                .filter_map(|s| match s.outcome {
+                    crate::types::SimOutcome::Event { time, observed } => {
+                        Some(crate::types::ObsRecord::Event {
+                            time,
+                            event_type: if observed {
+                                crate::types::EventType::Exact
+                            } else {
+                                crate::types::EventType::RightCensored
+                            },
+                            // Synthetic `[simulation]` subjects always enter at 0
+                            // (no left truncation), matching the template row
+                            // above; keep the two in sync if this path ever gains
+                            // delayed entry.
+                            entry_time: 0.0,
+                            cmt: s.cmt,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !events.is_empty() {
+                subject.obs_records = events;
+            }
         }
     }
 
@@ -5522,8 +5521,9 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
-    use crate::survival::{cif_curves, hazard_and_cum_hazard, mean_survival, median_survival};
-    use crate::types::EndpointLikelihood;
+    use crate::survival::{
+        cif_curves, hazard_and_cum_hazard, mean_survival, median_survival, tte_cause_params,
+    };
 
     // The competing-risks CIF telescopes the all-cause survival drop, which
     // requires the grid in ascending time order; sort a local copy so the
@@ -5542,15 +5542,15 @@ pub fn predict_survival(
         // each grid point, so collect the per-cause parameters up front.
         let mut causes: Vec<(usize, crate::types::HazardFamily, Vec<f64>, f64, f64)> = Vec::new();
         for (&cmt, endpoint) in &model.endpoints {
-            let EndpointLikelihood::Tte { hazard } = endpoint else {
+            let Some((family, params_vec)) =
+                tte_cause_params(endpoint, &params.theta, &zero_eta, &subject.covariates)
+            else {
                 continue;
             };
-            let crate::types::HazardSpec::Analytic { family, param_fn } = hazard;
-            let params_vec = param_fn(&params.theta, &zero_eta, &subject.covariates);
             // Distributional summaries are parameter-dependent, not time-dependent.
-            let t_median = median_survival(*family, &params_vec);
-            let t_mean = mean_survival(*family, &params_vec);
-            causes.push((cmt, *family, params_vec, t_median, t_mean));
+            let t_median = median_survival(family, &params_vec);
+            let t_mean = mean_survival(family, &params_vec);
+            causes.push((cmt, family, params_vec, t_median, t_mean));
         }
         if causes.is_empty() {
             continue;

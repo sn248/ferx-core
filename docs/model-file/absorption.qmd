@@ -525,18 +525,26 @@ model.
 
 ### Zero-order (`zero_order`)
 
-`zero_order(dur)` is, by definition, a zero-order infusion of duration `dur`, so
-it is anchored **in-engine** against an explicit infusion rather than a separate
-NONMEM run: a `zero_order(dur=DUR)` model fed by a bolus must predict identically
-to the *same disposition* fed by an explicit infusion of duration `DUR` (rate
-`Dose/DUR`). `tests/zero_order_absorption.rs` asserts this equivalence across the
-whole curve — the in-window ramp, the window-end kink, and the post-window decay —
-to `1e-6`, which pins the value path exactly (the constant-rate input reuses the
-same modeled-duration forcing as NONMEM's `RATE=−2`/`D1`). The forcing is
-additionally validated by the absorption-independent **mass-balance invariant**
-`∫A dt = F·Dose/ke` and by an end-to-end **duration-recovery fit** (gated behind
-`--features slow-tests`). `dur`'s sensitivity is finite-difference (see the note
-above), so this model uses the FD gradient path rather than the analytic `Dual2`
+`zero_order(dur)` is, by definition, a zero-order infusion of duration `dur` — i.e.
+NONMEM's modeled-duration case (`RATE=−2` → `D1`, rate `AMT/D1`) — so it is anchored
+two ways in `tests/zero_order_absorption.rs`:
+
+- **Directly against NONMEM.** `zero_order(dur=5)` (CL = 5, V = 50, AMT = 100)
+  reproduces NONMEM's exact ADVAN1 PRED for the matching `RATE=−2`/`D1` run —
+  published in `tests/nonmem/modeled_duration.ctl` / `data/modeled_duration_ref.csv`
+  — to within NONMEM's 3-decimal output rounding (observed max ≈ `4·10⁻⁴`). This
+  ties the absorption term to a real licensed NONMEM run, not only to an in-engine
+  sibling.
+- **In-engine against an explicit infusion.** A `zero_order(dur=DUR)` model fed by a
+  bolus predicts identically (to `1e-6`, across the in-window ramp, the window-end
+  kink, and the post-window decay) to the *same disposition* fed by an explicit
+  infusion of duration `DUR` (rate `Dose/DUR`) — pinning the new per-segment delivery
+  against the established infusion path.
+
+The forcing is additionally validated by the absorption-independent **mass-balance
+invariant** `∫A dt = F·Dose/ke` and by an end-to-end **duration-recovery fit** (gated
+behind `--features slow-tests`). `dur`'s sensitivity is finite-difference (see the
+note above), so this model uses the FD gradient path rather than the analytic `Dual2`
 route.
 
 ## Generating the disposition — `ode_template`

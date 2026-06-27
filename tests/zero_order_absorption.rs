@@ -181,6 +181,81 @@ fn zero_order_equals_explicit_infusion_of_the_same_duration() {
     }
 }
 
+/// Concentration readout (`S1 = V`, Form C `y = central/V`) over a zero-order
+/// input of **duration 5 h** — the parameters of the NONMEM modeled-duration
+/// anchor (CL = 5, V = 50, AMT = 100, D1 = 5 ⇒ rate 20 over 5 h).
+const ZERO_ORDER_CONC_D5_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta TVDUR(5.0, 0.05,  24.0)
+
+  omega ETA_CL ~ 0.0
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+"#;
+
+#[test]
+fn zero_order_matches_nonmem_modeled_duration_pred() {
+    // DIRECT NONMEM anchor (not the in-engine infusion transitivity): a
+    // `zero_order(dur)` input is, by definition, NONMEM's modeled-duration infusion
+    // (`RATE=-2` → `D1`, rate `AMT/D1`). NONMEM's exact ADVAN1 PRED for the scenario
+    // CL=5, V=50 (ke=0.1), AMT=100, D1=5 is published in
+    // `tests/nonmem/modeled_duration.ctl` / `data/modeled_duration_ref.csv` (the
+    // same anchor `tests/modeled_duration.rs` uses for the explicit-infusion path).
+    // ferx's `zero_order(dur=5)` ODE forcing must reproduce those PRED values — so
+    // the absorption term is tied to a real NONMEM run, not only to an in-engine
+    // sibling. Tolerance 1e-3: NONMEM's PRED is printed to 3 decimals, so the
+    // residual is dominated by that output rounding (observed max ≈ 4e-4), well
+    // below any real model discrepancy (a wrong window/mass diverges by ≫1e-3).
+    let nonmem_pred: &[(f64, f64)] = &[
+        (0.5, 0.195),
+        (1.0, 0.381),
+        (2.0, 0.725),
+        (5.0, 1.574), // end of the 5 h input window — the peak
+        (8.0, 1.166),
+        (12.0, 0.782),
+        (18.0, 0.429),
+        (24.0, 0.235),
+    ];
+
+    let model = parse_full_model(ZERO_ORDER_CONC_D5_MODEL)
+        .expect("zero_order concentration model parses")
+        .model;
+    let times: Vec<f64> = nonmem_pred.iter().map(|&(t, _)| t).collect();
+    let preds = predict(&model, &pop_single(times, 0.0), &model.default_params);
+
+    assert_eq!(preds.len(), nonmem_pred.len());
+    for (p, &(t, nm)) in preds.iter().zip(nonmem_pred.iter()) {
+        assert!(
+            (p.pred - nm).abs() < 1e-3,
+            "zero_order(dur=5) vs NONMEM ADVAN1 PRED diverge at t = {t}: \
+             ferx {} vs NONMEM {nm}",
+            p.pred
+        );
+    }
+}
+
 #[test]
 fn zero_order_restarts_after_reset_event_driven_path() {
     // A system reset (EVID=3/4) routes the subject through the event-driven walker

@@ -232,6 +232,191 @@ fn zero_order_restarts_after_reset_event_driven_path() {
     assert!(preds[1].pred > 1.0, "expected a real concentration at t=4");
 }
 
+#[test]
+fn zero_order_window_open_at_reset_stops_like_a_cut_infusion() {
+    // Adversarial reset case: the reset fires *while the window is still open*
+    // (mid-input) — the branch the cycle-mirror test above does NOT reach (there
+    // the window [0,4] has fully closed before the t=12 reset, so the `w_start >=
+    // reset_floor` turn-off is never the deciding factor). Here a dose at t=0 opens
+    // the window [0,4]; an EVID=3 reset at t=2 zeros the state and must also turn
+    // the still-open window OFF (`w_start = 0 < reset_floor = 2`), so no further
+    // mass is delivered after the reset.
+    //
+    // Oracle (not self-consistency): the same disposition fed by the *equivalent
+    // explicit infusion* (25 mg/h over 4 h ≡ zero_order(dur=4) of a 100 mg dose),
+    // cut by the identical reset. `active_infusions` and `active_zero_order_inputs`
+    // share the byte-for-byte `w_start >= reset_floor` turn-off, so the two curves
+    // must coincide across the whole timeline — the pre-reset ramp and the
+    // post-reset decay from the zeroed state. A regression that kept the
+    // zero-order window alive past the reset would inject extra mass and diverge
+    // here, while the cycle-mirror test above would still pass.
+    let zo = parse_full_model(ZERO_ORDER_MODEL)
+        .expect("zero_order model parses")
+        .model;
+    let plain = parse_full_model(PLAIN_1CPT_MODEL)
+        .expect("plain 1-cpt model parses")
+        .model;
+
+    let obs_times: Vec<f64> = (0..=80).map(|i| i as f64 * 0.25).collect(); // 0..20h
+    let n = obs_times.len();
+    let reset_at = 2.0; // strictly inside the window [0, 4]
+
+    let mk = |rate: f64| {
+        let mut s = common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, rate, false, 0.0)],
+            obs_times.clone(),
+            vec![0.0; n],
+            vec![1; n],
+        );
+        s.reset_times = vec![reset_at]; // EVID=3 mid-window → event-driven path
+        Population {
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+            subjects: vec![s],
+        }
+    };
+
+    let zo_preds = predict(&zo, &mk(0.0), &zo.default_params);
+    let inf_preds = predict(&plain, &mk(25.0), &plain.default_params);
+
+    assert_eq!(zo_preds.len(), inf_preds.len());
+    for (a, b) in zo_preds.iter().zip(inf_preds.iter()) {
+        assert!(
+            (a.pred - b.pred).abs() <= 1e-6 * (1.0 + b.pred.abs()),
+            "zero_order vs reset-cut infusion diverge at t = {} (reset at {}): {} vs {}",
+            a.time,
+            reset_at,
+            a.pred,
+            b.pred
+        );
+    }
+
+    // Independent absolute check (in case *both* models shared a bug): the reset
+    // must bite. A real pre-reset fill accrues (≈ 25·2 = 50 mg, minus elimination),
+    // and after the reset the window is OFF, so the amount only decays from the
+    // zeroed state — it never climbs back.
+    let pre_reset = zo_preds
+        .iter()
+        .filter(|p| p.time < reset_at - 1e-9)
+        .map(|p| p.pred)
+        .fold(0.0_f64, f64::max);
+    let post_reset = zo_preds
+        .iter()
+        .filter(|p| p.time > reset_at + 1e-9)
+        .map(|p| p.pred)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        pre_reset > 10.0,
+        "expected a real pre-reset partial fill, got {pre_reset}"
+    );
+    assert!(
+        post_reset < 1e-6,
+        "the window must be OFF after the reset (no further input); got post-reset max {post_reset}"
+    );
+}
+
+/// `ZERO_ORDER_MODEL` with an absorption **lagtime** on the dosing compartment
+/// (`LAGTIME1` ≡ NONMEM `ALAG1` for CMT 1): the input window shifts to
+/// `(lag, lag+dur]`. Same CL/V/DUR as `ZERO_ORDER_MODEL`; lag = 2 h.
+const ZERO_ORDER_LAGGED_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta TVDUR(4.0, 0.05,  24.0)
+  theta TVLAG(2.0, 0.001, 12.0)
+
+  omega ETA_CL ~ 0.0
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  CL       = TVCL * exp(ETA_CL)
+  V        = TVV
+  DUR      = TVDUR
+  LAGTIME1 = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+"#;
+
+#[test]
+fn zero_order_with_lagtime_is_the_unlagged_curve_shifted_by_the_lag() {
+    // A dose lagtime shifts the input window to (lag, lag+dur], so the window-start
+    // break moves to `dose.time + lag`. The full-containment filter only delivers
+    // the correct mass if a segment boundary lands there — every prior zero-order
+    // test runs lag = 0, where `w_start` coincides with the always-present dose-time
+    // break and so never exercises the lagged-start boundary.
+    //
+    // Oracle (not self-consistency): a lagtime is a pure time-shift of the whole
+    // input, so the lagged curve at `t` must equal the *unlagged* curve at `t - lag`
+    // for t >= lag (before which the lagged system is empty). Compare the two
+    // predict() curves on grids offset by exactly the lag.
+    let lagged = parse_full_model(ZERO_ORDER_LAGGED_MODEL)
+        .expect("lagged zero_order model parses")
+        .model;
+    let unlagged = parse_full_model(ZERO_ORDER_MODEL)
+        .expect("zero_order model parses")
+        .model;
+    let lag = 2.0;
+
+    let base: Vec<f64> = (0..=112).map(|i| i as f64 * 0.25).collect(); // 0..28h
+    let lagged_times: Vec<f64> = base.iter().map(|&t| t + lag).collect();
+
+    let unlagged_preds = predict(
+        &unlagged,
+        &pop_single(base.clone(), 0.0),
+        &unlagged.default_params,
+    );
+    let lagged_preds = predict(
+        &lagged,
+        &pop_single(lagged_times, 0.0),
+        &lagged.default_params,
+    );
+
+    // (1) Nothing absorbed before the lag: at the first lagged sample (t = lag) the
+    //     amount is still 0 — the window has not opened yet.
+    assert!(
+        lagged_preds[0].pred.abs() < 1e-9,
+        "lagged input must not start before t = lag; got {} at t = {}",
+        lagged_preds[0].pred,
+        lagged_preds[0].time
+    );
+
+    // (2) Time-shift identity: lagged(t + lag) == unlagged(t) across the whole
+    //     curve, including the in-window ramp and the window-end kink at t = DUR
+    //     (lagged: t = lag + DUR). This pins the lagged window-start break.
+    assert_eq!(unlagged_preds.len(), lagged_preds.len());
+    for (u, l) in unlagged_preds.iter().zip(lagged_preds.iter()) {
+        assert!(
+            (u.pred - l.pred).abs() <= 1e-6 * (1.0 + u.pred.abs()),
+            "lagged curve should be the unlagged curve shifted by {lag}h: \
+             unlagged(t={}) = {} vs lagged(t={}) = {}",
+            u.time,
+            u.pred,
+            l.time,
+            l.pred
+        );
+    }
+
+    // (3) The shift is real, not a degenerate all-zero match: the peak (at the
+    //     window end) is a genuine concentration.
+    let peak = lagged_preds.iter().map(|p| p.pred).fold(0.0_f64, f64::max);
+    assert!(peak > 1.0, "expected a real lagged peak, got {peak}");
+}
+
 /// `sequential` absorption: `zero_order(dur)` fills a depot, emptied to central by
 /// a hand-written first-order `- KA*depot` (no new intrinsic). central (CMT 2)
 /// holds the amount; the depot is CMT 1 and receives the zero-order input.

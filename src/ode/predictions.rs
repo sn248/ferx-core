@@ -472,16 +472,21 @@ pub(crate) fn active_infusions(
         .collect()
 }
 
-/// One dose's zero-order absorption window, precomputed **once per subject** as
-/// `(cmt_idx, rate, w_start, w_end)` — the constant `rate = F·amt/dur` delivered
-/// over `[w_start, w_end] = [time+lag, time+lag+dur]`. The precompute-once shape
-/// mirrors [`gated_infusions`].
+/// One dose's zero-order absorption window — `(cmt_idx, rate, w_start, w_end)`,
+/// the constant `rate = F·amt/dur` delivered over
+/// `[w_start, w_end] = [time+lag, time+lag+dur]`. The tuple shape mirrors
+/// [`gated_infusions`].
 ///
 /// `dur`/`F`/`lag` are **dose-time** attributes (fixed when the dose is given), so
-/// computing the window and its rate once — from the dose's own PK snapshot — and
-/// reusing them across every segment is what keeps `∫R_in = F·amt` exact even
-/// under time-varying covariates: recomputing the rate per segment from the
-/// running snapshot would let it drift mid-window and silently break mass balance.
+/// the window and its rate are built from **one** PK snapshot per dose — the
+/// per-dose `pk_at_dose[k]` on the event-driven path, the single subject snapshot
+/// `pk_params_flat` on the dense paths — and that one snapshot is the invariant
+/// that keeps `∫R_in = F·amt` exact even under time-varying covariates:
+/// re-deriving the rate from the *running* (mid-window) snapshot would let it
+/// drift and silently break mass balance. The event-driven path materialises the
+/// windows once and reuses them across segments; the dense paths re-derive them
+/// per segment, but always from that same fixed snapshot, so every segment sees
+/// byte-identical edges and rate (the cost is a small, often-empty `Vec`).
 type ZeroOrderWindow = (usize, f64, f64, f64);
 
 /// Build the per-dose [`ZeroOrderWindow`]s for a subject. `dur_for_dose` yields the

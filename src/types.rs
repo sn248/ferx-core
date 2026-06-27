@@ -2486,6 +2486,22 @@ impl CompiledModel {
             .any(|e| matches!(e, EndpointLikelihood::Tte { .. }))
     }
 
+    /// CMTs routed to a `Tte` endpoint, sorted ascending. Keeps the
+    /// "is this a TTE endpoint" predicate in one place (shared with
+    /// [`has_tte`](Self::has_tte)); callers that need the cause list — e.g.
+    /// building one censoring template row per cause in `run_model_simulate` —
+    /// use this instead of inlining the `matches!` filter.
+    #[cfg(feature = "survival")]
+    pub fn tte_cmts(&self) -> Vec<usize> {
+        let mut c: Vec<usize> = self
+            .endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| matches!(ep, EndpointLikelihood::Tte { .. }).then_some(*cmt))
+            .collect();
+        c.sort_unstable();
+        c
+    }
+
     /// Always false without the `survival` feature - TTE endpoints can't be
     /// parsed, so no model can carry one.
     #[cfg(not(feature = "survival"))]

@@ -1181,9 +1181,9 @@ fn obs_gaussian_dterm_coef(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
 
 /// Residual-eta (`iiv_on_ruv`) data-gradient term for a *quantified* observation:
 /// `∂(½ε²/v + ½ln v)/∂η_ruv = 1 − ε²/v` (the `∂v/∂η_ruv = 2v` factor cancels the ½),
-/// with `v` the `exp(2·η_ruv)`-scaled residual variance. Single source shared by the
-/// non-IOV and IOV inner gradients (and the reconverge test oracles) so they cannot
-/// drift (#474 review). The M3-censored row uses `h·z` instead — see the call sites.
+/// with `v` the `exp(2·η_ruv)`-scaled residual variance. Single source for the
+/// production non-IOV and IOV inner gradients so they cannot drift (#474 review). The
+/// M3-censored row uses `h·z` instead — see the call sites.
 #[inline]
 pub(crate) fn ruv_data_dterm(eps: f64, v: f64) -> f64 {
     1.0 - eps * eps / v
@@ -1191,11 +1191,8 @@ pub(crate) fn ruv_data_dterm(eps: f64, v: f64) -> f64 {
 
 #[inline]
 fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
-    let sqrt_v = v.sqrt();
-    let z = (y - f) / sqrt_v;
-    let ln_phi = -0.5 * z * z - 0.5 * std::f64::consts::TAU.ln();
-    let h = (ln_phi - crate::stats::special::log_normal_cdf(z)).exp();
-    h * (1.0 / sqrt_v + (y - f) * dv_df / (2.0 * v * sqrt_v))
+    let (h, _z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df);
+    h * m
 }
 
 /// Exact analytic `∂NLL_i/∂η` from the light first-order sensitivity provider:
@@ -1275,13 +1272,11 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
             // term is `−logΦ(z)` with `z = (y−f)/√v`, and `∂z/∂η_ruv = −z`, so
             // `∂(−logΦ)/∂η_ruv = h·z` (`h = φ(z)/Φ(z)`).
             if is_cens {
-                let z = (y - f) / v.sqrt();
-                let ln_phi = -0.5 * z * z - 0.5 * std::f64::consts::TAU.ln();
-                let h = (ln_phi - crate::stats::special::log_normal_cdf(z)).exp();
+                // Censored row: `∂(−logΦ(z))/∂η_ruv = h·z` (shared kernel).
+                let (h, z, _m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df);
                 ruv_grad += h * z;
             } else {
-                let eps = y - f;
-                ruv_grad += ruv_data_dterm(eps, v);
+                ruv_grad += ruv_data_dterm(y - f, v);
             }
         }
     }

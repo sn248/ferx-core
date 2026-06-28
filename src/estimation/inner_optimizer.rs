@@ -1249,7 +1249,8 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
             return None;
         }
         let dv_df = model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale;
-        let coef = if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
+        let is_cens = m3 && subject.cens.get(j).copied().unwrap_or(0) != 0;
+        let coef = if is_cens {
             m3_censored_dterm_df(y, f, v, dv_df)
         } else {
             obs_gaussian_dterm_coef(y, f, v, dv_df)
@@ -1258,10 +1259,19 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
             grad[k] += coef * obs.df_deta[k];
         }
         if ruv_idx.is_some() {
-            // ∂/∂η_ruv of the per-obs data term: `1 − ε²/v` (the `∂v/∂η_ruv = 2v`
-            // factor cancels the ½).
-            let eps = y - f;
-            ruv_grad += 1.0 - eps * eps / v;
+            // ∂/∂η_ruv of the per-obs data term. Quantified Gaussian row: `1 − ε²/v`
+            // (the `∂v/∂η_ruv = 2v` factor cancels the ½). M3-censored row (#4c): the
+            // term is `−logΦ(z)` with `z = (y−f)/√v`, and `∂z/∂η_ruv = −z`, so
+            // `∂(−logΦ)/∂η_ruv = h·z` (`h = φ(z)/Φ(z)`).
+            if is_cens {
+                let z = (y - f) / v.sqrt();
+                let ln_phi = -0.5 * z * z - 0.5 * std::f64::consts::TAU.ln();
+                let h = (ln_phi - crate::stats::special::log_normal_cdf(z)).exp();
+                ruv_grad += h * z;
+            } else {
+                let eps = y - f;
+                ruv_grad += 1.0 - eps * eps / v;
+            }
         }
     }
     if let Some(r) = ruv_idx {
@@ -2240,6 +2250,70 @@ mod tests {
         };
         let fd = gradient_fd(&obj, &eta, model.n_eta);
 
+        for k in 0..model.n_eta {
+            assert!(
+                (analytic[k] - fd[k]).abs() < 1e-4 * (1.0 + fd[k].abs()),
+                "η[{k}]: analytic {} vs FD {}",
+                analytic[k],
+                fd[k]
+            );
+        }
+    }
+
+    /// Closed-form `iiv_on_ruv` + M3 BLOQ (#4c): the analytic non-IOV inner
+    /// η-gradient must match central FD of `individual_nll`, exercising the censored
+    /// `η_ruv` data column `h·z` and the `exp(2·η_ruv)` variance scaling on the
+    /// censored rows (which previously forced FD via `iiv_on_ruv_forces_fd`).
+    #[test]
+    fn analytic_inner_gradient_iiv_on_ruv_m3_matches_fd() {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        let mut model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.05\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse closed-form iiv_on_ruv");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert_eq!(model.residual_error_eta, Some(3));
+        assert!(!model.iiv_on_ruv_forces_fd());
+
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 24.0],
+            obs_raw_times: Vec::new(),
+            // The last two rows are below the LLOQ = 2.0 (carried in `observations`).
+            observations: vec![8.0, 7.0, 5.0, 3.0, 2.0, 2.0],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0, 0, 0, 1, 1],
+            occasions: vec![1; 6],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+
+        let theta = &model.default_params.theta;
+        let omega = &model.default_params.omega;
+        let sigma = &model.default_params.sigma.values;
+        let eta = vec![0.12, -0.05, 0.2, 0.15]; // non-zero η_ruv
+
+        let analytic = analytic_eta_nll_gradient(&model, &subject, theta, &eta, omega, sigma)
+            .expect("analytic closed-form M3 + iiv_on_ruv inner gradient");
+
+        let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(&subject));
+        let obj = |e: &[f64]| -> f64 {
+            let mut s = scratch.borrow_mut();
+            individual_nll_into_with_schedule(
+                &model, &subject, theta, e, omega, sigma, &mut s, None,
+            )
+        };
+        let fd = gradient_fd(&obj, &eta, model.n_eta);
         for k in 0..model.n_eta {
             assert!(
                 (analytic[k] - fd[k]).abs() < 1e-4 * (1.0 + fd[k].abs()),
@@ -3277,8 +3351,10 @@ mod iov_tests {
     }
 
     /// IIV on residual error (#474): the closed-form inner η-gradient must match a
-    /// The inner-gradient model gate accepts a closed-form `iiv_on_ruv` model but
-    /// declines M3 BLOQ + `iiv_on_ruv` (those keep FD on both loops, #474).
+    /// The inner-gradient model gate accepts a closed-form `iiv_on_ruv` model AND
+    /// closed-form **M3 BLOQ + `iiv_on_ruv`** (#4c — the censored × residual-eta
+    /// cross-terms are assembled). Only **ODE** M3 + `iiv_on_ruv` still keeps FD
+    /// (not yet regression-tested on the ODE path; gated via `iiv_on_ruv_forces_fd`).
     #[test]
     fn analytic_inner_grad_gate_iiv_on_ruv() {
         use crate::parser::model_parser::parse_model_string;
@@ -3287,8 +3363,10 @@ mod iov_tests {
         )
         .expect("parse");
         assert!(analytic_inner_grad_supported_model(&model));
+        // #4c: closed-form M3 + iiv_on_ruv is now analytic (was FD).
         model.bloq_method = crate::types::BloqMethod::M3;
-        assert!(!analytic_inner_grad_supported_model(&model));
+        assert!(analytic_inner_grad_supported_model(&model));
+        assert!(!model.iiv_on_ruv_forces_fd());
     }
 
     /// central finite difference of the production `individual_nll` (which applies

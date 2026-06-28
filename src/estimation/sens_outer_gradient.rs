@@ -49,6 +49,20 @@ struct ErrTerms {
     alpha_p: f64, // α'ⱼ = dαⱼ/df
     p: f64,       // pⱼ
     beta: f64,    // βⱼ = dpⱼ/df
+    // M3-censored × residual-eta (`iiv_on_ruv`) cross-term coefficients (#4c).
+    // Zero on quantified rows and on non-`iiv_on_ruv` censored rows. With
+    // `z = (y−f)/√v`, `h = φ(z)/Φ(z)`, `m = 1/√v + (y−f)·R'/(2 v^{3/2})` and
+    // `C = h·(z² + h·z − 1)`, the censored data term `L = −logΦ(z)` under
+    // `v = R·exp(2·η_ruv)` has `∂²L/∂η_ruv² = C·z`, `∂²L/∂η_l∂η_ruv = C·m·a_l`,
+    // `∂²L/∂η_ruv∂θ = C·m·b`, `∂²L/∂η_ruv∂σ = ½·(C·z)·(∂v/∂σ)/v`. So the true
+    // inner Hessian's residual-eta row/col reads `ruv_cz`/`ruv_cm` instead of the
+    // Gaussian `2ε²/R`/`ruv_kappa`. `H̃`/`log|H̃|` exclude censored rows entirely
+    // (matching `gaussian_foce_accum`), so no `c̃`-column term is stored.
+    ruv_cz: f64, // C·z  (residual-eta diagonal of the true inner Hessian)
+    ruv_cm: f64, // C·m  (residual-eta × structural-η / θ / σ coupling)
+    /// True for an M3-censored row. The residual-eta blocks read the censored
+    /// `ruv_cz`/`ruv_cm` coefficients instead of the Gaussian `2ε²/R`/`ruv_kappa`.
+    censored: bool,
 }
 
 /// Inverse Mills ratio `h = φ(z)/Φ(z)`, evaluated through logs so it stays finite
@@ -101,7 +115,23 @@ fn err_terms(r: f64, d: f64, d2: f64, eps: f64) -> ErrTerms {
         alpha_p,
         p,
         beta,
+        ruv_cz: 0.0,
+        ruv_cm: 0.0,
+        censored: false,
     }
+}
+
+/// M3-censored × residual-eta cross coefficients `(C·z, C·m)` for an
+/// `iiv_on_ruv` censored row, where `r`/`d` already carry the `exp(2·η_ruv)`
+/// scale (so `z`/`h`/`m`/`C` are evaluated at the scaled variance). See
+/// [`ErrTerms`] for the role of each. `(0, 0)` for a quantified row.
+fn m3_censored_ruv_coeffs(y: f64, f: f64, r: f64, d: f64) -> (f64, f64) {
+    let w = r.sqrt();
+    let z = (y - f) / w;
+    let h = inv_mills(z);
+    let m = 1.0 / w + (y - f) * d / (2.0 * r * w);
+    let c = h * (z * z + h * z - 1.0);
+    (c * z, c * m)
 }
 
 /// Shared per-subject quantities the θ/Ω/Σ gradient blocks all consume, built
@@ -252,17 +282,20 @@ fn prepare_stacked(
         // as `alpha = 2·g1`, `alpha_p = 2·g2` (so the assembly's `½α`, `½α'` recover
         // `∂L/∂f`, `∂²L/∂f²`) and force `p = β = 0` (excluded from `H̃` / `log|H̃|`).
         let t = if is_cens {
-            // M3 + `iiv_on_ruv` routes to FD upstream (`analytic_outer_gradient_
-            // available`), so `is_cens` and `ruv` never co-occur on a reachable call.
-            // `r`/`d`/`d2` here carry `ruv_scale`; if a future caller bypassed the
-            // gate, the censored scalars would get a doubly-applied scale — pin it.
-            debug_assert!(
-                ruv.is_none(),
-                "M3 censoring with iiv_on_ruv must route to FD (gate bypassed)"
-            );
             censored[j] = true;
             any_cens = true;
+            // `r`/`d`/`d2` carry `ruv_scale`, so the censored scalars are evaluated at
+            // the scaled variance (#4c). M3 + `iiv_on_ruv` is now analytic: the
+            // censored × residual-eta cross coefficients `(C·z, C·m)` are stored for the
+            // true inner Hessian / mixed / σ blocks; the `H̃`/`log|H̃|` residual-eta
+            // blocks still exclude censored rows (they exclude *all* censored rows,
+            // matching `gaussian_foce_accum`).
             let (g1, g2) = m3_censored_scalars(y, f, r, d, d2);
+            let (ruv_cz, ruv_cm) = if ruv.is_some() {
+                m3_censored_ruv_coeffs(y, f, r, d)
+            } else {
+                (0.0, 0.0)
+            };
             ErrTerms {
                 r,
                 d,
@@ -271,6 +304,9 @@ fn prepare_stacked(
                 alpha_p: 2.0 * g2,
                 p: 0.0,
                 beta: 0.0,
+                ruv_cz,
+                ruv_cm,
+                censored: true,
             }
         } else {
             err_terms(r, d, d2, y - f)
@@ -289,21 +325,35 @@ fn prepare_stacked(
         // and `H̃[ruv,l] += gⱼ a_{jl}` (`gⱼ = dⱼ/Rⱼ`); the true Hessian gets
         // `H[ruv,ruv] += 2ε²/R` and `H[ruv,l] += κⱼ a_{jl}`.
         if let Some(rr) = ruv {
-            let eps = t.eps;
-            let g = t.d / t.r;
-            g_ruv[j] = g;
-            gp_ruv[j] = d2 / t.r - g * g;
-            let kappa = ruv_kappa(eps, t.r, t.d);
-            htilde[(rr, rr)] += 2.0;
-            h_inner[(rr, rr)] += 2.0 * eps * eps / t.r;
-            for l in 0..n_eta {
-                if l == rr {
-                    continue;
+            if censored[j] {
+                // Censored row: excluded from `H̃`/`log|H̃|` (so `g_ruv`/`gp_ruv` stay 0),
+                // but its residual-eta second derivatives DO enter the true inner Hessian:
+                // `H[ruv,ruv] += C·z`, `H[ruv,l] += C·m·a_l` (#4c).
+                h_inner[(rr, rr)] += t.ruv_cz;
+                for l in 0..n_eta {
+                    if l == rr {
+                        continue;
+                    }
+                    h_inner[(rr, l)] += t.ruv_cm * a[l];
+                    h_inner[(l, rr)] += t.ruv_cm * a[l];
                 }
-                htilde[(rr, l)] += g * a[l];
-                htilde[(l, rr)] += g * a[l];
-                h_inner[(rr, l)] += kappa * a[l];
-                h_inner[(l, rr)] += kappa * a[l];
+            } else {
+                let eps = t.eps;
+                let g = t.d / t.r;
+                g_ruv[j] = g;
+                gp_ruv[j] = d2 / t.r - g * g;
+                let kappa = ruv_kappa(eps, t.r, t.d);
+                htilde[(rr, rr)] += 2.0;
+                h_inner[(rr, rr)] += 2.0 * eps * eps / t.r;
+                for l in 0..n_eta {
+                    if l == rr {
+                        continue;
+                    }
+                    htilde[(rr, l)] += g * a[l];
+                    htilde[(l, rr)] += g * a[l];
+                    h_inner[(rr, l)] += kappa * a[l];
+                    h_inner[(l, rr)] += kappa * a[l];
+                }
             }
         }
         et.push(t);
@@ -354,7 +404,12 @@ fn prepare_stacked(
                 }
                 g_eta[l] += 2.0 * (gp * wjr * obs.df_deta[l] + g * sa);
             }
-            g_eta[rr] += -2.0 * q[j] / et[j].r;
+            // Censored rows carry no `c̃` residual-eta column in `H̃` (excluded, like
+            // all censored rows), so they contribute nothing to its log-det derivative
+            // either (#4c). `g`/`gp` are already 0 for them; gate the `∂p/∂η_ruv` term too.
+            if !censored.get(j).copied().unwrap_or(false) {
+                g_eta[rr] += -2.0 * q[j] / et[j].r;
+            }
         }
     }
 
@@ -610,33 +665,46 @@ fn sigma_block(
             let cmt = subject.obs_cmts[j];
             let f = obs.f;
             if prep.censored.get(j).copied().unwrap_or(false) {
-                // M3 censored row: data term `−logΦ((y−f)/√R(σ))` (not in `H̃`, so
+                // M3 censored row: data term `−logΦ((y−f)/√v(σ))` (not in `H̃`, so
                 // no `log|H̃|` σ-term). `∂L/∂σ` and `∂g1/∂σ = ½∂α/∂σ` by central FD
                 // of the closed-form censored scalars, mirroring the Gaussian path.
+                // Under `iiv_on_ruv` the variance carries `exp(2·η_ruv)` (`prep.ruv_scale`),
+                // so scale every error-function value here too (#4c — was unscaled).
+                let s = prep.ruv_scale;
                 let y = subject.observations[j];
                 let l_sig = (-crate::stats::special::log_normal_cdf(
-                    (y - f) / model.error_spec.variance_at(cmt, f, &sp).sqrt(),
+                    (y - f) / (model.error_spec.variance_at(cmt, f, &sp) * s).sqrt(),
                 ) + crate::stats::special::log_normal_cdf(
-                    (y - f) / model.error_spec.variance_at(cmt, f, &sm).sqrt(),
+                    (y - f) / (model.error_spec.variance_at(cmt, f, &sm) * s).sqrt(),
                 )) / (2.0 * h);
                 fixed += l_sig;
                 let (g1p, _) = m3_censored_scalars(
                     y,
                     f,
-                    model.error_spec.variance_at(cmt, f, &sp),
-                    model.error_spec.dvar_df(cmt, f, &sp),
-                    model.error_spec.d2var_df2(cmt, &sp),
+                    model.error_spec.variance_at(cmt, f, &sp) * s,
+                    model.error_spec.dvar_df(cmt, f, &sp) * s,
+                    model.error_spec.d2var_df2(cmt, &sp) * s,
                 );
                 let (g1m, _) = m3_censored_scalars(
                     y,
                     f,
-                    model.error_spec.variance_at(cmt, f, &sm),
-                    model.error_spec.dvar_df(cmt, f, &sm),
-                    model.error_spec.d2var_df2(cmt, &sm),
+                    model.error_spec.variance_at(cmt, f, &sm) * s,
+                    model.error_spec.dvar_df(cmt, f, &sm) * s,
+                    model.error_spec.d2var_df2(cmt, &sm) * s,
                 );
                 let dg1 = (g1p - g1m) / (2.0 * h);
                 for m in 0..n_eta {
                     m_vec[m] += dg1 * obs.df_deta[m];
+                }
+                // Censored residual-eta × σ cross-term (#4c): the residual-eta row of M
+                // is `∂²L/∂η_ruv∂σ = ½·(C·z)·(∂v/∂σ)/v`. `H̃` excludes censored, so this
+                // enters only the EBE-response `m_vec`, not `fixed`.
+                if let Some(rr) = prep.ruv {
+                    let r_sig = s
+                        * (model.error_spec.variance_at(cmt, f, &sp)
+                            - model.error_spec.variance_at(cmt, f, &sm))
+                        / (2.0 * h);
+                    m_vec[rr] += 0.5 * prep.et[j].ruv_cz * r_sig / prep.et[j].r;
                 }
                 continue;
             }
@@ -1755,27 +1823,38 @@ pub fn subject_eta_dx(
         for (j, obs) in sens.obs.iter().enumerate() {
             let cmt = subject.obs_cmts[j];
             let f = obs.f;
-            // M3 censored inner term uses the conditional variance R(f(η̂)); its
+            // M3 censored inner term uses the conditional variance `v(f(η̂))`; its
             // `½∂α/∂σ = ∂g1/∂σ` by central FD of the closed-form censored scalar.
+            // Under `iiv_on_ruv` the variance carries `exp(2·η_ruv)`, so scale every
+            // error-function value (#4c — was unscaled).
             if prep.censored.get(j).copied().unwrap_or(false) {
+                let s = prep.ruv_scale;
                 let y = subject.observations[j];
                 let (g1p, _) = m3_censored_scalars(
                     y,
                     f,
-                    model.error_spec.variance_at(cmt, f, &sp),
-                    model.error_spec.dvar_df(cmt, f, &sp),
-                    model.error_spec.d2var_df2(cmt, &sp),
+                    model.error_spec.variance_at(cmt, f, &sp) * s,
+                    model.error_spec.dvar_df(cmt, f, &sp) * s,
+                    model.error_spec.d2var_df2(cmt, &sp) * s,
                 );
                 let (g1m, _) = m3_censored_scalars(
                     y,
                     f,
-                    model.error_spec.variance_at(cmt, f, &sm),
-                    model.error_spec.dvar_df(cmt, f, &sm),
-                    model.error_spec.d2var_df2(cmt, &sm),
+                    model.error_spec.variance_at(cmt, f, &sm) * s,
+                    model.error_spec.dvar_df(cmt, f, &sm) * s,
+                    model.error_spec.d2var_df2(cmt, &sm) * s,
                 );
                 let dg1 = (g1p - g1m) / (2.0 * h);
                 for m in 0..n_eta {
                     mvec[m] += dg1 * obs.df_deta[m];
+                }
+                // Censored residual-eta × σ cross-term (#4c): `∂²L/∂η_ruv∂σ = ½·(C·z)·(∂v/∂σ)/v`.
+                if let Some(rr) = prep.ruv {
+                    let r_sig = s
+                        * (model.error_spec.variance_at(cmt, f, &sp)
+                            - model.error_spec.variance_at(cmt, f, &sm))
+                        / (2.0 * h);
+                    mvec[rr] += 0.5 * prep.et[j].ruv_cz * r_sig / prep.et[j].r;
                 }
                 continue;
             }
@@ -1877,7 +1956,13 @@ fn mixed_eta_theta(
     for j in 0..n_obs {
         let bjm = obs[j].df_dtheta[m];
         if let Some(rr) = ruv {
-            mk[rr] += ruv_kappa(et[j].eps, et[j].r, et[j].d) * bjm;
+            // ∂²l/∂η_ruv∂θ: Gaussian `ruv_kappa·b`, or the censored cross `C·m·b` (#4c).
+            let coef = if et[j].censored {
+                et[j].ruv_cm
+            } else {
+                ruv_kappa(et[j].eps, et[j].r, et[j].d)
+            };
+            mk[rr] += coef * bjm;
         }
         for k in 0..n_eta {
             let b2 = obs[j].d2f_deta_dtheta[k * n_theta_stride + m];
@@ -2457,6 +2542,7 @@ mod tests {
         let mut eta: Vec<f64> = warm.eta.iter().copied().collect();
         let n_eta = model.n_eta;
         let rr = model.residual_error_eta.expect("ruv model");
+        let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
         let sigma = &params.sigma.values;
         let omega_inv = &params.omega.inv;
         for _ in 0..50 {
@@ -2474,8 +2560,13 @@ mod tests {
                 let d2 = model.error_spec.d2var_df2(cmt, sigma) * s;
                 let y = subject.observations[j];
                 let eps = y - f;
-                let t = err_terms(r, d, d2, eps);
-                let (g1, g2) = (0.5 * t.alpha, 0.5 * t.alpha_p);
+                let is_cens = m3 && subject.cens.get(j).copied().unwrap_or(0) != 0;
+                let (g1, g2) = if is_cens {
+                    m3_censored_scalars(y, f, r, d, d2)
+                } else {
+                    let t = err_terms(r, d, d2, eps);
+                    (0.5 * t.alpha, 0.5 * t.alpha_p)
+                };
                 let a = obs.df_deta.as_slice();
                 for k in 0..n_eta {
                     grad[k] += g1 * a[k];
@@ -2483,16 +2574,35 @@ mod tests {
                         hess[(k, l)] += g2 * a[k] * a[l] + g1 * obs.d2f_deta2[k * n_eta + l];
                     }
                 }
-                // Residual-eta gradient / Hessian (a_{ruv} = A_{·,ruv} = 0).
-                grad[rr] += 1.0 - eps * eps / r;
-                hess[(rr, rr)] += 2.0 * eps * eps / r;
-                let kappa = 2.0 * eps / r + eps * eps * d / (r * r);
-                for l in 0..n_eta {
-                    if l == rr {
-                        continue;
+                // Residual-eta gradient / Hessian (a_{ruv} = A_{·,ruv} = 0). Censored
+                // rows use the M3 cross-terms `h·z` / `C·z` / `C·m·a` (#4c); quantified
+                // rows the Gaussian `1−ε²/R` / `2ε²/R` / `κ a` (#474).
+                if is_cens {
+                    let w = r.sqrt();
+                    let z = (y - f) / w;
+                    let h = inv_mills(z);
+                    let m = 1.0 / w + (y - f) * d / (2.0 * r * w);
+                    let c = h * (z * z + h * z - 1.0);
+                    grad[rr] += h * z;
+                    hess[(rr, rr)] += c * z;
+                    for l in 0..n_eta {
+                        if l == rr {
+                            continue;
+                        }
+                        hess[(rr, l)] += c * m * a[l];
+                        hess[(l, rr)] += c * m * a[l];
                     }
-                    hess[(rr, l)] += kappa * a[l];
-                    hess[(l, rr)] += kappa * a[l];
+                } else {
+                    grad[rr] += 1.0 - eps * eps / r;
+                    hess[(rr, rr)] += 2.0 * eps * eps / r;
+                    let kappa = 2.0 * eps / r + eps * eps * d / (r * r);
+                    for l in 0..n_eta {
+                        if l == rr {
+                            continue;
+                        }
+                        hess[(rr, l)] += kappa * a[l];
+                        hess[(l, rr)] += kappa * a[l];
+                    }
                 }
             }
             let step = hess.cholesky().unwrap().solve(&grad);
@@ -2612,6 +2722,96 @@ mod tests {
         let model = parse_model_string(WARFARIN_RUV).expect("parse");
         assert_eq!(model.residual_error_eta, Some(3));
         run_ruv_packed_check(&model, &[0.22, 11.0, 1.4]);
+    }
+
+    /// Closed-form `iiv_on_ruv` + **M3 BLOQ** (#4c): the analytic FOCEI packed
+    /// gradient must match Richardson reconverged FD of ferx's scaled, censored
+    /// FOCEI marginal across every θ/Ω/σ coordinate. This exercises the censored ×
+    /// residual-eta cross-terms — `h·z` (inner column), `C·z`/`C·m·a` (true inner
+    /// Hessian, mixed η-θ), the `C·z·(∂v/∂σ)/2v` σ-cross — and the exclusion of
+    /// censored rows from `H̃`/`log|H̃|` (matching `gaussian_foce_accum`).
+    #[test]
+    fn population_packed_gradient_iiv_on_ruv_m3_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+
+        let mut model = parse_model_string(WARFARIN_RUV).expect("parse");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert_eq!(model.residual_error_eta, Some(3));
+        // Gate flip: closed-form M3 + iiv_on_ruv is now analytic on both loops.
+        assert!(crate::sens::provider::analytic_outer_gradient_available(
+            &model
+        ));
+        assert!(!model.iiv_on_ruv_forces_fd());
+
+        let theta = vec![0.22, 11.0, 1.4];
+        // Censor the two latest (lowest-concentration) observations at an LLOQ above
+        // their prediction, so the M3 `−logΦ` term is genuinely active.
+        let mk = |times: &[f64]| -> Subject {
+            let mut s = ruv_subject(&model, &theta, times);
+            let n = s.obs_times.len();
+            for j in (n - 2)..n {
+                s.observations[j] *= 1.5;
+                s.cens[j] = 1;
+            }
+            s
+        };
+        let pop = Population {
+            subjects: vec![
+                mk(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
+                mk(&[0.25, 1.5, 3.0, 6.0, 12.0, 36.0, 72.0]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.clone();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe_ruv(&model, s, &params)))
+            .collect();
+
+        let analytic = population_gradient_sens(&model, &pop, &template, &x, &ehs)
+            .expect("M3 + iiv_on_ruv is analytic");
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    let eta = precise_ebe_ruv(&model, s, &p);
+                    marginal_nll_at(&model, s, &p, &eta)
+                })
+                .sum::<f64>()
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[k] += hh;
+                let mut xm = x.clone();
+                xm[k] -= hh;
+                (ofv(&xp) - ofv(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "m3+ruv x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[k],
+                fd,
+                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
+        }
     }
 
     /// The same residual-eta gradient must be exact on an **ODE** model: the

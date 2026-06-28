@@ -2773,19 +2773,23 @@ impl CompiledModel {
     /// `exp(eta_k)` — i.e. `EPS·EXP(ETA)` — for additive, proportional, and
     /// combined alike.
     /// Whether `iiv_on_ruv` combines with a feature that forces the analytic
-    /// gradient off and FD on for this model. Now only **M3 BLOQ** does — its
-    /// censored residual-eta second derivatives are not assembled. **IOV +
-    /// `iiv_on_ruv`** is analytic on the closed-form path: the IOV inner gradient
-    /// ([`analytic_eta_nll_gradient_iov`](crate::estimation::inner_optimizer)) carries the
-    /// residual-variance scaling and `η_ruv` column, and the outer assembly threads the
-    /// `η_ruv` column through the stacked `[η_bsv, κ]` layout (#474/#466). (ODE IOV +
-    /// `iiv_on_ruv` still routes to FD, but via `ode_iov_supported` — not this gate.)
-    /// Single source of truth shared by the outer gradient gate
+    /// gradient off and FD on for this model. The only remaining case is **M3 BLOQ
+    /// on the ODE path**: the closed-form censored × residual-eta cross-terms are
+    /// implemented in the shared assembly (#4c — `m3_censored_ruv_coeffs` + the
+    /// `ruv_cz`/`ruv_cm` blocks), but the ODE path is not yet regression-tested for
+    /// that combination, so it stays on FD. Everything else is analytic:
+    /// **closed-form M3 + `iiv_on_ruv`** (#4c), **IOV + `iiv_on_ruv`** (#474/#466 —
+    /// the inner gradient carries the `exp(2·η_ruv)` scaling + `η_ruv` column and the
+    /// outer assembly threads it through the stacked `[η_bsv, κ]` layout; ODE IOV +
+    /// `iiv_on_ruv` routes to FD via `ode_iov_supported`, not this gate). Single source
+    /// of truth shared by the outer gate
     /// ([`analytic_outer_gradient_available`](crate::sens::provider::analytic_outer_gradient_available))
     /// and the inner η-gradient gates, so the two halves stay matched (#474).
     #[inline]
     pub fn iiv_on_ruv_forces_fd(&self) -> bool {
-        self.residual_error_eta.is_some() && matches!(self.bloq_method, BloqMethod::M3)
+        self.residual_error_eta.is_some()
+            && matches!(self.bloq_method, BloqMethod::M3)
+            && self.ode_spec.is_some()
     }
 
     /// Whether a custom residual-error magnitude (#484) is active. The

@@ -3429,12 +3429,14 @@ mod tests {
         let mut ruv = test_helpers::analytical_model(GradientMethod::Auto);
         ruv.residual_error_eta = Some(0);
         assert!(analytic_outer_gradient_available(&ruv));
-        // …but M3 BLOQ + `iiv_on_ruv` falls back to FD (no censored residual-eta
-        // second derivatives are assembled).
+        // …and closed-form M3 BLOQ + `iiv_on_ruv` is now analytic too (#4c — the
+        // censored × residual-eta cross-terms are assembled). Only ODE M3 +
+        // `iiv_on_ruv` keeps FD (via `iiv_on_ruv_forces_fd`, which gates on
+        // `ode_spec.is_some()`).
         let mut ruv_m3 = test_helpers::analytical_model(GradientMethod::Auto);
         ruv_m3.residual_error_eta = Some(0);
         ruv_m3.bloq_method = crate::types::BloqMethod::M3;
-        assert!(!analytic_outer_gradient_available(&ruv_m3));
+        assert!(analytic_outer_gradient_available(&ruv_m3));
     }
 
     /// A TTE (`[event_model]`) objective has no analytic outer gradient (the

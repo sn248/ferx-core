@@ -613,14 +613,16 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if matches!(model.bloq_method, crate::types::BloqMethod::M3) {
         return false;
     }
-    // IIV on residual error (`iiv_on_ruv`): `η_ruv` enters through the variance
-    // (`v = R(f)·exp(2·η_ruv)`, `∂f/∂η_ruv = 0`), which the analytic IOV gradient assembly
-    // does not scale — it would differentiate an unscaled residual variance, an inner/outer
-    // mismatch (the inner already bails via `analytic_inner_common_bail`). Route to FD until
-    // the variance-scaling analytic gradient lands (#474). (#466 review round 2.)
-    if model.residual_error_eta.is_some() {
-        return false;
-    }
+    // IIV on residual error (`iiv_on_ruv`) IS analytic for closed-form IOV models:
+    // `η_ruv` enters only through the variance (`v = R(f)·exp(2·η_ruv)`, `∂f/∂η_ruv = 0`),
+    // and both halves now carry that scaling — the IOV inner gradient
+    // (`analytic_eta_nll_gradient_iov`) scales `v`/`dv_df` and adds the `η_ruv` variance
+    // column, and the IOV outer assembly threads `ruv = residual_error_eta` into
+    // `prepare_stacked` (the residual-eta `c̃` column rides the stacked `[η_bsv, κ]`
+    // layout). Mirrors the non-IOV `iiv_on_ruv` path (#474). Only IOV + M3-BLOQ still
+    // forces FD — the censored residual-eta second derivatives are not assembled (gated by
+    // the M3 check above, and by `iiv_on_ruv_forces_fd`). (ODE IOV + `iiv_on_ruv` stays FD
+    // via `ode_iov_supported`, which is unchanged.)
     // FREM + IOV: the analytic IOV inner gradient uses the ordinary residual variance for
     // every observation row, never the FREM covariate pseudo-obs variance the objective
     // (`individual_nll_iov`) uses for those rows; and the IOV objective returns a `1e18`

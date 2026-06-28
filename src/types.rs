@@ -2773,16 +2773,19 @@ impl CompiledModel {
     /// `exp(eta_k)` — i.e. `EPS·EXP(ETA)` — for additive, proportional, and
     /// combined alike.
     /// Whether `iiv_on_ruv` combines with a feature that forces the analytic
-    /// gradient off and FD on for this model: IOV (`n_kappa > 0`, whose inner
-    /// gradient does not carry the residual-variance scaling) or M3 BLOQ (whose
-    /// censored residual-eta second derivatives are not assembled). Single source
-    /// of truth shared by the outer gradient gate
+    /// gradient off and FD on for this model. Now only **M3 BLOQ** does — its
+    /// censored residual-eta second derivatives are not assembled. **IOV +
+    /// `iiv_on_ruv`** is analytic on the closed-form path: the IOV inner gradient
+    /// ([`analytic_eta_nll_gradient_iov`](crate::estimation::inner_optimizer)) carries the
+    /// residual-variance scaling and `η_ruv` column, and the outer assembly threads the
+    /// `η_ruv` column through the stacked `[η_bsv, κ]` layout (#474/#466). (ODE IOV +
+    /// `iiv_on_ruv` still routes to FD, but via `ode_iov_supported` — not this gate.)
+    /// Single source of truth shared by the outer gradient gate
     /// ([`analytic_outer_gradient_available`](crate::sens::provider::analytic_outer_gradient_available))
     /// and the inner η-gradient gates, so the two halves stay matched (#474).
     #[inline]
     pub fn iiv_on_ruv_forces_fd(&self) -> bool {
-        self.residual_error_eta.is_some()
-            && (self.n_kappa > 0 || matches!(self.bloq_method, BloqMethod::M3))
+        self.residual_error_eta.is_some() && matches!(self.bloq_method, BloqMethod::M3)
     }
 
     /// Whether a custom residual-error magnitude (#484) is active. The

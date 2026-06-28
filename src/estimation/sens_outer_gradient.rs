@@ -475,7 +475,12 @@ pub fn subject_theta_gradient_iov(
         n_stacked,
         omega_inv,
         stacked_eta_hat,
-        None,
+        // IIV on residual error (#474) for IOV: the residual-eta `c̃` column rides the
+        // stacked `[η_bsv, κ]` assembly (η_ruv ∈ the BSV block, so `rr < n_eta_bsv` is a
+        // valid stacked index; the residual-eta loops already span all stacked axes incl.
+        // κ). `None` for plain IOV models (`residual_var_scale` then defaults to 1.0).
+        // IOV + M3 stays gated out upstream, so censoring and `ruv` never co-occur here.
+        model.residual_error_eta,
     )?;
     Some(theta_block(&prep, &sens, params.theta.len()))
 }
@@ -4112,6 +4117,33 @@ mod tests {
   iov_column = OCC
 "#;
 
+    /// WARFARIN_IOV + IIV on residual error (`iiv_on_ruv = ETA_RUV`, the 4th omega →
+    /// eta index 3). FOCEI is required (non-interaction FOCE + `iiv_on_ruv` is rejected).
+    const WARFARIN_IOV_RUV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.05
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+
     /// Two-occasion IOV subject (no washout — carryover spans the boundary), with
     /// observations synthesised from the model at a reference (η, κ) so residuals
     /// are realistic.
@@ -4186,7 +4218,13 @@ mod tests {
         );
         let omega_inv = block.cholesky().unwrap().inverse();
         let sigma = &params.sigma.values;
+        // IIV on residual error (#4b): the inner Newton must minimise the SAME ruv-scaled
+        // objective `individual_nll_iov` uses, else the reconverged EBE (and the marginal
+        // FD built on it) would be wrong. `ruv_idx` is `None` and `residual_var_scale`
+        // returns `1.0` for non-`iiv_on_ruv` models, so this is a no-op there.
+        let ruv_idx = model.residual_error_eta;
         for _ in 0..50 {
+            let ruv_scale = model.residual_var_scale(&stacked);
             let sens = crate::sens::provider::subject_sensitivities_iov(
                 model,
                 subject,
@@ -4199,16 +4237,32 @@ mod tests {
             for (j, obs) in sens.obs.iter().enumerate() {
                 let cmt = subject.obs_cmts[j];
                 let f = obs.f;
-                let r = model.error_spec.variance_at(cmt, f, sigma);
-                let d = model.error_spec.dvar_df(cmt, f, sigma);
-                let d2 = model.error_spec.d2var_df2(cmt, sigma);
-                let t = err_terms(r, d, d2, subject.observations[j] - f);
+                let r = model.error_spec.variance_at(cmt, f, sigma) * ruv_scale;
+                let d = model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale;
+                let d2 = model.error_spec.d2var_df2(cmt, sigma) * ruv_scale;
+                let eps = subject.observations[j] - f;
+                let t = err_terms(r, d, d2, eps);
                 let a = &obs.df_deta;
                 for kk in 0..n_st {
                     g[kk] += 0.5 * t.alpha * a[kk];
                     for ll in 0..n_st {
                         h[(kk, ll)] += 0.5
                             * (t.alpha_p * a[kk] * a[ll] + t.alpha * obs.d2f_deta2[kk * n_st + ll]);
+                    }
+                }
+                // Residual-eta row/col (`a_{ruv} = 0`): data-term gradient `1 − ε²/v`, true
+                // Hessian `H[ruv,ruv] += 2ε²/v`, `H[ruv,l] += κ_j a_{jl}` — mirrors the
+                // `h_inner` residual-eta block in `prepare_stacked`.
+                if let Some(rr) = ruv_idx {
+                    g[rr] += 1.0 - eps * eps / r;
+                    h[(rr, rr)] += 2.0 * eps * eps / r;
+                    let kappa = ruv_kappa(eps, r, d);
+                    for ll in 0..n_st {
+                        if ll == rr {
+                            continue;
+                        }
+                        h[(rr, ll)] += kappa * a[ll];
+                        h[(ll, rr)] += kappa * a[ll];
                     }
                 }
             }
@@ -4307,6 +4361,93 @@ mod tests {
             let fd = (4.0 * f2 - f1) / 3.0; // Richardson
             eprintln!(
                 "iov theta[{m}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[m],
+                fd,
+                (analytic[m] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic[m], fd, max_relative = 3e-3, epsilon = 1e-5);
+        }
+    }
+
+    /// Two-occasion IOV + `iiv_on_ruv` subject (n_eta = 4 incl. ETA_RUV). η_ruv (the 4th
+    /// bsv eta) affects only the residual variance, not the predictions, so it is supplied
+    /// to `predict_iov` purely to keep the eta vector the right length.
+    fn iov_ruv_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
+        let obs_times = vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0];
+        let occasions = vec![1u32, 1, 1, 2, 2, 2];
+        let n = obs_times.len();
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions,
+            dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let preds = crate::pk::predict_iov(
+            model,
+            &subject,
+            theta,
+            &[0.12, -0.08, 0.2, 0.10],
+            &[vec![0.05], vec![-0.07]],
+        );
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        subject
+    }
+
+    /// Closed-form IOV + `iiv_on_ruv` (#4b): the analytic IOV θ-gradient (which now threads
+    /// `ruv = residual_error_eta` into `prepare_stacked`, so the residual-eta `c̃` column
+    /// rides the stacked `[η_bsv, κ]` assembly) must match the Richardson reconverged FD of
+    /// the FOCEI marginal — the marginal whose EBE `precise_ebe_iov` reconverges against the
+    /// same `exp(2·η_ruv)`-scaled objective. Proves the outer gate flip ships a correct
+    /// gradient.
+    #[test]
+    fn iov_iiv_on_ruv_theta_gradient_matches_reconverged_fd() {
+        let model = parse_model_string(WARFARIN_IOV_RUV).expect("parse warfarin IOV + iiv_on_ruv");
+        assert_eq!(model.residual_error_eta, Some(3));
+        assert!(crate::sens::provider::iov_analytical_supported(&model));
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_ruv_subject(&model, &theta);
+
+        // Joint EBE [η_bsv (4, incl. η_ruv), κ_g0 (1), κ_g1 (1)], analytically reconverged
+        // against the ruv-scaled inner objective.
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+
+        let analytic = subject_theta_gradient_iov(&model, &subject, &params, &stacked)
+            .expect("IOV + iiv_on_ruv θ-gradient supported");
+
+        let fd_at = |m: usize, h: f64| -> f64 {
+            let mut pp = params.clone();
+            pp.theta[m] += h;
+            let mut pm = params.clone();
+            pm.theta[m] -= h;
+            (marginal_nll_iov(&model, &subject, &pp) - marginal_nll_iov(&model, &subject, &pm))
+                / (2.0 * h)
+        };
+        for m in 0..theta.len() {
+            let h = 1e-4 * (1.0 + theta[m].abs());
+            let f1 = fd_at(m, h);
+            let f2 = fd_at(m, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "iov+ruv theta[{m}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
                 analytic[m],
                 fd,
                 (analytic[m] - fd).abs() / fd.abs().max(1e-12)

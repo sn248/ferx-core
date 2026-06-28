@@ -653,11 +653,15 @@ fn find_ebe_iov(
     // hits a common bail (escape hatch, `gradient = fd`, SDE, LTBS, or IIV on residual
     // error) or the subject carries survival/TTE records (whose hazard term the analytic
     // IOV gradient omits). An η-dependent `ExpressionScale` `obs_scale` is no longer a
-    // common bail (#486 made the non-IOV inner serve it analytically), but IOV still
-    // declines it: `iov_sens_supported` is `false` for any non-`None` scaling, so the
-    // `analytic_iov_inner` guard below already routes IOV + `ExpressionScale` to FD.
-    // Without these guards a joint IOV + `iiv_on_ruv` / IOV + TTE / `gradient = fd` fit
-    // would converge EBEs against an incomplete gradient.
+    // common bail (#486 made the non-IOV inner serve it analytically). For IOV it is
+    // now served analytically too (#575): `ode_iov_supported` admits a non-LTBS
+    // `ExpressionScale` divisor, so `iov_sens_supported` is `true` and the
+    // `analytic_iov_inner` path applies the per-occasion-group post-walk quotient
+    // (`apply_expression_scale_iov`). Constant `ScalarScale` and LTBS still route IOV
+    // to FD — LTBS via `analytic_inner_common_bail` (`log_transform`), `ScalarScale`
+    // via the `ode_iov_supported` allowlist (its in-walk transform isn't validated for
+    // the IOV path). Without these guards a joint IOV + `iiv_on_ruv` / IOV + TTE /
+    // `gradient = fd` fit would converge EBEs against an incomplete gradient.
     let analytic_iov_inner = crate::sens::provider::iov_sens_supported(model)
         && omega_iov_ref.is_some()
         && !analytic_inner_common_bail(model)
@@ -3024,10 +3028,10 @@ mod iov_tests {
     /// IOV + `iiv_on_ruv` fit would build the inner gradient on an unscaled residual
     /// variance, and `gradient = fd` would silently fail to disable the analytic inner.
     /// (`ExpressionScale` is no longer a common bail — the non-IOV analytical inner serves
-    /// it via the quotient rule; IOV keeps declining an η-dependent `obs_scale` through its
-    /// own gate — `ScalingSpec::None` required by `ode_iov_supported` here, and by
-    /// `iov_analytical_supported` for the closed-form path — pinned by the final
-    /// `iov_sens_supported` assertion below.)
+    /// it via the quotient rule. The **ODE** IOV path now serves an η-dependent `obs_scale`
+    /// too via the per-occasion-group post-walk quotient (#575); the **closed-form** IOV
+    /// path still declines it (`iov_analytical_supported` requires `ScalingSpec::None`) —
+    /// both pinned by the `iov_sens_supported` assertions below.)
     #[test]
     fn iov_inner_honours_common_bails() {
         use crate::parser::model_parser::parse_model_string;
@@ -3065,11 +3069,10 @@ mod iov_tests {
         model.residual_error_eta = None;
         assert!(crate::sens::provider::iov_sens_supported(&model));
 
-        // IOV + η-dependent `ExpressionScale` `obs_scale` must route to FD: neither IOV
-        // provider applies the `d(obs_scale)/d(stacked-η)` quotient term, so both gates
-        // require `ScalingSpec::None` (`iov_analytical_supported` / `ode_iov_supported`).
-        // Pin it here so a later loosening of either requirement can't silently run the
-        // analytic IOV inner gradient with the scale derivative dropped (#534 review #5).
+        // ODE IOV + η-dependent `ExpressionScale` `obs_scale` is now analytic (#575): the
+        // per-occasion-group post-walk quotient carries `d(obs_scale)/d(stacked-η)`, so
+        // `ode_iov_supported` (and hence `iov_sens_supported`) admits it. LTBS still
+        // declines — pinned in `sens::provider::tests::ode_iov_expr_scale_supported_and_gated`.
         let iov_scaled = parse_model_string(
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
         )
@@ -3082,8 +3085,8 @@ mod iov_tests {
             "obs_scale = 1000/V must parse as an η-dependent ExpressionScale"
         );
         assert!(
-            !crate::sens::provider::iov_sens_supported(&iov_scaled),
-            "IOV + η-dependent obs_scale must route to FD (neither IOV provider carries the scale derivative)"
+            crate::sens::provider::iov_sens_supported(&iov_scaled),
+            "ODE IOV + η-dependent obs_scale is analytic via the per-group quotient (#575)"
         );
 
         // Same for the CLOSED-FORM IOV path (`iov_analytical_supported`, provider.rs:638,

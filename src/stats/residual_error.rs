@@ -150,23 +150,54 @@ pub fn compute_r_matrix_with_correlations(
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> DMatrix<f64> {
-    // The bare-sigma `R` is exactly the custom-magnitude `R` with an all-ones
-    // multiplier: an empty `mult` makes every observation's loading multiplier
-    // default to 1.0. Delegate to the scaled builder so the diagonal-variance
-    // and cross-covariance formulas live in one place (#484 review #9) — a fix
-    // to the correlation math can no longer diverge the magnitude path from the
-    // bare path.
-    compute_r_matrix_with_correlations_scaled(
-        error_spec,
-        ipreds,
-        obs_cmts,
-        obs_times,
-        obs_raw_times,
-        occasions,
-        sigma_values,
-        correlations,
-        &[],
-    )
+    // NOTE: deliberately NOT delegated to `_scaled` with an empty multiplier.
+    // The diagonal here goes through `compute_r_diag` → `residual_variance`,
+    // which forms the proportional variance as `(f·σ)·(f·σ)`; `variance_at_scaled`
+    // (the `_scaled` diagonal) forms it as `((f·f)·σ)·σ`. The two are equal in
+    // exact arithmetic but differ by ~1 ULP under IEEE-754 reassociation on the
+    // f-dependent term (~55% of proportional/combined rows), so delegating would
+    // silently shift the bare-sigma R — and every OFV/CWRES built on it — off
+    // its current bit-for-bit value. Keep the legacy diagonal form here. (The
+    // magnitude path already uses the `_scaled` association by construction.)
+    let n = ipreds.len();
+    let mut r = DMatrix::<f64>::zeros(n, n);
+    let r_diag =
+        compute_r_diag_with_correlations(error_spec, ipreds, obs_cmts, sigma_values, correlations);
+    for (j, &v) in r_diag.iter().enumerate() {
+        r[(j, j)] = v;
+    }
+    if correlations.is_empty() {
+        return r;
+    }
+
+    let loadings: Vec<Vec<(usize, f64)>> = ipreds
+        .iter()
+        .zip(obs_cmts.iter())
+        .map(|(&f, &cmt)| error_spec.sigma_loadings(cmt, f, sigma_values.len()))
+        .collect();
+    for j in 0..n {
+        if loadings[j].is_empty() {
+            continue;
+        }
+        for k in (j + 1)..n {
+            if loadings[k].is_empty()
+                || !same_residual_block(obs_times, obs_raw_times, occasions, j, k)
+            {
+                continue;
+            }
+            let cov = cross_observation_covariance(
+                &loadings[j],
+                &loadings[k],
+                sigma_values,
+                correlations,
+            );
+            if cov != 0.0 {
+                r[(j, k)] = cov;
+                r[(k, j)] = cov;
+            }
+        }
+    }
+    r
 }
 
 /// Build the subject residual covariance matrix `R` with a per-observation
@@ -632,6 +663,34 @@ mod tests {
         let with =
             compute_iwres_with_correlations(&obs, &ipreds, &obs_cmts, &spec, &[1.0], &[], None);
         assert_eq!(plain, with);
+    }
+
+    #[test]
+    fn compute_r_matrix_diagonal_keeps_legacy_association() {
+        // Bit-reproducibility guard. The bare-sigma R diagonal must keep
+        // `residual_variance`'s `(f·σ)·(f·σ)` association, NOT the
+        // `((f·f)·σ)·σ` form `variance_at_scaled` uses. The two are equal in
+        // exact arithmetic but differ by ~1 ULP under IEEE-754 on ~55% of
+        // proportional/combined rows — so delegating `compute_r_matrix_with_correlations`
+        // to `_scaled` with an empty multiplier would silently shift every
+        // proportional/combined FOCE OFV and CWRES off its bit-for-bit value.
+        // `f = 32.451, σ = 0.159` is one such divergent pair.
+        let spec = ErrorSpec::Single(ErrorModel::Proportional);
+        let f = 32.451_f64;
+        let s = 0.159_f64;
+        let legacy = (f * s) * (f * s);
+        let reassociated = ((f * f) * s) * s;
+        assert_ne!(
+            legacy.to_bits(),
+            reassociated.to_bits(),
+            "fixture must be a pair where the two associations differ"
+        );
+        let r = compute_r_matrix_with_correlations(&spec, &[f], &[1], &[0.0], &[], &[], &[s], &[]);
+        assert_eq!(
+            r[(0, 0)].to_bits(),
+            legacy.to_bits(),
+            "R diagonal must use the legacy (f·σ)·(f·σ) association"
+        );
     }
 
     #[test]

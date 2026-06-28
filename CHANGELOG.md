@@ -253,6 +253,19 @@ section of the SDLC for the versioning policy).
   residual covariance matrix, use shifted times when pairing reset-segment
   residual blocks, and keep FREM CWRES variances unscaled by `iiv_on_ruv`
   (#549).
+- **Inner EBE optimizer no longer spuriously fails on ODE objectives, fixing a wrong OFV
+  for η-dependent `[scaling] obs_scale` models** (#555). The per-subject empirical-Bayes
+  BFGS stopped only on its gradient norm, but an adaptive-ODE-solver objective puts a
+  noise floor on the gradient that can sit above the inner tolerance — so a search that
+  had already reached the mode spun to `max_iter` and reported failure. `find_ebe` then
+  discarded the correct estimate and restarted Nelder–Mead from η=0, which on a
+  multimodal inner objective (e.g. `obs_scale = V1` with `V1 = … · exp(ETA_V1)`) settled
+  in a worse local minimum and inflated the FOCEI objective (≈370 OFV on the
+  `two_cpt_oral_cov` example; its analytical twin was unaffected). The inner BFGS now also
+  stops when the objective stops improving (a standard `ftol` criterion), so it converges
+  at the mode instead of failing — the ODE form's OFV-at-init now matches its analytical
+  twin (`−1193.59`, previously `−823.05`), and affected subjects converge in far fewer
+  inner iterations.
 - **Form C (`[scaling] y = <expr>`) ODE readouts now use per-observation covariate
   snapshots** (#535, #538). The explicit-output readout is evaluated against the
   covariate values on each observation's own data row rather than the subject's

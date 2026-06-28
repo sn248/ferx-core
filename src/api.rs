@@ -1056,6 +1056,29 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // Custom residual-error magnitude (#484) is wired through the FOCE/FOCEI
+    // objective (data term + Laplace curvature) only. SAEM's σ/θ M-step, the
+    // Gauss-Newton BHHH gradient, and the importance-sampling likelihood read
+    // the residual variance through paths that do not yet apply the
+    // per-observation magnitude, so reject them up front rather than silently
+    // fitting a mis-specified error model.
+    if model.has_custom_ruv_magnitude() {
+        for &m in &chain {
+            if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_RUV_MAGNITUDE_METHOD_UNSUPPORTED",
+                        "a custom residual-error magnitude (an [error_model] sigma written as an \
+                         expression of TIME / covariates / thetas) is currently supported for \
+                         method = foce and method = focei only. SAEM, GN, GN-hybrid, and \
+                         importance-sampling paths do not yet apply the per-observation magnitude.",
+                    )
+                    .with_block("error_model"),
+                );
+            }
+        }
+    }
+
     if !model.residual_correlations.is_empty() {
         for &m in &chain {
             if !matches!(m, EstimationMethod::Foce | EstimationMethod::Saem) {
@@ -4272,6 +4295,11 @@ fn compute_subject_results(
             let pred =
                 crate::pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta);
 
+            // Per-observation custom residual magnitude (#484): η-independent
+            // (θ/covariate/TIME only), so build it once and feed both the IWRES
+            // and CWRES diagnostics so they match the magnitude-aware OFV.
+            let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+
             // IWRES (NaN on censored rows — see compute_cwres for CWRES handling).
             let mut iwres = compute_iwres_with_correlations(
                 &subject.observations,
@@ -4280,6 +4308,7 @@ fn compute_subject_results(
                 &model.error_spec,
                 &params.sigma.values,
                 &model.residual_correlations,
+                ruv_mult.as_deref(),
             );
             // IIV on residual error (#409): the individual residual SD is scaled
             // by exp(η̂_ruv), so IWRES = (y−f)/(SD·exp(η̂_ruv)) = base / exp(η̂_ruv).
@@ -4315,6 +4344,7 @@ fn compute_subject_results(
                 &model.residual_correlations,
                 frem_r_override.as_deref(),
                 model.residual_error_eta,
+                ruv_mult.as_deref(),
             );
 
             // OFV contribution
@@ -5207,11 +5237,21 @@ fn emit_subject_rows<R: rand::Rng>(
     // drawn `eta_slice` includes η_ruv, so scale the residual variance by
     // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
     let ruv_scale = model.residual_var_scale(eta_slice);
+    // Per-observation custom residual magnitude (#484): η-independent, so build
+    // the [obs][sigma-slot] matrix once per subject and index it per row.
+    let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
     for (j, &ipred) in ipreds.iter().enumerate() {
         // FREM covariate pseudo-observations (FREMTYPE>0) use the additive
         // covariate sigma, not the PK error model applied to the θ+η override
         // that `compute_predictions_with_tv` now writes into FREM rows.
-        let var = model.sim_residual_variance(subject, j, ipred, &params.sigma.values, ruv_scale);
+        let var = model.sim_residual_variance(
+            subject,
+            j,
+            ipred,
+            &params.sigma.values,
+            ruv_scale,
+            ruv_mult.as_ref().map(|m| m[j].as_slice()),
+        );
         let eps: f64 = rng.sample(normal);
         let value = ipred + var.sqrt() * eps;
 
@@ -5970,6 +6010,7 @@ mod iov_integration {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -7698,6 +7739,7 @@ mod simulate_with_uncertainty_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -8512,6 +8554,7 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -8839,6 +8882,7 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -8997,6 +9041,7 @@ mod tests_derived_session_clock {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -9315,6 +9360,7 @@ mod tests_derived_iov_kappa {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,

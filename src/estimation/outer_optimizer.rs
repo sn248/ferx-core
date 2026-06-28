@@ -5004,6 +5004,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -5207,6 +5208,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
         check_gradient(&model, &make_population(3), 2);
     }
@@ -5624,6 +5626,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
             name: "iov_cov_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,

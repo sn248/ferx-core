@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Custom / time-varying residual-error magnitude** (#484). An `[error_model]`
+  sigma argument may now be an expression of `TIME`, covariates, and thetas
+  rather than a bare parameter — e.g.
+  `DV ~ combined(PROP_ERR * (if (TIME > 24) RUV_LATE else 1.0), ADD_ERR)` —
+  reproducing the NONMEM `$ERROR` idiom of a time- or covariate-dependent error
+  coefficient. The expression scales that sigma's loading per observation;
+  magnitudes may depend only on `TIME`/covariates/thetas (not η or the
+  prediction) and are supported for `method = foce`/`focei` (the analytic
+  gradient falls back to finite differences when active).
 - **`[fit_options] outer_xtol` / `outer_ftol`** (#469) — expose the derivative-free
   `bobyqa` outer optimizer's step (`xtol_rel`) and objective (`ftol_rel`) stop
   tolerances, previously hardcoded. Lets a fit tighten or loosen BOBYQA's
@@ -201,6 +210,19 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- **Custom residual-error magnitude (#484) now applies on every path, not just
+  the FOCE/FOCEI objective** (#576). The per-observation multiplier was wired
+  only into the OFV and silently dropped everywhere else, all without a guard:
+  `simulate()`/`--simulate` and NPDE drew residual error with a constant SD; the
+  sdtab IWRES/CWRES columns (and downstream VPC/goodness-of-fit) were mis-scaled
+  wherever the magnitude departed from 1; an ODE model under `focei` ran its
+  inner EBE loop with an analytic gradient that omitted the multiplier
+  (mismatched against the magnitude-aware objective → biased η̂ and estimates);
+  and a mixed PK+TTE model dropped the multiplier on its PK rows. All four paths
+  are now magnitude-aware. The parser also now rejects a magnitude expression
+  that references an **undeclared covariate** (including typos) even when the
+  model has no `[covariates]` block — previously such a name silently evaluated
+  to 0 and collapsed the multiplier to a constant.
 - **TTE frailty ω² on a nonlinear hazard parameter now converges onto the
   NONMEM/nlmixr2 consensus** (#469). The derivative-free `bobyqa` outer optimizer
   false-converged on the near-flat ω² ridge — its `ftol_rel` default (`1e-6`)

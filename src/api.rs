@@ -1057,6 +1057,29 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // Custom residual-error magnitude (#484) is wired through the FOCE/FOCEI
+    // objective (data term + Laplace curvature) only. SAEM's σ/θ M-step, the
+    // Gauss-Newton BHHH gradient, and the importance-sampling likelihood read
+    // the residual variance through paths that do not yet apply the
+    // per-observation magnitude, so reject them up front rather than silently
+    // fitting a mis-specified error model.
+    if model.has_custom_ruv_magnitude() {
+        for &m in &chain {
+            if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_RUV_MAGNITUDE_METHOD_UNSUPPORTED",
+                        "a custom residual-error magnitude (an [error_model] sigma written as an \
+                         expression of TIME / covariates / thetas) is currently supported for \
+                         method = foce and method = focei only. SAEM, GN, GN-hybrid, and \
+                         importance-sampling paths do not yet apply the per-observation magnitude.",
+                    )
+                    .with_block("error_model"),
+                );
+            }
+        }
+    }
+
     if !model.residual_correlations.is_empty() {
         for &m in &chain {
             if !matches!(m, EstimationMethod::Foce | EstimationMethod::Saem) {
@@ -5686,6 +5709,7 @@ mod iov_integration {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -7414,6 +7438,7 @@ mod simulate_with_uncertainty_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -8228,6 +8253,7 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -8555,6 +8581,7 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -8713,6 +8740,7 @@ mod tests_derived_session_clock {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -9031,6 +9059,7 @@ mod tests_derived_iov_kappa {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,

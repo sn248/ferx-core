@@ -191,6 +191,74 @@ pub fn compute_r_matrix_with_correlations(
     r
 }
 
+/// Build the subject residual covariance matrix `R` with a per-observation
+/// custom magnitude (#484). `mult` is the `[obs][sigma-slot]` multiplier matrix
+/// from [`crate::types::RuvMagnitude::eval_obs`]; each observation's sigma
+/// loadings are scaled by its row before forming the diagonal variance and any
+/// `block_sigma` cross-covariance. A `mult` whose rows are all ones reproduces
+/// [`compute_r_matrix_with_correlations`] exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_r_matrix_with_correlations_scaled(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    mult: &[Vec<f64>],
+) -> DMatrix<f64> {
+    let n = ipreds.len();
+    let mut r = DMatrix::<f64>::zeros(n, n);
+    let ones: Vec<f64> = Vec::new();
+    let row = |j: usize| -> &[f64] { mult.get(j).map(|v| v.as_slice()).unwrap_or(&ones) };
+    for j in 0..n {
+        let f = ipreds[j];
+        let cmt = obs_cmts.get(j).copied().unwrap_or(0);
+        r[(j, j)] = error_spec.variance_at_scaled(cmt, f, sigma_values, correlations, row(j));
+    }
+    if correlations.is_empty() {
+        return r;
+    }
+    // Scale each observation's loadings by its multiplier row before computing
+    // the cross-observation covariance.
+    let scale_loadings = |j: usize| -> Vec<(usize, f64)> {
+        let f = ipreds[j];
+        let cmt = obs_cmts.get(j).copied().unwrap_or(0);
+        let m = row(j);
+        error_spec
+            .sigma_loadings(cmt, f, sigma_values.len())
+            .into_iter()
+            .map(|(idx, coeff)| (idx, coeff * m.get(idx).copied().unwrap_or(1.0)))
+            .collect()
+    };
+    let loadings: Vec<Vec<(usize, f64)>> = (0..n).map(scale_loadings).collect();
+    for j in 0..n {
+        if loadings[j].is_empty() {
+            continue;
+        }
+        for k in (j + 1)..n {
+            if loadings[k].is_empty()
+                || !same_residual_block(obs_times, obs_raw_times, occasions, j, k)
+            {
+                continue;
+            }
+            let cov = cross_observation_covariance(
+                &loadings[j],
+                &loadings[k],
+                sigma_values,
+                correlations,
+            );
+            if cov != 0.0 {
+                r[(j, k)] = cov;
+                r[(k, j)] = cov;
+            }
+        }
+    }
+    r
+}
+
 /// Individual weighted residual: IWRES_j = (y_j - f_j) / sqrt(V_j)
 pub fn iwres(obs: f64, ipred: f64, error_model: ErrorModel, sigma_values: &[f64]) -> f64 {
     let v = residual_variance(error_model, ipred, sigma_values);

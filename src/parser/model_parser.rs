@@ -1503,11 +1503,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // names to indices into this flat vector and enforces the ODE-only
     // restriction.
     // Capture referenced sigma names before `parsed_error_model` is consumed.
-    let used_sigmas_in_error = used_sigma_names(&parsed_error_model);
+    let used_sigmas_in_error = used_sigma_names(&parsed_error_model, &sigma_names);
     validate_block_sigma_single_error_order(&parsed_error_model, &block_sigmas, &sigma_names)?;
+    // Capture the single-endpoint arguments before `parsed_error_model` is
+    // consumed, so the custom residual-magnitude programs (#484) can be built
+    // after the [covariates] block is parsed (covariate names are needed to
+    // validate the magnitude expressions).
+    let single_error_args: Option<(ErrorModel, Vec<String>)> = match &parsed_error_model {
+        ParsedErrorModel::Single(em, args) => Some((*em, args.clone())),
+        ParsedErrorModel::PerCmt(_) => None,
+    };
     let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
     let residual_correlations = build_residual_correlations(&block_sigmas, &sigma_names)?;
     validate_residual_correlations(&error_spec, &residual_correlations, &sigma_names)?;
+    // Keep a copy of the flat sigma names for the custom residual-magnitude
+    // build (#484), which runs after the [covariates] block is parsed.
+    let ruv_sigma_names = sigma_names.clone();
     let sigma = SigmaVector {
         values: sigma_values,
         names: sigma_names,
@@ -1782,6 +1793,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         residual_error_eta,
         // Populated below from the optional [initial_conditions] block (#521).
         analytical_init: Vec::new(),
+        // Populated below from the [error_model] magnitude expressions (#484).
+        ruv_magnitude: None,
     };
 
     // ── Optional blocks ──
@@ -2150,6 +2163,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     } else {
         None
     };
+
+    // ── Custom residual-error magnitude (#484) ──────────────────────────────
+    // Compile per-sigma magnitude multipliers now that covariate names are
+    // known (they validate the magnitude expressions). `None` for the common
+    // case of bare sigmas — the legacy variance path is then taken verbatim.
+    {
+        let ruv_theta_names = model.theta_names.clone();
+        let ruv_eta_names = model.eta_names.clone();
+        model.ruv_magnitude = build_ruv_magnitude(
+            &single_error_args,
+            &ruv_sigma_names,
+            &ruv_theta_names,
+            &ruv_eta_names,
+            &covariate_decls,
+        )?;
+    }
 
     // ── [event_model] / [event_model NAME] blocks ──────────────────────────────
     // Unnamed: `[event_model]` — one TTE endpoint.
@@ -7198,10 +7227,12 @@ fn validate_block_sigma_single_error_order(
     if block_sigmas.is_empty() {
         return Ok(());
     }
-    let ParsedErrorModel::Single(_, error_sigma_names) = parsed_error_model else {
+    let ParsedErrorModel::Single(_, error_sigma_args) = parsed_error_model else {
         return Ok(());
     };
-    for (idx, expected) in error_sigma_names.iter().enumerate() {
+    for (idx, arg) in error_sigma_args.iter().enumerate() {
+        let expected = arg_sigma_name(arg, sigma_names)?;
+        let expected = &expected;
         if sigma_names.get(idx) != Some(expected) {
             return Err(format!(
                 "block_sigma with a single-endpoint [error_model] requires the \
@@ -7398,6 +7429,34 @@ struct LtbsFlags {
     dv_pre_logged: bool,
 }
 
+/// Split an `[error_model]` argument list on commas that sit at paren depth 0,
+/// so a magnitude expression's own parenthesised commas stay within one
+/// argument. Each argument is trimmed; empty fragments are dropped.
+fn split_top_level_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                let part = s[start..i].trim();
+                if !part.is_empty() {
+                    out.push(part.to_string());
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        out.push(last.to_string());
+    }
+    out
+}
+
 fn parse_error_model(
     lines: &[String],
 ) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
@@ -7411,10 +7470,14 @@ fn parse_error_model(
     // Multi-endpoint (per-CMT dispatch, ODE models only):
     //   CMT=2: DV ~ proportional(PROP_ERR_PK)
     //   CMT=3: DV ~ additive(ADD_ERR_PD)
-    let re = Regex::new(r"(\w+)\s*~\s*(\w+)\(([^)]+)\)").unwrap();
+    // The argument list is captured greedily up to the final `)` so magnitude
+    // expressions with their own nested parens — `combined(PROP*(if (TIME>24)
+    // T else 1), ADD)` (#484) — survive intact; top-level commas are split out
+    // below with `split_top_level_args`.
+    let re = Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap();
     // LTBS LHS `log(DV) ~ TYPE(SIGMA)` — captures the logged data column,
     // the error type, and the sigma list.
-    let log_lhs_re = Regex::new(r"^\s*log\s*\(\s*(\w+)\s*\)\s*~\s*(\w+)\(([^)]+)\)").unwrap();
+    let log_lhs_re = Regex::new(r"^\s*log\s*\(\s*(\w+)\s*\)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap();
     let cmt_re = Regex::new(r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$").unwrap();
 
     // singles carry the per-line LTBS flags so the chosen single can stamp them.
@@ -7425,8 +7488,11 @@ fn parse_error_model(
     let mut iiv_on_ruv: Option<String> = None;
 
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        // Strip inline `# ...` comments so the anchored statement regex sees a
+        // clean `LHS ~ TYPE(args)` (a trailing comment would otherwise defeat
+        // the `$` anchor and the statement would be silently ignored).
+        let trimmed = line.split('#').next().unwrap_or("").trim();
+        if trimmed.is_empty() {
             continue;
         }
 
@@ -7460,7 +7526,9 @@ fn parse_error_model(
             }
         };
         let error_type = caps[2].to_lowercase();
-        let sigma_names: Vec<String> = caps[3].split(',').map(|s| s.trim().to_string()).collect();
+        // Split on top-level commas only, so a magnitude expression's own
+        // commas (e.g. inside a future `min(a, b)`) don't fragment an argument.
+        let sigma_names: Vec<String> = split_top_level_args(&caps[3]);
         // `log_additive` (case 1) is additive error whose prediction is logged
         // while DV is taken as-is (already log-transformed in the data).
         let type_is_log_additive = error_type == "log_additive";
@@ -7574,19 +7642,13 @@ fn build_error_spec(
     is_ode: bool,
 ) -> Result<(ErrorModel, ErrorSpec), String> {
     match parsed {
-        ParsedErrorModel::Single(model, names) => {
+        ParsedErrorModel::Single(model, args) => {
             // Single-endpoint sigmas are consumed positionally from the global
-            // sigma vector, but a referenced name that was never declared in
-            // [parameters] is a typo we should catch rather than silently bind
-            // to sigma[0]. (Mirrors the strict resolution on the PerCmt path.)
-            for nm in &names {
-                if !sigma_names.iter().any(|s| s == nm) {
-                    return Err(format!(
-                        "[error_model] references unknown sigma '{}' \
-                         (declare it in [parameters])",
-                        nm
-                    ));
-                }
+            // sigma vector. Each argument must scale exactly one declared sigma
+            // (a bare name or a magnitude expression, #484); `arg_sigma_name`
+            // both resolves that sigma and rejects an unknown/typo'd reference.
+            for arg in &args {
+                arg_sigma_name(arg, sigma_names)?;
             }
             Ok((model, ErrorSpec::Single(model)))
         }
@@ -7631,6 +7693,145 @@ fn build_error_spec(
                 ErrorSpec::PerCmt(map),
             ))
         }
+    }
+}
+
+/// Reserved built-in names a residual-magnitude expression (#484) may **not**
+/// reference in Phase 1. `IPRED`/`PRED`/`DV` would make the magnitude depend on
+/// the prediction beyond the built-in proportional loading; `TAD`/`TAFD` are
+/// not yet plumbed per-observation. `TIME` is the one allowed built-in.
+const RUV_FORBIDDEN_NAMES: &[&str] = &[
+    "IPRED", "PRED", "DV", "TAD", "TAFD", "IRES", "IWRES", "CWRES",
+];
+
+/// Validate a parsed residual-magnitude expression (#484). The magnitude may
+/// depend only on θ, the scaled sigma itself, `TIME`, and declared covariates —
+/// never on η/EBE or the prediction. `allowed_covs == None` means no
+/// `[covariates]` block was declared, so covariate references are read
+/// leniently (matching the rest of the parser).
+fn validate_ruv_expr(
+    expr: &Expression,
+    sigma_name: &str,
+    allowed_covs: Option<&[String]>,
+) -> Result<(), String> {
+    let mut err: Option<String> = None;
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if err.is_some() {
+            return;
+        }
+        match e {
+            Expression::Eta(_) => {
+                err = Some(
+                    "residual-magnitude expression may not depend on a random effect (eta)"
+                        .to_string(),
+                );
+            }
+            Expression::NnOutput { .. } => {
+                err = Some(
+                    "residual-magnitude expression may not reference a neural-network output"
+                        .to_string(),
+                );
+            }
+            Expression::Variable(name) => {
+                // The only individual-scope variable allowed is the sigma the
+                // expression scales; anything else (an individual parameter)
+                // would make the magnitude eta-dependent.
+                if !name.eq_ignore_ascii_case(sigma_name) && !name.eq_ignore_ascii_case("MACHEPS") {
+                    err = Some(format!(
+                        "residual-magnitude expression references `{}`, which is not \
+                         the scaled sigma `{}`, a covariate, or TIME",
+                        name, sigma_name
+                    ));
+                }
+            }
+            Expression::Covariate(name) => {
+                let upper = name.to_uppercase();
+                if RUV_FORBIDDEN_NAMES.contains(&upper.as_str()) {
+                    err = Some(format!(
+                        "residual-magnitude expression may not reference `{}` \
+                         (only TIME, covariates, thetas, and the sigma are allowed)",
+                        name
+                    ));
+                } else if !name.eq_ignore_ascii_case("TIME") {
+                    if let Some(covs) = allowed_covs {
+                        if !covs.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                            err = Some(format!(
+                                "residual-magnitude expression references undeclared covariate \
+                                 `{}` (declare it in [covariates])",
+                                name
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
+    match err {
+        Some(e) => Err(format!("[error_model] {}", e)),
+        None => Ok(()),
+    }
+}
+
+/// Build the custom residual-error magnitude (#484) from the single-endpoint
+/// `[error_model]` arguments, once covariate names are known. Returns `None`
+/// when every argument is a bare sigma (the legacy variance path is then taken
+/// verbatim). Each non-bare argument compiles to a per-observation multiplier
+/// closure over `(theta, observation covariates, TIME)`.
+fn build_ruv_magnitude(
+    single_error_args: &Option<(ErrorModel, Vec<String>)>,
+    sigma_names: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+) -> Result<Option<RuvMagnitude>, String> {
+    let Some((_em, args)) = single_error_args else {
+        return Ok(None);
+    };
+    let allowed_covs: Option<Vec<String>> = covariate_decls
+        .as_ref()
+        .map(|d| d.iter().map(|c| c.name.clone()).collect());
+    let mut per_sigma: Vec<Option<RuvMagFn>> = Vec::with_capacity(args.len());
+    let mut any = false;
+    for arg in args {
+        let sigma_name = arg_sigma_name(arg, sigma_names)?;
+        let trimmed = arg.trim();
+        if trimmed == sigma_name {
+            per_sigma.push(None);
+            continue;
+        }
+        any = true;
+        // The scaled sigma resolves to a `Variable` (bound to 1.0 at eval);
+        // unknown identifiers fall back to covariates (TIME / model covariates).
+        let defined = [sigma_name.clone()];
+        let ctx = ParseCtx {
+            theta_names,
+            eta_names,
+            defined_vars: &defined,
+            fallback_covariate: true,
+            nn_specs: &[],
+            ode_state_names: &[],
+        };
+        let expr = parse_scalar_expression(trimmed, ctx)
+            .map_err(|e| format!("[error_model] magnitude `{}`: {}", trimmed, e))?;
+        validate_ruv_expr(&expr, &sigma_name, allowed_covs.as_deref())?;
+        let sig = sigma_name.clone();
+        let f: RuvMagFn = Box::new(move |theta, obs_cov, time| {
+            let mut vars: HashMap<String, f64> = HashMap::new();
+            vars.insert(sig.clone(), 1.0);
+            // Provide TIME alongside the observation's covariate snapshot. The
+            // map is cloned per call only on the custom-magnitude path.
+            let mut cov = obs_cov.clone();
+            cov.insert("TIME".to_string(), time);
+            cov.insert("time".to_string(), time);
+            eval_expression(&expr, theta, &[], &cov, &vars, &[])
+        });
+        per_sigma.push(Some(f));
+    }
+    if any {
+        Ok(Some(RuvMagnitude { per_sigma }))
+    } else {
+        Ok(None)
     }
 }
 
@@ -8278,23 +8479,88 @@ fn collect_theta_eta_in_stmts(
 }
 
 /// Collect the sigma names referenced in a `ParsedErrorModel` (before index resolution).
-fn used_sigma_names(parsed: &ParsedErrorModel) -> std::collections::HashSet<String> {
+/// Collect the declared sigma names referenced anywhere in the `[error_model]`
+/// arguments. An argument may be a bare sigma name or a magnitude expression
+/// that scales one sigma (#484); either way we scan its identifiers and keep
+/// those that match a declared sigma. Best-effort and infallible — strict
+/// "exactly one sigma per argument" validation happens in `build_error_spec`.
+fn used_sigma_names(
+    parsed: &ParsedErrorModel,
+    sigma_names: &[String],
+) -> std::collections::HashSet<String> {
+    let sigma_set: std::collections::HashSet<&str> =
+        sigma_names.iter().map(|s| s.as_str()).collect();
+    let ident_re = Regex::new(r"[A-Za-z_]\w*").unwrap();
     let mut out = std::collections::HashSet::new();
+    let scan = |arg: &str, out: &mut std::collections::HashSet<String>| {
+        for m in ident_re.find_iter(arg) {
+            if sigma_set.contains(m.as_str()) {
+                out.insert(m.as_str().to_string());
+            }
+        }
+    };
     match parsed {
-        ParsedErrorModel::Single(_, names) => {
-            for n in names {
-                out.insert(n.clone());
+        ParsedErrorModel::Single(_, args) => {
+            for a in args {
+                scan(a, &mut out);
             }
         }
         ParsedErrorModel::PerCmt(entries) => {
-            for (_, _, names) in entries {
-                for n in names {
-                    out.insert(n.clone());
+            for (_, _, args) in entries {
+                for a in args {
+                    scan(a, &mut out);
                 }
             }
         }
     }
     out
+}
+
+/// Extract the single declared sigma that a `[error_model]` argument scales.
+///
+/// A bare argument `PROP_ERR` returns `PROP_ERR`; a magnitude expression such
+/// as `PROP_ERR * (if (TIME > 24) RUV else 1)` (#484) must reference exactly
+/// one declared sigma, which is returned. Zero or multiple referenced sigmas
+/// are errors — the sigma a magnitude scales must be unambiguous.
+fn arg_sigma_name(arg: &str, sigma_names: &[String]) -> Result<String, String> {
+    let sigma_set: std::collections::HashSet<&str> =
+        sigma_names.iter().map(|s| s.as_str()).collect();
+    let ident_re = Regex::new(r"[A-Za-z_]\w*").unwrap();
+    let mut found: Vec<String> = Vec::new();
+    for m in ident_re.find_iter(arg) {
+        let id = m.as_str();
+        if sigma_set.contains(id) && !found.iter().any(|f| f == id) {
+            found.push(id.to_string());
+        }
+    }
+    match found.len() {
+        1 => Ok(found.pop().unwrap()),
+        0 => {
+            // A bare identifier that isn't declared is a typo'd sigma name; keep
+            // the historical "unknown sigma" wording. A non-trivial expression
+            // that names no sigma is the #484-specific error.
+            let trimmed = arg.trim();
+            if Regex::new(r"^[A-Za-z_]\w*$").unwrap().is_match(trimmed) {
+                Err(format!(
+                    "[error_model] references unknown sigma '{}' \
+                     (declare it in [parameters])",
+                    trimmed
+                ))
+            } else {
+                Err(format!(
+                    "[error_model] argument `{}` references no declared sigma \
+                     (each magnitude expression must scale exactly one sigma parameter)",
+                    trimmed
+                ))
+            }
+        }
+        _ => Err(format!(
+            "[error_model] argument `{}` references multiple sigmas {:?}; \
+             a residual-magnitude expression may scale only one sigma",
+            arg.trim(),
+            found
+        )),
+    }
 }
 
 /// Warn about parameters declared in `[parameters]` that are not referenced in
@@ -15305,6 +15571,112 @@ mod tests {
         let c = parsed.model.residual_correlations[0];
         // cov 0.10 / (sqrt(0.04)·sqrt(1.0)) = 0.10 / 0.2 = 0.5.
         assert!((c.rho - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_ruv_magnitude_bare_sigmas_is_none() {
+        // A plain combined model carries no custom magnitude (legacy path).
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+  sigma ADD_ERR ~ 1.0
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+"#;
+        let model = parse_model_string(content).unwrap();
+        assert!(model.ruv_magnitude.is_none());
+        assert!(!model.has_custom_ruv_magnitude());
+    }
+
+    #[test]
+    fn test_ruv_magnitude_time_varying_prop_parses() {
+        // The proportional sigma magnitude inflates for TIME > 24 via a theta.
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_LATE(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+  sigma ADD_ERR ~ 1.0
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR * (if (TIME > 24.0) RUV_LATE else 1.0), ADD_ERR)
+"#;
+        let model = parse_model_string(content).unwrap();
+        let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+        assert!(rm.is_active());
+        assert_eq!(rm.per_sigma.len(), 2);
+        assert!(rm.per_sigma[0].is_some(), "prop slot has a multiplier");
+        assert!(rm.per_sigma[1].is_none(), "add slot is bare");
+
+        // theta = [.., RUV_LATE = 1.5]; index 2 is RUV_LATE.
+        let theta = vec![0.2, 10.0, 1.5];
+        let cov = std::collections::HashMap::new();
+        // Before 24 h the multiplier is 1; after, it is RUV_LATE.
+        let m_early = rm.eval_obs(&theta, &cov, 10.0);
+        let m_late = rm.eval_obs(&theta, &cov, 30.0);
+        assert!((m_early[0] - 1.0).abs() < 1e-12);
+        assert!((m_early[1] - 1.0).abs() < 1e-12);
+        assert!((m_late[0] - 1.5).abs() < 1e-12);
+        assert!((m_late[1] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_ruv_magnitude_rejects_eta_dependence() {
+        // A magnitude may not depend on a random effect (it must be η-independent).
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * exp(ETA_CL))
+"#;
+        let err = expect_parse_err(content);
+        assert!(err.contains("random effect"), "got: {err}");
+    }
+
+    #[test]
+    fn test_ruv_magnitude_rejects_undeclared_covariate() {
+        // With a [covariates] block, a magnitude covariate must be declared.
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_K(1.2)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_K * NOTACOV))
+[covariates]
+  WT continuous
+"#;
+        let err = expect_parse_err(content);
+        assert!(err.contains("undeclared covariate"), "got: {err}");
     }
 
     #[test]

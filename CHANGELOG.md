@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Custom / time-varying residual-error magnitude** (#484). An `[error_model]`
+  sigma argument may now be an expression of `TIME`, covariates, and thetas
+  rather than a bare parameter — e.g.
+  `DV ~ combined(PROP_ERR * (if (TIME > 24) RUV_LATE else 1.0), ADD_ERR)` —
+  reproducing the NONMEM `$ERROR` idiom of a time- or covariate-dependent error
+  coefficient. The expression scales that sigma's loading per observation;
+  magnitudes may depend only on `TIME`/covariates/thetas (not η or the
+  prediction) and are supported for `method = foce`/`focei` (the analytic
+  gradient falls back to finite differences when active).
 - Warn when no estimation method is set in the model file's `[fit_options]` or by
   the caller, making the implicit fallback to FOCEI visible instead of silent (#558).
 - Support NONMEM-style `block_sigma` residual covariance under SAEM for ordinary

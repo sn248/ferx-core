@@ -1030,6 +1030,9 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
         // inner kernels yet — route to FD. (An eta-dependent `ExpressionScale` is NOT a
         // bail here; see the doc above.)
         || !model.residual_correlations.is_empty()
+        // Custom residual-error magnitude (#484): the magnitude's θ-dependence is
+        // not in the analytic kernels yet — route to FD (which is magnitude-aware).
+        || model.has_custom_ruv_magnitude()
         // `iiv_on_ruv`: plain residual-η is now served analytically on both loops
         // (#474, the scaling lives in the shared gradient); only the cases that force
         // FD — IOV + `iiv_on_ruv` and M3-BLOQ + `iiv_on_ruv` — bail here, matching the
@@ -2617,6 +2620,7 @@ mod tests {
             }),
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
 
         // Subject: 2 PK obs + 1 FREM obs
@@ -2871,6 +2875,7 @@ mod iov_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -3589,6 +3594,7 @@ mod iov_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
         let subject = Subject {
             id: "1".into(),
@@ -3644,6 +3650,7 @@ mod iov_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
             name: "noniov_mu".into(),
             has_conditional_eta_params: false,
             pk_model: PkModel::OneCptIv,

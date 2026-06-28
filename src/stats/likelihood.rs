@@ -159,12 +159,24 @@ pub fn individual_nll_into_with_schedule(
     // Does not touch FREM covariate pseudo-observations (handled below before
     // this factor is applied) or the EKF process noise `p_obs`.
     let ruv_scale = model.residual_var_scale(eta);
+    // Per-observation custom residual magnitude (#484), evaluated once here (it
+    // is η-independent) and shared with the diagonal and dense paths so the EBE
+    // objective matches the outer OFV's variance.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
     let mut data_ll = 0.0;
     let has_censored_m3 =
         matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if !model.residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
-        match dense_residual_data_term(model, subject, &preds, sigma_values, ruv_scale, &p_obs) {
+        match dense_residual_data_term(
+            model,
+            subject,
+            &preds,
+            sigma_values,
+            ruv_scale,
+            &p_obs,
+            ruv_mult.as_deref(),
+        ) {
             Some(term) => data_ll += term,
             None => return 1e20,
         }
@@ -185,8 +197,12 @@ pub fn individual_nll_into_with_schedule(
                     }
                 }
             }
-            let v_resid =
-                model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values) * ruv_scale;
+            let v_resid = model.residual_variance_at_scaled(
+                subject.obs_cmts[j],
+                f_pred,
+                sigma_values,
+                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+            ) * ruv_scale;
             let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
@@ -262,17 +278,31 @@ fn dense_residual_data_term(
     sigma_values: &[f64],
     ruv_scale: f64,
     p_obs: &[f64],
+    ruv_mult: Option<&[Vec<f64>]>,
 ) -> Option<f64> {
-    let mut r = compute_r_matrix_with_correlations(
-        &model.error_spec,
-        preds,
-        &subject.obs_cmts,
-        &subject.obs_times,
-        &subject.obs_raw_times,
-        &subject.occasions,
-        sigma_values,
-        &model.residual_correlations,
-    );
+    let mut r = match ruv_mult {
+        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
+            &model.error_spec,
+            preds,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            &model.residual_correlations,
+            mult,
+        ),
+        None => compute_r_matrix_with_correlations(
+            &model.error_spec,
+            preds,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            &model.residual_correlations,
+        ),
+    };
     if ruv_scale != 1.0 {
         r *= ruv_scale;
     }
@@ -336,12 +366,21 @@ pub(crate) fn obs_nll_subject_from_preds(
     // IIV on residual error: scale the PK residual variance by exp(2·η_ruv).
     // FREM covariate rows keep their own (unscaled) EPSCOV variance.
     let ruv_scale = model.residual_var_scale(eta);
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
     let mut nll = 0.0;
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if !model.residual_correlations.is_empty() && !m3 && !has_frem_rows {
         // block_sigma + SDE is rejected up front (E_BLOCK_SIGMA_SDE_UNSUPPORTED)
         // for the SAEM M-step, so no EKF process noise enters here.
-        match dense_residual_data_term(model, subject, preds, sigma_values, ruv_scale, &[]) {
+        match dense_residual_data_term(
+            model,
+            subject,
+            preds,
+            sigma_values,
+            ruv_scale,
+            &[],
+            ruv_mult.as_deref(),
+        ) {
             Some(term) => nll += 0.5 * term,
             None => return 1e20,
         }
@@ -357,8 +396,12 @@ pub(crate) fn obs_nll_subject_from_preds(
             let f = if frem_var.is_some() { f } else { f.max(1e-12) };
             let v = match frem_var {
                 Some(vv) => vv.max(1e-12),
-                None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values)
-                    * ruv_scale)
+                None => (model.residual_variance_at_scaled(
+                    subject.obs_cmts[j],
+                    f,
+                    sigma_values,
+                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                ) * ruv_scale)
                     .max(1e-12),
             };
             let cens = subject.cens.get(j).copied().unwrap_or(0);
@@ -510,6 +553,10 @@ pub fn foce_subject_nll(
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
     let ipreds = model_predictions(model, subject, theta, eta_hat.as_slice());
 
+    // Per-observation custom residual magnitude (#484). η-independent, so one
+    // evaluation here feeds both the data term and the Laplace curvature term.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
+
     // For SDE models, inflate R with the EKF process-noise variance.
     let p_obs = if model.is_sde() {
         ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
@@ -615,6 +662,7 @@ pub fn foce_subject_nll(
             &p_obs,
             frem_r_override.as_deref(),
             model.residual_error_eta,
+            ruv_mult.as_deref(),
         )
     } else {
         // FOCE (no interaction): evaluate the residual variance R at the
@@ -644,6 +692,7 @@ pub fn foce_subject_nll(
             &p_obs,
             frem_r_override.as_deref(),
             pop_preds.as_deref(),
+            ruv_mult.as_deref(),
         )
     }
 }
@@ -719,6 +768,9 @@ pub fn foce_subject_nll_standard(
     // prediction f(η=0) — NONMEM's no-interaction semantics — which is always
     // ≥0, avoiding the f0 zero-crossing pathology on oral proportional models.
     r_pred_override: Option<&[f64]>,
+    // Per-observation custom residual magnitude (#484); `None` on the legacy
+    // path. Scales each observation's sigma loadings in R.
+    ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
     let n_obs = subject.observations.len();
 
@@ -735,16 +787,29 @@ pub fn foce_subject_nll_standard(
     // override must come last so it survives the r_pred_override re-evaluation
     // of R.
     let r_eval: &[f64] = r_pred_override.unwrap_or(&f0);
-    let mut r_matrix = compute_r_matrix_with_correlations(
-        error_spec,
-        r_eval,
-        &subject.obs_cmts,
-        &subject.obs_times,
-        &subject.obs_raw_times,
-        &subject.occasions,
-        sigma_values,
-        residual_correlations,
-    );
+    let mut r_matrix = match ruv_mult {
+        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
+            error_spec,
+            r_eval,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            residual_correlations,
+            mult,
+        ),
+        None => compute_r_matrix_with_correlations(
+            error_spec,
+            r_eval,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            residual_correlations,
+        ),
+    };
     for (j, v) in p_obs.iter().enumerate() {
         if j < r_matrix.nrows() {
             r_matrix[(j, j)] += *v;
@@ -872,6 +937,8 @@ pub fn foce_subject_nll_interaction(
     // IIV-on-RUV eta index, or `None`. The per-subject residual-variance scale
     // `exp(2·η̂_ruv)` and the extra `c̃` column are derived from `eta_hat`.
     residual_error_eta: Option<usize>,
+    // Per-observation custom residual magnitude (#484); `None` on legacy path.
+    ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
     let n_eta = eta_hat.len();
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
@@ -887,6 +954,7 @@ pub fn foce_subject_nll_interaction(
         frem_r_override,
         residual_error_eta,
         ruv_scale,
+        ruv_mult,
     ) else {
         return 1e20;
     };
@@ -946,6 +1014,7 @@ fn foce_subject_nll_interaction_with_tte(
         None, // TTE path does not support FREM R-override
         residual_error_eta,
         ruv_scale,
+        None, // custom residual magnitude (#484) unsupported on the TTE path
     ) else {
         return 1e20;
     };
@@ -1007,8 +1076,12 @@ fn gaussian_foce_accum(
     // multiplies R. `(None, 1.0)` reproduces the no-IIV-on-RUV behaviour.
     residual_error_eta: Option<usize>,
     ruv_scale: f64,
+    // Per-observation custom residual magnitude (#484); `None` on the legacy
+    // path. Scales the variance and its f-derivative per observation.
+    ruv_mult: Option<&[Vec<f64>]>,
 ) -> Option<GaussianFoceTerms> {
     let n_obs = subject.observations.len();
+    let mult_row = |j: usize| -> Option<&[f64]> { ruv_mult.map(|m| m[j].as_slice()) };
 
     // Partition observation indices into quantified vs censored (M3 only).
     let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
@@ -1033,7 +1106,13 @@ fn gaussian_foce_accum(
         let v_resid = if let Some(v) = frem_ov {
             v
         } else {
-            error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale
+            match mult_row(j) {
+                Some(m) => {
+                    error_spec.variance_at_scaled(subject.obs_cmts[j], f, sigma_values, &[], m)
+                        * ruv_scale
+                }
+                None => error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+            }
         };
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if !(v.is_finite() && v > 0.0) {
@@ -1048,7 +1127,12 @@ fn gaussian_foce_accum(
         // For the residual eta: ∂R/∂η_ruv = 2·R, so the column is the constant 2.
         let aj = h_matrix.row(j);
         let dvar_df = if is_pk_row {
-            error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values) * ruv_scale
+            match mult_row(j) {
+                Some(m) => {
+                    error_spec.dvar_df_scaled(subject.obs_cmts[j], f, sigma_values, m) * ruv_scale
+                }
+                None => error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+            }
         } else {
             0.0 // FREM rows: additive near-zero sigma, ∂R/∂f = 0
         };
@@ -1076,7 +1160,13 @@ fn gaussian_foce_accum(
     for &j in &bloq_idx {
         let limit = subject.observations[j];
         let f = ipreds[j];
-        let v = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale;
+        let v = match mult_row(j) {
+            Some(m) => {
+                error_spec.variance_at_scaled(subject.obs_cmts[j], f, sigma_values, &[], m)
+                    * ruv_scale
+            }
+            None => error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+        };
         if !(v.is_finite() && v > 0.0) {
             return None;
         }
@@ -1280,6 +1370,8 @@ pub fn foce_subject_nll_iov(
     if model.frem_config.is_some() && subject.fremtype.iter().any(|&ft| ft > 0) {
         return 1e18;
     }
+    // Per-observation custom residual magnitude (#484); η/κ-independent.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
     if interaction || m3_active {
         foce_subject_nll_interaction(
             subject,
@@ -1293,6 +1385,7 @@ pub fn foce_subject_nll_iov(
             &p_obs_iov,
             None, // IOV + FREM unsupported (guarded above)
             model.residual_error_eta,
+            ruv_mult.as_deref(),
         )
     } else {
         // FOCE (no interaction): evaluate R at the population prediction with
@@ -1328,6 +1421,7 @@ pub fn foce_subject_nll_iov(
             &p_obs_iov,
             None,
             pop_preds.as_deref(),
+            ruv_mult.as_deref(),
         )
     }
 }
@@ -1775,6 +1869,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -2111,6 +2206,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         let nll_override = foce_subject_nll_standard(
             &subject,
@@ -2125,6 +2221,7 @@ mod tests {
             &[],
             None,
             Some(&ipreds),
+            None,
         );
 
         assert!(nll_override.is_finite() && nll_f0.is_finite());
@@ -2170,6 +2267,7 @@ mod tests {
                 BloqMethod::Drop,
                 &[],
                 frem,
+                None,
                 None,
             )
         };
@@ -2252,6 +2350,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
 
         // Hand-compute the Laplace value with c̃ ≡ 0 (additive R).
@@ -2312,6 +2411,7 @@ mod tests {
             &[],
             None,    // no FREM override
             Some(0), // ETA_RUV is eta index 0
+            None,    // no custom magnitude
         );
 
         // Hand-computed marginal.
@@ -2346,6 +2446,7 @@ mod tests {
             &espec,
             BloqMethod::Drop,
             &[],
+            None,
             None,
             None,
         );
@@ -2533,6 +2634,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         let focei_additive = foce_subject_nll_interaction(
             &subj,
@@ -2544,6 +2646,7 @@ mod tests {
             &espec_additive,
             BloqMethod::Drop,
             &[],
+            None,
             None,
             None,
         );

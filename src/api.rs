@@ -4295,6 +4295,11 @@ fn compute_subject_results(
             let pred =
                 crate::pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta);
 
+            // Per-observation custom residual magnitude (#484): η-independent
+            // (θ/covariate/TIME only), so build it once and feed both the IWRES
+            // and CWRES diagnostics so they match the magnitude-aware OFV.
+            let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+
             // IWRES (NaN on censored rows — see compute_cwres for CWRES handling).
             let mut iwres = compute_iwres_with_correlations(
                 &subject.observations,
@@ -4303,6 +4308,7 @@ fn compute_subject_results(
                 &model.error_spec,
                 &params.sigma.values,
                 &model.residual_correlations,
+                ruv_mult.as_deref(),
             );
             // IIV on residual error (#409): the individual residual SD is scaled
             // by exp(η̂_ruv), so IWRES = (y−f)/(SD·exp(η̂_ruv)) = base / exp(η̂_ruv).
@@ -4338,6 +4344,7 @@ fn compute_subject_results(
                 &model.residual_correlations,
                 frem_r_override.as_deref(),
                 model.residual_error_eta,
+                ruv_mult.as_deref(),
             );
 
             // OFV contribution
@@ -5230,11 +5237,21 @@ fn emit_subject_rows<R: rand::Rng>(
     // drawn `eta_slice` includes η_ruv, so scale the residual variance by
     // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
     let ruv_scale = model.residual_var_scale(eta_slice);
+    // Per-observation custom residual magnitude (#484): η-independent, so build
+    // the [obs][sigma-slot] matrix once per subject and index it per row.
+    let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
     for (j, &ipred) in ipreds.iter().enumerate() {
         // FREM covariate pseudo-observations (FREMTYPE>0) use the additive
         // covariate sigma, not the PK error model applied to the θ+η override
         // that `compute_predictions_with_tv` now writes into FREM rows.
-        let var = model.sim_residual_variance(subject, j, ipred, &params.sigma.values, ruv_scale);
+        let var = model.sim_residual_variance(
+            subject,
+            j,
+            ipred,
+            &params.sigma.values,
+            ruv_scale,
+            ruv_mult.as_ref().map(|m| m[j].as_slice()),
+        );
         let eps: f64 = rng.sample(normal);
         let value = ipred + var.sqrt() * eps;
 

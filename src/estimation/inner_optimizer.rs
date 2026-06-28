@@ -1116,6 +1116,12 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
             || matches!(model.gradient_method, GradientMethod::Fd)
             || model.is_sde()
             || !model.residual_correlations.is_empty()
+            // Custom residual-error magnitude (#484): the magnitude's θ-dependence
+            // is not in the light Dual1 ODE kernel either, so the analytic inner
+            // gradient would omit the per-observation multiplier and mismatch the
+            // magnitude-aware objective — route to FD (which is magnitude-aware),
+            // matching the closed-form path's `analytic_inner_common_bail`.
+            || model.has_custom_ruv_magnitude()
             || model.iiv_on_ruv_forces_fd()
         {
             return false;
@@ -3355,6 +3361,64 @@ mod iov_tests {
                 epsilon = 1e-7
             );
         }
+    }
+
+    /// #484 review #1: an ODE model carrying a custom residual-error magnitude
+    /// must route the inner EBE gradient to FD (the magnitude-aware objective),
+    /// exactly like the closed-form path's `analytic_inner_common_bail`. Without
+    /// the ODE-branch bail the analytic Dual1 gradient would omit the
+    /// per-observation multiplier and converge to the wrong η̂. A control model
+    /// without the magnitude stays on the analytic inner gradient.
+    #[test]
+    fn ode_custom_magnitude_routes_inner_to_fd() {
+        use crate::parser::model_parser::parse_model_string;
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![5.0, 4.0, 3.0, 2.0, 1.0],
+            obs_cmts: vec![1; 5],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 5],
+            occasions: vec![1; 5],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+
+        // Control: plain proportional ODE → analytic inner gradient.
+        let mut plain = parse_model_string(
+            "[parameters]\n  theta TVCL(4.0,0.1,100.0)\n  theta TVV(30.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse plain ODE");
+        plain.gradient_method = GradientMethod::Auto;
+        assert!(!plain.has_custom_ruv_magnitude());
+        assert!(
+            analytic_inner_grad_supported(&plain, &subject),
+            "plain ODE model should take the analytic inner gradient"
+        );
+
+        // Same model with a TIME-varying residual magnitude → must bail to FD.
+        let mut mag = parse_model_string(
+            "[parameters]\n  theta TVCL(4.0,0.1,100.0)\n  theta TVV(30.0,1.0,500.0)\n  theta RUV_LATE(1.5,0.0,10.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR * (if (TIME > 4.0) RUV_LATE else 1.0))\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse ODE + custom magnitude");
+        mag.gradient_method = GradientMethod::Auto;
+        assert!(
+            mag.has_custom_ruv_magnitude(),
+            "fixture must carry a custom residual magnitude"
+        );
+        assert!(
+            !analytic_inner_grad_supported(&mag, &subject),
+            "ODE + custom magnitude must route the inner gradient to FD"
+        );
     }
 
     /// Parse a plain ODE + LTBS (`log_additive`) model with **no** `iiv_on_ruv`

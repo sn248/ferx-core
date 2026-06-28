@@ -205,6 +205,19 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- **Custom residual-error magnitude (#484) now applies on every path, not just
+  the FOCE/FOCEI objective** (#576). The per-observation multiplier was wired
+  only into the OFV and silently dropped everywhere else, all without a guard:
+  `simulate()`/`--simulate` and NPDE drew residual error with a constant SD; the
+  sdtab IWRES/CWRES columns (and downstream VPC/goodness-of-fit) were mis-scaled
+  wherever the magnitude departed from 1; an ODE model under `focei` ran its
+  inner EBE loop with an analytic gradient that omitted the multiplier
+  (mismatched against the magnitude-aware objective → biased η̂ and estimates);
+  and a mixed PK+TTE model dropped the multiplier on its PK rows. All four paths
+  are now magnitude-aware. The parser also now rejects a magnitude expression
+  that references an **undeclared covariate** (including typos) even when the
+  model has no `[covariates]` block — previously such a name silently evaluated
+  to 0 and collapsed the multiplier to a constant.
 - A diverged IMP/IMPMAP run is no longer reported as converged (#528). A
   collapsed-weight runaway pins θ to the parameter bounds and the final objective
   blows up to a finite-but-enormous value (~1e35); the convergence check only

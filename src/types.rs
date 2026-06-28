@@ -1518,35 +1518,12 @@ impl ErrorSpec {
         if correlations.is_empty() {
             return self.variance_at(cmt, f_pred, sigma);
         }
-        let loadings = self.sigma_loadings(cmt, f_pred, sigma.len());
-        if loadings.is_empty() {
-            return f64::NAN;
-        }
-        let mut v = 0.0;
-        for &(idx, coeff) in &loadings {
-            let Some(&s) = sigma.get(idx) else {
-                return f64::NAN;
-            };
-            v += coeff * coeff * s * s;
-        }
-        for corr in correlations {
-            let ci = loadings
-                .iter()
-                .find(|(idx, _)| *idx == corr.sigma_i)
-                .map(|(_, coeff)| *coeff);
-            let cj = loadings
-                .iter()
-                .find(|(idx, _)| *idx == corr.sigma_j)
-                .map(|(_, coeff)| *coeff);
-            let (Some(ci), Some(cj)) = (ci, cj) else {
-                continue;
-            };
-            let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
-                return f64::NAN;
-            };
-            v += 2.0 * ci * cj * corr.rho * si * sj;
-        }
-        v.max(1e-12)
+        // The correlated variance is exactly [`variance_at_scaled`] with an
+        // all-ones multiplier: an empty `mult` makes every loading's multiplier
+        // default to 1.0. Delegate so the loading + cross-covariance formula
+        // lives in one place (#484 review #9) and the magnitude path can never
+        // silently diverge from the bare-sigma path.
+        self.variance_at_scaled(cmt, f_pred, sigma, correlations, &[])
     }
 
     /// Residual variance with a per-observation custom magnitude (#484).
@@ -2844,6 +2821,12 @@ impl CompiledModel {
     ///   proportional error), which is wrong.
     /// * All other rows use the PK error model scaled by `ruv_scale` (pass
     ///   [`residual_var_scale`](Self::residual_var_scale)).
+    ///
+    /// `mult` is the per-sigma custom-magnitude multiplier row (#484) for this
+    /// observation, from [`ruv_obs_mult`](Self::ruv_obs_mult); `None` (or a row
+    /// of ones) reproduces the legacy unscaled variance. FREM covariate rows are
+    /// never magnitude-scaled — the multiplier acts on the PK residual only,
+    /// mirroring the likelihood and IWRES paths.
     #[inline]
     pub fn sim_residual_variance(
         &self,
@@ -2852,6 +2835,7 @@ impl CompiledModel {
         f_pred: f64,
         sigma: &[f64],
         ruv_scale: f64,
+        mult: Option<&[f64]>,
     ) -> f64 {
         if let Some(ref fc) = self.frem_config {
             if subject.fremtype.get(j).copied().unwrap_or(0) > 0 {
@@ -2859,7 +2843,7 @@ impl CompiledModel {
                 return (s * s).max(1e-12);
             }
         }
-        self.residual_variance_at(subject.obs_cmts[j], f_pred, sigma) * ruv_scale
+        self.residual_variance_at_scaled(subject.obs_cmts[j], f_pred, sigma, mult) * ruv_scale
     }
 
     /// Canonical compartment names for analytical models, used in `[derived]` expressions.
@@ -5149,17 +5133,64 @@ mod tests {
         let f = 2.0;
 
         // PK row: (f·σ_pk)² · ruv_scale.
-        let pk_var = model.sim_residual_variance(&subject, 0, f, &sigma, ruv);
+        let pk_var = model.sim_residual_variance(&subject, 0, f, &sigma, ruv, None);
         assert!((pk_var - (f * 0.3) * (f * 0.3) * ruv).abs() < 1e-12);
 
         // FREM row: covariate σ², independent of `f_pred` and `ruv_scale`.
-        let frem_var = model.sim_residual_variance(&subject, 1, 999.0, &sigma, ruv);
+        let frem_var = model.sim_residual_variance(&subject, 1, 999.0, &sigma, ruv, None);
         assert!((frem_var - 0.5 * 0.5).abs() < 1e-12);
 
         // Without a FREM config every row uses the PK error model.
         model.frem_config = None;
-        let pk_only = model.sim_residual_variance(&subject, 1, f, &sigma, 1.0);
+        let pk_only = model.sim_residual_variance(&subject, 1, f, &sigma, 1.0, None);
         assert!((pk_only - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sim_residual_variance_applies_custom_magnitude() {
+        // #484 review #3: simulate() must draw residual error with the custom
+        // magnitude, not a constant SD. A multiplier m on the proportional slot
+        // scales the variance by m²; an all-ones / None multiplier is the legacy
+        // variance exactly.
+        let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+        model.error_model = ErrorModel::Proportional;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        model.frem_config = None;
+
+        let subject = Subject {
+            id: "S".into(),
+            doses: vec![],
+            obs_times: vec![1.0],
+            obs_raw_times: vec![],
+            observations: vec![0.0],
+            obs_cmts: vec![1],
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: vec![],
+            obs_covariates: vec![],
+            pk_only_times: vec![],
+            pk_only_covariates: vec![],
+            reset_times: vec![],
+            cens: vec![0],
+            occasions: vec![],
+            dose_occasions: vec![],
+            fremtype: vec![0],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let sigma = vec![0.3];
+        let f = 2.0;
+
+        // Bare row: (f·σ)².
+        let bare = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, None);
+        assert!((bare - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
+
+        // Magnitude 2 on the proportional slot: (f·2·σ)² = 4·bare.
+        let scaled = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, Some(&[2.0]));
+        assert!((scaled - 4.0 * (f * 0.3) * (f * 0.3)).abs() < 1e-12);
+
+        // An all-ones multiplier reproduces the bare variance.
+        let unit = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, Some(&[1.0]));
+        assert!((unit - bare).abs() < 1e-12);
     }
 
     #[test]

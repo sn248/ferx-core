@@ -632,6 +632,7 @@ pub fn foce_subject_nll(
             // non-TTE branch below so M3 subjects always get the CᵀC correction.
             interaction || m3_active,
             model.residual_error_eta,
+            ruv_mult.as_deref(),
         );
     }
 
@@ -985,6 +986,7 @@ pub fn foce_subject_nll_interaction(
 ///   For pure-TTE subjects CᵀC is all-zero, so this only matters for mixed
 ///   PK+TTE models run under FOCE.
 #[cfg(feature = "survival")]
+#[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_interaction_with_tte(
     subject: &Subject,
     ipreds: &[f64],
@@ -999,6 +1001,10 @@ fn foce_subject_nll_interaction_with_tte(
     tte_hessian: DMatrix<f64>,         // FD Hessian of the raw TTE NLL w.r.t. η
     interaction: bool,                 // include the ½·CᵀC interaction term (FOCEI) or not (FOCE)
     residual_error_eta: Option<usize>, // IIV-on-RUV eta index (or None)
+    // Per-observation custom residual magnitude (#484); `None` on the legacy
+    // path. Scales the Gaussian (PK) rows' variance and f-derivative; the TTE
+    // rows carry no residual variance so the multiplier never touches them.
+    ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
     let n_eta = eta_hat.len();
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
@@ -1014,7 +1020,7 @@ fn foce_subject_nll_interaction_with_tte(
         None, // TTE path does not support FREM R-override
         residual_error_eta,
         ruv_scale,
-        None, // custom residual magnitude (#484) unsupported on the TTE path
+        ruv_mult, // custom residual magnitude (#484) — scales the Gaussian PK rows
     ) else {
         return 1e20;
     };
@@ -1500,6 +1506,7 @@ pub fn foce_population_nll(
 /// Compute CWRES (Conditional Weighted Residuals) for a subject.
 /// Censored observations get `NaN` since a weighted Gaussian residual is undefined
 /// when the observed value is censored.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_cwres(
     subject: &Subject,
     ipreds: &[f64],
@@ -1513,6 +1520,11 @@ pub fn compute_cwres(
     // IIV-on-RUV eta index (or None). Scales the residual diagonal `R` by
     // exp(2·η̂_ruv) so CWRES uses the subject's actual residual SD (#409).
     residual_error_eta: Option<usize>,
+    // Per-observation custom residual magnitude (#484) matrix, or `None` on the
+    // legacy path. Scales each row's residual variance so sdtab CWRES matches
+    // the magnitude-aware OFV (the multiplier is f-independent, so the matrix
+    // built at `ipred` applies unchanged at the SB-linearized `f0`).
+    ruv_mult: Option<&[Vec<f64>]>,
 ) -> Vec<f64> {
     let n_obs = subject.observations.len();
 
@@ -1525,16 +1537,29 @@ pub fn compute_cwres(
         .collect();
 
     // R_tilde
-    let mut r_matrix = compute_r_matrix_with_correlations(
-        error_spec,
-        &f0,
-        &subject.obs_cmts,
-        &subject.obs_times,
-        &subject.obs_raw_times,
-        &subject.occasions,
-        sigma_values,
-        residual_correlations,
-    );
+    let mut r_matrix = match ruv_mult {
+        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
+            error_spec,
+            &f0,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            residual_correlations,
+            mult,
+        ),
+        None => compute_r_matrix_with_correlations(
+            error_spec,
+            &f0,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            residual_correlations,
+        ),
+    };
     if let Some(overrides) = frem_r_override {
         apply_frem_r_matrix_overrides(&mut r_matrix, overrides);
     }
@@ -2496,12 +2521,63 @@ mod tests {
             &[],
             Some(&overrides),
             Some(0),
+            None,
         );
 
         let pk_expected = 1.0 / (sigma[0] * eta_hat[0].exp());
         let frem_expected = 1.0 / sigma[1];
         assert_relative_eq!(cwres[0], pk_expected, epsilon = 1e-12);
         assert_relative_eq!(cwres[1], frem_expected, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn compute_cwres_applies_custom_magnitude() {
+        // #484 review #4: sdtab CWRES must use the per-observation magnitude.
+        // With H = 0 the SB prediction f0 = ipred and R_tilde = R (diagonal), so
+        // for additive error CWRES_j = (y_j − f_j) / (m_j·σ).
+        let subject = Subject {
+            id: "1".to_string(),
+            doses: Vec::new(),
+            obs_times: vec![1.0, 2.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![12.0, 22.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: vec![0, 0],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let ipreds = vec![10.0, 20.0];
+        let eta_hat = DVector::from_vec(vec![0.0]);
+        let h = DMatrix::<f64>::zeros(2, 1);
+        let omega = OmegaMatrix::from_diagonal(&[0.1], vec!["ETA_CL".into()]);
+        let sigma = vec![2.0];
+        // Row 0 bare (m = 1), row 1 inflated (m = 3).
+        let mult = vec![vec![1.0], vec![3.0]];
+
+        let cwres = compute_cwres(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h,
+            &omega,
+            &sigma,
+            &ErrorSpec::Single(ErrorModel::Additive),
+            &[],
+            None,
+            None,
+            Some(&mult),
+        );
+        assert_relative_eq!(cwres[0], 2.0 / (1.0 * 2.0), epsilon = 1e-12);
+        assert_relative_eq!(cwres[1], 2.0 / (3.0 * 2.0), epsilon = 1e-12);
     }
 
     /// IIV on residual error (#409): `individual_nll` must multiply the residual

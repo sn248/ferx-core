@@ -7726,9 +7726,13 @@ const RUV_FORBIDDEN_NAMES: &[&str] = &[
 
 /// Validate a parsed residual-magnitude expression (#484). The magnitude may
 /// depend only on θ, the scaled sigma itself, `TIME`, and declared covariates —
-/// never on η/EBE or the prediction. `allowed_covs == None` means no
-/// `[covariates]` block was declared, so covariate references are read
-/// leniently (matching the rest of the parser).
+/// never on η/EBE or the prediction. Unlike the rest of the parser, covariate
+/// references here are **not** read leniently: an undeclared name silently
+/// evaluates to `0.0` (`covariates.get(name).unwrap_or(0.0)`), which would
+/// collapse the multiplier to a constant with no error — so any covariate the
+/// expression names (other than `TIME`) must appear in `allowed_covs`. A
+/// `allowed_covs == None` (no `[covariates]` block) therefore rejects every
+/// covariate reference, forcing the user to declare it.
 fn validate_ruv_expr(
     expr: &Expression,
     sigma_name: &str,
@@ -7773,14 +7777,20 @@ fn validate_ruv_expr(
                         name
                     ));
                 } else if !name.eq_ignore_ascii_case("TIME") {
-                    if let Some(covs) = allowed_covs {
-                        if !covs.iter().any(|c| c.eq_ignore_ascii_case(name)) {
-                            err = Some(format!(
-                                "residual-magnitude expression references undeclared covariate \
-                                 `{}` (declare it in [covariates])",
-                                name
-                            ));
-                        }
+                    // An undeclared covariate silently evaluates to 0.0 at every
+                    // observation, collapsing the magnitude to a constant — so
+                    // require declaration whether or not a [covariates] block
+                    // exists (`allowed_covs == None` ⇒ nothing is declared ⇒
+                    // reject). This also catches covariate-name typos.
+                    let declared = allowed_covs
+                        .is_some_and(|covs| covs.iter().any(|c| c.eq_ignore_ascii_case(name)));
+                    if !declared {
+                        err = Some(format!(
+                            "residual-magnitude expression references undeclared covariate \
+                             `{}` (declare it in [covariates]; an undeclared name silently \
+                             evaluates to 0 and would make the magnitude a constant)",
+                            name
+                        ));
                     }
                 }
             }
@@ -15808,6 +15818,30 @@ mod tests {
   DV ~ proportional(PROP_ERR * (1.0 + RUV_K * NOTACOV))
 [covariates]
   WT continuous
+"#;
+        let err = expect_parse_err(content);
+        assert!(err.contains("undeclared covariate"), "got: {err}");
+    }
+
+    #[test]
+    fn test_ruv_magnitude_rejects_covariate_without_covariates_block() {
+        // #484 review #5: with NO [covariates] block, a covariate reference in a
+        // magnitude expression must still be rejected — otherwise an undeclared
+        // name (or a typo) silently evaluates to 0 and collapses the multiplier
+        // to a constant, running a fit that does nothing of what was written.
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + 0.5 * WT))
 "#;
         let err = expect_parse_err(content);
         assert!(err.contains("undeclared covariate"), "got: {err}");

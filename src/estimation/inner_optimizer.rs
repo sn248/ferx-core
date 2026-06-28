@@ -498,20 +498,54 @@ pub fn find_ebe(
         }
     };
 
-    // If BFGS failed, fall back to Nelder-Mead. With `ebe_warm_start` (opt-in, off
-    // by default) seed the simplex from the BFGS partial η̂ — a weakly-identified η that BFGS
-    // ran far out sits on the steep prior slope, so NM slides to the mode in far
-    // fewer iterations than refining from η=0 in the flat basin. A non-finite
-    // partial is unusable, so cold-start from η=0 there. With the flag off, always
-    // cold-start from η=0 (bit-identical to the historical behaviour).
+    // If BFGS failed, fall back to Nelder-Mead — and keep the **lower-objective** of the
+    // BFGS partial and the NM result, never blindly overwriting with NM (#555). BFGS can
+    // report `false` while sitting on the true mode (its gradient norm floored above `tol`
+    // by ODE-solver noise, or a line search that exhausted its trials at the optimum), so
+    // discarding its partial and restarting NM from η=0 — which on a multimodal inner
+    // objective can settle in a worse basin — is exactly what blew up the FOCEI OFV.
+    // Selecting the argmin closes that whole class regardless of which `false` path fired.
+    //
+    // NM is restarted from η=0 (the historical seed); when `ebe_warm_start` is set it is
+    // *additionally* refined from the BFGS partial. The partial itself is also a candidate,
+    // so even if both NM runs do worse we never regress below where BFGS got.
     let bfgs_converged = result;
     let (nm_converged, used_fallback) = if !bfgs_converged {
-        let warm = ebe_warm_start_enabled() && eta.iter().all(|v| v.is_finite());
-        if !warm {
-            eta = vec![0.0; n_eta];
+        let partial = eta.clone();
+        let partial_finite = partial.iter().all(|v| v.is_finite());
+        // Best-so-far = the BFGS partial (if usable). A finite partial that BFGS reached
+        // and that survives the argmin counts as converged: the `false` was a stopping-
+        // criterion artifact (gradient-noise floor / line-search exhaustion at the mode),
+        // not divergence — so it should not trigger the non-converged EBE-refinement pass.
+        let (mut best_eta, mut best_f, mut best_ok) = if partial_finite {
+            (partial.clone(), obj(&partial), true)
+        } else {
+            (vec![0.0; n_eta], f64::INFINITY, false)
+        };
+        // Candidate 1: NM cold-restarted from η=0 (historical behaviour).
+        let mut eta_cold = vec![0.0; n_eta];
+        let cold_ok = nelder_mead_minimize(&obj, &mut eta_cold, n_eta, max_iter * 5, tol);
+        let f_cold = obj(&eta_cold);
+        if f_cold < best_f {
+            best_eta = eta_cold;
+            best_f = f_cold;
+            best_ok = cold_ok;
         }
-        let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
-        (nm_ok, true)
+        // Candidate 2 (opt-in): NM refined from the BFGS partial — a weakly-identified η
+        // that BFGS ran far out sits on the steep prior slope, where NM slides to the mode
+        // in far fewer iterations than refining from η=0 in the flat basin.
+        if partial_finite && ebe_warm_start_enabled() {
+            let mut eta_warm = partial;
+            let warm_ok = nelder_mead_minimize(&obj, &mut eta_warm, n_eta, max_iter * 5, tol);
+            let f_warm = obj(&eta_warm);
+            if f_warm < best_f {
+                best_eta = eta_warm;
+                best_ok = warm_ok;
+                // `best_f` not read past this final candidate.
+            }
+        }
+        eta = best_eta;
+        (best_ok, true)
     } else {
         (false, false)
     };
@@ -1561,18 +1595,12 @@ fn lbfgs_core(
     let mut rho_hist: Vec<f64> = Vec::new();
     let mut g = grad(x);
     let mut f_cur = obj(x);
-    // Objective-stall convergence (see [`INNER_FTOL_REL`]) — the same guard the dense
-    // BFGS carries, so a gradient-norm floored above `tol` by ODE-solver noise declares
-    // convergence at the mode rather than spinning to `max_iter` and reporting failure.
+    // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]): a
+    // gradient norm floored above `tol` by ODE-solver noise lets a search that reached the
+    // mode declare convergence rather than spinning to `max_iter`. Gated below on the
+    // gradient also being near-stationary.
     let mut stall = 0u32;
-    let objective_stalled = |f_old: f64, f_new: f64, stall: &mut u32| -> bool {
-        if (f_old - f_new) <= INNER_FTOL_REL * (1.0 + f_old.abs()) {
-            *stall += 1;
-        } else {
-            *stall = 0;
-        }
-        *stall >= INNER_STALL_LIMIT
-    };
+    let gnorm_gate = INNER_FTOL_GNORM_GATE * tol;
 
     for _iter in 0..max_iter {
         // Stopping metric. `stop_precond` is `Some` only for FREM, where the raw
@@ -1603,7 +1631,10 @@ fn lbfgs_core(
         if alpha == 0.0 {
             return false;
         }
-        let stalled = objective_stalled(f_cur, f_new, &mut stall);
+        // Stall only when the gradient is also near-stationary (`gnorm` already this
+        // iteration, on the same metric the `gnorm < tol` test uses) — see the gate
+        // rationale on [`INNER_FTOL_GNORM_GATE`].
+        let stalled = objective_stalled(f_cur, f_new, &mut stall) && gnorm <= gnorm_gate;
         f_cur = f_new;
 
         let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
@@ -1655,19 +1686,10 @@ fn dense_bfgs_core(
     // recompute `obj(x)` (one prediction walk per inner step on the hot path).
     let mut f_cur = obj(x);
     let mut first_step = true;
-    // Objective-stall convergence counter (see [`INNER_FTOL_REL`]). Incremented on an
-    // accepted step whose relative objective improvement is negligible; reset otherwise.
+    // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]),
+    // gated below on the gradient also being near-stationary.
     let mut stall = 0u32;
-    // True once `stall` reaches the limit: the objective has flattened, so we are at the
-    // mode even though `gnorm` may be floored above `tol` by ODE-solver noise (#555).
-    let objective_stalled = |f_old: f64, f_new: f64, stall: &mut u32| -> bool {
-        if (f_old - f_new) <= INNER_FTOL_REL * (1.0 + f_old.abs()) {
-            *stall += 1;
-        } else {
-            *stall = 0;
-        }
-        *stall >= INNER_STALL_LIMIT
-    };
+    let gnorm_gate = INNER_FTOL_GNORM_GATE * tol;
 
     for _iter in 0..max_iter {
         // `stop_precond` is `Some` only for FREM (issue #406); general fits stop
@@ -1710,7 +1732,7 @@ fn dense_bfgs_core(
             for i in 0..n {
                 x[i] += alpha * d[i];
             }
-            let stalled = objective_stalled(f_cur, f_new, &mut stall);
+            let stalled = objective_stalled(f_cur, f_new, &mut stall) && gnorm <= gnorm_gate;
             f_cur = f_new;
             if stalled {
                 return true;
@@ -1732,7 +1754,7 @@ fn dense_bfgs_core(
         for i in 0..n {
             x[i] += s[i];
         }
-        let stalled = objective_stalled(f_cur, f_new, &mut stall);
+        let stalled = objective_stalled(f_cur, f_new, &mut stall) && gnorm <= gnorm_gate;
         f_cur = f_new;
         if stalled {
             return true;
@@ -1886,21 +1908,48 @@ const MAX_LINE_SEARCH_TRIALS: usize = 30;
 /// Function-value stopping criterion for the inner BFGS, complementing the gradient
 /// norm test (`gnorm < tol`). When the objective is computed by the adaptive RK45 ODE
 /// solver, its step-pattern non-smoothness puts a noise floor on the gradient
-/// (empirically ~1e-6 at the mode for a 5-η `obs_scale = V1` model) that can sit *above*
+/// (empirically ~6e-7 at the mode for a 5-η `obs_scale = V1` model) that can sit *above*
 /// the inner `tol` (default `1e-7`). A BFGS that has already reached the posterior mode
 /// then sits on the answer with a dead-flat objective but never satisfies `gnorm < tol`,
-/// so it spins to `max_iter` and falsely reports failure — the caller then discards a
-/// correct η̂ and restarts Nelder–Mead from η=0, which on a multimodal inner objective
-/// can settle in a worse local minimum (the #555 OFV blow-up).
+/// so it spins to `max_iter` and reports failure.
 ///
 /// Declaring convergence once the *objective* has stopped improving for
-/// [`INNER_STALL_LIMIT`] consecutive accepted steps rescues exactly that case. It does
-/// not perturb a healthy search: the gradient-norm test is checked first each iteration
-/// and trips before the objective flattens whenever the noise floor is below `tol`.
+/// [`INNER_STALL_LIMIT`] consecutive accepted steps short-circuits that wasted spin. The
+/// stall return is **gated on the gradient also being near-stationary**
+/// ([`INNER_FTOL_GNORM_GATE`]·`tol`, evaluated on the same `stop_precond` metric the
+/// top-of-loop test uses): without that gate a run of heavily-backtracked tiny-`alpha`
+/// steps mid-descent could satisfy the flat-objective test while still far from the mode
+/// and hand the outer FOCE gradient a non-stationary η̂. The gate also keeps the FREM
+/// preconditioned stop (#406) authoritative — there the raw `f` flattens (covariate
+/// pseudo-obs etas seat early) long before the PK etas reach the joint mode, but the
+/// preconditioned `gnorm` does not, so the gate holds the stall off until both have.
+///
+/// This is a fast-path optimisation only: correctness on every `false`-on-a-converged
+/// search does **not** depend on it — `find_ebe` keeps the lower-objective of the BFGS
+/// partial and the Nelder–Mead restart, so a stall that never fires (e.g. at looser ODE
+/// tolerances where the objective noise floor exceeds the `ftol` threshold) still yields
+/// the correct EBE, just after the spin. See #555.
 const INNER_FTOL_REL: f64 = 1e-11;
 /// Consecutive negligible-improvement steps required before [`INNER_FTOL_REL`] declares
 /// convergence (a small count guards against a one-off flat step mid-descent).
 const INNER_STALL_LIMIT: u32 = 3;
+/// Multiple of the inner `tol` below which the (`stop_precond`-aware) gradient norm must
+/// already sit for the objective-stall stop to fire — see [`INNER_FTOL_REL`]. Generous
+/// enough to admit the ODE gradient-noise floor (a few × `tol`) yet far below the
+/// mid-descent gradient norms (≫10³·`tol`), so it cannot accept a non-stationary iterate.
+const INNER_FTOL_GNORM_GATE: f64 = 100.0;
+
+/// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`
+/// for [`INNER_STALL_LIMIT`] consecutive accepted steps. Shared verbatim by the dense and
+/// L-BFGS inner drivers so the two paths cannot drift apart on convergence (#555).
+fn objective_stalled(f_old: f64, f_new: f64, stall: &mut u32) -> bool {
+    if (f_old - f_new) <= INNER_FTOL_REL * (1.0 + f_old.abs()) {
+        *stall += 1;
+    } else {
+        *stall = 0;
+    }
+    *stall >= INNER_STALL_LIMIT
+}
 
 /// Backtracking line search with an Armijo sufficient-decrease test, choosing
 /// each successive trial step by **safeguarded quadratic interpolation** rather
@@ -3073,120 +3122,27 @@ mod iov_tests {
         }
     }
 
-    /// #555 localization, part 2: per-subject FOCEI marginal (incl. log|H̃|) for the
-    /// ODE `obs_scale = V1` form vs its analytical twin at the SAME fixed eta. This is
-    /// the assembled objective the outer OFV sums; a gap here that is absent from the
-    /// forward NLL (Layer 2) and the inner gradient (part 1) localizes to the FOCEI
-    /// Laplace `log|H̃|` term.
-    #[test]
-    fn repro555_ode_exprscale_marginal_vs_analytical() {
+    // ----- #555 shared fixtures (two_cpt_oral_cov, η+covariate `obs_scale = V1`) -----
+
+    /// Analytical + ODE twin of the ferx-r `two_cpt_oral_cov` model (5 η, `obs_scale = V1`
+    /// with `V1 = TVV1·(WT/70)^θ·exp(ETA_V1)` — both covariate- and η-dependent). The ODE
+    /// solver block is caller-supplied so a cheap fixed-η check can run tight and the inner
+    /// EBE check can run loose.
+    fn repro555_model_pair(ode_solver_block: &str) -> (CompiledModel, CompiledModel) {
         use crate::parser::model_parser::parse_model_string;
-        use crate::stats::likelihood::foce_subject_nll_interaction;
-
-        let header = "[parameters]\n  theta TVCL(5.0,0.1,100.0)\n  theta TVV1(50.0,1.0,500.0)\n  theta TVQ(10.0,0.1,100.0)\n  theta TVV2(100.0,1.0,500.0)\n  theta TVKA(1.2,0.01,10.0)\n  theta THETA_WT(0.75,0.01,5.0)\n  omega ETA_CL ~ 0.10\n  omega ETA_V1 ~ 0.10\n  omega ETA_Q ~ 0.05\n  omega ETA_V2 ~ 0.05\n  omega ETA_KA ~ 0.15\n  sigma PROP_ERR ~ 0.02 (sd)\n[individual_parameters]\n  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)\n  V1 = TVV1 * (WT/70)^THETA_WT * exp(ETA_V1)\n  Q = TVQ * exp(ETA_Q)\n  V2 = TVV2 * exp(ETA_V2)\n  KA = TVKA * exp(ETA_KA)\n";
-        let an_src = format!(
-            "{header}[structural_model]\n  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)\n[covariates]\n  WT continuous\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n"
-        );
-        let ode_src = format!(
-            "{header}[structural_model]\n  ode(obs_cmt=central, states=[depot, central, periph])\n[odes]\n  d/dt(depot) = -KA * depot\n  d/dt(central) = KA*depot - (CL/V1 + Q/V1)*central + (Q/V2)*periph\n  d/dt(periph) = (Q/V1)*central - (Q/V2)*periph\n[scaling]\n  obs_scale = V1\n[covariates]\n  WT continuous\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  ode_reltol = 1e-11\n  ode_abstol = 1e-13\n"
-        );
-        let an = parse_model_string(&an_src).expect("parse analytical");
-        let ode = parse_model_string(&ode_src).expect("parse ode");
-
-        let mut covariates = HashMap::new();
-        covariates.insert("WT".to_string(), 85.0);
-        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
-        let n = obs_times.len();
-        let subject = Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 250.0, 1, 0.0, false, 0.0)],
-            obs_times,
-            obs_raw_times: Vec::new(),
-            observations: vec![2.5, 3.5, 3.4, 2.3, 1.1, 0.8, 0.5],
-            obs_cmts: vec![2; n],
-            covariates,
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            cens: vec![0; n],
-            occasions: Vec::new(),
-            dose_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
-        };
-
-        let marginal = |m: &CompiledModel, eta: &[f64]| -> (f64, f64, f64) {
-            let p = &m.default_params;
-            let eta_v = nalgebra::DVector::from_column_slice(eta);
-            let ipreds = crate::pk::compute_predictions_with_tv(m, &subject, &p.theta, eta);
-            let jac = crate::sens::provider::subject_eta_jacobian(m, &subject, &p.theta, eta)
-                .expect("analytic jac");
-            let h = nalgebra::DMatrix::from_row_slice(subject.obs_times.len(), m.n_eta, &jac);
-            let marg = foce_subject_nll_interaction(
-                &subject,
-                &ipreds,
-                &eta_v,
-                &h,
-                &p.omega,
-                &p.sigma.values,
-                &m.error_spec,
-                m.bloq_method,
-                &[],
-                None,
-                m.residual_error_eta,
-                None, // no custom residual magnitude (#484) in this model
-            );
-            // also report log|H̃|-ish proxy: trace of a'a to see if jac magnitudes differ
-            let ata: f64 = (0..m.n_eta)
-                .map(|k| (0..h.nrows()).map(|j| h[(j, k)] * h[(j, k)]).sum::<f64>())
-                .sum();
-            (marg, ipreds.iter().sum::<f64>(), ata)
-        };
-
-        for eta in [vec![0.0; 5], vec![0.12, -0.08, 0.05, 0.04, -0.10]] {
-            let (ma, sa, aa) = marginal(&an, &eta);
-            let (mo, so, ao) = marginal(&ode, &eta);
-            // At a fixed eta the ODE `obs_scale = V1` form and its analytical twin must
-            // agree on the assembled FOCEI marginal (incl. log|H̃|) to integrator
-            // tolerance — the forward IPRED, the ∂f/∂η Jacobian, and the assembly are all
-            // path-independent here. (The #555 divergence lives in EBE *convergence*, not
-            // this fixed-eta objective — covered by `..._ebe_finds_global_min`.)
-            approx::assert_relative_eq!(ma, mo, max_relative = 1e-5, epsilon = 1e-4);
-            approx::assert_relative_eq!(sa, so, max_relative = 1e-5, epsilon = 1e-4);
-            approx::assert_relative_eq!(aa, ao, max_relative = 1e-5, epsilon = 1e-4);
-        }
-    }
-
-    /// #555 regression: on an ODE model with an η-dependent `[scaling] obs_scale = V1`,
-    /// the inner EBE must reach the correct posterior mode.
-    ///
-    /// Root cause: the inner BFGS *reaches* the mode but its gradient norm floors above
-    /// `tol` (the adaptive ODE solver's non-smoothness caps `gnorm` at ~6e-7 vs `tol`
-    /// 1e-7), so — lacking a function-value stopping criterion — it spun to `max_iter`
-    /// and reported failure. `find_ebe` then discarded that correct η̂ and restarted
-    /// Nelder–Mead from η=0, which on this multimodal inner objective settled ~20 NLL
-    /// units worse, inflating the FOCEI OFV by ~370 on the full dataset (the analytical
-    /// twin, whose smooth objective lets BFGS satisfy `gnorm < tol`, was the correct
-    /// reference). The fix adds an `ftol` (objective-stall) stop so BFGS declares
-    /// convergence at the mode. Subject 22 of the ferx-r `two_cpt_oral_cov` dataset
-    /// reproduces it deterministically; its rows are inlined so the test is
-    /// self-contained.
-    #[test]
-    fn repro555_ode_exprscale_ebe_finds_global_min() {
-        use crate::parser::model_parser::parse_model_string;
-        use crate::stats::likelihood::individual_nll;
-
         let header = "[parameters]\n  theta TVCL(5.0,0.1,100.0)\n  theta TVV1(50.0,1.0,500.0)\n  theta TVQ(10.0,0.1,100.0)\n  theta TVV2(100.0,1.0,500.0)\n  theta TVKA(1.2,0.01,10.0)\n  theta THETA_WT(0.75,0.01,5.0)\n  theta THETA_CRCL(0.50,0.01,5.0)\n  omega ETA_CL ~ 0.10\n  omega ETA_V1 ~ 0.10\n  omega ETA_Q ~ 0.05\n  omega ETA_V2 ~ 0.05\n  omega ETA_KA ~ 0.15\n  sigma PROP_ERR ~ 0.02 (sd)\n[individual_parameters]\n  CL = TVCL * (WT/70)^THETA_WT * (CRCL/100)^THETA_CRCL * exp(ETA_CL)\n  V1 = TVV1 * (WT/70)^THETA_WT * exp(ETA_V1)\n  Q = TVQ * exp(ETA_Q)\n  V2 = TVV2 * exp(ETA_V2)\n  KA = TVKA * exp(ETA_KA)\n";
         let an = parse_model_string(&format!(
             "{header}[structural_model]\n  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)\n[covariates]\n  WT continuous\n  CRCL continuous\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n"
-        )).expect("parse an");
+        )).expect("parse analytical");
         let ode = parse_model_string(&format!(
-            "{header}[structural_model]\n  ode(obs_cmt=central, states=[depot, central, periph])\n[odes]\n  d/dt(depot) = -KA * depot\n  d/dt(central) = KA*depot - (CL/V1 + Q/V1)*central + (Q/V2)*periph\n  d/dt(periph) = (Q/V1)*central - (Q/V2)*periph\n[scaling]\n  obs_scale = V1\n[covariates]\n  WT continuous\n  CRCL continuous\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n"
+            "{header}[structural_model]\n  ode(obs_cmt=central, states=[depot, central, periph])\n[odes]\n  d/dt(depot) = -KA * depot\n  d/dt(central) = KA*depot - (CL/V1 + Q/V1)*central + (Q/V2)*periph\n  d/dt(periph) = (Q/V1)*central - (Q/V2)*periph\n[scaling]\n  obs_scale = V1\n[covariates]\n  WT continuous\n  CRCL continuous\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n{ode_solver_block}"
         )).expect("parse ode");
+        (an, ode)
+    }
 
+    /// Subject 22 of the ferx-r `two_cpt_oral_cov` dataset — the subject that diverged in
+    /// #555 — inlined verbatim so the regression is self-contained (no external data file).
+    fn repro555_subject22() -> Subject {
         let mut covariates = HashMap::new();
         covariates.insert("WT".to_string(), 72.1);
         covariates.insert("CRCL".to_string(), 76.7);
@@ -3195,7 +3151,7 @@ mod iov_tests {
             2.0190, 2.4021, 2.2985, 1.8141, 1.4699, 1.2589, 1.0804, 0.8993, 0.7054, 0.5966,
         ];
         let n = obs_times.len();
-        let subject = Subject {
+        Subject {
             id: "22".into(),
             doses: vec![DoseEvent::new(0.0, 250.0, 1, 0.0, false, 0.0)],
             obs_times,
@@ -3214,29 +3170,104 @@ mod iov_tests {
             fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
+        }
+    }
+
+    /// #555 guard: at a *fixed* η the ODE `obs_scale = V1` form and its analytical twin
+    /// must agree on the assembled FOCEI marginal (incl. log|H̃|) to integrator tolerance —
+    /// the forward IPRED, the ∂f/∂η Jacobian, and the assembly are all path-independent
+    /// here. (The #555 divergence lives in EBE *convergence*, not this fixed-η objective —
+    /// see `repro555_ode_exprscale_ebe_finds_global_min`.) Tight ODE tol is cheap: no inner
+    /// optimisation runs, only a handful of `predict`/Jacobian evaluations.
+    #[test]
+    fn repro555_ode_exprscale_marginal_vs_analytical() {
+        use crate::stats::likelihood::foce_subject_nll_interaction;
+        let (an, ode) = repro555_model_pair("  ode_reltol = 1e-11\n  ode_abstol = 1e-13\n");
+        let subject = repro555_subject22();
+
+        let marginal = |m: &CompiledModel, eta: &[f64]| -> f64 {
+            let p = &m.default_params;
+            let eta_v = nalgebra::DVector::from_column_slice(eta);
+            let ipreds = crate::pk::compute_predictions_with_tv(m, &subject, &p.theta, eta);
+            let jac = crate::sens::provider::subject_eta_jacobian(m, &subject, &p.theta, eta)
+                .expect("analytic jac");
+            let h = nalgebra::DMatrix::from_row_slice(subject.obs_times.len(), m.n_eta, &jac);
+            foce_subject_nll_interaction(
+                &subject,
+                &ipreds,
+                &eta_v,
+                &h,
+                &p.omega,
+                &p.sigma.values,
+                &m.error_spec,
+                m.bloq_method,
+                &[],
+                None,
+                m.residual_error_eta,
+                None, // no custom residual magnitude (#484) in this model
+            )
         };
+
+        for eta in [vec![0.0; 5], vec![0.12, -0.08, 0.05, 0.04, -0.10]] {
+            let ma = marginal(&an, &eta);
+            let mo = marginal(&ode, &eta);
+            approx::assert_relative_eq!(ma, mo, max_relative = 1e-5, epsilon = 1e-4);
+        }
+    }
+
+    /// #555 regression: on an ODE model with an η-dependent `[scaling] obs_scale = V1`,
+    /// the inner EBE must reach the correct posterior mode.
+    ///
+    /// Root cause: the inner BFGS *reaches* the mode but its gradient norm floors above
+    /// `tol` (the adaptive ODE solver's non-smoothness caps `gnorm` above `tol`), so it
+    /// spun to `max_iter` and reported failure; `find_ebe` then discarded that correct η̂
+    /// and overwrote it with a cold Nelder–Mead restart from η=0, which on this multimodal
+    /// inner objective settled ~20 NLL units worse, inflating the FOCEI OFV by ~370 on the
+    /// full dataset (the analytical twin, whose smooth objective lets BFGS satisfy
+    /// `gnorm < tol`, was the correct reference). The fix is twofold: `find_ebe` now keeps
+    /// the lower-objective of the BFGS partial and the NM restart (so a `false`-on-a-
+    /// converged search can never regress the EBE), and the inner BFGS gained a gated
+    /// objective-stall (`ftol`) stop so it converges at the mode instead of spinning. This
+    /// test runs at a *moderate* ODE tolerance (not the 1e-10 of the original repro) to
+    /// stay Tier-1-fast and to exercise the realistic-tolerance path where the stall may
+    /// not fire and the argmin fallback is what guarantees correctness.
+    #[test]
+    fn repro555_ode_exprscale_ebe_finds_global_min() {
+        use crate::stats::likelihood::individual_nll;
+        let subject = repro555_subject22();
+
+        // Run at the DEFAULT ODE tolerances (`ode_reltol = 1e-4`, no override) — the
+        // realistic case a user actually hits, and the one where the gradient-noise floor
+        // is high enough that the BFGS objective-stall may never fire, so the argmin
+        // fallback is what guarantees the correct EBE. The analytical twin (whose smooth
+        // objective lets BFGS satisfy `gnorm < tol`) gives the reference global minimum.
+        let (an, ode) = repro555_model_pair("");
 
         let nll = |m: &CompiledModel, e: &[f64]| {
             let p = &m.default_params;
             individual_nll(m, &subject, &p.theta, e, &p.omega, &p.sigma.values)
         };
 
-        // The analytical twin's inner BFGS converges to the global minimum — the reference.
         let e_an = find_ebe(&an, &subject, &an.default_params, 300, 1e-7, None, None);
         let eta_an: Vec<f64> = e_an.eta.iter().copied().collect();
         let ref_nll = nll(&an, &eta_an);
 
-        // The ODE form must reach the same global minimum (objectives are identical).
+        // The ODE form must reach the same global minimum (objectives are identical), and
+        // must report it as a converged EBE (not a fallback that left it non-stationary).
         let e_od = find_ebe(&ode, &subject, &ode.default_params, 300, 1e-7, None, None);
         let eta_od: Vec<f64> = e_od.eta.iter().copied().collect();
         let ode_nll = nll(&ode, &eta_od);
 
-        // Pre-fix this stalled ~20 NLL units high; the global min is reached to integrator
-        // tolerance once the fallback keeps the better of {cold η=0, warm BFGS-partial}.
+        // Pre-fix the ODE EBE stalled ~20 NLL units high in a spurious basin; the global
+        // min is now reached (to integrator tolerance) at the default ODE tolerance too.
         assert!(
             ode_nll <= ref_nll + 0.5,
             "ODE EBE stuck in a spurious basin: inner NLL {ode_nll:.4} vs analytical global min {ref_nll:.4} \
              (eta_ode={eta_od:?}, eta_an={eta_an:?})"
+        );
+        assert!(
+            e_od.converged,
+            "ODE EBE should be reported converged at the mode"
         );
     }
 

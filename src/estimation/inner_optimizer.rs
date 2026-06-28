@@ -1033,11 +1033,12 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
         // Custom residual-error magnitude (#484): the magnitude's θ-dependence is
         // not in the analytic kernels yet — route to FD (which is magnitude-aware).
         || model.has_custom_ruv_magnitude()
-        // `iiv_on_ruv`: plain residual-η is now served analytically on both loops
-        // (#474, the scaling lives in the shared gradient); only the cases that force
-        // FD — IOV + `iiv_on_ruv` and M3-BLOQ + `iiv_on_ruv` — bail here, matching the
-        // outer gate via the shared `iiv_on_ruv_forces_fd` (was a blanket
-        // `residual_error_eta.is_some()` before #474 made plain `iiv_on_ruv` analytic).
+        // `iiv_on_ruv`: residual-η is served analytically on both loops for the
+        // closed-form path — plain (#474), IOV (#4b), and M3-BLOQ (#4c); the scaling
+        // and the censored/quantified `η_ruv` terms live in the shared gradient. Only
+        // **ODE** M3 + `iiv_on_ruv` still bails here (via `iiv_on_ruv_forces_fd`, which
+        // is now M3-AND-`ode_spec` only); ODE IOV + `iiv_on_ruv` bails separately via
+        // `ode_iov_supported`. Closed-form IOV/M3 + `iiv_on_ruv` no longer bail.
         || model.iiv_on_ruv_forces_fd()
 }
 
@@ -1178,6 +1179,16 @@ fn obs_gaussian_dterm_coef(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
     -eps / v + 0.5 * dv_df * (1.0 / v - eps * eps / (v * v))
 }
 
+/// Residual-eta (`iiv_on_ruv`) data-gradient term for a *quantified* observation:
+/// `∂(½ε²/v + ½ln v)/∂η_ruv = 1 − ε²/v` (the `∂v/∂η_ruv = 2v` factor cancels the ½),
+/// with `v` the `exp(2·η_ruv)`-scaled residual variance. Single source shared by the
+/// non-IOV and IOV inner gradients (and the reconverge test oracles) so they cannot
+/// drift (#474 review). The M3-censored row uses `h·z` instead — see the call sites.
+#[inline]
+pub(crate) fn ruv_data_dterm(eps: f64, v: f64) -> f64 {
+    1.0 - eps * eps / v
+}
+
 #[inline]
 fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
     let sqrt_v = v.sqrt();
@@ -1270,7 +1281,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
                 ruv_grad += h * z;
             } else {
                 let eps = y - f;
-                ruv_grad += 1.0 - eps * eps / v;
+                ruv_grad += ruv_data_dterm(eps, v);
             }
         }
     }
@@ -1320,19 +1331,26 @@ fn analytic_eta_nll_gradient_iov(
     // no `iiv_on_ruv` is declared, so a plain IOV model is unaffected. (IOV + M3 still
     // routes to FD via `iiv_on_ruv_forces_fd` / `iov_analytical_supported`, so no censored
     // residual-eta branch is needed here.)
+    // Only pay the `exp(2·η_ruv)` scaling + the `η_ruv` column when `iiv_on_ruv` is
+    // active; a plain IOV model runs the original op count (no per-obs ×1.0 multiplies
+    // and no residual-eta accumulation — #474 review).
     let ruv_idx = model.residual_error_eta;
-    let ruv_scale = model.residual_var_scale(stacked_true);
+    let ruv_scale = ruv_idx.map_or(1.0, |_| model.residual_var_scale(stacked_true));
     let mut grad = vec![0.0_f64; n_stacked];
     let mut ruv_grad = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
         let y = subject.observations[j];
         let cmt = subject.obs_cmts[j];
         let f = obs.f;
-        let v = model.residual_variance_at(cmt, f, sigma) * ruv_scale;
+        let mut v = model.residual_variance_at(cmt, f, sigma);
+        let mut dv_df = model.error_spec.dvar_df(cmt, f, sigma);
+        if ruv_idx.is_some() {
+            v *= ruv_scale;
+            dv_df *= ruv_scale;
+        }
         if !(v > 0.0) {
             return None;
         }
-        let dv_df = model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale;
         // NOTE: IOV currently has no M3 censored branch here (the IOV objective promotes
         // M3 to the marginal elsewhere); the uncensored Gaussian coefficient is shared
         // with the non-IOV inner via `obs_gaussian_dterm_coef` so they cannot drift.
@@ -1341,10 +1359,8 @@ fn analytic_eta_nll_gradient_iov(
             *g += coef * obs.df_deta[p];
         }
         if ruv_idx.is_some() {
-            // ∂/∂η_ruv of the per-obs data term: `1 − ε²/v` (the `∂v/∂η_ruv = 2v`
-            // factor cancels the ½), matching the non-IOV inner.
-            let eps = y - f;
-            ruv_grad += 1.0 - eps * eps / v;
+            // ∂/∂η_ruv of the per-obs data term `1 − ε²/v`, matching the non-IOV inner.
+            ruv_grad += ruv_data_dterm(y - f, v);
         }
     }
     if let Some(r) = ruv_idx {

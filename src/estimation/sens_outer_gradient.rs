@@ -899,7 +899,11 @@ pub fn subject_packed_gradient_iov(
         n_stacked,
         omega_inv,
         stacked_eta_hat,
-        None,
+        // IIV on residual error (#4b): thread the residual-eta index so the production
+        // packed gradient applies the `exp(2·η_ruv)` scaling and the `η_ruv` `c̃` column
+        // over the stacked layout. `None` for non-`iiv_on_ruv` IOV models. (Was `None` —
+        // the fix had only reached the test-only `subject_theta_gradient_iov`.)
+        model.residual_error_eta,
     )?;
 
     let n_theta = params.theta.len();
@@ -1483,7 +1487,10 @@ pub fn subject_eta_dx_iov(
         n_st,
         omega_inv,
         stacked_eta_hat,
-        None,
+        // Thread the residual-eta index for `iiv_on_ruv` IOV models (#4b). Defensive:
+        // the only consumer (`subject_packed_gradient_foce_iov`) is unreachable when
+        // `interaction` is set, and `iiv_on_ruv` requires FOCEI — but keep it correct.
+        model.residual_error_eta,
     )?;
     let n_theta = params.theta.len();
     let n_sigma = params.sigma.values.len();
@@ -4697,6 +4704,53 @@ mod tests {
                 (analytic[i] - fd).abs() / fd.abs().max(1e-9)
             );
             approx::assert_relative_eq!(analytic[i], fd, max_relative = 2e-3, epsilon = 2e-5);
+        }
+    }
+
+    /// IOV + `iiv_on_ruv` through the **production** packed-gradient path
+    /// (`subject_packed_gradient_iov`, not the `subject_theta_gradient_iov` helper):
+    /// the full `[θ, Ω_bsv, σ, Ω_iov]` analytic gradient must match Richardson
+    /// reconverged FD of the scaled FOCEI marginal. Regression for the review
+    /// finding that the residual-eta threading reached only the test helper, leaving
+    /// production on the unscaled variance with the `η_ruv` `c̃` column dropped.
+    #[test]
+    fn iov_iiv_on_ruv_packed_gradient_matches_reconverged_fd() {
+        let model = parse_model_string(WARFARIN_IOV_RUV).expect("parse warfarin IOV + iiv_on_ruv");
+        assert_eq!(model.residual_error_eta, Some(3));
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_ruv_subject(&model, &theta);
+        let template = params.clone();
+        let x = crate::estimation::parameterization::pack_params(&params);
+
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+        let analytic = subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+            .expect("IOV + iiv_on_ruv packed gradient supported");
+
+        let f = |xx: &[f64]| -> f64 {
+            let p = unpack_params(xx, &template);
+            marginal_nll_iov(&model, &subject, &p)
+        };
+        for i in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[i].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[i] += hh;
+                let mut xm = x.clone();
+                xm[i] -= hh;
+                (f(&xp) - f(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "iov+ruv packed x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[i],
+                fd,
+                (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+            );
+            approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
         }
     }
 

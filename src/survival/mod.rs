@@ -46,9 +46,42 @@ pub fn tte_data_term(
     eta: &[f64],
     covariates: &HashMap<String, f64>,
 ) -> f64 {
-    let HazardSpec::Analytic { family, param_fn } = hazard;
-    let params = param_fn(theta, eta, covariates);
+    match hazard {
+        HazardSpec::Analytic { family, param_fn } => {
+            let params = param_fn(theta, eta, covariates);
+            tte_nll_from_curves(
+                records,
+                |t| cum_hazard(*family, t, &params),
+                |t| hazard_and_cum_hazard(*family, t, &params).0,
+            )
+        }
+        // ODE-accumulated hazards are routed through `tte_endpoint_nll` → `tte_ode_nll`
+        // (which reads H(t)/h(t) from the integrated CHZ state); this closed-form entry
+        // point is analytic-only and returns the ill-defined sentinel if mis-called. Kept
+        // as an explicit, testable arm (not `unreachable!`/`debug_assert!`) so the dispatch
+        // contract is covered and behaves identically in debug and ci-test builds.
+        HazardSpec::OdeAccumulated { .. } => 1e20,
+    }
+}
 
+/// Per-record TTE negative log-likelihood from cumulative-hazard / hazard curves.
+///
+/// Shared by the analytic-family path ([`tte_data_term`]) and the ODE-accumulated
+/// path (joint PK-TTE); they differ only in *where* the curves come from.
+/// `cumhaz_at(t)` returns `H(t)`; `hazard_at(t)` returns the instantaneous hazard
+/// `h(t)`. Handles all three [`EventType`] variants and left truncation
+/// (entry_time > 0):
+///   RightCensored:    H(T) − H(entry)
+///   Exact:            H(T) − H(entry) − log h(T)
+///   IntervalCensored: −log [ exp(−(H(left)−H(entry))) − exp(−(H(right)−H(entry))) ]
+///
+/// Returns 1e20 as a sentinel when the likelihood is numerically ill-defined
+/// (e.g. negative interval probability, non-positive hazard for an exact event).
+pub fn tte_nll_from_curves(
+    records: &[ObsRecord],
+    cumhaz_at: impl Fn(f64) -> f64,
+    hazard_at: impl Fn(f64) -> f64,
+) -> f64 {
     let mut nll = 0.0_f64;
 
     for record in records {
@@ -60,26 +93,25 @@ pub fn tte_data_term(
         } = record;
 
         let h_entry = if *entry_time > 0.0 {
-            cum_hazard(*family, *entry_time, &params)
+            cumhaz_at(*entry_time)
         } else {
             0.0
         };
 
         match event_type {
             EventType::RightCensored => {
-                let h_t = cum_hazard(*family, *time, &params);
-                nll += h_t - h_entry;
+                nll += cumhaz_at(*time) - h_entry;
             }
             EventType::Exact => {
-                let (h_val, h_t) = hazard_and_cum_hazard(*family, *time, &params);
+                let h_val = hazard_at(*time);
                 if h_val <= 0.0 {
                     return 1e20;
                 }
-                nll += h_t - h_entry - h_val.ln();
+                nll += cumhaz_at(*time) - h_entry - h_val.ln();
             }
             EventType::IntervalCensored { left, right } => {
-                let h_l = cum_hazard(*family, *left, &params);
-                let h_r = cum_hazard(*family, *right, &params);
+                let h_l = cumhaz_at(*left);
+                let h_r = cumhaz_at(*right);
                 let a = h_l - h_entry; // H(left) − H(entry) ≥ 0
                 let delta = h_r - h_l; // H(right) − H(left) > 0 for a proper interval
                 if delta <= 0.0 {
@@ -298,8 +330,53 @@ pub(crate) fn tte_cause_params(
     let EndpointLikelihood::Tte { hazard } = endpoint else {
         return None;
     };
-    let HazardSpec::Analytic { family, param_fn } = hazard;
+    // Analytic families expose closed-form cause params; the ODE-accumulated hazard
+    // does not (its H/h come from the integrated CHZ state), so it has no analytic
+    // cause params here. Simulation of ODE-accumulated TTE is guarded at the api
+    // layer (Slice 2.2 root-finder); this simply reports "no analytic cause".
+    let HazardSpec::Analytic { family, param_fn } = hazard else {
+        return None;
+    };
     Some((*family, param_fn(theta, eta, covariates)))
+}
+
+/// Solve a subject's augmented ODE at `(theta, eta)` and read the cumulative hazard
+/// `H(t) = u[chz_state]` and instantaneous hazard `h(t) = u̇[chz_state]` at each `times`
+/// point (joint PK-TTE, #564). `times` must be the exact f64 values the caller will look
+/// up. Returns `(H, h)` aligned to `times`; an entry is NaN where the solve did not reach
+/// that time (or there is no ODE / the solve length disagrees). Shared by the TTE
+/// likelihood (`stats::likelihood::tte_ode_nll`) and `api::predict_survival` so the
+/// H/h-extraction contract lives in one place; one reusable derivative buffer serves all
+/// `h(t)` evaluations.
+#[cfg(feature = "survival")]
+pub(crate) fn ode_cumhaz_hazard(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    chz_state: usize,
+    theta: &[f64],
+    eta: &[f64],
+    times: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let n = times.len();
+    let (mut cum, mut haz) = (vec![f64::NAN; n], vec![f64::NAN; n]);
+    let Some(ode) = model.ode_spec.as_ref() else {
+        return (cum, haz);
+    };
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let states = crate::ode::ode_dense_solve_states(ode, &pk.values, theta, eta, subject, times);
+    if states.len() != n {
+        return (cum, haz);
+    }
+    // `h(t)` is the cumulative-hazard derivative: the bare hazard RHS at the integrated
+    // state (dose forcings touch PK compartments, not CHZ). One buffer, reused — only the
+    // `chz_state` slot is read, and the RHS always writes it.
+    let mut du = vec![0.0; ode.n_states];
+    for (i, &t) in times.iter().enumerate() {
+        cum[i] = states[i][chz_state];
+        (ode.rhs)(&states[i], &pk.values, t, &mut du);
+        haz[i] = du[chz_state];
+    }
+    (cum, haz)
 }
 
 /// Draw TTE event/censoring outcomes for a subject and append them to `results`.
@@ -345,6 +422,28 @@ pub fn simulate_tte<R: rand::Rng>(
     rng: &mut R,
     results: &mut Vec<crate::api::SimulationResult>,
 ) {
+    // ODE-accumulated (joint PK-TTE) hazards have no closed-form event-time inverse;
+    // drug-driven event-time sampling needs the Slice 2.2 ODE root-finder. The
+    // Result-returning `simulate_with_options` rejects this gracefully before reaching
+    // here; the bare `simulate()` / `simulate_with_seed()` (which return a Vec and cannot
+    // otherwise signal an error) hit this backstop rather than silently emitting no rows.
+    for record in &subject.obs_records {
+        let ObsRecord::Event { cmt, .. } = record;
+        if matches!(
+            model.endpoints.get(cmt),
+            Some(EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { .. }
+            })
+        ) {
+            panic!(
+                "simulate() does not yet support ODE-accumulated TTE hazards (joint PK-TTE, \
+                 CMT={cmt}); drug-driven event-time sampling lands in Slice 2.2 (#564). Call \
+                 simulate_with_options(...) for a graceful error, or use an analytic \
+                 [event_model] family."
+            );
+        }
+    }
+
     // Gather this subject's TTE causes — records routed to a `Tte` endpoint —
     // with each cause's drawn-parameter vector, entry time and window. (A subject
     // may also carry non-TTE records; those are skipped here.)
@@ -567,6 +666,56 @@ mod tests {
             sigma_idx: vec![],
         });
         assert!(tte_cause_params(&gaussian, &theta, &eta, &cov).is_none());
+
+        // An ODE-accumulated hazard has no closed-form cause params either (its H/h come
+        // from the integrated CHZ state), so it also takes the `None` branch.
+        let ode = EndpointLikelihood::Tte {
+            hazard: HazardSpec::OdeAccumulated { chz_state: 2 },
+        };
+        assert!(tte_cause_params(&ode, &theta, &eta, &cov).is_none());
+    }
+
+    #[test]
+    fn tte_data_term_ode_accumulated_is_analytic_only_sentinel() {
+        // `tte_data_term` is the closed-form (Analytic) entry point. ODE-accumulated
+        // hazards are dispatched elsewhere (tte_endpoint_nll → tte_ode_nll), so calling
+        // this with an OdeAccumulated hazard returns the ill-defined sentinel rather than
+        // a real likelihood — documenting (and covering) the dispatch contract.
+        let records = vec![ObsRecord::Event {
+            time: 10.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let hazard = HazardSpec::OdeAccumulated { chz_state: 2 };
+        let cov = HashMap::new();
+        let nll = tte_data_term(&records, &hazard, &[0.1], &[0.0], &cov);
+        assert_eq!(nll, 1e20);
+    }
+
+    #[test]
+    fn tte_nll_from_curves_degenerate_interval_returns_sentinel() {
+        use crate::types::HazardFamily;
+        // An interval with right ≤ left gives a non-positive Δ = H(right) − H(left); the
+        // shared per-record path returns the 1e20 sentinel (covers the degenerate guard).
+        let records = vec![ObsRecord::Event {
+            time: 0.0,
+            event_type: EventType::IntervalCensored {
+                left: 10.0,
+                right: 5.0,
+            },
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let param_fn: crate::types::HazardParamFn =
+            Box::new(|theta: &[f64], _eta: &[f64], _cov: &HashMap<String, f64>| vec![theta[0]]);
+        let hazard = HazardSpec::Analytic {
+            family: HazardFamily::Exponential,
+            param_fn,
+        };
+        let cov = HashMap::new();
+        let nll = tte_data_term(&records, &hazard, &[0.1], &[0.0], &cov);
+        assert_eq!(nll, 1e20);
     }
 
     #[test]

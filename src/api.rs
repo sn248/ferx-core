@@ -4976,10 +4976,20 @@ fn extract_standard_errors(
         })
         .collect();
 
-    // Theta: SE on original scale via delta method
-    // If x = log(theta), then SE(theta) = theta * SE(x)
+    // Theta: SE on original scale. Log-packed thetas (lower bound >= 0) are
+    // optimized as x = log(theta), so SE(theta) = theta * SE(x) (delta method).
+    // Identity-packed thetas (negative lower bound — e.g. covariate exponents,
+    // exposure–hazard slopes) are optimized on the natural scale already, so
+    // SE(theta) = SE(x): multiplying by the estimate would mis-scale it (and
+    // flip the sign for a negative estimate). See `theta_packs_log`.
     let se_theta: Vec<f64> = (0..n_theta)
-        .map(|i| template.theta[i] * se_packed[i])
+        .map(|i| {
+            if theta_packs_log(template.theta_lower[i]) {
+                template.theta[i] * se_packed[i]
+            } else {
+                se_packed[i]
+            }
+        })
         .collect();
 
     // Omega: SE via multivariate delta method on Cholesky parameterization.
@@ -5169,6 +5179,27 @@ pub fn simulate_with_options(
     opts: &SimulateOptions,
 ) -> Result<Vec<SimulationResult>, String> {
     use rand::SeedableRng;
+
+    // ODE-accumulated (joint PK-TTE) hazards can't be event-time-sampled yet: there is
+    // no closed-form inverse-CDF, and the drug-driven ODE event-location root-finder is
+    // Slice 2.2 (#564). Reject up front so a joint PK-TTE model gets a clear error here
+    // instead of silently producing no TTE rows (`tte_cause_params` returns None for it).
+    #[cfg(feature = "survival")]
+    if model.endpoints.values().any(|e| {
+        matches!(
+            e,
+            crate::types::EndpointLikelihood::Tte {
+                hazard: crate::types::HazardSpec::OdeAccumulated { .. }
+            }
+        )
+    }) {
+        return Err(
+            "simulate does not yet support ODE-accumulated TTE hazards (joint PK-TTE); \
+             drug-driven event-time sampling lands in Slice 2.2 (#564). Use an analytic \
+             [event_model] family to simulate, or simulate the PK separately."
+                .to_string(),
+        );
+    }
 
     // Validate the TTE horizon on the library path too — the `.ferx` parser
     // already rejects a non-finite / non-positive horizon, but a direct caller of
@@ -5931,6 +5962,29 @@ pub struct SurvivalPredictionResult {
     pub mean_survival: f64,
 }
 
+/// Linear-interpolated median survival time from a cumulative-hazard grid: the time
+/// where `H(t) = ln 2` (i.e. `S(t) = 0.5`). Used for ODE-accumulated hazards, whose
+/// median has no closed form. Returns NaN if the grid never reaches `ln 2`.
+#[cfg(feature = "survival")]
+fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64 {
+    let ln2 = std::f64::consts::LN_2;
+    // H(0) = 0 for a cumulative hazard, so if it has already reached ln2 by the first
+    // grid point the median lies in (0, grid[0]] — interpolate from the origin.
+    if let (Some(&t0), Some(&h0)) = (time_grid.first(), cum_haz.first()) {
+        if h0.is_finite() && h0 >= ln2 && t0 > 0.0 {
+            return t0 * ln2 / h0;
+        }
+    }
+    for i in 1..time_grid.len() {
+        let (h0, h1) = (cum_haz[i - 1], cum_haz[i]);
+        if h0.is_finite() && h1.is_finite() && h0 < ln2 && h1 >= ln2 && h1 > h0 {
+            let frac = (ln2 - h0) / (h1 - h0);
+            return time_grid[i - 1] + frac * (time_grid[i] - time_grid[i - 1]);
+        }
+    }
+    f64::NAN
+}
+
 /// Compute survival function predictions for TTE endpoints.
 ///
 /// For each subject and each TTE CMT in `model.endpoints`, evaluates the
@@ -5965,51 +6019,73 @@ pub fn predict_survival(
     let mut results = Vec::new();
 
     for subject in &population.subjects {
-        // Gather this subject's TTE causes at the typical values (η = 0). The
-        // all-cause survival and CIF need *every* cause's cumulative hazard at
-        // each grid point, so collect the per-cause parameters up front.
-        let mut causes: Vec<(usize, crate::types::HazardFamily, Vec<f64>, f64, f64)> = Vec::new();
+        // Per-cause hazard h(t) and cumulative hazard H(t) over the grid, plus the
+        // distributional summaries, at the typical values (η = 0). Analytic families
+        // use the closed forms; an ODE-accumulated (joint PK-TTE) hazard reads H(t)
+        // from the integrated CHZ state and h(t) from its derivative. The all-cause
+        // survival and CIF need every cause's H(t), so collect all causes up front.
+        #[allow(clippy::type_complexity)]
+        let mut rows: Vec<(usize, Vec<f64>, Vec<f64>, f64, f64)> = Vec::new();
         for (&cmt, endpoint) in &model.endpoints {
-            let Some((family, params_vec)) =
-                tte_cause_params(endpoint, &params.theta, &zero_eta, &subject.covariates)
-            else {
+            let crate::types::EndpointLikelihood::Tte { hazard } = endpoint else {
                 continue;
             };
-            // Distributional summaries are parameter-dependent, not time-dependent.
-            let t_median = median_survival(family, &params_vec);
-            let t_mean = mean_survival(family, &params_vec);
-            causes.push((cmt, family, params_vec, t_median, t_mean));
+            match hazard {
+                crate::types::HazardSpec::Analytic { .. } => {
+                    let Some((family, params_vec)) =
+                        tte_cause_params(endpoint, &params.theta, &zero_eta, &subject.covariates)
+                    else {
+                        continue;
+                    };
+                    let mut h_row = Vec::with_capacity(time_grid.len());
+                    let mut cum_row = Vec::with_capacity(time_grid.len());
+                    for &t in time_grid {
+                        let (h_val, cum_h) = hazard_and_cum_hazard(family, t, &params_vec);
+                        h_row.push(h_val);
+                        cum_row.push(cum_h);
+                    }
+                    let t_median = median_survival(family, &params_vec);
+                    let t_mean = mean_survival(family, &params_vec);
+                    rows.push((cmt, h_row, cum_row, t_median, t_mean));
+                }
+                crate::types::HazardSpec::OdeAccumulated { chz_state } => {
+                    if model.ode_spec.is_none() {
+                        continue;
+                    }
+                    // Read H(t)/h(t) from the augmented ODE solve — shared with the TTE
+                    // likelihood via `crate::survival::ode_cumhaz_hazard`.
+                    let (cum_row, h_row) = crate::survival::ode_cumhaz_hazard(
+                        model,
+                        subject,
+                        *chz_state,
+                        &params.theta,
+                        &zero_eta,
+                        time_grid,
+                    );
+                    // Median where S(t) = 0.5 ⇔ H(t) = ln2, linearly interpolated on the
+                    // grid (NaN if the grid never reaches it). Mean needs ∫₀^∞ S and is
+                    // left NaN for ODE hazards (a numerical-to-∞ summary is a follow-up).
+                    let t_median = grid_median_from_cumhaz(time_grid, &cum_row);
+                    rows.push((cmt, h_row, cum_row, t_median, f64::NAN));
+                }
+            }
         }
-        if causes.is_empty() {
+        if rows.is_empty() {
             continue;
         }
 
-        // Per-cause hazard and cumulative hazard over the grid.
-        let mut hz = Vec::with_capacity(causes.len());
-        let mut chz = Vec::with_capacity(causes.len());
-        for (_, family, params_vec, _, _) in &causes {
-            let mut h_row = Vec::with_capacity(time_grid.len());
-            let mut cum_row = Vec::with_capacity(time_grid.len());
-            for &t in time_grid {
-                let (h_val, cum_h) = hazard_and_cum_hazard(*family, t, params_vec);
-                h_row.push(h_val);
-                cum_row.push(cum_h);
-            }
-            hz.push(h_row);
-            chz.push(cum_row);
-        }
-
+        let chz: Vec<Vec<f64>> = rows.iter().map(|r| r.2.clone()).collect();
         let (cif, s_all) = cif_curves(&chz);
 
-        for (k, (cmt, _, _, t_median, t_mean)) in causes.iter().enumerate() {
+        for (k, (cmt, h_row, cum_row, t_median, t_mean)) in rows.iter().enumerate() {
             for (i, &t) in time_grid.iter().enumerate() {
                 results.push(SurvivalPredictionResult {
                     id: subject.id.clone(),
                     cmt: *cmt,
                     time: t,
-                    survival: (-chz[k][i]).exp(),
-                    cum_hazard: chz[k][i],
-                    hazard: hz[k][i],
+                    survival: (-cum_row[i]).exp(),
+                    cum_hazard: cum_row[i],
+                    hazard: h_row[i],
                     cif: cif[k][i],
                     survival_all: s_all[i],
                     median_survival: *t_median,
@@ -6020,6 +6096,35 @@ pub fn predict_survival(
     }
 
     results
+}
+
+#[cfg(all(test, feature = "survival"))]
+mod survival_predict_tests {
+    use super::grid_median_from_cumhaz;
+
+    #[test]
+    fn grid_median_interpolates_and_handles_no_crossing() {
+        let ln2 = std::f64::consts::LN_2;
+        let grid = [0.0, 1.0, 2.0, 3.0];
+        // H crosses ln2 between t=1 and t=2; linear interp puts the median at t=1.5
+        // (frac = (ln2 − 0.5·ln2)/(1.5·ln2 − 0.5·ln2) = 0.5).
+        let cum = [0.0, ln2 * 0.5, ln2 * 1.5, ln2 * 3.0];
+        let m = grid_median_from_cumhaz(&grid, &cum);
+        assert!(
+            (m - 1.5).abs() < 1e-9,
+            "median should interpolate to 1.5; got {m}"
+        );
+        // H never reaches ln2 on the grid → NaN.
+        let never = grid_median_from_cumhaz(&grid, &[0.0, 0.1, 0.2, 0.3]);
+        assert!(never.is_nan(), "no crossing → NaN; got {never}");
+        // Median at/before the first grid point (H(grid[0]) ≥ ln2): interpolated from the
+        // origin (0,0). grid[0]=2, H=2·ln2 ⇒ median = 2·ln2 / (2·ln2) = 1.0.
+        let early = grid_median_from_cumhaz(&[2.0, 4.0], &[ln2 * 2.0, ln2 * 4.0]);
+        assert!(
+            (early - 1.0).abs() < 1e-9,
+            "median before the first grid point interpolates from the origin; got {early}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7269,6 +7374,57 @@ mod extract_se_tests {
         let se = se_omega.unwrap();
         assert!((se[0] - 2.0 * 0.04).abs() < 1e-12);
         assert!((se[1] - 2.0 * 0.09).abs() < 1e-12);
+    }
+
+    /// Theta SE back-transform must respect the packing scale. A log-packed theta
+    /// (lower bound >= 0) is optimized as log(theta), so SE(theta) = theta * SE(x);
+    /// an identity-packed theta (negative lower bound, e.g. an exposure–hazard slope
+    /// or covariate exponent) is optimized on the natural scale, so SE(theta) = SE(x)
+    /// with no multiply. Regression for the bug where every theta was multiplied by
+    /// its estimate, mis-scaling (and sign-flipping for negative estimates) the SE
+    /// of identity-packed thetas.
+    #[test]
+    fn test_se_theta_respects_packing_scale() {
+        // theta[0] = TVCL, lower 0.1 >= 0  → log-packed
+        // theta[1] = BETA, lower -10 < 0   → identity-packed (can be negative)
+        let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["E1".into()]);
+        let template = ModelParameters {
+            theta: vec![2.0, 0.25],
+            theta_names: vec!["TVCL".into(), "BETA".into()],
+            theta_lower: vec![0.1, -10.0],
+            theta_upper: vec![50.0, 10.0],
+            theta_fixed: vec![false, false],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+        };
+        // Packed layout: theta(2) + omega(1) + sigma(1) = 4.
+        // Set diagonal so packed SEs are theta:0.1, theta:0.3 (the rest unused here).
+        let mut cov = DMatrix::<f64>::zeros(4, 4);
+        cov[(0, 0)] = 0.1_f64.powi(2); // se_packed[0] = 0.1
+        cov[(1, 1)] = 0.3_f64.powi(2); // se_packed[1] = 0.3
+        cov[(2, 2)] = 1.0;
+        cov[(3, 3)] = 1.0;
+        let (se_theta, _, _, _) = extract_standard_errors(&Some(cov), &template);
+        let se = se_theta.unwrap();
+        // log-packed: SE = theta * SE(x) = 2.0 * 0.1 = 0.2
+        assert!(
+            (se[0] - 0.2).abs() < 1e-12,
+            "log-packed theta SE = {}",
+            se[0]
+        );
+        // identity-packed: SE = SE(x) = 0.3 (NOT 0.25 * 0.3 = 0.075)
+        assert!(
+            (se[1] - 0.3).abs() < 1e-12,
+            "identity-packed theta SE = {} (must be the packed SE, not estimate-scaled)",
+            se[1]
+        );
     }
 
     // ── IOV (kappa) ──────────────────────────────────────────────────────────

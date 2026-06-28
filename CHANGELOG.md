@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Joint PK-TTE — drug-driven hazard via `[event_model] hazard = <expr>`** (#564). On an ODE
+  model, a `hazard` expression that references the PK state (e.g. `H0 * exp(BETA * (central / V))`)
+  is accumulated as a cumulative-hazard ODE compartment and estimated jointly with the PK by
+  FOCEI/SAEM, with shared random effects. Mutually exclusive with the analytic `family` hazard;
+  requires an ODE model (no IOV yet). Simulation of the ODE-accumulated hazard follows in a later
+  slice. See [Time-to-event](estimation/tte.qmd).
 - **Custom / time-varying residual-error magnitude** (#484). An `[error_model]`
   sigma argument may now be an expression of `TIME`, covariates, and thetas
   rather than a bare parameter — e.g.
@@ -221,7 +227,15 @@ section of the SDLC for the versioning policy).
   combination with a steady-state dose (`W_STEADY_STATE_INIT`) or a compartment
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
+
 ### Fixed
+- Standard errors for `theta` parameters with a **negative lower bound** (estimated on
+  the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
+  mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to
+  every theta, but it only applies to log-packed (non-negative) parameters; for
+  natural-scale thetas the reported SE was multiplied by the estimate (and would flip sign
+  for a negative estimate). Such thetas now report `SE = SE(packed)` directly. Surfaced by
+  the joint PK-TTE anchor, where `BETA`'s SE matched NONMEM only after the fix.
 - **Custom residual-error magnitude (#484) now applies on every path, not just
   the FOCE/FOCEI objective** (#576). The per-observation multiplier was wired
   only into the OFV and silently dropped everywhere else, all without a guard:

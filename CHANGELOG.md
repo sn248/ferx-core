@@ -20,6 +20,19 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Defensive-mixture importance sampling for IMP/IMPMAP — new `imp_defensive_alpha`
+  fit option** (#528). Each subject can draw an `imp_defensive_alpha` fraction of its
+  importance samples from the prior `N(0, Ω)`, bounding the importance weights so a
+  weakly-identified subject — e.g. an analytical `[initial_conditions]` baseline whose
+  `V` cancels in the amplitude — can no longer hijack the weighted M-step and walk θ to
+  the bounds. The option is **opt-in** (default `0.0`, the legacy single-proposal sampler
+  that stays bit-comparable with NONMEM); set a small positive value such as `0.1` to
+  enable the rescue. Applies to `imp` and `impmap`, including the FREM Rao-Blackwell
+  path; for an `impmap` stage it may also be written `impmap_defensive_alpha`. See
+  [Importance sampling](estimation/importance-sampling.qmd#defensive-mixture).
+- IMP/IMPMAP and SAEM now flag a finite-but-enormous runaway objective (≥ `1e15`) as
+  **not converged**, so a collapsed-weight blow-up can no longer report `converged` or
+  win multi-start selection (#528).
 - **Experimental `simulate_adaptive()` — state-reactive ("feedback") dosing simulation**
   (#553, epic #391). A programmatic entry point that simulates regimens where each dose is
   chosen at run time by a controller reading the simulated state (TDM target attainment,
@@ -183,6 +196,11 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- A diverged IMP/IMPMAP run is no longer reported as converged (#528). A
+  collapsed-weight runaway pins θ to the parameter bounds and the final objective
+  blows up to a finite-but-enormous value (~1e35); the convergence check only
+  tested `is_finite()`, so such a run could be flagged converged and even win
+  multi-start selection. It is now treated as diverged.
 - `outer_maxiter = 0` (NONMEM `MAXEVAL=0`) now means *evaluation only* on every
   optimizer (#562). The gradient NLopt path (`nlopt_lbfgs`/`slsqp`/`mma`) passed
   `maxiter = 0` straight to NLopt's `set_maxeval`, where `0` means **no limit** —

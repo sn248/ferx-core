@@ -251,6 +251,17 @@ section of the SDLC for the versioning policy).
   (#474)
 
 ### Performance
+- **Analytic sensitivity gradients for ODE IOV models with an `ExpressionScale`
+  `obs_scale` divisor** (#575). An `[odes]` model combining IOV (occasion `kappa`)
+  with an η-dependent `obs_scale = expr` (e.g. `obs_scale = V1`) previously routed
+  both the outer (θ/Ω/σ) and inner (EBE η) gradients to finite differences; each
+  feature was analytic alone (IOV #466, `ExpressionScale` #534) but not together.
+  The divisor's exact quotient rule is now applied as a post-walk per-occasion-group
+  jet over the stacked `(θ, η, κ)` axes, so these fits take the exact `Dual2`/`Dual1`
+  gradient — faster and Hessian-clean. Validated against finite differences of the
+  production predictor and against the equivalent Form-C readout (`y = central/V1`).
+  Still FD: the combination with LTBS or time-varying covariates, and the
+  closed-form (non-ODE) IOV path.
 - **Convergence-based early stop for steady-state equilibration** (#519). The SS=1
   pre-equilibration (both the f64 predictor and the `Dual1`/`Dual2` gradient path,
   and the closed-form/event-driven SS loops) previously always expanded a fixed

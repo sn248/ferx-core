@@ -5968,6 +5968,95 @@ mod tests {
         check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
     }
 
+    /// 1-cpt IV ODE IOV with an η-dependent `ExpressionScale` `obs_scale = V` divisor
+    /// (κ on CL, `ObsCmt` readout on the amount). The post-walk per-occasion-group
+    /// quotient (#575) must reproduce central FD of `predict_iov`, which applies the
+    /// same divisor per occasion (κ-aware). The ExpressionScale counterpart of
+    /// `ode_iov_provider_matches_fd_of_predict_iov`.
+    const WARFARIN_IOV_ODE_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    #[test]
+    fn ode_iov_expr_scale_supported_and_gated() {
+        let model = parse_model_string(WARFARIN_IOV_ODE_EXPRSCALE).expect("parse expr-scale IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + ExpressionScale obs_scale must be on the analytic path (#575)"
+        );
+        // + LTBS still routes to FD (the in-walk log transform is not composed with the
+        // post-walk quotient on the IOV path).
+        let mut ltbs = parse_model_string(WARFARIN_IOV_ODE_EXPRSCALE).expect("parse");
+        ltbs.log_transform = true;
+        assert!(
+            !crate::sens::ode_provider::ode_iov_supported(&ltbs),
+            "ExpressionScale + LTBS under IOV must fall back to FD"
+        );
+    }
+
+    #[test]
+    fn ode_iov_expr_scale_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_ODE_EXPRSCALE).expect("parse expr-scale IOV");
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
+        check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
+    }
+
+    #[test]
+    fn ode_iov_expr_scale_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_ODE_EXPRSCALE).expect("parse expr-scale IOV"),
+            &iov_subject(),
+            &[0.2, 10.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    /// The `obs_scale = V` divisor form is a numerical twin of the Form-C readout
+    /// `y = central / V` (already analytic + FD-validated): both compute `central/V`
+    /// and its exact stacked-(η,κ,θ) sensitivities, the divisor post-walk and the
+    /// readout in-walk. Per-observation value and `∂f/∂stacked` must agree (#575).
+    #[test]
+    fn ode_iov_expr_scale_equals_formc_readout() {
+        let divisor = parse_model_string(WARFARIN_IOV_ODE_EXPRSCALE).expect("parse divisor");
+        let formc = parse_model_string(WARFARIN_IOV_ODE).expect("parse Form-C");
+        let subject = iov_subject();
+        let theta = [0.2, 10.0];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        let a = subject_sensitivities_iov(&divisor, &subject, &theta, &stacked).expect("divisor");
+        let b = subject_sensitivities_iov(&formc, &subject, &theta, &stacked).expect("formc");
+        assert_eq!(a.obs.len(), b.obs.len());
+        for (oa, ob) in a.obs.iter().zip(b.obs.iter()) {
+            approx::assert_relative_eq!(oa.f, ob.f, max_relative = 1e-8, epsilon = 1e-10);
+            for (x, y) in oa.df_deta.iter().zip(ob.df_deta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-7, epsilon = 1e-9);
+            }
+        }
+    }
+
     /// **ODE IOV + steady-state bolus.** Each occasion's SS dose equilibrates with that
     /// occasion's κ-seeded params (dual SS-equilibration), then the per-occasion walk
     /// continues. Validated vs FD of `predict_iov` (#439 IOV × SS).

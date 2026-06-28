@@ -471,17 +471,31 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     if !ode.input_rate.is_empty() {
         return false;
     }
-    // No output scaling/LTBS, no per-cmt/indexed F, no seeded initial state (the bolus
-    // walk seeds compartments at zero). Estimated **lagtime IS supported**: the IOV walk
-    // runs through `integrate_tvcov_readout`/`integrate_tvcov_g`, which applies the dose-
-    // time shift + event-time saltation per occasion-seeded dose (#439 lagtime × IOV).
+    // No constant `ScalarScale`/LTBS, no per-cmt/indexed F, no seeded initial state (the
+    // bolus walk seeds compartments at zero). Estimated **lagtime IS supported**: the IOV
+    // walk runs through `integrate_tvcov_readout`/`integrate_tvcov_g`, which applies the
+    // dose-time shift + event-time saltation per occasion-seeded dose (#439 lagtime × IOV).
     // (`ode_analytical_supported` excludes indexed `ALAGn`. The per-subject gate
     // `ode_iov_subject_supported` now ADMITS finite-duration infusions and EVID 3/4 resets
     // — the shared `integrate_tvcov_g` walk carries the rate-boundary saltation and the
     // `reset_floor` per occasion — and declines only SS+ii>0, rate-defined-under-F, and
     // pk-only breakpoints (#472 review round 2 follow-up #2).)
-    if !matches!(model.scaling, ScalingSpec::None) || model.log_transform {
-        return false;
+    //
+    // An η-dependent `ExpressionScale` `obs_scale` divisor (`obs_scale = expr(θ,η)`) IS
+    // supported (#575): like the non-IOV ODE static walk (#534) it is applied as a
+    // post-walk quotient on the final `(θ, stacked-η)` jet — here per occasion group,
+    // since the divisor depends on the group's κ through the PK params (see
+    // `apply_expression_scale_iov` / `run_subject_iov`). Constant `ScalarScale` and LTBS
+    // stay FD (their in-walk output transform isn't validated for the IOV path — separate
+    // gap). Allowlist, not denylist, so a future scaling variant can only narrow scope.
+    match &model.scaling {
+        ScalingSpec::None => {}
+        ScalingSpec::ExpressionScale { deriv: Some(p), .. }
+            if !model.log_transform
+                && p.n_theta_axis() == model.n_theta
+                && p.n_eta_axis() == model.n_eta
+                && (1..=MAX_ODE_AXES).contains(&p.n_axes()) => {}
+        _ => return false,
     }
     // Bare lagtime only — a compartment-indexed `ALAGn` gives per-dose differing shifts
     // the single `PK_IDX_LAGTIME` walk cannot represent (same as indexed `F`).
@@ -1760,6 +1774,14 @@ fn ode_iov_subject_supported(
     if !subject.all_doses_fixed() {
         return None;
     }
+    // IOV + `ExpressionScale` `obs_scale` is served by a per-occasion-group post-walk
+    // quotient (#575), which assumes one covariate snapshot per group. A TV-cov subject
+    // would need a per-event scale jet (the divisor's covariate value differs within a
+    // group) — not carried yet, so route these to FD (mirrors the non-IOV
+    // `ode_tvcov_supported` declining `ExpressionScale`).
+    if matches!(model.scaling, ScalingSpec::ExpressionScale { .. }) && subject.has_tv_covariates() {
+        return None;
+    }
     // #419: rate-defined infusion under `F ≠ 1` is handled via the rate-off saltation
     // (moving window boundary), except for a steady-state rate-defined infusion (the
     // equilibration window would need to scale with `F`) → FD (shared gate, #473 review #4).
@@ -1938,6 +1960,78 @@ fn seed_pk_dual2_iov<const M: usize>(
     out
 }
 
+/// Apply the η-dependent `ExpressionScale` quotient `f ↦ f/s` to one IOV [`ObsSens`]
+/// row over the **stacked** `(θ, η_bsv, κ)` axes, given the precomputed scale jet `s`
+/// (value + `∂s/∂(θ, stacked-η)` + Hessian) for the observation's occasion group. The
+/// IOV analogue of the η/θ block of `apply_expression_scale` (#534): the identical
+/// quotient rule with `n_eta → n_stacked`, the scale's stacked-η axis `k` read at dual
+/// index `n_theta + k`. The scale jet is built once per occasion group by
+/// [`run_subject_iov`] (the divisor depends on the group's κ through the PK params), so
+/// this only does the per-row arithmetic (#575).
+fn apply_scale_quotient_obs_iov<const M: usize>(
+    o: &mut ObsSens,
+    s: &Dual2<M>,
+    n_theta: usize,
+    n_stacked: usize,
+) {
+    let f = o.f;
+    let inv = 1.0 / s.value;
+    let inv2 = inv * inv;
+    let inv3 = inv2 * inv;
+    // Snapshot the original `∂f/∂(stacked-η)` / `∂f/∂θ`: the Hessian update reads them
+    // across the whole k/l double loop, so they must be read before the in-place rewrite.
+    let fk: Vec<f64> = o.df_deta.clone();
+    let fm: Vec<f64> = o.df_dtheta.clone();
+    // η-η Hessian (stacked).
+    for k in 0..n_stacked {
+        for l in 0..n_stacked {
+            let idx = k * n_stacked + l;
+            let s_k = s.grad[n_theta + k];
+            let s_l = s.grad[n_theta + l];
+            let s_kl = s.hess[n_theta + k][n_theta + l];
+            o.d2f_deta2[idx] =
+                o.d2f_deta2[idx] * inv - fk[k] * s_l * inv2 - fk[l] * s_k * inv2 - f * s_kl * inv2
+                    + 2.0 * f * s_k * s_l * inv3;
+        }
+    }
+    // η-θ Hessian (stacked).
+    for k in 0..n_stacked {
+        for m in 0..n_theta {
+            let idx = k * n_theta + m;
+            let s_k = s.grad[n_theta + k];
+            let s_m = s.grad[m];
+            let s_km = s.hess[n_theta + k][m];
+            o.d2f_deta_dtheta[idx] = o.d2f_deta_dtheta[idx] * inv
+                - fk[k] * s_m * inv2
+                - fm[m] * s_k * inv2
+                - f * s_km * inv2
+                + 2.0 * f * s_k * s_m * inv3;
+        }
+    }
+    // First derivatives and value.
+    for k in 0..n_stacked {
+        o.df_deta[k] = fk[k] * inv - f * s.grad[n_theta + k] * inv2;
+    }
+    for m in 0..n_theta {
+        o.df_dtheta[m] = fm[m] * inv - f * s.grad[m] * inv2;
+    }
+    o.f = f * inv;
+}
+
+/// First-order, η-only counterpart of [`apply_scale_quotient_obs_iov`] for the inner
+/// EBE gradient: `∂(f/s)/∂η_k = (∂f/∂η_k)/s − f·(∂s/∂η_k)/s²` over the stacked η axes
+/// (`s.grad[k]`, no `n_theta` offset — the inner scale jet has no θ block). The IOV
+/// analogue of the η-block of `apply_expression_scale_inner` (#575).
+fn apply_scale_quotient_grad_iov<const N: usize>(o: &mut ObsGrad, s: &Dual1<N>, n_stacked: usize) {
+    let f = o.f;
+    let inv = 1.0 / s.value;
+    let inv2 = inv * inv;
+    for k in 0..n_stacked {
+        o.df_deta[k] = o.df_deta[k] * inv - f * s.grad[k] * inv2;
+    }
+    o.f = f * inv;
+}
+
 /// IOV outer (`Dual2<M>`, `M = n_theta + n_eta + K·n_kappa`) sensitivities for an ODE
 /// model — the IOV counterpart of [`run_subject_tvcov`]. Seeds each event's stacked
 /// PK duals at its (occasion, covariate-snapshot) — one source per occasion group when
@@ -1983,6 +2077,38 @@ fn run_subject_iov<const M: usize>(
             ))
         };
 
+    // η-dependent `ExpressionScale` `obs_scale` divisor (#575): one scale jet per
+    // occasion group (the divisor depends on the group's κ through the PK params),
+    // applied as a post-walk quotient on the final jet. Built here — *before*
+    // `seed_iov_events` moves `seed_group_cov` — reusing the same stacked PK seeding the
+    // walk uses, so the scale's `∂p/∂(θ, stacked-η)` matches the prediction's exactly.
+    // The per-subject gate declines `ExpressionScale` + TV-cov, so one snapshot (`cov`)
+    // per group is exact.
+    let group_scale: Option<Vec<Dual2<M>>> = match &model.scaling {
+        ScalingSpec::ExpressionScale {
+            deriv: Some(sprog), ..
+        } => {
+            let eta_bsv = &stacked_eta[..n_eta];
+            let mut jets = Vec::with_capacity(k_groups);
+            for g in 0..k_groups {
+                let seeded = seed_group_cov(g, cov)?;
+                let var_duals: Vec<Dual2<M>> = sprog
+                    .var_to_pk_slot()
+                    .iter()
+                    .map(|&s| {
+                        seeded
+                            .get(s)
+                            .copied()
+                            .unwrap_or_else(|| Dual2::constant(0.0))
+                    })
+                    .collect();
+                jets.push(sprog.eval_scale_dual::<M>(theta, eta_bsv, cov, &var_duals));
+            }
+            Some(jets)
+        }
+        _ => None,
+    };
+
     let (pk_at_dose, pk_at_obs) =
         seed_iov_events::<Dual2<M>>(subject, &occ_to_k, k_groups, cov, seed_group_cov)?;
 
@@ -2017,6 +2143,14 @@ fn run_subject_iov<const M: usize>(
             df_dtheta,
             d2f_deta_dtheta,
         });
+    }
+    // Apply the `ExpressionScale` quotient per observation, using its occasion group's
+    // scale jet (#575). Obs order matches `subject.obs_times` / `subject.occasions`.
+    if let Some(group_scale) = group_scale {
+        for (j, o) in out.iter_mut().enumerate() {
+            let g = *occ_to_k.get(&subject.occasions.get(j).copied()?)?;
+            apply_scale_quotient_obs_iov::<M>(o, &group_scale[g], n_theta, n_stacked);
+        }
     }
     Some(SubjectSens { obs: out })
 }
@@ -2139,6 +2273,36 @@ fn run_subject_iov_eta<const N: usize>(
             Some(seed_pk_dual1_iov::<N>(model, &pk, &cd, g, n_eta, n_kappa))
         };
 
+    // η-only `ExpressionScale` scale jets, one per occasion group (#575) — the inner
+    // counterpart of the outer `group_scale`. Built before `seed_iov_events` moves the
+    // closure, reusing the same stacked `Dual1` seeding so the scale gradient matches the
+    // walk's. The κ axes enter purely through `var_duals` (the scale references no κ by
+    // name); `eta_bsv` seeds the BSV η axes `0..n_eta` directly.
+    let group_scale: Option<Vec<Dual1<N>>> = match &model.scaling {
+        ScalingSpec::ExpressionScale {
+            deriv: Some(sprog), ..
+        } => {
+            let eta_bsv = &stacked_eta[..n_eta];
+            let mut jets = Vec::with_capacity(k_groups);
+            for g in 0..k_groups {
+                let seeded = seed_group_cov(g, cov)?;
+                let var_duals: Vec<Dual1<N>> = sprog
+                    .var_to_pk_slot()
+                    .iter()
+                    .map(|&s| {
+                        seeded
+                            .get(s)
+                            .copied()
+                            .unwrap_or_else(|| Dual1::constant(0.0))
+                    })
+                    .collect();
+                jets.push(sprog.eval_scale_dual1::<N>(theta, eta_bsv, cov, &var_duals));
+            }
+            Some(jets)
+        }
+        _ => None,
+    };
+
     let (pk_at_dose, pk_at_obs) =
         seed_iov_events::<Dual1<N>>(subject, &occ_to_k, k_groups, cov, seed_group_cov)?;
 
@@ -2155,6 +2319,13 @@ fn run_subject_iov_eta<const N: usize>(
             f: fd.value,
             df_deta,
         });
+    }
+    // Apply the η-only `ExpressionScale` quotient per observation (#575).
+    if let Some(group_scale) = group_scale {
+        for (j, o) in out.iter_mut().enumerate() {
+            let g = *occ_to_k.get(&subject.occasions.get(j).copied()?)?;
+            apply_scale_quotient_grad_iov::<N>(o, &group_scale[g], n_stacked);
+        }
     }
     Some(out)
 }

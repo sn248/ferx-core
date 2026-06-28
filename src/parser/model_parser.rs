@@ -4026,12 +4026,14 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.iscale_max = v;
         }
-        "imp_defensive_alpha" => {
-            let v = parse_f64("imp_defensive_alpha")?;
+        // `impmap_defensive_alpha` is an alias for `imp_defensive_alpha`: the
+        // defensive mixture is shared IMP/IMPMAP machinery, so both names write
+        // the same field (issue #528). The alias keeps the `impmap_*` namespace
+        // discoverable for IMPMAP users.
+        "imp_defensive_alpha" | "impmap_defensive_alpha" => {
+            let v = parse_f64(key)?;
             if !(0.0..1.0).contains(&v) {
-                return Err(format!(
-                    "fit option `imp_defensive_alpha` must be in [0, 1), got {v}"
-                ));
+                return Err(format!("fit option `{key}` must be in [0, 1), got {v}"));
             }
             opts.imp_defensive_alpha = v;
         }
@@ -14411,9 +14413,10 @@ mod tests {
 
     #[test]
     fn test_parse_imp_defensive_alpha() {
-        // Default is the stability-on value (issue #528).
-        assert_eq!(parse_fit_options(&[]).unwrap().imp_defensive_alpha, 0.1);
-        // In-range values are accepted; 0.0 opts back into the legacy sampler.
+        // Default is opt-out (legacy single-proposal sampler); the mixture is
+        // opt-in (issue #528).
+        assert_eq!(parse_fit_options(&[]).unwrap().imp_defensive_alpha, 0.0);
+        // In-range values are accepted.
         let opts = parse_fit_options(&["imp_defensive_alpha = 0.25".to_string()]).unwrap();
         assert_eq!(opts.imp_defensive_alpha, 0.25);
         assert_eq!(
@@ -14422,9 +14425,17 @@ mod tests {
                 .imp_defensive_alpha,
             0.0
         );
-        // Out of [0, 1) is rejected at parse time.
+        // `impmap_defensive_alpha` is an accepted alias for the same field.
+        assert_eq!(
+            parse_fit_options(&["impmap_defensive_alpha = 0.1".to_string()])
+                .unwrap()
+                .imp_defensive_alpha,
+            0.1
+        );
+        // Out of [0, 1) is rejected at parse time, under either spelling.
         assert!(parse_fit_options(&["imp_defensive_alpha = 1.0".to_string()]).is_err());
         assert!(parse_fit_options(&["imp_defensive_alpha = -0.1".to_string()]).is_err());
+        assert!(parse_fit_options(&["impmap_defensive_alpha = 1.0".to_string()]).is_err());
     }
 
     #[test]

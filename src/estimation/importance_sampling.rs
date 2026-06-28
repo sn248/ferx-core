@@ -256,6 +256,13 @@ pub fn run_importance_sampling(
     let omega_inv = omega.inv.clone();
     let log_det_omega = omega.log_det;
 
+    // Build the defensive-mixture broad component q_broad = N(0, Ω) once and
+    // share it read-only across the parallel subject loop (issue #528). It
+    // depends only on Ω, so a per-subject rebuild would redundantly re-Cholesky
+    // the same Ω⁻¹. `None` when the mixture is inactive (`alpha == 0`). The FREM
+    // Rao-Blackwell path builds its own (conditional-prior) component per subject.
+    let defensive_mixture = DefensiveMixture::new(&omega_inv, n_eta, defensive_alpha);
+
     // For IOV models, pre-compute Ω_iov⁻¹ and log|Ω_iov| for the joint proposal.
     // An IOV model (`n_kappa > 0`) must carry Ω_iov; enforce that here so the
     // per-subject joint path can rely on it without `Option` handling (and
@@ -414,6 +421,7 @@ pub fn run_importance_sampling(
                                 scratch,
                                 1.0,
                                 false,
+                                defensive_alpha,
                             ) {
                                 let ess_fraction = rb.ess_fraction;
                                 let var_log_marginal = if ess_fraction > 0.0 {
@@ -445,7 +453,7 @@ pub fn run_importance_sampling(
                     subj_seed,
                     scratch,
                     1.0, // iscale: no adaptive scaling for IMP EONLY
-                    defensive_alpha,
+                    defensive_mixture.as_ref(),
                 )
             }
         })
@@ -548,7 +556,7 @@ fn subject_is_estimate(
     seed: u64,
     scratch: &mut EventPkParams,
     iscale: f64,
-    defensive_alpha: f64,
+    mixture: Option<&DefensiveMixture>,
 ) -> SubjectIsOutput {
     let mut rng = StdRng::seed_from_u64(seed);
 
@@ -567,19 +575,8 @@ fn subject_is_estimate(
     };
 
     // Defensive-mixture component q_broad = N(0, Ω); see `subject_is_draws` and
-    // issue #528. `alpha == 0` reproduces the single-proposal estimator exactly.
-    let broad = if defensive_alpha > 0.0 {
-        build_broad_proposal(omega_inv, d)
-    } else {
-        None
-    };
-    let alpha = if broad.is_some() {
-        defensive_alpha
-    } else {
-        0.0
-    };
-    let ln_alpha = alpha.ln();
-    let ln_one_minus_alpha = (1.0 - alpha).ln();
+    // issue #528. `mixture == None` reproduces the single-proposal estimator
+    // exactly. The broad component is built once by the caller and shared.
 
     let normal = StandardNormal;
     let chi_sq = ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller");
@@ -606,16 +603,14 @@ fn subject_is_estimate(
     let mut diff = vec![0.0_f64; d];
 
     for _ in 0..k_samples {
-        let from_broad = alpha > 0.0 && rng.random::<f64>() < alpha;
+        let from_broad = mixture.is_some_and(|m| m.draws_broad(&mut rng));
         if from_broad {
             // Defensive draw η ~ N(0, Ω): centred at the prior mean (0), not η̂.
-            for zi in z.iter_mut() {
-                *zi = normal.sample(&mut rng);
-            }
-            broad
-                .as_ref()
-                .expect("broad set when alpha > 0")
-                .apply_l_sigma(&z, &mut eta_sample, 1.0);
+            mixture.expect("mixture set when from_broad").sample_broad(
+                &mut rng,
+                &mut z,
+                &mut eta_sample,
+            );
         } else {
             // Draw z ~ N(0, I_d) and c ~ χ²_ν; build η = η̂ + iscale·sqrt(ν/c) · L_Σ z.
             for zi in z.iter_mut() {
@@ -656,10 +651,9 @@ fn subject_is_estimate(
             log_t_const - 0.5 * (nu + d as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln();
         // Defensive mixture q = (1−α)·q_narrow + α·N(0,Ω); the broad component's
         // log-density is the prior `log_p_eta`. Scored for every sample.
-        let log_q = if alpha > 0.0 {
-            logsumexp2(ln_one_minus_alpha + log_q_narrow, ln_alpha + log_p_eta)
-        } else {
-            log_q_narrow
+        let log_q = match mixture {
+            Some(m) => m.log_q(log_q_narrow, log_p_eta),
+            None => log_q_narrow,
         };
 
         log_w.push(log_p_y + log_p_eta - log_q);
@@ -893,6 +887,7 @@ pub(crate) fn subject_is_draws_frem_rb(
     scratch: &mut EventPkParams,
     iscale: f64,
     use_sobol: bool,
+    defensive_alpha: f64,
 ) -> Option<SubjectDraws> {
     let np = pk_idx.len();
     let nc = cov_idx.len();
@@ -916,6 +911,19 @@ pub(crate) fn subject_is_draws_frem_rb(
     let h_pp = submatrix(h_post, pk_idx, pk_idx);
     let proposal = build_proposal(&h_pp, &p_pp, np)?;
     let eta_hat_pk: Vec<f64> = pk_idx.iter().map(|&i| eta_hat[i]).collect();
+
+    // Defensive-mixture component for the RB path (issue #528). The covering
+    // distribution is the *conditional* PK prior N(μ_pc, P_pp⁻¹) — the exact
+    // analogue of N(0, Ω) in the full-dimensional sampler — so the broad density
+    // at any η_p equals `log_prior` below. `defensive_alpha == 0` (or a non-PD
+    // P_pp) leaves the legacy single-proposal RB sampler and its RNG stream
+    // untouched. Sobol QMC is disabled while the mixture is active.
+    let mixture = if defensive_alpha > 0.0 {
+        build_broad_proposal(&p_pp, np)
+            .map(|broad| DefensiveMixture::from_proposal(broad, defensive_alpha))
+    } else {
+        None
+    };
 
     // Covariate data marginal log p(d) = log N(d; 0, Ω_cc + R), R = EPSCOV²·I.
     let r_cov = {
@@ -961,7 +969,7 @@ pub(crate) fn subject_is_draws_frem_rb(
     } else {
         Some(ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller"))
     };
-    let sobol_draws = if use_sobol && mvn {
+    let sobol_draws = if use_sobol && mvn && mixture.is_none() {
         Some(sobol_normal_draws(np, k_samples, seed))
     } else {
         None
@@ -975,20 +983,30 @@ pub(crate) fn subject_is_draws_frem_rb(
     let mut diff_q = vec![0.0_f64; np];
 
     for s_idx in 0..k_samples {
-        if let Some(ref qr) = sobol_draws {
-            z.copy_from_slice(&qr[s_idx]);
-        } else {
-            for zi in z.iter_mut() {
-                *zi = normal.sample(&mut rng);
+        let from_broad = mixture.as_ref().is_some_and(|m| m.draws_broad(&mut rng));
+        if from_broad {
+            // Defensive draw η_p ~ N(μ_pc, P_pp⁻¹): the conditional PK prior.
+            let m = mixture.as_ref().expect("mixture set when from_broad");
+            m.sample_broad(&mut rng, &mut z, &mut eta_p);
+            for (j, e) in eta_p.iter_mut().enumerate() {
+                *e += mu_pc[j];
             }
-        }
-        let scale = match &chi_sq {
-            Some(c) => (nu / c.sample(&mut rng).max(1e-300)).sqrt() * iscale,
-            None => iscale,
-        };
-        proposal.apply_l_sigma(&z, &mut eta_p, scale);
-        for (j, e) in eta_p.iter_mut().enumerate() {
-            *e += eta_hat_pk[j];
+        } else {
+            if let Some(ref qr) = sobol_draws {
+                z.copy_from_slice(&qr[s_idx]);
+            } else {
+                for zi in z.iter_mut() {
+                    *zi = normal.sample(&mut rng);
+                }
+            }
+            let scale = match &chi_sq {
+                Some(c) => (nu / c.sample(&mut rng).max(1e-300)).sqrt() * iscale,
+                None => iscale,
+            };
+            proposal.apply_l_sigma(&z, &mut eta_p, scale);
+            for (j, e) in eta_p.iter_mut().enumerate() {
+                *e += eta_hat_pk[j];
+            }
         }
 
         // Reconstruct full η: PK sample at pk_idx, fixed d at cov_idx.
@@ -1019,10 +1037,16 @@ pub(crate) fn subject_is_draws_frem_rb(
             *dq = eta_p[j] - eta_hat_pk[j];
         }
         let mahal = proposal.mahalanobis(&diff_q);
-        let log_q = if mvn {
+        let log_q_narrow = if mvn {
             log_q_const - 0.5 * inv_iscale_sq * mahal
         } else {
             log_q_const - 0.5 * (nu + np as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln()
+        };
+        // Mixture denominator q = (1−α)·q_narrow + α·q_cond_prior; the broad
+        // component's log-density is the conditional prior `log_prior`.
+        let log_q = match mixture.as_ref() {
+            Some(m) => m.log_q(log_q_narrow, log_prior),
+            None => log_q_narrow,
         };
 
         log_w.push(log_p_y + log_prior - log_q);
@@ -1122,7 +1146,7 @@ pub(crate) fn subject_is_draws(
     scratch: &mut EventPkParams,
     iscale: f64,
     use_sobol: bool,
-    defensive_alpha: f64,
+    mixture: Option<&DefensiveMixture>,
 ) -> SubjectDraws {
     let mvn = !nu.is_finite();
     let mut rng = StdRng::seed_from_u64(seed);
@@ -1150,22 +1174,11 @@ pub(crate) fn subject_is_draws(
     // amplitude) from contributing a single dominant sample that hijacks the
     // importance-weighted M-step. It bounds the weights, not the raw ESS — a
     // sharp interior likelihood spike can still keep ESS low — but it is enough
-    // to keep the population estimates identifiable. `alpha == 0` reproduces the
-    // pre-#528 single-proposal sampler exactly. Quasi-random (Sobol) draws are
-    // disabled when the mixture is active — the branch structure breaks the QMC
-    // sequence.
-    let broad = if defensive_alpha > 0.0 {
-        build_broad_proposal(omega_inv, d)
-    } else {
-        None
-    };
-    let alpha = if broad.is_some() {
-        defensive_alpha
-    } else {
-        0.0
-    };
-    let ln_alpha = alpha.ln();
-    let ln_one_minus_alpha = (1.0 - alpha).ln();
+    // to keep the population estimates identifiable. `mixture == None` reproduces
+    // the pre-#528 single-proposal sampler exactly. The broad component (which
+    // depends only on Ω) is built once by the caller and shared across subjects.
+    // Quasi-random (Sobol) draws are disabled when the mixture is active — the
+    // branch structure breaks the QMC sequence.
 
     let normal = StandardNormal;
     // Student-t scale mixing variable; unused for the MVN branch.
@@ -1201,7 +1214,7 @@ pub(crate) fn subject_is_draws(
     // Pre-generate Sobol quasi-random draws if requested and MVN. Disabled when
     // the defensive mixture is active (the per-sample component branch breaks
     // the quasi-random sequence).
-    let sobol_draws = if use_sobol && mvn && alpha == 0.0 {
+    let sobol_draws = if use_sobol && mvn && mixture.is_none() {
         Some(sobol_normal_draws(d, k_samples, seed))
     } else {
         None
@@ -1209,16 +1222,14 @@ pub(crate) fn subject_is_draws(
 
     for sample_idx in 0..k_samples {
         let mut eta_sample = vec![0.0_f64; d];
-        let from_broad = alpha > 0.0 && rng.random::<f64>() < alpha;
+        let from_broad = mixture.is_some_and(|m| m.draws_broad(&mut rng));
         if from_broad {
             // Defensive draw η ~ N(0, Ω): centred at the prior mean (0), not η̂.
-            for zi in z.iter_mut() {
-                *zi = normal.sample(&mut rng);
-            }
-            broad
-                .as_ref()
-                .expect("broad set when alpha > 0")
-                .apply_l_sigma(&z, &mut eta_sample, 1.0);
+            mixture.expect("mixture set when from_broad").sample_broad(
+                &mut rng,
+                &mut z,
+                &mut eta_sample,
+            );
         } else {
             if let Some(ref qr) = sobol_draws {
                 // Sobol quasi-random N(0,I) draws (MVN only)
@@ -1267,10 +1278,9 @@ pub(crate) fn subject_is_draws(
         // component's log-density equal to the Gaussian prior `log_p_eta`
         // (q_broad = N(0,Ω)). Evaluated for every sample (balance heuristic),
         // not just the component it was drawn from.
-        let log_q = if alpha > 0.0 {
-            logsumexp2(ln_one_minus_alpha + log_q_narrow, ln_alpha + log_p_eta)
-        } else {
-            log_q_narrow
+        let log_q = match mixture {
+            Some(m) => m.log_q(log_q_narrow, log_p_eta),
+            None => log_q_narrow,
         };
 
         log_w.push(log_p_y + log_p_eta - log_q);
@@ -1367,7 +1377,7 @@ pub(crate) fn find_optimal_iscale(
             scratch,
             scale,
             false, // pilot draws don't need Sobol
-            0.0,   // tune the narrow proposal alone; defensive mixing applies at the real draw
+            None,  // tune the narrow proposal alone; defensive mixing applies at the real draw
         );
         if draws.ess_fraction > best_ess {
             best_ess = draws.ess_fraction;
@@ -1781,6 +1791,85 @@ fn build_broad_proposal(omega_inv: &DMatrix<f64>, d: usize) -> Option<Proposal> 
     })
 }
 
+/// Defensive-mixture proposal component and precomputed log-mixing weights
+/// (issue #528). The proposal is `q = (1−α)·q_narrow + α·q_broad`; this struct
+/// owns the broad covering component `q_broad` and the per-component log-weights
+/// so the math lives in **one** place shared by `subject_is_estimate` and
+/// `subject_is_draws` (rather than being copy-pasted into each).
+///
+/// `q_broad` depends only on Ω (not on the subject), so the caller builds this
+/// **once** before the parallel subject loop and shares it read-only across
+/// subjects — avoiding a redundant per-subject Cholesky of Ω⁻¹. A `None` mixture
+/// means "inactive" (`alpha == 0` or a non-PD Ω) and reproduces the pre-#528
+/// single-proposal sampler exactly, including its RNG stream.
+pub(crate) struct DefensiveMixture {
+    /// Broad covering component `q_broad = N(0, Ω)`.
+    broad: Proposal,
+    /// Mixing fraction α ∈ (0, 1): probability a given draw comes from `q_broad`.
+    alpha: f64,
+    ln_alpha: f64,
+    ln_one_minus_alpha: f64,
+}
+
+impl DefensiveMixture {
+    /// Build the `N(0, Ω)` defensive component from Ω⁻¹. Returns `None` (no
+    /// mixture) when `alpha <= 0` or Ω⁻¹ is not positive-definite — in which case
+    /// the caller degrades to the narrow proposal alone.
+    pub(crate) fn new(omega_inv: &DMatrix<f64>, d: usize, alpha: f64) -> Option<Self> {
+        if alpha <= 0.0 {
+            return None;
+        }
+        let broad = build_broad_proposal(omega_inv, d)?;
+        Some(Self {
+            broad,
+            alpha,
+            ln_alpha: alpha.ln(),
+            ln_one_minus_alpha: (1.0 - alpha).ln(),
+        })
+    }
+
+    /// Build a defensive component from a pre-factored broad proposal (used by the
+    /// FREM Rao-Blackwell path, whose covering distribution is the conditional PK
+    /// prior `N(μ, P_pp⁻¹)` rather than `N(0, Ω)`).
+    fn from_proposal(broad: Proposal, alpha: f64) -> Self {
+        Self {
+            broad,
+            alpha,
+            ln_alpha: alpha.ln(),
+            ln_one_minus_alpha: (1.0 - alpha).ln(),
+        }
+    }
+
+    /// Decide whether this draw comes from the broad component. Consumes exactly
+    /// one uniform from `rng` — kept on the `Option` so callers preserve the
+    /// legacy (no-mixture) RNG stream by short-circuiting before any draw.
+    fn draws_broad(&self, rng: &mut StdRng) -> bool {
+        rng.random::<f64>() < self.alpha
+    }
+
+    /// Draw `η ~ q_broad` into `out` (centred at 0; the FREM RB caller shifts to
+    /// μ afterwards), using scratch buffer `z`.
+    fn sample_broad(&self, rng: &mut StdRng, z: &mut [f64], out: &mut [f64]) {
+        let normal = StandardNormal;
+        for zi in z.iter_mut() {
+            *zi = normal.sample(rng);
+        }
+        self.broad.apply_l_sigma(z, out, 1.0);
+    }
+
+    /// Mixture log-density `log[(1−α)·q_narrow + α·q_broad]` (balance heuristic —
+    /// scored for every sample regardless of which component produced it).
+    /// `log_q_broad` is the broad component's log-density at this sample (the
+    /// Gaussian prior for the `N(0,Ω)` component, or the conditional prior for the
+    /// FREM RB component).
+    fn log_q(&self, log_q_narrow: f64, log_q_broad: f64) -> f64 {
+        logsumexp2(
+            self.ln_one_minus_alpha + log_q_narrow,
+            self.ln_alpha + log_q_broad,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Numerical helpers
 // ---------------------------------------------------------------------------
@@ -2095,6 +2184,39 @@ mod tests {
         assert!(build_broad_proposal(&DMatrix::zeros(0, 0), 0).is_none());
         // Non-PD Ω⁻¹ (zero matrix) → None, so the mixture degrades to narrow-only.
         assert!(build_broad_proposal(&DMatrix::zeros(2, 2), 2).is_none());
+    }
+
+    #[test]
+    fn defensive_mixture_inactive_for_nonpositive_alpha() {
+        let omega_inv = DMatrix::from_diagonal(&DVector::from_vec(vec![4.0, 9.0]));
+        // alpha <= 0 → no mixture (the caller passes None into the sampler).
+        assert!(DefensiveMixture::new(&omega_inv, 2, 0.0).is_none());
+        assert!(DefensiveMixture::new(&omega_inv, 2, -0.1).is_none());
+        // A non-PD Ω⁻¹ also yields None (degrade to narrow-only).
+        assert!(DefensiveMixture::new(&DMatrix::zeros(2, 2), 2, 0.1).is_none());
+    }
+
+    #[test]
+    fn defensive_mixture_scores_balance_heuristic_and_samples_broad() {
+        let omega_inv = DMatrix::from_diagonal(&DVector::from_vec(vec![4.0, 9.0]));
+        let m = DefensiveMixture::new(&omega_inv, 2, 0.25).expect("PD Ω⁻¹ → mixture");
+        // log_q is the two-component balance-heuristic denominator.
+        let (log_q_narrow, log_q_broad) = (-3.0, -1.0);
+        let expected = logsumexp2(0.75_f64.ln() + log_q_narrow, 0.25_f64.ln() + log_q_broad);
+        assert!((m.log_q(log_q_narrow, log_q_broad) - expected).abs() < 1e-12);
+        // draws_broad consumes one uniform and decides by the α threshold; with a
+        // fixed seed the outcome is deterministic. sample_broad maps N(0,I)→N(0,Ω):
+        // a unit input on dim 0 ⇒ sd 0.5 (Ω = diag(0.25, 1/9)).
+        let mut rng = StdRng::seed_from_u64(7);
+        let _ = m.draws_broad(&mut rng);
+        let mut z = [1.0_f64, 0.0];
+        let mut out = [0.0_f64; 2];
+        // sample_broad refills z from rng; force the factor check via apply_l_sigma.
+        m.broad.apply_l_sigma(&z, &mut out, 1.0);
+        assert!((out[0].abs() - 0.5).abs() < 1e-12);
+        // Exercise the rng path too (just assert it writes finite values).
+        m.sample_broad(&mut rng, &mut z, &mut out);
+        assert!(out.iter().all(|v| v.is_finite()));
     }
 
     #[test]

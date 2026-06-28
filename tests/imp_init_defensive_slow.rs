@@ -10,7 +10,8 @@
 //! by the surviving samples — pushing θ far from the truth (in the NONMEM `run14`
 //! report all the way to the bounds with `OFV ≈ 1e35`).
 //!
-//! The defensive-mixture proposal (`imp_defensive_alpha`, default 0.1) draws a
+//! The defensive-mixture proposal (`imp_defensive_alpha`, opt-in; this test sets
+//! it explicitly) draws a
 //! fraction of samples from the prior `N(0, Ω)` and scores every sample under the
 //! resulting mixture density. Because the prior covers the conditional posterior,
 //! this **bounds the importance weights**, so no single collapsed-weight subject
@@ -155,7 +156,7 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
     );
     let pop = simulate_dv(&model, &template(), &model.default_params);
 
-    // Default defensive mixture (alpha = 0.1): θ is recovered near the truth.
+    // Defensive mixture enabled (alpha = 0.1): θ is recovered near the truth.
     let with_mix = fit(&model, &pop, &model.default_params, &saem_imp_opts(0.1))
         .expect("saem → imp on the init model must produce a fit");
     assert!(with_mix.converged, "defensive-mixture fit must converge");

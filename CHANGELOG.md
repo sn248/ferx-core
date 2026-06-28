@@ -21,12 +21,18 @@ section of the SDLC for the versioning policy).
 
 ### Added
 - **Defensive-mixture importance sampling for IMP/IMPMAP — new `imp_defensive_alpha`
-  fit option** (#528). Each subject now draws an `imp_defensive_alpha` fraction of its
-  importance samples from the prior `N(0, Ω)` (default `0.1`), bounding the importance
-  weights so a weakly-identified subject — e.g. an analytical `[initial_conditions]`
-  baseline whose `V` cancels in the amplitude — can no longer hijack the weighted M-step
-  and walk θ to the bounds. Set `imp_defensive_alpha = 0` to restore the previous
-  single-proposal sampler. See [Fit options](model-file/fit-options.qmd).
+  fit option** (#528). Each subject can draw an `imp_defensive_alpha` fraction of its
+  importance samples from the prior `N(0, Ω)`, bounding the importance weights so a
+  weakly-identified subject — e.g. an analytical `[initial_conditions]` baseline whose
+  `V` cancels in the amplitude — can no longer hijack the weighted M-step and walk θ to
+  the bounds. The option is **opt-in** (default `0.0`, the legacy single-proposal sampler
+  that stays bit-comparable with NONMEM); set a small positive value such as `0.1` to
+  enable the rescue. Applies to `imp` and `impmap`, including the FREM Rao-Blackwell
+  path; for an `impmap` stage it may also be written `impmap_defensive_alpha`. See
+  [Importance sampling](estimation/importance-sampling.qmd#defensive-mixture).
+- IMP/IMPMAP and SAEM now flag a finite-but-enormous runaway objective (≥ `1e15`) as
+  **not converged**, so a collapsed-weight blow-up can no longer report `converged` or
+  win multi-start selection (#528).
 - **Experimental `simulate_adaptive()` — state-reactive ("feedback") dosing simulation**
   (#553, epic #391). A programmatic entry point that simulates regimens where each dose is
   chosen at run time by a controller reading the simulated state (TDM target attainment,

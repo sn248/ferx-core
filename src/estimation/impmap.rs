@@ -87,19 +87,21 @@ const AUTO_SAMPLES_MAX: usize = 10_000;
 /// and collapse the ESS (the very rich-data failure mode that motivates IMPMAP).
 const IMP_PROPOSAL_COV_FLOOR: f64 = 1e-10;
 
-/// Objective ceiling beyond which an MCEM run is declared diverged rather than
-/// converged (issue #528). A collapsed-weight runaway pins θ to the parameter
-/// bounds and the final FOCE-Laplace OFV blows up to ~1e35 — a finite value
-/// that `is_finite()` would otherwise accept. Real −2logL objectives are at
-/// most in the thousands, so 1e30 is an unambiguous divergence flag with no
-/// risk of catching a legitimate fit.
-const OFV_DIVERGENCE_CAP: f64 = 1e30;
+/// Objective ceiling beyond which an estimation run is declared diverged rather
+/// than converged (issue #528). A collapsed-weight runaway pins θ to the
+/// parameter bounds and the final FOCE-Laplace OFV blows up to ~1e35 — a finite
+/// value that `is_finite()` would otherwise accept. Real −2logL objectives scale
+/// with the number of observations and reach at most ~1e6–1e7 even for very
+/// large cohorts, so 1e15 leaves ~8 orders of head-room above any legitimate fit
+/// while closing the gap that let a 1e12–1e29 runaway pass as converged.
+pub(crate) const OFV_DIVERGENCE_CAP: f64 = 1e15;
 
-/// Whether an MCEM run's final objective signals convergence rather than a
+/// Whether an estimation run's final objective signals convergence rather than a
 /// runaway. A non-finite OFV is an outright divergence; a finite-but-enormous
 /// one (≥ [`OFV_DIVERGENCE_CAP`]) is the bounded blowup of a collapsed-weight
-/// run, which `is_finite()` alone would wave through (issue #528).
-fn imp_run_converged(ofv: f64) -> bool {
+/// run, which `is_finite()` alone would wave through (issue #528). Shared by the
+/// IMP/IMPMAP MCEM core and SAEM (both can run away to a finite blowup).
+pub(crate) fn objective_converged(ofv: f64) -> bool {
     ofv.is_finite() && ofv.abs() < OFV_DIVERGENCE_CAP
 }
 
@@ -338,6 +340,18 @@ pub fn run_impmap(
             "IMPMAP: `impmap_sobol = true` is ignored because the proposal is a Student-t \
              (`impmap_proposal_df` is finite). Sobol draws apply only to the multivariate-normal \
              proposal — set `impmap_proposal_df = normal` to use them."
+                .to_string(),
+        );
+    }
+    // Sobol is also silently disabled when the defensive mixture is active: the
+    // broad/narrow per-sample branch breaks the quasi-random sequence, so the
+    // sampler falls back to plain Monte Carlo. Surface that rather than ignore it
+    // (issue #528).
+    if use_sobol && options.imp_defensive_alpha > 0.0 {
+        result.warnings.push(
+            "IMPMAP: `impmap_sobol = true` is ignored because the defensive mixture is active \
+             (`imp_defensive_alpha > 0`). Quasi-random draws are disabled when sampling from the \
+             broad/narrow mixture — set `imp_defensive_alpha = 0` to use Sobol draws."
                 .to_string(),
         );
     }
@@ -716,6 +730,16 @@ fn run_mcem(
         let iscale_min = options.iscale_min;
         let iscale_max = options.iscale_max;
         let defensive_alpha = options.imp_defensive_alpha;
+        // Build the defensive-mixture broad component q_broad = N(0, Ω) once per
+        // MCEM iteration (Ω changes each iteration but is shared across subjects)
+        // and pass it read-only into the parallel subject loop, avoiding a
+        // redundant per-subject Cholesky of Ω⁻¹ (issue #528). `None` when the
+        // mixture is inactive. The FREM RB path builds its own component.
+        let defensive_mixture = crate::estimation::importance_sampling::DefensiveMixture::new(
+            &omega_inv,
+            n_eta,
+            defensive_alpha,
+        );
         let draws: Vec<_> = population
             .subjects
             .par_iter()
@@ -795,6 +819,7 @@ fn run_mcem(
                                     scratch,
                                     1.0,
                                     use_sobol,
+                                    defensive_alpha,
                                 )
                             {
                                 return rb;
@@ -835,7 +860,7 @@ fn run_mcem(
                     scratch,
                     iscale,
                     use_sobol,
-                    defensive_alpha,
+                    defensive_mixture.as_ref(),
                 )
             })
             .collect();
@@ -1281,7 +1306,7 @@ fn run_mcem(
         // beyond a generous physical ceiling as non-converged too — real −2logL
         // values are at most thousands. Matches SAEM's `converged: ofv.is_finite()`
         // in spirit while catching the bounded blowup.
-        converged: imp_run_converged(ofv),
+        converged: objective_converged(ofv),
         n_iterations: n_iter,
         eta_hats,
         h_matrices,
@@ -1418,19 +1443,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn imp_run_converged_rejects_runaway_and_nonfinite() {
+    fn objective_converged_rejects_runaway_and_nonfinite() {
         // A normal objective converges.
-        assert!(imp_run_converged(-249.23));
-        assert!(imp_run_converged(0.0));
+        assert!(objective_converged(-249.23));
+        assert!(objective_converged(0.0));
+        // A legitimately large objective for a huge cohort still converges —
+        // 1e15 leaves head-room above any real −2logL.
+        assert!(objective_converged(1.0e7));
         // Non-finite is divergence.
-        assert!(!imp_run_converged(f64::NAN));
-        assert!(!imp_run_converged(f64::INFINITY));
-        assert!(!imp_run_converged(f64::NEG_INFINITY));
+        assert!(!objective_converged(f64::NAN));
+        assert!(!objective_converged(f64::INFINITY));
+        assert!(!objective_converged(f64::NEG_INFINITY));
         // The bounded blowup (issue #528): finite but enormous → not converged,
         // so a collapsed-weight runaway can't masquerade as a good fit or win
-        // multi-start selection.
-        assert!(!imp_run_converged(1e35));
-        assert!(!imp_run_converged(OFV_DIVERGENCE_CAP));
+        // multi-start selection. The lowered cap also rejects a less-extreme
+        // 1e20 runaway that the old 1e30 cap waved through.
+        assert!(!objective_converged(1e35));
+        assert!(!objective_converged(1e20));
+        assert!(!objective_converged(OFV_DIVERGENCE_CAP));
     }
 
     #[test]

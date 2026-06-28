@@ -241,9 +241,10 @@ fn imp_after_saem_populates_field() {
 
 #[test]
 fn imp_defensive_mixture_runs_for_both_alpha_branches() {
-    // The defensive-mixture proposal (issue #528) is on by default
-    // (`imp_defensive_alpha = 0.1`); `0.0` opts back into the single-proposal
-    // sampler. Both must produce a finite IS −2LL with in-range ESS, and on a
+    // The defensive-mixture proposal (issue #528) is opt-in (default
+    // `imp_defensive_alpha = 0.0`, the legacy single-proposal sampler); a small
+    // positive `alpha` enables it. Both must produce a finite IS −2LL with
+    // in-range ESS, and on a
     // well-identified model (warfarin) the two estimates should be close — the
     // mixture only changes things materially when the narrow proposal is
     // degenerate. This exercises both sampler branches in the fast PR job.

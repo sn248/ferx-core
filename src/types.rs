@@ -3807,9 +3807,16 @@ pub struct FitOptions {
     /// baseline whose V cancels in the amplitude) can hijack the importance-
     /// weighted M-step and walk θ to the bounds. (It bounds the weights, not the
     /// raw ESS — a sharp interior likelihood spike can still keep ESS low.)
-    /// Applies to both the estimating IMP/IMPMAP phases and the eval-only IS
-    /// marginal-likelihood pass. Must be in `[0, 1)`; `0.0` reproduces the
-    /// pre-#528 single-proposal sampler exactly. Default `0.1`.
+    /// Applies to the estimating IMP/IMPMAP phases (including the FREM
+    /// Rao-Blackwell path) and the eval-only IS marginal-likelihood pass. Must be
+    /// in `[0, 1)`. Default `0.0` — the mixture is **opt-in**, so the default
+    /// reproduces the pre-#528 single-proposal sampler and stays bit-comparable
+    /// with NONMEM (which has no defensive mixture); set a small positive value
+    /// (e.g. `0.1`) to enable the rescue for weakly-identified models. For an
+    /// IMPMAP stage the option may also be written as `impmap_defensive_alpha`
+    /// (an alias for this same field). Enabling the mixture disables Sobol QMC and
+    /// raises the per-subject ESS floor by ≈`alpha` (so `imp_low_ess_threshold`
+    /// flags fewer subjects).
     pub imp_defensive_alpha: f64,
     /// How LOQ-censored observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
@@ -4088,7 +4095,7 @@ impl Default for FitOptions {
             impmap_auto: true,
             iscale_min: 0.1,
             iscale_max: 10.0,
-            imp_defensive_alpha: 0.1,
+            imp_defensive_alpha: 0.0,
             bloq_method: BloqMethod::Drop,
             npde_nsim: 0,
             npde_seed: None,
@@ -4581,6 +4588,10 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "iscale_max",
             "frem_rao_blackwell",
             "impmap_auto",
+            // Both spellings write the same field; `impmap_*` is the canonical
+            // IMPMAP form, `imp_*` is accepted so neither is wrongly flagged
+            // "unsupported" (issue #528).
+            "impmap_defensive_alpha",
             "imp_defensive_alpha",
         ],
         EstimationMethod::Bayes => &[

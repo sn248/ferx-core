@@ -2569,6 +2569,33 @@ impl CompiledModel {
         )
     }
 
+    /// True when a residual error model is defined for `cmt` *and* its sigmas
+    /// resolve in `sigma`, so a DV (assay-noised) observation can be drawn there.
+    /// False for a [`ErrorSpec::PerCmt`] spec that omits `cmt` (or whose endpoint
+    /// `sigma_idx` falls outside `sigma`), or a `Single` model whose `sigma` is
+    /// shorter than its error model needs (`< n_sigma` — e.g. a `Combined` model
+    /// carrying one σ, down to no `[error_model]` at all). `simulate_adaptive`
+    /// consults this before drawing a DV monitor so an un-modeled compartment is a
+    /// typed error rather than a fabricated σ (#391 S1.5 edge a) — and so
+    /// [`residual_variance_at`](Self::residual_variance_at), which indexes
+    /// `sigma[0..n_sigma]` for a `Single` model (and the endpoint's `sigma_idx` for
+    /// a `PerCmt` one), is never reached with a `sigma` too short to cover it
+    /// (which would otherwise **panic** for `Single` or return **NaN** for
+    /// `PerCmt`). The two branches are symmetric: each requires `sigma` to cover
+    /// every index the variance computation will read.
+    pub fn has_residual_error_for_cmt(&self, cmt: usize, sigma: &[f64]) -> bool {
+        match &self.error_spec {
+            ErrorSpec::Single(em) => sigma.len() >= em.n_sigma(),
+            ErrorSpec::PerCmt(map) => map.get(&cmt).is_some_and(|ep| {
+                // The endpoint must carry enough sigma indices for its model *and*
+                // every one must resolve in `sigma`; `variance_at` reads
+                // `sigma_idx[0..n_sigma]`, so either shortfall yields a NaN variance.
+                ep.sigma_idx.len() >= ep.error_model.n_sigma()
+                    && ep.sigma_idx.iter().all(|&i| i < sigma.len())
+            }),
+        }
+    }
+
     /// Multiplicative factor applied to the residual *variance* for a subject
     /// whose random-effect vector is `eta`, from the IIV-on-RUV term
     /// (`Y = IPRED + EPS*EXP(ETA)`). Returns `exp(2*eta[k])` when
@@ -6245,5 +6272,69 @@ mod tests {
         }];
         let v = model.residual_variance_at(0, 10.0, &[0.2, 1.0]);
         assert_relative_eq!(v, 7.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn has_residual_error_for_cmt_covers_single_and_per_cmt() {
+        let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+
+        // Single error model: defined for every cmt iff sigma covers its n_sigma.
+        model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        assert!(model.has_residual_error_for_cmt(1, &[0.1]));
+        assert!(model.has_residual_error_for_cmt(99, &[0.1]));
+        assert!(
+            !model.has_residual_error_for_cmt(1, &[]),
+            "no sigma ⇒ no error model"
+        );
+        // A Combined model needs two sigmas; one is too short — `residual_variance`
+        // would otherwise index `sigma[1]` and PANIC (symmetric to the PerCmt
+        // out-of-range guard below, never a fabricated σ).
+        model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+        assert!(model.has_residual_error_for_cmt(1, &[0.1, 0.2]));
+        assert!(
+            !model.has_residual_error_for_cmt(1, &[0.1]),
+            "Combined needs 2 sigmas; 1 is too short to draw a DV"
+        );
+
+        // PerCmt: defined only for compartments present in the map.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            2usize,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![0],
+            },
+        );
+        model.error_spec = ErrorSpec::PerCmt(map);
+        assert!(
+            model.has_residual_error_for_cmt(2, &[0.1]),
+            "cmt 2 has an endpoint"
+        );
+        assert!(
+            !model.has_residual_error_for_cmt(1, &[0.1]),
+            "cmt 1 is not in the map"
+        );
+        // An endpoint whose sigma_idx falls outside `sigma` is not drawable —
+        // `residual_variance_at` would otherwise return NaN (symmetric to the
+        // Single empty-sigma guard, never a fabricated σ).
+        assert!(
+            !model.has_residual_error_for_cmt(2, &[]),
+            "cmt 2's sigma_idx is out of range for an empty sigma"
+        );
+        // A Combined endpoint needs two sigma indices; one is too few — `variance_at`
+        // would read `sigma_idx[1]` (absent) and return NaN even though sigma is long.
+        let mut combined_map = std::collections::HashMap::new();
+        combined_map.insert(
+            2usize,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![0], // only one index for a two-sigma model
+            },
+        );
+        model.error_spec = ErrorSpec::PerCmt(combined_map);
+        assert!(
+            !model.has_residual_error_for_cmt(2, &[0.1, 0.2]),
+            "a Combined endpoint with too few sigma indices is not drawable"
+        );
     }
 }

@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Defensive-mixture importance sampling for IMP/IMPMAP — new `imp_defensive_alpha`
+  fit option** (#528). Each subject now draws an `imp_defensive_alpha` fraction of its
+  importance samples from the prior `N(0, Ω)` (default `0.1`), bounding the importance
+  weights so a weakly-identified subject — e.g. an analytical `[initial_conditions]`
+  baseline whose `V` cancels in the amplitude — can no longer hijack the weighted M-step
+  and walk θ to the bounds. Set `imp_defensive_alpha = 0` to restore the previous
+  single-proposal sampler. See [Fit options](model-file/fit-options.qmd).
 - **Experimental `simulate_adaptive()` — state-reactive ("feedback") dosing simulation**
   (#553, epic #391). A programmatic entry point that simulates regimens where each dose is
   chosen at run time by a controller reading the simulated state (TDM target attainment,
@@ -177,6 +184,11 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- A diverged IMP/IMPMAP run is no longer reported as converged (#528). A
+  collapsed-weight runaway pins θ to the parameter bounds and the final objective
+  blows up to a finite-but-enormous value (~1e35); the convergence check only
+  tested `is_finite()`, so such a run could be flagged converged and even win
+  multi-start selection. It is now treated as diverged.
 - `outer_maxiter = 0` (NONMEM `MAXEVAL=0`) now means *evaluation only* on every
   optimizer (#562). The gradient NLopt path (`nlopt_lbfgs`/`slsqp`/`mma`) passed
   `maxiter = 0` straight to NLopt's `set_maxeval`, where `0` means **no limit** —

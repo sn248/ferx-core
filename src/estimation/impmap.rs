@@ -87,6 +87,22 @@ const AUTO_SAMPLES_MAX: usize = 10_000;
 /// and collapse the ESS (the very rich-data failure mode that motivates IMPMAP).
 const IMP_PROPOSAL_COV_FLOOR: f64 = 1e-10;
 
+/// Objective ceiling beyond which an MCEM run is declared diverged rather than
+/// converged (issue #528). A collapsed-weight runaway pins θ to the parameter
+/// bounds and the final FOCE-Laplace OFV blows up to ~1e35 — a finite value
+/// that `is_finite()` would otherwise accept. Real −2logL objectives are at
+/// most in the thousands, so 1e30 is an unambiguous divergence flag with no
+/// risk of catching a legitimate fit.
+const OFV_DIVERGENCE_CAP: f64 = 1e30;
+
+/// Whether an MCEM run's final objective signals convergence rather than a
+/// runaway. A non-finite OFV is an outright divergence; a finite-but-enormous
+/// one (≥ [`OFV_DIVERGENCE_CAP`]) is the bounded blowup of a collapsed-weight
+/// run, which `is_finite()` alone would wave through (issue #528).
+fn imp_run_converged(ofv: f64) -> bool {
+    ofv.is_finite() && ofv.abs() < OFV_DIVERGENCE_CAP
+}
+
 /// How each MCEM iteration positions the per-subject importance-sampling
 /// proposal — the one piece that distinguishes IMP from IMPMAP. Everything else
 /// (M-step, sufficient statistics, averaging, ESS diagnostics, final objective)
@@ -699,6 +715,7 @@ fn run_mcem(
         // ---- E-step B: importance sampling around each mode ----
         let iscale_min = options.iscale_min;
         let iscale_max = options.iscale_max;
+        let defensive_alpha = options.imp_defensive_alpha;
         let draws: Vec<_> = population
             .subjects
             .par_iter()
@@ -818,6 +835,7 @@ fn run_mcem(
                     scratch,
                     iscale,
                     use_sobol,
+                    defensive_alpha,
                 )
             })
             .collect();
@@ -1255,10 +1273,15 @@ fn run_mcem(
         ofv,
         // IMPMAP runs a fixed iteration schedule (no parameter-stabilization
         // stopping test yet), so the only convergence signal we can honestly
-        // report is a finite final objective — a non-finite OFV means the MCEM
-        // diverged. Matches SAEM's `converged: ofv.is_finite()`; importantly it
-        // keeps a diverged run from being preferred in multi-start selection.
-        converged: ofv.is_finite(),
+        // report is a sane final objective. A non-finite OFV means the MCEM
+        // diverged; but a *runaway* (importance weights collapse → weighted
+        // M-step walks θ to the bounds) produces a finite-but-enormous OFV
+        // (~1e35), which `is_finite()` alone would wave through as converged and
+        // could then win multi-start selection (issue #528). Treat any objective
+        // beyond a generous physical ceiling as non-converged too — real −2logL
+        // values are at most thousands. Matches SAEM's `converged: ofv.is_finite()`
+        // in spirit while catching the bounded blowup.
+        converged: imp_run_converged(ofv),
         n_iterations: n_iter,
         eta_hats,
         h_matrices,
@@ -1393,6 +1416,22 @@ fn theta_sigma_weighted_mstep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imp_run_converged_rejects_runaway_and_nonfinite() {
+        // A normal objective converges.
+        assert!(imp_run_converged(-249.23));
+        assert!(imp_run_converged(0.0));
+        // Non-finite is divergence.
+        assert!(!imp_run_converged(f64::NAN));
+        assert!(!imp_run_converged(f64::INFINITY));
+        assert!(!imp_run_converged(f64::NEG_INFINITY));
+        // The bounded blowup (issue #528): finite but enormous → not converged,
+        // so a collapsed-weight runaway can't masquerade as a good fit or win
+        // multi-start selection.
+        assert!(!imp_run_converged(1e35));
+        assert!(!imp_run_converged(OFV_DIVERGENCE_CAP));
+    }
 
     #[test]
     fn flags_non_fixed_theta_without_eta() {

@@ -232,6 +232,7 @@ pub fn run_importance_sampling(
     let nu = options.imp_proposal_df;
     let seed = options.imp_seed.unwrap_or(42);
     let threshold = options.imp_low_ess_threshold;
+    let defensive_alpha = options.imp_defensive_alpha;
     let cancel = &options.cancel;
 
     if k_samples < 2 {
@@ -444,6 +445,7 @@ pub fn run_importance_sampling(
                     subj_seed,
                     scratch,
                     1.0, // iscale: no adaptive scaling for IMP EONLY
+                    defensive_alpha,
                 )
             }
         })
@@ -546,6 +548,7 @@ fn subject_is_estimate(
     seed: u64,
     scratch: &mut EventPkParams,
     iscale: f64,
+    defensive_alpha: f64,
 ) -> SubjectIsOutput {
     let mut rng = StdRng::seed_from_u64(seed);
 
@@ -562,6 +565,21 @@ fn subject_is_estimate(
             };
         }
     };
+
+    // Defensive-mixture component q_broad = N(0, Ω); see `subject_is_draws` and
+    // issue #528. `alpha == 0` reproduces the single-proposal estimator exactly.
+    let broad = if defensive_alpha > 0.0 {
+        build_broad_proposal(omega_inv, d)
+    } else {
+        None
+    };
+    let alpha = if broad.is_some() {
+        defensive_alpha
+    } else {
+        0.0
+    };
+    let ln_alpha = alpha.ln();
+    let ln_one_minus_alpha = (1.0 - alpha).ln();
 
     let normal = StandardNormal;
     let chi_sq = ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller");
@@ -588,16 +606,28 @@ fn subject_is_estimate(
     let mut diff = vec![0.0_f64; d];
 
     for _ in 0..k_samples {
-        // Draw z ~ N(0, I_d) and c ~ χ²_ν; build η = η̂ + iscale·sqrt(ν/c) · L_Σ z.
-        for zi in z.iter_mut() {
-            *zi = normal.sample(&mut rng);
-        }
-        let c: f64 = chi_sq.sample(&mut rng).max(1e-300);
-        let scale = (nu / c).sqrt() * iscale;
-        // L_Σ z via the precomputed factor.
-        proposal.apply_l_sigma(&z, &mut eta_sample, scale);
-        for (j, e) in eta_sample.iter_mut().enumerate() {
-            *e += eta_hat[j];
+        let from_broad = alpha > 0.0 && rng.random::<f64>() < alpha;
+        if from_broad {
+            // Defensive draw η ~ N(0, Ω): centred at the prior mean (0), not η̂.
+            for zi in z.iter_mut() {
+                *zi = normal.sample(&mut rng);
+            }
+            broad
+                .as_ref()
+                .expect("broad set when alpha > 0")
+                .apply_l_sigma(&z, &mut eta_sample, 1.0);
+        } else {
+            // Draw z ~ N(0, I_d) and c ~ χ²_ν; build η = η̂ + iscale·sqrt(ν/c) · L_Σ z.
+            for zi in z.iter_mut() {
+                *zi = normal.sample(&mut rng);
+            }
+            let c: f64 = chi_sq.sample(&mut rng).max(1e-300);
+            let scale = (nu / c).sqrt() * iscale;
+            // L_Σ z via the precomputed factor.
+            proposal.apply_l_sigma(&z, &mut eta_sample, scale);
+            for (j, e) in eta_sample.iter_mut().enumerate() {
+                *e += eta_hat[j];
+            }
         }
 
         let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &eta_sample, scratch);
@@ -622,7 +652,15 @@ fn subject_is_estimate(
             *d_slot = eta_sample[k] - eta_hat[k];
         }
         let mahal = proposal.mahalanobis(&diff);
-        let log_q = log_t_const - 0.5 * (nu + d as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln();
+        let log_q_narrow =
+            log_t_const - 0.5 * (nu + d as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln();
+        // Defensive mixture q = (1−α)·q_narrow + α·N(0,Ω); the broad component's
+        // log-density is the prior `log_p_eta`. Scored for every sample.
+        let log_q = if alpha > 0.0 {
+            logsumexp2(ln_one_minus_alpha + log_q_narrow, ln_alpha + log_p_eta)
+        } else {
+            log_q_narrow
+        };
 
         log_w.push(log_p_y + log_p_eta - log_q);
     }
@@ -1084,6 +1122,7 @@ pub(crate) fn subject_is_draws(
     scratch: &mut EventPkParams,
     iscale: f64,
     use_sobol: bool,
+    defensive_alpha: f64,
 ) -> SubjectDraws {
     let mvn = !nu.is_finite();
     let mut rng = StdRng::seed_from_u64(seed);
@@ -1101,6 +1140,32 @@ pub(crate) fn subject_is_draws(
             };
         }
     };
+
+    // Defensive-mixture component q_broad = N(0, Ω) (issue #528). Drawing an
+    // `alpha` fraction of samples from the prior — and scoring every sample
+    // under the full mixture density q = (1−α)·q_narrow + α·q_broad — bounds the
+    // importance weight of any sample by `p(y|η)/α` (since q ≥ α·q_broad and
+    // q_broad is the prior). That stops a weakly-identified subject (e.g. an
+    // analytical `[initial_conditions]` baseline whose V cancels in the
+    // amplitude) from contributing a single dominant sample that hijacks the
+    // importance-weighted M-step. It bounds the weights, not the raw ESS — a
+    // sharp interior likelihood spike can still keep ESS low — but it is enough
+    // to keep the population estimates identifiable. `alpha == 0` reproduces the
+    // pre-#528 single-proposal sampler exactly. Quasi-random (Sobol) draws are
+    // disabled when the mixture is active — the branch structure breaks the QMC
+    // sequence.
+    let broad = if defensive_alpha > 0.0 {
+        build_broad_proposal(omega_inv, d)
+    } else {
+        None
+    };
+    let alpha = if broad.is_some() {
+        defensive_alpha
+    } else {
+        0.0
+    };
+    let ln_alpha = alpha.ln();
+    let ln_one_minus_alpha = (1.0 - alpha).ln();
 
     let normal = StandardNormal;
     // Student-t scale mixing variable; unused for the MVN branch.
@@ -1133,33 +1198,47 @@ pub(crate) fn subject_is_draws(
     let mut z = vec![0.0_f64; d];
     let mut diff = vec![0.0_f64; d];
 
-    // Pre-generate Sobol quasi-random draws if requested and MVN.
-    let sobol_draws = if use_sobol && mvn {
+    // Pre-generate Sobol quasi-random draws if requested and MVN. Disabled when
+    // the defensive mixture is active (the per-sample component branch breaks
+    // the quasi-random sequence).
+    let sobol_draws = if use_sobol && mvn && alpha == 0.0 {
         Some(sobol_normal_draws(d, k_samples, seed))
     } else {
         None
     };
 
     for sample_idx in 0..k_samples {
-        if let Some(ref qr) = sobol_draws {
-            // Sobol quasi-random N(0,I) draws (MVN only)
-            z.copy_from_slice(&qr[sample_idx]);
-        } else {
+        let mut eta_sample = vec![0.0_f64; d];
+        let from_broad = alpha > 0.0 && rng.random::<f64>() < alpha;
+        if from_broad {
+            // Defensive draw η ~ N(0, Ω): centred at the prior mean (0), not η̂.
             for zi in z.iter_mut() {
                 *zi = normal.sample(&mut rng);
             }
-        }
-        let scale = match &chi_sq {
-            Some(c) => {
-                let cc: f64 = c.sample(&mut rng).max(1e-300);
-                (nu / cc).sqrt() * iscale
+            broad
+                .as_ref()
+                .expect("broad set when alpha > 0")
+                .apply_l_sigma(&z, &mut eta_sample, 1.0);
+        } else {
+            if let Some(ref qr) = sobol_draws {
+                // Sobol quasi-random N(0,I) draws (MVN only)
+                z.copy_from_slice(&qr[sample_idx]);
+            } else {
+                for zi in z.iter_mut() {
+                    *zi = normal.sample(&mut rng);
+                }
             }
-            None => iscale,
-        };
-        let mut eta_sample = vec![0.0_f64; d];
-        proposal.apply_l_sigma(&z, &mut eta_sample, scale);
-        for (j, e) in eta_sample.iter_mut().enumerate() {
-            *e += eta_hat[j];
+            let scale = match &chi_sq {
+                Some(c) => {
+                    let cc: f64 = c.sample(&mut rng).max(1e-300);
+                    (nu / cc).sqrt() * iscale
+                }
+                None => iscale,
+            };
+            proposal.apply_l_sigma(&z, &mut eta_sample, scale);
+            for (j, e) in eta_sample.iter_mut().enumerate() {
+                *e += eta_hat[j];
+            }
         }
 
         let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &eta_sample, scratch);
@@ -1179,10 +1258,19 @@ pub(crate) fn subject_is_draws(
             *d_slot = eta_sample[k] - eta_hat[k];
         }
         let mahal = proposal.mahalanobis(&diff);
-        let log_q = if mvn {
+        let log_q_narrow = if mvn {
             log_q_const - 0.5 * inv_iscale_sq * mahal
         } else {
             log_q_const - 0.5 * (nu + d as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln()
+        };
+        // Mixture denominator: q = (1−α)·q_narrow + α·q_broad, with the broad
+        // component's log-density equal to the Gaussian prior `log_p_eta`
+        // (q_broad = N(0,Ω)). Evaluated for every sample (balance heuristic),
+        // not just the component it was drawn from.
+        let log_q = if alpha > 0.0 {
+            logsumexp2(ln_one_minus_alpha + log_q_narrow, ln_alpha + log_p_eta)
+        } else {
+            log_q_narrow
         };
 
         log_w.push(log_p_y + log_p_eta - log_q);
@@ -1279,6 +1367,7 @@ pub(crate) fn find_optimal_iscale(
             scratch,
             scale,
             false, // pilot draws don't need Sobol
+            0.0,   // tune the narrow proposal alone; defensive mixing applies at the real draw
         );
         if draws.ess_fraction > best_ess {
             best_ess = draws.ess_fraction;
@@ -1665,6 +1754,23 @@ fn build_proposal(h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize) -> Optio
 
     // Fallback: Σ = Ω (proposal scale = prior covariance). To keep the same
     // (L L' = Σ⁻¹) interface we Cholesky-factor Ω⁻¹ instead.
+    build_broad_proposal(omega_inv, d)
+}
+
+/// Build the prior-covariance proposal `Σ = Ω` (centred at 0) used as the
+/// defensive-mixture component (issue #528). Factoring `Ω⁻¹ = L Lᵀ` gives the
+/// same `(L L' = Σ⁻¹)` interface as [`build_proposal`], so `apply_l_sigma`
+/// draws `N(0, Ω)` and `mahalanobis` scores `η' Ω⁻¹ η`. Because the conditional
+/// posterior `p(η|y) ∝ p(η)·p(y|η)` has support contained in the prior's, this
+/// component is guaranteed to cover the posterior — bounding each importance
+/// weight by `p(y|η)/α` regardless of how poorly the narrow proposal is centred
+/// or scaled, so no single sample can dominate the weighted M-step. Returns
+/// `None` only when `Ω⁻¹` is not positive-definite (then the mixture degrades to
+/// the narrow proposal alone).
+fn build_broad_proposal(omega_inv: &DMatrix<f64>, d: usize) -> Option<Proposal> {
+    if d == 0 {
+        return None;
+    }
     let omega_inv_chol = omega_inv.clone().cholesky()?;
     let l = omega_inv_chol.l();
     let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
@@ -1678,6 +1784,15 @@ fn build_proposal(h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize) -> Optio
 // ---------------------------------------------------------------------------
 // Numerical helpers
 // ---------------------------------------------------------------------------
+
+/// Stable `log(eᵃ + eᵇ)` for the two-component defensive-mixture denominator.
+fn logsumexp2(a: f64, b: f64) -> f64 {
+    let m = a.max(b);
+    if m == f64::NEG_INFINITY {
+        return f64::NEG_INFINITY;
+    }
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
 
 /// Numerically stable `log Σ exp(xᵢ)` plus the normalised weights `wᵢ`.
 fn logsumexp_with_normalised(xs: &[f64]) -> (f64, Vec<f64>) {
@@ -1934,6 +2049,52 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-12);
         let ratio = w[1] / w[0];
         assert!((ratio - 1.0_f64.exp()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn logsumexp2_matches_direct_and_handles_neginf() {
+        // Matches the naive log(eᵃ + eᵇ) in the well-scaled regime.
+        let a = -1.3_f64;
+        let b = 2.7_f64;
+        let want = (a.exp() + b.exp()).ln();
+        assert!((logsumexp2(a, b) - want).abs() < 1e-12);
+        // One degenerate component collapses to the other.
+        assert!((logsumexp2(f64::NEG_INFINITY, 5.0) - 5.0).abs() < 1e-12);
+        assert!((logsumexp2(5.0, f64::NEG_INFINITY) - 5.0).abs() < 1e-12);
+        // Both degenerate → −∞ (no NaN).
+        assert_eq!(
+            logsumexp2(f64::NEG_INFINITY, f64::NEG_INFINITY),
+            f64::NEG_INFINITY
+        );
+        // Stable for large magnitudes (no overflow).
+        let big = logsumexp2(1000.0, 1001.0);
+        assert!((big - (1001.0 + (1.0 + (-1.0_f64).exp()).ln())).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_broad_proposal_factors_prior_and_scores_quadratic_form() {
+        // Ω⁻¹ = diag(4) ⇒ Ω = diag(0.25). The broad proposal draws N(0, Ω) and
+        // scores ‖·‖²_{Ω⁻¹}; check both against closed forms (issue #528).
+        let omega_inv = DMatrix::from_diagonal(&DVector::from_vec(vec![4.0, 9.0]));
+        let p = build_broad_proposal(&omega_inv, 2).expect("PD Ω⁻¹ must factor");
+        // log|Ω⁻¹| = log(4·9) = log 36.
+        assert!((p.log_det_inv_scale - 36.0_f64.ln()).abs() < 1e-12);
+        // mahalanobis(diff) == diff' Ω⁻¹ diff = 4·d0² + 9·d1².
+        let diff = [0.5, -2.0];
+        let want = 4.0 * 0.25 + 9.0 * 4.0;
+        assert!((p.mahalanobis(&diff) - want).abs() < 1e-12);
+        // apply_l_sigma maps N(0,I) → N(0,Ω): unit input on dim 0 ⇒ sd 0.5.
+        let mut out = [0.0_f64; 2];
+        p.apply_l_sigma(&[1.0, 0.0], &mut out, 1.0);
+        assert!((out[0].abs() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn build_broad_proposal_rejects_degenerate_inputs() {
+        // d == 0 → None (no random effects).
+        assert!(build_broad_proposal(&DMatrix::zeros(0, 0), 0).is_none());
+        // Non-PD Ω⁻¹ (zero matrix) → None, so the mixture degrades to narrow-only.
+        assert!(build_broad_proposal(&DMatrix::zeros(2, 2), 2).is_none());
     }
 
     #[test]

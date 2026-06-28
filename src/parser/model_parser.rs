@@ -4026,6 +4026,15 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.iscale_max = v;
         }
+        "imp_defensive_alpha" => {
+            let v = parse_f64("imp_defensive_alpha")?;
+            if !(0.0..1.0).contains(&v) {
+                return Err(format!(
+                    "fit option `imp_defensive_alpha` must be in [0, 1), got {v}"
+                ));
+            }
+            opts.imp_defensive_alpha = v;
+        }
         "npde_nsim" => opts.npde_nsim = parse_usize("npde_nsim")?,
         "npde_seed" => opts.npde_seed = parse_u64_opt("npde_seed")?,
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
@@ -14398,6 +14407,24 @@ mod tests {
         assert_eq!(opts.saem_n_convergence, 400);
         assert!(opts.sir);
         assert_eq!(opts.sir_samples, 2000);
+    }
+
+    #[test]
+    fn test_parse_imp_defensive_alpha() {
+        // Default is the stability-on value (issue #528).
+        assert_eq!(parse_fit_options(&[]).unwrap().imp_defensive_alpha, 0.1);
+        // In-range values are accepted; 0.0 opts back into the legacy sampler.
+        let opts = parse_fit_options(&["imp_defensive_alpha = 0.25".to_string()]).unwrap();
+        assert_eq!(opts.imp_defensive_alpha, 0.25);
+        assert_eq!(
+            parse_fit_options(&["imp_defensive_alpha = 0.0".to_string()])
+                .unwrap()
+                .imp_defensive_alpha,
+            0.0
+        );
+        // Out of [0, 1) is rejected at parse time.
+        assert!(parse_fit_options(&["imp_defensive_alpha = 1.0".to_string()]).is_err());
+        assert!(parse_fit_options(&["imp_defensive_alpha = -0.1".to_string()]).is_err());
     }
 
     #[test]

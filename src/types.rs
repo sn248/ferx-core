@@ -3797,6 +3797,20 @@ pub struct FitOptions {
     /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
     /// Default 10.0.
     pub iscale_max: f64,
+    /// Defensive-mixture weight for the IMP/IMPMAP importance-sampling proposal
+    /// (issue #528). Each subject draws an `imp_defensive_alpha` fraction of its
+    /// samples from the prior `N(0, Ω)` instead of the mode-centred t-proposal,
+    /// and every sample is scored under the resulting mixture density. Because
+    /// the prior is guaranteed to cover the conditional posterior, this bounds
+    /// each importance weight by `p(y|η)/alpha`, so no single sample from a
+    /// weakly-identified subject (e.g. an analytical `[initial_conditions]`
+    /// baseline whose V cancels in the amplitude) can hijack the importance-
+    /// weighted M-step and walk θ to the bounds. (It bounds the weights, not the
+    /// raw ESS — a sharp interior likelihood spike can still keep ESS low.)
+    /// Applies to both the estimating IMP/IMPMAP phases and the eval-only IS
+    /// marginal-likelihood pass. Must be in `[0, 1)`; `0.0` reproduces the
+    /// pre-#528 single-proposal sampler exactly. Default `0.1`.
+    pub imp_defensive_alpha: f64,
     /// How LOQ-censored observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -4074,6 +4088,7 @@ impl Default for FitOptions {
             impmap_auto: true,
             iscale_min: 0.1,
             iscale_max: 10.0,
+            imp_defensive_alpha: 0.1,
             bloq_method: BloqMethod::Drop,
             npde_nsim: 0,
             npde_seed: None,
@@ -4547,6 +4562,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "iscale_max",
             "frem_rao_blackwell",
             "imp_auto",
+            "imp_defensive_alpha",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -4565,6 +4581,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "iscale_max",
             "frem_rao_blackwell",
             "impmap_auto",
+            "imp_defensive_alpha",
         ],
         EstimationMethod::Bayes => &[
             "inner_maxiter",

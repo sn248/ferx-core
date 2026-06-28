@@ -20,6 +20,11 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`[fit_options] outer_xtol` / `outer_ftol`** (#469) — expose the derivative-free
+  `bobyqa` outer optimizer's step (`xtol_rel`) and objective (`ftol_rel`) stop
+  tolerances, previously hardcoded. Lets a fit tighten or loosen BOBYQA's
+  convergence on flat/noisy objective ridges. See
+  [fit options](model-file/fit-options.qmd).
 - **Defensive-mixture importance sampling for IMP/IMPMAP — new `imp_defensive_alpha`
   fit option** (#528). Each subject can draw an `imp_defensive_alpha` fraction of its
   importance samples from the prior `N(0, Ω)`, bounding the importance weights so a
@@ -196,6 +201,15 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- **TTE frailty ω² on a nonlinear hazard parameter now converges onto the
+  NONMEM/nlmixr2 consensus** (#469). The derivative-free `bobyqa` outer optimizer
+  false-converged on the near-flat ω² ridge — its `ftol_rel` default (`1e-6`)
+  stopped it short of ferx's *own* objective minimum, so a Weibull shape-frailty
+  read ω² 0.204 against the NONMEM LAPLACIAN 0.175 / nlmixr2 0.173 consensus on
+  identical data. The TTE objective is evaluated exactly, so its `ftol_rel` is now
+  auto-tightened to `1e-8` (it lands 0.176); non-TTE fits keep `1e-6` to avoid
+  grinding on noisy ODE/FD-inner objectives. This is a pure optimizer-convergence
+  fix and does not touch the separate FOCEI-Laplace *method* bias (#440).
 - A diverged IMP/IMPMAP run is no longer reported as converged (#528). A
   collapsed-weight runaway pins θ to the parameter bounds and the final objective
   blows up to a finite-but-enormous value (~1e35); the convergence check only

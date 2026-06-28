@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Joint PK-TTE — drug-driven hazard via `[event_model] hazard = <expr>`** (#564). On an ODE
+  model, a `hazard` expression that references the PK state (e.g. `H0 * exp(BETA * (central / V))`)
+  is accumulated as a cumulative-hazard ODE compartment and estimated jointly with the PK by
+  FOCEI/SAEM, with shared random effects. Mutually exclusive with the analytic `family` hazard;
+  requires an ODE model (no IOV yet). Simulation of the ODE-accumulated hazard follows in a later
+  slice. See [Time-to-event](estimation/tte.qmd).
 - **Custom / time-varying residual-error magnitude** (#484). An `[error_model]`
   sigma argument may now be an expression of `TIME`, covariates, and thetas
   rather than a bare parameter — e.g.
@@ -77,6 +83,18 @@ section of the SDLC for the versioning policy).
   per-segment constant; `dur`'s gradient is finite-difference for now (the analytic
   boundary impulse is follow-up #530). Examples
   `examples/zero_order_absorption.ferx` and `examples/sequential_absorption.ferx`.
+- **Biphasic / parallel absorption via a pathway-fraction multiplier** (#388). An
+  `[odes]` input-rate function may now be scaled by a declared individual parameter
+  (`FR*igd(...)`), and more than one input-rate term may feed a compartment — so the
+  Freijer & Post biphasic inverse-Gaussian model is written as
+  `d/dt(central) = FR1*igd(...) + FR2*igd(...)`, splitting the dose across two
+  pathways. The multiplier must be a single declared parameter (not an expression
+  like `(1-FR)`), so a two-pathway split declares a complementary fraction
+  (`FR2 = 1 - FR1`); the fit-time check enforces `0 < FR ≤ 1` and that the fractions
+  on a compartment sum to 1. The fraction's gradient is exact (analytic `Dual2`).
+  Example `examples/biphasic_igd_absorption.ferx`. (A fraction on `zero_order(...)`,
+  i.e. the `mixed`/`parallel` zero-order family, is not yet supported — follow-up
+  #505.)
 - Support NONMEM-style `block_sigma` residual covariance across paired same-time
   multi-endpoint observations under FOCE (#546).
 - Support fixed residual-error correlations via `block_sigma` for FOCE combined-error
@@ -209,7 +227,15 @@ section of the SDLC for the versioning policy).
   combination with a steady-state dose (`W_STEADY_STATE_INIT`) or a compartment
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
+
 ### Fixed
+- Standard errors for `theta` parameters with a **negative lower bound** (estimated on
+  the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
+  mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to
+  every theta, but it only applies to log-packed (non-negative) parameters; for
+  natural-scale thetas the reported SE was multiplied by the estimate (and would flip sign
+  for a negative estimate). Such thetas now report `SE = SE(packed)` directly. Surfaced by
+  the joint PK-TTE anchor, where `BETA`'s SE matched NONMEM only after the fix.
 - **Custom residual-error magnitude (#484) now applies on every path, not just
   the FOCE/FOCEI objective** (#576). The per-observation multiplier was wired
   only into the OFV and silently dropped everywhere else, all without a guard:
@@ -324,6 +350,17 @@ section of the SDLC for the versioning policy).
   (#474)
 
 ### Performance
+- **Analytic sensitivity gradients for ODE IOV models with an `ExpressionScale`
+  `obs_scale` divisor** (#575). An `[odes]` model combining IOV (occasion `kappa`)
+  with an η-dependent `obs_scale = expr` (e.g. `obs_scale = V1`) previously routed
+  both the outer (θ/Ω/σ) and inner (EBE η) gradients to finite differences; each
+  feature was analytic alone (IOV #466, `ExpressionScale` #534) but not together.
+  The divisor's exact quotient rule is now applied as a post-walk per-occasion-group
+  jet over the stacked `(θ, η, κ)` axes, so these fits take the exact `Dual2`/`Dual1`
+  gradient — faster and Hessian-clean. Validated against finite differences of the
+  production predictor and against the equivalent Form-C readout (`y = central/V1`).
+  Still FD: the combination with LTBS or time-varying covariates, and the
+  closed-form (non-ODE) IOV path.
 - **Convergence-based early stop for steady-state equilibration** (#519). The SS=1
   pre-equilibration (both the f64 predictor and the `Dual1`/`Dual2` gradient path,
   and the closed-form/event-driven SS loops) previously always expanded a fixed

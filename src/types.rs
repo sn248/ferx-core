@@ -2175,7 +2175,14 @@ pub enum HazardSpec {
         family: HazardFamily,
         param_fn: HazardParamFn,
     },
-    // OdeAccumulated deferred to Phase 2
+    /// Drug-driven hazard accumulated as an extra ODE state (joint PK-TTE, Phase 2).
+    ///
+    /// The parser appends a synthetic cumulative-hazard compartment to the model's
+    /// ODE system (`__chz' = hazard`, initial value 0); `chz_state` is that
+    /// compartment's index in the ODE state vector. The TTE likelihood reads
+    /// `H(t)` from the integrated state `u[chz_state]` and `h(t)` from its
+    /// derivative `du[chz_state]`, rather than from a closed-form family.
+    OdeAccumulated { chz_state: usize },
 }
 
 #[cfg(feature = "survival")]
@@ -2184,6 +2191,9 @@ impl std::fmt::Debug for HazardSpec {
         match self {
             HazardSpec::Analytic { family, .. } => {
                 write!(f, "HazardSpec::Analytic({family:?})")
+            }
+            HazardSpec::OdeAccumulated { chz_state } => {
+                write!(f, "HazardSpec::OdeAccumulated(chz_state={chz_state})")
             }
         }
     }

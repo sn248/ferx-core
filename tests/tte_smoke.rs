@@ -1378,6 +1378,9 @@ mod survival_smoke {
         };
         let param_fn = match hazard {
             ferx_core::HazardSpec::Analytic { param_fn, .. } => param_fn,
+            ferx_core::HazardSpec::OdeAccumulated { .. } => {
+                panic!("expected an analytic hazard, got OdeAccumulated")
+            }
         };
 
         let covariates = std::collections::HashMap::new();
@@ -1488,6 +1491,9 @@ mod survival_smoke {
         };
         let param_fn = match hazard {
             ferx_core::HazardSpec::Analytic { param_fn, .. } => param_fn,
+            ferx_core::HazardSpec::OdeAccumulated { .. } => {
+                panic!("expected an analytic hazard, got OdeAccumulated")
+            }
         };
         let theta = [1.0, 10.0, 0.05]; // TVCL, TVV, TVBASE
 
@@ -1641,6 +1647,61 @@ mod survival_smoke {
         }
         assert_eq!(model.n_theta, 2, "n_theta should be 2 (TVALPHA, TVGAMMA)");
         assert_eq!(model.n_eta, 1, "n_eta should be 1 (ETA_GAMMA)");
+    }
+
+    /// `examples/pktte_joint.ferx` must parse: an ODE PK model with an ODE-accumulated
+    /// (joint PK-TTE) hazard on CMT=3 and the synthetic `__chz` state appended.
+    #[test]
+    fn pktte_joint_example_file_parses() {
+        let src = include_str!("../examples/pktte_joint.ferx");
+        let model = parse_model_string(src).expect("pktte_joint.ferx must parse");
+        match model.endpoints.get(&3) {
+            Some(EndpointLikelihood::Tte {
+                hazard: ferx_core::HazardSpec::OdeAccumulated { chz_state },
+            }) => {
+                // depot(0), central(1), __chz(2)
+                assert_eq!(*chz_state, 2, "accumulator appended after depot, central");
+            }
+            other => panic!("expected OdeAccumulated TTE endpoint on CMT=3, got: {other:?}"),
+        }
+        let ode = model
+            .ode_spec
+            .as_ref()
+            .expect("joint PK-TTE is an ODE model");
+        assert!(
+            ode.state_names.iter().any(|s| s == "__chz_3"),
+            "ODE system must carry the appended accumulator; got {:?}",
+            ode.state_names
+        );
+    }
+
+    /// `data/pktte_joint.csv` must load with `examples/pktte_joint.ferx` and route rows
+    /// correctly: PK rows (CMT 2) → Gaussian observations, the event (CMT 3) → obs_records.
+    #[test]
+    fn pktte_joint_example_data_loads_and_routes() {
+        use ferx_core::api::read_population_for;
+        let model = parse_model_string(include_str!("../examples/pktte_joint.ferx"))
+            .expect("pktte_joint.ferx must parse");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/pktte_joint.csv");
+        let (pop, _) = read_population_for(&model, &None, path, None, None, None)
+            .expect("pktte_joint.csv must load");
+        assert_eq!(pop.subjects.len(), 6, "6 subjects");
+        for s in &pop.subjects {
+            assert_eq!(
+                s.observations.len(),
+                2,
+                "subject {} has 2 PK obs (CMT 2)",
+                s.id
+            );
+            assert_eq!(
+                s.obs_records.len(),
+                1,
+                "subject {} has 1 TTE record (CMT 3)",
+                s.id
+            );
+            let ObsRecord::Event { cmt, .. } = &s.obs_records[0];
+            assert_eq!(*cmt, 3, "the TTE record is routed to CMT 3");
+        }
     }
 
     // ── Phase 1 follow-up: Weibull / Gompertz fit smoke tests ─────────────────
@@ -1951,5 +2012,378 @@ mod survival_smoke {
             ),
             Err(e) => panic!("IOV+TTE FOCEI fit must not error: {e}"),
         }
+    }
+
+    // ── Joint PK-TTE: ODE-accumulated hazard (Phase 2, Slice 2.1 — #564) ───────
+
+    /// Oral 1-cpt PK + a drug-driven hazard on CMT=2. The hazard references the
+    /// `central` ODE state, so it must be ODE-accumulated, not analytic.
+    const JOINT_PKTTE_MODEL: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+
+  omega ETA_CL ~ 0.09
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+
+    #[test]
+    fn joint_pktte_hazard_injects_chz_state_and_ode_endpoint() {
+        let model = parse_model_string(JOINT_PKTTE_MODEL)
+            .expect("joint PK-TTE model with [event_model] hazard= must parse");
+
+        // CMT=2 is an ODE-accumulated TTE endpoint pointing at the appended
+        // accumulator. PK states depot=0, central=1, so __chz lands at index 2.
+        let ep = model
+            .endpoints
+            .get(&2)
+            .expect("CMT=2 must be a TTE endpoint");
+        let EndpointLikelihood::Tte { hazard } = ep else {
+            panic!("expected Tte endpoint, got {ep:?}");
+        };
+        match hazard {
+            ferx_core::HazardSpec::OdeAccumulated { chz_state } => {
+                assert_eq!(
+                    *chz_state, 2,
+                    "accumulator state index follows depot(0), central(1)"
+                );
+            }
+            other => panic!("expected OdeAccumulated hazard, got {other:?}"),
+        }
+        // Debug formatting names the variant (covers the HazardSpec Debug impl).
+        assert!(
+            format!("{hazard:?}").contains("OdeAccumulated"),
+            "Debug should name the variant; got {hazard:?}"
+        );
+
+        // The ODE system gained the synthetic accumulator as its trailing state.
+        let ode = model
+            .ode_spec
+            .as_ref()
+            .expect("joint PK-TTE is an ODE model");
+        assert_eq!(
+            ode.state_names,
+            vec![
+                "depot".to_string(),
+                "central".to_string(),
+                "__chz_2".to_string()
+            ],
+            "parser must append __chz_<cmt> as the trailing ODE state"
+        );
+    }
+
+    #[test]
+    fn hazard_without_ode_model_errors() {
+        // `hazard =` on an analytical (non-ODE) model has no accumulator to read.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+
+  omega ETA_CL ~ 0.09
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  H0 = TVH0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[event_model]
+  cmt    = 2
+  hazard = H0
+
+[fit_options]
+  method = focei
+";
+        let err = parse_model_string(src).expect_err("hazard= on a non-ODE model must error");
+        assert!(
+            err.contains("ODE model"),
+            "error should point at needing an ODE model; got: {err}"
+        );
+    }
+
+    #[test]
+    fn hazard_with_family_errors() {
+        // `hazard =` (ODE-accumulated) and `family =` (analytic) are mutually exclusive.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+
+  omega ETA_CL ~ 0.09
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  H0 = TVH0
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = H0
+  hazard = H0
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+";
+        let err = parse_model_string(src).expect_err("hazard= plus family= must error");
+        assert!(
+            err.contains("mixes"),
+            "error should flag the hazard/family conflict; got: {err}"
+        );
+    }
+
+    #[test]
+    fn hazard_without_cmt_errors() {
+        // `hazard =` with no `cmt`: the pre-scan can't key the accumulator to an endpoint.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  H0 = TVH0
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[event_model]
+  hazard = H0
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+        let err = parse_model_string(src).expect_err("hazard= without cmt must error");
+        assert!(err.contains("cmt"), "error should ask for cmt; got: {err}");
+    }
+
+    #[test]
+    fn hazard_with_iov_errors() {
+        // ODE-accumulated hazard + IOV (kappa) is rejected: the PK-driven hazard would
+        // need per-occasion η threaded into the ODE solve (not supported in Slice 2.1).
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+        let err = parse_model_string(src).expect_err("hazard= with IOV must error");
+        assert!(
+            err.contains("IOV"),
+            "error should flag the IOV limitation; got: {err}"
+        );
+    }
+
+    #[test]
+    fn hazard_state_name_collision_errors() {
+        // A user ODE state literally named `__chz_3` collides with the synthetic
+        // accumulator the parser appends for the CMT=3 hazard — must error, not silently
+        // corrupt the user's state via a duplicate name.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  H0 = TVH0
+[structural_model]
+  ode(obs_cmt=central, states=[central, __chz_3])
+[odes]
+  d/dt(central) = -(CL/V) * central
+  d/dt(__chz_3) = 0
+[event_model]
+  cmt    = 3
+  hazard = H0
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+        let err = parse_model_string(src).expect_err("__chz_3 state-name collision must error");
+        assert!(
+            err.contains("reserved") || err.contains("collides"),
+            "error should flag the reserved-name collision; got: {err}"
+        );
+    }
+
+    // One joint PK-TTE subject: oral dose + 2 PK obs + one (window-censored) TTE record.
+    fn joint_pktte_pop() -> Population {
+        let mut s = common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![2.0, 8.0],
+            vec![30.0, 20.0],
+            vec![1, 1],
+        );
+        s.obs_records = vec![ObsRecord::Event {
+            time: 24.0,
+            event_type: EventType::RightCensored,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        Population {
+            covariate_names: vec![],
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+            subjects: vec![s],
+        }
+    }
+
+    #[test]
+    fn predict_survival_joint_pktte_reads_ode_hazard() {
+        use ferx_core::predict_survival;
+        let model = parse_model_string(JOINT_PKTTE_MODEL).expect("joint PK-TTE model must parse");
+        let pop = joint_pktte_pop();
+        let grid = [0.0, 4.0, 8.0, 16.0, 24.0];
+        let preds = predict_survival(&model, &pop, &model.default_params, &grid);
+
+        assert_eq!(
+            preds.len(),
+            grid.len(),
+            "one row per grid point (single TTE CMT)"
+        );
+        assert!(
+            preds[0].cum_hazard.abs() < 1e-9,
+            "H(0)=0; got {}",
+            preds[0].cum_hazard
+        );
+        assert!(
+            (preds[0].survival - 1.0).abs() < 1e-9,
+            "S(0)=1; got {}",
+            preds[0].survival
+        );
+        for w in preds.windows(2) {
+            assert!(
+                w[1].cum_hazard >= w[0].cum_hazard - 1e-9,
+                "cumulative hazard must be non-decreasing"
+            );
+            assert!(
+                w[1].survival <= w[0].survival + 1e-9,
+                "survival must be non-increasing"
+            );
+            assert!(
+                w[1].hazard.is_finite() && w[1].hazard >= 0.0,
+                "instantaneous hazard must be finite ≥ 0; got {}",
+                w[1].hazard
+            );
+        }
+        // mean_survival is intentionally NaN for ODE hazards (∫₀^∞ S is a follow-up).
+        assert!(
+            preds[0].mean_survival.is_nan(),
+            "ODE mean_survival is NaN by design; got {}",
+            preds[0].mean_survival
+        );
+    }
+
+    #[test]
+    fn simulate_with_options_rejects_ode_hazard() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(JOINT_PKTTE_MODEL).expect("joint PK-TTE model must parse");
+        let pop = joint_pktte_pop();
+        let err = simulate_with_options(
+            &model,
+            &pop,
+            &model.default_params,
+            1,
+            &SimulateOptions::default(),
+        )
+        .expect_err("simulate must reject an ODE-accumulated hazard");
+        assert!(
+            err.contains("ODE-accumulated") && err.contains("Slice 2.2"),
+            "error should explain the ODE-hazard limitation; got: {err}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ODE-accumulated")]
+    fn simulate_seed_ode_hazard_panics() {
+        // The Vec-returning convenience entry can't signal an Err, so it hits the
+        // simulate_tte backstop panic rather than silently emitting no TTE rows.
+        let model = parse_model_string(JOINT_PKTTE_MODEL).expect("joint PK-TTE model must parse");
+        let pop = joint_pktte_pop();
+        let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 7);
     }
 }

@@ -1163,6 +1163,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         Vec::new()
     };
 
+    // Joint PK-TTE (Slice 2.1, #564): cmt → index of the synthetic cumulative-hazard
+    // ODE state appended for each ODE-driven `[event_model] hazard = ...`. Stays empty
+    // for every model without an ODE-accumulated hazard.
+    #[cfg(feature = "survival")]
+    let mut chz_state_map: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+
     let (
         pk_model,
         pk_param_map,
@@ -1172,12 +1179,37 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         diffusion_theta_fixed,
         diffusion_state_indices,
     ) = if is_ode {
-        let (state_names, obs_cmt_name) = parse_ode_structural(struct_lines)?;
-        let ode_lines = blocks
+        #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+        let (mut state_names, obs_cmt_name) = parse_ode_structural(struct_lines)?;
+        // Owned copy of the [odes] derivative lines so joint PK-TTE can append a
+        // cumulative-hazard accumulator without mutating the shared block map.
+        #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+        let mut ode_lines: Vec<String> = blocks
             .get("odes")
-            .ok_or("ODE model requires [odes] block")?;
+            .ok_or("ODE model requires [odes] block")?
+            .clone();
+        // For each ODE-driven `[event_model] hazard = <expr>`, append a synthetic
+        // accumulator state `__chz_<cmt>` with `d/dt(__chz_<cmt>) = <expr>`. It then
+        // compiles in the [odes] RHS namespace (states + individual parameters) like
+        // any derivative; the TTE likelihood reads H(t)/h(t) from this state, and the
+        // endpoint records its index via `chz_state_map` (#564).
+        #[cfg(feature = "survival")]
+        for (cmt, hazard_expr) in prescan_ode_hazards(&extracted)? {
+            let chz_idx = state_names.len();
+            let state = format!("__chz_{cmt}");
+            if state_names.contains(&state) {
+                return Err(format!(
+                    "[odes]: state `{state}` collides with the cumulative-hazard accumulator \
+                     the parser appends for the [event_model] CMT={cmt} hazard (joint PK-TTE) \
+                     — rename the ODE state (`__chz_*` names are reserved)."
+                ));
+            }
+            ode_lines.push(format!("d/dt({state}) = {hazard_expr}"));
+            state_names.push(state);
+            chz_state_map.insert(cmt, chz_idx);
+        }
         let mut ode_spec = build_ode_spec(
-            ode_lines,
+            &ode_lines,
             &state_names,
             obs_cmt_name.as_deref(),
             &indiv_var_names,
@@ -2220,6 +2252,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &indiv_stmts,
                 &model.kappa_names,
                 &model.error_spec,
+                &chz_state_map,
             )?;
             if model.endpoints.contains_key(&cmt) {
                 return Err(format!("[event_model]: CMT={cmt} declared more than once"));
@@ -3227,6 +3260,7 @@ fn parse_event_model_block(
     indiv_stmts: &[Statement],
     kappa_names: &[String],
     error_spec: &ErrorSpec,
+    chz_state_map: &std::collections::HashMap<usize, usize>,
 ) -> Result<
     (
         usize,
@@ -3263,6 +3297,10 @@ fn parse_event_model_block(
     let mut gamma_expr: Option<Expression> = None;
     // Any family: Σ(β·covariate) added on the log-hazard scale.
     let mut loghr_expr: Option<Expression> = None;
+    // ODE-accumulated hazard (joint PK-TTE): `hazard = <expr>` is injected as a
+    // cumulative-hazard ODE derivative before the ODE spec is built; here we only
+    // record its presence and route to the OdeAccumulated endpoint below.
+    let mut hazard_present = false;
 
     for line in lines {
         let trimmed = line.trim();
@@ -3311,19 +3349,24 @@ fn parse_event_model_block(
             "loghr" => {
                 loghr_expr = Some(parse_scalar_expression(value, ctx)?);
             }
+            "hazard" => {
+                // The expression itself is injected as the `d/dt(__chz_<cmt>)` ODE
+                // derivative by the parser pre-scan, so it is not compiled here.
+                hazard_present = true;
+            }
             other => {
                 return Err(format!(
                     "[event_model]: unknown key `{other}` \
-                     — valid keys: cmt, family, scale, rate, shape, alpha, gamma, loghr"
+                     — valid keys: cmt, family, scale, rate, shape, alpha, gamma, loghr, hazard"
                 ));
             }
         }
     }
 
     let cmt = cmt_opt.ok_or("[event_model]: missing required key `cmt`")?;
-    let family = family_opt.ok_or("[event_model]: missing required key `family`")?;
 
-    // Guard: same CMT can't be both Gaussian and TTE.
+    // Guard: same CMT can't be both Gaussian and TTE (applies to the analytic and
+    // the ODE-accumulated `hazard =` endpoint paths alike).
     match error_spec {
         ErrorSpec::PerCmt(cmt_map) => {
             if cmt_map.contains_key(&cmt) {
@@ -3345,6 +3388,57 @@ fn parse_event_model_block(
             // parse-time validation.
         }
     }
+
+    // ODE-accumulated hazard path (joint PK-TTE, Slice 2.1): `hazard = <expr>` was
+    // injected as a cumulative-hazard ODE derivative (`d/dt(__chz_<cmt>)`); the
+    // endpoint only records that accumulator's state index. Mutually exclusive with
+    // the analytic closed-form `family` keys.
+    if hazard_present {
+        if family_opt.is_some()
+            || scale_expr.is_some()
+            || shape_expr.is_some()
+            || alpha_expr.is_some()
+            || gamma_expr.is_some()
+            || loghr_expr.is_some()
+        {
+            return Err(format!(
+                "[event_model]: CMT={cmt} mixes `hazard = ...` (ODE-accumulated, joint \
+                 PK-TTE) with analytic keys (family/scale/rate/shape/alpha/gamma/loghr). \
+                 Use either a closed-form `family` or an ODE `hazard` expression, not both \
+                 — put drug and covariate effects directly in the hazard expression."
+            ));
+        }
+        if !kappa_names.is_empty() {
+            return Err(format!(
+                "[event_model]: CMT={cmt} declares an ODE-accumulated `hazard = ...` (joint \
+                 PK-TTE) in a model with inter-occasion variability (IOV / kappa). The \
+                 PK-driven hazard needs per-occasion random effects threaded into the ODE \
+                 solve, which is not yet supported (Slice 2.1) — remove IOV, or use an \
+                 analytic `family` hazard instead."
+            ));
+        }
+        let chz_state = *chz_state_map.get(&cmt).ok_or_else(|| {
+            format!(
+                "[event_model]: CMT={cmt} declares `hazard = ...` but the model has no ODE \
+                 system. ODE-accumulated hazard (joint PK-TTE) requires an ODE model — use \
+                 `ode(...)` in [structural_model] and define [odes]."
+            )
+        })?;
+        // The hazard compiles as the injected ODE derivative, so its θ/η/covariate
+        // dependencies flow through [individual_parameters] / [odes] (already covered by
+        // check_unused_parameters and the dead-parameter census) — none to report here.
+        return Ok((
+            cmt,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { chz_state },
+            },
+            Vec::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        ));
+    }
+
+    let family = family_opt.ok_or("[event_model]: missing required key `family`")?;
 
     // Validate family-specific keys: reject keys that do not belong to the chosen family.
     // Accepting and silently dropping them would mislead users into thinking they had an effect.
@@ -3579,6 +3673,55 @@ fn parse_event_model_block(
         event_model_thetas,
         event_model_etas,
     ))
+}
+
+/// Pre-scan `[event_model]` blocks for ODE-accumulated hazards (joint PK-TTE, #564).
+///
+/// Returns `(cmt, hazard_expr_text)` for every block that declares `hazard = <expr>`.
+/// Runs *before* the ODE spec is built so each hazard can be appended to the ODE
+/// system as a cumulative-hazard accumulator state (`d/dt(__chz_<cmt>) = <expr>`),
+/// which then compiles in the `[odes]` RHS namespace. Only the `cmt` and `hazard`
+/// keys are read here; full key/family validation and the `OdeAccumulated` endpoint
+/// are produced later by [`parse_event_model_block`] (malformed lines are reported
+/// there, so they are skipped rather than errored on in this lightweight pass).
+#[cfg(feature = "survival")]
+fn prescan_ode_hazards(extracted: &ExtractedBlocks) -> Result<Vec<(usize, String)>, String> {
+    let mut event_blocks: Vec<&Vec<String>> = Vec::new();
+    if let Some(lines) = extracted.unnamed.get("event_model") {
+        event_blocks.push(lines);
+    }
+    if let Some(named_map) = extracted.named.get("event_model") {
+        for lines in named_map.values() {
+            event_blocks.push(lines);
+        }
+    }
+
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for lines in event_blocks {
+        let mut cmt: Option<usize> = None;
+        let mut hazard: Option<String> = None;
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed.splitn(2, '=').map(|s| s.trim()).collect();
+            if parts.len() != 2 {
+                continue; // malformed `key = value` lines are reported downstream
+            }
+            match parts[0] {
+                "cmt" => cmt = parts[1].parse::<usize>().ok(),
+                "hazard" => hazard = Some(parts[1].to_string()),
+                _ => {}
+            }
+        }
+        if let Some(expr) = hazard {
+            let cmt = cmt
+                .ok_or("[event_model]: `hazard` requires `cmt` (the TTE endpoint's compartment)")?;
+            out.push((cmt, expr));
+        }
+    }
+    Ok(out)
 }
 
 // ── [simulation] block parser ───────────────────────────────────────────────
@@ -5628,28 +5771,121 @@ fn diffeq_state(line: &str) -> Option<String> {
     Some(rest[..close].to_string())
 }
 
-/// True if the call spanning `[start, end)` in `line` (ASCII) is **not** a bare,
-/// positively-signed, top-level additive term — i.e. it is scaled (`*` `/` `^`),
-/// negated (a leading `-`), or grouped (`(` immediately before / `)` immediately
-/// after, which can hide an outer scale such as `(transit(...))/V`). The
-/// input-rate forcing is always injected as `+R_in`, unscaled, so only a bare
-/// `+ transit(...)` term is faithful; any other context would silently drop the
-/// sign or scale. Surrounding spaces are skipped; the faithful preceding chars
-/// are `=` (RHS start) and `+`, the faithful following chars are end-of-line,
-/// `+`, and `-` (each starts a new additive term).
-fn call_is_scaled_or_signed(line: &str, start: usize, end: usize) -> bool {
+/// Inspect the operator context around an input-rate call spanning `[start, end)`
+/// in `line` (ASCII) and resolve an optional **pathway-fraction multiplier**
+/// (#388). The forcing is injected additively as `+frac·R_in`, so the only
+/// faithful contexts are a bare `+ fn(...)` term or a single
+/// declared-individual-parameter multiplier `FR * fn(...)`. Returns:
+///
+/// - `Ok((None, start))` — a bare, positively-signed additive term (no fraction);
+///   the rewrite-to-`0` starts at `start`.
+/// - `Ok((Some(slot), prefix_start))` — `FR*fn(...)` where `FR` is a declared
+///   individual parameter standing **alone** as the leading factor; `slot` is its
+///   parameter slot and `prefix_start` is where `FR` begins, so the rewrite-to-`0`
+///   swallows the `FR*` prefix too.
+/// - `Err(msg)` — any other scaling (`* / ^`), a leading `-`, grouping (`(`
+///   before / `)` after, e.g. `(fn(...))/V`), or a multiplier that is not a single
+///   declared parameter (`(1-FR)*`, `2.5*`, `K*FR*`) — each silently drops the
+///   sign/scale, so it is rejected loudly.
+///
+/// Requiring a bare declared parameter (not an arbitrary `(1-FR)` expression)
+/// keeps the fraction bound to one slot; a two-pathway split is two terms whose
+/// declared fractions sum to 1 (validated at fit-init).
+fn parse_input_rate_prefix(
+    line: &str,
+    start: usize,
+    end: usize,
+    fname: &str,
+    indiv_param_names: &[String],
+    indiv_param_slots: &[usize],
+) -> Result<(Option<usize>, usize), String> {
+    let scaled_err = || {
+        format!(
+            "[odes]: {fname}(...) must be a bare additive input rate (`+ {fname}(...)`) or a \
+             single declared-parameter pathway fraction (`FR*{fname}(...)`) — it cannot be \
+             otherwise scaled (`* / ^`), negated (a leading `-`), or wrapped in parentheses \
+             (e.g. `-{fname}(...)`, `({fname}(...))/V`), since these silently drop the sign/scale."
+        )
+    };
     let b = line.as_bytes();
-    let mut i = start;
-    while i > 0 && b[i - 1] == b' ' {
-        i -= 1;
-    }
-    let before_bad = i > 0 && matches!(b[i - 1], b'*' | b'/' | b'^' | b'-' | b'(');
+    // Trailing context: a `* / ^` or a closing `)` right after the call hides an
+    // outer scale/group (e.g. `fn(...)/V`, `(fn(...))*K`). Always rejected.
     let mut j = end;
     while j < b.len() && b[j] == b' ' {
         j += 1;
     }
-    let after_bad = j < b.len() && matches!(b[j], b'*' | b'/' | b'^' | b')');
-    before_bad || after_bad
+    if j < b.len() && matches!(b[j], b'*' | b'/' | b'^' | b')') {
+        return Err(scaled_err());
+    }
+    // Leading context: first non-space char to the left of the call.
+    let mut i = start;
+    while i > 0 && b[i - 1] == b' ' {
+        i -= 1;
+    }
+    if i == 0 {
+        return Ok((None, start)); // start of line (defensive; real RHS lines begin `d/dt(X)=`)
+    }
+    match b[i - 1] {
+        // Bare additive term: `= fn(...)` (RHS start) or `+ fn(...)`.
+        b'+' | b'=' => Ok((None, start)),
+        // A multiplier: it must be a single declared individual parameter `FR *`.
+        b'*' => {
+            let mut k = i - 1; // index of the `*`
+            while k > 0 && b[k - 1] == b' ' {
+                k -= 1;
+            }
+            // Identifier token immediately left of the `*`.
+            let mut id_start = k;
+            while id_start > 0
+                && (b[id_start - 1].is_ascii_alphanumeric() || b[id_start - 1] == b'_')
+            {
+                id_start -= 1;
+            }
+            if id_start == k {
+                return Err(scaled_err()); // no identifier (e.g. `)*fn`, numeric `5*fn`)
+            }
+            // The identifier must stand alone as the leading factor: the char before
+            // it (skipping spaces) is `+`/`=`/start. Anything else is a compound
+            // expression (`(1-FR)*`, `K*FR*`, `1-FR*`) or a negated/subtracted term
+            // (`- FR*`) — the sign/scale would be silently dropped, so this is the
+            // `scaled_err` case, *not* a "not a declared parameter" one (the name may
+            // well be declared; the problem is its surrounding context).
+            let mut p = id_start;
+            while p > 0 && b[p - 1] == b' ' {
+                p -= 1;
+            }
+            let name = &line[id_start..k];
+            // A leading digit means the "multiplier" is a numeric literal (`5*igd(...)`,
+            // or the `5` tail of `2.5*igd(...)`), not a parameter identifier — it drops
+            // a scale, so report the sign/scale rejection rather than the misleading
+            // "`5` is not a declared parameter".
+            if name.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+                return Err(scaled_err());
+            }
+            if p != 0 && !matches!(b[p - 1], b'+' | b'=') {
+                return Err(scaled_err());
+            }
+            let slot = indiv_param_names
+                .iter()
+                .position(|q| q == name)
+                .map(|idx| indiv_param_slots[idx])
+                .ok_or_else(|| frac_not_param_err(fname, name))?;
+            Ok((Some(slot), id_start))
+        }
+        // Scaled (`/ ^`), negated (`-`), or grouped (`(`): all drop the sign/scale.
+        _ => Err(scaled_err()),
+    }
+}
+
+/// Error for a pathway-fraction multiplier that is not a single declared
+/// individual parameter (#388) — e.g. `(1-FR)*fn(...)` or `2.5*fn(...)`.
+fn frac_not_param_err(fname: &str, name: &str) -> String {
+    format!(
+        "[odes]: the pathway-fraction multiplier `{name}` on `{fname}(...)` must be a single \
+         declared individual parameter (e.g. `FR*{fname}(...)` with `FR` in \
+         [individual_parameters]). An expression like `(1-FR)` is not allowed — declare a \
+         complementary parameter whose fractions sum to 1."
+    )
 }
 
 /// Split a string on top-level commas (commas outside nested parentheses).
@@ -5702,17 +5938,20 @@ const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] =
 ];
 
 /// Extract built-in absorption input-rate calls ([`INPUT_RATE_FNS`] —
-/// `transit(...)`, `igd(...)`) from the `[odes]` RHS lines. For each
-/// `d/dt(STATE) = … fn(arg=P, …) …`, records an [`InputRateForcing`] (`cmt` ←
-/// STATE index; named args resolved to individual-parameter slots, in the
-/// function's declared order) and rewrites the call to `0` so the remaining RHS
-/// parses as a normal expression. Returns the cleaned lines and the forcings.
+/// `transit(...)`, `igd(...)`, `weibull(...)`, `zero_order(...)`) from the `[odes]`
+/// RHS lines. For each `d/dt(STATE) = … [FR*]fn(arg=P, …) …`, records an
+/// [`InputRateForcing`] (`cmt` ← STATE index; named args resolved to
+/// individual-parameter slots in declared order; an optional leading declared
+/// parameter `FR` resolved to `frac_slot`) and rewrites the `[FR*]fn(...)` span to
+/// `0` so the remaining RHS parses as a normal expression. A line may carry **more
+/// than one** input-rate term (parallel / biphasic absorption, #388). Returns the
+/// cleaned lines and the forcings.
 ///
-/// Validation (negative-tested): the call must be the input rate of a top-level
-/// `d/dt(...)` equation; its args are exactly the function's declared names, each
-/// a declared individual parameter; a scaled call (`FR*fn(...)`) and more than
-/// one input-rate call per equation are rejected (parallel/biphasic comes with
-/// later models).
+/// Validation (negative-tested): an input-rate call may appear only in a top-level
+/// `d/dt(...)` equation; its args are exactly the function's declared names, each a
+/// declared individual parameter; a non-fraction scaling / sign / grouping is
+/// rejected ([`parse_input_rate_prefix`]); a fraction multiplier must be a single
+/// declared parameter; and a fraction on `zero_order(...)` is rejected pending #505.
 fn extract_input_rate_terms(
     rhs_lines: &[String],
     state_names: &[String],
@@ -5742,20 +5981,21 @@ fn extract_input_rate_terms(
     let mut forcings = Vec::new();
     let mut cleaned = Vec::with_capacity(rhs_lines.len());
     for raw in rhs_lines {
-        // Which built-in (if any) does this line call, and where? Table order
-        // breaks ties when a line names more than one (rejected just below).
-        let Some((fname, kind, arg_names, start)) = INPUT_RATE_FNS
+        // Lines with no built-in input-rate call pass through untouched.
+        if !INPUT_RATE_FNS
             .iter()
-            .find_map(|&(f, k, a)| find_word_call(raw, f).map(|s| (f, k, a, s)))
-        else {
+            .any(|&(f, _, _)| find_word_call(raw, f).is_some())
+        {
             cleaned.push(raw.clone());
             continue;
-        };
+        }
 
+        // An input-rate call may appear only in a `d/dt(STATE)` equation; the state
+        // (hence compartment) is shared by every input-rate term on the line.
         let state = diffeq_state(raw).ok_or_else(|| {
             format!(
-                "[odes]: {fname}(...) may only be the input rate of a `d/dt(...)` equation — \
-                 found it in `{}`",
+                "[odes]: an absorption input-rate function may only be the input rate of a \
+                 `d/dt(...)` equation — found one in `{}`",
                 raw.trim()
             )
         })?;
@@ -5764,72 +6004,93 @@ fn extract_input_rate_terms(
             .position(|s| s == &state)
             .ok_or_else(|| format!("[odes]: d/dt({state}): undeclared state"))?;
 
-        let open = start + fname.len();
-        let (inner, end) = balanced_parens(raw, open).ok_or_else(|| {
-            format!(
-                "[odes]: {fname}(...): unbalanced parentheses in `{}`",
-                raw.trim()
-            )
-        })?;
-        if call_is_scaled_or_signed(raw, start, end) {
-            return Err(format!(
-                "[odes]: {fname}(...) must be a standalone, positively-signed additive input \
-                 rate — it cannot be scaled (`* / ^`), negated (a leading `-`), or wrapped in \
-                 parentheses (e.g. `FR*{fname}(...)`, `-{fname}(...)`, `({fname}(...))/V`), \
-                 since these silently drop the sign/scale. Write it as a bare `+ {fname}(...)` \
-                 term."
-            ));
-        }
+        // Extract every input-rate call on the line — parallel / biphasic absorption
+        // splits the dose across ≥2 terms (#388) — rewriting each (with its optional
+        // `FR*` fraction prefix) to `0` so the remaining RHS parses as a normal
+        // expression. `work` shrinks each pass; indices below are into `work`.
+        let mut work = raw.clone();
+        loop {
+            let Some((fname, kind, arg_names, start)) = INPUT_RATE_FNS
+                .iter()
+                .find_map(|&(f, k, a)| find_word_call(&work, f).map(|s| (f, k, a, s)))
+            else {
+                break;
+            };
 
-        // Resolve each named arg into its declared slot position.
-        let mut slots: Vec<Option<usize>> = vec![None; arg_names.len()];
-        for part in split_args_on_commas(&inner) {
-            let (name, val) = part.split_once('=').ok_or_else(|| {
+            let open = start + fname.len();
+            let (inner, end) = balanced_parens(&work, open).ok_or_else(|| {
                 format!(
-                    "[odes]: {fname}(...) arguments must be `name=parameter`, got `{}`",
-                    part.trim()
+                    "[odes]: {fname}(...): unbalanced parentheses in `{}`",
+                    raw.trim()
                 )
             })?;
-            let (name, val) = (name.trim(), val.trim());
-            match arg_names.iter().position(|a| *a == name) {
-                Some(i) => slots[i] = Some(resolve_slot(fname, val, name)?),
-                None => {
-                    return Err(format!(
-                        "[odes]: {fname}(...) has no argument `{name}` (expected {})",
-                        arg_list(arg_names)
-                    ))
+
+            // Operator context: resolve an optional `FR*` pathway fraction and reject
+            // any other scaling / sign / grouping. `rewrite_start` ≤ `start` swallows
+            // the `FR*` prefix (if any) when the term is replaced by `0`.
+            let (frac_slot, rewrite_start) = parse_input_rate_prefix(
+                &work,
+                start,
+                end,
+                fname,
+                indiv_param_names,
+                indiv_param_slots,
+            )?;
+
+            // The zero-order family is delivered through a separate per-segment channel
+            // (`active_zero_order_inputs`) that does not yet carry the fraction scale, so
+            // a `FR*zero_order(...)` term (the `mixed` model) lands with #505. Reject it
+            // loudly rather than silently dropping the fraction.
+            if frac_slot.is_some() && kind == crate::pk::absorption::InputRateKind::ZeroOrder {
+                return Err(
+                    "[odes]: a pathway fraction on `zero_order(...)` (`FR*zero_order(...)`) is \
+                     not yet supported — fractional / mixed zero-order absorption lands with \
+                     #505. Use a bare `+ zero_order(...)` term for now."
+                        .to_string(),
+                );
+            }
+
+            // Resolve each named arg into its declared slot position.
+            let mut slots: Vec<Option<usize>> = vec![None; arg_names.len()];
+            for part in split_args_on_commas(&inner) {
+                let (name, val) = part.split_once('=').ok_or_else(|| {
+                    format!(
+                        "[odes]: {fname}(...) arguments must be `name=parameter`, got `{}`",
+                        part.trim()
+                    )
+                })?;
+                let (name, val) = (name.trim(), val.trim());
+                match arg_names.iter().position(|a| *a == name) {
+                    Some(i) => slots[i] = Some(resolve_slot(fname, val, name)?),
+                    None => {
+                        return Err(format!(
+                            "[odes]: {fname}(...) has no argument `{name}` (expected {})",
+                            arg_list(arg_names)
+                        ))
+                    }
                 }
             }
-        }
-        let mut arg_slots = Vec::with_capacity(arg_names.len());
-        for (i, slot) in slots.into_iter().enumerate() {
-            arg_slots.push(slot.ok_or_else(|| {
-                format!(
-                    "[odes]: {fname}(...) missing required argument `{}`",
-                    arg_names[i]
-                )
-            })?);
-        }
+            let mut arg_slots = Vec::with_capacity(arg_names.len());
+            for (i, slot) in slots.into_iter().enumerate() {
+                arg_slots.push(slot.ok_or_else(|| {
+                    format!(
+                        "[odes]: {fname}(...) missing required argument `{}`",
+                        arg_names[i]
+                    )
+                })?);
+            }
 
-        forcings.push(InputRateForcing {
-            cmt,
-            kind,
-            arg_slots,
-        });
+            forcings.push(InputRateForcing {
+                cmt,
+                kind,
+                arg_slots,
+                frac_slot,
+            });
 
-        let new_line = format!("{}0{}", &raw[..start], &raw[end..]);
-        if INPUT_RATE_FNS
-            .iter()
-            .any(|&(f, _, _)| find_word_call(&new_line, f).is_some())
-        {
-            return Err(
-                "[odes]: at most one absorption input-rate function per d/dt equation — \
-                 parallel/biphasic absorption (two input-rate terms on one compartment) is \
-                 not yet supported"
-                    .to_string(),
-            );
+            // Rewrite the `[FR*]fn(...)` span to `0`, then loop to find the next term.
+            work = format!("{}0{}", &work[..rewrite_start], &work[end..]);
         }
-        cleaned.push(new_line);
+        cleaned.push(work);
     }
     Ok((cleaned, forcings))
 }
@@ -12639,34 +12900,38 @@ mod tests {
         assert!(go("x = transit(n=NTR, mtt=MTT)")
             .unwrap_err()
             .contains("d/dt"));
+        // A leading multiplier that is not a declared individual parameter is not a
+        // valid pathway fraction (#388): `FR` is undeclared here.
         assert!(go("d/dt(depot) = FR*transit(n=NTR, mtt=MTT)")
             .unwrap_err()
-            .contains("scaled"));
+            .contains("pathway-fraction multiplier"));
         // Leading unary minus: the forcing is injected `+R_in`, so a negated call
         // would silently flip the sign of the input rate. Must be rejected.
         assert!(go("d/dt(depot) = -transit(n=NTR, mtt=MTT) - KA*depot")
             .unwrap_err()
-            .contains("standalone"));
+            .contains("bare additive"));
         // Subtracted term (wrong sign) even without `*`/`/` scaling.
         assert!(go("d/dt(depot) = KA*depot - transit(n=NTR, mtt=MTT)")
             .unwrap_err()
-            .contains("standalone"));
+            .contains("bare additive"));
         // Parenthesised + scaled outside the group: the old adjacency check saw
         // only the flanking `(`/`)`, so the `/V` was silently dropped — now rejected.
         assert!(go("d/dt(depot) = (transit(n=NTR, mtt=MTT))/V")
             .unwrap_err()
-            .contains("standalone"));
+            .contains("bare additive"));
         assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT")
             .unwrap_err()
             .contains("unbalanced"));
         assert!(go("d/dt(depot) = transit(NTR, mtt=MTT)")
             .unwrap_err()
             .contains("name=parameter"));
-        assert!(
-            go("d/dt(depot) = transit(n=NTR, mtt=MTT) + transit(n=NTR, mtt=MTT)")
-                .unwrap_err()
-                .contains("at most one")
-        );
+        // Two bare transit terms now PARSE — parallel/biphasic absorption is allowed
+        // at the parser layer (#388); the "must be fractioned" rule is a fit-init
+        // check (see `check_absorption_dosing` / `E_ABSORPTION_FRACTION`).
+        let (_c, two) =
+            go("d/dt(depot) = transit(n=NTR, mtt=MTT) + transit(n=NTR, mtt=MTT)").unwrap();
+        assert_eq!(two.len(), 2);
+        assert!(two.iter().all(|f| f.frac_slot.is_none()));
         // Nested parens in an arg value are split correctly, then rejected as a
         // non-parameter (exercises the comma-splitter's paren-depth tracking).
         assert!(go("d/dt(depot) = transit(n=foo(a,b), mtt=MTT)")
@@ -12717,6 +12982,121 @@ mod tests {
     }
 
     #[test]
+    fn extract_biphasic_igd_with_fractions() {
+        // Freijer biphasic IG (#388): FR1*igd(...) + FR2*igd(...) on one compartment.
+        // Two forcings, each with its declared-parameter fraction slot; the `FR*`
+        // prefix is swallowed in the cleaned RHS (each term → `0`).
+        let lines = vec!["d/dt(central) = FR1*igd(mat=MAT1, cv2=CV2_1) + FR2*igd(mat=MAT2, cv2=CV2_2) - CL/V*central".to_string()];
+        let states = vec!["central".to_string()];
+        let names = vec![
+            "FR1".to_string(),
+            "MAT1".to_string(),
+            "CV2_1".to_string(),
+            "FR2".to_string(),
+            "MAT2".to_string(),
+            "CV2_2".to_string(),
+            "CL".to_string(),
+            "V".to_string(),
+        ];
+        let slots = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
+        assert_eq!(cleaned[0], "d/dt(central) = 0 + 0 - CL/V*central");
+        assert_eq!(forcings.len(), 2);
+        // Pathway 1: FR1 (slot 0) × igd(MAT1@1, CV2_1@2).
+        assert_eq!(forcings[0].cmt, 0);
+        assert_eq!(forcings[0].frac_slot, Some(0));
+        assert_eq!(forcings[0].arg_slots, vec![1, 2]);
+        // Pathway 2: FR2 (slot 3) × igd(MAT2@4, CV2_2@5).
+        assert_eq!(forcings[1].frac_slot, Some(3));
+        assert_eq!(forcings[1].arg_slots, vec![4, 5]);
+    }
+
+    #[test]
+    fn extract_fraction_must_be_a_declared_parameter() {
+        let states = vec!["central".to_string()];
+        let names = vec!["FR".to_string(), "MAT".to_string(), "CV2".to_string()];
+        let slots = vec![0, 4, 5];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        // A bare declared-parameter multiplier IS accepted and resolves to its slot.
+        let (_c, f) = go("d/dt(central) = FR*igd(mat=MAT, cv2=CV2)").unwrap();
+        assert_eq!(f[0].frac_slot, Some(0));
+
+        // Whitespace around the `*` is tolerated (the prefix scanner skips spaces on
+        // both sides of the multiplier): `FR *igd`, `FR* igd`, `FR * igd` all resolve.
+        for line in [
+            "d/dt(central) = FR *igd(mat=MAT, cv2=CV2)",
+            "d/dt(central) = FR* igd(mat=MAT, cv2=CV2)",
+            "d/dt(central) = FR * igd(mat=MAT, cv2=CV2)",
+        ] {
+            let (_c, f) = go(line).unwrap();
+            assert_eq!(f[0].frac_slot, Some(0), "spaced fraction: {line}");
+        }
+
+        // `(1-FR)` is an expression, not a bare declared parameter — rejected (#388);
+        // the user must declare a complementary parameter.
+        let err = go("d/dt(central) = FR*igd(mat=MAT, cv2=CV2) + (1-FR)*igd(mat=MAT, cv2=CV2)")
+            .unwrap_err();
+        assert!(
+            err.contains("parentheses") || err.contains("pathway"),
+            "got: {err}"
+        );
+
+        // An undeclared multiplier names the offender and points at the fix.
+        let err2 = go("d/dt(central) = ZZ*igd(mat=MAT, cv2=CV2)").unwrap_err();
+        assert!(err2.contains("pathway-fraction multiplier"), "got: {err2}");
+
+        // A *declared* fraction in a negated/subtracted position is a dropped-sign
+        // error, not a "not a declared parameter" one: `FR` here IS declared, the
+        // defect is the leading `-`. Report it as the sign/scale rejection so the
+        // message is not misleading (regression for the misattributed diagnostic).
+        let err3 = go("d/dt(central) = MAT*central - FR*igd(mat=MAT, cv2=CV2)").unwrap_err();
+        assert!(
+            err3.contains("bare additive") && err3.contains("negated"),
+            "got: {err3}"
+        );
+        // A compound multiplier (`K*FR*`) where both names are declared is likewise a
+        // scale rejection, not a non-parameter one.
+        let err4 = go("d/dt(central) = MAT*FR*igd(mat=MAT, cv2=CV2)").unwrap_err();
+        assert!(err4.contains("bare additive"), "got: {err4}");
+        // A numeric-literal multiplier is a dropped scale, not a "declared parameter"
+        // problem — report it as the sign/scale rejection (review finding #2).
+        let err5 = go("d/dt(central) = 5*igd(mat=MAT, cv2=CV2)").unwrap_err();
+        assert!(
+            err5.contains("bare additive") && !err5.contains("pathway-fraction multiplier"),
+            "got: {err5}"
+        );
+        let err6 = go("d/dt(central) = 2.5*igd(mat=MAT, cv2=CV2)").unwrap_err();
+        assert!(err6.contains("bare additive"), "got: {err6}");
+    }
+
+    #[test]
+    fn extract_input_rate_non_ascii_does_not_panic() {
+        // The input-rate extractor byte-indexes the RHS, but every slice point is an
+        // ASCII anchor (`(` `)`, the fn name, the identifier/`*` of a fraction), so a
+        // multi-byte char *between* anchors must surface as a clean error or pass
+        // through untouched — never a non-char-boundary slice panic (review finding #4).
+        let states = vec!["central".to_string()];
+        let names = vec!["MAT".to_string(), "CV2".to_string()];
+        let slots = vec![4, 5];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        // Unicode inside an arg value (param name): clean "not declared" error.
+        assert!(go("d/dt(central) = igd(mat=MÄT, cv2=CV2)").is_err());
+        // Unicode minus (U+2212) and an accented word outside the call: the igd term is
+        // still extracted and the non-ASCII tail is preserved verbatim.
+        let (cleaned, f) = go("d/dt(central) = igd(mat=MAT, cv2=CV2) \u{2212} café").unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(cleaned[0], "d/dt(central) = 0 \u{2212} café");
+        // Unicode immediately before a `+`-led bare term.
+        let (_c, f2) = go("d/dt(central) = café + igd(mat=MAT, cv2=CV2)").unwrap();
+        assert_eq!(f2.len(), 1);
+    }
+
+    #[test]
     fn extract_igd_input_rate_rejects_bad_specs() {
         let states = vec!["central".to_string()];
         let names = vec!["MAT".to_string(), "CV2".to_string()];
@@ -12736,11 +13116,12 @@ mod tests {
             err.contains("missing required argument `cv2`"),
             "got: {err}"
         );
-        // Biphasic `FR*igd(...)` is a scaled call — rejected in Phase 1 (the shared
-        // fraction mechanism is a follow-up); the message names `igd`, not `transit`.
+        // `FR*igd(...)` is a pathway-fraction multiplier (#388), but `FR` is not a
+        // declared individual parameter here, so it is rejected as a non-parameter
+        // fraction; the message names `igd`, not `transit`.
         let scaled = go("d/dt(central) = FR*igd(mat=MAT, cv2=CV2)").unwrap_err();
         assert!(
-            scaled.contains("scaled") && scaled.contains("igd"),
+            scaled.contains("pathway-fraction multiplier") && scaled.contains("igd"),
             "got: {scaled}"
         );
         assert!(go("d/dt(central) = igd(mat=MAT, cv2=CV2")
@@ -12749,12 +13130,13 @@ mod tests {
         assert!(go("d/dt(central) = igd(MAT, cv2=CV2)")
             .unwrap_err()
             .contains("name=parameter"));
-        // Two input-rate calls on one equation (biphasic sum) rejected for now.
-        assert!(
-            go("d/dt(central) = igd(mat=MAT, cv2=CV2) + igd(mat=MAT, cv2=CV2)")
-                .unwrap_err()
-                .contains("at most one")
-        );
+        // Two bare igd calls on one equation now PARSE (biphasic sum, #388) into two
+        // unfractioned forcings; the "each term needs a fraction" rule is enforced at
+        // fit-init (`check_absorption_dosing`), not here.
+        let (_c, two) =
+            go("d/dt(central) = igd(mat=MAT, cv2=CV2) + igd(mat=MAT, cv2=CV2)").unwrap();
+        assert_eq!(two.len(), 2);
+        assert!(two.iter().all(|f| f.frac_slot.is_none()));
         // A word *ending* in `igd` (e.g. `xigd(`) is not an igd() call.
         let (kept, none) = go("d/dt(central) = xigd(mat=MAT, cv2=CV2) - central").unwrap();
         assert_eq!(kept[0], "d/dt(central) = xigd(mat=MAT, cv2=CV2) - central");
@@ -12809,10 +13191,11 @@ mod tests {
             err.contains("missing required argument `beta`"),
             "got: {err}"
         );
-        // A scaled call is rejected and the message names `weibull`.
+        // `FR*weibull(...)` is a pathway-fraction multiplier (#388) but `FR` is
+        // undeclared, so it is rejected as a non-parameter fraction naming `weibull`.
         let scaled = go("d/dt(central) = FR*weibull(td=TD, beta=BETA)").unwrap_err();
         assert!(
-            scaled.contains("scaled") && scaled.contains("weibull"),
+            scaled.contains("pathway-fraction multiplier") && scaled.contains("weibull"),
             "got: {scaled}"
         );
         // Positive control: a bare additive weibull() is accepted.
@@ -12869,8 +13252,8 @@ mod tests {
     #[test]
     fn extract_zero_order_input_rate_rejects_bad_specs() {
         let states = vec!["central".to_string()];
-        let names = vec!["DUR".to_string()];
-        let slots = vec![4];
+        let names = vec!["DUR".to_string(), "FZO".to_string()];
+        let slots = vec![4, 6];
         let go =
             |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
 
@@ -12885,11 +13268,12 @@ mod tests {
         assert!(go("d/dt(central) = zero_order()")
             .unwrap_err()
             .contains("name=parameter"));
-        // A scaled call is rejected and the message names `zero_order` (the
-        // fraction-multiplier composition `mixed`/`parallel` is #505).
+        // A pathway fraction on zero_order — even with a *declared* `FZO` — is rejected
+        // pending #505 (the zero-order channel doesn't carry the fraction scale yet);
+        // the `mixed`/`parallel` composition lands there.
         let scaled = go("d/dt(central) = FZO*zero_order(dur=DUR)").unwrap_err();
         assert!(
-            scaled.contains("scaled") && scaled.contains("zero_order"),
+            scaled.contains("not yet supported") && scaled.contains("zero_order"),
             "got: {scaled}"
         );
         assert!(go("x = zero_order(dur=DUR)").unwrap_err().contains("d/dt"));
@@ -12898,9 +13282,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_rejects_two_different_input_rate_fns_on_one_equation() {
-        // transit + igd on a single d/dt is rejected by the same one-call guard
-        // (mixed/parallel composition is a later phase).
+    fn extract_accepts_two_different_input_rate_fns_on_one_equation() {
+        // transit + igd on a single d/dt now parses (#388 lifts the one-call guard):
+        // two forcings on the same compartment, table order (transit before igd). The
+        // "each must be fractioned" rule is a fit-init check, not a parser one.
         let states = vec!["central".to_string()];
         let names = vec![
             "NTR".to_string(),
@@ -12910,8 +13295,19 @@ mod tests {
         ];
         let slots = vec![10, 11, 4, 5];
         let line = "d/dt(central) = transit(n=NTR, mtt=MTT) + igd(mat=MAT, cv2=CV2)".to_string();
-        let err = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap_err();
-        assert!(err.contains("at most one"), "got: {err}");
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&[line], &states, &names, &slots).unwrap();
+        assert_eq!(cleaned[0], "d/dt(central) = 0 + 0");
+        assert_eq!(forcings.len(), 2);
+        assert!(matches!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::Transit
+        ));
+        assert!(matches!(
+            forcings[1].kind,
+            crate::pk::absorption::InputRateKind::InverseGaussian
+        ));
+        assert!(forcings.iter().all(|f| f.cmt == 0 && f.frac_slot.is_none()));
     }
 
     #[test]

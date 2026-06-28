@@ -161,13 +161,19 @@ pub fn compute_r_matrix_with_correlations(
     // magnitude path already uses the `_scaled` association by construction.)
     let n = ipreds.len();
     let mut r = DMatrix::<f64>::zeros(n, n);
-    let r_diag =
-        compute_r_diag_with_correlations(error_spec, ipreds, obs_cmts, sigma_values, correlations);
-    for (j, &v) in r_diag.iter().enumerate() {
-        r[(j, j)] = v;
-    }
+    // Write the diagonal variance directly into `r` (mirrors
+    // `compute_r_diag_with_correlations`) rather than building a throwaway Vec
+    // and copying it in — this runs once per subject per FOCE inner/outer
+    // iteration. The empty-correlation case delegates to `variance_at`, the
+    // legacy `(f·σ)·(f·σ)` association the comment above relies on.
     if correlations.is_empty() {
+        for (j, (&f, &cmt)) in ipreds.iter().zip(obs_cmts.iter()).enumerate() {
+            r[(j, j)] = error_spec.variance_at(cmt, f, sigma_values);
+        }
         return r;
+    }
+    for (j, (&f, &cmt)) in ipreds.iter().zip(obs_cmts.iter()).enumerate() {
+        r[(j, j)] = error_spec.variance_at_with_correlations(cmt, f, sigma_values, correlations);
     }
 
     let loadings: Vec<Vec<(usize, f64)>> = ipreds
@@ -204,8 +210,13 @@ pub fn compute_r_matrix_with_correlations(
 /// custom magnitude (#484). `mult` is the `[obs][sigma-slot]` multiplier matrix
 /// from [`crate::types::RuvMagnitude::eval_obs`]; each observation's sigma
 /// loadings are scaled by its row before forming the diagonal variance and any
-/// `block_sigma` cross-covariance. A `mult` whose rows are all ones reproduces
-/// [`compute_r_matrix_with_correlations`] exactly.
+/// `block_sigma` cross-covariance. NOTE: a `mult` whose rows are all ones does
+/// **not** reproduce [`compute_r_matrix_with_correlations`] bit-for-bit. The
+/// bare path forms the diagonal as `(f·σ)·(f·σ)` whereas the scaled path uses
+/// `variance_at_scaled`'s reassociated `((f·f)·σ)·σ` form, which differs by
+/// ~1 ULP on ~55% of proportional/combined rows. The two diagonal builders are
+/// kept separate deliberately — do NOT re-collapse the bare path into
+/// `_scaled(..., &[])` (that is the exact regression this revert prevents).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_r_matrix_with_correlations_scaled(
     error_spec: &ErrorSpec,

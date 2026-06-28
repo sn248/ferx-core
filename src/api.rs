@@ -199,18 +199,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // draw then overwrites each template with its realised outcome (#522). Compute
     // the cause-CMT list once, outside the per-subject loop.
     #[cfg(feature = "survival")]
-    let tte_cmts: Vec<usize> = {
-        let mut c: Vec<usize> = parsed
-            .model
-            .endpoints
-            .iter()
-            .filter_map(|(cmt, ep)| {
-                matches!(ep, crate::types::EndpointLikelihood::Tte { .. }).then_some(*cmt)
-            })
-            .collect();
-        c.sort_unstable();
-        c
-    };
+    let tte_cmts: Vec<usize> = parsed.model.tte_cmts();
     #[cfg(feature = "survival")]
     if !tte_cmts.is_empty() && sim_spec.horizon.is_none() {
         return Err("[simulation] with a TTE endpoint requires `horizon = <t>` \
@@ -234,10 +223,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // otherwise carries a default `pk_model`, so the structural model alone can't
     // distinguish intent.
     let model_has_continuous = !parsed.model.default_params.sigma.values.is_empty();
-    #[cfg(feature = "survival")]
-    let model_has_tte = !tte_cmts.is_empty();
-    #[cfg(not(feature = "survival"))]
-    let model_has_tte = false;
+    let model_has_tte = parsed.model.has_tte();
     if sim_spec.obs_times.is_empty() {
         if model_has_continuous {
             return Err(
@@ -333,19 +319,31 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     )
     .map_err(|e| format!("simulation failed: {e}"))?;
 
+    // Group the simulation results by subject id once (they are emitted in
+    // subject order, but a map keeps the write-back independent of that), then
+    // write each subject's outcomes back in a single pass instead of re-scanning
+    // all of `sim_results` per subject twice (Gaussian, then TTE).
+    let mut sims_by_id: HashMap<&str, Vec<&SimulationResult>> = HashMap::new();
+    for s in &sim_results {
+        sims_by_id.entry(s.id.as_str()).or_default().push(s);
+    }
+
     let mut population = template;
     for subject in &mut population.subjects {
+        let Some(sims) = sims_by_id.get(subject.id.as_str()) else {
+            continue;
+        };
+
         // Gaussian write-back: only continuous outcomes map onto `observations`.
         // A TTE `Event` row would trip `continuous_value()`'s debug-assert, so
-        // filter it out here; the TTE outcomes are written into `obs_records` below.
-        let sims: Vec<_> = sim_results
+        // skip it here (the TTE outcomes go into `obs_records` below). Enumerating
+        // *after* the filter makes `j` index the continuous subsequence, matching
+        // the per-subject observation grid.
+        for (j, s) in sims
             .iter()
-            .filter(|s| {
-                s.id == subject.id
-                    && matches!(s.outcome, crate::types::SimOutcome::Continuous { .. })
-            })
-            .collect();
-        for (j, s) in sims.iter().enumerate() {
+            .filter(|s| matches!(s.outcome, crate::types::SimOutcome::Continuous { .. }))
+            .enumerate()
+        {
             if j < subject.observations.len() {
                 // Under LTBS the simulated DV is on the log scale and may be
                 // negative, so the positivity floor only applies to natural-scale
@@ -358,38 +356,39 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                 };
             }
         }
-    }
 
-    // TTE write-back (#522): replace each subject's template rows with the
-    // realised simulated outcomes — `Exact` at the drawn event time, or
-    // `RightCensored` at the horizon when no cause fired — so the fitted dataset
-    // (and any output) carries the simulated events rather than the placeholders.
-    #[cfg(feature = "survival")]
-    for subject in &mut population.subjects {
-        let events: Vec<crate::types::ObsRecord> = sim_results
-            .iter()
-            .filter(|s| s.id == subject.id)
-            .filter_map(|s| match s.outcome {
-                crate::types::SimOutcome::Event { time, observed } => {
-                    Some(crate::types::ObsRecord::Event {
-                        time,
-                        event_type: if observed {
-                            crate::types::EventType::Exact
-                        } else {
-                            crate::types::EventType::RightCensored
-                        },
-                        // Synthetic `[simulation]` subjects always enter at 0 (no
-                        // left truncation), matching the template row above; keep
-                        // the two in sync if this path ever gains delayed entry.
-                        entry_time: 0.0,
-                        cmt: s.cmt,
-                    })
-                }
-                _ => None,
-            })
-            .collect();
-        if !events.is_empty() {
-            subject.obs_records = events;
+        // TTE write-back (#522): replace the subject's template rows with the
+        // realised simulated outcomes — `Exact` at the drawn event time, or
+        // `RightCensored` at the horizon when no cause fired — so the fitted
+        // dataset (and any output) carries the simulated events rather than the
+        // placeholders.
+        #[cfg(feature = "survival")]
+        {
+            let events: Vec<crate::types::ObsRecord> = sims
+                .iter()
+                .filter_map(|s| match s.outcome {
+                    crate::types::SimOutcome::Event { time, observed } => {
+                        Some(crate::types::ObsRecord::Event {
+                            time,
+                            event_type: if observed {
+                                crate::types::EventType::Exact
+                            } else {
+                                crate::types::EventType::RightCensored
+                            },
+                            // Synthetic `[simulation]` subjects always enter at 0
+                            // (no left truncation), matching the template row
+                            // above; keep the two in sync if this path ever gains
+                            // delayed entry.
+                            entry_time: 0.0,
+                            cmt: s.cmt,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !events.is_empty() {
+                subject.obs_records = events;
+            }
         }
     }
 
@@ -5194,6 +5193,18 @@ fn simulate_inner<R: rand::Rng>(
 /// (length `n_eta + n_kappa`). Draws only residual epsilons from `rng`; the eta
 /// is supplied by the caller (freshly sampled, or propensity-matched).
 #[allow(clippy::too_many_arguments)]
+/// Display time for observation row `j`: the raw data TIME when available
+/// (matches sdtab / input), falling back to the internal `obs_times` clock,
+/// which may be the shifted clock for stacked reset occasions. Shared by every
+/// simulation row emitter so the static and reactive paths cannot drift.
+fn obs_row_time(subject: &Subject, j: usize) -> f64 {
+    subject
+        .obs_raw_times
+        .get(j)
+        .copied()
+        .unwrap_or(subject.obs_times[j])
+}
+
 fn emit_subject_rows<R: rand::Rng>(
     model: &CompiledModel,
     subject: &Subject,
@@ -5233,11 +5244,7 @@ fn emit_subject_rows<R: rand::Rng>(
             id: subject.id.clone(),
             // Raw data TIME (matches sdtab / input); `obs_times` may be
             // the internal shifted clock for stacked reset occasions.
-            time: subject
-                .obs_raw_times
-                .get(j)
-                .copied()
-                .unwrap_or(subject.obs_times[j]),
+            time: obs_row_time(subject, j),
             cmt: subject.obs_cmts[j],
             ipred,
             outcome: SimOutcome::Continuous { value },
@@ -5349,6 +5356,282 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     }
 
     results
+}
+
+// ======================================================================
+// Adaptive (state-reactive / feedback) dosing — epic #391, experimental.
+//
+// Public entry point that wraps the `pub(crate)` reactive driver
+// (`ode_predictions_adaptive`) with per-(subject, replicate) orchestration, the
+// tagged-row output schema (Part D), and the frozen-schedule replay verifier
+// (Part E backbone, default-on). Ipred monitors only; the `Dv` (assay-noised)
+// path and per-subject RNG substreams land in S1.5.
+// ======================================================================
+
+use crate::sim::adaptive::{
+    AdaptiveRun, ControllerCtx, DecisionLogEntry, DoseAction, DoseLedgerEntry, MonitorSpec,
+};
+
+/// Options for [`simulate_adaptive`].
+///
+/// `#[non_exhaustive]`: later knobs (per-subject schedules, the `Dv` path) land
+/// as added fields; construct via [`AdaptiveSimulateOptions::default`] and assign
+/// the fields you need.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AdaptiveSimulateOptions {
+    /// Seed for reproducibility. `None` draws η from entropy.
+    pub seed: Option<u64>,
+    /// Decision schedule on the subject clock — the times the controller is
+    /// consulted. The same schedule is used for every subject in this slice.
+    /// Must be non-empty: an empty schedule never consults the controller and is
+    /// rejected (it would otherwise be a silent dose-free run).
+    pub decision_times: Vec<f64>,
+    /// Signals the controller may read at each decision. **Ipred only** here — a
+    /// [`crate::sim::adaptive::ObserveMode::Dv`] monitor is rejected (it needs
+    /// the per-subject RNG substreams of S1.5).
+    pub monitors: Vec<MonitorSpec>,
+    /// Run the frozen-schedule replay verifier after each (subject, replicate)
+    /// (default `true`). A divergence is a typed `Err` that taints the whole
+    /// result — never a buried warning (#391 Part E).
+    pub verify: bool,
+    /// Per-run decision cap — the runaway / closed-loop guard. The driver errors
+    /// if a schedule exceeds it.
+    pub max_decisions: usize,
+}
+
+impl Default for AdaptiveSimulateOptions {
+    fn default() -> Self {
+        Self {
+            seed: None,
+            decision_times: Vec::new(),
+            monitors: Vec::new(),
+            verify: true,
+            max_decisions: 10_000,
+        }
+    }
+}
+
+/// Result of [`simulate_adaptive`]: the three Part-D artifacts that must agree,
+/// returned as one verified unit so a caller can never pair a trajectory with
+/// the wrong ledger. All three are long-form rows tagged by `(draw, sim, id)`.
+///
+/// `#[non_exhaustive]`: the remaining Part-D artifacts (per-subject metrics,
+/// population summary, run manifest) land as added fields without breaking
+/// callers who receive this struct.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AdaptiveSimulationResult {
+    /// Per-observation predictions: one row per (replicate, subject, obs time).
+    /// **Ipred only** in this slice — `ipred` and the `Continuous` value are both
+    /// the individual prediction; residual / assay error (the realized DV) and
+    /// its per-subject RNG substream arrive in S1.5.
+    pub trajectories: Vec<SimulationResult>,
+    /// Every dose the controllers actually issued, tagged by `(draw, sim)`.
+    pub ledger: Vec<DoseLedgerEntry>,
+    /// One row per decision (including holds), in schedule order, up to and
+    /// including any `Stop`.
+    pub decisions: Vec<DecisionLogEntry>,
+}
+
+/// Simulate state-reactive ("adaptive" / feedback) dosing over a population
+/// (epic #391, **experimental**).
+///
+/// For each subject and each of `n_sim` replicates: draw η ~ N(0, Ω), then run
+/// one integration driven by a **fresh** controller minted from
+/// `make_controller`. The controller is consulted at each `opts.decision_times`
+/// point — it reads the declared `opts.monitors` (and the live state /
+/// covariates / dose history via [`ControllerCtx`]) and returns the
+/// [`DoseAction`]s to apply. The engine owns the timeline, applies
+/// bioavailability / lag downstream exactly as for a static dose, and records
+/// every realized dose ([`AdaptiveSimulationResult::ledger`]) and every decision
+/// ([`AdaptiveSimulationResult::decisions`], including holds).
+///
+/// ## Controller factory — one per (subject, replicate)
+///
+/// `make_controller` is a **factory**, not a single shared closure: a fresh
+/// controller is built for each run. Real controllers carry per-subject state
+/// (debounce / `confirm` counters, windowed AUC, the current titration rung); a
+/// single shared `FnMut` would leak that state across subjects and replicates —
+/// a silent wrong answer that stateless test controllers never expose. A fresh
+/// controller per run makes the isolation structural. A stateless rule is just a
+/// factory whose closure ignores its environment, e.g.
+/// `|| |ctx: &ControllerCtx| { … }`.
+///
+/// ## Requirements — typed errors, never a silent wrong answer
+///
+/// - **Non-empty decision schedule.** An empty `opts.decision_times` never
+///   consults the controller (a silent dose-free run) and is rejected.
+/// - **ODE model.** The reactive driver runs on the ODE engine; a model with no
+///   `[odes]` block is rejected.
+/// - **Dose-free subjects.** The regimen is controller-driven; a subject that
+///   already carries `doses` is rejected (augmenting a pre-scheduled regimen is a
+///   later step).
+/// - **Ipred monitors only.** A `Dv` monitor is rejected (needs S1.5).
+/// - **Verification (default on).** Each run's realized ledger is replayed
+///   through the static engine and checked against the reactive trajectory; a
+///   divergence beyond solver tolerance is an `Err`.
+///
+/// The `draw` tag on every row is `1`: this slice carries no parameter
+/// uncertainty (that is Part C / a later slice), only between-subject η.
+pub fn simulate_adaptive<F, C>(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    make_controller: F,
+    opts: &AdaptiveSimulateOptions,
+) -> Result<AdaptiveSimulationResult, String>
+where
+    F: Fn() -> C,
+    C: FnMut(&ControllerCtx) -> Vec<DoseAction>,
+{
+    use rand::SeedableRng;
+
+    let ode = model.ode_spec.as_ref().ok_or_else(|| {
+        "simulate_adaptive requires an ODE model (the reactive driver runs on the ODE \
+         engine); this model has no [odes] block"
+            .to_string()
+    })?;
+
+    // An empty schedule means the controller is never consulted: the result is a
+    // dose-free simulation that the verifier (replaying an empty ledger) passes
+    // trivially. That is almost always a forgotten `decision_times` (the field
+    // defaults to empty), so reject it rather than return a silent no-op — the
+    // same "never a silent wrong answer" contract as the other preconditions.
+    if opts.decision_times.is_empty() {
+        return Err("simulate_adaptive requires a non-empty decision schedule \
+             (`AdaptiveSimulateOptions::decision_times`); with no decision times the controller \
+             is never consulted and no dose is ever issued"
+            .to_string());
+    }
+
+    let mut rng: rand::rngs::StdRng = match opts.seed {
+        Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+        None => rand::make_rng(),
+    };
+    let normal = Normal::new(0.0, 1.0).unwrap();
+    let n_eta = model.n_eta;
+
+    // Root seed for the controller-assay substreams (DV-mode monitors, S1.5).
+    // Resolved independently of the η `rng` above so that enabling a `Dv` monitor
+    // never shifts the η draws (the all-`Ipred` path stays byte-identical). With no
+    // run seed it is drawn from a fresh entropy source, matching the η stream's own
+    // nondeterminism.
+    let assay_root: u64 = match opts.seed {
+        Some(s) => s,
+        None => {
+            let mut entropy: rand::rngs::StdRng = rand::make_rng();
+            entropy.random::<u64>()
+        }
+    };
+
+    let mut trajectories: Vec<SimulationResult> = Vec::new();
+    let mut ledger: Vec<DoseLedgerEntry> = Vec::new();
+    let mut decisions: Vec<DecisionLogEntry> = Vec::new();
+
+    for sim_idx in 0..n_sim {
+        let sim = sim_idx + 1;
+        for subject in &population.subjects {
+            // Draw η ~ N(0, Ω); append zero kappas for IOV models (the reactive
+            // driver is BSV-only in this slice).
+            let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+            let eta = &params.omega.chol * DVector::from_column_slice(&z);
+            let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
+            eta_slice.resize(n_eta + model.n_kappa, 0.0);
+
+            let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
+
+            // Controller-assay capability for any `Dv` monitor: resolve the
+            // endpoint's residual variance by CMT (scaled by this subject's
+            // `ruv_scale` for IIV-on-RUV), or `None` when no [error_model] covers
+            // that compartment (S1.5 edge a). The base seed keys this
+            // (subject, replicate)'s controller-assay substream.
+            let ruv_scale = model.residual_var_scale(&eta_slice);
+            let sigma = &params.sigma.values;
+            let resid_var = |cmt: usize, ipred: f64| -> Option<f64> {
+                if !model.has_residual_error_for_cmt(cmt, sigma) {
+                    return None;
+                }
+                Some(model.residual_variance_at(cmt, ipred, sigma) * ruv_scale)
+            };
+            let assay = crate::sim::adaptive::AssayNoise {
+                resid_var: &resid_var,
+                base_seed: crate::sim::adaptive::subject_assay_base_seed(
+                    assay_root,
+                    &subject.id,
+                    sim,
+                ),
+            };
+
+            // A fresh controller per (subject, replicate) — see the factory note.
+            let mut controller = make_controller();
+            let run: AdaptiveRun = crate::ode::ode_predictions_adaptive(
+                ode,
+                &pk.values,
+                &params.theta,
+                &eta_slice,
+                subject,
+                &opts.decision_times,
+                &opts.monitors,
+                &mut controller,
+                opts.max_decisions,
+                Some(&assay),
+            )
+            .map_err(|e| format!("subject '{}' (sim {sim}): {e}", subject.id))?;
+
+            if opts.verify {
+                crate::ode::verify_adaptive_frozen_replay(
+                    ode,
+                    &pk.values,
+                    &params.theta,
+                    &eta_slice,
+                    subject,
+                    &opts.decision_times,
+                    &run,
+                )
+                .map_err(|e| {
+                    format!(
+                        "frozen-schedule replay verification failed for subject '{}' (sim {sim}): {e}",
+                        subject.id
+                    )
+                })?;
+            }
+
+            // Tagged trajectory rows (Ipred only). `run.predictions` is indexed
+            // by the subject's observation grid, exactly like `emit_subject_rows`.
+            for (j, &pred) in run.predictions.iter().enumerate() {
+                trajectories.push(SimulationResult {
+                    draw: 1,
+                    sim,
+                    id: subject.id.clone(),
+                    time: obs_row_time(subject, j),
+                    cmt: subject.obs_cmts[j],
+                    ipred: pred,
+                    outcome: SimOutcome::Continuous { value: pred },
+                });
+            }
+
+            // Stamp the replicate tags onto the ledger + decision rows — the
+            // single-subject driver emits draw/sim = 0.
+            for mut e in run.ledger {
+                e.draw = 1;
+                e.sim = sim;
+                ledger.push(e);
+            }
+            for mut d in run.decisions {
+                d.draw = 1;
+                d.sim = sim;
+                decisions.push(d);
+            }
+        }
+    }
+
+    Ok(AdaptiveSimulationResult {
+        trajectories,
+        ledger,
+        decisions,
+    })
 }
 
 /// Options controlling `simulate_with_uncertainty()`.
@@ -5545,8 +5828,9 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
-    use crate::survival::{cif_curves, hazard_and_cum_hazard, mean_survival, median_survival};
-    use crate::types::EndpointLikelihood;
+    use crate::survival::{
+        cif_curves, hazard_and_cum_hazard, mean_survival, median_survival, tte_cause_params,
+    };
 
     // The competing-risks CIF telescopes the all-cause survival drop, which
     // requires the grid in ascending time order; sort a local copy so the
@@ -5565,15 +5849,15 @@ pub fn predict_survival(
         // each grid point, so collect the per-cause parameters up front.
         let mut causes: Vec<(usize, crate::types::HazardFamily, Vec<f64>, f64, f64)> = Vec::new();
         for (&cmt, endpoint) in &model.endpoints {
-            let EndpointLikelihood::Tte { hazard } = endpoint else {
+            let Some((family, params_vec)) =
+                tte_cause_params(endpoint, &params.theta, &zero_eta, &subject.covariates)
+            else {
                 continue;
             };
-            let crate::types::HazardSpec::Analytic { family, param_fn } = hazard;
-            let params_vec = param_fn(&params.theta, &zero_eta, &subject.covariates);
             // Distributional summaries are parameter-dependent, not time-dependent.
-            let t_median = median_survival(*family, &params_vec);
-            let t_mean = mean_survival(*family, &params_vec);
-            causes.push((cmt, *family, params_vec, t_median, t_mean));
+            let t_median = median_survival(family, &params_vec);
+            let t_mean = mean_survival(family, &params_vec);
+            causes.push((cmt, family, params_vec, t_median, t_mean));
         }
         if causes.is_empty() {
             continue;
@@ -9764,6 +10048,581 @@ mod tests_derived_iov_kappa {
              the obs covariate (LAGCOV=5) would push arrival to @5.0 (after the obs) → NaN. \
              Got {}",
             tad[0]
+        );
+    }
+}
+
+// ── Tests: adaptive (state-reactive) dosing — simulate_adaptive (#391 S1.4b) ──
+#[cfg(test)]
+mod adaptive_sim_tests {
+    use super::*;
+    use crate::parser::model_parser::parse_model_string;
+    use crate::sim::adaptive::{ControllerCtx, DoseAction, MonitorSpec, ObserveMode};
+    use std::collections::HashMap;
+
+    // 1-cpt IV ODE, state = central amount, readout y = central (amount units).
+    // CL=5, V=50 → k = 0.1/h. ETA_CL is declared (the parser requires an omega)
+    // but **not referenced** by CL, so predictions are η-invariant and the whole
+    // simulation is effectively deterministic — the bit-exact oracle below relies
+    // on this (a drawn-but-unused η leaves the trajectory at the η=0 value).
+    const ODE_NO_IIV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    // Same structural model, with between-subject variability on CL.
+    const ODE_IIV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    // Analytical (non-ODE) twin — used to assert simulate_adaptive rejects it.
+    const ANALYTICAL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    fn subj(id: &str, obs_times: Vec<f64>, doses: Vec<DoseEvent>) -> Subject {
+        let n = obs_times.len();
+        let n_dose = doses.len();
+        Subject {
+            id: id.to_string(),
+            doses,
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1u32; n],
+            dose_occasions: vec![1u32; n_dose],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    fn population(subjects: Vec<Subject>) -> Population {
+        Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    /// A fixed 100 mg bolus into cmt 1 at every decision — the degenerate
+    /// (state-independent) controller.
+    fn fixed_bolus() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
+        |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+    }
+
+    #[test]
+    fn degenerate_oracle_matches_static_predict_bit_for_bit() {
+        // A controller that doses at every decision must reproduce the static
+        // engine on the same realized schedule. Last obs (54) is the global max
+        // and a dose lands at every decision, so the segment structures align and
+        // agreement is exact (the verifier, on by default, also passes).
+        let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+        let decisions = vec![0.0, 24.0, 48.0];
+        let obs = vec![6.0, 30.0, 54.0];
+
+        let pop = population(vec![subj("1", obs.clone(), vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            decision_times: decisions.clone(),
+            ..Default::default()
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect("adaptive sim runs");
+
+        // Static reference: same doses pre-scheduled, run through predict() (η=0,
+        // IPRED) — exactly what the realized ledger encodes.
+        let static_doses: Vec<DoseEvent> = decisions
+            .iter()
+            .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
+        let preds = predict(&model, &static_pop, &model.default_params);
+
+        assert_eq!(res.trajectories.len(), obs.len());
+        assert_eq!(res.ledger.len(), 3, "a dose at every decision");
+        for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+            assert!(
+                (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
+                "adaptive IPRED {} != static predict {} at t={}",
+                traj.ipred,
+                pred.pred,
+                traj.time
+            );
+        }
+    }
+
+    #[test]
+    fn reactive_holds_run_and_pass_the_default_verifier() {
+        // Genuinely reactive: dose 100 only when the monitored central amount is
+        // below 50. k = 0.1/h, so after the t=0 dose the amount is 100·e^{-0.2} ≈
+        // 81.9 at t=2 and ≈67.0 at t=4 — both > 50 → hold. Exactly one realized
+        // dose, and the t=2 / t=4 holds make the driver break where the static
+        // replay of the ledger (dose @0 only) does not — so this run passes
+        // through the verifier's *tolerance* branch, not the bit-exact path.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let pop = population(vec![subj("1", vec![1.0, 3.0, 5.0], vec![])]);
+        let monitors = vec![MonitorSpec::new("A", 1, ObserveMode::Ipred)];
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            decision_times: vec![0.0, 2.0, 4.0],
+            monitors,
+            ..Default::default() // verify = true
+        };
+        let make = || {
+            |ctx: &ControllerCtx| {
+                if ctx.signal("A").expect("monitor A declared") < 50.0 {
+                    vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+                } else {
+                    vec![DoseAction::Hold]
+                }
+            }
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, make, &opts)
+            .expect("verifier passes on the reactive run");
+        // One decision per schedule point is logged, including the two holds.
+        assert_eq!(res.decisions.len(), 3);
+        // Only the t=0 decision (amount 0 < 50) dosed.
+        assert_eq!(res.ledger.len(), 1);
+        assert_eq!(res.ledger[0].time, 0.0);
+    }
+
+    #[test]
+    fn fresh_controller_per_subject_prevents_state_leak() {
+        // The "no happy paths" guarantee of the factory signature: a *stateful*
+        // controller that doses only on its first call must dose every subject —
+        // proving each gets a fresh controller. A single shared FnMut would dose
+        // only the first subject (its counter would already be spent), so this
+        // asserts the leak is structurally impossible.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let pop = population(vec![
+            subj("A", vec![1.0], vec![]),
+            subj("B", vec![1.0], vec![]),
+            subj("C", vec![1.0], vec![]),
+        ]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            decision_times: vec![0.0],
+            ..Default::default()
+        };
+        let make = || {
+            let mut calls = 0usize;
+            move |_ctx: &ControllerCtx| {
+                let actions = if calls == 0 {
+                    vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+                } else {
+                    vec![DoseAction::Hold]
+                };
+                calls += 1;
+                actions
+            }
+        };
+        let res =
+            simulate_adaptive(&model, &pop, &model.default_params, 1, make, &opts).expect("runs");
+        assert_eq!(
+            res.ledger.len(),
+            3,
+            "every subject's first decision should dose (fresh controller each)"
+        );
+        let mut ids: Vec<&str> = res.ledger.iter().map(|e| e.subject.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn replicate_tags_are_stamped_on_every_row() {
+        // The single-subject driver emits draw/sim = 0; the orchestrator must
+        // stamp the real replicate index onto trajectory, ledger, and decision
+        // rows so the artifacts join.
+        let model = parse_model_string(ODE_IIV).expect("parse");
+        let pop = population(vec![subj("1", vec![6.0, 30.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(42),
+            decision_times: vec![0.0, 24.0],
+            ..Default::default()
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 2, fixed_bolus, &opts)
+            .expect("runs");
+
+        let sims: std::collections::BTreeSet<usize> = res.ledger.iter().map(|e| e.sim).collect();
+        assert_eq!(sims, [1, 2].into_iter().collect());
+        assert!(res.ledger.iter().all(|e| e.draw == 1));
+        assert!(res
+            .trajectories
+            .iter()
+            .all(|t| t.draw == 1 && (t.sim == 1 || t.sim == 2)));
+        assert!(res
+            .decisions
+            .iter()
+            .all(|d| d.draw == 1 && (d.sim == 1 || d.sim == 2)));
+    }
+
+    #[test]
+    fn same_seed_is_deterministic() {
+        let model = parse_model_string(ODE_IIV).expect("parse");
+        let pop = population(vec![
+            subj("1", vec![6.0, 30.0], vec![]),
+            subj("2", vec![6.0, 30.0], vec![]),
+        ]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(7),
+            decision_times: vec![0.0, 24.0],
+            ..Default::default()
+        };
+        let a = simulate_adaptive(&model, &pop, &model.default_params, 2, fixed_bolus, &opts)
+            .expect("run a");
+        let b = simulate_adaptive(&model, &pop, &model.default_params, 2, fixed_bolus, &opts)
+            .expect("run b");
+
+        let ip = |r: &AdaptiveSimulationResult| {
+            r.trajectories.iter().map(|t| t.ipred).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ip(&a),
+            ip(&b),
+            "IPRED trajectories must be seed-reproducible"
+        );
+        assert_eq!(a.ledger, b.ledger);
+        assert_eq!(a.decisions, b.decisions);
+    }
+
+    #[test]
+    fn rejects_analytical_model() {
+        let model = parse_model_string(ANALYTICAL).expect("parse analytical");
+        let pop = population(vec![subj("1", vec![6.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            decision_times: vec![0.0],
+            ..Default::default()
+        };
+        let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect_err("analytical model must be rejected");
+        assert!(err.contains("ODE"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_decision_schedule() {
+        // The default `decision_times` is empty; a caller who forgets to set it
+        // would otherwise get a silent dose-free run that passes the verifier
+        // trivially. That must be a typed error, not a happy-path no-op.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let pop = population(vec![subj("1", vec![6.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default() // decision_times left empty
+        };
+        let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect_err("an empty decision schedule must be rejected");
+        assert!(err.contains("decision schedule"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_subject_with_prescheduled_doses() {
+        // The regimen is controller-driven; a subject that already carries doses
+        // is a typed error (forwarded from the driver), never a silent merge.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let dosed = subj(
+            "1",
+            vec![6.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+        let pop = population(vec![dosed]);
+        let opts = AdaptiveSimulateOptions {
+            decision_times: vec![0.0],
+            ..Default::default()
+        };
+        let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect_err("pre-dosed subject must be rejected");
+        assert!(err.contains("dose-free"), "got: {err}");
+    }
+
+    #[test]
+    fn dv_monitor_without_error_model_is_rejected() {
+        // Edge (a): a DV monitor on a model with no residual error (here sigma is
+        // stripped) is a typed error, never a fabricated σ.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let mut params = model.default_params.clone();
+        params.sigma.values = vec![]; // no [error_model] coverage for the monitor
+        let pop = population(vec![subj("1", vec![6.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            decision_times: vec![0.0],
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
+            ..Default::default()
+        };
+        let err = simulate_adaptive(&model, &pop, &params, 1, fixed_bolus, &opts)
+            .expect_err("DV monitor with no error model must be rejected");
+        assert!(err.contains("error_model"), "got: {err}");
+    }
+
+    #[test]
+    fn verify_can_be_disabled() {
+        // The verifier is the default-on safety net; it can be turned off for a
+        // large run once the controller is trusted. Disabling it still produces
+        // the same trajectories/ledger (verification observes, it does not alter).
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let pop = population(vec![subj("1", vec![6.0, 30.0], vec![])]);
+        let mk = |verify: bool| AdaptiveSimulateOptions {
+            seed: Some(3),
+            decision_times: vec![0.0, 24.0],
+            verify,
+            ..Default::default()
+        };
+        let checked = simulate_adaptive(
+            &model,
+            &pop,
+            &model.default_params,
+            1,
+            fixed_bolus,
+            &mk(true),
+        )
+        .expect("verified run");
+        let unchecked = simulate_adaptive(
+            &model,
+            &pop,
+            &model.default_params,
+            1,
+            fixed_bolus,
+            &mk(false),
+        )
+        .expect("unverified run");
+        assert_eq!(checked.ledger, unchecked.ledger);
+        let ip = |r: &AdaptiveSimulationResult| {
+            r.trajectories.iter().map(|t| t.ipred).collect::<Vec<_>>()
+        };
+        assert_eq!(ip(&checked), ip(&unchecked));
+    }
+
+    // ----- S1.5: DV-mode (assay-noised) monitors --------------------------
+
+    /// Factory (mirrors `fixed_bolus`): titrate on the *measured* (DV) central
+    /// amount "A" — dose 100 mg when it falls below 50, else hold.
+    fn dv_threshold() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
+        |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("monitor A declared") < 50.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        }
+    }
+
+    #[test]
+    fn dv_monitor_run_passes_default_verifier() {
+        // End-to-end: a controller titrating on the DV signal, verify = true. Covers
+        // the assay-noise wiring (resid_var closure + per-subject base seed) and the
+        // driver's DV branch, and confirms the frozen-replay verifier stays green on
+        // a DV run (it replays realized doses, not decisions).
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let pop = population(vec![subj("1", vec![2.0, 6.0, 10.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(7),
+            decision_times: vec![0.0, 4.0, 8.0],
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
+            ..Default::default()
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, dv_threshold, &opts)
+            .expect("DV run passes the verifier");
+        assert_eq!(res.decisions.len(), 3);
+        // The DV value the controller saw is recorded, tagged as the Dv mode.
+        assert!(res
+            .decisions
+            .iter()
+            .all(|d| d.observed_signals[0].mode == ObserveMode::Dv));
+    }
+
+    #[test]
+    fn dv_monitor_collapses_to_ipred_as_sigma_to_zero() {
+        // sigma -> 0: titrating on the DV reproduces titrating on the latent IPRED,
+        // realized-ledger for realized-ledger.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let pop = population(vec![subj("1", vec![2.0, 6.0, 10.0], vec![])]);
+        let mut params = model.default_params.clone();
+        params.sigma.values = vec![1e-12];
+        let decision_times = vec![0.0, 4.0, 8.0];
+
+        let dv_opts = AdaptiveSimulateOptions {
+            seed: Some(7),
+            decision_times: decision_times.clone(),
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
+            ..Default::default()
+        };
+        let ipred_opts = AdaptiveSimulateOptions {
+            seed: Some(7),
+            decision_times,
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Ipred)],
+            ..Default::default()
+        };
+        let dv = simulate_adaptive(&model, &pop, &params, 1, dv_threshold, &dv_opts).expect("dv");
+        let ip =
+            simulate_adaptive(&model, &pop, &params, 1, dv_threshold, &ipred_opts).expect("ipred");
+        // Compare the *dosing decisions* (time/amt/cmt/rate), not the recorded
+        // observed signals: the residual variance floors at MIN_VARIANCE, so the DV
+        // readout never collapses to IPRED bit-for-bit — but the decisions it drives
+        // do. (The exact bit-for-bit collapse is pinned at the driver level with a
+        // literal zero-variance resolver.)
+        let schedule = |r: &AdaptiveSimulationResult| {
+            r.ledger
+                .iter()
+                .map(|e| (e.time, e.amt, e.cmt, e.rate))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            schedule(&dv),
+            schedule(&ip),
+            "DV with sigma→0 must make the same dosing decisions as IPRED"
+        );
+    }
+
+    #[test]
+    fn adding_dv_monitor_does_not_perturb_eta_trajectory() {
+        // Isolation: the controller-assay substream is disjoint from the η stream,
+        // so enabling a DV monitor leaves the η draws (hence the IPRED trajectory)
+        // bit-identical. Uses ODE_IIV (η on CL) and a signal-independent controller,
+        // so any trajectory difference could only come from a shifted η draw.
+        let model = parse_model_string(ODE_IIV).expect("parse");
+        let pop = population(vec![
+            subj("1", vec![6.0, 30.0], vec![]),
+            subj("2", vec![6.0, 30.0], vec![]),
+        ]);
+        let opts = |monitors: Vec<MonitorSpec>| AdaptiveSimulateOptions {
+            seed: Some(3),
+            decision_times: vec![0.0, 24.0],
+            monitors,
+            ..Default::default()
+        };
+        let no_mon = simulate_adaptive(
+            &model,
+            &pop,
+            &model.default_params,
+            3,
+            fixed_bolus,
+            &opts(vec![]),
+        )
+        .expect("no monitor");
+        let with_dv = simulate_adaptive(
+            &model,
+            &pop,
+            &model.default_params,
+            3,
+            fixed_bolus,
+            &opts(vec![MonitorSpec::new("A", 1, ObserveMode::Dv)]),
+        )
+        .expect("dv monitor");
+        let ip = |r: &AdaptiveSimulationResult| {
+            r.trajectories.iter().map(|t| t.ipred).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ip(&no_mon),
+            ip(&with_dv),
+            "a DV monitor must not shift the η draws / IPRED trajectory"
+        );
+    }
+
+    #[test]
+    fn dv_assay_draws_are_permutation_invariant() {
+        // The controller-assay substream is keyed by subject id, so a subject's DV
+        // draws — and thus its decisions — do not depend on iteration order. A large
+        // residual CV makes the noise flip decisions (so a position-keyed stream
+        // *would* change the ledger), and ODE_NO_IIV keeps η out of the picture.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let mut params = model.default_params.clone();
+        params.sigma.values = vec![0.3]; // 30% proportional CV: noise is consequential
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(11),
+            decision_times: vec![0.0, 4.0, 8.0],
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
+            ..Default::default()
+        };
+        let a = subj("A", vec![2.0, 6.0, 10.0], vec![]);
+        let b = subj("B", vec![2.0, 6.0, 10.0], vec![]);
+        let pop_ab = population(vec![a.clone(), b.clone()]);
+        let pop_ba = population(vec![b, a]);
+        let r_ab = simulate_adaptive(&model, &pop_ab, &params, 1, dv_threshold, &opts).expect("ab");
+        let r_ba = simulate_adaptive(&model, &pop_ba, &params, 1, dv_threshold, &opts).expect("ba");
+
+        let ledger_for = |r: &AdaptiveSimulationResult, id: &str| {
+            r.ledger
+                .iter()
+                .filter(|e| e.subject == id)
+                .map(|e| (e.time, e.amt))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ledger_for(&r_ab, "A"),
+            ledger_for(&r_ba, "A"),
+            "A's DV-driven doses must be order-independent"
+        );
+        assert_eq!(
+            ledger_for(&r_ab, "B"),
+            ledger_for(&r_ba, "B"),
+            "B's DV-driven doses must be order-independent"
+        );
+
+        // Non-vacuity: the assay noise must actually be id-keyed (not a no-op), or
+        // the invariance above could hold even under a position-keyed stream. At
+        // t=4 the trough is ~67 (non-zero, so proportional noise is live), and A and
+        // B observe *different* measured values — confirming the noise is consequential.
+        let dv_at = |r: &AdaptiveSimulationResult, id: &str, didx: usize| {
+            r.decisions
+                .iter()
+                .find(|d| d.subject == id && d.decision_idx == didx)
+                .map(|d| d.observed_signals[0].value)
+                .expect("decision logged")
+        };
+        assert_ne!(
+            dv_at(&r_ab, "A", 1),
+            dv_at(&r_ab, "B", 1),
+            "id-keyed assay noise must differ between subjects (test would be vacuous otherwise)"
         );
     }
 }

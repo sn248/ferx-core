@@ -10,8 +10,8 @@
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
 use crate::pk::absorption::PreparedInputRate;
 use crate::sim::adaptive::{
-    AdaptiveRun, ControllerCtx, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry,
-    MonitorSpec, ObserveMode, ObservedSignal,
+    assay_standard_normal, AdaptiveRun, AssayNoise, ControllerCtx, DecisionLogEntry,
+    DecisionOutcome, DoseAction, DoseLedgerEntry, MonitorSpec, ObserveMode, ObservedSignal,
 };
 use crate::types::{DoseEvent, PkParams, Subject};
 use std::borrow::Cow;
@@ -472,6 +472,107 @@ pub(crate) fn active_infusions(
         .collect()
 }
 
+/// One dose's zero-order absorption window — `(cmt_idx, rate, w_start, w_end)`,
+/// the constant `rate = F·amt/dur` delivered over
+/// `[w_start, w_end] = [time+lag, time+lag+dur]`. The tuple shape mirrors
+/// [`gated_infusions`].
+///
+/// `dur`/`F`/`lag` are **dose-time** attributes (fixed when the dose is given), so
+/// the window and its rate are built from **one** PK snapshot per dose — the
+/// per-dose `pk_at_dose[k]` on the event-driven path, the single subject snapshot
+/// `pk_params_flat` on the dense paths — and that one snapshot is the invariant
+/// that keeps `∫R_in = F·amt` exact even under time-varying covariates:
+/// re-deriving the rate from the *running* (mid-window) snapshot would let it
+/// drift and silently break mass balance. The event-driven path materialises the
+/// windows once and reuses them across segments; the dense paths re-derive them
+/// per segment, but always from that same fixed snapshot, so every segment sees
+/// byte-identical edges and rate (the cost is a small, often-empty `Vec`).
+type ZeroOrderWindow = (usize, f64, f64, f64);
+
+/// Build the per-dose [`ZeroOrderWindow`]s for a subject. `dur_for_dose` yields the
+/// floored `dur` for dose `k` from *its* PK snapshot — a single subject snapshot on
+/// the dense paths, the per-dose `pk_at_dose[k]` on the time-varying / event-driven
+/// path — so the window edges and rate stay consistent with that snapshot wherever
+/// it is also read (the break placement and the per-segment filter share this one
+/// source). Doses not feeding a `zero_order` forcing contribute no window.
+fn zero_order_windows(
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+    dose_f_bio: &[f64],
+    dur_for_dose: impl Fn(usize, &DoseEvent) -> Option<f64>,
+) -> Vec<ZeroOrderWindow> {
+    let mut out = Vec::new();
+    for (k, d) in doses.iter().enumerate() {
+        let Some(dur) = dur_for_dose(k, d) else {
+            continue;
+        };
+        let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+        let f_bio = dose_f_bio.get(k).copied().unwrap_or(1.0);
+        let w_start = d.time + lag;
+        out.push((
+            d.cmt.saturating_sub(1),
+            f_bio * d.amt / dur,
+            w_start,
+            w_start + dur,
+        ));
+    }
+    out
+}
+
+/// The per-segment **constant** zero-order rates whose window fully contains the
+/// closed segment `[t_start, t_end]` — the artifact-free analogue of
+/// [`active_infusions`] for `zero_order(dur)` forcings (#504).
+///
+/// A zero-order input delivers a constant `F·amt/dur` over its window. Evaluating
+/// the hard `tad ≤ dur` cutoff **pointwise** inside RK45 mis-resolves the step: the
+/// post-cutoff segment's left endpoint (`t = dur`) still reads the in-window rate,
+/// so the adaptive solver's first stage there over-counts a sliver of mass.
+/// Delivering it as a per-segment constant — like an infusion — sidesteps that: a
+/// window is included **only if it fully contains the segment** (`w_start ≤ t_start`
+/// and `w_end ≥ t_end`), so the post-cutoff segment (whose right end is past
+/// `w_end`) is correctly excluded. The break-time list splits at `w_end` (see
+/// [`push_zero_order_break_times`]) so every segment is fully inside or outside each
+/// window — the invariant this test relies on, exactly as [`active_infusions`]
+/// relies on it for infusion windows. `reset_floor` turns off windows opened before
+/// the most recent reset (EVID=3/4).
+fn active_zero_order_inputs(
+    windows: &[ZeroOrderWindow],
+    t_start: f64,
+    t_end: f64,
+    reset_floor: f64,
+) -> Vec<(usize, f64)> {
+    windows
+        .iter()
+        .filter(|&&(_, _, w_start, w_end)| {
+            w_start >= reset_floor
+                && w_start <= t_start + INFUSION_EPS
+                && w_end >= t_end - INFUSION_EPS
+        })
+        .map(|&(cmt, rate, _, _)| (cmt, rate))
+        .collect()
+}
+
+/// The floored zero-order duration `dur` for `dose`, if `dose` feeds a
+/// `zero_order(dur)` forcing (positive amount into that forcing's compartment);
+/// else `None`. The window length read through [`PreparedInputRate`] (so it is
+/// floored identically to the `R_in` evaluation); used by the [`zero_order_windows`]
+/// `dur_for_dose` closures and the event-driven timeline's cutoff break.
+fn zero_order_dur_for_dose(ode: &OdeSpec, dose: &DoseEvent, pk_params: &[f64]) -> Option<f64> {
+    if dose.amt <= 0.0 {
+        return None;
+    }
+    ode.input_rate.iter().find_map(|f| {
+        if f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt + 1 == dose.cmt {
+            match f.prepare(pk_params) {
+                PreparedInputRate::ZeroOrder { dur, .. } => Some(dur),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    })
+}
+
 /// True if a built-in absorption input-rate forcing (transit/etc.) feeds the
 /// compartment `cmt_1based` (the data file's 1-based CMT). A dose into such a
 /// compartment delivers its mass via `R_in(tad)` integrated over time
@@ -485,6 +586,24 @@ pub(crate) fn input_rate_consumes_cmt(ode: &OdeSpec, cmt_1based: usize) -> bool 
             .input_rate
             .iter()
             .any(|f| f.cmt == cmt_1based.saturating_sub(1))
+}
+
+/// Push the hard-cutoff break times — each window's end `w_end` — for the
+/// subject's precomputed zero-order windows (#504) onto a dense-path `break_times`
+/// list.
+///
+/// A zero-order input delivers a constant rate over `[w_start, w_end]` then stops —
+/// a step discontinuity at `w_end` that the smooth densities (transit/igd/weibull)
+/// don't have. Without a break there, the adaptive RK45 steps across the cutoff and
+/// mis-resolves the absorbed mass, so the timeline must break at `w_end` for every
+/// zero-order window — exactly mirroring the infusion-end break. Because the break
+/// reads `w_end` from the same [`ZeroOrderWindow`] the per-segment filter uses
+/// ([`active_zero_order_inputs`]), the segment edge and the containment boundary
+/// can't drift apart. Doses turned off by a later reset still get a harmless extra
+/// break (over-segmentation only). No-op for the common model with no zero-order
+/// window.
+fn push_zero_order_break_times(break_times: &mut Vec<f64>, windows: &[ZeroOrderWindow]) {
+    break_times.extend(windows.iter().map(|&(_, _, _, w_end)| w_end));
 }
 
 /// How a segment's infusions are injected as a `+rate` derivative term in the
@@ -587,6 +706,14 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
         if forcing.cmt >= dy.len() {
             continue;
         }
+        // Zero-order is delivered as a per-segment constant (`active_zero_order_inputs`,
+        // routed through the wrapper's spanning channel), not pointwise: its hard
+        // `tad ≤ dur` cutoff would otherwise let the post-cutoff segment's left
+        // endpoint over-count a sliver of mass (#504). Skip it here; the smooth
+        // densities (transit/igd/weibull) stay on this exact pointwise path.
+        if forcing.kind == crate::pk::absorption::InputRateKind::ZeroOrder {
+            continue;
+        }
         let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
             if d.cmt.saturating_sub(1) != forcing.cmt {
@@ -626,6 +753,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
 /// `f64::NEG_INFINITY` because the dispatcher routes reset subjects to the
 /// event-driven walker; the two reset-aware paths pass a real floor. `prepared`
 /// is the per-segment hoist from [`prepare_input_rates`].
+#[allow(clippy::too_many_arguments)] // each is a distinct slice of dose/forcing context
 fn wrap_rhs_with_forcings<'a>(
     ode: &'a OdeSpec,
     doses: &'a [DoseEvent],
@@ -634,9 +762,19 @@ fn wrap_rhs_with_forcings<'a>(
     reset_floor: f64,
     prepared: &'a [PreparedInputRate],
     infusions: InfusionInput,
+    zero_order: &'a [(usize, f64)],
 ) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
     move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
         (ode.rhs)(y, p, t, dy);
+        // Zero-order absorption (#504): a constant rate per *segment*, injected the
+        // same way as a spanning infusion (independent of the infusion gating
+        // shape). The caller passes only the windows that fully contain this
+        // segment (`active_zero_order_inputs`), so there is no time gate here.
+        for &(cmt_idx, rate) in zero_order {
+            if cmt_idx < dy.len() {
+                dy[cmt_idx] += rate;
+            }
+        }
         match &infusions {
             InfusionInput::Spanning(active) => {
                 for &(cmt_idx, rate) in active {
@@ -951,6 +1089,15 @@ fn integrate_segment(
         dose_f_bio,
         f64::NEG_INFINITY,
     );
+    // Zero-order absorption windows fully covering this segment (#504): constant
+    // `F·amt/dur` injected like a spanning infusion. The dense path has a single
+    // subject snapshot (`pk_params_flat`), so the windows are the same every
+    // segment and consistent with `ode_predictions`' break placement. (Empty for
+    // the common model / a non-zero_order subject — e.g. the adaptive caller.)
+    let zo_windows = zero_order_windows(&subject.doses, dose_lagtimes, dose_f_bio, |_, d| {
+        zero_order_dur_for_dose(ode, d, pk_params_flat)
+    });
+    let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, f64::NEG_INFINITY);
     // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
     // snapshot `ext_params` is constant across the integration (#322 #7).
     let prepared = prepare_input_rates(ode, ext_params);
@@ -962,6 +1109,7 @@ fn integrate_segment(
         f64::NEG_INFINITY,
         &prepared,
         InfusionInput::Spanning(active),
+        &zero_order,
     );
     let sol = solve_ode(
         &wrapped_rhs,
@@ -1003,6 +1151,32 @@ pub fn ode_predictions(
     theta: &[f64],
     eta: &[f64],
     subject: &Subject,
+) -> Vec<f64> {
+    ode_predictions_with_extra_breaks(ode, pk_params_flat, theta, eta, subject, &[])
+}
+
+/// [`ode_predictions`] with additional, dose-free segment break points seeded
+/// into the integration timeline.
+///
+/// Each `extra_break` only *splits* an integration interval — the integrator
+/// restarts there with the carried state, but no dose, observation, or state
+/// change is applied (the TAFD/TAD anchors, derived from `subject.doses`, are
+/// untouched). On the smooth models we integrate the result is invariant to
+/// where a no-event break falls only up to the adaptive solver's own error
+/// control, so this is the lever the frozen-schedule replay verifier
+/// ([`verify_adaptive_frozen_replay`]) uses to reproduce the reactive driver's
+/// segment structure exactly: the driver restarts at *every* decision time
+/// (including holds and post-`Stop` no-ops), so replaying with those same
+/// decision times as breaks makes the two engines share `integrate_segment`
+/// over identical segments — turning the comparison bit-aligned rather than
+/// merely tolerance-close.
+pub(crate) fn ode_predictions_with_extra_breaks(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+    extra_breaks: &[f64],
 ) -> Vec<f64> {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
@@ -1087,7 +1261,24 @@ pub fn ode_predictions(
             break_times.push(dose.time);
         }
     }
+    // Zero-order windows for this subject (#504): the dense paths have a single
+    // PK snapshot, so the per-dose `dur`/`F`/`lag` come from `pk_params_flat`.
+    // Break at each window end so segments align with the cutoff, and reuse the
+    // same windows for the per-segment constant-rate injection below.
+    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
+        zero_order_dur_for_dose(ode, d, pk_params_flat)
+    });
+    push_zero_order_break_times(&mut break_times, &zo_windows);
     break_times.push(t_last);
+    // No-event break points (e.g. the reactive driver's decision times) — they
+    // only re-segment the integration, never change state. Drop non-positive /
+    // non-finite entries (0.0 is already present; the timeline starts at 0).
+    break_times.extend(
+        extra_breaks
+            .iter()
+            .copied()
+            .filter(|b| b.is_finite() && *b > 0.0),
+    );
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
@@ -1279,8 +1470,13 @@ fn reject_unsupported_dose_compartment(
 ///   discontinues *future* decisions only; an infusion already in flight
 ///   completes its delivery (a committed dose is not retracted — a true safety
 ///   halt is a separate, explicit action, tracked as a follow-up).
-/// - **`ObserveMode::Ipred` only.** A `Dv` (assay-noised) monitor errors until
-///   S1.5 adds the per-subject RNG substreams that keep assay draws verifier-safe.
+/// - **Monitors resolve per-mode (S1.5).** `ObserveMode::Ipred` reads the latent
+///   state; `ObserveMode::Dv` adds the endpoint's residual draw — `IPRED +
+///   ε·√(residual variance)`, clamped at 0 — on the controller-assay substream
+///   carried in `assay` (keyed `(subject, replicate, decision, analyte)`). A `Dv`
+///   monitor with `assay = None`, or on a compartment with no `[error_model]`, is
+///   a typed error (never a fabricated σ). The all-`Ipred` path draws nothing, so
+///   it is byte-identical regardless of `assay`.
 /// - **Dose-free base subject** — the regimen is entirely controller-driven
 ///   (augmenting pre-scheduled doses is a later step).
 /// - **No lagged or input-rate (absorption) dosing.** Controller dosing into a
@@ -1308,9 +1504,9 @@ fn reject_unsupported_dose_compartment(
 /// break only restarts the integrator on a no-event segment, so predictions are
 /// unaffected on the smooth models tested; genuinely reactive/hold regimens are
 /// therefore pinned against the closed form instead.
-// `dead_code`: this is `pub(crate)` and exercised by tests; the public
-// `simulate_adaptive()` entry point that consumes it lands in S1.4 (#391).
-#[allow(clippy::too_many_arguments, dead_code)]
+// Consumed by the public `crate::api::simulate_adaptive()` entry point (S1.4b,
+// #391), which wraps it with per-(subject, replicate) orchestration.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ode_predictions_adaptive(
     ode: &OdeSpec,
     pk_params_flat: &[f64],
@@ -1321,6 +1517,9 @@ pub(crate) fn ode_predictions_adaptive(
     monitors: &[MonitorSpec],
     controller: &mut dyn FnMut(&ControllerCtx) -> Vec<DoseAction>,
     max_decisions: usize,
+    // Assay-noise capability for `Dv` monitors (#391 S1.5). `None` ⇒ Ipred-only;
+    // a `Dv` monitor then errors at its first decision.
+    assay: Option<&AssayNoise>,
 ) -> Result<AdaptiveRun, String> {
     let n = ode.n_states;
 
@@ -1340,13 +1539,6 @@ pub(crate) fn ode_predictions_adaptive(
         ));
     }
     for m in monitors {
-        if m.mode == ObserveMode::Dv {
-            return Err(format!(
-                "monitor '{}' requests DV (assay-noised) observation, which needs the per-subject \
-                 RNG substreams added in S1.5; the S1.3a driver serves Ipred monitors only",
-                m.name
-            ));
-        }
         if m.cmt == 0 || m.cmt > n {
             return Err(format!(
                 "monitor '{}' observes compartment {} but the model has {} state(s)",
@@ -1431,8 +1623,43 @@ pub(crate) fn ode_predictions_adaptive(
                 let mut signals: HashMap<String, f64> = HashMap::new();
                 let mut observed: Vec<ObservedSignal> = Vec::with_capacity(monitors.len());
                 for m in monitors {
-                    let value =
+                    let latent =
                         read_observable(ode, &u, pk_params_flat, theta, eta, decision_cov, m.cmt);
+                    // Resolve the monitored signal on its own mode: Ipred is the
+                    // latent readout; Dv adds the endpoint's assay residual draw on
+                    // the controller-assay substream (#391 S1.5).
+                    let value = match m.mode {
+                        ObserveMode::Ipred => latent,
+                        ObserveMode::Dv => {
+                            let a = assay.ok_or_else(|| {
+                                format!(
+                                    "decision {decision_index} at t={t_start}: monitor '{}' \
+                                     requests DV (assay-noised) observation but no assay-noise \
+                                     capability was supplied (Ipred-only run)",
+                                    m.name
+                                )
+                            })?;
+                            // Edge (a): a DV monitor on a compartment with no
+                            // residual error model is a typed error, not a guessed σ.
+                            let var = (a.resid_var)(m.cmt, latent).ok_or_else(|| {
+                                format!(
+                                    "decision {decision_index} at t={t_start}: monitor '{}' \
+                                     requests DV observation on compartment {} but no [error_model] \
+                                     defines residual error there",
+                                    m.name, m.cmt
+                                )
+                            })?;
+                            // `has_residual_error_for_cmt` (the gate behind `resid_var`)
+                            // requires `sigma` to cover the model's σ indices, so a `Some`
+                            // here is panic-free and structurally finite — no downstream
+                            // finiteness guard. Value-pathology (a NaN/∞ in `sigma`, a
+                            // diverged IPRED) is whole-sim garbage-in, out of scope here.
+                            let eps = assay_standard_normal(a.base_seed, decision_index, &m.name);
+                            // Edge (b): an assay cannot read below zero; clamp the
+                            // noised value at 0 (BLQ-blinding is deferred to Part F).
+                            (latent + var.sqrt() * eps).max(0.0)
+                        }
+                    };
                     signals.insert(m.name.clone(), value);
                     observed.push(ObservedSignal {
                         name: m.name.clone(),
@@ -1673,6 +1900,102 @@ pub(crate) fn ode_predictions_adaptive(
     })
 }
 
+/// Frozen-schedule replay verifier — the Part-E backbone of #391, default-on in
+/// [`crate::api::simulate_adaptive`].
+///
+/// Rebuild the *static* dose schedule from a reactive run's realized `ledger`,
+/// integrate it through the trusted static engine ([`ode_predictions`]) on the
+/// same `eta`, and check the reactive trajectory against it. The reactive driver
+/// (which re-plans break times as the controller acts) and `ode_predictions`
+/// (which plans up front) are different code, so agreement proves **the driver
+/// applied every realized dose identically to the static engine** — cleanly
+/// separating dose-bookkeeping correctness from controller logic (the latter is
+/// captured in the ledger). A divergence localizes a bug to dose application.
+///
+/// The replay reproduces the reactive driver's **segment structure**, so the
+/// check sits at the solver's true round-off floor rather than a held-decision
+/// slack. The driver restarts the integrator at *every* decision time (holds and
+/// post-`Stop` no-ops included); a naive static replay breaks only at realized
+/// doses, so a held decision used to perturb the adaptive RK45 step sequence at
+/// the solver's error level and forced a wide (×100) tolerance. Here the
+/// `decision_times` are fed back in as no-op breaks
+/// ([`ode_predictions_with_extra_breaks`]), so both engines walk the same
+/// segments through the same `integrate_segment` — agreement is bit-aligned, and
+/// the bound is a small multiple of the solver tolerance, tight enough to catch a
+/// sub-percent bookkeeping error (a dropped dose, wrong compartment, or
+/// double-applied `F` moves a prediction by O(dose), i.e. tens of percent) while
+/// staying clear of pure floating-point accumulation. A default-on verifier must
+/// never false-positive on a legitimate run; the exact double-entry / mass-
+/// balance bookkeeping checks are S6.
+///
+/// `decision_times` is the full schedule the run was driven from (not just the
+/// realized-dose times) — post-`Stop` decisions are not in `run.decisions` but
+/// the driver still breaks at them, so the realized ledger alone cannot
+/// reconstruct the segmentation.
+///
+/// `base_subject` is the dose-free subject the run was driven from; its
+/// observation grid (and any covariates) carry over, only `doses` are replaced
+/// with the realized ledger. The ledger stores nominal `amt`/`rate`
+/// (pre-bioavailability), exactly as a `subject.doses` entry, so `F`/lag re-apply
+/// downstream identically.
+pub(crate) fn verify_adaptive_frozen_replay(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    base_subject: &Subject,
+    decision_times: &[f64],
+    run: &AdaptiveRun,
+) -> Result<(), String> {
+    let mut static_subject = base_subject.clone();
+    static_subject.doses = run
+        .ledger
+        .iter()
+        .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+        .collect();
+
+    let static_preds = ode_predictions_with_extra_breaks(
+        ode,
+        pk_params_flat,
+        theta,
+        eta,
+        &static_subject,
+        decision_times,
+    );
+
+    if static_preds.len() != run.predictions.len() {
+        return Err(format!(
+            "frozen replay produced {} prediction(s) but the reactive run has {}",
+            static_preds.len(),
+            run.predictions.len()
+        ));
+    }
+
+    // Segment structures now match, so the slack is bounded by floating-point
+    // accumulation across the shared integration, not by where holds fall. A
+    // small multiple of the solver's own error control covers that while still
+    // flagging any sub-percent dose-bookkeeping divergence.
+    const REPLAY_TOL_FACTOR: f64 = 8.0;
+    let rel_tol = (REPLAY_TOL_FACTOR * ode.solver_opts.reltol).max(1e-9);
+    let abs_tol = (REPLAY_TOL_FACTOR * ode.solver_opts.abstol).max(1e-12);
+    for (j, (got, want)) in run.predictions.iter().zip(static_preds.iter()).enumerate() {
+        // Unrecorded slots are NaN in both engines (same observation grid), so
+        // NaN==NaN is agreement; a NaN-vs-finite split is a genuine divergence.
+        if got.is_nan() && want.is_nan() {
+            continue;
+        }
+        let diff = (got - want).abs();
+        let tol = abs_tol + rel_tol * want.abs();
+        if !(diff <= tol) {
+            return Err(format!(
+                "prediction {j} diverges from the frozen-schedule replay: \
+                 reactive={got}, static={want}, |Δ|={diff} > tol={tol}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// ODE-based predictions with per-event PK parameters (time-varying-covariate
 /// aware). Walks the merged dose+obs+pk-only timeline, integrating each
 /// segment `[cur_t, t_event]` with the PK params evaluated at `t_event` —
@@ -1826,6 +2149,14 @@ pub fn ode_predictions_event_driven(
             let (_, dur_eff) = d.bioavailable_infusion(dose_f_bio[k]);
             timeline.push((d.time + lag + dur_eff, Kind::InfusionEnd, k));
         }
+        // Zero-order absorption cutoff (#504): a dose feeding a `zero_order(dur)`
+        // compartment delivers a constant rate over `(0, dur]`, so break at the
+        // window end `d.time+lag+dur` exactly like an infusion end (no record, no
+        // state change — just a segment boundary so `active_zero_order_inputs`'s
+        // full-containment test sees each segment fully inside or outside).
+        if let Some(dur) = zero_order_dur_for_dose(ode, d, &pk_at_dose[k].values) {
+            timeline.push((d.time + lag + dur, Kind::InfusionEnd, k));
+        }
     }
     for (j, &t) in subject.obs_times.iter().enumerate() {
         timeline.push((t, Kind::Obs, j));
@@ -1837,6 +2168,16 @@ pub fn ode_predictions_event_driven(
         a.0.partial_cmp(&b.0)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| kind_order(a.1).cmp(&kind_order(b.1)))
+    });
+
+    // Zero-order windows (#504) read from each dose's **own** PK snapshot
+    // (`pk_at_dose[k]`) — the same per-dose source as the timeline cutoff above, so
+    // the window edge `w_end` and the per-segment containment test below agree, and
+    // the constant rate `F·amt/dur` is fixed at dose time (mass-exact even when
+    // `dur` rides a time-varying covariate, where a per-segment recompute would
+    // drift). Precomputed once here, then filtered per segment in the loop.
+    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |k, d| {
+        zero_order_dur_for_dose(ode, d, &pk_at_dose[k].values)
     });
 
     let mut cur_t = timeline[0].0;
@@ -1909,6 +2250,15 @@ pub fn ode_predictions_event_driven(
                 &dose_f_bio,
                 reset_floor,
             );
+            // Zero-order absorption windows covering [cur_t, t_event] (#504),
+            // reset-aware via the same `reset_floor` (a window opened pre-reset
+            // is off). Constant `F·amt/dur`, injected like a spanning infusion.
+            // `zo_windows` is precomputed once from the per-dose `pk_at_dose`
+            // snapshots (below), the same source as the timeline's cutoff break —
+            // so the window edge and the containment boundary can't drift apart,
+            // and the constant rate is fixed at dose time (mass-exact under
+            // time-varying covariates).
+            let zero_order = active_zero_order_inputs(&zo_windows, cur_t, t_event, reset_floor);
             // Hoist the input-rate constants once per segment (#322 #7); the
             // segment PK snapshot `ext_params_ed` is constant for the integration.
             let prepared = prepare_input_rates(ode, &ext_params_ed);
@@ -1920,6 +2270,7 @@ pub fn ode_predictions_event_driven(
                 reset_floor,
                 &prepared,
                 InfusionInput::Spanning(active),
+                &zero_order,
             );
             let saveat = vec![t_event];
             let sol = solve_ode(
@@ -2228,6 +2579,14 @@ pub fn ode_predictions_with_states(
             break_times.push(dose.time);
         }
     }
+    // Zero-order windows for this subject (#504): the dense paths have a single
+    // PK snapshot, so the per-dose `dur`/`F`/`lag` come from `pk_params_flat`.
+    // Break at each window end so segments align with the cutoff, and reuse the
+    // same windows for the per-segment constant-rate injection below.
+    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
+        zero_order_dur_for_dose(ode, d, pk_params_flat)
+    });
+    push_zero_order_break_times(&mut break_times, &zo_windows);
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
@@ -2349,6 +2708,9 @@ pub fn ode_predictions_with_states(
         // Resolve each active infusion to (cmt_idx, F·rate, t_start, t_end) for
         // the time-gated injection inside the seam (CMT=0 / out-of-range dropped).
         let gated = gated_infusions(&active_infusions, &subject.doses, &dose_f_bio, n);
+        // Zero-order absorption windows covering this segment (#504): constant
+        // `F·amt/dur` injected alongside the gated infusions (empty otherwise).
+        let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, f64::NEG_INFINITY);
         // Hoist the input-rate constants once per segment (#322 #7).
         let prepared = prepare_input_rates(ode, &ext_params);
         let wrapped_rhs = wrap_rhs_with_forcings(
@@ -2359,6 +2721,7 @@ pub fn ode_predictions_with_states(
             f64::NEG_INFINITY,
             &prepared,
             InfusionInput::Gated(gated),
+            &zero_order,
         );
 
         let sol = solve_ode(
@@ -2548,6 +2911,14 @@ pub fn ode_dense_solve_states(
     for &rt in &subject.reset_times {
         break_times.push(rt);
     }
+    // Zero-order windows for this subject (#504): the dense paths have a single
+    // PK snapshot, so the per-dose `dur`/`F`/`lag` come from `pk_params_flat`.
+    // Break at each window end so segments align with the cutoff, and reuse the
+    // same windows for the per-segment constant-rate injection below.
+    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
+        zero_order_dur_for_dose(ode, d, pk_params_flat)
+    });
+    push_zero_order_break_times(&mut break_times, &zo_windows);
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
@@ -2673,6 +3044,10 @@ pub fn ode_dense_solve_states(
             .filter(|&rt| rt <= t_start + 1e-12)
             .fold(f64::NEG_INFINITY, f64::max);
 
+        // Zero-order absorption windows covering this segment (#504): constant
+        // `F·amt/dur`, reset-aware via the same `reset_floor` (a window opened
+        // pre-reset is off), injected alongside the gated infusions.
+        let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, reset_floor);
         // Hoist the input-rate constants once per segment (#322 #7).
         let prepared = prepare_input_rates(ode, &ext_params);
         let wrapped_rhs = wrap_rhs_with_forcings(
@@ -2683,6 +3058,7 @@ pub fn ode_dense_solve_states(
             reset_floor,
             &prepared,
             InfusionInput::Gated(gated),
+            &zero_order,
         );
 
         let sol = solve_ode(
@@ -2884,6 +3260,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -2906,6 +3283,204 @@ mod tests {
             assert_eq!(run.ledger[i].decision_idx, i);
             assert_eq!(run.ledger[i].dose_idx, i);
         }
+    }
+
+    #[test]
+    fn frozen_replay_verifier_accepts_aligned_run_and_rejects_corruption() {
+        // The verifier's Err branches aren't reachable from a faithful run (the
+        // bookkeeping is correct), so exercise them directly: a faithful run
+        // passes, a perturbed trajectory is a typed divergence error, and a
+        // wrong-length prediction vector is a typed error rather than a panic.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let decisions = [0.0, 24.0, 48.0];
+        let obs = vec![6.0, 30.0, 54.0];
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let base = make_subject(vec![], obs);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+            None,
+        )
+        .expect("driver runs");
+
+        // A dose at every decision aligns the segment structure → exact match.
+        verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &decisions, &run)
+            .expect("aligned run matches the static replay");
+
+        let mut perturbed = run.clone();
+        perturbed.predictions[0] += 10.0;
+        let err = verify_adaptive_frozen_replay(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &perturbed,
+        )
+        .expect_err("a perturbed trajectory must fail verification");
+        assert!(err.contains("diverges"), "got: {err}");
+
+        let mut short = run.clone();
+        short.predictions.pop();
+        let err =
+            verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &decisions, &short)
+                .expect_err("a length mismatch must fail verification");
+        assert!(err.contains("prediction"), "got: {err}");
+    }
+
+    #[test]
+    fn frozen_replay_aligns_break_structure_on_held_decisions() {
+        // Regression for the held-decision tolerance fix: a run that holds at
+        // some decisions used to only agree with the static replay within a wide
+        // (×100·reltol) slack, because the driver breaks at every decision while a
+        // naive static replay breaks only at realized doses. Feeding the decision
+        // schedule back in as no-op breaks aligns the two engines' segments, so
+        // the run now passes the *tight* default verifier. Dose only while the
+        // central amount is below 50: at t=0 the trough is 0 → dose; the later
+        // decisions see a decayed-but-still-high amount → hold.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let decisions = [0.0, 2.0, 4.0];
+        let obs = vec![1.0, 3.0, 5.0];
+        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
+        let mut controller = |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("monitor A declared") < 50.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        };
+        let base = make_subject(vec![], obs);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &monitors,
+            &mut controller,
+            100,
+            None,
+        )
+        .expect("driver runs");
+        // Exactly one realized dose (t=0); the t=2 / t=4 decisions held.
+        assert_eq!(run.ledger.len(), 1, "only the t=0 decision should dose");
+
+        // Passes the tight (aligned) verifier — the whole point of the fix.
+        verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &decisions, &run)
+            .expect("held-decision run matches the aligned static replay");
+    }
+
+    #[test]
+    fn frozen_replay_residual_is_pinned_below_the_verifier_bound() {
+        // Characterization of the residual that justifies the verifier's tolerance
+        // factor (`REPLAY_TOL_FACTOR = 8`). On a held-decision run we measure the
+        // max relative |reactive − static| both ways:
+        //   * ALIGNED   (decision times fed back as no-op breaks): measured 0.0 —
+        //     the reactive driver and the static engine, walking identical segments
+        //     through the same `integrate_segment`, agree BIT-FOR-BIT.
+        //   * UNALIGNED (naive replay, breaks only at realized doses): measured
+        //     ~7.3e-8 here — a real held-decision perturbation that the alignment
+        //     removes entirely.
+        // Both sit far under the live verifier bound (×8·reltol = 8e-4), so it
+        // never false-positives; the ×8 is the conservative margin that holds even
+        // on stiffer models where the (pre-alignment) perturbation would be larger.
+        // If the alignment ever regresses, `rel_aligned` jumps toward the unaligned
+        // level and the bit-exact bound below fails loudly.
+        let ode = one_cpt_ode_spec(); // reltol 1e-4 / abstol 1e-6 (defaults)
+        let pk = pk_one(1.0, 10.0);
+        // CL=1, V=10 → k=0.1/h. A 100-unit bolus only while the central amount is
+        // below 50; it decays 100·e^{-0.1t}, crossing 50 near t≈6.9, so over this
+        // schedule the t=0 and t=8 troughs dose and t∈{2,4,6} hold — a dose/hold mix.
+        let decisions = [0.0, 2.0, 4.0, 6.0, 8.0];
+        let obs = vec![1.0, 3.0, 5.0, 7.0, 9.0];
+        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
+        let mut controller = |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("monitor A declared") < 50.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        };
+        let base = make_subject(vec![], obs);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &monitors,
+            &mut controller,
+            100,
+            None,
+        )
+        .expect("driver runs");
+        assert!(
+            run.ledger.len() >= 2,
+            "expected a dose/hold mix (≥2 realized doses), got {}",
+            run.ledger.len()
+        );
+
+        // Rebuild the static subject from the realized ledger, exactly as the
+        // verifier does.
+        let mut static_subject = base.clone();
+        static_subject.doses = run
+            .ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+            .collect();
+
+        let max_rel = |preds: &[f64]| -> f64 {
+            run.predictions
+                .iter()
+                .zip(preds)
+                .filter(|(g, w)| g.is_finite() && w.is_finite() && w.abs() > 0.0)
+                .map(|(g, w)| (g - w).abs() / w.abs())
+                .fold(0.0_f64, f64::max)
+        };
+
+        let aligned = ode_predictions_with_extra_breaks(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &static_subject,
+            &decisions,
+        );
+        let unaligned = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+
+        let rel_aligned = max_rel(&aligned);
+        let rel_unaligned = max_rel(&unaligned);
+
+        // Aligned replay is bit-exact (measured 0.0). Allow a few ULP of headroom
+        // for future legitimate reordering, but stay ~9 orders under the live ×8
+        // bound: a held-break-mismatch regression pushes this toward the unaligned
+        // level (~7e-8) and trips here long before the ×8 verifier would.
+        assert!(
+            rel_aligned <= 1e-12,
+            "aligned replay should match the reactive driver bit-for-bit, got {rel_aligned:e} \
+             (verifier bound is 8·reltol = 8e-4); the decision-time break alignment may have \
+             regressed"
+        );
+        // And the alignment is genuinely doing the work: the naive (unaligned)
+        // replay carries a real, measurable residual that the alignment eliminates.
+        assert!(
+            rel_unaligned > 1e-9,
+            "expected a measurable unaligned residual (the perturbation alignment removes); \
+             got {rel_unaligned:e} — if this is ~0 the scenario no longer holds any decisions, \
+             so the characterization is vacuous"
+        );
     }
 
     #[test]
@@ -2937,6 +3512,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3013,6 +3589,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3048,6 +3625,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert!(
@@ -3076,6 +3654,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert!(run.ledger.is_empty(), "zero-amount bolus records no dose");
@@ -3117,6 +3696,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3139,11 +3719,18 @@ mod tests {
         }
     }
 
+    // ----- S1.5: DV-mode (assay-noised) monitors (#391) -----------------
+
+    fn dv_monitor() -> [MonitorSpec; 1] {
+        [MonitorSpec::new("A", 1, ObserveMode::Dv)]
+    }
+
     #[test]
-    fn adaptive_rejects_dv_monitor() {
+    fn adaptive_dv_without_assay_capability_errors() {
+        // A DV monitor on an Ipred-only run (assay = None) is a typed error, not a
+        // silent fallback to the latent value.
         let ode = one_cpt_ode_spec();
         let pk = pk_one(1.0, 10.0);
-        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Dv)];
         let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
         let base = make_subject(vec![], vec![1.0]);
         let err = ode_predictions_adaptive(
@@ -3153,12 +3740,228 @@ mod tests {
             &[],
             &base,
             &[0.0],
-            &monitors,
+            &dv_monitor(),
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
-        assert!(err.contains("DV") || err.contains("S1.5"), "got: {err}");
+        assert!(
+            err.contains("DV") && err.contains("capability"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_dv_no_error_model_errors() {
+        // Edge (a): a DV monitor on a compartment with no residual error model is a
+        // typed error (resid_var returns None), never a fabricated sigma.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let base = make_subject(vec![], vec![1.0]);
+        let no_model = |_cmt: usize, _ipred: f64| None;
+        let assay = AssayNoise {
+            resid_var: &no_model,
+            base_seed: 7,
+        };
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &dv_monitor(),
+            &mut controller,
+            100,
+            Some(&assay),
+        )
+        .unwrap_err();
+        assert!(err.contains("error_model"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_dv_zero_variance_equals_ipred() {
+        // sigma -> 0: the DV signal collapses to the latent IPRED. Compare the value
+        // the controller saw under a zero-variance assay against an Ipred monitor on
+        // the same realized run.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0); // ke = 0.1
+        let decisions = [0.0, 24.0]; // dose at t=0, observe pre-dose trough at t=24
+        let base = make_subject(vec![], vec![24.0]);
+        let dose = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+
+        let mut ctrl_ref = dose;
+        let ref_run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[MonitorSpec::new("A", 1, ObserveMode::Ipred)],
+            &mut ctrl_ref,
+            100,
+            None,
+        )
+        .expect("ipred run");
+        let ipred = ref_run.decisions[1].observed_signals[0].value;
+
+        let zero_var = |_cmt: usize, _ipred: f64| Some(0.0);
+        let assay = AssayNoise {
+            resid_var: &zero_var,
+            base_seed: 12345,
+        };
+        let mut ctrl_dv = dose;
+        let dv_run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &dv_monitor(),
+            &mut ctrl_dv,
+            100,
+            Some(&assay),
+        )
+        .expect("dv run");
+        let dv = dv_run.decisions[1].observed_signals[0].value;
+
+        assert!(ipred > 0.0, "expected a non-zero trough at t=24");
+        assert_relative_eq!(dv, ipred, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn adaptive_dv_noised_and_deterministic() {
+        // Non-zero variance perturbs the latent IPRED, and the draw is reproducible:
+        // the same base seed yields the same value, a different seed a different one.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let decisions = [0.0, 24.0];
+        let base = make_subject(vec![], vec![24.0]);
+        let var4 = |_cmt: usize, _ipred: f64| Some(4.0); // sd = 2
+
+        let observe = |seed: u64| {
+            let assay = AssayNoise {
+                resid_var: &var4,
+                base_seed: seed,
+            };
+            let mut ctrl = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+            ode_predictions_adaptive(
+                &ode,
+                &pk.values,
+                &[],
+                &[],
+                &base,
+                &decisions,
+                &dv_monitor(),
+                &mut ctrl,
+                100,
+                Some(&assay),
+            )
+            .expect("dv run")
+            .decisions[1]
+                .observed_signals[0]
+                .value
+        };
+
+        let a = observe(999);
+        let b = observe(999);
+        let c = observe(1000);
+        assert_eq!(a, b, "same base seed must reproduce the assay draw");
+        assert_ne!(a, c, "a different base seed must change the assay draw");
+        let latent = 100.0 * (-2.4f64).exp(); // trough at t=24
+        assert!(
+            (a - latent).abs() > 1e-9,
+            "expected the assay to perturb the latent value"
+        );
+    }
+
+    #[test]
+    fn adaptive_dv_clamps_negative_at_zero() {
+        // Edge (b): the noised value cannot read below zero. At t=0 the pre-dose
+        // trough is 0, so a negative assay draw with a large sigma would push it
+        // negative; assert it clamps to exactly 0.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let neg_seed = (0u64..)
+            .find(|&s| assay_standard_normal(s, 0, "A") < 0.0)
+            .expect("some seed gives a negative draw");
+        let big_var = |_cmt: usize, _ipred: f64| Some(1.0e6);
+        let assay = AssayNoise {
+            resid_var: &big_var,
+            base_seed: neg_seed,
+        };
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &dv_monitor(),
+            &mut controller,
+            100,
+            Some(&assay),
+        )
+        .expect("dv run");
+        assert_eq!(
+            run.decisions[0].observed_signals[0].value, 0.0,
+            "a negative assay reading must clamp at 0"
+        );
+    }
+
+    #[test]
+    fn adaptive_dv_added_monitor_does_not_perturb_other_draw() {
+        // Non-perturbing: adding a second DV monitor (a new analyte) must not change
+        // the first analyte's draw — each is keyed by its own analyte name.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let decisions = [0.0, 24.0];
+        let base = make_subject(vec![], vec![24.0]);
+        let var4 = |_cmt: usize, _ipred: f64| Some(4.0);
+
+        let signal_a = |monitors: &[MonitorSpec]| {
+            let assay = AssayNoise {
+                resid_var: &var4,
+                base_seed: 555,
+            };
+            let mut ctrl = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+            let run = ode_predictions_adaptive(
+                &ode,
+                &pk.values,
+                &[],
+                &[],
+                &base,
+                &decisions,
+                monitors,
+                &mut ctrl,
+                100,
+                Some(&assay),
+            )
+            .expect("dv run");
+            run.decisions[1]
+                .observed_signals
+                .iter()
+                .find(|s| s.name == "A")
+                .expect("analyte A present")
+                .value
+        };
+
+        let one = [MonitorSpec::new("A", 1, ObserveMode::Dv)];
+        let two = [
+            MonitorSpec::new("A", 1, ObserveMode::Dv),
+            MonitorSpec::new("B", 1, ObserveMode::Dv),
+        ];
+        assert_eq!(
+            signal_a(&one),
+            signal_a(&two),
+            "adding analyte B must not perturb A's draw"
+        );
     }
 
     #[test]
@@ -3180,6 +3983,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("dose-free"), "got: {err}");
@@ -3201,6 +4005,7 @@ mod tests {
             &[],
             &mut controller,
             2,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("max_decisions"), "got: {err}");
@@ -3222,6 +4027,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("compartment"), "got: {err}");
@@ -3254,6 +4060,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3292,6 +4099,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("state"), "got: {err}");
@@ -3315,6 +4123,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("state"), "got: {err}");
@@ -3344,6 +4153,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("input-rate"), "got: {err}");
@@ -3368,6 +4178,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("lag time"), "got: {err}");
@@ -3412,6 +4223,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3459,6 +4271,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3507,6 +4320,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.ledger.len(), 1, "only the first decision infuses");
@@ -3555,6 +4369,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3610,6 +4425,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3662,6 +4478,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3698,6 +4515,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert!(
@@ -3729,6 +4547,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("rate"), "got: {err}");
@@ -3756,6 +4575,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("state"), "got: {err}");
@@ -3788,6 +4608,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("input-rate"), "got: {err}");
@@ -3816,6 +4637,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("lag time"), "got: {err}");
@@ -3847,6 +4669,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3893,6 +4716,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1, "only the stop decision is logged");
@@ -3919,6 +4743,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1, "stop ends the schedule after one");
@@ -3951,6 +4776,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1);
@@ -3987,6 +4813,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1);
@@ -4021,6 +4848,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1, "stop ends the schedule after one");
@@ -4046,6 +4874,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1);
@@ -4100,6 +4929,7 @@ mod tests {
                 &[],
                 &mut controller,
                 100,
+                None,
             )
             .expect_err("malformed / post-stop action list is rejected");
             assert!(err.contains(needle), "expected {needle:?}, got: {err}");
@@ -4425,6 +5255,133 @@ mod tests {
         assert!(!input_rate_consumes_cmt(&one_cpt_ode_spec(), 1));
     }
 
+    /// Single accumulator compartment (`dy = 0`) fed by a `zero_order(dur)`
+    /// forcing, `dur` at free slot 4 — the zero-order analogue of
+    /// `transit_accumulator_spec`, so its amount at large `t` equals the delivered
+    /// mass `∫R_in = F·amt` and at an interior `t < dur` equals the linear partial
+    /// `(F·amt/dur)·t` (a direct probe that the cutoff break is placed correctly).
+    fn zero_order_accumulator_spec() -> OdeSpec {
+        OdeSpec {
+            rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            }),
+            n_states: 1,
+            state_names: vec!["depot".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: vec![InputRateForcing {
+                cmt: 0,
+                kind: InputRateKind::ZeroOrder,
+                arg_slots: vec![4],
+            }],
+            init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+        }
+    }
+
+    fn pk_zero_order_vec(dur: f64, f: f64) -> Vec<f64> {
+        let mut v = vec![0.0; crate::types::MAX_PK_PARAMS];
+        v[4] = dur;
+        v[crate::types::PK_IDX_F] = f;
+        v
+    }
+
+    /// Build the per-dose windows from a single subject snapshot (the dense-path
+    /// shape) — the test analogue of the `|_, d| zero_order_dur_for_dose(...)`
+    /// closure the production callers pass.
+    fn zo_windows_for(
+        ode: &OdeSpec,
+        doses: &[DoseEvent],
+        lags: &[f64],
+        pk: &[f64],
+    ) -> Vec<ZeroOrderWindow> {
+        let f_bio: Vec<f64> = doses.iter().map(|_| 1.0).collect();
+        zero_order_windows(doses, lags, &f_bio, |_, d| {
+            zero_order_dur_for_dose(ode, d, pk)
+        })
+    }
+
+    #[test]
+    fn zero_order_window_edges_rate_and_cutoff_break() {
+        // A dose at t=2 into the zero-order compartment, lag 0.5, dur 4 ⇒ a window
+        // [2.5, 6.5] with rate F·amt/dur = 100/4 = 25, and a cutoff break at 6.5. A
+        // dose into a *different* compartment, and a zero-amount dose, contribute no
+        // window (so no break).
+        let ode = zero_order_accumulator_spec(); // cmt 0 ≡ 1-based CMT 1
+        let pk = pk_zero_order_vec(4.0, 1.0);
+        let doses = vec![
+            DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0), // feeds R_in
+            DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0), // other cmt → no window
+            DoseEvent::new(1.0, 0.0, 1, 0.0, false, 0.0),   // zero amt → no window
+        ];
+        let windows = zo_windows_for(&ode, &doses, &[0.5, 0.0, 0.0], &pk);
+        assert_eq!(windows, vec![(0, 25.0, 2.5, 6.5)]);
+
+        let mut breaks = Vec::new();
+        push_zero_order_break_times(&mut breaks, &windows);
+        assert_eq!(breaks, vec![6.5]);
+    }
+
+    #[test]
+    fn active_zero_order_includes_only_fully_contained_segments() {
+        // Window [2.5, 6.5], rate 25. A segment strictly inside is active; a segment
+        // straddling the cutoff (right end past w_end) is excluded — the
+        // full-containment rule that makes the post-cutoff mass exact. A reset_floor
+        // after the window start turns it off.
+        let windows: Vec<ZeroOrderWindow> = vec![(0, 25.0, 2.5, 6.5)];
+        assert_eq!(
+            active_zero_order_inputs(&windows, 3.0, 5.0, f64::NEG_INFINITY),
+            vec![(0, 25.0)]
+        );
+        // [5, 7] ends past w_end=6.5 ⇒ not fully contained ⇒ excluded.
+        assert!(active_zero_order_inputs(&windows, 5.0, 7.0, f64::NEG_INFINITY).is_empty());
+        // [1, 2] precedes the window start ⇒ excluded.
+        assert!(active_zero_order_inputs(&windows, 1.0, 2.0, f64::NEG_INFINITY).is_empty());
+        // reset_floor past the window start (e.g. 3.0) turns the window off.
+        assert!(active_zero_order_inputs(&windows, 3.0, 5.0, 3.0).is_empty());
+    }
+
+    #[test]
+    fn smooth_forcing_contributes_no_zero_order_window() {
+        // transit/igd/weibull are smooth (no cutoff) — they yield no zero-order
+        // window, so they keep their existing break structure and pointwise forcing.
+        let ode = transit_accumulator_spec();
+        let pk = pk_transit_vec(3.0, 2.0, 1.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        assert!(zo_windows_for(&ode, &doses, &[0.0], &pk).is_empty());
+    }
+
+    #[test]
+    fn zero_order_forcing_delivers_full_dose_mass() {
+        // After the window closes (`t > dur`) the accumulator holds ∫R_in = F·amt
+        // = 100 — not 200 (bolus double-count) and not 0 (no forcing). The cutoff
+        // break stops the input cleanly at `dur`, so the plateau is exact.
+        let ode = zero_order_accumulator_spec();
+        let pk = pk_zero_order_vec(4.0, 1.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let subj = make_subject(doses, vec![20.0]);
+        let preds = ode_predictions(&ode, &pk, &[], &[], &subj);
+        assert_relative_eq!(preds[0], 100.0, max_relative = 1e-6);
+    }
+
+    #[test]
+    fn zero_order_partial_window_is_linear() {
+        // Inside the window the accumulated mass is the rectangle's running area
+        // `(F·amt/dur)·t`: at t = dur/2 = 2 it is exactly half the dose. This only
+        // holds if the constant rate is delivered over `(0, dur]` and the cutoff
+        // break does not truncate the window early.
+        let ode = zero_order_accumulator_spec();
+        let pk = pk_zero_order_vec(4.0, 1.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let subj = make_subject(doses, vec![2.0]);
+        let preds = ode_predictions(&ode, &pk, &[], &[], &subj);
+        assert_relative_eq!(preds[0], 50.0, max_relative = 1e-6);
+    }
+
     #[test]
     fn transit_forcing_delivers_full_dose_mass() {
         // The accumulator depot should hold ∫R_in = F·amt = 100 once absorption
@@ -4636,6 +5593,7 @@ mod tests {
             f64::NEG_INFINITY,
             &prepared,
             InfusionInput::Spanning(vec![(0, 7.0)]),
+            &[],
         );
         let mut dy = vec![0.0];
         rhs(&[2.0], &params, 0.0, &mut dy); // base −ke·y = −2, +7 infusion = 5
@@ -4655,6 +5613,7 @@ mod tests {
             f64::NEG_INFINITY,
             &prepared,
             InfusionInput::Gated(vec![(0, 3.0, 2.0, 5.0)]),
+            &[],
         );
         let mut before = vec![0.0];
         rhs(&[0.0], &params, 1.0, &mut before); // before [2,5)
@@ -4685,6 +5644,7 @@ mod tests {
             f64::NEG_INFINITY,
             &prepared,
             InfusionInput::Spanning(Vec::new()),
+            &[],
         );
         let t = 1.5;
         let mut dy = vec![0.0];

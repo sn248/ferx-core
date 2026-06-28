@@ -279,6 +279,29 @@ fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
     (win_idx, if event { t_star } else { window }, event)
 }
 
+/// Destructure a TTE endpoint and evaluate its hazard parameters at the given
+/// `(theta, eta, covariates)`. Returns `None` for any non-`Tte` endpoint so
+/// callers can `filter_map`/`?` over `model.endpoints` or a looked-up CMT.
+///
+/// This centralises the `EndpointLikelihood::Tte { HazardSpec::Analytic {
+/// family, param_fn } }` destructure and `param_fn` evaluation shared by
+/// `simulate_tte` (per `obs_record`) and `predict_survival` (per endpoint), so a
+/// new `HazardSpec`/`HazardFamily` variant only has to be handled here. Callers
+/// supply their own trailing per-cause fields (window/entry time vs. summary
+/// statistics).
+pub(crate) fn tte_cause_params(
+    endpoint: &EndpointLikelihood,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<(HazardFamily, Vec<f64>)> {
+    let EndpointLikelihood::Tte { hazard } = endpoint else {
+        return None;
+    };
+    let HazardSpec::Analytic { family, param_fn } = hazard;
+    Some((*family, param_fn(theta, eta, covariates)))
+}
+
 /// Draw TTE event/censoring outcomes for a subject and append them to `results`.
 ///
 /// Called from `api::simulate_inner_with_draw` after the Gaussian path. Each
@@ -306,6 +329,11 @@ fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
 /// `None` keeps the per-record window. The override changes only the censoring
 /// comparison, never the number of uniforms drawn, so the RNG sequence (and the
 /// SSE characterization tests) are unaffected.
+// Same flat (model, subject, params, replicate indices, RNG, output sink) shape
+// as the sole caller `emit_subject_rows`, which carries this same allow: the args
+// are heterogeneous with no cohesive struct to bundle, and splitting them would
+// only diverge from that sibling.
+#[allow(clippy::too_many_arguments)]
 pub fn simulate_tte<R: rand::Rng>(
     model: &crate::types::CompiledModel,
     subject: &crate::types::Subject,
@@ -328,16 +356,18 @@ pub fn simulate_tte<R: rand::Rng>(
             time,
             event_type,
         } = record;
-        let Some(EndpointLikelihood::Tte { hazard }) = model.endpoints.get(cmt) else {
+        let Some(endpoint) = model.endpoints.get(cmt) else {
             continue;
         };
-        let HazardSpec::Analytic { family, param_fn } = hazard;
-        let params = param_fn(theta, eta, &subject.covariates);
+        let Some((family, params)) = tte_cause_params(endpoint, theta, eta, &subject.covariates)
+        else {
+            continue;
+        };
         // With an explicit `horizon`, every cause shares it as the administrative
         // window (#522); otherwise only a right-censored record marks a horizon and
         // an event record draws uncensored (+∞) — see `observation_window`.
         let window = horizon.unwrap_or_else(|| observation_window(event_type, *time));
-        causes.push((*cmt, *family, params, *entry_time, window));
+        causes.push((*cmt, family, params, *entry_time, window));
     }
 
     let push = |cmt: usize, time: f64, observed: bool, results: &mut Vec<_>| {
@@ -507,6 +537,36 @@ mod tests {
         let nll = tte_data_term(&records, &hazard, theta, eta, &cov);
         // -log L = H(T) = 0.1 * 10 = 1.0
         assert_abs_diff_eq!(nll, 1.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn tte_cause_params_evaluates_tte_and_skips_non_tte() {
+        use crate::types::{EndpointError, ErrorModel, HazardFamily, HazardParamFn};
+        let theta = [0.1_f64];
+        let eta = [0.0_f64];
+        let cov = HashMap::new();
+
+        // A `Tte` endpoint yields `Some((family, evaluated params))`.
+        let param_fn: HazardParamFn =
+            Box::new(|theta: &[f64], _eta: &[f64], _cov: &HashMap<String, f64>| vec![theta[0]]);
+        let tte = EndpointLikelihood::Tte {
+            hazard: HazardSpec::Analytic {
+                family: HazardFamily::Exponential,
+                param_fn,
+            },
+        };
+        let (family, params) =
+            tte_cause_params(&tte, &theta, &eta, &cov).expect("Tte endpoint must yield Some");
+        assert_eq!(family, HazardFamily::Exponential);
+        assert_eq!(params, vec![0.1]);
+
+        // A non-`Tte` (Gaussian) endpoint takes the `None` branch, letting callers
+        // `filter_map`/`continue` over a mixed endpoint map.
+        let gaussian = EndpointLikelihood::Gaussian(EndpointError {
+            error_model: ErrorModel::Additive,
+            sigma_idx: vec![],
+        });
+        assert!(tte_cause_params(&gaussian, &theta, &eta, &cov).is_none());
     }
 
     #[test]

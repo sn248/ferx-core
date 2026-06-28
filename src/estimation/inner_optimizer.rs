@@ -653,11 +653,15 @@ fn find_ebe_iov(
     // hits a common bail (escape hatch, `gradient = fd`, SDE, LTBS, or IIV on residual
     // error) or the subject carries survival/TTE records (whose hazard term the analytic
     // IOV gradient omits). An η-dependent `ExpressionScale` `obs_scale` is no longer a
-    // common bail (#486 made the non-IOV inner serve it analytically), but IOV still
-    // declines it: `iov_sens_supported` is `false` for any non-`None` scaling, so the
-    // `analytic_iov_inner` guard below already routes IOV + `ExpressionScale` to FD.
-    // Without these guards a joint IOV + `iiv_on_ruv` / IOV + TTE / `gradient = fd` fit
-    // would converge EBEs against an incomplete gradient.
+    // common bail (#486 made the non-IOV inner serve it analytically). For IOV it is
+    // now served analytically too (#575): `ode_iov_supported` admits a non-LTBS
+    // `ExpressionScale` divisor, so `iov_sens_supported` is `true` and the
+    // `analytic_iov_inner` path applies the per-occasion-group post-walk quotient
+    // (`apply_expression_scale_iov`). Constant `ScalarScale` and LTBS still route IOV
+    // to FD — LTBS via `analytic_inner_common_bail` (`log_transform`), `ScalarScale`
+    // via the `ode_iov_supported` allowlist (its in-walk transform isn't validated for
+    // the IOV path). Without these guards a joint IOV + `iiv_on_ruv` / IOV + TTE /
+    // `gradient = fd` fit would converge EBEs against an incomplete gradient.
     let analytic_iov_inner = crate::sens::provider::iov_sens_supported(model)
         && omega_iov_ref.is_some()
         && !analytic_inner_common_bail(model)

@@ -40,6 +40,22 @@ const E5: f64 = -17253.0 / 339200.0;
 const E6: f64 = 22.0 / 525.0;
 const E7: f64 = -1.0 / 40.0;
 
+/// Consecutive force-accepted minimum-step attempts with a **non-finite** local error
+/// before an integration segment is treated as unrecoverably pathological.
+///
+/// The break is gated on a non-finite error norm (NaN/∞) on purpose: that is the signature
+/// of a diverging trajectory whose padded-out predictions the likelihood will reject anyway.
+/// A *finite* error above tolerance at `min_dt` is merely a stiff or under-resolved segment —
+/// truncating it would freeze-pad the remaining save points with finite (but wrong) values
+/// that the likelihood would silently accept, so those are left to run to `max_steps` as
+/// before (#603 review #4).
+const MAX_CONSECUTIVE_MIN_STEP_CLAMPS: usize = 64;
+
+/// Step-shrink factor applied when the local error estimate is non-finite (NaN/∞). The
+/// trajectory is diverging, so shrink toward `min_dt` instead of falling into the
+/// I-controller's growth branch, which would otherwise enlarge the step on a NaN error.
+const NONFINITE_ERR_SHRINK_FACTOR: f64 = 0.2;
+
 /// ODE right-hand side function type.
 /// `rhs(u, params, t) -> du/dt`  where u and du are `&[f64]` of length n_states.
 pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
@@ -188,6 +204,7 @@ pub fn solve_ode_with_stats(
     // Any future revisit should condition PI on a non-FD gradient route
     // (analytical / analytic-sensitivity).
     const I_EXP: f64 = 1.0 / 5.0; // 0.20 — I-controller exponent for order p=5
+    let mut consecutive_min_step_clamps = 0usize;
 
     for _step in 0..opts.max_steps {
         if t >= tf - 1e-15 {
@@ -251,6 +268,10 @@ pub fn solve_ode_with_stats(
         err_norm = (err_norm / n as f64).sqrt();
 
         let accepted = err_norm <= 1.0 || dt_eff <= opts.min_dt;
+        // Only a force-accept at `min_dt` with a *non-finite* error counts toward the
+        // pathological-divergence break (#603 review #4); a finite-but-stiff clamp is left
+        // to run rather than freeze-padded into a silently-accepted wrong trajectory.
+        let nonfinite_min_step = accepted && dt_eff <= opts.min_dt && !err_norm.is_finite();
         if let Some(s) = stats.as_deref_mut() {
             s.record(accepted, err_norm, dt_eff, opts.min_dt);
         }
@@ -271,13 +292,24 @@ pub fn solve_ode_with_stats(
                 });
                 save_idx += 1;
             }
+
+            if nonfinite_min_step {
+                consecutive_min_step_clamps += 1;
+                if consecutive_min_step_clamps >= MAX_CONSECUTIVE_MIN_STEP_CLAMPS {
+                    break;
+                }
+            } else {
+                consecutive_min_step_clamps = 0;
+            }
         }
         // On reject: (u, t) is unchanged, so the existing k1 is still rhs(u, t)
         // for the next attempt; nothing to do.
 
         // Adapt step size (memoryless I-controller — see note above).
         let safety = 0.9;
-        let factor = if err_norm > 1e-15 {
+        let factor = if !err_norm.is_finite() {
+            NONFINITE_ERR_SHRINK_FACTOR
+        } else if err_norm > 1e-15 {
             safety * err_norm.powf(-I_EXP)
         } else {
             5.0
@@ -370,6 +402,7 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
     let mut save_idx = 0;
     let mut have_k1 = false;
     const I_EXP: f64 = 1.0 / 5.0;
+    let mut consecutive_min_step_clamps = 0usize;
 
     // Scalar-weighted combination `u[i] + dt·Σ wⱼ·kⱼ[i]` lifted to `T`.
     let comb = |base: T, dt_eff: f64, terms: &[(f64, T)]| -> T {
@@ -466,6 +499,9 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
         err_norm = (err_norm / n as f64).sqrt();
 
         let accepted = err_norm <= 1.0 || dt_eff <= opts.min_dt;
+        // Mirror the scalar path: only a non-finite force-accept at `min_dt` counts toward
+        // the pathological-divergence break (#603 review #4).
+        let nonfinite_min_step = accepted && dt_eff <= opts.min_dt && !err_norm.is_finite();
         if let Some(s) = stats.as_deref_mut() {
             s.record(accepted, err_norm, dt_eff, opts.min_dt);
         }
@@ -480,10 +516,21 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
                 });
                 save_idx += 1;
             }
+
+            if nonfinite_min_step {
+                consecutive_min_step_clamps += 1;
+                if consecutive_min_step_clamps >= MAX_CONSECUTIVE_MIN_STEP_CLAMPS {
+                    break;
+                }
+            } else {
+                consecutive_min_step_clamps = 0;
+            }
         }
 
         let safety = 0.9;
-        let factor = if err_norm > 1e-15 {
+        let factor = if !err_norm.is_finite() {
+            NONFINITE_ERR_SHRINK_FACTOR
+        } else if err_norm > 1e-15 {
             safety * err_norm.powf(-I_EXP)
         } else {
             5.0
@@ -716,6 +763,139 @@ mod tests {
         assert_eq!(stats.accepted_steps, 1);
         assert_eq!(stats.rejected_steps, 0);
         assert_eq!(stats.min_step_clamped_steps, 1);
+    }
+
+    #[test]
+    fn solve_ode_breaks_repeated_min_step_clamps_before_max_steps() {
+        let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = f64::NAN;
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1e-6,
+            min_dt: 1e-6,
+            max_steps: 10_000,
+            abstol: 1e-12,
+            reltol: 1e-12,
+        };
+        let mut stats = OdeSolverStats::default();
+        let result = solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(stats.attempted_steps, MAX_CONSECUTIVE_MIN_STEP_CLAMPS);
+        assert_eq!(
+            stats.min_step_clamped_steps,
+            MAX_CONSECUTIVE_MIN_STEP_CLAMPS
+        );
+    }
+
+    /// Regression for #603 review #4: a *finite-but-stiff* min-step clamp (large finite local
+    /// error pinned at `min_dt`) must NOT trip the divergence break — only non-finite errors
+    /// do. Otherwise the remaining save points get frozen-padded with finite-but-wrong values
+    /// the likelihood would silently accept. High-frequency finite forcing keeps every step
+    /// clamped with a finite error, so the solve runs its full `max_steps` budget (>> the
+    /// clamp limit) and returns finite predictions rather than breaking at the limit.
+    #[test]
+    fn solve_ode_does_not_break_on_finite_stiff_min_step_clamps() {
+        let rhs = |_u: &[f64], _p: &[f64], t: f64, du: &mut [f64]| {
+            du[0] = 1e6 * (t * 1e7).sin();
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1e-3,
+            min_dt: 1e-3,
+            max_steps: 200,
+            abstol: 1e-12,
+            reltol: 1e-12,
+        };
+        let mut stats = OdeSolverStats::default();
+        let result = solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+
+        // Ran the full budget — no early break at MAX_CONSECUTIVE_MIN_STEP_CLAMPS …
+        assert_eq!(stats.attempted_steps, opts.max_steps);
+        assert!(stats.attempted_steps > MAX_CONSECUTIVE_MIN_STEP_CLAMPS);
+        // … the segment really was in the stiff min-step-clamp regime …
+        assert!(stats.min_step_clamped_steps > MAX_CONSECUTIVE_MIN_STEP_CLAMPS);
+        // … and the predictions stayed finite (not NaN-padded).
+        assert_eq!(result.len(), 1);
+        assert!(result[0].u[0].is_finite());
+    }
+
+    /// Dual path mirrors [`solve_ode_does_not_break_on_finite_stiff_min_step_clamps`].
+    #[test]
+    fn solve_ode_g_does_not_break_on_finite_stiff_min_step_clamps() {
+        use crate::sens::dual2::Dual2;
+        let rhs = |_u: &[Dual2<1>], _p: &[Dual2<1>], t: f64, du: &mut [Dual2<1>]| {
+            du[0] = Dual2::constant(1e6 * (t * 1e7).sin());
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1e-3,
+            min_dt: 1e-3,
+            max_steps: 200,
+            abstol: 1e-12,
+            reltol: 1e-12,
+        };
+        let mut stats = OdeSolverStats::default();
+        let result = solve_ode_g_with_stats(
+            &rhs,
+            &[Dual2::<1>::constant(1.0)],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+
+        assert_eq!(stats.attempted_steps, opts.max_steps);
+        assert!(stats.min_step_clamped_steps > MAX_CONSECUTIVE_MIN_STEP_CLAMPS);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].u[0].value.is_finite());
+    }
+
+    #[test]
+    fn solve_ode_g_breaks_repeated_min_step_clamps_like_scalar() {
+        use crate::sens::dual2::Dual2;
+        let rhs = |_u: &[Dual2<1>], _p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+            du[0] = Dual2::constant(f64::NAN);
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1e-6,
+            min_dt: 1e-6,
+            max_steps: 10_000,
+            abstol: 1e-12,
+            reltol: 1e-12,
+        };
+        let mut stats = OdeSolverStats::default();
+        let result = solve_ode_g_with_stats(
+            &rhs,
+            &[Dual2::<1>::constant(1.0)],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(stats.attempted_steps, MAX_CONSECUTIVE_MIN_STEP_CLAMPS);
+        assert_eq!(
+            stats.min_step_clamped_steps,
+            MAX_CONSECUTIVE_MIN_STEP_CLAMPS
+        );
     }
 
     #[test]

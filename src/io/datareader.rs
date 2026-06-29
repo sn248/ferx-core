@@ -1052,6 +1052,13 @@ fn parse_subject(
     // random effects (matching NONMEM's EVID=4 semantics). `time_offset` is
     // the running shift; `max_eff_time` is the largest effective (shifted)
     // event time emitted so far.
+    //
+    // Subject time origin: the first non-excluded row becomes internal t=0.
+    // Raw TIME is still preserved for user-facing output (`obs_raw_times`) and
+    // data-selection filters, but the solver's independent variable should be a
+    // per-subject elapsed time so datasets may start at calendar/clock values
+    // other than zero (#573).
+    let mut subject_time_origin: Option<f64> = None;
     let mut time_offset = 0.0f64;
     let mut max_eff_time = f64::NEG_INFINITY;
 
@@ -1206,6 +1213,8 @@ fn parse_subject(
         // predict/simulate TIME) report the value the user wrote, while the
         // engine uses the shifted monotonic `time`.
         let raw_time = time;
+        let origin = *subject_time_origin.get_or_insert(raw_time);
+        let time = raw_time - origin;
 
         // Reset-delimited occasion segmentation (see `time_offset` above).
         // When an EVID=3/4 reset's TIME would land at or before the running
@@ -1364,21 +1373,19 @@ fn parse_subject(
                 #[cfg(feature = "survival")]
                 {
                     use crate::types::{EventType, ObsRecord};
-                    let raw_entry = _tentry_col
+                    let entry_time = _tentry_col
                         .and_then(|c| row.get(c))
-                        .map(|s| parse_f64(s))
-                        .unwrap_or(0.0)
-                        .max(0.0);
-                    if raw_entry > time + 1e-12 {
+                        .map(|s| (parse_f64(s) - origin).max(0.0))
+                        .unwrap_or(0.0);
+                    if entry_time > time + 1e-12 {
                         parse_warnings.push(format!(
-                            "Subject {id}: TENTRY={raw_entry} > TIME={time} on CMT={cmt} \
+                            "Subject {id}: TENTRY={entry_time} > TIME={time} on CMT={cmt} \
                              — entry time after the event/censoring time yields a negative \
                              effective cumulative hazard; row skipped"
                         ));
                         // Skip this malformed row rather than producing an invalid NLL.
                         continue;
                     }
-                    let entry_time = raw_entry;
                     // DV must be an integer code (0/1/2).  Reject fractional values
                     // explicitly: a DV of 1.9 would silently truncate to 1 (Exact event),
                     // misclassifying a censored observation.
@@ -2193,6 +2200,28 @@ mod tests {
         let pop = read_nonmem_csv(f.path(), None, None).unwrap();
         assert!(pop.subjects[0].reset_times.is_empty());
         assert!(!pop.subjects[0].has_resets());
+    }
+
+    #[test]
+    fn test_subject_time_origin_is_relative_but_raw_times_preserved() {
+        // Regression #573: data may use calendar/clock TIME values that do not
+        // start at zero for each subject. The engine clock is relative to the
+        // first retained row, while raw observation TIME remains available for
+        // sdtab/predict/simulate output.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CR\n\
+                   1,10,.,1,1,100,1.0\n\
+                   1,11,5.0,0,0,.,1.0\n\
+                   1,14,.,2,1,0,2.0\n\
+                   1,15,3.0,0,0,.,2.0\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        assert_eq!(subj.doses.len(), 1);
+        assert_eq!(subj.doses[0].time, 0.0);
+        assert_eq!(subj.obs_times, vec![1.0, 5.0]);
+        assert_eq!(subj.obs_raw_times, vec![11.0, 15.0]);
+        assert_eq!(subj.pk_only_times, vec![4.0]);
     }
 
     #[test]

@@ -240,6 +240,9 @@ section of the SDLC for the versioning policy).
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 
 ### Fixed
+- ODE+IOV fits now report their actual analytic-vs-finite-difference inner-gradient route,
+  including subject-level fallback reasons, instead of using the non-IOV gradient probe
+  for diagnostics (#590).
 - Standard errors for `theta` parameters with a **negative lower bound** (estimated on
   the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
   mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to

@@ -66,7 +66,7 @@ const _: () = assert!(
 
 /// Largest (θ + η) axis count for which the analytical η/θ chain (the
 /// individual-parameter program over `Dual2<M>`) is monomorphised.
-const MAX_ODE_AXES: usize = 16;
+pub(crate) const MAX_ODE_AXES: usize = 16;
 
 // SIX `disp!`/`dispatch_tv!(1, 2, …, 16)` dispatch tables are keyed on `MAX_ODE_AXES` and
 // enumerate `1..=16` explicitly with a silent `_ => None` — they live in the **entry-point

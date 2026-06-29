@@ -302,10 +302,11 @@ fn infusion_spans_segment(
 /// True when the time-varying-covariate ODE walk ([`run_subject_tvcov`] /
 /// [`run_subject_tvcov_eta`]) can serve this `(model, subject)`: an in-scope analytic
 /// ODE model whose subject carries TV covariates and uses the **bolus** dose subset.
-/// Infusion / steady-state / reset / EVID=2 / `init(...)` route to the FD fallback —
-/// production's TV-cov walk (`ode_predictions_event_driven`) handles those via
-/// forcing/SS machinery the dual walk does not yet mirror. Checked by *both* the
-/// outer and inner entry points so the analytic scope stays matched (#439).
+/// Non-IOV EVID=2 / `init(...)` route to the FD fallback — production's TV-cov walk
+/// (`ode_predictions_event_driven`) handles those via machinery this non-IOV dual walk
+/// does not yet mirror. The IOV dual walk carries EVID=2 breakpoints separately since
+/// #590. Checked by *both* the outer and inner entry points so the analytic scope stays
+/// matched (#439).
 /// True when the subject has a **rate-defined steady-state infusion under bioavailability
 /// `F ≠ 1`** — the one SS-infusion case still routed to FD (its equilibration cycles would
 /// each need the `F`-scaled active window, a moving boundary not yet carried). Shared by
@@ -411,7 +412,8 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     }
     // EVID 3/4 resets and finite-duration infusions ARE handled (resets zero the state;
     // infusions add `F·rate` forcing over their lagged window, with rate-boundary lagtime
-    // saltation). EVID=2 pk-only breakpoints are not (no seeded-PK record), so decline.
+    // saltation). EVID=2 pk-only breakpoints are not yet carried on the non-IOV TV-cov
+    // ODE path (the IOV path below supports them since #590).
     if !subject.pk_only_times.is_empty() {
         return false;
     }
@@ -493,10 +495,11 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // walk runs through `integrate_tvcov_readout`/`integrate_tvcov_g`, which applies the
     // dose-time shift + event-time saltation per occasion-seeded dose (#439 lagtime × IOV).
     // (`ode_analytical_supported` excludes indexed `ALAGn`. The per-subject gate
-    // `ode_iov_subject_supported` now ADMITS finite-duration infusions and EVID 3/4 resets
+    // `ode_iov_subject_supported` now ADMITS finite-duration infusions, EVID 3/4 resets,
+    // and EVID=2 pk-only breakpoints
     // — the shared `integrate_tvcov_g` walk carries the rate-boundary saltation and the
-    // `reset_floor` per occasion — and declines only SS+ii>0, rate-defined-under-F, and
-    // pk-only breakpoints (#472 review round 2 follow-up #2).)
+    // `reset_floor` per occasion — and declines only SS+lagtime, SS+time-dependent RHS,
+    // and rate-defined SS infusion under F (#472 review round 2 follow-up #2).)
     //
     // An η-dependent `ExpressionScale` `obs_scale` divisor (`obs_scale = expr(θ,η)`) IS
     // supported (#575): like the non-IOV ODE static walk (#534) it is applied as a
@@ -1585,6 +1588,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
     subject: &Subject,
     pk_at_dose: &[Vec<T>],
     pk_at_obs: &[Vec<T>],
+    pk_at_pk_only: &[Vec<T>],
 ) -> Vec<T> {
     // `ode_tvcov_supported` (checked by both TV-cov entry points before reaching
     // here) calls `ode_analytical_supported`, which declines a model whose `ode_spec`
@@ -1638,6 +1642,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         subject,
         pk_at_dose,
         pk_at_obs,
+        pk_at_pk_only,
         &f_bio_at_dose,
         &init_state,
         first_dose_time,
@@ -1687,7 +1692,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
 fn seed_tvcov_snapshots<T: Clone>(
     subject: &Subject,
     mut seed: impl FnMut(&std::collections::HashMap<String, f64>) -> Option<Vec<T>>,
-) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>)> {
+) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>, Vec<Vec<T>>)> {
     use std::collections::HashMap;
     // Canonical, hashable key for a covariate snapshot. `f64` is neither `Hash` nor
     // `Eq`, so key on `to_bits` (name-sorted); `to_bits` is total, so `NaN` keys are
@@ -1715,7 +1720,10 @@ fn seed_tvcov_snapshots<T: Clone>(
     let pk_at_obs: Vec<Vec<T>> = (0..subject.obs_times.len())
         .map(|j| seed_for(subject.obs_cov(j)))
         .collect::<Option<_>>()?;
-    Some((pk_at_dose, pk_at_obs))
+    let pk_at_pk_only: Vec<Vec<T>> = (0..subject.pk_only_times.len())
+        .map(|m| seed_for(subject.pk_only_cov(m)))
+        .collect::<Option<_>>()?;
+    Some((pk_at_dose, pk_at_obs, pk_at_pk_only))
 }
 
 /// Time-varying-covariate outer (`Dual2<M>`, `M = n_theta + n_eta`) sensitivities
@@ -1735,11 +1743,18 @@ fn run_subject_tvcov<const M: usize>(
 
     // Seed each event's per-snapshot PK duals via the shared dedup helper.
     // `seed_pk_dual2` is infallible, so wrap it in `Some`; the `?` never fires here.
-    let (pk_at_dose, pk_at_obs) = seed_tvcov_snapshots::<Dual2<M>>(subject, |cov| {
-        Some(seed_pk_dual2::<M>(model, prog, theta, eta, cov))
-    })?;
+    let (pk_at_dose, pk_at_obs, pk_at_pk_only) =
+        seed_tvcov_snapshots::<Dual2<M>>(subject, |cov| {
+            Some(seed_pk_dual2::<M>(model, prog, theta, eta, cov))
+        })?;
 
-    let preds = integrate_tvcov_readout::<Dual2<M>>(model, subject, &pk_at_dose, &pk_at_obs);
+    let preds = integrate_tvcov_readout::<Dual2<M>>(
+        model,
+        subject,
+        &pk_at_dose,
+        &pk_at_obs,
+        &pk_at_pk_only,
+    );
 
     let mut out = Vec::with_capacity(preds.len());
     for fd in &preds {
@@ -1822,11 +1837,8 @@ fn ode_iov_subject_supported(
     {
         return None;
     }
-    // EVID 3/4 resets and finite-duration infusions ARE handled by the event-driven walk;
-    // EVID=2 pk-only breakpoints are not.
-    if !subject.pk_only_times.is_empty() {
-        return None;
-    }
+    // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are
+    // handled by the event-driven walk.
     let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
     let k_groups = occ_groups.len();
     if k_groups == 0 {
@@ -1919,26 +1931,27 @@ pub fn ode_subject_eta_grad_iov(
 /// `(θ, η_bsv, κ)` axes from its [`CombinedDerivs`] — the IOV analogue of
 /// [`seed_pk_dual2`]. The combined column `c` of the program maps to a stacked dual
 /// axis: η_bsv (`c < n_eta`) → shared `n_theta + c`; κ (`c ≥ n_eta`) → group `g`'s
-/// block `n_theta + n_eta + g·n_kappa + (c − n_eta)`. Non-individual-parameter slots
-/// are seeded as constants (`pk.values`), exactly as the non-IOV seeder does. `cd`
-/// rows are parallel to `model.pk_indices` (the program-eval row order shared with
-/// [`pd_from_program`]).
+/// block `n_theta + n_eta + g·n_kappa + (c − n_eta)`. For EVID=2 pk-only events
+/// `group` is `None`, matching production's zero-κ `combined_for(u32::MAX)`; κ columns
+/// are then dropped. Non-individual-parameter slots are seeded as constants
+/// (`pk.values`), exactly as the non-IOV seeder does. `cd` rows are parallel to
+/// `model.pk_indices` (the program-eval row order shared with [`pd_from_program`]).
 fn seed_pk_dual2_iov<const M: usize>(
     model: &CompiledModel,
     pk: &crate::types::PkParams,
     cd: &crate::sens::provider::CombinedDerivs,
-    group: usize,
+    group: Option<usize>,
     n_eta: usize,
     n_kappa: usize,
     n_theta: usize,
 ) -> Vec<Dual2<M>> {
     let n_eff = n_eta + n_kappa;
-    let kappa_base = n_theta + n_eta + group * n_kappa;
-    let stacked_axis = |c: usize| -> usize {
+    let kappa_base = group.map(|g| n_theta + n_eta + g * n_kappa);
+    let stacked_axis = |c: usize| -> Option<usize> {
         if c < n_eta {
-            n_theta + c
+            Some(n_theta + c)
         } else {
-            kappa_base + (c - n_eta)
+            kappa_base.map(|base| base + (c - n_eta))
         }
     };
     let mut out: Vec<Dual2<M>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();
@@ -1949,14 +1962,15 @@ fn seed_pk_dual2_iov<const M: usize>(
             grad[m] = cd.dtheta[i][m];
         }
         for c in 0..n_eff {
-            let ax = stacked_axis(c);
+            let Some(ax) = stacked_axis(c) else {
+                continue;
+            };
             if ax >= M {
                 continue;
             }
             grad[ax] = cd.deta[i][c];
             for d in 0..n_eff {
-                let bx = stacked_axis(d);
-                if bx < M {
+                if let Some(bx) = stacked_axis(d).filter(|&bx| bx < M) {
                     hess[ax][bx] = cd.d2eta[i][c][d];
                 }
             }
@@ -2055,9 +2069,36 @@ fn run_subject_iov<const M: usize>(
                 prog, n_theta, n_eff, n_rows, cov, theta, &combined,
             )?;
             Some(seed_pk_dual2_iov::<M>(
-                model, &pk, &cd, g, n_eta, n_kappa, n_theta,
+                model,
+                &pk,
+                &cd,
+                Some(g),
+                n_eta,
+                n_kappa,
+                n_theta,
             ))
         };
+    // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
+    // closed-form provider, #598 review). Built lazily inside the closure so the common
+    // IOV subject with no EVID=2 records pays no allocation — the closure is only invoked
+    // when `seed_iov_events` actually has pk-only records to seed.
+    let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual2<M>>> {
+        let combined_pk_only =
+            crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
+        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov);
+        let cd = crate::sens::provider::iov_combined_derivs_dyn(
+            prog,
+            n_theta,
+            n_eff,
+            n_rows,
+            cov,
+            theta,
+            &combined_pk_only,
+        )?;
+        Some(seed_pk_dual2_iov::<M>(
+            model, &pk, &cd, None, n_eta, n_kappa, n_theta,
+        ))
+    };
 
     // Build every occasion group's stacked PK seeding at the subject-static covariate
     // snapshot. Shared by `static_group_dual` (the static-cov event-walk source) and the
@@ -2076,13 +2117,14 @@ fn run_subject_iov<const M: usize>(
         Some(build_all_groups()?)
     };
 
-    let (pk_at_dose, pk_at_obs) = seed_iov_events::<Dual2<M>>(
+    let (pk_at_dose, pk_at_obs, pk_at_pk_only) = seed_iov_events::<Dual2<M>>(
         subject,
         &occ_to_k,
         k_groups,
         cov,
         static_group_dual.as_deref(),
         seed_group_cov,
+        seed_pk_only_cov,
     )?;
 
     // η-dependent `ExpressionScale` `obs_scale` divisor: one scale jet per occasion group,
@@ -2111,7 +2153,13 @@ fn run_subject_iov<const M: usize>(
         _ => None,
     };
 
-    let preds = integrate_tvcov_readout::<Dual2<M>>(model, subject, &pk_at_dose, &pk_at_obs);
+    let preds = integrate_tvcov_readout::<Dual2<M>>(
+        model,
+        subject,
+        &pk_at_dose,
+        &pk_at_obs,
+        &pk_at_pk_only,
+    );
 
     // Read `∂f/∂(θ, stacked-η)` (+ 2nd order) off the dual — the negative-readout clamp
     // and output transform are already applied inside `integrate_tvcov_readout`.
@@ -2177,8 +2225,9 @@ fn seed_iov_events<T: Clone>(
     static_cov: &std::collections::HashMap<String, f64>,
     precomputed_static: Option<&[Vec<T>]>,
     mut seed_group_cov: impl FnMut(usize, &std::collections::HashMap<String, f64>) -> Option<Vec<T>>,
-) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>)> {
-    if subject.has_tv_covariates() {
+    mut seed_pk_only_cov: impl FnMut(&std::collections::HashMap<String, f64>) -> Option<Vec<T>>,
+) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>, Vec<Vec<T>>)> {
+    if subject.has_tv_covariates() || !subject.pk_only_covariates.is_empty() {
         let pk_at_dose = (0..subject.doses.len())
             .map(|d| {
                 let g = *occ_to_k.get(&subject.dose_occasions.get(d).copied()?)?;
@@ -2191,7 +2240,10 @@ fn seed_iov_events<T: Clone>(
                 seed_group_cov(g, subject.obs_cov(j))
             })
             .collect::<Option<_>>()?;
-        Some((pk_at_dose, pk_at_obs))
+        let pk_at_pk_only = (0..subject.pk_only_times.len())
+            .map(|m| seed_pk_only_cov(subject.pk_only_cov(m)))
+            .collect::<Option<_>>()?;
+        Some((pk_at_dose, pk_at_obs, pk_at_pk_only))
     } else {
         // Reuse the caller's per-group seeding when supplied (the scale path already built
         // it), else build it here. Same source either way (#575 review — no double seed).
@@ -2213,37 +2265,43 @@ fn seed_iov_events<T: Clone>(
         let pk_at_obs = (0..subject.obs_times.len())
             .map(|j| Some(group_dual[*occ_to_k.get(&subject.occasions.get(j).copied()?)?].clone()))
             .collect::<Option<_>>()?;
-        Some((pk_at_dose, pk_at_obs))
+        let pk_at_pk_only = if subject.pk_only_times.is_empty() {
+            Vec::new()
+        } else {
+            let seeded = seed_pk_only_cov(static_cov)?;
+            vec![seeded; subject.pk_only_times.len()]
+        };
+        Some((pk_at_dose, pk_at_obs, pk_at_pk_only))
     }
 }
 
 /// First-order (`Dual1<N>`, `N = n_stacked`) IOV seeder — the light counterpart of
 /// [`seed_pk_dual2_iov`]. Seeds only `∂p/∂(stacked-η)` (no θ axes, no Hessian): the
 /// combined column `c` maps to stacked axis `c` (η_bsv, `c < n_eta`) or
-/// `n_eta + group·n_kappa + (c − n_eta)` (κ). Reuses [`CombinedDerivs::deta`].
+/// `n_eta + group·n_kappa + (c − n_eta)` (κ). For EVID=2 pk-only events
+/// `group = None`, so κ columns are dropped. Reuses [`CombinedDerivs::deta`].
 fn seed_pk_dual1_iov<const N: usize>(
     model: &CompiledModel,
     pk: &crate::types::PkParams,
     cd: &crate::sens::provider::CombinedDerivs,
-    group: usize,
+    group: Option<usize>,
     n_eta: usize,
     n_kappa: usize,
 ) -> Vec<Dual1<N>> {
     let n_eff = n_eta + n_kappa;
-    let kappa_base = n_eta + group * n_kappa;
-    let stacked_axis = |c: usize| -> usize {
+    let kappa_base = group.map(|g| n_eta + g * n_kappa);
+    let stacked_axis = |c: usize| -> Option<usize> {
         if c < n_eta {
-            c
+            Some(c)
         } else {
-            kappa_base + (c - n_eta)
+            kappa_base.map(|base| base + (c - n_eta))
         }
     };
     let mut out: Vec<Dual1<N>> = pk.values.iter().map(|&v| Dual1::constant(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
         let mut grad = [0.0; N];
         for c in 0..n_eff {
-            let ax = stacked_axis(c);
-            if ax < N {
+            if let Some(ax) = stacked_axis(c).filter(|&ax| ax < N) {
                 grad[ax] = cd.deta[i][c];
             }
         }
@@ -2288,8 +2346,35 @@ fn run_subject_iov_eta<const N: usize>(
             let cd = crate::sens::provider::iov_combined_derivs_dyn(
                 prog, n_theta, n_eff, n_rows, cov, theta, &combined,
             )?;
-            Some(seed_pk_dual1_iov::<N>(model, &pk, &cd, g, n_eta, n_kappa))
+            Some(seed_pk_dual1_iov::<N>(
+                model,
+                &pk,
+                &cd,
+                Some(g),
+                n_eta,
+                n_kappa,
+            ))
         };
+    // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
+    // closed-form provider, #598 review). Built lazily inside the closure so the common
+    // IOV subject with no EVID=2 records pays no allocation.
+    let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual1<N>>> {
+        let combined_pk_only =
+            crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
+        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov);
+        let cd = crate::sens::provider::iov_combined_derivs_dyn(
+            prog,
+            n_theta,
+            n_eff,
+            n_rows,
+            cov,
+            theta,
+            &combined_pk_only,
+        )?;
+        Some(seed_pk_dual1_iov::<N>(
+            model, &pk, &cd, None, n_eta, n_kappa,
+        ))
+    };
 
     // Build every occasion group's stacked PK seeding at the subject-static covariate
     // snapshot — the inner counterpart of the outer `build_all_groups`. Shared by
@@ -2306,13 +2391,14 @@ fn run_subject_iov_eta<const N: usize>(
         Some(build_all_groups()?)
     };
 
-    let (pk_at_dose, pk_at_obs) = seed_iov_events::<Dual1<N>>(
+    let (pk_at_dose, pk_at_obs, pk_at_pk_only) = seed_iov_events::<Dual1<N>>(
         subject,
         &occ_to_k,
         k_groups,
         cov,
         static_group_dual.as_deref(),
         seed_group_cov,
+        seed_pk_only_cov,
     )?;
 
     // η-only `ExpressionScale` scale jets, one per occasion group. Mirrors production's
@@ -2339,7 +2425,13 @@ fn run_subject_iov_eta<const N: usize>(
         _ => None,
     };
 
-    let preds = integrate_tvcov_readout::<Dual1<N>>(model, subject, &pk_at_dose, &pk_at_obs);
+    let preds = integrate_tvcov_readout::<Dual1<N>>(
+        model,
+        subject,
+        &pk_at_dose,
+        &pk_at_obs,
+        &pk_at_pk_only,
+    );
 
     let mut out = Vec::with_capacity(preds.len());
     for fd in &preds {
@@ -2433,11 +2525,18 @@ fn run_subject_tvcov_eta<const N: usize>(
     let n_eta = model.n_eta;
 
     // Dedup identical covariate snapshots via the shared helper (#451 re-review #8).
-    let (pk_at_dose, pk_at_obs) = seed_tvcov_snapshots::<Dual1<N>>(subject, |cov| {
-        seed_pk_dual1::<N>(model, prog, theta, eta, cov)
-    })?;
+    let (pk_at_dose, pk_at_obs, pk_at_pk_only) =
+        seed_tvcov_snapshots::<Dual1<N>>(subject, |cov| {
+            seed_pk_dual1::<N>(model, prog, theta, eta, cov)
+        })?;
 
-    let preds = integrate_tvcov_readout::<Dual1<N>>(model, subject, &pk_at_dose, &pk_at_obs);
+    let preds = integrate_tvcov_readout::<Dual1<N>>(
+        model,
+        subject,
+        &pk_at_dose,
+        &pk_at_obs,
+        &pk_at_pk_only,
+    );
 
     let mut out = Vec::with_capacity(preds.len());
     for fd in &preds {
@@ -2735,6 +2834,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     subject: &Subject,
     pk_at_dose: &[Vec<T>],
     pk_at_obs: &[Vec<T>],
+    pk_at_pk_only: &[Vec<T>],
     f_bio_at_dose: &[T],
     init_state: &[T],
     first_dose_time: f64,
@@ -2744,15 +2844,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     let n_obs = subject.obs_times.len();
     let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
 
-    // This walk is the bolus-only subset of production's event-driven predictor — it
-    // omits infusion forcing, EVID 3/4 resets, and EVID=2 pk-only breakpoints, all of
-    // which the gate already excludes. (Estimated lagtime IS supported — see
-    // `has_lagtime` below.) Assert the invariant so a future gate change can't silently
-    // feed an unsupported subject to this simplified walk (#449 review #11).
-    debug_assert!(
-        subject.pk_only_times.is_empty(),
-        "integrate_tvcov_g handles bolus / infusion / EVID 3-4 reset; the gate excludes pk-only"
-    );
+    debug_assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
 
     // Per-dose lagtime: dose `k` arrives at `d.time + lag_val(k)`, with its lag read from
     // `pk_at_dose[k][dose_lag_slot[k]]` — the bare `PK_IDX_LAGTIME` slot or, for a
@@ -2820,21 +2912,27 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     };
     let inf_window_len = |k: usize| -> f64 { inf_eff[k].1.val() };
 
-    // Merged timeline: (time, kind, idx), kind ∈ {Reset=0, Dose=1, Obs=3, InfEnd=4} — the
-    // sort key matching production's `kind_order` (Reset before a co-timed Dose so an
-    // EVID=4 reset+dose zeros the state before its own dose lands; Dose before Obs;
-    // infusion-end last so an obs at the end reads the infusion still contributing). Doses
-    // (and infusion windows) sit at their lagged arrival `d.time + lag_val(k)`; resets are
-    // at their record time (fixed, not lag-shifted).
+    // Merged timeline: (time, kind, idx), kind ∈ {Reset=0, Dose=1, PkOnly=2, Obs=3,
+    // InfEnd=4} — the sort key matching production's `kind_order` (Reset before a
+    // co-timed Dose so an EVID=4 reset+dose zeros the state before its own dose lands;
+    // Dose before PkOnly before Obs; infusion-end last so an obs at the end reads the
+    // infusion still contributing). Doses (and infusion windows) sit at their lagged
+    // arrival `d.time + lag_val(k)`; resets and pk-only records are at their record time
+    // (fixed, not lag-shifted).
     const K_RESET: u8 = 0;
     const K_DOSE: u8 = 1;
+    const K_PKONLY: u8 = 2;
     const K_OBS: u8 = 3;
     const K_INF_END: u8 = 4;
     // Capacity includes one `K_INF_END` slot per infusion (each dose adds its window-end
     // event below), matching production's timeline reservation. `n_infusion_ends` was
     // computed once above (and reused for `has_any_infusion`).
     let mut tl: Vec<(f64, u8, usize)> = Vec::with_capacity(
-        subject.doses.len() + n_obs + subject.reset_times.len() + n_infusion_ends,
+        subject.doses.len()
+            + n_obs
+            + subject.pk_only_times.len()
+            + subject.reset_times.len()
+            + n_infusion_ends,
     );
     for &rt in &subject.reset_times {
         tl.push((rt, K_RESET, 0));
@@ -2848,6 +2946,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     }
     for (j, &t) in subject.obs_times.iter().enumerate() {
         tl.push((t, K_OBS, j));
+    }
+    for (m, &t) in subject.pk_only_times.iter().enumerate() {
+        tl.push((t, K_PKONLY, m));
     }
     tl.sort_by(|a, b| {
         a.0.partial_cmp(&b.0)
@@ -2883,13 +2984,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // (#472 review #1).
     let mut reset_floor = f64::NEG_INFINITY;
 
-    // Most-recent record's params, used to integrate a segment ending at a **reset**
-    // (which carries no PK record — mirrors production's `last_pk`). The first event's
-    // segment is empty (`cur_t == tl[0].0`), so this initial value is never read before a
-    // real record sets it; default to the first available snapshot.
+    // Most-recent record's params, used to integrate a segment ending at a **reset** or
+    // infusion-end (neither carries a PK record — mirrors production's `last_pk`). The first
+    // event's segment is empty (`cur_t == tl[0].0`), so this initial value is rarely read
+    // before a real record sets it; any available record snapshot is a defensive fallback.
     let mut last_params: &[T] = pk_at_obs
         .first()
         .or_else(|| pk_at_dose.first())
+        .or_else(|| pk_at_pk_only.first())
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
 
@@ -2898,6 +3000,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         // end-of-interval convention); a reset reuses the previous record's params.
         let params: &[T] = match kind {
             K_DOSE => &pk_at_dose[idx],
+            K_PKONLY => &pk_at_pk_only[idx],
             K_OBS => &pk_at_obs[idx],
             _ => last_params, // K_RESET / K_INF_END (not records)
         };
@@ -3132,6 +3235,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         } else if kind == K_OBS {
             states[idx].copy_from_slice(&u);
             last_params = &pk_at_obs[idx];
+        } else if kind == K_PKONLY {
+            // EVID=2 covariate-only record: no state jump or observation, but `$PK` has
+            // run at this record, and the next segment must use its params (with κ fixed
+            // at zero under IOV, matching production `predict_iov`).
+            last_params = &pk_at_pk_only[idx];
         } else if kind == K_INF_END {
             // Infusion window end: the rate turns off (the next segment's `active_inf`
             // excludes it). Not a record — no state change, no `last_params` update. The

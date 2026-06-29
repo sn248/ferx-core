@@ -831,18 +831,14 @@ fn build_iov_sources(
         return None;
     }
     // Combined effect vector for group `k`: `[η_bsv, κ_k]` (shared κ-axis layout).
-    let eta_bsv = &stacked_eta[..n_eta];
     let combined_for =
         |k: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, k);
     // EVID=2 (`pk_only`) rows carry no occasion label → BSV η with zero κ (matches
     // production `predict_iov`). Their κ derivatives are dropped from the stacked
-    // axes (group `None` below), so the prediction holds κ fixed at 0.
-    let combined_pk_only: Vec<f64> = {
-        let mut c = Vec::with_capacity(n_eff);
-        c.extend_from_slice(eta_bsv);
-        c.extend(std::iter::repeat(0.0).take(n_kappa));
-        c
-    };
+    // axes (group `None` below), so the prediction holds κ fixed at 0. Single-sourced
+    // with the ODE IOV provider via the shared helper (#598 review).
+    let combined_pk_only: Vec<f64> =
+        crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
 
     let prog = model
         .indiv_param_partials
@@ -6376,6 +6372,87 @@ mod tests {
             &[0.2, 10.0, 0.75],
             &[0.12, -0.08, 0.05, -0.10],
         );
+    }
+
+    #[test]
+    fn ode_iov_tvcov_pkonly_breakpoint_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_TVCOV_ODE).expect("parse ODE IOV+TV-cov");
+        let subject = iov_tvcov_subject(true);
+        assert!(
+            !subject.pk_only_times.is_empty(),
+            "fixture must carry an EVID=2 covariate breakpoint"
+        );
+        assert!(subject.has_tv_covariates(), "fixture must carry TV cov");
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "model-level ODE IOV gate must admit the fixture"
+        );
+        assert!(
+            subject_sensitivities_iov(
+                &model,
+                &subject,
+                &[0.2, 10.0, 0.75],
+                &[0.12, -0.08, 0.05, -0.10],
+            )
+            .is_some(),
+            "EVID=2 breakpoint must stay on the analytic ODE IOV path (#590)"
+        );
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.75],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    #[test]
+    fn ode_iov_tvcov_pkonly_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_TVCOV_ODE).expect("parse ODE IOV+TV-cov"),
+            &iov_tvcov_subject(true),
+            &[0.2, 10.0, 0.75],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    /// **Static-covariate** ODE IOV subject with an EVID=2 pk-only breakpoint. The TV-cov
+    /// pk-only tests above always take `seed_iov_events`' per-event (TV) branch; a subject
+    /// with no dose/obs TV covariates **and an empty `pk_only_covariates`** instead takes the
+    /// static-cov else-branch — the pk-only event is seeded once at the subject-static snapshot
+    /// and shared (`vec![seeded; len]`). This is reachable in production (e.g. a pk-only
+    /// breakpoint whose covariate was pruned as irrelevant while its time remained), so it must
+    /// stay analytic and match FD of `predict_iov` (#598 review — covers the else-branch).
+    #[test]
+    fn ode_iov_static_cov_pkonly_breakpoint_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        let mut subject = iov_subject();
+        // EVID=2 breakpoint at t=18 (occasion 2), no covariate snapshot → static-cov path.
+        subject.pk_only_times = vec![18.0];
+        assert!(
+            subject.pk_only_covariates.is_empty() && !subject.has_tv_covariates(),
+            "fixture must hit the static-cov pk-only branch (no TV cov, empty pk_only_covariates)"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model,
+                &subject,
+                &[0.2, 10.0],
+                &[0.12, -0.08, 0.05, -0.10],
+            )
+            .is_some(),
+            "static-cov EVID=2 breakpoint must stay on the analytic ODE IOV path"
+        );
+        check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
+    }
+
+    /// Inner η-gradient parity for the same static-cov pk-only subject — exercises the
+    /// `Dual1` seeder's static-cov else-branch (#598 review).
+    #[test]
+    fn ode_iov_static_cov_pkonly_inner_eta_grad_matches_outer() {
+        let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        let mut subject = iov_subject();
+        subject.pk_only_times = vec![18.0];
+        check_iov_inner_matches_outer(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
     }
 
     /// 2-cpt IV IOV `[odes]` model (κ on CL) — higher state/axis coverage for the ODE

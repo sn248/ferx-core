@@ -253,6 +253,9 @@ section of the SDLC for the versioning policy).
 - ODE+IOV models with an expression `[scaling] obs_scale` and time-varying covariates
   now stay on the analytic inner/outer gradient route instead of falling back to finite
   differences (#590).
+- ODE+IOV models with EVID=2 covariate-only breakpoints now keep analytic inner/outer
+  gradients when otherwise in scope; the breakpoint updates the ODE segment PK snapshot
+  with κ fixed at zero, matching production prediction semantics (#590).
 - Standard errors for `theta` parameters with a **negative lower bound** (estimated on
   the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
   mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to

@@ -218,9 +218,6 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         {
             return "steady-state dose + time-dependent ODE RHS";
         }
-        if !subject.pk_only_times.is_empty() {
-            return "EVID=2 covariate breakpoint";
-        }
         let occ_groups = split_obs_by_occasion(subject);
         if occ_groups.is_empty() {
             return "no observation occasions";

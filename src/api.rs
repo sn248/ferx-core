@@ -3814,10 +3814,13 @@ fn fit_inner(
         ));
     }
 
-    // When M3 censoring is combined with non-interaction FOCE, mixing linearized
-    // Gaussian residuals with non-linearized log Φ terms gives inconsistent
-    // OFVs near the LOQ boundary. The FOCE dispatcher routes affected
-    // subjects through FOCEI internally — surface the promotion to the user.
+    // NOTE (stale message — see #599): the text below claims censored FOCE subjects
+    // are "evaluated with η-interaction"/promoted to FOCEI internally. That is no longer
+    // true on either path — plain FOCE keeps a consistent Sheiner–Beal objective (non-IOV
+    // since #367, IOV since #591). The advice ("set method=focei for interaction
+    // semantics; FOCE-M3 and FOCEI-M3 are different optima") still holds; only the
+    // mechanism claim is wrong. Rewording is deferred to #599 (it must update the
+    // warning-taxonomy fixture in `types.rs` in lockstep).
     if matches!(model.bloq_method, BloqMethod::M3)
         && matches!(
             options.method,

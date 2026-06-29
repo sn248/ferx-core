@@ -11,6 +11,24 @@ pub use one_compartment::*;
 pub use three_compartment::*;
 pub use two_compartment::*;
 
+#[inline]
+fn model_uses_time_builtin(model: &CompiledModel) -> bool {
+    crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+}
+
+#[inline]
+fn pk_params_at_time(
+    model: &CompiledModel,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &std::collections::HashMap<String, f64>,
+    time: f64,
+) -> PkParams {
+    crate::parser::model_parser::with_model_time(time, || {
+        (model.pk_param_fn)(theta, eta, covariates)
+    })
+}
+
 /// Divide each prediction in-place by the scale derived from
 /// `model.scaling`. The convention is **divisive** so that
 /// `[scaling] obs_scale = 1000` maps mg/L → mg/mL (i.e. the user's number
@@ -391,18 +409,33 @@ pub fn compute_event_pk_params_into(
     out.obs.clear();
     out.pk_only.clear();
 
-    if subject.has_tv_covariates() {
+    if subject.has_tv_covariates() || model_uses_time_builtin(model) {
         for k in 0..subject.doses.len() {
-            out.dose
-                .push((model.pk_param_fn)(theta, eta, subject.dose_cov(k)));
+            out.dose.push(pk_params_at_time(
+                model,
+                theta,
+                eta,
+                subject.dose_cov(k),
+                subject.doses[k].time,
+            ));
         }
         for j in 0..subject.obs_times.len() {
-            out.obs
-                .push((model.pk_param_fn)(theta, eta, subject.obs_cov(j)));
+            out.obs.push(pk_params_at_time(
+                model,
+                theta,
+                eta,
+                subject.obs_cov(j),
+                subject.obs_times[j],
+            ));
         }
         for m in 0..subject.pk_only_times.len() {
-            out.pk_only
-                .push((model.pk_param_fn)(theta, eta, subject.pk_only_cov(m)));
+            out.pk_only.push(pk_params_at_time(
+                model,
+                theta,
+                eta,
+                subject.pk_only_cov(m),
+                subject.pk_only_times[m],
+            ));
         }
     } else {
         let p = (model.pk_param_fn)(theta, eta, &subject.covariates);
@@ -509,19 +542,39 @@ pub fn predict_iov(
     let dose_params: Vec<PkParams> = (0..subject.doses.len())
         .map(|d| {
             let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
-            (model.pk_param_fn)(theta, &combined_for(occ), subject.dose_cov(d))
+            pk_params_at_time(
+                model,
+                theta,
+                &combined_for(occ),
+                subject.dose_cov(d),
+                subject.doses[d].time,
+            )
         })
         .collect();
     let obs_params: Vec<PkParams> = (0..subject.obs_times.len())
         .map(|j| {
             let occ = subject.occasions.get(j).copied().unwrap_or(0);
-            (model.pk_param_fn)(theta, &combined_for(occ), subject.obs_cov(j))
+            pk_params_at_time(
+                model,
+                theta,
+                &combined_for(occ),
+                subject.obs_cov(j),
+                subject.obs_times[j],
+            )
         })
         .collect();
     // EVID=2 rows carry no occasion label → BSV eta with zero kappa.
     let pk_only_combined = combined_for(u32::MAX);
     let pk_only_params: Vec<PkParams> = (0..subject.pk_only_times.len())
-        .map(|m| (model.pk_param_fn)(theta, &pk_only_combined, subject.pk_only_cov(m)))
+        .map(|m| {
+            pk_params_at_time(
+                model,
+                theta,
+                &pk_only_combined,
+                subject.pk_only_cov(m),
+                subject.pk_only_times[m],
+            )
+        })
         .collect();
 
     let mut preds = if let Some(ref ode) = model.ode_spec {
@@ -1176,28 +1229,30 @@ pub fn compute_predictions_with_states(
     theta: &[f64],
     eta: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let uses_time = model_uses_time_builtin(model);
     if let Some(ref ode) = model.ode_spec {
         // ODE path: both ipred and states come from a single ODE integration.
         // TV-covariate and reset subjects need the event-driven path (which also
         // handles resets as break-points). Plain subjects use the simpler function
         // that avoids the per-event PK-parameter machinery.
-        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-        let (mut ipred, states) = if subject.has_tv_covariates() || subject.has_resets() {
-            let mut scratch = EventPkParams::with_capacity_for(subject);
-            compute_event_pk_params_into(model, subject, theta, eta, &mut scratch);
-            crate::ode::ode_predictions_event_driven_with_states(
-                ode,
-                subject,
-                theta,
-                eta,
-                &scratch.dose,
-                &scratch.obs,
-                &scratch.pk_only,
-            )
-        } else {
-            // Single-pass: one ODE integration yields both ipred and states.
-            crate::ode::ode_predictions_with_states(ode, &pk.values, theta, eta, subject)
-        };
+        let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
+        let (mut ipred, states) =
+            if subject.has_tv_covariates() || subject.has_resets() || uses_time {
+                let mut scratch = EventPkParams::with_capacity_for(subject);
+                compute_event_pk_params_into(model, subject, theta, eta, &mut scratch);
+                crate::ode::ode_predictions_event_driven_with_states(
+                    ode,
+                    subject,
+                    theta,
+                    eta,
+                    &scratch.dose,
+                    &scratch.obs,
+                    &scratch.pk_only,
+                )
+            } else {
+                // Single-pass: one ODE integration yields both ipred and states.
+                crate::ode::ode_predictions_with_states(ode, &pk.values, theta, eta, subject)
+            };
         // Apply [scaling] and LTBS log-transform — the single insertion point
         // shared with compute_predictions_with_tv_into_with_schedule (lines 1153–1154).
         // Without this, ODE models with `obs_scale` or `log_transform = true` would
@@ -1225,7 +1280,7 @@ pub fn compute_predictions_with_states(
             // compartments[i] → NaN via the .unwrap_or(&[]) fallback. Consistent
             // with the IOV convention. W_DERIVED_CMT_RESET_ANALYTICAL explains why.
             vec![]
-        } else if subject.has_tv_covariates() {
+        } else if subject.has_tv_covariates() || uses_time {
             // Superposition would use baseline pk_params while ipred honours per-event
             // TV parameters — silently wrong states. Outer-empty → NaN, consistent
             // with IOV and reset. W_DERIVED_CMT_TV_ANALYTICAL explains why.
@@ -1467,12 +1522,13 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
     let has_tv = subject.has_tv_covariates();
+    let uses_time = model_uses_time_builtin(model);
 
     let mut preds = if let Some(ref ode) = model.ode_spec {
         // ODE path. Resets (EVID=3/4) need the state-propagating event-driven
         // walker too, even without time-varying covariates — the plain
         // `ode_predictions` loop has no reset event.
-        if has_tv || subject.has_resets() {
+        if has_tv || subject.has_resets() || uses_time {
             compute_event_pk_params_into(model, subject, theta, eta, scratch);
             crate::ode::ode_predictions_event_driven(
                 ode,
@@ -1484,10 +1540,10 @@ pub fn compute_predictions_with_tv_into_with_schedule(
                 &scratch.pk_only,
             )
         } else {
-            let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+            let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
             crate::ode::ode_predictions(ode, &pk.values, theta, eta, subject)
         }
-    } else if (has_tv || subject.has_resets())
+    } else if (has_tv || subject.has_resets() || uses_time)
         && event_driven::supports_event_driven(model.pk_model)
     {
         compute_event_pk_params_into(model, subject, theta, eta, scratch);
@@ -1971,6 +2027,51 @@ mod tests {
         assert_relative_eq!(ev.dose[1].cl(), 15.0, epsilon = 1e-12);
         assert_relative_eq!(ev.obs[0].cl(), 10.0, epsilon = 1e-12);
         assert_relative_eq!(ev.obs[1].cl(), 20.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_event_pk_params_time_builtin_uses_event_times_without_tv_covariates() {
+        let model_str = "
+[parameters]
+  theta TVCL(10.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.1
+
+[individual_parameters]
+  if (TIME > 0.5) {
+    CL = (TVCL + TIME) * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=time)
+
+[error_model]
+  DV ~ additive(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(model_str)
+            .expect("TIME/time built-ins parse");
+        assert!(
+            !model
+                .referenced_covariates
+                .iter()
+                .any(|c| c == "TIME" || c == "time"),
+            "TIME/time must not be tracked as data covariates: {:?}",
+            model.referenced_covariates
+        );
+
+        let subj = make_subject_with_tv(HashMap::new(), Vec::new(), Vec::new(), 2, 2);
+        assert!(!subj.has_tv_covariates(), "fixture must stay on no-TV path");
+
+        let ev = compute_event_pk_params(&model, &subj, &model.default_params.theta, &[0.0]);
+
+        assert_relative_eq!(ev.dose[0].cl(), 10.0, epsilon = 1e-12); // TIME = 0
+        assert_relative_eq!(ev.dose[1].cl(), 11.0, epsilon = 1e-12); // TIME = 1
+        assert_relative_eq!(ev.obs[0].cl(), 11.0, epsilon = 1e-12); // TIME = 1
+        assert_relative_eq!(ev.obs[1].cl(), 12.0, epsilon = 1e-12); // TIME = 2
+        assert_relative_eq!(ev.dose[0].v(), 0.0, epsilon = 1e-12); // time = 0
+        assert_relative_eq!(ev.obs[1].v(), 2.0, epsilon = 1e-12); // time = 2
     }
 
     #[test]

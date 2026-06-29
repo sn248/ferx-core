@@ -240,6 +240,9 @@ fn expression_scale_axes_admissible(
 /// count within [`MAX_ODE_SENS_DIM`]. Per-subject gates (bolus-only doses, no TV
 /// covariates/resets) are checked in [`ode_subject_sensitivities`].
 pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
+        return false;
+    }
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };

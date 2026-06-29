@@ -1389,8 +1389,8 @@ impl Default for ErrorSpec {
 /// quantities that do **not** depend on the random effects (η) or the
 /// prediction beyond the built-in proportional loading, so the multiplier is
 /// constant across the inner EBE loop for a fixed θ. The covariate map must
-/// supply `TIME` (the parser injects it as a covariate reference) plus any
-/// model covariates the expression names.
+/// supply any model covariates the expression names; `TIME` is provided by the
+/// parser's event-time built-in.
 pub type RuvMagFn = Box<dyn Fn(&[f64], &HashMap<String, f64>, f64) -> f64 + Send + Sync>;
 
 /// Custom residual-error magnitude (#484): one optional multiplier per flat

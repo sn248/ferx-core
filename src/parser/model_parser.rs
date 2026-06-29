@@ -8563,7 +8563,8 @@ fn build_ruv_magnitude(
         }
         any = true;
         // The scaled sigma resolves to a `Variable` (bound to 1.0 at eval);
-        // unknown identifiers fall back to covariates (TIME / model covariates).
+        // unknown identifiers fall back to model covariates. TIME/time parse
+        // as event-time built-ins.
         let defined = [sigma_name.clone()];
         let ctx = ParseCtx {
             theta_names,
@@ -8580,12 +8581,15 @@ fn build_ruv_magnitude(
         let f: RuvMagFn = Box::new(move |theta, obs_cov, time| {
             let mut vars: HashMap<String, f64> = HashMap::new();
             vars.insert(sig.clone(), 1.0);
-            // Provide TIME alongside the observation's covariate snapshot. The
-            // map is cloned per call only on the custom-magnitude path.
+            // Preserve the legacy covariate-map injection for any pre-built
+            // expression that still treats TIME as a covariate; parsed models
+            // now use the event-time built-in via `with_model_time`.
             let mut cov = obs_cov.clone();
             cov.insert("TIME".to_string(), time);
             cov.insert("time".to_string(), time);
-            eval_expression(&expr, theta, &[], &cov, &vars, &[])
+            with_model_time(time, || {
+                eval_expression(&expr, theta, &[], &cov, &vars, &[])
+            })
         });
         per_sigma.push(Some(f));
     }
@@ -8701,6 +8705,7 @@ fn build_pk_param_fn(
     pk_entries.sort_by(|a, b| a.0.cmp(b.0));
     let mut pk_assignment_mapping: Vec<(usize, usize)> = Vec::with_capacity(pk_entries.len());
     let mut pk_const_mapping: Vec<(usize, f64)> = Vec::new();
+    let mut pk_time_mapping: Vec<usize> = Vec::new();
     for (pk_name, var_name) in pk_entries {
         let pk_slot = PkParams::name_to_index(pk_name).ok_or_else(|| {
             format!(
@@ -8714,7 +8719,9 @@ fn build_pk_param_fn(
             .get(var_name)
             .copied()
             .or_else(|| var_idx.get(&var_name.to_lowercase()).copied());
-        if let Some(var_slot) = var_slot {
+        if var_name == "TIME" || var_name == "time" {
+            pk_time_mapping.push(pk_slot);
+        } else if let Some(var_slot) = var_slot {
             pk_assignment_mapping.push((pk_slot, var_slot));
         } else if let Ok(c) = var_name.parse::<f64>() {
             // A numeric literal binds the slot to a constant — but `f64::from_str`
@@ -8801,6 +8808,7 @@ fn build_pk_param_fn(
         ode_assignment_mapping.clone()
     };
     let pk_slot_indices = pk_var_slots.iter().map(|&(slot, _)| slot).collect();
+    let uses_time_builtin = stmts_use_time_builtin(&stmts_owned) || !pk_time_mapping.is_empty();
     let indiv_param_program = IndivParamProgram {
         stmts: stmts_owned.clone(),
         n_vars,
@@ -8810,6 +8818,7 @@ fn build_pk_param_fn(
         n_theta: n_theta_base,
         n_eta: n_eta_extended,
         cov_names: cov_names_for_lookup.clone(),
+        uses_time_builtin,
     };
 
     // Snapshot the NN handles into the closure. Empty when no
@@ -8886,6 +8895,9 @@ fn build_pk_param_fn(
                     for &(pk_slot, c) in &pk_const_mapping {
                         p.values[pk_slot] = c;
                     }
+                    for &pk_slot in &pk_time_mapping {
+                        p.values[pk_slot] = current_model_time();
+                    }
                     // Modeled infusion duration (`D{cmt}`, RATE=-2; #394): write
                     // each duration parameter into its reserved spare slot so the
                     // analytical dose-resolution step can read it.
@@ -8926,6 +8938,7 @@ pub(crate) enum Expression {
     Literal(f64),
     Theta(usize),
     Eta(usize),
+    Time,
     Covariate(String),
     Variable(String),
     /// Same as `Variable(name)` but pre-resolved to a slot index. Produced
@@ -8955,6 +8968,30 @@ pub(crate) enum Expression {
         nn_idx: usize,
         output_idx: usize,
     },
+}
+
+thread_local! {
+    static MODEL_TIME: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
+    MODEL_TIME.with(|cell| {
+        let prev = cell.replace(time);
+        struct TimeGuard<'a>(&'a std::cell::Cell<f64>, f64);
+        impl Drop for TimeGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let guard = TimeGuard(cell, prev);
+        let out = f();
+        drop(guard);
+        out
+    })
+}
+
+fn current_model_time() -> f64 {
+    MODEL_TIME.with(std::cell::Cell::get)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9162,6 +9199,24 @@ fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::
             out.insert(name.clone());
         }
     });
+}
+
+fn stmts_use_time_builtin(stmts: &[Statement]) -> bool {
+    let mut found = false;
+    visit_stmt_nodes(stmts, &mut |e| {
+        if matches!(e, Expression::Time) {
+            found = true;
+        }
+    });
+    found
+}
+
+pub(crate) fn compiled_model_uses_time_builtin(model: &CompiledModel) -> bool {
+    model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .is_some_and(|program| program.uses_time_builtin)
 }
 
 /// Accumulate every `Variable(name)` in an expression whose name is not a key in
@@ -9419,6 +9474,7 @@ fn eval_expression(
         Expression::Literal(v) => *v,
         Expression::Theta(i) => theta[*i],
         Expression::Eta(i) => eta[*i],
+        Expression::Time => current_model_time(),
         Expression::Covariate(name) => covariates.get(name).copied().unwrap_or(0.0),
         Expression::Variable(name) => {
             if name.eq_ignore_ascii_case("MACHEPS") {
@@ -9578,6 +9634,7 @@ enum Op {
     PushConst(u32), // index into Bytecode.constants
     PushTheta(u32),
     PushEta(u32),
+    PushTime,
     PushVar(u32),
     PushCov(u32),
     PushNnOutput(u32, u32),
@@ -9750,6 +9807,7 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             Op::PushConst(_)
             | Op::PushTheta(_)
             | Op::PushEta(_)
+            | Op::PushTime
             | Op::PushVar(_)
             | Op::PushCov(_)
             | Op::PushNnOutput(_, _) => 1,
@@ -9826,6 +9884,7 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
         Expression::Literal(v) => bc.push_const(*v),
         Expression::Theta(i) => bc.ops.push(Op::PushTheta(*i as u32)),
         Expression::Eta(i) => bc.ops.push(Op::PushEta(*i as u32)),
+        Expression::Time => bc.ops.push(Op::PushTime),
         Expression::VariableIdx(i) => bc.ops.push(Op::PushVar(*i as u32)),
         Expression::CovariateIdx(i) => bc.ops.push(Op::PushCov(*i as u32)),
         Expression::Variable(_) | Expression::Covariate(_) => {
@@ -9982,6 +10041,7 @@ fn eval_bytecode(
             Op::PushConst(i) => push!(consts[i as usize]),
             Op::PushTheta(i) => push!(theta.get(i as usize).copied().unwrap_or(0.0)),
             Op::PushEta(i) => push!(eta.get(i as usize).copied().unwrap_or(0.0)),
+            Op::PushTime => push!(current_model_time()),
             Op::PushVar(i) => push!(vars.get(i as usize).copied().unwrap_or(0.0)),
             Op::PushCov(i) => push!(covariates.get(i as usize).copied().unwrap_or(0.0)),
             Op::PushNnOutput(nn_i, out_i) => {
@@ -10203,6 +10263,7 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
             Op::PushConst(i) => push!(k(consts[i as usize])),
             Op::PushTheta(i) => push!(theta.get(i as usize).copied().unwrap_or_else(|| k(0.0))),
             Op::PushEta(i) => push!(eta.get(i as usize).copied().unwrap_or_else(|| k(0.0))),
+            Op::PushTime => push!(k(current_model_time())),
             Op::PushVar(i) => push!(*vars.get(i as usize).unwrap_or(&k(0.0))),
             Op::PushCov(i) => push!(k(covariates.get(i as usize).copied().unwrap_or(0.0))),
             Op::PushNnOutput(nn_i, out_i) => {
@@ -10392,6 +10453,7 @@ fn eval_expression_indexed(
         Expression::Literal(v) => *v,
         Expression::Theta(i) => theta[*i],
         Expression::Eta(i) => eta[*i],
+        Expression::Time => current_model_time(),
         Expression::VariableIdx(i) => vars.get(*i).copied().unwrap_or(0.0),
         Expression::CovariateIdx(i) => covariates.get(*i).copied().unwrap_or(0.0),
         Expression::Covariate(_) | Expression::Variable(_) => {
@@ -10844,7 +10906,7 @@ impl OdeRhsProgram {
 /// unfolded walk on all axes.
 fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
     bc.ops.iter().any(|op| match op {
-        Op::PushEta(_) | Op::PushTheta(_) | Op::PushNnOutput(_, _) => true,
+        Op::PushEta(_) | Op::PushTheta(_) | Op::PushTime | Op::PushNnOutput(_, _) => true,
         Op::PushVar(i) => dyn_vars.get(*i as usize).copied().unwrap_or(false),
         _ => false,
     })
@@ -10855,7 +10917,10 @@ fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
 /// dynamic (conservative — it never appears in a resolved program).
 fn expr_is_dynamic(e: &Expression, dyn_vars: &[bool]) -> bool {
     match e {
-        Expression::Eta(_) | Expression::Theta(_) | Expression::NnOutput { .. } => true,
+        Expression::Eta(_)
+        | Expression::Theta(_)
+        | Expression::Time
+        | Expression::NnOutput { .. } => true,
         Expression::Variable(_) => true,
         Expression::VariableIdx(i) => dyn_vars.get(*i).copied().unwrap_or(false),
         Expression::Literal(_) | Expression::Covariate(_) | Expression::CovariateIdx(_) => false,
@@ -10969,6 +11034,9 @@ pub struct IndivParamProgram {
     n_eta: usize,
     /// Covariate names in `referenced_covariates` order (for the cov slice).
     cov_names: Vec<String>,
+    /// Whether `[individual_parameters]` or a direct analytical `pk(...=TIME)`
+    /// mapping reads the event-time built-in.
+    uses_time_builtin: bool,
 }
 
 impl IndivParamProgram {
@@ -11479,6 +11547,7 @@ fn resolve_expr_indices(
         Expression::Literal(_)
         | Expression::Theta(_)
         | Expression::Eta(_)
+        | Expression::Time
         | Expression::VariableIdx(_)
         | Expression::CovariateIdx(_)
         | Expression::NnOutput { .. } => {}
@@ -11610,7 +11679,7 @@ fn differentiate_with_chain(
         }
     };
     match expr {
-        Expression::Literal(_) => Expression::Literal(0.0),
+        Expression::Literal(_) | Expression::Time => Expression::Literal(0.0),
         Expression::Theta(k) => match axis {
             DiffAxis::Theta(j) => kron(*k, j),
             _ => Expression::Literal(0.0),
@@ -11817,6 +11886,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
         Expression::Literal(_)
         | Expression::Theta(_)
         | Expression::Eta(_)
+        | Expression::Time
         | Expression::Variable(_)
         | Expression::VariableIdx(_)
         | Expression::Covariate(_)
@@ -12509,6 +12579,10 @@ fn parse_atom(
             Ok((expr, p + 1))
         }
         Token::Ident(name) => {
+            if name == "TIME" || name == "time" {
+                return Ok((Expression::Time, pos + 1));
+            }
+
             // compartments[N] — subscript access into DerivedContext::compartments.
             // Emits Variable("__cmt_N") which build_derived_vars populates at eval time.
             // Only literal non-negative integer indices are supported.

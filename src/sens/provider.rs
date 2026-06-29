@@ -199,6 +199,9 @@ enum ExKind {
 /// Per-subject gates (TV covariates) are checked separately in
 /// [`subject_sensitivities`].
 pub fn analytical_supported(model: &CompiledModel) -> bool {
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
+        return false;
+    }
     matches!(
         model.pk_model,
         PkModel::OneCptIv
@@ -603,6 +606,9 @@ fn iov_combined_derivs<const MP: usize>(
 /// provider's gating).
 pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if model.n_kappa == 0 || model.ode_spec.is_some() {
+        return false;
+    }
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
         return false;
     }
     // M3 BLOQ: the IOV objective promotes M3 to the interaction (censored) marginal

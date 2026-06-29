@@ -15,6 +15,7 @@ Each line assigns a PK parameter using an arithmetic expression that can referen
 - **Theta parameters** -- names defined in `[parameters]` (e.g., `TVCL`, `TVV`)
 - **Eta random effects** -- names defined as omega parameters (e.g., `ETA_CL`, `ETA_V`)
 - **Covariates** -- column names from the data file (e.g., `WT`, `CRCL`)
+- **Event time** -- the built-ins `TIME` and `time`
 - **Constants** -- numeric literals (e.g., `70`, `0.75`)
 
 ## Supported Operators and Functions
@@ -65,6 +66,31 @@ operators (`<`, `<=`, `>`, `>=`, `==`, `!=`) and logical operators (`&&`,
 
 The inline form produces a value and can appear anywhere an expression is
 allowed. Both `then` and `else` branches are required.
+
+### Time-dependent parameters
+
+`TIME` and `time` are built-ins, not dataset covariates. They evaluate to the
+current PK event time when ferx evaluates `[individual_parameters]`: dose
+records, observations, and EVID=2 parameter-update records each see their own
+event time. This supports NONMEM-style `$PK` switches such as:
+
+```
+[individual_parameters]
+  if (TIME > 45) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+```
+
+For analytical models, using `TIME`/`time` routes the subject through the same
+event-driven parameter-switching path used for time-varying covariates. This
+matches the NONMEM `$PK IF (TIME.GT.45) ...` event-time convention: the
+parameter value used for each dose decay interval is the value active at that
+event on the PK timeline. For reset-stacked data where the displayed sdtab
+`TIME` may use the raw per-occasion clock, this built-in follows the internal
+monotone PK event clock.
 
 ### Interaction with mu-referencing
 
@@ -152,7 +178,9 @@ ferx records the `(ETA → THETA)` mapping and uses it to re-centre the inner-lo
 
 ## Covariate Detection
 
-Any uppercase identifier in the expression that does not match a theta name or eta name is automatically treated as a covariate. The covariate value is read from the corresponding column in the data file.
+Any uppercase identifier in the expression that does not match a theta name,
+eta name, or built-in such as `TIME` is automatically treated as a covariate.
+The covariate value is read from the corresponding column in the data file.
 
 For example, in `CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)`:
 - `TVCL` matches a theta parameter

@@ -20,6 +20,10 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- `TIME`/`time` are now built-in event-time values in `[individual_parameters]`
+  expressions and direct analytical `pk(...=TIME)` mappings, enabling
+  NONMEM-style time-dependent PK parameter switches without declaring `TIME` as
+  a covariate (#607).
 - **Per-subject outcome metrics for adaptive dosing** (#391, S2.4). `simulate_adaptive()` and
   `simulate_adaptive_from_spec()` now return a `metrics` field on `AdaptiveSimulationResult` —
   one `AdaptiveSubjectMetrics` row per realized `(subject, draw, sim)` run: cumulative dose,

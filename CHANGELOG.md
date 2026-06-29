@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Per-subject outcome metrics for adaptive dosing** (#391, S2.4). `simulate_adaptive()` and
+  `simulate_adaptive_from_spec()` now return a `metrics` field on `AdaptiveSimulationResult` —
+  one `AdaptiveSubjectMetrics` row per realized `(subject, draw, sim)` run: cumulative dose,
+  dose-increase / -decrease / hold / discontinuation counts, time-to-discontinuation, and the
+  observed-signal summary (min / max / mean). A new optional `[adaptive_dosing] target_window =
+  [low, high]` key adds `pct_time_in_window` (the fraction of the signal-bearing decisions whose
+  observed signal fell in the band; `high` may be `inf` for a one-sided target) — it reports a metric only and never
+  influences dosing. Every metric is derived from the realized dose ledger and decision log alone.
+  See [Adaptive dosing](model-file/adaptive-dosing.qmd).
 - **Drug-driven event-time simulation for joint PK-TTE** (#564). `simulate()` /
   `simulate_with_options()` now sample event times for an ODE-accumulated hazard
   (`hazard =` in `[event_model]`), not just analytic families: the augmented ODE is

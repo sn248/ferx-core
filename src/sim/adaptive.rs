@@ -334,6 +334,160 @@ pub struct AdaptiveRun {
     pub decisions: Vec<DecisionLogEntry>,
 }
 
+/// Per-subject outcome metrics for one realized adaptive-dosing run (#391 S2.4).
+///
+/// One row per `(subject, draw, sim)` — the same key as the trajectory, ledger,
+/// and decision-log rows in [`crate::AdaptiveSimulationResult`], so a metrics row
+/// joins to exactly the run it summarizes. Every field is computed by
+/// [`compute_subject_metrics`] from that run's realized dose ledger and decision
+/// log **alone** — no re-integration — so each number is a direct, auditable
+/// function of the recorded artifacts (the same "reproduce it from the artifacts"
+/// contract as the decision log).
+///
+/// The signal summary (`signal_min`/`max`/`mean`, `pct_time_in_window`) is over the
+/// values the controller actually observed at the decision times — the troughs/peaks
+/// the monitor saw, which for TDM is the clinically reported quantity. It is a
+/// **decision-grid** summary, not a dense-trajectory extremum, and (when several
+/// monitors are declared) summarizes the first one. When the run recorded no signal
+/// at any decision, the summary fields are `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveSubjectMetrics {
+    /// Subject id (matches [`DoseLedgerEntry::subject`]).
+    pub subject: String,
+    /// Parameter-uncertainty draw index (matches [`crate::SimulationResult::draw`]).
+    pub draw: usize,
+    /// Replicate index within the draw (matches [`crate::SimulationResult::sim`]).
+    pub sim: usize,
+    /// Total nominal dose delivered — Σ `amt` over the run's ledger rows
+    /// (pre-bioavailability: the prescribed amount, matching the ledger).
+    pub cumulative_dose: f64,
+    /// Number of realized doses (ledger rows). Holds and a bare `Stop` leave no
+    /// ledger row, so this counts doses actually given, not decisions.
+    pub n_doses: usize,
+    /// Times the realized dose stepped **up** relative to the previous realized
+    /// dose. By dose-delta (not which rule fired), so it counts dose changes that
+    /// actually happened — a `decrease` rule clamped at the lower bound re-issues
+    /// the same dose and is not counted. `rule_fired` on the ledger remains for
+    /// finer audit.
+    pub n_increases: usize,
+    /// Times the realized dose stepped **down** relative to the previous realized
+    /// dose (see [`AdaptiveSubjectMetrics::n_increases`]).
+    pub n_decreases: usize,
+    /// Decisions that issued no dose ([`DecisionOutcome::Hold`]).
+    pub n_holds: usize,
+    /// Whether the controller discontinued (a [`DecisionOutcome::Stop`] decision).
+    pub discontinued: bool,
+    /// Time of the `Stop` decision, or `None` if the run never discontinued.
+    pub time_to_discontinuation: Option<f64>,
+    /// Lowest observed signal across the decisions that recorded one (the deepest
+    /// trough the monitor saw), or `None` if no decision recorded a signal.
+    pub signal_min: Option<f64>,
+    /// Highest observed signal across the decisions that recorded one.
+    pub signal_max: Option<f64>,
+    /// Mean observed signal across the decisions that recorded one.
+    pub signal_mean: Option<f64>,
+    /// Fraction of the **signal-bearing** decisions whose observed value fell
+    /// within the spec's `target_window` `[lo, hi]` (inclusive), in `[0, 1]`. The
+    /// denominator is the count of decisions that recorded a signal — the same
+    /// basis as the signal summary above — not the raw decision count: a decision
+    /// with no recorded signal is neither in nor out of band, so it is excluded
+    /// rather than counted as a miss. `None` when no `target_window` is declared
+    /// (or no signal was recorded) — never a band guessed from the rule
+    /// thresholds (#584).
+    pub pct_time_in_window: Option<f64>,
+}
+
+/// Compute the [`AdaptiveSubjectMetrics`] for one realized run from its dose
+/// `ledger` and decision log alone (#391 S2.4).
+///
+/// `ledger` and `decisions` are the artifacts of a **single** `(subject, draw,
+/// sim)` run (the rows the per-subject driver emits), in emission order: `ledger`
+/// in dose order and `decisions` in schedule order. The function is pure — it
+/// re-integrates nothing — so it is unit-testable on hand-built rows. `target_window`
+/// comes from the [`AdaptiveDosingSpec`] (the file-driven path); the programmatic
+/// path passes `None`, leaving `pct_time_in_window` unreported.
+pub(crate) fn compute_subject_metrics(
+    subject: &str,
+    draw: usize,
+    sim: usize,
+    ledger: &[DoseLedgerEntry],
+    decisions: &[DecisionLogEntry],
+    target_window: Option<(f64, f64)>,
+) -> AdaptiveSubjectMetrics {
+    let cumulative_dose: f64 = ledger.iter().map(|e| e.amt).sum();
+    let n_doses = ledger.len();
+
+    // Dose changes between consecutive *realized* doses. A re-issued dose
+    // (unchanged, or clamped to the same bound) is bit-identical; a genuine step
+    // differs by the titration increment, so a small relative tolerance separates
+    // "no change" from a real step without miscounting float noise in compounded
+    // percentage steps.
+    let mut n_increases = 0usize;
+    let mut n_decreases = 0usize;
+    for w in ledger.windows(2) {
+        let (prev, cur) = (w[0].amt, w[1].amt);
+        let tol = 1e-9 * prev.abs().max(cur.abs()).max(1.0);
+        if cur > prev + tol {
+            n_increases += 1;
+        } else if cur < prev - tol {
+            n_decreases += 1;
+        }
+    }
+
+    let n_holds = decisions
+        .iter()
+        .filter(|d| matches!(d.outcome, DecisionOutcome::Hold))
+        .count();
+    let stop = decisions
+        .iter()
+        .find(|d| matches!(d.outcome, DecisionOutcome::Stop { .. }));
+    let discontinued = stop.is_some();
+    let time_to_discontinuation = stop.map(|d| d.time);
+
+    // Signal summary over the value the controller observed at each decision (the
+    // first monitor when several are declared). Decisions with no recorded signal
+    // are skipped, so an empty list yields `None` rather than a NaN.
+    let signal_vals: Vec<f64> = decisions
+        .iter()
+        .filter_map(|d| d.observed_signals.first().map(|s| s.value))
+        .collect();
+    let (signal_min, signal_max, signal_mean) = if signal_vals.is_empty() {
+        (None, None, None)
+    } else {
+        let min = signal_vals.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = signal_vals
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mean = signal_vals.iter().sum::<f64>() / signal_vals.len() as f64;
+        (Some(min), Some(max), Some(mean))
+    };
+    let pct_time_in_window = match target_window {
+        Some((lo, hi)) if !signal_vals.is_empty() => {
+            let n_in = signal_vals.iter().filter(|&&v| v >= lo && v <= hi).count();
+            Some(n_in as f64 / signal_vals.len() as f64)
+        }
+        _ => None,
+    };
+
+    AdaptiveSubjectMetrics {
+        subject: subject.to_string(),
+        draw,
+        sim,
+        cumulative_dose,
+        n_doses,
+        n_increases,
+        n_decreases,
+        n_holds,
+        discontinued,
+        time_to_discontinuation,
+        signal_min,
+        signal_max,
+        signal_mean,
+        pct_time_in_window,
+    }
+}
+
 // ── Controller-assay RNG substream (#391 S1.5) ──────────────────────────────
 //
 // A DV-mode monitor observes a *realized* measurement = IPRED + ε·√(residual
@@ -474,6 +628,14 @@ pub struct AdaptiveDosingSpec {
     /// Discrete titration levels (oncology). When set, `increase`/`decrease` step
     /// one level; mutually exclusive with percentage steps.
     pub levels: Option<Vec<f64>>,
+    /// Optional therapeutic target band `[low, high]` (inclusive) for the
+    /// monitored signal. It feeds **only** the `pct_time_in_window` outcome metric
+    /// (#391 S2.4) — it never influences dosing (the `when` rules do). `high` may
+    /// be `+∞` for a one-sided "at or above `low`" target. `None` leaves
+    /// `pct_time_in_window` unreported rather than guessing a band from the rule
+    /// thresholds (which conflates the control law with the clinical target). See
+    /// [`crate::AdaptiveSubjectMetrics`].
+    pub target_window: Option<(f64, f64)>,
     /// The first-matching-rule ladder, in file order.
     pub rules: Vec<AdaptiveRule>,
 }
@@ -536,6 +698,18 @@ impl AdaptiveDosingSpec {
                 "[adaptive_dosing]: start_dose {} is outside dose_bounds [{lo}, {hi}]",
                 self.start_dose
             ));
+        }
+        // `target_window` (metrics only): low must be finite and low <= high; high
+        // may be +∞ (a one-sided "at or above low" target). Checked here too, not
+        // just in the parser, so a hand-built spec can't reach metrics with an
+        // inverted/NaN band.
+        if let Some((wlo, whi)) = self.target_window {
+            if !wlo.is_finite() || whi.is_nan() || whi < wlo {
+                return Err(format!(
+                    "[adaptive_dosing]: target_window must be [low, high] with low finite and \
+                     low <= high (high may be inf): [{wlo}, {whi}]"
+                ));
+            }
         }
         // The decision schedule must be a non-empty, finite, strictly-increasing
         // list of non-negative times. The parser enforces this on the way in;
@@ -819,6 +993,7 @@ mod tests {
             dose_bounds: (0.0, 400.0),
             confirm: 1,
             levels: None,
+            target_window: None,
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 10.0,
@@ -906,6 +1081,41 @@ mod tests {
             action: AdaptiveAction::Increase(DoseStep::Level),
         }];
         assert!(s.validate().unwrap_err().contains("strictly increasing"));
+    }
+
+    #[test]
+    fn validate_rejects_inverted_or_nan_target_window() {
+        // `target_window` only feeds the `pct_time_in_window` metric, but a bad band
+        // must still be rejected: the parser checks it on the way in, and `validate`
+        // is the safety net for a hand-built `pub` spec reaching
+        // `simulate_adaptive_from_spec` without ever seeing the parser. Mirrors the
+        // parser's check (low finite, low <= high, high may be +inf).
+
+        // high < low (inverted).
+        let mut s = base_spec();
+        s.target_window = Some((20.0, 10.0));
+        assert!(s.validate().unwrap_err().contains("target_window"));
+
+        // non-finite low (NaN and +inf both rejected — low must be finite).
+        let mut s = base_spec();
+        s.target_window = Some((f64::NAN, 20.0));
+        assert!(s.validate().unwrap_err().contains("target_window"));
+        let mut s = base_spec();
+        s.target_window = Some((f64::INFINITY, 20.0));
+        assert!(s.validate().unwrap_err().contains("target_window"));
+
+        // NaN high.
+        let mut s = base_spec();
+        s.target_window = Some((10.0, f64::NAN));
+        assert!(s.validate().unwrap_err().contains("target_window"));
+
+        // Valid bands pass: a closed band and a one-sided "at or above low".
+        let mut s = base_spec();
+        s.target_window = Some((10.0, 20.0));
+        assert!(s.validate().is_ok());
+        let mut s = base_spec();
+        s.target_window = Some((10.0, f64::INFINITY));
+        assert!(s.validate().is_ok());
     }
 
     #[test]
@@ -1169,5 +1379,171 @@ mod tests {
             (var - 1.0).abs() < 0.2,
             "standard-normal draws should have ~unit variance, got {var}"
         );
+    }
+
+    // ── Per-subject metrics (#391 S2.4) ──────────────────────────────────────
+
+    fn ledger_entry(amt: f64) -> DoseLedgerEntry {
+        DoseLedgerEntry {
+            subject: "S".to_string(),
+            draw: 0,
+            sim: 0,
+            dose_idx: 0,
+            time: 0.0,
+            amt,
+            cmt: 1,
+            rate: 0.0,
+            decision_idx: 0,
+            rule_fired: "bolus".to_string(),
+            observed_signals: Vec::new(),
+            pre_state: None,
+            post_state: None,
+            f_applied: 1.0,
+        }
+    }
+
+    fn decision(time: f64, signal: Option<f64>, outcome: DecisionOutcome) -> DecisionLogEntry {
+        DecisionLogEntry {
+            subject: "S".to_string(),
+            draw: 0,
+            sim: 0,
+            decision_idx: 0,
+            time,
+            observed_signals: signal
+                .map(|v| {
+                    vec![ObservedSignal {
+                        name: "signal".to_string(),
+                        value: v,
+                        mode: ObserveMode::Ipred,
+                    }]
+                })
+                .unwrap_or_default(),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn metrics_summarize_doses_holds_and_discontinuation() {
+        // A titration that steps up once (100→125), back down once (125→100),
+        // re-issues unchanged (100→100), holds once, then discontinues.
+        let ledger = vec![
+            ledger_entry(100.0),
+            ledger_entry(125.0),
+            ledger_entry(100.0),
+            ledger_entry(100.0),
+        ];
+        let decisions = vec![
+            decision(24.0, Some(8.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(48.0, Some(5.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(72.0, Some(22.0), DecisionOutcome::Hold),
+            decision(96.0, Some(15.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(120.0, Some(45.0), DecisionOutcome::Stop { dosed: 0 }),
+        ];
+
+        let m = compute_subject_metrics("S", 1, 2, &ledger, &decisions, None);
+
+        assert_eq!(m.subject, "S");
+        assert_eq!((m.draw, m.sim), (1, 2));
+        assert_eq!(m.cumulative_dose, 425.0);
+        assert_eq!(m.n_doses, 4);
+        assert_eq!(m.n_increases, 1, "100→125 is the only step up");
+        assert_eq!(
+            m.n_decreases, 1,
+            "125→100 is the only step down; 100→100 is no change"
+        );
+        assert_eq!(m.n_holds, 1);
+        assert!(m.discontinued);
+        assert_eq!(m.time_to_discontinuation, Some(120.0));
+        assert_eq!(m.signal_min, Some(5.0));
+        assert_eq!(m.signal_max, Some(45.0));
+        assert_eq!(m.signal_mean, Some(19.0)); // (8+5+22+15+45)/5
+        assert_eq!(m.pct_time_in_window, None, "no target_window declared");
+    }
+
+    #[test]
+    fn metrics_pct_time_in_window_counts_signals_in_band() {
+        let ledger = vec![ledger_entry(100.0)];
+        let decisions = vec![
+            decision(0.0, Some(8.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(24.0, Some(5.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(48.0, Some(22.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(72.0, Some(15.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(96.0, Some(45.0), DecisionOutcome::Dosed { n: 1 }),
+        ];
+        // Two-sided band [10, 20]: only 15 is in band ⇒ 1/5.
+        let band = compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)));
+        assert_eq!(band.pct_time_in_window, Some(0.2));
+        // One-sided "at or above 10" ([10, +∞]): 22, 15, 45 ⇒ 3/5.
+        let one_sided =
+            compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, f64::INFINITY)));
+        assert_eq!(one_sided.pct_time_in_window, Some(0.6));
+    }
+
+    #[test]
+    fn metrics_reissued_doses_are_not_changes() {
+        // A fixed regimen (the degenerate controller): every dose identical ⇒ no
+        // increases, no decreases — the metrics half of the degenerate oracle.
+        let ledger = vec![ledger_entry(50.0), ledger_entry(50.0), ledger_entry(50.0)];
+        let decisions = vec![
+            decision(0.0, Some(3.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(24.0, Some(3.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(48.0, Some(3.0), DecisionOutcome::Dosed { n: 1 }),
+        ];
+        let m = compute_subject_metrics("S", 1, 1, &ledger, &decisions, None);
+        assert_eq!(m.n_increases, 0);
+        assert_eq!(m.n_decreases, 0);
+        assert_eq!(m.n_holds, 0);
+        assert!(!m.discontinued);
+        assert_eq!(m.time_to_discontinuation, None);
+        assert_eq!(m.cumulative_dose, 150.0);
+    }
+
+    #[test]
+    fn metrics_empty_run_has_no_signal_summary() {
+        // No doses, no decisions: counts are zero and the signal summary is `None`
+        // (not a NaN), even when a target_window is set (no signal to score).
+        let m = compute_subject_metrics("S", 1, 1, &[], &[], Some((10.0, 20.0)));
+        assert_eq!(m.cumulative_dose, 0.0);
+        assert_eq!(m.n_doses, 0);
+        assert_eq!(m.n_increases, 0);
+        assert_eq!(m.n_decreases, 0);
+        assert_eq!(m.n_holds, 0);
+        assert!(!m.discontinued);
+        assert_eq!(m.time_to_discontinuation, None);
+        assert_eq!(m.signal_min, None);
+        assert_eq!(m.signal_max, None);
+        assert_eq!(m.signal_mean, None);
+        assert_eq!(m.pct_time_in_window, None);
+    }
+
+    #[test]
+    fn metrics_signalless_decisions_are_excluded_not_counted_as_misses() {
+        // A *mixed* decision log — some decisions recorded a signal, some did not.
+        // `compute_subject_metrics` is a pure function whose contract admits this
+        // (a decision can carry an empty `observed_signals`), even though the
+        // current single-monitor engine records one at every decision. The signal
+        // summary and `pct_time_in_window` are over the **signal-bearing** decisions
+        // only: a measurement-less decision is neither in nor out of band, so it is
+        // excluded from the denominator rather than counted as a miss.
+        let ledger = vec![ledger_entry(100.0), ledger_entry(100.0)];
+        let decisions = vec![
+            decision(0.0, Some(12.0), DecisionOutcome::Dosed { n: 1 }), // in [10, 20]
+            decision(24.0, None, DecisionOutcome::Dosed { n: 1 }),      // no signal
+            decision(48.0, Some(8.0), DecisionOutcome::Dosed { n: 1 }), // below band
+            decision(72.0, None, DecisionOutcome::Hold),                // no signal
+        ];
+        let m = compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)));
+
+        // Summary spans only the two decisions that recorded a signal (12 and 8),
+        // not the two signal-less ones.
+        assert_eq!(m.signal_min, Some(8.0));
+        assert_eq!(m.signal_max, Some(12.0));
+        assert_eq!(m.signal_mean, Some(10.0));
+        // Denominator = 2 signal-bearing decisions, of which one (12) is in band:
+        // 1/2 = 0.5 — not 1/4 (raw decision count) and not 1/3.
+        assert_eq!(m.pct_time_in_window, Some(0.5));
+        // Holds are counted over all decisions, independent of whether a signal
+        // was recorded, so the signal-less Hold still registers.
+        assert_eq!(m.n_holds, 1);
     }
 }

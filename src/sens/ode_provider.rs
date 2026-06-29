@@ -66,7 +66,7 @@ const _: () = assert!(
 
 /// Largest (θ + η) axis count for which the analytical η/θ chain (the
 /// individual-parameter program over `Dual2<M>`) is monomorphised.
-const MAX_ODE_AXES: usize = 16;
+pub(crate) const MAX_ODE_AXES: usize = 16;
 
 // SIX `disp!`/`dispatch_tv!(1, 2, …, 16)` dispatch tables are keyed on `MAX_ODE_AXES` and
 // enumerate `1..=16` explicitly with a silent `_ => None` — they live in the **entry-point
@@ -311,7 +311,10 @@ fn infusion_spans_segment(
 /// each need the `F`-scaled active window, a moving boundary not yet carried). Shared by
 /// `ode_tvcov_supported` (outer) and `ode_iov_subject_supported` (inner) so the two gates
 /// stay byte-identical and can't silently desync (#473 review #4).
-fn has_rate_defined_ss_infusion_under_f(model: &CompiledModel, subject: &Subject) -> bool {
+pub(crate) fn has_rate_defined_ss_infusion_under_f(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> bool {
     model.has_bioavailability()
         && subject.doses.iter().any(|d| {
             d.ss && d.ii > 0.0

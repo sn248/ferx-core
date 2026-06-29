@@ -5,6 +5,7 @@ use crate::stats::likelihood::{
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The inner-loop η-gradient route resolved for a subject. Reported in the
@@ -112,7 +113,7 @@ pub(crate) fn gradient_route_summary(
 ) -> String {
     let (mut analytic, mut fd) = (0usize, 0usize);
     for subject in &population.subjects {
-        match resolve_gradient_method(model, subject) {
+        match resolve_gradient_method_for_reporting(model, subject, &model.default_params.theta) {
             InnerGradientMethod::Analytic => analytic += 1,
             InnerGradientMethod::Fd => fd += 1,
         }
@@ -145,6 +146,109 @@ pub(crate) fn gradient_route_summary(
     format!("{resolved}  [requested: {requested_label}]")
 }
 
+fn resolve_gradient_method_for_reporting(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+) -> InnerGradientMethod {
+    if model.n_kappa == 0 {
+        return resolve_gradient_method(model, subject);
+    }
+    if iov_inner_subject_route(model, subject, theta).is_some() {
+        InnerGradientMethod::Analytic
+    } else {
+        InnerGradientMethod::Fd
+    }
+}
+
+fn iov_inner_subject_route(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+) -> Option<Vec<crate::sens::provider::ObsGrad>> {
+    if !crate::sens::provider::iov_sens_supported(model)
+        || model.default_params.omega_iov.is_none()
+        || analytic_inner_common_bail(model)
+        || subject_has_survival_records(subject)
+    {
+        return None;
+    }
+    let k_occasions = split_obs_by_occasion(subject).len();
+    let n_flat = model.n_eta + k_occasions * model.n_kappa;
+    let stacked = vec![0.0; n_flat];
+    crate::sens::provider::subject_eta_grad_iov(model, subject, theta, &stacked)
+}
+
+fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
+    if matches!(model.gradient_method, GradientMethod::Fd) {
+        return "gradient = fd";
+    }
+    if analytic_inner_common_bail(model) {
+        return "model-level analytic inner fallback";
+    }
+    if model.default_params.omega_iov.is_none() {
+        return "missing omega_iov";
+    }
+    if subject_has_survival_records(subject) {
+        return "survival/TTE observations";
+    }
+    if !crate::sens::provider::iov_sens_supported(model) {
+        return "model outside IOV analytic scope";
+    }
+    if model.ode_spec.is_some() {
+        if !subject.all_doses_fixed() {
+            return "modeled RATE/DURATION dose";
+        }
+        if matches!(model.scaling, ScalingSpec::ExpressionScale { .. })
+            && subject.has_tv_covariates()
+        {
+            return "ODE IOV expression obs_scale + time-varying covariates";
+        }
+        // Mirror the SS gates of `ode_iov_subject_supported`, in the same order
+        // (they are checked *before* the occasion/axis gates below, so omitting
+        // them would misattribute an SS bail to a later reason). #590 review.
+        if crate::sens::ode_provider::has_rate_defined_ss_infusion_under_f(model, subject) {
+            return "steady-state rate-defined infusion under F";
+        }
+        let has_ss = subject.doses.iter().any(|d| d.ss && d.ii > 0.0);
+        if has_ss && model.has_lagtime() {
+            return "steady-state dose + estimated lagtime";
+        }
+        if has_ss
+            && model
+                .ode_spec
+                .as_ref()
+                .and_then(|o| o.rhs_program.as_ref())
+                .is_some_and(|p| p.uses_time_vars())
+        {
+            return "steady-state dose + time-dependent ODE RHS";
+        }
+        if !subject.pk_only_times.is_empty() {
+            return "EVID=2 covariate breakpoint";
+        }
+        let occ_groups = split_obs_by_occasion(subject);
+        if occ_groups.is_empty() {
+            return "no observation occasions";
+        }
+        if subject
+            .dose_occasions
+            .iter()
+            .any(|d_occ| !occ_groups.iter().any(|(occ, _)| occ == d_occ))
+        {
+            return "dose occasion without observations";
+        }
+        let n_stacked = model.n_eta + occ_groups.len() * model.n_kappa;
+        let m_dim = model.n_theta + n_stacked;
+        if m_dim > crate::sens::ode_provider::MAX_ODE_AXES {
+            return "ODE IOV stacked axis cap";
+        }
+    }
+    // Reached only for an FD subject (the caller invokes this after
+    // `iov_inner_subject_route(..).is_none()`), so this is the catch-all for any
+    // provider bail not enumerated above — never the analytic case.
+    "subject outside IOV analytic scope"
+}
+
 /// Warning when *some but not all* subjects fall back to the FD inner gradient
 /// (outside the analytic provider's scope — SS+reset, time-varying covariates,
 /// oral infusion, modeled-duration doses, …). Returns `None` for a uniform
@@ -161,6 +265,9 @@ pub(crate) fn fd_fallback_warning(
     population: &Population,
     theta: &[f64],
 ) -> Option<String> {
+    if model.n_kappa != 0 {
+        return iov_fd_fallback_warning(model, population, theta);
+    }
     let zeros = vec![0.0; model.n_eta];
     let n_total = population.subjects.len();
     let n_fd = population
@@ -178,6 +285,38 @@ pub(crate) fn fd_fallback_warning(
     } else {
         None
     }
+}
+
+fn iov_fd_fallback_warning(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Option<String> {
+    let n_total = population.subjects.len();
+    let mut n_fd = 0usize;
+    let mut reasons: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for subject in &population.subjects {
+        if iov_inner_subject_route(model, subject, theta).is_none() {
+            n_fd += 1;
+            *reasons.entry(iov_fd_reason(model, subject)).or_insert(0) += 1;
+        }
+    }
+    // Mirror the non-IOV contract: only warn for a *mixed* population. An
+    // all-analytic (`n_fd == 0`) population needs no warning, and an all-FD
+    // (`n_fd == n_total`) one is already obvious from the `finite-difference`
+    // banner and the model itself (e.g. `gradient = fd`, LTBS). #590 review.
+    if n_fd == 0 || n_fd == n_total {
+        return None;
+    }
+    let reason_text = reasons
+        .into_iter()
+        .map(|(reason, count)| format!("{reason}: {count}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "{n_fd} of {n_total} subjects use finite-difference inner gradients \
+         in the IOV loop ({reason_text}); their results are correct but slower."
+    ))
 }
 
 /// Global per-fit timing counters for gradient/Jacobian calls. Printed by
@@ -2888,6 +3027,50 @@ mod iov_tests {
         );
     }
 
+    #[test]
+    fn gradient_route_summary_reports_ode_iov_analytic_route() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+        let population = Population {
+            subjects: vec![Subject {
+                id: "1".into(),
+                doses: vec![
+                    DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+                ],
+                obs_times: vec![1.0, 6.0, 25.0, 30.0],
+                obs_raw_times: Vec::new(),
+                observations: vec![8.0, 6.0, 7.0, 5.0],
+                obs_cmts: vec![1; 4],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 4],
+                occasions: vec![1, 1, 2, 2],
+                dose_occasions: vec![1, 2],
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            }],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let summary = gradient_route_summary(&model, &population, GradientMethod::Auto);
+        assert!(
+            summary.starts_with("analytic (Dual2)"),
+            "ODE IOV provider should be reported as analytic, got: {summary}"
+        );
+    }
+
     /// Regression: `gradient = fd` must force the FD inner route on an
     /// analytic-supported model (previously the executor ignored
     /// `model.gradient_method`, so the option silently ran the Dual2 path while
@@ -2949,6 +3132,174 @@ mod iov_tests {
 
         // Uniform analytic → no warning.
         assert!(fd_fallback_warning(&model, &mk_pop(vec![analytic]), theta).is_none());
+    }
+
+    #[test]
+    fn iov_fd_fallback_warning_reports_subject_reason() {
+        // Covariate-free ODE IOV model the provider serves analytically, so the FD
+        // subject below is the *only* one out of scope — a genuinely mixed
+        // population (the all-FD case is suppressed, mirroring the non-IOV
+        // contract, #590 review).
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+        // Analytic subject: doses and observations in the same occasions.
+        let analytic_subject = Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        // FD subject: a dose in occasion 2 has no observations, so the stacked
+        // vector has no κ axis for it — the provider declines this subject.
+        let fd_subject = Subject {
+            id: "2".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 6.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0],
+            obs_cmts: vec![1; 2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 2],
+            occasions: vec![1, 1],
+            dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![analytic_subject, fd_subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let warning = fd_fallback_warning(&model, &population, &model.default_params.theta)
+            .expect("mixed IOV population should warn with a reason");
+        assert!(warning.contains("1 of 2"), "got: {warning}");
+        assert!(
+            warning.contains("dose occasion without observations"),
+            "got: {warning}"
+        );
+    }
+
+    /// Uniform all-FD IOV populations are silent, matching the non-IOV contract:
+    /// the `finite-difference` banner already makes a model-level fallback obvious.
+    #[test]
+    fn iov_fd_fallback_warning_silent_for_uniform_all_fd() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  gradient = fd\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV + gradient = fd");
+        let mk_subject = |id: &str| Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![mk_subject("1"), mk_subject("2")],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        // gradient = fd routes every subject to FD (uniform) → no warning.
+        assert!(
+            fd_fallback_warning(&model, &population, &model.default_params.theta).is_none(),
+            "uniform all-FD population must not warn"
+        );
+    }
+
+    /// Regression (#590 review): the SS gates of `ode_iov_subject_supported` are
+    /// checked *before* the occasion/axis gates, so `iov_fd_reason` must report an
+    /// SS bail as such — not fall through to a later, wrong reason. Without the
+    /// SS branch this subject was reported as "subject outside IOV analytic scope".
+    #[test]
+    fn iov_fd_reason_attributes_steady_state_lagtime_bail() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVLAG(0.5,0.01,5.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_LAG ~ 0.09\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  LAGTIME = TVLAG * exp(ETA_LAG)\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  obs_scale = V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV + lagtime");
+        assert!(
+            model.has_lagtime(),
+            "model should carry a LAGTIME individual parameter"
+        );
+        let subject = Subject {
+            id: "1".into(),
+            // Steady-state bolus (ss, ii > 0) under an estimated lagtime: the IOV
+            // provider declines via the `SS + lagtime` gate.
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            // No covariates: keep `has_tv_covariates()` false so the FD cause is the
+            // SS+lagtime gate, not the earlier `ExpressionScale + tv-cov` gate.
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        assert!(
+            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
+            "SS + lagtime subject must route to FD"
+        );
+        assert_eq!(
+            iov_fd_reason(&model, &subject),
+            "steady-state dose + estimated lagtime"
+        );
     }
 
     fn make_iov_model() -> CompiledModel {

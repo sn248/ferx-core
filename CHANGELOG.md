@@ -283,15 +283,21 @@ section of the SDLC for the versioning policy).
   for η-dependent `[scaling] obs_scale` models** (#555). The per-subject empirical-Bayes
   BFGS stopped only on its gradient norm, but an adaptive-ODE-solver objective puts a
   noise floor on the gradient that can sit above the inner tolerance — so a search that
-  had already reached the mode spun to `max_iter` and reported failure. `find_ebe` then
-  discarded the correct estimate and restarted Nelder–Mead from η=0, which on a
+  had already reached the mode spun to `max_iter` and reported failure. The inner loop
+  then discarded the correct estimate and restarted Nelder–Mead from η=0, which on a
   multimodal inner objective (e.g. `obs_scale = V1` with `V1 = … · exp(ETA_V1)`) settled
   in a worse local minimum and inflated the FOCEI objective (≈370 OFV on the
-  `two_cpt_oral_cov` example; its analytical twin was unaffected). The inner BFGS now also
-  stops when the objective stops improving (a standard `ftol` criterion), so it converges
-  at the mode instead of failing — the ODE form's OFV-at-init now matches its analytical
-  twin (`−1193.59`, previously `−823.05`), and affected subjects converge in far fewer
-  inner iterations.
+  `two_cpt_oral_cov` example; its analytical twin was unaffected). Two changes fix it:
+  the inner fallback (both the BSV and the IOV paths) now keeps the **lower-objective** of
+  the BFGS partial and the Nelder–Mead restart instead of blindly overwriting with NM; and
+  the inner BFGS gained an objective-stall stop (active only for ODE models, so analytical
+  and finite-difference fits are bit-identical to before) so it converges at the mode
+  rather than spinning. The ODE form's OFV-at-init now matches its analytical twin
+  (`−1193.59`, previously `−823.05`), at the default ODE tolerance, and affected subjects
+  converge in far fewer inner iterations. *Note:* with `ebe_warm_start` off (the default), a
+  fit that hits the inner fallback with a BFGS partial that beats the η=0 restart now
+  returns that partial rather than the NM-from-0 result, so a previously fallback-stalled
+  EBE/OFV may shift toward the better optimum.
 - **Form C (`[scaling] y = <expr>`) ODE readouts now use per-observation covariate
   snapshots** (#535, #538). The explicit-output readout is evaluated against the
   covariate values on each observation's own data row rather than the subject's

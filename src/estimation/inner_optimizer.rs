@@ -280,6 +280,55 @@ pub struct InnerLoopStats {
     pub n_fallback: usize,
 }
 
+/// Inner-EBE fallback shared by [`find_ebe`] and [`find_ebe_iov`], invoked when the inner
+/// BFGS reports non-convergence. Keeps the lower-objective of the BFGS partial and a single
+/// Nelder–Mead restart, so a `false`-on-a-converged search (gradient-noise floor / line-
+/// search exhaustion at the mode, #555) cannot have its correct η̂ discarded by an NM
+/// restart that wanders into a worse basin. The same policy serves IOV and non-IOV so the
+/// two paths cannot drift into contradictory convergence behaviour.
+///
+/// The restart seeds from the BFGS `partial` when `ebe_warm_start` is set (it sits on the
+/// steep prior slope, so NM reaches the mode in fewer steps), else from `cold_seed` (η=0
+/// for non-IOV, `[μ, 0…]` for IOV — the historical reset point). Exactly **one** NM solve
+/// runs, so enabling `ebe_warm_start` is never slower than leaving it off.
+///
+/// Returns `(eta, nm_converged)`. The **value** is the lower-objective of the BFGS partial
+/// and the NM restart — the substantive #555 fix: the previous code overwrote `eta` with the
+/// NM restart unconditionally, discarding a correct partial that BFGS had reached but not
+/// gnorm-verified. `nm_converged` is the Nelder–Mead convergence flag (as the pre-#555 code
+/// reported), so the per-subject convergence/diagnostic semantics are unchanged; the η̂
+/// *value* fed to the FOCEI gradient is what improves. A non-finite `obj(partial)` (NaN/∞)
+/// makes the partial unusable so the NM result is taken.
+fn argmin_inner_fallback(
+    obj: &dyn Fn(&[f64]) -> f64,
+    partial: &[f64],
+    cold_seed: &[f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+) -> (Vec<f64>, bool) {
+    let partial_f = obj(partial);
+    let partial_usable = partial_f.is_finite();
+    let warm = ebe_warm_start_enabled() && partial_usable;
+    let mut eta_nm = if warm {
+        partial.to_vec()
+    } else {
+        cold_seed.to_vec()
+    };
+    let nm_ok = nelder_mead_minimize(obj, &mut eta_nm, n, max_iter * 5, tol);
+    let f_nm = obj(&eta_nm);
+    // Keep the partial unless NM is *strictly* better. Written as a positive comparison so a
+    // non-finite `f_nm` (NM diverged) leaves `nm_strictly_better = false` and the finite
+    // partial is kept.
+    let nm_strictly_better = f_nm < partial_f;
+    let best = if partial_usable && !nm_strictly_better {
+        partial.to_vec()
+    } else {
+        eta_nm
+    };
+    (best, nm_ok)
+}
+
 /// Find Empirical Bayes Estimates (EBEs) for a single subject via BFGS.
 ///
 /// When `mu_k` is provided (mu-referencing active), the inner optimizer works
@@ -442,110 +491,72 @@ pub fn find_ebe(
     // in scope (Almquist et al. 2015): one provider evaluation per inner step
     // instead of the FD gradient's ~2·n_eta+1 predictions, and exact → fewer
     // steps. Per-point FD fallback if the provider can't serve a given (θ, η).
-    let result = {
-        if analytic_inner_grad_supported(model, subject) {
-            let profile = inner_profile_enabled();
-            let agrad = |e: &[f64]| -> Vec<f64> {
-                let t0 = std::time::Instant::now();
-                match analytic_eta_nll_gradient_with_schedule(
-                    model,
-                    subject,
-                    &params.theta,
-                    e,
-                    &params.omega,
-                    &params.sigma.values,
-                    schedule.as_ref(),
-                ) {
-                    Some(g) => {
-                        GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
-                        if profile {
-                            PROFILE_INNER_ANALYTIC_GRAD
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        g
-                    }
-                    None => {
-                        let g = gradient_fd(&obj, e, n_eta);
-                        GRADIENT_TIMINGS.record_fd(t0.elapsed().as_nanos() as u64);
-                        if profile {
-                            PROFILE_INNER_FD_FALLBACK
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        g
-                    }
+    //
+    // Enable the objective-stall convergence stop only for ODE models, whose adaptive
+    // RK45 objective carries a gradient-noise floor that can sit above `tol` (#555).
+    // Analytical/event-driven objectives are exact, so they keep the pure `gnorm < tol`
+    // criterion and stay bit-identical to prior releases.
+    let enable_stall = model.ode_spec.is_some();
+    // Single gradient closure used by *both* the optimizer and the fallback's stationarity
+    // check, so the two agree on convergence: the exact analytic η-gradient (Almquist 2015,
+    // one provider eval per step) when in scope with a per-point FD fallback, else FD
+    // throughout. Checking the fallback with a *different* (FD) gradient than the analytic
+    // one the BFGS converged on mislabels weakly-identified flat-basin EBEs (#587 review).
+    let use_analytic = analytic_inner_grad_supported(model, subject);
+    let profile = inner_profile_enabled();
+    let agrad = |e: &[f64]| -> Vec<f64> {
+        if !use_analytic {
+            return gradient_fd(&obj, e, n_eta);
+        }
+        let t0 = std::time::Instant::now();
+        match analytic_eta_nll_gradient_with_schedule(
+            model,
+            subject,
+            &params.theta,
+            e,
+            &params.omega,
+            &params.sigma.values,
+            schedule.as_ref(),
+        ) {
+            Some(g) => {
+                GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
+                if profile {
+                    PROFILE_INNER_ANALYTIC_GRAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-            };
-            inner_minimize_with_grad(
-                &obj,
-                &agrad,
-                &mut eta,
-                n_eta,
-                max_iter,
-                tol,
-                precond.as_deref(),
-                stop_precond,
-            )
-        } else {
-            inner_minimize(
-                &obj,
-                &mut eta,
-                n_eta,
-                max_iter,
-                tol,
-                precond.as_deref(),
-                stop_precond,
-            )
+                g
+            }
+            None => {
+                let g = gradient_fd(&obj, e, n_eta);
+                GRADIENT_TIMINGS.record_fd(t0.elapsed().as_nanos() as u64);
+                if profile {
+                    PROFILE_INNER_FD_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                g
+            }
         }
     };
+    let result = inner_minimize_with_grad(
+        &obj,
+        &agrad,
+        &mut eta,
+        n_eta,
+        max_iter,
+        tol,
+        precond.as_deref(),
+        stop_precond,
+        enable_stall,
+    );
 
-    // If BFGS failed, fall back to Nelder-Mead — and keep the **lower-objective** of the
-    // BFGS partial and the NM result, never blindly overwriting with NM (#555). BFGS can
-    // report `false` while sitting on the true mode (its gradient norm floored above `tol`
-    // by ODE-solver noise, or a line search that exhausted its trials at the optimum), so
-    // discarding its partial and restarting NM from η=0 — which on a multimodal inner
-    // objective can settle in a worse basin — is exactly what blew up the FOCEI OFV.
-    // Selecting the argmin closes that whole class regardless of which `false` path fired.
-    //
-    // NM is restarted from η=0 (the historical seed); when `ebe_warm_start` is set it is
-    // *additionally* refined from the BFGS partial. The partial itself is also a candidate,
-    // so even if both NM runs do worse we never regress below where BFGS got.
+    // If BFGS failed, fall back to Nelder-Mead — keeping the lower-objective of the BFGS
+    // partial and the NM restart rather than blindly overwriting with NM (#555). See
+    // [`argmin_inner_fallback`] for the rationale; the cold seed is η=0.
     let bfgs_converged = result;
     let (nm_converged, used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
-        let partial_finite = partial.iter().all(|v| v.is_finite());
-        // Best-so-far = the BFGS partial (if usable). A finite partial that BFGS reached
-        // and that survives the argmin counts as converged: the `false` was a stopping-
-        // criterion artifact (gradient-noise floor / line-search exhaustion at the mode),
-        // not divergence — so it should not trigger the non-converged EBE-refinement pass.
-        let (mut best_eta, mut best_f, mut best_ok) = if partial_finite {
-            (partial.clone(), obj(&partial), true)
-        } else {
-            (vec![0.0; n_eta], f64::INFINITY, false)
-        };
-        // Candidate 1: NM cold-restarted from η=0 (historical behaviour).
-        let mut eta_cold = vec![0.0; n_eta];
-        let cold_ok = nelder_mead_minimize(&obj, &mut eta_cold, n_eta, max_iter * 5, tol);
-        let f_cold = obj(&eta_cold);
-        if f_cold < best_f {
-            best_eta = eta_cold;
-            best_f = f_cold;
-            best_ok = cold_ok;
-        }
-        // Candidate 2 (opt-in): NM refined from the BFGS partial — a weakly-identified η
-        // that BFGS ran far out sits on the steep prior slope, where NM slides to the mode
-        // in far fewer iterations than refining from η=0 in the flat basin.
-        if partial_finite && ebe_warm_start_enabled() {
-            let mut eta_warm = partial;
-            let warm_ok = nelder_mead_minimize(&obj, &mut eta_warm, n_eta, max_iter * 5, tol);
-            let f_warm = obj(&eta_warm);
-            if f_warm < best_f {
-                best_eta = eta_warm;
-                best_ok = warm_ok;
-                // `best_f` not read past this final candidate.
-            }
-        }
-        eta = best_eta;
-        (best_ok, true)
+        let cold = vec![0.0; n_eta];
+        let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
+        eta = best;
+        (ok, true)
     } else {
         (false, false)
     };
@@ -700,41 +711,61 @@ fn find_ebe_iov(
         && omega_iov_ref.is_some()
         && !analytic_inner_common_bail(model)
         && !subject_has_survival_records(subject);
-    let bfgs_converged = if analytic_iov_inner {
+    // ODE objectives carry the adaptive-solver gradient-noise floor; enable the
+    // objective-stall stop only for them (see `find_ebe`).
+    let enable_stall = model.ode_spec.is_some();
+    // One gradient closure for both the optimizer and the fallback stationarity check
+    // (analytic stacked-η IOV gradient when in scope, else FD), so they agree on
+    // convergence — see the matching note in `find_ebe`.
+    let agrad = |p: &[f64]| -> Vec<f64> {
+        if !analytic_iov_inner {
+            return gradient_fd(&obj, p, n_flat);
+        }
         let omega_iov = omega_iov_ref.expect("analytic_iov_inner requires omega_iov");
-        let agrad = |p: &[f64]| -> Vec<f64> {
-            // Recover stacked_true = [η_true (= psi − mu), κ…] from the psi-space `p`;
-            // the gradient is identical in psi- and η_true-space (constant `mu` shift).
-            let mut stacked_true = p.to_vec();
-            for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
-                *st = p[k] - mu[k];
-            }
-            match analytic_eta_nll_gradient_iov(
-                model,
-                subject,
-                &params.theta,
-                &stacked_true,
-                &params.omega,
-                omega_iov,
-                &params.sigma.values,
-                n_eta,
-                n_kappa,
-                k_occasions,
-            ) {
-                Some(g) => g,
-                None => gradient_fd(&obj, p, n_flat),
-            }
-        };
-        inner_minimize_with_grad(&obj, &agrad, &mut x, n_flat, max_iter, tol, None, None)
-    } else {
-        inner_minimize(&obj, &mut x, n_flat, max_iter, tol, None, None)
+        // Recover stacked_true = [η_true (= psi − mu), κ…] from the psi-space `p`; the
+        // gradient is identical in psi- and η_true-space (constant `mu` shift).
+        let mut stacked_true = p.to_vec();
+        for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
+            *st = p[k] - mu[k];
+        }
+        match analytic_eta_nll_gradient_iov(
+            model,
+            subject,
+            &params.theta,
+            &stacked_true,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            n_eta,
+            n_kappa,
+            k_occasions,
+        ) {
+            Some(g) => g,
+            None => gradient_fd(&obj, p, n_flat),
+        }
     };
+    let bfgs_converged = inner_minimize_with_grad(
+        &obj,
+        &agrad,
+        &mut x,
+        n_flat,
+        max_iter,
+        tol,
+        None,
+        None,
+        enable_stall,
+    );
+    // On BFGS failure, keep the lower-objective of the BFGS partial and a Nelder–Mead
+    // restart (cold seed = prior mode `bsv_psi = μ`, κ = 0) rather than blindly overwriting
+    // with NM — the same #555 argmin policy as the non-IOV `find_ebe`, so the IOV inner
+    // loop no longer discards a correct η̂ when its gradient floors above `tol`.
     let (nm_converged, used_fallback) = if !bfgs_converged {
-        // Reset to prior mode: bsv_psi = mu (eta_true = 0), kappas = 0.
-        x = vec![0.0; n_flat];
-        x[..n_eta].copy_from_slice(&mu);
-        let nm_ok = nelder_mead_minimize(&obj, &mut x, n_flat, max_iter * 5, tol);
-        (nm_ok, true)
+        let partial = x.clone();
+        let mut cold = vec![0.0; n_flat];
+        cold[..n_eta].copy_from_slice(&mu);
+        let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol);
+        x = best;
+        (ok, true)
     } else {
         (false, false)
     };
@@ -1526,36 +1557,8 @@ fn inner_use_lbfgs(n: usize) -> bool {
     }
 }
 
-/// Inner EBE minimization with a finite-difference gradient. Dispatches per the
-/// fit-scoped [`inner_optimizer_mode`] (dense BFGS / L-BFGS / Nelder–Mead); in
-/// `Auto` it falls back to the [`INNER_LBFGS_MIN_DIM`] size threshold. All
-/// gradient-based variants converge to the same EBE (stationary point of
-/// `individual_nll + ½η'Ω⁻¹η`).
-fn inner_minimize(
-    obj: &dyn Fn(&[f64]) -> f64,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    stop_precond: Option<&[f64]>,
-) -> bool {
-    if matches!(
-        inner_optimizer_mode(),
-        crate::types::InnerOptimizer::NelderMead
-    ) {
-        return nelder_mead_minimize(obj, x, n, max_iter, tol);
-    }
-    let grad = |p: &[f64]| gradient_fd(obj, p, n);
-    if inner_use_lbfgs(n) {
-        lbfgs_core(obj, &grad, x, n, max_iter, tol, precond, stop_precond)
-    } else {
-        dense_bfgs_core(obj, &grad, x, n, max_iter, tol, precond, stop_precond)
-    }
-}
-
 /// Inner EBE minimization with an externally-provided gradient (analytic
-/// sensitivities or AD). Same fit-scoped dispatch as [`inner_minimize`]; the
+/// sensitivities or AD). Fit-scoped dispatch (dense BFGS / L-BFGS / Nelder–Mead); the
 /// `NelderMead` mode ignores the supplied gradient.
 #[allow(clippy::too_many_arguments)]
 fn inner_minimize_with_grad(
@@ -1567,6 +1570,7 @@ fn inner_minimize_with_grad(
     tol: f64,
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
+    enable_stall: bool,
 ) -> bool {
     if matches!(
         inner_optimizer_mode(),
@@ -1575,9 +1579,29 @@ fn inner_minimize_with_grad(
         return nelder_mead_minimize(obj, x, n, max_iter, tol);
     }
     if inner_use_lbfgs(n) {
-        lbfgs_core(obj, grad, x, n, max_iter, tol, precond, stop_precond)
+        lbfgs_core(
+            obj,
+            grad,
+            x,
+            n,
+            max_iter,
+            tol,
+            precond,
+            stop_precond,
+            enable_stall,
+        )
     } else {
-        dense_bfgs_core(obj, grad, x, n, max_iter, tol, precond, stop_precond)
+        dense_bfgs_core(
+            obj,
+            grad,
+            x,
+            n,
+            max_iter,
+            tol,
+            precond,
+            stop_precond,
+            enable_stall,
+        )
     }
 }
 
@@ -1593,18 +1617,19 @@ fn lbfgs_core(
     tol: f64,
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
+    enable_stall: bool,
 ) -> bool {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
     let mut rho_hist: Vec<f64> = Vec::new();
     let mut g = grad(x);
     let mut f_cur = obj(x);
-    // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]): a
-    // gradient norm floored above `tol` by ODE-solver noise lets a search that reached the
-    // mode declare convergence rather than spinning to `max_iter`. Gated below on the
-    // gradient also being near-stationary.
+    // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]): for ODE
+    // objectives whose gradient norm is floored above `tol` by solver noise, a search that
+    // reached the mode declares convergence rather than spinning to `max_iter`. Gated on
+    // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`).
     let mut stall = 0u32;
-    let gnorm_gate = INNER_FTOL_GNORM_GATE * tol;
+    let mut best_gnorm = f64::INFINITY;
 
     for _iter in 0..max_iter {
         // Stopping metric. `stop_precond` is `Some` only for FREM, where the raw
@@ -1616,6 +1641,11 @@ fn lbfgs_core(
         let gnorm = grad_norm_metric(&g, stop_precond);
         if gnorm < tol {
             return true;
+        }
+        // Has the gradient norm meaningfully improved on the best seen? (Plateau guard.)
+        let gnorm_improving = gnorm < best_gnorm * (1.0 - INNER_FTOL_GNORM_PLATEAU);
+        if gnorm < best_gnorm {
+            best_gnorm = gnorm;
         }
 
         let mut d = lbfgs_direction(&g, &s_hist, &y_hist, &rho_hist, n, precond);
@@ -1630,15 +1660,17 @@ fn lbfgs_core(
         }
 
         let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
-        // No sufficient-decrease step found: report non-convergence so the caller
-        // takes the fallback path rather than accepting a non-stationary η̂.
+        // No sufficient-decrease step found: report non-convergence so the caller takes the
+        // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
             return false;
         }
-        // Stall only when the gradient is also near-stationary (`gnorm` already this
-        // iteration, on the same metric the `gnorm < tol` test uses) — see the gate
-        // rationale on [`INNER_FTOL_GNORM_GATE`].
-        let stalled = objective_stalled(f_cur, f_new, &mut stall) && gnorm <= gnorm_gate;
+        // Stall only for ODE objectives, and only once the gradient has plateaued (no
+        // longer improving) — see [`INNER_FTOL_REL`]. `objective_stalled` is always called
+        // so the flat-step counter stays accurate; the plateau/ODE gates only decide
+        // whether a reached count converts to convergence.
+        let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
+        let stalled = enable_stall && obj_flat && !gnorm_improving;
         f_cur = f_new;
 
         let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
@@ -1683,6 +1715,7 @@ fn dense_bfgs_core(
     tol: f64,
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
+    enable_stall: bool,
 ) -> bool {
     let mut h_inv = init_h_inv(n, precond);
     let mut g = grad(x);
@@ -1690,16 +1723,23 @@ fn dense_bfgs_core(
     // recompute `obj(x)` (one prediction walk per inner step on the hot path).
     let mut f_cur = obj(x);
     let mut first_step = true;
-    // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]),
-    // gated below on the gradient also being near-stationary.
+    // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]): gated on
+    // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`), so
+    // smooth analytical/FD fits stay bit-identical and a non-stationary mid-descent iterate
+    // can't be accepted.
     let mut stall = 0u32;
-    let gnorm_gate = INNER_FTOL_GNORM_GATE * tol;
+    let mut best_gnorm = f64::INFINITY;
 
     for _iter in 0..max_iter {
         // `stop_precond` is `Some` only for FREM (issue #406); general fits stop
         // on the raw L2 norm so the converged EBE is independent of the `precond`
         // H0 that accelerates the search.
         let gnorm = grad_norm_metric(&g, stop_precond);
+        // Plateau guard: has `gnorm` meaningfully improved on the best seen?
+        let gnorm_improving = gnorm < best_gnorm * (1.0 - INNER_FTOL_GNORM_PLATEAU);
+        if gnorm < best_gnorm {
+            best_gnorm = gnorm;
+        }
 
         // Scale initial Hessian so first step is O(1) not O(gnorm). Only for the
         // identity-H0 path (`precond.is_none()`), where `stop_precond` is also
@@ -1726,17 +1766,15 @@ fn dense_bfgs_core(
             let d: Vec<f64> = (-&h_inv * &g_vec).iter().copied().collect();
             let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
             // Even steepest descent found no sufficient-decrease step: report
-            // non-convergence so the caller takes the Nelder–Mead fallback,
-            // which re-solves from η=0 and reaches the true mode. Claiming
-            // convergence here would hand the outer FOCE gradient a
-            // non-stationary η̂ and stall the population optimiser.
+            // non-convergence so the caller takes the argmin Nelder–Mead fallback.
             if alpha == 0.0 {
                 return false;
             }
             for i in 0..n {
                 x[i] += alpha * d[i];
             }
-            let stalled = objective_stalled(f_cur, f_new, &mut stall) && gnorm <= gnorm_gate;
+            let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
+            let stalled = enable_stall && obj_flat && !gnorm_improving;
             f_cur = f_new;
             if stalled {
                 return true;
@@ -1746,10 +1784,8 @@ fn dense_bfgs_core(
         }
 
         let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
-        // No sufficient-decrease step found: not yet at the mode (the descent
-        // direction exists but the line search exhausted its trials). Report
-        // failure so Nelder–Mead re-solves and the outer gradient sees a true
-        // stationary η̂.
+        // No sufficient-decrease step found: report non-convergence so the caller takes the
+        // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
             return false;
         }
@@ -1758,7 +1794,8 @@ fn dense_bfgs_core(
         for i in 0..n {
             x[i] += s[i];
         }
-        let stalled = objective_stalled(f_cur, f_new, &mut stall) && gnorm <= gnorm_gate;
+        let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
+        let stalled = enable_stall && obj_flat && !gnorm_improving;
         f_cur = f_new;
         if stalled {
             return true;
@@ -1913,35 +1950,39 @@ const MAX_LINE_SEARCH_TRIALS: usize = 30;
 /// norm test (`gnorm < tol`). When the objective is computed by the adaptive RK45 ODE
 /// solver, its step-pattern non-smoothness puts a noise floor on the gradient
 /// (empirically ~6e-7 at the mode for a 5-η `obs_scale = V1` model) that can sit *above*
-/// the inner `tol` (default `1e-7`). A BFGS that has already reached the posterior mode
-/// then sits on the answer with a dead-flat objective but never satisfies `gnorm < tol`,
-/// so it spins to `max_iter` and reports failure.
+/// the inner `tol`. A BFGS that has already reached the posterior mode then sits on the
+/// answer with a dead-flat objective but never satisfies `gnorm < tol`, so it spins to
+/// `max_iter` and reports failure.
 ///
 /// Declaring convergence once the *objective* has stopped improving for
-/// [`INNER_STALL_LIMIT`] consecutive accepted steps short-circuits that wasted spin. The
-/// stall return is **gated on the gradient also being near-stationary**
-/// ([`INNER_FTOL_GNORM_GATE`]·`tol`, evaluated on the same `stop_precond` metric the
-/// top-of-loop test uses): without that gate a run of heavily-backtracked tiny-`alpha`
-/// steps mid-descent could satisfy the flat-objective test while still far from the mode
-/// and hand the outer FOCE gradient a non-stationary η̂. The gate also keeps the FREM
-/// preconditioned stop (#406) authoritative — there the raw `f` flattens (covariate
-/// pseudo-obs etas seat early) long before the PK etas reach the joint mode, but the
-/// preconditioned `gnorm` does not, so the gate holds the stall off until both have.
+/// [`INNER_STALL_LIMIT`] consecutive accepted steps short-circuits that wasted spin. Two
+/// guards keep it from accepting a non-stationary iterate:
+///
+/// 1. **ODE-only** (`enable_stall`, set by `find_ebe`/`find_ebe_iov` for `[odes]` models).
+///    Analytical / event-driven objectives are exact, reach `gnorm < tol` normally, and
+///    stay bit-identical to prior releases — the stall never touches them.
+/// 2. **Gradient-plateau.** The stall fires only once the gradient has *stopped
+///    decreasing* — the current `gnorm` no longer improves the best seen by more than
+///    [`INNER_FTOL_GNORM_PLATEAU`]. Mid-descent (including a heavily-backtracked
+///    tiny-`alpha` stretch) the gradient is still shrinking, so the plateau test fails and
+///    the stall cannot fire at a non-stationary point. This adapts to whatever noise floor
+///    the solver tolerance produces, rather than a fixed multiple of `tol`. The plateau is
+///    measured on the same `stop_precond` metric the `gnorm < tol` test uses, so FREM's
+///    preconditioned stop (#406) stays authoritative.
 ///
 /// This is a fast-path optimisation only: correctness on every `false`-on-a-converged
-/// search does **not** depend on it — `find_ebe` keeps the lower-objective of the BFGS
-/// partial and the Nelder–Mead restart, so a stall that never fires (e.g. at looser ODE
-/// tolerances where the objective noise floor exceeds the `ftol` threshold) still yields
-/// the correct EBE, just after the spin. See #555.
+/// search does **not** depend on it — the inner fallback keeps the lower-objective of the
+/// BFGS partial and the Nelder–Mead restart and reports convergence from a real
+/// stationarity check, so a stall that never fires still yields the correct EBE. See #555.
 const INNER_FTOL_REL: f64 = 1e-11;
 /// Consecutive negligible-improvement steps required before [`INNER_FTOL_REL`] declares
 /// convergence (a small count guards against a one-off flat step mid-descent).
 const INNER_STALL_LIMIT: u32 = 3;
-/// Multiple of the inner `tol` below which the (`stop_precond`-aware) gradient norm must
-/// already sit for the objective-stall stop to fire — see [`INNER_FTOL_REL`]. Generous
-/// enough to admit the ODE gradient-noise floor (a few × `tol`) yet far below the
-/// mid-descent gradient norms (≫10³·`tol`), so it cannot accept a non-stationary iterate.
-const INNER_FTOL_GNORM_GATE: f64 = 100.0;
+/// Relative gradient-norm decrease that still counts as "the gradient is improving" for the
+/// plateau guard on the objective-stall stop (see [`INNER_FTOL_REL`]). While `gnorm` keeps
+/// dropping by more than this fraction the search is still descending, so the stall is held
+/// off; once it plateaus (no such decrease) the search is at the noise floor.
+const INNER_FTOL_GNORM_PLATEAU: f64 = 1e-3;
 
 /// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`
 /// for [`INNER_STALL_LIMIT`] consecutive accepted steps. Shared verbatim by the dense and
@@ -2441,8 +2482,10 @@ mod tests {
                 }
                 t0.elapsed().as_secs_f64() * 1e3 / runs as f64
             };
-            let t_dense = time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None));
-            let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None));
+            let t_dense =
+                time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
+            let t_lbfgs =
+                time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
             eprintln!(
                 "  n={n:4}  dense={t_dense:8.3} ms  lbfgs={t_lbfgs:8.3} ms  dense/lbfgs={:.2}x",
                 t_dense / t_lbfgs
@@ -2508,7 +2551,7 @@ mod tests {
             |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
         let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
         let mut x = vec![0.0, 0.0];
-        let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None);
+        let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None, false);
         assert!(ok, "BFGS should report convergence");
         assert!((x[0] - 1.0).abs() < 1e-6, "x0 = {}", x[0]);
         assert!((x[1] + 2.0).abs() < 1e-6, "x1 = {}", x[1]);
@@ -3273,6 +3316,54 @@ mod iov_tests {
             e_od.converged,
             "ODE EBE should be reported converged at the mode"
         );
+    }
+
+    /// #587 review: the shared inner-EBE fallback keeps the lower-objective **value** of the
+    /// BFGS partial and the Nelder–Mead restart (the substantive #555 fix — the η̂ value fed
+    /// to the FOCEI gradient), seeds NM from the partial under `ebe_warm_start`, and discards
+    /// a non-finite-objective partial. Uses a bimodal 1-D objective (deep well at x=-2,
+    /// f=-10; shallow well at x=+2, f=-1).
+    #[test]
+    fn argmin_inner_fallback_keeps_better_basin() {
+        let obj = |x: &[f64]| -> f64 {
+            let v = x[0];
+            if v < 0.0 {
+                (v + 2.0).powi(2) - 10.0
+            } else {
+                (v - 2.0).powi(2) - 1.0
+            }
+        };
+        set_ebe_warm_start(false);
+
+        // Partial in the deep (global) well, cold NM seed in the shallow well: the fallback
+        // keeps the lower-objective partial rather than overwriting with the shallow NM
+        // result (the old behaviour, which on this multimodal objective inflated the OFV).
+        let (eta, _) = argmin_inner_fallback(&obj, &[-2.0], &[2.0], 1, 200, 1e-8);
+        assert!((eta[0] + 2.0).abs() < 1e-2, "kept deep well, got {eta:?}");
+
+        // Partial in the shallow well, cold NM seed reaches the deep well: NM wins.
+        let (eta2, _) = argmin_inner_fallback(&obj, &[2.0], &[-2.0], 1, 200, 1e-8);
+        assert!(
+            (eta2[0] + 2.0).abs() < 1e-2,
+            "NM found deeper well, got {eta2:?}"
+        );
+
+        // Non-finite partial objective → unusable → NM result is taken.
+        let (eta3, _) = argmin_inner_fallback(&obj, &[f64::NAN], &[-2.0], 1, 200, 1e-8);
+        assert!(
+            eta3[0].is_finite(),
+            "NaN partial must be discarded, got {eta3:?}"
+        );
+
+        // `ebe_warm_start` seeds the single NM from the partial (covers the warm branch):
+        // from the deep well it stays there even though the cold seed is far away.
+        set_ebe_warm_start(true);
+        let (eta4, _) = argmin_inner_fallback(&obj, &[-2.0], &[5.0], 1, 200, 1e-8);
+        assert!(
+            (eta4[0] + 2.0).abs() < 1e-2,
+            "warm seed held the deep well, got {eta4:?}"
+        );
+        set_ebe_warm_start(false);
     }
 
     /// The IOV inner loop must honour the same model-level FD bails as the non-IOV inner

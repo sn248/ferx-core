@@ -1,6 +1,6 @@
 use crate::pk;
 use crate::stats::likelihood::{
-    individual_nll_into_with_schedule, individual_nll_iov, split_obs_by_occasion,
+    individual_nll_into_with_schedule, individual_nll_iov, iov_occasion_groups,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -173,7 +173,7 @@ fn iov_inner_subject_route(
     {
         return None;
     }
-    let k_occasions = split_obs_by_occasion(subject).len();
+    let k_occasions = iov_occasion_groups(subject).len();
     let n_flat = model.n_eta + k_occasions * model.n_kappa;
     let stacked = vec![0.0; n_flat];
     crate::sens::provider::subject_eta_grad_iov(model, subject, theta, &stacked)
@@ -218,20 +218,13 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         {
             return "steady-state dose + time-dependent ODE RHS";
         }
-        let occ_groups = split_obs_by_occasion(subject);
+        let occ_groups = iov_occasion_groups(subject);
         if occ_groups.is_empty() {
             return "no observation occasions";
         }
-        if subject
-            .dose_occasions
-            .iter()
-            .any(|d_occ| !occ_groups.iter().any(|(occ, _)| occ == d_occ))
-        {
-            return "dose occasion without observations";
-        }
         let n_stacked = model.n_eta + occ_groups.len() * model.n_kappa;
         let m_dim = model.n_theta + n_stacked;
-        if m_dim > crate::sens::ode_provider::MAX_ODE_AXES {
+        if m_dim > crate::sens::ode_provider::MAX_ODE_IOV_AXES {
             return "ODE IOV stacked axis cap";
         }
     }
@@ -398,7 +391,7 @@ pub struct EbeResult {
     pub nll: f64,
     /// Per-occasion kappas (empty when n_kappa == 0).
     /// `kappas[k]` corresponds to the k-th unique occasion (same order as
-    /// `split_obs_by_occasion`).
+    /// `iov_occasion_groups`).
     pub kappas: Vec<DVector<f64>>,
 }
 
@@ -791,7 +784,7 @@ fn find_ebe_iov(
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
 
-    let occ_groups = split_obs_by_occasion(subject);
+    let occ_groups = iov_occasion_groups(subject);
     let k_occasions = occ_groups.len();
 
     let n_flat = n_eta + k_occasions * n_kappa;
@@ -3332,27 +3325,26 @@ mod iov_tests {
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
-        // FD subject: a dose in occasion 2 has no observations, so the stacked
-        // vector has no κ axis for it — the provider declines this subject.
+        // FD subject: more occasion groups than the widened ODE IOV dispatch serves.
+        let n_wide = crate::sens::ode_provider::MAX_ODE_IOV_AXES;
         let fd_subject = Subject {
             id: "2".into(),
-            doses: vec![
-                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-            ],
-            obs_times: vec![1.0, 6.0],
+            doses: (0..n_wide)
+                .map(|i| DoseEvent::new(i as f64 * 24.0, 100.0, 1, 0.0, false, 0.0))
+                .collect(),
+            obs_times: (0..n_wide).map(|i| i as f64 * 24.0 + 1.0).collect(),
             obs_raw_times: Vec::new(),
-            observations: vec![8.0, 6.0],
-            obs_cmts: vec![1; 2],
+            observations: vec![8.0; n_wide],
+            obs_cmts: vec![1; n_wide],
             covariates: HashMap::new(),
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
-            cens: vec![0; 2],
-            occasions: vec![1, 1],
-            dose_occasions: vec![1, 2],
+            cens: vec![0; n_wide],
+            occasions: (1..=n_wide as u32).collect(),
+            dose_occasions: (1..=n_wide as u32).collect(),
             fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
@@ -3370,7 +3362,7 @@ mod iov_tests {
             .expect("mixed IOV population should warn with a reason");
         assert!(warning.contains("1 of 2"), "got: {warning}");
         assert!(
-            warning.contains("dose occasion without observations"),
+            warning.contains("ODE IOV stacked axis cap"),
             "got: {warning}"
         );
     }
@@ -3629,7 +3621,7 @@ mod iov_tests {
         let params = model.default_params.clone();
         let n_eta = model.n_eta;
         let n_kappa = model.n_kappa;
-        let k = split_obs_by_occasion(&subject).len();
+        let k = iov_occasion_groups(&subject).len();
         let n_stacked = n_eta + k * n_kappa;
         let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
         let stacked = vec![0.10, -0.05, 0.08, -0.12];
@@ -3920,7 +3912,7 @@ mod iov_tests {
         let params = model.default_params.clone();
         let n_eta = model.n_eta;
         let n_kappa = model.n_kappa;
-        let k = split_obs_by_occasion(&subject).len();
+        let k = iov_occasion_groups(&subject).len();
         let n_stacked = n_eta + k * n_kappa;
         let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
         // Non-zero η_ruv (index 3) so the residual-variance scaling is genuinely exercised.

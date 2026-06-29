@@ -256,6 +256,9 @@ section of the SDLC for the versioning policy).
 - ODE+IOV models with EVID=2 covariate-only breakpoints now keep analytic inner/outer
   gradients when otherwise in scope; the breakpoint updates the ODE segment PK snapshot
   with κ fixed at zero, matching production prediction semantics (#590).
+- ODE+IOV models with many occasion blocks or dose-only occasions now keep analytic
+  inner/outer gradients when otherwise in scope, covering per-subject stacks up to 96
+  axes (#590).
 - Standard errors for `theta` parameters with a **negative lower bound** (estimated on
   the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
   mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to

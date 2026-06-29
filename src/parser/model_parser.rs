@@ -6606,8 +6606,7 @@ fn build_ode_spec(
                     }
                 }
 
-                // TIME / T — subject-relative solver time axis (CSV raw TIME is
-                // preserved separately for output diagnostics).
+                // TIME / T — solver time axis (same as dataset TIME column).
                 if let Some(dst) = scratch.rhs_vars.get_mut(time_slot) {
                     *dst = t;
                 }

@@ -621,16 +621,15 @@ pub struct Subject {
     pub id: String,
     pub doses: Vec<DoseEvent>,
     pub obs_times: Vec<f64>,
-    /// Original observation times from the data file's TIME column, parallel to
-    /// `obs_times`. CSV-backed subjects use an internal elapsed-time clock
-    /// (`obs_times`: first retained row at t=0, with any reset-occasion shifts
-    /// layered on top; see `io/datareader`) while this keeps the raw value for
-    /// user-clock diagnostics: sdtab/covtab TIME and `predict()`/`simulate()` TIME.
+    /// Original (unshifted) observation times from the data file's TIME column,
+    /// parallel to `obs_times`. For subjects with stacked reset occasions whose
+    /// TIME restarts (see `io/datareader`), `obs_times` carries the internal
+    /// monotonic timeline while this keeps the raw value for the user-clock
+    /// diagnostics: sdtab/covtab TIME and `predict()`/`simulate()` TIME.
     /// `[derived]` integral windows use raw times so per-occasion AUC is
     /// correct. Populated for every observation read from a CSV (equal to
-    /// `obs_times` only when the subject clock already starts at zero and no
-    /// reset-occasion shift occurred); empty only for in-memory subjects, where
-    /// consumers fall back to `obs_times`.
+    /// `obs_times` when no shift occurred); empty only for in-memory subjects,
+    /// where consumers fall back to `obs_times`.
     pub obs_raw_times: Vec<f64>,
     pub observations: Vec<f64>,
     pub obs_cmts: Vec<usize>,

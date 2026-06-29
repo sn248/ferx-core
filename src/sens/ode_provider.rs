@@ -311,7 +311,10 @@ fn infusion_spans_segment(
 /// each need the `F`-scaled active window, a moving boundary not yet carried). Shared by
 /// `ode_tvcov_supported` (outer) and `ode_iov_subject_supported` (inner) so the two gates
 /// stay byte-identical and can't silently desync (#473 review #4).
-fn has_rate_defined_ss_infusion_under_f(model: &CompiledModel, subject: &Subject) -> bool {
+pub(crate) fn has_rate_defined_ss_infusion_under_f(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> bool {
     model.has_bioavailability()
         && subject.doses.iter().any(|d| {
             d.ss && d.ii > 0.0

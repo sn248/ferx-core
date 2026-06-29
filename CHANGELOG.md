@@ -250,6 +250,9 @@ section of the SDLC for the versioning policy).
 - ODE+IOV fits now report their actual analytic-vs-finite-difference inner-gradient route,
   including subject-level fallback reasons, instead of using the non-IOV gradient probe
   for diagnostics (#590).
+- ODE+IOV models with an expression `[scaling] obs_scale` and time-varying covariates
+  now stay on the analytic inner/outer gradient route instead of falling back to finite
+  differences (#590).
 - Standard errors for `theta` parameters with a **negative lower bound** (estimated on
   the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
   mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to

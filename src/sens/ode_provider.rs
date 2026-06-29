@@ -1791,14 +1791,11 @@ fn ode_iov_subject_supported(
     if !subject.all_doses_fixed() {
         return None;
     }
-    // IOV + `ExpressionScale` `obs_scale` is served by a per-occasion-group post-walk
-    // quotient (#575), which assumes one covariate snapshot per group. A TV-cov subject
-    // would need a per-event scale jet (the divisor's covariate value differs within a
-    // group) — not carried yet, so route these to FD (mirrors the non-IOV
-    // `ode_tvcov_supported` declining `ExpressionScale`).
-    if matches!(model.scaling, ScalingSpec::ExpressionScale { .. }) && subject.has_tv_covariates() {
-        return None;
-    }
+    // IOV + `ExpressionScale` `obs_scale` is served as a post-walk quotient. The scale
+    // materialisation mirrors production `predict_iov`: one scale per occasion group,
+    // evaluated at the subject-level covariate snapshot. A TV-cov subject may still use
+    // this route; the event walk gets TV-cov PK params, while scaling follows the live
+    // subject-static semantics (#590).
     // #419: rate-defined infusion under `F ≠ 1` is handled via the rate-off saltation
     // (moving window boundary), except for a steady-state rate-defined infusion (the
     // equilibration window would need to scale with `F`) → FD (shared gate, #473 review #4).
@@ -2037,9 +2034,9 @@ fn run_subject_iov<const M: usize>(
         };
 
     // For static-covariate subjects the per-occasion-group stacked PK seeding is the same
-    // source the event walk uses, so build it once here and share it with both the
-    // `ExpressionScale` scale jets and `seed_iov_events` — no double seeding (#575 review).
-    // `None` for TV-cov subjects (each event seeds at its own snapshot in `seed_iov_events`).
+    // source the event walk uses, so build it once here and share it with `seed_iov_events`
+    // — no double seeding (#575 review). `None` for TV-cov subjects (each event seeds at
+    // its own snapshot in `seed_iov_events`).
     let static_group_dual: Option<Vec<Vec<Dual2<M>>>> = if subject.has_tv_covariates() {
         None
     } else {
@@ -2050,19 +2047,35 @@ fn run_subject_iov<const M: usize>(
         )
     };
 
-    // η-dependent `ExpressionScale` `obs_scale` divisor (#575): one scale jet per
-    // occasion group (the divisor depends on the group's κ through the PK params),
-    // applied as a post-walk quotient on the final jet. Reuses `static_group_dual` (the
-    // same stacked PK seeding the walk uses, so the scale's `∂p/∂(θ, stacked-η)` matches
-    // the prediction's exactly); it is `Some` whenever the scale is active, since the
-    // per-subject gate declines `ExpressionScale` + TV-cov (one `cov` snapshot per group).
+    let (pk_at_dose, pk_at_obs) = seed_iov_events::<Dual2<M>>(
+        subject,
+        &occ_to_k,
+        k_groups,
+        cov,
+        static_group_dual.as_deref(),
+        seed_group_cov,
+    )?;
+
+    // η-dependent `ExpressionScale` `obs_scale` divisor: one scale jet per occasion group,
+    // matching production `predict_iov`'s subject-static `apply_scaling` call inside each
+    // occasion. Static subjects reuse `static_group_dual`; TV-cov subjects seed a static-cov
+    // scale jet for each group here.
     let group_scale: Option<Vec<Dual2<M>>> = match &model.scaling {
         ScalingSpec::ExpressionScale {
             deriv: Some(sprog), ..
         } => {
             let eta_bsv = &stacked_eta[..n_eta];
-            let groups = static_group_dual.as_ref()?;
             let slots = sprog.var_to_pk_slot();
+            let owned;
+            let groups: &[Vec<Dual2<M>>] = match static_group_dual.as_deref() {
+                Some(groups) => groups,
+                None => {
+                    owned = (0..k_groups)
+                        .map(|g| seed_group_cov(g, cov))
+                        .collect::<Option<Vec<_>>>()?;
+                    &owned
+                }
+            };
             let mut jets = Vec::with_capacity(k_groups);
             let mut var_duals: Vec<Dual2<M>> = Vec::with_capacity(slots.len());
             for seeded in groups {
@@ -2079,15 +2092,6 @@ fn run_subject_iov<const M: usize>(
         }
         _ => None,
     };
-
-    let (pk_at_dose, pk_at_obs) = seed_iov_events::<Dual2<M>>(
-        subject,
-        &occ_to_k,
-        k_groups,
-        cov,
-        static_group_dual.as_deref(),
-        seed_group_cov,
-    )?;
 
     let preds = integrate_tvcov_readout::<Dual2<M>>(model, subject, &pk_at_dose, &pk_at_obs);
 
@@ -2121,10 +2125,8 @@ fn run_subject_iov<const M: usize>(
             d2f_deta_dtheta,
         });
     }
-    // Apply the `ExpressionScale` quotient per observation, using its occasion group's
-    // scale jet (#575) via the shared per-row helper with `n_axes = n_stacked`. Obs order
-    // matches `subject.obs_times` / `subject.occasions`. Two scratch buffers reused across
-    // rows (not `2·n_obs` clones).
+    // Apply the `ExpressionScale` quotient per observation, using the observation's
+    // occasion-group scale. Two scratch buffers reused across rows (not `2·n_obs` clones).
     if let Some(group_scale) = group_scale {
         let mut fk: Vec<f64> = Vec::with_capacity(n_stacked);
         let mut fm: Vec<f64> = Vec::with_capacity(n_theta);
@@ -2271,9 +2273,8 @@ fn run_subject_iov_eta<const N: usize>(
             Some(seed_pk_dual1_iov::<N>(model, &pk, &cd, g, n_eta, n_kappa))
         };
 
-    // Static-cov per-group seeding built once, shared by the scale jets and the event
-    // walk — the inner counterpart of the outer `static_group_dual` (#575 review). `None`
-    // for TV-cov subjects.
+    // Static-cov per-group seeding built once and shared by the event walk — the inner
+    // counterpart of the outer `static_group_dual` (#575 review). `None` for TV-cov subjects.
     let static_group_dual: Option<Vec<Vec<Dual1<N>>>> = if subject.has_tv_covariates() {
         None
     } else {
@@ -2284,19 +2285,33 @@ fn run_subject_iov_eta<const N: usize>(
         )
     };
 
-    // η-only `ExpressionScale` scale jets, one per occasion group (#575) — the inner
-    // counterpart of the outer `group_scale`. Reuses `static_group_dual` (the same stacked
-    // `Dual1` seeding the walk uses, so the scale gradient matches the walk's). The κ axes
-    // enter purely through `var_duals` (the scale references no κ by name); `eta_bsv` seeds
-    // the BSV η axes `0..n_eta` directly. `Some` whenever the scale is active (gate declines
-    // `ExpressionScale` + TV-cov).
+    let (pk_at_dose, pk_at_obs) = seed_iov_events::<Dual1<N>>(
+        subject,
+        &occ_to_k,
+        k_groups,
+        cov,
+        static_group_dual.as_deref(),
+        seed_group_cov,
+    )?;
+
+    // η-only `ExpressionScale` scale jets, one per occasion group. Mirrors production's
+    // subject-static `apply_scaling` materialisation under IOV.
     let group_scale: Option<Vec<Dual1<N>>> = match &model.scaling {
         ScalingSpec::ExpressionScale {
             deriv: Some(sprog), ..
         } => {
             let eta_bsv = &stacked_eta[..n_eta];
-            let groups = static_group_dual.as_ref()?;
             let slots = sprog.var_to_pk_slot();
+            let owned;
+            let groups: &[Vec<Dual1<N>>] = match static_group_dual.as_deref() {
+                Some(groups) => groups,
+                None => {
+                    owned = (0..k_groups)
+                        .map(|g| seed_group_cov(g, cov))
+                        .collect::<Option<Vec<_>>>()?;
+                    &owned
+                }
+            };
             let mut jets = Vec::with_capacity(k_groups);
             let mut var_duals: Vec<Dual1<N>> = Vec::with_capacity(slots.len());
             for seeded in groups {
@@ -2314,15 +2329,6 @@ fn run_subject_iov_eta<const N: usize>(
         _ => None,
     };
 
-    let (pk_at_dose, pk_at_obs) = seed_iov_events::<Dual1<N>>(
-        subject,
-        &occ_to_k,
-        k_groups,
-        cov,
-        static_group_dual.as_deref(),
-        seed_group_cov,
-    )?;
-
     let preds = integrate_tvcov_readout::<Dual1<N>>(model, subject, &pk_at_dose, &pk_at_obs);
 
     let mut out = Vec::with_capacity(preds.len());
@@ -2337,7 +2343,7 @@ fn run_subject_iov_eta<const N: usize>(
             df_deta,
         });
     }
-    // Apply the η-only `ExpressionScale` quotient per observation (#575).
+    // Apply the η-only `ExpressionScale` quotient per observation (#575/#590).
     if let Some(group_scale) = group_scale {
         for (j, o) in out.iter_mut().enumerate() {
             let g = *occ_to_k.get(&subject.occasions.get(j).copied()?)?;

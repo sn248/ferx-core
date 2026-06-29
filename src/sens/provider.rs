@@ -6378,6 +6378,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ode_iov_tvcov_pkonly_breakpoint_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_TVCOV_ODE).expect("parse ODE IOV+TV-cov");
+        let subject = iov_tvcov_subject(true);
+        assert!(
+            !subject.pk_only_times.is_empty(),
+            "fixture must carry an EVID=2 covariate breakpoint"
+        );
+        assert!(subject.has_tv_covariates(), "fixture must carry TV cov");
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "model-level ODE IOV gate must admit the fixture"
+        );
+        assert!(
+            subject_sensitivities_iov(
+                &model,
+                &subject,
+                &[0.2, 10.0, 0.75],
+                &[0.12, -0.08, 0.05, -0.10],
+            )
+            .is_some(),
+            "EVID=2 breakpoint must stay on the analytic ODE IOV path (#590)"
+        );
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.75],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    #[test]
+    fn ode_iov_tvcov_pkonly_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_TVCOV_ODE).expect("parse ODE IOV+TV-cov"),
+            &iov_tvcov_subject(true),
+            &[0.2, 10.0, 0.75],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
     /// 2-cpt IV IOV `[odes]` model (κ on CL) — higher state/axis coverage for the ODE
     /// IOV walk: stacked dual width M = n_θ(4) + n_η(2) + K(2)·n_κ(1) = 8 (#439 ODE IOV).
     const WARFARIN_IOV_2CPT_ODE: &str = r#"
